@@ -103,6 +103,21 @@ describe('local address presentation policy', () => {
     expect(sanitizeLocalAddressText(`http://${name}:3000/report`, context)).not.toContain(`${name}:3000`);
   });
 
+  it('checks only card link fields in link-field mode', () => {
+    const context = { linkFieldsOnly: true };
+    const prose = '恢复：cd /root/iserver/repo && claude --resume 1 · http://127.0.0.1:3000/ · [技能](/home/alice/SKILL.md)';
+    expect(prepareLocalAddressContent(prose, 'text', context)).toBe(prose);
+    const card = JSON.stringify({ body: { elements: [{ tag: 'markdown', content: prose }] } });
+    expect(prepareLocalAddressContent(card, 'interactive', context)).toBe(card);
+    const malformed = '{"text": "' + prose;
+    expect(() => prepareLocalAddressContent(malformed, 'interactive')).toThrow();
+    expect(prepareLocalAddressContent(malformed, 'interactive', context)).toBe(malformed);
+    expect(() => prepareLocalAddressContent(JSON.stringify({ body: { elements: [{ tag: 'button', url: 'http://127.0.0.1:3000/' }] } }),
+      'interactive', context)).toThrow();
+    expect(() => prepareLocalAddressContent(JSON.stringify({ zh_cn: { content: [[{ tag: 'a', text: 'x', href: 'file:///tmp/a' }]] } }),
+      'post', context)).toThrow();
+  });
+
   describe('host capability links', () => {
     const scope = { hosts: ['10.20.30.40'], dashboardPorts: ['7891'] };
     const context = { localHosts: ['10.20.30.40'], hostIssuedLink: (url: string) => isHostCapabilityLink(url, scope) };

@@ -16,6 +16,9 @@ export interface LocalAddressContext {
   /** Capability links the host builds for its own pages. Consulted only for
    * card link fields; prose keeps the text policy. */
   hostIssuedLink?: (url: string) => boolean;
+  /** Check card link fields and leave prose as written. The transport sees
+   * host-written bodies too; prose is rewritten where model output enters. */
+  linkFieldsOnly?: boolean;
 }
 
 interface Context {
@@ -26,6 +29,7 @@ interface Context {
   internalFile: string;
   unavailableLink: string;
   hostIssuedLink?: (url: string) => boolean;
+  prose: boolean;
 }
 
 export class LocalAddressOutboundError extends OutputDeliveryTerminalError {
@@ -90,6 +94,7 @@ function contextFor(input: LocalAddressContext): Context {
     internalFile: input.internalFileLabel ?? '【内部文件】',
     unavailableLink: input.unavailableLinkLabel ?? '（未提供可访问链接）',
     hostIssuedLink: input.hostIssuedLink,
+    prose: !input.linkFieldsOnly,
   };
 }
 
@@ -240,6 +245,7 @@ function scrubLinks(input: string, ctx: Context): string {
 }
 
 function scrubText(input: string, ctx: Context): string {
+  if (!ctx.prose) return input;
   const linked = scrubLinks(input, ctx);
   const scrubAddress = (address: string): string => {
     const trailing = /[.,;:]+$/.exec(address)?.[0] ?? '';

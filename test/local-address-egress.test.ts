@@ -15,7 +15,8 @@ import {
 import { OutputDeliveryCoordinator } from '../src/services/output-delivery-coordinator.js';
 import { OutputDeliveryJournal } from '../src/services/output-delivery-journal.js';
 import { outputSnapshot } from '../src/services/universal-output-handoff.js';
-import { sanitizeLocalAddressNode } from '../src/im/lark/local-address-policy.js';
+import { sanitizeLocalAddressNode, sanitizeLocalAddressText } from '../src/im/lark/local-address-policy.js';
+import { localAddressContextForBot } from '../src/im/lark/local-address-context.js';
 import { buildTerminalUrl, resetTerminalProxy } from '../src/core/terminal-url.js';
 import { resolvePluginResultAccessUrl } from '../src/core/plugin-result-access-url.js';
 import { buildDashboardUrls, localHttpOrigin, workbenchEntryUrl, workbenchSpaUrl } from '../src/core/dashboard-url.js';
@@ -31,7 +32,9 @@ import { buildV3BlockedCard } from '../src/im/lark/v3-blocked-card.js';
 import { buildSessionsDetailCard, buildSessionTerminalUrl } from '../src/im/lark/sessions-card.js';
 import { composeDetail } from '../src/dashboard/session-card-model.js';
 import type { SessionRow } from '../src/core/dashboard-rows.js';
-import { buildStreamingCard, terminalMultiUrl } from '../src/im/lark/card-builder.js';
+import { buildSessionClosedCard, buildStreamingCard, terminalMultiUrl } from '../src/im/lark/card-builder.js';
+import { buildWorktreeCleanupResultCard } from '../src/im/lark/dismiss-card.js';
+import { deliverDashboardAdminLink, resolveDashboardAdminLink } from '../src/core/dashboard-command/link.js';
 import { buildTrustedResultDeliveryCard } from '../src/im/lark/trusted-result-delivery-card.js';
 import { flushFakeTimers } from './helpers/flush-fake-timers.js';
 
@@ -43,6 +46,9 @@ const card = () => ({ schema: '2.0', body: { elements: [
     value: { action: 'continue', path: '/tmp/internal-state', session_id: 's1' } },
 ] } });
 let nextApp = 0;
+/** The client marks callback values it routes; everything else must arrive as built. */
+const asBuilt = (body: unknown) => JSON.parse(typeof body === 'string' ? body : JSON.stringify(body),
+  (key, value) => key === '__bm_cb' ? undefined : value);
 
 function capture() {
   const app = 'local-egress-' + nextApp++;
@@ -61,9 +67,11 @@ function capture() {
 }
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
+// The transport sees host-written bodies too: it checks card link fields and
+// leaves prose to the model output entries (send, final output, reply card, CoT).
 describe('local addresses at the real Lark SDK write boundary', () => {
   it.each(['send', 'reply', 'dm', 'dm-deadline', 'ephemeral', 'update'] as const)(
-    '%s removes the reported skill destination and preserves callback data', async surface => {
+    '%s leaves prose as written and preserves callback data', async surface => {
       const { app, writes } = capture();
       const body = JSON.stringify(card());
       if (surface === 'send') await sendMessage(app, 'oc_chat', body, 'interactive');
@@ -74,37 +82,32 @@ describe('local addresses at the real Lark SDK write boundary', () => {
       if (surface === 'update') await updateMessage(app, 'om_card', body);
       expect(writes).toHaveLength(1);
       const sent = surface === 'ephemeral' ? writes[0].data.card : JSON.parse(writes[0].data.content);
-      expect(sent.body.elements[0].content).toContain('MIX Bot 协作技能');
-      expect(sent.body.elements[0].content).not.toContain('/data00/');
-      expect(sent.body.elements[0].content).not.toContain('SKILL.md');
-      expect(sent.body.elements[1].value.path).toBe('/tmp/internal-state');
-      expect(sent.body.elements[1].value.action).toBe('continue');
+      expect(asBuilt(sent)).toEqual(card());
     });
 
-  it('scrubs plain text, code and post text while keeping exact business URLs', async () => {
+  it('leaves plain text and post prose byte-identical', async () => {
     const { app, writes } = capture();
-    await sendMessage(app, 'oc_chat', '日志位于 /tmp/diagnosis.log\n```text\nfile:///home/alice/result.md\n```\n' + businessUrl);
-    const text = JSON.parse(writes[0].data.content).text;
-    expect(text).not.toContain('/tmp/');
-    expect(text).not.toContain('file:///');
-    expect(text).toContain(businessUrl);
-    await sendMessage(app, 'oc_chat', JSON.stringify({ zh_cn: { title: '报告 /Users/alice/report.md',
-      content: [[{ tag: 'text', text: skillText }]] } }), 'post');
-    expect(writes[1].data.content).not.toContain('/Users/');
-    expect(writes[1].data.content).not.toContain('/data00/');
+    const text = '日志位于 /tmp/diagnosis.log\n```text\nfile:///home/alice/result.md\n```\n' + businessUrl;
+    await sendMessage(app, 'oc_chat', text);
+    expect(JSON.parse(writes[0].data.content).text).toBe(text);
+    const post = JSON.stringify({ zh_cn: { title: '报告 /Users/alice/report.md', content: [[{ tag: 'text', text: skillText }]] } });
+    await sendMessage(app, 'oc_chat', post, 'post');
+    expect(writes[1].data.content).toBe(post);
   });
 
-  it('scrubs full streaming snapshots, including an unclosed local destination', async () => {
+  it('leaves streaming snapshots as written and rejects a local link field in a patched element', async () => {
     const { app, writes } = capture();
     await updateCardStreamElementContent(app, 'card1', 'body', '[技能](/data00/home/ali', 1, 'u1');
     await updateCardStreamElementContent(app, 'card1', 'body', skillText, 2, 'u2');
     await patchCardStreamElement(app, 'card1', 'body', { content: skillText }, 3, 'u3');
     await updateCardStreamingSettings(app, 'card1', { streamingMode: false, sequence: 4, uuid: 'u4', summary: '/tmp/result.md' });
     expect(writes).toHaveLength(4);
-    for (const write of writes) {
-      expect(JSON.stringify(write.data)).not.toContain('/data00/');
-      expect(JSON.stringify(write.data)).not.toContain('/tmp/');
-    }
+    expect(JSON.stringify(writes[0].data)).toContain('/data00/home/ali');
+    for (const write of writes.slice(1, 3)) expect(JSON.stringify(write.data)).toContain(JSON.stringify(skillText).slice(1, -1));
+    expect(JSON.stringify(writes[3].data)).toContain('/tmp/result.md');
+    await expect(patchCardStreamElement(app, 'card1', 'open', { tag: 'button', url: 'file:///tmp/report.md' }, 5, 'u5'))
+      .rejects.toMatchObject({ code: 'LOCAL_ADDRESS_OUTBOUND_REJECTED' });
+    expect(writes).toHaveLength(4);
   });
 
   it.each([
@@ -128,7 +131,7 @@ describe('local addresses at the real Lark SDK write boundary', () => {
     expect(writes[1].data.content).toBe(media);
   });
 
-  it('retries the same sanitized body and provider UUID after a transient rejection', async () => {
+  it('retries the same body and provider UUID after a transient rejection', async () => {
     vi.useFakeTimers();
     const { app, writes } = capture();
     let attempt = 0;
@@ -141,7 +144,7 @@ describe('local addresses at the real Lark SDK write boundary', () => {
     await flushFakeTimers(2_000);
     await expect(publishing).resolves.toBe('om_retry');
     expect(writes).toHaveLength(2);
-    expect(writes[0].data.content).not.toContain('/data00/');
+    expect(asBuilt(writes[0].data.content)).toEqual(card());
     expect(writes[1].data).toEqual(writes[0].data);
     expect(writes[1].data.uuid).toBe('stable-local-uuid');
   });
@@ -226,9 +229,8 @@ describe('host capability links in a default LAN deployment', () => {
     const devServer = terminalMultiUrl(`${webOrigin(5173)}/`);
     await expect(sendMessage(app, 'oc_chat', multiCard({ url: devServer.url, pc_url: devServer.pc_url }), 'interactive'))
       .rejects.toMatchObject(rejected);
-    await sendMessage(app, 'oc_chat', `[打开](${devServer.url}) 或 ${devServer.url}`);
-    expect(writes).toHaveLength(3);
-    expect(JSON.parse(writes[2].data.content).text).not.toContain('5173');
+    expect(sanitizeLocalAddressText(`[打开](${devServer.url}) 或 ${devServer.url}`, localAddressContextForBot(app)))
+      .not.toContain('5173');
   });
 
   it.each([
@@ -338,8 +340,35 @@ describe('host capability links in a default LAN deployment', () => {
       await expect(sendMessage(app, 'oc_chat', linkCard(url), 'interactive'), url).rejects.toMatchObject(rejected);
     }
     expect(writes).toHaveLength(0);
-    const terminalUrl = terminal();
-    await sendMessage(app, 'oc_chat', '终端在 ' + terminalUrl);
-    expect(JSON.parse(writes[0].data.content).text).not.toContain(terminalUrl);
+    // Link shapes exempt card link fields only; a model reply naming the page is prose.
+    expect(sanitizeLocalAddressText('终端在 ' + terminal(), localAddressContextForBot(app))).not.toContain(terminal());
+  });
+
+  it('sends host-written prose unchanged: resume command, terminal snapshot, status, cleanup and the admin Dashboard link', async () => {
+    const { app, writes } = capture();
+    const repo = '/root/iserver/myrepo';
+    const bodies = [
+      buildSessionClosedCard('sid-lan', 'om_root', 'Fix bug', 'claude-code', repo, `cd ${repo} && claude --resume 1234`, 'zh'),
+      buildStreamingCard('sid-lan', 'om_root', terminal(), 'title', `alice@devbox:${repo}$ ls ~/notes\nREADME.md`, 'working'),
+      buildWorktreeCleanupResultCard([{ id: 'wt1', run: { status: 'removed', dir: `${repo}-wt-feature` } }], 'zh'),
+    ];
+    for (const body of bodies) await sendMessage(app, 'oc_chat', body, 'interactive');
+    const status = `Session: sid-lan\nTerminal: ${terminal()}\nCWD: ${repo}`;
+    await replyMessage(app, 'om_root', status);
+    expect(writes.slice(0, 3).map(write => asBuilt(write.data.content))).toEqual(bodies.map(asBuilt));
+    expect(JSON.parse(writes[3].data.content).text).toBe(status);
+
+    const resolveLink = () => resolveDashboardAdminLink({ host: config.dashboard.externalHost,
+      readPortFile: () => String(config.dashboard.port), readTokenFile: () => 'dash_credential_abcdefghijklmnopqrstuvwxyz' });
+    const resolved = resolveLink();
+    if (!resolved.ok) throw new Error('dashboard link unavailable');
+    const reply = vi.fn(async () => undefined);
+    const admin = { larkAppId: app, rootId: 'om_root', adminOpenId: 'ou_admin', reply };
+    await expect(deliverDashboardAdminLink({ ...admin, message: { chatType: 'group', chatId: 'oc_chat', threadId: 'omt_1' } as any,
+      seams: { resolveLink } })).resolves.toBe('dm');
+    await expect(deliverDashboardAdminLink({ ...admin, message: { chatType: 'group', chatId: 'oc_chat' } as any,
+      seams: { resolveLink, getChatMode: async () => 'group' } })).resolves.toBe('ephemeral');
+    expect(JSON.parse(writes[4].data.content).text).toContain(resolved.link.url);
+    expect(JSON.stringify(writes[5].data.card)).toContain(resolved.link.url);
   });
 });

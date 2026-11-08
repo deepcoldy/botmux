@@ -29,7 +29,8 @@ function hostIssuedLink(): (url: string) => boolean {
   return url => isHostCapabilityLink(url, scope ??= hostLinkScope()) || !!vettedReplay.getStore()?.has(url);
 }
 
-/** Host-selected labels; never take policy exemptions from the agent payload. */
+/** Where model output enters. Host-selected labels; never take policy
+ * exemptions from the agent payload. */
 export function localAddressContextForBot(appId: string, workingDir?: string): LocalAddressContext {
   const locale = localeForBot(appId);
   return {
@@ -40,11 +41,18 @@ export function localAddressContextForBot(appId: string, workingDir?: string): L
   };
 }
 
+/** Every outbound body, whoever wrote it: a card link field must be one of the
+ * host's own link shapes. Host-written prose such as a resume command, a cwd
+ * or a Dashboard link sent to an admin is not rewritten. */
+export function linkFieldContext(): LocalAddressContext {
+  return { linkFieldsOnly: true, hostIssuedLink: hostIssuedLink() };
+}
+
 /** Whether a card link field holding `url` would be sent, for builders that
  * would rather leave a button out than have the whole card rejected. */
 export function sendableCardLink(url: string): boolean {
   try {
-    sanitizeLocalAddressNode({ url }, { hostIssuedLink: hostIssuedLink() });
+    sanitizeLocalAddressNode({ url }, linkFieldContext());
     return true;
   } catch (error) {
     if (error instanceof LocalAddressOutboundError) return false;

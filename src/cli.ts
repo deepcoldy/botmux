@@ -12228,7 +12228,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     process.exit(2);
   }
   // Process the expanded presentation before validation, uploads or any send
-  // ledger/hash. The Lark client independently protects legacy/replayed bodies.
+  // ledger/hash. The Lark client checks only card link fields, not prose.
   try {
     const localContext = localAddressContextForBot(s.larkAppId, s.workingDir);
     content = sanitizeLocalAddressText(content, localContext);
