@@ -1,4 +1,5 @@
 import { resolveExcludeSenderKinds } from './listener-filters.js';
+import { normalizeMessageListenerReplyMode } from '../../services/message-listener-reply-policy.js';
 import { mergeListenerContentPolicy, type MessageListenerData } from './roles.js';
 import { normalizeListenerContentPolicy } from '../../services/message-listener-content-policy.js';
 
@@ -104,7 +105,7 @@ export function buildListenerSavePayload(
       scope: 'top_level',
     },
     ...(contentPolicy ? { contentPolicy } : {}),
-    replyPolicy: { mode: listener.replyPolicy?.mode === 'chat' ? 'chat' : 'thread', sessionMode: 'per_message' },
+    replyPolicy: { mode: normalizeMessageListenerReplyMode(listener.replyPolicy?.mode), sessionMode: 'per_message' },
   };
 }
 
@@ -127,6 +128,7 @@ export type ListenerWidening =
   | 'includeSelf'
   | 'msgTypes'
   | 'keywords'
+  | 'replyThread'
   | 'replyChat';
 
 const ALL_SENDER_TYPES: readonly SenderType[] = ['user', 'bot'];
@@ -189,5 +191,6 @@ export function describeListenerWidening(
   if (added(msgTypesOf(b.messagePolicy?.includeMsgTypes), msgTypesOf(a.messagePolicy?.includeMsgTypes))) reasons.add('msgTypes');
   if (keywordFilterWidened(b.contentPolicy, a.contentPolicy)) reasons.add('keywords');
   if (b.replyPolicy?.mode !== 'chat' && a.replyPolicy?.mode === 'chat') reasons.add('replyChat');
+  if (b.replyPolicy?.mode === 'none' && a.replyPolicy?.mode === 'thread') reasons.add('replyThread');
   return [...reasons];
 }

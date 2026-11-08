@@ -606,6 +606,7 @@ import {
 } from './session-preview.js';
 import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { ChatRenameCooldown, chatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
+import { isSilentMessageListenerSession } from './message-listener-silence.js';
 import { executeChatRename } from './chat-rename-operation.js';
 import { authorizeHumanManager } from './human-manager-authorization.js';
 import { changeChatManager, getChatManagerStatus } from '../services/chat-manager.js';
@@ -4038,6 +4039,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   if (sessionTransportDisabled(ds)) return jsonRes(res, 200, { ok: false, error: 'no_feishu_transport' });
   if (ds.chatType !== 'group') return jsonRes(res, 400, { ok: false, error: 'not_group_chat' });
+  // Renaming the session's own group is a visible source-group write; a silent
+  // listener task must not change its source group. Human dashboard management
+  // still uses the host-only PUT /api/groups/:chatId/name route.
+  if (isSilentMessageListenerSession(ds.session)) {
+    return jsonRes(res, 403, { ok: false, error: 'silent_message_listener' });
+  }
   const normalized = normalizeLarkChatName(body.name);
   if (!normalized.ok) return jsonRes(res, 400, normalized);
 
@@ -8104,6 +8111,9 @@ ipcRoute('POST', '/api/message-listeners/:chatId/run-preview', requireBoundBot(a
     const results = [];
     for (const match of matches) {
       const triggerId = createMessageListenerRunPreviewTurnId();
+      // Register before worker IPC: even an immediately completed turn must
+      // find its preview record.
+      markMessageListenerRunPreviewTriggered(run.runId, match.messageId, { triggerId });
       try {
         const result = await triggerSessionTurn({
           source: {
@@ -8127,7 +8137,11 @@ ipcRoute('POST', '/api/message-listeners/:chatId/run-preview', requireBoundBot(a
           },
           instruction: renderMessageListenerInstruction(match),
           presentation: { topicMessage: null },
-        }, { larkAppId: cachedLarkAppId, activeSessions }, { stableTurnId: triggerId });
+        }, { larkAppId: cachedLarkAppId, activeSessions }, {
+          stableTurnId: triggerId,
+          ...(match.replyMode === 'none' ? { messageListenerRun: { sourceMessageId: match.messageId, replyMode: 'none' as const } } : {}),
+          messageListenerAutoClose: match.autoCloseAfterCompletion,
+        });
         const tracked = result.ok
           ? markMessageListenerRunPreviewTriggered(run.runId, match.messageId, {
               action: result.action,
