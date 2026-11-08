@@ -411,6 +411,14 @@ describe('session reasoning effort changes', () => {
     expect(setSessionReasoningEffort(ds, 'high')).toBe('unsupported');
   });
 
+  it('recognizes an Aiden launcher configured by absolute path by its file name', () => {
+    const { ds } = session();
+    ds.initConfig.wrapperCli = '/opt/aiden/bin/aiden x codex';
+    expect(sessionReasoningControl(ds)).toBeDefined();
+    ds.initConfig.wrapperCli = '/opt/aiden/bin/aiden-beta x codex';
+    expect(sessionReasoningControl(ds)).toBeUndefined();
+  });
+
   it('saves without retiring the worker and clears pending only after the new effort is observed', () => {
     const { ds, worker } = session();
     expect(setSessionReasoningEffort(ds, 'high')).toBe('saved');

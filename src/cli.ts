@@ -20054,6 +20054,10 @@ function printPluginServiceDeleteError(err: unknown): boolean {
 
 async function cmdPlugin(args: string[]): Promise<void> {
   const sub = (args[0] ?? 'list').toLowerCase();
+  if (sub === 'install-verified' || sub === 'uninstall-verified') {
+    if (!findArgValue(args, '--guard-json')) throw new Error('plugin_mutation_guard_required');
+    return cmdPlugin([sub === 'install-verified' ? 'install' : 'uninstall', ...args.slice(1)]);
+  }
   if (sub === 'help' || sub === '--help' || sub === '-h') {
     printPluginUsage();
     return;
@@ -20064,10 +20068,11 @@ async function cmdPlugin(args: string[]): Promise<void> {
     if (!spec) { printPluginUsage(); process.exit(1); }
     const { installPlugin } = await import('./core/plugins/install.js');
     const { resolveOfficialPluginPackageSpec } = await import('./core/plugins/init.js');
+    const { parsePluginMutationGuard } = await import('./core/plugins/mutation-guard.js');
     const resolvedSpec = resolveOfficialPluginPackageSpec(spec);
     let result;
     try {
-      result = installPlugin(resolvedSpec, { link: args.includes('--link') });
+      result = installPlugin(resolvedSpec, { link: args.includes('--link'), guard: parsePluginMutationGuard(findArgValue(args, '--guard-json')) });
     } catch (err) {
       if (printPluginServiceRunningError(err)) {
         process.exitCode = 1;
@@ -20209,29 +20214,37 @@ async function cmdPlugin(args: string[]): Promise<void> {
       console.error('❌ --bot 后需要 bot 名称、序号或 all。');
       process.exit(1);
     }
-    const { materializePlugin, dematerializePlugin } = await import('./core/plugins/materializer.js');
-    if (enable) {
-      if (botSelector) {
-        updateBotPluginBinding(pluginId, botSelector, true, () => materializePlugin(pluginId));
+    const { withPluginServiceLock } = await import('./core/plugins/service-manager.js');
+    await withPluginServiceLock(async () => {
+      const { invalidateGlobalConfigCache } = await import('./global-config.js');
+      invalidateGlobalConfigCache();
+      const { readPluginRegistry } = await import('./services/plugin-registry-store.js');
+      pluginRegistryCache = readPluginRegistry();
+      if (!pluginRegistryCache.plugins[pluginId]) throw new Error(`plugin_not_installed:${pluginId}`);
+      const { materializePlugin, dematerializePlugin } = await import('./core/plugins/materializer.js');
+      if (enable) {
+        if (botSelector) {
+          updateBotPluginBinding(pluginId, botSelector, true, () => materializePlugin(pluginId));
+        } else {
+          const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+          assertPluginBindingTransitionForCli(pluginId, true, current);
+          materializePlugin(pluginId);
+          updateGlobalPluginBinding(pluginId, true);
+        }
       } else {
-        const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
-        assertPluginBindingTransitionForCli(pluginId, true, current);
-        materializePlugin(pluginId);
-        updateGlobalPluginBinding(pluginId, true);
+        if (botSelector) {
+          updateBotPluginBinding(pluginId, botSelector, false);
+        } else {
+          const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+          assertPluginBindingTransitionForCli(pluginId, false, current);
+          updateGlobalPluginBinding(pluginId, false);
+        }
+        const stillReferenced = (normalizePluginIdList(readGlobalConfig().plugins) ?? []).includes(pluginId)
+          || loadBotsJson().some(bot => (normalizePluginIdList(bot.plugins) ?? []).includes(pluginId));
+        if (!stillReferenced) dematerializePlugin(pluginId);
       }
-    } else {
-      if (botSelector) {
-        updateBotPluginBinding(pluginId, botSelector, false);
-      } else {
-        const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
-        assertPluginBindingTransitionForCli(pluginId, false, current);
-        updateGlobalPluginBinding(pluginId, false);
-      }
-      const stillReferenced = (normalizePluginIdList(readGlobalConfig().plugins) ?? []).includes(pluginId)
-        || loadBotsJson().some(bot => (normalizePluginIdList(bot.plugins) ?? []).includes(pluginId));
-      if (!stillReferenced) dematerializePlugin(pluginId);
-    }
-    console.log(`✅ 已${enable ? '启用' : '禁用'}${botSelector ? ` Bot(${botSelector})` : '机器默认'}插件: ${pluginId}`);
+      console.log(`✅ 已${enable ? '启用' : '禁用'}${botSelector ? ` Bot(${botSelector})` : '机器默认'}插件: ${pluginId}`);
+    });
     return;
   }
 
@@ -20246,8 +20259,22 @@ async function cmdPlugin(args: string[]): Promise<void> {
     const { dematerializePlugin } = await import('./core/plugins/materializer.js');
     const { readPluginRegistry, removeInstalledPlugin } = await import('./services/plugin-registry-store.js');
     const { pluginHome } = await import('./core/plugins/paths.js');
+    const { parsePluginMutationGuard, assertPluginMutationGuard } = await import('./core/plugins/mutation-guard.js');
+    const guard = parsePluginMutationGuard(findArgValue(args, '--guard-json'));
+    const { invalidateGlobalConfigCache } = await import('./global-config.js');
+    const { renameSync } = await import('node:fs');
+    const assertConfirmation = () => {
+      if (!guard) return;
+      invalidateGlobalConfigCache();
+      if (guard.id !== pluginId) throw new Error('plugin_confirmation_id_mismatch');
+      assertPluginMutationGuard(guard, readPluginRegistry().plugins[pluginId]);
+      if ((readGlobalConfig().plugins ?? []).includes(pluginId) || loadBotsJson().some(bot => (bot.plugins ?? []).includes(pluginId))) {
+        throw new Error('plugin_confirmation_enabled');
+      }
+    };
     try {
       await withPluginServiceLock(async () => {
+        assertConfirmation();
         const lockedRegistry = readPluginRegistry();
         const installed = lockedRegistry.plugins[pluginId];
         if (!installed) throw new Error(`plugin_not_installed:${pluginId}`);
@@ -20265,11 +20292,23 @@ async function cmdPlugin(args: string[]): Promise<void> {
         }
 
         await deletePluginServicesOrThrowUnlocked([pluginId]);
+        assertConfirmation();
         dematerializePlugin(pluginId);
         await removePluginSkillRegistryEntries(pluginId);
-        removeInstalledPlugin(pluginId);
+        assertConfirmation();
         removePluginBindingsEverywhere(pluginId);
-        rmSync(pluginHome(pluginId), { recursive: true, force: true });
+        // Keep the registry retryable until all preceding cleanup succeeds.
+        const path = pluginHome(pluginId);
+        const retired = `${path}.removed-${process.pid}-${Date.now()}`;
+        const hadHome = existsSync(path);
+        if (hadHome) renameSync(path, retired);
+        try { removeInstalledPlugin(pluginId); }
+        catch (error) {
+          if (hadHome) renameSync(retired, path);
+          throw error;
+        }
+        try { rmSync(retired, { recursive: true, force: true }); }
+        catch { console.error('插件已卸载；临时备份目录清理失败，保留待清理。'); }
       });
     } catch (err) {
       if (err instanceof Error && err.message.startsWith(`plugin_has_enabled_dependents:${pluginId}:`)) {
