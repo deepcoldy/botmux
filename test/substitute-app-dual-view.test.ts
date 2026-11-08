@@ -115,7 +115,7 @@ describe('App ID dual-view identity proof', () => {
     expect(appIds(await resolveSubstituteAppMentions('cli_receiver', message))).toEqual(['cli_original', 'cli_original']);
   });
 
-  it.each([[], undefined])('verifies a rich-text @ whose event mentions[] is %j', async mentions => {
+  it.each([[[]], [undefined]])('verifies a rich-text @ whose event mentions[] is %j', async mentions => {
     stubViews(postPair(restPost(['@_user_1']), [{ key: '@_user_1', app: 'cli_original', open: 'ou_original' }]));
     const message = postEvent(wsPost(['ou_original']), mentions);
     const result = await resolveSubstituteAppMentions('cli_receiver', message);
