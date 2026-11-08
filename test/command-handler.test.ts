@@ -1969,6 +1969,15 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(resolvePassthroughCommands(LARK_APP_ID, 'ebsd').size).toBe(0);
   });
 
+  it('keeps raw passthrough off Riff while mojo and interactive Codex keep theirs', () => {
+    // Riff turns every write into its own remote task: `/compact` and its Enter
+    // would arrive as two remote prompts and no slash parser would see it.
+    expect(cliHasNoRawPassthroughSurface('riff')).toBe(true);
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'riff').size).toBe(0);
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'mojo').has('/compact')).toBe(true);
+    expect(resolvePassthroughCommands(LARK_APP_ID, 'codex').has('/compact')).toBe(true);
+  });
+
   it('threads the frozen CLI through the ADAPTER-SCOPED layer, not just the builtin set', () => {
     // Regression for the earlier miss: the override only guarded the codex-app
     // early return, so `resolveAdapterDefaultPassthroughCommands` still read the

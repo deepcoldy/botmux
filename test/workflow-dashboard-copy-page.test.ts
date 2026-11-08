@@ -18,6 +18,7 @@ import { canEditCopyGoal, canEditCopyNodes, copyGoalMode } from '../src/dashboar
 import { copyRequest, draftActionRequest } from '../src/dashboard/web/workflow-draft-api.js';
 import { loadSavedWorkflowDetailView } from '../src/workflows/v3/library-catalog.js';
 import { ui } from '../src/dashboard/web/ui.js';
+import { BotSearchPicker } from '../src/dashboard/web/bot-search-picker.js';
 import { BOTS, DOC, MAIN, OWNER, PI, SKETCHES, STEWARD, architectSettled, makeService, specMarkdown } from './helpers/workflow-draft-fakes.js';
 import { REVIEW, seedRun } from './helpers/workflow-copy-fakes.js';
 
@@ -164,9 +165,9 @@ describe('页面渲染', () => {
     expect(text(renderer.root)).not.toMatch(/ou_/);
     await act(async () => { buttons(renderer, '复制此版本')[0]!.props.onClick(); });
     await flush();
-    const select = renderer.root.find((node) => node.type === 'select' && node.props.id === 'wfc-bot');
-    expect(text(select)).toContain('与来源相同（主Bot）');
-    await act(async () => { select.props.onChange({ target: { value: DOC } }); });
+    const picker = renderer.root.find((node) => node.type === BotSearchPicker && node.props.id === 'wfc-bot');
+    expect(text(picker)).toContain('与来源相同（主Bot）');
+    await act(async () => { picker.props.onChange(DOC); });
     await act(async () => { buttons(renderer, '复制')[0]!.props.onClick(); });
     await flush();
     expect(sent.find((call) => call.url.endsWith('/drafts/from-source'))?.body)
@@ -262,5 +263,56 @@ describe('复核修复的页面（D6）', () => {
     const textOnly = stale.root.findAll((node) => node.type === 'input' && node.props.name === 'wfc-mode')[0]!;
     expect(textOnly.props.disabled).toBe(true);
     act(() => { stale.unmount(); });
+  });
+});
+
+describe('复制对话框：选过别的 Bot 后回到「与来源相同」', () => {
+  const text = (node: TestRenderer.ReactTestInstance): string => node.children.map((c) => typeof c === 'string' ? c : text(c)).join('');
+  const flush = async () => { for (let i = 0; i < 8; i++) await act(async () => { await new Promise((r) => setTimeout(r, 0)); }); };
+
+  async function dialog(bots: unknown[], sourceOrchestratorAppId: string) {
+    const sent: Array<{ url: string; body?: unknown }> = [];
+    vi.stubGlobal('window', { setTimeout, clearTimeout, location: { hash: '' } });
+    vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
+      sent.push({ url, ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}) });
+      if (url === '/api/v3/orchestration/bots') return { ok: true, status: 200, json: async () => ({ ok: true, bots }) } as Response;
+      return { ok: true, status: 200, json: async () => ({ ok: true, draft: { runId: 'copy-9' } }) } as Response;
+    });
+    const { CopyWorkflowDialog } = await import('../src/dashboard/web/workflow-copy.js');
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(CopyWorkflowDialog, {
+        source: { kind: 'run', runId: RUN }, sourceOrchestratorAppId, onClose: () => {}, onCopied: () => {},
+      }));
+    });
+    await flush();
+    const picker = () => renderer.root.find((node) => node.type === BotSearchPicker && node.props.id === 'wfc-bot');
+    const resets = () => renderer.root.findAll((node) => node.type === 'button' && String(node.props.className ?? '').includes('btn-link') && text(node).startsWith('与来源相同'));
+    const submit = async () => {
+      await act(async () => { renderer.root.findAll((node) => node.type === 'button' && text(node) === '复制')[0]!.props.onClick(); });
+      await flush();
+      return sent.filter((call) => call.url.endsWith('/drafts/from-source')).at(-1)?.body;
+    };
+    return { renderer, picker, resets, submit };
+  }
+
+  it.each([
+    ['the source bot is offline (its option cannot be picked)', [
+      { larkAppId: MAIN, name: '主Bot', cliId: 'claude-code', online: false, unavailable: { code: 'offline', why: 'daemon 不在线' } },
+      { larkAppId: DOC, name: '文档Bot', cliId: 'claude-code', online: true },
+    ]],
+    ['the source bot is not in the list at all', [
+      { larkAppId: DOC, name: '文档Bot', cliId: 'claude-code', online: true },
+    ]],
+  ])('%s', async (_name, bots) => {
+    const d = await dialog(bots, MAIN);
+    expect(text(d.picker())).toContain('与来源相同');
+    expect(d.resets()).toHaveLength(0);
+    await act(async () => { d.picker().props.onChange(DOC); });
+    expect(d.resets()).toHaveLength(1);
+    await act(async () => { d.resets()[0]!.props.onClick(); });
+    expect(text(d.picker())).toContain('与来源相同');
+    expect(await d.submit()).toEqual({ source: { kind: 'run', runId: RUN } });
+    act(() => { d.renderer.unmount(); });
   });
 });
