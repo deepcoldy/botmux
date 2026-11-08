@@ -485,7 +485,7 @@ import {
   upgradeRequired, waitForCodexExit,
   type CodexExecutable, type CodexProcess,
 } from './services/codex-session-upgrade.js';
-import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper, wrapperLaunchEnv } from './setup/cli-selection.js';
+import { buildWrappedLaunch, isTtadkWrapper, wrapperIdentityTokens, wrapperLaunchEnv } from './setup/cli-selection.js';
 import { buildForgeTraexLaunch, validateCliLaunchModeConfig } from './core/cli-launch-mode.js';
 import { cliUnavailableMessageAfterRetry, createAdapterAfterMissingCliWait } from './setup/cli-availability.js';
 import {
@@ -16741,7 +16741,7 @@ function dismissAidenCodexUpdateDialog(data: string, source: 'stream' | 'screen'
     lastInitConfig?.cliId !== 'codex'
     || lastInitConfig.adoptMode
     || !lastInitConfig.wrapperCli
-    || parseWrapperCli(lastInitConfig.wrapperCli)[0] !== 'aiden'
+    || wrapperIdentityTokens(lastInitConfig.wrapperCli)[0] !== 'aiden'
     || !awaitingFirstPrompt
   ) {
     return false;
@@ -16798,7 +16798,7 @@ function inspectAidenCodexUpdateDialogOnScreen(): boolean {
     lastInitConfig?.cliId !== 'codex'
     || lastInitConfig.adoptMode
     || !lastInitConfig.wrapperCli
-    || parseWrapperCli(lastInitConfig.wrapperCli)[0] !== 'aiden'
+    || wrapperIdentityTokens(lastInitConfig.wrapperCli)[0] !== 'aiden'
     || !awaitingFirstPrompt
   ) return false;
 
@@ -27024,7 +27024,7 @@ async function spawnCli(
       resolveBin: (b: string) => locateOnEffectiveChildPath(b, effectiveChildEnv) ?? b,
       realCliBin: cliAdapter!.resolvedBin,
     });
-    if (parseWrapperCli(cfg.wrapperCli).slice(0, 3).join(' ') === 'aiden x codex') {
+    if (wrapperIdentityTokens(cfg.wrapperCli).slice(0, 3).join(' ') === 'aiden x codex') {
       try {
         accessSync(cliAdapter!.resolvedBin, fsConstants.X_OK);
         if (!wiring.shimDataDir) throw new Error('SESSION_DATA_DIR is unavailable');
@@ -28909,7 +28909,7 @@ async function spawnCli(
       observeRestoredStartupHistoryOnScreen();
     }
     if (idleDetector?.isStartupPending()) {
-      if (cfg.resume && cfg.cliId === 'codex' && cfg.wrapperCli?.trim() === 'aiden x codex'
+      if (cfg.resume && cfg.cliId === 'codex' && wrapperIdentityTokens(cfg.wrapperCli).join(' ') === 'aiden x codex'
         && !isPersistentBackendReattach && !requestedAidenResumeRedraw && firstPromptBackend
         && aidenCodexResumeNeedsRedraw(renderer?.rawSnapshot({ preserveFormatting: true }) ?? '')) {
         requestedAidenResumeRedraw = true;
