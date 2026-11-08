@@ -21,6 +21,15 @@ export function productionFunction(path: string, name: string, scope: Record<str
   if (!declaration) throw new Error(`Missing function ${name}`);
   return evaluate(declaration.getText(file), scope);
 }
+export function productionConst(path: string, name: string, scope: Record<string, any>): any {
+  const file = ts.createSourceFile(path, readFileSync(join(process.env.CODEX_ASYNC_REVIEW_SOURCE_ROOT ?? '.', path), 'utf8'), ts.ScriptTarget.Latest, true);
+  for (const statement of file.statements) {
+    if (!ts.isVariableStatement(statement)) continue;
+    const declaration = statement.declarationList.declarations.find(d => d.name.getText(file) === name);
+    if (declaration?.initializer) return evaluate(declaration.initializer.getText(file), scope);
+  }
+  throw new Error(`Missing const ${name}`);
+}
 export function delivery(scope: Record<string, any>): any {
   const path = 'src/daemon.ts';
   const file = ts.createSourceFile(path, readFileSync(join(process.env.CODEX_ASYNC_REVIEW_SOURCE_ROOT ?? '.', path), 'utf8'), ts.ScriptTarget.Latest, true);
