@@ -7,7 +7,6 @@ import {
 import { isRemoteAccessEnabled } from '../global-config.js';
 import { devboxDashboardBaseUrl } from '../platform/devbox-dashboard-export.js';
 import { immersiveWorkbenchHash } from './workbench-shell.js';
-import { issueHostLink } from './host-issued-links.js';
 
 export interface DashboardUrls {
   /**
@@ -56,6 +55,12 @@ export function formatUrlHost(host: string): string {
   return host;
 }
 
+/** Origin of a page this machine serves itself; the Lark local-address
+ * policy recognizes the paths built on it (see core/host-capability-link). */
+export function localHttpOrigin(host: string, port: number | string): string {
+  return `http://${formatUrlHost(String(host))}:${port}`;
+}
+
 /**
  * Builds the dashboard URL(s) for a token.
  *
@@ -77,8 +82,7 @@ export function formatUrlHost(host: string): string {
  * dashboard link being the one place that always stays local.
  */
 export function buildDashboardUrls(opts: { host: string; port: number | string; token?: string }): DashboardUrls {
-  const localOrigin = `http://${formatUrlHost(String(opts.host))}:${opts.port}`;
-  issueHostLink(`${localOrigin}/`);
+  const localOrigin = localHttpOrigin(opts.host, opts.port);
   // Ask for the platform leg separately from the whole precedence chain: the two
   // answers differ exactly in the reverse-proxy / Devbox cases, which is the
   // distinction every token-stripping caller needs (see DashboardUrls.platformHosted).
@@ -158,7 +162,7 @@ export function workbenchSpaUrl(dashboardUrl: string): string | null {
   const u = parseHttpUrl(dashboardUrl);
   if (!u) return null;
   u.hash = immersiveWorkbenchHash(WORKBENCH_HASH_ROUTE);
-  return issueHostLink(u.toString());
+  return u.toString();
 }
 
 /**
@@ -182,7 +186,7 @@ export function workbenchEntryUrl(dashboardUrl: string): string | null {
   if (!u) return null;
   u.pathname = '/workbench';
   u.hash = '';
-  return issueHostLink(u.toString());
+  return u.toString();
 }
 
 /**
@@ -290,8 +294,8 @@ function remotePublicBase(): string | null {
  * URL-encoded.
  */
 export function buildV3RunDetailUrl(runId: string, opts: { host: string; port: number | string }): string {
-  const origin = remotePublicBase() ?? `http://${formatUrlHost(String(opts.host))}:${opts.port}`;
-  return issueHostLink(`${origin}/#/v3/${encodeURIComponent(runId)}`);
+  const origin = remotePublicBase() ?? localHttpOrigin(opts.host, opts.port);
+  return `${origin}/#/v3/${encodeURIComponent(runId)}`;
 }
 
 /**
@@ -313,7 +317,7 @@ export function buildV3TerminalUrl(
   const base = platformCentralTerminalBaseUrl() ?? nonPlatformRemoteBase();
   if (base) return `${base}/s/${encodeURIComponent(sessionId)}/${capability}`;
   if (!opts.webPort || opts.webPort <= 0) return null;
-  return issueHostLink(`http://${formatUrlHost(String(opts.host))}:${opts.webPort}/${capability}`);
+  return `${localHttpOrigin(opts.host, opts.webPort)}/${capability}`;
 }
 
 /**

@@ -153,7 +153,7 @@ import type { CliLaunchMode } from './cli-launch-mode.js';
 import { traeHome } from '../services/traex-paths.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
 import { LocalAddressOutboundError, prepareLocalAddressContent, sanitizeLocalAddressText } from '../im/lark/local-address-policy.js';
-import { admitVettedHostLinks, localAddressContextForBot } from '../im/lark/local-address-context.js';
+import { localAddressContextForBot, replayVettedBody } from '../im/lark/local-address-context.js';
 import { isStuckPageType } from './stuck-page-catalog.js';
 import { stuckCardFallbackText, stuckCardInitiatorOpenId, stuckCardPostErrorMeansUnsent, stuckKeyResultText } from './stuck-warning-card.js';
 
@@ -23140,27 +23140,27 @@ function deliverFinalOutput(
       const transport = handoff.store.freezeTransport(handoff.record.intentId, handoff.record.claim!, {
         content, msgType: msgType ?? 'interactive', providerUuid: opts?.uuid ?? bridgeFinalOutputUuid(ds, msg),
       });
-      admitVettedHostLinks(transport.content, transport.msgType);
       const ledger = new TurnSendLedger(config.session.dataDir);
       return ledger.execute({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: msg.turnId }, 'final',
         JSON.stringify([handoff.record.target, transport.msgType, transport.content]),
-        uuid => withAuditRedaction(transport.content, transport.msgType, body => cb.sessionReply(sessionAnchorId(ds), body, transport.msgType, ds.larkAppId, msg.turnId,
-          { ...opts, uuid, beforeWrite: handoff.control.beforeEffect, replyTarget: handoff.record.target, sourceSessionId: ds.session.sessionId })),
+        uuid => replayVettedBody(transport.content, transport.msgType, () => withAuditRedaction(transport.content, transport.msgType, body => cb.sessionReply(sessionAnchorId(ds), body, transport.msgType, ds.larkAppId, msg.turnId,
+          { ...opts, uuid, beforeWrite: handoff.control.beforeEffect, replyTarget: handoff.record.target, sourceSessionId: ds.session.sessionId }))),
         { fenced: true, providerUuid: transport.providerUuid, reuseExistingFinal: true, beforeDispatch: handoff.control.beforeEffect,
           noSideEffect: error => error instanceof LocalAddressOutboundError || isLarkContentAuditError(error)
             || [LARK_CODE_CARD_CONTENT_REJECTED, LARK_CODE_MESSAGE_CONTENT_TOO_LONG].includes(larkErrorCode(error) ?? -1) },
       ).then(result => { handoff.suppressed = result.replayed; return result.messageId; });
     }
+    let frozen: { content: string; msgType: string } | undefined;
     if (outputControl?.record.sink.kind === 'im' && replyCardModeFor(ds, msg.turnId) === 'legacy') {
       const providerUuid = opts?.uuid ?? outputControl.publicationUuid ?? bridgeFinalOutputUuid(ds, msg);
       const transport = outputControl.freezeTransport(`${msgType ?? 'interactive'}:${providerUuid}:${imageFallback.omitImages ? 'omit-images' : 'images'}`,
         { content, msgType: msgType ?? 'interactive', providerUuid });
-      admitVettedHostLinks(transport.content, transport.msgType);
+      frozen = transport;
       content = transport.content; msgType = transport.msgType;
       opts = { ...opts, uuid: transport.providerUuid };
     }
     const replyMsgType = msgType;
-    return withAuditRedaction(content, replyMsgType, body => cb.sessionReply(
+    const reply = () => withAuditRedaction(content, replyMsgType, body => cb.sessionReply(
       sessionAnchorId(ds),
       body,
       replyMsgType,
@@ -23175,6 +23175,7 @@ function deliverFinalOutput(
         },
         ...(groupContextAuthorOrigin ? { groupContextAuthorOrigin } : {}) },
     ));
+    return frozen ? replayVettedBody(frozen.content, frozen.msgType, reply) : reply();
   };
   setTimeout(async () => {
     if (!isStillOwned()) {

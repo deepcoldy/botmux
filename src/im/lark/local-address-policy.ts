@@ -13,8 +13,8 @@ export interface LocalAddressContext {
   localHosts?: readonly string[];
   internalFileLabel?: string;
   unavailableLinkLabel?: string;
-  /** Capability links the host issued itself (matched by origin and path).
-   * Consulted only for card link fields; prose keeps the text policy. */
+  /** Capability links the host builds for its own pages. Consulted only for
+   * card link fields; prose keeps the text policy. */
   hostIssuedLink?: (url: string) => boolean;
 }
 
@@ -119,6 +119,18 @@ function localServiceUrl(value: string, ctx: Context): boolean {
   } catch { return false; }
 }
 
+// Remote wrappers (Lark's open-in-client link, login redirects) carry their
+// target in the query, path or fragment; a local target makes the link local.
+const NESTED_URL = /[a-z][a-z0-9+.-]*:\/\/[^\s/?#&"'<>\\]+/gi;
+
+function carriesLocalUrl(target: string, ctx: Context): boolean {
+  if (/file:\/\//i.test(target)) return true;
+  for (const [nested] of target.matchAll(NESTED_URL)) {
+    if (localServiceUrl(nested, ctx)) return true;
+  }
+  return false;
+}
+
 function inWorkspace(value: string, ctx: Context): string | undefined {
   const path = posix.normalize(decoded(value).replace(/\\/g, '/').replace(/:\d+(?::\d+)?$/, ''));
   for (const root of ctx.roots) {
@@ -134,9 +146,9 @@ function inWorkspace(value: string, ctx: Context): string | undefined {
 
 function localDestination(value: string, ctx: Context): boolean {
   const target = decoded(value);
-  if (target.startsWith('//')) return localServiceUrl('https:' + target, ctx);
+  if (target.startsWith('//')) return localServiceUrl('https:' + target, ctx) || carriesLocalUrl(target, ctx);
   if (LOCAL_SCHEME.test(target) || ROOT_PATH.test(target) || inWorkspace(target, ctx)) return true;
-  if (/^[a-z][a-z0-9+.-]*:/i.test(target)) return localServiceUrl(target, ctx);
+  if (/^[a-z][a-z0-9+.-]*:/i.test(target)) return localServiceUrl(target, ctx) || carriesLocalUrl(target, ctx);
   // A link needs a remote scheme to be useful in Lark. Relative source text
   // and API paths outside link destinations are left alone.
   return !!target && !target.startsWith('#') && !/^[a-z][a-z0-9+.-]*:/i.test(target);
@@ -258,6 +270,7 @@ function scrubText(input: string, ctx: Context): string {
   for (const span of spans) {
     out += scrubSegment(linked.slice(cursor, span.start));
     out += localServiceUrl(span.originalUrl.startsWith('//') ? 'https:' + span.originalUrl : span.originalUrl, ctx)
+      || carriesLocalUrl(decoded(span.originalUrl), ctx)
       ? ctx.internalFile : span.originalUrl;
     cursor = span.end;
   }
@@ -268,13 +281,33 @@ export function sanitizeLocalAddressText(text: string, context: LocalAddressCont
   return scrubText(text, contextFor(context));
 }
 
+/** Lark's open-in-client link around one page: the terminal sidebar and the
+ * workflow and decision-board entries wrap a host link this way. */
+function larkWebUrlTarget(value: string): string | undefined {
+  let url: URL;
+  try { url = new URL(value); } catch { return undefined; }
+  if (url.protocol !== 'https:' || !/^applink\.(?:feishu\.cn|larksuite\.com)$/.test(url.hostname)
+    || url.pathname !== '/client/web_url/open' || url.username || url.password || url.hash) return undefined;
+  const params = [...url.searchParams];
+  const targets = params.filter(([name]) => name === 'url');
+  if (targets.length !== 1 || params.some(([name, param]) => name !== 'url' && !/^[\w.-]*$/.test(param))) return undefined;
+  return targets[0]![1];
+}
+
+function hostLink(value: string, ctx: Context): boolean {
+  if (!ctx.hostIssuedLink) return false;
+  if (ctx.hostIssuedLink(value)) return true;
+  const target = larkWebUrlTarget(value);
+  return target !== undefined && ctx.hostIssuedLink(target);
+}
+
 function scrubNode(node: unknown, key: string | undefined, ctx: Context): unknown {
   if (typeof node === 'string') {
     if (key && STRUCTURAL_KEYS.has(key)) return node;
     if (key && LINK_KEYS.has(key)) {
       // Without a public external host, Web terminal and Dashboard buttons point
-      // at this machine's own interface; only a link the host issued passes.
-      if (localDestination(node, ctx) && !ctx.hostIssuedLink?.(node)) throw new LocalAddressOutboundError();
+      // at this machine's own interface; only the host's own link shapes pass.
+      if (localDestination(node, ctx) && !hostLink(node, ctx)) throw new LocalAddressOutboundError();
       return node;
     }
     return scrubText(node, ctx);
@@ -296,7 +329,7 @@ export function sanitizeLocalAddressNode<T>(node: T, context: LocalAddressContex
 }
 
 /** Card link fields of a body that point at this machine. A body the host
- * vetted and froze for replay re-admits these instead of being re-judged. */
+ * vetted before persisting it for replay trusts these when it is sent again. */
 export function localJumpTargets(content: string, msgType: string, context: LocalAddressContext = {}): string[] {
   if (msgType !== 'interactive' && msgType !== 'post') return [];
   let parsed: unknown;

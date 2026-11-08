@@ -11,7 +11,6 @@ import { observePublishedGroupMessage } from '../src/services/group-context-runt
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
 import { LocalAddressOutboundError, prepareLocalAddressContent } from '../src/im/lark/local-address-policy.js';
 import { localAddressContextForBot } from '../src/im/lark/local-address-context.js';
-import { issueHostLink, resetHostIssuedLinks } from '../src/core/host-issued-links.js';
 import { writeRoleReplyPrivately } from '../src/core/role-resolver.js';
 import type { CotEntry } from '../src/types.js';
 import { buildTurnReplyCard, replyCardPresentation } from '../src/im/lark/turn-reply-card.js';
@@ -25,7 +24,9 @@ import { PI_TURN_BOUNDARY_CUSTOM_TYPE } from '../src/adapters/cli/pi-turn-bounda
 import { KimiActivityObserver } from '../src/services/kimi-cot.js';
 import { makeKimiSession, toolTurn } from './helpers/kimi-wire-fixture.js';
 
-vi.mock('../src/config.js', () => ({ config: { session: { dataDir: '' } } }));
+vi.mock('../src/config.js', () => ({ config: {
+  session: { dataDir: '' }, web: { externalHost: 'localhost' }, dashboard: { externalHost: 'localhost', port: 7891 },
+} }));
 vi.mock('../src/core/cost-calculator.js', () => ({ getSessionUsageSnapshot: vi.fn(() => ({ context: null, tokens: null })) }));
 vi.mock('../src/im/lark/card-handler.js', () => ({ resolveCardOperatorUnionId: vi.fn() }));
 vi.mock('../src/bot-registry.js', () => ({ getBot: vi.fn(), normalizeUsageDisplay: () => 'off' }));
@@ -176,10 +177,9 @@ describe('reply-card runtime eligibility and recovery', () => {
     },
   );
 
-  describe('host-issued links across processes and restarts', () => {
-    const link = 'http://localhost:40123/workflow/app_main/run-1';
-    const finalCard = JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'done' },
-      { tag: 'button', text: { tag: 'plain_text', content: 'workflow' }, behaviors: [{ type: 'open_url', default_url: link }] }] } });
+  describe('host links across processes and restarts', () => {
+    const card = (link: string) => JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'done' },
+      { tag: 'button', text: { tag: 'plain_text', content: 'open' }, behaviors: [{ type: 'open_url', default_url: link }] }] } });
     const storeIo = () => ({
       render: (record: Parameters<typeof buildTurnReplyCard>[0]) => buildTurnReplyCard(record, { canStop: true }),
       beforeEffect: vi.fn(), isWithdrawn: () => false,
@@ -187,28 +187,31 @@ describe('reply-card runtime eligibility and recovery', () => {
     });
     // The mocked client stands in for Feishu's write boundary, which judges every body.
     beforeEach(() => {
+      vi.stubEnv('HOME', dir);
       vi.mocked(updateMessage).mockImplementation(async (appId: string, _id: string, body: string) => {
         prepareLocalAddressContent(body, 'interactive', localAddressContextForBot(appId));
       });
     });
-    afterEach(() => resetHostIssuedLinks());
+    afterEach(() => { (config.dashboard as any).port = 7891; vi.unstubAllEnvs(); });
 
-    it('startup replays an unacknowledged PATCH whose host-issued link predates the restart', async () => {
+    it('startup replays an unacknowledged PATCH whose Dashboard link was vetted before the Dashboard moved', async () => {
       const ds = session();
       const store = new TurnReplyCardStore(dir);
       const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' };
       await store.prepare(key, { mode: 'unified', chatId: ds.chatId, rootId: ds.session.rootMessageId });
-      issueHostLink(link);
+      const link = 'http://localhost:7891/';
       const io = storeIo();
       await store.update(key, { kind: 'start' }, io);
-      await store.update(key, { kind: 'final', text: 'done', card: finalCard, source: 'explicit' }, io);
+      await store.update(key, { kind: 'final', text: 'done', card: card(link), source: 'explicit' }, io);
       io.patch.mockRejectedValueOnce(new Error('PATCH unavailable'));
       await expect(store.update(key, { kind: 'terminal', phase: 'completed', durationMs: 1 }, io)).rejects.toThrow();
       const record = store.read(key)!;
       expect(record.pendingPatch?.content).toContain(link);
       record.createdAtMs = record.updatedAtMs = 1;
       writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(record));
-      resetHostIssuedLinks();
+      (config.dashboard as any).port = 7892;
+      expect(() => prepareLocalAddressContent(record.pendingPatch!.content, 'interactive', localAddressContextForBot(ds.larkAppId)))
+        .toThrow(LocalAddressOutboundError);
 
       await sweepInterruptedReplyCards(ds.larkAppId);
       expect(updateMessage).toHaveBeenLastCalledWith(ds.larkAppId, 'om_reply', record.pendingPatch!.content,
@@ -216,13 +219,13 @@ describe('reply-card runtime eligibility and recovery', () => {
       expect(store.read(key)?.pendingPatch).toBeUndefined();
     });
 
-    it('re-renders an explicit final card that another process stored with the link it issued', async () => {
+    it('re-renders an explicit final card that a separate `botmux send` process stored with a host link', async () => {
       const ds = session();
       const send = vi.fn(async () => 'om_reply');
       await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
-      // `botmux send` runs in its own process: the link is in its registry, not this daemon's.
+      const link = 'http://localhost:7891/workflow/app_main/run-1';
       const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' };
-      await new TurnReplyCardStore(dir).update(key, { kind: 'final', text: 'done', card: finalCard, source: 'explicit' }, storeIo());
+      await new TurnReplyCardStore(dir).update(key, { kind: 'final', text: 'done', card: card(link), source: 'explicit' }, storeIo());
       vi.mocked(updateMessage).mockClear();
 
       await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase: 'completed' }, send);

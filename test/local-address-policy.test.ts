@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   localJumpTargets, prepareLocalAddressContent, sanitizeLocalAddressNode, sanitizeLocalAddressText,
 } from '../src/im/lark/local-address-policy.js';
-import { isHostIssuedLink, issueHostLink, resetHostIssuedLinks } from '../src/core/host-issued-links.js';
+import { isHostCapabilityLink } from '../src/core/host-capability-link.js';
 
 describe('local address presentation policy', () => {
   it.each([
@@ -94,33 +94,67 @@ describe('local address presentation policy', () => {
     expect(sanitizeLocalAddressText(`http://${name}:3000/report`, context)).not.toContain(`${name}:3000`);
   });
 
-  it('lets a card link through only for the exact origin and path the host issued', () => {
-    resetHostIssuedLinks();
-    try {
-      issueHostLink('http://10.20.30.40:7891/plugin-result-access/abc');
-      const context = { localHosts: ['10.20.30.40'], hostIssuedLink: isHostIssuedLink };
-      const issued = { behaviors: [{ type: 'open_url', android_url: 'http://10.20.30.40:7891/plugin-result-access/abc' }] };
-      expect(sanitizeLocalAddressNode(issued, context)).toEqual(issued);
-      // Query and fragment carry the capability and client route, not the destination.
-      expect(sanitizeLocalAddressNode({ url: 'http://10.20.30.40:7891/plugin-result-access/abc?t=2#x' }, context))
-        .toEqual({ url: 'http://10.20.30.40:7891/plugin-result-access/abc?t=2#x' });
-      for (const url of ['http://10.20.30.40:7891/api/sessions', 'http://10.20.30.40:7891/plugin-result-access/abd',
-        'http://10.20.30.40:7891/', 'http://10.20.30.40:3000/plugin-result-access/abc',
-        'http://alice@10.20.30.40:7891/plugin-result-access/abc', 'file:///tmp/report.md', 'http://127.0.0.1:7891/']) {
-        expect(() => sanitizeLocalAddressNode({ url }, context)).toThrowError(
-          expect.objectContaining({ code: 'LOCAL_ADDRESS_OUTBOUND_REJECTED' }));
+  describe('host capability links', () => {
+    const scope = { hosts: ['10.20.30.40'], dashboardPorts: ['7891'] };
+    const context = { localHosts: ['10.20.30.40'], hostIssuedLink: (url: string) => isHostCapabilityLink(url, scope) };
+    const cap = 'view_Token-abcdefghijklmnopqrstuvwxyz012345';
+    const sid = '3f2b6c1e-8d4a-4f6b-9c2d-1a2b3c4d5e6f';
+    const wrap = (url: string) => 'https://applink.feishu.cn/client/web_url/open?'
+      + new URLSearchParams({ mode: 'sidebar-semi', width: '800', url }).toString();
+    const rejected = expect.objectContaining({ code: 'LOCAL_ADDRESS_OUTBOUND_REJECTED' });
+
+    it.each([
+      `http://10.20.30.40:8800/s/${sid}`, `http://10.20.30.40:8800/s/${sid}?viewToken=${cap}`,
+      `http://10.20.30.40:45678/?viewToken=${cap}`, 'http://10.20.30.40:45678/?token=0123456789abcdef0123456789abcdef',
+      'http://10.20.30.40:7891/', `http://10.20.30.40:7891/?t=${cap}`, 'http://10.20.30.40:7891/#/v3/run-1',
+      'http://10.20.30.40:7891/#/workflows/run-1', `http://10.20.30.40:7891/#/sessions?session=${sid}`,
+      `http://10.20.30.40:7891/?t=${cap}#/agent-workbench?botmuxWorkbenchShell=immersive`,
+      `http://10.20.30.40:7891/workbench?t=${cap}`, `http://10.20.30.40:7891/plugin-result-access/${cap}`,
+      'http://10.20.30.40:7891/board/cli_a1/12', 'http://10.20.30.40:7891/workflow/cli_a1/run-1',
+      wrap(`http://10.20.30.40:8800/s/${sid}?viewToken=${cap}`),
+      'https://applink.larksuite.com/client/web_url/open?mode=appCenter&url=' + encodeURIComponent('http://10.20.30.40:7891/board/cli_a1/12'),
+    ])('sends the host link shape %s', url => {
+      expect(() => sanitizeLocalAddressNode({ url }, { localHosts: scope.hosts })).toThrowError(rejected);
+      expect(sanitizeLocalAddressNode({ url }, context)).toEqual({ url });
+    });
+
+    it.each([
+      'http://10.20.30.40:3000/', 'http://10.20.30.40:45678/', 'http://10.20.30.40:45678/anything',
+      'http://10.20.30.40:45678/?viewToken=GUESS', `http://10.20.30.40:45678/?viewToken=${cap}&next=x`,
+      'http://10.20.30.40:8800/s/victim?token=x', `http://10.20.30.40:8800/s/${sid}/../../etc`,
+      `http://10.20.30.40:8800/s/${sid}#/x`, 'http://10.20.30.40:3000/#/v3/run-1',
+      'http://10.20.30.40:7891/?t=GUESSED', 'http://10.20.30.40:7891/#/settings', 'http://10.20.30.40:7891/admin',
+      'http://10.20.30.40:7891/__daemon/shutdown', 'http://10.20.30.40:7891/plugin-result-access/short',
+      `http://10.20.30.40:7891/plugin-result-access/${cap}?t=${cap}`, `http://10.20.30.40:7891/?t=${cap}&x=1`,
+      'http://alice@10.20.30.40:7891/', 'https://10.20.30.40:7891/', 'http://127.0.0.1:7891/', 'file:///tmp/report.md',
+      wrap('http://10.20.30.40:5173/'), wrap('http://10.20.30.40:7891/') + '&next=' + encodeURIComponent('http://10.20.30.40:3000/'),
+      wrap('http://10.20.30.40:7891/') + '&url=x', wrap(wrap('http://10.20.30.40:7891/')),
+      'https://example.com/login?next=' + encodeURIComponent('http://10.20.30.40:3000/'),
+      'https://example.com/r/' + encodeURIComponent(encodeURIComponent('http://10.20.30.40:3000/x')),
+    ])('rejects %s', url => {
+      expect(() => sanitizeLocalAddressNode({ url }, context)).toThrowError(rejected);
+    });
+
+    it('scrubs local pages nested in a remote link from prose, host link or not', () => {
+      for (const url of [wrap(`http://10.20.30.40:8800/s/${sid}?viewToken=${cap}`),
+        'https://example.com/login?next=' + encodeURIComponent('http://10.20.30.40:3000/')]) {
+        expect(sanitizeLocalAddressText(`[打开](${url}) 或 ${url}`, context)).not.toContain('10.20.30.40');
       }
-      expect(sanitizeLocalAddressText('[入口](http://10.20.30.40:7891/plugin-result-access/abc)', context)).not.toContain('10.20.30.40');
-    } finally { resetHostIssuedLinks(); }
+      const remote = 'https://example.com/login?next=' + encodeURIComponent('https://docs.example.com/a');
+      expect(sanitizeLocalAddressText(`[登录](${remote}) ${remote}`, context)).toBe(`[登录](${remote}) ${remote}`);
+      expect(sanitizeLocalAddressNode({ url: remote }, context)).toEqual({ url: remote });
+    });
   });
 
   it('lists only the local jump targets of a card body', () => {
+    const wrapped = 'https://applink.feishu.cn/client/web_url/open?url=' + encodeURIComponent('http://10.20.30.40:7891/s/b');
     const body = JSON.stringify({ body: { elements: [
       { tag: 'button', multi_url: { url: 'https://applink.feishu.cn/x', android_url: 'http://10.20.30.40:7891/s/a' } },
+      { tag: 'button', url: wrapped },
       { tag: 'button', behaviors: [{ type: 'callback', value: { url: 'http://10.20.30.40:7891/opaque' } }] },
       { tag: 'markdown', content: '[x](http://10.20.30.40:7891/text)' },
     ] } });
-    expect(localJumpTargets(body, 'interactive', { localHosts: ['10.20.30.40'] })).toEqual(['http://10.20.30.40:7891/s/a']);
+    expect(localJumpTargets(body, 'interactive', { localHosts: ['10.20.30.40'] })).toEqual(['http://10.20.30.40:7891/s/a', wrapped]);
     expect(localJumpTargets(body, 'text', { localHosts: ['10.20.30.40'] })).toEqual([]);
   });
 

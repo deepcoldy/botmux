@@ -17,7 +17,6 @@
 import type { Locale } from '../../i18n/index.js';
 import { sidebarAppLink } from '../../core/decision-board/model.js';
 import { workflowSidebarEntryPath } from '../../core/workflow-sidebar-link.js';
-import { issueHostLink } from '../../core/host-issued-links.js';
 import type { Brand } from './lark-hosts.js';
 import { buildReplyCardChromeRow, REPLY_CARD_ACTIONS_ELEMENT_ID } from './reply-card-actions.js';
 import { workflowNodeMarkerActive } from '../../core/workflow-node-session.js';
@@ -59,8 +58,8 @@ export function workflowSidebarEntryLink(input: {
     return undefined;
   }
   const locale = input.locale ? { locale: input.locale } : {};
-  if (!input.sidebar) return { url: issueHostLink(`${origin}/#/workflows/${input.runId}`), ...locale };
-  const url = issueHostLink(`${origin}${path}`);
+  if (!input.sidebar) return { url: `${origin}/#/workflows/${input.runId}`, ...locale };
+  const url = `${origin}${path}`;
   return { url, appLink: sidebarAppLink(url, input.brand), ...locale };
 }
 

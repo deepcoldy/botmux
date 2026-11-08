@@ -11,7 +11,7 @@ import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { resolvePricingConfig } from '../services/model-pricing.js';
 import { localeForBot, t as tr } from '../i18n/index.js';
 import { LocalAddressOutboundError, prepareLocalAddressContent, sanitizeLocalAddressText } from '../im/lark/local-address-policy.js';
-import { admitVettedHostLinks, localAddressContextForBot } from '../im/lark/local-address-context.js';
+import { localAddressContextForBot, replayVettedBody } from '../im/lark/local-address-context.js';
 import { isLarkContentAuditError } from '../im/lark/content-audit.js';
 import { sendWithContentAuditRedaction } from '../im/lark/content-audit-redaction.js';
 import { logger } from '../utils/logger.js';
@@ -186,9 +186,6 @@ export async function updateTurnReplyCard(
     isWithdrawn: error => error instanceof MessageWithdrawnError,
     forceVisible: options.forceVisible || ds.cotForced,
     render: (record: import('../services/turn-reply-card.js').TurnReplyCardRecord) => {
-      // A stored final card was vetted by the process that wrote it (`botmux
-      // send`, or this daemon before a restart), whose registry is not this one.
-      if (record.finalCard) admitVettedHostLinks(record.finalCard, 'interactive');
       const cfg = getBot(ds.larkAppId).config;
       const presentation = replyCardPresentation(cfg, ds.chatId);
       return prepareLocalAddressContent(buildTurnReplyCard(record, {
@@ -342,12 +339,9 @@ async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: im
   await store.update(record, { kind: 'recover', beforeMs, orphanAskIds }, {
     beforeEffect,
     send: async () => { throw new Error('Recovery may only update an existing reply card'); },
-    patch: (id, card) => {
-      // The persisted pendingPatch and finalCard were vetted before this restart.
-      admitVettedHostLinks(card, 'interactive');
-      return patchReplyCardWithAuditRedaction(record.larkAppId, card, `recover turn=${record.turnId.substring(0, 8)}`,
-        body => patchPublishedGroupCard(record.larkAppId, record.chatId, id, body, record.rootId));
-    },
+    // The persisted pendingPatch was vetted before this restart.
+    patch: (id, card) => replayVettedBody(card, 'interactive', () => patchReplyCardWithAuditRedaction(record.larkAppId, card,
+      `recover turn=${record.turnId.substring(0, 8)}`, body => patchPublishedGroupCard(record.larkAppId, record.chatId, id, body, record.rootId))),
     sendOverflow: async (text, uuid) => {
       const file = join(store.directory, `${store.id(record)}-reply.md`);
       atomicWriteFileSync(file, text, { mode: 0o600, followTargetSymlink: false });

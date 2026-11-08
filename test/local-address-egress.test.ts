@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class { constructor(public opts: Record<string, unknown>) {} },
@@ -18,8 +18,9 @@ import { outputSnapshot } from '../src/services/universal-output-handoff.js';
 import { sanitizeLocalAddressNode } from '../src/im/lark/local-address-policy.js';
 import { buildTerminalUrl, resetTerminalProxy } from '../src/core/terminal-url.js';
 import { resolvePluginResultAccessUrl } from '../src/core/plugin-result-access-url.js';
-import { resetHostIssuedLinks } from '../src/core/host-issued-links.js';
-import { buildDashboardUrls, workbenchEntryUrl } from '../src/core/dashboard-url.js';
+import { buildDashboardUrls, localHttpOrigin, workbenchEntryUrl, workbenchSpaUrl } from '../src/core/dashboard-url.js';
+import { config } from '../src/config.js';
+import { globalConfigPath, mergeDashboardConfig } from '../src/global-config.js';
 import { resolveDashboardOrigin } from '../src/core/workbench-link.js';
 import { resolveWorkflowEntryLink } from '../src/core/workflow-entry-link.js';
 import { DecisionBoardService } from '../src/core/decision-board/service.js';
@@ -30,7 +31,7 @@ import { buildV3BlockedCard } from '../src/im/lark/v3-blocked-card.js';
 import { buildSessionsDetailCard, buildSessionTerminalUrl } from '../src/im/lark/sessions-card.js';
 import { composeDetail } from '../src/dashboard/session-card-model.js';
 import type { SessionRow } from '../src/core/dashboard-rows.js';
-import { buildStreamingCard } from '../src/im/lark/card-builder.js';
+import { buildStreamingCard, terminalMultiUrl } from '../src/im/lark/card-builder.js';
 import { buildTrustedResultDeliveryCard } from '../src/im/lark/trusted-result-delivery-card.js';
 import { flushFakeTimers } from './helpers/flush-fake-timers.js';
 
@@ -178,20 +179,26 @@ describe('local addresses at the real Lark SDK write boundary', () => {
 
 // No public external host configured: getLocalIp() is the advertised host, so
 // the host's own capability links point at this machine's interface.
-describe('host-issued capability links in a default LAN deployment', () => {
+describe('host capability links in a default LAN deployment', () => {
   let home: string;
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'botmux-lan-links-'));
     vi.stubEnv('HOME', home);
+    mkdirSync(dirname(globalConfigPath()), { recursive: true });
   });
   afterEach(() => {
-    resetHostIssuedLinks(); resetTerminalProxy(); vi.unstubAllEnvs();
+    resetTerminalProxy(); vi.unstubAllEnvs();
     rmSync(home, { recursive: true, force: true });
   });
-  const terminal = () => buildTerminalUrl({
-    session: { sessionId: 'sid-lan' }, workerPort: 9999, workerToken: 'write-token', workerViewToken: 'view-token',
+  const writeToken = '0123456789abcdef0123456789abcdef';
+  const viewToken = 'view_Token-abcdefghijklmnopqrstuvwxyz012345';
+  const terminal = (workerPort = 45678) => buildTerminalUrl({
+    session: { sessionId: 'sid-lan' }, workerPort, workerToken: writeToken, workerViewToken: viewToken,
   });
+  const webOrigin = (port: number | string) => localHttpOrigin(config.web.externalHost, port);
+  const dashboardOrigin = () => localHttpOrigin(config.dashboard.externalHost, config.dashboard.port);
   const linkCard = (url: string) => JSON.stringify({ body: { elements: [{ tag: 'button', url }] } });
+  const multiCard = (multi_url: Record<string, string>) => JSON.stringify({ body: { elements: [{ tag: 'button', multi_url }] } });
   const rejected = { code: 'LOCAL_ADDRESS_OUTBOUND_REJECTED' };
 
   it('sends the Web terminal button the host built for a direct-port worker', async () => {
@@ -202,6 +209,26 @@ describe('host-issued capability links in a default LAN deployment', () => {
     await sendMessage(app, 'oc_chat', streaming, 'interactive');
     expect(writes).toHaveLength(1);
     expect(writes[0].data.content).toContain(terminalUrl);
+  });
+
+  it('sends the terminal button wrapped for the Feishu sidebar, judging the page inside the wrapper', async () => {
+    const { app, writes } = capture();
+    mergeDashboardConfig({ openTerminalInFeishu: true });
+    const terminalUrl = terminal();
+    const multi = terminalMultiUrl(terminalUrl);
+    expect(multi.url.startsWith('https://applink.feishu.cn/client/web_url/open?')).toBe(true);
+    expect(multi.android_url).toBe(terminalUrl);
+    expect(() => sanitizeLocalAddressNode({ url: multi.url })).toThrow();
+    await sendMessage(app, 'oc_chat', buildStreamingCard('sid-lan', 'om_root', terminalUrl, 'title', 'screen', 'working'), 'interactive');
+    await sendMessage(app, 'oc_chat', multiCard({ url: multi.url, pc_url: multi.pc_url }), 'interactive');
+    expect(writes).toHaveLength(2);
+    expect(writes[0].data.content).toContain(JSON.stringify(multi.url).slice(1, -1));
+    const devServer = terminalMultiUrl(`${webOrigin(5173)}/`);
+    await expect(sendMessage(app, 'oc_chat', multiCard({ url: devServer.url, pc_url: devServer.pc_url }), 'interactive'))
+      .rejects.toMatchObject(rejected);
+    await sendMessage(app, 'oc_chat', `[打开](${devServer.url}) 或 ${devServer.url}`);
+    expect(writes).toHaveLength(3);
+    expect(JSON.parse(writes[2].data.content).text).not.toContain('5173');
   });
 
   it('sends the trusted plugin result card on the dashboard origin', async () => {
@@ -220,7 +247,7 @@ describe('host-issued capability links in a default LAN deployment', () => {
     ['progress', () => buildV3ProgressCard({ runId: 'lan-run-1', status: 'running', source: { kind: 'ad_hoc' },
       counts: { total: 1, done: 0, running: 1, waiting: 0, blocked: 0, failed: 0, skipped: 0, cancelled: 0, pending: 0 },
       currentNodeIds: ['n1'], waitingNodeIds: [], loops: [], revisit: { count: 0, refreshedNodeIds: [] }, updatedAt: '2026-07-11T12:34:56.000Z',
-      terminal: { sessionId: 'sid-v3', webPort: 8765, viewToken: 'v3-view' } } as any)],
+      terminal: { sessionId: 'sid-v3', webPort: 8765, viewToken } } as any)],
     ['gate', () => buildV3GateCard({ runId: 'lan-run-1', waitId: 'w1', nodeId: 'review', prompt: 'approve?' })],
     ['blocked', () => buildV3BlockedCard({ runId: 'lan-run-1', nodeId: 'n1', attemptId: 'a1', message: 'stuck' })],
   ] as const)('sends the v3 %s card with its run links', async (kind, build) => {
@@ -228,14 +255,14 @@ describe('host-issued capability links in a default LAN deployment', () => {
     const body = build();
     const links = [...body.matchAll(/"(?:url|android_url)":"(http:[^"]+)"/g)].map(match => match[1]!);
     expect(links.some(url => url.endsWith('/#/v3/lan-run-1'))).toBe(true);
-    if (kind === 'progress') expect(links.some(url => url.endsWith(':8765/?viewToken=v3-view'))).toBe(true);
+    if (kind === 'progress') expect(links.some(url => url.endsWith(`:8765/?viewToken=${viewToken}`))).toBe(true);
     for (const url of links) expect(() => sanitizeLocalAddressNode({ url })).toThrow();
     await sendMessage(app, 'oc_chat', body, 'interactive');
     expect(writes).toHaveLength(1);
     for (const url of links) expect(writes[0].data.content).toContain(url);
   });
 
-  it('sends session detail cards for a proxy session of another bot and a direct-port session', async () => {
+  it('sends session detail cards, leaving out only a direct-port link that carries no capability', async () => {
     const { app, writes } = capture();
     const rows = [
       { sessionId: 'sid-other-bot', larkAppId: 'cli_other_bot', proxyPort: 8801, webPort: 40001 },
@@ -243,16 +270,18 @@ describe('host-issued capability links in a default LAN deployment', () => {
     ].map(over => ({ rootMessageId: 'om_root', chatId: 'oc_chat', chatType: 'group', title: 't', cliId: 'claude-code',
       workingDir: '~/work', status: 'idle', lastMessageAt: 1, cliVersion: 'unknown', scope: 'thread', spawnedAt: 0,
       isOncall: false, hasHistory: true, ...over }) as SessionRow);
+    const proxyUrl = buildSessionTerminalUrl(rows[0]!)!;
+    expect(proxyUrl).toBe(`${webOrigin(8801)}/s/sid-other-bot`);
+    expect(() => sanitizeLocalAddressNode({ url: proxyUrl })).toThrow();
+    expect(buildSessionTerminalUrl(rows[1]!)).toBeNull();
     for (const row of rows) {
-      const terminalUrl = buildSessionTerminalUrl(row)!;
-      expect(() => sanitizeLocalAddressNode({ url: terminalUrl })).toThrow();
       await sendMessage(app, 'oc_chat', buildSessionsDetailCard(composeDetail(row, 2), {
-        invokerOpenId: 'ou_owner', locale: 'zh', nowMs: 2, scope: 'global', terminalUrl,
+        invokerOpenId: 'ou_owner', locale: 'zh', nowMs: 2, scope: 'global', terminalUrl: buildSessionTerminalUrl(row),
       }), 'interactive');
     }
     expect(writes).toHaveLength(2);
     expect(writes[0].data.content).toContain(':8801/s/sid-other-bot');
-    expect(writes[1].data.content).toContain(':40002');
+    expect(writes[1].data.content).not.toContain(':40002');
   });
 
   it('sends dashboard, workbench, workflow entry and decision-board item links', async () => {
@@ -261,29 +290,47 @@ describe('host-issued capability links in a default LAN deployment', () => {
       { h5LoginAvailable: () => true })!;
     const board = new DecisionBoardService({ dataDir: home, larkAppId: () => 'cli_board', brand: () => 'feishu',
       dashboardOrigin: () => resolveDashboardOrigin() } as any).itemLinks(3);
-    const dashboard = buildDashboardUrls({ host: new URL(entry.url).hostname, port: new URL(entry.url).port, token: 'dash-credential' }).url;
-    const workbench = workbenchEntryUrl(dashboard)!;
-    const links = [dashboard, workbench, entry.url, board.url!];
+    const dashboard = buildDashboardUrls({ host: config.dashboard.externalHost, port: config.dashboard.port,
+      token: 'dash_credential_abcdefghijklmnopqrstuvwxyz' }).url;
+    const links = [dashboard, workbenchEntryUrl(dashboard)!, workbenchSpaUrl(dashboard)!, entry.url, board.url!,
+      buildDashboardUrls({ host: config.dashboard.externalHost, port: config.dashboard.port }).url];
     for (const url of links) expect(() => sanitizeLocalAddressNode({ url })).toThrow();
     await sendMessage(app, 'oc_chat', JSON.stringify({ body: { elements: [buildWorkflowSidebarEntryButton(entry),
       { tag: 'button', multi_url: { url: board.appLink, android_url: board.url, ios_url: board.url } },
-      { tag: 'button', url: workbench }, { tag: 'button', url: dashboard }] } }), 'interactive');
+      ...links.map(url => ({ tag: 'button', url }))] } }), 'interactive');
     expect(writes).toHaveLength(1);
     for (const url of links) expect(writes[0].data.content).toContain(url);
   });
 
-  it('rejects paths and ports the host never issued, even on an origin it did', async () => {
+  it('sends a host link no builder in this process produced, as a separate `botmux send` process would', async () => {
     const { app, writes } = capture();
-    const terminalUrl = terminal();
-    const accessUrl = resolvePluginResultAccessUrl('view_token_abcdefghijklmnopqrstuvwxyz')!;
-    const { host, hostname } = new URL(terminalUrl);
-    const devServer = terminalUrl.replace(host, hostname.includes(':') ? `[${hostname}]:3000` : `${hostname}:3000`);
-    const dashboard = new URL(accessUrl).origin;
-    for (const url of [devServer, terminalUrl.replace('://', '://alice@'), `${new URL(terminalUrl).origin}/api/write`,
-      `${dashboard}/api/sessions`, `${dashboard}/plugin-result-access/view_token_someone_else_entirely`]) {
-      await expect(sendMessage(app, 'oc_chat', linkCard(url), 'interactive')).rejects.toMatchObject(rejected);
+    const links = [`${dashboardOrigin()}/#/v3/run-from-cli`, `${webOrigin(8800)}/s/sid-from-cli?viewToken=${viewToken}`];
+    await sendMessage(app, 'oc_chat', JSON.stringify({ body: { elements: links.map(url => ({ tag: 'button', url })) } }), 'interactive');
+    expect(writes).toHaveLength(1);
+  });
+
+  it('keeps sending Dashboard links after thousands of worker terminal links', async () => {
+    const { app, writes } = capture();
+    for (let port = 40000; port < 45000; port++) terminal(port);
+    await sendMessage(app, 'oc_chat', linkCard(`${dashboardOrigin()}/`), 'interactive');
+    expect(writes).toHaveLength(1);
+  });
+
+  it('rejects other paths, routes, parameters and ports on the hosts the links use', async () => {
+    const { app, writes } = capture();
+    const dashboard = dashboardOrigin();
+    for (const url of [
+      `${webOrigin(3000)}/`, `${webOrigin(5173)}/src/main.ts`, `${webOrigin(45678)}/`, `${webOrigin(45678)}/anything`,
+      `${webOrigin(45678)}/?viewToken=GUESS`, `${webOrigin(45678)}/?viewToken=${viewToken}&next=x`,
+      `${webOrigin(8800)}/s/victim?token=x`, `${webOrigin(3000)}/#/v3/run-1`, terminal().replace('://', '://alice@'),
+      `${dashboard}/api/sessions`, `${dashboard}/admin`, `${dashboard}/?t=GUESSED`, `${dashboard}/#/settings`,
+      `${dashboard}/plugin-result-access/short`, `${dashboard}/__daemon/shutdown`,
+      `https://example.com/login?next=${encodeURIComponent(`${webOrigin(3000)}/`)}`,
+    ]) {
+      await expect(sendMessage(app, 'oc_chat', linkCard(url), 'interactive'), url).rejects.toMatchObject(rejected);
     }
     expect(writes).toHaveLength(0);
+    const terminalUrl = terminal();
     await sendMessage(app, 'oc_chat', '终端在 ' + terminalUrl);
     expect(JSON.parse(writes[0].data.content).text).not.toContain(terminalUrl);
   });

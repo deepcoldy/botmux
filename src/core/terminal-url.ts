@@ -1,12 +1,11 @@
 import { config } from '../config.js';
-import { formatUrlHost } from './dashboard-url.js';
+import { localHttpOrigin } from './dashboard-url.js';
 import { dashboardSecretPath } from './dashboard-secret.js';
 import { deriveTerminalCardViewToken } from './terminal-write-auth.js';
 import { loadDashboardSecret } from '../dashboard/auth.js';
 import { platformTerminalBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
 import { isRemoteAccessEnabled } from '../global-config.js';
 import { devboxDashboardBaseUrl } from '../platform/devbox-dashboard-export.js';
-import { issueHostLink } from './host-issued-links.js';
 
 /**
  * Builds the public URL for a session's web terminal. When the per-daemon
@@ -172,9 +171,8 @@ export function buildTerminalUrl(
     }
   }
   const base = proxyReady
-    ? `http://${formatUrlHost(config.web.externalHost)}:${getTerminalAdvertisedPort()}/s/${ds.session.sessionId}`
-    : `http://${formatUrlHost(config.web.externalHost)}:${ds.workerPort ?? ds.session.webPort}`;
-  issueHostLink(base);
+    ? `${localHttpOrigin(config.web.externalHost, getTerminalAdvertisedPort())}/s/${ds.session.sessionId}`
+    : localHttpOrigin(config.web.externalHost, String(ds.workerPort ?? ds.session.webPort));
   return opts.write
     ? withCapability(base, 'token', ds.workerToken)
     : withCapability(base, 'viewToken', readToken);
