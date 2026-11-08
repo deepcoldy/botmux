@@ -516,7 +516,7 @@ import {
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
 import { createProductionDraftLaunchDeps, createProductionWorkflowDraftService, installWorkflowDraftService } from './core/workflow-draft-daemon.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setCardClickTurnPoster, setPromptSubmittedObserver, productionWorkflowDraftClarifier, productionWorkflowDraftSessionBinder, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setCardClickTurnPoster, productionWorkflowDraftClarifier, productionWorkflowDraftSessionBinder, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -7163,7 +7163,6 @@ const workflowMainWake = createWorkflowMainWake({
     const ds = findActiveBySessionId(sessionId);
     return !!ds && workflowMainWakeAcceptanceReported(ds, getBot(ds.larkAppId).config.cliId, promptHookRunsInCli);
   },
-  inputWritten: (sessionId, turnId) => findActiveBySessionId(sessionId)?.replyExecutionStarts?.has(JSON.stringify([turnId, null])) === true,
   deliver: (request, internal) => triggerSessionTurn(request, { larkAppId: workflowSelfAppId(), activeSessions }, internal),
   drive: (runId) => v3GateRunner.driveDetached(runId),
   listRunIds: () => {
@@ -7175,7 +7174,6 @@ const workflowMainWake = createWorkflowMainWake({
   },
   warn: (message) => logger.warn(message),
 });
-setPromptSubmittedObserver((sessionId) => workflowMainWake.onPromptSubmitted(sessionId));
 
 /** The directory a main-topic node the main bot runs itself would meet: its
  *  main session's, found by the same lookup the node's delivery makes (the
@@ -33132,7 +33130,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // Cover the frozen background now so an in-flight follow-up, a worker
       // replacement or a daemon restart before the terminal cannot repeat it.
       if (ds.session.workerGeneration !== context.workerGeneration) return;
-      workflowMainWake.onInputAccepted(ds.session.sessionId, receipt.turnId);
       const knownNative = ds.session.cliSessionId;
       // A receipt naming a different established native conversation is not
       // this session's evidence; a provisional first turn may learn its id here.
@@ -33140,6 +33137,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         logger.warn(`[group-context] native input receipt names another conversation; background may repeat turn=${receipt.turnId.slice(0, 12)}`);
         return;
       }
+      workflowMainWake.onInputAccepted(ds.session.sessionId, receipt.turnId);
       try {
         const restored = ds.session.deploymentContinuation;
         const authority = deploymentContinuationAuthority(ds);
@@ -33170,6 +33168,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           workerGeneration: context.workerGeneration },
         { kind: receipt.proofKind, ...(receipt.nativeTurnId ? { nativeTurnId: receipt.nativeTurnId } : {}) });
       } catch { logger.warn('[group-context] native input receipt unavailable; background may repeat'); }
+    },
+    onPromptSubmittedInput(ds, turnId, context) {
+      if (ds.session.workerGeneration !== context.workerGeneration) return;
+      workflowMainWake.onInputAccepted(ds.session.sessionId, turnId);
     },
     async onTurnTerminal(ds, terminal, context) {
       workflowMainWake.onTurnEnded(ds.session.sessionId, terminal.turnId);

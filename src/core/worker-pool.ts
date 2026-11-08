@@ -1248,6 +1248,13 @@ export interface WorkerPoolCallbacks {
     receipt: Extract<WorkerToDaemon, { type: 'native_input_consumed' }>,
     context: { workerGeneration: number },
   ) => void;
+  /** The live worker generation matched what the CLI's prompt hook submitted
+   * to the text it wrote for this turn. Fenced to the current generation. */
+  onPromptSubmittedInput?: (
+    ds: DaemonSession,
+    turnId: string,
+    context: { workerGeneration: number },
+  ) => void;
   /** Provider submission proof for one durable-primary Lark Inbox turn. */
   onTurnInputCommitted?: (
     ds: DaemonSession,
@@ -18107,6 +18114,22 @@ function setupWorkerHandlers(
           cb.onNativeInputConsumed?.(ds, msg, { workerGeneration });
         } catch (err) {
           logger.warn(`[${t}] native input receipt handler failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        break;
+      }
+      case 'prompt_submitted_input': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored prompt_submitted_input from stale worker generation`);
+          break;
+        }
+        try {
+          cb.onPromptSubmittedInput?.(ds, msg.turnId, { workerGeneration });
+        } catch (err) {
+          logger.warn(`[${t}] prompt submission handler failed: ${err instanceof Error ? err.message : String(err)}`);
         }
         break;
       }

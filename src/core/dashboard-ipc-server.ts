@@ -2509,14 +2509,6 @@ ipcRoute('POST', '/api/sessions/:sessionId/turns/:triggerId/interrupt', async (_
   });
 });
 
-let promptSubmittedObserver: ((sessionId: string) => void) | null = null;
-
-/** Daemon injects who hears that a session's CLI submitted its input box
- *  (an authenticated UserPromptSubmit hook claim). */
-export function setPromptSubmittedObserver(observer: ((sessionId: string) => void) | null): void {
-  promptSubmittedObserver = observer;
-}
-
 /**
  * Host-side atomic claim/pop for the UserPromptSubmit hook（#794 方向 B）。
  *
@@ -2547,24 +2539,21 @@ ipcRoute('POST', '/api/sessions/:sessionId/prompt-ctx/claim', async (req, res, p
   if (!/^[a-f0-9]{64}$/.test(fingerprint)) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_fingerprint' });
   }
+  const prefix = typeof body?.prefix === 'string' && body.prefix.length > 0
+    ? body.prefix.slice(0, 64)
+    : undefined;
   const w = ds?.worker;
   if (ds?.session.status === 'active' && w && !w.killed && w.connected !== false) {
     try {
-      w.send({ type: 'prompt_submitted' } satisfies DaemonToWorker, () => {
+      w.send({ type: 'prompt_submitted', fingerprint, ...(prefix ? { prefix } : {}) } satisfies DaemonToWorker, () => {
         /* best-effort notification: callback suppresses unhandled 'error' event on dead IPC */
       });
     } catch { /* IPC gone */ }
-  }
-  if (ds?.session.status === 'active') {
-    try { promptSubmittedObserver?.(params.sessionId); } catch { /* never fails the claim */ }
   }
   // 权威 turnId：daemon 当前这轮的 turnId（worker 发布的 managed_turn_origin）。
   // hook 不需要、也不应自己提供 turnId——daemon 只认自己的权威值，避免 FIFO 串轮。
   const turnId = ds?.managedTurnOrigin?.turnId;
   if (!turnId) return jsonRes(res, 404, { ok: false, error: 'no_active_turn' });
-  const prefix = typeof body?.prefix === 'string' && body.prefix.length > 0
-    ? body.prefix.slice(0, 64)
-    : undefined;
   const envelope = claimPromptContext(params.sessionId, turnId, fingerprint, prefix);
   if (!envelope) return jsonRes(res, 404, { ok: false, error: 'not_found' });
   jsonRes(res, 200, { ok: true, envelope });

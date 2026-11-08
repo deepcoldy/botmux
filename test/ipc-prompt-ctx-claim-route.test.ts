@@ -11,7 +11,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   setIpcAuthSecret,
-  setPromptSubmittedObserver,
   startIpcServer,
   type IpcServerHandle,
 } from '../src/core/dashboard-ipc-server.js';
@@ -32,7 +31,6 @@ afterEach(async () => {
   if (handle) await handle.close();
   handle = null;
   setIpcAuthSecret(null);
-  setPromptSubmittedObserver(null);
   vi.restoreAllMocks();
   claimMock.mockReset();
 });
@@ -206,7 +204,7 @@ describe('POST /api/sessions/:sessionId/prompt-ctx/claim', () => {
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ ok: false, error: 'no_active_turn' });
     // Worker is notified with a callback to suppress asynchronous child error events
-    expect(workerSend).toHaveBeenCalledWith({ type: 'prompt_submitted' }, expect.any(Function));
+    expect(workerSend).toHaveBeenCalledWith({ type: 'prompt_submitted', fingerprint: 'a'.repeat(64), prefix: 'some-prefix' }, expect.any(Function));
   });
 
   it('notifies worker with prompt_submitted on active turn', async () => {
@@ -217,7 +215,14 @@ describe('POST /api/sessions/:sessionId/prompt-ctx/claim', () => {
     const res = await postClaim('s-active-turn', VALID_BODY, { auth: 'signed' });
 
     expect(res.status).toBe(200);
-    expect(workerSend).toHaveBeenCalledWith({ type: 'prompt_submitted' }, expect.any(Function));
+    expect(workerSend).toHaveBeenCalledWith({ type: 'prompt_submitted', fingerprint: 'a'.repeat(64), prefix: 'some-prefix' }, expect.any(Function));
+  });
+
+  it('tells the worker what the hook submitted, without a prefix when the hook sent none', async () => {
+    const workerSend = vi.fn();
+    mockSession('s-no-prefix', { worker: { send: workerSend, killed: false, connected: true }, turnId: null });
+    await postClaim('s-no-prefix', { fingerprint: 'b'.repeat(64) }, { auth: 'signed' });
+    expect(workerSend).toHaveBeenCalledWith({ type: 'prompt_submitted', fingerprint: 'b'.repeat(64) }, expect.any(Function));
   });
 
   it('does not notify worker when worker is killed or disconnected', async () => {
@@ -230,25 +235,6 @@ describe('POST /api/sessions/:sessionId/prompt-ctx/claim', () => {
     mockSession('s-disconnected', { worker: { send: disconnectedSend, killed: false, connected: false }, turnId: null });
     await postClaim('s-disconnected', VALID_BODY, { auth: 'signed' });
     expect(disconnectedSend).not.toHaveBeenCalled();
-  });
-
-  it('tells the daemon the session submitted a prompt on an authenticated claim of a live session, whatever the claim finds', async () => {
-    const observed: string[] = [];
-    setPromptSubmittedObserver((sessionId) => { observed.push(sessionId); });
-    mockSession('s-hook', { turnId: null });
-    expect((await postClaim('s-hook', VALID_BODY, { auth: 'signed' })).status).toBe(404);
-    expect(observed).toEqual(['s-hook']);
-
-    mockSession('s-hook');
-    expect((await postClaim('s-hook', VALID_BODY, { capability: 'deadbeef'.repeat(8) })).status).toBe(403);
-    mockSession('s-hook', { status: 'stopped' });
-    await postClaim('s-hook', VALID_BODY, { auth: 'signed' });
-    expect(observed).toEqual(['s-hook']);
-
-    setPromptSubmittedObserver(() => { throw new Error('observer failed'); });
-    mockSession('s-hook');
-    claimMock.mockReturnValue('envelope-content');
-    expect((await postClaim('s-hook', VALID_BODY, { auth: 'signed' })).status).toBe(200);
   });
 
   it('does not notify worker when session is not active', async () => {

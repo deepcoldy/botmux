@@ -177,8 +177,6 @@ export interface WorkflowMainWakeDeps {
    *  only after it took the wake's text. Absent or false: by its terminal
    *  and the screen alone. */
   provesInputAcceptance?(sessionId: string): boolean;
-  /** The session's worker wrote this turn's text to its CLI. */
-  inputWritten?(sessionId: string, turnId: string): boolean;
   /** `triggerSessionTurn` with daemon-internal controls. */
   deliver(request: TriggerRequest, internal: WorkflowMainWakeDeliveryControls): Promise<TriggerResponse>;
   /** Re-drive a run after a checkpoint was released. */
@@ -216,12 +214,11 @@ export interface WorkflowMainWake {
   onScreenStatus(sessionId: string, update: { status: string; prevStatus?: string; turnId?: string }): void;
   /** A turn of a session reached its terminal. */
   onTurnEnded(sessionId: string, turnId: string): void;
-  /** The session's worker proved its CLI took this turn's exact input into
-   *  the conversation (a transcript record, a history line, an app-server ack). */
+  /** The session's worker proved its CLI took this turn's text: its prompt
+   *  hook submitted a prompt that is or starts with that text, or the input
+   *  entered the conversation (a transcript record, a history line, an
+   *  app-server ack). */
   onInputAccepted(sessionId: string, turnId: string): void;
-  /** The session's CLI submitted what its input box held (its
-   *  UserPromptSubmit hook ran). */
-  onPromptSubmitted(sessionId: string): void;
 }
 
 /** Where a wake goes: the main topic's live session, else the main topic
@@ -724,13 +721,6 @@ export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMain
       if (!parseWorkflowEventTurnId(turnId)) return;
       for (const entry of handedOver.get(sessionId) ?? []) {
         if (entry.turnId === turnId) accept(entry);
-      }
-    },
-    onPromptSubmitted: (sessionId) => {
-      // Session-wide: only a wake whose text was written by then — not one
-      // still queued behind the turn being submitted.
-      for (const entry of handedOver.get(sessionId) ?? []) {
-        if (entry.awaitsAcceptance && deps.inputWritten?.(sessionId, entry.turnId)) accept(entry);
       }
     },
   };

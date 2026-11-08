@@ -787,16 +787,9 @@ describe('checkpoint: the dependants wait for the main bot', () => {
     const drives: string[] = [];
     const warnings: string[] = [];
     const timers: Array<() => void> = [];
-    /** Turns the worker wrote to the CLI: each one it started. */
-    const written = new Set<string>();
-    const start = (turnId: string | undefined) => {
-      session.worker.active = turnId;
-      if (turnId) written.add(turnId);
-    };
+    const start = (turnId: string | undefined) => { session.worker.active = turnId; };
     const wake = createWorkflowMainWake({
-      ...(opts.reportsInput
-        ? { provesInputAcceptance: () => true, inputWritten: (_sessionId: string, turnId: string) => written.has(turnId) }
-        : {}),
+      ...(opts.reportsInput ? { provesInputAcceptance: () => true } : {}),
       baseDir: () => run.base,
       selfLarkAppId: () => BINDING.larkAppId,
       loadRun: opts.loadRun ?? (() => ({ dag: run.dag })),
@@ -847,12 +840,12 @@ describe('checkpoint: the dependants wait for the main bot', () => {
       if (session.worker.active) session.worker.queue.push(turnId);
       else start(turnId);
     };
-    /** The worker proves the CLI took this turn's text (native_input_consumed). */
+    /** The worker proves the CLI took this turn's text: its prompt hook
+     *  submitted that text (prompt_submitted_input), or a transcript record
+     *  of it (native_input_consumed). */
     const inputTaken = (turnId: string) => wake.onInputAccepted('sess-main', turnId);
-    /** The CLI submits its input box (UserPromptSubmit hook). */
-    const promptSubmitted = () => wake.onPromptSubmitted('sess-main');
     return {
-      wake, session, deliveries, drives, warnings, timers, tick, settled, screen, endTurn, personTurn, inputTaken, promptSubmitted,
+      wake, session, deliveries, drives, warnings, timers, tick, settled, screen, endTurn, personTurn, inputTaken,
     };
   }
   type Verdict = 'dispatch' | 'refuse';
@@ -1080,7 +1073,7 @@ describe('checkpoint: the dependants wait for the main bot', () => {
       await run.drive(executor);
       expect(dispatchedTo(executor, 'b')).toBe(0);
       // Minutes later the CLI submits it, runs it, and goes idle.
-      m.promptSubmitted();
+      m.inputTaken(wakeTurn);
       expect(released(run)).toEqual([]);
       m.screen('working', { turnless: true });
       expect(released(run)).toEqual([]);
@@ -1119,6 +1112,7 @@ describe('checkpoint: the dependants wait for the main bot', () => {
       l.screen('idle');
       l.wake.onTurnEnded('sess-main', lateTurn);
       l.inputTaken('om_person'); // another turn's input proves nothing about the wake
+      l.inputTaken(mintWorkflowEventTurnId('cp-proof-other', 1)); // nor another wake's
       l.wake.onTurnEnded('sess-main', lateTurn);
       expect(released(late.run)).toEqual([]);
       l.inputTaken(lateTurn);
@@ -1128,20 +1122,21 @@ describe('checkpoint: the dependants wait for the main bot', () => {
       expect(released(late.run)).toEqual(['a:wakeTurnEnded']);
     });
 
-    it('the prompt hook is the session\'s: one for the turn a wake is queued behind proves nothing about the wake', async () => {
+    it('the prompt hook submitting the turn a wake is queued behind proves nothing about the wake', async () => {
       const { run, cp } = await heldRun('cp-hook-queued');
       const m = cpIssuer(run, { reportsInput: true });
       m.personTurn();
       await m.wake.scan(run.dag.runId);
-      expect(m.session.worker.queue).toEqual([mintWorkflowEventTurnId(run.dag.runId, cp.eventSeq)]);
-      m.promptSubmitted(); // the person's message
+      const wakeTurn = mintWorkflowEventTurnId(run.dag.runId, cp.eventSeq);
+      expect(m.session.worker.queue).toEqual([wakeTurn]);
+      m.inputTaken('om_person'); // the person's message
       m.screen('working');
       m.screen('idle');
       m.endTurn(); // the wake is written now
       m.screen('working');
       m.screen('idle');
       expect(released(run)).toEqual([]);
-      m.promptSubmitted();
+      m.inputTaken(wakeTurn);
       m.screen('working', { turnless: true });
       m.screen('idle');
       expect(released(run)).toEqual(['a:wakeTurnEnded']);
@@ -1181,7 +1176,7 @@ describe('checkpoint: the dependants wait for the main bot', () => {
       m.screen('idle');
       // Minutes later the CLI submits the text and runs it, for longer than a poll.
       clock.t += 3 * 60_000;
-      m.promptSubmitted();
+      m.inputTaken(mintWorkflowEventTurnId(run.dag.runId, cp.eventSeq));
       m.screen('working', { turnless: true });
       clock.t += WORKFLOW_MAIN_WAKE_POLL_MS;
       await m.tick();
