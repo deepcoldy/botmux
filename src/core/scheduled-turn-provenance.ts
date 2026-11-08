@@ -40,6 +40,8 @@ import { effectiveScheduleChatIds } from '../services/schedule-store.js';
 import { isAutoCompletedSchedule } from '../services/schedule-until-done.js';
 import type { ScheduledTask, TrustedCaller } from '../types.js';
 import { parseScheduleRunAsClaim, scheduledTaskRunAs } from './schedule-run-as.js';
+import { backgroundAuthorityKey } from './background-execution-policy.js';
+import type { ScheduleAuthorityRecord } from '../services/schedule-authority-store.js';
 
 /** Scheduled turn ids: `schedule:<taskId>:<uuid>`. Task ids come from two
  *  producers (see schedule-store.createTask): legacy `randomUUID().substring(0,
@@ -55,6 +57,43 @@ const SCHEDULED_TURN_RE = /^schedule:([0-9a-z_]{1,50}):[0-9a-f]{8}-[0-9a-f]{4}-[
 export function parseScheduledTurnId(turnId: string): string | null {
   const match = SCHEDULED_TURN_RE.exec(turnId);
   return match ? match[1]! : null;
+}
+
+export function isManualScheduleRun(task: ScheduledTask, runId: string | undefined): boolean {
+  return !!runId && task.lastRunId === runId && task.manualRunAuthorization?.runId === runId;
+}
+
+export function isManualScheduledTurn(task: ScheduledTask, turnId: string): boolean {
+  return parseScheduledTurnId(turnId) === task.id
+    && isManualScheduleRun(task, task.manualRunAuthorization?.runId)
+    && Array.isArray(task.manualRunAuthorization?.turnIds)
+    && task.manualRunAuthorization.turnIds.includes(turnId);
+}
+
+/** A lookup or credential publication may await while the user edits/revokes
+ * authority. Runtime accounting and topic materialization do not change this
+ * definition fence. Call again after each asynchronous admission boundary. */
+export function assertScheduledAuthorityCurrent(
+  original: ScheduleAuthorityRecord,
+  current: ScheduleAuthorityRecord | undefined,
+  context: { runId?: string; turnId?: string; allowCompleted?: boolean },
+): void {
+  const permitted = current && (current.state === 'active'
+    || (context.allowCompleted && current.state === 'completed' && isAutoCompletedSchedule(current.task))
+    || (current.state === 'paused' && (context.turnId
+      ? isManualScheduledTurn(current.task, context.turnId)
+      : isManualScheduleRun(current.task, context.runId))));
+  const controlKey = (record: ScheduleAuthorityRecord) => JSON.stringify({
+    kind: record.kind, controlOpenId: record.controlOpenId, controlUnionId: record.controlUnionId,
+    credentialOpenId: record.credentialOpenId, runScopes: record.runScopes,
+    grantId: record.grantId, selfManage: record.selfManage,
+  });
+  if (!permitted || !current
+    || (context.runId && current.task.lastRunId !== context.runId)
+    || backgroundAuthorityKey(current.task) !== backgroundAuthorityKey(original.task)
+    || controlKey(current) !== controlKey(original)) {
+    throw new Error('schedule authority changed during turn admission');
+  }
 }
 
 /** Mint the turn id for a semantic-recovery continuation of a scheduled turn.
@@ -215,7 +254,9 @@ export function authorizeScheduledTurn(input: {
     // authority for that exact still-live turn.
     const autoCompletedStillLive = isAutoCompletedSchedule(task)
       && input.isScheduledTurnLive?.(input.turnId) === true;
-    if (!autoCompletedStillLive) return { error: 'task_disabled' };
+    const manualStillLive = isManualScheduledTurn(task, input.turnId)
+      && input.isScheduledTurnLive?.(input.turnId) === true;
+    if (!autoCompletedStillLive && !manualStillLive) return { error: 'task_disabled' };
   }
 
   // A claim from the claim card replaces the creator as the acting identity.

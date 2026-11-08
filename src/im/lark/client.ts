@@ -799,6 +799,7 @@ export async function sendUserMessage(
   msgType: string = 'text',
   uuid?: string,
   requestOptions?: LarkRequestOptions,
+  options?: Pick<OutboundMessageOptions, 'beforeWrite'>,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendUserMessage');
   content = prepareLocalAddressContent(content, msgType, linkFieldContext());
@@ -807,6 +808,8 @@ export async function sendUserMessage(
     larkAppId,
     'sendUserMessage',
     async () => {
+      // The permission proof must follow every gate wait, including retries.
+      if (options?.beforeWrite) await options.beforeWrite();
       const c = getBotClient(larkAppId);
       // Stamp callback-button ownership markers on interactive DMs too: this is the
       // FIFTH card egress surface (config / write-link / substitute / overload / …

@@ -217,6 +217,7 @@ import { SchedulePreconditionError } from './services/schedule-precondition-runn
 import {
   appendScheduleRunLog,
   markScheduleRunLogFailed,
+  type ScheduleRunLogEntry,
   type ScheduleRunOutcome,
   type ScheduleRunTargetResult,
 } from './services/schedule-run-log-store.js';
@@ -640,7 +641,18 @@ import {
 import { computeInputHash } from './utils/canonical-input-hash.js';
 import { matchingScheduleBotGrant, botScheduleAuthority, assertScheduleBotGrantActive } from './core/schedule-bot-grant.js';
 import { authorizeDelegatedScheduleRun, authorizeScheduleSelfManage } from './core/schedule-delegated-runtime.js';
-import { parseScheduledTurnId, readScheduledTaskFromAuthority } from './core/scheduled-turn-provenance.js';
+import { assertScheduledAuthorityCurrent, isManualScheduleRun, isManualScheduledTurn, parseScheduledTurnId, readScheduledTaskFromAuthority } from './core/scheduled-turn-provenance.js';
+import {
+  prepareScheduledRecoveryRun,
+  reconcileScheduledDelivery,
+  SCHEDULED_SEND_IN_FLIGHT_LIMIT_MS,
+  scheduledSendInFlightRecheckMs,
+  scheduledSessionRun,
+  scheduledTurnsOfCurrentRuns,
+  type ScheduledDeliveryStep,
+  type ScheduledSendSettlement,
+} from './core/scheduled-send.js';
+import { markScheduleRunLogDelivered } from './services/schedule-run-log-store.js';
 import { claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
 import { TRIGGER_USER_AUTH_TOOLS, delegatesOnMention } from './services/trigger-user-auth.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
@@ -4004,16 +4016,82 @@ async function promoteMaterializedTaskPositionSession(
   );
 }
 
+/** Account a scheduled turn's send on its task row and execution log, then hand
+ *  the outcome to `settled`. Re-arms while a sender is still delivering the turn
+ *  and while the execution-log row is not writable yet. */
+function settleScheduledDeliveryLater(
+  target: { ds?: DaemonSession; session: Session; turnId: string },
+  delayMs: number,
+  wait: { inFlightSince?: number; inFlightChecks?: number; logRetries?: number },
+  settled?: (delivery: ScheduledSendSettlement) => void,
+): void {
+  const sessionId = target.session.sessionId;
+  const timerKey = `${sessionId}:${target.turnId}`;
+  const prior = deferredScheduleSettleTimers.get(timerKey);
+  if (prior) clearTimeout(prior);
+  const timer = setTimeout(() => {
+    deferredScheduleSettleTimers.delete(timerKey);
+    const ds = target.ds ?? findActiveBySessionId(sessionId);
+    const session = ds?.session ?? target.session;
+    const larkAppId = ds?.larkAppId ?? session.larkAppId ?? '';
+    const chatId = ds?.chatId ?? session.chatId;
+    let step: ScheduledDeliveryStep | undefined;
+    try {
+      step = reconcileScheduledDelivery(config.session.dataDir, session, target.turnId, {
+        daemonDelivering: !!ds?.finalOutputDeliveriesByTurn?.get(target.turnId)?.size,
+        expired: wait.inFlightSince !== undefined
+          && Date.now() - wait.inFlightSince >= SCHEDULED_SEND_IN_FLIGHT_LIMIT_MS,
+      }, {
+        recordFailure: (taskId, runId, error, code) => scheduler.recordDeliveryFailure(taskId, runId, error, larkAppId, code, chatId),
+        recordDelivered: (taskId, runId) => scheduler.recordDeliverySuccess(taskId, runId, larkAppId, chatId),
+        markRunLogFailed: (taskId, runId, failure) => markScheduleRunLogFailed(taskId, runId, { ...failure, chatId }, larkAppId),
+        markRunLogDelivered: (taskId, runId) => markScheduleRunLogDelivered(taskId, runId, chatId, larkAppId),
+      });
+    } catch (error) {
+      logger.warn(`[scheduler] Delivery settlement failed for ${sessionId.slice(0, 8)}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (step?.next === 'in_flight') {
+      const checks = wait.inFlightChecks ?? 0;
+      settleScheduledDeliveryLater(target, scheduledSendInFlightRecheckMs(checks),
+        { ...wait, inFlightSince: wait.inFlightSince ?? Date.now(), inFlightChecks: checks + 1 }, settled);
+      return;
+    }
+    if (step?.next !== 'settled') {
+      if (step) logger.warn(`[scheduler] Delivery settlement for ${sessionId.slice(0, 8)} waits for its execution log`);
+      const retries = wait.logRetries ?? 0;
+      if (retries < 3) settleScheduledDeliveryLater(target, delayMs || 1_500, { ...wait, logRetries: retries + 1 }, settled);
+      return;
+    }
+    if (step.superseded) {
+      logger.warn(`[scheduler] Late ${step.delivery.state} send observation of a superseded run left unaccounted `
+        + `session=${sessionId.slice(0, 8)} turn=${target.turnId.slice(0, 12)}`);
+    }
+    settled?.(step.delivery);
+  }, delayMs);
+  deferredScheduleSettleTimers.set(timerKey, timer);
+}
+
+/** Settlement timers do not survive a restart, so a send that ended around one
+ *  would stay unaccounted. Settle every turn of a still-current run again
+ *  (accounted turns are no-ops); a pending edge settlement keeps the turn. */
+function reconcileScheduledDeliveriesAfterRestart(sessions: readonly Session[], larkAppId: string): number {
+  const turns = scheduledTurnsOfCurrentRuns(sessions.filter(session => session.larkAppId === larkAppId),
+    taskId => scheduler.getRuntimeTask(taskId, larkAppId)?.lastRunId);
+  for (const { session, turnId } of turns) {
+    if (!deferredScheduleSettleTimers.has(`${session.sessionId}:${turnId}`)) settleScheduledDeliveryLater({ session, turnId }, 0, {});
+  }
+  return turns.length;
+}
+
 function scheduleDeferredScheduleSettlement(
   ds: DaemonSession,
   context: { turnId: string; source: 'terminal' | 'idle'; errorCode?: string },
 ): void {
-  const run = ds.session.deferredScheduleRun;
+  const run = ds.session.deferredScheduleRun?.turnId === context.turnId
+    ? ds.session.deferredScheduleRun : scheduledSessionRun(ds.session, context.turnId);
   if (!run || run.turnId !== context.turnId) return;
   const sessionId = ds.session.sessionId;
   noteDeferredScheduleRunFailure(ds, context);
-  const prior = deferredScheduleSettleTimers.get(sessionId);
-  if (prior) clearTimeout(prior);
   // Exact transcript terminal needs only a short filesystem visibility grace.
   // Screen-only adapters use a longer confirmation and re-check that the same
   // turn is still idle before reclaiming the hidden session.
@@ -4025,8 +4103,11 @@ function scheduleDeferredScheduleSettlement(
   const delayMs = context.source === 'terminal'
     ? (remoteTerminal ? 1_500 : 300)
     : 1_500;
-  const timer = setTimeout(() => {
-    deferredScheduleSettleTimers.delete(sessionId);
+  settleScheduledDeliveryLater({ ds, session: ds.session, turnId: context.turnId }, delayMs, {}, delivery => {
+    // Another turn may start during the visibility grace. Its working state
+    // blocks hidden-session cleanup, but must not discard this turn's receipt.
+    if (context.source === 'idle' && ds.lastScreenStatus !== 'idle') return;
+    if (!ds.session.deferredScheduleRun) return;
     void settleDeferredScheduleRun(ds, context, {
       reconcile: reconcileDeferredTopicBinding,
       // Background path: no user surface, so a residual/refusal must at least be
@@ -4073,20 +4154,20 @@ function scheduleDeferredScheduleSettlement(
           `[scheduler] Closed silent deferred run whose prompt never reached the CLI `
           + `session=${sessionId.slice(0, 8)} task=${run.taskId} turn=${context.turnId.slice(0, 12)}`,
         );
-        void reportUndeliveredScheduleRun(run, undeliveredScheduleRunReporter(ds, run));
+        const deferredRun = ds.session.deferredScheduleRun;
+        if (deferredRun) void reportUndeliveredScheduleRun(deferredRun, undeliveredScheduleRunReporter(ds, deferredRun));
         return;
       }
       if (result.action === 'closed') {
         logger.info(
-          `[scheduler] Auto-closed silent deferred run with no botmux send `
+          `[scheduler] Closed deferred run delivery=${delivery.state} `
           + `session=${sessionId.slice(0, 8)} turn=${context.turnId.slice(0, 12)} source=${context.source}`,
         );
       }
     }).catch((err) => {
       logger.warn(`[scheduler] Deferred run settlement failed session=${sessionId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
     });
-  }, delayMs);
-  deferredScheduleSettleTimers.set(sessionId, timer);
+  });
 }
 
 function findChatReplyAlias(rootId: string, chatId: string, larkAppId: string): { chatId: string; sessionId: string; anchor?: string } | null {
@@ -4365,6 +4446,13 @@ function triggerUserAuthEnabledFor(ds: DaemonSession): boolean {
 }
 
 function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> | undefined {
+  if (parseScheduledTurnId(turnId)) {
+    prepareScheduledRecoveryRun(ds.session, turnId, {
+      getAuthority: taskId => scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId),
+      admitManualTurn: (taskId, runId, nextTurnId) => scheduler.admitManualRunTurn(taskId, runId, nextTurnId, ds.larkAppId),
+      persist: () => sessionStore.updateSession(ds.session),
+    });
+  }
   if (!triggerUserAuthEnabledFor(ds)) return;
   if (turnId.startsWith('schedule:')) {
     return prepareScheduledTurnCliIdentity(ds, turnId);
@@ -4571,7 +4659,8 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
   // or the session's last sender. A completed one-shot may still have an
   // admitted turn to restore/continue; manual disables and revocations cannot.
   const completedOnce = authority.state === 'completed' && isAutoCompletedSchedule(task);
-  if (authority.state !== 'active' && !completedOnce) {
+  if (authority.state !== 'active' && !completedOnce
+    && !(authority.state === 'paused' && isManualScheduledTurn(task, turnId))) {
     throw new Error(`schedule authority state is ${authority.state}; refusing identity`);
   }
   if ((task.larkAppId && task.larkAppId !== ds.larkAppId)
@@ -4600,6 +4689,8 @@ async function prepareScheduledTurnCliIdentity(ds: DaemonSession, turnId: string
     storageModel: identityModelForPublication(ds),
     privateChat: ds.chatType === 'p2p',
   });
+  assertScheduledAuthorityCurrent(authority, scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId),
+    { turnId, allowCompleted: true });
 }
 
 /** Ask the task's chat for a claimant (core/schedule-identity-claim). Off the
@@ -4682,10 +4773,13 @@ async function prepareDelegatedScheduledTurnIdentity(
   const authority = scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId);
   if (!authority) throw new Error('schedule authority record missing');
   if (authority.kind !== 'delegated') return false;
+  const assertCurrent = () => assertScheduledAuthorityCurrent(authority,
+    scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId), { turnId });
   const authorized = await authorizeDelegatedScheduleRun(
     authority.task,
     authority,
-    delegatedScheduleRuntimeDeps(ds.larkAppId),
+    { ...delegatedScheduleRuntimeDeps(ds.larkAppId), manualTurnId: turnId,
+      assertAuthorityCurrent: assertCurrent },
   );
   await publishTurnCliIdentity({
     botConfig: getBot(ds.larkAppId).config,
@@ -4698,6 +4792,7 @@ async function prepareDelegatedScheduledTurnIdentity(
     storageModel: identityModelForPublication(ds),
     privateChat: ds.chatType === 'p2p',
   });
+  assertCurrent();
   return true;
 }
 
@@ -5198,6 +5293,7 @@ export const __testOnly_sessionReply = sessionReply;
 export const __testOnly_activeSessions = activeSessions;
 export const __testOnly_promoteMaterializedTaskPositionSession = promoteMaterializedTaskPositionSession;
 export const __testOnly_scheduleDeferredScheduleSettlement = scheduleDeferredScheduleSettlement;
+export const __testOnly_reconcileScheduledDeliveriesAfterRestart = reconcileScheduledDeliveriesAfterRestart;
 export const __testOnly_scheduleRestoredStreamingCardPinRecovery = scheduleRestoredStreamingCardPinRecovery;
 export const __testOnly_restoreSessionsAndScheduleStartupRecovery = restoreSessionsAndScheduleStartupRecovery;
 
@@ -35362,7 +35458,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     if (!authority) {
       throw new Error('schedule authority record missing; refusing unregistered task');
     }
-    if (authority.state !== 'active') {
+    if (authority.state !== 'active' && !(authority.state === 'paused'
+      && executionContext.trigger === 'dashboard'
+      && isManualScheduleRun(authority.task, executionContext.runId))) {
       throw new Error(`schedule authority state is ${authority.state}; refusing run`);
     }
     if (authority.kind === 'delegated') {
@@ -35372,7 +35470,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       const authorized = await authorizeDelegatedScheduleRun(
         task,
         authority,
-        delegatedScheduleRuntimeDeps(effectiveAppId),
+        { ...delegatedScheduleRuntimeDeps(effectiveAppId), manualRunId: executionContext.runId,
+          assertAuthorityCurrent: () => assertScheduledAuthorityCurrent(authority,
+            scheduleAuthorityStore?.getRecord(effectiveAppId, task.id), { runId: executionContext.runId }) },
       );
       task = authorized.task;
     }
@@ -35387,6 +35487,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     ): void => {
       const finishedAt = new Date().toISOString();
       try {
+        const current = scheduler.getRuntimeTask(task.id, effectiveAppId);
+        let deliveryFailureBaseline: ScheduleRunLogEntry['deliveryFailureBaseline'];
+        if (current?.lastRunId === executionContext.runId
+          && current.deliveryFailureRunId === executionContext.runId) {
+          deliveryFailureBaseline = { outcome, errorCode: errorDetails?.errorCode,
+            error: errorDetails?.error, targetResults };
+          targetResults = targetResults?.map(target => current.deliveryFailureState?.targets[target.chatId]
+            ? { chatId: target.chatId, outcome: 'error', error: current.deliveryFailureState.targets[target.chatId] }
+            : target);
+          outcome = 'error';
+          errorDetails = { errorCode: current.lastDeliveryErrorCode ?? 'schedule_send_rejected', error: current.lastDeliveryError };
+        }
         appendScheduleRunLog({
           id: executionContext.runId,
           taskId: task.id,
@@ -35401,6 +35513,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           ...(errorDetails?.errorCode ? { errorCode: errorDetails.errorCode } : {}),
           ...(errorDetails?.error !== undefined ? { error: errorDetails.error } : {}),
           ...(targetResults !== undefined ? { targetResults } : {}),
+          ...(deliveryFailureBaseline ? { deliveryFailureBaseline } : {}),
         }, effectiveAppId);
       } catch (error) {
         logger.warn(
@@ -35436,8 +35549,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   refreshCliVersion,
                   runPrompt,
                   {
-                    prepareTurnIdentity: (session, turnId) =>
-                      prepareTurnCliIdentity(session, turnId),
+                    prepareTurnIdentity: async (session, turnId) => {
+                      // Re-read after preconditions/admission waits. A human can
+                      // pause, revoke or edit while those awaits are outstanding.
+                      const current = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
+                      if (!current || (current.state !== 'active'
+                        && !(current.state === 'paused'
+                          && scheduler.admitManualRunTurn(task.id, executionContext.runId, turnId, effectiveAppId)))) {
+                        throw new Error('schedule authority changed before turn admission');
+                      }
+                      assertScheduledAuthorityCurrent(authority, current, { runId: executionContext.runId });
+                      await prepareTurnCliIdentity(session, turnId);
+                      const prepared = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
+                      assertScheduledAuthorityCurrent(current, prepared, { runId: executionContext.runId, turnId });
+                    },
                     runId: executionContext.runId,
                   },
                 ),
@@ -35484,6 +35609,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
   });
   scheduler.startScheduler();
+  // Restored workers and redelivered outputs register their in-flight sends
+  // first, and a turn edge that arrives meanwhile keeps its own settlement.
+  setTimeout(() => {
+    try {
+      const turns = reconcileScheduledDeliveriesAfterRestart(sessionStore.listSessions(), cfg.larkAppId);
+      if (turns) logger.info(`[scheduler] Re-settling ${turns} scheduled send(s) of current runs after restart`);
+    } catch (err) {
+      logger.warn(`[scheduler] Scheduled send reconciliation failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }, 30_000).unref();
 
   // 决策看板：本 daemon 是自己这张看板唯一的写入方。存储懒打开，没开管家的 bot 不建库。
   // 写群关联时核实群：先用管家自己的凭据，查不到再用 bots.json 里本机其他 bot 的凭据（只在内存里建客户端）。

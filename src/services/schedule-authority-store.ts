@@ -15,6 +15,7 @@ import { canonicalScheduleInput } from './schedule-store.js';
 import { absorbLegacyFailureStats } from './schedule-until-done.js';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.js';
 import { backgroundAuthorityKey, backgroundPeerBelongsToJob, type BackgroundExecutionRegistration } from '../core/background-execution-policy.js';
+import { isManualScheduledTurn } from '../core/scheduled-turn-provenance.js';
 import { cleanupBackgroundJobHome } from './bytedcli-home.js';
 import { isAutoCompletedSchedule } from './schedule-until-done.js';
 import { reserveManagedDirectories } from './managed-directory-retention.js';
@@ -496,11 +497,17 @@ export class ScheduleAuthorityStore {
         this.db.exec('COMMIT;');
         return record.task;
       }
+      if (next.enabled !== record.task.enabled
+        || backgroundAuthorityKey(next) !== backgroundAuthorityKey(record.task)) {
+        delete next.manualRunAuthorization;
+      }
       // An edit (e.g. a prompt that now names a managed version) publishes new
       // references with the UPDATE; register only the delta vs the old row.
       releaseEdit = reserveManagedDirectories(next, record.task);
       const state = stateFor(next);
-      if ((state !== 'active' && !(state === 'completed' && isAutoCompletedSchedule(next)))
+      if ((state !== 'active' && !(state === 'completed' && isAutoCompletedSchedule(next))
+          && !next.manualRunAuthorization)
+        || next.manualRunAuthorization?.runId !== record.task.manualRunAuthorization?.runId
         || backgroundAuthorityKey(next) !== backgroundAuthorityKey(record.task)) {
         this.db.prepare('UPDATE schedule_background_executions SET revoked = 1 WHERE app_id = ? AND task_id = ?')
           .run(appId, taskId);
@@ -554,7 +561,8 @@ export class ScheduleAuthorityStore {
     try {
       const record = this.getRecord(job.appId, job.taskId);
       if (!record || record.kind !== 'direct'
-        || (record.state !== 'active' && !(record.state === 'completed' && isAutoCompletedSchedule(record.task)))
+        || (record.state !== 'active' && !(record.state === 'completed' && isAutoCompletedSchedule(record.task))
+          && !(record.state === 'paused' && isManualScheduledTurn(record.task, job.turnId)))
         || backgroundAuthorityKey(record.task) !== job.authorityKey) throw new Error('background_authority_changed');
       // A root is registered once; retrying an uncertain registration must not
       // extend its expiry or redirect it to another session/principal.

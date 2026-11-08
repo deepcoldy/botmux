@@ -221,6 +221,7 @@ import { TurnReplyCardStore } from './services/turn-reply-card.js';
 import { patchPublishedGroupCard, readGroupContextAuthorOrigin } from './services/group-context-publication.js';
 import { markGroupContextCardPurpose } from './im/lark/group-context-card.js';
 import { TurnSendLedger, type TurnSendKind } from './services/turn-send-ledger.js';
+import { feedbackPolicyForScheduledSend, ScheduleSendAttempt, scheduledSessionRun } from './core/scheduled-send.js';
 import { buildTurnReplyCard, replyCardPresentation } from './im/lark/turn-reply-card.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import {
@@ -4145,6 +4146,8 @@ interface SessionData {
     boundScope?: 'thread' | 'chat';
   };
   deferredScheduleRun?: DeferredScheduleRunData;
+  scheduledRun?: import('./types.js').Session['scheduledRun'];
+  scheduledRuns?: import('./types.js').Session['scheduledRuns'];
   vcMeetingReceiver?: {
     listenerAppId: string;
     meetingId: string;
@@ -11268,6 +11271,23 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   const originSession = originSessionId
     ? sessionsForOrigin.get(originSessionId)
     : undefined;
+  let effectiveResponseKind: TurnSendKind = argValue(rest, '--response-kind') === 'final' ? 'final' : 'progress';
+  const scheduledOrigin = authoritativeOriginTurnCtx?.sessionId === originSession?.sessionId
+    ? originSession : undefined;
+  const scheduledOriginRun = scheduledSessionRun(scheduledOrigin, authoritativeOriginTurnCtx?.turnId);
+  const scheduledSendAttempt = authoritativeOriginTurnCtx?.turnId && scheduledOrigin
+    && scheduledOriginRun
+    ? new ScheduleSendAttempt(resolveDataDir(), scheduledOrigin, authoritativeOriginTurnCtx.turnId)
+    : undefined;
+  if (scheduledSendAttempt) {
+    // Once the origin is authenticated, also observe process.exit-based
+    // preflight refusals. Possible provider effects remain unknown, never retried.
+    process.once('exit', code => {
+      if (code === 0 || effectiveResponseKind !== 'final') return;
+      try { scheduledSendAttempt.fail(new Error(`botmux send exited ${code} without a final delivery receipt`)); }
+      catch { /* observability cannot change a send's outcome */ }
+    });
+  }
   const hostRelayRequiresCodexAppLedger = !!trustedRelayCtx
     && process.env.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER === '1';
   // The live worker authorizes a Codex App relay only while an exact durable
@@ -11435,7 +11455,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // Only an explicit `final` may opt into feedback controls and indexing;
   // `progress` and `auxiliary` (interim / supplementary output) both deliver
   // normally without a feedback region, matching the requirement's three roles.
-  let effectiveResponseKind: TurnSendKind = responseKind ?? 'progress';
+  effectiveResponseKind = responseKind ?? 'progress';
   let expectedLinks = argValues(rest, '--expected-link');
   if (rest.some((token, index) => token === '--expected-link='
     || (token === '--expected-link'
@@ -11952,7 +11972,13 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // worker restart, turn rotation, or Codex ledger settlement.
   let checkSendTopics: ((lookup?: TopicMessageLookup) => Promise<void>) | undefined;
   let arbitraryMentionRequired = false;
-  const revalidateIsolatedOrigin = async (): Promise<ManagedOriginAttestation | undefined> => {
+  let scheduledProviderEffectStarted = false;
+  const knownPreProviderRejections = new Set<unknown>();
+  const beginScheduledProviderEffect = (): void => {
+    scheduledProviderEffectStarted = true;
+    scheduledSendAttempt?.providerRequestStarted();
+  };
+  const resolveRevalidatedIsolatedOrigin = async (): Promise<ManagedOriginAttestation | undefined> => {
     if (!isolatedAttestationContext || !isolatedManagedOriginCtx) return undefined;
     const fresh = await attestManagedOrigin({
       context: isolatedAttestationContext,
@@ -11988,6 +12014,15 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     }
     return fresh;
   };
+  const revalidateIsolatedOrigin = async (): Promise<ManagedOriginAttestation | undefined> => {
+    try { return await resolveRevalidatedIsolatedOrigin(); }
+    catch (error) {
+      // This proof rejected the current call before its effect. An earlier
+      // provider attempt, even one whose response was lost, stays ambiguous.
+      if (!scheduledProviderEffectStarted) knownPreProviderRejections.add(error);
+      throw error;
+    }
+  };
   const revalidateIsolatedOriginBeforeEffect = async (
     lookup?: TopicMessageLookup,
   ): Promise<ManagedOriginAttestation | undefined> => {
@@ -11998,6 +12033,10 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   };
   const fenceIsolatedOriginBeforeEffect = async (lookup?: TopicMessageLookup): Promise<void> => {
     await revalidateIsolatedOriginBeforeEffect(lookup);
+  };
+  const fenceScheduledProviderWrite = async (lookup?: TopicMessageLookup): Promise<void> => {
+    await fenceIsolatedOriginBeforeEffect(lookup);
+    beginScheduledProviderEffect();
   };
   const fenceIsolatedOrigin = async (): Promise<void> => {
     await revalidateIsolatedOrigin();
@@ -12036,7 +12075,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
           : { suppressHook: true as const }
         : undefined;
     return {
-      beforeWrite: fenceIsolatedOriginBeforeEffect,
+      beforeWrite: fenceScheduledProviderWrite,
       ...(hookOptions ?? {}),
       ...(groupContextAuthorOrigin ? { groupContextAuthorOrigin } : {}),
     };
@@ -12610,9 +12649,14 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   const executeTurnPrimary = async (
     renderedContent: string,
     dispatch: (providerUuid?: string) => Promise<string>,
-  ): Promise<{ messageId: string; replayed: boolean }> => turnSendKey
-    ? turnSendLedger.execute(turnSendKey, effectiveResponseKind, renderedContent, dispatch)
-    : { messageId: await dispatch(), replayed: false };
+  ): Promise<{ messageId: string; replayed: boolean }> => {
+    return turnSendKey
+      ? turnSendLedger.execute(turnSendKey, effectiveResponseKind, renderedContent, dispatch, {
+          ...(scheduledSendAttempt ? { noSideEffect: (error: unknown) =>
+            !scheduledProviderEffectStarted && knownPreProviderRejections.has(error) } : {}),
+        })
+      : { messageId: await dispatch(), replayed: false };
+  };
   let existingTurnPrimary: { messageId: string; replayed: boolean } | undefined;
   try {
     existingTurnPrimary = turnSendKey
@@ -12745,11 +12789,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       const voiceDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
         await revalidateIsolatedOriginBeforeEffect();
         const out = await synthesizeVoiceOpus(appId, content, {
-          beforeProviderEffect: fenceIsolatedOriginBeforeEffect,
+          beforeProviderEffect: fenceScheduledProviderWrite,
         });
         dir = out.dir;
         voiceDurationMs = out.durationMs;
         await revalidateIsolatedOriginBeforeEffect();
+        beginScheduledProviderEffect();
         const fileKey = await uploadFile(appId, out.path, { duration: out.durationMs });
         const proposedOutput = {
           targetChatId,
@@ -12777,7 +12822,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
           const deliveryUuid = prepared?.providerKey ?? providerUuid;
           await revalidateIsolatedOriginBeforeEffect();
           const privateMessageId = !sendInto && !overrideChatId
-            ? await sendPrivateReply(s, currentTurnId, canonicalOutput.content, canonicalOutput.msgType, deliveryUuid)
+            ? await sendPrivateReply(s, currentTurnId, canonicalOutput.content, canonicalOutput.msgType, deliveryUuid,
+                { beforeWrite: fenceScheduledProviderWrite })
             : undefined;
           const deferred = privateMessageId !== undefined
             ? { handled: true, messageId: privateMessageId, materializedNow: false, rootMessageId: undefined }
@@ -13234,7 +13280,13 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       feedbackPolicy = undefined;
     }
   }
-  const feedbackRequesterSubjectId = replyTargetSenderOpenId ?? s.ownerOpenId;
+  // A reused session's owner or last sender is not this automatic turn's
+  // requester. Only the identity frozen on the host-written run may claim it.
+  const feedbackRequesterSubjectId = scheduledOriginRun
+    ? scheduledOriginRun.requesterSubjectId : replyTargetSenderOpenId ?? s.ownerOpenId;
+  feedbackPolicy = feedbackPolicyForScheduledSend({ policy: feedbackPolicy,
+    requesterSubjectId: feedbackRequesterSubjectId,
+    authenticatedTurnId: authoritativeOriginTurnCtx?.turnId, session: scheduledOrigin });
   const withOncallGroup = (card: string): string => {
     if (effectiveResponseKind !== 'final' || asVoice || sendTopLevel || overrideChatId || sendInto || vcMeetingManagedSendOrigin) return card;
     const attached = attachOncallGroupButton(card, oncallGroupPolicy, s.chatId, s.chatType);
@@ -13262,6 +13314,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // turn sender is another bot. Only the `requester` audience needs a resolvable
   // human recipient to make its control clickable.
   if (feedbackPolicy && effectiveResponseKind === 'final' && feedbackPolicy.audience === 'requester' && !feedbackRequesterSubjectId) {
+    try { scheduledSendAttempt?.fail(new Error('requester identity missing for final feedback')); } catch { /* best-effort */ }
     console.error('botmux send: 无法确认本次提问者身份，不能发送带反馈控件的最终回答');
     process.exit(2);
   }
@@ -13295,7 +13348,17 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     mentions.push({ open_id: replyTargetSenderOpenId, name: '' });
   }
 
-  const { sendMessage, replyMessage, urgentMessage, uploadImage, uploadFile, MessageWithdrawnError, getChatModeStrict, getMessageThreadId } = await import('./im/lark/client.js');
+  const { sendMessage, replyMessage, urgentMessage, uploadImage: uploadLarkImage, uploadFile: uploadLarkFile, MessageWithdrawnError, getChatModeStrict, getMessageThreadId } = await import('./im/lark/client.js');
+  // Uploads are observable too. A later authority refusal must not erase an
+  // earlier upload attempt, including media sent before the primary message.
+  const uploadImage: typeof uploadLarkImage = (...args) => {
+    beginScheduledProviderEffect();
+    return uploadLarkImage(...args);
+  };
+  const uploadFile: typeof uploadLarkFile = (...args) => {
+    beginScheduledProviderEffect();
+    return uploadLarkFile(...args);
+  };
   // Effective target chat for top-level mode (defaults to session's chat)
   const targetChatId = overrideChatId ?? s.chatId;
   // Chat-scope sessions (普通群整群一会话) post to chatId without
@@ -13440,7 +13503,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     // exact durable attempt/member instead of inheriting the early cmd gate.
     revalidateVcMeetingManagedSend();
     if (!sendInto && !overrideChatId) {
-      const privateMessageId = await sendPrivateReply(s, currentTurnId, content, msgType, uuid);
+      const privateMessageId = await sendPrivateReply(s, currentTurnId, content, msgType, uuid,
+        { beforeWrite: fenceScheduledProviderWrite });
       if (privateMessageId !== undefined) return privateMessageId;
     }
     if (!sendInto && (!overrideChatId || overrideChatId === s.chatId)) {
@@ -13663,6 +13727,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       if (!durableIpcPort) {
         throw new Error('durable primary send requires the owning daemon IPC port');
       }
+      beginScheduledProviderEffect();
       const messageId = await dispatchDurableSessionMessage({
         post: (sessionId, route, payload) => postSessionCliIpc(
           durableIpcPort,
@@ -13747,7 +13812,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
               );
             }
           : dispatchAfterOriginGate,
-        beforeWrite: fenceIsolatedOriginBeforeEffect,
+        beforeWrite: fenceScheduledProviderWrite,
         beforeEffect: originAlreadyRevalidated
           ? undefined
           : fenceIsolatedOrigin,
@@ -14317,6 +14382,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
               async (lookup) => {
                 await revalidateIsolatedOriginBeforeEffect(lookup);
                 revalidateVcMeetingManagedSend();
+                beginScheduledProviderEffect();
               }),
             isWithdrawn: error => error instanceof MessageWithdrawnError,
             render: record => buildTurnReplyCard(record, {
@@ -14699,6 +14765,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     }));
   } catch (err: any) {
     if (err instanceof TopicSendError) throw err;
+    try { if (effectiveResponseKind === 'final') scheduledSendAttempt?.fail(err); } catch { /* best-effort */ }
     console.error(`发送失败: ${describeSendFailure(err)}`);
     process.exit(1);
   }

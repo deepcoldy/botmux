@@ -128,8 +128,12 @@ describe('durable private output', () => {
     writeRoleReplyPrivately(APP, GROUP, true);
     const s = session(); delete s.replyTargets;
     const beforeWrite = vi.fn();
+    vi.mocked(sendUserMessage).mockImplementationOnce(async (_app, _id, _content, _type, _uuid, _requestOptions, options) => {
+      await options?.beforeWrite?.();
+      return 'om_private';
+    });
     expect(await sendPrivateReply(s, 'turn_a', 'answer', 'text', 'stable', { senderOpenId: 'ou_original', senderIsBot: false, failClosed: true, beforeWrite })).toBe('om_private');
-    expect(sendUserMessage).toHaveBeenCalledWith(APP, 'ou_original', 'answer', 'text', 'stable');
+    expect(sendUserMessage).toHaveBeenCalledWith(APP, 'ou_original', 'answer', 'text', 'stable', undefined, { beforeWrite });
     expect(beforeWrite).toHaveBeenCalledOnce();
   });
   it('retains unknown private delivery instead of falling back to the group', async () => {

@@ -24,7 +24,12 @@ import { defaultHttpInstance } from '@larksuiteoapi/node-sdk';
   } else if (url.endsWith('/im/v1/messages')) {
     const body = JSON.parse(config.data);
     console.log('CAPTURE_MESSAGE=' + JSON.stringify(body));
-    data = { code: 0, data: { message_id: 'om_test_sent' } };
+    if (process.env.TEST_MESSAGE_STARTED_PORT) {
+      await fetch(`http://127.0.0.1:${process.env.TEST_MESSAGE_STARTED_PORT}/test/message-started`, { method: 'POST' });
+    }
+    data = process.env.TEST_MESSAGE_FAILURE === '1'
+      ? { code: 230049, msg: 'message is being sent; acknowledgement unavailable' }
+      : { code: 0, data: { message_id: 'om_test_sent' } };
   } else if (url.includes('/im/v1/chats/oc_test')) {
     data = { code: 0, data: { chat_mode: 'group', chat_type: 'private' } };
   } else {
