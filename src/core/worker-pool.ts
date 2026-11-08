@@ -42,6 +42,7 @@ import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill
 import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
+import { confirmCodexModelLaunch, readCodexModelLaunchReceipt, readCodexModelSettingsCursor, refreshCodexModelSelection, recordCodexModelLaunch, resetCodexModelSelection, supportsCodexModelSelection } from '../services/codex-model-selection.js';
 import { readStatuslineSnapshot, toCardQuota } from '../services/statusline-snapshot.js';
 import { notePromptCacheKeepaliveResult, notePromptCacheKeepaliveScreenStatus, resolvedPromptCacheTtl } from './prompt-cache-keepalive.js';
 import { settleAutoCompactSafeComposerRefusal } from './auto-compact.js';
@@ -3522,10 +3523,55 @@ function storedSessionCliDisplayName(ds: DaemonSession): string {
  * contract, and persisting it is exactly the mistake the frozen model was.
  */
 function recordLaunchModel(ds: DaemonSession, model: string | undefined): void {
-  if (ds.spawnModelOverride) return;
-  if (ds.session.model === model) return;
-  ds.session.model = model;   // undefined clears a stale record
+  const recordedNativeLaunch = !ds.adoptedFrom && !ds.initConfig?.adoptMode
+    && recordCodexModelLaunch(ds.session, model);
+  if (!recordedNativeLaunch && (ds.spawnModelOverride || ds.session.model === model)) return;
+  if (!ds.spawnModelOverride) ds.session.model = model;   // undefined clears a stale record
   sessionStore.updateSession(ds.session);
+}
+
+/** Resolve only this conversation's settings before a launcher can overwrite
+ * them. A bound instance never falls back to a different Codex home. */
+function refreshNativeCodexModel(ds: DaemonSession, botCfg: Parameters<typeof resolveSessionLaunchModel>[1], requireComplete = false): boolean {
+  if (!supportsCodexModelSelection(ds.session) || ds.adoptedFrom || ds.initConfig?.adoptMode
+    || !ds.session.cliSessionId) return false;
+  try {
+    const receipt = readCodexModelLaunchReceipt(config.session.dataDir, ds.session.sessionId);
+    if (receipt) confirmCodexModelLaunch(ds.session, receipt);
+    const binding = ds.session.cliInstanceBinding ?? ds.initConfig?.cliInstanceBinding;
+    const path = binding
+      ? findCodexRolloutBySessionId(ds.session.cliSessionId, {
+        codexHome: binding.codexHome, noFollow: binding.source !== 'legacy',
+      })
+      : resolveSessionTranscriptPath({
+        cliId: 'codex', sessionId: ds.session.sessionId,
+        cliSessionId: ds.session.cliSessionId,
+        cwd: ds.workingDir ?? ds.session.workingDir,
+        larkAppId: ds.larkAppId, fresh: true,
+      })?.path;
+    if (!path) return false;
+    if (requireComplete && !readCodexModelSettingsCursor(path)?.complete) return false;
+    const inherited = resolveSessionLaunchModel({
+      ...ds, spawnModelOverride: undefined,
+      session: { ...ds.session, codexModelSelection: undefined },
+    }, botCfg);
+    refreshCodexModelSelection(ds.session, path, inherited, ds.session.cliSessionId);
+    return true;
+  } catch (error) {
+    logger.warn(`[${tag(ds)}] Could not read native Codex model settings: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+}
+
+/** Checkpoint the current native model before clearing the saved preference.
+ * An unrelated /effort snapshot from the still-running CLI must not recreate it. */
+export function resetSessionCodexModelSelection(ds: DaemonSession): boolean {
+  if (!supportsCodexModelSelection(ds.session) || ds.adoptedFrom || ds.initConfig?.adoptMode
+    || isSessionRestartInFlight(ds)) return false;
+  if (ds.session.cliSessionId && !refreshNativeCodexModel(ds, getBot(ds.larkAppId).config, true)) return false;
+  resetCodexModelSelection(ds.session);
+  sessionStore.updateSession(ds.session);
+  return true;
 }
 
 function sessionServiceTier(ds: DaemonSession, cliId: CliId): CodexServiceTier | undefined {
@@ -3580,6 +3626,7 @@ function sessionAgentConfig(
     // is false → no bot model leaks to a different CLI; same-CLI keeps the bot's model
     // and stays consistent with in-place restarts (latestModelForRespawn), which never
     // pass through this snapshot branch. spawnModelOverride is honored automatically.
+    refreshNativeCodexModel(ds, botCfg);
     const modelChoice = resolveSessionLaunchModelChoice(ds, botCfg);
     const model = modelChoice.model;
     recordLaunchModel(ds, model);
@@ -3685,6 +3732,7 @@ function sessionAgentConfig(
     if (repaired) sessionStore.updateSession(ds.session);
   }
   // Resolved at EVERY spawn, resume included — see resolveSessionLaunchModel.
+  refreshNativeCodexModel(ds, botCfg);
   const modelChoice = resolveSessionLaunchModelChoice(ds, botCfg);
   const model = modelChoice.model;
   recordLaunchModel(ds, model);
@@ -7643,16 +7691,19 @@ function sessionMojoBlockEnv(ds: DaemonSession): Record<string, string> {
  * undefined = 取不到（bot 已注销等异常），让 worker 保持快照不动（=旧行为）。
  */
 export function latestModelForRespawn(ds: DaemonSession): string | null | undefined {
+  let botCfg: Parameters<typeof resolveSessionLaunchModel>[1];
   try {
-    const model = resolveSessionLaunchModel(ds, getBot(ds.larkAppId).config);
-    // An in-worker respawn IS a launch, so the rule-3 record must converge here
-    // too — otherwise `/restart` starts B while the record still says A, and a
-    // later CLI hot-switch pulls A back out of the record.
-    recordLaunchModel(ds, model);
-    return model ?? null;
+    botCfg = getBot(ds.larkAppId).config;
   } catch {
     return undefined;
   }
+  refreshNativeCodexModel(ds, botCfg);
+  const model = resolveSessionLaunchModel(ds, botCfg);
+  // An in-worker respawn IS a launch, so the rule-3 record must converge here
+  // too — otherwise `/restart` starts B while the record still says A, and a
+  // later CLI hot-switch pulls A back out of the record.
+  recordLaunchModel(ds, model);
+  return model ?? null;
 }
 
 export function latestPinEffortForRespawn(ds: DaemonSession): { reasoningEffort?: import('../services/codex-reasoning-effort.js').CodexReasoningEffort | null } {
@@ -7857,12 +7908,13 @@ export function requestSessionRestart(
     settingAttempt = attemptId;
     try {
       if (ds.worker && !ds.worker.killed) {
+        const model = opts.topicEffort?.model ?? latestModelForRespawn(ds);
         if (opts.topicEffort) topicEffortRestartReadiness.set(ds.session.sessionId, { attemptId, worker: ds.worker, workerGeneration: ds.workerGeneration, workerReady: !!ds.workerReady, cliReady: !!ds.cliReady, requested: opts.topicEffort });
         ds.workerReady = false;
         // In-worker respawn: the next prompt belongs to a NEW CLI generation.
         ds.cliReady = false;
         ds.worker.send({ type: 'restart', attemptId, ...restartIpcReason(observer.source), ...cwdMove,
-          ...(opts.topicEffort ? {} : { ...restartSessionEnvFields(ds), ...latestPinEffortForRespawn(ds) }), model: opts.topicEffort?.model ?? latestModelForRespawn(ds),
+          ...(opts.topicEffort ? {} : { ...restartSessionEnvFields(ds), ...latestPinEffortForRespawn(ds) }), model,
           ...(opts.topicEffort ? { topicEffort: opts.topicEffort } : {}),
           traexAutoModel: opts.topicEffort ? null : latestTraexAutoModelForRespawn(ds),
           ...(opts.topicEffort ? {} : { codexRpcInput: latestCodexRpcInputForRespawn(ds),
@@ -18946,6 +18998,12 @@ function setupWorkerHandlers(
         } else {
           logger.warn(`[${t}] Ignored invalid or stale runner_build_ready`);
         }
+        break;
+      }
+
+      case 'codex_model_launch': {
+        if (!ownsLifecycleMutation()) break;
+        if (confirmCodexModelLaunch(ds.session, msg)) sessionStore.updateSession(ds.session);
         break;
       }
 
