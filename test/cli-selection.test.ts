@@ -1106,6 +1106,19 @@ describe('wrapper launcher written as an absolute path', () => {
     ]);
     expect(out.bin).toBe('/opt/aiden/bin/aiden');
     expect(out.args).toEqual(['x', 'codex', '--no-alt-screen', '-C', '/repo']);
+
+    const withEffort = buildWrappedLaunch(
+      '/opt/aiden/bin/aiden x codex',
+      ['-c', 'model_reasoning_effort="high"', '--no-alt-screen'],
+      (bin) => bin,
+      { aidenCodexShimDir: '/botmux/shim', aidenCodexRealBin: '/resolved/codex' },
+    );
+    expect(withEffort.bin).toBe('/botmux/shim/launch');
+    expect(withEffort.args).toEqual(['/opt/aiden/bin/aiden', 'x', 'codex', '--no-alt-screen']);
+    expect(withEffort.env).toMatchObject({
+      BOTMUX_AIDEN_CODEX_REAL_BIN: '/resolved/codex',
+      BOTMUX_AIDEN_CODEX_REASONING_EFFORT: 'high',
+    });
   });
 
   it('rewrites -c to --config and disables the selector for an absolute-path cjadk codex', () => {
