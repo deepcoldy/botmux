@@ -5468,7 +5468,7 @@ async function forceTopicWorktreeTarget(baseDir: string, anchor: string): Promis
   branch: string;
   targetSubdir?: string;
 }> {
-  const { mainWorktreeFor, worktreeRootFor } = await import('./services/git-worktree.js');
+  const { mainWorktreeFor, worktreeRootFor, worktreeTargetPath } = await import('./services/git-worktree.js');
   const containingRoot = await worktreeRootFor(baseDir);
   const repoRoot = await mainWorktreeFor(baseDir);
   // `git rev-parse --show-toplevel` can canonicalize platform aliases (for
@@ -5481,7 +5481,7 @@ async function forceTopicWorktreeTarget(baseDir: string, anchor: string): Promis
   const branch = `wt/botmux-${short}`;
   return {
     branch,
-    worktreePath: join(dirname(repoRoot), `${basename(repoRoot)}-wt-botmux-${short}`),
+    worktreePath: worktreeTargetPath(repoRoot, `${basename(repoRoot)}-wt-botmux-${short}`),
     ...((subdir && !subdir.startsWith('..') && !isAbsolute(subdir)) ? { targetSubdir: subdir } : {}),
   };
 }
@@ -32430,6 +32430,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const tmuxEnvScrub = scrubTmuxServerGlobalEnv();
   if (tmuxEnvScrub.removed.length > 0) {
     logger.info(`[tmux] scrubbed ${tmuxEnvScrub.removed.length} server-global env key(s): ${tmuxEnvScrub.removed.join(', ')}`);
+  }
+  if (tmuxEnvScrub.updated.length > 0) {
+    logger.info(`[tmux] rewrote ${tmuxEnvScrub.updated.length} server-global env key(s): ${tmuxEnvScrub.updated.join(', ')}`);
   }
   if (tmuxEnvScrub.failed.length > 0) {
     logger.warn(`[tmux] failed to scrub server-global env key(s): ${tmuxEnvScrub.failed.join(', ')}`);
