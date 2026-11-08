@@ -42,6 +42,7 @@ import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill
 import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
+import { confirmCodexModelLaunch, readCodexModelLaunchReceipt, readCodexModelSettingsCursor, refreshCodexModelSelection, recordCodexModelLaunch, resetCodexModelSelection, supportsCodexModelSelection } from '../services/codex-model-selection.js';
 import { readStatuslineSnapshot, toCardQuota } from '../services/statusline-snapshot.js';
 import { notePromptCacheKeepaliveResult, notePromptCacheKeepaliveScreenStatus, resolvedPromptCacheTtl } from './prompt-cache-keepalive.js';
 import { settleAutoCompactSafeComposerRefusal } from './auto-compact.js';
@@ -66,6 +67,7 @@ import {
   markMessageListenerRunPreviewFailed,
   markMessageListenerRunPreviewReplied,
   markMessageListenerRunPreviewRunning,
+  markMessageListenerRunPreviewCompleted,
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { MissingWorkingDirError } from './working-dir-recovery.js';
@@ -938,6 +940,7 @@ import { parseVcMeetingListenerOutput } from '../services/vc-meeting-listener-ou
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn, resolveDeferredScheduledTurnId } from './silent-schedule-turns.js';
+import { isSilentMessageListenerSession } from './message-listener-silence.js';
 import {
   mintScheduledContinuationTurnId,
   parseScheduledTurnId,
@@ -1456,6 +1459,7 @@ const universalOutputProcessors = new Map<string, { worker: ChildProcess; run(re
 function outputProcessorKey(ds: DaemonSession): string { return `${ds.larkAppId}:${ds.session.sessionId}`; }
 
 function freezeOutputSink(ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'final_output' }>): OutputSink {
+  if (isSilentMessageListenerSession(ds.session)) return { kind: 'suppressed', reason: 'silent_message_listener' };
   const journal = outputDeliveryJournal(config.session.dataDir, ds.larkAppId);
   const origin = journal.sink(ds.session.sessionId, msg.turnId);
   if (origin && origin.kind !== 'im') return origin;
@@ -1823,6 +1827,7 @@ export function isResumeRecoveryPlaceholder(ds: DaemonSession): boolean {
 // takes effect without a daemon restart. The `/card` command can override it
 // per-session via `ds.streamingCardForced` (manually summon a live card).
 function streamingCardDisabled(ds: DaemonSession, turnId?: string): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return true;
   if (privateReplyEnabled(ds.session)) return true;
   if (isDocNativeSession(ds) || handoffCardBlocksStreaming(ds, turnId)) return true;
   if (ds.streamingCardForced) return false;
@@ -1837,6 +1842,7 @@ function streamingCardDisabled(ds: DaemonSession, turnId?: string): boolean {
 }
 
 function silentTurnReactions(ds: DaemonSession): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return true;
   try {
     return getBot(ds.larkAppId).config.silentTurnReactions === true;
   } catch { return false; }
@@ -3522,10 +3528,55 @@ function storedSessionCliDisplayName(ds: DaemonSession): string {
  * contract, and persisting it is exactly the mistake the frozen model was.
  */
 function recordLaunchModel(ds: DaemonSession, model: string | undefined): void {
-  if (ds.spawnModelOverride) return;
-  if (ds.session.model === model) return;
-  ds.session.model = model;   // undefined clears a stale record
+  const recordedNativeLaunch = !ds.adoptedFrom && !ds.initConfig?.adoptMode
+    && recordCodexModelLaunch(ds.session, model);
+  if (!recordedNativeLaunch && (ds.spawnModelOverride || ds.session.model === model)) return;
+  if (!ds.spawnModelOverride) ds.session.model = model;   // undefined clears a stale record
   sessionStore.updateSession(ds.session);
+}
+
+/** Resolve only this conversation's settings before a launcher can overwrite
+ * them. A bound instance never falls back to a different Codex home. */
+function refreshNativeCodexModel(ds: DaemonSession, botCfg: Parameters<typeof resolveSessionLaunchModel>[1], requireComplete = false): boolean {
+  if (!supportsCodexModelSelection(ds.session) || ds.adoptedFrom || ds.initConfig?.adoptMode
+    || !ds.session.cliSessionId) return false;
+  try {
+    const receipt = readCodexModelLaunchReceipt(config.session.dataDir, ds.session.sessionId);
+    if (receipt) confirmCodexModelLaunch(ds.session, receipt);
+    const binding = ds.session.cliInstanceBinding ?? ds.initConfig?.cliInstanceBinding;
+    const path = binding
+      ? findCodexRolloutBySessionId(ds.session.cliSessionId, {
+        codexHome: binding.codexHome, noFollow: binding.source !== 'legacy',
+      })
+      : resolveSessionTranscriptPath({
+        cliId: 'codex', sessionId: ds.session.sessionId,
+        cliSessionId: ds.session.cliSessionId,
+        cwd: ds.workingDir ?? ds.session.workingDir,
+        larkAppId: ds.larkAppId, fresh: true,
+      })?.path;
+    if (!path) return false;
+    if (requireComplete && !readCodexModelSettingsCursor(path)?.complete) return false;
+    const inherited = resolveSessionLaunchModel({
+      ...ds, spawnModelOverride: undefined,
+      session: { ...ds.session, codexModelSelection: undefined },
+    }, botCfg);
+    refreshCodexModelSelection(ds.session, path, inherited, ds.session.cliSessionId);
+    return true;
+  } catch (error) {
+    logger.warn(`[${tag(ds)}] Could not read native Codex model settings: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+}
+
+/** Checkpoint the current native model before clearing the saved preference.
+ * An unrelated /effort snapshot from the still-running CLI must not recreate it. */
+export function resetSessionCodexModelSelection(ds: DaemonSession): boolean {
+  if (!supportsCodexModelSelection(ds.session) || ds.adoptedFrom || ds.initConfig?.adoptMode
+    || isSessionRestartInFlight(ds)) return false;
+  if (ds.session.cliSessionId && !refreshNativeCodexModel(ds, getBot(ds.larkAppId).config, true)) return false;
+  resetCodexModelSelection(ds.session);
+  sessionStore.updateSession(ds.session);
+  return true;
 }
 
 function sessionServiceTier(ds: DaemonSession, cliId: CliId): CodexServiceTier | undefined {
@@ -3580,6 +3631,7 @@ function sessionAgentConfig(
     // is false → no bot model leaks to a different CLI; same-CLI keeps the bot's model
     // and stays consistent with in-place restarts (latestModelForRespawn), which never
     // pass through this snapshot branch. spawnModelOverride is honored automatically.
+    refreshNativeCodexModel(ds, botCfg);
     const modelChoice = resolveSessionLaunchModelChoice(ds, botCfg);
     const model = modelChoice.model;
     recordLaunchModel(ds, model);
@@ -3685,6 +3737,7 @@ function sessionAgentConfig(
     if (repaired) sessionStore.updateSession(ds.session);
   }
   // Resolved at EVERY spawn, resume included — see resolveSessionLaunchModel.
+  refreshNativeCodexModel(ds, botCfg);
   const modelChoice = resolveSessionLaunchModelChoice(ds, botCfg);
   const model = modelChoice.model;
   recordLaunchModel(ds, model);
@@ -4712,6 +4765,7 @@ export function managedAuxUiSuppressedFor(
   turnId?: string,
   dispatchAttempt?: number,
 ): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return true;
   try {
     if (!larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) return true;
   } catch {
@@ -7643,16 +7697,19 @@ function sessionMojoBlockEnv(ds: DaemonSession): Record<string, string> {
  * undefined = 取不到（bot 已注销等异常），让 worker 保持快照不动（=旧行为）。
  */
 export function latestModelForRespawn(ds: DaemonSession): string | null | undefined {
+  let botCfg: Parameters<typeof resolveSessionLaunchModel>[1];
   try {
-    const model = resolveSessionLaunchModel(ds, getBot(ds.larkAppId).config);
-    // An in-worker respawn IS a launch, so the rule-3 record must converge here
-    // too — otherwise `/restart` starts B while the record still says A, and a
-    // later CLI hot-switch pulls A back out of the record.
-    recordLaunchModel(ds, model);
-    return model ?? null;
+    botCfg = getBot(ds.larkAppId).config;
   } catch {
     return undefined;
   }
+  refreshNativeCodexModel(ds, botCfg);
+  const model = resolveSessionLaunchModel(ds, botCfg);
+  // An in-worker respawn IS a launch, so the rule-3 record must converge here
+  // too — otherwise `/restart` starts B while the record still says A, and a
+  // later CLI hot-switch pulls A back out of the record.
+  recordLaunchModel(ds, model);
+  return model ?? null;
 }
 
 export function latestPinEffortForRespawn(ds: DaemonSession): { reasoningEffort?: import('../services/codex-reasoning-effort.js').CodexReasoningEffort | null } {
@@ -7857,12 +7914,13 @@ export function requestSessionRestart(
     settingAttempt = attemptId;
     try {
       if (ds.worker && !ds.worker.killed) {
+        const model = opts.topicEffort?.model ?? latestModelForRespawn(ds);
         if (opts.topicEffort) topicEffortRestartReadiness.set(ds.session.sessionId, { attemptId, worker: ds.worker, workerGeneration: ds.workerGeneration, workerReady: !!ds.workerReady, cliReady: !!ds.cliReady, requested: opts.topicEffort });
         ds.workerReady = false;
         // In-worker respawn: the next prompt belongs to a NEW CLI generation.
         ds.cliReady = false;
         ds.worker.send({ type: 'restart', attemptId, ...restartIpcReason(observer.source), ...cwdMove,
-          ...(opts.topicEffort ? {} : { ...restartSessionEnvFields(ds), ...latestPinEffortForRespawn(ds) }), model: opts.topicEffort?.model ?? latestModelForRespawn(ds),
+          ...(opts.topicEffort ? {} : { ...restartSessionEnvFields(ds), ...latestPinEffortForRespawn(ds) }), model,
           ...(opts.topicEffort ? { topicEffort: opts.topicEffort } : {}),
           traexAutoModel: opts.topicEffort ? null : latestTraexAutoModelForRespawn(ds),
           ...(opts.topicEffort ? {} : { codexRpcInput: latestCodexRpcInputForRespawn(ds),
@@ -14388,6 +14446,7 @@ export function auxUiSuppressedFor(
   turnId?: string,
   dispatchAttempt?: number,
 ): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return true;
   // No-transport session (apiOnly bot or HTTP virtual chat): there is no real
   // Feishu chat to render into.
   try {
@@ -17325,6 +17384,7 @@ function setupWorkerHandlers(
   /** Auxiliary worker UI is never an authorized output channel for a dedicated
    * VC receiver. Dashboard/audit state is still updated before these guards. */
   const managedAuxUiSuppressed = (turnId?: string, dispatchAttempt?: number): boolean => {
+    if (isSilentMessageListenerSession(ds.session)) return true;
     // No-transport session (apiOnly bot or HTTP virtual chat): there is no real
     // Feishu chat to render a card/reaction into. Suppress ALL auxiliary UI at
     // the single source every aux-UI handler funnels through — this is the
@@ -17415,6 +17475,7 @@ function setupWorkerHandlers(
     dispatchAttempt?: number,
     terminalDiagnostic = false,
   ): boolean => {
+    if (isSilentMessageListenerSession(ds.session)) return true;
     if (isSilentScheduledTurn(ds, turnId)) return true;
     // Loud triggers suppress model replies, not a redacted runtime failure.
     // Scheduled silence and managed/attempt ownership remain authoritative.
@@ -19053,6 +19114,12 @@ function setupWorkerHandlers(
         } else {
           logger.warn(`[${t}] Ignored invalid or stale runner_build_ready`);
         }
+        break;
+      }
+
+      case 'codex_model_launch': {
+        if (!ownsLifecycleMutation()) break;
+        if (confirmCodexModelLaunch(ds.session, msg)) sessionStore.updateSession(ds.session);
         break;
       }
 
@@ -20892,7 +20959,7 @@ function setupWorkerHandlers(
             });
           }
         }
-        if (msg.turnId.startsWith('mlrp_turn_')) {
+        if (msg.turnId.startsWith('mlrp_turn_') && !isSilentMessageListenerSession(ds.session)) {
           markMessageListenerRunPreviewReplied(msg.turnId, {
             sessionId: ds.session.sessionId,
             replyMessageId: msg.messageId,
@@ -21264,6 +21331,10 @@ function setupWorkerHandlers(
           logger.error(`[${t}] Failed to persist turn_terminal for ${msg.turnId.substring(0, 8)}: ${err.message}`);
         }
         if (terminalPersisted) publishTurnFinished(ds, msg);
+        if (terminalPersisted && msg.turnId.startsWith('mlrp_turn_')
+          && msg.status === 'completed' && isSilentMessageListenerSession(ds.session)) {
+          markMessageListenerRunPreviewCompleted(msg.turnId);
+        }
         try {
           if (!ordinaryHttpTerminal) handleOrdinaryTurnRecoveryTerminal(ds.session, msg);
           recoveryHandled = recoveryOwnsTerminal;

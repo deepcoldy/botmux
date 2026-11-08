@@ -79,6 +79,13 @@ describe('per-bot environment policy', () => {
     const child = buildSessionChildEnv(worker, { mode: 'strict' });
     for (const key of Object.keys(base)) expect(key in child, key).toBe(false);
   });
+  it('keeps the fenced-run marker through strict worker, CLI and backend boundaries', () => {
+    const worker = buildBotWorkerEnv({ ...host, BOTMUX_FENCED_RUN: '1' }, strict);
+    const child = buildSessionChildEnv(worker, strict);
+    const pane = inheritBotEnv(child, { mode: 'strict' });
+    for (const [name, env] of Object.entries({ worker, child, pane })) expect(env.BOTMUX_FENCED_RUN, name).toBe('1');
+    expect('BOTMUX_FENCED_RUN' in buildSessionChildEnv(buildBotWorkerEnv(host, strict), strict)).toBe(false);
+  });
   it('preserves per-session homes and workflows after trusted injection', () => {
     const env = buildSessionChildEnv({ ...host, CODEX_HOME: '/test/bot/codex', BOTMUX_WORKFLOW: '1', BOTMUX_GOAL_PATH: '/test/goal', SESSION_DATA_DIR: '/test/data' }, strict);
     expect(env.CODEX_HOME === '/test/bot/codex').toBe(true);

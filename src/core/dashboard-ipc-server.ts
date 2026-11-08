@@ -606,6 +606,7 @@ import {
 } from './session-preview.js';
 import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { ChatRenameCooldown, chatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
+import { isSilentMessageListenerSession } from './message-listener-silence.js';
 import { executeChatRename } from './chat-rename-operation.js';
 import { authorizeHumanManager } from './human-manager-authorization.js';
 import { changeChatManager, getChatManagerStatus } from '../services/chat-manager.js';
@@ -4040,6 +4041,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   if (sessionTransportDisabled(ds)) return jsonRes(res, 200, { ok: false, error: 'no_feishu_transport' });
   if (ds.chatType !== 'group') return jsonRes(res, 400, { ok: false, error: 'not_group_chat' });
+  // Renaming the session's own group is a visible source-group write; a silent
+  // listener task must not change its source group. Human dashboard management
+  // still uses the host-only PUT /api/groups/:chatId/name route.
+  if (isSilentMessageListenerSession(ds.session)) {
+    return jsonRes(res, 403, { ok: false, error: 'silent_message_listener' });
+  }
   const normalized = normalizeLarkChatName(body.name);
   if (!normalized.ok) return jsonRes(res, 400, normalized);
 
@@ -4257,29 +4264,42 @@ function decisionBoardRoute(method: string, path: string,
   });
 }
 
+/**
+ * 本机其他 daemon 记下本轮结果或举手时按群通知管家（host HMAC）。只带群 ID，管家自己重新读状态。
+ * 不放在 /api/decision-board 下：Dashboard 不转发它。
+ */
+ipcRoute('POST', '/api/steward/task-event', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBody<Record<string, unknown>>(req, 4096).catch(() => undefined);
+  const chatId = typeof body?.chatId === 'string' && /^oc_[A-Za-z0-9_-]{1,128}$/.test(body.chatId) ? body.chatId : null;
+  if (!chatId) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  decisionBoardService?.noteTaskEvent(chatId);
+  return jsonRes(res, 200, { ok: true });
+});
+
 decisionBoardRoute('GET', '/api/decision-board/meta', (service, _req, res) => {
   jsonRes(res, 200, { ok: true, ...service.meta() });
 });
 
-decisionBoardRoute('GET', '/api/decision-board', (service, req, res) => {
+decisionBoardRoute('GET', '/api/decision-board', async (service, req, res) => {
   const url = new URL(req.url!, 'http://localhost');
   const author = decisionBoardAuthor(url.searchParams.get('author'));
   if (!author) return jsonRes(res, 400, { ok: false, error: 'invalid_author' });
   const viewRaw = url.searchParams.get('view');
   const view = viewRaw === 'decide' || viewRaw === 'active' || viewRaw === 'all' ? viewRaw : 'decide';
   const query = url.searchParams.get('q')?.slice(0, 200) ?? undefined;
-  jsonRes(res, 200, { ok: true, view, ...service.list(view, author, query) });
+  jsonRes(res, 200, { ok: true, view, ...await service.listView(view, author, query) });
 });
 
 decisionBoardRoute('GET', '/api/decision-board/guide', (service, _req, res) => {
   jsonRes(res, 200, { ok: true, ...service.guide() });
 });
 
-decisionBoardRoute('GET', '/api/decision-board/items/:seq', (service, req, res, params) => {
+decisionBoardRoute('GET', '/api/decision-board/items/:seq', async (service, req, res, params) => {
   const seq = decisionBoardSeq(params.seq);
   const author = decisionBoardAuthor(new URL(req.url!, 'http://localhost').searchParams.get('author'));
   if (seq === null || !author) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
-  jsonRes(res, 200, { ok: true, ...service.detail(seq, author) });
+  jsonRes(res, 200, { ok: true, ...await service.detailView(seq, author) });
 });
 
 decisionBoardRoute('POST', '/api/decision-board/items/:seq/seen', (service, _req, res, params) => {
@@ -8093,6 +8113,9 @@ ipcRoute('POST', '/api/message-listeners/:chatId/run-preview', requireBoundBot(a
     const results = [];
     for (const match of matches) {
       const triggerId = createMessageListenerRunPreviewTurnId();
+      // Register before worker IPC: even an immediately completed turn must
+      // find its preview record.
+      markMessageListenerRunPreviewTriggered(run.runId, match.messageId, { triggerId });
       try {
         const result = await triggerSessionTurn({
           source: {
@@ -8116,7 +8139,11 @@ ipcRoute('POST', '/api/message-listeners/:chatId/run-preview', requireBoundBot(a
           },
           instruction: renderMessageListenerInstruction(match),
           presentation: { topicMessage: null },
-        }, { larkAppId: cachedLarkAppId, activeSessions }, { stableTurnId: triggerId });
+        }, { larkAppId: cachedLarkAppId, activeSessions }, {
+          stableTurnId: triggerId,
+          ...(match.replyMode === 'none' ? { messageListenerRun: { sourceMessageId: match.messageId, replyMode: 'none' as const } } : {}),
+          messageListenerAutoClose: match.autoCloseAfterCompletion,
+        });
         const tracked = result.ok
           ? markMessageListenerRunPreviewTriggered(run.runId, match.messageId, {
               action: result.action,
