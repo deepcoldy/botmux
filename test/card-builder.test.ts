@@ -347,6 +347,15 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     expect(md).not.toContain('![x](');
   });
 
+  it('offers a clear-search button on no match that re-fires adopt_search', () => {
+    const resumable = [{ cliSessionId: 'aaa', cwd: '/home/proj', title: 'unrelated', lastActivityAt: 1 }];
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { searchQuery: 'ja' }));
+    const buttons = (card.body.elements ?? []).filter((e: any) => e.tag === 'button');
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0].behaviors[0].value.action).toBe('adopt_search');
+    expect(buttons[0].behaviors[0].value.selected).toBe('');
+  });
+
   const herdrLive = (extra: Partial<AdoptableSession> = {}): AdoptableSession => ({
     source: 'herdr',
     herdrSessionName: 'collie',
@@ -699,10 +708,6 @@ describe('getCliDisplayName', () => {
     expect(getCliDisplayName('codex')).toBe('Codex');
   });
 
-  it('should return "Gemini" for gemini', () => {
-    expect(getCliDisplayName('gemini')).toBe('Gemini');
-  });
-
   it('should return "OpenCode" for opencode', () => {
     expect(getCliDisplayName('opencode')).toBe('OpenCode');
   });
@@ -817,6 +822,57 @@ describe('buildConfigCard', () => {
     // Sentinel first = "clear and follow the CLI/model default".
     expect(select.options.map((o: any) => o.value)).toEqual(['__unset__', 'low', 'high', 'max']);
     expect(select.initial_option).toBe('max');
+  });
+
+  it('shows the shared-bot sandbox advice only when the data carries it, as short lines plus a folded CLI list', () => {
+    const texts = (card: any) => JSON.stringify(card.elements ?? card.body?.elements ?? card);
+    const plain = parse(buildConfigCard(configData(null), 'zh'));
+    // CLI display names legitimately appear in the CLI dropdown; the advice
+    // block has its own markers that must be absent without sandboxAdvice.
+    expect(texts(plain)).not.toContain('建议开启白名单隔离');
+    expect(texts(plain)).not.toContain('已验证可用的 CLI');
+
+    const card = (cliSupport: 'verified' | 'unverified' | 'unsupported' | 'wrapper' | 'blocked', cliId: string, reasons: string[] = ['oncall']) =>
+      parse(buildConfigCard({ ...configData(null), sandboxAdvice: { reasons, cliSupport, cliId } }, 'zh'));
+    const elementsOf = (c: any): any[] => c.elements ?? c.body?.elements ?? [];
+    const adviceBlock = (c: any) => elementsOf(c).find((e: any) => e.tag === 'markdown' && String(e.content).includes('建议开启白名单隔离'));
+    const fold = (c: any) => elementsOf(c).find((e: any) => e.tag === 'collapsible_panel');
+
+    const verified = card('verified', 'codex', ['oncall', 'allowedUsers']);
+    // One fact per line: headline, why, the reasons, where to turn it on, the current CLI.
+    expect(String(adviceBlock(verified).content).split('\n')).toEqual([
+      '**⚠️ 建议开启白名单隔离**',
+      '这个 bot 被多人使用，群成员可以通过 agent 读到本机凭证。',
+      '原因：开了 Oncall 值班模式、allowedUsers 有多人',
+      '开启：Dashboard → Bot 配置 → 文件沙盒，新会话生效',
+      '当前 CLI：Codex，已验证可用',
+    ]);
+    // The verified list sits in a folded panel, not in the advice text.
+    // Literal list, not derived from the table: it must be the matrix result in table order.
+    expect(fold(verified).expanded).toBe(false);
+    expect(fold(verified).header.title.content).toBe('已验证可用的 CLI（Linux 实测）');
+    expect(fold(verified).elements[0].content).toBe('Claude、Codex、Antigravity、OpenCode、Pi、Oh My Pi、Grok Build、Kimi');
+    expect(String(adviceBlock(verified).content)).not.toContain('Grok Build');
+
+    // Each support state gets its own CLI line; the dynamic keys resolve to text.
+    const cliLine = (c: any) => String(adviceBlock(c).content).split('\n').at(-1);
+    expect(cliLine(card('unsupported', 'codex-app'))).toBe('当前 CLI：Codex App，暂不支持白名单隔离，请改用 Codex');
+    expect(cliLine(card('unverified', 'relay'))).toBe('当前 CLI：Relay，还没验证过，开启前先在测试会话里试一下');
+    expect(cliLine(card('wrapper', 'claude-code'))).toBe('当前 CLI：Claude，通过 wrapper 启动。开启白名单隔离后 wrapper 仍在沙盒内运行；若 wrapper 依赖的路径不在白名单内会明确报错拒绝启动，把这些路径加进沙盒白名单（只读/读写）即可');
+    expect(String(adviceBlock(card('verified', 'codex', ['allowedChatGroups'])).content)).toContain('原因：allowedChatGroups 授权了整群发言');
+    expect(texts(card('wrapper', 'claude-code'))).not.toContain('card.config.sandbox_advice');
+
+    // A local-but-sandbox-refusing backend (herdr/zellij/zmx/orca): no "turn it
+    // on" action line and no verified-list fold — they would brick sessions.
+    const backendBlocked = card('blocked', 'claude-code');
+    expect(String(adviceBlock(backendBlocked).content).split('\n')).toEqual([
+      '**⚠️ 建议开启白名单隔离**',
+      '这个 bot 被多人使用，群成员可以通过 agent 读到本机凭证。',
+      '原因：开了 Oncall 值班模式',
+      '当前会话后端不支持文件沙盒（开启后新会话会起不来）；请先把后端切换为 tmux 或 pty，再回来开启',
+    ]);
+    expect(fold(backendBlocked)).toBeUndefined();
+    expect(String(adviceBlock(backendBlocked).content)).not.toContain('开启：Dashboard');
   });
 
   it('renders card-behaviour toggles', () => {
@@ -1136,16 +1192,16 @@ describe('buildSessionCard', () => {
 
     it('can include local attach buttons for non-resume CLIs when mode-aware readiness is true', () => {
       enableLocalCliOpen();
-      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'gemini', false, false, 'en', true));
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'mimocode', false, false, 'en', true));
       const actions = findActions(card);
       const btn = actions.find((a: any) => a.value?.action === 'open_local_cli');
-      expect(btn?.value.cli_id).toBe('gemini');
-      expect(btn?.text.content).toBe('💻 Open Gemini');
+      expect(btn?.value.cli_id).toBe('mimocode');
+      expect(btn?.text.content).toBe('💻 Open MiMoCode');
     });
 
     it('does not include local-CLI open buttons when precise local resume is unavailable', () => {
       enableLocalCliOpen();
-      for (const cli of ['codex-app', 'gemini', 'mira', 'mir', undefined] as const) {
+      for (const cli of ['codex-app', 'mimocode', 'mira', 'mir', undefined] as const) {
         const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, cli));
         const actions = findActions(card);
         expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
@@ -1195,11 +1251,11 @@ describe('buildSessionCard', () => {
     });
 
     it('should include restart button with CLI display name', () => {
-      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'gemini', true));
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'opencode', true));
       const actions = findActions(card);
       const restartBtn = actions.find((a: any) => a.value?.action === 'restart');
       expect(restartBtn).toBeDefined();
-      expect(restartBtn.text.content).toContain('Gemini');
+      expect(restartBtn.text.content).toContain('OpenCode');
       expect(restartBtn.value.root_id).toBe(ROOT);
       expect(restartBtn.value.session_id).toBe(SID);
     });
@@ -1733,7 +1789,7 @@ describe('buildStreamingCard', () => {
 
     it('renders nothing for a fully-empty snapshot (unsupported CLI)', () => {
       const card = parse(buildStreamingCard(
-        SID, ROOT, URL, TITLE, CONTENT, 'working', 'gemini', 'hidden',
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'opencode', 'hidden',
         undefined, undefined, false, false, 'en', undefined, undefined, false,
         { context: null, tokens: null },
       ));
@@ -1837,6 +1893,29 @@ describe('buildStreamingCard', () => {
       const actions = findActions(card);
       const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_display');
       expect(toggleBtn.value).not.toHaveProperty('card_nonce');
+    });
+  });
+
+  // #2062: the idempotent display target exists only for the primary
+  // multi-replica control lane; single-replica cards keep the old payload
+  // (byte-for-byte, see card-builder-wire-golden).
+  describe('display toggle target mode', () => {
+    afterEach(() => { vi.unstubAllEnvs(); });
+    const toggleValue = (mode: 'hidden' | 'screenshot') => findActions(
+      parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, mode)),
+    ).find((a: any) => a.value?.action === 'toggle_display').value;
+
+    it('carries the visible target in primary coordination mode', () => {
+      vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+      expect(toggleValue('hidden').target_display_mode).toBe('screenshot');
+      expect(toggleValue('screenshot').target_display_mode).toBe('hidden');
+    });
+
+    it('omits it outside primary mode', () => {
+      vi.stubEnv('BOTMUX_COORDINATION_MODE', 'disabled');
+      expect(toggleValue('hidden')).not.toHaveProperty('target_display_mode');
+      vi.stubEnv('BOTMUX_COORDINATION_MODE', '');
+      expect(toggleValue('screenshot')).not.toHaveProperty('target_display_mode');
     });
   });
 
@@ -2465,7 +2544,7 @@ describe('buildSessionClosedCard', () => {
     expect(findMarkdownContent(card)).toContain('/proj/x');
   });
 
-  it('shows a fallback note when the CLI cannot resume from CLI args (gemini/opencode)', () => {
+  it('shows a fallback note when the CLI cannot resume from CLI args (e.g. opencode)', () => {
     const card = parse(buildSessionClosedCard(
       'sess-3', 'om_root', 'topic', 'opencode', undefined, null,
     ));
@@ -2692,6 +2771,32 @@ describe('buildRelayPickerCard', () => {
     expect(allMd).toMatch(/没有匹配|No sessions match/);
   });
 
+  // Regression: the no-match card used to dead-end — the only way back was to
+  // clear the input and submit '', which Lark doesn't fire. A clear-search
+  // button re-fires relay_search without input_value, so the handler resolves
+  // the query to '' and re-renders the full list.
+  it('offers a clear-search button on no match that re-fires relay_search', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: 'ja' }));
+    const buttons = card.body.elements.filter((e: any) => e.tag === 'button');
+    expect(buttons).toHaveLength(1);
+    const v = buttons[0].behaviors[0].value;
+    expect(v.action).toBe('relay_search');
+    expect(v.target_chat_id).toBe('oc_t');
+    expect(v.root_id).toBe('om_r');
+    expect(v.invoker_open_id).toBe('ou_invoker_test');
+    expect(v.selected).toBe('');
+    // Not shown when the search has hits.
+    const hit = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: 'session 1' }));
+    expect(hit.body.elements.filter((e: any) => e.tag === 'button')).toHaveLength(0);
+  });
+
+  it('escapes the echoed search query in the no-match message', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: '![x](http://evil/b)' }));
+    const allMd = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+    expect(allMd).toContain('\\[x\\]');
+    expect(allMd).not.toContain('![x](');
+  });
+
   // Regression (申晗现场): a p2p entry's chatLabel is the raw DM chatId while
   // the card RENDERS the「单聊」literal — searching by the label the user sees
   // must find the entry, not return「没有匹配」. The DM was also buried on
@@ -2851,6 +2956,64 @@ describe('buildPrivateSnapshotCard', () => {
       .flatMap((e: any) => e.actions ?? []);
   }
 
+  it('keeps the card under the size budget when the screen holds a huge backtick run', () => {
+    for (const screen of ['`'.repeat(36_000), 'a\n' + '`'.repeat(200_000) + '\nb']) {
+      const json = buildPrivateSnapshotCard(
+        'https://t.example/ro', 'my session', 'idle', 'claude-code', undefined, screen,
+        'sess-9', 'om_anchor', 'zh',
+      );
+      expect(Buffer.byteLength(json, 'utf-8')).toBeLessThan(20_000);
+    }
+  });
+
+  it('still fences output containing a backtick run so it cannot break out of the code block', () => {
+    const card = build({ screen: 'x\n```\n# not a heading\n```\ny' });
+    const md = card.elements.find((e: any) => e.tag === 'markdown' && e.content.includes('not a heading')).content;
+    const fence = md.match(/^`+/)![0];
+    expect(fence.length).toBeGreaterThan(3);
+    expect(md.endsWith(fence)).toBe(true);
+  });
+
+  it('caps a run of exactly 9 backticks at 8 in the body, keeping a length-9 fence that closes', () => {
+    const card = build({ screen: 'a\n' + '`'.repeat(9) });
+    const md = card.elements.find((e: any) => e.tag === 'markdown' && e.content.startsWith('`')).content;
+    const fence = '`'.repeat(9);
+    expect(md.startsWith(fence)).toBe(true);
+    expect(md.endsWith(fence)).toBe(true);
+    // The capped content sits between the two fences; no run of 9+ survives there.
+    const body = md.slice(fence.length, md.length - fence.length);
+    const maxBodyRun = (body.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 0);
+    expect(maxBodyRun).toBe(8);
+  });
+
+  it('stays bounded when a huge backtick run is the final line and truncation keeps its tail', () => {
+    // The run is the LAST line: once truncateContent preserves an oversized
+    // line's tail, dropping the cap would keep ~50k ticks and the two
+    // maxRun+1 fences would push the card past Feishu's size limit.
+    const json = buildPrivateSnapshotCard(
+      'https://t.example/ro', 'my session', 'idle', 'claude-code', undefined,
+      'a\n' + '`'.repeat(200_000),
+      'sess-9', 'om_anchor', 'zh',
+    );
+    expect(Buffer.byteLength(json, 'utf-8')).toBeLessThan(20_000);
+  });
+
+  it('bounds whole card size under Feishu limit when content is densely packed with quotes or backslashes (#2929)', () => {
+    // 50,000 quotes or backslashes: before fix, raw byte length was ~50 KB but
+    // JSON escaping doubled it to ~100 KB, pushing the whole card to ~101 KB (near the ~109 KB limit).
+    // With JSON-escaped budgeting, whole card size stays safely bounded.
+    for (const denseChar of ['"', '\\']) {
+      const dense = denseChar.repeat(50_000);
+      const json = buildPrivateSnapshotCard(
+        'https://t.example/ro', 'my session', 'idle', 'claude-code', undefined,
+        dense,
+        'sess-9', 'om_anchor', 'zh',
+      );
+      const byteLen = Buffer.byteLength(json, 'utf-8');
+      expect(byteLen).toBeLessThanOrEqual(60_000);
+    }
+  });
+
   it('does not opt private one-shot snapshots into shared PATCH updates', () => {
     expect(build().config.update_multi).toBeUndefined();
   });
@@ -3000,4 +3163,81 @@ describe('remote backends get no PTY quick-action keys', () => {
       expect(keysIn(cliId)).toEqual([]);
     });
   }
+});
+
+describe('truncateContent single oversized line', () => {
+  it('keeps the tail of a newline-free blob within budget', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('a'.repeat(300_000) + 'END', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.endsWith('a'.repeat(900) + 'END')).toBe(true);
+  });
+
+  it.each(['\n', '\r\n', '\n\n'])('still keeps content when the blob ends with %j', async (eol) => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('a'.repeat(300_000) + 'END' + eol, 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out).toContain('a'.repeat(900) + 'END');
+  });
+
+  it('keeps the oversized last line even when short lines precede it', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('head\nmid\n' + 'b'.repeat(5000) + 'END', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.endsWith('b'.repeat(900) + 'END')).toBe(true);
+    expect(out).not.toContain('head');
+  });
+
+  it('does not split multibyte characters when cutting a long line', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('中'.repeat(5000) + '尾', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out).not.toContain('\uFFFD');
+    expect(out.endsWith('尾')).toBe(true);
+  });
+
+  it('keeps the whole fitted last non-blank line pushed out by trailing newlines', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    // The 600-byte non-blank line fits within the 970-byte body budget, but the
+    // 401 trailing newlines push total size to 1001, so line bisection leaves
+    // only blank lines. The line must be kept in full: a negative byte offset
+    // (600 - 970) must clamp to 0, not slice off the line's head.
+    const out = truncateContent('x'.repeat(600) + '\n'.repeat(401), 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.split('\n')[1]).toBe('x'.repeat(600));
+  });
+
+  it('skips whitespace-only (not just empty) lines when picking the tail line', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    // After split('\n') the final element is spaces, not an empty string. The
+    // reverse scan must trim() candidates, otherwise the body is blank again.
+    const out = truncateContent('y'.repeat(3000) + '\n   ', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.split('\n')[1]).toBe('y'.repeat(970));
+  });
+
+  it('budget accounts for JSON escape expansion for quote- and backslash-dense input (#2929)', async () => {
+    const { truncateContent, jsonEscapedByteLength } = await import('../src/im/lark/card-builder.js');
+    const maxBytes = 1000;
+    for (const denseChar of ['"', '\\']) {
+      const out = truncateContent(denseChar.repeat(5000), 'zh', maxBytes);
+      expect(jsonEscapedByteLength(out)).toBeLessThanOrEqual(maxBytes);
+    }
+  });
+});
+
+describe('truncateContent JSON-escape byte budget across lines (#2929)', () => {
+  it.each(['"', '\\'])('accounts for escape expansion when line-bisecting %j-dense multi-line input', async (denseChar) => {
+    const { truncateContent, jsonEscapedByteLength } = await import('../src/im/lark/card-builder.js');
+    const maxBytes = 1000;
+    // 20 lines × 80 escape-doubled chars: 1600 raw bytes but ~3200 JSON-escaped.
+    // Newlines force the LINE bisection path; the single-line cases above only
+    // exercise the single-oversized-line char fallback, so reverting the line
+    // predicate to raw byte length survives those but must fail here.
+    const content = Array.from({ length: 20 }, () => denseChar.repeat(80)).join('\n');
+    const out = truncateContent(content, 'zh', maxBytes);
+    expect(jsonEscapedByteLength(out)).toBeLessThanOrEqual(maxBytes);
+    // Tail is retained rather than the output collapsing to just the prefix.
+    expect(out.endsWith(denseChar)).toBe(true);
+  });
 });

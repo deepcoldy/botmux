@@ -16,6 +16,9 @@
  *   - fails CLOSED (spawn throws, nothing created) if the pane is in fact gone,
  *   - and an authoritative 'missing' on the re-probe yields a proper cold spawn.
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -30,6 +33,16 @@ vi.mock('node:child_process', () => {
     spawnSync: vi.fn(),
   };
 });
+
+// The anti-fork boot gate probes the server through child_process; with it
+// mocked, the darwin lsof census reads as unavailable and the gate fails closed
+// for its full bounded wait (Linux reads /proc and is unaffected). The gate has
+// its own tests; here it is a pass-through so the probe chain stays the unit
+// under test.
+vi.mock('../src/adapters/backend/tmux-anti-fork.js', () => ({
+  createTmuxBootGate: () => ({ leadingArgs: () => [] }),
+  TmuxCompetingServerBlockedError: class TmuxCompetingServerBlockedError extends Error {},
+}));
 
 vi.mock('node:fs', () => {
   const actual: any = require('node:fs');
@@ -252,7 +265,7 @@ describe('indeterminate probe → selector → spawn → worker decisions (singl
     expect(backend.isReattach).toBe(true);
 
     const willReattachPersistent = selected.isReattach === true;
-    backend.spawn('gemini', ['-i', 'first user message'], {
+    backend.spawn('opencode', ['-i', 'first user message'], {
       cwd: '/tmp', cols: 200, rows: 50,
       env: process.env as Record<string, string>,
       strictEnvReattach: willReattachPersistent,
@@ -314,7 +327,7 @@ describe('indeterminate probe → selector → spawn → worker decisions (singl
       const { selected } = runChain();
       const exits: unknown[] = [];
       selected.backend.onExit((code, signal) => exits.push([code, signal]));
-      expect(() => selected.backend.spawn('gemini', ['-i', 'first user message'], {
+      expect(() => selected.backend.spawn('opencode', ['-i', 'first user message'], {
         cwd: '/tmp', cols: 200, rows: 50, env: process.env as Record<string, string>,
         strictEnvReattach: true,
       })).toThrow();
@@ -333,7 +346,7 @@ describe('indeterminate probe → selector → spawn → worker decisions (singl
     expect(gate.action).toBe('spawn');
     expect(reconciled).toBe('missing');
     expect(selected.isReattach).toBe(false);
-    selected.backend.spawn('gemini', ['-i', 'first user message'], {
+    selected.backend.spawn('opencode', ['-i', 'first user message'], {
       cwd: '/tmp', cols: 200, rows: 50, env: process.env as Record<string, string>,
     });
     const newSession = mockedExecFileSync.mock.calls.find(c => (c[1] as string[]).includes('new-session'));
@@ -354,7 +367,7 @@ describe('indeterminate probe → selector → spawn → worker decisions (singl
       return Buffer.from('') as any;
     }) as any);
     const selected = selectSessionBackend({ sessionId: SESSION_ID, backendType: 'tmux', hasExistingSession: false });
-    expect(() => selected.backend.spawn('gemini', [], {
+    expect(() => selected.backend.spawn('opencode', [], {
       cwd: '/tmp', cols: 200, rows: 50, env: process.env as Record<string, string>,
     })).toThrow(/duplicate/);
   });

@@ -14,11 +14,18 @@ import { randomBytes } from 'node:crypto';
  */
 export type RestartSource = 'slash' | 'card' | 'cli_crash' | 'dashboard' | 'cwd_move';
 export type RestartTerminalStatus = 'succeeded' | 'failed' | 'timed_out';
-export type RestartObserverStatus = 'in_progress' | RestartTerminalStatus;
+/**
+ * `cancelled`: the attempt was dropped without a result because the session's
+ * worker was retired underneath it (close, transfer, cold restart). Observers
+ * hear it so a status they already showed does not stay "in progress" forever.
+ */
+export type RestartObserverStatus = 'in_progress' | RestartTerminalStatus | 'cancelled';
 
 export interface RestartObserver {
   source: RestartSource;
-  notify(status: RestartObserverStatus): void | Promise<void>;
+  /** `attemptId` names the physical attempt: observers that joined the same
+   *  attempt receive the same id, so they can share one visible status. */
+  notify(status: RestartObserverStatus, attemptId: string): void | Promise<void>;
 }
 
 interface RestartAttempt {
@@ -44,7 +51,7 @@ export class RestartCoordinator {
     const existing = this.attempts.get(sessionId);
     if (existing) {
       existing.observers.push(observer);
-      this.enqueueNotify(observer, 'in_progress');
+      this.enqueueNotify(observer, 'in_progress', existing.id);
       return { attemptId: existing.id, joined: true };
     }
 
@@ -58,7 +65,7 @@ export class RestartCoordinator {
 
     // Notifications are deliberately detached: a slow IM request must not
     // postpone replacing the process.
-    this.enqueueNotify(observer, 'in_progress');
+    this.enqueueNotify(observer, 'in_progress', attemptId);
     try {
       const started = startPhysicalRestart(attemptId);
       void Promise.resolve(started).catch(() => {
@@ -75,7 +82,7 @@ export class RestartCoordinator {
     if (!attempt || attempt.id !== attemptId) return false;
     this.attempts.delete(sessionId);
     clearTimeout(attempt.timer);
-    for (const observer of attempt.observers) this.enqueueNotify(observer, status);
+    for (const observer of attempt.observers) this.enqueueNotify(observer, status, attemptId);
     return true;
   }
 
@@ -89,6 +96,7 @@ export class RestartCoordinator {
     if (!attempt) return false;
     this.attempts.delete(sessionId);
     clearTimeout(attempt.timer);
+    for (const observer of attempt.observers) this.enqueueNotify(observer, 'cancelled', attempt.id);
     return true;
   }
 
@@ -101,17 +109,17 @@ export class RestartCoordinator {
     this.attempts.clear();
   }
 
-  private async notify(observer: RestartObserver, status: RestartObserverStatus): Promise<void> {
+  private async notify(observer: RestartObserver, status: RestartObserverStatus, attemptId: string): Promise<void> {
     try {
-      await observer.notify(status);
+      await observer.notify(status, attemptId);
     } catch {
       // Best effort; one observer cannot block the restart or other observers.
     }
   }
 
-  private enqueueNotify(observer: RestartObserver, status: RestartObserverStatus): void {
+  private enqueueNotify(observer: RestartObserver, status: RestartObserverStatus, attemptId: string): void {
     const previous = this.notifications.get(observer) ?? Promise.resolve();
-    const next = previous.then(() => this.notify(observer, status));
+    const next = previous.then(() => this.notify(observer, status, attemptId));
     this.notifications.set(observer, next);
     void next.finally(() => {
       if (this.notifications.get(observer) === next) this.notifications.delete(observer);

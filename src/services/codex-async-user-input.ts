@@ -17,14 +17,22 @@ export function parseCodexAsyncUserInput(value: unknown): CodexAsyncUserInput | 
     ...(typeof v.nativeTurnId === 'string' ? { nativeTurnId: v.nativeTurnId } : {}) };
 }
 
-/** Only the authenticated answer to an ordinary human Lark question may use
- * in-turn delivery. Legacy cards and other sinks retain serial delivery. */
-export function codexAsyncAnswerSteerTarget(input: CodexAsyncUserInput, facts: {
+export interface CodexAsyncAnswerSteerFacts {
   answerer: string; originalAnswerer?: string; human: boolean;
   managedLark: boolean; cleanInputAccepted: boolean;
-}): string | undefined {
-  return input.nativeTurnId && facts.human && facts.managedLark && facts.cleanInputAccepted
-    && facts.originalAnswerer === facts.answerer ? input.nativeTurnId : undefined;
+}
+
+/** A proven human answer remains interactive after it starts its own turn,
+ * including answers from legacy cards without a native target. This grant
+ * alone never permits inserting that answer into an unrelated native turn. */
+export function codexAsyncAnswerSteerable(facts: CodexAsyncAnswerSteerFacts): boolean {
+  return facts.human && facts.managedLark && facts.cleanInputAccepted
+    && facts.originalAnswerer === facts.answerer;
+}
+
+/** In-turn answer delivery additionally requires its original native target. */
+export function codexAsyncAnswerSteerTarget(input: CodexAsyncUserInput, facts: CodexAsyncAnswerSteerFacts): string | undefined {
+  return codexAsyncAnswerSteerable(facts) ? input.nativeTurnId : undefined;
 }
 
 /** This only narrows an existing daemon steer grant. A synthetic async answer

@@ -6,7 +6,7 @@ import { isIP } from 'node:net';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import type { FeedbackEventEnvelope, FrozenWebhookDestination } from './feedback-outbox.js';
-import type { SkillFeedbackStore } from './skill-feedback-store.js';
+import type { CompatibleFeedbackStore } from './feedback-storage-types.js';
 
 export interface AddressRecord { address: string; family: 4 | 6 }
 type Lookup = (hostname: string) => Promise<AddressRecord[]>;
@@ -143,14 +143,14 @@ export async function dispatchWebhookAttempt(input: {
       headers: { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(body)), 'User-Agent': 'botmux-feedback-webhook/1', 'X-Botmux-Event-Id': input.event.eventId, 'X-Botmux-Event-Type': input.event.type, 'X-Botmux-Timestamp': timestamp, 'X-Botmux-Signature': `v1=${signature}` },
     });
     return { kind: classifyWebhookResponse(response.status), status: response.status, ...(response.headers['retry-after'] ? { retryAfter: response.headers['retry-after'] } : {}) };
-  } catch (error) { return { kind: 'retry', error: String((error as Error)?.message ?? error).slice(0, 500) }; }
+  } catch { return { kind: 'retry', error: 'webhook_outcome_unknown' }; }
 }
 
 export function startFeedbackWebhookDispatcher(options: {
-  store: SkillFeedbackStore; readSecret: (ref: string) => string | undefined;
+  store: CompatibleFeedbackStore; readSecret: (ref: string) => string | undefined;
   dispatch?: typeof dispatchWebhookAttempt; intervalMs?: number; staleClaimMs?: number; batchSize?: number; shutdownMs?: number;
   allowPrivateNetworks?: boolean; onError?: (error: unknown) => void;
-}): { ready: Promise<void>; stop: (timeoutMs?: number) => Promise<void> } {
+}): { ready: Promise<void>; stop: (timeoutMs?: number) => Promise<void>; quiesce: () => Promise<void> } {
   let stopped = false, timer: NodeJS.Timeout | undefined, running: Promise<void> | undefined;
   const controller = new AbortController();
   const dispatch = options.dispatch ?? dispatchWebhookAttempt;
@@ -158,21 +158,21 @@ export function startFeedbackWebhookDispatcher(options: {
     if (stopped || running) return;
     running = (async () => {
       const now = Date.now(), claimToken = randomUUID();
-      const claim = options.store.tryClaimFeedbackOutbox({ now, limit: options.batchSize ?? 10, claimToken });
+      const claim = await options.store.tryClaimFeedbackOutbox({ now, limit: options.batchSize ?? 10, claimToken });
       if (!claim.done) return;
       const rows = claim.rows;
       await Promise.all(rows.map(async row => {
         try {
           const secret = options.readSecret(row.destination.secretRef);
-          if (!secret) { options.store.tryRescheduleFeedbackOutbox(row.outboxId, claimToken, { now, nextAttemptAt: now, error: 'webhook_secret_missing', permanent: true }); return; }
+          if (!secret) { await options.store.tryRescheduleFeedbackOutbox(row.outboxId, claimToken, { now, nextAttemptAt: now, error: 'webhook_secret_missing', permanent: true }); return; }
           const result = await dispatch({ destination: row.destination, event: row.event, secret, allowPrivateNetworks: options.allowPrivateNetworks, signal: controller.signal });
-          if (result.kind === 'delivered') { options.store.trySettleFeedbackOutboxDelivered(row.outboxId, claimToken, result.status ?? 200, new Date().toISOString()); return; }
+          if (result.kind === 'delivered') { await options.store.trySettleFeedbackOutboxDelivered(row.outboxId, claimToken, result.status ?? 200, new Date().toISOString()); return; }
           const delay = result.kind === 'retry' ? computeRetryDelay({ attempts: row.attempts, retryAfter: result.retryAfter }) : 0;
-          options.store.tryRescheduleFeedbackOutbox(row.outboxId, claimToken, { now, nextAttemptAt: now + delay, error: result.error ?? `webhook_http_${result.status ?? 0}`, httpStatus: result.status, permanent: result.kind === 'failed' });
+          await options.store.tryRescheduleFeedbackOutbox(row.outboxId, claimToken, { now, nextAttemptAt: now + delay, error: result.error === 'webhook_outcome_unknown' ? `webhook_outcome_unknown:${claimToken}` : result.error ?? `webhook_http_${result.status ?? 0}`, httpStatus: result.status, permanent: result.kind === 'failed' });
         } catch (error) {
           options.onError?.(error);
           const delay = computeRetryDelay({ attempts: row.attempts });
-          options.store.tryRescheduleFeedbackOutbox(row.outboxId, claimToken, { now, nextAttemptAt: now + delay, error: String((error as Error)?.message ?? error).slice(0, 500), permanent: false });
+          await options.store.tryRescheduleFeedbackOutbox(row.outboxId, claimToken, { now, nextAttemptAt: now + delay, error: String((error as Error)?.message ?? error).slice(0, 500), permanent: false });
         }
       }));
     })().finally(() => { running = undefined; });
@@ -181,9 +181,11 @@ export function startFeedbackWebhookDispatcher(options: {
   const installInterval = (): void => {
     if (stopped || timer) return;
     timer = setInterval(() => {
-      try { options.store.tryResetExpiredFeedbackOutboxClaims(Date.now(), options.staleClaimMs ?? 60_000); }
-      catch (error) { options.onError?.(error); }
-      void tick().catch(error => options.onError?.(error));
+      void (async () => {
+        try { await options.store.tryResetExpiredFeedbackOutboxClaims(Date.now(), options.staleClaimMs ?? 60_000); }
+        catch (error) { options.onError?.(error); }
+        await tick();
+      })().catch(error => options.onError?.(error));
     }, options.intervalMs ?? 5_000);
     timer.unref?.();
   };
@@ -194,7 +196,7 @@ export function startFeedbackWebhookDispatcher(options: {
     // webhooks never delivered until process restart). Report the bootstrap
     // failure but let the self-healing interval take over.
     try {
-      options.store.tryResetExpiredFeedbackOutboxClaims(Date.now(), options.staleClaimMs ?? 60_000);
+      await options.store.tryResetExpiredFeedbackOutboxClaims(Date.now(), options.staleClaimMs ?? 60_000);
       await tick();
     } catch (error) {
       options.onError?.(error);
@@ -202,7 +204,12 @@ export function startFeedbackWebhookDispatcher(options: {
       installInterval();
     }
   })();
-  return { ready, stop: async (timeoutMs?: number) => {
+  return { ready, quiesce: async () => {
+    stopped = true;
+    if (timer) clearInterval(timer);
+    await ready;
+    await running;
+  }, stop: async (timeoutMs?: number) => {
     stopped = true; if (timer) clearInterval(timer); controller.abort();
     // Caller (daemon shutdown) passes the REMAINING shared deadline budget so
     // this stop cannot add its own default window on top of the total shutdown

@@ -75,7 +75,10 @@ type TmuxRun = (...args: string[]) => { stdout?: string | null };
 
 /**
  * Wait until a pane is dead and its exit status is known; returns the status
- * as text ('' only if it never became known) and what was last seen.
+ * as text and what was last seen. `status` is '' both when no status became
+ * known and for a signal death, which has no exit code; `seen` tells them
+ * apart — a signal death ends with the kernel reading (`kernel={"kind":
+ * "signaled",…}`) or, once tmux reaped it, with tmux's own empty status.
  *
  * tmux publishes `#{pane_dead_status}` only once it has reaped the pane's
  * process. Until then the pane reads `1:` — dead, no status — and on CI tmux
@@ -318,6 +321,15 @@ describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code'
       expect(await waitForDeadPane(tmux, 'bmx-corpse')).toMatchObject({ dead: true, status: '77' });
     });
 
+    // The fixture's other kernel outcome: a signal death has no exit code, so
+    // the wait ends with an empty status and says why in `seen`.
+    it('lets the corpse fixture end on an unreaped signal death without inventing a code', async () => {
+      tmux('new-session', '-d', '-s', 'bmx-signal-corpse', 'sh -c "kill -9 $$"', ';', 'set-option', '-t', 'bmx-signal-corpse', 'remain-on-exit', 'on');
+      const result = await waitForDeadPane(tmux, 'bmx-signal-corpse');
+      expect(result).toMatchObject({ dead: true, status: '' });
+      expect(result.seen).toContain('kernel={"kind":"signaled","signal":9}');
+    });
+
     it('keeps an unreaped signal death on the ordinary channel and reaps its remnant', async () => {
       expect(await runToExit('sleep 1.5; kill -9 $$')).toEqual({ code: 1, signal: null });
       const sessions = String(tmux('list-sessions', '-F', '#{session_name}').stdout ?? '').split('\n').filter(Boolean);
@@ -490,6 +502,111 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
       exists = tmux('has-session', '-t', 'bmx-corpse').status === 0;
     }
     expect(exists).toBe(false);
+  });
+
+  // 2026-11-06: corpses left behind by a tmux server crash. Launch selection
+  // reads the corpse as 'missing', so the next generation CREATES the session —
+  // and every new-session failed with "duplicate session: bmx-…" until someone
+  // removed the corpse by hand.
+  it('a fresh launch onto a corpse\'s name reaps the corpse and starts a live session', async () => {
+    const corpsePanePid = String(tmux('display-message', '-p', '-t', 'bmx-corpse', '#{pane_pid}').stdout).trim();
+    const backend = new TmuxPipeBackend('bmx-corpse', { createSession: true, ownsSession: true, socketName: socket });
+    try {
+      backend.spawn('/bin/sh', ['-c', 'sleep 60'], {
+        cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+      });
+      const pane = String(tmux('display-message', '-p', '-t', 'bmx-corpse', '#{pane_dead}:#{pane_pid}').stdout).trim();
+      const [dead, panePid] = pane.split(':');
+      expect(dead).toBe('0');
+      expect(panePid).not.toBe(corpsePanePid);
+      // The neighbour was never touched.
+      expect(String(tmux('display-message', '-p', '-t', 'bmx-live-one', '#{pane_dead}').stdout).trim()).toBe('0');
+    } finally {
+      backend.kill();
+    }
+  });
+
+  // Only a session whose panes are ALL dead may be reaped: a live one keeps
+  // both its pane and the original error.
+  it('a fresh launch onto a LIVE session\'s name still fails and leaves that session alone', () => {
+    const livePanePid = String(tmux('display-message', '-p', '-t', 'bmx-live-one', '#{pane_pid}').stdout).trim();
+    const backend = new TmuxPipeBackend('bmx-live-one', { createSession: true, ownsSession: true, socketName: socket });
+    expect(() => backend.spawn('/bin/sh', ['-c', 'sleep 60'], {
+      cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+    })).toThrow(/duplicate session/);
+    expect(String(tmux('display-message', '-p', '-t', 'bmx-live-one', '#{pane_dead}:#{pane_pid}').stdout).trim())
+      .toBe(`0:${livePanePid}`);
+  });
+
+  // A split opened in the Web terminal can leave one dead pane (retained by
+  // remain-on-exit) next to one LIVE pane. The reap requires EVERY pane dead:
+  // such a session is alive, and neither pane may be touched.
+  it('never reaps a session whose dead pane shares it with a live pane', async () => {
+    tmux('set-option', '-t', 'bmx-live-one', 'remain-on-exit', 'on');
+    tmux('split-window', '-t', 'bmx-live-one', '-d', 'sh -c "exit 8"');
+    // 与 waitForDeadPane 同一个理由：pane_dead 翻到 1 之后 tmux 才回填
+    // pane_dead_status，饥饿下这个 '1:' 瞬态能持续超过 3s 墙钟（CI 实测在整
+    // 个等待窗口里一直是 '1:'），按墙钟给预算会在状态回填前耗尽。按读次数给
+    // 预算——被调度走的测试不产生读取，饥饿只会拉长墙钟而不会烧穿预算。
+    let panes: string[] = [];
+    for (let reads = 0; reads < DEAD_PANE_MAX_READS; reads += 1) {
+      panes = String(
+        tmux('list-panes', '-s', '-t', '=bmx-live-one:', '-F', '#{pane_dead}:#{pane_dead_status}').stdout ?? '',
+      ).split('\n').map(line => line.trim()).filter(Boolean).sort();
+      if (panes.includes('1:8')) break;
+      await new Promise(resolve => setTimeout(resolve, DEAD_PANE_POLL_INTERVAL_MS));
+    }
+    expect(panes, 'one live and one retained dead pane').toEqual(['0:', '1:8']);
+    const livePanePid = String(tmux('display-message', '-p', '-t', 'bmx-live-one', '#{pane_pid}').stdout).trim();
+    const backend = new TmuxPipeBackend('bmx-live-one', { createSession: true, ownsSession: true, socketName: socket });
+    expect(() => backend.spawn('/bin/sh', ['-c', 'sleep 60'], {
+      cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+    })).toThrow(/duplicate session/);
+    const after = String(
+      tmux('list-panes', '-s', '-t', '=bmx-live-one:', '-F', '#{pane_dead}:#{pane_dead_status}').stdout ?? '',
+    ).split('\n').map(line => line.trim()).filter(Boolean).sort();
+    expect(after).toEqual(['0:', '1:8']);
+    expect(String(tmux('display-message', '-p', '-t', 'bmx-live-one', '#{pane_pid}').stdout).trim()).toBe(livePanePid);
+  });
+
+  // The corpse can be reaped by someone else between the reap's two tmux calls.
+  // A bare `-t bmx-corpse` then PREFIX-matches the live `bmx-corpse-neighbour`;
+  // the reap must name its session exactly. The wrapper makes the race certain.
+  it('a corpse that vanishes mid-reap never lets the reap hit a live session sharing its prefix', () => {
+    tmux('new-session', '-d', '-s', 'bmx-corpse-neighbour', 'sleep 60');
+    const neighbour = () => String(tmux('display-message', '-p', '-t', 'bmx-corpse-neighbour', '#{pane_dead}:#{pane_pid}').stdout).trim();
+    const before = neighbour();
+    expect(before.startsWith('0:')).toBe(true);
+    const raceBin = join(dir, 'race-bin');
+    mkdirSync(raceBin);
+    writeFileSync(join(raceBin, 'tmux'), [
+      '#!/bin/sh',
+      `'${realTmux}' -S '${socket}' "$@"`,
+      'rc=$?',
+      `case " $* " in *" list-panes "*) '${realTmux}' -S '${socket}' kill-session -t '=bmx-corpse' >/dev/null 2>&1 ;; esac`,
+      'exit $rc',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    process.env.PATH = `${raceBin}:${process.env.PATH}`;
+    const backend = new TmuxPipeBackend('bmx-corpse', { createSession: true, ownsSession: true, socketName: socket });
+    try {
+      backend.spawn('/bin/sh', ['-c', 'sleep 60'], {
+        cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+      });
+    } finally {
+      backend.kill();
+    }
+    expect(neighbour()).toBe(before);
+  });
+
+  it('never reaps a session outside botmux\'s bmx- names, even a corpse', async () => {
+    tmux('new-session', '-d', '-s', 'user-corpse', 'sh -c "exit 5"', ';', 'set-option', '-t', 'user-corpse', 'remain-on-exit', 'on');
+    expect(await waitForDeadPane(tmux, 'user-corpse')).toMatchObject({ dead: true });
+    const backend = new TmuxPipeBackend('user-corpse', { createSession: true, ownsSession: true, socketName: socket });
+    expect(() => backend.spawn('/bin/sh', ['-c', 'sleep 60'], {
+      cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+    })).toThrow(/duplicate session/);
+    expect(tmux('has-session', '-t', '=user-corpse').status).toBe(0);
   });
 });
 

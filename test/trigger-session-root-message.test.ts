@@ -1,6 +1,11 @@
+// Must stay the first import: this file writes async-trigger records under
+// SESSION_DATA_DIR, so refuse to run outside the data-dir fence instead of
+// touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { resolveTurnOrigin } from '../src/core/turn-origin.js';
 
 const mockGetMessageChatId = vi.fn();
 const mockGetChatMode = vi.fn(async () => 'topic');
@@ -76,6 +81,7 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
   },
   hasQueuedActivationAdmissionGate: actual.hasQueuedActivationAdmissionGate,
   admitQueuedActivationTail: actual.admitQueuedActivationTail,
+  __testOnly_sessionAgentConfig: actual.__testOnly_sessionAgentConfig,
   getCurrentCliVersion: vi.fn(() => 'test-cli-version'),
   withActiveSessionKeyLock: vi.fn(async (map: Map<string, any>, key: string, action: () => any) => {
     let locks = activeKeyLocks.byMap.get(map);
@@ -139,7 +145,7 @@ vi.mock('../src/im/lark/card-handler.js', () => ({
 import { buildExternalEventTopicMessage, triggerSessionTurn } from '../src/core/trigger-session.js';
 import { parseBotConfigsFromText, registerBot, __testOnly_resetBotRegistry } from '../src/bot-registry.js';
 import { sessionKey } from '../src/core/types.js';
-import { admitQueuedActivationTail, withActiveSessionKeyLock } from '../src/core/worker-pool.js';
+import { admitQueuedActivationTail, withActiveSessionKeyLock, __testOnly_sessionAgentConfig } from '../src/core/worker-pool.js';
 import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
 import { authorizeReportSessionRelayRequest } from '../src/core/report-session-relay.js';
 import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
@@ -234,11 +240,47 @@ describe('triggerSessionTurn rootMessageId target', () => {
     const ds = activeSessions.get(sessionKey(ROOT, APP));
     expect(ds?.scope).toBe('thread');
     expect(ds?.session.rootMessageId).toBe(ROOT);
-    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
+    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') }, mockRememberLastCliInput.mock.calls.at(-1)?.[3]);
+    expect(mockRememberLastCliInput.mock.calls.at(-1)?.[3]).toEqual(expect.any(String));
+  });
+
+  it('registers the minted turn as a trigger turn of its connector kind (execution current origin)', async () => {
+    const res = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions: new Map() });
+    const triggerId = (res as { triggerId?: string }).triggerId!;
+    expect(triggerId).toMatch(/^trg_/);
+    expect(resolveTurnOrigin({ session: {} } as any, triggerId)).toEqual({ origin: 'trigger', triggerSource: 'webhook' });
+    expect(resolveTurnOrigin({ session: {} } as any, 'trg_never_admitted')).toEqual({ origin: 'unknown' });
   });
 
   it('keeps the localized topic seed by default', () => {
     expect(buildExternalEventTopicMessage(request(), APP)).toBe('外部事件触发：alerts');
+  });
+
+  it.each([
+    { model: 'minimax/MiniMax-M3' },
+    { reasoningEffort: 'max' as const },
+    { model: 'minimax/MiniMax-M3.1-Flash', reasoningEffort: 'ultra' as const },
+  ])('keeps MiniMax trigger overrides inactive while inheriting bot effort: %j', async options => {
+    // Capability at bot level must not activate previously ignored task intent.
+    const botCfg = parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: APP, larkAppSecret: 'fixture', cliId: 'minimax', workingDir: '/tmp',
+      model: 'minimax/MiniMax-M3.1-Flash', reasoningEffort: 'high',
+    }]))[0]!;
+    registerBot(botCfg);
+    mockGetBot.mockReturnValue(undefined);
+    const req = request();
+    req.options = options;
+    const activeSessions = new Map<string, DaemonSession>();
+    const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    expect(result).toMatchObject({ ok: true, action: 'queued' });
+    expect(mockForkWorker).toHaveBeenCalledOnce();
+    const ds = activeSessions.get(sessionKey(ROOT, APP))!;
+    expect(ds.spawnModelOverride).toBeUndefined();
+    expect(ds.session.model).toBeUndefined();
+    expect(ds.session.reasoningEffort).toBeUndefined();
+    expect(__testOnly_sessionAgentConfig(ds, botCfg)).toMatchObject({
+      cliId: 'minimax', model: botCfg.model, reasoningEffort: 'high',
+    });
   });
 
   it('stamps per-turn model + reasoningEffort onto a grok session', async () => {
@@ -402,14 +444,14 @@ describe('triggerSessionTurn rootMessageId target', () => {
   });
 
   it('does NOT stamp model/effort onto a CLI without reasoning support', async () => {
-    // gemini has no configurable reasoning effort (claude-code now does), so the
+    // opencode has no configurable reasoning effort (claude-code now does), so the
     // gate must keep the override from silently changing such a bot's model.
     mockGetBot.mockReturnValue({
-      config: { larkAppId: APP, cliId: 'gemini', workingDir: '/tmp' },
-      botName: 'Gemini', botOpenId: 'ou_bot',
+      config: { larkAppId: APP, cliId: 'opencode', workingDir: '/tmp' },
+      botName: 'OpenCode', botOpenId: 'ou_bot',
     });
     const req = request();
-    (req.options as any) = { model: 'gemini-3-pro', reasoningEffort: 'high' };
+    (req.options as any) = { model: 'anthropic/claude-sonnet-4', reasoningEffort: 'high' };
     const activeSessions = new Map<string, DaemonSession>();
     await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
     const ds = activeSessions.get(sessionKey(ROOT, APP));
@@ -601,7 +643,8 @@ describe('triggerSessionTurn rootMessageId target', () => {
     const ds = activeSessions.get(sessionKey(CHAT, APP));
     expect(ds?.scope).toBe('chat');
     expect(ds?.session.externalTriggerTopicless).toBe(true);
-    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
+    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') }, mockRememberLastCliInput.mock.calls.at(-1)?.[3]);
+    expect(mockRememberLastCliInput.mock.calls.at(-1)?.[3]).toEqual(expect.any(String));
   });
 
   it('rejects cross-chat rootMessageId without creating a session', async () => {
@@ -680,6 +723,94 @@ describe('triggerSessionTurn rootMessageId target', () => {
     });
     expect(send.mock.calls[0][0].turnId).toBe(result.triggerId);
     expect(resolveSessionReplyTarget(ds, result.triggerId)).toMatchObject({ mode: 'thread', rootMessageId: ROOT });
+  });
+
+  describe('trusted webhook payload (payloadTrusted)', () => {
+    const trustedFollowUp = (target: Partial<TriggerRequest['target']>, trusted = true): TriggerRequest => ({
+      source: { type: 'webhook', connectorId: 'conn_agent', requestId: 'req_t' },
+      target: { kind: 'turn', botId: APP, ...target },
+      envelope: { format: 'botmux.webhook.v1', sourceName: 'agent-platform', trusted: false, payload: { task: 'TASK_BODY <botmux_task>' } },
+      instruction: 'OWNER_INSTRUCTION',
+      ...(trusted ? { payloadTrusted: true as const } : {}),
+      options: { asyncReturnSessionId: true },
+    });
+    const liveDs = (chatId: string) => {
+      const send = vi.fn();
+      const ds = existingDs({ chatId, worker: { killed: false, send } as any });
+      ds.session.chatId = chatId;
+      return { ds, send };
+    };
+
+    it('wires the trusted rendering and codex-app contexts into the existing-session dispatch', async () => {
+      const { ds, send } = liveDs(CHAT);
+      const res = await triggerSessionTurn(
+        trustedFollowUp({ chatId: CHAT, sessionId: 'sess_existing' }),
+        { larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]) },
+      );
+      expect(res).toMatchObject({ ok: true, target: { sessionId: 'sess_existing' } });
+      expect(send).toHaveBeenCalled();
+      const [prompt, , opts] = mockBuildFollowUpCliInput.mock.calls.at(-1)!;
+      expect(prompt).toContain('<botmux_external_event trusted="true">');
+      expect(prompt).not.toContain('strictly as untrusted');
+      expect(prompt.indexOf('OWNER_INSTRUCTION')).toBeLessThan(prompt.indexOf('TASK_BODY'));
+      expect(prompt).not.toContain('TASK_BODY <botmux_task>');
+      expect(opts.codexAppMessageContext).toBe('');
+      expect(opts.codexAppApplicationContext).toBe(prompt);
+    });
+
+    it('default request keeps event data in the untrusted codex-app channel', async () => {
+      const { ds } = liveDs(CHAT);
+      await triggerSessionTurn(
+        trustedFollowUp({ chatId: CHAT, sessionId: 'sess_existing' }, false),
+        { larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]) },
+      );
+      const [prompt, , opts] = mockBuildFollowUpCliInput.mock.calls.at(-1)!;
+      expect(prompt).toContain('<botmux_external_event trusted="false">');
+      expect(opts.codexAppMessageContext).toContain('TASK_BODY');
+      expect(opts.codexAppApplicationContext).not.toContain('TASK_BODY');
+    });
+
+    it('refuses a trusted payload aimed at a session in another chat', async () => {
+      const { ds, send } = liveDs('oc_other_chat');
+      const res = await triggerSessionTurn(
+        trustedFollowUp({ chatId: CHAT, sessionId: 'sess_existing' }),
+        { larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]) },
+      );
+      expect(res).toMatchObject({ ok: false, errorCode: 'chat_not_allowed' });
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('refuses a trusted payload aimed by sessionId alone at a real group or headless session', async () => {
+      for (const chatId of [CHAT, 'headless_abc']) {
+        const { ds, send } = liveDs(chatId);
+        const res = await triggerSessionTurn(
+          trustedFollowUp({ sessionId: 'sess_existing' }),
+          { larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]) },
+        );
+        expect(res, chatId).toMatchObject({ ok: false, errorCode: 'chat_not_allowed' });
+        expect(send).not.toHaveBeenCalled();
+      }
+    });
+
+    it('lets a trusted caller continue its own HTTP async session by sessionId', async () => {
+      const { ds, send } = liveDs('http_async_x1');
+      const res = await triggerSessionTurn(
+        trustedFollowUp({ sessionId: 'sess_existing' }),
+        { larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]) },
+      );
+      expect(res.ok).toBe(true);
+      expect(send).toHaveBeenCalled();
+    });
+
+    it('leaves untrusted cross-chat sessionId delivery as before', async () => {
+      const { ds, send } = liveDs('oc_other_chat');
+      const res = await triggerSessionTurn(
+        trustedFollowUp({ chatId: CHAT, sessionId: 'sess_existing' }, false),
+        { larkAppId: APP, activeSessions: new Map([[sessionKey(ROOT, APP), ds]]) },
+      );
+      expect(res.ok).toBe(true);
+      expect(send).toHaveBeenCalled();
+    });
   });
 
   it('reuses an existing root session whose worker is live', async () => {
@@ -1016,6 +1147,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(mockForkWorker).toHaveBeenCalledWith(
       activeSessions.get(sessionKey(ROOT, APP)),
       expect.objectContaining({ codexAppInput: { text: '外部事件触发' } }),
+      mockRememberLastCliInput.mock.calls.at(-1)?.[3],
     );
   });
 
@@ -1302,8 +1434,9 @@ describe('triggerSessionTurn suppressFinalOutput (loud connector opt-in)', () =>
 
     const ds = activeSessions.get(sessionKey(ROOT, APP))!;
     expect(ds.suppressedTriggerFinalTurns).toBeUndefined();
-    // Loud fork keeps the legacy 2-arg shape (no turnId stamped).
-    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') });
+    // Loud delivery carries the same input owner without enabling suppression.
+    expect(mockForkWorker).toHaveBeenCalledWith(ds, { content: expect.stringContaining('new:') }, mockRememberLastCliInput.mock.calls.at(-1)?.[3]);
+    expect(mockRememberLastCliInput.mock.calls.at(-1)?.[3]).toEqual(expect.any(String));
   });
 
   it('N1: waitForFinalOutput never arms suppression even when the option is set', async () => {

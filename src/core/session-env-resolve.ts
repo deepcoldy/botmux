@@ -7,7 +7,7 @@
  */
 import type { BackendType } from '../adapters/backend/types.js';
 import { readRawGlobalSessionEnv } from '../global-config.js';
-import { botInjectedEnv, buildSessionChildEnv, type EnvPolicy } from './env-policy.js';
+import { botInjectedEnv, buildBotWorkerEnv, buildSessionChildEnv, type EnvPolicy } from './env-policy.js';
 import type { SessionEnvLockContext } from './per-bot-env.js';
 import { isRemoteBackendId } from './remote-cli-ids.js';
 import {
@@ -101,7 +101,9 @@ export function resolveSessionEnv(input: {
     const bot = botEnvLayer(input.bot);
     composed = composeSessionEnv(
       [input.global ?? readGlobalSessionEnvLayer(), input.skipBotSet ? { set: {}, unset: bot.unset } : bot],
-      sessionEnvLockContextForBot(input.bot, input.facts),
+      // The wrapper follows the backend this launch runs on, which a session can
+      // pin away from the bot's default (worker.ts usesLarkToolBinding).
+      sessionEnvLockContextForBot({ ...input.bot, backendType: input.backendType }, input.facts),
     );
   }
   return {
@@ -137,4 +139,22 @@ export function botOneShotProbeEnv(base: NodeJS.ProcessEnv, bot: SessionEnvBotIn
 
 export function botOneShotEnv(base: NodeJS.ProcessEnv, bot: SessionEnvBotInput): NodeJS.ProcessEnv {
   return botOneShotProbeEnv(base, bot).env;
+}
+
+/**
+ * The env view of worker spawnCli's network-policy pre-checks: it evaluates
+ * `networkProxyError(policy, { ...process.env, ...cfg.env })` inside the
+ * WORKER process, whose own environment is the daemon env filtered through
+ * `buildBotWorkerEnv` at fork time (strict drops daemon proxy variables
+ * unless granted via inherit). `cfg.env` is the composed global/bot overlay.
+ * The check runs BEFORE the CLI child env is built, so `envUnset` (applied
+ * only at that child boundary) is not visible here yet. Dashboard save-time
+ * warnings must use this same view: with the raw daemon env they false-warn
+ * on a strict bot whose daemon proxy the worker never inherits, and without
+ * the composed overlay they miss a proxy set in the global sessionEnv layer
+ * (which every new session then refuses to launch with).
+ */
+export function sessionNetworkPolicyEnvView(base: NodeJS.ProcessEnv, bot: SessionEnvBotInput, backendType: BackendType): NodeJS.ProcessEnv {
+  const { env } = resolveSessionEnv({ bot, backendType });
+  return { ...buildBotWorkerEnv(base, bot.envPolicy), ...env };
 }

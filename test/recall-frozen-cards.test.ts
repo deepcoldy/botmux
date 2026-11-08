@@ -1,3 +1,7 @@
+// 第一个 import：测试围栏（unit-setup / bun-test-fence）没生效时整个文件直接拒跑。
+// 本文件有用例往 homedir()/.claude/projects 下写 Claude 会话转录；2026-11-06 一次绕过 setupFiles
+// 的全量运行里，这份转录落进了真实的 ~/.claude/projects。
+import { isInsideDir } from './helpers/require-fenced-data-dir.js';
 import { pendingStartingCardPublication } from '../src/core/starting-card-publication.js';
 /**
  * Unit tests for recallFrozenCards (worker-pool.ts).
@@ -147,6 +151,11 @@ import {
 import { MessageWithdrawnError, MessageUpdateExpiredError } from '../src/im/lark/client.js';
 import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import { getBot, resolveUsageDisplay } from '../src/bot-registry.js';
+
+// 转录路径由 homedir() 推导：HOME 不在本文件的测试围栏内就拒绝加载，一个文件都不写。
+if (!isInsideDir(homedir(), process.env.__TEST_DATA_DIR_FENCE)) {
+  throw new Error(`refusing to run: HOME ${homedir()} is not inside the test fence`);
+}
 
 const buildStreamingCardMock = buildStreamingCard as ReturnType<typeof vi.fn>;
 const getBotMock = getBot as ReturnType<typeof vi.fn>;
@@ -423,7 +432,7 @@ describe('restoreUsageLimitRuntimeState', () => {
     expect(buildStreamingCard).toHaveBeenCalledWith(
       SESSION_ID,
       'om_root',
-      `http://localhost:8800/s/${SESSION_ID}`,
+      '',
       't',
       '',
       'limited',
@@ -439,7 +448,8 @@ describe('restoreUsageLimitRuntimeState', () => {
       false,
       // 17th arg: streaming-card usage snapshot (no transcript in this test →
       // empty; turnTokens is always present, null when no turn delta is known).
-      { context: null, tokens: null, turnTokens: null },
+      // A supported Claude session also carries the idle auto-compact toggle state.
+      { context: null, tokens: null, turnTokens: null, idleAutoCompact: { enabled: false, minutes: 55 } },
       // 18th arg: no configured runtime display name for this Claude fixture.
       undefined,
       // 19th arg: Codex Fast tier badge — undefined for this non-Codex fixture.
@@ -451,6 +461,10 @@ describe('restoreUsageLimitRuntimeState', () => {
       undefined,
       // 22nd arg: no streaming-card buttons are hidden by default.
       [],
+      // 23rd arg: screenshot-unavailable placeholder flag — not set on restore.
+      false,
+      // 24th arg: per-chat substitute card control — unavailable for this fixture.
+      undefined,
     );
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live_limit', '{}');
   });
@@ -1458,7 +1472,7 @@ describe('scheduleCardPatch adjacent duplicate handling', () => {
 // gaps in the first cut; these lock the corrected contract:
 //   - the arm predicate must NOT depend on the Web Terminal port (ZMX ready with
 //     port=0 must still refresh), and must gate on native-usage CLI capability
-//     (gemini/opencode/… have no transcript → nothing to refresh) and on
+//     (opencode/kimi/… have no transcript → nothing to refresh) and on
 //     usageDisplay='streaming';
 //   - the tick reads fresh (breaks the 15s cost-reader throttle) and is
 //     self-correcting (clears its own timer when state no longer qualifies).
@@ -1501,9 +1515,9 @@ describe('usageRefreshShouldRun (arm/clear predicate)', () => {
     expect(usageRefreshShouldRun(ds)).toBe(false);
   });
 
-  it('is false for a CLI without native usage (gemini/opencode/…)', () => {
+  it('is false for a CLI without native usage (opencode/kimi/…)', () => {
     const ds = workingDs();
-    ds.session.cliId = 'gemini' as any;
+    ds.session.cliId = 'opencode';
     expect(usageRefreshShouldRun(ds)).toBe(false);
   });
 
@@ -1572,8 +1586,17 @@ describe('refreshStreamingCardUsage (interval tick)', () => {
     expect(call[2]).toBe(''); // 3rd positional arg = read-only terminal URL
   });
 
-  it('renders the read-only terminal URL for a Web-Terminal backend (tmux/pty)', () => {
+  it('renders an empty terminal URL for a Web-Terminal backend that has no live worker port', () => {
     const ds = workingDs();
+    ds.session.webPort = 9101; // persisted from a prior generation
+    refreshStreamingCardUsage(ds);
+    const call = buildStreamingCardMock.mock.calls[0]!;
+    expect(call[2]).toBe('');
+  });
+
+  it('renders the read-only terminal URL for a live Web-Terminal backend (tmux/pty)', () => {
+    const ds = workingDs();
+    ds.worker = { killed: false } as any;
     ds.workerPort = 9101; // a real Web Terminal port
     refreshStreamingCardUsage(ds);
     const call = buildStreamingCardMock.mock.calls[0]!;
@@ -1654,7 +1677,7 @@ describe('syncUsageRefreshTimer (state-boundary arm/clear)', () => {
   it('does not arm for an unsupported CLI (no group-visible empty-usage PATCH storm)', () => {
     vi.useFakeTimers();
     const ds = workingDs();
-    ds.session.cliId = 'gemini' as any;
+    ds.session.cliId = 'opencode';
     syncUsageRefreshTimer(ds);
     expect(ds.usageRefreshTimer).toBeUndefined();
     vi.advanceTimersByTime(USAGE_REFRESH_INTERVAL_MS * 3);

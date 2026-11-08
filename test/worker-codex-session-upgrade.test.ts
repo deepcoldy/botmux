@@ -25,7 +25,7 @@ type Upgrade = (target: CodexExecutable, running: CodexProcess[]) => Promise<voi
 function evaluate<T>(name: string, state: Record<string, any>): T {
   // A separate lexical scope per harness keeps mutable worker globals isolated.
   // eslint-disable-next-line no-new-func
-  return new Function('state', `with (state) { ${extracted(name)}; return ${name}; }`)(state) as T;
+  return new Function('state', `with (state) { ${extracted('nativeSessionForkPending')} ${extracted(name)}; return ${name}; }`)(state) as T;
 }
 
 function deferred<T>() {
@@ -103,6 +103,7 @@ function harness() {
     clearTimeout,
     // Correlated restart attempt bookkeeping (#1863).
     activeRestartAttemptId: undefined,
+    pendingTopicEffortRestart: undefined,
     restartWindowLaunch: undefined,
     pendingLaunchConvergence: undefined,
     decideRestartReceipt,

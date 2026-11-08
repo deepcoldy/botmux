@@ -294,7 +294,7 @@ export function createCardClickTurnBinder(deps: CardClickTurnBinderDeps) {
     try { deps.beginNewTurn(ds, args.prompt, turnId); } catch (err) {
       logger.warn(`[card-click-turn] beginNewTurn failed for ${turnId}: ${err instanceof Error ? err.message : String(err)}`);
     }
-    rememberLastCliInput(ds, args.prompt, input);
+    rememberLastCliInput(ds, args.prompt, input, turnId);
     markSessionActivity(ds, Date.now(), { human: true });
     sessionStore.updateSession(ds.session);
     logger.info(`[card-click-turn] ${ds.session.sessionId.slice(0, 8)} turn ${turnId} sender=${senderOpenId}`);

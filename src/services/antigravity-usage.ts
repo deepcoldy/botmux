@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { openDatabaseSyncNow } from './sqlite-compat.js';
@@ -148,6 +148,57 @@ export interface AntigravityUsageReadResult {
     reasoningEffort: string;
   };
   result: SessionTokenUsage | null;
+}
+
+/** Read only recent native generation metadata for the session's model.
+ * Independent of usage display and transcript growth; WAL commits may precede
+ * the next transcript record. Missing evidence never invents a default model. */
+export function readLatestAntigravityRuntime(
+  cliSessionId: string,
+  opts?: { conversationsDir?: string },
+): { model?: string } {
+  const dbPath = antigravityRuntimeDbPath(cliSessionId, opts);
+  if (!dbPath || !existsSync(dbPath)) return {};
+  const db = openDatabaseSyncNow(dbPath, { readOnly: true });
+  if (!db) return {};
+  try {
+    // Most recent row normally carries the model. Keep a small backward window
+    // for partial metadata without rereading all historical token counts.
+    const rows = db.prepare('SELECT data FROM gen_metadata ORDER BY idx DESC LIMIT 16').all() as Array<{ data: unknown }>;
+    for (const row of rows) {
+      if (!(row.data instanceof Uint8Array)) continue;
+      const model = parseGenMetadataRow(row.data)?.model.trim();
+      if (model) return { model };
+    }
+  } catch { /* unavailable/old schema: keep identity unknown */ }
+  finally { try { db.close(); } catch { /* best-effort */ } }
+  return {};
+}
+
+function antigravityRuntimeDbPath(cliSessionId: string, opts?: { conversationsDir?: string }): string | undefined {
+  if (!cliSessionId || !/^[a-zA-Z0-9_-][a-zA-Z0-9._-]*$/.test(cliSessionId)) return;
+  return join(opts?.conversationsDir ?? join(homedir(), '.gemini', 'antigravity-cli', 'conversations'), `${cliSessionId}.db`);
+}
+
+/** WAL commits need not change the main database. Sample before reading so a
+ * concurrent commit cannot be cached as though that newer snapshot was read.
+ * Exclude ctime: opening a WAL read-only may change that metadata without any
+ * new database content, which would invalidate every successful cache read. */
+export function antigravityRuntimeSignature(cliSessionId: string, opts?: { conversationsDir?: string }): string | undefined {
+  const dbPath = antigravityRuntimeDbPath(cliSessionId, opts);
+  if (!dbPath) return;
+  const signature = (path: string, optional = false): string => {
+    try {
+      const st = statSync(path, { bigint: true });
+      if (!st.isFile()) throw new Error('Not a native database file');
+      return [st.dev, st.ino, st.size, st.mtimeNs].join(':');
+    } catch (error) {
+      if (optional && (error as NodeJS.ErrnoException).code === 'ENOENT') return 'absent';
+      throw error;
+    }
+  };
+  try { return `${signature(dbPath)}|${signature(dbPath + '-wal', true)}`; }
+  catch { return; }
 }
 
 export function readAntigravityTokenUsage(

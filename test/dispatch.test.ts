@@ -34,6 +34,7 @@ import {
   offTopicSubBotTopic,
   foldableChatSessionAppIds,
   recordDispatchInputCommit,
+  unboundInputCommitLogLevel,
   resolveReportPlacement,
   resolveReportRecipientForSession,
   resolveSendTarget,
@@ -161,6 +162,16 @@ describe('dispatch completion switch wiring', () => {
     expect(result).not.toContain('--status completed');
     expect(result).toContain('--content-file');
     expect(result).toContain('`\\n`');
+  });
+
+  it('uses completed status for direct source replies and keeps a single result sink', () => {
+    const result = buildDispatchCompletionBrief({
+      brief: 'review the locked commit', dispatchRootId: 'om_seed_exact',
+      exactReportRootEnabled: true, sameTopicSendEnabled: true, resultDelivery: 'reply',
+    });
+    expect(result).toContain('botmux report --dispatch-root om_seed_exact --status completed');
+    expect(result).not.toContain('--delivery reply');
+    expect(result).not.toContain('botmux send --no-mention');
   });
 
   it.each(['publish', 'publish-and-relay'] as const)(
@@ -1065,6 +1076,24 @@ describe('acceptedDispatchBotAppIds', () => {
       notBeforeMs: sentAt,
       isWorkerAlive,
     })).toEqual(['cli_repo']);
+  });
+
+  it('warns only for unbound Lark message turns that arrived inside a topic; rootless and synthetic turns stay at debug', () => {
+    const chatSession = {
+      larkAppId: 'cli_repo', chatId: 'oc_target', scope: 'chat' as const,
+      status: 'active', pid: workerPid, workerGeneration,
+    };
+    const inTopic = { target: { mode: 'thread' as const, rootMessageId: 'om_seed' }, inThread: true };
+    const topLevel = { target: { mode: 'plain' as const, chatId: 'oc_target' }, inThread: false };
+    const scheduled = 'schedule:5d7e581a:0b1c2d3e-0000-4000-8000-000000000000';
+    expect(recordDispatchInputCommit(chatSession, scheduled, workerGeneration)).toBe(false);
+    expect(unboundInputCommitLogLevel(scheduled, inTopic)).toBe('debug');
+    expect(unboundInputCommitLogLevel('bmx-recovery-0b1c2d3e', inTopic)).toBe('debug');
+    expect(recordDispatchInputCommit(chatSession, 'om_unbound', workerGeneration)).toBe(false);
+    expect(unboundInputCommitLogLevel('om_unbound', inTopic)).toBe('warn');
+    expect(unboundInputCommitLogLevel('om_unbound', topLevel)).toBe('debug');
+    // completion-proposal 续跑回合是 om_ 形状的合成回合，chat 作用域下不带话题根。
+    expect(unboundInputCommitLogLevel(`om_${'0'.repeat(32)}`, topLevel)).toBe('debug');
   });
 
   it('keeps a rootless ordinary chat-scope turn unbound instead of falling back to a stale session root', () => {

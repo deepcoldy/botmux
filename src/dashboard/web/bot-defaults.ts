@@ -7,6 +7,7 @@ import type { CodexReasoningEffort } from '../../services/codex-reasoning-effort
 import type { CodexServiceTier } from '../../services/codex-service-tier.js';
 import type { StreamingCardButtonId } from '../../im/lark/streaming-card-buttons.js';
 import type { TraexAutoModelConfig } from '../../services/traex-auto-model.js';
+import type { ScratchCapability } from '../../adapters/backend/scratch-capability.js';
 
 /** Bot 配置页的分类 tab。放在这个轻量模块里：⌘K 索引（入口包）要按它生成条目，页面本身很重。 */
 export type BotDefaultsTab = 'common' | 'sessions' | 'security' | 'cards' | 'advanced';
@@ -60,7 +61,9 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.dshProfileTitle', 'botDefaults.dshRuntimeTitle', 'botDefaults.sectionRiff',
       'botDefaults.riffModel', 'botDefaults.riffReasoningEffort',
       'botDefaults.riffSandboxCluster', 'botDefaults.riffJwtEnv',
-      'botDefaults.autoModelTitle', 'botDefaults.autoModelReselectPerTurn',
+      'botDefaults.autoModelTitle', 'botDefaults.autoModelPreflightLoadCheck',
+      'botDefaults.autoModelOverloadThreshold', 'botDefaults.autoModelPreflightTimeout',
+      'botDefaults.autoModelReselectPerTurn',
       'botDefaults.agentCli', 'botDefaults.runtimeDisplayName', 'botDefaults.runtimeLegacyPath',
       'botDefaults.runtimeUpdateProvider', 'botDefaults.nativeSubagentModel', 'botDefaults.nativeSubagentCustomModel',
       'botDefaults.nativeSubagentReasoningEffort', 'botDefaults.nativeSubagentCustomReasoningEffort',
@@ -95,7 +98,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'steward',
     tab: 'sessions',
     titleKey: 'botDefaults.sectionSteward',
-    fieldKeys: ['botDefaults.stewardEnabled', 'botDefaults.stewardChat', 'botDefaults.stewardAutoJoin', 'botDefaults.stewardAutoJoinSolo', 'botDefaults.stewardGuide'],
+    fieldKeys: ['botDefaults.stewardEnabled', 'botDefaults.stewardChat', 'botDefaults.stewardDecisionCards', 'botDefaults.stewardAutoJoin', 'botDefaults.stewardAutoJoinSolo', 'botDefaults.stewardCloseHints', 'botDefaults.stewardGuide'],
   },
   {
     id: 'substitute',
@@ -105,6 +108,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.substituteEnabled', 'botDefaults.substituteTargets', 'botDefaults.substituteChats',
       'botDefaults.substituteExcludedChats', 'botDefaults.substituteReplyMode', 'botDefaults.substituteDisclosure',
       'botDefaults.substituteControlCard', 'botDefaults.substituteTopicGroups', 'botDefaults.substituteTopicActive',
+      'botDefaults.substituteKeywords',
     ],
   },
   {
@@ -157,12 +161,13 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.replyCardMode', 'botDefaults.autoStreaming', 'botDefaults.pinStreamingCard',
       'botDefaults.privateCard', 'botDefaults.writableLink', 'botDefaults.footerTiming',
       'botDefaults.usageDisplay', 'botDefaults.silentTurnReactions', 'botDefaults.replyCardActions',
-      'botDefaults.cotEnabled', 'botDefaults.replyCardTools',
+      'botDefaults.cotEnabled', 'botDefaults.replyCardTools', 'botDefaults.replyCardShowTools',
       'botDefaults.replyFooterEnabled', 'botDefaults.replyFooterBrand', 'botDefaults.replyFooterModel',
       'botDefaults.replyFooterUsage', 'botDefaults.replyFooterRecipients', 'botDefaults.replyFooterVoice',
       'botDefaults.streamingButton.output', 'botDefaults.streamingButton.terminal',
       'botDefaults.streamingButton.writeLink', 'botDefaults.streamingButton.compact',
       'botDefaults.streamingButton.stop', 'botDefaults.streamingButton.close',
+      'botDefaults.streamingButton.substitute',
       'quietPreset.title', 'quietPreset.switch',
     ],
   },
@@ -194,7 +199,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'codex-app-display',
     tab: 'advanced',
     titleKey: 'botDefaults.sectionCodexAppDisplay',
-    fieldKeys: ['botDefaults.codexAppCleanInput', 'botDefaults.codexBrowser', 'botDefaults.noProgressNotify', 'botDefaults.noProgressNotifyTimeoutLabel'],
+    fieldKeys: ['botDefaults.codexAppCleanInput', 'botDefaults.codexBrowser', 'botDefaults.codexBrowserAutoApproveOrigins', 'botDefaults.noProgressNotify', 'botDefaults.noProgressNotifyTimeoutLabel'],
   },
   {
     id: 'codex-runtime',
@@ -223,6 +228,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     fieldKeys: ['botDefaults.sectionLaunchShell', 'sessionEnv.sectionTitle', 'sessionEnv.inheritLabel', 'sessionEnv.tmuxTitle'],
   },
   { id: 'owner-reminder', tab: 'advanced', titleKey: 'botDefaults.ownerReminderTitle', fieldKeys: ['botDefaults.ownerReminderEnabled', 'botDefaults.ownerReminderText', 'botDefaults.ownerReminderInterval'] },
+  { id: 'long-task-reminder', tab: 'cards', titleKey: 'botDefaults.longTaskReminderTitle', fieldKeys: ['botDefaults.longTaskReminderEnabled', 'botDefaults.longTaskReminderThreshold', 'botDefaults.longTaskReminderInterval'] },
 ];
 
 export function botDefaultsSectionDomId(id: string): string {
@@ -297,6 +303,7 @@ export type BotSubstituteTarget = {
 export type BotSubstituteMode = {
   enabled: boolean;
   targets: BotSubstituteTarget[];
+  keywords?: string[];
   disclosure: 'prefix' | 'none';
   chats?: string[];
   excludedChats?: string[];
@@ -351,6 +358,20 @@ export type BotDefaultsRow = {
   autoboundChatCount?: number;
   /** 当前 oncall 绑定数；null = daemon 太旧没报。 */
   oncallChatCount?: number | null;
+  /** allowedUsers 条目数；null / 缺省 = daemon 太旧没报。只用于共享 bot 的沙盒建议。 */
+  allowedUsersCount?: number | null;
+  /** 排除 p2pMode='group' 会话群后的 oncall 绑定数（null = daemon 太旧）。 */
+  oncallSharedChatCount?: number | null;
+  /** 排除会话群后的 allowedChatGroups 条目数（null = daemon 太旧）。 */
+  allowedChatGroupsCount?: number | null;
+  /** 本地文件沙盒是否能作用于该 bot（远程后端 false→不显示建议；null = daemon 太旧）。 */
+  localSandboxApplies?: boolean | null;
+  /** 当前后端是否接受文件沙盒（herdr/zellij/zmx/orca/无远端证明的本地 mojo 为 false；null = daemon 太旧）。 */
+  sandboxCapable?: boolean | null;
+  /** Worker spawn 实际生效的沙盒模式（含全局 env / legacy readIsolation；null = daemon 太旧）。 */
+  effectiveSandboxMode?: 'off' | 'oncall' | 'scratch' | null;
+  /** daemon 环境变量 BOTMUX_SANDBOX 对所有 bot 的强制模式（null = 未强制 / daemon 太旧）。 */
+  sandboxEnvForce?: 'oncall' | 'scratch' | null;
   brandLabel?: string | null;
   /** Sparse per-bot reply-card style override; null means all built-in defaults. */
   replyStyle?: ReplyStyleConfig | null;
@@ -367,6 +388,9 @@ export type BotDefaultsRow = {
   scratchDenyPaths?: string[] | null;
   /** Whether the scratch mode is available on this platform (Linux only). */
   scratchSupported?: boolean;
+  /** Daemon-side read-only probe of what scratch can use on this machine
+   *  (null: older daemon). Advice only; never blocks saving. */
+  scratchCapability?: ScratchCapability | null;
   codexAuthSync?: 'shared' | 'isolated';
   /** Trigger-user CLI auth: null / absent = off (the historical behavior, where
    *  CLI calls use whatever identity is logged in on the machine).
@@ -390,8 +414,17 @@ export type BotDefaultsRow = {
   /** Opt-in policy, configured for future sessions; absence retains legacy behavior. */
   sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy | null;
   sandboxNetworkPolicyPlatform?: string | null;
+  /** Host nameservers usable as dnsServers (Linux), for the editor's starting template. */
+  sandboxNetworkHostDns?: string[];
+  /** Proxy variable names set for this bot's workers (daemon env + bot env). */
+  sandboxNetworkProxyEnv?: string[];
   /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer). */
   sandboxPaths?: { readWrite: string[]; readOnly: string[]; deny: string[] } | null;
+  /** Stored readWrite entries that are `/`, HOME, the botmux data root or an
+   *  ancestor of them: no longer accepted on save, run as readOnly. */
+  sandboxPathsForbiddenReadWrite?: string[];
+  /** Stored readOnly entries naming `/`: refused on save, ignored at spawn. */
+  sandboxPathsReadOnlyRoot?: string[];
   /** Whether the unified file sandbox ALSO applies cross-bot read isolation for
    *  this bot's sessions — true when the CLI (claude/codex) + platform (macOS/Linux)
    *  + no wrapper can enforce it. Drives the capability label under the toggle. */
@@ -417,12 +450,16 @@ export type BotDefaultsRow = {
   silentTurnReactions?: boolean;
   codexAppCleanInput?: boolean;
   codexBrowser?: boolean;
+  codexBrowserAutoApproveOrigins?: boolean;
   writableTerminalLinkInCard?: boolean;
   privateCard?: boolean;
   replyCardActions?: boolean;
   /** Bot-level master switch for the native CoT (thinking process) message.
    *  Default ON — only an explicit false means disabled. */
   cotEnabled?: boolean;
+  /** Show tool calls/commands/results in unified reply cards. Default ON;
+   *  only meaningful for replyCardMode 'unified'. */
+  replyCardShowTools?: boolean;
   /** Whether each turn carries the `<sender>` speaker tag. Default ON — only an
    *  explicit false means the tag is suppressed. */
   senderTag?: boolean;
@@ -439,6 +476,11 @@ export type BotDefaultsRow = {
   startupBlocked?: {
     reason: 'quota_fallback_cycle';
     cycle: string[];
+  } | {
+    /** cliId of a removed CLI (gemini): the Bot is not started until it changes. */
+    reason: 'retired_cli';
+    cliId: string;
+    replacement: string;
   };
   summaryRange?: { limit?: number; sinceHours?: number };
   summaryMemory?: boolean;
@@ -451,7 +493,7 @@ export type BotDefaultsRow = {
   topicUnavailablePolicy?: 'legacy' | 'stop';
   replyDelivery?: 'send' | 'transcript' | null;
   promptInjection?: 'default' | 'none';
-  /** 当前 cliId 的缺省投递方式；目前统一为 'send'。 */
+  /** 当前 cliId 的缺省投递方式（doubao 缺省 transcript，其余 CLI 缺省 send）。 */
   replyDeliveryDefault?: 'send' | 'transcript';
   /** 当前 cliId 是否有转写采集通道（claude-code / 结构化转写白名单）；false 时开关禁用。 */
   replyDeliverySupported?: boolean;
@@ -472,6 +514,8 @@ export type BotDefaultsRow = {
   logicalSessionCount?: number;
   residentSessionCount?: number;
   dormantSessionCount?: number;
+  /** Per-bot native execution reminder preferences; absent means opt-in defaults. */
+  longTaskReminder?: import('../../services/long-task-reminder-policy.js').LongTaskReminderConfig | null;
   sessionOwnerReminder?: {
     enabled: boolean;
     intervalMinutes: number;

@@ -3,6 +3,13 @@ import { DAEMON_ENV_KEYS, resolveDaemonEnv } from '../src/cli/daemon-lifecycle-e
 import { DASHBOARD_H5_ENV_KEYS, DASHBOARD_H5_ENV_PREFIX } from '../src/utils/child-env.js';
 import { resolveDashboardH5AuthConfig } from '../src/dashboard/h5-auth.js';
 
+it('reloads final-output handoff and clears a removed switch on managed restart', () => {
+  expect(resolveDaemonEnv({ BOTMUX_SESSION_ID: 'session-1', BOTMUX_FINAL_OUTPUT_HANDOFF: '0' }, 'BOTMUX_FINAL_OUTPUT_HANDOFF=1'))
+    .toMatchObject({ BOTMUX_FINAL_OUTPUT_HANDOFF: '1' });
+  expect(resolveDaemonEnv({ BOTMUX_SESSION_ID: 'session-1', BOTMUX_FINAL_OUTPUT_HANDOFF: '1' }, 'WEB_HOST=0.0.0.0'))
+    .toMatchObject({ BOTMUX_FINAL_OUTPUT_HANDOFF: '' });
+});
+
 /**
  * Every key resolves to '' unless a source sets it, except the terminal and
  * dashboard bind hosts whose historical defaults land in resolveDaemonEnv. Built from
@@ -63,6 +70,8 @@ describe('resolveDaemonEnv()', () => {
       'BOTMUX_DASHBOARD_EXTERNAL_HOST=dashboard.example.com',
       'BOTMUX_DASHBOARD_HOST=127.0.0.1',
       'BOTMUX_DASHBOARD_PORT=7991',
+      'BOTMUX_TERMINAL_ROUTE_HOST=10.0.0.8',
+      'BOTMUX_TERMINAL_ROUTE_PORT=11419',
       'BOTMUX_DAEMON_IPC_BASE_PORT=7992',
       'BOTMUX_DASHBOARD_PUBLIC_READONLY=false',
       // The regression this pins: a bot session's pane wrapper unsets BOTMUX_*,
@@ -82,6 +91,8 @@ describe('resolveDaemonEnv()', () => {
       BOTMUX_DASHBOARD_EXTERNAL_HOST: 'dashboard.example.com',
       BOTMUX_DASHBOARD_HOST: '127.0.0.1',
       BOTMUX_DASHBOARD_PORT: '7991',
+      BOTMUX_TERMINAL_ROUTE_HOST: '10.0.0.8',
+      BOTMUX_TERMINAL_ROUTE_PORT: '11419',
       BOTMUX_DAEMON_IPC_BASE_PORT: '7992',
       BOTMUX_DASHBOARD_PUBLIC_READONLY: 'false',
       BOTMUX_PUBLIC_URL: 'http://botmux.example.com',
@@ -108,6 +119,34 @@ describe('resolveDaemonEnv()', () => {
       BOTMUX_FORWARD_FOLLOWUP_WAIT_MS: '0',
       BOTMUX_GLOBAL_CONFIG_FILE: '/mnt/shared/global-config.json',
       BOTMUX_GROUP_CONTEXT_SETTINGS_FILE: '/mnt/shared/group-context-settings.json',
+    });
+  });
+
+  it('re-reads the sender resolve timeout from .env on a session-origin restart, including rollback', () => {
+    // P2 regression: the CLI pane wrapper does not unset this key, so a
+    // restart from inside a session (or a detached self-upgrade restart)
+    // inherits the OLD daemon's value, and the daemon's dotenv load never
+    // overrides an inherited key. The lifecycle snapshot must therefore
+    // resolve it from the persisted file like the other machine-wide knobs —
+    // otherwise editing it has no effect and, worse, deleting it from the
+    // file can never restore the documented 800ms default.
+    const inheritedWithStaleValue = {
+      BOTMUX_SESSION_ID: 'session-1',
+      BOTMUX_SENDER_RESOLVE_TIMEOUT_MS: '3000',
+    };
+
+    expect(resolveDaemonEnv(inheritedWithStaleValue, [
+      'BOTMUX_SENDER_RESOLVE_TIMEOUT_MS=1500',
+    ].join('\n'))).toMatchObject({
+      BOTMUX_SENDER_RESOLVE_TIMEOUT_MS: '1500',
+    });
+
+    // Rollback: key removed from the file must resolve to '' so the consumer
+    // falls back to its default instead of keeping the inherited stale value.
+    expect(resolveDaemonEnv(inheritedWithStaleValue, [
+      'BOTMUX_FORWARD_FOLLOWUP_WAIT_MS=1500',
+    ].join('\n'))).toMatchObject({
+      BOTMUX_SENDER_RESOLVE_TIMEOUT_MS: '',
     });
   });
 

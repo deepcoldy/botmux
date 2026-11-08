@@ -142,4 +142,91 @@ describe('resolveSessionById', () => {
     });
     expect(result).toMatchObject({ ok: false, reason: 'unmigrated', message: UNMIGRATED_OPERATOR_HINT });
   });
+
+  it('after an authoritative 404, names the app the store says owns the session', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'resolve-session-'));
+    seedPersistedSessionRows(dataDir, 'cli_owner', {
+      s1: { sessionId: 's1', larkAppId: 'cli_owner', chatId: 'oc_o', rootMessageId: 'om_o', status: 'active' },
+    });
+    const result = await resolveSessionById('s1', {
+      dataDir,
+      env: { BOTMUX_LARK_APP_ID: 'cli_self' },
+      knownAppIds: new Set(['cli_self', 'cli_owner']),
+      findDaemon: () => ({ larkAppId: 'cli_self', ipcPort: 9, botmuxVersion: '3.56.0' }),
+      loadSecret: () => 'secret',
+      fetchIpc: async () => new Response(JSON.stringify({ error: 'not_found' }), { status: 404 }),
+      cliVersion: '3.56.0',
+    });
+    // Still a miss: the owning daemon's answer stands.
+    expect(result).toMatchObject({
+      ok: false,
+      reason: 'not_found',
+      diagnostics: { ownerAppId: 'cli_owner', askedDaemons: [{ appId: 'cli_self', version: '3.56.0' }] },
+    });
+    expect(!result.ok && result.message).toContain('该会话属于 app cli_owner');
+    expect(!result.ok && result.message).not.toContain('botmux restart');
+  });
+
+  it('flags a daemon on another build than this CLI, and stays quiet when versions are undetermined', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'resolve-session-'));
+    const ask = (daemonVersion: string | undefined, cliVersion: string | undefined, extraEnv: NodeJS.ProcessEnv = {}) => resolveSessionById('s1', {
+      dataDir,
+      env: { BOTMUX_LARK_APP_ID: 'cli_self', ...extraEnv },
+      knownAppIds: new Set(['cli_self']),
+      findDaemon: () => ({ larkAppId: 'cli_self', ipcPort: 9, ...(daemonVersion ? { botmuxVersion: daemonVersion } : {}) }),
+      loadSecret: () => 'secret',
+      fetchIpc: async () => new Response(JSON.stringify({ error: 'not_found' }), { status: 404 }),
+      cliVersion,
+    });
+    const stale = await ask('3.50.0', '3.56.0');
+    expect(!stale.ok && stale.message).toContain('v3.50.0');
+    expect(!stale.ok && stale.message).toContain('botmux restart');
+    // Same message for a store-side miss reached without a usable secret.
+    const viaStore = await resolveSessionById('s1', {
+      dataDir,
+      env: {},
+      knownAppIds: new Set(['cli_self']),
+      listDaemons: () => [{ larkAppId: 'cli_self', ipcPort: 9, botmuxVersion: '3.50.0' }],
+      loadSecret: () => { throw new Error('sandboxed'); },
+      cliVersion: '3.56.0',
+    });
+    expect(viaStore).toMatchObject({ ok: false, reason: 'not_found' });
+    expect(!viaStore.ok && viaStore.message).toContain('botmux restart');
+    for (const [daemonVersion, cliVersion] of [['3.56.0', '3.56.0'], [undefined, '3.56.0'], ['3.50.0', '0.0.0']] as const) {
+      const quiet = await ask(daemonVersion, cliVersion);
+      expect(!quiet.ok && quiet.message).not.toContain('botmux restart');
+    }
+
+    // Design doc 2026-08-12 §3.6: a session subprocess (the agent's own shell
+    // — an unsandboxed session IS the host) must get STATE ONLY: no fleet
+    // command and no version numbers, on both the authoritative-404 and the
+    // store-miss paths.
+    const assertStateOnly = (message: string) => {
+      expect(message).toContain('本次未做任何修改');
+      expect(message).not.toContain('botmux restart');
+      expect(message).not.toContain('3.50.0');
+      expect(message).not.toContain('3.56.0');
+    };
+    for (const sessionEnv of [
+      { BOTMUX_SESSION_ID: 'sess-1' },
+      { BOTMUX_ORIGIN_CHANNEL_ID: 'oc_origin' },
+    ]) {
+      // Authoritative-404 path (owning daemon answers).
+      const scopedMiss = await ask('3.50.0', '3.56.0', sessionEnv);
+      expect(scopedMiss.ok).toBe(false);
+      assertStateOnly(!scopedMiss.ok ? scopedMiss.message : '');
+    }
+    // Store-miss path: no daemon reachable and no usable secret.
+    const scopedStoreMiss = await resolveSessionById('s1', {
+      dataDir,
+      env: { BOTMUX_SESSION_ID: 'sess-1' },
+      knownAppIds: new Set(['cli_self']),
+      listDaemons: () => [{ larkAppId: 'cli_self', ipcPort: 9, botmuxVersion: '3.50.0' }],
+      loadSecret: () => { throw new Error('sandboxed'); },
+      cliVersion: '3.56.0',
+    });
+    expect(scopedStoreMiss.ok).toBe(false);
+    assertStateOnly(!scopedStoreMiss.ok ? scopedStoreMiss.message : '');
+  });
 });
+

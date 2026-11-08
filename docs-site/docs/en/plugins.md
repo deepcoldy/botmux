@@ -1,87 +1,185 @@
-# Plugin Development and Market Registration
+# Plugin Development and Publishing
 
-A Botmux Plugin uses one publishable npm package to deliver Skills, MCP, CLI
-commands, a Dashboard page, and a Host Service. This guide is for plugin authors
-and operators. It covers the complete path from project creation and package
-validation to npm publishing and Plugin Market registration.
+A Botmux plugin is **one npm package**. Once installed, it can give the Agent Skills and MCP tools, add subcommands to the `botmux` CLI, add a page to the Dashboard, run a long-lived background service, and register Feishu `/slash commands` and card buttons.
 
-> Current boundary: the Plugin Market is a separate discovery index. Publishing
-> a package to npm does **not** register it in the market, and the current
-> stable Botmux release does not read that index during installation. The full
-> npm package name is always the most reliable installation entry point.
+Start with what you want to do:
 
-## How Botmux loads a Plugin
+| I want to… | Go to |
+| --- | --- |
+| Install an existing plugin and turn it on for a Bot | [Install and manage plugins](#install-and-manage-plugins) |
+| Write a plugin from scratch | [Five-minute start](#five-minute-start) → [Building each contribution](#building-each-contribution) |
+| Publish to npm and list it in the Plugin Market | [Publish to npm](#publish-to-npm) → [Register in the Plugin Market](#register-in-the-plugin-market) |
 
-The root `package.json` is the development, validation, and npm publishing
-envelope. Botmux reads its manifest during installation, then keeps only the
-package's `dist/` directory as the runtime unit. Contributions are discovered at
-fixed paths:
+> Installing a third-party plugin means trusting its author: plugin code runs as the system user that runs Botmux, and installing from npm may run npm lifecycle scripts. Only install packages you trust.
 
-| Capability | Source | Installed entry |
+## What a plugin can provide
+
+A plugin delivers its capabilities through **fixed directories**. Botmux scans them at install time, so nothing else needs registering. Every entry lives in the build output `dist/`:
+
+| Capability | Purpose | Entry after install (relative to `dist/`) |
 | --- | --- | --- |
-| Skill | `skills/<name>/SKILL.md` | `dist/skills/<name>/SKILL.md` |
-| MCP | `src/mcp/` | `dist/mcp/index.json` |
-| CLI command | `src/cli/` | `dist/cli/{index.js,commands.json}` |
-| Dashboard | `src/dashboard/` | `dist/dashboard/index.js` |
-| Host Service | `src/service/` | `dist/service/index.js` |
+| Skill | Instructions for the Agent | `skills/<name>/SKILL.md` |
+| MCP | Tools for the Agent (at most one server per plugin) | `mcp/index.json` |
+| CLI commands | Ops entry points shaped like `botmux <command>` | `cli/index.js` + `cli/commands.json` |
+| Dashboard page | A plugin page inside the Dashboard | `dashboard/index.js` |
+| Dashboard settings | Server-side adapter the page uses to read/write config (optional) | `server/settings.js` |
+| Host Service | A long-running background process, e.g. a local HTTP service | `service/index.js` |
+| Feishu slash commands | `/xxx` in a chat goes straight to the plugin | `commands/index.json` (needs a Host Service) |
+| Card button callbacks | Button clicks on the plugin's cards go to the plugin | `card-actions/index.json` (needs a Host Service) |
 
-There is currently no general worker/daemon hook contribution. Put long-running
-processes in a Host Service, Agent tools in MCP or a Skill, and operational
-entry points in CLI commands.
+There is no general daemon/worker hook. Put long-running logic in a Host Service, Agent capabilities in MCP or a Skill, and human-facing ops entry points in CLI commands.
 
-Installation and enablement are separate operations:
+## Five-minute start
 
-1. `plugin install` downloads the package, validates its manifest, discovers
-   contributions, and stores `dist/`.
-2. `plugin enable` binds the plugin as a machine default or to selected Bots and
-   prepares Skill/MCP snapshots for future sessions.
-
-Botmux does not intentionally invoke the plugin's CLI, Dashboard, MCP, or
-Service entry during installation. However, an npm installation **may run npm
-lifecycle scripts**. Installing a third-party plugin still means trusting its
-publisher.
-
-## Create a project
-
-Plugin **development** requires Node.js 22 or newer with `npm` on your `PATH` —
-the generator shells out to npm to scaffold, install, and test the project. (This
-is a requirement of plugin development specifically; botmux itself is a
-self-contained binary and needs no Node — see [Quickstart](/en/quickstart).)
-
-Install botmux by whichever route you prefer, then run the generator:
+Plugin development needs **Node.js 22+** with `npm` on `PATH`: the generator uses npm to scaffold, install dependencies, and run tests. (That is only a requirement for developing plugins. Botmux itself is a self-contained binary and does not need Node; see [Quick Start](/en/quickstart).)
 
 ```bash
+# 1. Install botmux (either way)
 curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
-# or, if you'd rather install through npm: npm install -g botmux@latest
+# npm install -g botmux@latest
 
+# 2. Generate a plugin project
 botmux plugin init my-plugin
 cd botmux-plugin-my-plugin
+
+# 3. Install in development mode and enable it
+botmux plugin install . --link
+botmux plugin enable my-plugin
+
+# 4. Try the sample command
+botmux my-plugin:hello
 ```
 
-The generator creates a project from the official template, including:
+`plugin init` creates the project from the official template and runs `npm install` and `npm test` for you (`git init` is best-effort; failing it is fine). Defaults:
 
-- npm package name `@botmux-ai/plugin-my-plugin`;
-- Plugin ID `my-plugin`;
-- `my-plugin:` CLI command prefix;
-- examples for all five contribution types;
-- completed `npm install` and `npm test` runs, plus a best-effort `git init`.
+| Item | Default |
+| --- | --- |
+| Directory | `botmux-plugin-my-plugin` |
+| npm package name | `@botmux-ai/plugin-my-plugin` |
+| Plugin ID | `my-plugin` |
+| CLI command prefix | `my-plugin:` |
+| Samples | One for each basic contribution type |
 
-`@botmux-ai` is the official npm organization. Third-party authors without
-publishing access to that scope must change `package.json.name` to a package
-they control:
+`@botmux-ai` is the official npm organization. If you can't publish to that scope, change `name` in `package.json` to a package you control, such as `@your-org/plugin-my-plugin`. The Plugin ID can stay `my-plugin`, but third-party packages must be installed by their full package name.
+
+## Install and manage plugins
+
+### Install
+
+```bash
+# Third-party package: use the full name, ideally pinned to an exact version
+botmux plugin install @your-org/plugin-my-plugin@1.2.3
+
+# Official short ID: expands to @botmux-ai/plugin-my-plugin
+botmux plugin install my-plugin
+
+# A local directory or a packed tarball
+botmux plugin install ./path/to/plugin
+botmux plugin install "file:/absolute/path/plugin-package.tgz"
+```
+
+Installing does three things: download, validate the manifest, and scan the contribution entries, then store `dist/` under `~/.botmux/plugins/<id>/`. **Installing does not run plugin code and does not start the Service.**
+
+### Enable: choose which Bots it applies to
+
+After installing, enable the plugin so it shows up in sessions:
+
+```bash
+# Machine default: applies to every Bot (including Bots added later)
+botmux plugin enable my-plugin
+
+# One Bot only; all = write an entry for each currently configured Bot
+botmux plugin enable my-plugin --bot <name|index|all>
+
+# Turn it off
+botmux plugin disable my-plugin
+botmux plugin disable my-plugin --bot <name|index|all>
+```
+
+- Without `--bot` you get the machine-default scope (stored as `plugins` in `~/.botmux/config.json`). There is no `--global`.
+- Per-Bot enablement is stored in that Bot's `plugins` field in `bots.json` and **adds to** the machine default.
+- If a plugin is already enabled as machine default, turn the machine default off before configuring it per Bot.
+- **After enabling, disabling, or updating, start a new session.** A running CLI does not hot-load new Skills/MCP. Feishu slash commands are the exception: they take effect on the next message.
+
+`botmux plugin list` shows installed plugins and whether each is enabled as machine default.
+
+### Manage from the Dashboard
+
+The **插件** (Plugins) page in the Dashboard sidebar lists every installed plugin. Each plugin card lets you:
+
+- Toggle the machine default with "为所有 Bot 启用" (enable for all Bots), or tick Bots one by one under "按 Bot 启用" (enable per Bot);
+- Start, stop, and restart the plugin's Host Service and see its status, port, PID, access URL, and health check;
+- Expand the details to see what the plugin provides, grouped into Skills / MCP / CLI commands / Dashboard / Service;
+- "Pin 到侧栏" (pin to sidebar) to put the plugin's own Dashboard page in the sidebar.
+
+A plugin's own page lives at `#/plugins/<plugin-id>`. For more on the Dashboard, see [Dashboard](/en/dashboard).
+
+### Manage the Host Service
+
+```bash
+botmux plugin service status
+botmux plugin service start my-plugin      # or --all
+botmux plugin service stop my-plugin
+botmux plugin service restart my-plugin
+```
+
+A Service has one of two modes (declared in the manifest):
+
+| Mode | Behavior |
+| --- | --- |
+| `manual` (default) | Starts only when you run `plugin service start` |
+| `auto` | `botmux start` / `botmux restart` make sure it is running |
+
+- `botmux stop` **keeps** plugin Services running by default; `botmux stop --with-plugin` stops auto Services too.
+- `botmux restart` does not stop auto Services first by default; `botmux restart --with-plugin` stops them and starts them again.
+- Services are managed by Botmux's built-in supervisor; you don't need PM2. Logs are in `~/.botmux/plugin-supervisor/logs/<plugin-id>-out.log` and `-err.log`.
+
+### Update and uninstall
+
+To update, install the new version again. If the plugin has a Service, stop it first. Botmux does **not** stop a Service for you during install, update, or uninstall; a running Service makes the command fail:
+
+```bash
+botmux plugin service stop my-plugin
+botmux plugin install @your-org/plugin-my-plugin@1.2.4
+botmux plugin enable my-plugin
+botmux plugin service start my-plugin
+```
+
+Uninstall:
+
+```bash
+botmux plugin service stop my-plugin
+botmux plugin uninstall my-plugin
+```
+
+Uninstalling removes the plugin's enablement from every scope and deletes the whole `~/.botmux/plugins/<id>/` directory (including plugin config), so back it up first if you need it. It is refused while other enabled plugins depend on it. The `--force` flag shown in help currently cannot bypass dependency or Service protections.
+
+### Tune a plugin's MCP per Bot
+
+To give one Bot's plugin MCP different environment variables or its own timeout, add `pluginRuntime` to that Bot in [bots.json](/en/bots-json):
 
 ```json
 {
-  "name": "@your-org/plugin-my-plugin"
+  "plugins": ["reporting"],
+  "pluginRuntime": {
+    "reporting": {
+      "env": { "PROFILE": "production" },
+      "toolTimeoutMs": 120000
+    }
+  }
 }
 ```
 
-The Plugin ID can remain `my-plugin`. Users must install a third-party package
-by its full npm package name.
+| Field | Meaning |
+| --- | --- |
+| `env` | Injected only into this plugin's local stdio MCP process for this Bot; never into the model CLI's environment |
+| `toolTimeoutMs` | Total timeout per tool call for this plugin (milliseconds, positive integer); defaults to the MCP SDK default |
+
+The machine-wide ceiling is `mcpGatewayMaxToolTimeoutMs` in `~/.botmux/config.json`, default `600000` (10 minutes). `toolTimeoutMs` can't exceed this ceiling; if it does, preparing plugins for a new session fails with an error. Changes apply on the next CLI cold start or new session.
 
 ## `package.json` and the manifest
 
-This complete example includes a plugin dependency and a Service:
+The plugin's root `package.json` is both the npm package description and the plugin manifest (the `botmux` field). Full example:
 
 ```json
 {
@@ -116,31 +214,24 @@ This complete example includes a plugin dependency and a Service:
 }
 ```
 
-The installer validates that:
+Install-time checks:
 
 - `version` is valid SemVer;
 - `keywords` contains `botmux-plugin`;
 - `botmux.id` matches `^[a-z][a-z0-9._-]{0,63}$`;
 - the package contains a `dist/` directory;
-- `service.mode` is either `manual` or `auto`;
-- every declared contribution has a valid fixed entry.
+- `service.mode` is `manual` or `auto` (defaults to `manual`);
+- every contribution entry exists and is well-formed.
 
-Restrict `files` to `dist/` and inspect `npm pack --dry-run` before publishing.
-npm may still include root files such as `package.json`, README, and LICENSE
-automatically, so those files must not contain secrets either.
+`botmux.dependencies.plugins` lists Plugin IDs only; version ranges are not supported. To enable a plugin, its dependencies must be installed and enabled in the same scope. A plugin that other enabled plugins depend on cannot be disabled or uninstalled.
 
-`botmux.dependencies.plugins` contains Plugin IDs only; version ranges are not
-supported. Before the current plugin can be enabled, every dependency must be
-installed and enabled in the same machine-default or Bot scope. Botmux also
-refuses to disable or uninstall a plugin while another enabled plugin depends on
-it.
+Keep `files` limited to `dist/` and check `npm pack --dry-run` before publishing. npm still includes `package.json`, README, and LICENSE automatically, so make sure those contain nothing sensitive either.
 
-## Develop contribution types
+## Building each contribution
 
 ### CLI commands
 
-`src/cli/index.js` default-exports a handler map. The official template emits
-both `dist/cli/index.js` and the command index during the build:
+`src/cli/index.js` default-exports a "command name → handler" object. The official template's build emits both `dist/cli/index.js` and the command index `dist/cli/commands.json`:
 
 ```js
 export default {
@@ -157,45 +248,30 @@ export default {
 };
 ```
 
-Command names must match `^[a-z][a-z0-9._:-]{0,63}$`. Botmux does not add a
-namespace automatically. If two enabled plugins expose the same command name,
-execution fails with a conflict, so use a consistent `<plugin-id>:` prefix.
+Users call it directly as `botmux my-plugin:hello [args...]`.
 
-A handler can read:
+- Command names must match `^[a-z][a-z0-9._:-]{0,63}$`. Botmux adds no namespace, and two enabled plugins with the same command name fail with a conflict, so always prefix with `<plugin-id>:`.
+- If `run` returns a string it is printed; a number becomes the exit code.
+- From a host terminal, only **machine-default** plugins are searched; inside an Agent session, the plugins enabled for that session are searched.
 
-- `pluginId`, `pluginDir`, `packageName`, `version`, `manifest`, and `args`;
-- `api.logger`;
-- `api.resolve(relativePath)`;
-- `api.config.get/set/replace`;
+`ctx` gives you:
+
+- `pluginId`, `pluginDir`, `packageName`, `version`, `manifest`, `args`;
+- `api.logger`, `api.resolve(relativePath)`;
+- `api.config.get/set/replace`: read and write the plugin's private config at `~/.botmux/plugins/<id>/config.json`;
 - `api.settingsPath`.
-
-Private plugin configuration lives under `~/.botmux/plugins/<id>/` and is
-readable and writable by the current system user.
 
 ### Skill
 
-The source entry for each Skill is:
+Write it at `skills/<skill-name>/SKILL.md` during development; after the build it must be at `dist/skills/<skill-name>/SKILL.md`.
 
-```text
-skills/<skill-name>/SKILL.md
-```
-
-After the build it must be present at:
-
-```text
-dist/skills/<skill-name>/SKILL.md
-```
-
-Running Agents do not hot-load new Skills after a plugin is enabled or updated.
-Start a new session so Botmux can regenerate the Plugin/Skill snapshot for the
-new CLI process.
+After enabling or updating, a running Agent does not hot-load the new Skill. Start a new session and Botmux regenerates the plugin and Skill snapshot for that CLI process.
 
 ### MCP
 
-Each plugin can currently contribute at most one MCP server. The built
-`dist/mcp/index.json` supports two transports.
+Each plugin can provide at most one MCP server, declared in `dist/mcp/index.json`. Two transports are supported.
 
-stdio:
+Local process (stdio):
 
 ```json
 {
@@ -205,7 +281,7 @@ stdio:
 }
 ```
 
-Streamable HTTP:
+Remote HTTP (Streamable HTTP):
 
 ```json
 {
@@ -215,57 +291,63 @@ Streamable HTTP:
 }
 ```
 
-Constraints and caveats:
+Things to know:
 
 - only `stdio` and `streamable-http` are supported;
-- the MCP name is the Plugin ID; do not add a separate `name`;
+- the MCP name is the Plugin ID automatically, so don't add `name`;
 - `./...` paths are relative to the installed `dist/`;
-- `${VAR}` string templates are not supported in this configuration;
-- bundle local MCP runtime dependencies into `dist/` rather than relying on the
-  development `node_modules`;
-- never put real tokens, cookies, or secrets in the package; runtime code should
-  read them from a controlled environment or private plugin configuration.
+- `${VAR}` string templates are not supported; to vary settings per Bot, use [`pluginRuntime`](#tune-a-plugins-mcp-per-bot) above;
+- bundle a local MCP's runtime dependencies into `dist/` instead of relying on the development `node_modules`;
+- never put real tokens, cookies, or secrets in the package; read them at runtime from a controlled environment or the plugin's private config.
 
-Botmux aggregates the enabled MCP servers for a session through one MCP Gateway.
-The plugin set and credential snapshot are fixed for the lifetime of a CLI
-process, so create a new session after changing bindings or configuration.
+Botmux aggregates the MCP servers of all plugins enabled for the current session through one MCP Gateway. When tools from different plugins share a name, the Gateway adds a prefix to tell them apart. The plugin set and credential snapshot are fixed per CLI process, so start a new session after changing enablement or config.
 
-#### Trusted caller identity injection
+#### Trusted caller identity
 
-When a turn is triggered by a real IM user, the Gateway injects a
-**host-stamped, model-unforgeable** caller identity into forwarded `tools/call`
-requests, for plugins that need per-user authorization or auditing. The
-contract:
+When a turn is triggered by a real Feishu user, the Gateway attaches a caller identity to forwarded `tools/call` requests. It is **stamped by the host and cannot be forged by the model**, so plugins can enforce per-user permissions or audit.
 
-- The identity appears in two places: `_meta.botmuxTrustedCaller` on the MCP
-  request (injected for both `stdio` and `streamable-http`), and, for
-  `streamable-http`, the `x-botmux-trusted-open-id` / `x-botmux-trusted-union-id`
-  / `x-botmux-trusted-app-id` request headers (plus `x-botmux-turn-id` /
-  `x-botmux-dispatch-attempt`). The fields inside `botmuxTrustedCaller` are
-  `requestUserOpenId` / `requestUserUnionId` / `requestLarkAppId`.
-- **Trust only these `botmux`-namespaced keys.** Before injecting, the Gateway
-  **unconditionally strips** any client- (model-) supplied `_meta` key that
-  starts with `botmux`, and any inbound `x-botmux-trusted-*` header — whether or
-  not a host identity exists for the turn. A model therefore cannot impersonate
-  anyone by putting `_meta.botmuxTrustedCaller` in the tool arguments.
-- Conversely, do **not** read bare keys (an un-namespaced `requestUserUnionId`,
-  a custom `trustedCaller`, etc.) as an identity source: those are outside the
-  strip set and can be freely set by the model.
-- Not every turn has a trusted identity: system/recovery turns, and turns whose
-  sender has no `open_id`/`union_id`, inject nothing. Plugins must **fail closed**
-  when `botmuxTrustedCaller` is absent (refuse the identity-bound operation)
-  rather than falling back to any model-reported value.
-- The identity lives only in the host worker's process memory, set per turn, and
-  is never written to a file; do not surface it (or the transport token) to users
-  or logs.
+**Where to read it:**
 
-Background and design (Feishu docs): [Botmux Plugin Development and Market
-Registration Guide](https://bytedance.larkoffice.com/docx/FE2mdNdSgoFMVuxWTS7ctqO6nFb)
-and the [Agent Chrome Plugin Guide](https://bytedance.larkoffice.com/docx/RJPfdn0oHoC5zgxVXH1cKMjFnqc)
-(the latter is a full worked example of packaging MCP + Skill + Service into a
-`@botmux-ai/plugin-*` with per-session isolation).
+- `_meta.botmuxTrustedCaller` on the MCP request (both stdio and streamable-http). Common fields:
 
-### Dashboard
+  | Field | Meaning |
+  | --- | --- |
+  | `requestUserOpenId` / `requestUserUnionId` | The user who triggered this turn |
+  | `requestLarkAppId` | The current Bot's Feishu app ID |
+  | `senderType` | `user` or `bot`: whether a human or another Bot opened this turn; absent when it can't be determined |
+  | `source` / `taskId` | No `source` = an ordinary Feishu message; `schedule_creator` = a scheduled task running as its creator/claimer (`taskId` is the task ID); `failed_turn_recovery` = an automatic retry of a failed request, not a new human action |
+  | `turnId` / `dispatchAttempt` | This turn's ID and delivery attempt, useful for idempotency |
+
+- streamable-http also gets request headers: `x-botmux-trusted-open-id`, `x-botmux-trusted-union-id`, `x-botmux-trusted-app-id`, plus `x-botmux-turn-id` and `x-botmux-dispatch-attempt`. The headers do **not** carry `source`, `taskId`, or `senderType`; read `_meta` when you need them.
+
+**How to use it safely:**
+
+- **Trust only keys in the `botmux` namespace.** Before forwarding, the Gateway unconditionally strips any `_meta` key starting with `botmux` that the model supplied, as well as inbound `x-botmux-trusted-*` headers, so the model cannot impersonate someone else.
+- Don't treat bare keys (such as an un-namespaced `requestUserUnionId` or a custom `trustedCaller`) as identity. They are not stripped and the model can fill them freely.
+- Not every turn has a user identity: turns without a sender ID carry no `requestUserOpenId` / `requestUserUnionId` (`botmuxTrustedCaller` may hold only `turnId`). **Fail closed** when those user fields are missing (refuse identity-gated operations) and never fall back to values the model reports.
+- To confirm "a human just asked for this", check `senderType === "user"` and that `source` is absent.
+- The host injects the identity per turn. Don't show it to users, and don't log it together with transport tokens.
+
+#### Keep sensitive results away from the model
+
+Some tool results (business data, report files) shouldn't go to the model. A local stdio MCP can declare a result in the tool response's `_meta.botmuxHostDelivery`, and Botmux delivers it straight to the requester:
+
+```json
+{
+  "schemaVersion": 1,
+  "deliveryId": "report-20261105-0001",
+  "markdown": "## Monthly report\n…",
+  "files": [{ "path": "report.xlsx" }]
+}
+```
+
+- A "结果已生成" (result ready) card appears in the chat. Its "查看或下载" (view or download) button opens a host-controlled page that **only the requester of this turn can see**, and the link expires;
+- the model only gets a receipt (`delivered`, `deliveryId`, `fileCount`), never the raw result;
+- attachments must live under `~/.botmux/plugins/<id>/outbound/` and are deleted after successful delivery; up to 8 files, each ≤ 8 MiB, ≤ 16 MiB in total;
+- only local stdio MCP servers can use it, and the turn must carry a trusted human identity; otherwise the tool call fails.
+- `botmuxTrustedCaller.hostCapabilities` containing `result_delivery_v1` means the current host supports it.
+
+### Dashboard page
 
 `src/dashboard/index.js` default-exports a component:
 
@@ -275,47 +357,36 @@ export default function PluginDashboard({ pluginId, api }) {
 }
 ```
 
-The fixed route is `#/plugins/<plugin-id>`. The current Dashboard Plugin API
-provides:
+The route is fixed at `#/plugins/<plugin-id>`. `api` provides:
 
-- `getServiceStatus()`;
-- `startService()`;
-- `stopService()`;
-- `restartService()`;
+| Method | Purpose |
+| --- | --- |
+| `react` | The host's React instance; reuse it instead of bundling another copy |
+| `getServiceStatus()` | Read this plugin's Service status |
+| `startService()` / `stopService()` / `restartService()` | Control this plugin's Service |
+| `getSettings()` / `saveSettings(value)` | Read/write config through the settings adapter |
+| `listBots()` | List manageable Bots |
 
-- `react`: the host React instance (use it instead of bundling another copy);
-- `getSettings()`: read the adapter's browser-safe settings;
-- `saveSettings(value)`: save a JSON value through the adapter;
-- `listBots()`: list the manageable bots.
-
-Settings require an explicit `dist/server/settings.js` ES module exporting both methods:
+**Settings adapter**: to use `getSettings` / `saveSettings`, ship `dist/server/settings.js` exporting both functions:
 
 ```ts
 export function getSettings(api: { config: PluginConfigApi }): unknown | Promise<unknown>;
 export function saveSettings(api: { config: PluginConfigApi }, value: unknown): unknown | Promise<unknown>;
 ```
 
-`api` contains **only `config`**, with `get(key?)`, `set(key, value)`,
-`replace(object)` and `path`. It is not `baseApi`: there is no `runtime`,
-`logger`, `resolve`, or `settingsPath`. Use the controlled config API and
-explicitly select safe fields; never return the raw `config.json` or secrets.
-Both methods may return a JSON-serializable value or void; null/undefined
-is normalized to `{ ok: true }`. Malformed request JSON returns 400; missing
-plugins/adapters return 404; unsupported methods return 405. Adapter failures,
-invalid exports and non-serializable results return a complete 500 JSON response
-with the generic `plugin_settings_failed` code, never the internal exception.
-The adapter exports are checked when requested, without executing plugin code
-in the convention scanner.
+- The injected `api` has **only `config`**: `get(key?)`, `set(key, value)`, `replace(object)`, and `path`. There is no `logger`, `resolve`, or `settingsPath`.
+- Return only fields that are safe to show in a browser; don't echo raw `config.json` or secrets.
+- Return values must be JSON-serializable; returning `null`/`undefined` gives the browser `{ "ok": true }`.
+- Errors: invalid request JSON → 400; plugin missing or no adapter → 404; unsupported method → 405; adapter throws, bad exports, or unserializable result → 500 with the single code `plugin_settings_failed`, never the raw exception.
+- The install scan does not run adapter code; exports are checked at request time.
 
-
-Dashboard code runs inside the authority boundary of the user who installed
-Botmux. Do not render sensitive configuration into the page or browser logs.
+Dashboard code runs within the permissions of the system user that installed Botmux. Don't render sensitive config into the page or browser logs.
 
 ### Host Service
 
-A Service requires both:
+A Service needs both of these:
 
-- `package.json#botmux.service.mode`;
+- `botmux.service.mode` in `package.json`;
 - `dist/service/index.js`.
 
 Example:
@@ -340,18 +411,107 @@ export default {
 };
 ```
 
-`host` is already safe to interpolate into a URL, including brackets for an IPv6
-literal. If the Service export includes `mode`, it must match the manifest:
+- The `pm2` field name is kept only for compatibility with older plugins. Botmux's built-in supervisor interprets it; PM2 is not needed. Supported keys: `script`, `args`, `cwd`, `env`, `autorestart`, `killTimeoutMs`, `watchDelayMs`.
+- If the export sets `mode`, it must match the manifest.
+- The `host` passed to `urls()` is already URL-ready (IPv6 literals come bracketed).
+- The Service process receives `BOTMUX_PLUGIN_ID`, `BOTMUX_PLUGIN_DIR`, and `BOTMUX_PLUGIN_HOME`.
+- With the single-file Botmux binary, JS scripts run on its embedded Bun, so no separate Node install is needed.
+- While developing with `--link`, the Service restarts automatically when `dist/` changes (only `dist/botmux-build/` is watched if it exists).
 
-- `manual`: starts only after an explicit `plugin service start`;
-- `auto`: `botmux start` and `botmux restart` ensure the Service is online.
+### Feishu slash commands
 
-A normal `botmux stop` leaves plugin Services running.
-`botmux stop --with-plugin` also stops auto Services.
+A plugin can register its own Feishu commands. For example, `/work-bind status` in a chat does not go to the CLI; it goes straight to the plugin's Host Service, and Botmux posts the plugin's text or card reply back to the chat.
+
+**Declare**: ship `dist/commands/index.json`; the plugin must have a Host Service:
+
+```json
+{
+  "schemaVersion": 1,
+  "endpoint": "/botmux/commands/v1",
+  "commands": [
+    { "name": "/work-bind", "description": "Bind or view this chat's work item" }
+  ]
+}
+```
+
+- `name` must be a lowercase `/xxx` (letters, digits, `:` `_` `-`), 1–16 per plugin, no duplicates;
+- it can't reuse a Botmux built-in or CLI passthrough command (such as `/help`, `/close`, `/compact`); that is rejected at install time;
+- `description` is optional, up to 120 characters, and is listed in the "🧩 Plugin commands" section at the end of `/help`;
+- `endpoint` is a relative path. Botmux builds `http://127.0.0.1:<port><endpoint>` itself, so the Service definition **must set a fixed `port`**.
+
+**What users see:**
+
+- the sender must be allowed to talk to this Bot; no session is created, nothing goes to the CLI, and no quota is used;
+- in a regular group that requires @-mentioning the Bot (see [Mention mode](/en/mention-mode)), plugin commands need the @ too;
+- if two enabled plugins declare the same command, it is disabled and the Bot replies that multiple plugins declared it;
+- if the Bot's `customPassthroughCommands` has the same name, passthrough wins;
+- if the plugin service is offline, times out (10 seconds), or returns something invalid, the Bot replies that the plugin command is unavailable; it never falls back to sending the message to the CLI;
+- enabling or disabling a plugin takes effect on the next message, no restart needed.
+
+**Request and response**: Botmux sends a `POST` to the endpoint with `Authorization: Bearer <token>` (the token is in the Service's `BOTMUX_PLUGIN_CARD_ACTION_TOKEN` environment variable, shared with card callbacks). It is sent once, with no retry:
+
+```json
+{
+  "schemaVersion": 1,
+  "eventId": "om_xxx",
+  "larkAppId": "cli_xxx",
+  "command": "/work-bind",
+  "args": "status",
+  "chat": { "chatId": "oc_xxx", "chatType": "group", "anchor": "om_xxx" },
+  "sender": { "openId": "ou_xxx", "unionId": "on_xxx" },
+  "privileges": { "canOperate": true, "canTalk": true },
+  "locale": "zh"
+}
+```
+
+- `eventId` is the triggering message ID; use it for idempotency;
+- `args` already has the command name stripped;
+- `privileges` is computed by the host on the spot: `canOperate` means the sender can manage this Bot, `canTalk` means they can talk to it. **Use only this for authorization**; never infer identity or permissions from `args`.
+
+The plugin replies:
+
+```json
+{ "schemaVersion": 1, "reply": { "text": "Bound" } }
+```
+
+`reply` can be `{ "text": "…" }` (up to 4000 characters), `{ "card": { … } }`, or omitted (no reply). Button callbacks in the card may only use actions this plugin declared in `card-actions`.
+
+### Card button callbacks
+
+Buttons on cards the plugin sends can be handled by the plugin when clicked.
+
+**Declare**: ship `dist/card-actions/index.json`; it also needs a Host Service with a fixed `port`:
+
+```json
+{
+  "schemaVersion": 1,
+  "endpoint": "/botmux/card-actions/v1",
+  "actions": ["my-plugin.confirm"],
+  "actionPrefixes": ["my-plugin."]
+}
+```
+
+- Provide at least one of `actions` (exact match) and `actionPrefixes` (prefix match); neither may overlap Botmux's own button actions;
+- a button's action name comes from its `value.action`, falling back to the button's `name`;
+- to send a card with plugin buttons from a session: `botmux send --plugin-card-action my-plugin --card-file card.json` (only together with `--card-file` / `--card-json`).
+
+On click, Botmux `POST`s the operator, card context, button value, and form values to the endpoint (same Bearer token), along with host-computed `privileges`. The plugin can reply:
+
+```json
+{
+  "schemaVersion": 1,
+  "ack": {
+    "toast": { "type": "success", "content": "Confirmed" },
+    "card": { "schema": "2.0", "body": {} }
+  }
+}
+```
+
+`toast` is a short notice after the click (`success` / `info` / `warning` / `error`); `card` updates the card in place. Both are optional. The plugin must still check `privileges` on every click; permission at send time is not authorization at click time.
 
 ## Local build and acceptance
 
-Development mode:
+During development:
 
 ```bash
 npm install
@@ -362,193 +522,92 @@ botmux plugin enable my-plugin
 botmux my-plugin:hello
 ```
 
-`--link` is for local-directory development only. It links the installed runtime
-directory to the project's current `dist/`. Source edits still require another
-build. After adding or removing a contribution entry, reinstall the plugin so
-Botmux rescans it.
+`--link` is for local directories only; it links the plugin runtime directory to your project's `dist/`. You still need to rebuild after editing source. After adding or removing contribution entries, run `plugin install` again so Botmux rescans.
 
-Build the real release tarball:
+Before publishing, verify again with a real tarball:
 
 ```bash
 npm ci
 npm test
 npm pack --dry-run
 npm pack
-```
 
-Then test the tarball itself:
-
-```bash
 botmux plugin install "file:/absolute/path/plugin-package.tgz"
 botmux plugin enable my-plugin
-botmux plugin service start my-plugin
+botmux plugin service start my-plugin   # skip if there is no Service
 botmux plugin service status
 ```
 
-Omit the Service commands for a plugin without a Service. The important
-acceptance criterion is not merely that the repository works, but that the
-extracted `dist/` remains functional without source files or the development
-`node_modules`.
-
-## Installation, enablement, and Service lifecycle
-
-Install from npm:
-
-```bash
-# Third-party package: use the full name and pin an exact version
-botmux plugin install @your-org/plugin-my-plugin@1.2.3
-
-# Official short ID: expands to @botmux-ai/plugin-my-plugin
-botmux plugin install my-plugin
-```
-
-Enablement scopes:
-
-```bash
-# Machine default, effective for every Bot
-botmux plugin enable my-plugin
-
-# One Bot, or every currently configured Bot explicitly
-botmux plugin enable my-plugin --bot <name|index|all>
-
-botmux plugin disable my-plugin
-botmux plugin disable my-plugin --bot <name|index|all>
-```
-
-Without `--bot`, the machine default is used; `--global` is neither needed nor
-accepted. If the plugin is already enabled as a machine default, disable that
-default before configuring individual Bots. Start a new Agent session after
-enabling or updating a plugin.
-
-Service management:
-
-```bash
-botmux plugin service status
-botmux plugin service start my-plugin
-botmux plugin service stop my-plugin
-botmux plugin service restart my-plugin
-```
-
-Updating currently means installing the new version again. Stop an existing
-Service first:
-
-```bash
-botmux plugin service stop my-plugin
-botmux plugin install @your-org/plugin-my-plugin@1.2.4
-botmux plugin enable my-plugin
-botmux plugin service start my-plugin
-```
-
-Botmux never stops a running Service implicitly during install, update, or
-uninstall.
-
-Uninstall:
-
-```bash
-botmux plugin service stop my-plugin
-botmux plugin uninstall my-plugin
-```
-
-Uninstall removes plugin bindings and `~/.botmux/plugins/<id>/`, which can
-include private plugin configuration. Back it up first when needed. Although
-current help text lists `--force`, the implementation does not use it to bypass
-dependency or Service lifecycle guards.
+The point is not "it runs inside the repo" but that the extracted `dist/` works on its own, without the source tree or `node_modules`.
 
 ## Publish to npm
 
-Before publishing, add repository metadata and confirm that the package name
-belongs to an npm scope you control:
+1. Fill in repository metadata and confirm the package name is in an npm scope you control:
 
-```json
-{
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/your-org/botmux-plugin-my-plugin.git"
-  },
-  "homepage": "https://github.com/your-org/botmux-plugin-my-plugin#readme",
-  "bugs": {
-    "url": "https://github.com/your-org/botmux-plugin-my-plugin/issues"
-  }
-}
-```
+   ```json
+   {
+     "repository": {
+       "type": "git",
+       "url": "git+https://github.com/your-org/botmux-plugin-my-plugin.git"
+     },
+     "homepage": "https://github.com/your-org/botmux-plugin-my-plugin#readme",
+     "bugs": {
+       "url": "https://github.com/your-org/botmux-plugin-my-plugin/issues"
+     }
+   }
+   ```
 
-Check the npm login:
+2. Check that you are logged in (for an existing package you can also confirm owners with `npm owner ls <package>`; before the first publish the package doesn't exist yet and that returns 404, so skip it):
 
-```bash
-npm whoami --registry=https://registry.npmjs.org/
-```
+   ```bash
+   npm whoami --registry=https://registry.npmjs.org/
+   ```
 
-For an existing package, you can also verify its owners. Skip this before the
-first publication because the package does not exist yet and the command will
-return 404:
+3. Publish the scoped public package:
 
-```bash
-npm owner ls @your-org/plugin-my-plugin \
-  --registry=https://registry.npmjs.org/
-```
+   ```bash
+   npm publish --access public --registry=https://registry.npmjs.org/
+   ```
 
-Publish a public scoped package:
+   Publishing must satisfy the account or package 2FA policy. For long-running CI, prefer npm Trusted Publishing (OIDC) over storing long-lived write tokens. If your account uses a security key/passkey and an older npm CLI only asks for an OTP, use a current CLI temporarily; it prints a browser confirmation link:
 
-```bash
-npm publish --access public --registry=https://registry.npmjs.org/
-```
+   ```bash
+   npx --yes npm@latest publish --access public --registry=https://registry.npmjs.org/
+   ```
 
-Publishing must satisfy the account and package 2FA policy or use explicitly
-authorized automation credentials. Prefer npm Trusted Publishing/OIDC for
-long-lived CI instead of storing a long-lived write token.
+4. Verify after publishing:
 
-If the account uses a security key or Passkey but an older npm CLI only asks for
-an OTP, use the current npm CLI in an interactive terminal:
+   ```bash
+   npm view @your-org/plugin-my-plugin@1.2.3 \
+     version dist.tarball dist.shasum dist.integrity \
+     --json --registry=https://registry.npmjs.org/
 
-```bash
-npx --yes npm@latest publish \
-  --access public \
-  --registry=https://registry.npmjs.org/
-```
+   npm view @your-org/plugin-my-plugin dist-tags \
+     --json --registry=https://registry.npmjs.org/
+   ```
 
-The CLI prints a WebAuthn page URL where the security-key challenge can be
-completed.
-
-Verify the published package:
-
-```bash
-npm view @your-org/plugin-my-plugin@1.2.3 \
-  version dist.tarball dist.shasum dist.integrity \
-  --json \
-  --registry=https://registry.npmjs.org/
-
-npm view @your-org/plugin-my-plugin dist-tags \
-  --json \
-  --registry=https://registry.npmjs.org/
-```
-
-An npm version cannot be overwritten. Every fix requires a new version.
+Published npm versions can't be overwritten; every fix needs a new version number.
 
 ## Register in the Plugin Market
 
-### npm and the Market are separate paths
+### The Market and npm are separate
 
-The Botmux Plugin Market is a standalone static repository:
+The Botmux Plugin Market (`https://github.com/botmux-ai/plugin-market`) is a standalone static repository. It only stores discovery metadata, hosts no code, and is not a security endorsement.
 
-```text
-https://github.com/botmux-ai/plugin-market
-```
+- Publishing to npm does **not** register the plugin in the Market;
+- Botmux currently does **not** read the Market index when installing: `botmux plugin install <short-id>` just expands to `@botmux-ai/plugin-<short-id>` by convention, so registered third-party plugins still need their full package name;
+- `botmux plugin search`, `info`, `register`, and `publish` are not implemented yet;
+- `compatibility.botmux` in a Market entry is metadata only; the installer doesn't check it.
 
-It stores discovery metadata only. It neither hosts plugin code nor establishes
-a security trust boundary. Make sure the npm package is publicly readable before
-opening the Market PR.
+### Submit an entry
 
-External contributors should fork the Market repository. This GitHub CLI command
-clones the contributor's fork and retains the official repository as upstream:
+Make sure the npm package is publicly readable first. External contributors fork the Market repository:
 
 ```bash
 gh repo fork botmux-ai/plugin-market --clone
 cd plugin-market
 git switch -c register-my-plugin
 ```
-
-Maintainers with write access to `botmux-ai/plugin-market` may clone the
-upstream repository directly instead.
 
 Add `plugins/my-plugin.json`:
 
@@ -557,7 +616,7 @@ Add `plugins/my-plugin.json`:
   "id": "my-plugin",
   "package": "@your-org/plugin-my-plugin",
   "displayName": "My Plugin",
-  "description": "One sentence describing the problem this plugin solves.",
+  "description": "One sentence on what problem the plugin solves.",
   "repo": "https://github.com/your-org/botmux-plugin-my-plugin",
   "docs": "https://github.com/your-org/botmux-plugin-my-plugin#readme",
   "categories": ["mcp", "productivity"],
@@ -567,25 +626,17 @@ Add `plugins/my-plugin.json`:
 }
 ```
 
-Required fields:
+| Field | Rule |
+| --- | --- |
+| `id`, `package`, `displayName`, `description`, `repo`, `categories`, `compatibility.botmux` | Required |
+| `docs` | Optional |
+| `repo`, `docs` | Must be HTTPS URLs |
+| `categories` | Each matches `^[a-z][a-z0-9-]{0,31}$`, no duplicates |
+| `package` | With the official scope it must be exactly `@botmux-ai/plugin-<id>` |
 
-- `id`;
-- `package`;
-- `displayName`;
-- `description`;
-- `repo`;
-- `categories`;
-- `compatibility.botmux`.
+`>=3.8.0` is only a placeholder. Fill in the minimum version based on the Botmux capabilities your plugin uses and the versions you tested.
 
-`docs` is optional. `repo` and `docs` must be HTTPS URLs. Category values must
-match `^[a-z][a-z0-9-]{0,31}$` and must be unique. A package in the official
-scope must be named exactly `@botmux-ai/plugin-<id>`.
-
-The `>=3.8.0` value in the example is only a placeholder. Set the minimum
-version from the Botmux APIs the plugin actually uses and the compatibility
-tests you have run.
-
-Generate the aggregate index and validate it:
+Build the index, validate, and open a PR:
 
 ```bash
 npm install
@@ -600,66 +651,35 @@ gh pr create \
   --head YOUR_GITHUB_USER:register-my-plugin
 ```
 
-Replace `YOUR_GITHUB_USER` with the GitHub account that owns the fork.
-
-Commit both the source entry and the regenerated `index.json`. The abbreviated
-Market README flow mentions only `npm test`, but validation rejects a stale
-index and instructs the author to run `npm run build` first.
-
-### Current CLI boundary
-
-As of stable `botmux@3.8.0`, with current `master` behaving the same way:
-
-- `botmux plugin search`, `info`, `register`, and `publish` are not implemented;
-- `botmux plugin install <short-id>` does not read the Market index; it expands
-  by convention to `@botmux-ai/plugin-<short-id>`;
-- even after a third-party plugin is registered in the Market, it must currently
-  be installed by its full npm package name;
-- `compatibility.botmux` is currently Market metadata; the installer does not
-  enforce its SemVer range.
-
-The available verbs are `list`, `init`, `install`, `uninstall`, `enable`,
-`disable`, `emit`, and `service`. `emit` is a legacy Codex Notifier
-compatibility entry, not a general Plugin event or daemon-hook contribution.
-Treat `botmux plugin --help` as the final source of truth.
+Replace `YOUR_GITHUB_USER` with your GitHub username. The PR must include **both** the entry file and the regenerated `index.json`; running only `npm test` without `npm run build` fails validation when the index is stale.
 
 ## Security and release checklist
 
 Installing a plugin means trusting its code:
 
-- npm installation may run package lifecycle scripts;
-- CLI, MCP, Dashboard, and Service code all run with the authority of the system
-  user who installed Botmux;
-- in production, install only trusted publishers, pin an exact version, and
-  verify registry integrity;
-- never package tokens, cookies, private keys, browser profiles, logs, or user
-  data in `dist/`;
-- do not make `dist/` depend on repository source, the development directory, or
-  undeclared global packages;
-- inspect the complete `npm pack --dry-run` file list;
-- enable dependency auditing, code review, branch protection, and Trusted
-  Publishing;
-- Market registration is discovery, not a substitute for code review.
+- npm installs may run package lifecycle scripts;
+- CLI, MCP, Dashboard, and Service code all run with the permissions of the system user running Botmux;
+- in production, install only packages from trusted publishers, pin exact versions, and verify registry integrity;
+- never pack tokens, cookies, private keys, browser profiles, logs, or user data into `dist/`;
+- don't let `dist/` depend on repo source, the development directory, or undeclared global packages;
+- Market registration is a discovery channel, not a substitute for code review.
 
-Final acceptance:
+Before publishing, confirm:
 
 - [ ] `npm ci && npm test` passes;
-- [ ] `dist/` is self-contained and works without source files or
-      `node_modules`;
+- [ ] `dist/` is self-contained and runs without the source tree or `node_modules`;
 - [ ] `npm pack --dry-run` contains no sensitive files;
-- [ ] manifest, CLI command, MCP, and Service entries pass validation;
-- [ ] Service mode matches between the manifest and the exported definition;
-- [ ] both local-directory and real-tarball installation have been tested;
-- [ ] the npm version, dist-tag, and integrity have been verified after
-      publication;
-- [ ] the Market entry passes `npm run build && npm test`;
-- [ ] the Market PR contains both the entry file and `index.json`.
+- [ ] the manifest and every contribution entry pass validation;
+- [ ] the Service export's `mode` matches the manifest; a fixed `port` is set if you use slash commands or card callbacks;
+- [ ] both the local directory and the real tarball were installed and checked;
+- [ ] after publishing, version, dist-tag, and integrity were verified;
+- [ ] the Market entry passed `npm run build && npm test`, and the PR includes both the entry file and `index.json`.
 
 ## References
 
 - [Botmux source](https://github.com/deepcoldy/botmux)
-- [Official Plugin template](https://github.com/botmux-ai/botmux-plugin-template)
+- [Official plugin template](https://github.com/botmux-ai/botmux-plugin-template)
 - [Botmux Plugin Market](https://github.com/botmux-ai/plugin-market)
-- [Agent Chrome Plugin example](https://github.com/botmux-ai/botmux-plugin-agent-chrome)
-- [npm: creating and publishing scoped public packages](https://docs.npmjs.com/creating-and-publishing-scoped-public-packages/)
-- [npm: Trusted Publishing](https://docs.npmjs.com/trusted-publishers/)
+- [Agent Chrome plugin example](https://github.com/botmux-ai/botmux-plugin-agent-chrome): a complete example that packs MCP, Skill, and Service into one plugin with per-session isolation
+- [npm: Creating and publishing scoped public packages](https://docs.npmjs.com/creating-and-publishing-scoped-public-packages/)
+- [npm: Trusted publishing](https://docs.npmjs.com/trusted-publishers/)

@@ -65,11 +65,11 @@ export function createCopilotAdapter(pathOverride?: string): CliAdapter {
     // Tells the worker to demote resume-without-id to a fresh launch + notify.
     resumeRequiresCliSessionId: true,
 
-    // Copilot's Ink TUI behaves like Gemini/OpenCode: the TextInput
+    // Copilot's Ink TUI behaves like OpenCode: the TextInput
     // component has an async startup phase; writing during that window can
     // be silently lost. Once the prompt is rendered, sendText + Enter is
     // reliable. No documented bracketed-paste fold (unlike cursor), so the
-    // simple write+Enter path mirrors the gemini adapter.
+    // simple write+Enter path (writeTextThenEnter).
     writeInput: writeTextThenEnter,
 
     completionPattern: undefined,   // quiescence only — no explicit completion marker

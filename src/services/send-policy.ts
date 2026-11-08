@@ -426,6 +426,7 @@ export function parseAttentionFlag(args: string[]): { requested: boolean; kind: 
 }
 
 export const URGENT_MODES = ['app', 'sms', 'phone'] as const;
+
 export type UrgentMode = typeof URGENT_MODES[number];
 
 export interface UrgentFlagResult {
@@ -518,5 +519,41 @@ export function attentionUsageError(args: AttentionUsageArgs): string | null {
   if (!args.hasText) {
     return '--attention 需要文本 reason（看板「需要你」列要显示原因，不能只发图片/文件）。';
   }
+  return null;
+}
+
+export interface DiffFlagResult {
+  requested: boolean;
+  path?: string;
+  error?: string;
+}
+
+/** Core display flag, parsed alongside --attention and --urgent. */
+export function parseDiffFlag(args: string[]): DiffFlagResult {
+  const flags = args.filter(arg => arg === '--diff' || arg.startsWith('--diff='));
+  if (flags.length === 0) return { requested: false };
+  if (flags.length > 1) return { requested: true, error: '--diff 只能指定一次。' };
+  const flag = flags[0]!;
+  const path = flag === '--diff' ? args[args.indexOf(flag) + 1] : flag.slice('--diff='.length);
+  if (!path?.trim() || path.startsWith('--')) return { requested: true, error: '--diff 需要 unified diff 文件路径。' };
+  if (['-', '/dev/stdin', '/dev/fd/0', '/proc/self/fd/0'].includes(path)) {
+    return { requested: true, error: '--diff 需要已保存的文件；stdin 留给消息摘要。' };
+  }
+  return { requested: true, path };
+}
+
+export interface DiffUsageArgs {
+  requested: boolean;
+  customCardRequested: boolean;
+  mediaRequested: boolean;
+  voice: boolean;
+  slash: boolean;
+}
+
+export function diffUsageError(args: DiffUsageArgs): string | null {
+  if (!args.requested) return null;
+  if (args.customCardRequested) return '--diff 不能与 --card-file/--card-json 混用。';
+  if (args.mediaRequested) return '--diff 不能与图片/附件/视频混用；先发送完整文件，再发送 diff 最终卡片。';
+  if (args.voice || args.slash) return '--diff 不能与 --voice/--slash 混用。';
   return null;
 }

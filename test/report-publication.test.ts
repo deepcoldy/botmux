@@ -94,6 +94,27 @@ describe('durable report publication', () => {
     await expect(deliverPublishedReport(f)).rejects.toThrow('stale');
     expect(f.publish).not.toHaveBeenCalled();
   });
+  it('replays a settled receipt without consulting live session state', async () => {
+    // A stored receipt is the durable outcome of a completed write; a stale turn
+    // on retry must not turn it into a rejection or trigger another write.
+    const f = fixture();
+    const settled = await deliverPublishedReport(f);
+    expect(settled.status).toBe(200);
+    f.validate.mockImplementation(() => { throw new Error('stale'); });
+    const replay = await deliverPublishedReport(f);
+    expect(replay).toEqual(settled);
+    expect(f.publish).toHaveBeenCalledTimes(1);
+    expect(f.relay).toHaveBeenCalledTimes(1);
+  });
+  it('keeps a pending journal unknown even when the live turn is stale', async () => {
+    const f = fixture();
+    f.publish.mockRejectedValueOnce(new Error('response lost'));
+    expect((await deliverPublishedReport(f)).status).toBe(502);
+    f.validate.mockImplementation(() => { throw new Error('stale'); });
+    const retry = await deliverPublishedReport(f);
+    expect(retry).toMatchObject({ status: 409, body: { error: 'report_publication_unknown' } });
+    expect(f.publish).toHaveBeenCalledTimes(1);
+  });
   it('fails closed on corrupt persisted state', async () => {
     const f = fixture(); await deliverPublishedReport(f);
     const file = join(f.dataDir, 'report-deliveries', `${f.key}.json`);

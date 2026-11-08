@@ -6,15 +6,12 @@ import {
   chatHasAddableBots,
   createAddBotsReconciler,
   createReconciledChatCommitter,
-  loadGroupRoleProfileContext,
   markBotsInChat,
   mergeReconciledChat,
   paginateGroupRows,
   planAddBotsFollowup,
-  roleProfileBootstrapStatus,
   stewardJoinNotes,
   summarizeAddBotsResult,
-  suggestRoleProfileIdFromChat,
 } from '../src/dashboard/web/groups.js';
 import { hasExplicitChatRole, summarizeGroupProfileMatches } from '../src/dashboard/web/role-profile-match.js';
 
@@ -188,29 +185,6 @@ describe('stewardJoinNotes — create-group steward feedback', () => {
   it('no stewards in the result (no steward on this machine) → nothing to show', () => {
     expect(stewardJoinNotes(undefined, [])).toEqual([]);
     expect(stewardJoinNotes([{ ok: true }], [])).toEqual([]);
-  });
-});
-
-describe('roleProfileBootstrapStatus — create-group profile feedback', () => {
-  it('summarizes a sent bootstrap message', () => {
-    const status = roleProfileBootstrapStatus('collab-main', 'om_bootstrap', null);
-
-    expect(status).toEqual({
-      kind: 'ok',
-      text: 'Profile：collab-main；bootstrap 消息已发送：om_bootstrap',
-    });
-  });
-
-  it('summarizes failure details without dropping interpolated values', () => {
-    const status = roleProfileBootstrapStatus(
-      '<profile>',
-      null,
-      '<script>alert(1)</script>',
-    );
-
-    expect(status?.kind).toBe('warn');
-    expect(status?.text).toContain('<profile>');
-    expect(status?.text).toContain('<script>alert(1)</script>');
   });
 });
 
@@ -536,8 +510,7 @@ describe('createAddBotsReconciler — overlapping-batch snapshot reconciliation'
     const committed: any[] = [];
     const commit = createReconciledChatCommitter({
       getSnapshot: () => ref,
-      applySnapshot: merged => { setSnapshot(merged); }, // reuse the ONE entry point
-      onCommitted: merged => { committed.push(merged); },
+      applySnapshot: merged => { setSnapshot(merged); committed.push(merged); }, // reuse the ONE entry point
     });
 
     const canonical = (inX: boolean, inY: boolean) => ({
@@ -729,77 +702,5 @@ describe('summarizeGroupProfileMatches — group role/profile status', () => {
     );
 
     expect(matches).toEqual([]);
-  });
-});
-
-describe('suggestRoleProfileIdFromChat — prompt default', () => {
-  it('keeps only backend-valid profile id characters', () => {
-    expect(suggestRoleProfileIdFromChat('AI ChangeLog / Prod 群')).toBe('ai-changelog-prod');
-  });
-
-  it('falls back to a safe id when the group name has no valid ascii token', () => {
-    expect(suggestRoleProfileIdFromChat('项目群')).toBe('profile');
-  });
-});
-
-describe('loadGroupRoleProfileContext — bounded role requests', () => {
-  it('loads explicit chat roles in one batch and skips unconfigured memberships', async () => {
-    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      const url = String(input);
-      if (url === '/api/role-profiles') {
-        return { ok: true, status: 200, json: async () => ({ profiles: [{ profileId: 'main' }] }) } as Response;
-      }
-      if (url === '/api/role-profiles/main') {
-        return {
-          ok: true,
-          status: 200,
-          json: async () => ({ entries: [{ profileId: 'main', larkAppId: 'botA', content: 'role A' }] }),
-        } as Response;
-      }
-      if (url === '/api/roles/batch') {
-        expect(init?.method).toBe('POST');
-        expect(JSON.parse(String(init?.body))).toEqual({
-          targets: [{ larkAppId: 'botA', chatId: 'oc_team' }],
-        });
-        return {
-          ok: true,
-          status: 200,
-          json: async () => ({
-            roles: [{
-              larkAppId: 'botA',
-              chatId: 'oc_team',
-              content: 'role A',
-              hasRole: true,
-              effectiveContent: 'role A',
-              effectiveSource: 'chat',
-              hasEffectiveRole: true,
-            }],
-          }),
-        } as Response;
-      }
-      throw new Error(`unexpected fetch: ${url}`);
-    });
-    vi.stubGlobal('fetch', fetchMock);
-
-    const context = await loadGroupRoleProfileContext({
-      bots: [],
-      chats: [{
-        chatId: 'oc_team',
-        memberBots: [
-          { larkAppId: 'botA', inChat: true, hasRole: true },
-          { larkAppId: 'botB', inChat: true, hasRole: false },
-          { larkAppId: 'botC', inChat: false, hasRole: true },
-        ],
-      }],
-    });
-
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    expect(fetchMock.mock.calls.map(call => String(call[0])).filter(url => url.startsWith('/api/roles/')))
-      .toEqual(['/api/roles/batch']);
-    expect(context.groupRoleContentByBot.get('botA\u0000oc_team')).toEqual({
-      content: 'role A',
-      source: 'chat',
-    });
-    expect(context.groupRoleContentByBot.has('botB\u0000oc_team')).toBe(false);
   });
 });

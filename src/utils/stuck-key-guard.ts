@@ -11,7 +11,12 @@
  *   - fresh capture returns null or throws  → no keys written, send expired
  *   - backend/lifetime changed after capture, OR page type no longer matches
  *     → no keys written, send expired
+ *   - key sequence not allowed for the page (when `allowKeys` is given)
+ *     → no keys written, send expired
  *   - write success → send delivered; write returns false or throws → send failed
+ *   - with `afterWrite`: after a successful write, wait a short settle, take a
+ *     fresh capture on the SAME backend/lifetime, re-classify it and report
+ *     what the screen shows now together with `delivered`
  *
  * backend/lifetime are read via getters (not value snapshots) so the guard can
  * re-check LIVE state after `await capture()` — a backend replacement or CLI
@@ -32,6 +37,33 @@ export interface StuckKeyGuardResult {
   sent: 'delivered' | 'expired' | 'failed' | 'none';
   /** Whether keys were actually written to the backend. */
   wroteKeys: boolean;
+  /** Post-key observation (only when `afterWrite` is configured and keys were written). */
+  after?: StuckKeyAfterObservation;
+  /** Expired because the page changed: the fresh capture (same backend and
+   *  CLI lifetime) that showed a different page — or none. The caller can
+   *  re-evaluate the hold / raise the card for what is on screen now. */
+  expiredScreen?: string;
+}
+
+/** What the screen shows shortly after a stuck-card key landed. */
+export interface StuckKeyAfterObservation {
+  /** False when no capture could be taken, or the backend / CLI lifetime
+   *  changed while waiting (the screen then says nothing about this key). */
+  observed: boolean;
+  /** Raw fresh capture (worker-internal; not forwarded to the daemon). */
+  screen?: string;
+  /** Known blocking page on the fresh capture; undefined = none recognised. */
+  pageType?: string;
+  /** Bounded plain-text bottom of the fresh capture. */
+  screenTail?: string;
+}
+
+/** Extra facts reported with `delivered` when `afterWrite` is configured. */
+export interface StuckKeyDeliveredDetails {
+  key: string | undefined;
+  afterObserved: boolean;
+  afterPageType?: string;
+  afterScreenTail?: string;
 }
 
 /**
@@ -72,9 +104,27 @@ export interface StuckKeyGuardDeps {
   writeKeys: (keys: string[], isFinal: boolean) => Promise<boolean>;
   /** Sends a message back to the daemon. */
   sendExpired: (nonce: number, turnId: string | undefined, dispatchAttempt: number | undefined) => void;
-  sendDelivered: (nonce: number, turnId: string | undefined, dispatchAttempt: number | undefined) => void;
+  sendDelivered: (
+    nonce: number,
+    turnId: string | undefined,
+    dispatchAttempt: number | undefined,
+    details?: StuckKeyDeliveredDetails,
+  ) => void;
   sendFailed: (nonce: number, turnId: string | undefined, dispatchAttempt: number | undefined) => void;
   log: (msg: string) => void;
+  /** Defence in depth: the exact key sequence the card may write on the
+   *  re-matched page (core/stuck-page-catalog isAllowedStuckKeySequence).
+   *  Omitted = no key check (legacy callers). */
+  allowKeys?: (pageType: string, keys: readonly string[]) => boolean;
+  /** Observe the page after a successful write and report it with
+   *  `delivered`. Omitted = deliver immediately with no details (legacy). */
+  afterWrite?: {
+    settleMs: number;
+    sleep: (ms: number) => Promise<void>;
+    screenTail: (screen: string) => string;
+    /** Runs after `delivered` was sent (e.g. re-evaluate the input hold). */
+    onObserved?: (observation: StuckKeyAfterObservation) => void;
+  };
 }
 
 /**
@@ -102,6 +152,8 @@ export async function processStuckWarningTuiKeys(
     sendDelivered,
     sendFailed,
     log,
+    allowKeys,
+    afterWrite,
   } = deps;
 
   // P1-2: validate the CLI lifetime the card was issued for BEFORE doing
@@ -145,6 +197,12 @@ export async function processStuckWarningTuiKeys(
   if (currentMatch !== stuckPageType) {
     log(`TUI keys from stale stuck-warning card (nonce=${stuckNonce}, expected=${stuckPageType}, current=${currentMatch ?? 'none'}) — dropped, notifying daemon`);
     sendExpired(stuckNonce, turnId, dispatchAttempt);
+    return { sent: 'expired', wroteKeys: false, expiredScreen: currentSnap };
+  }
+
+  if (allowKeys && !allowKeys(stuckPageType, keys)) {
+    log(`TUI keys from stuck-warning card (nonce=${stuckNonce}, page=${stuckPageType}) rejected: key sequence ${JSON.stringify(keys)} is not allowed on this page — dropped`);
+    sendExpired(stuckNonce, turnId, dispatchAttempt);
     return { sent: 'expired', wroteKeys: false };
   }
 
@@ -155,9 +213,51 @@ export async function processStuckWarningTuiKeys(
     writeOk = false;
   }
   if (writeOk) {
-    sendDelivered(stuckNonce, turnId, dispatchAttempt);
-    return { sent: 'delivered', wroteKeys: true };
+    if (!afterWrite) {
+      sendDelivered(stuckNonce, turnId, dispatchAttempt);
+      return { sent: 'delivered', wroteKeys: true };
+    }
+    const after = await observeAfterWrite(frozenBackend, frozenLifetime, deps, afterWrite);
+    sendDelivered(stuckNonce, turnId, dispatchAttempt, {
+      key: keys[0],
+      afterObserved: after.observed,
+      ...(after.observed && after.pageType ? { afterPageType: after.pageType } : {}),
+      ...(after.observed && after.screenTail ? { afterScreenTail: after.screenTail } : {}),
+    });
+    try {
+      afterWrite.onObserved?.(after);
+    } catch (err: any) {
+      log(`Stuck-card post-key hook failed: ${err?.message ?? err}`);
+    }
+    return { sent: 'delivered', wroteKeys: true, after };
   }
   sendFailed(stuckNonce, turnId, dispatchAttempt);
   return { sent: 'failed', wroteKeys: false };
+}
+
+/** Settle, then capture on the backend the key was written to. Any capture
+ *  failure, or a backend / lifetime change during the settle or the capture,
+ *  yields `observed: false` — never a screen from a different CLI. */
+async function observeAfterWrite(
+  backend: SessionBackend | null,
+  lifetime: number,
+  deps: StuckKeyGuardDeps,
+  afterWrite: NonNullable<StuckKeyGuardDeps['afterWrite']>,
+): Promise<StuckKeyAfterObservation> {
+  const stillSame = (): boolean => deps.getBackend() === backend && deps.getCurrentLifetime() === lifetime;
+  try {
+    await afterWrite.sleep(afterWrite.settleMs);
+    if (!backend || !stillSame()) return { observed: false };
+    const fresh = await deps.capture(backend, deps.renderCols, deps.renderRows, { filter: false });
+    const screen = fresh?.content ?? null;
+    if (!screen || !stillSame()) return { observed: false };
+    return {
+      observed: true,
+      screen,
+      pageType: deps.match(screen),
+      screenTail: afterWrite.screenTail(screen),
+    };
+  } catch {
+    return { observed: false };
+  }
 }

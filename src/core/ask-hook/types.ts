@@ -28,6 +28,7 @@ export interface HookAskAdapter {
     answersByQuestion: ReadonlyArray<ReadonlyArray<string>>,
     parsed: ParsedAsk,
     comment?: string | null,
+    customAnswers?: ReadonlyArray<string | null>,
   ): string;
 
   /** hook 接管失败时的"放行/无操作" directive（让 CLI 回退原生终端提问）。 */

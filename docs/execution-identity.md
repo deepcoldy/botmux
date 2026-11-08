@@ -16,7 +16,7 @@
 | 非 Lark 传输（apiOnly / headless / http_async） | 不挂 runner | 是 | 单快照文件 |
 | 非 Linux（macOS 等） | 不挂 runner | 是 | 单快照文件 |
 
-模型的唯一事实源是 **worker 实际 spawn 后的决策**：worker 用 `resolveLocalSandboxMode`（含 `BOTMUX_SANDBOX` 操作开关与 remote 后端豁免）解析出本次 spawn 的真实沙盒，用 `resolveSpawnNetworkShape` 得出「沙盒是否生效 / bwrap argv 是否带 `--unshare-net` / 主机 loopback 是否可达」，再经 `resolveIdentityStorageModel`（Linux + binding + 沙盒不切断 loopback）得出模型，渲染 wrapper 后立刻经私有 IPC（`session_identity_decision`）上报 daemon。daemon 只消费当前 worker 世代的上报值发布身份，**不再从冻结配置或自己的 `BOTMUX_SANDBOX` 环境二次推导**——配置与环境在沙盒事实上分叉时（如 worker 进程带了与 daemon 不同的开关），两侧各自选模型正是旧实现「工具恒 77 + 明文落盘」的根因。worker 未上报（冷启动 / daemon 重启后重报前）fail-closed 按 single 发布、proven 内容路由拒绝；上报 proven 但会话结构（adopt/remote/apiOnly/binding 关闭）不允许时，两个模型都拒发布直到活 worker 重新上报。环境开关 × 冻结配置的五格矩阵与真 bwrap 探针见 `test/identity-spawn-matrix.test.ts`。
+模型的唯一事实源是 **worker 实际 spawn 后的决策**：worker 用 `resolveLocalSandboxMode`（含 `BOTMUX_SANDBOX` 操作开关与 remote 后端豁免）解析出本次 spawn 的真实沙盒，用 `resolveSpawnNetworkShape` 得出「沙盒是否生效 / bwrap argv 是否带 `--unshare-net` / 主机 loopback 是否可达」，再经 `resolveIdentityStorageModel`（Linux + binding + 沙盒不切断 loopback）得出模型，渲染 wrapper 后立刻经私有 IPC（`session_identity_decision`）上报 daemon。daemon 只消费当前 worker 世代的上报值发布身份，**不再从冻结配置或自己的 `BOTMUX_SANDBOX` 环境二次推导**——配置与环境在沙盒事实上分叉时（如 worker 进程带了与 daemon 不同的开关），两侧各自选模型正是旧实现「工具恒 77 + 明文落盘」的根因。worker 未上报（冷启动 / daemon 重启后重报前）fail-closed 按 single 发布、proven 内容路由拒绝；上报 proven 但会话结构（adopt/remote/apiOnly/binding 关闭）不允许时，两个模型都拒发布直到活 worker 重新上报。环境开关 × 冻结配置的七格矩阵与真 bwrap 探针见 `test/identity-spawn-matrix.test.ts`。
 
 **accept→fork 窗口与模型翻转重发**：daemon 在消息接受时（先于 worker fork）就要发布开场轮身份，此时尚无上报，故按 single 兜底写入根快照。worker 无 marker 的首次 single 初始化只清理 R3 时代的 `turns/<sha>/` 残留，**保留**该根快照（首轮不被清成 77）；首次 proven 初始化则清空根明文。daemon 以「上一次实际发布使用的模型」（内存 `lastPublishedIdentityModel`，不依赖上一帧上报，故重启窗口也成立）判定翻转：收到与发布模型不一致的上报时，先删除错误模型的制品（single→proven：删根明文；proven→single：忘 proven 内存），再在该 turnId 仍是活轮次时重发。活轮判定以「当前 worker 世代的决策消息（已过 stale 世代闸、只在 spawn 同步发）」为权威——这覆盖新话题开场边界（此时 `currentTurnId`/`pendingTurnId` 等 daemon 字段还没指向开场轮）——但 turn 已在当前 worker 终态集合（`turn_terminal` 观察）中的不重发。重发结果记 `lastIdentityDecisionRepublish{model,turnId,ok}`：成功才移动基线（相同决策不再重放）；失败显式 `logger.error` 收口、基线不动且记 `ok:false`，随后同模型决策可重试、另一模型决策可修复已做的清理。
 
@@ -68,6 +68,16 @@ Direct 定时任务沿用持久化的可信创建者。模型翻转后的重发�
 - **权限**：认领、「改为我认领」、「重新执行」都要求点击人对本 Bot 过 `canOperate`，否则只回个人可见提示、不改状态。`claim_rev` 在 authority 写事务里做比较，旧卡或并发点击不会覆盖较新的认领。任务此刻已有可用身份（创建人或认领人恢复了权限）时，待认领卡上的「认领」只刷新卡片、不改运行身份；要换人只能在已认领卡上点「改为我认领」。「重新执行」与 `/schedule run` 同入口，暂停的任务、或此刻没有可用身份的任务都拒绝。
 - **审计**：每次点击记一行 `[schedule-claim] action=… outcome=… task=… chat=… operator_union=… operator_open=… at=…`；`/schedule list` 的 runAs 显示认领人与认领时间。
 - Delegated 任务不发卡（身份来自委托）。认领后改提示词不会让认领失效，与创建人语义一致。
+
+### 宿主终端创建任务时的 `--run-as`
+
+宿主终端（持有 daemon HMAC、没有对话轮次的调用方）创建的 direct 任务历史上没有创建人，到点必发认领卡。`botmux schedule add --run-as <ou_|邮箱>` 让宿主显式提名一个执行身份，但**提名不等于信任**：
+
+- 只在 CLI 处于宿主形态（检测不到当前会话）时接受，会话内（含 `--run-as=x` 等号形式）一律拒绝——agent 不能自报身份，会话任务的创建人仍从当前 live turn 推导。
+- daemon 的 `SCHEDULE_DELEGATED_ADD_ROUTE` 宿主分支在执行 bot 自己的 app 视角下解析：邮箱先经 `resolveAllowedUsersWithMap` 换成本 app 的 `open_id`，再经 `resolveUnionIdFromOpenId` 取 `union_id`；两道解析任一失败即 403 `schedule_run_as_unresolved`（跨 app 的 `ou_`、缺 scope、飞书瞬时失败都落在这里，fail-closed）。
+- 解析成功后仍要求 `canOperate(appId, chatId, openId, unionId)` 通过，否则 403 `schedule_run_as_not_allowed`，任务不创建。
+- 请求体自带的 `ownerOpenId` / `ownerUnionId` 在宿主分支一律解构剥离，身份只来自上述校验结果；`creatorLarkAppId` 恒为执行 bot 自己。
+- 到点由 `resolveScheduledRunIdentity` 用同一个 `canOperate` 复核：通过则按该人发布凭证、不发卡；失权则照常进入 `creator_revoked` 认领流程（direct 任务可被认领）。
 
 ### Dashboard 新建 / 编辑定时任务时的创建人
 

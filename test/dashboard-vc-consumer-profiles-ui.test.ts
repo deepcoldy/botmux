@@ -5,6 +5,7 @@ import {
   VcConsumerProfilesGate,
   VcConsumerProfilesSection,
 } from '../src/dashboard/web/vc-consumer-profiles-section.js';
+import { DropdownMenu } from '../src/dashboard/web/dashboard-components.js';
 import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 import { VC_MEETING_CONSUMER_PROFILE_TEMPLATE_CATALOG } from '../src/services/vc-meeting-consumer-profile-templates.js';
 
@@ -585,12 +586,9 @@ describe('VcConsumerProfilesSection · 按 bot 的会议开关', () => {
     expect(addButton(r)!.props.disabled).toBe(true);
     expect(buttonByClass(r, 'vc-profile-remove')!.props.disabled).toBe(true);
     expect(saveButton(r)!.props.disabled).toBe(true);
-    const menus = r.root.findAllByType('details');
+    const menus = r.root.findAllByType(DropdownMenu);
     expect(menus.length).toBeGreaterThan(0);
-    for (const menu of menus) {
-      expect(String(menu.props.className ?? '')).toContain('is-disabled');
-      expect(menu.findByType('summary').props['aria-disabled']).toBe(true);
-    }
+    for (const menu of menus) expect(menu.props.disabled).toBe(true);
 
     put.resolve(jsonRes(200, catalogBody({
       revision: 'rev-2',

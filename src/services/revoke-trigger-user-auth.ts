@@ -48,6 +48,8 @@ export async function revokeTriggerUserAuth(args: {
 
   // Bump first so an in-flight mint or login observes the revocation even if
   // the CLI logout call hangs. Logout still runs while the HOME exists.
+  // Required before logoutBytedcli AND clearBytedcliAuth: SDK children can
+  // recreate deleted files, but cannot stamp the newly persisted epoch.
   bumpCliAuthEpoch(args.openId);
 
   const larkHome = larkCliHomeFor(args.openId);

@@ -193,7 +193,7 @@ describe('build-bun-binary.mjs — re-signs darwin output, because the bun pin i
   });
 
   it('degrades to a warning when a darwin target is cross-built off macOS', () => {
-    // codesign is macOS-only. release.yml builds darwin on macos-14, so the
+    // codesign is macOS-only. release.yml builds darwin on macOS, so the
     // shipped path always signs; `--all` on a Linux dev box must still work.
     expect(BUILD).toMatch(/process\.platform !== 'darwin'/);
     expect(BUILD).toMatch(/cannot ad-hoc sign/);

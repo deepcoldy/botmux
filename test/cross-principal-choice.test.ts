@@ -153,9 +153,11 @@ describe('cross-principal choice vocabulary', () => {
     }
   });
 
-  // `botmux send --as independent -- "<prose>"` is a deliberate answer to this
-  // card, so the prose must not disqualify it — otherwise the documented way for
-  // a bot to answer fails exactly when the bot also explains itself.
+  // `botmux send --as independent` with business prose in the body (heredoc or
+  // --content-file; the legacy `-- "<prose>"` spelling is rejected by the send
+  // preflight) is a deliberate answer to this card, so the prose must not
+  // disqualify it — otherwise the way for a bot to answer fails exactly when
+  // the bot also explains itself.
   it('honours an --as marker even when the visible body is business text', () => {
     const marked = embedCrossPrincipalAsToken('顺带说一句，这条我想单独做', 'independent');
     expect(isCrossPrincipalChoiceOnlyText(marked, 'classification')).toBe(true);

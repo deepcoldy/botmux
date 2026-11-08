@@ -4,11 +4,17 @@ import { mkdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
 import { withJournalMutationSync } from './journal.js';
+import { readRunEnvelope } from './run-envelope.js';
 
 /**
  * Persist exactly one matching runStarted event before a host returns success
  * or schedules detached execution. A non-empty journal without that identity
  * is corruption, not an invitation to append a new history root.
+ *
+ * A run whose validated `run.json` pins `nodeExecutor: "bot"` gets that stamp
+ * on this one root (the runtime only stamps a journal it finds empty, and
+ * this boundary always comes first). A journal rooted earlier without it is
+ * left as written (append-only): readers decide from run.json for those.
  */
 export function persistV3StartIntent(runId: string, runDir: string): void {
   if (basename(runDir) !== runId) {
@@ -25,7 +31,7 @@ export function persistV3StartIntent(runId: string, runDir: string): void {
       // A torn-only physical tail was durably truncated by the mutation
       // boundary. It contained no committed record, so this remains the one
       // history root rather than appending after corrupt bytes.
-      append({ type: 'runStarted', runId }, { durable: true });
+      append({ type: 'runStarted', runId, ...(pinsBotExecutor(runDir, runId) ? { nodeExecutor: 'bot' as const } : {}) }, { durable: true });
       return;
     }
     if (starts.length !== 1 || starts[0]!.runId !== runId) {
@@ -35,4 +41,11 @@ export function persistV3StartIntent(runId: string, runDir: string): void {
       );
     }
   });
+}
+
+/** The validated envelope pins bot execution. Missing / invalid = no stamp
+ *  (an invalid envelope is refused by every start path on its own). */
+function pinsBotExecutor(runDir: string, runId: string): boolean {
+  const read = readRunEnvelope(runDir, runId);
+  return read.kind === 'ok' && 'nodeExecutor' in read.envelope && read.envelope.nodeExecutor === 'bot';
 }

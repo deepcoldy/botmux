@@ -21,6 +21,23 @@ export function responseErrorText(res: DashboardJsonResponse): string {
   return String(reason || res.body?.error || res.status);
 }
 
+/** Codes the bot-defaults page translates to readable text: shared bots.json
+ *  invariants a save can trip, plus the read-isolation route's own 409 guards
+ *  (its first dashboard caller is the legacy-flag clear button). */
+const CONFIG_INVARIANT_TEXT_KEYS: Record<string, string> = {
+  sandbox_network_policy_requires_local_pty_oncall: 'botDefaults.networkPolicyBlocksChange',
+  invalid_sandbox_network_policy: 'botDefaults.networkPolicyStoredInvalid',
+  read_isolation_active_sessions: 'botDefaults.readIsolationClearActiveSessions',
+  read_isolation_teardown_unverified: 'botDefaults.readIsolationClearTeardownUnverified',
+};
+
+/** {@link responseErrorText}, with known config-invariant codes translated. */
+export function configErrorText(res: DashboardJsonResponse, tr: (key: string) => string): string {
+  const code = res.body?.reason ?? res.body?.error;
+  const key = typeof code === 'string' ? CONFIG_INVARIANT_TEXT_KEYS[code] : undefined;
+  return key ? tr(key) : responseErrorText(res);
+}
+
 export function caughtErrorText(e: any): string {
   return e?.message ?? String(e);
 }
