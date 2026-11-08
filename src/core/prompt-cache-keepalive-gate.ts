@@ -18,7 +18,7 @@
  * authoritative (zmx can carry stale scrollback), so they are refused here on
  * purpose rather than relying on how far a whole-screen scan happens to reach.
  */
-import { claudeActionPrompt } from '../services/claude-action-prompt.js';
+import { claudeActionPrompt, screenHasUnresolvedPermissionQuestion } from '../services/claude-action-prompt.js';
 import { codexNativeComposerState } from '../services/codex-terminal-session.js';
 import { screenShowsFramedPrompt } from '../utils/input-gate.js';
 import type { PtyHandle } from '../adapters/cli/types.js';
@@ -69,7 +69,11 @@ export function promptCacheKeepaliveRefusal(probe: PromptCacheKeepaliveWriteProb
     return state === 'empty' ? undefined : 'prompt_not_framed';
   }
   if (!probe.screen || !probe.readyPattern) return 'no_screen_evidence';
-  if (claudeActionPrompt(probe.screen)) return 'action_prompt_open';
+  if (claudeActionPrompt(probe.screen, { footerAnywhere: true })) return 'action_prompt_open';
+  // Also fail closed on a dialog the notification parser deliberately does
+  // not reconstruct (question wrapped past the join window / 400-char cap):
+  // the screen still carries the hard choices+footer evidence.
+  if (screenHasUnresolvedPermissionQuestion(probe.screen)) return 'action_prompt_open';
   if (!screenShowsFramedPrompt(probe.screen, probe.readyPattern)) return 'prompt_not_framed';
   // Same line screenShowsFramedPrompt anchored on: the LAST readyPattern hit.
   // An empty composer renders as `❯` plus (non-breaking) spaces; anything else

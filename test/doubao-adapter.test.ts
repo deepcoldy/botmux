@@ -12,8 +12,11 @@ import {
   doubaoSessionRoots,
   findDoubaoSessionForSubmit,
   parseDoubaoAvailableModels,
+  pollDoubaoSessionForSubmit,
+  DOUBAO_SUBMIT_CAPTURE_BUDGET_MS,
 } from '../src/adapters/cli/doubao.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
+import { STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS } from '../src/services/codex-bridge-queue.js';
 
 const SID = '38450922917357570';
 const OTHER_SID = '38450174181084930';
@@ -163,6 +166,48 @@ describe('doubao session capture', () => {
     expect(doubaoSessionExists(OTHER_SID, [root])).toBe(false);
     expect(doubaoSessionExists(SID, [])).toBeUndefined();
     expect(createDoubaoAdapter('/bin/doubao').checkResumeTargetExists?.({ sessionId: 's', cliSessionId: 'bad id' })).toBe(false);
+  });
+});
+
+describe('doubao submit capture polling', () => {
+  /** Fake clock: each sleep advances time; `find` sees the current time. */
+  function fakeClock() {
+    let t = 0;
+    return {
+      now: () => t,
+      sleep: async (ms: number) => { t += ms; },
+    };
+  }
+
+  it('still captures an id that appears 8s after submit (cold service start)', async () => {
+    const clock = fakeClock();
+    const sid = await pollDoubaoSessionForSubmit(
+      () => (clock.now() >= 8_000 ? SID : undefined),
+      clock,
+    );
+    expect(sid).toBe(SID);
+  });
+
+  it('returns immediately once the id is found instead of waiting out the budget', async () => {
+    const clock = fakeClock();
+    let calls = 0;
+    const sid = await pollDoubaoSessionForSubmit(() => (++calls >= 3 ? SID : undefined), clock);
+    expect(sid).toBe(SID);
+    expect(clock.now()).toBeLessThan(1_000);
+  });
+
+  it('gives up after the budget so a turn without a record does not block forever', async () => {
+    const clock = fakeClock();
+    const sid = await pollDoubaoSessionForSubmit(() => undefined, clock);
+    expect(sid).toBeUndefined();
+    expect(clock.now()).toBeGreaterThanOrEqual(DOUBAO_SUBMIT_CAPTURE_BUDGET_MS);
+    expect(clock.now()).toBeLessThan(DOUBAO_SUBMIT_CAPTURE_BUDGET_MS + 1_000);
+  });
+
+  it('finishes inside the bridge verification grace so a late id still binds the turn', () => {
+    // The structured queue prunes the head once this grace lapses; the in-band
+    // poll (plus the paste/Enter delay) has to end before that.
+    expect(DOUBAO_SUBMIT_CAPTURE_BUDGET_MS + 1_000).toBeLessThan(STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS);
   });
 });
 

@@ -27,6 +27,9 @@ import type { V3ArchitectBotAssignment, V3RosterBot, V3SketchAssignee } from './
 const ARCHITECT_NODE_ID = 'architect';
 const MAX_UNAVAILABLE_CHARS = 200;
 const ARCHITECT_ATTEMPT_ID = 'architect/attempts/001';
+/** Bounds on the previous attempt's problems quoted back to the Architect. */
+const MAX_PREVIOUS_PROBLEMS = 20;
+const MAX_PREVIOUS_PROBLEM_CHARS = 500;
 
 export interface RunArchitectInput {
   runId: string;
@@ -47,6 +50,9 @@ export interface RunArchitectInput {
    *  group chat (design 2026-11-03 §6): the roster to assign from. Absent =
    *  today's prompt, unchanged. */
   botAssignment?: V3ArchitectBotAssignment;
+  /** Why the host turned down the previous attempt of this run (the problems
+   *  it left in grill.state.json), so this attempt can fix them. */
+  previousProblems?: readonly string[];
 }
 
 export interface RunArchitectResult {
@@ -62,6 +68,7 @@ export function buildArchitectGoal(
   specPath: string,
   specJsonPath: string,
   botAssignment?: V3ArchitectBotAssignment,
+  previousProblems?: readonly string[],
 ): string {
   const sketchFields = [
     'sketchId',
@@ -149,7 +156,24 @@ export function buildArchitectGoal(
     '- Include an artifact contract table listing producer node, output key, path, kind, and every consumer.',
     '- List any assumptions or unresolved risks for human review.',
     ...(botAssignment ? architectBotAssignmentLines(botAssignment) : []),
+    ...previousProblemLines(previousProblems),
   ].join('\n');
+}
+
+/** The host's refusal of the previous attempt, one quoted line each. */
+function previousProblemLines(problems: readonly string[] | undefined): string[] {
+  const lines = (problems ?? [])
+    .map((problem) => problem.replace(/\s+/g, ' ').trim())
+    .filter((problem) => problem.length > 0)
+    .slice(0, MAX_PREVIOUS_PROBLEMS)
+    .map((problem) => `  - ${JSON.stringify(problem.slice(0, MAX_PREVIOUS_PROBLEM_CHARS))}`);
+  if (lines.length === 0) return [];
+  return [
+    '',
+    'Previous attempt:',
+    '- The host rejected the previous attempt of this run for these reasons. Produce a DAG that fixes every one of them (if a reason is about the spec rather than the DAG, mention it in architect-notes.md):',
+    ...lines,
+  ];
 }
 
 function rosterEntry(bot: V3RosterBot): Record<string, unknown> {
@@ -195,11 +219,39 @@ function architectBotAssignmentLines(assignment: V3ArchitectBotAssignment): stri
       : []),
     `- Otherwise pick the roster bot whose CLI, model and role best fit the node; when unsure, use the main bot (${main}).`,
     '- architect-notes.md MUST contain a `## Bot assignments` section with exactly one line per goal node: `- <nodeId> → <larkAppId>: <one-line reason>` (a loop body node as `<loopId>.<bodyNodeId>`).',
+    '- Optionally mark a goal node `"checkpoint": true` where, once it is done, its result should be looked at before deciding how the rest goes (e.g. an investigation whose findings decide the next steps). When it completes, the nodes that depend on it wait while the main bot reviews the result (it may change the rest of the flow), then the flow goes on. At least one node must depend on a checkpoint — the main bot is only woken while the run goes on, so the host rejects a checkpoint nothing depends on (add a downstream summary node, or drop the mark). Do not mark routine nodes; loop body nodes cannot be checkpoints.',
+    ...architectPlacementLines(assignment),
   ];
 }
 
+/** The bot-run-only placement part of the prompt (design 2026-11-03 §5.2). */
+function architectPlacementLines(assignment: V3ArchitectBotAssignment): string[] {
+  const mainTopic = assignment.mainTopic;
+  if (!mainTopic?.available) {
+    const why = JSON.stringify((mainTopic?.why ?? 'unknown').replace(/\s+/g, ' ').trim().slice(0, MAX_UNAVAILABLE_CHARS));
+    return [
+      `- Placement: this run has no usable main topic (${why}), so every node is handed off in a node topic of its own. Do not set \`placement\`.`,
+    ];
+  }
+  return [
+    '',
+    'Placement (where each top-level goal node is handed off):',
+    '- `"placement": "topic"` (the default; omit the field) opens a node topic: the node\'s handoff, the bot\'s progress messages, questions and report all live there. `"placement": "main"` hands the node off right in the main topic (no node topic) — for small steps whose result the people in the main topic want to see directly.',
+    '- Use a node topic when ANY of these holds: likely over ~10 minutes or several rounds of back-and-forth; may need to ask a person or discuss; many progress messages (editing code, running tests, fetching data); may be reworked by a revisit; runs in parallel with other nodes.',
+    '- Use the main topic only when ALL of these hold: a one-step small job (summarize, rewrite, format, look up one number); strictly serial with the other main-topic nodes; its result is what the main topic wants to read.',
+    '- Hard rules (the host rejects the DAG otherwise): (1) two main-topic nodes executed by the same bot must be ordered — one a transitive `depends` ancestor of the other — because a bot has only one session in the main topic; (2) the main bot\'s own main-topic nodes run in the main session itself, so rule 1 applies to them as well. Loop body nodes, loop and host nodes never take `placement`.',
+    '- architect-notes.md MUST contain a `## Placements` section with exactly one line per top-level goal node: `- <nodeId> → main|topic: <one-line reason>`.',
+  ];
+}
+
+/** Where the Architect's (only) attempt writes: its worker's pty.log,
+ *  stdout.log and stderr.log live here until the next attempt wipes it. */
+export function architectAttemptDir(runDir: string): string {
+  return join(runDir, 'architect', 'attempts', '001');
+}
+
 export async function runArchitect(input: RunArchitectInput): Promise<RunArchitectResult> {
-  const attemptDir = join(input.runDir, 'architect', 'attempts', '001');
+  const attemptDir = architectAttemptDir(input.runDir);
   const outputDir = join(attemptDir, 'work');
   const inputsPath = join(attemptDir, 'inputs.json');
   const manifestPath = join(attemptDir, 'manifest.json');
@@ -212,7 +264,7 @@ export async function runArchitect(input: RunArchitectInput): Promise<RunArchite
   rmSync(attemptDir, { recursive: true, force: true });
   mkdirSync(outputDir, { recursive: true });
 
-  const goal = buildArchitectGoal(input.specPath, input.specJsonPath, input.botAssignment);
+  const goal = buildArchitectGoal(input.specPath, input.specJsonPath, input.botAssignment, input.previousProblems);
   const inputs = {
     inputs: [
       { from: 'grill', name: 'spec.json', path: input.specJsonPath, kind: 'json' },

@@ -192,10 +192,12 @@ export function listDurableVcMeetingImRoutingCandidates(
       listenerAppId: record.larkAppId,
       meetingId: record.meeting.id,
     })?.phase === 'closed') continue;
+    // Unreadable delivery state must surface (→ turn entry blocks visibly),
+    // not read as "no projection" and silently demote the route to ordinary.
     const projections = listVcMeetingMemberProjections(dataDir, {
       listenerAppId: record.larkAppId,
       meetingId: record.meeting.id,
-    });
+    }, { ioErrors: 'throw' });
     const selectedAgents = record.selectedAgents ?? [];
     const selectedMembers = selectedAgents.length > 0
       ? selectedAgents
@@ -290,6 +292,7 @@ export function listSealedVcMeetingImRoutingCandidates(
     const projections = listVcMeetingActiveProjectionsForReceiverSession(
       dataDir,
       binding.receiverSessionId,
+      { ioErrors: 'throw' },
     );
     // Dedicated receiver sessions are one member epoch. Fail closed if legacy
     // residue makes that identity non-unique instead of guessing a projection.
@@ -537,6 +540,47 @@ export function resolveDurableVcMeetingImRouting(
     },
     now,
   ), input.disambiguation);
+}
+
+export type VcMeetingImTurnRoutingResult =
+  | VcMeetingImRoutingResult
+  | {
+      /** Durable meeting state could not be read (transient I/O error,
+       * quarantined evidence, …). `fallback` tells the caller what to do. */
+      kind: 'unavailable';
+      /** `ordinary`: this bot has no meeting receiver session in the chat, so
+       * the message is handled as a normal turn. `block`: the chat does have a
+       * receiver session, so the caller must answer visibly instead of
+       * guessing meeting vs. ordinary context. */
+      fallback: 'ordinary' | 'block';
+      error: string;
+    };
+
+/**
+ * Turn-entry wrapper around {@link resolveDurableVcMeetingImRouting}: every
+ * explicit group @mention passes through it, most of them unrelated to any
+ * meeting. A failure to read the VC meeting stores must therefore not escape
+ * and drop the message (2026-11-06: a wrongly quarantined runtime store made
+ * every @mention on the host vanish without a reply). Degrade instead: without
+ * a dedicated receiver session there is no meeting context to lose, so route
+ * it as ordinary; with one, block visibly rather than silently mis-route.
+ * This never widens meeting access — inviter talk (vc-meeting-inviter-access)
+ * still fails closed on the same error.
+ */
+export function resolveVcMeetingImRoutingForTurn(
+  dataDir: string,
+  input: Parameters<typeof resolveDurableVcMeetingImRouting>[1],
+  now = Date.now(),
+): VcMeetingImTurnRoutingResult {
+  try {
+    return resolveDurableVcMeetingImRouting(dataDir, input, now);
+  } catch (error) {
+    return {
+      kind: 'unavailable',
+      fallback: (input.sealedReceiverSessions?.length ?? 0) > 0 ? 'block' : 'ordinary',
+      error: catchUpErrorMessage(error),
+    };
+  }
 }
 
 function catchUpErrorMessage(error: unknown): string {

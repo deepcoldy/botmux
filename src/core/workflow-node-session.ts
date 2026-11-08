@@ -27,7 +27,66 @@ export function workflowNodeMarkerFromBinding(
     publishRoot: binding.publishRoot,
     orchestratorAppId: binding.sourceLarkAppId,
     registeredAt: registeredAt.toISOString(),
+    ...(binding.placement === 'main' ? { placement: 'main' as const } : {}),
   };
+}
+
+/**
+ * How a handoff turn is handed to a live worker (design §5.5): a main-topic
+ * handoff goes into an ordinary session that may be in the middle of someone
+ * else's turn (for the main bot, the turn that started the run or a wake),
+ * so it waits behind that turn as a turn of its own — its node deadline
+ * counts from when it starts — and is never folded into it. A node topic's
+ * session is the node's own: nothing changes there.
+ */
+export function workflowHandoffInputOptions(
+  handoff: Pick<WorkflowNodeSessionMarker, 'placement'> | undefined,
+): { queueAfterActiveTurn?: true } {
+  return handoff?.placement === 'main' ? { queueAfterActiveTurn: true } : {};
+}
+
+/** What the report route needs of a session's marker (§5.5). */
+export function workflowNodeReportMarker(marker: WorkflowNodeSessionMarker): {
+  handoffMessageId: string;
+  nonce: string;
+  placement?: 'main';
+  started?: boolean;
+  active?: boolean;
+} {
+  return {
+    handoffMessageId: marker.handoffMessageId,
+    nonce: marker.nonce,
+    ...(marker.placement === 'main'
+      ? { placement: 'main' as const, started: !!marker.handoffStartedAt, active: workflowNodeMarkerActive(marker) }
+      : {}),
+  };
+}
+
+/**
+ * Does this marker make its session a node session (session kind
+ * `botNode`: no workflow / multi-bot skills, the node plugin dir)? A node
+ * topic's session is the node's own and stays one. A main-topic handoff
+ * (design §5.5) goes into the bot's ordinary main-topic session — possibly
+ * the main session itself — which outlives the attempt: it never changes kind.
+ */
+export function isWorkflowNodeSessionMarker(marker: Pick<WorkflowNodeSessionMarker, 'placement'> | undefined): boolean {
+  return !!marker && marker.placement !== 'main';
+}
+
+/**
+ * Does the marker still stand for an attempt in progress? A node-topic
+ * marker always does (that session is the node's). A main-topic marker only
+ * until its attempt ends — work handed in (`submittedAt`) or the attempt
+ * stopped / revoked / reported blocked (`closedAt`) — so the reused ordinary
+ * session is not treated as a node session afterwards (sidebar entry, stall
+ * tracking, turn stops).
+ */
+export function workflowNodeMarkerActive(
+  marker: Pick<WorkflowNodeSessionMarker, 'placement' | 'submittedAt' | 'closedAt'> | undefined,
+): boolean {
+  if (!marker) return false;
+  if (marker.placement !== 'main') return true;
+  return !marker.submittedAt && !marker.closedAt;
 }
 
 /** Replace the handoff card's self-reference with its real message id in the

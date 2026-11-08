@@ -78,11 +78,10 @@ describe('claude-code —— hook 注入策略（adopt 兼容 + SessionStart 真
     expect(adapter.hookInstall?.sessionStartCommand).toContain('session-ready');
   });
 
-  it('--settings 恒带 statusLine → `botmux statusline`，refreshInterval=60', () => {
+  it('--settings 恒带 statusLine → statusline 轻量入口，refreshInterval=60', () => {
     const parsed = settingsOf(adapter.buildArgs({ sessionId: 's', resume: false }));
     expect(parsed.statusLine).toMatchObject({ type: 'command', refreshInterval: 60 });
     expect(typeof parsed.statusLine.command).toBe('string');
-    expect(parsed.statusLine.command.endsWith('statusline')).toBe(true);
     expect(parsed.statusLine.command).toBe(statuslineHookCommand());
     expect(parsed.statusLine.command).not.toContain('index-daemon');
     // 只走进程级：全局 hookInstall 不声明 statusLine（全局单值会覆盖用户自己的）

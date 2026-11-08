@@ -35,6 +35,8 @@ import {
 import { activeSessionKey } from '../src/core/types.js';
 import { readPersistedSessionRows } from './helpers/session-store-disk.js';
 import { loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
+import { applyWorkerLaunchModel } from '../src/core/worker-launch-model.js';
+import { applyRespawnConfigPatch } from '../src/core/respawn-config-patch.js';
 import { settleDurableTurnForRestart } from '../src/core/restart-followup-policy.js';
 
 const t0 = Date.parse('2026-11-04T10:00:00.000Z');
@@ -224,7 +226,7 @@ describe('Codex model selection across interrupted and overlapping launches', ()
         cliRestartInProgress: false, tmuxRestartTimer: undefined,
         durableTurnInFlight: false, currentBotmuxTurnId: undefined,
         configureTraexAutoModel: vi.fn(), settleDurableTurnForRestart,
-        restartCliProcess: vi.fn(async () => {}),
+        restartCliProcess: vi.fn(async () => {}), applyWorkerLaunchModel, applyRespawnConfigPatch,
       };
       await loadWorkerMessageHandler('restart', scope)(message);
       now(250);
@@ -390,7 +392,7 @@ describe('Codex model selection across interrupted and overlapping launches', ()
       cliRestartInProgress: false, tmuxRestartTimer: undefined,
       durableTurnInFlight: false, currentBotmuxTurnId: undefined,
       configureTraexAutoModel: vi.fn(), settleDurableTurnForRestart,
-      restartCliProcess: vi.fn(async () => {}),
+      restartCliProcess: vi.fn(async () => {}), applyWorkerLaunchModel, applyRespawnConfigPatch,
     };
     await loadWorkerMessageHandler('restart', scope)(message);
     expect(scope.lastInitConfig.model).toBe('C');

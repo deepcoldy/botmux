@@ -1,3 +1,4 @@
+import { ModelPinChip } from './model-pin.js';
 import type React from 'react';
 import {
   memo,
@@ -28,6 +29,8 @@ import {
   t,
 } from './ui.js';
 import { deriveSessionBoardColumn, sessionExchangePreview } from './sessions.js';
+import { deriveSessionTaskStatus } from '../../core/session-task-status.js';
+import { sessionTaskCardLine, sessionTaskStatusText, taskTone } from './session-task-view.js';
 import { previewMarkdownHtml } from './preview-markdown.js';
 import { SandboxDriftChip } from './session-sandbox-drift-chip.js';
 import { useT } from './react-hooks.js';
@@ -117,16 +120,6 @@ function repoBasename(workingDir: unknown): string {
   if (!value) return '-';
   const parts = value.replace(/\\/g, '/').split('/').filter(Boolean);
   return parts.at(-1) ?? value;
-}
-
-function boardSignalLabel(s: any): string {
-  if (s.agentAttention?.reason) return s.agentAttention.reason;
-  if (s.agentAttention) return t('sessions.board.signalAgent');
-  if (s.pendingRepo) return t('sessions.board.signalRepo');
-  if (s.tuiPromptActive) return t('sessions.board.signalPrompt');
-  if (s.status === 'limited') return t('sessions.board.signalLimited');
-  if (s.status === 'stalled') return t('sessions.board.signalStalled');
-  return '';
 }
 
 /** 看板列 → 状态色点：与卡片左侧状态条同一套语义（需要你/进行中/待办/空闲）。 */
@@ -517,6 +510,8 @@ function RenameInput(props: {
 
 function KanbanCardBase(props: {
   row: any;
+  /** 不在群簇里的单张卡片自己带群头像；簇内成员由簇头统一显示。 */
+  chatAvatar?: boolean;
   dragId: string | null;
   dropBeforeId: string | null;
   editingId: string | null;
@@ -535,10 +530,10 @@ function KanbanCardBase(props: {
   const botName = botDisplayName(row);
   const chatTitle = chatDisplayTitle(row);
   const repo = repoBasename(row.workingDir);
-  const signal = boardSignalLabel(row);
-  // 状态色条：需要你 / 进行中 / 待办 / 空闲（deriveSessionBoardColumn）；已关闭单独一色。
-  const boardCol = deriveSessionBoardColumn(row);
-  const signalKind = boardCol ?? (row.status === 'closed' ? 'closed' : 'idle');
+  const taskStatus = deriveSessionTaskStatus(row);
+  const taskLine = sessionTaskCardLine(taskStatus);
+  // 状态色条：需要你 / 进行中 / 没做完 / 已交付 / 空闲（deriveSessionBoardColumn）；已关闭单独一色。
+  const signalKind = deriveSessionBoardColumn(row) ?? 'closed';
   const exchange = sessionExchangePreview(row);
   const meta = [botName, chatTitle].filter(Boolean).join(' · ');
   const status = String(row.status ?? 'unknown');
@@ -615,10 +610,17 @@ function KanbanCardBase(props: {
           onClick={event => event.stopPropagation()}
           onChange={() => callbacks.onToggleSelect(row)}
         />
+        {props.chatAvatar && row.chatId ? (
+          <span
+            className="kanban-card-avatar"
+            title={chatTitle ?? String(row.chatId)}
+            dangerouslySetInnerHTML={rawHtml(chatAvatarHtml({ chatId: row.chatId, name: chatTitle ?? String(row.chatId), size: 'sm' }))}
+          />
+        ) : null}
         <span className={`badge cli-${cssToken(row.cliId)}`}>{row.cliId ?? 'unknown'}</span>
         {row.adopt ? <span className="badge">adopt</span> : null}
         {row.locked ? <span className="session-lock-badge" title={t('sessions.locked')}>{t('sessions.locked')}</span> : null}
-        <SandboxDriftChip row={row} />
+        <SandboxDriftChip row={row} /><ModelPinChip row={row} />
         {menuItems.length ? <CardMenu items={menuItems} /> : null}
       </div>
       <div className="kanban-card-title-row">
@@ -638,8 +640,17 @@ function KanbanCardBase(props: {
           </p>
         )}
       </div>
-      {/* 「需要你」的原因单独一行、允许换行：塞在卡片头里和 CLI 徽标抢宽度时只剩几个字。 */}
-      {signal ? <p className="session-signal kanban-card-reason" title={signal}>{signal}</p> : null}
+      {/* 任务状态单独一行、允许换行：塞在卡片头里和 CLI 徽标抢宽度时只剩几个字。 */}
+      {taskLine ? (
+        <p
+          className={`${taskLine.tone === 'need' ? 'session-signal ' : ''}kanban-card-reason kanban-card-task`}
+          data-tone={taskLine.tone}
+          title={taskLine.detail ? `${taskLine.label} · ${taskLine.detail}` : taskLine.label}
+        >
+          <span className="kanban-card-task-label">{taskLine.label}</span>
+          {taskLine.detail ? <span className="kanban-card-task-detail">{taskLine.detail}</span> : null}
+        </p>
+      ) : null}
       {meta ? (
         <p className="kanban-card-meta" title={repo !== '-' ? `${meta} · ${repo}` : meta}>
           {meta}
@@ -652,7 +663,8 @@ function KanbanCardBase(props: {
           <span
             className="kanban-card-dot"
             data-status={cssToken(status)}
-            title={callbacks.sessionStatusText(status)}
+            data-task={taskTone(taskStatus)}
+            title={sessionTaskStatusText(row)}
           />
         </span>
         {row.webPort && callbacks.onOpenTerminal ? (
@@ -686,7 +698,7 @@ function KanbanCardBase(props: {
  * 而不是整列。
  */
 const KanbanCard = memo(KanbanCardBase, (prev, next) => {
-  if (prev.row !== next.row) return false;
+  if (prev.row !== next.row || !!prev.chatAvatar !== !!next.chatAvatar) return false;
   const id = next.row.sessionId;
   // callbacks 是整个 props 对象：selectedSessionIds 每次选中都是新 Set，onXxx 现在已在
   // 页面侧固定。所以不能拿它的引用当判据（那等于 memo 永不命中），要逐个比卡片真正
@@ -731,7 +743,7 @@ function ClusterViewBase(props: {
   onDragStartCluster: (chatId: string, col: SessionKanbanColumn, event: DragEvent<HTMLElement>) => void;
 }): React.JSX.Element {
   const item = props.item;
-  if (item.type === 'card') return <KanbanCard {...props.cardProps} row={item.row} />;
+  if (item.type === 'card') return <KanbanCard {...props.cardProps} row={item.row} chatAvatar />;
   const title = chatDisplayTitle(item.rows[0]) ?? item.chatId;
   const dragging = props.dragCluster?.chatId === item.chatId && props.dragCluster.col === props.columnId;
   const visibleRows = props.expanded

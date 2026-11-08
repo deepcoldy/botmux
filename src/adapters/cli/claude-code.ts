@@ -33,6 +33,7 @@ import { wrapBracketedPaste } from './tui-input.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
 import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
+import { decideStartupSwitchConfirm } from '../../utils/claude-switch-confirm.js';
 
 /** Resolve cwd to its canonical (symlink-free) absolute path for project-hash
  *  computation. Claude Code itself runs `process.cwd()` which the kernel returns
@@ -100,8 +101,11 @@ export function claudeJsonlPathForSession(sessionId: string, cwd: string, dataDi
  *  exact slug path when it exists (normal case), the unique glob hit for long
  *  slugs, or null when absent/ambiguous. */
 export function resolveClaudeJsonlPath(sessionId: string, cwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): string | null {
+  const isFile = (path: string): boolean => {
+    try { return statSync(path).isFile(); } catch { return false; }
+  };
   const exact = claudeJsonlPathForSession(sessionId, cwd, dataDir);
-  if (existsSync(exact)) return exact;
+  if (isFile(exact)) return exact;
   const projectHash = realpathCwd(cwd).replace(/[^A-Za-z0-9-]/g, '-');
   if (projectHash.length <= 200) return null;
   const projectsDir = join(dataDir, 'projects');
@@ -112,7 +116,7 @@ export function resolveClaudeJsonlPath(sessionId: string, cwd: string, dataDir: 
   const hits = entries
     .filter(name => name === projectHash || name.startsWith(`${prefix}-`))
     .map(name => join(projectsDir, name, target))
-    .filter(p => existsSync(p));
+    .filter(isFile);
   return hits.length === 1 ? hits[0]! : null;
 }
 
@@ -739,10 +743,11 @@ export function resolveJsonlFromPid(pid: number, expectedCwd: string, dataDir: s
     }
   }
   if (!procStartVerified && realpathCwd(parsed.cwd) !== realpathCwd(expectedCwd)) return null;
-  return {
-    path: claudeJsonlPathForSession(parsed.sessionId, parsed.cwd, dataDir),
-    cliSessionId: parsed.sessionId,
-  };
+  // An in-session cwd change updates the pid record, not the transcript's original bucket.
+  const path = resolveClaudeJsonlPath(parsed.sessionId, parsed.cwd, dataDir)
+    ?? resolveClaudeJsonlPath(parsed.sessionId, expectedCwd, dataDir)
+    ?? claudeJsonlPathForSession(parsed.sessionId, parsed.cwd, dataDir);
+  return { path, cliSessionId: parsed.sessionId };
 }
 
 /** Linux-only: probe `/proc/<pid>/fd` for any signal that reveals Claude's
@@ -1318,7 +1323,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // replyDelivery=transcript：系统提示改口为「最终回复由 botmux 自动转发」。v3 workflow
       // 子会话（GOAL_ENV.V3_MARKER）的收口靠 botmux send，强制保持 send 措辞。
       const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, larkToolAppId, replyDelivery: effectiveReplyDelivery, solo }));
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, larkToolAppId, replyDelivery: effectiveReplyDelivery, solo, cliId: 'claude-code' }));
       return args;
     },
 
@@ -1345,6 +1350,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         return !!current && current !== path && !!readDeltaText(current, 0)?.includes(marker);
       };
     },
+
+    // `/effort <level>` / `/model <name>` replayed into a resumed conversation
+    // whose prompt cache may still be warm: Claude asks before re-reading the
+    // history, and records the command only once that is answered.
+    startupCommandConfirmation: decideStartupSwitchConfirm,
 
     async writeInput(pty, content) {
       // HERDR advertises an explicit bracketed-paste frame: send the complete
@@ -1621,6 +1631,28 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // jsonl append by 5–15s. The worker calls recheck() after a delay, and
       // suppresses the user-facing warning when the line shows up by then.
       return { ...buildResult(false), recheck };
+    },
+
+    // One-shot re-submit for a draft parked in the composer (the cold-start
+    // late-SessionStart rescue in scheduleSubmitFailureNotify). Uses the SAME
+    // submit-key resolution as writeInput: with a remapped submit
+    // (keybindings.json / CLAUDE_CODE_SUBMIT_KEY, Enter possibly bound to
+    // chat:newline) plain Enter would only insert a newline and strand the
+    // draft again. False means no terminal-sendable submit key or an
+    // unconfirmed backend send — the caller must not guess with another key.
+    pressComposerSubmit(pty) {
+      const keybindings = resolveClaudeChatKeybindings(join(variant.dataDir, 'keybindings.json'));
+      try {
+        if (pty.sendSpecialKeys && keybindings.submitKeys) {
+          return pty.sendSpecialKeys(...keybindings.submitKeys) !== false;
+        }
+        if (!pty.sendSpecialKeys && keybindings.rawSubmitSequence) {
+          return pty.write(keybindings.rawSubmitSequence) !== false;
+        }
+      } catch {
+        return false;
+      }
+      return false;
     },
 
     completionPattern: COMPLETION_RE,

@@ -218,6 +218,7 @@ export function createOhMyPiAdapter(
         larkToolAppId,
         replyDelivery: effectiveReplyDelivery,
         solo,
+        cliId: 'oh-my-pi',
       });
 
       // Inject the Botmux routing prompt into the process environment so that

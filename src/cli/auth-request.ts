@@ -5,7 +5,7 @@ export const AUTH_REQUEST_USAGE = `用法: botmux auth request [--scope "<scope1
 --scope 指定本次所需权限，以空格或逗号分隔；省略时使用默认授权。
 --allow-unknown (或 --force) 允许放行未录入静态清单的合法格式权限（运行时逃生通道）。
 补授权前先核对当前任务已确定的操作，把所需的多个权限合并到一次 --scope 请求，不要逐项发链接或申请无关权限。
-由 Agent 通过 botmux send 将 authUrl 发给用户，可用 auth wait 等待授权就绪。
+单聊里返回 authUrl，由 Agent 通过 botmux send 发给用户；群聊里 botmux 直接私聊发起人发链接，返回 delivery=dm、不含 authUrl。授权链接只发给发起人本人，不要贴到群里。可用 auth wait 等待授权就绪。
 Daemon 自动完成授权；本轮结束后，用户也可在有效期内授权，再发消息恢复操作。
 wait 每 2 秒查询一次，最多等待 5 分钟，返回 JSON。`;
 

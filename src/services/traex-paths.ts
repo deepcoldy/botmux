@@ -59,6 +59,16 @@ export function traeConfigPath(env: NodeJS.ProcessEnv = process.env): string {
   return join(traeHomeFor(env), 'traecli.toml');
 }
 
+/** Per-install identifier at the TRAE data root. TRAE CLI (0.213.x verified
+ *  under strace) opens it O_RDWR|O_CREAT on EVERY start of its embedded app
+ *  server — even when it already exists — and aborts the whole TUI with
+ *  "failed to start embedded app server: Read-only file system (os error 30)"
+ *  when the open fails. The file sandbox therefore binds exactly this file
+ *  read-write (see CliAdapter.sandboxWritableFiles), never the whole root. */
+export function traeInstallationIdPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(traeHomeFor(env), 'installation_id');
+}
+
 /** TRAE's state root (SQLite DBs, history, sessions) the sandbox binds
  *  read-write for a child running with `env`. */
 export function traeCliStatePath(env: NodeJS.ProcessEnv = process.env): string {

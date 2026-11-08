@@ -14,6 +14,10 @@ export interface InboundTrustedCallerDeps {
     larkAppId: string,
     messageId: string,
   ): Promise<string | null>;
+  resolveVerifiedUserEmail?(
+    larkAppId: string,
+    openId: string,
+  ): Promise<string | undefined>;
 }
 
 const UNION_ID_RE = /^on_[A-Za-z0-9_-]{4,128}$/;
@@ -48,10 +52,24 @@ export async function trustedCallerFromInbound(
     }
   }
 
+  let email: string | undefined;
+  if (input.senderIsBot === false
+    && input.senderOpenId
+    && deps.resolveVerifiedUserEmail) {
+    try {
+      email = await deps.resolveVerifiedUserEmail(input.larkAppId, input.senderOpenId);
+    } catch {
+      // A missing Contact scope or transient lookup failure must not turn into
+      // an asserted principal. Reads remain available; credential consumers
+      // fail closed because the email field stays absent.
+    }
+  }
+
   if (!input.senderOpenId && !unionId) return undefined;
   return {
     ...(input.senderOpenId ? { requestUserOpenId: input.senderOpenId } : {}),
     ...(unionId ? { requestUserUnionId: unionId } : {}),
+    ...(email ? { verifiedEmail: email } : {}),
     requestLarkAppId: input.larkAppId,
     ...(input.senderIsBot === undefined
       ? {}

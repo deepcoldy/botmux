@@ -76,6 +76,25 @@ describe('substitute-mode store', () => {
     expect(readConfig().substituteMode).toEqual(registry.getBot('app_default').config.substituteMode);
   });
 
+  it('saves, reloads, edits and clears keywords while preserving the substitute target', async () => {
+    writeConfig();
+    let { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    const config = { enabled: true, targets: [{ openId: 'ou_sub' }] };
+    await store.updateBotSubstituteMode('app_default', { ...config, keywords: [' incident ', '', 'incident'] });
+    expect(readConfig().substituteMode.keywords).toEqual(['incident']);
+
+    ({ registry, store } = await freshModules());
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    expect(registry.getBot('app_default').config.substituteMode?.keywords).toEqual(['incident']);
+    await store.updateBotSubstituteMode('app_default', { ...config, enabled: false, keywords: ['oncall'] });
+    expect(registry.getBot('app_default').config.substituteMode).toMatchObject({ enabled: false, keywords: ['oncall'] });
+    await store.updateBotSubstituteMode('app_default', { ...config, keywords: [] });
+    expect(readConfig().substituteMode).not.toHaveProperty('keywords');
+    expect(registry.getBot('app_default').config.substituteMode?.targets).toEqual(config.targets);
+    expect(registry.getBot('app_default').config.substituteMode).not.toHaveProperty('keywords');
+  });
+
   it('persists a disabled config with its targets and reloads it', async () => {
     writeConfig();
     const { registry, store } = await freshModules();

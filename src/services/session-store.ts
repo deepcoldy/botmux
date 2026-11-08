@@ -3,6 +3,7 @@ import { resolveCodexProfileHome } from './codex-profiles.js';
 import { readFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
 import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { pidExistsEpermAlive } from '../utils/process-alive.js';
@@ -2156,7 +2157,7 @@ export function persistActiveRemoteLineagesExactBatch(
  *  the serialized row identical skips the write — the daemon fires several
  *  updateSession() calls per inbound message (activity bump, pid, stream-card
  *  state, …) and many of them change nothing. */
-function persistRow(session: Session): void {
+function persistRow(session: Session, modelPinWrite = false): void {
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
   if (!ownStore) {
     throw new SessionStoreUnavailableError(
@@ -2169,6 +2170,9 @@ function persistRow(session: Session): void {
   const existing = ownStore.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (existing) {
     const durable = JSON.parse(existing.row) as Session;
+    // Only explicit pin writers may change intent. Late metadata copies cannot
+    // resurrect a cleared pin or erase a newer choice.
+    if (!modelPinWrite) session = { ...session, modelPin: durable.modelPin };
     if (durable.workspaceRetirement) {
       if (session.status !== 'closed') throw new Error('workspace_retired');
       // Late whole-row writers may hold a pre-close copy. Retirement cannot
@@ -2187,6 +2191,22 @@ function persistRow(session: Session): void {
     }
     if (session.serviceTier === undefined && durable.serviceTier !== undefined) {
       session = { ...session, serviceTier: durable.serviceTier };
+    }
+    if (durable.protectedHttpEgressPolicy !== undefined) {
+      if (session.protectedHttpEgressPolicy !== undefined
+        && !isDeepStrictEqual(
+          session.protectedHttpEgressPolicy,
+          durable.protectedHttpEgressPolicy,
+        )) {
+        throw new Error('Protected HTTP egress policy is immutable');
+      }
+      // The first successful freeze owns this field permanently. Whole-row
+      // metadata writers created before that freeze must carry it forward,
+      // while later writers may only replay the exact durable value.
+      session = {
+        ...session,
+        protectedHttpEgressPolicy: durable.protectedHttpEgressPolicy,
+      };
     }
     if (durable.cliInstanceBinding) {
       if (session.cliInstanceBinding && JSON.stringify(session.cliInstanceBinding) !== JSON.stringify(durable.cliInstanceBinding)) {
@@ -2947,9 +2967,9 @@ export function clearSessionPidsIfUnchanged(
   return targets.length;
 }
 
-export function updateSession(session: Session): void {
+export function updateSession(session: Session, options: { modelPinWrite?: true } = {}): void {
   loadForWrite();
-  try { persistRow(session); }
+  try { persistRow(session, options.modelPinWrite); }
   catch (error) {
     const row = ownStore?.selectRow.get(session.sessionId) as { row: string } | undefined;
     if (row) {
@@ -2963,7 +2983,14 @@ export function updateSession(session: Session): void {
     throw error;
   }
   const durable = ownStore?.selectRow.get(session.sessionId) as { row: string } | undefined;
-  if (durable) Object.assign(session, JSON.parse(durable.row));
+  if (durable) {
+    const row = JSON.parse(durable.row) as Session;
+    Object.assign(session, row);
+    // Object.assign does not remove a key the durable row lacks; drop an
+    // in-memory pin explicitly instead of leaving a lingering own `undefined`.
+    if (row.modelPin === undefined) delete session.modelPin;
+    else session.modelPin = row.modelPin;
+  }
   sessions.set(session.sessionId, session);
 }
 
@@ -3003,6 +3030,8 @@ export function mutateOwnedSessionsAtomically<T>(
     /** Fail fast with SessionStoreBusyError instead of blocking the daemon's
      * event loop behind the connection's normal busy_timeout. */
     nonblocking?: boolean;
+    /** Explicit pin writer, never ordinary metadata. */
+    modelPinWrite?: true;
   } = {},
 ): { result: T; rows: Map<string, Session> } {
   loadForWrite();
@@ -3023,7 +3052,7 @@ export function mutateOwnedSessionsAtomically<T>(
       fresh.set(sessionId, structuredClone(JSON.parse(hit.row) as Session));
     }
     result = mutate(fresh);
-    for (const row of fresh.values()) persistRow(row);
+    for (const row of fresh.values()) persistRow(row, options.modelPinWrite);
   });
   for (const [sessionId, row] of fresh) {
     const cached = sessions.get(sessionId);
@@ -3933,10 +3962,11 @@ function shadowRoutingAnchor(sourceSessionId: string, laneId: string): string {
 
 const PRINCIPAL_LANE_RUNTIME_KEYS = [
   'cliId', 'promptInjection', 'cliLaunchSnapshot', 'cliInstanceBinding', 'cliRuntime', 'cliPathOverride',
-  'codexProfile', 'codexProfileHome', 'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'reasoningEffort', 'modelBackendVariant',
+  'codexProfile', 'codexProfileHome', 'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'modelPin', 'reasoningEffort', 'modelBackendVariant',
   'backendType', 'mojoIdentity', 'mojoIdentityHostDefault',
   'sandbox', 'sandboxPaths', 'sandboxHidePaths',
   'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy',
+  'protectedHttpEgressPolicy',
 ] as const satisfies readonly (keyof Session)[];
 
 function copyPrincipalLaneRuntimeConfig(source: Session, target: Session): void {

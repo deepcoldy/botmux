@@ -36,6 +36,27 @@ describe('trigger request contract', () => {
     if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
   });
 
+  it('accepts payloadTrusted only as literal true on a webhook turn', () => {
+    const ok = request();
+    ok.payloadTrusted = true;
+    expect(validateTriggerRequest(ok).ok).toBe(true);
+    for (const mutate of [
+      (r: any) => { r.payloadTrusted = 'true'; },
+      (r: any) => { r.payloadTrusted = false; },
+      (r: any) => { r.payloadTrusted = 1; },
+      (r: any) => { r.payloadTrusted = true; r.source.type = 'headless'; },
+      (r: any) => { r.payloadTrusted = true; r.source.type = 'vc_meeting'; },
+      (r: any) => { r.payloadTrusted = true; r.source.type = 'ui'; },
+      (r: any) => { r.payloadTrusted = true; r.target = { kind: 'workflow', botId: 'app1', chatId: 'oc_1', workflowId: 'w' }; },
+    ]) {
+      const bad = request() as any;
+      mutate(bad);
+      const v = validateTriggerRequest(bad);
+      expect(v.ok).toBe(false);
+      if (!v.ok) expect(v.status).toBe(400);
+    }
+  });
+
   it('accepts every known connector source type and rejects unknown ones', () => {
     for (const type of TRIGGER_SOURCE_TYPES) {
       const req = request();

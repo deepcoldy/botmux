@@ -19,6 +19,7 @@ import {
   lookupWorkflowHandoffByNonce,
   readDispatchRegistryLoose,
   recordWorkflowHandoffBinding,
+  recordWorkflowHandoffRefusal,
   resolveInboundWorkflowHandoff,
   revokeWorkflowHandoff,
   workflowHandoffNonce,
@@ -175,6 +176,23 @@ describe('inbound workflow handoff verification', () => {
     const registry = readDispatchRegistryLoose(dir) as Record<string, any>;
     registry[`workflow-handoff:${NONCE}`].revoked = { at: new Date().toISOString(), reason: 'x', signature: 'forged' };
     expect(lookupWorkflowHandoffByNonce({ registry, nonce: NONCE, secret: SECRET })).toMatchObject({ kind: 'workflow', revoked: false });
+  });
+
+  it('a refusal (design §15.4) is kept on a registered handoff only, signed, first reason wins', async () => {
+    const dir = dataDir();
+    await recordWorkflowHandoffRefusal(dir, SECRET, NONCE, 'too early');
+    expect(readDispatchRegistryLoose(dir)).toEqual({});
+    await recordWorkflowHandoffBinding(dir, SECRET, binding());
+    await recordWorkflowHandoffRefusal(dir, SECRET, NONCE, 'outside the range');
+    await recordWorkflowHandoffRefusal(dir, SECRET, NONCE, 'second reason');
+    expect(lookupWorkflowHandoffByNonce({ registry: readDispatchRegistryLoose(dir), nonce: NONCE, secret: SECRET }))
+      .toMatchObject({ kind: 'workflow', refusal: 'outside the range' });
+    // Not signed with the host secret: no refusal.
+    expect(lookupWorkflowHandoffByNonce({ registry: readDispatchRegistryLoose(dir), nonce: NONCE, secret: 'other-secret' }))
+      .not.toHaveProperty('refusal');
+    const registry = readDispatchRegistryLoose(dir) as Record<string, any>;
+    registry[`workflow-handoff:${NONCE}`].refused.reason = 'forged';
+    expect(lookupWorkflowHandoffByNonce({ registry, nonce: NONCE, secret: SECRET })).not.toHaveProperty('refusal');
   });
 
   it('M15: a nonce can never be re-bound to a different binding; re-recording the same one is idempotent', async () => {

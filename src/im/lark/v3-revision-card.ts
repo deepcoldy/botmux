@@ -9,6 +9,7 @@
 import type { V3RevisionConfirmReason } from '../../workflows/v3/event-contract.js';
 import type { V3RevisionCardView } from '../../workflows/v3/run-edit.js';
 import { short, v3RunDetailUrl } from './v3-card-common.js';
+import { buildWorkflowSidebarEntryV1Button, type WorkflowSidebarEntryLink } from './workflow-sidebar-entry.js';
 
 export const V3_REVISION_APPROVE_ACTION = 'v3_revision_approve';
 export const V3_REVISION_REJECT_ACTION = 'v3_revision_reject';
@@ -32,6 +33,24 @@ export interface V3RevisionCardInput {
   view: V3RevisionCardView;
   webDetailUrl?: string;
   resolution?: V3RevisionCardResolution;
+  /** §11.1: a run whose nodes are handed to bots in the chat gets the「工作流 ›」
+   *  sidebar entry in place of「Web 详情（需登录）」. Absent = the card is exactly
+   *  what it always was. */
+  workflowEntry?: WorkflowSidebarEntryLink;
+}
+
+/** The card's bottom link row: the run's sidebar entry when it has one,
+ *  otherwise the Dashboard run page as before. */
+function detailRow(webDetailUrl: string, entry: WorkflowSidebarEntryLink | undefined): Record<string, unknown> {
+  return {
+    tag: 'action',
+    actions: [entry ? buildWorkflowSidebarEntryV1Button(entry) : {
+      tag: 'button',
+      text: { tag: 'plain_text', content: 'Web 详情（需登录）' },
+      type: 'default',
+      multi_url: { url: webDetailUrl, pc_url: webDetailUrl, android_url: webDetailUrl, ios_url: webDetailUrl },
+    }],
+  };
 }
 
 /** 稳定 nonce：同一 run 同一提案的卡重发时一致。 */
@@ -134,15 +153,7 @@ export function buildV3RevisionCard(input: V3RevisionCardInput): string {
       ],
     });
   }
-  elements.push({
-    tag: 'action',
-    actions: [{
-      tag: 'button',
-      text: { tag: 'plain_text', content: 'Web 详情（需登录）' },
-      type: 'default',
-      multi_url: { url: webDetailUrl, pc_url: webDetailUrl, android_url: webDetailUrl, ios_url: webDetailUrl },
-    }],
-  });
+  elements.push(detailRow(webDetailUrl, input.workflowEntry));
 
   return JSON.stringify({
     config: { wide_screen_mode: true },
@@ -180,6 +191,8 @@ export function buildV3RerunGrantCard(input: {
   epoch: number;
   webDetailUrl?: string;
   resolution?: { kind: 'granted' | 'void'; by?: string; detail?: string };
+  /** §11.1: see {@link V3RevisionCardInput.workflowEntry}. */
+  workflowEntry?: WorkflowSidebarEntryLink;
 }): string {
   const webDetailUrl = input.webDetailUrl ?? v3RunDetailUrl(input.runId);
   const resolution = input.resolution;
@@ -216,15 +229,7 @@ export function buildV3RerunGrantCard(input: {
     };
     elements.push({ tag: 'action', actions: [button('➕ 追加 1 次', 'primary', value)] });
   }
-  elements.push({
-    tag: 'action',
-    actions: [{
-      tag: 'button',
-      text: { tag: 'plain_text', content: 'Web 详情（需登录）' },
-      type: 'default',
-      multi_url: { url: webDetailUrl, pc_url: webDetailUrl, android_url: webDetailUrl, ios_url: webDetailUrl },
-    }],
-  });
+  elements.push(detailRow(webDetailUrl, input.workflowEntry));
   return JSON.stringify({
     config: { wide_screen_mode: true },
     header: {

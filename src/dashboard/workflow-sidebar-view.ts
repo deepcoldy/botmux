@@ -3,11 +3,13 @@
  *
  * 两种受众、两份数据，都在服务端定形，不靠前端隐藏：
  *   - 管理员：与 `GET /api/v3/runs/:id` 同一份 `RunView`（含终端 / 日志入口），外加落点链接；
- *   - 本群成员：按白名单**重新构造**的精简视图——节点名、目标、负责 Bot、状态、耗时、落点。
- *     不含终端、日志、产物、参数值、错误详情。用白名单而不是从 RunView 里删字段：以后
- *     RunView 多出任何字段，成员视图也不会跟着多出来。
+ *   - 本群成员：按白名单**重新构造**的精简视图——节点名、目标、负责 Bot、状态、耗时、落点、
+ *     流程版本历史。不含终端、日志、产物、参数值、错误详情。用白名单而不是从 RunView 里删
+ *     字段：以后 RunView 多出任何字段，成员视图也不会跟着多出来。
  *
- * 流程版本历史要等「运行中修改流程」落地后才有数据，现在不出这一块。
+ * 流程版本历史（§11.3 / §13.7）对成员只给已生效的版本：版本号、时间、角色（主 Bot / 发起人 /
+ * 其他成员）、生成的计数摘要、是否经过发起人确认。不给 open_id，也不给修改说明（note 是自由
+ * 文本，可能写了参数值）。
  */
 
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
@@ -15,7 +17,15 @@ import { join, resolve, sep } from 'node:path';
 
 import { readJournal } from '../workflows/v3/journal.js';
 import { foldV3ExternalAttempts } from '../workflows/v3/external-attempt-ledger.js';
-import { isValidRunId, projectRun, type RunAttemptOutcome, type RunNodeView, type RunView } from '../workflows/v3/ops-projection.js';
+import {
+  isValidRunId,
+  projectRun,
+  type RunAttemptOutcome,
+  type RunNodeView,
+  type RunRevisionEntryView,
+  type RunRevisionView,
+  type RunView,
+} from '../workflows/v3/ops-projection.js';
 import { readRunEnvelope } from '../workflows/v3/run-envelope.js';
 import type { V3NodeStatus } from '../workflows/v3/orchestrator.js';
 import type { V3RunStatus } from '../workflows/v3/state.js';
@@ -149,10 +159,24 @@ export interface WorkflowSidebarMemberNode {
   landing?: WorkflowSidebarLanding;
 }
 
+/** One flow version that took effect (version 1 = the approved flow is not
+ *  listed, as on the Dashboard). */
+export interface WorkflowSidebarMemberRevision {
+  revision: number;
+  at: number;
+  by: RunRevisionEntryView['by'];
+  /** Generated count summary (`+1 节点、改派 1`), never the free-text note. */
+  summary: string;
+  /** Went through the initiator's confirmation card. */
+  confirmed: boolean;
+}
+
 export interface WorkflowSidebarMemberView {
   runId: string;
   runStatus: V3RunStatus;
   nodes: WorkflowSidebarMemberNode[];
+  /** Present once the run's flow was changed at runtime. */
+  revisions?: { current: number; history: WorkflowSidebarMemberRevision[] };
   generatedAt: number;
 }
 
@@ -177,6 +201,22 @@ function runMeta(run: WorkflowSidebarRun, opts: WorkflowSidebarProjectOptions, a
     mainBot: { ...(audience === 'admin' ? { larkAppId: run.mainLarkAppId } : {}), ...(name ? { name } : {}) },
     ...(run.chatId ? { chatUrl: chatAppLink(run.chatId, opts.brand) } : {}),
   };
+}
+
+/** Field by field: applied versions only, five fields each. */
+function memberRevisions(revision: RunRevisionView | undefined): WorkflowSidebarMemberView['revisions'] {
+  if (!revision) return undefined;
+  const history = revision.history
+    .filter((entry) => entry.state === 'applied')
+    .map((entry): WorkflowSidebarMemberRevision => ({
+      revision: entry.revision,
+      at: entry.at,
+      by: entry.by,
+      summary: entry.summary,
+      confirmed: entry.confirmed,
+    }));
+  if (history.length === 0 && revision.current <= 1) return undefined;
+  return { current: revision.current, history };
 }
 
 function clipGoal(goal: string): string {
@@ -249,10 +289,17 @@ export function projectWorkflowSidebarMember(
       ...(landing ? { landing } : {}),
     };
   });
+  const revisions = memberRevisions(full.revision);
   return {
     ok: true,
     audience: 'member',
     run: runMeta(run, opts, 'member'),
-    view: { runId: full.runId, runStatus: full.runStatus, nodes, generatedAt: full.generatedAt },
+    view: {
+      runId: full.runId,
+      runStatus: full.runStatus,
+      nodes,
+      ...(revisions ? { revisions } : {}),
+      generatedAt: full.generatedAt,
+    },
   };
 }

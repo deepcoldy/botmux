@@ -22,7 +22,7 @@ export interface LocalTurnFailureNotice {
 
 export function localTurnFailureNotice(
   turn: Pick<BridgePendingTurn,
-    'turnId' | 'isScheduled' | 'replyAnchorTurnId' | 'precedingLarkTurnId'
+    'turnId' | 'isScheduled' | 'isBackgroundWake' | 'replyAnchorTurnId' | 'precedingLarkTurnId'
     | 'terminalOutcome' | 'terminalOutcomeAtMs'>,
   opts: {
     /** Failures recorded before this instant belong to an earlier worker
@@ -31,6 +31,10 @@ export function localTurnFailureNotice(
     /** Zero-injection terminal sync: the daemon captured a reply target for
      *  the local turn itself (terminal_turn_started). */
     zeroPromptTerminalSync: boolean;
+    /** This background-wake turn is one whose answer the worker forwards to
+     *  the Lark turn that launched its task (transcript delivery). Elsewhere a
+     *  wake stays an ordinary local turn. */
+    backgroundWakeForwarded?: boolean;
   },
 ): LocalTurnFailureNotice | undefined {
   const outcome = turn.terminalOutcome;
@@ -40,8 +44,10 @@ export function localTurnFailureNotice(
   if (turn.terminalOutcomeAtMs === undefined || turn.terminalOutcomeAtMs < opts.liveSinceMs) return undefined;
   // A scheduled fire keeps its strict create-time anchor: borrowing a later
   // topic would route cross-topic (see BridgeTurnQueue.handleScheduledTurnStart).
+  // A forwarded background wake likewise reports where its answer would go.
+  const anchored = turn.isScheduled || (turn.isBackgroundWake === true && opts.backgroundWakeForwarded === true);
   const replyTurnId = opts.zeroPromptTerminalSync
     ? turn.turnId
-    : turn.isScheduled ? turn.replyAnchorTurnId : turn.precedingLarkTurnId;
+    : anchored ? turn.replyAnchorTurnId : turn.precedingLarkTurnId;
   return { errorCode: outcome.errorCode, ...(replyTurnId ? { replyTurnId } : {}) };
 }

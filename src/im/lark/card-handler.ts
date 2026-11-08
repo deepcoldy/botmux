@@ -1,7 +1,10 @@
+import { modelPinText } from '../../core/model-pin.js';
+import { resolveSessionModelPinView } from '../../core/session-model.js';
+import { forkManualTurn } from '../../core/manual-turn-dispatch.js';
 import { isCodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 import { botAcceptsLaunchModel } from '../../core/launch-model-capability.js';
 import { randomUUID } from 'node:crypto';
-import { MODEL_SLUG_PATTERN, sessionModelChoices, sessionModelPickerData, buildSessionModelPickerCard, buildDefaultModelPickerCard, defaultModelPickerData, defaultModelSelectionKey } from './session-model-picker.js';
+import { DEFAULT_MODEL_VALUE_PATTERN, MODEL_SLUG_PATTERN, sessionModelChoices, sessionModelPickerData, buildSessionModelPickerCard, buildDefaultModelPickerCard, defaultModelPickerData, defaultModelSelectionKey } from './session-model-picker.js';
 /**
  * Lark card action handler — processes button clicks and dropdown selections
  * from Feishu interactive cards.
@@ -18,9 +21,12 @@ import { replyCardKey, updateTurnReplyCard } from '../../core/turn-reply-card.js
 import { TurnReplyCardStore, replyCardIsTerminal } from '../../services/turn-reply-card.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
+import { writeSessionModelPin, recordTurnExplicitMention } from '../../core/worker-pool.js';
+import { messageMentionsBot } from './message-parser.js';
+import { validateModelPin } from '../../core/model-pin.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
-import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
+import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, getChatModeStrict, getCachedChatModeStrict, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
 import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, buildGrantRequesterNoticeCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, frozenIdleLabel, STREAMING_CARD_PATCH_VERSION } from './card-builder.js';
 import type { GrantCardDelivery } from './card-builder.js';
 import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
@@ -75,13 +81,14 @@ import {
   type CompletionProposalCardHandlerDeps,
 } from './completion-proposal-card.js';
 import { createCliAdapterSync } from '../../adapters/cli/registry.js';
-import { frozenSessionSandboxMode } from '../../adapters/cli/sandbox-mode.js';
+import { sessionCardSandboxMode } from '../../adapters/cli/sandbox-mode.js';
 import { buildClosedSessionCard } from '../../core/closed-session-card.js';
 import { cleanupSessionWorktree } from '../../core/session-worktree-cleanup.js';
 import { CLEANUP_SESSION_WORKTREE_ACTION, handleSessionWorktreeCleanupAction } from './session-worktree-cleanup-card.js';
 import { recordCreatedWorktree } from '../../services/botmux-worktree-store.js';
 import { ttadkConfigModelChoices } from '../../setup/cli-selection.js';
 import { logger } from '../../utils/logger.js';
+import { buildRestartStatusCard, restartStatusCardNotifier } from '../../core/restart-status-card.js';
 import * as sessionStore from '../../services/session-store.js';
 import { applyIdleAutoCompactSetting, idleAutoCompactMinutes, isIdleAutoCompactEnabled } from '../../core/idle-auto-compact.js';
 import { cancelDeploymentContinuation } from '../../services/deployment-continuation.js';
@@ -94,13 +101,15 @@ import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
-import { topicReasoningControl, setTopicReasoningEffort, isSessionRestartInFlight, setSessionReasoningEffort, sessionSupportsIdleAutoCompact, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
+import { sessionReasoningControl, updateCodexCliEffort, topicReasoningControl, setTopicReasoningEffort, isSessionRestartInFlight, setSessionReasoningEffort, sessionSupportsIdleAutoCompact, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, substituteCardControlFor, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
 import { publishAttentionPatch, publishClosedSessionPatch, announcePendingRepoSession } from '../../core/session-activity.js';
-import { fallbackTurnId, rehomeReplyTargetState } from '../../core/reply-target.js';
+import { fallbackTurnId, rehomeReplyTargetState, inheritTurnReplyRouting } from '../../core/reply-target.js';
 import { sendWorkerIpc } from '../../core/worker-ipc.js';
+import { stuckPageOptionAt, type StuckPageOption } from '../../core/stuck-page-catalog.js';
+import { decideStuckKeyClick } from '../../core/stuck-warning-card.js';
 import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { activeSessionKey, sessionKey, sessionAnchorId, frozenDisplayMode, markRepoCardConsumed, isActiveRepoCard, larkTransportEnabled } from '../../core/types.js';
@@ -112,7 +121,7 @@ import { createRepoWorktree, removeRepoWorktree, restoreDeletedWorktree, dirSuff
 import { repinSessionWorkingDir } from '../../core/session-cwd.js';
 import { answerRestartWithoutWorkingDir, reclaimUnstartedOpening, recoveryCardForm, workingDirRecoveryPending } from '../../core/working-dir-recovery.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
-import { handleCommand } from '../../core/command-handler.js';
+import { configWriteFailureText, handleCommand } from '../../core/command-handler.js';
 import {
   DISMISS_CLEANUP_WT_ACTION,
   DISMISS_CONFIRM_ACTION,
@@ -125,6 +134,7 @@ import { isRemoteBackendSession, resolvePairedSpawnBackendType } from '../../cor
 import { sessionConfiguredRuntimeDisplayName } from '../../core/cli-runtime-display.js';
 import { worktreeSlugFromContextAI } from '../../services/worktree-slug-ai.js';
 import { t, localeForBot, isLocale, type Locale } from '../../i18n/index.js';
+import { agentManagedNoteSuffix } from '../../services/agent-managed-config-note.js';
 import { SCHEDULE_IDENTITY_ACTION_PREFIX } from './schedule-identity-claim-card.js';
 import {
   isLocalCliOpenCapable,
@@ -137,6 +147,7 @@ import {
 import { hasProtectedSessionMutationOwnership } from '../../core/session-mutation-guard.js';
 import { persistPendingRepoCardMessageId } from '../../core/pending-repo-journal.js';
 import { runDetachedBotTurnAdmission, withBotTurnMutation, tryWithBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
+import { setSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
 import { isSharedAdoptSession } from '../../core/shared-adopt.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
@@ -304,6 +315,65 @@ export async function resolveCardOperatorUnionId(
 
 function tag(ds: DaemonSession): string {
   return ds.session.sessionId.substring(0, 8);
+}
+
+/**
+ * Press one stuck-card key: claim the card (a second click while the first is
+ * in flight is dropped), forward the key with the warning's nonce / CLI
+ * lifetime / page type taken from the daemon session (never from the card),
+ * and show "processing" until the worker answers with tui_keys_delivered,
+ * stuck_warning_expired or tui_prompt_submit_failed. Callers have already
+ * mapped (page type, button index) to `option` and checked who clicked.
+ */
+async function pressStuckWarningKey(
+  ds: DaemonSession,
+  option: StuckPageOption,
+  cardMessageId: string | undefined,
+): Promise<any> {
+  if (!ds.worker) return undefined;
+  if (ds.stuckWarningProcessing) {
+    logger.info(`[${tag(ds)}] Duplicate stuck-warning card click — dropped (processing already in flight)`);
+    return undefined;
+  }
+  ds.stuckWarningProcessing = true;
+  // Only Enter re-arms the detector (it advances from the hook list to a
+  // per-hook review page); t/Esc resolve or leave the page.
+  const rearmStuckDetector = option.key === 'Enter';
+  const stuckNonce = ds.stuckWarningNonce;
+  const locDs = localeForBot(ds.larkAppId);
+  const processingText = t('card.stuck.processing', undefined, locDs);
+  try {
+    await sendWorkerIpc(ds.worker, {
+      type: 'tui_keys',
+      keys: [option.key],
+      isFinal: true,
+      rearmStuckDetector,
+      stuckNonce,
+      stuckCliLifetime: ds.stuckWarningCliLifetime,
+      stuckPageType: ds.stuckWarningPageType,
+      selectedText: processingText,
+    } as DaemonToWorker);
+  } catch (err) {
+    ds.stuckWarningProcessing = false;
+    logger.warn(`[${tag(ds)}] TUI key IPC delivery failed: ${err instanceof Error ? err.message : String(err)}`);
+    return {
+      toast: {
+        type: 'warning',
+        content: t('card.action.tui_ipc_failed', undefined, locDs),
+      },
+    };
+  }
+  logger.info(`[${tag(ds)}] Stuck-warning key: [${option.key}] rearmStuck=${rearmStuckDetector} stuckNonce=${stuckNonce ?? 'none'}`);
+  // Do NOT clear authority or render success here: the worker may still
+  // refuse the key (screen changed). The card resolves on the worker's ACK.
+  const processingCard = buildTuiPromptProcessingCard(processingText, locDs);
+  if (cardMessageId) {
+    updateMessage(ds.larkAppId, cardMessageId, processingCard).catch(err =>
+      logger.debug(`[${tag(ds)}] Failed to set stuck-warning card to processing: ${err}`),
+    );
+  }
+  publishAttentionPatch(ds);
+  try { return JSON.parse(processingCard); } catch { return undefined; }
 }
 
 const LEGACY_SELF_HEAL_ACTIONS = new Set(['toggle_display', 'toggle_stream', 'refresh_screenshot']);
@@ -813,13 +883,22 @@ export async function commitRepoSelection(
           codexAppInputGateFrozen: true,
         };
       }
-      if (pendingRawInput) rememberLastCliInput(ds, pendingRawInput, pendingRawInput);
-      else if (hasBufferedInput && wrappedInput) rememberLastCliInput(ds, pendingPrompt, wrappedInput);
+      if (pendingRawInput) rememberLastCliInput(ds, pendingRawInput, pendingRawInput, ds.pendingRawTurnId ?? ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId);
+      else if (hasBufferedInput && wrappedInput) rememberLastCliInput(ds, pendingPrompt, wrappedInput, ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId);
       // Keep the reservation and every buffered opening field intact through
       // forkWorker's synchronous pre-accept/write-ahead phase. If it throws,
       // the user can retry this exact selection without losing the first turn.
       const pendingTurnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
       if (!emptyStart && pendingTurnId) await prepareTurn?.(ds, pendingTurnId);
+      // 被 @ 回执的来源记录挂在交给 forkWorker 的同一 turnId 上（turn_terminal 带回的就是它）；
+      // raw 冷启动的 turnId 不经 forkWorker，而是在 prompt_ready 随 raw_input 下发，这里不记。
+      if (!emptyStart && !pendingRawInput && pendingTurnId) {
+        recordTurnExplicitMention(ds, pendingTurnId, messageMentionsBot(
+          { mentions: ds.pendingMentions },
+          ds.larkAppId,
+          selfBot.botOpenId,
+        ));
+      }
       forkWorker(
         ds,
         prompt,
@@ -993,6 +1072,7 @@ export async function commitRepoSelection(
         current.session = session;
         current.lastUserPrompt = undefined;
         current.lastCliInput = undefined;
+        current.lastCliInputTurnId = undefined;
         current.workingDir = dirPath;
         session.workingDir = dirPath;
         session.larkAppId = current.larkAppId;
@@ -1422,7 +1502,8 @@ async function deliverMenuTerminalLink(
         loc,
         isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
         sessionRuntimeDisplayName(ds),
-        frozenSessionSandboxMode(ds.session.sandbox),
+        sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
+        ds.session.modelPin ? resolveSessionModelPinView(ds, getBot(ds.larkAppId).config) : undefined,
       );
       // viewToken is read-only and already present on the in-chat streaming
       // card, so this card needs no private delivery; ephemeral just keeps it
@@ -1444,7 +1525,8 @@ async function deliverMenuTerminalLink(
       loc,
       isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
       sessionRuntimeDisplayName(ds),
-      frozenSessionSandboxMode(ds.session.sandbox),
+      sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
+      ds.session.modelPin ? resolveSessionModelPinView(ds, getBot(ds.larkAppId).config) : undefined,
     );
     void deliverWriteLinkCard(ds, operatorOpenId, cardJson);
     return 'write-sent';
@@ -1511,6 +1593,35 @@ function cardClickTurnToastKey(reason: string): string {
     case 'cross_principal': return 'card.click_turn.cross_principal';
     default: return 'card.click_turn.rejected';
   }
+}
+
+interface SubstituteToggleNoticeContext {
+  appId: string;
+  operatorOpenId?: string;
+}
+
+/**
+ * Rejection result for the per-group substitute toggle.
+ *
+ * A toast only rides the synchronous callback response. The ACK wrapper passes
+ * the REAL timeout state to `afterAck(timedOut)`; only when it already ACKed
+ * (the handler exceeded the deadline) do we send one visible DM from the
+ * receiving bot to the operator. Fast results never duplicate the toast as a DM.
+ */
+function substituteToggleRejection(content: string, ctx: SubstituteToggleNoticeContext): any {
+  return {
+    toast: { type: 'warning', content },
+    afterAck: async (ackTimedOut?: boolean) => {
+      if (!ackTimedOut || !ctx.operatorOpenId) return;
+      try {
+        await sendUserMessage(ctx.appId, ctx.operatorOpenId, content, 'text');
+      } catch (err) {
+        logger.warn(
+          `[substitute-card] slow rejection notice failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    },
+  };
 }
 
 export async function handleCardAction(input: unknown, deps: CardHandlerDeps, larkAppId?: string): Promise<any> {
@@ -1767,8 +1878,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     const durationMs = formLimits ? formLimits.durationMs : claim.durationMs;
     const expiresAt = durationMs === undefined ? undefined : Date.now() + durationMs;
     // 触发本次授权申请的原始消息事件：授权成功后重放，用户无需再 @ 一遍。
-    // 自助申请卡每次只对应一个 target，取第一个即可。
-    const pendingMessage = claim.messageData;
+    // 自助申请卡每次只对应一个 target，取第一个即可。待处理期间各 target 暂存的消息排在它后面。
+    const replayMessages = [...(claim.messageData ? [claim.messageData] : []), ...(claim.heldMessages ?? [])];
     const granted: string[] = [];
     const failed: Array<{ openId: string; reason: string }> = [];
     for (const tt of targets) {
@@ -1789,6 +1900,18 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     if (granted.length === 0) {
       claim.restore();
       return { toast: { type: 'error', content: t('card.grant.toast_failed', { reason: failed[0]?.reason ?? 'unknown' }, loc) } };
+    }
+    // 授权成功后按序重放触发本次申请的原始消息和待处理期间暂存的消息，用户无需再 @ 一遍。
+    // replayGrantedMessage 内部异步执行（setImmediate）、按调用顺序串行处理，不阻塞 callback 响应。
+    // 授权此刻已生效：必须在下面任何 await 之前入队，否则发送方新来的实时消息会插到暂存消息前面、先扣额度。
+    if (deps.replayGrantedMessage) {
+      for (const replayData of replayMessages) {
+        try {
+          deps.replayGrantedMessage(replayData, larkAppId);
+        } catch (err) {
+          logger.warn(`replay granted message failed (grant still applied): ${err}`);
+        }
+      }
     }
     // 部分成功：失败 target 的 pending 已随核销一起清掉——卡马上要变终态（owner 无法再点原卡重试），
     // 留着的话 isThrottled 会挡住失败 target 后续的自助申请直到 pending 过期（已落盘，重启也清不掉）。
@@ -1853,15 +1976,6 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           }
         })
         .catch(err => logger.error(`grant post-callback background tasks failed: ${err}`));
-    }
-    // 授权成功后重放触发本次申请的原始消息，用户无需再 @ 一遍。
-    // replayGrantedMessage 内部异步执行（setImmediate），不阻塞 callback 响应。
-    if (pendingMessage && deps.replayGrantedMessage) {
-      try {
-        deps.replayGrantedMessage(pendingMessage, larkAppId);
-      } catch (err) {
-        logger.warn(`replay granted message failed (grant still applied): ${err}`);
-      }
     }
     return resultCardBody;
   }
@@ -2009,10 +2123,14 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     return handleCompletionProposalAction(data, larkAppId, deps.completionProposalDeps);
   }
 
-  if (['feedback_submit', 'feedback_reason', 'feedback_comment', 'skill_feedback_submit'].includes(value?.action ?? '') && larkAppId) {
+  if (['feedback_custom_action', 'feedback_submit', 'feedback_reason', 'feedback_comment', 'skill_feedback_submit'].includes(value?.action ?? '') && larkAppId) {
     const { handleSkillFeedbackCardAction } = await import('./skill-feedback-card.js');
     const { getSkillFeedbackStore } = await import('../../services/skill-feedback-store.js');
     const { config } = await import('../../config.js');
+    const { handleFeedbackExtensionCard } = await import('../../services/feedback-extension-host.js');
+    const extension = await handleFeedbackExtensionCard(data, larkAppId, config.session.dataDir);
+    if (extension !== undefined) return extension;
+    if (value?.action === 'feedback_custom_action') return { toast: { type: 'error', content: '动作不存在或已失效' } };
     return handleSkillFeedbackCardAction(data, larkAppId, {
       store: await getSkillFeedbackStore(config.session.dataDir),
       loadBaseCard: async (platformMessageId) => {
@@ -2365,16 +2483,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     let accepted = false;
     try {
       if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, cliInput, turnId);
-      // Cold session: fork a worker with the transcript as its opening input,
-      // matching how retry_last_task revives a dead worker. `forkWorker` throws
-      // on refusal rather than returning a flag, so acceptance is claimed only
-      // after it returns — the earlier `accepted = true` before the call would
-      // have reported success for a fork that never happened, with the
-      // one-shot follow-up token already consumed and no retry affordance.
-      else {
-        forkWorker(ds, cliInput, ds.hasHistory);
-        accepted = true;
-      }
+      else accepted = forkManualTurn(ds, cliInput, turnId, forkWorker);
     } catch (err) {
       logger.warn(`[${tag(ds)}] /quote injection threw: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -2393,7 +2502,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     // only ever driven through /quote would keep that flag forever — final text
     // answers still arrive, but its streaming card is permanently dead with no
     // visible cause and no way for the user to revive it.
-    rememberLastCliInput(ds, transcript.text, cliInput);
+    rememberLastCliInput(ds, transcript.text, cliInput, turnId);
     ds.lastScreenStatus = 'working';
     ds.streamCardPending = true;
     ds.currentTurnId = turnId;
@@ -2516,9 +2625,13 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         valueToApply = coerced.value as string | string[];
       }
       const r = await applyConfigField(larkAppId, spec, valueToApply);
-      if (!r.ok) return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, loc) } };
+      if (!r.ok) {
+        const failure = configWriteFailureText(spec, r.reason, loc);
+        return { toast: { type: failure.actionable ? 'warning' : 'error', content: failure.text } };
+      }
       logger.info(`[config:${larkAppId}] text field ${spec.key} saved via card`);
-      return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` } };
+      const textNote = await agentManagedNoteSuffix(larkAppId, spec.key, loc);
+      return { toast: { type: textNote ? 'info' : 'success', content: `✓ ${spec.key} = ${r.newText}${textNote}` } };
     }
 
     // 消息额度使用独立私信子卡自由输入，与 Dashboard 的 1–1000 语义一致。
@@ -2596,7 +2709,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       r = await applyConfigField(larkAppId, spec, !cur);
     } else {
       const raw = (action as any)?.option ?? (action as any)?.input_value ?? '';
-      if (defaultPicker && raw !== CONFIG_UNSET && (effortPicker ? !isCodexReasoningEffort(raw) : !MODEL_SLUG_PATTERN.test(raw))) {
+      if (defaultPicker && raw !== CONFIG_UNSET && (effortPicker ? !isCodexReasoningEffort(raw) : !DEFAULT_MODEL_VALUE_PATTERN.test(raw))) {
         return { toast: { type: 'error', content: t(effortPicker ? 'card.models.effort_invalid' : 'card.reply_actions.model_unsupported', undefined, loc) } };
       }
       if (raw === CONFIG_UNSET) {
@@ -2615,20 +2728,23 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       if (defaultPicker && r.reason === 'reasoning_effort_not_supported_by_model') {
         return { toast: { type: 'warning', content: t(effortPicker ? 'card.models.effort_invalid' : 'card.models.effort_incompatible', undefined, loc) }, ...(await reRender()) };
       }
-      return { toast: { type: 'error', content: t('cmd.config.write_failed', { reason: r.reason }, loc) } };
+      const failure = configWriteFailureText(spec, r.reason, loc);
+      return { toast: { type: failure.actionable ? 'warning' : 'error', content: failure.text } };
     }
     if (defaultPicker) {
       const refreshKey = defaultModelSelectionKey(larkAppId);
       const { models: choices, load } = await defaultModelPickerData(larkAppId);
       const current = getBot(larkAppId);
+      const pickerNote = await agentManagedNoteSuffix(larkAppId, spec.key, loc);
       if (defaultModelSelectionKey(larkAppId) !== refreshKey || !botAcceptsLaunchModel(current.config)
         || !current.resolvedAllowedUsers.includes(operatorOpenId)) {
-        return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText} · ${t('card.models.changed', undefined, loc)}` } };
+        return { toast: { type: pickerNote ? 'info' : 'success', content: `✓ ${spec.key} = ${r.newText} · ${t('card.models.changed', undefined, loc)}${pickerNote}` } };
       }
-      return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` },
+      return { toast: { type: pickerNote ? 'info' : 'success', content: `✓ ${spec.key} = ${r.newText}${pickerNote}` },
         card: { type: 'raw' as const, data: JSON.parse(buildDefaultModelPickerCard(larkAppId, choices, current.config.model, loc, refreshKey, { cliId: current.config.cliId, effort: current.config.reasoningEffort }, load)) } };
     }
-    return { toast: { type: 'success', content: `✓ ${spec.key} = ${r.newText}` }, ...(await reRender()) };
+    const fieldNote = await agentManagedNoteSuffix(larkAppId, spec.key, loc);
+    return { toast: { type: fieldNote ? 'info' : 'success', content: `✓ ${spec.key} = ${r.newText}${fieldNote}` }, ...(await reRender()) };
   }
 
   // ─── /relay picker: confirm transfer (stage 2 → done) ──────────────────
@@ -3325,6 +3441,130 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       return { toast: { type: 'success', content: t('card.voice.toast_wait', undefined, locDs) } };
     }
 
+    // 「在本群关闭/开启替身模式」：per-bot + per-chat 运行态开关。按钮值携带目标
+    // desired，写入按目标而不是翻转；重复点击/重投幂等。权限由 SENSITIVE_CARD_ACTIONS
+    // 的 canOperate 门在入口执行，最终写入段再核对一次。
+    if (actionType === 'toggle_substitute') {
+      const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds || !larkAppId || !cardMessageId) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, loc) } };
+      }
+      const receivedAppId = larkAppId;
+      const receivedChatId = ds.chatId;
+      const receivedSessionId = ds.session.sessionId;
+      const reject = (content: string) => substituteToggleRejection(content, {
+        appId: receivedAppId,
+        operatorOpenId,
+      });
+
+      if (receivedAppId !== ds.larkAppId) {
+        return reject(t('card.substitute.stale_card', undefined, loc));
+      }
+      const desired = value?.desired;
+      if (desired !== 'on' && desired !== 'off') {
+        // Missing/invalid desired means an old or crafted card. Never blind-toggle.
+        return reject(t('card.substitute.stale_card', undefined, loc));
+      }
+      if (cardMessageId !== ds.streamCardId) {
+        return reject(t('card.substitute.stale_card', undefined, loc));
+      }
+
+      // Trusted card placement: action.value is client-roundtripped data, so ask
+      // Lark which chat actually contains the clicked message.
+      let actualChatId: string | undefined;
+      try {
+        const detail = await getMessageDetail(receivedAppId, cardMessageId);
+        actualChatId = detail?.items?.[0]?.chat_id;
+      } catch (err) {
+        logger.warn(`[substitute-card] message detail probe failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (actualChatId !== receivedChatId) {
+        return reject(t('card.substitute.stale_card', undefined, loc));
+      }
+
+      // Strict chat mode only. getChatMode()'s lenient unknown→group fallback is
+      // NOT proof that this is a flat group, so it cannot authorize the write.
+      const strictMode = await getChatModeStrict(receivedAppId, receivedChatId);
+      if (strictMode === 'unknown') {
+        return reject(t('card.substitute.mode_unknown', undefined, loc));
+      }
+      if (strictMode === 'p2p') {
+        return reject(t('cmd.substitute.unsupported', undefined, loc));
+      }
+      if (strictMode === 'topic' && getBot(receivedAppId).config.substituteMode?.topicGroups === false) {
+        return reject(t('cmd.substitute.topic_disabled', undefined, loc));
+      }
+
+      // Final write section: no awaits inside. All external lookups above may
+      // have raced a card replacement, session transfer/close, permission change
+      // or live config edit — re-verify everything against the captured identity.
+      const mutation = await tryWithBotTurnMutation(receivedAppId, 1000, ():
+        | { ok: true }
+        | { ok: false; key: string } => {
+        const current = [...activeSessions.values()].find(
+          candidate => candidate.session.sessionId === receivedSessionId
+            && candidate.larkAppId === receivedAppId,
+        );
+        if (!current || current !== ds) return { ok: false, key: 'card.substitute.stale_card' };
+        if (activeSessions.get(activeSessionKey(current)) !== current) {
+          return { ok: false, key: 'card.substitute.stale_card' };
+        }
+        if (current.session.status !== 'active') return { ok: false, key: 'card.substitute.stale_card' };
+        if (current.chatId !== receivedChatId) return { ok: false, key: 'card.substitute.stale_card' };
+        if (current.streamCardId !== cardMessageId) return { ok: false, key: 'card.substitute.stale_card' };
+        if (isSessionTransferring(current)) return { ok: false, key: 'card.substitute.stale_card' };
+        if (!canOperate(receivedAppId, receivedChatId, operatorOpenId)) {
+          return { ok: false, key: 'cmd.substitute.owner_only' };
+        }
+        const liveCfg = getBot(receivedAppId).config.substituteMode;
+        if (liveCfg?.enabled !== true) return { ok: false, key: 'cmd.substitute.unsupported' };
+        if (liveCfg.excludedChats?.includes(receivedChatId)) {
+          return { ok: false, key: 'cmd.substitute.blocked' };
+        }
+        if (liveCfg.chats?.length && !liveCfg.chats.includes(receivedChatId)) {
+          return { ok: false, key: 'card.substitute.out_of_scope' };
+        }
+        // Final strict-mode evidence: the earlier query is only a fast reject.
+        // Another confirmed chat.get may have changed the shared cache while we
+        // waited for the mutation gate, so re-read the current strict source and
+        // never write based on the pre-await snapshot.
+        const liveStrictMode = getCachedChatModeStrict(receivedAppId, receivedChatId);
+        if (!liveStrictMode) return { ok: false, key: 'card.substitute.mode_unknown' };
+        if (liveStrictMode === 'p2p') return { ok: false, key: 'cmd.substitute.unsupported' };
+        if (liveStrictMode === 'topic' && liveCfg.topicGroups === false) {
+          return { ok: false, key: 'cmd.substitute.topic_disabled' };
+        }
+        try {
+          setSubstituteEnabledForChat(receivedAppId, receivedChatId, desired === 'on');
+        } catch (err) {
+          logger.warn(
+            `[substitute-card] save failed: app=${receivedAppId} chat=${receivedChatId} `
+            + `desired=${desired}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return { ok: false, key: 'card.substitute.save_failed' };
+        }
+        return { ok: true };
+      });
+      if (!mutation.acquired) {
+        return reject(t('card.substitute.busy', undefined, loc));
+      }
+      if (!mutation.value.ok) {
+        return reject(t(mutation.value.key, undefined, loc));
+      }
+
+      logger.info(
+        `[substitute-card] ${desired === 'on' ? 'enabled' : 'disabled'} by ${operatorOpenId ?? '?'} `
+        + `app=${receivedAppId} chat=${receivedChatId} card=${cardMessageId.substring(0, 12)}`,
+      );
+      return {
+        toast: {
+          type: 'success',
+          content: t(desired === 'on' ? 'cmd.substitute.updated_on' : 'cmd.substitute.updated_off', undefined, loc),
+        },
+        card: { type: 'raw' as const, data: JSON.parse(buildStreamingCardJson(ds)) },
+      };
+    }
+
     // 「⏲️ 闲置自动压缩：开/关」：本会话 opt-in（core/idle-auto-compact.ts）。按钮值带目标
     // 状态 desired，旧卡片重复点击幂等；设置落在会话行上，daemon 重启后仍生效。
     if (actionType === 'toggle_idle_compact') {
@@ -3378,14 +3618,23 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           || value.expected_model !== control.model
           || value.expected_effort !== (ds.session.topicReasoningEffort?.effort ?? '')
           || value.expected_effort_model !== (ds.session.topicReasoningEffort?.model ?? '')) return 'stale' as const;
-        if (actionType === 'session_effort_pick') return setTopicReasoningEffort(ds, action?.option);
+        if (actionType === 'session_effort_pick') return setTopicReasoningEffort(ds, action?.option, { source: 'card', setBy: operatorOpenId });
         const selected = ds.session.topicReasoningEffort;
         if (!selected || value.effort !== selected.effort || !control.choices.includes(selected.effort)) return 'invalid' as const;
         if (!sessionAcceptsDirectCommand(ds) || isSessionRestartInFlight(ds)) return 'busy' as const;
         if (!ds.session.cliSessionId) return 'unsupported' as const;
+        const cliName = sessionCliDisplayName(ds);
         const result = requestSessionRestart(ds, {
           source: 'card',
-          notify: async status => { await sessionReply(rootId, t(`card.topic_effort.restart_${status}`, undefined, loc)); },
+          notify: restartStatusCardNotifier({
+            larkAppId: ds.larkAppId,
+            sessionId: ds.session.sessionId,
+            render: status => buildRestartStatusCard({
+              status, cliName, source: 'effort', locale: loc,
+              ...(status === 'cancelled' ? {} : { body: t(`card.topic_effort.restart_${status}`, undefined, loc) }),
+            }),
+            post: card => sessionReply(rootId, card, 'interactive'),
+          }),
         }, { topicEffort: { model: control.model, effort: selected.effort, nativeSessionId: ds.session.cliSessionId } });
         requested = !!result && !result.startFailure && !result.joined;
         return requested ? 'saved' as const : 'busy' as const;
@@ -3419,9 +3668,43 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           || !cardMessageId || cardMessageId !== ds.streamCardId
           || value.card_nonce !== ds.streamCardNonce
           || value.expected_effort !== (ds.session.reasoningEffort ?? '')) return 'stale' as const;
-        return setSessionReasoningEffort(ds, data.action?.option);
+        const control = sessionReasoningControl(ds);
+        if (!control) return 'unsupported' as const;
+        const effort = control.choices.find(choice => choice === data.action?.option);
+        if (!effort) return 'invalid' as const;
+        // Keep the verified cold-start path for suspended sessions and wrappers.
+        // A live Codex uses the same native, receipt-confirmed menu as /effort.
+        const worker = ds.worker;
+        if (!worker || worker.killed || (ds.initConfig ?? ds.session).wrapperCli) {
+          return setSessionReasoningEffort(ds, effort, { source: 'card', setBy: operatorOpenId });
+        }
+        const generation = ds.workerGeneration;
+        const sessionGeneration = ds.session.workerGeneration;
+        const nativeId = ds.session.cliSessionId;
+        const stillCurrent = () => getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType) === ds
+          && ds.worker === worker && ds.workerGeneration === generation
+          && ds.session.workerGeneration === sessionGeneration
+          && ds.session.cliSessionId === nativeId && ds.session.status === 'active';
+        const notify = async (result: import('../../types.js').CodexAppEffortResult) => {
+          if (!stillCurrent()) return;
+          scheduleCardPatch(ds, buildStreamingCardJson(ds), undefined, { userInitiated: true });
+          const key = result.reason ? `cmd.effort.${result.reason}`
+            : result.status === 'invalid' && !result.choices?.length
+              ? 'cmd.effort.invalid_without_choices' : `cmd.effort.${result.status}`;
+          const text = t(key, { effort, choices: result.choices?.join(', ') ?? '' }, loc);
+          await deliverEphemeralOrReply(ds, operatorOpenId, text, 'text', () => sessionReply(rootId, text));
+        };
+        // Native menu navigation may take seconds. Acknowledge the card callback
+        // and release the bot mutation gate before waiting for the CLI receipt.
+        void updateCodexCliEffort(ds, effort, undefined, () => stillCurrent() && canOperate(ds.larkAppId, ds.chatId, operatorOpenId), { source: 'card', setBy: operatorOpenId }).then(notify).catch(error => {
+          logger.warn(`[${tag(ds)}] Card effort update failed: ${String(error)}`);
+        });
+        return 'updating' as const;
       });
       if (!mutation.acquired) return warning('card.effort.busy');
+      if (mutation.value === 'updating') return {
+        toast: { type: 'info', content: t('card.effort.updating', undefined, loc) },
+      };
       if (mutation.value !== 'saved') return warning(`card.effort.${mutation.value}`);
       return {
         toast: { type: 'success', content: t('card.effort.saved', undefined, loc) },
@@ -3491,16 +3774,12 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       logger.info(`[${tag(ds)}] Correlated restart via card button`);
       requestSessionRestart(ds, {
         source: 'card',
-        notify: status => {
-          const content = t(`cmd.restart.${status}`, { cliName }, locDs);
-          return deliverEphemeralOrReply(
-            ds,
-            operatorOpenId,
-            content,
-            'text',
-            () => sessionReply(rootId, content),
-          );
-        },
+        notify: restartStatusCardNotifier({
+          larkAppId: ds.larkAppId,
+          sessionId: ds.session.sessionId,
+          render: status => buildRestartStatusCard({ status, cliName, source: 'card', locale: locDs }),
+          post: card => sessionReply(rootId, card, 'interactive'),
+        }),
       });
     }
 
@@ -3844,12 +4123,13 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         await sessionReply(rootId, t('card.action.retry_last_task_unavailable', undefined, locDs));
         return;
       }
+      const retryTurnId = `retry-${randomUUID()}`;
+      const rollbackReplyRouting = inheritTurnReplyRouting(ds, ds.lastCliInputTurnId, retryTurnId);
       let accepted = false;
       try {
-        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput);
+        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
         else {
-          forkWorker(ds, retryInput, ds.hasHistory);
-          accepted = true;
+          accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
         }
       } catch (err) {
         logger.warn(
@@ -3858,9 +4138,12 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         );
       }
       if (!accepted) {
+        rollbackReplyRouting();
+        sessionStore.updateSession(ds.session);
         await sessionReply(rootId, t('card.action.retry_last_task_unavailable', undefined, locDs));
         return;
       }
+      rememberLastCliInput(ds, ds.lastUserPrompt ?? cliInput, retryInput, retryTurnId);
       // Only now consume the one-shot retry state and advertise working: live
       // IPC or the durable activation tail already owns the exact retry input.
       clearUsageLimitState(ds);
@@ -3896,6 +4179,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           streamCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          false,
+          substituteCardControlFor(ds),
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -4006,12 +4291,13 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         // 带上旧 sidecar 会让 CLI 收到与正文不符的结构化载荷。
         ...(!continueMode && retryCodexAppInput ? { codexAppInput: retryCodexAppInput } : {}),
       };
+      const retryTurnId = `retry-${randomUUID()}`;
+      const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
       let accepted = false;
       try {
-        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput);
+        if (ds.worker && !ds.worker.killed) accepted = sendWorkerInput(ds, retryInput, retryTurnId);
         else {
-          forkWorker(ds, retryInput, ds.hasHistory);
-          accepted = true;
+          accepted = forkManualTurn(ds, retryInput, retryTurnId, forkWorker);
         }
       } catch (err) {
         logger.warn(
@@ -4020,12 +4306,14 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         );
       }
       if (!accepted) {
+        rollbackReplyRouting();
+        sessionStore.updateSession(ds.session);
         return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
       }
       // Start the cooldown only after acceptance: a rejected click must not
       // burn it (same post-acceptance ordering as /retry and retry_last_task).
       markRetryAttempt(ds.session);
-      rememberLastCliInput(ds, failedTurn.userPrompt, retryInput);
+      rememberLastCliInput(ds, failedTurn.userPrompt, retryInput, retryTurnId);
       sessionStore.updateSession(ds.session);
       ds.lastScreenStatus = 'working';
       ds.streamCardPending = true;
@@ -4050,6 +4338,48 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       };
     }
 
+    // Safe keys on the "CLI is stuck on a blocking page" card. Deliberately
+    // NOT in SENSITIVE_CARD_ACTIONS: the turn initiator (often a talk-only
+    // member) must be able to press the keys that only decline/skip; the gate
+    // is decideStuckKeyClick (core/stuck-warning-card.ts). The key comes from
+    // the catalog by (active page type, button index) — the card names none.
+    if (actionType === 'stuck_key' && ds) {
+      const locDs = localeForBot(ds.larkAppId);
+      if (isSessionTransferring(ds)) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('cmd.session.transfer_in_progress', undefined, locDs),
+          },
+        };
+      }
+      const decision = decideStuckKeyClick({
+        cardMessageId,
+        activeCardId: ds.stuckWarningCardId,
+        valueNonce: value?.nonce,
+        activeNonce: ds.stuckWarningNonce,
+        pageType: ds.stuckWarningPageType,
+        rawIndex: value?.selected_index,
+        operatorOpenId,
+        initiatorOpenId: ds.stuckWarningInitiatorOpenId,
+        // Global Dashboard switch, read live at click time: off = operators only.
+        initiatorKeysEnabled: config.stuckCardInitiatorKeys !== false,
+        operatorIsAdmin: () => canOperate(ds.larkAppId, ds.chatId, operatorOpenId),
+        operatorCanTalk: () => canTalk(
+          ds.larkAppId, ds.chatId, operatorOpenId, undefined, data?.operator?.union_id, ds.chatType,
+        ),
+      });
+      if (decision.kind === 'drop') {
+        logger.info(`[${tag(ds)}] stuck_key click dropped (${decision.reason}): card=${cardMessageId ?? 'none'} active=${ds.stuckWarningCardId ?? 'none'} nonce=${value?.nonce ?? 'none'}/${ds.stuckWarningNonce ?? 'none'} index=${value?.selected_index ?? 'none'}`);
+        return;
+      }
+      if (decision.kind === 'deny') {
+        logger.info(`[${tag(ds)}] stuck_key refused for ${operatorOpenId ?? 'unknown'} (index=${value?.selected_index})`);
+        return { toast: { type: 'warning', content: t(decision.toastKey, undefined, locDs) } };
+      }
+      return pressStuckWarningKey(ds, decision.option, cardMessageId);
+    }
+
     if (actionType === 'tui_keys' && ds) {
       if (isSessionTransferring(ds)) {
         return {
@@ -4070,24 +4400,39 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         logger.info(`[${tag(ds)}] tui_keys from stale card ${cardMessageId} — ignored (active tui=${ds.tuiPromptCardId ?? 'none'} stuck=${ds.stuckWarningCardId ?? 'none'})`);
         return;
       }
+      // Stuck-warning card (only reached by operators here: `tui_keys` is
+      // behind the canOperate card gate; the same card's `stuck_key` buttons
+      // have their own gate). Derive the single allowed key from the page
+      // type + selected index via the catalog the card was built from —
+      // NEVER trust value.keys / value.is_final / option_type, which could be
+      // tampered. A missing/malformed/out-of-range index resolves to nothing,
+      // never to a default (index 0 is "trust" on the hook pages). Toggle
+      // state belongs to the ScreenAnalyzer card only.
+      if (isActiveStuckCard) {
+        if ((value?.option_type ?? 'select') === 'toggle') {
+          logger.info(`[${tag(ds)}] Ignored toggle from non-TUI card ${cardMessageId}`);
+          return;
+        }
+        const option = stuckPageOptionAt(ds.stuckWarningPageType, value?.selected_index);
+        if (!option) {
+          logger.info(`[${tag(ds)}] Stuck-warning card click with invalid selected_index=${value?.selected_index ?? 'none'} for pageType=${ds.stuckWarningPageType ?? 'none'} — dropped`);
+          return;
+        }
+        return pressStuckWarningKey(ds, option, cardMessageId);
+      }
+
       let keys: string[] = [];
       try { keys = JSON.parse(value?.keys ?? '[]'); } catch { /* bad json */ }
       const isFinal = value?.is_final === '1';
       const optionType = value?.option_type ?? 'select';
       const selectedIndex = Number(value?.selected_index ?? 0);
       const selectedText = value?.selected_text ?? `Option ${selectedIndex + 1}`;
-      if (isActiveTuiCard && ds.tuiPromptProcessing) {
+      if (ds.tuiPromptProcessing) {
         logger.info(`[${tag(ds)}] Duplicate TUI prompt card click — dropped (processing already in flight)`);
         return;
       }
 
       if (optionType === 'toggle') {
-        // Only a ScreenAnalyzer TUI card may own toggle state. A stuck-warning
-        // card must never read or mutate the other card's global selections.
-        if (!isActiveTuiCard) {
-          logger.info(`[${tag(ds)}] Ignored toggle from non-TUI card ${cardMessageId}`);
-          return;
-        }
         // Toggle: only update card UI, do NOT send keys to terminal yet.
         // Keys will be sent in batch when confirm is clicked.
         if (!ds.tuiToggledIndices) ds.tuiToggledIndices = [];
@@ -4116,15 +4461,10 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       }
 
       // For a normal TUI confirm: batch all toggled options' keys first.
-      // For a stuck-warning card: derive the single allowed key from the
-      // page type + selected index — NEVER trust value.keys from the card,
-      // which could be tampered to inject arbitrary keys. The allowlist is
-      // exactly the documented controls for each Codex hook-review screen.
       if (ds.worker) {
-        let allKeys: string[] = [];
-        let isFinalStuck = false;
+        const allKeys: string[] = [];
         let dispatchedKeys = false;
-        if (isActiveTuiCard && ds.tuiToggledIndices?.length && ds.tuiPromptOptions) {
+        if (ds.tuiToggledIndices?.length && ds.tuiPromptOptions) {
           // Send each toggled option's keys in sequence
           for (const ti of ds.tuiToggledIndices.sort((a, b) => a - b)) {
             const opt = ds.tuiPromptOptions[ti];
@@ -4132,96 +4472,27 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
               allKeys.push(...opt.keys);
             }
           }
-          // Then the action's own keys (confirm/select)
-          allKeys.push(...keys);
-        } else if (isActiveStuckCard) {
-          // P1-4: do NOT trust the callback's selected_index. Require it to be
-          // present and a safe integer, then range-check against the page type's
-          // option count. A missing/malformed index must NOT default to 0 (trust),
-          // which is the highest-risk action.
-          const rawIdx = value?.selected_index;
-          if (rawIdx === undefined || rawIdx === null || rawIdx === '') {
-            logger.info(`[${tag(ds)}] Stuck-warning card click missing selected_index — dropped`);
-            return;
-          }
-          const idx = Number(rawIdx);
-          if (!Number.isSafeInteger(idx)) {
-            logger.info(`[${tag(ds)}] Stuck-warning card click with non-integer selected_index=${rawIdx} — dropped`);
-            return;
-          }
-          // Allowlist: map (pageType, idx) → the one safe key.
-          // Level 1: 0=t, 1=Enter, 2=Esc ; Level 2: 0=t, 1=Esc
-          const pt = ds.stuckWarningPageType;
-          const allowlist = pt === 'hook review level 1'
-            ? ['t', 'Enter', 'Escape']
-            : pt === 'hook review level 2'
-              ? ['t', 'Escape']
-              : null;
-          if (!allowlist || idx < 0 || idx >= allowlist.length) {
-            logger.info(`[${tag(ds)}] Stuck-warning card click with out-of-range index ${idx} for pageType=${pt ?? 'none'} — dropped`);
-            return;
-          }
-          allKeys = [allowlist[idx]];
-          // Stuck-card actions are always final (they resolve the current
-          // hook-review screen). Define this server-side — do NOT trust
-          // value.is_final from the callback.
-          isFinalStuck = true;
-        } else {
-          // Non-stuck, non-TUI card (shouldn't happen given the active-card
-          // guard above, but fail-closed).
-          allKeys.push(...keys);
         }
+        // Then the action's own keys (confirm/select)
+        allKeys.push(...keys);
 
+        const resolveText = ds.tuiToggledIndices?.length
+          ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
+          : selectedText;
         if (allKeys.length > 0) {
-          const effectiveFinal = isFinal || isFinalStuck;
-          // Atomic processing claim: if a previous click is already in flight
-          // (waiting for tui_keys_delivered / stuck_warning_expired ACK), drop
-          // this duplicate. Without this, two rapid clicks could both pass the
-          // fresh-capture guard and inject keys twice.
-          if (isActiveStuckCard) {
-            if (ds.stuckWarningProcessing) {
-              logger.info(`[${tag(ds)}] Duplicate stuck-warning card click — dropped (processing already in flight)`);
-              return;
-            }
-            ds.stuckWarningProcessing = true;
-          }
-          if (isActiveTuiCard && effectiveFinal) {
-            ds.tuiPromptProcessing = true;
-          }
-          // Only the stuck-warning card's Enter action re-arms the detector
-          // (Enter advances from the hook list to a per-hook review). Match by
-          // the actual keys sent — NOT by optionType, since t is typed 'confirm'
-          // in the card definition. t/Esc and all ScreenAnalyzer cards never
-          // set this flag. Also require the source card to be our own.
-          const isStuckWarningEnter = isActiveStuckCard
-            && allKeys.length === 1
-            && allKeys[0] === 'Enter';
-          // If this click is from a stuck-warning card, forward the nonce,
-          // cliLifetime, and page type so the worker can re-verify the current
-          // screen still matches before injecting keys. A stale click (CLI
-          // recovered) will be dropped at the worker boundary.
-          const stuckNonce = isActiveStuckCard ? ds.stuckWarningNonce : undefined;
-          const stuckCliLifetime = isActiveStuckCard ? ds.stuckWarningCliLifetime : undefined;
-          const stuckPage = isActiveStuckCard ? ds.stuckWarningPageType : undefined;
-          const resolveText = isActiveTuiCard && ds.tuiToggledIndices?.length
-            ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
-            : selectedText;
+          if (isFinal) ds.tuiPromptProcessing = true;
           try {
             await sendWorkerIpc(ds.worker, {
               type: 'tui_keys',
               keys: allKeys,
-              isFinal: effectiveFinal,
-              rearmStuckDetector: isStuckWarningEnter,
-              stuckNonce,
-              stuckCliLifetime,
-              stuckPageType: stuckPage,
-              cardMessageId: isActiveTuiCard ? cardMessageId : undefined,
+              isFinal,
+              rearmStuckDetector: false,
+              cardMessageId,
               selectedText: resolveText || selectedText,
             } as DaemonToWorker);
             dispatchedKeys = true;
           } catch (err) {
-            if (isActiveStuckCard) ds.stuckWarningProcessing = false;
-            if (isActiveTuiCard && effectiveFinal) ds.tuiPromptProcessing = false;
+            if (isFinal) ds.tuiPromptProcessing = false;
             logger.warn(`[${tag(ds)}] TUI key IPC delivery failed: ${err instanceof Error ? err.message : String(err)}`);
             return {
               toast: {
@@ -4230,32 +4501,13 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
               },
             };
           }
-          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${effectiveFinal} rearmStuck=${isStuckWarningEnter} stuckNonce=${stuckNonce ?? 'none'} — "${selectedText}"`);
+          logger.info(`[${tag(ds)}] TUI keys: [${allKeys.join(',')}] final=${isFinal} — "${selectedText}"`);
         }
 
-        if ((isFinal || isFinalStuck) && dispatchedKeys) {
-          const resolveText = isActiveTuiCard && ds.tuiToggledIndices?.length
-            ? ds.tuiToggledIndices.map(i => ds.tuiPromptOptions?.[i]?.text).filter(Boolean).join(', ')
-            : selectedText;
+        if (isFinal && dispatchedKeys) {
           const finalText = resolveText || selectedText;
           const locDs = localeForBot(ds.larkAppId);
-          // For a stuck-warning card, do NOT clear authority or render success
-          // here. The worker may still reject the keys (stale screen). We show a
-          // "processing" state to block duplicate clicks, and wait for the
-          // worker's tui_keys_delivered (success), stuck_warning_expired
-          // ("page changed, not sent"), or tui_prompt_submit_failed ACK before
-          // resolving the card.
-          if (isActiveStuckCard) {
-            if (cardMessageId) {
-              const processingCard = buildTuiPromptProcessingCard('处理中…', locDs);
-              updateMessage(ds.larkAppId, cardMessageId, processingCard).catch(err =>
-                logger.debug(`[${tag(ds)}] Failed to set stuck-warning card to processing: ${err}`),
-              );
-            }
-            publishAttentionPatch(ds);
-            try { return JSON.parse(buildTuiPromptProcessingCard('处理中…', locDs)); } catch { /* fall through */ }
-          }
-          // Normal TUI prompt cards also remain in processing until the worker
+          // Normal TUI prompt cards remain in processing until the worker
           // confirms backend delivery via tui_prompt_resolved. A worker/backend
           // rejection produces tui_prompt_submit_failed instead.
           publishAttentionPatch(ds);
@@ -4370,7 +4622,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           locDs,
           isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
           sessionRuntimeDisplayName(ds),
-          frozenSessionSandboxMode(ds.session.sandbox),
+          sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
+          ds.session.modelPin ? resolveSessionModelPinView(ds, getBot(ds.larkAppId).config) : undefined,
         );
         // 普通群发「仅自己可见」私密卡，话题群 / 单聊自动回退私聊 DM（两条通道都私密，
         // 不泄露写入 token）。fire-and-forget，保持卡片回调快速返回。
@@ -4401,8 +4654,12 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         value?.stream_card_version !== STREAMING_CARD_PATCH_VERSION;
       const isFrozenClick = clickedNonce && ds.streamCardNonce && clickedNonce !== ds.streamCardNonce;
 
+      const requestedDisplayMode: DisplayMode | undefined =
+        value?.target_display_mode === 'hidden' || value?.target_display_mode === 'screenshot'
+          ? value.target_display_mode
+          : undefined;
       const nextMode = (current: DisplayMode): DisplayMode =>
-        current === 'hidden' ? 'screenshot' : 'hidden';
+        requestedDisplayMode ?? (current === 'hidden' ? 'screenshot' : 'hidden');
 
       if (needsPatchContractMigration) {
         const legacyMessageId = cardMessageId
@@ -4535,6 +4792,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           unavailable,
+          substituteCardControlFor(ds),
         );
         return { cardJson, unavailable };
       };
@@ -4732,6 +4990,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           cachedStreamCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          false,
+          substituteCardControlFor(ds),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -4813,6 +5073,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           streamCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          false,
+          substituteCardControlFor(ds),
         );
         return {
           toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) },
@@ -4938,6 +5200,13 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     // Model pick from the reply-card menu. Passthrough `/model <slug>` into the
     // live session, gated like compact_session plus an idle boundary and a
     // strict slug whitelist (PTY injection must never carry free text).
+    if (actionType === 'session_model_unpin') {
+      if (!ds || !operatorOpenId || !canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) return { toast: { type: 'warning', content: '没有操作权限或会话已失效' } };
+      if (value.expected_pin_set_at !== ds.session.modelPin?.setAt) return { toast: { type: 'warning', content: '话题固定已变更，请刷新卡片后重试。' } };
+      try { if (writeSessionModelPin(ds, undefined) === false) return { toast: { type: 'info', content: '本话题未固定，无需解除。' } }; }
+      catch (error) { return { toast: { type: 'warning', content: String(error instanceof Error ? error.message : error) } }; }
+      return { toast: { type: 'success', content: '已解除话题固定，下次启动 CLI 生效；可空闲后 /restart。' } };
+    }
     if (actionType === 'reply_model_pick' || actionType === 'session_model_pick') {
       const loc = localeForBot(ds?.larkAppId ?? larkAppId);
       if (!ds) {
@@ -4996,9 +5265,19 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         || cliHasNoRawPassthroughSurface(cliId, { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })) {
         return { toast: { type: 'warning', content: t('card.reply_actions.model_unsupported', undefined, loc) } };
       }
+      const pinError = validateModelPin({ model: slug }, { cliId, backendType: ds.session.backendType });
+      if (pinError || ds.adoptedFrom || isRemoteBackendSession(ds) || isSessionRestartInFlight(ds)) {
+        return { toast: { type: 'warning', content: pinError ?? '当前会话不能安全重启以应用话题固定' } };
+      }
+      try {
+        writeSessionModelPin(ds, { model: slug, source: 'card', setBy: operatorOpenId, setAt: new Date().toISOString() });
+      } catch (error) { return { toast: { type: 'warning', content: String(error instanceof Error ? error.message : error) } }; }
+      const view = resolveSessionModelPinView(ds, getBot(ds.larkAppId).config);
+      if (view?.shadowedBy) return { toast: { type: 'warning', content: modelPinText(view) + '；本次未透传或重启 CLI。' } };
+      const selectedEffort = ds.session.modelPin?.effort;
       let delivered = false;
       try {
-        const accepted = deps.deliverPassthroughCommand(ds, `/model ${slug}`, {
+        const accepted = deps.deliverPassthroughCommand(ds, `/model ${slug}${selectedEffort && cliId === 'codex' ? ` --reasoning=${selectedEffort}` : ''}`, {
           anchor: sessionAnchorId(ds),
           senderOpenId: operatorOpenId,
           senderIsBot: false,
@@ -5014,11 +5293,15 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       } catch (err) {
         logger.warn(`[${tag(ds)}] model command delivery failed: ${String(err)}`);
       }
-      if (!delivered) {
-        return { toast: { type: 'warning', content: t('card.reply_actions.model_failed', undefined, loc) } };
+      const restart = requestSessionRestart(ds, { source: 'card', notify: async status => {
+        if (status === 'failed' || status === 'timed_out') await deps.sessionReply(sessionAnchorId(ds), '话题固定已保存，但 CLI 重启未完成；请空闲后 /restart。', 'text', ds.larkAppId);
+      } });
+      if (!restart || restart.startFailure) {
+        return { toast: { type: 'warning', content: '已固定到本话题；CLI 应用失败，请空闲后 /restart。' } };
       }
+      if (!delivered) return { toast: { type: 'warning', content: '已固定到本话题；透传未入队，正在通过 CLI 重启应用。' } };
       logger.info(`[${tag(ds)}] reply-card menu: /model ${slug} passthrough sent`);
-      return { toast: { type: 'success', content: t('card.reply_actions.model_sent', { model: slug }, loc) } };
+      return { toast: { type: 'success', content: `已固定到本话题：${slug}${selectedEffort ? ` · ${selectedEffort}` : '（未固定推理强度）'}，正在重启 CLI 应用` } };
     }
 
     if (actionType === 'reply_menu_cancel') return {};
@@ -5072,6 +5355,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           cachedStreamCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          false,
+          substituteCardControlFor(ds),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }

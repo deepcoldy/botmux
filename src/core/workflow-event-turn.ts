@@ -41,6 +41,17 @@ export function isInboundMessageTurnId(turnId: string): boolean {
   return turnId.startsWith('om_') || turnId.startsWith('join_');
 }
 
+/** A daemon-minted turn nobody at the keyboard opened: an external trigger
+ *  (`trg_…`, e.g. a `botmux report` relay), another workflow wake turn
+ *  (`workflow-event:…`) or a scheduled fire (`schedule:…`). When one of these
+ *  moves a session's turn pointers it is no interjection, so a wake turn it
+ *  queues behind keeps acting (design §13.1). Anything else — a message
+ *  (`om_` / `join_`), a card click (`cct_`), a recovery or an unknown id —
+ *  still counts as overtaking it: fail closed. */
+export function isUnattendedSyntheticTurnId(turnId: string): boolean {
+  return turnId.startsWith('trg_') || turnId.startsWith('workflow-event:') || turnId.startsWith('schedule:');
+}
+
 /** Run-bound verification of a workflow event turn (injected by the caller
  *  that owns the run's binding). */
 export type WorkflowEventTurnVerifier = (input: WorkflowEventTurnRef & {

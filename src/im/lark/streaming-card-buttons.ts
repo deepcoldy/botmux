@@ -5,6 +5,7 @@ export const STREAMING_CARD_BUTTON_IDS = [
   'compact',
   'stop',
   'close',
+  'substitute',
 ] as const;
 
 export type StreamingCardButtonId = typeof STREAMING_CARD_BUTTON_IDS[number];

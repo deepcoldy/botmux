@@ -47,6 +47,7 @@ import {
   v3RevisionFilePaths,
   V3_DAG_REVISIONS_DIR,
   V3DagPatchError,
+  V3_DAG_PATCH_NOTE_MAX,
   type V3DagPatch,
   type V3RerunBudgetBlock,
   v3RevisitBudgetEpoch,
@@ -62,12 +63,14 @@ import type {
 import { readJournal, withJournalMutationSync } from './journal.js';
 import { revisitBudgetStatus } from './core-control.js';
 import { materialize, type V3RunSnapshot } from './state.js';
-import { loadAuthorizedV3Run, type V3RunEnvelope } from './run-envelope.js';
+import { frozenNodeWorkingDir, loadAuthorizedV3Run, type V3RunEnvelope } from './run-envelope.js';
 import { parseFrozenBotSnapshots } from './bot-resolve.js';
 import { voidWaitOnce } from './gate-wait-store.js';
 import { isValidRunId } from './ops-projection.js';
 import type { RunChatBinding } from './grill-state.js';
 import { resolveV3RunInitiator, type V3RunEditTurnOrigin } from './cli-daemon-command-authority.js';
+import { v3ReasonRequiredProblem } from './action-provenance.js';
+import { v3MainSessionDirProblem, v3NodePlacement, v3PlacementProblems, type V3MainTopicAvailability } from './placement.js';
 
 // ─── Who may change the flow directly (M1) ────────────────────────────────
 
@@ -77,6 +80,9 @@ export interface V3RunEditCaller {
   /** Authenticated human of the current turn. */
   openId: string;
   origin: V3RunEditTurnOrigin;
+  /** The CLI runs inside a `workflow-event:` turn: `--reason` is required
+   *  (design §13.6, see `v3ReasonRequiredProblem`). */
+  wakeTurn?: boolean;
 }
 
 export type V3RunEditTurnClass = 'initiator' | 'runEvent' | 'other';
@@ -113,10 +119,11 @@ export function v3RevisionActor(caller: V3RunEditCaller): string {
   return caller.origin === 'runEvent' ? 'main_bot' : caller.openId;
 }
 
-/** Why the main bot acted (§13.6). The reason becomes mandatory with the
- *  wake-up wiring; until then it is the edit's note (may be empty). */
-function autoProvenance(caller: V3RunEditCaller, note: string | undefined): { auto?: { reason: string } } {
-  return caller.origin === 'runEvent' ? { auto: { reason: note ?? '' } } : {};
+/** Why the main bot acted (§13.6): its `--reason` — mandatory in a wake
+ *  turn — else, for a turn that may leave it out (a scheduled turn), the
+ *  edit's note, possibly empty. */
+function autoProvenance(caller: V3RunEditCaller, note: string | undefined, reason: string | undefined): { auto?: { reason: string } } {
+  return caller.origin === 'runEvent' ? { auto: { reason: reason ?? note ?? '' } } : {};
 }
 
 function autoOf(value: { auto?: { reason: string } }): { auto?: { reason: string } } {
@@ -228,6 +235,11 @@ interface LoadedEditableRun {
   frozenBots: Map<string, BotSnapshot>;
   binding?: RunChatBinding;
   initiatorOpenId?: string;
+}
+
+/** The run's frozen executor, as {@link planV3DagRevision} takes it. */
+function revisionExecutor(run: LoadedEditableRun): { nodeExecutor?: 'bot' } {
+  return 'nodeExecutor' in run.envelope && run.envelope.nodeExecutor === 'bot' ? { nodeExecutor: 'bot' } : {};
 }
 
 function runDirFor(baseDir: string, runId: string): string {
@@ -342,9 +354,94 @@ export interface ApplyV3RunEditInput {
   patch: unknown;
   baseRevision: number;
   caller: V3RunEditCaller;
+  /** `--reason`: why the change is made. Required in a wake turn; in a human
+   *  turn it stands in for the patch's `note` when that is absent. */
+  reason?: string;
   /** Resolve a bot the run has not used yet (proposal-only). Throws when the
    *  selector names no usable bot. */
   resolveNewBotSnapshot: (selector: string) => BotSnapshot;
+  /** §5.2 hard rule 3: whether the run's main topic can host `main` nodes
+   *  (the daemon reads the main session). Consulted only when the edit moves
+   *  a node into the main topic; absent = unknown, and such an edit is
+   *  refused rather than guessed. */
+  mainTopic?: V3MainTopicAvailability;
+  /** Bot display names for the refusals (default: the app id). */
+  nameOf?: (larkAppId: string) => string;
+  /** The main session's directory in comparison form (`comparableSessionDir`),
+   *  for an edit that makes a node one the main bot runs in the main topic
+   *  while the run has a frozen working directory. Undefined = unknown: such
+   *  an edit is not refused here, the runtime gate decides. */
+  mainSessionDir?: string;
+}
+
+/** §5.2 hard rule 3 for the nodes an edit newly places in the main topic
+ *  (added as `main`, or moved there). Placements already in effect passed it
+ *  when they took effect, and the main session's shape does not change. */
+function newlyMainTopicProblems(
+  before: V3Dag,
+  after: V3Dag,
+  mainTopic: V3MainTopicAvailability | undefined,
+): string[] {
+  const beforeById = new Map(before.nodes.map((node) => [node.id, node]));
+  const moved = new Set(after.nodes
+    .filter((node) => v3NodePlacement(node) === 'main' && v3NodePlacement(beforeById.get(node.id)) !== 'main')
+    .map((node) => node.id));
+  if (moved.size === 0) return [];
+  return v3PlacementProblems({
+    dag: after,
+    mainLarkAppId: '',
+    executorOf: () => '',
+    mainTopic: mainTopic ?? { available: false, why: '无法确认主会话是不是话题里的会话' },
+    rule3Nodes: moved,
+  }).filter((problem) => problem.rule === 3).map((problem) => problem.message);
+}
+
+/** §5.2 rule 2 × §15.4 for the nodes an edit newly makes the main bot's own
+ *  main-topic nodes (added as such, moved into the main topic, or moved to
+ *  the main bot): with a frozen working directory other than the main
+ *  session's they could never run. Who executes a node is decided as the
+ *  revision planner decides it for rules 1–2. Nodes that already were such
+ *  passed (or predate) the Gate-2 check and are not re-judged. */
+function newlyMainSessionNodesProblem(input: {
+  before: V3Dag;
+  after: V3Dag;
+  snap: V3RunSnapshot;
+  bots: ReadonlyMap<string, BotSnapshot>;
+  reassigned: V3RevisionChanges['reassigned'];
+  added: readonly string[];
+  mainLarkAppId: string;
+  workingDir: string | undefined;
+  mainSessionDir: string | undefined;
+}): string | undefined {
+  if (input.workingDir === undefined || input.mainSessionDir === undefined || !input.mainLarkAppId) return undefined;
+  const moves = new Map(input.reassigned.map((move) => [move.nodeId, move.to]));
+  const added = new Set(input.added);
+  const appOf = (selector: string | undefined): string =>
+    snapshotForSelector(input.bots, selector)?.larkAppId ?? selector ?? input.mainLarkAppId;
+  const ownMain = (dag: V3Dag, nodeId: string, executor: string): boolean => {
+    const node = dag.nodes.find((candidate) => candidate.id === nodeId);
+    return !!node && isGoalNode(node) && v3NodePlacement(node) === 'main' && executor === input.mainLarkAppId;
+  };
+  const nodes: Array<{ nodeId: string; larkAppId: string; placement: 'main' }> = [];
+  for (const node of input.after.nodes) {
+    if (!isGoalNode(node)) continue;
+    const move = moves.get(node.id);
+    const after = move !== undefined ? appOf(move)
+      : (added.has(node.id) ? undefined : input.snap.assignments.get(node.id)) ?? appOf(node.bot);
+    if (!ownMain(input.after, node.id, after)) continue;
+    const previous = input.before.nodes.find((candidate) => candidate.id === node.id);
+    const before = added.has(node.id) || !previous
+      ? undefined
+      : v3CurrentExecutorApp(input.snap, input.bots, node.id, isGoalNode(previous) ? previous.bot : undefined) ?? input.mainLarkAppId;
+    if (before !== undefined && ownMain(input.before, node.id, before)) continue;
+    nodes.push({ nodeId: node.id, larkAppId: after, placement: 'main' });
+  }
+  return v3MainSessionDirProblem({
+    nodes,
+    mainLarkAppId: input.mainLarkAppId,
+    workingDir: input.workingDir,
+    mainSessionDir: input.mainSessionDir,
+  });
 }
 
 interface WrittenRevision {
@@ -462,6 +559,13 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
   } catch (err) {
     return { kind: 'invalid', problems: err instanceof V3DagPatchError ? err.problems : [String(err)] };
   }
+  const reason = input.reason?.trim() || undefined;
+  const missingReason = v3ReasonRequiredProblem(input.caller, reason);
+  if (missingReason) return { kind: 'invalid', problems: [missingReason] };
+  // A human turn's reason is its note when the patch has none (display only).
+  if (input.caller.origin === 'human' && reason && !patch.note) {
+    patch = { ...patch, note: reason.slice(0, V3_DAG_PATCH_NOTE_MAX) };
+  }
   const runDir = runDirFor(input.baseDir, input.runId);
   const journalPath = join(runDir, 'journal.ndjson');
   if (!existsSync(journalPath)) return { kind: 'rejected', reason: 'missing' };
@@ -482,7 +586,7 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
   }
   const turn = classifyV3RunEditTurn(run.initiatorOpenId, input.caller);
   const actor = v3RevisionActor(input.caller);
-  const auto = autoProvenance(input.caller, patch.note);
+  const auto = autoProvenance(input.caller, patch.note, reason);
 
   type Locked =
     | Exclude<V3RunEditOutcome, { kind: 'applied' | 'proposed' }>
@@ -516,12 +620,28 @@ export function applyV3RunEdit(input: ApplyV3RunEditInput): V3RunEditOutcome {
       knownBots,
       // The initiator's own edit lifts a spent rerun budget itself (M2 乙).
       liftSpentRerunBudget: turn === 'initiator',
+      ...revisionExecutor(run),
+      ...(input.nameOf ? { nameOf: input.nameOf } : {}),
     });
     if (!planned.ok) {
       return { kind: 'invalid', problems: planned.problems, ...(planned.rerunBudget ? { rerunBudget: planned.rerunBudget } : {}) };
     }
     const plan = planned.plan;
     if (!hasChanges(plan.changes)) return { kind: 'invalid', problems: ['the patch changes nothing'] };
+    const placementProblems = newlyMainTopicProblems(effective.dag, plan.dag, input.mainTopic);
+    if (placementProblems.length > 0) return { kind: 'invalid', problems: placementProblems };
+    const ownMainProblem = newlyMainSessionNodesProblem({
+      before: effective.dag,
+      after: plan.dag,
+      snap,
+      bots: knownBots,
+      reassigned: plan.changes.reassigned,
+      added: plan.changes.added,
+      mainLarkAppId: run.binding?.larkAppId ?? snapshotForSelector(knownBots, '')?.larkAppId ?? '',
+      workingDir: frozenNodeWorkingDir(run.envelope),
+      mainSessionDir: input.mainSessionDir,
+    });
+    if (ownMainProblem) return { kind: 'invalid', problems: [ownMainProblem] };
     const reasons = v3ConfirmReasonsForTurn(turn, plan.reasons);
     const direct = reasons.length === 0;
     if (!direct && plan.budgetGrants.length > 0) {
@@ -800,6 +920,7 @@ function carryPendingProposal(input: {
     snap: before.snap,
     patch: pinned.patch,
     knownBots: before.knownBots,
+    ...revisionExecutor(run),
   });
   if (!shown.ok || v3RevisionDigest(dagFileBytes(shown.plan.dag)) !== pending.sha256) return { ok: false, cause: 'notApplicable' };
   const ours = v3RevisionInvolvedNodes(direct.plan);
@@ -811,6 +932,7 @@ function carryPendingProposal(input: {
     snap: materialize([...direct.events]),
     patch: pinned.patch,
     knownBots: direct.knownBots,
+    ...revisionExecutor(run),
   });
   if (!rebased.ok) return { ok: false, cause: 'notApplicable' };
   const reasons = v3ConfirmReasonsForTurn(proposalTurnClass(pending.by, run.initiatorOpenId), rebased.plan.reasons);
@@ -1024,6 +1146,7 @@ function replanProposal(
     snap,
     patch,
     knownBots,
+    ...revisionExecutor(run),
   });
   if (!planned.ok) return { ok: false, detail: planned.problems.join('; ') };
   const dagBytes = dagFileBytes(planned.plan.dag);

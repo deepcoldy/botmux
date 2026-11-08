@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import { prependBotmuxBin, botmuxWrapperFiles, resolveBotmuxWrapperBinDir } from '../src/core/botmux-wrapper.js';
 
 describe('resolveBotmuxWrapperBinDir — single source of truth (core-only isolation)', () => {
@@ -11,6 +14,21 @@ describe('resolveBotmuxWrapperBinDir — single source of truth (core-only isola
   });
   it('core-only WITHOUT SESSION_DATA_DIR falls back to shared (defensive; entrypoint always sets it)', () => {
     expect(resolveBotmuxWrapperBinDir({ BOTMUX_CORE_ONLY: '1', HOME: '/home/u' })).toBe('/home/u/.botmux/bin');
+  });
+
+  it('normal fleet resolves a symlinked HOME before putting the wrapper directory on sandbox PATH', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-wrapper-home-'));
+    try {
+      const realHome = join(root, 'real-home');
+      const linkedHome = join(root, 'linked-home');
+      mkdirSync(join(realHome, '.botmux', 'bin'), { recursive: true });
+      symlinkSync(realHome, linkedHome, 'dir');
+
+      expect(resolveBotmuxWrapperBinDir({ HOME: linkedHome }))
+        .toBe(join(realpathSync(realHome), '.botmux', 'bin'));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

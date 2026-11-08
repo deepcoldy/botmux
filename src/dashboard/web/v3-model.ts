@@ -98,11 +98,37 @@ export function nodeWaitingMs(node: RunNodeView, generatedAt: number): number | 
   return since === undefined ? undefined : Math.max(0, generatedAt - since);
 }
 
+/** A blocked node the main bot handed to a human (design §13.6). */
+export function nodeHandedToHuman(node: RunNodeView): boolean {
+  return node.status === 'blocked' && node.errorCode === 'HANDED_TO_HUMAN';
+}
+
+export const V3_INTERVENTION_LABEL: Record<NonNullable<RunNodeView['interventions']>[number]['kind'], string> = {
+  retry: '主 Bot 自动重试',
+  reassign: '主 Bot 自动改派',
+  rerun: '主 Bot 自动重做',
+  handedToHuman: '交给人决定',
+};
+
+export const V3_CHECKPOINT_LABEL: Record<NonNullable<RunNodeView['checkpoint']>, string> = {
+  holding: '检查点：等主 Bot 看完结果，后续节点暂停',
+  reviewed: '检查点：主 Bot 已看过结果',
+  notReviewed: '检查点：没等到主 Bot 看结果，已按原流程继续',
+};
+
+export const V3_INTERVENTION_ROLE_LABEL: Record<NonNullable<RunNodeView['interventions']>[number]['by'], string> = {
+  mainBot: '主 Bot',
+  initiator: '发起人',
+  other: '其他成员',
+};
+
 /** Third row of a graph node: display state, then elapsed / attempt count. */
 export function nodeStatusLine(node: RunNodeView, generatedAt: number | undefined): string {
   const label = V3_DISPLAY_LABEL[V3_DISPLAY_STATUS[node.status]];
   const parts = [label];
   if (node.status === 'gateWaiting') parts.push('审批');
+  else if (node.status === 'pending' && node.waitingOnCheckpoint?.length) parts.push('等检查点');
+  else if (nodeHandedToHuman(node)) parts.push('交给人决定');
   else if (node.status === 'blocked') parts.push('受阻');
   if (generatedAt !== undefined) {
     const elapsed = nodeElapsedMs(node, generatedAt);
@@ -121,6 +147,19 @@ export function nodeBotLine(node: RunNodeView): string {
   if (!bot) return '';
   const who = bot.name ?? bot.larkAppId ?? bot.selector ?? '默认 Bot';
   return bot.cliId ? `${who} · ${bot.cliId}` : who;
+}
+
+/** §5.1: whether a bot run hands this node off in the main topic. */
+export function nodeInMainTopic(node: RunNodeView): boolean {
+  return node.handoff ? node.handoff.placement === 'main' : node.placement === 'main';
+}
+
+/** Graph box second row: the bot, plus「主话题」for a main-topic node (a
+ *  node topic is the default and is not marked). */
+export function nodeBoxBotLine(node: RunNodeView): string {
+  const line = nodeBotLine(node);
+  if (!line || !nodeInMainTopic(node)) return line;
+  return node.handoff?.queued ? `${line} · 主话题 · 排队中` : `${line} · 主话题`;
 }
 
 export const V3_DECISION_LABEL: Record<string, string> = {
@@ -151,9 +190,14 @@ export function isTerminalRunStatus(status: RunView['runStatus'] | undefined): b
   return status === 'succeeded' || status === 'failed' || status === 'cancelled';
 }
 
+/** Segments under `#/workflows/` that name a page, not a run (design
+ *  2026-11-03 workflow-dashboard-orchestration E13); matched before run detail. */
+const V3_RESERVED_WORKFLOW_SEGMENTS = new Set(['new', 'drafts', 'library']);
+
 export function v3RunIdFromHash(hash = typeof location !== 'undefined' ? location.hash : ''): string | null {
   const m = hash.match(/^#\/workflows\/([^?#]+)/);
   if (!m) return null;
+  if (V3_RESERVED_WORKFLOW_SEGMENTS.has(m[1]!.split('/')[0]!)) return null;
   try {
     return decodeURIComponent(m[1]!);
   } catch {

@@ -1,3 +1,4 @@
+import { isWorkflowNodeSessionMarker, workflowHandoffInputOptions } from './workflow-node-session.js';
 import { deploymentContinuationCandidate, claimDeploymentContinuation, deploymentContinuationClaimCurrent, setDeploymentContinuation } from '../services/deployment-continuation.js';
 import { canTalk } from '../im/lark/event-dispatcher.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
@@ -20,10 +21,11 @@ import { getRuntimeTask, scheduledWorkingDirSwapReason, updateRuntimeTaskState }
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, recordTurnExplicitMention, resumeTurnNotices } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
+import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks } from '../adapters/cli/shared-hints.js';
 import { usesLarkToolBinding } from './lark-tool-binding.js';
 import { effectiveReplyDelivery, type ReplyDelivery } from './reply-delivery.js';
@@ -72,7 +74,7 @@ import { trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { hasUnsettledCodexAppDispatch } from '../utils/codex-app-dispatch-ledger.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
-import type { MessageResource } from '../im/lark/message-parser.js';
+import { messageMentionsBot, type MessageResource } from '../im/lark/message-parser.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
 import {
   activeSessionKey,
@@ -95,6 +97,7 @@ import { parseWorkingDirList } from '../utils/working-dir.js';
 import { resolveRoleInjection } from './role-resolver.js';
 import { ensureDefaultWhiteboard, getWhiteboard, whiteboardEnabled } from '../services/whiteboard-store.js';
 import { botAutoWorktreeEnabled } from '../services/default-worktree.js';
+import { unpinnedSessionWorkingDir } from './working-dir-range.js';
 import { armSilentScheduledTurn, disarmSilentScheduledTurn } from './silent-schedule-turns.js';
 import { getAttachmentsDir } from './attachment-path.js';
 import { resolveRegularGroupMode } from '../services/chat-reply-mode-store.js';
@@ -240,7 +243,7 @@ async function resumeRestoredPendingRepoSetup(
   ds.pendingRepo = false;
   ensureSessionWhiteboard(ds);
   if (setup.rawInput) {
-    rememberLastCliInput(ds, setup.rawInput, setup.rawInput);
+    rememberLastCliInput(ds, setup.rawInput, setup.rawInput, setup.turnId);
     forkWorker(ds, '', { resume: false, turnId: setup.turnId });
   } else {
     const bot = getBot(ds.larkAppId);
@@ -272,7 +275,14 @@ async function resumeRestoredPendingRepoSetup(
         larkToolResume: false,
       },
     );
-    rememberLastCliInput(ds, setup.prompt, input);
+    rememberLastCliInput(ds, setup.prompt, input, setup.turnId);
+    if (setup.turnId) {
+      recordTurnExplicitMention(ds, setup.turnId, messageMentionsBot(
+        { mentions: ds.pendingMentions },
+        ds.larkAppId,
+        bot.botOpenId,
+      ));
+    }
     forkWorker(ds, input, { resume: false, turnId: setup.turnId });
   }
   logger.info(`[${ds.session.sessionId.substring(0, 8)}] Resumed durable pending repo opening without selectable projects`);
@@ -607,11 +617,7 @@ export function getSessionWorkingDir(ds?: DaemonSession): string {
     // BASE that a spawn path turns into a per-session worktree, never a launch dir.
     // Handing it out as a plain fallback would drop an unpinned session straight
     // into the shared repo, defeating the isolation the flag buys.
-    if (!botAutoWorktreeEnabled(ds.larkAppId)) {
-      const botDefault = effectiveDefaultWorkingDir(bot.config);
-      if (botDefault) return expandHome(botDefault);
-    }
-    return expandHome(bot.config.workingDir ?? '~');
+    return expandHome(unpinnedSessionWorkingDir(bot.config, botAutoWorktreeEnabled(ds.larkAppId)));
   }
   // Fallback for calls without a session (e.g. during restore)
   return expandHome(config.daemon.workingDir);
@@ -1319,7 +1325,7 @@ function frozenSessionSandbox(sessionId: string): Session['sandbox'] | undefined
 /** The session row carries a verified workflow-node marker (design
  *  2026-11-03 §4.2); set before its opening input is built. */
 function isWorkflowNodeSessionRow(sessionId: string): boolean {
-  return !!sessionStore.getSession(sessionId)?.workflowNode;
+  return isWorkflowNodeSessionMarker(sessionStore.getSession(sessionId)?.workflowNode);
 }
 
 function inputPromptInjection(sessionId: string, larkAppId?: string, cliId?: string): PromptInjection {
@@ -2062,10 +2068,16 @@ function effectivePromptHookConfigPath(
 ): string | undefined {
   const base = adapter.hookInstall?.configPath;
   if (!base) return undefined;
-  const sandboxRequested = botConfig.sandbox === true
-    || botConfig.readIsolation === true
-    || process.env.BOTMUX_SANDBOX === '1';
-  const willRedirect = sandboxRequested
+  // scratch keeps the CLI's native home, like the worker (only oncall redirects).
+  let oncallRequested: boolean;
+  try {
+    oncallRequested = resolveSandboxMode({
+      configSandbox: botConfig.sandbox,
+      readIsolation: botConfig.readIsolation === true,
+      envValue: process.env.BOTMUX_SANDBOX,
+    }) === 'oncall';
+  } catch { return undefined; }
+  const willRedirect = oncallRequested
     && adapter.supportsReadIsolation === true
     && !botConfig.wrapperCli
     && (sessionBackendType ?? botConfig.backendType) !== 'riff'
@@ -2381,6 +2393,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
     s.modelFallback?.claudeSessionId === ds.modelFallback?.claudeSessionId &&
     s.lastUserPrompt === ds.lastUserPrompt &&
     s.lastCliInput === ds.lastCliInput &&
+    s.lastCliInputTurnId === ds.lastCliInputTurnId &&
     JSON.stringify(s.lastCodexAppInput ?? null) === JSON.stringify(ds.lastCodexAppInput ?? null) &&
     JSON.stringify(s.replyThreadAliases ?? {}) === JSON.stringify(ds.replyThreadAliases ?? {}) &&
     JSON.stringify(s.currentReplyTarget ?? null) === JSON.stringify(ds.currentReplyTarget ?? null)
@@ -2395,6 +2408,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   s.modelFallback = ds.modelFallback;
   s.lastUserPrompt = ds.lastUserPrompt;
   s.lastCliInput = ds.lastCliInput;
+  s.lastCliInputTurnId = ds.lastCliInputTurnId;
   if (ds.lastCodexAppInput) s.lastCodexAppInput = ds.lastCodexAppInput;
   else delete s.lastCodexAppInput;
   s.replyThreadAliases = ds.replyThreadAliases;
@@ -2408,6 +2422,7 @@ export function rememberLastCliInput(
   ds: DaemonSession,
   userPrompt: string,
   cliInput: string | CliTurnPayload,
+  inputTurnId: string | undefined,
   opts?: { codexAppInputAccepted?: boolean },
 ): void {
   // A real CLI input means the post-restart silence is over — let the normal
@@ -2416,6 +2431,7 @@ export function rememberLastCliInput(
   ds.lastUserPrompt = userPrompt;
   const normalized = typeof cliInput === 'string' ? { content: cliInput } : cliInput;
   ds.lastCliInput = normalized.content;
+  ds.lastCliInputTurnId = inputTurnId;
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId;
   const keepCodexAppInput = opts?.codexAppInputAccepted ?? (
@@ -2436,6 +2452,7 @@ export function rememberLastCliInput(
   else delete ds.lastCodexAppInput;
   ds.session.lastUserPrompt = userPrompt;
   ds.session.lastCliInput = normalized.content;
+  ds.session.lastCliInputTurnId = inputTurnId;
   if (replayCodexAppInput) ds.session.lastCodexAppInput = replayCodexAppInput;
   else delete ds.session.lastCodexAppInput;
   ds.session.replyThreadAliases = ds.replyThreadAliases;
@@ -3017,6 +3034,7 @@ export async function restoreActiveSessions(
           modelFallback: session.modelFallback,
           lastUserPrompt: session.lastUserPrompt,
           lastCliInput: session.lastCliInput,
+          lastCliInputTurnId: session.lastCliInputTurnId,
           lastCodexAppInput: session.lastCodexAppInput,
           replyThreadAliases: session.replyThreadAliases,
           currentReplyTarget: session.currentReplyTarget,
@@ -3227,6 +3245,7 @@ export async function restoreActiveSessions(
       modelFallback: session.modelFallback,
       lastUserPrompt: session.lastUserPrompt,
       lastCliInput: session.lastCliInput,
+      lastCliInputTurnId: session.lastCliInputTurnId,
       lastCodexAppInput: session.lastCodexAppInput,
       replyThreadAliases: session.replyThreadAliases,
       currentReplyTarget: session.currentReplyTarget,
@@ -3447,6 +3466,7 @@ export async function restoreActiveSessions(
     if (!stillOwnsRestoreRegistration(ds)) continue;
     try {
       ensureOrdinaryTurnRecoveryAttached(ds);
+      resumeTurnNotices(ds);
       const restoredLeaseId = interruptedReadonlyContinuationLeaseIds.get(ds.session.sessionId);
       if (!restoredLeaseId
         || !markReadonlyTaskContinuationInterruptedByRestart(ds, restoredLeaseId)) {
@@ -3933,6 +3953,7 @@ export async function takeOverDurableActiveRemoteSession(
       modelFallback: persisted.modelFallback,
       lastUserPrompt: persisted.lastUserPrompt,
       lastCliInput: persisted.lastCliInput,
+      lastCliInputTurnId: persisted.lastCliInputTurnId,
       lastCodexAppInput: persisted.lastCodexAppInput,
       replyThreadAliases: persisted.replyThreadAliases,
       currentReplyTarget: persisted.currentReplyTarget,
@@ -4220,6 +4241,7 @@ export async function resumeSession(
     modelFallback: session.modelFallback,
     lastUserPrompt: session.lastUserPrompt,
     lastCliInput: session.lastCliInput,
+    lastCliInputTurnId: session.lastCliInputTurnId,
     lastCodexAppInput: session.lastCodexAppInput,
     replyThreadAliases: session.replyThreadAliases,
     currentReplyTarget: session.currentReplyTarget,
@@ -4909,6 +4931,7 @@ export async function executeScheduledTask(
           // keeps its stable virtual anchor; hand materialization ownership to
           // the new turn (the first `botmux send` validates turn equality).
           existing.session.deferredScheduleRun.turnId = scheduledTurnId;
+          existing.deferredScheduleUnconfirmedTurnId = scheduledTurnId;
           if (runtime?.runId) existing.session.deferredScheduleRun.runId = runtime.runId;
           else delete existing.session.deferredScheduleRun.runId;
           sessionStore.updateSession(existing.session);
@@ -4930,7 +4953,7 @@ export async function executeScheduledTask(
           turnId: scheduledTurnId,
           trustedCaller: scheduledTrustedCaller,
         });
-        rememberLastCliInput(existing, task.prompt, input);
+        rememberLastCliInput(existing, task.prompt, input, scheduledTurnId);
         if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
         if (existing.worker && !existing.worker.killed) {
           try {
@@ -5077,7 +5100,7 @@ export async function executeScheduledTask(
         (winner ? ` to ${winner.session.sessionId}` : ''),
       );
     }
-    rememberLastCliInput(ds, task.prompt, prompt);
+    rememberLastCliInput(ds, task.prompt, prompt, scheduledTurnId);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
     try {
       forkWorker(ds, prompt, scheduledTurnId);
@@ -5247,7 +5270,7 @@ export async function deliverOwnerBatchTurn(
           turnId,
           trustedCaller,
         });
-        rememberLastCliInput(existing, input.prompt, payload);
+        rememberLastCliInput(existing, input.prompt, payload, turnId);
         if (existing.worker && !existing.worker.killed) {
           try {
             if (sendWorkerInput(existing, payload, turnId, trustedCaller ? { trustedCaller } : {})) {
@@ -5333,7 +5356,7 @@ export async function deliverOwnerBatchTurn(
       throw new Error(`decision board batch lost active-session registration for ${anchor}`
         + (winner ? ` to ${winner.session.sessionId}` : ''));
     }
-    rememberLastCliInput(ds, input.prompt, prompt);
+    rememberLastCliInput(ds, input.prompt, prompt, turnId);
     try {
       forkWorker(ds, prompt, turnId);
     } catch (err) {
@@ -5363,6 +5386,10 @@ export interface WorkflowNodeTurnInput {
   /** Only for a handoff that carries the run initiator's delegation (design
    *  §10): publish the turn's tool identity before the CLI gets the turn. */
   prepareTurnIdentity?: (session: DaemonSession, turnId: string) => void | Promise<void>;
+  /** The run's Gate-2 `--working-dir`, already checked against this bot's
+   *  range (design §15.4): a NEW node session starts there instead of the
+   *  bot's default; an existing one keeps its directory. */
+  workingDir?: string;
 }
 
 /**
@@ -5415,8 +5442,12 @@ export async function deliverWorkflowNodeTurn(
           attachments: input.attachments,
           turnId,
         });
-        rememberLastCliInput(existing, input.prompt, payload);
-        if (existing.worker && !existing.worker.killed && sendWorkerInput(existing, payload, turnId)) {
+        rememberLastCliInput(existing, input.prompt, payload, turnId);
+        // Design §5.5: a main-topic node of the main bot runs in the main
+        // session, which may be in the middle of another turn (the one that
+        // started the run, a wake): queue behind it as a turn of its own.
+        if (existing.worker && !existing.worker.killed
+          && sendWorkerInput(existing, payload, turnId, workflowHandoffInputOptions(input.marker))) {
           return { sessionId: existing.session.sessionId };
         }
         forkWorker(existing, payload, { resume: existing.hasHistory, turnId });
@@ -5449,10 +5480,14 @@ export async function deliverWorkflowNodeTurn(
       cliVersion: getCurrentCliVersion(),
       lastMessageAt: now,
       hasHistory: false,
-      workingDir: effectiveDefaultWorkingDir(bot.config),
+      workingDir: input.workingDir ?? effectiveDefaultWorkingDir(bot.config),
       initialStartPending: true,
       pendingPrompt: input.prompt,
     };
+    if (input.workingDir !== undefined) {
+      session.workingDir = input.workingDir;
+      sessionStore.updateSession(session);
+    }
     ensureSessionWhiteboard(ds);
     const prompt = buildNewTopicCliInput(input.prompt, session.sessionId,
       ds.session.cliLaunchSnapshot?.cliId ?? session.cliId ?? bot.config.cliId,
@@ -5477,7 +5512,7 @@ export async function deliverWorkflowNodeTurn(
       await closeSession(session.sessionId);
       throw new Error(`workflow node turn lost active-session registration for ${anchor}`);
     }
-    rememberLastCliInput(ds, input.prompt, prompt);
+    rememberLastCliInput(ds, input.prompt, prompt, turnId);
     try {
       forkWorker(ds, prompt, turnId);
     } catch (err) {
@@ -5680,8 +5715,9 @@ async function forkOrShowRepoCard(
 
   ensureSessionWhiteboard(ds);
   const prompt = buildPrompt();
-  rememberLastCliInput(ds, userContent, prompt);
-  forkWorker(ds, prompt);
+  const openingTurnId = ds.pendingTurnId ?? `opening-${randomUUID()}`;
+  rememberLastCliInput(ds, userContent, prompt, openingTurnId);
+  forkWorker(ds, prompt, { turnId: openingTurnId });
   // forkWorker pre-accept is synchronous. Keep the reservation and all input
   // buffers intact if it throws; only expose the normal worker state after it
   // has accepted the first turn.
@@ -5942,6 +5978,9 @@ export interface CreateHeadlessSessionArgs {
   workingDir?: string;
   model?: string;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** See Session.headless.failureDiagnostics: set by the workflow draft's
+   *  clarify session only. */
+  failureDiagnostics?: true;
 }
 
 export async function createHeadlessSession(
@@ -5972,6 +6011,7 @@ export async function createHeadlessSession(
       id: headlessId,
       createdAt: nowIso,
       source: 'cli',
+      ...(args.failureDiagnostics === true ? { failureDiagnostics: true as const } : {}),
     };
     session.lastMessageAt = nowIso;
     session.workingDir = wd.resolvedPath;
