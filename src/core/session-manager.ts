@@ -22,10 +22,11 @@ import { getRuntimeTask, scheduledWorkingDirSwapReason, updateRuntimeTaskState }
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, recordTurnExplicitMention, resumeTurnNotices } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
+import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks } from '../adapters/cli/shared-hints.js';
 import { usesLarkToolBinding } from './lark-tool-binding.js';
 import { effectiveReplyDelivery, type ReplyDelivery } from './reply-delivery.js';
@@ -74,7 +75,7 @@ import { trustedCallerForScheduledTask } from './scheduled-turn-provenance.js';
 import { addCodexAppContext } from '../utils/codex-app-context.js';
 import { hasUnsettledCodexAppDispatch } from '../utils/codex-app-dispatch-ledger.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
-import type { MessageResource } from '../im/lark/message-parser.js';
+import { messageMentionsBot, type MessageResource } from '../im/lark/message-parser.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
 import {
   activeSessionKey,
@@ -276,6 +277,13 @@ async function resumeRestoredPendingRepoSetup(
       },
     );
     rememberLastCliInput(ds, setup.prompt, input, setup.turnId);
+    if (setup.turnId) {
+      recordTurnExplicitMention(ds, setup.turnId, messageMentionsBot(
+        { mentions: ds.pendingMentions },
+        ds.larkAppId,
+        bot.botOpenId,
+      ));
+    }
     forkWorker(ds, input, { resume: false, turnId: setup.turnId });
   }
   logger.info(`[${ds.session.sessionId.substring(0, 8)}] Resumed durable pending repo opening without selectable projects`);
@@ -2061,10 +2069,16 @@ function effectivePromptHookConfigPath(
 ): string | undefined {
   const base = adapter.hookInstall?.configPath;
   if (!base) return undefined;
-  const sandboxRequested = botConfig.sandbox === true
-    || botConfig.readIsolation === true
-    || process.env.BOTMUX_SANDBOX === '1';
-  const willRedirect = sandboxRequested
+  // scratch keeps the CLI's native home, like the worker (only oncall redirects).
+  let oncallRequested: boolean;
+  try {
+    oncallRequested = resolveSandboxMode({
+      configSandbox: botConfig.sandbox,
+      readIsolation: botConfig.readIsolation === true,
+      envValue: process.env.BOTMUX_SANDBOX,
+    }) === 'oncall';
+  } catch { return undefined; }
+  const willRedirect = oncallRequested
     && adapter.supportsReadIsolation === true
     && !botConfig.wrapperCli
     && (sessionBackendType ?? botConfig.backendType) !== 'riff'
@@ -3453,6 +3467,7 @@ export async function restoreActiveSessions(
     if (!stillOwnsRestoreRegistration(ds)) continue;
     try {
       ensureOrdinaryTurnRecoveryAttached(ds);
+      resumeTurnNotices(ds);
       const restoredLeaseId = interruptedReadonlyContinuationLeaseIds.get(ds.session.sessionId);
       if (!restoredLeaseId
         || !markReadonlyTaskContinuationInterruptedByRestart(ds, restoredLeaseId)) {
@@ -5971,6 +5986,9 @@ export interface CreateHeadlessSessionArgs {
   workingDir?: string;
   model?: string;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** See Session.headless.failureDiagnostics: set by the workflow draft's
+   *  clarify session only. */
+  failureDiagnostics?: true;
 }
 
 export async function createHeadlessSession(
@@ -6001,6 +6019,7 @@ export async function createHeadlessSession(
       id: headlessId,
       createdAt: nowIso,
       source: 'cli',
+      ...(args.failureDiagnostics === true ? { failureDiagnostics: true as const } : {}),
     };
     session.lastMessageAt = nowIso;
     session.workingDir = wd.resolvedPath;

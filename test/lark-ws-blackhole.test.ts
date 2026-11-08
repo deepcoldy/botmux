@@ -21,7 +21,7 @@ it.skipIf(!resolveBunExecutable())('exits nonzero after rebuilding over a persis
   expect(result.stderr).toContain('exiting for supervisor recovery');
 }, 15_000);
 
-it.skipIf(!resolveBunExecutable())('the parked Bun daemon exits on an uncaught native WS ErrorEvent', () => {
+it.skipIf(!resolveBunExecutable())('the parked Bun daemon exits on an uncaught native WS error', () => {
   const result = spawnSyncBunTsEvalWithRepoImports("await import('./test/fixtures/lark-ws-fatal-probe.ts')", {
     encoding: 'utf8', timeout: 6_000,
   });

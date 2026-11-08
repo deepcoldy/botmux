@@ -23,7 +23,7 @@
  * timers) so the daemon wiring stays thin and tests use fakes.
  */
 
-import { readFileSync, rmSync, existsSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -110,6 +110,8 @@ import {
 } from './node-executor-mode.js';
 import type { V3MainTopicAvailability } from './placement.js';
 import {
+  WORKFLOW_DRAFT_MAX_HANDOFFS,
+  WORKFLOW_DRAFT_MAX_MODEL_CALL_BOTS,
   WORKFLOW_DRAFT_MAX_ORPHANS,
   WORKFLOW_LAUNCH_MAX_EXTRA_MEMBERS,
   WORKFLOW_DRAFT_MAX_TURNS,
@@ -138,7 +140,22 @@ import {
   WORKFLOW_COPY_DAG_FILE,
   workflowTemplateRunNeedsConfirmation,
   type WorkflowDraftCopy,
+  WORKFLOW_DRAFT_FAILURE_DETAIL_MAX,
+  WORKFLOW_DRAFT_FAILURE_TERMINAL_MAX,
+  type WorkflowDraftFailure,
+  type WorkflowDraftFailureSummary,
+  type WorkflowDraftHandoffRecord,
 } from './draft-store.js';
+import { stuckScreenTail } from '../../core/stuck-page-catalog.js';
+import {
+  classifyFailureCode,
+  extractFailureCode,
+  failureCountsAgainstModel,
+  maskFailureText,
+  normalizeFailureCode,
+  type WorkflowDraftFailureCategory,
+  type WorkflowDraftFailureStep,
+} from './draft-failure.js';
 import { readLinuxBootIdentity, readProcessStartIdentity } from '../../utils/process-identity.js';
 import { withFileLockSync } from '../../utils/file-lock.js';
 import { pidIsSignalable } from '../../utils/process-alive.js';
@@ -256,6 +273,8 @@ export type WorkflowDraftErrorCode =
   | 'unresolved_params'
   /** D6: only a draft copied from a run / template does this. */
   | 'not_a_copy'
+  /** 换编排 Bot is under way: only it, 「放弃」 and 「删除」 go on meanwhile. */
+  | 'handoff_pending'
   | 'bad_request';
 
 const STATUS: Record<WorkflowDraftErrorCode, number> = {
@@ -299,6 +318,7 @@ const STATUS: Record<WorkflowDraftErrorCode, number> = {
   source_unreadable: 422,
   unresolved_params: 409,
   not_a_copy: 409,
+  handoff_pending: 409,
   bad_request: 400,
 };
 
@@ -328,7 +348,10 @@ export type DraftClarifyResult =
   | { state: 'running' }
   /** `finishedAt`: when the turn ended, if known (the idle clock). */
   | { state: 'completed'; content: string; finishedAt?: string }
-  | { state: 'failed'; error?: string }
+  /** `errorCode`: the worker's structured terminal code, when it gave one.
+   *  `errorDetail`: the provider's own error text; `terminalTail`: the CLI
+   *  screen when the turn ended — each only when the worker had it. */
+  | { state: 'failed'; error?: string; errorCode?: string; errorDetail?: string; terminalTail?: string }
   /** The session or turn no longer exists. */
   | { state: 'not_found' };
 
@@ -418,6 +441,15 @@ export interface WorkflowDraftView {
     specCandidate?: { markdown: string; triggerId?: string };
     error?: string;
   };
+  /** The latest unanswered model failure of the orchestrator (structured:
+   *  category, code, step, bot). Older drafts have only `clarify.error`. */
+  failure?: WorkflowDraftFailure;
+  /** 换编排 Bot under way (the current orchestrator still owns the draft). */
+  handoff?: { toAppId: string; state: 'closing' | 'ready'; at: string };
+  /** 换编排 Bot history (oldest first): who, from / to which bot, when, and
+   *  the first confirmation's confirmer before / after (each open_id under
+   *  its own app). */
+  handoffs?: Array<Omit<WorkflowDraftHandoffRecord, 'token'>>;
   spec?: { markdown?: string; json?: unknown; sha256?: string };
   specConfirmation?: WorkflowDraftRecord['specConfirmation'];
   architect?: WorkflowDraftRecord['architect'] & { elapsedMs: number };
@@ -526,6 +558,8 @@ interface MutateOpts {
   launched?: boolean;
   /** Not activity: leave updatedAt (the staleness clock) as it is. */
   keepUpdatedAt?: boolean;
+  /** 换编排 Bot itself: not refused by a pending handoff. */
+  handoffOp?: boolean;
 }
 
 interface ArchitectTask {
@@ -549,6 +583,64 @@ function errorText(error: unknown): string {
 /** At most `max` characters, the ellipsis included (schema limits are hard). */
 function clip(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, Math.max(0, max - 1))}…`;
+}
+
+/** A failure's raw error text as the page shows it: credential shapes
+ *  masked, then clipped (masking first, so a clip never leaves half a key). */
+function failureDetail(text: string | undefined, max = WORKFLOW_DRAFT_FAILURE_DETAIL_MAX): string | undefined {
+  const masked = typeof text === 'string' ? maskFailureText(text).trim() : '';
+  return masked ? clip(masked, max) : undefined;
+}
+
+/** Terminal output as plain text: masked as a whole first (a token never
+ *  straddles the cut), then escapes stripped, the last rows, clipped. */
+function failureTerminalTail(text: string | undefined): string | undefined {
+  if (!text) return undefined;
+  const plain = stuckScreenTail(text, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER);
+  const tail = stuckScreenTail(maskFailureText(plain), 60, WORKFLOW_DRAFT_FAILURE_TERMINAL_MAX);
+  if (!tail.trim()) return undefined;
+  return tail;
+}
+
+/** How much more than asked a tail read takes, so the partial first row it
+ *  drops still leaves about `maxBytes`. */
+const TAIL_READ_MARGIN = 4 * 1024;
+
+/**
+ * About the last `maxBytes` of a file as text, or undefined (missing,
+ * unreadable). Cut mid-file it starts at a row boundary: a partial first row
+ * may be the second half of a credential whose name was cut off — no mask
+ * could recognise it — so it is dropped.
+ */
+function readFileTail(path: string, maxBytes: number): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    const size = fstatSync(fd).size;
+    const length = Math.min(size, maxBytes + TAIL_READ_MARGIN);
+    if (length <= 0) return undefined;
+    const buffer = Buffer.alloc(length);
+    readSync(fd, buffer, 0, length, size - length);
+    let text = buffer.toString('utf-8');
+    if (length < size) {
+      const newline = text.indexOf('\n');
+      text = newline < 0 ? '' : text.slice(newline + 1);
+    }
+    return text || undefined;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* closed */ }
+  }
+}
+
+/** What the Architect's worker left: its stderr (the raw error lines) and
+ *  its terminal (pty.log) — read from its attempt dir, never sent anywhere. */
+function architectFailureLogs(dir: string | undefined): { stderr?: string; terminal?: string } {
+  if (!dir) return {};
+  const stderr = readFileTail(join(dir, 'stderr.log'), 16 * 1024);
+  const terminal = readFileTail(join(dir, 'pty.log'), 64 * 1024) ?? readFileTail(join(dir, 'stdout.log'), 64 * 1024);
+  return { ...(stderr ? { stderr } : {}), ...(terminal ? { terminal } : {}) };
 }
 
 function pushTurn(draft: WorkflowDraftRecord, turn: WorkflowDraftTurn): void {
@@ -758,6 +850,8 @@ export class WorkflowDraftService {
   private readonly suspending = new Set<string>();
   /** Clarify sessions whose close failed; the sweep retries them. */
   private readonly orphans = new Map<string, { sessionId: string; headlessId?: string }>();
+  /** Sessions this process closed successfully (most recent, bounded). */
+  private readonly closedSessions = new Set<string>();
   /** This service instance (one per daemon boot) as a reservation holder. */
   private readonly holder: WorkflowDraftReservationHolder;
   private readonly holderAlive: (holder: WorkflowDraftReservationHolder) => boolean;
@@ -858,6 +952,11 @@ export class WorkflowDraftService {
       // run.json is the commit: past it, only the launch may go on (start).
       if (!opts.launched && existsSync(join(runDir, V3_RUN_ENVELOPE_FILE))) {
         throw err('run_committed', 'run.json 已写入，这个草稿只能「继续」启动');
+      }
+      // Its clarify session is (being) closed for the next orchestrator:
+      // only the handoff itself, 「放弃」 and 「删除」 (allowAbandoned) go on.
+      if (draft.handoff && !opts.handoffOp && !opts.allowAbandoned) {
+        throw err('handoff_pending', '正在换编排 Bot：先完成或取消这次更换', { toAppId: draft.handoff.toAppId });
       }
     }
     if (opts.baseVersion !== undefined && opts.baseVersion !== draft.version) {
@@ -1014,6 +1113,78 @@ export class WorkflowDraftService {
     if (opts.nodeBots) delete draft.nodeBots;
   }
 
+  // ── model failures (what the page says, what the picker warns about) ──
+
+  /** A bot's configured CLI and its bots.json `model`, for a failure record.
+   *  No model configured: none is named (nothing is inferred from the bot's
+   *  env or the CLI's own defaults). */
+  private botFacts(appId: string): { cliId?: string; model?: string } {
+    try {
+      const bot = this.deps.loadBots().find((candidate) => candidate.larkAppId === appId);
+      if (!bot) return {};
+      const model = typeof bot.model === 'string' ? bot.model.trim() : '';
+      return {
+        ...(typeof bot.cliId === 'string' && bot.cliId ? { cliId: bot.cliId.slice(0, 64) } : {}),
+        ...(model && /^[A-Za-z0-9._:/@[\]+-]{1,200}$/.test(model) ? { model } : {}),
+      };
+    } catch {
+      return {};
+    }
+  }
+
+  /** Record a failed model call of this daemon's bot on the draft: the cause
+   *  (category + code) for the heading, and what actually happened — the raw
+   *  error, the terminal output tail, the session to open a terminal for. */
+  private noteFailure(
+    draft: WorkflowDraftRecord,
+    step: WorkflowDraftFailureStep,
+    input: {
+      code?: string;
+      category?: WorkflowDraftFailureCategory;
+      detail?: string;
+      terminalTail?: string;
+      sessionId?: string;
+    },
+  ): void {
+    const category = input.category ?? classifyFailureCode(input.code);
+    const summary: WorkflowDraftFailureSummary = {
+      category,
+      ...(input.code ? { code: input.code } : {}),
+      step,
+      larkAppId: this.deps.appId,
+      ...this.botFacts(this.deps.appId),
+      at: this.now().toISOString(),
+    };
+    const detail = failureDetail(input.detail);
+    const terminalTail = failureTerminalTail(input.terminalTail);
+    draft.failure = {
+      ...summary,
+      ...(detail ? { detail } : {}),
+      ...(terminalTail ? { terminalTail } : {}),
+      ...(input.sessionId ? { sessionId: input.sessionId.slice(0, 256) } : {}),
+    };
+    // The picker's warning is about the model: a session that did not start,
+    // or an outcome nobody can attribute, is not held against it. It keeps
+    // the cause only — no raw text reaches the bot list.
+    if (failureCountsAgainstModel(category)) this.noteModelCall(draft, { failure: summary });
+  }
+
+  /** A model call of this daemon's bot went through. */
+  private noteModelOk(draft: WorkflowDraftRecord): void {
+    delete draft.failure;
+    this.noteModelCall(draft, { okAt: this.now().toISOString() });
+  }
+
+  private noteModelCall(draft: WorkflowDraftRecord, entry: { okAt?: string; failure?: WorkflowDraftFailureSummary }): void {
+    const calls = { ...(draft.modelCalls ?? {}) };
+    const prior = calls[this.deps.appId] ?? {};
+    delete calls[this.deps.appId];
+    calls[this.deps.appId] = { ...prior, ...entry };
+    const keys = Object.keys(calls);
+    while (keys.length > WORKFLOW_DRAFT_MAX_MODEL_CALL_BOTS) delete calls[keys.shift()!];
+    draft.modelCalls = calls;
+  }
+
   // ── clarify session ──
 
   /** Commit a finished pending turn; true when draft changed. Never awaits. */
@@ -1068,10 +1239,22 @@ export class WorkflowDraftService {
         draft.clarify.specCandidate = { triggerId: pending.triggerId, markdown: parsed.specMarkdown.slice(0, 256_000), at };
       }
       delete draft.clarify.error;
+      this.noteModelOk(draft);
     } else if (result.state === 'failed') {
-      const why = result.error ? clip(result.error, 1000) : '这一轮没有产出回复';
-      pushTurn(draft, { role: 'system', text: `这一轮失败了：${why}`, at, triggerId: pending.triggerId });
-      draft.clarify.error = why;
+      // The turn list says the code; the failure record keeps the raw error
+      // (masked, clipped) and the session, whose terminal shows the rest.
+      const code = normalizeFailureCode(result.errorCode) ?? extractFailureCode(result.error);
+      const why = code ? `（${code}）` : '';
+      pushTurn(draft, { role: 'system', text: `这一轮失败了${why}`, at, triggerId: pending.triggerId });
+      draft.clarify.error = code ? `这一轮失败了：${code}` : '这一轮没有产出回复';
+      // The provider's own words when the worker had them; else the trigger's.
+      const detail = result.errorDetail || result.error;
+      this.noteFailure(draft, 'clarify_turn', {
+        ...(code ? { code } : {}),
+        ...(detail ? { detail } : {}),
+        ...(result.terminalTail ? { terminalTail: result.terminalTail } : {}),
+        ...(sessionId ? { sessionId } : {}),
+      });
     } else {
       draft.clarify.state = 'disconnected';
       draft.clarify.error = '会话已断开';
@@ -1161,12 +1344,14 @@ export class WorkflowDraftService {
           delete draft.clarify.suspendedAt;
           delete draft.clarify.suspendRefusedAt;
           delete draft.clarify.error;
+          // A new attempt: the page stops showing the old failure meanwhile.
+          delete draft.failure;
           pushTurn(draft, { role: input.role, text: input.display, at, triggerId: sent.triggerId });
         } else if (sent.disconnected) {
           draft.clarify.state = 'disconnected';
           draft.clarify.error = '会话已断开';
         } else {
-          draft.clarify.error = clip(sent.error, 1000);
+          draft.clarify.error = failureDetail(sent.error, 1000) ?? '发送失败';
         }
         return { changed: true, result: undefined };
       });
@@ -1178,7 +1363,7 @@ export class WorkflowDraftService {
         if (sent.busy) throw err('busy', '会话正在重启，请稍后重试');
         throw sent.disconnected
           ? err('session_disconnected', '会话已断开，点「继续」重新起会话')
-          : err('clarify_unavailable', `没能把消息发给编排 Bot：${clip(sent.error, 300)}`);
+          : err('clarify_unavailable', `没能把消息发给编排 Bot：${failureDetail(sent.error, 300) ?? '未知错误'}`);
       }
     } finally {
       this.inflight.delete(reservation);
@@ -1231,7 +1416,9 @@ export class WorkflowDraftService {
         delete draft.clarify.pending;
         if (!made.ok) {
           draft.clarify.state = 'disconnected';
-          draft.clarify.error = clip(made.error, 1000);
+          draft.clarify.error = failureDetail(made.error, 1000) ?? '会话没有开起来';
+          const code = normalizeFailureCode(made.error) ?? extractFailureCode(made.error);
+          this.noteFailure(draft, 'clarify_start', { category: 'session', ...(code ? { code } : {}), detail: made.error });
           return { changed: true, result: false };
         }
         draft.clarify.headlessId = made.headlessId;
@@ -1245,7 +1432,16 @@ export class WorkflowDraftService {
           delete draft.clarify.error;
         } else {
           draft.clarify.state = 'disconnected';
-          draft.clarify.error = clip(sent?.error ?? '会话没有接受第一轮', 1000);
+          draft.clarify.error = failureDetail(sent?.error, 1000) ?? '会话没有接受第一轮';
+          const code = normalizeFailureCode(sent?.error) ?? extractFailureCode(sent?.error);
+          // A worker that took the turn and failed it reports through the
+          // turn's result; here the first turn was not even accepted.
+          this.noteFailure(draft, 'clarify_start', {
+            category: 'session',
+            ...(code ? { code } : {}),
+            ...(sent?.error ? { detail: sent.error } : {}),
+            ...(draft.clarify.sessionId ? { sessionId: draft.clarify.sessionId } : {}),
+          });
         }
         return { changed: true, result: true };
       });
@@ -1257,6 +1453,12 @@ export class WorkflowDraftService {
     }
   }
 
+  private rememberClosed(sessionId: string): void {
+    this.closedSessions.delete(sessionId);
+    this.closedSessions.add(sessionId);
+    while (this.closedSessions.size > 256) this.closedSessions.delete(this.closedSessions.values().next().value!);
+  }
+
   /** Close a clarify session; on failure remember it (in memory, and on the
    *  draft when it still exists) so the sweep retries. */
   private async closeOrRemember(runId: string | undefined, session: { sessionId?: string; headlessId?: string }): Promise<boolean> {
@@ -1265,8 +1467,13 @@ export class WorkflowDraftService {
     try {
       await this.deps.clarifier.close(entry);
       this.orphans.delete(entry.sessionId);
+      this.rememberClosed(entry.sessionId);
       return true;
     } catch (error) {
+      // Closed already by a concurrent close of the same session (two tabs
+      // preparing one handoff): not an orphan — recording it would make the
+      // draft look unclosed after the other close marked it ready.
+      if (this.closedSessions.has(entry.sessionId)) return true;
       this.log(`[workflow-draft] closing clarify session ${entry.sessionId} failed (will retry): ${errorText(error)}`);
       this.orphans.set(entry.sessionId, entry);
       if (runId) {
@@ -2086,6 +2293,7 @@ export class WorkflowDraftService {
         draft.clarify.pending = this.reservationEntry(reservation);
         delete draft.clarify.sessionId;
         delete draft.clarify.headlessId;
+        delete draft.failure;
         return { changed: true, result: { old, prompt, title: clip(draft.goal.replace(/\s+/g, ' '), 80) } };
       });
     } catch (error) {
@@ -2094,6 +2302,242 @@ export class WorkflowDraftService {
     }
     await this.closeOrRemember(runId, prior.old);
     await this.startSession(runId, prior.prompt, prior.title, reservation);
+    return this.view(runId);
+  }
+
+  // ── 换编排 Bot ──
+  //
+  // A draft belongs to its orchestrator's daemon (the Dashboard routes by
+  // draft.json's orchestratorAppId). Handing it to another bot is two steps on
+  // two daemons, joined by a token, each safe to repeat:
+  //
+  //   1. prepare (current owner): record `handoff {toAppId, token}` and close
+  //      every clarify session it knows of; once all are closed the handoff
+  //      is `ready`. The owner refuses every other write meanwhile (only
+  //      cancel / 放弃 / 删除), and its idle sweep leaves the draft alone.
+  //   2. accept (target): in ONE write under the draft lock, only for a ready
+  //      handoff naming it with this token — orchestratorAppId := target, the
+  //      initiator as the target resolved them, the handoff moved to history —
+  //      then a new clarify session starts with the conversation and the spec
+  //      candidate carried in (as 「继续」 does).
+  //
+  // Ownership is that one field of one file, written atomically: before the
+  // accept write the old bot owns the draft, after it the new one — a crash
+  // anywhere leaves exactly one owner (a half-done handoff is finished or
+  // cancelled from the page). Two tabs: one token wins; a repeated accept of
+  // the winning token answers the draft without a second session.
+
+  /** Clarifying, 待确认需求, or a failed Architect at 待编排 — never once 拉群开始 began. */
+  private assertHandoffable(runId: string, draft: WorkflowDraftRecord, grill: GrillState): void {
+    this.assertNotTemplateRun(draft, '换编排 Bot');
+    if (draft.launch) throw err('state_conflict', '已经开始拉群，不能再换编排 Bot');
+    this.assertNotArchitecting(runId, draft, grill);
+    const architectFailed = !!draft.architect && ['failed', 'timed_out', 'interrupted', 'cancelled'].includes(draft.architect.state);
+    if (!(grill.status === 'grilling' || grill.status === 'spec_ready' || (grill.status === 'spec_approved' && architectFailed))) {
+      throw err('state_conflict', '只有澄清中、待确认需求或编排失败的草稿能换编排 Bot', { grillStatus: grill.status });
+    }
+  }
+
+  /** Why `appId` cannot orchestrate (the rules draft creation applies), or undefined. */
+  private orchestratorProblem(appId: string, opts: { online: boolean }): string | undefined {
+    const bot = this.deps.loadBots().find((candidate) => candidate.larkAppId === appId);
+    if (!bot) return '编排 Bot 不在本机 bots.json 里';
+    const why = v3BotStaticExclusion(bot);
+    if (why) return `这个 Bot 不能编排工作流：${why}`;
+    if (isStewardBot(bot.steward)) return '管家 Bot 不能当编排 Bot';
+    if (opts.online) {
+      let online = false;
+      try { online = this.deps.isDaemonOnline(appId); } catch { online = false; }
+      if (!online) return '这个 Bot 的 daemon 不在线';
+    }
+    return undefined;
+  }
+
+  /**
+   * The draft's initiator, as the target bot resolved them (I1), taking the
+   * draft over. An open_id is per app, so it proves nothing across bots:
+   *   - a platform login: the same union_id (vouched by the platform, resolved
+   *     by each bot's own app into its own open_id);
+   *   - a local-token login: the local token again — on the target that is
+   *     the target bot's owner (D1), whoever that is; handing over is allowed
+   *     whether or not the two bots' owners are one person (maintainer's call).
+   * The login path itself never changes across a handoff.
+   */
+  private assertHandoffInitiator(recorded: WorkflowDraftInitiator, initiator: WorkflowDraftInitiator): void {
+    if (initiator.source !== recorded.source) throw err('not_initiator', '只有这个草稿的发起人能换编排 Bot');
+    if (recorded.source === 'dashboard-platform' && (!recorded.unionId || initiator.unionId !== recorded.unionId)) {
+      throw err('not_initiator', '只有这个草稿的发起人能换编排 Bot');
+    }
+  }
+
+  /** Step 1 on the current orchestrator (see above). Repeating it for the
+   *  same target keeps the token; another target replaces it. */
+  async prepareHandoff(
+    runId: string,
+    initiator: WorkflowDraftInitiator,
+    input: { toLarkAppId: unknown; baseVersion?: number },
+  ): Promise<{ token: string; toAppId: string; draft: WorkflowDraftView }> {
+    const toAppId = typeof input.toLarkAppId === 'string' ? input.toLarkAppId.trim() : '';
+    if (!toAppId || toAppId.length > 128) throw err('bad_request', 'toLarkAppId 不能为空');
+    if (toAppId === this.deps.appId) throw err('bad_request', '新的编排 Bot 和现在的是同一个');
+    const first = this.mutate(runId, initiator, { baseVersion: input.baseVersion, handoffOp: true }, ({ draft, grill }) => {
+      this.assertHandoffable(runId, draft, grill);
+      if (draft.clarify.pending) throw err('clarify_turn_running', '上一轮还没回复，等它结束再换编排 Bot');
+      if (draft.clarify.sessionId && this.suspending.has(draft.clarify.sessionId)) throw err('busy', '会话正在释放空闲进程，请稍后重试');
+      const problem = this.orchestratorProblem(toAppId, { online: true });
+      if (problem) throw err('orchestrator_ineligible', problem);
+      const sessions = draftSessions(draft);
+      const same = draft.handoff?.toAppId === toAppId ? draft.handoff : undefined;
+      const token = same?.token ?? randomUUID();
+      const state = sessions.length === 0 ? 'ready' as const : 'closing' as const;
+      if (state === 'ready' && draft.clarify.state !== 'closed') draft.clarify.state = 'disconnected';
+      draft.handoff = { toAppId, token, state, at: same?.at ?? this.now().toISOString() };
+      return { changed: true, result: { token, sessions } };
+    });
+    if (first.sessions.length > 0) {
+      let allClosed = true;
+      for (const session of first.sessions) {
+        if (!(await this.closeOrRemember(runId, session))) allClosed = false;
+      }
+      if (!allClosed) throw err('clarify_unavailable', '现在的编排 Bot 没能关掉它的澄清会话，请稍后重试（或取消这次更换）');
+      const outcome = this.mutate(runId, undefined, { handoffOp: true }, ({ draft }) => {
+        // The sessions just closed are gone whatever happened to the handoff
+        // meanwhile (取消更换 during the close, another target): the draft
+        // must not keep pointing at them, or its next message fails once.
+        const closed = new Set(first.sessions.map((session) => session.sessionId));
+        let changed = false;
+        if (draft.clarify.sessionId && closed.has(draft.clarify.sessionId)) {
+          delete draft.clarify.sessionId;
+          delete draft.clarify.headlessId;
+          delete draft.clarify.suspendedAt;
+          delete draft.clarify.suspendRefusedAt;
+          if (draft.clarify.state !== 'closed') draft.clarify.state = 'disconnected';
+          changed = true;
+        }
+        const prior = draft.orphanSessions ?? [];
+        const rest = prior.filter((item) => !closed.has(item.sessionId));
+        if (rest.length !== prior.length) changed = true;
+        if (rest.length > 0) draft.orphanSessions = rest; else delete draft.orphanSessions;
+        if (draft.handoff?.token !== first.token) return { changed, result: 'cancelled' as const };
+        if (draftSessions(draft).length > 0) return { changed, result: 'open' as const };
+        if (draft.clarify.state !== 'closed') draft.clarify.state = 'disconnected';
+        delete draft.clarify.suspendedAt;
+        delete draft.clarify.suspendRefusedAt;
+        draft.handoff = { ...draft.handoff, state: 'ready' };
+        return { changed: true, result: 'ready' as const };
+      });
+      if (outcome === 'cancelled') throw err('state_conflict', '这次更换已被取消或换了目标，请刷新后再试');
+      if (outcome === 'open') throw err('clarify_unavailable', '澄清会话还没全部关掉，请稍后重试');
+    }
+    this.log(`[workflow-draft] handoff of ${runId} prepared: ${this.deps.appId} → ${toAppId}`);
+    return { token: first.token, toAppId, draft: await this.view(runId) };
+  }
+
+  /** 取消更换 on the current orchestrator: the draft stays; its session is
+   *  closed, so 「继续」 opens a new one. */
+  async cancelHandoff(runId: string, initiator: WorkflowDraftInitiator): Promise<WorkflowDraftView> {
+    this.mutate(runId, initiator, { handoffOp: true }, ({ draft }) => {
+      if (!draft.handoff) throw err('state_conflict', '没有进行中的更换');
+      delete draft.handoff;
+      return { changed: true, result: undefined };
+    });
+    return this.view(runId);
+  }
+
+  /** Step 2 on the target (this daemon's bot): take the draft over. */
+  async acceptHandoff(runId: string, initiator: WorkflowDraftInitiator, input: { token: unknown }): Promise<WorkflowDraftView> {
+    const token = typeof input.token === 'string' ? input.token : '';
+    if (!/^[0-9a-f-]{36}$/.test(token)) throw err('bad_request', 'token 不合法');
+    const runDir = this.runDirOf(runId);
+    const reservation = this.reserve();
+    let next: { prompt?: string; title: string; fromAppId: string } | undefined;
+    try {
+      next = withWorkflowDraftLock(runDir, runId, () => {
+        if (!isWorkflowDraftDir(runDir)) throw err('unknown_draft', `没有这个草稿：${runId}`);
+        const draft = readWorkflowDraft(runDir);
+        const grill = readGrillState(runDir);
+        if (!draft || !grill || draft.deletedAt || draft.runId !== runId || grill.runId !== runId || grill.chatBinding) {
+          throw err('unknown_draft', `没有这个草稿：${runId}`);
+        }
+        if (draft.orchestratorAppId === this.deps.appId) {
+          // This token already moved it here (a second tab, a retried request).
+          if (draft.handoffs?.some((item) => item.token === token && item.toAppId === this.deps.appId)) {
+            if (!sameInitiator(initiator, draft.initiator)) throw err('not_initiator', '只有这个草稿的发起人能换编排 Bot');
+            return undefined;
+          }
+          throw err('state_conflict', '这个草稿已经由这个 Bot 编排');
+        }
+        const handoff = draft.handoff;
+        if (!handoff || handoff.token !== token || handoff.toAppId !== this.deps.appId) {
+          throw err('state_conflict', '这次更换已被取消或换了目标，请刷新后再试');
+        }
+        if (draft.abandonedAt) throw err('draft_abandoned', '这个草稿已放弃');
+        this.assertHandoffInitiator(draft.initiator, initiator);
+        this.assertHandoffable(runId, draft, grill);
+        if (handoff.state !== 'ready') throw err('busy', '原来的编排 Bot 还在关闭澄清会话，请稍后重试');
+        if (draft.clarify.pending || draftSessions(draft).length > 0) throw err('state_conflict', '原来的澄清会话还没关掉');
+        const problem = this.orchestratorProblem(this.deps.appId, { online: false });
+        if (problem) throw err('orchestrator_ineligible', problem);
+        const at = this.now().toISOString();
+        const fromAppId = draft.orchestratorAppId;
+        const nameOf = this.deps.nameOf();
+        // The conversation so far and the spec candidate go to the new bot as
+        // the first turn of its session (D2's 「继续」 carry-over).
+        const prompt = grill.status === 'grilling' || grill.status === 'spec_ready'
+          ? buildDraftClarifyResume({
+              runId,
+              goal: draft.goal,
+              specMarkdown: readTextOrUndefined(grill.specPath) ?? draft.clarify.specCandidate?.markdown,
+              turns: draft.clarify.turns,
+            })
+          : undefined;
+        draft.orchestratorAppId = this.deps.appId;
+        // The person as THIS bot's app knows them (open_id is per app); the
+        // first confirmation (确认需求), if any, is restamped the same way —
+        // the history keeps each open_id under the app that issued it.
+        const previous = draft.initiator;
+        const confirmedBy = draft.specConfirmation?.confirmedByOpenId;
+        draft.initiator = initiator;
+        if (draft.specConfirmation) draft.specConfirmation = { ...draft.specConfirmation, confirmedByOpenId: initiator.openId };
+        delete draft.handoff;
+        const entry: WorkflowDraftHandoffRecord = {
+          fromAppId,
+          toAppId: this.deps.appId,
+          token,
+          at,
+          by: {
+            source: initiator.source,
+            fromOpenId: previous.openId,
+            toOpenId: initiator.openId,
+            ...(initiator.source === 'dashboard-platform' && initiator.unionId ? { unionId: initiator.unionId } : {}),
+          },
+          ...(confirmedBy ? { specConfirmation: { fromOpenId: confirmedBy, toOpenId: initiator.openId } } : {}),
+        };
+        draft.handoffs = [...(draft.handoffs ?? []), entry].slice(-WORKFLOW_DRAFT_MAX_HANDOFFS);
+        delete draft.failure;
+        delete draft.clarify.error;
+        delete draft.clarify.sessionId;
+        delete draft.clarify.headlessId;
+        delete draft.clarify.suspendedAt;
+        delete draft.clarify.suspendRefusedAt;
+        draft.clarify.state = 'disconnected';
+        pushTurn(draft, {
+          role: 'system',
+          text: `编排 Bot 从 ${nameOf(fromAppId)} 换成了 ${nameOf(this.deps.appId)}；之前的对话和 spec 候选已带给新的编排 Bot`
+            + (confirmedBy ? '；「确认需求」的确认人已改为新编排 Bot 下的发起人身份' : ''),
+          at,
+        });
+        if (prompt) draft.clarify.pending = this.reservationEntry(reservation);
+        this.persist(runDir, draft);
+        return { ...(prompt ? { prompt } : {}), title: clip(draft.goal.replace(/\s+/g, ' '), 80), fromAppId };
+      });
+    } catch (error) {
+      this.inflight.delete(reservation);
+      throw this.mapError(error);
+    }
+    if (next) this.log(`[workflow-draft] handoff of ${runId} accepted: ${next.fromAppId} → ${this.deps.appId}`);
+    if (next?.prompt) await this.startSession(runId, next.prompt, next.title, reservation);
+    else this.inflight.delete(reservation);
     return this.view(runId);
   }
 
@@ -2210,6 +2654,7 @@ export class WorkflowDraftService {
       this.assertStatus(grill, ['spec_approved', 'dag_ready'], '编排');
       if (grill.status === 'dag_ready') hostReviseDag(runDir, this.now());
       this.flowChanged(draft, { nodeBots: true });
+      delete draft.failure;
       draft.architect = {
         state: 'running',
         attempt: (draft.architect?.attempt ?? 0) + 1,
@@ -2234,6 +2679,7 @@ export class WorkflowDraftService {
     task.done = (async () => {
       let ok = false;
       let problems: string[] | undefined;
+      let attemptDir: string | undefined;
       try {
         const bots = this.deps.loadBots();
         const nameOf = this.deps.nameOf();
@@ -2269,6 +2715,7 @@ export class WorkflowDraftService {
         }, this.now());
         ok = outcome.ok;
         problems = outcome.problems;
+        attemptDir = outcome.attemptDir;
       } catch (error) {
         problems = [errorText(error)];
         this.retreatIfStuck(runDir, problems);
@@ -2283,6 +2730,7 @@ export class WorkflowDraftService {
       // in between mistakes it for a lost one. Recording is tried with the
       // problems, then without them; if both fail, the next write or read
       // finds 编排中 with no task and heals it to 编排中断.
+      const logs = ok ? {} : architectFailureLogs(attemptDir);
       const record = (problemsToKeep: string[] | undefined) => this.mutate(runId, undefined, { allowAbandoned: true }, ({ draft }) => {
         if (draft.architect?.state !== 'running') return { changed: false, result: undefined };
         const { problems: _old, ...rest } = draft.architect;
@@ -2292,12 +2740,29 @@ export class WorkflowDraftService {
           finishedAt: this.now().toISOString(),
           ...(problemsToKeep && problemsToKeep.length > 0 && !ok ? { problems: problemsToKeep } : {}),
         };
-        if (ok) this.flowChanged(draft, { nodeBots: true });
+        if (ok) {
+          this.flowChanged(draft, { nodeBots: true });
+          this.noteModelOk(draft);
+        } else if (state === 'timed_out' || state === 'failed') {
+          // The Architect's problems are its own words (validation, manifest):
+          // only a code-shaped token in them is taken as the cause; they and
+          // its worker's stderr are the raw error, its pty.log the terminal.
+          const code = state === 'failed'
+            ? (why ?? []).map((problem) => extractFailureCode(problem)).find((found) => !!found)
+            : undefined;
+          const detail = [...(problemsToKeep ?? []), ...(logs.stderr ? [logs.stderr.trim()] : [])].filter(Boolean).join('\n');
+          this.noteFailure(draft, 'architect', {
+            ...(state === 'timed_out' ? { category: 'timeout' as const } : {}),
+            ...(code ? { code } : {}),
+            ...(detail ? { detail } : {}),
+            ...(logs.terminal ? { terminalTail: logs.terminal } : {}),
+          });
+        }
         return { changed: true, result: undefined };
       });
       try {
         try {
-          record(why?.map((problem) => clip(problem, 4000)).slice(0, 200));
+          record(why?.map((problem) => failureDetail(problem, 4000) ?? '').filter(Boolean).slice(0, 200));
         } catch (error) {
           this.log(`[workflow-draft] recording architect outcome for ${runId} failed, retrying without details: ${errorText(error).slice(0, 300)}`);
           record(ok ? undefined : ['编排失败，详细原因没能记录']);
@@ -2569,6 +3034,7 @@ export class WorkflowDraftService {
       }
       const at = this.now().toISOString();
       draft.abandonedAt = at;
+      delete draft.handoff;
       if (draft.launch) {
         draft.launch.state = 'abandoned';
         draft.launch.abandonedAt = at;
@@ -2886,7 +3352,9 @@ export class WorkflowDraftService {
         patch?.(launch, draft);
         launch.state = 'paused';
         delete launch.token;
-        launch.error = { ...stop, message: clip(stop.message, 4000), at: this.now().toISOString() };
+        // Launch-stage messages carry raw provider / IPC text: mask before clipping,
+        // the same rule the failure panel applies.
+        launch.error = { ...stop, message: clip(maskFailureText(stop.message), 4000), at: this.now().toISOString() };
         return { changed: true, result: undefined };
       });
     } catch (error) {
@@ -3350,7 +3818,7 @@ export class WorkflowDraftService {
       const at = this.now().toISOString();
       launch.migrate = bound.ok
         ? { status: 'bound', at, sessionId: session!.sessionId }
-        : { status: 'unavailable', at, error: clip(bound.error, 2000) };
+        : { status: 'unavailable', at, error: clip(maskFailureText(bound.error ?? ''), 2000) };
       if (bound.ok) {
         draft.clarify.state = 'migrated';
         delete draft.clarify.suspendedAt;
@@ -4048,7 +4516,7 @@ export class WorkflowDraftService {
     }
     if (!started.ok) {
       this.stopLaunch(runId, token, {
-        step: 'start', code: clip(started.error, 64), retryable: true,
+        step: 'start', code: clip(maskFailureText(started.error ?? ''), 64), retryable: true,
         message: `启动失败（HTTP ${started.status}）：${started.error}${started.detail ? `（${started.detail}）` : ''}`,
       });
       return false;
@@ -4241,7 +4709,7 @@ export class WorkflowDraftService {
       title,
       phase: workflowDraftPhase(grill, draft, phaseReady),
       grillStatus: grill.status,
-      ...(grill.problems?.length ? { problems: grill.problems } : {}),
+      ...(grill.problems?.length ? { problems: grill.problems.map(maskFailureText) } : {}),
       createdAt: draft.createdAt,
       updatedAt,
       stale: now.getTime() - Date.parse(updatedAt) >= WORKFLOW_DRAFT_STALE_MS,
@@ -4253,8 +4721,12 @@ export class WorkflowDraftService {
         ...(draft.clarify.specCandidate
           ? { specCandidate: { markdown: draft.clarify.specCandidate.markdown, ...(draft.clarify.specCandidate.triggerId ? { triggerId: draft.clarify.specCandidate.triggerId } : {}) } }
           : {}),
-        ...(draft.clarify.error ? { error: draft.clarify.error } : {}),
+        // Older records kept the raw text: masked on the way out too.
+        ...(draft.clarify.error ? { error: maskFailureText(draft.clarify.error) } : {}),
       },
+      ...(draft.failure ? { failure: draft.failure } : {}),
+      ...(draft.handoff ? { handoff: { toAppId: draft.handoff.toAppId, state: draft.handoff.state, at: draft.handoff.at } } : {}),
+      ...(draft.handoffs?.length ? { handoffs: draft.handoffs.map(({ token: _token, ...entry }) => entry) } : {}),
       ...(specMarkdown !== undefined || specJsonText !== undefined
         ? { spec: {
             ...(specMarkdown !== undefined ? { markdown: specMarkdown } : {}),
@@ -4265,6 +4737,7 @@ export class WorkflowDraftService {
       ...(draft.architect
         ? { architect: {
             ...draft.architect,
+            ...(draft.architect.problems ? { problems: draft.architect.problems.map(maskFailureText) } : {}),
             elapsedMs: Math.max(0, (draft.architect.finishedAt ? Date.parse(draft.architect.finishedAt) : now.getTime()) - Date.parse(draft.architect.startedAt)),
           } }
         : {}),
@@ -4386,7 +4859,8 @@ export class WorkflowDraftService {
           if (refreshed) this.persist(runDir, draft, { keepUpdatedAt: refreshed !== 'activity' });
           // 拉群开始 began: the clarify session is about to move (or moved)
           // into the main topic — its lifetime is the topic's now (§4.2).
-          if (draft.launch || clarifySessionInTopic(draft)) return;
+          // 换编排 Bot under way: its session is being closed for the next bot.
+          if (draft.launch || draft.handoff || clarifySessionInTopic(draft)) return;
           const { clarify } = draft;
           if (clarify.state !== 'active' || clarify.pending || !clarify.sessionId || !clarify.lastMessageAt) return;
           if (this.suspending.has(clarify.sessionId)) return;

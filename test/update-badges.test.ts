@@ -144,3 +144,12 @@ describe('updateBadges', () => {
     }
   });
 });
+
+// 机器可校验的一致性(K4)：读 GitHub 实际执行的 workflow YAML。Actions 排队时 badge job 要等很久才拿到 runner，
+// 若后续触发会取消正在等的那次，每次上游跑完都重新排队，badge 一直发不出去，也不会报错。
+describe('README badges workflow', () => {
+  it('lets the queued update finish and only replaces the waiting one', () => {
+    const { jobs } = parseYaml(readFileSync(join(repoRoot, '.github/workflows/badges.yml'), 'utf8'));
+    expect(jobs.update.concurrency['cancel-in-progress']).toBe(false);
+  });
+});

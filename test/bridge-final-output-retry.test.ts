@@ -21,7 +21,7 @@ import MarkdownIt from 'markdown-it';
 import * as cotMessage from '../src/im/lark/cot-message.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { outputSnapshot } from '../src/services/universal-output-handoff.js';
-import { OutputDeliveryJournal } from '../src/services/output-delivery-journal.js';
+import { OutputDeliveryJournal, outputDeliveryJournal } from '../src/services/output-delivery-journal.js';
 import { OutputDeliveryCoordinator } from '../src/services/output-delivery-coordinator.js';
 import { finalOutputSnapshot } from '../src/services/final-output-handoff.js';
 import { FinalOutputHandoffStore } from '../src/services/final-output-handoff-store.js';
@@ -2897,6 +2897,52 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
+  it('settles a silent listener test run on its terminal without a source reply', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const run = createMessageListenerRunPreview('app_test', 'oc_chat', ['om_source']);
+    const triggerId = 'mlrp_turn_silent';
+    markMessageListenerRunPreviewTriggered(run.runId, 'om_source', { sessionId: 'sid-final-out', triggerId });
+    const ds = makeDs();
+    ds.session.messageListenerRun = { sourceMessageId: 'om_source', replyMode: 'none' };
+    ds.currentTurnId = triggerId;
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', { ...finalOutputMsg(), sessionId: ds.session.sessionId, turnId: triggerId });
+    (ds.worker as any).emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: triggerId, status: 'completed' });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(getMessageListenerRunPreview(run.runId)?.results[0]).toMatchObject({ state: 'completed', ok: true });
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('marks the durable output journal of a silent listener turn as intentionally suppressed', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const triggerId = 'mlrp_turn_journal';
+    const ds = makeDs();
+    ds.session.messageListenerRun = { sourceMessageId: 'om_source', replyMode: 'none' };
+    ds.currentTurnId = triggerId;
+    ds.initConfig = { ...(ds.initConfig ?? {}), finalOutputHandoff: { version: 2 as const, token: 'tok-silent' } };
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const base = { ...finalOutputMsg(), sessionId: ds.session.sessionId, turnId: triggerId };
+    const snapshot = outputSnapshot(ds.larkAppId, base);
+    (ds.worker as any).emit('message', {
+      ...base,
+      handoff: { version: 2 as const, token: 'tok-silent', id: snapshot.id, fingerprint: snapshot.fingerprint },
+    });
+    // The handoff processor settles through async coordinator/DB steps; flush
+    // the microtask queue instead of asserting synchronously after emit.
+    for (let i = 0; i < 5; i += 1) {
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+    }
+    const stored = outputDeliveryJournal(config.session.dataDir, ds.larkAppId).read(snapshot.id);
+    expect(stored?.sink).toMatchObject({
+      kind: 'suppressed',
+      reason: 'silent_message_listener',
+    });
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
   it('records Hermes source binding and allows matching sourceHermesSessionId', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
@@ -5426,6 +5472,129 @@ describe('Worker hidden schedule retirement', () => {
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(onDeferredScheduleTurnSettled).not.toHaveBeenCalled();
+  });
+});
+
+describe('Worker turn_input_rejected for document-comment turns', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const rejection = {
+    type: 'turn_input_rejected',
+    turnId: 'reply-b',
+    reason: 'cross_principal_requires_owner_confirmation',
+    rejectedBeforeAdmission: true,
+    activeTurnId: 'reply-a',
+    activeCaller: {
+      requestUserOpenId: 'ou_a',
+      requestUserUnionId: 'on_a',
+      requestLarkAppId: 'app_test',
+      senderType: 'user',
+    },
+  } satisfies Extract<WorkerToDaemon, { type: 'turn_input_rejected' }>;
+
+  function setupDocCommentSession() {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.scope = 'chat';
+    ds.chatId = 'doc:doc-token';
+    ds.session.scope = 'chat';
+    ds.session.chatId = 'doc:doc-token';
+    const activeTarget = {
+      fileToken: 'doc-token', fileType: 'docx', commentId: 'comment-1', replyToOpenId: 'ou_a',
+      replyId: 'reply-a', reactionType: 'Typing', reactionIdentity: 'tenant' as const,
+    };
+    const rejectedTarget = {
+      fileToken: 'doc-token', fileType: 'docx', commentId: 'comment-1', replyToOpenId: 'ou_b',
+      replyId: 'reply-b', reactionId: 'reaction-b', reactionType: 'Typing', reactionIdentity: 'tenant' as const,
+    };
+    ds.docCommentTurns = new Map([['reply-a', activeTarget], ['reply-b', rejectedTarget]]);
+    ds.session.docCommentTargets = {
+      'reply-a': { ...activeTarget, turnId: 'reply-a' },
+      'reply-b': { ...rejectedTarget, turnId: 'reply-b' },
+    };
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    return { ds, sessionReply };
+  }
+
+  it('answers a comment rejected before admission on its own thread and clears its Typing marker once', async () => {
+    const { ds, sessionReply } = setupDocCommentSession();
+    // worker 重发同一拒收帧时，评论串里也只能出现一条提示。
+    (ds.worker as any).emit('message', rejection);
+    (ds.worker as any).emit('message', rejection);
+    await vi.waitFor(() => expect(removeCommentReactionMock).toHaveBeenCalled());
+
+    expect(replyToDocCommentMock).toHaveBeenCalledTimes(1);
+    expect(replyToDocCommentMock).toHaveBeenCalledWith(
+      'app_test', { fileToken: 'doc-token', fileType: 'docx' }, 'comment-1', expect.any(String), 'ou_b',
+    );
+    expect(removeCommentReactionMock).toHaveBeenCalledTimes(1);
+    expect(removeCommentReactionMock).toHaveBeenCalledWith(
+      'app_test', { fileToken: 'doc-token', fileType: 'docx' }, 'comment-1', 'reply-b', 'Typing', { identity: 'tenant' },
+    );
+    expect(sessionReply).not.toHaveBeenCalled();
+    // 被拒评论的回复落点已消费，仍在执行的那一轮的落点原样保留。
+    expect([...(ds.docCommentTurns?.keys() ?? [])]).toEqual(['reply-a']);
+    expect(Object.keys(ds.session.docCommentTargets ?? {})).toEqual(['reply-a']);
+  });
+
+  it('cancels the rejected Codex App turn from the dispatch ledger before reporting it as not executed', async () => {
+    const { ds } = setupDocCommentSession();
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'dispatch-a', turnId: 'reply-a', state: 'prepared', content: 'a', deliverySink: 'doc_comment' },
+      { dispatchId: 'dispatch-b', turnId: 'reply-b', state: 'accepted', content: 'b', deliverySink: 'doc_comment' },
+    ];
+    (ds.worker as any).emit('message', rejection);
+    await vi.waitFor(() => expect(removeCommentReactionMock).toHaveBeenCalled());
+
+    // 不撤掉这条 accepted，下一轮 prepare 会报 dispatch_out_of_order，refork 还会把已告知未执行的输入重放一遍。
+    expect(ds.session.codexAppDispatchLedger?.map(entry => entry.dispatchId)).toEqual(['dispatch-a']);
+    expect(replyToDocCommentMock).toHaveBeenCalledTimes(1);
+    expect([...(ds.docCommentTurns?.keys() ?? [])]).toEqual(['reply-a']);
+  });
+
+  it('keeps the old silent path when the Codex App ledger entry of the rejected turn cannot be cancelled', async () => {
+    const { ds } = setupDocCommentSession();
+    const ledger = [
+      { dispatchId: 'dispatch-b', turnId: 'reply-b', state: 'prepared' as const, content: 'b', deliverySink: 'doc_comment' as const },
+    ];
+    ds.session.codexAppDispatchLedger = ledger;
+    (ds.worker as any).emit('message', rejection);
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    expect(ds.session.codexAppDispatchLedger).toEqual(ledger);
+    expect(replyToDocCommentMock).not.toHaveBeenCalled();
+    expect(removeCommentReactionMock).not.toHaveBeenCalled();
+    expect([...(ds.docCommentTurns?.keys() ?? [])]).toEqual(['reply-a', 'reply-b']);
+    expect(Object.keys(ds.session.docCommentTargets ?? {})).toEqual(['reply-a', 'reply-b']);
+  });
+
+  it('keeps the old silent path when the rejected turn is the pending queued activation', async () => {
+    const { ds } = setupDocCommentSession();
+    const journalInput = { content: 'b' };
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationToken = 'activation-b';
+    ds.session.queuedActivationTurnId = 'reply-b';
+    ds.session.queuedActivationInput = journalInput;
+    (ds.worker as any).emit('message', rejection);
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    // 激活日志还在，下次 fork 会重放这条输入，此时告诉用户「未执行」就是错的。
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationTurnId).toBe('reply-b');
+    expect(ds.session.queuedActivationInput).toBe(journalInput);
+    expect(replyToDocCommentMock).not.toHaveBeenCalled();
+    expect(removeCommentReactionMock).not.toHaveBeenCalled();
+    expect([...(ds.docCommentTurns?.keys() ?? [])]).toEqual(['reply-a', 'reply-b']);
+    expect(Object.keys(ds.session.docCommentTargets ?? {})).toEqual(['reply-a', 'reply-b']);
   });
 });
 

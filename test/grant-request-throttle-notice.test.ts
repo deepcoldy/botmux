@@ -45,6 +45,7 @@ import { registerBot, __testOnly_resetBotRegistry } from '../src/bot-registry.js
 import { maybeSendGrantRequestCard } from '../src/im/lark/event-dispatcher.js';
 import {
   isThrottled,
+  claimPendingGrant,
   markDenied,
   markPendingDelivered,
   openPending,
@@ -57,6 +58,7 @@ import {
 import { clearChatMemberCache } from '../src/im/lark/grant-owner.js';
 import { replyMessage, sendUserMessage, listChatMemberOpenIds } from '../src/im/lark/client.js';
 import { localeForBot, t } from '../src/i18n/index.js';
+import { logger } from '../src/utils/logger.js';
 
 const APP = 'throttle_notice_app';
 const OWNER = 'ou_owner';
@@ -237,5 +239,67 @@ describe('maybeSendGrantRequestCard — notice while the request is throttled', 
       ['om_r2', 'pending'],
       ['om_r3', 'pending'],
     ]);
+  });
+});
+
+/**
+ * 机器人发送方（调用方不传 notifyThrottledRequester）在申请卡待批期间的后续消息：不回话（免得两个 bot
+ * 互相回话），但挂到 pending 上等批准后重放；挂不上的要留日志，不能静默丢。
+ */
+describe('maybeSendGrantRequestCard — bot sender while the request is throttled', () => {
+  const BOT = 'ou_foreign_bot';
+  const botEvent = (id: string) => ({
+    message: { message_id: id, chat_id: GROUP, chat_type: 'group', content: `{"text":"task ${id}"}` },
+    sender: { sender_id: { open_id: BOT }, sender_type: 'bot' },
+  });
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'botmux-grant-bot-hold-'));
+    __testOnly_resetBotRegistry();
+    _resetGrantPending();
+    clearChatMemberCache();
+    vi.mocked(replyMessage).mockReset().mockResolvedValue('om_reply');
+    vi.mocked(sendUserMessage).mockReset().mockResolvedValue('om_dm');
+    vi.mocked(listChatMemberOpenIds).mockReset().mockResolvedValue([OWNER, BOT]);
+  });
+  afterEach(() => { rmSync(tempDir, { recursive: true, force: true }); });
+
+  it('the 2nd and 3rd message are held in arrival order for the approval, and the bot gets no answer', async () => {
+    registerRestrictedBot();
+    await maybeSendGrantRequestCard(APP, groupMsg('om_b1'), GROUP, BOT, botEvent('om_b1'));
+    await maybeSendGrantRequestCard(APP, groupMsg('om_b2'), GROUP, BOT, botEvent('om_b2'));
+    await maybeSendGrantRequestCard(APP, groupMsg('om_b3'), GROUP, BOT, botEvent('om_b3'));
+    expect(replies().map(c => [c[1], c[3]])).toEqual([['om_b1', 'interactive']]);
+    expect(sendUserMessage).not.toHaveBeenCalled();
+    const nonce = String(replies()[0]![2]).match(/nonce[^0-9a-z]{1,12}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/)?.[1];
+    const claim = claimPendingGrant(APP, GROUP, [BOT], nonce ?? '');
+    expect(claim.ok).toBe(true);
+    if (!claim.ok) return;
+    expect(claim.messageData?.message?.message_id).toBe('om_b1');
+    expect((claim.heldMessages ?? []).map(m => m.message.message_id)).toEqual(['om_b2', 'om_b3']);
+  });
+
+  it('a human sender is unchanged: one notice, nothing held', async () => {
+    registerRestrictedBot();
+    const nonce = openPendingMulti(APP, GROUP, [REQUESTER], 3, undefined, 60_000);
+    markPendingDelivered(APP, GROUP, [REQUESTER], nonce);
+    await maybeSendGrantRequestCard(APP, groupMsg('om_h2'), GROUP, REQUESTER, botEvent('om_h2'), asHuman);
+    expect(replies().map(c => [c[1], c[2]])).toEqual([['om_h2', pendingText()]]);
+    const claim = claimPendingGrant(APP, GROUP, [REQUESTER], nonce);
+    expect(claim.ok && claim.heldMessages).toBeUndefined();
+  });
+
+  it('a bot message that cannot be held (request just denied) is logged instead of vanishing', async () => {
+    registerRestrictedBot();
+    markPendingDelivered(APP, GROUP, [BOT], openPending(APP, GROUP, BOT, 3, botEvent('om_d1'), 60_000));
+    markDenied(APP, GROUP, BOT);
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => {});
+    try {
+      await maybeSendGrantRequestCard(APP, groupMsg('om_d2'), GROUP, BOT, botEvent('om_d2'));
+      expect(replies()).toHaveLength(0);
+      expect(info.mock.calls.some(c => String(c[0]).includes(BOT.substring(0, 12)))).toBe(true);
+    } finally {
+      info.mockRestore();
+    }
   });
 });

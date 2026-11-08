@@ -8,7 +8,10 @@
  *   POST /api/v3/orchestration/drafts/:runId/…   → 草稿属主 daemon（写）
  *   POST /api/v3/orchestration/drafts/from-source {source, larkAppId?} 复制为新工作流（D6）
  *        → larkAppId 的 daemon；不填 = 来源的编排 Bot（run.json 绑定的主 Bot / 模板所属 Bot，读盘）
- *   GET  /api/v3/orchestration/bots              编排 Bot 下拉框（D3，只读）
+ *   POST /api/v3/orchestration/drafts/:runId/orchestrator {larkAppId, baseVersion?} 换编排 Bot：
+ *        先问新 Bot 的 daemon「我是谁」（I1），再让现编排 Bot prepare（关澄清会话），
+ *        最后让新 Bot accept（接管）；中途断了，页面再点一次从断处接着做
+ *   GET  /api/v3/orchestration/bots              编排 Bot 下拉框（D3，只读；带「最近一次调用模型失败」）
  *
  * The Dashboard only classifies the login (D1 `classifyDashboardInitiator`)
  * and routes; the orchestrating bot's daemon resolves the person, applies the
@@ -25,8 +28,9 @@ import {
   classifyDashboardInitiator,
   dashboardInitiatorHeaders,
   initiatorFailureBody,
+  WORKFLOW_INITIATOR_PATH,
 } from '../core/workflow-initiator.js';
-import { listWorkflowDrafts, workflowDraftOwner } from '../workflows/v3/draft-store.js';
+import { listWorkflowDrafts, workflowDraftOwner, type WorkflowDraftFailureSummary } from '../workflows/v3/draft-store.js';
 import {
   WorkflowCopySourceError,
   parseWorkflowCopySource,
@@ -42,6 +46,10 @@ import { isStewardBot } from '../core/decision-board/model.js';
 export const WORKFLOW_DRAFTS_API_PATH = '/api/v3/orchestration/drafts';
 /** 复制为新工作流 (D6). Not a run id: minted ids always end in 8 hex digits. */
 export const WORKFLOW_DRAFTS_FROM_SOURCE_TAIL = '/from-source';
+/** 换编排 Bot: the one draft route the Dashboard runs itself (two daemons). */
+export const WORKFLOW_DRAFT_ORCHESTRATOR_TAIL = '/orchestrator';
+/** Daemon draft routes the page never calls directly (取消更换 stays open). */
+const WORKFLOW_DRAFT_INTERNAL_TAILS: ReadonlySet<string> = new Set(['/handoff/prepare', '/handoff/accept']);
 const MAX_BODY_BYTES = 1024 * 1024;
 
 export interface WorkflowDraftsApiDeps {
@@ -151,6 +159,25 @@ export async function handleWorkflowDraftsApi(
       return true;
     }
   }
+  if (method === 'POST' && match?.[2] === WORKFLOW_DRAFT_ORCHESTRATOR_TAIL) {
+    let runId: string;
+    try { runId = decodeURIComponent(match[1]!); } catch {
+      jsonRes(res, 400, { ok: false, error: 'bad_run_id', retryable: false });
+      return true;
+    }
+    const headers = initiatorHeadersOrRefuse(req, res, deps);
+    if (!headers) return true;
+    await switchOrchestrator(res, runId, parsed as Record<string, unknown>, headers, deps);
+    return true;
+  }
+
+  // The handoff's two steps run only inside POST /orchestrator, which checks
+  // the person on the target (I1) first and keeps the token off the page.
+  if (match?.[2] !== undefined && WORKFLOW_DRAFT_INTERNAL_TAILS.has(match[2])) {
+    jsonRes(res, 404, { ok: false, error: 'not_found', retryable: false });
+    return true;
+  }
+
   let larkAppId: string | undefined;
   if (tail === WORKFLOW_DRAFTS_FROM_SOURCE_TAIL) {
     if (method !== 'POST') {
@@ -204,27 +231,11 @@ export async function handleWorkflowDraftsApi(
     }
   }
 
-  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  let headers: Record<string, string> = { 'content-type': 'application/json' };
   if (method === 'POST') {
-    const actor = readDashboardPlatformActor(req, deps.platformBound);
-    const claim = classifyDashboardInitiator({
-      identity: deps.identity,
-      canManageHost: deps.canManageHost,
-      viaPlatformTunnel: actor.viaPlatformTunnel,
-      platformUnionId: actor.unionId,
-      directActorHeader: actor.ignoredActorHeader,
-    });
-    if (!claim.ok) {
-      if (claim.error === 'platform_direct_unsupported') {
-        logger.warn(
-          `[workflow-drafts] refused platform_direct_unsupported: X-Botmux-Actor on a non-tunnel connection `
-          + `(peer=${req.socket?.remoteAddress ?? '?'}:${req.socket?.remotePort ?? '?'})`,
-        );
-      }
-      jsonRes(res, claim.status, initiatorFailureBody(claim));
-      return true;
-    }
-    Object.assign(headers, dashboardInitiatorHeaders(claim));
+    const withInitiator = initiatorHeadersOrRefuse(req, res, deps);
+    if (!withInitiator) return true;
+    headers = withInitiator;
   }
 
   let upstream: Response;
@@ -240,6 +251,125 @@ export async function handleWorkflowDraftsApi(
   }
   await relay(res, upstream);
   return true;
+}
+
+/** The login as the daemon reads it (D1), or the refusal answered. */
+function initiatorHeadersOrRefuse(req: IncomingMessage, res: ServerResponse, deps: WorkflowDraftsApiDeps): Record<string, string> | undefined {
+  const actor = readDashboardPlatformActor(req, deps.platformBound);
+  const claim = classifyDashboardInitiator({
+    identity: deps.identity,
+    canManageHost: deps.canManageHost,
+    viaPlatformTunnel: actor.viaPlatformTunnel,
+    platformUnionId: actor.unionId,
+    directActorHeader: actor.ignoredActorHeader,
+  });
+  if (!claim.ok) {
+    if (claim.error === 'platform_direct_unsupported') {
+      logger.warn(
+        `[workflow-drafts] refused platform_direct_unsupported: X-Botmux-Actor on a non-tunnel connection `
+        + `(peer=${req.socket?.remoteAddress ?? '?'}:${req.socket?.remotePort ?? '?'})`,
+      );
+    }
+    jsonRes(res, claim.status, initiatorFailureBody(claim));
+    return undefined;
+  }
+  return { 'content-type': 'application/json', ...dashboardInitiatorHeaders(claim) };
+}
+
+async function readUpstream(upstream: Response): Promise<{ status: number; body: Record<string, unknown> | undefined }> {
+  const text = await upstream.text();
+  let body: unknown;
+  try { body = JSON.parse(text); } catch { body = undefined; }
+  return { status: upstream.status, body: body && typeof body === 'object' && !Array.isArray(body) ? body as Record<string, unknown> : undefined };
+}
+
+function answer(res: ServerResponse, upstream: { status: number; body: Record<string, unknown> | undefined }): void {
+  if (!upstream.body) {
+    jsonRes(res, 502, { ok: false, error: 'daemon_bad_response', retryable: true });
+    return;
+  }
+  const body = upstream.body;
+  if (body.ok === false && typeof body.retryable !== 'boolean') {
+    jsonRes(res, upstream.status, { ...body, ok: false, error: body.error ?? 'daemon_error', retryable: upstream.status >= 500 });
+    return;
+  }
+  jsonRes(res, upstream.status, body);
+}
+
+/**
+ * 换编排 Bot, run by the Dashboard across the two daemons (each checks the
+ * person itself; the Dashboard only sequences):
+ *   1. the target's daemon resolves the login (I1) — refused: nothing changed;
+ *   2. the current owner (from draft.json) prepares: records the target and
+ *      closes its clarify session;
+ *   3. the target accepts: takes the draft over in one write, starts a new
+ *      session with the conversation carried in.
+ * Interrupted after 2: the page shows the pending handoff; asking again
+ * repeats 2 (same token) and does 3. Already moved: the target answers.
+ */
+async function switchOrchestrator(
+  res: ServerResponse,
+  runId: string,
+  body: Record<string, unknown>,
+  headers: Record<string, string>,
+  deps: WorkflowDraftsApiDeps,
+): Promise<void> {
+  const target = typeof body.larkAppId === 'string' && body.larkAppId.trim() ? body.larkAppId.trim() : undefined;
+  if (!target) {
+    jsonRes(res, 400, { ok: false, error: 'larkAppId_required', retryable: false });
+    return;
+  }
+  const owner = workflowDraftOwner(deps.runsDir, runId);
+  if (!owner) {
+    jsonRes(res, 404, { ok: false, error: 'unknown_draft', retryable: false });
+    return;
+  }
+  const draftPath = `${WORKFLOW_DRAFTS_API_PATH}/${encodeURIComponent(runId)}`;
+  const call = async (larkAppId: string, path: string, payload: unknown) => {
+    try {
+      return await readUpstream(await deps.proxyToDaemon(larkAppId, path, { method: 'POST', headers, body: JSON.stringify(payload) }));
+    } catch {
+      return undefined;
+    }
+  };
+  // Moved already (a second tab, or a retry after the accept landed): the
+  // target answers the draft.
+  const answerMoved = async () => {
+    let upstream: Response;
+    try { upstream = await deps.proxyToDaemon(target, draftPath, { method: 'GET', headers: { 'content-type': 'application/json' } }); } catch {
+      jsonRes(res, 502, { ok: false, error: 'daemon_proxy_failed', retryable: true });
+      return;
+    }
+    await relay(res, upstream);
+  };
+  // A step refused as bot_mismatch: the draft changed hands meanwhile — if
+  // to the target (another tab's handoff landed), that is this one's answer.
+  const movedToTarget = (step: { body: Record<string, unknown> | undefined }) =>
+    step.body?.error === 'bot_mismatch' && workflowDraftOwner(deps.runsDir, runId) === target;
+  if (owner === target) {
+    await answerMoved();
+    return;
+  }
+  const who = await call(target, WORKFLOW_INITIATOR_PATH, { larkAppId: target });
+  if (!who) { jsonRes(res, 502, { ok: false, error: 'daemon_proxy_failed', retryable: true }); return; }
+  if (who.body?.ok !== true) { answer(res, who); return; }
+  const baseVersion = typeof body.baseVersion === 'number' ? body.baseVersion : undefined;
+  const prepared = await call(owner, `${draftPath}/handoff/prepare`, { toLarkAppId: target, ...(baseVersion !== undefined ? { baseVersion } : {}) });
+  if (!prepared) { jsonRes(res, 502, { ok: false, error: 'daemon_proxy_failed', retryable: true }); return; }
+  if (prepared.body?.ok !== true || typeof prepared.body.token !== 'string') {
+    if (movedToTarget(prepared)) await answerMoved(); else answer(res, prepared);
+    return;
+  }
+  const accepted = await call(target, `${draftPath}/handoff/accept`, { token: prepared.body.token });
+  if (!accepted) { jsonRes(res, 502, { ok: false, error: 'daemon_proxy_failed', retryable: true }); return; }
+  if (accepted.body?.ok !== true && movedToTarget(accepted)) { await answerMoved(); return; }
+  // A refused accept leaves the handoff ready on the old bot: the page offers
+  // 「继续更换」 / 「取消更换」 (and the draft as it stands now).
+  if (accepted.body?.ok !== true && prepared.body.draft) {
+    answer(res, { status: accepted.status, body: { ...accepted.body, draft: prepared.body.draft } });
+    return;
+  }
+  answer(res, accepted);
 }
 
 // ─── 编排 Bot 下拉框（§4.1，D3）─────────────────────────────────────────────
@@ -265,6 +395,10 @@ export interface WorkflowOrchestratorBotOption {
   cliId: string;
   online: boolean;
   unavailable?: { code: WorkflowOrchestratorUnavailableCode; why: string };
+  /** Its latest model call recorded on a draft failed, and none went through
+   *  since (read from the draft records; no model is called to find out).
+   *  Shown next to the option, never blocking. */
+  recentFailure?: WorkflowDraftFailureSummary;
 }
 
 /**
@@ -277,6 +411,7 @@ export function workflowOrchestratorBotOptions(
   bots: readonly BotConfig[],
   isOnline: (larkAppId: string) => boolean,
   nameOf: (larkAppId: string) => string,
+  recentFailures: ReadonlyMap<string, WorkflowDraftFailureSummary> = new Map(),
 ): WorkflowOrchestratorBotOption[] {
   return bots.map((bot) => {
     const online = isOnline(bot.larkAppId);
@@ -292,6 +427,7 @@ export function workflowOrchestratorBotOptions(
       cliId: bot.cliId,
       online,
       ...(code ? { unavailable: { code, why: why ?? 'daemon 不在线' } } : {}),
+      ...(recentFailures.get(bot.larkAppId) ? { recentFailure: recentFailures.get(bot.larkAppId)! } : {}),
     };
   });
 }

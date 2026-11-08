@@ -98,7 +98,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'steward',
     tab: 'sessions',
     titleKey: 'botDefaults.sectionSteward',
-    fieldKeys: ['botDefaults.stewardEnabled', 'botDefaults.stewardChat', 'botDefaults.stewardDecisionCards', 'botDefaults.stewardAutoJoin', 'botDefaults.stewardAutoJoinSolo', 'botDefaults.stewardCloseHints', 'botDefaults.stewardGuide'],
+    fieldKeys: ['botDefaults.stewardEnabled', 'botDefaults.stewardChat', 'botDefaults.stewardDecisionCards', 'botDefaults.stewardAutoJoin', 'botDefaults.stewardAutoJoinSolo', 'botDefaults.stewardCloseHints', 'botDefaults.stewardTaskHints', 'botDefaults.stewardGuide'],
   },
   {
     id: 'substitute',
@@ -108,6 +108,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.substituteEnabled', 'botDefaults.substituteTargets', 'botDefaults.substituteChats',
       'botDefaults.substituteExcludedChats', 'botDefaults.substituteReplyMode', 'botDefaults.substituteDisclosure',
       'botDefaults.substituteControlCard', 'botDefaults.substituteTopicGroups', 'botDefaults.substituteTopicActive',
+      'botDefaults.substituteKeywords',
     ],
   },
   {
@@ -302,6 +303,7 @@ export type BotSubstituteTarget = {
 export type BotSubstituteMode = {
   enabled: boolean;
   targets: BotSubstituteTarget[];
+  keywords?: string[];
   disclosure: 'prefix' | 'none';
   chats?: string[];
   excludedChats?: string[];

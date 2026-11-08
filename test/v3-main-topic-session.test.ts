@@ -35,6 +35,9 @@ import {
 } from '../src/core/workflow-node-session.js';
 import { workflowNodeSessionEntry } from '../src/im/lark/workflow-sidebar-entry.js';
 
+/** The directory decision these runs (none pins a working dir) hand admitInbound. */
+const UNPINNED = { kind: 'default' } as const;
+
 // A handoff admitInbound refuses records the refusal in the dispatch
 // registry fire-and-forget, then tells the main bot. Teardown waits until
 // every refusal of the test has reached the main bot — its registry write is
@@ -420,7 +423,7 @@ describe('F5 (second review): a marker whose attempt ended out of sight does not
     // B's binding write prunes A's entry (revocation included).
     await bindingFor(world.dataDir, B, 'f5-b', clock.t);
     expect(daemon.isRevoked(A)).toBe(false);
-    const out = daemon.admitInbound(bBinding(world.dataDir), 'om_h_b', 'cli_a', undefined, ds.session.workflowNode);
+    const out = daemon.admitInbound(bBinding(world.dataDir), 'om_h_b', 'cli_a', undefined, ds.session.workflowNode, UNPINNED);
     expect(out.start || !out.reason.includes('另一个工作流节点')).toBe(true);
     expect(ds.session.workflowNode).toMatchObject({ closedAt: expect.any(String) });
   });
@@ -443,7 +446,7 @@ describe('F5 (second review): a marker whose attempt ended out of sight does not
     const daemon = createWorkflowNodeDaemon({ ...wiringDeps(world.dataDir, run, [ds], []), now: () => clock.t });
     await bindingFor(world.dataDir, B, 'f5-b', clock.t);
     const busy = () => {
-      const out = daemon.admitInbound(bBinding(world.dataDir), 'om_h_b', 'cli_a', undefined, ds.session.workflowNode);
+      const out = daemon.admitInbound(bBinding(world.dataDir), 'om_h_b', 'cli_a', undefined, ds.session.workflowNode, UNPINNED);
       return !out.start && out.reason.includes('另一个工作流节点');
     };
     // Never started: acceptance + timeout (600 s) + grace (1 h) + slack (10 min).
@@ -480,7 +483,7 @@ describe('F5 (second review): a marker whose attempt ended out of sight does not
     await bindingFor(world.dataDir, B, 'f5-b', clock.t);
     // Past the default node timeout + grace + slack, well inside the ceiling.
     clock.t += (1800 + 3600 + 600 + 60) * 1000;
-    const out = daemon.admitInbound(bBinding(world.dataDir), 'om_h_b', 'cli_a', undefined, ds.session.workflowNode);
+    const out = daemon.admitInbound(bBinding(world.dataDir), 'om_h_b', 'cli_a', undefined, ds.session.workflowNode, UNPINNED);
     expect(out).toMatchObject({ start: false, reason: expect.stringContaining('另一个工作流节点') });
     expect(ds.session.workflowNode?.closedAt).toBeUndefined();
   });
@@ -492,7 +495,7 @@ describe('F5 (second review): a marker whose attempt ended out of sight does not
     const ds = session('sess-a', markerOf(A, 'f5-a', clock.t));
     const daemon = createWorkflowNodeDaemon({ ...wiringDeps(world.dataDir, run, [ds], []), now: () => clock.t });
     await bindingFor(world.dataDir, B, 'f5-b', clock.t);
-    const out = daemon.admitInbound(bBinding(world.dataDir), 'om_h_b', 'cli_a', undefined, ds.session.workflowNode);
+    const out = daemon.admitInbound(bBinding(world.dataDir), 'om_h_b', 'cli_a', undefined, ds.session.workflowNode, UNPINNED);
     expect(out.start || !out.reason.includes('另一个工作流节点')).toBe(true);
     expect(ds.session.workflowNode).toMatchObject({ closedAt: expect.any(String) });
   });
@@ -602,7 +605,7 @@ describe('ADV-3: one main-topic session carries one node at a time', () => {
     const { lookupWorkflowHandoff, readDispatchRegistryLoose } = await import('../src/core/workflow-handoff-binding.js');
     const found = lookupWorkflowHandoff({ registry: readDispatchRegistryLoose(a.world.dataDir), dispatchRoot: b.attempt.handoffMessageId!, secret: SECRET });
     if (found.kind !== 'workflow') throw new Error('no binding');
-    const admission = daemon.admitInbound(found.binding, b.attempt.handoffMessageId!, 'cli_a', undefined, ds.session.workflowNode);
+    const admission = daemon.admitInbound(found.binding, b.attempt.handoffMessageId!, 'cli_a', undefined, ds.session.workflowNode, UNPINNED);
     expect(admission).toMatchObject({ start: false, reason: expect.stringContaining('正在执行另一个工作流节点') });
     expect(ds.session.workflowNode?.nonce).toBe(a.marker.nonce);
     // The refusal is recorded, then sent, in the background (behind a file lock).
@@ -611,7 +614,7 @@ describe('ADV-3: one main-topic session carries one node at a time', () => {
     // The same handoff again (a re-delivery), or one after the first ended or
     // was revoked: not refused as busy (the next gate is the run's directory).
     const notBusy = (existing: WorkflowNodeSessionMarker) => {
-      const out = daemon.admitInbound(found.binding, b.attempt.handoffMessageId!, 'cli_a', undefined, existing);
+      const out = daemon.admitInbound(found.binding, b.attempt.handoffMessageId!, 'cli_a', undefined, existing, UNPINNED);
       return out.start || !out.reason.includes('另一个工作流节点');
     };
     expect(notBusy(b.marker)).toBe(true);

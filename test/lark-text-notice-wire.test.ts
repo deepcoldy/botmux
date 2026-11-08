@@ -164,15 +164,17 @@ describe('dashboard resume notice reaches Feishu wrapped once', () => {
     }
   }
 
-  it.each(LOCALES)('ordinary resume ($lang) resolves the bot locale and keeps the CLI name', async ({ lang, hasCjk }) => {
-    const fragment = lang === 'en' ? 'Session resumed through the command line' : '会话已通过命令行恢复';
-    const otherFragment = lang === 'en' ? '会话已通过命令行恢复' : 'Session resumed through the command line';
+  // The route also serves the Dashboard session row's resume button.
+  it.each(LOCALES)('ordinary resume ($lang) resolves the bot locale, keeps the CLI name and names no caller', async ({ lang, hasCjk }) => {
+    const fragment = lang === 'en' ? 'Session resumed' : '会话已恢复';
+    const otherFragment = lang === 'en' ? '会话已恢复' : 'Session resumed';
     const w = await resumeOnce(lang, { root: 'om_resume_root', cliId: 'codex' });
     expect(w.api).toBe('reply');
     expect(w.path).toMatchObject({ message_id: 'om_resume_root' });
     const notice = expectSingleWrap(w.data.content, '🔄');
     expect(notice).toContain(fragment);
     expect(notice).not.toContain(otherFragment);
+    expect(notice).not.toMatch(/command line|命令行/i);
     expect(notice).toContain('Codex');
     expect(/[一-鿿]/u.test(notice)).toBe(hasCjk);
   });

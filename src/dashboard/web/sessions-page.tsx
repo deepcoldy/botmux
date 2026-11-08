@@ -33,7 +33,6 @@ import { FeedGroupPicker } from './feed-group-picker.js';
 import { ModalDialog } from './modal-dialog.js';
 import { FeedGroupAuthOverlay, FeedGroupAuthPrompt, useFeedGroups } from './feed-groups.js';
 import { BotMultiSelect } from './bot-multi-select.js';
-import { SessionHorizontalScrollbar } from './session-horizontal-scrollbar.js';
 import {
   normalizeSessionsViewMode,
   readStoredCreateKeepOpen,
@@ -103,6 +102,8 @@ import {
   ui,
 } from './ui.js';
 import { isOffBoardDormant, type SessionKanbanColumn } from './kanban-model.js';
+import { deriveSessionTaskStatus } from '../../core/session-task-status.js';
+import { sessionTaskStatusText, statusFilterLabel, taskTone } from './session-task-view.js';
 import {
   SessionsKanbanView,
   type SessionsKanbanIcons,
@@ -196,9 +197,9 @@ function windowStorage(): Storage | undefined {
   return typeof window === 'undefined' ? undefined : window.localStorage;
 }
 
-function StatusBadge(props: { status: unknown }): React.JSX.Element {
-  const raw = String(props.status ?? 'unknown');
-  return <span className={`status status-${cssToken(raw)}`}>{sessionStatusText(raw)}</span>;
+function StatusBadge(props: { row: any }): React.JSX.Element {
+  const tone = taskTone(deriveSessionTaskStatus(props.row));
+  return <span className={`status status-task-${tone}`}>{sessionTaskStatusText(props.row)}</span>;
 }
 
 /** 任务态徽标：机器可能空闲，但 transcript 里还有未完成的 TODO。挂在卡片上让人
@@ -509,7 +510,7 @@ function SessionsFilters(props: {
   // 不再提供与默认项完全等价的「全部（含已关闭）」；默认项文案也按视图区分。
   const kanbanKeepsClosed = props.viewMode === 'kanban';
   const statusOptions: ChatFilterOption[] = [
-    ...SESSION_STATUS_OPTIONS.map(status => ({ value: status, label: sessionStatusText(status) })),
+    ...SESSION_STATUS_OPTIONS.map(status => ({ value: status, label: statusFilterLabel(status) })),
     ...(kanbanKeepsClosed ? [] : [{ value: SESSION_STATUS_ANY, label: t('sessions.filters.statusAnyInclClosed') }]),
   ];
   const cliOptions: ChatFilterOption[] = CLI_FILTER_OPTIONS.map(cli => ({ value: cli, label: cli }));
@@ -834,7 +835,7 @@ export function SessionsTableBase(props: {
       case 'cliId':
         return <td data-label={labels.cliId}><span className={`badge cli-${cssToken(row.cliId)}`} title={row.runtimeId && row.runtimeId !== row.cliId ? `${row.cliId} / ${row.runtimeId}` : undefined}>{sessionCliDisplayName(row)}</span></td>;
       case 'status':
-        return <td data-label={labels.status}><StatusBadge status={row.status} /><TodoBadge row={row} /><LockChip row={row} /><SandboxDriftChip row={row} /><ModelPinChip row={row} /></td>;
+        return <td data-label={labels.status}><StatusBadge row={row} /><TodoBadge row={row} /><LockChip row={row} /><SandboxDriftChip row={row} /><ModelPinChip row={row} /></td>;
       case 'chat':
         return <td className="session-location-cell" data-label={labels.chat} title={sessionLocationTitle(row)}>{sessionLocationText(row)}</td>;
       case 'tokenIn':
@@ -1133,7 +1134,7 @@ function TerminalModal(props: { state: TerminalState | null; onClose: () => void
               <span className="term-modal-title-copy">
                 <span className="term-modal-title-main">
                   <TerminalNameEditor row={row} onRename={props.onRename} />
-                  <StatusBadge status={row.status} />
+                  <StatusBadge row={row} />
                 </span>
                 <span className="term-modal-subtitle">
                   <span>{botDisplayName(row)}</span>
@@ -1315,7 +1316,7 @@ function Drawer(props: {
               <IconActionButton id="drawer-close" className="card-act drawer-close-btn" icon={ICON.close} label={t('sessions.dismiss')} onClick={props.onClose} />
             </div>
             <span className="drawer-status-line">
-              <StatusBadge status={row.status} />
+              <StatusBadge row={row} />
               <TodoBadge row={row} />
               <LockChip row={row} />
             </span>
@@ -1989,16 +1990,9 @@ function SessionsPage(): React.JSX.Element {
     }
     const stage = viewStageRef.current;
     if (!stage) return;
-    // The table's local scrollbar is a sibling, excluded from scrollable
-    // overflow. Animate their common host so the stage doesn't retain its own
-    // transform/opacity stacking context beneath the scrollbar after fill:both.
-    // Other views keep the original stage animation (their host is contents).
     stage.classList.remove('sessions-view-stage-enter');
-    const host = stage.parentElement;
-    host?.classList.remove('sessions-view-stage-enter');
-    const animated = viewMode === 'table' && host ? host : stage;
-    void animated.offsetWidth;
-    animated.classList.add('sessions-view-stage-enter');
+    void stage.offsetWidth;
+    stage.classList.add('sessions-view-stage-enter');
   }, [viewMode]);
 
   useEffect(() => {
@@ -2113,7 +2107,7 @@ function SessionsPage(): React.JSX.Element {
     row: any,
     column: SessionKanbanColumn,
     position: number,
-    prev: { column: unknown; position: unknown },
+    prev: { column: unknown; columnAt: unknown; position: unknown },
   ): Promise<void> => {
     try {
       const r = await fetch(`/api/sessions/${encodeURIComponent(row.sessionId)}/board`, {
@@ -2124,12 +2118,14 @@ function SessionsPage(): React.JSX.Element {
       const body = await r.json().catch(() => ({}));
       if (!r.ok || body?.ok === false) {
         row.kanbanColumn = prev.column;
+        row.kanbanColumnAt = prev.columnAt;
         row.kanbanPosition = prev.position;
         refresh();
         if (r.status !== 401) toast(`${t('sessions.kanban.moveFail')}: ${body?.error ?? r.status}`, { kind: 'error' });
       }
     } catch (e) {
       row.kanbanColumn = prev.column;
+      row.kanbanColumnAt = prev.columnAt;
       row.kanbanPosition = prev.position;
       refresh();
       toast(`${t('sessions.kanban.moveFail')}: ${e}`, { kind: 'error' });
@@ -2144,8 +2140,9 @@ function SessionsPage(): React.JSX.Element {
       if (move.row.status === 'closed' && move.column !== 'done') continue;
       const row = store.sessions.get(sessionId);
       if (!row) continue;
-      const prev = { column: row.kanbanColumn, position: row.kanbanPosition };
+      const prev = { column: row.kanbanColumn, columnAt: row.kanbanColumnAt, position: row.kanbanPosition };
       row.kanbanColumn = move.column;
+      row.kanbanColumnAt = Date.now();
       row.kanbanPosition = move.position;
       void persistBoardMove(row, move.column, move.position, prev);
       changed = true;
@@ -2743,12 +2740,10 @@ function SessionsPage(): React.JSX.Element {
         onLock={locked => void runBulkLock(locked)}
       />
 
-      <div className={viewMode === 'table' ? 'sessions-table-scroll-host' : 'sessions-scroll-host-contents'}>
       <div
         ref={viewStageRef}
         className="sessions-view-stage"
         data-view={viewMode}
-        data-local-horizontal-scrollbar={bootstrapped && viewMode === 'table' ? '' : undefined}
       >
         {!bootstrapped ? <SessionsSkeleton /> : null}
         {bootstrapped && viewMode === 'table' ? (
@@ -2800,8 +2795,6 @@ function SessionsPage(): React.JSX.Element {
           />
         </div>
         ) : null}
-      </div>
-      {bootstrapped && viewMode === 'table' ? <SessionHorizontalScrollbar scrollRef={viewStageRef} /> : null}
       </div>
       {bootstrapped && viewMode === 'kanban' && dormantOffBoard > 0 ? (
         <p className="sessions-dormant-hint">

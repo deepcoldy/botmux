@@ -24,7 +24,7 @@
 | `/restart` | 重启 CLI 进程（保留 session 上下文） |
 | `/close` | 关闭会话并发送可恢复卡片（含 CLI 自身 resume 命令）。关闭后再发消息会开新会话 |
 | `/resume [会话id]` | 本话题/本群**没有会话**时恢复已关闭的会话：不带参数恢复这里最近关闭的一个；带别处的会话 id 时像 `/fork` 一样复制到这里继续（继承完整上下文，原会话不动；仅支持可 fork 的 CLI；Codex / TraeX 的已关闭会话无法确认启动形态，需到原处恢复）。**有会话时**原样交给 CLI 自带的 `/resume`。有对话权限即可使用；跨位置复制凭会话 id（只在原聊天可见、不可猜），信任级别同 `/fork` |
-| `/dismiss` | 专属会话群顶层专用：卡片确认后关闭群内本机 Bot 的全部会话，再解散整个群（仅建群者本人且具备操作权限；代码与 worktree 保留；私聊、普通群、子话题、adopt 会话不支持）。只想关闭会话、保留群聊请用 `/close` |
+| `/dismiss` | 卡片确认后关闭群内本机 Bot 的全部会话，再解散整个群。专属会话群：只能在顶层发，仅建群者本人且具备操作权限；普通群和话题群：需要操作权限，并且 Bot 是群主、是群里唯一的 Bot，否则直接回复没有权限、不关任何会话。代码与 worktree 保留；私聊、adopt 会话不支持。只想关闭会话、保留群聊请用 `/close` |
 | `/cleanup-wt <ID>` | worktree 最终删除失败后重试已持久化的清理任务；删除前会重新校验权限、活动会话、worktree 身份和安全状态 |
 | `/fork <任务>` | 继承当前会话的完整上下文，新建一个并行的分身话题（私聊、话题群、普通群的会话话题内都能用）；源会话原样继续（Claude 系 / Codex 或 TraeX 终端模式） |
 | `/forklist` | 重发当前会话的分身任务面板，显示运行/结束状态和子话题链接 |
@@ -196,7 +196,9 @@ Claude Code 等其它 CLI 的 `/effort` 仍按下面的透传规则处理。
 
 `/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` —— 字面送达底层 CLI，交给它的内置命令处理（Codex CLI / App 的 `/effort` 例外，见上文）。
 
-`/fast` 仅对 Codex 生效：切换 Codex 原生的 service tier 档位，流式卡片会显示只读的 `⚡ <档位>` 徽标，如实反映 Codex 实际运行的档位。在 RPC 输入模式或 Riff 后端上，按键到不了 Codex 执行器，因此 `/fast` 在这些后端会 fail-closed 给出明确提示，而非静默失效。
+**Riff 后端无透传面**：Riff 没有本地 CLI，上述斜杠命令不会以按键方式送达，而是按普通消息封装成**一次远端任务**，命令文本也不会进入任何斜杠解析器。因此在 Riff 会话里发 `/compact`、`/model` 等（含 `customPassthroughCommands` 自定义项）等价于发一条普通对话文本，不会被拆成多次远端任务。
+
+`/fast` 仅对 Codex 生效：切换 Codex 原生的 service tier 档位，流式卡片会显示只读的 `⚡ <档位>` 徽标，如实反映 Codex 实际运行的档位。在 RPC 输入模式或 Mojo 后端上，`/fast` 仍走透传分支，会被 fail-closed 明确拒绝、给出提示，而不会静默生效。Riff 后端则按上一段处理：`/fast` 不进透传，而是作为普通消息封装成一次远端任务，同样不会切换档位。
 
 部分 CLI 还有 adapter 默认放行的命令：Claude Code / Codex 默认放行 `/goal`，因此新话题第一条发 `/goal ...` 也会先启动/选择仓库，再把 `/goal ...` 原样投给 CLI。
 

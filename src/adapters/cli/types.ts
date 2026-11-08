@@ -300,6 +300,13 @@ export interface CliAdapter {
     modelBackendVariant?: 'standard' | 'max';
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
+    /** Version of the CLI binary this spawn will run ("1.17.11", "2.1.4", …), as
+     *  last probed by the daemon (`getCurrentCliVersion`). Adapters use it to gate
+     *  flags that only newer releases accept — passing an unknown flag makes some
+     *  CLIs print help and exit 1, which the daemon amplifies into a crash loop.
+     *  Missing or "unknown" means "not probed": adapters must then behave as if the
+     *  flag is unsupported (keep the old argv) rather than guess. */
+    cliVersion?: string;
     /** Codex App only: restricted local browser extension bridge. */
     codexBrowser?: import('../../core/codex-browser-config.js').CodexBrowserConfig;
     /** Codex-family only: when true (default from the global `bypassCodexHookTrust`
@@ -527,6 +534,16 @@ export interface CliAdapter {
     failureReason?: string;
     recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
   }>;
+
+  /** Press the composer's SUBMIT key once for a draft already parked in the
+   *  input box (the cold-start late-SessionStart re-submit path). Must use the
+   *  same key resolution as {@link writeInput}: users can remap submit
+   *  (keybindings.json / CLAUDE_CODE_SUBMIT_KEY) and bind plain Enter to
+   *  chat:newline, in which case sending Enter would merely insert a newline.
+   *  Returns false when no terminal-sendable submit key is configured or the
+   *  backend could not confirm the send (ambiguous — callers must not retry on
+   *  a guess). Adapters without this method get a plain Enter. */
+  pressComposerSubmit?(pty: PtyHandle): boolean;
 
   /** Optional deterministic evidence that a slash-command LINE typed into the
    *  TUI (a bot startup command such as `/effort xhigh`) was executed, e.g.

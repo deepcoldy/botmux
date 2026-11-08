@@ -14,14 +14,15 @@ import { sessionPromptInjection } from '../../core/prompt-injection.js';
 import { normalizeCardActionData } from './card-action-data.js';
 import { logCardActionDiagnostics } from './card-action-diagnostics.js';
 import { existsSync } from 'node:fs';
-import { basename as pathBasename, dirname, join } from 'node:path';
+import { basename as pathBasename, join } from 'node:path';
 import { closeResidualIsLocal, describeCloseResidual } from '../../core/close-residual.js';
 import { config } from '../../config.js';
 import { replyCardKey, updateTurnReplyCard } from '../../core/turn-reply-card.js';
 import { TurnReplyCardStore, replyCardIsTerminal } from '../../services/turn-reply-card.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
-import { writeSessionModelPin } from '../../core/worker-pool.js';
+import { writeSessionModelPin, recordTurnExplicitMention } from '../../core/worker-pool.js';
+import { messageMentionsBot } from './message-parser.js';
 import { validateModelPin } from '../../core/model-pin.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
@@ -97,7 +98,7 @@ import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { AutoWorktreeFailClosedError } from '../../services/default-worktree.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
-import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
+import { cliHasNoRawPassthroughSurface, cliSupportsCompactAction } from '../../core/passthrough-commands.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
 import { sessionReasoningControl, updateCodexCliEffort, topicReasoningControl, setTopicReasoningEffort, isSessionRestartInFlight, setSessionReasoningEffort, sessionSupportsIdleAutoCompact, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, substituteCardControlFor, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
@@ -116,7 +117,7 @@ import type { DaemonSession } from '../../core/types.js';
 import { readPrincipalLaneTurnBinding } from '../../core/principal-lane-turn.js';
 import { buildTerminalUrl, platformTerminalReadEntryActive } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
-import { createRepoWorktree, removeRepoWorktree, restoreDeletedWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
+import { createRepoWorktree, removeRepoWorktree, restoreDeletedWorktree, dirSuffixForBranch, pushWorktreeBranch, worktreeTargetPath } from '../../services/git-worktree.js';
 import { repinSessionWorkingDir } from '../../core/session-cwd.js';
 import { answerRestartWithoutWorkingDir, reclaimUnstartedOpening, recoveryCardForm, workingDirRecoveryPending } from '../../core/working-dir-recovery.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
@@ -552,8 +553,8 @@ function stringListFromLarkMultiSelect(raw: unknown): string[] {
 
 function multiWorktreeParentPath(repoPaths: string[], name: string): string {
   const first = repoPaths[0];
-  const parentRoot = first ? dirname(first) : process.cwd();
-  return join(parentRoot, dirSuffixForBranch(name));
+  const dirName = dirSuffixForBranch(name);
+  return first ? worktreeTargetPath(first, dirName) : join(process.cwd(), dirName);
 }
 
 function worktreeChildNameForRepo(repoPath: string, projects: ProjectInfo[] | undefined): string {
@@ -889,6 +890,15 @@ export async function commitRepoSelection(
       // the user can retry this exact selection without losing the first turn.
       const pendingTurnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
       if (!emptyStart && pendingTurnId) await prepareTurn?.(ds, pendingTurnId);
+      // 被 @ 回执的来源记录挂在交给 forkWorker 的同一 turnId 上（turn_terminal 带回的就是它）；
+      // raw 冷启动的 turnId 不经 forkWorker，而是在 prompt_ready 随 raw_input 下发，这里不记。
+      if (!emptyStart && !pendingRawInput && pendingTurnId) {
+        recordTurnExplicitMention(ds, pendingTurnId, messageMentionsBot(
+          { mentions: ds.pendingMentions },
+          ds.larkAppId,
+          selfBot.botOpenId,
+        ));
+      }
       forkWorker(
         ds,
         prompt,
@@ -1868,8 +1878,8 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     const durationMs = formLimits ? formLimits.durationMs : claim.durationMs;
     const expiresAt = durationMs === undefined ? undefined : Date.now() + durationMs;
     // 触发本次授权申请的原始消息事件：授权成功后重放，用户无需再 @ 一遍。
-    // 自助申请卡每次只对应一个 target，取第一个即可。
-    const pendingMessage = claim.messageData;
+    // 自助申请卡每次只对应一个 target，取第一个即可。待处理期间各 target 暂存的消息排在它后面。
+    const replayMessages = [...(claim.messageData ? [claim.messageData] : []), ...(claim.heldMessages ?? [])];
     const granted: string[] = [];
     const failed: Array<{ openId: string; reason: string }> = [];
     for (const tt of targets) {
@@ -1890,6 +1900,18 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     if (granted.length === 0) {
       claim.restore();
       return { toast: { type: 'error', content: t('card.grant.toast_failed', { reason: failed[0]?.reason ?? 'unknown' }, loc) } };
+    }
+    // 授权成功后按序重放触发本次申请的原始消息和待处理期间暂存的消息，用户无需再 @ 一遍。
+    // replayGrantedMessage 内部异步执行（setImmediate）、按调用顺序串行处理，不阻塞 callback 响应。
+    // 授权此刻已生效：必须在下面任何 await 之前入队，否则发送方新来的实时消息会插到暂存消息前面、先扣额度。
+    if (deps.replayGrantedMessage) {
+      for (const replayData of replayMessages) {
+        try {
+          deps.replayGrantedMessage(replayData, larkAppId);
+        } catch (err) {
+          logger.warn(`replay granted message failed (grant still applied): ${err}`);
+        }
+      }
     }
     // 部分成功：失败 target 的 pending 已随核销一起清掉——卡马上要变终态（owner 无法再点原卡重试），
     // 留着的话 isThrottled 会挡住失败 target 后续的自助申请直到 pending 过期（已落盘，重启也清不掉）。
@@ -1955,15 +1977,6 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         })
         .catch(err => logger.error(`grant post-callback background tasks failed: ${err}`));
     }
-    // 授权成功后重放触发本次申请的原始消息，用户无需再 @ 一遍。
-    // replayGrantedMessage 内部异步执行（setImmediate），不阻塞 callback 响应。
-    if (pendingMessage && deps.replayGrantedMessage) {
-      try {
-        deps.replayGrantedMessage(pendingMessage, larkAppId);
-      } catch (err) {
-        logger.warn(`replay granted message failed (grant still applied): ${err}`);
-      }
-    }
     return resultCardBody;
   }
 
@@ -2019,7 +2032,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     // card first, then run the same path as a typed `/dismiss --confirm=`,
     // which re-checks permission and state and reports into the group.
     return {
-      card: { type: 'raw', data: buildDismissSubmittedCard(loc) },
+      card: { type: 'raw', data: buildDismissSubmittedCard(loc, String(value.ordinary_group) === 'true') },
       afterAck: () => handleCommand('/dismiss', chatId, {
         messageId: cardMessageId ?? `dismiss-confirm-${chatId}`,
         rootId: chatId,
@@ -5094,21 +5107,45 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // button whose /compact gets dropped as non-frame input or, worse, delivered to
       // the model as an ordinary user message. Refuse here too, so the button path can
       // never reopen a channel the router deliberately closed.
-      if (cliHasNoRawPassthroughSurface(sessionCliId(ds), { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })) {
+      const compactCliId = sessionCliId(ds);
+      if (!cliSupportsCompactAction(compactCliId, { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })) {
         return { toast: { type: 'warning', content: t('card.action.compact_unsupported', undefined, locDs) } };
+      }
+      // ACP compaction is a separate turn, not interactive steering. Wait for
+      // the business turn and any queued input before rotating reply ownership.
+      if (compactCliId === 'minimax' && (!ds.cliReady || !sessionAcceptsDirectCommand(ds))) {
+        return { toast: { type: 'warning', content: t('card.action.compact_busy', undefined, locDs) } };
       }
       if (!deps.deliverPassthroughCommand) {
         return { toast: { type: 'warning', content: t('card.action.compact_unsupported', undefined, locDs) } };
       }
-      deps.deliverPassthroughCommand(ds, '/compact', {
-        anchor: sessionAnchorId(ds),
-        senderOpenId: operatorOpenId,
-        senderIsBot: false,
-        messageId: cardMessageId ?? `compact-${Date.now()}`,
-        // A chat-scope card's root_id is the chat id, not a message: passing it
-        // on would freeze an unreplyable thread target for this turn.
-        replyRootId: ds.scope === 'chat' ? undefined : rootId,
-      });
+      let delivered = false;
+      const onDelivered = () => {
+        delivered = true;
+        // Fence at IPC acceptance, before subsequent card persistence can
+        // throw. A second click must not replay an already submitted command.
+        if (compactCliId === 'minimax') ds.cliReady = false;
+      };
+      try {
+        const accepted = deps.deliverPassthroughCommand(ds, '/compact', {
+          anchor: sessionAnchorId(ds),
+          senderOpenId: operatorOpenId,
+          senderIsBot: false,
+          messageId: cardMessageId ?? `compact-${Date.now()}`,
+          ...(compactCliId === 'minimax' ? { turnId: `compact-${randomUUID()}` } : {}),
+          // A chat-scope card's root_id is the chat id, not a message: passing it
+          // on would freeze an unreplyable thread target for this turn.
+          replyRootId: ds.scope === 'chat' ? undefined : rootId,
+          onDelivered,
+        });
+        // Legacy injected dependencies return void rather than an acceptance receipt.
+        if (!delivered && accepted !== false) onDelivered();
+      } catch (err) {
+        logger.warn(`[${tag(ds)}] compact command delivery failed: ${String(err)}`);
+      }
+      if (!delivered) {
+        return { toast: { type: 'warning', content: t('card.action.compact_failed', undefined, locDs) } };
+      }
       logger.info(`[${tag(ds)}] compact_session: /compact passthrough sent`);
       return { toast: { type: 'success', content: t('card.action.compact_sent', { cliName: sessionCliDisplayName(ds) }, locDs) } };
     }
