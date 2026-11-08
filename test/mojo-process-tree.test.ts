@@ -21,6 +21,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   DEFAULT_PROC_ROOT,
   MOJO_TREE_NONCE_ENV,
+  isIncompleteEnvironRead,
   isProcRootOverridden,
   isVanishedProcError,
   mojoTreeScanSupported,
@@ -126,6 +127,42 @@ describe('scanMojoTree enumeration', () => {
     const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
     if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
     expect(scan.members).toEqual([]);
+  });
+});
+
+describe('isIncompleteEnvironRead tells an exec-cut read from a complete environ', () => {
+  const NUL = String.fromCharCode(0);
+  it('treats a 0-byte read (exec between mm swap and env write) as incomplete', () => {
+    expect(isIncompleteEnvironRead('')).toBe(true);
+  });
+  it('treats a non-empty block missing its trailing NUL (truncated mid-exec) as incomplete', () => {
+    // The tree nonce is appended last, so a block cut before the NUL boundary
+    // cannot contain it; finalising on it would lose a setsid escapee.
+    expect(isIncompleteEnvironRead('PATH=/bin' + NUL + 'BIG_0=' + 'x'.repeat(40))).toBe(true);
+  });
+  it('treats a complete NUL-terminated environ (with or without the nonce) as final', () => {
+    expect(isIncompleteEnvironRead('PATH=/bin' + NUL)).toBe(false);
+    expect(isIncompleteEnvironRead(`${MOJO_TREE_NONCE_ENV}=${NONCE}` + NUL)).toBe(false);
+  });
+  it('keeps a genuinely empty env (env -i) in the re-read set, never a false member', () => {
+    // It reads '' on every attempt, so it stays "incomplete" through the budget
+    // and is only ever unclaimed — never upgraded to a member.
+    expect(isIncompleteEnvironRead('')).toBe(true);
+  });
+});
+
+describe('a truncated non-empty environ is re-read but never falsely claimed', () => {
+  it('leaves a permanently truncated escapee unclaimed without failing the scan', () => {
+    const NUL = String.fromCharCode(0);
+    proc(100, { ppid: 1, pgid: 100 });
+    // setsid escapee: ppid 1, own group, so only the env nonce could claim it.
+    // A static truncated environ (no trailing NUL, nonce absent) is re-read on
+    // every round, exhausts the budget, and stays a non-member — never a crash
+    // and never a false positive. Plain files keep this free of FIFO scheduling.
+    proc(300, { ppid: 1, pgid: 300, env: 'PATH=/bin' + NUL + 'BIG_0=' + 'x'.repeat(40) });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members.map(m => m.pid)).not.toContain(300);
   });
 });
 
