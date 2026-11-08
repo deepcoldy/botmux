@@ -10992,20 +10992,23 @@ async function handleSessionLifecycleSignal(req: IncomingMessage, res: ServerRes
     }
   }
   if (ds?.worker) {
+    const signal = compaction ? 'claude-compaction-start' : 'session-ready';
     const requestId = randomUUID();
     const ack = waitForSessionReadyAck(requestId, 2_000);
     try {
       ds.worker.send(compaction
         ? { type: 'claude_compaction_start', startedAtMs: raw.startedAtMs as number, requestId }
         : { type: 'session_ready', source, requestId } as DaemonToWorker);
-      logger.info(`[${sessionId.slice(0, 8)}] session-ready signal forwarded to worker (source=${source ?? '?'})`);
+      logger.info(compaction
+        ? `[${sessionId.slice(0, 8)}] ${signal} signal forwarded to worker (startedAtMs=${raw.startedAtMs})`
+        : `[${sessionId.slice(0, 8)}] ${signal} signal forwarded to worker (source=${source ?? '?'})`);
     } catch (err) {
       cancelSessionReadyAck(requestId);
-      logger.warn(`session-ready forward failed: ${err instanceof Error ? err.message : String(err)}`);
+      logger.warn(`${signal} forward failed: ${err instanceof Error ? err.message : String(err)}`);
     }
     const acknowledged = await ack;
     if (!acknowledged) {
-      logger.warn(`[${sessionId.slice(0, 8)}] session-ready worker ACK timed out; allowing hook to continue`);
+      logger.warn(`[${sessionId.slice(0, 8)}] ${signal} worker ACK timed out; allowing hook to continue`);
     }
   }
   return jsonRes(res, 200, { ok: true });
