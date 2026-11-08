@@ -476,7 +476,6 @@ MCP 进程启动时，如果能力已关闭或未 provision、插件不在 `allo
 
 同一个 stdio MCP 子进程重启后，一次性密钥通道目前不会再次交付，受保护工具会退回只读；需重建会话恢复。不同出站策略收集入口的用户错误提示尚待统一。
 
-||||||| 15acd8dde
 ### 按触发人身份调用 CLI（`triggerUserAuth`） {#trigger-user-auth}
 
 **默认关闭。** 打开后，这个 Bot 会话里的 `lark-cli` / `bytedcli` 用「发这条消息的人」自己的授权调用，而不是本机的登录态。适合多人共用一个 Bot：谁发的消息，就以谁的身份读文档、查日程、调内部平台。
@@ -510,7 +509,7 @@ v3.20 起，botmux 自己保存的飞书用户授权按「应用 + 授权人」�
 
 | 字段 | 说明 |
 |------|------|
-| `replyCardMode` | `legacy`（默认）：进度和答复分开发；`unified`：同一轮的进度、工具调用和最终答复都更新在一张卡里。支持未开沙盒的 Claude Code / Codex / Grok / TraeX / Pi 普通会话，从下一轮生效 |
+| `replyCardMode` | `legacy`（默认）：进度和答复分开发；`unified`：同一轮的进度、工具调用和最终答复都更新在一张卡里。支持未开沙盒的 Claude Code / Codex / Grok / TraeX / Pi / Kimi 普通会话，从下一轮生效 |
 | `replyCardShowTools` | 仅 `unified`：设 `false` 隐藏卡里的工具调用，思考摘要和进度照常显示 |
 | `disableStreamingCard` | `true` 时不发实时终端状态卡。Web 终端照常运行，最终答复照常发送 |
 | `hiddenStreamingCardButtons` | 隐藏实时卡上的按钮，可选 `output`、`terminal`、`writeLink`、`compact`、`stop`、`close`。例如 `["terminal", "writeLink", "close"]`。也可用 `/botconfig set hiddenStreamingCardButtons terminal,close` |
