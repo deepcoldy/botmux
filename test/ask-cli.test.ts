@@ -395,9 +395,9 @@ describe('botmux ask — CLI boundary', () => {
     let requestBody: Record<string, unknown> | undefined;
 
     const server = createServer(async (req, res) => {
-      let body = '';
-      for await (const chunk of req) body += chunk;
-      requestBody = JSON.parse(body) as Record<string, unknown>;
+      if (!isAskPost(req)) { req.resume(); res.writeHead(404).end(); return; }
+      const body = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+      if (body !== undefined) requestBody = body;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
         kind: 'answered',
@@ -486,9 +486,9 @@ describe('botmux ask — CLI boundary', () => {
     let requestBody: Record<string, unknown> | undefined;
 
     const server = createServer(async (req, res) => {
-      let body = '';
-      for await (const chunk of req) body += chunk;
-      requestBody = JSON.parse(body) as Record<string, unknown>;
+      if (!isAskPost(req)) { req.resume(); res.writeHead(404).end(); return; }
+      const body = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+      if (body !== undefined) requestBody = body;
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({
         kind: 'answered', answers: [['yes']], by: 'ou_test', comment: null, timedOut: false,
