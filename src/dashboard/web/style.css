@@ -35747,3 +35747,23 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .status-task-todo { background: color-mix(in srgb, var(--st-todo) 14%, transparent); color: var(--st-todo); }
 .status-task-idle { background: var(--surface-muted); color: var(--muted); }
 .status-task-closed { background: var(--surface-muted); color: var(--faint); }
+
+/* 决策看板：关联群里的子任务状态 */
+.dboard-hint-chip.is-task_delivered { background: var(--success-soft); color: var(--success); }
+.dboard-hint-chip.is-task_needs_you, .dboard-hint-chip.is-task_interrupted { background: var(--warning-soft); color: var(--warning); }
+.dboard-hint-banner.is-task_delivered { border-left-color: var(--success); background: var(--success-soft); }
+.dboard-hint-banner.is-task_needs_you, .dboard-hint-banner.is-task_interrupted { border-left-color: var(--warning); background: var(--warning-soft); }
+.dboard-row-task { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 6px; min-width: 0; color: var(--fg-2); font-size: var(--fs-12); }
+.dboard-row-task[data-fresh="true"] .dboard-task-label { font-weight: 600; }
+.dboard-task-label { flex: 0 0 auto; padding: 0 6px; border-radius: var(--radius-full); background: var(--surface-2, var(--info-soft)); color: var(--fg-2); }
+[data-task="delivered"] > .dboard-task-label { background: var(--success-soft); color: var(--success); }
+[data-task="needs_you"] > .dboard-task-label, [data-task="interrupted"] > .dboard-task-label { background: var(--warning-soft); color: var(--warning); }
+[data-task="working"] > .dboard-task-label { background: var(--info-soft); color: var(--info); }
+[data-task="unreadable"] > .dboard-task-label, [data-task="closed"] > .dboard-task-label, [data-task="no_session"] > .dboard-task-label { opacity: 0.75; }
+.dboard-task-time { flex: 0 0 auto; color: var(--muted); }
+.dboard-task-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 12em; }
+.dboard-tasks { display: grid; gap: 6px; margin: 8px 0; }
+.dboard-tasks-list { display: grid; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.dboard-task { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 8px; font-size: var(--fs-12); color: var(--fg-2); }
+.dboard-task-chat { flex: 0 0 auto; font-weight: 600; color: var(--fg-1, inherit); }
+.dboard-task .dboard-task-text { white-space: normal; overflow-wrap: anywhere; }

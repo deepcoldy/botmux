@@ -40,6 +40,8 @@ import {
 } from '../src/core/turn-outcome.js';
 import { messages as zhMessages } from '../src/i18n/zh.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { onSessionTaskEvent, type SessionTaskEvent } from '../src/core/session-task-events.js';
+import { publishAttentionPatch } from '../src/core/session-activity.js';
 
 const dataDir = mkdtempSync(join(tmpdir(), 'turn-outcome-'));
 afterAll(() => rmSync(dataDir, { recursive: true, force: true }));
@@ -57,14 +59,17 @@ function makeDs(sessionId: string, extra: Record<string, unknown> = {}): DaemonS
 
 const patches: Array<{ sessionId: string; patch: Record<string, unknown> }> = [];
 dashboardEventBus.subscribe(event => {
-  if (event.type === 'session.update') patches.push(event.body as never);
+  if (event.type === 'session.update' && 'lastTurn' in ((event.body as { patch?: object }).patch ?? {})) patches.push(event.body as never);
 });
+const taskEvents: SessionTaskEvent[] = [];
+onSessionTaskEvent(e => { taskEvents.push(e); });
 
 beforeEach(() => {
   h.stored.clear();
   h.writes.length = 0;
   h.failNextUpdate = false;
   patches.length = 0;
+  taskEvents.length = 0;
   clock += 60_000;
 });
 
@@ -318,13 +323,15 @@ describe('noteLateFinalReply', () => {
 
 describe('holdLastTurnThrough', () => {
   it('auto-compact activity does not push the current result out', () => {
-    const ds = makeDs('s-hold', { lastTurn: { turnId: 't1', outcome: 'delivered', at: clock - 10 } });
+    const ds = makeDs('s-hold', { chatId: 'oc_a', lastTurn: { turnId: 't1', outcome: 'delivered', at: clock - 10 } });
     expect(isMaintenanceTurnId('auto-compact:lx1')).toBe(true);
     expect(isMaintenanceTurnId('auto-compact:idle:lx1')).toBe(true);
     expect(isMaintenanceTurnId('om_123')).toBe(false);
     const held = holdLastTurnThrough(ds, clock);
     expect(held).toEqual({ turnId: 't1', outcome: 'delivered', at: clock - 10, heldThrough: clock });
     expect(patches).toEqual([{ sessionId: 's-hold', patch: { lastTurn: held } }]);
+    // 续期不是新结果，不再通知管家。
+    expect(taskEvents).toEqual([]);
     expect(deriveSessionTaskStatus({ status: 'idle', lastMessageAt: clock, lastTurn: held }).kind).toBe('delivered');
     expect(deriveSessionTaskStatus({ status: 'idle', lastMessageAt: clock + 1, lastTurn: held }).kind).toBe('idle');
   });
@@ -334,5 +341,45 @@ describe('holdLastTurnThrough', () => {
     ds.lastMessageAt = clock - 5;
     expect(holdLastTurnThrough(ds, clock)).toBeUndefined();
     expect(h.writes).toEqual([]);
+  });
+});
+
+describe('任务状态事件（给管家的子任务提醒）', () => {
+  it('已交付、中断、补登成已交付时按群发一次；没有输出、没有群、没写进去的不发', async () => {
+    const opts = { recoveryHandled: false, now, dataDir };
+    const ds = makeDs('s-ev', { chatId: 'oc_a' });
+    await recordTurnOutcome(ds, { turnId: 't1', status: 'completed' }, { ...opts, isFinalDelivered: () => true });
+    expect(taskEvents).toEqual([{ chatId: 'oc_a', sessionId: 's-ev' }]);
+    await recordTurnOutcome(ds, { turnId: 't2', status: 'failed', errorCode: 'api_error' }, { ...opts, isFinalDelivered: () => false });
+    expect(taskEvents).toHaveLength(2);
+    clock += 10;
+    ds.lastMessageAt = clock - 5;
+    await recordTurnOutcome(ds, { turnId: 't3', status: 'completed' }, { ...opts, isFinalDelivered: () => false });
+    expect(ds.session.lastTurn).toMatchObject({ turnId: 't3', outcome: 'no_output' });
+    expect(taskEvents).toHaveLength(2);
+    noteLateFinalReply(ds, 't3', { now, dataDir });
+    expect(taskEvents).toHaveLength(3);
+
+    h.failNextUpdate = true;
+    await recordTurnOutcome(ds, { turnId: 't4', status: 'completed' }, { ...opts, isFinalDelivered: () => true });
+    expect(taskEvents).toHaveLength(3);
+    const noChat = makeDs('s-nochat');
+    await recordTurnOutcome(noChat, { turnId: 't1', status: 'completed' }, { ...opts, isFinalDelivered: () => true });
+    expect(taskEvents).toHaveLength(3);
+  });
+
+  it('举手：同一次举手只发一次，新举手再发；放下不发', () => {
+    const ds = makeDs('s-hand', { chatId: 'oc_a' }) as DaemonSession & { agentAttention?: unknown };
+    publishAttentionPatch(ds);
+    expect(taskEvents).toEqual([]);
+    ds.agentAttention = { kind: 'decision', reason: '要不要合？', at: clock, source: 'agent' };
+    publishAttentionPatch(ds);
+    publishAttentionPatch(ds);
+    expect(taskEvents).toEqual([{ chatId: 'oc_a', sessionId: 's-hand' }]);
+    ds.agentAttention = undefined;
+    publishAttentionPatch(ds);
+    ds.agentAttention = { kind: 'decision', reason: '又来一个', at: clock + 1, source: 'agent' };
+    publishAttentionPatch(ds);
+    expect(taskEvents).toHaveLength(2);
   });
 });
