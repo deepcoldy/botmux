@@ -311,8 +311,8 @@ describe('Worker ready: set_display_mode re-sync', () => {
         worker: makeFakeWorker(),
         workerReady: true,
         workerPort: 9999,
-        workerViewToken: 'view_live',
-        workerCardViewToken: 'card_live',
+        workerViewToken: 'view_live'.padEnd(43, '0'),
+        workerCardViewToken: 'card_live'.padEnd(43, '0'),
         streamCardId: 'om_live_card',
         session: {
           ...makeDs().session,
@@ -716,21 +716,22 @@ describe('Worker ready: set_display_mode re-sync', () => {
   it('POST path forwards ready.turnId to sessionReply for initial alias cards', async () => {
     const fakeWorker = makeFakeWorker();
     const ds = makeDs({ streamCardPending: true, streamCardId: undefined, worker: fakeWorker });
+    const viewToken = 'view_cap'.padEnd(43, '0');
 
     setupActiveWorkerHandlers(ds, fakeWorker);
     fakeWorker.emit('message', {
       type: 'ready',
       port: 9999,
       token: 'tok_abc',
-      viewToken: 'view_cap',
+      viewToken,
       turnId: 'om_turn_ready',
     });
     await flush();
 
     expect(sessionReplyMock).toHaveBeenCalledTimes(1);
     expect(sessionReplyMock.mock.calls[0][4]).toBe('om_turn_ready');
-    expect(ds.workerViewToken).toBe('view_cap');
-    expect(JSON.stringify(sessionReplyMock.mock.calls[0][1])).toContain('viewToken=view_cap');
+    expect(ds.workerViewToken).toBe(viewToken);
+    expect(JSON.stringify(sessionReplyMock.mock.calls[0][1])).toContain(`viewToken=${viewToken}`);
     const logs = loggerInfoMock.mock.calls.flat().join('\n');
     expect(logs).toContain('viewToken=[redacted]');
     expect(logs).not.toContain('view_cap');

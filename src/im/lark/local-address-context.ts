@@ -15,10 +15,12 @@ function read(path: string): string {
   try { return existsSync(path) ? readFileSync(path, 'utf8').trim() : ''; } catch { return ''; }
 }
 
+/** A missing config section allows nothing; it must not fail the card render. */
 function hostLinkScope(): HostLinkScope {
+  const { web, dashboard } = config as Partial<typeof config>;
   return {
-    hosts: [config.web.externalHost, config.dashboard.externalHost],
-    dashboardPorts: [read(join(homedir(), '.botmux', '.dashboard-port')), String(config.dashboard.port)].filter(Boolean),
+    hosts: [web?.externalHost ?? '', dashboard?.externalHost ?? ''],
+    dashboardPorts: [read(join(homedir(), '.botmux', '.dashboard-port')), String(dashboard?.port ?? '')].filter(Boolean),
   };
 }
 
