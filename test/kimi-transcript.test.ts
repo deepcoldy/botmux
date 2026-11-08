@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { CotEntry } from '../src/types.js';
@@ -116,6 +116,33 @@ describe('Kimi session lookup by botmux session', () => {
     const env = { KIMI_CODE_HOME: home };
     const s = makeKimiSession(home, { id: 'session_a', workDir: home, lastPrompt: null, records: [wire.metadata(), wire.prompt(0, envelope(BOTMUX))] });
     makeKimiSession(home, { id: 'session_b', workDir: home, lastPrompt: 'typed locally', records: [wire.prompt(0, 'typed locally')] });
+    expect(findKimiWireForBotmuxSession(BOTMUX, home, { env })).toBe(s.wirePath);
+  });
+
+  it('does not re-read an unchanged large log that has no marker', () => {
+    const home = tmp();
+    const env = { KIMI_CODE_HOME: home };
+    // A hand-typed session: no botmux prompt in state.json and a log larger
+    // than the head probe, so only a whole-log read can decide it.
+    const filler = JSON.stringify({ type: 'filler', text: 'x'.repeat(1000) }) + '\n';
+    const head = filler.repeat(300);
+    const s = makeKimiSession(home, { id: 'session_a', workDir: home, lastPrompt: null, records: [] });
+    const tailMarker = `<session_id>${BOTMUX}</session_id>\n`;
+    const tailNoMarker = 'y'.repeat(tailMarker.length - 1) + '\n';
+    writeFileSync(s.wirePath, head + tailNoMarker);
+    const pinned = new Date('2026-01-01T00:00:00Z');
+    utimesSync(s.wirePath, pinned, pinned);
+    expect(findKimiWireForBotmuxSession(BOTMUX, home, { env })).toBeUndefined();
+
+    // Same size, same mtime, but now the marker IS past the probe. A cached
+    // miss answers without reading the log again, so it stays a miss…
+    writeFileSync(s.wirePath, head + tailMarker);
+    utimesSync(s.wirePath, pinned, pinned);
+    expect(readFileSync(s.wirePath, 'utf8')).toContain(tailMarker);
+    expect(findKimiWireForBotmuxSession(BOTMUX, home, { env })).toBeUndefined();
+
+    // …and any write (Kimi only appends) moves size/mtime and re-reads it.
+    appendFileSync(s.wirePath, filler);
     expect(findKimiWireForBotmuxSession(BOTMUX, home, { env })).toBe(s.wirePath);
   });
 
