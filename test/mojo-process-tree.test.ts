@@ -144,13 +144,14 @@ describe('an empty environ read from a live process is not final', () => {
     }
     fs.writeFileSync(FIFO, CONTENT + '\\0');
   `;
-  // Serves the first empty read, then unlinks the FIFO and puts a directory in
-  // its place so every later re-read gets EISDIR: a non-vanished, non-permission
-  // error that can also be manufactured when the suite runs as root. The write
-  // fd held across the swap wakes any reader that already reopened the stale
-  // FIFO inode (it gets EOF and retries) instead of leaving it blocked forever.
-  const SERVE_ERROR = `
+  // Serves the first empty read, then replaces the FIFO with whatever `swap`
+  // leaves behind. The held open blocks until the first re-read opens the FIFO,
+  // so that re-read always lands on the old inode and reads EOF when the fd
+  // closes; by then the swap is done, so later re-reads see the replacement and
+  // none is left blocked on a FIFO that has no writer.
+  const serveThenSwap = (swap: string): string => `
     const fs = require('node:fs');
+    const path = require('node:path');
     const { FIFO } = process.env;
     fs.closeSync(fs.openSync(FIFO, 'w'));
     for (;;) {
@@ -158,10 +159,14 @@ describe('an empty environ read from a live process is not final', () => {
       catch (err) { if (err.code === 'ENXIO') break; throw err; }
     }
     const held = fs.openSync(FIFO, 'w');
-    fs.rmSync(FIFO);
-    fs.mkdirSync(FIFO);
+    ${swap}
     fs.closeSync(held);
   `;
+  // EISDIR: a non-vanished, non-permission error that can also be manufactured
+  // when the suite runs as root.
+  const SERVE_ERROR = serveThenSwap('fs.rmSync(FIFO); fs.mkdirSync(FIFO);');
+  // The whole /proc/<pid> entry disappears: the process exited mid re-read.
+  const SERVE_GONE = serveThenSwap('fs.rmSync(path.dirname(FIFO), { recursive: true });');
   const servers: ChildProcess[] = [];
   afterEach(() => { for (const s of servers.splice(0)) s.kill('SIGKILL'); });
 
@@ -207,6 +212,17 @@ describe('an empty environ read from a live process is not final', () => {
     if (scan.ok) throw new Error('expected the re-read error to fail the whole scan');
     expect(scan.failure.kind).toBe('proc-entry-unreadable');
     expect(scan.failure).toMatchObject({ pid: 300 });
+  });
+
+  it('a pid that vanishes during the re-read neither fails the scan nor drops its live child', () => {
+    proc(100, { ppid: 1, pgid: 100 });
+    // Left the group, was caught mid-exec, then exited while being re-read; the
+    // child it forked earlier is still running and hangs off it by ppid.
+    environMidExec(200, { ppid: 100, pgid: 200 }, SERVE_GONE);
+    proc(300, { ppid: 200, pgid: 300 });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members.map(m => m.pid)).toContain(300);
   });
 });
 
