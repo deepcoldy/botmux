@@ -28,7 +28,7 @@ import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
 import {claudeActionPrompt} from './services/claude-action-prompt.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
-import { CODEX_CONFIG_FILE, hostCodexConfigPath } from './services/codex-isolated-config.js';
+import { CODEX_CONFIG_FILE, seedIsolatedCodexHome } from './services/codex-isolated-config.js';
 import { supportsZeroPromptInjection } from './core/prompt-injection.js';
 import { SCHEDULE_PROMPT_UNDELIVERED_ERROR_CODE } from './core/deferred-schedule-settlement.js';
 import { supportsTranscriptReplyDeliveryForBot } from './core/reply-delivery.js';
@@ -49,7 +49,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
@@ -774,7 +774,7 @@ import {
   projectRuntimeScreenStatus,
 } from './utils/runtime-screen-status.js';
 import { AsyncSerialQueue } from './utils/async-serial-queue.js';
-import { provisionCodexAuth, type CodexAuthSyncMode } from './services/codex-auth-sync.js';
+import { type CodexAuthSyncMode } from './services/codex-auth-sync.js';
 import {
   CLAUDE_AUTH_OVERRIDE_ENV_KEYS,
   claudeAuthOverrideKeys,
@@ -2602,13 +2602,10 @@ function provisionIsolatedBotHome(
         claudeProfileDir ? join(claudeProfileDir, '.claude.json') : undefined,
       );
     } else {
-      const cdir = provisionCodexAuth({ botHome, mode: codexAuthSync, log });
-      // config.toml: seed ONCE (it may carry per-bot customizations afterwards).
-      // The Dashboard's "re-sync from host" (services/codex-isolated-config.ts)
-      // is the explicit way to refresh it later.
-      const cfgDst = join(cdir, CODEX_CONFIG_FILE);
-      const cfgSrc = hostCodexConfigPath();
-      if (!existsSync(cfgDst) && existsSync(cfgSrc)) copyFileSync(cfgSrc, cfgDst);
+      // config.toml / AGENTS.md: seed ONCE (they may carry per-bot customizations
+      // afterwards). The Dashboard's "re-sync from host" is the explicit way to
+      // refresh them later.
+      seedIsolatedCodexHome({ botHome, mode: codexAuthSync, log });
     }
   } catch (e) {
     log(`[read-isolation] WARN provisioning bot home failed: ${(e as Error).message}`);
