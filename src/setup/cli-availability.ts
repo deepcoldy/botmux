@@ -177,6 +177,7 @@ export async function checkCliAvailabilityAsync(
           available: false, localExecutableRequired: true, command,
           status: inconclusive ? 'unknown' : 'unavailable',
           reason: inconclusive ? 'CLI 检测未完成，请稍后重试' : `找不到可执行文件「${command}」`,
+          ...(inconclusive ? {} : { missingExecutable: true }),
         };
   };
   try {
@@ -295,4 +296,26 @@ export async function cliUnavailableMessageAfterRetry(
       : `重试后仍无法启动：${result.reason ?? '本地启动依赖不可用'}`);
   }
   return unavailableMessage(result, input, displayName);
+}
+
+/**
+ * 本机为什么起不了这个 Agent 的任何新会话：只在启动要用的可执行文件确实不存在、
+ * 且像启动检查那样等一次再看仍不存在时返回原因，否则 undefined。
+ *
+ * 判定必须比启动检查宽：返回原因就意味着本机每次启动都会失败。登录 shell 探测
+ * 超时或出错只算「未知」；forge doctor 失败、启动配置非法也不算缺可执行文件，
+ * 留给每次启动的检查去报。
+ */
+export async function missingCliExecutableAfterRetry(
+  input: CliAvailabilityInput,
+  deps: { sleep?: (ms: number) => Promise<void> } = {},
+): Promise<string | undefined> {
+  const missing = async (): Promise<string | undefined> => {
+    if (!checkCliAvailability(input, { shellFallback: false }).missingExecutable) return undefined;
+    const probe = await checkCliAvailabilityAsync(input);
+    return probe.missingExecutable ? probe.reason : undefined;
+  };
+  if (!await missing()) return undefined;
+  await (deps.sleep ?? sleepMs)(MISSING_CLI_EXECUTABLE_RETRY_MS);
+  return missing();
 }

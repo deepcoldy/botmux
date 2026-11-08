@@ -25,6 +25,7 @@ import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWork
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
+import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
 import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks } from '../adapters/cli/shared-hints.js';
 import { usesLarkToolBinding } from './lark-tool-binding.js';
 import { effectiveReplyDelivery, type ReplyDelivery } from './reply-delivery.js';
@@ -2060,10 +2061,16 @@ function effectivePromptHookConfigPath(
 ): string | undefined {
   const base = adapter.hookInstall?.configPath;
   if (!base) return undefined;
-  const sandboxRequested = botConfig.sandbox === true
-    || botConfig.readIsolation === true
-    || process.env.BOTMUX_SANDBOX === '1';
-  const willRedirect = sandboxRequested
+  // scratch keeps the CLI's native home, like the worker (only oncall redirects).
+  let oncallRequested: boolean;
+  try {
+    oncallRequested = resolveSandboxMode({
+      configSandbox: botConfig.sandbox,
+      readIsolation: botConfig.readIsolation === true,
+      envValue: process.env.BOTMUX_SANDBOX,
+    }) === 'oncall';
+  } catch { return undefined; }
+  const willRedirect = oncallRequested
     && adapter.supportsReadIsolation === true
     && !botConfig.wrapperCli
     && (sessionBackendType ?? botConfig.backendType) !== 'riff'
@@ -5964,6 +5971,9 @@ export interface CreateHeadlessSessionArgs {
   workingDir?: string;
   model?: string;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** See Session.headless.failureDiagnostics: set by the workflow draft's
+   *  clarify session only. */
+  failureDiagnostics?: true;
 }
 
 export async function createHeadlessSession(
@@ -5994,6 +6004,7 @@ export async function createHeadlessSession(
       id: headlessId,
       createdAt: nowIso,
       source: 'cli',
+      ...(args.failureDiagnostics === true ? { failureDiagnostics: true as const } : {}),
     };
     session.lastMessageAt = nowIso;
     session.workingDir = wd.resolvedPath;

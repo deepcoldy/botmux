@@ -38,6 +38,11 @@ import { readGrillState, type GrillState, type GrillStatus } from './grill-state
 import { V3_RUN_ENVELOPE_FILE } from './run-envelope.js';
 import { V3FlowSummarySchema } from './flow-summary.js';
 import { isValidRunId } from './ops-projection.js';
+import {
+  WORKFLOW_DRAFT_FAILURE_CATEGORIES,
+  WORKFLOW_DRAFT_FAILURE_CODE_RE,
+  WORKFLOW_DRAFT_FAILURE_STEPS,
+} from './draft-failure.js';
 
 export const WORKFLOW_DRAFT_FILE = 'draft.json';
 export const WORKFLOW_DRAFT_SCHEMA_VERSION = 1 as const;
@@ -49,6 +54,10 @@ export const WORKFLOW_DRAFT_MAX_TURNS = 200;
 export const WORKFLOW_DRAFT_MAX_TURN_CHARS = 64_000;
 /** Clarify sessions whose close failed, kept for the sweep to retry. */
 export const WORKFLOW_DRAFT_MAX_ORPHANS = 20;
+/** Orchestrator handoffs remembered (the oldest drop first). */
+export const WORKFLOW_DRAFT_MAX_HANDOFFS = 20;
+/** Bots whose model outcomes a draft remembers (the oldest drop first). */
+export const WORKFLOW_DRAFT_MAX_MODEL_CALL_BOTS = 20;
 
 const SHA256_RE = /^sha256:[0-9a-f]{64}$/;
 const iso = z.string().min(1).max(64);
@@ -396,6 +405,82 @@ const launchSchema = z.object({
   abandonedAt: iso.optional(),
 }).strict();
 
+/** Raw failure text kept on a draft (credential shapes masked, clipped). */
+export const WORKFLOW_DRAFT_FAILURE_DETAIL_MAX = 2000;
+/** Terminal output tail kept on a draft (plain text, masked, clipped). */
+export const WORKFLOW_DRAFT_FAILURE_TERMINAL_MAX = 4000;
+
+/**
+ * A model call of the orchestrating bot that failed (clarify turn, clarify
+ * session start, Architect): the closed-set category and error code (the
+ * page's heading), where, which bot with its CLI and its bots.json `model`
+ * (only when configured), and — to show the person what actually happened —
+ * the raw error text and the terminal output tail (credential shapes masked,
+ * clipped), plus the clarify session id the page opens a terminal for
+ * (draft-failure.ts).
+ */
+const failureSummaryShape = {
+  category: z.enum(WORKFLOW_DRAFT_FAILURE_CATEGORIES),
+  code: z.string().regex(WORKFLOW_DRAFT_FAILURE_CODE_RE).optional(),
+  step: z.enum(WORKFLOW_DRAFT_FAILURE_STEPS),
+  larkAppId: appIdSchema,
+  cliId: z.string().min(1).max(64).optional(),
+  model: z.string().min(1).max(200).optional(),
+  at: iso,
+};
+const failureSummarySchema = z.object(failureSummaryShape).strict();
+const failureSchema = z.object({
+  ...failureSummaryShape,
+  detail: z.string().min(1).max(WORKFLOW_DRAFT_FAILURE_DETAIL_MAX).optional(),
+  terminalTail: z.string().min(1).max(WORKFLOW_DRAFT_FAILURE_TERMINAL_MAX).optional(),
+  sessionId: z.string().min(1).max(256).optional(),
+}).strict();
+
+export type WorkflowDraftFailure = z.infer<typeof failureSchema>;
+/** What the orchestrator picker learns of a bot's failure: no raw text. */
+export type WorkflowDraftFailureSummary = z.infer<typeof failureSummarySchema>;
+
+/**
+ * 换编排 Bot (handoff) under way: the current orchestrator (still the owner)
+ * has recorded the target and is closing its clarify sessions (`closing`), or
+ * has closed them (`ready`). Ownership moves in ONE write by the target's
+ * daemon (orchestratorAppId := target, handoff removed), under the draft lock
+ * and only for this token — never two owners, never none.
+ */
+const handoffSchema = z.object({
+  toAppId: appIdSchema,
+  token: z.string().regex(/^[0-9a-f-]{36}$/),
+  state: z.enum(['closing', 'ready']),
+  at: iso,
+}).strict();
+
+/**
+ * One 换编排 Bot in the draft's history: who, from which bot to which, when,
+ * and the first confirmation's confirmer before and after. Every open_id is
+ * recorded as ITS app saw it (`from*` under fromAppId, `to*` under toAppId) —
+ * never one app's open_id reused under the other.
+ */
+const handoffHistorySchema = z.object({
+  fromAppId: appIdSchema,
+  toAppId: appIdSchema,
+  token: z.string().regex(/^[0-9a-f-]{36}$/),
+  at: iso,
+  by: z.object({
+    source: initiatorSchema.shape.source,
+    fromOpenId: openId,
+    toOpenId: openId,
+    /** A platform login's union_id (the same on both apps). */
+    unionId: z.string().min(1).max(128).optional(),
+  }).strict().optional(),
+  /** The first confirmation (确认需求) restamped for the new app. */
+  specConfirmation: z.object({
+    fromOpenId: openId,
+    toOpenId: openId,
+  }).strict().optional(),
+}).strict();
+
+export type WorkflowDraftHandoffRecord = z.infer<typeof handoffHistorySchema>;
+
 export const WorkflowDraftRecordSchema = z.object({
   schemaVersion: z.literal(WORKFLOW_DRAFT_SCHEMA_VERSION),
   runId: z.string().min(1).max(256),
@@ -426,6 +511,18 @@ export const WorkflowDraftRecordSchema = z.object({
     sessionId: z.string().min(1).max(256),
     headlessId: z.string().min(1).max(256).optional(),
   }).strict()).max(WORKFLOW_DRAFT_MAX_ORPHANS).optional(),
+  /** The latest model failure of the current orchestrator that nothing has
+   *  answered since (cleared by a reply, a new attempt, a handoff). */
+  failure: failureSchema.optional(),
+  /** Per bot that orchestrated this draft: its last model call that went
+   *  through and its last failure (survives handoffs; the orchestrator
+   *  picker's "最近一次调用模型失败" reads it). */
+  modelCalls: z.record(appIdSchema, z.object({
+    okAt: iso.optional(),
+    failure: failureSummarySchema.optional(),
+  }).strict()).optional(),
+  handoff: handoffSchema.optional(),
+  handoffs: z.array(handoffHistorySchema).max(WORKFLOW_DRAFT_MAX_HANDOFFS).optional(),
 }).strict();
 
 export type WorkflowDraftRecord = z.infer<typeof WorkflowDraftRecordSchema>;
@@ -436,6 +533,7 @@ export type WorkflowDraftArchitect = z.infer<typeof architectSchema>;
 export type WorkflowDraftFlowConfirmation = z.infer<typeof flowConfirmationSchema>;
 export type WorkflowDraftLaunch = z.infer<typeof launchSchema>;
 export type WorkflowDraftLaunchProblem = z.infer<typeof launchProblemSchema>;
+export type WorkflowDraftHandoff = z.infer<typeof handoffSchema>;
 
 export class WorkflowDraftBusyError extends Error {
   constructor(runId: string) {
@@ -713,4 +811,36 @@ export function workflowDraftOwner(baseDir: string, runId: string): string | und
   // A marked-deleted draft still routes, so a repeated delete can finish it;
   // a launched one too, so its launch calls answer deterministically.
   return draft && draft.runId === runId ? draft.orchestratorAppId : undefined;
+}
+
+/**
+ * Per bot: its latest model failure across the given drafts, when no later
+ * model call of that bot went through (a reply landed, an Architect run
+ * succeeded). Read from the records only — nothing calls a model to find out.
+ */
+export function latestModelFailures(records: Iterable<Pick<WorkflowDraftRecord, 'modelCalls'>>): Map<string, WorkflowDraftFailureSummary> {
+  const okAt = new Map<string, string>();
+  const failed = new Map<string, WorkflowDraftFailureSummary>();
+  for (const record of records) {
+    for (const [appId, calls] of Object.entries(record.modelCalls ?? {})) {
+      if (calls.okAt && calls.okAt > (okAt.get(appId) ?? '')) okAt.set(appId, calls.okAt);
+      if (calls.failure && calls.failure.at > (failed.get(appId)?.at ?? '')) failed.set(appId, calls.failure);
+    }
+  }
+  for (const [appId, failure] of failed) {
+    const ok = okAt.get(appId);
+    if (ok && ok >= failure.at) failed.delete(appId);
+  }
+  return failed;
+}
+
+/** {@link latestModelFailures} over every draft dir under `baseDir` (launched
+ *  ones too: their records still hold the outcomes). */
+export function recentModelFailures(baseDir: string): Map<string, WorkflowDraftFailureSummary> {
+  const records: WorkflowDraftRecord[] = [];
+  for (const { runDir } of listWorkflowDraftDirs(baseDir, { launched: true })) {
+    const record = readWorkflowDraft(runDir);
+    if (record?.modelCalls) records.push(record);
+  }
+  return latestModelFailures(records);
 }

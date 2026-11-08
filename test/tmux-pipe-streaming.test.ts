@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
-import { createReadStream, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, type ReadStream } from 'node:fs';
+import { createReadStream, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, type ReadStream } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
 import { pipePaneShellCommand } from '../src/adapters/backend/tmux-pipe-relay.js';
+import { resetTmuxVersionCacheForTests } from '../src/setup/ensure-tmux.js';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
 
 const quote = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
@@ -39,6 +40,8 @@ afterEach(() => {
   }
   socket = undefined;
   process.env.PATH = originalPath;
+  vi.unstubAllEnvs();
+  resetTmuxVersionCacheForTests();
   if (root) rmSync(root, { recursive: true, force: true });
   root = undefined;
 });
@@ -197,24 +200,52 @@ writeFileSync(${JSON.stringify(ready)}, 'ready');
       }
     });
 
-  // The backend passes the command to tmux directly, or — behind the legacy
-  // dead-pane guard — inside an if-shell command string that tmux parses
-  // itself. pipe-pane then expands it as a format and strftime string.
-  it.each(['pipe-pane argument', 'if-shell command string'] as const)(
-    'delivers to a FIFO path with shell and tmux metacharacters via the %s', async form => {
-      const fx = fixture('uutils');
-      socket = join(fx.root, 'socket');
-      const dir = join(fx.root, `a b#S%d$x"y'z`); mkdirSync(dir);
-      const fifo = join(dir, 'out.fifo');
-      execFileSync('mkfifo', [fifo]);
-      const out = collect(fifo);
-      const tmux = (...args: string[]) => execFileSync(realTmux!, ['-S', socket!, ...args], { env: { ...process.env, PATH: fx.path }, encoding: 'utf8' });
-      tmux('new-session', '-d', '-s', 'meta', '-x', '80', '-y', '20', 'sleep 60');
-      const command = pipePaneShellCommand(fifo);
-      if (form === 'pipe-pane argument') tmux('pipe-pane', '-O', '-t', 'meta', command);
-      else tmux('if-shell', '-F', '-t', 'meta', '#{pane_dead}', 'display-message -p dead', `pipe-pane -O -t meta ${quote(command)}`);
-      // The pane's terminal echoes typed input, so it reaches the pipe as output.
-      tmux('send-keys', '-t', 'meta', '-l', 'marker-42');
-      await vi.waitFor(() => expect(out.text()).toContain('marker-42'), { timeout: 3000, interval: 20 });
+  // tmux expands the pipe-pane argument as a format and strftime string.
+  it('delivers to a FIFO path with shell and tmux metacharacters via the pipe-pane argument', async () => {
+    const fx = fixture('uutils');
+    socket = join(fx.root, 'socket');
+    const dir = join(fx.root, `a b\\sl#S%d$x"y'z`); mkdirSync(dir);
+    const fifo = join(dir, 'out.fifo');
+    execFileSync('mkfifo', [fifo]);
+    const out = collect(fifo);
+    const tmux = (...args: string[]) => execFileSync(realTmux!, ['-S', socket!, ...args], { env: { ...process.env, PATH: fx.path }, encoding: 'utf8' });
+    tmux('new-session', '-d', '-s', 'meta', '-x', '80', '-y', '20', 'sleep 60');
+    tmux('pipe-pane', '-O', '-t', 'meta', pipePaneShellCommand(fifo));
+    // The pane's terminal echoes typed input, so it reaches the pipe as output.
+    tmux('send-keys', '-t', 'meta', '-l', 'marker-42');
+    await vi.waitFor(() => expect(out.text()).toContain('marker-42'), { timeout: 3000, interval: 20 });
+  });
+
+  // Below tmux 3.2, or with an unreadable version, the backend subscribes inside
+  // an if-shell command string that tmux parses again; tmux 2.x's parser knows
+  // no backslash escapes outside quotes. The shim reports 3.1c so a modern
+  // binary takes that path too; a real 2.x/3.0/3.1 binary takes it by itself.
+  // tmux 3.x expands a `~` opening a quoted target (an adopted user session).
+  it.each(['legacy-guard', '~legacy-guard'])('delivers through the legacy dead-pane guard of session %s to a FIFO path with shell and tmux metacharacters', async (sessionName) => {
+    const fx = fixture('uutils');
+    socket = join(fx.root, 'socket');
+    const commands = join(fx.root, 'tmux-commands');
+    writeFileSync(join(fx.bin, 'tmux'), `#!/bin/sh
+case "$*" in
+  -V) echo 'tmux 3.1c'; exit 0 ;;
+  'display-message -p #{version}') echo 3.1c; exit 0 ;;
+esac
+echo "$1" >> ${quote(commands)}
+exec ${quote(realTmux!)} -S ${quote(socket)} "$@"
+`, { mode: 0o700 });
+    process.env.PATH = fx.path;
+    const tmp = join(fx.root, `a b\\sl#S%d$x"y'z`); mkdirSync(tmp);
+    vi.stubEnv('TMPDIR', tmp);
+    resetTmuxVersionCacheForTests();
+    backend = new TmuxPipeBackend(sessionName, { createSession: true, ownsSession: true });
+    let received = '';
+    backend.onData(data => { received += data; });
+    backend.spawn('/bin/sh', ['-c', 'sleep 60'], {
+      cwd: fx.root, env: { PATH: process.env.PATH, HOME: fx.root },
+      cols: 80, rows: 20, strictEnv: true,
     });
+    expect(readFileSync(commands, 'utf8').split('\n')).toContain('if-shell');
+    expect(backend.write('marker-42')).toBe(true);
+    await vi.waitFor(() => expect(received).toContain('marker-42'), { timeout: 3000, interval: 20 });
+  });
 });
