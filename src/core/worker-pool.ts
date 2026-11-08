@@ -13021,6 +13021,10 @@ export function isForkCapableSession(ds: DaemonSession): boolean {
   const cliId = sessionCliId(ds, botCfg);
   if (!FORK_CAPABLE_CLI_IDS.has(cliId)) return false;
   if (cliId === 'antigravity' && isRemoteBackendSession(ds)) return false;
+  // agy writes its fork receipt to --log-file under ~/.gemini; the scratch
+  // overlay keeps that write out of the host path the worker tails.
+  if (cliId === 'antigravity'
+    && sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged) === 'scratch') return false;
   // An external App Server thread is not a local rollout. `codex fork` would
   // resolve against the terminal client's own CODEX_HOME and could fork an
   // unrelated/empty local session, so refuse rather than claiming a copy was
