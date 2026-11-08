@@ -1,5 +1,18 @@
 /** English translations — mirrors the keys defined in `zh.ts`. */
 export const messages: Record<string, string> = {
+  'worker.purge_images_unsupported': '🧹 "Purge tiny images and continue" is only supported for local Claude Code sessions. Use /clear or start a new topic instead.',
+  'worker.purge_images_busy': '🧹 The CLI is restarting, so tiny images cannot be purged right now; the transcript was not changed. Tap again once it is back.',
+  'worker.purge_images_sandbox_unsupported': '🧹 "Purge tiny images and continue" is not supported yet for sessions in the macOS isolation sandbox; the transcript was not changed. Use /clear or start a new topic instead.',
+  'worker.purge_images_exit_unproven': '🧹 Could not confirm the CLI process had fully stopped, so nothing was purged and the transcript was not changed. Try again shortly, or recover with /clear.',
+  'worker.purge_images_unmeasurable': '🧹 The transcript contains an image whose size cannot be read (unsupported format or incomplete data), so nothing was purged and the transcript was not changed. Use /clear or start a new topic instead.',
+  'worker.purge_images_unsupported_source': '🧹 The images in the transcript are not embedded data (e.g. links or file references), so their size cannot be checked locally; the transcript was not changed. Use /clear or start a new topic instead.',
+  'worker.purge_images_no_images': '🧹 The current transcript contains no images (the session file may have rotated); it was not changed. Use /clear or start a new topic instead.',
+  'worker.purge_images_not_found': '🧹 Every image in the current transcript is large enough, so there was nothing to purge and the transcript was not changed. Forward the full error from the web terminal to the admin, or recover with /clear for now.',
+  'worker.purge_images_failed': '🧹 The transcript could not be read or rewritten, so nothing was purged and it was not changed. You can recover with /clear instead.',
+  'worker.purge_images_done': '🧹 Removed {removed} undersized image(s) from {files} transcript file(s) (originals backed up as .botmux-purge-bak-* alongside). The CLI restarted with --resume and is continuing automatically; text context is kept.',
+  'worker.purge_images_partial': '🧹 Removed {removed} undersized image(s) from {files} transcript file(s) (originals backed up as .botmux-purge-bak-* alongside) and restarted the CLI with --resume. Some images in the transcript could not be measured or processed and were left as they are, so the conversation was not continued automatically, to avoid hitting the same error again. Send any message to continue; if the same error comes back, recover with /clear or start a new topic.',
+  'worker.purge_images_restart_failed': '🧹 Removed {removed} undersized image(s) from {files} transcript file(s) (originals backed up as .botmux-purge-bak-* alongside), but the CLI failed to restart, so the conversation was not continued. Recover the CLI as the following error message suggests, then send a message to continue.',
+  'worker.purge_images_superseded': '🧹 Removed {removed} undersized image(s) from {files} transcript file(s) (originals backed up as .botmux-purge-bak-* alongside), but another restart replaced this one, so the conversation was not continued. Send any message once the CLI is back.',
   'feedback.storage.choose': 'Feedback storage: SQLite [default] / PostgreSQL (sqlite/postgresql): ',
   'feedback.storage.configPath': 'PostgreSQL config JSON path (credential reference only, no plaintext password): ',
   'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> [task] — Change Codex reasoning effort; a task may follow on the same or subsequent lines and is submitted after confirmation. CLI affects future turns; App active-turn updates require step_model_switching (off by default; levels depend on the model)',
@@ -1648,8 +1661,12 @@ export const messages: Record<string, string> = {
   'card.turn_failed.retry_safe': 'This turn\'s input never reached the CLI, so **nothing was executed**. Retrying is safe.',
   'card.turn_failed.retry_caveated': '⚠️ This turn **may have partially executed** (edited files, commits, messages sent). Continue does NOT replay it verbatim: the CLI is asked to **inspect the current state first**, work out how far it got, and resume from there — stopping and handing back to you if it cannot tell. Still worth a glance at the Web Terminal.',
   'card.turn_failed.no_retry': 'Re-sending the same input cannot succeed for this error. Check the cause, then send a new message.',
+  'card.turn_failed.image_too_small': '🧹 The session history now contains an image that is too small (e.g. a 1×1 placeholder pixel, usually produced when the CLI reads such an image file). That image is re-sent with every following message, so **any ordinary follow-up gets the same 400 — plain resending does not help**.\n\nRecovery (any of these works):\n1. Tap **Purge tiny images and continue** below: the offending blocks are removed from the session transcript (original file backed up), the CLI restarts with --resume, and the turn continues automatically — **text context is kept**;\n2. Or send `/clear` in this topic to reset the conversation, then resend the task (local action, no model request);\n3. Or start a fresh topic.',
+  'card.btn.purge_images_continue': '🧹 Purge tiny images and continue',
   'card.turn_failed.no_input': 'No re-sendable input was recorded for this turn (it stopped before submission). Send a new message instead.',
 
+  'card.action.purge_images_unsupported': '⚠️ "Purge tiny images and continue" is only available for local Claude Code topic sessions.',
+  'card.action.purge_images_started': 'Purging tiny images and restarting to continue…',
   'card.action.retry_turn_missing': '⚠️ No input record found for this turn, so it cannot be retried. Send a new message instead.',
   'card.action.retry_turn_stale': '⚠️ This card is out of date (the session failed again or was already retried). Use the latest card, or send a new message.',
   'card.action.retry_turn_cooldown': '⏳ Retry is cooling down. Try again in {seconds}s.',
@@ -1670,6 +1687,7 @@ export const messages: Record<string, string> = {
   'card.recovery_failed.cause.quota': 'Model quota exhausted or rate limited',
   'card.recovery_failed.cause.provider_auth': 'Model API authentication failed (expired credentials or no permission)',
   'card.recovery_failed.cause.provider_rejected': 'The model API rejected the request',
+  'card.recovery_failed.cause.image_too_small': 'The session history contains an image that is too small, so the model API rejects every request',
   'card.recovery_failed.cause.capacity': 'The model service is out of capacity',
   'card.recovery_failed.cause.outcome_unverified': 'No result arrived after the automatic continuation, so completion cannot be confirmed',
   'card.recovery_failed.cause.restart_interrupted': 'A Botmux restart interrupted automatic recovery',
@@ -1830,6 +1848,7 @@ export const messages: Record<string, string> = {
   'daemon.force_topic_ready': '💬 New topic created. Send a task in this topic, or use /repo first to choose a project.',
   'daemon.force_topic_started': '↪️ Moved into a new topic and started working…',
   'daemon.force_topic_current_dir_missing': '⚠️ This chat has no current working directory to reuse. Start a normal chat session first, or bind one with /oncall bind.',
+  'daemon.force_topic_worktree_command_unsupported': '⚠️ {cmd} cannot follow /tw directly: a /tw topic has no session until its worktree is built, so the command has nowhere to run. If you do not need the worktree, send {cmd} on its own; otherwise start the topic with /tw <task> first, then send {cmd} inside the topic.',
   // ─── Topic directive header (`[title] /t /repo … /model … body`) rejections ──
   // Fail closed: one bad field voids the whole header, so this reply is the
   // user's only feedback and must name the offending field.
