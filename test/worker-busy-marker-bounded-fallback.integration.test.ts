@@ -12,7 +12,7 @@
  * The timing thresholds are shortened through BOTMUX_TEST_* env vars so the
  * behaviour is deterministic without waiting the production ~17.5s window.
  */
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -135,4 +135,97 @@ describe('bounded busy-marker prompt-ready fallback', () => {
     expect(g.messages.filter(m => m.type === 'prompt_ready')).toHaveLength(0);
     expect(g.logs.join('')).not.toMatch(/bounded fallback window/);
   }, 18_000);
+
+  it('does not release mid-turn while the Claude transcript still holds the turn open', async () => {
+    // Claude Code with prefersReducedMotion draws a static spinner: a real turn
+    // waiting on the API shows the busy footer over its composer on a frozen
+    // screen (2.1.319 measured 12-35s with zero PTY bytes), the same screen as a
+    // stale glyph. Only the transcript tells them apart.
+    const WORK_MS = 15_000;
+    const root = mkdtempSync(join(tmpdir(), 'bmx-busy-open-turn-'));
+    roots.push(root);
+    const workDir = join(root, 'work');
+    const dataDir = join(root, 'session');
+    mkdirSync(workDir, { recursive: true });
+    mkdirSync(dataDir, { recursive: true });
+    const cliSessionId = 'deadbeef-1234-4678-9abc-def012343223';
+    const projectDir = join(root, '.claude', 'projects', realpathSync(workDir).replace(/[^A-Za-z0-9-]/g, '-'));
+    mkdirSync(projectDir, { recursive: true });
+    const transcript = join(projectDir, `${cliSessionId}.jsonl`);
+    const earlier = new Date(Date.now() - 1_800_000).toISOString();
+    writeFileSync(transcript, [
+      { type: 'user', uuid: 'p0', timestamp: earlier, message: { role: 'user', content: 'hi' } },
+      { type: 'assistant', uuid: 'a0', timestamp: earlier, message: { id: 'm0', role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'hello' }] } },
+      { type: 'system', subtype: 'turn_duration', uuid: 'd0', timestamp: earlier },
+    ].map(row => `${JSON.stringify(row)}\n`).join(''));
+    const footer = '⏵⏵ bypass permissions on (shift+tab to cycle)';
+    const screen = (lines: string[]) => ['\x1b[2J\x1b[H', 'Fake Claude Code', '', ...lines, '─'.repeat(48), '❯ ', '─'.repeat(48)].join('\r\n');
+    const marks = join(root, 'marks.log');
+    const fakeCli = join(root, 'fake-claude');
+    writeFileSync(fakeCli, `#!/usr/bin/env node
+import('node:fs').then(fs => {
+if (process.argv.includes('--version')) { console.log('2.1.319 (Claude Code)'); process.exit(0); }
+const put = row => fs.appendFileSync(${JSON.stringify(transcript)}, JSON.stringify({ timestamp: new Date().toISOString(), ...row }) + '\\n');
+const mark = what => fs.appendFileSync(${JSON.stringify(marks)}, Date.now() + ' ' + what + '\\n');
+process.stdout.write(${JSON.stringify(screen([]) + '\r\n  ' + footer)});
+let typed = '';
+process.stdin.on('data', chunk => {
+  typed += chunk.toString();
+  if (!/[\\r\\n]$/.test(typed)) return;
+  if (typed.includes('\\x1b[200~') && !typed.includes('\\x1b[201~')) return;
+  typed = '';
+  put({ type: 'user', uuid: 'u1', message: { role: 'user', content: 'long task' } });
+  mark('work-start');
+  process.stdout.write(${JSON.stringify(screen(['❯ long task', '● Envisioning…']) + '\r\n  ' + footer + ' · esc to interrupt')});
+  setTimeout(() => {
+    put({ type: 'assistant', uuid: 'a1', message: { id: 'm1', role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }] } });
+    put({ type: 'system', subtype: 'turn_duration', uuid: 'd1' });
+    mark('work-end');
+    process.stdout.write(${JSON.stringify(screen(['❯ long task', '● done']) + '\r\n  ' + footer)});
+  }, ${WORK_MS});
+});
+setInterval(() => {}, 1_000);
+});
+`);
+    chmodSync(fakeCli, 0o755);
+
+    const messages: { at: number; msg: WorkerToDaemon }[] = [];
+    const logs: string[] = [];
+    const sid = `busy-fallback-turn-${randomUUID()}`;
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: { ...process.env, HOME: root, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sid, ...ENV },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.push(child);
+    child.on('message', m => messages.push({ at: Date.now(), msg: m as WorkerToDaemon }));
+    child.stdout?.on('data', c => logs.push(c.toString()));
+    child.stderr?.on('data', c => logs.push(c.toString()));
+    child.send({
+      type: 'init', sessionId: sid, chatId: 'oc_test', rootMessageId: 'om_root',
+      workingDir: workDir, cliId: 'claude-code', cliPathOverride: fakeCli, cliSessionId, resume: true,
+      backendType: 'pty', prompt: '', larkAppId: 'app_test', larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    const readyCount = () => messages.filter(m => m.msg.type === 'prompt_ready').length;
+    const waitFor = async (check: () => boolean, ms: number) => {
+      const deadline = Date.now() + ms;
+      while (Date.now() < deadline && !check()) {
+        if (child.exitCode !== null) throw new Error(`worker exited early\n${logs.join('')}`);
+        await new Promise(r => setTimeout(r, 100));
+      }
+    };
+    await waitFor(() => readyCount() > 0, 30_000);
+    expect(readyCount(), `expected the startup prompt_ready\n${logs.join('')}`).toBeGreaterThan(0);
+    const before = messages.length;
+    child.send({ type: 'message', content: 'long task', turnId: 'om_turn' } satisfies DaemonToWorker);
+    const workEnd = () => Number(/(\d+) work-end/.exec((() => { try { return readFileSync(marks, 'utf8'); } catch { return ''; } })())?.[1] ?? NaN);
+    await waitFor(() => Number.isFinite(workEnd()), WORK_MS + 10_000);
+    await waitFor(() => messages.slice(before).some(m => m.msg.type === 'prompt_ready'), 8_000);
+
+    const readyAt = messages.slice(before).filter(m => m.msg.type === 'prompt_ready').map(m => m.at);
+    expect(readyAt.filter(at => at < workEnd()), `prompt_ready published mid-turn\n${logs.join('')}`).toHaveLength(0);
+    expect(readyAt.length, `expected prompt_ready once the turn closed\n${logs.join('')}`).toBeGreaterThan(0);
+    expect(logs.join('')).not.toMatch(/bounded fallback window/);
+  }, 70_000);
 });

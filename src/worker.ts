@@ -22676,22 +22676,18 @@ function scheduleBusyPatternIdleProbe(source: string): void {
  * describes. Called only from the busy-pattern re-probe loop after
  * probeBusyPatternIdle() still deferred. Returns true when it forced
  * prompt-ready (and stopped the loop). It never overrides structured
- * session-state busy and only acts on positive composer evidence while the
- * screen is frozen, so a genuinely working CLI keeps deferring. */
+ * session-state busy or a transcript that still holds the turn open, and only
+ * acts on positive composer evidence while the screen is frozen, so a
+ * genuinely working CLI keeps deferring. */
 function maybeForceReadyOnStaleBusyMarker(source: string, be: SessionBackend): boolean {
+  if (!backendScreenEvidenceIsAuthoritativeForMutation() || !cliAdapter?.busyPattern) return false;
   const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
-  // The structured session-state store is authoritative: never force readiness
-  // while it reports active work, even if the viewport glyph looks stale.
-  if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({
+  const sessionStateBusy = !!cliAdapter.isSessionBusy?.({
     sessionId,
     cliSessionId: currentCliSid,
     isCliProcessAlive: cliProcessAliveProbe(be),
-    getCurrentScreen: backendScreenEvidenceIsAuthoritativeForMutation()
-      ? () => captureBackendScreen(be) : undefined,
-  })) {
-    return false;
-  }
-  if (!backendScreenEvidenceIsAuthoritativeForMutation() || !cliAdapter?.busyPattern) return false;
+    getCurrentScreen: () => captureBackendScreen(be),
+  });
   let content = '';
   try {
     content = captureBackendScreen(be);
@@ -22707,7 +22703,8 @@ function maybeForceReadyOnStaleBusyMarker(source: string, be: SessionBackend): b
     now: Date.now(),
     screenRevision: backendScreenRevision,
     readyPatternVisible,
-    sessionStateBusy: false,
+    sessionStateBusy,
+    transcriptTurnOpen: !!bridgeJsonlPath && claudeTranscriptLatestTurnState(bridgeJsonlPath) === 'open',
     cliAlive: cliProcessAliveFromBackend(be),
   };
   busyReadyFallbackGate.observe(observation);

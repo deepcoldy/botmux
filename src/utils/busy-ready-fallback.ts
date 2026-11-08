@@ -18,9 +18,17 @@
  *     never a mere absence of the busy marker);
  *  3. the structured session-state store does NOT report active work — that
  *     signal is authoritative and is never overridden here;
- *  4. the defer episode has lasted at least `fallbackMs`;
- *  5. the screen revision has stayed unchanged for at least `stableScreenMs`,
+ *  4. the CLI's own transcript does NOT leave the turn open. Claude Code draws
+ *     its `❯` composer while working, and with `prefersReducedMotion` its
+ *     spinner is static: a real turn waiting on the API (thinking, a slow
+ *     first token, retry backoff) shows busy footer + composer on a frozen
+ *     screen for well over `stableScreenMs`, exactly like a stale glyph;
+ *  5. the defer episode has lasted at least `fallbackMs`;
+ *  6. the screen revision has stayed unchanged for at least `stableScreenMs`,
  *     i.e. the screen is frozen rather than still streaming.
+ *
+ * A tick vetoed by 3 or 4 neither starts nor extends an episode: the bound
+ * only measures time during which the screen glyph alone holds readiness back.
  *
  * The class is clock-agnostic: callers pass `now` and the observed screen
  * revision explicitly, so the timing logic is deterministic under a fake clock.
@@ -40,6 +48,8 @@ export interface BusyProbeObservation {
   readyPatternVisible: boolean;
   /** True while the structured session-state store reports active work. Never overridden by this gate. */
   sessionStateBusy: boolean;
+  /** True while the CLI's transcript still leaves the current turn open. Never overridden by this gate. */
+  transcriptTurnOpen: boolean;
   /** False only when the CLI process is known to be dead; undefined/true means alive-or-unknown. */
   cliAlive: boolean | undefined;
 }
@@ -53,6 +63,7 @@ export class BusyReadyFallbackGate {
 
   /** Record one still-deferred probe tick. Tracks the episode start and the last screen-revision change. */
   observe(o: BusyProbeObservation): void {
+    if (vetoed(o)) return;
     if (this.deferStartedAt === null) {
       this.deferStartedAt = o.now;
       this.lastRevisionChangeAt = o.now;
@@ -73,12 +84,16 @@ export class BusyReadyFallbackGate {
   /** True only when a busy marker is stale (composer visible, screen frozen, CLI alive) past the bounded window. */
   shouldForceReady(o: BusyProbeObservation): boolean {
     if (this.deferStartedAt === null) return false;
-    // Structured busy and a dead/unknown-composer CLI are never force-released.
-    if (o.sessionStateBusy || o.cliAlive === false || !o.readyPatternVisible) return false;
+    // Structured busy, an open transcript turn and a dead/unknown-composer CLI are never force-released.
+    if (vetoed(o) || o.cliAlive === false || !o.readyPatternVisible) return false;
     const { fallbackMs, stableScreenMs } = this.thresholds();
     if (o.now - this.deferStartedAt < fallbackMs) return false;
     // A screen that is still streaming (revision changed recently) means real work.
     if (o.now - this.lastRevisionChangeAt < stableScreenMs) return false;
     return true;
   }
+}
+
+function vetoed(o: BusyProbeObservation): boolean {
+  return o.sessionStateBusy || o.transcriptTurnOpen;
 }

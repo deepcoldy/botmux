@@ -15,6 +15,7 @@ function obs(t: number, rev: number, over: Partial<BusyProbeObservation> = {}): 
     screenRevision: rev,
     readyPatternVisible: true,
     sessionStateBusy: false,
+    transcriptTurnOpen: false,
     cliAlive: true,
     ...over,
   };
@@ -78,6 +79,24 @@ describe('BusyReadyFallbackGate', () => {
     const o = obs(5000, 7, { sessionStateBusy: true });
     gate.observe(o);
     expect(gate.shouldForceReady(o)).toBe(false);
+  });
+
+  it('never overrides a transcript that still holds the turn open', () => {
+    const gate = makeGate();
+    gate.observe(obs(0, 7));
+    const o = obs(5000, 7, { transcriptTurnOpen: true });
+    gate.observe(o);
+    expect(gate.shouldForceReady(o)).toBe(false);
+  });
+
+  it('vetoed ticks neither start nor extend the episode', () => {
+    const gate = makeGate();
+    gate.observe(obs(0, 7, { transcriptTurnOpen: true }));
+    gate.observe(obs(3000, 7, { sessionStateBusy: true }));
+    // The first unvetoed tick opens the episode: the full window still applies.
+    gate.observe(obs(6000, 7));
+    expect(gate.shouldForceReady(obs(6000 + FALLBACK_MS - 1, 7))).toBe(false);
+    expect(gate.shouldForceReady(obs(6000 + FALLBACK_MS, 7))).toBe(true);
   });
 
   it('requires positive composer evidence: no ready pattern means no force', () => {
