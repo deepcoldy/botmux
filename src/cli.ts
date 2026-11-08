@@ -6205,6 +6205,43 @@ async function postSessionCliIpc(
     : loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
 }
 
+/** `botmux board attach` 的说明页 / 视频：正文是文件原始字节。鉴权同 postSessionCliIpc，capability 放请求头。 */
+async function postBoardExplainerUpload(
+  ipcPort: number,
+  sessionId: string,
+  ref: string,
+  file: { name: string; mime: string; bytes: Buffer },
+): Promise<Response> {
+  const { BOARD_UPLOAD_HEADERS: H } = await import('./core/decision-board/files.js');
+  const headers: Record<string, string> = {
+    'content-type': file.mime,
+    [H.name]: encodeURIComponent(file.name),
+    [H.ref]: encodeURIComponent(ref),
+  };
+  let hostSecret: string | undefined;
+  if (!process.env.BOTMUX_SEND_RELAY) {
+    try { hostSecret = loadDaemonIpcSecret(); } catch { /* sandboxed/read-isolated: capability fallback below */ }
+  }
+  if (!hostSecret) {
+    const claim = readManagedOriginCapability(
+      resolveDataDir(),
+      sessionId,
+      process.env.BOTMUX_SEND_RELAY,
+      process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+    );
+    if (claim) {
+      headers[H.capability] = claim.capability;
+      if (claim.turnId) headers[H.turnId] = claim.turnId;
+      if (claim.dispatchAttempt !== undefined) headers[H.dispatchAttempt] = String(claim.dispatchAttempt);
+    }
+  }
+  const path = `/api/sessions/${encodeURIComponent(sessionId)}/decision-board/upload`;
+  const init = { method: 'POST', headers, body: new Uint8Array(file.bytes) } satisfies RequestInit;
+  return hostSecret
+    ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
+    : loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+}
+
 let deferredTopicSidecarWritable: boolean | undefined;
 
 /** The daemon's deferred-topic claim route, or undefined when no daemon port is
@@ -6683,7 +6720,9 @@ ${SESSION_RENAME_USAGE}
 
 /** `botmux board …`：管家写决策看板。解析与输出在 cli/board-command.ts，这里只负责找会话和发 IPC。 */
 async function cmdBoard(argv: string[]): Promise<void> {
-  const { BOARD_CLI_USAGE, formatBoardResult, parseBoardArgs, readBoardAttachFiles } = await import('./cli/board-command.js');
+  const {
+    BOARD_CLI_USAGE, formatBoardResult, parseBoardArgs, readBoardAttachFiles, readBoardExplainerFiles, splitBoardAttachPaths,
+  } = await import('./cli/board-command.js');
   const parsed = parseBoardArgs(argv);
   if (!parsed.ok) {
     console.error(`botmux board: ${parsed.error}`);
@@ -6696,14 +6735,20 @@ async function cmdBoard(argv: string[]): Promise<void> {
     return;
   }
   const { action, json, request, attachPaths } = parsed.parsed;
+  let explainers: Array<{ name: string; mime: string; bytes: Buffer }> = [];
   if (attachPaths.length) {
-    const files = readBoardAttachFiles(attachPaths);
-    if (!files.ok) {
-      console.error(`botmux board: ${files.error}`);
+    const fail = (error: string) => {
+      console.error(`botmux board: ${error}`);
       process.exitCode = 1;
-      return;
-    }
-    request.files = files.files;
+    };
+    const split = splitBoardAttachPaths(attachPaths);
+    if (!split.ok) return fail(split.error);
+    const images = readBoardAttachFiles(split.images);
+    if (!images.ok) return fail(images.error);
+    const read = readBoardExplainerFiles(split.explainers);
+    if (!read.ok) return fail(read.error);
+    if (images.files.length) request.files = images.files;
+    explainers = read.files;
   }
   const sid = parsed.parsed.sessionId ?? findAncestorSessionId();
   if (!sid) {
@@ -6723,6 +6768,23 @@ async function cmdBoard(argv: string[]): Promise<void> {
     console.error('当前 Bot daemon 不在线。');
     process.exitCode = 1;
     return;
+  }
+  if (explainers.length) {
+    const staged: string[] = [];
+    for (const file of explainers) {
+      const up = await postBoardExplainerUpload(ipcPort, session.sessionId, String(request.ref), file);
+      const upBody = await up.json().catch(() => ({})) as { ok?: boolean; id?: string; error?: string; message?: string; warnings?: string[] };
+      if (!up.ok || !upBody.ok || !upBody.id) {
+        const old = up.status === 401 || (up.status === 404 && upBody.error === 'not_found');
+        console.error(`botmux board attach 失败: ${file.name}：${upBody.message ?? upBody.error ?? `HTTP ${up.status}`}`
+          + (old ? '（daemon 版本过旧，还不支持图文说明；重启 daemon 后再试）' : ''));
+        process.exitCode = 1;
+        return;
+      }
+      for (const w of upBody.warnings ?? []) console.error(`⚠ ${file.name}：${w}`);
+      staged.push(upBody.id);
+    }
+    request.staged = staged;
   }
   const response = await postSessionCliIpc(ipcPort, session.sessionId, 'decision-board', request);
   const body = await response.json().catch(() => ({})) as Record<string, unknown> & { ok?: boolean; error?: string; message?: string };

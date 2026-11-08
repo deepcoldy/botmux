@@ -6,6 +6,16 @@
 import { readFileSync, statSync } from 'node:fs';
 import { basename, extname } from 'node:path';
 import { DASHBOARD_IMAGE_MAX_BYTES } from '../core/dashboard-images.js';
+import {
+  BOARD_EXPLAINER_MIME_BY_EXT,
+  BOARD_EXPLAINERS_PER_ATTACH,
+  BOARD_HTML_MAX_BYTES,
+  BOARD_VIDEO_MAX_BYTES,
+  boardExplainerMaxBytes,
+  boardExplainerTooLargeText,
+} from '../core/decision-board/files.js';
+
+const MB = 1024 * 1024;
 
 export const BOARD_CLI_USAGE = `botmux board — 决策看板（只在管家 bot 的会话里可用）
 
@@ -16,7 +26,7 @@ export const BOARD_CLI_USAGE = `botmux board — 决策看板（只在管家 bot
   botmux board add <标题> --link chat=oc_… [字段…]        新建，必须带群（或 --no-chat "<原因>"）；带 --key 且已存在时按 set 更新（已完成 / 已关闭的不改，重开用 set）
   botmux board set <编号|key> [字段…] [--clear-ask]      改字段；改状态和待拍板内容会自动进历史
   botmux board history <编号|key> <一句话> [--handled]   追加历史；--handled = 这项最近一批决定已执行
-  botmux board attach <编号|key> <图片>... [--note 说明] 附截图（png / jpg / gif / webp）
+  botmux board attach <编号|key> <文件>... [--note 说明] 附截图（png / jpg / gif / webp）或图文说明（.html 说明页 / .mp4 / .webm 视频）
   botmux board pending [--json]                         owner 已提交、还没标记执行的决定
 
 字段:
@@ -44,6 +54,12 @@ export const BOARD_CLI_USAGE = `botmux board — 决策看板（只在管家 bot
   --dismiss-hint          仅 set：收起这一项当前的提示（「建议关闭 / 建议推进 / 该看一眼」），同一条不再出现
   --note <一句话>         同时往历史里记一句
   --title <新标题>        仅 set
+
+图文说明（attach）:
+  .html                   单个文件，图片内嵌成 data URL，UTF-8，不超过 ${BOARD_HTML_MAX_BYTES / MB}MB。看板上不跑脚本、不加载外链
+                          （网址图片、CDN 样式 / 字体），只显示 data: 图片和内联样式
+  .mp4 / .webm            不超过 ${BOARD_VIDEO_MAX_BYTES / MB}MB；mp4 请用 H.264 编码、加 -movflags +faststart（手机上边下边播）
+  一次最多 ${BOARD_EXPLAINERS_PER_ATTACH} 个说明页 / 视频，可以和截图一起附；同一条命令只记一条历史
 
 编号写 12 或 #12 都行。所有子命令加 --json 输出完整 JSON。`;
 
@@ -209,7 +225,7 @@ export function parseBoardArgs(argv: string[]): { ok: true; help: true } | { ok:
     case 'attach': {
       const bad = allowOnly(['--note', '--session-id']);
       if (bad) return { ok: false, error: bad };
-      if (pos.length < 2) return { ok: false, error: '用法: botmux board attach <编号|key> <图片>... [--note 说明]' };
+      if (pos.length < 2) return { ok: false, error: '用法: botmux board attach <编号|key> <文件>... [--note 说明]' };
       request.ref = pos[0];
       attachPaths.push(...pos.slice(1));
       const note = single('--note');
@@ -241,6 +257,43 @@ export function readBoardAttachFiles(paths: string[], read: (p: string) => Buffe
     try { bytes = size(p); } catch { return { ok: false, error: `读不到文件：${p}` }; }
     if (bytes > DASHBOARD_IMAGE_MAX_BYTES) return { ok: false, error: `图片超过 10MB：${p}` };
     files.push({ name: basename(p), mimeType, dataBase64: read(p).toString('base64') });
+  }
+  return { ok: true, files };
+}
+
+/**
+ * attach 的文件按扩展名分两类：截图走原来的 JSON 请求（{@link readBoardAttachFiles}），说明页 / 视频单独上传
+ * （{@link readBoardExplainerFiles}）。两类都不认的直接报错。
+ */
+export function splitBoardAttachPaths(paths: string[]): { ok: true; images: string[]; explainers: string[] } | { ok: false; error: string } {
+  const images: string[] = [];
+  const explainers: string[] = [];
+  for (const p of paths) {
+    const ext = extname(p).toLowerCase();
+    if (IMAGE_MIME[ext]) images.push(p);
+    else if (BOARD_EXPLAINER_MIME_BY_EXT[ext]) explainers.push(p);
+    else return { ok: false, error: `只支持截图（png / jpg / gif / webp）、说明页（.html）和视频（.mp4 / .webm）：${p}` };
+  }
+  if (explainers.length > BOARD_EXPLAINERS_PER_ATTACH) {
+    return { ok: false, error: `一次最多附 ${BOARD_EXPLAINERS_PER_ATTACH} 个说明页 / 视频，分几次 attach` };
+  }
+  return { ok: true, images, explainers };
+}
+
+export interface BoardExplainerFile { name: string; mime: string; bytes: Buffer }
+
+/** 读说明页 / 视频：只认扩展名和大小，文件头和 HTML 写法由 daemon 再验。 */
+export function readBoardExplainerFiles(paths: string[], read: (p: string) => Buffer = p => readFileSync(p),
+  size: (p: string) => number = p => statSync(p).size): { ok: true; files: BoardExplainerFile[] } | { ok: false; error: string } {
+  const files: BoardExplainerFile[] = [];
+  for (const p of paths) {
+    const mime = BOARD_EXPLAINER_MIME_BY_EXT[extname(p).toLowerCase()];
+    if (!mime) return { ok: false, error: `说明页只支持 .html，视频只支持 .mp4 / .webm：${p}` };
+    let bytes: number;
+    try { bytes = size(p); } catch { return { ok: false, error: `读不到文件：${p}` }; }
+    if (bytes > boardExplainerMaxBytes(mime)) return { ok: false, error: boardExplainerTooLargeText(mime, p) };
+    if (bytes === 0) return { ok: false, error: `文件是空的：${p}` };
+    files.push({ name: basename(p), mime, bytes: read(p) });
   }
   return { ok: true, files };
 }
@@ -309,8 +362,13 @@ export function formatBoardResult(action: BoardAction, body: Record<string, unkn
       return `#${body.seq} 已记入历史${handled ? `，标记 ${handled} 个决定已执行` : ''}`;
     }
     case 'attach': {
-      const files = (body.files ?? []) as unknown[];
-      return `#${body.seq} 已附 ${files.length} 张图`;
+      const files = (body.files ?? []) as Array<{ mime?: string }>;
+      const explainers = files.filter(f => typeof f.mime === 'string' && !f.mime.startsWith('image/')).length;
+      if (!explainers) return `#${body.seq} 已附 ${files.length} 张图`;
+      const images = files.length - explainers;
+      const link = linkOf(body as { appLink?: string; url?: string });
+      return `#${body.seq} 已附图文说明 ${explainers} 个${images ? `、截图 ${images} 张` : ''}${link ? `
+${link}` : ''}`;
     }
     case 'pending': {
       const decisions = (body.decisions ?? []) as Array<{ batchId: number; seq: number; title: string; choice?: string; choiceLabel?: string; text: string; images: number; itemChangedSinceDecision?: boolean }>;
