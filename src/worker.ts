@@ -27374,6 +27374,7 @@ async function spawnCli(
         spawnBin,
         spawnArgs,
         readGlobalConfig().worker,
+        { warn: log },
       );
       if (scopeRelease.blocked) {
         log(`Session scope name unavailable, launching under ${scopeRelease.unitName}: ${scopeRelease.blocked}`);
@@ -29131,7 +29132,7 @@ function stopOwnedSessionScope(reason: string): void {
   try {
     // Includes spawn-generation fallback scopes, also ones a previous worker
     // picked before this worker reattached the pane.
-    const stopped = stopAllSessionScopes(cfg.sessionId);
+    const stopped = stopAllSessionScopes(cfg.sessionId, { warn: log });
     log(stopped
       ? `Stopped owned session scope (${reason})`
       : `Owned session scope was absent or could not be stopped (${reason})`);
