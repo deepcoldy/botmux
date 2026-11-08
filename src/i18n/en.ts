@@ -1819,6 +1819,7 @@ export const messages: Record<string, string> = {
   'daemon.force_topic_ready': '💬 New topic created. Send a task in this topic, or use /repo first to choose a project.',
   'daemon.force_topic_started': '↪️ Moved into a new topic and started working…',
   'daemon.force_topic_current_dir_missing': '⚠️ This chat has no current working directory to reuse. Start a normal chat session first, or bind one with /oncall bind.',
+  'daemon.force_topic_worktree_command_unsupported': '⚠️ {cmd} cannot follow /tw directly: the worktree has to exist before the command has somewhere to run. Start the topic with /tw <task> first, then send {cmd} inside the topic once the worktree is ready.',
   // ─── Topic directive header (`[title] /t /repo … /model … body`) rejections ──
   // Fail closed: one bad field voids the whole header, so this reply is the
   // user's only feedback and must name the offending field.

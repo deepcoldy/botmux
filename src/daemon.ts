@@ -5498,10 +5498,11 @@ function resolveForceTopicCurrentWorkingDir(ctx: {
   anchor: string;
   chatId: string;
   larkAppId: string;
-  currentSession?: DaemonSession;
 }): string | undefined {
   const loc = localeForBot(ctx.larkAppId);
-  const current = validateExplicitForceTopicWorkingDir(ctx.currentSession?.workingDir, loc);
+  const currentSession = activeSessions.get(sessionKey(ctx.chatId, ctx.larkAppId))
+    ?? activeSessions.get(sessionKey(ctx.anchor, ctx.larkAppId));
+  const current = validateExplicitForceTopicWorkingDir(currentSession?.workingDir, loc);
   if (current) return current;
 
   const oncall = validateExplicitForceTopicWorkingDir(findOncallChat(ctx.larkAppId, ctx.chatId)?.workingDir, loc);
@@ -5518,6 +5519,29 @@ function resolveForceTopicCurrentWorkingDir(ctx: {
     const resolved = validateExplicitForceTopicWorkingDir(peer.workingDir, loc);
     if (resolved) return resolved;
   }
+  return undefined;
+}
+
+/**
+ * `/th` `/tw` 头后紧跟斜杠命令时用的目录。与常规建会话路径同序：先跑 resolvePinnedWorkingDir
+ * （第 2 层 defaultOncall 自动绑定会写状态，每条 spawn 路径都要照样发生，绑出的 oncall
+ * 目录也是当前目录的一个来源），再取当前目录。取不到时已回复用户，调用方不得再建会话。
+ */
+async function resolveForceTopicSlashWorkingDir(ctx: {
+  scope: 'thread' | 'chat';
+  anchor: string;
+  chatId: string;
+  chatType: 'group' | 'p2p';
+  larkAppId: string;
+  mode: 'here' | 'worktree';
+  reply: (text: string) => Promise<unknown>;
+}): Promise<string | undefined> {
+  const { scope, anchor, chatId, chatType, larkAppId } = ctx;
+  await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  const dir = resolveForceTopicCurrentWorkingDir({ scope, anchor, chatId, larkAppId });
+  if (dir) return dir;
+  await ctx.reply(tr('daemon.force_topic_current_dir_missing', undefined, localeForBot(larkAppId)));
+  logger.warn(`[/t:${ctx.mode}] no current workingDir available for chat ${chatId}`);
   return undefined;
 }
 
@@ -25459,13 +25483,16 @@ async function startInitialPassthroughSession(args: {
   /** 本轮 inbound 进入 durable 队列（staging + append）后回调，供调用方翻转
    *  ingress 接纳标记——之后的 repo card / 状态回复失败不得再诱导重发。 */
   onDurablyAdmitted?: () => void;
+  /** `/th` `/tw` 生命周期头：目录取当前群会话目录而不是 bot 默认目录；`worktree` 再以它为基目录，
+   *  走与 `/tw <任务>` 同一条强制建 worktree 的路径。 */
+  lifecycle?: 'here' | 'worktree';
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
     parsed, promptResources, commandContent, senderOpenId, substitute, senderUnionId,
     memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender,
     senderIsBot, cardlessForceTopicSeed, onDurablyAdmitted,
-    routeToCanonicalOwner,
+    routeToCanonicalOwner, lifecycle,
   } = args;
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender, {
     promptContent: commandContent || parsed.content,
@@ -25473,6 +25500,14 @@ async function startInitialPassthroughSession(args: {
   })) {
     return;
   }
+  // 与常规建会话路径同序：过配额闸之后取目录；放在建会话之前，缺目录时不留会话行。
+  const lifecycleWorkingDir = lifecycle
+    ? await resolveForceTopicSlashWorkingDir({
+        scope, anchor, chatId, chatType, larkAppId, mode: lifecycle,
+        reply: text => sessionReply(anchor, text, 'text', larkAppId),
+      })
+    : undefined;
+  if (lifecycle && !lifecycleWorkingDir) return;
   // Reply attribution's is-bot. `resolvedSenderIsBot` is a BOOLEAN for the
   // legacy consumers that need one (pendingSender.type, quoteTargetSenderIsBot,
   // loser-handoff turn.senderIsBot). `resolvedSenderIsBotTriState` keeps
@@ -25513,10 +25548,12 @@ async function startInitialPassthroughSession(args: {
   fillNativeTopicId(session, scope, parsed.threadId);
   sessionStore.updateSession(session);
 
-  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = lifecycleWorkingDir
+    ? { pinnedWorkingDir: lifecycleWorkingDir, oncallEntry: undefined, inheritedFrom: null, pinnedFromBotDefault: false }
+    : await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
   // Auto-worktree: register PENDING (router buffers, no force-fork) and build the
   // worktree off the critical path (see willAutoWorktree / runAutoWorktreeCommit).
-  const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
+  const autoWt = lifecycle === 'worktree' || willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
   const ds: DaemonSession = {
     session,
     worker: null,
@@ -25561,10 +25598,14 @@ async function startInitialPassthroughSession(args: {
     }
     return;
   }
+  const lifecycleWorktree = lifecycle === 'worktree' && pinnedWorkingDir
+    ? { force: true, ...await forceTopicWorktreeTarget(pinnedWorkingDir, anchor), reuseExisting: true }
+    : undefined;
   if (ds.pendingRepo) {
     stageClaimedPendingRepoSetup(activeSessions, ds, {
       mode: autoWt ? 'auto_worktree' : 'picker',
       ...(autoWt && pinnedWorkingDir ? { baseDir: pinnedWorkingDir } : {}),
+      ...lifecycleWorktree,
       turnId: messageId,
     });
   }
@@ -25581,7 +25622,7 @@ async function startInitialPassthroughSession(args: {
     ds.initialStartPending = false; // pendingRepo/worktree now owns buffering
     // 挂起态提交：worktree 建好后经 runAutoWorktreeCommit → commitRepoSelection 拉起
     // pendingRawInput 冷启动会话。detach → 立即返回，不阻塞本条消息处理。
-    startAutoWorktreePending(ds, { anchor, baseDir: pinnedWorkingDir, title: session.title, prompt: commandContent, operatorOpenId: ownerOpenId });
+    startAutoWorktreePending(ds, { anchor, baseDir: pinnedWorkingDir, title: session.title, prompt: commandContent, operatorOpenId: ownerOpenId, ...lifecycleWorktree });
     return;
   }
 
@@ -25597,7 +25638,9 @@ async function startInitialPassthroughSession(args: {
     forkReservedInitialRawSession(ds, availableBots);
     // fork 成功即开场已交给 CLI；fork 抛错则本轮只存在于内存，保持重发提示。
     onDurablyAdmitted?.();
-    const reason = oncallEntry
+    const reason = lifecycle
+      ? `/t ${lifecycle} current dir`
+      : oncallEntry
       ? `oncall-bound chat ${chatId}`
       : inheritedFrom
       ? `inherited from sibling session ${inheritedFrom.sessionId.substring(0, 8)} (app=${inheritedFrom.larkAppId ?? 'unknown'})`
@@ -26493,21 +26536,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     return;
   }
 
-  // 斜杠命令执行段已搬到 executeNewTopicSlash（输入全部显式）。生命周期头后的
-  // passthrough / 预建型 daemon 命令必须先走下面的 cwd/worktree 会话准备，因此由执行段
-  // 返回 deferred，而不是在 bot 默认目录冷启动或提前建一个未钉目录的命令会话。
-  const newTopicSlash = await executeNewTopicSlash({
+  // 斜杠命令执行段已搬到 executeNewTopicSlash（输入全部显式）；true = 已处理。
+  if (await executeNewTopicSlash({
     ctx, data, larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId, replyAnchorId, parsed, resources, cmdContent,
     senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger,
     forceTopic, forceTopicMode, botCfg,
-  });
-  if (newTopicSlash === true) return;
-  const lifecycleRawOpening = newTopicSlash && newTopicSlash.kind === 'lifecycle_passthrough'
-    ? newTopicSlash.commandContent
-    : undefined;
-  const lifecycleDaemonCommand = newTopicSlash && newTopicSlash.kind === 'lifecycle_daemon'
-    ? newTopicSlash
-    : undefined;
+  })) return;
 
   // A setup-only `/t` must still pass the same talk-permission recheck as any
   // CLI input, but it creates no AI turn and therefore must not consume a
@@ -26635,14 +26669,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // 直接在 `getSessionWorkingDir` 解析出的默认目录里起会话 —— 就是 command-handler 里
   // `!repoArg && ds.pendingRepo` 那条分支（选仓卡「直接开始」按钮的文本孪生）。
   const lifecycleWorkingDir = forceTopic && forceTopicMode !== 'default'
-    ? resolveForceTopicCurrentWorkingDir({
-        scope,
-        anchor,
-        chatId,
-        larkAppId,
-        currentSession: activeSessions.get(sessionKey(chatId, larkAppId))
-          ?? activeSessions.get(sessionKey(anchor, larkAppId)),
-      })
+    ? resolveForceTopicCurrentWorkingDir({ scope, anchor, chatId, larkAppId })
     : undefined;
   if (forceTopic && forceTopicMode !== 'default' && !lifecycleWorkingDir) {
     await sessionReply(
@@ -26813,11 +26840,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     hasHistory: false,
     initialStartPending: true,
     pendingRepo: !pinnedWorkingDir || autoWt,
-    pendingPrompt: lifecycleRawOpening !== undefined || lifecycleDaemonCommand ? '' : promptContent,
-    ...(lifecycleRawOpening !== undefined ? {
-      pendingRawInput: lifecycleRawOpening,
-      pendingRawTurnId: replyAnchorId,
-    } : {}),
+    pendingPrompt: promptContent,
     // Turn identity must equal the reply anchor so current-turn provenance
     // (quoteTargetId === marker.turnId) holds on session-group first turns.
     // Outside a birth replyAnchorId === messageId, so plain paths are unchanged.
@@ -26942,15 +26965,6 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // messages buffered during creation). detach → return immediately.
   if (pinnedWorkingDir && autoWt) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
-    if (lifecycleDaemonCommand) {
-      await handleCommand(
-        lifecycleDaemonCommand.cmd,
-        anchor,
-        { ...parsed, content: lifecycleDaemonCommand.commandContent },
-        commandDepsForInvocation({ scope, chatId, anchor, messageId: parsed.messageId, replyRootId }),
-        larkAppId,
-      );
-    }
     // 已 durable staging（auto_worktree）且通过放弃闸：detached 建库流程接管投递。
     markIngressAdmitted(ctx);
     ds.initialStartPending = false; // pendingRepo/worktree now owns buffering
@@ -26972,17 +26986,6 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // Pinned (oncall binding or inherited from sibling bot): spawn CLI immediately.
   if (pinnedWorkingDir) {
     if (await replyInvalidWorkingDirs(anchor, larkAppId, ds)) return;
-    if (lifecycleDaemonCommand) {
-      await handleCommand(
-        lifecycleDaemonCommand.cmd,
-        anchor,
-        { ...parsed, content: lifecycleDaemonCommand.commandContent },
-        commandDepsForInvocation({ scope, chatId, anchor, messageId: parsed.messageId, replyRootId }),
-        larkAppId,
-      );
-      markIngressAdmitted(ctx);
-      return;
-    }
     // 指令头只交代规格、没写任务：空跑 CLI 等下一条（详见 forkReservedIdleSession）。
     // 这条路径不产生 AI 回合、也没有流式卡片，所以用一句确认回显真正钉下去的东西。
     if (topicHeaderIdleStart && !hasBufferedOpeningInput(ds)) {
@@ -27004,11 +27007,6 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       messageId,
     });
     const availableBots = await getAvailableBots(larkAppId, chatId);
-    if (lifecycleRawOpening !== undefined) {
-      forkReservedInitialRawSession(ds, availableBots);
-      markIngressAdmitted(ctx);
-      return;
-    }
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
     await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
@@ -27093,11 +27091,6 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       messageId,
     });
     const availableBots = await getAvailableBots(larkAppId, chatId);
-    if (lifecycleRawOpening !== undefined) {
-      forkReservedInitialRawSession(ds, availableBots);
-      markIngressAdmitted(ctx);
-      return;
-    }
     // Ack reaction targets the ORIGINAL inbound message (2nd arg); the turn id
     // (5th arg) is the reply anchor so provenance holds on session-group births.
     await noteTurnReceived(ds, messageId, content, newTopicSender, replyAnchorId, substituteTrigger ? SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE : undefined);
@@ -27146,16 +27139,7 @@ interface NewTopicSlashContext {
   botCfg: ReturnType<typeof getBot>['config'];
 }
 
-type NewTopicSlashExecution = boolean | {
-  kind: 'lifecycle_passthrough';
-  commandContent: string;
-} | {
-  kind: 'lifecycle_daemon';
-  cmd: string;
-  commandContent: string;
-};
-
-async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<NewTopicSlashExecution> {
+async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolean> {
   const { ctx, data, larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId, replyAnchorId, parsed, resources, cmdContent, senderOpenId, senderUnionId, teamTrustUnionId, isBotSenderType, isForeignBotSender, substituteTrigger, forceTopic, forceTopicMode, botCfg } = slash;
   // Intercept daemon commands in new topics (no session needed for some commands)
   // acceptSlashFromBots gate: a bot sender's slash command is only routed as a
@@ -27297,11 +27281,6 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<NewTop
       return true;
     }
     if (slashDecision.kind === 'passthrough') {
-      // 生命周期变体先准备当前目录 / worktree，再把原始命令作为 pendingRawInput 交给
-      // forkReservedInitialRawSession；不能落进普通 prompt，否则 CLI 看见的是 XML 包装文本。
-      if (forceTopicMode !== 'default') {
-        return { kind: 'lifecycle_passthrough', commandContent };
-      }
       if (slashDecision.delivery === 'cold_start') {
         await startInitialPassthroughSession({
           promptResources: resources,
@@ -27325,6 +27304,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<NewTop
           // passthrough 也能让 bot→bot 的 --mention-back 直通不对称门禁。
           senderIsBot: isForeignBotSender,
           cardlessForceTopicSeed: forceTopic !== null,
+          lifecycle: forceTopicMode === 'default' ? undefined : forceTopicMode,
           // New-topic senders are humans here (mirrors the normal new-topic
           // spawn path, which assigns ownership unconditionally too).
           ownerOpenId: senderOpenId,
@@ -27382,12 +27362,22 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<NewTop
         await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, invocationDeps, larkAppId);
         return true;
       }
-      // Lifecycle headers own cwd/worktree preparation. Defer precreate commands until the
-      // ordinary new-session path has resolved and persisted that setup; otherwise this
-      // branch creates a command scratch in the bot default directory and skips `/th`/`/tw`.
-      if (forceTopicMode !== 'default') {
-        return { kind: 'lifecycle_daemon', cmd, commandContent };
+      // `/tw` + 预建型命令：worktree 在后台异步建，命令执行时会话还没有落地目录——
+      // /status 只能报基目录、/cd 会被随后建好的 worktree 盖掉、/close 之后 worktree
+      // 照建不误。没有说得通的组合语义，直接拒绝并告诉用户怎么做，不建任何会话。
+      if (forceTopicMode === 'worktree') {
+        await invocationDeps.sessionReply(anchor, tr('daemon.force_topic_worktree_command_unsupported', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        return true;
       }
+      // `/th` + 预建型命令：与默认路径同一个命令会话（不建开场、不过配额闸），只是目录
+      // 钉在当前群会话目录上，话题里之后的真实任务从这里 fork。
+      const lifecycleWorkingDir = forceTopicMode === 'here'
+        ? await resolveForceTopicSlashWorkingDir({
+            scope, anchor, chatId, chatType, larkAppId, mode: forceTopicMode,
+            reply: text => invocationDeps.sessionReply(anchor, text, 'text', larkAppId),
+          })
+        : undefined;
+      if (forceTopicMode === 'here' && !lifecycleWorkingDir) return true;
       // Same rootMessageId reasoning as below in the main spawn path:
       // thread-scope MUST anchor on the thread root or sessionAnchorId() will
       // disagree with activeSessions's key and downstream card buttons silently
@@ -27423,7 +27413,9 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<NewTop
       // spawn path" (see resolvePinnedWorkingDir) — skipping it here also left
       // that write undone for the whole life of the chat, since later turns
       // reuse this session and never re-enter a spawn path.
-      const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+      const { pinnedWorkingDir, pinnedFromBotDefault } = lifecycleWorkingDir
+        ? { pinnedWorkingDir: lifecycleWorkingDir, pinnedFromBotDefault: false }
+        : await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
       // …EXCEPT when that dir would have triggered auto-worktree. There the bot
       // default is a worktree BASE, not a launch dir: the ordinary spawn paths
       // answer it with `pendingRepo` + a detached worktree build, which a daemon
