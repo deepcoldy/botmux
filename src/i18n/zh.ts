@@ -1325,6 +1325,7 @@ export const messages: Record<string, string> = {
   'ai.followup.reminder_hook': '本会话通过 botmux 桥接飞书,终端里的输出用户看不到。会话约定:回复通过 botmux send 发送到飞书会话;发什么、发几条由你判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND。',
   'ai.followup.reminder_no_resend': '发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND;send 成功即已送达,本轮无可见文本地结束是正常的,别因「无输出」提示重发',
   'ai.followup.feishu_safe_emphasis': '短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。',
+  'ai.followup.no_local_addresses': '回复里不要放开发机路径、文件协议或本机服务地址，文件用附件或可访问链接。',
   // No-transport 续轮（apiOnly bot / HTTP 虚拟会话）：这是程序发起的请求-应答，无飞书
   // 会话、无其它 bot 协作，也不该 botmux send。哨兵语义只在本轮内容里的
   // <botmux_http_response_mode> 出现一次（迁移不删，#808 async settle 依赖它），

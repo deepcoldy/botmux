@@ -488,6 +488,19 @@ describe('botmux routing prose XML boundaries', () => {
   });
 });
 
+describe('local-address rule placement', () => {
+  it.each(['zh', 'en'] as const)('states the full rule once per session and a one-line reminder per turn (%s)', locale => {
+    const rule = t('ai.routing.no_local_addresses', undefined, locale);
+    const reminder = t('ai.followup.no_local_addresses', undefined, locale);
+    expect(buildBotmuxSystemPromptText({ locale })).toContain(rule);
+    expect(buildBotmuxShellHints(locale).join('\n')).toContain(rule);
+    const followUp = buildFollowUpContent('hello', 'sid-rule', { locale });
+    expect(followUp).toContain(reminder);
+    expect(followUp).not.toContain(rule);
+    expect(reminder.length * 2).toBeLessThan(rule.length);
+  });
+});
+
 describe('buildFollowUpContent', () => {
   const SESSION_ID = 'follow-up-session-456';
 

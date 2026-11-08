@@ -71,11 +71,13 @@ function feedbackResponseKindHint(locale?: Locale): string {
   return t('ai.routing.feedback_response_kind', undefined, locale);
 }
 
-/** Per-turn Lark presentation rules, shared by inline and hook envelopes. */
+/** Per-turn Lark presentation rules, shared by inline and hook envelopes. Every
+ *  follow-up carries these, so the local-address rule is one sentence here; the
+ *  full rule rides once in the system prompt or opening routing hints. */
 export function feishuReplyPresentationGuidance(locale?: Locale): string {
   return [
     t('ai.followup.feishu_safe_emphasis', undefined, locale),
-    t('ai.routing.no_local_addresses', undefined, locale),
+    t('ai.followup.no_local_addresses', undefined, locale),
   ].join('\n');
 }
 
