@@ -151,8 +151,7 @@ built-in defaults
         "maxLength": 1000
       }
     },
-    "allowReselect": false,
-    "buttonAlign": "left"
+    "allowReselect": false
   }
 }
 ```
