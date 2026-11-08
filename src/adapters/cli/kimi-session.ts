@@ -29,9 +29,11 @@ export function isKimiSessionId(id: string | undefined): id is string {
   return !!id && KIMI_SESSION_ID_RE.test(id);
 }
 
-interface IndexEntry { sessionId: string; sessionDir: string; workDir?: string }
+export interface KimiSessionIndexEntry { sessionId: string; sessionDir: string; workDir?: string }
+type IndexEntry = KimiSessionIndexEntry;
 
-function readIndex(home: string): IndexEntry[] {
+/** Live (non-deleted) entries of `<home>/session_index.jsonl`, in file order. */
+export function readKimiSessionIndex(home: string): KimiSessionIndexEntry[] {
   let text: string;
   try { text = readFileSync(join(home, 'session_index.jsonl'), 'utf8'); } catch { return []; }
   const deleted = new Set<string>();
@@ -49,7 +51,7 @@ function readIndex(home: string): IndexEntry[] {
   return entries.filter(e => !deleted.has(e.sessionId));
 }
 
-function sameDir(a: string, b: string): boolean {
+export function sameKimiWorkDir(a: string, b: string): boolean {
   const variants = (p: string) => {
     const out = [resolve(p)];
     try { out.push(realpathSync(p)); } catch { /* lexical only */ }
@@ -72,9 +74,9 @@ export function findKimiSessionForBotmuxSession(
   const home = kimiHome(env);
   const sessionsRoot = resolve(join(home, 'sessions')) + sep;
   const marker = `<session_id>${botmuxSessionId}</session_id>`;
-  const entries = readIndex(home).reverse();
+  const entries = readKimiSessionIndex(home).reverse();
   for (const entry of entries) {
-    if (workingDir && entry.workDir && !sameDir(entry.workDir, workingDir)) continue;
+    if (workingDir && entry.workDir && !sameKimiWorkDir(entry.workDir, workingDir)) continue;
     const dir = resolve(entry.sessionDir);
     // Same containment rule Kimi applies to index entries.
     if (!dir.startsWith(sessionsRoot) || dir.split(sep).pop() !== entry.sessionId) continue;

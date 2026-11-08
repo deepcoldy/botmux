@@ -208,6 +208,40 @@ describe('resolveAsyncTriggerState — failed', () => {
     });
   });
 
+  it('the raw error and screen tail of a worker-terminal failure only for a lookup that asks for them', () => {
+    const memResult = {
+      status: 'failed' as const,
+      failedAt: 7000,
+      errorCode: 'trigger_failed' as const,
+      terminalErrorCode: 'provider_authentication_failed',
+    };
+    const diagnostics = { terminalErrorDetail: 'API Error: 403 Access denied for model x', terminalScreenTail: '❯ API Error: 403' };
+    const lookup = (withDiagnostics: boolean, includeFailureDiagnostics?: boolean) => resolveAsyncTriggerState({
+      sessionId: 's1',
+      liveActive: true,
+      storedStatus: 'open',
+      memTriggerId: 'trg_a',
+      memResult: withDiagnostics ? { ...memResult, ...diagnostics } : memResult,
+      ...(includeFailureDiagnostics === undefined ? {} : { includeFailureDiagnostics }),
+    });
+
+    // The HTTP trigger-result route does not ask: the same response as a
+    // failure that never had them.
+    for (const asked of [undefined, false]) {
+      const response = lookup(true, asked);
+      expect('terminalErrorDetail' in response).toBe(false);
+      expect('terminalScreenTail' in response).toBe(false);
+      expect(response).toEqual(lookup(false, asked));
+    }
+    // The draft's in-process lookup asks.
+    expect(lookup(true, true)).toMatchObject({
+      state: 'failed', terminalErrorCode: 'provider_authentication_failed', ...diagnostics,
+    });
+    const without = lookup(false, true);
+    expect('terminalErrorDetail' in without).toBe(false);
+    expect('terminalScreenTail' in without).toBe(false);
+  });
+
   it('rebuilds an explicit worker terminal from durable state after restart', () => {
     const r = resolveAsyncTriggerState({
       sessionId: 's1',
