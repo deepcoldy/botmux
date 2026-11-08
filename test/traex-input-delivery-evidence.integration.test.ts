@@ -12,6 +12,8 @@ import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import { workerTmuxArgs } from './helpers/worker-tmux-session.js';
 
 const delay = (ms: number) => new Promise<void>(done => setTimeout(done, ms));
+/** Longest gap between two polls that still counts against a step budget. */
+const MAX_POLL_CHARGE_MS = 250;
 type Submission = { text: string; nativeTurnId: string };
 
 describe('TraeX input delivery evidence ordering', () => {
@@ -115,14 +117,20 @@ setInterval(() => {
       const sent = (content: string, turnId: string) => child.send({ type: 'message', content, turnId });
       const received = (): Submission[] => readFileSync(submissions, 'utf8')
         .split('\n').filter(Boolean).map(line => JSON.parse(line));
-      const wait = async (predicate: () => boolean, label: string, timeout = 12_000) => {
-        const deadline = Date.now() + timeout;
-        while (Date.now() < deadline) {
-          if (predicate()) return;
+      // A step budget counts only time this process was scheduled. A runner
+      // stall suspends the worker and this test together, and a wall-clock
+      // deadline would charge all of it to whichever step happened to wait.
+      const wait = async (predicate: () => boolean, label: string, budgetMs = 12_000) => {
+        let spent = 0;
+        let last = performance.now();
+        while (!predicate()) {
           if (child.exitCode !== null || child.signalCode !== null) throw new Error(`worker exited: ${label}\n${logs.join('')}`);
+          if (spent >= budgetMs) throw new Error(`timeout: ${label}\n${logs.join('')}`);
           await delay(25);
+          const now = performance.now();
+          spent += Math.min(now - last, MAX_POLL_CHARGE_MS);
+          last = now;
         }
-        throw new Error(`timeout: ${label}\n${logs.join('')}`);
       };
       const nativeEvent = (payload: unknown) => appendFileSync(rollout,
         `${JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload })}\n`);
@@ -132,6 +140,9 @@ setInterval(() => {
           cliId: 'traex', cliPathOverride: fake, cliSessionId: nativeSessionId, resume: true,
           backendType: 'tmux', prompt: '', larkAppId: 'app_test', larkAppSecret: 'dummy_test_secret', locale: 'zh',
         });
+        // Loading worker.ts through tsx on a cold cache took 22-25s on a starved
+        // runner; that is harness cost, so it gets its own budget.
+        await wait(() => logs.join('').includes('Worker started, waiting for init'), 'worker booted', 60_000);
         await wait(() => messages.some(m => m.type === 'prompt_ready'), 'initial readiness', 30_000);
         sent('check version', 'om_first');
         await wait(() => received().length === 1, 'first input received');
@@ -201,6 +212,7 @@ setInterval(() => {
         rmSync(root, { recursive: true, force: true });
       }
     },
-    80_000,
+    // Wall clock: unlike the step budgets it includes runner stalls.
+    120_000,
   );
 });
