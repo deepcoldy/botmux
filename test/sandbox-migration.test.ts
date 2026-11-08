@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { migrateSandboxConfigAtStartup, migrateSandboxConfigOnDisk } from '../src/services/sandbox-migration.js';
+import { parseBotConfigsFromText } from '../src/bot-registry.js';
 import { withFileLock } from '../src/utils/file-lock.js';
 
 let dir: string;
@@ -87,6 +88,140 @@ describe('migrateSandboxConfigOnDisk', () => {
     write(entries);
     await migrateSandboxConfigOnDisk(botsPath);
     expect(readFileSync(`${botsPath}.bak-sandbox-v1`, 'utf-8')).toBe(bakContent);
+  });
+});
+
+describe('migration output stays loadable under strict sandbox field validation (#2530)', () => {
+  it.each([
+    ['legacy deny', { sandbox: true, sandboxHidePaths: ['~/.ssh', null] }],
+    ['legacy readOnly', { sandbox: true, sandboxReadonlyPaths: ['/srv/ro', 42] }],
+    ['readDenyExtraPaths', { readIsolation: true, readDenyExtraPaths: ['~/x', 7] }],
+  ])('sanitizes non-string legacy elements so the migrated file parses (%s)', async (_label, entry) => {
+    write([{ larkAppId: 'cli_a', larkAppSecret: 's', name: 'a', ...entry }]);
+    const { migrated } = await migrateSandboxConfigOnDisk(botsPath);
+    expect(migrated).toEqual(['cli_a']);
+    expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).not.toThrow();
+  });
+
+  it('re-migrates an already-persisted malformed sandboxPaths back into a loadable shape', async () => {
+    // An older build wrote the raw, unsanitized migration output to disk.
+    write([{
+      larkAppId: 'cli_a', larkAppSecret: 's', name: 'a',
+      sandbox: true,
+      sandboxHidePaths: ['~/.ssh', null],
+      sandboxPaths: { deny: ['~/.ssh', null] },
+    }]);
+    const { migrated } = await migrateSandboxConfigOnDisk(botsPath);
+    expect(migrated).toEqual(['cli_a']);
+    expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).not.toThrow();
+    expect(read()[0].sandboxPaths).toEqual({ deny: ['~/.ssh'] });
+  });
+
+  it('drops a malformed sandboxPaths when every legacy element is non-string', async () => {
+    // Nothing valid survives sanitization; the unloadable on-disk value must be
+    // removed rather than left to reject the whole bots.json at next startup.
+    write([{
+      larkAppId: 'cli_a', larkAppSecret: 's', name: 'a',
+      sandbox: true,
+      sandboxHidePaths: [null, 42],
+      sandboxPaths: { deny: [null, 42] },
+    }]);
+    const { migrated } = await migrateSandboxConfigOnDisk(botsPath);
+    expect(migrated).toEqual(['cli_a']);
+    expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).not.toThrow();
+    expect(read()[0].sandboxPaths).toBeUndefined();
+  });
+
+  it('repairs a malformed on-disk tier in place without losing its valid entries', async () => {
+    // No legacy source at all: the surviving string element must be kept —
+    // repairing loadability must never widen the sandbox by dropping a deny.
+    write([{
+      larkAppId: 'cli_a', larkAppSecret: 's', name: 'a',
+      sandbox: true,
+      sandboxPaths: { deny: ['/srv/secret', null] },
+    }]);
+    await migrateSandboxConfigOnDisk(botsPath);
+    const tiers = read()[0].sandboxPaths;
+    expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).not.toThrow();
+    expect(tiers.deny).toContain('/srv/secret');
+    expect(tiers.deny).toEqual(['/srv/secret']);
+  });
+
+  it('keeps valid on-disk tiers authoritative; stale legacy only fills absent tiers', async () => {
+    write([{
+      larkAppId: 'cli_a', larkAppSecret: 's', name: 'a',
+      sandbox: true,
+      sandboxHidePaths: ['~/.ssh'], // retained-for-downgrade legacy, now stale
+      sandboxPaths: { deny: ['/srv/secret', 42], readWrite: ['/srv/work'] },
+    }]);
+    await migrateSandboxConfigOnDisk(botsPath);
+    const tiers = read()[0].sandboxPaths;
+    expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).not.toThrow();
+    // Monotonicity: every valid on-disk entry survives the repair.
+    expect(tiers.deny).toEqual(['/srv/secret']);
+    expect(tiers.readWrite).toEqual(['/srv/work']);
+    // Stale legacy must not overwrite an existing on-disk tier.
+    expect(tiers.deny).not.toContain('~/.ssh');
+  });
+
+  it('fills an absent on-disk tier from legacy while repairing a malformed sibling', async () => {
+    write([{
+      larkAppId: 'cli_a', larkAppSecret: 's', name: 'a',
+      sandbox: true,
+      sandboxHidePaths: ['/legacy-deny'],
+      sandboxPaths: { readOnly: ['/srv/ro', 9] },
+    }]);
+    await migrateSandboxConfigOnDisk(botsPath);
+    const tiers = read()[0].sandboxPaths;
+    expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).not.toThrow();
+    expect(tiers.readOnly).toEqual(['/srv/ro']);
+    expect(tiers.deny).toEqual(['/legacy-deny']);
+  });
+
+  it.each([
+    ['scalar deny string', { deny: '~/.ssh' }],
+    ['scalar readOnly number', { readOnly: 42 }],
+    ['scalar readWrite boolean', { readWrite: true }],
+  ])('does not silently delete a scalar tier without a legacy source — stays fail-closed (%s)', async (_label, tiers) => {
+    // issue #2530 literal shape: a hand-written scalar carries an intent the
+    // migration cannot extract. Deleting it would widen the sandbox before the
+    // parser ever runs, so migration must leave the entry untouched and let the
+    // strict loader report the exact bad field.
+    write([{
+      larkAppId: 'cli_a', larkAppSecret: 's', name: 'a',
+      sandbox: true,
+      sandboxPaths: tiers,
+    }]);
+    const { migrated } = await migrateSandboxConfigOnDisk(botsPath);
+    expect(migrated).toEqual([]);
+    expect(read()[0].sandboxPaths).toEqual(tiers);
+    expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).toThrow(/must be an array of path strings|must be an object/);
+  });
+
+  it('still fail-closes when one tier is valid but a sibling scalar has no legacy source', async () => {
+    write([{
+      larkAppId: 'cli_a', larkAppSecret: 's', name: 'a',
+      sandbox: true,
+      sandboxPaths: { deny: ['/good'], readWrite: 5 },
+    }]);
+    const { migrated } = await migrateSandboxConfigOnDisk(botsPath);
+    expect(migrated).toEqual([]);
+    expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).toThrow(/sandboxPaths\.readWrite/);
+    // The valid sibling stays on disk for the operator's repair.
+    expect(read()[0].sandboxPaths.deny).toEqual(['/good']);
+  });
+
+  it('repairs a scalar tier from legacy when a legacy source exists', async () => {
+    write([{
+      larkAppId: 'cli_a', larkAppSecret: 's', name: 'a',
+      sandbox: true,
+      sandboxHidePaths: ['/legacy-deny'],
+      sandboxPaths: { deny: '~/.ssh' },
+    }]);
+    const { migrated } = await migrateSandboxConfigOnDisk(botsPath);
+    expect(migrated).toEqual(['cli_a']);
+    expect(() => parseBotConfigsFromText(readFileSync(botsPath, 'utf-8'))).not.toThrow();
+    expect(read()[0].sandboxPaths.deny).toEqual(['/legacy-deny']);
   });
 });
 

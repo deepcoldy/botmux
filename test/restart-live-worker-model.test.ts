@@ -20,6 +20,15 @@
  * Run:  pnpm vitest run test/restart-live-worker-model.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const transcriptPathMock = vi.fn();
+vi.mock('../src/services/transcript-resolver.js', async (original) => ({
+  ...await original<typeof import('../src/services/transcript-resolver.js')>(),
+  resolveSessionTranscriptPath: (...args: unknown[]) => transcriptPathMock(...args),
+}));
 
 vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -46,6 +55,8 @@ import {
   __testOnly_resetRestartCoordinator,
 } from '../src/core/worker-pool.js';
 import { resolveSessionLaunchModel } from '../src/core/session-model.js';
+import { recordCodexModelLaunch } from '../src/services/codex-model-selection.js';
+import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 
 let sessionCounter = 0;
 
@@ -73,7 +84,69 @@ function observer() {
 beforeEach(() => {
   getBotMock.mockReset();
   updateSessionMock.mockReset();
+  transcriptPathMock.mockReset();
   __testOnly_resetRestartCoordinator();
+});
+
+describe('native Codex settings enter both real launch paths', () => {
+  let dir: string;
+  const start = Date.parse('2026-11-04T00:00:00.000Z');
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(start);
+    dir = mkdtempSync(join(tmpdir(), 'botmux-native-resume-'));
+    const path = join(dir, 'rollout.jsonl');
+    writeFileSync(path, JSON.stringify({ timestamp: new Date(start + 100).toISOString(), type: 'event_msg',
+      payload: { type: 'thread_settings_applied', thread_settings: { model: 'native-B' } },
+    }) + '\n');
+    transcriptPathMock.mockReturnValue({ path, kind: 'codex' });
+    getBotMock.mockReturnValue({ config: { cliId: 'codex', model: 'default-A' } });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('sends the confirmed native choice in a live-worker restart', () => {
+    const { ds, send } = makeDs({ cliSessionId: 'native-1', model: 'default-A' });
+    recordCodexModelLaunch(ds.session, 'default-A');
+    vi.setSystemTime(start + 1000);
+    requestSessionRestart(ds, observer());
+    expect(send.mock.calls[0][0]).toMatchObject({ type: 'restart', model: 'native-B' });
+    expect(ds.session.codexModelSelection).toMatchObject({ nativeSessionId: 'native-1', override: 'native-B' });
+  });
+
+  it('recovers a native choice on cold launch without a worker runtime update', () => {
+    const { ds } = makeDs({ cliSessionId: 'native-1', model: 'default-A', agentFrozen: true });
+    recordCodexModelLaunch(ds.session, 'default-A');
+    vi.setSystemTime(start + 1000);
+    const restored = { ...ds, session: JSON.parse(JSON.stringify(ds.session)), worker: null };
+    const result = __testOnly_sessionAgentConfig(restored, { cliId: 'codex', model: 'default-A' });
+    expect(result.model).toBe('native-B');
+    const args = createCodexAdapter('/test/codex').buildArgs({
+      sessionId: restored.session.sessionId, workingDir: dir,
+      resume: true, resumeSessionId: 'native-1', model: result.model,
+    });
+    expect(args[args.indexOf('--model') + 1]).toBe('native-B');
+    expect(restored.session.model).toBe('native-B');
+    expect(updateSessionMock).toHaveBeenCalledWith(restored.session);
+  });
+
+  it('keeps a saved preference when the native file is unavailable', () => {
+    const { ds } = makeDs({ cliSessionId: 'native-1', model: 'native-B', codexModelSelection: {
+      nativeSessionId: 'native-1', launchModel: 'native-B', launchStartedAtMs: start, override: 'native-B',
+    } });
+    transcriptPathMock.mockReturnValue({ path: join(dir, 'missing.jsonl'), kind: 'codex' });
+    expect(latestModelForRespawn(ds)).toBe('native-B');
+  });
+
+  it('does not consult native settings or change model policy for another CLI', () => {
+    const { ds } = makeDs({ cliId: 'claude-code', model: 'sonnet', cliSessionId: 'native-1' });
+    getBotMock.mockReturnValue({ config: { cliId: 'claude-code', model: 'opus' } });
+    expect(latestModelForRespawn(ds)).toBe('opus');
+    expect(transcriptPathMock).not.toHaveBeenCalled();
+    expect(ds.session.codexModelSelection).toBeUndefined();
+  });
 });
 
 afterEach(() => {
@@ -165,7 +238,9 @@ describe('an in-worker respawn converges the rule-3 record too', () => {
 
     expect(latestModelForRespawn(ds)).toBe('gpt-5.6-terra');
     expect(ds.session.model).toBe('gpt-5.5');
-    expect(updateSessionMock).not.toHaveBeenCalled();
+    // Record the one-shot launch BASELINE, without turning it into a preference.
+    expect(ds.session.codexModelSelection).toMatchObject({ launchModel: 'gpt-5.6-terra' });
+    expect(ds.session.codexModelSelection.override).toBeUndefined();
   });
 
   // THE state sequence the record exists for: launch on A → live `/restart`

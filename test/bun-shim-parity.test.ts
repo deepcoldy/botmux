@@ -384,6 +384,7 @@ describe('exact-path env overrides are cleared by the shared fence', () => {
     'BOTMUX_USAGE_DIR',
     'BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH',
     'BOTMUX_CORE_STATE_DIR',
+    'BOTMUX_GLOBAL_CONFIG_FILE',
     'MIRAMCP_CONFIG_PATH',
     'MIRA_CONFIG_PATH',
     'MIRAMCP_PID_FILE',
@@ -392,7 +393,7 @@ describe('exact-path env overrides are cleared by the shared fence', () => {
   it('deletes every one of them even when the caller had them set', () => {
     // Drive the helper against a THROWAWAY env object, not `process.env`. The
     // helper also rewrites the CLI homes (`CODEX_HOME`, `GROK_HOME`, …) and the
-    // `XDG_*`/Windows profile dirs, so snapshotting only the nine keys asserted
+    // `XDG_*`/Windows profile dirs, so snapshotting only the ten keys asserted
     // here would leave any of those the caller had set pointing at the temp dir
     // this test then deletes — a dangling path for every later test in the
     // process. An isolated object sidesteps the whole restore problem.

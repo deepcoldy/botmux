@@ -1,6 +1,7 @@
 import { getBot, type GroupMessageListenerOverride, type MessageListenerConfig } from '../bot-registry.js';
 import { rmwBotEntry } from './config-store.js';
 import { normalizeListenerContentPolicy } from './message-listener-content-policy.js';
+import { normalizeMessageListenerReplyMode } from './message-listener-reply-policy.js';
 
 export type MessageListenerUpdate = {
   enabled: boolean;
@@ -99,7 +100,7 @@ export function sanitizeMessageListenerUpdate(raw: unknown): MessageListenerUpda
     ...(Object.keys(senderPolicy).length > 0 ? { senderPolicy } : {}),
     messagePolicy,
     ...(contentPolicy ? { contentPolicy } : {}),
-    ...(rawReply.mode === 'chat' ? { replyPolicy: { mode: 'chat', sessionMode: 'per_message' } } : {}),
+    replyPolicy: { mode: normalizeMessageListenerReplyMode(rawReply.mode), sessionMode: 'per_message' },
   };
 }
 
@@ -169,7 +170,7 @@ export function messageListenerConfigFromUpdate(patch: MessageListenerUpdate): M
     ...(patch.senderPolicy && Object.keys(patch.senderPolicy).length > 0 ? { senderPolicy: patch.senderPolicy } : {}),
     ...(patch.messagePolicy ? { messagePolicy: { ...patch.messagePolicy, scope: 'top_level' } } : { messagePolicy: { scope: 'top_level' } }),
     ...(patch.contentPolicy ? { contentPolicy: patch.contentPolicy } : {}),
-    replyPolicy: { mode: patch.replyPolicy?.mode === 'chat' ? 'chat' : 'thread', sessionMode: 'per_message' },
+    replyPolicy: { mode: normalizeMessageListenerReplyMode(patch.replyPolicy?.mode), sessionMode: 'per_message' },
   };
 }
 

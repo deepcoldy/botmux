@@ -386,6 +386,22 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().repoPickerMode).toBe('repos');
   });
 
+  it('reads worktreeRoot as a trimmed absolute or ~/-prefixed path', () => {
+    for (const worktreeRoot of ['/data00/worktrees', '~/wts']) {
+      writeFileSync(globalConfigPath(), JSON.stringify({ worktreeRoot: ` ${worktreeRoot} ` }));
+      invalidateGlobalConfigCache();
+      expect(readGlobalConfig().worktreeRoot).toBe(worktreeRoot);
+    }
+  });
+
+  it('ignores relative or non-string worktreeRoot values', () => {
+    for (const worktreeRoot of ['wts', '~other/wts', '   ', 42]) {
+      writeFileSync(globalConfigPath(), JSON.stringify({ worktreeRoot }));
+      invalidateGlobalConfigCache();
+      expect(readGlobalConfig().worktreeRoot).toBeUndefined();
+    }
+  });
+
   it('preserves separator whitespace in groupNamePrefix', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({ groupNamePrefix: '  [AI] ' }));
     expect(readGlobalConfig().groupNamePrefix).toBe('  [AI] ');

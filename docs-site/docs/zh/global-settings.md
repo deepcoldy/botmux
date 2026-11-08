@@ -23,6 +23,7 @@
 | 定时任务按某个时区算 | 通用设置 → 定时任务 → 时区 | `scheduleTimeZone` | 跟随主机 |
 | `/g` 建的群自动加前缀 | 通用设置 → 群聊创建 | `groupNamePrefix` | 不加 |
 | 选仓卡里不显示 worktree | 通用设置 → 仓库选择 | `repoPickerMode` | 仓库 + worktree |
+| 新建的 worktree 放到大数据盘 | 通用设置 → Worktree | `worktreeRoot` | 建在主仓库旁边 |
 | 下载新版走代理 | 系统与维护 → 自动维护 → GitHub 下载代理 | `httpProxy` | 不设 |
 | `/login` 授权后不用手动粘贴链接 | 通用设置 → 访问权限 → OAuth 回调基址 | `oauthRedirectBase` | 不设 |
 
@@ -136,6 +137,7 @@ botmux worker-budget unset                           # 清掉自定义，回到�
 
 - **`/g` 群名前缀**（通用设置 → 群聊创建，`groupNamePrefix`）：用 `/group` 或 `/g` 建群时，群名前面自动加上这段文字，例如 `AI讨论·`。别的建群方式不加。清空保存就关掉，最多约 2 秒生效。详见[一键新建会话群](/group)。
 - **仓库选择卡模式**（通用设置 → 仓库选择，`repoPickerMode`）：`all`（默认，仓库和它的 worktree 都列出来）或 `repos`（只列主仓库）。选了 `repos` 后，直接写 `/repo <worktree 路径>` 仍然能进 worktree。
+- **worktree 存放目录**（通用设置 → Worktree，`worktreeRoot`）：botmux 新建的 worktree 放到这个目录下，例如 `/data00/worktrees`，适合系统盘小、另有大数据盘的机器。目录下按主仓库所在路径分层：`/root/iserver/botmux` 的 worktree 会建成 `/data00/worktrees/root/iserver/botmux-wt-…`，所以不同位置的同名仓库不会冲突。填一个已存在、可写的目录的绝对路径（可以 `~/` 开头）。只影响之后新建的 worktree，已有的留在原处照常使用，之后再换目录也不影响。这个目录之后若不存在或不可写（比如数据盘没挂上、被重新挂成只读），新 worktree 会临时建回主仓库旁边，并在日志里告警。清空保存就恢复为建在主仓库旁边，最多约 2 秒生效。
 
 ## 网络与访问
 

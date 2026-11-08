@@ -12,6 +12,7 @@ type Settings = ComponentProps<typeof SettingsBody>['settings'];
 
 const settings: Settings = {
   groupNamePrefix: '',
+  worktreeRoot: '',
   publicReadOnly: false,
   openTerminalInFeishu: false,
   enableLocalCliOpen: false,
