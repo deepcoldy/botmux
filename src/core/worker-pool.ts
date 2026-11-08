@@ -10,7 +10,7 @@ import { deploymentContinuationAuthority } from './deployment-continuation-autho
 import { CliProgressNotifier, cliProgressNoticeCard } from '../services/cli-progress-notice.js';
 import { traexStreamCardActivity } from './stream-card-activity.js';
 import { listPendingAsks } from './ask-broker.js';
-import { PERMISSION_ALLOW_KEY, PERMISSION_DENY_KEY } from './ask-hook/types.js';
+import { isHookPermissionAsk } from './ask-hook/types.js';
 import { captureCodexCleanupRelease, type CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
 import { removeP2pForceTopicRoot } from '../services/p2p-force-topic-store.js';
 import { archiveCodexForCleanup, ownedLocalCodex } from '../services/codex-cleanup-archive.js';
@@ -95,6 +95,8 @@ import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableR
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { resolveCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
+import { refundRetryAttempt } from '../services/failed-turn-retry.js';
+import { takePurgeClickRollback } from '../services/image-purge-recovery.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
 import { cleanupMojoIsolatedWorkspace } from '../adapters/backend/mojo-isolated-workspace.js';
@@ -154,6 +156,8 @@ import {
 import type { CliLaunchMode } from './cli-launch-mode.js';
 import { traeHome } from '../services/traex-paths.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
+import { LocalAddressOutboundError, prepareLocalAddressContent, sanitizeLocalAddressText } from '../im/lark/local-address-policy.js';
+import { localAddressContextForBot, replayVettedBody, sendableCardLink } from '../im/lark/local-address-context.js';
 import { isStuckPageType } from './stuck-page-catalog.js';
 import { stuckCardFallbackText, stuckCardInitiatorOpenId, stuckCardPostErrorMeansUnsent, stuckKeyResultText } from './stuck-warning-card.js';
 
@@ -1882,13 +1886,17 @@ export function sessionSupportsWebTerminal(ds: DaemonSession): boolean {
  *  keeps its entry after a restart. A direct link embeds the port itself, and a
  *  persisted port belongs to the current generation only while a worker exists
  *  to listen on it (it is that worker's preferred port) — once restored without
- *  one, it is the previous daemon's and nothing listens there. */
+ *  one, it is the previous daemon's and nothing listens there. A direct link
+ *  without a read capability is also empty: Feishu refuses a bare local root,
+ *  and that must cost the button, not the card. */
 export function readableTerminalUrlFor(ds: DaemonSession): string {
   if (!sessionSupportsWebTerminal(ds)) return '';
   const port = getTerminalProxyPort()
     ? ds.workerPort ?? ds.session.webPort
     : ds.workerPort ?? (ds.worker ? ds.session.webPort : undefined);
-  return port ? buildTerminalUrl(ds) : '';
+  if (!port) return '';
+  const url = buildTerminalUrl(ds);
+  return sendableCardLink(url) ? url : '';
 }
 
 /** Empty means the live streaming card should not offer a Web Terminal button.
@@ -1903,7 +1911,8 @@ export function liveReadableTerminalUrlFor(ds: DaemonSession): string {
   // The terminal server outlives the CLI during restart/diagnostic parking.
   // Prompt readiness does not determine whether the worker's port is usable.
   if (!ds.workerPort) return '';
-  return buildTerminalUrl(ds);
+  const url = buildTerminalUrl(ds);
+  return sendableCardLink(url) ? url : '';
 }
 
 // Per-bot opt-in: the writable terminal link to embed directly in the streaming
@@ -2855,6 +2864,13 @@ export function buildOrdinaryRecoveryNoticeCard(
     failedAt: new Date(record.createdAt),
     retry: retried
       ? { kind: 'retried', byOpenId: retried.byOpenId, at: new Date(retried.at) }
+      : ds.session.lastFailedTurn?.turnId === record.logicalTurnId
+        && cliId === 'claude-code'
+        && (record.causeErrorCode === 'provider_image_too_small'
+          || record.errorCode === 'provider_image_too_small')
+        // A generic re-delivery repeats the poisoned history forever. The purge
+        // action must outrank record.retry for this specific terminal.
+        ? { kind: 'purge_images', turnId: record.logicalTurnId }
       : record.retry
         ? { kind: 'available' }
         : ds.session.lastFailedTurn?.turnId === record.logicalTurnId
@@ -14040,6 +14056,10 @@ export function sendWorkerInput(
      * onto an auto-restarted CLI after a crash+terminalize (turn-level PR #71).
      * The dormant-fork path rides `atMostOnce` on the fork init instead. */
     atMostOnce?: true;
+    /** Recovery from a poisoned-history image 400: the worker rewrites the
+     *  session transcript (drops undersized image blocks), respawns with
+     *  --resume, and this turn is delivered only after the fresh CLI is ready. */
+    purgeUndersizedImages?: true;
     trustedCaller?: TrustedCaller;
     /** Queue behind a running turn instead of folding into it (type-ahead):
      *  the input must start as a turn of its own. */
@@ -14072,6 +14092,9 @@ export function sendWorkerInput(
   }
   const transferGate = transferInputGates.get(ds);
   if ((!ds.worker || ds.worker.killed) && !transferGate) return false;
+  // The purge is a live-worker action; a staged tail would replay as a plain
+  // continuation onto the unpurged transcript.
+  if (opts.purgeUndersizedImages && hasQueuedActivationAdmissionGate(ds)) return false;
   let normalized = typeof payload === 'string' ? { content: payload } : payload;
   const trustedController = trustedSessionController(ds);
   const bot = getBot(ds.larkAppId);
@@ -14215,6 +14238,7 @@ export function sendWorkerInput(
     ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
     ...(opts.atMostOnce ? { atMostOnce: true } : {}),
+    ...(opts.purgeUndersizedImages ? { purgeUndersizedImages: true as const } : {}),
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
@@ -17156,8 +17180,7 @@ const PERMISSION_CARD_GRACE_MS = 3_000;
 /** The hook's allow/deny card for a Claude permission dialog, still unanswered. */
 function permissionCardPending(ds: DaemonSession): boolean {
   return listPendingAsks().some(a => a.larkAppId === ds.larkAppId && a.sessionId === ds.session.sessionId
-    && a.originKind === 'hook' && a.questions.length === 1
-    && a.questions[0].options.map(o => o.key).join('\n') === `${PERMISSION_ALLOW_KEY}\n${PERMISSION_DENY_KEY}`);
+    && isHookPermissionAsk(a));
 }
 
 function setupWorkerHandlers(
@@ -18140,6 +18163,19 @@ function setupWorkerHandlers(
           break;
         }
         discardTriggerStreamingCard(ds, msg.turnId);
+        const purgeClick = takePurgeClickRollback(ds, msg.turnId);
+        if (purgeClick) {
+          if (purgeClick.receipt && refundRetryAttempt(ds.session, purgeClick.receipt)) {
+            logger.info(`[${t}] Refunded retry cooldown of rejected purge continuation ${msg.turnId} (${msg.reason})`);
+          }
+          if (ds.lastCliInputTurnId === msg.turnId) {
+            const prevStatus = ds.lastScreenStatus;
+            purgeClick.restoreTurnState();
+            if (ds.lastScreenStatus !== prevStatus) stampIdleSinceAt(ds, prevStatus);
+            persistStreamCardState(ds);
+          }
+          sessionStore.updateSession(ds.session);
+        }
         if (msg.rejectedBeforeAdmission) rejectDocCommentTurnBeforeAdmission(ds, msg.turnId, msg.reason);
         await rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg);
         // The turn never started and will never terminal. Run GC, but do NOT
@@ -23232,6 +23268,8 @@ function deliverFinalOutput(
     turnId?: string,
     opts?: Omit<WorkerSessionReplyOptions, 'sourceSessionId'>,
   ) => {
+    content = prepareLocalAddressContent(content, msgType ?? 'interactive',
+      localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir));
     if (!isStillOwned() || ds.session.status === 'closed') {
       return Promise.reject(new Error('Final output ownership changed or session closed'));
     }
@@ -23242,21 +23280,24 @@ function deliverFinalOutput(
       const ledger = new TurnSendLedger(config.session.dataDir);
       return ledger.execute({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: msg.turnId }, 'final',
         JSON.stringify([handoff.record.target, transport.msgType, transport.content]),
-        uuid => withAuditRedaction(transport.content, transport.msgType, body => cb.sessionReply(sessionAnchorId(ds), body, transport.msgType, ds.larkAppId, msg.turnId,
-          { ...opts, uuid, beforeWrite: handoff.control.beforeEffect, replyTarget: handoff.record.target, sourceSessionId: ds.session.sessionId })),
+        uuid => replayVettedBody(transport.content, transport.msgType, () => withAuditRedaction(transport.content, transport.msgType, body => cb.sessionReply(sessionAnchorId(ds), body, transport.msgType, ds.larkAppId, msg.turnId,
+          { ...opts, uuid, beforeWrite: handoff.control.beforeEffect, replyTarget: handoff.record.target, sourceSessionId: ds.session.sessionId }))),
         { fenced: true, providerUuid: transport.providerUuid, reuseExistingFinal: true, beforeDispatch: handoff.control.beforeEffect,
-          noSideEffect: error => isLarkContentAuditError(error) || [LARK_CODE_CARD_CONTENT_REJECTED, LARK_CODE_MESSAGE_CONTENT_TOO_LONG].includes(larkErrorCode(error) ?? -1) },
+          noSideEffect: error => error instanceof LocalAddressOutboundError || isLarkContentAuditError(error)
+            || [LARK_CODE_CARD_CONTENT_REJECTED, LARK_CODE_MESSAGE_CONTENT_TOO_LONG].includes(larkErrorCode(error) ?? -1) },
       ).then(result => { handoff.suppressed = result.replayed; return result.messageId; });
     }
+    let frozen: { content: string; msgType: string } | undefined;
     if (outputControl?.record.sink.kind === 'im' && replyCardModeFor(ds, msg.turnId) === 'legacy') {
       const providerUuid = opts?.uuid ?? outputControl.publicationUuid ?? bridgeFinalOutputUuid(ds, msg);
       const transport = outputControl.freezeTransport(`${msgType ?? 'interactive'}:${providerUuid}:${imageFallback.omitImages ? 'omit-images' : 'images'}`,
         { content, msgType: msgType ?? 'interactive', providerUuid });
+      frozen = transport;
       content = transport.content; msgType = transport.msgType;
       opts = { ...opts, uuid: transport.providerUuid };
     }
     const replyMsgType = msgType;
-    return withAuditRedaction(content, replyMsgType, body => cb.sessionReply(
+    const reply = () => withAuditRedaction(content, replyMsgType, body => cb.sessionReply(
       sessionAnchorId(ds),
       body,
       replyMsgType,
@@ -23271,6 +23312,7 @@ function deliverFinalOutput(
         },
         ...(groupContextAuthorOrigin ? { groupContextAuthorOrigin } : {}) },
     ));
+    return frozen ? replayVettedBody(frozen.content, frozen.msgType, reply) : reply();
   };
   setTimeout(async () => {
     if (!isStillOwned()) {
@@ -23293,7 +23335,8 @@ function deliverFinalOutput(
       if (docTurn) {
         // 嵌套回复到用户那条评论 thread（已挂在其下，无需再 ↪ 前缀）。这是兜底路径
         // （模型没显式 botmux send），默认 @ 回原评论人，仅首块加。
-        const chunks = chunkCommentText(msg.content);
+        const chunks = chunkCommentText(sanitizeLocalAddressText(msg.content,
+          localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir)));
         for (let i = 0; i < chunks.length; i++) {
           if (!isStillOwned()) { onComplete?.(false); return; }
           const write = (hooks?: import('../services/output-delivery-journal.js').OutputProviderEffectHooks) => replyToDocComment(ds.larkAppId, { fileToken: docTurn.fileToken, fileType: docTurn.fileType }, docTurn.commentId, chunks[i], i === 0 ? docTurn.replyToOpenId : undefined, hooks);
@@ -23919,11 +23962,13 @@ function deliverFinalOutput(
       // reads its untruncated log) reaches it, and retrying only ends in a
       // silent give-up with nothing in the chat.
       const rejectedCode = larkErrorCode(err);
+      const localAddressRejected = err instanceof LocalAddressOutboundError;
       const cardRejected = !managedReceiver && !resolveDocCommentTarget(ds, msg.turnId)
         && (rejectedCode === LARK_CODE_CARD_CONTENT_REJECTED || rejectedCode === LARK_CODE_MESSAGE_CONTENT_TOO_LONG);
-      if (isLarkContentAuditError(err) || cardRejected) {
+      if (isLarkContentAuditError(err) || cardRejected || localAddressRejected) {
         const deliveredParts = partialResultMessages();
-        const permanentReason = cardRejected ? 'card_content_rejected' : 'content_audit_blocked';
+        const permanentReason = localAddressRejected ? 'local_address_outbound_rejected'
+          : cardRejected ? 'card_content_rejected' : 'content_audit_blocked';
         if (handoff) { handoff.auxiliary = true; handoff.rejectedReason = permanentReason; }
         if (outputControl) outputControl.rejectedReason = permanentReason;
         observeTurnResultDelivery(resultBinding, { status: 'unavailable', reason: permanentReason },
@@ -23933,7 +23978,7 @@ function deliverFinalOutput(
         // Codex runner unacknowledged and restarts the entire retry loop.
         // Send a fixed notice, settle this output, and preserve the session.
         const auditCode = larkErrorCode(err);
-        const rejection = cardRejected ? 'card content' : 'content audit';
+        const rejection = localAddressRejected ? 'local address policy' : cardRejected ? 'card content' : 'content audit';
         logger.error(
           `[${t}] Bridge final_output rejected by Lark ${rejection} code=${auditCode ?? 'unknown'} `
           + `(turn ${msg.turnId.substring(0, 8)}); not retrying`,
@@ -23942,7 +23987,8 @@ function deliverFinalOutput(
         // 自动打码重发过仍被拒 / 找不到可打码的内容，分别给出如实的说明；两者都
         // 不要求用户操作——这是模型输出触发的拦截，完整回复在 Web 终端里。
         const redaction = cardRejected ? undefined : contentAuditRedactionOutcome(err);
-        const notice = tr(cardRejected ? 'worker.final_output_card_rejected'
+        const notice = tr(localAddressRejected ? 'worker.final_output_local_address_rejected'
+          : cardRejected ? 'worker.final_output_card_rejected'
           : redaction?.retried ? 'worker.final_output_content_audit_blocked'
             : 'worker.final_output_content_audit_blocked_unredacted',
           { code: String(auditCode ?? 'unknown') }, locale);
@@ -23951,7 +23997,7 @@ function deliverFinalOutput(
         // this very notice) or truncated so multiple blocks share one dedupe key.
         // Hash the composite to a stable 50-char token.
         const noticeUuid = `ab_${createHash('sha256')
-          .update(`${cardRejected ? 'card-rejected' : 'audit-blocked'}:${ds.session.sessionId}:${msg.turnId}`)
+          .update(`${localAddressRejected ? 'local-address-rejected' : cardRejected ? 'card-rejected' : 'audit-blocked'}:${ds.session.sessionId}:${msg.turnId}`)
           .digest('hex')
           .slice(0, 47)}`;
         try {
@@ -23967,7 +24013,7 @@ function deliverFinalOutput(
         ds.agentAttention = { kind: 'blocked', reason: `${rejection} ${auditCode ?? 'unknown'}`, at: Date.now() };
         publishAttentionPatch(ds);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
-          reason: cardRejected ? 'card_content_rejected' : 'content_audit_blocked',
+          reason: permanentReason,
           message: `Lark ${rejection} ${auditCode ?? 'unknown'} rejected the final reply`,
           turnId: msg.turnId,
         });

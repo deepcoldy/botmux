@@ -3,6 +3,19 @@
  * "source of truth" dictionary; `en.ts` mirrors the same keys.
  */
 export const messages: Record<string, string> = {
+  'worker.purge_images_unsupported': '🧹「清理小图并续跑」仅支持本地 Claude Code 会话，当前会话不适用。请改用 /clear 或开新话题恢复。',
+  'worker.purge_images_busy': '🧹 CLI 正在重启，暂时无法清理小图，会话记录未改动。请等它恢复后再点一次。',
+  'worker.purge_images_sandbox_unsupported': '🧹 当前会话运行在 macOS 隔离沙箱中，暂不支持「清理小图并续跑」，会话记录未改动。请改用 /clear 或开新话题恢复。',
+  'worker.purge_images_exit_unproven': '🧹 未能确认 CLI 进程已安全停下，本次没有清理，会话记录未改动。请稍后重试，或用 /clear 恢复。',
+  'worker.purge_images_unmeasurable': '🧹 会话记录里有无法识别尺寸的图片（格式不支持或数据不完整），本次没有清理，会话记录未改动。请用 /clear 或开新话题恢复。',
+  'worker.purge_images_unsupported_source': '🧹 会话记录里的图片不是内嵌数据（如链接或文件引用），无法在本地判断尺寸，会话记录未改动。请用 /clear 或开新话题恢复。',
+  'worker.purge_images_no_images': '🧹 当前会话记录里没有图片（会话文件可能已轮转），会话记录未改动。请用 /clear 或开新话题恢复。',
+  'worker.purge_images_not_found': '🧹 当前会话记录里的图片尺寸都正常，没有可清理的过小图片，会话记录未改动。请把网页终端里的完整报错反馈给管理员，或先用 /clear 恢复。',
+  'worker.purge_images_failed': '🧹 会话记录读取或改写失败，本次没有清理，会话记录未改动。可改用 /clear 恢复。',
+  'worker.purge_images_done': '🧹 已从 {files} 个会话记录文件移除 {removed} 张过小图片（原文件已备份为同目录 .botmux-purge-bak-*），CLI 已以 --resume 重启，正在自动续跑，文本上下文保留。',
+  'worker.purge_images_partial': '🧹 已从 {files} 个会话记录文件移除 {removed} 张过小图片（原文件已备份为同目录 .botmux-purge-bak-*），CLI 已以 --resume 重启。但会话记录里还有无法确认尺寸或没能处理的图片，已原样保留；为免再撞同一个错误，这次没有自动续跑。发送任意消息即可继续；如果仍报同样的错误，请用 /clear 或开新话题恢复。',
+  'worker.purge_images_restart_failed': '🧹 已从 {files} 个会话记录文件移除 {removed} 张过小图片（原文件已备份为同目录 .botmux-purge-bak-*），但 CLI 重启失败，这次没有自动续跑。请按随后的错误提示恢复 CLI，再发送消息继续。',
+  'worker.purge_images_superseded': '🧹 已从 {files} 个会话记录文件移除 {removed} 张过小图片（原文件已备份为同目录 .botmux-purge-bak-*），但这次重启被另一次重启取代，没有自动续跑。等 CLI 恢复后发送任意消息即可继续。',
   'feedback.storage.choose': '反馈存储：SQLite [默认] / PostgreSQL (sqlite/postgresql)：',
   'feedback.storage.configPath': 'PostgreSQL 配置 JSON 路径（仅凭据引用，不填明文密码）：',
   'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> [任务] — 修改 Codex 推理强度；任务可同一行或换行附带，强度确认后再投递。CLI 从下一轮生效；App 更新当前轮需启用 step_model_switching（默认关闭，档位以模型为准）',
@@ -553,6 +566,24 @@ export const messages: Record<string, string> = {
   'cmd.mention_mode.owner_only': '⚠️ 只有 owner/allowedUsers 可以修改 @ 策略。',
   'cmd.mention_mode.usage': '用法：/mention-mode always｜topic｜never｜ambient\nalways=必须 @ 才回复（默认）；topic=顶层要 @，话题内免 @ 续话；never=免 @，群内消息都回复；ambient=同 never，但消息 @ 了别人时保持安静。',
   'cmd.mention_mode.failed': '⚠️ 切换失败：{reason}',
+  'cmd.secretary.status_on': '本群秘书：已开启（{at} 开启）。\n我会旁听本群消息、盯着本机 bot 在本群的会话，发现做一半停了 / 卡住 / 没人认领的任务时出面。\n关闭：/secretary off',
+  'cmd.secretary.status_off': '本群秘书：未开启。\n开启：@我 /secretary on（只对本群生效，开启后仍可正常和我对话）',
+  'cmd.secretary.enabled': '✅ 已在本群开启秘书（群描述末尾会多一行 [botmux:secretary=…] 标记，全群唯一）。我会感知本群每条新消息、跟进本群 bot 的在跑任务（含 federation 里其它机器上的 bot），有事才出声。\n需要本 bot 有「获取群组中所有消息」权限。',
+  'cmd.secretary.disabled': '✅ 已关闭本群秘书。',
+  'cmd.secretary.already_on': '本群秘书已经是开启状态。',
+  'cmd.secretary.already_off': '本群秘书本来就没开。',
+  'cmd.secretary.unsupported': '⚠️ /secretary 只支持群聊，私聊和会话群不支持。',
+  'cmd.secretary.owner_only': '⚠️ 只有 owner/allowedUsers 可以开关本群秘书。',
+  'cmd.secretary.session_title': '群秘书',
+  'cmd.secretary.patrol_session_title': '秘书话题巡查',
+  'cmd.secretary.status_other': '本群秘书现在是 {name}，不是我。\n要换成我：@我 /secretary takeover',
+  'cmd.secretary.taken': '本群已经有秘书：{name}。一个群只能有一个秘书（不分机器）。\n要换成我：@我 /secretary takeover（{name} 一分钟内自动停手）',
+  'cmd.secretary.not_mine': '本群秘书是 {name}，不是我。要关闭请 @{name} /secretary off。',
+  'cmd.secretary.took_over': '✅ 已从 {name} 接管本群秘书，{name} 一分钟内自动停手。',
+  'cmd.secretary.usage': '用法：/secretary on｜off｜takeover｜status',
+  'cmd.secretary.failed': '⚠️ 切换失败：{reason}',
+  'cmd.secretary.not_enabled': '⚠️ 本 bot 还没有开放群秘书。需要 owner 先在 Dashboard 机器人配置的「会话模式」里打开「群秘书」（或 /botconfig set groupSecretaryEnabled on）。',
+  'cmd.secretary.status_paused': '本群秘书登记的是我，但本 bot 的群秘书开关已关闭，现在不旁听也不巡检。在 Dashboard 重新打开即恢复；不再需要可 @我 /secretary off。',
   'cmd.substitute.status_on': '当前群替身模式：已开启（默认）。群里 @ 到配置的替身对象时，我会代答。',
   'cmd.substitute.status_off': '当前群替身模式：已关闭。可用 @我 /substitute on 重新开启。',
   'cmd.substitute.updated_on': '✅ 已开启当前群替身模式。',
@@ -967,6 +998,7 @@ export const messages: Record<string, string> = {
   'config.label.autoStartOnGroupJoin': '进群即开工',
   'config.label.autoStartOnNewTopic': '新话题即开工',
   'config.label.chatManagerEnabled': '群负责人（默认接待者）',
+  'config.label.groupSecretaryEnabled': '群秘书',
   'config.label.disableCliBypass': '关绕过·更安全',
   'config.label.restrictGrantCommands': '被授权人仅对话',
   'config.label.p2pOpen': '私聊全开',
@@ -1227,6 +1259,10 @@ export const messages: Record<string, string> = {
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
   'ai.routing.intro': '你在飞书（Lark）会话中。用户看不到终端输出，必须用 `botmux send` 发送回复。',
+  'ai.routing.no_local_addresses': '用户在自己的飞书客户端阅读回复，无法访问开发机文件或本机服务。所有回复、进度、协作说明和卡片禁止携带开发机绝对路径、文件协议或本机服务地址；技能只写名称，源码使用仓库相对引用，交付文件使用附件或真实可访问链接，没有链接时说明交付状态，禁止编造地址。',
+  'card.local_address.internal_file': '【内部文件】',
+  'card.local_address.unavailable_link': '（未提供可访问链接）',
+  'worker.final_output_local_address_rejected': '结果卡包含无法供用户访问的本机跳转地址，完整结果未发送。已停止原样重试。',
   'ai.routing.usage_send': '- 发送：`botmux send "消息"`',
   'ai.routing.usage_mention_gate': '- 每条 send 必须三选一：`--mention <open_id>` / `--mention-back` / `--no-mention`——按内容价值选：有实质结论要对方看/确认/决策 → @；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发',
   'ai.routing.usage_attachments': '- 附件：`--images`、`--files`、`--videos`；尺寸/排版选择先 `botmux skill show botmux-send`',
@@ -1321,6 +1357,7 @@ export const messages: Record<string, string> = {
   'ai.followup.reminder_hook': '本会话通过 botmux 桥接飞书,终端里的输出用户看不到。会话约定:回复通过 botmux send 发送到飞书会话;发什么、发几条由你判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND。',
   'ai.followup.reminder_no_resend': '发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND;send 成功即已送达,本轮无可见文本地结束是正常的,别因「无输出」提示重发',
   'ai.followup.feishu_safe_emphasis': '短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。',
+  'ai.followup.no_local_addresses': '回复里不要放开发机路径、文件协议或本机服务地址，文件用附件或可访问链接。',
   // No-transport 续轮（apiOnly bot / HTTP 虚拟会话）：这是程序发起的请求-应答，无飞书
   // 会话、无其它 bot 协作，也不该 botmux send。哨兵语义只在本轮内容里的
   // <botmux_http_response_mode> 出现一次（迁移不删，#808 async settle 依赖它），
@@ -1649,8 +1686,16 @@ export const messages: Record<string, string> = {
   // 「跑到一半挂了」——重发会重跑，必须让用户自己判断。
   'card.turn_failed.retry_caveated': '⚠️ 这一轮**可能已经执行了一部分**（改文件 / 提交 / 发消息等）。点「继续」不会原样重跑：会让 CLI **先读取当前现场**，判断做到哪一步，再从上次的进度接着做；判断不了会停下来交回你决定。仍建议先看一眼 Web 终端。',
   'card.turn_failed.no_retry': '当前错误重发同样的输入也无法成功，请检查后发送新的消息。',
+  // 会话历史里混入了尺寸过小（如 1×1）的图片块：通常是 CLI 的读图工具读了占位像素图。
+  // 该图会随之后每一次请求重放，所以继续/重发都必然再次 400。首选一键恢复：worker
+  // 清洗会话记录里的小图块（备份）后 --resume 重启并自动续跑，文本上下文保留；
+  // /clear 是本地操作、不发 API 请求，作为无按钮时的兜底出口（/compact 也会 400）。
+  'card.turn_failed.image_too_small': '🧹 当前会话历史中混入了尺寸过小的图片（如 1×1 占位像素图，通常是 CLI 读取了这类图片文件）。该图片会随后续每一条消息一起发送，所以**继续发任何指令都会得到同样的 400 错误，普通重发无效**。\n\n恢复方法（任选其一）：\n1. 点下方「清理小图并续跑」：自动从会话记录移除这类图片（原文件备份）后重启恢复，**文本上下文保留**；\n2. 或在本话题发送 `/clear` 清空上下文后重发任务（本地操作，不需要请求模型）；\n3. 或直接开一个新话题重新开始。',
+  'card.btn.purge_images_continue': '🧹 清理小图并续跑（保留上下文）',
   'card.turn_failed.no_input': '这一轮没有可重发的输入记录（任务在提交前就中断了），请直接发送新的消息。',
 
+  'card.action.purge_images_unsupported': '⚠️「清理小图并续跑」仅支持本地 Claude Code 话题会话，当前会话不适用。',
+  'card.action.purge_images_started': '正在清理会话小图并重启续跑…',
   'card.action.retry_turn_missing': '⚠️ 找不到这一轮的输入记录，无法重试。请直接发送新的消息。',
   'card.action.retry_turn_stale': '⚠️ 这张卡片已过期（会话后来又失败过或已重试）。请用最新那张卡片，或直接发送新的消息。',
   'card.action.retry_turn_cooldown': '⏳ 重试冷却中，请在 {seconds} 秒后再试。',
@@ -1671,6 +1716,7 @@ export const messages: Record<string, string> = {
   'card.recovery_failed.cause.quota': '模型额度用尽或调用频率受限',
   'card.recovery_failed.cause.provider_auth': '模型接口鉴权失败（凭据失效或没有权限）',
   'card.recovery_failed.cause.provider_rejected': '请求被模型接口拒绝',
+  'card.recovery_failed.cause.image_too_small': '会话历史里混入了尺寸过小的图片，模型接口拒收整个请求',
   'card.recovery_failed.cause.capacity': '模型服务容量不足',
   'card.recovery_failed.cause.outcome_unverified': '自动续跑后没有收到结果，无法确认是否完成',
   'card.recovery_failed.cause.restart_interrupted': 'Botmux 重启打断了自动恢复',
@@ -1831,6 +1877,7 @@ export const messages: Record<string, string> = {
   'daemon.force_topic_ready': '💬 新话题已创建。请在话题内发送任务，也可以先用 /repo 选择项目。',
   'daemon.force_topic_started': '↪️ 已转入新话题，正在处理…',
   'daemon.force_topic_current_dir_missing': '⚠️ 当前群聊还没有可复用的工作目录。请先在普通群启动一个会话或使用 /oncall bind 绑定目录。',
+  'daemon.force_topic_worktree_command_unsupported': '⚠️ /tw 后面不能直接跟 {cmd}：/tw 话题要等 worktree 建好才有会话，命令没有落点。不需要 worktree 就直接发 {cmd}；需要的话先发 /tw <任务> 开话题，再在话题里发 {cmd}。',
   // ─── 话题指令头（`[标题] /t /repo … /model … 正文`）的拒绝文案 ───────────
   // fail closed：任一项不合法就整条不生效，所以这条回复是用户唯一的反馈，
   // 必须指名道姓说清哪一项错了。
@@ -2228,6 +2275,22 @@ export const messages: Record<string, string> = {
   'card.ask.invalidated': '已失效',
   'card.ask.invalidated_claimant_gone': '提问的会话已不在等这个回答（CLI 已退出、重启或这一轮已结束），这张卡不再接收回答。需要继续的话直接在会话里发消息。',
   'card.ask.invalidated_answer_undelivered': '这个回答没有送进会话：提问的 CLI 已不在等待。需要继续的话直接在会话里发消息。',
+  'card.ask.permission_timed_out': '超时未答 · 已自动拒绝',
+  'card.ask.permission_timed_out_detail': '截止前没人在卡片上确认，botmux 已按「拒绝」回复 Claude Code（若终端里已处理，以终端为准）。',
+  'card.ask.cli_outcome.cli_auto_denied': '已超时 · Claude Code 自动拒绝',
+  'card.ask.cli_outcome.cli_auto_denied.detail': 'Claude Code 的确认框无人处理，到时自动拒绝了这次操作，命令未执行。',
+  'card.ask.cli_outcome.terminal_allowed': '已在终端处理 · 允许执行',
+  'card.ask.cli_outcome.terminal_allowed.detail': '这次操作已在终端被允许并执行完毕。',
+  'card.ask.cli_outcome.terminal_rejected': '已在终端处理 · 拒绝',
+  'card.ask.cli_outcome.terminal_rejected.detail': '这次操作在终端被拒绝或取消（含 Esc 中断），命令未执行。',
+  'card.ask.cli_outcome.allowed_elsewhere': '已在 Claude Code 内放行',
+  'card.ask.cli_outcome.allowed_elsewhere.detail': '这次操作在 Claude Code 内被放行（不是通过这张卡），已执行。',
+  'card.ask.cli_outcome.denied_elsewhere': '已在 Claude Code 内拒绝',
+  'card.ask.cli_outcome.denied_elsewhere.detail': '这次操作在 Claude Code 内被拒绝（不是通过这张卡），命令未执行。',
+  'card.ask.cli_outcome.resolved_elsewhere': '已在 Claude Code 内结束',
+  'card.ask.cli_outcome.resolved_elsewhere.detail': 'Claude Code 已不经这张卡结束了这次确认，这张卡不再生效。',
+  'card.ask.cli_outcome.cli_stopped_waiting': 'Claude Code 已结束这次确认',
+  'card.ask.cli_outcome.cli_stopped_waiting.detail': '确认框已关闭（终端已处理、本轮被中断或会话已退出），这张卡不再生效。',
   'card.ask.answerable_designated_member': '指定成员（仅本人可操作）',
   'card.ask.answerable_talk_members': '本群可对话成员',
 

@@ -36,6 +36,7 @@ export const ASK_FORM_ACTION = 'ask_form_submit';
 import { supportsAskCustomInput } from '../../core/ask-custom-input.js';
 import { buildAskCustomForm } from './ask-custom-form.js';
 import { optionDescriptions } from './ask-option-descriptions.js';
+import { permissionAskSettleStatus } from './ask-permission-status.js';
 
 const MAX_BUTTONS_PER_ACTION_ROW = 4;
 
@@ -886,6 +887,8 @@ function settleStatus(result: AskResult, ask: PendingAsk, locale?: Locale): stri
     const commentLine = result.comment ? `\n${t('card.ask.supplement', { comment: escapeMd(result.comment) }, locale)}` : '';
     return `**${t('card.ask.selected', undefined, locale)}**\n${escapeMd(summary)}${commentLine}\n${t('common.operator', { by: escapeMd(short(result.by, 28)) }, locale)}`;
   }
+  const permission = permissionAskSettleStatus(ask, result, locale);
+  if (permission) return `**${permission.headline}**\n${permission.detail}`;
   if (result.kind === 'timedOut') {
     return `**${t('card.ask.timed_out', undefined, locale)}**`;
   }
@@ -901,7 +904,7 @@ function templateForResult(result: AskResult): string {
   switch (result.kind) {
     case 'answered': return 'green';
     case 'timedOut': return 'orange';
-    case 'invalidated': return 'grey';
+    case 'invalidated': return result.cliOutcome === 'cli_auto_denied' ? 'orange' : 'grey';
   }
 }
 

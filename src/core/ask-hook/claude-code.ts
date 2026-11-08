@@ -47,6 +47,7 @@
 
 import type { AskQuestion } from '../ask-types.js';
 import { PERMISSION_ALLOW_KEY, PERMISSION_DENY_KEY, type HookAskAdapter, type ParsedAsk } from './types.js';
+import { createClaudePermissionWatcher } from './claude-permission-watch.js';
 
 /** 从 payload 中提取原始 questions 数组（用于写回 updatedInput.questions）。 */
 function extractRawQuestions(payload: unknown): Array<Record<string, unknown>> {
@@ -135,17 +136,14 @@ const claudeCodeAdapter: HookAskAdapter = {
     return '';
   },
 
-  parsePermissionRequest(payload: unknown): ParsedAsk | null {
-    if (!payload || typeof payload !== 'object') return null;
+  parsePermissionRequest(payload: unknown, env?: Record<string, string | undefined>): ParsedAsk | null {
+    const toolName = permissionToolName(payload);
+    if (!toolName) return null;
     const p = payload as Record<string, unknown>;
-    if (p.hook_event_name !== 'PermissionRequest') return null;
-    // AskUserQuestion 的 PermissionRequest 由 parseQuestions 走提问卡片（迁移期兼容），
-    // 这里不当成权限确认，避免一次提问被拆成「允许/拒绝」。
-    const toolName = typeof p.tool_name === 'string' ? p.tool_name : '';
-    if (!toolName || toolName === 'AskUserQuestion') return null;
 
     const prompt = [
       `Claude 请求执行一个需要人工确认的操作（终端已弹出确认框，会话在等待）。`,
+      ...autoDenyNotice(p, toolName, env),
       `工具：${toolName}`,
       ...describeToolInput(p.tool_input),
     ].join('\n');
@@ -168,7 +166,45 @@ const claudeCodeAdapter: HookAskAdapter = {
     if (!allow && message) decision.message = message;
     return JSON.stringify({ hookSpecificOutput: { hookEventName: 'PermissionRequest', decision } });
   },
+
+  createPermissionOutcomeWatcher(payload: unknown) {
+    return permissionToolName(payload) ? createClaudePermissionWatcher(payload) : null;
+  },
 };
+
+/** 取真值时 Claude Code 不再对危险删除检查倒计时自动拒绝：bypass 模式下确认框一直等，auto 模式下
+ *  改由分类器裁决、不再问人。后者是放松，进程级开关又没法只给 bypass 模式用，botmux 不替用户设它。 */
+const CLAUDE_DISABLE_RM_TIMEOUT_ENV = 'CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT';
+/** Claude Code 2.1.x 只给危险删除检查（Bash，bypassPermissions / auto 模式）开自动拒绝倒计时，
+ *  默认 120 秒，只有 Anthropic 远端开关能改。倒计时与 PermissionRequest hook 同时开始。 */
+const CLAUDE_RM_AUTO_DENY_MS = 120_000;
+const AUTO_DENY_MODES = new Set(['bypassPermissions', 'auto']);
+
+function isEnvTruthy(value: string | undefined): boolean {
+  return !!value && ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
+}
+
+/** payload 不说是哪种安全检查，只能写成条件句；时间按卡片截止时间同样的本机时区展示。 */
+function autoDenyNotice(
+  p: Record<string, unknown>,
+  toolName: string,
+  env: Record<string, string | undefined> | undefined,
+): string[] {
+  if (!env || toolName !== 'Bash' || !AUTO_DENY_MODES.has(String(p.permission_mode))) return [];
+  if (isEnvTruthy(env[CLAUDE_DISABLE_RM_TIMEOUT_ENV])) return [];
+  const at = new Date(Date.now() + CLAUDE_RM_AUTO_DENY_MS).toLocaleTimeString('zh-CN', { hour12: false });
+  return [`⚠️ 若这是 Claude Code 内置的危险删除检查，约 2 分钟内（${at} 前）没人确认会被 Claude Code 自动拒绝、命令不执行；结果会同步到这张卡。`];
+}
+
+/** PermissionRequest 的工具名；AskUserQuestion 的 PermissionRequest 由 parseQuestions 走提问卡片
+ *  （迁移期兼容），不当成权限确认，避免一次提问被拆成「允许/拒绝」。 */
+function permissionToolName(payload: unknown): string | null {
+  if (!payload || typeof payload !== 'object') return null;
+  const p = payload as Record<string, unknown>;
+  if (p.hook_event_name !== 'PermissionRequest') return null;
+  const toolName = typeof p.tool_name === 'string' ? p.tool_name : '';
+  return toolName && toolName !== 'AskUserQuestion' ? toolName : null;
+}
 
 /** 卡片问题正文会被截到 512 字，这里给每段留足余量，优先保住命令本体。 */
 const PERMISSION_INPUT_MAX = 360;

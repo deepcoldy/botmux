@@ -56,6 +56,24 @@ export interface AskQuestion {
   defaultSelectedKeys?: ReadonlyArray<string>;
 }
 
+/** How the asking CLI ended a hook permission confirmation on its own, without
+ *  the card: its built-in confirmation timeout, a terminal choice, or the hook
+ *  being terminated with nothing recorded. */
+export const CLI_PERMISSION_OUTCOMES = [
+  'cli_auto_denied',
+  'terminal_allowed',
+  'terminal_rejected',
+  'allowed_elsewhere',
+  'denied_elsewhere',
+  'resolved_elsewhere',
+  'cli_stopped_waiting',
+] as const;
+export type CliPermissionOutcome = typeof CLI_PERMISSION_OUTCOMES[number];
+
+export function isCliPermissionOutcome(value: unknown): value is CliPermissionOutcome {
+  return typeof value === 'string' && (CLI_PERMISSION_OUTCOMES as readonly string[]).includes(value);
+}
+
 /** Terminal result of an ask, returned to the CLI caller. Discriminated by
  *  `kind` so the CLI can map straight to stdout shape + exit code.
  *
@@ -95,8 +113,10 @@ export type AskResult =
       /** card_delivery_failed: delivery never completed; do not describe this as
        *  a missing answer. claimant_gone / answer_undelivered: the hook never
        *  re-attached, so the asking CLI is no longer waiting (the latter: an
-       *  answer had been given but could not reach it). */
-      failureCode?: 'card_delivery_failed' | 'claimant_gone' | 'answer_undelivered';
+       *  answer had been given but could not reach it). cli_resolved: the asking
+       *  CLI ended this permission confirmation itself; see `cliOutcome`. */
+      failureCode?: 'card_delivery_failed' | 'claimant_gone' | 'answer_undelivered' | 'cli_resolved';
+      cliOutcome?: CliPermissionOutcome;
       selected: null;
       by: null;
       comment: null;
