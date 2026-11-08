@@ -1,0 +1,39 @@
+{
+  // `bun run build` 里紧跟 emit 的那一步：只检查不产出，覆盖 src 之外必须过类型检查的代码。
+  //
+  // - scripts/：`tsconfig.json` 只 include `src/**`，验收脚本与浏览器夹具却直接 import 生产模块
+  //   （h5-auth、session-preview、agent-workbench-view…）。不检查它们时，生产侧改了类型契约，
+  //   脚本照样 exit 0，只会表现成「跑绿了但验的是旧契约」——批 1 与批 2 都真实踩到过这种
+  //   fixture 腐烂（脚本里缺 owner/workerGeneration、location 缺 protocol/hostname）。
+  // - 下面点名的测试 mock 与 helper。
+  //
+  // 故意不 include `src/**/*`：src/ 已由 emit 那一步按同一套规则完整检查过，这里只经 import
+  // 拉进被脚本与测试用到的那部分；再整个 include 一遍等于把 src/ 重复检查。`src/**/*.d.ts`
+  // 是环境声明，没有 import 会拉到它们，必须点名，否则这里的类型环境会和 emit 那一步不一致。
+  //
+  // 只改「不产出、允许 src 之外的根目录」，其余编译选项（strict、NodeNext 解析、JSX）一律继承
+  // 根配置——验的必须是生产同一套规则。
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false
+  },
+  "include": [
+    "src/**/*.d.ts",
+    "scripts/**/*.ts",
+    "scripts/**/*.tsx",
+    "test/helpers/spawn-result.ts",
+    "test/ensure-herdr-integrations.test.ts",
+    "test/hermes-transcript.test.ts",
+    "test/mtr-transcript.test.ts",
+    "test/tmux-pipe-backend.test.ts",
+    "test/transient-snapshot.test.ts",
+    "test/vc-agent-polling-source.test.ts",
+    "test/helpers/mock-llm-server/**/*",
+    "test/mock-llm-server.test.ts"
+  ],
+  "exclude": ["node_modules", "dist"]
+}

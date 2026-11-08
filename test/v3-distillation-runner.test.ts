@@ -30,6 +30,7 @@ import {
 } from '../src/workflows/v3/distillation-runner.js';
 import type { V3DistillationModelFieldV1 } from '../src/workflows/v3/distillation-compiler.js';
 import type { BotSnapshot } from '../src/workflows/v3/contract.js';
+import { logger } from '../src/utils/logger.js';
 
 const roots: string[] = [];
 const originalAnthropicApiKey = process.env.ANTHROPIC_API_KEY;
@@ -293,6 +294,23 @@ describe('runV3DistillationModel', () => {
     const etcTmpfs = invocation!.args.findIndex((value, index, args) =>
       value === '/etc' && args[index - 1] === '--tmpfs');
     expect(etcTmpfs).toBeGreaterThan(0);
+  });
+
+  it('logs the original error behind a scratch setup failure', async () => {
+    const dirs = fixture();
+    const missing = join(dirs.root, 'missing-scratch-parent');
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    try {
+      await expect(runV3DistillationModel({ fields: FIELDS, botSnapshot: bot() }, {
+        scratchParent: missing,
+        platform: 'linux',
+        adapterBin: process.execPath,
+        invokeStructuredModel: vi.fn(),
+      })).rejects.toMatchObject({ code: 'SCRATCH_SETUP_FAILED' });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(missing));
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('accepts the CLI result-string fallback but rejects model-controlled names', async () => {

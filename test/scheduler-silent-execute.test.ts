@@ -152,6 +152,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
     };
   })()),
   ensureOrdinaryTurnRecoveryAttached: vi.fn(),
+  resumeTurnNotices: vi.fn(),
   isRelayableRealSession: vi.fn((ds: DaemonSession) =>
     (!!ds.worker && !ds.worker.killed) || !!ds.session.cliId || !!ds.session.lastCliInput),
   isDisposableCommandScratch: vi.fn((ds: DaemonSession) =>
@@ -644,6 +645,8 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
     const turnId = sendWorkerInputMock.mock.calls[0][2];
     expect(session.deferredScheduleRun?.turnId).toBe(turnId);
     expect(session.deferredScheduleRun?.routingAnchor).toBe(taskAnchor);
+    // The old turn may still emit unattributed frames; they must not settle this one.
+    expect(existing.deferredScheduleUnconfirmedTurnId).toBe(turnId);
   });
 
   it('non-silent first fire seeds a real topic, writes the root back to the task, and forks a thread session', async () => {
