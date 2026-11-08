@@ -36,7 +36,7 @@ import { homedir } from 'node:os';
 import { installCursorUsageHook } from '../services/cursor-usage-hook.js';
 import { statSync, lstatSync, readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, ensureChatManagerSkill, removeWorkflowSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
@@ -68,7 +68,7 @@ import {
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
 import { MissingWorkingDirError } from './working-dir-recovery.js';
-import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
+import { spawnWorker, isStandaloneBinary, preloadImportSpecifier, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import {
   resolveSessionLaunchModel,
   resolveSessionLaunchModelChoice,
@@ -213,6 +213,7 @@ import { resolveSubstituteCardControl, type SubstituteCardControl } from '../im/
 import { isLarkContentAuditError, larkErrorCode } from '../im/lark/content-audit.js';
 import { contentAuditRedactionOutcome, sendWithContentAuditRedaction } from '../im/lark/content-audit-redaction.js';
 import { LARK_CODE_CARD_CONTENT_REJECTED, LARK_CODE_MESSAGE_CONTENT_TOO_LONG } from '../im/lark/lark-errors.js';
+import { isRetryableLarkError } from '../im/lark/api-gate.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from '../services/model-pricing.js';
 import type { BotConfig } from '../bot-registry.js';
 import { RestartCoordinator, type RestartObserver, type RestartSource } from './restart-coordinator.js';
@@ -365,9 +366,9 @@ function resolvePricingForBot(larkAppId?: string): ResolvedModelPricing | undefi
 }
 
 /** 在完整 Worker 模块加载前接住首条 IPC，避免冷启动耗时被误判为投递失败。 */
-function workerForkExecArgv(): string[] {
+export function workerForkExecArgv(bun: boolean = Boolean(process.versions.bun)): string[] {
   const preloadPath = join(__dirname, '..', 'worker-ipc-preload.js');
-  return [...process.execArgv, '--import', pathToFileURL(preloadPath).href];
+  return [...process.execArgv, '--import', preloadImportSpecifier(preloadPath, bun)];
 }
 
 /** Secondary index of the same retirements by session id: the WeakMap above is
@@ -819,8 +820,13 @@ import {
   recoveryNoticeInitiator,
   recoveryOutcomeI18nKey,
   RecoveryNoticeOutbox,
+  addTurnNotice,
+  recoveryNoticeRetryDelayMs,
+  recoveryNoticeSendNeverLanded,
+  recoveryNoticeSendOutcomeUnknown,
   type OrdinaryRecoveryNoticeRecord,
   type RecoveryNoticeHost,
+  type TurnNoticeRecord,
 } from '../services/ordinary-recovery-notice.js';
 import {
   attachReadonlyTaskContinuation,
@@ -2644,6 +2650,109 @@ const ordinaryRecoveryNoticeOutbox = new RecoveryNoticeOutbox<ReturnType<typeof 
   cancel: timer => clearTimeout(timer),
   log: (level, message) => logger[level](`[recovery-notice] ${message}`),
 });
+
+/** A transport failure, or a rate limit / server error Feishu reports as
+ *  transient. A send stopped by a pre-send topic check is judged by the error
+ *  that made the check fail. */
+const turnNoticeSendRetryable = (error: unknown): boolean => {
+  const transient = (e: unknown) =>
+    recoveryNoticeSendNeverLanded(e) || recoveryNoticeSendOutcomeUnknown(e) || isRetryableLarkError(e);
+  const cause = (error as { cause?: unknown } | null | undefined)?.cause;
+  return transient(error) || (cause !== undefined && transient(cause));
+};
+
+/** Re-sends a failure card / worker notice whose first send failed
+ *  transiently, with the same backoff, 24h cap and fixed uuid as the recovery
+ *  card. Any other failure ends the retries. */
+const turnNoticeOutbox = new RecoveryNoticeOutbox<ReturnType<typeof setTimeout>, TurnNoticeRecord>({
+  schedule: (delayMs, run) => {
+    const timer = setTimeout(run, delayMs);
+    timer.unref?.();
+    return timer;
+  },
+  cancel: timer => clearTimeout(timer),
+  log: (level, message) => logger[level](`[turn-notice] ${message}`),
+  retryable: turnNoticeSendRetryable,
+});
+
+function turnNoticeHost(ds: DaemonSession): RecoveryNoticeHost<TurnNoticeRecord> {
+  const find = (uuid: string) => ds.session.turnNotices?.find(entry => entry.delivery.uuid === uuid);
+  return {
+    key: ds.session.sessionId,
+    list: () => ds.session.turnNotices ?? [],
+    update: (uuid, mutate) => {
+      const record = find(uuid);
+      if (!record) return undefined;
+      mutate(record);
+      sessionStore.updateSession(ds.session);
+      return find(uuid);
+    },
+    send: record => requireCallbacks().sessionReply(
+      sessionAnchorId(ds),
+      record.content,
+      record.msgType,
+      ds.larkAppId,
+      record.turnId,
+      { uuid: record.delivery.uuid, sourceSessionId: ds.session.sessionId },
+    ),
+    canDeliver: () => ordinaryTurnRecoveryStillOwnsSession(ds),
+  };
+}
+
+/** Re-arm notices still owed from before a daemon restart or worker respawn. */
+export function resumeTurnNotices(ds: DaemonSession): void {
+  turnNoticeOutbox.resume(turnNoticeHost(ds));
+}
+
+/** Send a failure card / worker notice. When the send fails transiently (see
+ *  turnNoticeSendRetryable) the notice is kept on the session and retried with
+ *  the same uuid; any other failure is thrown as before. */
+async function sendTurnNotice(
+  ds: DaemonSession,
+  notice: Pick<TurnNoticeRecord, 'kind' | 'turnId' | 'msgType' | 'content'>,
+): Promise<void> {
+  const uuid = randomUUID();
+  try {
+    await requireCallbacks().sessionReply(
+      sessionAnchorId(ds),
+      notice.content,
+      notice.msgType,
+      ds.larkAppId,
+      notice.turnId,
+      { uuid, sourceSessionId: ds.session.sessionId },
+    );
+  } catch (err) {
+    if (!turnNoticeSendRetryable(err)) throw err;
+    const now = Date.now();
+    const delayMs = recoveryNoticeRetryDelayMs(1);
+    const lastError = err instanceof Error ? err.message : String(err);
+    const list = addTurnNotice(ds.session.turnNotices, {
+      ...notice,
+      createdAt: now,
+      delivery: {
+        state: 'pending',
+        attempts: 1,
+        uuid,
+        nextAttemptAt: now + delayMs,
+        lastError,
+        ...(recoveryNoticeSendNeverLanded(err) ? {} : { uncertainSince: now }),
+      },
+    });
+    ds.session.turnNotices = list;
+    try {
+      sessionStore.updateSession(ds.session);
+    } catch (persistErr) {
+      // A failed write reloads the durable row; this process still retries
+      // from memory (a restart then cannot resume it).
+      ds.session.turnNotices = list;
+      logger.error(`[${tag(ds)}] Failed to persist owed ${notice.kind} notice: `
+        + `${persistErr instanceof Error ? persistErr.message : String(persistErr)}`);
+    }
+    logger.warn(`[${tag(ds)}] Failed to deliver ${notice.kind} notice (${lastError}); `
+      + `retrying in ${Math.round(delayMs / 1000)}s`);
+    resumeTurnNotices(ds);
+  }
+}
 
 function enqueueOrdinaryRecoveryNotice(
   ds: DaemonSession,
@@ -17156,6 +17265,7 @@ function setupWorkerHandlers(
   const loc = botLocale(botCfg);
   ensureOrdinaryTurnRecoveryAttached(ds, botCfg);
   ensureReadonlyTaskContinuationAttached(ds, botCfg);
+  resumeTurnNotices(ds);
   const notifyStartupFailure = async (
     reason: string,
     turnId?: string,
@@ -20762,10 +20872,10 @@ function setupWorkerHandlers(
               // A refused card (content audit on the screen text, size) must
               // not swallow the notice the text path always delivered.
               logger.warn(`[${t}] input_not_submitted card refused, falling back to text: ${err?.message ?? err}`);
-              await scopedReply(msg.message, 'text', msg.turnId);
+              await sendTurnNotice(ds, { kind: 'user_notify', turnId: fallbackTurnId(ds, msg.turnId), msgType: 'text', content: msg.message });
             }
           } else {
-            await scopedReply(msg.message, 'text', msg.turnId);
+            await sendTurnNotice(ds, { kind: 'user_notify', turnId: fallbackTurnId(ds, msg.turnId), msgType: 'text', content: msg.message });
           }
         } catch (err: any) {
           logger.error(`[${t}] Failed to deliver user_notify to Lark: ${err.message}`);
@@ -21105,15 +21215,16 @@ function setupWorkerHandlers(
             turnId: msg.turnId,
           });
           try {
-            await scopedReply(
-              buildSessionTurnFailedCard(ds, {
+            await sendTurnNotice(ds, {
+              kind: 'turn_failure',
+              turnId: fallbackTurnId(ds, msg.turnId),
+              msgType: 'interactive',
+              content: buildSessionTurnFailedCard(ds, {
                 status: msg.status === 'ambiguous' ? 'ambiguous' : 'failed',
                 ...(msg.errorCode !== undefined ? { errorCode: msg.errorCode } : {}),
                 ...(msg.retryable !== undefined ? { retryable: msg.retryable } : {}),
               }),
-              'interactive',
-              msg.turnId,
-            );
+            });
           } catch (err) {
             logger.error(
               `[${t}] Failed to deliver turn failure card: `
