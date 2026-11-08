@@ -63,6 +63,44 @@ describe('WrittenInputLedger', () => {
     expect(ledger.takeSubmitted(submitted(submittedPrompt))).toBe('workflow-event:r1:2');
   });
 
+  it('a prefix that already backed a claim never backs another one: recalled old text is not credited to the wake currently held', () => {
+    const ledger = new WrittenInputLedger();
+    const head = 'C'.repeat(40);
+    const third = `${head} three`;
+    const ninth = `${head} nine`;
+    // The earlier wake was submitted normally: its fingerprint claim consumes
+    // its entry and spends the shared prefix.
+    ledger.noteWritten('workflow-event:r1:3', third);
+    expect(ledger.takeSubmitted(submitted(third))).toBe('workflow-event:r1:3');
+    // The wake the daemon now holds is the only entry with that prefix left.
+    ledger.noteWritten('workflow-event:r1:9', ninth);
+    // Up-arrow recalls the consumed wake's text and submits it verbatim: its
+    // fingerprint has no entry, and the spent prefix must not credit wake 9.
+    expect(ledger.takeSubmitted(submitted(third))).toBeUndefined();
+    // The held entry was not consumed: its own exact submit still resolves.
+    expect(ledger.takeSubmitted(submitted(ninth))).toBe('workflow-event:r1:9');
+  });
+
+  it('a claimed prefix spent through the prefix fallback is tainted as well', () => {
+    const ledger = new WrittenInputLedger();
+    const head = 'C'.repeat(40);
+    ledger.noteWritten('workflow-event:r1:1', `${head} one`);
+    const appended = `${head} one\nmore text in the same input box`;
+    expect(ledger.takeSubmitted(submitted(appended))).toBe('workflow-event:r1:1');
+    // A later held wake sharing the prefix cannot be credited via recall.
+    ledger.noteWritten('workflow-event:r1:2', `${head} two`);
+    expect(ledger.takeSubmitted(submitted(appended))).toBeUndefined();
+  });
+
+  it('a unique prefix belonging to a different text is untouched by the taint and still resolves', () => {
+    const ledger = new WrittenInputLedger();
+    ledger.noteWritten('workflow-event:r1:3', WAKE);
+    expect(ledger.takeSubmitted(submitted(WAKE))).toBe('workflow-event:r1:3');
+    ledger.noteWritten('om_person', 'a completely different human opening line');
+    expect(ledger.takeSubmitted(submitted('a completely different human opening line, then more')))
+      .toBe('om_person');
+  });
+
   it('a turn written again is remembered once, and only the latest writes are kept', () => {
     const ledger = new WrittenInputLedger();
     ledger.noteWritten('t-0', 'first text');
