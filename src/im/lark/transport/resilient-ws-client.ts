@@ -120,7 +120,8 @@ export function createResilientWsClient(options: Options, hooks: Hooks = {}, pol
     sdk.clearLiveness();
     if (!previous) return;
     // Only this client owns these listeners. Keep the permanent error listener:
-    // Bun emits an asynchronous ErrorEvent on terminate() during CONNECTING.
+    // terminate() during CONNECTING emits an asynchronous 'error' (an ErrorEvent on
+    // Bun <=1.4.3, an Error on Bun 1.4.4 and Node).
     for (const event of ['open', 'close', 'message', 'pong']) previous.removeAllListeners(event);
     if (previous.readyState === WebSocket.CLOSED) return;
     try {

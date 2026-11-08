@@ -1233,6 +1233,8 @@ const attaching = new Set<string>();   // dedup concurrent attaches per appId
 interface ResolvedDashboardSettings {
   /** Machine-wide prefix applied only by the `/group` and `/g` slash commands. */
   groupNamePrefix: string;
+  /** Machine-wide directory for new botmux-created worktrees; '' = next to the repo. */
+  worktreeRoot: string;
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   enableLocalCliOpen: boolean;
@@ -1915,6 +1917,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
   const larkCli = checkLarkCliVersion();
   return {
     groupNamePrefix: global.groupNamePrefix ?? '',
+    worktreeRoot: global.worktreeRoot ?? '',
     publicReadOnly: dashboard.publicReadOnly ?? config.dashboard.publicReadOnly,
     openTerminalInFeishu: dashboard.openTerminalInFeishu === true,
     enableLocalCliOpen: dashboard.enableLocalCliOpen === true,
@@ -4573,8 +4576,8 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // 会话写操作的跨站门禁（cookie 是 Lax，跨站 POST 仍会带上）。放在鉴权判决之后、
-    // 所有会话路由之前，按 /api/sessions/ 前缀加显式名单（/api/trigger、/api/asks/answer）拦截。
+    // 写接口的跨站门禁（cookie 是 Lax，跨站 POST 仍会带上）。放在鉴权判决之后、
+    // 所有 /api/ 路由之前，对 /api/ 下的非读方法拦截。
     if (!sessionWriteOriginAllowed(req, url.pathname)) {
       return dashboardControlJson(res, 403, { ok: false, error: 'control_origin_forbidden' });
     }

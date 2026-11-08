@@ -14,7 +14,7 @@ import { sessionPromptInjection } from '../../core/prompt-injection.js';
 import { normalizeCardActionData } from './card-action-data.js';
 import { logCardActionDiagnostics } from './card-action-diagnostics.js';
 import { existsSync } from 'node:fs';
-import { basename as pathBasename, dirname, join } from 'node:path';
+import { basename as pathBasename, join } from 'node:path';
 import { closeResidualIsLocal, describeCloseResidual } from '../../core/close-residual.js';
 import { config } from '../../config.js';
 import { replyCardKey, updateTurnReplyCard } from '../../core/turn-reply-card.js';
@@ -118,7 +118,7 @@ import type { DaemonSession } from '../../core/types.js';
 import { readPrincipalLaneTurnBinding } from '../../core/principal-lane-turn.js';
 import { buildTerminalUrl, platformTerminalReadEntryActive } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
-import { createRepoWorktree, removeRepoWorktree, restoreDeletedWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
+import { createRepoWorktree, removeRepoWorktree, restoreDeletedWorktree, dirSuffixForBranch, pushWorktreeBranch, worktreeTargetPath } from '../../services/git-worktree.js';
 import { repinSessionWorkingDir } from '../../core/session-cwd.js';
 import { answerRestartWithoutWorkingDir, reclaimUnstartedOpening, recoveryCardForm, workingDirRecoveryPending } from '../../core/working-dir-recovery.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
@@ -582,8 +582,8 @@ function stringListFromLarkMultiSelect(raw: unknown): string[] {
 
 function multiWorktreeParentPath(repoPaths: string[], name: string): string {
   const first = repoPaths[0];
-  const parentRoot = first ? dirname(first) : process.cwd();
-  return join(parentRoot, dirSuffixForBranch(name));
+  const dirName = dirSuffixForBranch(name);
+  return first ? worktreeTargetPath(first, dirName) : join(process.cwd(), dirName);
 }
 
 function worktreeChildNameForRepo(repoPath: string, projects: ProjectInfo[] | undefined): string {

@@ -100,7 +100,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
 
       - name: Require Midscene model configuration
         run: |
@@ -249,7 +249,7 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         if: steps.feishu_config.outputs.ready == 'true'
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
 
       - name: Check Midscene model connectivity
         id: model
@@ -413,7 +413,7 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
 
       - name: Install dependencies
         run: bun install --frozen-lockfile

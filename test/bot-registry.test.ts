@@ -2961,3 +2961,32 @@ describe('network policy configuration loading', () => {
     expect(config.sandboxNetworkPolicy!.public.rules![0]!.cidr).toBe('8.8.8.8/32');
   });
 });
+
+describe('sandbox field types', () => {
+  it.each([
+    ['sandboxPaths.deny', { sandboxPaths: { deny: '~/.ssh' } }],
+    ['sandboxPaths.readOnly', { sandboxPaths: { readWrite: ['/srv'], readOnly: '/srv/ref' } }],
+    ['sandboxPaths.readWrite', { sandboxPaths: { readWrite: '/srv/work' } }],
+    ['sandboxPaths.deny', { sandboxPaths: { deny: ['~/.ssh', 7] } }],
+    ['sandboxPaths', { sandboxPaths: ['~/.ssh'] }],
+    ['scratchDenyPaths', { scratchDenyPaths: '~/.ssh' }],
+    ['sandboxNetwork', { sandboxNetwork: 'false' }],
+  ])('rejects a mistyped %s instead of reading it as unset', async (field, overrides) => {
+    const mod = await freshImport();
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ sandbox: true, ...overrides })])))
+      .toThrow(`Bot config [0]: ${field} must be`);
+  });
+
+  it('keeps well-typed lists and treats null as not set', async () => {
+    const mod = await freshImport();
+    const [config] = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({
+      sandbox: true,
+      sandboxPaths: { deny: [' ~/.ssh ', ''], readOnly: null },
+      scratchDenyPaths: null,
+      sandboxNetwork: null,
+    })]));
+    expect(config.sandboxPaths).toEqual({ readWrite: [], readOnly: [], deny: ['~/.ssh'] });
+    expect(config.scratchDenyPaths).toEqual([]);
+    expect(config.sandboxNetwork).toBeUndefined();
+  });
+});
