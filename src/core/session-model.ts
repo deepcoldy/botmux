@@ -3,6 +3,7 @@ import { isPinSuspendedForAdopt } from './shared-adopt.js';
 import { cliModelSupportsReasoningEffort, reasoningEffortsForCliModel, type CodexReasoningEffort } from '../services/codex-reasoning-effort.js';
 import { groupModelSettings, type GroupDefaultModels, type GroupModelSettings } from './group-default-models.js';
 import type { CliId } from '../adapters/cli/types.js';
+import { supportsCodexModelSelection } from '../services/codex-model-selection.js';
 import {
   TRAEX_AUTO_MODEL_ID,
   validTraexAutoModelRuntime,
@@ -15,6 +16,7 @@ export type LaunchModelSession = {
   session: {
     cliId?: CliId;
     model?: string;
+    codexModelSelection?: import('../services/codex-model-selection.js').CodexModelSelection;
     modelPin?: ModelPin;
     cliSessionId?: string;
     traexAutoModelRuntime?: TraexAutoModelRuntimeState;
@@ -22,6 +24,7 @@ export type LaunchModelSession = {
     scope?: 'thread' | 'chat';
     chatType?: 'group' | 'p2p';
     adoptedFrom?: unknown;
+    backendType?: string;
     existingAppServerEndpoint?: string;
     dispatchLaunchSpec?: { effective: { model: string; reasoningEffort?: CodexReasoningEffort } };
   };
@@ -68,6 +71,12 @@ export function resolveSessionLaunchModelChoice(
     logicalModel = ds.session.dispatchLaunchSpec.effective.model;
   } else if (ds.spawnModelOverride) {
     logicalModel = ds.spawnModelOverride;
+  } else if (supportsCodexModelSelection(ds.session) && ds.session.codexModelSelection?.override
+    && ds.session.codexModelSelection.nativeSessionId === ds.session.cliSessionId) {
+    // A confirmed in-terminal /model choice outranks a BotMux pin: applying a
+    // pin also drives the native CLI to that model, so once the native setting
+    // catches up the override self-clears and the pin resumes governing.
+    logicalModel = ds.session.codexModelSelection.override;
   } else if (ds.session.modelPin && cliMatchesBot(ds.session, botCfg) && !isPinSuspendedForAdopt(ds)) {
     logicalModel = ds.session.modelPin.model;
   } else {
@@ -106,11 +115,29 @@ export function resolveSessionLaunchModelChoice(
  * `session.model` freeze), so a long-running session could never be moved off
  * its original model.
  *
- * Precedence: dispatchLaunchSpec → spawnModelOverride → explicit modelPin
- * (only while cliMatchesBot and the session is not a shared adopt) → captured
- * group defaults → live bot model
- * (only while cliMatchesBot) → session.model launch record. A pin is a user
- * action, never a frozen copy of a bot default (#773), and can be cleared.
+ * Precedence:
+ *   1. a persisted dispatch launch specification.
+ *   2. `spawnModelOverride` — an explicit per-trigger choice (trigger API
+ *      `options.model`), in-memory only, see DaemonSession.
+ *   3. a confirmed native Codex model override, bound to this conversation
+ *      (local Codex PTY/tmux only). Applying a BotMux pin also drives the
+ *      native CLI to that model, at which point the override self-clears, so a
+ *      pin resumes governing once the native setting catches up.
+ *   4. an explicit `modelPin` — only while cliMatchesBot and the session is
+ *      not a shared adopt. A pin is a user action, never a frozen copy of a bot
+ *      default (#773), and can be cleared.
+ *   5. the group default captured at topic creation, for the selected CLI.
+ *      Later group edits never alter this snapshot.
+ *   6. the live bot config, **only when the session's frozen `cliId` still
+ *      matches the bot's** — a session pinned to another CLI (a bot that
+ *      switched CLI later, or a Codex App thread takeover that forces
+ *      `codex-app`) must not be handed a model string meant for a different
+ *      CLI.
+ *   7. the model this session was last launched with (`session.model`, stamped
+ *      by sessionAgentConfig on every spawn), as a last resort for exactly that
+ *      mismatch case: it is the value that CLI actually ran with. Never
+ *      consulted while the live config applies, which is what makes a dashboard
+ *      edit effective on old sessions.
  *
  * A shared-adopt session (external pane or codex --remote viewer) never gets
  * relaunched with botmux args: its pin is retained but suspended for the whole

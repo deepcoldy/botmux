@@ -55,6 +55,12 @@ export function formatUrlHost(host: string): string {
   return host;
 }
 
+/** Origin of a page this machine serves itself; the Lark local-address
+ * policy recognizes the paths built on it (see core/host-capability-link). */
+export function localHttpOrigin(host: string, port: number | string): string {
+  return `http://${formatUrlHost(String(host))}:${port}`;
+}
+
 /**
  * Builds the dashboard URL(s) for a token.
  *
@@ -76,7 +82,7 @@ export function formatUrlHost(host: string): string {
  * dashboard link being the one place that always stays local.
  */
 export function buildDashboardUrls(opts: { host: string; port: number | string; token?: string }): DashboardUrls {
-  const localOrigin = `http://${formatUrlHost(String(opts.host))}:${opts.port}`;
+  const localOrigin = localHttpOrigin(opts.host, opts.port);
   // Ask for the platform leg separately from the whole precedence chain: the two
   // answers differ exactly in the reverse-proxy / Devbox cases, which is the
   // distinction every token-stripping caller needs (see DashboardUrls.platformHosted).
@@ -288,7 +294,7 @@ function remotePublicBase(): string | null {
  * URL-encoded.
  */
 export function buildV3RunDetailUrl(runId: string, opts: { host: string; port: number | string }): string {
-  const origin = remotePublicBase() ?? `http://${formatUrlHost(String(opts.host))}:${opts.port}`;
+  const origin = remotePublicBase() ?? localHttpOrigin(opts.host, opts.port);
   return `${origin}/#/v3/${encodeURIComponent(runId)}`;
 }
 
@@ -311,7 +317,7 @@ export function buildV3TerminalUrl(
   const base = platformCentralTerminalBaseUrl() ?? nonPlatformRemoteBase();
   if (base) return `${base}/s/${encodeURIComponent(sessionId)}/${capability}`;
   if (!opts.webPort || opts.webPort <= 0) return null;
-  return `http://${formatUrlHost(String(opts.host))}:${opts.webPort}/${capability}`;
+  return `${localHttpOrigin(opts.host, opts.webPort)}/${capability}`;
 }
 
 /**

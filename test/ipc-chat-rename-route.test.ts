@@ -110,6 +110,28 @@ describe('POST /api/sessions/:sessionId/chat-rename', () => {
     // FR-7 requires a cache-refresh warning be recorded on failure.
     expect(warnSpy.mock.calls.some(([msg]) => String(msg).includes('cache_refresh_failed'))).toBe(true);
   });
+
+  it('refuses to rename the source group from a silent listener session', async () => {
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+      session: {
+        sessionId: 's-chat-rename',
+        chatId: 'oc-chat-rename-route-test',
+        rootMessageId: 'ml:om_source',
+        messageListenerRun: { sourceMessageId: 'om_source', replyMode: 'none' as const },
+      },
+      managedTurnOrigin: { capability: CAP },
+      larkAppId: 'app-silent-rename',
+      chatId: 'oc-chat-rename-route-test',
+      chatType: 'group',
+    } as any);
+    vi.spyOn(workerPool, 'getActiveSessionsRegistry').mockReturnValue(new Map());
+    const renameSpy = vi.spyOn(groupsStore, 'renameChat');
+
+    const res = await postRename('new');
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'silent_message_listener' });
+    expect(renameSpy).not.toHaveBeenCalled();
+  });
 });
 
 describe('PUT /api/groups/:chatId/name', () => {
