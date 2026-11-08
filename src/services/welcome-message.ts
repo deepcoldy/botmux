@@ -90,6 +90,7 @@ function claimDelivery(
     if (current?.status === 'sent') return { kind: 'already_sent', sentAt: current.sentAt };
     if (current?.status === 'sending') {
       const age = nowMs - Date.parse(current.claimedAt);
+      // 时钟回拨会让认领落在未来：TTL 内照样视为占用，超出 TTL 的不可能是活着的持有者。
       if (Math.abs(age) < WELCOME_CLAIM_TTL_MS) {
         return { kind: 'held', claimedAt: current.claimedAt, recheckInMs: WELCOME_CLAIM_TTL_MS - age + 1_000 };
       }

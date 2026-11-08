@@ -44,6 +44,15 @@ function claimBy(token: string, claimedAtMs: number): WelcomeRecord {
   return { status: 'sending', claimedAt: new Date(claimedAtMs).toISOString(), recipient: OWNER, token };
 }
 
+function heldSend() {
+  let markStarted!: () => void;
+  const started = new Promise<void>(resolve => { markStarted = resolve; });
+  let finish!: (err?: Error) => void;
+  const outcome = new Promise<void>((resolve, reject) => { finish = err => (err ? reject(err) : resolve()); });
+  const send = vi.fn<SendFn>(() => { markStarted(); return outcome; });
+  return { send, started, finish };
+}
+
 afterEach(() => {
   vi.useRealTimers();
 });
@@ -132,6 +141,29 @@ describe('deliverWelcomeMessageOnce', () => {
     expect(send).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps a claim stamped slightly ahead of this clock held instead of overwriting it', async () => {
+    const dataDir = freshDir();
+    const claimedAt = new Date(T0 + WELCOME_CLAIM_TTL_MS / 2).toISOString();
+    const ahead = claimBy('live', Date.parse(claimedAt));
+    writeRecord(dataDir, APP, ahead);
+    const send = vi.fn<SendFn>(async () => undefined);
+    const result = await deliverWelcomeMessageOnce({ dataDir, larkAppId: APP, message: 'hi', recipient: OWNER, send, sleep: async () => undefined, now: clockAt(T0).now });
+    expect(result).toEqual({ status: 'claim_held', claimedAt });
+    expect(send).not.toHaveBeenCalled();
+    expect(readWelcomeRecord(dataDir, APP)).toEqual(ahead);
+  });
+
+  it('takes over a claim stamped further ahead than the TTL without waiting', async () => {
+    const dataDir = freshDir();
+    writeRecord(dataDir, APP, claimBy('skewed', T0 + WELCOME_CLAIM_TTL_MS + 1_000));
+    const send = vi.fn<SendFn>(async () => undefined);
+    const sleep = vi.fn(async (_ms: number) => undefined);
+    const result = await deliverWelcomeMessageOnce({ dataDir, larkAppId: APP, message: 'hi', recipient: OWNER, send, sleep, now: clockAt(T0).now });
+    expect(result.status).toBe('sent');
+    expect(sleep).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
   it('waits out a fresh claim whose holder died, then takes it over in the same start', async () => {
     const dataDir = freshDir();
     const age = 1_000;
@@ -182,6 +214,26 @@ describe('deliverWelcomeMessageOnce', () => {
     const result = await deliverWelcomeMessageOnce({ dataDir, larkAppId: APP, message: 'hi', recipient: OWNER, send, now: clockAt(T0).now });
     expect(result.status).toBe('failed');
     expect(readWelcomeRecord(dataDir, APP)).toEqual(taken);
+  });
+
+  it('gives a takeover its own claim, so the stale holder failing late leaves it alone', async () => {
+    const dataDir = freshDir();
+    const stale = heldSend();
+    const taker = heldSend();
+    const staleStart = deliverWelcomeMessageOnce({ dataDir, larkAppId: APP, message: 'hi', recipient: OWNER, send: stale.send, now: clockAt(T0).now });
+    await stale.started;
+
+    const takeoverAt = T0 + WELCOME_CLAIM_TTL_MS + 1_000;
+    const takerStart = deliverWelcomeMessageOnce({ dataDir, larkAppId: APP, message: 'hi', recipient: OWNER, send: taker.send, now: clockAt(takeoverAt).now });
+    await taker.started;
+
+    stale.finish(new Error('stalled holder gave up'));
+    expect((await staleStart).status).toBe('failed');
+    expect(readWelcomeRecord(dataDir, APP)).toMatchObject({ status: 'sending', claimedAt: new Date(takeoverAt).toISOString() });
+
+    taker.finish();
+    expect((await takerStart).status).toBe('sent');
+    expect(readWelcomeRecord(dataDir, APP)?.status).toBe('sent');
   });
 
   it('abandons a send that exceeds the budget, aborts it and releases the claim', async () => {
