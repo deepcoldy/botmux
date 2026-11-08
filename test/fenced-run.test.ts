@@ -5,9 +5,14 @@
  */
 import { describe, expect, it } from 'vitest';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { resolve } from 'node:path';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { fencedRunEnv } from '../scripts/fenced-run.js';
+import { userSystemdBusEnv } from '../src/core/session-scope.js';
 
 const SCRIPT = resolve(__dirname, '..', 'scripts', 'fenced-run.ts');
+const SESSION_SCOPE = resolve(__dirname, '..', 'src', 'core', 'session-scope.ts');
 let bun: string | undefined;
 try { bun = execFileSync('which', ['bun'], { encoding: 'utf8' }).trim(); } catch { /* optional */ }
 let realTmux: string | undefined;
@@ -41,6 +46,24 @@ describe.skipIf(!bun)('fenced-run', () => {
       { ...process.env, XDG_RUNTIME_DIR: '/run/user/0' });
     expect(r.status).toBe(0);
     expect(r.stdout.trim()).toBe('/run/user/0');
+  });
+
+  it.skipIf(process.platform !== 'linux')('stops botmux deriving the user bus from /run/user unless the bus is kept', () => {
+    // The socket check is stubbed so the probe means the same on a host without a user bus.
+    const probe = `const s=await import(${JSON.stringify(SESSION_SCOPE)});`
+      + 'console.log(JSON.stringify(s.userSystemdBusEnv({isSocket:()=>true})??null))';
+    const invoker = { ...process.env, XDG_RUNTIME_DIR: '/run/user/0', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/0/bus' };
+    const fenced = run(['--', bun!, '-e', probe], invoker);
+    expect(fenced.status, fenced.stderr).toBe(0);
+    expect(JSON.parse(fenced.stdout.trim().split('\n').pop()!)).toBeNull();
+
+    const kept = run(['--keep-user-bus', '--', bun!, '-e', probe], invoker);
+    expect(kept.status, kept.stderr).toBe(0);
+    const uid = process.getuid!();
+    expect(JSON.parse(kept.stdout.trim().split('\n').pop()!)).toEqual({
+      XDG_RUNTIME_DIR: `/run/user/${uid}`,
+      DBUS_SESSION_BUS_ADDRESS: `unix:path=/run/user/${uid}/bus`,
+    });
   });
 
   it('keeps config.session.dataDir, mojo workspaces and session markers out of the live fleet', async () => {
@@ -77,5 +100,49 @@ describe.skipIf(!bun)('fenced-run', () => {
     const r = run(['--', 'tmux', '-S', `/tmp/tmux-${uid}/botmux`, 'list-sessions']);
     expect(r.status).toBe(3);
     expect(r.stderr).toMatch(/refus/i);
+  });
+});
+
+describe.skipIf(process.platform !== 'linux')('fencedRunEnv user bus', () => {
+  const uid = process.getuid?.() ?? 0;
+  const derived = { XDG_RUNTIME_DIR: `/run/user/${uid}`, DBUS_SESSION_BUS_ADDRESS: `unix:path=/run/user/${uid}/bus` };
+  const isSocket = () => true;
+
+  function childEnv(base: NodeJS.ProcessEnv, keepUserBus: boolean): NodeJS.ProcessEnv {
+    const root = mkdtempSync(join(tmpdir(), 'bmx-frb-'));
+    try {
+      return fencedRunEnv(base, join(root, 'home'), { root, binDir: null, denyLog: join(root, 'denied.log') },
+        { keepUserBus, isBusSocket: isSocket });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+  const busVars = (env: NodeJS.ProcessEnv) => ({
+    XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS: env.DBUS_SESSION_BUS_ADDRESS,
+  });
+
+  it('leaves botmux no user bus to derive by default', () => {
+    const env = childEnv({ XDG_RUNTIME_DIR: '/run/user/0', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/0/bus' }, false);
+    expect(busVars(env)).toEqual({ XDG_RUNTIME_DIR: undefined, DBUS_SESSION_BUS_ADDRESS: undefined });
+    expect(userSystemdBusEnv({ env, isSocket })).toBeUndefined();
+  });
+
+  it('passes the invoker bus through unchanged with --keep-user-bus', () => {
+    const env = childEnv({ DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/private-bus' }, true);
+    expect(busVars(env)).toEqual({ XDG_RUNTIME_DIR: undefined, DBUS_SESSION_BUS_ADDRESS: 'unix:path=/tmp/private-bus' });
+    expect(userSystemdBusEnv({ env, isSocket })).toEqual(derived);
+  });
+
+  it('hands --keep-user-bus the bus botmux would derive when the invoker exported none', () => {
+    const env = childEnv({}, true);
+    expect(busVars(env)).toEqual(derived);
+    expect(userSystemdBusEnv({ env, isSocket })).toEqual(derived);
+  });
+
+  it('cannot win the bus back by nesting --keep-user-bus inside a fence that dropped it', () => {
+    const outer = childEnv({ XDG_RUNTIME_DIR: '/run/user/0', DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/0/bus' }, false);
+    const env = childEnv(outer, true);
+    expect(busVars(env)).toEqual({ XDG_RUNTIME_DIR: undefined, DBUS_SESSION_BUS_ADDRESS: undefined });
+    expect(userSystemdBusEnv({ env, isSocket })).toBeUndefined();
   });
 });

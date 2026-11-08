@@ -88,6 +88,22 @@ it.each([
   expect(runCodexInvocation).not.toHaveBeenCalled();
 });
 
+// The machine-wide force switch has THREE active values (1/oncall/scratch):
+// the spawned native CLI gets no bwrap/Seatbelt wrap on this path, so the gate
+// must reject for every active value (and fail closed on an invalid one — the
+// worker refuses to spawn with it), not only for the legacy BOTMUX_SANDBOX=1.
+it.each(['1', 'oncall', 'scratch', 'yes'])('does not bypass the machine-wide sandbox force: BOTMUX_SANDBOX=%s', async raw => {
+  vi.stubEnv('BOTMUX_SANDBOX', raw);
+  try {
+    const s = await start();
+    const capability = await (await fetchDaemonIpc(s.port, '/api/headless/invocations/capabilities', {}, secret)).json() as any;
+    expect(capability.capability.supported).toBe(false);
+    const response = await fetchDaemonIpc(s.port, '/api/headless/invocations', { method: 'POST', body: JSON.stringify(request), headers: { 'content-type': 'application/json' } }, secret);
+    expect(response.status).toBe(400);
+    expect(runCodexInvocation).not.toHaveBeenCalled();
+  } finally { vi.unstubAllEnvs(); }
+});
+
 import { runPiInvocation } from '../src/services/constrained-invocation/pi-runtime.js';
 
 

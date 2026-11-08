@@ -622,6 +622,14 @@ function hasCliProcess(
 }
 
 /**
+ * How deep the Codex ownership search descends below its launch root. Under the
+ * network-policy sandbox the CLI sits 7 levels below the session-scope sh (8
+ * below an OSC relay); see the measured chain in traex-leaf-pid.ts. An npm
+ * install adds its Node launcher on top of that.
+ */
+export const CODEX_LEAF_SEARCH_DEPTH = 16;
+
+/**
  * Resolve the REAL CLI pid spawned underneath a wrapperCli launcher
  * (e.g. `aiden x claude`, where the launcher forks real Claude Code as a child).
  *

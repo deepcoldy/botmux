@@ -11,6 +11,7 @@ import {
   type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults-page.js';
 import { isOnboardingSubmitDisabled } from '../src/dashboard/web/bot-onboarding.js';
+import { DropdownMenu } from '../src/dashboard/web/dashboard-components.js';
 
 // Profile scanning has its own component/browser tests. Keep these agent-save
 // contract tests independent of that additional GET request.
@@ -287,8 +288,9 @@ describe('Codex-compatible runtime editor', () => {
       expect(requests[1]).not.toHaveProperty('replaceCliSelection');
       // The picker can deliberately choose the same key. This is distinguishable
       // from an untouched fallback key even for an unregistered Codex wrapper.
-      act(() => root.findByProps({ id: 'bd-menu-agentCliId' }).findAllByType('button')
-        .find(button => button.props['aria-current'] === 'true')!.props.onClick());
+      const cliMenu = root.find(node => node.type === DropdownMenu && node.props.id === 'bd-menu-agentCliId');
+      expect(cliMenu.props.notifyOnReselect).toBe(true);
+      act(() => cliMenu.props.onChange(cliMenu.props.value));
       await save();
       expect(requests[2]).toMatchObject({ cliId: key, replaceCliSelection: true });
       expect(patchBot).toHaveBeenLastCalledWith('cli_runtime', expect.objectContaining({ wrapperCli: null }));

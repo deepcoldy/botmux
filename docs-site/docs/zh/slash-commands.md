@@ -196,7 +196,9 @@ Claude Code 等其它 CLI 的 `/effort` 仍按下面的透传规则处理。
 
 `/compact` `/model` `/clear` `/plugin` `/usage` `/new` `/context` `/cost` `/mcp` `/diff` `/code-review` `/security-review` `/review` `/btw` `/effort` `/fast` —— 字面送达底层 CLI，交给它的内置命令处理（Codex CLI / App 的 `/effort` 例外，见上文）。
 
-`/fast` 仅对 Codex 生效：切换 Codex 原生的 service tier 档位，流式卡片会显示只读的 `⚡ <档位>` 徽标，如实反映 Codex 实际运行的档位。在 RPC 输入模式或 Riff 后端上，按键到不了 Codex 执行器，因此 `/fast` 在这些后端会 fail-closed 给出明确提示，而非静默失效。
+**Riff 后端无透传面**：Riff 没有本地 CLI，上述斜杠命令不会以按键方式送达，而是按普通消息封装成**一次远端任务**，命令文本也不会进入任何斜杠解析器。因此在 Riff 会话里发 `/compact`、`/model` 等（含 `customPassthroughCommands` 自定义项）等价于发一条普通对话文本，不会被拆成多次远端任务。
+
+`/fast` 仅对 Codex 生效：切换 Codex 原生的 service tier 档位，流式卡片会显示只读的 `⚡ <档位>` 徽标，如实反映 Codex 实际运行的档位。在 RPC 输入模式或 Mojo 后端上，`/fast` 仍走透传分支，会被 fail-closed 明确拒绝、给出提示，而不会静默生效。Riff 后端则按上一段处理：`/fast` 不进透传，而是作为普通消息封装成一次远端任务，同样不会切换档位。
 
 部分 CLI 还有 adapter 默认放行的命令：Claude Code / Codex 默认放行 `/goal`，因此新话题第一条发 `/goal ...` 也会先启动/选择仓库，再把 `/goal ...` 原样投给 CLI。
 

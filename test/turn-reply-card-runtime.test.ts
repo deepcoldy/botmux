@@ -617,7 +617,7 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(existsSync(new TurnReplyCardStore(dir).directory)).toBe(false);
   });
 
-  it.each(['new-bot', 'worker-sandbox', 'legacy-isolation', 'worker-isolation', 'global'] as const)(
+  it.each(['new-bot', 'worker-sandbox', 'legacy-isolation', 'worker-isolation', 'global', 'global-oncall', 'global-scratch'] as const)(
     'rejects %s isolation even with a persisted unified reservation', source => {
       const ds = session();
       new TurnReplyCardStore(dir).prepareSync({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' }, {
@@ -628,6 +628,8 @@ describe('reply-card runtime eligibility and recovery', () => {
       if (source === 'worker-sandbox') ds.initConfig = { sandbox: true } as DaemonSession['initConfig'];
       if (source === 'worker-isolation') ds.initConfig = { readIsolation: true } as DaemonSession['initConfig'];
       if (source === 'global') vi.stubEnv('BOTMUX_SANDBOX', '1');
+      if (source === 'global-oncall') vi.stubEnv('BOTMUX_SANDBOX', 'oncall');
+      if (source === 'global-scratch') vi.stubEnv('BOTMUX_SANDBOX', 'scratch');
       expect(replyCardModeFor(ds)).toBe('legacy');
     },
   );

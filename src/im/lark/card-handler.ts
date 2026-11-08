@@ -14,14 +14,15 @@ import { sessionPromptInjection } from '../../core/prompt-injection.js';
 import { normalizeCardActionData } from './card-action-data.js';
 import { logCardActionDiagnostics } from './card-action-diagnostics.js';
 import { existsSync } from 'node:fs';
-import { basename as pathBasename, dirname, join } from 'node:path';
+import { basename as pathBasename, join } from 'node:path';
 import { closeResidualIsLocal, describeCloseResidual } from '../../core/close-residual.js';
 import { config } from '../../config.js';
 import { replyCardKey, updateTurnReplyCard } from '../../core/turn-reply-card.js';
 import { TurnReplyCardStore, replyCardIsTerminal } from '../../services/turn-reply-card.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
-import { writeSessionModelPin } from '../../core/worker-pool.js';
+import { writeSessionModelPin, recordTurnExplicitMention } from '../../core/worker-pool.js';
+import { messageMentionsBot } from './message-parser.js';
 import { validateModelPin } from '../../core/model-pin.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
@@ -116,7 +117,7 @@ import type { DaemonSession } from '../../core/types.js';
 import { readPrincipalLaneTurnBinding } from '../../core/principal-lane-turn.js';
 import { buildTerminalUrl, platformTerminalReadEntryActive } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
-import { createRepoWorktree, removeRepoWorktree, restoreDeletedWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
+import { createRepoWorktree, removeRepoWorktree, restoreDeletedWorktree, dirSuffixForBranch, pushWorktreeBranch, worktreeTargetPath } from '../../services/git-worktree.js';
 import { repinSessionWorkingDir } from '../../core/session-cwd.js';
 import { answerRestartWithoutWorkingDir, reclaimUnstartedOpening, recoveryCardForm, workingDirRecoveryPending } from '../../core/working-dir-recovery.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
@@ -552,8 +553,8 @@ function stringListFromLarkMultiSelect(raw: unknown): string[] {
 
 function multiWorktreeParentPath(repoPaths: string[], name: string): string {
   const first = repoPaths[0];
-  const parentRoot = first ? dirname(first) : process.cwd();
-  return join(parentRoot, dirSuffixForBranch(name));
+  const dirName = dirSuffixForBranch(name);
+  return first ? worktreeTargetPath(first, dirName) : join(process.cwd(), dirName);
 }
 
 function worktreeChildNameForRepo(repoPath: string, projects: ProjectInfo[] | undefined): string {
@@ -889,6 +890,15 @@ export async function commitRepoSelection(
       // the user can retry this exact selection without losing the first turn.
       const pendingTurnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
       if (!emptyStart && pendingTurnId) await prepareTurn?.(ds, pendingTurnId);
+      // 被 @ 回执的来源记录挂在交给 forkWorker 的同一 turnId 上（turn_terminal 带回的就是它）；
+      // raw 冷启动的 turnId 不经 forkWorker，而是在 prompt_ready 随 raw_input 下发，这里不记。
+      if (!emptyStart && !pendingRawInput && pendingTurnId) {
+        recordTurnExplicitMention(ds, pendingTurnId, messageMentionsBot(
+          { mentions: ds.pendingMentions },
+          ds.larkAppId,
+          selfBot.botOpenId,
+        ));
+      }
       forkWorker(
         ds,
         prompt,
