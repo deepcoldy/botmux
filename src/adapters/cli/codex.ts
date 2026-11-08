@@ -158,8 +158,15 @@ function normaliseHistoryText(text: string): string {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
 
+// Codex stores the submitted composer text trimmed (0.150 through 0.167), so a
+// message with leading/trailing whitespace never appears byte-for-byte.
 function historyTextMatches(actual: string, expected: string): boolean {
-  return actual === expected || normaliseHistoryText(actual) === normaliseHistoryText(expected);
+  if (actual === expected) return true;
+  const a = normaliseHistoryText(actual);
+  const e = normaliseHistoryText(expected);
+  if (a === e) return true;
+  const trimmed = e.trim();
+  return trimmed !== '' && a.trim() === trimmed;
 }
 
 /** Optional ownership filter for a history match. `history.jsonl` is a single
