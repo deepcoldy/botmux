@@ -32,13 +32,35 @@ describe('WrittenInputLedger', () => {
     expect(ledger.takeSubmitted(submitted(WAKE))).toBe('workflow-event:r1:3');
   });
 
-  it('turns sharing a prefix: the earliest written first', () => {
+  it('a prefix shared by two written turns (workflow wakes share their static preamble) proves neither and consumes nothing', () => {
     const ledger = new WrittenInputLedger();
     const second = WAKE.replace('node a', 'node b');
     ledger.noteWritten('workflow-event:r1:3', WAKE);
     ledger.noteWritten('workflow-event:r1:4', second);
-    expect(ledger.takeSubmitted({ prefix: prefixOf(second) })).toBe('workflow-event:r1:3');
+    expect(prefixOf(WAKE)).toBe(prefixOf(second));
+    // A prefix-only submit (the full fingerprint missed after an append, a
+    // sanitization difference) cannot pick one over the other.
+    expect(ledger.takeSubmitted({ prefix: prefixOf(second) })).toBeUndefined();
+    // Nothing was consumed: the exact fingerprints still resolve both turns.
     expect(ledger.takeSubmitted(submitted(second))).toBe('workflow-event:r1:4');
+    expect(ledger.takeSubmitted(submitted(WAKE))).toBe('workflow-event:r1:3');
+  });
+
+  it('a stale wake entry cannot steal a later wake submit whose prefix it shares', () => {
+    const ledger = new WrittenInputLedger();
+    const head = 'C'.repeat(40);
+    ledger.noteWritten('workflow-event:r1:1', `${head} one`); // Esc-cleared, never submitted, still in the ledger
+    ledger.noteWritten('workflow-event:r1:2', `${head} two`);
+    const submittedPrompt = `${head} two\nappended in the same box after the write`;
+    expect(ledger.takeSubmitted(submitted(submittedPrompt))).toBeUndefined();
+  });
+
+  it('with the stale entry gone, the same prefix-only submit resolves the one remaining turn', () => {
+    const ledger = new WrittenInputLedger();
+    const head = 'C'.repeat(40);
+    ledger.noteWritten('workflow-event:r1:2', `${head} two`);
+    const submittedPrompt = `${head} two\nappended in the same box after the write`;
+    expect(ledger.takeSubmitted(submitted(submittedPrompt))).toBe('workflow-event:r1:2');
   });
 
   it('a turn written again is remembered once, and only the latest writes are kept', () => {
