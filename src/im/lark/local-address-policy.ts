@@ -45,7 +45,10 @@ const md = new MarkdownIt({ html: false, linkify: false });
 md.validateLink = () => true;
 const LOCAL_SCHEME = /^(?:file|vscode(?:-insiders)?|vscode-remote|cursor|idea|jetbrains|subl|atom|skill):/i;
 const ROOT_PATH = /^(?:\/(?:home|Users|root|tmp|private|var|run|mnt|media|Volumes|opt|srv|etc|usr|bin|sbin|dev|proc|sys|data\d*|workspace|workspaces)(?:\/|$)|~(?:\/|$)|\$(?:HOME|\{HOME\})(?:\/|$)|%USERPROFILE%(?:[\\/]|$)|[a-z]:[\\/]|\\\\)/i;
-const ADDRESS_TOKEN = /(?:\b(?:file|vscode(?:-insiders)?|vscode-remote|cursor|idea|jetbrains|subl|atom|skill):[^\s<>"'\x60，。、；！？]*|(?<![\w/])(?:\/(?:home|Users|root|tmp|private|var|run|mnt|media|Volumes|opt|srv|etc|usr|bin|sbin|dev|proc|sys|data\d*|workspace|workspaces)(?=\/|$)|~(?=\/|$)|\$(?:HOME|\{HOME\})(?=\/|$)|%USERPROFILE%(?=[\\/]|$)|[a-z]:[\\/]|\\\\)[^\s<>"'\x60，。、；！？()[\]]*)/giu;
+// /dev streams and the kernel's /proc and /sys views name no user file, so shell
+// text like `2>/dev/null` stays readable. A process's cwd and root under /proc
+// lead back into the filesystem and stay covered.
+const ADDRESS_TOKEN = /(?:\b(?:file|vscode(?:-insiders)?|vscode-remote|cursor|idea|jetbrains|subl|atom|skill):[^\s<>"'\x60，。、；！？]*|(?<![\w/])(?!\/dev\/(?:null|stdin|stdout|stderr|fd\/\d+)(?![\w.\/-])|\/(?:proc|sys)(?:\/|$)(?!(?:self|thread-self|\d+)\/(?:task\/\d+\/)?(?:cwd|root)(?:\/|$)))(?:\/(?:home|Users|root|tmp|private|var|run|mnt|media|Volumes|opt|srv|etc|usr|bin|sbin|dev|proc|sys|data\d*|workspace|workspaces)(?=\/|$)|~(?=\/|$)|\$(?:HOME|\{HOME\})(?=\/|$)|%USERPROFILE%(?=[\\/]|$)|[a-z]:[\\/]|\\\\)[^\s<>"'\x60，。、；！？()[\]]*)/giu;
 const LINK_KEYS = new Set(['href', 'url', 'pc_url', 'android_url', 'ios_url', 'default_url']);
 const STRUCTURAL_KEYS = new Set([
   'tag', 'element_id', 'name', 'data_type', 'img_key', 'image_key', 'file_key',

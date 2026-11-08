@@ -103,6 +103,30 @@ describe('local address presentation policy', () => {
     expect(sanitizeLocalAddressText(`http://${name}:3000/report`, context)).not.toContain(`${name}:3000`);
   });
 
+  it.each([
+    'ls 2>/dev/null', 'cmd >/dev/null 2>&1', 'cat /dev/stdin', 'echo x > /dev/stderr', 'echo x >/dev/stdout',
+    'diff <(a) /dev/fd/63', 'cat /proc/cpuinfo', 'cat /proc/1234/status', 'ls -l /proc/self/fd/3',
+    'cat /sys/class/net/eth0/address', 'mount | grep /proc',
+  ])('keeps a system path that names no user file: %s', text => {
+    expect(sanitizeLocalAddressText(text)).toBe(text);
+  });
+
+  it.each([
+    '/dev/tty', '/dev/null.d/x', '/dev/fd/3/secret', '/proc/self/cwd/src/main.ts', '/proc/1/root/home/alice/x',
+    '/proc/self/task/12/cwd/x', '/proc/../home/alice/x', '/sys/../root/.ssh/id_rsa',
+  ])('still covers a user file reached through a system path: %s', address => {
+    const out = sanitizeLocalAddressText('结果：' + address);
+    expect(out).toContain('【内部文件】');
+    expect(out).not.toMatch(/tty|null\.d|secret|main\.ts|alice|id_rsa|\/x$/);
+  });
+
+  it('exempts system paths in prose only', () => {
+    expect(sanitizeLocalAddressText('ls 2>/dev/null && cat /home/alice/secret.txt')).toBe('ls 2>/dev/null && cat 【内部文件】');
+    expect(sanitizeLocalAddressText('/dev/null:/home/alice/secret')).toBe('/dev/null:【内部文件】');
+    expect(sanitizeLocalAddressText('[日志](/dev/null)')).toBe('日志（未提供可访问链接）');
+    expect(() => sanitizeLocalAddressNode({ url: '/proc/cpuinfo' })).toThrow();
+  });
+
   it('checks only card link fields in link-field mode', () => {
     const context = { linkFieldsOnly: true };
     const prose = '恢复：cd /root/iserver/repo && claude --resume 1 · http://127.0.0.1:3000/ · [技能](/home/alice/SKILL.md)';
