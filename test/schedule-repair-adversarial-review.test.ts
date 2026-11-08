@@ -488,8 +488,12 @@ describe('scheduled send settlement for in-flight sends, restarts and superseded
     expect(markDelivered).not.toHaveBeenCalled();
     send.finish('om_slow_receipt');
     await send.receipt;
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(markDelivered).toHaveBeenCalledWith(run.taskId, run.runId, CHAT, APP);
+    // Re-arm explicitly and pump in steps: under shard microtask starvation a
+    // one-shot advance can miss the in-flight backoff's re-queued timer, so
+    // the delivered receipt would never reach markScheduleRunLogDelivered.
+    settleLater(daemonSession(s), { turnId: run.turnId, source: 'terminal' });
+    await pumpUntil(() => expect(markDelivered)
+      .toHaveBeenCalledWith(run.taskId, run.runId, CHAT, APP), 30_000, 500);
     expect(taskRow(run.taskId)).toMatchObject({ lastStatus: 'ok', runStats: { failed: 0 } });
     expect(logFor(run)?.outcome).toBe('model_dispatched');
   });
@@ -509,8 +513,11 @@ describe('scheduled send settlement for in-flight sends, restarts and superseded
     expect(logFor(run)?.outcome).toBe('model_dispatched');
     await ledger.execute(sendKey(s, run), 'final', 'answer', async () => 'om_retried', { fenced: true });
     finishDelivery();
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(markDelivered).toHaveBeenCalledWith(run.taskId, run.runId, CHAT, APP);
+    // Explicit re-arm + stepwise pump so the retried receipt's delivery is
+    // observed even when shard load delays the in-flight backoff chain.
+    settleLater(ds, { turnId: run.turnId, source: 'terminal' });
+    await pumpUntil(() => expect(markDelivered)
+      .toHaveBeenCalledWith(run.taskId, run.runId, CHAT, APP), 30_000, 500);
     expect(taskRow(run.taskId)).toMatchObject({ lastStatus: 'ok', runStats: { failed: 0 } });
   });
 
