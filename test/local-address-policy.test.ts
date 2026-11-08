@@ -85,6 +85,14 @@ describe('local address presentation policy', () => {
     expect(sanitizeLocalAddressText('http://10.20.30.41/api', context)).toBe('http://10.20.30.41/api');
   });
 
+  it.each(['ubuntu', 'master', 'devbox'])('keeps ordinary words that happen to be the machine name: %s', name => {
+    const context = { localHosts: [name] };
+    const prose = `On Ubuntu 22.04, merge into master or origin/master; the devbox image ships node 22.`;
+    expect(sanitizeLocalAddressText(prose, context)).toBe(prose);
+    expect(sanitizeLocalAddressText(`dev server ${name}:3000/report`, context)).not.toContain(`${name}:3000`);
+    expect(sanitizeLocalAddressText(`http://${name}:3000/report`, context)).not.toContain(`${name}:3000`);
+  });
+
   it('lets a card link through only for an origin the host issued itself', () => {
     const hostLinkOrigin = (origin: string) => origin === 'http://10.20.30.40:7891';
     const context = { localHosts: ['10.20.30.40'], hostLinkOrigin };

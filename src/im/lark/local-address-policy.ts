@@ -1,4 +1,5 @@
 import MarkdownIt from 'markdown-it';
+import { isIP } from 'node:net';
 import { homedir, hostname, networkInterfaces } from 'node:os';
 import { posix } from 'node:path';
 import { extractHttpUrlSpans } from '../../services/link-ref-extractor.js';
@@ -73,15 +74,19 @@ function contextFor(input: LocalAddressContext): Context {
   }
   const roots = (input.workspaceRoots ?? [process.cwd()]).map(root => root.replace(/\\/g, '/').replace(/\/+$/, ''));
   const hostPaths = [...roots, homedir()].filter(root => root && root !== '/').map(escaped);
-  const hostNames = ['0.0.0.0', '::', '::1', ...hosts].filter(Boolean)
+  const hostNames = ['0.0.0.0', '::', '::1', ...hosts].filter(host => isIP(host))
     .map(host => host.includes(':') ? '(?:\\[' + escaped(host) + '\\]|' + escaped(host) + ')' : escaped(host));
   const mappedLoopback = '::ffff:(?:127(?:\\.\\d{1,3}){3}|7f[0-9a-f]{2}:[0-9a-f]{1,4})';
   hostNames.push('(?:\\[' + mappedLoopback + '\\]|' + mappedLoopback + ')');
+  // Machine names are often ordinary words (ubuntu, master, devbox). In prose
+  // one only names this host when it carries a port; URLs are judged by authority.
+  const machineNames = [...hosts].filter(host => host && !isIP(host)).map(escaped);
+  const machineAddress = machineNames.length ? '|(?:' + machineNames.join('|') + '):\\d+' : '';
   return {
     roots,
     hosts,
     hostPaths: new RegExp('(?<![\\w/])(?:' + hostPaths.join('|') + ')(?=/|$)[^\\s<>"\\x27\\x60，。、；！？()[\\]]*', 'gu'),
-    hostNames: new RegExp('(?<![\\w.-])(?:localhost|127(?:\\.\\d{1,3}){3}|' + hostNames.join('|') + ')(?::\\d+)?(?![\\w.:-])(?:/[^\\s<>"\\x27\\x60，。、；！？()[\\]]*)?', 'giu'),
+    hostNames: new RegExp('(?<![\\w.-])(?:(?:localhost|127(?:\\.\\d{1,3}){3}|' + hostNames.join('|') + ')(?::\\d+)?' + machineAddress + ')(?![\\w.:-])(?:/[^\\s<>"\\x27\\x60，。、；！？()[\\]]*)?', 'giu'),
     internalFile: input.internalFileLabel ?? '【内部文件】',
     unavailableLink: input.unavailableLinkLabel ?? '（未提供可访问链接）',
     hostLinkOrigin: input.hostLinkOrigin,
