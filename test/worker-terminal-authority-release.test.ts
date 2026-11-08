@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { turnFailureDiagnostics } from '../src/services/turn-failure-diagnostics.js';
 import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
 import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -52,6 +53,8 @@ function harness(opts: { markerPath?: string } = {}) {
     crossPrincipalIsolationOn: () => false,
     send: vi.fn(),
     log: vi.fn(),
+    turnFailureScreen: () => undefined,
+    turnFailureDiagnostics,
   };
   scope.markTurnRetired = (turnId?: string) => { if (turnId) scope.retiredTurnIds.add(turnId); };
   scope.setCaptureIdentity = (turnId?: string, dispatchAttempt?: number, caller?: string) => {

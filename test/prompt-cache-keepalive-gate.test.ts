@@ -124,6 +124,12 @@ describe('promptCacheKeepaliveRefusal', () => {
     expect(promptCacheKeepaliveRefusal({ ...ok, screen: WRAPPED_DIALOG_DIRECTLY_ABOVE_COMPOSER })).toBe('action_prompt_open');
   });
 
+  it('refuses a one-line permission question with the composer still painted below', () => {
+    const screen = [PERMISSION_DIALOG, RULE, '❯ ', RULE, '  ⏵⏵ bypass permissions on (shift+tab to cycle)'].join('\n');
+    expect(READY.test(screen)).toBe(true);
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen })).toBe('action_prompt_open');
+  });
+
   it('refuses a dialog wrapped beyond the join window (the notification parser stays silent)', () => {
     // Head + 4 continuations: claudeActionPrompt deliberately does not
     // reconstruct it, but the hard choices+footer evidence is on screen.

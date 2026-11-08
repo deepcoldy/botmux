@@ -12,6 +12,7 @@ import { resolveUserShell, buildBotmuxEnvAssignments, shellWrapperScript, shellC
 import { resolveBotmuxWrapperBinDir } from '../../core/botmux-wrapper.js';
 import { logger } from '../../utils/logger.js';
 import { PROCESS_TABLE_MAX_BUFFER } from '../../utils/exec-limits.js';
+import { resolveEntrySpawn } from '../../core/self-spawn.js';
 
 /**
  * ZellijBackend — session backend using zellij for process persistence.
@@ -510,7 +511,7 @@ export function findServerPid(sessionName: string): number | null {
     return servers.find(s => suffix.test(s.socketPath))?.pid ?? null;
   }
 
-  const probeScript = fileURLToPath(new URL('./zellij-socket-probe.js', import.meta.url));
+  const probe = resolveEntrySpawn('zellij-socket-probe', fileURLToPath(new URL('../../', import.meta.url)));
   for (const dir of [...new Set(servers.map(s => dirname(s.socketPath)))]) {
     const sock = join(dir, sessionName);
     if (!existsSync(sock)) continue;
@@ -524,7 +525,7 @@ export function findServerPid(sessionName: string): number | null {
     // plausible accident. Hard failures (connect refused etc.) abort.
     const agreed: number[] = [];
     for (let attempt = 0; attempt < 3; attempt++) {
-      const r = spawnSync(process.execPath, [probeScript, sock, ...candidates.map(c => String(c.pid))], {
+      const r = spawnSync(probe.command, [...probe.args, sock, ...candidates.map(c => String(c.pid))], {
         encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 8000,
       });
       if (r.status === 0) {
