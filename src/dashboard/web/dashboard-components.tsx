@@ -2,21 +2,61 @@ import type React from 'react';
 import {
   lazy,
   Suspense,
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
   type ButtonHTMLAttributes,
-  type CSSProperties,
+  type ComponentType,
   type HTMLAttributes,
+  type ReactElement,
   type ReactNode,
 } from 'react';
-import { createPortal } from 'react-dom';
 import { dropdownRootClassName, DropdownTriggerValue, type DropdownMenuProps } from './dropdown-shared.js';
 import { floatingPortalHost } from './floating-host.js';
+import {
+  infoTipClassName,
+  infoTipTrigger,
+  OverflowTextScroll,
+  overflowTextRootProps,
+  useOverflowText,
+  type InfoTipProps,
+  type OverflowTextProps,
+} from './tip-shared.js';
 
 export { dropdownLabel, type DropdownOption } from './dropdown-shared.js';
 export { floatingPortalHost };
+
+/**
+ * A component whose implementation arrives in its own chunk, the first time one
+ * renders; until then `Fallback` stands in, looking the same but inert.
+ * A failed chunk load must not reach React: nothing above these components
+ * catches it, so the whole page would unmount. The browser keeps the failed
+ * fetch for the life of the page, so there is nothing to retry either; the
+ * fallback stays.
+ */
+export function lazyWithFallback<P extends object>(
+  load: () => Promise<{ default: ComponentType<P> }>,
+  Fallback: ComponentType<P>,
+  name: string,
+  options: {
+    /**
+     * Base UI's hover hooks reach for DOM globals such as `Element` as soon as
+     * they mount. Under react-test-renderer there are none, even when a test
+     * stubs `window`, so without a DOM keep the fallback.
+     */
+    browserOnly?: boolean;
+  } = {},
+): (props: P) => React.JSX.Element {
+  const Impl = lazy(() => load().catch((error: unknown) => {
+    console.error(`botmux ${name} failed to load`, error);
+    return { default: Fallback };
+  })) as unknown as ComponentType<P>;
+  return function LazyWithFallback(props: P): React.JSX.Element {
+    if (options.browserOnly && typeof Element === 'undefined') return <Fallback {...props} />;
+    return (
+      <Suspense fallback={<Fallback {...props} />}>
+        <Impl {...props} />
+      </Suspense>
+    );
+  };
+}
 
 export function Html(props: { html: string; as?: 'span' | 'div' }): React.JSX.Element {
   const Tag = props.as ?? 'span';
@@ -118,210 +158,59 @@ export function RefreshIconButton(props: Omit<ButtonHTMLAttributes<HTMLButtonEle
   );
 }
 
-export function InfoTip(props: {
-  children: ReactNode;
-  label?: string;
-  className?: string;
-  trigger?: ReactNode;
-  preventClick?: boolean;
-  focusable?: boolean;
-}): React.JSX.Element {
-  const tipRef = useRef<HTMLSpanElement | null>(null);
-  const hideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const [open, setOpen] = useState(false);
-  const [position, setPosition] = useState<{ left: number; top: number; placement: 'top' | 'bottom' } | null>(null);
-
-  const updatePosition = useCallback(() => {
-    const tip = tipRef.current;
-    if (!tip || typeof window === 'undefined') return;
-    const rect = tip.getBoundingClientRect();
-    const maxWidth = Math.min(360, Math.max(160, window.innerWidth - 48));
-    const minLeft = 24 + maxWidth / 2;
-    const maxLeft = window.innerWidth - 24 - maxWidth / 2;
-    const centered = rect.left + rect.width / 2;
-    const left = Math.min(Math.max(centered, minLeft), Math.max(minLeft, maxLeft));
-    const useBottom = rect.top < 80;
-    setPosition({
-      left,
-      top: useBottom ? rect.bottom + 8 : rect.top - 8,
-      placement: useBottom ? 'bottom' : 'top',
-    });
-  }, []);
-
-  const show = useCallback(() => {
-    if (hideTimer.current) { clearTimeout(hideTimer.current); hideTimer.current = null; }
-    updatePosition();
-    setOpen(true);
-  }, [updatePosition]);
-
-  // Delay the hide so the pointer can travel from the trigger to the
-  // body-portaled popover without it vanishing — required to select/copy the
-  // popover text. Hovering the popover itself cancels the pending hide (show).
-  const hide = useCallback(() => {
-    if (hideTimer.current) clearTimeout(hideTimer.current);
-    hideTimer.current = setTimeout(() => setOpen(false), 160);
-  }, []);
-
-  useEffect(() => () => { if (hideTimer.current) clearTimeout(hideTimer.current); }, []);
-
-  useEffect(() => {
-    if (!open) return undefined;
-    updatePosition();
-    window.addEventListener('resize', updatePosition);
-    window.addEventListener('scroll', updatePosition, true);
-    return () => {
-      window.removeEventListener('resize', updatePosition);
-      window.removeEventListener('scroll', updatePosition, true);
-    };
-  }, [open, updatePosition]);
-
-  const popover = open && position && typeof document !== 'undefined'
-    ? createPortal(
-      <span
-        className={`ui-info-pop ui-info-pop-floating ui-info-pop-${position.placement}`}
-        role="tooltip"
-        style={{ left: position.left, top: position.top }}
-        onMouseEnter={show}
-        onMouseLeave={hide}
-      >
-        {props.children}
-      </span>,
-      floatingPortalHost(tipRef.current, document.body),
-    )
-    : null;
-
+function InfoTipFallback(props: InfoTipProps): React.JSX.Element {
   return (
     <span
-      ref={tipRef}
-      className={['ui-info-tip', props.className].filter(Boolean).join(' ')}
-      tabIndex={props.focusable === false ? undefined : 0}
+      className={infoTipClassName(props)}
       aria-label={props.label}
       onClick={props.preventClick === false ? undefined : event => event.preventDefault()}
-      onMouseEnter={show}
-      onMouseLeave={hide}
-      onFocus={show}
-      onBlur={hide}
     >
-      {props.trigger ?? <span className="ui-info-mark" aria-hidden="true">?</span>}
-      {popover}
+      {infoTipTrigger(props)}
     </span>
   );
 }
 
-export function OverflowText(props: {
-  text: string;
-  children?: ReactNode;
-  className?: string;
-  textClassName?: string;
-  popoverClassName?: string;
-  showPopover?: boolean;
-  durationMs?: number;
-}): React.JSX.Element {
-  const anchorRef = useRef<HTMLSpanElement | null>(null);
-  const [open, setOpen] = useState(false);
-  const [overflowing, setOverflowing] = useState(false);
-  const [position, setPosition] = useState<{ left: number; top: number; placement: 'top' | 'bottom' } | null>(null);
+/**
+ * `?` help mark whose popup explains a field. Hover or tap opens it; a click
+ * pins it open so its text can be copied; from the keyboard, Enter or Space.
+ */
+export const InfoTip = lazyWithFallback(() => import('./info-tip-popover.js'), InfoTipFallback, 'info tip', {
+  browserOnly: true,
+});
 
-  const measureOverflow = useCallback((): boolean => {
-    const anchor = anchorRef.current;
-    if (!anchor) return false;
-    const text = anchor.querySelector<HTMLElement>('.ui-overflow-scroll') ?? anchor;
-    const nextOverflowing = text.scrollWidth > anchor.clientWidth + 1;
-    setOverflowing(nextOverflowing);
-    if (!nextOverflowing) setOpen(false);
-    return nextOverflowing;
-  }, []);
-
-  const updatePosition = useCallback(() => {
-    const anchor = anchorRef.current;
-    if (!anchor || typeof window === 'undefined') return;
-    const rect = anchor.getBoundingClientRect();
-    const maxWidth = Math.min(460, Math.max(220, window.innerWidth - 48));
-    const minLeft = 24 + maxWidth / 2;
-    const maxLeft = window.innerWidth - 24 - maxWidth / 2;
-    const centered = rect.left + rect.width / 2;
-    const left = Math.min(Math.max(centered, minLeft), Math.max(minLeft, maxLeft));
-    const useBottom = rect.top < 84;
-    setPosition({
-      left,
-      top: useBottom ? rect.bottom + 8 : rect.top - 8,
-      placement: useBottom ? 'bottom' : 'top',
-    });
-  }, []);
-
-  const show = useCallback(() => {
-    if (!props.text.trim() || !measureOverflow()) return;
-    if (props.showPopover === false) {
-      setOpen(false);
-      return;
-    }
-    updatePosition();
-    setOpen(true);
-  }, [measureOverflow, props.showPopover, props.text, updatePosition]);
-
-  const hide = useCallback(() => setOpen(false), []);
-
-  useEffect(() => {
-    const anchor = anchorRef.current;
-    if (!anchor || typeof window === 'undefined') return undefined;
-    const raf = window.requestAnimationFrame(measureOverflow);
-    const resizeObserver = typeof ResizeObserver !== 'undefined'
-      ? new ResizeObserver(() => measureOverflow())
-      : null;
-    resizeObserver?.observe(anchor);
-    window.addEventListener('resize', measureOverflow);
-    return () => {
-      window.cancelAnimationFrame(raf);
-      resizeObserver?.disconnect();
-      window.removeEventListener('resize', measureOverflow);
-    };
-  }, [measureOverflow, props.text]);
-
-  useEffect(() => {
-    if (!open) return undefined;
-    updatePosition();
-    window.addEventListener('resize', updatePosition);
-    window.addEventListener('scroll', updatePosition, true);
-    return () => {
-      window.removeEventListener('resize', updatePosition);
-      window.removeEventListener('scroll', updatePosition, true);
-    };
-  }, [open, updatePosition]);
-
-  const popover = props.showPopover !== false && open && position && typeof document !== 'undefined'
-    ? createPortal(
-      <span
-        className={[
-          'ui-info-pop',
-          'ui-info-pop-floating',
-          `ui-info-pop-${position.placement}`,
-          'ui-overflow-popover',
-          props.popoverClassName,
-        ].filter(Boolean).join(' ')}
-        role="tooltip"
-        style={{ left: position.left, top: position.top }}
-      >
-        {props.text}
-      </span>,
-      floatingPortalHost(anchorRef.current, document.body),
-    )
-    : null;
-
+function OverflowTextPlain(props: OverflowTextProps): React.JSX.Element {
+  const { ref, overflowing, measure } = useOverflowText(props.text);
   return (
-    <span
-      ref={anchorRef}
-      className={['ui-overflow-text', overflowing ? 'is-overflowing' : '', props.className].filter(Boolean).join(' ')}
-      style={props.durationMs ? { '--ui-overflow-duration': `${props.durationMs}ms` } as CSSProperties : undefined}
-      onMouseEnter={show}
-      onMouseLeave={hide}
-    >
-      <span className={['ui-overflow-scroll', props.textClassName].filter(Boolean).join(' ')}>
-        {props.children ?? props.text}
-      </span>
-      {popover}
+    <span ref={ref} {...overflowTextRootProps(props, overflowing)} onMouseEnter={measure}>
+      <OverflowTextScroll {...props} />
     </span>
   );
 }
+
+const OverflowTextWithTooltip = lazyWithFallback<OverflowTextProps>(
+  () => import('./hover-tooltips.js').then(module => ({ default: module.OverflowTextTooltip })),
+  OverflowTextPlain,
+  'overflow text tooltip',
+  { browserOnly: true },
+);
+
+export function OverflowText(props: OverflowTextProps): React.JSX.Element {
+  return props.showPopover === false ? <OverflowTextPlain {...props} /> : <OverflowTextWithTooltip {...props} />;
+}
+
+type IconTipProps = {
+  label: string;
+  /** A single DOM element (button or link); it becomes the tooltip trigger. */
+  children: ReactElement;
+};
+
+/** Label tooltip for an icon-only control: hover or keyboard focus shows it, a click hides it. */
+export const IconTip = lazyWithFallback<IconTipProps>(
+  () => import('./hover-tooltips.js').then(module => ({ default: module.IconTipTooltip })),
+  props => props.children,
+  'icon tooltip',
+  { browserOnly: true },
+);
 
 export function FieldTitle(props: {
   children: ReactNode;
@@ -423,31 +312,14 @@ function DropdownMenuFallback(props: DropdownMenuProps<string>): React.JSX.Eleme
   );
 }
 
-/**
- * A failed chunk load must not reach React: nothing above a dropdown catches it,
- * so the whole page would unmount. The browser keeps the failed fetch for the
- * life of the page, so there is nothing to retry either; the trigger stays inert.
- */
-function lazyDropdownImpl(load: () => Promise<DropdownImplModule>) {
-  return lazy(() => load().catch((error: unknown): DropdownImplModule => {
-    console.error('botmux dropdown failed to load', error);
-    return { default: DropdownMenuFallback };
-  }));
-}
-
 export function createDropdownMenu(importers: DropdownImplImporters) {
-  const DropdownSelect = lazyDropdownImpl(importers.select);
-  const DropdownCombobox = lazyDropdownImpl(importers.combobox);
+  const DropdownSelect = lazyWithFallback(importers.select, DropdownMenuFallback, 'dropdown');
+  const DropdownCombobox = lazyWithFallback(importers.combobox, DropdownMenuFallback, 'dropdown');
   return function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): React.JSX.Element {
     // `onChange: (value: T) => void` only accepts this menu's own options, which
     // are the only values the implementation can report back.
     const erased = props as unknown as DropdownMenuProps<string>;
-    const Impl = props.searchable ? DropdownCombobox : DropdownSelect;
-    return (
-      <Suspense fallback={<DropdownMenuFallback {...erased} />}>
-        <Impl {...erased} />
-      </Suspense>
-    );
+    return props.searchable ? <DropdownCombobox {...erased} /> : <DropdownSelect {...erased} />;
   };
 }
 

@@ -30,7 +30,6 @@ import { buildBotCards, loadGroupsSnapshot } from './overview.js';
 import { BotOnboardingDialog, OPEN_BOT_ONBOARDING_EVENT, openBotOnboarding } from './bot-onboarding.js';
 import { requestOpenCreateSession } from './create-session-entry.js';
 import { InfoTip } from './dashboard-components.js';
-import { initIconTooltips } from './icon-tooltip.js';
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
 import {
   updateAndRestartBotmux,
@@ -1935,7 +1934,6 @@ void (async () => {
   applyShellLocaleFromHash();
   const host = document.getElementById('app-root');
   if (!host) throw new Error('missing dashboard app root');
-  initIconTooltips();
   appRoot = createRoot(host);
 
   // 工作流侧边栏（任务消息签名行「工作流 ›」→ /workflow/<app>/<run> 302 到这里）：飞书侧栏只有
