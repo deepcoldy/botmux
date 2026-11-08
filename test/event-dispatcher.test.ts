@@ -7129,6 +7129,52 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({ substituteTrigger: undefined }));
   });
 
+  it.each(['bot sender', 'chat off'] as const)('App ID lookup skips a direct @bot that also @s the target: %s', async gate => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID, OTHER_BOT_OPEN_ID],
+      substituteMode: { enabled: true, targets: [{ appId: 'cli_external' }] },
+    });
+    mockGetChatMode.mockResolvedValue('group');
+    mockIsSubstituteEnabledForChat.mockReturnValue(gate !== 'chat off');
+    const options = {
+      senderOpenId: gate === 'bot sender' ? OTHER_BOT_OPEN_ID : USER_OPEN_ID,
+      messageId: `om_direct_skip_${gate === 'bot sender' ? 'bot' : 'off'}`, chatId: 'oc_direct_skip',
+      content: JSON.stringify({ text: '@_bot @_user_1 help' }),
+      mentions: [
+        { key: '@_bot', name: 'Bot', id: { open_id: MY_OPEN_ID } },
+        { key: '@_user_1', name: 'External', id: { open_id: 'ou_external' } },
+      ],
+    };
+    const event = gate === 'bot sender' ? makeBotMessageEvent(options) : makeUserMessageEvent(options);
+    stubAppIdViews(event.message, { ou_external: 'cli_external', [MY_OPEN_ID]: MY_APP_ID });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    expect(mockGetMessageDetail).not.toHaveBeenCalled();
+    const calls = [...handlers.handleNewTopic.mock.calls, ...handlers.handleThreadReply.mock.calls];
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1]?.substituteTrigger).toBeUndefined();
+  });
+
+  it.each(['user', 'bot'] as const)('App ID substitute: a %s slash command naming the target keeps ordinary routing', async senderType => {
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID, OTHER_BOT_OPEN_ID],
+      substituteMode: { enabled: true, targets: [{ appId: 'cli_external' }] },
+    });
+    mockGetChatMode.mockResolvedValue('group');
+    const options = {
+      senderOpenId: senderType === 'user' ? USER_OPEN_ID : OTHER_BOT_OPEN_ID,
+      messageId: `om_slash_${senderType}`, chatId: 'oc_slash_app', rootId: `om_slash_${senderType}`, threadId: null,
+      content: JSON.stringify({ text: '@_user_1 /solve help' }),
+      mentions: [{ key: '@_user_1', name: 'External', id: { open_id: 'ou_external' } }],
+    };
+    const event = senderType === 'user' ? makeUserMessageEvent(options) : makeBotMessageEvent(options);
+    stubAppIdViews(event.message, { ou_external: 'cli_external' });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    const calls = [...handlers.handleNewTopic.mock.calls, ...handlers.handleThreadReply.mock.calls];
+    expect(calls.some(call => call[1]?.substituteTrigger)).toBe(false);
+  });
+
   it.each(['group', 'topic'] as const)('App ID substitute: a rich-text @ with empty mentions[] triggers in %s', async chatMode => {
     setupBotState({ allowedUsers: [USER_OPEN_ID], substituteMode: { enabled: true, targets: [{ appId: 'cli_external' }] } });
     mockGetChatMode.mockResolvedValue(chatMode);

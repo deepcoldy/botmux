@@ -70,6 +70,13 @@ describe('App ID dual-view identity proof', () => {
     expect(substituteMentionIdentities(result).some(mention => mention.appId)).toBe(false);
   });
 
+  it('does not find @_user_1 inside @_user_10', async () => {
+    const message = { ...event(), content: JSON.stringify({ text: '@_user_10 help' }) };
+    stubViews(views(message));
+    const result = await resolveSubstituteAppMentions('cli_receiver', message);
+    expect(substituteMentionIdentities(result).some(mention => mention.appId)).toBe(false);
+  });
+
   it.each(['app', 'baseline'] as const)('fails closed if the %s view fails', async failing => {
     const pair = views();
     getMessageDetail.mockImplementation(async (_app, _message, options) => {
