@@ -67,7 +67,7 @@ export const decisionBoardFilesDir = (dataDir: string, appId: string): string =>
 // 看板仍能打开。补列见 migrateChatColumns，回滚期间旧构建留下的不一致见 healChatFields。
 // 「自动发现可以关的项」的六列（board_items.close_when / depends_on / next_check_at / hint_json /
 // hint_notified / hint_dismissed）同理：都可空，存量行全是 NULL = 没写条件、没有提示，不升版本号。
-// 补列见 migrateHintColumns。
+// 补列见 migrateHintColumns。「子任务提醒」的 board_items.task_notified 同理。
 const SCHEMA_VERSION = 3;
 
 /** 管家写入的字段补丁。undefined = 不动；null = 清空（仅可选字段）。 */
@@ -172,6 +172,7 @@ interface ItemRow {
   /** 同上：补列前的旧行没有这几列。 */
   close_when?: string | null; depends_on?: string | null; next_check_at?: number | null;
   hint_json?: string | null; hint_notified?: string | null; hint_dismissed?: string | null;
+  task_notified?: string | null;
 }
 
 function rowToItem(r: ItemRow): BoardItem {
@@ -282,6 +283,7 @@ function migrateHintColumns(db: DatabaseSyncLike): void {
   const columns: Array<[string, string]> = [
     ['close_when', 'TEXT'], ['depends_on', 'TEXT'], ['next_check_at', 'INTEGER'],
     ['hint_json', 'TEXT'], ['hint_notified', 'TEXT'], ['hint_dismissed', 'TEXT'],
+    ['task_notified', 'TEXT'],
   ];
   for (const [column, type] of columns) {
     if (!have.has(column)) db.exec(`ALTER TABLE board_items ADD COLUMN ${column} ${type};`);
@@ -380,6 +382,8 @@ export class DecisionBoardStore {
           hint_notified TEXT,
           -- 管家收起过的提示 key（JSON 数组）：之后不再标出。
           hint_dismissed TEXT,
+          -- 已提醒过管家的子任务结果 key（JSON 数组）：同一次交付 / 举手 / 中断只提醒一次。
+          task_notified TEXT,
           PRIMARY KEY (app_id, seq)
         ) WITHOUT ROWID;
         CREATE UNIQUE INDEX IF NOT EXISTS board_items_key ON board_items(app_id, item_key) WHERE item_key IS NOT NULL;
@@ -980,6 +984,51 @@ export class DecisionBoardStore {
         if (!keys.includes(e.key)) continue;
         const next = keys.filter(k => k !== e.key);
         this.stmt('UPDATE board_items SET hint_notified = ? WHERE app_id = ? AND seq = ?')
+          .run(next.length ? JSON.stringify(next) : null, appId, e.seq);
+      }
+    });
+  }
+
+  // ─── 子任务提醒 ────────────────────────────────────────────────────────────────
+
+  /** 没结束、且关联了这些群之一的事项（含已提醒过的 key）。 */
+  itemsForChats(appId: string, chatIds: readonly string[]):
+    Array<{ item: BoardItem; links: BoardLink[]; taskNotified: string[] }> {
+    if (chatIds.length === 0) return [];
+    const wanted = new Set(chatIds);
+    const rows = this.stmt('SELECT * FROM board_items WHERE app_id = ? ORDER BY seq').all(appId) as ItemRow[];
+    const out: Array<{ item: BoardItem; links: BoardLink[]; taskNotified: string[] }> = [];
+    for (const row of rows) {
+      const item = rowToItem(row);
+      if (isEndedState(item.state)) continue;
+      const links = this.links(appId, item.seq);
+      const hit = (item.primaryChat && wanted.has(item.primaryChat)) || links.some(l => l.kind === 'chat' && wanted.has(l.ref));
+      if (hit) out.push({ item, links, taskNotified: keyListFromJson(row.task_notified) });
+    }
+    return out;
+  }
+
+  /** 提醒送进管家会话之前记下这些 key；送不出去再 {@link unmarkTaskNotified}。 */
+  markTaskNotified(appId: string, entries: ReadonlyArray<{ seq: number; key: string }>): void {
+    this.tx(() => {
+      for (const e of entries) {
+        const row = this.itemRow(appId, e.seq);
+        if (!row) continue;
+        this.stmt('UPDATE board_items SET task_notified = ? WHERE app_id = ? AND seq = ?')
+          .run(JSON.stringify(appendKey(keyListFromJson(row.task_notified), e.key)), appId, e.seq);
+      }
+    });
+  }
+
+  unmarkTaskNotified(appId: string, entries: ReadonlyArray<{ seq: number; key: string }>): void {
+    this.tx(() => {
+      for (const e of entries) {
+        const row = this.itemRow(appId, e.seq);
+        if (!row) continue;
+        const keys = keyListFromJson(row.task_notified);
+        if (!keys.includes(e.key)) continue;
+        const next = keys.filter(k => k !== e.key);
+        this.stmt('UPDATE board_items SET task_notified = ? WHERE app_id = ? AND seq = ?')
           .run(next.length ? JSON.stringify(next) : null, appId, e.seq);
       }
     });
