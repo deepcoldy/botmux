@@ -30,10 +30,13 @@ jobs:
     if: >-
       github.repository == 'deepcoldy/botmux' &&
       (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion != 'cancelled')
-    # Job level, so a skipped run does not cancel one that is publishing.
+    # Job level, so a skipped run takes no slot. One update runs to the end and
+    # GitHub keeps only the newest waiting one. Cancelling would restart the wait
+    # for a runner on every upstream completion; while Actions is backed up, no
+    # update would ever be published.
     concurrency:
       group: readme-badges
-      cancel-in-progress: true
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:

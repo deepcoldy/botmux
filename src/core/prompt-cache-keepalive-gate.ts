@@ -69,7 +69,7 @@ export function promptCacheKeepaliveRefusal(probe: PromptCacheKeepaliveWriteProb
     return state === 'empty' ? undefined : 'prompt_not_framed';
   }
   if (!probe.screen || !probe.readyPattern) return 'no_screen_evidence';
-  if (claudeActionPrompt(probe.screen)) return 'action_prompt_open';
+  if (claudeActionPrompt(probe.screen, { footerAnywhere: true })) return 'action_prompt_open';
   // Also fail closed on a dialog the notification parser deliberately does
   // not reconstruct (question wrapped past the join window / 400-char cap):
   // the screen still carries the hard choices+footer evidence.
