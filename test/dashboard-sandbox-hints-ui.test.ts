@@ -325,6 +325,31 @@ describe('CodexIsolatedConfigInfo — isolated config.toml path + re-sync', () =
     await act(async () => { await resyncButton(view).props.onClick(); });
     expect(JSON.stringify(view.root.findByProps({ 'data-codex-config-status': '' }).props)).toContain(INFO.hostPath);
   });
+
+  it('names AGENTS.md in the confirm and reports both backups when the host has one', async () => {
+    confirmMock.mockResolvedValue(true);
+    const info = { ...INFO, agentsPath: '/srv/bots/app_a/codex/AGENTS.md', hostAgentsPath: '/home/u/.codex/AGENTS.md', hostAgentsExists: true };
+    const view = await mountInfo(info);
+    responder = call => call.method === 'GET' ? { body: info } : {
+      body: { ok: true, backupPath: '/srv/bots/app_a/codex/config.toml.bak-x', agentsBackupPath: '/srv/bots/app_a/codex/AGENTS.md.bak-x' },
+    };
+    await act(async () => { await resyncButton(view).props.onClick(); });
+    const asked = JSON.stringify(confirmMock.mock.calls[0][0]);
+    expect(asked).toContain(info.agentsPath);
+    expect(asked).toContain(info.hostAgentsPath);
+    const status = JSON.stringify(view.root.findByProps({ 'data-codex-config-status': '' }).props);
+    expect(status).toContain('/srv/bots/app_a/codex/config.toml.bak-x');
+    expect(status).toContain('/srv/bots/app_a/codex/AGENTS.md.bak-x');
+  });
+
+  it('keeps the config.toml-only confirm when the host has no AGENTS.md', async () => {
+    confirmMock.mockResolvedValue(false);
+    const view = await mountInfo({ ...INFO, agentsPath: '/srv/bots/app_a/codex/AGENTS.md', hostAgentsPath: '/home/u/.codex/AGENTS.md', hostAgentsExists: false });
+    await act(async () => { await resyncButton(view).props.onClick(); });
+    const asked = JSON.stringify(confirmMock.mock.calls[0][0]);
+    expect(asked).toContain(INFO.path);
+    expect(asked).not.toContain('AGENTS.md');
+  });
 });
 
 describe('SandboxDriftChip', () => {

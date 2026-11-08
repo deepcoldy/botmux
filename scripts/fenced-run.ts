@@ -28,7 +28,8 @@
  *   - unless --keep-user-bus: no XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS,
  *     so `systemctl --user` / `busctl --user` cannot touch the real user
  *     manager (enable/stop units, stop a live session scope). botmux's own
- *     scope code sees BOTMUX_FENCED_RUN=1 and stops deriving the bus from
+ *     scope code sees BOTMUX_FENCED_RUN=1 (kept through strict envPolicy too)
+ *     and uses only the bus variables it is given, never deriving
  *     /run/user/<uid>/bus (userSystemdBusEnv), so it takes the no-bus path too.
  *     With --keep-user-bus the child gets the invoker's bus variables, or the
  *     bus botmux would derive when the invoker exported none.
@@ -90,7 +91,7 @@ export function fencedRunEnv(
     delete env.XDG_RUNTIME_DIR;
     delete env.DBUS_SESSION_BUS_ADDRESS;
   } else if (!env.XDG_RUNTIME_DIR && !env.DBUS_SESSION_BUS_ADDRESS) {
-    // Behind BOTMUX_FENCED_RUN botmux reads the bus from these variables only.
+    // Behind BOTMUX_FENCED_RUN botmux uses these variables as given and derives nothing.
     Object.assign(env, userSystemdBusEnv({ env: base, isSocket: opts.isBusSocket }));
   }
   env.BOTMUX_FENCED_RUN = '1';

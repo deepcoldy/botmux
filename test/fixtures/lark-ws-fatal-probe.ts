@@ -1,5 +1,5 @@
 // The compiled __daemon entry leaves module evaluation pending in cli.ts.
-// Bun 1.4.3 then prints uncaught WS errors and continues by default.
+// Bun (1.4.3 and 1.4.4 alike) then prints uncaught WS errors and continues by default.
 import { createServer } from 'node:net';
 import { type AddressInfo } from 'node:net';
 import WebSocket from 'ws';

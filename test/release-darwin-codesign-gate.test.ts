@@ -69,13 +69,13 @@ const gte = (a: string, b: string) => {
 };
 
 /** First Bun version known to write a valid darwin ad-hoc signature (#39837).
- *  A FLOOR, not the pin: package.json may be ahead (it is — 1.4.3), and this
+ *  A FLOOR, not the pin: package.json may be ahead (it is — 1.4.4), and this
  *  only has to stay at or below it. Deliberately NOT bumped in lockstep, so the
  *  assertion below keeps testing "the pin carries the fix" instead of restating
  *  whatever the pin currently happens to be.
  *  ⚠️ ONLY for the HOST arch — see the build-bun-binary.mjs suite below: 1.4.1
- *  still writes an invalid signature when cross-compiling darwin-x64, and 1.4.2
- *  and 1.4.3 re-measured identically, so this pin is necessary but NOT sufficient. */
+ *  still writes an invalid signature when cross-compiling darwin-x64, and 1.4.2,
+ *  1.4.3 and 1.4.4 re-measured identically, so this pin is necessary but NOT sufficient. */
 const FIRST_GOOD_BUN = '1.4.1';
 
 describe('release.yml — every darwin binary is codesign-verified before it ships', () => {
@@ -160,7 +160,7 @@ describe('build-bun-binary.mjs — re-signs darwin output, because the bun pin i
    * darwin-arm64" and its test only compiles --target=bun-darwin-arm64; nothing
    * upstream covers x86_64. So bumping the pin again does NOT close this, and
    * these assertions exist so nobody deletes the re-sign after reading
-   * "we're already on 1.4.3".
+   * "we're already on 1.4.4".
    *
    * RE-MEASURED the same way when the pin moved 1.4.1 → 1.4.2 (1.4.0 as a
    * control, so the check is known to discriminate between versions):
@@ -170,6 +170,9 @@ describe('build-bun-binary.mjs — re-signs darwin output, because the bun pin i
    * RE-MEASURED again when the pin moved 1.4.2 → 1.4.3 (1.4.2 as the control,
    * reproducing the numbers above exactly):
    *   1.4.3 → arm64 VALID   (17167/17167)  x64 INVALID (2/19065, incl. slot 0)
+   * RE-MEASURED again when the pin moved 1.4.3 → 1.4.4 (1.4.3 as the control,
+   * reproducing the line above exactly):
+   *   1.4.4 → arm64 VALID   (21599/21599)  x64 INVALID (2/23777, incl. slot 0)
    */
   it('ad-hoc re-signs with codesign --force --sign -', () => {
     // #39764 reports --remove-signature and BUN_NO_CODESIGN_MACHO_BINARY=1 as NOT

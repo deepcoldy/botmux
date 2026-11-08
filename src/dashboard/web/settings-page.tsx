@@ -37,6 +37,7 @@ interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: Mainte
 
 interface DashboardSettings {
   groupNamePrefix: string;
+  worktreeRoot: string;
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   enableLocalCliOpen: boolean;
@@ -211,6 +212,7 @@ function traexInstallMessage(install: any, tr: (k: string) => string): StatusMes
 function parseSettings(s: any): DashboardSettings {
   return {
     groupNamePrefix: typeof s?.groupNamePrefix === 'string' ? s.groupNamePrefix : '',
+    worktreeRoot: typeof s?.worktreeRoot === 'string' ? s.worktreeRoot : '',
     publicReadOnly: s?.publicReadOnly === true,
     openTerminalInFeishu: s?.openTerminalInFeishu === true,
     enableLocalCliOpen: s?.enableLocalCliOpen === true,
@@ -1241,6 +1243,17 @@ export function SettingsBody(props: {
             />
           </div>
         </SettingsBlock>
+        <SettingsBlock id="settings-worktree" title={tr('settings.sectionWorktree')}>
+          <WorktreeRootRow
+            value={settings.worktreeRoot}
+            disabled={dis || savingKey === 'worktreeRoot'}
+            onSave={value => props.onSave(
+              'worktreeRoot',
+              { worktreeRoot: value },
+              s => ({ ...s, worktreeRoot: value }),
+            )}
+          />
+        </SettingsBlock>
         <SettingsBlock id="settings-schedule" title={tr('settings.sectionSchedule')}>
           <TimeZoneRow
             value={settings.scheduleTimeZone}
@@ -1948,6 +1961,54 @@ export function GroupNamePrefixRow(props: {
           onClick={submit}
         >
           {tr('settings.groupNamePrefixSave')}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export function WorktreeRootRow(props: {
+  value: string;
+  disabled: boolean;
+  onSave(value: string): Promise<void> | void;
+}) {
+  const tr = useT();
+  const [draft, setDraft] = useState(props.value);
+  useEffect(() => setDraft(props.value), [props.value]);
+
+  const dirty = draft.trim() !== props.value;
+  const submit = () => {
+    if (props.disabled || !dirty) return;
+    void props.onSave(draft.trim());
+  };
+
+  return (
+    <div className="settings-subfield">
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.worktreeRootHelp')}>{tr('settings.worktreeRoot')}</FieldTitle>
+        <input
+          className="settings-text-input"
+          type="text"
+          value={draft}
+          placeholder={tr('settings.worktreeRootPlaceholder')}
+          disabled={props.disabled}
+          onChange={event => setDraft(event.currentTarget.value)}
+          onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); submit(); } }}
+        />
+      </div>
+      <p className="settings-subfield-hint" data-worktree-root-hint>
+        {props.value
+          ? tr('settings.worktreeRootCurrent', { path: props.value })
+          : tr('settings.worktreeRootDefault')}
+      </p>
+      <div className="actions">
+        <button
+          type="button"
+          className="page-primary-action"
+          disabled={props.disabled || !dirty}
+          onClick={submit}
+        >
+          {tr('settings.worktreeRootSave')}
         </button>
       </div>
     </div>

@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { pickTurnReplyTarget } from '../src/core/reply-target.js';
+import { isSilentMessageListenerSession, messageListenerSendBlocked } from '../src/core/message-listener-silence.js';
 import { parseDispatchArgs } from '../src/cli/dispatch-args.js';
 import { buildDispatchCompletionBrief, buildDispatchMessages, buildProjectDispatchSyncAction,
   buildRepoPrimeText, parseDispatchBotSpec, resolveSendTarget } from '../src/core/dispatch.js';
@@ -93,6 +94,7 @@ function harness(mode: Mode, options: {
   const state = {
     parseDispatchArgs, buildDispatchCompletionBrief, buildDispatchMessages, buildProjectDispatchSyncAction,
     buildRepoPrimeText, parseDispatchBotSpec, resolveSendTarget, pickTurnReplyTarget,
+    isSilentMessageListenerSession, messageListenerSendBlocked,
     resolveSessionContext: () => undefined,
     process: { env: { SESSION_DATA_DIR: '/isolated/data' }, exitCode: 0,
       exit: (code: number) => { throw new Error('exit:' + code + '\n' + stderr.join('\n')); } },
@@ -108,6 +110,9 @@ function harness(mode: Mode, options: {
     // pre-card shape (no attemptAt, no /dispatch-tree IPC). An explicit
     // taskTreeCardEnabled:true exercises the on path.
     isDispatchTaskTreeCardEnabled: () => options.taskTreeCardEnabled === true,
+    // Extracted cmdDispatch checks for a group-secretary patrol turn; these
+    // harness turns are ordinary bot turns, so no patrol root applies.
+    parseSecretaryPatrolRoot: () => undefined,
     loadSessions: () => new Map([['source', { sessionId: 'source', chatId: 'oc_chat', larkAppId: 'cli_source' }]]),
     requireSessionById: async (sid: string) => ({
       sessionId: sid, chatId: 'oc_chat', larkAppId: 'cli_source',
