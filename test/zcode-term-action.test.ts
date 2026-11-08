@@ -11,9 +11,10 @@
  */
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { isCriticalInterruptKey, sendCriticalControlKey } from '../src/adapters/backend/critical-control-key.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
+import { cursorStopLeftParkedFollowUp } from '../src/adapters/cli/cursor.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 
 const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
@@ -69,6 +70,14 @@ function harness(
     traexQuotaPending: undefined, traexAutoModelController: null,
     emitReadyCodexTurns: vi.fn(),
     runAfterAmbiguousSubmissionWrites: async (_backend: unknown, action: () => unknown) => action(),
+    screen: '',
+    captureBackendScreen: () => state.screen,
+    backendScreenEvidenceIsAuthoritativeForMutation: () => true,
+    isFlushing: false,
+    injectionFlushing: false,
+    commandLineWritesPending: 0,
+    sessionRenameInFlight: () => false,
+    cursorStopLeftParkedFollowUp,
   };
   const factory = new Function('state', `with (state) { ${slice}; return { handleTermAction }; }`);
   const handler = factory(state) as { handleTermAction: (key: string) => Promise<void> };
@@ -188,5 +197,123 @@ describe('handleTermAction doubao bridge-mark retirement', () => {
     h.queue.peek()[0]!.finalText = 'ANSWER';
     await h.handle('ctrlc');
     expect(h.queue.peek().map(t => t.turnId)).toEqual(['om_turn']);
+  });
+});
+
+// Cursor flushes its follow-ups queue only when a turn ends naturally. After a
+// stop, an IM message typed ahead during the stopped turn stays parked at
+// `enter steer` (cursor-agent 2026.09.23) while botmux believes it delivered
+// it. One Enter on the idle, empty composer submits exactly that item; an Enter
+// while the turn still runs would steer into it, and one on a non-empty
+// composer would submit something else.
+describe('handleTermAction for Cursor with a parked follow-up', () => {
+  // Rows of real `tmux capture-pane -e` output (box and padding runs shortened).
+  // The cursor block splits the placeholder (`→ A` + `dd a follow-up`), so
+  // the screen must be matched without its SGR codes.
+  const panel = [
+    '\u001b[0m\u001b[39m\u001b[49m \u001b[33m┌─ follow-ups ────┐',
+    '\u001b[39m \u001b[33m│ \u001b[2m\u001b[39m○ Reply with exactly: PINEAPPLE    \u001b[0m\u001b[33m\u001b[49m │',
+    '\u001b[39m \u001b[33m│ \u001b[2m\u001b[39menter steer · ↑ select/edit · esc cancel    \u001b[0m\u001b[33m\u001b[49m │',
+    '\u001b[39m \u001b[33m└────┘',
+  ].join('\n');
+  const composer = '\u001b[49m \u001b[48;5;233m \u001b[2m→ \u001b[0;7m\u001b[39m\u001b[48;5;233mA\u001b[0;2m\u001b[39m\u001b[48;5;233mdd a follow-up\u001b[0m\u001b[39m\u001b[48;5;233m';
+  const running = `${panel}\n${composer}    \u001b[2mctrl+c to stop\u001b[0m\u001b[39m\u001b[48;5;233m`;
+  const stopped = `${panel}\n${composer}\n\u001b[49m  \u001b[2mPress Ctrl+C again to exit`;
+  const cursor = { id: 'cursor' };
+
+  afterEach(() => { vi.useRealTimers(); });
+
+  for (const backendType of ['pty', 'tmux'] as const) {
+    it(`submits the parked item once the stopped turn has ended (${backendType})`, async () => {
+      vi.useFakeTimers();
+      const h = harness(undefined, backendType, cursor);
+      h.state.screen = running;
+      await h.handle('ctrlc');
+      await vi.advanceTimersByTimeAsync(1_000);
+      const keys = () => (backendType === 'tmux' ? h.specialKeys : h.written);
+      expect(keys()).toEqual([backendType === 'tmux' ? 'C-c' : '\x03']);
+      h.state.screen = stopped;
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(keys()).toEqual(backendType === 'tmux' ? ['C-c', 'Enter'] : ['\x03', '\r']);
+    });
+  }
+
+  it('does not press Enter when the composer holds text', async () => {
+    vi.useFakeTimers();
+    const h = harness(undefined, 'tmux', cursor);
+    h.state.screen = stopped.replace(composer, '\u001b[49m \u001b[48;5;233m \u001b[2m→ \u001b[0mhalf-typed reply');
+    await h.handle('ctrlc');
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(h.specialKeys).toEqual(['C-c']);
+  });
+
+  it('does not press Enter when nothing is parked', async () => {
+    vi.useFakeTimers();
+    const h = harness(undefined, 'tmux', cursor);
+    h.state.screen = stopped.replace(panel, '');
+    await h.handle('ctrlc');
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(h.specialKeys).toEqual(['C-c']);
+  });
+
+  it('waits for an in-flight IM write before pressing Enter', async () => {
+    vi.useFakeTimers();
+    const h = harness(undefined, 'tmux', cursor);
+    h.state.screen = stopped;
+    h.state.isFlushing = true;
+    await h.handle('ctrlc');
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.specialKeys).toEqual(['C-c']);
+    h.state.isFlushing = false;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.specialKeys).toEqual(['C-c', 'Enter']);
+  });
+
+  it('only an explicit stop submits it, not a bare Escape', async () => {
+    vi.useFakeTimers();
+    const h = harness(undefined, 'tmux', cursor);
+    h.state.screen = stopped;
+    await h.handle('esc');
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(h.specialKeys).toEqual(['Escape']);
+  });
+
+  it('waits for an in-flight session rename before pressing Enter', async () => {
+    vi.useFakeTimers();
+    const h = harness(undefined, 'tmux', cursor);
+    h.state.screen = stopped;
+    let renameInFlight = true;
+    h.state.sessionRenameInFlight = () => renameInFlight;
+    await h.handle('ctrlc');
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.specialKeys).toEqual(['C-c']);
+    renameInFlight = false;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.specialKeys).toEqual(['C-c', 'Enter']);
+  });
+
+  // The submitter runs in a timer callback outside handleTermAction's
+  // try/catch: an Orca relay rejecting Enter (adopted terminal gone) must be
+  // logged and swallowed, not thrown into the worker uncaughtException exit.
+  it('swallows a backend rejecting Enter instead of throwing out of the timer', async () => {
+    vi.useFakeTimers();
+    const h = harness(undefined, 'tmux', cursor);
+    h.state.screen = stopped;
+    const realSend = h.state.backend.sendSpecialKeys;
+    h.state.backend.sendSpecialKeys = (key: string) => {
+      if (key === 'Enter') throw new Error('Orca terminal rejected input');
+      return realSend(key);
+    };
+    await h.handle('ctrlc');
+    // A throw escaping the timer callback would make this await reject.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.specialKeys).toEqual(['C-c']);
+    expect(h.state.log).toHaveBeenCalledWith(
+      expect.stringContaining('submitting the parked follow-up failed'),
+    );
+    // The matched branch returns without rescheduling: no retry storm later.
+    h.state.backend.sendSpecialKeys = realSend;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(h.specialKeys).toEqual(['C-c']);
   });
 });

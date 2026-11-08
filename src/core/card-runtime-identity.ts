@@ -25,7 +25,8 @@ export function withCardRuntimeIdentity(
   // the same footing as Grok's signals.json, and is fresher than the launch
   // config — so it outranks every other source here.
   const zcodeNative = effectiveCliId === 'zcode';
-  const nativeRuntime = effectiveCliId === 'grok' || effectiveCliId === 'minimax' || zcodeNative;
+  // Kimi: alias + thinking effort from its wire log's `llm.request`.
+  const nativeRuntime = effectiveCliId === 'grok' || effectiveCliId === 'minimax' || effectiveCliId === 'kimi' || zcodeNative;
   const nativeModel = nativeRuntime ? snapshot.model?.trim() : undefined;
   const nativeEffort = nativeRuntime ? snapshot.reasoningEffort?.trim() : undefined;
   const model = (zcodeNative ? nativeModel : undefined)
