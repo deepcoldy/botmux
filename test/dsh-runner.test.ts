@@ -509,6 +509,23 @@ describe('dsh-runner', () => {
     expect(h.stdout).not.toContain('›');
   });
 
+  it('retries initialize while a plugin provider has not registered its model yet', async () => {
+    h = spawnRunner('model-not-ready');
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    expect(h.stdout).toContain('dsh connected');
+    expect(readLog(h).filter((r: any) => r.initialize)).toHaveLength(3);
+  }, 30_000);
+
+  it('fails at once on any other initialize error', async () => {
+    h = spawnRunner('initialize-error');
+    const code = await new Promise<number | null>(resolve => h!.child.on('exit', resolve));
+
+    expect(code).toBe(1);
+    expect(h.stderr).toContain('boom');
+    expect(readLog(h).filter((r: any) => r.initialize)).toHaveLength(1);
+  });
+
   it('reaps a wedged turn with the watchdog and exits for restart', async () => {
     h = spawnRunner('hang', ['--turn-timeout-ms', '500']);
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });

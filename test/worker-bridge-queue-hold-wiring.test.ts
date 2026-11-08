@@ -34,6 +34,7 @@ describe('worker events that end a queue hold', () => {
       probeStartupBlocker: () => false, stopBusyPatternIdleProbe: () => {}, readyGate: { shouldHold: () => false },
       awaitingPostSessionStartPromptEvidence: false, isSettlingFirstFlush: false,
       freshnessInputQueue: { onPromptReady: () => 'proceed' }, spawnArgvTurnStartGateHolds: () => false,
+      backgroundTaskTracker: { pendingTurnAgents: () => 0 },
       hasStructuredLifecycleBlock: () => false, structuredRejectedReadyEvidenceGeneration: undefined,
       queuedTurnAdvanceConsumedForPrompt: undefined, decideQueuedReadyTransition: () => ({}),
       ptyOutputGeneration: { snapshot: () => 0 }, durableTurnInFlight: false,
