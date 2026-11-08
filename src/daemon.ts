@@ -25508,6 +25508,10 @@ async function startInitialPassthroughSession(args: {
       })
     : undefined;
   if (lifecycle && !lifecycleWorkingDir) return;
+  // 认领槽位与写 pending-repo journal 之间不能有 await：窗口内重启会按基目录恢复会话。
+  const lifecycleWorktree = lifecycle === 'worktree' && lifecycleWorkingDir
+    ? { force: true, ...await forceTopicWorktreeTarget(lifecycleWorkingDir, anchor), reuseExisting: true }
+    : undefined;
   // Reply attribution's is-bot. `resolvedSenderIsBot` is a BOOLEAN for the
   // legacy consumers that need one (pendingSender.type, quoteTargetSenderIsBot,
   // loser-handoff turn.senderIsBot). `resolvedSenderIsBotTriState` keeps
@@ -25598,9 +25602,6 @@ async function startInitialPassthroughSession(args: {
     }
     return;
   }
-  const lifecycleWorktree = lifecycle === 'worktree' && pinnedWorkingDir
-    ? { force: true, ...await forceTopicWorktreeTarget(pinnedWorkingDir, anchor), reuseExisting: true }
-    : undefined;
   if (ds.pendingRepo) {
     stageClaimedPendingRepoSetup(activeSessions, ds, {
       mode: autoWt ? 'auto_worktree' : 'picker',
