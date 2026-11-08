@@ -6,6 +6,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   holdPurgeClickRollback,
+  PURGE_CONTINUATION_WITHHELD,
+  PURGE_IMAGES_NOT_APPLIED,
   planPurgeRequest,
   purgeOutcomeNotice,
   runPurgeMaintenance,
@@ -129,22 +131,62 @@ describe('runPurgeMaintenance', () => {
       .resolves.toMatchObject({ kind: 'failed' });
     await expect(run(report({ imageBlocks: 1 }))).resolves.toMatchObject({ kind: 'nothing_removed' });
   });
+
+  it.each([
+    ['an unmeasurable image', { unmeasurable: [{ file: TARGET.jsonlPath, fileIndex: 0 }] }],
+    ['a non-embedded image', { skippedSourceTypes: ['url'] }],
+    ['a file it could not handle', { failedFiles: [{ file: 'agent.jsonl', reason: 'EACCES' }] }],
+  ])('calls a purge that left %s behind partial', async (_label, leftover) => {
+    const partial = report({ ...REMOVABLE, imageBlocks: 2, ...leftover });
+    await expect(runPurgeMaintenance({ waitForQuiescence: async () => {}, purge: () => partial }))
+      .resolves.toEqual({ kind: 'partial', report: partial });
+  });
 });
 
 describe('purgeOutcomeNotice', () => {
-  it('delivers the continuation only after a successful purge', () => {
-    expect(purgeOutcomeNotice({ kind: 'purged', report: REMOVABLE })).toMatchObject({
+  const PARTIAL = report({ ...REMOVABLE, imageBlocks: 2, unmeasurable: [{ file: TARGET.jsonlPath, fileIndex: 0 }] });
+
+  it('delivers the continuation only after a complete purge and a running replacement', () => {
+    expect(purgeOutcomeNotice({ kind: 'purged', report: REMOVABLE }, 'spawned')).toEqual({
       key: 'worker.purge_images_done',
       params: { files: '1', removed: '1' },
       deliverContinuation: true,
     });
-    for (const outcome of [
-      { kind: 'nothing_removed' as const, report: report({ imageBlocks: 1 }) },
-      { kind: 'not_quiescent' as const, detail: 'timeout' },
-      { kind: 'failed' as const, detail: 'EIO' },
-    ]) {
-      expect(purgeOutcomeNotice(outcome).deliverContinuation).toBe(false);
+  });
+
+  it.each([
+    ['a partial purge', { kind: 'partial' as const, report: PARTIAL }, 'spawned' as const, 'worker.purge_images_partial'],
+    ['a failed respawn', { kind: 'purged' as const, report: REMOVABLE }, 'failed' as const, 'worker.purge_images_restart_failed'],
+    ['a failed respawn after a partial purge', { kind: 'partial' as const, report: PARTIAL }, 'failed' as const, 'worker.purge_images_restart_failed'],
+    ['a superseded respawn', { kind: 'purged' as const, report: REMOVABLE }, 'superseded' as const, 'worker.purge_images_superseded'],
+  ])('withholds the continuation after %s that changed the transcript', (_label, outcome, respawn, key) => {
+    expect(purgeOutcomeNotice(outcome, respawn)).toEqual({
+      key,
+      params: { files: '1', removed: '1' },
+      deliverContinuation: false,
+      rejectReason: PURGE_CONTINUATION_WITHHELD,
+    });
+  });
+
+  it.each([
+    [{ kind: 'nothing_removed' as const, report: report({ imageBlocks: 1 }) }, 'worker.purge_images_not_found'],
+    [{ kind: 'not_quiescent' as const, detail: 'timeout' }, 'worker.purge_images_exit_unproven'],
+    [{ kind: 'failed' as const, detail: 'EIO' }, 'worker.purge_images_failed'],
+  ])('reports an untouched transcript as not applied (%#)', (outcome, key) => {
+    for (const respawn of ['spawned', 'failed', 'superseded'] as const) {
+      expect(purgeOutcomeNotice(outcome, respawn)).toEqual({
+        key,
+        deliverContinuation: false,
+        rejectReason: PURGE_IMAGES_NOT_APPLIED,
+      });
     }
+  });
+
+  it('stays silent when the restart died before maintenance ran', () => {
+    expect(purgeOutcomeNotice(undefined, 'failed')).toEqual({
+      deliverContinuation: false,
+      rejectReason: PURGE_IMAGES_NOT_APPLIED,
+    });
   });
 });
 

@@ -14,6 +14,7 @@ import {
   resolvePurgeResumeTarget,
 } from '../src/services/transcript-image-purge.js';
 import {
+  PURGE_CONTINUATION_WITHHELD,
   PURGE_IMAGES_NOT_APPLIED,
   planPurgeRequest,
   purgeOutcomeNotice,
@@ -33,11 +34,15 @@ function png(width: number, height: number): string {
   return buf.toString('base64');
 }
 
-function transcriptWith(width: number, height: number): string {
+function imageLine(data: string): string {
   return `${JSON.stringify({
     type: 'user',
-    message: { role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: png(width, height) } }] },
+    message: { role: 'user', content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data } }] },
   })}\n`;
+}
+
+function transcriptWith(width: number, height: number): string {
+  return imageLine(png(width, height));
 }
 
 let roots: string[] = [];
@@ -50,6 +55,7 @@ type RestartOpts = {
   exactResumeSessionId?: string;
   preserveScratchTreeForRespawn?: boolean;
   beforeRespawn?: (retiring: { pid?: number; processScope: number[] }) => Promise<void>;
+  onRespawnSettled?: (result: 'spawned' | 'failed' | 'superseded') => void;
 };
 
 function setup(transcript: string, overrides: Record<string, unknown> = {}) {
@@ -93,7 +99,10 @@ function setup(transcript: string, overrides: Record<string, unknown> = {}) {
   start('retry-1', undefined, enqueue);
   const notices = () => send.mock.calls.map(([m]) => m).filter(m => m.type === 'user_notify').map(m => m.message);
   const rejections = () => send.mock.calls.map(([m]) => m).filter(m => m.type === 'turn_input_rejected');
-  return { jsonl, send, enqueue, restartCliProcess, notices, rejections };
+  const restartOpts = () => restartCliProcess.mock.calls[0][1];
+  const purgeAfterExit = () => restartOpts().beforeRespawn!({ pid: 4242, processScope: [4242] });
+  const settleRespawn = (result: 'spawned' | 'failed' | 'superseded') => restartOpts().onRespawnSettled!(result);
+  return { jsonl, send, enqueue, restartCliProcess, notices, rejections, purgeAfterExit, settleRespawn };
 }
 
 describe('startTranscriptImagePurge', () => {
@@ -114,33 +123,73 @@ describe('startTranscriptImagePurge', () => {
     expect(rejections()).toHaveLength(1);
   });
 
-  it('restarts on the active transcript, purges after the exit is proven, then delivers the continuation', async () => {
-    const { jsonl, enqueue, restartCliProcess, notices, rejections } = setup(transcriptWith(1, 1), {
+  it('restarts on the active transcript, purges after the exit is proven, and continues once the replacement runs', async () => {
+    const { jsonl, enqueue, restartCliProcess, notices, rejections, purgeAfterExit, settleRespawn } = setup(transcriptWith(1, 1), {
       lastResolvedSandboxMode: 'scratch',
     });
     expect(restartCliProcess).toHaveBeenCalledTimes(1);
-    const opts = restartCliProcess.mock.calls[0][1];
-    expect(opts).toMatchObject({ exactResumeSessionId: SID, preserveScratchTreeForRespawn: process.platform === 'linux' });
+    expect(restartCliProcess.mock.calls[0][1]).toMatchObject({
+      exactResumeSessionId: SID,
+      preserveScratchTreeForRespawn: process.platform === 'linux',
+    });
     // Nothing is written or delivered before the old CLI is gone.
     expect(readFileSync(jsonl, 'utf8')).toContain('"type":"image"');
     expect(enqueue).not.toHaveBeenCalled();
 
-    await opts.beforeRespawn!({ pid: 4242, processScope: [4242] });
+    await purgeAfterExit();
     expect(readFileSync(jsonl, 'utf8')).not.toContain('"type":"image"');
+    // Nothing is promised before the replacement exists.
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(notices()).toEqual([]);
+
+    settleRespawn('spawned');
     expect(enqueue).toHaveBeenCalledTimes(1);
     expect(notices()).toEqual(['worker.purge_images_done']);
     expect(rejections()).toEqual([]);
   });
 
+  it('releases the continuation when the replacement fails to spawn after the purge', async () => {
+    const { jsonl, enqueue, notices, rejections, purgeAfterExit, settleRespawn } = setup(transcriptWith(1, 1));
+    await purgeAfterExit();
+    settleRespawn('failed');
+    expect(readFileSync(jsonl, 'utf8')).not.toContain('"type":"image"');
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(notices()).toEqual(['worker.purge_images_restart_failed']);
+    expect(rejections()).toEqual([{ type: 'turn_input_rejected', turnId: 'retry-1', reason: PURGE_CONTINUATION_WITHHELD }]);
+  });
+
+  it('does not continue over an image it could not measure', async () => {
+    const unmeasurable = imageLine(Buffer.from('not an image at all').toString('base64'));
+    const { jsonl, enqueue, notices, rejections, purgeAfterExit, settleRespawn } = setup(transcriptWith(1, 1) + unmeasurable);
+    await purgeAfterExit();
+    settleRespawn('spawned');
+    // The tiny image is gone; the one of unknown size is still there.
+    expect(readFileSync(jsonl, 'utf8').split('\n').filter(line => line.includes('"type":"image"'))).toEqual([unmeasurable.trimEnd()]);
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(notices()).toEqual(['worker.purge_images_partial']);
+    expect(rejections()).toEqual([{ type: 'turn_input_rejected', turnId: 'retry-1', reason: PURGE_CONTINUATION_WITHHELD }]);
+  });
+
   it('leaves the transcript alone and rejects the continuation when the exit cannot be proven', async () => {
     const original = transcriptWith(1, 1);
-    const { jsonl, enqueue, restartCliProcess, notices, rejections } = setup(original, {
+    const { jsonl, enqueue, notices, rejections, purgeAfterExit, settleRespawn } = setup(original, {
       waitForProcessQuiescence: () => Promise.reject(new Error('process 4242 did not exit')),
     });
-    await restartCliProcess.mock.calls[0][1].beforeRespawn!({ pid: 4242, processScope: [4242] });
+    await purgeAfterExit();
+    settleRespawn('spawned');
     expect(readFileSync(jsonl, 'utf8')).toBe(original);
     expect(enqueue).not.toHaveBeenCalled();
     expect(notices()).toEqual(['worker.purge_images_exit_unproven']);
-    expect(rejections()).toHaveLength(1);
+    expect(rejections()).toEqual([{ type: 'turn_input_rejected', turnId: 'retry-1', reason: PURGE_IMAGES_NOT_APPLIED }]);
+  });
+
+  it('only rejects the continuation when the restart dies before the purge runs', () => {
+    const original = transcriptWith(1, 1);
+    const { jsonl, enqueue, notices, rejections, settleRespawn } = setup(original);
+    settleRespawn('failed');
+    expect(readFileSync(jsonl, 'utf8')).toBe(original);
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(notices()).toEqual([]);
+    expect(rejections()).toEqual([{ type: 'turn_input_rejected', turnId: 'retry-1', reason: PURGE_IMAGES_NOT_APPLIED }]);
   });
 });

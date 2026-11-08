@@ -285,6 +285,7 @@ interface PurgeContext {
   minDimension: number;
   trustedRoot: string;
   dryRun: boolean;
+  budgetBytes: number;
   remainingBytes: number;
   report: PurgeReport;
 }
@@ -311,7 +312,7 @@ function purgeFile(file: string, ctx: PurgeContext): void {
       return;
     }
     if (initialStat.size > ctx.remainingBytes) {
-      report.failedFiles.push({ file, reason: `over the ${MAX_PURGE_BYTES}-byte purge budget` });
+      report.failedFiles.push({ file, reason: `over the ${ctx.budgetBytes}-byte purge budget` });
       return;
     }
     raw = readFileSync(fd);
@@ -424,7 +425,7 @@ const SESSION_SUBDIR_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9
  *  `dryRun` only reports what would be removed and writes nothing. */
 export function purgeUndersizedImages(
   mainJsonlPath: string,
-  opts: { minDimension?: number; trustedProjectsRoot?: string; dryRun?: boolean } = {},
+  opts: { minDimension?: number; trustedProjectsRoot?: string; dryRun?: boolean; maxReadBytes?: number } = {},
 ): PurgeReport {
   const report: PurgeReport = {
     files: [],
@@ -454,7 +455,8 @@ export function purgeUndersizedImages(
     minDimension: opts.minDimension ?? MIN_IMAGE_DIMENSION,
     trustedRoot,
     dryRun: opts.dryRun === true,
-    remainingBytes: MAX_PURGE_BYTES,
+    budgetBytes: opts.maxReadBytes ?? MAX_PURGE_BYTES,
+    remainingBytes: opts.maxReadBytes ?? MAX_PURGE_BYTES,
     report,
   };
   purgeFile(mainJsonlPath, ctx);

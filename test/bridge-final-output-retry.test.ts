@@ -165,7 +165,7 @@ import {
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
 import { markRetryAttempt } from '../src/services/failed-turn-retry.js';
-import { holdPurgeClickRollback, PURGE_IMAGES_NOT_APPLIED } from '../src/services/image-purge-recovery.js';
+import { holdPurgeClickRollback, PURGE_CONTINUATION_WITHHELD, PURGE_IMAGES_NOT_APPLIED } from '../src/services/image-purge-recovery.js';
 import { emitSessionLifecycleHook } from '../src/services/session-lifecycle-hooks.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
@@ -6127,9 +6127,9 @@ describe('purge-and-continue on the daemon side', () => {
     return ds;
   }
 
-  it('refunds the retry cooldown when the worker rejects the purge continuation', async () => {
+  it.each([PURGE_IMAGES_NOT_APPLIED, PURGE_CONTINUATION_WITHHELD])('refunds the retry cooldown when the worker rejects the purge continuation (%s)', async (reason) => {
     const ds = purgeClickedDs();
-    (ds.worker as any).emit('message', { type: 'turn_input_rejected', turnId: 'retry-purge', reason: PURGE_IMAGES_NOT_APPLIED });
+    (ds.worker as any).emit('message', { type: 'turn_input_rejected', turnId: 'retry-purge', reason });
     await vi.waitFor(() => expect(ds.session.lastFailedTurn?.lastRetryAt).toBeUndefined());
     expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
     expect(updateSessionMock).toHaveBeenCalledWith(ds.session);

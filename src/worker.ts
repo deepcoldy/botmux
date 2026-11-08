@@ -521,7 +521,7 @@ import { assertEbsdPerBotEnv, ebsdBotmuxSessionDir } from './adapters/cli/ebsd.j
 import { resolveServiceSecretReadonlyFiles } from './adapters/cli/service-secret-files.js';
 import { migrateLegacyOmpSession } from './services/oh-my-pi-legacy-migration.js';
 import { describePurgeReport, purgeUndersizedImages, resolvePurgeResumeTarget } from './services/transcript-image-purge.js';
-import { PURGE_IMAGES_NOT_APPLIED, planPurgeRequest, purgeOutcomeNotice, runPurgeMaintenance } from './services/image-purge-recovery.js';
+import { PURGE_IMAGES_NOT_APPLIED, planPurgeRequest, purgeOutcomeNotice, runPurgeMaintenance, type PurgeMaintenanceOutcome } from './services/image-purge-recovery.js';
 import { isCodexAppCliId, isCodexFamilyCliId, type StructuredBridgeDrainResult, type StructuredBridgeSpec } from './adapters/cli/types.js';
 import type { CliAdapter, CliLaunchNotice, PtyHandle, SubmitRecheckResult, CliId } from './adapters/cli/types.js';
 import { detectCliStartupBlocker, screenMayShowCredential, startupBlockerKey, type CliStartupBlocker } from './core/cli-startup-blocker.js';
@@ -29264,19 +29264,35 @@ async function restartCliProcess(
     beforeRespawn?: (retiring: { pid?: number; processScope: number[] }) => Promise<void>;
     /** Keep the Linux scratch view for the respawn (see killCli). */
     preserveScratchTreeForRespawn?: boolean;
+    /** Called exactly once with how this restart ended, including when it never
+     *  got as far as a spawn. 'spawned' runs while input is still queued for
+     *  the replacement. A failed spawn exits the worker right after. */
+    onRespawnSettled?: (result: 'spawned' | 'failed' | 'superseded') => void;
   } = {},
 ): Promise<void> {
+  let respawnSettled = false;
+  const settleRespawn = (result: 'spawned' | 'failed' | 'superseded'): void => {
+    if (respawnSettled || !opts.onRespawnSettled) return;
+    respawnSettled = true;
+    try {
+      opts.onRespawnSettled(result);
+    } catch (err) {
+      log(`onRespawnSettled failed (${reason}): ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
   if (codexAutoUpgrade) {
     // This restart is abandoned; the server-loss marker must not survive to be
     // consumed by a later, unrelated restart.
     lastCliExitServerReplaced = false;
     codexAutoUpgrade.reject?.(new Error(reason));
+    settleRespawn('failed');
     return;
   }
   if (lastInitConfig?.adoptMode || lastInitConfig?.existingAppServerEndpoint) {
     // Adopt workers never restart in place; no restart consumes the marker.
     lastCliExitServerReplaced = false;
     log(`Restart ignored in shared-adopt mode (${reason})`);
+    settleRespawn('failed');
     return;
   }
   // Invalidate queued/deferred callbacks before async teardown begins. Waiting
@@ -29378,6 +29394,7 @@ async function restartCliProcess(
         );
         // cliRestartInProgress / rawInputRestartGate deliberately stay armed so no
         // input is accepted while the outcome is unknown.
+        settleRespawn('failed');
         await sendFatalWorkerErrorAndExit(new Error(
           `restart teardown not proven: ${teardownVerdict.reason ?? 'unknown'}`,
         ));
@@ -29439,13 +29456,17 @@ async function restartCliProcess(
             await prepareCodexNativeTitleGeneration(restartCfg, codexRpcEngine);
             replacementSpawnInProgress = false;
             if (codexRpcEngine) armRpcStartupDialogDismiss();
+            settleRespawn('spawned');
           } catch (err) {
             replacementSpawnInProgress = false;
             cliRestartInProgress = false;
+            settleRespawn(err instanceof CliSpawnSupersededError ? 'superseded' : 'failed');
             if (err instanceof CliSpawnSupersededError) return;
             await sendFatalWorkerErrorAndExit(err);
             return;
           }
+        } else {
+          settleRespawn('failed');
         }
         cliRestartInProgress = false;
         replacementSpawnInProgress = false;
@@ -29517,6 +29538,7 @@ async function restartCliProcess(
     } catch (err) {
       replacementSpawnInProgress = false;
       cliRestartInProgress = false;
+      settleRespawn('failed');
       try {
         await sendFatalWorkerErrorAndExit(err);
       } catch { /* sendFatalWorkerErrorAndExit is already best-effort */ }
@@ -32147,9 +32169,9 @@ function startTranscriptImagePurge(
   const notify = (key: string, params?: Record<string, string>): void => {
     send({ type: 'user_notify', message: t(key, params), turnId });
   };
-  const rejectContinuation = (): void => {
-    if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, PURGE_IMAGES_NOT_APPLIED);
-    else if (turnId) send({ type: 'turn_input_rejected', turnId, reason: PURGE_IMAGES_NOT_APPLIED });
+  const rejectContinuation = (reason: string): void => {
+    if (ordinaryImTurnId) rejectOrdinaryImTurn(ordinaryImTurnId, reason);
+    else if (turnId) send({ type: 'turn_input_rejected', turnId, reason });
   };
   // bridgeJsonlPath is the authoritative active transcript: it follows in-pane
   // /clear rotations and points through the scratch merged view.
@@ -32177,10 +32199,11 @@ function startTranscriptImagePurge(
   if (plan.kind === 'decline') {
     log(`Transcript image purge declined (${plan.logReason})`);
     notify(plan.noticeKey);
-    rejectContinuation();
+    rejectContinuation(PURGE_IMAGES_NOT_APPLIED);
     return;
   }
   log(`Transcript image purge accepted: ${describePurgeReport(plan.report)}`);
+  let outcome: PurgeMaintenanceOutcome | undefined;
   void restartCliProcess('purge undersized transcript images', {
     immediate: true,
     preservePending: true,
@@ -32192,7 +32215,7 @@ function startTranscriptImagePurge(
     exactResumeSessionId: plan.target.sessionId,
     preserveScratchTreeForRespawn: plan.preserveScratchTree,
     beforeRespawn: async retiring => {
-      const outcome = await runPurgeMaintenance({
+      outcome = await runPurgeMaintenance({
         waitForQuiescence: () => waitForProcessQuiescence(retiring.pid, {
           now: () => Date.now(),
           wait: ms => delay(ms),
@@ -32200,13 +32223,14 @@ function startTranscriptImagePurge(
         }, { ownedPids: retiring.processScope }),
         purge: () => purgeUndersizedImages(plan.target.jsonlPath, purgeOptions(plan.target.jsonlPath)),
       });
-      log(`Transcript image purge ${outcome.kind}: ${outcome.kind === 'purged' || outcome.kind === 'nothing_removed'
-        ? describePurgeReport(outcome.report)
-        : outcome.detail}`);
-      const notice = purgeOutcomeNotice(outcome);
-      notify(notice.key, notice.params);
+      log(`Transcript image purge ${outcome.kind}: ${'report' in outcome ? describePurgeReport(outcome.report) : outcome.detail}`);
+    },
+    onRespawnSettled: respawn => {
+      const notice = purgeOutcomeNotice(outcome, respawn);
+      log(`Transcript image purge respawn ${respawn}; continuation ${notice.deliverContinuation ? 'delivered' : 'withheld'}`);
+      if (notice.key) notify(notice.key, notice.params);
       if (notice.deliverContinuation) enqueueContinuation();
-      else rejectContinuation();
+      else rejectContinuation(notice.rejectReason);
     },
   });
 }

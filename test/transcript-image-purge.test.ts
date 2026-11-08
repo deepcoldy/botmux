@@ -266,6 +266,43 @@ describe('purgeUndersizedImages', () => {
       .message.content[0].content[0].type).toBe('text');
   });
 
+  it('touches nothing when the main transcript alone is over the read budget', () => {
+    const root = makeTemp();
+    const main = join(root, `${SID}.jsonl`);
+    const mainBefore = `${imageRecord(png(1, 1).toString('base64'))}\n`;
+    writeFileSync(main, mainBefore);
+    const subDir = join(root, SID, 'subagents');
+    mkdirSync(subDir, { recursive: true });
+    const sub = join(subDir, 'agent-deadbeef.jsonl');
+    const subBefore = `${imageRecord(png(1, 1).toString('base64'))}\n`;
+    writeFileSync(sub, subBefore);
+
+    const report = purgeUndersizedImages(main, { maxReadBytes: Buffer.byteLength(mainBefore) - 1 });
+    expect(report.removed).toBe(0);
+    expect(report.failedFiles).toEqual([{ file: main, reason: expect.stringContaining('budget') }]);
+    expect(readFileSync(main, 'utf8')).toBe(mainBefore);
+    expect(readFileSync(sub, 'utf8')).toBe(subBefore);
+    expect(backupsOf(root)).toEqual([]);
+  });
+
+  it('shares the read budget with subagents after the main transcript', () => {
+    const root = makeTemp();
+    const main = join(root, `${SID}.jsonl`);
+    const mainBefore = `${imageRecord(png(1, 1).toString('base64'))}\n`;
+    writeFileSync(main, mainBefore);
+    const subDir = join(root, SID, 'subagents');
+    mkdirSync(subDir, { recursive: true });
+    const sub = join(subDir, 'agent-deadbeef.jsonl');
+    const subBefore = `${imageRecord(png(1, 1).toString('base64'))}\n`;
+    writeFileSync(sub, subBefore);
+
+    const report = purgeUndersizedImages(main, { maxReadBytes: Buffer.byteLength(mainBefore) + 1 });
+    expect(report.files.map(r => r.file)).toEqual([main]);
+    expect(report.failedFiles).toEqual([{ file: sub, reason: expect.stringContaining('budget') }]);
+    expect(readFileSync(main, 'utf8')).not.toContain('"type":"image"');
+    expect(readFileSync(sub, 'utf8')).toBe(subBefore);
+  });
+
   it('lists other transcripts under the session folder without touching them', () => {
     const root = makeTemp();
     const main = join(root, `${SID}.jsonl`);

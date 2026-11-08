@@ -8,15 +8,20 @@
  *     the daemon refunds the retry cooldown.
  *  2. After the CLI was killed (`runPurgeMaintenance`): the restart must go on
  *     no matter what, so failures become an outcome instead of an exception.
- *     Only a successful purge delivers the continuation; replaying it over the
- *     untouched history would just hit the same 400 again.
+ *     What the user is told, and whether the continuation is delivered, waits
+ *     for the respawn (`purgeOutcomeNotice`): only a complete purge followed by
+ *     a running replacement continues. Replaying the continuation over history
+ *     that may still hold the bad image would just hit the same 400 again.
  */
 import type { PurgeReport, PurgeResumeTarget } from './transcript-image-purge.js';
 import type { RetryAttemptReceipt } from './failed-turn-retry.js';
 
-/** `turn_input_rejected` reason for a continuation whose purge did not happen.
- *  The daemon refunds the retry cooldown for it: nothing was changed. */
+/** `turn_input_rejected` reason for a continuation whose purge did not happen. */
 export const PURGE_IMAGES_NOT_APPLIED = 'purge_images_not_applied';
+/** `turn_input_rejected` reason for a continuation withheld after the purge
+ *  changed the transcript. Either way the continuation never reached the CLI,
+ *  so the daemon rolls the click back the same way. */
+export const PURGE_CONTINUATION_WITHHELD = 'purge_continuation_withheld';
 
 export type PurgeRequestPlan =
   | { kind: 'decline'; noticeKey: string; logReason: string }
@@ -71,6 +76,9 @@ export function unpurgedNoticeKey(report: PurgeReport): string {
 
 export type PurgeMaintenanceOutcome =
   | { kind: 'purged'; report: PurgeReport }
+  /** Something was removed, but an image the purge examined is still
+   *  unsettled (unmeasurable, not embedded, or in a file it could not handle). */
+  | { kind: 'partial'; report: PurgeReport }
   | { kind: 'nothing_removed'; report: PurgeReport }
   | { kind: 'not_quiescent'; detail: string }
   | { kind: 'failed'; detail: string };
@@ -95,40 +103,59 @@ export async function runPurgeMaintenance(deps: {
   } catch (err) {
     return { kind: 'failed', detail: errorText(err) };
   }
-  if (report.removed > 0) return { kind: 'purged', report };
+  if (report.removed > 0) {
+    const unsettled = report.unmeasurable.length > 0 || report.skippedSourceTypes.length > 0 || report.failedFiles.length > 0;
+    return { kind: unsettled ? 'partial' : 'purged', report };
+  }
   if (report.failedFiles.length > 0) {
     return { kind: 'failed', detail: report.failedFiles.map(entry => `${entry.file}: ${entry.reason}`).join('; ') };
   }
   return { kind: 'nothing_removed', report };
 }
 
-export interface PurgeOutcomeNotice {
-  key: string;
-  params?: Record<string, string>;
-  deliverContinuation: boolean;
-}
+/** How the restart around the purge ended. */
+export type PurgeRespawnResult = 'spawned' | 'failed' | 'superseded';
 
-export function purgeOutcomeNotice(outcome: PurgeMaintenanceOutcome): PurgeOutcomeNotice {
+export type PurgeOutcomeNotice = { key?: string; params?: Record<string, string> } & (
+  | { deliverContinuation: true }
+  | { deliverContinuation: false; rejectReason: string }
+);
+
+/** Decided once the respawn settled: a failed spawn exits the worker, so a
+ *  continuation queued for a replacement that never came would be lost while
+ *  the user had already been told it was running. `outcome` is undefined when
+ *  the restart died before maintenance ran; the worker's fatal error explains
+ *  that, so there is no notice of our own. */
+export function purgeOutcomeNotice(
+  outcome: PurgeMaintenanceOutcome | undefined,
+  respawn: PurgeRespawnResult,
+): PurgeOutcomeNotice {
+  if (!outcome) return { deliverContinuation: false, rejectReason: PURGE_IMAGES_NOT_APPLIED };
   switch (outcome.kind) {
     case 'purged':
-      return {
-        key: 'worker.purge_images_done',
-        params: { files: String(outcome.report.files.length), removed: String(outcome.report.removed) },
-        deliverContinuation: true,
-      };
+    case 'partial': {
+      const params = { files: String(outcome.report.files.length), removed: String(outcome.report.removed) };
+      const withheld = (key: string): PurgeOutcomeNotice => (
+        { key, params, deliverContinuation: false, rejectReason: PURGE_CONTINUATION_WITHHELD }
+      );
+      if (respawn === 'failed') return withheld('worker.purge_images_restart_failed');
+      if (respawn === 'superseded') return withheld('worker.purge_images_superseded');
+      if (outcome.kind === 'partial') return withheld('worker.purge_images_partial');
+      return { key: 'worker.purge_images_done', params, deliverContinuation: true };
+    }
     case 'nothing_removed':
-      return { key: unpurgedNoticeKey(outcome.report), deliverContinuation: false };
+      return { key: unpurgedNoticeKey(outcome.report), deliverContinuation: false, rejectReason: PURGE_IMAGES_NOT_APPLIED };
     case 'not_quiescent':
-      return { key: 'worker.purge_images_exit_unproven', deliverContinuation: false };
+      return { key: 'worker.purge_images_exit_unproven', deliverContinuation: false, rejectReason: PURGE_IMAGES_NOT_APPLIED };
     case 'failed':
-      return { key: 'worker.purge_images_failed', deliverContinuation: false };
+      return { key: 'worker.purge_images_failed', deliverContinuation: false, rejectReason: PURGE_IMAGES_NOT_APPLIED };
   }
 }
 
 /** What a purge click changed on the daemon session, held until the worker
- *  either takes the continuation or rejects it. A rejection means neither the
- *  purge nor the continuation ran, so the click gives back its cooldown stamp
- *  and the turn state it overwrote. */
+ *  either takes the continuation or rejects it. A rejection means the
+ *  continuation never ran, so the click gives back its cooldown stamp and the
+ *  turn state it overwrote. */
 export interface PurgeClickRollback {
   receipt?: RetryAttemptReceipt;
   restoreTurnState: () => void;
