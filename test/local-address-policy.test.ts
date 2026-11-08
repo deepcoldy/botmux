@@ -77,6 +77,15 @@ describe('local address presentation policy', () => {
     expect(sanitizeLocalAddressText(remote)).toBe(remote);
   });
 
+  it.each(['git+https://github.com/org/repo.git', 'seehttps://example.com/a ok', 'svn+http://example.com/trunk'])(
+    'writes a URL behind a scheme prefix once: %s', text => {
+      expect(sanitizeLocalAddressText(text)).toBe(text);
+    });
+
+  it('replaces a local URL behind a scheme prefix once', () => {
+    expect(sanitizeLocalAddressText('git+http://127.0.0.1:3000/x ok', { internalFileLabel: '[F]' })).toBe('[F] ok');
+  });
+
   it('uses explicit local host identity without rejecting other private-network services', () => {
     const context = { localHosts: ['devbox.example.internal', '10.20.30.40'] };
     const local = 'http://devbox.example.internal:3000/report';

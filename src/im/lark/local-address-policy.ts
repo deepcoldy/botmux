@@ -268,6 +268,8 @@ function scrubText(input: string, ctx: Context): string {
   }
   spans.sort((a, b) => a.start - b.start);
   for (const span of spans) {
+    // An outer span (`git+https://...`) already covers the http(s) span inside it.
+    if (span.start < cursor) continue;
     out += scrubSegment(linked.slice(cursor, span.start));
     out += localServiceUrl(span.originalUrl.startsWith('//') ? 'https:' + span.originalUrl : span.originalUrl, ctx)
       || carriesLocalUrl(decoded(span.originalUrl), ctx)
