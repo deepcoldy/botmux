@@ -6518,6 +6518,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
       resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
       false,
       substituteCardControlFor(ds),
+      ds.keysPanelOpen === true,
     );
     scheduleCardPatch(ds, frozenCard);
 

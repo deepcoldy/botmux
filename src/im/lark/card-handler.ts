@@ -4924,9 +4924,10 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     }
 
     // Terminal-key grid expand/collapse. Pure daemon render state — no worker
-    // IPC, unlike display toggles: flip the session flag, persist it, then PATCH
-    // the live card through the same serialized queue. Clicks on historical
-    // cards (nonce mismatch) are acknowledged without mutating state.
+    // IPC, unlike display toggles: apply the state the clicked card asked for,
+    // persist it, then PATCH the live card through the same serialized queue.
+    // Clicks on historical cards (message id / nonce mismatch) change nothing
+    // and say so.
     if (actionType === 'toggle_keys_panel') {
       if (coordinationModeIsPrimary()) {
         return { toast: { type: 'warning', content: t('card.action.primary_keys_unavailable', undefined, localeForBot(larkAppId)) } };
@@ -4943,9 +4944,11 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
         || ds.streamCardId === CARD_POSTING_SENTINEL
         || cardMessageId !== ds.streamCardId
         || value?.card_nonce !== ds.streamCardNonce) {
-        return { toast: { type: 'info', content: t('toast.action_received_bg', undefined, locKeys) } };
+        return { toast: { type: 'warning', content: t('card.action.keys_panel_stale', undefined, locKeys) } };
       }
-      ds.keysPanelOpen = !ds.keysPanelOpen;
+      ds.keysPanelOpen = value?.desired === 'open' ? true
+        : value?.desired === 'closed' ? false
+          : !ds.keysPanelOpen;
       persistStreamCardState(ds);
       const cardJson = buildStreamingCardJson(ds);
       if (scheduleCardPatch(ds, cardJson, undefined, { userInitiated: true })) {

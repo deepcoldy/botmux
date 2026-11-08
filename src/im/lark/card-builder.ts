@@ -1189,7 +1189,7 @@ export function buildStreamingCard(
   // （见 cardUsageFooterSegment 的 compactHintThreshold）。
 
   // ── Primary control row: high-frequency / dangerous actions only. The rest
-  //    move into the overflow menu on the secondary row, so narrow cards (e.g.
+  //    move into the 「更多操作」 collapsible panel below, so narrow cards (e.g.
   //    meeting chats) no longer render a dozen full-width buttons stacked into
   //    one long vertical strip.
   const primaryActions: any[] = [];
@@ -1244,10 +1244,12 @@ export function buildStreamingCard(
     elements.push({
       tag: 'action',
       actions: [
+        // 按钮值带目标状态 desired（而非「翻转」）：连点两下、或卡面与会话状态不一致时，
+        // 点击结果都等于用户看到的那个箭头。
         callbackButton(
           `${t('card.btn.keys_panel', undefined, locale)} ${keysPanelOpen ? '▴' : '▾'}`,
           'default',
-          { action: 'toggle_keys_panel', ...actionBase },
+          { action: 'toggle_keys_panel', desired: keysPanelOpen ? 'closed' : 'open', ...actionBase },
         ),
       ],
     });
@@ -1402,7 +1404,7 @@ export function buildStreamingCard(
     });
     // Row widths are deliberately unequal: Feishu truncates button text with an
     // ellipsis when a weighted column gets narrower than the label. Labels are
-    // therefore single symbols wherever possible (×/⇥/␣/↵/⇞/⇟) — even a
+    // therefore single symbols wherever possible (×/⇥/␣/↵/▲/▼) — even a
     // half-width column can't ellipsize one glyph. Esc renders as × (its
     // common "exit/cancel" glyph); ^C stays textual, already two characters.
     const keyRow = (keys: Array<{ label: string; key: string }>, topMargin = false) => ({

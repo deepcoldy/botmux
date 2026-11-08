@@ -1431,6 +1431,7 @@ export const messages: Record<string, string> = {
   'card.action.resume_pending_body': 'The resume request is durable. BotMux is rebuilding the remote runtime and verifying that the Runner can really serve requests.\n\nDo not click again; this card will update automatically when the operation succeeds or fails.',
   'card.action.primary_lifecycle_unavailable': '⚠️ Card-based close, resume, and restart are not yet available in multi-replica durable mode. Send `/close` in this thread to close the session; mention the bot again to start a new session.',
   'card.action.primary_keys_unavailable': 'Terminal keys stay expanded in this deployment. Please use the latest card.',
+  'card.action.keys_panel_stale': '⚠️ This card is no longer the latest card of the session. Use the latest card to show or hide terminal keys.',
   'card.action.primary_display_unavailable': '⚠️ This card is no longer the latest card of the session, or you are not allowed to operate it. Use the latest card to show or hide output.',
   'card.action.disconnected': '⏏ Disconnected. The original CLI is untouched.',
   'card.reply_actions.terminal': 'Open terminal',

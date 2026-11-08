@@ -20193,6 +20193,7 @@ function setupWorkerHandlers(
               resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
               false,
               substituteCardControlFor(ds),
+              ds.keysPanelOpen === true,
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -20304,6 +20305,7 @@ function setupWorkerHandlers(
               resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
               false,
               substituteCardControlFor(ds),
+              ds.keysPanelOpen === true,
             );
             scheduleCardPatch(ds, frozenCard);
           }
