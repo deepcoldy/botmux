@@ -21,6 +21,23 @@ function running(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
+/**
+ * Wait until a signalled descendant leaves the running state (zombie or gone both
+ * count as reaped). The production code rejects as soon as the child's stdio pipes
+ * close, and inside do_exit the kernel closes file descriptors BEFORE the task becomes
+ * a visible zombie: a zero-delay liveness read can therefore still see state S/R while
+ * the SIGTERM/SIGKILL is already being delivered. A genuinely unkillable descendant
+ * (the real leak this test guards against) stays running past the bounded wait.
+ */
+async function waitForReaped(pid: number, timeoutMs = 5_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!running(pid)) return true;
+    await new Promise<void>(resolve => setTimeout(resolve, 20));
+  }
+  return !running(pid);
+}
+
 function run(executable: string, args: string[], input = bigInput): Promise<string> {
   return collectNativePrint(executable, args, { cwd: '/tmp', env: { PATH: '/usr/bin:/bin' }, input }, new AbortController().signal);
 }
@@ -57,9 +74,9 @@ describe.skipIf(!supported)('collectNativePrint when stdin closes early', () => 
       const script = (status: number) => `exec 4<&0; sleep 30 <&4 4<&- & echo $! > "$1"; exit ${status}`;
       const started = Date.now();
       await expect(run('/bin/sh', ['-c', script(3), 'sh', pidFile])).rejects.toThrow('native_inference_failed');
-      expect(running(Number(readFileSync(pidFile, 'utf8')))).toBe(false);
+      expect(await waitForReaped(Number(readFileSync(pidFile, 'utf8')))).toBe(true);
       await expect(run('/bin/sh', ['-c', script(0), 'sh', pidFile])).rejects.toThrow('native_transport_closed');
-      expect(running(Number(readFileSync(pidFile, 'utf8')))).toBe(false);
+      expect(await waitForReaped(Number(readFileSync(pidFile, 'utf8')))).toBe(true);
       expect(Date.now() - started).toBeLessThan(10_000);
     } finally {
       rmSync(dir, { recursive: true, force: true });
