@@ -310,7 +310,9 @@ export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: s
   // turn ledger and the runner rejects non-frame input, wedging the session.
   // ebsd is interactive but still has no raw surface: service mode requires the
   // service-user envelope and its own writer/terminal-marker ledger for every
-  // external message. Keep all of these on the normal structured turn path.
+  // external message. Riff turns every write into its own remote task, so a
+  // typed command never reaches a slash parser. Keep all of these on the
+  // normal structured turn path.
   if (cliHasNoRawPassthroughSurface(effectiveCliId)) return new Set();
   for (const c of resolveAdapterDefaultPassthroughCommands(larkAppId, effectiveCliId)) {
     effective.add(c);
