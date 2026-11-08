@@ -98,8 +98,9 @@ export function createLarkAskCardDispatcher(
       // 但在 chat-scope 下它实际是 chat_id (oc_...) 而非 message_id (om_...).
       // 飞书 /messages/{id}/reply 只接受 om_ — 用 oc_ 会 400 invalid message_id.
       // 所以这里要按前缀判断是否真的能 reply.
+      const replyRoot = ask.cardRootMessageId ?? ask.rootMessageId;
       const canReplyToRoot = !ask.deliveryTarget &&
-        typeof ask.rootMessageId === 'string' && ask.rootMessageId.startsWith('om_');
+        typeof replyRoot === 'string' && replyRoot.startsWith('om_');
       const sendToRecipient = (content: string, type: string, uuid?: string) => ask.deliveryTarget
         ? sendUser(ask.larkAppId, ask.deliveryTarget.openId, content, type, uuid)
         : send(ask.larkAppId, ask.chatId, content, type, uuid);
@@ -116,7 +117,7 @@ export function createLarkAskCardDispatcher(
         if (promptTruncated) {
           try {
             await sendPromptAttachment(ask, upload, (content, fileUuid) => canReplyToRoot
-              ? reply(ask.larkAppId, ask.rootMessageId!, content, 'file', true, fileUuid)
+              ? reply(ask.larkAppId, replyRoot!, content, 'file', true, fileUuid)
               : sendToRecipient(content, 'file', fileUuid));
           } catch (err) {
             if (classifyAskDispatchError(err).retryable) throw err;
@@ -125,7 +126,7 @@ export function createLarkAskCardDispatcher(
           }
         }
         const messageId = canReplyToRoot
-          ? await reply(ask.larkAppId, ask.rootMessageId!, cardJson, 'interactive', true, uuid)
+          ? await reply(ask.larkAppId, replyRoot!, cardJson, 'interactive', true, uuid)
           : await sendToRecipient(cardJson, 'interactive', uuid);
         return { messageId };
       } catch (err) {
