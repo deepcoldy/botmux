@@ -399,6 +399,9 @@ export interface DaemonSession {
   ownerOpenId?: string;          // receives owner-only links and controls write-enabled access
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
+  /** Whether the streaming card's terminal-key grid is expanded. Daemon-owned
+   *  and carried through every card PATCH so streaming refreshes keep it open. */
+  keysPanelOpen?: boolean;
   /** Visible Lark destination of the live streaming card. Unlike
    * currentReplyTarget this remains bound to the card after a newer turn is
    * accepted, so parking cannot attribute the predecessor to the new topic. */

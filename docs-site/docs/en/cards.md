@@ -46,13 +46,16 @@ The card body is a **live screenshot** of the terminal: xterm renders the CLI's 
 
 ### Card buttons
 
+Frequently used buttons sit on the card's main row. The low-frequency buttons marked "More Actions" below live in the "More Actions" collapsible panel under the main row; tap the panel title to open it.
+
 | Button | What it does |
 |--------|--------------|
-| 📖 Show Output / 📕 Hide Output | Expand or collapse the terminal screenshot; when expanded you also get 📝 Export Text and 🔃 Refresh |
+| 📖 Show Output / 📕 Hide Output | More Actions. Expand or collapse the terminal screenshot; when expanded the panel also has 📝 Export Text and 🔃 Refresh |
+| ⌨️ Terminal Keys ▾ / ▴ | Appears when output is shown; shows or hides the terminal keys at the bottom of the card (see [Interrupting or correcting a turn](#interrupting-or-correcting-a-turn) below) |
 | 🖥️ Open Web Terminal | **Read-only** terminal view |
-| 🔑 Get Write Link | Get a **writable** terminal link. Flat groups first try a "visible only to you" card; topics, private chats, or a failed send fall back to a DM |
+| 🔑 Get Write Link | More Actions. Get a **writable** terminal link. Flat groups first try a "visible only to you" card; topics, private chats, or a failed send fall back to a DM |
 | 🗜️ Compact | Send `/compact` to the CLI to compress context (shown only when the CLI supports it) |
-| ⏲️ Idle auto-compact: on/off | Compact automatically after the session sits idle, same as [`/idlecompact`](/en/slash-commands) |
+| ⏲️ Idle auto-compact: on/off | More Actions. Compact automatically after the session sits idle, same as [`/idlecompact`](/en/slash-commands) |
 | ⏹ Stop | Interrupt the current turn (same as ^C); the session stays. Only shown while the turn is still running |
 | ❌ Close Session | Close the session; adopted sessions show "⏏ Disconnect" here |
 | 🔁 Retry Last Task | Appears when the quota recovers and the status becomes "Ready to retry" |
@@ -62,10 +65,10 @@ You can hide buttons you don't need in the Dashboard (see "Hiding card buttons" 
 
 ### Interrupting or correcting a turn
 
-**You don't have to wait for it to finish.** With output shown, the bottom of the card has quick keys: Esc, ^C, Tab, Space, Enter, arrow keys, ⇞ Page ½ Up, ⇟ Page ½ Down. Tapping Esc presses Esc in the terminal; after interrupting, just send a new instruction.
+**You don't have to wait for it to finish.** With output shown, tap "⌨️ Terminal Keys ▾" and a set of terminal keys appears at the bottom of the card: × (Esc), ^C, ⇥ (Tab), ␣ (Space), ↵ (Enter), arrow keys, ▲ half page up, ▼ half page down. Tapping × presses Esc in the terminal; after interrupting, just send a new instruction.
 
-- The quick keys only appear when **output is shown**, and remote backends (Riff / Mojo) don't have them.
-- By default, messages you send while a turn is running are queued and fed in after it ends. To correct course immediately, tap Esc or ⏹ Stop first.
+- The terminal keys are only available when **output is shown**, and remote backends (Riff / Mojo) don't have them. They start hidden; once you show them, later cards of the same session keep them shown until you hide them again.
+- By default, messages you send while a turn is running are queued and fed in after it ends. To correct course immediately, tap × (Esc) or ⏹ Stop first.
 
 ### Card lifecycle
 

@@ -115,6 +115,7 @@ import type { DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
 import { createWorkerStderrRing, WORKER_ERROR_MARKER } from '../src/core/worker-stderr-ring.js';
 import { sandboxNamespaceNotice } from '../src/core/system-bwrap.js';
+import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import { RESTART_WINDOW_MS } from '../src/core/restart-policy.js';
 
 function makeFakeWorker() {
@@ -307,6 +308,24 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
 
     expect(worker.send).toHaveBeenCalledWith({ type: 'close' });
     expect(ds.session.suspendedColdResume).toBeFalsy();
+  });
+
+  it('the crash freeze keeps the terminal keys grid the session had open', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-crash-keys', worker);
+    ds.streamCardId = 'om_stream_card';
+    ds.streamCardNonce = 'nonce_live';
+    ds.keysPanelOpen = true;
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    await crashTimes(worker, 3, undefined);
+    // Each auto-restart clears readiness; the card is frozen only when the CLI
+    // came back up before the crash that ends the loop.
+    ds.workerReady = true;
+    await crashTimes(worker, 1, undefined);
+
+    expect(buildStreamingCard).toHaveBeenCalled();
+    expect(vi.mocked(buildStreamingCard).mock.calls.at(-1)?.[24]).toBe(true);
   });
 
   it('crash card falls back to the per-worker stderr ring when logTail is missing', async () => {

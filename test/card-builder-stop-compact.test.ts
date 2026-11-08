@@ -58,6 +58,20 @@ function findButton(actions: any[], action: string): any {
   return actions.find((a: any) => a.tag === 'button' && a.value?.action === action);
 }
 
+/** The idle auto-compact toggle lives in the titled more-actions panel;
+ *  the button value carries the desired target state. */
+function idleCompactButton(card: any, desired: 'on' | 'off'): any {
+  const panel = card.elements.find((e: any) => e.tag === 'collapsible_panel');
+  const walk = (nodes: any[]): any[] => nodes.flatMap((n: any) => [
+    n,
+    ...(Array.isArray(n.columns) ? walk(n.columns.flatMap((c: any) => c.elements ?? [])) : []),
+    ...(Array.isArray(n.elements) ? walk(n.elements) : []),
+  ]);
+  return walk(panel?.elements ?? [])
+    .filter((n: any) => n?.tag === 'button')
+    .find((b: any) => b.value?.action === 'toggle_idle_compact' && b.value.desired === desired);
+}
+
 function build(opts: {
   status?: string;
   cliId?: string;
@@ -439,26 +453,27 @@ describe('session reasoning selector', () => {
 describe('buildStreamingCard: idle auto-compact toggle (toggle_idle_compact)', () => {
   const usageWith = (enabled: boolean) => ({ context: null, tokens: null, idleAutoCompact: { enabled, minutes: 55 } });
 
-  it('renders in the main control row next to compact, showing the current state', () => {
-    const off = findButton(headerActions(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(false) })), 'toggle_idle_compact');
+  it('renders in the more-actions panel, showing the current state and the target state', () => {
+    const off = idleCompactButton(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(false) }), 'on');
+    expect(off).toBeDefined();
     expect(off.text.content).toContain('关');
-    expect(off.value.desired).toBe('on');
-    expect(off.value.session_id).toBe(SID);
-    const on = findButton(headerActions(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(true) })), 'toggle_idle_compact');
+    const on = idleCompactButton(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(true) }), 'off');
+    expect(on).toBeDefined();
     expect(on.text.content).toContain('开');
-    expect(on.value.desired).toBe('off');
-    const actions = headerActions(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(false) })).map((a: any) => a.value?.action);
-    expect(actions.indexOf('toggle_idle_compact')).toBe(actions.indexOf('compact_session') + 1);
+    // The button carries the session binding the handler needs.
+    const card = build({ status: 'idle', cliId: 'claude-code', usage: usageWith(false) });
+    expect(off.value.session_id).toBe(SID);
   });
 
   it('localises the label', () => {
-    const btn = findButton(headerActions(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(true), locale: 'en' })), 'toggle_idle_compact');
-    expect(btn.text.content).toMatch(/idle/i);
+    const button = idleCompactButton(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(true), locale: 'en' }), 'off');
+    expect(button.text.content).toMatch(/idle/i);
   });
 
   it('is not rendered when the snapshot carries no toggle state (unsupported CLI/backend)', () => {
     const card = build({ status: 'idle', cliId: 'gemini', usage: { context: null, tokens: null } });
-    expect(findButton(headerActions(card), 'toggle_idle_compact')).toBeFalsy();
+    expect(idleCompactButton(card, 'on')).toBeFalsy();
+    expect(idleCompactButton(card, 'off')).toBeFalsy();
   });
 
   it('follows the compact button\'s hidden-button setting', () => {
@@ -467,6 +482,7 @@ describe('buildStreamingCard: idle auto-compact toggle (toggle_idle_compact)', (
       undefined, undefined, false, false, undefined, undefined, undefined, false,
       usageWith(true) as any, undefined, undefined, undefined, undefined, ['compact'],
     ));
-    expect(findButton(headerActions(card), 'toggle_idle_compact')).toBeFalsy();
+    expect(idleCompactButton(card, 'on')).toBeFalsy();
+    expect(idleCompactButton(card, 'off')).toBeFalsy();
   });
 });

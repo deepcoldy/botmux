@@ -4210,6 +4210,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           false,
           substituteCardControlFor(ds),
+          ds.keysPanelOpen === true,
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -4906,6 +4907,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           unavailable,
           substituteCardControlFor(ds),
+          ds.keysPanelOpen === true,
         );
         return { cardJson, unavailable };
       };
@@ -5044,6 +5046,40 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       return;
     }
 
+    // Terminal-key grid expand/collapse. Pure daemon render state — no worker
+    // IPC, unlike display toggles: apply the state the clicked card asked for,
+    // persist it, then PATCH the live card through the same serialized queue.
+    // Clicks on historical cards (message id / nonce mismatch) change nothing
+    // and say so.
+    if (actionType === 'toggle_keys_panel') {
+      if (coordinationModeIsPrimary()) {
+        return { toast: { type: 'warning', content: t('card.action.primary_keys_unavailable', undefined, localeForBot(larkAppId)) } };
+      }
+      if (!ds) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
+      }
+      const locKeys = localeForBot(ds.larkAppId);
+      if (ds.session.status === 'closed'
+        || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, locKeys) } };
+      }
+      if (!ds.streamCardId
+        || ds.streamCardId === CARD_POSTING_SENTINEL
+        || cardMessageId !== ds.streamCardId
+        || value?.card_nonce !== ds.streamCardNonce) {
+        return { toast: { type: 'warning', content: t('card.action.keys_panel_stale', undefined, locKeys) } };
+      }
+      ds.keysPanelOpen = value?.desired === 'open' ? true
+        : value?.desired === 'closed' ? false
+          : !ds.keysPanelOpen;
+      persistStreamCardState(ds);
+      const cardJson = buildStreamingCardJson(ds);
+      if (scheduleCardPatch(ds, cardJson, undefined, { userInitiated: true })) {
+        return { toast: { type: 'info', content: t('toast.action_received_bg', undefined, locKeys) } };
+      }
+      try { return JSON.parse(cardJson); } catch { return; }
+    }
+
     // Export current terminal text as a thread reply. One-shot action — the
     // card body itself stays in screenshot mode. For frozen cards, export
     // from the cached frozen content; for the live card, use ds.lastScreenContent.
@@ -5105,6 +5141,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           false,
           substituteCardControlFor(ds),
+          ds.keysPanelOpen === true,
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -5188,6 +5225,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           false,
           substituteCardControlFor(ds),
+          ds.keysPanelOpen === true,
         );
         return {
           toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) },
@@ -5494,6 +5532,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
           false,
           substituteCardControlFor(ds),
+          ds.keysPanelOpen === true,
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }

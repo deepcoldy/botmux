@@ -2432,6 +2432,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
     s.streamCardNonce === ds.streamCardNonce &&
     s.streamCardReplyTargetKey === ds.streamCardReplyTargetKey &&
     s.displayMode === ds.displayMode &&
+    (s.streamKeysPanelOpen ?? false) === (ds.keysPanelOpen ?? false) &&
     s.currentImageKey === ds.currentImageKey &&
     s.currentTurnTitle === ds.currentTurnTitle &&
     sameUsageLimit(s.usageLimit, ds.usageLimit) &&
@@ -2448,6 +2449,7 @@ export function persistStreamCardState(ds: DaemonSession): void {
   s.streamCardNonce = ds.streamCardNonce;
   s.streamCardReplyTargetKey = ds.streamCardReplyTargetKey;
   s.displayMode = ds.displayMode;
+  s.streamKeysPanelOpen = ds.keysPanelOpen === true;
   s.currentImageKey = ds.currentImageKey;
   s.currentTurnTitle = ds.currentTurnTitle;
   s.usageLimit = ds.usageLimit;
@@ -3071,6 +3073,7 @@ export async function restoreActiveSessions(
           streamCardId: session.streamCardId,
           streamCardNonce: session.streamCardNonce,
           streamCardReplyTargetKey: session.streamCardReplyTargetKey,
+          keysPanelOpen: session.streamKeysPanelOpen === true,
           displayMode: session.displayMode === 'screenshot' || session.displayMode === 'hidden'
             ? session.displayMode
             : (session.streamExpanded ? 'screenshot' : 'hidden'),
@@ -3284,6 +3287,7 @@ export async function restoreActiveSessions(
       streamCardId: session.streamCardId,
       streamCardNonce: session.streamCardNonce,
       streamCardReplyTargetKey: session.streamCardReplyTargetKey,
+      keysPanelOpen: session.streamKeysPanelOpen === true,
       displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
       currentImageKey: session.currentImageKey,
       currentTurnTitle: session.currentTurnTitle,
@@ -3992,6 +3996,7 @@ export async function takeOverDurableActiveRemoteSession(
       streamCardId: persisted.streamCardId,
       streamCardNonce: persisted.streamCardNonce,
       streamCardReplyTargetKey: persisted.streamCardReplyTargetKey,
+      keysPanelOpen: persisted.streamKeysPanelOpen === true,
       displayMode: persisted.displayMode ?? (persisted.streamExpanded ? 'screenshot' : 'hidden'),
       currentImageKey: persisted.currentImageKey,
       currentTurnTitle: persisted.currentTurnTitle,
@@ -4280,6 +4285,7 @@ export async function resumeSession(
     streamCardId: session.streamCardId,
     streamCardNonce: session.streamCardNonce,
     streamCardReplyTargetKey: session.streamCardReplyTargetKey,
+    keysPanelOpen: session.streamKeysPanelOpen === true,
     displayMode: session.displayMode ?? (session.streamExpanded ? 'screenshot' : 'hidden'),
     currentImageKey: session.currentImageKey,
     currentTurnTitle: session.currentTurnTitle,

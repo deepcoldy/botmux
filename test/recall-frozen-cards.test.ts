@@ -465,6 +465,7 @@ describe('restoreUsageLimitRuntimeState', () => {
       false,
       // 24th arg: per-chat substitute card control — unavailable for this fixture.
       undefined,
+      false,
     );
     expect(updateMessageMock).toHaveBeenCalledWith(APP_ID, 'om_live_limit', '{}');
   });
