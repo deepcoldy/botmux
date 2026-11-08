@@ -21,7 +21,7 @@ import { getRuntimeTask, scheduledWorkingDirSwapReason, updateRuntimeTaskState }
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, findQuarantinedRoutingConflict, isDisposableCommandScratch, isRelayableRealSession, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart, resumeTurnNotices } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -3452,6 +3452,7 @@ export async function restoreActiveSessions(
     if (!stillOwnsRestoreRegistration(ds)) continue;
     try {
       ensureOrdinaryTurnRecoveryAttached(ds);
+      resumeTurnNotices(ds);
       const restoredLeaseId = interruptedReadonlyContinuationLeaseIds.get(ds.session.sessionId);
       if (!restoredLeaseId
         || !markReadonlyTaskContinuationInterruptedByRestart(ds, restoredLeaseId)) {
@@ -4916,6 +4917,7 @@ export async function executeScheduledTask(
           // keeps its stable virtual anchor; hand materialization ownership to
           // the new turn (the first `botmux send` validates turn equality).
           existing.session.deferredScheduleRun.turnId = scheduledTurnId;
+          existing.deferredScheduleUnconfirmedTurnId = scheduledTurnId;
           if (runtime?.runId) existing.session.deferredScheduleRun.runId = runtime.runId;
           else delete existing.session.deferredScheduleRun.runId;
           sessionStore.updateSession(existing.session);

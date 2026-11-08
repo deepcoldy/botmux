@@ -8,8 +8,13 @@ import * as scheduler from '../src/core/scheduler.js';
 import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as preconditionStore from '../src/services/schedule-precondition-store.js';
-import { createTaskWithOptionalPrecondition } from '../src/core/schedule-precondition-config.js';
+import { createTaskWithOptionalPrecondition, updateTaskWithOptionalPrecondition } from '../src/core/schedule-precondition-config.js';
 import { executeScheduledTaskWithPrecondition } from '../src/services/schedule-precondition-gate.js';
+import {
+  botmuxScheduleExecutor,
+  botmuxScheduleReconciler,
+  parseScheduleInput,
+} from '../src/workflows/hostExecutors/botmux-schedule.js';
 
 const APP = 'cli_authority';
 let dataDir: string;
@@ -227,6 +232,54 @@ describe('scheduler host authority integration', () => {
     it('replays an identical create without consuming quota', () => {
       const first = scheduler.addTask({ ...params, id: 'turn0001' }, turn('om_turn', 1));
       expect(scheduler.addTask({ ...params, id: 'turn0001' }, turn('om_turn', 1))).toEqual(first);
+    });
+  });
+
+  it('rolls a failed precondition edit back from the authority row, not the projection', () => {
+    const task = scheduler.addTask({ ...params, id: 'guard001', chatId: 'oc_authority' });
+    // schedules.json is writable from a sandboxed session.
+    scheduleStore.updateTask(task.id, { chatId: 'oc_attacker' }, APP);
+    vi.spyOn(preconditionStore, 'activateSchedulePrecondition')
+      .mockImplementationOnce(() => { throw new Error('activation write failed'); });
+    expect(() => updateTaskWithOptionalPrecondition(
+      task.id, { chatId: 'oc_dashboard', prompt: 'edited' }, APP, 'printf 0',
+    )).toThrow('activation write failed');
+    expect(store.getRecord(APP, task.id)?.task).toMatchObject({ chatId: 'oc_authority', prompt: 'check' });
+  });
+
+  describe('v3 botmux-schedule host executor', () => {
+    const frozen = () => parseScheduleInput({
+      name: 'wf poll', schedule: 'every 30m', prompt: 'check', workingDir: '/repo',
+      chatId: 'oc_chat', chatType: 'group', larkAppId: APP,
+    });
+
+    it('commits to authority so the task is schedulable and survives a daemon restart', async () => {
+      const input = frozen();
+      await expect(botmuxScheduleExecutor.invoke(input, 'wf3_poll'))
+        .resolves.toMatchObject({ output: { taskId: 'wf3_poll' } });
+      expect(store.getRecord(APP, 'wf3_poll')?.state).toBe('active');
+      expect(scheduler.getNextRun('wf3_poll')).not.toBeNull();
+
+      store.initializeApp(APP, scheduleStore.listTasks(APP));
+      scheduleStore.replaceAuthoritativeProjection(store.listTasks(APP), APP);
+      expect(scheduleStore.getTask('wf3_poll', APP)?.name).toBe('wf poll');
+
+      await expect(botmuxScheduleExecutor.invoke(input, 'wf3_poll'))
+        .resolves.toMatchObject({ output: { taskId: 'wf3_poll' } });
+      await expect(botmuxScheduleReconciler.readOnlyLookup!('wf3_poll', input))
+        .resolves.toMatchObject({ found: true, externalRefs: { taskId: 'wf3_poll' } });
+      await expect(botmuxScheduleReconciler.readOnlyLookup!('wf3_poll', { ...input, prompt: 'other' }))
+        .rejects.toThrow(/IdempotencyConflict/);
+    });
+
+    it('recovers the receipt from authority when the projection write failed', async () => {
+      const input = frozen();
+      vi.spyOn(scheduleStore, 'projectAuthoritativeTask')
+        .mockImplementationOnce(() => { throw new Error('disk full'); });
+      await botmuxScheduleExecutor.invoke(input, 'wf3_lost');
+      expect(scheduleStore.getTask('wf3_lost', APP)).toBeUndefined();
+      await expect(botmuxScheduleReconciler.readOnlyLookup!('wf3_lost', input))
+        .resolves.toMatchObject({ found: true, externalRefs: { taskId: 'wf3_lost' } });
     });
   });
 
