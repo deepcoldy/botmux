@@ -30,6 +30,9 @@ export interface RawDispatchFailureLike {
  */
 export interface RewrapableSubmissionFailure {
   message: string;
+  /** False when the writer itself proved its input never reached the backend
+   *  (e.g. a framed runner refused the line before buffering any byte). */
+  submissionStarted?: boolean;
   runnerGenerationUnsafe?: boolean;
 }
 
@@ -41,11 +44,20 @@ export interface RewrappedSubmissionFailure {
 }
 
 /**
- * Preserve the framed-runner safety marker when an error escapes the
- * ambiguous submission transaction. Without this, a `runnerGenerationUnsafe`
- * error from the writer is re-wrapped into a plain error and the caller's
- * fence-generation classification silently downgrades to `notify`, re-opening
- * the "half-frame merges with the next queued line and is dropped" bug.
+ * Preserve the writer's own evidence when an error escapes the ambiguous
+ * submission transaction:
+ *
+ * - `runnerGenerationUnsafe`: without it, a dirty framed-runner error is
+ *   re-wrapped into a plain error and the caller's fence-generation
+ *   classification silently downgrades to `notify`, re-opening the "half-frame
+ *   merges with the next queued line and is dropped" bug.
+ * - `submissionStarted === false`: the transaction only knows its write
+ *   callback ran; a writer that proved no byte reached the backend knows more.
+ *   Overwriting that proof with `true` makes a clean rejection look ambiguous
+ *   on fence-capable backends only, so recovery that is correct on every other
+ *   backend never runs there. Only an explicit `false` from the writer
+ *   withdraws the claim; a plain error never does, and a transaction rejected
+ *   before its write (outer `false`) is never raised to `true`.
  */
 export function rewrapSubmissionFailure(
   err: unknown,
@@ -57,7 +69,7 @@ export function rewrapSubmissionFailure(
   return {
     message: recoveryFailureReason ? `${detail}; ${recoveryFailureReason}` : detail,
     ...(recoveryFailureReason ? { recoveryFailureReason } : {}),
-    submissionStarted,
+    submissionStarted: submissionStarted && e?.submissionStarted !== false,
     runnerGenerationUnsafe: !!e?.runnerGenerationUnsafe,
   };
 }

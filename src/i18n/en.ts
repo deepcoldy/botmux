@@ -1548,6 +1548,8 @@ export const messages: Record<string, string> = {
   'card.effort.unavailable': 'Session unavailable or you lack permission to operate it.',
   'card.action.compact_sent': '🗜️ /compact sent to {cliName}',
   'card.action.compact_no_worker': '⚠️ CLI is not running; cannot compact',
+  'card.action.compact_busy': '⚠️ The session is still processing work; compact after it becomes idle',
+  'card.action.compact_failed': '⚠️ Compaction was not submitted; check the session status and retry',
   'card.action.compact_unsupported': '⚠️ Card compact is not supported here; send /compact directly',
   'card.action.close_refused': 'Could not close the session because remote cancellation was not proven ({error}). The session was kept for retry and the remote may still be running. Retry later.',
   'card.action.close_refused_with_task': 'Could not close the session because remote cancellation was not proven ({error}). The session was kept for retry. Remote session id: {taskId}. The remote may still be running; retry later.',
