@@ -147,7 +147,6 @@ import {
   type WorkflowDraftHandoffRecord,
 } from './draft-store.js';
 import { stuckScreenTail } from '../../core/stuck-page-catalog.js';
-import { architectAttemptDir } from './architect.js';
 import {
   classifyFailureCode,
   extractFailureCode,
@@ -636,9 +635,9 @@ function readFileTail(path: string, maxBytes: number): string | undefined {
 }
 
 /** What the Architect's worker left: its stderr (the raw error lines) and
- *  its terminal (pty.log) — read from the attempt dir, never sent anywhere. */
-function architectFailureLogs(runDir: string): { stderr?: string; terminal?: string } {
-  const dir = architectAttemptDir(runDir);
+ *  its terminal (pty.log) — read from its attempt dir, never sent anywhere. */
+function architectFailureLogs(dir: string | undefined): { stderr?: string; terminal?: string } {
+  if (!dir) return {};
   const stderr = readFileTail(join(dir, 'stderr.log'), 16 * 1024);
   const terminal = readFileTail(join(dir, 'pty.log'), 64 * 1024) ?? readFileTail(join(dir, 'stdout.log'), 64 * 1024);
   return { ...(stderr ? { stderr } : {}), ...(terminal ? { terminal } : {}) };
@@ -2680,6 +2679,7 @@ export class WorkflowDraftService {
     task.done = (async () => {
       let ok = false;
       let problems: string[] | undefined;
+      let attemptDir: string | undefined;
       try {
         const bots = this.deps.loadBots();
         const nameOf = this.deps.nameOf();
@@ -2715,6 +2715,7 @@ export class WorkflowDraftService {
         }, this.now());
         ok = outcome.ok;
         problems = outcome.problems;
+        attemptDir = outcome.attemptDir;
       } catch (error) {
         problems = [errorText(error)];
         this.retreatIfStuck(runDir, problems);
@@ -2729,7 +2730,7 @@ export class WorkflowDraftService {
       // in between mistakes it for a lost one. Recording is tried with the
       // problems, then without them; if both fail, the next write or read
       // finds 编排中 with no task and heals it to 编排中断.
-      const logs = ok ? {} : architectFailureLogs(runDir);
+      const logs = ok ? {} : architectFailureLogs(attemptDir);
       const record = (problemsToKeep: string[] | undefined) => this.mutate(runId, undefined, { allowAbandoned: true }, ({ draft }) => {
         if (draft.architect?.state !== 'running') return { changed: false, result: undefined };
         const { problems: _old, ...rest } = draft.architect;

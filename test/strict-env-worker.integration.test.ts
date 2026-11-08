@@ -80,7 +80,10 @@ console.log('Ready >'); setTimeout(() => {}, 30000);
 `;
     writeFileSync(script, source, { mode: 0o700 });
     writeFileSync(bots, JSON.stringify([{ larkAppId: 'app_probe', larkAppSecret: '', apiOnly: true, cliId }]));
+    // The command shim redirects -S, while the boot guard also scans the
+    // configured socket label. Keep both away from the host's live server.
     const env = { ...inheritBotEnv(process.env, { mode: 'strict' }), HOME: dir, SESSION_DATA_DIR: join(dir, 'data'),
+      BOTMUX_TMUX_SOCKET: `strict-env-${sessionId}`,
       BOTS_CONFIG: bots, BOTMUX_NO_CLAIM: '1', HOUSEHOLD_API_CREDENTIAL: 'household-sentinel', FINANCE_SERVICE_SECRET: 'finance-sentinel', UNLISTED_CLOUD_CREDENTIAL: 'host-sentinel', SIBLING_AUTH: 'sibling-sentinel', HTTPS_PROXY: 'proxy-sentinel' };
     if (restore) {
       const bin = join(dir, 'bin'); mkdirSync(bin);

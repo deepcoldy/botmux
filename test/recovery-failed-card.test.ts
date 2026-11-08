@@ -76,6 +76,15 @@ describe('recovery failure card', () => {
     });
   });
 
+  it('offers purge-and-continue for an image-poisoned ordinary recovery notice', () => {
+    const { buttons } = render({ retry: { kind: 'purge_images', turnId: 'om_A' } });
+    expect(buttons.some(b => b.value?.action === 'retry_recovery_turn')).toBe(false);
+    expect(buttons.some(b => b.value?.action === 'retry_turn')).toBe(false);
+    expect(buttons.find(b => b.value?.action === 'purge_images_continue')?.value).toMatchObject({
+      action: 'purge_images_continue', turn_id: 'om_A', session_id: 'sess-1', root_id: 'om_root',
+    });
+  });
+
   it('without re-delivery material offers no retry button', () => {
     for (const reason of ['no_input', 'scheduled', 'unsupported'] as const) {
       const { buttons, markdown } = render({ retry: { kind: 'none', reason } });
@@ -90,7 +99,7 @@ describe('cause classification', () => {
     const codes = [
       'provider_server_error', 'provider_unexpected_eof', 'provider_no_model_reply', 'provider_rate_limited',
       'provider_authentication_failed', 'provider_invalid_request', CODEX_CAPACITY_ERROR_CODE,
-      'recovery_outcome_unverified', 'recovery_restart_unverified', 'recovery_enqueue_failed',
+      'provider_image_too_small', 'recovery_outcome_unverified', 'recovery_restart_unverified', 'recovery_enqueue_failed',
       'recovery_persist_failed', 'recovery_disabled', 'something_new', undefined,
     ];
     const keys = codes.map(code => recoveryCauseI18nKey(code));
@@ -98,7 +107,7 @@ describe('cause classification', () => {
       for (const locale of ['zh', 'en'] as const) expect(t(key, undefined, locale)).not.toBe(key);
     }
     // Network/DNS-type failures and quota are told apart from each other.
-    expect(new Set(keys.slice(0, 7)).size).toBe(7);
+    expect(new Set(keys.slice(0, 8)).size).toBe(8);
     // An unknown code falls back to the generic sentence, never echoes itself.
     expect(t(recoveryCauseI18nKey('something_new'), undefined, 'zh')).not.toContain('something_new');
   });

@@ -4463,7 +4463,16 @@ function CodexAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   );
 }
 
-type CodexConfigInfo = { isolated: boolean; path: string; exists: boolean; hostPath: string; hostExists: boolean };
+type CodexConfigInfo = {
+  isolated: boolean;
+  path: string;
+  exists: boolean;
+  hostPath: string;
+  hostExists: boolean;
+  agentsPath?: string;
+  hostAgentsPath?: string;
+  hostAgentsExists?: boolean;
+};
 
 /**
  * 独立 CODEX_HOME 的 config.toml：worker 只在首次从宿主复制一次（之后可能有本 bot 的
@@ -4493,20 +4502,24 @@ export function CodexIsolatedConfigInfo(props: { bot: BotDefaultsRow }) {
 
   async function resync(): Promise<void> {
     if (!info) return;
+    const withAgents = !!(info.hostAgentsExists && info.agentsPath && info.hostAgentsPath);
     const ok = await confirm({
-      title: tr('botDefaults.codexConfigResyncConfirmTitle'),
-      message: tr('botDefaults.codexConfigResyncConfirmMessage', { host: info.hostPath, path: info.path }),
+      title: tr(withAgents ? 'botDefaults.codexConfigResyncWithAgentsConfirmTitle' : 'botDefaults.codexConfigResyncConfirmTitle'),
+      message: withAgents
+        ? tr('botDefaults.codexConfigResyncWithAgentsConfirmMessage', { host: info.hostPath, path: info.path, hostAgents: info.hostAgentsPath!, agents: info.agentsPath! })
+        : tr('botDefaults.codexConfigResyncConfirmMessage', { host: info.hostPath, path: info.path }),
       confirmLabel: tr('botDefaults.codexConfigResync'),
     });
     if (!ok) return;
     setBusy(true);
     setStatus(null);
     try {
-      const res = await sendJson<{ ok: boolean; backupPath?: string | null; error?: string; message?: string }>('POST', `${url}/resync`, {});
+      const res = await sendJson<{ ok: boolean; backupPath?: string | null; agentsBackupPath?: string | null; error?: string; message?: string }>('POST', `${url}/resync`, {});
       if (res.ok) {
+        const backups = [res.body.backupPath, res.body.agentsBackupPath].filter(Boolean).join(', ');
         setStatus({
-          text: res.body.backupPath
-            ? tr('botDefaults.codexConfigResynced', { backup: res.body.backupPath })
+          text: backups
+            ? tr('botDefaults.codexConfigResynced', { backup: backups })
             : tr('botDefaults.codexConfigResyncedNoBackup'),
           ok: true,
         });
@@ -6513,6 +6526,8 @@ function SessionModeSection(props: {
   const [docStatus, setDocStatus] = useState<StatusMessage>(null);
   const [chatManager, setChatManager] = useState(props.bot.chatManagerEnabled === true);
   const [chatManagerStatus, setChatManagerStatus] = useState<StatusMessage>(null);
+  const [groupSecretary, setGroupSecretary] = useState(props.bot.groupSecretaryEnabled === true);
+  const [groupSecretaryStatus, setGroupSecretaryStatus] = useState<StatusMessage>(null);
 
   useEffect(() => {
     setP2p(normalizeP2pMode(props.bot.p2pMode));
@@ -6528,6 +6543,9 @@ function SessionModeSection(props: {
   useEffect(() => {
     setChatManager(props.bot.chatManagerEnabled === true);
   }, [props.bot.chatManagerEnabled]);
+  useEffect(() => {
+    setGroupSecretary(props.bot.groupSecretaryEnabled === true);
+  }, [props.bot.groupSecretaryEnabled]);
 
   async function saveP2p(next: string): Promise<void> {
     const mode = normalizeP2pMode(next);
@@ -6706,6 +6724,19 @@ function SessionModeSection(props: {
       />
       <div className="bd-mode-group-side" style={{ margin: '0 0 8px' }}><StatusSpan status={chatManagerStatus} attr={{ 'data-chat-manager-status': '' }} /></div>
 
+      <ToggleRow
+        checked={groupSecretary}
+        disabled={busy === 'groupSecretary'}
+        dataAction="toggle-group-secretary"
+        title={tr('botDefaults.groupSecretaryTitle')}
+        help={tr('botDefaults.groupSecretaryHelp')}
+        onChange={checked => {
+          setGroupSecretary(checked);
+          void saveCardMode('groupSecretary', { groupSecretaryEnabled: checked }, setGroupSecretaryStatus);
+        }}
+      />
+      <div className="bd-mode-group-side" style={{ margin: '0 0 8px' }}><StatusSpan status={groupSecretaryStatus} attr={{ 'data-group-secretary-status': '' }} /></div>
+
       <footer className="bd-session-mode-footer">{tr('botDefaults.sessionModeFooter')}</footer>
 
       <div className="bd-row bd-session-mode-doc">
@@ -6744,6 +6775,7 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   const [autoJoinSolo, setAutoJoinSolo] = useState(savedForm.autoJoinSoloGroups);
   const [decisionCards, setDecisionCards] = useState(savedForm.decisionCards);
   const [closeHints, setCloseHints] = useState(savedForm.closeHints);
+  const [taskHints, setTaskHints] = useState(savedForm.taskHints);
   const [guideMode, setGuideMode] = useState<StewardGuideMode>(savedForm.guideMode);
   const [guideText, setGuideText] = useState(savedForm.guideText);
   const [busy, setBusy] = useState(false);
@@ -6764,6 +6796,7 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   useEffect(() => { setAutoJoinSolo(savedForm.autoJoinSoloGroups); }, [appId, savedForm.autoJoinSoloGroups]);
   useEffect(() => { setDecisionCards(savedForm.decisionCards); }, [appId, savedForm.decisionCards]);
   useEffect(() => { setCloseHints(savedForm.closeHints); }, [appId, savedForm.closeHints]);
+  useEffect(() => { setTaskHints(savedForm.taskHints); }, [appId, savedForm.taskHints]);
   useEffect(() => {
     setGuideMode(savedForm.guideMode);
     setGuideText(savedForm.guideText);
@@ -6843,6 +6876,12 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
     const previous = closeHints;
     setCloseHints(on);
     void save({ ...savedForm, closeHints: on }, setStatus, () => setCloseHints(previous));
+  }
+
+  function toggleTaskHints(on: boolean): void {
+    const previous = taskHints;
+    setTaskHints(on);
+    void save({ ...savedForm, taskHints: on }, setStatus, () => setTaskHints(previous));
   }
 
   function changeChat(next: string): void {
@@ -6932,6 +6971,14 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
             title={tr('botDefaults.stewardCloseHints')}
             help={tr('botDefaults.stewardCloseHintsHelp')}
             onChange={toggleCloseHints}
+          />
+          <ToggleRow
+            checked={taskHints}
+            disabled={busy}
+            dataAction="toggle-steward-task-hints"
+            title={tr('botDefaults.stewardTaskHints')}
+            help={tr('botDefaults.stewardTaskHintsHelp')}
+            onChange={toggleTaskHints}
           />
           <div className="bd-row bd-steward-guide">
             <div className="bd-field">
