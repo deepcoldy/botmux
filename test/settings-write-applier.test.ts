@@ -6,8 +6,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 // Tests run as root here, where a real permission check always passes.
-vi.mock('node:fs', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:fs')>();
+// `require` inside the factory, not the vitest-only `importOriginal` argument:
+// bun passes none, so taking it would drop this whole file from the bun leg.
+vi.mock('node:fs', () => {
+  const actual = require('node:fs') as typeof import('node:fs');
   return { ...actual, accessSync: vi.fn(actual.accessSync) };
 });
 
