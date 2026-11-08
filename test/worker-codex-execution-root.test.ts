@@ -56,7 +56,7 @@ function executionFixture(scope: Record<string, any>) {
     effectiveBackendType: 'pty', currentCliCredentialIsolated: false,
     readComm: (pid: number) => pid === 200 ? 'codex' : 'node',
     readCmdline: () => ['/opt/codex'], isZombieProcess: () => false,
-    cliIdForComm, isNonInteractiveCodexArgv,
+    cliIdForComm, isNonInteractiveCodexArgv, snapshotChildPids: () => () => [],
     findLaunchedCliPid: (pid: number) => findLaunchedCliPid(pid, 'codex', 6, {
       childrenOf: p => p === 100 ? [200] : [],
       commOf: p => p === 200 ? 'codex' : 'node',

@@ -490,6 +490,8 @@ import {
   findLaunchedCliPid,
   findCliProcess,
   scheduleWrapperRealCliPid,
+  snapshotChildPids,
+  CODEX_LEAF_SEARCH_DEPTH,
   readComm,
   readCmdline,
   isNonInteractiveCodexArgv,
@@ -12785,7 +12787,8 @@ function resolveCodexOwnershipPid(
 ): number {
   if (!launcherActive || !candidatePid) return candidatePid;
   if (codexProcessIsNativeLeaf(candidatePid, filterExecutable)) return candidatePid;
-  return findLaunchedCliPid(candidatePid, 'codex', 6, {}, filterExecutable) ?? candidatePid;
+  return findLaunchedCliPid(candidatePid, 'codex', CODEX_LEAF_SEARCH_DEPTH, { childrenOf: snapshotChildPids() }, filterExecutable)
+    ?? candidatePid;
 }
 
 /** TRAE counterpart of currentCodexObservedPid: the pid of the TRAE process
@@ -27868,7 +27871,7 @@ async function spawnCli(
       // without changing the retry policy of other CLIs or trusting UI as identity.
       intervalMs,
       maxAttempts: Math.ceil(FIRST_PROMPT_HARD_TIMEOUT_MS / intervalMs),
-      findRealPid: (lp) => findLaunchedCliPid(lp, 'codex', 6, {}, codexFilterExecutable),
+      findRealPid: (lp) => findLaunchedCliPid(lp, 'codex', CODEX_LEAF_SEARCH_DEPTH, { childrenOf: snapshotChildPids() }, codexFilterExecutable),
       isDirectLeaf: (lp) => codexProcessIsNativeLeaf(lp, codexFilterExecutable),
       getBackend: () => backend,
       // Deliberately the stable spawn-time launcher pid, not backend.getChildPid():
