@@ -5,7 +5,9 @@
  * (getLocalIp fallback), and the Lark local-address policy lets a card link
  * field through only when it has one of these shapes. The judgment reads the
  * URL and configuration only, so the daemon, a `botmux send` process and a
- * restarted daemon all agree on the same body.
+ * restarted daemon all agree on the same body, as long as they see the same
+ * Dashboard port: a sandbox with its own HOME cannot read the recorded one
+ * and only knows the configured port.
  *
  * A model can still spell a link of the same shape; the page behind it checks
  * its own session, capability or login, so a guessed one opens nothing.
@@ -50,7 +52,7 @@ export function isHostCapabilityLink(value: string, scope: HostLinkScope): boole
   const terminal = capabilityQuery(url, ['token', 'viewToken']);
   if (!url.hash && terminal !== 'other') {
     if (TERMINAL_PATH.test(url.pathname)) return true;
-    if (url.pathname === '/' && terminal === 'one') return true;
+    if (url.pathname === '/' && terminal === 'one' && !scope.dashboardPorts.includes(port)) return true;
   }
   if (!scope.dashboardPorts.includes(port)) return false;
   const dashboard = capabilityQuery(url, ['t']);
