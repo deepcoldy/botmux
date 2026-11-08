@@ -31,7 +31,7 @@ vi.mock('../src/services/statusline-snapshot.js', () => ({
 }));
 
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
-import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep } from '../src/core/prompt-cache-keepalive.js';
+import { notePromptCacheKeepaliveResult, resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep } from '../src/core/prompt-cache-keepalive.js';
 import { deriveSessionTaskStatus } from '../src/core/session-task-status.js';
 import { stampIdleSinceAt } from '../src/core/worker-pool.js';
 import { deriveKanbanColumn } from '../src/dashboard/web/kanban-model.js';
@@ -59,8 +59,8 @@ function makeDs(): DaemonSession {
   } as unknown as DaemonSession;
 }
 
-/** 一次运行态变化，走生产代码的盖戳。 */
-function edge(ds: DaemonSession, status: ScreenStatus, at: number): void {
+/** worker 上报一次屏幕状态（可以和上一次相同），走生产代码的盖戳。 */
+function screenUpdate(ds: DaemonSession, status: ScreenStatus, at: number): void {
   const prev = ds.lastScreenStatus;
   ds.lastScreenStatus = status;
   stampIdleSinceAt(ds, prev, at);
@@ -100,26 +100,28 @@ beforeEach(() => {
 describe('busySinceAt', () => {
   it('进入忙碌时记下时刻，一直忙着不动，离开忙碌就清掉', () => {
     const ds = makeDs();
-    edge(ds, 'starting', NOON);
+    screenUpdate(ds, 'starting', NOON);
     expect(ds.busySinceAt).toBe(NOON);
-    edge(ds, 'working', NOON + 5 * SEC);
-    edge(ds, 'working', NOON + 6 * SEC);
-    edge(ds, 'analyzing', NOON + 10 * SEC);
-    edge(ds, 'active', NOON + 15 * SEC);
+    screenUpdate(ds, 'working', NOON + 5 * SEC);
+    screenUpdate(ds, 'working', NOON + 6 * SEC);
+    screenUpdate(ds, 'analyzing', NOON + 10 * SEC);
+    screenUpdate(ds, 'active', NOON + 15 * SEC);
     expect(ds.busySinceAt).toBe(NOON);
-    edge(ds, 'idle', NOON + 20 * SEC);
+    screenUpdate(ds, 'idle', NOON + 20 * SEC);
     expect(ds.busySinceAt).toBeUndefined();
-    edge(ds, 'working', NOON + 30 * SEC);
+    screenUpdate(ds, 'working', NOON + 30 * SEC);
     expect(ds.busySinceAt).toBe(NOON + 30 * SEC);
-    edge(ds, 'limited', NOON + 40 * SEC);
+    screenUpdate(ds, 'limited', NOON + 40 * SEC);
     expect(ds.busySinceAt).toBeUndefined();
+    // 状态变化时的时刻跟着 screen_update 自己的补丁走，这里不重复推。
+    expect(patches).toEqual([]);
   });
 
   it('真的开始干活：举手被新一轮盖过，手动放的列也失效', () => {
     const ds = makeDs();
     expect(deriveSessionTaskStatus(row(ds))).toMatchObject({ kind: 'needs_you', reason: 'attention' });
     expect(deriveKanbanColumn(row(ds))).toBe('done');
-    edge(ds, 'working', NOON);
+    screenUpdate(ds, 'working', NOON);
     expect(deriveSessionTaskStatus(row(ds))).toEqual({ kind: 'working', since: NOON });
     expect(deriveKanbanColumn(row(ds))).toBe('in_progress');
   });
@@ -127,11 +129,11 @@ describe('busySinceAt', () => {
   it('提示缓存保活自己的忙碌段不算新一轮：举手还挡着，手动放的列也还在', () => {
     const ds = makeDs();
     keepalive(ds, NOON);
-    edge(ds, 'working', NOON + 2 * SEC);
+    screenUpdate(ds, 'working', NOON + 2 * SEC);
     expect(ds.busySinceAt).toBeUndefined();
     expect(deriveSessionTaskStatus(row(ds))).toMatchObject({ kind: 'needs_you', reason: 'attention' });
     expect(deriveKanbanColumn(row(ds))).toBe('done');
-    edge(ds, 'idle', NOON + 20 * SEC);
+    screenUpdate(ds, 'idle', NOON + 20 * SEC);
     expect(ds.busySinceAt).toBeUndefined();
     expect(ds.idleSinceAt).toBe(IDLE_SINCE);
     expect(deriveKanbanColumn(row(ds))).toBe('done');
@@ -141,41 +143,76 @@ describe('busySinceAt', () => {
   it('保活还没回到空闲就开始了真的一轮：这段忙碌算到真的一轮上，并推给看板', () => {
     const ds = makeDs();
     keepalive(ds, NOON);
-    edge(ds, 'working', NOON + 2 * SEC);
+    screenUpdate(ds, 'working', NOON + 2 * SEC);
     // daemon 派发新一轮时（beginNewTurn）重置保活。
     resetPromptCacheKeepalive(ds, NOON + 5 * SEC);
     expect(ds.busySinceAt).toBe(NOON + 5 * SEC);
     expect(patches).toEqual([{ busySinceAt: NOON + 5 * SEC }]);
     expect(deriveSessionTaskStatus(row(ds))).toEqual({ kind: 'working', since: NOON + 5 * SEC });
     expect(deriveKanbanColumn(row(ds))).toBe('in_progress');
-    edge(ds, 'analyzing', NOON + 8 * SEC);
+    screenUpdate(ds, 'analyzing', NOON + 8 * SEC);
     expect(ds.busySinceAt).toBe(NOON + 5 * SEC);
-    edge(ds, 'idle', NOON + 30 * SEC);
+    screenUpdate(ds, 'idle', NOON + 30 * SEC);
     expect(ds.busySinceAt).toBeUndefined();
     expect(ds.idleSinceAt).toBe(NOON + 30 * SEC);
   });
 
-  it('只有保活占着的忙碌段才补记，其它时候开始新一轮不动 busySinceAt', () => {
+  it('开始新一轮时屏幕还没转忙，或这段忙碌已经记过：不动 busySinceAt', () => {
     const ds = makeDs();
     keepalive(ds, NOON);
     // 保活已打出、屏幕还没转忙：留给接下来的忙碌边沿去记。
     resetPromptCacheKeepalive(ds, NOON + 1 * SEC);
     expect(ds.busySinceAt).toBeUndefined();
-    edge(ds, 'working', NOON + 2 * SEC);
+    screenUpdate(ds, 'working', NOON + 2 * SEC);
     expect(ds.busySinceAt).toBe(NOON + 2 * SEC);
     resetPromptCacheKeepalive(ds, NOON + 9 * SEC);
     expect(ds.busySinceAt).toBe(NOON + 2 * SEC);
     expect(patches).toEqual([]);
   });
 
+  it('保活打进去以后一直没回到空闲（比如网页终端接着敲了字）：过了 10 分钟的在飞窗口就补记，并推给看板', () => {
+    const ds = makeDs();
+    keepalive(ds, NOON);
+    notePromptCacheKeepaliveResult(ds, true);
+    screenUpdate(ds, 'working', NOON + 2 * SEC);
+    screenUpdate(ds, 'working', NOON + 10 * MIN - 1);
+    expect(ds.busySinceAt).toBeUndefined();
+    screenUpdate(ds, 'working', NOON + 10 * MIN);
+    expect(ds.busySinceAt).toBe(NOON + 10 * MIN);
+    expect(patches).toEqual([{ busySinceAt: NOON + 10 * MIN }]);
+    expect(deriveSessionTaskStatus(row(ds))).toEqual({ kind: 'working', since: NOON + 10 * MIN });
+    screenUpdate(ds, 'analyzing', NOON + 11 * MIN);
+    screenUpdate(ds, 'working', NOON + 12 * MIN);
+    expect(ds.busySinceAt).toBe(NOON + 10 * MIN);
+    expect(patches).toHaveLength(1);
+  });
+
+  it('worker 拒收保活时忙碌边沿已经先到：这段忙碌是真的工作，下一次上报就补记；先派发了真的一轮就从派发时刻记', () => {
+    const ds = makeDs();
+    keepalive(ds, NOON);
+    screenUpdate(ds, 'working', NOON + 1 * SEC);
+    notePromptCacheKeepaliveResult(ds, false);
+    expect(ds.busySinceAt).toBeUndefined();
+    screenUpdate(ds, 'working', NOON + 20 * SEC);
+    expect(ds.busySinceAt).toBe(NOON + 20 * SEC);
+    expect(patches).toEqual([{ busySinceAt: NOON + 20 * SEC }]);
+
+    const dispatched = makeDs();
+    keepalive(dispatched, NOON);
+    screenUpdate(dispatched, 'working', NOON + 1 * SEC);
+    notePromptCacheKeepaliveResult(dispatched, false);
+    resetPromptCacheKeepalive(dispatched, NOON + 3 * SEC);
+    expect(dispatched.busySinceAt).toBe(NOON + 3 * SEC);
+  });
+
   it('保活打出去 10 分钟还没回到空闲就不再当保活，转忙照常记时刻', () => {
     const fresh = makeDs();
     keepalive(fresh, NOON);
-    edge(fresh, 'working', NOON + 10 * MIN - 1);
+    screenUpdate(fresh, 'working', NOON + 10 * MIN - 1);
     expect(fresh.busySinceAt).toBeUndefined();
     const stale = makeDs();
     keepalive(stale, NOON);
-    edge(stale, 'working', NOON + 10 * MIN);
+    screenUpdate(stale, 'working', NOON + 10 * MIN);
     expect(stale.busySinceAt).toBe(NOON + 10 * MIN);
   });
 });

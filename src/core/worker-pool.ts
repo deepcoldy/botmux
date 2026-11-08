@@ -14870,12 +14870,22 @@ export function stampIdleSinceAt(
     ds.idleSinceAt = undefined;
   }
   const busy = BUSY_RUNTIME_STATUSES.has(ds.lastScreenStatus ?? '');
-  // A prompt-cache keep-alive's own busy period is not a new round: stamping it
-  // would supersede a raised hand and release a manual board column for the
-  // length of a ping. resetPromptCacheKeepalive stamps it if a real turn takes
-  // the busy period over.
-  if (busy && !BUSY_RUNTIME_STATUSES.has(prev ?? '')) ds.busySinceAt = promptCacheKeepaliveInFlight(ds, now) ? undefined : now;
-  else if (!busy) ds.busySinceAt = undefined;
+  if (!busy) {
+    ds.busySinceAt = undefined;
+  } else if (!BUSY_RUNTIME_STATUSES.has(prev ?? '') || ds.busySinceAt === undefined) {
+    // A prompt-cache keep-alive's own busy period is not a new round: stamping it
+    // would supersede a raised hand and release a manual board column for the
+    // length of a ping. Once the keep-alive is refused or goes stale while the
+    // screen stays busy, the busy period is real work and the next update stamps it.
+    ds.busySinceAt = promptCacheKeepaliveInFlight(ds, now) ? undefined : now;
+    // The screen_update patch carries busySinceAt only on a status change.
+    if (ds.busySinceAt !== undefined && prev === ds.lastScreenStatus) {
+      dashboardEventBus.publish({
+        type: 'session.update',
+        body: { sessionId: ds.session.sessionId, patch: { busySinceAt: ds.busySinceAt } },
+      });
+    }
+  }
   // A prompt-cache keep-alive's own busy period is not activity: restore the
   // idle stretch's original start so idleSuspendMinutes keeps counting.
   notePromptCacheKeepaliveScreenStatus(ds, prev, now);

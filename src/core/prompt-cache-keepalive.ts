@@ -132,14 +132,14 @@ export function promptCacheKeepaliveInFlight(ds: DaemonSession, now = Date.now()
 }
 
 /**
- * A real turn started: the idle stretch (and its ping budget) is over. If the
- * keep-alive's busy period is still on screen, it now belongs to the real turn;
- * its edge left `busySinceAt` unset and no new edge is coming, so stamp it here.
+ * A real turn started: the idle stretch (and its ping budget) is over. A busy
+ * screen without `busySinceAt` is a keep-alive's busy period (or one the worker
+ * refused to type into); it now belongs to the real turn, so stamp it here
+ * instead of waiting for the next screen update.
  */
 export function resetPromptCacheKeepalive(ds: DaemonSession, now = Date.now()): void {
-  const keepaliveTyped = ds.promptCacheKeepalive?.inFlightSince !== undefined;
   ds.promptCacheKeepalive = undefined;
-  if (!keepaliveTyped || ds.busySinceAt !== undefined || !BUSY_RUNTIME_STATUSES.has(ds.lastScreenStatus ?? '')) return;
+  if (ds.busySinceAt !== undefined || !BUSY_RUNTIME_STATUSES.has(ds.lastScreenStatus ?? '')) return;
   ds.busySinceAt = now;
   dashboardEventBus.publish({
     type: 'session.update',
