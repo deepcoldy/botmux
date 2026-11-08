@@ -15,6 +15,8 @@ import {
 } from './ui.js';
 import { buildBotCards, loadGroupsSnapshot, type BotCard } from './overview.js';
 import { requestOpenCreateSession } from './create-session-entry.js';
+import { deriveSessionTaskStatus } from '../../core/session-task-status.js';
+import { DocCommentFailures } from './doc-comment-failures.js';
 import {
   CreateActionButton,
   HeaderAction,
@@ -32,8 +34,6 @@ type SessionRow = Record<string, any> & { sessionId: string };
 type ScheduleRow = Record<string, any> & { id: string };
 type ActiveSortMode = 'time' | 'attention';
 
-/** 「进行中」口径：working / analyzing / active（starting 是过渡态，不计入）。 */
-const WORKING_STATUSES = new Set(['working', 'analyzing', 'active']);
 const TEAM_EXPAND_KEY = 'botmux.overview.teamExpanded';
 const ACTIVE_SORT_KEY = 'botmux.overview.activeSort';
 const TEAM_DESKTOP_COLUMNS = 5;
@@ -400,10 +400,10 @@ function OverviewPage() {
     () => sortActiveSessions(attentionAll, activeSortMode).slice(0, ATTENTION_LIST_CAP),
     [attentionAll, activeSortMode],
   );
-  // 「进行中」：只保留 working/analyzing/active，按最近消息排序。
+  // 「进行中」：会话任务状态为进行中的，按最近消息排序。
   const workingAll = useMemo(
     () => active
-      .filter(s => WORKING_STATUSES.has(String(s.status)))
+      .filter(s => deriveSessionTaskStatus(s).kind === 'working')
       .sort((a, b) => Number(b.lastMessageAt ?? 0) - Number(a.lastMessageAt ?? 0)),
     [active],
   );
@@ -458,6 +458,8 @@ function OverviewPage() {
         <StatChip tone="active" label={tr('overview.activeSessions')} value={active.length} />
         <StatChip tone="online" label={tr('overview.onlineBots')} value={onlineBots} suffix={`/ ${cards.length}`} />
       </div>
+
+      <DocCommentFailures />
 
       <section className="overview-block attention-section">
         <SectionHeader

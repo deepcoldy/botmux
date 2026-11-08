@@ -880,3 +880,57 @@ describe('report relay fallback (#2262)', () => {
     expect(describeReportRelayFallback(undefined)).toBeUndefined();
   });
 });
+
+describe('source-topic direct reply authorization', () => {
+  const replyRegistry = {
+    om_reply: {
+      reportBinding: createDispatchReportBinding(BINDING_SECRET, {
+        dispatchRoot: 'om_reply',
+        targetLarkAppId: 'cli_orchestrator',
+        targetSessionId: 'session-orchestrator',
+        targetChatId: 'oc_orchestrator',
+        targetScope: 'thread',
+        sourceName: '直投子任务',
+        issuedAt: '2026-11-05T00:00:00.000Z',
+        reply: { rootMessageId: 'om_orch_root', sourceTurnId: 'om_current', reporterLarkAppId: 'cli_source' },
+      }),
+    },
+  };
+  const reporterSession = (larkAppId = 'cli_source'): ReportSessionRelaySessionView => ({
+    sessionId: 'session-source', larkAppId, chatId: 'oc_delivery_group', receiver: false,
+    scope: 'thread', rootMessageId: 'om_reply',
+    liveOrigin: { capability: CAPABILITY, turnId: 'turn-current', dispatchAttempt: 2 },
+  });
+  const decide = (
+    raw: Record<string, unknown>,
+    overrides: Partial<Parameters<typeof authorizeReportSessionRelayRequest>[0]> = {},
+  ) => authorizeReportSessionRelayRequest({
+    raw: { sessionId: 'session-source', dispatchRoot: 'om_reply', content: '完成',
+      originCapability: CAPABILITY, ...raw },
+    trustedHost: true, session: reporterSession(), selfLarkAppId: 'cli_source',
+    registry: replyRegistry, bindingSecret: BINDING_SECRET, ...overrides,
+  });
+
+  it('attaches the signed reply binding only for a completed relay report', () => {
+    const completed = decide({ status: 'completed' });
+    expect(completed.ok).toBe(true);
+    if (!completed.ok) throw new Error(completed.error);
+    expect(completed.replyBinding).toBe(replyRegistry.om_reply.reportBinding);
+    for (const status of ['blocked', 'in_progress', 'failed'] as const) {
+      const decision = decide({ status });
+      expect(decision.ok, status).toBe(true);
+      if (decision.ok) expect(decision.replyBinding, status).toBeUndefined();
+    }
+    for (const delivery of ['publish', 'publish-and-relay'] as const) {
+      const decision = decide({ status: 'completed', delivery });
+      expect(decision.ok, delivery).toBe(true);
+      if (decision.ok) expect(decision.replyBinding, delivery).toBeUndefined();
+    }
+  });
+
+  it('rejects a reporter app not named in the host-signed reply binding', () => {
+    expect(decide({ status: 'completed' }, {
+      session: reporterSession('cli_intruder'), selfLarkAppId: 'cli_intruder',
+    })).toEqual({ ok: false, status: 403, error: 'report_reply_reporter_mismatch' });
+  });
+});

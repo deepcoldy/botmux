@@ -69,7 +69,7 @@ describe('shutdown staged-quiescence orchestration (fail-closed)', () => {
   it('late (but in-budget) disconnect still transitions into drain; the terminal is persisted', async () => {
     const dir = freshDir();
     const store = await getSkillFeedbackStore(dir);
-    store.recordTurnDelivery({ botAppId: 'app', sessionId: 'sess', turnId: 'turn-1', nativeSessionId: 'ns', dispatchAttempt: 0,
+    await store.recordTurnDelivery({ botAppId: 'app', sessionId: 'sess', turnId: 'turn-1', nativeSessionId: 'ns', dispatchAttempt: 0,
       platform: 'lark', platformAppId: 'app', platformMessageId: 'om_a', chatId: 'oc', topicRootId: 'om_root',
       content: 'x', cliId: 'claude-code', cardMode: 'feedback', status: 'delivered', requesterSubjectId: 'ou_r', policy: { enabled: true } as any });
     // A terminal was enqueued while the producer was still up (before drain).
@@ -86,13 +86,13 @@ describe('shutdown staged-quiescence orchestration (fail-closed)', () => {
     expect(result.disconnectQuiesced).toBe(true);
     expect(result.settlementQuiesced).toBe(true);
     expect(result.drained).toBe(true);
-    expect(store.listTurnCompletionEvents().length).toBe(1); // persisted
+    expect((await store.listTurnCompletionEvents()).length).toBe(1); // persisted
   });
 
   it('a producer that NEVER disconnects within the deadline keeps admission OPEN — a late terminal is NOT refused', async () => {
     const dir = freshDir();
     const store = await getSkillFeedbackStore(dir);
-    store.recordTurnDelivery({ botAppId: 'app', sessionId: 'sess', turnId: 'turn-2', nativeSessionId: 'ns', dispatchAttempt: 0,
+    await store.recordTurnDelivery({ botAppId: 'app', sessionId: 'sess', turnId: 'turn-2', nativeSessionId: 'ns', dispatchAttempt: 0,
       platform: 'lark', platformAppId: 'app', platformMessageId: 'om_b', chatId: 'oc', topicRootId: 'om_root',
       content: 'x', cliId: 'claude-code', cardMode: 'feedback', status: 'delivered', requesterSubjectId: 'ou_r', policy: { enabled: true } as any });
 
@@ -110,7 +110,7 @@ describe('shutdown staged-quiescence orchestration (fail-closed)', () => {
     await enqueueTurnTerminal({ dataDir: dir, botAppId: 'app', sessionId: 'sess',
       terminal: { turnId: 'turn-2', dispatchAttempt: 0, status: 'completed' }, onError: e => errors.push(e) });
     expect(errors.map(String).join()).not.toContain('refused_shutdown');
-    expect(store.listTurnCompletionEvents().length).toBe(1); // accepted & persisted
+    expect((await store.listTurnCompletionEvents()).length).toBe(1); // accepted & persisted
     stuck.disconnect(); // cleanup
   });
 

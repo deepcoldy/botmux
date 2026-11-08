@@ -116,6 +116,8 @@ describe('Saved Workflow CLI current-turn authentication', () => {
         chatId: 'oc_real',
         rootMessageId: 'om_real',
         sessionId: 'sess-1',
+        // `turn-b` is not a human message id (`om_…`): never frozen as initiator.
+        humanTurn: false,
       });
     } finally {
       rmSync(dataDir, { recursive: true, force: true });

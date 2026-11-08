@@ -108,6 +108,29 @@ class Store {
     }
     this.emit();
   }
+  /**
+   * Bot 改名后把缓存里会话/排程行的 botName 换成当前名（按 larkAppId 现查）。
+   * 行里的 botName 是快照：session.update 不带它，不改写的话直接读 row.botName 的
+   * 渲染点（工作台分组/搜索/信息栏等）会一直显示旧名。只动内存缓存，不回写服务端。
+   * 有变化才 emit，让按 version 记忆的派生数据重算。
+   */
+  relabelBots(nameOf: (larkAppId: string) => string | undefined): boolean {
+    let changed = false;
+    const relabel = <T extends Record<string, any>>(map: Map<string, T>) => {
+      for (const [key, row] of map) {
+        const appId = typeof row.larkAppId === 'string' ? row.larkAppId : '';
+        const name = appId ? nameOf(appId) : undefined;
+        if (name && row.botName !== name) {
+          map.set(key, { ...row, botName: name });
+          changed = true;
+        }
+      }
+    };
+    relabel(this.sessions);
+    relabel(this.schedules);
+    if (changed) this.emit();
+    return changed;
+  }
   onBotsChanged(fn: () => void) { this.botsListeners.add(fn); return () => this.botsListeners.delete(fn); }
   onScheduleRunLogsChanged(fn: (taskId?: string) => void) {
     this.scheduleRunLogListeners.add(fn);

@@ -54,6 +54,7 @@ export type AskApiBodyError =
   | 'bad_input'
   | 'bad_answererOpenId'
   | 'bad_inputMode'
+  | 'bad_allowCustom'
   | 'bad_multiSelect'
   | 'bad_defaultSelectedKeys'
   | 'bad_requestId'

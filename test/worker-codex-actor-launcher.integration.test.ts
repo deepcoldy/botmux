@@ -5,9 +5,9 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { expect, it } from 'vitest';
 import { resolveDaemonCurrentActor, snapshotProcessIdentities } from '../src/core/current-actor-attestation.js';
+import { resolveDaemonCurrentExecution } from '../src/core/current-execution.js';
 import { readComm } from '../src/core/session-discovery.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
-import { stopSessionScope } from '../src/core/session-scope.js';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
@@ -27,6 +27,11 @@ const variants = [
 ] as const;
 
 for (const backendType of ['pty', 'tmux'] as const) {
+  it.skipIf(process.platform !== 'linux' || (backendType === 'tmux' && !tmuxAvailable))(
+    `attests current execution after a slow Codex launcher (${backendType})`,
+    () => runLauncherAttestationCase(backendType, variants[0], 8_000),
+    40_000,
+  );
   for (const variant of variants) {
     it.skipIf(process.platform !== 'linux' || (backendType === 'tmux' && !tmuxAvailable))(
       `attests tools below a Codex launcher that starts as a shell (${backendType}, ${variant.key})`,
@@ -39,6 +44,7 @@ for (const backendType of ['pty', 'tmux'] as const) {
 async function runLauncherAttestationCase(
   backendType: 'pty' | 'tmux',
   variant: { key: string; leafName: string },
+  startupDelayMs = 0,
 ): Promise<void> {
   const root = mkdtempSync(join(tmpdir(), 'bmx-actor-launcher-'));
   const dataDir = join(root, 'data');
@@ -128,6 +134,8 @@ exec '${node}' '${launcherScript}'
     const shellPid = Number(readFileSync(shellPidFile, 'utf8'));
     expect(readComm(shellPid)).toBe('sh');
     expect(snapshotProcessIdentities(initial.cliPid!)).toContain(`${shellPid}:${readProcessStartIdentity(shellPid)}`);
+    // Beyond the former six-second discovery budget, with no rollout/history.
+    if (startupDelayMs) await new Promise(r => setTimeout(r, startupDelayMs));
     writeFileSync(launcherRelease, 'ready');
     await waitFor(() => existsSync(pidsFile));
     cliPids = JSON.parse(readFileSync(pidsFile, 'utf8'));
@@ -153,6 +161,10 @@ exec '${node}' '${launcherScript}'
       resolveIdentity: async () => ({ openId: 'ou_test', type: 'user', email: 'test@example.com' }),
     });
     await expect(request()).resolves.toMatchObject({ ok: true, document: { actor: { email: 'test@example.com' } } });
+    expect(resolveDaemonCurrentExecution({
+      sessionId, peer: { pid: peerPid!, procStart: readProcessStartIdentity(peerPid!)! },
+      findSession: () => ds,
+    })).toMatchObject({ status: 'verified', turnId: 'om_next' });
     expect(attestation.cliPid).toBe(cliPids!.native);
     expect(attestation.cliPid).not.toBe(cliPids!.launcher);
     // The attested leaf must be the process actually carrying the variant's
@@ -170,7 +182,6 @@ exec '${node}' '${launcherScript}'
     for (const pid of [peerPid, cliPids?.native, cliPids?.launcher]) {
       if (pid) try { process.kill(pid, 'SIGKILL'); } catch { /* exited */ }
     }
-    stopSessionScope(sessionId);
     if (backendType === 'tmux') {
       try { execFileSync('tmux', ['kill-server'], { env: privateTmuxEnv(root), stdio: 'ignore' }); } catch { /* exited */ }
     }

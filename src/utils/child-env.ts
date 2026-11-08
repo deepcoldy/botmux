@@ -466,12 +466,19 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // Unguessable pane/profile authority channel. It selects an exact read carve
   // but is not sufficient without the daemon-rotated capability inside it.
   'BOTMUX_ORIGIN_CHANNEL_ID',
+  // Workflow node session marker: `botmux skill show` inside a tmux / zellij
+  // pane must see it like a PTY child does; being listed also means a stale
+  // value in a shared server's global env is unset for ordinary panes.
+  'BOTMUX_WORKFLOW_NODE_SESSION',
   // Keep `botmux bots list` and ready-gated CLIs aligned with daemon config.
   'BOTMUX_LARK_LIST_BOTS_API_ENABLED',
   'BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS',
   // Host-resolved multi-topic orchestration switch. Managed panes must not
   // inherit a stale value from a co-tenant tmux server.
   'BOTMUX_MULTI_TOPIC_ENABLED',
+  // Same for the dispatch task-tree card switch: a file-sandboxed CLI cannot
+  // read ~/.botmux/config.json, so the daemon must project the resolved value.
+  'BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED',
   'BOTMUX_READY_COMMAND',
   // Structured end-of-turn idle report command, injected per session for
   // adapters that opt in (dsh-tui). Not a credential and not fatal when absent.
@@ -485,12 +492,14 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
   // Trigger-user CLI identity. The pane inherits PATH from the user's rcfile,
   // NOT from childEnv, so the worker's PATH prepend never reaches it — these
-  // three are how the wrapper dir gets back in front, via the login-shell shim
-  // (ZDOTDIR/BASH_ENV) that re-prepends BOTMUX_IDENTITY_BIN after path_helper.
+  // these are how the wrapper dirs get back in front, via the login-shell shim
+  // (ZDOTDIR/BASH_ENV) that re-prepends BOTMUX_IDENTITY_BIN and
+  // BOTMUX_WRAPPER_BIN after path_helper.
   // Without them on this allowlist the whole feature is inert in a tmux pane:
   // every governed call silently resolves the real tool and runs as the machine
   // account.
   'BOTMUX_IDENTITY_BIN',
+  'BOTMUX_WRAPPER_BIN',
   'BOTMUX_LARK_TOOL_BINDING',
   'ZDOTDIR',
   'BASH_ENV',
@@ -607,6 +616,11 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   'BOTMUX_LARK_APP_ID',
   // cjadk wrapper-branch knob, set/deleted per spawn by the worker.
   'CJADK_INTERACTIVE',
+  // Workflow node session marker (workflows/session-kind.ts), set per
+  // session by the worker. An inherited copy (e.g. `botmux restart` issued
+  // from a node session) would silently strip the workflow hint and skills
+  // from every ordinary session the daemon then starts.
+  'BOTMUX_WORKFLOW_NODE_SESSION',
 ] as const;
 
 /** Delete inherited session-only identity/capabilities from `env` in place. */
@@ -764,9 +778,13 @@ export function isBotmuxManagedTmuxServerGlobalEnvKey(key: string): boolean {
  *
  * Returns a fresh object; the input env is not mutated.
  */
-export function redactChildEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function redactChildEnv(
+  base: NodeJS.ProcessEnv,
+  additionalKeys: readonly string[] = [],
+): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   for (const key of REDACTED_CHILD_ENV_KEYS) delete env[key];
+  for (const key of additionalKeys) delete env[key];
   // Minimum-exposure sweep for the Dashboard-only H5 login family: the named
   // keys above are already gone, this also catches any BOTMUX_DASHBOARD_FEISHU_H5_*
   // knob added later. No CLI child ever consumes one, so a prefix-wide strip

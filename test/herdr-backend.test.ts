@@ -416,6 +416,47 @@ describe('HerdrBackend.spawn', () => {
     be.kill();
   });
 
+  it.skipIf(process.platform === 'win32')('Herdr 0.7.5: removes protected env after the interactive rcfile before exec', async () => {
+    setManagedLaunchResponses('claude');
+    const be = new HerdrBackend(SESSION);
+    be.spawn('/usr/bin/env', [], {
+      cwd: '/work',
+      cols: 120,
+      rows: 30,
+      env: {
+        PATH: '/usr/bin:/bin',
+        FIXTURE_SECRET: 'base-secret',
+        BOTMUX_PROTECTED_SECRET_FD: '3',
+      },
+      injectEnv: { FIXTURE_TOKEN: 'per-bot-token' },
+      protectedUnsetEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN', 'BOTMUX_PROTECTED_SECRET_FD'],
+      cliBin: '/home/test/.local/bin/claude',
+    });
+
+    const workspaceCall = herdrCall('workspace', 'create')!;
+    expect(workspaceCall).not.toContain('FIXTURE_SECRET=base-secret');
+    expect(workspaceCall).not.toContain('FIXTURE_TOKEN=per-bot-token');
+    expect(workspaceCall).not.toContain('BOTMUX_PROTECTED_SECRET_FD=3');
+
+    const launcherPath = paneLauncherPath();
+    const { execFileSync: realExecFileSync } = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const output = realExecFileSync('/bin/sh', [launcherPath], {
+      encoding: 'utf8',
+      env: {
+        PATH: '/usr/bin:/bin',
+        KEEP_AFTER_RC: 'visible',
+        FIXTURE_SECRET: 'restored-by-rcfile',
+        FIXTURE_TOKEN: 'restored-by-rcfile',
+        BOTMUX_PROTECTED_SECRET_FD: '9',
+      },
+    });
+    expect(output).toContain('KEEP_AFTER_RC=visible');
+    expect(output).not.toContain('FIXTURE_SECRET=');
+    expect(output).not.toContain('FIXTURE_TOKEN=');
+    expect(output).not.toContain('BOTMUX_PROTECTED_SECRET_FD=');
+    be.kill();
+  });
+
   it('Herdr 0.7.5: rejects unsupported launch wrappers before creating a workspace', () => {
     setManagedLaunchResponses('pi');
     const be = new HerdrBackend(SESSION);
@@ -795,6 +836,41 @@ describe('HerdrBackend.spawn', () => {
     expect(startCall).toBeDefined();
     expect(startCall).toContain('--session');
     expect(startCall![startCall!.indexOf('--session') + 1]).toBe(SESSION);
+    be.kill();
+  });
+
+  it('legacy Herdr prefixes trusted protected removals after shell startup', () => {
+    setHerdrResponses([
+      { match: a => a.includes('--version'), reply: () => 'herdr 0.6.6\n' },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      {
+        match: a => a.includes('agent') && a.includes('start'),
+        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: '2-3' } } }),
+      },
+      { match: a => a.includes('read'), reply: () => PANE_READ_REPLY('hello') },
+    ]);
+    const be = new HerdrBackend(SESSION);
+    be.spawn('claude', [], {
+      cwd: '/work',
+      cols: 120,
+      rows: 30,
+      env: { FIXTURE_SECRET: 'base-secret', BOTMUX_PROTECTED_SECRET_FD: '3' },
+      injectEnv: { FIXTURE_TOKEN: 'per-bot-token' },
+      protectedUnsetEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN', 'BOTMUX_PROTECTED_SECRET_FD'],
+    });
+
+    const startCall = herdrCall('agent', 'start', 'botmux')!;
+    expect(startCall.slice(startCall.indexOf('--') + 1)).toEqual([
+      '/usr/bin/env',
+      '-u', 'FIXTURE_SECRET',
+      '-u', 'FIXTURE_TOKEN',
+      '-u', 'BOTMUX_PROTECTED_SECRET_FD',
+      'claude',
+    ]);
+    const startOpts = findCallOpts(a => a.includes('agent') && a.includes('start'));
+    expect(startOpts?.env?.FIXTURE_SECRET).toBeUndefined();
+    expect(startOpts?.env?.FIXTURE_TOKEN).toBeUndefined();
+    expect(startOpts?.env?.BOTMUX_PROTECTED_SECRET_FD).toBeUndefined();
     be.kill();
   });
 

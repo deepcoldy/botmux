@@ -1,0 +1,65 @@
+name: Feedback PostgreSQL
+
+on:
+  pull_request:
+    paths:
+      - 'src/services/feedback*'
+      - 'src/services/skill-feedback-store.ts'
+      - 'src/services/turn-completion-events.ts'
+      - 'test/feedback*'
+      - 'package.json'
+      - 'bun.lock'
+      - '.github/workflows/feedback-postgres.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: PostgreSQL ${{ matrix.postgres }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ['15', '17']
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+      - run: bun install --frozen-lockfile
+      - name: Start disposable TLS PostgreSQL
+        run: |
+          mkdir -p "$RUNNER_TEMP/feedback-pg"
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout "$RUNNER_TEMP/feedback-pg/server.key" \
+            -out "$RUNNER_TEMP/feedback-pg/server.crt" -days 1 \
+            -subj '/CN=localhost' -addext 'subjectAltName=DNS:localhost,IP:127.0.0.1'
+          chmod 600 "$RUNNER_TEMP/feedback-pg/server.key"
+          docker run --detach --name feedback-pg -p 127.0.0.1:55439:5432 \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -v "$RUNNER_TEMP/feedback-pg:/certs" \
+            --entrypoint bash postgres:${{ matrix.postgres }} \
+            -c 'cp /certs/server.* /tmp/; chown postgres:postgres /tmp/server.*; chmod 600 /tmp/server.key; exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/tmp/server.crt -c ssl_key_file=/tmp/server.key'
+          for attempt in $(seq 1 60); do
+            if docker exec feedback-pg pg_isready -U postgres; then exit 0; fi
+            sleep 1
+          done
+          docker logs feedback-pg
+          exit 1
+      - name: Test real backends and migration
+        env:
+          BOTMUX_TEST_POSTGRES_URL: postgresql://postgres@127.0.0.1:55439/postgres
+          BOTMUX_TEST_POSTGRES_MAJOR: ${{ matrix.postgres }}
+        run: |
+          export BOTMUX_TEST_POSTGRES_CA="$RUNNER_TEMP/feedback-pg/server.crt"
+          export HOME="$RUNNER_TEMP/feedback-home"
+          mkdir -p "$HOME"
+          bun run test:e2e -- test/feedback-postgres.e2e.ts test/feedback-migration.e2e.ts
+      - name: Stop test database
+        if: always()
+        run: docker rm -f feedback-pg || true

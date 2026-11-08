@@ -101,7 +101,7 @@ export function appendDispatchReportProtocol(brief: string, dispatchRootId: stri
   return appendDispatchReportProtocolWithDelivery(brief, dispatchRootId, 'relay');
 }
 
-export type DispatchResultDelivery = 'relay' | 'publish' | 'publish-and-relay';
+export type DispatchResultDelivery = 'relay' | 'publish' | 'publish-and-relay' | 'reply';
 
 export function appendDispatchReportProtocolWithDelivery(
   brief: string,
@@ -110,11 +110,13 @@ export function appendDispatchReportProtocolWithDelivery(
 ): string {
   const root = dispatchRootId.trim();
   if (!DISPATCH_ROOT_ID_RE.test(root)) throw new Error('dispatch report protocol requires a valid om_ root id');
-  const deliveryFlag = delivery === 'relay' ? '' : ` --delivery ${delivery}`;
+  const deliveryFlag = delivery === 'reply' ? ' --status completed' : delivery === 'relay' ? '' : ` --delivery ${delivery}`;
   return brief.trimEnd()
     + '\n\n— 完成回报 —\n'
     + `干完后运行 \`botmux report --dispatch-root ${root}${deliveryFlag} "子项目完成 + 产出位置/摘要"\`。`
-    + (delivery === 'relay'
+    + (delivery === 'reply'
+      ? '最终结果由运行层原样投递到派单来源话题，不启动来源 Bot 的模型。仅最终完成才用 completed；澄清或阻碍用 --status blocked，进度用 --status in_progress，仍沿原会话回传。'
+      : delivery === 'relay'
       ? '结果将回传到派单来源会话；不要在本话题 @ 来源 bot（那会另起一个没有上下文的新会话）。'
       : delivery === 'publish'
         ? '结果内容将保持 Markdown 结构发布到当前派单话题，不再回传来源会话。'
@@ -670,12 +672,19 @@ export function recordDispatchInputCommit(
 
 /**
  * Dispatch acceptance waits on receipts keyed by the kickoff's Lark message id
- * (`om_…`). Synthetic turns (scheduled `schedule:…`, recovery, preview runs)
- * can never be a kickoff, so a missing receipt for them is expected and only
- * worth a debug line; an unbound Lark message turn keeps the warning.
+ * (`om_…`), and the kickoff is always posted inside the dispatch topic. Only an
+ * unbound Lark message turn whose inbound destination shows it arrived inside a
+ * topic keeps the warning. Synthetic turns (scheduled `schedule:…`, recovery,
+ * preview runs) and rootless chat-scope turns (p2p, flat group replies, the
+ * `om_`-shaped completion-proposal continuation) can never be a kickoff, so a
+ * missing receipt for them is expected and only worth a debug line.
  */
-export function unboundInputCommitLogLevel(turnId: string): 'warn' | 'debug' {
-  return turnId.trim().startsWith('om_') ? 'warn' : 'debug';
+export function unboundInputCommitLogLevel(
+  turnId: string,
+  inbound: { target: SessionReplyTarget; inThread?: boolean },
+): 'warn' | 'debug' {
+  if (!turnId.trim().startsWith('om_')) return 'debug';
+  return inbound.target.mode !== 'plain' || inbound.inThread === true ? 'warn' : 'debug';
 }
 
 /**

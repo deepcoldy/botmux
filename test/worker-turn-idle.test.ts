@@ -510,6 +510,72 @@ describe('worker turn-idle channel', () => {
     expect(publishedIdentity(harness)).toMatchObject({ turnId: NEXT_TURN_ID, identityTurnId: NEXT_TURN_ID });
   }, 60_000);
 
+  it('delivers an owner interruption past scheduled input without settling the live turn', async () => {
+    const owner = {
+      requestUserOpenId: 'ou_queue_owner', requestUserUnionId: 'on_queue_owner',
+      requestLarkAppId: 'app_turn_idle', senderType: 'user' as const,
+    };
+    const harness = await startWorkerWaitingOnTurn(undefined, { trustedCaller: owner });
+    const scheduleId = 'schedule:blocked-prefix';
+    harness.child.send({
+      type: 'message', content: 'scheduled continuation', turnId: scheduleId,
+      queueAfterActiveTurn: true, trustedCaller: { ...owner, source: 'schedule_creator', taskId: 'task' },
+    } satisfies DaemonToWorker);
+    await waitFor(harness, () => harness.logs.join('').includes('scheduled continuation'),
+      'worker to receive scheduled input behind the live turn');
+    harness.child.send({
+      type: 'message', content: 'human interruption', turnId: NEXT_TURN_ID, trustedCaller: owner,
+    } satisfies DaemonToWorker);
+    await waitFor(harness, () => queuedTurnIds(harness).includes(NEXT_TURN_ID)
+      && harness.messages.some(message => message.type === 'turn_execution_started'
+        && message.turnId === NEXT_TURN_ID),
+      'human input to reach the CLI type-ahead write and publish its execution receipt', 10_000);
+    expect(activeTurnId(harness)).toBe(TURN_ID);
+    expect(publishedIdentity(harness).callerOpenId).toBe(owner.requestUserOpenId);
+    expect(harness.messages.some(message => message.type === 'turn_execution_started'
+      && message.turnId === NEXT_TURN_ID)).toBe(true);
+    expect(harness.messages.some(message => message.type === 'turn_execution_started'
+      && message.turnId === scheduleId)).toBe(false);
+  }, 60_000);
+
+  it('writes a scheduled continuation once the type-ahead successor that blocked it reports idle', async () => {
+    // A runs; the owner's follow-up H is written as type-ahead; a scheduled
+    // continuation S then waits behind the active task. A's ready edge advances
+    // the active turn to H, which blocks S. H's own idle report must still be a
+    // real ready edge: if the blocked flush left the worker marked ready, that
+    // report is dropped as `already-ready`, H keeps the authority forever and
+    // S is never written on a CLI whose only turn end is this report.
+    const owner = {
+      requestUserOpenId: 'ou_queue_owner', requestUserUnionId: 'on_queue_owner',
+      requestLarkAppId: 'app_turn_idle', senderType: 'user' as const,
+    };
+    const harness = await startWorkerWaitingOnTurn(undefined, { trustedCaller: owner });
+    harness.child.send({
+      type: 'message', content: 'owner follow-up', turnId: NEXT_TURN_ID, trustedCaller: owner,
+    } satisfies DaemonToWorker);
+    await waitFor(harness, () => queuedTurnIds(harness).includes(NEXT_TURN_ID), 'H to queue as type-ahead');
+    // dsh-tui's PTY write is text → 1s → Enter; let H's write transaction
+    // release the flush before A's terminal arrives.
+    await delay(1500);
+    const scheduleId = 'schedule:behind-type-ahead';
+    harness.child.send({
+      type: 'message', content: 'scheduled continuation', turnId: scheduleId,
+      queueAfterActiveTurn: true, trustedCaller: { ...owner, source: 'schedule_creator', taskId: 'task' },
+    } satisfies DaemonToWorker);
+    await waitFor(harness, () => harness.logs.join('').includes('scheduled continuation'),
+      'worker to receive scheduled input behind the live turn');
+
+    harness.child.send({ type: 'turn_idle', turnId: TURN_ID, seq: 1 } satisfies DaemonToWorker);
+    await waitFor(harness, () => activeTurnId(harness) === NEXT_TURN_ID, 'A to hand the active turn to H');
+    await delay(300);
+    const scheduleStarted = () => harness.messages.some(message => message.type === 'turn_execution_started'
+      && message.turnId === scheduleId);
+    expect(scheduleStarted()).toBe(false);
+
+    harness.child.send({ type: 'turn_idle', turnId: NEXT_TURN_ID, seq: 2 } satisfies DaemonToWorker);
+    await waitFor(harness, scheduleStarted, 'S to start after H reports idle', 10_000);
+  }, 60_000);
+
   /**
    * The blocker this channel shipped with, restated for the post-#1781 worker.
    *

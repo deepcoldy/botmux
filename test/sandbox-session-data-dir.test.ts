@@ -310,7 +310,7 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
           'BOTMUX_HOST_RELAY_AUTHORIZED=1', command, ...prefixArgs,
           // If classification ever regresses, stop at the later argument
           // validation gate. No credentials, provider request or network.
-          join(repoRoot, 'src/cli.ts'), 'send', 'fixture', '--video'],
+          join(repoRoot, 'src/cli.ts'), 'send', 'fixture', '--video', '/tmp/unused.mp4'],
       });
       expect(plan).not.toBeNull();
       const args = [...plan!.args];
@@ -344,7 +344,7 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
             printf session > "$SESSION_DATA_DIR/.botmux-cli-pids/$$"
             "$@"
           `, 'marker-fixture', command, ...prefixArgs, join(repoRoot, 'src/cli.ts'),
-          'send', 'fixture', '--video'],
+          'send', 'fixture', '--video', '/tmp/unused.mp4'],
       });
       expect(plan).not.toBeNull();
       const result = spawnSync(plan!.bin, plan!.args, {
@@ -369,9 +369,10 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
       plan = prepareDirectSandbox({
         sessionId: 'session', dataDir: f.dataDir, policy: f.policy,
         chdir: repoRoot, home: f.home, cliBin: command,
-        // A valueless flag is rejected at the start of relaySend, proving that
-        // the normal relay path was reached without issuing any real request.
-        cliArgs: [...prefixArgs, join(repoRoot, 'src/cli.ts'), 'send', 'fixture', '--completion-proposal-file'],
+        // A syntactically valid proposal path whose file is missing is rejected
+        // INSIDE relaySend, proving the normal relay path was reached without
+        // issuing any real request (send's argv preflight accepts it first).
+        cliArgs: [...prefixArgs, join(repoRoot, 'src/cli.ts'), 'send', 'fixture', '--completion-proposal-file', '/tmp/unused.json'],
       });
       expect(plan).not.toBeNull();
       writeFileSync(join(plan!.outbox, RELAY_ORIGIN_CAPABILITY_BASENAME), JSON.stringify({
@@ -382,8 +383,10 @@ describe.skipIf(!hasBwrap)('sandbox session-data root', () => {
         encoding: 'utf8', timeout: 15_000,
       });
       expect(result.error).toBeUndefined();
-      expect(result.status, result.stderr).toBe(2);
-      expect(result.stderr).toContain('relay: --completion-proposal-file 需要路径参数');
+      // Relay reached: it owns the missing-proposal-file error (exit 1), not
+      // send's argv preflight.
+      expect(result.status, result.stderr).toBe(1);
+      expect(result.stderr).toContain('relay: 文件不存在: /tmp/unused.json');
     } finally {
       cleanup(f, plan);
     }

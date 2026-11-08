@@ -22,7 +22,9 @@ import { describe, it, expect, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { resumeStartsFresh } from '../src/services/resume-fresh-policy.js';
+import { opencodeDbPath } from '../src/services/opencode-paths.js';
 import { buildClosedSessionCard } from '../src/core/closed-session-card.js';
 import { getCliDisplayName } from '../src/im/lark/card-builder.js';
 import { t } from '../src/i18n/index.js';
@@ -54,6 +56,48 @@ describe('resumeStartsFresh', () => {
       writeFileSync(join(kdir, 'agents', 'main', 'wire.jsonl'), `{"type":"metadata","protocol_version":"1.4"}\n{"content":"<session_id>${sid}</session_id>"}\n`);
       writeFileSync(join(root, 'kimi', 'session_index.jsonl'), JSON.stringify({ sessionId: 'session_aaaa', sessionDir: kdir, workDir: work }) + '\n');
       expect(resumeStartsFresh({ cliId: 'kimi', sessionId: sid, workingDir: work })).toBe(false);
+    } finally {
+      for (const [key, value] of Object.entries(prev)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { cliId: 'opencode', table: 'part' },
+    { cliId: 'opencode2', table: 'session_message' },
+  ])('$cliId finds its own session: fresh exactly when the same probe the worker runs finds none', ({ cliId, table }) => {
+    const root = mkdtempSync(join(tmpdir(), 'resume-fresh-'));
+    const prev = { XDG_DATA_HOME: process.env.XDG_DATA_HOME };
+    try {
+      process.env.XDG_DATA_HOME = root;
+      const sid = '4c0a8f9e-1b2d-4e3f-8a5b-6c7d8e9f0a1b';
+      // No OpenCode DB at all: the probe cannot tell, keep the restored copy.
+      expect(resumeStartsFresh({ cliId, sessionId: sid })).toBe(false);
+      // OpenCode has a DB but no session carrying this botmux id: the worker starts fresh.
+      mkdirSync(join(root, 'opencode'), { recursive: true });
+      const db = new DatabaseSync(opencodeDbPath());
+      db.exec(`
+        CREATE TABLE session (id TEXT PRIMARY KEY);
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+        CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+        CREATE TABLE session_v2 (id TEXT PRIMARY KEY);
+        CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, time_created INTEGER, data TEXT);
+      `);
+      expect(resumeStartsFresh({ cliId, sessionId: sid })).toBe(true);
+      // OpenCode has the session (its prompt carries the botmux id): history is back.
+      const text = `<session_id>${sid}</session_id>`;
+      if (table === 'part') {
+        db.prepare('INSERT INTO session (id) VALUES (?)').run('ses_v1');
+        db.prepare('INSERT INTO message VALUES (?,?,?,?)').run('msg_1', 'ses_v1', 1000, JSON.stringify({ role: 'user' }));
+        db.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run('prt_1', 'msg_1', 'ses_v1', 1000, JSON.stringify({ type: 'text', text }));
+      } else {
+        db.prepare('INSERT INTO session_v2 (id) VALUES (?)').run('ses_v2');
+        db.prepare('INSERT INTO session_message VALUES (?,?,?,?,?)').run('msg_1', 'ses_v2', 'user', 1000, JSON.stringify({ text }));
+      }
+      db.close();
+      expect(resumeStartsFresh({ cliId, sessionId: sid })).toBe(false);
     } finally {
       for (const [key, value] of Object.entries(prev)) {
         if (value === undefined) delete process.env[key]; else process.env[key] = value;

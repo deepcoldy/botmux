@@ -31,8 +31,10 @@ import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { buildPiArgs, createPiAdapter } from '../src/adapters/cli/pi.js';
 import { buildCredentialIsolationRules } from '../src/adapters/cli/read-isolation.js';
+import { protectedMcpHomePaths, type ProtectedMcpWorkerPolicy } from '../src/core/protected-mcp-capabilities.js';
 import { sessionSkillManifestPath } from '../src/core/skills/manifest-store.js';
 import { sessionSkillSnapshotRoot } from '../src/core/skills/snapshot.js';
+import { workflowNodePluginDir } from '../src/skills/workflow-node-plugin-dir.js';
 
 const ctx = (o: Partial<FsPolicyContext> = {}): FsPolicyContext => ({
   platform: 'darwin',
@@ -467,6 +469,10 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/omp-plugin/x').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/pi-skills/x').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/pi-skills/extensions/pi-turn-boundary-extension.js').access).toBe('readOnly');
+    // …and their workflow-node-session copies (what a node session's CLI loads instead).
+    for (const dir of ['claude-plugin', 'cursor-plugin', 'omp-plugin', 'pi-skills']) {
+      expect(accessForPath(p.rules, `${workflowNodePluginDir(`/Users/u/.botmux/${dir}`)}/skills/botmux-send/SKILL.md`).access).toBe('readOnly');
+    }
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/dashboard-daemons/cli_x.json').access).toBe('readOnly'); // daemon IPC discovery
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/bots-info.json').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/bot-openids-cli_self.json').access).toBe('readOnly'); // own
@@ -2096,9 +2102,19 @@ describe('buildFsPolicy — session skill manifest + skill snapshot', () => {
   });
 
   it('oncall + device-credential boundary: the credential masks hide neither the manifest nor the snapshot', () => {
+    const protectedPaths = protectedMcpHomePaths('/Users/u', {
+      capabilities: [],
+      protectedHomePaths: ['.fixture-credential'],
+      redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+    } satisfies ProtectedMcpWorkerPolicy);
     for (const platform of ['darwin', 'linux'] as const) {
-      const cred = buildCredentialIsolationRules({ homeDir: '/Users/u', botmuxHome: '/Users/u/.botmux' });
+      const cred = buildCredentialIsolationRules(
+        { homeDir: '/Users/u', botmuxHome: '/Users/u/.botmux' },
+        protectedPaths,
+      );
       const p = buildFsPolicy(skillCtx({ platform, mandatoryDenyPaths: cred.denyPaths, mandatoryDenyRegexes: cred.denyRegexes }));
+      expect(accessForPath(p.rules, '/Users/u/.fixture-credential').access).toBe('deny');
+      expect((p.denyRegexes ?? []).some(rx => new RegExp(rx).test('/Users/u/.fixture-credential.tmp'))).toBe(true);
       for (const path of [ownManifest, `${snapshot}/deploy/SKILL.md`]) {
         expect(accessForPath(p.rules, path).access).toBe('readOnly');
         expect((p.denyRegexes ?? []).some(rx => new RegExp(rx).test(path))).toBe(false);

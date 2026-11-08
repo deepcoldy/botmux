@@ -54,6 +54,7 @@ function deps(overrides: Record<string, unknown> = {}) {
       d.session.status === 'active' && !!d.worker && !d.worker.killed
       && !d.terminalIdentityTurnIds?.has(turnId)),
     prepareTurnCliIdentity: vi.fn(async () => {}),
+    trackTurnIdentityPublication: vi.fn((_dataDir: string, _sessionId: string, work: Promise<unknown>) => work),
     ...overrides,
   };
 }
@@ -76,6 +77,14 @@ async function testProductionLiveness(terminal: Set<string> | undefined, expectR
 }
 
 describe('handleIdentityDecisionFlip', () => {
+  it('registers the whole replay as an in-flight publication so a first tool call waits for it', async () => {
+    const replay = Promise.resolve();
+    const d = deps({ prepareTurnCliIdentity: vi.fn(() => replay) });
+    const ds = sessionFixture();
+    await runHandler(ds, { model: 'proven', flipped: true, turnId: 'om_open' }, d);
+    expect(d.trackTurnIdentityPublication).toHaveBeenCalledWith('/tmp/flip-data', 'flip-session', replay);
+  });
+
   it('does nothing without a flip or a turn id', async () => {
     const d = deps();
     await runHandler(sessionFixture(), { model: 'proven', flipped: false, turnId: 'om_open' }, d);

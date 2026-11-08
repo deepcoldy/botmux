@@ -12,6 +12,7 @@ import { syntheticSessionUuid, type WorkerHandle, type WorkerProcessFactory, typ
 import { readV3AttemptWorkerFence } from '../src/workflows/v3/worker-fence.js';
 import { botToSnapshot, parseFrozenBotSnapshots } from '../src/workflows/v3/bot-resolve.js';
 import type { BotConfig } from '../src/bot-registry.js';
+import { invalidateGlobalConfigCache } from '../src/global-config.js';
 
 // The default factory delegates to self-spawn's spawnWorker, which is the only
 // path that gets the compiled-binary case right. Mock node:child_process so we
@@ -183,6 +184,67 @@ describe('v3WorkerBackendType', () => {
 });
 
 describe('v3 ephemeral pool', () => {
+  it('does not inherit machine protected env names even when the workflow bot enables no matching plugin', async () => {
+    vi.stubEnv('FIXTURE_SECRET', 'machine-secret');
+    vi.stubEnv('FIXTURE_TOKEN', 'machine-token');
+    vi.stubEnv('INVALID_RECORD_SECRET', 'invalid-record-machine-secret');
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(dir, 'current-global.json'));
+    vi.stubEnv('BOTMUX_PROTECTED_SECRET_FD', '3');
+    try {
+      writeFileSync(join(dir, 'current-global.json'), JSON.stringify({ protectedMcpCapabilities: {
+        'fixture.secret.v1': {
+          enabled: true,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
+          containmentProfile: 'local-stdio-secret-v1',
+          isolation: {
+            protectedHomePaths: ['.fixture-credential'],
+            redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+          },
+        },
+        legacy: { secret: { source: 'env', name: 'INVALID_RECORD_SECRET' } },
+      } }));
+      invalidateGlobalConfigCache();
+      const worker = new ScriptedWorker();
+      const factory = factoryFor(worker);
+      const pool = createEphemeralPool({
+        factory,
+        workerPath: '/tmp/worker.js',
+        quiesceMs: 1,
+        resolveLarkAppSecret: () => 'secret',
+        resolveBot: () => ({
+          env: {
+            FIXTURE_SECRET: 'bot-reintroduced-secret',
+            FIXTURE_TOKEN: 'bot-reintroduced-token',
+            INVALID_RECORD_SECRET: 'bot-reintroduced-invalid-record-secret',
+          },
+        }),
+      });
+      const running = pool.runNode(request());
+      await worker.waitForInit();
+      try {
+        expect(factory.lastOpts!.env.FIXTURE_SECRET).toBeUndefined();
+        expect(factory.lastOpts!.env.FIXTURE_TOKEN).toBeUndefined();
+        expect(factory.lastOpts!.env.INVALID_RECORD_SECRET).toBeUndefined();
+        expect(factory.lastOpts!.env.BOTMUX_PROTECTED_SECRET_FD).toBeUndefined();
+        expect(worker.init.env.FIXTURE_SECRET).toBeUndefined();
+        expect(worker.init.env.FIXTURE_TOKEN).toBeUndefined();
+        expect(worker.init.env.INVALID_RECORD_SECRET).toBeUndefined();
+        expect(worker.init.protectedMcpPolicy).toEqual({
+          capabilities: [],
+          protectedHomePaths: ['.secrets/mcp-secret'],
+          redactEnv: ['BOTMUX_PROTECTED_SECRET_FD', 'FIXTURE_SECRET', 'FIXTURE_TOKEN', 'INVALID_RECORD_SECRET'],
+        });
+      } finally {
+        worker.emitExit(0);
+        await running;
+      }
+    } finally {
+      vi.unstubAllEnvs();
+      invalidateGlobalConfigCache();
+    }
+  });
+
   it('freezes only strict names, filters worker inheritance and resolves this bot env without persisting credentials', async () => {
     vi.stubEnv('UNLISTED_CLOUD_CREDENTIAL', 'host-sentinel');
     vi.stubEnv('HTTPS_PROXY', 'proxy-sentinel');

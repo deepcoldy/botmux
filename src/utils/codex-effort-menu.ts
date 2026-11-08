@@ -1,5 +1,6 @@
 import type { CodexDrainResult } from '../services/codex-transcript.js';
 import type { CodexAppEffortResult } from '../types.js';
+import { detectCodexChoiceModal } from './codex-choice-modal.js';
 type CodexThreadSettings = NonNullable<CodexDrainResult['latestThreadSettings']>;
 
 type Menu = { kind: 'model' | 'effort' | 'advanced'; rows: Array<{ label: string; selected: boolean }> };
@@ -71,13 +72,42 @@ export function hasEmptyCodexComposer(screen: string): boolean {
 
 export interface CodexEffortMenuIO {
   screen(): Promise<string>;
+  /**
+   * Type the literal `/model` line WITHOUT submitting it. The batch is
+   * deliberately split: the submitting Enter is issued by the controller only
+   * after `submitGuard()` has re-read the screen. A TUI confirmation popup that
+   * appears between the text and the Enter would otherwise receive that Enter
+   * and activate its highlighted row (`› 1. Yes, continue anyway`).
+   */
   command(): Promise<void>;
+  /**
+   * Pre-submit re-check, awaited after `command()` typed the text and before
+   * the Enter that submits it. It must re-read the CURRENT screen (draining any
+   * pending render first) and return false when a selection surface owns the
+   * keyboard. Returning false aborts without pressing Enter; the caller's
+   * caller keeps queued input held until the composer is provably clear.
+   * Absent = the backend cannot render such a popup.
+   */
+  submitGuard?(): Promise<boolean>;
+  /**
+   * Undo the text `command()` typed without submitting it.
+   *
+   * A refused guard must not leave `/model` sitting in the composer: the next
+   * user message would be appended to it (`/model` + `fix the bug` →
+   * `modelfix the bug`) and the user's turn would be lost as a slash command.
+   * Only ever called for text THIS operation typed, and only when the screen is
+   * still a plain composer — never into a popup, where a clear key would be
+   * consumed as menu input.
+   */
+  discardTypedCommand?(): Promise<void>;
   key(key: 'Up' | 'Down' | 'Enter' | 'Escape' | 's'): void;
   /** Only settings appended AFTER this operation started, from its exact rollout. */
   settings(): CodexThreadSettings | undefined;
   isCurrent(): boolean;
   signal: AbortSignal;
   deadline: number;
+  /** Fixed reason codes only: never include composer text or a raw screen. */
+  unavailable?(reason: 'inactive' | 'composer_not_empty' | 'menu_already_open' | 'modal_surface' | 'session_selection_unavailable'): void;
   now?: () => number;
   delay?: (ms: number) => Promise<void>;
 }
@@ -102,11 +132,28 @@ export async function applyCodexEffortMenu(
   const alive = () => io.isCurrent() && !io.signal.aborted && now() < io.deadline;
   try {
     const initial = await io.screen();
-    if (!alive() || !hasEmptyCodexComposer(initial) || parseCodexEffortMenu(initial)) {
+    const unavailable = !alive() ? 'inactive'
+      : parseCodexEffortMenu(initial) ? 'menu_already_open'
+        : detectCodexChoiceModal(initial) ? 'modal_surface'
+          : !hasEmptyCodexComposer(initial) ? 'composer_not_empty' : undefined;
+    if (unavailable) {
+      io.unavailable?.(unavailable);
       return { status: 'unavailable', reason: 'cli_menu_unavailable' };
     }
     await io.command();
     opened = true;
+    // A confirmation popup can paint between the typed text and this Enter.
+    // Only ask for the re-check when the caller provided one: its absence
+    // means the backend cannot show such a popup, not that the screen is clear.
+    if (io.submitGuard && !await io.submitGuard()) {
+      io.unavailable?.('modal_surface');
+      // The typed line is still in the composer. Remove it before returning so a
+      // queued user message cannot be appended onto it.
+      await io.discardTypedCommand?.();
+      return { status: 'unavailable', reason: 'cli_menu_unavailable' };
+    }
+    if (!alive()) return { status: 'error' };
+    io.key('Enter');
     while (alive()) {
       const settings = io.settings();
       const screen = await io.screen();
@@ -156,6 +203,7 @@ export async function applyCodexEffortMenu(
           else if (menu.kind === 'model' || /^More reasoning/.test(menu.rows[target]!.label)) io.key('Enter');
           else {
             if (!/enter (?:default|apply)\s*·\s*s session\s*·\s*esc back/i.test(screen)) {
+              io.unavailable?.('session_selection_unavailable');
               return { status: 'unavailable', reason: 'cli_menu_unavailable' };
             }
             io.key('s'); // Use the session-scoped key for both default and apply menus.

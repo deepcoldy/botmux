@@ -1,0 +1,50 @@
+
+  SessionStart hooks
+  1 hook needs review before it can run.
+❯ [!] Hook 1 · new
+  Event     SessionStart
+  Source    Session flags - /<session-flags>/config.toml
+  Command   echo hi
+  Mode      Sync
+  Timeout   600s
+  Trust     New hook - review required
+
+
+  t trust  |  esc go back
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

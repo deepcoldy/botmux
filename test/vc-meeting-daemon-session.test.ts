@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -458,6 +458,21 @@ import {
   getVcMeetingHubCloseState,
   listVcMeetingHubMembers,
 } from '../src/services/vc-meeting-delivery-hub-store.js';
+import { getVcMeetingPreparation } from '../src/services/vc-meeting-preparations-store.js';
+import {
+  listVcMeetingRuntimeSessions,
+  listVcMeetingRuntimeSessionsByListenerAndAgent,
+  pruneExpiredVcMeetingRuntimeSessions,
+  recordVcMeetingRuntimeSession,
+} from '../src/services/vc-meeting-runtime-store.js';
+
+const QUARANTINED_RUNTIME_STORE_ERROR =
+  'vc meeting runtime session store has quarantined evidence for /data/vc-meeting-runtime-sessions.json';
+function failNextRuntimeStoreRead(): void {
+  vi.mocked(listVcMeetingRuntimeSessionsByListenerAndAgent).mockImplementationOnce(() => {
+    throw new Error(QUARANTINED_RUNTIME_STORE_ERROR);
+  });
+}
 
 const APP_ID = 'cli_vc_daemon_test';
 const OTHER_APP_ID = 'cli_vc_other_test';
@@ -1795,6 +1810,150 @@ describe('VC meeting daemon session lifecycle', () => {
     });
     __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID);
     expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_global_off')).toBe(false);
+  });
+
+  describe('startup restore with unreadable meeting state', () => {
+    function registerListener(): void {
+      registerBot({
+        larkAppId: APP_ID,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+        vcMeetingAgent: { enabled: true, larkCliProfile: APP_ID, attentionTargetOpenId: TARGET_OPEN_ID },
+      });
+    }
+    function pushRuntimeRecord(meetingId: string): void {
+      runtimeStoreRecords.push({
+        larkAppId: APP_ID,
+        meeting: { id: meetingId, topic: meetingId },
+        listenerChatId: `oc_${meetingId}`,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+      });
+    }
+
+    it('logs and skips the bot instead of throwing out of daemon startup', () => {
+      registerListener();
+      pushRuntimeRecord('m_restore_store_down');
+      vi.mocked(listVcMeetingRuntimeSessions).mockImplementationOnce(() => {
+        throw new Error('vc meeting runtime session store has quarantined evidence for /data/vc-meeting-runtime-sessions.json');
+      });
+
+      // This runs inside startDaemon's per-bot loop: a throw here used to abort
+      // startup for every bot on the host.
+      expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_store_down')).toBe(false);
+
+      // Durable record untouched: the next start restores it.
+      expect(runtimeStoreRecords.some(r => r.meeting.id === 'm_restore_store_down')).toBe(true);
+      __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID);
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_store_down')).toBe(true);
+    });
+
+    it('a meeting whose state cannot be read does not block the other meetings', () => {
+      registerListener();
+      pushRuntimeRecord('m_restore_bad');
+      pushRuntimeRecord('m_restore_good');
+      const hubDir = join(config.session.dataDir, 'vc-meeting-delivery-hub');
+      mkdirSync(hubDir, { recursive: true });
+      // Quarantined hub evidence makes getVcMeetingHubCloseState throw for this meeting only.
+      writeFileSync(join(hubDir, `${APP_ID}__m_restore_bad.json.corrupt.1.1`), '{bad', 'utf-8');
+
+      expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_good')).toBe(true);
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_bad')).toBe(false);
+      expect(runtimeStoreRecords.some(r => r.meeting.id === 'm_restore_bad')).toBe(true);
+    });
+
+    it('still restores meetings when pruning expired records fails', () => {
+      registerListener();
+      pushRuntimeRecord('m_restore_prune_down');
+      vi.mocked(pruneExpiredVcMeetingRuntimeSessions).mockImplementationOnce(() => {
+        throw new Error('file-lock timeout');
+      });
+
+      expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_prune_down')).toBe(true);
+    });
+
+    it('stops the timers a meeting already armed when its restore fails late', () => {
+      vi.useFakeTimers();
+      registerListener();
+      preparationRecords.push({
+        larkAppId: APP_ID, meetingNo: '688542737', prepChatId: 'oc_m_restore_late', agentAppId: AGENT_APP_ID, qaMode: 'auto',
+      });
+      runtimeStoreRecords.push({
+        larkAppId: APP_ID,
+        meeting: { id: 'm_restore_late', topic: 'late' },
+        listenerChatId: 'oc_m_restore_late',
+        consumerMode: 'agent',
+        selectedAgentAppId: AGENT_APP_ID,
+        preparationMeetingNo: '688542737',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+      });
+      const timersBefore = vi.getTimerCount();
+      // The legacy prepared-consumer migration persists AFTER flush/tick timers are armed.
+      vi.mocked(recordVcMeetingRuntimeSession).mockImplementationOnce(() => {
+        throw new Error('ENOSPC: no space left on device');
+      });
+
+      expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_late')).toBe(false);
+      expect(vi.getTimerCount()).toBe(timersBefore);
+    });
+
+    it('drops a half-restored meeting session instead of leaving partial state behind', () => {
+      registerListener();
+      runtimeStoreRecords.push({
+        larkAppId: APP_ID,
+        meeting: { id: 'm_restore_half', topic: 'half' },
+        listenerChatId: 'oc_m_restore_half',
+        preparationMeetingNo: '688542737',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+      });
+      // Fails after the in-memory session was already created for this meeting.
+      vi.mocked(getVcMeetingPreparation).mockImplementationOnce(() => {
+        throw new Error('injected failure after session creation');
+      });
+
+      expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_half')).toBe(false);
+    });
+
+    it('keeps a healthy session that existed before restore when the same record fails again', () => {
+      vi.useFakeTimers();
+      registerListener();
+      preparationRecords.push({
+        larkAppId: APP_ID, meetingNo: '688542737', prepChatId: 'oc_m_restore_existing', agentAppId: AGENT_APP_ID, qaMode: 'auto',
+      });
+      runtimeStoreRecords.push({
+        larkAppId: APP_ID,
+        meeting: { id: 'm_restore_existing', topic: 'existing' },
+        listenerChatId: 'oc_m_restore_existing',
+        preparationMeetingNo: '688542737',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+      });
+      __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID);
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_existing')).toBe(true);
+      const timersAfterFirstRestore = vi.getTimerCount();
+      expect(timersAfterFirstRestore).toBeGreaterThan(0);
+
+      // The second restore fetches the already-restored session, then fails. The
+      // catch must only tear down entries THIS restore created, never the
+      // pre-existing healthy session or its timers.
+      vi.mocked(getVcMeetingPreparation).mockImplementationOnce(() => {
+        throw new Error('injected failure against existing session');
+      });
+      expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_existing')).toBe(true);
+      expect(vi.getTimerCount()).toBe(timersAfterFirstRestore);
+    });
   });
 
   it('global VC switch blocks stale confirmation cards from starting a new listener', async () => {
@@ -7589,6 +7748,125 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(triggerSessionCalls[0].req.envelope.payload.stream.final).toBe(true);
   });
 
+  it('a closing meeting whose restore fails leaves no closing entry behind and is restored on the next start', async () => {
+    vi.useFakeTimers();
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          minBatchItems: 1,
+          agentCandidates: [{ larkAppId: AGENT_APP_ID, label: 'Claude Loopy' }],
+        },
+      },
+    });
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_close_restore_fail',
+      meeting: { id: 'm_close_restore_fail', meetingNo: '585858587', topic: 'Close restore fail' },
+      raw: { event: { meeting: { id: 'm_close_restore_fail', meeting_no: '585858587' } } },
+    });
+    await selectConsumerAgentViaCard('Claude Loopy');
+    expect(__vcMeetingAgentTest.beginCloseIntentForTest(APP_ID, 'm_joined_585858587')).toBeTypeOf('number');
+
+    const restart = () => {
+      __vcMeetingAgentTest.reset();
+      __vcMeetingAgentTest.setGlobalVcMeetingAgentEnabledForTest(true);
+      __vcMeetingAgentTest.setGlobalVcMeetingListenerBotAppIdForTest(null);
+      __vcMeetingAgentTest.setCrossAppLocalReceiverForTest(true);
+      __vcMeetingAgentTest.setSelfDaemonLarkAppIdForTest(APP_ID);
+    };
+    restart();
+    // The closing path persists the runtime record; make that write fail once.
+    vi.mocked(recordVcMeetingRuntimeSession).mockImplementationOnce(() => {
+      throw new Error('ENOSPC: no space left on device');
+    });
+    const timersBefore = vi.getTimerCount();
+    expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
+    expect(__vcMeetingAgentTest.closingConsumerCount()).toBe(0);
+    expect(vi.getTimerCount()).toBe(timersBefore);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(triggerSessionCalls).toHaveLength(0);
+
+    restart();
+    meetingEventFetchResults.push({
+      raw: {},
+      batch: { source: 'polling', meeting: { id: 'm_joined_585858587' }, items: [] },
+    });
+    __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID);
+    expect(__vcMeetingAgentTest.closingConsumerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(triggerSessionCalls).toHaveLength(1);
+    expect(triggerSessionCalls[0].req.envelope.payload.stream.final).toBe(true);
+  });
+
+  it('keeps a closing entry restored earlier when a later restore of that meeting fails', async () => {
+    vi.useFakeTimers();
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          minBatchItems: 1,
+          agentCandidates: [{ larkAppId: AGENT_APP_ID, label: 'Claude Loopy' }],
+        },
+      },
+    });
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_close_restore_existing',
+      meeting: { id: 'm_close_restore_existing', meetingNo: '585858589', topic: 'Close restore existing' },
+      raw: { event: { meeting: { id: 'm_close_restore_existing', meeting_no: '585858589' } } },
+    });
+    await selectConsumerAgentViaCard('Claude Loopy');
+    expect(__vcMeetingAgentTest.beginCloseIntentForTest(APP_ID, 'm_joined_585858589')).toBeTypeOf('number');
+
+    const restart = () => {
+      __vcMeetingAgentTest.reset();
+      __vcMeetingAgentTest.setGlobalVcMeetingAgentEnabledForTest(true);
+      __vcMeetingAgentTest.setGlobalVcMeetingListenerBotAppIdForTest(null);
+      __vcMeetingAgentTest.setCrossAppLocalReceiverForTest(true);
+      __vcMeetingAgentTest.setSelfDaemonLarkAppIdForTest(APP_ID);
+    };
+    restart();
+    // First restore succeeds: the durable-close record becomes the live closing
+    // entry that a later (re-entrant) restore must not tear down.
+    __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID);
+    expect(__vcMeetingAgentTest.closingConsumerCount()).toBe(1);
+    expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_joined_585858589')).toBe(false);
+
+    // The next restore re-enters the durable-close branch and fails persisting
+    // after replacing the entry. The catch only removes entries IT created, so
+    // the pre-existing closing state stays and reconciliation is not dropped.
+    vi.mocked(recordVcMeetingRuntimeSession).mockImplementationOnce(() => {
+      throw new Error('ENOSPC: no space left on device');
+    });
+    expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
+    expect(__vcMeetingAgentTest.closingConsumerCount()).toBe(1);
+    // The session created by this failed restore is still cleaned up.
+    expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_joined_585858589')).toBe(false);
+    // The durable record is kept for another restart to retry from.
+    expect(runtimeStoreRecords.some(r => r.meeting.id === 'm_joined_585858589')).toBe(true);
+  });
+
   it('abandons and retires a frozen close epoch at the hard deadline when its body cannot be recovered', async () => {
     vi.useFakeTimers();
     __vcMeetingAgentTest.setConsumerCloseTimingForTest({
@@ -8566,6 +8844,40 @@ describe('VC meeting daemon session lifecycle', () => {
       },
     });
     expect(triggerSessionCalls).toHaveLength(0);
+
+    // The same chat now owns a dedicated receiver session. If the meeting store
+    // becomes unreadable, the @mention must be answered visibly and blocked —
+    // neither thrown away (the old behaviour) nor silently treated as ordinary.
+    failNextRuntimeStoreRead();
+    const sentBefore = sentMessages.length;
+    const unavailable = await __vcMeetingAgentTest.routeConsumerBeforeTurnForTest(
+      AGENT_APP_ID,
+      'oc_listener_1',
+    );
+    expect(unavailable.result).toEqual({ block: true });
+    expect(unavailable.ctx.vcMeetingImTurnOrigin).toBeUndefined();
+    const notices = sentMessages.slice(sentBefore);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ receiveId: 'oc_listener_1', msgType: 'text' });
+    expect(triggerSessionCalls).toHaveLength(0);
+  });
+
+  it('handles an ordinary group @mention normally when the meeting runtime store is unreadable', async () => {
+    registerConsumerAgentBot();
+    failNextRuntimeStoreRead();
+    const sentBefore = sentMessages.length;
+
+    // Before the fix this rejected, and the dispatcher dropped the whole
+    // message with only "Error handling message event" in the err log.
+    const routed = await __vcMeetingAgentTest.routeConsumerBeforeTurnForTest(
+      AGENT_APP_ID,
+      'oc_plain_group_without_meeting',
+    );
+
+    expect(routed.result).toBeUndefined();
+    expect(routed.ctx.vcMeetingImTurnOrigin).toBeUndefined();
+    expect(sentMessages.slice(sentBefore)).toHaveLength(0);
+    expect(vi.mocked(listVcMeetingRuntimeSessionsByListenerAndAgent)).toHaveBeenCalled();
   });
 
   it('routes consumer catch-up to the listener daemon even when its bot config is shared locally', async () => {
