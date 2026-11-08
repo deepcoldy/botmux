@@ -17,6 +17,16 @@ export function infoTipClassName(props: InfoTipProps): string {
   return ['ui-info-tip', props.className].filter(Boolean).join(' ');
 }
 
+/** A node's text when it is plain text, for naming a control after it. */
+export function plainText(node: ReactNode): string | undefined {
+  return typeof node === 'string' || typeof node === 'number' ? String(node) : undefined;
+}
+
+/** The mark is a button to screen readers; without a `label` it takes its name from plain-text help. */
+export function infoTipLabel(props: InfoTipProps): string | undefined {
+  return props.label ?? plainText(props.children);
+}
+
 export function infoTipTrigger(props: InfoTipProps): ReactNode {
   return props.trigger ?? <span className="ui-info-mark" aria-hidden="true">?</span>;
 }

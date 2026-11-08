@@ -3,7 +3,7 @@ import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { IconTip, InfoTip, lazyWithFallback, OverflowText } from '../src/dashboard/web/dashboard-components.js';
+import { FieldTitle, IconTip, InfoTip, lazyWithFallback, OverflowText } from '../src/dashboard/web/dashboard-components.js';
 import { FeedGroupPicker, feedGroupPickerLabel } from '../src/dashboard/web/feed-group-picker.js';
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -81,6 +81,23 @@ describe('InfoTip before its popover loads', () => {
     })), 'ui-info-tip')[0];
     expect(passThrough.props.onClick).toBeUndefined();
     expect(passThrough.findByProps({ className: 'nav-update-dot' })).toBeTruthy();
+  });
+});
+
+// 上了 Base UI 后 `?` 是 role=button，没名字的按钮读屏只会念「按钮」。
+describe('the accessible name of the InfoTip mark', () => {
+  const markLabel = (element: React.ReactElement) => hostNodes(create(element), 'ui-info-tip')[0].props['aria-label'];
+
+  it('falls back to plain-text help when no label is given', () => {
+    expect(markLabel(h(InfoTip, { label: 'Help', children: 'Body text' }))).toBe('Help');
+    expect(markLabel(h(InfoTip, { children: 'Body text' }))).toBe('Body text');
+    expect(markLabel(h(InfoTip, { children: h('b', null, 'Rich') }))).toBeUndefined();
+  });
+
+  it('in FieldTitle is the helpLabel, else the plain-text title, else the help', () => {
+    expect(markLabel(h(FieldTitle, { help: 'Explains it', helpLabel: 'About the toggle', children: 'Toggle' }))).toBe('About the toggle');
+    expect(markLabel(h(FieldTitle, { help: 'Explains it', children: 'Toggle' }))).toBe('Toggle');
+    expect(markLabel(h(FieldTitle, { help: 'Explains it', children: ['Toggle', h('span', { key: 'o' }, 'optional')] }))).toBe('Explains it');
   });
 });
 

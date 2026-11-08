@@ -12,9 +12,11 @@ import { dropdownRootClassName, DropdownTriggerValue, type DropdownMenuProps } f
 import { floatingPortalHost } from './floating-host.js';
 import {
   infoTipClassName,
+  infoTipLabel,
   infoTipTrigger,
   OverflowTextScroll,
   overflowTextRootProps,
+  plainText,
   useOverflowText,
   type InfoTipProps,
   type OverflowTextProps,
@@ -162,7 +164,7 @@ function InfoTipFallback(props: InfoTipProps): React.JSX.Element {
   return (
     <span
       className={infoTipClassName(props)}
-      aria-label={props.label}
+      aria-label={infoTipLabel(props)}
       onClick={props.preventClick === false ? undefined : event => event.preventDefault()}
     >
       {infoTipTrigger(props)}
@@ -221,7 +223,7 @@ export function FieldTitle(props: {
   return (
     <span className={['ui-field-title', props.className].filter(Boolean).join(' ')}>
       <span className="ui-field-title-text">{props.children}</span>
-      {props.help ? <InfoTip label={props.helpLabel}>{props.help}</InfoTip> : null}
+      {props.help ? <InfoTip label={props.helpLabel ?? plainText(props.children)}>{props.help}</InfoTip> : null}
     </span>
   );
 }

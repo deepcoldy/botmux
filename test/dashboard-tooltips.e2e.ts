@@ -214,6 +214,32 @@ describe('dashboard tips and pickers on Base UI', () => {
       expect(await focused(mark())).toBe(true);
     });
 
+    it('closes once Tab moves on past it, whether Enter or a click opened it', async () => {
+      await page.locator('#before').focus();
+      await page.keyboard.press('Tab');
+      await page.keyboard.press('Tab');
+      await page.keyboard.press('Enter');
+      await expect.poll(() => visible(help())).toBe(true);
+      await page.keyboard.press('Tab');
+      await expect.poll(() => visible(help())).toBe(false);
+      expect(await focused(page.locator('#nav'))).toBe(true);
+
+      await mark().click();
+      await expect.poll(() => visible(help())).toBe(true);
+      await page.mouse.move(away.x, away.y);
+      await page.keyboard.press('Tab');
+      await expect.poll(() => visible(help())).toBe(false);
+      expect(await focused(page.locator('#nav'))).toBe(true);
+    });
+
+    it('is a button named by its label, else the field title, else plain-text help', async () => {
+      await expect.poll(() => page.getByRole('button', { name: 'Top help', exact: true }).count()).toBe(1);
+      expect(await page.getByRole('button', { name: 'Toggle', exact: true }).evaluate(el => el.matches('#toggle .ui-info-tip'))).toBe(true);
+      await page.locator('#open-dialog').click();
+      expect(await page.getByRole('button', { name: 'Help inside the dialog', exact: true })
+        .evaluate(el => el.matches('#dialog-tip .ui-info-tip'))).toBe(true);
+    });
+
     it('opens on tap on a touch screen, without toggling the checkbox', async () => {
       const context = await browser.newContext({ hasTouch: true, isMobile: true, viewport: { width: 390, height: 844 } });
       const touch = await context.newPage();

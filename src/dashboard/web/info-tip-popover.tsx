@@ -2,7 +2,7 @@ import type React from 'react';
 import { useRef, useState } from 'react';
 import { Popover } from '@base-ui/react/popover';
 import { floatingPortalContainer } from './floating-host.js';
-import { infoTipClassName, infoTipTrigger, TIP_OPEN_DELAY_MS, type InfoTipProps } from './tip-shared.js';
+import { infoTipClassName, infoTipLabel, infoTipTrigger, TIP_OPEN_DELAY_MS, type InfoTipProps } from './tip-shared.js';
 
 /**
  * InfoTip on Base UI Popover: hover or tap opens it, a click pins it open,
@@ -20,7 +20,7 @@ export default function InfoTipPopover(props: InfoTipProps): React.JSX.Element {
         // Time to carry the pointer over to the popup and select its text.
         closeDelay={160}
         nativeButton={false}
-        render={<span ref={triggerRef} className={infoTipClassName(props)} aria-label={props.label} />}
+        render={<span ref={triggerRef} className={infoTipClassName(props)} aria-label={infoTipLabel(props)} />}
         // Sits inside another control (the sidebar nav link), so it is no tab stop of its own.
         {...(props.focusable === false ? { tabIndex: undefined, role: undefined } : null)}
         onClick={props.preventClick === false

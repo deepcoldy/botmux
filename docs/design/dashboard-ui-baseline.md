@@ -132,7 +132,7 @@
   - 弹层默认相对触发器居中；要贴左缘或右缘时，在触发器根节点上设 `--dropdown-align: start` / `end`。宽度可用 `var(--anchor-width)`（触发器宽度）。
   - 限高必须带 `var(--available-height, 100vh)`，否则触发器上下空间都不够时会超出视口。
 - `InfoTip`（`FieldTitle` 的 `help` 也走它）和 `FeedGroupPicker` 底层是 Base UI 的 Popover，`OverflowText` 的全文浮层和图标按钮的 `IconTip` 是 Base UI 的 Tooltip；实现都随第一个渲染的实例按需加载，加载前是外观一致、不可交互的占位。浮层同样 portal 到 `body` 或打开中的原生 `<dialog>`：
-  - `InfoTip`：hover 或点按打开，点击后固定（可以选中复制），Esc 或点别处关闭。`?` 在 `<label>` 里时点击不会切换开关；`preventClick={false}` 表示点击交给外层链接、不固定浮层，`focusable={false}` 表示不单独占 Tab 位。
+  - `InfoTip`：hover 或点按打开，点击后固定（可以选中复制），Esc 或点别处关闭。`?` 在 `<label>` 里时点击不会切换开关；`preventClick={false}` 表示点击交给外层链接、不固定浮层，`focusable={false}` 表示不单独占 Tab 位。`?` 对读屏是按钮，要有名字：没传 `label` 时用纯文本说明命名，`FieldTitle` 没传 `helpLabel` 时用纯文本标题命名。
   - 图标按钮的文字提示用 `<IconTip label>` 包住按钮或链接（子元素必须是单个 DOM 元素），不再用 `data-tip`。提示只在 hover 和键盘焦点时出现，点击即隐藏，触屏不出现；按钮本身仍要有 `aria-label`。
   - 浮层不在页面 DOM 里，样式只能写在浮层自己的 class 上（`.ui-info-pop`、`.ui-overflow-popover`、`.icon-tip`、`.feed-group-picker-pop`），方向和进出场用 `[data-side]`、`[data-starting-style]` / `[data-ending-style]`；触发器展开态是触发器上的 `[data-popup-open]`。
 - `LoadingState` 用于所有数据加载占位；页面级使用默认尺寸，卡片、弹窗、列表、局部面板使用 `compact` 或页面 class 缩小高度，但必须复用同一个 `.page-loading-spin`。
