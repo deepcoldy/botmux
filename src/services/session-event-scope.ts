@@ -65,6 +65,10 @@ export class WorkerSessionEventScope {
     };
     retry();
   }
+  refuseBinding(bindingId: string): void {
+    const binding = this.bindings.get(bindingId);
+    if (binding) this.restoreAfterAbortedStart(binding);
+  }
   confirmAbortedStart(bindingId: string): void {
     const pending = this.abortReports.get(bindingId); if (!pending) return;
     if (pending.timer) clearTimeout(pending.timer);

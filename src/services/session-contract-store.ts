@@ -37,11 +37,18 @@ function eventRuntime(event: ContractEvent): RuntimeRef | undefined {
   return undefined;
 }
 function terminalPhase(phase: string): boolean { return ['succeeded', 'failed', 'cancelled'].includes(phase); }
+// Recovery replays these records to prove a runtime interval; never pruned.
+const structuralEvents = ['runtime_bound', 'runtime_reserved'];
+const retention = { events: 1024, executions: 256, results: 256, operations: 128, interval: 128 };
+function eventRecord(event: ContractEvent, json = JSON.stringify(event)): string {
+  return structuralEvents.includes(event.type) ? json : `sha256:${createHash('sha256').update(json).digest('hex')}`;
+}
 
 const contractSchema = `
       CREATE TABLE IF NOT EXISTS contracts(session_key TEXT PRIMARY KEY, revision INTEGER NOT NULL, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS entities(session_key TEXT NOT NULL,kind TEXT NOT NULL,id TEXT NOT NULL,phase TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(session_key,kind,id));
       CREATE INDEX IF NOT EXISTS contract_entities_phase ON entities(session_key,kind,phase);
+      CREATE INDEX IF NOT EXISTS contract_execution_turns ON entities(session_key,kind,json_extract(value,'$.ref.turnId'));
       CREATE TABLE IF NOT EXISTS deferred_events(session_key TEXT NOT NULL,binding_id TEXT NOT NULL,event_id TEXT NOT NULL,sequence INTEGER NOT NULL,value TEXT NOT NULL,PRIMARY KEY(session_key,event_id));
       CREATE TABLE IF NOT EXISTS observation_watermarks(session_key TEXT NOT NULL,producer TEXT NOT NULL,runtime_id TEXT NOT NULL,sequence INTEGER NOT NULL,PRIMARY KEY(session_key,producer,runtime_id));
       CREATE TABLE IF NOT EXISTS events(session_key TEXT NOT NULL,event_id TEXT NOT NULL,type TEXT NOT NULL,decision TEXT NOT NULL,value TEXT NOT NULL,revision INTEGER NOT NULL,PRIMARY KEY(session_key,event_id));
@@ -57,6 +64,7 @@ export class SessionContractStore {
   private databaseIdentity?: { device: bigint; inode: bigint };
   private closed = false;
   private readonly epochFloors = new Map<string, number>();
+  private readonly writesSincePrune = new Map<string, number>();
   private get db(): DatabaseSyncLike {
     if (this.closed) throw new Error('session_contract_store_closed');
     if (this.connection === this.ownedDatabase && this.databaseIdentity && !this.isCurrentDatabase()) {
@@ -115,7 +123,7 @@ export class SessionContractStore {
     return this.transaction(() => {
       const session = this.read(ref); if (!session) throw new Error('contract_session_missing');
       const tables = Object.fromEntries(snapshotTables.map(table => [table,
-        this.db.prepare(`SELECT * FROM ${table} WHERE session_key=?`).all(sessionKey(ref)) as Array<Record<string, unknown>>]));
+        this.db.prepare(`SELECT * FROM ${table} WHERE session_key=? ORDER BY rowid`).all(sessionKey(ref)) as Array<Record<string, unknown>>]));
       return structuredClone({ version: 2, session, tables });
     });
   }
@@ -228,7 +236,9 @@ export class SessionContractStore {
     return this.entity(ref, 'result_delivery', JSON.stringify([turnId, dispatchAttempt ?? null]));
   }
   executions(ref: ContractSessionRef, turnId?: string, dispatchAttempt?: number): ExecutionContract[] {
-    const rows = this.db.prepare("SELECT value FROM entities WHERE session_key=? AND kind='execution'").all(sessionKey(ref)) as Array<{ value: string }>;
+    const rows = (turnId === undefined
+      ? this.db.prepare("SELECT value FROM entities WHERE session_key=? AND kind='execution'").all(sessionKey(ref))
+      : this.db.prepare("SELECT value FROM entities WHERE session_key=? AND kind='execution' AND json_extract(value,'$.ref.turnId')=?").all(sessionKey(ref), turnId)) as Array<{ value: string }>;
     return rows.map(row => JSON.parse(row.value) as ExecutionContract).filter(value => !turnId || (value.ref.turnId === turnId && value.ref.dispatchAttempt === dispatchAttempt));
   }
   pendingOperations(ref: ContractSessionRef): ControlOperation[] {
@@ -243,8 +253,9 @@ export class SessionContractStore {
   private applyInside(ref: ContractSessionRef, event: ContractEvent, eventId: string, expectedRevision?: number): ContractTransition {
     const session = this.read(ref); if (!session) throw new Error('contract_session_missing');
     const seen = this.db.prepare('SELECT value FROM events WHERE session_key=? AND event_id=?').get(sessionKey(ref), eventId) as { value: string } | undefined;
+    const json = JSON.stringify(event);
     if (seen) {
-      if (seen.value !== JSON.stringify(event)) throw new Error('contract_event_conflict');
+      if (seen.value !== json && seen.value !== eventRecord(event, json)) throw new Error('contract_event_conflict');
       return { session, decision: 'duplicate' };
     }
     if (expectedRevision !== undefined && session.revision !== expectedRevision) throw new SessionContractConflict(session.revision);
@@ -280,9 +291,34 @@ export class SessionContractStore {
         }
       }
     }
-    this.db.prepare('INSERT INTO events(session_key,event_id,type,decision,value,revision) VALUES(?,?,?,?,?,?)').run(sessionKey(ref), eventId, event.type, result.decision, JSON.stringify(event), result.session.revision);
+    // Observation sequences are already watermarked; an unchanged readiness
+    // sample needs no dedup record.
+    if (!changed && (event.type === 'runtime_busy' || event.type === 'runtime_ready')) return result;
+    this.db.prepare('INSERT INTO events(session_key,event_id,type,decision,value,revision) VALUES(?,?,?,?,?,?)').run(sessionKey(ref), eventId, event.type, result.decision, eventRecord(event, json), result.session.revision);
     this.rememberEpoch(ref, result.session.runtimeEpoch);
+    const writes = (this.writesSincePrune.get(sessionKey(ref)) ?? 0) + 1;
+    this.writesSincePrune.set(sessionKey(ref), writes % retention.interval);
+    if (writes >= retention.interval) this.prune(ref);
     return result;
+  }
+  /** Bounded history: recent dedup records, recent settled attempts and their
+   * result facts. Recovery records and unsettled work are retained. */
+  prune(ref: ContractSessionRef): void {
+    this.transaction(() => {
+      const key = sessionKey(ref); const structural = structuralEvents.map(type => `'${type}'`).join(',');
+      this.db.prepare(`DELETE FROM events WHERE session_key=? AND type NOT IN (${structural}) AND rowid NOT IN (SELECT rowid FROM events WHERE session_key=? AND type NOT IN (${structural}) ORDER BY rowid DESC LIMIT ?)`)
+        .run(key, key, retention.events);
+      const older = (kind: string, keep: number, phases: string[]) => this.db.prepare(`DELETE FROM entities WHERE session_key=? AND kind=? AND phase IN (${phases.map(() => '?').join(',')}) AND rowid NOT IN (SELECT rowid FROM entities WHERE session_key=? AND kind=? ORDER BY rowid DESC LIMIT ?)`)
+        .run(key, kind, ...phases, key, kind, keep);
+      older('execution', retention.executions, ['succeeded', 'failed', 'cancelled']);
+      older('operation', retention.operations, ['confirmed', 'failed_before_effect', 'rejected']);
+      // A turn whose attempt is still unsettled may yet deliver its result.
+      for (const kind of ['result_binding', 'result_delivery', 'result_revision']) {
+        this.db.prepare(`DELETE FROM entities WHERE session_key=? AND kind=? AND rowid NOT IN (SELECT rowid FROM entities WHERE session_key=? AND kind=? ORDER BY rowid DESC LIMIT ?)
+          AND NOT EXISTS (SELECT 1 FROM entities x WHERE x.session_key=entities.session_key AND x.kind='execution' AND x.phase NOT IN ('succeeded','failed','cancelled')
+            AND json_extract(x.value,'$.ref.turnId')=json_extract(entities.id,'$[0]'))`).run(key, kind, key, kind, retention.results);
+      }
+    });
   }
   bindWorker(ref: ContractSessionRef, worker: WorkerRef): SessionContract {
     this.ensure(ref); return this.apply(ref, { type: 'worker_bound', worker }).session;
@@ -378,6 +414,9 @@ export class SessionContractStore {
   }
   deferredEvents<T>(ref: ContractSessionRef, bindingId: string): T[] {
     return (this.db.prepare('SELECT value FROM deferred_events WHERE session_key=? AND binding_id=? ORDER BY sequence,event_id').all(sessionKey(ref), bindingId) as Array<{ value: string }>).map(row => JSON.parse(row.value));
+  }
+  discardDeferred(ref: ContractSessionRef, bindingId: string): void {
+    this.db.prepare('DELETE FROM deferred_events WHERE session_key=? AND binding_id=?').run(sessionKey(ref), bindingId);
   }
   acknowledgeDeferred(ref: ContractSessionRef, eventId: string, rejectedMessage?: unknown): void {
     if (rejectedMessage !== undefined) {

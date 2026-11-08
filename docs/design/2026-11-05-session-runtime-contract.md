@@ -35,6 +35,12 @@ Restoration skips predecessors whose starts were also aborted. The no-spawn
 report retains its original binding and retries until the host acknowledges its
 durable commit. Observed no-spawn evidence also fences late permits while the
 commit is failing; a lost acknowledgement cannot leave the reservation pending.
+A spawn that fails before its runtime publishes an identity reports the same
+abort: that replacement never became addressable and must not mask the
+surviving runtime's exit. When the host refuses a binding (for example while
+another control operation owns the session), it stops the unbound reservation,
+discards its deferred events and tells the worker, which returns to its previous
+binding. Later events of a stopped reservation are rejected, not deferred.
 
 Events carry a producer ID, producer sequence, event ID, session reference and
 their original runtime/execution/operation scope. Async callbacks keep the scope
@@ -42,6 +48,11 @@ they were created under. Live screen callbacks use the current semantic binding
 of the same physical source. Native hooks carry the binding ID inherited by the
 CLI; MCP calls capture their scope at admission. Neither a later caller nor a
 payload's mutable operation ID can replace a captured callback origin.
+A CLI started before binding IDs existed has none. Its session-ready and
+turn-idle hooks attach to the current runtime only when it is the sole settled
+candidate: active lifecycle, no control operation, no pending replacement, a
+matching native session when both sides know one, and for turn-idle an attempt
+that belongs to that runtime.
 
 `SessionEventGateway` validates the trusted IPC producer and full attempt before
 any binding or state mutation. Old readiness, screen and runtime configuration
@@ -76,6 +87,14 @@ Observed allocator high watermarks survive that cache refresh and are persisted
 into restored rows without restoring old executor authority. Older checkpoint
 files cannot make a known allocated epoch available for a new reservation.
 
+History is bounded per session: the newest 1024 deduplication records, 256
+settled attempts and result facts, and 128 settled operations. Reservation and
+binding records, which recovery replays, and unsettled work are never pruned.
+Other deduplication records store a digest of the event, so reusing an event ID
+for a different event is still a conflict. Unchanged busy/ready samples are
+covered by the observation watermark and are not recorded; a turn records one
+ready-to-busy edge. Turn lookups use an index instead of scanning all attempts.
+
 Readiness has separate worker-online and prompt-ready facets. `workerReady`,
 `cliReady` and `cliReadyGeneration` are compatible read projections. Screen idle,
 IPC receipt and prompt readiness do not settle a business execution.
@@ -83,13 +102,17 @@ IPC receipt and prompt readiness do not settle a business execution.
 Operations progress through `planned`, `applying`, `confirmed`,
 `failed_before_effect`, `rejected` or `uncertain`. They retain their operation ID,
 target runtime/attempt and prior lifecycle. Timeout retains an uncertain
-operation; concurrent requests join it. A planned restart recovered before its
+operation; concurrent requests join it while its replacement reservation is still
+unbound. Once none is pending, a new restart supersedes it and the late result
+settles only the retired operation. A planned restart recovered before its
 start claim resumes the same operation, with a single start claim. Close can
 supersede another operation; its late success cannot revive a closed selection.
 A rejected close restores the previous suspended lifecycle.
 If persistence of the restart start claim fails before physical restart is
 invoked, the operation settles as `failed_before_effect` and can be retried.
-Failures after invocation remain uncertain because effects may already exist.
+A failure the worker reports after invocation is a known outcome: it settles as
+`rejected` and restores the prior lifecycle, so the next restart is a new
+attempt. Only a missing outcome remains uncertain.
 
 An unverified suspend retains `uncertain`: the backing verifier has already
 attempted teardown, so failure does not prove that no effect occurred. Retrying
@@ -97,8 +120,15 @@ suspend reuses the same operation and rechecks the exact selected runtime's
 backing. A verified teardown confirms that operation. Restart can supersede an
 uncertain suspend or cancel, retaining the old intent and restoring its prior
 lifecycle under the new restart fence. Late results settle only the retired
-operation. Input stays fenced until verification or restart confirmation;
-ordinary readiness events alone do not prove a failed teardown harmless.
+operation. A newly forked worker takes over an uncertain suspend or cancel under
+a new restart, so its first runtime may start. Readiness projections stay false
+until verification or restart confirmation; ordinary readiness events alone do
+not prove a failed teardown harmless.
+
+Control operations do not fence user input. The worker queues messages across
+restart and resume, and an unverified suspend or cancel leaves the executor live,
+so messages and Stop are still delivered. Only a closing or closed session
+refuses input.
 
 During reserve-to-bind replacement, an authorized predecessor exit still records
 the physical loss and reconciles its executions, but has historical admission.

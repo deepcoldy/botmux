@@ -83,13 +83,16 @@ export class SessionController {
   bindingMayStart(bindingId: string): boolean {
     return !this.abortedBindings.has(bindingId) && this.store.binding(this.ref, bindingId)?.phase === 'starting';
   }
-  abandonBinding(bindingId: string, worker: WorkerRef, eventId: string): boolean {
+  abandonBinding(bindingId: string, worker: WorkerRef, eventId: string, reason = 'runtime_start_aborted'): boolean {
     const runtime = this.store.binding(this.ref, bindingId);
     if (!runtime || runtime.identity || !this.store.bindingProducer(this.ref, bindingId, worker)) return false;
     // Remember the worker's no-spawn evidence before a fallible durable write,
     // so an older reservation await cannot release a contradictory permit.
     this.abortedBindings.add(bindingId);
-    this.store.apply(this.ref, { type: 'runtime_lost', runtime: runtime.ref, confirmed: true, reason: 'runtime_start_aborted' }, eventId);
+    this.store.atomic(() => {
+      this.store.apply(this.ref, { type: 'runtime_lost', runtime: runtime.ref, confirmed: true, reason }, eventId);
+      this.store.discardDeferred(this.ref, bindingId);
+    });
     this.refresh(); return true;
   }
   admitsRegistration(type: string, bindingId: string, context: SessionEventContext | undefined, worker: WorkerRef): boolean {
@@ -98,7 +101,7 @@ export class SessionController {
     return admission.kind === 'worker';
   }
   nativeSignal(bindingId: unknown, nativeSessionId?: unknown, turnId?: string, dispatchAttempt?: number): import('../services/session-contract.js').SessionCommandContext | undefined {
-    if (typeof bindingId !== 'string') return undefined;
+    if (typeof bindingId !== 'string') return this.unboundNativeSignal(nativeSessionId, turnId, dispatchAttempt);
     const source = this.store.binding(this.ref, bindingId); if (!source) return undefined;
     const current = this.store.runtime(this.ref);
     const owner = this.store.read(this.ref)?.worker;
@@ -110,6 +113,17 @@ export class SessionController {
     if (typeof nativeSessionId === 'string' && current?.identity?.nativeSessionId === nativeSessionId
       && samePhysicalRuntimeIdentity(source.identity, current.identity)) return { version: 2, runtime: current.ref };
     return undefined;
+  }
+  /** A CLI launched before runtime bindings existed has no binding ID in its
+   * hook environment. Only a settled, sole current runtime may adopt it. */
+  private unboundNativeSignal(nativeSessionId?: unknown, turnId?: string, dispatchAttempt?: number): import('../services/session-contract.js').SessionCommandContext | undefined {
+    const state = this.store.read(this.ref)!; const current = this.store.runtime(this.ref);
+    if (!current?.identity || state.lifecycle !== 'active' || state.activeOperationId || !sameWorker(current.worker, state.worker)
+      || !['starting', 'ready'].includes(current.phase) || this.store.hasPendingRuntimeReplacement(this.ref, current.ref)) return undefined;
+    if (typeof nativeSessionId === 'string' && current.identity.nativeSessionId !== undefined && current.identity.nativeSessionId !== nativeSessionId) return undefined;
+    const execution = turnId ? this.store.executions(this.ref, turnId, dispatchAttempt)[0] : undefined;
+    if (execution?.runtime && !sameRuntime(execution.runtime, current.ref)) return undefined;
+    return { version: 2, runtime: current.ref, ...(execution ? { execution: execution.ref } : {}) };
   }
   admitInput(turnId: string, dispatchAttempt?: number, admissionId?: string): ExecutionRef {
     const execution = this.store.atomic(() => {
@@ -141,9 +155,24 @@ export class SessionController {
     const state = this.store.read(this.ref)!;
     return state.lifecycle === 'active' && !state.activeOperationId;
   }
+  /** User input is not owned by a control operation: the worker queues it
+   * across restart/resume, and an unverified suspend leaves the executor live. */
+  acceptsUserInput(): boolean {
+    return !['closing', 'closed'].includes(this.store.read(this.ref)!.lifecycle);
+  }
   prepareResume(): string | undefined {
     if (this.store.read(this.ref)!.lifecycle !== 'suspended') return this.operation()?.kind === 'resume' ? this.operation()!.operationId : undefined;
     const { operation } = this.beginControl('resume'); this.controlStarted(operation.operationId); return operation.operationId;
+  }
+  /** Operation the first runtime of a newly forked worker binds under. A new
+   * worker replaces whatever executor an unverified suspend/cancel left. */
+  prepareWorkerStart(requested?: string): string | undefined {
+    const resume = this.prepareResume(); if (requested || resume) return requested ?? resume;
+    let operation = this.operation();
+    if (operation?.phase === 'uncertain' && (operation.kind === 'suspend' || operation.kind === 'cancel')) {
+      operation = this.beginControl('restart').operation; this.controlStarted(operation.operationId);
+    }
+    return operation?.kind === 'restart' ? operation.operationId : undefined;
   }
   currentAuthority(): boolean {
     const active = eventScope.getStore();
@@ -201,7 +230,11 @@ export class SessionController {
       if (runtime && this.store.bindingProducer(this.ref, context.bindingId, channel)) {
         if (context.scope.runtime && !sameRuntime(context.scope.runtime, runtime.ref)) return { kind: 'reject', reason: 'runtime_binding_scope_mismatch' };
         const waitsForBinding = message.type === 'restart_result' && message.status === 'succeeded';
-        if (!runtime.identity && (waitsForBinding || !['ready', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'restart_result', 'session_ready_ack'].includes(message.type))) {
+        // A start that never bound can still report why it failed; that report
+        // is worker-scoped and must outlive the released reservation.
+        const failureReport = message.type === 'error' || message.type === 'worker_error' || (message.type === 'restart_result' && message.status !== 'succeeded');
+        if (!runtime.identity && !failureReport && ['stopped', 'retiring'].includes(runtime.phase)) return { kind: 'reject', reason: 'runtime_reservation_abandoned' };
+        if (!runtime.identity && !failureReport && (waitsForBinding || !['ready', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'restart_result', 'session_ready_ack'].includes(message.type))) {
           this.store.deferEvent(this.ref, context.bindingId, context.eventId, context.sequence, message);
           return { kind: 'defer', bindingId: context.bindingId };
         }
@@ -245,7 +278,7 @@ export class SessionController {
         evidence: code === 'preempted_by_user_message' ? 'caller_interrupt_boundary' : uncertainTerminal ? 'observer_loss' : 'native_terminal', ...(code ? { errorCode: code } : {}) };
     }
     if (message.type === 'final_output' && execution) event = { type: 'execution_output', execution, output: { availability: message.content ? 'available' : 'empty', ...(typeof message.content === 'string' ? { content: message.content } : {}), completeness: message.turnFailed ? 'partial' : 'final' } };
-    if (message.type === 'restart_result' && typeof message.attemptId === 'string') event = { type: 'control_result', operationId: message.attemptId, phase: message.status === 'succeeded' ? 'confirmed' : message.untouched ? 'failed_before_effect' : 'uncertain', ...(runtime ? { runtime } : {}) };
+    if (message.type === 'restart_result' && typeof message.attemptId === 'string') event = { type: 'control_result', operationId: message.attemptId, phase: message.status === 'succeeded' ? 'confirmed' : message.untouched ? 'failed_before_effect' : message.status === 'failed' ? 'rejected' : 'uncertain', ...(runtime ? { runtime } : {}), ...(message.status === 'failed' && typeof message.category === 'string' ? { error: message.category } : {}) };
     if (message.type === 'turn_interrupt_result' && context.scope.operationId) {
       const operation = this.operation(context.scope.operationId);
       if (!operation || operation.kind !== 'cancel' || operation.targetExecution?.turnId !== message.turnId

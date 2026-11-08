@@ -178,6 +178,7 @@ export function reduceSessionContract(input: ContractTransitionInput, event: Con
       if (!['active', 'resuming'].includes(session.lifecycle)) return finish('stale');
       if (['retiring', 'stopped', 'unresolved'].includes(state.runtime!.phase)) return finish('stale');
       if (session.activeOperationId && state.operation?.kind !== 'restart' && state.operation?.kind !== 'resume') return finish('stale');
+      if (event.type === 'runtime_busy' && !state.runtime!.promptReady) return finish('duplicate');
       state.runtime!.promptReady = event.type === 'runtime_ready';
       if (event.type === 'runtime_ready') { state.runtime!.phase = 'ready'; state.runtime!.promptReadySequence++; session.readinessSequence++; }
       return finish('applied');

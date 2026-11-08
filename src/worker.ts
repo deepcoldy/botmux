@@ -22368,12 +22368,17 @@ async function spawnCli(
       workerSessionEventScope?.reportAbortedStart(binding, () => send({ type: 'runtime_binding_aborted', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) }));
       throw new CliSpawnSupersededError();
     }
-    try { await spawnCliBody(cfg, opts); await publishRuntimeContract(binding); }
+    try { await spawnCliBody(cfg, opts); }
     catch (error) {
-      // Preserve the failed generation's scope even when its physical process
-      // never existed. The matching control operation decides the outcome.
+      // A replacement that never published an identity releases its
+      // reservation; otherwise it would mask the surviving runtime's exit.
+      if (!binding.identity) {
+        workerSessionEventScope?.restoreAfterAbortedStart(binding, previousBinding);
+        workerSessionEventScope?.reportAbortedStart(binding, () => send({ type: 'runtime_binding_aborted', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) }));
+      }
       throw error;
     }
+    await publishRuntimeContract(binding);
   }, execution);
 }
 
@@ -32528,6 +32533,10 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
 
     case 'runtime_binding_aborted_ack': {
       workerSessionEventScope?.confirmAbortedStart(msg.bindingId);
+      break;
+    }
+    case 'runtime_binding_refused': {
+      workerSessionEventScope?.refuseBinding(msg.bindingId);
       break;
     }
     case 'runtime_contract_reserved': {

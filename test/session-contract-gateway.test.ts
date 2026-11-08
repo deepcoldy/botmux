@@ -345,10 +345,8 @@ describe('contract gateway and real worker boundaries', () => {
     }
     if (condition === 'history_gap') {
       const checkpoint = s.store.snapshot(s.ref);
-      checkpoint.tables.events = checkpoint.tables.events.filter(row => {
-        const event = JSON.parse(row.value as string);
-        return event.type !== 'runtime_reserved' || event.runtime.ref.runtimeId !== middle.runtimeId;
-      });
+      checkpoint.tables.events = checkpoint.tables.events.filter(row => row.type !== 'runtime_reserved'
+        || JSON.parse(row.value as string).runtime.ref.runtimeId !== middle.runtimeId);
       s.store.restore(checkpoint);
     }
     if (condition === 'middle_attempt') {

@@ -263,7 +263,8 @@ const restartCoordinator = new RestartCoordinator({ persistence: {
     else if (phase === 'started') return controller.controlStarted(operationId) ? 'started' : 'joined';
     else {
       const known = controller.operation(operationId);
-      if (known?.phase !== 'confirmed' && known?.phase !== 'failed_before_effect' && known?.phase !== 'rejected') controller.controlResult(operationId, phase === 'succeeded' ? 'confirmed' : phase === 'failed_before_effect' ? 'failed_before_effect' : 'uncertain', controller.currentRuntime());
+      // A worker-reported failure is a known outcome; only silence stays uncertain.
+      if (known?.phase !== 'confirmed' && known?.phase !== 'failed_before_effect' && known?.phase !== 'rejected') controller.controlResult(operationId, phase === 'succeeded' ? 'confirmed' : phase === 'failed_before_effect' ? 'failed_before_effect' : phase === 'failed' ? 'rejected' : 'uncertain', controller.currentRuntime());
     }
     const operation = controller.operation(operationId);
     return operation?.phase === 'confirmed' || operation?.phase === 'failed_before_effect' || operation?.phase === 'rejected' ? 'terminal' : 'uncertain';
@@ -11956,7 +11957,7 @@ export function sendWorkerSessionInput(
     cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
   }
   const controller = controllerForSession(ds);
-  if (controller && !controller.allowsInput()) return false;
+  if (controller && !controller.acceptsUserInput()) return false;
   const scoped = controller && message.type === 'message' && message.turnId
     ? { ...message, sessionCommand: { version: 2 as const, execution: controller.admitInput(message.turnId, message.dispatchAttempt) } }
     : message;
@@ -16540,9 +16541,7 @@ function forkWorkerPrepared(
   }
   const runtimeController = controllerForSession(ds, true);
   if (runtimeController) {
-    const resumeOperationId = runtimeController.prepareResume();
-    const pendingOperation = runtimeController.operation();
-    initMsg.restartAttemptId ??= resumeOperationId ?? (pendingOperation?.kind === 'restart' ? pendingOperation.operationId : undefined);
+    initMsg.restartAttemptId = runtimeController.prepareWorkerStart(initMsg.restartAttemptId);
     initMsg.sessionContract = runtimeController.bindWorker(workerGeneration);
     if (initMsg.turnId) initMsg.sessionCommand = { version: 2, execution: runtimeController.admitInput(initMsg.turnId, initMsg.dispatchAttempt) };
   }
@@ -21811,7 +21810,23 @@ function setupWorkerHandlers(
             admissionStates: sessionController.store.executions(sessionController.ref).map(({ ref, runtime, phase }) => ({ ref, runtime, phase })) } as DaemonToWorker);
           for (const pending of sessionController.store.deferredEvents<WorkerToDaemon>(sessionController.ref, msg.bindingId)) await handleWorkerMessage(pending);
         }
-      } catch (error) { logger.warn(`[${t}] Runtime contract binding not confirmed: ${String(error)}`); }
+      } catch (error) {
+        logger.warn(`[${t}] Runtime contract binding not confirmed: ${String(error)}`);
+        // A refused binding never becomes current. Release its reservation so
+        // it cannot mask the surviving runtime's exit, and return the worker
+        // to that runtime's binding.
+        if (msg.type === 'runtime_binding') {
+          try {
+            if (sessionController.store.binding(sessionController.ref, msg.bindingId)?.phase === 'starting'
+              && sessionController.abandonBinding(msg.bindingId, contractWorker, metadata!.eventId, 'runtime_binding_refused')) {
+              await sessionController.flushPrimary();
+              if (ds.worker === worker && sameWorker(sessionController.store.read(sessionController.ref)!.worker, contractWorker)) {
+                worker.send({ type: 'runtime_binding_refused', bindingId: msg.bindingId } as DaemonToWorker);
+              }
+            }
+          } catch (settleError) { logger.warn(`[${t}] Refused runtime binding not settled: ${String(settleError)}`); }
+        }
+      }
       return;
     }
     let recoveredOrigin: import('../services/session-contract.js').SessionEventContext | undefined;
@@ -24169,7 +24184,7 @@ export function forkAdoptWorker(
   };
   const runtimeController = controllerForSession(ds, true);
   if (runtimeController) {
-    initMsg.restartAttemptId ??= runtimeController.prepareResume();
+    initMsg.restartAttemptId = runtimeController.prepareWorkerStart(initMsg.restartAttemptId);
     initMsg.sessionContract = runtimeController.bindWorker(workerGeneration);
   }
   setupWorkerHandlers(ds, worker, startupState, workerGeneration, stderrRing);

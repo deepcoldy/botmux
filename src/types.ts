@@ -2062,6 +2062,8 @@ export interface CodexAppEffortResult {
 type DaemonToWorkerBase =
   | { type: 'runtime_contract_reserved'; bindingId: string; mayStart: boolean; runtime?: import('./services/session-contract.js').RuntimeRef }
   | { type: 'runtime_binding_aborted_ack'; bindingId: string }
+  /** The host refused this binding; the worker returns to its predecessor. */
+  | { type: 'runtime_binding_refused'; bindingId: string }
   | { type: 'runtime_contract_assigned'; bindingId: string; runtime: import('./services/session-contract.js').RuntimeRef; mayExecute: boolean; executions?: import('./services/session-contract.js').ExecutionRef[]; admissionStates?: import('./services/session-contract.js').ExecutionAdmissionState[] }
   | { type: 'execution_contract_assigned'; bindingId: string; execution: import('./services/session-contract.js').ExecutionRef }
   | import('./services/universal-output-handoff.js').OutputHandoffReceipt
