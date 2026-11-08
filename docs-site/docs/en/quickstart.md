@@ -81,7 +81,7 @@ Running `botmux setup` on a machine that's already configured shows a menu: Add 
 
 > Want to configure from a script or an AI agent instead of the interactive UI? Use the `botmux setup add` / `botmux setup list` subcommands; `botmux setup help` shows all options.
 
-> 👋 **Welcome message on first launch**: `botmux setup add ... --welcome-message "Reply /init to get started"` (or `--welcome-message @welcome.txt` to read from a file) makes the bot DM its owner once after it first comes online; for an existing bot use `botmux setup edit <process-name|AppID> --welcome-message ...`, and `-` clears it. Delivery is recorded under `welcome-sent/` in the daemon data dir so restarts never resend; a failed send does not block startup and is retried on the next start.
+> 👋 **Welcome message on first launch**: `botmux setup add ... --welcome-message "Reply /init to get started"` (or `--welcome-message-file welcome.txt` to read it from a file) makes the bot DM its owner once after it first comes online; for an existing bot use `botmux setup edit <process-name|AppID> --welcome-message ...`, and `-` clears it. Delivery is recorded under `welcome-sent/` in the daemon data dir so restarts never resend; a failed send does not block startup and is retried on the next start. See [bots.json · Welcome message](/en/bots-json#welcome-message).
 
 ## Step 3 · Start
 
