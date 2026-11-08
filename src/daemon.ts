@@ -612,6 +612,7 @@ import {
   takeOverDurableActiveRemoteSession,
   closeCliMismatchedSessionsForBot,
   resolveScheduledTaskExecutionPosition,
+  promptHookRunsInCli,
 } from './core/session-manager.js';
 import { createGroupSecretaryRuntime, setGroupSecretaryRuntime } from './services/group-secretary-runtime.js';
 import { fetchObserveSnapshot } from './services/session-observe-command-fetch.js';
@@ -843,7 +844,7 @@ import {
 } from './workflows/v3/daemon-run.js';
 import { v3ActionActor, v3ActionRecord, v3ReasonRequiredProblem } from './workflows/v3/action-provenance.js';
 import { handNodeToHuman } from './workflows/v3/external-control.js';
-import { createWorkflowMainWake, workflowMainWakeSessionState } from './core/workflow-main-wake.js';
+import { createWorkflowMainWake, workflowMainWakeAcceptanceReported, workflowMainWakeSessionState } from './core/workflow-main-wake.js';
 import { buildV3GateCard } from './im/lark/v3-gate-card.js';
 import { buildV3RerunGrantCard, buildV3RevisionCard } from './im/lark/v3-revision-card.js';
 import {
@@ -7233,6 +7234,12 @@ const workflowMainWake = createWorkflowMainWake({
   // The cascade's idle evidence (cli-idle-wait); until restore re-attached
   // the CLIs that survived a restart, every session counts as busy.
   sessionState: (sessionId) => workflowMainWakeSessionState(findActiveBySessionId(sessionId), { sessionsRestored }),
+  // Claude Code's UserPromptSubmit hook and its transcript receipt tell when
+  // the CLI took a wake's text.
+  provesInputAcceptance: (sessionId) => {
+    const ds = findActiveBySessionId(sessionId);
+    return !!ds && workflowMainWakeAcceptanceReported(ds, getBot(ds.larkAppId).config.cliId, promptHookRunsInCli);
+  },
   deliver: (request, internal) => triggerSessionTurn(request, { larkAppId: workflowSelfAppId(), activeSessions }, internal),
   drive: (runId) => v3GateRunner.driveDetached(runId),
   listRunIds: () => {
@@ -33310,6 +33317,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         logger.warn(`[group-context] native input receipt names another conversation; background may repeat turn=${receipt.turnId.slice(0, 12)}`);
         return;
       }
+      workflowMainWake.onInputAccepted(ds.session.sessionId, receipt.turnId);
       try {
         const restored = ds.session.deploymentContinuation;
         const authority = deploymentContinuationAuthority(ds);
@@ -33340,6 +33348,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           workerGeneration: context.workerGeneration },
         { kind: receipt.proofKind, ...(receipt.nativeTurnId ? { nativeTurnId: receipt.nativeTurnId } : {}) });
       } catch { logger.warn('[group-context] native input receipt unavailable; background may repeat'); }
+    },
+    onPromptSubmittedInput(ds, turnId, context) {
+      if (ds.session.workerGeneration !== context.workerGeneration) return;
+      workflowMainWake.onInputAccepted(ds.session.sessionId, turnId);
     },
     async onTurnTerminal(ds, terminal, context) {
       workflowMainWake.onTurnEnded(ds.session.sessionId, terminal.turnId);

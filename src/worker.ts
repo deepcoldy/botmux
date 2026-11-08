@@ -27,6 +27,7 @@ import type { Duplex } from 'node:stream';
 import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
 import {claudeActionPrompt} from './services/claude-action-prompt.js';
+import { WrittenInputLedger } from './services/prompt-submission-match.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
 import { CODEX_CONFIG_FILE, seedIsolatedCodexHome } from './services/codex-isolated-config.js';
 import { supportsZeroPromptInjection } from './core/prompt-injection.js';
@@ -8403,6 +8404,8 @@ let pendingRestartInterruption: InterruptedWork | undefined;
 /** The last input written to the CLI: the turn a standalone restart note
  *  continues when nothing else is queued. */
 let lastWrittenCliInput: PendingCliInput | undefined;
+/** Turns written to the CLI, until its prompt hook reports submitting one. */
+const writtenInputs = new WrittenInputLedger();
 let restoredDeploymentTurnId: string | undefined;
 /** When this worker saw its previous CLI process end (exit callback, or its
  *  own teardown). Lets the scan tell the process's exit kills from a task
@@ -9104,6 +9107,7 @@ function saveUnsentInputsForSuccessor(reason: string): void {
  *  continues, and a restored predecessor input is no longer outstanding. */
 function noteCliInputWritten(item: PendingCliInput): void {
   lastWrittenCliInput = item;
+  if (item.turnId) writtenInputs.noteWritten(item.turnId, item.content);
   if (restoredUnsentInputs.delete(item) && restoredUnsentInputs.size === 0) {
     const unsentPath = unsentInputJournalPath();
     if (unsentPath) try { settleTakenUnsentInputs(unsentPath); } catch { /* next take reports it */ }
@@ -34060,6 +34064,8 @@ process.on('message', async (raw: unknown, handle: unknown) => {
         // 遗留的上一轮已终态 turnId，防止边沿更新误归因到历史 turn。
         publishScreenStatus('working', { force: true, clearTurnId: true });
       }
+      const submittedTurnId = writtenInputs.takeSubmitted(msg);
+      if (submittedTurnId) send({ type: 'prompt_submitted_input', turnId: submittedTurnId });
       break;
     }
 
