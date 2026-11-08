@@ -966,6 +966,7 @@ import {
 import { clearAllSessionIdentities, collectProvenIdentityContents } from './cli-identity.js';
 import {
   identityBindingAllowsProven,
+  larkToolBindingEffective,
   type IdentityStorageModel,
 } from './lark-tool-binding.js';
 import { larkToolDelegationTurnIds } from './lark-tool-delegation.js';
@@ -1626,6 +1627,7 @@ function provenStructurallyPossible(ds: DaemonSession): boolean {
     larkAppId: ds.larkAppId,
     chatId: ds.chatId,
     apiOnly: bot.apiOnly,
+    headless: ds.session.headless,
     adoptMode: !!ds.session.adoptedFrom,
     existingAppServerEndpoint: ds.session.existingAppServerEndpoint,
     backendType: ds.session.backendType ?? bot.backendType ?? config.daemon.backendType,
@@ -7494,8 +7496,14 @@ export function resolveSessionEnvForSession(
     skipBotSet: !!(ds.session?.cliLaunchSnapshot || ds.session?.cliInstanceBinding),
     // Same session facts the worker's usesLarkToolBinding sees.
     facts: {
-      larkBindingOff: !larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly })
-        || ds.session?.existingAppServerEndpoint !== undefined,
+      larkBindingOff: !larkToolBindingEffective({
+        chatId: ds.chatId,
+        apiOnly: botCfg.apiOnly,
+        headless: ds.session?.headless,
+        adoptMode: !!ds.session?.adoptedFrom,
+        existingAppServerEndpoint: ds.session?.existingAppServerEndpoint,
+        backendType,
+      }),
     },
   });
   const protectedKeys = new Set(protectedMcpCurrentRedactedEnvKeys(

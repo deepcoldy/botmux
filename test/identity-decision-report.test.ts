@@ -24,6 +24,7 @@ import {
   identityStorageModelForDaemonSession,
   recordWorkerIdentityDecision,
 } from '../src/core/worker-pool.js';
+import { headlessChatId } from '../src/services/headless-session-store.js';
 function sessionFixture(extra: Record<string, unknown> = {}): any {
   return {
     session: {
@@ -139,6 +140,30 @@ describe('fail-closed on impossible or malformed reports', () => {
       model: 'proven', sandboxEngaged: false, loopbackShared: true,
     });
     expect(identityDecisionConflict(ds)).toBeTruthy();
+    expect(identityStorageModelForDaemonSession(ds)).toBe('single');
+  });
+
+  it('honors a proven report from a verified headless session, whose worker runs the binding without chat transport', () => {
+    const ds = sessionFixture({
+      chatId: headlessChatId('hl_decision01'),
+      sessionExtra: { headless: { id: 'hl_decision01', source: 'cli', createdAt: '2026-11-08T00:00:00.000Z' } },
+    });
+    recordWorkerIdentityDecision(ds, worker, 9, {
+      model: 'proven', sandboxEngaged: false, loopbackShared: true,
+    });
+    expect(identityDecisionConflict(ds)).toBeUndefined();
+    expect(identityStorageModelForDaemonSession(ds)).toBe('proven');
+  });
+
+  it('refuses a proven report when the headless record does not own the session chat', () => {
+    const ds = sessionFixture({
+      chatId: headlessChatId('hl_someoneelse01'),
+      sessionExtra: { headless: { id: 'hl_decision01', source: 'cli', createdAt: '2026-11-08T00:00:00.000Z' } },
+    });
+    recordWorkerIdentityDecision(ds, worker, 9, {
+      model: 'proven', sandboxEngaged: false, loopbackShared: true,
+    });
+    expect(identityDecisionConflict(ds)).toMatch(/structurally cannot run proven/);
     expect(identityStorageModelForDaemonSession(ds)).toBe('single');
   });
 

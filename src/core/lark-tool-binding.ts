@@ -81,19 +81,35 @@ export function larkToolIdentityEnabled(config: { chatId: string; apiOnly?: bool
       && headlessChatId(config.headless.id) === config.chatId);
 }
 
-/** Ordinary local and headless sessions adopt the lark-cli binding unless explicitly disabled (larkToolBinding === false).
- * Old/adopt/remote/workflow sessions do not use it.
- * Note: _dataDir, resume, forkSession are preserved for caller signature compatibility. */
-export function usesLarkToolBinding(config: {
-  sessionId: string; larkAppId: string; chatId: string; apiOnly?: boolean;
+/** Session facts that decide whether the managed lark-cli wrapper applies. */
+export interface LarkToolBindingFacts {
+  chatId: string;
+  apiOnly?: boolean;
   headless?: { id: string; source: string };
-  resume?: boolean; forkSession?: boolean; adoptMode?: boolean; existingAppServerEndpoint?: string;
+  adoptMode?: boolean;
+  existingAppServerEndpoint?: string;
+  /** The backend the session actually runs on, not the bot's default. */
   backendType: import('../adapters/backend/types.js').BackendType;
+}
+
+/** Whether this session shape runs the managed lark-cli wrapper, before the
+ * bot's own larkToolBinding switch. The worker decides its spawn from this and
+ * daemon-side mirrors (session env lock, identity model check) must too, or the
+ * two sides disagree about whether ZDOTDIR/BASH_ENV belong to botmux.
+ * Old/adopt/remote/workflow sessions and external app-servers do not use it. */
+export function larkToolBindingEffective(config: LarkToolBindingFacts, workflow = false): boolean {
+  return !(workflow || config.adoptMode || config.existingAppServerEndpoint
+    || isRemoteBackendId(config.backendType) || !larkToolIdentityEnabled(config));
+}
+
+/** Ordinary local and headless sessions adopt the lark-cli binding unless explicitly disabled (larkToolBinding === false).
+ * Note: _dataDir, resume, forkSession are preserved for caller signature compatibility. */
+export function usesLarkToolBinding(config: LarkToolBindingFacts & {
+  sessionId: string; larkAppId: string;
+  resume?: boolean; forkSession?: boolean;
   larkToolBinding?: boolean;
 }, _dataDir?: string, workflow = false): boolean {
-  if (workflow || config.adoptMode || config.existingAppServerEndpoint
-    || isRemoteBackendId(config.backendType) || !larkToolIdentityEnabled(config)) return false;
-  return config.larkToolBinding !== false;
+  return larkToolBindingEffective(config, workflow) && config.larkToolBinding !== false;
 }
 
 /**
@@ -142,16 +158,8 @@ export function resolveIdentityStorageModel(input: {
  *  uses this solely to fail closed when a worker reports `proven` for a
  *  session whose structure cannot run proven (e.g. binding disabled after a
  *  daemon restart with newer config). */
-export function identityBindingAllowsProven(input: {
+export function identityBindingAllowsProven(input: Parameters<typeof usesLarkToolBinding>[0] & {
   platform: NodeJS.Platform;
-  sessionId: string;
-  larkAppId: string;
-  chatId: string;
-  apiOnly?: boolean;
-  adoptMode?: boolean;
-  existingAppServerEndpoint?: string;
-  backendType: import('../adapters/backend/types.js').BackendType;
-  larkToolBinding?: boolean;
 }): boolean {
   return input.platform === 'linux' && usesLarkToolBinding(input);
 }
@@ -289,8 +297,8 @@ export function hasLarkToolBinding(dataDir: string, sessionId: string): boolean 
   catch { return false; }
 }
 
-export function larkToolPrompt(appId: string, locale?: string, noTransport = false): string {
-  if (noTransport) return locale === 'en'
+export function larkToolPrompt(appId: string, locale?: string, headlessNoUserChannel = false): string {
+  if (headlessNoUserChannel) return locale === 'en'
     ? `lark-cli uses application ${appId}. Calls default to this bot. This headless session has no human authorization channel; --as user is unavailable. If the bot lacks access, report the blocked resource through the session result channel so the caller can resolve it. Do not change profiles or repeat writes whose result is uncertain.`
     : `lark-cli 固定使用当前机器人的应用 ${appId}，默认以 bot 身份调用。本后台会话没有真人授权通道，--as user 不可用。bot 无权时，通过会话结果通道报告受阻资源，由调用方处理权限。不要切换 profile，也不要重复执行结果尚不确定的写操作。`;
   return locale === 'en'
