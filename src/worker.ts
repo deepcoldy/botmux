@@ -20482,9 +20482,18 @@ async function flushPending(): Promise<void> {
   let promptReadyDeferred = false;
   // The write of `item` settled: prompts on screen belong to the CLI again
   // and its bridge mark's TTL starts now.
-  const settleSubmission = (item: PendingCliInput): void => {
+  const settleSubmission = (item: PendingCliInput, submitted = false): void => {
     const inFlight = cliSubmissionInFlight;
     if (!inFlight || inFlight.item !== item) return;
+    // The daemon may still hold the idle this write started from, and a suspend
+    // queued behind the backlog fires on the report below: put the turn the CLI
+    // just took ahead of it. Forced, so a stale usage banner cannot read as
+    // `limited`, which also fulfils queued suspends.
+    if (submitted && publishedCliInputBacklog !== undefined
+      && inFlight.generation === cliSpawnGeneration
+      && projectedRuntimeScreenStatus() === 'working') {
+      publishScreenStatus('working', { force: true });
+    }
     cliSubmissionInFlight = null;
     if (inFlight.bridgeTurnId) bridgeQueue.releaseWriteHold(inFlight.bridgeTurnId, item.dispatchAttempt);
     if (inFlight.readyDeferred) {
@@ -21274,7 +21283,7 @@ async function flushPending(): Promise<void> {
         }
         break;
       } finally {
-        settleSubmission(item);
+        settleSubmission(item, result?.submitted === true);
       }
       if (isCodexAppCliId(lastInitConfig?.cliId)
         && item.turnId

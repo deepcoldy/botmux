@@ -58,9 +58,12 @@ function wokenClaudeWorker(opts: { promptReady?: boolean; transcriptPath?: strin
     maybeQueuePostSubmitNativeSessionTitle: () => false,
     settleStaleWriteContinuation,
     redriveRejectedStructuredReady: vi.fn(() => { redriven.push(scope.structuredRejectedReadyEvidenceGeneration); }),
+    renderer: { snapshot: () => ({ content: 'claude composer', changed: false }), markNewTurn: vi.fn() },
+    backgroundWaitPayload: () => ({}),
   });
   scope.deferTurnInputCommitUntilSubmission = loadWorkerFunction('deferTurnInputCommitUntilSubmission', scope);
   scope.markPromptReady = loadWorkerFunction('markPromptReady', scope);
+  scope.publishScreenStatus = loadWorkerFunction('publishScreenStatus', scope);
   scope.cliInputBacklogKey = loadWorkerFunction('cliInputBacklogKey', scope);
   scope.cliInputBacklog = loadWorkerFunction('cliInputBacklog', scope);
   scope.publishCliInputBacklog = loadWorkerFunction('publishCliInputBacklog', scope);
@@ -136,10 +139,27 @@ describe('a woken worker typing its first message into the CLI', () => {
     h.ipc.length = 0;
     h.finishWrite({ submitted: true });
     await flushing;
-    // Reported as soon as the write settles, not with whatever is sent next.
-    expect(h.ipc).toEqual([{ type: 'cli_input_backlog', pending: false }]);
+    // Reported as soon as the write settles, not with whatever is sent next,
+    // and behind the turn the CLI just took: until then the daemon holds the
+    // idle this write started from, which a queued suspend reads as settled.
+    expect(h.ipc).toEqual([
+      expect.objectContaining({ type: 'screen_update', status: 'working' }),
+      { type: 'cli_input_backlog', pending: false },
+    ]);
     h.send({ type: 'prompt_ready' });
     expect(h.ipc.at(-1)).toEqual({ type: 'prompt_ready' });
+    h.submitFailureChains.clear();
+  });
+
+  it('reports no turn for a write the CLI did not take', async () => {
+    const h = wokenClaudeWorker();
+    h.scope.publishedCliInputBacklog = h.scope.cliInputBacklogKey({ pending: false });
+    const flushing = h.flush();
+    await untilWriting(h);
+
+    h.finishWrite({ submitted: false, recheck: vi.fn(async () => false) });
+    await flushing;
+    expect(h.ipc.filter(m => m.type === 'screen_update')).toEqual([]);
     h.submitFailureChains.clear();
   });
 

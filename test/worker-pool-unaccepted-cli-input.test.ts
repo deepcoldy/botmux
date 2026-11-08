@@ -253,6 +253,27 @@ describe('a session whose CLI has not taken its message yet', () => {
     expect(woken.pendingSuspendReason).toBeUndefined();
   });
 
+  it('keeps a suspend queued during the write off the turn that write opened, until that turn ends', async () => {
+    const { worker, woken } = overCapWithOnlyTheWokenSessionIdle();
+    worker.emit('message', { type: 'cli_input_backlog', pending: true, writingTurnId: WAKE_TURN });
+    worker.emit('message', { type: 'cli_install_changed', runningVersion: '1.1.0', installedVersion: '1.3.0' });
+    await flush();
+
+    // What the worker sends once the CLI takes the message.
+    worker.emit('message', { type: 'screen_update', content: '', status: 'working', turnId: WAKE_TURN });
+    worker.emit('message', { type: 'cli_input_backlog', pending: false });
+    await flush();
+
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'suspend' });
+    expect(woken.worker).toBe(worker);
+
+    worker.emit('message', { type: 'screen_update', content: '', status: 'idle', turnId: WAKE_TURN });
+    await flush();
+
+    expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
+    expect(woken.worker).toBe(null);
+  });
+
   it('tells the user when a deliberate suspend retires the worker mid-write, even if the write then fails', () => {
     const { worker, woken } = overCapWithOnlyTheWokenSessionIdle();
     worker.emit('message', { type: 'cli_input_backlog', pending: true, writingTurnId: WAKE_TURN });
