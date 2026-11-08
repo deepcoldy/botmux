@@ -5684,6 +5684,7 @@ export function createLarkEventDispatcherRuntime(
         //
         // 唯一留在闸门里的 bot 专属逻辑是下面的 cross-ref 冷启动自愈：它不是一条
         // 授权来源，而是「同部署兄弟 bot 的身份还没学到」这个**识别**问题的补救。
+        let siblingAuthorized = false;
         if (!botTalk.allowed) {
           // 黑名单 bot：静默 return，不做 sibling 冷启动自愈（否则被黑的同部署
           // 兄弟 bot 会经这条识别补救旁路绕过否决腿直接路由）、不发授权卡。
@@ -5703,6 +5704,7 @@ export function createLarkEventDispatcherRuntime(
           const sibling = await resolveSiblingBotBySenderOpenId(larkAppId, chatId, senderOpenId)
             .catch((err): { ok: false; reason: string } => ({ ok: false, reason: `resolve_threw: ${err?.message ?? String(err)}` }));
           if (sibling.ok) {
+            siblingAuthorized = true;
             // Persist the newly-proven mapping so subsequent @s from this
             // sibling hit isKnownPeerBot directly (no live API roundtrip).
             updateBotOpenIdCrossRef(config.session.dataDir, larkAppId, [
@@ -5726,15 +5728,36 @@ export function createLarkEventDispatcherRuntime(
         }
         logger.info(`Bot-to-bot @mention detected (scope=${ctx.scope}): routing to handleThreadReply`);
         const routedCtx = { ...ctx, chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger };
+        // Only substitute turns add a post-wait check; ordinary direct mentions
+        // retain their existing delivery path and downstream permission gates.
+        const deliverBotMessage = async () => {
+          if (substituteRoute?.kind === 'trigger') {
+            const currentTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
+            if (currentTalk.reason === 'blocked' || (!currentTalk.allowed && !siblingAuthorized)) {
+              logger.info(`[substitute:${larkAppId}] sender lost talk access while queued msg=${messageId.substring(0, 12)}`);
+              return;
+            }
+            const current = decideSubstituteMessageRoute({
+              larkAppId, message, chatType,
+              ownsSession: () => handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false,
+            }, substituteRoute.chatMode);
+            if (current.kind !== 'trigger') {
+              logger.info(`[substitute:${larkAppId}] App ID route changed while queued (${current.kind}) msg=${messageId.substring(0, 12)}`);
+              return;
+            }
+            routedCtx.substituteTrigger = current.trigger;
+          }
+          await handlers.handleThreadReply(data, routedCtx);
+        };
         if (primary) {
           preparePrimaryRoutingContext(routedCtx, primary);
           if (await assertPrimaryRouteOwner(routedCtx, primary) === 'retry') {
             return primaryResult(routedCtx, primary);
           }
-          await serializeByAnchor(ctx.anchor, () => handlers.handleThreadReply(data, routedCtx), 0);
+          await serializeByAnchor(ctx.anchor, deliverBotMessage, 0);
           return primaryResult(routedCtx, primary);
         }
-        void serializeByAnchor(ctx.anchor, () => handlers.handleThreadReply(data, routedCtx), 0)
+        void serializeByAnchor(ctx.anchor, deliverBotMessage, 0)
           .catch(err => logger.error(`Error handling bot @mention: ${err}`));
         return;
       }

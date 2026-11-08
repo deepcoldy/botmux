@@ -7051,6 +7051,70 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(mockGetMessageDetail).toHaveBeenCalledTimes(hit ? 2 : 0);
   });
 
+  it.each([false, true])('ordinary bot direct mentions retain queue delivery with substitute configured=%s', async configured => {
+    const bot = setupBotState({
+      allowedUsers: [USER_OPEN_ID, OTHER_BOT_OPEN_ID],
+      substituteMode: configured ? { enabled: true, targets: [{ appId: 'cli_external' }] } : undefined,
+    });
+    mockGetChatMode.mockResolvedValue('topic');
+    let release!: () => void;
+    handlers.handleThreadReply.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    const event = (messageId: string) => makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID, messageId, rootId: 'om_direct_queue', chatId: 'oc_direct_queue',
+      content: JSON.stringify({ text: '@_user_1 help' }),
+      mentions: [{ key: '@_user_1', name: 'Receiver', id: { open_id: MY_OPEN_ID } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](event('om_direct_first'));
+    await flushEventWork();
+    expect(handlers.handleThreadReply).toHaveBeenCalledTimes(1);
+    try {
+      await capturedHandlers['im.message.receive_v1'](event('om_direct_second'));
+      await flushEventWork();
+      expect(handlers.handleThreadReply).toHaveBeenCalledTimes(1);
+      bot.config.allowedUsers = bot.resolvedAllowedUsers = [USER_OPEN_ID];
+    } finally { release(); }
+    await flushEventWork();
+    expect(handlers.handleThreadReply).toHaveBeenCalledTimes(2);
+    expect(mockGetMessageDetail).not.toHaveBeenCalled();
+    expect(mockIsSubstituteEnabledForChat).not.toHaveBeenCalled();
+  });
+
+  it.each(['disable', 'remove-target', 'revoke', 'block', 'exclude-chat', 'chat-off', 'add-keyword'])
+    ('App ID substitute rechecks %s after waiting in its queue', async change => {
+      const bot = setupBotState({
+        allowedUsers: [USER_OPEN_ID, OTHER_BOT_OPEN_ID],
+        substituteMode: { enabled: true, targets: [{ appId: 'cli_external' }] },
+      });
+      mockGetChatMode.mockResolvedValue('topic');
+      let release!: () => void;
+      handlers.handleThreadReply.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+      const event = (messageId: string) => makeBotMessageEvent({
+        senderOpenId: OTHER_BOT_OPEN_ID, messageId, rootId: 'om_substitute_queue', chatId: 'oc_substitute_queue',
+        content: JSON.stringify({ text: '@_user_1 help' }),
+        mentions: [{ key: '@_user_1', name: 'External', id: { app_id: 'cli_external' } }],
+      });
+      await capturedHandlers['im.message.receive_v1'](event('om_substitute_first'));
+      await flushEventWork();
+      expect(handlers.handleThreadReply).toHaveBeenCalledTimes(1);
+      try {
+        await capturedHandlers['im.message.receive_v1'](event('om_substitute_second'));
+        await flushEventWork();
+        expect(handlers.handleThreadReply).toHaveBeenCalledTimes(1);
+        if (change === 'disable') bot.config.substituteMode!.enabled = false;
+        if (change === 'remove-target') bot.config.substituteMode!.targets = [];
+        if (change === 'revoke') bot.config.allowedUsers = bot.resolvedAllowedUsers = [USER_OPEN_ID];
+        if (change === 'block') {
+          bot.config.allowedUsers = bot.resolvedAllowedUsers = [USER_OPEN_ID];
+          bot.resolvedBlockedUsers.push(OTHER_BOT_OPEN_ID);
+        }
+        if (change === 'exclude-chat') bot.config.substituteMode!.excludedChats = ['oc_substitute_queue'];
+        if (change === 'chat-off') mockIsSubstituteEnabledForChat.mockReturnValue(false);
+        if (change === 'add-keyword') bot.config.substituteMode!.keywords = ['oncall'];
+      } finally { release(); }
+      await flushEventWork();
+      expect(handlers.handleThreadReply).toHaveBeenCalledTimes(1);
+    });
+
   it('App ID substitute never substitutes an unrelated same-name bot', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID], substituteMode: { enabled: true, targets: [{ appId: 'cli_external' }] } });
     mockGetChatMode.mockResolvedValue('topic');
