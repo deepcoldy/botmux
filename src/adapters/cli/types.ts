@@ -866,6 +866,16 @@ export interface CliAdapter {
    *  and the screen decides, as it does without OSC 7501. */
   readonly programStatusSubmitAwaitsBusy?: boolean;
 
+  /** The CLI reports an OSC 7501 terminal state (idle) before its composer
+   *  accepts input: omp 18.10 reports `idle` from `InteractiveMode.init()`
+   *  before its `session_start` hooks run, and a paste + Enter in that window
+   *  is dropped while writeInput still reports success. When true, IdleDetector
+   *  ignores idle/done/error reports until this process has published a first
+   *  idle from other evidence (screen quiescence / transcript) or reported
+   *  `working`/`blocked`; startup readiness stays on the screen heuristics, as
+   *  with program status off. Later reports are authoritative as usual. */
+  readonly programStatusStartupIdleUntrusted?: boolean;
+
   /** A structured terminal closes the business turn but does not by itself
    *  prove the PTY composer is writable. On an authoritative local screen,
    *  require fresh composer evidence (`staticBusyClearPattern`, falling back
@@ -947,8 +957,8 @@ export interface CliAdapter {
    *  free-text option, so this list is curation, not a hard whitelist. */
   readonly modelChoices?: readonly string[];
 
-  /** Optional live model discovery: enumerate the models this CLI can actually
-   *  use right now (e.g. `traex debug models` prints its full catalogue as
+  /** Optional live model discovery: enumerate configured model candidates,
+   *  not a guarantee of successful API access (e.g. `traex debug models` prints its full catalogue as
    *  JSON). The dashboard model picker invokes it on demand for the SELECTED
    *  CLI only — never in a scan over all adapters — and merges the result with
    *  `modelChoices`. Contract:
@@ -959,7 +969,7 @@ export interface CliAdapter {
    *    JSON can be hundreds of KB;
    *  - absent = the CLI cannot enumerate its models; the picker shows
    *    `modelChoices` only. */
-  readonly detectModels?: () => Promise<readonly string[] | null>;
+  readonly detectModels?: (options?: { env?: NodeJS.ProcessEnv }) => Promise<readonly string[] | null>;
 
   /** Optional richer form of {@link detectModels}. Adapters that already parse
    *  a model catalogue should implement this and derive detectModels from it,

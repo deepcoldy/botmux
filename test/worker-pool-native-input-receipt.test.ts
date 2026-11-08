@@ -159,6 +159,31 @@ function makeDs(worker: any): DaemonSession {
 
 async function flush(): Promise<void> { await new Promise(resolve => setTimeout(resolve, 0)); }
 
+describe('prompt_submitted_input fencing', () => {
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('delivers the live generation\'s match and drops a replaced worker\'s or an older generation\'s', async () => {
+    const onPromptSubmittedInput = vi.fn();
+    initWorkerPool({ sessionReply: vi.fn(), getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn(), onPromptSubmittedInput } as any);
+    const worker = makeFakeWorker();
+    const ds = makeDs(worker);
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const match = { type: 'prompt_submitted_input', turnId: 'workflow-event:run-1:3' };
+    worker.emit('message', match);
+    await flush();
+    expect(onPromptSubmittedInput).toHaveBeenCalledWith(ds, 'workflow-event:run-1:3', { workerGeneration: ds.session.workerGeneration });
+    onPromptSubmittedInput.mockClear();
+    ds.worker = makeFakeWorker();
+    worker.emit('message', match);
+    await flush();
+    ds.worker = worker;
+    ds.session.workerGeneration = (ds.session.workerGeneration ?? 1) + 1;
+    worker.emit('message', match);
+    await flush();
+    expect(onPromptSubmittedInput).not.toHaveBeenCalled();
+  });
+});
+
 describe('native_input_consumed fencing', () => {
   beforeEach(() => { vi.clearAllMocks(); });
 

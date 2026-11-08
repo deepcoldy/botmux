@@ -24,7 +24,8 @@ import { composeEntries, sortByStatus, paginate, composeDetail } from '../../das
 import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
 import type { SessionRow } from '../../core/dashboard-rows.js';
 import { config } from '../../config.js';
-import { formatUrlHost } from '../../core/dashboard-url.js';
+import { localHttpOrigin } from '../../core/dashboard-url.js';
+import { sendableCardLink } from './local-address-context.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from '../../core/close-residual.js';
 import { type Locale, t } from '../../i18n/index.js';
 
@@ -582,15 +583,19 @@ function mapResumeDisabledReason(reasonKey: string | undefined): string | undefi
  *  the session has no port at all (e.g. closed / starting).
  *
  *  Closed sessions can carry a stale webPort, so closed rows are always
- *  rejected here even if the raw row still has a port value. */
+ *  rejected here even if the raw row still has a port value.
+ *
+ *  The direct-port link carries no capability, so on this machine's own
+ *  interface it looks like any local service and Lark would reject the whole
+ *  card; it is left out there. */
 export function buildSessionTerminalUrl(row: SessionRow): string | null {
   if (row.status === 'closed') return null;
-  const host = formatUrlHost(config.web.externalHost);
   if (typeof row.proxyPort === 'number' && row.proxyPort > 0) {
-    return `http://${host}:${row.proxyPort}/s/${encodeURIComponent(row.sessionId)}`;
+    return `${localHttpOrigin(config.web.externalHost, row.proxyPort)}/s/${encodeURIComponent(row.sessionId)}`;
   }
   if (typeof row.webPort === 'number' && row.webPort > 0) {
-    return `http://${host}:${row.webPort}`;
+    const url = localHttpOrigin(config.web.externalHost, row.webPort);
+    return sendableCardLink(url) ? url : null;
   }
   return null;
 }

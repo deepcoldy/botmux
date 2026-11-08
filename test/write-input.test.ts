@@ -289,6 +289,61 @@ function decodeRunnerLine(line: string, prefix: string): any {
 // 1. Single-line content
 // =========================================================================
 
+describe('Pi paste submission', () => {
+  it.each(['tmux', 'raw'] as const)('%s preserves trailing backslashes and submits exactly once', async (mode) => {
+    for (const content of ['path\\', '\\', 'path\\\\', '第一行\n\npath\\', 'x'.repeat(2_000) + '\\', 'plain\ntext', 'path\\\n']) {
+      let composer = '';
+      const submitted: string[] = [];
+      // Model Pi's editor boundary, not the adapter's write sequence: Enter
+      // after a backslash inserts a newline; otherwise submit trims the value.
+      const enter = () => {
+        if (composer.endsWith('\\')) composer = composer.slice(0, -1) + '\n';
+        else {
+          submitted.push(composer.trim());
+          composer = '';
+        }
+      };
+      const write = (text: string) => {
+        if (text === '\r') enter();
+        else {
+          expect(text.startsWith('\x1b[200~')).toBe(true);
+          expect(text.endsWith('\x1b[201~')).toBe(true);
+          composer += text.slice(6, -6);
+        }
+      };
+      const pty: PtyHandle = mode === 'raw' ? { write } : {
+        write,
+        pasteText: text => { composer += text; },
+        sendSpecialKeys: key => {
+          expect(key).toBe('Enter');
+          enter();
+        },
+      };
+      await createPiAdapter('/bin/pi').writeInput(pty, content);
+      expect(submitted).toEqual([content.trim()]);
+      expect(composer).toBe('');
+    }
+  });
+
+  it.each(['tmux', 'raw'] as const)('%s pastes content without a trailing backslash byte for byte', async (mode) => {
+    vi.useFakeTimers();
+    try {
+      for (const content of ['plain', 'a\\b', 'path\\\n', '第一行\n\n第二行 ', '\\ leading']) {
+        const pasted: string[] = [];
+        const pty: PtyHandle = mode === 'raw'
+          ? { write: text => { if (text !== '\r') pasted.push(text); } }
+          : { write: () => {}, pasteText: text => { pasted.push(text); }, sendSpecialKeys: () => true };
+        const write = createPiAdapter('/bin/pi').writeInput(pty, content);
+        await flushFakeTimers(2_000);
+        await write;
+        expect(pasted).toEqual([mode === 'raw' ? `\x1b[200~${content}\x1b[201~` : content]);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe('writeInput: single-line, tmux mode', () => {
   it.each([...HUMAN_TYPING_ADAPTERS, ...PLAIN_ADAPTERS, OPENCODE_ADAPTER])('%s: sendText + Enter, no pasteText', async (_name, adapter) => {
     const pty = makeTmuxPty();

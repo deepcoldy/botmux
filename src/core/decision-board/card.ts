@@ -63,6 +63,8 @@ export interface DecisionCardInput {
   links: { url?: string; appLink?: string };
   /** 当前状态下（进入待拍板之后）最近的一次决定；没有就不显示。 */
   status?: CardDecisionStatus;
+  /** 这一项附了几个图文说明（说明页 / 视频）；卡片里放不下，只提示去看板上看。 */
+  explainers?: number;
   /**
    * 卡片不再是入口时只给链接：'disabled' = 关了「飞书卡片拍板」或管家；'moved' = 管家群换了，
    * 新卡片在新群；'replaced' = 这张已被同一项更新的卡片顶替。
@@ -86,6 +88,7 @@ const TEXT = {
     tooBig: '内容太长，卡片放不下，去看板上拍板。',
     notDeciding: (state: string) => `这一项现在是「${state}」，不再待拍板。`,
     noLink: (seq: number) => `到 Dashboard 的决策看板 #${seq} 处理。`,
+    explainers: (n: number) => `📎 附了 ${n} 个图文说明（说明页 / 视频），去看板上查看`,
     footer: '只有看板 owner 能点；同一项在卡片和网页上都提交时，以后提交的为准。',
     chose: (label: string, web: boolean) => web ? `网页上已选 **${label}**` : `已选 **${label}**`,
     noteSubmitted: (web: boolean) => web ? '网页上已提交说明' : '已提交说明',
@@ -115,6 +118,7 @@ const TEXT = {
     tooBig: 'Too long for a card. Decide on the board.',
     notDeciding: (state: string) => `This item is now "${state}" and no longer awaits a decision.`,
     noLink: (seq: number) => `Open item #${seq} in the Dashboard decision board.`,
+    explainers: (n: number) => `📎 ${n} explainer${n === 1 ? '' : 's'} attached (page / video); view on the board`,
     footer: 'Only the board owner can click. If both the card and the web page submit, the later one wins.',
     chose: (label: string, web: boolean) => web ? `Picked **${label}** on the web` : `Picked **${label}**`,
     noteSubmitted: (web: boolean) => web ? 'Note submitted on the web' : 'Note submitted',
@@ -212,6 +216,7 @@ function linkOnlyCard(input: DecisionCardInput, template: string, notice: string
   const label = BOARD_STATE_LABELS[input.locale === 'en' ? 'en' : 'zh'][item.state];
   const body: string[] = [];
   if (item.summary) body.push(`**${L.summary}**：${md(clip(oneLine(item.summary), SUMMARY_CHARS))}`);
+  if (input.explainers) body.push(L.explainers(input.explainers));
   if (input.status) body.push(statusLine(input.status, input.locale));
   body.push(notice);
   if (!input.links.url) body.push(L.noLink(item.seq));
@@ -229,6 +234,7 @@ function openCard(input: DecisionCardInput): Record<string, unknown> {
   const ask = decisionAskKey(item);
   const top: string[] = [];
   if (item.summary) top.push(`**${L.summary}**：${md(clip(oneLine(item.summary), SUMMARY_CHARS))}`);
+  if (input.explainers) top.push(L.explainers(input.explainers));
   if (item.question) top.push(`**${L.question}**：${md(clip(item.question, QUESTION_CHARS))}`);
   const optionLines = item.options.map(o => {
     const rec = o.key === item.recommend ? (loc === 'en' ? ` **(${L.recommend})**` : `**（${L.recommend}）**`) : '';
@@ -338,8 +344,10 @@ export class DecisionCards {
     const item = store.getItem(app, seq);
     if (!item) return undefined;
     const effectiveRetired = retired ?? (this.enabled() ? undefined : 'disabled' as const);
+    const explainers = store.explainerCounts(app).get(seq);
     const card = buildDecisionCard({
       appId: app, locale: this.deps.locale(), item, links: this.deps.links(seq), status: this.status(item),
+      ...(explainers ? { explainers } : {}),
       ...(effectiveRetired ? { retired: effectiveRetired } : {}),
     });
     return { card, hash: decisionCardHash(card) };

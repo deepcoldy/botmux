@@ -2,6 +2,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { readLarkToolBinding, parseLarkToolInvocation, larkToolChildEnv, larkToolPassthroughEnv, LARK_TOOL_ROUTE, larkToolPrompt } from './core/lark-tool-binding.js';
 import { larkToolExecutionArgs } from './core/lark-tool-command.js';
 import { loopbackFetch } from './core/loopback-fetch.js';
+import { isHeadlessSessionChatId } from './core/types.js';
 import { findOnlineDaemon, parseDaemonIpcPort } from './utils/daemon-discovery.js';
 
 const isLarkAppId = (value: string): boolean => /^cli_[A-Za-z0-9]{4,64}$/.test(value);
@@ -44,7 +45,7 @@ async function main(): Promise<void> {
     identity = { mode: invocation.mode, credential: result.credential, ...(platformUser ? { appId: result.appId } : {}) };
   }
   if (invocation.showHelp) {
-    process.stderr.write(`botmux: ${larkToolPrompt(binding.appId, process.env.LANG?.startsWith('zh') ? 'zh' : 'en')}\n`);
+    process.stderr.write(`botmux: ${larkToolPrompt(binding.appId, process.env.LANG?.startsWith('zh') ? 'zh' : 'en', isHeadlessSessionChatId(process.env.BOTMUX_CHAT_ID ?? ''))}\n`);
   }
   const args = larkToolExecutionArgs(invocation);
   const childEnv = isPassthrough

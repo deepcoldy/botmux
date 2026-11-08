@@ -321,8 +321,8 @@ import { DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISP
 import { SANDBOX_RELAY_ROUTE_GATE_ENV, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } from './core/sandbox-send-route.js';
 import { scheduleIpcErrorMessage } from './core/schedule-ipc-errors.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE, readDispatchReportBindingSecret, resolveVerifiedDispatchReportTarget } from './core/dispatch-report-binding.js';
-import { isRetryableAskHttpStatus } from './core/ask-types.js';
-import { PERMISSION_ALLOW_KEY } from './core/ask-hook/types.js';
+import { isRetryableAskHttpStatus, type CliPermissionOutcome } from './core/ask-types.js';
+import { PERMISSION_ALLOW_KEY, type PermissionOutcomeWatcher } from './core/ask-hook/types.js';
 import { linuxIsolationDetected } from './core/linux-isolation.js';
 import {
   hasManagedOriginIsolationMarker,
@@ -373,6 +373,8 @@ import {
 } from './utils/bot-routing.js';
 import { botsInfoObjectEntries, isBotsInfoRouteEntry, normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
 import { getDefaultLocale, isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
+import { sanitizeLocalAddressText, sanitizeLocalAddressNode } from './im/lark/local-address-policy.js';
+import { localAddressContextForBot } from './im/lark/local-address-context.js';
 import {
   crossPrincipalAsKeyword,
   crossPrincipalBotSendGate,
@@ -6203,6 +6205,43 @@ async function postSessionCliIpc(
     : loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
 }
 
+/** `botmux board attach` 的说明页 / 视频：正文是文件原始字节。鉴权同 postSessionCliIpc，capability 放请求头。 */
+async function postBoardExplainerUpload(
+  ipcPort: number,
+  sessionId: string,
+  ref: string,
+  file: { name: string; mime: string; bytes: Buffer },
+): Promise<Response> {
+  const { BOARD_UPLOAD_HEADERS: H } = await import('./core/decision-board/files.js');
+  const headers: Record<string, string> = {
+    'content-type': file.mime,
+    [H.name]: encodeURIComponent(file.name),
+    [H.ref]: encodeURIComponent(ref),
+  };
+  let hostSecret: string | undefined;
+  if (!process.env.BOTMUX_SEND_RELAY) {
+    try { hostSecret = loadDaemonIpcSecret(); } catch { /* sandboxed/read-isolated: capability fallback below */ }
+  }
+  if (!hostSecret) {
+    const claim = readManagedOriginCapability(
+      resolveDataDir(),
+      sessionId,
+      process.env.BOTMUX_SEND_RELAY,
+      process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+    );
+    if (claim) {
+      headers[H.capability] = claim.capability;
+      if (claim.turnId) headers[H.turnId] = claim.turnId;
+      if (claim.dispatchAttempt !== undefined) headers[H.dispatchAttempt] = String(claim.dispatchAttempt);
+    }
+  }
+  const path = `/api/sessions/${encodeURIComponent(sessionId)}/decision-board/upload`;
+  const init = { method: 'POST', headers, body: new Uint8Array(file.bytes) } satisfies RequestInit;
+  return hostSecret
+    ? fetchDaemonIpc(ipcPort, path, init, hostSecret)
+    : loopbackFetch(`http://127.0.0.1:${ipcPort}${path}`, init);
+}
+
 let deferredTopicSidecarWritable: boolean | undefined;
 
 /** The daemon's deferred-topic claim route, or undefined when no daemon port is
@@ -6681,7 +6720,9 @@ ${SESSION_RENAME_USAGE}
 
 /** `botmux board …`：管家写决策看板。解析与输出在 cli/board-command.ts，这里只负责找会话和发 IPC。 */
 async function cmdBoard(argv: string[]): Promise<void> {
-  const { BOARD_CLI_USAGE, formatBoardResult, parseBoardArgs, readBoardAttachFiles } = await import('./cli/board-command.js');
+  const {
+    BOARD_CLI_USAGE, formatBoardResult, parseBoardArgs, readBoardAttachFiles, readBoardExplainerFiles, splitBoardAttachPaths,
+  } = await import('./cli/board-command.js');
   const parsed = parseBoardArgs(argv);
   if (!parsed.ok) {
     console.error(`botmux board: ${parsed.error}`);
@@ -6694,14 +6735,20 @@ async function cmdBoard(argv: string[]): Promise<void> {
     return;
   }
   const { action, json, request, attachPaths } = parsed.parsed;
+  let explainers: Array<{ name: string; mime: string; bytes: Buffer }> = [];
   if (attachPaths.length) {
-    const files = readBoardAttachFiles(attachPaths);
-    if (!files.ok) {
-      console.error(`botmux board: ${files.error}`);
+    const fail = (error: string) => {
+      console.error(`botmux board: ${error}`);
       process.exitCode = 1;
-      return;
-    }
-    request.files = files.files;
+    };
+    const split = splitBoardAttachPaths(attachPaths);
+    if (!split.ok) return fail(split.error);
+    const images = readBoardAttachFiles(split.images);
+    if (!images.ok) return fail(images.error);
+    const read = readBoardExplainerFiles(split.explainers);
+    if (!read.ok) return fail(read.error);
+    if (images.files.length) request.files = images.files;
+    explainers = read.files;
   }
   const sid = parsed.parsed.sessionId ?? findAncestorSessionId();
   if (!sid) {
@@ -6721,6 +6768,23 @@ async function cmdBoard(argv: string[]): Promise<void> {
     console.error('当前 Bot daemon 不在线。');
     process.exitCode = 1;
     return;
+  }
+  if (explainers.length) {
+    const staged: string[] = [];
+    for (const file of explainers) {
+      const up = await postBoardExplainerUpload(ipcPort, session.sessionId, String(request.ref), file);
+      const upBody = await up.json().catch(() => ({})) as { ok?: boolean; id?: string; error?: string; message?: string; warnings?: string[] };
+      if (!up.ok || !upBody.ok || !upBody.id) {
+        const old = up.status === 401 || (up.status === 404 && upBody.error === 'not_found');
+        console.error(`botmux board attach 失败: ${file.name}：${upBody.message ?? upBody.error ?? `HTTP ${up.status}`}`
+          + (old ? '（daemon 版本过旧，还不支持图文说明；重启 daemon 后再试）' : ''));
+        process.exitCode = 1;
+        return;
+      }
+      for (const w of upBody.warnings ?? []) console.error(`⚠ ${file.name}：${w}`);
+      staged.push(upBody.id);
+    }
+    request.staged = staged;
   }
   const response = await postSessionCliIpc(ipcPort, session.sessionId, 'decision-board', request);
   const body = await response.json().catch(() => ({})) as Record<string, unknown> & { ok?: boolean; error?: string; message?: string };
@@ -12257,6 +12321,18 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     console.error(`botmux send refused: ${stable}`);
     process.exit(2);
   }
+  // Process the expanded presentation before validation, uploads or any send
+  // ledger/hash. The Lark client checks only card link fields, not prose.
+  try {
+    const localContext = localAddressContextForBot(s.larkAppId, s.workingDir);
+    content = sanitizeLocalAddressText(content, localContext);
+    if (preparedText !== undefined) preparedText = sanitizeLocalAddressText(preparedText, localContext);
+    if (customCard) customCard = sanitizeLocalAddressNode(customCard, localContext);
+    if (completionProposalVisible) completionProposalVisible = sanitizeLocalAddressNode(completionProposalVisible, localContext);
+  } catch (error) {
+    console.error('botmux send refused: ' + (error instanceof Error ? error.message : 'LOCAL_ADDRESS_OUTBOUND_REJECTED'));
+    process.exit(2);
+  }
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
     ?? frozenTurnDispatch?.replyTargetSenderOpenId
     ?? turnReplyTarget?.senderOpenId
@@ -17508,37 +17584,13 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
 
   let res: Response;
   try {
-    const requestBody = { ...body };
-    if (typeof requestBody.originCapability !== 'string') {
-      const sessionId = typeof requestBody.sessionId === 'string'
-        ? requestBody.sessionId
-        : undefined;
-      const claim = readManagedOriginCapability(
-        resolveDataDir(),
-        sessionId,
-        process.env.BOTMUX_SEND_RELAY,
-        process.env.BOTMUX_ORIGIN_CHANNEL_ID,
-      );
-      if (claim) requestBody.originCapability = claim.capability;
-    }
-    const init = {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(requestBody),
-      // No client-side timeout — broker enforces `timeoutMs` and will respond
-      // with `kind:'timedOut'` so this fetch always settles.
-    } satisfies RequestInit;
-    let hostSecret: string | undefined;
-    if (!process.env.BOTMUX_SEND_RELAY) {
-      try { hostSecret = loadDaemonIpcSecret(); } catch { /* read-isolated CLI uses live marker auth */ }
-    }
     // Versioned admission prevents an old daemon silently dropping the
     // respondent restriction on a choice-only request. Never downgrade it.
     const endpoint = body.answererOpenId || (body.questions as import('./core/ask-types.js').AskQuestion[] | undefined)?.some(q => q.input)
       ? '/api/asks/form-v1' : '/api/asks';
-    res = hostSecret
-      ? await fetchDaemonIpc(daemon.ipcPort, endpoint, init, hostSecret)
-      : await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}${endpoint}`, init);
+    // No client-side timeout — broker enforces `timeoutMs` and will respond
+    // with `kind:'timedOut'` so this fetch always settles.
+    res = await postAskIpc(daemon.ipcPort, endpoint, body);
   } catch (fetchErr) {
     // Socket refused / reset / timeout → daemon is down or restarting → retryable.
     const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
@@ -17563,6 +17615,78 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
     throw mkErr(`botmux ask: daemon 返回非 JSON: ${jsonErr}`, false);
   }
 }
+
+/** POST an ask-family request to the session's daemon: host HMAC when the host
+ *  secret is readable, otherwise the session's live origin capability. */
+async function postAskIpc(ipcPort: number, endpoint: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<Response> {
+  const requestBody = { ...body };
+  if (typeof requestBody.originCapability !== 'string') {
+    const sessionId = typeof requestBody.sessionId === 'string'
+      ? requestBody.sessionId
+      : undefined;
+    const claim = readManagedOriginCapability(
+      resolveDataDir(),
+      sessionId,
+      process.env.BOTMUX_SEND_RELAY,
+      process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+    );
+    if (claim) requestBody.originCapability = claim.capability;
+  }
+  const init = {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(requestBody),
+    ...(signal ? { signal } : {}),
+  } satisfies RequestInit;
+  let hostSecret: string | undefined;
+  if (!process.env.BOTMUX_SEND_RELAY) {
+    try { hostSecret = loadDaemonIpcSecret(); } catch { /* read-isolated CLI uses live marker auth */ }
+  }
+  return hostSecret
+    ? fetchDaemonIpc(ipcPort, endpoint, init, hostSecret)
+    : loopbackFetch(`http://127.0.0.1:${ipcPort}${endpoint}`, init);
+}
+
+/**
+ * 告诉 daemon：发起这张权限卡的 CLI 已自行了结这次确认（内置超时自动拒绝、终端裁决、hook 被
+ * 终止），让卡片立刻落到真实结局。daemon 暂时不可达时在 budget 内重试；daemon 还不认识这张卡（409，
+ * 卡片自己的 POST 可能还在登记）时短暂重试；老 daemon 没有这条路由（404）或其它确定性失败返回
+ * false，卡片由 hook 断开后的既有失效兜底收尾。
+ */
+async function postAskCliResolved(body: Record<string, unknown>, budgetMs: number): Promise<boolean> {
+  return sendCliResolvedReport((signal) => {
+    const daemon = findDaemon(body.larkAppId as string);
+    return daemon ? postAskIpc(daemon.ipcPort, '/api/asks/cli-resolved', body, signal) : Promise.resolve(null);
+  }, budgetMs);
+}
+
+/** Retry loop behind postAskCliResolved; `send` resolves null while no daemon is registered. */
+export async function sendCliResolvedReport(
+  send: (signal: AbortSignal) => Promise<Response | null>,
+  budgetMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + budgetMs;
+  const unknownAskDeadline = Date.now() + Math.min(budgetMs, CLI_RESOLVED_UNKNOWN_ASK_RETRY_MS);
+  for (let attempt = 1; ; attempt++) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    let unknownAsk = false;
+    try {
+      const res = await send(AbortSignal.timeout(remaining));
+      if (res?.ok) return true;
+      if (res) {
+        unknownAsk = res.status === 409;
+        if (unknownAsk ? Date.now() >= unknownAskDeadline : !isRetryableAskHttpStatus(res.status)) return false;
+      }
+    } catch { /* daemon unreachable or restarting → retry within budget */ }
+    const wait = Math.min(unknownAsk ? CLI_RESOLVED_UNKNOWN_ASK_POLL_MS : 1_000 * attempt, 5_000, deadline - Date.now());
+    if (wait <= 0) return false;
+    await new Promise(resolve => setTimeout(resolve, wait));
+  }
+}
+
+const CLI_RESOLVED_UNKNOWN_ASK_RETRY_MS = 3_000;
+const CLI_RESOLVED_UNKNOWN_ASK_POLL_MS = 200;
 
 async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   // Workflow-subagent safety gate (same posture as cmdSend): a CLI running
@@ -17802,6 +17926,8 @@ export async function runHook(
   resolveCliSessionRouteFn?: (cliSessionId: string) => Promise<import('./adapters/adopt-route.js').AdoptRoute | null>,
   resolveTurnOriginFn: (sessionId: string) => { turnId?: string; dispatchAttempt?: number } | null | undefined =
     sessionId => resolveSessionContext(resolveDataDir(), sessionId),
+  /** 权限确认专用：观察 CLI 是否绕过卡片自行了结了这次确认，并把结局回报 daemon。缺省 = 只等卡片。 */
+  cliOutcome?: HookCliOutcomeOptions,
 ): Promise<{ stdout: string }> {
   const { getHookAdapter } = await import('./core/ask-hook/registry.js');
 
@@ -17819,7 +17945,7 @@ export async function runHook(
   // 解析问题：askUserQuestion → 提问卡片；终端权限确认框（PermissionRequest）→
   // 允许/拒绝卡片；其余事件 → passthrough 放行
   const askParsed = adapter.parseQuestions(payload);
-  const permissionParsed = askParsed ? null : adapter.parsePermissionRequest?.(payload) ?? null;
+  const permissionParsed = askParsed ? null : adapter.parsePermissionRequest?.(payload, env) ?? null;
   const parsed = askParsed ?? permissionParsed;
   if (!parsed) {
     return { stdout: adapter.passthrough(payload) };
@@ -17980,32 +18106,76 @@ export async function runHook(
   // stable key, so the SAME card resolves through the normal hook directive.
   // Blocking here keeps Claude spinning; the native picker never renders.
   const deadline = Date.now() + timeoutMs;
-  let result: import('./core/ask-types.js').AskResult | undefined;
-  let attempt = 0;
-  while (true) {
-    try {
-      result = await postAskFn(body);
-      break;
-    } catch (err) {
-      // Retry ONLY genuinely transient failures (daemon unreachable / network /
-      // 502-503-504 startup-not-ready — see postAsk's `retryable`). That is the
-      // restart-in-progress case. A deterministic error (4xx bad body /
-      // capability / unsupported, non-JSON) has retryable=false → passthrough
-      // immediately rather than spin for 24h. A non-coded throw is also treated
-      // as non-retryable.
-      const retryable = (err as { retryable?: boolean } | undefined)?.retryable === true;
-      if (!retryable || Date.now() >= deadline) {
-        return unresolved(PERMISSION_DENY_UNDELIVERED);
+  const abandonAsk = new AbortController();
+  const awaitAsk = async (): Promise<import('./core/ask-types.js').AskResult | null> => {
+    let attempt = 0;
+    while (true) {
+      try {
+        return await postAskFn(body);
+      } catch (err) {
+        if (abandonAsk.signal.aborted) return null;
+        // Retry ONLY genuinely transient failures (daemon unreachable / network /
+        // 502-503-504 startup-not-ready — see postAsk's `retryable`). That is the
+        // restart-in-progress case. A deterministic error (4xx bad body /
+        // capability / unsupported, non-JSON) has retryable=false → passthrough
+        // immediately rather than spin for 24h. A non-coded throw is also treated
+        // as non-retryable.
+        const retryable = (err as { retryable?: boolean } | undefined)?.retryable === true;
+        if (!retryable || Date.now() >= deadline) return null;
+        attempt++;
+        // Backoff: quick first reconnects (daemon usually returns in a few
+        // seconds), capped at 5s. Never sleep past the deadline.
+        const backoff = Math.min(5_000, 500 * attempt);
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return null;
+        await new Promise<void>((r) => {
+          const wake = () => {
+            clearTimeout(timer);
+            abandonAsk.signal.removeEventListener('abort', wake);
+            r();
+          };
+          const timer = setTimeout(wake, Math.min(backoff, remaining));
+          abandonAsk.signal.addEventListener('abort', wake, { once: true });
+        });
+        if (abandonAsk.signal.aborted) return null;
       }
-      attempt++;
-      // Backoff: quick first reconnects (daemon usually returns in a few
-      // seconds), capped at 5s. Never sleep past the deadline.
-      const backoff = Math.min(5_000, 500 * attempt);
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) return unresolved(PERMISSION_DENY_UNDELIVERED);
-      await new Promise((r) => setTimeout(r, Math.min(backoff, remaining)));
     }
+  };
+
+  let result: import('./core/ask-types.js').AskResult | null;
+  if (permissionParsed && adapter.formatPermissionDecision && cliOutcome) {
+    // Claude Code can end the confirmation without this hook (its own timeout,
+    // a terminal choice, an interrupt). Whichever ends first wins; when it is
+    // the CLI, settle the card with that outcome instead of waiting it out.
+    const watcher = adapter.createPermissionOutcomeWatcher?.(payload) ?? null;
+    // Already over before the card exists (answered in the terminal, or the hook
+    // terminated): posting it now would only leave a card nothing settles.
+    if (cliOutcome.terminated?.aborted || watcher?.scan()) {
+      return { stdout: adapter.formatPermissionDecision(false, PERMISSION_RESOLVED_BY_CLI) };
+    }
+    const stopWatching = new AbortController();
+    const first = await Promise.race([
+      awaitAsk().then(ask => ({ ask })),
+      watchCliPermissionOutcome(watcher, cliOutcome, stopWatching.signal).then(outcome => ({ outcome })),
+    ]);
+    stopWatching.abort();
+    if ('outcome' in first) {
+      abandonAsk.abort();
+      await cliOutcome.reportCliResolved({
+        sessionId: routeSessionId,
+        larkAppId: routeLarkAppId,
+        requestId,
+        outcome: first.outcome,
+        ...(hookOrigin?.turnId ? { originTurnId: hookOrigin.turnId } : {}),
+        ...(hookOrigin?.dispatchAttempt !== undefined ? { originDispatchAttempt: hookOrigin.dispatchAttempt } : {}),
+      }, cliOutcome.terminated?.aborted ? HOOK_TERMINATED_REPORT_BUDGET_MS : CLI_RESOLVED_REPORT_BUDGET_MS).catch(() => false);
+      return { stdout: adapter.formatPermissionDecision(false, PERMISSION_RESOLVED_BY_CLI) };
+    }
+    result = first.ask;
+  } else {
+    result = await awaitAsk();
   }
+  if (!result) return unresolved(PERMISSION_DENY_UNDELIVERED);
 
   if (permissionParsed && adapter.formatPermissionDecision) {
     return { stdout: permissionDecisionFromResult(result, timeoutMs, adapter.formatPermissionDecision) };
@@ -18022,6 +18192,71 @@ export async function runHook(
 /** 权限确认默认等 10 分钟；上限必须小于 hook 安装侧的进程超时（见 hook-installer）。 */
 const PERMISSION_DEFAULT_TIMEOUT_MS = 600_000;
 const PERMISSION_MAX_TIMEOUT_MS = 840_000;
+
+export interface HookCliOutcomeOptions {
+  /** Tell the daemon the CLI ended this confirmation itself; true once the card is settled. */
+  reportCliResolved: (body: Record<string, unknown>, budgetMs: number) => Promise<boolean>;
+  /** Aborted when the CLI terminates this hook process (Esc / No / interrupt / exit). */
+  terminated?: AbortSignal;
+  pollMs?: number;
+  terminatedGraceMs?: number;
+}
+
+const CLI_OUTCOME_POLL_MS = 1_000;
+/** Claude Code stamps the terminal's verdict before it terminates the hook, but the
+ *  transcript reaches disk a little later. */
+const TERMINATED_SCAN_GRACE_MS = 300;
+const TERMINATED_SCAN_POLL_MS = 50;
+/** Claude Code follows its SIGTERM with a hard kill about 1.3s later; grace + budget must fit. */
+const HOOK_TERMINATED_REPORT_BUDGET_MS = 700;
+const CLI_RESOLVED_REPORT_BUDGET_MS = 30_000;
+
+/** Resolves once the CLI has ended the confirmation without this hook: an
+ *  outcome recorded by the CLI itself, or the CLI terminating the hook. Never
+ *  resolves after `stop` aborts. */
+function watchCliPermissionOutcome(
+  watcher: PermissionOutcomeWatcher | null,
+  opts: HookCliOutcomeOptions,
+  stop: AbortSignal,
+): Promise<CliPermissionOutcome> {
+  return new Promise((resolve) => {
+    let timer: NodeJS.Timeout | undefined;
+    const cleanup = () => {
+      clearTimeout(timer);
+      opts.terminated?.removeEventListener('abort', onTerminated);
+    };
+    const finish = (outcome: CliPermissionOutcome) => {
+      cleanup();
+      resolve(outcome);
+    };
+    function onTerminated() {
+      cleanup();
+      const giveUpAt = Date.now() + (opts.terminatedGraceMs ?? TERMINATED_SCAN_GRACE_MS);
+      const rescan = () => {
+        if (stop.aborted) return;
+        const outcome = watcher?.scan();
+        if (outcome) return finish(outcome);
+        if (!watcher || Date.now() >= giveUpAt) return finish('cli_stopped_waiting');
+        timer = setTimeout(rescan, TERMINATED_SCAN_POLL_MS);
+      };
+      rescan();
+    }
+    const tick = () => {
+      if (stop.aborted) return;
+      const outcome = watcher?.scan();
+      if (outcome) return finish(outcome);
+      timer = setTimeout(tick, opts.pollMs ?? CLI_OUTCOME_POLL_MS);
+    };
+    stop.addEventListener('abort', cleanup, { once: true });
+    if (opts.terminated?.aborted) return onTerminated();
+    opts.terminated?.addEventListener('abort', onTerminated, { once: true });
+    if (watcher) tick();
+  });
+}
+
+// The CLI has already closed its dialog and ignores this; deny keeps it safe if not.
+const PERMISSION_RESOLVED_BY_CLI =
+  'This permission request was already resolved in Claude Code itself, so the Lark/Feishu card no longer applies.';
 
 // 以下 message 是回给模型看的（Claude 把 deny message 作为工具结果交给模型），
 // 所以用英文并直接给出可执行的下一步。
@@ -18085,7 +18320,27 @@ async function cmdHook(cliId: string): Promise<void> {
   }
 
   const env = process.env as Record<string, string | undefined>;
-  const result = await runHook(payload, env, postAsk, cliId);
+  const permissionRequest = !adapter.parseQuestions(payload) && !!adapter.parsePermissionRequest?.(payload, env);
+  const terminated = new AbortController();
+  if (permissionRequest) {
+    // The CLI terminates this hook when its dialog closes without us (Esc / No /
+    // interrupt / exit). Stay just long enough to settle the card, then go.
+    const onTerminate = () => {
+      terminated.abort();
+      setTimeout(() => process.exit(0), TERMINATED_SCAN_GRACE_MS + HOOK_TERMINATED_REPORT_BUDGET_MS + 300).unref();
+    };
+    process.once('SIGTERM', onTerminate);
+    process.once('SIGHUP', onTerminate);
+  }
+  let result: { stdout: string };
+  try {
+    result = await runHook(payload, env, postAsk, cliId, undefined, undefined, undefined,
+      permissionRequest ? { reportCliResolved: postAskCliResolved, terminated: terminated.signal } : undefined);
+  } catch (err) {
+    // A permission dialog left undecided would wait on a terminal nobody watches.
+    if (!permissionRequest || !adapter.formatPermissionDecision) throw err;
+    result = { stdout: adapter.formatPermissionDecision(false, PERMISSION_DENY_UNDELIVERED) };
+  }
   if (result.stdout) {
     // The directive can embed the user's free-form answer (unbounded size);
     // wait for the pipe write to complete before the explicit exit truncates it.
