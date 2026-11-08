@@ -1518,7 +1518,7 @@ function finalOutputHandoffHost(appId: string): FinalOutputHandoffHost {
       logger.warn(`[final-handoff] ${record.intentId} ${String(error)}`);
       if (['delivered', 'suppressed'].includes(store.read(record.intentId)?.state ?? '')) return;
       const ds = findActiveBySessionId(record.output.sessionId);
-      if (ds?.larkAppId === appId && raiseDaemonAttention(ds, 'blocked', FINAL_HANDOFF_DELIVERY_REASON)) {
+      if (ds?.larkAppId === appId && raiseDaemonAttention(ds, 'blocked', FINAL_HANDOFF_DELIVERY_REASON, record.output.turnId)) {
         publishAttentionPatch(ds);
       }
     },
@@ -17829,7 +17829,7 @@ function setupWorkerHandlers(
         }
       },
       error: (error, terminal) => {
-        if (raiseDaemonAttention(ds, 'blocked', FINAL_HANDOFF_DELIVERY_REASON)) publishAttentionPatch(ds);
+        if (raiseDaemonAttention(ds, 'blocked', FINAL_HANDOFF_DELIVERY_REASON, record.output.turnId)) publishAttentionPatch(ds);
         logger.warn(`[${t}] Universal output ${terminal ? 'terminally rejected' : 'remains durable'}: ${String(error)}`);
       },
     });
@@ -23645,7 +23645,7 @@ function deliverFinalOutput(
           })
         : undefined;
       if (durableDelivery?.kind === 'ambiguous') {
-        if (raiseDaemonAttention(ds, 'blocked', `Durable final output is ambiguous: ${durableDelivery.error}`)) publishAttentionPatch(ds);
+        if (raiseDaemonAttention(ds, 'blocked', `Durable final output is ambiguous: ${durableDelivery.error}`, msg.turnId)) publishAttentionPatch(ds);
         logger.error(`[${t}] Durable final_output ambiguous: ${durableDelivery.error}`);
         onComplete?.(false);
         return;
@@ -23853,7 +23853,7 @@ function deliverFinalOutput(
         // Push the needs-you row immediately; the owner-reminder sweep would
         // surface it eventually, but the Dashboard must not wait for the next
         // row refresh to light up.
-        if (raiseDaemonAttention(ds, 'blocked', err.message)) publishAttentionPatch(ds);
+        if (raiseDaemonAttention(ds, 'blocked', err.message, msg.turnId)) publishAttentionPatch(ds);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
           reason: 'topic_send_blocked', message: err.message, turnId: msg.turnId,
         });
