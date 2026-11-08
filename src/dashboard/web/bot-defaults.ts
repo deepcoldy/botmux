@@ -108,6 +108,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.substituteEnabled', 'botDefaults.substituteTargets', 'botDefaults.substituteChats',
       'botDefaults.substituteExcludedChats', 'botDefaults.substituteReplyMode', 'botDefaults.substituteDisclosure',
       'botDefaults.substituteControlCard', 'botDefaults.substituteTopicGroups', 'botDefaults.substituteTopicActive',
+      'botDefaults.substituteKeywords',
     ],
   },
   {
@@ -302,6 +303,7 @@ export type BotSubstituteTarget = {
 export type BotSubstituteMode = {
   enabled: boolean;
   targets: BotSubstituteTarget[];
+  keywords?: string[];
   disclosure: 'prefix' | 'none';
   chats?: string[];
   excludedChats?: string[];
