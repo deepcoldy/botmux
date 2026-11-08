@@ -95,14 +95,47 @@ describe('decideAutoRestart', () => {
 
   // N2（评审实测）：永久计数不随恢复健康重置时，一次历史 127 会让这条会话此后
   // 任何一次 127 都立即不重启（实测隔 90 天仍如此）。调用方在 prompt_ready 时
-  // 删除计数，所以“重置后”就是 prev=undefined —— 这里钉的是该语义正确。
-  it('a cleared streak (CLI recovered) starts a fresh permanent budget', () => {
+  // 记下 readyAt，ready 后存活满一个窗口就算恢复。
+  it('a streak whose CLI stayed up a full window after ready starts a fresh permanent budget', () => {
     const first = decideAutoRestart({ prev: undefined, now, code: 127 });
     expect(first.shouldRestart).toBe(true);
-    // The CLI recovered and the daemon dropped the counter (prompt_ready path).
-    const afterRecovery = decideAutoRestart({ prev: undefined, now: now + 90 * 24 * 3600 * 1000, code: 127 });
+    const recovered = { ...first.next, readyAt: now + 1000 };
+    const afterRecovery = decideAutoRestart({ prev: recovered, now: now + 90 * 24 * 3600 * 1000, code: 127 });
     expect(afterRecovery.shouldRestart).toBe(true);
     expect(afterRecovery.next.count).toBe(1);
+  });
+
+  // #2551：CLI 每次重启都能到 prompt、一收到输入就退出。ready 之后很快又退出仍属
+  // 同一轮连续失败，熔断必须照常触发。
+  it('keeps counting when the CLI exits again shortly after reaching the prompt', () => {
+    let prev: ReturnType<typeof decideAutoRestart>['next'] | undefined;
+    const decisions = [0, 1, 2, 3].map(i => {
+      const at = now + i * 5000;
+      const decision = decideAutoRestart({ prev, now: at, code: 42 });
+      prev = { ...decision.next, readyAt: at + 2000 };
+      return decision;
+    });
+    expect(decisions.slice(0, 3).every(d => d.shouldRestart)).toBe(true);
+    expect(decisions[3]!.shouldRestart).toBe(false);
+    expect(decisions[3]!.reason).toBe('window_budget');
+
+    const first = decideAutoRestart({ prev: undefined, now, code: 127 });
+    const again = decideAutoRestart({ prev: { ...first.next, readyAt: now + 2000 }, now: now + 4000, code: 127 });
+    expect(again.shouldRestart).toBe(false);
+    expect(again.reason).toBe('permanent_exit');
+  });
+
+  // 「存活满一个窗口」是严格大于：恰好等于窗口仍算同一轮，超出 1ms 才开新预算。
+  it('treats exactly one window after ready as the same streak, but window+1ms as recovered', () => {
+    const readyAt = now + 1000;
+    const seeded = { count: 1, lastAt: now, lastCode: 127 as const, permanentCount: 1, readyAt };
+
+    const atBoundary = decideAutoRestart({ prev: seeded, now: readyAt + RESTART_WINDOW_MS, code: 127 });
+    expect(atBoundary.shouldRestart).toBe(false);
+
+    const pastBoundary = decideAutoRestart({ prev: seeded, now: readyAt + RESTART_WINDOW_MS + 1, code: 127 });
+    expect(pastBoundary.shouldRestart).toBe(true);
+    expect(pastBoundary.next.permanentCount).toBe(1);
   });
 
   it('a streak that was NEVER cleared still stops on the second permanent exit much later', () => {

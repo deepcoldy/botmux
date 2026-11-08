@@ -1,6 +1,6 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { basename, extname, join } from 'node:path';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, renameSync, rmSync } from 'node:fs';
 import { listChatMessagesUntil, listThreadMessagesWithContext, listMessagesByThreadId, downloadMessageResource } from '../im/lark/client.js';
 import { parseApiMessage, createImgNumberer, extractResources, cardContentHasUpgradeFallback, resolveMergedCardContent, structuredMentionRefs, rawPlaceholderText, postMentionRefs } from '../im/lark/message-parser.js';
 import { GROUP_CONTEXT_CARD_CONTENT_VERSION } from '../im/lark/group-context-card.js';
@@ -288,7 +288,7 @@ function readLocal(appId: string, chatId: string) {
   return { messages: records.map(renderRecord), incomplete: gap || hasMore, reason: gap ? 'retention_gap' : hasMore ? 'local_scan_limit' : undefined };
 }
 
-async function resolveAttachments(request: GroupContextTurnRequest, records: GroupContextRenderMessage[], signal: AbortSignal) {
+async function resolveAttachments(request: GroupContextTurnRequest, records: GroupContextRenderMessage[], signal: AbortSignal, onResolved: (attachment: LarkAttachment) => void) {
   if (!/图|照片|菜单|附件|文件|image|photo|picture|attachment|document|menu/i.test(request.query)) return { attachments: [], incomplete: false };
   const latest = new Map<string, GroupContextRenderMessage>();
   for (const record of records) {
@@ -299,23 +299,36 @@ async function resolveAttachments(request: GroupContextTurnRequest, records: Gro
     .sort((a, b) => b.seq - a.seq).slice(0, 5).reverse();
   const attachments: LarkAttachment[] = [];
   let incomplete = false;
-  for (const record of selected) {
-    for (const resource of (record.resourceRefs ?? []).slice(0, 5 - attachments.length)) {
-      if (signal.aborted) return { attachments, incomplete: true };
-      if (!resource.key || !['image', 'file'].includes(resource.type)) continue;
-      try {
-        // Never turn an API-supplied filename into a filesystem traversal.
-        if (!/^om_[A-Za-z0-9_-]+$/.test(record.messageId)) throw new Error('invalid_message_id');
-        const dir = getAttachmentsDir(request.appId, record.messageId);
-        mkdirSync(dir, { recursive: true, mode: 0o700 });
-        const extension = extname(resource.name ?? '').replace(/[^.a-zA-Z0-9]/g, '').slice(0, 12);
-        const path = join(dir, `context-${createHash('sha256').update(resource.key).digest('hex').slice(0, 20)}${extension || (resource.type === 'image' ? '.png' : '.bin')}`);
-        if (!existsSync(path)) await downloadMessageResource(request.appId, record.messageId, resource.key, resource.type as 'image' | 'file', path, undefined, { allowUserTokenFallback: false });
-        const attachment: LarkAttachment = { type: resource.type as 'image' | 'file', path, name: basename(resource.name ?? path), resourceKey: resource.key };
-        attachments.push(await normalizeImageAttachment(attachment));
-      } catch { incomplete = true; }
+  // Video bodies are the slowest downloads: they only take the slots and the
+  // budget left once every image and file has resolved.
+  for (const videoPass of [false, true]) {
+    for (const record of selected) {
+      const refs = record.resourceRefs ?? [];
+      for (const resource of (videoPass ? refs.filter(ref => ref.type === 'video') : refs).slice(0, 5 - attachments.length)) {
+        if (signal.aborted) return { attachments, incomplete: true };
+        if (!resource.key || !['image', 'file', 'video'].includes(resource.type) || (resource.type === 'video') !== videoPass) continue;
+        try {
+          // Never turn an API-supplied filename into a filesystem traversal.
+          if (!/^om_[A-Za-z0-9_-]+$/.test(record.messageId)) throw new Error('invalid_message_id');
+          const dir = getAttachmentsDir(request.appId, record.messageId);
+          mkdirSync(dir, { recursive: true, mode: 0o700 });
+          const extension = extname(resource.name ?? '').replace(/[^.a-zA-Z0-9]/g, '').slice(0, 12);
+          const path = join(dir, `context-${createHash('sha256').update(resource.key).digest('hex').slice(0, 20)}${extension || (resource.type === 'image' ? '.png' : '.bin')}`);
+          if (!existsSync(path)) {
+            // Any file at `path` is reused as complete by later turns.
+            const partial = `${path}.${randomUUID()}.part`;
+            try {
+              await downloadMessageResource(request.appId, record.messageId, resource.key, resource.type as 'image' | 'file' | 'video', partial, undefined, { allowUserTokenFallback: false });
+              renameSync(partial, path);
+            } finally { rmSync(partial, { force: true }); }
+          }
+          const attachment = await normalizeImageAttachment({ type: resource.type as 'image' | 'file' | 'video', path, name: basename(resource.name ?? path), resourceKey: resource.key });
+          attachments.push(attachment);
+          onResolved(attachment);
+        } catch { incomplete = true; }
+      }
+      if (attachments.length >= 5) break;
     }
-    if (attachments.length >= 5) break;
   }
   return { attachments, incomplete };
 }

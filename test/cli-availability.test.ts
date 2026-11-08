@@ -1,5 +1,5 @@
 import * as childProcess from 'node:child_process';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -12,6 +12,7 @@ import {
   hasAgentLaunchConfigChanged,
   preliminaryCliAvailability,
   createAdapterAfterMissingCliWait,
+  missingCliExecutableAfterRetry,
 } from '../src/setup/cli-availability.js';
 
 // Pass-through spies: every process the availability check could start (the
@@ -414,5 +415,107 @@ describe('a launch whose CLI executable is missing', () => {
       expect((await launch({ cliId: 'mira' }, fakeAdapterFactory(process.execPath), sleep)).waited).toBe(false);
       expect(sleep).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('whether a daemon that cannot launch its CLI stays out of Feishu event delivery', () => {
+  const originalShell = process.env.SHELL;
+  const tempDirs: string[] = [];
+  afterEach(() => {
+    if (originalShell === undefined) delete process.env.SHELL;
+    else process.env.SHELL = originalShell;
+    for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+  const tempDir = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cli-subscribe-'));
+    tempDirs.push(dir);
+    return dir;
+  };
+  /** A login shell whose `command -v` answers with a fixed line and exit code. */
+  const fakeShell = (answer: string, exitCode: number) => {
+    const path = join(tempDir(), 'fake-shell');
+    writeFileSync(path, `#!/bin/sh\necho '${answer}'\nexit ${exitCode}\n`);
+    chmodSync(path, 0o755);
+    return path;
+  };
+
+  it('stays out when the configured CLI path does not exist, still missing after the launch wait', async () => {
+    const missing = join(tempDir(), 'claude');
+    const sleep = vi.fn(async () => {});
+    const reason = await missingCliExecutableAfterRetry({ cliId: 'claude-code', cliPathOverride: missing }, { sleep });
+    expect(reason).toContain(missing);
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it('joins when the CLI is at its configured path or on PATH', async () => {
+    const dir = tempDir();
+    const sleep = vi.fn(async () => {});
+    expect(await missingCliExecutableAfterRetry({ cliId: 'claude-code', cliPathOverride: executable(dir, 'claude') }, { sleep }))
+      .toBeUndefined();
+    executable(dir, 'codex');
+    process.env.PATH = dir;
+    expect(await missingCliExecutableAfterRetry({ cliId: 'codex' }, { sleep })).toBeUndefined();
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('joins when the CLI is found only through a login shell', async () => {
+    const claude = executable(tempDir(), 'claude');
+    process.env.PATH = '';
+    process.env.SHELL = fakeShell(claude, 0);
+    const sleep = vi.fn(async () => {});
+    expect(await missingCliExecutableAfterRetry({ cliId: 'claude-code' }, { sleep })).toBeUndefined();
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('joins when the login shell probe breaks instead of answering', async () => {
+    process.env.PATH = '';
+    process.env.SHELL = fakeShell('', 2);
+    expect(await missingCliExecutableAfterRetry({ cliId: 'claude-code' }, { sleep: async () => {} })).toBeUndefined();
+  });
+
+  it('joins once a CLI that is reinstalling itself comes back during the wait', async () => {
+    const dir = tempDir();
+    const sleep = vi.fn(async () => { executable(dir, 'claude'); });
+    expect(await missingCliExecutableAfterRetry({ cliId: 'claude-code', cliPathOverride: join(dir, 'claude') }, { sleep }))
+      .toBeUndefined();
+    expect(sleep).toHaveBeenCalledTimes(1);
+  });
+
+  it('judges by what a launch really runs: the wrapper, not the CLI it replaces', async () => {
+    const dir = tempDir();
+    executable(dir, 'codex');
+    process.env.PATH = dir;
+    const sleep = async () => {};
+    const missingWrapper = join(dir, 'gateway');
+    expect(await missingCliExecutableAfterRetry({ cliId: 'codex', wrapperCli: `${missingWrapper} codex` }, { sleep }))
+      .toContain(missingWrapper);
+    executable(dir, 'gateway');
+    expect(await missingCliExecutableAfterRetry({
+      cliId: 'codex',
+      cliPathOverride: join(dir, 'missing-codex'),
+      wrapperCli: 'gateway codex',
+    }, { sleep })).toBeUndefined();
+  });
+
+  it('joins for agents with nothing to launch locally, and leaves other launch failures to the launch check', async () => {
+    process.env.PATH = '';
+    const sleep = vi.fn(async () => {});
+    for (const cliId of ['mira', 'riff'] as const) {
+      expect(await missingCliExecutableAfterRetry({ cliId }, { sleep })).toBeUndefined();
+    }
+    // An invalid launch configuration.
+    expect(await missingCliExecutableAfterRetry({ cliId: 'codex', cliLaunchMode: 'forge-traex' }, { sleep }))
+      .toBeUndefined();
+    // Both executables there, but forge doctor fails — and is not even run at startup.
+    const dir = tempDir();
+    executable(dir, 'traex');
+    const doctorRan = join(dir, 'doctor-ran');
+    writeFileSync(join(dir, 'forge'), `#!/bin/sh\n: > '${doctorRan}'\nexit 1\n`);
+    chmodSync(join(dir, 'forge'), 0o755);
+    process.env.PATH = dir;
+    expect(await missingCliExecutableAfterRetry({ cliId: 'traex', cliLaunchMode: 'forge-traex' }, { sleep }))
+      .toBeUndefined();
+    expect(existsSync(doctorRan)).toBe(false);
+    expect(sleep).not.toHaveBeenCalled();
   });
 });

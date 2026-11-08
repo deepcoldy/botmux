@@ -903,7 +903,7 @@ import {
   type TurnTerminalCarrier,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
-import { decideAutoRestart } from './restart-policy.js';
+import { decideAutoRestart, type RestartCounter } from './restart-policy.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
 import { acceptSessionGroupTitle } from '../services/session-group-title.js';
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
@@ -6879,7 +6879,7 @@ async function closeWithdrawnSessionIfLedgerEmpty(
 
 // ─── Restart rate-limiting ──────────────────────────────────────────────────
 
-export const restartCounts = new Map<string, { count: number; lastAt: number }>();
+export const restartCounts = new Map<string, RestartCounter>();
 
 // ─── Skills installation ────────────────────────────────────────────────────
 
@@ -10324,6 +10324,48 @@ function consumeDocCommentTurn(ds: DaemonSession, turnId: string): void {
   }
 }
 
+/** A document turn refused before admission never runs and never emits
+ * final_output, so nothing else would answer its comment or clear its Typing
+ * marker. The route is consumed synchronously before any await: a duplicate
+ * rejection frame then finds no target and cannot post a second notice.
+ * A pending queued activation and a Codex App accepted ledger entry are both
+ * replayed by the next fork; unless that entry is cancelled, the turn may
+ * still run, so it must not be reported as not executed. */
+function rejectDocCommentTurnBeforeAdmission(ds: DaemonSession, turnId: string, reason: string): void {
+  const docTurn = resolveDocCommentTarget(ds, turnId);
+  if (!docTurn) return;
+  if (ds.session.queuedActivationPending && ds.session.queuedActivationTurnId === turnId) return;
+  const ledgerEntries = ds.session.codexAppDispatchLedger?.filter(entry => entry.turnId === turnId) ?? [];
+  if (ledgerEntries.length > 0) {
+    const accepted = ledgerEntries.length === 1 && ledgerEntries[0]!.state === 'accepted' ? ledgerEntries[0]! : undefined;
+    if (!accepted || !rollbackAcceptedCodexAppDispatch(ds, accepted.dispatchId, turnId, accepted.dispatchAttempt)) return;
+  }
+  consumeDocCommentTurn(ds, turnId);
+  logger.warn(`[${tag(ds)}] doc-comment turn rejected before admission turn=${turnId.substring(0, 16)} reason=${reason}`);
+  const file = { fileToken: docTurn.fileToken, fileType: docTurn.fileType };
+  const notice = tr(
+    'worker.input_rejected_before_admission',
+    { turnId: turnId.substring(0, 16), reason },
+    botLocale(getBot(ds.larkAppId).config),
+  );
+  void (async () => {
+    try {
+      await replyToDocComment(ds.larkAppId, file, docTurn.commentId, notice, docTurn.replyToOpenId);
+    } catch (err: any) {
+      logger.error(`[doc-comment] failed to report rejected turn ${turnId.substring(0, 16)}: ${err?.message ?? err}`);
+    }
+    const reactionType = docTurn.reactionType ?? (docTurn.replyId ? 'Typing' : undefined);
+    if (reactionType && docTurn.replyId) {
+      try {
+        await removeCommentReaction(ds.larkAppId, file, docTurn.commentId, docTurn.replyId, reactionType,
+          { identity: docTurn.reactionIdentity });
+      } catch (err: any) {
+        logger.debug(`[doc-comment] failed to remove rejected reaction ${reactionType}: ${err?.message ?? err}`);
+      }
+    }
+  })();
+}
+
 function collectDocCommentReactionTargets(
   ds: DaemonSession | undefined,
   stored: Session | undefined,
@@ -13021,6 +13063,10 @@ export function isForkCapableSession(ds: DaemonSession): boolean {
   const cliId = sessionCliId(ds, botCfg);
   if (!FORK_CAPABLE_CLI_IDS.has(cliId)) return false;
   if (cliId === 'antigravity' && isRemoteBackendSession(ds)) return false;
+  // agy writes its fork receipt to --log-file under ~/.gemini; the scratch
+  // overlay keeps that write out of the host path the worker tails.
+  if (cliId === 'antigravity'
+    && sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged) === 'scratch') return false;
   // An external App Server thread is not a local rollout. `codex fork` would
   // resolve against the terminal client's own CODEX_HOME and could fork an
   // unrelated/empty local session, so refuse rather than claiming a copy was
@@ -13537,14 +13583,14 @@ function rollbackAcceptedCodexAppDispatch(
   dispatchId: string | undefined,
   turnId: string | undefined,
   dispatchAttempt: number | undefined,
-): void {
-  if (!dispatchId || !turnId) return;
+): boolean {
+  if (!dispatchId || !turnId) return false;
   const cancelled = cancelCodexAppDispatch(ds.session.codexAppDispatchLedger ?? [], {
     dispatchId,
     turnId,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
   });
-  if (!cancelled.ok) return;
+  if (!cancelled.ok) return false;
   const priorLedger = ds.session.codexAppDispatchLedger;
   ds.session.codexAppDispatchLedger = cancelled.ledger;
   try {
@@ -13559,7 +13605,9 @@ function rollbackAcceptedCodexAppDispatch(
     }
   } catch {
     ds.session.codexAppDispatchLedger = priorLedger;
+    return false;
   }
+  return true;
 }
 
 /**
@@ -17057,6 +17105,12 @@ function setupWorkerHandlers(
     throw new Error('worker generation reservation changed before IPC setup');
   }
   ds.taskContinuationRpcProof = undefined;
+  // 新 Node worker 代次绑定即作废旧崩溃连胜：上一 worker 代次（OOM/管控死亡、
+  // 或 killWorker/retire 后由任务续跑/用户消息拉起的替代进程）锚定的 readyAt
+  // 不能连坐新一代——否则新 CLI 在旧 readyAt 的 60s 窗口内第一次永久退出
+  // （127/77）就会被直接熔断，连自己唯一的一次重启机会都拿不到。in-worker 的
+  // CLI 崩溃自动重启不换 worker、不经过这里，#2551 的快速退出循环熔断照常。
+  restartCounts.delete(ds.session.sessionId);
   // Tier authority belongs to this exact worker generation. Start unknown and
   // wait for the new worker's rollout-bound observation; this also clears a
   // Codex badge before a role switch starts a non-Codex worker.
@@ -18011,6 +18065,7 @@ function setupWorkerHandlers(
           break;
         }
         discardTriggerStreamingCard(ds, msg.turnId);
+        if (msg.rejectedBeforeAdmission) rejectDocCommentTurnBeforeAdmission(ds, msg.turnId, msg.reason);
         await rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg);
         // The turn never started and will never terminal. Run GC, but do NOT
         // release this turn's own ledger anchor here: a same-turnId redelivery
@@ -18748,13 +18803,14 @@ function setupWorkerHandlers(
         ds.cliReady = true;
         ds.cliReadyGeneration = (ds.cliReadyGeneration ?? 0) + 1;
         logger.info(`[${t}] ${sessionCliDisplayName(ds, botCfg)} is ready for input`);
-        // 恢复健康即清零崩溃重启计数：计数只描述「连续失败」。CLI 真的跑到
-        // 了可输入 prompt，说明此前那些崩溃并不构成持续的确定性故障——此前若
-        // 有一次历史性永久退出（127/77）留在计数里，不清掉的话这条会话此后任何
-        // 一次永久退出都会立即放弃自动重启（实测隔 90 天仍如此）。见
-        // restart-policy 的「恢复健康即清零」约定。
-        if (restartCounts.delete(ds.session.sessionId)) {
-          logger.info(`[${t}] Cleared crash-restart streak after a successful ready`);
+        // 到了 prompt 不等于恢复健康：CLI 可能每收到一条（被重投的）输入就退出，
+        // 在这里清零会让熔断永远不触发。只记下本轮崩溃后首次 ready 的时间，ready
+        // 后稳定存活满一个窗口再崩溃才算新一轮——一次历史性永久退出（127/77）因此
+        // 也不会让这条会话此后任何一次永久退出都立即放弃自动重启。见 restart-policy。
+        const restartStreak = restartCounts.get(ds.session.sessionId);
+        if (restartStreak && restartStreak.readyAt === undefined) {
+          restartStreak.readyAt = Date.now();
+          logger.info(`[${t}] CLI ready after ${restartStreak.count} crash(es); the restart streak resets only if it stays up`);
         }
         // A live prompt means a (re)spawn reached a working CLI — clear the lazy
         // cold-resume marker set when we parked a crash diagnostic shell. The

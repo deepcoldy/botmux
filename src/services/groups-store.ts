@@ -83,6 +83,28 @@ export async function isInChat(larkAppId: string, chatId: string): Promise<boole
   }
 }
 
+/**
+ * Whether a chat is gone for this bot, only on an explicit answer: a dissolved
+ * chat still answers with chat_status `dissolved`/`dissolved_save`, and a chat
+ * the bot was removed from still answers `normal` with is_in_chat=false.
+ * Any error or other state is undefined (unknown), never gone.
+ */
+export async function probeChatGone(larkAppId: string, chatId: string): Promise<'disbanded' | 'bot_removed' | undefined> {
+  const client = getBotClient(larkAppId);
+  const path = `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`;
+  try {
+    const info: any = await larkGet(client, path);
+    if (info.code !== 0) return undefined;
+    const status = info.data?.chat_status;
+    if (status === 'dissolved' || status === 'dissolved_save') return 'disbanded';
+    if (status !== 'normal') return undefined;
+    const member: any = await larkGet(client, `${path}/members/is_in_chat`);
+    return member.code === 0 && member.data?.is_in_chat === false ? 'bot_removed' : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export type RenameChatResult =
   | { ok: true; oldName: string; newName: string; changed: boolean }
   | {

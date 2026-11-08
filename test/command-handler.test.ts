@@ -753,7 +753,8 @@ import { recordP2pForceTopicRoot, removeP2pForceTopicRoot } from '../src/service
 import { buildAdoptSelectCard, buildRepoSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
 import { registerGroupAutoTitle } from '../src/services/group-auto-title.js';
-import { getAllBots, getBot, loadBotConfigs, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
+import { getAllBots, getBot, loadBotConfigs, findOncallChat, effectiveDefaultWorkingDir, type ChatReplyMode } from '../src/bot-registry.js';
+import { getChatReplyModeState, resolveRegularGroupMode } from '../src/services/chat-reply-mode-store.js';
 import { t } from '../src/i18n/index.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
 import { hasBytedcliHome, beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge } from '../src/services/bytedcli-auth.js';
@@ -3107,6 +3108,119 @@ describe('handleCommand', () => {
         'chat',
         expect.objectContaining({ forkTaskText: '接手群', childOwnerOpenId: 'ou_sender' }),
       );
+    });
+  });
+
+  describe('/fork --create 新群的回复模式', () => {
+    // 分身登记在新群 chatId（chat-scope）上。路由只看 resolveRegularGroupMode：
+    // new-topic 下顶层消息走 thread/messageId，其余三种走 chat/chatId。
+    // 这里用真实 store + 临时 bots.json，读回的是生效值和落盘结果。
+    const NEW_CHAT = 'oc_new_group';
+    let dir: string | undefined;
+    let configPath: string;
+
+    function useBotDefault(mode: ChatReplyMode): void {
+      dir = mkdtempSync(join(tmpdir(), 'botmux-fork-create-reply-mode-'));
+      configPath = join(dir, 'bots.json');
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: LARK_APP_ID,
+        larkAppSecret: 'secret-1',
+        cliId: 'claude-code',
+        regularGroupReplyMode: mode,
+      }]));
+      const base = defaultGetBot(LARK_APP_ID);
+      vi.mocked(getBot).mockReturnValue({ ...base, config: { ...base.config, regularGroupReplyMode: mode } } as any);
+    }
+
+    function storedOverrides(): Record<string, ChatReplyMode> | undefined {
+      return JSON.parse(readFileSync(configPath, 'utf-8'))[0].chatReplyModes;
+    }
+
+    async function forkCreate(): Promise<DaemonSession> {
+      const ds = makeDaemonSession({
+        scope: 'chat',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_sender', scope: 'chat' }),
+      });
+      await handleCommand('/fork', ROOT_ID, makeLarkMessage('/fork --create 分身群'), makeDeps(ds), LARK_APP_ID);
+      return ds;
+    }
+
+    beforeEach(async () => {
+      // 外层 beforeEach 把 existsSync 钉成恒 true；临时配置目录里的旁路文件必须按真实存在判断，
+      // 否则配置写入会去 lstat 一个不存在的文件。
+      const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+      vi.mocked(existsSync).mockImplementation((p: any) =>
+        dir && typeof p === 'string' && p.startsWith(dir + '/') ? realFs.existsSync(p) : true);
+    });
+
+    afterEach(() => {
+      delete process.env.BOTS_CONFIG;
+      if (dir) rmSync(dir, { recursive: true, force: true });
+      dir = undefined;
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+    });
+
+    it('Bot 默认 new-topic：分身登记前新群已按群覆盖为 chat-topic，Bot 默认不变', async () => {
+      useBotDefault('new-topic');
+      let modeAtFork: ChatReplyMode | undefined;
+      vi.mocked(forkSession).mockImplementationOnce(async (_sessionId: string, chatId: string) => {
+        modeAtFork = resolveRegularGroupMode(LARK_APP_ID, chatId);
+        return { ok: true, childSessionId: 'child-pinned' };
+      });
+
+      const ds = await forkCreate();
+
+      expect(forkSession).toHaveBeenCalledWith('sess-001', NEW_CHAT, NEW_CHAT, 'group', 'chat', expect.anything());
+      expect(modeAtFork).toBe('chat-topic');
+      expect(getChatReplyModeState(LARK_APP_ID, NEW_CHAT)).toEqual({
+        override: 'chat-topic', default: 'new-topic', effective: 'chat-topic', inherited: false,
+      });
+      expect(storedOverrides()).toEqual({ [NEW_CHAT]: 'chat-topic' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].regularGroupReplyMode).toBe('new-topic');
+      expect(ds.session.forkChildSessionIds).toEqual(['child-pinned']);
+    });
+
+    it.each(['chat', 'chat-topic', 'shared'] as const)('Bot 默认 %s：顶层本来就落在 chatId，不写群级覆盖', async (mode) => {
+      useBotDefault(mode);
+
+      await forkCreate();
+
+      expect(forkSession).toHaveBeenCalledWith('sess-001', NEW_CHAT, NEW_CHAT, 'group', 'chat', expect.anything());
+      expect(getChatReplyModeState(LARK_APP_ID, NEW_CHAT)).toEqual({
+        override: null, default: mode, effective: mode, inherited: true,
+      });
+      expect(storedOverrides()).toBeUndefined();
+    });
+
+    it('Bot 默认 new-topic 但分身失败：撤掉刚写的群级覆盖，新群恢复继承', async () => {
+      useBotDefault('new-topic');
+      let modeAtFork: ChatReplyMode | undefined;
+      vi.mocked(forkSession).mockImplementationOnce(async (_sessionId: string, chatId: string) => {
+        modeAtFork = resolveRegularGroupMode(LARK_APP_ID, chatId);
+        return { ok: false, error: 'worker_busy' };
+      });
+
+      const ds = await forkCreate();
+
+      expect(modeAtFork).toBe('chat-topic');
+      expect(getChatReplyModeState(LARK_APP_ID, NEW_CHAT)).toEqual({
+        override: null, default: 'new-topic', effective: 'new-topic', inherited: true,
+      });
+      expect(storedOverrides()).toBeUndefined();
+      expect(ds.session.forkChildSessionIds).toBeUndefined();
+    });
+
+    it('写群级覆盖抛错时仍照常完成分身', async () => {
+      useBotDefault('new-topic');
+      // 配置路径丢失 ⟹ rmwBotEntry 拒绝。
+      delete process.env.BOTS_CONFIG;
+
+      const ds = await forkCreate();
+
+      expect(forkSession).toHaveBeenCalledWith('sess-001', NEW_CHAT, NEW_CHAT, 'group', 'chat', expect.anything());
+      expect(ds.session.forkChildSessionIds).toEqual(['child-sess-1']);
     });
   });
 

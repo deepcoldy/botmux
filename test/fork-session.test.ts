@@ -173,6 +173,21 @@ describe('isForkCapableSession', () => {
     expect(isForkCapableSession(makeSourceDs({ cliId: 'antigravity', backendType: 'remote-runner' }))).toBe(false);
   });
 
+  it('refuses Antigravity in the scratch sandbox, whose fork receipt the worker cannot read', () => {
+    expect(isForkCapableSession(makeSourceDs({ cliId: 'antigravity', sandbox: 'scratch' }))).toBe(false);
+    vi.stubEnv('BOTMUX_SANDBOX', 'scratch');
+    try {
+      expect(isForkCapableSession(makeSourceDs({ cliId: 'antigravity', sandbox: false }))).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('keeps Antigravity forkable under the oncall sandbox and other CLIs under scratch', () => {
+    expect(isForkCapableSession(makeSourceDs({ cliId: 'antigravity', sandbox: true }))).toBe(true);
+    expect(isForkCapableSession(makeSourceDs({ cliId: 'claude-code', sandbox: 'scratch' }))).toBe(true);
+  });
+
   it('refuses aiden because its adapter has no native fork contract', () => {
     const ds = makeSourceDs({ cliId: 'aiden' });
     expect(isForkCapableSession(ds)).toBe(false);

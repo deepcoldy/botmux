@@ -260,6 +260,7 @@ import type { CliTurnPayload, CrossPrincipalInterruption, CrossPrincipalInterrup
 import { ensureCjkFontsInstalled } from './utils/font-installer.js';
 import { scrubTmuxServerGlobalEnv, tmuxEnv } from './setup/ensure-tmux.js';
 import { entryNeedsContactResolve } from './setup/bot-config-editor.js';
+import { missingCliExecutableAfterRetry } from './setup/cli-availability.js';
 import { invalidWorkingDirs } from './utils/working-dir.js';
 import { validateWorkingDir } from './core/working-dir.js';
 import { comparableSessionDir } from './core/working-dir-range.js';
@@ -996,10 +997,11 @@ function startAdminUnionsPublisher(larkAppId: string): void {
   void publisher.publish();
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, getGroupStats, fetchBotProfileFromLark, setSelfMentionNameObserver, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, humanCanRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, getGroupStats, fetchBotProfileFromLark, setSelfMentionNameObserver, createLarkEventDispatcherRuntime, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, humanCanRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, ensureMessageRecalledEventSubscribed, ensureChatDisbandedEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers, type LarkEventDispatcherRuntime } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, isPollingDocTriggerMode, listAllDocSubscriptions, normalizeDocNativeWatchSubscription, putDocSubscription, recordDocWatchActivity, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReactionChecked, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments, polledReplyTriggerAllowed, type DocCommentReactionIdentity } from './im/lark/doc-comment.js';
 import { classifyLarkError } from './im/lark/error-classify.js';
+import { closeSessionsInGoneChat, closeSessionsInGoneChatsOnStartup } from './core/dismiss-command.js';
 import { ListenerCircuitBreaker } from './services/listener-circuit-breaker.js';
 import { pruneBotAttachments } from './core/attachment-prune.js';
 import { learnFromMentions, getIdentity, resolveSender, resolveVerifiedUserIdentity, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -6993,6 +6995,7 @@ const workflowWorkingDirOperatorWiring = createWorkflowWorkingDirOperatorWiring(
   listChatMemberOpenIds: (appId, chatId) => listChatMemberOpenIds(appId, chatId),
   canRunDaemonCommand: (appId, chatId, openId, unionId, cmd, chatType) => humanCanRunDaemonCommand(appId, chatId, openId, unionId, cmd, chatType),
   selfLarkAppId: () => workflowSelfAppId(),
+  warn: (message) => logger.warn(message),
 });
 
 const workflowNodeDaemon = createWorkflowNodeDaemon({
@@ -34114,6 +34117,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       ensureMessageUpdatedEventSubscribed(cfg.larkAppId).catch(err => {
         logger.debug(`[${cfg.larkAppId}] message-updated event subscription check failed: ${err?.message ?? err}`);
       });
+      ensureChatDisbandedEventSubscribed(cfg.larkAppId).catch(err => {
+        logger.debug(`[${cfg.larkAppId}] chat-disbanded event subscription check failed: ${err?.message ?? err}`);
+      });
       // Reconcile existing enabled rooms at startup; default-off deployments
       // do not acquire an extra platform subscription as a side effect.
       if (sessionStore.listSessions().some(session => session.larkAppId === cfg.larkAppId
@@ -34180,6 +34186,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         appId,
         () => handleBotAdded(chatId, operatorOpenId, appId),
       ),
+      handleChatGone: (chatId, appId, reason) =>
+        closeSessionsInGoneChat({ larkAppId: appId, chatId, reason, activeSessions }),
       handleDocComment: (ctx) => handleDocComment(ctx),
       handleVcMeetingPush: (ctx) => withBotTurnAdmission(
         ctx.larkAppId,
@@ -34468,13 +34476,27 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           });
         });
       } else {
-        startEventDispatchers.push(() => startLarkEventDispatcher(
-          cfg.larkAppId,
-          cfg.larkAppSecret,
-          botEventHandlers,
-          normalizeBrand(cfg.brand),
-          durableCoordinationRuntime?.store,
-        ));
+        const missingCli = await missingCliExecutableAfterRetry({
+          cliId: cfg.cliId,
+          cliPathOverride: cfg.cliPathOverride,
+          wrapperCli: cfg.wrapperCli,
+          cliLaunchMode: cfg.cliLaunchMode,
+        });
+        if (missingCli) {
+          logger.error(
+            `[${cfg.larkAppId}] 跳过飞书长连接注册：${missingCli}（cliId=${cfg.cliId}）。`
+            + '本机起不动这个 bot 的 CLI，注册了只会分走同一应用的消息再报会话启动失败；本 daemon 不会收到这个 bot 的任何飞书消息。'
+            + '在本机安装或修正 CLI（PATH / cliPathOverride / wrapperCli）后重启 daemon，或改由能启动它的机器承载此 bot。',
+          );
+        } else {
+          startEventDispatchers.push(() => startLarkEventDispatcher(
+            cfg.larkAppId,
+            cfg.larkAppSecret,
+            botEventHandlers,
+            normalizeBrand(cfg.brand),
+            durableCoordinationRuntime?.store,
+          ));
+        }
       }
     }
 
@@ -34606,6 +34628,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   startHookAskReclaim();
 
   for (const startDispatcher of startEventDispatchers) startDispatcher();
+  if (!cfg.apiOnly) void closeSessionsInGoneChatsOnStartup({ larkAppId: cfg.larkAppId, activeSessions });
   if (durableCoordinationRuntime?.mode === 'primary') {
     const deliverDurablePrimaryMessage = async (
       request: DurableSessionSendRequest,
