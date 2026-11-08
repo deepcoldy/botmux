@@ -10,6 +10,7 @@ import { buildSessionMessagePreview } from './session-message-preview.js';
 import { turnStartedAt } from './turn-outcome.js';
 import type { DaemonSession } from './types.js';
 import type { Session } from '../types.js';
+import { emitSessionTaskEvent } from './session-task-events.js';
 
 /**
  * Stamp `lastHumanMessageAt` on a session that is being created by a human
@@ -145,12 +146,31 @@ export function publishNativeTopicLinkPatchForSession(session: Session, activeLi
   return true;
 }
 
+const emittedAttention = new WeakMap<DaemonSession, number>();
+
+/** Tell the steward about a raise only when it is a new one, i.e. it has a new
+ *  `at`. Pushes that repeat the same raise (delivery retries keep the first
+ *  `at`, see raiseDaemonAttention) stay quiet. Don't dedupe on the reason: a
+ *  later turn can fail the same way with its own `at`, and the steward's alert
+ *  key is the raise time. */
+function noteAttentionEvent(ds: DaemonSession): void {
+  const raised = ds.agentAttention;
+  if (!raised) {
+    emittedAttention.delete(ds);
+    return;
+  }
+  if (emittedAttention.get(ds) === raised.at) return;
+  emittedAttention.set(ds, raised.at);
+  if (ds.session.chatId) emitSessionTaskEvent({ chatId: ds.session.chatId, sessionId: ds.session.sessionId });
+}
+
 /** Push the current attention signals (repo-selection pending / TUI prompt
  *  open) to the dashboard. Call after mutating `ds.pendingRepo` or
  *  `ds.tuiPromptCardId` so the board view's needs-you column tracks live
  *  state. Idempotent — patches are derived from the session, never toggled
  *  blindly. */
 export function publishAttentionPatch(ds: DaemonSession): void {
+  noteAttentionEvent(ds);
   dashboardEventBus.publish({
     type: 'session.update',
     body: {
