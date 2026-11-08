@@ -4754,7 +4754,11 @@ function makeSessionGroupBoardFields(): (chatId: string) => { sessionGroup?: tru
  *
  *  Legacy `action`/`async` fields are still populated so existing webhook
  *  consumers keep working; new callers branch on `state`. */
-function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string): TriggerResponse {
+function buildAsyncTriggerLookupResponse(
+  sessionId: string,
+  triggerId?: string,
+  opts: { includeFailureDiagnostics?: boolean } = {},
+): TriggerResponse {
   const ds = findActiveBySessionId(sessionId);
   const storedRaw = ds?.session ?? sessionStore.getSession(sessionId);
   const persistedRaw = asyncTriggerStore.lookup(sessionId, triggerId);
@@ -4884,10 +4888,13 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
       failedAt: memResult.failedAt,
       errorCode: memResult.errorCode,
       terminalErrorCode: memResult.terminalErrorCode,
+      terminalErrorDetail: memResult.terminalErrorDetail,
+      terminalScreenTail: memResult.terminalScreenTail,
       usage: memResult.usage,
       interruptedAt: memResult.interruptedAt,
     } : undefined,
     memTriggerId: memResult ? memTriggerId : undefined,
+    ...(opts.includeFailureDiagnostics ? { includeFailureDiagnostics: true } : {}),
     persisted,
     storedStatus: stored ? (stored.status === 'closed' ? 'closed' : 'open') : undefined,
     closedAt: stored?.closedAt,
@@ -6860,7 +6867,9 @@ export function productionWorkflowDraftClarifier(): DraftClarifier {
     activeSessions: getActiveSessionsRegistry,
     createHeadlessSession: (active, args) => withBotTurnAdmission(args.larkAppId, () => createHeadlessSession(active, undefined, args)),
     triggerSessionTurn,
-    lookupTriggerResult: buildAsyncTriggerLookupResponse,
+    // In-process: the draft's failure panel shows the raw error and screen.
+    lookupTriggerResult: (sessionId, triggerId) =>
+      buildAsyncTriggerLookupResponse(sessionId, triggerId, { includeFailureDiagnostics: true }),
     sessionStatus: (sessionId) => (findActiveBySessionId(sessionId)?.session ?? sessionStore.getOwnedSession(sessionId))?.status,
     suspendWorker,
     isSuspendable: (ds) => isSuspendableBackendType(ds.initConfig?.backendType),
@@ -9384,6 +9393,7 @@ ipcRoute('PUT', '/api/bot-substitute-mode', requireBoundBot(async (req, res) => 
   const r = await substituteModeStore.updateBotSubstituteMode(cachedLarkAppId, {
     enabled: rec.enabled === true,
     targets,
+    keywords: rec.keywords,
     disclosure: rec.disclosure === 'none' ? 'none' : 'prefix',
     replyMode: rec.replyMode === 'quote' ? 'quote' : 'thread',
     disableControlCard: rec.disableControlCard === true,

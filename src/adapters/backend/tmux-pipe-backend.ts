@@ -81,6 +81,16 @@ export function literalSendKeysArgs(target: string, text: string, version = getT
   return body ? ['send-keys', '-t', target, '-l', '--', body, ';', ...hex] : hex;
 }
 
+/** Quote one argument of a command string that tmux parses itself (an if-shell
+ *  branch). tmux 2.x has no backslash escapes outside quotes, so the `'\''`
+ *  form above splits there; every tmux unescapes `\\`, `\"`, `\$`, `\~` inside
+ *  double quotes, and tmux 3.x expands a `~` that opens them (an adopted pane's
+ *  target is the user's own session name). tmux 2.x also ends a command at an
+ *  argument ending in `;`. */
+function tmuxQuote(s: string): string {
+  return `"${s.replace(/[\\"$~]/g, '\\$&')}"`;
+}
+
 /** `failed` was added in tmux 3.2. Older/unknown versions retain every exit
  *  with `on`; handlePaneExit() reads the status and reaps that pane, including
  *  clean exits, so keeping it does not leak a session. */
@@ -826,7 +836,7 @@ export class TmuxPipeBackend implements SessionBackend {
     // re-thrown at once instead of delaying the same failure.
     // The copier must forward short writes at once, or a quiet CLI's ready /
     // final bytes never reach the worker and its next input queues forever.
-    const pipePaneCommand = `pipe-pane -O -t ${shellescape(this.paneTarget)} ${shellescape(pipePaneShellCommand(this.fifoPath))}`;
+    const pipeShellCommand = pipePaneShellCommand(this.fifoPath);
     // Same-boundary decision as the applied remain-on-exit value: it was
     // resolved against the RUNNING server (serverTmuxVersion) in
     // createDetachedSession/applySessionOptions before this attach. Guard
@@ -840,8 +850,9 @@ export class TmuxPipeBackend implements SessionBackend {
           // tmux 2.8 can crash its server when pipe-pane dereferences an
           // already-dead pane's released event. Keep this check and subscription
           // in ONE server queue; a client-side probe would race the CLI exit.
+          const guardedPipePane = `pipe-pane -O -t ${tmuxQuote(this.paneTarget)} ${tmuxQuote(pipeShellCommand)}`;
           const output = execSync(
-            `${this.tmuxCmd} if-shell -F -t ${shellescape(this.paneTarget)} '#{pane_dead}' ${shellescape(`display-message -p ${deadPaneMarker}`)} ${shellescape(pipePaneCommand)}`,
+            `${this.tmuxCmd} if-shell -F -t ${shellescape(this.paneTarget)} '#{pane_dead}' ${shellescape(`display-message -p ${deadPaneMarker}`)} ${shellescape(guardedPipePane)}`,
             { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000, env: tmuxEnv() },
           );
           if (String(output).trim() === deadPaneMarker) {
@@ -851,7 +862,7 @@ export class TmuxPipeBackend implements SessionBackend {
           }
         } else {
           execSync(
-            `${this.tmuxCmd} ${pipePaneCommand}`,
+            `${this.tmuxCmd} pipe-pane -O -t ${shellescape(this.paneTarget)} ${shellescape(pipeShellCommand)}`,
             { stdio: ['ignore', 'ignore', 'pipe'], timeout: 5000, env: tmuxEnv() },
           );
         }

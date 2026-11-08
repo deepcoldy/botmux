@@ -3,6 +3,7 @@ import { isWorkflowNodeSessionMarker } from './workflow-node-session.js';
 import { stageOrdinaryTurnRecoveryTerminal, reconcileOrdinaryTurnRecoveryTerminalReceipt } from '../services/ordinary-turn-recovery.js';
 import { codexAppRecoveryCaller, codexCapacityRecoveryCli } from '../services/codex-app-failure.js';
 import { codexAppSettlementOutcome } from '../services/runner-final-outcome.js';
+import { turnFailureDiagnostics } from '../services/turn-failure-diagnostics.js';
 import { canTalk, evaluateTalk } from '../im/lark/event-dispatcher.js';
 import { cancelDeploymentContinuation, deploymentContinuationClaimCurrent } from '../services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from './deployment-continuation-authority.js';
@@ -895,6 +896,7 @@ import {
   storedSessionAnchorId,
   isDocNativeSession,
   isHttpVirtualSession,
+  isHeadlessSessionChatId,
   larkTransportEnabled,
   remoteRetirementAdmissionPhase,
   type DaemonSession,
@@ -10322,6 +10324,48 @@ function consumeDocCommentTurn(ds: DaemonSession, turnId: string): void {
   }
 }
 
+/** A document turn refused before admission never runs and never emits
+ * final_output, so nothing else would answer its comment or clear its Typing
+ * marker. The route is consumed synchronously before any await: a duplicate
+ * rejection frame then finds no target and cannot post a second notice.
+ * A pending queued activation and a Codex App accepted ledger entry are both
+ * replayed by the next fork; unless that entry is cancelled, the turn may
+ * still run, so it must not be reported as not executed. */
+function rejectDocCommentTurnBeforeAdmission(ds: DaemonSession, turnId: string, reason: string): void {
+  const docTurn = resolveDocCommentTarget(ds, turnId);
+  if (!docTurn) return;
+  if (ds.session.queuedActivationPending && ds.session.queuedActivationTurnId === turnId) return;
+  const ledgerEntries = ds.session.codexAppDispatchLedger?.filter(entry => entry.turnId === turnId) ?? [];
+  if (ledgerEntries.length > 0) {
+    const accepted = ledgerEntries.length === 1 && ledgerEntries[0]!.state === 'accepted' ? ledgerEntries[0]! : undefined;
+    if (!accepted || !rollbackAcceptedCodexAppDispatch(ds, accepted.dispatchId, turnId, accepted.dispatchAttempt)) return;
+  }
+  consumeDocCommentTurn(ds, turnId);
+  logger.warn(`[${tag(ds)}] doc-comment turn rejected before admission turn=${turnId.substring(0, 16)} reason=${reason}`);
+  const file = { fileToken: docTurn.fileToken, fileType: docTurn.fileType };
+  const notice = tr(
+    'worker.input_rejected_before_admission',
+    { turnId: turnId.substring(0, 16), reason },
+    botLocale(getBot(ds.larkAppId).config),
+  );
+  void (async () => {
+    try {
+      await replyToDocComment(ds.larkAppId, file, docTurn.commentId, notice, docTurn.replyToOpenId);
+    } catch (err: any) {
+      logger.error(`[doc-comment] failed to report rejected turn ${turnId.substring(0, 16)}: ${err?.message ?? err}`);
+    }
+    const reactionType = docTurn.reactionType ?? (docTurn.replyId ? 'Typing' : undefined);
+    if (reactionType && docTurn.replyId) {
+      try {
+        await removeCommentReaction(ds.larkAppId, file, docTurn.commentId, docTurn.replyId, reactionType,
+          { identity: docTurn.reactionIdentity });
+      } catch (err: any) {
+        logger.debug(`[doc-comment] failed to remove rejected reaction ${reactionType}: ${err?.message ?? err}`);
+      }
+    }
+  })();
+}
+
 function collectDocCommentReactionTargets(
   ds: DaemonSession | undefined,
   stored: Session | undefined,
@@ -13019,6 +13063,10 @@ export function isForkCapableSession(ds: DaemonSession): boolean {
   const cliId = sessionCliId(ds, botCfg);
   if (!FORK_CAPABLE_CLI_IDS.has(cliId)) return false;
   if (cliId === 'antigravity' && isRemoteBackendSession(ds)) return false;
+  // agy writes its fork receipt to --log-file under ~/.gemini; the scratch
+  // overlay keeps that write out of the host path the worker tails.
+  if (cliId === 'antigravity'
+    && sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged) === 'scratch') return false;
   // An external App Server thread is not a local rollout. `codex fork` would
   // resolve against the terminal client's own CODEX_HOME and could fork an
   // unrelated/empty local session, so refuse rather than claiming a copy was
@@ -13535,14 +13583,14 @@ function rollbackAcceptedCodexAppDispatch(
   dispatchId: string | undefined,
   turnId: string | undefined,
   dispatchAttempt: number | undefined,
-): void {
-  if (!dispatchId || !turnId) return;
+): boolean {
+  if (!dispatchId || !turnId) return false;
   const cancelled = cancelCodexAppDispatch(ds.session.codexAppDispatchLedger ?? [], {
     dispatchId,
     turnId,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
   });
-  if (!cancelled.ok) return;
+  if (!cancelled.ok) return false;
   const priorLedger = ds.session.codexAppDispatchLedger;
   ds.session.codexAppDispatchLedger = cancelled.ledger;
   try {
@@ -13557,7 +13605,9 @@ function rollbackAcceptedCodexAppDispatch(
     }
   } catch {
     ds.session.codexAppDispatchLedger = priorLedger;
+    return false;
   }
+  return true;
 }
 
 /**
@@ -16653,6 +16703,16 @@ function forkWorkerPrepared(
     // marker so its CLI system prompt and `botmux skill show` skip workflow.
     // A main-topic handoff's marker (§5.5) leaves the ordinary session as is.
     ...(isWorkflowNodeSessionMarker(ds.session.workflowNode) ? { workflowNodeSession: true as const } : {}),
+    // A workflow draft's clarify session (persisted on the session, so every
+    // fork — restore, resume, cold resume after an idle release — carries it):
+    // only its failed turns capture the provider's error and the screen tail.
+    // Once moved into its topic (拉群开始), the draft's panel no longer reads
+    // it: the session's chat is then the topic's, already when the transfer
+    // forks the topic's worker (before the binding is recorded, or if it never
+    // is), so the chat — not the binding record — decides.
+    ...(ds.session.headless?.failureDiagnostics === true && isHeadlessSessionChatId(ds.session.chatId)
+      ? { captureTurnFailureDiagnostics: true as const }
+      : {}),
     feedback: feedbackPolicy,
     terminalCardEpoch: ds.session.terminalCardEpoch,
     // Freeze the ACTUAL loaded bots-config path (getLoadedConfigPath) so a
@@ -17999,6 +18059,7 @@ function setupWorkerHandlers(
           break;
         }
         discardTriggerStreamingCard(ds, msg.turnId);
+        if (msg.rejectedBeforeAdmission) rejectDocCommentTurnBeforeAdmission(ds, msg.turnId, msg.reason);
         await rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg);
         // The turn never started and will never terminal. Run GC, but do NOT
         // release this turn's own ledger anchor here: a same-turnId redelivery
@@ -21142,6 +21203,14 @@ function setupWorkerHandlers(
                   asyncResult.failedAt = failedAt;
                   asyncResult.errorCode = 'trigger_failed';
                   asyncResult.terminalErrorCode = failureCode;
+                  // Re-masked here: an older or foreign worker may not have.
+                  // Both are this terminal's, like the code: a later terminal
+                  // (another attempt) never shows under an earlier one's text.
+                  const diagnostics = turnFailureDiagnostics({ errorDetail: msg.errorDetail, screen: msg.screenTail });
+                  if (diagnostics.errorDetail) asyncResult.terminalErrorDetail = diagnostics.errorDetail;
+                  else delete asyncResult.terminalErrorDetail;
+                  if (diagnostics.screenTail) asyncResult.terminalScreenTail = diagnostics.screenTail;
+                  else delete asyncResult.terminalScreenTail;
                 }
               }
               try {

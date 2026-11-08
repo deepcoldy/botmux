@@ -986,7 +986,8 @@ export interface WriteRedirectWhitelistOptions {
  * referer 绑死单个 appId 的内联 postJson。
  *
  * 瞬态写入失败会在总截止时间内恢复至多两轮，每轮先重新读取现值再合并写；
- * 写成功后必须读回确认。权限/登录拒绝不重试，创建/发布等其它 POST 不受影响。
+ * 写成功后必须读回确认。尚未提交写入时，读现值遇到网络抖动也按同一退避重读；
+ * 截止时间内始终读不回就保持零写入。权限/登录拒绝不重试，创建/发布等其它 POST 不受影响。
  * **只在「URL 被 console 判非法」这一类错误上**兜底写一次「线上现值 ∪
  * 127.0.0.1 那条」：`wanted` 里某条 URL 的格式被拒时整批会一起失败，最小集能保住
  * 最核心的粘贴回调链路。网络抖动 / 403 鉴权失败不触发最小集兜底（见
@@ -1033,11 +1034,12 @@ export async function writeRedirectWhitelist(
     }
     return result;
   };
+  let unreadable: RedirectWhitelistWriteResult | undefined;
   try {
     for (let attempt = 0; ; attempt++) {
       try {
         // 每一轮都重读现值；结果未知时可能已写入，也可能有人新增了自定义地址。
-        const result = await writeRedirectWhitelistOnce(boundedPostJson, appId, wanted, {
+        const { readFailure, ...result } = await writeRedirectWhitelistOnce(boundedPostJson, appId, wanted, {
           ...options,
           // 新应用允许的初始盲写不能延伸到恢复阶段：前一轮可能已经落地。
           allowBlindWrite: attempt === 0 && options.allowBlindWrite === true,
@@ -1045,6 +1047,12 @@ export async function writeRedirectWhitelist(
         controller.signal.throwIfAborted();
         const mutation = mutationSubmitted ? { mutationSubmitted: true } : {};
         if (result.status === 'skipped_unreadable') {
+          if (!mutationSubmitted && attempt < TRANSIENT_FETCH_RETRY_DELAYS_MS.length
+            && isLikelyTransientNetworkError(readFailure)) {
+            unreadable = result;
+            await waitForRedirectRetry(TRANSIENT_FETCH_RETRY_DELAYS_MS[attempt], controller.signal);
+            continue;
+          }
           return mutationSubmitted
             ? { ...result, ...mutation, warning: '白名单写入已提交或结果未知，但恢复时无法读回现值；为避免覆盖自定义地址，未继续写入' }
             : result;
@@ -1061,7 +1069,11 @@ export async function writeRedirectWhitelist(
         }
         return { ...result, ...mutation, redirectUrls: live };
       } catch (err) {
-        if (controller.signal.aborted) throw controller.signal.reason;
+        if (controller.signal.aborted) {
+          // 只在重读、从未提交写入时耗尽预算：结果仍是零写入的「读不到现值」。
+          if (unreadable && !mutationSubmitted) return unreadable;
+          throw controller.signal.reason;
+        }
         if (attempt >= TRANSIENT_FETCH_RETRY_DELAYS_MS.length || !isRetryableRedirectWriteError(err)) throw err;
         await waitForRedirectRetry(TRANSIENT_FETCH_RETRY_DELAYS_MS[attempt], controller.signal);
       }
@@ -1124,9 +1136,10 @@ async function writeRedirectWhitelistOnce(
   appId: string,
   wanted: string[],
   options: WriteRedirectWhitelistOptions,
-): Promise<RedirectWhitelistWriteResult> {
+): Promise<RedirectWhitelistWriteResult & { readFailure?: unknown }> {
   let existing: string[] | null = null;
   let readError: string | undefined;
+  let readFailure: unknown;
   try {
     const payload = await postJson(`/developers/v1/safe_setting/${appId}`, {});
     existing = extractOpenPlatformRedirectUrls(payload);
@@ -1139,6 +1152,7 @@ async function writeRedirectWhitelistOnce(
     // 端点不存在 / 网络抖动 / 403 → 当作读不出来。
     existing = null;
     readError = safeErrorMessage(err);
+    readFailure = err;
   }
 
   if (existing === null && !options.allowBlindWrite) {
@@ -1148,6 +1162,7 @@ async function writeRedirectWhitelistOnce(
       existing: null,
       redirectUrls: [],
       warning: `读不到开放平台现有 redirect 白名单（${readError ?? '未知原因'}），为避免覆盖用户自定义回调地址，本次未写入`,
+      readFailure,
     };
   }
 

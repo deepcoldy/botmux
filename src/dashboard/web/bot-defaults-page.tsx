@@ -7272,7 +7272,7 @@ function CommandTriggerSection(props: { bot: BotDefaultsRow }) {
   );
 }
 
-function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+export function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const initial = props.bot.substituteMode ?? null;
   const [enabled, setEnabled] = useState(initial?.enabled === true);
@@ -7290,6 +7290,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
   const [controlCard, setControlCard] = useState(initial?.disableControlCard !== true);
   const [chatsText, setChatsText] = useState(() => formatSubstituteChats(initial?.chats));
   const [excludedChatsText, setExcludedChatsText] = useState(() => formatSubstituteChats(initial?.excludedChats));
+  const [keywordsText, setKeywordsText] = useState(() => (initial?.keywords ?? []).join('\n'));
   // 话题群相关开关缺省开：只有显式 false 才是关（与 normalize 语义一致）。
   const [topicGroups, setTopicGroups] = useState(initial?.topicGroups !== false);
   const [topicActiveSessionTrigger, setTopicActiveSessionTrigger] = useState(initial?.topicActiveSessionTrigger !== false);
@@ -7384,13 +7385,14 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
     setControlCard(next?.disableControlCard !== true);
     setChatsText(formatSubstituteChats(next?.chats));
     setExcludedChatsText(formatSubstituteChats(next?.excludedChats));
+    setKeywordsText((next?.keywords ?? []).join('\n'));
     setTopicGroups(next?.topicGroups !== false);
     setTopicActiveSessionTrigger(next?.topicActiveSessionTrigger !== false);
     const targets = next?.targets ?? [];
     setTargetRows(targets.length ? targets.map(target => makeTargetDraft(target)) : [makeTargetDraft()]);
   }, [props.bot.larkAppId, props.bot.substituteMode]);
 
-  async function save(body: { enabled: boolean; targets: BotSubstituteTarget[]; disclosure?: 'prefix' | 'none'; chats?: string[]; excludedChats?: string[]; replyMode?: 'thread' | 'quote'; disableControlCard?: boolean; topicGroups?: boolean; topicActiveSessionTrigger?: boolean }): Promise<void> {
+  async function save(body: { enabled: boolean; targets: BotSubstituteTarget[]; keywords?: string[]; disclosure?: 'prefix' | 'none'; chats?: string[]; excludedChats?: string[]; replyMode?: 'thread' | 'quote'; disableControlCard?: boolean; topicGroups?: boolean; topicActiveSessionTrigger?: boolean }): Promise<void> {
     setBusy(true);
     setStatus(null);
     try {
@@ -7412,6 +7414,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
         setControlCard(next?.disableControlCard !== true);
         setChatsText(formatSubstituteChats(next?.chats));
         setExcludedChatsText(formatSubstituteChats(next?.excludedChats));
+        setKeywordsText((next?.keywords ?? []).join('\n'));
         setTopicGroups(next?.topicGroups !== false);
         setTopicActiveSessionTrigger(next?.topicActiveSessionTrigger !== false);
         if (resolution.length) {
@@ -7484,7 +7487,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
       setStatus({ text: `✗ ${tr('botDefaults.substituteTargetsInvalid')}` });
       return;
     }
-    void save({ enabled, targets, disclosure, chats: parseSubstituteChats(chatsText), excludedChats: parseSubstituteChats(excludedChatsText), replyMode, disableControlCard: !controlCard, topicGroups, topicActiveSessionTrigger });
+    void save({ enabled, targets, keywords: parseSubstituteChats(keywordsText), disclosure, chats: parseSubstituteChats(chatsText), excludedChats: parseSubstituteChats(excludedChatsText), replyMode, disableControlCard: !controlCard, topicGroups, topicActiveSessionTrigger });
   }
 
   const disclosureOptions: DropdownFieldOption<'prefix' | 'none'>[] = [
@@ -7507,6 +7510,20 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
         help={tr('botDefaults.substituteHelp')}
         onChange={setEnabled}
       />
+      <div className="bd-row">
+        <label>
+          <FieldTitle help={tr('botDefaults.substituteKeywordsHelp')}>{tr('botDefaults.substituteKeywords')}</FieldTitle>
+          <textarea
+            data-input="substituteKeywords"
+            rows={3}
+            placeholder={tr('botDefaults.substituteKeywordsPlaceholder')}
+            value={keywordsText}
+            disabled={busy}
+            onChange={event => setKeywordsText(event.currentTarget.value)}
+          />
+          <p className="help">{tr('botDefaults.substituteKeywordsHelp')}</p>
+        </label>
+      </div>
       <ToggleRow
         checked={topicGroups}
         disabled={busy}

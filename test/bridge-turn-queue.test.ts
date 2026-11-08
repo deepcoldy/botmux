@@ -1214,6 +1214,39 @@ describe('BridgeTurnQueue', () => {
       expect(q.size()).toBe(0);
     });
 
+    it('an API error that ends the host turn keeps its text, and the absorbed turn ends with the same error', () => {
+      const q = new BridgeTurnQueue();
+      const promptB = 'second request while busy';
+      const text = 'API Error: 403 {"error":{"type":"permission_error","message":"Access denied for model x"}}';
+      q.mark('tA', makeFingerprint('first request'), 100, normaliseForFingerprint('first request'), 1);
+      q.mark('tB', makeFingerprint(promptB), 200, normaliseForFingerprint(promptB), 1);
+      q.ingest([
+        user('uA', 'first request'),
+        assistantToolUse('a-tool'),
+        absorbedQueued('q-absorbed', promptB, new Date(5000).toISOString()),
+        {
+          type: 'assistant', uuid: 'a-403', isApiErrorMessage: true, error: 'authentication_failed', apiErrorStatus: 403,
+          message: { role: 'assistant', model: '<synthetic>', stop_reason: 'stop_sequence', content: [{ type: 'text', text }] },
+        } as TranscriptEvent,
+        { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent,
+      ]);
+      const ready = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(ready.map(t => [t.turnId, t.terminalOutcome?.status, t.terminalErrorDetail])).toEqual([
+        ['tA', 'failed', text],
+        ['tB', 'failed', text],
+      ]);
+    });
+
+    it('a completed turn carries no error text', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('tA', makeFingerprint('hi'), 100, normaliseForFingerprint('hi'), 1);
+      q.ingest([user('uA', 'hi'), assistant('a-final', 'hello'),
+        { type: 'system', subtype: 'turn_duration', uuid: 'duration' } as TranscriptEvent]);
+      const [turn] = q.drainEmittable({ explicitTerminalOnly: true });
+      expect(turn).toMatchObject({ turnId: 'tA', terminalOutcome: { status: 'completed' } });
+      expect(turn!.terminalErrorDetail).toBeUndefined();
+    });
+
     it('absorbed input stays queued until its host turn closes', () => {
       const q = new BridgeTurnQueue();
       const promptB = 'second request while busy';
