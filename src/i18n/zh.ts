@@ -3,6 +3,19 @@
  * "source of truth" dictionary; `en.ts` mirrors the same keys.
  */
 export const messages: Record<string, string> = {
+  'worker.purge_images_unsupported': '🧹「清理小图并续跑」仅支持本地 Claude Code 会话，当前会话不适用。请改用 /clear 或开新话题恢复。',
+  'worker.purge_images_busy': '🧹 CLI 正在重启，暂时无法清理小图，会话记录未改动。请等它恢复后再点一次。',
+  'worker.purge_images_sandbox_unsupported': '🧹 当前会话运行在 macOS 隔离沙箱中，暂不支持「清理小图并续跑」，会话记录未改动。请改用 /clear 或开新话题恢复。',
+  'worker.purge_images_exit_unproven': '🧹 未能确认 CLI 进程已安全停下，本次没有清理，会话记录未改动。请稍后重试，或用 /clear 恢复。',
+  'worker.purge_images_unmeasurable': '🧹 会话记录里有无法识别尺寸的图片（格式不支持或数据不完整），本次没有清理，会话记录未改动。请用 /clear 或开新话题恢复。',
+  'worker.purge_images_unsupported_source': '🧹 会话记录里的图片不是内嵌数据（如链接或文件引用），无法在本地判断尺寸，会话记录未改动。请用 /clear 或开新话题恢复。',
+  'worker.purge_images_no_images': '🧹 当前会话记录里没有图片（会话文件可能已轮转），会话记录未改动。请用 /clear 或开新话题恢复。',
+  'worker.purge_images_not_found': '🧹 当前会话记录里的图片尺寸都正常，没有可清理的过小图片，会话记录未改动。请把网页终端里的完整报错反馈给管理员，或先用 /clear 恢复。',
+  'worker.purge_images_failed': '🧹 会话记录读取或改写失败，本次没有清理，会话记录未改动。可改用 /clear 恢复。',
+  'worker.purge_images_done': '🧹 已从 {files} 个会话记录文件移除 {removed} 张过小图片（原文件已备份为同目录 .botmux-purge-bak-*），CLI 已以 --resume 重启，正在自动续跑，文本上下文保留。',
+  'worker.purge_images_partial': '🧹 已从 {files} 个会话记录文件移除 {removed} 张过小图片（原文件已备份为同目录 .botmux-purge-bak-*），CLI 已以 --resume 重启。但会话记录里还有无法确认尺寸或没能处理的图片，已原样保留；为免再撞同一个错误，这次没有自动续跑。发送任意消息即可继续；如果仍报同样的错误，请用 /clear 或开新话题恢复。',
+  'worker.purge_images_restart_failed': '🧹 已从 {files} 个会话记录文件移除 {removed} 张过小图片（原文件已备份为同目录 .botmux-purge-bak-*），但 CLI 重启失败，这次没有自动续跑。请按随后的错误提示恢复 CLI，再发送消息继续。',
+  'worker.purge_images_superseded': '🧹 已从 {files} 个会话记录文件移除 {removed} 张过小图片（原文件已备份为同目录 .botmux-purge-bak-*），但这次重启被另一次重启取代，没有自动续跑。等 CLI 恢复后发送任意消息即可继续。',
   'feedback.storage.choose': '反馈存储：SQLite [默认] / PostgreSQL (sqlite/postgresql)：',
   'feedback.storage.configPath': 'PostgreSQL 配置 JSON 路径（仅凭据引用，不填明文密码）：',
   'cmd.effort.usage': '/effort <low|medium|high|xhigh|max|ultra> [任务] — 修改 Codex 推理强度；任务可同一行或换行附带，强度确认后再投递。CLI 从下一轮生效；App 更新当前轮需启用 step_model_switching（默认关闭，档位以模型为准）',
@@ -1649,8 +1662,16 @@ export const messages: Record<string, string> = {
   // 「跑到一半挂了」——重发会重跑，必须让用户自己判断。
   'card.turn_failed.retry_caveated': '⚠️ 这一轮**可能已经执行了一部分**（改文件 / 提交 / 发消息等）。点「继续」不会原样重跑：会让 CLI **先读取当前现场**，判断做到哪一步，再从上次的进度接着做；判断不了会停下来交回你决定。仍建议先看一眼 Web 终端。',
   'card.turn_failed.no_retry': '当前错误重发同样的输入也无法成功，请检查后发送新的消息。',
+  // 会话历史里混入了尺寸过小（如 1×1）的图片块：通常是 CLI 的读图工具读了占位像素图。
+  // 该图会随之后每一次请求重放，所以继续/重发都必然再次 400。首选一键恢复：worker
+  // 清洗会话记录里的小图块（备份）后 --resume 重启并自动续跑，文本上下文保留；
+  // /clear 是本地操作、不发 API 请求，作为无按钮时的兜底出口（/compact 也会 400）。
+  'card.turn_failed.image_too_small': '🧹 当前会话历史中混入了尺寸过小的图片（如 1×1 占位像素图，通常是 CLI 读取了这类图片文件）。该图片会随后续每一条消息一起发送，所以**继续发任何指令都会得到同样的 400 错误，普通重发无效**。\n\n恢复方法（任选其一）：\n1. 点下方「清理小图并续跑」：自动从会话记录移除这类图片（原文件备份）后重启恢复，**文本上下文保留**；\n2. 或在本话题发送 `/clear` 清空上下文后重发任务（本地操作，不需要请求模型）；\n3. 或直接开一个新话题重新开始。',
+  'card.btn.purge_images_continue': '🧹 清理小图并续跑（保留上下文）',
   'card.turn_failed.no_input': '这一轮没有可重发的输入记录（任务在提交前就中断了），请直接发送新的消息。',
 
+  'card.action.purge_images_unsupported': '⚠️「清理小图并续跑」仅支持本地 Claude Code 话题会话，当前会话不适用。',
+  'card.action.purge_images_started': '正在清理会话小图并重启续跑…',
   'card.action.retry_turn_missing': '⚠️ 找不到这一轮的输入记录，无法重试。请直接发送新的消息。',
   'card.action.retry_turn_stale': '⚠️ 这张卡片已过期（会话后来又失败过或已重试）。请用最新那张卡片，或直接发送新的消息。',
   'card.action.retry_turn_cooldown': '⏳ 重试冷却中，请在 {seconds} 秒后再试。',
@@ -1671,6 +1692,7 @@ export const messages: Record<string, string> = {
   'card.recovery_failed.cause.quota': '模型额度用尽或调用频率受限',
   'card.recovery_failed.cause.provider_auth': '模型接口鉴权失败（凭据失效或没有权限）',
   'card.recovery_failed.cause.provider_rejected': '请求被模型接口拒绝',
+  'card.recovery_failed.cause.image_too_small': '会话历史里混入了尺寸过小的图片，模型接口拒收整个请求',
   'card.recovery_failed.cause.capacity': '模型服务容量不足',
   'card.recovery_failed.cause.outcome_unverified': '自动续跑后没有收到结果，无法确认是否完成',
   'card.recovery_failed.cause.restart_interrupted': 'Botmux 重启打断了自动恢复',
