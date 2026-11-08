@@ -5252,13 +5252,15 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 describe('Worker hidden schedule retirement', () => {
   const turnId = 'schedule:task-hidden:11111111-2222-3333-4444-555555555555';
 
-  function prepareHiddenRun(armedAt = Date.now(), hidden = true, humanFollowUp = false) {
+  function prepareHiddenRun(
+    armedAt = Date.now(), hidden = true, humanFollowUp = false,
+    routingAnchor = 'schedule-run:task-hidden:11111111-2222-3333-4444-555555555555',
+  ) {
     const ds = makeDs();
     ds.adoptedFrom = undefined;
     ds.session.cliId = 'traex';
     ds.session.deferredScheduleRun = {
-      taskId: 'task-hidden', turnId,
-      routingAnchor: 'schedule-run:task-hidden:11111111-2222-3333-4444-555555555555',
+      taskId: 'task-hidden', turnId, routingAnchor,
       createdAt: new Date().toISOString(),
     };
     ds.session.rootMessageId = ds.session.deferredScheduleRun.routingAnchor;
@@ -5334,6 +5336,56 @@ describe('Worker hidden schedule retirement', () => {
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
+  it('does not settle a re-fired task-position run on the previous turn\'s unattributed idle', async () => {
+    const { ds, sessionReply, onDeferredScheduleTurnSettled } = prepareHiddenRun(
+      Date.now(), true, false, 'schedule-task:task-hidden',
+    );
+    const rerunTurnId = 'schedule:task-hidden:66666666-7777-8888-9999-000000000000';
+    ds.session.deferredScheduleRun!.turnId = rerunTurnId;
+    ds.deferredScheduleUnconfirmedTurnId = rerunTurnId;
+    const idle: Extract<WorkerToDaemon, { type: 'screen_update' }> = {
+      type: 'screen_update', content: 'ready', status: 'idle',
+    };
+    (ds.worker as any).emit('message', idle);
+    await Promise.resolve();
+    expect(ds.lastScreenStatus).toBe('idle');
+    expect(onDeferredScheduleTurnSettled).not.toHaveBeenCalled();
+
+    (ds.worker as any).emit('message', { ...idle, status: 'working', turnId: rerunTurnId });
+    (ds.worker as any).emit('message', idle);
+    await Promise.resolve();
+    expect(onDeferredScheduleTurnSettled).toHaveBeenCalledExactlyOnceWith(ds, { turnId: rerunTurnId, source: 'idle' });
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('does not let an in-flight frame stamped with the previous turn disarm the marker', async () => {
+    // The scheduler rewrites run.turnId in the daemon while the worker's periodic
+    // sampler may already have queued a screen_update stamped with the OLD turn.
+    // That frame matches neither run nor marker: it must neither settle nor clear
+    // the marker, or the old turn's later unattributed tail would settle the new
+    // turn again.
+    const oldTurn = turnId;
+    const rerunTurnId = 'schedule:task-hidden:66666666-7777-8888-9999-000000000000';
+    const { ds, sessionReply, onDeferredScheduleTurnSettled } = prepareHiddenRun(
+      Date.now(), true, false, 'schedule-task:task-hidden',
+    );
+    ds.session.deferredScheduleRun!.turnId = rerunTurnId;
+    ds.deferredScheduleUnconfirmedTurnId = rerunTurnId;
+    ds.silentScheduledTurns = new Map([[oldTurn, Date.now()], [rerunTurnId, Date.now()]]);
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'wrapping up', status: 'idle', turnId: oldTurn,
+    });
+    await Promise.resolve();
+    expect(onDeferredScheduleTurnSettled).not.toHaveBeenCalled();
+
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'ready', status: 'idle',
+    });
+    await Promise.resolve();
+    expect(onDeferredScheduleTurnSettled).not.toHaveBeenCalled();
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
   it.each([true, false])('keeps a still-hidden run quiet after the bounded turn registry expired, identity=%s', async hasIdentity => {
     const { ds, sessionReply } = prepareHiddenRun(Date.now() - 25 * 60 * 60 * 1000);
     (ds.worker as any).emit('message', {
@@ -5374,6 +5426,129 @@ describe('Worker hidden schedule retirement', () => {
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(onDeferredScheduleTurnSettled).not.toHaveBeenCalled();
+  });
+});
+
+describe('Worker turn_input_rejected for document-comment turns', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const rejection = {
+    type: 'turn_input_rejected',
+    turnId: 'reply-b',
+    reason: 'cross_principal_requires_owner_confirmation',
+    rejectedBeforeAdmission: true,
+    activeTurnId: 'reply-a',
+    activeCaller: {
+      requestUserOpenId: 'ou_a',
+      requestUserUnionId: 'on_a',
+      requestLarkAppId: 'app_test',
+      senderType: 'user',
+    },
+  } satisfies Extract<WorkerToDaemon, { type: 'turn_input_rejected' }>;
+
+  function setupDocCommentSession() {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.scope = 'chat';
+    ds.chatId = 'doc:doc-token';
+    ds.session.scope = 'chat';
+    ds.session.chatId = 'doc:doc-token';
+    const activeTarget = {
+      fileToken: 'doc-token', fileType: 'docx', commentId: 'comment-1', replyToOpenId: 'ou_a',
+      replyId: 'reply-a', reactionType: 'Typing', reactionIdentity: 'tenant' as const,
+    };
+    const rejectedTarget = {
+      fileToken: 'doc-token', fileType: 'docx', commentId: 'comment-1', replyToOpenId: 'ou_b',
+      replyId: 'reply-b', reactionId: 'reaction-b', reactionType: 'Typing', reactionIdentity: 'tenant' as const,
+    };
+    ds.docCommentTurns = new Map([['reply-a', activeTarget], ['reply-b', rejectedTarget]]);
+    ds.session.docCommentTargets = {
+      'reply-a': { ...activeTarget, turnId: 'reply-a' },
+      'reply-b': { ...rejectedTarget, turnId: 'reply-b' },
+    };
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    return { ds, sessionReply };
+  }
+
+  it('answers a comment rejected before admission on its own thread and clears its Typing marker once', async () => {
+    const { ds, sessionReply } = setupDocCommentSession();
+    // worker 重发同一拒收帧时，评论串里也只能出现一条提示。
+    (ds.worker as any).emit('message', rejection);
+    (ds.worker as any).emit('message', rejection);
+    await vi.waitFor(() => expect(removeCommentReactionMock).toHaveBeenCalled());
+
+    expect(replyToDocCommentMock).toHaveBeenCalledTimes(1);
+    expect(replyToDocCommentMock).toHaveBeenCalledWith(
+      'app_test', { fileToken: 'doc-token', fileType: 'docx' }, 'comment-1', expect.any(String), 'ou_b',
+    );
+    expect(removeCommentReactionMock).toHaveBeenCalledTimes(1);
+    expect(removeCommentReactionMock).toHaveBeenCalledWith(
+      'app_test', { fileToken: 'doc-token', fileType: 'docx' }, 'comment-1', 'reply-b', 'Typing', { identity: 'tenant' },
+    );
+    expect(sessionReply).not.toHaveBeenCalled();
+    // 被拒评论的回复落点已消费，仍在执行的那一轮的落点原样保留。
+    expect([...(ds.docCommentTurns?.keys() ?? [])]).toEqual(['reply-a']);
+    expect(Object.keys(ds.session.docCommentTargets ?? {})).toEqual(['reply-a']);
+  });
+
+  it('cancels the rejected Codex App turn from the dispatch ledger before reporting it as not executed', async () => {
+    const { ds } = setupDocCommentSession();
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'dispatch-a', turnId: 'reply-a', state: 'prepared', content: 'a', deliverySink: 'doc_comment' },
+      { dispatchId: 'dispatch-b', turnId: 'reply-b', state: 'accepted', content: 'b', deliverySink: 'doc_comment' },
+    ];
+    (ds.worker as any).emit('message', rejection);
+    await vi.waitFor(() => expect(removeCommentReactionMock).toHaveBeenCalled());
+
+    // 不撤掉这条 accepted，下一轮 prepare 会报 dispatch_out_of_order，refork 还会把已告知未执行的输入重放一遍。
+    expect(ds.session.codexAppDispatchLedger?.map(entry => entry.dispatchId)).toEqual(['dispatch-a']);
+    expect(replyToDocCommentMock).toHaveBeenCalledTimes(1);
+    expect([...(ds.docCommentTurns?.keys() ?? [])]).toEqual(['reply-a']);
+  });
+
+  it('keeps the old silent path when the Codex App ledger entry of the rejected turn cannot be cancelled', async () => {
+    const { ds } = setupDocCommentSession();
+    const ledger = [
+      { dispatchId: 'dispatch-b', turnId: 'reply-b', state: 'prepared' as const, content: 'b', deliverySink: 'doc_comment' as const },
+    ];
+    ds.session.codexAppDispatchLedger = ledger;
+    (ds.worker as any).emit('message', rejection);
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    expect(ds.session.codexAppDispatchLedger).toEqual(ledger);
+    expect(replyToDocCommentMock).not.toHaveBeenCalled();
+    expect(removeCommentReactionMock).not.toHaveBeenCalled();
+    expect([...(ds.docCommentTurns?.keys() ?? [])]).toEqual(['reply-a', 'reply-b']);
+    expect(Object.keys(ds.session.docCommentTargets ?? {})).toEqual(['reply-a', 'reply-b']);
+  });
+
+  it('keeps the old silent path when the rejected turn is the pending queued activation', async () => {
+    const { ds } = setupDocCommentSession();
+    const journalInput = { content: 'b' };
+    ds.session.queuedActivationPending = true;
+    ds.session.queuedActivationToken = 'activation-b';
+    ds.session.queuedActivationTurnId = 'reply-b';
+    ds.session.queuedActivationInput = journalInput;
+    (ds.worker as any).emit('message', rejection);
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    // 激活日志还在，下次 fork 会重放这条输入，此时告诉用户「未执行」就是错的。
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationTurnId).toBe('reply-b');
+    expect(ds.session.queuedActivationInput).toBe(journalInput);
+    expect(replyToDocCommentMock).not.toHaveBeenCalled();
+    expect(removeCommentReactionMock).not.toHaveBeenCalled();
+    expect([...(ds.docCommentTurns?.keys() ?? [])]).toEqual(['reply-a', 'reply-b']);
+    expect(Object.keys(ds.session.docCommentTargets ?? {})).toEqual(['reply-a', 'reply-b']);
   });
 });
 

@@ -12334,14 +12334,23 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       }
     : undefined;
   // Relay staging paths and mtimes are attempt-local. Durable final replay must
-  // identify images by bytes so the same sandbox request can recover after a
-  // lost relay response without being rejected as a different attachment.
-  const durableImageIdentities = currentTurnId && effectiveResponseKind === 'final'
-    ? await Promise.all(images.map(async image => {
-        const inspection = await inspectFileOnlyAttachment(image, [], true);
-        return { sha256: inspection.sha256! };
-      }))
-    : images.map(sendAttachmentIdentity);
+  // identify attachments by bytes so the same sandbox request can recover after
+  // a lost relay response without being rejected as a different attachment.
+  // A non-regular --files (one-shot FIFO) can only be read once, by the upload,
+  // so it keeps the stat identity; relay staging always writes regular files.
+  const durableFinal = !!currentTurnId && effectiveResponseKind === 'final';
+  const attachmentIdentity = async (path: string) => durableFinal && statSync(path).isFile()
+    ? { sha256: (await inspectFileOnlyAttachment(path, [], true)).sha256! }
+    : sendAttachmentIdentity(path);
+  const durableImageIdentities = await Promise.all(images.map(attachmentIdentity));
+  const durableFileIdentities = fileOnlyPrimaryRequested && expectedLinkRenderedContent.startsWith('file-only:sha256:')
+    ? [{ sha256: expectedLinkRenderedContent.slice('file-only:sha256:'.length) }]
+    : await Promise.all(files.map(attachmentIdentity));
+  const durableVideoIdentities = await Promise.all(videoAttachments.map(async ({ videoPath, coverPath, durationMs }) => ({
+    video: await attachmentIdentity(videoPath),
+    cover: await attachmentIdentity(coverPath),
+    durationMs,
+  })));
   const turnRequestIdentity = canonicalJson({
     version: 1,
     content: expectedLinkRenderedContent,
@@ -12402,14 +12411,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     },
     attachments: {
       images: durableImageIdentities,
-      files: fileOnlyPrimaryRequested && expectedLinkRenderedContent.startsWith('file-only:sha256:')
-        ? [{ sha256: expectedLinkRenderedContent.slice('file-only:sha256:'.length) }]
-        : files.map(sendAttachmentIdentity),
-      videos: videoAttachments.map(({ videoPath, coverPath, durationMs }) => ({
-        video: sendAttachmentIdentity(videoPath),
-        cover: sendAttachmentIdentity(coverPath),
-        durationMs,
-      })),
+      files: durableFileIdentities,
+      videos: durableVideoIdentities,
     },
   });
   try {
@@ -15576,7 +15579,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     const appIds = parsedBotApps.map(item => item.appId);
     const resolved = await resolveCurrentChatBotOpenIdsByLarkAppIds(appId, targetChatId, appIds);
     if (!resolved.ok) {
-      console.error(`dispatch 协作身份解析失败: ${resolved.error}: ${resolved.message}`);
+      const timeoutHint = resolved.timeoutMs !== undefined
+        ? `\n群成员实时查询在 ${resolved.timeoutMs}ms 内未返回；网络较慢时可调大环境变量 BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS（毫秒）后重试。`
+        : '';
+      console.error(`dispatch 协作身份解析失败: ${resolved.error}: ${resolved.message}${timeoutHint}`);
       process.exit(1);
     }
     let botInfo: Array<{ larkAppId: string; botName: string | null }> = [];

@@ -9,7 +9,7 @@ import { normalizeCardActionData } from './card-action-data.js';
 import { logCardActionDiagnostics } from './card-action-diagnostics.js';
 import { createHash } from 'node:crypto';
 import { startLarkConnection, type LarkConnection } from './transport/connection.js';
-import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, loadBotConfigsCached, vcMeetingAgentConfigActive, type BotConfig, type BotState } from '../../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, loadBotConfigsCached, vcMeetingAgentConfigActive, type BotConfig, type BotState, type SubstituteModeConfig } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, resolveUnionIdFromOpenIdStrict, replyMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { listChats, type ChatBrief } from '../../services/groups-store.js';
@@ -26,6 +26,7 @@ import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, resolveNonsupportMessage, daemonCommandLanePreview, type MentionIdentity } from './message-parser.js';
+import { matchesSubstituteKeywords } from '../../services/substitute-keywords.js';
 import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.js';
 import { commandPrecedesMentions, isCommandTargetOnly } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
@@ -60,7 +61,7 @@ import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { isChatManager } from '../../services/chat-manager.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
-import { openPending, isThrottled, clearPending, markPendingDelivered, tryReserveOwnerDmSlot, releaseOwnerDmSlot, claimThrottleNotice } from './grant-pending.js';
+import { openPending, isThrottled, clearPending, markPendingDelivered, tryReserveOwnerDmSlot, releaseOwnerDmSlot, claimThrottleNotice, holdPendingMessage } from './grant-pending.js';
 import { resolveGrantApprover, resolveGrantRequestRoute, type GrantRequestRoute } from './grant-owner.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import {
@@ -1941,8 +1942,19 @@ const SUBSTITUTE_TRIGGER_MESSAGE_TYPES = new Set(['text', 'post']);
 export function resolveSubstituteTrigger(
   larkAppId: string,
   message: any,
+  cfg: SubstituteModeConfig | undefined = getBot(larkAppId).config.substituteMode,
 ): import('../../types.js').SubstituteTrigger | undefined {
-  const cfg = getBot(larkAppId).config.substituteMode;
+  const mention = resolveSubstituteMention(cfg, message);
+  return mention && matchesSubstituteKeywords(cfg?.keywords, message)
+    ? mention : undefined;
+}
+
+// Keep the raw @target candidate separate: hard-off gates must also suppress
+// messages that miss keywords, or relaxed mention policies can pick them up.
+function resolveSubstituteMention(
+  cfg: SubstituteModeConfig | undefined,
+  message: any,
+): import('../../types.js').SubstituteTrigger | undefined {
   if (!cfg?.enabled || !cfg.targets?.length) return undefined;
   const messageType = message?.message_type ?? message?.msg_type;
   if (!SUBSTITUTE_TRIGGER_MESSAGE_TYPES.has(messageType)) return undefined;
@@ -2583,8 +2595,8 @@ export function humanCanRunDaemonCommand(
  * 受 grant-pending 节流：pending 中 / deny 冷却期内不再发卡。真人路径的调用方传
  * `notifyThrottledRequester`，申请人在这期间再来找 bot 时回一句原因（同一张卡 / 同一次拒绝
  * 只回一次，见 claimThrottleNotice）；卡片就回复在申请人自己消息下面时不回（卡片本身就是说明），
- * 只有转投管理员私聊、申请人看不见卡的情况才提示「还在等」。bot 发送方不传，保持静默，免得两个
- * bot 互相回话。
+ * 只有转投管理员私聊、申请人看不见卡的情况才提示「还在等」。bot 发送方不传：不回话（免得两个
+ * bot 互相回话），把消息挂到待处理的申请卡上，批准后按到达顺序重放；挂不上（已被拒绝 / 暂存已满）时记日志。
  * 开放模式（无 owner）兜底不发。关了 autoGrantRequestCards 是文档写明的静默拦截，不回话。
  *
  * 默认（grantRequestToOwnerDm 未开）：卡片回复在原会话、正文 @ resolveGrantApprover 选出的管理员；
@@ -2613,7 +2625,16 @@ export async function maybeSendGrantRequestCard(
     return;
   }
   if (isThrottled(larkAppId, chatId, requesterOpenId)) {
-    if (opts?.notifyThrottledRequester) await replyThrottledRequester(larkAppId, message, chatId, requesterOpenId);
+    if (opts?.notifyThrottledRequester) {
+      await replyThrottledRequester(larkAppId, message, chatId, requesterOpenId);
+      return;
+    }
+    const held = messageData === undefined ? 'no_message' : holdPendingMessage(larkAppId, chatId, requesterOpenId, messageData);
+    if (held === 'held') {
+      logger.info(`[grant:${larkAppId}] holding message ${String(message?.message_id ?? '?').substring(0, 12)} from ${requesterOpenId.substring(0, 12)} in ${chatId.substring(0, 12)} until the request card is handled`);
+    } else if (held !== 'duplicate') {
+      logSilentGrantDrop(larkAppId, chatId, requesterOpenId, `request throttled, message not held: ${held}`);
+    }
     return;
   }
   const chatType: 'p2p' | 'group' = message?.chat_type === 'p2p' ? 'p2p' : 'group';
@@ -3128,10 +3149,12 @@ async function listenerChatFailed(
   if (!adminOpenId) return;
   const dm =
     `[botmux] 群消息监听已自动熔断：${chatId}\n` +
-    `该群连续 ${LISTENER_PERMANENT_THRESHOLD} 次返回永久错误${codePart}（${classified.message.slice(0, 120)}），` +
-    `通常是 bot 被移出群或群已解散。已停止对该群的高频轮询并转为 10 分钟慢探测；` +
-    `bot 被重新拉回后会自动恢复。如不再需要该监听，可在工作台关闭对应群监听。` +
-    `（同一应用其它群也在窗口内熔断时不重复私信，请以工作台监听状态为准。）`;
+    `原因：该群连续 ${LISTENER_PERMANENT_THRESHOLD} 次返回永久错误${codePart}（${classified.message.slice(0, 120)}），` +
+    `通常是 bot 被移出群或群已解散。\n` +
+    `现状：已停止对该群的常规轮询，改为每 ${Math.round(LISTENER_PROBE_INTERVAL_MS / 60_000)} 分钟探测一次。\n` +
+    `恢复：把 bot 重新拉回该群，下一次探测成功后自动恢复监听，无需重启；如不再需要该监听，可在工作台关闭该群的监听。\n` +
+    `${Math.round(LISTENER_ALERT_DEDUPE_MS / 60_000)} 分钟内同一应用其它群也熔断时不再逐条私信，` +
+    `可在 daemon 日志（botmux logs）中搜索「circuit OPEN for chat=」找到这些群。`;
   lastListenerAlertAt.set(larkAppId, now);
   try {
     await dmAdmin(larkAppId, adminOpenId, dm, `listener circuit open ${chatId.substring(0, 12)}`);
@@ -5717,6 +5740,7 @@ export function createLarkEventDispatcherRuntime(
       // per-chat toggle disk read entirely for bots that never configured a
       // substitute target (the overwhelming majority on the hot path).
       const substituteCfg = getBot(larkAppId).config.substituteMode;
+      const substituteMention = chatType === 'group' ? resolveSubstituteMention(substituteCfg, message) : undefined;
       let substituteChatMode: 'group' | 'topic' | undefined;
       // chats 白名单在 getChatMode 之前（纯内存判断走在 API roundtrip 前），
       // 对普通群与话题群统一生效：白名单是「替身可触发的群」清单，与群形态无关。
@@ -5739,7 +5763,7 @@ export function createLarkEventDispatcherRuntime(
           && chatType === 'group'
           && !explicitlyMentionedThisBot
           && isSubstituteExcludedChat(substituteCfg, chatId)
-          && resolveSubstituteTrigger(larkAppId, message)) {
+          && substituteMention) {
         logger.info(
           `[substitute:${larkAppId}] excluded chat — dropping @target message ` +
           `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
@@ -5756,7 +5780,7 @@ export function createLarkEventDispatcherRuntime(
           && !explicitlyMentionedThisBot
           && isSubstituteAllowedChat(substituteCfg, chatId)
           && !isSubstituteEnabledForChat(larkAppId, chatId)
-          && resolveSubstituteTrigger(larkAppId, message)) {
+          && substituteMention) {
         logger.info(
           `[substitute:${larkAppId}] per-chat off — dropping @target message ` +
           `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
@@ -5764,12 +5788,31 @@ export function createLarkEventDispatcherRuntime(
         return;
       }
       let substituteTrigger = substituteChatMode
-        ? resolveSubstituteTrigger(larkAppId, message)
+        // Keep the same snapshot across getChatMode's async lookup: mixing
+        // old keywords with newly saved targets can bypass the hand-off gate.
+        ? resolveSubstituteTrigger(larkAppId, message, substituteCfg)
         : undefined;
-      if (substituteTrigger && !explicitlyMentionedThisBot) {
-        const rawText = extractMessageTextForRouting(message);
-        const stripped = rawText ? stripLeadingMentions(rawText.trim(), message?.mentions ?? []).trim() : '';
-        if (stripped.startsWith('/')) substituteTrigger = undefined;
+      // Slash-command exemption predates the keyword gate: the "@目标" inside
+      // `/solve @someone …` is a command argument rather than a substitute
+      // hand-off, so the message keeps its ordinary routing (see mention-mode
+      // docs). Resolve it before the keyword-miss hard stop, otherwise turning
+      // keywords on would make such command messages disappear instead of
+      // reaching the normal session. The parse only runs when a substitute
+      // mention is present, so the hot path is unchanged.
+      const substituteRawText = substituteMention ? extractMessageTextForRouting(message) : null;
+      const substituteStripped = substituteRawText
+        ? stripLeadingMentions(substituteRawText.trim(), message?.mentions ?? []).trim()
+        : '';
+      const mentionlessSlash = substituteStripped.startsWith('/');
+      if (substituteMention && !explicitlyMentionedThisBot && !mentionlessSlash
+          && !matchesSubstituteKeywords(substituteCfg?.keywords, message)) {
+        // A keyword miss is a hand-off to the person, including owned topics,
+        // mentionMode=never and solo groups. Do not fall through to auto-reply.
+        logger.debug(`[substitute:${larkAppId}] keyword miss — dropping @target message msg=${messageId.substring(0, 12)}`);
+        return;
+      }
+      if (substituteTrigger && !explicitlyMentionedThisBot && mentionlessSlash) {
+        substituteTrigger = undefined;
       }
       if (substituteTrigger && substituteChatMode === 'topic'
           && substituteCfg?.topicActiveSessionTrigger === false
@@ -6415,8 +6458,10 @@ export function createLarkEventDispatcherRuntime(
       logger.info(`[grant:${larkAppId}] durable primary: not replaying granted message ${String(data?.message?.message_id ?? '').substring(0, 12)} outside the durable inbox`);
       return;
     }
+    // 批准时会连着重放多条（原消息 + 待批期间暂存的消息）：与实时入站走同一条按会话的入站串行道，
+    // 否则 processMessageEvent 内的异步路由会让后一条先投到会话。setImmediate 是 FIFO，调用顺序即入道顺序。
     setImmediate(() => {
-      void processMessageEvent(data)
+      void serializeByAnchor(rawMessageIngressAnchor(larkAppId, data?.message), () => processMessageEvent(data))
         .catch(err => logger.error(`Error replaying message event after grant: ${err}`));
     });
   }

@@ -178,6 +178,11 @@ export interface TriggerResponse {
   message?: string;
   errorCode?: TriggerErrorCode;
   terminalErrorCode?: string;
+  /** In-process lookups only (the workflow draft's failure panel), never on
+   *  the HTTP trigger-result route: the provider's raw error text and the
+   *  CLI screen tail of a worker-terminal failure, masked and clipped. */
+  terminalErrorDetail?: string;
+  terminalScreenTail?: string;
   error?: string;
   /** Structured recovery metadata when a v2 definition is no longer runnable. */
   reason?: LegacyWorkflowRetirementReason;

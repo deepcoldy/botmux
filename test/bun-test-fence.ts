@@ -1,9 +1,10 @@
-import { afterAll, mock } from 'bun:test';
+import { afterAll, afterEach, mock } from 'bun:test';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import * as realOs from 'node:os';
 import { fenceHomeRootedEnv } from './helpers/fence-home-env.js';
 import { installSessionDataDirFence } from './helpers/session-data-dir-fence.js';
+import { installSystemdFence, systemdFenceError, takeSystemdFenceViolations } from './helpers/systemd-fence.js';
 import {
   applyTmuxFenceEnv,
   createTmuxFence,
@@ -105,6 +106,17 @@ const fencedOs = {
 };
 
 mock.module('node:os', () => ({ ...fencedOs, default: fencedOs }));
+
+// Same systemd fence as vitest's unit-setup.ts (test/helpers/systemd-fence.ts):
+// the patched builtin covers `require`, the module mock covers ESM imports.
+const fencedChildProcess = installSystemdFence(fileRoot);
+mock.module('node:child_process', () => ({ ...fencedChildProcess, default: fencedChildProcess }));
+const failOnSystemdFenceViolations = (): void => {
+  const attempts = takeSystemdFenceViolations();
+  if (attempts.length > 0) throw systemdFenceError(attempts);
+};
+afterEach(failOnSystemdFenceViolations);
+afterAll(failOnSystemdFenceViolations);
 
 // Same tmux fence as vitest (test/helpers/tmux-fence.ts): no test may reach the
 // host's tmux servers. `bun test` runs every file in this one process, so one
