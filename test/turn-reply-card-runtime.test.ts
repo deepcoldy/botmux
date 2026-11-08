@@ -8,7 +8,7 @@ import { getBot } from '../src/bot-registry.js';
 import { replyCardModeFor, updateTurnReplyCard, settleTurnReplyCards, supersedeTurnReplyCard, sweepInterruptedReplyCards, queueTurnReplyTools, flushTurnReplyTools } from '../src/core/turn-reply-card.js';
 import { MessageWithdrawnError, updateMessage, uploadFile, replyMessage, sendMessage } from '../src/im/lark/client.js';
 import { observePublishedGroupMessage } from '../src/services/group-context-runtime.js';
-import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
+import { TurnReplyCardStore, replyCardIsTerminal } from '../src/services/turn-reply-card.js';
 import { getSession } from '../src/services/session-store.js';
 import { LocalAddressOutboundError, prepareLocalAddressContent } from '../src/im/lark/local-address-policy.js';
 import { localAddressContextForBot } from '../src/im/lark/local-address-context.js';
@@ -130,6 +130,24 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(body).not.toContain('/home/alice/');
     expect(body).not.toContain('/custom/project/');
     expect(body).toContain('src/main.ts:12');
+  });
+
+  it('settles an interrupted reply card when the session store is unavailable at startup', async () => {
+    const ds = session({ workingDir: '/custom/project' });
+    const send = vi.fn(async (_body: string) => 'om_reply');
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'progress', text: '读了 /home/alice/.agents/skills/a/SKILL.md' }, send);
+    const store = new TurnReplyCardStore(dir);
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' };
+    const record = store.read(key)!;
+    record.createdAtMs = record.updatedAtMs = 1;
+    writeFileSync(join(store.directory, `${store.id(key)}.json`), JSON.stringify(record));
+    vi.mocked(updateMessage).mockClear();
+    vi.mocked(getSession).mockImplementationOnce(() => { throw new Error('session store unavailable'); });
+    await sweepInterruptedReplyCards(ds.larkAppId);
+    expect(updateMessage).toHaveBeenCalledOnce();
+    expect(vi.mocked(updateMessage).mock.calls[0][2]).not.toContain('/home/alice/');
+    expect(replyCardIsTerminal(store.read(key)!)).toBe(true);
   });
 
   it('removes local addresses from an overflow attachment that startup recovery sends', async () => {
