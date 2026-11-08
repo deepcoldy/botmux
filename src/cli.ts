@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
+import { isMessageListenerTaskAnchor, isSilentMessageListenerSession, messageListenerSendBlocked } from './core/message-listener-silence.js';
 import { buildReplyConsoleUrl } from './core/dashboard-url.js';
 /**
  * CLI entry point for botmux.
@@ -4104,6 +4105,7 @@ interface AdoptedFromData {
 
 interface SessionData {
   sessionId: string;
+  messageListenerRun?: import('./core/message-listener-silence.js').SilentMessageListenerRun;
   chatId: string;
   chatType?: 'group' | 'p2p';
   rootMessageId: string;
@@ -9359,6 +9361,30 @@ async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ 
   return { sid, larkAppId: s.larkAppId, session: s };
 }
 
+async function silentListenerSources(session: SessionData): Promise<SessionData[]> {
+  const context = resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID);
+  const origin = context?.sessionId && context.sessionId !== session.sessionId
+    ? await requireSessionById(context.sessionId) : session;
+  return [origin, session].filter(source => isSilentMessageListenerSession(source));
+}
+
+async function assertListenerChatWriteAllowed(session: SessionData, chatId: string, refusal: string): Promise<void> {
+  if ((await silentListenerSources(session)).some(source => messageListenerSendBlocked(source, chatId))) {
+    throw new Error(refusal);
+  }
+}
+
+async function assertListenerCardDestination(session: SessionData, appId: string, messageId?: string): Promise<void> {
+  const sources = await silentListenerSources(session);
+  if (!sources.length) return;
+  const destination = messageId
+    ? await (await import('./im/lark/client.js')).getMessageChatId(appId, messageId)
+    : session.chatId;
+  if (sources.some(source => messageListenerSendBlocked(source, destination ?? undefined))) {
+    throw new Error('silent_message_listener: 来源群已设置静默执行，不能发布或更新来源群卡片。');
+  }
+}
+
 async function cmdTabs(rest: string[]): Promise<void> {
   const {
     CHAT_TABS_CLI_USAGE,
@@ -9395,6 +9421,10 @@ async function cmdTabs(rest: string[]): Promise<void> {
     console.error('botmux tabs: 当前会话不是群聊；请在群会话中运行，或传 --chat-id <oc_xxx>');
     process.exitCode = 2;
     return;
+  }
+  if (parsed.action !== 'list') {
+    await assertListenerChatWriteAllowed(session, chatId,
+      'botmux tabs: silent_message_listener: 来源群已设置静默执行，不能修改来源群标签页。');
   }
   try {
     const result = await executeChatTabsCli({ ...parsed, larkAppId, resolvedChatId: chatId });
@@ -9442,6 +9472,8 @@ async function cmdTopNotice(rest: string[]): Promise<void> {
     process.exitCode = 2;
     return;
   }
+  await assertListenerChatWriteAllowed(session, chatId,
+    'botmux top-notice: silent_message_listener: 来源群已设置静默执行，不能在来源群置顶或取消置顶。');
   try {
     const result = await executeChatTopNoticeCli({
       ...parsed,
@@ -9525,10 +9557,14 @@ async function cmdHistory(rest: string[]): Promise<void> {
       process.exit(1);
     }
 
+    // Silent listener sessions anchor on an internal `ml:` route id that must
+    // never reach Lark read APIs; use the frozen real source message id.
+    const threadRootMessageId = s.messageListenerRun?.sourceMessageId ?? s.rootMessageId;
+
     let ambientBeforeCreateTime: string | undefined;
     if (effectiveScope === 'ambient') {
       try {
-        const detail = await getMessageDetail(appId, s.rootMessageId, { userCardContent: false });
+        const detail = await getMessageDetail(appId, threadRootMessageId, { userCardContent: false });
         ambientBeforeCreateTime = detail?.items?.[0]?.create_time;
       } catch {
         // Best-effort only: ambient history should still work if the root
@@ -9542,9 +9578,9 @@ async function cmdHistory(rest: string[]): Promise<void> {
       : effectiveScope === 'ambient'
         ? await listAmbientChatMessages(appId, s.chatId, limit, {
             beforeCreateTime: ambientBeforeCreateTime,
-            excludeRootMessageId: s.rootMessageId,
+            excludeRootMessageId: threadRootMessageId,
           })
-        : await listThreadMessages(appId, s.chatId, s.rootMessageId, limit);
+        : await listThreadMessages(appId, s.chatId, threadRootMessageId, limit);
     // Expand merge_forward to <forwarded_messages> XML, mirroring the live event
     // path in daemon.ts. Each message gets its own numberer with resources
     // assigned BEFORE text extraction, so in-body [图片 N] placeholders match
@@ -10615,7 +10651,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
   // Only trust a real message id as the thread anchor — chat-scope sessions
   // anchor on the chat id (oc_…), which must NOT be used as a reply target.
   const rootEnv = process.env.BOTMUX_ROOT_MESSAGE_ID;
-  const rootMessageId = rootEnv?.startsWith('om_') ? rootEnv : '';
+  const rootMessageId = rootEnv?.startsWith('om_') || isMessageListenerTaskAnchor(rootEnv) ? rootEnv! : '';
   const scopeEnv = process.env.BOTMUX_SESSION_SCOPE;
   const scope: 'thread' | 'chat' =
     scopeEnv === 'chat' || scopeEnv === 'thread' ? scopeEnv : (rootMessageId ? 'thread' : 'chat');
@@ -10656,6 +10692,13 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
     sessionId,
     chatId,
     rootMessageId,
+    // Riff/mojo sandboxes have no local session store, so the frozen listener
+    // identity must be rebuilt from the env anchor: without it `history` and
+    // the source-topic availability checks would hand the internal `ml:` id
+    // to Lark read APIs instead of the real source message id.
+    ...(isMessageListenerTaskAnchor(rootMessageId)
+      ? { messageListenerRun: { sourceMessageId: rootMessageId.slice(3), replyMode: 'none' as const } }
+      : {}),
     title: 'riff',
     status: 'active',
     createdAt: new Date().toISOString(),
@@ -11557,6 +11600,18 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     }
   }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+  const silentListenerSources = [originSession, s].filter(source => source && isSilentMessageListenerSession(source));
+  if (silentListenerSources.length > 0) {
+    // Check the actual reply destination; --quote/--into derive their chat
+    // from a message id and can otherwise bypass a --chat-id-only check.
+    const targetMessageId = sendInto ?? explicitQuote;
+    const destination = targetMessageId
+      ? await (await import('./im/lark/client.js')).getMessageChatId(s.larkAppId, targetMessageId)
+      : !sendTopLevel && s.scope !== 'chat' ? s.chatId : overrideChatId ?? s.chatId;
+    if (silentListenerSources.some(source => messageListenerSendBlocked(source!, destination ?? undefined))) {
+      throw new Error('silent_message_listener: 来源群已设置静默执行。请将结果保留在 assistant 输出中；任务需要发往其他群时显式指定目标群。');
+    }
+  }
   const replyStyle = resolveReplyStyle(resolveReplyStyleConfig(s.larkAppId));
   if (replyLayout && !replyStyle.layout) {
     console.error('botmux send: 当前 Bot 已关闭 layout，本次按普通回复卡发送');
@@ -12510,7 +12565,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   const topicSourceTurn = pickTurnReplyTarget(topicSourceSession, topicSourceTurnId);
   const sourceTopicTarget = exactOriginDispatch?.replyTarget ?? resolveSendTarget({
     topLevel: false, chatScope: topicSourceSession.scope === 'chat', chatId: topicSourceSession.chatId,
-    rootMessageId: topicSourceSession.rootMessageId, replyTargetRootId: topicSourceTurn?.rootMessageId,
+    rootMessageId: topicSourceSession.messageListenerRun?.sourceMessageId ?? topicSourceSession.rootMessageId, replyTargetRootId: topicSourceTurn?.rootMessageId,
     replyTargetTurnId: topicSourceTurn?.turnId,
     replyTargetQuoteOnly: topicSourceTurn?.quoteOnly, currentTurnId: topicSourceTurnId,
   });
@@ -14588,6 +14643,7 @@ async function cmdCard(rest: string[]): Promise<void> {
       try {
         const { sid, larkAppId, session } = await resolveSessionAppId(runtimeParsed.sessionId);
         assertSessionTransportOrExit({ chatId: session.chatId, larkAppId }, 'card stream runtime');
+        await assertListenerCardDestination(session, larkAppId);
         if (runtimeParsed.operation === 'bind-runtime' && runtimeParsed.labels) {
           const linkRefPayload = { card: runtimeParsed.labels as Record<string, unknown> };
           const linkRefMode = await attestCardLinkRefMode(sid, linkRefPayload);
@@ -14669,6 +14725,7 @@ async function cmdCard(rest: string[]): Promise<void> {
 
     const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
     assertSessionTransportOrExit({ chatId: session.chatId, larkAppId }, 'card stream');
+    if (parsed.operation !== 'snapshot') await assertListenerCardDestination(session, larkAppId);
     try {
       if (parsed.operation === 'write') {
         const linkRefPayload = { text: contentInput!.content };
@@ -14869,6 +14926,7 @@ async function cmdCard(rest: string[]): Promise<void> {
   // Target-aware door: a --session-id pointing at a virtual/apiOnly session is
   // refused even from a transport-capable turn.
   assertSessionTransportOrExit({ chatId: session.chatId, larkAppId }, 'card patch');
+  await assertListenerCardDestination(session, larkAppId, parsed.messageId);
   if (process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1') {
     try {
       const { getMessageChatId } = await import('./im/lark/client.js');
@@ -15243,6 +15301,9 @@ async function cmdDispatchTree(rest: string[]): Promise<void> {
   const originClaim = freezeDispatchOriginClaim(sid);
   const s = await requireSessionById(sid);
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+  if (isSilentMessageListenerSession(s)) {
+    throw new Error('silent_message_listener: 来源群已设置静默执行，不能在来源群更新任务树卡片。');
+  }
   const result = await trySyncDispatchTaskTree({
     originClaim,
     sessionId: sid,
@@ -15592,6 +15653,20 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   }
   const { resolveCurrentChatBotOpenIdsByLarkAppIds, replyMessage, lookupMessageChatId } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
+
+  // Silent listener tasks may only orchestrate inside other groups: their
+  // seed/prime messages and task-tree cards must never land in the source
+  // group. --into derives its chat from a real message id, so resolve the
+  // actual destination instead of trusting a --chat-id-only view.
+  const silentDispatchSources = [dispatchOrigin, s].filter(source => isSilentMessageListenerSession(source));
+  if (silentDispatchSources.length > 0) {
+    const dispatchDestination = intoRoot
+      ? await lookupMessageChatId(appId, intoRoot)
+      : targetChatId;
+    if (silentDispatchSources.some(source => messageListenerSendBlocked(source, dispatchDestination ?? undefined))) {
+      throw new Error('silent_message_listener: 来源群已设置静默执行，不能在来源群派发话题或更新任务树；请显式指定其他目标群。');
+    }
+  }
 
   const parsedBotApps: Array<{ appId: string; role?: string }> = [];
   for (const raw of botAppSpecs) {
@@ -16426,13 +16501,23 @@ async function cmdReport(rest: string[]): Promise<void> {
   // Destination overrides cannot erase the original session/turn source.
   const reportOrigin = reportContext?.sessionId && reportContext.sessionId !== sid
     ? await requireSessionById(reportContext.sessionId) : s;
+  const silentReportSources = [reportOrigin, s].filter(source => isSilentMessageListenerSession(source));
+  if (silentReportSources.length > 0) {
+    const targetMessageId = explicitInto ?? explicitDispatchRoot;
+    const destination = targetMessageId
+      ? await (await import('./im/lark/client.js')).getMessageChatId(s.larkAppId, targetMessageId)
+      : s.chatId;
+    if (silentReportSources.some(source => messageListenerSendBlocked(source, destination ?? undefined))) {
+      throw new Error('silent_message_listener: 来源群已设置静默执行。请将回报保留在 assistant 输出中。');
+    }
+  }
   const reportOriginTurnId = reportContext?.sessionId === reportOrigin.sessionId
     ? reportContext.turnId : undefined;
   const reportOriginTurn = pickTurnReplyTarget(reportOrigin, reportOriginTurnId);
   const reportSourceAppId = reportOrigin.larkAppId!;
   const reportSource = resolveSendTarget({
     topLevel: false, chatScope: (reportOrigin.scope ?? 'thread') === 'chat', chatId: reportOrigin.chatId,
-    rootMessageId: reportOrigin.rootMessageId, replyTargetRootId: reportOriginTurn?.rootMessageId,
+    rootMessageId: reportOrigin.messageListenerRun?.sourceMessageId ?? reportOrigin.rootMessageId, replyTargetRootId: reportOriginTurn?.rootMessageId,
     replyTargetTurnId: reportOriginTurn?.turnId,
     replyTargetQuoteOnly: reportOriginTurn?.quoteOnly, currentTurnId: reportOriginTurnId,
   });

@@ -52,6 +52,12 @@ describe('listener draft patches', () => {
 });
 
 describe('buildListenerSavePayload', () => {
+  it('keeps silence when another field is edited and distinguishes it from thread replies', () => {
+    const silent = { ...allowListListener(), replyPolicy: { mode: 'none' as const } };
+    expect(buildListenerSavePayload({ ...silent, name: 'renamed' }, () => undefined).replyPolicy?.mode).toBe('none');
+    expect(listenerDraftKey(silent)).not.toBe(listenerDraftKey(allowListListener()));
+  });
+
   it('persists only the list of the active sender mode', () => {
     const listener = patchListenerSenderPolicy(allowListListener(), { excludeSenderOpenIds: ['ou_stale'] });
     const payload = buildListenerSavePayload(listener, () => undefined);
@@ -131,6 +137,13 @@ describe('describeListenerWidening', () => {
     expect(widen(base, toggleListenerMsgType(base, 'image', true))).toEqual(['msgTypes']);
     expect(widen(base, toggleListenerMsgType(base, 'post', false))).toEqual([]);
     expect(widen(base, { ...base, replyPolicy: { mode: 'chat', sessionMode: 'per_message' } })).toEqual(['replyChat']);
+  });
+
+  it('reports newly visible replies when leaving silence, but not when entering it', () => {
+    const silent = { ...base, replyPolicy: { mode: 'none' as const } };
+    expect(widen(silent, base)).toEqual(['replyThread']);
+    expect(widen(silent, { ...base, replyPolicy: { mode: 'chat' } })).toEqual(['replyChat']);
+    expect(widen(base, silent)).toEqual([]);
   });
 
   it('compares keyword filters as sets under their match mode', () => {

@@ -6762,6 +6762,7 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   const [autoJoinSolo, setAutoJoinSolo] = useState(savedForm.autoJoinSoloGroups);
   const [decisionCards, setDecisionCards] = useState(savedForm.decisionCards);
   const [closeHints, setCloseHints] = useState(savedForm.closeHints);
+  const [taskHints, setTaskHints] = useState(savedForm.taskHints);
   const [guideMode, setGuideMode] = useState<StewardGuideMode>(savedForm.guideMode);
   const [guideText, setGuideText] = useState(savedForm.guideText);
   const [busy, setBusy] = useState(false);
@@ -6782,6 +6783,7 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   useEffect(() => { setAutoJoinSolo(savedForm.autoJoinSoloGroups); }, [appId, savedForm.autoJoinSoloGroups]);
   useEffect(() => { setDecisionCards(savedForm.decisionCards); }, [appId, savedForm.decisionCards]);
   useEffect(() => { setCloseHints(savedForm.closeHints); }, [appId, savedForm.closeHints]);
+  useEffect(() => { setTaskHints(savedForm.taskHints); }, [appId, savedForm.taskHints]);
   useEffect(() => {
     setGuideMode(savedForm.guideMode);
     setGuideText(savedForm.guideText);
@@ -6861,6 +6863,12 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
     const previous = closeHints;
     setCloseHints(on);
     void save({ ...savedForm, closeHints: on }, setStatus, () => setCloseHints(previous));
+  }
+
+  function toggleTaskHints(on: boolean): void {
+    const previous = taskHints;
+    setTaskHints(on);
+    void save({ ...savedForm, taskHints: on }, setStatus, () => setTaskHints(previous));
   }
 
   function changeChat(next: string): void {
@@ -6950,6 +6958,14 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
             title={tr('botDefaults.stewardCloseHints')}
             help={tr('botDefaults.stewardCloseHintsHelp')}
             onChange={toggleCloseHints}
+          />
+          <ToggleRow
+            checked={taskHints}
+            disabled={busy}
+            dataAction="toggle-steward-task-hints"
+            title={tr('botDefaults.stewardTaskHints')}
+            help={tr('botDefaults.stewardTaskHintsHelp')}
+            onChange={toggleTaskHints}
           />
           <div className="bd-row bd-steward-guide">
             <div className="bd-field">

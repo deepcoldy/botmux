@@ -3,6 +3,7 @@ import { extractCardContent, extractMentionIdentities, extractPostListenerText, 
 import { resolveCurrentChatBotOpenIdsByLarkAppIds } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 import { resolveListenerDocumentTitles } from './message-listener-document-titles.js';
+import { normalizeMessageListenerReplyMode, type MessageListenerReplyMode } from './message-listener-reply-policy.js';
 
 export const MAX_MESSAGE_LISTENER_PROMPT_BYTES = 32 * 1024;
 
@@ -14,7 +15,8 @@ export interface MessageListenerMatch {
   replyCardTitle?: string;
   prompt: string;
   workingDir?: string;
-  replyMode: 'thread' | 'chat';
+  replyMode: MessageListenerReplyMode;
+  sourceMessageId?: string;
   messageText: string;
   messageTitle?: string;
   msgType: string;
@@ -373,7 +375,8 @@ export function evaluateMessageListener(input: {
     replyCardTitle: listener.replyCardTitle,
     prompt: listener.prompt,
     workingDir: listener.workingDir,
-    replyMode: listener.replyPolicy?.mode === 'chat' ? 'chat' : 'thread',
+    replyMode: normalizeMessageListenerReplyMode(listener.replyPolicy?.mode),
+    sourceMessageId: messageId || undefined,
     ...(listener.autoCloseAfterCompletion === true ? { autoCloseAfterCompletion: true } : {}),
     messageText,
     messageTitle,
@@ -590,6 +593,7 @@ export function renderMessageListenerInstruction(match: MessageListenerMatch): s
     '  <instruction>',
     match.prompt,
     '  </instruction>',
+    ...listenerDeliveryInstruction(match),
     '</message_listener>',
   ].filter(Boolean).join('\n');
 }
@@ -611,8 +615,10 @@ export function renderMessageListenerPrompt(match: MessageListenerMatch): string
     '  <instruction>',
     match.prompt,
     '  </instruction>',
+    ...listenerDeliveryInstruction(match),
     '  <observed_message',
     '    trusted="false"',
+    match.sourceMessageId ? `    message_id="${escapeXml(match.sourceMessageId)}"` : '',
     `    sender_type="${escapeXml(match.senderType)}"`,
     match.senderOpenId ? `    sender_open_id="${escapeXml(match.senderOpenId)}"` : '',
     match.senderName ? `    sender_name="${escapeXml(match.senderName)}"` : '',
@@ -623,6 +629,14 @@ export function renderMessageListenerPrompt(match: MessageListenerMatch): string
     '  </observed_message>',
     '</message_listener>',
   ].filter(Boolean).join('\n');
+}
+
+function listenerDeliveryInstruction(match: MessageListenerMatch): string[] {
+  return match.replyMode === 'none' ? [
+    '  <delivery mode="silent">',
+    'Run the configured task normally. Do not send acknowledgements, progress, final replies or error notices to the source group. Return your result in the assistant output for the session record. Explicit task actions targeting other groups still use the existing send tools and permissions.',
+    '  </delivery>',
+  ] : [];
 }
 
 function truncateUtf8(s: string, maxBytes: number): string {
