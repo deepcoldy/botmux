@@ -40,6 +40,29 @@ it('projects a fork-agent permission dialog without its command or targets', () 
   expect(prompt).not.toContain('Extract end-of-beat');
 });
 
+const DIALOG_ROWS = [
+  '⏺ 确认框长这样：',
+  '',
+  ' Do you want to proceed?',
+  ' ❯ 1. Yes',
+  '   2. No',
+  '',
+  ' Esc to cancel',
+];
+
+it.each([
+  ['more reply text', ['', '  以上就是权限确认框的样子。']],
+  ['a closing code fence', ['  ```']],
+  ['the composer box', ['─'.repeat(64), '❯ ', '─'.repeat(64), '  ⏵⏵ bypass permissions on (shift+tab to cycle)']],
+])('does not notify for a dialog quoted in the transcript when %s follows the footer', (_, below) => {
+  expect(claudeActionPrompt([...DIALOG_ROWS, ...below].join('\n'))).toBeUndefined();
+});
+
+it('still notifies when only blank or border rows follow the footer', () => {
+  expect(claudeActionPrompt([...DIALOG_ROWS, '', '╰' + '─'.repeat(62) + '╯', '   '].join('\n')))
+    .toContain('Do you want to proceed?');
+});
+
 it('projects the three-choice variant (don\'t ask again) with a plain title', () => {
   const prompt = claudeActionPrompt([
     '──────────────────────────────────────',

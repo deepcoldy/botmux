@@ -203,7 +203,7 @@ import {
 } from './services/web-terminal-settings-store.js';
 import { aidenCodexResumeNeedsRedraw, CodexUpdateDialogGuard, codexUpdateDialogSafeKeys } from './utils/codex-update-dialog.js';
 import { CodexModelMigrationDialogGuard, codexModelMigrationSafeKeys, isCodexModelMigrationScreen } from './utils/codex-model-migration-dialog.js';
-import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
+import { ClaudeSwitchConfirmGuard, claudeSwitchKindForCommand, type ClaudeSwitchKind } from './utils/claude-switch-confirm.js';
 import { applyCodexEffortMenu, hasEmptyCodexComposer, parseCodexEffortMenu } from './utils/codex-effort-menu.js';
 import { detectCodexChoiceModal } from './utils/codex-choice-modal.js';
 import { sandboxBoolValue, resolveSpawnNetworkShape } from './adapters/cli/sandbox-mode.js';
@@ -419,6 +419,7 @@ import {
 import { baselineCursorTranscript, drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
 import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './services/cursor-cot.js';
 import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot, type AntigravityCotEntry } from './services/antigravity-cot.js';
+import { KimiActivityObserver } from './services/kimi-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
 import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen } from './adapters/cli/antigravity.js';
 import {
@@ -654,6 +655,7 @@ import {
   type StuckPageType,
 } from './utils/stuck-detector.js';
 import { isAllowedStuckKeySequence, redactStuckPageTail, stuckScreenTail } from './core/stuck-page-catalog.js';
+import { turnFailureDiagnostics } from './services/turn-failure-diagnostics.js';
 import { processStuckWarningTuiKeys, shouldRearmStuckDetector } from './utils/stuck-key-guard.js';
 import { sendTuiKeySequence, submitTuiTextInput } from './utils/tui-input-delivery.js';
 import { snapshotToPng, snapshotToText, shouldCaptureScreen, isScreenSelfDriven } from './utils/transient-snapshot.js';
@@ -3562,6 +3564,13 @@ let startupCommandAckHold: {
   backend: SessionBackend;
   generation: number;
   timer: ReturnType<typeof setTimeout> | null;
+  /** The command's confirmation dialog can still come up while it is held. */
+  confirmation: StartupCommandConfirmationState;
+  /** Turn the hold's notices belong to: the first queued input at hold time, so
+   *  a later notice cannot land on another turn. */
+  turnId: string | undefined;
+  /** The "a dialog is waiting in the terminal" notice already went out. */
+  dialogNoticeSent: boolean;
 } | null = null;
 /** Per-spawn: the first write of this spawn has seen the CLI's input prompt on
  *  screen (see decideFirstWriteLiveness). Pre-set for spawns that do not type
@@ -4629,6 +4638,81 @@ function startupCommandExecuted(probe: (() => boolean) | undefined, submitOutput
   });
 }
 
+/** Answering a startup command's confirmation dialog (see
+ *  CliAdapter.startupCommandConfirmation) while the command is unconfirmed.
+ *  The screen is a native capture, so it is read only after new PTY output (a
+ *  dialog coming up is new output) and at most once per
+ *  STARTUP_CONFIRM_SCREEN_POLL_MS. An accept dialog still on screen
+ *  STARTUP_CONFIRM_REPRESS_MS after an Enter gets another one — an Enter that
+ *  lands while the dialog is drawn but its select not yet listening is lost —
+ *  up to STARTUP_CONFIRM_MAX_PRESSES in all; after that the held-queue notice
+ *  leaves it to a person, as for a dialog that must stay for one. */
+const STARTUP_CONFIRM_SCREEN_POLL_MS = 1_000;
+/** Claude records the command within ~1s of the answer on a loaded host (see
+ *  STARTUP_COMMAND_ACK_TIMEOUT_MS); 3s means the Enter was not taken. */
+const STARTUP_CONFIRM_REPRESS_MS = 3_000;
+const STARTUP_CONFIRM_MAX_PRESSES = 3;
+
+interface StartupCommandConfirmationState {
+  cmd: string;
+  /** PTY output generation at the last screen read; null before the first. */
+  checkedGeneration: number | null;
+  checkedAt: number;
+  presses: number;
+  pressedAt: number;
+  /** A dialog that must stay for a person was logged already. */
+  leftForPersonLogged: boolean;
+  /** Verdict of the latest screen read: which dialog, if any, is up now. */
+  onScreen: 'accept' | 'leave' | null;
+}
+
+function newStartupCommandConfirmationState(cmd: string): StartupCommandConfirmationState {
+  return { cmd, checkedGeneration: null, checkedAt: 0, presses: 0, pressedAt: 0, leftForPersonLogged: false, onScreen: null };
+}
+
+/** Press Enter on the dialog when the adapter says the command line already
+ *  answers it. Returns true when an Enter went out just now. */
+function answerStartupCommandConfirmation(state: StartupCommandConfirmationState, be: SessionBackend): boolean {
+  const decide = cliAdapter?.startupCommandConfirmation;
+  if (!decide || state.presses >= STARTUP_CONFIRM_MAX_PRESSES) return false;
+  if (!backendScreenEvidenceIsAuthoritativeForMutation()) return false;
+  const now = Date.now();
+  if (now - state.checkedAt < STARTUP_CONFIRM_SCREEN_POLL_MS) return false;
+  const repressDue = state.presses > 0 && now - state.pressedAt >= STARTUP_CONFIRM_REPRESS_MS;
+  if (state.checkedGeneration !== null && ptyOutputGeneration.isCurrent(state.checkedGeneration) && !repressDue) return false;
+  state.checkedAt = now;
+  state.checkedGeneration = ptyOutputGeneration.snapshot();
+  let verdict: { accept: boolean; detail: string } | null;
+  try { verdict = decide(captureBackendScreen(be), state.cmd); } catch { return false; }
+  state.onScreen = verdict ? (verdict.accept ? 'accept' : 'leave') : null;
+  if (!verdict) return false;
+  if (!verdict.accept) {
+    if (!state.leftForPersonLogged) {
+      state.leftForPersonLogged = true;
+      log(`Startup command ${state.cmd}: ${verdict.detail} — left for a person; queue stays held`);
+    }
+    return false;
+  }
+  if (state.presses > 0 && !repressDue) return false;
+  state.presses += 1;
+  state.pressedAt = now;
+  log(`Startup command ${state.cmd}: ${verdict.detail} — accepting with Enter (${state.presses}/${STARTUP_CONFIRM_MAX_PRESSES})`);
+  pressBackendEnter(be);
+  return true;
+}
+
+function pressBackendEnter(be: SessionBackend | null): void {
+  try {
+    if (be && 'sendSpecialKeys' in be) {
+      (be as any).sendSpecialKeys('Enter');
+    } else {
+      be?.write('\r');
+    }
+  } catch {
+    // Pane already gone: the generation fence of the caller takes it from here.
+  }
+}
+
 function clearStartupCommandAckHold(): void {
   if (startupCommandAckHold?.timer) clearTimeout(startupCommandAckHold.timer);
   startupCommandAckHold = null;
@@ -4648,24 +4732,62 @@ function armStartupCommandAckPoll(): void {
       return;
     }
     if (hold.confirmed()) void flushPending();
+    else {
+      answerStartupCommandConfirmation(hold.confirmation, hold.backend);
+      // The dialog may come up only now, after the hold's notice already said
+      // "if the command is still in the input box, press Enter". Correct that
+      // once: a person told to press Enter here would approve a hook's request
+      // for themselves — exactly what the notice exists to prevent.
+      if (hold.confirmation.onScreen === 'leave' && !hold.dialogNoticeSent) {
+        sendStartupCommandHoldNotice(hold, true);
+      }
+    }
     armStartupCommandAckPoll();
   }, STARTUP_CMD_HOLD_POLL_MS);
   hold.timer.unref?.();
 }
 
-function holdForStartupCommandAck(cmd: string, confirmed: () => boolean, be: SessionBackend, generation: number): void {
-  startupCommandAckHold = { cmd, confirmed, backend: be, generation, timer: null };
-  log(`Startup command not confirmed within ${STARTUP_COMMAND_ACK_TIMEOUT_MS}ms — holding ${pendingMessages.length} queued input(s) behind it: ${cmd}`);
+/** Tell the thread what a hold is waiting for. A confirmation dialog left for a
+ *  person is what the terminal shows, not a command waiting in the input box:
+ *  say so, or "press Enter" would pick whatever the dialog has focused. At most
+ *  one dialog notice per hold (see dialogNoticeSent) — a hook's dialog only
+ *  appears once, so this never turns into a stream of notices. */
+function sendStartupCommandHoldNotice(
+  hold: NonNullable<typeof startupCommandAckHold>,
+  dialogPending: boolean,
+): void {
+  if (dialogPending) hold.dialogNoticeSent = true;
   send({
     type: 'user_notify',
     kind: 'input_not_submitted',
-    turnId: pendingMessages[0]?.turnId ?? currentBotmuxTurnId,
-    message: t('worker.startup_command_unconfirmed', {
+    turnId: hold.turnId ?? pendingMessages[0]?.turnId ?? currentBotmuxTurnId,
+    message: t(dialogPending ? 'worker.startup_command_dialog_pending' : 'worker.startup_command_unconfirmed', {
       cliName: cliName(),
-      command: cmd,
+      command: hold.cmd,
       secs: Math.round(STARTUP_COMMAND_ACK_TIMEOUT_MS / 1000),
     }),
   });
+}
+
+function holdForStartupCommandAck(
+  cmd: string,
+  confirmed: () => boolean,
+  be: SessionBackend,
+  generation: number,
+  confirmation: StartupCommandConfirmationState,
+): void {
+  startupCommandAckHold = {
+    cmd,
+    confirmed,
+    backend: be,
+    generation,
+    timer: null,
+    confirmation,
+    turnId: pendingMessages[0]?.turnId ?? currentBotmuxTurnId,
+    dialogNoticeSent: false,
+  };
+  log(`Startup command not confirmed within ${STARTUP_COMMAND_ACK_TIMEOUT_MS}ms — holding ${pendingMessages.length} queued input(s) behind it: ${cmd}`);
+  sendStartupCommandHoldNotice(startupCommandAckHold, confirmation.onScreen === 'leave');
   armStartupCommandAckPoll();
 }
 
@@ -4733,11 +4855,18 @@ async function runStartupCommands(): Promise<boolean> {
         continue;
       }
       const confirmed = () => startupCommandExecuted(probe, submitOutputGeneration);
-      const deadline = Date.now() + STARTUP_COMMAND_ACK_TIMEOUT_MS;
+      const confirmation = newStartupCommandConfirmationState(cmd);
+      let deadline = Date.now() + STARTUP_COMMAND_ACK_TIMEOUT_MS;
       while (!confirmed()) {
         if (backend !== be || cliSpawnGeneration !== generation || cliRestartInProgress) return false;
+        // e.g. Claude's "Change effort level?" before a resumed conversation's
+        // cached history is re-read: the command is recorded only once it is
+        // answered, so the answer restarts the wait for that record.
+        if (answerStartupCommandConfirmation(confirmation, be)) {
+          deadline = Math.max(deadline, Date.now() + STARTUP_COMMAND_ACK_TIMEOUT_MS);
+        }
         if (Date.now() >= deadline) {
-          holdForStartupCommandAck(cmd, confirmed, be, generation);
+          holdForStartupCommandAck(cmd, confirmed, be, generation, confirmation);
           return false;
         }
         await delay(STARTUP_CMD_ACK_POLL_MS);
@@ -5111,12 +5240,14 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         stampMojoTurnMark(msg.turnId, undefined); // a passthrough IS a mojo turn
         writeCliPidMarker();
         publishSandboxRelayCapability();
-        // A mid-session `/effort <level>` opens a Yes/No "Change effort level?"
-        // confirm dialog; arm the guard so onPtyData can auto-accept it. Armed
-        // before the bytes land (not after the submission is acknowledged) so
-        // a dialog that renders during the acceptance wait is not missed. Bare
-        // `/effort` opens a level picker (unknown target) and is left alone.
-        if (isEffortLevelCommand(msg.content)) armEffortConfirm();
+        // A mid-session `/effort <level>` / `/model <name>` can open a Yes/No
+        // "Change effort level?" / "Switch model?" confirm dialog; arm the
+        // guard so onPtyData can auto-accept it. Armed before the bytes land
+        // (not after the submission is acknowledged) so a dialog that renders
+        // during the acceptance wait is not missed. Bare `/effort` / `/model`
+        // open a picker (unknown target) and are left alone.
+        const switchKind = claudeSwitchKindForCommand(msg.content);
+        if (switchKind) armSwitchConfirm(switchKind);
         // `/btw <question>` answers in an overlay that never reaches the
         // transcript; arm the capture before the bytes land.
         const btwQuestion = claudeBtwQuestion(msg.content);
@@ -5134,7 +5265,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
       recoveryFailureReason = err instanceof SubmissionWriteError
         ? err.recoveryFailureReason
         : undefined;
-      disarmEffortConfirm();
+      disarmSwitchConfirm();
       disarmBtwCapture();
       switch (classifyRawDispatchFailure(err, isWorkflowWorker())) {
         case 'fence-generation':
@@ -11438,13 +11569,26 @@ function emitReadyTurns(opts: {
         + `(${outcome.status}${outcome.errorCode ? `/${outcome.errorCode}` : ''}) — replayed history, no Lark turn to notify`);
       continue;
     }
+    if (outcome && outcome.status !== 'completed') {
+      emitTurnTerminal(
+        turn.turnId,
+        outcome.status,
+        outcome.errorCode,
+        turn.dispatchAttempt,
+        nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
+        outcome.retryable,
+        undefined,
+        turn.terminalErrorDetail,
+      );
+      continue;
+    }
     emitTurnTerminal(
       turn.turnId,
       outcome?.status ?? 'completed',
-      outcome && outcome.status !== 'completed' ? outcome.errorCode : undefined,
+      undefined,
       turn.dispatchAttempt,
       nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
-      outcome && outcome.status !== 'completed' ? outcome.retryable : undefined,
+      undefined,
     );
   }
 }
@@ -12303,6 +12447,87 @@ function armAntigravityCotForTurn(): void {
   if (!cid) return;
   persistCliSessionId(cid);
   ensureAntigravityCotReader(cid);
+}
+
+// ─── Kimi activity observer (read-only) ─────────────────────────────────
+//
+// Kimi keeps its turn lifecycle on OSC 7501 and its replies on `botmux send`;
+// this observer only follows the session's wire log and streams thinking /
+// narration / tool activity to the current turn (dynamic reply card, CoT).
+// It never marks, starts, settles or delivers a turn, so a log it cannot find
+// or parse costs the card its activity and nothing else.
+let kimiActivityObserver: KimiActivityObserver | undefined;
+
+function stopKimiActivityObserver(): void {
+  kimiActivityObserver?.stop();
+  kimiActivityObserver = undefined;
+}
+
+function startKimiActivityObserver(opts: {
+  cfg: Extract<DaemonToWorker, { type: 'init' }>;
+  resume: boolean;
+  /** The id/cwd/env the adapter resolved `--session` with (see kimi.ts). */
+  resumeLookupSessionId: string;
+  workingDir: string | undefined;
+  env: NodeJS.ProcessEnv;
+}): void {
+  stopKimiActivityObserver();
+  const { cfg } = opts;
+  if (cfg.cliId !== 'kimi' || cfg.adoptMode === true) return;
+  // Full-root COW scratch: Kimi writes its log inside the overlay, which the
+  // host-side lookup cannot see.
+  if (lastResolvedSandboxMode === 'scratch') return;
+  const observer = new KimiActivityObserver({
+    botmuxSessionId: opts.resumeLookupSessionId,
+    markerSessionId: cfg.sessionId,
+    workingDir: opts.workingDir,
+    env: opts.env,
+    resume: opts.resume,
+    onEntries: entries => {
+      // No attribution target (between turns, or before the first turn's
+      // identity is set): the poll's drain has already advanced the read
+      // offset, so these entries are consumed without appearing on any card.
+      // Kimi only logs while a prompt is running and the worker sets capture
+      // identity before writing that prompt, so the window normally holds
+      // nothing; in-turn tails are additionally covered by the two
+      // synchronous edge drains, which check the turn before draining.
+      if (kimiActivityObserver !== observer || !currentBotmuxTurnId) return;
+      observeCotEntries(entries, { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+    },
+    log,
+  });
+  kimiActivityObserver = observer;
+  try {
+    observer.start();
+  } catch (err: any) {
+    log(`Kimi activity observer failed to start: ${err?.message ?? err}`);
+    stopKimiActivityObserver();
+  }
+}
+
+/** Kimi accepts no input while a turn runs (no type-ahead: the next message
+ *  waits for `prompt_ready`), so everything already in its log when a turn
+ *  ends belongs to that turn: read it synchronously at the terminal and idle
+ *  edges so the poll's lag cannot hand it to the next turn. */
+function drainKimiActivityInto(turn: { turnId: string | undefined; dispatchAttempt?: number }): void {
+  if (!kimiActivityObserver || !turn.turnId) return;
+  try {
+    const entries = kimiActivityObserver.drain();
+    if (entries.length) observeCotEntries(entries, { turnId: turn.turnId, dispatchAttempt: turn.dispatchAttempt });
+  } catch (err: any) {
+    log(`Kimi activity drain failed: ${err?.message ?? err}`);
+  }
+}
+
+/** The daemon settles an ordinary Kimi turn on `prompt_ready`: read what the
+ *  turn has logged so far and flush it ahead of that edge, so the card's
+ *  final view carries the turn's complete activity. */
+function settleKimiActivityBeforeIdle(): void {
+  if (!kimiActivityObserver || !currentBotmuxTurnId) return;
+  drainKimiActivityInto({ turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+  if (thinkingTurn?.turnId === currentBotmuxTurnId && thinkingTurn.dispatchAttempt === currentBotmuxDispatchAttempt) {
+    flushThinkingUpdate();
+  }
 }
 
 function cursorBridgeAttach(path: string, mode: CursorAttachMode = 'baseline-existing'): void {
@@ -13987,6 +14212,15 @@ function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
         ? { dispatchAttempt: turn.dispatchAttempt }
         : {}),
     });
+    if (turn.terminalStatus && turn.terminalStatus !== 'completed' && turn.terminalErrorSummary) {
+      // The provider's error summary, for the failure record (masked there).
+      emitTurnTerminal(
+        turn.turnId, turn.terminalStatus, turn.terminalErrorCode, turn.dispatchAttempt,
+        nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
+        undefined, undefined, turn.terminalErrorSummary,
+      );
+      continue;
+    }
     emitTurnTerminal(
       turn.turnId,
       turn.terminalStatus ?? 'completed',
@@ -14037,6 +14271,7 @@ function stopCodexBridge(): void {
   cursorCotReaderChatId = undefined;
   stopAllAntigravityCot();
   antigravityCotReaderSessionId = undefined;
+  stopKimiActivityObserver();
   codexBridgePendingSessionId = undefined;
   codexBridgeUnprovenSession = undefined;
   codexAdoptPendingPid = undefined;
@@ -16233,34 +16468,37 @@ const AIDEN_CODEX_UPDATE_MAX_ATTEMPTS = 3;
 let aidenCodexUpdateLastActionAt = 0;
 let aidenCodexUpdateAttempts = 0;
 let aidenCodexUpdateLimitNotified = false;
-// Auto-confirm Claude Code's mid-session "Change effort level?" Yes/No dialog.
-// Armed only by botmux's own `/effort <level>` passthrough (see deliverRawInput)
-// and disarmed on match, timeout, or CLI respawn — never inspects idle screens.
-const effortConfirmGuard = new EffortConfirmDialogGuard();
-let effortConfirmTimer: ReturnType<typeof setTimeout> | null = null;
+// Auto-confirm Claude Code's mid-session "Change effort level?" / "Switch
+// model?" Yes/No dialog. Armed only by botmux's own `/effort <level>` or
+// `/model <name>` passthrough (see deliverRawInput) and disarmed on match,
+// timeout, or CLI respawn — never inspects idle screens. Startup commands use
+// the screen-based answerStartupCommandConfirmation instead.
+const switchConfirmGuard = new ClaudeSwitchConfirmGuard();
+let switchConfirmTimer: ReturnType<typeof setTimeout> | null = null;
 // The dialog appears within a second of the command landing; keep the arm
 // window short so a later, unrelated screen can never be mistaken for it.
-const EFFORT_CONFIRM_WINDOW_MS = 8_000;
+const SWITCH_CONFIRM_WINDOW_MS = 8_000;
 
-function disarmEffortConfirm(): void {
-  if (effortConfirmTimer) {
-    clearTimeout(effortConfirmTimer);
-    effortConfirmTimer = null;
+function disarmSwitchConfirm(): void {
+  if (switchConfirmTimer) {
+    clearTimeout(switchConfirmTimer);
+    switchConfirmTimer = null;
   }
-  effortConfirmGuard.disarm();
+  switchConfirmGuard.disarm();
 }
 
-/** Arm the effort-confirm guard for a bounded window after a `/effort <level>`
- *  passthrough. Only claude-code sessions we drive show this dialog. */
-function armEffortConfirm(): void {
+/** Arm the switch-confirm guard for a bounded window after a `/effort <level>`
+ *  or `/model <name>` passthrough. Only claude-code sessions we drive show
+ *  this dialog. */
+function armSwitchConfirm(kind: ClaudeSwitchKind): void {
   if (lastInitConfig?.cliId !== 'claude-code' || lastInitConfig.adoptMode) return;
-  disarmEffortConfirm();
-  effortConfirmGuard.arm();
-  effortConfirmTimer = setTimeout(() => {
-    effortConfirmTimer = null;
-    effortConfirmGuard.disarm();
-  }, EFFORT_CONFIRM_WINDOW_MS);
-  effortConfirmTimer.unref?.();
+  disarmSwitchConfirm();
+  switchConfirmGuard.arm(kind);
+  switchConfirmTimer = setTimeout(() => {
+    switchConfirmTimer = null;
+    switchConfirmGuard.disarm();
+  }, SWITCH_CONFIRM_WINDOW_MS);
+  switchConfirmTimer.unref?.();
 }
 
 // Relay Claude Code's `/btw` side answer to the IM thread: watch the screen
@@ -18319,17 +18557,14 @@ function handlePtyDataChunk(data: string): void {
 
   if (handleVisibleStartupInteraction(data)) return;
 
-  // Effort-switch confirm auto-accept. Armed only by our own `/effort <level>`
-  // passthrough, so this never fires on an ordinary screen. The dialog's
-  // default row is "Yes", so Enter confirms — mirroring the trust dialog.
-  if (effortConfirmGuard.isArmed() && effortConfirmGuard.inspect(data) === 'confirm') {
-    disarmEffortConfirm();
-    log('Effort-switch confirm dialog detected, auto-accepting...');
-    if (backend && 'sendSpecialKeys' in backend) {
-      (backend as any).sendSpecialKeys('Enter');
-    } else {
-      backend?.write('\r');
-    }
+  // Effort/model switch confirm auto-accept. Armed only by our own
+  // `/effort <level>` / `/model <name>` passthrough, so this never fires on an
+  // ordinary screen. The dialog's default row is "Yes", so Enter confirms —
+  // mirroring the trust dialog.
+  if (switchConfirmGuard.isArmed() && switchConfirmGuard.inspect(data) === 'confirm') {
+    disarmSwitchConfirm();
+    log('Effort/model switch confirm dialog detected, auto-accepting...');
+    pressBackendEnter(backend);
     return;
   }
 
@@ -19135,7 +19370,18 @@ function markPromptReady(): void {
     hasQueuedTurn: queuedTypeAheadTurns.length > 0,
   });
   const beforeMarkerSync = readyTransition(false);
-  if (beforeMarkerSync.releaseActiveTurnAuthority) {
+  // A ready reported as working below (the argv-baked first prompt still runs,
+  // or the turn only waits on its background agents) is not the turn's end:
+  // that work still reports under this turn's authority.
+  const readyContinuesTurn = (spawnArgvInitialPromptBusy
+      || (backgroundTaskTracker.pendingTurnAgents() > 0 && !spawnArgvNeedsWorkingSeed))
+    && !!renderer
+    && queuedTypeAheadTurns.length === 0
+    && pendingMessages.length === 0
+    && pendingRawInputs.length === 0
+    && pendingSessionRename === null
+    && !isFlushing;
+  if (beforeMarkerSync.releaseActiveTurnAuthority && !readyContinuesTurn) {
     releaseActiveTurnAuthority('prompt_ready');
   }
   // A ready published without the detector's own idle (first-prompt timeout
@@ -19187,6 +19433,8 @@ function markPromptReady(): void {
     deliverRestartInterruptionNote();
   }
   sandboxWrapperAwaitingFirstPrompt = undefined;
+  // Kimi: publish the finished turn's last activity before its idle edge.
+  if (kimiActivityObserver) settleKimiActivityBeforeIdle();
   send({ type: 'prompt_ready' });
   if (codexAutoUpgrade?.stage === 'restoring') codexAutoUpgrade.ready?.();
   if (codexUpgradeTimer && codexRuntimeObservedGeneration !== cliSpawnGeneration) {
@@ -21601,7 +21849,7 @@ function startScreenUpdates(): void {
         const prompt = claudeActionPrompt(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
         if (prompt && prompt !== lastClaudeActionPrompt) {
           lastClaudeActionPrompt = prompt;
-          send({type: 'user_notify', message: prompt, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt});
+          send({type: 'user_notify', kind: 'claude_permission_prompt', message: prompt, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt});
         } else if (!prompt) {
           lastClaudeActionPrompt = '';
         }
@@ -21989,8 +22237,8 @@ function handleClaudeStopFailure(
       return true;
     },
     now: Date.now,
-    emit: (turnId, status, errorCode, dispatchAttempt, retryable) => {
-      emitTurnTerminal(turnId, status, errorCode, dispatchAttempt, undefined, retryable);
+    emit: (turnId, status, errorCode, dispatchAttempt, retryable, errorDetail) => {
+      emitTurnTerminal(turnId, status, errorCode, dispatchAttempt, undefined, retryable, undefined, errorDetail);
     },
     notify: (errorCode, replyTurnId) => {
       send({
@@ -26141,6 +26389,11 @@ async function spawnCli(
           + `not pinning a custom LARKSUITE_CLI_DATA_DIR into the sandbox; the in-sandbox lark-cli will `
           + `use the default store. The real keystore is still denied/carve-out'd by policy (no leak).`);
       }
+      // Release the previous generation before preparing: its cleanup tears down
+      // this same session's tree, so running it afterwards would remove the tree
+      // the new CLI is about to run in.
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } sandboxStopWatcher = null; }
+      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } sandboxCleanup = null; }
       const sbx = prepareDirectSandbox({
         networkPolicy: effectiveSandboxNetworkPolicy,
         sessionId: cfg.sessionId,
@@ -26183,8 +26436,6 @@ async function spawnCli(
       spawnBin = sbx.bin;
       spawnArgs = sbx.args;
       Object.assign(childEnv, sbx.env);
-      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
       sandboxCleanup = sbx.cleanup;
       sandboxRelayOutbox = sbx.outbox;
       localProtectedMcpContainmentActiveCapabilityIds = (
@@ -26335,6 +26586,11 @@ async function spawnCli(
       }
     } else if (process.platform === 'darwin') {
       // ── macOS: APFS clonefile COW clone + Seatbelt ──
+      // Release the previous generation before preparing: its cleanup tears down
+      // this same session's tree, so running it afterwards would remove the tree
+      // the new CLI is about to run in.
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } sandboxStopWatcher = null; }
+      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } sandboxCleanup = null; }
       const prepared = prepareMacScratchSandboxDetailed({
         sessionId: cfg.sessionId,
         dataDir: scratchDataDir,
@@ -26354,8 +26610,6 @@ async function spawnCli(
       spawnBin = sbx.bin;
       spawnArgs = sbx.args;
       Object.assign(childEnv, sbx.env);
-      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
       sandboxCleanup = sbx.cleanup;
       sandboxRelayOutbox = sbx.outbox;
       scratchMappings = sbx.mappings;
@@ -26370,6 +26624,11 @@ async function spawnCli(
     } else {
       // ── Linux: full-root COW overlay ──
       const storage: ScratchStorage = cfg.scratchStorage === 'disk' ? 'disk' : 'tmpfs';
+      // Release the previous generation before preparing: its cleanup tears down
+      // this same session's tree, so running it afterwards would remove the tree
+      // the new CLI is about to run in.
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } sandboxStopWatcher = null; }
+      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } sandboxCleanup = null; }
       const prepared = prepareScratchSandboxDetailed({
         sessionId: cfg.sessionId,
         dataDir: scratchDataDir,
@@ -26397,8 +26656,6 @@ async function spawnCli(
       spawnBin = sbx.bin;
       spawnArgs = sbx.args;
       Object.assign(childEnv, sbx.env);
-      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
       sandboxCleanup = sbx.cleanup;
       sandboxRelayOutbox = sbx.outbox;
       scratchMappings = scratchLinuxMappings(sbx.mergedHostPath);
@@ -26867,6 +27124,10 @@ async function spawnCli(
     ]) addProtectedCredentialMask(path);
     let credentialCliBin = spawnBin;
     try { credentialCliBin = realpathSync(spawnBin); } catch { /* spawn will fail closed if unresolved */ }
+    // Release the previous generation before preparing: its cleanup removes this
+    // same session's relay outbox.
+    if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } sandboxStopWatcher = null; }
+    if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } sandboxCleanup = null; }
     // A credential-only pane has no sound in-pane send authority (see
     // prepareCredentialOnlyRelayOutbox for the four measured reasons), so give it
     // the SAME host-side relay the full sandbox uses. Without this the confined
@@ -26922,8 +27183,6 @@ async function spawnCli(
     // never a Feishu credential; the host watcher re-execs the send outside the
     // pane and performs the authoritative origin check.
     childEnv.BOTMUX_SEND_RELAY = credentialRelay.outbox;
-    if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-    if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
     sandboxCleanup = credentialRelay.cleanup;
     sandboxRelayOutbox = credentialRelay.outbox;
     // session-id is FORCED so a relayed send cannot target another session.
@@ -27748,6 +28007,16 @@ async function spawnCli(
     } else {
       codexBridgeStartTimer();
     }
+  }
+
+  if (cfg.cliId === 'kimi') {
+    startKimiActivityObserver({
+      cfg,
+      resume: effectiveResume,
+      resumeLookupSessionId: effectiveAdapterSessionId,
+      workingDir: buildArgsWorkingDir,
+      env: { ...process.env, ...perBotInjectEnv },
+    });
   }
 
   // Arm the ready-gate for FRESH ready-integrated spawns. Until
@@ -28798,7 +29067,7 @@ function killCli(opts: {
   aidenCodexUpdateAttempts = 0;
   aidenCodexUpdateLimitNotified = false;
   resetCodexModelMigrationState();
-  disarmEffortConfirm();
+  disarmSwitchConfirm();
   disarmBtwCapture();
   appRunnerControlDecoder.reset();
 }
@@ -31426,6 +31695,18 @@ function retireTerminatedMarkerTurn(parsed: {
   return true;
 }
 
+/** Set from `init`: this session is a workflow draft's clarify session, whose
+ *  failure panel reads a failed turn's provider error and screen tail. Every
+ *  other session's terminal stays as it was: no capture, no extra fields. */
+let captureTurnFailureDiagnostics = false;
+
+/** The screen a failed turn left behind, for its failure record. Best
+ *  effort: no backend, or a capture that throws, is no screen. */
+function turnFailureScreen(): string | undefined {
+  if (!backend) return undefined;
+  try { return captureBackendScreen(backend); } catch { return undefined; }
+}
+
 /** Report CLI processing completion independently from user-visible output.
  *  Keep a bounded worker-local dedup set because transcript watchers and app
  *  runners may surface the same final boundary more than once. */
@@ -31439,6 +31720,9 @@ function emitTurnTerminal(
   /** Backend-supplied completion instant (codex-app's runner timestamps its own
    *  finals). Clamped to now by the clock; absent means "use this instant". */
   completedAtMs?: number,
+  /** The provider's own error text for a non-completed terminal, raw: masked
+   *  and clipped below, before it leaves the worker. */
+  errorDetail?: string,
 ): void {
   if (!sessionId || !turnId) return;
   if (traexQuotaPending?.turnId === turnId) traexQuotaPending = undefined;
@@ -31470,9 +31754,13 @@ function emitTurnTerminal(
     releaseTerminatedActiveTurnAuthority();
   }
   retireTerminatedQueuedTurn(turnId, dispatchAttempt);
+  if (kimiActivityObserver) drainKimiActivityInto({ turnId, dispatchAttempt });
   if (thinkingTurn?.turnId === turnId && thinkingTurn.dispatchAttempt === dispatchAttempt) {
     flushThinkingUpdate();
   }
+  const diagnostics = captureTurnFailureDiagnostics && (status === 'failed' || status === 'ambiguous')
+    ? turnFailureDiagnostics({ errorDetail, screen: turnFailureScreen() })
+    : {};
   send({
     type: 'turn_terminal',
     sessionId,
@@ -31484,6 +31772,7 @@ function emitTurnTerminal(
     ...(retryable !== undefined ? { retryable } : {}),
     ...(timing ? { completedAtMs: timing.completedAtMs } : {}),
     ...(timing?.durationMs !== undefined ? { durationMs: timing.durationMs } : {}),
+    ...diagnostics,
   });
   let wakePending = false;
   if (terminalReleasesDurableTurn(
@@ -31904,6 +32193,7 @@ process.on('message', async (raw: unknown, handle: unknown) => {
       // daemon's own env: the daemon does not set it for other sessions.
       if (msg.workflowNodeSession === true) process.env[WORKFLOW_NODE_SESSION_ENV] = '1';
       else delete process.env[WORKFLOW_NODE_SESSION_ENV];
+      captureTurnFailureDiagnostics = msg.captureTurnFailureDiagnostics === true;
       if (ordinaryImTurnId) {
         const duplicateState = receiveOrdinaryImTurn(ordinaryImTurnId);
         // Receipt is the daemon ↔ worker transport boundary. Publish it before

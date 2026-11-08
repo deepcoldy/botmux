@@ -2661,7 +2661,7 @@ export type ChatBotMember = {
 type ChatBotListApiItem = { botId: string; botName: string };
 type ChatBotListApiResult =
   | { ok: true; items: ChatBotListApiItem[] }
-  | { ok: false; reason: string; cacheable: boolean };
+  | { ok: false; reason: string; cacheable: boolean; timeoutMs?: number };
 
 /**
  * A bot row returned directly by Feishu's live `/members/bots` endpoint.
@@ -2695,13 +2695,22 @@ export type CurrentChatBotAppResolution =
         | 'subject_lark_app_ambiguous';
       message: string;
       invalidSubjectLarkAppIds?: string[];
+      /** 仅当实时成员查询按 listBotsApiTimeoutMs 本地超时时存在，值为当时生效的上限。 */
+      timeoutMs?: number;
     };
+
+class LarkCallTimeoutError extends Error {
+  constructor(label: string, readonly timeoutMs: number) {
+    super(`${label} timed out after ${timeoutMs}ms`);
+    this.name = 'LarkCallTimeoutError';
+  }
+}
 
 function promiseWithTimeout<T>(p: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return p;
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer = setTimeout(() => reject(new LarkCallTimeoutError(label, timeoutMs)), timeoutMs);
   });
   return Promise.race([p, timeout]).finally(() => {
     if (timer) clearTimeout(timer);
@@ -2731,7 +2740,12 @@ async function listChatBotsViaMembersBots(
       .filter((it: ChatBotListApiItem) => it.botId && it.botName);
     return { ok: true, items };
   } catch (err: any) {
-    return { ok: false, reason: err?.message ?? String(err), cacheable: true };
+    return {
+      ok: false,
+      reason: err?.message ?? String(err),
+      cacheable: true,
+      ...(err instanceof LarkCallTimeoutError ? { timeoutMs: err.timeoutMs } : {}),
+    };
   }
 }
 
@@ -2780,6 +2794,7 @@ export async function resolveCurrentChatBotOpenIdsByLarkAppIds(
       ok: false,
       error: 'live_membership_unavailable',
       message: `live_chat_bot_members_unavailable: ${live.reason}`,
+      ...(live.timeoutMs !== undefined ? { timeoutMs: live.timeoutMs } : {}),
     };
   }
 
@@ -2864,6 +2879,7 @@ export async function resolveCurrentChatBotOpenIdsByLarkAppIds(
         error: 'live_membership_unavailable',
         message: `is_in_chat failed for ${appId}: ${err?.message ?? String(err)}`,
         invalidSubjectLarkAppIds: subjectLarkAppIds.includes(appId) ? [appId] : undefined,
+        ...(err instanceof LarkCallTimeoutError ? { timeoutMs: err.timeoutMs } : {}),
       };
     }
   }
