@@ -45,6 +45,8 @@ import type { TriggerUserAuthConfig, TriggerUserAuthTool } from '../services/tri
 import { isUsableOpenId } from '../utils/user-token.js';
 import { logger } from '../utils/logger.js';
 import { ensureSessionTempLayout, sessionTempDir, sessionTempDirWithoutAlias } from './session-temp.js';
+import { ensureBackgroundJobHome } from '../services/bytedcli-home.js';
+import { resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 
 export type { IdentityStorageModel };
 
@@ -281,7 +283,7 @@ function identityLayoutMarkerPath(sessionDataDir: string, sessionId: string): st
   return join(sessionIdentityDataDir(sessionDataDir, sessionId), IDENTITY_LAYOUT_FILE);
 }
 
-function readIdentityLayout(sessionDataDir: string, sessionId: string): IdentityStorageModel | undefined {
+export function readIdentityLayout(sessionDataDir: string, sessionId: string): IdentityStorageModel | undefined {
   try {
     const value = readFileSync(identityLayoutMarkerPath(sessionDataDir, sessionId), 'utf8').trim();
     return value === 'proven-v1' || value === 'single-v1'
@@ -527,6 +529,8 @@ export interface BytedCliIdentity extends TurnBound {
   cloudJwt: string;
   /** Optional: only present once a Codebase JWT has been minted for this person. */
   codeJwt?: string;
+  /** Partition-scoped ByteCloud JWTs; the wrapper swaps one in by `--site`. */
+  regionalCloudJwts?: Partial<Record<BytedcliRegion, string>>;
   /** See {@link LarkCliIdentity.openId}. */
   openId?: string;
   /**
@@ -605,6 +609,76 @@ const OPEN_ID_VAR = 'BOTMUX_IDENTITY_OPEN_ID';
 const HOME_VAR = 'BOTMUX_IDENTITY_HOME';
 
 /**
+ * ByteCloud JWTs are partition-scoped: a cn token is refused by i18n services
+ * (`invalid jwt token ... partition i18n`). The daemon mints one per region and
+ * the bytedcli wrapper picks the one matching the call's `--site` (or
+ * BYTEDCLI_CLOUD_SITE), so these never reach the child under their own names.
+ */
+export type BytedcliRegion = 'i18n' | 'i18nbd' | 'tx';
+const BYTEDCLI_REGIONAL_JWT_VARS: Record<BytedcliRegion, string> = {
+  i18n: 'BOTMUX_IDENTITY_CLOUD_JWT_I18N',
+  i18nbd: 'BOTMUX_IDENTITY_CLOUD_JWT_I18NBD',
+  tx: 'BOTMUX_IDENTITY_CLOUD_JWT_TX',
+};
+/** `--site` values (bytedcli 0.178) grouped by the JWT region each one uses,
+ *  measured by minting with every site. Sites not listed keep the default. */
+const BYTEDCLI_SITE_REGIONS: Record<BytedcliRegion, readonly string[]> = {
+  // The site `i18n` belongs to i18nbd; the i18n region uses i18n-tt.
+  i18n: ['i18n-tt', 'eu-ttp', 'eu-ttp-limited', 'eu-ttp-full'],
+  // us-ttpbd cannot be minted (auth commands reject it): it is scoped to
+  // bmq / apm argos log / cloud-ticket, which all request an i18n-bd JWT.
+  i18nbd: ['i18n', 'i18n-bd', 'us-ttpbd'],
+  tx: ['us-ttp', 'us-ttp-bdee', 'us-ttp-usts'],
+};
+/** bytedcli's CLOUD_SITE_ALIAS_MAP (identical in 0.173–0.187). Aliases of a
+ *  site without a regional token need no entry in the case below. */
+const BYTEDCLI_SITE_ALIASES: Readonly<Record<string, string>> = {
+  prod: 'cn', online: 'cn', 'sinf-cn': 'cn', boei18n: 'boe', 'boe-i18n': 'boe',
+  row: 'i18n-tt', i18ntt: 'i18n-tt', 'tiktok-row': 'i18n-tt',
+  usttp: 'us-ttp', 'tx-ttp': 'us-ttp', 'ttp-us': 'us-ttp', 'ttp-us-limited': 'us-ttp',
+  usttpbdee: 'us-ttp-bdee', usttpusts: 'us-ttp-usts',
+  euttp: 'eu-ttp', 'ttp-eu': 'eu-ttp',
+};
+
+/** Case pattern matching `site` in any letter case. */
+function anyCaseGlob(site: string): string {
+  return site.replace(/[a-z]/g, c => `[${c}${c.toUpperCase()}]`);
+}
+
+/** Shell lines selecting the regional ByteCloud JWT for this call's site. */
+function bytedcliRegionalSelection(): string[] {
+  const cases = (Object.keys(BYTEDCLI_SITE_REGIONS) as BytedcliRegion[]).map(region => {
+    const sites = BYTEDCLI_SITE_REGIONS[region];
+    const aliases = Object.keys(BYTEDCLI_SITE_ALIASES).filter(alias => sites.includes(BYTEDCLI_SITE_ALIASES[alias]));
+    return `    ${[...sites, ...aliases].map(anyCaseGlob).join('|')}) __botmux_regional=$${BYTEDCLI_REGIONAL_JWT_VARS[region]} ;;`;
+  });
+  return [
+    '  __botmux_site=${BYTEDCLI_CLOUD_SITE:-}',
+    '  __botmux_next=',
+    // Last --site wins, as with the CLI's own option parsing. Arguments are
+    // only read, never rewritten: "$@" is passed to the tool unchanged.
+    '  for __botmux_arg in "$@"; do',
+    '    if [ -n "$__botmux_next" ]; then __botmux_site=$__botmux_arg; __botmux_next=; continue; fi',
+    '    case "$__botmux_arg" in',
+    '      --) break ;;',
+    '      --site) __botmux_next=1 ;;',
+    '      --site=*) __botmux_site=${__botmux_arg#--site=} ;;',
+    '    esac',
+    '  done',
+    // bytedcli trims and lowercases the site before resolving it.
+    '  __botmux_site=${__botmux_site#"${__botmux_site%%[![:space:]]*}"}',
+    '  __botmux_site=${__botmux_site%"${__botmux_site##*[![:space:]]}"}',
+    '  __botmux_regional=',
+    '  case "$__botmux_site" in',
+    ...cases,
+    '  esac',
+    // No token for that region: keep the default one rather than refusing.
+    '  if [ -n "$__botmux_regional" ]; then BYTEDCLI_USER_CLOUD_JWT=$__botmux_regional; fi',
+    `  unset __botmux_site __botmux_next __botmux_arg __botmux_regional ${Object.values(BYTEDCLI_REGIONAL_JWT_VARS).join(' ')}`,
+  ];
+}
+
+/**
  * Values must survive `.` (source) in `/bin/sh` unchanged.
  *
  * A single-quoted shell word is fully literal apart from the quote itself, so
@@ -647,6 +721,10 @@ export function renderIdentityEnv(identity: CliIdentity): string {
   } else {
     pairs.push([MODE_VAR, 'user'], ['BYTEDCLI_USER_CLOUD_JWT', identity.cloudJwt]);
     if (identity.codeJwt) pairs.push(['BYTEDCLI_USER_CODE_JWT', identity.codeJwt]);
+    for (const [region, jwt] of Object.entries(identity.regionalCloudJwts ?? {})) {
+      const key = BYTEDCLI_REGIONAL_JWT_VARS[region as BytedcliRegion];
+      if (key && jwt) pairs.push([key, jwt]);
+    }
     // Same variable the lark-cli device-code identity uses: the wrapper scopes
     // HOME to this exec only (see renderIdentityWrapper).
     if (identity.home) pairs.push([HOME_VAR, identity.home]);
@@ -715,7 +793,7 @@ export function bytedcliTurnHome(
  *
  * The single place the layout `<base>/identity-home/bytedcli/<digest>` is
  * spelled. `base` is the only thing the two callers disagree about —
- * {@link bytedcliTurnHome} passes the plain scratch, {@link withBytedcliHome}
+ * {@link bytedcliTurnHome} passes the plain scratch, {@link publishedIdentityShape}
  * passes whatever {@link bytedcliHomeRoot} settled on — so keeping the join in
  * one function is what stops the published path from drifting away from the one
  * the tests pin. That drift would be a security regression, not a cosmetic one:
@@ -773,8 +851,11 @@ function bytedcliHomeRoot(sessionDataDir: string, sessionId: string): string {
  *  short-alias layout (or falls back to the cache-root spelling) and only then
  *  computes the path, so the published HOME is the short one and the executor is
  *  never the first writer of the layout. See {@link bytedcliHomeRoot}. */
-function withBytedcliHome(sessionDataDir: string, sessionId: string, identity: CliIdentity): CliIdentity {
+export function publishedIdentityShape(sessionDataDir: string, sessionId: string, identity: CliIdentity): CliIdentity {
   if (identity.tool !== 'bytedcli' || 'mode' in identity || identity.home) return identity;
+  if (identity.turnId?.startsWith('background:')) {
+    return { ...identity, home: ensureBackgroundJobHome(identity.turnId.slice('background:'.length)) };
+  }
   const base = bytedcliHomeRoot(sessionDataDir, sessionId);
   return { ...identity, home: bytedcliHomeFromBase(base, sessionId, identity) };
 }
@@ -798,7 +879,7 @@ export function writeSessionIdentity(
   published: CliIdentity,
   model: IdentityStorageModel,
 ): string {
-  const identity = withBytedcliHome(sessionDataDir, sessionId, published);
+  const identity = publishedIdentityShape(sessionDataDir, sessionId, published);
   const body = renderIdentityEnv(identity);
   const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool, identity.turnId);
   if (model === 'proven') {
@@ -1142,6 +1223,7 @@ export function renderIdentityWrapper(
     // daemon-provided identity when it carries them.
     `${TURN_VAR}=`,
     `${OPEN_ID_VAR}=`,
+    ...(tool === 'bytedcli' ? Object.values(BYTEDCLI_REGIONAL_JWT_VARS).map(key => `${key}=`) : []),
     // Same for the per-exec HOME: an inherited value must not redirect an
     // identity that does not carry one.
     `${HOME_VAR}=`,
@@ -1154,6 +1236,7 @@ export function renderIdentityWrapper(
     '',
     `case "$${MODE_VAR}" in`,
     '  user|bot)',
+    ...(tool === 'bytedcli' ? bytedcliRegionalSelection().map(line => `  ${line}`) : []),
     `    export ${exportKeys}`,
     '    ;;',
     '  user-home)',
@@ -1179,7 +1262,11 @@ export function renderIdentityWrapper(
     `    if [ -n "$${DENY_MSG_VAR}" ]; then`,
     `      printf '%s\\n' "$${DENY_MSG_VAR}" >&2`,
     '    else',
-    `      printf '%s\\n' 'botmux: ${tool} 需要发起人本人的授权，当前会话没有可用凭证，命令未执行。请发送 /login 完成授权后重试。' >&2`,
+    // Nothing was published for this call (no refusal text either): the turn's
+    // identity is still being prepared, or its publication failed. That is
+    // not an authorization verdict, so say so instead of sending the person
+    // to /login again.
+    `      printf '%s\\n' 'botmux: ${tool} 本轮的发起人身份还没有准备好（可能仍在获取凭据），命令未执行。这不一定是没授权：稍等几秒重试本命令；连续失败再发 /login status 查看授权状态。' '[reason=identity_not_published]' >&2`,
     '    fi',
     `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '    ;;',
@@ -1369,8 +1456,14 @@ export function installLoginShellPathShim(binDir: string): { zdotdir: string; ba
   const reprepend = [
     '# botmux trigger-user identity — generated, do not edit.',
     '# Re-prepend the wrapper dir AFTER path_helper has rebuilt PATH.',
+    'if [ -n "${BOTMUX_WRAPPER_BIN:-}" ]; then',
+    '  case "$PATH:" in',
+    '    "$BOTMUX_WRAPPER_BIN":*) ;;',
+    '    *) PATH="$BOTMUX_WRAPPER_BIN${PATH:+:$PATH}"; export PATH ;;',
+    '  esac',
+    'fi',
     'if [ -n "$BOTMUX_IDENTITY_BIN" ]; then',
-    '  case ":$PATH:" in',
+    '  case "$PATH:" in',
     '    "$BOTMUX_IDENTITY_BIN":*) ;;',
     '    *) PATH="$BOTMUX_IDENTITY_BIN${PATH:+:$PATH}"; export PATH ;;',
     '  esac',
@@ -1782,6 +1875,7 @@ export function prepareTriggerUserCliEnv(
     try {
       const { zdotdir, bashEnv } = installLoginShellPathShim(wrapperDir);
       childEnv.BOTMUX_IDENTITY_BIN = wrapperDir;
+      childEnv.BOTMUX_WRAPPER_BIN = resolveBotmuxWrapperBinDir(childEnv);
       childEnv.ZDOTDIR = zdotdir;
       childEnv.BASH_ENV = bashEnv;
     } catch (e) {

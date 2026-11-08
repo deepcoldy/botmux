@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   boundLarkPlatformPolicy,
   platformAuthRequestRedirect,
+  platformIncrementalAuthorizeUrl,
   resolveBoundLarkUserCredential,
 } from '../src/core/lark-tool-platform-credential.js';
 import { __setPlatformCredentialDepsForTest } from '../src/core/platform-credential-source.js';
@@ -113,6 +114,8 @@ describe('resolveBoundLarkUserCredential', () => {
     const out = await result;
     expect(out).toMatchObject({ ok: false, reason: 'platform', authorizeUrl: PAGE });
     expect(out.ok === false && out.reason === 'platform' && out.error).toContain(PAGE);
+     // The cause travels with the text the agent relays.
+    expect(out.ok === false && out.reason === 'platform' && out.error).toMatch(/\[reason=platform_[a-z_]+\]$/);
   });
 
   it('platform mode never consults the bot-app grant', async () => {
@@ -125,7 +128,9 @@ describe('resolveBoundLarkUserCredential', () => {
   it('platform mode on an unbound machine refuses instead of falling back', async () => {
     bound = false;
     const { result, tokenFn } = resolve(bot({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' }), 'bot-app-token');
-    expect(await result).toMatchObject({ ok: false, reason: 'platform' });
+    const out = await result;
+    expect(out).toMatchObject({ ok: false, reason: 'platform' });
+    expect(out.ok === false && out.reason === 'platform' && out.error).toContain('[reason=platform_unbound]');
     expect(tokenFn).not.toHaveBeenCalled();
   });
 
@@ -162,9 +167,26 @@ describe('resolveBoundLarkUserCredential', () => {
 });
 
 describe('platformAuthRequestRedirect', () => {
-  const redirect = (config: any, botAppToken: string | null) =>
+  const redirect = (config: any, botAppToken: string | null, scopes?: string[]) =>
     platformAuthRequestRedirect({ bot: config, openId: 'ou_person', delegated: false,
-      botAppToken: async openId => (openId === 'ou_person' ? botAppToken : 'WRONG_PERSON') });
+      botAppToken: async openId => (openId === 'ou_person' ? botAppToken : 'WRONG_PERSON'),
+      ...(scopes ? { scopes } : {}) });
+
+  it('carries the missing scopes to the platform page so one click adds just those', async () => {
+    const out = await redirect(bot({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' }), null,
+      ['base:record:read', 'base:record:create', 'base:record:read']);
+    const url = new URL(out!.authorizeUrl!);
+    expect(url.origin + url.pathname).toBe(PAGE);
+    // The platform page reads it back with URLSearchParams: deduplicated, space separated.
+    expect(url.searchParams.getAll('scope')).toEqual(['base:record:read base:record:create']);
+    expect(out!.error).toContain(out!.authorizeUrl!);
+    expect(out!.error).toContain('补充授权');
+  });
+
+  it('without scopes the plain platform page is unchanged', async () => {
+    const out = await redirect(bot({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' }), null, []);
+    expect(out!.authorizeUrl).toBe(PAGE);
+  });
 
   it('leaves the bot-app flow alone when the platform does not apply', async () => {
     expect(await redirect(bot(), null)).toBeNull();
@@ -193,5 +215,13 @@ describe('platformAuthRequestRedirect', () => {
     const out = await redirect(bot({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' }), 'bot-app-token');
     expect(out).not.toBeNull();
     expect(out?.authorizeUrl).toBeUndefined();
+  });
+});
+
+describe('platformIncrementalAuthorizeUrl', () => {
+  it('encodes scopes as one query value that URLSearchParams decodes back', () => {
+    const url = platformIncrementalAuthorizeUrl(PAGE, ['base:record:read', 'docs:document.media:upload']);
+    expect(new URL(url).searchParams.get('scope')).toBe('base:record:read docs:document.media:upload');
+    expect(platformIncrementalAuthorizeUrl(PAGE, [])).toBe(PAGE);
   });
 });

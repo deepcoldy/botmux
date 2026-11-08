@@ -34,6 +34,7 @@ import {
   __testOnly_runPendingSuspendIfSettled as runPendingSuspendIfSettled,
   suspendWorker,
   setSessionReasoningEffort,
+  topicReasoningControl, setTopicReasoningEffort, __testOnly_resetRestartCoordinator,
   sendWorkerInput,
   __testOnly_resetOrdinaryImDeliveries,
   sessionReasoningControl,
@@ -538,5 +539,56 @@ describe('session reasoning effort changes', () => {
     expect(() => setSessionReasoningEffort(ds, 'high')).toThrow('disk full');
     expect(ds.session.reasoningEffort).toBe('ultra');
     expect(worker.send).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('model-bound topic reasoning effort preferences', () => {
+  function topic() {
+    const { ds } = busySession('idle');
+    ds.session.cliId = 'traex'; ds.session.model = 'GPT-6.1-Sol'; ds.session.reasoningEffort = 'xhigh';
+    ds.initConfig = { cliId: 'traex', backendType: 'tmux', model: 'GPT-6.1-Sol', reasoningEffort: 'xhigh' };
+    ds.activeModel = 'GPT-6.1-Sol'; ds.activeReasoningEffort = 'xhigh'; ds.workerReady = true; ds.cliReady = true;
+    return ds;
+  }
+  beforeEach(() => { __testOnly_resetRestartCoordinator(); __testOnly_resetOrdinaryImDeliveries(); });
+  it('saves a topic override without replacing the original launch preference or sending CLI input', async () => {
+    const ds = topic();
+    expect(setTopicReasoningEffort(ds, 'medium')).toBe('saved');
+    expect(ds.session.topicReasoningEffort).toEqual({ model: 'GPT-6.1-Sol', effort: 'medium' });
+    expect(ds.session.reasoningEffort).toBe('xhigh');
+    expect(ds.initConfig.reasoningEffort).toBe('xhigh');
+    expect(ds.worker.send).not.toHaveBeenCalled();
+    expect(topicReasoningControl(ds)).toMatchObject({ selected: 'medium', active: 'xhigh', pending: true });
+  });
+  it('rolls back the topic preference when persistence fails', async () => {
+    const store = await import('../src/services/session-store.js');
+    const ds = topic(); const previous = { model: 'GPT-6.1-Sol', effort: 'high' }; ds.session.topicReasoningEffort = previous;
+    vi.mocked(store.updateSession).mockImplementationOnce(() => { throw new Error('disk full'); });
+    expect(() => setTopicReasoningEffort(ds, 'medium')).toThrow('disk full');
+    expect(ds.session.topicReasoningEffort).toBe(previous);
+  });
+  it('keeps a previous model preference dormant after an in-session model change', () => {
+    const ds = topic(); expect(setTopicReasoningEffort(ds, 'medium')).toBe('saved');
+    ds.activeModel = 'DeepSeek-V4-Pro'; ds.activeReasoningEffort = 'high';
+    expect(topicReasoningControl(ds)).toMatchObject({ model: 'DeepSeek-V4-Pro', selected: 'high', pending: false });
+    expect(ds.session.topicReasoningEffort.model).toBe('GPT-6.1-Sol');
+  });
+  it('does not save while the session is working or for an unsupported level', () => {
+    const ds = topic(); ds.lastScreenStatus = 'working';
+    expect(setTopicReasoningEffort(ds, 'medium')).toBe('busy');
+    ds.lastScreenStatus = 'idle'; expect(setTopicReasoningEffort(ds, 'ultra')).toBe('invalid');
+    expect(ds.session.topicReasoningEffort).toBeUndefined();
+  });
+  it.each(['cli', 'remote', 'adopt', 'wrapper', 'auto', 'workflow'])('withholds controls for %s', kind => {
+    const ds = topic();
+    if (kind === 'cli') ds.session.cliId = ds.initConfig.cliId = 'claude-code';
+    if (kind === 'remote') ds.initConfig.backendType = 'riff';
+    if (kind === 'adopt') ds.initConfig.adoptMode = true;
+    if (kind === 'wrapper') ds.initConfig.wrapperCli = 'ttadk traex';
+    if (kind === 'auto') ds.initConfig.traexAutoModel = { enabled: true };
+    if (kind === 'workflow') ds.initConfig.workflowNodeSession = true;
+    expect(topicReasoningControl(ds)).toBeUndefined();
+    expect(setTopicReasoningEffort(ds, 'medium')).toBe('unsupported');
   });
 });

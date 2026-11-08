@@ -88,6 +88,69 @@ describe('delegated schedule runtime authorization', () => {
     })).resolves.toBeUndefined();
   });
 
+  it('lets a host-terminal task without any controller stop itself', async () => {
+    const hostTask = {
+      ...authority,
+      kind: 'direct' as const,
+      task: { ...task, ownerOpenId: undefined, ownerUnionId: undefined },
+      controlOpenId: undefined,
+      controlUnionId: undefined,
+      credentialOpenId: undefined,
+      runScopes: [],
+      selfManage: false,
+    };
+    const lookups = {
+      resolveTargetOpenId: vi.fn(async () => undefined),
+      listChatMemberOpenIds: vi.fn(async () => []),
+    };
+    await expect(authorizeScheduleSelfManage(hostTask, {
+      selfManageEnabled: false,
+      targetChatId: 'oc_chat',
+      adminOpenIds: [],
+      ...lookups,
+    })).resolves.toBeUndefined();
+    expect(lookups.resolveTargetOpenId).not.toHaveBeenCalled();
+    expect(lookups.listChatMemberOpenIds).not.toHaveBeenCalled();
+
+    // Still bound to the live states: a paused or removed host task stays put.
+    for (const state of ['paused', 'revoked'] as const) {
+      await expect(authorizeScheduleSelfManage({ ...hostTask, state }, {
+        selfManageEnabled: false, targetChatId: 'oc_chat', adminOpenIds: [], ...lookups,
+      })).rejects.toThrow(`schedule authority state is ${state}`);
+    }
+
+    // A naturally completed until-done task keeps one live cleanup turn; the
+    // completedRunStillLive state gate is evaluated before the exemption and
+    // no controller lookup may happen.
+    await expect(authorizeScheduleSelfManage({
+      ...hostTask, state: 'completed',
+      task: { ...hostTask.task, enabled: false, disabledReason: 'once_completed' as const },
+    }, {
+      selfManageEnabled: false, targetChatId: 'oc_chat', adminOpenIds: [], ...lookups,
+    })).resolves.toBeUndefined();
+    expect(lookups.resolveTargetOpenId).not.toHaveBeenCalled();
+    expect(lookups.listChatMemberOpenIds).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [{ controlOpenId: 'ou_gone', controlUnionId: undefined }, 'no longer an allowed bot operator'],
+    [{ controlOpenId: undefined, controlUnionId: 'on_gone' }, 'no longer an allowed bot operator'],
+    [{ controlOpenId: 'ou_gone', controlUnionId: 'on_gone' }, 'no longer an allowed bot operator'],
+    // A sender whose open_id Lark left empty is recorded, not absent.
+    [{ controlOpenId: '', controlUnionId: undefined }, 'no longer an allowed bot operator'],
+    [{ controlOpenId: '', controlUnionId: '' }, 'no longer an allowed bot operator'],
+  ])('keeps the live controller check for a direct task recording %o', async (control, message) => {
+    await expect(authorizeScheduleSelfManage({
+      ...authority, kind: 'direct', selfManage: false, credentialOpenId: undefined, runScopes: [], ...control,
+    }, {
+      selfManageEnabled: false,
+      targetChatId: 'oc_chat',
+      adminOpenIds: ['ou_user_target'],
+      resolveTargetOpenId: async () => 'ou_user_target',
+      listChatMemberOpenIds: async () => ['ou_user_target'],
+    })).rejects.toThrow(message);
+  });
+
   it('keeps legacy tasks outside scheduled self-management', async () => {
     await expect(authorizeScheduleSelfManage({ ...authority, kind: 'legacy' }, {
       selfManageEnabled: true,

@@ -10,6 +10,7 @@ import { localTerminalCapable } from '../core/local-terminal-opener.js';
 import type { DaemonSession } from '../core/types.js';
 import { getSessionPersistentBackendType, persistentBackendTargetForSession } from '../core/persistent-backend.js';
 import { readGlobalConfig, type LocalCliOpenMode } from '../global-config.js';
+import { resolveCliSpawn } from '../core/self-spawn.js';
 
 export const LOCAL_CLI_IDS = [
   'claude-code',
@@ -33,6 +34,7 @@ export const LOCAL_CLI_IDS = [
   'kimi',
   'grok',
   'zcode',
+  'doubao',
 ] as const satisfies readonly CliId[];
 
 export type LocalCliId = typeof LOCAL_CLI_IDS[number];
@@ -61,6 +63,7 @@ const RESUME_COMMAND_PREFIXES: Record<Exclude<LocalCliId, 'oh-my-pi'>, string> =
   'kimi': 'kimi --session',
   'grok': 'grok --resume',
   'zcode': 'zcode --resume',
+  'doubao': 'doubao --resume',
 };
 
 type AdoptedMetadata = NonNullable<DaemonSession['adoptedFrom']> | NonNullable<DaemonSession['session']['adoptedFrom']>;
@@ -303,14 +306,13 @@ function buildManagedAttachCommand(ds: DaemonSession): LocalCliOpenResult {
       'unset ZMX_SESSION ZMX_SESSION_PREFIX',
       ...socketEnv,
     ].join('; ');
-    const helper = [
-      shellQuote(process.execPath),
-      shellQuote(CLI_ENTRYPOINT),
+    const attach = resolveCliSpawn(CLI_ENTRYPOINT, [
       '__zmx-attach-managed',
-      shellQuote(target.sessionName),
-      shellQuote(ds.session.sessionId),
-      ...(target.socketDir !== undefined ? [shellQuote(target.socketDir)] : []),
-    ].join(' ');
+      target.sessionName,
+      ds.session.sessionId,
+      ...(target.socketDir !== undefined ? [target.socketDir] : []),
+    ]);
+    const helper = [attach.command, ...attach.args].map(shellQuote).join(' ');
     return {
       ok: true,
       command: `${prelude}; exec ${helper}`,

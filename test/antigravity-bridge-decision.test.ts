@@ -190,5 +190,6 @@ describe('decideAntigravityNotifyAction', () => {
     expect(decideAntigravityNotifyAction(A, B_FULL)).toEqual({ kind: 'rotate', path: B_FULL });
     expect(decideAntigravityNotifyAction(undefined, A_FULL)).toEqual({ kind: 'bind-initial', path: A_FULL });
     expect(decideAntigravityNotifyAction(A, undefined)).toEqual({ kind: 'wait-pending' });
+    expect(decideAntigravityNotifyAction(undefined, undefined)).toEqual({ kind: 'wait-pending' });
   });
 });

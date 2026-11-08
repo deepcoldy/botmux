@@ -100,10 +100,10 @@ export function decideAntigravityNotifyAction(
   boundPath: string | undefined,
   resolvedPath: string | undefined,
 ): AntigravityNotifyAction {
-  // Unbound with nothing resolved also lands here (historical behavior: the
-  // ticker's pid probe covers that first attach).
-  if (resolvedPath === boundPath || isSameAntigravityConversation(resolvedPath, boundPath)) return { kind: 'same' };
   if (!resolvedPath) return { kind: 'wait-pending' };
+  // A missing first log is pending, just like a missing log after /new. Treat
+  // only two resolved paths for the same conversation as an existing bind.
+  if (resolvedPath === boundPath || isSameAntigravityConversation(resolvedPath, boundPath)) return { kind: 'same' };
   return boundPath ? { kind: 'rotate', path: resolvedPath } : { kind: 'bind-initial', path: resolvedPath };
 }
 

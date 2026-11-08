@@ -83,6 +83,52 @@ describe('IdleDetector: isReadyEvidenceWeak()', () => {
     readyPatternStrong: withoutRuleArm,
   }));
 
+  it('republishes viewport-verified readiness after an earlier idle edge was not admitted', () => {
+    vi.useFakeTimers();
+    const detector = makeTraexish();
+    const idle = vi.fn();
+    try {
+      detector.onIdle(idle);
+      detector.feed('──────\x1b[2;1H❯ Ask TRAE CLI to do anything');
+      vi.advanceTimersByTime(4_000);
+      expect(detector.isIdleNow()).toBe(true);
+      expect(detector.isReadyEvidenceWeak()).toBe(true);
+      expect(idle).toHaveBeenCalledTimes(1);
+      expect(detector.seedReadyEvidence()).toBe(false);
+      expect(idle).toHaveBeenCalledTimes(1);
+      expect(detector.seedReadyEvidence(true)).toBe(true);
+      expect(detector.isReadyEvidenceWeak()).toBe(false);
+      expect(idle).toHaveBeenCalledTimes(2);
+    } finally {
+      detector.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps static capacity-queue evidence gated when rechecking an old idle edge', () => {
+    vi.useFakeTimers();
+    const detector = new IdleDetector(makeCli({
+      readyPattern: /❯/,
+      staticBusyPattern: /Queued for capacity/,
+      staticBusyClearPattern: /❯/,
+    }));
+    const idle = vi.fn();
+    try {
+      detector.onIdle(idle);
+      detector.feed('❯');
+      vi.advanceTimersByTime(4_000);
+      expect(idle).toHaveBeenCalledTimes(1);
+      detector.feed('Queued for capacity');
+      detector.seedReadyEvidence(true);
+      vi.advanceTimersByTime(4_000);
+      expect(idle).toHaveBeenCalledTimes(1);
+      expect(detector.isIdleNow()).toBe(false);
+    } finally {
+      detector.dispose();
+      vi.useRealTimers();
+    }
+  });
+
   it('tags a prompt joined to a horizontal rule (cursor-addressed redraw) as weak', () => {
     const detector = makeTraexish();
     detector.feed('──────────────────────────❯ Ask TraeCode CLI to do anything');

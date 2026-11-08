@@ -26,9 +26,10 @@ const mocks = vi.hoisted(() => ({
   overview: vi.fn(),
   issue: vi.fn(),
   issueDeps: { marker: 'issue-deps' },
+  boardCard: vi.fn(),
   createDaemonClientFor: vi.fn((appId: string) => ({ client: appId })),
   v3: {
-    gate: vi.fn(), blocked: vi.fn(), revisit: vi.fn(), loop: vi.fn(), runSave: vi.fn(), distill: vi.fn(),
+    gate: vi.fn(), blocked: vi.fn(), revisit: vi.fn(), loop: vi.fn(), revision: vi.fn(), runSave: vi.fn(), distill: vi.fn(),
   },
 }));
 
@@ -40,11 +41,13 @@ vi.mock('../src/im/lark/groups-card.js', async (orig) => ({ ...(await orig<objec
 vi.mock('../src/im/lark/overview-card.js', async (orig) => ({ ...(await orig<object>()), handleOverviewCardAction: mocks.overview }));
 vi.mock('../src/im/lark/issue-command.js', async (orig) => ({ ...(await orig<object>()), handleIssueCardAction: mocks.issue }));
 vi.mock('../src/im/lark/issue-command-deps.js', async (orig) => ({ ...(await orig<object>()), buildIssueCommandDeps: () => mocks.issueDeps }));
+vi.mock('../src/core/decision-board/card-action.js', async (orig) => ({ ...(await orig<object>()), handleDecisionCardAction: mocks.boardCard }));
 vi.mock('../src/daemon-internal-client-wrapper.js', async (orig) => ({ ...(await orig<object>()), createDaemonClientFor: mocks.createDaemonClientFor }));
 vi.mock('../src/im/lark/v3-gate-card-handler.js', async (orig) => ({ ...(await orig<object>()), handleV3GateAction: mocks.v3.gate }));
 vi.mock('../src/im/lark/v3-blocked-card-handler.js', async (orig) => ({ ...(await orig<object>()), handleV3BlockedAction: mocks.v3.blocked }));
 vi.mock('../src/im/lark/v3-revisit-grant-card-handler.js', async (orig) => ({ ...(await orig<object>()), handleV3RevisitGrantAction: mocks.v3.revisit }));
 vi.mock('../src/im/lark/v3-loop-grant-card-handler.js', async (orig) => ({ ...(await orig<object>()), handleV3LoopGrantAction: mocks.v3.loop }));
+vi.mock('../src/im/lark/v3-revision-card-handler.js', async (orig) => ({ ...(await orig<object>()), handleV3RevisionAction: mocks.v3.revision }));
 vi.mock('../src/im/lark/v3-run-save-card-handler.js', async (orig) => ({ ...(await orig<object>()), handleV3RunSaveAction: mocks.v3.runSave }));
 vi.mock('../src/im/lark/v3-distillation-card-handler.js', async (orig) => ({ ...(await orig<object>()), handleV3DistillationAction: mocks.v3.distill }));
 
@@ -63,7 +66,7 @@ const clickData = (action: string, extra: Record<string, unknown> = {}): any => 
 });
 
 beforeEach(() => {
-  for (const m of [mocks.settings, mocks.sessions, mocks.groupSessions, mocks.schedules, mocks.groups, mocks.overview, mocks.issue,
+  for (const m of [mocks.settings, mocks.sessions, mocks.groupSessions, mocks.schedules, mocks.groups, mocks.overview, mocks.issue, mocks.boardCard,
     ...Object.values(mocks.v3), mocks.createDaemonClientFor]) m.mockClear();
 });
 
@@ -71,6 +74,7 @@ describe('前缀路由表', () => {
   it('表序与前缀逐项钉死', () => {
     expect(CARD_PREFIX_ROUTES.map(r => r.prefix)).toEqual([
       'dash_settings_', 'dash_sessions_', 'group_sessions_', 'dash_schedules_', 'dash_groups_', 'issue_', 'dash_overview_',
+      'board_card_',
     ]);
   });
 
@@ -126,6 +130,14 @@ describe('前缀路由表', () => {
     expect(mocks.issue).toHaveBeenCalledWith(data, 'cli_app', mocks.issueDeps);
   });
 
+  it('board_card_ → handleDecisionCardAction(data, larkAppId)，不经 session 查找与 canOperate 门', async () => {
+    mocks.boardCard.mockResolvedValueOnce({ toast: { type: 'error', content: 'board' } });
+    const data = clickData('board_card_pick');
+    expect(await handleCardAction(data, baseDeps(), 'cli_app')).toEqual({ toast: { type: 'error', content: 'board' } });
+    expect(mocks.boardCard).toHaveBeenCalledWith(data, 'cli_app');
+    expect(mocks.issue).not.toHaveBeenCalled();
+  });
+
   it.each(['dash_settings_open', 'dash_overview_goto', 'issue_refresh'])('%s 缺 larkAppId 时不转交（落空继续往下走）', async (action) => {
     await handleCardAction(clickData(action), baseDeps(), undefined).catch(() => undefined);
     for (const m of [mocks.settings, mocks.overview, mocks.issue]) expect(m).not.toHaveBeenCalled();
@@ -133,8 +145,8 @@ describe('前缀路由表', () => {
 });
 
 describe('v3 路由表', () => {
-  it('表序钉死：gate → blocked → revisitGrant → loopGrant → runSave → distillation', () => {
-    expect(V3_CARD_ROUTES.map(r => r.name)).toEqual(['gate', 'blocked', 'revisitGrant', 'loopGrant', 'runSave', 'distillation']);
+  it('表序钉死：gate → blocked → revisitGrant → loopGrant → revision → runSave → distillation', () => {
+    expect(V3_CARD_ROUTES.map(r => r.name)).toEqual(['gate', 'blocked', 'revisitGrant', 'loopGrant', 'revision', 'runSave', 'distillation']);
   });
 
   const v3Cases: Array<[string, string, () => ReturnType<typeof vi.fn>, string]> = [
@@ -143,6 +155,8 @@ describe('v3 路由表', () => {
     ['blocked', 'v3_blocked_ask_answer', () => mocks.v3.blocked, 'v3BlockedDeps'],
     ['revisitGrant', 'v3_revisit_grant', () => mocks.v3.revisit, 'v3RevisitGrantDeps'],
     ['loopGrant', 'v3_loop_grant', () => mocks.v3.loop, 'v3LoopGrantDeps'],
+    ['revision', 'v3_revision_approve', () => mocks.v3.revision, 'v3RevisionDeps'],
+    ['revision', 'v3_revision_reject', () => mocks.v3.revision, 'v3RevisionDeps'],
     ['runSave', 'v3_run_save', () => mocks.v3.runSave, 'v3RunSaveDeps'],
     ['distillation', 'v3_distill_accept', () => mocks.v3.distill, 'v3DistillationDeps'],
   ];
@@ -198,8 +212,8 @@ describe('敏感动作清单', () => {
     'cleanup_session_worktree', 'close', 'compact_session', 'disconnect', 'export_text', 'get_write_link', 'open_local_cli', 'open_local_terminal',
     'quote_confirm', 'refresh_screenshot', 'reply_card_menu', 'reply_model_pick',
     'repo_manual_submit', 'repo_rebuild_worktree', 'repo_worktree_submit', 'restart', 'resume',
-    'retry_last_task', 'retry_turn', 'set_reasoning_effort', 'skip_repo', 'stop_turn', 'takeover', 'term_action',
-    'toggle_display', 'toggle_stream', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_cancel', 'wf_reject',
+    'retry_last_task', 'retry_turn', 'session_effort_apply', 'session_effort_pick', 'session_model_pick', 'session_model_unpin', 'set_reasoning_effort', 'skip_repo', 'stop_turn', 'takeover', 'term_action',
+    'toggle_display', 'toggle_idle_compact', 'toggle_stream', 'toggle_substitute', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_cancel', 'wf_reject',
     'worktree_toggle_mode',
   ];
 
@@ -217,13 +231,15 @@ describe('敏感动作清单', () => {
     }
   });
 
-  it('拒绝时给 toast 的只有「取权 / 打开」类动作和关闭卡的清理 worktree，key 与原实现一致', () => {
+  it('拒绝时给 toast 的只有「取权 / 打开」类动作、闲置自动压缩开关和关闭卡的清理 worktree，key 与原实现一致', () => {
     const withToast = [...SENSITIVE_CARD_ACTIONS].filter(([, m]) => m.denyToastKey).map(([a, m]) => [a, m.denyToastKey]);
     expect(withToast.sort()).toEqual([
       ['cleanup_session_worktree', 'card.worktree_cleanup.no_permission'],
       ['get_write_link', 'card.action.write_link_no_permission'],
       ['open_local_cli', 'card.action.local_cli_no_permission'],
       ['open_local_terminal', 'card.action.local_terminal_no_permission'],
+      ['toggle_idle_compact', 'card.idle_compact.no_permission'],
+      ['toggle_substitute', 'cmd.substitute.owner_only'],
     ]);
   });
 

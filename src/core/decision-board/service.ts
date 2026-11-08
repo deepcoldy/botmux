@@ -8,7 +8,8 @@
  *
  * 存储懒打开：第一次真的用到看板时才建 `decision-board.sqlite`。
  */
-import { copyFileSync, mkdirSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Locale } from '../../i18n/types.js';
 import type { Brand } from '../../im/lark/lark-hosts.js';
@@ -17,9 +18,28 @@ import { parseDashboardImageUploads } from '../dashboard-images.js';
 import {
   BoardError,
   DecisionBoardStore,
+  decisionBoardDbPath,
   type ItemPatch,
 } from '../../services/decision-board-store.js';
+import {
+  formatHintNotice,
+  formatHintPrompt,
+  formatHintTurnId,
+  parseCloseWhenSpec,
+  parseDependsOnSpec,
+  parseHintTurnId,
+  parseNextCheckSpec,
+  type HintNoticeEntry,
+  type PrMergeState,
+} from './hints.js';
 import { formatChatLookupFailures, lookupProvesChatNotFound, type ChatLookupResult } from './chat-lookup.js';
+import {
+  DECISION_CARD_ACTION_NOTE,
+  DECISION_CARD_ACTION_PICK,
+  DecisionCards,
+  cardNoteText,
+  decisionAskKey,
+} from './card.js';
 import {
   BOARD_STATE_LABELS,
   CHAT_REF_PATTERN,
@@ -43,8 +63,10 @@ import {
   parseUnlinkSpec,
   sidebarAppLink,
   stewardGuidePreset,
+  stewardCloseHintsOn,
   stewardReady,
   type BoardBatch,
+  type BoardHint,
   type BoardItem,
   type BoardLink,
   type BoardOption,
@@ -84,7 +106,66 @@ export interface DecisionBoardServiceDeps {
    * 只在写 chat 关联时调用；凭据只留在 daemon 进程内。`deadline` 是这条命令共用的截止时间。
    */
   lookupChat(chatId: string, opts: { deadline: number }): Promise<ChatLookupResult>;
+  /**
+   * 管家群里的拍板卡片（见 card.ts）。不接线时不发卡，其余行为不变。
+   */
+  cards?: {
+    /** uuid：飞书发送去重键（补发同一张卡时不变，上次其实已发出时不会出第二张）。 */
+    sendCard(chatId: string, cardJson: string, uuid: string): Promise<string>;
+    updateCard(messageId: string, cardJson: string): Promise<void>;
+    isCardGone(error: unknown): boolean;
+  };
+  /**
+   * 后台巡检查 PR 合没合（`owner/repo#12`）。查不到（网络、频控、没权限、不是 GitHub 上的仓库）返回
+   * undefined，巡检这轮不据此下结论。缓存与限流由实现负责（见 github-pr-state.ts）。
+   */
+  prState?(ref: string): Promise<PrMergeState | undefined>;
 }
+
+/** 卡片按钮回调交给 {@link DecisionBoardService.cardClick} 的内容（身份取自飞书事件，不取 value）。 */
+export interface BoardCardClick {
+  operatorOpenId?: string;
+  operatorUnionId?: string;
+  value: Record<string, unknown>;
+  formValue?: unknown;
+  messageId?: string;
+}
+
+/** 卡片回调的结果：toast 和 / 或换上的卡片；deliver 在回调应答之后执行（投递可能要几秒）。 */
+export interface BoardCardClickResult {
+  toast?: { type: 'success' | 'info' | 'warning' | 'error'; content: string };
+  card?: Record<string, unknown>;
+  deliver?: () => Promise<void>;
+}
+
+const CARD_TOASTS = {
+  zh: {
+    unavailable: '这张卡片已失效，去看板上处理',
+    disabled: '这个管家没开「飞书卡片拍板」，去看板上处理',
+    noPermission: '只有看板 owner 能在卡片上拍板',
+    gone: '这一项已经不在看板上了',
+    notDeciding: '这一项已经不在待拍板了，卡片已刷新',
+    stale: '选项刚改过，卡片已刷新，请按最新选项再点',
+    noteRequired: '先在说明框里写点什么',
+    replaced: '这张卡片已过期，请用管家群里这一项最新的卡片，或去看板上处理',
+    duplicate: '这个决定已经交给管家了',
+    accepted: (label: string) => `已选 ${label}，正在交给管家`,
+    acceptedNote: '已提交说明，正在交给管家',
+  },
+  en: {
+    unavailable: 'This card has expired; use the board instead',
+    disabled: 'Decision cards are off for this steward; use the board instead',
+    noPermission: 'Only the board owner can decide on this card',
+    gone: 'This item is no longer on the board',
+    notDeciding: 'This item no longer awaits a decision; card refreshed',
+    stale: 'The options just changed; card refreshed, please pick again',
+    noteRequired: 'Write something in the note box first',
+    replaced: 'This card is outdated; use the latest card for this item in the steward chat, or the board',
+    duplicate: 'This decision was already sent to the steward',
+    accepted: (label: string) => `Picked ${label}; sending to the steward`,
+    acceptedNote: 'Note submitted; sending to the steward',
+  },
+} as const;
 
 /** CLI 发来的请求体：选项和关联都传原始 spec 字符串，由这里统一解析。 */
 export interface BoardCliRequest {
@@ -107,6 +188,14 @@ export interface BoardCliRequest {
   noChat?: unknown;
   /** `--allow-unverified-chat`：查不到的群也写，标「未核实」。 */
   allowUnverifiedChat?: unknown;
+  /** `--close-when "pr:owner/repo#12 merged" | "item:66 done" | manual | auto` */
+  closeWhen?: unknown;
+  /** `--depends-on 66,70 | none` */
+  dependsOn?: unknown;
+  /** `--next-check +2d | 2026-11-10T09:30+08:00 | none` */
+  nextCheck?: unknown;
+  /** `--dismiss-hint`：收起当前提示。 */
+  dismissHint?: unknown;
 }
 
 /** 建项缺群时的报错：写清楚三种写法（管家照着改命令即可）。 */
@@ -130,11 +219,69 @@ const CHAT_VERIFY_BUDGET_MS = 20_000;
 
 const PATCH_TEXT_FIELDS = ['key', 'stage', 'kind', 'repo', 'summary', 'progress', 'question', 'recommend', 'recommendReason', 'note', 'title'] as const;
 
+/**
+ * 一轮巡检里最多问这么多个 PR（多数命中查询模块的缓存，不发请求）。超出时按轮转着查：每轮从上一轮停下的
+ * 位置接着往后，几轮就覆盖全部；没轮到的 PR 用上次查到的状态。
+ */
+const HINT_PR_LOOKUPS_PER_ROUND = 40;
+
+/**
+ * 同一条提示的通知最多自动投这么多次（投递抛错时重试）。deliver() 可能已经在群里发出横幅才失败，
+ * 无上限重试会每 5 分钟往管家群刷一条；超过就不再自动发，提示仍留在看板上。
+ */
+const HINT_NOTICE_MAX_ATTEMPTS = 3;
+
 export class DecisionBoardService {
   private storeRef?: DecisionBoardStore;
   private readonly delivering = new Map<number, Promise<BoardBatch>>();
+  readonly cards?: DecisionCards;
+  /** 批次按编号顺序逐个投递：较早的一批先进管家会话，覆盖标记在投递那一刻读，先后才对得上。 */
+  private deliveryChain: Promise<unknown> = Promise.resolve();
+  private sweeping = false;
+  /** 正在投的提示通知（与 sweeping 分开：投递卡住时巡检照常给看板标提示，只是这期间不再发新通知）。 */
+  private noticeInFlight = false;
+  /** 已送进 worker、还没确认的提示回合 → 这一轮通知的 key。送达失败回执到了按它撤销「已通知」。 */
+  private readonly hintRounds = new Map<string, Array<{ seq: number; key: string }>>();
+  /** `<seq>:<key>` → 已经自动投过几次（只在内存里：重启后从头算，最多再多发几次）。 */
+  private readonly hintAttempts = new Map<string, number>();
+  /** 上次查到的 PR 状态：这一轮没轮到、或这轮查不到的 PR 用它。 */
+  private readonly prKnown = new Map<string, PrMergeState>();
+  private prCursor = 0;
 
-  constructor(private readonly deps: DecisionBoardServiceDeps) {}
+  constructor(private readonly deps: DecisionBoardServiceDeps) {
+    const sink = deps.cards;
+    if (sink) {
+      this.cards = new DecisionCards({
+        store: () => this.store(),
+        appId: () => this.appId,
+        locale: () => this.deps.locale(),
+        steward: () => this.deps.steward(),
+        links: seq => this.itemLinks(seq),
+        hasOwner: () => !!this.deps.ownerOpenId(),
+        sendCard: (chatId, card, uuid) => sink.sendCard(chatId, card, uuid),
+        updateCard: (messageId, card) => sink.updateCard(messageId, card),
+        isCardGone: error => sink.isCardGone(error),
+        log: (level, message) => this.deps.log(level, message),
+      });
+    }
+  }
+
+  /** 卡片同步不挡看板写入：失败只记日志（DecisionCards 内部已兜住）。 */
+  private syncCard(seq: number, create = false): void {
+    if (!this.cards) return;
+    void this.cards.sync(seq, { create });
+  }
+
+  /** 等卡片同步跑完（测试用）。 */
+  async cardsIdle(): Promise<void> {
+    await this.cards?.idle();
+  }
+
+  /** daemon 起来后对一遍卡片：补发上次没发出去的、刷新内容过期的（含批次在重启前后变了状态）。 */
+  async reconcileCards(): Promise<void> {
+    if (!this.cards || !this.isSteward()) return;
+    await this.cards.reconcile();
+  }
 
   private get appId(): string { return this.deps.larkAppId(); }
 
@@ -150,6 +297,7 @@ export class DecisionBoardService {
   }
 
   close(): void {
+    this.cards?.stop();
     this.storeRef?.close();
     this.storeRef = undefined;
   }
@@ -206,7 +354,8 @@ export class DecisionBoardService {
 
   guide(): { effective: string; preset: string } {
     const locale = this.deps.locale();
-    return { effective: composeStewardGuide(this.deps.steward(), locale), preset: stewardGuidePreset(locale) };
+    const steward = this.deps.steward();
+    return { effective: composeStewardGuide(steward, locale), preset: stewardGuidePreset(locale, steward) };
   }
 
   // ─── CLI ─────────────────────────────────────────────────────────────────
@@ -271,6 +420,25 @@ export class DecisionBoardService {
         throw new BoardError('no_chat_conflict', '同时给了群（--link chat=）和无群原因（--no-chat），只能二选一');
       }
     }
+    if (req.closeWhen !== undefined) {
+      if (typeof req.closeWhen !== 'string') throw new BoardError('invalid_close_when', '--close-when 必须是字符串');
+      const parsed = parseCloseWhenSpec(req.closeWhen);
+      if (typeof parsed === 'object' && 'error' in parsed) throw new BoardError('invalid_close_when', parsed.error);
+      patch.closeWhen = parsed === 'auto' ? null : parsed;
+    }
+    if (req.dependsOn !== undefined) {
+      if (typeof req.dependsOn !== 'string') throw new BoardError('invalid_depends_on', '--depends-on 必须是字符串');
+      const parsed = parseDependsOnSpec(req.dependsOn);
+      if (!Array.isArray(parsed)) throw new BoardError('invalid_depends_on', parsed.error);
+      patch.dependsOn = parsed;
+    }
+    if (req.nextCheck !== undefined) {
+      if (typeof req.nextCheck !== 'string') throw new BoardError('invalid_next_check', '--next-check 必须是字符串');
+      const parsed = parseNextCheckSpec(req.nextCheck, Date.now());
+      if (parsed !== null && typeof parsed === 'object') throw new BoardError('invalid_next_check', parsed.error);
+      patch.nextCheckAt = parsed;
+    }
+    if (req.dismissHint === true) patch.dismissHint = true;
     if (req.clearAsk === true) {
       patch.question = null;
       patch.options = [];
@@ -357,8 +525,17 @@ export class DecisionBoardService {
     return seq;
   }
 
+  /**
+   * 提示只在开着「自动发现可以关的项」时给出：关掉后巡检不再刷新，库里留下的提示会过时，不往外带。
+   */
+  private withVisibleHint<T extends Pick<BoardItem, 'hint'>>(item: T): T {
+    if (!item.hint || stewardCloseHintsOn(this.deps.steward())) return item;
+    const { hint: _hidden, ...rest } = item;
+    return rest as T;
+  }
+
   private itemOut(seq: number) {
-    const item = this.store().getItem(this.appId, seq)!;
+    const item = this.withVisibleHint(this.store().getItem(this.appId, seq)!);
     const rest = this.withoutStaleReason(item, this.store().links(this.appId, seq));
     return { ...rest, stateLabel: BOARD_STATE_LABELS[this.deps.locale()][item.state], ...this.itemLinks(seq),
       ...this.chatState(item, this.store().links(this.appId, seq)) };
@@ -381,6 +558,7 @@ export class DecisionBoardService {
           ...(i.stage ? { stage: i.stage } : {}), ...(i.key ? { key: i.key } : {}), ...(i.repo ? { repo: i.repo } : {}),
           pendingDecisions: i.pendingDecisions, updatedAt: i.updatedAt, ...this.itemLinks(i.seq),
           ...this.chatState(i, i.links),
+          ...(this.withVisibleHint(i).hint ? { hint: i.hint } : {}),
         }));
         return { view, counts: store.counts(app), missingChat: items.filter(i => i.missingChat).length, items };
       }
@@ -410,7 +588,9 @@ export class DecisionBoardService {
         await this.verifyChatLinks(patch, req.allowUnverifiedChat === true, existing);
         // 查群可能要等十几秒：期间管家被关掉了就不再写。
         this.requireSteward();
+        const before = existingSeq !== undefined ? store.getItem(app, existingSeq) : undefined;
         const { item, created } = store.addItem(app, { ...patch, title }, ctx.sessionId, undefined, this.deps.locale());
+        this.syncCard(item.seq, askChanged(before, item));
         return { created, item: this.itemOut(item.seq) };
       }
       case 'set': {
@@ -424,13 +604,16 @@ export class DecisionBoardService {
           const item = store.getItem(app, seq)!;
           if (!item.options.some(o => o.key === patch.recommend)) throw new BoardError('unknown_recommend', `推荐项 ${patch.recommend} 不在选项里`);
         }
-        store.updateItem(app, seq, patch, ctx.sessionId, undefined, this.deps.locale());
+        const before = store.getItem(app, seq);
+        const after = store.updateItem(app, seq, patch, ctx.sessionId, undefined, this.deps.locale());
+        this.syncCard(seq, askChanged(before, after));
         return { item: this.itemOut(seq) };
       }
       case 'history': {
         const seq = this.resolveRef(req.ref);
         if (typeof req.text !== 'string') throw new BoardError('text_required', '历史内容不能为空');
         const res = store.appendHistory(app, seq, req.text, { handled: req.handled === true, actorRef: ctx.sessionId });
+        if (res.handled) this.syncCard(seq);
         return { seq, eventId: res.eventId, handledDecisions: res.handled, ...this.itemLinks(seq) };
       }
       case 'attach': {
@@ -475,7 +658,7 @@ export class DecisionBoardService {
     return {
       ...this.meta(),
       items: store.listItems(this.appId, view, { author, query }).map(i => ({
-        ...this.withoutStaleReason(i, i.links), links: this.renderLinks(i.links, i.primaryChat), ...this.itemLinks(i.seq),
+        ...this.withVisibleHint(this.withoutStaleReason(i, i.links)), links: this.renderLinks(i.links, i.primaryChat), ...this.itemLinks(i.seq),
         missingChat: itemMissingChat(i, i.links),
       })),
       drafts: store.listDrafts(this.appId, author).map(d => ({ seq: d.seq, updatedAt: d.updatedAt })),
@@ -489,7 +672,7 @@ export class DecisionBoardService {
     if (!detail) throw new BoardError('item_not_found', `没有 #${seq}`);
     return {
       ...detail,
-      item: this.withoutStaleReason(detail.item, detail.links),
+      item: this.withVisibleHint(this.withoutStaleReason(detail.item, detail.links)),
       links: this.renderLinks(detail.links, detail.item.primaryChat),
       missingChat: itemMissingChat(detail.item, detail.links),
       ...this.itemLinks(seq),
@@ -530,6 +713,7 @@ export class DecisionBoardService {
 
   async submit(input: { author: string; submitter?: string; authorName?: string; nonce: string; items: Array<{ seq: number; draftUpdatedAt: number }> }) {
     const res = this.store().submit(this.appId, input);
+    if (!res.duplicate) for (const d of res.decisions) this.syncCard(d.seq);
     if (res.duplicate && (res.batch.delivery === 'delivered' || res.batch.delivery === 'dispatched')) {
       // 同 nonce 重试：
       //  - delivered：已送达，直接返回；
@@ -556,6 +740,7 @@ export class DecisionBoardService {
     const turnId = batch.turnId ?? formatBoardTurnId(this.appId, batch.id);
     store.markBatchFailed(this.appId, batch.id, 'delivery_interrupted');
     this.deps.log('warn', `[decision-board] batch #${batch.id} (turn ${turnId}) was interrupted mid-delivery; marked failed for manual re-delivery`);
+    this.syncBatchCards(batch.id);
     return store.getBatch(this.appId, batch.id)!;
   }
 
@@ -597,21 +782,249 @@ export class DecisionBoardService {
    * 回调转到这里：不往管家群发失败卡片（owner 在看板前，不是群里），把批次退回 failed，
    * 页面的「重新投递」用同一个稳定 turnId 再投。已 delivered 的不动。
    */
-  noteDeliveryFailure(turnId: string, reason: string): void {
+  noteDeliveryFailure(turnId: string, reason: string, messageKey?: string): void {
+    const hintRound = parseHintTurnId(turnId);
+    if (hintRound) {
+      if (hintRound.appId !== this.appId) return;
+      const entries = this.hintRounds.get(turnId);
+      this.hintRounds.delete(turnId);
+      if (!entries?.length) return;
+      // 只有 worker 明确说没收下（入队前拒绝）才重发；收据超时之类是「结果未知」，CLI 可能已经拿到了，
+      // 重发会在群里和会话里各多一份，就保持「已通知」（提示还留在看板上）。
+      if (messageKey !== 'worker.input_rejected_before_admission') {
+        this.deps.log('warn', `[decision-board] hint notice ${turnId} delivery unconfirmed (${reason}); not resending`);
+        return;
+      }
+      this.deps.log('warn', `[decision-board] hint notice ${turnId} rejected by worker (${reason}); will retry next sweep`);
+      this.store().unmarkHintsNotified(this.appId, this.retryable(entries));
+      return;
+    }
     const parsed = parseBoardTurnId(turnId);
     if (!parsed || parsed.appId !== this.appId) return;
     const batch = this.store().getBatch(this.appId, parsed.batchId);
     if (!batch || batch.delivery === 'delivered') return;
     this.deps.log('warn', `[decision-board] batch #${parsed.batchId} worker delivery failed (${reason})`);
     this.store().markBatchFailed(this.appId, parsed.batchId, reason.slice(0, 400));
+    this.syncBatchCards(parsed.batchId);
+  }
+
+  /** 没送达的一批再投一次：上一轮进程死在投递途中的先收敛成 failed（与 redeliver 同口径），再按同一个回合 id 投。 */
+  private async retryStuckBatch(batchId: number): Promise<void> {
+    const batch = this.store().getBatch(this.appId, batchId);
+    if (!batch || batch.delivery === 'delivered' || this.delivering.has(batchId)) return;
+    if (batch.delivery === 'dispatched') this.settleInterruptedBatch(this.store(), batch);
+    await this.deliverBatch(batchId);
+  }
+
+  /** 批次投递状态变了：这一批里每一项的卡片跟着刷新（已选 X → 已交给管家 / 投递失败）。 */
+  private syncBatchCards(batchId: number): void {
+    if (!this.cards) return;
+    try {
+      for (const d of this.store().batchDecisions(this.appId, batchId)) this.syncCard(d.seq);
+    } catch (error) {
+      this.deps.log('warn', `[decision-board] card refresh for batch #${batchId} skipped: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  // ─── 飞书拍板卡片 ─────────────────────────────────────────────────────────
+
+  /**
+   * owner 在管家群的拍板卡片上点了选项（或只交说明）。只认管家 bot 的 owner；写进看板后
+   * 和网页提交一样建批次、走 deliverBatch 投递（投递放在 deliver 里，回调应答之后再跑）。
+   */
+  cardClick(click: BoardCardClick): BoardCardClickResult {
+    const T = CARD_TOASTS[this.deps.locale() === 'en' ? 'en' : 'zh'];
+    const cards = this.cards;
+    const v = click.value;
+    if (!cards || v.app !== this.appId) return { toast: { type: 'warning', content: T.unavailable } };
+    const owner = this.deps.ownerOpenId();
+    if (!owner || !click.operatorOpenId || click.operatorOpenId !== owner) {
+      this.deps.log('info', `[decision-board] card click by non-owner ${click.operatorOpenId ?? '?'} rejected`);
+      return { toast: { type: 'error', content: T.noPermission } };
+    }
+    const seq = typeof v.seq === 'string' && /^\d{1,9}$/.test(v.seq) ? Number(v.seq) : NaN;
+    const store = this.store();
+    const item = Number.isSafeInteger(seq) ? store.getItem(this.appId, seq) : undefined;
+    if (!item) return { toast: { type: 'warning', content: T.gone } };
+    const refreshed = (content: string, type: 'info' | 'warning' = 'warning'): BoardCardClickResult => {
+      const r = cards.render(seq);
+      if (r && click.messageId) cards.noteRendered(seq, click.messageId, r.hash);
+      return { toast: { type, content }, ...(r ? { card: r.card } : {}) };
+    };
+    // 关了开关：不写入，把这张卡收成只有链接的版本。
+    if (!cards.enabled()) return refreshed(T.disabled);
+    // 点的是被顶替的旧卡（卡片失效后另发过、或管家群换过）：不写入，也不把它换回能点的卡片，
+    // 免得一项有两张能点的卡。
+    if (click.messageId && !cards.isCurrentCard(seq, click.messageId)) {
+      const r = cards.render(seq, 'replaced');
+      return { toast: { type: 'warning', content: T.replaced }, ...(r ? { card: r.card } : {}) };
+    }
+    const choice = v.action === DECISION_CARD_ACTION_PICK && typeof v.key === 'string' && v.key ? v.key : undefined;
+    if (v.action !== DECISION_CARD_ACTION_PICK && v.action !== DECISION_CARD_ACTION_NOTE) return { toast: { type: 'warning', content: T.unavailable } };
+    if (v.action === DECISION_CARD_ACTION_PICK && !choice) return { toast: { type: 'warning', content: T.unavailable } };
+    const text = cardNoteText(click.formValue);
+    if (!choice && !text) return { toast: { type: 'warning', content: T.noteRequired } };
+    if (item.state !== 'decide') return refreshed(T.notDeciding);
+    if (v.ask !== decisionAskKey(item) || (choice && !item.options.some(o => o.key === choice))) return refreshed(T.stale);
+    // 连点、或飞书没收到应答后的重试：最近一条还没被处理 / 覆盖的决定就是同一个选择和说明时不再建批次。
+    // 那一批投递失败时顺带重投一次（同一个回合 id，管家那边不会重复执行）。
+    // 只有在同一份选项下（指纹相同）才算重复：选项改过之后同一个选项键可能换了意思，那是新决定。
+    const latest = store.latestDecision(this.appId, seq);
+    const latestBatch = latest ? store.getBatch(this.appId, latest.batchId) : undefined;
+    if (latest && latestBatch && !latest.handledAt && latest.supersededBy === undefined
+      && latestBatch.createdAt >= item.stateAt && (latest.askKey ?? v.ask) === v.ask
+      && (latest.choice ?? undefined) === choice && latest.text.trim() === text) {
+      const res = refreshed(T.duplicate, 'info');
+      // 那一批没送达（失败，或上一轮进程死在投递途中）：顺带重投一次，同一个回合 id。
+      const stuck = latestBatch.delivery === 'failed'
+        || (latestBatch.delivery === 'dispatched' && !this.delivering.has(latestBatch.id));
+      return stuck ? { ...res, deliver: () => this.retryStuckBatch(latestBatch.id) } : res;
+    }
+    let submitted: ReturnType<DecisionBoardStore['submitCard']>;
+    try {
+      submitted = store.submitCard(this.appId, {
+        seq, ...(choice ? { choice } : {}), text,
+        submitter: click.operatorUnionId && /^[A-Za-z0-9_-]{1,128}$/.test(click.operatorUnionId) ? `u:${click.operatorUnionId}` : 'owner',
+        nonce: `card:${seq}:${randomUUID()}`,
+        // 校验与写入在同一把写锁里：两次检查之间管家刚好改了选项或关掉事项，也不会按旧卡片写进去。
+        verify: current => {
+          if (current.state !== 'decide') throw new BoardError('item_not_deciding');
+          if (decisionAskKey(current) !== v.ask) throw new BoardError('card_stale');
+        },
+      });
+    } catch (error) {
+      if (error instanceof BoardError && error.code === 'item_not_deciding') return refreshed(T.notDeciding);
+      if (error instanceof BoardError && (error.code === 'card_stale' || error.code === 'unknown_choice')) return refreshed(T.stale);
+      throw error;
+    }
+    const batchId = submitted.batch.id;
+    // 被覆盖的较早批次所在的卡片（同一项，就是这张）随下面的同步一起刷新。
+    const res = refreshed(choice ? T.accepted(`${choice} ${item.options.find(o => o.key === choice)?.label ?? ''}`.trim()) : T.acceptedNote, 'info');
+    return {
+      ...res,
+      toast: { type: 'success', content: res.toast!.content },
+      deliver: async () => { await this.deliverBatch(batchId); },
+    };
+  }
+
+  // ─── 自动发现可以关的项 ─────────────────────────────────────────────────
+
+  /**
+   * 后台巡检一轮（daemon 定时调用，不调模型）：查 PR 状态 → 在一个写事务里给每一项求提示（只标提示、
+   * 记历史，不改状态）→ 有还没通知过的提示就合成一条通知送进管家会话（一轮最多一条）。
+   *
+   * 只在「自动发现可以关的项」开着、管家群选好、看板库已经存在时跑；同一时间只跑一轮。
+   * 通知送不出去（管家会话在开场、投递抛错）时不记「已通知」，下一轮重试；送进 worker 之后
+   * 异步失败的回执由 {@link noteDeliveryFailure} 撤销「已通知」。
+   */
+  async sweepHints(now = Date.now()): Promise<{ marked: number; cleared: number; notified: number } | undefined> {
+    const steward = this.deps.steward();
+    if (!stewardCloseHintsOn(steward)) return undefined;
+    // 没用过看板的 bot 不为巡检建库。
+    if (!this.storeRef && !existsSync(decisionBoardDbPath(this.deps.dataDir))) return undefined;
+    if (this.sweeping) return undefined;
+    this.sweeping = true;
+    let pending: Array<{ seq: number; title: string; hint: BoardHint }> = [];
+    let summary: { marked: number; cleared: number };
+    let at: number;
+    try {
+      const store = this.store();
+      const app = this.appId;
+      const refs = store.hintPrRefs(app);
+      const batch = refs.length > HINT_PR_LOOKUPS_PER_ROUND
+        ? Array.from({ length: HINT_PR_LOOKUPS_PER_ROUND }, (_, i) => refs[(this.prCursor + i) % refs.length]!)
+        : refs;
+      if (refs.length > HINT_PR_LOOKUPS_PER_ROUND) {
+        this.prCursor = (this.prCursor + HINT_PR_LOOKUPS_PER_ROUND) % refs.length;
+        this.deps.log('info', `[decision-board] hint sweep: ${refs.length} PRs, checking ${HINT_PR_LOOKUPS_PER_ROUND} this round (rotating)`);
+      }
+      for (const ref of batch) {
+        let state: PrMergeState | undefined;
+        try {
+          state = await this.deps.prState?.(ref);
+        } catch (error) {
+          this.deps.log('warn', `[decision-board] hint sweep: PR ${ref} lookup failed (${error instanceof Error ? error.message : String(error)})`);
+        }
+        if (state) this.prKnown.set(ref, state);
+      }
+      // 查 PR 期间开关可能被关掉：关了就不再写。
+      if (!stewardCloseHintsOn(this.deps.steward())) return undefined;
+      // 查 PR 可能花了一阵：提示时间和历史按查完的时间记，不早于期间管家的改动。
+      at = Math.max(now, Date.now());
+      const locale = this.deps.locale();
+      const result = store.sweepHints(app, { now: at, locale, prState: ref => this.prKnown.get(ref) }, at);
+      pending = result.pending;
+      summary = { marked: result.marked, cleared: result.cleared };
+    } finally {
+      this.sweeping = false;
+    }
+    let notified = 0;
+    if (pending.length) notified = await this.deliverHintNotice(pending, at, this.deps.locale());
+    if (summary.marked || summary.cleared || notified) {
+      this.deps.log('info', `[decision-board] hint sweep: marked ${summary.marked}, cleared ${summary.cleared}, notified ${notified}`);
+    }
+    return { ...summary, notified };
+  }
+
+  /** 还没到自动投递上限的那些 key（超过上限的保持「已通知」，不再自动发）。 */
+  private retryable(entries: ReadonlyArray<{ seq: number; key: string }>): Array<{ seq: number; key: string }> {
+    return entries.filter(e => (this.hintAttempts.get(`${e.seq}:${e.key}`) ?? 0) < HINT_NOTICE_MAX_ATTEMPTS);
+  }
+
+  private async deliverHintNotice(pending: Array<{ seq: number; title: string; hint: BoardHint }>, round: number, locale: Locale): Promise<number> {
+    const steward = this.deps.steward();
+    if (!stewardReady(steward)) return 0;
+    // 上一条通知还在投（deliver 卡住）：这轮不再叠一条，提示留到下一轮。
+    if (this.noticeInFlight) return 0;
+    this.noticeInFlight = true;
+    try {
+      const entries: HintNoticeEntry[] = pending.map(p => {
+        const links = this.itemLinks(p.seq);
+        const link = links.appLink ?? links.url;
+        return { seq: p.seq, title: p.title, hint: p.hint, ...(link ? { link } : {}) };
+      });
+      const keys = pending.map(p => ({ seq: p.seq, key: p.hint.key }));
+      for (const k of keys) this.hintAttempts.set(`${k.seq}:${k.key}`, (this.hintAttempts.get(`${k.seq}:${k.key}`) ?? 0) + 1);
+      while (this.hintAttempts.size > 512) this.hintAttempts.delete(this.hintAttempts.keys().next().value!);
+      const turnId = formatHintTurnId(this.appId, round);
+      // 先记「已通知」再投：deliver() 里进程死掉时宁可漏一次（看板上的提示还在），也不重复刷屏；
+      // deliver() 明确失败就撤销（没到次数上限的），下一轮重试。
+      this.store().markHintsNotified(this.appId, keys);
+      this.hintRounds.set(turnId, keys);
+      while (this.hintRounds.size > 16) this.hintRounds.delete(this.hintRounds.keys().next().value!);
+      try {
+        await this.deps.deliver({
+          turnId,
+          prompt: formatHintPrompt(entries, locale),
+          announcement: { texts: splitEchoText(formatHintNotice(entries, locale)), images: [] },
+          attachments: [],
+          chatId: steward.chatId,
+          sessionTitle: locale === 'en' ? 'Steward' : '管家',
+        });
+      } catch (error) {
+        this.hintRounds.delete(turnId);
+        const retry = this.retryable(keys);
+        this.store().unmarkHintsNotified(this.appId, retry);
+        this.deps.log('warn', `[decision-board] hint notice ${turnId} delivery failed: ${error instanceof Error ? error.message : String(error)}`
+          + (retry.length < keys.length ? `; ${keys.length - retry.length} hint(s) reached ${HINT_NOTICE_MAX_ATTEMPTS} attempts, not retrying` : ''));
+        return 0;
+      }
+      return keys.length;
+    } finally {
+      this.noticeInFlight = false;
+    }
   }
 
   /** 同一批次同时只投一次；投完返回最新的批次状态（失败不抛，记在批次上）。 */
   deliverBatch(batchId: number): Promise<BoardBatch> {
     const inflight = this.delivering.get(batchId);
     if (inflight) return inflight;
-    const run = this.deliverBatchOnce(batchId).finally(() => this.delivering.delete(batchId));
+    const run = this.deliveryChain.catch(() => undefined).then(() => this.deliverBatchOnce(batchId)).finally(() => {
+      this.delivering.delete(batchId);
+      this.syncBatchCards(batchId);
+    });
     this.delivering.set(batchId, run);
+    this.deliveryChain = run;
     return run;
   }
 
@@ -631,6 +1044,9 @@ export class DecisionBoardService {
       store.markBatchFailed(app, batchId, 'steward_chat_missing');
       return store.getBatch(app, batchId)!;
     }
+    // 提交人名字要查通讯录（可能要等）：放在落 dispatched、读覆盖标记之前，读完到交给 deliver 之间不再等别的。
+    const ownerOpenId = this.deps.ownerOpenId();
+    const ownerName = batch.authorName || await this.deps.ownerName().catch(() => undefined);
     store.markBatchAttempt(app, batchId);
     // 稳定回合 id + dispatched 在【调用 deliver 之前】落盘：deliver() 内部要发横幅、走
     // 会话锁、把输入交给 worker，其中任何一步后进程死亡，重启都只能看到「结果未知」的
@@ -666,13 +1082,19 @@ export class DecisionBoardService {
         ...(d.choice ? { choice: d.choice } : {}),
         ...(option ? { choiceLabel: option.label } : {}),
         recommended: !!d.choice && item?.recommend === d.choice,
+        ...(batch.source === 'card' ? { source: 'card' as const } : {}),
+        ...(() => {
+          const detail = store.supersededDetail(app, batchId, d.seq);
+          const settled = detail.filter(x => x.settled).map(x => x.batchId);
+          const open = detail.filter(x => !x.settled).map(x => x.batchId);
+          return { ...(settled.length ? { supersedes: settled } : {}), ...(open.length ? { supersedesPending: open } : {}) };
+        })(),
+        ...(d.supersededBy !== undefined ? { supersededBy: d.supersededBy } : {}),
         text: d.text,
         fileCount: d.fileIds.length,
         ...(chat?.url ? { primaryChat: { text: chat.text, url: chat.url } } : {}),
       };
     });
-    const ownerOpenId = this.deps.ownerOpenId();
-    const ownerName = batch.authorName || await this.deps.ownerName().catch(() => undefined);
     const prompt = formatBatchMessage({
       batchId,
       authorName: ownerName || 'owner',
@@ -717,13 +1139,24 @@ export class DecisionBoardService {
   }
 }
 
+/**
+ * 这次写入要不要（在还没有卡片时）发新卡：刚进入待拍板（含新建即待拍板），或待拍板的问题 / 选项 /
+ * 推荐变了。只改进展、阶段这类字段不发新卡（已有卡片照样原地刷新）。
+ */
+function askChanged(before: BoardItem | undefined, after: BoardItem): boolean {
+  if (after.state !== 'decide') return false;
+  if (!before || before.state !== 'decide') return true;
+  return decisionAskKey(before) !== decisionAskKey(after);
+}
+
 /** 统一把服务层错误映射成 IPC 响应。 */
 export function boardErrorStatus(error: unknown): { status: number; error: string; message: string } {
   if (error instanceof BoardError) {
     const status = error.code === 'not_steward' ? 409
       : error.code === 'item_not_found' || error.code === 'batch_not_found' ? 404
         : error.code === 'storage_unavailable' ? 503
-          : error.code === 'draft_changed' || error.code === 'draft_missing' || error.code === 'key_conflict' ? 409
+          : error.code === 'draft_changed' || error.code === 'draft_missing' || error.code === 'key_conflict'
+            || error.code === 'item_ended' ? 409
             : 400;
     return { status, error: error.code, message: error.message };
   }

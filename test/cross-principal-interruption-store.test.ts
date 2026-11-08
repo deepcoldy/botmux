@@ -4,6 +4,7 @@ import {
   continueCrossPrincipalOwnerWait,
   crossPrincipalInterruptionId,
   crossPrincipalOwnerWaitDisposition,
+  crossPrincipalRerouteGaps,
   markCrossPrincipalSuggestionWaiting,
   stageCrossPrincipalInterruptionRecord,
 } from '../src/core/cross-principal-interruption-store.js';
@@ -178,5 +179,36 @@ describe('cross-principal interruption durable identity', () => {
       reason: 'feature_disabled',
     });
     expect(cancelCrossPrincipalInterruptionsForFeatureDisable(source)).toEqual([]);
+  });
+});
+
+describe('cross-principal reroute preconditions', () => {
+  const envelope = {
+    turnId: 'om_b',
+    text: 'B input',
+    userPrompt: 'B input',
+    createdAt: '2026-09-09T00:01:00.000Z',
+  };
+  const active = { turnId: 'om_a', caller: owner };
+
+  it('has no gap when a different known principal owns a known active turn', () => {
+    expect(crossPrincipalRerouteGaps({ envelope, proposer, active })).toEqual([]);
+  });
+
+  it('names each missing or same-principal precondition', () => {
+    expect(crossPrincipalRerouteGaps({ proposer, active })).toEqual(['envelope']);
+    expect(crossPrincipalRerouteGaps({ envelope, active })).toEqual(['proposer']);
+    expect(crossPrincipalRerouteGaps({ envelope, proposer })).toEqual(['active']);
+    expect(crossPrincipalRerouteGaps({
+      envelope,
+      proposer,
+      active: { turnId: 'om_a', caller: { ...proposer } },
+    })).toEqual(['active_caller_is_proposer']);
+    expect(crossPrincipalRerouteGaps({
+      envelope,
+      proposer,
+      active: { turnId: 'om_a', caller: owner, controller: { ...proposer } },
+    })).toEqual(['active_controller_is_proposer']);
+    expect(crossPrincipalRerouteGaps({})).toEqual(['envelope', 'proposer', 'active']);
   });
 });
