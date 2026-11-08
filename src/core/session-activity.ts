@@ -145,20 +145,21 @@ export function publishNativeTopicLinkPatchForSession(session: Session, activeLi
   return true;
 }
 
-const emittedAttention = new WeakMap<DaemonSession, { at: number; reason: string }>();
+const emittedAttention = new WeakMap<DaemonSession, number>();
 
-/** Tell the steward about a raise only when it is a new one: nothing was up,
- *  the agent asked again, or the daemon raised for a different reason. Pushes
- *  that repeat the same raise (delivery retries) stay quiet. */
+/** Tell the steward about a raise only when it is a new one, i.e. it has a new
+ *  `at`. Pushes that repeat the same raise (delivery retries keep the first
+ *  `at`, see raiseDaemonAttention) stay quiet. Don't dedupe on the reason: a
+ *  later turn can fail the same way with its own `at`, and the steward's alert
+ *  key is the raise time. */
 function noteAttentionEvent(ds: DaemonSession): void {
   const raised = ds.agentAttention;
   if (!raised) {
     emittedAttention.delete(ds);
     return;
   }
-  const last = emittedAttention.get(ds);
-  if (last && (last.at === raised.at || (raised.source !== 'agent' && last.reason === raised.reason))) return;
-  emittedAttention.set(ds, { at: raised.at, reason: raised.reason });
+  if (emittedAttention.get(ds) === raised.at) return;
+  emittedAttention.set(ds, raised.at);
   if (ds.session.chatId) emitSessionTaskEvent({ chatId: ds.session.chatId, sessionId: ds.session.sessionId });
 }
 

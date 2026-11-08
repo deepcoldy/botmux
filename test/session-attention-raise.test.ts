@@ -27,22 +27,26 @@ describe('steward events from raised hands', () => {
       raiseDaemonAttention(ds, 'blocked', 'final delivery failed', T0);
       publishAttentionPatch(ds);
       expect(events).toHaveLength(1);
-      // 投递重试：同一件事反复推送，哪怕旧代码把时刻刷新了。
+      // 投递重试：同一次举手反复推送，重试保留首次时刻，不是新的一次；原因变了但时刻没变也还是这一次。
       publishAttentionPatch(ds);
-      ds.agentAttention = { kind: 'blocked', reason: 'final delivery failed', at: T0 + 5_000 };
+      raiseDaemonAttention(ds, 'blocked', 'final delivery failed', T0 + 5_000);
+      publishAttentionPatch(ds);
+      raiseDaemonAttention(ds, 'blocked', 'durable final output is ambiguous', T0 + 8_000);
       publishAttentionPatch(ds);
       expect(events).toHaveLength(1);
-      ds.agentAttention = { kind: 'blocked', reason: 'API 报错', at: T0 + 10_000 };
+      // 同一原因、但有自己的时刻：后一轮又这样失败了（bot 协作群里前一次的手没人放下），是新的一次。
+      ds.agentAttention = { kind: 'blocked', reason: 'final delivery failed', at: T0 + 10_000 };
       publishAttentionPatch(ds);
       expect(events).toHaveLength(2);
       // 清掉之后再举，是新的一次。
       ds.agentAttention = undefined;
       publishAttentionPatch(ds);
-      ds.agentAttention = { kind: 'blocked', reason: 'API 报错', at: T0 + 20_000 };
+      ds.agentAttention = { kind: 'blocked', reason: 'final delivery failed', at: T0 + 20_000 };
       publishAttentionPatch(ds);
       expect(events).toHaveLength(3);
-      // agent 每次举手都是一次新的请求。
+      // agent 每次举手都是一次新的请求；同一次举手期间别的信号（待选仓库、TUI 选择框）再推补丁不算。
       ds.agentAttention = { kind: 'decision', reason: '选方案', at: T0 + 30_000, source: 'agent' };
+      publishAttentionPatch(ds);
       publishAttentionPatch(ds);
       ds.agentAttention = { kind: 'decision', reason: '选方案', at: T0 + 40_000, source: 'agent' };
       publishAttentionPatch(ds);
