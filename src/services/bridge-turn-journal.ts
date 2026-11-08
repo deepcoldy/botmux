@@ -35,9 +35,13 @@ import { mkdirSync, rmSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
+import { canHandoffFinalOutput, type FinalOutputSnapshot } from './final-output-handoff.js';
 
 export interface BridgeTurnJournalEntry {
   turnId: string;
+  /** Only newly admitted turns under the negotiated protocol opt in. */
+  handoffVersion?: 1;
+  pendingFinal?: FinalOutputSnapshot;
   dispatchAttempt?: number;
   /** Admission-frozen mode for this exact turn. Absence is disabled and keeps
    *  journals written by older Botmux versions byte-compatible on read. */
@@ -54,6 +58,20 @@ export interface BridgeTurnJournalEntry {
    *  line can only exist at/after this byte, so restore re-drains from here
    *  instead of re-reading the whole file. Always a line boundary. */
   offsetAtMark: number;
+  /** Set when a later CLI generation of the same worker process took the
+   *  entry over: the turn's in-memory carryover or restart note is queued to
+   *  be written into that generation, and is marked again when it is. Until
+   *  then this entry is the turn's only durable record, so a restore treats it
+   *  as written into the claiming generation (#2727). */
+  claimedAtMs?: number;
+  /** Plain IM inputs proven to share one native execution. This attribution
+   * survives a checkpoint after the earlier queue heads were superseded. It
+   * is revalidated against the native transcript identity when restored. */
+  mergedExecution?: {
+    sourceTurnId: string;
+    sourceSessionId?: string;
+    supersededTurnIds: string[];
+  };
 }
 
 /** Entries older than this are dropped at restore instead of re-marked: a
@@ -149,16 +167,77 @@ export function readBridgeTurnJournal(path: string): BridgeTurnJournalEntry[] {
     && typeof entry?.offsetAtMark === 'number'
     && (entry?.linkRefMode === undefined
       || entry.linkRefMode === 'observe'
-      || entry.linkRefMode === 'enabled'));
+      || entry.linkRefMode === 'enabled'))
+    .map(entry => {
+      if (entry.pendingFinal && (!canHandoffFinalOutput(entry.pendingFinal.output)
+        || !/^[a-f0-9]{64}$/.test(entry.pendingFinal.intentId)
+        || !/^[a-f0-9]{64}$/.test(entry.pendingFinal.fingerprint)
+        || entry.pendingFinal.output.turnId !== entry.turnId)) {
+        throw new Error('Invalid pending final handoff journal');
+      }
+      const { mergedExecution, claimedAtMs, ...rest } = entry;
+      const plain = typeof claimedAtMs === 'number' && Number.isFinite(claimedAtMs)
+        ? { ...rest, claimedAtMs }
+        : rest;
+      // Invalid optional merge evidence must not discard the pending answer
+      // or invent delivery credit. Older journals have no such field.
+      if (!isJsonObject(mergedExecution)
+        || typeof mergedExecution.sourceTurnId !== 'string' || !mergedExecution.sourceTurnId
+        || (mergedExecution.sourceSessionId !== undefined && typeof mergedExecution.sourceSessionId !== 'string')
+        || !Array.isArray(mergedExecution.supersededTurnIds)
+        || !mergedExecution.supersededTurnIds.length
+        || !mergedExecution.supersededTurnIds.every(id => typeof id === 'string' && id.length > 0)) return plain;
+      return { ...plain, mergedExecution: {
+        sourceTurnId: mergedExecution.sourceTurnId,
+        ...(mergedExecution.sourceSessionId ? { sourceSessionId: mergedExecution.sourceSessionId } : {}),
+        supersededTurnIds: [...new Set(mergedExecution.supersededTurnIds)],
+      } };
+    });
 }
 
-export function writeBridgeTurnJournal(path: string, pending: BridgeTurnJournalEntry[]): void {
-  const bounded = pending.length > MAX_JOURNAL_ENTRIES
-    ? pending.slice(pending.length - MAX_JOURNAL_ENTRIES)
-    : pending;
+export function writeBridgeTurnJournal(path: string, pending: BridgeTurnJournalEntry[], acknowledgedIntentId?: string): void {
+  // Takeover/pruning callers may know only CLI marks. Until its exact ACK,
+  // a persisted final snapshot must survive those older lifecycle operations.
+  const pinned = readBridgeTurnJournal(path).filter(entry => entry.pendingFinal && entry.pendingFinal.intentId !== acknowledgedIntentId);
+  pending = [...pending];
+  for (const entry of pinned) {
+    const index = pending.findIndex(item => item.turnId === entry.turnId && item.dispatchAttempt === entry.dispatchAttempt);
+    if (index < 0) pending.push(entry);
+    else pending[index] = entry;
+  }
+  const retained = pending.filter(entry => !!entry.pendingFinal || entry.handoffVersion === 1);
+  if (retained.length > MAX_JOURNAL_ENTRIES) throw new Error('final_output_handoff_backpressure');
+  const slots = MAX_JOURNAL_ENTRIES - retained.length;
+  const ordinary = pending.filter(entry => !entry.pendingFinal && entry.handoffVersion !== 1);
+  const selected = new Set([...retained, ...(slots > 0 ? ordinary.slice(-slots) : [])]);
+  const bounded = pending.filter(entry => selected.has(entry));
   const payload: BridgeTurnJournalFile = { version: 1, pending: bounded };
   mkdirSync(dirname(path), { recursive: true });
-  atomicWriteFileSync(path, `${JSON.stringify(payload)}\n`, { mode: 0o600, followTargetSymlink: false });
+  atomicWriteFileSync(path, `${JSON.stringify(payload)}\n`, { mode: 0o600, followTargetSymlink: false, durable: pending.some(entry => entry.handoffVersion === 1) });
+}
+
+export function stageBridgeFinalOutput(path: string, snapshot: FinalOutputSnapshot, allowFinalSnapshot = false): void {
+  const entries = readBridgeTurnJournal(path);
+  let entry = entries.find(item => item.turnId === snapshot.output.turnId && item.dispatchAttempt === undefined);
+  // Capacity may have prevented the original mark from reaching disk. The
+  // completed native output itself is sufficient recovery data; never replay
+  // this final-only entry as a business input or transcript mark.
+  if (!entry && allowFinalSnapshot) {
+    entry = { turnId: snapshot.output.turnId, handoffVersion: 1, markTimeMs: Date.now(), jsonlPath: 'final-output-snapshot', offsetAtMark: 0, pendingFinal: snapshot };
+    entries.push(entry);
+  }
+  if (!entry || entry.handoffVersion !== 1) throw new Error('final_output_handoff_missing_admission');
+  if (entry.pendingFinal && entry.pendingFinal.fingerprint !== snapshot.fingerprint) throw new Error('final_output_handoff_conflict');
+  entry.pendingFinal = snapshot;
+  writeBridgeTurnJournal(path, entries);
+}
+
+export function acknowledgeBridgeFinalOutput(path: string, snapshot: FinalOutputSnapshot): void {
+  const entries = readBridgeTurnJournal(path);
+  const entry = entries.find(item => item.pendingFinal?.intentId === snapshot.intentId);
+  if (!entry) return;
+  if (entry.pendingFinal?.fingerprint !== snapshot.fingerprint) throw new Error('final_output_handoff_ack_mismatch');
+  writeBridgeTurnJournal(path, entries.filter(item => item !== entry), snapshot.intentId);
 }
 
 export function appendBridgeTurnJournalEntry(path: string, entry: BridgeTurnJournalEntry): void {
@@ -175,7 +254,7 @@ export function removeBridgeTurnJournalEntry(
 ): void {
   const pending = readBridgeTurnJournal(path);
   const remaining = pending.filter(entry =>
-    !(entry.turnId === turnId
+    entry.pendingFinal || !(entry.turnId === turnId
       && (dispatchAttempt === undefined || entry.dispatchAttempt === dispatchAttempt)));
   if (remaining.length === pending.length) return;
   if (remaining.length === 0) {
@@ -186,22 +265,42 @@ export function removeBridgeTurnJournalEntry(
 }
 
 export function clearBridgeTurnJournal(path: string): void {
+  const pinned = readBridgeTurnJournal(path).filter(entry => !!entry.pendingFinal);
+  if (pinned.length > 0) { writeBridgeTurnJournal(path, pinned); return; }
   rmSync(path, { force: true });
 }
+
+/** Slack for comparing a mark against a process start read from the OS: Linux
+ *  derives it from whole-second `btime` plus clock ticks, `ps -o lstart=` has
+ *  one-second resolution. A mark is taken right before its input is written
+ *  into a running CLI, seconds after that process started, so the slack only
+ *  ever keeps a borderline entry. */
+export const LIVE_CLI_START_TOLERANCE_MS = 2_000;
 
 /** Pure restore filter: which journal entries may be re-marked on this
  *  worker generation? Scoped to the same transcript file (rotation between
  *  generations makes offset+fingerprint attribution unsafe) and bounded by
- *  age (stale partials are noise). */
+ *  age (stale partials are noise).
+ *
+ *  `liveCliStartedAtMs`: when the worker re-attaches a CLI that survived the
+ *  previous worker, an entry marked before that process started was written
+ *  into an earlier CLI generation that was replaced inside the old worker.
+ *  Unless that replacement claimed it (its takeover was still queued when the
+ *  old worker died), nothing will ever answer it again; restoring it would
+ *  rewind the replay to that old mark and re-deliver everything the session
+ *  answered since (#2727). */
 export function selectRestorableBridgeTurns(
   entries: readonly BridgeTurnJournalEntry[],
-  opts: { currentJsonlPath: string; nowMs?: number; maxAgeMs?: number },
+  opts: { currentJsonlPath: string; nowMs?: number; maxAgeMs?: number; liveCliStartedAtMs?: number },
 ): BridgeTurnJournalEntry[] {
   const nowMs = opts.nowMs ?? Date.now();
   const maxAgeMs = opts.maxAgeMs ?? BRIDGE_TURN_RESTORE_MAX_AGE_MS;
+  const liveCliStartedAtMs = opts.liveCliStartedAtMs;
   return entries
     .filter(entry => entry.jsonlPath === opts.currentJsonlPath
       && nowMs - entry.markTimeMs <= maxAgeMs
+      && (liveCliStartedAtMs === undefined
+        || (entry.claimedAtMs ?? entry.markTimeMs) >= liveCliStartedAtMs - LIVE_CLI_START_TOLERANCE_MS)
       // Only PLAIN Lark IM turns are restorable. Durable turns
       // (dispatchAttempt set) have their own cross-restart recovery owner (the
       // daemon's persisted queuedActivation* write-ahead + receipt
@@ -212,6 +311,41 @@ export function selectRestorableBridgeTurns(
       // journal file left behind by a pre-fix build across an upgrade.
       && entry.dispatchAttempt === undefined)
     .sort((a, b) => a.markTimeMs - b.markTimeMs);
+}
+
+/** A new CLI generation starts in the same worker process: every entry the
+ *  retired generation(s) left — marked, or last claimed, at or before the
+ *  retirement — is claimed by the new one at `claimedAtMs`. Nothing is
+ *  dropped here: until the new generation writes the carried-over input or
+ *  restart note (which marks the turn again), the entry is the turn's only
+ *  durable record, and a worker killed in that window must leave it to the
+ *  next process. Returns the entries and how many were claimed. */
+export function claimRetiredGenerationEntries(
+  entries: readonly BridgeTurnJournalEntry[],
+  retiredAtMs: number,
+  claimedAtMs: number,
+): { entries: BridgeTurnJournalEntry[]; claimed: number } {
+  let claimed = 0;
+  const next = entries.map(entry => {
+    if ((entry.claimedAtMs ?? entry.markTimeMs) > retiredAtMs) return entry;
+    claimed++;
+    return { ...entry, claimedAtMs };
+  });
+  return { entries: next, claimed };
+}
+
+/** After the claiming generation wrote an input: a claimed entry whose turn
+ *  is no longer queued in memory was either taken over — its re-mark already
+ *  replaced it — or never will be (no carryover, no restart note under its
+ *  id). Left on disk, the latter would be restored by the next worker process
+ *  as a turn IT interrupted, rewinding the replay to its old mark (#2727).
+ *  Keeps unclaimed entries and claims whose turn is still waiting to be
+ *  written. */
+export function entriesStillOwned(
+  entries: readonly BridgeTurnJournalEntry[],
+  queuedTurnIds: ReadonlySet<string>,
+): BridgeTurnJournalEntry[] {
+  return entries.filter(entry => entry.claimedAtMs === undefined || queuedTurnIds.has(entry.turnId));
 }
 
 /**

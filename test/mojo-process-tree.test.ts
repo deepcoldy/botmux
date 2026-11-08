@@ -14,12 +14,14 @@
  *   - platform gate  off-Linux, /proc means nothing, so scanning is refused
  */
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   DEFAULT_PROC_ROOT,
   MOJO_TREE_NONCE_ENV,
+  isIncompleteEnvironRead,
   isProcRootOverridden,
   isVanishedProcError,
   mojoTreeScanSupported,
@@ -128,7 +130,189 @@ describe('scanMojoTree enumeration', () => {
   });
 });
 
+describe('isIncompleteEnvironRead tells an exec-cut read from a complete environ', () => {
+  const NUL = String.fromCharCode(0);
+  it('treats a 0-byte read (exec between mm swap and env write) as incomplete', () => {
+    expect(isIncompleteEnvironRead('')).toBe(true);
+  });
+  it('treats a non-empty block missing its trailing NUL (truncated mid-exec) as incomplete', () => {
+    // The tree nonce is appended last, so a block cut before the NUL boundary
+    // cannot contain it; finalising on it would lose a setsid escapee.
+    expect(isIncompleteEnvironRead('PATH=/bin' + NUL + 'BIG_0=' + 'x'.repeat(40))).toBe(true);
+  });
+  it('treats a complete NUL-terminated environ (with or without the nonce) as final', () => {
+    expect(isIncompleteEnvironRead('PATH=/bin' + NUL)).toBe(false);
+    expect(isIncompleteEnvironRead(`${MOJO_TREE_NONCE_ENV}=${NONCE}` + NUL)).toBe(false);
+  });
+  it('keeps a genuinely empty env (env -i) in the re-read set, never a false member', () => {
+    // It reads '' on every attempt, so it stays "incomplete" through the budget
+    // and is only ever unclaimed — never upgraded to a member.
+    expect(isIncompleteEnvironRead('')).toBe(true);
+  });
+});
+
+describe('a truncated non-empty environ is re-read but never falsely claimed', () => {
+  it('leaves a permanently truncated escapee unclaimed without failing the scan', () => {
+    const NUL = String.fromCharCode(0);
+    proc(100, { ppid: 1, pgid: 100 });
+    // setsid escapee: ppid 1, own group, so only the env nonce could claim it.
+    // A static truncated environ (no trailing NUL, nonce absent) is re-read on
+    // every round, exhausts the budget, and stays a non-member — never a crash
+    // and never a false positive. Plain files keep this free of FIFO scheduling.
+    proc(300, { ppid: 1, pgid: 300, env: 'PATH=/bin' + NUL + 'BIG_0=' + 'x'.repeat(40) });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members.map(m => m.pid)).not.toContain(300);
+  });
+});
+
+describe('an incomplete environ read from a live process is not final', () => {
+  // exec installs the new address space before it writes the new environment,
+  // and /proc/<pid>/environ reads empty in between; a read split across
+  // buffers can also come back cut short. A FIFO stands in for that file: the
+  // child serves one incomplete read (empty unless `first` is set), waits for
+  // the reader to close it, then serves CONTENT to the next open.
+  const SERVE = `
+    const fs = require('node:fs');
+    const { FIFO, FIRST, CONTENT } = process.env;
+    const first = fs.openSync(FIFO, 'w');
+    const firstText = JSON.parse(FIRST);
+    if (firstText) fs.writeSync(first, firstText);
+    fs.closeSync(first);
+    for (;;) {
+      try { fs.closeSync(fs.openSync(FIFO, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK)); }
+      catch (err) { if (err.code === 'ENXIO') break; throw err; }
+    }
+    fs.writeFileSync(FIFO, CONTENT + '\\0');
+  `;
+  // Serves the first empty read, then replaces the FIFO with whatever `swap`
+  // leaves behind. The held open blocks until the first re-read opens the FIFO,
+  // so that re-read always lands on the old inode and reads `held` then EOF
+  // when the fd closes; by then the swap is done, so later re-reads see the
+  // replacement and none is left blocked on a FIFO that has no writer.
+  const serveThenSwap = (swap: string): string => `
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const { FIFO, HELD, CONTENT } = process.env;
+    fs.closeSync(fs.openSync(FIFO, 'w'));
+    for (;;) {
+      try { fs.closeSync(fs.openSync(FIFO, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK)); }
+      catch (err) { if (err.code === 'ENXIO') break; throw err; }
+    }
+    const held = fs.openSync(FIFO, 'w');
+    ${swap}
+    const heldText = JSON.parse(HELD);
+    if (heldText) fs.writeSync(held, heldText);
+    fs.closeSync(held);
+  `;
+  // EISDIR: a non-vanished, non-permission error that can also be manufactured
+  // when the suite runs as root.
+  const SERVE_ERROR = serveThenSwap('fs.rmSync(FIFO); fs.mkdirSync(FIFO);');
+  // The whole /proc/<pid> entry disappears: the process exited mid re-read.
+  const SERVE_GONE = serveThenSwap('fs.rmSync(path.dirname(FIFO), { recursive: true });');
+  // From the second re-read on, environ is a regular file holding CONTENT.
+  const SERVE_THEN_FILE = serveThenSwap(
+    'fs.writeFileSync(FIFO + ".next", CONTENT + "\\0"); fs.renameSync(FIFO + ".next", FIFO);',
+  );
+  const NUL = String.fromCharCode(0);
+  // A read cut short by exec: no trailing NUL.
+  const CUT_SHORT = `PATH=/bin${NUL}BIG_0=${'x'.repeat(40)}`;
+  const servers: ChildProcess[] = [];
+  afterEach(() => { for (const s of servers.splice(0)) s.kill('SIGKILL'); });
+
+  function environMidExec(
+    pid: number,
+    opts: { ppid: number; pgid: number; state?: string; stat?: string },
+    {
+      serve = SERVE,
+      first = '',
+      held = '',
+      content = `${MOJO_TREE_NONCE_ENV}=${NONCE}`,
+    }: { serve?: string; first?: string; held?: string; content?: string } = {},
+  ): void {
+    proc(pid, opts);
+    const fifo = join(procRoot, String(pid), 'environ');
+    rmSync(fifo);
+    expect(spawnSync('mkfifo', [fifo]).status).toBe(0);
+    servers.push(spawn(process.execPath, ['-e', serve], {
+      // Environment values cannot hold NUL, so payloads that need it go as JSON.
+      env: { ...process.env, FIFO: fifo, FIRST: JSON.stringify(first), HELD: JSON.stringify(held), CONTENT: content },
+      stdio: 'ignore',
+    }));
+  }
+
+  it('claims a setsid escapee whose first environ read landed mid-exec', () => {
+    proc(100, { ppid: 1, pgid: 100 });
+    environMidExec(300, { ppid: 1, pgid: 300 });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members.find(m => m.pid === 300)?.via).toBe('env');
+  });
+
+  it('claims a setsid escapee whose first environ read was cut short mid-exec', () => {
+    proc(100, { ppid: 1, pgid: 100 });
+    environMidExec(300, { ppid: 1, pgid: 300 }, { first: CUT_SHORT });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members.find(m => m.pid === 300)?.via).toBe('env');
+  });
+
+  it('keeps re-reading while a re-read still comes back cut short', () => {
+    proc(100, { ppid: 1, pgid: 100 });
+    environMidExec(300, { ppid: 1, pgid: 300 }, { serve: SERVE_THEN_FILE, held: CUT_SHORT });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members.find(m => m.pid === 300)?.via).toBe('env');
+  });
+
+  it('never un-claims a pid whose cut-short read already carried the nonce', () => {
+    proc(100, { ppid: 1, pgid: 100 });
+    // A shell reorders envp, so in a descendant the nonce need not be last and a
+    // cut-short block can hold it. The process then execs into a scrubbed env.
+    environMidExec(300, { ppid: 1, pgid: 300 }, {
+      first: `PATH=/bin${NUL}${MOJO_TREE_NONCE_ENV}=${NONCE}${NUL}BIG_0=${'x'.repeat(40)}`,
+      content: 'PATH=/bin',
+    });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members.find(m => m.pid === 300)?.via).toBe('env');
+  });
+
+  it('reads kernel thread and zombie environs once, since they are empty for good', () => {
+    const filler = Array.from({ length: 16 }, () => '0');
+    filler[3] = String(0x00200000);   // flags: PF_KTHREAD
+    proc(100, { ppid: 1, pgid: 100 });
+    environMidExec(400, { ppid: 2, pgid: 0, stat: `400 (kworker/0:1) S 2 0 ${filler.join(' ')} 1000` });
+    environMidExec(500, { ppid: 1, pgid: 500, state: 'Z' });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members.map(m => m.pid)).toEqual([100]);
+  });
+
+  it('fails the whole scan when a re-read of an empty environ errors, instead of keeping the non-member verdict', () => {
+    proc(100, { ppid: 1, pgid: 100 });
+    environMidExec(300, { ppid: 1, pgid: 300 }, { serve: SERVE_ERROR });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    expect(scan.ok).toBe(false);
+    if (scan.ok) throw new Error('expected the re-read error to fail the whole scan');
+    expect(scan.failure.kind).toBe('proc-entry-unreadable');
+    expect(scan.failure).toMatchObject({ pid: 300 });
+  });
+
+  it('a pid that vanishes during the re-read neither fails the scan nor drops its live child', () => {
+    proc(100, { ppid: 1, pgid: 100 });
+    // Left the group, was caught mid-exec, then exited while being re-read; the
+    // child it forked earlier is still running and hangs off it by ppid.
+    environMidExec(200, { ppid: 100, pgid: 200 }, { serve: SERVE_GONE });
+    proc(300, { ppid: 200, pgid: 300 });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members.map(m => m.pid)).toContain(300);
+  });
+});
+
 describe('PGID claiming is gated on root identity (P0-3)', () => {
+
   it('a recycled root pid never claims the stranger group wearing its number', () => {
     // The turn root (pid 100, starttime 1000) was reaped; a NEW process now
     // wears pid 100 (starttime 2000) and leads its own group with a child.

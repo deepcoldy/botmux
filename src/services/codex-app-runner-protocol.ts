@@ -10,7 +10,7 @@ export interface CodexAppRunnerInput {
   codexAppInput?: CodexAppTurnInput;
   /** Immutable botmux/Lark message id used only for reply routing. */
   replyTurnId?: string;
-  /** Explicit positive: this plain-human-interactive turn may `turn/steer` into
+  /** Explicit positive: this authorized human input/answer may `turn/steer` into
    * an already-active Codex App turn. Missing/false ⇒ forced serial (start its
    * own turn only when the runner is idle). */
   codexAppSteerable?: true;

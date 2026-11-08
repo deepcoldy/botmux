@@ -25,6 +25,8 @@ import {
   setGlobalLocale,
   writeCodexNotifierConfig,
   writeHostOverloadAlertConfig,
+  writeScheduleBotGrantConfig,
+  type ScheduleBotGrant,
   SESSION_CLEANUP_HOUR_OPTIONS,
   SESSION_CLEANUP_MIN_INTERVAL_MINUTES,
   type SessionCleanupGlobalConfig,
@@ -35,6 +37,7 @@ import {
   isCodexNotifierHookInstalled,
 } from '../features/codex-notifier/index.js';
 import { isLocale } from '../i18n/types.js';
+import { canonicalScheduleBotGrant, isScheduleBotGrant, overlappingScheduleBotGrants } from '../core/schedule-bot-grant.js';
 import { normalizePromptCacheConfig, type PromptCacheConfig } from '../services/prompt-cache-policy.js';
 import { isLocalDevInstall } from '../utils/install-info.js';
 import { isAutoUpdateSupportedInstall } from '../utils/global-install.js';
@@ -57,10 +60,14 @@ export interface ResolvedDashboardSettingsView {
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
   reapOrphanTmuxServers: boolean;
+  tmuxOrphanSessionSweep: boolean;
+  tmuxOrphanSessionBareWrapperKill: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
   /** Machine-wide reply-card footer brand signature switch. Default ON. */
   cardBrandLabel: boolean;
+  /** Whether the turn initiator may press the safe keys on a stuck card. Default ON. */
+  stuckCardInitiatorKeys: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -102,6 +109,14 @@ export interface ResolvedDashboardSettingsView {
   };
   noVisibleOutputHint: boolean;
   crossPrincipalInterruption: boolean;
+  /** Cross-bot schedule delegation switches and host bot grants. */
+  scheduleBotGrants?: {
+    createEnabled: boolean;
+    selfManageEnabled: boolean;
+    grants: ScheduleBotGrant[];
+    ignoredCount?: number;
+    botOptions?: Array<{ larkAppId: string; botName: string | null }>;
+  };
   vcMeetingAgent: {
     enabled: boolean;
     larkCliVersion?: string | null;
@@ -112,8 +127,11 @@ export interface ResolvedDashboardSettingsView {
   localDevInstall: boolean;
   autoUpdateSupported?: boolean;
   remoteAccess?: boolean;
-  /** Machine-wide v3 Workflow feature switch. Default ON. */
-  workflow: { enabled: boolean };
+  /** Machine-wide v3 Workflow feature switch (default OFF), the
+   *  experimental node executor for newly authorized runs (default
+   *  `ephemeral`) and whether their handoffs carry the initiator's identity
+   *  (default off). */
+  workflow: { enabled: boolean; nodeExecutor?: 'ephemeral' | 'bot'; handoffIdentity?: boolean };
   /** Machine-wide Claude Code prompt-cache default (TTL + idle keep-alive);
    *  null = not configured (off). Bots override it field by field. */
   promptCache: PromptCacheConfig | null;
@@ -125,8 +143,9 @@ export interface ResolvedDashboardSettingsView {
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
   };
-  /** Machine-wide multi-topic orchestration switch. Default ON. */
-  multiTopic: { enabled: boolean };
+  /** Machine-wide multi-topic orchestration switch. Default ON. The nested
+   *  task-tree card switch is default OFF and optional. */
+  multiTopic: { enabled: boolean; taskTreeCard?: boolean };
   /** OAuth 授权回跳基址（`<base>/oauth/callback`），null/absent = 未配置。 */
   oauthRedirectBase?: string | null;
   /** Proxy for binary self-update downloads, null/absent = unset. */
@@ -160,6 +179,8 @@ export interface SettingsWriteApplierDeps {
   writeCodexNotifierConfig: (config: import('../global-config.js').CodexNotifierGlobalConfig) => void;
   /** Replace known host-overload-alert fields while preserving future sibling keys. */
   writeHostOverloadAlertConfig: (config: import('../global-config.js').HostOverloadAlertGlobalConfig) => void;
+  /** Write the bot-grant entry; defaults are removed, other scheduleDelegation keys kept. */
+  writeScheduleBotGrantConfig: (patch: Parameters<typeof writeScheduleBotGrantConfig>[0]) => void;
   /** Atomic write of maintenance-level fields (autoUpdate / autoRestart). */
   mergeMaintenanceConfig: (patch: MaintenanceConfig) => MaintenanceConfig;
   /** Set global UI locale (null = clear). Fans out to daemons via IPC. */
@@ -208,6 +229,7 @@ export function defaultSettingsWriteApplierDeps(
     mergeGlobalConfig,
     writeCodexNotifierConfig,
     writeHostOverloadAlertConfig,
+    writeScheduleBotGrantConfig,
     mergeMaintenanceConfig,
     setGlobalLocale,
     parseMaintenancePatch,
@@ -248,9 +270,12 @@ export type ApplySettingsWriteError =
   | 'invalid_codexRpcInput'
   | 'invalid_autoUpgradeCodexSessions'
   | 'invalid_reapOrphanTmuxServers'
+  | 'invalid_tmuxOrphanSessionSweep'
+  | 'invalid_tmuxOrphanSessionBareWrapperKill'
   | 'invalid_bypassCodexHookTrust'
   | 'invalid_hideCodexRateLimitModelNudge'
   | 'invalid_cardBrandLabel'
+  | 'invalid_stuckCardInitiatorKeys'
   | 'invalid_codexNotifier'
   | 'invalid_codexNotifier_enabled'
   | 'invalid_codexNotifier_targetBotAppId'
@@ -273,6 +298,13 @@ export type ApplySettingsWriteError =
   | 'hostOverloadAlert_target_offline'
   | 'invalid_noVisibleOutputHint'
   | 'invalid_crossPrincipalInterruption'
+  | 'invalid_scheduleBotGrants'
+  | 'invalid_scheduleBotGrants_createEnabled'
+  | 'invalid_scheduleBotGrants_selfManageEnabled'
+  | 'invalid_scheduleBotGrants_grant'
+  | 'scheduleBotGrants_duplicate_id'
+  | 'scheduleBotGrants_overlap'
+  | 'scheduleBotGrants_stale'
   | 'invalid_repoPickerMode'
   | 'invalid_remoteAccess'
   | 'invalid_vcMeetingAgent'
@@ -280,6 +312,8 @@ export type ApplySettingsWriteError =
   | 'invalid_vcMeetingAgent_listenerBotAppId'
   | 'invalid_workflow'
   | 'invalid_workflow_enabled'
+  | 'invalid_workflow_nodeExecutor'
+  | 'invalid_workflow_handoffIdentity'
   | 'invalid_promptCache'
   | 'invalid_sessionCleanup'
   | 'invalid_sessionCleanup_enabled'
@@ -492,6 +526,18 @@ export async function applySettingsWrite(
     }
     patch.reapOrphanTmuxServers = obj.reapOrphanTmuxServers;
   }
+  if ('tmuxOrphanSessionSweep' in obj) {
+    if (typeof obj.tmuxOrphanSessionSweep !== 'boolean') {
+      return { ok: false, error: 'invalid_tmuxOrphanSessionSweep' };
+    }
+    patch.tmuxOrphanSessionSweep = obj.tmuxOrphanSessionSweep;
+  }
+  if ('tmuxOrphanSessionBareWrapperKill' in obj) {
+    if (typeof obj.tmuxOrphanSessionBareWrapperKill !== 'boolean') {
+      return { ok: false, error: 'invalid_tmuxOrphanSessionBareWrapperKill' };
+    }
+    patch.tmuxOrphanSessionBareWrapperKill = obj.tmuxOrphanSessionBareWrapperKill;
+  }
   if ('bypassCodexHookTrust' in obj) {
     if (typeof obj.bypassCodexHookTrust !== 'boolean') {
       return { ok: false, error: 'invalid_bypassCodexHookTrust' };
@@ -509,6 +555,15 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_cardBrandLabel' };
     }
     patch.cardBrandLabel = obj.cardBrandLabel;
+  }
+  if ('stuckCardInitiatorKeys' in obj) {
+    if (typeof obj.stuckCardInitiatorKeys !== 'boolean') {
+      return { ok: false, error: 'invalid_stuckCardInitiatorKeys' };
+    }
+    // Default ON: only `false` is stored. Writing the default removes the key
+    // (mergeDashboardConfig drops undefined), so the file never pins the
+    // default and a future default change still reaches untouched installs.
+    patch.stuckCardInitiatorKeys = obj.stuckCardInitiatorKeys ? undefined : false;
   }
   if ('noVisibleOutputHint' in obj) {
     if (typeof obj.noVisibleOutputHint !== 'boolean') {
@@ -640,6 +695,48 @@ export async function applySettingsWrite(
     hostOverloadAlertPatch = next;
   }
 
+  let scheduleBotGrantPatch: Parameters<typeof writeScheduleBotGrantConfig>[0] | undefined;
+  if ('scheduleBotGrants' in obj) {
+    const raw = obj.scheduleBotGrants;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, error: 'invalid_scheduleBotGrants' };
+    }
+    const incoming = raw as Record<string, unknown>;
+    const next: Parameters<typeof writeScheduleBotGrantConfig>[0] = {};
+    for (const key of ['createEnabled', 'selfManageEnabled'] as const) {
+      if (!(key in incoming)) continue;
+      if (typeof incoming[key] !== 'boolean') return { ok: false, error: `invalid_scheduleBotGrants_${key}` };
+      next[key] = incoming[key] as boolean;
+    }
+    if ('grants' in incoming) {
+      // Unlike the config reader, which drops a bad entry and keeps the rest,
+      // a Dashboard save is refused as a whole: the editor must not appear to
+      // keep a grant that would never apply.
+      const grants = incoming.grants;
+      if (!Array.isArray(grants) || !grants.every(isScheduleBotGrant)) {
+        return { ok: false, error: 'invalid_scheduleBotGrants_grant' };
+      }
+      if (new Set(grants.map(grant => grant.id)).size !== grants.length) {
+        return { ok: false, error: 'scheduleBotGrants_duplicate_id' };
+      }
+      if (overlappingScheduleBotGrants(grants).length > 0) {
+        return { ok: false, error: 'scheduleBotGrants_overlap' };
+      }
+      // The list is written whole, so it must be based on what is on disk now:
+      // a page opened before another tab (or a hand edit) revoked a grant would
+      // otherwise write that grant straight back.
+      const base = incoming.baseGrants;
+      const onDisk = deps.readGlobalConfig().scheduleDelegation?.botGrants ?? [];
+      const canonical = (list: ScheduleBotGrant[]) => JSON.stringify(list.map(canonicalScheduleBotGrant));
+      if (!Array.isArray(base) || !base.every(isScheduleBotGrant) || canonical(base) !== canonical(onDisk)) {
+        return { ok: false, error: 'scheduleBotGrants_stale' };
+      }
+      next.botGrants = grants;
+    }
+    if (Object.keys(next).length === 0) return { ok: false, error: 'invalid_scheduleBotGrants' };
+    scheduleBotGrantPatch = next;
+  }
+
   let touched = false;
   if (Object.keys(patch).length > 0) {
     deps.mergeDashboardConfig(patch);
@@ -668,12 +765,33 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_workflow' };
     }
     const wf = raw as Record<string, unknown>;
-    if (typeof wf.enabled !== 'boolean') {
+    const hasEnabled = 'enabled' in wf;
+    const hasNodeExecutor = 'nodeExecutor' in wf;
+    const hasHandoffIdentity = 'handoffIdentity' in wf;
+    if ((hasEnabled || (!hasNodeExecutor && !hasHandoffIdentity)) && typeof wf.enabled !== 'boolean') {
       return { ok: false, error: 'invalid_workflow_enabled' };
     }
+    if (hasNodeExecutor && wf.nodeExecutor !== 'ephemeral' && wf.nodeExecutor !== 'bot') {
+      return { ok: false, error: 'invalid_workflow_nodeExecutor' };
+    }
+    if (hasHandoffIdentity && typeof wf.handoffIdentity !== 'boolean') {
+      return { ok: false, error: 'invalid_workflow_handoffIdentity' };
+    }
     // Merge over existing so a future sibling key in the workflow block survives.
-    const current = deps.readGlobalConfig().workflow ?? {};
-    deps.mergeGlobalConfig({ workflow: { ...current, enabled: wf.enabled } });
+    const next: Record<string, unknown> = { ...(deps.readGlobalConfig().workflow ?? {}) };
+    if (hasEnabled) next.enabled = wf.enabled;
+    if (hasNodeExecutor) {
+      // Only the non-default value is stored: switching back to `ephemeral`
+      // removes the key so an untouched install keeps no trace of it.
+      if (wf.nodeExecutor === 'bot') next.nodeExecutor = 'bot';
+      else delete next.nodeExecutor;
+    }
+    if (hasHandoffIdentity) {
+      // Same rule: off is the default and leaves no key behind.
+      if (wf.handoffIdentity === true) next.handoffIdentity = true;
+      else delete next.handoffIdentity;
+    }
+    deps.mergeGlobalConfig({ workflow: Object.keys(next).length > 0 ? next as GlobalConfig['workflow'] : null });
     touched = true;
   }
 
@@ -743,8 +861,17 @@ export async function applySettingsWrite(
     if (typeof multiTopic.enabled !== 'boolean') {
       return { ok: false, error: 'invalid_multiTopic_enabled' };
     }
+    if (multiTopic.taskTreeCard !== undefined && typeof multiTopic.taskTreeCard !== 'boolean') {
+      return { ok: false, error: 'invalid_multiTopic_taskTreeCard' };
+    }
     const current = deps.readGlobalConfig().multiTopic ?? {};
-    deps.mergeGlobalConfig({ multiTopic: { ...current, enabled: multiTopic.enabled } });
+    deps.mergeGlobalConfig({
+      multiTopic: {
+        ...current,
+        enabled: multiTopic.enabled,
+        ...(typeof multiTopic.taskTreeCard === 'boolean' ? { taskTreeCard: multiTopic.taskTreeCard } : {}),
+      },
+    });
     touched = true;
   }
 
@@ -890,6 +1017,11 @@ export async function applySettingsWrite(
 
   if (hostOverloadAlertPatch) {
     deps.writeHostOverloadAlertConfig(hostOverloadAlertPatch);
+    touched = true;
+  }
+
+  if (scheduleBotGrantPatch) {
+    deps.writeScheduleBotGrantConfig(scheduleBotGrantPatch);
     touched = true;
   }
 

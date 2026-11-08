@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   caughtErrorText,
+  configErrorText,
   responseErrorText,
   saveBotField,
   type SaveBotFieldSpec,
@@ -138,5 +139,21 @@ describe('responseErrorText / caughtErrorText', () => {
     expect(caughtErrorText(new Error('x'))).toBe('x');
     expect(caughtErrorText('plain')).toBe('plain');
     expect(caughtErrorText(undefined)).toBe('undefined');
+  });
+});
+
+describe('configErrorText — 已知守卫码翻译，未知码回落原文', () => {
+  const tr = (k: string) => `T:${k}`;
+  it('清除 readIsolation 的两个 409 守卫码显示翻译文案而非裸错误码', () => {
+    expect(configErrorText(res({ error: 'read_isolation_active_sessions' }, { ok: false, status: 409 }), tr))
+      .toBe('T:botDefaults.readIsolationClearActiveSessions');
+    expect(configErrorText(res({ error: 'read_isolation_teardown_unverified' }, { ok: false, status: 409 }), tr))
+      .toBe('T:botDefaults.readIsolationClearTeardownUnverified');
+  });
+
+  it('reason 优先于 error；未知码原样回落', () => {
+    expect(configErrorText(res({ reason: 'read_isolation_active_sessions' }), tr))
+      .toBe('T:botDefaults.readIsolationClearActiveSessions');
+    expect(configErrorText(res({ error: 'boom' }), tr)).toBe('boom');
   });
 });

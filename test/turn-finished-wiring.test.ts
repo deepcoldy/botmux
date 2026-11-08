@@ -137,8 +137,13 @@ function deliver(ds: DaemonSession, msg: WorkerToDaemon): Promise<void> {
 async function readMarker(turnId: string): Promise<string> {
   const started = Date.now();
   while (Date.now() - started < 4000) {
-    try { return readFileSync(join(markerDir, turnId), 'utf8'); }
-    catch { await new Promise(resolve => setTimeout(resolve, 20)); }
+    try {
+      const body = readFileSync(join(markerDir, turnId), 'utf8');
+      // The hook runs in another process: creation/truncation can be visible
+      // before its JSON bytes are written. Existence alone is not completion.
+      JSON.parse(body);
+      return body;
+    } catch { await new Promise(resolve => setTimeout(resolve, 20)); }
   }
   return '';
 }

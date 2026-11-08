@@ -25,6 +25,7 @@ import type { RestartEnvFallback } from './restart-env-refresh.js';
 import { stripDashboardH5Env } from '../utils/child-env.js';
 import { scrubSessionTempEnv } from './session-temp.js';
 import { findQuotaFallbackCycles } from '../services/quota-fallback.js';
+import { findRetiredCliBots } from '../adapters/cli/retired-cli.js';
 import {
   inspectFleetProcess,
   signalAttestedFleetProcess,
@@ -210,6 +211,9 @@ export function resolveFleetBots(): FleetBotSpec[] {
  * resolveFleetMembers(), so operators retain a recovery surface. */
 export function resolveFleetBotsFromEntries(list: readonly unknown[]): FleetBotSpec[] {
   const cyclicAppIds = new Set(findQuotaFallbackCycles(list as any[]).flat());
+  // Rows on a removed CLI (gemini) are not started either: their daemon would
+  // only exit on the same notice in a restart loop (see retired-cli.ts).
+  const retiredIndexes = new Set(findRetiredCliBots(list).map(bot => bot.index));
   return list.map((b, index) => {
     const bot = (b ?? {}) as { name?: unknown; larkAppId?: unknown };
     return {
@@ -220,7 +224,7 @@ export function resolveFleetBotsFromEntries(list: readonly unknown[]): FleetBotS
       appId: typeof bot.larkAppId === 'string' ? bot.larkAppId : '',
       botIndex: index,
     };
-  }).filter(spec => !cyclicAppIds.has(spec.appId));
+  }).filter(spec => !cyclicAppIds.has(spec.appId) && !retiredIndexes.has(spec.botIndex));
 }
 
 const LOG_DIR = join(CONFIG_DIR, 'logs');

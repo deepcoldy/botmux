@@ -466,6 +466,7 @@ export interface OpenCodeLikeAdapterOptions {
   dbPath: () => string;
   skillsDir: string;
   hookConfigPath: string;
+  resumeFindsOwnSession?: boolean;
   modelChoices: readonly string[] | undefined;
   /** live 模型枚举的子命令参数（opencode / mimo 都是 `models` 纯文本列表）。 */
   modelListArgs: readonly string[];
@@ -608,6 +609,8 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
       return `${runtime.defaultBin} -s ${sid}`;
     },
 
+    resumeFindsOwnSession: runtime.resumeFindsOwnSession,
+
     /** Resume 目标预检：id 不在 session 表 → false（worker 落回全新会话并提示），
      *  避免 `Session not found` exit 1 被放大成自动重启 crash-loop。DB 读不了
      *  （node:sqlite 缺失 / 首次运行 / sandbox 未授权该 DB 路径）→ undefined，交给
@@ -716,6 +719,14 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     dbPath: opencodeDbPath,
     skillsDir: '~/.config/opencode/skills',
     hookConfigPath: '~/.config/opencode/plugin/botmux-ask.js',
+    resumeFindsOwnSession: true,
+    // Data root + the global config dir: opencode.json (providers / model), the
+    // botmux ask plugin written above and global skills. Under the oncall
+    // sandbox the config dir was absent, so OpenCode fell back to its built-in
+    // hosted model and the botmux ask hook never loaded. Read-write, like
+    // MiMoCode's: OpenCode installs plugin dependencies into it on every start
+    // (package.json / node_modules) and exits on a read-only mount.
+    authPaths: ['~/.local/share/opencode', '~/.config/opencode'],
     modelListArgs: ['models'],
     autoApproveArg: '--auto',
     autoApproveMinVersion: '1.17.12',

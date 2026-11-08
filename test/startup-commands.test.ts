@@ -70,7 +70,7 @@ describe('shouldRunStartupCommandsOnSpawn', () => {
 
 describe('shouldDeferInitialPromptForStartup', () => {
   it('defers only when commands exist AND the CLI bakes the prompt into args', () => {
-    // Gemini/OpenCode/MTR/Pi/Oh-My-Pi: prompt rides launch args → would run
+    // OpenCode/MTR/Pi/Oh-My-Pi: prompt rides launch args → would run
     // before the startup-command hook unless deferred to the queue (Codex P1).
     expect(shouldDeferInitialPromptForStartup({ hasStartupCommands: true, adoptMode: false, passesInitialPromptViaArgs: true })).toBe(true);
   });

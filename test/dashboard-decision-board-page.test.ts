@@ -312,6 +312,19 @@ describe('Bot config steward section', () => {
     expect(p2p().props.disabled).toBe(true);
   });
 
+  it('"decision cards in Feishu" is on by default; turning it off saves false, turning it back on drops the field', async () => {
+    serve();
+    await render({ enabled: true, chatId: 'oc_1' });
+    const cards = () => renderer!.root.find(n => n.type === 'input' && n.props['data-action'] === 'toggle-steward-decision-cards');
+    expect(cards().props.checked).toBe(true);
+    expect(text()).toContain(zh('botDefaults.stewardDecisionCards'));
+    await act(async () => { cards().props.onChange({ currentTarget: { checked: false } }); });
+    expect(calls('PUT', '/api/bots/cli_s/steward').at(-1)!.body).toEqual({ steward: { enabled: true, chatId: 'oc_1', decisionCards: false } });
+    expect(cards().props.checked).toBe(false);
+    await act(async () => { cards().props.onChange({ currentTarget: { checked: true } }); });
+    expect(calls('PUT', '/api/bots/cli_s/steward').at(-1)!.body).toEqual({ steward: { enabled: true, chatId: 'oc_1' } });
+  });
+
   it('the auto-join switch only shows while the bot is a steward, and a saved "off" survives turning the steward off and on', async () => {
     serve();
     await render({ enabled: false, autoJoinNewGroups: false });
@@ -452,3 +465,103 @@ describe('item detail · previous / next', () => {
   });
 });
 
+
+describe('linked chats', () => {
+  const applink = (chatId: string) => `https://applink.feishu.cn/client/chat/open?openChatId=${chatId}`;
+  const chat = (ref: string, text: string, extra: Record<string, unknown> = {}) => ({ kind: 'chat' as const, ref, text, url: applink(ref), ...extra });
+  const pr = { kind: 'pr' as const, ref: 'o/r#1', text: 'PR #1', url: 'https://github.com/o/r/pull/1' };
+  const anchors = () => renderer!.root.findAll(n => n.type === 'a');
+  const chatAnchors = () => anchors().filter(a => a.props['data-chat']);
+  const insideAnchor = (node: ReactTestInstance): boolean => {
+    for (let p = node.parent; p; p = p.parent) if (p.type === 'a') return true;
+    return false;
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetBoardNavMemory();
+    vi.stubGlobal('location', { hash: '#/board?view=all', pathname: '/', search: '' });
+    vi.stubGlobal('history', { state: null, replaceState: () => {} });
+  });
+
+  function serve(items: Array<Partial<BoardItem> & { seq: number; links: any[] }>, details: Record<number, Partial<BoardDetailResponse>> = {}) {
+    routes = (url, init) => {
+      const method = init.method ?? 'GET';
+      if (url.endsWith('/api/decision-board/boards')) {
+        return json({ ok: true, boards: [{ larkAppId: 'cli_a', botName: '管家', online: true, steward: { enabled: true, ready: true } }] });
+      }
+      if (url.includes('/items?') && method === 'GET') {
+        return json({ ok: true, view: 'all', steward: { enabled: true, ready: true }, counts: { decide: 0, active: items.length, all: items.length },
+          items: items.map(i => ({ ...boardItem(i.seq, { state: 'active' }), hasDraft: false, pendingDecisions: 0, unseen: false, ...i })), drafts: [], batches: [] });
+      }
+      const one = /\/items\/(\d+)$/.exec(url);
+      if (one && method === 'GET') return json({ ok: true, ...detail(Number(one[1]), details[Number(one[1])]) });
+      if (url.endsWith('/seen')) return json({ ok: true });
+      return json({ ok: false, error: 'not_found' }, 404);
+    };
+  }
+
+  async function openSummary() {
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(BoardSummaryView, { route: { view: 'all' } }));
+    });
+    for (let i = 0; i < 4; i += 1) await flush();
+  }
+
+  async function openDetail(seq: number) {
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(ItemDetailView, { appId: 'cli_a', seq }));
+    });
+    await flush();
+  }
+
+  it('each row opens its main chat in Feishu; rows without a chat say why or flag it, with no button', async () => {
+    serve([
+      { seq: 1, links: [pr, chat('oc_task', '任务群'), chat('oc_review', 'PR 评审群', { primary: true })] },
+      // 旧 daemon 不标 primary：第一个群就是主群。
+      { seq: 2, links: [chat('oc_old', '群 oc_old'), chat('oc_old2', '群 oc_old2')] },
+      { seq: 3, links: [pr], noChatReason: '只有 issue，还没开工' },
+      { seq: 4, links: [] },
+    ]);
+    await openSummary();
+    const joins = chatAnchors();
+    expect(joins.map(a => [a.props['data-chat'], a.props.href, a.props.target])).toEqual([
+      ['oc_review', applink('oc_review'), '_blank'],
+      ['oc_old', applink('oc_old'), '_blank'],
+    ]);
+    // 「进群」是行内详情链接的兄弟，不是套在链接里的链接。
+    for (const a of joins) expect(insideAnchor(a)).toBe(false);
+    expect(textOf(joins[0]!)).toBe(zh('decisionBoard.joinChat'));
+    const all = text();
+    expect(all).toContain('PR 评审群');
+    expect(all).toContain(zh('decisionBoard.moreChats', { n: 1 }));
+    expect(all).toContain(zh('decisionBoard.noChat', { reason: '只有 issue，还没开工' }));
+    expect(all).toContain(zh('decisionBoard.chatMissing'));
+  });
+
+  it('the detail page lists every chat under the title, main chat first and marked; chats are not repeated among the other links', async () => {
+    serve([], { 31: { links: [pr, chat('oc_a', '任务群', { chatCheck: 'unverified' }), chat('oc_b', 'PR 评审群', { primary: true, chatCheck: 'verified' })] } });
+    await openDetail(31);
+    const joins = chatAnchors();
+    expect(joins.map(a => [a.props['data-chat'], a.props.href, a.props.target])).toEqual([
+      ['oc_b', applink('oc_b'), '_blank'], ['oc_a', applink('oc_a'), '_blank'],
+    ]);
+    expect(textOf(joins[0]!)).toContain(zh('decisionBoard.primaryChat'));
+    expect(textOf(joins[0]!)).not.toContain(zh('decisionBoard.chatUnverified'));
+    expect(textOf(joins[1]!)).toContain(zh('decisionBoard.chatUnverified'));
+    expect(textOf(joins[1]!)).not.toContain(zh('decisionBoard.primaryChat'));
+    // 下方关联只剩 PR。
+    expect(anchors().filter(a => a.props.className === 'dboard-link').map(a => a.props.href)).toEqual([pr.url]);
+  });
+
+  it('the detail page tells the owner how to get a missing chat added, and shows the no-chat reason when there is one', async () => {
+    serve([], { 31: { links: [pr] }, 32: { links: [], item: boardItem(32, { noChatReason: '管家自己处理' }) } });
+    await openDetail(31);
+    expect(chatAnchors()).toEqual([]);
+    expect(text()).toContain('botmux board set 31 --link chat=oc_…');
+    act(() => renderer!.unmount());
+    await openDetail(32);
+    expect(text()).toContain(zh('decisionBoard.noChat', { reason: '管家自己处理' }));
+    expect(text()).not.toContain('--link chat=oc_');
+  });
+});

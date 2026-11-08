@@ -27,6 +27,13 @@ import {
   normalizeIsolationPath,
   shouldRedirectCliData,
 } from '../src/adapters/cli/read-isolation.js';
+import { protectedMcpHomePaths, type ProtectedMcpWorkerPolicy } from '../src/core/protected-mcp-capabilities.js';
+
+const protectedPolicy: ProtectedMcpWorkerPolicy = {
+  capabilities: [],
+  protectedHomePaths: ['.fixture-credential'],
+  redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+};
 
 describe('CLI data redirect gate', () => {
   const base = { supportsReadIsolation: true, sessionDataDir: '/srv/botmux/data' };
@@ -160,10 +167,15 @@ describe('evaluateReadIsolationGate (fail-closed, single decision point)', () =>
 });
 
 describe('mandatory device credential isolation', () => {
-  it('activates once either the enrollment marker or a device credential exists', () => {
+  it('activates once an enrollment marker, device credential, or protected MCP Home path is configured', () => {
     expect(credentialIsolationRequired({ markerExists: false, deviceCredentialExists: false })).toBe(false);
     expect(credentialIsolationRequired({ markerExists: true, deviceCredentialExists: false })).toBe(true);
     expect(credentialIsolationRequired({ markerExists: false, deviceCredentialExists: true })).toBe(true);
+    expect(credentialIsolationRequired({
+      markerExists: false,
+      deviceCredentialExists: false,
+      protectedHomePaths: ['/home/agent/.fixture-credential'],
+    })).toBe(true);
     expect(deviceCredentialIsolationMarkerPath('/home/agent/'))
       .toBe('/home/agent/.botmux/.device-credential-isolation');
   });
@@ -188,14 +200,17 @@ describe('mandatory device credential isolation', () => {
   });
 
   it('denies dedicated, legacy, marker, backup, and atomic sidecar paths', () => {
+    const protectedPaths = protectedMcpHomePaths('/home/agent/', protectedPolicy);
     const rules = buildCredentialIsolationRules({
       homeDir: '/home/agent',
       botmuxHome: '/srv/botmux-runtime',
-    });
+    }, protectedPaths);
     expect(rules.roots).toEqual(['/home/agent/.botmux', '/srv/botmux-runtime']);
     expect(rules.denyPaths).toContain('/home/agent/.botmux/device-auth');
     expect(rules.denyPaths).toContain('/srv/botmux-runtime/platform.json');
     expect(rules.denyPaths).toContain('/home/agent/.botmux/.device-credential-isolation');
+    expect(rules.denyPaths).toContain('/home/agent/.fixture-credential');
+    expect(rules.denyRegexes.some(rx => new RegExp(rx).test('/home/agent/.fixture-credential.tmp'))).toBe(true);
     for (const name of [
       'device-auth',
       'device.json',
@@ -206,6 +221,15 @@ describe('mandatory device credential isolation', () => {
     ]) {
       expect(isCredentialIsolationReservedBasename(name), name).toBe(true);
     }
+  });
+
+  it('resolves only validated relative protected paths beneath daemon Home', () => {
+    const tampered = {
+      ...protectedPolicy,
+      protectedHomePaths: ['.fixture-credential', '../escape', '/absolute', 'nested/../escape'],
+    } as ProtectedMcpWorkerPolicy;
+    expect(protectedMcpHomePaths('/home/agent/', tampered))
+      .toEqual(['/home/agent/.fixture-credential']);
   });
 
   it('credential-only isolation leaves the session skill manifest, skill snapshot and store readable (`botmux skill show` works)', () => {
@@ -1057,7 +1081,9 @@ describe('worker read-isolation fences', () => {
     expect(adoptBranches.length).toBeGreaterThan(0);
     for (const branch of adoptBranches) expect(gateAt).toBeLessThan(branch.index!);
 
-    const wrapperAt = strippedSource.search(/if \(cfg\.wrapperCli\b/);
+    // The unsandboxed wrapperCli call site (the sandboxed one runs before the
+    // full sandbox, where credential-only confinement is never applied).
+    const wrapperAt = strippedSource.search(/if \(wrapperCliConfigured && !wrapperInsideSandbox\)/);
     const spawnAt = strippedSource.search(/backend\.spawn\(spawnBin, spawnArgs\b/);
     expect(wrapperAt).toBeGreaterThan(0);
     for (const flavour of ['credentialOnlySeatbelt', 'credentialOnlyBwrap']) {

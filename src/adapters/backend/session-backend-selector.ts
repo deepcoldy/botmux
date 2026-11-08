@@ -18,6 +18,7 @@ import { managedTmuxCandidateSockets } from './tmux-socket.js';
 import { ZellijBackend } from './zellij-backend.js';
 import { ZmxBackend } from './zmx-backend.js';
 import { classifyTmuxProbeFailure } from '../../setup/ensure-tmux.js';
+import { isCodexAppCliId } from '../cli/types.js';
 import { resolveZmxSocketDir, zmxEnv } from '../../setup/ensure-zmx.js';
 import type { BackendType, HerdrBackendConfig, PersistentBackendTarget, SessionBackend, SessionProbe } from './types.js';
 
@@ -359,6 +360,8 @@ export function backendGateUserMessage(backend: BackendType, reason: string): st
  */
 export function backendSandboxCompatibilityError(opts: {
   backendType: BackendType;
+  cliId?: string;
+  platform?: NodeJS.Platform;
   fileSandboxRequested: boolean;
   /** Compatibility input for callers that still model standalone read
    * isolation. The worker passes false because its unified sandbox request
@@ -380,6 +383,13 @@ export function backendSandboxCompatibilityError(opts: {
   const isolationRequested =
     opts.fileSandboxRequested || opts.effectiveReadIsolationRequested;
   if (!isolationRequested) return undefined;
+  // The Linux file sandboxes hide /tmp and the bootstrap directory, so this
+  // runner cannot reach its authenticated control endpoint. Credential-only
+  // bwrap keeps them visible and is not a file/read sandbox request here.
+  if ((opts.platform ?? process.platform) === 'linux' && isCodexAppCliId(opts.cliId)
+    && (opts.backendType === 'pty' || opts.backendType === 'tmux')) {
+    return 'codex_app_file_sandbox_unsupported';
+  }
   if (
     opts.backendType === 'pty'
     || opts.backendType === 'tmux'
@@ -411,6 +421,9 @@ export function backendSandboxCompatibilityError(opts: {
 
 /** Actionable card shown before an incompatible backend/isolation launch fails. */
 export function backendSandboxCompatibilityUserMessage(reason: string): string {
+  if (reason === 'codex_app_file_sandbox_unsupported') {
+    return 'Codex App 暂不支持 Linux 文件沙盒（oncall / scratch）。请关闭 sandbox（包括全局 BOTMUX_SANDBOX 和 legacy readIsolation），或选择支持文件沙盒的 CLI 后重试。';
+  }
   return [
     '⚠️ 当前后端无法执行 botmux 的文件沙盒或读隔离，已拒绝启动以避免未隔离运行。',
     `原因：${reason}`,

@@ -215,6 +215,28 @@ describe('createGroupWithBots', () => {
     expect(result.notifyError).toBeNull();
   });
 
+  it('ownerNotice false: a topic group gets the transfer but no @-notice message of any kind', async () => {
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_topic', invalidBotIds: [], invalidUserIds: [] });
+    mockResolveAllowedUsersWithMap.mockResolvedValue({ resolved: [USER_OPEN_ID], map: new Map([['on_operator', USER_OPEN_ID]]) });
+    mockTransferChatOwner.mockResolvedValue({ ok: true });
+
+    const byUnion = await createGroupWithBots({
+      creatorLarkAppId: CREATOR, larkAppIds: [CREATOR, OTHER_BOT], chatMode: 'topic',
+      ownerUnionIds: ['on_operator'], transferOwnerUnionId: 'on_operator', ownerNotice: false,
+    });
+    const byOpenId = await createGroupWithBots({
+      creatorLarkAppId: CREATOR, larkAppIds: [CREATOR], chatMode: 'topic',
+      userOpenIds: [USER_OPEN_ID], transferOwnerTo: USER_OPEN_ID, notifyOwnerOpenId: USER_OPEN_ID, ownerNotice: false,
+    });
+
+    expect(mockCreateChat).toHaveBeenCalledWith(CREATOR, expect.objectContaining({ chatMode: 'topic' }));
+    expect(mockTransferChatOwner).toHaveBeenCalledTimes(2);
+    expect(mockSendMessage).not.toHaveBeenCalled();
+    for (const result of [byUnion, byOpenId]) {
+      expect(result).toMatchObject({ ownerTransferredTo: USER_OPEN_ID, transferError: null, notifyMessageId: null, notifyError: null });
+    }
+  });
+
   it('does not resolve or transfer when Lark rejected the operator union_id invite', async () => {
     mockCreateChat.mockResolvedValue({ chatId: 'oc_team', invalidBotIds: [], invalidUserIds: [] });
     mockAddUsersByUnionId.mockResolvedValue({ invalidUserIds: ['on_operator'] });

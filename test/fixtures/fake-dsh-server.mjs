@@ -13,6 +13,7 @@ import { appendFileSync } from 'node:fs';
  *
  * Scenarios via FAKE_DSH_SCENARIO:
  *   happy (default) - full event stream with assistant text + usage
+ *   reasoning       - real DSH reasoning, interim text, tool call/result, then final text + usage
  *   multi-step      - two assistant/message events; only the last is the final
  *                     answer, usage accumulates, and its two text blocks join
  *                     with no separator
@@ -25,6 +26,9 @@ import { appendFileSync } from 'node:fs';
  *   bad-prompt-ack  - first session/prompt returns no messageId, the second
  *                     runs the happy path (preamble must survive)
  *   bad-initialize  - initialize returns no server identity
+ *   model-not-ready - the first two initialize calls fail with "has no configured
+ *                     model" (a plugin provider still registering its models)
+ *   initialize-error - every initialize fails with an unrelated JSON-RPC error
  *   error           - session/prompt fails with a JSON-RPC error
  *   turn-error      - prompt accepted, but the turn ends with an LLM error
  *                     (like the real 401 path): no assistant/message, a
@@ -85,6 +89,7 @@ if (logPath) appendFileSync(logPath, JSON.stringify(launch) + '\n');
 
 let inputBuffer = '';
 let promptCount = 0;
+let initializeCount = 0;
 
 function send(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n');
@@ -132,6 +137,52 @@ function runHappyTurn(sessionId, messageId) {
         source: { callId },
         content: [{ type: 'tool-result', content: [{ type: 'text', text: 'hi\n' }], isError: false }],
       },
+    },
+  });
+  notify('session.status', { sessionId, status: 'idle' });
+}
+
+function runReasoningTurn(sessionId, messageId) {
+  sendInboxReceipt(sessionId, messageId);
+  const callId = 'call_cot_1';
+  const args = '{"command":"echo cot-probe"}';
+  sessionEvent(sessionId, {
+    type: 'assistant/message',
+    data: {
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: '先确认命令' },
+          { type: 'text', text: '先执行一下命令。' },
+          { type: 'tool-call', id: callId, name: 'bash', arguments: args },
+        ],
+      },
+    },
+  });
+  sessionEvent(sessionId, {
+    type: 'tool/call',
+    data: { callId, name: 'bash', arguments: args },
+  });
+  sessionEvent(sessionId, {
+    type: 'tool/result',
+    data: {
+      message: {
+        role: 'tool', source: { kind: 'tool', callId }, toolCallId: callId,
+        content: [{ type: 'text', text: 'cot-probe\n' }], isError: false,
+      },
+    },
+  });
+  sessionEvent(sessionId, {
+    type: 'assistant/message',
+    data: {
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: '输出已确认' },
+          { type: 'text', text: finalText },
+        ],
+      },
+      usage: { inputTokens: 100, outputTokens: 42, cacheReadTokens: 10, reasoningTokens: 8 },
     },
   });
   notify('session.status', { sessionId, status: 'idle' });
@@ -271,6 +322,19 @@ function handleLine(line) {
   }
   if (msg.method === 'initialize') {
     if (logPath) appendFileSync(logPath, JSON.stringify({ initialize: msg.params }) + '\n');
+    initializeCount++;
+    if (scenario === 'model-not-ready' && initializeCount <= 2) {
+      send({
+        jsonrpc: '2.0',
+        id: msg.id,
+        error: { code: -32000, message: `pi-ai provider "${msg.params?.provider}" has no configured model "${msg.params?.model}"` },
+      });
+      return;
+    }
+    if (scenario === 'initialize-error') {
+      send({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'boom' } });
+      return;
+    }
     if (scenario === 'bad-initialize') {
       send({ jsonrpc: '2.0', id: msg.id, result: {} });
       return;
@@ -315,6 +379,7 @@ function handleLine(line) {
     // Notifications land after the enqueue receipt, like the real server.
     setImmediate(() => {
       if (scenario === 'empty') runEmptyTurn(sessionId, messageId);
+      else if (scenario === 'reasoning') runReasoningTurn(sessionId, messageId);
       else if (scenario === 'multi-step') runMultiStepTurn(sessionId, messageId);
       else if (scenario === 'stale') runStaleTurn(sessionId, messageId);
       else if (scenario === 'turn-error') runTurnErrorTurn(sessionId, messageId);

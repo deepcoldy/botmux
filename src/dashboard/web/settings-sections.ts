@@ -19,7 +19,7 @@ export interface SettingsSection {
  */
 export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
   { id: 'settings-access', module: 'settings.moduleGeneral', section: 'settings.sectionAccess', fields: ['settings.publicReadOnly', 'settings.remoteAccess', 'settings.oauthRedirectBase'] },
-  { id: 'settings-cards', module: 'settings.moduleGeneral', section: 'settings.sectionCards', fields: ['settings.cardBrandLabel', 'settings.openTerminalInFeishu', 'settings.enableLocalCliOpen', 'settings.localCliOpenMode'] },
+  { id: 'settings-cards', module: 'settings.moduleGeneral', section: 'settings.sectionCards', fields: ['settings.cardBrandLabel', 'settings.openTerminalInFeishu', 'settings.stuckCardInitiatorKeys', 'settings.enableLocalCliOpen', 'settings.localCliOpenMode'] },
   { id: 'settings-group-creation', module: 'settings.moduleGeneral', section: 'settings.sectionGroupCreation', fields: ['settings.groupNamePrefix'] },
   {
     id: 'settings-experimental',
@@ -35,11 +35,14 @@ export const SETTINGS_SECTIONS: readonly SettingsSection[] = [
       'settings.codexNotifier',
       'settings.noVisibleOutputHint',
       'settings.crossPrincipalInterruption',
+      'settings.scheduleDelegationCreate',
+      'settings.scheduleDelegationSelfManage',
+      'settings.scheduleBotGrants',
     ],
   },
   { id: 'settings-overload', module: 'settings.moduleGeneral', section: 'settings.sectionHostOverloadAlert', fields: ['settings.hostOverloadAlert'] },
   { id: 'settings-whiteboard', module: 'settings.moduleGeneral', section: 'settings.sectionWhiteboard', fields: ['settings.whiteboardEnable'] },
-  { id: 'settings-workflow', module: 'settings.moduleGeneral', section: 'settings.sectionWorkflow', fields: ['settings.workflowEnable'] },
+  { id: 'settings-workflow', module: 'settings.moduleGeneral', section: 'settings.sectionWorkflow', fields: ['settings.workflowEnable', 'settings.workflowNodeExecutorBot', 'settings.workflowHandoffIdentity'] },
   { id: 'settings-multi-topic', module: 'settings.moduleGeneral', section: 'settings.sectionMultiTopic', fields: ['settings.multiTopicEnable'] },
   { id: 'settings-repo-picker', module: 'settings.moduleGeneral', section: 'settings.sectionRepoPicker', fields: ['settings.repoPickerMode'] },
   { id: 'settings-schedule', module: 'settings.moduleGeneral', section: 'settings.sectionSchedule', fields: ['settings.scheduleTimeZone', 'settings.sessionCleanupEnable', 'settings.sessionCleanupArchiveCodex'] },

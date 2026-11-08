@@ -62,7 +62,7 @@ function activeScheduledSession(): any {
 }
 
 describe('daemon current actor attestation', () => {
-  it('derives the HTTP client pid from the live kernel socket tuple', () => {
+  it('derives the HTTP client pid from the live kernel socket tuple', async () => {
     const procRoot = mkdtempSync(join(tmpdir(), 'actor-peer-'));
     mkdirSync(join(procRoot, 'net'), { recursive: true });
     writeFileSync(join(procRoot, 'net', 'tcp'), [
@@ -74,7 +74,7 @@ describe('daemon current actor attestation', () => {
     mkdirSync(join(procRoot, '101', 'fd'), { recursive: true });
     symlinkSync('socket:[4242]', join(procRoot, '101', 'fd', '7'));
 
-    expect(resolveLoopbackPeerProcesses({
+    expect(await resolveLoopbackPeerProcesses({
       remoteAddress: '127.0.0.1',
       remotePort: 50_000,
       localPort: 7_951,
@@ -82,13 +82,13 @@ describe('daemon current actor attestation', () => {
     })).toEqual({ ok: true, peer: { pid: 101, procStart: '2000' } });
   });
 
-  it('rejects a non-loopback request before process lookup', () => {
-    expect(resolveLoopbackPeerProcesses({
+  it('rejects a non-loopback request before process lookup', async () => {
+    expect(await resolveLoopbackPeerProcesses({
       remoteAddress: '10.0.0.1', remotePort: 50_000, localPort: 7_951,
     })).toEqual({ ok: false, reason: 'not_loopback' });
   });
 
-  it('honors BOTMUX_LOOPBACK_PEERS: a configured LAN peer passes the address ring and reaches local socket-inode resolution', () => {
+  it('honors BOTMUX_LOOPBACK_PEERS: a configured LAN peer passes the address ring and reaches local socket-inode resolution', async () => {
     const procRoot = mkdtempSync(join(tmpdir(), 'actor-peer-env-'));
     mkdirSync(join(procRoot, 'net'), { recursive: true });
     // No client-side tuple in this host's tables → a remote peer could never
@@ -100,10 +100,10 @@ describe('daemon current actor attestation', () => {
     process.env.BOTMUX_LOOPBACK_PEERS = '10.0.0.1';
     __resetLoopbackPeersCacheForTest();
     try {
-      expect(resolveLoopbackPeerProcesses({
+      expect(await resolveLoopbackPeerProcesses({
         remoteAddress: '10.0.0.1', remotePort: 50_000, localPort: 7_951, procRoot,
       })).toEqual({ ok: false, reason: 'peer_unresolved' });
-      expect(resolveLoopbackPeerProcesses({
+      expect(await resolveLoopbackPeerProcesses({
         remoteAddress: '10.0.0.2', remotePort: 50_000, localPort: 7_951, procRoot,
       })).toEqual({ ok: false, reason: 'not_loopback' });
     } finally {
@@ -398,6 +398,27 @@ describe('daemon current actor attestation', () => {
       expect(resolveDaemonCurrentExecution(input)).toMatchObject({ status: 'verified', turnId: 'om_turn' });
       // Incremental auth uses this same proof before creating a user grant.
       expect(attestCurrentTurnLoopbackPeer(input)).toMatchObject({ callerOpenId: 'ou_current', turnId: 'om_turn' });
+    });
+
+    it('requires the App runner to attest its nested app-server before new tools can cross turns', async () => {
+      const { procRoot, ds, check, input } = fixture();
+      writeProc(procRoot, 95, 1, '950');
+      writeProc(procRoot, 100, 95, '1000');
+      ds.localProcessAttestation.cliPid = 95;
+      ds.localProcessAttestation.cliProcStart = '950';
+      ds.managedTurnOrigin.preexistingProcessIdentities.push('95:950');
+      // The runner is the CLI entry; the persistent native engine below it
+      // must not be mistaken for a previous-turn tool.
+      expect(resolveDaemonCurrentExecution(input)).toBeNull();
+      ds.localProcessAttestation.enginePid = 100;
+      ds.localProcessAttestation.engineProcStart = '1000';
+      expect(resolveDaemonCurrentExecution(input)).toMatchObject({ status: 'verified' });
+      await expect(check()).resolves.toMatchObject({ ok: true });
+      ds.managedTurnOrigin.preexistingProcessIdentities.push('102:2000');
+      writeProc(procRoot, 103, 102, '3000');
+      await expect(check(103, '3000')).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+      writeProc(procRoot, 100, 95, 'recycled');
+      expect(resolveDaemonCurrentExecution(input)).toBeNull();
     });
 
     it.each([

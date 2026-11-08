@@ -80,7 +80,17 @@ export const COMMANDS: readonly CommandSpec[] = [
   },
   { name: '/restart', sessionPolicy: 'default', help: ['help.restart'] },
   { name: '/status', sessionPolicy: 'default', help: ['help.status'] },
+  { name: '/models', sessionPolicy: 'sessionless', help: ['help.models'] },
+  { name: '/modelpin', sessionPolicy: 'existingOnly', help: ['help.modelpin'] },
   { name: '/retry', sessionPolicy: 'default', help: ['help.retry'] },
+  {
+    name: '/rewind', sessionPolicy: 'existingOnly', help: ['help.rewind'],
+    notes: '可选 `<n>` 预览、`<n> confirm` 执行；只对 Claude Code（append-only transcript）生效',
+  },
+  {
+    name: '/idlecompact', sessionPolicy: 'existingOnly', help: ['help.idlecompact'],
+    notes: '可选 `on` / `off` / `<分钟 1–59>`，不带参数看状态；只改本会话的闲置自动压缩设置，只对 Claude Code / tmux 后端 Codex 生效',
+  },
   { name: '/queue', sessionPolicy: 'existingOnly', multiline: true, literalBody: true, help: ['help.queue'],
     notes: 'Codex App 活会话中的文字消息按原生 FIFO 新轮次执行；其它 CLI 明确拒绝，不创建会话' },
   { name: '/help', sessionPolicy: 'default', help: ['help.help'] },
@@ -121,6 +131,11 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: '/pair', sessionPolicy: 'default', help: ['help.pair'] },
   {
     name: '/login', sessionPolicy: 'default', help: ['help.login', 'help.login_status'],
+  },
+  {
+    name: '/logout', sessionPolicy: 'sessionless', permission: 'talk',
+    help: ['help.logout'],
+    notes: '只撤销发送者自己的触发人凭据；撤销他人走 dashboard IPC',
   },
   { name: '/adopt', sessionPolicy: 'default', help: ['help.adopt', 'help.adopt_pane', 'help.adopt_orca'] },
   {
@@ -190,7 +205,7 @@ export const COMMANDS: readonly CommandSpec[] = [
     notes: '恰好 1 个 token（清理任务 ID）；主干 #956 引入，rebase 时与 oracle 同步登记',
   },
   { name: '/cli', sessionPolicy: 'default', help: [], notes: '恰好 1 个 token；`/help` 不展示' },
-  { name: '/effort', cliId: ['codex-app', 'codex'], sessionPolicy: 'existingOnly', help: ['cmd.effort.usage'] },
+  { name: '/effort', cliId: ['codex-app', 'codex'], sessionPolicy: 'existingOnly', multiline: true, literalBody: true, help: ['cmd.effort.usage'] },
   {
     name: '/resume', claimWithoutSessionOnly: true, permission: 'talk', sessionPolicy: 'sessionless', help: ['help.resume'],
     notes: '无会话时恢复本话题/本群已关闭的会话（不带参数 = 最近一个）；有会话时透传给 CLI 自带的 /resume。'

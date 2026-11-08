@@ -1,3 +1,5 @@
+import { assertScheduleBotGrantActive } from '../src/core/schedule-bot-grant.js';
+import { authorizeScheduleSelfManage as realAuthorizeSelfManage } from '../src/core/schedule-delegated-runtime.js';
 import { mkdtempSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +10,7 @@ import { dispatchCallerFromReply } from '../src/core/dispatch-user-delegation.js
 import { pickTurnReplyTarget, registryTurnMayAuthenticateHuman } from '../src/core/reply-target.js';
 import { parseScheduledTurnId } from '../src/core/scheduled-turn-provenance.js';
 import { isUntilDoneClosed, UNTIL_DONE_NOTE_MAX_CHARS } from '../src/services/schedule-until-done.js';
+import { readManagedScheduleUpdate } from '../src/core/schedule-managed-update.js';
 
 // A real directory: capabilityScheduleWorkingDir realpaths both sides.
 const REPO = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-sched-repo-')));
@@ -57,13 +60,22 @@ function harness(action = 'pause', turnId = 'om_human', id = 'a1b2c3d4') {
     parseScheduledTurnId,
     isUntilDoneClosed,
     UNTIL_DONE_NOTE_MAX_CHARS,
-    authorizeScheduleSelfManage,
+    authorizeScheduleSelfManage, assertScheduleBotGrantActive,
     readGlobalConfig: () => ({ scheduleDelegation: { selfManageEnabled: true } }),
     resolveUnionIdFromOpenId: async () => 'on_admin',
     resolveTargetAppOpenId: async () => ({ status: 'resolved', openId: 'ou_admin' }),
     listChatMemberOpenIds: async () => ['ou_admin'],
     scheduleAuthorityStore: { getRecord: () => record },
     scheduler,
+    readManagedScheduleUpdate,
+    // The compound commit itself runs against real stores in
+    // schedule-managed-update.test.ts; here it only records the call.
+    applyManagedScheduleUpdate: vi.fn((taskId: string, _appId: string, updates: Record<string, unknown>) => {
+      const result = scheduler.updateTask(taskId, updates) as { ok: boolean; error?: string };
+      return result.ok
+        ? { ok: true, task: { schedule: String(updates.schedule ?? '0 9 * * *'), nextRunAt: null, enabled: true } }
+        : { ok: false, error: result.error ?? 'not_found_or_denied' };
+    }),
     jsonRes: (_res: unknown, status: number, value: unknown) => ({ status, value }),
   };
   const run = new Function('scope', `with (scope) { ${code}; return handler; }`)(scope);
@@ -93,6 +105,109 @@ function configureProviderActor(
 }
 
 describe('managed schedule mutation route', () => {
+  it.each(['pause', 'remove'])('lets the owning bot %s its policy task in the original topic after a report', async action => {
+    const h = harness(action, 'report:1');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.ds.scope = 'thread';
+    h.ds.session.rootMessageId = 'om_topic';
+    Object.assign(h.record, { selfManage: true, state: 'paused', controlOpenId: 'ou_admin',
+      controlUnionId: 'on_admin', runScopes: [], grantId: 'bot-policy:cli_controller:team:delivery:cli_target' });
+    Object.assign(h.record.task, { larkAppId: 'cli_target', rootMessageId: 'om_topic' });
+    h.scope.authorizeScheduleSelfManage = realAuthorizeSelfManage;
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true, selfManageEnabled: true,
+      botGrants: [{ id: 'team', sourceAppId: 'cli_controller', targetAppIds: ['cli_target'],
+        chatIds: ['oc_chat'], controllerUnionId: 'on_admin' }] } });
+    expect((await h.run()).status).toBe(200);
+    h.ds.session.rootMessageId = 'om_other';
+    expect((await h.run()).status).toBe(403);
+    h.ds.scope = 'thread';
+    h.ds.session.rootMessageId = 'om_topic';
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true, selfManageEnabled: true } });
+    expect((await h.run()).status).toBe(403);
+  });
+  // Topic cleanup is the bot service authority's. A person in the same topic
+  // keeps the ordinary rules: a non-administrator is refused, an administrator
+  // still manages the task through the current-human path.
+  function botPolicyTaskInTopic(action: string, turnId: string) {
+    const h = harness(action, turnId);
+    h.ds.scope = 'thread';
+    h.ds.session.rootMessageId = 'om_topic';
+    Object.assign(h.record, { selfManage: true, controlOpenId: 'ou_admin',
+      controlUnionId: 'on_admin', runScopes: [], grantId: 'bot-policy:cli_controller:team:delivery:cli_target' });
+    Object.assign(h.record.task, { larkAppId: 'cli_target', rootMessageId: 'om_topic' });
+    h.scope.authorizeScheduleSelfManage = realAuthorizeSelfManage;
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true, selfManageEnabled: true,
+      botGrants: [{ id: 'team', sourceAppId: 'cli_controller', targetAppIds: ['cli_target'],
+        chatIds: ['oc_chat'], controllerUnionId: 'on_admin' }] } });
+    return h;
+  }
+  it.each(['pause', 'remove'])('refuses a non-administrator in the original topic who asks to %s a bot policy task', async action => {
+    const h = botPolicyTaskInTopic(action, 'om_member');
+    h.ds.activeInteractiveTurn.caller.requestUserOpenId = 'ou_member';
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_mutation_current_human_required' } });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+    expect(h.scheduler.disableTask).not.toHaveBeenCalled();
+  });
+  // The topic is the one this turn runs in, computed as the delegated-add route
+  // computed it when it stored the task. In a chat-scope session the session
+  // anchor is only its first message, so it must not stand in for the topic.
+  it('in a chat-scope session, cleans up only the task of the thread the bot turn runs in', async () => {
+    const h = botPolicyTaskInTopic('remove', 'report:1');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    Object.assign(h.ds, { scope: 'chat' });
+    h.ds.session = { sessionId: 's1', rootMessageId: 'om_first',
+      replyTargets: { 'report:1': { rootMessageId: 'om_thread2', updatedAt: '2026-10-29T00:00:00.000Z' } } };
+    h.record.task.rootMessageId = 'om_first';
+    expect((await h.run()).status).toBe(403);
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+    h.record.task.rootMessageId = 'om_thread2';
+    expect((await h.run()).status).toBe(200);
+    expect(h.scheduler.removeTask).toHaveBeenCalledOnce();
+  });
+  it('refuses topic cleanup when the grant is revoked while the controller is being checked', async () => {
+    const h = botPolicyTaskInTopic('remove', 'report:1');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.scope.resolveTargetAppOpenId = async () => {
+      h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true, selfManageEnabled: true } });
+      return { status: 'resolved', openId: 'ou_admin' };
+    };
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_self_manage_denied' } });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
+  it('refuses topic cleanup from a bot turn the receiving bot did not observe itself', async () => {
+    const h = botPolicyTaskInTopic('remove', 'report:1');
+    h.ds.activeInteractiveTurn.caller = { senderType: 'bot', requestLarkAppId: 'cli_controller' };
+    expect((await h.run()).status).toBe(403);
+    h.ds.activeInteractiveTurn.caller.requestLarkAppId = 'cli_target';
+    expect((await h.run()).status).toBe(200);
+    expect(h.scheduler.removeTask).toHaveBeenCalledOnce();
+  });
+  it.each(['pause', 'remove'])('still lets an administrator in the original topic %s a bot policy task', async action => {
+    const h = botPolicyTaskInTopic(action, 'om_admin_turn');
+    expect((await h.run()).status).toBe(200);
+    expect(action === 'pause' ? h.scheduler.disableTask : h.scheduler.removeTask).toHaveBeenCalledWith('a1b2c3d4');
+  });
+  it('rejects topic cleanup when its managed turn changes during authorization', async () => {
+    const h = harness('remove', 'report:1');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.ds.scope = 'thread';
+    h.ds.session.rootMessageId = 'om_topic';
+    Object.assign(h.record, { selfManage: true, grantId: 'bot-policy:cli_controller:team:delivery:cli_target' });
+    h.record.task.rootMessageId = 'om_topic';
+    h.scope.authorizeScheduleSelfManage = async () => { h.ds.workerGeneration++; };
+    expect(await h.run()).toMatchObject({ status: 409, value: { error: 'schedule_mutation_turn_changed' } });
+    expect(h.scheduler.removeTask).not.toHaveBeenCalled();
+  });
+  it.each(['update', 'resume', 'run'])('does not turn a bot policy cleanup grant into %s authority', async action => {
+    const h = harness(action, 'report:1');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    h.ds.scope = 'thread';
+    h.ds.session.rootMessageId = 'om_topic';
+    Object.assign(h.record, { selfManage: true, grantId: 'bot-policy:cli_controller:team:delivery:cli_target' });
+    h.record.task.rootMessageId = 'om_topic';
+    expect((await h.run()).status).toBe(403);
+  });
+
   it('refuses a capability-only update of a task pinned outside the caller\'s reach', async () => {
     const h = harness('update');
     h.record.kind = 'direct';
@@ -330,6 +445,39 @@ describe('managed schedule mutation route', () => {
     expect(h.scheduler.removeTask).not.toHaveBeenCalled();
   });
 
+  it('commits a frequency change of a precondition-bound task through the compound edit', async () => {
+    const h = harness('update');
+    h.record.kind = 'direct';
+    h.record.task.preconditionRef = 'host-protected';
+    h.scope.readJsonBody = async () => ({ sessionId: 's1', originCapability: 'c'.repeat(64),
+      originTurnId: 'om_human', action: 'update', id: 'a1b2c3d4', schedule: ' every 4h ' });
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true, task: { schedule: 'every 4h' } } });
+    expect(h.scope.applyManagedScheduleUpdate).toHaveBeenCalledWith('a1b2c3d4', 'cli_target', { schedule: 'every 4h' });
+  });
+
+  it.each([
+    [{ schedule: '   ' }, 'invalid_schedule_expression'],
+    [{ schedule: 7 }, 'invalid_schedule_expression'],
+    [{}, 'invalid_schedule_update'],
+  ])('rejects malformed update body %j before committing', async (fields, error) => {
+    const h = harness('update');
+    h.record.kind = 'direct';
+    h.scope.readJsonBody = async () => ({ sessionId: 's1', originCapability: 'c'.repeat(64),
+      originTurnId: 'om_human', action: 'update', id: 'a1b2c3d4', ...fields });
+    expect(await h.run()).toMatchObject({ status: 400, value: { error } });
+    expect(h.scope.applyManagedScheduleUpdate).not.toHaveBeenCalled();
+  });
+
+  it('refuses a frequency change from a non-administrator before committing', async () => {
+    const h = harness('update');
+    h.record.kind = 'direct';
+    h.ds.activeInteractiveTurn.caller.requestUserOpenId = 'ou_member';
+    h.scope.readJsonBody = async () => ({ sessionId: 's1', originCapability: 'c'.repeat(64),
+      originTurnId: 'om_human', action: 'update', id: 'a1b2c3d4', schedule: 'every 4h' });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_mutation_current_human_required' } });
+    expect(h.scope.applyManagedScheduleUpdate).not.toHaveBeenCalled();
+  });
+
   it('requires a new authorization to change a delegated task canonical input', async () => {
     const h = harness('update');
     expect(await h.run()).toMatchObject({ status: 403, value: { error: 'delegated_schedule_reauthorization_required' } });
@@ -435,6 +583,65 @@ describe('managed schedule mutation route', () => {
     other.ds.activeInteractiveTurn.caller.senderType = 'bot';
     expect(await other.run()).toMatchObject({ status: 403, value: { error: 'schedule_mutation_current_human_required' } });
     expect(other.scheduler.completeTask).not.toHaveBeenCalled();
+  });
+
+  // `botmux schedule add` from the host terminal stores no controller. Its own
+  // scheduled turn must be able to close it, or an until-done task retries
+  // until the deadline even after the work is finished.
+  it.each(['done', 'pause', 'remove'] as const)(
+    'lets a host-terminal task\'s scheduled turn %s itself through the real authorizer',
+    async action => {
+      const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+      const h = harness(action, turnId, 'self');
+      h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+      h.record.kind = 'direct';
+      h.record.runScopes = [];
+      h.record.task = { id: 'a1b2c3d4', chatId: 'oc_chat', workingDir: REPO, enabled: true,
+        untilDone: { status: 'open', attempts: 2 } };
+      h.scope.authorizeScheduleSelfManage = realAuthorizeSelfManage;
+      h.scope.getDashboardAdminOpenIds = () => [];
+      h.scope.readGlobalConfig = () => ({});
+      expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
+      const mutated = { done: h.scheduler.completeTask, pause: h.scheduler.disableTask,
+        remove: h.scheduler.removeTask }[action];
+      expect(mutated).toHaveBeenCalledWith('a1b2c3d4', ...(action === 'done' ? [undefined] : []));
+
+      // The exemption is for stopping itself only, never another task or a rerun.
+      for (const [otherAction, otherId] of [[action, 'deadbeef'], ['run', 'self'], ['update', 'self']]) {
+        const other = harness(otherAction, turnId, otherId);
+        other.ds.activeInteractiveTurn.caller.senderType = 'bot';
+        other.record.kind = 'direct';
+        other.scope.authorizeScheduleSelfManage = realAuthorizeSelfManage;
+        expect(await other.run()).toMatchObject({ status: 403,
+          value: { error: 'schedule_mutation_current_human_required' } });
+      }
+    },
+  );
+
+  it('still refuses self-close for a direct task whose recorded controller lost access', async () => {
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const h = harness('done', turnId, 'self');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    Object.assign(h.record, { kind: 'direct', controlOpenId: 'ou_left', controlUnionId: 'on_left', runScopes: [] });
+    h.record.task = { id: 'a1b2c3d4', chatId: 'oc_chat', enabled: true, untilDone: { status: 'open', attempts: 1 } };
+    h.scope.authorizeScheduleSelfManage = realAuthorizeSelfManage;
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_self_manage_denied',
+      detail: 'schedule controller is no longer an allowed bot operator' } });
+    expect(h.scheduler.completeTask).not.toHaveBeenCalled();
+  });
+
+  it('lets a controllerless naturally completed until-done task remove itself through the real authorizer', async () => {
+    const turnId = 'schedule:a1b2c3d4:12345678-1234-1234-1234-123456789abc';
+    const h = harness('remove', turnId, 'self');
+    h.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    Object.assign(h.record, { kind: 'direct', state: 'completed', runScopes: [] });
+    h.record.task = { id: 'a1b2c3d4', chatId: 'oc_chat', workingDir: REPO, enabled: false,
+      disabledReason: 'once_completed', untilDone: { status: 'done', attempts: 3 } };
+    h.scope.authorizeScheduleSelfManage = realAuthorizeSelfManage;
+    h.scope.getDashboardAdminOpenIds = () => [];
+    h.scope.readGlobalConfig = () => ({});
+    expect(await h.run()).toMatchObject({ status: 200, value: { ok: true } });
+    expect(h.scheduler.removeTask).toHaveBeenCalledWith('a1b2c3d4');
   });
 
   it('reports a repeated done as a replay and a plain task as not until-done', async () => {

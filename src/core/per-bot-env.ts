@@ -96,7 +96,11 @@ const RESERVED_ENV_KEYS = new Set<string>([
 ]);
 
 /** Whether `key` is botmux-controlled and therefore rejected from per-bot env. */
-export function isReservedPerBotEnvKey(key: string): boolean {
+export function isReservedPerBotEnvKey(
+  key: string,
+  additionalReservedKeys: readonly string[] = [],
+): boolean {
+  if (additionalReservedKeys.includes(key)) return true;
   if (RESERVED_ENV_KEYS.has(key)) return true;
   return RESERVED_ENV_PREFIXES.some((p) => key.startsWith(p));
 }
@@ -173,19 +177,49 @@ export function sessionEnvLock(key: string, ctx: SessionEnvLockContext = {}): Se
  * aren't a string/number/boolean (primitives are stringified). Pure + total —
  * always returns an object, never throws.
  */
-export function sanitizePerBotEnv(raw: unknown): Record<string, string> {
-  const obj =
-    raw && typeof raw === 'object' && !Array.isArray(raw)
-      ? (raw as Record<string, unknown>)
-      : {};
+export function sanitizePerBotEnv(
+  raw: unknown,
+  additionalReservedKeys: readonly string[] = [],
+): Record<string, string> {
+  const obj = perBotEnvObject(raw);
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(obj)) {
     if (!ENV_KEY_RE.test(key)) continue;
-    if (isReservedPerBotEnvKey(key)) continue;
+    if (isReservedPerBotEnvKey(key, additionalReservedKeys)) continue;
     if (typeof value === 'string') out[key] = value;
     else if (typeof value === 'number' || typeof value === 'boolean') out[key] = String(value);
   }
   return out;
+}
+
+/** Coerce the raw `env` field to a plain object (non-object input → {}). */
+function perBotEnvObject(raw: unknown): Record<string, unknown> {
+  return raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>)
+    : {};
+}
+
+/**
+ * Keys a raw `env` object carries that {@link sanitizePerBotEnv} drops because
+ * they are botmux-reserved (valid env-var name + reserved). Lets config loaders
+ * emit an actionable warning instead of silently deleting operator config.
+ *
+ * Deliberately CLI-agnostic: it only reports WHICH keys were dropped. Whether a
+ * dropped key has a supported top-level replacement depends on the bot's
+ * `cliId` (only `claude-code`'s `CLAUDE_CONFIG_DIR` maps to `cliConfigDir`), so
+ * that hint belongs to the caller, not here. Invalid names are excluded (a
+ * separate problem); only reserved-but-otherwise-valid keys are returned, in
+ * object order (Object.keys is already unique — no de-dup needed).
+ */
+export function droppedReservedPerBotEnvKeys(
+  raw: unknown,
+  additionalReservedKeys: readonly string[] = [],
+): string[] {
+  const keys: string[] = [];
+  for (const key of Object.keys(perBotEnvObject(raw))) {
+    if (ENV_KEY_RE.test(key) && isReservedPerBotEnvKey(key, additionalReservedKeys)) keys.push(key);
+  }
+  return keys;
 }
 
 /**

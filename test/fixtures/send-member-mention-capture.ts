@@ -8,7 +8,9 @@ import { defaultHttpInstance } from '@larksuiteoapi/node-sdk';
     data = { code: 0, tenant_access_token: 'test-token', expire: 7200 };
   } else if (url.includes('/contact/v3/users/batch_get_id')) {
     console.log('CONTACT_LOOKUP=' + config.data);
-    data = { code: 0, data: { user_list: [] } };
+    data = { code: 0, data: { user_list: process.env.TEST_MEMBER_SCENARIO === 'outsider'
+      ? [{ email: 'recipient@example.com', user_id: 'ou_outside' }]
+      : [] } };
   } else if (url.includes('/im/v1/chats/oc_test/members')) {
     const scenario = process.env.TEST_MEMBER_SCENARIO;
     const items = scenario === 'missing'

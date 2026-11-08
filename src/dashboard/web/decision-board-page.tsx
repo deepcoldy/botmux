@@ -47,6 +47,7 @@ import {
   BOARD_EMPTY_VIEW_KEYS,
   BOARD_EVENT_KIND_KEYS,
   BOARD_FILES_PER_DRAFT,
+  BOARD_HINT_LABEL_KEYS,
   BOARD_IMAGE_TYPES,
   BOARD_VIEW_LABEL_KEYS,
   BOARD_VIEW_ORDER,
@@ -60,7 +61,10 @@ import {
   draftFromServer,
   draftNeedsReview,
   isDraftEmpty,
+  itemChatView,
+  knownHint,
   newSubmitNonce,
+  nonChatLinks,
   orderSubmitCandidates,
   parseBoardHash,
   pickBoard,
@@ -75,6 +79,7 @@ import {
   type BoardDetailResponse,
   type BoardDraft,
   type BoardEvent,
+  type BoardHint,
   type BoardItem,
   type BoardListResponse,
   type BoardRoute,
@@ -83,6 +88,7 @@ import {
   type BoardView,
   type DraftInput,
   type DraftSaveState,
+  type ItemChatView,
   type RenderedLink,
   type SubmitCandidate,
   type Translate,
@@ -162,6 +168,107 @@ function LinkChips(props: { links: RenderedLink[] }) {
         <span key={`${link.kind}:${link.ref}:${index}`} className="dboard-link dboard-link-plain" title={link.ref}>{link.text}</span>
       ))}
     </div>
+  );
+}
+
+/**
+ * 进群：直接是群 applink 的链接，交给飞书客户端接管（与 Dashboard 其它「打开聊天」同一做法；
+ * 用脚本打开会让侧栏里的页面跳走，而不是切到那个群）。
+ */
+function JoinChatLink(props: { link: RenderedLink; className: string; children: ReactNode }) {
+  const tr = useT();
+  if (!props.link.url) return null;
+  return (
+    <a className={props.className} href={props.link.url} target="_blank" rel="noopener noreferrer"
+      title={tr('decisionBoard.joinChatTitle', { name: props.link.text })} data-chat={props.link.ref}>
+      {props.children}
+    </a>
+  );
+}
+
+function UnverifiedTag() {
+  const tr = useT();
+  return <span className="dboard-chat-tag is-warn" title={tr('decisionBoard.chatUnverifiedTitle')}>{tr('decisionBoard.chatUnverified')}</span>;
+}
+
+/** 汇总行里的巡检提示：标签 + 原因（触屏上没有悬停，原因直接写出来）。 */
+function HintChip(props: { hint: BoardHint | undefined }) {
+  const tr = useT();
+  const hint = knownHint(props.hint);
+  if (!hint) return null;
+  return (
+    <span className="dboard-hint-row" data-hint={hint.kind}>
+      <span className={`dboard-hint-chip is-${hint.kind}`}>💡 {tr(BOARD_HINT_LABEL_KEYS[hint.kind])}</span>
+      <span className="dboard-hint-reason">{hint.reason}</span>
+    </span>
+  );
+}
+
+/** 详情页标题下的一行：「建议关闭：PR … 已合入（巡检发现，状态没改…）」。 */
+function HintBanner(props: { hint: BoardHint | undefined }) {
+  const tr = useT();
+  const hint = knownHint(props.hint);
+  if (!hint) return null;
+  return (
+    <p className={`dboard-hint-banner is-${hint.kind}`} data-hint={hint.kind} role="note">
+      💡 {tr('decisionBoard.hintDetail', { label: tr(BOARD_HINT_LABEL_KEYS[hint.kind]), reason: hint.reason })}
+    </p>
+  );
+}
+
+/** 汇总行标题下的一行：主群名（+N 个群）/ 无群：原因 / ⚠ 缺群。 */
+function RowChatLine(props: { view: ItemChatView }) {
+  const tr = useT();
+  const { view } = props;
+  if (view.primary) {
+    return (
+      <span className="dboard-row-chat">
+        <span className="dboard-row-chat-name">💬 {view.primary.text}</span>
+        {view.primary.chatCheck === 'unverified' ? <UnverifiedTag /> : null}
+        {view.chats.length > 1 ? <span className="dboard-row-chat-more">{tr('decisionBoard.moreChats', { n: view.chats.length - 1 })}</span> : null}
+      </span>
+    );
+  }
+  if (view.noChatReason) return <span className="dboard-row-chat is-none">{tr('decisionBoard.noChat', { reason: view.noChatReason })}</span>;
+  return <span className="dboard-row-chat is-missing">⚠ {tr('decisionBoard.chatMissing')}</span>;
+}
+
+/** 详情页标题下方：这一项的全部群，主群在前；没有群时写原因或标缺群。 */
+function ChatPanel(props: { seq: number; view: ItemChatView }) {
+  const tr = useT();
+  const { view } = props;
+  if (!view.primary) {
+    return view.noChatReason
+      ? <p className="dboard-chats is-none">{tr('decisionBoard.noChat', { reason: view.noChatReason })}</p>
+      : (
+        <div className="dboard-chats is-missing" role="note">
+          <span>⚠ {tr('decisionBoard.chatMissingAdd')}</span>
+          <code>{`botmux board set ${props.seq} --link chat=oc_…`}</code>
+          <span>{tr('decisionBoard.chatMissingReason')}</span>
+          <code>{`botmux board set ${props.seq} --no-chat "…"`}</code>
+        </div>
+      );
+  }
+  return (
+    <section className="dboard-chats" aria-label={tr('decisionBoard.chatsTitle')}>
+      <span className="dboard-chats-label">{tr('decisionBoard.chatsTitle')}</span>
+      <div className="dboard-chats-list">
+        {view.chats.map(link => {
+          const primary = link === view.primary;
+          const body = (
+            <>
+              <span className="dboard-chat-name">{link.text}</span>
+              {primary ? <span className="dboard-chat-tag">{tr('decisionBoard.primaryChat')}</span> : null}
+              {link.chatCheck === 'unverified' ? <UnverifiedTag /> : null}
+              <span className="dboard-chat-go">{tr('decisionBoard.joinChat')} ↗</span>
+            </>
+          );
+          return link.url
+            ? <JoinChatLink key={link.ref} link={link} className={`dboard-chat${primary ? ' is-primary' : ''}`}>{body}</JoinChatLink>
+            : <span key={link.ref} className={`dboard-chat${primary ? ' is-primary' : ''}`}>{body}</span>;
+        })}
+      </div>
+    </section>
   );
 }
 
@@ -423,8 +530,10 @@ function BoardRow(props: { appId: string; item: BoardListResponse['items'][numbe
   const { item } = props;
   const asking = item.state === 'decide' || item.state === 'accept';
   const question = asking && item.question ? questionOneLine(item.question) : '';
+  const chat = itemChatView(item, item.links);
+  // 「进群」与整行的详情链接是兄弟元素：链接里不能再套链接。
   return (
-    <li>
+    <li className="dboard-row-item">
       <a className={`dboard-row${item.unseen ? ' is-unseen' : ''}`} href={boardItemHash(props.appId, item.seq)} data-seq={item.seq}>
         <span className="dboard-row-dot" aria-label={item.unseen ? tr('decisionBoard.unseenMark') : undefined}>{item.unseen ? '●' : ''}</span>
         <span className="dboard-row-main">
@@ -440,6 +549,8 @@ function BoardRow(props: { appId: string; item: BoardListResponse['items'][numbe
             </span>
           ) : null}
           {item.pendingDecisions > 0 ? <span className="dboard-row-pending">{tr('decisionBoard.pendingShort')}</span> : null}
+          <HintChip hint={item.hint} />
+          <RowChatLine view={chat} />
         </span>
         <span className="dboard-row-meta">
           <StateChip state={item.state} stage={item.stage} />
@@ -448,6 +559,9 @@ function BoardRow(props: { appId: string; item: BoardListResponse['items'][numbe
           {item.hasDraft ? <span className="dboard-row-draft">{tr('decisionBoard.draftMark')}</span> : null}
         </span>
       </a>
+      <span className="dboard-row-join">
+        {chat.primary ? <JoinChatLink link={chat.primary} className="dboard-join-btn">{tr('decisionBoard.joinChat')}</JoinChatLink> : null}
+      </span>
     </li>
   );
 }
@@ -1090,7 +1204,9 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
         <StateChip state={item.state} stage={item.stage} />
       </header>
       <p className="dboard-detail-meta">{meta}</p>
-      <LinkChips links={detail.links} />
+      <HintBanner hint={item.hint} />
+      <ChatPanel seq={item.seq} view={itemChatView(item, detail.links)} />
+      <LinkChips links={nonChatLinks(detail.links)} />
       {item.summary?.trim() ? (
         <p className="dboard-summary"><span className="dboard-summary-label">{tr('decisionBoard.summaryLabel')}</span>{item.summary}</p>
       ) : null}

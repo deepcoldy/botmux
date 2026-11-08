@@ -102,11 +102,8 @@ describe('终端页 #status 与字节角标的 served 契约', () => {
     expect(html).toContain("_wbBytesEl.textContent='已接收 '");
   });
 
-  it('启动失败：#status 只留短词，长详情写进居中的 boot-error（不与顶部横幅同位）', () => {
-    expect(html).toContain("status.textContent='加载失败'");
-    expect(html).toContain('box.textContent=detail');
-    expect(html).toContain("box.classList.add('show')");
-  });
+  // 启动失败时 #status 只写短词「加载失败」、详情进 #boot-error：处理函数已抽到
+  // src/core/web-terminal-boot-error.ts，由 test/web-terminal-boot-error.test.ts 跑真实源码验证。
 
   it('启动 error 监听在连接建立后摘除（良性运行时报错不再劫持健康状态），连上后收起中央错误块', () => {
     expect(html).toContain("addEventListener('error',_wbBootstrapError,true)");
@@ -123,5 +120,17 @@ describe('终端页 #status 与字节角标的 served 契约', () => {
     const onclose = html.slice(html.indexOf('ws.onclose=function(){'), html.indexOf('ws.onerror=function'));
     expect(onclose).toContain('_wbHideBytes()');
     expect(onclose).toContain("el.textContent='disconnected'");
+  });
+});
+
+// 源码结构护栏(K4)：终端页的资源引用写在 worker.ts 的模板字符串里，没有可调用的 seam；只能还原 served HTML
+// 核对它不再直接引用任何外部 http(s) 资源——xterm 组件改由 worker 同源提供（见 src/core/xterm-vendor-assets.ts），
+// 浏览器连不上公共 CDN 时终端曾整页空白（ReferenceError: Can't find variable: Terminal）。
+describe('终端页不依赖外部 CDN', () => {
+  it('served HTML 里没有指向 http(s) 地址的 <script src> / <link href>', () => {
+    const html = servedHtml();
+    const external = [...html.matchAll(/<(?:script|link)\b[^>]*\b(?:src|href)\s*=\s*["']?(?:https?:)?\/\/[^"'\s>]+/gi)]
+      .map((m) => m[0]);
+    expect(external).toEqual([]);
   });
 });

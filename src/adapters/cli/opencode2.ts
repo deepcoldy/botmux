@@ -90,6 +90,8 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
       return `opencode2 -s ${sid}`;
     },
 
+    resumeFindsOwnSession: true,
+
     /** Resume 目标预检：id 不在 session_v2 表 → false
      *  （worker 落回全新会话并提示），避免 `Session not found` exit 1 被放大成
      *  daemon 自动重启 crash-loop。DB 读不了 → undefined，交给 worker 二级护栏。 */

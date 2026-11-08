@@ -1,5 +1,7 @@
 # Botmux 反馈能力：现阶段实现说明
 
+存储扩展：反馈现支持可选 PostgreSQL、维护窗口迁移和 Dashboard 配置，使用与恢复边界见 [反馈存储](feedback-storage.md)。下文保留原实现版本的历史说明，不代表新功能已部署。
+
 > 文档状态：基于 `feat/skill-feedback` commit `6d5136fa`、schema v7 与 Completion Proposal v1 整理
 >
 > 对照基线：Botmux 作者反馈能力技术方案 review 稿（revision 7）

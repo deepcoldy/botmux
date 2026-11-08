@@ -1,8 +1,17 @@
 import { describe, expect, it } from 'vitest';
+import { ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
 import {
+  cliHasNoRawPassthroughSurface,
   normalizePassthroughCommand,
   parseCustomPassthroughInput,
 } from '../src/core/passthrough-commands.js';
+
+describe('cliHasNoRawPassthroughSurface', () => {
+  it('refuses exactly the structured, runner and service CLIs plus Riff across the whole registry', () => {
+    expect(ALL_CLI_IDS.filter(id => cliHasNoRawPassthroughSurface(id)).sort())
+      .toEqual(['codex-app', 'dsh', 'ebsd', 'minimax', 'mir', 'mira', 'riff']);
+  });
+});
 
 describe('normalizePassthroughCommand', () => {
   it('joins internal whitespace with a hyphen', () => {

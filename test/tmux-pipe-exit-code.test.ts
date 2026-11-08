@@ -23,8 +23,45 @@ import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { readUnreapedPaneExit } from '../src/adapters/backend/unreaped-pane-exit.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 
+// Pure fold for the corpse waiter: merge one raw
+// `#{pane_dead}:#{pane_dead_status}[:#{pane_pid}:#{pid}]` line into the
+// observation so far (only the first two fields classify). ONLY a parseable
+// 0:/1: updates it; an unreadable line (a spawnSync timeout returns null
+// stdout under starvation) retains the previous observation, and an explicit
+// later 0: is adopted (no erroneous freeze). Without this, a `1:` followed by
+// timed-out reads was overwritten back to {dead:false}, erasing an
+// already-confirmed death.
+//
+// SEMANTIC BOUNDARY vs the PRODUCTION resolvePaneDeath: this fold accumulates
+// the CURRENT state across the fixture's reads — an explicit later `0:` is
+// adopted, because it estimates "what is the pane now" across inconclusive
+// reads. resolvePaneDeath returns a ONE-SHOT verdict and latches death
+// irreversibly (a `0:` after `1:` is a tmux glitch there). The two must not be
+// "unified": reachable sequences never disagree (a fixed-target pane does not
+// revive; respawn-pane is unused in src/), but their monotonicity is opposite
+// on purpose.
+function mergePaneObservation(
+  prev: { dead: boolean; status: string },
+  rawLine: string,
+): { dead: boolean; status: string } {
+  const [dead, status] = String(rawLine ?? '').trim().split(':');
+  if (dead !== '0' && dead !== '1') return prev; // unreadable: retain
+  return { dead: dead === '1', status: status ?? '' };
+}
+
 let realTmux: string | undefined;
 try { realTmux = execFileSync('which', ['tmux'], { encoding: 'utf8' }).trim(); } catch { /* optional */ }
+
+// The #2453 lab chains `remain-on-exit failed` into new-session; tmux < 3.2
+// rejects that value and no corpse is created, so the lab is modern-tmux only.
+let realTmuxSupportsFailed = false;
+try {
+  const v = String(execFileSync(realTmux!, ['-V'], { encoding: 'utf8', timeout: 3000 }));
+  const m = /tmux (\d+)\.(\d+)/.exec(v);
+  const major = m ? Number(m[1]) : 0;
+  const minor = m ? Number(m[2]) : 0;
+  realTmuxSupportsFailed = major > 3 || (major === 3 && minor >= 2);
+} catch { /* tmux missing: outer skipIf handles */ }
 let python3: string | undefined;
 try { python3 = execFileSync('which', ['python3'], { encoding: 'utf8' }).trim(); } catch { /* optional */ }
 
@@ -38,7 +75,10 @@ type TmuxRun = (...args: string[]) => { stdout?: string | null };
 
 /**
  * Wait until a pane is dead and its exit status is known; returns the status
- * as text ('' only if it never became known) and what was last seen.
+ * as text and what was last seen. `status` is '' both when no status became
+ * known and for a signal death, which has no exit code; `seen` tells them
+ * apart — a signal death ends with the kernel reading (`kernel={"kind":
+ * "signaled",…}`) or, once tmux reaped it, with tmux's own empty status.
  *
  * tmux publishes `#{pane_dead_status}` only once it has reaped the pane's
  * process. Until then the pane reads `1:` — dead, no status — and on CI tmux
@@ -55,24 +95,35 @@ type TmuxRun = (...args: string[]) => { stdout?: string | null };
  * measured 13.8–14.5s under a 4-core / 12×yes load, ~6s unloaded). Running out
  * of reads therefore means something is wrong rather than slow, and `seen`
  * says which: a pane that never died (`0:…`), a session that is gone (empty —
- * remain-on-exit was not applied), or a dead pane whose process is neither
- * reaped nor an unreaped zombie of this server.
+ * remain-on-exit was not applied), a dead pane whose process is neither
+ * reaped nor an unreaped zombie of this server, or a death an earlier parseable
+ * `1:` already confirmed while every later read timed out — that last case must
+ * still read dead, so parseable answers are FOLDED (mergePaneObservation)
+ * instead of trusting the final read.
  */
 const DEAD_PANE_POLL_INTERVAL_MS = 25;
 const DEAD_PANE_MAX_READS = 240;
-async function waitForDeadPane(tmux: TmuxRun, name: string): Promise<{ dead: boolean; status: string; seen: string }> {
+async function waitForDeadPane(
+  tmux: TmuxRun,
+  name: string,
+  opts: { maxReads?: number; intervalMs?: number } = {},
+): Promise<{ dead: boolean; status: string; seen: string }> {
+  const maxReads = opts.maxReads ?? DEAD_PANE_MAX_READS;
+  const intervalMs = opts.intervalMs ?? DEAD_PANE_POLL_INTERVAL_MS;
   let seen = '';
-  for (let reads = 0; reads < DEAD_PANE_MAX_READS; reads += 1) {
+  let obs = { dead: false, status: '' };
+  for (let reads = 0; reads < maxReads; reads += 1) {
     seen = String(tmux('display-message', '-p', '-t', name, '#{pane_dead}:#{pane_dead_status}:#{pane_pid}:#{pid}').stdout ?? '').trim();
+    obs = mergePaneObservation(obs, seen);
     const [dead, status = '', panePid, serverPid] = seen.split(':');
     if (dead === '1') {
       if (status !== '') return { dead: true, status, seen };
       const kernel = readUnreapedPaneExit(Number(panePid), Number(serverPid));
       if (kernel) return { dead: true, status: kernel.kind === 'exited' ? String(kernel.code) : '', seen: `${seen} kernel=${JSON.stringify(kernel)}` };
     }
-    await new Promise(r => setTimeout(r, DEAD_PANE_POLL_INTERVAL_MS));
+    await new Promise(r => setTimeout(r, intervalMs));
   }
-  return { dead: seen.startsWith('1:'), status: '', seen };
+  return { dead: obs.dead, status: '', seen };
 }
 
 describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code', () => {
@@ -225,7 +276,8 @@ describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code'
    * inherited when it daemonises, so it never learns a pane died and never
    * reaps one — exactly the observed corpse, on every run.
    */
-  describe.skipIf(!python3 || process.platform !== 'linux')('when the tmux server never reaps the pane process (#2453)', () => {
+  // The lab uses remain-on-exit failed (modern tmux only); see realTmuxSupportsFailed.
+  describe.skipIf(!python3 || process.platform !== 'linux' || !realTmuxSupportsFailed)('when the tmux server never reaps the pane process (#2453)', () => {
     const BLOCK_SIGCHLD_THEN_EXEC =
       'import os, signal, sys\n'
       + 'signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGCHLD})\n'
@@ -267,6 +319,15 @@ describe.skipIf(!realTmux)('tmux backend reports the pane pid\'s real exit code'
     it('lets the corpse fixture learn the exit code tmux never publishes', async () => {
       tmux('new-session', '-d', '-s', 'bmx-corpse', 'sh -c "exit 77"', ';', 'set-option', '-t', 'bmx-corpse', 'remain-on-exit', 'failed');
       expect(await waitForDeadPane(tmux, 'bmx-corpse')).toMatchObject({ dead: true, status: '77' });
+    });
+
+    // The fixture's other kernel outcome: a signal death has no exit code, so
+    // the wait ends with an empty status and says why in `seen`.
+    it('lets the corpse fixture end on an unreaped signal death without inventing a code', async () => {
+      tmux('new-session', '-d', '-s', 'bmx-signal-corpse', 'sh -c "kill -9 $$"', ';', 'set-option', '-t', 'bmx-signal-corpse', 'remain-on-exit', 'on');
+      const result = await waitForDeadPane(tmux, 'bmx-signal-corpse');
+      expect(result).toMatchObject({ dead: true, status: '' });
+      expect(result.seen).toContain('kernel={"kind":"signaled","signal":9}');
     });
 
     it('keeps an unreaped signal death on the ordinary channel and reaps its remnant', async () => {
@@ -315,6 +376,10 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
     // timeout even though the option below is set atomically. Exiting at once
     // makes the pane dead essentially at creation; the atomic chain still
     // guarantees remain-on-exit is in effect, so status 77 is recorded.
+    // Use `on` for the fixture so it also works on tmux <3.2 (where `failed`
+    // is an unknown option); exit 77 is retained under BOTH `on` and
+    // `failed`, and these probes only need a retained dead pane with its
+    // status — the option mode does not change the lines they read.
     // The option MUST be chained ATOMICALLY into new-session (`\; set-option`,
     // one server queue, in order) — the same way createDetachedSession does it.
     // It is per session and must target the corpse itself, not the neighbour
@@ -322,7 +387,7 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
     tmux('new-session', '-d', '-s', 'bmx-live-one', 'sleep 60');
     tmux(
       'new-session', '-d', '-s', 'bmx-corpse', 'sh -c "exit 77"',
-      ';', 'set-option', '-t', 'bmx-corpse', 'remain-on-exit', 'failed',
+      ';', 'set-option', '-t', 'bmx-corpse', 'remain-on-exit', 'on',
     );
     // The corpse exits 77 at once, so its status must become known. A miss
     // means the corpse was not set up as intended; `seen` in the failure diff
@@ -438,6 +503,111 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
     }
     expect(exists).toBe(false);
   });
+
+  // 2026-11-06: corpses left behind by a tmux server crash. Launch selection
+  // reads the corpse as 'missing', so the next generation CREATES the session —
+  // and every new-session failed with "duplicate session: bmx-…" until someone
+  // removed the corpse by hand.
+  it('a fresh launch onto a corpse\'s name reaps the corpse and starts a live session', async () => {
+    const corpsePanePid = String(tmux('display-message', '-p', '-t', 'bmx-corpse', '#{pane_pid}').stdout).trim();
+    const backend = new TmuxPipeBackend('bmx-corpse', { createSession: true, ownsSession: true, socketName: socket });
+    try {
+      backend.spawn('/bin/sh', ['-c', 'sleep 60'], {
+        cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+      });
+      const pane = String(tmux('display-message', '-p', '-t', 'bmx-corpse', '#{pane_dead}:#{pane_pid}').stdout).trim();
+      const [dead, panePid] = pane.split(':');
+      expect(dead).toBe('0');
+      expect(panePid).not.toBe(corpsePanePid);
+      // The neighbour was never touched.
+      expect(String(tmux('display-message', '-p', '-t', 'bmx-live-one', '#{pane_dead}').stdout).trim()).toBe('0');
+    } finally {
+      backend.kill();
+    }
+  });
+
+  // Only a session whose panes are ALL dead may be reaped: a live one keeps
+  // both its pane and the original error.
+  it('a fresh launch onto a LIVE session\'s name still fails and leaves that session alone', () => {
+    const livePanePid = String(tmux('display-message', '-p', '-t', 'bmx-live-one', '#{pane_pid}').stdout).trim();
+    const backend = new TmuxPipeBackend('bmx-live-one', { createSession: true, ownsSession: true, socketName: socket });
+    expect(() => backend.spawn('/bin/sh', ['-c', 'sleep 60'], {
+      cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+    })).toThrow(/duplicate session/);
+    expect(String(tmux('display-message', '-p', '-t', 'bmx-live-one', '#{pane_dead}:#{pane_pid}').stdout).trim())
+      .toBe(`0:${livePanePid}`);
+  });
+
+  // A split opened in the Web terminal can leave one dead pane (retained by
+  // remain-on-exit) next to one LIVE pane. The reap requires EVERY pane dead:
+  // such a session is alive, and neither pane may be touched.
+  it('never reaps a session whose dead pane shares it with a live pane', async () => {
+    tmux('set-option', '-t', 'bmx-live-one', 'remain-on-exit', 'on');
+    tmux('split-window', '-t', 'bmx-live-one', '-d', 'sh -c "exit 8"');
+    // 与 waitForDeadPane 同一个理由：pane_dead 翻到 1 之后 tmux 才回填
+    // pane_dead_status，饥饿下这个 '1:' 瞬态能持续超过 3s 墙钟（CI 实测在整
+    // 个等待窗口里一直是 '1:'），按墙钟给预算会在状态回填前耗尽。按读次数给
+    // 预算——被调度走的测试不产生读取，饥饿只会拉长墙钟而不会烧穿预算。
+    let panes: string[] = [];
+    for (let reads = 0; reads < DEAD_PANE_MAX_READS; reads += 1) {
+      panes = String(
+        tmux('list-panes', '-s', '-t', '=bmx-live-one:', '-F', '#{pane_dead}:#{pane_dead_status}').stdout ?? '',
+      ).split('\n').map(line => line.trim()).filter(Boolean).sort();
+      if (panes.includes('1:8')) break;
+      await new Promise(resolve => setTimeout(resolve, DEAD_PANE_POLL_INTERVAL_MS));
+    }
+    expect(panes, 'one live and one retained dead pane').toEqual(['0:', '1:8']);
+    const livePanePid = String(tmux('display-message', '-p', '-t', 'bmx-live-one', '#{pane_pid}').stdout).trim();
+    const backend = new TmuxPipeBackend('bmx-live-one', { createSession: true, ownsSession: true, socketName: socket });
+    expect(() => backend.spawn('/bin/sh', ['-c', 'sleep 60'], {
+      cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+    })).toThrow(/duplicate session/);
+    const after = String(
+      tmux('list-panes', '-s', '-t', '=bmx-live-one:', '-F', '#{pane_dead}:#{pane_dead_status}').stdout ?? '',
+    ).split('\n').map(line => line.trim()).filter(Boolean).sort();
+    expect(after).toEqual(['0:', '1:8']);
+    expect(String(tmux('display-message', '-p', '-t', 'bmx-live-one', '#{pane_pid}').stdout).trim()).toBe(livePanePid);
+  });
+
+  // The corpse can be reaped by someone else between the reap's two tmux calls.
+  // A bare `-t bmx-corpse` then PREFIX-matches the live `bmx-corpse-neighbour`;
+  // the reap must name its session exactly. The wrapper makes the race certain.
+  it('a corpse that vanishes mid-reap never lets the reap hit a live session sharing its prefix', () => {
+    tmux('new-session', '-d', '-s', 'bmx-corpse-neighbour', 'sleep 60');
+    const neighbour = () => String(tmux('display-message', '-p', '-t', 'bmx-corpse-neighbour', '#{pane_dead}:#{pane_pid}').stdout).trim();
+    const before = neighbour();
+    expect(before.startsWith('0:')).toBe(true);
+    const raceBin = join(dir, 'race-bin');
+    mkdirSync(raceBin);
+    writeFileSync(join(raceBin, 'tmux'), [
+      '#!/bin/sh',
+      `'${realTmux}' -S '${socket}' "$@"`,
+      'rc=$?',
+      `case " $* " in *" list-panes "*) '${realTmux}' -S '${socket}' kill-session -t '=bmx-corpse' >/dev/null 2>&1 ;; esac`,
+      'exit $rc',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    process.env.PATH = `${raceBin}:${process.env.PATH}`;
+    const backend = new TmuxPipeBackend('bmx-corpse', { createSession: true, ownsSession: true, socketName: socket });
+    try {
+      backend.spawn('/bin/sh', ['-c', 'sleep 60'], {
+        cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+      });
+    } finally {
+      backend.kill();
+    }
+    expect(neighbour()).toBe(before);
+  });
+
+  it('never reaps a session outside botmux\'s bmx- names, even a corpse', async () => {
+    tmux('new-session', '-d', '-s', 'user-corpse', 'sh -c "exit 5"', ';', 'set-option', '-t', 'user-corpse', 'remain-on-exit', 'on');
+    expect(await waitForDeadPane(tmux, 'user-corpse')).toMatchObject({ dead: true });
+    const backend = new TmuxPipeBackend('user-corpse', { createSession: true, ownsSession: true, socketName: socket });
+    expect(() => backend.spawn('/bin/sh', ['-c', 'sleep 60'], {
+      cwd: dir, cols: 100, rows: 30, env: { ...process.env } as Record<string, string>, paneLaunchDir: dir,
+    })).toThrow(/duplicate session/);
+    expect(tmux('has-session', '-t', '=user-corpse').status).toBe(0);
+  });
 });
 
 /**
@@ -446,6 +616,70 @@ describe.skipIf(!realTmux)('tmux liveness probes treat a kept corpse as missing'
  * exactly the window that turned a real `exit 3` into the fallback code 1
  * under CI load, so it must not rely on a timing-dependent end-to-end test.
  */
+describe('mergePaneObservation (corpse waiter fold)', () => {
+  const fold = (lines: string[]) => lines.reduce(mergePaneObservation, { dead: false, status: '' });
+  const alive = { dead: false, status: '' };
+  const deadNoCode = { dead: true, status: '' };
+
+  // '' = unreadable read (a spawnSync timeout has null stdout under starvation);
+  // '0:' explicit alive; '1:' dead w/o status; '1:77' dead+code. Only parseable
+  // 0:/1: updates the observation; unreadable retains; a later explicit 0: wins.
+  it.each([
+    [['1:', '', '', ''], deadNoCode],
+    [['1:77', '', ''], { dead: true, status: '77' }],
+    [['1:', '', ''], deadNoCode],
+    [['0:', ''], alive],
+    [['', '1:'], deadNoCode],
+    [['1:', '1:', '1:'], deadNoCode],
+    [['', '1:', '0:'], alive],
+    [['1:', '', '0:'], alive],
+    [['1:', '0:', ''], alive],
+    [['', '', ''], alive],
+    [['1:', '0:'], alive],
+  ] as const)('folds %j -> %j', (lines, expected) => {
+    expect(fold([...lines])).toEqual(expected);
+  });
+});
+
+// These drive the REAL fixture waiter (module-level waitForDeadPane) with a
+// scripted tmux, so the fold is asserted on the loop the corpse describe
+// actually calls — there is no second seam loop to bypass. 2-field lines give
+// NaN pane/server pids, so the kernel probe names no /proc entry and fails
+// closed (readUnreapedPaneExit returns null); only the tmux fold is exercised.
+describe('waitForDeadPane folds parseable answers across reads', () => {
+  const run = (lines: readonly string[]) => {
+    let i = 0;
+    const fakeTmux: TmuxRun = () => ({ stdout: lines[Math.min(i++, lines.length - 1)] });
+    return waitForDeadPane(fakeTmux, 'bmx-fold', { maxReads: lines.length, intervalMs: 0 });
+  };
+
+  // The exact #2436 defect: a code-less death confirmed, then every later read
+  // times out ('' = null stdout). Reverting the waiter to trust only its final
+  // read (dead: seen.startsWith('1:')) must make THIS test red.
+  it('keeps a confirmed code-less death when every later read times out', async () => {
+    expect(await run(['1:', '', ''])).toMatchObject({ dead: true, status: '' });
+  });
+
+  it('keeps a death confirmed mid-run even though the last read is unreadable', async () => {
+    expect(await run(['', '1:', ''])).toMatchObject({ dead: true, status: '' });
+  });
+
+  it('returns the real code as soon as a dead-with-code read arrives', async () => {
+    expect(await run(['1:', '1:77'])).toMatchObject({ dead: true, status: '77' });
+  });
+
+  // The fixture estimates CURRENT state: an explicit alive answer after a
+  // code-less death is adopted (production resolvePaneDeath instead latches —
+  // see the boundary note above mergePaneObservation).
+  it('adopts a later explicit 0: and ends unconfirmed when the budget then runs out', async () => {
+    expect(await run(['1:', '0:', ''])).toMatchObject({ dead: false, status: '' });
+  });
+
+  it('stays unconfirmed when every read is unreadable', async () => {
+    expect(await run(['', '', ''])).toMatchObject({ dead: false, status: '' });
+  });
+});
+
 describe('resolvePaneDeath three-way verdict: alive / dead / unknown', () => {
   const noSleep = () => {};
   const OPTS = { attempts: 5, intervalMs: 0 };

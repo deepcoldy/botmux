@@ -8,9 +8,11 @@ import { describe, expect, it, vi } from 'vitest';
 import type { CodexPendingTurn } from '../src/services/codex-bridge-queue.js';
 import { uncollectedTurnsNeedingNotice } from '../src/services/structured-uncollected-notice.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
 
 /** CLI readiness as the worker tracks it. Default: the CLI did come up. */
 interface Readiness {
+  lastInitConfig?: { adoptMode: boolean; cliUpgrade?: { from: string; to: string } };
   isPromptReady?: boolean;
   promptReadyEdges?: number;
   promptReadyEdgesAtFreshCliStart?: number;
@@ -58,6 +60,9 @@ function harness(dropped: CodexPendingTurn[], readiness: Readiness = { isPromptR
     uncollectedTurnsNeedingNotice,
     // The write of this turn threw; its own submit-failure notice is out.
     structuredTurnsWithSubmitNotice: new Set(['om_write_failed']),
+    inputDeliveryEvidence: new InputDeliveryEvidenceTracker(),
+    submitActivityEvidenceSince: vi.fn((_sinceMs: number, identity?: { turnId?: string }) =>
+      identity?.turnId === 'om_sent_during_receipt' ? 'botmux-send' : undefined),
     // A deferred submit recheck is still deciding this one.
     submitFailureChains: {
       has: (key: { turnId?: string; cliGeneration: number }) => key.turnId === 'om_rechecking' && key.cliGeneration === 3,
@@ -82,7 +87,9 @@ describe('worker: expired structured heads', () => {
       { turnId: 'codex-local-1', isLocal: true, started: false },
       { turnId: 'om_write_failed', started: false },
       { turnId: 'om_rechecking', started: false },
+      { turnId: 'om_sent_during_receipt', started: false },
     ]);
+    scope.inputDeliveryEvidence.start({ turnId: 'om_sent_during_receipt', cliGeneration: 3 }, 100);
 
     expect(prune('structured bridge tick')).toBe(true);
 
@@ -101,6 +108,8 @@ describe('worker: expired structured heads', () => {
     ]));
     // A consumed write-failure entry does not suppress a later, fresh mark.
     expect(scope.structuredTurnsWithSubmitNotice.has('om_write_failed')).toBe(false);
+    expect(scope.submitActivityEvidenceSince).toHaveBeenCalledWith(100,
+      expect.objectContaining({ turnId: 'om_sent_during_receipt' }));
   });
 
   it('says "not started" only behind a recognized startup blocker', () => {

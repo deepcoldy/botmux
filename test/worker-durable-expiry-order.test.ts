@@ -11,7 +11,11 @@ import { describe, expect, it, vi } from 'vitest';
 import { classifyRestartTeardown } from '../src/adapters/backend/destroy-result.js';
 import { isRemoteBackendType } from '../src/core/persistent-backend.js';
 import { decideRestartFollowup, restartLaunchSettings } from '../src/core/restart-followup-policy.js';
+import { protectedMcpRedactedEnvKeys } from '../src/core/protected-mcp-capabilities.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
+import { restartSpendsFreshBudget, exitMarksServerReplaced } from '../src/core/restart-fresh-budget.js';
+import { join } from 'node:path';
 
 type Restart = (reason: string, opts?: { immediate?: boolean; preservePending?: boolean; restartCause?: 'traex-auto-model' }) => Promise<void>;
 
@@ -23,12 +27,15 @@ function restartHarness(opts: { replacementPromptReadyDuringSpawn: boolean }) {
     lastInitConfig: { cliId: 'claude-code', sessionId: 'sid', workingDir: '/project', resume: false },
     cliSpawnGeneration: 1,
     submitFailureChains: { clear: vi.fn() },
+    inputDeliveryEvidence: new InputDeliveryEvidenceTracker(),
     queuedActivationReceipts: { clear: vi.fn() },
     cliRestartInProgress: false,
     replacementSpawnInProgress: false,
     restartWindowLaunch: undefined,
     rawInputRestartGate: false,
     consecutiveInWorkerRestarts: 0,
+    lastCliExitServerReplaced: false,
+    restartSpendsFreshBudget,
     tmuxRestartTimer: null,
     remoteThreadId: undefined,
     intentionalRestartBackend: undefined,
@@ -81,6 +88,59 @@ function restartHarness(opts: { replacementPromptReadyDuringSpawn: boolean }) {
 }
 
 describe('worker restart input fence', () => {
+  it('forgets old input and terminal evidence before restarting the CLI', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    const old = { turnId: 'old-turn', dispatchAttempt: 2, cliGeneration: 1 };
+    h.scope.inputDeliveryEvidence.start(old, 100);
+    h.scope.inputDeliveryEvidence.observeStructuredTerminal(old);
+    expect(h.scope.inputDeliveryEvidence.hasStructuredTerminal(old)).toBe(true);
+
+    await h.restart('daemon request', { preservePending: true });
+
+    expect(h.scope.inputDeliveryEvidence.hasStructuredTerminal(old)).toBe(false);
+    expect(h.scope.inputDeliveryEvidence.writeStartedAtMs(old)).toBeUndefined();
+    await h.runSpawnTimer();
+  });
+
+  it('forgets old evidence when a new spawn fails before creating a replacement', async () => {
+    const inputDeliveryEvidence = new InputDeliveryEvidenceTracker();
+    const old = { turnId: 'old-turn', dispatchAttempt: 2, cliGeneration: 7 };
+    inputDeliveryEvidence.start(old, 100);
+    inputDeliveryEvidence.observeStructuredTerminal(old);
+    const scope = {
+      cliSpawnGeneration: 7,
+      inputDeliveryEvidence,
+      networkPolicySupportError: () => undefined,
+      networkProxyLaunchError: async () => undefined,
+      protectedHttpEgressCliSupportError: () => undefined,
+      protectedMcpRedactedEnvKeys,
+      resetCodexModelMigrationState: vi.fn(),
+      backgroundTaskTracker: { reset: vi.fn() },
+      join,
+      homedir: () => '/fixture',
+      tmpdir: () => '/fixture/tmp',
+      ensureSessionTempDir: () => '/fixture/session',
+      pinSessionMcpGatewaySocketRoot: vi.fn(),
+      applySessionTempEnv: vi.fn(),
+      process: { platform: process.platform, env: {} },
+      submitFailureChains: { clear: vi.fn() },
+      queuedActivationReceipts: { clear: vi.fn() },
+      // spawnCli's entry points the worker's TRAE readers at the bot's
+      // TRAE_HOME before any of the gates below run. It is a no-op for this
+      // non-traex assertion, but the real worker global must be present or the
+      // harness throws a TypeError before reaching the expected rejection.
+      followBotTraeHome: vi.fn(),
+    };
+    const spawn = loadWorkerFunction<(cfg: unknown) => Promise<void>>('spawnCli', scope);
+
+    await expect(spawn({ sessionId: 'sid', cliId: 'traex', existingAppServerEndpoint: 'ws://localhost' }))
+      .rejects.toThrow('existing App Server attachment requires cliId');
+
+    expect(scope.cliSpawnGeneration).toBe(8);
+    expect(inputDeliveryEvidence.hasStructuredTerminal(old)).toBe(false);
+    expect(inputDeliveryEvidence.writeStartedAtMs(old)).toBeUndefined();
+  });
+
   it('preserves the activity latch only for a capacity-model rotation', async () => {
     const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
     await h.restart('capacity rotation', { preservePending: true, restartCause: 'traex-auto-model' });
@@ -116,5 +176,58 @@ describe('worker restart input fence', () => {
     expect(h.scope.cliRestartInProgress).toBe(false);
     expect(h.scope.settleRestartAttemptOnReady).toHaveBeenCalledTimes(1);
     expect(h.scope.flushPending).toHaveBeenCalledTimes(1);
+  });
+
+  // 2026-11-06: a tmux server loss took respawned panes down a second time and
+  // tier-2 forced 71 sessions to a FRESH conversation.
+  it('does not spend the fresh-session budget when the previous exit was a tmux server loss', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    h.scope.consecutiveInWorkerRestarts = 1;
+    h.scope.lastCliExitServerReplaced = true;
+    await h.restart('daemon request');
+    expect(h.scope.consecutiveInWorkerRestarts).toBe(1);
+    // consumed: the next restart is judged on its own exit
+    expect(h.scope.lastCliExitServerReplaced).toBe(false);
+  });
+
+  it('still spends the budget for an ordinary CLI exit', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    h.scope.consecutiveInWorkerRestarts = 1;
+    await h.restart('daemon request');
+    expect(h.scope.consecutiveInWorkerRestarts).toBe(2);
+  });
+
+  it('clears a stale server-loss marker when the restart is abandoned for a codex auto-upgrade', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    const reject = vi.fn();
+    h.scope.codexAutoUpgrade = { reject };
+    h.scope.lastCliExitServerReplaced = true;
+    await h.restart('daemon request');
+    expect(reject).toHaveBeenCalledOnce();
+    expect(h.scope.lastCliExitServerReplaced).toBe(false);
+  });
+
+  it('clears a stale server-loss marker when restart is ignored in adopt mode', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    h.scope.lastInitConfig = { adoptMode: true };
+    h.scope.lastCliExitServerReplaced = true;
+    await h.restart('daemon request');
+    expect(h.scope.lastCliExitServerReplaced).toBe(false);
+  });
+});
+
+describe('restart fresh-budget policy', () => {
+  it('marks only an unintentional exit that the backend attributes to a server replacement', () => {
+    expect(exitMarksServerReplaced({ intentionalRestart: false, backendReportsServerReplaced: true })).toBe(true);
+    expect(exitMarksServerReplaced({ intentionalRestart: true, backendReportsServerReplaced: true })).toBe(false);
+    expect(exitMarksServerReplaced({ intentionalRestart: false, backendReportsServerReplaced: false })).toBe(false);
+    expect(exitMarksServerReplaced({ intentionalRestart: true, backendReportsServerReplaced: false })).toBe(false);
+  });
+
+  it('spends the budget for a normal exit but not for a server loss or a user-initiated respawn', () => {
+    expect(restartSpendsFreshBudget({ previousExitServerReplaced: false })).toBe(true);
+    expect(restartSpendsFreshBudget({ previousExitServerReplaced: true })).toBe(false);
+    expect(restartSpendsFreshBudget({ skipRestartBudget: true, previousExitServerReplaced: false })).toBe(false);
+    expect(restartSpendsFreshBudget({ skipRestartBudget: true, previousExitServerReplaced: true })).toBe(false);
   });
 });

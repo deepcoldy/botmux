@@ -4,21 +4,27 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
   clearWorkerConfig,
+  configuredProtectedMcpEnvKeys,
   GROUP_NAME_PREFIX_MAX_LENGTH,
   globalVcMeetingAgentListenerBotAppId,
   globalConfigPath,
   isGlobalVcMeetingAgentEnabled,
   invalidateGlobalConfigCache,
   isMultiTopicOrchestrationEnabled,
+  isDispatchTaskTreeCardEnabled,
   isWorkflowFeatureEnabled,
   mergeDashboardConfig,
   mergeGlobalConfig,
+  paneSwitchEnv,
   mergeWorkerConfig,
   readGlobalConfig,
   writeCodexNotifierConfig,
   writeHostOverloadAlertConfig,
+  writeScheduleBotGrantConfig,
+  ignoredScheduleBotGrantCount,
 } from '../src/global-config.js';
 import { resolveCodexNotifierConfig } from '../src/features/codex-notifier/config.js';
+import { protectedMcpIsolationPolicy } from '../src/core/protected-mcp-capabilities.js';
 
 describe('global dashboard config', () => {
   let home: string;
@@ -83,6 +89,27 @@ describe('global dashboard config', () => {
     });
   });
 
+  it('validates idle auto-compaction dashboard settings', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: {
+        autoCompactEnabled: true,
+        autoCompactThreshold: 75.4,
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().dashboard).toEqual({
+      autoCompactEnabled: true,
+      autoCompactThreshold: 75,
+    });
+
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      dashboard: { autoCompactEnabled: false, autoCompactThreshold: 101 },
+    }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().dashboard).toEqual({ autoCompactEnabled: false });
+  });
+
   it('uses an absolute operator-provided global config path', () => {
     const shared = join(home, 'control', 'config.json');
     mkdirSync(dirname(shared), { recursive: true });
@@ -96,6 +123,166 @@ describe('global dashboard config', () => {
   it('rejects a relative operator-provided global config path', () => {
     vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', 'control/config.json');
     expect(() => globalConfigPath()).toThrow(/must be absolute/);
+  });
+
+  it('reads protected MCP capabilities from machine-wide config with writes default-off', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      protectedMcpCapabilities: {
+        'fixture.secret.v1': {
+          allowedPluginIds: ['fixture-plugin', 'fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
+          principal: 'verified-human-email',
+          containmentProfile: 'local-stdio-secret-v1',
+          isolation: {
+            protectedHomePaths: ['.fixture-credential', '.fixture-credential'],
+            redactEnv: ['FIXTURE_TOKEN', 'FIXTURE_TOKEN'],
+          },
+        },
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().protectedMcpCapabilities).toEqual({
+      'fixture.secret.v1': {
+        enabled: false,
+        allowedPluginIds: ['fixture-plugin'],
+        secret: { source: 'file', path: '.secrets/mcp-secret' },
+        principal: 'verified-human-email',
+        containmentProfile: 'local-stdio-secret-v1',
+        isolation: {
+          protectedHomePaths: ['.fixture-credential'],
+          redactEnv: ['FIXTURE_TOKEN'],
+        },
+      },
+    });
+  });
+
+  it('accepts the fixed egress-guard containment profile in machine-wide config', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      protectedMcpCapabilities: {
+        'fixture.actor-write.v1': {
+          enabled: false,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
+          principal: 'verified-human-email',
+          containmentProfile: 'local-stdio-secret-egress-guard-v1',
+        },
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().protectedMcpCapabilities).toEqual({
+      'fixture.actor-write.v1': {
+        enabled: false,
+        allowedPluginIds: ['fixture-plugin'],
+        secret: { source: 'file', path: '.secrets/mcp-secret' },
+        principal: 'verified-human-email',
+        containmentProfile: 'local-stdio-secret-egress-guard-v1',
+      },
+    });
+  });
+
+  it('drops malformed protected MCP capability entries without widening access', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      protectedMcpCapabilities: {
+        '../escape': {
+          enabled: true,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
+          containmentProfile: 'local-stdio-secret-v1',
+        },
+        'fixture.absolute-path.v1': {
+          enabled: true,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
+          containmentProfile: 'local-stdio-secret-v1',
+          isolation: { protectedHomePaths: ['/tmp/credential'] },
+        },
+        'fixture.bad-env.v1': {
+          enabled: true,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'env', name: 'BAD-NAME' },
+          containmentProfile: 'local-stdio-secret-v1',
+        },
+        'fixture.unknown-profile.v1': {
+          enabled: true,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
+          containmentProfile: 'operator-composed-profile',
+        },
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().protectedMcpCapabilities).toBeUndefined();
+  });
+
+  it('drops protected MCP capability records whose enabled flag is not boolean', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      protectedMcpCapabilities: {
+        'fixture.string-enabled.v1': {
+          enabled: 'true',
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/string-secret' },
+          isolation: { redactEnv: ['FIXTURE_STRING_SECRET'] },
+          containmentProfile: 'local-stdio-secret-v1',
+        },
+        'fixture.numeric-enabled.v1': {
+          enabled: 1,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/numeric-secret' },
+          isolation: { redactEnv: ['FIXTURE_NUMERIC_SECRET'] },
+          containmentProfile: 'local-stdio-secret-v1',
+        },
+        'fixture.boolean-enabled.v1': {
+          enabled: false,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/boolean-secret' },
+          isolation: { redactEnv: ['FIXTURE_BOOLEAN_SECRET'] },
+          containmentProfile: 'local-stdio-secret-v1',
+        },
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().protectedMcpCapabilities).toEqual({
+      'fixture.boolean-enabled.v1': {
+        enabled: false,
+        allowedPluginIds: ['fixture-plugin'],
+        secret: { source: 'file', path: '.secrets/boolean-secret' },
+        isolation: { redactEnv: ['FIXTURE_BOOLEAN_SECRET'] },
+        containmentProfile: 'local-stdio-secret-v1',
+      },
+    });
+    expect(configuredProtectedMcpEnvKeys()).toEqual([
+      'FIXTURE_STRING_SECRET',
+      'FIXTURE_NUMERIC_SECRET',
+      'FIXTURE_BOOLEAN_SECRET',
+    ]);
+  });
+
+  it('keeps matching protected MCP isolation active while the capability is disabled', () => {
+    const config = {
+      'fixture.secret.v1': {
+        enabled: false,
+        allowedPluginIds: ['fixture-plugin'],
+        secret: { source: 'file' as const, path: '.secrets/mcp-secret' },
+        containmentProfile: 'local-stdio-secret-v1' as const,
+        isolation: {
+          protectedHomePaths: ['.fixture-credential'],
+          redactEnv: ['FIXTURE_TOKEN'],
+        },
+      },
+    };
+
+    expect(protectedMcpIsolationPolicy(['fixture-plugin'], config)).toEqual({
+      protectedHomePaths: ['.secrets/mcp-secret', '.fixture-credential'],
+      redactEnv: ['FIXTURE_TOKEN'],
+    });
+    expect(protectedMcpIsolationPolicy(['other-plugin'], config)).toEqual({
+      protectedHomePaths: ['.secrets/mcp-secret'],
+      redactEnv: [],
+    });
   });
 
   it('rejects an uncoordinated global config write in primary mode', () => {
@@ -542,6 +729,45 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().httpProxy).toBeUndefined();
   });
 
+  it('loads explicit bot scheduling scopes without accepting malformed or ambiguous grants', () => {
+    const grant = { id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target', 'cli_target'],
+      chatIds: ['oc_team'], controllerUnionId: 'on_admin' };
+    writeFileSync(globalConfigPath(), JSON.stringify({ scheduleDelegation: { botGrants: [
+      grant, { ...grant, id: 'bad', controllerUnionId: 'ou_app_scoped' },
+      { ...grant, id: 'duplicate' }, { ...grant, id: 'duplicate' },
+    ] } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().scheduleDelegation?.botGrants).toEqual([{ ...grant, targetAppIds: ['cli_target'] }]);
+    // The Dashboard is told how many hand-edited entries it cannot show.
+    expect(ignoredScheduleBotGrantCount()).toBe(3);
+  });
+  it('writes the Dashboard bot-grant entry without storing defaults or touching other delegation keys', () => {
+    const grant = { id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target', 'cli_target'],
+      chatIds: ['oc_team'], controllerUnionId: 'on_admin' };
+    const disk = () => JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+    writeFileSync(globalConfigPath(), JSON.stringify({ lang: 'zh' }));
+    // Turning things off on a host that never had them leaves the file as it was.
+    writeScheduleBotGrantConfig({ createEnabled: false, selfManageEnabled: false, botGrants: [] });
+    expect(disk()).toEqual({ lang: 'zh' });
+
+    writeScheduleBotGrantConfig({ createEnabled: true, botGrants: [grant] });
+    expect(disk().scheduleDelegation).toEqual({ createEnabled: true,
+      botGrants: [{ ...grant, targetAppIds: ['cli_target'] }] });
+
+    // Hand-edited keys this entry does not own survive every write.
+    writeFileSync(globalConfigPath(), JSON.stringify({ scheduleDelegation: {
+      ...disk().scheduleDelegation, runEnabled: false, runScopes: ['bytedcli'], futureKey: 1 } }));
+    writeScheduleBotGrantConfig({ selfManageEnabled: true });
+    writeScheduleBotGrantConfig({ createEnabled: false, botGrants: [] });
+    expect(disk().scheduleDelegation).toEqual({ selfManageEnabled: true, runEnabled: false,
+      runScopes: ['bytedcli'], futureKey: 1 });
+
+    // Back to every default: the whole block goes.
+    writeFileSync(globalConfigPath(), JSON.stringify({ lang: 'zh', scheduleDelegation: { selfManageEnabled: true } }));
+    writeScheduleBotGrantConfig({ selfManageEnabled: false });
+    expect(disk()).toEqual({ lang: 'zh' });
+    expect(readGlobalConfig().scheduleDelegation).toBeUndefined();
+  });
   it('keeps schedule delegation issuance and execution revocation independent', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       scheduleDelegation: { createEnabled: true, runEnabled: false,
@@ -670,5 +896,85 @@ describe('global sessionCleanup config', () => {
       sessionCleanup: { enabled: 'yes', olderThanHours: 24 },
     }));
     expect(readGlobalConfig().sessionCleanup).toEqual({ olderThanHours: 24 });
+  });
+});
+
+describe('dispatch task-tree card switch (multiTopic.taskTreeCard)', () => {
+  let home: string;
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-global-config-tree-'));
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home);
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(home, 'config.json'));
+    vi.stubEnv('BOTS_CONFIG', join(home, 'bots.json'));
+    vi.stubEnv('BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED', '');
+    mkdirSync(dirname(globalConfigPath()), { recursive: true });
+    invalidateGlobalConfigCache();
+  });
+  afterEach(() => invalidateGlobalConfigCache());
+
+  const writeConfig = (obj: unknown) => { writeFileSync(globalConfigPath(), JSON.stringify(obj)); invalidateGlobalConfigCache(); };
+
+  it('defaults OFF with no config and when the field is absent', () => {
+    expect(isDispatchTaskTreeCardEnabled()).toBe(false);
+    writeConfig({ multiTopic: { enabled: true } });
+    expect(isDispatchTaskTreeCardEnabled()).toBe(false);
+  });
+
+  it('is ON only when multiTopic.taskTreeCard === true', () => {
+    writeConfig({ multiTopic: { enabled: true, taskTreeCard: true } });
+    expect(isDispatchTaskTreeCardEnabled()).toBe(true);
+    writeConfig({ multiTopic: { enabled: true, taskTreeCard: false } });
+    expect(isDispatchTaskTreeCardEnabled()).toBe(false);
+  });
+
+  it('lets the env override win over the saved config', () => {
+    writeConfig({ multiTopic: { enabled: true, taskTreeCard: false } });
+    vi.stubEnv('BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED', 'true');
+    expect(isDispatchTaskTreeCardEnabled()).toBe(true);
+    writeConfig({ multiTopic: { enabled: true, taskTreeCard: true } });
+    vi.stubEnv('BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED', 'false');
+    expect(isDispatchTaskTreeCardEnabled()).toBe(false);
+  });
+
+  it('env override wins even when the global config file is unreadable/absent (file-sandboxed CLI)', () => {
+    // A file-sandboxed CLI cannot read ~/.botmux/config.json (readRawConfig
+    // silently returns {}); the daemon projects the value via env, which the
+    // reader must honour without needing the file.
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(home, 'does-not-exist.json'));
+    invalidateGlobalConfigCache();
+    expect(isDispatchTaskTreeCardEnabled()).toBe(false);
+    vi.stubEnv('BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED', 'true');
+    expect(isDispatchTaskTreeCardEnabled()).toBe(true);
+    vi.stubEnv('BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED', 'false');
+    expect(isDispatchTaskTreeCardEnabled()).toBe(false);
+  });
+
+  it('projects the resolved switches into pane env as strings, resolving the card from the passed env', () => {
+    // No config file: defaults (multiTopic ON, card OFF, workflow OFF).
+    const off = paneSwitchEnv({});
+    expect(off).toEqual({
+      BOTMUX_WORKFLOW_ENABLED: 'false',
+      BOTMUX_MULTI_TOPIC_ENABLED: 'true',
+      BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED: 'false',
+    });
+    // Env override (the value the worker actually passes through) flips only
+    // the card — proving paneSwitchEnv projects a true config/env into 'true'.
+    const on = paneSwitchEnv({ BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED: 'true', BOTMUX_MULTI_TOPIC_ENABLED: 'false' });
+    expect(on).toMatchObject({
+      BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED: 'true',
+      BOTMUX_MULTI_TOPIC_ENABLED: 'false',
+    });
+    // Every value must be a literal 'true'/'false' string for env(1).
+    for (const v of Object.values(paneSwitchEnv({ BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED: '1' }))) {
+      expect(v === 'true' || v === 'false').toBe(true);
+    }
+  });
+
+  it('normalizes the nested field and keeps it when the parent enabled toggle flips', () => {
+    mergeGlobalConfig({ multiTopic: { enabled: true, taskTreeCard: true } });
+    expect(readGlobalConfig().multiTopic).toEqual({ enabled: true, taskTreeCard: true });
+    mergeGlobalConfig({ multiTopic: { enabled: false, taskTreeCard: true } });
+    expect(readGlobalConfig().multiTopic).toEqual({ enabled: false, taskTreeCard: true });
   });
 });

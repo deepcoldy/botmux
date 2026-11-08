@@ -8,7 +8,7 @@
 - 页面放进 Dashboard：`#/board` 是汇总页（待你拍板 / 进行中 / 全部），`#/board/<bot>/<编号>` 是详情页。权限沿用 Dashboard 登录，不另做一套。
 - 每个事项一条链接：PC 用飞书 applink `web_url/open?mode=sidebar-semi` 在右侧栏打开，手机打开原链接。绑了平台的走 m-<machineId> + 飞书 SSO；开源部署走已有的 H5 免登，没配 H5 就是普通 Dashboard 登录。
 - 草稿存在服务端、自动保存、不发出去。点一次「提交」生成一个批次，**马上**送进管家会话：一条消息、一个回合。管家空闲就立刻开始读；正在跑就排在当前回合后面。投递复用定时任务的回合投递路径。
-- 这是通用功能：任何 botmux 用户都能把自己的一个 bot 设成管家，推进自己的开发任务。管家的活来自两处：owner 在管家群里交代的事，和 owner 提交的批次。**定时巡检不在本功能里**，是独立功能，后面单独做；想先用的话，现有定时任务就能配。
+- 这是通用功能：任何 botmux 用户都能把自己的一个 bot 设成管家，推进自己的开发任务。管家的活来自两处：owner 在管家群里交代的事，和 owner 提交的批次。**定时巡检**不新建调度：在管家群建一条普通定时任务叫醒管家，巡检规则写进预置 guide（见第 11 节，2026-11-03 追加）。
 - 管家在 Bot 配置里开，每个 bot 默认关。可配：管家所在群、提示词（预置 + 追加或替换）。预置规则由 `botmux board guide` 按需输出；只在管家群里常驻一行提示（约 50 token），告诉它有看板、规则去哪读。
 - 管家写看板用 `botmux board add/set/history/attach/list/show/pending/guide`。
 
@@ -43,9 +43,16 @@ board_items      事项（主键 app_id + seq；seq 就是 #12）
   recommend, recommend_reason   推荐项和理由
   rev              管家每改一次内容 +1（提交时用来提示「你写完草稿后管家又改过这项」）
   created_at / updated_at / state_at / steward_event_at / owner_seen_at
-board_links      关联对象 (app_id, seq, kind, ref, label, ord)。ord 是事项内写入序号，从 0 起、无空洞：只有新关联
+  primary_chat     主群（oc_…）。指向的群不在关联里时按第一条 chat 关联算；删掉主群那条关联时一并清空
+  no_chat_reason   确实没有群时的原因（--no-chat）；只在没有 chat 关联时生效，挂上群自动清空
+board_links      关联对象 (app_id, seq, kind, ref, label, ord, chat_check, chat_name)。ord 是事项内写入序号，从 0 起、无空洞：只有新关联
                    占号，已有关联只改标签不挪位置；列表按 ord 排（同一毫秒写入时 created_at 打平，不能靠时间）。schema v2
                    kind = pr | issue | chat | thread | session | commit | doc | url
+                   chat_check（仅 chat）= verified 写入时查到了群 | unverified 显式允许未核实 | NULL 核实功能上线前的旧关联
+                   chat_name（仅 chat）= 最近一次核实查到的群名，和管家的 label 分开；展示 label > chat_name > 默认
+                   primary_chat / no_chat_reason / chat_check / chat_name 四列都可空，老库打开时按列存在性补列，不升 schema
+                   版本（旧构建的显式列 INSERT 照常可用，回滚不 fail-closed）；每次打开时清掉回滚期间旧构建留下的
+                   失效主群指定和已有群的无群原因
 board_events     历史，只追加：时间、actor（steward / owner / system，加会话 id 或提交人）、
                    kind（note / state / edit / decision / reply / attach / link / import）、text、data_json
 board_files      附件元数据：sha256、mime、大小、上传方（owner / steward）、所属事项、ord。ord 是看板内（按 app_id，
@@ -61,6 +68,8 @@ board_decisions  批次里每项的决定：选项、文本、附件、提交时
 **状态对应**：旧表格的 11 个状态按下面映射——待你拍板 → decide；待你验收 → accept；在审 / 在修 / 在验证 / 可合 → active，原状态名写进阶段；等作者 / 等外部 → waiting，原状态名写进阶段；已合 / 已完成 → done（「已合」写进阶段）；已关闭 → closed。状态只决定页面分组，具体的流程词放在「阶段」里，botmux 不把 PR 流程写死。
 
 **关联对象怎么显示**：pr / commit 按 GitHub 地址拼链接（不调 GitHub API）；chat 用 `chatAppLink` 打开群；thread 用 `threadAppLink` 打开话题；session 链到 Dashboard 会话页和 Web 终端；其它仓库或系统用 `url=`。
+
+**事项必须关联群（2026-10-28）**：`board add` 新建时必须带 `--link chat=oc_…`，确实没有群写 `--no-chat "<原因>"`；`board set` 不强制，存量不迁移，`list` 标出缺群的项。写 chat 关联前由管家 daemon 用本机 bot 的凭据查 `im/v1/chats/:chat_id`：先管家 bot，查不到再按 bots.json 顺序、分小批并发试其他同 owner、同品牌的 bot（同 owner 沿用同机 Bot 互信的判定，含上位闸：管家关了 `trustSameOwnerBots` 就只用管家自己；单次 5 秒、总共 20 秒上限；一次请求里几个群之间限 2 个并发）。查到的群名单独存，作默认展示，管家的标签优先；都查不到整次写入拒绝，`--allow-unverified-chat` 才写并标 unverified。其他 bot 的客户端只在 daemon 内存里建，不落盘、不进日志。汇总页每行给主群的「进群」按钮，详情页标题下方列全部群，批次的逐项文本带主群链接。
 
 **隔离**：
 - 一个管家 bot 一张看板，按 app_id 隔开。同一台机器上几个 owner 各开自己的管家 bot，就是几张看板，页面上可以切换。
@@ -266,7 +275,7 @@ botmux board show <编号|key> [--json]                           # 全部字段
 botmux board add <标题> [--key K] [--state S] [--stage 阶段] [--kind 类型] [--repo 仓库]
                  [--summary 一句话] [--progress 进展]
                  [--ask 问题 --option "A=做法 → 结果" ... --recommend A --reason 理由]
-                 [--link pr=owner/repo#N | chat=oc_… | thread=om_… | session=<id> | commit=owner/repo@sha | url=…]...
+                 [--link pr=owner/repo#N | chat=oc_… | thread=oc_…/omt_… | session=<id> | commit=owner/repo@sha | url=…]...
                  [--note 一句话]                                 # 同 key 已存在时按 set 更新，并给出提示
 botmux board set <编号|key> [字段同上] [--clear-ask] [--note 一句话]   # 改状态和字段会自动记进历史
                  [--unlink kind=ref]...                          # 删关联；先删后加，--unlink 旧 --link 新 = 替换
@@ -315,10 +324,10 @@ botmux board guide                                               # 打印管家�
 - 飞书侧栏的真机体验要你来看。
 
 **后续**：
-- 定时巡检（独立功能）：按频率叫醒管家，扫 owner 名下未完成的会话和 PR，把要拍板的写进看板。在那之前，可以用现有定时任务手配一条，prompt 里写巡检要求即可，看板这边不用改。
+- ~~定时巡检~~：已做，见第 11 节。
 - 和项目群模式打通：项目主控遇到要 owner 拍板的阻塞时写进管家看板，事项关联到项目群。
 - 管家群里放一张就地更新的「看板摘要卡」（待拍板数 + 打开看板按钮），代替每轮的长汇报。
-- 在卡片上直接点 A/B 写草稿（仍然要点提交）。
+- ~~在卡片上直接点 A/B 写草稿（仍然要点提交）~~：改成点了直接提交，见第 12 节。
 - 待拍板超过 N 小时就私聊或加急提醒（默认关）。
 - 让别的 bot（PR 群里的开发 bot）也能往管家看板报「要拍板」。
 - 关联对象自动刷新状态（PR 合没合、群里最后一条消息）。
@@ -344,3 +353,59 @@ botmux board guide                                               # 打印管家�
 5. **和项目群模式的关系**：A（推荐）分开做，后续让项目主控把要拍板的阻塞写进管家看板；B 把看板做成项目群模式的一部分（每个项目一张），管家就是项目主控。
 
 参考：[飞书开放平台：在飞书内打开网页（web_url/open）](https://open.feishu.cn/document/common-capabilities/applink-protocol/supported-protocol/open-the-web-view-in-feishu-to-access-the-specified-url?lang=zh-CN)
+
+## 11. 定时巡检（2026-11-03 追加）
+
+按频率叫醒管家，扫 owner 名下没完成的事，把要拍板的写进看板。方案讨论见 [issue #2731](https://github.com/deepcoldy/botmux/issues/2731)。
+
+**触发**：复用定时任务，不加调度器、不加 `steward` 字段、不加表。巡检就是建在管家群的一条普通定时任务（`--silent`，没有新情况不发消息），prompt 固定一句「【决策看板 · 巡检】按 botmux board guide 里「定时巡检」一节执行」。owner 在管家群里说要巡检，管家按 guide 用 `botmux schedule add` 建；改频率、暂停、删除走 `botmux schedule` 和 Dashboard 定时任务页。巡检回合和批次落在同一个管家群 chat 级会话，赶上管家在跑就按现有机制排队。
+
+**规则（预置 guide「定时巡检」一节）**，来自手配回扫时踩过的四个坑：
+
+| 坑 | 规则 |
+|---|---|
+| 没有原文链接的事项进了看板 | 原文 = 触发这件事的飞书消息或话题（owner 判断时要看的上下文）。每项带能直接跳过去的定位链接：话题 `thread=oc_…/omt_…`、单条消息 `url=`、botmux 会话 `session=`、PR / issue `pr=` / `issue=`；找不到原文的不写 |
+| 已经办完的又被报出来 | 先收口再发现：没结束的项逐项核对现状；写之前核对，已合 / 已关 / 已定的不写成待拍板 |
+| 同一件事报了两次 | `--key` 与原文来源一一对应、格式固定（`thread:omt_…`、`msg:om_…`、`session:<id>`、`pr:owner/repo#N`、`issue:owner/repo#N`）；只报增量，报过的项记一句历史，已在待拍板、报过、没变化的不再提醒，没报出去的下一轮补报 |
+| 很久以前的旧事被翻出来 | 只看最近 7 天有动静的；更早的、看板上没有的不翻 |
+
+**代码护栏（唯一的行为改动）**：`board add` 命中已有 key、而那一项已结束（done / closed）时拒绝（`item_ended`，409），不改它。原来同 key 的 add 等于 set，巡检误判一次就能把关掉的旧事改回待拍板，靠 prompt 拦不住。重开要显式 `board set`。
+
+**巡检上报命令（复审修正）**：巡检回合是 `--silent` 定时任务在管家群的 chat 级回合，daemon 不发 banner、不播种这一回合的 reply-target，CLI 侧没有「触发消息发送者」，`botmux send --mention-back` 会被 @ 决策门禁拒绝（exit 2）。所以 guide 里巡检的汇总上报固定写 `botmux send --attention=decision --no-mention "…"`：消息照常发到管家群，`--attention=decision` 把会话举进 dashboard「需要你」列；确实要飞书里 @ owner 时显式写 `--mention <owner 的 open_id>`。「要 owner 拍板」一节保留 `--mention-back`，那一节发生在真人回合，有触发消息发送者。
+
+botmux 本身仍不调 GitHub API，PR 由管家用仓库自己的工具（如 gh）查。
+
+## 12. 飞书卡片拍板（2026-11-06 追加）
+
+owner 不打开看板也能拍板：事项进入待拍板（或改了问题 / 选项 / 推荐）时，daemon 往管家群发这一项的拍板卡片，点选项直接提交。
+
+**发卡与更新**（`src/core/decision-board/card.ts`）：
+
+- 卡片内容只由看板数据推导（纯函数 `buildDecisionCard`）；`board_cards` 表按事项记消息 id 和内容指纹，一项只留一张卡。
+- 触发点：`board add / set` 之后、批次提交与投递状态变化之后（含 worker 失败回执）、`history --handled` 之后。还没有卡片时，只在「刚进入待拍板或待拍板内容变了」时发；已有卡片的，内容指纹变了就原地 PATCH，没变不 PATCH。同一项的同步串行，连续 set 不会发出两张卡。
+- 发新卡前先落一行占位（消息 id 为空），发成功再写上；发送失败或进程死在中间时占位留着，下一次同步或 daemon 启动时的对账补发，补发沿用同一个飞书去重键（uuid），上次其实已发出时不会出第二张。
+- PATCH 失败：卡已失效（撤回、超过编辑期限、话题被封）且仍在待拍板时另发一张顶替；其它失败按 30s / 2min / 10min 退避重试，用完等下次写入或启动对账。卡片失败不影响看板写入。
+- 关了开关（或管家）：不发新卡，已发的卡收成只有链接；点了不写入。管家群换了：重新待拍板时在新群发，旧群那张收成「已移到新群」；点被顶替的旧卡不写入，也不换回能点的卡。
+- 降级（只给现状和链接，没有按钮）：不在待拍板（含关闭、完成）、选项超过 `DECISION_CARD_MAX_OPTIONS`（6）、整卡超过 24KB。
+
+**点击**（`DecisionBoardService.cardClick`，回调前缀 `board_card_`，在 session 查找和 canOperate 门之前分发）：
+
+- 只认管家 bot 的 owner（`getOwnerOpenId`，与过载告警卡同口径），身份取飞书事件里的 operator，不取按钮 value；别人点给无权限提示，不写任何东西。
+- 按钮带「问题 + 选项 + 推荐」的指纹，和当前内容对不上就拒绝并换上最新卡片；状态与指纹在写锁里再核一次。
+- 写入是一个只含这一项的批次（`board_batches.source = 'card'`），不经草稿、不动网页上的草稿；之后的投递与网页提交是同一条 `deliverBatch` 路径（发件箱、补投、失败回执、同 turnId 重投都一样）。投递放在回调应答之后（`afterAck`），卡片先显示「正在交给管家」，送达 / 失败后由同步刷新。
+- 同一选择和说明连点或重试不建第二个批次；那一批投递失败时顺带重投一次。
+
+**冲突：以后提交的为准**（`board_decisions.superseded_by`）：
+
+- 新决定写入时，同一项较早、还没执行的决定记 `superseded_by`，条件是两者至少一方来自卡片；网页上连续提交的几批仍逐批执行（老行为不变）。网页草稿选的选项已不在、或事项已不在待拍板时不覆盖。
+- 较早那批还没送到管家（pending / failed）：同时记 `handled_at` 作废，不再算 pending，`--handled` 不会落到它头上；新批次写「覆盖：… 作废」，它若之后才被投递，消息里写「已被覆盖，不用执行」。旧构建也认 `handled_at`，回滚不会让它复活。
+- 已经送到或正在送（dispatched / delivered）：管家可能已在执行，不替它作废，仍按批次顺序待执行；新批次写「覆盖：… 已送到你这里、还没标执行」，管家先按实际情况 `--handled` 那一条再执行新的。`--handled` 始终落在最早的未执行决定上，账本与管家实际做的事一致。
+- 批次按编号顺序串行投递，覆盖标记在投递前读，较早的一批不会晚于覆盖它的那批进管家会话。
+- 决定记下当时「问题 + 选项 + 推荐」的指纹（`board_decisions.ask_key`）：之后选项改过，卡片只写「已选 A（之后选项改过）」，再点同一个键算新决定。
+- 时间线记一条系统历史；卡片上写明覆盖关系。
+
+**开关**：`steward.decisionCards`，默认开、只在关掉时写 `false`，Dashboard「Bot 配置 → 管家」可改。只对管家可用（开了管家、选了管家群）的 bot 生效，其它群行为不变。
+
+**存储**：`board_batches.source`、`board_decisions.superseded_by` / `ask_key` 三个可空列按列存在性补，`board_cards` 用 `CREATE TABLE IF NOT EXISTS`，不升版本号；回滚到旧构建时看板照常打开（旧构建不认这几列；已作废的决定靠 `handled_at` 仍算已处理）。
+
+**给管家的文本**：只改 `botmux board guide` 的「要 owner 拍板」「执行一批决定」两节各加一条（卡片会自动发、别再自己发带选项的卡片；覆盖标记怎么处理），常驻提示不变。

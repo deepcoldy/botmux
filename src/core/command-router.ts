@@ -39,7 +39,7 @@ export interface SlashCommandInvocation {
  *  are intentionally left for the CLI instead of being intercepted by the
  *  daemon; otherwise discussion text such as `/adopt <pane>` can accidentally
  *  trigger real daemon actions. */
-export function parseSlashCommandInvocation(content: string): SlashCommandInvocation | null {
+export function parseSlashCommandInvocation(content: string, cliId?: string): SlashCommandInvocation | null {
   // trim BOTH ends: a trailing newline/space rides into the returned `content`
   // and, for a passthrough command relayed verbatim to the CLI (raw_input), gets
   // typed as a literal trailing newline — which breaks the CLI's slash-command
@@ -55,15 +55,19 @@ export function parseSlashCommandInvocation(content: string): SlashCommandInvoca
   if (!cmd) return null;
 
   // Explicit payload commands keep their entire body, including examples.
-  const literalBody = commandSpec(cmd)?.literalBody === true;
+  const spec = commandSpec(cmd);
+  const cliPayload = !!spec?.cliId && commandCliIdMatches(spec.cliId, cliId) && spec.multiline === true
+    && /^\/effort\s+(?:low|medium|high|xhigh|max|ultra)(?:\s|$)/i.test(trimmed);
+  const literalBody = spec?.literalBody === true && (!spec.cliId || cliPayload);
   // Treat angle-bracket placeholders as documentation, not an invocation.
-  if (!literalBody && /<[^>\r\n]+>/.test(firstLine)) return null;
+  const invocationPrefix = cliPayload ? firstLine.split(/\s+/).slice(0, 2).join(' ') : firstLine;
+  if ((!literalBody || cliPayload) && /<[^>\r\n]+>/.test(invocationPrefix)) return null;
 
   const restNonBlank = lines.slice(1).map(l => l.trim()).filter(Boolean);
   if (restNonBlank.length > 0) {
     // A list of slash commands is almost certainly discussion / planning text.
     if (!literalBody && restNonBlank.some(l => l.startsWith('/'))) return null;
-    if (!MULTILINE_COMMANDS.has(cmd)) return null;
+    if (!MULTILINE_COMMANDS.has(cmd) && !cliPayload) return null;
   }
 
   return { cmd, content: trimmed };
@@ -178,7 +182,7 @@ export function classifySlash(input: SlashRouteInput): SlashRouteDecision {
   }
 
   // ② parse：不以 `/` 开头是"没有命令"；占位符/多行是"讨论文本"。
-  const invocation = parseSlashCommandInvocation(input.text);
+  const invocation = parseSlashCommandInvocation(input.text, input.cliId);
   if (!invocation) {
     if (!input.text.trim().startsWith('/')) return { kind: 'forward', reason: 'no_slash' };
     // 多行被今天的解析器判成"讨论文本"的，只在「thread + 活 worker + 无附件」下再试一次

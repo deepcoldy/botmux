@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import {
   chmodSync,
   copyFileSync,
@@ -15,12 +15,17 @@ import { createServer as createHttpServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { tsRunnerPrefix } from './helpers/ts-runner.js';
+import { resolveBunExecutable, resolveNodeExecutable, tsRunnerPrefix } from './helpers/ts-runner.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { captureAttachedCodexAppProcessIdentity, codexAppEngineHasExited, verifyCodexAppProcessIdentity } from '../src/services/codex-app-process-attestation.js';
+import { parseCodexAppEngineIdentityClaim, verifyCodexAppEngineIdentity } from '../src/services/codex-app-engine-identity.js';
+import { readProcessStartIdentity } from '../src/core/session-marker.js';
+import { applyTrustedCodexAppStateMarker, CodexAppReadyAuthority, CodexAppTurnLiveness } from '../src/utils/codex-app-turn-liveness.js';
 import { encodeRunnerInput } from '../src/adapters/cli/runner-input.js';
 import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from '../src/services/codex-app-runner-protocol.js';
 import { parseAskBody, registerAskForResponse } from '../src/core/ask-api.js';
 import { _resetForTest as resetAskBroker, setCardDispatcher, setCanTalkChecker, submitAsk, submitCustomReply } from '../src/core/ask-broker.js';
-import { deliverCodexAsyncAnswer } from '../src/services/codex-async-user-input.js';
+import { deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable } from '../src/services/codex-async-user-input.js';
 import type { PendingAsk } from '../src/core/ask-types.js';
 import {
   CodexAppControlFinalAssembler,
@@ -103,6 +108,7 @@ class ControlCollector {
     private readonly disconnectOnFirstFinalChunk = false,
     private readonly omitFirstFinalChunk = false,
     private readonly disconnectAfterFirstFinalEndBeforeAck = false,
+    private readonly applyState?: (payload: Record<string, any>, control: { generation: string; seq: number }) => Promise<boolean>,
   ) {
     this.socketDirectory = mkdtempSync('/tmp/bca-sock-');
     this.socketPath = codexAppControlSocketPath(this.socketDirectory, SESSION_ID);
@@ -112,6 +118,8 @@ class ControlCollector {
     this.server = createServer(socket => this.accept(socket));
     liveCollectors.add(this);
   }
+
+  get committedThrough(): number { return this.lastSeq; }
 
   listen(): Promise<void> {
     return new Promise((resolvePromise, rejectPromise) => {
@@ -160,7 +168,8 @@ class ControlCollector {
     const finalAssembler = new CodexAppControlFinalAssembler();
     const challenge = generateCodexAppControlChallenge();
     let authenticated = false;
-    socket.on('data', chunk => {
+    let processing = Promise.resolve();
+    socket.on('data', chunk => { processing = processing.then(async () => {
       const decoded = decoder.push(chunk);
       if (decoded.droppedMalformed) socket.destroy();
       for (const line of decoded.lines) {
@@ -212,6 +221,11 @@ class ControlCollector {
           )}\n`);
           continue;
         }
+        if (record.kind === 'state' && this.applyState
+            && !await this.applyState(record.payload, { generation: record.generation, seq: record.seq })) {
+          socket.destroy();
+          return;
+        }
         this.markers.push({ kind: record.kind, payload: record.payload });
         if (record.kind === 'final-chunk'
             && this.disconnectOnFirstFinalChunk
@@ -254,7 +268,7 @@ class ControlCollector {
           record.seq,
         )}\n`);
       }
-    });
+    }).catch(() => socket.destroy()); });
     socket.on('error', () => undefined);
     socket.on('close', () => this.sockets.delete(socket));
     socket.write(`${encodeCodexAppControlChallenge(SESSION_ID, challenge)}\n`);
@@ -567,7 +581,7 @@ function readRequests(logPath: string): Array<Record<string, any>> {
 
 async function exerciseRunner(opts: {
   version: string;
-  behavior?: 'success' | 'capability-error' | 'generic-error' | 'osc-injection' | 'empty-final' | 'start-response-last';
+  behavior?: 'success' | 'capability-error' | 'generic-error' | 'capacity-error' | 'failed-no-error' | 'osc-injection' | 'empty-final' | 'start-response-last';
   includeMissingImage?: boolean;
   includeSidecar?: boolean;
   turnCount?: number;
@@ -666,7 +680,117 @@ afterEach(async () => {
 // not a mask: a real regression fails all three attempts deterministically.
 // Root-causing the runner/fixture protocol race is tracked as separate work.
 describe('codex-app-runner app-server protocol integration', { timeout: 120_000, retry: 2 }, () => {
-  it.each(['selected', 'text', 'duplicate', 'early', 'malformed', 'foreign', 'interrupted', 'exit', 'workflow', 'timedOut', 'refused', 'no-start', 'limit', 'corrected', 'overlap'] as const)(
+  it('publishes capacity failure as a signed structured terminal rather than a successful reply', async () => {
+    const result = await exerciseRunner({ version: '0.162.1', behavior: 'capacity-error' });
+    expect(result.final.errorCode).toBe('codex_capacity_exceeded');
+    expect(result.final.replyTurnId).toBe('om_integration_123');
+    expect(result.final.content).toContain('Selected model is at capacity');
+    expect(result.finals).toHaveLength(1);
+  });
+  it('settles a native failed terminal without an error object as a generic failure instead of crashing', async () => {
+    // Protocol variant: turn/completed status:'failed' with NO error key.
+    // JSON.stringify(undefined) returns undefined (not the string), so the
+    // classifier must not descend into toLowerCase — that TypeError was
+    // uncaught and killed the whole runner (exit 1, zero finals). It must settle
+    // as the generic code, survive, and still emit exactly one real final.
+    const result = await exerciseRunner({ version: '0.162.1', behavior: 'failed-no-error' });
+    expect(result.final.errorCode).toBe('codex_app_turn_failed');
+    expect(result.final.replyTurnId).toBe('om_integration_123');
+    expect(result.finals).toHaveLength(1);
+  });
+  it.each(['steer-capacity', 'steer-capacity-history'] as const)(
+    'carries the structured capacity code only on the steered group REAL final: %s', async behavior => {
+      // REGRESSION: a native capacity failure terminating a STEERED group settles
+      // through settleSteeredCompletion (canonical id) or
+      // reconcileSteeredGroupFromHistory (non-canonical id, history match). Both
+      // group paths must classify the terminal like the single-turn path.
+      // Without turn.failureCode there, the real final carries no errorCode: the
+      // worker omits turnFailed and the whole group — including parked HTTP steer
+      // members — settles as completed despite the failure text.
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-steer-capacity-'));
+      const fakeCodex = join(dir, 'fake-codex');
+      const logPath = join(dir, 'requests.jsonl');
+      copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+      chmodSync(fakeCodex, 0o755);
+      const control = new ControlCollector(dir);
+      await control.listen();
+      const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', behavior, control.bootstrap.path);
+      const send = (text: string, replyTurnId: string) => {
+        harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+          `legacy:${text}`,
+          { text, clientUserMessageId: replyTurnId },
+          replyTurnId,
+          true,
+        )}\r`);
+      };
+      try {
+        await waitFor(harness, () => control.states.some(state => state.busy === false));
+        send('root', 'om_sc_root');
+        await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+        send('follow', 'om_sc_follow');
+        await waitFor(harness, () => control.finals.length === 2
+          && control.states.filter(state => state.busy === false).length >= 2);
+        expect(control.finals).toEqual([
+          expect.objectContaining({ turnId: 'om_sc_root', content: '', disposition: 'steer_superseded' }),
+          expect.objectContaining({
+            turnId: 'om_sc_follow',
+            content: expect.stringContaining('Selected model is at capacity'),
+            errorCode: 'codex_capacity_exceeded',
+          }),
+        ]);
+        // The superseded member carries no failure code and the real final no
+        // supersede disposition.
+        expect(control.finals[0]).not.toHaveProperty('errorCode');
+        expect(control.finals[1]).not.toHaveProperty('disposition');
+      } finally {
+        await stopChild(harness.child);
+        await control.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  it('settles a steered group whose real native failure has no error object without crashing', async () => {
+    // Same crash class as the single-turn path, reached through
+    // settleSteeredCompletion on a steered group: turn/completed is
+    // status:'failed' with no error key. The group must still expand into its
+    // superseded member + one real final carrying the GENERIC failure code, and
+    // the runner must stay alive (the wait predicate's early-exit guard fails
+    // the test on exit 1).
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-steer-noerr-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'steer-failed-no-error', control.bootstrap.path);
+    const send = (text: string, replyTurnId: string) => {
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(
+        `legacy:${text}`,
+        { text, clientUserMessageId: replyTurnId },
+        replyTurnId,
+        true,
+      )}\r`);
+    };
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      send('root', 'om_ne_root');
+      await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
+      send('follow', 'om_ne_follow');
+      await waitFor(harness, () => control.finals.length === 2
+        && control.states.filter(state => state.busy === false).length >= 2);
+      expect(control.finals).toEqual([
+        expect.objectContaining({ turnId: 'om_ne_root', content: '', disposition: 'steer_superseded' }),
+        expect.objectContaining({ turnId: 'om_ne_follow', errorCode: 'codex_app_turn_failed' }),
+      ]);
+      expect(harness.child.exitCode).toBeNull();
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['selected', 'text', 'duplicate', 'early', 'malformed', 'foreign', 'interrupted', 'exit', 'workflow', 'timedOut', 'refused', 'no-start', 'limit', 'corrected', 'overlap', 'live-steer'] as const)(
     'bridges async questions without blocking the turn, through the real broker: %s', async outcome => {
       resetAskBroker();
       setCanTalkChecker(() => true);
@@ -679,6 +803,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       setCardDispatcher({ send: async ask => { cards.push(ask); return { messageId: 'om_async_card' }; } });
       const posts: any[] = [];
       const deliveries: string[] = [];
+      const answerTurnId = outcome === 'live-steer' ? 'codex-async-answer-live' : 'async-answer-turn';
       let responseClosed = false;
       let routeError: unknown;
       let harness!: Harness;
@@ -700,8 +825,11 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
               isCurrent: () => harness.child.exitCode === null,
               deliver: async text => {
                 deliveries.push(text);
+                const target = codexAsyncAnswerSteerTarget(input.asyncUserInput!, {
+                  answerer: 'ou_owner', originalAnswerer: 'ou_owner', human: true, managedLark: true, cleanInputAccepted: true,
+                });
                 harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(text,
-                  { text, clientUserMessageId: 'async-answer-turn' }, 'async-answer-turn')}\r`);
+                  { text, clientUserMessageId: answerTurnId, ...(target ? { steerTargetTurnId: target } : {}) }, answerTurnId, !!target)}\r`);
                 return true;
               },
             });
@@ -721,7 +849,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       });
       try {
         await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
-        harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('Ask and continue', undefined, 'om_async_input')}\r`);
+        harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('Ask and continue', outcome === 'live-steer' ? { text: 'Ask and continue', clientUserMessageId: 'om_async_input' } : undefined, 'om_async_input', outcome === 'live-steer')}\r`);
         if (outcome === 'limit') {
           await waitFor(harness, () => posts.some(p => p.asyncFailure === 'limit') && control.finals.length > 0);
           expect(cards).toHaveLength(32);
@@ -753,8 +881,13 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
           } else {
             // The model finishes independent work BEFORE the user answers;
             // the question remains live and did not leak into the final.
-            await waitFor(harness, () => control.finals.length > 0);
-            if (outcome === 'overlap') {
+            if (outcome === 'live-steer') {
+              expect(control.finals).toHaveLength(0);
+              expect(posts[0].asyncUserInput.nativeTurnId).toBe('turn-fake-1');
+            } else await waitFor(harness, () => control.finals.length > 0);
+            if (outcome === 'live-steer') {
+              // The fixture cannot finish until the answer enters turn/steer.
+            } else if (outcome === 'overlap') {
               expect(control.finals[0].content).toBe('Example: Which environment?\nPPE (Recommended) / Production END EXAMPLE\nIndependent work completed');
               // The final came over the control socket; stdout has its own pipe.
               await waitFor(harness, () => harness.stdout.includes('END EXAMPLE'));
@@ -774,6 +907,17 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
             await waitFor(harness, () => control.finals.length >= 2);
             expect(deliveries).toHaveLength(1); expect(posts.filter(p => !p.asyncFailure)).toHaveLength(1);
             const starts = readRequests(logPath).filter(r => r.method === 'turn/start');
+            if (outcome === 'live-steer') {
+              expect(starts).toHaveLength(1);
+              const steer = readRequests(logPath).filter(r => r.method === 'turn/steer');
+              expect(steer).toHaveLength(1);
+              expect(steer[0].params.expectedTurnId).toBe('turn-fake-1');
+              expect(steer[0].params.input[0].text).toContain('call_async_question');
+              expect(steer[0].params.steerTargetTurnId).toBeUndefined();
+              expect(control.finals[0].disposition).toBe('steer_superseded');
+              expect(control.finals[1].content).toBe('Answer incorporated before task finished');
+              expect(control.finals[1].replyTurnId).toBe(answerTurnId);
+            } else {
             expect(starts).toHaveLength(2);
             expect(starts[1].params.threadId).toBe(starts[0].params.threadId);
             expect(starts[1].params.clientUserMessageId).toBe('async-answer-turn');
@@ -782,6 +926,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
             expect(reply).toContain('call_async_question');
             expect(reply).toContain(outcome === 'selected' ? 'Production' : 'Use PPE and Elia');
             expect(control.finals[1].replyTurnId ?? control.finals[1].turnId).toBe('async-answer-turn');
+            }
           }
         }
         expect(routeError).toBeUndefined();
@@ -793,7 +938,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     },
   );
 
-  it.each(['selected', 'string', 'custom', 'text', 'timedOut', 'refused', 'interrupt-error', 'cancelled', 'exit', 'unsupported', 'workflow'] as const)(
+  it.each(['selected', 'string', 'custom', 'text', 'timedOut', 'refused', 'interrupt-error', 'cancelled', 'cancelled-nested', 'exit', 'unsupported', 'workflow'] as const)(
     'bridges native user input through the real runner/IPC exchange: %s', async outcome => {
       const dir = mkdtempSync(join(tmpdir(), 'botmux-native-user-input-'));
       const fakeCodex = join(dir, 'fake-codex');
@@ -825,7 +970,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         sessionId: SESSION_ID, capability: 'a'.repeat(64), turnId: 'om_native_input', dispatchAttempt: 1, ipcPort: port,
       }), { mode: 0o600 });
       const requestId = outcome === 'string' ? 'native-question-1' : 9201;
-      const behavior = ['cancelled', 'exit', 'unsupported', 'text', 'string', 'interrupt-error'].includes(outcome) ? `user-input-${outcome}` : 'user-input';
+      const behavior = ['cancelled', 'cancelled-nested', 'exit', 'unsupported', 'text', 'string', 'interrupt-error'].includes(outcome) ? `user-input-${outcome}` : 'user-input';
       const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', behavior, control.bootstrap.path, {
         env: { BOTMUX_SEND_RELAY: dir, BOTMUX_ORIGIN_CHANNEL_ID: '', SESSION_DATA_DIR: dir,
           BOTMUX_LARK_APP_ID: 'app-test', BOTMUX_CHAT_ID: 'oc_test', BOTMUX_ROOT_MESSAGE_ID: 'om_test',
@@ -844,7 +989,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
           expect(posts[0]).toMatchObject({ sessionId: SESSION_ID, originCapability: 'a'.repeat(64), originTurnId: 'om_native_input',
             questions: [{ prompt: expect.stringContaining('Test first') }, { prompt: expect.stringContaining('Choose channel') }] });
           expect(readRequests(logPath).some(r => r.id === requestId && r.result !== undefined)).toBe(false);
-          if (outcome === 'cancelled' || outcome === 'exit') {
+          if (outcome === 'cancelled' || outcome === 'cancelled-nested' || outcome === 'exit') {
             await waitFor(harness, () => closed);
             // A late result cannot revive or reply to the completed/dead turn.
             respond({ kind: 'answered', answers: [['Production'], ['Lark']], comment: null });
@@ -884,6 +1029,49 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       }
     },
   );
+
+  it('keeps the no-progress window fed while a native question waits for the human', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-native-user-input-wait-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex); chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir); await control.listen();
+    let postedAtMs = 0;
+    let respond: ((result: unknown) => void) | undefined;
+    const http = createHttpServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        if (req.url !== '/api/asks') { res.writeHead(400).end(); return; }
+        postedAtMs = Date.now();
+        respond = result => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(result)); };
+      });
+    });
+    await new Promise<void>(resolve => http.listen(0, '127.0.0.1', resolve));
+    const port = (http.address() as { port: number }).port;
+    writeFileSync(join(dir, '.botmux-origin-capability.json'), JSON.stringify({
+      sessionId: SESSION_ID, capability: 'a'.repeat(64), turnId: 'om_native_wait', dispatchAttempt: 1, ipcPort: port,
+    }), { mode: 0o600 });
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'user-input', control.bootstrap.path, {
+      env: { BOTMUX_SEND_RELAY: dir, BOTMUX_ORIGIN_CHANNEL_ID: '', SESSION_DATA_DIR: dir,
+        BOTMUX_LARK_APP_ID: 'app-test', BOTMUX_CHAT_ID: 'oc_test', BOTMUX_ROOT_MESSAGE_ID: 'om_test' },
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('Ask me', undefined, 'om_native_wait')}\r`);
+      await waitFor(harness, () => respond !== undefined);
+      // app-server emits nothing while the question is open; any later progress
+      // marker can only come from the runner's wait heartbeat.
+      await waitFor(harness, () => control.activities.some(
+        activity => activity.phase === 'progress' && activity.atMs - postedAtMs >= 2_000,
+      ), 20_000);
+      respond!({ kind: 'answered', answers: [['Production'], ['Lark']], comment: null });
+      await waitFor(harness, () => control.finals.length > 0);
+    } finally {
+      await stopChild(harness.child); await control.close();
+      http.closeAllConnections(); await new Promise<void>(resolve => http.close(() => resolve()));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it('refuses to start without a worker-established control bootstrap', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-runner-no-key-'));
@@ -1318,7 +1506,11 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
-  it('does NOT steer a non-steerable input into an autonomous Goal; it waits and starts its own turn after the Goal completes (B3 gate)', async () => {
+  it.each([
+    { label: 'ordinary serial', id: 'om_b3_serial', steerable: false, target: undefined },
+    { label: 'late async answer', id: 'codex-async-answer-late', steerable: true, target: 'turn-fake-1' },
+    { label: 'async answer without metadata', id: 'codex-async-answer-missing', steerable: true, target: undefined },
+  ])('does NOT steer an unrelated input into an autonomous Goal: $label (B3 gate)', async entry => {
     // B3: only a daemon-authorized (codexAppSteerable) input may steer into an
     // active autonomous Goal continuation. A missing/false-flag input (a special
     // sink — HTTP wait / doc-comment / receiver — or any non-plain-interactive
@@ -1345,8 +1537,9 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
 
       // A NON-steerable follow-up arrives while the Goal is native-busy (no flag).
       harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('serial follow', {
-        text: 'serial follow', clientUserMessageId: 'om_b3_serial',
-      })}\r`);
+        text: 'serial follow', clientUserMessageId: entry.id,
+        ...(entry.target ? { steerTargetTurnId: entry.target } : {}),
+      }, entry.id, entry.steerable)}\r`);
 
       // /queue admissions omit the same positive flag. Two inputs must keep
       // their own turns and FIFO order, rather than merge into the active Goal.
@@ -1365,13 +1558,13 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       const starts = requests.filter(r => r.method === 'turn/start');
       expect(starts).toHaveLength(3);
       expect(starts[1].params).toMatchObject({
-        clientUserMessageId: 'om_b3_serial',
+        clientUserMessageId: entry.id,
         input: [{ type: 'text', text: 'serial follow', text_elements: [] }],
       });
       expect(starts[2].params.clientUserMessageId).toBe('om_b3_serial_2');
       expect(control.finals[2]).toMatchObject({ turnId: 'om_b3_serial_2' });
       // The follow-up's final is its own answer, not the Goal's autonomous text.
-      expect(control.finals[1]).toMatchObject({ turnId: 'om_b3_serial' });
+      expect(control.finals[1]).toMatchObject({ turnId: entry.id });
       expect(control.finals[1].content).not.toContain('autonomous goal text before Lark input');
     } finally {
       await stopChild(harness.child);
@@ -1380,7 +1573,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
-  it('steers a follow-up into a start turn proven by an exact turn/started BEFORE the start response returns (B1 start-response-last)', async () => {
+  it.each(['om_sr_root', 'codex-async-answer-legacy'])('steers a human follow-up into %s before the start response returns', async rootTurnId => {
     // B1: the app-server may publish an exact-client `turn/started` before it
     // replies to `turn/start`. That exact match proves the canonical native id,
     // so a follow-up must be able to steer into the SAME turn during the pending
@@ -1404,7 +1597,9 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         `legacy:${text}`,
         { text, clientUserMessageId: replyTurnId },
         replyTurnId,
-        true,
+        replyTurnId === rootTurnId && rootTurnId.startsWith('codex-async-answer-')
+          ? codexAsyncAnswerSteerable({ answerer: 'ou_owner', originalAnswerer: 'ou_owner',
+            human: true, managedLark: true, cleanInputAccepted: true }) : true,
       );
       harness.child.stdin.write(`${CONTROL_PREFIX}${encoded}\r`);
     };
@@ -1414,7 +1609,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       // Root: turn/started (exact clientId) arrives ~immediately; the start
       // response is delayed 120ms. Wait until the runner logged the turn/start
       // request so the follow-up races the pending response.
-      send('root', 'om_sr_root');
+      send('root', rootTurnId);
       await waitFor(harness, () => readRequests(logPath).some(r => r.method === 'turn/start'));
       // Follow-up arrives while the root start response is STILL pending.
       send('follow', 'om_sr_follow');
@@ -1433,7 +1628,7 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
         clientUserMessageId: 'om_sr_follow',
       });
       expect(control.finals).toEqual([
-        expect.objectContaining({ turnId: 'om_sr_root', content: '', disposition: 'steer_superseded' }),
+        expect.objectContaining({ turnId: rootTurnId, content: '', disposition: 'steer_superseded' }),
         expect.objectContaining({ turnId: 'om_sr_follow', content: 'fake answer 1' }),
       ]);
       // steer lifecycle emitted for the follow-up.
@@ -1907,6 +2102,261 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
+  it.skipIf(process.platform !== 'linux' || !resolveBunExecutable() || !resolveNodeExecutable())
+    .each(['native', 'node-launcher'] as const)('registers native engines across idle recovery on the authenticated worker path: %s', async launchMode => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-native-engine-recovery-'));
+    const fakeCodex = join(dir, 'codex');
+    const logPath = join(dir, 'requests.jsonl');
+    const pidPath = join(dir, 'app-server.pid');
+    const launcherPidPath = join(dir, 'launcher.pid');
+    const finishGate = join(dir, 'finish-gate');
+    writeFileSync(finishGate, 'ready');
+    // A Node script cannot reach process attestation (/proc/exe is node).
+    // Compile to an actual codex executable; do not mock the kernel proof.
+    const build = spawnSync(resolveBunExecutable()!, ['build', '--compile', FAKE_SERVER_FIXTURE, '--outfile', fakeCodex],
+      { encoding: 'utf8', timeout: 60_000 });
+    expect(build.status, build.stderr).toBe(0);
+    let codexBin = fakeCodex;
+    if (launchMode === 'node-launcher') {
+      codexBin = join(dir, 'codex-launcher.mjs');
+      // Reproduce the npm CLI: a persistent Node launcher inherits the RPC
+      // pipes and spawns the native codex server. Keep both processes real.
+      writeFileSync(codexBin, `#!${resolveNodeExecutable()}\n`
+        + `import { spawn } from 'node:child_process';\n`
+        + `import { writeFileSync } from 'node:fs';\n`
+        + `writeFileSync(process.env.FAKE_CODEX_LAUNCHER_PID_PATH, String(process.pid));\n`
+        // Keep the launcher alive across an idle-settle timer before the
+        // native server exists, including after idle engine recovery.
+        + `await new Promise(resolve => setTimeout(resolve, Number(process.env.FAKE_CODEX_LAUNCH_DELAY_MS ?? '100')));\n`
+        + `const child = spawn(${JSON.stringify(fakeCodex)}, process.argv.slice(2), { stdio: 'inherit' });\n`
+        + `for (const signal of ['SIGTERM', 'SIGINT', 'SIGHUP']) process.on(signal, () => child.kill(signal));\n`
+        // A real launcher exits some time after its native child: Node first
+        // reaps the child, then tears itself down. Make that gap fixed and
+        // visible, so an input sent inside it fails every run, not under load.
+        + `child.on('exit', code => setTimeout(() => process.exit(code ?? 1), Number(process.env.FAKE_CODEX_LAUNCHER_EXIT_DELAY_MS ?? '0')));\n`);
+      chmodSync(codexBin, 0o755);
+    }
+    const published: any[] = [];
+    const rejected: string[] = [];
+    const tracker = new CodexAppTurnLiveness();
+    const authority = new CodexAppReadyAuthority();
+    let harness: Harness | undefined;
+    const scope: Record<string, any> = {
+      lastInitConfig: { cliId: 'codex-app', sessionId: SESSION_ID, larkAppId: 'cli_test' },
+      isCodexAppCliId: (id: string) => id === 'codex-app',
+      backend: { getChildPid: () => harness?.child.pid },
+      codexAppRunnerProcessIdentity: undefined,
+      captureAttachedCodexAppProcessIdentity, codexAppEngineHasExited, verifyCodexAppProcessIdentity,
+      parseCodexAppEngineIdentityClaim, verifyCodexAppEngineIdentity, readProcessStartIdentity,
+      // handleTrustedCodexAppMarker's "runner dropped its attested engine" branch
+      // clears the frozen engine identity through this worker global. It must be
+      // provided: without it that branch threw a TypeError, which destroyed the
+      // control connection and turned the drop into an endless reconnect loop.
+      clearCodexAppEngineIdentity: () => {
+        if (!scope.codexAppEngineIdentity) return;
+        scope.codexAppEngineIdentity = undefined;
+        scope.publishLocalProcessAttestation();
+      },
+      // Engine attestations and runner-only republications are both real, but
+      // they answer different questions. Keeping them distinguishable lets the
+      // assertions below count ENGINES; conflating them made the count depend on
+      // whether the post-SIGTERM state raced ahead of the engine's observed exit
+      // (3 vs 2 entries for the same behaviour).
+      publishLocalProcessAttestation: () => published.push(scope.codexAppEngineIdentity
+        ? { enginePid: scope.codexAppEngineIdentity.pid, engineProcStart: scope.codexAppEngineIdentity.procStart }
+        : { runner: scope.codexAppRunnerProcessIdentity }),
+      rejectCodexAppControlMarker: (reason: string) => rejected.push(reason),
+      // Fail-closed paths must show up here, not as a TypeError that the
+      // collector turns into a silent reconnect loop.
+      failCodexAppControlGeneration: (reason: string) => rejected.push(`fail-closed: ${reason}`),
+      codexAppSignedStateReadiness: (payload: any) => payload.acceptingInput ? 'ready' : 'waiting',
+      applyTrustedCodexAppStateMarker, codexAppTurnLiveness: tracker, codexAppReadyAuthority: authority,
+      codexAppProofDeadline: { clear() {} }, cleanupCodexAppControlBootstrap() {},
+      awaitingFirstPrompt: false, idleDetector: { reset() {} }, queueMicrotask() {},
+      codexAppCompletionAwaitingFinal: false, codexAppTurnDispatchQueue: { recoveredPrefix: () => [] },
+      currentBotmuxTurnId: undefined,
+      codexAppGenerationCommits: [], codexAppRecoveredDispatches: [],
+      adoptInitialActiveTurn: (entry: any) => { scope.currentBotmuxTurnId = entry.turnId; scope.restored = entry; },
+      publishSandboxRelayCapability() {}, log() {},
+    };
+    scope.clearCodexAppEngineIdentity = loadWorkerFunction('clearCodexAppEngineIdentity', scope);
+    scope.restoreCodexAppAttestedTurn = loadWorkerFunction('restoreCodexAppAttestedTurn', scope);
+    const apply = loadWorkerFunction<(kind: string, payload: any, control?: any) => Promise<boolean>>('handleTrustedCodexAppMarker', scope);
+    const control = new ControlCollector(dir, false, false, false, false, async (payload, proof) => {
+      try { return await apply('state', payload, proof); }
+      catch (error) {
+        rejected.push(`${String(error)} ${JSON.stringify({ claim: payload.appServerProcess,
+          previous: scope.codexAppEngineIdentity, busy: payload.busy, boundary: payload.processIdentityBoundary,
+          previousStart: scope.codexAppEngineIdentity && readProcessStartIdentity(scope.codexAppEngineIdentity.pid),
+          verified: verifyCodexAppEngineIdentity(payload.appServerProcess, harness?.child.pid) })}`);
+        return false;
+      }
+    });
+    // ControlCollector authenticates the runner directly, bypassing the real
+    // worker's activateCodexAppControlConnection. Supply the active identity
+    // that production publishes after accepting the challenge proof.
+    scope.codexAppControlProven = true;
+    scope.codexAppControlStateValue = {
+      status: 'active', identities: [{ generation: control.bootstrap.identity.generation }],
+    };
+    await control.listen();
+    harness = startRunner(codexBin, dir, logPath, '0.144.6', 'success', control.bootstrap.path,
+      { env: { FAKE_CODEX_PID_PATH: pidPath, FAKE_CODEX_FINISH_GATE: finishGate,
+        // Wide enough that the control re-acceptance below lands inside the
+        // replacement client's initialize() window, before the launcher has
+        // spawned the native engine.
+        ...(launchMode === 'node-launcher' ? { FAKE_CODEX_LAUNCH_DELAY_MS: '1200', FAKE_CODEX_LAUNCHER_EXIT_DELAY_MS: '300',
+          FAKE_CODEX_LAUNCHER_PID_PATH: launcherPidPath } : {}) } });
+    const enginePublications = () => published.filter((entry: any) => entry?.enginePid !== undefined);
+    const waitForNative = async (predicate: () => boolean) => {
+      await waitFor(harness!, () => rejected.length > 0 || predicate(), 60_000).catch(error => {
+        const tail = control.markers.slice(-8).map(marker => marker.kind
+          + (marker.payload.processIdentityBoundary ? `:${marker.payload.processIdentityBoundary}` : '')
+          + (typeof marker.payload.busy === 'boolean' ? `:busy=${marker.payload.busy}` : ''));
+        throw new Error(`rejected=${JSON.stringify(rejected)} auths=${control.authCount} finals=${control.finals.length} `
+          + `last markers=${tail.join(' | ')}\n${(error as Error).message}`);
+      });
+      expect(rejected).toEqual([]);
+    };
+    // A replacement client is created and assigned to `client` before its
+    // initialize() RPC returns, and signed state can be emitted inside that
+    // window: an idle settle, or the control re-acceptance edge
+    // (`controlAcceptanceCount > 1`). Such a state must carry NO engine root.
+    // Attesting the npm launcher there freezes it as the engine root, and the
+    // real native engine's next state then reads as an unauthorized swap, so
+    // the worker runs failCodexAppControlGeneration. This drops the accepted
+    // control socket to force that re-authentication while the slow launcher
+    // has not spawned the native engine yet.
+    const expectNoRootDuringReplacementInitialization = async (
+      collector: ControlCollector, running: Harness, previousLauncherPid: number,
+    ): Promise<void> => {
+      // Wait for the replacement launcher to enter its deliberate delay. This
+      // pins the re-authentication to initialize(), rather than racing input.
+      await waitFor(running, () => Number(readFileSync(launcherPidPath, 'utf8')) !== previousLauncherPid, 60_000);
+      const launcherPid = Number(readFileSync(launcherPidPath, 'utf8'));
+      const before = collector.states.length;
+      await collector.restartEndpoint();
+      await waitFor(running, () => collector.states.length > before, 60_000);
+      const windowStates = collector.states.slice(before);
+      expect(windowStates.length).toBeGreaterThan(0);
+      // The first state of the window is the one emitted by the re-acceptance,
+      // while the replacement client is still inside initialize(): it must not
+      // claim any engine root at all.
+      expect(windowStates[0].appServerProcess).toBeUndefined();
+      // And the spawned child is the npm launcher, kept alive by the delay above
+      // so it is still the only process this client has. Publishing it is the
+      // defect that turns the real engine into an "unauthorized swap".
+      const rooted = windowStates.filter(state => state.appServerProcess !== undefined);
+      expect(rooted.map(state => state.appServerProcess.pid)).not.toContain(launcherPid);
+    };
+    // The runner settles idle 20ms after a turn. "The last state is idle" was
+    // already true from the startup state, so the engine could be killed
+    // before that settle. When the runner then noticed the exit first, its
+    // idle state carried no engine identity — a worker branch this extracted
+    // scope could not run, so the collector dropped the connection and the
+    // runner replayed the same state forever (#2520). Wait for the idle state
+    // that follows this turn's final instead.
+    const idleAfterLastFinal = () => {
+      const finalEnd = control.markers.findLastIndex(marker => marker.kind === 'final-end');
+      return control.markers.slice(finalEnd + 1).some(marker => marker.kind === 'state' && marker.payload.busy === false);
+    };
+    try {
+      await waitForNative(() => control.states.at(-1)?.busy === false);
+      expect(enginePublications()).toHaveLength(1);
+      expect(enginePublications()[0].enginePid).toBe(Number(readFileSync(pidPath, 'utf8')));
+      expect(control.states.at(-1)?.appServerProcess).toEqual({
+        pid: enginePublications()[0].enginePid, procStart: enginePublications()[0].engineProcStart,
+      });
+      const initialLauncherPid = launchMode === 'node-launcher'
+        ? Number(readFileSync(launcherPidPath, 'utf8')) : undefined;
+      let probeInitWindow = false;
+      for (const [index, turnId] of ['om_native_before', 'om_native_after', 'om_native_next'].entries()) {
+        if (index === 1) {
+          const pid = Number(readFileSync(pidPath, 'utf8'));
+          // The runner treats its engine as gone only once its OWN child's exit
+          // handler has run (`client.hasExited`); that handler logs the line
+          // counted below. A dead engine pid is not that signal: with the npm
+          // launcher the runner's child is the launcher, which exits after it
+          // has reaped the native engine, and even a reaped child can reach the
+          // runner's exit handler after its stdin. Input sent before the line
+          // finds a "live" client, turn/start goes into the dead engine's pipe,
+          // and the unknown outcome fences the generation (#2676).
+          const exitLines = () => harness!.stdout.split('[codex-app] app-server exited').length - 1;
+          const exitedBefore = exitLines();
+          process.kill(pid, 'SIGTERM');
+          await waitForNative(() => {
+            try { process.kill(pid, 0); return false; }
+            catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+            return exitLines() > exitedBefore;
+          });
+          probeInitWindow = launchMode === 'node-launcher';
+        }
+        // Production reserves a local liveness slot BEFORE the runner discovers
+        // the dead engine. This must not be confused with native execution.
+        tracker.begin(turnId);
+        authority.beginWork();
+        harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(turnId, { text: turnId }, turnId)}\r`);
+        if (probeInitWindow) {
+          probeInitWindow = false;
+          await expectNoRootDuringReplacementInitialization(control, harness!, initialLauncherPid!);
+        }
+        await waitForNative(() => control.finals.length === index + 1);
+        tracker.completeCurrent();
+        await waitForNative(idleAfterLastFinal);
+      }
+      expect(rejected).toEqual([]);
+      const engines = enginePublications();
+      expect(engines).toHaveLength(2);
+      expect(engines[1].enginePid).toBe(Number(readFileSync(pidPath, 'utf8')));
+      expect(engines[1].enginePid).not.toBe(engines[0].enginePid);
+      for (const state of control.states) {
+        if (state.appServerProcess) {
+          expect(engines.some(engine => engine.enginePid === state.appServerProcess.pid
+            && engine.engineProcStart === state.appServerProcess.procStart)).toBe(true);
+        }
+      }
+      const boundary = control.states.find(state => state.processIdentityBoundary === 'idle_restart');
+      expect(boundary).toMatchObject({ busy: true, tracksTurn: false, processIdentity: engines[1] });
+      const boundaryIndex = control.markers.findIndex(marker => marker.payload === boundary);
+      const submittedAfter = control.markers.findIndex((marker, index) => index > boundaryIndex
+        && marker.kind === 'activity' && marker.payload.phase === 'submitted');
+      expect(boundaryIndex).toBeGreaterThan(-1);
+      expect(submittedAfter).toBeGreaterThan(boundaryIndex);
+      expect(control.authCount).toBe(launchMode === 'node-launcher' ? 2 : 1);
+      expect(control.finals.map(final => final.turnId)).toEqual(['om_native_before', 'om_native_after', 'om_native_next']);
+      // Replace the observing worker during native work. The signed state must
+      // bind the exact persisted reply turn, rather than guessing from busy.
+      unlinkSync(finishGate);
+      tracker.begin('om_warm_recovery');
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('om_warm_recovery',
+        { text: 'warm recovery' }, 'om_warm_recovery')}\r`);
+      await waitForNative(() => readRequests(logPath).filter(request => request.method === 'turn/start').length === 4);
+      const head = { state: 'prepared', dispatchId: 'warm-dispatch', turnId: 'om_warm_recovery',
+        codexAppSteerable: true, replyTargetSenderOpenId: 'ou_original', replyTargetSenderIsBot: false };
+      scope.codexAppGenerationCommits = [{ generation: control.bootstrap.identity.generation,
+        committedThrough: control.committedThrough }];
+      scope.codexAppRecoveredDispatches = [head];
+      scope.codexAppTurnDispatchQueue.recoveredPrefix = () => [head];
+      await control.restartEndpoint();
+      await waitForNative(() => !!scope.restored);
+      expect(scope.restored).toMatchObject({ turnId: 'om_warm_recovery',
+        trustedCaller: { requestLarkAppId: 'cli_test', requestUserOpenId: 'ou_original', senderType: 'user' } });
+      expect(control.states.at(-1)).toMatchObject({ busy: true, activeReplyTurnId: 'om_warm_recovery' });
+      scope.codexAppTurnDispatchQueue.recoveredPrefix = () => [];
+      writeFileSync(finishGate, 'ready');
+      await waitForNative(() => control.finals.length === 4);
+      tracker.completeCurrent();
+      expect(control.authCount).toBe(launchMode === 'node-launcher' ? 3 : 2);
+      expect(rejected).toEqual([]);
+      expect(readRequests(logPath).filter(request => request.method === 'thread/start')).toHaveLength(1);
+      expect(readRequests(logPath).filter(request => request.method === 'thread/resume')).toHaveLength(1);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 240_000);
+
   it.each([
     { behavior: 'success', content: 'fake answer 1' },
     { behavior: 'resume-not-found', content: 'not found' },
@@ -1932,14 +2382,18 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       send('om_before_exit');
       await waitFor(harness, () => control.finals.length === 1 && control.states.at(-1)?.busy === false);
       const pid = Number(readFileSync(pidPath, 'utf8'));
+      const exitedBefore = harness.stdout.split('[codex-app] app-server exited').length - 1;
       process.kill(pid, 'SIGTERM');
       // The fixture's PID is a real child of the runner, not a mocked RPC rejection.
+      // A gone pid is not enough: the next input must also wait for the runner's
+      // own exit handler (its log line), or it can reach a client the runner
+      // still believes alive (#2676).
       await waitFor(harness, () => {
         try { process.kill(pid, 0); return false; }
         catch (error) {
-          if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true;
-          throw error;
+          if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
         }
+        return harness.stdout.split('[codex-app] app-server exited').length - 1 > exitedBefore;
       });
       send('om_after_exit');
       await waitFor(harness, () => control.finals.length === 2
@@ -3013,6 +3467,130 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
       await control.close();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('rediscovers a disconnected browser within the same native runner', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'browser-reconnect-runner-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    const plugin = join(dir, 'plugin'); mkdirSync(join(plugin, 'scripts'), { recursive: true });
+    writeFileSync(join(plugin, 'scripts', 'browser-service.mjs'), 'export async function handleRpc(){return {}}');
+    writeFileSync(join(plugin, 'scripts', 'browser-client.mjs'), `
+      let setupCount=0,discoveries=0;
+      export async function setupBrowserRuntime(){setupCount++;return {browsers:{get:async family=>{
+        if(family!=='chrome')throw new Error('wrong browser family');
+        const id=String(++discoveries);
+        const tab={id:'7',title:async()=> 'Example',url:async()=> 'https://example.test',
+          dom_cua:{get_visible_dom:async()=>{if(id==='1')throw new Error('Browser is not available: 1');
+            return {connected:id,setupCount};}}};
+        return {browserId:id,nameSession:async()=>{},
+          user:{openTabs:async()=>[{id:'7'}],claimTab:async()=>tab},
+          tabs:{get:async()=>tab}};
+      }}}}
+    `);
+    writeFileSync(fakeCodex, `#!/usr/bin/env node
+      const fs=require('node:fs'),readline=require('node:readline');
+      if(process.argv.includes('--version')){console.log('codex 0.162.1');process.exit(0)}
+      const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+      const notify=(method,params)=>send({method,params});
+      const ops=[{operation:'list_tabs'},{operation:'claim_tab',tabId:'7'},
+        {operation:'snapshot',tabId:'7'},{operation:'list_tabs'},
+        {operation:'snapshot',tabId:'7'},{operation:'claim_tab',tabId:'7'},
+        {operation:'snapshot',tabId:'7'}];
+      let index=0;
+      const tool=()=>send({id:9000+index,method:'item/tool/call',params:{threadId:'thread-browser',
+        turnId:'turn-browser',callId:'browser-'+index,tool:'botmux_browser',arguments:ops[index]}});
+      readline.createInterface({input:process.stdin}).on('line',line=>{
+        const q=JSON.parse(line);fs.appendFileSync(process.env.FAKE_CODEX_LOG,JSON.stringify(q)+'\\n');
+        if(q.id>=9000&&q.result){
+          if(++index<ops.length){tool();return;}
+          const item={type:'agentMessage',id:'answer',text:'Browser recovered'};
+          notify('item/completed',{threadId:'thread-browser',turnId:'turn-browser',item});
+          notify('turn/completed',{threadId:'thread-browser',turn:{id:'turn-browser',status:'completed',items:[item]}});return;
+        }
+        if(q.id===undefined)return;
+        let result={};
+        if(q.method==='initialize')result={userAgent:'fake-codex'};
+        if(q.method==='thread/start')result={thread:{id:'thread-browser',turns:[]}};
+        if(q.method==='turn/start')result={turn:{id:'turn-browser'}};
+        send({id:q.id,result});
+        if(q.method==='turn/start'){
+          notify('turn/started',{threadId:'thread-browser',turn:{id:'turn-browser'}});tool();
+        }
+      });
+    `); chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir); await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'browser-reconnect', control.bootstrap.path, {
+      extraArgs: ['--browser-family', 'chrome', '--browser-plugin-root', plugin],
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('read browser', { text: 'read browser' })}\r`);
+      await waitFor(harness, () => control.finals.length === 1);
+      const results = readRequests(logPath).filter(r => r.id >= 9000 && r.result).map(r => r.result);
+      expect(results.map(r => r.success)).toEqual([true, true, false, true, false, true, true]);
+      expect(results[2].contentItems[0].text).toContain('Browser is not available: 1');
+      expect(JSON.parse(results[6].contentItems[0].text).snapshot).toEqual({ connected: '2', setupCount: 1 });
+      expect(readRequests(logPath).filter(r => r.method === 'turn/start')).toHaveLength(1);
+    } finally { await stopChild(harness.child); await control.close(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it.each([false, true])('loads bot origin delegation through the real runner argv: %s', async automatic => {
+    const dir = mkdtempSync(join(tmpdir(), 'site-policy-runner-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    const plugin = join(dir, 'plugin'); mkdirSync(join(plugin, 'scripts'), { recursive: true });
+    writeFileSync(join(plugin, 'scripts', 'browser-service.mjs'), 'export async function handleRpc(){return {}}');
+    writeFileSync(join(plugin, 'scripts', 'browser-client.mjs'), `
+      export async function setupBrowserRuntime(){return {browsers:{get:async()=>({
+        browserId:'test',nameSession:async()=>{},user:{openTabs:async()=>{
+          const answer=await globalThis.nodeRepl.createElicitation({meta:{codex_approval_kind:'mcp_tool_call',
+            connector_id:'browser-use',tool_name:'access_browser_origin',origin:'https://example.test',persist:'always'}});
+          return [{id:answer.action,title:answer.meta?.persist??'none'}];
+        }}
+      })}}}
+    `);
+    writeFileSync(fakeCodex, `#!/usr/bin/env node
+      const fs=require('node:fs'),readline=require('node:readline');
+      if(process.argv.includes('--version')){console.log('codex 0.162.1');process.exit(0)}
+      const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');
+      const notify=(method,params)=>send({method,params});
+      readline.createInterface({input:process.stdin}).on('line',line=>{
+        const q=JSON.parse(line);fs.appendFileSync(process.env.FAKE_CODEX_LOG,JSON.stringify(q)+'\\n');
+        if(q.id===9009){
+          const item={type:'agentMessage',id:'answer',text:JSON.stringify(q.result)};
+          notify('item/completed',{threadId:'thread-site',turnId:'turn-site',item});
+          notify('turn/completed',{threadId:'thread-site',turn:{id:'turn-site',status:'completed',items:[item]}});return;
+        }
+        if(q.id===undefined)return;
+        let result={};
+        if(q.method==='initialize')result={userAgent:'fake-codex'};
+        if(q.method==='thread/start')result={thread:{id:'thread-site',turns:[]}};
+        if(q.method==='turn/start')result={turn:{id:'turn-site'}};
+        send({id:q.id,result});
+        if(q.method==='turn/start'){
+          notify('turn/started',{threadId:'thread-site',turn:{id:'turn-site'}});
+          send({id:9009,method:'item/tool/call',params:{threadId:'thread-site',turnId:'turn-site',
+            callId:'site-call',tool:'botmux_browser',arguments:{operation:'list_tabs'}}});
+        }
+      });
+    `); chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir); await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.162.1', 'site-policy', control.bootstrap.path, {
+      extraArgs: ['--browser-family', 'chrome', '--browser-plugin-root', plugin,
+        ...(automatic ? ['--browser-auto-approve-origins'] : [])],
+      // The default path must cancel before any real Ask transport can run.
+      env: { BOTMUX_SESSION_ID: '', BOTMUX_CHAT_ID: '', BOTMUX_LARK_APP_ID: '', BOTMUX_ROOT_MESSAGE_ID: '' },
+    });
+    try {
+      await waitFor(harness, () => harness.stdout.includes('Codex App connected.'));
+      harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput('check site', { text: 'check site' })}\r`);
+      await waitFor(harness, () => control.finals.length === 1);
+      const answer = readRequests(logPath).find(r => r.id === 9009 && r.result)?.result;
+      expect(answer?.success).toBe(true);
+      const text = answer.contentItems.find((item: any) => item.type === 'inputText').text;
+      expect(JSON.parse(text).tabs).toEqual([{ id: automatic ? 'accept' : 'cancel', title: automatic ? 'session' : 'none' }]);
+    } finally { await stopChild(harness.child); await control.close(); rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('registers the bounded browser dynamic tool only when the bridge is enabled', async () => {

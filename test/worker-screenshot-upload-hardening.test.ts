@@ -467,7 +467,13 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       expect(found).toBeDefined();
       return found!;
     };
-    const functions = ['setCaptureIdentity', 'markTurnRetired', 'advanceQueuedTypeAheadTurn', 'acknowledgeTurnInputCommitted']
+    const functions = [
+      'setCaptureIdentity',
+      'markTurnRetired',
+      'rememberQueuedTurnAdvanceForPendingReady',
+      'advanceQueuedTypeAheadTurn',
+      'acknowledgeTurnInputCommitted',
+    ]
       .map(name => findNode(node => ts.isFunctionDeclaration(node) && node.name?.text === name).getText(tree));
     const preparation = findNode(node => ts.isVariableDeclaration(node)
       && ts.isIdentifier(node.name) && node.name.text === 'prepareNormalWrite') as ts.VariableDeclaration;
@@ -482,10 +488,13 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
     const harness = new Function('send', 'isCodexAppCliId', `
       let currentBotmuxTurnId, currentBotmuxDispatchAttempt, currentVcMeetingImTurnOrigin;
       let captureRevision = 0, captureIdentityAnnounced = false, currentTurnSteerPromoted = false;
-      let queuedTypeAheadTurns = [], queuedTurnAdvanceConsumedForPrompt = false;
+      let queuedTypeAheadTurns = [], queuedTurnAdvanceConsumedForPrompt;
+      const ptyOutputGeneration = { snapshot: () => 7 };
       const retiredTurnIds = new Set();
       const started = [];
       const syncQueuedTurnsFromMarkerDisk = () => false;
+      // No terminal has gone out for any queued record in this scenario.
+      const turnTerminalEmitted = () => false, dropQueuedTurnRecord = () => false;
       const readSendMarkers = () => [];
       const markActiveTurnStarted = record => started.push(record);
       const writeCliPidMarker = () => {}, publishSandboxRelayCapability = () => {}, log = () => {};
@@ -500,6 +509,10 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
       const usageLimitTracker = { beginTurn: () => 1 }, currentUsageLimitSnapshot = () => undefined;
       const claudeBridgeActive = false, codexBridgeActive = false;
       const lastInitConfig = { cliId: 'dsh-tui' }, cliAdapter = { reliableTurnTerminal: false };
+      // Durable output handoff is negotiated per worker init; this queue-only
+      // harness runs without one, so the fence write stays inert (the guard
+      // short-circuits before TurnSendLedger is touched).
+      const universalOutputHandoff = undefined;
       const stampMojoTurnMark = () => {}, markTurnExecutionStart = () => {};
       const logicalMsg = 'queued input', msg = logicalMsg;
       let submissionPreparationFailed = false;

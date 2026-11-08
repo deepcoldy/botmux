@@ -1,3 +1,4 @@
+import { matchingScheduleBotGrant } from '../src/core/schedule-bot-grant.js';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -71,6 +72,7 @@ function harness(overrides: Record<string, unknown> = {}) {
     isTrustedHostIpcRequest: () => body.remoteRunnerSessionTool === true,
     selfDaemonLarkAppId: 'cli_target',
     jsonRes: (_res: unknown, status: number, value: unknown) => ({ status, value }),
+    matchingScheduleBotGrant,
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
     getBot: () => ({ config: { triggerUserAuth: { enabled: true,
       tools: ['lark-cli', 'bytedcli'] } } }),
@@ -101,6 +103,59 @@ function harness(overrides: Record<string, unknown> = {}) {
 }
 
 describe('delegated schedule add route', () => {
+  it('redeems a bot grant only while the receiving host permits its exact scope', async () => {
+    const h = harness();
+    const original = h.scope.dispatchUserForTurn;
+    h.scope.dispatchUserForTurn = async () => {
+      const payload = await original();
+      payload.authority.capabilities[0].botGrantId = 'team';
+      return payload;
+    };
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_bot_grant_denied' } });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true,
+      botGrants: [{ id: 'team', sourceAppId: 'cli_source', targetAppIds: ['cli_target'],
+        chatIds: ['oc_chat'], controllerUnionId: 'on_user' }] } });
+    expect((await h.run()).status).toBe(201);
+    expect(h.commitDelegatedTask).toHaveBeenCalledWith(expect.objectContaining({
+      grantId: 'bot-policy:cli_source:team:delivery-1:cli_target',
+      control: expect.objectContaining({ runScopes: [] }),
+    }));
+  });
+  describe('bot grant redemption', () => {
+    const policy = { createEnabled: true, botGrants: [{ id: 'team', sourceAppId: 'cli_source',
+      targetAppIds: ['cli_target'], chatIds: ['oc_chat'], controllerUnionId: 'on_user' }] };
+    const granted = (mutate: (payload: any) => void = () => {}) => {
+      const h = harness();
+      const original = h.scope.dispatchUserForTurn;
+      h.scope.dispatchUserForTurn = async () => {
+        const payload = await original();
+        payload.authority.capabilities[0].botGrantId = 'team';
+        mutate(payload);
+        return payload;
+      };
+      h.scope.readGlobalConfig = () => ({ scheduleDelegation: policy });
+      return h;
+    };
+    it('commits nothing when the grant is revoked while the controller is being resolved', async () => {
+      const h = granted();
+      h.scope.resolveTargetAppOpenId = async () => {
+        h.scope.readGlobalConfig = () => ({ scheduleDelegation: { createEnabled: true } });
+        return { status: 'resolved', openId: 'ou_user_target' };
+      };
+      expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_bot_grant_denied' } });
+      expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+    });
+    it.each([
+      ['a controller other than the grant\'s', (payload: any) => { payload.authority.unionId = 'on_other'; }],
+      ['personal tool credentials', (payload: any) => { payload.authority.tools = ['bytedcli']; }],
+      ['persistent run scopes', (payload: any) => { payload.authority.capabilities[0].allowedRunScopes = ['bytedcli']; }],
+    ])('refuses a signed bot-grant delegation that carries %s', async (_label, mutate) => {
+      const h = granted(mutate);
+      expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_bot_grant_denied' } });
+      expect(h.commitDelegatedTask).not.toHaveBeenCalled();
+    });
+  });
   it('aligns a Remote Runner bot turn with its provider-selected developer Actor', async () => {
     const h = harness({
       remoteRunnerSessionTool: true,
@@ -696,4 +751,118 @@ it('creates after same-turn revoke/republication without reviving the busy hint'
   } } });
   expect(h.ds.activeInteractiveTurn).toBeUndefined();
   expect(h.scope.scheduler.addTask).toHaveBeenCalledOnce();
+});
+
+// `--run-as` on the host-terminal route: the host admin names a person, but the
+// person becomes the task's creator only after resolution in the executing
+// bot's own app namespace AND a live canOperate admission. Identity fields in
+// the request body are never trusted as-is.
+describe('host-terminal --run-as identity', () => {
+  function hostRunAsHarness(overrides: {
+    runAs?: unknown;
+    extraTask?: Record<string, unknown>;
+    canOperate?: boolean;
+    emailMap?: Map<string, string>;
+    unionId?: string | null;
+  } = {}) {
+    const h = harness({ sessionId: '' });
+    h.scope.findActiveBySessionId = () => undefined;
+    h.scope.isTrustedHostIpcRequest = () => true;
+    h.body.task.executionPosition = 'top-level';
+    delete h.body.task.rootMessageId;
+    if (overrides.runAs !== undefined) h.body.task.runAs = overrides.runAs;
+    Object.assign(h.body.task, overrides.extraTask ?? {});
+    h.scope.resolveAllowedUsersWithMap = vi.fn(async () => ({
+      resolved: [], map: overrides.emailMap ?? new Map(), errored: false,
+      entryStatus: new Map(), definitiveMisses: [],
+    }));
+    h.scope.resolveUnionIdFromOpenId = vi.fn(async () =>
+      (overrides.unionId === undefined ? 'on_runner' : overrides.unionId));
+    h.scope.canOperate = vi.fn(() => overrides.canOperate ?? true);
+    return h;
+  }
+
+  function addTaskArg(h: ReturnType<typeof hostRunAsHarness>): Record<string, unknown> {
+    expect(h.scope.scheduler.addTask).toHaveBeenCalledTimes(1);
+    return h.scope.scheduler.addTask.mock.calls[0][0] as Record<string, unknown>;
+  }
+
+  it('stamps a verified ou_ identity after the canOperate admission and never persists runAs', async () => {
+    const h = hostRunAsHarness({ runAs: 'ou_runner1' });
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    expect(h.scope.canOperate).toHaveBeenCalledWith('cli_target', 'oc_chat', 'ou_runner1', 'on_runner');
+    const arg = addTaskArg(h);
+    expect(arg).toMatchObject({
+      ownerOpenId: 'ou_runner1', ownerUnionId: 'on_runner', creatorLarkAppId: 'cli_target',
+    });
+    expect(arg).not.toHaveProperty('runAs');
+  });
+
+  it('resolves an email to the bot-scoped open_id before admission', async () => {
+    const h = hostRunAsHarness({
+      runAs: 'runner@example.com',
+      emailMap: new Map([['runner@example.com', 'ou_from_email']]),
+    });
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    expect(h.scope.resolveAllowedUsersWithMap)
+      .toHaveBeenCalledWith('cli_target', ['runner@example.com']);
+    expect(h.scope.resolveUnionIdFromOpenId).toHaveBeenCalledWith('cli_target', 'ou_from_email');
+    expect(addTaskArg(h)).toMatchObject({
+      ownerOpenId: 'ou_from_email', ownerUnionId: 'on_runner', creatorLarkAppId: 'cli_target',
+    });
+  });
+
+  it('refuses 403 when the named person cannot operate the bot', async () => {
+    const h = hostRunAsHarness({ runAs: 'ou_runner1', canOperate: false });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_run_as_not_allowed' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses 403 when the email does not resolve for this app', async () => {
+    const h = hostRunAsHarness({ runAs: 'ghost@example.com', emailMap: new Map() });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_run_as_unresolved' } });
+    expect(h.scope.resolveUnionIdFromOpenId).not.toHaveBeenCalled();
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('refuses 403 when the open_id does not resolve to a union_id (foreign app / missing scope)', async () => {
+    const h = hostRunAsHarness({ runAs: 'ou_runner1', unionId: null });
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_run_as_unresolved' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['bare word', 'badid'],
+    ['ou_ prefix only', 'ou_'],
+    ['whitespace inside', 'ou_has space'],
+    ['not an email', 'notanemail'],
+    ['non-string number', 123],
+    ['empty string', ''],
+  ])('rejects a malformed --run-as value with 400 (%s)', async (_label, runAs) => {
+    const h = hostRunAsHarness({ runAs: runAs as unknown });
+    expect(await h.run()).toMatchObject({ status: 400, value: { error: 'schedule_run_as_invalid' } });
+    expect(h.scope.scheduler.addTask).not.toHaveBeenCalled();
+  });
+
+  it('strips body-supplied ownerOpenId/ownerUnionId when no --run-as is given (ownerless host task)', async () => {
+    const h = hostRunAsHarness({ extraTask: { ownerOpenId: 'ou_evil', ownerUnionId: 'on_evil' } });
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    const arg = addTaskArg(h);
+    expect(arg.ownerOpenId).toBeUndefined();
+    expect(arg.ownerUnionId).toBeUndefined();
+  });
+
+  it('lets a verified --run-as override body-supplied owner fields and creator app', async () => {
+    const h = hostRunAsHarness({
+      runAs: 'ou_runner1',
+      extraTask: {
+        ownerOpenId: 'ou_evil', ownerUnionId: 'on_evil',
+        creatorLarkAppId: 'cli_OTHER', creatorChatId: 'oc_other',
+      },
+    });
+    expect(await h.run()).toMatchObject({ status: 201, value: { ok: true } });
+    expect(addTaskArg(h)).toMatchObject({
+      ownerOpenId: 'ou_runner1', ownerUnionId: 'on_runner', creatorLarkAppId: 'cli_target',
+    });
+  });
 });

@@ -7,7 +7,6 @@ import type { ModelOnlyRuntime, NativeInvocationOutput } from './runtime.js';
 import { runCodexInvocation } from './codex-runtime.js';
 import { runClaudeInvocation } from './claude-runtime.js';
 import { runPiInvocation } from './pi-runtime.js';
-import { runGeminiInvocation } from './gemini-runtime.js';
 import { runOpenCodeInvocation } from './opencode-runtime.js';
 import { modelOnlyAssessments } from './support-status.js';
 
@@ -43,10 +42,6 @@ const adapters: ReadonlyMap<string, ModelOnlyAdapter> = new Map<string, ModelOnl
   ['pi', {
     cli: 'pi', authSubdir: 'pi', nativeProtocol: 'print-json', modelPolicy: 'caller_selected_native_catalog',
     acceptsIdentity: () => true, run: runPiInvocation,
-  }],
-  ['gemini', {
-    cli: 'gemini', authSubdir: 'gemini', nativeProtocol: 'headless-stream-json-policy', modelPolicy: 'caller_selected_native_catalog',
-    acceptsIdentity: () => true, run: runGeminiInvocation,
   }],
   ['opencode', {
     cli: 'opencode', authSubdir: 'opencode', nativeProtocol: 'run-json-policy', modelPolicy: 'caller_selected_native_catalog',

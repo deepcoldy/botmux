@@ -37,9 +37,8 @@ export function MemberAccessSection(props: {
   const [quotaOption, setQuotaOption] = useState<string>('3');
   const [durationOption, setDurationOption] = useState<string>(String(GRANT_DURATION_OPTIONS[0]));
   const [busy, setBusy] = useState(false);
-  // 懒加载：ManageDialog 一打开就为每个在群 bot 打 members-display / 黑名单 /
-  // readback 三个请求太吵；折叠区首次展开才加载。
-  const [active, setActive] = useState(false);
+  // 挂载即加载：群管理抽屉在「成员权限」页签首次打开时才挂载本组件，
+  // 所以打开抽屉本身不会打 members-display / 黑名单 / readback 请求。
   const seqRef = useRef(0);
 
   useEffect(() => {
@@ -49,7 +48,6 @@ export function MemberAccessSection(props: {
   }, [members, appId]);
 
   useEffect(() => {
-    if (!active) return;
     if (!appId) {
       setDisplays(null);
       setGranted(new Set());
@@ -83,7 +81,7 @@ export function MemberAccessSection(props: {
         setLoadError(true);
       }
     }
-  }, [active, appId, chat.chatId]);
+  }, [appId, chat.chatId]);
 
   const blockedSet = useMemo(() => new Set(blocked.resolved), [blocked]);
 
@@ -224,7 +222,6 @@ export function MemberAccessSection(props: {
   if (members.length === 0) {
     return (
       <section className="g-member-access" data-member-access>
-        <h4>{tr('grantAdmin.sectionTitle')}</h4>
         <p className="empty">{tr('grantAdmin.noBot')}</p>
       </section>
     );
@@ -232,122 +229,116 @@ export function MemberAccessSection(props: {
 
   return (
     <section className="g-member-access" data-member-access>
-      <details
-        data-member-access-toggle
-        onToggle={ev => setActive(ev.currentTarget.open)}
-      >
-        <summary><h4>{tr('grantAdmin.sectionTitle')}</h4></summary>
-        <p><small>{tr('grantAdmin.sectionHelp')}</small></p>
-        <label className="checkbox-row">
-          <strong>{tr('grantAdmin.botSwitcher')}</strong>
-          <select
-            data-action="bot-switch"
-            value={appId}
-            disabled={props.disabled === true || busy}
-            onChange={ev => setAppId(ev.currentTarget.value)}
-          >
-            {members.map(member => (
-              <option key={member.larkAppId} value={member.larkAppId}>
-                {`${member.botName ?? member.larkAppId} (${member.larkAppId})`}
-              </option>
-            ))}
-          </select>
-        </label>
+      <p className="g-panel-help">{tr('grantAdmin.sectionHelp')}</p>
+      <label className="checkbox-row">
+        <strong>{tr('grantAdmin.botSwitcher')}</strong>
+        <select
+          data-action="bot-switch"
+          value={appId}
+          disabled={props.disabled === true || busy}
+          onChange={ev => setAppId(ev.currentTarget.value)}
+        >
+          {members.map(member => (
+            <option key={member.larkAppId} value={member.larkAppId}>
+              {`${member.botName ?? member.larkAppId} (${member.larkAppId})`}
+            </option>
+          ))}
+        </select>
+      </label>
 
-        {loadError ? <p className="hint-warn-inline">{tr('grantAdmin.loadFailed')}</p> : null}
-        {active && displays === null && !loadError ? <p className="empty">{tr('grantAdmin.loading')}</p> : null}
+      {loadError ? <p className="hint-warn-inline">{tr('grantAdmin.loadFailed')}</p> : null}
+      {displays === null && !loadError ? <p className="empty">{tr('grantAdmin.loading')}</p> : null}
 
-        {displays !== null ? (
-        <>
-          <input
-            type="search"
-            data-action="member-search"
-            placeholder={tr('grantAdmin.search')}
-            value={search}
+      {displays !== null ? (
+      <>
+        <input
+          type="search"
+          data-action="member-search"
+          placeholder={tr('grantAdmin.search')}
+          value={search}
+          disabled={disabled || busy}
+          onChange={ev => setSearch(ev.currentTarget.value)}
+        />
+        <p><small>{tr('grantAdmin.selected', { count: selected.size })}</small></p>
+
+        {(['users', 'bots'] as const).map(group => {
+          const rows = filtered[group];
+          return (
+            <div className="g-member-access-group" key={group} data-member-group={group}>
+              <strong>{tr(group === 'users' ? 'grantAdmin.groupUsers' : 'grantAdmin.groupBots')} ({rows.length})</strong>
+              {rows.length === 0 ? <p className="empty">—</p> : rows.map(member => (
+                <MemberRow
+                  key={member.openId}
+                  member={member}
+                  checked={selected.has(member.openId)}
+                  granted={granted.has(member.openId)}
+                  blocked={blockedSet.has(member.openId)}
+                  disabled={disabled || busy}
+                  tr={tr}
+                  onToggle={toggleMember}
+                  onSetBlocked={setRowBlocked}
+                />
+              ))}
+            </div>
+          );
+        })}
+
+        <div className="g-member-access-controls">
+          <label>
+            {tr('grantAdmin.quota')}{' '}
+            <select
+              data-action="quota-select"
+              value={quotaOption}
+              disabled={disabled || busy}
+              onChange={ev => setQuotaOption(ev.currentTarget.value)}
+            >
+              {QUOTA_OPTIONS.map(value => (
+                <option key={value} value={value}>
+                  {value === 'unlimited' ? tr('grantAdmin.unlimited') : value}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            {tr('grantAdmin.duration')}{' '}
+            <select
+              data-action="duration-select"
+              value={durationOption}
+              disabled={disabled || busy}
+              onChange={ev => setDurationOption(ev.currentTarget.value)}
+            >
+              {GRANT_DURATION_OPTIONS.map((ms, index) => (
+                <option key={ms} value={String(ms)}>{tr(DURATION_LABEL_KEYS[index] ?? 'grantAdmin.duration1h')}</option>
+              ))}
+              <option value="permanent">{tr('grantAdmin.permanent')}</option>
+            </select>
+          </label>
+          <button
+            type="button"
+            className="primary"
+            data-action="grant-selected"
+            disabled={disabled || busy || selected.size === 0}
+            onClick={() => void grantSelected()}
+          >{tr('grantAdmin.grantSelected')}</button>
+        </div>
+
+        <div className="g-member-access-whole">
+          <p><small>{tr('grantAdmin.wholeHelp')}</small></p>
+          <button
+            type="button"
+            data-action="whole-grant"
             disabled={disabled || busy}
-            onChange={ev => setSearch(ev.currentTarget.value)}
-          />
-          <p><small>{tr('grantAdmin.selected', { count: selected.size })}</small></p>
-
-          {(['users', 'bots'] as const).map(group => {
-            const rows = filtered[group];
-            return (
-              <div className="g-member-access-group" key={group} data-member-group={group}>
-                <strong>{tr(group === 'users' ? 'grantAdmin.groupUsers' : 'grantAdmin.groupBots')} ({rows.length})</strong>
-                {rows.length === 0 ? <p className="empty">—</p> : rows.map(member => (
-                  <MemberRow
-                    key={member.openId}
-                    member={member}
-                    checked={selected.has(member.openId)}
-                    granted={granted.has(member.openId)}
-                    blocked={blockedSet.has(member.openId)}
-                    disabled={disabled || busy}
-                    tr={tr}
-                    onToggle={toggleMember}
-                    onSetBlocked={setRowBlocked}
-                  />
-                ))}
-              </div>
-            );
-          })}
-
-          <div className="g-member-access-controls">
-            <label>
-              {tr('grantAdmin.quota')}{' '}
-              <select
-                data-action="quota-select"
-                value={quotaOption}
-                disabled={disabled || busy}
-                onChange={ev => setQuotaOption(ev.currentTarget.value)}
-              >
-                {QUOTA_OPTIONS.map(value => (
-                  <option key={value} value={value}>
-                    {value === 'unlimited' ? tr('grantAdmin.unlimited') : value}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              {tr('grantAdmin.duration')}{' '}
-              <select
-                data-action="duration-select"
-                value={durationOption}
-                disabled={disabled || busy}
-                onChange={ev => setDurationOption(ev.currentTarget.value)}
-              >
-                {GRANT_DURATION_OPTIONS.map((ms, index) => (
-                  <option key={ms} value={String(ms)}>{tr(DURATION_LABEL_KEYS[index] ?? 'grantAdmin.duration1h')}</option>
-                ))}
-                <option value="permanent">{tr('grantAdmin.permanent')}</option>
-              </select>
-            </label>
-            <button
-              type="button"
-              className="primary"
-              data-action="grant-selected"
-              disabled={disabled || busy || selected.size === 0}
-              onClick={() => void grantSelected()}
-            >{tr('grantAdmin.grantSelected')}</button>
-          </div>
-
-          <div className="g-member-access-whole">
-            <p><small>{tr('grantAdmin.wholeHelp')}</small></p>
-            <button
-              type="button"
-              data-action="whole-grant"
-              disabled={disabled || busy}
-              onClick={() => void setWholeGroup(true)}
-            >{tr('grantAdmin.wholeGrant')}</button>
-            <button
-              type="button"
-              data-action="whole-revoke"
-              disabled={disabled || busy}
-              onClick={() => void setWholeGroup(false)}
-            >{tr('grantAdmin.wholeRevoke')}</button>
-          </div>
-        </>
-      ) : null}
-      </details>
+            onClick={() => void setWholeGroup(true)}
+          >{tr('grantAdmin.wholeGrant')}</button>
+          <button
+            type="button"
+            data-action="whole-revoke"
+            disabled={disabled || busy}
+            onClick={() => void setWholeGroup(false)}
+          >{tr('grantAdmin.wholeRevoke')}</button>
+        </div>
+      </>
+    ) : null}
     </section>
   );
 }

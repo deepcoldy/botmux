@@ -5,10 +5,13 @@
 // 值导入会把它们打进浏览器 bundle。
 import type {
   BoardBatch,
+  BoardChatCheck,
   BoardDecision,
   BoardDraft,
   BoardEvent,
   BoardFile,
+  BoardHint,
+  BoardHintKind,
   BoardItem,
   BoardLinkKind,
   BoardState,
@@ -19,6 +22,8 @@ import type {
 
 export type {
   BoardBatch,
+  BoardHint,
+  BoardHintKind,
   BoardDecision,
   BoardDraft,
   BoardEvent,
@@ -39,6 +44,12 @@ export interface RenderedLink {
   label?: string;
   text: string;
   url?: string;
+  /** 仅 chat：这一项的主群。旧 daemon 不给，按第一个群算（见 itemChatView）。 */
+  primary?: boolean;
+  /** 仅 chat：verified / unverified；缺省 = 核实功能上线前的旧关联，不打标。 */
+  chatCheck?: BoardChatCheck;
+  /** 仅 chat：查到的群名（text 已按「标签 > 群名」取好，这里只是原始值）。 */
+  chatName?: string;
 }
 
 export interface StewardStatus {
@@ -66,6 +77,36 @@ export interface BoardItemSummary extends BoardItem {
   unseen: boolean;
   url?: string;
   appLink?: string;
+}
+
+// ─── 事项关联的群 ─────────────────────────────────────────────────────────────
+
+export interface ItemChatView {
+  /** 这一项的群，主群在最前，其余按管家写入的顺序。 */
+  chats: RenderedLink[];
+  primary?: RenderedLink;
+  /** 只在没有群时生效（之后补了群，原因就不再成立）。 */
+  noChatReason?: string;
+  /** 没有群、也没写原因：页面标「缺群」，提醒管家补。 */
+  missing: boolean;
+}
+
+/** 汇总行和详情页共用：从关联里挑出群、定主群（服务端标的 primary，没标就是第一个群）。 */
+export function itemChatView(item: Pick<BoardItem, 'noChatReason'>, links: readonly RenderedLink[]): ItemChatView {
+  const chats = links.filter(l => l.kind === 'chat');
+  const primary = chats.find(l => l.primary) ?? chats[0];
+  const reason = item.noChatReason?.trim();
+  return {
+    chats: primary ? [primary, ...chats.filter(l => l !== primary)] : [],
+    ...(primary ? { primary } : {}),
+    ...(!primary && reason ? { noChatReason: reason } : {}),
+    missing: !primary && !reason,
+  };
+}
+
+/** 详情页下方的关联对象里不再重复列群（群在标题下方单独一栏）。 */
+export function nonChatLinks(links: readonly RenderedLink[]): RenderedLink[] {
+  return links.filter(l => l.kind !== 'chat');
 }
 
 export interface BoardListResponse {
@@ -254,6 +295,18 @@ export const BOARD_ACTOR_LABEL_KEYS: Readonly<Record<BoardEvent['actor'], string
   system: 'decisionBoard.actorSystem',
 };
 
+/** 巡检提示的标签：建议关闭 / 建议推进 / 该看一眼。 */
+export const BOARD_HINT_LABEL_KEYS: Readonly<Record<BoardHintKind, string>> = {
+  close: 'decisionBoard.hintClose',
+  advance: 'decisionBoard.hintAdvance',
+  stale: 'decisionBoard.hintStale',
+};
+
+/** 认得的提示才显示（新 daemon 加了别的类型、旧页面不认时不显示半截标签）。 */
+export function knownHint(hint: BoardHint | undefined): BoardHint | undefined {
+  return hint && Object.prototype.hasOwnProperty.call(BOARD_HINT_LABEL_KEYS, hint.kind) ? hint : undefined;
+}
+
 export const BOARD_EVENT_KIND_KEYS: Readonly<Record<BoardEvent['kind'], string>> = {
   create: 'decisionBoard.eventCreate',
   note: 'decisionBoard.eventNote',
@@ -263,6 +316,7 @@ export const BOARD_EVENT_KIND_KEYS: Readonly<Record<BoardEvent['kind'], string>>
   reply: 'decisionBoard.eventReply',
   attach: 'decisionBoard.eventAttach',
   link: 'decisionBoard.eventLink',
+  hint: 'decisionBoard.eventHint',
 };
 
 /** 「待拍板·在审」：状态 + 自由文本阶段。 */
@@ -503,6 +557,10 @@ export interface StewardForm {
   autoJoinNewGroups: boolean;
   /** 只有一个人和一个 bot 的新群也带上管家；默认关。 */
   autoJoinSoloGroups: boolean;
+  /** 待拍板时往管家群发能直接点选项的卡片；默认开。 */
+  decisionCards: boolean;
+  /** 后台巡检找出可以关 / 可以推进 / 该看一眼的事项；默认关。 */
+  closeHints: boolean;
 }
 
 export function stewardFormFrom(cfg: StewardConfig | null | undefined): StewardForm {
@@ -513,6 +571,8 @@ export function stewardFormFrom(cfg: StewardConfig | null | undefined): StewardF
     guideText: cfg?.guideText ?? '',
     autoJoinNewGroups: cfg?.autoJoinNewGroups !== false,
     autoJoinSoloGroups: cfg?.autoJoinSoloGroups === true,
+    decisionCards: cfg?.decisionCards !== false,
+    closeHints: cfg?.closeHints === true,
   };
 }
 
@@ -531,9 +591,12 @@ export function stewardPayload(form: StewardForm): StewardConfig | null {
     ...(guideText ? { guideText } : {}),
     ...(form.autoJoinNewGroups ? {} : { autoJoinNewGroups: false }),
     ...(form.autoJoinSoloGroups ? { autoJoinSoloGroups: true } : {}),
+    ...(form.decisionCards ? {} : { decisionCards: false }),
+    ...(form.closeHints ? { closeHints: true } : {}),
   };
   if (!value.enabled && !value.chatId && !value.guideMode && !value.guideText
-    && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true) return null;
+    && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true && value.closeHints !== true
+    && value.decisionCards !== false) return null;
   return value;
 }
 

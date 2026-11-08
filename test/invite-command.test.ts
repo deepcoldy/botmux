@@ -56,7 +56,7 @@ function inviteMessage(overrides: {
 }
 
 let tmpDir: string;
-function writeBotsInfo(entries: Array<{ larkAppId: string; botName: string | null }>) {
+function writeBotsInfo(entries: Array<{ larkAppId: string; botName?: unknown }>) {
   writeFileSync(join(tmpDir, 'bots-info.json'), JSON.stringify(entries));
 }
 function writePlatformSync(bots: Array<{ appId: string; name?: string; unionId?: string }>) {
@@ -125,6 +125,21 @@ describe('readBotsInfoEntries', () => {
   it('parses entries with larkAppId', () => {
     writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
     expect(readBotsInfoEntries()).toEqual([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
+  });
+  it('drops malformed rows (null/scalar/bad appId/truthy non-string botName) but keeps valid rows', () => {
+    writeBotsInfo([
+      null,
+      'scalar',
+      { larkAppId: '', botName: 'EmptyApp' },
+      { larkAppId: 'cli_bad_name', botName: 42 },
+      { larkAppId: 'cli_array_name', botName: ['Codex'] },
+      { larkAppId: 'cli_null_name', botName: null },
+      { larkAppId: 'cli_codex', botName: 'Codex' },
+    ] as any);
+    expect(readBotsInfoEntries()).toEqual([
+      { larkAppId: 'cli_null_name', botName: null },
+      { larkAppId: 'cli_codex', botName: 'Codex' },
+    ]);
   });
 });
 
@@ -207,6 +222,18 @@ describe('tryHandleInviteCommand — 解析与拉人', () => {
     expect(out).toContain('Codex');
   });
 
+  it('malformed row (truthy non-string botName) before a valid row neither crashes the command nor hides the valid row', async () => {
+    // bots-info.json 可手工编辑/半写入：truthy 非字符串 botName 曾让
+    // e.botName?.toLowerCase() 抛 TypeError，/invite 在任何回执发出前崩溃（静默失效）。
+    writeBotsInfo([
+      { larkAppId: 'cli_bad', botName: 42 },
+      { larkAppId: 'cli_codex', botName: 'Codex' },
+    ]);
+    expect(await tryHandleInviteCommand('b1', inviteMessage(), OWNER)).toBe(true);
+    expect(addBotMock).toHaveBeenCalledWith('b1', 'oc_1', ['cli_codex']);
+    expect(replyMock).toHaveBeenCalled();
+  });
+
   it('already-in-chat target (live roster openId match) is skipped', async () => {
     writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
     rosterMock.mockImplementation(async () => [
@@ -218,7 +245,7 @@ describe('tryHandleInviteCommand — 解析与拉人', () => {
   });
 
   it('name not in bots-info → unresolved with --app hint, no add', async () => {
-    writeBotsInfo([{ larkAppId: 'cli_gemini', botName: 'Gemini' }]);
+    writeBotsInfo([{ larkAppId: 'cli_kimi', botName: 'Kimi' }]);
     expect(await tryHandleInviteCommand('b1', inviteMessage(), OWNER)).toBe(true);
     expect(addBotMock).not.toHaveBeenCalled();
     const out = String(replyMock.mock.calls.at(-1)![2]);
@@ -255,14 +282,14 @@ describe('tryHandleInviteCommand — 解析与拉人', () => {
     writeBotsInfo([{ larkAppId: 'cli_codex', botName: 'Codex' }]);
     rosterMock.mockImplementation(async () => [
       { larkAppId: 'b1', openId: ME, name: 'Claude', displayName: 'Claude' },
-      { larkAppId: 'cli_gemini', openId: 'ou_gemini', name: 'Gemini', displayName: 'Gemini' },
+      { larkAppId: 'cli_kimi', openId: 'ou_kimi', name: 'Kimi', displayName: 'Kimi' },
     ]);
     const msg = inviteMessage({
       text: '@_user_1 /invite @_user_2 @_user_3 @_user_4',
       mentions: [
         { key: '@_user_1', id: { open_id: ME }, name: 'Claude' },
         { key: '@_user_2', id: { open_id: 'ou_codex' }, name: 'Codex' },
-        { key: '@_user_3', id: { open_id: 'ou_gemini' }, name: 'Gemini' },
+        { key: '@_user_3', id: { open_id: 'ou_kimi' }, name: 'Kimi' },
         { key: '@_user_4', id: { open_id: 'ou_ghost' }, name: 'Ghost' },
       ],
     });
@@ -271,7 +298,7 @@ describe('tryHandleInviteCommand — 解析与拉人', () => {
     const out = String(replyMock.mock.calls.at(-1)![2]);
     expect(out).toContain('Codex');
     expect(out).toContain('已在群内');
-    expect(out).toContain('Gemini');
+    expect(out).toContain('Kimi');
     expect(out).toContain('无法解析');
     expect(out).toContain('Ghost');
   });
@@ -279,18 +306,18 @@ describe('tryHandleInviteCommand — 解析与拉人', () => {
   it('whole-batch failure falls back to per-id invites and reports individual results', async () => {
     writeBotsInfo([
       { larkAppId: 'cli_codex', botName: 'Codex' },
-      { larkAppId: 'cli_gemini', botName: 'Gemini' },
+      { larkAppId: 'cli_kimi', botName: 'Kimi' },
     ]);
     addBotMock
       .mockImplementationOnce(async (_a, _c, ids: string[]) => ids.map(id => ({ id, ok: false, error: 'batch boom' })))
       .mockImplementation(async (_a, _c, ids: string[]) =>
-        ids.map(id => ({ id, ok: id !== 'cli_gemini', ...(id === 'cli_gemini' ? { error: 'invalid_id' } : {}) })));
+        ids.map(id => ({ id, ok: id !== 'cli_kimi', ...(id === 'cli_kimi' ? { error: 'invalid_id' } : {}) })));
     const msg = inviteMessage({
       text: '@_user_1 /invite @_user_2 @_user_3',
       mentions: [
         { key: '@_user_1', id: { open_id: ME }, name: 'Claude' },
         { key: '@_user_2', id: { open_id: 'ou_codex' }, name: 'Codex' },
-        { key: '@_user_3', id: { open_id: 'ou_gemini' }, name: 'Gemini' },
+        { key: '@_user_3', id: { open_id: 'ou_kimi' }, name: 'Kimi' },
       ],
     });
     expect(await tryHandleInviteCommand('b1', msg, OWNER)).toBe(true);
@@ -300,7 +327,7 @@ describe('tryHandleInviteCommand — 解析与拉人', () => {
     expect(out).toContain('已拉进群');
     expect(out).toContain('Codex');
     expect(out).toContain('拉入失败');
-    expect(out).toContain('Gemini');
+    expect(out).toContain('Kimi');
   });
 
   it('post (rich-text) form: operator at-node + invite text node + target at-node', async () => {

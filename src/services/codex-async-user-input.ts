@@ -1,16 +1,48 @@
 import type { AskQuestion, AskResult } from '../core/ask-types.js';
 import { codexUserInputAnswer } from './codex-user-input.js';
+import type { CodexAppTurnInput } from '../types.js';
 
 export const CODEX_ASYNC_ASK_ORIGIN = 'native-user-input-async';
-export interface CodexAsyncUserInput { threadId: string; itemId: string }
+export interface CodexAsyncUserInput { threadId: string; itemId: string; nativeTurnId?: string }
 
 export function parseCodexAsyncUserInput(value: unknown): CodexAsyncUserInput | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const v = value as Record<string, unknown>;
-  if (Object.keys(v).some(k => k !== 'threadId' && k !== 'itemId')) return undefined;
+  if (Object.keys(v).some(k => k !== 'threadId' && k !== 'itemId' && k !== 'nativeTurnId')) return undefined;
   if (typeof v.threadId !== 'string' || !v.threadId.trim() || v.threadId.length > 128
     || typeof v.itemId !== 'string' || !v.itemId.trim() || v.itemId.length > 128) return undefined;
-  return { threadId: v.threadId, itemId: v.itemId };
+  if (v.nativeTurnId !== undefined && (typeof v.nativeTurnId !== 'string'
+    || !v.nativeTurnId.trim() || v.nativeTurnId.length > 128)) return undefined;
+  return { threadId: v.threadId, itemId: v.itemId,
+    ...(typeof v.nativeTurnId === 'string' ? { nativeTurnId: v.nativeTurnId } : {}) };
+}
+
+export interface CodexAsyncAnswerSteerFacts {
+  answerer: string; originalAnswerer?: string; human: boolean;
+  managedLark: boolean; cleanInputAccepted: boolean;
+}
+
+/** A proven human answer remains interactive after it starts its own turn,
+ * including answers from legacy cards without a native target. This grant
+ * alone never permits inserting that answer into an unrelated native turn. */
+export function codexAsyncAnswerSteerable(facts: CodexAsyncAnswerSteerFacts): boolean {
+  return facts.human && facts.managedLark && facts.cleanInputAccepted
+    && facts.originalAnswerer === facts.answerer;
+}
+
+/** In-turn answer delivery additionally requires its original native target. */
+export function codexAsyncAnswerSteerTarget(input: CodexAsyncUserInput, facts: CodexAsyncAnswerSteerFacts): string | undefined {
+  return codexAsyncAnswerSteerable(facts) ? input.nativeTurnId : undefined;
+}
+
+/** This only narrows an existing daemon steer grant. A synthetic async answer
+ * without its target (e.g. a legacy card or a stripped sidecar) stays serial. */
+export function codexAsyncSteerTargetMatches(
+  replyTurnId: string | undefined, input: CodexAppTurnInput | undefined, nativeTurnId: string | undefined,
+): boolean {
+  const target = input?.steerTargetTurnId;
+  if (!target) return !replyTurnId?.startsWith('codex-async-answer-');
+  return nativeTurnId !== undefined && target === nativeTurnId;
 }
 
 /** Generated 0.162 protocol: agentMessage.delivery=async, questions have
