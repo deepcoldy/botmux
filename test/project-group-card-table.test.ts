@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { buildProjectGroupCard } from '../src/im/lark/project-group-card.js';
-import type { ProjectGroupState } from '../src/services/project-group-store.js';
+import { projectTitleWithoutTaskMarker, type ProjectGroupState } from '../src/services/project-group-store.js';
 
 function makeProject(overrides: Partial<ProjectGroupState> = {}): ProjectGroupState {
   const now = new Date().toISOString();
@@ -74,5 +74,13 @@ describe('buildProjectGroupCard workstream table', () => {
     expect(serialized).not.toContain(marker);
     expect(goalText).toContain('…');
     expect(goalText).not.toContain(goal);
+  });
+
+  it.each([
+    ['a trailing marker', '终态刷新修复 [task:0917F0D4099C854321C8ACA3F1459C31] ', '终态刷新修复'],
+    ['a marker followed by more title', '[task:0917f0d4099c854321c8aca3f1459c31] 终态刷新修复', '[task:0917f0d4099c854321c8aca3f1459c31] 终态刷新修复'],
+    ['a non-hex task tag', '终态刷新修复 [task:xyz]', '终态刷新修复 [task:xyz]'],
+  ])('group-facing title handles %s', (_, title, shown) => {
+    expect(projectTitleWithoutTaskMarker(title)).toBe(shown);
   });
 });

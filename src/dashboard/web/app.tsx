@@ -30,7 +30,6 @@ import { buildBotCards, loadGroupsSnapshot } from './overview.js';
 import { BotOnboardingDialog, OPEN_BOT_ONBOARDING_EVENT, openBotOnboarding } from './bot-onboarding.js';
 import { requestOpenCreateSession } from './create-session-entry.js';
 import { InfoTip } from './dashboard-components.js';
-import { initFloatingScrollbars } from './floating-scrollbars.js';
 import { initIconTooltips } from './icon-tooltip.js';
 import { PLUGIN_PINS_CHANGED_EVENT } from './plugin-events.js';
 import {
@@ -1937,7 +1936,6 @@ void (async () => {
   applyShellLocaleFromHash();
   const host = document.getElementById('app-root');
   if (!host) throw new Error('missing dashboard app root');
-  initFloatingScrollbars(host);
   initIconTooltips();
   appRoot = createRoot(host);
 
