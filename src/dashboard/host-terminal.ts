@@ -45,6 +45,7 @@ import { logger } from '../utils/logger.js';
 import { isExecutable, locateExecutable } from '../utils/executable.js';
 import { herdrExecutable } from '../utils/herdr-executable.js';
 import { redactChildEnv } from '../utils/child-env.js';
+import { startWsHeartbeat } from '../utils/ws-heartbeat.js';
 import { preferredManagedTmuxSocket, tmuxSocketArgs } from '../adapters/backend/tmux-socket.js';
 import { parseCookie } from './auth.js';
 import {
@@ -718,6 +719,9 @@ export function createHostTerminalManager(deps: HostTerminalDeps): HostTerminalM
   // 不绑定 http server（手动 handleUpgrade）：dashboard 的 upgrade 事件全局共享。
   // perMessageDeflate 保持 ws 默认的关闭：终端帧压缩省的带宽换不回 CPU 和延迟。
   const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false, maxPayload: 8 * 1024 * 1024 });
+  // 不告而别的客户端（手机休眠、断网）要靠心跳剔除：bun 1.4.4 的 ws 服务端不再有空闲超时，
+  // 不剔除就永远挂在 term.clients 里，空闲回收永远不会启动，终端数一路涨到 MAX_TERMINALS。
+  const heartbeat = startWsHeartbeat();
 
   function setOwner(term: HostTerminal, owner: Client | null): void {
     if (term.owner === owner) return;
@@ -813,9 +817,19 @@ export function createHostTerminalManager(deps: HostTerminalDeps): HostTerminalM
     const term = terminals.get(decodeURIComponent(m[1]));
     if (!term || term.exited) { try { socket.destroy(); } catch { /* ignore */ } return true; }
     wss.handleUpgrade(req, socket as any, head, (ws) => {
+      // Must precede the term.exited early return below: on bun 1.4.4 (and npm
+      // ws) a server-side socket with no 'error' listener turns a malformed frame
+      // into an uncaughtException, and the dashboard process installs no
+      // uncaughtException trap — one bad frame would crash every host terminal.
+      // That early return closes before a Client exists, so it can never reach
+      // the detach listener attached on the normal path; this swallow covers it.
+      // On the normal path the detach listener below is added too (both run;
+      // detach is idempotent).
+      ws.on('error', () => { /* closing or detached by the path-specific handler */ });
       if (term.exited) { try { ws.close(1000, 'process_exited'); } catch { /* ignore */ } return; }
       const c: Client = { ws, unacked: 0, hidden: false, stale: false, lastAckAt: Date.now() };
       term.clients.add(c);
+      heartbeat.watch(ws);
       if (term.idleTimer) { clearTimeout(term.idleTimer); term.idleTimer = null; }
       sendControl(ws, { t: 'hello', terminal: info(term) });
       // 现任主控端已经收不到输出（停投 / 后台）时，新连上的端直接接任——它的尺寸若恰好
@@ -831,6 +845,7 @@ export function createHostTerminalManager(deps: HostTerminalDeps): HostTerminalM
   };
 
   const shutdown: HostTerminalManager['shutdown'] = () => {
+    heartbeat.stop();
     for (const term of [...terminals.values()]) destroy(term, 'dashboard_shutdown');
   };
 

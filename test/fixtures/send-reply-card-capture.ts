@@ -129,9 +129,14 @@ const topicLookups = new Map<string, number>();
     const state = states[id] ?? 'live';
     if (state === 'error') throw new Error('topic lookup unavailable');
     data = state === 'withdrawn-code' ? { code: 230011, msg: 'withdrawn' }
-      : { code: 0, data: { items: [{ message_id: id, chat_id: 'oc_test',
+      : { code: 0, data: { items: state === 'missing' ? [] : [{ message_id: id, chat_id: 'oc_test',
         deleted: state === 'withdrawn' || (state === 'withdraw-after-preflight' && count > 1),
         body: { content: '{"text":"hello"}' } }] } };
+  } else if (url.pathname === '/open-apis/im/v1/messages' && process.env.BOTMUX_TEST_LIST_MESSAGES === '1') {
+    // Env-gated list endpoint (message.list walks); defaults to an empty page
+    // so read-only commands such as `botmux history` complete without extra
+    // per-test fixture surface.
+    data = { code: 0, data: { has_more: false, page_token: '', items: [] } };
   } else if (url.pathname.includes('/im/v1/messages/')) {
     // BOTMUX_TEST_THREAD_ID: the looked-up message now belongs to that topic.
     const threadId = process.env.BOTMUX_TEST_THREAD_ID;

@@ -34,7 +34,11 @@ function parsePluginRegistryText(text: string): PluginRegistryFile {
       if (!record.packageName || !record.version || !record.manifest) continue;
       plugins[id] = record;
     }
-    return { schemaVersion: 1, plugins };
+    const rawRevision = (parsed as { revision?: unknown })?.revision;
+    const revision = typeof rawRevision === 'number' && Number.isSafeInteger(rawRevision) && rawRevision > 0
+      ? rawRevision
+      : undefined;
+    return { schemaVersion: 1, plugins, ...(revision ? { revision } : {}) };
   } catch {
     return { schemaVersion: 1, plugins: {} };
   }
@@ -47,6 +51,21 @@ function parsePluginRegistry(): PluginRegistryFile {
     return parsePluginRegistryText(readFileSync(file, 'utf-8'));
   } catch {
     return { schemaVersion: 1, plugins: {} };
+  }
+}
+
+/** Read-only preflight for destructive cleanup, before a lazy migration can discard invalid records. */
+export function isPluginRegistryCompleteForCleanup(): boolean {
+  try {
+    const text = readFileSync(pluginRegistryPath(), 'utf8');
+    const raw = JSON.parse(text);
+    if (raw?.schemaVersion !== 1 || !raw.plugins || typeof raw.plugins !== 'object' || Array.isArray(raw.plugins)) return false;
+    const parsed = parsePluginRegistryText(text);
+    const ids = Object.keys(raw.plugins);
+    return ids.length === Object.keys(parsed.plugins).length
+      && ids.every(id => Object.hasOwn(parsed.plugins, id));
+  } catch {
+    return false;
   }
 }
 
@@ -65,9 +84,23 @@ function assertPublicPluginRegistry(registry: PluginRegistryFile): void {
   }
 }
 
+/** Read the durable mutation counter straight from disk. Callers already hold
+ *  the registry lock. Unlike a stat identity this never collides: every atomic
+ *  rewrite gets the next integer, including rewrites that restore the exact
+ *  same plugin set (the empty-slot A→B→A case). */
+function readRegistryRevisionUnlocked(): number {
+  try {
+    return parsePluginRegistryText(readFileSync(pluginRegistryPath(), 'utf-8')).revision ?? 0;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0;
+    throw error;
+  }
+}
+
 function writePluginRegistryUnlocked(registry: PluginRegistryFile): void {
   assertPublicPluginRegistry(registry);
   mkdirSync(dirname(pluginRegistryPath()), { recursive: true });
+  registry.revision = readRegistryRevisionUnlocked() + 1;
   atomicWriteFileSync(pluginRegistryPath(), JSON.stringify(registry, null, 2) + '\n', { mode: 0o600 });
 }
 
