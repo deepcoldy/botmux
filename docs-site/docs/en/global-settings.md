@@ -23,6 +23,7 @@ You can also edit `~/.botmux/config.json` directly. Every item below lists its J
 | Run scheduled tasks in a specific timezone | General → Scheduled tasks → Timezone | `scheduleTimeZone` | Follow host |
 | Prefix group names created by `/g` | General → Group Creation | `groupNamePrefix` | None |
 | Hide worktrees in the repo picker | General → Repo Picker | `repoPickerMode` | Repos + worktrees |
+| Put new worktrees on a larger disk | General → Worktrees | `worktreeRoot` | Next to the main repo |
 | Download new versions through a proxy | System & Maintenance → Auto Maintenance → GitHub download proxy | `httpProxy` | Not set |
 | Skip pasting the callback URL after `/login` | General → Access → OAuth callback base URL | `oauthRedirectBase` | Not set |
 
@@ -136,6 +137,7 @@ An invalid timezone name is skipped and the next level is used. The auto-update 
 
 - **`/g` group name prefix** (General → Group Creation, `groupNamePrefix`): groups created with `/group` or `/g` get this text in front of their name, e.g. `AI-chat·`. Other ways of creating groups don't. Clear it and save to turn it off; takes effect within about 2 seconds. See [Create a session group](/en/group).
 - **Repo picker card mode** (General → Repo Picker, `repoPickerMode`): `all` (default, repos plus their worktrees) or `repos` (main repos only). With `repos`, `/repo <worktree path>` still takes you into a worktree.
+- **Worktree directory** (General → Worktrees, `worktreeRoot`): botmux creates new worktrees under this directory, e.g. `/data00/worktrees`. Useful when the system disk is small and a larger data disk is mounted. Worktrees are laid out under it by the main repo's own path: a worktree of `/root/iserver/botmux` becomes `/data00/worktrees/root/iserver/botmux-wt-…`, so repos with the same name in different places don't collide. Use an absolute path (may start with `~/`) to an existing, writable directory. Only affects worktrees created from then on; existing ones stay where they are and keep working, also if you change the directory again later. If the directory later goes missing or stops being writable (e.g. the data disk isn't mounted, or was remounted read-only), new worktrees are created next to the main repo instead and a warning is logged. Clear it and save to go back to creating them next to the main repo; takes effect within about 2 seconds.
 
 ## Network and access
 
