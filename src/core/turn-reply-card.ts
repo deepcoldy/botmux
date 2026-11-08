@@ -10,7 +10,7 @@ import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { resolvePricingConfig } from '../services/model-pricing.js';
 import { localeForBot, t as tr } from '../i18n/index.js';
-import { prepareLocalAddressContent, sanitizeLocalAddressText } from '../im/lark/local-address-policy.js';
+import { LocalAddressOutboundError, prepareLocalAddressContent, sanitizeLocalAddressText } from '../im/lark/local-address-policy.js';
 import { localAddressContextForBot } from '../im/lark/local-address-context.js';
 import { isLarkContentAuditError } from '../im/lark/content-audit.js';
 import { sendWithContentAuditRedaction } from '../im/lark/content-audit-redaction.js';
@@ -234,9 +234,9 @@ export async function updateTurnReplyCard(
     catch (error) {
       publication({ status: 'unavailable', reason: 'delivery_unknown' },
         acknowledged.size ? 'partial' : 'unknown', 'delivery_unknown');
-      // 内容安全审计拒收是确定性的（打码重发已在 transport 里做过一次），原样重试无用。
+      // 内容安全审计拒收和本机跳转地址拒发都是确定性的（打码重发已在 transport 里做过一次），原样重试无用。
       if (attempt >= 2 || error instanceof MessageWithdrawnError || isLarkContentAuditError(error)
-        || store.read(key)?.withdrawn) throw error;
+        || error instanceof LocalAddressOutboundError || store.read(key)?.withdrawn) throw error;
       await new Promise(resolve => setTimeout(resolve, attempt === 0 ? 800 : 2000));
       beforeEffect();
     }

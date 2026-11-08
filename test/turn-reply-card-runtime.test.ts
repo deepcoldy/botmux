@@ -9,6 +9,7 @@ import { replyCardModeFor, updateTurnReplyCard, settleTurnReplyCards, supersedeT
 import { MessageWithdrawnError, updateMessage, uploadFile, replyMessage, sendMessage } from '../src/im/lark/client.js';
 import { observePublishedGroupMessage } from '../src/services/group-context-runtime.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
+import { LocalAddressOutboundError } from '../src/im/lark/local-address-policy.js';
 import { writeRoleReplyPrivately } from '../src/core/role-resolver.js';
 import type { CotEntry } from '../src/types.js';
 import { buildTurnReplyCard, replyCardPresentation } from '../src/im/lark/turn-reply-card.js';
@@ -525,6 +526,17 @@ describe('reply-card runtime eligibility and recovery', () => {
       });
       // original + one masked copy; the identical-payload retry loop is skipped.
       expect(updateMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not retry a local jump-target rejection', async () => {
+      const ds = session();
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, async () => 'om_reply');
+      vi.mocked(updateMessage).mockClear();
+      vi.mocked(updateMessage).mockRejectedValue(new LocalAddressOutboundError());
+      await expect(updateTurnReplyCard(ds, 'om_mode', final, async () => 'unused')).rejects.toMatchObject({
+        code: 'LOCAL_ADDRESS_OUTBOUND_REJECTED',
+      });
+      expect(updateMessage).toHaveBeenCalledTimes(1);
     });
   });
 
