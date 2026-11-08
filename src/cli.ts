@@ -127,6 +127,7 @@ import {
   isScriptedSetupInvocation,
   maskAppSecret,
   parseSetupCommand,
+  resolveWelcomeMessageFile,
   SETUP_CLI_USAGE,
   type SetupCommand,
 } from './setup/setup-args.js';
@@ -1824,13 +1825,18 @@ async function cmdSetupScripted(
     return;
   }
 
-  // --welcome-message @<文件>：执行层读文件（setup-args 保持纯函数）。
-  if ((cmd.action === 'add' || cmd.action === 'edit') && cmd.flags.welcomeMessage?.startsWith('@')) {
-    const file = resolve(expandHomePath(cmd.flags.welcomeMessage.slice(1)));
+  if (cmd.action === 'add' || cmd.action === 'edit') {
     try {
-      cmd.flags.welcomeMessage = readFileSync(file, 'utf8');
+      cmd.flags = resolveWelcomeMessageFile(cmd.flags, path => {
+        const file = resolve(expandHomePath(path));
+        try {
+          return readFileSync(file, 'utf8');
+        } catch (err) {
+          throw new Error(`读取欢迎语文件 ${file} 失败: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      });
     } catch (err) {
-      failSetupScripted(cmd.json, `读取欢迎语文件 ${file} 失败: ${err instanceof Error ? err.message : String(err)}`);
+      failSetupScripted(cmd.json, err instanceof Error ? err.message : String(err));
       return;
     }
   }

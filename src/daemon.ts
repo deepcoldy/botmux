@@ -105,7 +105,7 @@ import { botmuxVersion } from './utils/install-info.js';
 import { SESSION_STORE_PROTOCOL } from './utils/daemon-version-display.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
-import { deliverWelcomeMessageOnce } from './services/welcome-message.js';
+import { deliverWelcomeMessageOnce, planStartupWelcomeMessages } from './services/welcome-message.js';
 import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageUpdateExpiredError, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { GROUP_JOIN_ANCHOR_SCAN_LIMIT, pickGroupJoinAnchorMessageId, resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
@@ -153,7 +153,7 @@ import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
-import { coordinationModeIsPrimary, initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
+import { coordinationModeIsPrimary, initializeDurableCoordinationRuntime, type DurableCoordinationMode } from './services/durable-coordination-runtime.js';
 import { effortTaskFingerprint } from './services/codex-effort-task-state.js';
 import { closeLinkRefRuntime, initializeLinkRefRuntime } from './services/link-ref-runtime.js';
 import { startDurableInboxShadowConsumer } from './services/durable-inbox-shadow-consumer.js';
@@ -5761,26 +5761,29 @@ function notifyAllowedUsersResolveFailure(
 /**
  * bots.json `welcomeMessage`：机器人首次成功上线（事件分发已启动）后私聊 owner 一次。
  * 与 notifyAllowedUsersResolveFailure 同款 fire-and-forget + 限时，绝不阻塞启动；
- * 失败不落记录，下次启动重试。
+ * 失败释放认领，下次启动重试。各状态的日志由 deliverWelcomeMessageOnce 打。
  */
-function sendStartupWelcomeMessages(): void {
-  for (const bot of getAllBots()) {
-    const { larkAppId, welcomeMessage, apiOnly } = bot.config;
-    if (!welcomeMessage || apiOnly) continue;
+function sendStartupWelcomeMessages(coordinationMode: DurableCoordinationMode): void {
+  const plans = planStartupWelcomeMessages(getAllBots().map(bot => bot.config), {
+    coordinationMode,
+    resolvedOwnerOpenId: getOwnerOpenId,
+    configuredOwnerOpenId: getConfiguredOwnerOpenId,
+  });
+  for (const plan of plans) {
+    const { larkAppId } = plan;
+    if (plan.action === 'skip') {
+      logger.info(`[${larkAppId}] welcome message not sent: ${plan.reason === 'api_only'
+        ? 'core-only bot has no Feishu identity'
+        : 'BOTMUX_COORDINATION_MODE=primary replicas do not share the delivery record'}`);
+      continue;
+    }
     void deliverWelcomeMessageOnce({
       dataDir: config.session.dataDir,
       larkAppId,
-      message: welcomeMessage,
-      recipient: getOwnerOpenId(larkAppId) ?? getConfiguredOwnerOpenId(larkAppId),
-      send: (openId, text) => sendUserMessage(larkAppId, openId, text, 'text', undefined, { timeoutMs: 10_000 }),
-    }).then(result => {
-      if (result.status === 'sent') {
-        logger.info(`[${larkAppId}] welcome message sent to owner ${result.recipient.slice(0, 12)}`);
-      } else if (result.status === 'failed') {
-        logger.warn(`[${larkAppId}] welcome message DM failed (will retry on next start): ${result.error}`);
-      } else if (result.status === 'no_recipient') {
-        logger.warn(`[${larkAppId}] welcome message pending: no owner open_id resolved yet (will retry on next start)`);
-      }
+      message: plan.message,
+      recipient: plan.recipient,
+      send: (openId, text, { uuid, signal }) =>
+        sendUserMessage(larkAppId, openId, text, 'text', uuid, { timeoutMs: 10_000, signal }),
     }).catch(err => {
       logger.warn(`[${larkAppId}] welcome message skipped: ${err instanceof Error ? err.message : String(err)}`);
     });
@@ -34672,7 +34675,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   for (const startDispatcher of startEventDispatchers) startDispatcher();
   if (!cfg.apiOnly) void closeSessionsInGoneChatsOnStartup({ larkAppId: cfg.larkAppId, activeSessions });
-  sendStartupWelcomeMessages();
+  sendStartupWelcomeMessages(durableCoordinationRuntime?.mode ?? 'disabled');
   if (durableCoordinationRuntime?.mode === 'primary') {
     const deliverDurablePrimaryMessage = async (
       request: DurableSessionSendRequest,
