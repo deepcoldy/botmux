@@ -10,7 +10,7 @@ import { deploymentContinuationAuthority } from './deployment-continuation-autho
 import { CliProgressNotifier, cliProgressNoticeCard } from '../services/cli-progress-notice.js';
 import { traexStreamCardActivity } from './stream-card-activity.js';
 import { listPendingAsks } from './ask-broker.js';
-import { PERMISSION_ALLOW_KEY, PERMISSION_DENY_KEY } from './ask-hook/types.js';
+import { isHookPermissionAsk } from './ask-hook/types.js';
 import { captureCodexCleanupRelease, type CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
 import { removeP2pForceTopicRoot } from '../services/p2p-force-topic-store.js';
 import { archiveCodexForCleanup, ownedLocalCodex } from '../services/codex-cleanup-archive.js';
@@ -17180,8 +17180,7 @@ const PERMISSION_CARD_GRACE_MS = 3_000;
 /** The hook's allow/deny card for a Claude permission dialog, still unanswered. */
 function permissionCardPending(ds: DaemonSession): boolean {
   return listPendingAsks().some(a => a.larkAppId === ds.larkAppId && a.sessionId === ds.session.sessionId
-    && a.originKind === 'hook' && a.questions.length === 1
-    && a.questions[0].options.map(o => o.key).join('\n') === `${PERMISSION_ALLOW_KEY}\n${PERMISSION_DENY_KEY}`);
+    && isHookPermissionAsk(a));
 }
 
 function setupWorkerHandlers(
