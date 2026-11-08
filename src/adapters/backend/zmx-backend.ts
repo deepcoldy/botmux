@@ -2553,6 +2553,7 @@ export function zmxFreshSessionEnv(opts: SpawnOpts, socketDir?: string): NodeJS.
 /** Strip every payload-delivered key from ZMX control subprocesses. */
 export function zmxControlEnv(opts: SpawnOpts, socketDir?: string): NodeJS.ProcessEnv {
   const env = opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : { ...opts.env };
+  const payloadKeys = new Set(Object.keys(opts.injectEnv ?? {}));
   for (const assignment of buildBotmuxEnvAssignments(opts.env, opts.injectEnv, undefined, opts.gitConfigPairs)) {
     const equals = assignment.indexOf('=');
     if (equals <= 0) continue;
@@ -2561,15 +2562,14 @@ export function zmxControlEnv(opts: SpawnOpts, socketDir?: string): NodeJS.Proce
     // injected payload. ZMX control clients also need the caller's TMPDIR when
     // resolving a socket without an explicit ZMX_DIR.
     if (SESSION_TEMP_ENV_KEYS.some(tempKey => tempKey === key) && opts.injectEnv?.[key] === undefined) continue;
-    delete env[key];
+    payloadKeys.add(key);
   }
-  if (opts.injectEnv) {
-    for (const key of Object.keys(opts.injectEnv)) delete env[key];
-  }
-  // A session PATH (e.g. the Lark identity shim) belongs only to the CLI.
-  // Once stripped, use the worker's PATH to find host-managed zmx, then add
-  // the normal search paths and freeze the socket address after sanitizing.
-  env.PATH ??= process.env.PATH;
+  for (const key of payloadKeys) delete env[key];
+  // A payload PATH (e.g. the Lark identity shim dir) is for the CLI only.
+  // Control clients must still find zmx the way the availability probe did,
+  // through the worker's own PATH. Search paths and the recorded socket
+  // address are applied after stripping so payload keys cannot override them.
+  if (payloadKeys.has('PATH')) env.PATH = process.env.PATH;
   return zmxEnv(env, socketDir);
 }
 

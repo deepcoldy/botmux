@@ -142,11 +142,62 @@ describe('zmx env/probe helpers', () => {
     expect(result.error).toBeUndefined();
     expect(result.status).toBe(0);
     expect(result.stdout.trim()).toBe('host-zmx');
-    expect(env.PATH?.split(':')).not.toContain(sessionBin);
+    // Same lookup as the availability probe, so a host with two zmx installs
+    // drives the one that passed the probe.
+    expect(env.PATH).toBe(zmxEnv().PATH);
+    const pathEntries = env.PATH?.split(':') ?? [];
+    expect(pathEntries).toContain(hostBin);
+    expect(pathEntries).toEqual(expect.arrayContaining(['/usr/bin', '/bin']));
+    expect(pathEntries).not.toContain(sessionBin);
     expect(env.API_TOKEN).toBeUndefined();
     expect(env.BOTMUX_SESSION_ID).toBeUndefined();
     expect(opts.env.PATH).toBe(cliPath);
     expect(zmxFreshSessionEnv(opts).PATH).toBe(env.PATH);
+  });
+
+  it('builds the same control env as before when no PATH is injected', () => {
+    vi.stubEnv('PATH', '/worker/only/bin');
+    const searchPath = (path?: string) => zmxEnv(path === undefined ? {} : { PATH: path }).PATH;
+    const sessionEnv = {
+      PATH: '/session/bin:/usr/bin',
+      HOME: '/home/session',
+      TMPDIR: '/tmp/session-scratch',
+      KEEP_ME: 'yes',
+      HTTPS_PROXY: 'http://proxy.invalid:3128',
+      BOTMUX_SESSION_ID: 'session-secret',
+      ZMX_SESSION: 'outer',
+      ZMX_SESSION_PREFIX: 'dev-',
+      ZMX_DIR: '/tmp/caller-zmx',
+    };
+    const opts = {
+      cwd: '/tmp', cols: 80, rows: 24, env: sessionEnv,
+      injectEnv: { API_TOKEN: 'payload-secret', ZMX_DIR: '/tmp/payload-zmx' },
+    };
+
+    expect(zmxControlEnv(opts, '/tmp/recorded-zmx')).toStrictEqual({
+      PATH: searchPath('/session/bin:/usr/bin'),
+      HOME: '/home/session',
+      TMPDIR: '/tmp/session-scratch',
+      KEEP_ME: 'yes',
+      ZMX_DIR: '/tmp/recorded-zmx',
+    });
+    expect(zmxControlEnv({ ...opts, injectEnv: undefined })).toStrictEqual({
+      PATH: searchPath('/session/bin:/usr/bin'),
+      HOME: '/home/session',
+      TMPDIR: '/tmp/session-scratch',
+      KEEP_ME: 'yes',
+      ZMX_DIR: '/tmp/caller-zmx',
+    });
+    expect(zmxControlEnv({ ...opts, strictEnv: true }, '/tmp/recorded-zmx')).toStrictEqual({
+      PATH: searchPath('/session/bin:/usr/bin'),
+      HOME: '/home/session',
+      TMPDIR: '/tmp/session-scratch',
+      ZMX_DIR: '/tmp/recorded-zmx',
+    });
+    // Without an injected PATH the worker PATH never leaks in, even when the
+    // session env has no PATH of its own.
+    const { PATH: _sessionPath, ...sessionEnvWithoutPath } = sessionEnv;
+    expect(zmxControlEnv({ ...opts, env: sessionEnvWithoutPath }).PATH).toBe(searchPath(undefined));
   });
 
   it('records the native socket directory once and preserves it across selection in another environment', () => {
