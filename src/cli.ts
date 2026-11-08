@@ -90,6 +90,7 @@ import {
 } from './autostart.js';
 import { tmuxEnv, clientTmuxVersionForEnv, tmuxVersionAtLeast } from './setup/ensure-tmux.js';
 import { tmuxSocketArgs } from './adapters/backend/tmux-socket.js';
+import { sandboxEnabled } from './adapters/backend/sandbox.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
 import { findQuotaFallbackCycles } from './services/quota-fallback.js';
 import { findRetiredCliBots, retiredCliNotice } from './adapters/cli/retired-cli.js';
@@ -14010,7 +14011,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
           && !sendTopLevel && !vcMeetingManagedSendOrigin
           && !overrideChatId && !sendInto
           && !(s.sandbox === true || s.sandbox === 'oncall' || s.sandbox === 'scratch'
-            || process.env.BOTMUX_READ_ISOLATION === '1' || process.env.BOTMUX_SANDBOX === '1')
+            || process.env.BOTMUX_READ_ISOLATION === '1' || sandboxEnabled())
           && sid && anchorId
           && getBot(appId)?.config?.replyCardActions === true) {
           replyCardMenu = buildReplyCardActionOverflow({
@@ -14075,7 +14076,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       // A restored record can remain readable (for example via the Linux host
       // relay). Match the daemon's sandbox exclusion instead of reviving it.
       const replyCardSandboxed = s.sandbox === true || s.sandbox === 'oncall' || s.sandbox === 'scratch' || process.env.BOTMUX_READ_ISOLATION === '1'
-        || process.env.BOTMUX_SANDBOX === '1';
+        || sandboxEnabled();
       const canUseReplyCard = replyKey && !durableCoordinationPrimary
         && !privateReplyEnabled(s) && !replyCardSandboxed && !sendTopLevel && !overrideChatId && !sendInto
         && !vcMeetingManagedSendOrigin && !attention.requested && !explicitQuote && !noQuote
