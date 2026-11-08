@@ -30,6 +30,11 @@ export type BlindTurnVerdict =
   | { kind: 'none' }
   /** The bridge read the turn (its file grew, or it moved onto another one). */
   | { kind: 'read' }
+  /** An idle-compaction span the bridge read nothing of. Compaction writes its
+   *  records after the prompt returns and answers nobody, so it is not
+   *  reported; but terminal input the worker never sees (a client attached
+   *  straight to the pane) can run a real turn inside it. */
+  | { kind: 'maintenance'; turnStartedAtMs: number }
   | {
     kind: 'blind';
     /** When this turn started. */
@@ -79,13 +84,13 @@ export class BridgeBlindTurnWatch {
     this.idleCompaction = false;
     this.lastPromptAtMs = nowMs;
     if (!turn) return { kind: 'none' };
-    if (turn.maintenance && !hasPendingTurn) return { kind: 'none' };
     if (at.path !== turn.at.path || at.offset > turn.at.offset) {
       this.blindSinceMs = undefined;
       this.reported = false;
       return { kind: 'read' };
     }
     if (nowMs - turn.startedAtMs < BLIND_TURN_MIN_BUSY_MS) return { kind: 'none' };
+    if (turn.maintenance && !hasPendingTurn) return { kind: 'maintenance', turnStartedAtMs: turn.startedAtMs };
     this.blindSinceMs ??= turn.startedAtMs;
     return { kind: 'blind', turnStartedAtMs: turn.startedAtMs, blindSinceMs: this.blindSinceMs, reported: this.reported };
   }

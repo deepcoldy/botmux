@@ -378,6 +378,7 @@ import {
 import { CodexBridgeQueue, pruneExpiredPreStartHeadsAndEmit, selectStaleRestoredJournalTurns, type CodexPendingTurn } from './services/codex-bridge-queue.js';
 import { uncollectedTurnsNeedingNotice } from './services/structured-uncollected-notice.js';
 import { BridgeBlindTurnWatch, blindTurnNeedsNotice, type BridgeReadPosition } from './services/claude-bridge-blind-turn.js';
+import { terminalInputSubmits } from './adapters/cli/tui-input.js';
 import { detectCodexComposerState } from './services/codex-composer-state.js';
 import { refreshCodexTerminalSession, codexTerminalSessionIsBound } from './services/codex-terminal-session.js';
 import {
@@ -3905,6 +3906,20 @@ let lastWebTerminalInputAtMs = 0;
 let webTerminalInputGeneration = 0;
 /** webTerminalInputGeneration at the latest SessionStart boundary. */
 let webTerminalInputGenerationAtBoundary = 0;
+/** The forwards among those that submitted the CLI's input box
+ *  (terminalInputSubmits). ESC, Ctrl-C, arrow keys and characters still being
+ *  typed are terminal activity, not new model input. */
+let lastWebTerminalSubmitAtMs = 0;
+let webTerminalSubmitGeneration = 0;
+
+function noteWebTerminalInput(data: string): void {
+  lastWebTerminalInputAtMs = Date.now();
+  webTerminalInputGeneration++;
+  if (terminalInputSubmits(data)) {
+    lastWebTerminalSubmitAtMs = lastWebTerminalInputAtMs;
+    webTerminalSubmitGeneration++;
+  }
+}
 /** After the SessionStart signal fires, Ink's startup rendering or sibling
  *  hooks may still be active — typing immediately can trip Claude's
  *  paste-burst heuristic and the `\` soft-newline markers (claude-code
@@ -10424,16 +10439,16 @@ function noteClaudeBridgeTurnStarted(): void {
 
 /** 压缩 hook 只标记维护状态，不能打开 ready gate 或宣告模型回复结束。 */
 let claudeCompactionInputSnapshot: {
-  webGeneration: number;
+  webSubmitGeneration: number;
   writtenInput: typeof lastWrittenCliInput;
 } | undefined;
 
 function handleClaudeCompactionSignal(startedAtMs: number): void {
   if (lastInitConfig?.cliId !== 'claude-code') return;
-  if (lastWebTerminalInputAtMs > startedAtMs) return;
+  if (lastWebTerminalSubmitAtMs >= startedAtMs) return;
   if (bridgeBlindTurnWatch.noteCompactionStarted(bridgeQueue.peek().length > 0, startedAtMs)) {
     claudeCompactionInputSnapshot = {
-      webGeneration: webTerminalInputGeneration,
+      webSubmitGeneration: webTerminalSubmitGeneration,
       writtenInput: lastWrittenCliInput,
     };
   }
@@ -10449,11 +10464,21 @@ function judgeClaudeBridgeTurn(): void {
   // Judge what is on disk now, not what the last poll happened to drain.
   try { bridgeIngest(); } catch (err: any) { log(`Bridge ingest before the turn check failed: ${err.message}`); }
   const inputDuringCompaction = claudeCompactionInputSnapshot !== undefined
-    && (webTerminalInputGeneration !== claudeCompactionInputSnapshot.webGeneration
+    && (webTerminalSubmitGeneration !== claudeCompactionInputSnapshot.webSubmitGeneration
       || lastWrittenCliInput !== claudeCompactionInputSnapshot.writtenInput);
   const verdict = bridgeBlindTurnWatch.noteTurnEnded(bridgeReadPosition(), Date.now(),
     bridgeQueue.peek().length > 0 || inputDuringCompaction);
   claudeCompactionInputSnapshot = undefined;
+  if (verdict.kind === 'maintenance') {
+    // Input typed into a client attached straight to the pane reaches neither
+    // the queue nor the web counters, so a turn may have run inside this span.
+    // Recover it if Claude demonstrably writes another transcript; never report.
+    log(`Bridge read nothing during a ${Math.round((Date.now() - verdict.turnStartedAtMs) / 1000)}s ${cliName()} compaction span; not reporting it as an unread turn`);
+    if (relocateUnreadClaudeTranscript(verdict.turnStartedAtMs)) {
+      try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit after transcript recovery failed: ${err.message}`); }
+    }
+    return;
+  }
   if (verdict.kind !== 'blind') return;
   log(`Bridge read nothing from ${bridgeJsonlPath} during a ${Math.round((Date.now() - verdict.turnStartedAtMs) / 1000)}s ${cliName()} turn; locating the transcript it writes`);
   if (relocateUnreadClaudeTranscript(verdict.blindSinceMs)) {
@@ -29956,8 +29981,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
                 if (backend !== target || cliLifetimeNonce !== lifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
               }
               auditTerminalInput(auditUser, msg.data);
-              lastWebTerminalInputAtMs = Date.now();
-              webTerminalInputGeneration++;
+              noteWebTerminalInput(msg.data);
               if (usesHerdrSnapshotWebHistory()) {
                 if (msg.data.includes('\x1b[<64;')) herdrWebScrollDirection = 'up';
                 else if (msg.data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';

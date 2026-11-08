@@ -1,5 +1,6 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { terminalInputSubmits } from '../src/adapters/cli/tui-input.js';
 import {
   BLIND_TURN_MIN_BUSY_MS,
   BridgeBlindTurnWatch,
@@ -9,74 +10,169 @@ import {
 const OLD = '/claude/projects/-w/6b50f4a4-3392-43df-837b-02261f498b43.jsonl';
 const NEW = '/claude/projects/-w/76cd870a-7bd4-46e7-b191-34290ff42dc2.jsonl';
 const LONG = BLIND_TURN_MIN_BUSY_MS + 1;
+const ESC = '\x1b';
+const paste = (text: string): string => `\x1b[200~${text}\x1b[201~`;
 
-describe('worker 压缩事件与漏读通知', () => {
-  afterEach(() => vi.useRealTimers());
-  it.each(['web', 'written', 'pending'])('维护期间出现 %s 输入时仍报告真实漏读', (input) => {
+/** The real worker functions over one shared scope: the PreCompact signal, a
+ *  web-terminal forward and the prompt-ready judge. The bridge never grows, so
+ *  every busy span below reads as unread unless the compaction exemption holds. */
+function compactionWorker(relocate: () => boolean = () => false) {
+  const watch = new BridgeBlindTurnWatch();
+  const send = vi.fn();
+  const pending: Array<{ started: boolean; isLocal: boolean; turnId: string }> = [];
+  const relocateUnreadClaudeTranscript = vi.fn(relocate);
+  const bridgeDrainAndMaybeEmit = vi.fn();
+  const scope: Record<string, unknown> = {
+    lastInitConfig: { cliId: 'claude-code', adoptMode: false },
+    bridgeBlindTurnWatch: watch,
+    bridgeQueue: { peek: () => pending },
+    bridgeJsonlPath: OLD,
+    bridgeReadPosition: () => ({ path: OLD, offset: 100 }),
+    bridgeIngest: vi.fn(),
+    bridgeDrainAndMaybeEmit,
+    relocateUnreadClaudeTranscript,
+    zeroPromptTerminalSync: () => true,
+    readSendMarkers: () => [],
+    lastWebTerminalInputAtMs: 0,
+    webTerminalInputGeneration: 0,
+    lastWebTerminalSubmitAtMs: 0,
+    webTerminalSubmitGeneration: 0,
+    lastWrittenCliInput: undefined,
+    claudeCompactionInputSnapshot: undefined,
+    terminalInputSubmits,
+    blindTurnNeedsNotice,
+    cliName: () => 'Claude',
+    log: vi.fn(),
+    t: (key: string) => key,
+    send,
+  };
+  return {
+    scope,
+    pending,
+    relocateUnreadClaudeTranscript,
+    bridgeDrainAndMaybeEmit,
+    compactionSignal: loadWorkerFunction<(hookStartedAtMs: number) => void>('handleClaudeCompactionSignal', scope),
+    webInput: loadWorkerFunction<(data: string) => void>('noteWebTerminalInput', scope),
+    judge: loadWorkerFunction<() => void>('judgeClaudeBridgeTurn', scope),
+    busy: () => watch.noteTurnStarted({ path: OLD, offset: 100 }, Date.now()),
+    notices: () => send.mock.calls.filter(([message]) => message?.type === 'user_notify').length,
+  };
+}
+
+describe('worker：空闲压缩期间的输入与漏读通知', () => {
+  beforeEach(() => {
     vi.useFakeTimers();
-    vi.setSystemTime(100);
-    const watch = new BridgeBlindTurnWatch();
-    const send = vi.fn();
-    const pending: Array<{ started: boolean; isLocal: boolean; turnId: string }> = [];
-    const scope = {
-      lastInitConfig: { cliId: 'claude-code', adoptMode: false },
-      bridgeBlindTurnWatch: watch,
-      bridgeQueue: { peek: () => pending },
-      bridgeJsonlPath: OLD,
-      bridgeReadPosition: () => ({ path: OLD, offset: 100 }),
-      bridgeIngest: vi.fn(), relocateUnreadClaudeTranscript: () => false,
-      zeroPromptTerminalSync: () => true, readSendMarkers: () => [],
-      webTerminalInputGeneration: 0, lastWebTerminalInputAtMs: 0,
-      lastWrittenCliInput: undefined as unknown,
-      blindTurnNeedsNotice, cliName: () => 'Claude', log: vi.fn(), t: (key: string) => key, send,
-    };
-    const signal = loadWorkerFunction<(at: number) => void>('handleClaudeCompactionSignal', scope);
-    const judge = loadWorkerFunction<() => void>('judgeClaudeBridgeTurn', scope);
-    signal(100);
-    watch.noteTurnStarted({ path: OLD, offset: 100 }, 101);
-    if (input === 'web') scope.webTerminalInputGeneration++;
-    else if (input === 'written') scope.lastWrittenCliInput = {};
-    else pending.push({ started: false, isLocal: false, turnId: 'new-input' });
-    // 重复开始信号不能重置输入快照，导致吞掉此前已送入的输入。
-    signal(100);
-    vi.advanceTimersByTime(LONG + 1);
-    judge();
-    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: 'user_notify' }));
+    vi.setSystemTime(10_000);
   });
-  it('维护开始先于 JSONL 落盘时不通知；下一轮真实漏读仍触发通知', () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
-    const watch = new BridgeBlindTurnWatch();
-    const send = vi.fn();
-    const scope = {
-      lastInitConfig: { cliId: 'claude-code', adoptMode: false },
-      bridgeBlindTurnWatch: watch,
-      bridgeQueue: { peek: () => [] },
-      bridgeJsonlPath: OLD,
-      bridgeReadPosition: () => ({ path: OLD, offset: 100 }),
-      bridgeIngest: vi.fn(),
-      relocateUnreadClaudeTranscript: () => false,
-      zeroPromptTerminalSync: () => true,
-      readSendMarkers: () => [],
-      blindTurnNeedsNotice,
-      cliName: () => 'Claude',
-      log: vi.fn(),
-      t: (key: string) => key,
-      send,
-    };
-    const signal = loadWorkerFunction<(startedAtMs: number) => void>('handleClaudeCompactionSignal', scope);
-    const judge = loadWorkerFunction<() => void>('judgeClaudeBridgeTurn', scope);
-    watch.noteTurnStarted({ path: OLD, offset: 100 }, 0);
-    signal(0);
-    vi.advanceTimersByTime(65_000);
-    judge();
-    expect(send).not.toHaveBeenCalled();
-    vi.advanceTimersByTime(31_000);
-    watch.noteCompactionFinished();
-    watch.noteTurnStarted({ path: OLD, offset: 100 }, Date.now());
+  afterEach(() => vi.useRealTimers());
+
+  it.each([
+    ['ESC', [ESC]],
+    ['Ctrl-C', ['\x03']],
+    ['ArrowUp', ['\x1b[A']],
+    ['没提交的字符', ['h', 'ello']],
+    ['括号粘贴里的换行', [paste('line1\rline2')]],
+  ])('Web 终端在压缩期间按 %s 不算新输入：不误报；之后真正漏读的一轮照常告警', (_label, chunks) => {
+    const w = compactionWorker();
+    w.compactionSignal(Date.now());
+    w.busy();
+    vi.advanceTimersByTime(2_000);
+    for (const chunk of chunks) w.webInput(chunk);
     vi.advanceTimersByTime(LONG);
-    judge();
-    expect(send).toHaveBeenCalledWith(expect.objectContaining({ type: 'user_notify' }));
+    w.judge();
+    expect(w.notices()).toBe(0);
+
+    w.busy();
+    vi.advanceTimersByTime(LONG);
+    w.judge();
+    expect(w.notices()).toBe(1);
+  });
+
+  it.each([
+    ['Web 提交', ['hello\r']],
+    ['多段输入后回车', ['h', 'el', 'lo', '\r']],
+    ['未开括号粘贴时粘贴带换行', ['line1\rline2']],
+    ['粘贴后再回车', [paste('line1\rline2'), '\r']],
+    ['粘贴与回车在同一段', [`${paste('line1')}\r`]],
+  ])('Web 终端在压缩期间%s：仍报告漏读', (_label, chunks) => {
+    const w = compactionWorker();
+    w.compactionSignal(Date.now());
+    w.busy();
+    vi.advanceTimersByTime(2_000);
+    for (const chunk of chunks) w.webInput(chunk);
+    vi.advanceTimersByTime(LONG);
+    w.judge();
+    expect(w.notices()).toBe(1);
+  });
+
+  it.each([
+    ['ESC', ESC, 0],
+    ['Web 提交', 'hello\r', 1],
+  ])('hook 晚到：hook 已开始、信号还没到 worker 时按了 %s', (_label, data, expected) => {
+    const w = compactionWorker();
+    const hookStartedAtMs = Date.now();
+    vi.advanceTimersByTime(500);
+    w.webInput(data);
+    vi.advanceTimersByTime(500);
+    w.compactionSignal(hookStartedAtMs);
+    w.busy();
+    vi.advanceTimersByTime(LONG);
+    w.judge();
+    expect(w.notices()).toBe(expected);
+  });
+
+  it.each(['web', 'written', 'pending'])('压缩期间出现 %s 输入时仍报告漏读；重复的开始信号不重置输入快照', (input) => {
+    const w = compactionWorker();
+    const hookStartedAtMs = Date.now();
+    w.compactionSignal(hookStartedAtMs);
+    w.busy();
+    if (input === 'web') w.webInput('hello\r');
+    else if (input === 'written') w.scope.lastWrittenCliInput = {};
+    else w.pending.push({ started: false, isLocal: false, turnId: 'new-input' });
+    w.compactionSignal(hookStartedAtMs);
+    vi.advanceTimersByTime(LONG);
+    w.judge();
+    expect(w.notices()).toBe(1);
+  });
+
+  it('提示符先于 compact_boundary 落盘时不通知；下一轮真实漏读仍触发通知', () => {
+    const w = compactionWorker();
+    w.busy();
+    w.compactionSignal(Date.now());
+    vi.advanceTimersByTime(65_000);
+    w.judge();
+    expect(w.notices()).toBe(0);
+    vi.advanceTimersByTime(31_000);
+    (w.scope.bridgeBlindTurnWatch as BridgeBlindTurnWatch).noteCompactionFinished();
+    w.busy();
+    vi.advanceTimersByTime(LONG);
+    w.judge();
+    expect(w.notices()).toBe(1);
+  });
+
+  it('压缩跨度里 Claude 实际写的是另一个 transcript 时（直接 attach 的终端可能在里面跑了一轮），照常切过去补读，但不告警', () => {
+    const w = compactionWorker(() => true);
+    const hookStartedAtMs = Date.now();
+    w.compactionSignal(hookStartedAtMs);
+    w.busy();
+    vi.advanceTimersByTime(LONG);
+    w.judge();
+    expect(w.relocateUnreadClaudeTranscript).toHaveBeenCalledWith(hookStartedAtMs);
+    expect(w.bridgeDrainAndMaybeEmit).toHaveBeenCalledTimes(1);
+    expect(w.notices()).toBe(0);
+  });
+});
+
+describe('terminalInputSubmits', () => {
+  it.each([
+    ['\r', true],
+    ['\n', true],
+    [`${ESC}\r`, true],
+    ['\x7f', false],
+    [paste('a\nb\n'), false],
+    ['\x1b[200~没收尾的粘贴\r', false],
+  ])('%j → %s', (data, expected) => {
+    expect(terminalInputSubmits(data)).toBe(expected);
   });
 });
 
@@ -112,11 +208,24 @@ describe('BridgeBlindTurnWatch', () => {
     watch.noteTurnStarted({ path: OLD, offset: 100 }, 0);
     watch.noteCompactionStarted(false, 0);
     watch.noteTurnStarted({ path: OLD, offset: 100 }, 100);
-    expect(watch.noteTurnEnded({ path: OLD, offset: 100 }, 65_000)).toEqual({ kind: 'none' });
+    expect(watch.noteTurnEnded({ path: OLD, offset: 100 }, 65_000)).toEqual({ kind: 'maintenance', turnStartedAtMs: 0 });
     watch.noteCompactionFinished();
     expect(watch.noteTurnEnded({ path: OLD, offset: 200 }, 96_000)).toEqual({ kind: 'none' });
     watch.noteTurnStarted({ path: OLD, offset: 200 }, 100_000);
     expect(watch.noteTurnEnded({ path: OLD, offset: 200 }, 100_000 + LONG).kind).toBe('blind');
+  });
+
+  it('压缩跨度里 bridge 读到了新内容：与没有压缩时一样算读到，结束之前的漏读 run', () => {
+    const watch = new BridgeBlindTurnWatch();
+    watch.noteTurnStarted({ path: OLD, offset: 100 }, 0);
+    watch.noteTurnEnded({ path: OLD, offset: 100 }, LONG);
+    watch.noteReported();
+    watch.noteCompactionStarted(false, 9_000);
+    watch.noteTurnStarted({ path: OLD, offset: 100 }, 10_000);
+    expect(watch.noteTurnEnded({ path: OLD, offset: 200 }, 10_000 + LONG)).toEqual({ kind: 'read' });
+    watch.noteTurnStarted({ path: OLD, offset: 200 }, 20_000);
+    expect(watch.noteTurnEnded({ path: OLD, offset: 200 }, 20_000 + LONG))
+      .toMatchObject({ kind: 'blind', blindSinceMs: 20_000, reported: false });
   });
 
   it('已存在待处理模型轮次时，PreCompact 不屏蔽真正漏读的告警', () => {
