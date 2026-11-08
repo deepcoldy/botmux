@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -231,13 +231,21 @@ describe('host capability links in a default LAN deployment', () => {
     expect(JSON.parse(writes[2].data.content).text).not.toContain('5173');
   });
 
-  it('sends the trusted plugin result card on the dashboard origin', async () => {
+  it.each([
+    ['configured', undefined],
+    ['fallback', Number(config.dashboard.port) + 4],
+  ] as const)('sends the trusted plugin result card on the %s dashboard port', async (_kind, boundPort) => {
+    if (boundPort) {
+      mkdirSync(join(home, '.botmux'), { recursive: true });
+      writeFileSync(join(home, '.botmux', '.dashboard-port'), String(boundPort));
+    }
     const { app, writes } = capture();
     const accessUrl = resolvePluginResultAccessUrl('view_token_abcdefghijklmnopqrstuvwxyz')!;
     expect(() => sanitizeLocalAddressNode({ android_url: accessUrl })).toThrow();
     const entry = buildTrustedResultDeliveryCard({
       accessUrl, expiresAt: new Date(Date.now() + 3_600_000).toISOString(), brand: 'feishu',
     });
+    if (boundPort) expect(new URL(accessUrl).port).toBe(String(boundPort));
     await sendMessage(app, 'oc_chat', entry, 'interactive');
     expect(writes).toHaveLength(1);
     expect(writes[0].data.content).toContain(accessUrl);

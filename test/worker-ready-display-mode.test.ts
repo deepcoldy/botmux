@@ -331,6 +331,19 @@ describe('Worker ready: set_display_mode re-sync', () => {
   });
 
   it.each([
+    ['keeps', 'view_cap'.padEnd(43, '0')],
+    ['omits', null],
+  ] as const)('%s the direct-port terminal button by whether the worker reported a read capability', (verdict, token) => {
+    const ds = makeDs({
+      worker: makeFakeWorker(), workerReady: true, workerPort: 9999, workerViewToken: token,
+      session: { ...makeDs().session, backendType: 'tmux', webPort: 9999 },
+    });
+    for (const url of [readableTerminalUrlFor(ds), liveReadableTerminalUrlFor(ds)]) {
+      expect(url).toBe(verdict === 'keeps' ? `http://localhost:9999?viewToken=${token}` : '');
+    }
+  });
+
+  it.each([
     { name: 'diagnostic parking', crashDiagnosticParked: true },
     { name: 'CLI restart', crashDiagnosticParked: false },
   ])('keeps the terminal server available during $name without a ready CLI', ({ crashDiagnosticParked }) => {

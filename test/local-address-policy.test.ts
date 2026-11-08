@@ -121,7 +121,7 @@ describe('local address presentation policy', () => {
     it.each([
       'http://10.20.30.40:3000/', 'http://10.20.30.40:45678/', 'http://10.20.30.40:45678/anything',
       'http://10.20.30.40:45678/?viewToken=GUESS', `http://10.20.30.40:45678/?viewToken=${cap}&next=x`,
-      'http://10.20.30.40:8800/s/victim?token=x', `http://10.20.30.40:8800/s/${sid}/../../etc`,
+      'http://10.20.30.40:8800/s/victim?token=x', `http://10.20.30.40:8800/s/${sid}/../../etc`, `http://10.20.30.40:8800/s/${sid}/x`,
       `http://10.20.30.40:8800/s/${sid}#/x`, 'http://10.20.30.40:3000/#/v3/run-1',
       'http://10.20.30.40:7891/?t=GUESSED', 'http://10.20.30.40:7891/#/settings', 'http://10.20.30.40:7891/admin',
       'http://10.20.30.40:7891/__daemon/shutdown', 'http://10.20.30.40:7891/plugin-result-access/short',
@@ -129,6 +129,7 @@ describe('local address presentation policy', () => {
       'http://alice@10.20.30.40:7891/', 'https://10.20.30.40:7891/', 'http://127.0.0.1:7891/', 'file:///tmp/report.md',
       wrap('http://10.20.30.40:5173/'), wrap('http://10.20.30.40:7891/') + '&next=' + encodeURIComponent('http://10.20.30.40:3000/'),
       wrap('http://10.20.30.40:7891/') + '&url=x', wrap(wrap('http://10.20.30.40:7891/')),
+      'https://example.com/client/web_url/open?url=' + encodeURIComponent('http://10.20.30.40:7891/'),
       'https://example.com/login?next=' + encodeURIComponent('http://10.20.30.40:3000/'),
       'https://example.com/r/' + encodeURIComponent(encodeURIComponent('http://10.20.30.40:3000/x')),
     ])('rejects %s', url => {
