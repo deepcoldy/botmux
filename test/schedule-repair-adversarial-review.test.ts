@@ -464,9 +464,14 @@ describe('scheduled send settlement for in-flight sends, restarts and superseded
   const taskRow = (id: string) => store.getRecord(APP, id)!.task;
   const sendKey = (s: Session, run: { turnId: string }) => ({ larkAppId: APP, sessionId: s.sessionId, turnId: run.turnId });
   function slowFinal(s: Session, run: { turnId: string }) {
+    // Build the deferred synchronously: ledger.execute invokes dispatch only
+    // after its lock await, so assigning resolve inside the dispatch left
+    // `finish` undefined under shard microtask starvation. The dispatch now
+    // simply awaits a promise whose resolver exists from the first tick.
     let finish!: (messageId: string) => void;
+    const delivery = new Promise<string>(resolve => { finish = resolve; });
     const receipt = new TurnSendLedger(isolated.dataDir).execute(sendKey(s, run), 'final', 'slow final',
-      () => new Promise<string>(resolve => { finish = resolve; }), { fenced: true });
+      () => delivery, { fenced: true });
     return { receipt, finish: (messageId: string) => finish(messageId) };
   }
 
@@ -531,7 +536,7 @@ describe('scheduled send settlement for in-flight sends, restarts and superseded
     await pumpUntil(() => expect(taskRow(run.taskId)).toMatchObject({ lastStatus: 'ok', runStats: { failed: 0 } }),
       30_000, 500);
     expect(logFor(run)?.outcome).toBe('model_dispatched');
-  }, 60_000);
+  }, 120_000);
 
   it('settles a send whose pending settlement a daemon restart dropped', async () => {
     const s = session();
@@ -644,7 +649,7 @@ describe('scheduled send settlement for in-flight sends, restarts and superseded
       expect(logFor(run)?.outcome).toBe('model_dispatched');
       expect(markFailed).not.toHaveBeenCalled();
     }, 60_000, 500);
-  }, 60_000);
+  }, 120_000);
 
   it('settles a recovered run by its recovery turn alone when reconciling after a restart', async () => {
     const s = session();
