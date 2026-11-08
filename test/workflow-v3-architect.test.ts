@@ -291,6 +291,23 @@ describe('allocateArchitectAttempt', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('throws instead of spinning when the next number is past MAX_SAFE_INTEGER', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'v3-architect-alloc-boundary-'));
+    try {
+      // MAX_SAFE_INTEGER parses to a safe integer, so the readdir filter lets
+      // it through; the next n would be 2^53 — the in-loop guard must fail
+      // closed instead of entering the stuck EEXIST retry loop.
+      const boundary = String(Number.MAX_SAFE_INTEGER);
+      mkdirSync(join(attemptsOf(dir), boundary), { recursive: true });
+
+      expect(() => allocateArchitectAttempt(dir)).toThrow(/安全整数/);
+      // It throws before mkdir, so no unsafe-numbered directory is left behind.
+      expect(readdirSync(attemptsOf(dir))).toEqual([boundary]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 /**
