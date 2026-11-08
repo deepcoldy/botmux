@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { normalizeSubstituteMode } from '../src/services/substitute-mode-normalize.js';
 
 describe('normalizeSubstituteMode', () => {
@@ -149,5 +149,17 @@ describe('App ID configuration reload', () => {
   });
   it('does not fall back to a person when the App ID is malformed', () => {
     expect(normalizeSubstituteMode({ enabled: true, targets: [{ appId: 'bad', openId: 'ou_stale' }] })).toBeUndefined();
+  });
+  it('lowercases an App ID so a hand-written uppercase value still matches', () => {
+    expect(normalizeSubstituteMode({ enabled: true, targets: [{ appId: ' CLI_External9 ' }] })?.targets)
+      .toEqual([{ appId: 'cli_external9' }]);
+  });
+  it('reports each dropped App ID target', () => {
+    const onInvalidAppId = vi.fn();
+    const cfg = normalizeSubstituteMode({
+      enabled: true, targets: [{ appId: 'bad' }, { appId: 42 }, { appId: 'cli_ok' }],
+    }, onInvalidAppId);
+    expect(cfg?.targets).toEqual([{ appId: 'cli_ok' }]);
+    expect(onInvalidAppId.mock.calls).toEqual([['bad'], [42]]);
   });
 });

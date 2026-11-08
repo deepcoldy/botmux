@@ -3644,6 +3644,10 @@ export function loadBotConfigsCached(): readonly BotConfig[] {
 }
 
 /** Pure parser: bots.json text → BotConfig[]. Exported for testing & reuse. */
+// Uncached config loads re-parse bots.json several times per turn; warn once
+// per bot and value for the life of the process.
+const warnedInvalidSubstituteAppIds = new Set<string>();
+
 export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
   let parsed: unknown;
   try {
@@ -3888,7 +3892,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // Shared normalizer (with substitute-mode-store): keeps a disabled config's
     // target list so the dashboard toggle can flip without re-entering everyone;
     // only an enabled-but-unmatchable config collapses to undefined.
-    const substituteMode: SubstituteModeConfig | undefined = normalizeSubstituteMode(entry.substituteMode);
+    const substituteMode: SubstituteModeConfig | undefined = normalizeSubstituteMode(entry.substituteMode, value => {
+      const shown = JSON.stringify(value)?.slice(0, 80);
+      const key = `${entry.larkAppId}\0${shown}`;
+      if (warnedInvalidSubstituteAppIds.has(key)) return;
+      warnedInvalidSubstituteAppIds.add(key);
+      logger.warn(`[substitute:${entry.larkAppId}] ignoring substitute target with invalid appId ${shown}`);
+    });
 
     // chatReplyModes：只保留每群显式设置，非法值丢弃。四态 chat｜chat-topic｜
     // new-topic｜shared 都保留解析。显式设置即使与当前 per-bot 默认相同也保留为覆盖；

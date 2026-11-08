@@ -145,6 +145,12 @@ describe('App ID configuration', () => {
     expect(resolveRaw).not.toHaveBeenCalled();
     expect(getProfile).not.toHaveBeenCalled();
   });
+  it('saves an uppercase App ID in the lowercase form Feishu reports', async () => {
+    const result = await resolveSubstituteTargets('cli_receiver', [{ appId: 'CLI_External' }, { appId: 'cli_external' }], deps);
+    expect(result.targets).toEqual([{ appId: 'cli_external' }]);
+    expect(result.resolution.map(entry => entry.appId)).toEqual(['cli_external', 'cli_external']);
+    expect(result.invalidAppId).toBe(false);
+  });
   it('rejects an invalid App ID instead of falling back to a carried person identifier', async () => {
     const result = await resolveSubstituteTargets('cli_receiver', [{ appId: 'bad', openId: 'ou_alice' }], deps);
     expect(result.targets).toEqual([]);

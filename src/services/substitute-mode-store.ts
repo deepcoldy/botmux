@@ -126,15 +126,16 @@ export async function resolveSubstituteTargets(
   for (const { t, raw } of inputs) {
     if (!raw && t.appId === undefined) continue;
     if (t.appId !== undefined) {
-      if (typeof t.appId !== 'string' || !/^cli_[a-z0-9]+$/i.test(raw)) {
+      const appId = raw.toLowerCase();
+      if (typeof t.appId !== 'string' || !/^cli_[a-z0-9]+$/.test(appId)) {
         invalidAppId = true;
         resolution.push({ input: raw, ok: false, reason: 'unresolvable' });
         continue;
       }
-      resolution.push({ input: raw, ok: true, appId: raw, name: t.name });
-      if (!seen.has(raw)) {
-        seen.add(raw);
-        targets.push({ appId: raw, ...(t.name ? { name: t.name } : {}) });
+      resolution.push({ input: raw, ok: true, appId, name: t.name });
+      if (!seen.has(appId)) {
+        seen.add(appId);
+        targets.push({ appId, ...(t.name ? { name: t.name } : {}) });
       }
       continue;
     }

@@ -22,7 +22,10 @@ import type { SubstituteModeConfig, SubstituteTarget } from '../bot-registry.js'
  *    de-duplicated, and dropped when empty. They persist on a disabled config
  *    the same way targets do.
  */
-export function normalizeSubstituteMode(raw: unknown): SubstituteModeConfig | undefined {
+export function normalizeSubstituteMode(
+  raw: unknown,
+  onInvalidAppId?: (value: unknown) => void,
+): SubstituteModeConfig | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const rec = raw as Record<string, unknown>;
   const targets = Array.isArray(rec.targets)
@@ -31,9 +34,14 @@ export function normalizeSubstituteMode(raw: unknown): SubstituteModeConfig | un
         const src = item as Record<string, unknown>;
         const target: SubstituteTarget = {};
         if (src.appId !== undefined) {
-          if (typeof src.appId !== 'string' || !/^cli_[a-z0-9]+$/i.test(src.appId.trim())) return [];
+          // Feishu reports App IDs in lowercase only.
+          const appId = typeof src.appId === 'string' ? src.appId.trim().toLowerCase() : '';
+          if (!/^cli_[a-z0-9]+$/.test(appId)) {
+            onInvalidAppId?.(src.appId);
+            return [];
+          }
           // App ID is the sole matching identity; never retain a stale resolved person/bot id.
-          target.appId = src.appId.trim();
+          target.appId = appId;
           if (typeof src.name === 'string' && src.name.trim()) target.name = src.name.trim();
           return [target];
         }
