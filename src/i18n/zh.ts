@@ -1853,6 +1853,7 @@ export const messages: Record<string, string> = {
   'daemon.force_topic_ready': '💬 新话题已创建。请在话题内发送任务，也可以先用 /repo 选择项目。',
   'daemon.force_topic_started': '↪️ 已转入新话题，正在处理…',
   'daemon.force_topic_current_dir_missing': '⚠️ 当前群聊还没有可复用的工作目录。请先在普通群启动一个会话或使用 /oncall bind 绑定目录。',
+  'daemon.force_topic_worktree_command_unsupported': '⚠️ /tw 后面不能直接跟 {cmd}：/tw 话题要等 worktree 建好才有会话，命令没有落点。不需要 worktree 就直接发 {cmd}；需要的话先发 /tw <任务> 开话题，再在话题里发 {cmd}。',
   // ─── 话题指令头（`[标题] /t /repo … /model … 正文`）的拒绝文案 ───────────
   // fail closed：任一项不合法就整条不生效，所以这条回复是用户唯一的反馈，
   // 必须指名道姓说清哪一项错了。
