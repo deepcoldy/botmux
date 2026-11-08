@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, unlinkSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync, readFileSync, existsSync, unlinkSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -151,9 +151,9 @@ function okArchitectDeps(): ArchitectDeps {
   return {
     runArchitect: async (input) => ({
       status: 'ok',
-      dagPath: join(input.runDir, 'architect/attempts/001/work/dag.json'),
-      notesPath: join(input.runDir, 'architect/attempts/001/work/architect-notes.md'),
-      manifestPath: join(input.runDir, 'architect/attempts/001/manifest.json'),
+      dagPath: join(input.attempt.attemptDir, 'work/dag.json'),
+      notesPath: join(input.attempt.attemptDir, 'work/architect-notes.md'),
+      manifestPath: join(input.attempt.attemptDir, 'manifest.json'),
     }),
     loadDag: () => ({ schemaVersion: 2, runId: 'r', nodes: [] }),
     botSnapshot: DUMMY_BOT,
@@ -388,20 +388,21 @@ describe('host — architect（codex 3 断言）', () => {
     }
   });
 
-  it('并发 architect 共享 run 级 async transaction：attempt001 只启动一个 worker，竞争调用明确 busy', async () => {
+  it('并发 architect 共享 run 级 async transaction：只启动一个 worker（attempt 001），竞争调用明确 busy 且不占号', async () => {
     const b = base();
     let releaseWorker: () => void = () => {};
     let first: Promise<Awaited<ReturnType<typeof hostArchitect>>> | undefined;
     try {
       const { runDir } = toApprovedSpec(b);
+      const attemptsDir = join(runDir, 'architect', 'attempts');
       const workerGate = new Promise<void>((resolve) => { releaseWorker = resolve; });
       const runArchitect = vi.fn(async (input: Parameters<ArchitectDeps['runArchitect']>[0]) => {
         await workerGate;
         return {
           status: 'ok' as const,
-          dagPath: join(input.runDir, 'architect/attempts/001/work/dag.json'),
-          notesPath: join(input.runDir, 'architect/attempts/001/work/architect-notes.md'),
-          manifestPath: join(input.runDir, 'architect/attempts/001/manifest.json'),
+          dagPath: join(input.attempt.attemptDir, 'work/dag.json'),
+          notesPath: join(input.attempt.attemptDir, 'work/architect-notes.md'),
+          manifestPath: join(input.attempt.attemptDir, 'manifest.json'),
         };
       });
       const deps: ArchitectDeps = {
@@ -411,21 +412,30 @@ describe('host — architect（codex 3 断言）', () => {
 
       first = hostArchitect(runDir, deps);
       await waitUntil(() => runArchitect.mock.calls.length === 1);
+      expect(runArchitect.mock.calls[0]![0].attempt.attemptId).toBe('architect/attempts/001');
       expect(readGrillState(runDir)!.status).toBe('architect_running');
 
-      // The second call cannot enter runArchitect (and therefore cannot rm -rf
-      // the shared attempt001) while the first process/call owns the file lock.
+      // The second call cannot allocate an attempt or start a worker while the
+      // first process/call owns the file lock.
       await expect(hostArchitect(runDir, deps)).rejects.toThrow(/another workflow host mutation|\u53e6一个 workflow host mutation/);
       expect(runArchitect).toHaveBeenCalledTimes(1);
+      expect(readdirSync(attemptsDir)).toEqual(['001']);
       expect(readGrillState(runDir)!.status).toBe('architect_running');
 
       releaseWorker();
       const out = await first;
       first = undefined;
       expect(out.ok).toBe(true);
+      expect(out.attemptDir).toBe(join(attemptsDir, '001'));
       expect(out.state.status).toBe('dag_ready');
       expect(readGrillState(runDir)!.status).toBe('dag_ready');
       expect(runArchitect).toHaveBeenCalledTimes(1);
+
+      hostReviseDag(runDir);
+      const again = await hostArchitect(runDir, deps);
+      expect(runArchitect.mock.calls[1]![0].attempt.attemptId).toBe('architect/attempts/002');
+      expect(again.state.dagPath).toBe(join(attemptsDir, '002', 'work', 'dag.json'));
+      expect(readdirSync(attemptsDir).sort()).toEqual(['001', '002']);
     } finally {
       releaseWorker();
       await first?.catch(() => undefined);

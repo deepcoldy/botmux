@@ -16,6 +16,7 @@ import { authorizeSessionScopedIpc, bindSessionScopedIpcIdentity } from '../src/
 import { createExplicitAskContinuation, explicitAskOriginIsLive } from '../src/core/explicit-ask-continuation.js';
 import { frozenReplyContextForTurn } from '../src/core/reply-target.js';
 import { createLarkAskCardDispatcher } from '../src/im/lark/ask-card.js';
+import { isSilentMessageListenerSession } from '../src/core/message-listener-silence.js';
 import { productionConst } from './helpers/codex-async-answer-function-harness.js';
 
 // 执行 daemon.ts 里真实的 handleAskRequest，配真实 broker / 显式 ask 回执 / 飞书发卡器，
@@ -79,6 +80,7 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
       authorizeSessionScopedIpc,
       bindSessionScopedIpcIdentity,
       larkTransportEnabled: () => true,
+      isSilentMessageListenerSession,
       getBot: () => ({ config: { apiOnly: false, cliId: 'codex-app' } }),
       resolveDocumentAskDelivery: async () => undefined,
       captureRoutingGeneration: () => ({}),

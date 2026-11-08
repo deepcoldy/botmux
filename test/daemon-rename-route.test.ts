@@ -322,6 +322,30 @@ describe('document Ask production routing', () => {
     },
   );
 
+  it('refuses to surface an ask card from a silent listener session into the source group', async () => {
+    registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'codex', allowedUsers: [OWNER] });
+    const ds = seedThreadSession('ml:om_silent_source', 'silent listener task');
+    ds.session.messageListenerRun = { sourceMessageId: 'om_silent_source', replyMode: 'none' as const };
+    let card: PendingAsk | undefined;
+    setCardDispatcher({ async send(ask) { card = ask; return { messageId: 'om_should_not_send' }; } });
+    const secret = 'silent-ask-test-secret';
+    setIpcAuthSecret(secret);
+    const server = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    try {
+      const path = '/api/asks';
+      const response = await fetch(`http://127.0.0.1:${server.port}${path}`, {
+        method: 'POST', headers: daemonIpcAuthHeaders({ secret, port: server.port, method: 'POST', path,
+          headers: { 'content-type': 'application/json' } }),
+        body: JSON.stringify({ sessionId: ds.session.sessionId, larkAppId: APP, chatId: CHAT,
+          rootMessageId: 'ml:om_silent_source', questions, timeoutMs: 60_000,
+          originKind: 'native-user-input', originTurnId: 'turn-silent' }),
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ ok: false, error: 'silent_message_listener' });
+      expect(card).toBeUndefined();
+    } finally { await server.close(); }
+  });
+
   it.each(['button', 'dm-text'] as const)('keeps async document questions private and preserves their reply route after completion: %s', async answerMode => {
     const ds = seedDocument();
     const bot = registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'codex-app',
