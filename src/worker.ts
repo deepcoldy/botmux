@@ -27,6 +27,7 @@ import type { Duplex } from 'node:stream';
 import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
 import {claudeActionPrompt} from './services/claude-action-prompt.js';
+import { WrittenInputLedger } from './services/prompt-submission-match.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
 import { CODEX_CONFIG_FILE, seedIsolatedCodexHome } from './services/codex-isolated-config.js';
 import { supportsZeroPromptInjection } from './core/prompt-injection.js';
@@ -8403,6 +8404,8 @@ let pendingRestartInterruption: InterruptedWork | undefined;
 /** The last input written to the CLI: the turn a standalone restart note
  *  continues when nothing else is queued. */
 let lastWrittenCliInput: PendingCliInput | undefined;
+/** Turns written to the CLI, until its prompt hook reports submitting one. */
+const writtenInputs = new WrittenInputLedger();
 let restoredDeploymentTurnId: string | undefined;
 /** When this worker saw its previous CLI process end (exit callback, or its
  *  own teardown). Lets the scan tell the process's exit kills from a task
@@ -9104,6 +9107,7 @@ function saveUnsentInputsForSuccessor(reason: string): void {
  *  continues, and a restored predecessor input is no longer outstanding. */
 function noteCliInputWritten(item: PendingCliInput): void {
   lastWrittenCliInput = item;
+  if (item.turnId) writtenInputs.noteWritten(item.turnId, item.content);
   if (restoredUnsentInputs.delete(item) && restoredUnsentInputs.size === 0) {
     const unsentPath = unsentInputJournalPath();
     if (unsentPath) try { settleTakenUnsentInputs(unsentPath); } catch { /* next take reports it */ }
@@ -25207,6 +25211,18 @@ async function spawnCli(
   if (boundLark) {
     identityShellEnv.BOTMUX_LARK_TOOL_BINDING = larkToolBindingPath(identityDataDir!, cfg.sessionId);
     if (process.env.BOTMUX_DAEMON_IPC_PORT) identityShellEnv.BOTMUX_DAEMON_IPC_PORT = process.env.BOTMUX_DAEMON_IPC_PORT;
+    // CLI launchers and native tool runners may rebuild PATH and skip shell
+    // startup hooks. Forward the managed entry explicitly, just like its
+    // binding locator, instead of relying only on inherited PATH/BASH_ENV.
+    const effectivePath = perBotInjectEnv.PATH ?? process.env.PATH;
+    // Linux file sandboxes construct a canonical /run/sbxbin-first PATH later;
+    // a host-side .set override would bypass those sandbox command entries.
+    // Limit this compatibility fix to direct TraeX launches. Gateway wrappers
+    // own their config forwarding and must not receive a new raw -c setting.
+    if (cfg.cliId === 'traex' && !cfg.wrapperCli && !sandboxRequested && effectivePath !== undefined) {
+      const dir = identityShellEnv.BOTMUX_IDENTITY_BIN;
+      identityShellEnv.PATH = [dir, ...effectivePath.split(':').filter(path => path !== dir)].join(':');
+    }
   }
   if (cfg.cliId === 'traex' && !cfg.adoptMode && effectiveResume && effectiveCliSessionId) {
     noteTraexResumeTargetLeftInDefaultHome(effectiveCliSessionId);
@@ -26315,6 +26331,7 @@ async function spawnCli(
       // Feishu-cred grant + hard-denies bots.json/lark-cli stores so a workingDir=~
       // grant can't re-expose them, and independently withholds the role-library grant.
       larkTransportEnabled,
+      larkToolIdentityEnabled: boundLark,
       // ALWAYS freeze BOTH botmux authority roots for a no-transport turn: the
       // configured one (`botmuxHome` above = dirname(dataDir)) AND the canonical
       // default `~/.botmux`. A custom SESSION_DATA_DIR moves the data dir, but the
@@ -34047,6 +34064,8 @@ process.on('message', async (raw: unknown, handle: unknown) => {
         // 遗留的上一轮已终态 turnId，防止边沿更新误归因到历史 turn。
         publishScreenStatus('working', { force: true, clearTurnId: true });
       }
+      const submittedTurnId = writtenInputs.takeSubmitted(msg);
+      if (submittedTurnId) send({ type: 'prompt_submitted_input', turnId: submittedTurnId });
       break;
     }
 

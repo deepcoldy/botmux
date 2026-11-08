@@ -3396,6 +3396,7 @@ export function BotAgentSection(props: {
               ariaLabel={tr('botDefaults.agentModel')}
               defaultLabel={tr('botDefaults.modelPickerDefault')}
               customLabel={tr('botDefaults.modelPickerCustom')}
+              includeDefault
               menuClassName="bd-field-menu"
               detectedCount={detectedLiveCount || undefined}
               detectedLabel={detectedLiveCount > 0

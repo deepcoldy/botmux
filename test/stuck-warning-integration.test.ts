@@ -1100,9 +1100,10 @@ describe('Claude permission dialog notice (integration)', () => {
     const notice = () => fakeWorker.emit('message', {
       type: 'user_notify', kind: 'claude_permission_prompt', message: 'Claude 正等待你确认', turnId: 'turn_1',
     });
-    const hookAsk = (options = ALLOW_DENY, sessionId = ds.session.sessionId) => void registerAsk({
+    const hookAsk = (options = ALLOW_DENY, sessionId = ds.session.sessionId, kind: 'permission' | 'question' = 'permission') => void registerAsk({
       larkAppId: ds.larkAppId, chatId: ds.chatId, rootMessageId: 'om_root', sessionId, originKind: 'hook', timeoutMs: 600_000,
-      questions: [{ prompt: 'Claude 请求执行一个需要人工确认的操作', multiSelect: false, options }],
+      questions: [{ prompt: 'Claude 请求执行一个需要人工确认的操作', multiSelect: false, options,
+        ...(kind === 'permission' ? { allowCustom: false } : {}) }],
     });
     return { notice, hookAsk };
   }
@@ -1128,6 +1129,7 @@ describe('Claude permission dialog notice (integration)', () => {
     ['no card arrives (hook missing, fork agent)', () => {}],
     ['only another kind of ask is pending', hookAsk => hookAsk([{ key: 'staging', label: 'staging' }, { key: 'production', label: 'production' }])],
     ['the pending card belongs to another session', hookAsk => hookAsk(ALLOW_DENY, 'sid-other')],
+    ['only an AskUserQuestion card whose options happen to be allow / deny is pending', hookAsk => hookAsk(ALLOW_DENY, undefined, 'question')],
   ])('is sent when %s', async (_, pending) => {
     const { notice, hookAsk } = setup();
     pending(hookAsk);

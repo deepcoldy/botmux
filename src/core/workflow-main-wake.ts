@@ -38,7 +38,14 @@
  * session going idle after a working screen of that very turn), when the
  * session that took it is closed or its CLI stops (`wakeSessionEnded`), when
  * the wake cannot be delivered (retries used up), or at the safety cap
- * {@link WORKFLOW_CHECKPOINT_HOLD_MAX_MS}. A wake queued behind another turn
+ * {@link WORKFLOW_CHECKPOINT_HOLD_MAX_MS}. On a session whose CLI reports
+ * taking an input, an end counts only after the CLI took the wake's text: a
+ * CLI can go idle with the text still unsubmitted in its input box, and its
+ * worker's idle and terminal then end nothing (warned once; the hold stays
+ * until the CLI takes the text, or the cap). Taken only after such an end (a
+ * proof that lagged a short turn), it ends at the first look a poll or more
+ * later that finds the session idle (a run of the text since would have
+ * ended it at that run's idle edge). A wake queued behind another turn
  * is not released by that turn's end. After a restart (nothing of the turn
  * in memory) a hold whose wake already went out is released as soon as the
  * session that took it is proven idle — looked at on every scan, poll and
@@ -49,6 +56,9 @@
 
 import { join } from 'node:path';
 
+import type { CliId } from '../adapters/cli/types.js';
+import type { PromptHookTarget } from './session-manager.js';
+import { effectiveSessionCliId } from './session-rename.js';
 import type { DaemonSession } from './types.js';
 import type { V3Dag } from '../workflows/v3/dag.js';
 import type { RunChatBinding } from '../workflows/v3/grill-state.js';
@@ -103,6 +113,28 @@ export function workflowMainWakeSessionState(
   return ds.cliReady && (ds.lastScreenStatus === undefined || ds.lastScreenStatus === 'idle') ? 'idle' : 'busy';
 }
 
+/** Whether a session's CLI reports, on every submit, taking an input: only
+ *  where botmux's UserPromptSubmit hook runs (`promptHookRuns`: Claude Code
+ *  on this host, the hook in the settings it reads). It runs before the model
+ *  starts on the text; the transcript record (`native_input_consumed`) backs
+ *  it up. Other CLIs' proofs are not there on every submit (a Codex history
+ *  line or app-server ack, a Claude fork's transcript record within its mark's
+ *  lifetime), and a correctly submitted wake must never wait for the cap. An
+ *  adopted pane runs no hook. */
+export function workflowMainWakeAcceptanceReported(
+  ds: DaemonSession | undefined,
+  botCliId: CliId,
+  promptHookRuns: (target: PromptHookTarget) => boolean,
+): boolean {
+  if (!ds || ds.adoptedFrom || ds.session.adoptedFrom) return false;
+  return promptHookRuns({
+    cliId: effectiveSessionCliId(ds) ?? botCliId,
+    ...(ds.session.cliConfigDir ? { cliConfigDir: ds.session.cliConfigDir } : {}),
+    ...(ds.session.backendType ? { sessionBackendType: ds.session.backendType } : {}),
+    larkAppId: ds.larkAppId,
+  });
+}
+
 export interface WorkflowMainWakeSessionView {
   sessionId: string;
   /** What the verifier will compare: the thread root (thread scope) or the
@@ -140,6 +172,11 @@ export interface WorkflowMainWakeDeps {
    *  over to anything but a `busy` one (with no live CLI the trigger starts
    *  one whose first turn is the wake). */
   sessionState(sessionId: string): WorkflowMainWakeSessionState;
+  /** Whether the session's CLI reports taking an input on every submit
+   *  ({@link workflowMainWakeAcceptanceReported}): a wake handed to it ends
+   *  only after it took the wake's text. Absent or false: by its terminal
+   *  and the screen alone. */
+  provesInputAcceptance?(sessionId: string): boolean;
   /** `triggerSessionTurn` with daemon-internal controls. */
   deliver(request: TriggerRequest, internal: WorkflowMainWakeDeliveryControls): Promise<TriggerResponse>;
   /** Re-drive a run after a checkpoint was released. */
@@ -177,6 +214,11 @@ export interface WorkflowMainWake {
   onScreenStatus(sessionId: string, update: { status: string; prevStatus?: string; turnId?: string }): void;
   /** A turn of a session reached its terminal. */
   onTurnEnded(sessionId: string, turnId: string): void;
+  /** The session's worker proved its CLI took this turn's text: its prompt
+   *  hook submitted a prompt that is or starts with that text, or the input
+   *  entered the conversation (a transcript record, a history line, an
+   *  app-server ack). */
+  onInputAccepted(sessionId: string, turnId: string): void;
 }
 
 /** Where a wake goes: the main topic's live session, else the main topic
@@ -241,6 +283,15 @@ interface HandedOverWake {
   checkpoint: boolean;
   /** A working screen of this very turn was seen: its worker was on it. */
   seenRunning?: boolean;
+  /** Its session's CLI reports taking an input: the turn can end only once
+   *  `accepted`. */
+  awaitsAcceptance?: boolean;
+  /** The CLI took the wake's text. */
+  accepted?: boolean;
+  /** An end seen before `accepted` was warned about. */
+  warnedUnaccepted?: boolean;
+  /** When it was taken, if only after an end was seen. */
+  acceptedAfterEnd?: number;
   /** Found after a restart: this process never saw it start. */
   restored?: boolean;
   /** When this process took it on. */
@@ -342,7 +393,7 @@ export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMain
     if (!list) return;
     const ended = list.filter(match);
     if (ended.length === 0) return;
-    const rest = list.filter((entry) => !match(entry));
+    const rest = list.filter((entry) => !ended.includes(entry));
     if (rest.length > 0) handedOver.set(sessionId, rest);
     else handedOver.delete(sessionId);
     for (const entry of ended) {
@@ -351,10 +402,25 @@ export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMain
     rescanWaiting(sessionId);
   }
 
+  /** An end of a wake turn seen before its CLI took the text, which may
+   *  still sit unsubmitted in the input box: it ends nothing. */
+  function endedUnaccepted(entry: HandedOverWake): void {
+    if (entry.warnedUnaccepted) return;
+    entry.warnedUnaccepted = true;
+    deps.warn(`[workflow-wake:${entry.runId}] wake ${entry.eventSeq} looked finished before the main session's CLI took its text; ${entry.checkpoint ? 'the checkpoint stays held' : 'later wakes wait'} until the CLI takes it, at most ${WORKFLOW_CHECKPOINT_HOLD_MAX_MS / 60_000} minutes`);
+  }
+
+  function accept(entry: HandedOverWake): void {
+    if (entry.accepted) return;
+    entry.accepted = true;
+    if (entry.warnedUnaccepted) entry.acceptedAfterEnd = now();
+  }
+
   /** What the session's state alone proves about the wakes handed to it:
    *  closed or no CLI — over; idle — over for the ones found after a restart
-   *  (nothing else tells which turn is running there). Never in the way of
-   *  later wakes for longer than the hold cap. */
+   *  (nothing else tells which turn is running there), and for one taken after
+   *  its end was seen, a poll ago or more. Never in the way of later wakes for
+   *  longer than the hold cap. */
   function settle(sessionId: string): void {
     if (!handedOver.has(sessionId)) return;
     const state = deps.sessionState(sessionId);
@@ -362,7 +428,10 @@ export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMain
       endWakes(sessionId, () => true, 'wakeSessionEnded');
       return;
     }
-    if (state === 'idle') endWakes(sessionId, (entry) => entry.restored === true, 'wakeTurnEnded');
+    if (state === 'idle') {
+      endWakes(sessionId, (entry) => entry.restored === true
+        || (entry.acceptedAfterEnd !== undefined && now() - entry.acceptedAfterEnd >= WORKFLOW_MAIN_WAKE_POLL_MS), 'wakeTurnEnded');
+    }
     endWakes(sessionId, (entry) => now() - entry.at >= WORKFLOW_CHECKPOINT_HOLD_MAX_MS, 'holdTimeout');
   }
 
@@ -462,7 +531,14 @@ export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMain
             if (!view?.opening) throw err;
             recordError = err;
           }
-          inFlightEntry = { runId, eventSeq: event.eventSeq, turnId, checkpoint: event.kind === 'checkpoint', at: now() };
+          inFlightEntry = {
+            runId,
+            eventSeq: event.eventSeq,
+            turnId,
+            checkpoint: event.kind === 'checkpoint',
+            ...(deps.provesInputAcceptance?.(sessionId) ? { awaitsAcceptance: true } : {}),
+            at: now(),
+          };
           track(sessionId, inFlightEntry);
         },
         onDispatchRefused: () => { refused = true; },
@@ -620,14 +696,32 @@ export function createWorkflowMainWake(deps: WorkflowMainWakeDeps): WorkflowMain
       if (status !== 'idle' || prevStatus === 'idle') return;
       // Went idle: the end of a wake turn seen running (the fallback for CLIs
       // without a turn terminal) — not of one still queued behind the turn
-      // that just ended; after a restart, idle proven now.
-      endWakes(sessionId, (entry) => entry.seenRunning === true, 'wakeTurnEnded');
+      // that just ended. The screen shows a turn from its write on, so on a
+      // CLI that reports taking input only a wake it took has ended. After a
+      // restart, idle proven now.
+      endWakes(sessionId, (entry) => {
+        if (!entry.awaitsAcceptance) return entry.seenRunning === true;
+        if (entry.accepted) return true;
+        if (entry.seenRunning) endedUnaccepted(entry);
+        return false;
+      }, 'wakeTurnEnded');
       settle(sessionId);
       rescanWaiting(sessionId);
     },
     onTurnEnded: (sessionId, turnId) => {
       if (!parseWorkflowEventTurnId(turnId)) return;
-      endWakes(sessionId, (entry) => entry.turnId === turnId, 'wakeTurnEnded');
+      endWakes(sessionId, (entry) => {
+        if (entry.turnId !== turnId) return false;
+        if (!entry.awaitsAcceptance || entry.accepted) return true;
+        endedUnaccepted(entry);
+        return false;
+      }, 'wakeTurnEnded');
+    },
+    onInputAccepted: (sessionId, turnId) => {
+      if (!parseWorkflowEventTurnId(turnId)) return;
+      for (const entry of handedOver.get(sessionId) ?? []) {
+        if (entry.turnId === turnId) accept(entry);
+      }
     },
   };
 }

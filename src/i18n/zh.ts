@@ -1259,6 +1259,10 @@ export const messages: Record<string, string> = {
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
   'ai.routing.intro': '你在飞书（Lark）会话中。用户看不到终端输出，必须用 `botmux send` 发送回复。',
+  'ai.routing.no_local_addresses': '用户在自己的飞书客户端阅读回复，无法访问开发机文件或本机服务。所有回复、进度、协作说明和卡片禁止携带开发机绝对路径、文件协议或本机服务地址；技能只写名称，源码使用仓库相对引用，交付文件使用附件或真实可访问链接，没有链接时说明交付状态，禁止编造地址。',
+  'card.local_address.internal_file': '【内部文件】',
+  'card.local_address.unavailable_link': '（未提供可访问链接）',
+  'worker.final_output_local_address_rejected': '结果卡包含无法供用户访问的本机跳转地址，完整结果未发送。已停止原样重试。',
   'ai.routing.usage_send': '- 发送：`botmux send "消息"`',
   'ai.routing.usage_mention_gate': '- 每条 send 必须三选一：`--mention <open_id>` / `--mention-back` / `--no-mention`——按内容价值选：有实质结论要对方看/确认/决策 → @；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发',
   'ai.routing.usage_attachments': '- 附件：`--images`、`--files`、`--videos`；尺寸/排版选择先 `botmux skill show botmux-send`',
@@ -1353,6 +1357,7 @@ export const messages: Record<string, string> = {
   'ai.followup.reminder_hook': '本会话通过 botmux 桥接飞书,终端里的输出用户看不到。会话约定:回复通过 botmux send 发送到飞书会话;发什么、发几条由你判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND。',
   'ai.followup.reminder_no_resend': '发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND;send 成功即已送达,本轮无可见文本地结束是正常的,别因「无输出」提示重发',
   'ai.followup.feishu_safe_emphasis': '短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。',
+  'ai.followup.no_local_addresses': '回复里不要放开发机路径、文件协议或本机服务地址，文件用附件或可访问链接。',
   // No-transport 续轮（apiOnly bot / HTTP 虚拟会话）：这是程序发起的请求-应答，无飞书
   // 会话、无其它 bot 协作，也不该 botmux send。哨兵语义只在本轮内容里的
   // <botmux_http_response_mode> 出现一次（迁移不删，#808 async settle 依赖它），
@@ -2269,6 +2274,22 @@ export const messages: Record<string, string> = {
   'card.ask.invalidated': '已失效',
   'card.ask.invalidated_claimant_gone': '提问的会话已不在等这个回答（CLI 已退出、重启或这一轮已结束），这张卡不再接收回答。需要继续的话直接在会话里发消息。',
   'card.ask.invalidated_answer_undelivered': '这个回答没有送进会话：提问的 CLI 已不在等待。需要继续的话直接在会话里发消息。',
+  'card.ask.permission_timed_out': '超时未答 · 已自动拒绝',
+  'card.ask.permission_timed_out_detail': '截止前没人在卡片上确认，botmux 已按「拒绝」回复 Claude Code（若终端里已处理，以终端为准）。',
+  'card.ask.cli_outcome.cli_auto_denied': '已超时 · Claude Code 自动拒绝',
+  'card.ask.cli_outcome.cli_auto_denied.detail': 'Claude Code 的确认框无人处理，到时自动拒绝了这次操作，命令未执行。',
+  'card.ask.cli_outcome.terminal_allowed': '已在终端处理 · 允许执行',
+  'card.ask.cli_outcome.terminal_allowed.detail': '这次操作已在终端被允许并执行完毕。',
+  'card.ask.cli_outcome.terminal_rejected': '已在终端处理 · 拒绝',
+  'card.ask.cli_outcome.terminal_rejected.detail': '这次操作在终端被拒绝或取消（含 Esc 中断），命令未执行。',
+  'card.ask.cli_outcome.allowed_elsewhere': '已在 Claude Code 内放行',
+  'card.ask.cli_outcome.allowed_elsewhere.detail': '这次操作在 Claude Code 内被放行（不是通过这张卡），已执行。',
+  'card.ask.cli_outcome.denied_elsewhere': '已在 Claude Code 内拒绝',
+  'card.ask.cli_outcome.denied_elsewhere.detail': '这次操作在 Claude Code 内被拒绝（不是通过这张卡），命令未执行。',
+  'card.ask.cli_outcome.resolved_elsewhere': '已在 Claude Code 内结束',
+  'card.ask.cli_outcome.resolved_elsewhere.detail': 'Claude Code 已不经这张卡结束了这次确认，这张卡不再生效。',
+  'card.ask.cli_outcome.cli_stopped_waiting': 'Claude Code 已结束这次确认',
+  'card.ask.cli_outcome.cli_stopped_waiting.detail': '确认框已关闭（终端已处理、本轮被中断或会话已退出），这张卡不再生效。',
   'card.ask.answerable_designated_member': '指定成员（仅本人可操作）',
   'card.ask.answerable_talk_members': '本群可对话成员',
 

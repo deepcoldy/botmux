@@ -6,6 +6,7 @@ import { t, type Locale } from '../../i18n/index.js';
 import { askOptionLayoutForBot } from './ask-option-layout.js';
 import { supportsAskCustomInput } from '../../core/ask-custom-input.js';
 import { buildAskCustomForm } from './ask-custom-form.js';
+import { permissionAskSettleStatus } from './ask-permission-status.js';
 
 const safe = (text: string) => stripCardMarkdownImages(text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]'))
   .replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -71,9 +72,12 @@ export function turnReplyAskSummary(entry: ReplyCardAsk, locale: Locale = 'zh'):
       ? result.customAnswers?.[i] ?? result.inputs?.[i] ?? result.answers[i]?.map(key => q.options.find(o => o.key === key)?.label ?? key).join(', ') : '';
     return `🙋 ${safe(q.prompt)}${labels ? `\n✓ ${safe(labels)}` : ''}`;
   });
+  const permission = result ? permissionAskSettleStatus(ask, result, locale) : undefined;
   if (result?.kind === 'answered') {
     if (result.comment) lines.push(`💬 ${safe(result.comment)}`);
     else if (!result.inputs?.some(Boolean) && !result.customAnswers?.some(Boolean) && result.answers.every(keys => keys.length === 0)) lines.push(locale === 'en' ? '✓ No options selected' : '✓ 未选择任何选项');
+  } else if (permission) {
+    lines.push(`${permission.headline}\n${permission.detail}`);
   } else {
     lines.push(result?.kind === 'timedOut' ? t('card.ask.timed_out', undefined, locale)
       : result?.kind === 'invalidated' ? t('card.ask.invalidated', undefined, locale)

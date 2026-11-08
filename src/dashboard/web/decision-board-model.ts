@@ -2,7 +2,8 @@
 // 管家配置的保存载荷。不碰 DOM、不发请求，页面和测试都直接 import。
 //
 // 类型只从 core 模型 type-import：那个模块会连带拉进 lark-hosts 等服务端代码，
-// 值导入会把它们打进浏览器 bundle。
+// 值导入会把它们打进浏览器 bundle。files.js 不依赖任何模块，可以值导入。
+import { boardFileKind, type BoardFileKind } from '../../core/decision-board/files.js';
 import type {
   BoardBatch,
   BoardChatCheck,
@@ -88,6 +89,8 @@ export interface BoardItemSummary extends BoardItem, ItemTaskFields {
   unseen: boolean;
   url?: string;
   appLink?: string;
+  /** 图文说明（说明页 + 视频）个数；没有或旧 daemon 不带。 */
+  explainers?: number;
 }
 
 // ─── 事项关联的群 ─────────────────────────────────────────────────────────────
@@ -474,6 +477,45 @@ export function checkBoardImages(files: ReadonlyArray<{ type: string; size: numb
   if (files.some(f => f.size > BOARD_IMAGE_MAX_BYTES)) return { ok: false, reason: 'size' };
   if (existing + files.length > BOARD_FILES_PER_DRAFT) return { ok: false, reason: 'count' };
   return { ok: true };
+}
+
+// ─── 图文说明 ─────────────────────────────────────────────────────────────────────
+
+export type { BoardFileKind };
+
+export interface BoardExplainer {
+  id: string;
+  kind: 'html' | 'video';
+  name: string;
+  bytes: number;
+  createdAt: number;
+}
+
+/**
+ * 说明页嵌在页内时 iframe 的 sandbox：空串 = 全部限制（不跑脚本、不透明源、不能弹窗 / 提交表单 / 导航顶层）。
+ * 和响应头里的 CSP sandbox 是两道闸，哪一道单独都够。
+ */
+export const BOARD_EXPLAINER_SANDBOX = '';
+
+/** 事项的图文说明（说明页和视频），新附的在前；截图不算。 */
+export function boardExplainers(files: readonly BoardFile[]): BoardExplainer[] {
+  const out: BoardExplainer[] = [];
+  for (const f of files) {
+    const kind = boardFileKind(f.mime);
+    if (kind === 'html' || kind === 'video') out.push({ id: f.id, kind, name: f.name, bytes: f.bytes, createdAt: f.createdAt });
+  }
+  return out.sort((a, b) => b.createdAt - a.createdAt);
+}
+
+/** 历史里一个附件怎么显示：不在文件列表里的按截图处理（和以前一样）。 */
+export function eventFileKind(id: string, files: ReadonlyMap<string, BoardFile>): BoardFileKind {
+  const file = files.get(id);
+  return (file && boardFileKind(file.mime)) || 'image';
+}
+
+export function formatBoardBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
 // ─── 提交 ───────────────────────────────────────────────────────────────────

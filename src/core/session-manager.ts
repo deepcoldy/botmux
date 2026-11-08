@@ -27,7 +27,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
-import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks } from '../adapters/cli/shared-hints.js';
+import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks, feishuReplyPresentationGuidance } from '../adapters/cli/shared-hints.js';
 import { usesLarkToolBinding } from './lark-tool-binding.js';
 import { effectiveReplyDelivery, type ReplyDelivery } from './reply-delivery.js';
 import {
@@ -1266,6 +1266,7 @@ function managedLarkToolAppIdForPrompt(
       larkAppId,
       chatId,
       apiOnly: botConfig.apiOnly,
+      headless: session?.headless,
       resume,
       forkSession: session?.pendingForkSession,
       adoptMode: !!session?.adoptedFrom,
@@ -1292,6 +1293,7 @@ function credentialBoundaryForPrompt(
       policy,
       managedLarkToolAppIdForPrompt(larkAppId, sessionId, chatId, resume),
       locale,
+      sessionIsNoTransport(larkAppId, chatId),
     );
   } catch { return ''; }
 }
@@ -1797,7 +1799,7 @@ export function buildNewTopicCliInput(
  * Mirrors buildNewTopicPrompt structure but for subsequent messages.
  * Session ID is omitted for adopt mode and CLIs with injectsSessionContext.
  */
-type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'formatting' | 'reminder' | 'whiteboard' | 'groupHistory' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
+type FollowUpBlockKey = 'sessionId' | 'role' | 'credentials' | 'summaryMemory' | 'formatting' | 'reminder' | 'whiteboard' | 'groupHistory' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
 
 /**
  * 按既有顺序构造 follow-up 的各个块。inline 模式直接 join；hook 模式
@@ -1874,7 +1876,7 @@ function buildFollowUpBlocks(
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, opts?.locale);
   const formattingBlock = opts?.cliId !== 'mira' && !noTransport
-    ? `<botmux_formatting>${t('ai.followup.feishu_safe_emphasis', undefined, opts?.locale)}</botmux_formatting>`
+    ? `<botmux_formatting>${feishuReplyPresentationGuidance(opts?.locale)}</botmux_formatting>`
     : '';
   const skipSessionId = opts?.isAdoptMode || (opts?.cliId
     ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
@@ -1887,6 +1889,14 @@ function buildFollowUpBlocks(
   // user's text. Per-turn attribution (sender/attachments/mentions) stays after.
   if (!skipSessionId) blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
+  if (noTransport && !skipSessionId) {
+    const session = sessionStore.getSession(sessionId);
+    const resume = !!session?.cliId || !!session?.lastCliInput || !!session?.backendType;
+    if (managedLarkToolAppIdForPrompt(opts?.larkAppId, sessionId, opts?.chatId, resume)) {
+      const credentialBoundary = credentialBoundaryForPrompt(opts?.larkAppId, sessionId, opts?.chatId, resume, opts?.locale);
+      if (credentialBoundary) blocks.push({ key: 'credentials', text: credentialBoundary });
+    }
+  }
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
   if (formattingBlock && !bare) blocks.push({ key: 'formatting', text: formattingBlock });
   // transcript：不注入 reminder（判定同样落在 KEY 选择层，hook 模式的 sidecar 自然为空
@@ -1978,7 +1988,7 @@ export function buildFollowUpContent(
   ) {
     const formattingGuidance = sessionIsNoTransport(opts.larkAppId, opts.chatId) || opts.cliId === 'mira'
       ? undefined
-      : t('ai.followup.feishu_safe_emphasis', undefined, opts.locale);
+      : feishuReplyPresentationGuidance(opts.locale);
     return buildServiceUserPrompt(
       [opts?.sharedGroupContext, content].filter(Boolean).join('\n\n'),
       formattingGuidance,
@@ -2002,6 +2012,10 @@ function buildServiceUserPrompt(content: string, formattingGuidance?: string): s
  * 工具调用读取，行为分叉）；8k 留余量。超限的轮次回退 inline 模式。
  */
 const HOOK_ENVELOPE_MAX_CHARS = 8000;
+
+/** Backends known to run the CLI on this host, where botmux's UserPromptSubmit
+ *  hook can run (an allowlist). */
+const PROMPT_HOOK_LOCAL_BACKENDS = new Set(['pty', 'tmux', 'herdr', 'zellij', 'zmx']);
 
 /**
  * 判定该 follow-up 是否走 hook 注入模式（#794 P1 方向 B）。四重条件全部满足：
@@ -2029,11 +2043,10 @@ function resolveEnvelopeInjectionMode(cfg?: EnvelopeInjectionCfg): 'hook' | 'inl
   // 必须用会话冻结的 backendType（不是当前 bot 配置，那是 next-session 生效）。
   // 只有确知在本地跑 CLI 的后端才允许 hook 模式（白名单）。未来新增远端后端
   // 时默认 inline，不会静默丢 reminder（review hardening：黑名单会漏）。
-  const LOCAL_BACKENDS = new Set(['pty', 'tmux', 'herdr', 'zellij', 'zmx']);
   // fail-closed（review B3）：sessionBackendType 缺失（null/undefined）时不再短路
   // 放过，强制 inline。现网 spawn 的 reconcileRiffBackendType 已把 claude-code 钉在
   // 本地后端，此条是防未来远端后端的硬化；所有调用点都传 ds.session.backendType。
-  if (!cfg.sessionBackendType || !LOCAL_BACKENDS.has(cfg.sessionBackendType)) return 'inline';
+  if (!cfg.sessionBackendType || !PROMPT_HOOK_LOCAL_BACKENDS.has(cfg.sessionBackendType)) return 'inline';
   let adapter: CliAdapter;
   try {
     adapter = createCliAdapterSync(cfg.cliId, cfg.cliPathOverride);
@@ -2091,6 +2104,29 @@ function effectivePromptHookConfigPath(
   if (!dataDir) return base;
   const botmuxHome = dirname(dataDir);
   return join(botHomePath(botmuxHome, larkAppId), 'claude', 'settings.json');
+}
+
+export interface PromptHookTarget {
+  cliId: CliId;
+  cliConfigDir?: string;
+  sessionBackendType?: BackendType;
+  larkAppId: string;
+}
+
+/** Whether botmux's UserPromptSubmit hook runs on every submit of a session's
+ *  CLI: run on this host, by an adapter that installs the hook, found in the
+ *  settings file that CLI reads. Hook mode's preflight without its opt-in. */
+export function promptHookRunsInCli(target: PromptHookTarget): boolean {
+  if (!target.sessionBackendType || !PROMPT_HOOK_LOCAL_BACKENDS.has(target.sessionBackendType)) return false;
+  let adapter: CliAdapter;
+  let botConfig: BotConfig;
+  try {
+    adapter = createCliAdapterSync(target.cliId, undefined, target.cliConfigDir ? { configDir: target.cliConfigDir } : undefined);
+    botConfig = getBot(target.larkAppId).config;
+  } catch { return false; }
+  if (!adapter.hookInstall?.userPromptSubmitCommand) return false;
+  const effectivePath = effectivePromptHookConfigPath(adapter, botConfig, target.larkAppId, target.sessionBackendType);
+  return !!effectivePath && hasInstalledPromptHookCached(effectivePath);
 }
 
 function withInitialLinkRefSources(
@@ -2184,7 +2220,7 @@ export function buildFollowUpCliInput(
   const roleBlock = renderApplicationRoleBlock(opts.larkAppId, opts.chatId, { followUp: true });
   const formattingBlock = sessionIsNoTransport(opts.larkAppId, opts.chatId)
     ? ''
-    : `<botmux_formatting>${t('ai.followup.feishu_safe_emphasis', undefined, opts.locale)}</botmux_formatting>`;
+    : `<botmux_formatting>${feishuReplyPresentationGuidance(opts.locale)}</botmux_formatting>`;
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts.whiteboardId,
     noTransport: sessionIsNoTransport(opts.larkAppId, opts.chatId),
