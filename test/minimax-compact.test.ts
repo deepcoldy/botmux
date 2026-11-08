@@ -162,6 +162,35 @@ it.each([true, false])('reannounces ready after a proven unsubmitted compact, in
   expect(drainStates).toEqual([false]);
 });
 
+it.each(['replaced', 'restarting'] as const)('does not reannounce a rejected compact when the backend is %s', async transition => {
+  const backend = { write: vi.fn(() => true), sendText: vi.fn(() => true), sendSpecialKeys: vi.fn(() => false) };
+  const replacement = { write: vi.fn(() => true) };
+  const worker = rawWorker(createMinimaxAdapter('/not-executed'), backend);
+  const drain = vi.fn(async () => {});
+  worker.scope.flushPending = drain;
+  backend.sendSpecialKeys.mockImplementation(() => {
+    // Change lifecycle at the real writer's rejected pre-flush, before its
+    // failure unwinds. A stale ready hint must not reopen the compact gate.
+    if (transition === 'replaced') worker.scope.backend = replacement;
+    else worker.scope.cliRestartInProgress = true;
+    return false;
+  });
+
+  await worker.deliver({ type: 'raw_input', content: '/compact', turnId: 'compact-rejected' });
+  expect(backend.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  expect(backend.sendText).not.toHaveBeenCalled();
+  expect(backend.write).not.toHaveBeenCalled();
+  expect(worker.events).toContainEqual({ type: 'turn_terminal', turnId: 'compact-rejected', status: 'ambiguous' });
+  expect(worker.events.filter(event => event.type === 'user_notify'))
+    .toEqual([expect.objectContaining({ turnId: 'compact-rejected' })]);
+
+  // Observe any recovery drain queued by the rejected command on Node and Bun.
+  await new Promise<void>(resolve => setImmediate(resolve));
+  expect(worker.events.filter(event => event.type === 'prompt_ready')).toHaveLength(0);
+  expect(drain).not.toHaveBeenCalled();
+  expect(replacement.write).not.toHaveBeenCalled();
+});
+
 // ZMX keeps a submission journal around every logical write, so the same
 // rejected compact goes through the real journal transaction and its rewrap of
 // the writer's failure. The journal's verdict on cancel decides recovery.
