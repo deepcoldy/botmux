@@ -1503,6 +1503,12 @@ export interface BotConfig {
    */
   brand?: Brand;
   /**
+   * `botmux setup add|configure --extra-scopes-file` 记下的追加权限清单绝对路径，之后不带参的
+   * `setup configure` 沿用它。只有 setup 脚本化命令直接读写 bots.json 里的这个字段；
+   * {@link parseBotConfigsFromText} 不携带它，daemon 运行时也不用。
+   */
+  extraScopesFile?: string;
+  /**
    * Bot-level synchronous card-action ACK cutoff in milliseconds. When a card
    * handler is still running at this point, Botmux ACKs with a background-work
    * toast and applies a later card result via message.patch. Valid range is

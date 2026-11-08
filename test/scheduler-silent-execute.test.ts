@@ -306,6 +306,22 @@ describe('retained-topic scheduled send policy', () => {
 });
 
 describe('executeScheduledTask — silent thread fire', () => {
+  it('freezes the fire requester separately from a reused session owner', async () => {
+    const active = new Map<string, DaemonSession>();
+    const owned = baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true,
+      ownerOpenId: 'ou_creator', ownerUnionId: 'on_creator', creatorLarkAppId: APP });
+    await executeScheduledTask(owned, active, refreshCliVersion, undefined, { runId: 'run-owned' });
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    const first = ds.session.scheduledRun!;
+    expect(first).toMatchObject({ runId: 'run-owned', requesterSubjectId: 'ou_creator' });
+    await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active, refreshCliVersion, undefined, { runId: 'run-anonymous' });
+    expect(ds.session.ownerOpenId).toBe('ou_creator');
+    expect(ds.session.scheduledRun).toMatchObject({ runId: 'run-anonymous' });
+    expect(ds.session.scheduledRun?.requesterSubjectId).toBeUndefined();
+    expect(ds.session.scheduledRuns?.[first.turnId]).toEqual(first);
+  });
+
   it('prepares an exact scheduled-turn identity before the worker is forked', async () => {
     const active = new Map<string, DaemonSession>();
     let prepared = false;

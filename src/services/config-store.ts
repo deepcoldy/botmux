@@ -69,12 +69,14 @@ export function requireConfigPath(): string {
 /**
  * 在跨进程锁内对某个 bot 条目做 read-modify-write。`mutate` 拿到最新磁盘快照决定
  * 写什么；返回 `{ write:false }` 表示不写。沿用 oncall-store 原有语义。
+ * `options.path` 给没加载过 bot registry 的调用方（如 CLI）显式指定 bots.json。
  */
 export async function rmwBotEntry<T>(
   larkAppId: string,
   mutate: (entry: any, raw: any[]) => { write: boolean; result: T } | T | Promise<{ write: boolean; result: T } | T>,
+  options: { path?: string } = {},
 ): Promise<{ ok: true; result: T } | { ok: false; reason: string }> {
-  const path = requireConfigPath();
+  const path = options.path ?? requireConfigPath();
   return runDurableConfigMutation({
     scope: 'bots',
     path,

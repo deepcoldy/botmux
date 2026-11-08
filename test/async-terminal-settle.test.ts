@@ -160,7 +160,7 @@ describe('interruptExactWorkerTurn', () => {
     (ds.worker as any).emit('message', {
       type: 'turn_interrupt_result', requestId: sent.requestId, turnId: 'turn-exact', delivered: true,
     });
-    await expect(pending).resolves.toEqual({ ok: true });
+    await expect(pending).resolves.toEqual({ ok: true, confirmation: 'interrupt_delivered' });
   });
 });
 

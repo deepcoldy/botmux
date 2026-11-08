@@ -8,6 +8,9 @@ import { basename, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { atomicWriteFileSync } from '../src/utils/atomic-write.js';
 import { isValidMarkerIdentityTurnId } from '../src/core/turn-id-shape.js';
+import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
+import { SessionContractStore } from '../src/services/session-contract-store.js';
+import { SessionController } from '../src/core/session-controller.js';
 
 /**
  * Live wedge (Claude, chat-scope session + 10-minute silent schedule):
@@ -98,6 +101,27 @@ function startTurn(h: Record<string, any>, turnId: string): void {
 }
 
 describe('turn terminal releases the active turn authority', () => {
+  it('resolves an observed preemption from a later native completion through the real emitter', async () => {
+    vi.useFakeTimers(); const data = mkdtempSync(join(tmpdir(), 'terminal-evidence-')); const store = new SessionContractStore(data, 'cli_terminal_evidence');
+    try {
+      const ds: any = { larkAppId: 'cli_terminal_evidence', chatId: 'oc', session: { sessionId: 'sid', status: 'active' }, cliReadyGeneration: 0 };
+      const controller = new SessionController(ds, store); const worker = controller.bindWorker(1).worker;
+      const scope = new WorkerSessionEventScope(controller.ref, worker); const binding = scope.beginRuntime();
+      const runtime = controller.reserveBinding(binding.bindingId, worker); controller.bindRuntime(binding.bindingId, worker, { backend: 'tmux', physicalId: '111:start', proof: 'process_start' }); scope.assign(binding.bindingId, runtime);
+      const execution = controller.admitInput('turnA', 1); store.bindQueuedExecution(controller.ref, execution, runtime); scope.rememberExecution(execution, binding);
+      const h = harness(); h.workerSessionEventScope = scope; h.currentBotmuxTurnId = 'turnA'; h.currentBotmuxDispatchAttempt = 1;
+      const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', { workerSessionEventScope: scope });
+      h.send = vi.fn(message => controller.ingest(metadata(message), worker));
+      scope.run(binding, () => {
+        h.emitTurnTerminal('turnA', 'cancelled', 'preempted_by_user_message', 1);
+        setTimeout(scope.bind(() => h.emitTurnTerminal('turnA', 'completed', undefined, 1)), 10);
+      }, execution);
+      expect(store.execution(controller.ref, execution.executionId)?.phase).toBe('reconciling');
+      await vi.advanceTimersByTimeAsync(11);
+      expect(store.execution(controller.ref, execution.executionId)?.phase).toBe('succeeded');
+      expect(h.send.mock.calls.filter(([message]: any[]) => message.type === 'turn_terminal').map(([message]: any[]) => message.status)).toEqual(['cancelled', 'completed']);
+    } finally { vi.useRealTimers(); store.close(); rmSync(data, { recursive: true, force: true }); }
+  });
   it('does not advance authority to a type-ahead turn that ended inside its host turn', () => {
     const h = harness();
     startTurn(h, 'om_host');

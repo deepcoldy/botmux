@@ -78,6 +78,23 @@ describe('authorizeScheduledTurn', () => {
     return join(botHomePath(dirname(dataDir), appId), 'schedules.json');
   }
 
+  it('admits only the exact live manually authorized turn of a paused task', () => {
+    writeTask({ enabled: false, disabledReason: 'manual', lastRunId: 'manual-run',
+      manualRunAuthorization: { runId: 'manual-run', turnIds: [TURN_ID] } });
+    const input = { dataDir, turnId: TURN_ID, sessionLarkAppId: appId,
+      sessionChatId: chatId, isOwnerAllowed: () => true };
+    expect(authorizeScheduledTurn({ ...input, isScheduledTurnLive: () => true }))
+      .toMatchObject({ ownerOpenId: owner });
+    expect(authorizeScheduledTurn(input)).toEqual({ error: 'task_disabled' });
+    expect(authorizeScheduledTurn({ ...input,
+      turnId: `schedule:${TASK_ID}:aaaaaaaa-1234-1234-1234-123456789abc`,
+      isScheduledTurnLive: () => true })).toEqual({ error: 'task_disabled' });
+    expect(authorizeScheduledTurn({ ...input, sessionChatId: 'oc_other',
+      isScheduledTurnLive: () => true })).toEqual({ error: 'binding_mismatch' });
+    expect(authorizeScheduledTurn({ ...input, isOwnerAllowed: () => false,
+      isScheduledTurnLive: () => true })).toEqual({ error: 'owner_revoked' });
+  });
+
   function writeTask(over: Record<string, unknown> = {}, id: string = TASK_ID): void {
     const dir = dirname(schedulesPath());
     mkdirSync(dir, { recursive: true });

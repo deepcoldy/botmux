@@ -261,7 +261,7 @@ import {
   updateTaskWithOptionalPrecondition,
   type SchedulePreconditionMutation,
 } from './schedule-precondition-config.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, closeSessionForBackgroundCleanup, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, suspendWorkerAsync, killWorker, requestSessionRestart, isSessionRestartInFlight, getDaemonReplyCardUsageSnapshot, getDaemonReplyCardRenderSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
 import {
   awaitReadonlyTaskContinuationUser,
   cancelReadonlyTaskContinuationExplicit,
@@ -2519,7 +2519,8 @@ ipcRoute('POST', '/api/sessions/:sessionId/turns/:triggerId/interrupt', async (_
     // exists. Otherwise an exit between Ctrl+C and fsync could rewrite this
     // caller-selected terminal into dispatch_unknown.
     ds.idempotentAsyncTurns?.delete(params.triggerId);
-    return jsonRes(res, 200, { ok: true, action: 'interrupted', sessionId: params.sessionId, triggerId: params.triggerId });
+    return jsonRes(res, 200, { ok: true, action: 'interrupted', sessionId: params.sessionId, triggerId: params.triggerId,
+      ...(delivery.operationId ? { cancellation: { operationId: delivery.operationId, state: 'requested', nativeConfirmed: false } } : {}) });
   });
 });
 
@@ -3029,7 +3030,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/wake', async (req, res, params) => {
 ipcRoute('POST', '/api/sessions/:sessionId/suspend', async (_req, res, params) => {
   const initial = findActiveBySessionId(params.sessionId);
   if (!initial) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
-  return withBotTurnMutation(initial.larkAppId, () => {
+  return withBotTurnMutation(initial.larkAppId, async () => {
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   if (isSessionTransferring(ds)) {
@@ -3070,7 +3071,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/suspend', async (_req, res, params) =
   if (!isSuspendableBackendType(ds.initConfig?.backendType)) {
     return jsonRes(res, 409, { ok: false, error: 'backend_not_suspendable' });
   }
-  if (!suspendWorker(ds, 'manual_suspend')) {
+  if (!await suspendWorkerAsync(ds, 'manual_suspend')) {
     // The backend is nominally suspendable, so false means the exact backing
     // teardown could not be positively verified (or a last-moment ownership
     // guard refused). Never report dormant success in that state.
@@ -3232,7 +3233,7 @@ ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
       if (!isSuspendableBackendType(ds.initConfig?.backendType)) continue;
       if (ds.lastScreenStatus !== 'idle') continue;              // never cut an in-flight reply
       try {
-        if (suspendWorker(ds, 'host_overload_suspend')) affected++;
+        if (await suspendWorkerAsync(ds, 'host_overload_suspend')) affected++;
       } catch (err) {
         logger.warn(`[overload-sweep] suspend failed for ${ds.session.sessionId.slice(0, 8)}: ${ipcErrorText(err)}`);
       }

@@ -221,6 +221,7 @@ import { TurnReplyCardStore } from './services/turn-reply-card.js';
 import { patchPublishedGroupCard, readGroupContextAuthorOrigin } from './services/group-context-publication.js';
 import { markGroupContextCardPurpose } from './im/lark/group-context-card.js';
 import { TurnSendLedger, type TurnSendKind } from './services/turn-send-ledger.js';
+import { feedbackPolicyForScheduledSend, ScheduleSendAttempt, scheduledSessionRun } from './core/scheduled-send.js';
 import { buildTurnReplyCard, replyCardPresentation } from './im/lark/turn-reply-card.js';
 import { CardRuntimeStatusBridge } from './services/card-runtime-status-bridge.js';
 import {
@@ -866,6 +867,8 @@ async function finishOpenPlatformSetup(
     quiet?: boolean;
     /** 本次 setup 刚创建出这个应用 —— 只有它允许 redirect 白名单在读失败时盲写覆盖。 */
     appJustCreated?: boolean;
+    /** 内置清单 + --extra-scopes-file 合并后的权限清单；不传用内置默认清单。 */
+    scopeManifest?: import('./setup/open-platform-automation.js').ScopeManifest;
   } = {},
 ): Promise<SetupOpenPlatformOutcome> {
   const say = (...args: unknown[]) => { if (!options.quiet) console.log(...args); };
@@ -896,6 +899,7 @@ async function finishOpenPlatformSetup(
     disableQrLogin: options.reuseOnly,
     disableBytedcliFallback: options.reuseOnly || options.forceQrLogin,
     appJustCreated: options.appJustCreated,
+    scopeManifest: options.scopeManifest,
   });
   const outcome = classifySetupOpenPlatformOutcome(result);
   if (result.ok) {
@@ -903,6 +907,10 @@ async function finishOpenPlatformSetup(
     say(`   Session 来源: ${result.sessionSource}`);
     const skipped = result.skippedScopeCount ?? 0;
     say(`   已导入权限数: ${result.scopeCount}${skipped > 0 ? `（另有 ${skipped} 项当前租户目录中没有，已跳过）` : ''}`);
+    if (options.scopeManifest && skipped > 0 && result.skippedScopes) {
+      const names = [...result.skippedScopes.tenant.map(n => `${n}(tenant)`), ...result.skippedScopes.user.map(n => `${n}(user)`)];
+      say(`   已跳过的权限: ${names.join(', ')}`);
+    }
     if (result.scopeWarning) {
       say(`   ⚠️ 权限注册未全部成功（部分租户对个别权限有限制）：${result.scopeWarning}`);
       say('      可稍后到开放平台「权限管理」手动补齐缺失权限。');
@@ -1770,9 +1778,46 @@ function setupAddContinuationCommand(
   appId: string,
   brand: Brand,
   ownerPlaceholder = '<OWNER_EMAIL>',
+  extraScopesFile?: string,
 ): string {
   return `botmux setup add --app-id ${appId} --app-secret <APP_SECRET> ` +
-    `--allowed-users ${ownerPlaceholder}${brand === 'lark' ? ' --brand lark' : ''} --open-platform-auto`;
+    `--allowed-users ${ownerPlaceholder}${brand === 'lark' ? ' --brand lark' : ''} --open-platform-auto` +
+    (extraScopesFile ? ` --extra-scopes-file ${shellQuoteArg(extraScopesFile)}` : '');
+}
+
+function shellQuoteArg(value: string): string {
+  return /^[A-Za-z0-9_./~:=@%+-]+$/.test(value) ? value : `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+type SetupExtraScopes = import('./setup/extra-scopes.js').ExtraScopesResolution;
+
+/** --extra-scopes-file 与已记录路径的取舍见 resolveExtraScopes；显式传入的文件有问题时抛错。 */
+async function resolveSetupExtraScopes(
+  requested: string | null | undefined,
+  saved?: unknown,
+): Promise<SetupExtraScopes> {
+  if (requested === undefined && saved === undefined) return {};
+  const { resolveExtraScopes } = await import('./setup/extra-scopes.js');
+  const { readDefaultScopeManifest } = await import('./setup/open-platform-automation.js');
+  return resolveExtraScopes({ requested, saved, base: readDefaultScopeManifest() });
+}
+
+/** 锁内重读 bots.json，只改这一个机器人的 extraScopesFile（null 删除），不拿入口快照整文件覆盖。 */
+async function persistBotExtraScopesFile(larkAppId: string, value: string | null): Promise<void> {
+  const { rmwBotEntry } = await import('./services/config-store.js');
+  const result = await rmwBotEntry(larkAppId, entry => {
+    if (value === null) delete entry.extraScopesFile;
+    else entry.extraScopesFile = value;
+    return { write: true, result: undefined };
+  }, { path: BOTS_JSON_FILE });
+  if (!result.ok) throw new Error(result.reason);
+}
+
+function printSetupExtraScopes(report: SetupExtraScopes['report']): void {
+  if (!report) return;
+  if (report.warning) console.warn(`⚠️  ${report.warning}`);
+  else if (report.cleared) console.log('已清除记录的追加权限清单，本次只申请内置清单。');
+  else if (report.merged) console.log(`追加权限清单: ${report.file}（内置清单之外 ${report.addedScopeCount} 项）`);
 }
 
 /** 某个（可能带 ~ 前缀的）路径若不存在/不是目录，返回展开后的绝对路径；合法返回 null。 */
@@ -1810,7 +1855,7 @@ function botJsonView(bot: Record<string, any>, index: number): Record<string, an
  * 的老姿势在问题序列变化时会静默错位）。校验口径与 TUI 一致：目录存在性、
  * owner 必填、凭证变更时的 tenant_access_token 校验，任一失败不写盘。
  */
-async function cmdSetupScripted(
+export async function cmdSetupScripted(
   argv: string[],
   cloneSource?: Record<string, any>,
 ): Promise<void> {
@@ -1867,11 +1912,36 @@ async function cmdSetupScripted(
     }
     const bot = bots[index];
     const processName = botProcessName(bot, index, PM2_NAME);
+    if (typeof cmd.extraScopesFile === 'string' && botBrand(bot) !== 'feishu') {
+      failSetupScripted(cmd.json, 'Lark 租户不支持开放平台自动配置，--extra-scopes-file 不会生效；请在开放平台「权限管理」手动添加这些权限。');
+      return;
+    }
+    // 显式 --extra-scopes-file 优先（- 清除）；否则沿用该机器人上次记下的路径。
+    let extraScopes: SetupExtraScopes;
+    try {
+      extraScopes = await resolveSetupExtraScopes(cmd.extraScopesFile, bot.extraScopesFile);
+    } catch (err) {
+      failSetupScripted(cmd.json, err instanceof Error ? err.message : String(err));
+      return;
+    }
+    if (extraScopes.persist !== undefined) {
+      try {
+        await persistBotExtraScopesFile(bot.larkAppId, extraScopes.persist);
+      } catch (err) {
+        failSetupScripted(cmd.json, `记录追加权限清单路径失败: ${err instanceof Error ? err.message : String(err)}。未执行开放平台自动配置。`);
+        return;
+      }
+      if (extraScopes.persist === null) delete bot.extraScopesFile;
+      else bot.extraScopesFile = extraScopes.persist;
+    }
+    if (!cmd.json) printSetupExtraScopes(extraScopes.report);
+    const extraScopesJson = extraScopes.report ? { extraScopes: extraScopes.report } : {};
     const openPlatform = await finishOpenPlatformSetup(bot.larkAppId, botBrand(bot), {
       // Machine-readable callers must never be surprised by an interactive QR.
       reuseOnly: cmd.json && !cmd.switchAccount,
       forceQrLogin: cmd.switchAccount,
       quiet: cmd.json,
+      scopeManifest: extraScopes.manifest,
     });
     if (openPlatform.status === 'failed' || openPlatform.status === 'manual') {
       const continueCommand = setupOpenPlatformRetryCommand(bot.larkAppId, openPlatform);
@@ -1887,6 +1957,7 @@ async function cmdSetupScripted(
           bot: botJsonView(bot, index),
           appId: bot.larkAppId,
           openPlatform: setupOpenPlatformOutcomeJson(openPlatform),
+          ...extraScopesJson,
           ...(continueCommand ? { continueCommand } : {}),
           next,
         },
@@ -1902,6 +1973,7 @@ async function cmdSetupScripted(
         bot: botJsonView(bot, index),
         appId: bot.larkAppId,
         openPlatform: setupOpenPlatformOutcomeJson(openPlatform),
+        ...extraScopesJson,
         live,
         next,
       }, null, 2));
@@ -1921,6 +1993,17 @@ async function cmdSetupScripted(
     let createdAppId: string | undefined;
     let createdAppName: string | undefined;
     const requestedBrand = normalizeBrand(cmd.flags.brand);
+    // 追加权限清单在建应用之前就读取校验：文件写错不该留下一个已创建的半成品应用。
+    let extraScopes: SetupExtraScopes;
+    try {
+      extraScopes = await resolveSetupExtraScopes(cmd.extraScopesFile);
+    } catch (err) {
+      failSetupScripted(cmd.json, err instanceof Error ? err.message : String(err));
+      return;
+    }
+    if (!cmd.json) printSetupExtraScopes(extraScopes.report);
+    const extraScopesFile = extraScopes.report?.file ?? undefined;
+    const extraScopesJson = extraScopes.report ? { extraScopes: extraScopes.report } : {};
     if (!existsSync(BOTS_JSON_FILE) && existsSync(ENV_FILE)) {
       const legacy = parseDotEnvToBotConfig();
       if (legacy.larkAppId && legacy.larkAppSecret) {
@@ -2075,11 +2158,11 @@ async function cmdSetupScripted(
 
       if (!credentials.ok) {
         const continueCommand = credentials.appId
-          ? setupAddContinuationCommand(credentials.appId, requestedBrand)
+          ? setupAddContinuationCommand(credentials.appId, requestedBrand, undefined, extraScopesFile)
           : undefined;
         failSetupScripted(cmd.json,
           `${credentials.message}${credentials.appId ? `；已创建 AppID ${credentials.appId}，请从开放平台读取 App Secret 后运行 ${continueCommand} 继续，未重复创建。` : ''}`,
-          credentials.appId ? { partial: true, appId: credentials.appId, appName, continueCommand } : {},
+          credentials.appId ? { partial: true, appId: credentials.appId, appName, ...extraScopesJson, continueCommand } : {},
         );
         return;
       }
@@ -2132,12 +2215,12 @@ async function cmdSetupScripted(
     const v = await validateCredentials(bot.larkAppId, bot.larkAppSecret, botBrand(bot));
     if (!v.ok) {
       const continueCommand = createdAppId
-        ? setupAddContinuationCommand(createdAppId, botBrand(bot))
+        ? setupAddContinuationCommand(createdAppId, botBrand(bot), undefined, extraScopesFile)
         : undefined;
       failSetupScripted(
         cmd.json,
         `凭证校验失败 (${v.error}): ${v.message}${createdAppId ? `；应用 ${createdAppId} 已创建，未重复创建。请运行 ${continueCommand} 继续。` : ''}`,
-        createdAppId ? { partial: true, appId: createdAppId, ...(createdAppName ? { appName: createdAppName } : {}), continueCommand } : {},
+        createdAppId ? { partial: true, appId: createdAppId, ...(createdAppName ? { appName: createdAppName } : {}), ...extraScopesJson, continueCommand } : {},
       );
       return;
     }
@@ -2155,7 +2238,7 @@ async function cmdSetupScripted(
     );
     if (unusableOwners.length > 0) {
       const continueCommand = createdAppId
-        ? setupAddContinuationCommand(createdAppId, botBrand(bot), '<OWNER_EMAIL_OR_UNION_ID>')
+        ? setupAddContinuationCommand(createdAppId, botBrand(bot), '<OWNER_EMAIL_OR_UNION_ID>', extraScopesFile)
         : undefined;
       failSetupScripted(
         cmd.json,
@@ -2167,6 +2250,7 @@ async function cmdSetupScripted(
               partial: true,
               appId: createdAppId,
               ...(createdAppName ? { appName: createdAppName } : {}),
+              ...extraScopesJson,
               continueCommand,
             }
           : {},
@@ -2175,15 +2259,16 @@ async function cmdSetupScripted(
     }
 
     try {
+      if (typeof extraScopes.persist === 'string') bot.extraScopesFile = extraScopes.persist;
       writeBotsJsonAtomic([...existing, bot]);
     } catch (err) {
       const continueCommand = createdAppId
-        ? setupAddContinuationCommand(createdAppId, botBrand(bot))
+        ? setupAddContinuationCommand(createdAppId, botBrand(bot), undefined, extraScopesFile)
         : undefined;
       failSetupScripted(
         cmd.json,
         `写入 bot 配置失败: ${err instanceof Error ? err.message : String(err)}${createdAppId ? `；应用 ${createdAppId} 已创建，未重复创建。请运行 ${continueCommand} 继续。` : ''}`,
-        createdAppId ? { partial: true, appId: createdAppId, ...(createdAppName ? { appName: createdAppName } : {}), continueCommand } : {},
+        createdAppId ? { partial: true, appId: createdAppId, ...(createdAppName ? { appName: createdAppName } : {}), ...extraScopesJson, continueCommand } : {},
       );
       return;
     }
@@ -2213,6 +2298,7 @@ async function cmdSetupScripted(
         // 只认「本次命令确实创建出了这个 appId」这一条硬证据：--app-id/--app-secret
         // 直接传进来的存量应用绝不能拿到盲写授权。
         appJustCreated: createdAppId !== undefined && createdAppId === bot.larkAppId,
+        scopeManifest: extraScopes.manifest,
       });
     }
 
@@ -2231,6 +2317,7 @@ async function cmdSetupScripted(
           botsFile: BOTS_JSON_FILE,
           envMigrated: migratedEnv || undefined,
           openPlatform: setupOpenPlatformOutcomeJson(openPlatform),
+          ...extraScopesJson,
           continueCommand,
           live: {
             ok: false,
@@ -2255,6 +2342,7 @@ async function cmdSetupScripted(
         botsFile: BOTS_JSON_FILE,
         envMigrated: migratedEnv || undefined,
         openPlatform: setupOpenPlatformOutcomeJson(openPlatform),
+        ...extraScopesJson,
         live,
         next,
       }, null, 2));
@@ -4145,6 +4233,8 @@ interface SessionData {
     boundScope?: 'thread' | 'chat';
   };
   deferredScheduleRun?: DeferredScheduleRunData;
+  scheduledRun?: import('./types.js').Session['scheduledRun'];
+  scheduledRuns?: import('./types.js').Session['scheduledRuns'];
   vcMeetingReceiver?: {
     listenerAppId: string;
     meetingId: string;
@@ -11268,6 +11358,23 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   const originSession = originSessionId
     ? sessionsForOrigin.get(originSessionId)
     : undefined;
+  let effectiveResponseKind: TurnSendKind = argValue(rest, '--response-kind') === 'final' ? 'final' : 'progress';
+  const scheduledOrigin = authoritativeOriginTurnCtx?.sessionId === originSession?.sessionId
+    ? originSession : undefined;
+  const scheduledOriginRun = scheduledSessionRun(scheduledOrigin, authoritativeOriginTurnCtx?.turnId);
+  const scheduledSendAttempt = authoritativeOriginTurnCtx?.turnId && scheduledOrigin
+    && scheduledOriginRun
+    ? new ScheduleSendAttempt(resolveDataDir(), scheduledOrigin, authoritativeOriginTurnCtx.turnId)
+    : undefined;
+  if (scheduledSendAttempt) {
+    // Once the origin is authenticated, also observe process.exit-based
+    // preflight refusals. Possible provider effects remain unknown, never retried.
+    process.once('exit', code => {
+      if (code === 0 || effectiveResponseKind !== 'final') return;
+      try { scheduledSendAttempt.fail(new Error(`botmux send exited ${code} without a final delivery receipt`)); }
+      catch { /* observability cannot change a send's outcome */ }
+    });
+  }
   const hostRelayRequiresCodexAppLedger = !!trustedRelayCtx
     && process.env.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER === '1';
   // The live worker authorizes a Codex App relay only while an exact durable
@@ -11435,7 +11542,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // Only an explicit `final` may opt into feedback controls and indexing;
   // `progress` and `auxiliary` (interim / supplementary output) both deliver
   // normally without a feedback region, matching the requirement's three roles.
-  let effectiveResponseKind: TurnSendKind = responseKind ?? 'progress';
+  effectiveResponseKind = responseKind ?? 'progress';
   let expectedLinks = argValues(rest, '--expected-link');
   if (rest.some((token, index) => token === '--expected-link='
     || (token === '--expected-link'
@@ -11952,7 +12059,13 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // worker restart, turn rotation, or Codex ledger settlement.
   let checkSendTopics: ((lookup?: TopicMessageLookup) => Promise<void>) | undefined;
   let arbitraryMentionRequired = false;
-  const revalidateIsolatedOrigin = async (): Promise<ManagedOriginAttestation | undefined> => {
+  let scheduledProviderEffectStarted = false;
+  const knownPreProviderRejections = new Set<unknown>();
+  const beginScheduledProviderEffect = (): void => {
+    scheduledProviderEffectStarted = true;
+    scheduledSendAttempt?.providerRequestStarted();
+  };
+  const resolveRevalidatedIsolatedOrigin = async (): Promise<ManagedOriginAttestation | undefined> => {
     if (!isolatedAttestationContext || !isolatedManagedOriginCtx) return undefined;
     const fresh = await attestManagedOrigin({
       context: isolatedAttestationContext,
@@ -11988,6 +12101,15 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     }
     return fresh;
   };
+  const revalidateIsolatedOrigin = async (): Promise<ManagedOriginAttestation | undefined> => {
+    try { return await resolveRevalidatedIsolatedOrigin(); }
+    catch (error) {
+      // This proof rejected the current call before its effect. An earlier
+      // provider attempt, even one whose response was lost, stays ambiguous.
+      if (!scheduledProviderEffectStarted) knownPreProviderRejections.add(error);
+      throw error;
+    }
+  };
   const revalidateIsolatedOriginBeforeEffect = async (
     lookup?: TopicMessageLookup,
   ): Promise<ManagedOriginAttestation | undefined> => {
@@ -11998,6 +12120,10 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   };
   const fenceIsolatedOriginBeforeEffect = async (lookup?: TopicMessageLookup): Promise<void> => {
     await revalidateIsolatedOriginBeforeEffect(lookup);
+  };
+  const fenceScheduledProviderWrite = async (lookup?: TopicMessageLookup): Promise<void> => {
+    await fenceIsolatedOriginBeforeEffect(lookup);
+    beginScheduledProviderEffect();
   };
   const fenceIsolatedOrigin = async (): Promise<void> => {
     await revalidateIsolatedOrigin();
@@ -12036,7 +12162,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
           : { suppressHook: true as const }
         : undefined;
     return {
-      beforeWrite: fenceIsolatedOriginBeforeEffect,
+      beforeWrite: fenceScheduledProviderWrite,
       ...(hookOptions ?? {}),
       ...(groupContextAuthorOrigin ? { groupContextAuthorOrigin } : {}),
     };
@@ -12610,9 +12736,14 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   const executeTurnPrimary = async (
     renderedContent: string,
     dispatch: (providerUuid?: string) => Promise<string>,
-  ): Promise<{ messageId: string; replayed: boolean }> => turnSendKey
-    ? turnSendLedger.execute(turnSendKey, effectiveResponseKind, renderedContent, dispatch)
-    : { messageId: await dispatch(), replayed: false };
+  ): Promise<{ messageId: string; replayed: boolean }> => {
+    return turnSendKey
+      ? turnSendLedger.execute(turnSendKey, effectiveResponseKind, renderedContent, dispatch, {
+          ...(scheduledSendAttempt ? { noSideEffect: (error: unknown) =>
+            !scheduledProviderEffectStarted && knownPreProviderRejections.has(error) } : {}),
+        })
+      : { messageId: await dispatch(), replayed: false };
+  };
   let existingTurnPrimary: { messageId: string; replayed: boolean } | undefined;
   try {
     existingTurnPrimary = turnSendKey
@@ -12745,11 +12876,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       const voiceDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
         await revalidateIsolatedOriginBeforeEffect();
         const out = await synthesizeVoiceOpus(appId, content, {
-          beforeProviderEffect: fenceIsolatedOriginBeforeEffect,
+          beforeProviderEffect: fenceScheduledProviderWrite,
         });
         dir = out.dir;
         voiceDurationMs = out.durationMs;
         await revalidateIsolatedOriginBeforeEffect();
+        beginScheduledProviderEffect();
         const fileKey = await uploadFile(appId, out.path, { duration: out.durationMs });
         const proposedOutput = {
           targetChatId,
@@ -12777,7 +12909,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
           const deliveryUuid = prepared?.providerKey ?? providerUuid;
           await revalidateIsolatedOriginBeforeEffect();
           const privateMessageId = !sendInto && !overrideChatId
-            ? await sendPrivateReply(s, currentTurnId, canonicalOutput.content, canonicalOutput.msgType, deliveryUuid)
+            ? await sendPrivateReply(s, currentTurnId, canonicalOutput.content, canonicalOutput.msgType, deliveryUuid,
+                { beforeWrite: fenceScheduledProviderWrite })
             : undefined;
           const deferred = privateMessageId !== undefined
             ? { handled: true, messageId: privateMessageId, materializedNow: false, rootMessageId: undefined }
@@ -13234,7 +13367,13 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       feedbackPolicy = undefined;
     }
   }
-  const feedbackRequesterSubjectId = replyTargetSenderOpenId ?? s.ownerOpenId;
+  // A reused session's owner or last sender is not this automatic turn's
+  // requester. Only the identity frozen on the host-written run may claim it.
+  const feedbackRequesterSubjectId = scheduledOriginRun
+    ? scheduledOriginRun.requesterSubjectId : replyTargetSenderOpenId ?? s.ownerOpenId;
+  feedbackPolicy = feedbackPolicyForScheduledSend({ policy: feedbackPolicy,
+    requesterSubjectId: feedbackRequesterSubjectId,
+    authenticatedTurnId: authoritativeOriginTurnCtx?.turnId, session: scheduledOrigin });
   const withOncallGroup = (card: string): string => {
     if (effectiveResponseKind !== 'final' || asVoice || sendTopLevel || overrideChatId || sendInto || vcMeetingManagedSendOrigin) return card;
     const attached = attachOncallGroupButton(card, oncallGroupPolicy, s.chatId, s.chatType);
@@ -13262,6 +13401,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // turn sender is another bot. Only the `requester` audience needs a resolvable
   // human recipient to make its control clickable.
   if (feedbackPolicy && effectiveResponseKind === 'final' && feedbackPolicy.audience === 'requester' && !feedbackRequesterSubjectId) {
+    try { scheduledSendAttempt?.fail(new Error('requester identity missing for final feedback')); } catch { /* best-effort */ }
     console.error('botmux send: 无法确认本次提问者身份，不能发送带反馈控件的最终回答');
     process.exit(2);
   }
@@ -13295,7 +13435,17 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     mentions.push({ open_id: replyTargetSenderOpenId, name: '' });
   }
 
-  const { sendMessage, replyMessage, urgentMessage, uploadImage, uploadFile, MessageWithdrawnError, getChatModeStrict, getMessageThreadId } = await import('./im/lark/client.js');
+  const { sendMessage, replyMessage, urgentMessage, uploadImage: uploadLarkImage, uploadFile: uploadLarkFile, MessageWithdrawnError, getChatModeStrict, getMessageThreadId } = await import('./im/lark/client.js');
+  // Uploads are observable too. A later authority refusal must not erase an
+  // earlier upload attempt, including media sent before the primary message.
+  const uploadImage: typeof uploadLarkImage = (...args) => {
+    beginScheduledProviderEffect();
+    return uploadLarkImage(...args);
+  };
+  const uploadFile: typeof uploadLarkFile = (...args) => {
+    beginScheduledProviderEffect();
+    return uploadLarkFile(...args);
+  };
   // Effective target chat for top-level mode (defaults to session's chat)
   const targetChatId = overrideChatId ?? s.chatId;
   // Chat-scope sessions (普通群整群一会话) post to chatId without
@@ -13440,7 +13590,8 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     // exact durable attempt/member instead of inheriting the early cmd gate.
     revalidateVcMeetingManagedSend();
     if (!sendInto && !overrideChatId) {
-      const privateMessageId = await sendPrivateReply(s, currentTurnId, content, msgType, uuid);
+      const privateMessageId = await sendPrivateReply(s, currentTurnId, content, msgType, uuid,
+        { beforeWrite: fenceScheduledProviderWrite });
       if (privateMessageId !== undefined) return privateMessageId;
     }
     if (!sendInto && (!overrideChatId || overrideChatId === s.chatId)) {
@@ -13663,6 +13814,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       if (!durableIpcPort) {
         throw new Error('durable primary send requires the owning daemon IPC port');
       }
+      beginScheduledProviderEffect();
       const messageId = await dispatchDurableSessionMessage({
         post: (sessionId, route, payload) => postSessionCliIpc(
           durableIpcPort,
@@ -13747,7 +13899,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
               );
             }
           : dispatchAfterOriginGate,
-        beforeWrite: fenceIsolatedOriginBeforeEffect,
+        beforeWrite: fenceScheduledProviderWrite,
         beforeEffect: originAlreadyRevalidated
           ? undefined
           : fenceIsolatedOrigin,
@@ -14317,6 +14469,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
               async (lookup) => {
                 await revalidateIsolatedOriginBeforeEffect(lookup);
                 revalidateVcMeetingManagedSend();
+                beginScheduledProviderEffect();
               }),
             isWithdrawn: error => error instanceof MessageWithdrawnError,
             render: record => buildTurnReplyCard(record, {
@@ -14699,6 +14852,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     }));
   } catch (err: any) {
     if (err instanceof TopicSendError) throw err;
+    try { if (effectiveResponseKind === 'final') scheduledSendAttempt?.fail(err); } catch { /* best-effort */ }
     console.error(`发送失败: ${describeSendFailure(err)}`);
     process.exit(1);
   }
@@ -18377,12 +18531,14 @@ async function cmdSessionReady(): Promise<void> {
     payloadText = Buffer.concat(chunks).toString('utf-8');
   } catch { /* stdin 读不到也无所谓 */ }
   let source: string | undefined;
+  let nativeSessionId: string | undefined;
   try {
     const p = JSON.parse(payloadText);
     if (p && typeof p.source === 'string') source = p.source;
+    if (p && typeof p.session_id === 'string') nativeSessionId = p.session_id;
   } catch { /* 非 JSON / 空 → 不带 source */ }
 
-  await postSessionScopedSignal('/api/session-ready', { source });
+  await postSessionScopedSignal('/api/session-ready', { source, nativeSessionId });
   process.exit(0);
 }
 
@@ -18466,6 +18622,7 @@ async function postSessionScopedSignal(
           : (liveOrigin?.dispatchAttempt
             ?? (Number.isSafeInteger(envAttempt) && envAttempt > 0 ? envAttempt : undefined)),
         ...payload,
+        runtimeBindingId: process.env.BOTMUX_RUNTIME_BINDING_ID,
       }),
     } satisfies RequestInit;
     let hostSecret: string | undefined;

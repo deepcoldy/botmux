@@ -12,6 +12,7 @@ import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection
 import { existsSync, statSync } from 'node:fs';
 import { normalizeImageAttachment, imageSequenceHint } from './attachment-image-format.js';
 import { randomUUID } from 'node:crypto';
+import { recordScheduledSessionRun } from './scheduled-send.js';
 import { basename, dirname, join } from 'node:path';
 import { expandHome, validateWorkingDir } from './working-dir.js';
 import { config } from '../config.js';
@@ -4975,6 +4976,11 @@ export async function executeScheduledTask(
           throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
         }
         markSessionActivity(existing);
+        if (runtime?.runId) {
+          recordScheduledSessionRun(existing.session, { taskId: task.id, runId: runtime.runId, turnId: scheduledTurnId,
+            requesterSubjectId: scheduledTrustedCaller?.requestUserOpenId });
+          sessionStore.updateSession(existing.session);
+        }
         ensureSessionWhiteboard(existing);
         if (existing.session.deferredScheduleRun
           && existing.session.deferredScheduleRun.routingAnchor.startsWith('schedule-task:')) {
@@ -5068,6 +5074,8 @@ export async function executeScheduledTask(
     const now = Date.now();
     session.larkAppId = larkAppId;
     session.scope = runtimeScope;
+    if (runtime?.runId) recordScheduledSessionRun(session, { taskId: task.id, runId: runtime.runId, turnId: scheduledTurnId,
+      requesterSubjectId: scheduledTrustedCaller?.requestUserOpenId });
     if (scheduledTrustedCaller) {
       // A fresh scheduled session is owned by the authenticated task creator.
       // Persist both ids so an in-turn `botmux schedule add` can create a child
