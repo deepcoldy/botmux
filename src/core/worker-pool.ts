@@ -11516,6 +11516,22 @@ type WorkerCliInputBacklog = Omit<Extract<WorkerToDaemon, { type: 'cli_input_bac
  * which must not erase the turn that write was carrying. */
 const workerCliInputBacklogs = new WeakMap<ChildProcess, WorkerCliInputBacklog>();
 
+/** TurnIds whose `turn_input_committed` ACK the daemon observed from this exact
+ *  worker, including ACKs that drained after it retired (the stale-message
+ *  branch still settles those). A retire-time "never reached the CLI" notice
+ *  must not name a turn carrying such a receipt: the ACK is an exact fact, not
+ *  a recency guess. Keyed by the process, like the backlog. */
+const workerCommittedTurnIds = new WeakMap<ChildProcess, Set<string>>();
+
+function recordWorkerCommittedTurn(worker: ChildProcess, turnId: string): void {
+  let committed = workerCommittedTurnIds.get(worker);
+  if (!committed) {
+    committed = new Set();
+    workerCommittedTurnIds.set(worker, committed);
+  }
+  committed.add(turnId);
+}
+
 export function recordWorkerCliInputBacklog(worker: ChildProcess, backlog: WorkerCliInputBacklog): void {
   if (!backlog.pending && !backlog.writingTurnId) {
     workerCliInputBacklogs.delete(worker);
@@ -11970,7 +11986,15 @@ function settleWorkerCliInputBacklog(
 ): void {
   const turnId = workerCliInputBacklogs.get(worker)?.writingTurnId;
   workerCliInputBacklogs.delete(worker);
+  const committedTurns = workerCommittedTurnIds.get(worker);
+  workerCommittedTurnIds.delete(worker);
   if (!turnId || !options.notify || options.ownedByDeliveryTracker.has(turnId)) return;
+  // A commit ACK that drained before exit proves the CLI took this turn, even
+  // if the backlog's own clear was dropped by the stale-worker fence.
+  if (committedTurns?.has(turnId)) {
+    logger.info(`[${tag(ds)}] Suppressed retire notice: turn=${turnId.substring(0, 16)} commit ACK observed before exit`);
+    return;
+  }
   logger.warn(`[${tag(ds)}] Worker retired while writing turn=${turnId.substring(0, 16)} to its CLI`);
   reportOrdinaryTurnUndelivered(
     ds,
@@ -17797,6 +17821,7 @@ function setupWorkerHandlers(
       // nothing about execution and must keep the visible-failure timers
       // running. Stale workers gain no other authority.
       if (msg.type === 'turn_input_committed') {
+        recordWorkerCommittedTurn(worker, msg.turnId);
         completeStaleWorkerOrdinaryImDelivery(worker, msg.turnId);
       }
       logger.debug(`[${t}] Ignored stale worker message: ${msg.type}`);
@@ -18069,6 +18094,7 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored turn_input_committed from stale worker generation`);
           break;
         }
+        recordWorkerCommittedTurn(worker, msg.turnId);
         if (msg.durablePrimaryInbox) {
           try {
             cb.onTurnInputCommitted?.(ds, msg, { workerGeneration });

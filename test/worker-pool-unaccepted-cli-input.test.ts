@@ -300,6 +300,31 @@ describe('a session whose CLI has not taken its message yet', () => {
     expect(retiredBeforeCliAcceptNotices(sessionReply, WAKE_TURN)).toEqual([]);
   });
 
+  it('does not report a turn as lost when its commit ACK drained after the worker retired', () => {
+    const { worker, woken } = overCapWithOnlyTheWokenSessionIdle();
+    worker.emit('message', { type: 'cli_input_backlog', pending: true, writingTurnId: WAKE_TURN });
+
+    expect(suspendWorker(woken, 'manual_suspend')).toBe(true);
+    // The CLI actually took the input: its commit ACK drains after suspendWorker
+    // detached ds.worker, so the stale-message branch settles it.
+    worker.emit('message', { type: 'turn_input_committed', turnId: WAKE_TURN });
+    worker.emit('exit', 0, null);
+
+    expect(retiredBeforeCliAcceptNotices(sessionReply, WAKE_TURN)).toEqual([]);
+  });
+
+  it('stays silent when a live commit ACK was observed even if the backlog clear never arrived', () => {
+    const { worker, woken } = overCapWithOnlyTheWokenSessionIdle();
+    worker.emit('message', { type: 'cli_input_backlog', pending: true, writingTurnId: WAKE_TURN });
+    // ACK observed while this worker is still the live generation.
+    worker.emit('message', { type: 'turn_input_committed', turnId: WAKE_TURN });
+
+    expect(suspendWorker(woken, 'manual_suspend')).toBe(true);
+    worker.emit('exit', 0, null);
+
+    expect(retiredBeforeCliAcceptNotices(sessionReply, WAKE_TURN)).toEqual([]);
+  });
+
   it('leaves a worker crash to the existing crash handling', () => {
     const { worker } = overCapWithOnlyTheWokenSessionIdle();
     worker.emit('message', { type: 'cli_input_backlog', pending: true, writingTurnId: WAKE_TURN });
