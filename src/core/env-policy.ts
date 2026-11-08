@@ -21,6 +21,10 @@ export const STRICT_ENV_BASELINE = [
   'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR',
   'SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT', 'USERPROFILE',
 ] as const;
+// scripts/fenced-run.ts marks its whole process tree; a strict boundary that
+// dropped the mark would let scope code derive the real user bus again
+// (session-scope.ts userSystemdBusEnv). BOTMUX* names cannot be granted via inherit.
+const FENCE_MARKER_KEYS = ['BOTMUX_FENCED_RUN'] as const;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const PROCESS_HOME_KEYS = new Set(['GROK_HOME', 'DSH_HOME', 'LARKSUITE_CLI_DATA_DIR']);
 
@@ -47,7 +51,7 @@ export function inheritBotEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): Node
   if (normalized?.mode !== 'strict') return { ...base };
   const out: NodeJS.ProcessEnv = {};
   // Revalidate at IPC boundaries: malformed strict config must never widen it.
-  for (const key of [...STRICT_ENV_BASELINE, ...(normalized.inherit ?? [])]) {
+  for (const key of [...STRICT_ENV_BASELINE, ...FENCE_MARKER_KEYS, ...(normalized.inherit ?? [])]) {
     if (base[key] !== undefined) out[key] = base[key];
   }
   return out;

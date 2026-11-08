@@ -769,6 +769,16 @@ export function buildBotmuxEnvAssignments(
       if (val === undefined) continue;
       out.push(`${key}=${val}`);
     }
+    // Fence marker (scripts/fenced-run.ts): tmuxEnv() strips every BOTMUX* key
+    // from the tmux client env and it is not in BOTMUX_INJECTED_ENV_KEYS, so
+    // without this per-pane assignment a CLI inside a fenced tmux/zellij/zmx
+    // pane loses BOTMUX_FENCED_RUN and userSystemdBusEnv() derives the real
+    // /run/user/<uid>/bus again. Like proxy/CA/workflow keys it is published
+    // only on the per-pane env(1) prefix (never the shared server global) and
+    // only when present, so production (unfenced) panes emit nothing.
+    if (env.BOTMUX_FENCED_RUN !== undefined) {
+      out.push(`BOTMUX_FENCED_RUN=${env.BOTMUX_FENCED_RUN}`);
+    }
   }
   // Per-bot env (bots.json `env`): appended AFTER the botmux-managed keys so a
   // bot's provider creds win over any same-named leftover, and emitted ONLY

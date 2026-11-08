@@ -21,7 +21,7 @@ import MarkdownIt from 'markdown-it';
 import * as cotMessage from '../src/im/lark/cot-message.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { outputSnapshot } from '../src/services/universal-output-handoff.js';
-import { OutputDeliveryJournal } from '../src/services/output-delivery-journal.js';
+import { OutputDeliveryJournal, outputDeliveryJournal } from '../src/services/output-delivery-journal.js';
 import { OutputDeliveryCoordinator } from '../src/services/output-delivery-coordinator.js';
 import { finalOutputSnapshot } from '../src/services/final-output-handoff.js';
 import { FinalOutputHandoffStore } from '../src/services/final-output-handoff-store.js';
@@ -2893,6 +2893,52 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       state: 'replied',
       sessionId: ds.session.sessionId,
       replyMessageId: 'om_explicit_reply',
+    });
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('settles a silent listener test run on its terminal without a source reply', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const run = createMessageListenerRunPreview('app_test', 'oc_chat', ['om_source']);
+    const triggerId = 'mlrp_turn_silent';
+    markMessageListenerRunPreviewTriggered(run.runId, 'om_source', { sessionId: 'sid-final-out', triggerId });
+    const ds = makeDs();
+    ds.session.messageListenerRun = { sourceMessageId: 'om_source', replyMode: 'none' };
+    ds.currentTurnId = triggerId;
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', { ...finalOutputMsg(), sessionId: ds.session.sessionId, turnId: triggerId });
+    (ds.worker as any).emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: triggerId, status: 'completed' });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(getMessageListenerRunPreview(run.runId)?.results[0]).toMatchObject({ state: 'completed', ok: true });
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('marks the durable output journal of a silent listener turn as intentionally suppressed', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const triggerId = 'mlrp_turn_journal';
+    const ds = makeDs();
+    ds.session.messageListenerRun = { sourceMessageId: 'om_source', replyMode: 'none' };
+    ds.currentTurnId = triggerId;
+    ds.initConfig = { ...(ds.initConfig ?? {}), finalOutputHandoff: { version: 2 as const, token: 'tok-silent' } };
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const base = { ...finalOutputMsg(), sessionId: ds.session.sessionId, turnId: triggerId };
+    const snapshot = outputSnapshot(ds.larkAppId, base);
+    (ds.worker as any).emit('message', {
+      ...base,
+      handoff: { version: 2 as const, token: 'tok-silent', id: snapshot.id, fingerprint: snapshot.fingerprint },
+    });
+    // The handoff processor settles through async coordinator/DB steps; flush
+    // the microtask queue instead of asserting synchronously after emit.
+    for (let i = 0; i < 5; i += 1) {
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+    }
+    const stored = outputDeliveryJournal(config.session.dataDir, ds.larkAppId).read(snapshot.id);
+    expect(stored?.sink).toMatchObject({
+      kind: 'suppressed',
+      reason: 'silent_message_listener',
     });
     expect(sessionReply).not.toHaveBeenCalled();
   });
