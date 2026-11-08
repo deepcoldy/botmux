@@ -560,7 +560,7 @@ function nonNegativeInteger(raw: string, fallback: number): number | null {
   return Number(value);
 }
 
-type SubstituteTargetIdField = 'email' | 'openId' | 'userId' | 'unionId';
+type SubstituteTargetIdField = 'appId' | 'email' | 'openId' | 'userId' | 'unionId';
 
 type SubstituteTargetDraft = {
   key: number;
@@ -578,7 +578,7 @@ type SubstituteTargetDraft = {
   };
 };
 
-const substituteTargetIdFields: SubstituteTargetIdField[] = ['email', 'openId', 'userId', 'unionId'];
+const substituteTargetIdFields: SubstituteTargetIdField[] = ['appId', 'email', 'openId', 'userId', 'unionId'];
 
 function parseSubstituteChats(text: string): string[] {
   const values = text.split(/[\r\n,，;；]+/).map(s => s.trim()).filter(Boolean);
@@ -605,6 +605,7 @@ export function buildSubstituteTarget(
 ): BotSubstituteTarget | null {
   const idValue = row.idValue.trim();
   if (!idValue) return null;
+  if (row.idField === 'appId') return { appId: idValue };
   const target: BotSubstituteTarget = { ...row.persisted };
   const idEdited = row.persisted[row.idField] !== idValue
     || (row.originalIdField != null && row.originalIdField !== row.idField);
@@ -3396,6 +3397,7 @@ export function BotAgentSection(props: {
               ariaLabel={tr('botDefaults.agentModel')}
               defaultLabel={tr('botDefaults.modelPickerDefault')}
               customLabel={tr('botDefaults.modelPickerCustom')}
+              includeDefault
               menuClassName="bd-field-menu"
               detectedCount={detectedLiveCount || undefined}
               detectedLabel={detectedLiveCount > 0
@@ -4463,7 +4465,16 @@ function CodexAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   );
 }
 
-type CodexConfigInfo = { isolated: boolean; path: string; exists: boolean; hostPath: string; hostExists: boolean };
+type CodexConfigInfo = {
+  isolated: boolean;
+  path: string;
+  exists: boolean;
+  hostPath: string;
+  hostExists: boolean;
+  agentsPath?: string;
+  hostAgentsPath?: string;
+  hostAgentsExists?: boolean;
+};
 
 /**
  * 独立 CODEX_HOME 的 config.toml：worker 只在首次从宿主复制一次（之后可能有本 bot 的
@@ -4493,20 +4504,24 @@ export function CodexIsolatedConfigInfo(props: { bot: BotDefaultsRow }) {
 
   async function resync(): Promise<void> {
     if (!info) return;
+    const withAgents = !!(info.hostAgentsExists && info.agentsPath && info.hostAgentsPath);
     const ok = await confirm({
-      title: tr('botDefaults.codexConfigResyncConfirmTitle'),
-      message: tr('botDefaults.codexConfigResyncConfirmMessage', { host: info.hostPath, path: info.path }),
+      title: tr(withAgents ? 'botDefaults.codexConfigResyncWithAgentsConfirmTitle' : 'botDefaults.codexConfigResyncConfirmTitle'),
+      message: withAgents
+        ? tr('botDefaults.codexConfigResyncWithAgentsConfirmMessage', { host: info.hostPath, path: info.path, hostAgents: info.hostAgentsPath!, agents: info.agentsPath! })
+        : tr('botDefaults.codexConfigResyncConfirmMessage', { host: info.hostPath, path: info.path }),
       confirmLabel: tr('botDefaults.codexConfigResync'),
     });
     if (!ok) return;
     setBusy(true);
     setStatus(null);
     try {
-      const res = await sendJson<{ ok: boolean; backupPath?: string | null; error?: string; message?: string }>('POST', `${url}/resync`, {});
+      const res = await sendJson<{ ok: boolean; backupPath?: string | null; agentsBackupPath?: string | null; error?: string; message?: string }>('POST', `${url}/resync`, {});
       if (res.ok) {
+        const backups = [res.body.backupPath, res.body.agentsBackupPath].filter(Boolean).join(', ');
         setStatus({
-          text: res.body.backupPath
-            ? tr('botDefaults.codexConfigResynced', { backup: res.body.backupPath })
+          text: backups
+            ? tr('botDefaults.codexConfigResynced', { backup: backups })
             : tr('botDefaults.codexConfigResyncedNoBackup'),
           ok: true,
         });
@@ -4614,7 +4629,10 @@ export function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
       setStatus,
       setBusy,
       saved: tr('botDefaults.sandboxSaved'),
-      errorText: res => configErrorText(res, tr),
+      // On this route only scratch can trip the zero-injection invariant.
+      errorText: res => res.body?.error === 'zero_prompt_unsupported'
+        ? tr('botDefaults.promptInjectionUnsupportedScratch')
+        : configErrorText(res, tr),
       onSaved: body => patchBot(bot.larkAppId, {
         sandbox: body.sandbox === true,
         sandboxMode: (body.mode ?? next) as 'off' | 'oncall' | 'scratch',
@@ -6513,6 +6531,8 @@ function SessionModeSection(props: {
   const [docStatus, setDocStatus] = useState<StatusMessage>(null);
   const [chatManager, setChatManager] = useState(props.bot.chatManagerEnabled === true);
   const [chatManagerStatus, setChatManagerStatus] = useState<StatusMessage>(null);
+  const [groupSecretary, setGroupSecretary] = useState(props.bot.groupSecretaryEnabled === true);
+  const [groupSecretaryStatus, setGroupSecretaryStatus] = useState<StatusMessage>(null);
 
   useEffect(() => {
     setP2p(normalizeP2pMode(props.bot.p2pMode));
@@ -6528,6 +6548,9 @@ function SessionModeSection(props: {
   useEffect(() => {
     setChatManager(props.bot.chatManagerEnabled === true);
   }, [props.bot.chatManagerEnabled]);
+  useEffect(() => {
+    setGroupSecretary(props.bot.groupSecretaryEnabled === true);
+  }, [props.bot.groupSecretaryEnabled]);
 
   async function saveP2p(next: string): Promise<void> {
     const mode = normalizeP2pMode(next);
@@ -6706,6 +6729,19 @@ function SessionModeSection(props: {
       />
       <div className="bd-mode-group-side" style={{ margin: '0 0 8px' }}><StatusSpan status={chatManagerStatus} attr={{ 'data-chat-manager-status': '' }} /></div>
 
+      <ToggleRow
+        checked={groupSecretary}
+        disabled={busy === 'groupSecretary'}
+        dataAction="toggle-group-secretary"
+        title={tr('botDefaults.groupSecretaryTitle')}
+        help={tr('botDefaults.groupSecretaryHelp')}
+        onChange={checked => {
+          setGroupSecretary(checked);
+          void saveCardMode('groupSecretary', { groupSecretaryEnabled: checked }, setGroupSecretaryStatus);
+        }}
+      />
+      <div className="bd-mode-group-side" style={{ margin: '0 0 8px' }}><StatusSpan status={groupSecretaryStatus} attr={{ 'data-group-secretary-status': '' }} /></div>
+
       <footer className="bd-session-mode-footer">{tr('botDefaults.sessionModeFooter')}</footer>
 
       <div className="bd-row bd-session-mode-doc">
@@ -6744,6 +6780,7 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   const [autoJoinSolo, setAutoJoinSolo] = useState(savedForm.autoJoinSoloGroups);
   const [decisionCards, setDecisionCards] = useState(savedForm.decisionCards);
   const [closeHints, setCloseHints] = useState(savedForm.closeHints);
+  const [taskHints, setTaskHints] = useState(savedForm.taskHints);
   const [guideMode, setGuideMode] = useState<StewardGuideMode>(savedForm.guideMode);
   const [guideText, setGuideText] = useState(savedForm.guideText);
   const [busy, setBusy] = useState(false);
@@ -6764,6 +6801,7 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
   useEffect(() => { setAutoJoinSolo(savedForm.autoJoinSoloGroups); }, [appId, savedForm.autoJoinSoloGroups]);
   useEffect(() => { setDecisionCards(savedForm.decisionCards); }, [appId, savedForm.decisionCards]);
   useEffect(() => { setCloseHints(savedForm.closeHints); }, [appId, savedForm.closeHints]);
+  useEffect(() => { setTaskHints(savedForm.taskHints); }, [appId, savedForm.taskHints]);
   useEffect(() => {
     setGuideMode(savedForm.guideMode);
     setGuideText(savedForm.guideText);
@@ -6843,6 +6881,12 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
     const previous = closeHints;
     setCloseHints(on);
     void save({ ...savedForm, closeHints: on }, setStatus, () => setCloseHints(previous));
+  }
+
+  function toggleTaskHints(on: boolean): void {
+    const previous = taskHints;
+    setTaskHints(on);
+    void save({ ...savedForm, taskHints: on }, setStatus, () => setTaskHints(previous));
   }
 
   function changeChat(next: string): void {
@@ -6932,6 +6976,14 @@ export function StewardSection(props: { bot: BotDefaultsRow; patchBot: PatchBot;
             title={tr('botDefaults.stewardCloseHints')}
             help={tr('botDefaults.stewardCloseHintsHelp')}
             onChange={toggleCloseHints}
+          />
+          <ToggleRow
+            checked={taskHints}
+            disabled={busy}
+            dataAction="toggle-steward-task-hints"
+            title={tr('botDefaults.stewardTaskHints')}
+            help={tr('botDefaults.stewardTaskHintsHelp')}
+            onChange={toggleTaskHints}
           />
           <div className="bd-row bd-steward-guide">
             <div className="bd-field">
@@ -7254,7 +7306,7 @@ function CommandTriggerSection(props: { bot: BotDefaultsRow }) {
   );
 }
 
-function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+export function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const initial = props.bot.substituteMode ?? null;
   const [enabled, setEnabled] = useState(initial?.enabled === true);
@@ -7272,6 +7324,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
   const [controlCard, setControlCard] = useState(initial?.disableControlCard !== true);
   const [chatsText, setChatsText] = useState(() => formatSubstituteChats(initial?.chats));
   const [excludedChatsText, setExcludedChatsText] = useState(() => formatSubstituteChats(initial?.excludedChats));
+  const [keywordsText, setKeywordsText] = useState(() => (initial?.keywords ?? []).join('\n'));
   // 话题群相关开关缺省开：只有显式 false 才是关（与 normalize 语义一致）。
   const [topicGroups, setTopicGroups] = useState(initial?.topicGroups !== false);
   const [topicActiveSessionTrigger, setTopicActiveSessionTrigger] = useState(initial?.topicActiveSessionTrigger !== false);
@@ -7289,7 +7342,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
       name: target?.name ?? '',
       persisted: target ? { ...target } : {},
       originalIdField: target ? idField : undefined,
-      resolution: target?.name || target?.avatarUrl
+      resolution: target?.appId ? { ok: true, name: target.name } : target?.name || target?.avatarUrl
         ? { ok: true, name: target.name, avatarUrl: target.avatarUrl }
         : undefined,
     };
@@ -7318,12 +7371,13 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
       const res = await resolveSubstituteTarget(props.bot.larkAppId, target);
       if (!isCurrent()) return;
       setTargetRows(rows => rows.map(r => {
-        if (r.key !== key) return r;
+        if (r.key !== key || r.idField !== row.idField || r.idValue.trim() !== idValue) return r;
         if (!res.ok) return { ...r, resolving: false, resolution: { ok: false } };
         const entry = res.resolution;
         if (entry?.ok === true) {
           // userId passthrough: nothing was verified (no openId / profile) —
           // keep the editable name input instead of showing a fake chip.
+          if (entry.appId) return { ...r, persisted: { appId: entry.appId }, resolving: false, resolution: { ok: true } };
           if (!entry.openId) return { ...r, resolving: false, resolution: undefined };
           const persisted: BotSubstituteTarget = { ...r.persisted };
           persisted.openId = entry.openId;
@@ -7366,13 +7420,14 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
     setControlCard(next?.disableControlCard !== true);
     setChatsText(formatSubstituteChats(next?.chats));
     setExcludedChatsText(formatSubstituteChats(next?.excludedChats));
+    setKeywordsText((next?.keywords ?? []).join('\n'));
     setTopicGroups(next?.topicGroups !== false);
     setTopicActiveSessionTrigger(next?.topicActiveSessionTrigger !== false);
     const targets = next?.targets ?? [];
     setTargetRows(targets.length ? targets.map(target => makeTargetDraft(target)) : [makeTargetDraft()]);
   }, [props.bot.larkAppId, props.bot.substituteMode]);
 
-  async function save(body: { enabled: boolean; targets: BotSubstituteTarget[]; disclosure?: 'prefix' | 'none'; chats?: string[]; excludedChats?: string[]; replyMode?: 'thread' | 'quote'; disableControlCard?: boolean; topicGroups?: boolean; topicActiveSessionTrigger?: boolean }): Promise<void> {
+  async function save(body: { enabled: boolean; targets: BotSubstituteTarget[]; keywords?: string[]; disclosure?: 'prefix' | 'none'; chats?: string[]; excludedChats?: string[]; replyMode?: 'thread' | 'quote'; disableControlCard?: boolean; topicGroups?: boolean; topicActiveSessionTrigger?: boolean }): Promise<void> {
     setBusy(true);
     setStatus(null);
     try {
@@ -7394,6 +7449,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
         setControlCard(next?.disableControlCard !== true);
         setChatsText(formatSubstituteChats(next?.chats));
         setExcludedChatsText(formatSubstituteChats(next?.excludedChats));
+        setKeywordsText((next?.keywords ?? []).join('\n'));
         setTopicGroups(next?.topicGroups !== false);
         setTopicActiveSessionTrigger(next?.topicActiveSessionTrigger !== false);
         if (resolution.length) {
@@ -7466,7 +7522,7 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
       setStatus({ text: `✗ ${tr('botDefaults.substituteTargetsInvalid')}` });
       return;
     }
-    void save({ enabled, targets, disclosure, chats: parseSubstituteChats(chatsText), excludedChats: parseSubstituteChats(excludedChatsText), replyMode, disableControlCard: !controlCard, topicGroups, topicActiveSessionTrigger });
+    void save({ enabled, targets, keywords: parseSubstituteChats(keywordsText), disclosure, chats: parseSubstituteChats(chatsText), excludedChats: parseSubstituteChats(excludedChatsText), replyMode, disableControlCard: !controlCard, topicGroups, topicActiveSessionTrigger });
   }
 
   const disclosureOptions: DropdownFieldOption<'prefix' | 'none'>[] = [
@@ -7489,6 +7545,20 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
         help={tr('botDefaults.substituteHelp')}
         onChange={setEnabled}
       />
+      <div className="bd-row">
+        <label>
+          <FieldTitle help={tr('botDefaults.substituteKeywordsHelp')}>{tr('botDefaults.substituteKeywords')}</FieldTitle>
+          <textarea
+            data-input="substituteKeywords"
+            rows={3}
+            placeholder={tr('botDefaults.substituteKeywordsPlaceholder')}
+            value={keywordsText}
+            disabled={busy}
+            onChange={event => setKeywordsText(event.currentTarget.value)}
+          />
+          <p className="help">{tr('botDefaults.substituteKeywordsHelp')}</p>
+        </label>
+      </div>
       <ToggleRow
         checked={topicGroups}
         disabled={busy}
@@ -7581,8 +7651,9 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
                   label: tr(`botDefaults.substituteTarget${value[0].toUpperCase()}${value.slice(1)}`),
                 }))}
                 onChange={idField => {
+                  resolveEpochs.current.set(target.key, (resolveEpochs.current.get(target.key) ?? 0) + 1);
                   setTargetRows(rows => rows.map(row => row.key === target.key
-                    ? { ...row, idField, idValue: row.persisted[idField] ?? '', resolution: undefined }
+                    ? { ...row, idField, idValue: row.persisted[idField] ?? '', resolving: false, resolution: undefined }
                     : row));
                 }}
               />
@@ -7596,14 +7667,17 @@ function SubstituteModeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot 
                 disabled={busy}
                 onChange={event => {
                   const idValue = event.currentTarget.value;
-                  setTargetRows(rows => rows.map(row => row.key === target.key ? { ...row, idValue, resolution: undefined } : row));
+                  resolveEpochs.current.set(target.key, (resolveEpochs.current.get(target.key) ?? 0) + 1);
+                  setTargetRows(rows => rows.map(row => row.key === target.key ? { ...row, idValue, resolving: false, resolution: undefined } : row));
                 }}
                 onBlur={() => {
                   if (target.idValue.trim()) void resolveTargetRow(target.key);
                 }}
               />
               <div className="bd-substitute-target-name">
-                {target.resolving ? (
+                {target.idField === 'appId' ? (
+                  <span className={target.resolution?.ok === false ? "bd-substitute-target-resolution-badge" : "bd-substitute-target-name-chip"}>{target.resolution?.ok === false ? substituteReasonText(target.resolution.reason) : tr('botDefaults.substituteTargetAppIdHint')}</span>
+                ) : target.resolving ? (
                   <span className="bd-substitute-target-resolving">{tr('botDefaults.substituteResolving')}</span>
                 ) : target.resolution?.ok === true && (target.name || target.resolution.avatarUrl) ? (
                   <>

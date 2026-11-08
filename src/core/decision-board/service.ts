@@ -20,7 +20,10 @@ import {
   DecisionBoardStore,
   decisionBoardDbPath,
   type ItemPatch,
+  type StagedFileInput,
 } from '../../services/decision-board-store.js';
+import { discardStagedExplainer, readStagedExplainer, stageBoardExplainer } from '../../services/decision-board-staging.js';
+import { BOARD_EXPLAINERS_PER_ATTACH, normalizeBoardFileName } from './files.js';
 import {
   formatHintNotice,
   formatHintPrompt,
@@ -33,6 +36,18 @@ import {
   type PrMergeState,
 } from './hints.js';
 import { formatChatLookupFailures, lookupProvesChatNotFound, type ChatLookupResult } from './chat-lookup.js';
+import { ChatTaskReader, type ChatTaskReaderDeps } from './chat-task-reader.js';
+import {
+  formatTaskNotice,
+  formatTaskPrompt,
+  itemChatIds,
+  itemTaskHint,
+  stewardUpdatedAt,
+  taskHintForChat,
+  type ChatTaskState,
+  type TaskHint,
+  type TaskNoticeEntry,
+} from './chat-task.js';
 import {
   DECISION_CARD_ACTION_NOTE,
   DECISION_CARD_ACTION_PICK,
@@ -65,7 +80,9 @@ import {
   stewardGuidePreset,
   stewardCloseHintsOn,
   stewardReady,
+  stewardTaskHintsOn,
   type BoardBatch,
+  type BoardFile,
   type BoardHint,
   type BoardItem,
   type BoardLink,
@@ -120,6 +137,10 @@ export interface DecisionBoardServiceDeps {
    * undefined，巡检这轮不据此下结论。缓存与限流由实现负责（见 github-pr-state.ts）。
    */
   prState?(ref: string): Promise<PrMergeState | undefined>;
+  /**
+   * 读关联群里的会话（本机所有 bot），算群状态与子任务提醒。不接线时看板不带群状态、不提醒。
+   */
+  chatTasks?: ChatTaskReaderDeps;
 }
 
 /** 卡片按钮回调交给 {@link DecisionBoardService.cardClick} 的内容（身份取自飞书事件，不取 value）。 */
@@ -181,6 +202,8 @@ export interface BoardCliRequest {
   text?: unknown;
   handled?: unknown;
   files?: unknown;
+  /** attach：先经上传接口写进暂存区的说明页 / 视频（id 列表）。 */
+  staged?: unknown;
   note?: unknown;
   /** `--primary-chat oc_…` */
   primaryChat?: unknown;
@@ -231,6 +254,21 @@ const HINT_PR_LOOKUPS_PER_ROUND = 40;
  */
 const HINT_NOTICE_MAX_ATTEMPTS = 3;
 
+/**
+ * 子任务提醒的防抖：收到第一个事件后等这么久再统一核对，期间的事件合成一条。一轮刚结束时常常紧跟着
+ * 群里的新消息又开一轮，等一下也能让「又开始跑了」的群不提醒。
+ */
+export const TASK_ALERT_DEBOUNCE_MS = 2 * 60_000;
+
+type NoticeChannel = 'hint' | 'task';
+
+/** Dashboard 上一项的子任务视图：各关联群的状态、是否有管家还没处理的新结果、提示。 */
+export interface ItemTaskView {
+  taskChats?: ChatTaskState[];
+  taskFresh?: boolean;
+  taskHint?: TaskHint;
+}
+
 export class DecisionBoardService {
   private storeRef?: DecisionBoardStore;
   private readonly delivering = new Map<number, Promise<BoardBatch>>();
@@ -241,14 +279,20 @@ export class DecisionBoardService {
   /** 正在投的提示通知（与 sweeping 分开：投递卡住时巡检照常给看板标提示，只是这期间不再发新通知）。 */
   private noticeInFlight = false;
   /** 已送进 worker、还没确认的提示回合 → 这一轮通知的 key。送达失败回执到了按它撤销「已通知」。 */
-  private readonly hintRounds = new Map<string, Array<{ seq: number; key: string }>>();
+  private readonly hintRounds = new Map<string, { channel: NoticeChannel; keys: Array<{ seq: number; key: string }>; chats: string[] }>();
   /** `<seq>:<key>` → 已经自动投过几次（只在内存里：重启后从头算，最多再多发几次）。 */
   private readonly hintAttempts = new Map<string, number>();
   /** 上次查到的 PR 状态：这一轮没轮到、或这轮查不到的 PR 用它。 */
   private readonly prKnown = new Map<string, PrMergeState>();
   private prCursor = 0;
+  private readonly chatTaskReader?: ChatTaskReader;
+  /** 等防抖结束后核对的群。 */
+  private readonly taskPending = new Set<string>();
+  private taskTimer?: ReturnType<typeof setTimeout>;
+  private taskFlushing = false;
 
   constructor(private readonly deps: DecisionBoardServiceDeps) {
+    if (deps.chatTasks) this.chatTaskReader = new ChatTaskReader(deps.chatTasks);
     const sink = deps.cards;
     if (sink) {
       this.cards = new DecisionCards({
@@ -297,6 +341,9 @@ export class DecisionBoardService {
   }
 
   close(): void {
+    if (this.taskTimer) clearTimeout(this.taskTimer);
+    this.taskTimer = undefined;
+    this.taskPending.clear();
     this.cards?.stop();
     this.storeRef?.close();
     this.storeRef = undefined;
@@ -617,6 +664,7 @@ export class DecisionBoardService {
         return { seq, eventId: res.eventId, handledDecisions: res.handled, ...this.itemLinks(seq) };
       }
       case 'attach': {
+        if (req.staged !== undefined) return this.attachWithExplainers(req, ctx);
         const seq = this.resolveRef(req.ref);
         const parsed = parseDashboardImageUploads(req.files);
         if (!parsed.ok) throw new BoardError('invalid_files', `截图不合规：${parsed.error}`);
@@ -639,6 +687,49 @@ export class DecisionBoardService {
       default:
         throw new BoardError('unknown_action', `不认识的子命令：${action || '(空)'}`);
     }
+  }
+
+  /**
+   * `botmux board attach` 带了说明页 / 视频：它们已经由 stageExplainer 写进暂存区，这里和同一条命令里的
+   * 截图一起挂到事项上，只记一条历史。暂存必须是同一事项、同一会话上传的；读到的暂存不管
+   * attach 成败都丢掉。
+   */
+  private attachWithExplainers(req: BoardCliRequest, ctx: { sessionId: string }) {
+    const seq = this.resolveRef(req.ref);
+    const ids = Array.isArray(req.staged) ? [...new Set(req.staged)] : null;
+    if (!ids || ids.length === 0) throw new BoardError('files_required', '至少附一个文件');
+    if (ids.length > BOARD_EXPLAINERS_PER_ATTACH) {
+      throw new BoardError('too_many_files', `一次最多附 ${BOARD_EXPLAINERS_PER_ATTACH} 个说明页 / 视频`);
+    }
+    const staged: Array<StagedFileInput & { id: string }> = [];
+    let saved: BoardFile[];
+    try {
+      for (const id of ids) staged.push(readStagedExplainer(this.deps.dataDir, this.appId, id, { seq, sessionId: ctx.sessionId }));
+      const parsed = parseDashboardImageUploads(req.files);
+      if (!parsed.ok) throw new BoardError('invalid_files', `截图不合规：${parsed.error}`);
+      saved = this.store().attachExplainers(this.appId, seq, {
+        staged,
+        images: parsed.images.map(img => ({ bytes: Buffer.from(img.dataBase64, 'base64'), mime: img.mimeType, name: img.name })),
+      }, typeof req.note === 'string' ? req.note : undefined, ctx.sessionId);
+    } finally {
+      for (const s of staged) discardStagedExplainer(this.deps.dataDir, this.appId, s.id);
+    }
+    this.syncCard(seq);
+    return { seq, files: saved.map(f => ({ id: f.id, name: f.name, bytes: f.bytes, mime: f.mime })), ...this.itemLinks(seq) };
+  }
+
+  /**
+   * 上传一个说明页 / 视频到暂存区（正文是文件原始字节，流式写盘）。返回的 id 由同一会话的 attach 引用。
+   * 先确认管家开着、事项存在，再读正文。
+   */
+  async stageExplainer(input: { ref: unknown; name: string; mime: string; body: AsyncIterable<Uint8Array | string> }, ctx: { sessionId: string }) {
+    this.requireSteward();
+    const seq = this.resolveRef(input.ref);
+    const name = normalizeBoardFileName(input.name, input.mime, 'explainer');
+    const { staged, warnings } = await stageBoardExplainer(this.deps.dataDir, this.appId, {
+      seq, sessionId: ctx.sessionId, name, mime: input.mime, body: input.body,
+    });
+    return { id: staged.id, seq, name: staged.name, mime: staged.mime, bytes: staged.bytes, warnings };
   }
 
   // ─── Dashboard ───────────────────────────────────────────────────────────
@@ -681,6 +772,125 @@ export class DecisionBoardService {
     };
   }
 
+  /** 各项关联群的状态（排除管家群）。读不到会话 inventory 时各群都是「读不到」。 */
+  private async chatStatesFor(lists: ReadonlyArray<readonly string[]>, fresh = false): Promise<Map<string, ChatTaskState>> {
+    if (!this.chatTaskReader) return new Map();
+    return this.chatTaskReader.read(lists.flat(), { fresh });
+  }
+
+  private taskView(item: Pick<BoardItem, 'primaryChat' | 'state' | 'updatedAt' | 'stewardEventAt' | 'createdAt'>, links: readonly BoardLink[],
+    states: Map<string, ChatTaskState>): ItemTaskView {
+    if (!this.chatTaskReader) return {};
+    const chats = itemChatIds(item, links, this.deps.steward()?.chatId).map(id => states.get(id) ?? { chatId: id, kind: 'unreadable' as const });
+    if (chats.length === 0) return {};
+    const hint = itemTaskHint(item, chats);
+    return {
+      taskChats: chats,
+      taskFresh: !!hint,
+      ...(hint && stewardTaskHintsOn(this.deps.steward()) ? { taskHint: hint } : {}),
+    };
+  }
+
+  /** Dashboard 列表：{@link list} + 各项关联群的状态；「进行中」视图里群里有新结果的排在前面。 */
+  async listView(view: BoardView, author: string, query?: string) {
+    const base = this.list(view, author, query);
+    const stewardChat = this.deps.steward()?.chatId;
+    const states = await this.chatStatesFor(base.items.map(i => itemChatIds(i, i.links, stewardChat)));
+    const items = base.items.map(i => ({ ...i, ...this.taskView(i, i.links, states) }));
+    if (view === 'active') {
+      const order = new Map(items.map((i, n) => [i.seq, n]));
+      items.sort((a, b) => Number(!!b.taskFresh) - Number(!!a.taskFresh) || order.get(a.seq)! - order.get(b.seq)!);
+    }
+    return { ...base, items };
+  }
+
+  /** Dashboard 详情：{@link detail} + 每个关联群的状态。 */
+  async detailView(seq: number, author: string) {
+    const base = this.detail(seq, author);
+    const stewardChat = this.deps.steward()?.chatId;
+    const states = await this.chatStatesFor([itemChatIds(base.item, base.links, stewardChat)]);
+    return { ...base, ...this.taskView(base.item, base.links, states) };
+  }
+
+  /**
+   * 任一 daemon 记下本轮结果或举手时按群转到这里。只记下群、排一次防抖核对，不信任事件内容。
+   */
+  noteTaskEvent(chatId: string): void {
+    const steward = this.deps.steward();
+    if (!this.chatTaskReader || !stewardTaskHintsOn(steward) || chatId === steward.chatId) return;
+    if (!this.storeRef && !existsSync(decisionBoardDbPath(this.deps.dataDir))) return;
+    this.taskPending.add(chatId);
+    this.scheduleTaskFlush();
+  }
+
+  private scheduleTaskFlush(): void {
+    if (this.taskTimer || this.taskPending.size === 0) return;
+    this.taskTimer = setTimeout(() => {
+      this.taskTimer = undefined;
+      void this.flushTaskAlerts().catch(err => this.deps.log('warn', `[decision-board] task alert failed: ${err instanceof Error ? err.message : String(err)}`));
+    }, TASK_ALERT_DEBOUNCE_MS);
+    this.taskTimer.unref?.();
+  }
+
+  /**
+   * 防抖到点：重新读这些群的状态，对关联了它们、没结束的事项算提醒：只有已交付 / 等人处理 / 中断，
+   * 且晚于管家最后一次更新这一项、这个结果还没提醒过。全部合成一条发给管家会话。
+   * 返回这轮提醒了几条。
+   */
+  async flushTaskAlerts(): Promise<number> {
+    if (this.taskFlushing) {
+      this.scheduleTaskFlush();
+      return 0;
+    }
+    const chats = [...this.taskPending];
+    this.taskPending.clear();
+    const steward = this.deps.steward();
+    if (!chats.length || !this.chatTaskReader || !stewardTaskHintsOn(steward)) return 0;
+    this.taskFlushing = true;
+    let entries: TaskNoticeEntry[] = [];
+    try {
+      const watched = chats.filter(c => c !== steward.chatId);
+      if (!this.store().itemsForChats(this.appId, watched).length) return 0;
+      const states = await this.chatStatesFor([watched], true);
+      const locale = this.deps.locale();
+      // 读状态可能花了一阵：按此刻的事项判断（期间管家可能已经更新、关掉或改了关联）。
+      for (const { item, links, taskNotified } of this.store().itemsForChats(this.appId, watched)) {
+        const since = stewardUpdatedAt(item);
+        const itemLinks = this.itemLinks(item.seq);
+        const link = itemLinks.appLink ?? itemLinks.url;
+        for (const chatId of itemChatIds(item, links, steward.chatId)) {
+          const state = watched.includes(chatId) ? states.get(chatId) : undefined;
+          const hint = state ? taskHintForChat(state, since) : undefined;
+          if (!hint || taskNotified.includes(hint.key)) continue;
+          const chatLink = links.find(l => l.kind === 'chat' && l.ref === chatId);
+          entries.push({
+            seq: item.seq, title: item.title, hint,
+            ...(chatLink ? { chatText: linkText(chatLink, locale) } : {}),
+            ...(link ? { link } : {}),
+          });
+        }
+      }
+    } finally {
+      this.taskFlushing = false;
+    }
+    entries = entries.filter(e => (this.hintAttempts.get(`${e.seq}:${e.hint.key}`) ?? 0) < HINT_NOTICE_MAX_ATTEMPTS);
+    if (!entries.length) return 0;
+    const sent = await this.deliverHintNotice(entries.map(e => ({ seq: e.seq, key: e.hint.key, chat: e.hint.chatId })), Date.now(), this.deps.locale(), {
+      channel: 'task',
+      prompt: formatTaskPrompt(entries, this.deps.locale()),
+      notice: formatTaskNotice(entries, this.deps.locale()),
+    });
+    if (!sent) this.retryTaskChats(entries.map(e => e.hint.chatId));
+    else this.deps.log('info', `[decision-board] task alert: notified ${sent}`);
+    return sent;
+  }
+
+  /** 没送出去的提醒稍后再核对一次（投递次数上限与巡检提示共用）。 */
+  private retryTaskChats(chats: readonly string[]): void {
+    for (const c of chats) this.taskPending.add(c);
+    this.scheduleTaskFlush();
+  }
+
   markSeen(seq: number): void {
     this.store().markSeen(this.appId, seq);
   }
@@ -709,6 +919,11 @@ export class DecisionBoardService {
 
   readFile(id: string) {
     return this.store().readFile(this.appId, id);
+  }
+
+  /** 只取元数据和磁盘路径：视频按 Range 分段读，不整个读进内存。 */
+  fileInfo(id: string) {
+    return this.store().getFile(this.appId, id);
   }
 
   async submit(input: { author: string; submitter?: string; authorName?: string; nonce: string; items: Array<{ seq: number; draftUpdatedAt: number }> }) {
@@ -786,17 +1001,23 @@ export class DecisionBoardService {
     const hintRound = parseHintTurnId(turnId);
     if (hintRound) {
       if (hintRound.appId !== this.appId) return;
-      const entries = this.hintRounds.get(turnId);
+      const round = this.hintRounds.get(turnId);
       this.hintRounds.delete(turnId);
-      if (!entries?.length) return;
+      const entries = round?.keys;
+      if (!round || !entries?.length) return;
       // 只有 worker 明确说没收下（入队前拒绝）才重发；收据超时之类是「结果未知」，CLI 可能已经拿到了，
       // 重发会在群里和会话里各多一份，就保持「已通知」（提示还留在看板上）。
       if (messageKey !== 'worker.input_rejected_before_admission') {
         this.deps.log('warn', `[decision-board] hint notice ${turnId} delivery unconfirmed (${reason}); not resending`);
         return;
       }
-      this.deps.log('warn', `[decision-board] hint notice ${turnId} rejected by worker (${reason}); will retry next sweep`);
-      this.store().unmarkHintsNotified(this.appId, this.retryable(entries));
+      this.deps.log('warn', `[decision-board] hint notice ${turnId} rejected by worker (${reason}); will retry`);
+      if (round.channel === 'task') {
+        this.store().unmarkTaskNotified(this.appId, this.retryable(entries));
+        this.retryTaskChats(round.chats);
+      } else {
+        this.store().unmarkHintsNotified(this.appId, this.retryable(entries));
+      }
       return;
     }
     const parsed = parseBoardTurnId(turnId);
@@ -959,7 +1180,19 @@ export class DecisionBoardService {
       this.sweeping = false;
     }
     let notified = 0;
-    if (pending.length) notified = await this.deliverHintNotice(pending, at, this.deps.locale());
+    if (pending.length) {
+      const locale = this.deps.locale();
+      const entries: HintNoticeEntry[] = pending.map(p => {
+        const links = this.itemLinks(p.seq);
+        const link = links.appLink ?? links.url;
+        return { seq: p.seq, title: p.title, hint: p.hint, ...(link ? { link } : {}) };
+      });
+      notified = await this.deliverHintNotice(pending.map(p => ({ seq: p.seq, key: p.hint.key })), at, locale, {
+        channel: 'hint',
+        prompt: formatHintPrompt(entries, locale),
+        notice: formatHintNotice(entries, locale),
+      });
+    }
     if (summary.marked || summary.cleared || notified) {
       this.deps.log('info', `[decision-board] hint sweep: marked ${summary.marked}, cleared ${summary.cleared}, notified ${notified}`);
     }
@@ -971,45 +1204,53 @@ export class DecisionBoardService {
     return entries.filter(e => (this.hintAttempts.get(`${e.seq}:${e.key}`) ?? 0) < HINT_NOTICE_MAX_ATTEMPTS);
   }
 
-  private async deliverHintNotice(pending: Array<{ seq: number; title: string; hint: BoardHint }>, round: number, locale: Locale): Promise<number> {
+  /**
+   * 把一轮提示（巡检的关闭 / 推进提示，或子任务提醒）合成一条送进管家会话。两类各记各的「已通知」。
+   */
+  private async deliverHintNotice(
+    keys: Array<{ seq: number; key: string; chat?: string }>,
+    round: number,
+    locale: Locale,
+    content: { channel: NoticeChannel; prompt: string; notice: string },
+  ): Promise<number> {
     const steward = this.deps.steward();
     if (!stewardReady(steward)) return 0;
-    // 上一条通知还在投（deliver 卡住）：这轮不再叠一条，提示留到下一轮。
+    // 上一条通知还在投（deliver 卡住）：这轮不再叠一条，留到下一轮。
     if (this.noticeInFlight) return 0;
     this.noticeInFlight = true;
+    const store = this.store();
+    const mark = (entries: Array<{ seq: number; key: string }>) => content.channel === 'task'
+      ? store.markTaskNotified(this.appId, entries) : store.markHintsNotified(this.appId, entries);
+    const unmark = (entries: Array<{ seq: number; key: string }>) => content.channel === 'task'
+      ? store.unmarkTaskNotified(this.appId, entries) : store.unmarkHintsNotified(this.appId, entries);
     try {
-      const entries: HintNoticeEntry[] = pending.map(p => {
-        const links = this.itemLinks(p.seq);
-        const link = links.appLink ?? links.url;
-        return { seq: p.seq, title: p.title, hint: p.hint, ...(link ? { link } : {}) };
-      });
-      const keys = pending.map(p => ({ seq: p.seq, key: p.hint.key }));
-      for (const k of keys) this.hintAttempts.set(`${k.seq}:${k.key}`, (this.hintAttempts.get(`${k.seq}:${k.key}`) ?? 0) + 1);
+      const plain = keys.map(k => ({ seq: k.seq, key: k.key }));
+      for (const k of plain) this.hintAttempts.set(`${k.seq}:${k.key}`, (this.hintAttempts.get(`${k.seq}:${k.key}`) ?? 0) + 1);
       while (this.hintAttempts.size > 512) this.hintAttempts.delete(this.hintAttempts.keys().next().value!);
       const turnId = formatHintTurnId(this.appId, round);
       // 先记「已通知」再投：deliver() 里进程死掉时宁可漏一次（看板上的提示还在），也不重复刷屏；
       // deliver() 明确失败就撤销（没到次数上限的），下一轮重试。
-      this.store().markHintsNotified(this.appId, keys);
-      this.hintRounds.set(turnId, keys);
+      mark(plain);
+      this.hintRounds.set(turnId, { channel: content.channel, keys: plain, chats: [...new Set(keys.flatMap(k => (k.chat ? [k.chat] : [])))] });
       while (this.hintRounds.size > 16) this.hintRounds.delete(this.hintRounds.keys().next().value!);
       try {
         await this.deps.deliver({
           turnId,
-          prompt: formatHintPrompt(entries, locale),
-          announcement: { texts: splitEchoText(formatHintNotice(entries, locale)), images: [] },
+          prompt: content.prompt,
+          announcement: { texts: splitEchoText(content.notice), images: [] },
           attachments: [],
           chatId: steward.chatId,
           sessionTitle: locale === 'en' ? 'Steward' : '管家',
         });
       } catch (error) {
         this.hintRounds.delete(turnId);
-        const retry = this.retryable(keys);
-        this.store().unmarkHintsNotified(this.appId, retry);
+        const retry = this.retryable(plain);
+        unmark(retry);
         this.deps.log('warn', `[decision-board] hint notice ${turnId} delivery failed: ${error instanceof Error ? error.message : String(error)}`
-          + (retry.length < keys.length ? `; ${keys.length - retry.length} hint(s) reached ${HINT_NOTICE_MAX_ATTEMPTS} attempts, not retrying` : ''));
+          + (retry.length < plain.length ? `; ${plain.length - retry.length} hint(s) reached ${HINT_NOTICE_MAX_ATTEMPTS} attempts, not retrying` : ''));
         return 0;
       }
-      return keys.length;
+      return plain.length;
     } finally {
       this.noticeInFlight = false;
     }
@@ -1153,6 +1394,8 @@ function askChanged(before: BoardItem | undefined, after: BoardItem): boolean {
 export function boardErrorStatus(error: unknown): { status: number; error: string; message: string } {
   if (error instanceof BoardError) {
     const status = error.code === 'not_steward' ? 409
+      : error.code === 'file_too_large' ? 413
+      : error.code === 'staging_full' ? 507
       : error.code === 'item_not_found' || error.code === 'batch_not_found' ? 404
         : error.code === 'storage_unavailable' ? 503
           : error.code === 'draft_changed' || error.code === 'draft_missing' || error.code === 'key_conflict'

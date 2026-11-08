@@ -14,14 +14,15 @@ import { sessionPromptInjection } from '../../core/prompt-injection.js';
 import { normalizeCardActionData } from './card-action-data.js';
 import { logCardActionDiagnostics } from './card-action-diagnostics.js';
 import { existsSync } from 'node:fs';
-import { basename as pathBasename, dirname, join } from 'node:path';
+import { basename as pathBasename, join } from 'node:path';
 import { closeResidualIsLocal, describeCloseResidual } from '../../core/close-residual.js';
 import { config } from '../../config.js';
 import { replyCardKey, updateTurnReplyCard } from '../../core/turn-reply-card.js';
 import { TurnReplyCardStore, replyCardIsTerminal } from '../../services/turn-reply-card.js';
 import { getBot, getAllBots, getOwnerOpenId } from '../../bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
-import { writeSessionModelPin } from '../../core/worker-pool.js';
+import { writeSessionModelPin, recordTurnExplicitMention } from '../../core/worker-pool.js';
+import { messageMentionsBot } from './message-parser.js';
 import { validateModelPin } from '../../core/model-pin.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
@@ -93,11 +94,12 @@ import { applyIdleAutoCompactSetting, idleAutoCompactMinutes, isIdleAutoCompactE
 import { cancelDeploymentContinuation } from '../../services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from '../../core/deployment-continuation-authority.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../../services/failed-turn-retry.js';
+import { holdPurgeClickRollback } from '../../services/image-purge-recovery.js';
 import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { AutoWorktreeFailClosedError } from '../../services/default-worktree.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
-import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
+import { cliHasNoRawPassthroughSurface, cliSupportsCompactAction } from '../../core/passthrough-commands.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
 import { sessionReasoningControl, updateCodexCliEffort, topicReasoningControl, setTopicReasoningEffort, isSessionRestartInFlight, setSessionReasoningEffort, sessionSupportsIdleAutoCompact, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, substituteCardControlFor, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
@@ -116,7 +118,7 @@ import type { DaemonSession } from '../../core/types.js';
 import { readPrincipalLaneTurnBinding } from '../../core/principal-lane-turn.js';
 import { buildTerminalUrl, platformTerminalReadEntryActive } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
-import { createRepoWorktree, removeRepoWorktree, restoreDeletedWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
+import { createRepoWorktree, removeRepoWorktree, restoreDeletedWorktree, dirSuffixForBranch, pushWorktreeBranch, worktreeTargetPath } from '../../services/git-worktree.js';
 import { repinSessionWorkingDir } from '../../core/session-cwd.js';
 import { answerRestartWithoutWorkingDir, reclaimUnstartedOpening, recoveryCardForm, workingDirRecoveryPending } from '../../core/working-dir-recovery.js';
 import { withCodexAppContext } from '../../utils/codex-app-context.js';
@@ -410,6 +412,34 @@ function isLiveWorkerIdleOrLimited(ds: DaemonSession): boolean {
   return ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited';
 }
 
+/** Snapshot of the turn state a purge click overwrites. Restoring it is only
+ *  sound while the rejected continuation is still the session's latest input. */
+function captureTurnStateBeforePurgeClick(ds: DaemonSession): () => void {
+  const live = {
+    suppressRecoveryCard: ds.suppressRecoveryCard,
+    lastUserPrompt: ds.lastUserPrompt,
+    lastCliInput: ds.lastCliInput,
+    lastCliInputTurnId: ds.lastCliInputTurnId,
+    lastCodexAppInput: ds.lastCodexAppInput,
+    currentTurnTitle: ds.currentTurnTitle,
+    currentImageKey: ds.currentImageKey,
+  };
+  const persisted = {
+    lastUserPrompt: ds.session.lastUserPrompt,
+    lastCliInput: ds.session.lastCliInput,
+    lastCliInputTurnId: ds.session.lastCliInputTurnId,
+    lastCodexAppInput: ds.session.lastCodexAppInput,
+  };
+  const { lastScreenStatus, streamCardPending } = ds;
+  return () => {
+    Object.assign(ds, live);
+    Object.assign(ds.session, persisted);
+    // Worker screen updates own these after the click; only undo the click's marks.
+    if (ds.lastScreenStatus === 'working') ds.lastScreenStatus = lastScreenStatus;
+    if (ds.streamCardPending) ds.streamCardPending = streamCardPending;
+  };
+}
+
 function isLegacySelfHealAction(actionType?: string): boolean {
   return !!actionType && LEGACY_SELF_HEAL_ACTIONS.has(actionType);
 }
@@ -552,8 +582,8 @@ function stringListFromLarkMultiSelect(raw: unknown): string[] {
 
 function multiWorktreeParentPath(repoPaths: string[], name: string): string {
   const first = repoPaths[0];
-  const parentRoot = first ? dirname(first) : process.cwd();
-  return join(parentRoot, dirSuffixForBranch(name));
+  const dirName = dirSuffixForBranch(name);
+  return first ? worktreeTargetPath(first, dirName) : join(process.cwd(), dirName);
 }
 
 function worktreeChildNameForRepo(repoPath: string, projects: ProjectInfo[] | undefined): string {
@@ -889,6 +919,15 @@ export async function commitRepoSelection(
       // the user can retry this exact selection without losing the first turn.
       const pendingTurnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
       if (!emptyStart && pendingTurnId) await prepareTurn?.(ds, pendingTurnId);
+      // 被 @ 回执的来源记录挂在交给 forkWorker 的同一 turnId 上（turn_terminal 带回的就是它）；
+      // raw 冷启动的 turnId 不经 forkWorker，而是在 prompt_ready 随 raw_input 下发，这里不记。
+      if (!emptyStart && !pendingRawInput && pendingTurnId) {
+        recordTurnExplicitMention(ds, pendingTurnId, messageMentionsBot(
+          { mentions: ds.pendingMentions },
+          ds.larkAppId,
+          selfBot.botOpenId,
+        ));
+      }
       forkWorker(
         ds,
         prompt,
@@ -2022,7 +2061,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     // card first, then run the same path as a typed `/dismiss --confirm=`,
     // which re-checks permission and state and reports into the group.
     return {
-      card: { type: 'raw', data: buildDismissSubmittedCard(loc) },
+      card: { type: 'raw', data: buildDismissSubmittedCard(loc, String(value.ordinary_group) === 'true') },
       afterAck: () => handleCommand('/dismiss', chatId, {
         messageId: cardMessageId ?? `dismiss-confirm-${chatId}`,
         rootId: chatId,
@@ -4329,6 +4368,90 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       };
     }
 
+    if (actionType === 'purge_images_continue' && ds) {
+      const locDs = localeForBot(ds.larkAppId);
+      // Same gates as retry_turn, plus the /restart gate set: the worker action
+      // rewrites the transcript and respawns --resume, which shared-adopt and
+      // remote backends must never do.
+      if (isSessionTransferring(ds)) {
+        return {
+          toast: { type: 'warning', content: t('cmd.session.transfer_in_progress', undefined, locDs) },
+        };
+      }
+      if (isSharedAdoptSession(ds) || isRemoteBackendSession(ds)) {
+        return { toast: { type: 'warning', content: t('card.action.purge_images_unsupported', undefined, locDs) } };
+      }
+      if (sessionCliId(ds) !== 'claude-code') {
+        return { toast: { type: 'warning', content: t('card.action.purge_images_unsupported', undefined, locDs) } };
+      }
+      if (hasProtectedSessionMutationOwnership(ds)) {
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
+      }
+      const failedTurn = ds.session.lastFailedTurn;
+      if (!failedTurn) {
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_missing', undefined, locDs) } };
+      }
+      const clickedTurnId = value?.turn_id;
+      if (!clickedTurnId || clickedTurnId !== failedTurn.turnId) {
+        logger.info(
+          `[${tag(ds)}] purge_images_continue from stale card (clicked=${clickedTurnId?.slice(0, 8) ?? 'none'} `
+          + `current=${failedTurn.turnId.slice(0, 8)}) — refused`,
+        );
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_stale', undefined, locDs) } };
+      }
+      const cooldownMs = retryCooldownRemaining(failedTurn);
+      if (cooldownMs > 0) {
+        return {
+          toast: {
+            type: 'warning',
+            content: t('card.action.retry_turn_cooldown', { seconds: Math.ceil(cooldownMs / 1000) }, locDs),
+          },
+        };
+      }
+      const continueInput = { content: buildTurnContinuePrompt() };
+      // Same turnId handling as retry_turn: never reuse failedTurn.turnId — that
+      // om_ id is a committed ordinary turn the worker would dedupe before the
+      // purge branch.
+      const retryTurnId = `retry-${randomUUID()}`;
+      const rollbackReplyRouting = inheritTurnReplyRouting(ds, failedTurn.turnId, retryTurnId);
+      let accepted = false;
+      try {
+        // No live worker: nothing to purge-and-respawn. Reject rather than a
+        // plain fork that would replay the poisoned transcript.
+        if (ds.worker && !ds.worker.killed) {
+          accepted = sendWorkerInput(ds, continueInput, retryTurnId, { purgeUndersizedImages: true });
+        }
+      } catch (err) {
+        logger.warn(
+          `[${tag(ds)}] purge_images_continue failed before acceptance: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      if (!accepted) {
+        rollbackReplyRouting();
+        sessionStore.updateSession(ds.session);
+        return { toast: { type: 'warning', content: t('card.action.retry_turn_submit_failed', undefined, locDs) } };
+      }
+      // The worker may still decline (or fail the purge after stopping the CLI)
+      // and reject this turn; that rejection undoes the click.
+      const restoreTurnState = captureTurnStateBeforePurgeClick(ds);
+      const retryReceipt = markRetryAttempt(ds.session);
+      holdPurgeClickRollback(ds, retryTurnId, { ...(retryReceipt ? { receipt: retryReceipt } : {}), restoreTurnState });
+      rememberLastCliInput(ds, failedTurn.userPrompt, continueInput, retryTurnId);
+      sessionStore.updateSession(ds.session);
+      ds.lastScreenStatus = 'working';
+      ds.streamCardPending = true;
+      ds.currentTurnTitle = (failedTurn.userPrompt || ds.currentTurnTitle || ds.session.title
+        || getCliDisplayName(sessionCliId(ds))).substring(0, 50);
+      ds.currentImageKey = undefined;
+      persistStreamCardState(ds);
+      logger.info(
+        `[${tag(ds)}] purge_images_continue accepted for turn ${failedTurn.turnId.slice(0, 8)} `
+        + `(attempt #${ds.session.lastFailedTurn?.retryCount ?? 1})`,
+      );
+      return { toast: { type: 'success', content: t('card.action.purge_images_started', undefined, locDs) } };
+    }
+
     // Safe keys on the "CLI is stuck on a blocking page" card. Deliberately
     // NOT in SENSITIVE_CARD_ACTIONS: the turn initiator (often a talk-only
     // member) must be able to press the keys that only decline/skip; the gate
@@ -5135,21 +5258,45 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
       // button whose /compact gets dropped as non-frame input or, worse, delivered to
       // the model as an ordinary user message. Refuse here too, so the button path can
       // never reopen a channel the router deliberately closed.
-      if (cliHasNoRawPassthroughSurface(sessionCliId(ds), { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })) {
+      const compactCliId = sessionCliId(ds);
+      if (!cliSupportsCompactAction(compactCliId, { dshRuntime: getBot(ds.larkAppId).config.dshRuntime })) {
         return { toast: { type: 'warning', content: t('card.action.compact_unsupported', undefined, locDs) } };
+      }
+      // ACP compaction is a separate turn, not interactive steering. Wait for
+      // the business turn and any queued input before rotating reply ownership.
+      if (compactCliId === 'minimax' && (!ds.cliReady || !sessionAcceptsDirectCommand(ds))) {
+        return { toast: { type: 'warning', content: t('card.action.compact_busy', undefined, locDs) } };
       }
       if (!deps.deliverPassthroughCommand) {
         return { toast: { type: 'warning', content: t('card.action.compact_unsupported', undefined, locDs) } };
       }
-      deps.deliverPassthroughCommand(ds, '/compact', {
-        anchor: sessionAnchorId(ds),
-        senderOpenId: operatorOpenId,
-        senderIsBot: false,
-        messageId: cardMessageId ?? `compact-${Date.now()}`,
-        // A chat-scope card's root_id is the chat id, not a message: passing it
-        // on would freeze an unreplyable thread target for this turn.
-        replyRootId: ds.scope === 'chat' ? undefined : rootId,
-      });
+      let delivered = false;
+      const onDelivered = () => {
+        delivered = true;
+        // Fence at IPC acceptance, before subsequent card persistence can
+        // throw. A second click must not replay an already submitted command.
+        if (compactCliId === 'minimax') ds.cliReady = false;
+      };
+      try {
+        const accepted = deps.deliverPassthroughCommand(ds, '/compact', {
+          anchor: sessionAnchorId(ds),
+          senderOpenId: operatorOpenId,
+          senderIsBot: false,
+          messageId: cardMessageId ?? `compact-${Date.now()}`,
+          ...(compactCliId === 'minimax' ? { turnId: `compact-${randomUUID()}` } : {}),
+          // A chat-scope card's root_id is the chat id, not a message: passing it
+          // on would freeze an unreplyable thread target for this turn.
+          replyRootId: ds.scope === 'chat' ? undefined : rootId,
+          onDelivered,
+        });
+        // Legacy injected dependencies return void rather than an acceptance receipt.
+        if (!delivered && accepted !== false) onDelivered();
+      } catch (err) {
+        logger.warn(`[${tag(ds)}] compact command delivery failed: ${String(err)}`);
+      }
+      if (!delivered) {
+        return { toast: { type: 'warning', content: t('card.action.compact_failed', undefined, locDs) } };
+      }
       logger.info(`[${tag(ds)}] compact_session: /compact passthrough sent`);
       return { toast: { type: 'success', content: t('card.action.compact_sent', { cliName: sessionCliDisplayName(ds) }, locDs) } };
     }

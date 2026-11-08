@@ -28,6 +28,11 @@
  * digit picks its row directly, and a bracketed paste while the picker is
  * active is dropped.
  */
+// 第一个 import：测试围栏（unit-setup / bun-test-fence）没生效时整个文件直接拒跑。
+// 本文件的 runScenario 往 homedir() 下写 .zshrc 和 .botmux，假 codex 子进程继承 HOME 后往
+// ~/.codex 写 history.jsonl 和 sessions；绕过 setupFiles 的运行（如 0 字节 vitest 配置）里，
+// 这些写入会直接覆盖真实的 ~/.zshrc、追加进真实的 Codex 历史。
+import { isInsideDir } from './helpers/require-fenced-data-dir.js';
 import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
@@ -40,6 +45,11 @@ import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import { preferredManagedTmuxSocket, tmuxSocketArgs } from '../src/adapters/backend/tmux-socket.js';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
+
+// 上面列的写入都落在 homedir() 下：HOME 不在本文件的测试围栏内就拒绝加载，一个文件都不写。
+if (!isInsideDir(homedir(), process.env.__TEST_DATA_DIR_FENCE)) {
+  throw new Error(`refusing to run: HOME ${homedir()} is not inside the test fence`);
+}
 
 const tmuxAvailable = probeTmuxFunctional().ok;
 const productionBackend = tmuxAvailable ? 'tmux' : 'pty';

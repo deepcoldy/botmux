@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { validateCodexServiceTier } from '../src/services/codex-service-tier-catalog.js';
+import { resolveEffectiveFeedbackPolicy, type FeedbackPolicyLayer } from '../src/services/feedback-policy-resolver.js';
 
 vi.mock('../src/services/codex-service-tier-catalog.js', () => ({
   validateCodexServiceTier: vi.fn(async () => ({ ok: true })),
@@ -606,6 +607,31 @@ describe('bot-config store', () => {
       value: { enabled: true, audience: 'requester' },
     });
     expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
+  });
+
+  it('keeps an explicit buttonAlign left on the bot layer so it can override a team right', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('feedback')!;
+    const team = { enabled: true, buttonAlign: 'right' } as const;
+    const stored = (raw: string) => {
+      const result = store.coerceConfigValue(spec, raw);
+      expect(result.ok).toBe(true);
+      return (result as { ok: true; value: unknown }).value as FeedbackPolicyLayer;
+    };
+
+    const explicitLeft = stored('{"enabled":true,"buttonAlign":"left"}');
+    expect(explicitLeft.buttonAlign).toBe('left');
+    const effective = resolveEffectiveFeedbackPolicy({ team, bot: explicitLeft })!;
+    expect(effective.enabled).toBe(true);
+    expect('buttonAlign' in effective).toBe(false);
+
+    // No buttonAlign on the bot layer: the team value is inherited.
+    const unset = stored('{"enabled":true}');
+    expect('buttonAlign' in unset).toBe(false);
+    expect(resolveEffectiveFeedbackPolicy({ team, bot: unset })?.buttonAlign).toBe('right');
+
+    expect(stored('{"enabled":true,"buttonAlign":"right"}').buttonAlign).toBe('right');
+    expect(store.coerceConfigValue(spec, '{"enabled":true,"buttonAlign":"center"}')).toEqual({ ok: false, reason: 'invalid_json' });
   });
 
   it('persists presentation rules through the config store and reloads the same policy', async () => {
@@ -1849,6 +1875,35 @@ describe('bot-config store', () => {
     const r = await store.applyConfigField('app_default', spec, 'codex');
     expect(r.ok).toBe(true);
     expect(readConfig()).toMatchObject({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+  });
+
+  it.each(['cursor', 'doubao', 'antigravity'])('invariant backstop: updateBotSandboxMode rejects switching a zero-injection %s bot to scratch (rmwBotEntry path, no promptInjection write)', async cliId => {
+    const { registry } = await loaded({ cliId, promptInjection: 'none' });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    const r = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('zero_prompt_unsupported');
+    expect(readConfig().sandbox).toBeUndefined();
+    expect(registry.getBot('app_default').config.sandbox).not.toBe('scratch');
+    // oncall keeps zero injection working
+    expect((await sandboxStore.updateBotSandboxMode('app_default', 'oncall')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ promptInjection: 'none', sandbox: 'oncall' });
+  });
+
+  it('repair exit: a stored zero-injection cursor+scratch entry can leave scratch', async () => {
+    await loaded({ cliId: 'cursor', promptInjection: 'none', sandbox: 'scratch' });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    expect((await sandboxStore.updateBotSandboxMode('app_default', 'off')).ok).toBe(true);
+    expect(readConfig().sandbox).toBeUndefined();
+    expect(readConfig().promptInjection).toBe('none');
+  });
+
+  it('repair exit: a stored zero-injection cursor+scratch entry can turn zero injection off', async () => {
+    const { store } = await loaded({ cliId: 'cursor', promptInjection: 'none', sandbox: 'scratch' });
+    const r = await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'default');
+    expect(r.ok).toBe(true);
+    expect(readConfig().promptInjection).not.toBe('none');
+    expect(readConfig().sandbox).toBe('scratch');
   });
 
   it('invariant backstop: updateBotSandboxMode rejects switching a cursor+transcript bot to scratch (rmwBotEntry path, no replyDelivery write)', async () => {

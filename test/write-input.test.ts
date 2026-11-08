@@ -289,6 +289,61 @@ function decodeRunnerLine(line: string, prefix: string): any {
 // 1. Single-line content
 // =========================================================================
 
+describe('Pi paste submission', () => {
+  it.each(['tmux', 'raw'] as const)('%s preserves trailing backslashes and submits exactly once', async (mode) => {
+    for (const content of ['path\\', '\\', 'path\\\\', '第一行\n\npath\\', 'x'.repeat(2_000) + '\\', 'plain\ntext', 'path\\\n']) {
+      let composer = '';
+      const submitted: string[] = [];
+      // Model Pi's editor boundary, not the adapter's write sequence: Enter
+      // after a backslash inserts a newline; otherwise submit trims the value.
+      const enter = () => {
+        if (composer.endsWith('\\')) composer = composer.slice(0, -1) + '\n';
+        else {
+          submitted.push(composer.trim());
+          composer = '';
+        }
+      };
+      const write = (text: string) => {
+        if (text === '\r') enter();
+        else {
+          expect(text.startsWith('\x1b[200~')).toBe(true);
+          expect(text.endsWith('\x1b[201~')).toBe(true);
+          composer += text.slice(6, -6);
+        }
+      };
+      const pty: PtyHandle = mode === 'raw' ? { write } : {
+        write,
+        pasteText: text => { composer += text; },
+        sendSpecialKeys: key => {
+          expect(key).toBe('Enter');
+          enter();
+        },
+      };
+      await createPiAdapter('/bin/pi').writeInput(pty, content);
+      expect(submitted).toEqual([content.trim()]);
+      expect(composer).toBe('');
+    }
+  });
+
+  it.each(['tmux', 'raw'] as const)('%s pastes content without a trailing backslash byte for byte', async (mode) => {
+    vi.useFakeTimers();
+    try {
+      for (const content of ['plain', 'a\\b', 'path\\\n', '第一行\n\n第二行 ', '\\ leading']) {
+        const pasted: string[] = [];
+        const pty: PtyHandle = mode === 'raw'
+          ? { write: text => { if (text !== '\r') pasted.push(text); } }
+          : { write: () => {}, pasteText: text => { pasted.push(text); }, sendSpecialKeys: () => true };
+        const write = createPiAdapter('/bin/pi').writeInput(pty, content);
+        await flushFakeTimers(2_000);
+        await write;
+        expect(pasted).toEqual([mode === 'raw' ? `\x1b[200~${content}\x1b[201~` : content]);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe('writeInput: single-line, tmux mode', () => {
   it.each([...HUMAN_TYPING_ADAPTERS, ...PLAIN_ADAPTERS, OPENCODE_ADAPTER])('%s: sendText + Enter, no pasteText', async (_name, adapter) => {
     const pty = makeTmuxPty();
@@ -598,6 +653,84 @@ describe('writeInput: multiline, tmux mode', () => {
     await adapter.writeInput(pty, MULTILINE);
     expect(pty.pasteText).toHaveBeenCalledWith(MULTILINE);
     expect(pty.sendText).not.toHaveBeenCalled();
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+});
+
+describe('pressComposerSubmit: claude-code parked-draft rescue', () => {
+  it('tmux: sends plain Enter with the default binding', () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    removeClaudeKeybindings();
+    const pty = makeTmuxPty();
+    expect(adapter.pressComposerSubmit?.(pty)).toBe(true);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledTimes(1);
+    expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+  });
+
+  it('raw PTY: writes CR with the default binding', () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    removeClaudeKeybindings();
+    const pty = makeRawPty();
+    expect(adapter.pressComposerSubmit?.(pty)).toBe(true);
+    expect(pty.write).toHaveBeenCalledWith('\r');
+  });
+
+  it('tmux: honours CLAUDE_CODE_SUBMIT_KEY without a bare Enter', () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    removeClaudeKeybindings();
+    process.env.CLAUDE_CODE_SUBMIT_KEY = 'meta+enter';
+    try {
+      const pty = makeTmuxPty();
+      expect(adapter.pressComposerSubmit?.(pty)).toBe(true);
+      expect(pty.sendSpecialKeys).toHaveBeenCalledWith('M-Enter');
+      expect(pty.sendSpecialKeys).not.toHaveBeenCalledWith('Enter');
+    } finally {
+      delete process.env.CLAUDE_CODE_SUBMIT_KEY;
+    }
+  });
+
+  it('tmux: Enter remapped to newline sends the bound meta+enter submit key', () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    writeClaudeKeybindings({ 'meta+enter': 'chat:submit', enter: 'chat:newline' });
+    try {
+      const pty = makeTmuxPty();
+      expect(adapter.pressComposerSubmit?.(pty)).toBe(true);
+      expect(pty.sendSpecialKeys).toHaveBeenCalledWith('M-Enter');
+      expect(pty.sendSpecialKeys).not.toHaveBeenCalledWith('Enter');
+    } finally {
+      removeClaudeKeybindings();
+    }
+  });
+
+  it('raw PTY: remapped alt+enter submit becomes the ESC-prefix sequence', () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    writeClaudeKeybindings({ 'alt+enter': 'chat:submit', enter: 'chat:newline' });
+    try {
+      const pty = makeRawPty();
+      expect(adapter.pressComposerSubmit?.(pty)).toBe(true);
+      expect(pty.write).toHaveBeenCalledWith('\x1b\r');
+    } finally {
+      removeClaudeKeybindings();
+    }
+  });
+
+  it('returns false and sends nothing when no terminal-sendable submit key exists', () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    writeClaudeKeybindings({ enter: 'chat:newline' });
+    try {
+      const pty = makeTmuxPty();
+      expect(adapter.pressComposerSubmit?.(pty)).toBe(false);
+      expect(pty.sendSpecialKeys).not.toHaveBeenCalled();
+    } finally {
+      removeClaudeKeybindings();
+    }
+  });
+
+  it('returns false when the backend cannot confirm the send', () => {
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    removeClaudeKeybindings();
+    const pty = { ...makeTmuxPty(), sendSpecialKeys: vi.fn(() => false) } satisfies PtyHandle;
+    expect(adapter.pressComposerSubmit?.(pty)).toBe(false);
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
   });
 });
@@ -1339,6 +1472,83 @@ describe('claude-code writeInput submission confirmation', () => {
       JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content: 'slow hook still running' } }) + '\n',
     );
     expect(recheck()).toBe(true);  // Now the worker suppresses the warning
+  });
+
+  it('recheck confirms a prompt queued to a running subagent without pinning its transcript', async () => {
+    // While the TUI views a running Task/Agent subagent, Claude hands the
+    // prompt to that agent and records it only in <sid>/subagents/*.jsonl,
+    // as a queued_command attachment written once the agent takes its next
+    // step — typically after the in-band confirm budget has run out.
+    const cwd = '/tmp/recheck-subagent';
+    const sessionId = '5ab5ab5a-5ab5-45ab-85ab-5ab5ab5ab5ab';
+    const pinnedPath = makeJsonlForSession('recheck-subagent', sessionId, cwd);
+    writeClaudePidFile(31341, { sessionId, cwd });
+    const subagentDir = join(dirname(pinnedPath), sessionId, 'subagents');
+    mkdirSync(subagentDir, { recursive: true });
+    const content = 'please also cover the retry path in the new test';
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    const pty: PtyHandle = {
+      claudeJsonlPath: pinnedPath,
+      cliPid: 31341,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn(),
+    };
+
+    const result = await adapter.writeInput(pty, content);
+    expect(result).toMatchObject({ submitted: false });
+    const recheck = (result as any)?.recheck as () => boolean;
+    expect(recheck()).toBe(false);
+
+    writeFileSync(join(subagentDir, 'agent-a0123456789abcdef.jsonl'), JSON.stringify({
+      isSidechain: true,
+      agentId: 'a0123456789abcdef',
+      type: 'attachment',
+      timestamp: new Date().toISOString(),
+      attachment: { type: 'queued_command', prompt: content, origin: { kind: 'human' }, isMeta: true },
+    }) + '\n');
+    expect(recheck()).toBe(true);
+    expect(pty.claudeJsonlPath).toBe(pinnedPath);
+  });
+
+  it('in-band confirmation never pins a transcript on a queued_command record', async () => {
+    // Only the boolean recheck accepts queued_command records. The in-band
+    // dir fallback and the last-resort fan-out pin what they match, so a
+    // sibling pane's queued prompt with the same text must not move the bridge.
+    const cwd = '/tmp/inband-queued-command';
+    const sessionId = '6ac6ac6a-6ac6-46ac-86ac-6ac6ac6ac6ac';
+    const pinnedPath = makeJsonlForSession('inband-queued-command', sessionId, cwd);
+    writeClaudePidFile(31342, { sessionId, cwd });
+    const siblingPath = join(dirname(pinnedPath), '7bd7bd7b-7bd7-47bd-87bd-7bd7bd7bd7bd.jsonl');
+    const content = 'please also cover the retry path in the sibling pane';
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    let wroteSibling = false;
+    const pty: PtyHandle = {
+      claudeJsonlPath: pinnedPath,
+      cliPid: 31342,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter' || wroteSibling) return;
+        wroteSibling = true;
+        writeFileSync(siblingPath, JSON.stringify({
+          type: 'attachment',
+          timestamp: new Date().toISOString(),
+          attachment: { type: 'queued_command', prompt: content, commandMode: 'prompt', origin: { kind: 'human' } },
+        }) + '\n');
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, content);
+    expect(result).toMatchObject({ submitted: false });
+    expect(pty.claudeJsonlPath).toBe(pinnedPath);
+    // Positive control: the record is visible to the boolean recheck.
+    expect(((result as any)?.recheck as () => boolean)()).toBe(true);
+    expect(pty.claudeJsonlPath).toBe(pinnedPath);
   });
 
   it('extractMessageContentForFingerprint strips envelopes and metadata to isolate user payload', () => {

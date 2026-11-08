@@ -174,14 +174,44 @@ function sessionMarkerVerdict(sessionDir: string, marker: string): MarkerVerdict
     if (lastPrompt.includes(marker)) return 'match';
     if (SESSION_MARKER_RE.test(lastPrompt)) return 'foreign';
   }
-  const wire = kimiMainWirePath(sessionDir);
-  const head = readRange(wire, 0, WIRE_HEAD_PROBE_BYTES);
-  if (head === undefined) return 'miss';
-  if (head.includes(marker)) return 'match';
-  if (Buffer.byteLength(head, 'utf8') < WIRE_HEAD_PROBE_BYTES) return 'miss';
+  return wireMarkerVerdict(kimiMainWirePath(sessionDir), marker);
+}
+
+/** Logs known to lack a marker, keyed by log + marker, valued by the log's
+ *  `size:mtime` when it was read. Turn boundaries and every streaming-card
+ *  tick re-run the lookup (fresh), so a cwd full of large hand-typed sessions
+ *  would otherwise be re-read in full each time. A log whose size and mtime
+ *  are unchanged still lacks the marker; any write moves one of them and
+ *  re-reads it. Matches are not kept: the lookup stops at the first one. */
+const wireMarkerMisses = new Map<string, string>();
+const WIRE_MARKER_MISS_CACHE_MAX = 256;
+
+function wireMarkerVerdict(wire: string, marker: string): MarkerVerdict {
+  let stamp: string;
   try {
-    return readFileSync(wire, 'utf8').includes(marker) ? 'match' : 'miss';
+    const st = statSync(wire);
+    stamp = `${st.size}:${st.mtimeMs}`;
   } catch { return 'miss'; }
+  const key = `${wire}\0${marker}`;
+  if (wireMarkerMisses.get(key) === stamp) return 'miss';
+  wireMarkerMisses.delete(key);
+  if (scanWireForMarker(wire, marker)) return 'match';
+  if (wireMarkerMisses.size >= WIRE_MARKER_MISS_CACHE_MAX) {
+    const oldest = wireMarkerMisses.keys().next().value;
+    if (oldest !== undefined) wireMarkerMisses.delete(oldest);
+  }
+  wireMarkerMisses.set(key, stamp);
+  return 'miss';
+}
+
+/** The head of the log (where a botmux session's first prompt lands), then
+ *  the whole log only when the head did not hold all of it. */
+function scanWireForMarker(wire: string, marker: string): boolean {
+  const head = readRange(wire, 0, WIRE_HEAD_PROBE_BYTES);
+  if (head === undefined) return false;
+  if (head.includes(marker)) return true;
+  if (Buffer.byteLength(head, 'utf8') < WIRE_HEAD_PROBE_BYTES) return false;
+  try { return readFileSync(wire, 'utf8').includes(marker); } catch { return false; }
 }
 
 /** Whose conversation a session's latest prompt belongs to, from state.json

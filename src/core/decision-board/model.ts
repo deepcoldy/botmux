@@ -443,6 +443,11 @@ export interface StewardConfig {
    * 记一条历史，并给管家会话发一条合并的短通知。只提示，不改状态。默认关，只在打开时写 `true`。
    */
   closeHints?: boolean;
+  /**
+   * 事项关联的群里有一轮结束、举手或中断时，在这一项上标「子任务已交付 / 等人处理 / 中断」，
+   * 并给管家会话发一条合并的短通知。只提示，不改状态。默认关，只在打开时写 `true`。
+   */
+  taskHints?: boolean;
 }
 
 export const STEWARD_GUIDE_TEXT_MAX = 20_000;
@@ -457,7 +462,7 @@ export function normalizeStewardConfig(raw: unknown):
   if (raw === null || raw === undefined) return { ok: true, value: null };
   if (typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: 'steward 必须是对象' };
   const r = raw as Record<string, unknown>;
-  const known = new Set(['enabled', 'chatId', 'guideMode', 'guideText', 'autoJoinNewGroups', 'autoJoinSoloGroups', 'closeHints', 'decisionCards']);
+  const known = new Set(['enabled', 'chatId', 'guideMode', 'guideText', 'autoJoinNewGroups', 'autoJoinSoloGroups', 'closeHints', 'decisionCards', 'taskHints']);
   const unknown = Object.keys(r).filter(k => !known.has(k));
   if (unknown.length) return { ok: false, reason: `steward 有未知字段：${unknown.join(', ')}` };
   if (r.enabled !== undefined && typeof r.enabled !== 'boolean') return { ok: false, reason: 'steward.enabled 必须是布尔值' };
@@ -472,6 +477,9 @@ export function normalizeStewardConfig(raw: unknown):
   }
   if (r.closeHints !== undefined && r.closeHints !== null && typeof r.closeHints !== 'boolean') {
     return { ok: false, reason: 'steward.closeHints 必须是布尔值' };
+  }
+  if (r.taskHints !== undefined && r.taskHints !== null && typeof r.taskHints !== 'boolean') {
+    return { ok: false, reason: 'steward.taskHints 必须是布尔值' };
   }
   let chatId: string | undefined;
   if (r.chatId !== undefined && r.chatId !== null && r.chatId !== '') {
@@ -504,10 +512,11 @@ export function normalizeStewardConfig(raw: unknown):
     ...(r.autoJoinSoloGroups === true ? { autoJoinSoloGroups: true } : {}),
     ...(r.decisionCards === false ? { decisionCards: false } : {}),
     ...(r.closeHints === true ? { closeHints: true } : {}),
+    ...(r.taskHints === true ? { taskHints: true } : {}),
   };
   if (!value.enabled && !value.chatId && !value.guideMode && !value.guideText
     && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true && value.closeHints !== true
-    && value.decisionCards !== false) {
+    && value.decisionCards !== false && value.taskHints !== true) {
     return { ok: true, value: null };
   }
   return { ok: true, value };
@@ -535,6 +544,11 @@ export function stewardDecisionCardsOn(cfg: StewardConfig | undefined): cfg is S
 /** 后台巡检开着：管家开着、选了管家群（通知要有地方投）、且打开了 closeHints。 */
 export function stewardCloseHintsOn(cfg: StewardConfig | undefined): boolean {
   return stewardReady(cfg) && cfg.closeHints === true;
+}
+
+/** 子任务提醒开着：管家可用（开关开 + 选了管家群）且打开了 taskHints。 */
+export function stewardTaskHintsOn(cfg: StewardConfig | undefined): cfg is StewardConfig & { chatId: string } {
+  return stewardReady(cfg) && cfg.taskHints === true;
 }
 
 /**
@@ -578,6 +592,25 @@ const GUIDE_PRESET_ZH = `你是 owner 的管家，帮 owner 推进他交代的�
   给两三个选项，写清后果和你的推荐。
 - 写完在管家群里用 \`botmux send --attention=decision --mention-back "…"\` 说一声，附上 \`botmux board list\` 给出的链接；发出去之后给每项记一句 \`botmux board history <编号> "已报 owner"\`。
 - 管家开着「飞书卡片拍板」（默认开）时，botmux 会在改成 decide 或改了选项后自动往管家群发这一项的拍板卡片，之后原地更新；owner 在卡片上点的选项和网页提交一样，以「决策看板 · 批次」送到你这里。这时上面那条消息一句话说明要定什么即可，不用再列选项、不要自己发带选项的卡片。选项超过 ${DECISION_CARD_MAX_OPTIONS} 个时卡片只给看板链接。
+
+## 附图文说明（待拍板涉及代码或界面改动时）
+- 让 owner 不用翻群就能看懂要定什么：写成 decide 的同时附一份说明页，写清背景、改了什么、改前改后对比、测试结果：\`botmux board attach <编号> explainer.html --note "图文说明"\`。能录屏的再附一段视频（.mp4 / .webm，不超过 50MB；mp4 用 H.264、加 \`-movflags +faststart\`），可以和说明页放在同一条 attach 里。
+- 说明页是单个 .html 文件（UTF-8，不超过 10MB）：截图内嵌成 data URL，样式写在 \`<style>\` 里。看板上不跑脚本、不加载外链（网址图片、CDN 样式和字体都会被拦掉）；相关链接挂到事项的 \`--link\` 上，不写进说明页。
+- 最小模板（截图转 data URL：\`echo "data:image/png;base64,$(base64 -w0 shot.png)"\`）：
+\`\`\`html
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>#12 标题</title>
+<style>body{font:15px/1.6 system-ui,sans-serif;max-width:860px;margin:0 auto;padding:16px} img{max-width:100%;border:1px solid #ddd} .cmp{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}</style>
+</head><body>
+<h1>#12 标题</h1>
+<h2>背景</h2><p>为什么要改，一两句。</p>
+<h2>改了什么</h2><ul><li>…</li></ul>
+<h2>改前 / 改后</h2>
+<div class="cmp"><figure><img src="data:image/png;base64,…" alt=""><figcaption>改前</figcaption></figure><figure><img src="data:image/png;base64,…" alt=""><figcaption>改后</figcaption></figure></div>
+<h2>测试结果</h2><pre>跑了什么、结果</pre>
+</body></html>
+\`\`\`
 
 ## 执行一批决定（收到「决策看板 · 批次」消息时）
 - 逐项处理：先 \`botmux board show <编号>\` 看最新内容，再按决定执行。
@@ -628,6 +661,25 @@ const GUIDE_PRESET_EN = `You are the owner's steward. You push forward the devel
   \`botmux board set <n> --state decide --ask "question" --option "A=approach → outcome and risk" --option "B=…" --recommend A --reason "why"\`.
 - Then tell the owner in the steward chat with \`botmux send --attention=decision --mention-back "…"\`, including the links from \`botmux board list\`; once sent, note \`botmux board history <n> "reported to owner"\` on each item.
 - With "Decision cards in Feishu" on (the default), botmux posts this item's decision card in the steward chat after it becomes decide or its options change, and updates it in place; an option the owner picks on the card reaches you as a "Decision board · batch", same as a web submission. Then one sentence on what needs deciding is enough: do not repeat the options or post your own option card. With more than ${DECISION_CARD_MAX_OPTIONS} options the card only links to the board.
+
+## Attaching an explainer (decisions that involve code or UI changes)
+- Let the owner understand what to decide without reading the chats: when you make such an item decide, attach an explainer page covering the background, what changed, before / after, and test results: \`botmux board attach <n> explainer.html --note "explainer"\`. If it can be screen-recorded, attach a video too (.mp4 / .webm, at most 50MB; mp4 in H.264 with \`-movflags +faststart\`); it can go in the same attach as the page.
+- The page is a single .html file (UTF-8, at most 10MB): screenshots inlined as data URLs, styles in \`<style>\`. The board runs no scripts and loads nothing external (image URLs, CDN styles and fonts are all blocked); put related links on the item with \`--link\`, not in the page.
+- Minimal template (screenshot to data URL: \`echo "data:image/png;base64,$(base64 -w0 shot.png)"\`):
+\`\`\`html
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>#12 Title</title>
+<style>body{font:15px/1.6 system-ui,sans-serif;max-width:860px;margin:0 auto;padding:16px} img{max-width:100%;border:1px solid #ddd} .cmp{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}</style>
+</head><body>
+<h1>#12 Title</h1>
+<h2>Background</h2><p>Why this change, in a sentence or two.</p>
+<h2>What changed</h2><ul><li>…</li></ul>
+<h2>Before / after</h2>
+<div class="cmp"><figure><img src="data:image/png;base64,…" alt=""><figcaption>Before</figcaption></figure><figure><img src="data:image/png;base64,…" alt=""><figcaption>After</figcaption></figure></div>
+<h2>Test results</h2><pre>What you ran and the result</pre>
+</body></html>
+\`\`\`
 
 ## Executing a batch (when a "Decision board · batch" message arrives)
 - Item by item: \`botmux board show <n>\` for the latest state, then act on the decision.
@@ -693,12 +745,37 @@ function withHintRules(text: string, locale: Locale): string {
   return out;
 }
 
+// 「子任务提醒」开着时插在「定时巡检」前面的一小节。
+const TASK_HINT_SECTION: Record<Locale, { beforeSection: string; section: string }> = {
+  zh: {
+    beforeSection: '## 定时巡检（',
+    section: `## 子任务结果（收到「决策看板 · 子任务」消息时）
+- 事项关联的群里有一轮交付、举手或中断时自动发来，只是提示、状态没改：逐项 \`botmux board show <编号>\` 看群里的结果，用 \`botmux board set\` 回写进展或改状态；要 owner 拍板的照常转成待拍板。
+
+`,
+  },
+  en: {
+    beforeSection: '## Scheduled patrol (',
+    section: `## Subtask results (when a "Decision board · subtask" message arrives)
+- Sent automatically when a chat linked to an item finishes a turn, raises a hand or is interrupted. Hints only; no state was changed: for each item, \`botmux board show <n>\` to read the chat's result, then write back progress or change the state with \`botmux board set\`; anything the owner must decide becomes decide as usual.
+
+`,
+  },
+};
+
+function withTaskHintSection(text: string, locale: Locale): string {
+  const rules = TASK_HINT_SECTION[locale];
+  const at = text.indexOf(rules.beforeSection);
+  return at >= 0 ? text.slice(0, at) + rules.section + text.slice(at) : text;
+}
+
 const STANDARD_HEADING: Record<Locale, string> = { zh: '## 推进标准', en: '## Standard' };
 const CUSTOM_HEADING: Record<Locale, string> = { zh: '## owner 的自定义规则（与上文冲突时以这里为准）', en: '## Owner custom rules (these win over anything above)' };
 
 export function stewardGuidePreset(locale: Locale, cfg?: StewardConfig): string {
   const preset = locale === 'en' ? GUIDE_PRESET_EN : GUIDE_PRESET_ZH;
-  return stewardCloseHintsOn(cfg) ? withHintRules(preset, locale) : preset;
+  const withHints = stewardCloseHintsOn(cfg) ? withHintRules(preset, locale) : preset;
+  return stewardTaskHintsOn(cfg) ? withTaskHintSection(withHints, locale) : withHints;
 }
 
 /**

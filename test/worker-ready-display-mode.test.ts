@@ -331,8 +331,8 @@ describe('Worker ready: set_display_mode re-sync', () => {
         worker: makeFakeWorker(),
         workerReady: true,
         workerPort: 9999,
-        workerViewToken: 'view_live',
-        workerCardViewToken: 'card_live',
+        workerViewToken: 'view_live'.padEnd(43, '0'),
+        workerCardViewToken: 'card_live'.padEnd(43, '0'),
         streamCardId: 'om_live_card',
         session: {
           ...makeDs().session,
@@ -347,6 +347,19 @@ describe('Worker ready: set_display_mode re-sync', () => {
       expect(JSON.parse(buildStreamingCardJson(ds, 'working')).readUrl).toBe(liveUrl);
     } finally {
       resetTerminalProxy();
+    }
+  });
+
+  it.each([
+    ['keeps', 'view_cap'.padEnd(43, '0')],
+    ['omits', null],
+  ] as const)('%s the direct-port terminal button by whether the worker reported a read capability', (verdict, token) => {
+    const ds = makeDs({
+      worker: makeFakeWorker(), workerReady: true, workerPort: 9999, workerViewToken: token,
+      session: { ...makeDs().session, backendType: 'tmux', webPort: 9999 },
+    });
+    for (const url of [readableTerminalUrlFor(ds), liveReadableTerminalUrlFor(ds)]) {
+      expect(url).toBe(verdict === 'keeps' ? `http://localhost:9999?viewToken=${token}` : '');
     }
   });
 
@@ -736,21 +749,22 @@ describe('Worker ready: set_display_mode re-sync', () => {
   it('POST path forwards ready.turnId to sessionReply for initial alias cards', async () => {
     const fakeWorker = makeFakeWorker();
     const ds = makeDs({ streamCardPending: true, streamCardId: undefined, worker: fakeWorker });
+    const viewToken = 'view_cap'.padEnd(43, '0');
 
     setupActiveWorkerHandlers(ds, fakeWorker);
     fakeWorker.emit('message', {
       type: 'ready',
       port: 9999,
       token: 'tok_abc',
-      viewToken: 'view_cap',
+      viewToken,
       turnId: 'om_turn_ready',
     });
     await flush();
 
     expect(sessionReplyMock).toHaveBeenCalledTimes(1);
     expect(sessionReplyMock.mock.calls[0][4]).toBe('om_turn_ready');
-    expect(ds.workerViewToken).toBe('view_cap');
-    expect(JSON.stringify(sessionReplyMock.mock.calls[0][1])).toContain('viewToken=view_cap');
+    expect(ds.workerViewToken).toBe(viewToken);
+    expect(JSON.stringify(sessionReplyMock.mock.calls[0][1])).toContain(`viewToken=${viewToken}`);
     const logs = loggerInfoMock.mock.calls.flat().join('\n');
     expect(logs).toContain('viewToken=[redacted]');
     expect(logs).not.toContain('view_cap');
@@ -1286,6 +1300,25 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(fakeWorker.send).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'set_display_mode', mode: 'screenshot' }),
     );
+  });
+
+  it('keeps silent listener startup, notifications and failure local while running the worker', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, displayMode: 'screenshot', streamingCardForced: true });
+    ds.session.rootMessageId = 'ml:om_source';
+    ds.session.messageListenerRun = { sourceMessageId: 'om_source', replyMode: 'none' };
+    setupActiveWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'ready', port: 9999, token: 'tok' });
+    await flush();
+    expect(ds.workerReady).toBe(true);
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'set_display_mode', mode: 'screenshot' }));
+    worker.emit('message', { type: 'user_notify', message: 'requires attention' });
+    worker.emit('message', { type: 'steer_accepted', turnId: 'om_turn', appTurnId: 'app_turn' });
+    worker.emit('message', { type: 'error', message: 'invalid launch configuration' });
+    await flush();
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(pinMessageMock).not.toHaveBeenCalled();
   });
 
   it('managed/silent-suppressed ready (apiOnly transport) still sends set_display_mode', async () => {

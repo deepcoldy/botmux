@@ -207,7 +207,8 @@ export function extractPostAtParticipants(message: { content?: string } | null |
  * "explicit @ hands off to normal routing, not the listener" rule can never
  * diverge between legs. Matches by open_id OR by app_id (via mentionAppId, which
  * covers every observed app_id shape), and also scans post-content inline `at`
- * tags (post messages may not populate `mentions`).
+ * tags (post messages may not populate `mentions`). Parsed `LarkMention`s
+ * (camelCase `openId` / `appId`) match too — turn-origin records only keep those.
  */
 export function messageMentionsBot(
   message: { mentions?: any[]; content?: string; body?: { content?: string } } | null | undefined,
@@ -217,7 +218,7 @@ export function messageMentionsBot(
   if (!botOpenId && !larkAppId) return false;
   const mentions: any[] = message?.mentions ?? [];
   for (const m of mentions) {
-    if (botOpenId && mentionOpenId(m) === botOpenId) return true;
+    if (botOpenId && (mentionOpenId(m) === botOpenId || m?.openId === botOpenId)) return true;
     if (larkAppId && mentionAppId(m) === larkAppId) return true;
   }
   // Post-content inline `at` tags (bot-sent post messages may omit `mentions`).
@@ -267,7 +268,8 @@ export function extractMentionIdentities(message: {
           // target and pollute the userId leg with an open_id value.
           out.push({
             name: node.user_name,
-            openId: node.user_id,
+            ...(typeof node.user_id === 'string' && node.user_id.startsWith('cli_')
+              ? { appId: node.user_id } : { openId: node.user_id }),
           });
         }
       }

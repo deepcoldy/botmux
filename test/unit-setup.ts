@@ -1,8 +1,9 @@
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { inject, vi } from 'vitest';
+import { afterAll, afterEach, inject, vi } from 'vitest';
 import { fenceHomeRootedEnv } from './helpers/fence-home-env.js';
 import { installSessionDataDirFence } from './helpers/session-data-dir-fence.js';
+import { installSystemdFence, systemdFenceError, takeSystemdFenceViolations } from './helpers/systemd-fence.js';
 
 // Disposable SESSION_DATA_DIR / mojo workspace root for this file (shared with
 // the e2e project's setup file).
@@ -23,6 +24,31 @@ process.env.USERPROFILE = fileHome;
 // at a live home that never go through `homedir()`, and a normal Botmux shell has
 // them set to the real fleet.
 fenceHomeRootedEnv(fileHome);
+
+// No test may reach the host's systemd (test/helpers/systemd-fence.ts). A call
+// the code under test caught still fails the test that made it.
+installSystemdFence(fileRoot);
+const failOnSystemdFenceViolations = (): void => {
+  const attempts = takeSystemdFenceViolations();
+  if (attempts.length > 0) throw systemdFenceError(attempts);
+};
+afterEach(failOnSystemdFenceViolations);
+afterAll(failOnSystemdFenceViolations);
+
+// A React test can return before a lazily imported component it rendered has
+// loaded (the dashboard's DropdownMenu imports its Base UI implementation on
+// first render). React then retries the suspended tree outside act() and logs
+// "A suspended resource finished loading inside a test…". When that lands after
+// the file's last test, Vitest is already closing the worker RPC and fails a
+// green run with EnvironmentTeardownError ("Closing rpc while
+// onUserConsoleLog was pending"). So in act environments a test ends only after
+// its in-flight dynamic imports have settled, inside act() so the retry render
+// is flushed there too.
+afterEach(async () => {
+  if ((globalThis as { IS_REACT_ACT_ENVIRONMENT?: unknown }).IS_REACT_ACT_ENVIRONMENT !== true) return;
+  const { act } = await import('react');
+  await act(() => vi.dynamicImportSettled());
+});
 
 vi.mock('node:os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:os')>();

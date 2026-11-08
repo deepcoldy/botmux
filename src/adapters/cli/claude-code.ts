@@ -23,7 +23,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { shellQuote } from '../../core/cli-launch-mode.js';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
-import { claudeStopFailureHookCommand, sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
+import { claudeCompactionHookCommand, claudeStopFailureHookCommand, sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
@@ -816,7 +816,18 @@ export function findOpenClaudeSessionIds(pid: number, dataDir: string = DEFAULT_
 function findJsonlAcrossProjectsRoot(
   searchPath: string,
   fingerprint: string,
-  options: { minMtimeMs?: number; minEventTimestampMs?: number; includeQueueOperations?: boolean },
+  options: {
+    minMtimeMs?: number;
+    minEventTimestampMs?: number;
+    includeQueueOperations?: boolean;
+    /** Include Task/Agent subagent transcripts (<sid>/subagents/*.jsonl).
+     *  Only safe for boolean "did the prompt land" checks: the matched
+     *  subagent path must NOT be pinned as the watched session jsonl. */
+    includeSubagentTranscripts?: boolean;
+    /** Also match queued_command attachments. Same restriction: boolean
+     *  checks only, never pin the match. */
+    includeQueuedCommandAttachments?: boolean;
+  },
 ): string | null {
   if (fingerprint.length < CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN) return null;
   const primaryDir = dirname(searchPath);
@@ -1459,12 +1470,19 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         // drift like worker thinking `-foo-bar/` while Claude actually appends
         // to `-foo-bar-baz/`). Same minMtime guard as the in-band fingerprint
         // fallback so a stale historical match can't suppress the warning.
+        // Subagent transcripts and queued_command attachments are included
+        // here only (boolean use — the matched path is never pinned): while
+        // the TUI views a subagent, a prompt is recorded solely in
+        // <sid>/subagents/*.jsonl, as a queued_command attachment written at
+        // the agent's next step when it is still running.
         const searchPath = currentPath ?? pty.claudeJsonlPath;
         if (!searchPath) return false;
         const matched = findJsonlAcrossProjectsRoot(searchPath, submitFingerprint, {
           minMtimeMs: submitSearchMinMtime,
           minEventTimestampMs: submitSearchMinMtime,
           includeQueueOperations: true,
+          includeSubagentTranscripts: true,
+          includeQueuedCommandAttachments: true,
         });
         return !!matched;
       };
@@ -1633,6 +1651,28 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return { ...buildResult(false), recheck };
     },
 
+    // One-shot re-submit for a draft parked in the composer (the cold-start
+    // late-SessionStart rescue in scheduleSubmitFailureNotify). Uses the SAME
+    // submit-key resolution as writeInput: with a remapped submit
+    // (keybindings.json / CLAUDE_CODE_SUBMIT_KEY, Enter possibly bound to
+    // chat:newline) plain Enter would only insert a newline and strand the
+    // draft again. False means no terminal-sendable submit key or an
+    // unconfirmed backend send — the caller must not guess with another key.
+    pressComposerSubmit(pty) {
+      const keybindings = resolveClaudeChatKeybindings(join(variant.dataDir, 'keybindings.json'));
+      try {
+        if (pty.sendSpecialKeys && keybindings.submitKeys) {
+          return pty.sendSpecialKeys(...keybindings.submitKeys) !== false;
+        }
+        if (!pty.sendSpecialKeys && keybindings.rawSubmitSequence) {
+          return pty.write(keybindings.rawSubmitSequence) !== false;
+        }
+      } catch {
+        return false;
+      }
+      return false;
+    },
+
     completionPattern: COMPLETION_RE,
     readyPattern: /❯/,
     // 忙碌正证据：Claude Code 工作时输入框 ❯ 常驻（readyPattern 在忙时也命中），
@@ -1692,6 +1732,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // claude` 剥掉（aiden 硬拒 --settings），全局这条是它唯一能拿到就绪信号的渠道，
       // 避免首条 prompt 空等 45s；原生 Claude 也只从这一个来源读取 ready hook。
       sessionStartCommand: sessionReadyHookCommand(),
+      preCompactCommand: variant.id === 'claude-code' ? claudeCompactionHookCommand() : undefined,
       // UserPromptSubmit per-turn 上下文 hook（#794）：同样写全局 settings.json。
       // 仅当 per-bot envelopeInjection=auto 时 daemon 才写 sidecar 走注入路径，
       // 其余情况 hook 触发但读不到 sidecar，空输出 no-op。

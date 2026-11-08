@@ -358,6 +358,17 @@ describe('session presentation redaction', () => {
     expect(session.gitBranch).toBe('issue/CUSTOMER-123');
   });
 
+  it('keeps the turn result for anonymous viewers but drops the reply first line', () => {
+    const lastTurn = { turnId: 't1', outcome: 'delivered', at: 300, summary: 'private reply' };
+    const rows = redactSessionsForPublic([{ ...session, lastTurn }]) as any[];
+    expect(rows[0].lastTurn).toEqual({ turnId: 't1', outcome: 'delivered', at: 300 });
+    const updated = redactSessionEventForPublic('session.update', { sessionId: 's1', patch: { lastTurn } }) as any;
+    expect(updated.patch.lastTurn).toEqual({ turnId: 't1', outcome: 'delivered', at: 300 });
+    expect(lastTurn.summary).toBe('private reply');
+    const workbench = projectSessionsForAudience([{ ...session, lastTurn }], 'workbench') as any[];
+    expect(workbench[0].lastTurn).toEqual(lastTurn);
+  });
+
   it('applies the same policy to spawned and update SSE bodies', () => {
     const spawned = redactSessionEventForPublic('session.spawned', { session }) as any;
     expect(spawned.session).not.toHaveProperty('gitBranch');

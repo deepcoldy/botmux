@@ -186,4 +186,39 @@ describe('feedback policy layered resolution', () => {
       effective: null, reason: 'ambiguous_team', teamId: null,
     });
   });
+
+  describe('buttonAlign layering', () => {
+    it('lets a later layer override an earlier one, including back to left', () => {
+      expect(resolveEffectiveFeedbackPolicy({ team: enabled, bot: { buttonAlign: 'right' } })?.buttonAlign).toBe('right');
+      expect(resolveEffectiveFeedbackPolicy({ team: { ...enabled, buttonAlign: 'left' }, bot: { buttonAlign: 'right' } })?.buttonAlign).toBe('right');
+      const chatLeft = resolveEffectiveFeedbackPolicy({ team: enabled, bot: { buttonAlign: 'right' }, chat: { buttonAlign: 'left' } })!;
+      expect(chatLeft.buttonAlign).toBeUndefined();
+      expect('buttonAlign' in chatLeft).toBe(false);
+    });
+
+    it('inherits the earlier layer when a later layer does not set it', () => {
+      expect(resolveEffectiveFeedbackPolicy({ team: { ...enabled, buttonAlign: 'right' }, bot: { allowReselect: true }, chat: {} })?.buttonAlign).toBe('right');
+    });
+
+    it('leaves the effective policy free of the key when no layer sets it', () => {
+      expect('buttonAlign' in resolveEffectiveFeedbackPolicy({ bot: enabled })!).toBe(false);
+    });
+
+    it('validates a layer without filling defaults and rejects invalid values', () => {
+      expect(normalizeFeedbackPolicyLayer({ buttonAlign: 'right' })).toEqual({ buttonAlign: 'right' });
+      expect(normalizeFeedbackPolicyLayer({ enabled: true })).toEqual({ enabled: true });
+      expect(() => normalizeFeedbackPolicyLayer({ buttonAlign: 'middle' })).toThrow('feedback.buttonAlign must be left or right');
+      expect(() => normalizeFeedbackPolicyLayer({ buttonAlign: 'center' })).toThrow('feedback.buttonAlign must be left or right');
+    });
+
+    it('reports which layer supplied the alignment', () => {
+      const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-align-'));
+      const trace = traceFeedbackPolicyForDelivery({
+        dataDir, larkAppId: 'app', chatId: 'chat',
+        bot: { feedback: { enabled: true, buttonAlign: 'right' }, chatFeedbackPolicies: { chat: { buttonAlign: 'left' } } },
+      });
+      expect(trace.sources.buttonAlign).toBe('chat');
+      expect(trace.effective && 'buttonAlign' in trace.effective).toBe(false);
+    });
+  });
 });

@@ -31,12 +31,12 @@ jobs:
         with:
           node-version: 22
 
-      - run: npm install -g pnpm@9.5.0
+      - run: node scripts/ci-net-retry.mjs npm install -g pnpm@9.5.0
 
       - name: Build docs (base=/botmux/, 资源同源)
         working-directory: docs-site
         run: |
-          pnpm install --frozen-lockfile
+          node ../scripts/ci-net-retry.mjs pnpm install --frozen-lockfile
           BOTMUX_DOCS_BASE=/botmux/ BOTMUX_DOCS_ASSET_PREFIX=/botmux/ pnpm build
 
       - name: Deploy /botmux/ to deepcoldy.github.io

@@ -1,5 +1,5 @@
 import { isRemoteCliId } from '../../core/remote-cli-ids.js';
-import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
+import { cliSupportsCompactAction } from '../../core/passthrough-commands.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
 import type { SandboxMode } from '../../adapters/cli/sandbox-mode.js';
@@ -1205,11 +1205,12 @@ export function buildStreamingCard(
       { action: 'retry_last_task', ...actionBase },
     ));
   }
-  // 「压缩」显示判据必须调谓词 cliHasNoRawPassthroughSurface，不能手写 cliId 字面量：
-  // remote CLI（riff/mojo）无本地终端；无 raw passthrough 面的 CLI（codex-app/mira/mir/
-  // dsh/ebsd）发 /compact 会被帧协议丢弃或当成普通消息白烧一个 turn。dshRuntime='tui'
-  // 的真交互 TUI 照常显示。handler 侧另有同谓词拒绝兜底。
-  if (!hidden.has('compact') && !isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
+  // 「压缩」显示判据必须调谓词，不能手写 cliId 字面量：Builder 与 handler 共用
+  // cliSupportsCompactAction——remote CLI（riff/mojo）无本地终端；无 raw passthrough 面
+  // 的 CLI（codex-app/mira/mir/dsh/ebsd）发 /compact 会被帧协议丢弃或当成普通消息白烧
+  // 一个 turn；MiniMax 经帧协议把 /compact 交给 ACP，同样由该谓词放行，但不开放任意 TUI
+  // passthrough。dshRuntime='tui' 的真交互 TUI 照常显示。handler 侧另有同谓词拒绝兜底。
+  if (!hidden.has('compact') && !isRemoteCliId(cliId) && cliSupportsCompactAction(effectiveCliId, { dshRuntime })) {
     primaryActions.push(callbackButton(t('card.btn.compact', undefined, locale), 'default', { action: 'compact_session', ...actionBase }));
   }
   // 「停止」仅在有 turn 可停时显示（working/analyzing/stalled）：idle 无 turn 可停，
@@ -2251,13 +2252,17 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
 
   // 重试建议与按钮由同一个 retryOffer 决定，避免「卡上说能重试但按钮不给」。
   const canRetry = o.retryOffer !== 'none' && !!o.retryTurnId;
-  const adviceKey = o.retryOffer === 'none'
-    ? 'card.turn_failed.no_retry'
-    : !o.retryTurnId
-      ? 'card.turn_failed.no_input'
-      : o.retryOffer === 'safe'
-        ? 'card.turn_failed.retry_safe'
-        : 'card.turn_failed.retry_caveated';
+  // 图片尺寸 400 是会话历史被毒化：任何重试/续跑都会带着同一张图再 400，
+  // 必须优先于通用 no_retry 文案，给出 /clear 恢复指引。
+  const adviceKey = o.errorCode === 'provider_image_too_small'
+    ? 'card.turn_failed.image_too_small'
+    : o.retryOffer === 'none'
+      ? 'card.turn_failed.no_retry'
+      : !o.retryTurnId
+        ? 'card.turn_failed.no_input'
+        : o.retryOffer === 'safe'
+          ? 'card.turn_failed.retry_safe'
+          : 'card.turn_failed.retry_caveated';
   elements.push({ tag: 'markdown', content: t(adviceKey, undefined, locale) });
 
   const actions: any[] = [];
@@ -2282,6 +2287,21 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
         // handler 据此决定提交「原话」还是「续跑指令」。渲染与执行读同一个
         // retryOffer，卡上写的语义就是真正会发生的事。
         mode: o.retryOffer === 'safe' ? 'resend' : 'continue',
+        ...actionBase,
+      },
+    });
+  }
+  // 小图毒化：普通「继续」会把同一张图再发一遍、必然再 400。单独给一个
+  // primary 动作——worker 先清洗会话记录再 --resume 重启，随后自动续跑，
+  // 文本上下文保留（无需 /clear）。没有失败轮次凭据（retryTurnId）时不给。
+  if (o.errorCode === 'provider_image_too_small' && o.retryTurnId) {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.purge_images_continue', undefined, locale) },
+      type: 'primary',
+      value: {
+        action: 'purge_images_continue',
+        turn_id: o.retryTurnId,
         ...actionBase,
       },
     });
@@ -2324,6 +2344,9 @@ export interface RecoveryFailedCardOpts {
      *  very turn: keep the pre-existing admin「继续这一轮」button (retry_turn,
      *  continue mode) that recovery cards used to carry. */
     | { kind: 'continue_legacy'; turnId: string }
+    /** A poisoned-history image failure can be repaired in place even when the
+     *  ordinary recovery notice has no re-delivery envelope. */
+    | { kind: 'purge_images'; turnId: string }
     | { kind: 'none'; reason: 'no_input' | 'scheduled' | 'unsupported' };
   terminalUrl?: string;
   locale?: Locale;
@@ -2368,6 +2391,8 @@ export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
     ? t('card.recovery_failed.retry_hint', undefined, locale)
     : o.retry.kind === 'continue_legacy'
       ? t('card.turn_failed.retry_caveated', undefined, locale)
+    : o.retry.kind === 'purge_images'
+      ? t('card.turn_failed.image_too_small', undefined, locale)
     : o.retry.kind === 'retried'
       ? t('card.recovery_failed.retried', {
         who: `<at id=${o.retry.byOpenId}></at>`,
@@ -2402,6 +2427,20 @@ export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
         action: 'retry_turn',
         turn_id: o.retry.turnId,
         mode: 'continue',
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        cli_id: o.cliId ?? 'claude-code',
+      },
+    });
+  }
+  if (o.retry.kind === 'purge_images') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.purge_images_continue', undefined, locale) },
+      type: 'primary',
+      value: {
+        action: 'purge_images_continue',
+        turn_id: o.retry.turnId,
         root_id: o.rootId,
         session_id: o.sessionId,
         cli_id: o.cliId ?? 'claude-code',

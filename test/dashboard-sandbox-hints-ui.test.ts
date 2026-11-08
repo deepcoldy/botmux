@@ -27,6 +27,7 @@ import {
 import type { BotDefaultsRow } from '../src/dashboard/web/bot-defaults.js';
 import { SandboxDriftChip } from '../src/dashboard/web/session-sandbox-drift-chip.js';
 import { runSkillUpdate } from '../src/dashboard/web/skills-page.js';
+import { t } from '../src/dashboard/web/ui.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -219,6 +220,18 @@ describe('SandboxSection — confirm before switching the sandbox on', () => {
     expect(JSON.parse(sandboxPuts()[0]!.body!)).toEqual({ mode: 'off' });
   });
 
+  it('a zero-injection rejection of scratch shows the existing scratch zero-injection note', async () => {
+    confirmMock.mockResolvedValue(true);
+    responder = () => ({ status: 400, body: { ok: false, error: 'zero_prompt_unsupported' } });
+    const view = mount(React.createElement(SandboxSection, {
+      bot: bot({ cliId: 'cursor', promptInjection: 'none', sandboxMode: 'off', scratchSupported: true }), patchBot: vi.fn(),
+    }));
+    await click(view, 'sandbox-mode-scratch');
+    expect(view.root.findByProps({ 'data-sandbox-status': '' }).children.join(''))
+      .toBe(`✗ ${t('botDefaults.promptInjectionUnsupportedScratch')}`);
+    expect(view.root.findByProps({ 'data-action': 'sandbox-mode-off' }).props['aria-pressed']).toBe(true);
+  });
+
   it('re-picking the current mode or changing scratch storage does not ask again', async () => {
     const view = mount(React.createElement(SandboxSection, { bot: bot({ sandboxMode: 'scratch', scratchSupported: true }), patchBot: vi.fn() }));
     await click(view, 'sandbox-mode-scratch');
@@ -324,6 +337,31 @@ describe('CodexIsolatedConfigInfo — isolated config.toml path + re-sync', () =
     responder = call => call.method === 'GET' ? { body: INFO } : { status: 404, body: { ok: false, error: 'host_config_missing' } };
     await act(async () => { await resyncButton(view).props.onClick(); });
     expect(JSON.stringify(view.root.findByProps({ 'data-codex-config-status': '' }).props)).toContain(INFO.hostPath);
+  });
+
+  it('names AGENTS.md in the confirm and reports both backups when the host has one', async () => {
+    confirmMock.mockResolvedValue(true);
+    const info = { ...INFO, agentsPath: '/srv/bots/app_a/codex/AGENTS.md', hostAgentsPath: '/home/u/.codex/AGENTS.md', hostAgentsExists: true };
+    const view = await mountInfo(info);
+    responder = call => call.method === 'GET' ? { body: info } : {
+      body: { ok: true, backupPath: '/srv/bots/app_a/codex/config.toml.bak-x', agentsBackupPath: '/srv/bots/app_a/codex/AGENTS.md.bak-x' },
+    };
+    await act(async () => { await resyncButton(view).props.onClick(); });
+    const asked = JSON.stringify(confirmMock.mock.calls[0][0]);
+    expect(asked).toContain(info.agentsPath);
+    expect(asked).toContain(info.hostAgentsPath);
+    const status = JSON.stringify(view.root.findByProps({ 'data-codex-config-status': '' }).props);
+    expect(status).toContain('/srv/bots/app_a/codex/config.toml.bak-x');
+    expect(status).toContain('/srv/bots/app_a/codex/AGENTS.md.bak-x');
+  });
+
+  it('keeps the config.toml-only confirm when the host has no AGENTS.md', async () => {
+    confirmMock.mockResolvedValue(false);
+    const view = await mountInfo({ ...INFO, agentsPath: '/srv/bots/app_a/codex/AGENTS.md', hostAgentsPath: '/home/u/.codex/AGENTS.md', hostAgentsExists: false });
+    await act(async () => { await resyncButton(view).props.onClick(); });
+    const asked = JSON.stringify(confirmMock.mock.calls[0][0]);
+    expect(asked).toContain(INFO.path);
+    expect(asked).not.toContain('AGENTS.md');
   });
 });
 

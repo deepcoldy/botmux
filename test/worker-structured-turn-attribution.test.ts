@@ -219,3 +219,44 @@ describe('structured turn send attribution retirement', () => {
     expect(h.currentBotmuxTurnId).toBeUndefined();
   });
 });
+
+describe('structured bridge terminal: the provider error summary goes with a failed turn', () => {
+  function emitOne(turn: CodexPendingTurn) {
+    const scope: Record<string, any> = {
+      sessionId: 'sid', universalOutputHandoff: false,
+      bridgeGateInputForTurn: (_sid: unknown, _turn: unknown, gate: unknown) => gate,
+      codexBridgeQueue: { drainEmittable: () => [turn], peek: () => [], restoreDrained: vi.fn() },
+      checkpointCodexAdoptRecovery: vi.fn(), checkpointStructuredBridgeRecovery: vi.fn(),
+      recoverTraexQuotaTurn: () => false,
+      armPostTerminalInputFence: vi.fn(), lastInitConfig: { adoptMode: false },
+      isExistingAppServerSharedBridge: () => false, readSendMarkers: () => [],
+      zeroPromptTerminalSync: () => false,
+      structuredBridgeIs: () => false, structuredFallbackKind: () => 'none',
+      replyDeliveryMode: () => 'explicit', bridgeTurnOutcome: () => 'completed',
+      notifyExplicitRepliesObserved: vi.fn(), attributableExplicitReplyMarkersForTurnWindow: () => [],
+      attributableBridgeReplyMarkers: () => [],
+      usageLimitTracker: { noteTurnCompleted: vi.fn() },
+      releaseInputDeliveryQuarantineForStructuredTerminal: vi.fn(),
+      retireRpcLifecycleFromStructuredTerminal: vi.fn(), emitTurnTerminal: vi.fn(),
+      retireStructuredTurnAttribution: vi.fn(), send: vi.fn(), log: vi.fn(),
+    };
+    loadWorkerFunction('emitReadyCodexTurns', scope)();
+    return scope.emitTurnTerminal.mock.calls as unknown[][];
+  }
+
+  it('failed with a summary: the summary is the terminal\'s error text (its 8th argument)', () => {
+    const calls = emitOne({ turnId: 'om_failed', started: true, finalText: '', markTimeMs: 200,
+      terminalStatus: 'failed', terminalErrorCode: 'provider_server_error', terminalErrorSummary: 'upstream 502 from the gateway' });
+    expect(calls).toEqual([['om_failed', 'failed', 'provider_server_error', undefined, undefined, undefined, undefined, 'upstream 502 from the gateway']]);
+  });
+
+  it.each([
+    ['completed', { terminalStatus: 'completed' as const, terminalErrorSummary: 'not an error' }],
+    ['failed without a summary', { terminalStatus: 'failed' as const, terminalErrorCode: 'provider_server_error' }],
+  ])('%s: the terminal is emitted as before, with no error text', (_name, fields) => {
+    const calls = emitOne({ turnId: 'om_x', started: true, finalText: 'answer', markTimeMs: 200, ...fields });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.length).toBeLessThanOrEqual(5);
+    expect(calls[0]![7]).toBeUndefined();
+  });
+});

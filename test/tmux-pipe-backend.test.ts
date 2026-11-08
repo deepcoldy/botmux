@@ -91,7 +91,9 @@ import {
   buildPipePaneStartupError,
   __testOnly_liveFifoReaderCount,
   resolveReportedExitCode,
+  literalSendKeysArgs,
 } from '../src/adapters/backend/tmux-pipe-backend.js';
+import { pipePaneShellCommand } from '../src/adapters/backend/tmux-pipe-relay.js';
 import { resetTmuxVersionCacheForTests, getTmuxVersionCached } from '../src/setup/ensure-tmux.js';
 import { bufferSpawnResult } from './helpers/spawn-result.js';
 import { takePaneLaunchFile } from './helpers/pane-launch.js';
@@ -865,6 +867,43 @@ describe('TmuxPipeBackend server selection (dedicated socket)', () => {
     const calls = everyTmuxCall();
     expect(calls.length).toBeGreaterThan(0);
     expect(calls.filter(call => call.includes('-L '))).toEqual([]);
+  });
+});
+
+describe('literalSendKeysArgs (tmux eats a trailing ";")', () => {
+  it('keeps plain text as one literal send-keys', () => {
+    expect(literalSendKeysArgs('0:1.0', 'mid;dle')).toEqual(['send-keys', '-t', '0:1.0', '-l', '--', 'mid;dle']);
+  });
+
+  it('sends trailing semicolons as hex keys in the same invocation', () => {
+    expect(literalSendKeysArgs('0:1.0', '93&#47;')).toEqual([
+      'send-keys', '-t', '0:1.0', '-l', '--', '93&#47', ';', 'send-keys', '-t', '0:1.0', '-H', '3b',
+    ]);
+    expect(literalSendKeysArgs('p', 'E;;')).toEqual(['send-keys', '-t', 'p', '-l', '--', 'E', ';', 'send-keys', '-t', 'p', '-H', '3b', '3b']);
+  });
+
+  it('never leaves a literal argument ending in ";" or a backslash-escaped one', () => {
+    expect(literalSendKeysArgs('p', ';')).toEqual(['send-keys', '-t', 'p', '-H', '3b']);
+    expect(literalSendKeysArgs('p', 'B\\;')).toEqual(['send-keys', '-t', 'p', '-l', '--', 'B\\', ';', 'send-keys', '-t', 'p', '-H', '3b']);
+  });
+
+  it('keeps the old argv on tmux without -H (< 3.0)', () => {
+    expect(literalSendKeysArgs('p', 'X;', { major: 2, minor: 9 })).toEqual(['send-keys', '-t', 'p', '-l', '--', 'X;']);
+    expect(literalSendKeysArgs('p', 'X;', { major: 3, minor: 0 })).toContain('-H');
+  });
+
+  it('sendText and sendLines route through it', () => {
+    const be = new TmuxPipeBackend('0:3.1');
+    be.spawn('', [], spawnOpts());
+    mockedExecFileSync.mockClear();
+    be.sendText('&#10;');
+    be.sendLines(['a;', 'b'], 'S-Enter');
+    const [text, lines] = getExecFileCalls().map(call => call[1] as string[]);
+    expect(text.slice(-5)).toEqual(['send-keys', '-t', '0:3.1', '-H', '3b']);
+    expect(text).toContain('&#10');
+    expect(text).not.toContain('&#10;');
+    expect(lines).toContain('3b');
+    expect(lines.filter(arg => arg !== ';' && arg.endsWith(';'))).toEqual([]);
   });
 });
 
@@ -2777,17 +2816,22 @@ describe('TmuxPipeBackend dead-pane guard before pipe-pane (#2419)', () => {
     }) as typeof execSync);
   }
 
-  // Shape assertions that discriminate beyond a contains() on the unwrapped
-  // command: (1) the marker display MUST be the then-branch (death verdict),
-  // i.e. appear before the subscription in argv; (2) the subscription MUST
-  // reach tmux as ONE single-quoted if-shell argument — an unescaped
-  // pipePaneCommand splits into "too many arguments" on both 2.8 and 3.3a,
-  // so the guard silently never runs while a weaker contains() still passes.
-  function expectGuardShape(cmd: string) {
-    const unwrapped = unescapeQuotes(cmd);
-    expect(unwrapped).toContain(`pipe-pane -O -t '${target}'`);
-    expect(cmd.indexOf(MARKER)).toBeLessThan(cmd.indexOf('pipe-pane -O'));
-    expect(cmd).toContain("'pipe-pane -O -t");
+  // The shell hands if-shell its arguments, then tmux parses the subscription
+  // branch AGAIN as a command string. tmux 2.8, 3.0 and 3.1 take this path, so
+  // the branch is read with the stricter of their rules: the subscription
+  // must arrive as exactly one pipe-pane with the shell command byte-for-byte.
+  // The marker display is the then-branch (death verdict), before it in argv.
+  function expectGuardShape(cmd: string, paneTarget = target) {
+    const words = shWords(cmd);
+    const ifShell = words.slice(words.indexOf('if-shell'));
+    expect(ifShell.slice(0, 6)).toEqual(['if-shell', '-F', '-t', paneTarget, '#{pane_dead}', `display-message -p ${MARKER}`]);
+    expect(ifShell).toHaveLength(7);
+    const subscription = legacyTmuxWords(ifShell[6]);
+    expect(subscription.slice(0, 4)).toEqual(['pipe-pane', '-O', '-t', paneTarget]);
+    expect(subscription).toHaveLength(5);
+    const fifo = /^exec >'([^']+)' /.exec(subscription[4])?.[1];
+    expect(fifo).toMatch(/botmux-pipe-[0-9a-f]+\.fifo$/);
+    expect(subscription[4]).toBe(pipePaneShellCommand(fifo!));
   }
 
   function attachCommands(): string[] {
@@ -2796,10 +2840,75 @@ describe('TmuxPipeBackend dead-pane guard before pipe-pane (#2419)', () => {
       .filter(c => c.includes('pipe-pane') || c.includes('if-shell'));
   }
 
-  // The wrapped command is itself a single-quoted argument of if-shell, so its
-  // inner quotes reach us shell-escaped (`'\''`); unescape to read its shape.
-  function unescapeQuotes(s: string): string {
-    return s.replace(/'\\''/g, "'");
+  // /bin/sh word splitting for the single-quote quoting the backend emits.
+  function shWords(cmd: string): string[] {
+    const words: string[] = [];
+    let word: string | null = null;
+    for (let i = 0; i < cmd.length; i++) {
+      const ch = cmd[i]!;
+      if (ch === "'") {
+        const end = cmd.indexOf("'", i + 1);
+        if (end < 0) throw new Error(`unterminated quote in ${cmd}`);
+        word = (word ?? '') + cmd.slice(i + 1, end);
+        i = end;
+      } else if (ch === '\\') {
+        word = (word ?? '') + cmd[++i];
+      } else if (ch === ' ') {
+        if (word !== null) words.push(word);
+        word = null;
+      } else if (/["$`;&|<>#]/.test(ch)) {
+        throw new Error(`unquoted shell metacharacter ${ch} in ${cmd}`);
+      } else {
+        word = (word ?? '') + ch;
+      }
+    }
+    if (word !== null) words.push(word);
+    return words;
+  }
+
+  // tmux 2.8 cmd_string_split (cmd-string.c): single quotes are literal, double
+  // quotes take backslash escapes, and outside quotes a backslash is an ordinary
+  // character and `#` starts a comment. `$` and a leading `~` would expand, and
+  // cmd_list_parse ends the command at any argument ending in `;`. tmux 3.0/3.1
+  // (cmd-parse.y) also expand a `~` that opens a double-quoted string.
+  function legacyTmuxWords(cmd: string): string[] {
+    const words: string[] = [];
+    let word: string | null = null;
+    for (let i = 0; i < cmd.length; i++) {
+      const ch = cmd[i]!;
+      if (ch === "'") {
+        const end = cmd.indexOf("'", i + 1);
+        if (end < 0) throw new Error(`unterminated quote in ${cmd}`);
+        word = (word ?? '') + cmd.slice(i + 1, end);
+        i = end;
+      } else if (ch === '"') {
+        if (cmd[i + 1] === '~') throw new Error(`tmux 3.0 would expand ~ in ${cmd}`);
+        let text = '';
+        for (i++; cmd[i] !== '"'; i++) {
+          if (i >= cmd.length) throw new Error(`unterminated quote in ${cmd}`);
+          if (cmd[i] === '$') throw new Error(`tmux would expand $ in ${cmd}`);
+          if (cmd[i] === '\\') {
+            i++;
+            text += ({ e: '\x1b', r: '\r', n: '\n', t: '\t' } as Record<string, string>)[cmd[i]!] ?? cmd[i];
+          } else {
+            text += cmd[i];
+          }
+        }
+        word = (word ?? '') + text;
+      } else if (ch === '$' || (ch === '~' && word === null)) {
+        throw new Error(`tmux would expand ${ch} in ${cmd}`);
+      } else if (ch === '#') {
+        break;
+      } else if (ch === ' ' || ch === '\t') {
+        if (word !== null) words.push(word);
+        word = null;
+      } else {
+        word = (word ?? '') + ch;
+      }
+    }
+    if (word !== null) words.push(word);
+    if (words.some(w => w.endsWith(';'))) throw new Error(`tmux 2.8 would split ${cmd} at a ;`);
+    return words;
   }
 
   it.each(['tmux 2.8', 'tmux 3.1c', 'tmux not-a-version'])(
@@ -2821,6 +2930,21 @@ describe('TmuxPipeBackend dead-pane guard before pipe-pane (#2419)', () => {
         be.kill();
       }
     });
+
+  // An adopted pane's target is the user's own session name.
+  it.each(['tmux 2.8', 'tmux 3.1c'])('%s: a pane target starting with ~ reaches the subscription literally', (versionString) => {
+    emulateOldTmux(versionString);
+    const tildeTarget = `~${target}`;
+    const be = new TmuxPipeBackend(tildeTarget, { createSession: true, ownsSession: true });
+    try {
+      expect(() => be.spawn('', [], spawnOpts())).not.toThrow();
+      const cmds = attachCommands();
+      expect(cmds).toHaveLength(1);
+      expectGuardShape(cmds[0], tildeTarget);
+    } finally {
+      be.kill();
+    }
+  });
 
   it('a marker reply on a fresh create is a deterministic one-shot startup failure: no retry, no exit, reader recycled', () => {
     emulateOldTmux('tmux 2.8', { attachReply: MARKER });

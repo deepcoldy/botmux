@@ -89,7 +89,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     titleKey: 'botDefaults.sectionSessionMode',
     fieldKeys: [
       'botDefaults.groupP2p', 'botDefaults.groupRegular', 'botDefaults.groupMention', 'botDefaults.sgTag',
-      'botDefaults.docSubscribeMode', 'botDefaults.chatManagerTitle', 'botDefaults.sgTagAuthPasteLabel',
+      'botDefaults.docSubscribeMode', 'botDefaults.chatManagerTitle', 'botDefaults.groupSecretaryTitle', 'botDefaults.sgTagAuthPasteLabel',
       'botDefaults.sgTagName', 'botDefaults.sgClosedTagName',
     ],
   },
@@ -98,7 +98,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'steward',
     tab: 'sessions',
     titleKey: 'botDefaults.sectionSteward',
-    fieldKeys: ['botDefaults.stewardEnabled', 'botDefaults.stewardChat', 'botDefaults.stewardDecisionCards', 'botDefaults.stewardAutoJoin', 'botDefaults.stewardAutoJoinSolo', 'botDefaults.stewardCloseHints', 'botDefaults.stewardGuide'],
+    fieldKeys: ['botDefaults.stewardEnabled', 'botDefaults.stewardChat', 'botDefaults.stewardDecisionCards', 'botDefaults.stewardAutoJoin', 'botDefaults.stewardAutoJoinSolo', 'botDefaults.stewardCloseHints', 'botDefaults.stewardTaskHints', 'botDefaults.stewardGuide'],
   },
   {
     id: 'substitute',
@@ -108,6 +108,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.substituteEnabled', 'botDefaults.substituteTargets', 'botDefaults.substituteChats',
       'botDefaults.substituteExcludedChats', 'botDefaults.substituteReplyMode', 'botDefaults.substituteDisclosure',
       'botDefaults.substituteControlCard', 'botDefaults.substituteTopicGroups', 'botDefaults.substituteTopicActive',
+      'botDefaults.substituteKeywords',
     ],
   },
   {
@@ -291,6 +292,7 @@ export type NativeSubagentRuntimePolicy = {
 };
 
 export type BotSubstituteTarget = {
+  appId?: string;
   openId?: string;
   userId?: string;
   unionId?: string;
@@ -302,6 +304,7 @@ export type BotSubstituteTarget = {
 export type BotSubstituteMode = {
   enabled: boolean;
   targets: BotSubstituteTarget[];
+  keywords?: string[];
   disclosure: 'prefix' | 'none';
   chats?: string[];
   excludedChats?: string[];
@@ -541,6 +544,7 @@ export type BotDefaultsRow = {
   groupJoinCommand?: string;
   autoStartOnNewTopic?: boolean;
   chatManagerEnabled?: boolean;
+  groupSecretaryEnabled?: boolean;
   autoStartExcludedChats?: string[];
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;
@@ -801,6 +805,7 @@ export async function fetchBotDefaults(): Promise<LoadBotsResult> {
 export type SubstituteTargetResolution = {
   input?: string;
   ok?: boolean;
+  appId?: string;
   openId?: string;
   name?: string;
   avatarUrl?: string;

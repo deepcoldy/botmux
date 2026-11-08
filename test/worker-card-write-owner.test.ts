@@ -218,6 +218,33 @@ describe('native worker card publication', () => {
 });
 
 
+describe('Web Terminal button on a default LAN host', () => {
+  it.each([
+    ['keeps', { viewToken: 'v'.repeat(43), cardViewToken: 'c'.repeat(43) }],
+    ['drops only', {}],
+  ] as const)('%s the button when the worker reports %o', async (verdict, capabilities) => {
+    prepareStatusCard();
+    const worker = Object.assign(new EventEmitter(), {
+      killed: false, send: vi.fn(), kill: vi.fn(), pid: 12345,
+      stdout: new EventEmitter(), stderr: new EventEmitter(),
+    });
+    ds.worker = worker as any;
+    ds.lastScreenStatus = 'working';
+    ds.displayMode = 'hidden';
+    const pending: Promise<unknown>[] = [];
+    initWorkerPool({ sessionReply: (...args) => {
+      const work = sessionReply(...args); pending.push(work); return work;
+    }, getSessionWorkingDir: () => ds.session.workingDir!, getActiveCount: () => 1, closeSession: vi.fn() });
+    setupWorkerHandlers(ds, worker as any);
+    await worker.listeners('message')[0]({ type: 'ready', port: 9999, token: 'fixture', turnId: 'om_turn_old', ...capabilities });
+    await Promise.allSettled(pending);
+    expect(ds.streamCardId).toBe('om_sent');
+    const card = JSON.stringify(mocks.reply.mock.calls[0][0]);
+    if (verdict === 'keeps') expect(card).toContain(`:9999?viewToken=${'c'.repeat(43)}`);
+    else expect(card).not.toContain(':9999');
+  });
+});
+
 describe('queued streaming-card PATCH ownership', () => {
   const changes = ['nonce', 'generation', 'turn', 'session', 'registry', 'chat', 'card', 'disabled', 'transport', 'scope', 'retirement'] as const;
   it.each(changes)('does not retry a PATCH after its %s owner changes', async change => {

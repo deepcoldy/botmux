@@ -100,6 +100,7 @@ describe('claude-code —— hook 注入策略（adopt 兼容 + SessionStart 真
     });
     // 同时把 SessionStart 就绪 hook 写全局（为 aiden x claude 这类剥 --settings 的启动器供信号）
     expect(adapter.hookInstall?.sessionStartCommand).toMatch(/session-ready$/);
+    expect(adapter.hookInstall?.preCompactCommand).toMatch(/__claude-compaction-v1$/);
     // 仍标记 asksViaHook（驱动「不装 botmux-ask skill 兜底」）
     expect(adapter.asksViaHook).toBe(true);
   });
