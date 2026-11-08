@@ -11,7 +11,7 @@ import type { AskResult, PendingAsk } from '../core/ask-types.js';
 export type ReplyCardMode = 'legacy' | 'unified';
 /** CLI capability only; session and transport exclusions remain runtime gates. */
 export function supportsUnifiedReplyCardCli(cliId: string | undefined): boolean {
-  return cliId !== undefined && ['claude-code', 'codex', 'grok', 'traex', 'pi'].includes(cliId);
+  return cliId !== undefined && ['claude-code', 'codex', 'grok', 'traex', 'pi', 'kimi'].includes(cliId);
 }
 /** Retain quiet delivery only for persisted turns accepted by older versions. */
 export type TurnReplyCardMode = ReplyCardMode | 'final-only';

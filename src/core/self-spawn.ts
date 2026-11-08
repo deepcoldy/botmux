@@ -1,5 +1,6 @@
 import { spawn, fork, type ChildProcess, type StdioOptions } from 'node:child_process';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 /**
  * Spawn one of botmux's own entry modules (daemon / core-only / worker /
@@ -30,6 +31,7 @@ import { join } from 'node:path';
 export type BotmuxEntry =
   | 'core-only' | 'daemon' | 'worker' | 'supervisor' | 'dashboard'
   | 'plugin-supervisor' | 'sandbox-network-runner' | 'program-status-relay' | 'background-execution-runner'
+  | 'zellij-socket-probe'
   // CLI-adapter runners. Unlike the entries above these are not fleet processes:
   // an adapter spawns one as the CLI session itself (`resolvedBin` is
   // process.execPath and the runner is argv[0]). They need the same treatment for
@@ -48,6 +50,7 @@ const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
   'sandbox-network-runner': '__sandbox-network-runner',
   'program-status-relay': '__program-status-relay',
   'background-execution-runner': '__background-execution-runner',
+  'zellij-socket-probe': '__zellij-socket-probe',
   'codex-app-runner': '__codex-app-runner',
   'dsh-runner': '__dsh-runner',
   'mira-runner': '__mira-runner',
@@ -68,6 +71,7 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
   'sandbox-network-runner': 'sandbox-network-runner.js',
   'program-status-relay': 'program-status-relay.js',
   'background-execution-runner': 'background-execution-runner.js',
+  'zellij-socket-probe': 'adapters/backend/zellij-socket-probe.js',
   'codex-app-runner': 'codex-app-runner.js',
   'dsh-runner': 'dsh-runner.js',
   'mira-runner': 'mira-runner.js',
@@ -203,6 +207,16 @@ export function entryForSubcommand(token: string): BotmuxEntry | null {
     if (sub === token) return entry as BotmuxEntry;
   }
   return null;
+}
+
+/**
+ * `--import` operand for a preload file. Bun does not decode file URLs there (a
+ * CJK, space, `%` or `#` path fails with "preload not found"), so it needs the
+ * raw absolute path; Node resolves a raw path as a URL (`%xx` decoded, `#`
+ * starts a fragment), so it keeps the file URL.
+ */
+export function preloadImportSpecifier(path: string, bun: boolean = Boolean(process.versions.bun)): string {
+  return bun ? path : pathToFileURL(path).href;
 }
 
 /**

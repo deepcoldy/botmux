@@ -167,7 +167,7 @@ describe('daemon session-scoped IPC route wiring', () => {
     const askInput = ask.slice(inputAt, ask.indexOf('};', inputAt));
     expect(askInput).toContain('boundAsk.larkAppId');
     expect(askInput).not.toContain('parsed.larkAppId');
-    expect(ask.indexOf('registerAskForResponse(askInput')).toBeGreaterThan(inputAt);
+    expect(ask.search(/registerAskForResponse\((\{ \.\.\.)?askInput\b/)).toBeGreaterThan(inputAt);
 
     const hook = route('/api/hooks/emit');
     const hookBindAt = hook.indexOf('boundPayload = bindSessionScopedIpcIdentity(');
