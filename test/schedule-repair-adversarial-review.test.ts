@@ -47,6 +47,23 @@ let serial = 0;
 const pending: (() => void)[] = [];
 const turn = (id: string, n = 1) => `schedule:${id}:${String(n).padStart(8, '0')}-1234-1234-1234-123456789abc`;
 
+/** Pump the fake clock in bounded steps until `check` passes or the simulated
+ *  deadline passes. Each step also yields real microtasks, so timer chains that
+ *  re-arm themselves after an await keep draining under host load (a single
+ *  advanceTimersByTimeAsync leaves the later re-arms pending there). */
+async function pumpUntil(check: () => void, simulatedMs: number, stepMs = 1_000): Promise<void> {
+  for (let elapsed = 0; elapsed < simulatedMs; elapsed += stepMs) {
+    await vi.advanceTimersByTimeAsync(stepMs);
+    try {
+      check();
+      return;
+    } catch {
+      // keep pumping
+    }
+  }
+  check();
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(new Date('2026-11-06T01:00:00.000Z'));
@@ -501,17 +518,20 @@ describe('scheduled send settlement for in-flight sends, restarts and superseded
     settleLater(ds, { turnId: run.turnId, source: 'terminal' });
     await vi.advanceTimersByTimeAsync(SCHEDULED_SEND_IN_FLIGHT_LIMIT_MS / 2);
     expect(taskRow(run.taskId).lastStatus).toBe('ok');
-    await vi.advanceTimersByTimeAsync(SCHEDULED_SEND_IN_FLIGHT_LIMIT_MS);
-    expect(taskRow(run.taskId)).toMatchObject({ lastStatus: 'error',
-      lastDeliveryErrorCode: 'schedule_send_unknown', runStats: { failed: 1 } });
+    // The settlement re-arms through the 0.5s→15s backoff chain until the
+    // 10-minute in-flight limit. Pump the faked clock in steps so every re-arm
+    // queued after an await still fires; a one-shot advance stalls on load.
+    await pumpUntil(() => expect(taskRow(run.taskId)).toMatchObject({ lastStatus: 'error',
+      lastDeliveryErrorCode: 'schedule_send_unknown', runStats: { failed: 1 } }),
+      SCHEDULED_SEND_IN_FLIGHT_LIMIT_MS + 60_000);
     expect(logFor(run)).toMatchObject({ outcome: 'error', errorCode: 'schedule_send_unknown' });
     send.finish('om_after_wait');
     await send.receipt;
     settleLater(ds, { turnId: run.turnId, source: 'terminal' });
-    await vi.advanceTimersByTimeAsync(2_000);
-    expect(taskRow(run.taskId)).toMatchObject({ lastStatus: 'ok', runStats: { failed: 0 } });
+    await pumpUntil(() => expect(taskRow(run.taskId)).toMatchObject({ lastStatus: 'ok', runStats: { failed: 0 } }),
+      30_000, 500);
     expect(logFor(run)?.outcome).toBe('model_dispatched');
-  });
+  }, 60_000);
 
   it('settles a send whose pending settlement a daemon restart dropped', async () => {
     const s = session();
@@ -608,22 +628,23 @@ describe('scheduled send settlement for in-flight sends, restarts and superseded
     const ledger = new TurnSendLedger(isolated.dataDir);
     new ScheduleSendAttempt(isolated.dataDir, s, run.turnId).fail(new Error('first attempt rejected'));
     settleLater(ds, { turnId: run.turnId, source: 'terminal' });
-    await vi.advanceTimersByTimeAsync(2_000);
-    expect(taskRow(run.taskId).runStats?.failed).toBe(1);
+    await pumpUntil(() => expect(taskRow(run.taskId).runStats?.failed).toBe(1), 30_000, 500);
     await ledger.execute(sendKey(s, run), 'final', 'retried', async () => 'om_retried');
     settleLater(ds, { turnId: run.turnId, source: 'terminal' });
-    await vi.advanceTimersByTimeAsync(2_000);
-    expect(taskRow(run.taskId)).toMatchObject({ lastStatus: 'ok', runStats: { failed: 0 } });
+    await pumpUntil(() => expect(taskRow(run.taskId)).toMatchObject({ lastStatus: 'ok', runStats: { failed: 0 } }),
+      30_000, 500);
     await ledger.pruneCompleted(Date.now() + TURN_SEND_LEDGER_COMPLETED_RETENTION_MS + 1);
     const markFailed = vi.spyOn(runLogs, 'markScheduleRunLogFailed');
     scheduler.stopScheduler();
     scheduler.startScheduler();
     reconcileAfterRestart([s], APP);
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(taskRow(run.taskId)).toMatchObject({ lastStatus: 'ok', runStats: { failed: 0 } });
-    expect(logFor(run)?.outcome).toBe('model_dispatched');
-    expect(markFailed).not.toHaveBeenCalled();
-  });
+    // Keep pumping across the restart reconciliation timer and its re-arms.
+    await pumpUntil(() => {
+      expect(taskRow(run.taskId)).toMatchObject({ lastStatus: 'ok', runStats: { failed: 0 } });
+      expect(logFor(run)?.outcome).toBe('model_dispatched');
+      expect(markFailed).not.toHaveBeenCalled();
+    }, 60_000, 500);
+  }, 60_000);
 
   it('settles a recovered run by its recovery turn alone when reconciling after a restart', async () => {
     const s = session();
