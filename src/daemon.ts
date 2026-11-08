@@ -1071,7 +1071,7 @@ import {
 } from './core/completion-proposal.js';
 import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
-import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
+import { handleCliResolvedRequest, parseAskBody, registerAskForResponse } from './core/ask-api.js';
 import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable } from './services/codex-async-user-input.js';
 import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
 import { isHumanOpenId } from './im/lark/client.js';
@@ -10885,6 +10885,33 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
 };
 ipcRoute('POST', '/api/asks', handleAskRequest);
 ipcRoute('POST', '/api/asks/form-v1', handleAskRequest);
+
+// The hook behind a permission card reports that its CLI ended the confirmation
+// without the card (built-in timeout, terminal choice, interrupt). Same caller
+// and authentication as /api/asks; it can only settle that session's own hook
+// permission ask, and only into a non-answer.
+ipcRoute('POST', '/api/asks/cli-resolved', async (req, res) => {
+  let raw: unknown;
+  try {
+    raw = await readJsonBody<unknown>(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const { status, body } = handleCliResolvedRequest(raw, {
+    trustedHost: isTrustedHostIpcRequest(req),
+    sessionsRestored,
+    findSession: (sessionId) => {
+      const ds = findActiveBySessionId(sessionId);
+      return ds && {
+        larkAppId: ds.larkAppId,
+        sessionId: ds.session.sessionId,
+        receiverSession: !!ds.session.vcMeetingReceiver,
+        liveOrigin: ds.managedTurnOrigin,
+      };
+    },
+  });
+  return jsonRes(res, status, body);
+});
 
 // ─── attention IPC route (internal: set needs-you state) ─────────────────────
 //
