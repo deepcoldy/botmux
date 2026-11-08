@@ -353,6 +353,31 @@ describe('schedule form chat picker', () => {
     expect(form.onSubmit).not.toHaveBeenCalled();
   });
 
+  it('drops the retained topic root once an edited topic schedule moves to another group', async () => {
+    const form = await renderForm({ ...EDITING, executionPosition: 'topic', rootMessageId: 'om_existing' });
+    const rootInput = () => form.root.findByProps({ placeholder: 'om_...' });
+    const submit = () => act(() => form.root.findByType('form').props.onSubmit({ preventDefault() {} }));
+
+    expect(rootInput().props.value).toBe('om_existing');
+    submit();
+    expect(form.onSubmit).toHaveBeenCalledWith(expect.objectContaining({
+      executionPosition: 'topic',
+      rootMessageId: 'om_existing',
+      chatIds: ['oc_alpha'],
+      updateExecutionPosition: true,
+    }));
+    form.onSubmit.mockClear();
+
+    // The old root belongs to Alpha's thread; keeping it after switching to Beta
+    // would bind the schedule to a topic in a different group.
+    form.toggle();
+    act(() => form.checkbox('oc_beta')!.props.onChange({ currentTarget: { checked: true } }));
+    expect(rootInput().props.value).toBe('');
+    submit();
+    expect(form.onSubmit).not.toHaveBeenCalled();
+    expect(rootInput().props['aria-invalid']).toBe(true);
+  });
+
   it.each([
     ['create', null],
     ['edit', { ...EDITING, chatIds: [] }],

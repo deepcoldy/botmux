@@ -1,3 +1,5 @@
+import { stripAnsiScreenText } from './idle-detector.js';
+
 /**
  * Worker input-gate — decide whether an incoming Lark message is written to the
  * CLI's PTY now, or queued until the CLI is ready.
@@ -7,9 +9,13 @@
  *
  *  - `isPromptReady`  — the CLI is idle and waiting for input.
  *  - `isFlushing`     — a drain loop is already running; let it pick this up.
- *  - type-ahead       — the adapter (Codex/CoCo/Claude) can accept input while
- *                       BUSY: the TUI parks it in its own queue / steers it into
- *                       the active turn.
+ *  - type-ahead       — the adapter (Codex/CoCo/Claude/antigravity) can accept
+ *                       input while BUSY: the TUI parks it, or steers it into
+ *                       the active turn. Antigravity's Queue waits for the turn
+ *                       to end; Send Immediately forwards without cancelling
+ *                       the current tool. That Enter is unsafe on agy's
+ *                       permission dialog, so the policy drops type-ahead when
+ *                       the bot disables the approval bypass.
  *
  * The catch the type-ahead case must respect: parking only works once the TUI
  * is actually up. During STARTUP (and tmux re-attach) the input box doesn't
@@ -375,4 +381,44 @@ export function decideSettleMarkReady(state: {
  */
 export function decideHardTimeoutAction(supportsTypeAhead: boolean): 'flush' | 'mark-ready' {
   return supportsTypeAhead ? 'flush' : 'mark-ready';
+}
+
+/**
+ * May the FIRST write of a fresh CLI spawn (startup commands or the first
+ * queued prompt) be typed now?
+ *
+ * Every timeout path that releases the first prompt (the 15s soft timeout's
+ * type-ahead flush, the ready-gate's 45s fallback settle) assumes the TUI is
+ * already reading input. Under host load that assumption fails: on 2026-10-20 a
+ * Claude Code spawn printed nothing for 66s, the gate fallback measured "45s of
+ * quiet" from a PTY that had never produced a byte, and `/effort xhigh` plus a
+ * multi-line prompt were typed into a process that was not reading yet. When
+ * Ink finally attached, it read the whole backlog as one paste burst: every
+ * Enter became a newline, every soft-newline `\` stayed literal, and nothing was
+ * submitted.
+ *
+ * Evidence that the input box exists, strongest first: an authoritative ready
+ * signal from the CLI itself (a direct ready command — NOT Claude's
+ * SessionStart hook, which only proves the startup selector is behind us), or
+ * the readyPattern on screen, which every adapter with one already relies on
+ * for idle detection. Without a readyPattern or a viewport there is nothing to
+ * check (unchanged behavior). The first-prompt hard cap stays a real deadline:
+ * past it the write goes through as before, so a stale readyPattern can delay
+ * the first prompt but never trap it.
+ */
+export function decideFirstWriteLiveness(state: {
+  readyPattern: RegExp | undefined;
+  /** Rendered viewport text; undefined when no screen is available. */
+  viewport: string | undefined;
+  /** The CLI's own ready signal arrived and proves its input box (not Claude-family). */
+  readySignal: boolean;
+  /** The spawn's first-prompt hard cap has elapsed. */
+  hardCapReached: boolean;
+}): { write: boolean; reason: 'no-ready-pattern' | 'no-viewport' | 'ready-signal' | 'prompt-visible' | 'hard-cap' | 'prompt-not-visible' } {
+  if (!state.readyPattern) return { write: true, reason: 'no-ready-pattern' };
+  if (state.readySignal) return { write: true, reason: 'ready-signal' };
+  if (state.viewport === undefined) return { write: true, reason: 'no-viewport' };
+  if (state.readyPattern.test(stripAnsiScreenText(state.viewport))) return { write: true, reason: 'prompt-visible' };
+  if (state.hardCapReached) return { write: true, reason: 'hard-cap' };
+  return { write: false, reason: 'prompt-not-visible' };
 }

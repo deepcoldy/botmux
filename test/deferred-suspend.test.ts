@@ -2,8 +2,8 @@
 // `pendingSuspendReason`，真正的 kill 推迟到会话转入 idle/limited 后由
 // runPendingSuspendIfSettled 兑现。这里钉住兑现函数的状态门控与幂等；
 // 排队半边（IPC 路由）见 ipc-suspend-route.test.ts。
-import { describe, expect, it, vi } from 'vitest';
-import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { once } from 'node:events';
 import { spawnTsEval } from './helpers/ts-runner.js';
@@ -11,6 +11,7 @@ import { dirname, join } from 'node:path';
 
 vi.mock('../src/services/session-store.js', () => ({
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  listSessions: vi.fn(() => []),
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
   updateSessionPid: vi.fn(),
@@ -33,11 +34,16 @@ import {
   __testOnly_runPendingSuspendIfSettled as runPendingSuspendIfSettled,
   suspendWorker,
   setSessionReasoningEffort,
+  topicReasoningControl, setTopicReasoningEffort, __testOnly_resetRestartCoordinator,
   sendWorkerInput,
   __testOnly_resetOrdinaryImDeliveries,
   sessionReasoningControl,
   __testOnly_sessionAgentConfig as sessionAgentConfig,
+  __testOnly_setSuspendBackingVerifier,
+  setActiveSessionsRegistry,
+  transferSession,
 } from '../src/core/worker-pool.js';
+import { sessionKey } from '../src/core/types.js';
 vi.mock('../src/services/codex-transcript.js', async orig => ({
   ...await orig<typeof import('../src/services/codex-transcript.js')>(),
   findCodexRolloutBySessionId: vi.fn(() => new URL('../package.json', import.meta.url).pathname),
@@ -45,6 +51,9 @@ vi.mock('../src/services/codex-transcript.js', async orig => ({
 }));
 import { drainCodexRollout, findCodexRolloutBySessionId } from '../src/services/codex-transcript.js';
 import { logger } from '../src/utils/logger.js';
+
+beforeEach(() => __testOnly_setSuspendBackingVerifier(() => true));
+afterEach(() => __testOnly_setSuspendBackingVerifier());
 
 function fakeWorker() {
   return {
@@ -123,6 +132,32 @@ describe('runPendingSuspendIfSettled', () => {
   // 或 backend 不可挂起。拒绝是**暂时**的，吃掉标志会让这次请求一路丢到下一个
   // `suspend all` 周期才补回来。routing transfer 的门是模块私有的，这里用同样走
   // 「早退且零副作用」的 pty 分支来钉住「拒绝 ⇒ 标志保留」这条不变式。
+  // A CLI whose install was replaced under it must not take another turn, and a
+  // pty session has no dormant state: the worker is retired the way /cd does,
+  // so the next message cold-starts with resume.
+  it('retires a pty worker for an install-change claim instead of waiting forever', () => {
+    const { ds, worker } = busySession('idle', { pending: 'cli_install_changed' });
+    ds.initConfig = { backendType: 'pty' };
+    ds.hasHistory = false;
+
+    runPendingSuspendIfSettled(ds);
+
+    expect(worker.send).toHaveBeenCalledWith({ type: 'close' });
+    expect(ds.worker).toBe(null);
+    expect(ds.hasHistory).toBe(true);
+    expect(ds.pendingSuspendReason).toBeUndefined();
+  });
+
+  it('keeps an install-change claim on a pty worker that is still producing', () => {
+    const { ds, worker } = busySession('working', { pending: 'cli_install_changed' });
+    ds.initConfig = { backendType: 'pty' };
+
+    runPendingSuspendIfSettled(ds);
+
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(ds.pendingSuspendReason).toBe('cli_install_changed');
+  });
+
   it('keeps the flag queued when suspendWorker refuses', () => {
     const { ds, worker } = busySession('idle');
     ds.initConfig = { backendType: 'pty' };
@@ -135,17 +170,31 @@ describe('runPendingSuspendIfSettled', () => {
 
   // 只保留标志还不够：会话安静下来后就不再有 screen_update，可能永远等不到下一个
   // checkpoint。transfer 结算后必须有一个显式的重试触发点。
-  it('re-arms on transfer settle rather than waiting for a checkpoint that may never come', () => {
-    const src = readFileSync(join(process.cwd(), 'src/core/worker-pool.ts'), 'utf8');
-    const fn = src.slice(
-      src.indexOf('function runPendingSuspendIfSettled'),
-      src.indexOf('export const __testOnly_runPendingSuspendIfSettled'),
-    );
-    expect(fn).toContain('deferUntilSessionTransferSettled(ds, () => runPendingSuspendIfSettled(ds, ownsGeneration))');
-    // 传的必须是纯 generation 判定：ownsLifecycleMutation 把「不在 transfer 中」
-    // 也折了进去，用它会让 transfer 期间被当成「不是我们的」而跳过重试注册。
-    expect(src).toContain('runPendingSuspendIfSettled(ds, ownsWorkerSession)');
-    expect(src).not.toContain('runPendingSuspendIfSettled(ds, ownsLifecycleMutation)');
+  it('re-arms on transfer settle rather than waiting for a checkpoint that may never come', async () => {
+    const { ds, worker } = busySession('idle');
+    // 生成号判定在 transfer 期间仍为真；transfer 结算后不会再有 screen_update。
+    worker.exitCode = 0;
+    worker.connected = true;
+    Object.assign(ds, { larkAppId: 'app-deferred-transfer', chatId: 'oc_source', scope: 'thread', hasHistory: true });
+    Object.assign(ds.session, { chatId: 'oc_source', rootMessageId: 'om_source', scope: 'thread', larkAppId: 'app-deferred-transfer' });
+    setActiveSessionsRegistry(new Map([[sessionKey('om_source', ds.larkAppId), ds]]));
+    let finishDetach!: (detached: boolean) => void;
+    const detach = vi.fn(() => new Promise<boolean>((resolve) => { finishDetach = resolve; }));
+
+    const moving = transferSession(ds.session.sessionId, 'oc_target', 'om_target', 'group', 'chat', {
+      detachWorkerImpl: detach,
+      forkWorkerImpl: vi.fn() as any,
+    });
+    await vi.waitFor(() => expect(detach).toHaveBeenCalledOnce());
+
+    runPendingSuspendIfSettled(ds, () => true);
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'suspend' });
+    expect(ds.pendingSuspendReason).toBe('manual_suspend');
+
+    finishDetach(false);
+    await moving;
+    await vi.waitFor(() => expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' }));
+    expect(ds.pendingSuspendReason).toBeUndefined();
   });
 
   // 钉住 predicate 的防御语义（defense-in-depth）：当传入的 generation 判定为假
@@ -490,5 +539,56 @@ describe('session reasoning effort changes', () => {
     expect(() => setSessionReasoningEffort(ds, 'high')).toThrow('disk full');
     expect(ds.session.reasoningEffort).toBe('ultra');
     expect(worker.send).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('model-bound topic reasoning effort preferences', () => {
+  function topic() {
+    const { ds } = busySession('idle');
+    ds.session.cliId = 'traex'; ds.session.model = 'GPT-6.1-Sol'; ds.session.reasoningEffort = 'xhigh';
+    ds.initConfig = { cliId: 'traex', backendType: 'tmux', model: 'GPT-6.1-Sol', reasoningEffort: 'xhigh' };
+    ds.activeModel = 'GPT-6.1-Sol'; ds.activeReasoningEffort = 'xhigh'; ds.workerReady = true; ds.cliReady = true;
+    return ds;
+  }
+  beforeEach(() => { __testOnly_resetRestartCoordinator(); __testOnly_resetOrdinaryImDeliveries(); });
+  it('saves a topic override without replacing the original launch preference or sending CLI input', async () => {
+    const ds = topic();
+    expect(setTopicReasoningEffort(ds, 'medium')).toBe('saved');
+    expect(ds.session.topicReasoningEffort).toEqual({ model: 'GPT-6.1-Sol', effort: 'medium' });
+    expect(ds.session.reasoningEffort).toBe('xhigh');
+    expect(ds.initConfig.reasoningEffort).toBe('xhigh');
+    expect(ds.worker.send).not.toHaveBeenCalled();
+    expect(topicReasoningControl(ds)).toMatchObject({ selected: 'medium', active: 'xhigh', pending: true });
+  });
+  it('rolls back the topic preference when persistence fails', async () => {
+    const store = await import('../src/services/session-store.js');
+    const ds = topic(); const previous = { model: 'GPT-6.1-Sol', effort: 'high' }; ds.session.topicReasoningEffort = previous;
+    vi.mocked(store.updateSession).mockImplementationOnce(() => { throw new Error('disk full'); });
+    expect(() => setTopicReasoningEffort(ds, 'medium')).toThrow('disk full');
+    expect(ds.session.topicReasoningEffort).toBe(previous);
+  });
+  it('keeps a previous model preference dormant after an in-session model change', () => {
+    const ds = topic(); expect(setTopicReasoningEffort(ds, 'medium')).toBe('saved');
+    ds.activeModel = 'DeepSeek-V4-Pro'; ds.activeReasoningEffort = 'high';
+    expect(topicReasoningControl(ds)).toMatchObject({ model: 'DeepSeek-V4-Pro', selected: 'high', pending: false });
+    expect(ds.session.topicReasoningEffort.model).toBe('GPT-6.1-Sol');
+  });
+  it('does not save while the session is working or for an unsupported level', () => {
+    const ds = topic(); ds.lastScreenStatus = 'working';
+    expect(setTopicReasoningEffort(ds, 'medium')).toBe('busy');
+    ds.lastScreenStatus = 'idle'; expect(setTopicReasoningEffort(ds, 'ultra')).toBe('invalid');
+    expect(ds.session.topicReasoningEffort).toBeUndefined();
+  });
+  it.each(['cli', 'remote', 'adopt', 'wrapper', 'auto', 'workflow'])('withholds controls for %s', kind => {
+    const ds = topic();
+    if (kind === 'cli') ds.session.cliId = ds.initConfig.cliId = 'claude-code';
+    if (kind === 'remote') ds.initConfig.backendType = 'riff';
+    if (kind === 'adopt') ds.initConfig.adoptMode = true;
+    if (kind === 'wrapper') ds.initConfig.wrapperCli = 'ttadk traex';
+    if (kind === 'auto') ds.initConfig.traexAutoModel = { enabled: true };
+    if (kind === 'workflow') ds.initConfig.workflowNodeSession = true;
+    expect(topicReasoningControl(ds)).toBeUndefined();
+    expect(setTopicReasoningEffort(ds, 'medium')).toBe('unsupported');
   });
 });

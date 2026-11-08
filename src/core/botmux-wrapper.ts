@@ -38,27 +38,17 @@ function wrapperFilename(
  * process somehow lacks SESSION_DATA_DIR (defensive; the entrypoint always sets it).
  */
 export function resolveBotmuxWrapperBinDir(env: NodeJS.ProcessEnv = process.env): string {
+  let binDir: string;
   if (env.BOTMUX_CORE_ONLY === '1' && env.SESSION_DATA_DIR) {
-    return join(env.SESSION_DATA_DIR, 'bin');
+    binDir = join(env.SESSION_DATA_DIR, 'bin');
+  } else {
+    binDir = join(env.HOME ?? env.USERPROFILE ?? homedir(), '.botmux', 'bin');
   }
-  return join(env.HOME ?? env.USERPROFILE ?? homedir(), '.botmux', 'bin');
-}
-
-/**
- * Stable daemon-updated wrapper path. Derive it from the same single source of
- * truth used by daemon.writePidFile(), including the dedicated core-only bin.
- * Canonicalize the directory so a symlinked lexical HOME still lands on the path
- * that a full bwrap session actually binds. BOTMUX_BIN_PATH is an MCP gateway
- * override, not a wrapper-write location, and therefore is intentionally ignored.
- */
-export function resolveStableBotmuxWrapperPath(
-  env: NodeJS.ProcessEnv = process.env,
-  platform: NodeJS.Platform = process.platform,
-): string {
-  const lexicalDir = resolveBotmuxWrapperBinDir(env);
-  let canonicalDir = lexicalDir;
-  try { canonicalDir = realpathSync(lexicalDir); } catch { /* wrapper dir not materialized yet */ }
-  return join(canonicalDir, wrapperFilename(BOTMUX_WRAPPER_BASENAME, platform));
+  try {
+    return realpathSync(binDir);
+  } catch {
+    return binDir;
+  }
 }
 
 export function resolveNativeSubagentRuntimeHookWrapperPath(

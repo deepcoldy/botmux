@@ -11,14 +11,20 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  GROUP_CONTEXT_SETTINGS_FILE_ENV,
   getGroupContextSettings,
   setGroupContextSettings,
 } from '../src/services/group-context-settings-store.js';
+import { createDurableConfigCoordinator } from '../src/services/durable-config-coordinator.js';
+import { setDurableConfigCoordinator } from '../src/services/durable-config-mutation.js';
+import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-coordination.js';
 import { logger } from '../src/utils/logger.js';
 
 const roots: string[] = [];
 
 afterEach(() => {
+  setDurableConfigCoordinator(undefined);
+  vi.unstubAllEnvs();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -84,6 +90,66 @@ describe('group context settings store', () => {
     vi.resetModules();
     const fresh = await import('../src/services/group-context-settings-store.js');
     expect(fresh.getGroupContextSettings('app_three', 'oc_group', dir).enabled).toBe(true);
+  });
+
+  it('uses an explicitly configured shared canonical file across data directories', async () => {
+    const firstDir = dataDir();
+    const secondDir = dataDir();
+    const sharedDir = dataDir();
+    const sharedPath = join(sharedDir, 'canonical-group-context.json');
+    vi.stubEnv(GROUP_CONTEXT_SETTINGS_FILE_ENV, sharedPath);
+
+    await setGroupContextSettings('oc_group', { enabled: true }, firstDir);
+
+    expect(getGroupContextSettings('app_two', 'oc_group', secondDir).enabled).toBe(true);
+    expect(JSON.parse(readFileSync(sharedPath, 'utf8')).configs.oc_group.enabled).toBe(true);
+  });
+
+  it('requires the durable coordinator for primary shared-setting writes', async () => {
+    const dir = dataDir();
+    vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+    vi.stubEnv(GROUP_CONTEXT_SETTINGS_FILE_ENV, join(dir, 'canonical-group-context.json'));
+
+    await expect(setGroupContextSettings('oc_group', { enabled: true }, dir))
+      .rejects.toThrow('durable_config_coordinator_unavailable');
+  });
+
+  it('fails closed when primary mode has no shared canonical path', async () => {
+    const dir = dataDir();
+    vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+    expect(getGroupContextSettings('app_one', 'oc_group', dir).enabled).toBe(false);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(`${GROUP_CONTEXT_SETTINGS_FILE_ENV} is required`));
+    await expect(setGroupContextSettings('oc_group', { enabled: true }, dir))
+      .rejects.toThrow(`${GROUP_CONTEXT_SETTINGS_FILE_ENV} is required`);
+    warn.mockRestore();
+  });
+
+  it('records primary shared-setting writes in a separate durable CAS scope', async () => {
+    const dir = dataDir();
+    const path = join(dir, 'canonical-group-context.json');
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'));
+    const coordinator = createDurableConfigCoordinator({ store, ownerId: 'group-context-test' });
+    vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+    vi.stubEnv(GROUP_CONTEXT_SETTINGS_FILE_ENV, path);
+    setDurableConfigCoordinator(coordinator);
+
+    await setGroupContextSettings('oc_group', { enabled: true }, dir);
+
+    expect(getGroupContextSettings('app_two', 'oc_group', dir).enabled).toBe(true);
+    expect(await store.readAuxiliaryState('auxiliary::config-cas::group-context'))
+      .toMatchObject({
+        revision: 2,
+        value: {
+          phase: 'committed',
+          audit: [expect.objectContaining({
+            changedPaths: ['configs.oc_group.enabled', 'configs.oc_group.maxContextChars',
+              'configs.oc_group.maxMessages', 'configs.oc_group.retentionDays'],
+          })],
+        },
+      });
+    await store.close();
   });
 
   it('accepts each inclusive numeric boundary', async () => {

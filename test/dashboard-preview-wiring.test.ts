@@ -4,43 +4,28 @@ import { describe, expect, it } from 'vitest';
 const dashboardSource = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
 
 describe('central dashboard preview wiring', () => {
-  it('mounts the shared HTTP/WS proxy and reuses positive owner resolution', () => {
-    expect(dashboardSource).toContain('createSessionPreviewProxy({');
-    expect(dashboardSource).toContain('resolve: resolveDashboardSessionPreview');
-    expect(dashboardSource).toContain('await sessionPreviewProxy.handleHttp(req, res, url)');
-    expect(dashboardSource).toContain('sessionPreviewProxy.handleUpgrade(req, clientSocket, head)');
-  });
-
-  // 行为证据在 session-preview-ownership / -lifecycle / -close 三个套件里；这里只钉
-  // 「中央 Dashboard 确实把生产依赖接到了那些函数上」这一件源码事实。
-  it('re-checks listener ownership on every hop and tears the session down when it changes', () => {
-    expect(dashboardSource).toContain('resolveSessionPreviewForProxy({');
-    expect(dashboardSource).toContain('isTargetOwned: target => sessionPreviewTargetStillOwned(target)');
-    expect(dashboardSource).toContain('invalidateStalePreviewTarget(staleSessionId, owner, staleTarget)');
+  // 源码结构护栏(K2)：预览代理把本机 dev server 端口暴露到已登录的同源路由上；端口号会被内核
+  // 回收给下一个本机进程（P1-12），握手到登记之间还有最长 45s 的窗口（P1-1/P1-4）。判定逻辑的
+  // 行为证据在 session-preview-ownership / -lifecycle / -close / -proxy 套件里，但中央 dashboard.ts
+  // 是带模块副作用的巨型闭包、没有行为 seam：把 isTargetOwned 写成 `() => true`、去掉 onStaleTarget
+  // 或 bindStream 的登记前复核，类型检查照样通过，却会静默开洞。这里只钉这几处接线存在且先于登记。
+  it('re-checks port ownership on every hop and re-validates identity and target before registering a stream', () => {
+    // 每一跳都走同一个带 owner 复核的解析入口
+    expect(dashboardSource).toMatch(/createSessionPreviewProxy\(\{[\s\S]*?resolve:\s*resolveDashboardSessionPreview\b/);
+    expect(dashboardSource).toMatch(/isTargetOwned:\s*\w+\s*=>\s*sessionPreviewTargetStillOwned\(/);
+    expect(dashboardSource).toMatch(/onStaleTarget:[\s\S]{0,120}?invalidateStalePreviewTarget\(/);
+    // 失效收口：断掉既有预览流 + 收回交互租约；daemon 生命周期事件也触发同一收口
     expect(dashboardSource).toContain('authSessionConnections.closeSessionStreams(sessionId)');
     expect(dashboardSource).toContain('previewInteraction.relockSession(sessionId)');
-    expect(dashboardSource).toContain('authSessionConnections.register(authSessionId, close, ctx.sessionId)');
-  });
-
-  // P1-1：行为证据在 session-preview（指纹与事件收口判据）与 session-preview-proxy
-  // （握手期换靶必须拒）两个套件里；这里只钉「中央 Dashboard 真的把这两件事接上了」。
-  it('re-checks the dialed target before registering a stream and converges SSE replays by fingerprint', () => {
-    expect(dashboardSource).toContain('const current = resolveDashboardSessionPreview(ctx.sessionId);');
-    expect(dashboardSource).toContain('if (!current.ok || !sameSessionPreviewTarget(current.target, ctx.target)) return false;');
-    expect(dashboardSource).toContain('previewTeardownForDaemonEvent(ev, lastSeenPreviewFingerprints)');
-    // 收口只走这一条判据：不能再有绕过指纹记忆的无条件 teardown 分支。
-    expect(dashboardSource).not.toContain('teardownSessionPreview(ev.body.sessionId)');
-  });
-
-  // P1-3：失效清理是「作废我判定失效的那一个」，不是「清空当前值」——在途 DELETE 不
-  // 得误删这段窗口里刚注册的新目标。行为证据在 ipc-preview-route 套件里。
-  it('names the stale registration in the invalidation DELETE instead of clearing unconditionally', () => {
-    expect(dashboardSource).toContain('?expectedRegisteredAt=${encodeURIComponent(staleTarget.registeredAt)}');
-  });
-
-  it('projects internal targets out of both REST snapshots and SSE events', () => {
-    expect(dashboardSource).toContain('projectSessionPreviewsForBrowser(sessions)');
-    expect(dashboardSource).toContain('projectSessionPreviewEventForBrowser(ev.type, ev.body)');
-    expect(dashboardSource).toContain("url.pathname.match(/^\\/api\\/sessions\\/([^/]+)\\/preview$/)");
+    expect(dashboardSource).toMatch(/previewTeardownForDaemonEvent\([\s\S]{0,120}?teardownSessionPreview\(/);
+    // bindStream：身份存活与目标指纹复核都必须先于登记
+    const bindStart = dashboardSource.indexOf('bindStream:');
+    expect(bindStart).toBeGreaterThan(-1);
+    const registerAt = dashboardSource.indexOf('authSessionConnections.register(', bindStart);
+    expect(registerAt).toBeGreaterThan(bindStart);
+    const beforeRegister = dashboardSource.slice(bindStart, registerAt);
+    expect(beforeRegister).toContain('terminalAuthSessionLive(');
+    expect(beforeRegister).toContain('resolveDashboardSessionPreview(');
+    expect(beforeRegister).toContain('sameSessionPreviewTarget(');
   });
 });

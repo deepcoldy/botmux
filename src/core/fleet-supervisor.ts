@@ -12,8 +12,11 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
-import { openSync, closeSync, mkdirSync } from 'node:fs';
+import { feedbackMaintenanceActive } from '../services/feedback-maintenance.js';
+import { resolveBotmuxDataDir } from './data-dir.js';
+import { closeSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { openRotatedAppendLog } from '../utils/log-rotate.js';
 import { isStandaloneBinary, resolveEntrySpawn, type BotmuxEntry } from './self-spawn.js';
 import { scrubExternalMemberEnv } from '../utils/child-env.js';
 import { readDurableProcessIdentity } from '../utils/process-identity.js';
@@ -429,6 +432,16 @@ export class FleetSupervisor {
   private spawnBot(spec: FleetBotSpec, isRestart: boolean): void {
     if (this.stopping) return;
     const entry = spec.entry ?? 'daemon';
+    if (!spec.external && entry === 'daemon' && feedbackMaintenanceActive(resolveBotmuxDataDir({ env: this.opts.daemonEnv }))) {
+      this.log(`feedback maintenance: deferred ${spec.name}`);
+      const timer = setTimeout(() => {
+        this.restartTimers.delete(spec.name);
+        this.spawnBot(spec, isRestart);
+      }, 1000);
+      timer.unref();
+      this.restartTimers.set(spec.name, timer);
+      return;
+    }
     // An external member (a plugin service) runs an arbitrary command instead of
     // one of our entry modules. Everything BELOW this point — logs, state,
     // restart budget, graceful stop — is shared verbatim; only the command and
@@ -457,8 +470,9 @@ export class FleetSupervisor {
     if (this.opts.logDir) {
       try {
         mkdirSync(this.opts.logDir, { recursive: true });
-        outFd = openSync(join(this.opts.logDir, `${logBase}-out.log`), 'a');
-        errFd = openSync(join(this.opts.logDir, `${logBase}-err.log`), 'a');
+        // 打开前按大小轮转（默认 20MiB，保留 1 份 .1），防止单一日志无限增长吃满磁盘。
+        outFd = openRotatedAppendLog(join(this.opts.logDir, `${logBase}-out.log`));
+        errFd = openRotatedAppendLog(join(this.opts.logDir, `${logBase}-err.log`));
         stdio = ['ignore', outFd, errFd];
       } catch (err) {
         this.log(`${spec.name} log file open failed, inheriting stdio: ${err instanceof Error ? err.message : err}`);

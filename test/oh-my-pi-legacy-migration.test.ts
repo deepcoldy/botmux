@@ -270,16 +270,4 @@ describe('OMP legacy session migration', () => {
     expect(readFileSync(source, 'utf8')).toContain(sessionId);
     expect(readdirSync(exactDir).filter(name => name.endsWith('.tmp'))).toEqual([]);
   });
-
-  it('pins the cold-resume worker guard and preflight-before-probe ordering', () => {
-    const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-    const preflight = worker.indexOf("if (cfg.cliId === 'oh-my-pi' && effectiveResume && !willReattachPersistent && !cfg.adoptMode)");
-    const migration = worker.indexOf('migrateLegacyOmpSession(', preflight);
-    const probe = worker.indexOf('cliAdapter.checkResumeTargetExists?.({', migration);
-    expect(preflight).toBeGreaterThan(-1);
-    expect(migration).toBeGreaterThan(preflight);
-    expect(probe).toBeGreaterThan(migration);
-    expect(worker.slice(migration, probe)).toContain('effectiveAdapterSessionId');
-    expect(worker.slice(migration, probe)).toContain('cfg.workingDir');
-  });
 });

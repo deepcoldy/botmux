@@ -15,7 +15,10 @@ import { collectPluginCliCommands } from '../src/core/plugins/runtime.js';
 import { dematerializePlugin, materializePlugin } from '../src/core/plugins/materializer.js';
 import { resolvePluginSkillPackages } from '../src/core/plugins/skills.js';
 import { readSkillRegistry } from '../src/services/skill-registry-store.js';
-import { readPluginMcpDescriptor } from '../src/core/plugins/mcp/private-store.js';
+import {
+  publicPluginMcpContribution,
+  readPluginMcpDescriptor,
+} from '../src/core/plugins/mcp/private-store.js';
 
 describe('plugin manifest and registry basics', () => {
   let home: string;
@@ -217,6 +220,123 @@ describe('plugin manifest and registry basics', () => {
     )).toThrow(/unsupported_plugin_mcp_runtime_template/);
   });
 
+  it('accepts opaque protected capabilities only for local stdio MCP servers', () => {
+    const makeSource = (name: string, descriptor: Record<string, unknown>) => {
+      const root = join(home, name);
+      mkdirSync(join(root, 'mcp'), { recursive: true });
+      writeFileSync(join(root, 'mcp', 'server.js'), 'process.stdin.resume();\n');
+      writeFileSync(join(root, 'mcp', 'index.json'), JSON.stringify({
+        command: ['node', './mcp/server.js'],
+        ...descriptor,
+      }));
+      return root;
+    };
+
+    expect(scanPluginContributions(
+      makeSource('fixture-protected-secret', { protectedCapability: 'fixture.secret.v1' }),
+      { schemaVersion: 1, id: 'fixture-plugin' },
+    ).mcp).toMatchObject({ protectedCapability: 'fixture.secret.v1' });
+    expect(() => scanPluginContributions(
+      makeSource('invalid-protected-secret', { protectedCapability: '../escape' }),
+      { schemaVersion: 1, id: 'fixture-plugin' },
+    )).toThrow(/invalid_plugin_mcp_protected_capability/);
+    expect(() => scanPluginContributions(
+      makeSource('protected-fd-env', { env: { BOTMUX_PROTECTED_SECRET_FD: '9' } }),
+      { schemaVersion: 1, id: 'fixture-plugin' },
+    )).toThrow(/reserved_plugin_mcp_env:BOTMUX_PROTECTED_SECRET_FD/);
+
+    const httpRoot = join(home, 'http-protected-secret');
+    mkdirSync(join(httpRoot, 'mcp'), { recursive: true });
+    writeFileSync(join(httpRoot, 'mcp', 'index.json'), JSON.stringify({
+      transport: 'streamable-http',
+      url: 'https://mcp.example.test/api',
+      protectedCapability: 'fixture.secret.v1',
+    }));
+    expect(() => scanPluginContributions(
+      httpRoot,
+      { schemaVersion: 1, id: 'fixture-plugin' },
+    )).toThrow(/protected_capability_requires_stdio/);
+  });
+
+  it('accepts validated protected egress policies only for local stdio MCP servers', () => {
+    const valid = {
+      id: 'fixture.write.v1',
+      targets: [{
+        scheme: 'https',
+        host: 'fixture.internal.example',
+        port: 443,
+        denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
+      }],
+    };
+    const makeSource = (name: string, descriptor: Record<string, unknown>) => {
+      const root = join(home, name);
+      mkdirSync(join(root, 'mcp'), { recursive: true });
+      writeFileSync(join(root, 'mcp', 'server.js'), 'process.stdin.resume();\n');
+      writeFileSync(join(root, 'mcp', 'index.json'), JSON.stringify({
+        transport: 'stdio',
+        command: ['node', './mcp/server.js'],
+        ...descriptor,
+      }));
+      return root;
+    };
+
+    expect(scanPluginContributions(
+      makeSource('fixture-protected-egress', { protectedEgressPolicy: valid }),
+      { schemaVersion: 1, id: 'fixture-plugin' },
+    ).mcp).toMatchObject({ protectedEgressPolicy: valid });
+
+    for (const [name, invalid] of [
+      ['invalid-id', { ...valid, id: '../escape' }],
+      ['invalid-scheme', { ...valid, targets: [{ ...valid.targets[0], scheme: 'http' }] }],
+      ['invalid-host', { ...valid, targets: [{ ...valid.targets[0], host: '*.example.com' }] }],
+      ['invalid-route', { ...valid, targets: [{ ...valid.targets[0], denyRoutes: [{ methods: ['POST'], path: 'relative' }] }] }],
+    ] as const) {
+      expect(() => scanPluginContributions(
+        makeSource(`fixture-protected-egress-${name}`, { protectedEgressPolicy: invalid }),
+        { schemaVersion: 1, id: 'fixture-plugin' },
+      )).toThrow(/invalid_plugin_mcp_protected_egress_policy/);
+    }
+
+    const httpRoot = join(home, 'http-protected-egress');
+    mkdirSync(join(httpRoot, 'mcp'), { recursive: true });
+    writeFileSync(join(httpRoot, 'mcp', 'index.json'), JSON.stringify({
+      transport: 'streamable-http',
+      url: 'https://mcp.example.test/api',
+      protectedEgressPolicy: valid,
+    }));
+    expect(() => scanPluginContributions(
+      httpRoot,
+      { schemaVersion: 1, id: 'fixture-plugin' },
+    )).toThrow(/protected_egress_policy_requires_stdio/);
+  });
+
+  it('scans Lark slash command declarations and rejects reserved names', () => {
+    const makeSource = (name: string, commands: unknown[]) => {
+      const root = join(home, name);
+      mkdirSync(join(root, 'commands'), { recursive: true });
+      mkdirSync(join(root, 'service'), { recursive: true });
+      writeFileSync(join(root, 'service', 'index.js'), 'export default {};\n');
+      writeFileSync(join(root, 'commands', 'index.json'), JSON.stringify({
+        schemaVersion: 1, endpoint: '/botmux/commands/v1', commands,
+      }));
+      return root;
+    };
+    const manifest = (id: string) => ({ schemaVersion: 1 as const, id, service: { mode: 'auto' as const } });
+
+    expect(scanPluginContributions(
+      makeSource('cmd-ok', [{ name: '/work-bind', description: '绑定工作项' }]),
+      manifest('cmd-ok'),
+    )?.commands).toEqual({
+      schemaVersion: 1,
+      endpoint: '/botmux/commands/v1',
+      commands: [{ name: '/work-bind', description: '绑定工作项' }],
+    });
+    for (const reserved of ['/close', '/disconnect', '/effort', '/t', '/compact', '/grant']) {
+      expect(() => scanPluginContributions(makeSource(`cmd-${reserved.slice(1)}`, [{ name: reserved }]), manifest('cmd-x')))
+        .toThrow(`plugin_command_reserved:${reserved}`);
+    }
+  });
+
   it('scans Streamable HTTP MCP declarations without a local command', () => {
     const root = join(home, 'http-mcp');
     mkdirSync(join(root, 'mcp'), { recursive: true });
@@ -260,9 +380,19 @@ describe('plugin manifest and registry basics', () => {
       botmux: { schemaVersion: 1, id: 'private-mcp' },
     }));
     writeFileSync(join(source, 'dist', 'mcp', 'server.mjs'), 'process.stdin.resume();\n');
+    const protectedEgressPolicy = {
+      id: 'fixture.write.v1',
+      targets: [{
+        scheme: 'https',
+        host: 'fixture.internal.example',
+        port: 443,
+        denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
+      }],
+    };
     writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
       command: ['node', './mcp/server.mjs'],
       env: { PRIVATE_MCP_TOKEN: 'secret-value-never-in-registry' },
+      protectedEgressPolicy,
     }));
 
     const installed = installLocalPlugin(source);
@@ -274,6 +404,19 @@ describe('plugin manifest and registry basics', () => {
     });
     expect(JSON.stringify(persisted)).not.toContain('secret-value-never-in-registry');
     expect(JSON.stringify(persisted)).not.toContain('./mcp/server.mjs');
+    expect(JSON.stringify(persisted)).not.toContain('fixture.internal.example');
+    expect(JSON.stringify(persisted)).not.toContain('/v1/items/update');
+
+    expect(publicPluginMcpContribution({
+      name: 'private-mcp',
+      transport: 'stdio',
+      command: ['node', './mcp/server.mjs'],
+      protectedEgressPolicy,
+    })).toEqual({
+      name: 'private-mcp',
+      transport: 'stdio',
+      privateRef: 'private/mcp.json',
+    });
 
     const privatePath = pluginMcpPrivatePath('private-mcp');
     expect(lstatSync(privatePath).mode & 0o777).toBe(0o600);
@@ -281,6 +424,7 @@ describe('plugin manifest and registry basics', () => {
       name: 'private-mcp',
       command: ['node', './mcp/server.mjs'],
       env: { PRIVATE_MCP_TOKEN: 'secret-value-never-in-registry' },
+      protectedEgressPolicy,
     });
   });
 
@@ -390,6 +534,49 @@ describe('plugin manifest and registry basics', () => {
       /plugin_mcp_registry_migration_failed:invalid_plugin_mcp_contribution:legacy-malformed/,
     );
     expect(readFileSync(pluginRegistryPath(), 'utf8')).toBe(legacyRegistry);
+    expect(existsSync(pluginMcpPrivatePath(id))).toBe(false);
+  });
+
+  it('rejects a protected egress policy leaked into public MCP metadata', () => {
+    const now = new Date().toISOString();
+    const id = 'leaked-egress-policy';
+    const leakedRegistry = JSON.stringify({
+      schemaVersion: 1,
+      plugins: {
+        [id]: {
+          id,
+          packageName: `@botmux-ai/plugin-${id}`,
+          version: '0.1.0',
+          source: { type: 'npm', spec: `@botmux-ai/plugin-${id}` },
+          manifest: { schemaVersion: 1, id },
+          contributions: {
+            mcp: {
+              name: id,
+              transport: 'stdio',
+              privateRef: 'private/mcp.json',
+              protectedEgressPolicy: {
+                id: 'fixture.write.v1',
+                targets: [{
+                  scheme: 'https',
+                  host: 'fixture.internal.example',
+                  port: 443,
+                  denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
+                }],
+              },
+            },
+          },
+          installedAt: now,
+          updatedAt: now,
+        },
+      },
+    });
+    mkdirSync(dirname(pluginRegistryPath()), { recursive: true });
+    writeFileSync(pluginRegistryPath(), leakedRegistry);
+
+    expect(() => readPluginRegistry()).toThrow(
+      /plugin_mcp_registry_migration_failed:invalid_plugin_mcp_contribution:leaked-egress-policy/,
+    );
+    expect(readFileSync(pluginRegistryPath(), 'utf8')).toBe(leakedRegistry);
     expect(existsSync(pluginMcpPrivatePath(id))).toBe(false);
   });
 

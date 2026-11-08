@@ -12,6 +12,7 @@ import {
 import { accessForPath, buildFsPolicy, type FsPolicyContext } from '../src/adapters/cli/fs-policy.js';
 import { resolve } from 'node:path';
 import type { InstalledPluginRecord } from '../src/core/plugins/types.js';
+import { spawnSyncTsScript } from './helpers/ts-runner.js';
 
 /**
  * A sandboxed bot gets `~/.botmux/plugins-registry.json` read-only and nothing
@@ -241,34 +242,51 @@ describe('fs-policy exposes the plugin registry read-only', () => {
  * deliberately keeps denied (it can hold voice credentials). `readGlobalConfig()`
  * swallows EPERM and returns {}, so a naive listing would print every plugin
  * WITHOUT the `enabled` flag — asserting "not enabled" from an unread file. The
- * listing must say "unknown" instead.
- *
- * Source-lock (cli.ts's plugin branch is not separately importable): pinned by
- * SEMANTICS, not by identifier spelling, so a correct refactor stays green.
+ * listing must say "unknown" instead. Exercised through the real
+ * `botmux plugin list` CLI against a temp HOME.
  */
 describe('plugin list distinguishes "not enabled" from "could not read the enabled set"', () => {
-  const cliSource = readFileSync(resolve('src/cli.ts'), 'utf-8');
+  let home: string;
 
-  it('classifies ANY unreadable global config as unknown, not just the deny errnos', () => {
-    const fn = cliSource.slice(cliSource.indexOf('function readEnabledPluginIdsOrUnknown'));
-    const body = fn.slice(0, fn.indexOf('\n}\n') + 2);
-    // Reads the global config path, not some other file.
-    expect(body).toMatch(/readFileSync\(globalConfigPath\(\)/);
-    // Every read failure is "unknown". Keying on the errno is the bug: seatbelt
-    // denies the read (EPERM) while bwrap never binds the file in (ENOENT), so an
-    // errno filter works on macOS and silently does nothing on Linux.
-    expect(body).toMatch(/catch\s*\{\s*return undefined;?\s*\}/);
-    expect(body).not.toMatch(/EPERM|EACCES|ENOENT|\.code/);
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-plugin-list-'));
+    vi.stubEnv('HOME', home);
+    upsertInstalledPlugin(record('data-mcp'));
   });
 
-  it('the listing consumes the classifier and surfaces the unknown state', () => {
-    const listBranch = cliSource.slice(cliSource.indexOf("if (sub === 'list' || sub === 'ls')"));
-    const body = listBranch.slice(0, listBranch.indexOf('\n  if (sub ==='));
-    // No direct readGlobalConfig() in the listing — that is the call that cannot
-    // tell denied from empty.
-    expect(body).not.toMatch(/readGlobalConfig\(\)/);
-    // The unknown state must be visible in the output, not silently dropped.
-    expect(body).toContain('enabled?');
-    expect(body).toMatch(/undefined/);
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(home, { recursive: true, force: true });
   });
+
+  const pluginList = (globalConfigFile: string) => {
+    const result = spawnSyncTsScript(resolve('src/cli.ts'), ['plugin', 'list'], {
+      env: { PATH: process.env.PATH, HOME: home, BOTMUX_GLOBAL_CONFIG_FILE: globalConfigFile },
+      encoding: 'utf8',
+      timeout: 60_000,
+    });
+    expect(result.status, String(result.stderr)).toBe(0);
+    return String(result.stdout);
+  };
+
+  it('reports the enabled set it could read', () => {
+    const configFile = join(home, 'global-config.json');
+    writeFileSync(configFile, JSON.stringify({ plugins: ['data-mcp'] }));
+    const out = pluginList(configFile);
+    expect(out).toMatch(/^data-mcp\t\S+\tenabled$/m);
+    expect(out).not.toContain('enabled?');
+  });
+
+  it('marks every plugin unknown when the global config cannot be read, whatever the errno', () => {
+    // seatbelt denies the read (EPERM) while bwrap never binds the file in
+    // (ENOENT); an errno filter works on one and silently lies on the other.
+    // A directory in place of the file (EISDIR) stands in for "any other errno"
+    // and, unlike chmod, still fails when the suite runs as root.
+    const unreadable = join(home, 'config-is-a-directory');
+    mkdirSync(unreadable);
+    for (const configFile of [unreadable, join(home, 'not-bound-into-sandbox.json')]) {
+      const out = pluginList(configFile);
+      expect(out).toMatch(/^data-mcp\t\S+\tenabled\?$/m);
+    }
+  }, 120_000);
 });

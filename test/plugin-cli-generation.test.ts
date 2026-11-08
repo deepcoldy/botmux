@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { CliAdapter } from '../src/adapters/cli/types.js';
@@ -12,7 +12,9 @@ import {
 } from '../src/core/plugins/mcp/session-runtime.js';
 import { pluginMcpPrivatePath } from '../src/core/plugins/paths.js';
 import { readSessionPluginManifest } from '../src/core/plugins/session-manifest.js';
-import { readSessionSkillManifest } from '../src/core/skills/manifest-store.js';
+import { readSessionSkillManifest, sessionSkillManifestPath } from '../src/core/skills/manifest-store.js';
+import { installLocalSkill } from '../src/services/skill-registry-store.js';
+import { accessForPath, buildFsPolicy } from '../src/adapters/cli/fs-policy.js';
 
 function write(file: string, content: string): void {
   mkdirSync(dirname(file), { recursive: true });
@@ -67,6 +69,33 @@ describe('CLI plugin generation', () => {
     expect(existsSync(user)).toBe(true);
   });
 
+  it('suppresses an unchanged delivered Auto catalog while still refreshing snapshots and publishing removals', () => {
+    const source = join(home, 'skill-src', 'demo');
+    write(join(source, 'SKILL.md'), '---\nname: demo\ndescription: A demo\n---\n# Demo');
+    installLocalSkill(source, { link: false });
+    const opts = { sessionId: 'auto-catalog', bot: { larkAppId: 'app', skills: { include: ['skill:demo'] } },
+      dataDir, cliId: 'traex' as const, adapter: { id: 'traex' } as CliAdapter,
+      workingDir: join(home, 'proj'), prompt: 'first', replacesPriorGeneration: false };
+    const first = prepareCliPluginGeneration(opts);
+    expect(first.prompt).toContain('botmux_skills');
+    const same = prepareCliPluginGeneration({ ...opts, prompt: '', replacesPriorGeneration: true,
+      previousSkillCatalogFingerprint: first.skillCatalogFingerprint });
+    expect(same.prompt).toBe('');
+    expect(same.skillCatalog).toBeUndefined();
+    expect(same.deferredSkillCatalog).toBeUndefined();
+    expect(same.skillReadonlyRoots?.length).toBeGreaterThan(0);
+    expect(readSessionSkillManifest('auto-catalog')?.prioritySkills.map(skill => skill.name)).toEqual(['demo']);
+    const unchangedRealTurn = prepareCliPluginGeneration({ ...opts, prompt: 'next ask', replacesPriorGeneration: true,
+      previousSkillCatalogFingerprint: first.skillCatalogFingerprint });
+    expect(unchangedRealTurn.prompt).toBe('next ask');
+    const removed = prepareCliPluginGeneration({ ...opts, bot: { larkAppId: 'app' }, prompt: '',
+      replacesPriorGeneration: true, previousSkillCatalogFingerprint: first.skillCatalogFingerprint });
+    expect(removed.deferredSkillCatalog).toContain('Skills not listed here are no longer available');
+    expect(removed.skillCatalogFingerprint).not.toBe(first.skillCatalogFingerprint);
+    const ordinary = prepareCliPluginGeneration({ ...opts, prompt: '', replacesPriorGeneration: true });
+    expect(ordinary.deferredSkillCatalog).toContain('<botmux_skills_refresh>');
+  });
+
   it('replaces Skills and MCP plugin bindings when the same session starts a new CLI process', () => {
     const source = join(home, 'demo-source');
     write(join(source, 'package.json'), JSON.stringify({
@@ -90,9 +119,30 @@ describe('CLI plugin generation', () => {
     installLocalPlugin(source);
     const adapter = { id: 'codex' } as CliAdapter;
 
+    expect(() => prepareCliPluginGeneration({
+      sessionId: 'timeout-ceiling',
+      bot: { larkAppId: 'app', plugins: ['demo'], pluginRuntime: { demo: { toolTimeoutMs: 120_000 } } },
+      global: { plugins: [], mcpGatewayMaxToolTimeoutMs: 60_000 },
+      dataDir,
+      cliId: 'codex',
+      adapter,
+      workingDir: '/repo',
+      prompt: 'test',
+      replacesPriorGeneration: false,
+    })).toThrow('plugin_mcp_tool_timeout_exceeds_max:demo:120000:60000');
+
     const first = prepareCliPluginGeneration({
       sessionId: 'same-session',
-      bot: { larkAppId: 'app-1', plugins: ['demo'] },
+      bot: {
+        larkAppId: 'app-1',
+        plugins: ['demo'],
+        pluginRuntime: {
+          demo: {
+            env: { DEMO_PROFILE: 'test', DEMO_SOCKET: '/tmp/demo.sock' },
+            toolTimeoutMs: 120_000,
+          },
+        },
+      },
       global: { plugins: [] },
       dataDir,
       cliId: 'codex',
@@ -112,7 +162,12 @@ describe('CLI plugin generation', () => {
       pluginIds: ['demo'],
       entries: [{
         pluginId: 'demo',
-        server: { transport: 'stdio', command: ['./mcp/server.mjs'] },
+        toolTimeoutMs: 120_000,
+        server: {
+          transport: 'stdio',
+          command: ['./mcp/server.mjs'],
+          env: { DEMO_PROFILE: 'test', DEMO_SOCKET: '/tmp/demo.sock' },
+        },
       }],
     });
     if (!firstMcpRuntime) throw new Error('expected session MCP runtime manifest');
@@ -151,5 +206,117 @@ describe('CLI plugin generation', () => {
     expect(sessionMcpRuntimeHostOnlyPaths(refreshedMcpRuntime, dataDir)).toEqual([
       sessionMcpRuntimeManifestPath('same-session', dataDir),
     ]);
+  });
+  it('hands the sandbox only this session\'s snapshot of exactly the enabled skills', () => {
+    // Two installed skills; the bot enables one. Under sandbox=true the worker
+    // feeds skillReadonlyRoots into fs-policy's sessionOwnedReadonlyRoots: it
+    // must be the session's own snapshot root — never the store or a skill dir.
+    const src = join(home, 'skill-src');
+    for (const name of ['deploy', 'payroll']) {
+      write(join(src, name, 'SKILL.md'), `---\nname: ${name}\ndescription: ${name} skill\n---\n# ${name}`);
+      installLocalSkill(join(src, name), { link: false });
+    }
+    for (const [cliId, adapter] of [
+      ['codex', { id: 'codex' } as CliAdapter],
+      ['claude-code', { id: 'claude-code', skillDelivery: { nativeKind: 'claude-plugin' } } as CliAdapter],
+    ] as const) {
+      const result = prepareCliPluginGeneration({
+        sessionId: 'roots',
+        bot: { larkAppId: 'app-1', skills: { include: ['skill:deploy'] } },
+        global: { plugins: [] },
+        dataDir,
+        cliId,
+        adapter,
+        workingDir: join(home, 'proj'),
+        prompt: 'task',
+        replacesPriorGeneration: false,
+      });
+      const snapshot = realpathSync(join(dataDir, 'runtime-skills', 'roots', 'snapshot'));
+      const storeRoot = realpathSync(join(home, '.botmux', 'skills', 'store'));
+      expect(result.skillReadonlyRoots).toContain(snapshot);
+      for (const forbidden of [storeRoot, join(storeRoot, 'deploy'), join(storeRoot, 'payroll')]) {
+        expect(result.skillReadonlyRoots).not.toContain(forbidden);
+      }
+      expect(readdirSync(snapshot)).toEqual(['deploy']);
+      const manifest = readSessionSkillManifest('roots');
+      expect(manifest?.prioritySkills.map(skill => [skill.name, skill.rootDir, skill.snapshotOf]))
+        .toEqual([['deploy', join(snapshot, 'deploy'), join(storeRoot, 'deploy')]]);
+      expect(existsSync(sessionSkillManifestPath('roots', dataDir))).toBe(true);
+    }
+    // workingDir = ~ (the default when a bot configures none) contains the
+    // store, but it is no credential location: the store skill still snapshots.
+    const wide = prepareCliPluginGeneration({
+      sessionId: 'wide', bot: { larkAppId: 'app-1', skills: { include: ['skill:deploy'] } },
+      global: { plugins: [] }, dataDir, cliId: 'codex', adapter: { id: 'codex' } as CliAdapter,
+      workingDir: home, prompt: 'task', replacesPriorGeneration: false,
+    });
+    const wideSnapshot = realpathSync(join(dataDir, 'runtime-skills', 'wide', 'snapshot'));
+    expect(wide.skillReadonlyRoots).toEqual([wideSnapshot]);
+    expect(readdirSync(wideSnapshot)).toEqual(['deploy']);
+    expect(readSessionSkillManifest('wide')?.diagnostics).toEqual([]);
+    expect(wide.diagnostics.join('\n')).not.toContain('skill_snapshot');
+  });
+
+  it('review repros: only the store skill is snapshotted — linked skills (sibling bot home, host ~/.claude, aliased ~/.ssh, working-dir link) are never copied and no credential is in reach (generation → fs-policy)', () => {
+    const realHome = realpathSync(home);
+    const botmux = join(realHome, '.botmux');
+    const sibling = join(botmux, 'bots', 'cli_sibling');
+    write(join(sibling, 'send-cred.json'), '{"appSecret":"SIBLING-SECRET"}');
+    write(join(sibling, 'SKILL.md'), '---\nname: sibhome\n---\n# planted in the sibling home');
+    write(join(realHome, '.claude', '.credentials.json'), '{"token":"HOST-CLAUDE-SECRET"}');
+    write(join(realHome, '.claude', 'SKILL.md'), '---\nname: hostclaude\n---\n# root');
+    write(join(realHome, 'proj', '.shared', 'wd', 'SKILL.md'), '---\nname: wdlink\n---\n# agent-writable');
+    write(join(realHome, 'skill-src', 'deploy', 'SKILL.md'), '---\nname: deploy\n---\n# Deploy');
+    installLocalSkill(join(realHome, 'skill-src', 'deploy'), { link: false });
+    // The alias target lives OUTSIDE home, like a real `~/.ssh -> /vault/ssh`.
+    const vault = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-vault-')));
+    try {
+      write(join(vault, 'ssh', 'id_rsa'), 'PRIVATE-KEY-SECRET');
+      write(join(vault, 'ssh', 'SKILL.md'), '---\nname: vaultssh\n---\n# planted');
+      symlinkSync(join(vault, 'ssh'), join(realHome, '.ssh'));
+      for (const dir of [sibling, join(realHome, '.claude'), join(vault, 'ssh'), join(realHome, 'proj', '.shared', 'wd')]) {
+        installLocalSkill(dir, { link: true });
+      }
+      const result = prepareCliPluginGeneration({
+        sessionId: 'linked',
+        bot: { larkAppId: 'cli_self', skills: { include: ['skill:deploy', 'skill:sibhome', 'skill:hostclaude', 'skill:vaultssh', 'skill:wdlink'] } },
+        global: { plugins: [] },
+        dataDir,
+        cliId: 'codex',
+        adapter: { id: 'codex' } as CliAdapter,
+        workingDir: join(realHome, 'proj'),
+        prompt: 'task',
+        replacesPriorGeneration: false,
+      });
+      const manifest = readSessionSkillManifest('linked');
+      const snapshot = realpathSync(join(dataDir, 'runtime-skills', 'linked', 'snapshot'));
+      // Catalog unchanged; only the store skill points into the snapshot.
+      expect(manifest?.prioritySkills.map(skill => [skill.name, !!skill.snapshotOf]).sort()).toEqual([
+        ['deploy', true], ['hostclaude', false], ['sibhome', false], ['vaultssh', false], ['wdlink', false],
+      ]);
+      expect(readdirSync(snapshot)).toEqual(['deploy']);
+      const contents = (dir: string): string[] => readdirSync(dir, { withFileTypes: true })
+        .flatMap(e => e.isDirectory() ? contents(join(dir, e.name)) : [readFileSync(join(dir, e.name), 'utf-8')]);
+      expect(contents(join(dataDir, 'runtime-skills', 'linked')).join('\n')).not.toMatch(/SECRET|agent-writable|planted/);
+      // Only the session snapshot reaches the sandbox, so the credentials stay
+      // unreachable under the real policy, with or without a Lark transport…
+      const roots = result.skillReadonlyRoots ?? [];
+      expect(roots).toEqual([snapshot]);
+      for (const larkTransportEnabled of [true, false]) {
+        const policy = buildFsPolicy({
+          platform: 'linux', homeDir: realHome, botmuxHome: botmux, sessionDataDir: realpathSync(dataDir),
+          sessionId: 'linked', workingDir: join(realHome, 'proj'), currentAppId: 'cli_self',
+          botHome: join(botmux, 'bots', 'cli_self'), redirectedCliData: true, larkTransportEnabled,
+          sessionOwnedReadonlyRoots: roots,
+        });
+        for (const secret of [join(sibling, 'send-cred.json'), join(realHome, '.claude', '.credentials.json'),
+          join(vault, 'ssh', 'id_rsa'), join(realHome, '.ssh', 'id_rsa')]) {
+          expect(accessForPath(policy.rules, secret).access, `${secret} transport=${larkTransportEnabled}`).not.toMatch(/readOnly|readWrite/);
+        }
+        expect(accessForPath(policy.rules, join(snapshot, 'deploy', 'SKILL.md')).access).toBe('readOnly');
+      }
+    } finally {
+      rmSync(vault, { recursive: true, force: true });
+    }
   });
 });

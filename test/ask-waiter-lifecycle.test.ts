@@ -95,10 +95,15 @@ describe('ask caller lifetime', () => {
     const hook = { ...input, originKind: 'hook', backendSurvivesRestart: true };
     const controller = new AbortController();
     const first = registerAsk(hook, controller.signal);
+    await Promise.resolve();
     controller.abort();
     await first;
-    expect(answer()).toBe('accepted');
-    expect(await registerAsk(hook)).toMatchObject({ kind: 'answered', comment: 'A follow-up question' });
+    // No hook is attached: free text is not this ask's answer (it must reach the
+    // session as an ordinary message), but a card click is kept for the hook.
+    expect(findPendingAskByAnchor(anchor)).toBeUndefined();
+    expect(answer()).toBe('stale');
+    expect(tryResolveAsk({ askId: cards[0].askId, nonce: cards[0].nonce, selected: 'yes', by: 'user' })).toBe('accepted');
+    expect(await registerAsk(hook)).toMatchObject({ kind: 'answered', answers: [['yes']] });
     expect(cards).toHaveLength(1);
   });
 
@@ -140,9 +145,12 @@ describe('ask caller lifetime', () => {
     await Promise.resolve();
     a.abort(); await first;
     const second = registerAsk(hook, b.signal);
+    // Re-attached: the hook is waiting again, so text answers it as before.
+    expect(findPendingAskByAnchor(anchor)).toBeDefined();
     b.abort(); await second;
-    expect(answer()).toBe('accepted');
-    expect(await registerAsk(hook)).toMatchObject({ kind: 'answered' });
+    expect(answer()).toBe('stale');
+    expect(tryResolveAsk({ askId: cards[0].askId, nonce: cards[0].nonce, selected: 'no', by: 'user' })).toBe('accepted');
+    expect(await registerAsk(hook)).toMatchObject({ kind: 'answered', answers: [['no']] });
     expect(cards).toHaveLength(1);
   });
 

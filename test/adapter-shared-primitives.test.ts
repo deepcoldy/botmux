@@ -2,7 +2,7 @@
  * 适配器共享原语：tui-input（writeTextThenEnter / bracketed paste）、runner-path、
  * model-catalog-json 的 detect 帮手。
  *
- * 这些原先是 aiden / copilot / gemini / mtr、codex-app / dsh / mira / mir / minimax、
+ * 这些原先是 aiden / copilot / mtr、codex-app / dsh / mira / mir / minimax、
  * coco / traex / opencode / codex 里逐字重复的实现；这里直接锁住共享实现的行为，
  * 并抽样在多个「别的 CLI」上确认它们确实接上了共享实现（行为由 write-input.test.ts 等覆盖）。
  */
@@ -20,7 +20,6 @@ import { resolveRunnerPath } from '../src/adapters/cli/runner-path.js';
 import { capabilitySlugs } from '../src/adapters/cli/model-catalog-json.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
-import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
 
@@ -71,7 +70,6 @@ describe('tui-input', () => {
   it.each([
     ['aiden', createAidenAdapter('/bin/aiden')],
     ['copilot', createCopilotAdapter('/bin/copilot')],
-    ['gemini', createGeminiAdapter('/bin/gemini')],
     ['mtr', createMtrAdapter('/bin/mtr')],
   ])('%s adapter submits through the shared sequence', async (_name, adapter) => {
     const { pty, calls } = recorderPty(true);

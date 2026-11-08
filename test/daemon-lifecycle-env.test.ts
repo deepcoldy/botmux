@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { DAEMON_ENV_KEYS, resolveDaemonEnv } from '../src/cli/daemon-lifecycle-env.js';
 import { DASHBOARD_H5_ENV_KEYS, DASHBOARD_H5_ENV_PREFIX } from '../src/utils/child-env.js';
+import { resolveDashboardH5AuthConfig } from '../src/dashboard/h5-auth.js';
+
+it('reloads final-output handoff and clears a removed switch on managed restart', () => {
+  expect(resolveDaemonEnv({ BOTMUX_SESSION_ID: 'session-1', BOTMUX_FINAL_OUTPUT_HANDOFF: '0' }, 'BOTMUX_FINAL_OUTPUT_HANDOFF=1'))
+    .toMatchObject({ BOTMUX_FINAL_OUTPUT_HANDOFF: '1' });
+  expect(resolveDaemonEnv({ BOTMUX_SESSION_ID: 'session-1', BOTMUX_FINAL_OUTPUT_HANDOFF: '1' }, 'WEB_HOST=0.0.0.0'))
+    .toMatchObject({ BOTMUX_FINAL_OUTPUT_HANDOFF: '' });
+});
 
 /**
  * Every key resolves to '' unless a source sets it, except the terminal and
@@ -63,6 +70,8 @@ describe('resolveDaemonEnv()', () => {
       'BOTMUX_DASHBOARD_EXTERNAL_HOST=dashboard.example.com',
       'BOTMUX_DASHBOARD_HOST=127.0.0.1',
       'BOTMUX_DASHBOARD_PORT=7991',
+      'BOTMUX_TERMINAL_ROUTE_HOST=10.0.0.8',
+      'BOTMUX_TERMINAL_ROUTE_PORT=11419',
       'BOTMUX_DAEMON_IPC_BASE_PORT=7992',
       'BOTMUX_DASHBOARD_PUBLIC_READONLY=false',
       // The regression this pins: a bot session's pane wrapper unsets BOTMUX_*,
@@ -82,6 +91,8 @@ describe('resolveDaemonEnv()', () => {
       BOTMUX_DASHBOARD_EXTERNAL_HOST: 'dashboard.example.com',
       BOTMUX_DASHBOARD_HOST: '127.0.0.1',
       BOTMUX_DASHBOARD_PORT: '7991',
+      BOTMUX_TERMINAL_ROUTE_HOST: '10.0.0.8',
+      BOTMUX_TERMINAL_ROUTE_PORT: '11419',
       BOTMUX_DAEMON_IPC_BASE_PORT: '7992',
       BOTMUX_DASHBOARD_PUBLIC_READONLY: 'false',
       BOTMUX_PUBLIC_URL: 'http://botmux.example.com',
@@ -97,6 +108,8 @@ describe('resolveDaemonEnv()', () => {
       'BOTMUX_COORDINATION_PROVIDER_HANDSHAKE_TIMEOUT_MS=5000',
       'BOTMUX_COORDINATION_PROVIDER_REQUEST_TIMEOUT_MS=30000',
       'BOTMUX_FORWARD_FOLLOWUP_WAIT_MS=0',
+      'BOTMUX_GLOBAL_CONFIG_FILE=/mnt/shared/global-config.json',
+      'BOTMUX_GROUP_CONTEXT_SETTINGS_FILE=/mnt/shared/group-context-settings.json',
     ].join('\n'))).toMatchObject({
       BOTMUX_COORDINATION_MODE: 'primary',
       BOTMUX_COORDINATION_PROVIDER_BIN: '/opt/botmux/provider',
@@ -104,6 +117,36 @@ describe('resolveDaemonEnv()', () => {
       BOTMUX_COORDINATION_PROVIDER_HANDSHAKE_TIMEOUT_MS: '5000',
       BOTMUX_COORDINATION_PROVIDER_REQUEST_TIMEOUT_MS: '30000',
       BOTMUX_FORWARD_FOLLOWUP_WAIT_MS: '0',
+      BOTMUX_GLOBAL_CONFIG_FILE: '/mnt/shared/global-config.json',
+      BOTMUX_GROUP_CONTEXT_SETTINGS_FILE: '/mnt/shared/group-context-settings.json',
+    });
+  });
+
+  it('re-reads the sender resolve timeout from .env on a session-origin restart, including rollback', () => {
+    // P2 regression: the CLI pane wrapper does not unset this key, so a
+    // restart from inside a session (or a detached self-upgrade restart)
+    // inherits the OLD daemon's value, and the daemon's dotenv load never
+    // overrides an inherited key. The lifecycle snapshot must therefore
+    // resolve it from the persisted file like the other machine-wide knobs —
+    // otherwise editing it has no effect and, worse, deleting it from the
+    // file can never restore the documented 800ms default.
+    const inheritedWithStaleValue = {
+      BOTMUX_SESSION_ID: 'session-1',
+      BOTMUX_SENDER_RESOLVE_TIMEOUT_MS: '3000',
+    };
+
+    expect(resolveDaemonEnv(inheritedWithStaleValue, [
+      'BOTMUX_SENDER_RESOLVE_TIMEOUT_MS=1500',
+    ].join('\n'))).toMatchObject({
+      BOTMUX_SENDER_RESOLVE_TIMEOUT_MS: '1500',
+    });
+
+    // Rollback: key removed from the file must resolve to '' so the consumer
+    // falls back to its default instead of keeping the inherited stale value.
+    expect(resolveDaemonEnv(inheritedWithStaleValue, [
+      'BOTMUX_FORWARD_FOLLOWUP_WAIT_MS=1500',
+    ].join('\n'))).toMatchObject({
+      BOTMUX_SENDER_RESOLVE_TIMEOUT_MS: '',
     });
   });
 
@@ -235,16 +278,19 @@ describe('DAEMON_ENV_KEYS enforces fleet credential boundaries', () => {
   });
 
   it('keeps every var resolveDashboardH5AuthConfig reads OFF the whitelist (drift guard)', () => {
-    // Scrape the single consumer's source: an H5 knob added to h5-auth.ts and
-    // then "helpfully" whitelisted here would put a credential-family key back
-    // into the shared fleet block. Also sweep the whole prefix so no future
-    // DAEMON_ENV_KEYS entry can smuggle the family in under a new name.
-    const h5 = readFileSync(new URL('../src/dashboard/h5-auth.ts', import.meta.url), 'utf-8');
-    const read = new Set(h5.match(/BOTMUX_DASHBOARD_FEISHU_H5_[A-Z0-9_]+/g) ?? []);
-    expect(read.size).toBeGreaterThan(0);
-    for (const key of read) {
-      expect(DAEMON_ENV_KEYS as readonly string[], key).not.toContain(key);
-    }
+    // Record what the single consumer actually reads: an H5 knob added to
+    // h5-auth.ts and then "helpfully" whitelisted here would put a
+    // credential-family key back into the shared fleet block. The only shared
+    // key it may read is the non-secret public URL.
+    const read = new Set<string>();
+    const env = new Proxy({} as NodeJS.ProcessEnv, {
+      get: (_target, key) => { if (typeof key === 'string') read.add(key); return undefined; },
+    });
+    resolveDashboardH5AuthConfig(env);
+    expect([...read].filter(key => key.startsWith(DASHBOARD_H5_ENV_PREFIX)).length).toBeGreaterThan(0);
+    const shared = [...read].filter(key => (DAEMON_ENV_KEYS as readonly string[]).includes(key));
+    expect(shared).toEqual(['BOTMUX_PUBLIC_URL']);
+    // Sweep the whole prefix so no future DAEMON_ENV_KEYS entry can smuggle the family in under a new name.
     for (const key of DAEMON_ENV_KEYS) {
       expect(key.startsWith(DASHBOARD_H5_ENV_PREFIX), key).toBe(false);
     }

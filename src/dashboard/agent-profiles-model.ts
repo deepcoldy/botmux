@@ -518,8 +518,3 @@ export function agentPushRequests(
   if (promptInjection && agent.promptInjection!.mode === 'none') out.push(promptInjection);
   return out;
 }
-
-/** Agent 是否设置了任何分组（全不设置的 Agent 关联后不会改变 Bot 任何配置）。 */
-export function agentHasSections(agent: AgentSectionsConfig): boolean {
-  return AGENT_SECTIONS.some(section => agent[section] !== undefined);
-}

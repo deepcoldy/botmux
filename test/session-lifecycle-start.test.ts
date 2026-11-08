@@ -1,6 +1,17 @@
-import { EventEmitter } from 'node:events';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+// 第一个 import：测试围栏（unit-setup / bun-test-fence）没生效时整个文件直接拒跑。
+// 本文件的会话启动链路会经 ensureCliSkills 往 homedir() 推导的目录装 CLI 钩子和配置
+// （~/.config/opencode/plugin/botmux-ask.js、~/.trae/traecli.toml、~/.codex/config.toml）；
+// 2026-11-06 一次绕过 setupFiles 的全量运行里，真实的 opencode 插件就是这样被改写的。
+import { isInsideDir } from './helpers/require-fenced-data-dir.js';
+import { EventEmitter, once } from 'node:events';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
+import { acceptSessionGroupTitle } from '../src/services/session-group-title.js';
+
+vi.mock('../src/services/session-group-title.js', () => ({
+  acceptSessionGroupTitle: vi.fn(),
+  scheduleSessionGroupTitle: vi.fn(),
+}));
 
 const {
   emitHookEventMock,
@@ -9,6 +20,9 @@ const {
   checkWorkerAdmissionMock,
   standaloneBinaryMock,
   tmuxProbeMock,
+  collectProtectedHttpEgressPoliciesMock,
+  resolveProtectedHttpEgressTargetsMock,
+  loggerErrorMock,
 } = vi.hoisted(() => ({
   emitHookEventMock: vi.fn(),
   forkMock: vi.fn(),
@@ -16,7 +30,19 @@ const {
   checkWorkerAdmissionMock: vi.fn(),
   standaloneBinaryMock: vi.fn(() => false),
   tmuxProbeMock: vi.fn(() => 'exists' as const),
+  collectProtectedHttpEgressPoliciesMock: vi.fn(() => [] as any[]),
+  resolveProtectedHttpEgressTargetsMock: vi.fn(),
+  loggerErrorMock: vi.fn(),
 }));
+
+vi.mock('../src/core/protected-http-egress.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/protected-http-egress.js')>();
+  return {
+    ...actual,
+    collectProtectedHttpEgressPolicies: (...args: unknown[]) => collectProtectedHttpEgressPoliciesMock(...args),
+    resolveProtectedHttpEgressTargets: (...args: unknown[]) => resolveProtectedHttpEgressTargetsMock(...args),
+  };
+});
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
@@ -76,6 +102,16 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
     retryOffer: o.retryOffer,
     action: o.retryOffer !== 'none' && o.retryTurnId ? 'retry_turn' : undefined,
   })),
+  // Recovery failure notices (ordinary-turn recovery settled failed) use their
+  // own card; echo what the assertions read (codes, retry affordance, turn).
+  buildRecoveryFailedCard: vi.fn((o: any) => JSON.stringify({
+    type: 'recovery-failed',
+    logicalTurnId: o.logicalTurnId,
+    errorCodes: o.errorCodes,
+    retry: o.retry?.kind,
+    action: o.retry?.kind === 'available' ? 'retry_recovery_turn'
+      : o.retry?.kind === 'continue_legacy' ? 'retry_turn' : undefined,
+  })),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
@@ -128,6 +164,7 @@ vi.mock('../src/services/session-store.js', () => ({
   cleanupSessionBridgeSendMarkers: vi.fn(),
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
   closeSession: vi.fn(),
+  getSessionFresh: vi.fn(),
   updateSession: vi.fn(),
   updateSessionPid: vi.fn(),
 }));
@@ -154,7 +191,8 @@ vi.mock('../src/skills/installer.js', () => ({
   ensureSkills: vi.fn(),
   ensureAskSkill: vi.fn(),
   ensureWhiteboardSkill: vi.fn(),
-  ensureWorkflowSkills: vi.fn(),
+  ensureChatManagerSkill: vi.fn(),
+  removeWorkflowSkills: vi.fn(),
   removeGlobalBotmuxSkills: vi.fn(),
 }));
 
@@ -176,7 +214,7 @@ vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
-  logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
+  logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: loggerErrorMock },
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => ({
@@ -188,22 +226,29 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 import { __testOnly_resetSessionLifecycleHooks } from '../src/services/session-lifecycle-hooks.js';
 
-// Scheduled-task store seen by the recovery continuation's identity lookup.
-// Keyed by task id; empty means "task deleted" (no identity, fail-closed).
-const { scheduledTasksForProvenance } = vi.hoisted(() => ({
+// Host authority store seen by the scheduled-turn identity lookups (the
+// daemon's loadScheduledTaskForIdentity callback). Keyed by task id; empty
+// means "task deleted" (no identity, fail-closed).
+// `tamperedProjection` is what a sandboxed CLI wrote into its BOT_HOME
+// schedules.json; daemon identity decisions must never see it.
+const { scheduledTasksForProvenance, tamperedProjection } = vi.hoisted(() => ({
   scheduledTasksForProvenance: new Map<string, any>(),
+  tamperedProjection: new Map<string, any>(),
 }));
 vi.mock('../src/core/scheduled-turn-provenance.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/core/scheduled-turn-provenance.js')>();
   return {
     ...actual,
     readScheduledTaskForProvenance: (_dataDir: string, _larkAppId: string, taskId: string) =>
-      scheduledTasksForProvenance.get(taskId),
+      tamperedProjection.get(taskId) ?? scheduledTasksForProvenance.get(taskId),
   };
 });
+const loadScheduledTaskForIdentity = (_larkAppId: string, taskId: string) =>
+  scheduledTasksForProvenance.get(taskId);
 import { armSilentScheduledTurn, isSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 import {
   __testOnly_resetOrdinaryImDeliveries,
+  adoptSandboxBlocked,
   auxUiSuppressedFor,
   detachWorkerForTransfer,
   ensureOrdinaryTurnRecoveryAttached,
@@ -219,9 +264,13 @@ import {
   resolveQuarantinedForkPlan,
   restartCounts,
   sendWorkerInput,
+  admitQueuedActivationTail,
   setActiveSessionsRegistry,
   suspendWorker,
+  currentGatewayCallerOpenId,
+  __testOnly_setSuspendBackingVerifier,
 } from '../src/core/worker-pool.js';
+import { MissingWorkingDirError } from '../src/core/working-dir-recovery.js';
 import {
   awaitReadonlyTaskContinuationUser,
   cancelReadonlyTaskContinuationExplicit,
@@ -238,14 +287,36 @@ import {
   readManagedOriginCapability,
 } from '../src/core/managed-origin-capability.js';
 import type { DaemonSession } from '../src/core/types.js';
+import type { TrustedCaller, WorkerToDaemon } from '../src/types.js';
 import { activeSessionKey } from '../src/core/types.js';
+import { resolveDaemonCurrentActor } from '../src/core/current-actor-attestation.js';
+import { resolveDaemonCurrentExecution } from '../src/core/current-execution.js';
+import { readProcessStartIdentity } from '../src/utils/process-identity.js';
+import { spawnTsEval } from './helpers/ts-runner.js';
 import * as sessionStore from '../src/services/session-store.js';
+import { readWorkerProcessStart } from '../src/core/session-worker-identity.js';
+import { spawnTsScript } from './helpers/ts-runner.js';
 import { getBot } from '../src/bot-registry.js';
+import { config } from '../src/config.js';
+import { invalidateGlobalConfigCache, readGlobalConfig } from '../src/global-config.js';
+import { setLinkRefRuntime, type LinkRefRuntime } from '../src/services/link-ref-runtime.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { retireCodexAppDispatchAfterBackingMissing } from '../src/utils/codex-app-dispatch-ledger.js';
-import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
+
+// 上面那些钩子和配置都按 homedir() 落盘：HOME 不在本文件的测试围栏内就拒绝加载，一个文件都不写。
+if (!isInsideDir(homedir(), process.env.__TEST_DATA_DIR_FENCE)) {
+  throw new Error(`refusing to run: HOME ${homedir()} is not inside the test fence`);
+}
+
+// The session working directory these fixtures point at. It must exist:
+// forkWorker refuses to start a CLI whose directory is gone (it no longer falls
+// back to $HOME), and a fixed path like `/repo` exists on some hosts but not on
+// CI, which is how a missing-directory failure once hid behind a green local run.
+const REPO = mkdtempSync(join(tmpdir(), 'botmux-lifecycle-repo-'));
+afterAll(() => { rmSync(REPO, { recursive: true, force: true }); });
 
 function makeFakeWorker() {
   const worker = new EventEmitter() as any;
@@ -268,7 +339,7 @@ function makeDs(overrides?: Partial<DaemonSession>): DaemonSession {
       status: 'active',
       createdAt: new Date('2026-05-27T00:00:00.000Z').toISOString(),
       chatType: 'group',
-      workingDir: '/repo',
+      workingDir: REPO,
     },
     worker: null,
     workerPort: null,
@@ -281,7 +352,7 @@ function makeDs(overrides?: Partial<DaemonSession>): DaemonSession {
     cliVersion: '1.0',
     lastMessageAt: 5678,
     hasHistory: false,
-    workingDir: '/repo',
+    workingDir: REPO,
     ...overrides,
   } as DaemonSession;
 }
@@ -305,10 +376,12 @@ function defaultBot(overrides: Record<string, unknown> = {}) {
 }
 
 beforeEach(() => {
+  __testOnly_setSuspendBackingVerifier(() => true);
   vi.useRealTimers();
   vi.clearAllMocks();
   delete process.env.BOTMUX_TASK_CONTINUATION_ENABLED;
   delete process.env.BOTMUX_READONLY_CONTINUATION_ENABLED;
+  vi.mocked(sessionStore.getSessionFresh).mockReturnValue(undefined);
   vi.mocked(sessionStore.updateSession).mockImplementation(() => undefined);
   vi.mocked(sessionStore.updateSessionPid).mockImplementation(() => undefined);
   tmuxProbeMock.mockReturnValue('exists');
@@ -318,6 +391,8 @@ beforeEach(() => {
   restartCounts.clear();
   standaloneBinaryMock.mockReturnValue(false);
   forkMock.mockImplementation(() => makeFakeWorker());
+  collectProtectedHttpEgressPoliciesMock.mockReturnValue([]);
+  resolveProtectedHttpEgressTargetsMock.mockReset();
   checkWorkerAdmissionMock.mockReturnValue({
     allowed: true,
     reasons: [],
@@ -332,18 +407,1307 @@ beforeEach(() => {
   });
   initWorkerPool({
     sessionReply: vi.fn(async () => 'om_reply'),
-    getSessionWorkingDir: () => '/repo',
+    getSessionWorkingDir: () => REPO,
     getActiveCount: () => 1,
     closeSession: vi.fn(),
+    loadScheduledTaskForIdentity,
   });
+  tamperedProjection.clear();
   setActiveSessionsRegistry(undefined);
+  setLinkRefRuntime(undefined);
 });
 
 afterEach(() => {
+  __testOnly_setSuspendBackingVerifier();
   delete process.env.BOTMUX_TASK_CONTINUATION_ENABLED;
   delete process.env.BOTMUX_READONLY_CONTINUATION_ENABLED;
   disposeReadonlyTaskContinuation({ sessionId: 'sid-start-test' });
   setActiveSessionsRegistry(undefined);
+  setLinkRefRuntime(undefined);
+});
+
+describe('protected MCP env stays out of ordinary worker IPC', () => {
+  it.each(['normal', 'adopt'])('redacts newly configured rejected env-source names from %s fork inheritance and worker policy', mode => {
+    const trustedHome = mkdtempSync(join(tmpdir(), 'botmux-live-redaction-home-'));
+    const configPath = join(trustedHome, 'global.json');
+    vi.stubEnv('HOME', trustedHome);
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', configPath);
+    vi.stubEnv('BOTMUX_SANDBOX', '0');
+    vi.stubEnv('FIXTURE_LIVE_LEGACY_SECRET', 'inherited-legacy-secret');
+    vi.stubEnv('FIXTURE_LIVE_REDACTED', 'inherited-redacted-secret');
+    try {
+      writeFileSync(configPath, '{}');
+      invalidateGlobalConfigCache();
+      expect(readGlobalConfig().protectedMcpCapabilities).toBeUndefined();
+      // The daemon is already running when an operator adds a rejected legacy
+      // source. Its recognizable names still need to reach the actual fork.
+      writeFileSync(configPath, JSON.stringify({ protectedMcpCapabilities: {
+        legacy: {
+          secret: { source: 'env', name: 'FIXTURE_LIVE_LEGACY_SECRET' },
+          isolation: { redactEnv: ['FIXTURE_LIVE_REDACTED'] },
+        },
+      } }));
+      invalidateGlobalConfigCache();
+      vi.mocked(getBot).mockImplementation(() => defaultBot({
+        env: { FIXTURE_LIVE_LEGACY_SECRET: 'bot-reintroduced-secret', SAFE_VISIBLE_VALUE: 'visible' },
+      }));
+      const ds = makeDs(mode === 'adopt' ? {
+        adoptedFrom: {
+          tmuxTarget: 'bmx-live-redaction:0.0', originalCliPid: 23456,
+          sessionId: 'fixture-adopted', cliId: 'codex', cwd: REPO,
+        },
+      } : undefined);
+      if (mode === 'adopt') forkAdoptWorker(ds, { prompt: 'live env redaction' });
+      else forkWorker(ds, 'live env redaction');
+      const env = forkMock.mock.calls.at(-1)![2].env;
+      const init = (ds.worker as any).send.mock.calls[0][0];
+      expect(env.FIXTURE_LIVE_LEGACY_SECRET).toBeUndefined();
+      expect(env.FIXTURE_LIVE_REDACTED).toBeUndefined();
+      expect(init.protectedMcpPolicy.redactEnv).toEqual(expect.arrayContaining([
+        'FIXTURE_LIVE_LEGACY_SECRET', 'FIXTURE_LIVE_REDACTED',
+      ]));
+      expect(init.env?.FIXTURE_LIVE_LEGACY_SECRET).toBeUndefined();
+      if (mode === 'normal') expect(init.env).toEqual({ SAFE_VISIBLE_VALUE: 'visible' });
+      expect(JSON.stringify(init)).not.toContain('bot-reintroduced-secret');
+    } finally {
+      vi.unstubAllEnvs();
+      invalidateGlobalConfigCache();
+      rmSync(trustedHome, { recursive: true, force: true });
+    }
+  });
+
+  it('removes daemon-protected values from the initial worker payload after live bot reinjection', () => {
+    const trustedHome = mkdtempSync(join(tmpdir(), 'botmux-lifecycle-secret-home-'));
+    const configPath = join(trustedHome, '.botmux', 'config.json');
+    mkdirSync(join(trustedHome, '.botmux', 'protected-secrets'), { recursive: true, mode: 0o700 });
+    writeFileSync(join(trustedHome, '.botmux', 'protected-secrets', 'fixture.key'),
+      'fixture-file-secret', { mode: 0o600 });
+    writeFileSync(configPath, JSON.stringify({
+      protectedMcpCapabilities: {
+        'fixture.secret.v1': {
+          enabled: true,
+          allowedPluginIds: ['demo'],
+          secret: { source: 'file', path: '.botmux/protected-secrets/fixture.key' },
+          containmentProfile: 'local-stdio-secret-v1',
+          isolation: { redactEnv: ['FIXTURE_PROTECTED_SECRET', 'FIXTURE_PROTECTED_REDACTED'] },
+        },
+      },
+    }), { mode: 0o600 });
+    vi.stubEnv('HOME', trustedHome);
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', configPath);
+    try {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({
+        env: {
+          FIXTURE_PROTECTED_SECRET: 'reintroduced-secret',
+          FIXTURE_PROTECTED_REDACTED: 'reintroduced-token',
+          SAFE_VISIBLE_VALUE: 'visible',
+        },
+      }));
+      const ds = makeDs();
+
+      forkWorker(ds, 'ordinary protected env payload', { turnId: 'om_protected_init' });
+
+      const worker = forkMock.mock.results.at(-1)!.value;
+      const init = vi.mocked(worker.send).mock.calls[0][0];
+      expect(init.type).toBe('init');
+      expect(init.env).toEqual({ SAFE_VISIBLE_VALUE: 'visible' });
+      expect(JSON.stringify(init)).not.toContain('reintroduced-secret');
+      expect(JSON.stringify(init)).not.toContain('reintroduced-token');
+      expect(JSON.stringify(init)).not.toContain('fixture-file-secret');
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(trustedHome, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('protected HTTP egress policy freezing at worker preparation', () => {
+  const policy = {
+    id: 'fixture.write.v1',
+    targets: [{
+      scheme: 'https' as const,
+      host: 'fixture.internal.example',
+      port: 443,
+      denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
+    }],
+  };
+
+  it('rejects feedback maintenance before reading bot configuration or starting protected DNS', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-maintenance-before-freeze-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    try {
+      writeFileSync(join(dataDir, 'feedback-maintenance.json'), JSON.stringify({
+        migrationId: 'fixture', state: 'draining', generation: 1,
+        participants: [], blockers: [],
+      }));
+      const ds = makeDs();
+      const onAdmission = vi.fn();
+
+      expect(forkWorker(ds, 'maintenance opening', false, { onAdmission })).toBe(false);
+
+      expect(onAdmission.mock.calls).toEqual([['rejected']]);
+      expect(getBot).not.toHaveBeenCalled();
+      expect(collectProtectedHttpEgressPoliciesMock).not.toHaveBeenCalled();
+      expect(resolveProtectedHttpEgressTargetsMock).not.toHaveBeenCalled();
+      expect(forkMock).not.toHaveBeenCalled();
+      expect(ds.session.protectedHttpEgressPolicy).toBeUndefined();
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rechecks feedback maintenance after DNS before persisting a policy or creating a worker', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-maintenance-during-freeze-'));
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    let resolveDns!: (addresses: string[][]) => void;
+    const dns = new Promise<string[][]>(resolve => { resolveDns = resolve; });
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(dns);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    try {
+      const ds = makeDs();
+      const onAdmission = vi.fn();
+
+      expect(forkWorker(ds, 'opening before maintenance', false, { onAdmission })).toBe(true);
+      expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
+      expect(forkMock).not.toHaveBeenCalled();
+      writeFileSync(join(dataDir, 'feedback-maintenance.json'), JSON.stringify({
+        migrationId: 'fixture', state: 'draining', generation: 1,
+        participants: [], blockers: [],
+      }));
+      resolveDns([['10.20.30.40']]);
+      await vi.waitFor(() => expect(onAdmission.mock.calls).toEqual([['rejected']]));
+
+      expect(forkMock).not.toHaveBeenCalled();
+      expect(sessionStore.updateSession).not.toHaveBeenCalled();
+      expect(ds.session.protectedHttpEgressPolicy).toBeUndefined();
+    } finally {
+      resolveDns([['10.20.30.40']]);
+      await dns;
+      config.session.dataDir = previousDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('freezes the enabled plugin policy into worker init even when no actor capability is enabled', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.20.30.40', '2001:db8::40']]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = makeDs();
+
+    expect(forkWorker(ds, 'protected egress', { turnId: 'om_egress_init' })).toBe(true);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init.protectedHttpEgressPolicy).toEqual({
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+      frozenAddresses: [['10.20.30.40', '2001:db8::40']],
+    });
+    expect(init.protectedLoopbackProxyAttestation).toEqual({
+      secret: expect.stringMatching(/^[a-f0-9]{64}$/),
+      workerGeneration: ds.workerGeneration,
+    });
+    expect(ds.protectedLoopbackProxyAttestation).toEqual(init.protectedLoopbackProxyAttestation);
+    expect(JSON.stringify(init.env ?? {})).not.toContain(init.protectedLoopbackProxyAttestation.secret);
+    expect(init.protectedMcpPolicy.capabilities).toEqual([]);
+  });
+
+  it('does not retrofit a newly enabled protected egress policy onto a legacy resumed session', () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.20.30.40']]);
+    const ds = makeDs({ hasHistory: true });
+
+    expect(forkWorker(ds, 'legacy resume', true)).toBe(true);
+
+    expect(collectProtectedHttpEgressPoliciesMock).not.toHaveBeenCalled();
+    expect(resolveProtectedHttpEgressTargetsMock).not.toHaveBeenCalled();
+    expect(ds.session.protectedHttpEgressPolicy).toBeNull();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(vi.mocked(worker.send).mock.calls[0][0]).toEqual(expect.objectContaining({
+      type: 'init',
+      protectedHttpEgressPolicy: undefined,
+    }));
+  });
+
+  it('freezes the absence of protected egress on a fresh session', () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([]);
+    const ds = makeDs();
+
+    expect(forkWorker(ds, 'fresh unprotected session', { turnId: 'om_unprotected' })).toBe(true);
+
+    expect(ds.session.protectedHttpEgressPolicy).toBeNull();
+    expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(vi.mocked(worker.send).mock.calls[0][0]).toEqual(expect.objectContaining({
+      type: 'init',
+      protectedHttpEgressPolicy: undefined,
+    }));
+  });
+
+  it('persists the frozen protected egress policy on a fresh session', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.20.30.40']]);
+    const ds = makeDs();
+
+    expect(forkWorker(ds, 'fresh protected session', { turnId: 'om_fresh' })).toBe(true);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+
+    expect(ds.session.protectedHttpEgressPolicy).toEqual({
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+      frozenAddresses: [['10.20.30.40']],
+    });
+  });
+
+  it('reuses a session-frozen protected egress policy without resolving DNS again', () => {
+    const frozen = {
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+      frozenAddresses: [['10.20.30.40']],
+    };
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'replacement-plugin',
+      capabilityId: 'replacement.actor-write.v1',
+      policy: { ...policy, id: 'replacement.write.v1' },
+      policyDigest: 'e'.repeat(64),
+    }]);
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.99.99.99']]);
+    const ds = makeDs({ hasHistory: true });
+    ds.session.protectedHttpEgressPolicy = structuredClone(frozen);
+
+    expect(forkWorker(ds, 'protected resume', true)).toBe(true);
+
+    expect(collectProtectedHttpEgressPoliciesMock).not.toHaveBeenCalled();
+    expect(resolveProtectedHttpEgressTargetsMock).not.toHaveBeenCalled();
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      protectedHttpEgressPolicy: frozen,
+    }));
+  });
+
+  it('keeps a session-frozen absence when a policy is enabled before resume', () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    const ds = makeDs({ hasHistory: true });
+    ds.session.protectedHttpEgressPolicy = null;
+
+    expect(forkWorker(ds, 'unprotected resume', { resume: true })).toBe(true);
+
+    expect(ds.session.protectedHttpEgressPolicy).toBeNull();
+    expect(collectProtectedHttpEgressPoliciesMock).not.toHaveBeenCalled();
+    expect(resolveProtectedHttpEgressTargetsMock).not.toHaveBeenCalled();
+    const worker = forkMock.mock.results[0]!.value;
+    expect(vi.mocked(worker.send).mock.calls[0][0]).toMatchObject({
+      type: 'init',
+      protectedHttpEgressPolicy: undefined,
+    });
+  });
+
+  it('fails closed before child creation when the protected egress freeze cannot be persisted', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.20.30.40']]);
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (session.protectedHttpEgressPolicy !== undefined) {
+        throw new Error('protected egress disk full');
+      }
+    });
+    const ds = makeDs();
+    const onAdmissionBlocked = vi.fn();
+
+    expect(forkWorker(ds, 'protected persistence failure', { turnId: 'om_persist_fail' }, {
+      onAdmissionBlocked,
+    })).toBe(true);
+    await vi.waitFor(() => expect(onAdmissionBlocked).toHaveBeenCalled());
+
+    expect(onAdmissionBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('protected egress disk full'),
+      turnId: 'om_persist_fail',
+    }));
+    expect(ds.session.protectedHttpEgressPolicy).toBeUndefined();
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps a durable protected egress policy reloaded after a concurrent freeze conflict', async () => {
+    const currentPolicy = {
+      pluginId: 'current-plugin',
+      capabilityId: 'current.actor-write.v1',
+      policy: { ...policy, id: 'current.write.v1' },
+      policyDigest: 'c'.repeat(64),
+    };
+    const durablePolicy = {
+      pluginId: 'durable-plugin',
+      capabilityId: 'durable.actor-write.v1',
+      policy: { ...policy, id: 'durable.write.v1' },
+      policyDigest: 'a'.repeat(64),
+      frozenAddresses: [['10.10.10.10']],
+    };
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([currentPolicy]);
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.20.30.40']]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['current-plugin'] }));
+    const ds = makeDs();
+    const blocked = vi.fn();
+    let firstFreeze = true;
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (firstFreeze && session.protectedHttpEgressPolicy !== undefined) {
+        firstFreeze = false;
+        session.protectedHttpEgressPolicy = structuredClone(durablePolicy);
+        throw new Error('Session changed concurrently; routing write refused');
+      }
+    });
+
+    expect(forkWorker(ds, 'first', { turnId: 'om_first' }, {
+      onAdmissionBlocked: blocked,
+    })).toBe(true);
+    await vi.waitFor(() => expect(blocked).toHaveBeenCalled());
+    expect(ds.session.protectedHttpEgressPolicy).toEqual(durablePolicy);
+
+    expect(forkWorker(ds, 'retry', { turnId: 'om_retry' })).toBe(true);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+    expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(forkMock.mock.results[0]!.value.send).mock.calls[0][0])
+      .toEqual(expect.objectContaining({ protectedHttpEgressPolicy: durablePolicy }));
+  });
+
+  it('keeps a durable frozen absence reloaded after a concurrent freeze conflict', () => {
+    const ds = makeDs();
+    vi.mocked(sessionStore.getSessionFresh).mockImplementation(() => ({
+      ...structuredClone(ds.session),
+      protectedHttpEgressPolicy: null,
+    }));
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (session.protectedHttpEgressPolicy === null) {
+        throw new Error('Session changed concurrently; routing write refused');
+      }
+    });
+
+    expect(() => forkWorker(ds, 'concurrent unprotected freeze', { turnId: 'om_null_conflict' }))
+      .toThrow('Session changed concurrently; routing write refused');
+    expect(ds.session.protectedHttpEgressPolicy).toBeNull();
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('fails closed before forking when more than one enabled plugin declares a policy', () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([
+      {
+        pluginId: 'fixture-one',
+        capabilityId: 'fixture.actor-write.v1',
+        policy,
+        policyDigest: '1'.repeat(64),
+      },
+      {
+        pluginId: 'fixture-two',
+        capabilityId: 'fixture.other-actor-write.v1',
+        policy: { ...policy, id: 'fixture.other.v1' },
+        policyDigest: '2'.repeat(64),
+      },
+    ]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-one', 'fixture-two'] }));
+
+    expect(() => forkWorker(makeDs(), 'ambiguous egress', { turnId: 'om_egress_many' }))
+      .toThrow('multiple_protected_http_egress_policies');
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(resolveProtectedHttpEgressTargetsMock).not.toHaveBeenCalled();
+  });
+
+  it('surfaces DNS freeze failure through the caller-owned admission notice lane', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    resolveProtectedHttpEgressTargetsMock.mockRejectedValue(new Error('dns unavailable'));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const onAdmission = vi.fn();
+    const onAdmissionBlocked = vi.fn();
+
+    expect(forkWorker(makeDs(), 'protected egress', { turnId: 'om_egress_dns' }, {
+      onAdmission,
+      onAdmissionBlocked,
+    })).toBe(true);
+    await vi.waitFor(() => expect(onAdmission).toHaveBeenCalledWith('rejected'));
+
+    expect(onAdmissionBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('dns unavailable'),
+      turnId: 'om_egress_dns',
+    }));
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('removes DNS followers before rejecting them when target resolution fails', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let failLookup!: (error: Error) => void;
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise((_, reject) => {
+      failLookup = reject;
+    }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = makeDs();
+    const followerAdmissions: string[] = [];
+    const durabilityEvents: string[] = [];
+    const followerBlocked = vi.fn();
+
+    expect(forkWorker(ds, 'opening', { turnId: 'om_dns_opening' })).toBe(true);
+    expect(forkWorker(ds, 'follower', { turnId: 'om_dns_follower' }, {
+      onAdmission: admission => {
+        followerAdmissions.push(admission);
+        if (admission === 'rejected') durabilityEvents.push('follower rejected');
+      },
+      onAdmissionBlocked: followerBlocked,
+    })).toBe(true);
+    const followerTailId = ds.session.queuedActivationTail?.[0]?.id;
+    expect(followerTailId).toBeTruthy();
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (!session.queuedActivationTail?.some(entry => entry.id === followerTailId)) {
+        durabilityEvents.push('cleanup persisted');
+      }
+    });
+
+    failLookup(new Error('dns unavailable'));
+    await vi.waitFor(() => expect(followerAdmissions).toEqual(['deferred', 'rejected']));
+
+    expect(durabilityEvents.slice(0, 2)).toEqual(['cleanup persisted', 'follower rejected']);
+    expect(ds.session.queuedActivationTail?.some(entry => entry.id === followerTailId)).toBeFalsy();
+    expect(followerBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('dns unavailable'),
+      turnId: 'om_dns_follower',
+    }));
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('durably queues a concurrent input behind one pending DNS freeze and forks exactly once', async () => {
+    standaloneBinaryMock.mockReturnValue(true);
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let finishLookup!: (addresses: string[][]) => void;
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise(resolve => {
+      finishLookup = resolve;
+    }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = makeDs();
+    const firstAdmission = vi.fn();
+    const secondAdmission = vi.fn();
+
+    expect(forkWorker(ds, 'first protected turn', { turnId: 'om_egress_first' }, {
+      onAdmission: firstAdmission,
+    })).toBe(true);
+    expect(forkWorker(ds, 'second protected turn', {
+      turnId: 'om_egress_second',
+    }, { onAdmission: secondAdmission })).toBe(true);
+
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({
+        userPrompt: 'second protected turn',
+        turnId: 'om_egress_second',
+        cliInput: expect.objectContaining({ content: 'second protected turn' }),
+      }),
+    ]);
+    expect(secondAdmission).toHaveBeenCalledWith('deferred');
+
+    finishLookup([['10.20.30.40']]);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+
+    const worker = forkMock.mock.results[0]!.value;
+    expect(secondAdmission).toHaveBeenLastCalledWith('deferred');
+    worker.emit('message', { type: 'worker_ipc_ready' });
+    await vi.waitFor(() => expect(secondAdmission).toHaveBeenLastCalledWith('accepted'));
+    const businessMessages = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message.type !== 'worker_ipc_probe');
+    expect(businessMessages[0]).toMatchObject({
+      type: 'init',
+      prompt: 'first protected turn',
+      turnId: 'om_egress_first',
+    });
+    expect(businessMessages[1]).toMatchObject({
+      type: 'message',
+      content: 'second protected turn',
+      turnId: 'om_egress_second',
+    });
+  });
+
+  it.each([true, { resume: true, turnId: 'om_dns_resume' }] as const)(
+    'keeps a nonempty resume behind the pending DNS freeze (%j)', async resume => {
+      standaloneBinaryMock.mockReturnValue(true);
+      collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+        pluginId: 'fixture-plugin',
+        capabilityId: 'fixture.actor-write.v1',
+        policy,
+        policyDigest: 'd'.repeat(64),
+      }]);
+      let finishLookup!: (addresses: string[][]) => void;
+      resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise(resolve => {
+        finishLookup = resolve;
+      }));
+      const ds = makeDs();
+      ds.session.sessionId = `sid-dns-resume-${typeof resume}`;
+      const admissions: string[] = [];
+
+      forkWorker(ds, 'opening protected turn', { turnId: 'om_dns_opening' });
+      // Resume observers reuse the in-flight snapshot even if live plugins
+      // have changed; re-reading them would lose the pending opening's policy.
+      collectProtectedHttpEgressPoliciesMock.mockImplementation(() => {
+        throw new Error('resume must reuse pending policy');
+      });
+      forkWorker(ds, 'resumed follower', resume, {
+        onAdmission: admission => admissions.push(admission),
+      });
+      const beforeDns = {
+        worker: ds.worker,
+        policy: ds.session.protectedHttpEgressPolicy,
+        tail: structuredClone(ds.session.queuedActivationTail),
+        admissions: [...admissions],
+      };
+      finishLookup([['10.20.30.40']]);
+      await Promise.resolve();
+      const worker = ds.worker as ReturnType<typeof makeFakeWorker>;
+      worker.emit('message', { type: 'worker_ipc_ready' });
+      await Promise.resolve();
+
+      expect(beforeDns.worker).toBeNull();
+      expect(beforeDns.policy).toBeUndefined();
+      expect(beforeDns.admissions).toEqual(['deferred']);
+      expect(beforeDns.tail).toEqual([
+        expect.objectContaining({ userPrompt: 'resumed follower' }),
+      ]);
+      expect(admissions).toEqual(['deferred', 'accepted']);
+      expect(forkMock).toHaveBeenCalledTimes(1);
+      expect(collectProtectedHttpEgressPoliciesMock).toHaveBeenCalledTimes(1);
+      expect(ds.session.protectedHttpEgressPolicy).toMatchObject({
+        pluginId: 'fixture-plugin',
+        policyDigest: 'd'.repeat(64),
+        frozenAddresses: [['10.20.30.40']],
+      });
+      const messages = vi.mocked(worker.send).mock.calls
+        .map(call => call[0]).filter(message => message.type !== 'worker_ipc_probe');
+      expect(messages).toEqual([
+        expect.objectContaining({ type: 'init', prompt: 'opening protected turn' }),
+        expect.objectContaining({ type: 'message', content: 'resumed follower' }),
+      ]);
+    },
+  );
+
+  it.each([true, { resume: true }, false] as const)(
+    'accepts an empty DNS waiter after the opening worker bootstraps (%j)', async resume => {
+      standaloneBinaryMock.mockReturnValue(true);
+      collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+        pluginId: 'fixture-plugin',
+        capabilityId: 'fixture.actor-write.v1',
+        policy,
+        policyDigest: 'd'.repeat(64),
+      }]);
+      let finishLookup!: (addresses: string[][]) => void;
+      resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise(resolve => {
+        finishLookup = resolve;
+      }));
+      const ds = makeDs();
+      ds.session.sessionId = `sid-empty-dns-waiter-${JSON.stringify(resume)}`;
+      const admissions: string[] = [];
+
+      forkWorker(ds, 'opening protected turn', { turnId: 'om_empty_waiter_opening' });
+      forkWorker(ds, '', resume, { onAdmission: admission => admissions.push(admission) });
+      const beforeDns = { worker: ds.worker, admissions: [...admissions] };
+      finishLookup([['10.20.30.40']]);
+      await Promise.resolve();
+      const beforeBootstrap = [...admissions];
+      const worker = ds.worker as ReturnType<typeof makeFakeWorker>;
+      worker.emit('message', { type: 'worker_ipc_ready' });
+      await Promise.resolve();
+
+      expect(beforeDns).toEqual({ worker: null, admissions: ['deferred'] });
+      expect(beforeBootstrap).toEqual(['deferred']);
+      expect(admissions).toEqual(['deferred', 'accepted']);
+      expect(ds.session.queuedActivationTail).toBeUndefined();
+      expect(forkMock).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(worker.send).mock.calls.map(call => call[0])
+        .filter(message => message.type !== 'worker_ipc_probe')).toEqual([
+        expect.objectContaining({ type: 'init', prompt: 'opening protected turn' }),
+      ]);
+    },
+  );
+
+  it('rejects both resume messages and empty resume observers when pending DNS fails', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let failLookup!: (error: Error) => void;
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise((_, reject) => {
+      failLookup = reject;
+    }));
+    const ds = makeDs();
+    ds.session.sessionId = 'sid-dns-resume-failure';
+    const messageAdmissions: string[] = [];
+    const observerAdmissions: string[] = [];
+    const messageBlocked = vi.fn();
+    const observerBlocked = vi.fn();
+    const persistedTails: Array<typeof ds.session.queuedActivationTail> = [];
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      persistedTails.push(structuredClone(session.queuedActivationTail));
+    });
+
+    forkWorker(ds, 'opening protected turn', { turnId: 'om_resume_failure_opening' });
+    forkWorker(ds, 'resume message', { resume: true, turnId: 'om_resume_message' }, {
+      onAdmission: admission => messageAdmissions.push(admission),
+      onAdmissionBlocked: messageBlocked,
+    });
+    let observerError: unknown;
+    try {
+      forkWorker(ds, '', true, {
+        onAdmission: admission => observerAdmissions.push(admission),
+        onAdmissionBlocked: observerBlocked,
+      });
+    } catch (error) {
+      observerError = error;
+    }
+    const beforeFailure = {
+      message: [...messageAdmissions], observer: [...observerAdmissions], worker: ds.worker,
+    };
+    failLookup(new Error('dns unavailable'));
+    await Promise.resolve();
+
+    expect(observerError).toBeUndefined();
+    expect(beforeFailure).toEqual({ message: ['deferred'], observer: ['deferred'], worker: null });
+    expect(messageAdmissions).toEqual(['deferred', 'rejected']);
+    expect(observerAdmissions).toEqual(['deferred', 'rejected']);
+    expect(persistedTails).toContainEqual([
+      expect.objectContaining({ userPrompt: 'resume message', turnId: 'om_resume_message' }),
+    ]);
+    expect(persistedTails.at(-1)).toBeUndefined();
+    expect(ds.session.queuedActivationTail).toBeUndefined();
+    expect(ds.session.protectedHttpEgressPolicy).toBeUndefined();
+    expect(messageBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('dns unavailable'), turnId: 'om_resume_message',
+    }));
+    expect(observerBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('dns unavailable'),
+    }));
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('accepts an empty resume observer even when a message follower cannot be durably promoted', async () => {
+    standaloneBinaryMock.mockReturnValue(true);
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let finishLookup!: (addresses: string[][]) => void;
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise(resolve => {
+      finishLookup = resolve;
+    }));
+    const ds = makeDs();
+    ds.session.sessionId = 'sid-empty-resume-promotion-failure';
+    const messageAdmissions: string[] = [];
+    const observerAdmissions: string[] = [];
+
+    forkWorker(ds, 'opening protected turn', { turnId: 'om_promotion_opening' });
+    forkWorker(ds, 'durable message follower', { turnId: 'om_promotion_follower' }, {
+      onAdmission: admission => messageAdmissions.push(admission),
+    });
+    forkWorker(ds, '', { resume: true }, {
+      onAdmission: admission => observerAdmissions.push(admission),
+    });
+    finishLookup([['10.20.30.40']]);
+    await Promise.resolve();
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (session.queuedActivationPending) throw new Error('promotion disk full');
+    });
+    const worker = ds.worker as ReturnType<typeof makeFakeWorker>;
+    worker.emit('message', { type: 'worker_ipc_ready' });
+    await Promise.resolve();
+
+    expect(observerAdmissions).toEqual(['deferred', 'accepted']);
+    expect(messageAdmissions).toEqual(['deferred', 'rejected']);
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({ userPrompt: 'durable message follower', turnId: 'om_promotion_follower' }),
+    ]);
+    expect(ds.session.queuedActivationPending).toBeFalsy();
+    expect(vi.mocked(worker.send).mock.calls.map(call => call[0])
+      .filter(message => message.type !== 'worker_ipc_probe')).toEqual([
+      expect.objectContaining({ type: 'init', prompt: 'opening protected turn' }),
+    ]);
+  });
+
+  it.each([null, { pluginId: 'replacement-plugin', policyDigest: 'e'.repeat(64) }] as const)(
+    'keeps the frozen policy conflict guard ahead of pending resume admission (%j)', async replacement => {
+      standaloneBinaryMock.mockReturnValue(true);
+      collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+        pluginId: 'fixture-plugin',
+        capabilityId: 'fixture.actor-write.v1',
+        policy,
+        policyDigest: 'd'.repeat(64),
+      }]);
+      let finishLookup!: (addresses: string[][]) => void;
+      resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise(resolve => {
+        finishLookup = resolve;
+      }));
+      const ds = makeDs();
+      ds.session.sessionId = `sid-dns-frozen-conflict-${replacement === null ? 'null' : 'object'}`;
+      const onAdmission = vi.fn();
+      forkWorker(ds, 'opening protected turn', { turnId: 'om_conflict_opening' });
+      ds.session.protectedHttpEgressPolicy = replacement === null ? null : {
+        ...replacement, capabilityId: 'replacement.actor.v1', policy,
+        frozenAddresses: [['10.99.99.99']],
+      };
+      let resumeError: unknown;
+      try {
+        forkWorker(ds, 'conflicting resume', true, { onAdmission });
+      } catch (error) {
+        resumeError = error;
+      }
+      delete ds.session.protectedHttpEgressPolicy;
+      finishLookup([['10.20.30.40']]);
+      await Promise.resolve();
+      const worker = ds.worker as ReturnType<typeof makeFakeWorker>;
+      worker.emit('message', { type: 'worker_ipc_ready' });
+      await Promise.resolve();
+
+      expect(resumeError).toEqual(new Error('protected_http_egress_policy_changed_during_freeze'));
+      expect(onAdmission).not.toHaveBeenCalled();
+      expect(ds.session.queuedActivationTail).toBeUndefined();
+      expect(forkMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('refuses an ordinary follower when the pending DNS policy is disabled in live config', async () => {
+    standaloneBinaryMock.mockReturnValue(true);
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let finishLookup!: (addresses: string[][]) => void;
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise(resolve => {
+      finishLookup = resolve;
+    }));
+    const ds = makeDs();
+    ds.session.sessionId = 'sid-dns-policy-disabled';
+    const onAdmission = vi.fn();
+
+    forkWorker(ds, 'opening protected turn', { turnId: 'om_disabled_opening' });
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([]);
+    let followerError: unknown;
+    try {
+      forkWorker(ds, 'ordinary follower', { turnId: 'om_disabled_follower' }, { onAdmission });
+    } catch (error) {
+      followerError = error;
+    }
+    const beforeDns = { worker: ds.worker, policy: ds.session.protectedHttpEgressPolicy };
+    finishLookup([['10.20.30.40']]);
+    await Promise.resolve();
+    const worker = ds.worker as ReturnType<typeof makeFakeWorker>;
+    worker.emit('message', { type: 'worker_ipc_ready' });
+    await Promise.resolve();
+
+    expect(beforeDns).toEqual({ worker: null, policy: undefined });
+    expect(followerError).toEqual(new Error('protected_http_egress_policy_changed_during_freeze'));
+    expect(onAdmission).not.toHaveBeenCalled();
+    expect(ds.session.queuedActivationTail).toBeUndefined();
+    expect(ds.session.protectedHttpEgressPolicy).toMatchObject({
+      pluginId: 'fixture-plugin', policyDigest: 'd'.repeat(64),
+      frozenAddresses: [['10.20.30.40']],
+    });
+    expect(forkMock).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(worker.send).mock.calls.map(call => call[0])
+      .filter(message => message.type !== 'worker_ipc_probe')).toEqual([
+      expect.objectContaining({ type: 'init', prompt: 'opening protected turn' }),
+    ]);
+  });
+
+  it.each(['accepted', 'rejected'] as const)(
+    'settles DNS waiters before an admission callback synchronously reenters forkWorker (%s)', async outcome => {
+      standaloneBinaryMock.mockReturnValue(true);
+      collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+        pluginId: 'fixture-plugin',
+        capabilityId: 'fixture.actor-write.v1',
+        policy,
+        policyDigest: 'd'.repeat(64),
+      }]);
+      let finishLookup!: (addresses: string[][]) => void;
+      resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise(resolve => {
+        finishLookup = resolve;
+      }));
+      const ds = makeDs();
+      ds.session.sessionId = `sid-dns-callback-reentry-${outcome}`;
+      const observerAdmissions: string[] = [];
+      const followerAdmissions: string[] = [];
+
+      forkWorker(ds, 'opening protected turn', { turnId: 'om_callback_opening' });
+      forkWorker(ds, outcome === 'accepted' ? '' : 'failed promotion follower', { resume: true }, {
+        onAdmission: admission => {
+          observerAdmissions.push(admission);
+          if (admission === outcome) {
+            forkWorker(ds, 'reentered follower', { turnId: 'om_callback_reentered' }, {
+              onAdmission: next => followerAdmissions.push(next),
+            });
+          }
+        },
+      });
+      finishLookup([['10.20.30.40']]);
+      await Promise.resolve();
+      if (outcome === 'rejected') {
+        let failPromotion = true;
+        vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+          if (failPromotion && session.queuedActivationPending) {
+            failPromotion = false;
+            throw new Error('promotion disk full');
+          }
+        });
+      }
+      const worker = ds.worker as ReturnType<typeof makeFakeWorker>;
+      worker.emit('message', { type: 'worker_ipc_ready' });
+      await Promise.resolve();
+
+      expect(observerAdmissions).toEqual(['deferred', outcome]);
+      expect(followerAdmissions).toEqual(outcome === 'accepted' ? ['accepted'] : ['deferred']);
+      // With no durable owner the ordinary fork path may replace the worker;
+      // its new init must carry the reentered input instead of parking it in a
+      // settled DNS tail. A retained activation tail must keep the same FIFO.
+      if (ds.worker !== worker) {
+        ds.worker!.emit('message', { type: 'worker_ipc_ready' });
+        await Promise.resolve();
+      }
+      if (outcome === 'rejected') {
+        expect(ds.session.queuedActivationTail?.map(entry => entry.userPrompt))
+          .toEqual(['failed promotion follower', 'reentered follower']);
+        expect(promoteQueuedActivationTail(ds)).toBe(true);
+        worker.emit('message', {
+          type: 'queued_activation_submitted', sessionId: ds.session.sessionId,
+          activationToken: ds.session.queuedActivationToken,
+        });
+        await Promise.resolve();
+        expect(promoteQueuedActivationTail(ds)).toBe(true);
+      }
+      expect(ds.session.queuedActivationTail).toBeUndefined();
+      expect(forkMock.mock.results.flatMap(result =>
+        vi.mocked(result.value.send).mock.calls.map(call => call[0]))
+        .filter(message => message.type === 'message'
+          || (message.type === 'init' && message.prompt !== 'opening protected turn'))
+        .map(message => message.type === 'init' ? message.prompt : message.content))
+        .toEqual(outcome === 'accepted'
+          ? ['reentered follower'] : ['failed promotion follower', 'reentered follower']);
+    },
+  );
+
+  it('rejects and removes DNS followers when the standalone worker exits before IPC bootstrap', async () => {
+    standaloneBinaryMock.mockReturnValue(true);
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let finishFirstLookup!: (addresses: string[][]) => void;
+    resolveProtectedHttpEgressTargetsMock
+      .mockReturnValueOnce(new Promise(resolve => {
+        finishFirstLookup = resolve;
+      }))
+      .mockResolvedValueOnce([['10.20.30.41']]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = makeDs();
+    const firstFollowerAdmission = vi.fn();
+    const secondFollowerAdmission = vi.fn();
+
+    expect(forkWorker(ds, 'opening protected turn', { turnId: 'om_egress_opening' })).toBe(true);
+    expect(forkWorker(ds, 'first queued protected follower', {
+      turnId: 'om_egress_follower_1',
+    }, { onAdmission: firstFollowerAdmission })).toBe(true);
+    expect(forkWorker(ds, 'second queued protected follower', {
+      turnId: 'om_egress_follower_2',
+    }, { onAdmission: secondFollowerAdmission })).toBe(true);
+    expect(firstFollowerAdmission).toHaveBeenCalledWith('deferred');
+    expect(secondFollowerAdmission).toHaveBeenCalledWith('deferred');
+    const followerTailIds = ds.session.queuedActivationTail?.map(entry => entry.id) ?? [];
+    expect(followerTailIds).toHaveLength(2);
+    const unrelatedTail = admitQueuedActivationTail(ds, {
+      userPrompt: 'unrelated queued turn',
+      cliInput: { content: 'unrelated queued turn' },
+      turnId: 'om_unrelated_tail',
+    });
+
+    finishFirstLookup([['10.20.30.40']]);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+
+    const persistedTailsAfterExit: Array<typeof ds.session.queuedActivationTail> = [];
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      persistedTailsAfterExit.push(structuredClone(session.queuedActivationTail));
+    });
+    const firstWorker = forkMock.mock.results[0]!.value;
+    firstWorker.emit('exit', 1, null);
+
+    await vi.waitFor(() => expect(firstFollowerAdmission).toHaveBeenLastCalledWith('rejected'));
+    expect(secondFollowerAdmission).toHaveBeenLastCalledWith('rejected');
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({ id: unrelatedTail.id, turnId: 'om_unrelated_tail' }),
+    ]);
+    expect(ds.session.queuedActivationTail?.some(entry => followerTailIds.includes(entry.id))).toBe(false);
+    expect(persistedTailsAfterExit).toContainEqual([
+      expect.objectContaining({ id: unrelatedTail.id, turnId: 'om_unrelated_tail' }),
+    ]);
+
+    expect(forkWorker(ds, 'retry protected turn', { turnId: 'om_egress_retry' })).toBe(true);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(2));
+    expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
+    const retryWorker = forkMock.mock.results[1]!.value;
+    retryWorker.emit('message', { type: 'worker_ipc_ready' });
+  });
+
+  it('keeps a failed pre-ready follower cleanup pending until a later fork persists it', async () => {
+    standaloneBinaryMock.mockReturnValue(true);
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let finishFirstLookup!: (addresses: string[][]) => void;
+    resolveProtectedHttpEgressTargetsMock
+      .mockReturnValueOnce(new Promise(resolve => {
+        finishFirstLookup = resolve;
+      }))
+      .mockResolvedValueOnce([['10.20.30.41']]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = makeDs();
+    const followerAdmissions: string[] = [];
+    const followerBlocked = vi.fn();
+    const durabilityEvents: string[] = [];
+
+    expect(forkWorker(ds, 'opening protected turn', { turnId: 'om_egress_persist_opening' })).toBe(true);
+    expect(forkWorker(ds, 'queued protected follower', {
+      turnId: 'om_egress_persist_follower',
+    }, {
+      onAdmission: admission => {
+        followerAdmissions.push(admission);
+        if (admission === 'rejected') durabilityEvents.push('follower rejected');
+      },
+      onAdmissionBlocked: followerBlocked,
+    })).toBe(true);
+    expect(followerAdmissions).toEqual(['deferred']);
+    const followerTailId = ds.session.queuedActivationTail?.[0]?.id;
+    expect(followerTailId).toBeTruthy();
+
+    finishFirstLookup([['10.20.30.40']]);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+
+    let cleanupWriteAttempts = 0;
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (session.queuedActivationTail !== undefined) return;
+      cleanupWriteAttempts += 1;
+      if (cleanupWriteAttempts === 1) throw new Error('cleanup disk full');
+      durabilityEvents.push('cleanup persisted');
+    });
+    const firstWorker = forkMock.mock.results[0]!.value;
+    firstWorker.emit('exit', 1, null);
+
+    expect(cleanupWriteAttempts).toBe(1);
+    expect(followerAdmissions).toEqual(['deferred']);
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({ id: followerTailId, turnId: 'om_egress_persist_follower' }),
+    ]);
+    expect(followerBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('cleanup persistence failed'),
+      turnId: 'om_egress_persist_follower',
+    }));
+    expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
+    expect(forkMock).toHaveBeenCalledTimes(1);
+
+    expect(forkWorker(ds, 'retry after cleanup failure', {
+      turnId: 'om_egress_persist_retry',
+    })).toBe(true);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(2));
+    expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
+    expect(cleanupWriteAttempts).toBeGreaterThanOrEqual(2);
+    expect(followerAdmissions).toEqual(['deferred', 'rejected']);
+    expect(durabilityEvents.slice(0, 2)).toEqual(['cleanup persisted', 'follower rejected']);
+    expect(ds.session.queuedActivationTail?.some(entry => entry.id === followerTailId)).toBeFalsy();
+
+    const retryWorker = forkMock.mock.results[1]!.value;
+    retryWorker.emit('message', { type: 'worker_ipc_ready' });
+  });
+
+  it('reports a post-freeze preparation exception as preparation failure rather than DNS failure', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    resolveProtectedHttpEgressTargetsMock.mockResolvedValue([['10.20.30.40']]);
+    checkWorkerAdmissionMock.mockImplementation(() => {
+      throw new Error('late preparation boom');
+    });
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const onAdmissionBlocked = vi.fn();
+
+    expect(forkWorker(makeDs(), 'protected egress', { turnId: 'om_egress_late' }, {
+      onAdmissionBlocked,
+    })).toBe(true);
+    await vi.waitFor(() => expect(onAdmissionBlocked).toHaveBeenCalled());
+
+    expect(onAdmissionBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining(
+        'Worker preparation failed after protected egress freeze: late preparation boom',
+      ),
+      turnId: 'om_egress_late',
+    }));
+    expect(loggerErrorMock).toHaveBeenCalledWith(expect.stringContaining(
+      'Worker preparation after protected HTTP egress freeze failed',
+    ));
+    expect(loggerErrorMock).not.toHaveBeenCalledWith(expect.stringContaining(
+      'Protected HTTP egress target freeze failed',
+    ));
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('removes DNS followers before rejecting them when post-freeze preparation fails', async () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy,
+      policyDigest: 'd'.repeat(64),
+    }]);
+    let finishLookup!: (addresses: string[][]) => void;
+    resolveProtectedHttpEgressTargetsMock.mockReturnValue(new Promise(resolve => {
+      finishLookup = resolve;
+    }));
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = makeDs();
+    const followerAdmissions: string[] = [];
+    const durabilityEvents: string[] = [];
+    const followerBlocked = vi.fn();
+
+    expect(forkWorker(ds, 'opening', { turnId: 'om_opening' })).toBe(true);
+    expect(forkWorker(ds, 'follower', { turnId: 'om_follower' }, {
+      onAdmission: admission => {
+        followerAdmissions.push(admission);
+        if (admission === 'rejected') durabilityEvents.push('follower rejected');
+      },
+      onAdmissionBlocked: followerBlocked,
+    })).toBe(true);
+    expect(followerAdmissions).toEqual(['deferred']);
+    const followerTailId = ds.session.queuedActivationTail?.[0]?.id;
+    expect(followerTailId).toBeTruthy();
+
+    let preparationFailed = false;
+    vi.mocked(sessionStore.updateSession).mockImplementation(session => {
+      if (!session.queuedActivationTail?.some(entry => entry.id === followerTailId)) {
+        durabilityEvents.push('cleanup persisted');
+      }
+      if (!preparationFailed
+        && session.protectedHttpEgressPolicy !== undefined
+        && session.sandbox !== undefined) {
+        preparationFailed = true;
+        throw new Error('post-policy preparation write failed');
+      }
+    });
+    finishLookup([['10.20.30.40']]);
+    await vi.waitFor(() => expect(followerAdmissions).toEqual(['deferred', 'rejected']));
+
+    expect(durabilityEvents.slice(0, 2)).toEqual(['cleanup persisted', 'follower rejected']);
+    expect(ds.session.queuedActivationTail?.some(entry => entry.id === followerTailId)).toBeFalsy();
+    expect(followerBlocked).toHaveBeenCalledWith(expect.objectContaining({
+      content: expect.stringContaining('post-policy preparation write failed'),
+      turnId: 'om_follower',
+    }));
+
+    expect(forkWorker(ds, 'retry opening', { turnId: 'om_retry' })).toBe(true);
+    await vi.waitFor(() => expect(forkMock).toHaveBeenCalledTimes(1));
+    const retryWorker = forkMock.mock.results[0]!.value;
+    retryWorker.emit('message', { type: 'worker_ipc_ready' });
+    await Promise.resolve();
+    expect(resolveProtectedHttpEgressTargetsMock).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(retryWorker.send).mock.calls
+      .map(call => call[0])
+      .some(message => message.type === 'message' && message.turnId === 'om_follower'))
+      .toBe(false);
+  });
+});
+
+describe('LinkRef turn admission mode freeze', () => {
+  it('resolves an unfrozen source sidecar at the real fork boundary', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ linkRefs: { mode: 'enabled' } }));
+    const prepareTurn = vi.fn(({ payload }: { payload: any }) => ({
+      ...payload,
+      content: `${payload.content}\n\n<link-ref-companion />`,
+      linkRefs: { mode: 'enabled' },
+    }));
+    setLinkRefRuntime({ prepareTurn } as unknown as LinkRefRuntime);
+    const ds = makeDs();
+
+    forkWorker(ds, {
+      content: 'task',
+      linkRefs: {
+        // Builder placeholder only: sources mean this envelope has not crossed
+        // the daemon admission boundary and therefore is not frozen yet.
+        mode: 'disabled',
+        sources: [{ sourceType: 'user_message', kind: 'text', text: 'source' }],
+      },
+    }, { turnId: 'om_link_ref_admit' });
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(prepareTurn).toHaveBeenCalledWith(expect.objectContaining({ mode: 'enabled' }));
+    expect(init.prompt).toContain('<link-ref-companion />');
+    expect(init.linkRefMode).toBe('enabled');
+  });
+
+  it('reuses a source-free mode already frozen in a queued record', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ linkRefs: { mode: 'disabled' } }));
+    const prepareTurn = vi.fn(({ payload }: { payload: any }) => payload);
+    setLinkRefRuntime({ prepareTurn } as unknown as LinkRefRuntime);
+    const ds = makeDs();
+
+    forkWorker(ds, {
+      content: 'queued task',
+      linkRefs: { mode: 'observe' },
+    }, { turnId: 'om_link_ref_frozen' });
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(prepareTurn).not.toHaveBeenCalled();
+    expect(init.linkRefMode).toBe('observe');
+  });
+
+  it('freezes mode when a successor first enters the durable activation tail', () => {
+    const bot = defaultBot({ linkRefs: { mode: 'enabled' } });
+    vi.mocked(getBot).mockImplementation(() => bot);
+    const prepareTurn = vi.fn(({ payload }: { payload: any }) => ({
+      ...payload,
+      content: `${payload.content}\n\n<frozen-link-ref />`,
+      linkRefs: { mode: 'enabled' },
+    }));
+    setLinkRefRuntime({ prepareTurn } as unknown as LinkRefRuntime);
+    const ds = makeDs({ worker: makeFakeWorker() });
+
+    admitQueuedActivationTail(ds, {
+      userPrompt: 'queued',
+      turnId: 'om_link_ref_tail',
+      cliInput: {
+        content: 'queued',
+        linkRefs: {
+          mode: 'disabled',
+          sources: [{ sourceType: 'user_message', kind: 'text', text: 'queued source' }],
+        },
+      },
+    });
+    bot.config.linkRefs = { mode: 'disabled' };
+
+    expect(ds.session.queuedActivationTail?.[0]?.cliInput).toEqual(expect.objectContaining({
+      content: 'queued',
+      linkRefs: {
+        mode: 'enabled',
+        sources: [{ sourceType: 'user_message', kind: 'text', text: 'queued source' }],
+      },
+    }));
+    expect(promoteQueuedActivationTail(ds)).toBe(true);
+    expect(prepareTurn).toHaveBeenCalledOnce();
+    expect(ds.worker?.send).toHaveBeenCalledWith(expect.objectContaining({
+      turnId: 'om_link_ref_tail',
+      linkRefMode: 'enabled',
+      content: expect.stringContaining('<frozen-link-ref />'),
+    }));
+  });
+
+  it('uses the pending-repository mode frozen before a later config change', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ linkRefs: { mode: 'disabled' } }));
+    const prepareTurn = vi.fn(({ payload }: { payload: any }) => ({
+      ...payload,
+      content: `${payload.content}\n\n<pending-link-ref />`,
+      linkRefs: { mode: 'enabled' },
+    }));
+    setLinkRefRuntime({ prepareTurn } as unknown as LinkRefRuntime);
+    const ds = makeDs();
+    ds.pendingLinkRefMode = 'enabled';
+
+    forkWorker(ds, {
+      content: 'pending opening',
+      linkRefs: {
+        mode: 'disabled',
+        sources: [{ sourceType: 'user_message', kind: 'text', text: 'pending source' }],
+      },
+    }, { turnId: 'om_pending_link_ref' });
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(prepareTurn).toHaveBeenCalledWith(expect.objectContaining({ mode: 'enabled' }));
+    expect(init.prompt).toContain('<pending-link-ref />');
+    expect(init.linkRefMode).toBe('enabled');
+  });
+
+  it('does not upgrade a pending-repository turn frozen as disabled', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ linkRefs: { mode: 'enabled' } }));
+    const prepareTurn = vi.fn(({ payload }: { payload: any }) => payload);
+    setLinkRefRuntime({ prepareTurn } as unknown as LinkRefRuntime);
+    const ds = makeDs();
+    ds.pendingLinkRefMode = 'disabled';
+
+    forkWorker(ds, { content: 'legacy pending opening' }, { turnId: 'om_pending_disabled' });
+
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(prepareTurn).not.toHaveBeenCalled();
+    expect(init.prompt).toBe('legacy pending opening');
+    expect(init).not.toHaveProperty('linkRefMode');
+  });
 });
 
 describe('narrow XPI shared-cwd generation admission seam', () => {
@@ -377,7 +1741,7 @@ describe('host memory pressure worker admission', () => {
     const sessionReply = vi.fn(async () => 'om_pressure');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -422,7 +1786,7 @@ describe('host memory pressure worker admission', () => {
     const sessionReply = vi.fn(async () => 'om_pressure');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -462,6 +1826,30 @@ describe('host memory pressure worker admission', () => {
 
     expect(forkMock).toHaveBeenCalledTimes(1);
     expect(admissions).toEqual(['accepted']);
+  });
+
+  it('forks the worker without daemon-only sentinels, bot tokens, or the egress socket locator', () => {
+    // The sentinel is the daemon/dashboard cores' private exit code: a worker
+    // that inherited it would exit 90 on a clean stop, read as a crash.
+    const keys = [
+      'BOTMUX_PM2_GRACEFUL_EXIT_CODE',
+      'GITHUB_TOKEN',
+      'GH_TOKEN',
+      'BOTMUX_PROTECTED_EGRESS_SOCKET',
+    ] as const;
+    const prev = keys.map(key => process.env[key]);
+    keys.forEach(key => { process.env[key] = 'leaked'; });
+    try {
+      expect(forkWorker(makeDs(), 'hello', false)).toBe(true);
+      const options = forkMock.mock.calls[0]![2] as { env: NodeJS.ProcessEnv };
+      expect(options.env.PATH).toBeDefined();
+      for (const key of keys) expect(key in options.env, key).toBe(false);
+    } finally {
+      keys.forEach((key, i) => {
+        if (prev[i] === undefined) delete process.env[key];
+        else process.env[key] = prev[i];
+      });
+    }
   });
 
   it('leaves explicit retry ownership with the caller during device isolation', async () => {
@@ -518,7 +1906,7 @@ describe('host memory pressure worker admission', () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -556,7 +1944,7 @@ describe('host memory pressure worker admission', () => {
     vi.useFakeTimers();
     initWorkerPool({
       sessionReply: vi.fn(async () => 'om_reply'),
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -601,7 +1989,7 @@ describe('host memory pressure worker admission', () => {
     vi.useFakeTimers();
     initWorkerPool({
       sessionReply: vi.fn(async () => 'om_reply'),
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -646,7 +2034,7 @@ describe('host memory pressure worker admission', () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -695,7 +2083,7 @@ describe('host memory pressure worker admission', () => {
     const sessionReply = vi.fn(async () => 'om_blocked');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -736,7 +2124,7 @@ describe('host memory pressure worker admission', () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -786,7 +2174,7 @@ describe('host memory pressure worker admission', () => {
     const sessionReply = vi.fn(async () => 'om_blocked');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -831,13 +2219,37 @@ describe('host memory pressure worker admission', () => {
 });
 
 describe('ordinary IM worker receipt acknowledgement', () => {
+  it('propagates durable-primary attribution through the actual fork init message', () => {
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+
+    expect(forkWorker(ds, 'durable opening', {
+      turnId: 'om_durable_opening',
+      dispatchAttempt: 9,
+      durablePrimaryInbox: true,
+    })).toBe(true);
+
+    expect(ds.initConfig).toMatchObject({
+      type: 'init',
+      prompt: 'durable opening',
+      turnId: 'om_durable_opening',
+      dispatchAttempt: 9,
+      durablePrimaryInbox: true,
+    });
+  });
+
   it('starts standalone init delivery only after the Worker IPC bootstrap is ready', async () => {
     vi.useFakeTimers();
     standaloneBinaryMock.mockReturnValue(true);
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -873,7 +2285,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -906,7 +2318,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_delayed');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -941,7 +2353,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -973,7 +2385,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_delayed');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1005,7 +2417,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_delayed');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1035,7 +2447,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_delayed');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1067,7 +2479,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1116,14 +2528,14 @@ describe('ordinary IM worker receipt acknowledgement', () => {
   it('reports an unstageable pre-admission rejection as a known non-execution', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_reply');
-    // The daemon declines the handoff — this is the real fallback path: the XPI
-    // switch is off, or the rejection lacked a safe reroute envelope/owner. The
-    // delivery then falls back to retry/fail, and its terminal notice must still
-    // describe a KNOWN outcome: the turn never entered the worker queue.
+    // The daemon declines the handoff — the XPI switch TTL-skew path (the daemon
+    // already reads the switch off). The delivery falls back to retry/fail, and
+    // its terminal notice must still describe a KNOWN outcome: the turn never
+    // entered the worker queue.
     const onOrdinaryImInputRejected = vi.fn(async () => false);
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
       onOrdinaryImInputRejected,
@@ -1206,7 +2618,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     });
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
       onOrdinaryImInputRejected,
@@ -1286,12 +2698,69 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
+  it('fails a deterministic rejection the daemon cannot reroute at once as not executed, without retrying', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const onOrdinaryImInputRejected = vi.fn(async () => 'not_executed' as const);
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onOrdinaryImInputRejected,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+
+    // A peer bot's message arrives while a caller-less scheduled turn runs, so
+    // the daemon has no principal to ask for confirmation.
+    const peerBot = {
+      requestUserOpenId: 'ou_peer_bot',
+      requestUserUnionId: 'on_peer_bot',
+      requestLarkAppId: 'app_test',
+      senderType: 'bot' as const,
+    };
+    expect(sendWorkerInput(ds, 'business turn', 'om_business', { trustedCaller: peerBot })).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    const rejection = {
+      type: 'turn_input_rejected',
+      turnId: 'om_business',
+      reason: 'cross_principal_requires_owner_confirmation',
+      rejectedBeforeAdmission: true,
+      activeTurnId: 'schedule:abcd1234:00000000-0000-4000-8000-000000000000',
+    };
+    worker.emit('message', rejection);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
+    worker.emit('message', rejection);
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(onOrdinaryImInputRejected).toHaveBeenCalledTimes(1);
+    const businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(1);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    const terminal = String(sessionReply.mock.calls[0]?.[1]);
+    expect(terminal).toContain('没有被执行');
+    expect(terminal).toContain('om_business');
+    expect(terminal).toContain('cross_principal_requires_owner_confirmation');
+    expect(terminal).not.toContain('无法确认这条消息是否已进入 Worker 的执行队列');
+  });
+
   it('retries the exact turn once and reports a visible failure when no receipt ACK arrives', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_failure');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1326,7 +2795,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_delayed');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1354,7 +2823,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_failure');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1386,7 +2855,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_delayed');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1418,7 +2887,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1448,7 +2917,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1481,7 +2950,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_failure');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1509,7 +2978,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_failure');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1534,7 +3003,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_failure');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1564,7 +3033,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1600,7 +3069,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1636,7 +3105,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1669,7 +3138,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1699,7 +3168,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1728,7 +3197,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1769,7 +3238,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1800,7 +3269,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1825,7 +3294,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_failure');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1871,7 +3340,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_failure');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1899,7 +3368,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_delayed');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1927,7 +3396,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_failure');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -1950,7 +3419,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     const sessionReply = vi.fn(async () => 'om_delayed');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -2957,7 +4426,7 @@ describe('TraeX task continuation', () => {
     const sessionReply = vi.fn(async () => 'om_readonly_final');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -3024,7 +4493,7 @@ describe('TraeX task continuation', () => {
     const sessionReply = vi.fn(async () => 'om_recovered_final');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -3078,7 +4547,7 @@ describe('TraeX task continuation', () => {
     });
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -3137,7 +4606,7 @@ describe('TraeX task continuation', () => {
     const sessionReply = vi.fn(async () => 'om_unexpected');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -3179,7 +4648,7 @@ describe('TraeX task continuation', () => {
     const sessionReply = vi.fn(async () => 'om_disabled_recovered_warning');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -3281,7 +4750,7 @@ describe('ordinary Claude semantic recovery', () => {
     const sessionReply = vi.fn(async () => 'om_warning');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -3345,12 +4814,15 @@ describe('ordinary Claude semantic recovery', () => {
     // there is no input to re-send. The raw error code must still be visible:
     // it is the only thing distinguishing a real provider fault from the
     // unconditional "cannot retry safely" fallback wording.
+    // Delivered through the recovery-notice outbox: a stable Feishu uuid rides
+    // along so a retried send after an unconfirmed one is de-duplicated.
     expect(sessionReply).toHaveBeenCalledWith(
       'om_root',
       expect.stringContaining('provider_unexpected_eof'),
       'interactive',
       'app_test',
       'om_original',
+      expect.objectContaining({ uuid: expect.any(String) }),
     );
     expect(vi.mocked(sessionReply).mock.calls[0][1]).not.toContain('retry_turn');    expect(ds.agentAttention).toEqual(expect.objectContaining({
       kind: 'blocked',
@@ -3379,7 +4851,7 @@ describe('ordinary Claude semantic recovery', () => {
   });
 
   it.each([
-    ['gemini', {}],
+    ['opencode', {}],
     ['codex', { adoptedFrom: { sessionId: 'external' } }],
     ['codex', { chatId: 'http_async_test' }],
     ['claude-code', { adoptedFrom: { sessionId: 'external' } }],
@@ -3413,12 +4885,12 @@ describe('ordinary Claude semantic recovery', () => {
     const sessionReply = vi.fn(async () => 'om_warning');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
     const ds = makeDs({
-      adoptedFrom: { sessionId: 'external', cliId: 'claude-code', cwd: '/repo' },
+      adoptedFrom: { sessionId: 'external', cliId: 'claude-code', cwd: REPO },
     } as any);
     forkWorker(ds, 'adopted turn', 'om_adopted');
     const worker = forkMock.mock.results.at(-1)!.value;
@@ -3442,7 +4914,7 @@ describe('ordinary Claude semantic recovery', () => {
       'interactive',
       'app_test',
       'om_adopted',
-      { sourceSessionId: 'sid-start-test' },
+      expect.objectContaining({ sourceSessionId: 'sid-start-test' }),
     ));
     expect(ds.session.ordinaryTurnRecovery).toBeUndefined();
     expect(ds.agentAttention).toEqual(expect.objectContaining({
@@ -3461,7 +4933,7 @@ describe('ordinary Claude semantic recovery', () => {
     const sessionReply = vi.fn(async () => 'om_x');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -3492,7 +4964,7 @@ describe('ordinary Claude semantic recovery', () => {
     const sessionReply = vi.fn(async () => 'om_x');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -3526,7 +4998,7 @@ describe('ordinary Claude semantic recovery', () => {
     const sessionReply = vi.fn(async () => 'om_x');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -3552,7 +5024,7 @@ describe('ordinary Claude semantic recovery', () => {
     const sessionReply = vi.fn(async () => 'om_warning');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -3852,7 +5324,7 @@ describe('ordinary Claude semantic recovery', () => {
     const sessionReply = vi.fn(async () => 'om_warning');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -3889,14 +5361,17 @@ describe('ordinary Claude semantic recovery', () => {
       'interactive',
       'app_test',
       'om_original',
+      expect.objectContaining({ uuid: expect.any(String) }),
     );
-    // The builder is stubbed in this suite, so assert on the policy decision it
-    // was handed: `caveated`, never `safe`. A safe offer here would render a
-    // verbatim-resend button for a turn whose progress is unknown.
+    // The builder is stubbed in this suite, so assert on the decision it was
+    // handed: this turn has no recorded human sender (no reply registry entry,
+    // no caller) and no lastFailedTurn, so there is nothing it may re-deliver
+    // or continue — never a button that replays a turn of unknown progress.
     const recoveryCard = JSON.parse(
       vi.mocked(sessionReply).mock.calls.find(c => c[2] === 'interactive')![1] as string,
     );
-    expect(recoveryCard.retryOffer).toBe('caveated');
+    expect(recoveryCard.retry).toBe('none');
+    expect(recoveryCard.action).toBeUndefined();
     expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
       status: 'attention_required',
       lastErrorCode: 'recovery_delivery_failed',
@@ -3926,6 +5401,30 @@ describe('persistent backend target handoff', () => {
       persistentBackendTarget: target,
     }));
   });
+
+  it('passes the herdr config when herdr comes from the session stamp rather than the bot', () => {
+    // The bot sets no backendType, so herdr is decided by the stamp (or the
+    // daemon-wide BACKEND_TYPE). The env-level herdr config must still reach
+    // the worker, with the bot's own herdr fields layered over it.
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ herdr: { tab: '3' } }));
+    const daemon = config.daemon as { herdr?: unknown };
+    daemon.herdr = { sessionName: 'default', placement: 'split', tab: '9' };
+    try {
+      const ds = makeDs();
+      ds.session.backendType = 'herdr';
+
+      forkWorker(ds, 'resume', true);
+
+      const worker = forkMock.mock.results.at(-1)!.value;
+      expect(vi.mocked(worker.send).mock.calls[0][0]).toEqual(expect.objectContaining({
+        type: 'init',
+        backendType: 'herdr',
+        backendConfig: { sessionName: 'default', placement: 'split', tab: '3' },
+      }));
+    } finally {
+      delete daemon.herdr;
+    }
+  });
 });
 
 describe('no-transport read isolation follows local sandbox config (not forced)', () => {
@@ -3933,7 +5432,7 @@ describe('no-transport read isolation follows local sandbox config (not forced)'
   // OR HTTP virtual chat) is NO LONGER force-isolated. readIsolation is opt-in
   // only — driven purely by explicit per-bot `readIsolation` — so a no-transport
   // session with no sandbox config reads the disk like a normal chat. The env
-  // secret-withhold (asserted in api-only-mode-wiring) is a SEPARATE boundary and
+  // secret-withhold (asserted in the describe below) is a SEPARATE boundary and
   // stays independent of this.
   const readInit = () => {
     const worker = forkMock.mock.results.at(-1)!.value;
@@ -3972,6 +5471,67 @@ describe('no-transport read isolation follows local sandbox config (not forced)'
     const ds = makeDs();
     forkWorker(ds, 'hello', false);
     expect(readInit().readIsolation).toBe(false);
+  });
+});
+
+describe('no-transport workers never receive the Lark app secret', () => {
+  // The secret is withheld at the daemon→worker boundary (fork env AND init
+  // message) rather than trusting an apiOnly flag the sandboxed agent could
+  // flip; both fork paths (fresh + adopt) must do it.
+  const lastFork = (ds: DaemonSession) => ({
+    env: (forkMock.mock.calls.at(-1)?.[2] as { env?: Record<string, string | undefined> }).env ?? {},
+    init: vi.mocked((ds.worker as any).send).mock.calls[0][0],
+  });
+  const virtualDs = (overrides: Partial<DaemonSession> = {}) => makeDs({
+    chatId: 'http_async_secret', session: { ...makeDs().session, chatId: 'http_async_secret' }, ...overrides,
+  });
+  const adoptedFrom = {
+    source: 'tmux', tmuxTarget: 'work:0.0', originalCliPid: 4242, sessionId: 'sess-adopt-secret',
+    cliId: 'claude-code', cwd: REPO, paneCols: 200, paneRows: 50,
+  } as DaemonSession['adoptedFrom'];
+
+  it('apiOnly bot: empty secret in fork env and init even when bots.json carries one', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ apiOnly: true, larkAppSecret: 'real-secret' }));
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const { env, init } = lastFork(ds);
+    expect(env.LARK_APP_SECRET).toBe('');
+    expect(init.larkAppSecret).toBe('');
+    expect(init.apiOnly).toBe(true);
+  });
+
+  it('HTTP virtual chat on a normal bot: secret withheld, and the adopt path never forks at all', () => {
+    const fresh = virtualDs();
+    forkWorker(fresh, 'hello', false);
+    expect(lastFork(fresh).env.LARK_APP_SECRET).toBe('');
+    expect(lastFork(fresh).init.larkAppSecret).toBe('');
+
+    // Adopt would attach an unconfined pre-existing CLI: refused before any fork
+    // and the stale adopt metadata is dropped so it cold-starts instead.
+    forkMock.mockClear();
+    const adopted = virtualDs({ adoptedFrom });
+    forkAdoptWorker(adopted, { prompt: 'hi', turnId: 'om_adopt_secret' });
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(adopted.adoptedFrom).toBeUndefined();
+  });
+
+  it('a real chat keeps the secret, and the init freezes the daemon-loaded bots config path', () => {
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const { env, init } = lastFork(ds);
+    expect(env.LARK_APP_SECRET).toBe('secret');
+    expect(init.larkAppSecret).toBe('secret');
+    // Host-owned facts the worker's fs policy denies against — never re-guessed
+    // from env inside the worker.
+    expect(init.loadedBotsConfigPath).toBe('/home/u/.botmux/bots.json');
+    expect(init.loadedBotsConfigProvenance).toBe('loaded');
+  });
+
+  it('adopt-observe is refused for apiOnly bots and HTTP virtual chats (cold-start instead)', () => {
+    expect(adoptSandboxBlocked({ apiOnly: true })).toBe(true);
+    expect(adoptSandboxBlocked({}, { chatId: 'http_async_adopt' })).toBe(true);
+    expect(adoptSandboxBlocked({}, { chatId: 'headless_hl_adopt1234' })).toBe(true);
+    expect(adoptSandboxBlocked({}, { chatId: 'oc_real_chat' })).toBe(false);
   });
 });
 
@@ -4099,6 +5659,28 @@ describe('CLI runtime session freeze', () => {
     expect(resumedInit.cliRuntime).toEqual(firstInit.cliRuntime);
     expect(resumedInit.cliPathOverride).toBe('/opt/vendor-codex');
     expect(ds.session.cliRuntime).toEqual(firstInit.cliRuntime);
+  });
+});
+
+describe('delivered-final failure-notice opt-in init wiring', () => {
+  it.each([undefined, false, 'true'])('does not send the experimental field when the bot value is %s', value => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ suppressDeliveredFinalFailureNotice: value }));
+    const ds = makeDs();
+    forkWorker(ds, 'hello', { turnId: 'om_default' });
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init.type).toBe('init');
+    expect(init).not.toHaveProperty('suppressDeliveredFinalFailureNotice');
+  });
+
+  it('freezes an explicit opt-in on the worker init', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ suppressDeliveredFinalFailureNotice: true }));
+    const ds = makeDs();
+    forkWorker(ds, 'hello', { turnId: 'om_opt_in' });
+    const worker = forkMock.mock.results.at(-1)!.value;
+    const init = vi.mocked(worker.send).mock.calls[0][0];
+    expect(init.suppressDeliveredFinalFailureNotice).toBe(true);
+    expect(ds.initConfig?.suppressDeliveredFinalFailureNotice).toBe(true);
   });
 });
 
@@ -5326,7 +6908,7 @@ describe('Codex App clean-input feature gate', () => {
     });
     initWorkerPool({
       sessionReply: vi.fn(async () => 'om_reply'),
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
       enforceLiveSessionCap,
@@ -5366,7 +6948,7 @@ describe('Codex App clean-input feature gate', () => {
       });
       initWorkerPool({
         sessionReply: vi.fn(async () => 'om_reply'),
-        getSessionWorkingDir: () => '/repo',
+        getSessionWorkingDir: () => REPO,
         getActiveCount: () => 1,
         closeSession: vi.fn(),
         onQueuedActivationSubmitted: release,
@@ -5545,7 +7127,7 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
         originalCliPid: 4242,
         sessionId: 'sess-adopt-live',
         cliId: 'claude-code',
-        cwd: '/repo',
+        cwd: REPO,
         paneCols: 200,
         paneRows: 50,
       },
@@ -5567,6 +7149,35 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
       turnId: 'om_refork_turn',
     }));
     expect(init).not.toHaveProperty('replyStyle');
+  });
+
+  it('admits LinkRefs from the complete adopt re-fork payload', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ linkRefs: { mode: 'enabled' } }));
+    const prepareTurn = vi.fn(({ payload }: { payload: any }) => ({
+      ...payload,
+      content: `${payload.content}\n\n<adopt-link-ref-companion />`,
+      linkRefs: { mode: 'enabled' },
+    }));
+    setLinkRefRuntime({ prepareTurn } as unknown as LinkRefRuntime);
+    const ds = makeAdoptDs();
+
+    forkAdoptWorker(ds, {
+      payload: {
+        content: '<bridge>hello from Lark</bridge>',
+        linkRefs: {
+          mode: 'disabled',
+          sources: [{ sourceType: 'user_message', kind: 'text', text: 'https://example.test/action' }],
+        },
+      },
+      turnId: 'om_adopt_link_ref',
+    });
+
+    expect(prepareTurn).toHaveBeenCalledWith(expect.objectContaining({ mode: 'enabled' }));
+    expect(vi.mocked((ds.worker as any).send).mock.calls[0][0]).toEqual(expect.objectContaining({
+      prompt: expect.stringContaining('<adopt-link-ref-companion />'),
+      turnId: 'om_adopt_link_ref',
+      linkRefMode: 'enabled',
+    }));
   });
 
   it('forwards atMostOnce into an adopt init so a retained XPI turn is not replayed by the worker', () => {
@@ -5737,7 +7348,7 @@ describe('session.start lifecycle integration', () => {
     const enforceLiveSessionCap = vi.fn();
     initWorkerPool({
       sessionReply: vi.fn(async () => 'om_reply'),
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 31,
       closeSession: vi.fn(),
       enforceLiveSessionCap,
@@ -5883,7 +7494,7 @@ describe('session.start lifecycle integration', () => {
         originalCliPid: 23456,
         sessionId: 'codex-session',
         cliId: 'codex',
-        cwd: '/repo',
+        cwd: REPO,
       },
     }));
 
@@ -5905,7 +7516,7 @@ describe('session.start lifecycle integration', () => {
         originalCliPid: 23456,
         sessionId: 'codex-session',
         cliId: 'codex',
-        cwd: '/repo',
+        cwd: REPO,
       },
     }));
 
@@ -5928,7 +7539,7 @@ describe('session.start lifecycle integration', () => {
         originalCliPid: 23456,
         sessionId: 'codex-session',
         cliId: 'codex',
-        cwd: '/repo',
+        cwd: REPO,
       },
     }));
 
@@ -6209,6 +7820,20 @@ describe('session.start lifecycle integration', () => {
     expect(sessionStore.updateSession).toHaveBeenCalledWith(ds.session);
   });
 
+  it('forwards the current Codex chat resident semantic title to group naming', () => {
+    const ds = makeDs({ scope: 'chat' });
+    ds.session.scope = 'chat';
+    forkWorker(ds, '<user_message>排查超时</user_message>', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    vi.mocked(acceptSessionGroupTitle).mockClear();
+    worker.emit('message', { type: 'native_session_title_generated', title: '[BotMux·Lark] 排查超时' });
+    expect(acceptSessionGroupTitle).toHaveBeenCalledWith(ds.larkAppId, ds.session, '[BotMux·Lark] 排查超时');
+    vi.mocked(acceptSessionGroupTitle).mockClear();
+    ds.session.nativeSessionTitleUserDefined = true;
+    worker.emit('message', { type: 'native_session_title_generated', title: '[BotMux·Lark] 迟到标题' });
+    expect(acceptSessionGroupTitle).not.toHaveBeenCalled();
+  });
+
   it('ignores a late generated title after the user explicitly renames the session', () => {
     const ds = makeDs({
       session: {
@@ -6238,7 +7863,7 @@ describe('blocker #3: forkAdoptWorker refuses sandbox-enabled bots', () => {
       originalCliPid: 23456,
       sessionId: 'codex-session',
       cliId: 'codex',
-      cwd: '/repo',
+      cwd: REPO,
     },
   });
 
@@ -6282,6 +7907,32 @@ describe('blocker #3: forkAdoptWorker refuses sandbox-enabled bots', () => {
       reason: 'adopt',
     }));
   });
+
+  it('protected HTTP egress policy → refuses adopt because an existing process cannot receive the frozen network boundary', () => {
+    collectProtectedHttpEgressPoliciesMock.mockReturnValue([{
+      pluginId: 'fixture-plugin',
+      capabilityId: 'fixture.actor-write.v1',
+      policy: {
+        id: 'fixture.write.v1',
+        targets: [{
+          scheme: 'https',
+          host: 'fixture.internal.example',
+          port: 443,
+          denyRoutes: [{ methods: ['POST'], path: '/v1/items/update' }],
+        }],
+      },
+      policyDigest: 'd'.repeat(64),
+    }]);
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ plugins: ['fixture-plugin'] }));
+    const ds = adopt();
+    ds.session.adoptedFrom = { ...ds.adoptedFrom } as any;
+
+    expect(forkAdoptWorker(ds)).toBe('rejected');
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(resolveProtectedHttpEgressTargetsMock).not.toHaveBeenCalled();
+    expect(ds.adoptedFrom).toBeUndefined();
+    expect(ds.session.adoptedFrom).toBeUndefined();
+  });
 });
 
 describe('managed turn authority worker generations', () => {
@@ -6308,6 +7959,150 @@ describe('managed turn authority worker generations', () => {
 
   afterEach(() => {
     scheduledTasksForProvenance.delete('feedbeef');
+  });
+
+  function startAttestedWorker(caller: TrustedCaller | null = scheduledCaller) {
+    const ds = makeDs();
+    ds.session.replyTargets = {
+      [scheduledTurnId]: {
+        rootMessageId: 'om_root', senderOpenId: 'ou_latest_sender',
+        updatedAt: new Date().toISOString(),
+      },
+    };
+    const start = () => {
+      forkWorker(ds, { content: 'scheduled', trustedCaller: scheduledCaller }, scheduledTurnId);
+      const worker = forkMock.mock.results.at(-1)!.value;
+      worker.pid = process.pid;
+      worker.connected = true;
+      worker.emit('message', {
+        type: 'local_process_attestation', backendType: 'pty', credentialIsolated: false,
+        cliPid: process.pid, cliProcStart: readProcessStartIdentity(process.pid),
+      });
+      return worker;
+    };
+    let worker = start();
+    const publish = (changes: Partial<Extract<WorkerToDaemon, { type: 'managed_turn_origin' }>> = {}) => {
+      worker.emit('message', {
+        type: 'managed_turn_origin', sessionId: ds.session.sessionId,
+        capability: 'scheduled-capability', turnId: scheduledTurnId,
+        identityTurnId: scheduledTurnId, dispatchAttempt: 1, trustedCaller: caller,
+        ...changes,
+      });
+    };
+    publish();
+    return { ds, worker, publish, restart: () => { worker = start(); } };
+  }
+
+  async function startToolPeer() {
+    const child = spawnTsEval("process.stdout.write('ready'); process.stdin.resume();", {
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    await once(child.stdout!, 'data');
+    return {
+      peer: { pid: child.pid!, procStart: readProcessStartIdentity(child.pid!)! },
+      close: async () => {
+        const exited = once(child, 'exit');
+        child.kill();
+        await exited;
+      },
+    };
+  }
+
+  // Callerless delegated execution publishes trustedCaller:null on EVERY
+  // republication. A republication that omits the field (older worker) must
+  // keep the explicit null and must NOT let the reply-target sender become the
+  // callerOpenId — otherwise plugin_result_delivery authenticates a human reply
+  // as the callerless turn (the review's mixed-tuple bug).
+  it('keeps an explicit callerless (trustedCaller:null) republication from borrowing a reply-target caller', () => {
+    const { ds, publish } = startAttestedWorker(null);
+    expect(ds.managedTurnOrigin?.trustedCaller).toBeNull();
+    expect(ds.managedTurnOrigin?.callerOpenId).toBeUndefined();
+
+    // New worker republishes identically but leaves the field out (as an older
+    // worker in a mixed fleet would).
+    publish({ capability: 'republished-capability', trustedCaller: undefined });
+    expect(ds.managedTurnOrigin?.trustedCaller).toBeNull();
+    expect(ds.managedTurnOrigin?.callerOpenId).toBeUndefined();
+
+    // Gateway caller resolution for this turn is therefore callerless; the
+    // human reply-target sender never leaks into the tuple.
+    expect(currentGatewayCallerOpenId(ds, scheduledTurnId)).toBeUndefined();
+  });
+
+  it.skipIf(process.platform !== 'linux').each([
+    ['direct', scheduledCaller],
+    ['delegated', null],
+  ] as const)('keeps a running %s tool attested across repeated origin publication', async (_mode, caller) => {
+    const { ds, publish } = startAttestedWorker(caller);
+    const tool = await startToolPeer();
+    const input = { sessionId: ds.session.sessionId, peer: tool.peer, findSession: () => ds };
+    const actor = () => resolveDaemonCurrentActor({
+      ...input,
+      resolveIdentity: async (_appId, openId) => ({ openId, type: 'user', email: 'scheduler@example.test' }),
+    });
+    try {
+      expect(resolveDaemonCurrentExecution(input)).toMatchObject({ status: 'verified', turnId: scheduledTurnId });
+      expect((await actor()).ok).toBe(caller !== null);
+      publish({ capability: 'republished-capability' });
+      expect(resolveDaemonCurrentExecution(input)).toMatchObject({ status: 'verified', turnId: scheduledTurnId });
+      expect((await actor()).ok).toBe(caller !== null);
+      expect(ds.managedTurnOrigin?.callerOpenId).toBe(caller?.requestUserOpenId);
+
+      publish({ turnId: 'om_steered_envelope', capability: 'steered-capability', dispatchAttempt: undefined });
+      expect(resolveDaemonCurrentExecution(input)).toMatchObject({ status: 'verified', turnId: 'om_steered_envelope' });
+      expect(resolveDaemonCurrentExecution(input)?.dispatchAttempt).toBeUndefined();
+      expect((await actor()).ok).toBe(caller !== null);
+    } finally {
+      await tool.close();
+    }
+  });
+
+  it.skipIf(process.platform !== 'linux').each([
+    'caller', 'turn', 'attempt', 'worker generation', 'revocation',
+  ] as const)('rejects an old tool after %s changes the execution boundary', async change => {
+    const { ds, worker, publish, restart } = startAttestedWorker();
+    const oldTool = await startToolPeer();
+    const input = (peer: typeof oldTool.peer) => ({ sessionId: ds.session.sessionId, peer, findSession: () => ds });
+    try {
+      expect(resolveDaemonCurrentExecution(input(oldTool.peer))?.status).toBe('verified');
+      if (change === 'worker generation') restart();
+      if (change === 'revocation') worker.emit('message', {
+        type: 'managed_turn_origin_revoked', sessionId: ds.session.sessionId,
+        capability: 'scheduled-capability', turnId: scheduledTurnId,
+      });
+      publish({
+        capability: 'next-capability',
+        ...(change === 'caller' ? { trustedCaller: { ...scheduledCaller, requestUserOpenId: 'ou_next' } } : {}),
+        ...(change === 'turn' ? { turnId: 'om_next', identityTurnId: 'om_next' } : {}),
+        ...(change === 'attempt' ? { dispatchAttempt: 2 } : {}),
+      });
+      expect(resolveDaemonCurrentExecution(input(oldTool.peer))).toBeNull();
+      const nextTool = await startToolPeer();
+      try {
+        expect(resolveDaemonCurrentExecution(input(nextTool.peer))?.status).toBe('verified');
+      } finally {
+        await nextTool.close();
+      }
+    } finally {
+      await oldTool.close();
+    }
+  });
+
+  it.each([
+    [scheduledCaller, 'ou_latest_sender', 'trusted_caller_mismatch'],
+    [scheduledCaller, scheduledCaller.requestUserOpenId, 'plugin_result_delivery_failed'],
+    [null, 'ou_latest_sender', 'trusted_caller_mismatch'],
+  ] as const)('binds plugin delivery to the published authority %j for %s', (caller, deliveryCaller, expectedError) => {
+    const { ds, worker } = startAttestedWorker(caller);
+    worker.emit('message', {
+      type: 'plugin_result_delivery', requestId: 'authority-test', sessionId: ds.session.sessionId,
+      turnId: scheduledTurnId, dispatchAttempt: 1, callerOpenId: deliveryCaller,
+      pluginId: 'test', deliveryId: 'test', viewToken: 'invalid',
+      expiresAt: '2099-01-01T00:00:00.000Z', fileCount: 0, responseKind: 'final',
+    });
+    expect(worker.send).toHaveBeenCalledWith({
+      type: 'plugin_result_delivery_result', requestId: 'authority-test', ok: false, error: expectedError,
+    });
   });
 
   it('keeps a fresh scheduled turn bound across repeated managed-origin publications', async () => {
@@ -6399,6 +8194,21 @@ describe('managed turn authority worker generations', () => {
 
     expect(ds.managedTurnOrigin?.callerOpenId).toBeUndefined();
     expect(ds.scheduledTurnCallers).toBeUndefined();
+  });
+
+  it('rejects a scheduled creator that only matches a sandbox-rewritten schedules.json', () => {
+    // The agent swapped the creator in its BOT_HOME projection; the forged
+    // caller agrees with that file but not with the host authority row.
+    const forged = { ...scheduledCaller, requestUserOpenId: 'ou_forged', requestUserUnionId: 'on_forged' };
+    tamperedProjection.set('feedbeef', {
+      ...scheduledTasksForProvenance.get('feedbeef'),
+      ownerOpenId: forged.requestUserOpenId,
+      ownerUnionId: forged.requestUserUnionId,
+    });
+    const ds = makeDs();
+    forkWorker(ds, { content: 'scheduled', trustedCaller: forged }, scheduledTurnId);
+
+    expect(ds.scheduledTurnCallers?.get(scheduledTurnId)).toBeUndefined();
   });
 
   it('binds a live injected scheduled turn and clears the pending identity on terminal', async () => {
@@ -6512,7 +8322,7 @@ describe('managed turn authority worker generations', () => {
   it('clears retained policy authority when exit reconciliation kills the same worker', async () => {
     initWorkerPool({
       sessionReply: vi.fn(async () => 'om_reply'),
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
       // onCliExit is async in production. A reconciliation step can kill the
@@ -6639,7 +8449,7 @@ describe('managed turn authority worker generations', () => {
         originalCliPid: 23456,
         sessionId: 'codex-session',
         cliId: 'codex',
-        cwd: '/repo',
+        cwd: REPO,
       },
     });
     forkMock.mockImplementationOnce(() => { throw new Error('adopt replacement fork failed'); });
@@ -6939,7 +8749,7 @@ describe('worker startup failure delivery', () => {
     const sessionReply = vi.fn(async () => 'om_error_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -6979,7 +8789,7 @@ describe('worker startup failure delivery', () => {
     const sessionReply = vi.fn(async () => 'om_error_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -7022,7 +8832,7 @@ describe('worker startup failure delivery', () => {
     const sessionReply = vi.fn(async () => 'om_error_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -7052,7 +8862,7 @@ describe('worker startup failure delivery', () => {
     const sessionReply = vi.fn(async () => 'om_error_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -7079,7 +8889,7 @@ describe('worker startup failure delivery', () => {
 
   it('leaves a durable VC delivery pre-ready worker exit to the receipt chain (no reply)', async () => {
     const sessionReply = vi.fn(async () => 'om_error_reply');
-    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO, getActiveCount: () => 1, closeSession: vi.fn() });
     const ds = makeDs();
     (ds.session as unknown as { vcMeetingReceiver: unknown }).vcMeetingReceiver = {
       meetingId: 'm1', memberId: 'mem1', memberEpoch: 1,
@@ -7098,7 +8908,7 @@ describe('worker startup failure delivery', () => {
 
   it('leaves a durable VC delivery fork-level error to the receipt chain (no reply)', async () => {
     const sessionReply = vi.fn(async () => 'om_error_reply');
-    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO, getActiveCount: () => 1, closeSession: vi.fn() });
     const ds = makeDs();
     (ds.session as unknown as { vcMeetingReceiver: unknown }).vcMeetingReceiver = {
       meetingId: 'm1', memberId: 'mem1', memberEpoch: 1,
@@ -7116,7 +8926,7 @@ describe('worker startup failure delivery', () => {
 
   it('Plan B: a plain user IM-turn fork error on a meeting-agent session DOES surface to the user', async () => {
     const sessionReply = vi.fn(async () => 'om_error_reply');
-    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO, getActiveCount: () => 1, closeSession: vi.fn() });
     const ds = makeDs();
     (ds.session as unknown as { vcMeetingReceiver: unknown }).vcMeetingReceiver = {
       meetingId: 'm1', memberId: 'mem1', memberEpoch: 1,
@@ -7137,7 +8947,7 @@ describe('worker startup failure delivery', () => {
 
   it('Plan B: a durable meeting-delivery fork error stays fenced (not surfaced out-of-band)', async () => {
     const sessionReply = vi.fn(async () => 'om_error_reply');
-    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO, getActiveCount: () => 1, closeSession: vi.fn() });
     const ds = makeDs();
     (ds.session as unknown as { vcMeetingReceiver: unknown }).vcMeetingReceiver = {
       meetingId: 'm1', memberId: 'mem1', memberEpoch: 1,
@@ -7159,7 +8969,7 @@ describe('worker startup failure delivery', () => {
     const sessionReply = vi.fn(async () => 'om_error_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -7179,7 +8989,7 @@ describe('worker startup failure delivery', () => {
     const sessionReply = vi.fn(async () => 'om_error_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -7203,7 +9013,7 @@ describe('worker startup failure delivery', () => {
     const sessionReply = vi.fn(async () => 'om_error_reply');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
     });
@@ -7213,7 +9023,7 @@ describe('worker startup failure delivery', () => {
         originalCliPid: 23456,
         sessionId: 'codex-session',
         cliId: 'codex',
-        cwd: '/repo',
+        cwd: REPO,
       },
     });
     forkAdoptWorker(ds);
@@ -7425,6 +9235,15 @@ describe('forkWorker session agent config freeze', () => {
 
   // ── An EXPLICIT per-trigger override (trigger API options.model) still wins
   //    over the bot config — that is the only thing that outranks it now. ──
+  it.each([false, true])('explicit pin reaches the actual worker init on fresh/restore spawn (resume=%s)', resume => {
+    const ds = makeDs();
+    ds.session.modelPin = { model: 'gpt-6.1-terra', effort: 'high', source: 'topic-header', setBy: 'owner', setAt: new Date().toISOString() };
+    forkWorker(ds, '', resume);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'init', model: 'gpt-6.1-terra', reasoningEffort: 'high', resume }));
+    expect(ds.session.model).toBe('gpt-6.1-terra');
+  });
+
   it('prefers an explicit per-trigger model override over the bot config', () => {
     const ds = makeDs();
     ds.session.cliId = 'codex' as any;
@@ -7494,12 +9313,54 @@ describe('forkWorker session.workingDir back-fill (cross-bot inherit enabler)', 
     expect(ds.session.workingDir).toBe('/pinned-repo');
   });
 
-  it('NEVER pins the homedir crash-fallback when the resolved dir is missing', () => {
-    initPool(() => join(tmp, 'gone'));   // does not exist → forkWorker falls back to homedir()
+  it('refuses to start the CLI when the resolved dir is missing instead of falling back to $HOME', () => {
+    const gone = join(tmp, 'gone');
+    const onMissingWorkingDir = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => gone,
+      onMissingWorkingDir,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
     const ds = makeDs();
-    ds.session.workingDir = undefined;
-    forkWorker(ds, 'hi', false);
-    expect(ds.session.workingDir).toBeFalsy();   // cwd(homedir) !== rawCwd(missing) → not persisted
+    ds.session.workingDir = gone;
+    ds.workingDir = gone;
+    forkMock.mockClear();
+
+    expect(() => forkWorker(ds, 'hi', { turnId: 'om_turn_missing' })).toThrow(MissingWorkingDirError);
+
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(onMissingWorkingDir).toHaveBeenCalledWith(ds, gone, { turnId: 'om_turn_missing' });
+    expect(ds.workingDir).toBe(gone);           // not rewritten to $HOME for the next attempt
+    expect(ds.session.workingDir).toBe(gone);
+    expect(ds.worker).toBeFalsy();
+  });
+
+  it('re-attaching a backing session probed alive still forks past a deleted dir (worker in $HOME)', () => {
+    const gone = join(tmp, 'gone');
+    const onMissingWorkingDir = vi.fn();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => gone,
+      onMissingWorkingDir,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.session.workingDir = gone;
+    ds.workingDir = gone;
+    forkMock.mockClear();
+
+    forkWorker(ds, '', true, { reattachLiveBackend: true });
+
+    expect(onMissingWorkingDir).not.toHaveBeenCalled();
+    expect(forkMock).toHaveBeenCalledTimes(1);
+    expect((forkMock.mock.calls[0]![2] as { cwd: string }).cwd).toBe(homedir());
+    // The real directory stays on the session, so a later cold start sees it
+    // missing and refuses rather than inheriting the worker's $HOME.
+    expect(ds.workingDir).toBe(gone);
+    expect(ds.session.workingDir).toBe(gone);
   });
 
   it('NEVER pins a legitimately-resolved $HOME (a sibling must not inherit the home dir)', () => {
@@ -7530,9 +9391,10 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     const sessionReply = vi.fn(async () => 'om_card');
     initWorkerPool({
       sessionReply,
-      getSessionWorkingDir: () => '/repo',
+      getSessionWorkingDir: () => REPO,
       getActiveCount: () => 1,
       closeSession: vi.fn(),
+      loadScheduledTaskForIdentity,
     });
     const ds = makeDs();
     forkWorker(ds, 'warm up', 'om_original');
@@ -7590,6 +9452,22 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     });
   });
 
+  it('keeps a scheduled creator turn behind any active interactive turn', async () => {
+    const { ds, worker } = await bootClaudeSession();
+    expect(sendWorkerInput(
+      ds,
+      'hourly task prompt',
+      SCHEDULED_TURN,
+      { trustedCaller: CREATOR_IDENTITY as TrustedCaller },
+    )).toBe(true);
+
+    expect(sentMessages(worker).at(-1)).toMatchObject({
+      turnId: SCHEDULED_TURN,
+      trustedCaller: CREATOR_IDENTITY,
+      queueAfterActiveTurn: true,
+    });
+  });
+
   it('admits a scheduled fire into semantic recovery and continues it as the same scheduled turn', async () => {
     const { ds, worker, sessionReply } = await bootClaudeSession();
     armSilentScheduledTurn(ds, SCHEDULED_TURN);
@@ -7602,6 +9480,8 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
       continuationsStarted: 0,
       status: 'running',
       silentLogicalTurnIds: [SCHEDULED_TURN],
+      // The admitted input is frozen for a failure card's re-delivery.
+      retryInputs: { [SCHEDULED_TURN]: { cliInput: 'hourly task prompt' } },
     });
 
     worker.emit('message', {
@@ -7687,6 +9567,50 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
     }));
   });
 
+  it('continues as the authority-store creator even after the sandbox rewrote schedules.json', async () => {
+    const { ds, worker } = await bootClaudeSession();
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    tamperedProjection.set('abcdef12', {
+      ...scheduledTasksForProvenance.get('abcdef12'),
+      ownerOpenId: 'ou_someone_else',
+      ownerUnionId: 'on_someone_else',
+    });
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: SCHEDULED_TURN,
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+    const continuation = sentMessages(worker).find(message => message.turnId !== SCHEDULED_TURN);
+    expect(continuation.trustedCaller).toEqual(CREATOR_IDENTITY);
+  });
+
+  it('continues without an identity when only schedules.json still lists the task', async () => {
+    const { ds, worker } = await bootClaudeSession();
+    expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
+    ackInput(worker, SCHEDULED_TURN);
+    tamperedProjection.set('abcdef12', scheduledTasksForProvenance.get('abcdef12'));
+    scheduledTasksForProvenance.clear();
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: SCHEDULED_TURN,
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+    const continuation = sentMessages(worker).find(message => message.turnId !== SCHEDULED_TURN);
+    expect(continuation.turnId).toMatch(/^schedule:abcdef12:/);
+    expect(continuation.trustedCaller).toBeUndefined();
+  });
+
   it('continues without an identity when the scheduled task was deleted meanwhile', async () => {
     const { ds, worker } = await bootClaudeSession();
     expect(sendWorkerInput(ds, 'hourly task prompt', SCHEDULED_TURN)).toBe(true);
@@ -7720,6 +9644,7 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
       continuationsStarted: 0,
       status: 'running',
       queuedLogicalTurnIds: ['om_second'],
+      retryInputs: { om_first: { cliInput: 'first question' }, om_second: { cliInput: 'second question' } },
     });
 
     worker.emit('message', {
@@ -7731,6 +9656,7 @@ describe('ordinary-turn recovery admission (scheduled turns, type-ahead)', () =>
       currentTurnId: 'om_second',
       continuationsStarted: 0,
       status: 'running',
+      retryInputs: { om_second: { cliInput: 'second question' } },
     });
 
     worker.emit('message', {
@@ -7871,7 +9797,7 @@ describe('Codex capacity recovery', () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ codexCapacityRecovery: true, ...botOverrides }));
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_card');
-    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn() });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO, getActiveCount: () => 1, closeSession: vi.fn() });
     const ds = makeDs();
     forkWorker(ds, 'original task', 'om_capacity');
     const worker = forkMock.mock.results.at(-1)!.value;
@@ -8026,7 +9952,7 @@ describe('Codex capacity recovery', () => {
     expect(continuations(worker)).toHaveLength(2);
     expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'exhausted', continuationsStarted: 2 });
     expect(sessionReply).toHaveBeenCalledOnce();
-    expect(sessionReply.mock.calls[0][1]).toContain('turn-failed');
+    expect(sessionReply.mock.calls[0][1]).toContain('recovery-failed');
   });
 
   it('uses capacity advice for a Codex runtime with a custom display name', async () => {
@@ -8189,4 +10115,138 @@ it('an admitted Codex successor fences old recovery even when saving its new sta
   await vi.advanceTimersByTimeAsync(60_000);
   expect(ds.session.ordinaryTurnRecovery).toMatchObject({ status: 'cancelled', logicalTurnId: 'om_new' });
   expect(vi.mocked(worker.send).mock.calls.map(c => c[0] as any).filter(m => m?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(0);
+});
+
+describe('/btw side answer relay', () => {
+  const forkWithReply = (overrides?: Partial<DaemonSession>) => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    expect(forkWorker(makeDs(overrides), 'hello', false)).toBe(true);
+    return { sessionReply, worker: forkMock.mock.results.at(-1)!.value };
+  };
+
+  it('replies under the /btw turn, capping long answers and flagging screen-read ones', async () => {
+    const { sessionReply, worker } = forkWithReply();
+    worker.emit('message', { type: 'btw_answer', turnId: 'om_btw_short', question: 'what is 1+1?', answer: 'Two.', source: 'clipboard' });
+    const long = `${'a'.repeat(6_000)}TAIL_BEYOND_CAP`;
+    worker.emit('message', { type: 'btw_answer', turnId: 'om_btw_clip', question: 'long?', answer: long, source: 'clipboard' });
+    worker.emit('message', { type: 'btw_answer', turnId: 'om_btw_screen', question: 'long?', answer: long, source: 'screen' });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(3));
+
+    expect(sessionReply.mock.calls.map(call => [call[2], call[4]])).toEqual([
+      ['interactive', 'om_btw_short'],
+      ['interactive', 'om_btw_clip'],
+      ['interactive', 'om_btw_screen'],
+    ]);
+    const [short, clip, screen] = sessionReply.mock.calls.map(call => String(call[1]));
+    expect(short).toContain('what is 1+1?');
+    expect(short).toContain('Two.');
+    for (const card of [clip, screen]) {
+      expect(card).toContain('a'.repeat(1_000));
+      expect(card).not.toContain('TAIL_BEYOND_CAP');
+    }
+    // A screen-read answer carries an extra "may be partial" note.
+    expect(screen.length).toBeGreaterThan(clip.length);
+  });
+
+  it('drops the answer when the session has no Lark transport', async () => {
+    const { sessionReply, worker } = forkWithReply({ chatId: 'http_async_btw' });
+    worker.emit('message', { type: 'btw_answer', turnId: 'om_btw', question: 'q', answer: 'a', source: 'clipboard' });
+    await new Promise(resolveTick => setTimeout(resolveTick, 20));
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+});
+
+describe('worker pid record', () => {
+  // A real idle child stands in for the forked worker so its birth identity is
+  // readable; updateSessionPid is mocked and only the cleanup signals it.
+  async function withIdleChild(run: (pid: number) => void): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-fork-pid-identity-'));
+    const script = join(dir, 'worker.js');
+    writeFileSync(script, 'setTimeout(() => {}, 600_000);\n');
+    const child = spawnTsScript(script, [], { stdio: 'ignore' });
+    try {
+      await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
+      run(child.pid!);
+    } finally {
+      child.kill('SIGKILL');
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it('persists a forked worker pid together with its birth identity', async () => {
+    await withIdleChild(pid => {
+      const worker = makeFakeWorker();
+      worker.pid = pid;
+      forkMock.mockImplementationOnce(() => worker);
+
+      forkWorker(makeDs(), 'hello', { turnId: 'om_pid_identity' });
+
+      const identity = readWorkerProcessStart(pid);
+      expect(identity).toBeTruthy();
+      expect(sessionStore.updateSessionPid).toHaveBeenCalledWith('sid-start-test', pid, identity);
+    });
+  });
+
+  it('persists an adopt worker pid together with its birth identity', async () => {
+    await withIdleChild(pid => {
+      const worker = makeFakeWorker();
+      worker.pid = pid;
+      forkMock.mockImplementationOnce(() => worker);
+      const ds = makeDs({
+        adoptedFrom: {
+          source: 'tmux',
+          tmuxTarget: 'work:0.0',
+          originalCliPid: 4242,
+          sessionId: 'sess-adopt-pid',
+          cliId: 'claude-code',
+          cwd: REPO,
+          paneCols: 200,
+          paneRows: 50,
+        },
+      });
+
+      forkAdoptWorker(ds, { prompt: 'hi', turnId: 'om_adopt_pid_identity' });
+
+      expect(sessionStore.updateSessionPid).toHaveBeenCalledWith('sid-start-test', pid, readWorkerProcessStart(pid));
+    });
+  });
+});
+
+describe('turn failure diagnostics: only a workflow draft clarify session asks its worker for them', () => {
+  const headless = { id: 'hl_draft', createdAt: '2026-11-06T00:00:00.000Z', source: 'cli' as const };
+  const initOf = () => {
+    const worker = forkMock.mock.results.at(-1)!.value;
+    return vi.mocked(worker.send).mock.calls.map(call => call[0]).find(message => message.type === 'init');
+  };
+
+  it('a draft clarify session (marker persisted on session.headless): the init asks for them', () => {
+    const ds = makeDs({ hasHistory: true, chatId: 'headless_hl_draft' });
+    ds.session.chatId = 'headless_hl_draft';
+    ds.session.headless = { ...headless, failureDiagnostics: true };
+    expect(forkWorker(ds, '', true)).toBe(true);
+    expect(initOf()).toMatchObject({ type: 'init', captureTurnFailureDiagnostics: true });
+  });
+
+  it.each([
+    ['an ordinary topic session', undefined, 'oc_chat'],
+    ['a `botmux headless` session', headless, 'headless_hl_draft'],
+    // The transfer into the main topic forks the topic's worker before the
+    // binding is recorded (or the recording never lands): the chat decides.
+    ['a draft clarify session whose transfer into its topic forks the worker', { ...headless, failureDiagnostics: true as const }, 'oc_topic'],
+    ['a draft clarify session already bound into its topic', { ...headless, failureDiagnostics: true as const, boundChatId: 'oc_topic' }, 'oc_topic'],
+  ] as const)('%s: the init does not carry the field at all', (_name, headlessBlock, chatId) => {
+    const ds = makeDs({ hasHistory: true, chatId });
+    ds.session.chatId = chatId;
+    if (headlessBlock) ds.session.headless = { ...headlessBlock };
+    expect(forkWorker(ds, '', true)).toBe(true);
+    const init = initOf();
+    expect(init).toMatchObject({ type: 'init' });
+    expect(Object.keys(init)).not.toContain('captureTurnFailureDiagnostics');
+  });
 });

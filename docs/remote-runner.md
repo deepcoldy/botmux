@@ -14,9 +14,9 @@
     "requiredCapabilities": [
       "start", "resume", "turn", "cancel", "detach", "reattach", "status",
       "terminal_screen", "terminal_input", "terminal_resize", "outbound_message",
-      "outbound_message_explicit_mention",
+      "outbound_message_explicit_mention", "outbound_message_final",
       "session_tool",
-      "session_tool_schedule"
+      "session_tool_schedule", "session_tool_schedule_actor"
     ],
     "handshakeTimeoutMs": 30000,
     "operationTimeoutMs": 20000
@@ -96,7 +96,7 @@ provider 可以额外声明三项通用终端能力：
 
 ### 可选主动消息
 
-声明 `outbound_message` 后，provider 可以在一个仍为 active 的 turn 内请求 BotMux 向该 turn 的当前会话位置发送非终态正文和有界图片。该能力只表达内容、图片字节和寻址意图，不接受 chat、topic root 或 Bot 身份；真实路由、mention 门禁、图片上传、卡片渲染、hook 和平台调用继续由 BotMux 的普通 `send` 链路负责。provider 额外声明 `outbound_message_explicit_mention` 后，可以提交与普通 `botmux send --mention` 相同的原始 mention 参数，仍由宿主应用目标 Bot 的既有配置和校验规则。
+声明 `outbound_message` 后，provider 可以在一个仍为 active 的 turn 内请求 BotMux 向该 turn 的当前会话位置发送正文和有界图片。该能力只表达内容、图片字节和寻址意图，不接受 chat、topic root 或 Bot 身份；真实路由、mention 门禁、图片上传、卡片渲染、hook 和平台调用继续由 BotMux 的普通 `send` 链路负责。provider 额外声明 `outbound_message_explicit_mention` 后，可以提交与普通 `botmux send --mention` 相同的原始 mention 参数，仍由宿主应用目标 Bot 的既有配置和校验规则。
 
 ```json
 {
@@ -118,7 +118,7 @@ provider 可以额外声明三项通用终端能力：
 ```
 
 - `content` 使用 BotMux Markdown；普通文本是其子集，单条最多 32 KiB。
-- `responseKind` 仅允许 `progress|auxiliary`，不能借此声明 turn 最终完成；`final|failure` 仍是唯一终态。
+- `responseKind` 缺省能力只允许 `progress|auxiliary`。只有 host 的 `requiredCapabilities` 与 provider hello 同时声明 `outbound_message_final` 时才允许 `final`；该请求通过普通 `botmux send --response-kind final` 投递并成为本轮唯一 Lark final，随后 provider 仍须发送协议 `final|failure` 收口执行生命周期。Host 收到 `delivered` 回执后会把同 turn 的 provider `final` 仅作为生命周期终态，不再投递其中的 transcript 或空结果兜底；`rejected|unknown` 时则保留 provider final，避免用户无结果。旧 host/provider 未双边协商时发送 `final` 会 fail-closed。
 - `mention` 允许 `none|requester|explicit`。`requester` 仍要通过当前 turn 的精确回复对象与多参与者门禁；`explicit` 必须同时携带非空 `mentions` 字符串数组，并要求 provider 声明 `outbound_message_explicit_mention`。BotMux 把每项原样转为普通 `--mention` 参数：字面 `ou_` 沿用直接透传语义，邮箱、手机号、`union_id` 或姓名是否可解析以及目标群成员校验，完全复用目标 Bot 的 `allowArbitraryMention` 配置，不增加 Remote Runner 专属的“当前话题参与者”限制。
 - `images` 可省略；只允许 PNG/JPEG/GIF/WebP，最多 4 张、解码后合计最多 2 MiB。文件名、MIME、base64 canonical encoding 和文件 magic 都会在协议边界校验；宿主只在私有临时目录物化，并固定转成普通 `botmux send --images`，turn 仍不能发送任意文件、视频或语音。
 - `turnId` 必须等于 active turn，`generation` 必须等于当前 backend state；迟到或跨代事件会 fail-closed。
@@ -139,7 +139,7 @@ BotMux 完成宿主侧尝试后会写回 `outbound_message_result` 命令：
 
 结果为 `delivered|rejected|unknown`。`unknown` 表示平台可能已经接受消息但 BotMux 无法证明结果，provider 必须把它交给调用方且不得自动重放。结果命令本身是一次宿主到 provider 的结算通知，不要求 provider 再发 ACK；provider 无法把结果交给远端调用方时，应以当前 turn 的 `failure` 明确收口。
 
-主动消息写入独立的非终态发送标记，不会代替或抑制随后正常到达的 turn `final/failure`。该 capability 同样不属于默认必需集合，只有显式配置它的部署才会在握手时要求 provider 支持。
+`progress|auxiliary` 写入独立的非终态发送标记，不会代替或抑制随后正常到达的 turn `final/failure`；协商后的 `final` 写入终态发送标记，用于抑制同一 turn 随后的 transcript 重复回复。上述 capability 都不属于默认必需集合，只有显式配置它们的部署才会在握手时要求 provider 支持。
 成功 `final` 必须等待当前 turn 的所有 `outbound_message_result` 和 `session_tool_result` 写回；失败终态立即收口，迟到结果不会影响后续 turn。
 `final.content` 若只包含 Unicode whitespace 或 format controls（例如 U+200B 零宽空格），仍会正常提交 `turn_terminal`，但不会生成没有可见正文的 `final_output` 卡片；一旦存在可见文字则保留原始内容，不改写正文中的连接符或双向控制序列。
 
@@ -147,7 +147,25 @@ BotMux 完成宿主侧尝试后会写回 `outbound_message_result` 命令：
 
 声明 `session_tool` 后，provider 可以在 active turn 内请求 BotMux 宿主执行一组固定的结构化 Session helper；持久调度写操作还要求部署的 `requiredCapabilities` 和 provider hello 同时显式声明 `session_tool_schedule`。provider 不能传 argv、环境变量、可执行文件、Session ID、Chat、Topic root、Bot 或工作目录；BotMux 把结构化请求翻译为当前 worker/turn 绑定的本机构建 CLI，并继续复用原有 transport、权限和审计门禁。自由字符串使用单一 opaque argv token 传递，daemon 对 Remote Runner 请求再次核对当前 Chat、Topic root 和工作目录。有状态的 schedule 请求仍由 daemon 根据当前真人、delegated capability 或定时任务 self-management 规则重新授权。只升级 Host 而未显式要求新 capability 的旧部署保持原只读权限面。
 
-Bot-authored turn 若由 provider 自己的受信策略选出了有效真人 Actor，可额外协商 `session_tool_schedule_actor`。只有 host 的 `requiredCapabilities` 与 provider hello 同时声明该能力时，`schedule.add` 事件才能携带 `controllerOpenId`；该字段不来自模型可写的结构化请求。worker 继续用同一 turn、dispatch attempt 与 backend generation 约束事件，daemon 再按当前 Bot App 解析 union_id，并复核 controller 是 Bot 管理员和目标群成员后，才把任务按该真人 owner/control identity 落盘。该能力不改变原始消息的 bot caller 归因，也不允许选择 App、Chat、Topic、工作目录、运行凭据或后续管理范围。
+Bot-authored turn 的 `trustedCaller` 可以携带独立的 `botOwner`。直接调用者仍由 `requestUserOpenId/requestUserUnionId + senderType=bot` 表示；`botOwner` 只在飞书已确认发送者是 Bot、两种 sender ID 同时精确命中目标 Bot 自己的 `botActorOwnerBindings`，且配置的 Owner union_id/email 能由目标 App 的 Contact API 重新解析时生成。该字段不会从消息正文、Session owner、最近真人或中心平台团队目录推断；缺失、重复冲突、邮箱不符和解析失败均保持缺失，由需要真人凭据的 provider 失败关闭。`botOwner` 是 host 只在出站 turn 命令里铸造的字段：provider 在 `ready.recoveredTurn` 里回传的同名字段只做形状校验（形状非法仍整包拒绝），不会写回恢复 turn 的 caller，下一条出站 turn 命令会携带重新铸造的值。
+
+该映射属于接收 Bot 的部署策略，写在同一条 canonical `bots.json` 配置中；open_id 必须是接收 App 实际观察到的 source Bot open_id，union_id 使用同租户稳定值，email 必须是小写 canonical 值。多 Pod 部署的每个 bot-sent turn 都从 daemon 启动时锁定的 `BOTS_CONFIG` 路径重新读取该策略，不把单个 Pod 的热更新内存或网络文件系统 watch 当成全局权威；文件不可读、目标 Bot 缺失/重复或策略格式错误时都保持 `botOwner` 缺失。未知字段、非法 ID、重复 source open_id/union_id 会让整个 Bot 配置拒绝启动，避免安全字段拼错后静默失效：
+
+```json
+{
+  "larkAppId": "cli_target",
+  "botActorOwnerBindings": [
+    {
+      "sourceBotOpenId": "ou_source",
+      "sourceBotUnionId": "on_source",
+      "ownerUnionId": "on_owner",
+      "ownerEmail": "owner@example.com"
+    }
+  ]
+}
+```
+
+Bot-authored turn 若由 provider 自己的受信策略选出了有效真人 Actor，可额外协商 `session_tool_schedule_actor`。只有 host 的 `requiredCapabilities` 与 provider hello 同时声明该能力时，schedule 写事件才能携带 `controllerOpenId`；该字段不来自模型可写的结构化请求。worker 继续用同一 turn、dispatch attempt 与 backend generation 约束事件，daemon 再按当前 Bot App 解析 union_id，并复核 controller 是 Bot 管理员和目标群成员。`schedule.add` 按该真人 owner/control identity 落盘；`update|remove|pause|resume|run` 只允许管理当前 Chat 中由同一 controller 创建的 direct task，仍拒绝 delegated task、跨 controller、跨群或换代后的请求。该能力不改变原始消息的 bot caller 归因，也不允许选择 App、Chat、Topic、工作目录或运行凭据。
 
 当前 allowlist：
 
@@ -159,7 +177,7 @@ Bot-authored turn 若由 provider 自己的受信策略选出了有效真人 Act
 - `schedule.add`：只接受 schedule、prompt、名称、执行位置、静默、模型、思考强度和工作日历等结构化任务字段；Chat、Topic root、Bot 和工作目录由当前 Session 推导。
 - `schedule.update|remove|pause|resume|run`：只接受合法任务 ID 和各动作的最小字段，并继续通过现有 daemon mutation route 授权；`self` 只允许当前定时执行自行 pause/remove。
 
-不属于 allowlist 的 ask、handoff、workflow、改名、任意管理或其他写操作在协议层无法表达。provider 也不能通过该能力扩大 `outbound_message` 的寻址、有界图片以外附件、加急、attention 或 final 能力。
+不属于 allowlist 的 ask、handoff、workflow、改名、任意管理或其他写操作在协议层无法表达。provider 也不能通过该能力扩大 `outbound_message` 的寻址、有界图片以外附件、加急或 attention；`final` 必须单独双边协商 `outbound_message_final`。
 
 ```json
 {
@@ -209,7 +227,7 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
     "generation": 3,
     "snapshot": {
       "context": { "usedTokens": 7274, "windowTokens": 258400, "percentUsed": 3 },
-      "tokens": { "in": 7230, "out": 44 },
+      "tokens": { "in": 7230, "out": 44, "cacheReadTokens": 6100, "cacheCreateTokens": 1000 },
       "turnTokens": { "in": 7230, "out": 44 },
       "model": "example-model",
       "reasoningEffort": "high"
@@ -220,6 +238,7 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
 
 - `generation` 必须等于当前远端 compute generation；旧 generation 的快照会被拒绝。
 - `context` 和 `tokens` 必须显式为对象或 `null`。缺失指标保持缺失，不得由 provider 估算。
+- `tokens.cacheReadTokens` / `tokens.cacheCreateTokens` 可选，表示累计缓存读 / 写 token，都包含在 `in` 里（不得大于 `in`）。上报后卡片显示 `缓存命中 N%`（N = cacheReadTokens / in，向下取整）；不报则不显示。
 - BotMux 严格校验非负整数、上下文百分比和运行时标签，然后把快照交给普通卡片的同一套 usage renderer。
 - 这是 v1 的可选 additive 字段：旧 provider 不上报时行为不变，旧 BotMux 会忽略该字段，因此无需增加 capability 或升级协议版本。
 - 最近一次通过校验的快照会随 Session 持久化；远端 generation 前进时自动清除，避免恢复后显示旧计算资源的数据。

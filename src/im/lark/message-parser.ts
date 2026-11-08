@@ -6,10 +6,13 @@ import {
   REPLY_CARD_FOOTER_ELEMENT_ID,
   REPLY_CARD_FOOTER_MARKER,
   REPLY_CARD_HEADING_ELEMENT_ID_RE,
+  WORKFLOW_SIDEBAR_ENTRY_ELEMENT_ID,
+  WORKFLOW_SIDEBAR_ENTRY_LABEL,
 } from './reply-card-footer-signature.js';
 import { hasBotmuxCallbackMarker } from './callback-button-marker.js';
+import { isWorkflowSidebarEntryUrl } from '../../core/workflow-sidebar-link.js';
 import { extractFeishuCardMarkdownImageKeys } from './card-markdown-image-references.js';
-import { stripTrailingGroupContextCardPurposeMarker } from './group-context-card.js';
+import { stripTrailingGroupContextCardPurposeMarker, hasTrailingGroupContextMediaPurposeMarker } from './group-context-card.js';
 
 // Event data structure from WSClient im.message.receive_v1
 // sender is at data top-level, NOT inside data.message
@@ -204,7 +207,8 @@ export function extractPostAtParticipants(message: { content?: string } | null |
  * "explicit @ hands off to normal routing, not the listener" rule can never
  * diverge between legs. Matches by open_id OR by app_id (via mentionAppId, which
  * covers every observed app_id shape), and also scans post-content inline `at`
- * tags (post messages may not populate `mentions`).
+ * tags (post messages may not populate `mentions`). Parsed `LarkMention`s
+ * (camelCase `openId` / `appId`) match too — turn-origin records only keep those.
  */
 export function messageMentionsBot(
   message: { mentions?: any[]; content?: string; body?: { content?: string } } | null | undefined,
@@ -214,7 +218,7 @@ export function messageMentionsBot(
   if (!botOpenId && !larkAppId) return false;
   const mentions: any[] = message?.mentions ?? [];
   for (const m of mentions) {
-    if (botOpenId && mentionOpenId(m) === botOpenId) return true;
+    if (botOpenId && (mentionOpenId(m) === botOpenId || m?.openId === botOpenId)) return true;
     if (larkAppId && mentionAppId(m) === larkAppId) return true;
   }
   // Post-content inline `at` tags (bot-sent post messages may omit `mentions`).
@@ -251,7 +255,7 @@ export function extractMentionIdentities(message: {
   const out = (message?.mentions ?? []).map(mentionIdentity);
   try {
     const content = JSON.parse(message?.content ?? '{}');
-    const inner = content.zh_cn ?? content.en_us ?? content;
+    const inner = resolvePostBody(content);
     if (Array.isArray(inner?.content)) {
       for (const paragraph of inner.content) {
         if (!Array.isArray(paragraph)) continue;
@@ -385,7 +389,7 @@ export function isPureCardUpgradeFallback(content: string): boolean {
 }
 
 export interface MessageResource {
-  type: 'image' | 'file';
+  type: 'image' | 'file' | 'video';
   key: string;
   name: string;
   /** When set, download uses this message_id instead of the parent (e.g. merge_forward sub-messages). */
@@ -398,10 +402,10 @@ export interface MessageResource {
  * the same number, so duplicates across merge_forward sub-messages collapse
  * correctly.
  *
- * Image and file counters are INDEPENDENT — `formatAttachmentsHint` emits
- * `<image n=...>` and `<file n=...>` separately numbered, so a message with
+ * Image, file and video counters are INDEPENDENT — `formatAttachmentsHint`
+ * emits each attachment type separately numbered, so a message with
  * one image and one file should render as `[图片 1]` + `[文件 1]`, not
- * `[图片 1]` + `[文件 2]`. Keys are typed via the `image:` / `file:` prefix.
+ * `[图片 1]` + `[文件 2]`. Keys use the `image:` / `file:` / `video:` prefix.
  */
 export interface ImgNumberer {
   assign(key: string): { num: number; isNew: boolean };
@@ -411,18 +415,48 @@ export function createImgNumberer(): ImgNumberer {
   const map = new Map<string, number>();
   let imgCounter = 0;
   let fileCounter = 0;
+  let videoCounter = 0;
   return {
     assign(key: string) {
       const existing = map.get(key);
       if (existing !== undefined) return { num: existing, isNew: false };
-      // Key prefix selects the counter so image/file numbering stays
-      // independent (mirrors formatAttachmentsHint's per-type imgN/fileN).
-      // Unknown prefixes share the image counter as a safe default.
-      const num = key.startsWith('file:') ? ++fileCounter : ++imgCounter;
+      // Typed keys share the same independent counters as formatAttachmentsHint.
+      // Unknown prefixes retain the historical image counter.
+      const num = key.startsWith('file:') ? ++fileCounter
+        : key.startsWith('video:') ? ++videoCounter : ++imgCounter;
       map.set(key, num);
       return { num, isNew: true };
     },
   };
+}
+
+const VIDEO_FILE_NAME = /\.(mp4|m4v|mov|webm|mkv|avi|flv|3gp|wmv|mts)$/i;
+
+/** A single classifier keeps extraction, deduplication and text numbering aligned. */
+function fileResource(node: any): MessageResource | null {
+  if (typeof node.file_key !== 'string' || !node.file_key) return null;
+  const name = typeof node.file_name === 'string' && node.file_name ? node.file_name : node.file_key;
+  return { type: VIDEO_FILE_NAME.test(name) ? 'video' : 'file', key: node.file_key, name };
+}
+
+function mediaResource(node: any): MessageResource | null {
+  // image_key is only the poster; it must never replace a present video body.
+  if (typeof node.file_key === 'string' && node.file_key) {
+    return { type: 'video', key: node.file_key,
+      name: typeof node.file_name === 'string' && node.file_name ? node.file_name : `${node.file_key}.mp4` };
+  }
+  // A legacy poster-only payload is an image, never a JPEG renamed to .mp4.
+  if (typeof node.image_key === 'string' && node.image_key) {
+    return { type: 'image', key: node.image_key, name: `${node.image_key}.jpg` };
+  }
+  return null;
+}
+
+function resourcePlaceholder(resource: MessageResource, numberer?: ImgNumberer, includeName = false): string {
+  const label = resource.type === 'image' ? '图片' : resource.type === 'video' ? '视频' : '文件';
+  const index = numberer ? ` ${numberer.assign(`${resource.type}:${resource.key}`).num}` : '';
+  const name = includeName ? `: ${resource.name}` : '';
+  return `[${label}${index}${name}]`;
 }
 
 export function extractResources(msgType: string, rawContent: string, numberer?: ImgNumberer): MessageResource[] {
@@ -441,10 +475,10 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
       return resources;
     }
 
-    if (msgType === 'file') {
+    if (msgType === 'file' || msgType === 'media') {
       const resources: MessageResource[] = [];
-      const fileKey = parsed.file_key;
-      if (fileKey) pushIfNew(resources, { type: 'file', key: fileKey, name: parsed.file_name ?? fileKey });
+      const resource = msgType === 'media' ? mediaResource(parsed) : fileResource(parsed);
+      if (resource) pushIfNew(resources, resource);
       return resources;
     }
 
@@ -454,11 +488,14 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
       for (const block of contentBlocks) {
         const nodes = Array.isArray(block) ? block : [block];
         for (const node of nodes) {
-          if ((node.tag === 'img' || node.tag === 'media') && node.image_key) {
+          if (node.tag === 'media') {
+            const resource = mediaResource(node);
+            if (resource) pushIfNew(resources, resource);
+          } else if (node.tag === 'img' && node.image_key) {
             pushIfNew(resources, { type: 'image', key: node.image_key, name: `${node.image_key}.jpg` });
-          }
-          if (node.tag === 'file' && node.file_key) {
-            pushIfNew(resources, { type: 'file', key: node.file_key, name: node.file_name ?? node.file_key });
+          } else if (node.tag === 'file') {
+            const resource = fileResource(node);
+            if (resource) pushIfNew(resources, resource);
           }
         }
       }
@@ -469,7 +506,8 @@ export function extractResources(msgType: string, rawContent: string, numberer?:
       const topLevelFiles = Array.isArray(parsed.files) ? parsed.files : [];
       for (const file of topLevelFiles) {
         if (file?.file_key) {
-          pushIfNew(resources, { type: 'file', key: file.file_key, name: file.file_name ?? file.file_key });
+          const resource = fileResource(file);
+          if (resource) pushIfNew(resources, resource);
         }
       }
       return resources;
@@ -838,6 +876,28 @@ export function stripLeadingMentions(content: string, mentions?: { name: string 
   return s;
 }
 
+/**
+ * Dispatcher 路由侧复刻 daemon **命令车道**对入站消息的渲染：即 daemon 在
+ * `handleNewTopicAdmitted` / `handleThreadReplyAdmitted` 里做斜杠判定前看到的
+ * `parsed.content`（post 标题拼成首行、段落以 `\n` 连接、`at`→`@user_name`
+ * 不带前导空格、`a`→`text(href)`、`code_block`→多行围栏、`img`→`[图片 N]`）。
+ *
+ * 热路径上的 {@link extractMessageTextForRouting}（在 dispatcher 里）只拼 text
+ * 节点、丢弃 title 与附件节点，是给 `/t` 等判定用的轻量窥视，**不能**拿它判内置
+ * 免 @ 命令：两套渲染在带标题富文本、text 与 at 紧贴等形态上会给出不同文本，
+ * 导致「群闸放行、daemon 却不认命令」地误建会话。需要与 daemon 结论对齐的判定
+ * 用本函数取车道文本，再走同一个 {@link stripLeadingMentions } +
+ * `parseSlashCommandInvocation`，两侧同一结论才放行。
+ *
+ * 纯解析：不做资源下载、合并转发展开或语音转写（那些发生在 daemon 更深处；本函数
+ * 的调用方只在轻量窥视已形似单行内置命令时才调用，附件/语音候选在 dispatcher
+ * 更早处已被路由）。
+ */
+export function daemonCommandLanePreview(data: RawEventData): { text: string; mentions: LarkMention[] } {
+  const { parsed } = parseEventMessage(data, createImgNumberer());
+  return { text: parsed.content, mentions: parsed.mentions ?? [] };
+}
+
 function matchesMentionId(m: any, id: string): boolean {
   if (!m || !id) return false;
   const openId = m.openId ?? mentionOpenId(m);
@@ -1063,19 +1123,19 @@ function renderPostNode(node: any, numberer?: ImgNumberer): string {
   }
   if (node.tag === 'at') return `@${node.user_name ?? 'unknown'}`;
   if (node.tag === 'code_block') return renderPostCodeBlock(node);
-  if (node.tag === 'img' || node.tag === 'media') {
-    const key = node.image_key ?? node.file_key;
+  if (node.tag === 'media') {
+    const resource = mediaResource(node);
+    return resource ? resourcePlaceholder(resource, numberer) : '[视频]';
+  }
+  if (node.tag === 'img') {
+    const key = node.image_key;
     if (key && numberer) return `[图片 ${numberer.assign(`image:${key}`).num}]`;
     return '[图片]';
   }
   if (node.tag === 'file') {
-    const key = node.file_key;
-    const name = node.file_name ?? '';
-    if (key && numberer) {
-      const n = numberer.assign(`file:${key}`).num;
-      return name ? `[文件 ${n}: ${name}]` : `[文件 ${n}]`;
-    }
-    return name ? `[文件: ${name}]` : '[文件]';
+    const resource = fileResource(node);
+    if (resource) return resourcePlaceholder(resource, numberer, !!node.file_name);
+    return node.file_name ? `[文件: ${node.file_name}]` : '[文件]';
   }
   return '';
 }
@@ -1129,16 +1189,14 @@ function extractTextContent(msgType: string, rawContent: string, mentions?: RawE
       } catch { /* fall through */ }
       return '[图片]';
     }
-    if (msgType === 'file') {
+    if (msgType === 'file' || msgType === 'media') {
       try {
         const p = JSON.parse(rawContent);
-        if (p.file_key && numberer) {
-          const n = numberer.assign(`file:${p.file_key}`).num;
-          return p.file_name ? `[文件 ${n}: ${p.file_name}]` : `[文件 ${n}]`;
-        }
-        return `[文件: ${p.file_name ?? 'unknown'}]`;
+        const resource = msgType === 'media' ? mediaResource(p) : fileResource(p);
+        if (resource) return resourcePlaceholder(resource, numberer, msgType === 'file' && !!p.file_name);
+        return msgType === 'media' ? '[视频]' : `[文件: ${p.file_name ?? 'unknown'}]`;
       } catch {
-        return '[文件]';
+        return msgType === 'media' ? '[视频]' : '[文件]';
       }
     }
     if (msgType === 'audio') {
@@ -1240,12 +1298,31 @@ function isSignedFormatBFooterLine(line: string): boolean {
   return inner !== null && (hasCurrentFooterMarker(inner) || hasExactMarkerMarkdown(inner));
 }
 
+/** The「工作流 ›」labels in every locale the entry is rendered in. */
+const WORKFLOW_SIDEBAR_ENTRY_LABELS: ReadonlySet<string> = new Set(Object.values(WORKFLOW_SIDEBAR_ENTRY_LABEL));
+
+/**
+ * The workflow sidebar entry botmux puts at the right end of a task card's
+ * signature row. The full card (Format B) keeps its element id; the
+ * simplified rendering (Format A) may not, so there the label has to match
+ * and any link it carries must be a workflow entry — a third-party button
+ * that merely shares the label but points elsewhere is kept.
+ */
+function isWorkflowSidebarEntryButton(el: any): boolean {
+  if (el?.element_id === WORKFLOW_SIDEBAR_ENTRY_ELEMENT_ID) return true;
+  const label = typeof el?.text === 'string' ? el.text : el?.text?.content;
+  if (typeof label !== 'string' || !WORKFLOW_SIDEBAR_ENTRY_LABELS.has(label.trim())) return false;
+  const url = buttonOpenUrl(el);
+  return url === undefined || isWorkflowSidebarEntryUrl(url);
+}
+
 /** Strict compatibility recognizer for Format A cards emitted before the
  * versioned marker existed. Recipient chrome is required; without it, the old
  * default-brand-only footer is indistinguishable from a real repository link. */
 function isMeaningfulFormatANode(node: unknown): boolean {
   if (!node || typeof node !== 'object') return false;
   const value = node as any;
+  if (value.tag === 'button' && isWorkflowSidebarEntryButton(value)) return false;
   if (value.tag === 'text') return typeof value.text === 'string' && value.text.trim().length > 0;
   return true;
 }
@@ -1381,7 +1458,8 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer, m
                 ? stripTrailingGroupContextCardPurposeMarker(node.text)
                 : node.text;
               if (visibleText !== node.text
-                && (paragraphIndex !== lastMeaningfulParagraphIndex || paragraphIndex === 0)) {
+                && (hasTrailingGroupContextMediaPurposeMarker(node.text)
+                  || paragraphIndex !== lastMeaningfulParagraphIndex || paragraphIndex === 0)) {
                 if (visibleText) textNodes.push(visibleText);
                 continue;
               }
@@ -1419,6 +1497,7 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer, m
               // via the Format A list view WITHOUT a resolve pass, so dropping
               // the URL here would lose button links on that main path.
               if (isBotmuxCallbackButton(node)) continue;
+              if (isWorkflowSidebarEntryButton(node)) continue;
               const btnText = typeof node.text === 'string' ? node.text : node.text?.content;
               if (btnText) {
                 const url = buttonOpenUrl(node);
@@ -1430,6 +1509,9 @@ export function extractCardContent(rawContent: string, numberer?: ImgNumberer, m
               if (ph) buttons.push(`[输入框: ${ph}]`);
             }
             else if (node.tag === 'select_static' || node.tag === 'multi_select_static' || node.tag === 'overflow') {
+              // botmux's own callback controls (reply-card menu/model picker,
+              // effort/config selects) are pure UI chrome — drop them.
+              if (isBotmuxCallbackButton(node)) continue;
               const ph = typeof node.placeholder === 'string' ? node.placeholder : node.placeholder?.content;
               const opts = Array.isArray(node.options)
                 ? node.options.map((o: any) => (typeof o.text === 'string' ? o.text : o.text?.content)).filter(Boolean)
@@ -1532,18 +1614,13 @@ export const CARD_EMBEDDED_PLACEHOLDER = '[卡片内嵌组件，需在飞书客�
 export function isPlaceholderOnlyText(text: string): boolean {
   if (!text.trim()) return false;
   const stripped = text
-    // `[图片]` / `[图片 2]` / `[文件]` / `[文件 3]` / `[语音]` / `[卡片]`
-    .replace(/\[(?:图片|文件|语音|卡片)(?:\s+\d+)?\]/g, '')
+    // Media placeholders carry no authored text, including numbered videos.
+    .replace(/\[(?:图片|文件|视频|语音|卡片)(?:\s+\d+)?\]/g, '')
     .replace(/\[卡片 \(模板\)\]/g, '')
     .replace(/\[合并转发消息\]/g, '')
     .replaceAll(CARD_EMBEDDED_PLACEHOLDER, '')
     .trim();
   return stripped === '';
-}
-
-/** Wrap merged text so extractCardContent returns it verbatim downstream. */
-export function wrapResolvedCardText(text: string): string {
-  return JSON.stringify({ [RESOLVED_TEXT_KEY]: text });
 }
 
 /** Strip inline markup (font/text_tag tags, bold markers) but keep text,
@@ -1730,10 +1807,13 @@ function firstNonEmptyString(...candidates: unknown[]): string | undefined {
  *  in extractElementText.
  *
  *  Primary detection is the egress-stamped ownership marker
- *  (callback-button-marker.ts). This wordlist is the LEGACY fallback for
- *  cards sent by pre-marker builds (chat history is long-lived), covering
- *  every action dispatched by card-handler as of the fix — it is frozen;
- *  new botmux buttons rely on the marker, not on growing this list.
+ *  (callback-button-marker.ts). This wordlist is a defense-in-depth fallback
+ *  for two cases: cards still in chat history that were sent by pre-marker
+ *  builds (history is long-lived), and any delivery path that fails to stamp
+ *  the egress marker. It covers every action dispatched by card-handler; when
+ *  adding a new internal control that can traverse an unstamped path, register
+ *  it here (with a parser test asserting it does not leak), do not rely on the
+ *  marker alone.
  *  Third-party cards' buttons (Argos 确认/创建群组…) stay: they carry no
  *  marker and their `value` never uses botmux's action vocabulary. */
 const BOTMUX_INTERNAL_CARD_ACTIONS: ReadonlySet<string> = new Set([
@@ -1742,9 +1822,10 @@ const BOTMUX_INTERNAL_CARD_ACTIONS: ReadonlySet<string> = new Set([
   'open_local_terminal', 'refresh_screenshot', 'restart', 'resume',
   'retry_last_task', 'takeover', 'term_action', 'toggle_display',
   'toggle_stream', 'tui_keys', 'tui_text_input', 'voice_summary',
+  'reply_card_menu', 'reply_model_pick', 'session_model_pick', 'session_effort_pick', 'session_effort_apply', 'models_default_pick', 'models_default_effort_pick', 'reply_menu_cancel',
   // pendingRepo gates
   'repo_manual_submit', 'repo_worktree_submit', 'skip_repo',
-  'worktree_toggle_mode',
+  'worktree_toggle_mode', 'repo_rebuild_worktree',
   // config / grant / relay cards
   'config_toggle', 'config_set', 'config_quota', 'config_quota_open',
   'config_quota_save', 'config_text_open', 'config_text_save',
@@ -1866,7 +1947,7 @@ function extractCardHeaderTagTexts(header: unknown): string[] {
  *  table into extra rows. */
 function cardTableCellText(value: unknown): string {
   const text = nestedCardText(value);
-  return (text ?? '')
+  return stripTrailingGroupContextCardPurposeMarker(text ?? '')
     .replace(/\r\n?/g, '\n')
     .replace(/\\/g, '\\\\')
     .replace(/\|/g, '\\|')
@@ -2024,6 +2105,8 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   // botmux's own callback buttons (🔊 语音总结 …) are dropped entirely.
   if (tag === 'button') {
     if (isBotmuxCallbackButton(el)) return;
+    // The workflow sidebar entry is signature-row navigation, like the footer.
+    if (isWorkflowSidebarEntryButton(el)) return;
     const btnText = typeof el.text === 'string' ? el.text : el.text?.content;
     if (btnText) {
       const url = buttonOpenUrl(el);
@@ -2038,7 +2121,10 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   }
 
   // select / multi-select / overflow — surface placeholder + selectable
-  // options so the choices the card offers aren't lost.
+  // options so the choices the card offers aren't lost. botmux's own callback
+  // controls (reply card menu/model picker, effort/config selects) are dropped.
+  if ((tag === 'select_static' || tag === 'multi_select_static' || tag === 'overflow')
+    && isBotmuxCallbackButton(el)) return;
   if (tag === 'select_static' || tag === 'multi_select_static' || tag === 'overflow') {
     const ph = el.placeholder?.content;
     const opts = Array.isArray(el.options)
@@ -2053,7 +2139,8 @@ function extractElementText(el: any, parts: string[], imgLabel: (key: string) =>
   // alt is often the only machine-readable description of what the image shows.
   if (tag === 'img' || tag === 'image') {
     const k = el.image_key ?? el.img_key;
-    const alt = (typeof el.alt === 'string' ? el.alt : el.alt?.content)?.trim();
+    const rawAlt = typeof el.alt === 'string' ? el.alt : el.alt?.content;
+    const alt = typeof rawAlt === 'string' ? stripTrailingGroupContextCardPurposeMarker(rawAlt).trim() : undefined;
     if (k) parts.push(alt ? withImgAlt(imgLabel(k), alt) : imgLabel(k));
   }
 

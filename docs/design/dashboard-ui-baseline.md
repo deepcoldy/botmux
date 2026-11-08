@@ -13,7 +13,7 @@
 - 左侧导航是独立浮动纵向 rail；桌面端始终展示 icon + label，移动端转为横向滚动导航。
 - 内容区保持高密度后台布局，页面主体不做营销式 hero。
 - 顶栏和导航只放全局入口，页面级主操作、筛选、批量操作、二级 tab 放在页面内部。
-- 页面和内部列表的滚动条使用悬浮式视觉层，不占布局宽度；不要通过 `scrollbar-gutter` 或额外右侧留白预留滚动槽，避免内容在出现滚动条时被挤压。
+- 页面和内部列表统一使用浏览器原生细滚动条（`style.css` 顶部的全局规则），可以直接拖动。Linux / Windows 上滚动条占约 10px 布局宽度，内容开始溢出时可用宽度变窄是预期行为；macOS 按系统设置显示。不要给单个列表另写滚动条颜色、宽度或 `scrollbar-gutter`，也不要用脚本画模拟滚动条；只有横向滑动的标签栏、按键条可以隐藏滚动条。
 
 ## 圆角
 
@@ -36,6 +36,7 @@
 ## 顶栏
 
 - 左侧：logo、`Botmux`、`Dashboard`。
+- 中列：全局搜索入口（搜索框外观 + `⌘K` / `Ctrl K` 提示），面板是顶部锚定的原生 `<dialog>`；窄屏收成与其它工具同尺寸的圆形图标，≤440px 时「文档」入口让位给它（文档在面板的「打开文档」里仍一步可达）。
 - 右侧：语言、主题、Docs 等低频工具和 owner 头像。
 - 创建会话、添加机器人等页面级主操作放回对应页面标题区，不放在顶栏。
 - 会话概览是顶栏唯一的全局会话状态入口；待处理通知收进会话概览弹窗顶部的紧凑 notice，不单独在顶栏中间占位。
@@ -62,9 +63,9 @@
 - 页面标题下面的顶层筛选/导航栏统一使用 `dashboard-toolbar`：透明背景、无外框面板、8px 控件间距、控件高度 34px。不要恢复成带边框的大面板式 `.filters`。
 - 标题下 toolbar 的单选下拉筛选优先使用 React `DropdownMenu` 自定义菜单，保证 trigger、弹层、选项 hover/选中态一致；不要在这类位置继续使用原生 `select`。
 - 页面内一级 tab 切换使用紧凑 segmented rail：外框 34px、内距 2px、选中块 28px、灰色选中背景 + 平台紫色文字；不要使用旧式上圆角 tab + 底线组合。
-- 团队协作、角色管理这类页面级二级入口统一使用 `insight-tabs` / `itab` 结构的 segmented rail，当前项用 `on` / `aria-selected` 表达；不要混用 `dashboard-toolbar` 链接和单独的 `active` 样式。
+- 角色管理、连接器这类页面级二级入口统一使用 `insight-tabs` / `itab` 结构的 segmented rail，当前项用 `on` / `aria-selected` 表达；不要混用 `dashboard-toolbar` 链接和单独的 `active` 样式。
 - 一级 tab 的页面状态/加载计数放在 tab rail 右侧同一行，作为弱化文本处理；不要单独占一行挤压内容区。
-- 会话控制页内的分段 switch 选中态统一为灰色背景 + 平台紫色文字，包括工作流/团队/机器人、看板/状态板/表格、24H/72H/7d 这类同组切换；不要混用黑底白字、紫底白字或发光选中态。
+- 会话控制页内的分段 switch 选中态统一为灰色背景 + 平台紫色文字，包括看板/列表、24H/72H/7d 这类同组切换；不要混用黑底白字、紫底白字或发光选中态。
 - 条件分组控件按可见性展开/收起时使用约 320ms 的缓入缓出，不做突然消失或快速跳变；`prefers-reduced-motion` 下不保留过渡。
 - 页面标题下面的分段 switch 尺寸以 24H/72H/7d 阈值组为基准：外框高度 34px、内距 2px、选中块高度 28px，选中背景到外框四周留白一致。
 - 带静态条件名的 switch 需要组合成同一个胶囊控件，例如“空闲超过 + 24H/72H/7d”；不要把条件名和取值拆成两个并列 chip。
@@ -125,6 +126,11 @@
 - `HeaderAction` 用于“查看全部”等标题行次级跳转按钮；多个控件时用 `HeaderControls` 包裹。
 - `OverviewList`、`OverviewListItem`、`OverviewListMain`、`OverviewListTail` 用于工作台同类紧凑列表。列表项高度由内容决定，不因列表容器变高而拉伸。
 - `DropdownMenu` 用于短选项下拉筛选/排序；`SortMenu` 是排序语义的兼容封装。触发按钮只展示当前模式，不展示“排序”前缀；触发器宽度默认使用 `--dropdown-trigger-width`，选中项和 hover 项使用不同背景，避免状态黏连。
+- `DropdownMenu` 底层是 Base UI 的 Select（`searchable` 时是 Combobox），实现随第一个渲染的下拉按需加载。弹层 portal 到 `body`（触发器在打开的原生 `<dialog>` 里时 portal 到该 dialog），由 Floating UI 做翻转和视口碰撞，不再被滚动容器裁切。页面样式接入规则：
+  - 触发器用 `.页面class > .sect-sort-trigger` 命中，展开态是根节点上的 `.is-open`。
+  - 弹层不在页面 DOM 里，不能用祖先选择器；组件把 `className` 原样写到弹层的 `data-menu` 上，用 `.sect-sort-pop[data-menu~="页面class"]` 写宽度、限高等。选项是 `.sect-sort-item`，状态是 `[data-selected]`、`[data-highlighted]`（鼠标悬停和键盘高亮共用）、`[data-disabled]`。
+  - 弹层默认相对触发器居中；要贴左缘或右缘时，在触发器根节点上设 `--dropdown-align: start` / `end`。宽度可用 `var(--anchor-width)`（触发器宽度）。
+  - 限高必须带 `var(--available-height, 100vh)`，否则触发器上下空间都不够时会超出视口。
 - `LoadingState` 用于所有数据加载占位；页面级使用默认尺寸，卡片、弹窗、列表、局部面板使用 `compact` 或页面 class 缩小高度，但必须复用同一个 `.page-loading-spin`。
 - `OverflowText` 用于单行文本溢出处理：外层容器必须有明确宽度或 `min-width: 0`，内部文本由组件检测 `scrollWidth`，只有溢出时才显示平台风格 fixed tooltip 并执行横向 pan 动画。不要在各页面复制测量、portal tooltip 或 marquee 逻辑。
 - 公共组件只沉淀结构和状态 class，不写业务数据逻辑；页面自己的 API、过滤、排序、权限判断保留在页面模块内。
@@ -140,7 +146,7 @@
 - 设置/配置类页面不要把所有表单塞进一个大背景容器；按访问、投递、维护、版本等职责拆成独立模块卡片，模块之间用页面网格建立关系。
 - 页面内容区的普通容器统一使用 `card`、`bd-card`、`panel` 或对应页面已有 panel class；默认实色背景、弱边框、12px 圆角、不使用玻璃泛光。
 - 表格、矩阵、列表项、树节点、技能卡、Webhook item、Workflow panel 都按“独立边框行卡”处理；hover 只做轻量背景和边框反馈。
-- Webhook、团队协作这类对象列表默认使用“标题 + 状态 tag + 元信息 tag + 右侧操作”的行卡结构；长 URL、邀请码、curl 示例放在行卡内部的弱背景代码块里，不要回退成裸表格或长串内联文本。
+- Webhook 这类对象列表默认使用“标题 + 状态 tag + 元信息 tag + 右侧操作”的行卡结构；长 URL、邀请码、curl 示例放在行卡内部的弱背景代码块里，不要回退成裸表格或长串内联文本。
 - 内联样式只允许表达一次性布局或运行态数值；背景、圆角、边框、hover、状态色应沉淀到 CSS class。
 
 ## 色彩和动效

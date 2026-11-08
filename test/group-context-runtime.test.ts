@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 const network = vi.hoisted(() => ({ history: vi.fn(), thread: vi.fn(), threadContext: vi.fn(), byThreadId: vi.fn(), download: vi.fn(), detail: vi.fn(), update: vi.fn() }));
 vi.mock('../src/im/lark/client.js', () => ({
   listChatMessagesUntil: network.history,
@@ -212,6 +212,84 @@ describe('group context platform integration', () => {
     expect(value?.body).toContain('STRUCTURED_ANSWER');
     expect(value?.body).not.toMatch(/FLATTENED_PROCESS|STRUCTURED_PROCESS|已完成/);
     expect(getGroupContextMessage('cli_b', 'oc_room', 'om_merged')).toMatchObject({ cardContentVersion: 1, updateTime: now - 1 });
+  });
+
+  it.each(['runtime', 'message'] as const)('rehydrates image-only list cards to retain %s classification without a Footer', async purpose => {
+    const now = Date.now();
+    writeFileSync(join(dir, 'bots-info.json'), JSON.stringify([{ larkAppId: 'cli_peer', botName: 'Fixture' }]));
+    const flattened = JSON.stringify({ elements: [[{ tag: 'img', image_key: 'img_v3_public' }]] });
+    const structured = JSON.stringify(markGroupContextCardPurpose({ schema: '2.0', body: { elements: [
+      { tag: 'img', img_key: 'img_v3_public', alt: { tag: 'plain_text', content: 'Public image' } },
+    ] } }, purpose));
+    expect(structured).not.toContain('botmux_reply_footer');
+    network.history.mockResolvedValue([{ message_id: 'om_image', chat_id: 'oc_room', create_time: String(now - 100),
+      update_time: String(now - 100), msg_type: 'interactive', sender: { id: 'cli_peer', sender_type: 'app' }, body: { content: flattened } }]);
+    network.detail.mockImplementation(async (_app, _id, options) => ({ items: [{ update_time: String(now - 1),
+      body: { content: options.userCardContent ? structured : flattened } }] }));
+    await prepareGroupContextForTurn({ appId: 'cli_b', chatId: 'oc_room', turnId: 'om_next', createTime: now, query: '总结' });
+    expect(network.detail.mock.calls.some(call => call[2]?.userCardContent === true)).toBe(true);
+    const stored = getGroupContextMessage('cli_b', 'oc_room', 'om_image');
+    if (purpose === 'runtime') expect(stored).toBeUndefined();
+    else {
+      expect(stored?.resourceRefs.map(ref => ref.key)).toEqual(['img_v3_public']);
+      expect(stored?.text).toContain('Public image');
+      expect(stored?.text).not.toContain('\u2063');
+    }
+  });
+
+  it.each(['runtime', 'message'] as const)('rehydrates a chart snapshot to preserve %s without an empty Footer', async purpose => {
+    const now = Date.now();
+    writeFileSync(join(dir, 'bots-info.json'), JSON.stringify([{ larkAppId: 'cli_peer', botName: 'Fixture' }]));
+    const flattened = JSON.stringify({ elements: [[{ tag: 'img', image_key: 'img_v3_chart_snapshot' }]] });
+    const structured = JSON.stringify(markGroupContextCardPurpose({ schema: '2.0', body: { elements: [
+      { tag: 'chart', chart_spec: { type: 'bar', title: { text: 'Sales' }, data: { values: [{ category: 'A', value: 1 }] } } },
+    ] } }, purpose));
+    expect(structured).not.toContain('botmux_reply_footer');
+    network.history.mockResolvedValue([{ message_id: 'om_chart', chat_id: 'oc_room', create_time: String(now - 100),
+      update_time: String(now - 100), msg_type: 'interactive', sender: { id: 'cli_peer', sender_type: 'app' }, body: { content: flattened } }]);
+    network.detail.mockImplementation(async (_app, _id, options) => ({ items: [{ update_time: String(now - 1),
+      body: { content: options.userCardContent ? structured : flattened } }] }));
+    await prepareGroupContextForTurn({ appId: 'cli_b', chatId: 'oc_room', turnId: 'om_next', createTime: now, query: '总结' });
+    expect(network.detail.mock.calls.some(call => call[2]?.userCardContent === true)).toBe(true);
+    const stored = getGroupContextMessage('cli_b', 'oc_room', 'om_chart');
+    if (purpose === 'runtime') expect(stored).toBeUndefined();
+    else {
+      expect(stored?.text).toContain('Sales');
+      expect(stored?.text).toContain('| A | 1 |');
+    }
+  });
+
+  it.each(['detail-failure', 'detail-still-list', 'over-limit'] as const)('preserves third-party image lists during %s', async scenario => {
+    const now = Date.now();
+    writeFileSync(join(dir, 'bots-info.json'), JSON.stringify([{ larkAppId: 'cli_peer', botName: 'Fixture' }]));
+    const foreignCount = scenario === 'over-limit' ? 12 : 1;
+    const knownCount = scenario === 'over-limit' ? 10 : 1;
+    const imageCard = (key: string) => JSON.stringify({ elements: [[{ tag: 'img', image_key: key }]] });
+    const message = (id: string, sender: string, key: string) => ({ message_id: id, chat_id: 'oc_room',
+      create_time: String(now - 100), update_time: String(now - 100), msg_type: 'interactive',
+      sender: { id: sender, sender_type: 'app' }, body: { content: imageCard(key) } });
+    network.history.mockResolvedValue([
+      ...Array.from({ length: foreignCount }, (_, i) => message(`om_external_${i}`, 'cli_external', `img_v3_external_${i}`)),
+      ...Array.from({ length: knownCount }, (_, i) => message(`om_known_${i}`, 'cli_peer', `img_v3_known_${i}`)),
+    ]);
+    network.detail.mockImplementation(async (_app, id, options) => {
+      if (scenario === 'detail-failure') throw new Error('detail unavailable');
+      const card = scenario === 'over-limit' && options.userCardContent
+        ? JSON.stringify(markGroupContextCardPurpose({ schema: '2.0', body: { elements: [
+            { tag: 'img', img_key: `img_v3_${id}`, alt: { tag: 'plain_text', content: '' } },
+          ] } }, 'runtime'))
+        : imageCard(`img_v3_${id}`);
+      return { items: [{ update_time: String(now - 1), body: { content: card } }] };
+    });
+    const prepared = await prepareGroupContextForTurn({ appId: 'cli_b', chatId: 'oc_room', turnId: 'om_next', createTime: now, query: '总结' });
+    for (let i = 0; i < foreignCount; i++) {
+      expect(getGroupContextMessage('cli_b', 'oc_room', `om_external_${i}`)?.resourceRefs.map(ref => ref.key)).toEqual([`img_v3_external_${i}`]);
+    }
+    expect(network.detail.mock.calls.every(call => call[1].startsWith('om_known_'))).toBe(true);
+    expect(new Set(network.detail.mock.calls.map(call => call[1])).size).toBe(Math.min(knownCount, 8));
+    // Unknown known-producer cards stay excluded; failure cannot publish runtime images.
+    for (let i = 0; i < knownCount; i++) expect(getGroupContextMessage('cli_b', 'oc_room', `om_known_${i}`)).toBeUndefined();
+    expect(prepared?.incomplete).toBe(true);
   });
 
   it('excludes a card completed after the triggering message even if the list had an old timestamp', async () => {
@@ -438,5 +516,63 @@ describe('group context platform integration', () => {
     expect((await preparing)?.body).toContain('choice 104');
     expect(getGroupContextMessage('cli_b', 'oc_room', 'om_stream_104')).toBeDefined();
     expect(getGroupContextMessage('cli_b', 'oc_room', 'om_stream_0')).toBeUndefined();
+  });
+});
+
+describe('group context history attachments', () => {
+  it.each([
+    ['a video (current classification)', 'video'],
+    ['a video stored as a file before the reclassification', 'file'],
+  ] as const)('delivers %s quoted from history', async (_, type) => {
+    const now = Date.now();
+    network.history.mockResolvedValue([]);
+    network.download.mockImplementation(async (_app, _id, _key, _type, path) => { writeFileSync(path, 'video-bytes'); });
+    upsertGroupContextMessage('cli_b', { messageId: 'om_clip', chatId: 'oc_room', conversationScope: 'main', senderId: 'ou_user',
+      senderType: 'user', msgType: type === 'video' ? 'media' : 'file', text: '[视频: demo.mp4]', createTime: now - 10,
+      resourceRefs: [{ type, key: 'file_v3_clip', name: 'demo.mp4' }], sourceAppId: 'cli_b' });
+    const prepared = await prepareGroupContextForTurn({ appId: 'cli_b', chatId: 'oc_room', turnId: 'om_next', createTime: now, query: '看看上面的附件' });
+    expect(prepared?.attachments).toEqual([expect.objectContaining({ type, name: 'demo.mp4', resourceKey: 'file_v3_clip' })]);
+    expect(network.download).toHaveBeenCalledWith('cli_b', 'om_clip', 'file_v3_clip', type, expect.any(String), undefined, { allowUserTokenFallback: false });
+  });
+
+  const shot = (now: number) => upsertGroupContextMessage('cli_b', { messageId: 'om_shot', chatId: 'oc_room', conversationScope: 'main', senderId: 'ou_user',
+    senderType: 'user', msgType: 'image', text: '[图片]', createTime: now - 20, resourceRefs: [{ type: 'image', key: 'img_shot', name: 'shot.png' }], sourceAppId: 'cli_b' });
+  const clip = (now: number) => upsertGroupContextMessage('cli_b', { messageId: 'om_clip', chatId: 'oc_room', conversationScope: 'main', senderId: 'ou_user',
+    senderType: 'user', msgType: 'media', text: '[视频: clip.mp4]', createTime: now - 10, resourceRefs: [{ type: 'video', key: 'file_v3_clip', name: 'clip.mp4' }], sourceAppId: 'cli_b' });
+
+  it.each([
+    ['after', [shot, clip]],
+    ['before', [clip, shot]],
+  ] as const)('keeps a history image when a video posted %s it is still downloading at the budget', async (_, order) => {
+    vi.useFakeTimers();
+    const now = Date.now();
+    network.history.mockResolvedValue([]);
+    let videoRequested!: () => void;
+    const requested = new Promise<void>(resolve => { videoRequested = resolve; });
+    network.download.mockImplementation(async (_app, _id, key, _type, path) => {
+      if (key === 'file_v3_clip') { videoRequested(); return new Promise(() => {}); }
+      writeFileSync(path, 'image-bytes');
+    });
+    for (const seed of order) seed(now);
+    const preparing = prepareGroupContextForTurn({ appId: 'cli_b', chatId: 'oc_room', turnId: 'om_next', createTime: now, query: '看看上面的图片' });
+    await requested;
+    await vi.advanceTimersByTimeAsync(3100);
+    const prepared = await preparing;
+    expect(prepared?.attachments).toEqual([expect.objectContaining({ type: 'image', resourceKey: 'img_shot' })]);
+    expect(prepared?.incomplete).toBe(true);
+  });
+
+  it('downloads a cut-off history video again instead of reusing the partial file', async () => {
+    const now = Date.now();
+    network.history.mockResolvedValue([]);
+    network.download.mockImplementationOnce(async (_app, _id, _key, _type, path) => { writeFileSync(path, 'PARTIAL'); throw new Error('stream reset'); });
+    clip(now);
+    const first = await prepareGroupContextForTurn({ appId: 'cli_b', chatId: 'oc_room', turnId: 'om_t1', createTime: now, query: '看看上面的附件' });
+    expect(first?.attachments ?? []).toEqual([]);
+    network.download.mockImplementation(async (_app, _id, _key, _type, path) => { writeFileSync(path, 'FULL'); });
+    const second = await prepareGroupContextForTurn({ appId: 'cli_b', chatId: 'oc_room', turnId: 'om_t2', createTime: now + 1, query: '看看上面的附件' });
+    const [video] = second?.attachments ?? [];
+    expect(readFileSync(video.path, 'utf8')).toBe('FULL');
+    expect(readdirSync(dirname(video.path))).toEqual([basename(video.path)]);
   });
 });

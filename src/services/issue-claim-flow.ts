@@ -47,10 +47,6 @@ export function claimMarker(claimId: string): string {
   return `#${claimId.slice(0, 8)}`;
 }
 
-export function matchesClaimMarker(groupName: string, claimId: string): boolean {
-  return groupName.includes(claimMarker(claimId));
-}
-
 /** 群名长度上限。与本仓其它建群点一致（command-handler 的 MAX_NAME / FORK_MAX_NAME）。 */
 const GROUP_NAME_MAX = 50;
 

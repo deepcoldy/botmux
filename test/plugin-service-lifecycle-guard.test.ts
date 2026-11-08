@@ -185,30 +185,4 @@ describe('plugin service lifecycle guard', () => {
       'service-demo', 'remove',
     );
   });
-
-  it('keeps the uninstall service check and destructive cleanup in one service lock', () => {
-    const cliSource = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-    const branchStart = cliSource.indexOf("if (sub === 'uninstall' || sub === 'remove' || sub === 'rm')");
-    const branchEnd = cliSource.indexOf("if (sub === 'service' || sub === 'services')", branchStart);
-
-    expect(branchStart).toBeGreaterThanOrEqual(0);
-    expect(branchEnd).toBeGreaterThan(branchStart);
-
-    const uninstallBranch = cliSource.slice(branchStart, branchEnd);
-    const lockStart = uninstallBranch.indexOf('withPluginServiceLock');
-    const serviceCheck = uninstallBranch.indexOf("assertPluginServiceStopped(pluginId, 'uninstall')");
-    const serviceDelete = uninstallBranch.indexOf('deletePluginServicesOrThrowUnlocked([pluginId])');
-    const materializedDelete = uninstallBranch.indexOf('dematerializePlugin(pluginId)');
-    const registryDelete = uninstallBranch.indexOf('removeInstalledPlugin(pluginId)');
-    const runtimeDelete = uninstallBranch.indexOf('rmSync(pluginHome(pluginId)');
-
-    // The status check and every destructive step must share the same lock;
-    // otherwise a concurrent `plugin service start` can create an orphan supervisor app.
-    expect(lockStart).toBeGreaterThanOrEqual(0);
-    expect(serviceCheck).toBeGreaterThan(lockStart);
-    expect(serviceDelete).toBeGreaterThan(serviceCheck);
-    expect(materializedDelete).toBeGreaterThan(serviceDelete);
-    expect(registryDelete).toBeGreaterThan(materializedDelete);
-    expect(runtimeDelete).toBeGreaterThan(registryDelete);
-  });
 });

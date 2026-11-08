@@ -7,6 +7,7 @@
  * wrapped queuedPrompt, clears queued). The CLI process is external — forkWorker
  * is stubbed so we exercise the routing/parking logic in isolation.
  */
+import { cardVisibleText } from './helpers/card-visible-text.js';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { Session } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -68,6 +69,7 @@ vi.mock('../src/services/project-scanner.js', () => ({
 }));
 
 const forkWorkerMock = vi.fn();
+const recordTurnExplicitMentionMock = vi.fn();
 const sendWorkerInputMock = vi.fn();
 const closeWorkerSessionMock = vi.fn(async () => ({ ok: true, outcome: 'closed', alreadyClosed: false }));
 /** Registration-time quarantine check (the real one scans the session store). */
@@ -76,6 +78,7 @@ const runAutoWorktreeCommitMock = vi.fn(async () => {});
 let activeRegistryMock: Map<string, DaemonSession> | null = null;
 vi.mock('../src/core/worker-pool.js', () => ({
   forkWorker: (...a: any[]) => forkWorkerMock(...a),
+  recordTurnExplicitMention: (...a: any[]) => recordTurnExplicitMentionMock(...a),
   sendWorkerInput: (...a: any[]) => sendWorkerInputMock(...a),
   forkAdoptWorker: vi.fn(),
   adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
@@ -84,6 +87,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getCurrentCliVersion: vi.fn(() => 'test-cli-v1'),
   restoreUsageLimitRuntimeState: vi.fn(),
   ensureOrdinaryTurnRecoveryAttached: vi.fn(),
+  resumeTurnNotices: vi.fn(),
   ensureReadonlyTaskContinuationAttached: vi.fn(),
   findQuarantinedRoutingConflict: (...a: [string, string]) => findQuarantinedRoutingConflictMock(...a),
   setActiveSessionIfActive: vi.fn((map: Map<string, any>, k: string, ds: any) => {
@@ -166,6 +170,7 @@ beforeEach(() => {
   store.clear();
   sessionSeq = 0;
   forkWorkerMock.mockClear();
+  recordTurnExplicitMentionMock.mockClear();
   sendMessageMock.mockClear();
   uploadImageMock.mockClear();
   replyMessageMock.mockClear();
@@ -485,7 +490,7 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     expect(payload.content.match(/CURRENT_REPLY_SENTINEL/g)).toHaveLength(1);
     expect(payload).not.toHaveProperty('codexAppInput');
 
-    rememberLastCliInput(restored, 'CURRENT_REPLY_SENTINEL', payload);
+    rememberLastCliInput(restored, 'CURRENT_REPLY_SENTINEL', payload, 'om_current');
     expect(restored.lastCliInput).toBe(payload.content);
     expect(restored.lastCodexAppInput).toBeUndefined();
     expect(restored.session.lastCodexAppInput).toBeUndefined();
@@ -526,6 +531,37 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
     expect(sendMessageMock).toHaveBeenCalledWith(APP, CHAT, expect.any(String), 'interactive');
     expect(deleteMessageMock).toHaveBeenCalledWith(APP, 'om_stale_picker');
     expect(forkWorkerMock).not.toHaveBeenCalled();
+  });
+
+  it('restored picker with no selectable project records the opening\'s explicit @ on the forked turn', async () => {
+    const pending: Session = {
+      sessionId: 'pending-picker-at',
+      chatId: CHAT,
+      rootMessageId: CHAT,
+      scope: 'chat',
+      larkAppId: APP,
+      title: 'pick a repo',
+      status: 'active',
+      createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+      queued: true,
+      queuedPrompt: 'OPENING_N',
+      pendingRepoSetup: {
+        mode: 'picker',
+        prompt: 'OPENING_N',
+        turnId: 'om_opening_at',
+        mentions: [{ key: '@_user_1', name: 'TestBot', openId: 'ou_bot' }],
+      },
+    };
+    store.set(pending.sessionId, pending);
+
+    const active = new Map<string, DaemonSession>();
+    await restoreActiveSessions(active);
+
+    const restored = active.get(sessionKey(CHAT, APP))!;
+    expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+    const forkedTurnId = forkWorkerMock.mock.calls[0]![2]?.turnId;
+    expect(forkedTurnId).toBe('om_opening_at');
+    expect(recordTurnExplicitMentionMock).toHaveBeenCalledWith(restored, forkedTurnId, true);
   });
 
   it('isolates a picker publish failure and keeps restoring later sessions with the exact setup journal', async () => {
@@ -939,6 +975,66 @@ describe('spawnDashboardSession — in_progress starts immediately', () => {
     expect(dashboardEventBus.publish).toHaveBeenCalledWith(expect.objectContaining({
       type: 'session.spawned',
     }));
+  });
+});
+
+describe('spawnDashboardSession — default working dir missing', () => {
+  // Starting without a pick would land in the bot's default working dir, which
+  // is gone: forkWorker refuses it. The session waits on the missing-directory
+  // picker instead (manual entry even with nothing to scan, no 「直接开启会话」).
+  // Keep `_`: markdown escaping must differ from the visible path we assert.
+  const MISSING = `${process.env.TMPDIR ?? '/tmp'}/botmux-dash-missing-${process.pid}/gone_dir/botmux`;
+
+  beforeEach(() => {
+    vi.mocked(getBot).mockReturnValue({
+      config: { cliId: 'claude-code', cliPathOverride: undefined, defaultWorkingDir: MISSING },
+      botName: 'TestBot', botOpenId: 'ou_bot',
+    } as any);
+    sendMessageMock.mockImplementation(async (...a: any[]) => (a[3] === 'interactive' ? 'om_missing_picker' : 'om_banner_123'));
+  });
+
+  function publishedCard(): string {
+    const call = sendMessageMock.mock.calls.find((c: any[]) => c[3] === 'interactive') as any[] | undefined;
+    return String(call?.[2] ?? '');
+  }
+
+  it('立即开跑：不 fork，发缺目录选仓卡，首轮挂在卡后', async () => {
+    const active = new Map<string, DaemonSession>();
+
+    const result = await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: 'start where it can', column: 'in_progress', role: 'solo',
+    });
+
+    expect(result).toEqual({ ok: true, sessionId: 'sess-1' });
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.initialStartPending).toBe(false);
+    expect(cardVisibleText(publishedCard())).toContain(MISSING);
+    expect(publishedCard()).toContain('repo_manual_submit');
+    expect(publishedCard()).not.toContain('skip_repo');
+    expect(ds.repoCardMessageId).toBe('om_missing_picker');
+    expect(ds.session.pendingRepoSetup).toMatchObject({ mode: 'picker', repoCardMessageId: 'om_missing_picker' });
+    expect(ds.session.pendingRepoSetup?.prompt).toContain('start where it can');
+    expect(dashboardEventBus.publish).toHaveBeenCalledWith(expect.objectContaining({ type: 'session.spawned' }));
+  });
+
+  it('待办池「开始」：同样等选目录，排队的任务保留', async () => {
+    const active = new Map<string, DaemonSession>();
+    await spawnDashboardSession(active, undefined, {
+      larkAppId: APP, chatId: CHAT, content: 'queued for later', column: 'backlog', role: 'solo',
+    });
+    const ds = active.get(sessionKey(CHAT, APP))!;
+
+    const result = await activateQueuedSession(ds);
+
+    expect(result.ok).toBe(true);
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.session.queued).toBe(true);
+    expect(ds.session.queuedPrompt).toContain('queued for later');
+    expect(publishedCard()).toContain('repo_manual_submit');
+    expect(publishedCard()).not.toContain('skip_repo');
   });
 });
 

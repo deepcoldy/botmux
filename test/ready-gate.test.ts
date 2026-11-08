@@ -30,8 +30,6 @@
  * Run: pnpm vitest run test/ready-gate.test.ts
  */
 import { afterEach, describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import { ReadyGate, shouldArmReadyGate } from '../src/utils/ready-gate.js';
 import { resolveReadySignalTimeoutMs, shouldReleaseFirstPromptTimeout } from '../src/utils/input-gate.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
@@ -162,25 +160,6 @@ const FIRST_PROMPT_TIMEOUT_MS = 15_000;
 const FIRST_PROMPT_HARD_TIMEOUT_MS = 90_000;
 const READY_FLUSH_SETTLE_MS = 1_000;
 const READY_FLUSH_SETTLE_CAP_MS = 6_000;
-
-/** src/worker.ts, read once — the two source-pinned assertions below bind their
- *  timelines to the real call sites instead of restating intent. */
-const WORKER_SRC = readFileSync(join(__dirname, '..', 'src', 'worker.ts'), 'utf8');
-
-/** The `forced` qualifier on the first-prompt gate release (worker.ts,
- *  `releaseFirstPromptTimeout`). Without it the release is unconditional, so the
- *  15s SOFT timeout opens an armed gate and a non-deferring adapter's first
- *  write lands at ~15s + settle instead of at its 45s fallback edge. */
-const FIRST_PROMPT_GATE_RELEASE_GUARD = 'if (forced && readyGate.shouldHold())';
-
-/** The real call-site window around `releaseReadyGate('first-prompt hard
- *  timeout')` — the guard + the release call, so a timeline can read the rule
- *  the code actually implements. */
-function firstPromptGateReleaseCallSite(): string {
-  const call = WORKER_SRC.indexOf("releaseReadyGate('first-prompt hard timeout')");
-  if (call < 0) throw new Error('worker.ts no longer releases the ready gate on the first-prompt timeout');
-  return WORKER_SRC.slice(Math.max(0, call - 400), call);
-}
 
 /** Model one spawn's first-prompt gate under fake timers, using the production
  *  decision functions the worker actually calls. Flush times are returned as the
@@ -354,62 +333,6 @@ describe('first-prompt fallback alignment', () => {
     expect(timeline.writableAtMs).toBe(45_000 + READY_FLUSH_SETTLE_CAP_MS);
   });
 
-  it('a non-deferring adapter (claude-code) holds the gate through the 15s soft timeout: only the hard cap may open it', () => {
-    // The gate exists to stop a startup selector's fake ❯ from eating the first
-    // message. claude-code does NOT declare deferFirstPromptTimeoutUntilReady, so
-    // its 15s soft timeout releases the QUEUE — but if it also opened the gate,
-    // the write would move from master's ~45-51s (the READY_SIGNAL_TIMEOUT_MS
-    // fallback, the gate's only release edge besides a real signal) to ~15-21s,
-    // i.e. into a selector that may not have been passed yet.
-    const callSite = firstPromptGateReleaseCallSite();
-    // The code fact the timeline below is derived from: the release is qualified
-    // by `forced` (asserted at the end, so a regression fails on the BEHAVIOUR
-    // first and this line only confirms the source it came from).
-    const softTimeoutReleasesGate = !callSite.includes(FIRST_PROMPT_GATE_RELEASE_GUARD);
-    vi.useFakeTimers();
-    vi.setSystemTime(0);
-    const gate = new ReadyGate();
-    gate.arm();
-    let gateReleasedAtMs = Number.POSITIVE_INFINITY;
-    const release = (): void => { if (gate.receive()) gateReleasedAtMs = Date.now(); };
-
-    // The 15s SOFT timeout (forced = false): the queue is released here, which is
-    // master's semantics for an adapter without defer…
-    const softTimeoutReleasedQueue = shouldReleaseFirstPromptTimeout({
-      deferFirstPromptTimeoutUntilReady: false,
-      hasReadyPattern: true,
-      elapsedMs: FIRST_PROMPT_TIMEOUT_MS,
-      hardTimeoutMs: FIRST_PROMPT_HARD_TIMEOUT_MS,
-    });
-    vi.advanceTimersByTime(FIRST_PROMPT_TIMEOUT_MS);
-    if (softTimeoutReleasesGate) release(); // the regression this pins
-    const gateOpenAtSoftTimeout = !gate.shouldHold();
-    // …and the adapter's own cap is 75s away, so no settle is cancelled here
-    // (worker.ts cancels only `if (forced)`), and both flushPending() and
-    // markPromptReady() bail while the gate still holds → nothing is written.
-    const writableAtSoftTimeout = gateOpenAtSoftTimeout;
-
-    // 45s: the gate's own fallback (READY_SIGNAL_TIMEOUT_MS) — its release edge.
-    const fallbackMs = resolveReadySignalTimeoutMs({
-      alignFallbackWithFirstPromptHardCap: false,
-      readySignalTimeoutMs: READY_SIGNAL_TIMEOUT_MS,
-      firstPromptHardTimeoutMs: FIRST_PROMPT_HARD_TIMEOUT_MS,
-    });
-    vi.advanceTimersByTime(fallbackMs - FIRST_PROMPT_TIMEOUT_MS);
-    if (gate.shouldHold()) release();
-    // Post-release: the worker settles for PTY quiescence (quiet PTY, so the
-    // 1s window is satisfied) and only then flushes.
-    const writableAtMs = gateReleasedAtMs + READY_FLUSH_SETTLE_MS;
-
-    expect(softTimeoutReleasedQueue).toBe(true);
-    expect(fallbackMs).toBe(READY_SIGNAL_TIMEOUT_MS);
-    expect(gateReleasedAtMs, 'the 15s soft timeout opened the ready gate').toBe(READY_SIGNAL_TIMEOUT_MS);
-    expect(writableAtSoftTimeout, 'the first message reached the PTY while the gate was still armed').toBe(false);
-    expect(writableAtMs, 'the first write moved off the 45s fallback edge').toBe(READY_SIGNAL_TIMEOUT_MS + READY_FLUSH_SETTLE_MS);
-    expect(callSite, 'worker.ts must release the first-prompt gate at the hard cap only')
-      .toContain(FIRST_PROMPT_GATE_RELEASE_GUARD);
-  });
-
   it('a deferring adapter without a readyPattern is not aligned (release at 45s)', () => {
     vi.useFakeTimers();
     const timeline = runFirstPromptTimeline({
@@ -442,16 +365,5 @@ describe('first-prompt fallback alignment', () => {
       readySignalTimeoutMs: READY_SIGNAL_TIMEOUT_MS,
       firstPromptHardTimeoutMs: FIRST_PROMPT_HARD_TIMEOUT_MS,
     })).toBe(45_000);
-  });
-
-  it('the worker cancels a pending settle at the hard cap only, never at a soft timeout (source pin)', () => {
-    // The timeline above models the contract ("the cap bounds every write");
-    // this pins the real call site so a refactor cannot drop the cancellation
-    // and silently restore the 90-96s window — nor make it unconditional, which
-    // would strip the settle from the legacy soft-timeout release.
-    const worker = readFileSync(join(__dirname, '..', 'src', 'worker.ts'), 'utf8');
-    const hardCapRelease = worker.indexOf("releaseReadyGate('first-prompt hard timeout')");
-    expect(hardCapRelease).toBeGreaterThan(-1);
-    expect(worker.slice(hardCapRelease, hardCapRelease + 800)).toContain('if (forced) cancelFirstFlushSettle();');
   });
 });

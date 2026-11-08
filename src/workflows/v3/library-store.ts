@@ -7,7 +7,7 @@
  * are immutable, content-addressed, and installed without replacement.
  */
 
-import { constants as fsConstants, promises as fs } from 'node:fs';
+import { constants as fsConstants, promises as fs, readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 
@@ -21,12 +21,11 @@ import {
   SAVED_WORKFLOW_ID_RE,
   SAVED_WORKFLOW_METADATA_SCHEMA_VERSION,
   SAVED_WORKFLOW_REVISION_ID_RE,
-  SAVED_WORKFLOW_REVISION_SCHEMA_VERSION,
   buildSavedWorkflowRevision,
+  isWrittenSavedWorkflowRevisionSchema,
   canonicalJsonStringify,
   loadSavedWorkflowRevision,
   mintSavedWorkflowId,
-  normalizeSavedWorkflowLookupKey,
   validateSavedWorkflowMetadata,
   type LoadedSavedWorkflowRevision,
   type SavedWorkflowMetadata,
@@ -118,11 +117,6 @@ export interface SavedWorkflowListResult {
   entries: SavedWorkflowMetadata[];
   invalid: Array<{ workflowId: string; error: string }>;
 }
-
-export type SavedWorkflowResolution =
-  | { kind: 'not_found' }
-  | { kind: 'resolved'; metadata: SavedWorkflowMetadata }
-  | { kind: 'ambiguous'; matches: SavedWorkflowMetadata[] };
 
 export function workflowLibraryRoot(dataDir: string): string {
   if (!dataDir) throw new Error('dataDir is required');
@@ -237,7 +231,7 @@ function exactLibraryBytes(input: CreateOrRecoverExactSavedWorkflowInput): {
     workflowId: metadata.workflowId,
     revisionId: input.expectedRevision.revisionId,
   });
-  const rebuiltRevision = input.expectedRevision.schemaVersion === SAVED_WORKFLOW_REVISION_SCHEMA_VERSION
+  const rebuiltRevision = isWrittenSavedWorkflowRevisionSchema(input.expectedRevision.schemaVersion)
     ? buildSavedWorkflowRevision(loadedRevision.payload)
     : input.expectedRevision;
   if (canonicalJsonStringify(rebuiltRevision) !== canonicalJsonStringify(input.expectedRevision)) {
@@ -517,7 +511,7 @@ export async function verifyExactSavedWorkflowOrigin(
       try {
         const parsed = JSON.parse(bytes) as unknown;
         const loaded = loadSavedWorkflowRevision(parsed, { workflowId, revisionId });
-        const canonical = (parsed as StoredSavedWorkflowRevision).schemaVersion === SAVED_WORKFLOW_REVISION_SCHEMA_VERSION
+        const canonical = isWrittenSavedWorkflowRevisionSchema((parsed as StoredSavedWorkflowRevision).schemaVersion)
           ? buildSavedWorkflowRevision(loaded.payload)
           : parsed;
         if (bytes !== `${canonicalJsonStringify(canonical)}\n`) {
@@ -644,6 +638,19 @@ export async function readSavedWorkflowMetadata(
   return validateSavedWorkflowMetadata(JSON.parse(raw));
 }
 
+/** Synchronous metadata read, for a re-check inside a synchronous lock. */
+export function readSavedWorkflowMetadataSync(dataDir: string, workflowId: string): SavedWorkflowMetadata {
+  const path = savedWorkflowMetadataPath(dataDir, workflowId);
+  let raw: string;
+  try {
+    raw = readFileSync(path, 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') throw new SavedWorkflowNotFoundError(workflowId);
+    throw err;
+  }
+  return validateSavedWorkflowMetadata(JSON.parse(raw));
+}
+
 export async function readSavedWorkflowRevision(
   dataDir: string,
   workflowId: string,
@@ -747,24 +754,6 @@ export async function publishLatestSavedWorkflow(
   });
 }
 
-export async function archiveSavedWorkflow(
-  dataDir: string,
-  workflowId: string,
-  input: { actor: SavedWorkflowOwner; now?: Date },
-): Promise<SavedWorkflowMetadata> {
-  return withExistingSavedWorkflowMutationLock(dataDir, workflowId, async () => {
-    const metadata = await readSavedWorkflowMetadata(dataDir, workflowId);
-    assertOwner(metadata, input.actor);
-    const next = validateSavedWorkflowMetadata({
-      ...metadata,
-      status: 'archived',
-      updatedAt: (input.now ?? new Date()).toISOString(),
-    });
-    await writeMetadata(dataDir, next);
-    return next;
-  });
-}
-
 export async function listSavedWorkflows(
   dataDir: string,
   opts: ListSavedWorkflowOptions = {},
@@ -806,20 +795,57 @@ function isVisible(metadata: SavedWorkflowMetadata, opts: ListSavedWorkflowOptio
   return true;
 }
 
-export async function resolveSavedWorkflowRef(
+/** Every revision of one workflow, oldest first (version history, §5.3).
+ *  Each file is verified exactly as a single read is. */
+export async function listSavedWorkflowRevisions(
   dataDir: string,
-  ref: string,
-  opts: ListSavedWorkflowOptions = {},
-): Promise<SavedWorkflowResolution> {
-  const normalized = normalizeSavedWorkflowLookupKey(ref);
-  const { entries } = await listSavedWorkflows(dataDir, opts);
-  const matches = entries.filter((metadata) =>
-    metadata.workflowId === ref ||
-    normalizeSavedWorkflowLookupKey(metadata.displayName) === normalized ||
-    metadata.aliases.some((alias) => normalizeSavedWorkflowLookupKey(alias) === normalized));
-  if (matches.length === 0) return { kind: 'not_found' };
-  if (matches.length > 1) return { kind: 'ambiguous', matches };
-  return { kind: 'resolved', metadata: matches[0]! };
+  workflowId: string,
+): Promise<LoadedSavedWorkflowRevision[]> {
+  const dir = join(savedWorkflowDir(dataDir, workflowId), REVISIONS_DIR);
+  let names: string[];
+  try {
+    names = await fs.readdir(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') throw new SavedWorkflowNotFoundError(workflowId);
+    throw err;
+  }
+  const out: LoadedSavedWorkflowRevision[] = [];
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    const revisionId = name.slice(0, -'.json'.length);
+    if (!SAVED_WORKFLOW_REVISION_ID_RE.test(revisionId)) continue;
+    out.push(await readSavedWorkflowRevision(dataDir, workflowId, revisionId));
+  }
+  return out.sort((a, b) => a.payload.humanVersion - b.payload.humanVersion || a.revisionId.localeCompare(b.revisionId));
+}
+
+/**
+ * Every workflow of every bot sharing `dataDir`, without a chat (the
+ * Dashboard catalog, §5.3 / I9: a Dashboard admin sees all, chat-scoped ones
+ * labelled). Archived ones are owner management state and stay out.
+ */
+export async function listSavedWorkflowCatalog(dataDir: string): Promise<SavedWorkflowListResult> {
+  const root = workflowLibraryRoot(dataDir);
+  let names: string[];
+  try {
+    names = await fs.readdir(root);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { entries: [], invalid: [] };
+    throw err;
+  }
+  const entries: SavedWorkflowMetadata[] = [];
+  const invalid: Array<{ workflowId: string; error: string }> = [];
+  for (const workflowId of names.sort()) {
+    if (!SAVED_WORKFLOW_ID_RE.test(workflowId)) continue;
+    try {
+      const metadata = await readSavedWorkflowMetadata(dataDir, workflowId);
+      if (metadata.status !== 'archived') entries.push(metadata);
+    } catch (err) {
+      invalid.push({ workflowId, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  entries.sort((a, b) => a.displayName.localeCompare(b.displayName) || a.workflowId.localeCompare(b.workflowId));
+  return { entries, invalid };
 }
 
 async function writeMetadata(dataDir: string, metadata: SavedWorkflowMetadata): Promise<void> {

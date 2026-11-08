@@ -295,3 +295,62 @@ describe('session-observe normalizer', () => {
     expect(observe.raw).toBe(row);
   });
 });
+
+describe('session-observe context block', () => {
+  const measurement = {
+    usedTokens: 161_240,
+    windowTokens: 1_000_000,
+    compactions: 2,
+    measuredAt: OBSERVED_AT - 3_000,
+    source: 'claude-transcript',
+  };
+
+  it('projects the daemon-computed measurement verbatim', () => {
+    const observe = normalizeSessionRow(makeRow({ contextUsage: measurement }), { observedAt: OBSERVED_AT });
+    expect(observe.context).toEqual(measurement);
+  });
+
+  it('keeps an unknown window or compaction count as null, never 0', () => {
+    const observe = normalizeSessionRow(
+      makeRow({ contextUsage: { ...measurement, windowTokens: null, compactions: null } }),
+      { observedAt: OBSERVED_AT },
+    );
+    expect(observe.context).toEqual({ ...measurement, windowTokens: null, compactions: null });
+  });
+
+  it('leaves context absent when the row carries no measurement', () => {
+    const observe = normalizeSessionRow(makeRow({}), { observedAt: OBSERVED_AT });
+    expect('context' in observe).toBe(false);
+  });
+
+  it.each([
+    ['zero used tokens', { usedTokens: 0 }],
+    ['non-finite used tokens', { usedTokens: Number.NaN }],
+    ['missing used tokens', { usedTokens: undefined }],
+    ['string used tokens', { usedTokens: '161240' }],
+    ['missing measuredAt', { measuredAt: undefined }],
+    ['empty source', { source: '' }],
+  ])('drops the whole block instead of reporting a partial one: %s', (_name, patch) => {
+    const observe = normalizeSessionRow(
+      makeRow({ contextUsage: { ...measurement, ...patch } }),
+      { observedAt: OBSERVED_AT },
+    );
+    expect('context' in observe).toBe(false);
+  });
+
+  it('degrades malformed optional parts to null without dropping the block', () => {
+    const observe = normalizeSessionRow(
+      makeRow({ contextUsage: { ...measurement, windowTokens: -5, compactions: 1.5 } }),
+      { observedAt: OBSERVED_AT },
+    );
+    expect(observe.context).toEqual({ ...measurement, windowTokens: null, compactions: null });
+  });
+
+  it('is a realtime fact: a failed probe never carries it', () => {
+    const observe = normalizeSessionRow(
+      makeRow({ contextUsage: measurement }),
+      { observedAt: OBSERVED_AT, probe: { status: 'unreachable', source: 'daemon-ipc' } },
+    );
+    expect('context' in observe).toBe(false);
+  });
+});

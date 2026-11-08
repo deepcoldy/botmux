@@ -145,12 +145,10 @@ export function normalizeFeedbackPolicy(raw: unknown): FeedbackPolicy {
   if (input.reviewers !== undefined) {
     reviewers = validateReviewerEntries(input.reviewers);
   }
-  // `reviewers` audience is meaningless without at least one reviewer, and a
-  // silently-empty allowlist would render an un-clickable control. Fail closed
-  // at config time instead of shipping a dead button.
-  if (audience === 'reviewers' && reviewers.length === 0) {
-    throw new Error('feedback.audience "reviewers" requires a non-empty feedback.reviewers allowlist');
-  }
+  // An empty reviewers allowlist is intentional: keep the feedback control
+  // visible, but let the callback identity gate reject every operator. This
+  // surfaces the configured feedback affordance without widening access when
+  // the trusted reviewer list has not been filled in yet.
   // A reviewers allowlist only has meaning under the reviewers audience; reject
   // the combination rather than silently ignoring it (a requester-only or
   // everyone card must never appear to have carried an allowlist).
@@ -216,14 +214,39 @@ export function normalizeFeedbackPolicy(raw: unknown): FeedbackPolicy {
   };
 }
 
-export function resolveFeedbackPolicy(raw: unknown, bot?: { apiOnly?: boolean }): FeedbackPolicy | undefined {
-  if (bot?.apiOnly || !raw || typeof raw !== 'object' || Array.isArray(raw) || (raw as { enabled?: unknown }).enabled !== true) return undefined;
-  return normalizeFeedbackPolicy(raw);
-}
-
 /** Whether an entry needs a send-time contact lookup to become a matchable id. */
 function isResolvableReviewerEntry(entry: string): boolean {
   return !entry.startsWith('ou_') && !entry.startsWith('on_');
+}
+
+/**
+ * Outcome of one send-time reviewer contact resolution. Mirrors
+ * resolveAllowedUsersWithMap: a missing key in `map` is an unresolved entry,
+ * and `entryStatus` distinguishes a definitive miss (no such user / not
+ * visible — drop) from a transient one (rate limit / 5xx — eligible for
+ * last-known-good recovery). A bare `Map` is accepted and treated as
+ * "definitive for every missing entry" for simple callers.
+ */
+export interface FeedbackReviewerResolveOutcome {
+  map: Map<string, string>;
+  /** True when a transient contact-API failure hit any requested entry. */
+  errored?: boolean;
+  /** Per-raw-entry verdict; an absent status defaults to definitive. */
+  entryStatus?: Map<string, 'resolved' | 'transient' | 'definitive'>;
+}
+
+export interface MaterializeFeedbackReviewersResult {
+  policy: FeedbackPolicy;
+  /** True when at least one configured entry transient-failed this pass. */
+  transientFailure: boolean;
+  /** Raw entries reused from `previousResolvedMap` instead of a fresh ou_. */
+  recoveredEntries: string[];
+  /** Transient-failed entries for which no cached ou_ was available. */
+  unrecoveredEntries: string[];
+  /** Entries with a definitive verdict (gone / not visible / invalid). */
+  definitiveEntries: string[];
+  /** Healthy raw → ou_ mappings produced this pass, for cache write-through. */
+  freshMap: Map<string, string>;
 }
 
 /**
@@ -234,42 +257,105 @@ function isResolvableReviewerEntry(entry: string): boolean {
  * send time, with the bot's own app credentials) into this bot's app-scoped
  * `ou_`, exactly like owner `allowedUsers`. `ou_`/`on_` pass through untouched.
  *
- * Fail closed by dropping only the entries this resolution could not prove:
- *  - a resolver that maps an email to an `ou_` replaces that entry;
- *  - an unresolved email is DROPPED (never shipped as a dead entry that
- *    silently gates nothing, and never left as raw text the callback can't
- *    match). If every entry drops, the caller sees an empty allowlist and must
- *    fail closed (no clickable control) rather than emitting an open card.
+ * Two distinct ways an entry can be missing MUST NOT collapse into the same
+ * empty allowlist:
+ *  - a definitive miss (the API answered but knows no such user / the user is
+ *    not visible): DROP the entry. An all-definitive list legitimately
+ *    converges to an empty allowlist — the control stays visible, the
+ *    callback rejects every operator;
+ *  - a transient miss (throw / non-zero batch code / rate limit / 5xx): the
+ *    config may be perfectly correct, so an entry still in config reuses its
+ *    `previousResolvedMap` ou_ (last known good). A transient entry without a
+ *    cached id is reported in `unrecoveredEntries` instead of silently
+ *    converging, so the caller can refuse to ship an empty snapshot.
+ * A cached ou_ is NEVER reused for a definitive verdict or an entry no longer
+ * in config (the walk only visits current entries), mirroring the
+ * allowed-users-apply invariants: no reviving removed reviewers.
  *
- * `resolve` receives the raw email entries and returns a map from the
- * raw entry to a resolved `ou_` (missing key = unresolved). It is only called
- * when there is something to resolve, so `everyone`/`requester` and pure-id
- * `reviewers` policies never trigger a lookup.
+ * `resolve` receives the raw email entries. It is only called when there is
+ * something to resolve, so `everyone`/`requester` and pure-id `reviewers`
+ * policies never trigger a lookup.
  */
 export async function materializeFeedbackReviewers(
   policy: FeedbackPolicy,
-  resolve: (entries: string[]) => Promise<Map<string, string>>,
-): Promise<FeedbackPolicy> {
-  if (policy.audience !== 'reviewers') return policy;
+  resolve: (entries: string[]) => Promise<FeedbackReviewerResolveOutcome | Map<string, string>>,
+  options: { previousResolvedMap?: Readonly<Record<string, string>> } = {},
+): Promise<MaterializeFeedbackReviewersResult> {
+  const noop: MaterializeFeedbackReviewersResult = {
+    policy, transientFailure: false, recoveredEntries: [], unrecoveredEntries: [], definitiveEntries: [], freshMap: new Map(),
+  };
+  if (policy.audience !== 'reviewers') return noop;
   const pending = policy.reviewers.filter(isResolvableReviewerEntry);
-  if (pending.length === 0) return policy;
+  if (pending.length === 0) return noop;
   let map: Map<string, string>;
+  let errored = false;
+  let entryStatus: Map<string, 'resolved' | 'transient' | 'definitive'> | undefined;
   try {
-    map = await resolve(pending);
+    const outcome = await resolve(pending);
+    if (outcome instanceof Map) {
+      map = outcome;
+    } else {
+      map = outcome.map;
+      errored = outcome.errored === true;
+      entryStatus = outcome.entryStatus;
+    }
   } catch {
-    // A transient resolver failure must not silently widen or dead-gate the
-    // card. Drop the unresolved entries; keep any literal ids that need no
-    // lookup. An all-dropped result yields an empty allowlist (caller fails
-    // closed), never an open one.
+    // A thrown resolution is a whole-batch transient failure (network /
+    // timeout / 5xx), never a per-email identity verdict. Every pending entry
+    // becomes cache-recovery eligible.
     map = new Map();
+    errored = true;
+    entryStatus = new Map(pending.map(entry => [entry, 'transient']));
   }
+  // Absent explicit status: errored ⇒ transient (retry/cache eligible),
+  // otherwise definitive (never revive). Unknown statuses fail safe to
+  // definitive.
+  const statusOf = (entry: string): 'resolved' | 'transient' | 'definitive' => {
+    const status = entryStatus?.get(entry);
+    if (status === 'resolved' || status === 'transient' || status === 'definitive') return status;
+    return errored ? 'transient' : 'definitive';
+  };
+
+  const previous = options.previousResolvedMap ?? {};
   const seen = new Set<string>();
   const reviewers: string[] = [];
+  const recoveredEntries: string[] = [];
+  const unrecoveredEntries: string[] = [];
+  const definitiveEntries: string[] = [];
+  const freshMap = new Map<string, string>();
+  let transientFailure = false;
   for (const entry of policy.reviewers) {
-    const resolved = isResolvableReviewerEntry(entry) ? map.get(entry) : entry;
-    if (!resolved || seen.has(resolved)) continue;
-    seen.add(resolved);
-    reviewers.push(resolved);
+    if (!isResolvableReviewerEntry(entry)) {
+      if (!seen.has(entry)) { seen.add(entry); reviewers.push(entry); }
+      continue;
+    }
+    const fresh = map.get(entry);
+    if (fresh && fresh.startsWith('ou_')) {
+      freshMap.set(entry, fresh);
+      if (!seen.has(fresh)) { seen.add(fresh); reviewers.push(fresh); }
+      continue;
+    }
+    const status = statusOf(entry);
+    if (status === 'transient') {
+      transientFailure = true;
+      const cached = previous[entry];
+      if (cached && cached.startsWith('ou_') && !seen.has(cached)) {
+        seen.add(cached);
+        reviewers.push(cached);
+        recoveredEntries.push(entry);
+      } else {
+        unrecoveredEntries.push(entry);
+      }
+      continue;
+    }
+    definitiveEntries.push(entry);
   }
-  return { ...policy, reviewers };
+  return {
+    policy: { ...policy, reviewers },
+    transientFailure,
+    recoveredEntries,
+    unrecoveredEntries,
+    definitiveEntries,
+    freshMap,
+  };
 }

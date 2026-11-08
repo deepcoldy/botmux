@@ -44,6 +44,9 @@ const PROGRAM_STATUS_ZERO_WIDTH = /[\u200b-\u200d\ufeff]/g;
  *  such as Ink / Antigravity dots ⣾⣽⣻⢿⡿⣟⣯⣷), and OpenCode progress bar chars (■⬝). */
 const SPINNER_RE = /[·✢✳✶✻✽\u2800-\u28ff■⬝]/;
 
+/** Keep in sync with the rule-joined composer arm in the TraeX adapter. */
+const RULE_JOINED_CLEAR_CHAR = /[─━]/;
+
 /** Default quiescence timeout (ms) — idle if PTY silent + no recent spinner */
 const QUIESCENCE_MS = 2_000;
 /** Spinner guard — don't declare idle if spinner seen within this window */
@@ -97,6 +100,10 @@ export class IdleDetector {
   private staticBusyClearPattern: RegExp | undefined;
   private busyTransitionArmed = false;
   private readyPattern: RegExp | undefined;
+  /** Stricter readyPattern without the cursor-addressed rule arm. */
+  private readyPatternStrong: RegExp | undefined;
+  /** Whether the current ready evidence matches ONLY via a weak rule arm. */
+  private readyEvidenceWeak = false;
   private readySeen = false;
   private startupPendingPattern: RegExp | undefined;
   private startupReadyPattern: RegExp | undefined;
@@ -126,15 +133,25 @@ export class IdleDetector {
   private programStatusFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private programStatusBlockInfo: ProgramStatusBlock | null = null;
   private programStatusErrorMsg: string | undefined;
+  /** Wall clock of the last accepted OSC 7501 report (0 = none yet). */
+  private programStatusLastAtMs = 0;
+  /** CliAdapter.programStatusSubmitAwaitsBusy. */
+  private readonly submitAwaitsBusy: boolean;
+  /** Deadline set by reset() when submitAwaitsBusy (0 = not waiting). Until a
+   *  `working` / `blocked` report arrives, a terminal report is left over from
+   *  before the submit and does not complete the turn. */
+  private submitBusyDeadlineMs = 0;
   /** See CliAdapter.programStatusStartupIdleUntrusted. */
-  private programStatusStartupIdleUntrusted: boolean;
+  private readonly programStatusStartupIdleUntrusted: boolean;
 
   constructor(cli: CliAdapter, private readonly captureStartupScreen?: () => string) {
+    this.submitAwaitsBusy = cli.programStatusSubmitAwaitsBusy === true;
     this.completionPattern = cli.completionPattern;
     this.idleToBusyPattern = cli.idleToBusyPattern;
     this.staticBusyPattern = cli.staticBusyPattern;
     this.staticBusyClearPattern = cli.staticBusyClearPattern;
     this.readyPattern = cli.readyPattern;
+    this.readyPatternStrong = cli.readyPatternStrong;
     this.startupPendingPattern = cli.startupPendingPattern;
     this.startupReadyPattern = cli.startupReadyPattern;
     this.startupResume = cli.startupResume;
@@ -160,19 +177,33 @@ export class IdleDetector {
    * The caller must first confirm the PTY is quiet AND the current rendered
    * screen matches readyPattern. This only restores readySeen — a full
    * quiescence check (spinner guard included) still runs on top of it, so no
-   * existing check is bypassed.
+   * existing check is bypassed. A newly initialized restored composer can opt
+   * into rechecking evidence whose timer already expired behind startup loading.
    */
-  seedReadyEvidence(): boolean {
+  seedReadyEvidence(recheckExisting = false): boolean {
     if (this.programStatusAuthority) {
       // The post-SessionStart fallback only calls this once the viewport
       // already shows a prompt. Re-publish the OSC terminal state; do not
       // let the screen timer declare idle while a child is still working.
-      if (this.isIdle || !this.isTerminalProgramStatus()) return false;
+      // Already being idle is no reason to skip it: when OSC reports idle
+      // before the SessionStart signal, resetReadyEvidence() republishes that
+      // edge while the worker's ready gate still holds, the worker drops it,
+      // and every caller of this method is one still waiting for an edge.
+      // Skipping it left the first prompt to the 15s timeout (#2178).
+      if (!this.isTerminalProgramStatus() || this.submitBusyDeadlineMs !== 0) return false;
       this.markIdle('program-status');
       return true;
     }
-    if (this.isIdle || this.readySeen) return false;
+    if (!recheckExisting && (this.isIdle || this.readySeen)) return false;
+    // A startup fence may have declined an earlier idle callback. A freshly
+    // verified viewport must be able to re-publish that edge, as the OSC path
+    // above already does. Re-run every quiescence guard instead of treating
+    // the detector's old idle bit as proof that the Worker accepted readiness.
+    this.isIdle = false;
     this.readySeen = true;
+    // Viewport-verified seeding (recheckExisting) has already passed the
+    // adapter's rendered composer predicate; it is never weak evidence.
+    if (recheckExisting) this.readyEvidenceWeak = false;
     this.clearTimer();
     this.quiescenceCheck();
     return true;
@@ -236,6 +267,7 @@ export class IdleDetector {
     );
     if (readyMatched) {
       this.readySeen = true;
+      this.tagReadyEvidence(stripped);
     }
 
     // Pre-idle static-busy latch (capacity-queue screens).
@@ -253,6 +285,9 @@ export class IdleDetector {
     //  a submitted user message (`› text`) followed by a fresh queue line
     //  must NOT clear the latch (the queue is fresher), while a queue line
     //  followed by a real composer redraw must clear it.
+    //  Rule-joined composer matches are weaker: a cursor-addressed queue
+    //  repaint can retain the composer underneath the queue notice. Such
+    //  a match may clear only when this chunk has no queue evidence.
     // STALE-TAIL: after a clear, queue text lingering in the tail must not
     //  re-set the latch. Record the clear position in the tail; only queue
     //  evidence AFTER that position is fresh enough to set.
@@ -262,7 +297,9 @@ export class IdleDetector {
         : -1;
       const staticChunkIdx = lastMatchIndex(this.staticBusyPattern, stripped);
       const staticTailIdx = lastMatchIndex(this.staticBusyPattern, this.outputTail);
-      if (clearIdx >= 0 && clearIdx > staticChunkIdx) {
+      const clearStartsOnRule = clearIdx >= 0 && RULE_JOINED_CLEAR_CHAR.test(stripped[clearIdx]!);
+      if (clearIdx >= 0 && clearIdx > staticChunkIdx
+        && (!clearStartsOnRule || staticChunkIdx < 0)) {
         this.staticBusyLatch = false;
         // Record where the clear landed in the tail so stale queue text
         // before it doesn't re-set the latch on the next chunk.
@@ -270,7 +307,10 @@ export class IdleDetector {
         this.staticBusyClearTailPos = chunkStart >= 0
           ? chunkStart + clearIdx
           : this.outputTail.length;
-      } else if (staticTailIdx >= 0 && staticTailIdx > this.staticBusyClearTailPos) {
+      } else if (staticChunkIdx >= 0
+        || (staticTailIdx >= 0 && staticTailIdx > this.staticBusyClearTailPos)) {
+        // A large repaint can evict its queue line from the rolling tail.
+        // Fresh evidence in the current chunk must still establish the hold.
         this.staticBusyLatch = true;
       }
     }
@@ -322,10 +362,12 @@ export class IdleDetector {
     this.busyTransitionArmed = false;
     this.outputTail = '';
     this.readySeen = false;
+    this.readyEvidenceWeak = false;
     this.staticBusyLatch = false;
     this.staticBusyClearTailPos = -1;
     this.lastSpinnerAt = Date.now();
     this.clearTimer();
+    this.submitBusyDeadlineMs = this.submitAwaitsBusy ? Date.now() + PROGRAM_STATUS_FALLBACK_MS : 0;
     // A new submit invalidates the previous snapshot. Stale terminal states
     // (idle / done / error) must not immediately complete the turn we just started.
     // If any working or blocked record remains, keep authority and do not arm
@@ -364,7 +406,8 @@ export class IdleDetector {
     // armed before this call, sees a fresh program-status edge. A working
     // or blocked snapshot stays busy; Claude emits `idle` when the prompt
     // is actually ready.
-    const republishTerminal = this.programStatusAuthority && this.isTerminalProgramStatus();
+    const republishTerminal = this.programStatusAuthority && this.isTerminalProgramStatus()
+      && this.submitBusyDeadlineMs === 0;
     this.isIdle = false;
     this.busyTransitionArmed = false;
     this.outputTail = '';
@@ -398,15 +441,28 @@ export class IdleDetector {
     ) {
       return;
     }
+    this.programStatusLastAtMs = Date.now();
 
     if (event.state === 'clear') {
       if (event.id === undefined) {
-        this.exitProgramStatusAuthority();
+        // A bare `clear` empties the whole state table.
+        this.programStatusRecords.clear();
+        this.evictedBusyIds.clear();
+        this.programStatusBlockInfo = null;
+        this.programStatusErrorMsg = undefined;
+        // programStatusSubmitAwaitsBusy: Kimi's cold-start session reset emits
+        // this `clear` between the submit and the first busy report. Dropping
+        // authority here would hand the turn to the 2s screen-quiet path while
+        // a static approval dialog may already be painted. Keep authority until
+        // the busy report or the submit deadline.
+        if (!this.armSubmitBusyFallback()) this.exitProgramStatusAuthority();
         return;
       }
       this.deleteProgramStatusSubtree(event.id);
       if (this.programStatusRecords.size === 0 && this.evictedBusyIds.size === 0) {
-        this.exitProgramStatusAuthority();
+        if (!this.armSubmitBusyFallback()) {
+          this.exitProgramStatusAuthority();
+        }
         return;
       }
       this.programStatusAuthority = true;
@@ -440,6 +496,7 @@ export class IdleDetector {
       app,
       at: ++this.programStatusClock,
     });
+    if (event.state === 'working' || event.state === 'blocked') this.submitBusyDeadlineMs = 0;
     this.evictProgramStatusRecords();
     this.programStatusAuthority = true;
     this.clearProgramStatusFallback();
@@ -448,6 +505,45 @@ export class IdleDetector {
 
   programStatusActive(): boolean {
     return this.programStatusAuthority;
+  }
+
+  /** OSC 7501 currently holds the session busy with a `working` record (a
+   *  `blocked` one waits on a human and is reported separately). */
+  programStatusHeldWorking(): boolean {
+    if (!this.programStatusAuthority || this.isIdle) return false;
+    let working = this.evictedBusyIds.size > 0;
+    for (const rec of this.programStatusRecords.values()) {
+      if (rec.state === 'blocked') return false;
+      if (rec.state === 'working') working = true;
+    }
+    return working;
+  }
+
+  /** Milliseconds since the last accepted OSC 7501 report. */
+  programStatusQuietMs(now: number = Date.now()): number {
+    return this.programStatusLastAtMs === 0 ? Number.POSITIVE_INFINITY : now - this.programStatusLastAtMs;
+  }
+
+  /**
+   * Drop a `working` hold the caller has proven stale from other evidence: the
+   * CLI's transcript closed the turn with nothing written since, and the
+   * screen shows its idle prompt. OSC 7501 has no heartbeat, so a lost
+   * terminal report (or a child id that never reports back) would otherwise
+   * keep the session busy forever. Leaves authority mode — the next report
+   * re-engages it, and until then a busy redraw can still flip the session
+   * back through idleToBusyPattern. Never releases a `blocked` record.
+   */
+  releaseStaleProgramStatus(): boolean {
+    if (!this.programStatusHeldWorking() || this.isStartupPending()) return false;
+    this.programStatusAuthority = false;
+    this.programStatusRecords.clear();
+    this.evictedBusyIds.clear();
+    this.programStatusBlockInfo = null;
+    this.programStatusErrorMsg = undefined;
+    this.clearProgramStatusFallback();
+    this.markStartupComplete();
+    this.markIdle('external');
+    return true;
   }
 
   /** Latest blocked record, for a later wait-card. Never logged here. */
@@ -475,9 +571,43 @@ export class IdleDetector {
     this.markIdle('external');
   }
 
+  /** The worker published prompt-ready on evidence of its own (the
+   *  first-prompt-timeout screen probe, a ready-gate settle, …) without this
+   *  detector having reported idle. Take that as this cycle's idle edge, minus
+   *  the callback the worker has just acted on, so the next explicit busy
+   *  marker is reported. Otherwise the edge stays disarmed until the detector
+   *  publishes an idle of its own — after the next turn — and that whole turn
+   *  reads as idle. No-op once this cycle already has its idle edge. */
+  adoptPromptReady(): void {
+    if (this.isIdle || this.busyTransitionArmed) return;
+    // An OSC 7501 working/blocked turn outranks a worker-side ready, as in
+    // fireIdle(): adopting it would mask the stale-working release and the
+    // busy edge that report must still produce.
+    if (this.programStatusAuthority && this.hasBusyProgramStatus()) return;
+    // The next feed() starts a fresh cycle from here (and drops the stale tail).
+    this.isIdle = true;
+    this.firstIdlePublished = true;
+    this.busyTransitionArmed = true;
+  }
+
   /** Read-only view of the current cycle's idle edge (no side effects). */
   isIdleNow(): boolean {
     return this.isIdle;
+  }
+
+  /** Whether the input prompt is CURRENTLY rendered on screen, regardless of
+   *  the quiescence window that gates `isIdle`. The prompt can be visible
+   *  hundreds of milliseconds before the idle edge fires: callers that hold a
+   *  bounded wait for transcript closing records use this to stand down when
+   *  the idle edge is imminent instead of racing it. A `working` screen
+   *  (spinner, no prompt) returns false, so a turn stuck under a held busy
+   *  status with no idle edge still gets its fallback exit. */
+  screenShowsPrompt(): boolean {
+    if (!this.readyPattern) return false;
+    let screen = '';
+    try { screen = this.captureStartupScreen?.() ?? ''; } catch { return false; }
+    const stripped = this.stripAnsi(screen);
+    return this.readyPattern.test(stripped) || this.readyPattern.test(this.outputTail);
   }
 
   /** Shared by the worker's screen-ready and hard-timeout write paths. */
@@ -657,7 +787,29 @@ export class IdleDetector {
       this.readyPattern.test(stripped) || this.readyPattern.test(this.outputTail)
     )) {
       this.readySeen = true;
+      this.tagReadyEvidence(stripped);
     }
+  }
+
+  /** Tag the latest ready match weak when it exists only through the
+   *  cursor-addressed rule arm (the strong sibling matches neither the
+   *  current chunk nor the rolling tail). Adapters without a declared strong
+   *  pattern always produce strong evidence. */
+  private tagReadyEvidence(stripped: string): void {
+    if (!this.readyPatternStrong) {
+      this.readyEvidenceWeak = false;
+      return;
+    }
+    const strong = this.readyPatternStrong.test(stripped)
+      || this.readyPatternStrong.test(this.outputTail);
+    this.readyEvidenceWeak = !strong;
+  }
+
+  /** True when the current ready evidence matched ONLY the weak rule-joined
+   *  arm. The worker requires a rendered-viewport composer check before
+   *  admitting a first prompt on weak traex evidence. */
+  isReadyEvidenceWeak(): boolean {
+    return this.readyEvidenceWeak;
   }
 
   private hasBusyProgramStatus(): boolean {
@@ -679,7 +831,41 @@ export class IdleDetector {
   private publishHeldProgramStatusTerminal(): void {
     if (!this.programStatusAuthority || this.isStartupPending()) return;
     if (!this.isTerminalProgramStatus() || this.isIdle) return;
+    if (this.holdTerminalForSubmitBusy()) return;
     this.markIdle('program-status');
+  }
+
+  /** programStatusSubmitAwaitsBusy: whether this terminal report must wait for
+   *  the submit's busy report. While it waits, a fallback timer runs to the
+   *  deadline fixed at reset(); repeated reports re-arm it for the remaining
+   *  time only. At the deadline the detector leaves authority and the screen
+   *  decides. */
+  private holdTerminalForSubmitBusy(): boolean {
+    return this.armSubmitBusyFallback();
+  }
+
+  /** While a submit is waiting for its first busy report, keep authority alive
+   *  to the deadline fixed at reset() and arm (or re-arm for the remaining time
+   *  only) the timer that drops it. Returns false when no submit is waiting
+   *  (opt-in off, busy already seen, or deadline passed); the caller then takes
+   *  the ordinary path (publish the terminal, or leave authority). A `clear`
+   *  that empties the records must call this: reset() withholds its own timer
+   *  while a busy record is held, so the record the clear just removed leaves
+   *  nothing that would otherwise release the hold. */
+  private armSubmitBusyFallback(): boolean {
+    if (this.submitBusyDeadlineMs === 0) return false;
+    const remaining = this.submitBusyDeadlineMs - Date.now();
+    if (remaining <= 0) {
+      this.submitBusyDeadlineMs = 0;
+      return false;
+    }
+    this.clearProgramStatusFallback();
+    this.programStatusFallbackTimer = setTimeout(() => {
+      this.programStatusFallbackTimer = null;
+      this.submitBusyDeadlineMs = 0;
+      this.exitProgramStatusAuthority();
+    }, remaining);
+    return true;
   }
 
   private applyProgramStatus(): void {
@@ -707,6 +893,7 @@ export class IdleDetector {
       // must not retire that hold; the ready banner publishes the turn.
       if (this.isStartupPending()) return;
       this.markStartupComplete();
+      if (this.holdTerminalForSubmitBusy()) return;
       if (!this.isIdle) this.markIdle('program-status');
     }
   }

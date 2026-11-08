@@ -1,5 +1,16 @@
 import { describe, it, expect } from 'vitest';
-import { sanitizePerBotEnv, isReservedPerBotEnvKey } from '../src/core/per-bot-env.js';
+import {
+  droppedReservedPerBotEnvKeys,
+  isReservedPerBotEnvKey,
+  sanitizePerBotEnv,
+} from '../src/core/per-bot-env.js';
+import { protectedMcpRedactedEnvKeys, type ProtectedMcpWorkerPolicy } from '../src/core/protected-mcp-capabilities.js';
+
+const protectedEnvKeys = protectedMcpRedactedEnvKeys({
+  capabilities: [],
+  protectedHomePaths: ['.fixture-credential'],
+  redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+} satisfies ProtectedMcpWorkerPolicy);
 
 describe('sanitizePerBotEnv()', () => {
   it('keeps valid env keys and stringifies primitive values', () => {
@@ -58,6 +69,9 @@ describe('sanitizePerBotEnv()', () => {
         LARKSUITE_CLI_DATA_DIR: '/tmp/evil-keystore',
         CLAUDE_CODE_RESUME_TOKEN_THRESHOLD: '1',
         CJADK_INTERACTIVE: '1',
+        FIXTURE_SECRET: 'machine-secret',
+        FIXTURE_TOKEN: 'machine-token',
+        BOTMUX_PROTECTED_SECRET_FD: '3',
         IS_SANDBOX: '1',
         SESSION_DATA_DIR: '/tmp',
         TMPDIR: '/tmp/shared',
@@ -66,7 +80,7 @@ describe('sanitizePerBotEnv()', () => {
         __OWNER_OPEN_ID: 'ou_x',
         // a legit key survives alongside the rejected ones
         ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
-      }),
+      }, protectedEnvKeys),
     ).toEqual({ ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic' });
   });
 
@@ -76,6 +90,32 @@ describe('sanitizePerBotEnv()', () => {
     expect(sanitizePerBotEnv([])).toEqual({});
     expect(sanitizePerBotEnv('ANTHROPIC_BASE_URL=x')).toEqual({});
     expect(sanitizePerBotEnv(42)).toEqual({});
+  });
+});
+
+describe('droppedReservedPerBotEnvKeys()', () => {
+  it('returns only the valid-named reserved keys sanitizePerBotEnv drops', () => {
+    expect(
+      droppedReservedPerBotEnvKeys({
+        CLAUDE_CONFIG_DIR: '/tmp/claude',
+        CODEX_HOME: '/tmp/codex',
+        BOTMUX_SESSION_ID: 'hijack',
+        ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
+        '1BAD': 'x',
+        OK_OBJ: { nested: true },
+      }),
+    ).toEqual(['CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'BOTMUX_SESSION_ID']);
+  });
+
+  it('is empty for non-reserved or non-object input', () => {
+    expect(droppedReservedPerBotEnvKeys({ ANTHROPIC_BASE_URL: 'x', HTTPS_PROXY: 'y' })).toEqual([]);
+    expect(droppedReservedPerBotEnvKeys(undefined)).toEqual([]);
+    expect(droppedReservedPerBotEnvKeys(null)).toEqual([]);
+    expect(droppedReservedPerBotEnvKeys('CODEX_HOME=x')).toEqual([]);
+  });
+
+  it('does not report invalid env names (a different problem from reserved keys)', () => {
+    expect(droppedReservedPerBotEnvKeys({ 'BAD-NAME': 'x', 'has space': 'y' })).toEqual([]);
   });
 });
 
@@ -92,6 +132,9 @@ describe('isReservedPerBotEnvKey()', () => {
       'TMPDIR', 'TMP', 'TEMP', '__OWNER_OPEN_ID',
     ]) {
       expect(isReservedPerBotEnvKey(k), k).toBe(true);
+    }
+    for (const k of ['FIXTURE_SECRET', 'FIXTURE_TOKEN']) {
+      expect(isReservedPerBotEnvKey(k, protectedEnvKeys), k).toBe(true);
     }
   });
 

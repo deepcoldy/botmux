@@ -1,0 +1,50 @@
+
+  ~/ec-apply-access
+
+
+
+
+
+
+
+
+                    ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+                    │                                                                                                                      │
+                    │  ⠀⠀⠀⠀⠀⠀⣀⣀⡀⠀⠀⠀⢀⠄   Grok Build  1.0.70                                                                                 │
+                    │  ⠀⠀⠀⣠⣾⠿⠛⠛⠛⠛⢀⡴⠁⠀                                                                                                      │
+                    │  ⠀⠀⣼⡟⠁⠀⠀⠀⢀⡴⠻⣿⡀⠀   Changelog                                                                                          │
+                    │  ⠀⠀⣿⡇⠀⠀⠀⠔⠁⠀⠀⣿⡇⠀                                                                                                      │
+                    │  ⠀⠀⢹⣷⠀⠀⠀⠀⠀⢀⣴⡿⠀⠀    • /plugins now counts only the plugin skills that load, and says how many were skipped because…   │
+                    │  ⠀⢀⠞⠁⠠⢶⣶⣶⣶⠿⠋⠀⠀⠀    • Answered questions now have a blank line between them, except in compact mode (/compact-mode…   │
+                    │  ⠐⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀    • GROK_DISABLE_EXPERIMENTS turns off every [[experiments]] entry in your configuration; [exper…   │
+                    │                                                                                                                      │
+                    │                   Resume session                                                                             ctrl+r  │
+                    │                   New worktree                                                                               ctrl+w  │
+                    │                   Changelog                                                                                          │
+                    │                   Quit                                                                                       ctrl+q  │
+                    │                                                                                                                      │
+                    ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                                                                                                        │
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── Grok 4.6 (high) ─╯
+
+                                                                                                                                        Logged in with API key
+

@@ -1,6 +1,7 @@
 import { assertMessageTopicAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../../cli/topic-send-guard.js';
 import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync } from 'node:fs';
 import { dirname, extname, basename, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { Client } from '@larksuiteoapi/node-sdk';
@@ -14,6 +15,7 @@ import { resolveUserToken } from '../../utils/user-token.js';
 import { listObservedBots } from '../../services/observed-bots-store.js';
 import { getBotCapability } from '../../services/bot-profile-store.js';
 import { getGroupContextSettings } from '../../services/group-context-settings-store.js';
+import { botsInfoObjectEntries, isBotsInfoRouteEntry } from '../../services/bots-info-shape.js';
 import type { GroupContextDeliveryBinding } from '../../services/group-context-delivery-store.js';
 import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
@@ -32,6 +34,8 @@ import {
   LARK_CODE_USER_SCOPE_MISSING,
   larkApiError,
   structuredLarkCode,
+  classifyContactErrorCode,
+  type DefinitiveContactErrorCode,
 } from './lark-errors.js';
 import type { ChatContext } from '../../types.js';
 import { downloadResourceWithRange, isResourceSizeLimitError, type ResourceStream } from './resource-range-download.js';
@@ -232,8 +236,9 @@ const listBotsApiFailures = new Map<string, { reason: string; expiresAt: number 
  * chars, 1-hour TTL — see spike report §1.2).  When supplied, the Feishu
  * server returns the original message_id for repeat requests within TTL,
  * making the send idempotent.  Workflow runtime passes the attempt's
- * idempotencyKey here so retries don't re-send.  Existing callers omit
- * the param and get exactly the pre-Step-6 behavior.
+ * idempotencyKey here so retries don't re-send.  Callers that omit the param
+ * still get a per-call generated token (see {@link dedupeUuid}) so api-gate
+ * retries inside this call cannot post the message twice.
  */
 export interface OutboundMessageOptions {
   /** Revalidate the frozen source immediately before every provider attempt. */
@@ -336,6 +341,17 @@ async function recordPublishedGroupContext(larkAppId: string, data: any, body: s
   } catch { logger.warn('[group-context] outbound observation failed; publication remains successful'); }
 }
 
+/**
+ * Dedupe token for one logical send. The api-gate re-runs the whole closure on
+ * 429/5xx/network errors, and a request that landed server-side before the
+ * response was lost would be posted a second time. Generating the token OUTSIDE
+ * the closure keeps it stable across gate retries so Feishu returns the original
+ * message_id. Caller-supplied uuids win; the generated one is never exposed to hooks.
+ */
+function dedupeUuid(uuid?: string): string {
+  return uuid || randomUUID();
+}
+
 export async function sendMessage(
   larkAppId: string,
   chatId: string,
@@ -346,6 +362,7 @@ export async function sendMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendMessage');
+  const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'sendMessage', async () => {
     // A retry gets a new cache after the gate wait, never a previous attempt's
     // available result. Destination and source checks may share this lookup.
@@ -364,7 +381,7 @@ export async function sendMessage(
           receive_id: chatId,
           msg_type: msgType as any,
           content: body,
-          ...(uuid ? { uuid } : {}),
+          uuid: wireUuid,
         },
       });
     } catch (err: any) {
@@ -414,6 +431,7 @@ export async function replyMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'replyMessage');
+  const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'replyMessage', async () => {
     const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
     await assertMessageWriteAllowed(larkAppId, messageId, topicLookup.lookup);
@@ -432,7 +450,7 @@ export async function replyMessage(
           msg_type: msgType as any,
           content: body,
           ...(replyInThread ? { reply_in_thread: true } : {}),
-          ...(uuid ? { uuid } : {}),
+          uuid: wireUuid,
         },
       });
     } catch (err: any) {
@@ -525,6 +543,7 @@ export async function forwardMessage(
   uuid?: string,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'forwardMessage');
+  const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'forwardMessage', async () => {
     await assertMessageWriteAllowed(larkAppId, messageId);
     const c = getBotClient(larkAppId);
@@ -533,7 +552,7 @@ export async function forwardMessage(
       res = await (c as any).im.v1.message.forward({
         path: { message_id: messageId },
         // NOTE: forward takes `uuid` in params (not data) — unlike create/reply.
-        params: { receive_id_type: 'chat_id', ...(uuid ? { uuid } : {}) },
+        params: { receive_id_type: 'chat_id', uuid: wireUuid },
         data: { receive_id: chatId },
       });
     } catch (err: any) {
@@ -664,22 +683,11 @@ export async function resolveUnionIdFromOpenIdStrict(
 /** 用户资料（名字+头像）查询缓存：key = appId:idType:id。字符串值 = 确定性
  *  负结果的类别（跨应用/不可见/无效 id），每次查都会失败，别反复打 API。
  *  瞬时失败（网络/频控/服务端 40003）不缓存——下次调用应当重试，负缓存瞬时
- *  错误会把合法用户长期钉成「查不到」。 */
-type DefinitiveProfileMiss = 'cross_app' | 'not_visible' | 'invalid_id';
+ *  错误会把合法用户长期钉成「查不到」。分类器在零依赖的 lark-errors.ts，
+ *  body 与 throw 两种返回形状共用同一口径。 */
+type DefinitiveProfileMiss = DefinitiveContactErrorCode;
 const userProfileCache = new Map<string, { name: string; avatarUrl?: string } | DefinitiveProfileMiss>();
 const USER_PROFILE_CACHE_MAX = 1000;
-
-/** Contact API 确定性失败码 → 类别（重试也不会变）：99992361 open_id 属其他
- *  应用；41050 无权限看该用户（不在通讯录可见范围）；41012 user id 无效 /
- *  40001 参数无效。其余非零码（如 40003 internal error）与网络异常视为瞬时。
- *  SDK 基于 Axios，非 2xx 以异常抛出、业务码在 response.data.code——调用方
- *  的 catch 也要走这里（getLarkErrorCode 提取）。 */
-function classifyContactErrorCode(code: number | undefined): DefinitiveProfileMiss | undefined {
-  if (code === LARK_CODE_CROSS_APP_OPEN_ID) return 'cross_app';
-  if (code === LARK_CODE_CONTACT_NOT_VISIBLE) return 'not_visible';
-  if (code === LARK_CODE_CONTACT_NO_SUCH_USER || code === LARK_CODE_CONTACT_INVALID_PARAM) return 'invalid_id';
-  return undefined;
-}
 
 export type UserProfileLookup =
   | { status: 'ok'; profile: { name: string; avatarUrl?: string } }
@@ -789,6 +797,7 @@ export async function sendUserMessage(
   requestOptions?: LarkRequestOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendUserMessage');
+  const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(
     larkAppId,
     'sendUserMessage',
@@ -809,7 +818,7 @@ export async function sendUserMessage(
         receive_id: openId,
         msg_type: msgType as any,
         content: body,
-        ...(uuid ? { uuid } : {}),
+        uuid: wireUuid,
       };
 
       const res = requestOptions
@@ -958,7 +967,7 @@ export async function getChatContext(larkAppId: string, chatId: string): Promise
     else mode = 'unknown';
 
     if (mode !== 'unknown') {
-      chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now() });
+      chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now(), strict: true });
     } else {
       logger.warn(`getChatContext(${chatId}) unrecognized chat_mode='${rawMode}'`);
     }
@@ -1045,7 +1054,12 @@ export async function getChatNameAndMode(
  *                perspective (chat-scope by default) */
 export type ChatMode = 'group' | 'topic' | 'p2p';
 
-const chatModeCache = new BoundedMap<string, { mode: ChatMode; cachedAt: number }>(1000);
+/** `strict` records provenance: true only when the mode came from a successful
+ *  chat.get classification (getChatModeStrict / getChatContext). getChatMode's
+ *  lenient `unknown → group` fallback stores strict:false so callers that need
+ *  proof (e.g. the substitute-card topicGroups gate) never treat a failed
+ *  lookup as a confirmed flat group. */
+const chatModeCache = new BoundedMap<string, { mode: ChatMode; cachedAt: number; strict: boolean }>(1000);
 const CHAT_MODE_TTL_MS = 5 * 60 * 1000; // 5 min — chat_mode can change when a group is converted to topic mode
 
 /** Resolve the conversational topology of a chat (话题群 vs 普通群 vs p2p).
@@ -1098,7 +1112,7 @@ export async function getChatModeStrict(larkAppId: string, chatId: string): Prom
       logger.warn(`getChatModeStrict(${chatId}) unrecognized chat_mode='${rawMode}' — returning 'unknown'`);
       return 'unknown';
     }
-    chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now() });
+    chatModeCache.set(`${larkAppId}::${chatId}`, { mode, cachedAt: Date.now(), strict: true });
     return mode;
   } catch (err: any) {
     logger.warn(`getChatModeStrict(${chatId}) errored: ${err?.message ?? err}`);
@@ -1109,6 +1123,15 @@ export async function getChatModeStrict(larkAppId: string, chatId: string): Prom
 export function getCachedChatMode(larkAppId: string, chatId: string): ChatMode | undefined {
   const cached = chatModeCache.get(`${larkAppId}::${chatId}`);
   if (cached && Date.now() - cached.cachedAt < CHAT_MODE_TTL_MS) return cached.mode;
+  return undefined;
+}
+
+/** Like {@link getCachedChatMode}, but only returns modes proven by a successful
+ *  strict chat.get. A lenient `unknown → group` fallback is never evidence that
+ *  the chat is flat, so feature gates that must fail closed use this. */
+export function getCachedChatModeStrict(larkAppId: string, chatId: string): ChatMode | undefined {
+  const cached = chatModeCache.get(`${larkAppId}::${chatId}`);
+  if (cached && cached.strict && Date.now() - cached.cachedAt < CHAT_MODE_TTL_MS) return cached.mode;
   return undefined;
 }
 
@@ -1129,7 +1152,7 @@ export async function getChatMode(
   if (strict !== 'unknown') return strict;
   const mode: ChatMode = 'group';
   logger.warn(`getChatMode(${chatId}) unconfirmed; falling back to 'group'`);
-  chatModeCache.set(cacheKey, { mode, cachedAt: Date.now() });
+  chatModeCache.set(cacheKey, { mode, cachedAt: Date.now(), strict: false });
   return mode;
 }
 
@@ -1531,6 +1554,48 @@ export async function getMessageDetail(
   return res.data;
 }
 
+/** Parse the sender union_id from an IM message fetched with
+ * `user_id_type=union_id`. Kept pure so malformed provider responses can be
+ * tested without mocking the Lark SDK. */
+export function messageSenderUnionIdFromDetail(detail: unknown): string | null {
+  const item = (detail as { items?: unknown[] } | null)?.items?.[0] as {
+    sender?: { sender_type?: unknown; id_type?: unknown; id?: unknown };
+  } | undefined;
+  const sender = item?.sender;
+  const unionId = typeof sender?.id === 'string' ? sender.id.trim() : '';
+  if (sender?.sender_type !== 'user'
+    || sender.id_type !== 'union_id'
+    || !/^on_[A-Za-z0-9_-]{4,128}$/.test(unionId)) return null;
+  return unionId;
+}
+
+/**
+ * Recover the tenant-stable sender identity for one exact inbound message.
+ * Lark sometimes omits union_id from the event envelope while the message API
+ * can still return the same sender directly in union-id form.
+ */
+export async function resolveMessageSenderUnionId(
+  larkAppId: string,
+  messageId: string,
+): Promise<string | null> {
+  if (!messageId.startsWith('om_')) return null;
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
+      user_id_type: 'union_id',
+      with_sender_name: 'false',
+    }, { timeoutMs: 2_000 });
+    if (res?.code !== 0) return null;
+    return messageSenderUnionIdFromDetail(res.data);
+  } catch (err) {
+    logger.debug(
+      `[union_id] message sender resolve failed for ${messageId.substring(0, 12)}: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+}
+
 /** Resolve a message's chat without collapsing provider failures into absence.
  * Authorization gates must distinguish unavailable evidence from a mismatch. */
 export async function lookupMessageChatId(
@@ -1609,13 +1674,15 @@ export async function getMessageThreadId(
  * token authorized for this bot), which is what the paths without a per-turn
  * sender still rely on.
  */
-export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, senderOpenId?: string, options?: { allowUserTokenFallback?: boolean }): Promise<void> {
+export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file' | 'video', savePath: string, senderOpenId?: string, options?: { allowUserTokenFallback?: boolean }): Promise<void> {
   // apiOnly hard-gate BEFORE the app→user token fallback. Without this, the
   // App Token attempt (getBotClient) throws LarkTransportDisabledError, gets
   // caught below as a "failed app download", and silently falls through to the
   // raw user-token fetch — bypassing the boundary. A core-only bot has no
   // Feishu resource to download; refuse up front.
   assertLarkTransport(larkAppId, 'downloadMessageResource');
+  // Feishu downloads video bodies through the file endpoint.
+  const apiType = type === 'video' ? 'file' : type;
   const dir = dirname(savePath);
   if (!existsSync(dir)) {
     mkdirSync(dir, { recursive: true });
@@ -1623,7 +1690,7 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
 
   // Try App Token first
   try {
-    await downloadWithAppToken(larkAppId, messageId, fileKey, type, savePath);
+    await downloadWithAppToken(larkAppId, messageId, fileKey, apiType, savePath);
     logger.info(`Downloaded ${type} ${fileKey} → ${savePath}`);
     return;
   } catch (appErr: any) {
@@ -1675,7 +1742,7 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
     );
   }
 
-  await downloadWithUserToken(userToken, messageId, fileKey, type, savePath, brand);
+  await downloadWithUserToken(userToken, messageId, fileKey, apiType, savePath, brand);
   logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via User Token)`);
 }
 
@@ -1930,6 +1997,15 @@ export async function resolveAllowedUsersWithMap(
   errored?: boolean;
   entryStatus: Map<string, EntryResolveStatus>;
   hasPermanentBatchError?: boolean;
+  /**
+   * Raw entries (email / mobile / on_) this pass PROVED unresolvable: a
+   * code-0 batch omitted them, or a definitive contact code (41050 不可见 /
+   * 41012 / 40001 / code-0 无 user) ruled them out. These are NOT transient —
+   * no retry is scheduled and they must never be revived from cache. Literal
+   * `ou_` is always kept as-is and never appears here. Callers surface them as
+   * log warnings / user-facing hints instead of silently dropping them.
+   */
+  definitiveMisses: string[];
 }> {
   const map = new Map<string, string>();
   // True when a TRANSIENT failure (throw / rate limit / server error) hit any
@@ -2081,6 +2157,10 @@ export async function resolveAllowedUsersWithMap(
               // the returned user_list → definitive miss (no such user / not
               // visible), NOT a transient failure. Do not fall back to cache.
               entryStatus.set(rawEmail, 'definitive');
+              // 此前确定性 miss 完全静默（连 WARN 都没有），条目从运行时名单
+              // 消失却无任何线索。只打日志：不拒绝写入、不发 owner DM。
+              logger.warn(`allowedUsers email ${rawEmail} definitively unresolved for ${larkAppId} `
+                + `(code-0 batch omitted it: no such user / not visible); entry dropped from the runtime allowlist.`);
             }
           }
         }
@@ -2157,6 +2237,9 @@ export async function resolveAllowedUsersWithMap(
               // code-0 but this mobile absent from user_list → definitive miss
               // (no such user / not visible), same as the email case.
               entryStatus.set(rawEntry, 'definitive');
+              // 与 email 分支同口径：确定性 miss 只打日志，不再静默丢弃。
+              logger.warn(`allowedUsers mobile ${rawEntry} definitively unresolved for ${larkAppId} `
+                + `(code-0 batch omitted it: no such user / not visible); entry dropped from the runtime allowlist.`);
             }
           }
         }
@@ -2188,7 +2271,15 @@ export async function resolveAllowedUsersWithMap(
       resolved.push(oid);
     }
   }
-  return { resolved, map, errored, entryStatus, hasPermanentBatchError };
+  // 一次性汇总本次确定性解析失败的原始条目（保持配置顺序），供调用方打日志 /
+  // 在 /botconfig 回复里提示。所有标 definitive 的位置（email 批量、mobile
+  // 批量、union_id 单查）都由这一张表覆盖；literal ou_ 恒为 resolved 不会出现，
+  // transient 条目排除在外（重试仍可能恢复）。
+  const definitiveMisses: string[] = [];
+  for (const v of raw) {
+    if (entryStatus.get(v) === 'definitive') definitiveMisses.push(v);
+  }
+  return { resolved, map, errored, entryStatus, hasPermanentBatchError, definitiveMisses };
 }
 
 /**
@@ -2560,7 +2651,7 @@ export type ChatBotMember = {
 type ChatBotListApiItem = { botId: string; botName: string };
 type ChatBotListApiResult =
   | { ok: true; items: ChatBotListApiItem[] }
-  | { ok: false; reason: string; cacheable: boolean };
+  | { ok: false; reason: string; cacheable: boolean; timeoutMs?: number };
 
 /**
  * A bot row returned directly by Feishu's live `/members/bots` endpoint.
@@ -2594,13 +2685,22 @@ export type CurrentChatBotAppResolution =
         | 'subject_lark_app_ambiguous';
       message: string;
       invalidSubjectLarkAppIds?: string[];
+      /** 仅当实时成员查询按 listBotsApiTimeoutMs 本地超时时存在，值为当时生效的上限。 */
+      timeoutMs?: number;
     };
+
+class LarkCallTimeoutError extends Error {
+  constructor(label: string, readonly timeoutMs: number) {
+    super(`${label} timed out after ${timeoutMs}ms`);
+    this.name = 'LarkCallTimeoutError';
+  }
+}
 
 function promiseWithTimeout<T>(p: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return p;
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer = setTimeout(() => reject(new LarkCallTimeoutError(label, timeoutMs)), timeoutMs);
   });
   return Promise.race([p, timeout]).finally(() => {
     if (timer) clearTimeout(timer);
@@ -2630,7 +2730,12 @@ async function listChatBotsViaMembersBots(
       .filter((it: ChatBotListApiItem) => it.botId && it.botName);
     return { ok: true, items };
   } catch (err: any) {
-    return { ok: false, reason: err?.message ?? String(err), cacheable: true };
+    return {
+      ok: false,
+      reason: err?.message ?? String(err),
+      cacheable: true,
+      ...(err instanceof LarkCallTimeoutError ? { timeoutMs: err.timeoutMs } : {}),
+    };
   }
 }
 
@@ -2679,6 +2784,7 @@ export async function resolveCurrentChatBotOpenIdsByLarkAppIds(
       ok: false,
       error: 'live_membership_unavailable',
       message: `live_chat_bot_members_unavailable: ${live.reason}`,
+      ...(live.timeoutMs !== undefined ? { timeoutMs: live.timeoutMs } : {}),
     };
   }
 
@@ -2763,6 +2869,7 @@ export async function resolveCurrentChatBotOpenIdsByLarkAppIds(
         error: 'live_membership_unavailable',
         message: `is_in_chat failed for ${appId}: ${err?.message ?? String(err)}`,
         invalidSubjectLarkAppIds: subjectLarkAppIds.includes(appId) ? [appId] : undefined,
+        ...(err instanceof LarkCallTimeoutError ? { timeoutMs: err.timeoutMs } : {}),
       };
     }
   }
@@ -2974,9 +3081,13 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
   try {
     const infoPath = join(config.session.dataDir, 'bots-info.json');
     if (existsSync(infoPath)) {
-      const entries: Array<{ larkAppId: string; botOpenId: string | null; botName: string | null }> = JSON.parse(readFileSync(infoPath, 'utf-8'));
+      const entries = botsInfoObjectEntries(JSON.parse(readFileSync(infoPath, 'utf-8')))
+        .filter(isBotsInfoRouteEntry);
       for (const e of entries) {
-        appIdToInfo.set(e.larkAppId, { botOpenId: e.botOpenId, botName: e.botName });
+        appIdToInfo.set(e.larkAppId, {
+          botOpenId: typeof e.botOpenId === 'string' ? e.botOpenId : null,
+          botName: e.botName ?? null,
+        });
       }
     }
   } catch { /* ignore corrupt file */ }
@@ -3099,4 +3210,27 @@ export async function listChatBotMembers(larkAppId: string, chatId: string): Pro
   }
 
   return configured;
+}
+
+/** Current application only. Throws on missing scope/unknown membership. */
+/** Strict chat facts for an authorization gate: throws on any provider failure
+ *  or an unclassifiable chat, never guesses a default. */
+export async function getChatRoutingFacts(
+  larkAppId: string,
+  chatId: string,
+): Promise<{ external: boolean; mode: 'group' | 'p2p' }> {
+  const res: any = await larkGet(getBotClient(larkAppId), `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`);
+  if (res.code !== 0) throw larkApiError('get chat', res);
+  const rawMode = String(res.data?.chat_mode ?? '').toLowerCase();
+  const mode = rawMode === 'p2p' ? 'p2p' : rawMode === 'group' || rawMode === 'topic' ? 'group' : null;
+  if (!mode || typeof res.data?.external !== 'boolean') throw new Error('chat_facts_unknown');
+  return { external: res.data.external, mode };
+}
+
+export async function isCurrentBotInChat(larkAppId: string, chatId: string): Promise<boolean> {
+  const response: any = await larkGet(getBotClient(larkAppId),
+    `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`);
+  if (response.code !== 0 && response.code !== undefined) throw larkApiError('check bot chat membership', response);
+  if (typeof response.data?.is_in_chat !== 'boolean') throw new Error('chat_membership_unknown');
+  return response.data.is_in_chat;
 }

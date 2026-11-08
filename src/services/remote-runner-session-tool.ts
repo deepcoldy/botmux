@@ -92,6 +92,7 @@ export function remoteRunnerSessionToolArgs(
     case 'schedule.update':
       return [
         'schedule', 'update', request.taskId,
+        ...(request.schedule !== undefined ? [`--schedule=${request.schedule}`] : []),
         ...(request.prompt !== undefined ? [`--prompt=${request.prompt}`] : []),
         ...(request.calendar !== undefined
           ? [`--calendar=${request.calendar === null ? 'none' : request.calendar}`]
@@ -110,7 +111,7 @@ export function remoteRunnerSessionToolArgs(
   }
 }
 
-function quotedAttachments(
+export function quotedAttachments(
   stdout: string,
   env: NodeJS.ProcessEnv,
 ): { stdout: string; attachments?: RemoteRunnerSessionToolAttachment[] } {

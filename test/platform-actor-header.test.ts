@@ -66,6 +66,30 @@ describe('platform actor header', () => {
     }
   });
 
+  it('#2004：免登录只读访客（非 owner、平台没注入操作者）标为 anonymous，其余身份都不标', () => {
+    expect(resolve(undefined, 'guest')?.anonymous).toBe(true);
+    expect(resolve(undefined, 'teammate')?.anonymous).toBe(true);
+    // 形状异常被丢弃的操作者同样当作没有身份（fail closed）。
+    expect(resolve('ou:evil', 'guest')?.anonymous).toBe(true);
+    expect(resolve('ou_alice', 'guest')?.anonymous).toBeUndefined();
+    expect(resolve('ou_alice', 'owner')?.anonymous).toBeUndefined();
+    // owner 角色只发给已登录的人；老平台不注入操作者时也不降成匿名。
+    expect(resolve(undefined, 'owner')?.anonymous).toBeUndefined();
+    const legacy = resolveDashboardIdentity({
+      legacyCookie: ACTIVE,
+      activeToken: ACTIVE,
+      roleHeader: undefined,
+      actorHeader: undefined,
+      scopesHeader: undefined,
+      platformMachineId: null,
+      platformActorScope: machineId => `scope-${machineId}`,
+      legacyAuthSessionId: token => `legacy-${token}`,
+      h5: null,
+    });
+    expect(legacy?.kind).toBe('legacy-dashboard');
+    expect(legacy?.anonymous).toBeUndefined();
+  });
+
   it('teammate / guest 角色同样带上操作者，且仍是只读', () => {
     const guest = resolve('ou_alice', 'guest');
     expect(guest?.userId).toBe('platform:scope-machine-1:ou_alice:guest');
@@ -270,7 +294,7 @@ describe('gate: dashboard:manage 开管理面但不开整机', () => {
 
   it('但仍不是本机 owner —— 三个「拿到就等于拿到整机」的面照旧关着', () => {
     const g = gateFor('/api/settings');
-    // dashboard.ts 里 debug-terminal / write-link / spawn-command 三处直接查
+    // dashboard.ts 里 host-terminal / write-link / spawn-command 三处直接查
     // legacyAuthed，不看 decision，所以这个 false 就是那三处的拒绝依据。
     expect(g.legacyAuthed).toBe(false);
   });

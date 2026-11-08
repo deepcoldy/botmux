@@ -16,6 +16,9 @@
  *   - fails CLOSED (spawn throws, nothing created) if the pane is in fact gone,
  *   - and an authoritative 'missing' on the re-probe yields a proper cold spawn.
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -30,6 +33,16 @@ vi.mock('node:child_process', () => {
     spawnSync: vi.fn(),
   };
 });
+
+// The anti-fork boot gate probes the server through child_process; with it
+// mocked, the darwin lsof census reads as unavailable and the gate fails closed
+// for its full bounded wait (Linux reads /proc and is unaffected). The gate has
+// its own tests; here it is a pass-through so the probe chain stays the unit
+// under test.
+vi.mock('../src/adapters/backend/tmux-anti-fork.js', () => ({
+  createTmuxBootGate: () => ({ leadingArgs: () => [] }),
+  TmuxCompetingServerBlockedError: class TmuxCompetingServerBlockedError extends Error {},
+}));
 
 vi.mock('node:fs', () => {
   const actual: any = require('node:fs');
@@ -68,6 +81,7 @@ import { shouldQueueInitialPrompt } from '../src/codex-rpc-lifecycle.js';
 import { resetTmuxVersionCacheForTests } from '../src/setup/ensure-tmux.js';
 import type { SessionProbe } from '../src/adapters/backend/types.js';
 import { bufferSpawnResult } from './helpers/spawn-result.js';
+import { takePaneLaunchFile } from './helpers/pane-launch.js';
 
 setStartupTmuxRetrySleepForTests(() => {});
 
@@ -251,7 +265,7 @@ describe('indeterminate probe → selector → spawn → worker decisions (singl
     expect(backend.isReattach).toBe(true);
 
     const willReattachPersistent = selected.isReattach === true;
-    backend.spawn('gemini', ['-i', 'first user message'], {
+    backend.spawn('opencode', ['-i', 'first user message'], {
       cwd: '/tmp', cols: 200, rows: 50,
       env: process.env as Record<string, string>,
       strictEnvReattach: willReattachPersistent,
@@ -297,9 +311,6 @@ describe('indeterminate probe → selector → spawn → worker decisions (singl
       pendingProvenancePresent: false,
       isolationMarkerReattachSafe: false,
     } as any).action).toBe('refuse-inconclusive-probe');
-    expect(workerSource).toMatch(
-      /if \(appliedIsolationCapabilities\.length > 0 && persistentSessionName && !willReattachPersistent\)/,
-    );
   });
 
   it('fails CLOSED when the biased reattach meets a pane that is really gone', () => {
@@ -316,7 +327,7 @@ describe('indeterminate probe → selector → spawn → worker decisions (singl
       const { selected } = runChain();
       const exits: unknown[] = [];
       selected.backend.onExit((code, signal) => exits.push([code, signal]));
-      expect(() => selected.backend.spawn('gemini', ['-i', 'first user message'], {
+      expect(() => selected.backend.spawn('opencode', ['-i', 'first user message'], {
         cwd: '/tmp', cols: 200, rows: 50, env: process.env as Record<string, string>,
         strictEnvReattach: true,
       })).toThrow();
@@ -335,12 +346,13 @@ describe('indeterminate probe → selector → spawn → worker decisions (singl
     expect(gate.action).toBe('spawn');
     expect(reconciled).toBe('missing');
     expect(selected.isReattach).toBe(false);
-    selected.backend.spawn('gemini', ['-i', 'first user message'], {
+    selected.backend.spawn('opencode', ['-i', 'first user message'], {
       cwd: '/tmp', cols: 200, rows: 50, env: process.env as Record<string, string>,
     });
     const newSession = mockedExecFileSync.mock.calls.find(c => (c[1] as string[]).includes('new-session'));
     expect(newSession).toBeDefined();
-    expect((newSession![1] as string[]).join(' ')).toContain('first user message');
+    // The CLI argv reaches the pane through its launch file, not the tmux command.
+    expect(takePaneLaunchFile(newSession![1] as string[]).body).toContain(`'first user message'`);
   });
 
   it('keeps the fresh-path invariant: a predicted-fresh create that collides throws (no duplicate swallowing)', () => {
@@ -355,33 +367,20 @@ describe('indeterminate probe → selector → spawn → worker decisions (singl
       return Buffer.from('') as any;
     }) as any);
     const selected = selectSessionBackend({ sessionId: SESSION_ID, backendType: 'tmux', hasExistingSession: false });
-    expect(() => selected.backend.spawn('gemini', [], {
+    expect(() => selected.backend.spawn('opencode', [], {
       cwd: '/tmp', cols: 200, rows: 50, env: process.env as Record<string, string>,
     })).toThrow(/duplicate/);
   });
 });
 
-describe('worker wiring (source pins)', () => {
-  it('gates tmux through the tri-state resolver, not the boolean hasSession', () => {
-    expect(workerSource).not.toMatch(/hasExistingSession = TmuxBackend\.hasSession\(/);
-    expect(workerSource).toMatch(/resolveTmuxBackendGate\(\{/);
-    expect(workerSource).toMatch(/TmuxBackend\.probeSessionWithRetry\(tmuxSessionName\)/);
-    expect(workerSource).toMatch(/persistentReattachBias\(resolvedTmuxSessionProbe\)/);
-  });
-
-  it('re-probes an indeterminate reattach before the first selection', () => {
-    const reconcileAt = workerSource.indexOf('reconcileBiasedReattachProbe(before');
-    const selectAt = workerSource.indexOf('let selectedBackend = selectBackend();');
-    expect(reconcileAt).toBeGreaterThan(0);
-    expect(reconcileAt).toBeLessThan(selectAt);
-  });
-
-  it('resets the frozen tmux probe to missing after every post-kill re-selection', () => {
-    expect(workerSource.match(/resolvedTmuxSessionProbe = 'missing';/g)?.length).toBeGreaterThanOrEqual(2);
-    expect(workerSource).toMatch(/resolvedTmuxSessionProbe = postKillProbe === 'exists' \? 'exists' : 'missing';/);
-  });
-
-  it('routes an args-baked prompt through the queue on a predicted reattach', () => {
-    expect(workerSource).toMatch(/shouldDeferInitialPromptForReattach\(\{\s*willReattachPersistent,/);
+describe('worker consumes the reattach prediction at spawn', () => {
+  // 源码结构护栏(K2/K3)：worker.ts 是无导出的进程入口，下面两处消费 willReattachPersistent 的分支在
+  // spawn 闭包里，没有行为 seam（上面的链路用例跑的是它们调用的纯函数）。#833 写明预测 reattach 时：
+  // ① 读隔离不得为未执行 wrapper 的旧 pane 写 fresh boot marker——那等于伪造隔离证明（K2）；
+  // ② argv 传首条 prompt 的 CLI 必须改走输入队列——reattach 不执行启动 argv，原来会静默丢首条消息（K3）。
+  it('never writes a fresh isolation proof nor bakes the first prompt into argv on a predicted reattach', () => {
+    const markerGate = workerSource.match(/if \(appliedIsolationCapabilities\.length > 0 && [^)]*\)/);
+    expect(markerGate?.[0]).toContain('!willReattachPersistent');
+    expect(workerSource).toMatch(/shouldDeferInitialPromptForReattach\(\{[^}]*\bwillReattachPersistent\b/);
   });
 });

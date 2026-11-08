@@ -174,13 +174,6 @@ export function parseWorkbenchHash(hash: string): { surface: WorkbenchSurface; s
   return null;
 }
 
-/** Only the two Workbench routes may cross the H5 login page. */
-export function safeWorkbenchReturnTo(value: string | null | undefined): string {
-  if (!value || !value.startsWith('/#')) return '/';
-  const parsed = parseWorkbenchHash(value.slice(1));
-  return parsed ? `/${buildWorkbenchHash(parsed.surface, parsed.sessionId ?? undefined)}` : '/';
-}
-
 export function clampRailWidth(value: number): number {
   if (!Number.isFinite(value)) return WORKBENCH_RAIL_DEFAULT;
   return Math.min(WORKBENCH_RAIL_MAX, Math.max(WORKBENCH_RAIL_MIN, Math.round(value)));

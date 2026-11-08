@@ -1,3 +1,5 @@
+import type { ProtectedHttpEgressPolicy } from '../protected-http-egress.js';
+
 export type PluginRuntime = 'cli' | 'service';
 export type PluginServiceMode = 'manual' | 'auto';
 
@@ -17,6 +19,8 @@ export interface PluginStdioMcpServer {
   transport: 'stdio';
   command: string[];
   env?: Record<string, string>;
+  protectedCapability?: string;
+  protectedEgressPolicy?: ProtectedHttpEgressPolicy;
 }
 
 export interface PluginStreamableHttpMcpServer {
@@ -67,6 +71,19 @@ export interface PluginCardActionsContribution {
   endpoint: string;
 }
 
+/** One Lark slash command a plugin service handles (`/work-bind`). */
+export interface PluginCommandEntry {
+  name: string;
+  description?: string;
+}
+
+/** Public, install-time declaration of Lark slash commands routed to a plugin service. */
+export interface PluginCommandsContribution {
+  schemaVersion: 1;
+  endpoint: string;
+  commands: PluginCommandEntry[];
+}
+
 export interface PluginContributions {
   skills?: PluginSkillEntry[];
   dashboard?: PluginDashboardEntry[];
@@ -74,6 +91,7 @@ export interface PluginContributions {
   cli?: PluginCliContribution;
   service?: PluginServiceContribution;
   cardActions?: PluginCardActionsContribution;
+  commands?: PluginCommandsContribution;
 }
 
 /** Installation-time scan result before MCP details are moved to private
@@ -151,4 +169,5 @@ export interface PluginMaterializedFile {
   dashboard?: Array<{ id: string; entry: string }>;
   service?: Array<{ name: string }>;
   cardActions?: PluginCardActionsContribution;
+  commands?: PluginCommandsContribution;
 }

@@ -25,6 +25,18 @@ const structured = {
 };
 
 describe('Codex App clean-input protocol mapping', () => {
+  it('keeps the async steer constraint private to host routing', () => {
+    const input = { text: 'answer', steerTargetTurnId: 'native-original', clientUserMessageId: 'codex-async-answer-test' };
+    expect(isCodexAppTurnInput(input)).toBe(true);
+    expect(isCodexAppTurnInput({ ...input, steerTargetTurnId: '' })).toBe(false);
+    expect(isCodexAppTurnInput({ ...input, steerTargetTurnId: 42 })).toBe(false);
+    const result = buildCodexAppTurnStartParams({
+      threadId: 'thread', cwd: '/tmp/work', legacyContent: 'legacy',
+      codexAppInput: input, codexVersion: parseCodexVersion('codex-cli 0.162.1'),
+    });
+    expect(result.params.input).toEqual([{ type: 'text', text: 'answer', text_elements: [] }]);
+    expect(result.params).not.toHaveProperty('steerTargetTurnId');
+  });
   it('parses standard and prerelease Codex version banners', () => {
     expect(parseCodexVersion('codex-cli 0.144.1\n')).toEqual({ major: 0, minor: 144, patch: 1 });
     expect(parseCodexVersion('codex-cli 0.136.0-beta.1')).toEqual({ major: 0, minor: 136, patch: 0 });

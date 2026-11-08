@@ -1,5 +1,3 @@
-import type { BackendType } from '../adapters/backend/types.js';
-
 /**
  * Codex App turn liveness, driven by the app-server runner's explicit turn
  * activity markers.  This deliberately reports "no observable progress"
@@ -8,23 +6,6 @@ import type { BackendType } from '../adapters/backend/types.js';
  */
 
 export const CODEX_APP_NO_PROGRESS_TIMEOUT_MS = 90_000;
-
-const PERSISTENT_BACKEND_TYPES: ReadonlySet<BackendType> = new Set(['tmux', 'herdr', 'zellij']);
-
-/**
- * Decide whether an existing persistent pane needs a synthetic observation.
- * This deliberately does not depend on pipe mode: Zellij reattaches through
- * its own PTY (`isPipeMode=false`) but preserves the same running CLI.
- */
-export function shouldBeginCodexAppReattachObservation(input: {
-  cliId?: string;
-  backendType: BackendType;
-  isReattach: boolean;
-}): boolean {
-  return input.cliId === 'codex-app'
-    && input.isReattach
-    && PERSISTENT_BACKEND_TYPES.has(input.backendType);
-}
 
 export interface CodexAppLivenessPoll {
   active: boolean;

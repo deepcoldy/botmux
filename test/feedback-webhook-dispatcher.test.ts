@@ -13,6 +13,7 @@ import {
 } from '../src/services/feedback-webhook-dispatcher.js';
 import { parseBotConfigsFromText } from '../src/bot-registry.js';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
+import { beginFeedbackMaintenance, freezeFeedbackSource } from '../src/services/feedback-maintenance.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -60,6 +61,52 @@ describe('feedback webhook destination and secret safety', () => {
 });
 
 describe('feedback webhook attempt contract', () => {
+  it('retains unknown request outcome and blocks migration after a transport reset', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-unknown-')); dirs.push(dir);
+    const db = await SkillFeedbackStore.open(dir);
+    db.recordTurnTerminal({ botAppId: 'app', sessionId: 's', turnId: 't', status: 'completed' });
+    db.recordTurnDelivery({
+      botAppId: 'app', sessionId: 's', turnId: 't', platform: 'lark', platformAppId: 'app', platformMessageId: 'm',
+      content: 'answer', cardMode: 'card', status: 'delivered',
+      webhookDestinations: [{ id: 'd', enabled: true, url: 'https://8.8.8.8/hook', eventTypes: ['turn.completed'], secretRef: 'secret' }],
+    });
+    const dispatcher = startFeedbackWebhookDispatcher({
+      store: db, readSecret: () => 'secret',
+      dispatch: input => dispatchWebhookAttempt({ ...input, request: async () => { throw new Error('ECONNRESET_after_receiver_commit'); } }),
+    });
+    await dispatcher.ready;
+    await dispatcher.quiesce();
+    await beginFeedbackMaintenance(dir, 'unknown-webhook');
+    try {
+      await expect(freezeFeedbackSource(dir, 'unknown-webhook')).rejects.toThrow('feedback_outbox_unsettled');
+    } finally { db.close(); }
+  });
+  it('maintenance quiescence waits for an in-flight request without aborting it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-quiesce-')); dirs.push(dir);
+    const db = await SkillFeedbackStore.open(dir);
+    db.recordTurnTerminal({ botAppId: 'app', sessionId: 's', turnId: 't', status: 'completed' });
+    db.recordTurnDelivery({
+      botAppId: 'app', sessionId: 's', turnId: 't', platform: 'lark', platformAppId: 'app', platformMessageId: 'm',
+      content: 'answer', cardMode: 'card', status: 'delivered',
+      webhookDestinations: [{ id: 'd', enabled: true, url: 'https://hook.example/x', eventTypes: ['turn.completed'], secretRef: 'secret' }],
+    });
+    const started = deferred<AbortSignal | undefined>();
+    const request = deferred<{ kind: 'delivered'; status: number }>();
+    const dispatcher = startFeedbackWebhookDispatcher({
+      store: db, readSecret: () => 'secret',
+      dispatch: async input => { started.resolve(input.signal); return request.promise; },
+    });
+    const signal = await started.promise;
+    let quiesced = false;
+    const stopping = dispatcher.quiesce().then(() => { quiesced = true; });
+    await Promise.resolve();
+    expect(quiesced).toBe(false);
+    expect(signal?.aborted).toBe(false);
+    request.resolve({ kind: 'delivered', status: 200 });
+    await stopping;
+    expect(db.listFeedbackOutbox()[0].status).toBe('delivered');
+    db.close();
+  });
   it('recovers stale claims, immediately dispatches due rows, and stops boundedly', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-pump-')); dirs.push(dir);
     const db = await SkillFeedbackStore.open(dir);
@@ -165,3 +212,4 @@ describe('feedback webhook attempt contract', () => {
     expect(computeRetryDelay({ attempts: 2, random: () => 0.5, baseDelayMs: 1000, maxDelayMs: 300_000 })).toBe(1000);
   });
 });
+import { deferred } from './helpers/feedback-deferred.js';

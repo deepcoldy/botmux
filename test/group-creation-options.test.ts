@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseGroupCreationArgs, parseGroupCreationDefaults, resolveGroupCreationAgents } from '../src/services/group-creation-options.js';
+import { formatSlashGroupName, parseGroupCreationArgs, parseGroupCreationDefaults, resolveGroupCreationAgents, resolveGroupDecorations } from '../src/services/group-creation-options.js';
 
 describe('/g customization', () => {
   it('preserves punctuation, spaces and the first non-empty name line', () => {
@@ -54,13 +54,17 @@ describe('/g customization', () => {
     expect(parseGroupCreationArgs('Project --=foo').name).toBe('Project --=foo');
     expect(parseGroupCreationArgs('Project --=').name).toBe('Project --=');
   });
+  it('accepts --avatar logo and logo defaults', () => {
+    expect(parseGroupCreationArgs('Project --avatar logo')).toEqual({ name: 'Project', avatar: 'logo', roleProfileId: undefined });
+    expect(parseGroupCreationDefaults({ avatar: 'logo' })).toEqual({ avatar: 'logo' });
+  });
   it.each([
     '--tag "unclosed', '--agents', '--agents a,,b', '--tag', '--avatar random',
     '--tag A --no-tag', '--no-agents=x', '--tag --avatar name',
   ])('still rejects malformed known flags: %s', raw => {
     expect(() => parseGroupCreationArgs(raw)).toThrow();
   });
-  it.each([null, [], { agents: 'Review' }, { agents: [''] }, { avatar: true }, { tag: '字'.repeat(61) }, { typo: 1 }].map(value => ({ value })))('rejects malformed defaults', ({ value }) => {
+  it.each([null, [], { agents: 'Review' }, { agents: [''] }, { avatar: true }, { avatar: 'emoji' }, { auto: true }, { tag: '字'.repeat(61) }, { typo: 1 }].map(value => ({ value })))('rejects malformed defaults', ({ value }) => {
     expect(() => parseGroupCreationDefaults(value)).toThrow();
   });
   it('uses current config despite removed, missing, duplicate or transportless cached bots', () => {
@@ -83,5 +87,26 @@ describe('/g customization', () => {
     expect(resolveGroupCreationAgents(['review', 'cli_review', 'Build'], bots, bots)).toEqual(['cli_review', 'cli_build']);
     expect(() => resolveGroupCreationAgents(['missing'], bots, bots)).toThrow('Unknown');
     expect(() => resolveGroupCreationAgents(['Review'], [...bots, { larkAppId: 'cli_review2' }], [...bots, { larkAppId: 'cli_review2', botName: 'Review' }])).toThrow('Ambiguous');
+  });
+});
+
+describe('/g decorations', () => {
+  it('defaults to the session-group logo and AI-titles only unnamed groups', () => {
+    expect(resolveGroupDecorations({ name: '' })).toEqual({ avatar: 'logo', autoTitle: true });
+    expect(resolveGroupDecorations({ name: '项目讨论' })).toEqual({ avatar: 'logo', autoTitle: false });
+  });
+  it('lets an explicit avatar decide, and off means none', () => {
+    expect(resolveGroupDecorations({ name: '', avatar: 'name' })).toEqual({ avatar: 'name', autoTitle: true });
+    expect(resolveGroupDecorations({ name: '', avatar: 'off' })).toEqual({ avatar: undefined, autoTitle: true });
+  });
+});
+
+describe('formatSlashGroupName', () => {
+  it('prefixes once and truncates by code point within 50 UTF-16 units', () => {
+    expect(formatSlashGroupName('修复登录', 'AI·')).toBe('AI·修复登录');
+    expect(formatSlashGroupName('AI·修复登录', 'AI·')).toBe('AI·修复登录');
+    const long = formatSlashGroupName('😀'.repeat(60));
+    expect(long.endsWith('…')).toBe(true);
+    expect(long.length).toBeLessThanOrEqual(51);
   });
 });

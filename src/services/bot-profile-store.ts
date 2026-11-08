@@ -22,7 +22,7 @@
  * file, so there is no cross-bot lost-update window. Same rationale as the
  * per-bot team-role files in role-resolver.ts.
  */
-import { existsSync, mkdirSync, unlinkSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { isJsonObject, readJsonFileSoft } from '../utils/json-file.js';
@@ -157,19 +157,4 @@ export function clearBotCapability(dataDir: string, larkAppId: string): boolean 
     try { unlinkSync(profilePath(dataDir, larkAppId)); } catch { /* already gone */ }
   }
   return had;
-}
-
-/** All recorded profiles, keyed by larkAppId. */
-export function listBotProfiles(dataDir: string): Record<string, BotProfile> {
-  const dir = profilesDir(dataDir);
-  const out: Record<string, BotProfile> = {};
-  let files: string[];
-  try { files = readdirSync(dir); } catch { return out; }
-  for (const f of files) {
-    if (!f.endsWith('.json')) continue;
-    const larkAppId = f.slice(0, -'.json'.length);
-    const p = readProfile(dataDir, larkAppId);
-    if (p) out[larkAppId] = p;
-  }
-  return out;
 }

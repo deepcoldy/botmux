@@ -111,6 +111,12 @@ export interface FsPolicyContext {
    *  exec `node <checkout>/dist/cli.js …`) can load — without this a sandboxed
    *  `botmux send` / SessionStart+AskUserQuestion hooks EPERM on cli.js. */
   botmuxInstallRoot?: string;
+  /** Paths under botmuxInstallRoot that are not part of the code (untracked /
+   *  ignored entries of a git checkout: `.env`, bots configs, login state,
+   *  `.git`, …; see install-root-masks.ts). Denied as MANDATORY rules unless
+   *  the caller itself grants that part of the checkout (a workingDir or user
+   *  path at/inside the install root — a bot working ON the checkout). */
+  botmuxInstallRootMaskPaths?: readonly string[];
   /** Daemon-mediated relay outbox (Linux) — readWrite. */
   outbox?: string;
   /** Extra writable roots (resolved TMPDIR, admin extras). */
@@ -146,7 +152,8 @@ export interface FsPolicyContext {
    *  authPaths (`~/.codex` etc.) are NOT Feishu creds and stay granted readWrite.
    *  Absent/true = normal behavior. */
   larkTransportEnabled?: boolean;
-  /** No-transport ONLY: the SECOND botmux authority root to freeze, when the
+  /** The SECOND botmux root to deny (transport sessions: as the botmux-root
+   *  ceiling; no-transport: as an authority root), when the
    *  daemon runs with a custom SESSION_DATA_DIR so `configuredBotmuxHome`
    *  (= dirname(dataDir), passed as `botmuxHome`) differs from the default
    *  `~/.botmux`. BOTH must be denied wholesale — the default root still holds
@@ -155,8 +162,15 @@ export interface FsPolicyContext {
    *  when equal to `botmuxHome`. MUST be canonical + host-frozen (never derived
    *  from agent-controllable env). */
   defaultBotmuxHome?: string;
-  /** No-transport ONLY: the ACTUAL loaded bots-config path, frozen by the daemon
+  /** Whether `botmuxHome` (dirname of the data dir) is a real botmux home —
+   *  false for a degenerate parent such as $HOME or / (SESSION_DATA_DIR=$HOME/data
+   *  or /data), decided by the worker with plausibleConfiguredBotmuxHome. Transport
+   *  sessions then deny only `<botmuxHome>/bots` + the data dir instead of the
+   *  whole parent. Absent = true. */
+  botmuxHomePlausible?: boolean;
+  /** The ACTUAL loaded bots-config path, frozen by the daemon
    *  (`getLoadedConfigPath()`), NOT guessed from BOTS_CONFIG env by the worker.
+   *  Transport sessions deny it by exact path. For no-transport turns:
    *  When it lives INSIDE a frozen authority root the parent mask already covers
    *  it (no extra rule needed). When it lives OUTSIDE every authority root,
    *  buildFsPolicy THROWS {@link FsPolicyConfigError} — a no-transport turn must
@@ -368,6 +382,8 @@ function commonHomeBaseline(h: string): FsRule[] {
     rw(`${h}/.cache`), rw(`${h}/.npm`), rw(`${h}/.local/state`),
     // The daemon-written botmux wrapper (head of PATH) + skill plugin dir.
     ro(`${h}/.botmux/bin`), ro(`${h}/.botmux/claude-plugin`), ro(`${h}/.botmux/cursor-plugin`),
+    // Their workflow-node-session copies (skills/workflow-node-plugin-dir.ts).
+    ro(`${h}/.botmux/claude-plugin-workflow-node`), ro(`${h}/.botmux/cursor-plugin-workflow-node`),
     // Installed-plugin registry. Secret-free BY CONTRACT: `assertPublicPluginRegistry`
     // refuses to persist a record carrying `command`/`env`/`url`/`headers`, and a
     // plugin's real MCP descriptor lives in its own `private/mcp.json` — which stays
@@ -435,6 +451,16 @@ function linuxBaseline(h: string): FsRule[] {
   ];
 }
 
+/** Host credential trees the baseline preset DENIES for `homeDir` (crown jewels:
+ *  ~/.ssh, ~/.aws, ~/.netrc, toolchain tokens, ~/.lark-cli, macOS keychains …).
+ *  Exported so daemon-side code that COPIES host content into a sandbox-readable
+ *  place (session skill snapshots, core/skills/snapshot.ts) refuses the very same
+ *  trees — one source of truth for "what is a host secret". Pure. */
+export function baselineDeniedHostPaths(platform: 'darwin' | 'linux', homeDir: string): string[] {
+  const base = platform === 'darwin' ? darwinBaseline(homeDir) : linuxBaseline(homeDir);
+  return base.filter(rule => rule.access === 'deny').map(rule => rule.path);
+}
+
 // ───────────────────────────── policy assembly ───────────────────────────────
 
 /**
@@ -450,6 +476,7 @@ export class FsPolicyConfigError extends Error {
   readonly kind:
     | 'external-bots-config'
     | 'working-dir-is-authority'
+    | 'working-dir-in-botmux-home'
     | 'working-dir-is-host-only'
     | 'bots-config-in-carveout';
   constructor(kind: FsPolicyConfigError['kind'], message: string) {
@@ -635,7 +662,10 @@ export function computeNoTransportAuthorityRoots(input: {
  */
 export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   const candidates: FsRule[] = [];
-  const hostOnlyRoots = (ctx.hostOnlyDenyPaths ?? [])
+  const hostOnlyRoots = [
+    `${ctx.sessionDataDir}/link-refs`,
+    ...(ctx.hostOnlyDenyPaths ?? []),
+  ]
     .map(normalizeFsPath)
     .filter((p): p is string => p !== null);
   const suppressedHostOnlyPaths: string[] = [];
@@ -728,6 +758,59 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     }
   }
 
+  // Transport-enabled sessions: the botmux roots are a CEILING, not merely
+  // "uncovered". With a project workingDir they are unreachable anyway
+  // (deny-by-default), but a workingDir (or another broad grant) that is an
+  // ANCESTOR of a root — workingDir=~, the default when none is configured —
+  // used to re-open the whole tree readWrite: bots.json, .dashboard-secret,
+  // sibling BOT_HOMEs and their send-cred.json. The roots are denied as
+  // MANDATORY rules below and every legitimate surface (own BOT_HOME, bin,
+  // plugin dirs, own session files, …) is re-allowed at a deeper path exactly
+  // as in the uncovered case, so the agent sees the same ~/.botmux either way.
+  // A workingDir AT or INSIDE a denied region (other than inside its own
+  // BOT_HOME) would sit beside or below the deny with nothing left to protect
+  // it — refuse that layout instead of half-confining it.
+  //
+  // `botmuxHome` is dirname(SESSION_DATA_DIR), which is a real botmux home only
+  // in the standard / custom-instance layouts. With SESSION_DATA_DIR=$HOME/data
+  // or /data it is $HOME or /, and with <checkout>/data it is the install root
+  // itself (whose read-only grant a same-path deny would override). For such a
+  // degenerate parent the ceiling narrows to the two botmux-owned entries in
+  // it: `<parent>/bots` (BOT_HOMEs) and the session data dir. The default
+  // `~/.botmux` is a botmux home by definition and always gets the full ceiling.
+  const installRootPath = ctx.botmuxInstallRoot ? normalizeFsPath(ctx.botmuxInstallRoot) : null;
+  const configuredHome = normalizeFsPath(ctx.botmuxHome);
+  const defaultHome = ctx.defaultBotmuxHome ? normalizeFsPath(ctx.defaultBotmuxHome) : null;
+  const configuredIsHome = configuredHome !== null
+    && (configuredHome === defaultHome
+      || (ctx.botmuxHomePlausible !== false && configuredHome !== installRootPath));
+  const botmuxRoots = larkTransport
+    ? [...new Set([configuredIsHome ? configuredHome : null, defaultHome].filter((p): p is string => p !== null))]
+    : [];
+  // A narrowed entry that contains the default botmux home (a data dir AT
+  // $HOME, as some test harnesses set) is not botmux-owned either: denying it
+  // would hide the whole home, CLI binaries and auth dirs included. The
+  // default home under it keeps its own full ceiling.
+  const narrowedBotmuxDenies = larkTransport && configuredHome !== null && !configuredIsHome
+    ? [`${configuredHome === '/' ? '' : configuredHome}/bots`, normalizeFsPath(ctx.sessionDataDir)]
+      .filter((p): p is string => p !== null
+        && !botmuxRoots.some(root => coversPath(root, p))
+        && !(defaultHome !== null && coversPath(p, defaultHome)))
+    : [];
+  if (larkTransport) {
+    const wd = normalizeFsPath(ctx.workingDir);
+    const ownHome = normalizeFsPath(ctx.botHome);
+    const denied = [...botmuxRoots, ...narrowedBotmuxDenies];
+    if (wd !== null && denied.some(root => coversPath(root, wd)) && !(ownHome && coversPath(ownHome, wd))) {
+      throw new FsPolicyConfigError(
+        'working-dir-in-botmux-home',
+        `sandbox refuses workingDir ${wd}: it lives inside the botmux data directory `
+        + `(${denied.join(', ')}), which holds every bot's credentials; choose a project `
+        + `directory outside it (or the bot's own BOT_HOME).`,
+      );
+    }
+  }
+
   // Hoisted into a named const (vs the upstream inline `candidates.push(...)`)
   // because roleLibAccess() below inspects baseline's DENY entries.
   const baseline = ctx.platform === 'darwin' ? darwinBaseline(ctx.homeDir) : linuxBaseline(ctx.homeDir);
@@ -736,7 +819,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // Adapter-declared surfaces.
   push(ctx.execPaths, 'readOnly', 'adapter');
   // authPaths = the model CLI's OWN login/state surface (~/.codex, ~/.claude
-  // credentials, Seed/bytedcli SSO, Gemini OAuth, OpenCode DB, …) — NOT Feishu.
+  // credentials, Seed/bytedcli SSO, Antigravity OAuth, OpenCode DB, …) — NOT Feishu.
   // These MUST stay granted even for a no-transport turn, else the CLI can't
   // authenticate and the core functionality breaks. The no-Lark-transport gate
   // only denies Feishu-authority paths (below), never the CLI's own auth.
@@ -853,20 +936,22 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // daemon 在每次提交 user turn 前把 reminder/whiteboard 写到这里；hook 子进程
   // （在沙盒内）按内容指纹读回。worker 预创建目录以通过 existence-filter。
   if (ctx.sessionId) push([`${ctx.sessionDataDir}/prompt-ctx/${ctx.sessionId}`], 'readOnly', 'internal');
-  // Trigger-user CLI identity (this session ONLY) — the wrapper on PATH sources
-  // `cli-identity/<sessionId>.bin/.data/<tool>.env` on every invocation. Bind
-  // the per-session directory, not each mutable file: atomic writes replace
-  // inodes, while a long-lived bwrap single-file bind keeps reading the old one.
+  // Trigger-user CLI identity surface (this session ONLY).
   //
-  // Granted per file/dir, never the `cli-identity/` parent: that directory holds
-  // every concurrent session's files, each with a live user token belonging to a
-  // different person. A parent grant would let one session read another's — the
-  // exact cross-person leak this feature exists to prevent — and it would fail
-  // OPEN for sessions created after spawn.
+  // In the proven model the daemon keeps token material in its own memory and
+  // hands it to the wrapper over the loopback process-proof channel, so this
+  // directory holds no tokens at all — only the wrapper binaries, shell shims
+  // and the active-turn marker. In the single-snapshot model it additionally
+  // holds the one per-tool `<tool>.env` file the daemon overwrites each turn.
   //
-  // Read-only by construction: the daemon writes these, the CLI must never be
-  // able to. Writable would let an agent publish its own identity and act as
-  // anyone whose token it could name.
+  // Granted per session directory, never the `cli-identity/` parent: that
+  // directory holds every concurrent session's identity surface. A parent
+  // grant would let one session read another's — the exact cross-person leak
+  // this feature exists to prevent — and it would fail OPEN for sessions
+  // created after spawn.
+  //
+  // Read-only by construction: the daemon writes here, the CLI must never be
+  // able to. Writable would let an agent publish its own identity.
   if (ctx.sessionId && larkTransport) {
     push([`${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`], 'readOnly', 'internal');
   }
@@ -896,6 +981,12 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     `${bh}/cursor-plugin`,      // skill/plugin dir (cursor --plugin-dir); no secrets
     `${bh}/omp-plugin`,         // skill/plugin dir (omp --plugin-dir); no secrets
     `${bh}/pi-skills`,          // skill dir (pi --skill); no secrets
+    // Workflow-node-session copies of the four dirs above (same skills minus
+    // the withheld ones; skills/workflow-node-plugin-dir.ts); no secrets.
+    `${bh}/claude-plugin-workflow-node`,
+    `${bh}/cursor-plugin-workflow-node`,
+    `${bh}/omp-plugin-workflow-node`,
+    `${bh}/pi-skills-workflow-node`,
     `${bh}/lark-scopes.json`,   // static scope catalog
     // dashboard-daemons (sibling IPC port table) is the discovery half of the
     // trusted-host escalation — a no-transport turn must NOT get it (paired with
@@ -1002,6 +1093,28 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   push(dropAuthority(ctx.userPaths?.readOnly), 'readOnly', 'user');
   push(ctx.userPaths?.deny, 'deny', 'user');
   push(ctx.mandatoryDenyPaths, 'deny', 'mandatory');
+  // Botmux-root ceiling for transport sessions (see botmuxRoots above). The
+  // loaded bots config is denied by exact path too: BOTS_CONFIG may point
+  // outside the roots (e.g. into the botmux checkout or a project dir).
+  push(botmuxRoots, 'deny', 'mandatory');
+  push(narrowedBotmuxDenies, 'deny', 'mandatory');
+  if (larkTransport && ctx.loadedBotsConfigPath) push([ctx.loadedBotsConfigPath], 'deny', 'mandatory');
+  // Non-code entries of the install root. The read-only install-root grant
+  // exists only so the CLI can load dist/ + node_modules/; it must not expose
+  // what a developer keeps beside the code. Only a workingDir AT or INSIDE the
+  // install root lifts the masks under it (that bot is working on the checkout
+  // itself); a sandboxPaths grant of the checkout, or any ancestor grant, does
+  // not — it means "let the agent read this tree", not "develop botmux".
+  const installRoot = installRootPath;
+  if (installRoot && ctx.botmuxInstallRootMaskPaths?.length) {
+    const wd = normalizeFsPath(ctx.workingDir);
+    const checkoutWorkingDir = wd !== null && coversPath(installRoot, wd) ? wd : null;
+    push(ctx.botmuxInstallRootMaskPaths.filter(p => {
+      const n = normalizeFsPath(p);
+      return n !== null && n !== installRoot && coversPath(installRoot, n)
+        && !(checkoutWorkingDir && coversPath(checkoutWorkingDir, n));
+    }), 'deny', 'mandatory');
+  }
   push(serviceCredentialReadOnlyPaths, 'readOnly', 'mandatory');
   push(hostOnlyRoots, 'deny', 'mandatory');
   push(ctx.mandatoryReadOnlyPaths, 'readOnly', 'mandatory');
@@ -1212,6 +1325,65 @@ export function compileToSeatbelt(policy: FsPolicy): string {
 }
 
 // ───────────────────────────── bwrap compiler ────────────────────────────────
+
+export interface SymlinkProbe {
+  /** lstat(path).isSymbolicLink(); false when absent. */
+  isSymlink(path: string): boolean;
+  /** realpath(path); undefined when it cannot be resolved (dangling). */
+  realpath(path: string): string | undefined;
+}
+
+/**
+ * Baseline directories are candidates written lexically (`/opt`, `/usr`,
+ * `/etc`, `~/.cache` …). On hosts where one of them is a symlink (`/opt ->
+ * /data00/opt` on some devboxes) bwrap resolves the bind source to the real
+ * directory but the mount target `/opt` is then a mountpoint for a different
+ * path — MEASURED in a user report: `bwrap: Can't bind mount /oldroot/data00
+ * on /newroot/opt`. Handle it the way usrmerge `/bin` is handled: recreate the
+ * link inside the fresh root (`--symlink <real> <path>`, via
+ * CompileBwrapOpts.symlinks) and bind the REAL path instead.
+ *
+ * Rules (any source) below the lexical link are moved under the real path too,
+ * so longest-prefix still decides. A rule already naming the real path wins
+ * over the relocated baseline (an explicit grant/deny is never widened or
+ * narrowed by a baseline candidate). A dangling baseline link is dropped —
+ * nothing to expose. Only a link whose PARENT is already canonical is
+ * rebuilt; deeper aliasing is left untouched (as before). Pure given `io`.
+ */
+export function relocateSymlinkedBaselineRules(
+  rules: readonly FsRule[],
+  io: SymlinkProbe,
+): { rules: FsRule[]; symlinks: { path: string; target: string }[] } {
+  const symlinks: { path: string; target: string }[] = [];
+  const moves: { from: string; to: string }[] = [];
+  const dropped = new Set<string>();
+  for (const r of rules) {
+    if (r.source !== 'baseline' || r.access === 'deny' || r.path === '/') continue;
+    if (!io.isSymlink(r.path)) continue;
+    const parent = r.path.slice(0, r.path.lastIndexOf('/')) || '/';
+    if (io.realpath(parent) !== parent) continue;
+    const target = io.realpath(r.path);
+    if (!target) { dropped.add(r.path); continue; }
+    if (target === r.path || coversPath(r.path, target) || coversPath(target, r.path)) continue;
+    if (symlinks.some(l => l.path === r.path)) continue;
+    symlinks.push({ path: r.path, target });
+    moves.push({ from: r.path, to: target });
+  }
+  if (!moves.length && !dropped.size) return { rules: [...rules], symlinks };
+  const byPath = new Map<string, FsRule>();
+  for (const r of rules) {
+    if (dropped.has(r.path)) continue;
+    const move = moves.find(m => coversPath(m.from, r.path));
+    if (!move) { byPath.set(r.path, r); continue; }
+    const path = move.to + r.path.slice(move.from.length);
+    // A rule already naming the real path wins whichever order it comes in: an
+    // earlier one is kept here, a later one overwrites below via set().
+    if (!byPath.has(path)) byPath.set(path, { ...r, path });
+  }
+  const out = [...byPath.values()].sort((a, b) =>
+    pathDepth(a.path) - pathDepth(b.path) || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return { rules: out, symlinks };
+}
 
 export interface CompileBwrapOpts {
   /** Top-level symlinks to replicate inside the tmpfs root (usrmerge /bin →

@@ -4,6 +4,7 @@ export interface TurnAuthorityIdentity {
   /** Authenticated collaborative input must wait even when sent by the same caller. */
   queueAfterActiveTurn?: true;
   turnId?: string;
+  identityTurnId?: string;
   dispatchAttempt?: number;
   caller?: TrustedCaller;
   /** Stable controller of the surrounding task/session. The active caller may
@@ -107,6 +108,7 @@ export class ActiveTurnAuthority {
       ...(this.active.caller ? { caller: this.active.caller } : {}),
       ...(this.active.controller ? { controller: this.active.controller } : {}),
       ...(this.active.turnId ? { turnId: this.active.turnId } : {}),
+      ...(this.active.identityTurnId ? { identityTurnId: this.active.identityTurnId } : {}),
       ...(this.active.dispatchAttempt !== undefined
         ? { dispatchAttempt: this.active.dispatchAttempt }
         : {}),
@@ -121,6 +123,7 @@ export class ActiveTurnAuthority {
     }
     this.active = Object.freeze({
       turnId: identity.turnId,
+      ...(identity.identityTurnId ? { identityTurnId: identity.identityTurnId } : {}),
       ...(identity.dispatchAttempt !== undefined
         ? { dispatchAttempt: identity.dispatchAttempt }
         : {}),
@@ -150,11 +153,14 @@ export class ActiveTurnAuthority {
     const active = this.active;
     this.active = Object.freeze({
       turnId: identity.turnId,
+      ...(active
+        ? { identityTurnId: active.identityTurnId ?? active.turnId }
+        : identity.identityTurnId ? { identityTurnId: identity.identityTurnId } : {}),
       ...(identity.dispatchAttempt !== undefined
         ? { dispatchAttempt: identity.dispatchAttempt }
         : {}),
-      ...(active?.caller
-        ? { caller: active.caller }
+      ...(active
+        ? active.caller ? { caller: active.caller } : {}
         : identity.caller
         ? { caller: frozenCaller(identity.caller) }
         : {}),
@@ -178,6 +184,7 @@ export class ActiveTurnAuthority {
       const previous = this.active;
       this.active = Object.freeze({
         turnId: identity.turnId,
+        ...(identity.identityTurnId ? { identityTurnId: identity.identityTurnId } : {}),
         ...(identity.dispatchAttempt !== undefined
           ? { dispatchAttempt: identity.dispatchAttempt }
           : {}),

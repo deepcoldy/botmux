@@ -94,6 +94,15 @@ describe('parseCardStreamArgs', () => {
     });
     expect(parseCardStreamArgs(['finish', '--stream-id', STREAM_ID, '--summary=完成']))
       .toEqual({ ok: true, operation: 'finish', streamId: STREAM_ID, summary: '完成' });
+    expect(parseCardStreamArgs([
+      'finish', '--stream-id', STREAM_ID,
+      '--summary', '{{botmux_link:lr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}',
+    ])).toEqual({
+      ok: true,
+      operation: 'finish',
+      streamId: STREAM_ID,
+      summary: '{{botmux_link:lr_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}}',
+    });
     expect(parseCardStreamArgs(['snapshot', '--stream-id', STREAM_ID, '--session-id', 'sid_1']))
       .toEqual({ ok: true, operation: 'snapshot', streamId: STREAM_ID, sessionId: 'sid_1' });
     expect(parseCardStreamArgs([

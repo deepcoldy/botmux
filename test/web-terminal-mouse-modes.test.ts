@@ -10,12 +10,8 @@
  *   - parsePaneModeFlags parses/rejects display-message output
  *   - TmuxPipeBackend.capturePaneInputModes queries the REAL pane target and
  *     composes the sequence (empty on error/exit)
- *   - worker seed appends the mode seed for WRITE clients only, and the client
- *     script trailing-throttles pure-motion reports (1003 floods → send-keys)
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 
 vi.mock('node:child_process', () => ({
   execSync: vi.fn(),
@@ -115,39 +111,5 @@ describe('TmuxPipeBackend.capturePaneInputModes', () => {
 
     mockedExecSync.mockReturnValueOnce("can't find pane\n" as any);
     expect(backend.capturePaneInputModes()).toBe('');
-  });
-});
-
-describe('worker web-terminal wiring (source assertions)', () => {
-  const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-
-  it('appends the pane mode seed for write clients only', () => {
-    expect(workerSource).toContain(
-      "const modeSeed = hasWrite ? (backend?.capturePaneInputModes?.() ?? '') : '';",
-    );
-    expect(workerSource).toContain('ws.send(seed + modeSeed + herdrWebCursorSequence());');
-    // Mode seed alone must still be sent when the capture seed is empty.
-    expect(workerSource).toContain('if (seed.length > 0 || modeSeed.length > 0) {');
-  });
-
-  it('trailing-throttles pure-motion mouse reports in the client script', () => {
-    // Motion = SGR button code 35 plus shift(+4)/alt(+8)/ctrl(+16) combinations.
-    expect(workerSource).toContain(
-      'var _MOTION_RE=/^(?:\\\\x1b\\\\[<(?:35|39|43|47|51|55|59|63);\\\\d+;\\\\d+[Mm])+$/;',
-    );
-    // Non-motion input must cancel a pending motion to preserve event order.
-    const onData = workerSource.slice(
-      workerSource.indexOf('term.onData(function(d){'),
-      workerSource.indexOf('var fixedSize='),
-    );
-    expect(onData).toContain('_motionPend=d;');
-    expect(onData).toContain('if(_motionT){clearTimeout(_motionT);_motionT=0}');
-    expect(onData.indexOf('_MOTION_RE.test(d)')).toBeLessThan(onData.indexOf('_sendInput(d);'));
-  });
-
-  it('keeps the motion-code set in sync with the client regex', () => {
-    // Base 35 (0b100011: motion, no button) + modifier bits 4/8/16.
-    const expected = [0, 4, 8, 12, 16, 20, 24, 28].map(m => 35 + m).join('|');
-    expect(workerSource).toContain(`(?:${expected})`);
   });
 });

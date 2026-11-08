@@ -45,11 +45,14 @@ import {
   opendirSync,
   readdirSync,
   readSync,
+  realpathSync,
   statSync,
   type Dirent,
 } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { codexHistoryPath, codexSessionsRoot } from './codex-paths.js';
+import { createHash } from 'node:crypto';
+import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
+import { codexHome, codexHistoryPath, codexSessionsRoot } from './codex-paths.js';
+import { openDatabaseSyncNow } from './sqlite-compat.js';
 import { baselineJsonlCursor, beginJsonlDrain, iterateJsonlLines, scanJsonlBackward, scanJsonlBackwardFd } from './jsonl-cursor.js';
 import type { CodexThreadSettings } from './codex-service-tier.js';
 // cot-subject 与 process-open-files 只用语言/Node 内建，等价于内联，不违反本模块 dependency-free 口径。
@@ -59,14 +62,64 @@ import { boundSubjectForTransport, subjectFromArgsString, subjectFromInputObject
 const UNTRUSTED_SESSION_SCAN_MAX_DEPTH = 3;
 const UNTRUSTED_SESSION_SCAN_MAX_ENTRIES = 50_000;
 
-/** Extract the cliSessionId encoded in a rollout filename. Codex's session
- *  id is UUID-shaped (8-4-4-4-12 hex), which lets us anchor the regex on
- *  the UUID alone — the `<ts>` segment between "rollout-" and the sid
- *  contains its own dashes that would otherwise let a greedy match swallow
- *  parts of the sid. Returns undefined for paths that don't match. */
+/** STRICT, cross-CLI parser for the cliSessionId encoded in a rollout
+ *  filename. Codex's session id is UUID-shaped (8-4-4-4-12 hex), which lets
+ *  us anchor the regex on the UUID alone — the `<ts>` segment between
+ *  "rollout-" and the sid contains its own dashes that would otherwise let a
+ *  greedy match swallow parts of the sid.
+ *
+ *  Deliberately STRICT — it matches only the canonical
+ *  `rollout-<ts>-<sid>.jsonl` name and returns undefined for the
+ *  byte-identical `-<sid>_<uuid>.jsonl` shape. That suffix is ambiguous: for
+ *  Codex it is a resumed GENERATION file, but for TRAE X it is a resumed
+ *  SEGMENT. A shared/ambiguous caller that accepted the suffix could let a
+ *  TRAE pid-probe adopt persist the wrong native session id (#1854).
+ *
+ *  This exported function currently has ZERO production callers by design:
+ *  Codex's own generation-aware reads all go through the Codex-scoped
+ *  {@link codexGenerationSessionIdFromRolloutPath} (a Codex pid's open fds /
+ *  CODEX_HOME index+scan / an already-bound Codex bridge — the only places a
+ *  `_<uuid>` suffix is known to mean a Codex generation). Do NOT treat this
+ *  parser as dead code under the "remove test-only exports" rule: it is the
+ *  load-bearing body of the cross-CLI invariant pinned by
+ *  `test/structured-bridge-spec.test.ts > pins the per-CLI differences`
+ *  (mutating the regex to accept the suffix makes that guard fail). Keep the
+ *  strict parser and the Codex-scoped parser separate. */
 export function codexSessionIdFromRolloutPath(path: string): string | undefined {
-  const m = /rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i.exec(path);
-  return m ? m[1] : undefined;
+  return CODEX_ROLLOUT_SESSION_RE.exec(path)?.[1];
+}
+
+const CODEX_ROLLOUT_SESSION_RE = /rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i;
+
+/** Codex-scoped parser that also accepts a resumed-generation suffix
+ *  (`rollout-<ts>-<sid>_<generation>.jsonl`), always returning the original
+ *  session id, never the generation id. Call ONLY on paths already scoped to
+ *  a Codex process or CODEX_HOME — not on a shared/ambiguous path where the
+ *  same suffix could be a TRAE segment. */
+export function codexGenerationSessionIdFromRolloutPath(path: string): string | undefined {
+  return CODEX_GENERATION_ROLLOUT_SESSION_RE.exec(basename(path))?.[1];
+}
+
+const CODEX_GENERATION_ROLLOUT_SESSION_RE = /^rollout-.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?\.jsonl$/i;
+
+/** True for a resumed-generation filename (`-<sid>_<generation>.jsonl`).
+ *  Generation candidates need session_meta header verification because more
+ *  than one can exist for one session; the plain `-<sid>.jsonl` name keeps
+ *  its historical suffix contract for any sid shape. */
+export function codexRolloutNameHasGeneration(name: string): boolean {
+  return /_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/i.test(name);
+}
+
+/** Stable identity of one persisted rollout record: a hash of the record's
+ *  raw line (its UTF-8 text; rollout JSON is valid UTF-8). Independent of
+ *  parse-time fallbacks (missing/invalid timestamps become Date.now() and
+ *  must NOT enter event identity) and of the file/offset, so a line copied
+ *  verbatim into a resumed generation file hashes identically whether it was
+ *  seen by the forward reader or a backward scan, while two same-text
+ *  records at different timestamps differ (the timestamp lives in the
+ *  persisted line). */
+export function codexRolloutLineId(line: string | Buffer): string {
+  return createHash('sha256').update(line.toString('utf8')).digest('hex');
 }
 
 type CodexRolloutRef = { path: string; cliSessionId: string };
@@ -77,7 +130,10 @@ type CodexRolloutRef = { path: string; cliSessionId: string };
  *  transcripts open in the same process, so choosing the first fd can bind
  *  an adopted pane to the wrong conversation.
  *
- *  两种平台都用 `codexSessionIdFromRolloutPath` 提取 sid。 */
+ *  两种平台（Linux /proc 与 macOS lsof 兜底）都用同一套进程打开文件枚举
+ *  与 `codexGenerationSessionIdFromRolloutPath` 提取 sid：这些 fd 已确定属于
+ *  一个 Codex 进程，所以这里可以识别 Codex 的 generation 后缀；严格的
+ *  {@link codexSessionIdFromRolloutPath} 只服务跨 CLI 歧义守卫，不在此链路。 */
 export function findCodexRolloutByPid(pid: number): CodexRolloutRef | undefined {
   const targets = listProcessOpenFiles(pid);
   if (!targets) return undefined;
@@ -148,15 +204,27 @@ function matchCodexRolloutPath(target: string): CodexRolloutRef | undefined {
   // env-independent structural shape: a `sessions/` path segment plus the
   // distinctive `rollout-<ts>-<uuid>.jsonl` filename (validated below).
   if (!/(^|\/)sessions\//.test(target)) return undefined;
-  const sid = codexSessionIdFromRolloutPath(target);
+  // These fds belong to a Codex process, so a `_<uuid>` suffix here is a real
+  // Codex resumed generation — use the Codex-scoped parser. The strict
+  // codexSessionIdFromRolloutPath (which rejects that suffix because the same
+  // shape is a TRAE segment, #1854) is intentionally not used on this
+  // Codex-owned path; it exists only to pin the cross-CLI guard in tests.
+  const sid = codexGenerationSessionIdFromRolloutPath(target);
   if (!sid) return undefined;
   return { path: target, cliSessionId: sid };
 }
 
 export interface CodexBridgeEvent {
   /** Synthetic uuid for dedup: `<absPath>:<byteOffset>` of the line start.
-   *  Stable across re-drains because rollout files are append-only. */
+   *  Stable across re-drains because rollout files are append-only. The
+   *  cross-generation bridge rewrites this to a content id (see
+   *  codex-rollout-replay) using {@link rawId}. */
   uuid: string;
+  /** Hash of the originating raw rollout line. Identical for a record
+   *  copied verbatim into a resumed generation file, independent of byte
+   *  offset and of parse-time timestamp fallbacks. Absent only for events
+   *  synthesized without a single backing record. */
+  rawId?: string;
   /** Wall-clock ms parsed from the event's `timestamp` field. Falls back
    *  to Date.now() if missing/unparseable so the gate's window math still
    *  has something to compare against. */
@@ -171,8 +239,13 @@ export interface CodexBridgeEvent {
    *     without starting, closing, or otherwise advancing the queue
    *   - 'cot' is a cosmetic mid-turn record (reasoning / tool call / tool
    *     output) attributed to the collecting turn for the CoT message; it
-   *     never starts or closes a turn */
-  kind: 'user' | 'turn_started' | 'assistant_final' | 'turn_aborted' | 'turn_bind' | 'cot';
+   *     never starts or closes a turn
+   *   - 'input_queued' (Pi) says the CLI accepted the next input while busy
+   *     and holds it until its current work ends; the head keeps its place
+   *     instead of expiring, but is NOT started (the running work is not it)
+   *   - 'cli_settled' (Pi) says the CLI finished all queued work; a head
+   *     still held by it was not taken up and resumes its normal lease */
+  kind: 'user' | 'turn_started' | 'assistant_final' | 'turn_aborted' | 'turn_bind' | 'cot' | 'input_queued' | 'cli_settled';
   /** Concatenated text from the message's content blocks (input_text for
    *  user, output_text for assistant). Empty for 'cot' events. */
   text: string;
@@ -197,6 +270,10 @@ export interface CodexBridgeEvent {
    *  can use it to bind cosmetic/terminal events to the exact started turn
    *  instead of relying solely on whichever turn is currently collecting. */
   sourceTurnId?: string;
+  /** Identity of a genuine native user message. TRAE can accept several
+   * messages into one running turn; different message ids are real steering
+   * inputs, while mirrors of the same message must remain idempotent. */
+  sourceMessageId?: string;
   /** The transcript parser has positive evidence that this user record starts
    * a distinct native turn while an older id-less turn remains open. */
   preserveCollecting?: boolean;
@@ -836,11 +913,25 @@ export interface CodexDrainResult {
    *  `nextOffset` binds the turn lower bound to the exact cursor it follows,
    *  so truncation or an unrelated seek cannot reuse stale state. */
   state?: CodexDrainState;
+  /** Background tasks the CLI started or saw stop in this byte range. Only a
+   *  drainer whose CLI runs background tasks sets it (Grok). */
+  backgroundTasks?: BackgroundTaskSignals;
+}
+
+/** Background-task changes read from a structured transcript. `atMs` is when
+ *  the launch was written, so a launch replayed from an earlier CLI process
+ *  can be told apart from a live one. */
+export interface BackgroundTaskSignals {
+  launched: Array<{ taskId: string; kind: 'shell' | 'monitor'; atMs: number }>;
+  settled: string[];
 }
 
 export interface CodexDrainState {
   nextOffset: number;
   turnStartOffset: number;
+  activeNativeTurnId?: string;
+  sourceSessionId?: string;
+  sourcePath?: string;
 }
 
 /** Model / reasoning-effort pair read from a rollout's `turn_context` record. */
@@ -882,17 +973,89 @@ export function runtimeFromTurnContext(obj: any): RolloutRuntimeSnapshot | undef
   };
 }
 
-/** Locate the rollout file for a given Codex sessionId. Codex names files
- *  `rollout-<ts>-<sid>.jsonl`, so a suffix match is unambiguous. The
- *  directory tree is small (year/month/day) — a one-shot recursive scan
- *  is cheap enough that we don't bother caching. */
+/** A session_meta header can carry large base_instructions; read the first
+ *  line in chunks up to this cap rather than a fixed 64 KiB window. */
+const SESSION_META_HEADER_MAX_BYTES = 1024 * 1024;
+
+/** Result of inspecting a rollout's first line:
+ *  - verified + sid: first line is a session_meta row with that id
+ *  - verified + null: first line is fully readable but is not a session_meta id
+ *  - unverified: no complete first line could be read (missing, being
+ *    written, larger than the cap, symlink refusal, IO/parse error). Callers
+ *    that need positive identification must treat unverified as untrusted. */
+type RolloutHeaderCheck = { verified: true; sid: string | null } | { verified: false };
+
+function rolloutHeaderCheck(path: string, noFollow = false): RolloutHeaderCheck {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | (noFollow ? constants.O_NOFOLLOW : 0));
+    if (!fstatSync(fd).isFile()) return { verified: false };
+    const chunks: Buffer[] = [];
+    let total = 0;
+    let complete = false;
+    while (total < SESSION_META_HEADER_MAX_BYTES) {
+      const chunk = Buffer.alloc(64 * 1024);
+      const count = readSync(fd, chunk, 0, chunk.length, total);
+      if (count === 0) break;
+      const nl = chunk.subarray(0, count).indexOf(0x0a);
+      if (nl >= 0) {
+        chunks.push(chunk.subarray(0, nl));
+        complete = true;
+        break;
+      }
+      chunks.push(chunk.subarray(0, count));
+      total += count;
+      if (count < chunk.length) break; // EOF
+    }
+    // Codex records are newline-terminated; a file without a complete first
+    // line is still being written (or exceeds the cap) — unverifiable, not an
+    // absent meta row.
+    if (!complete) return { verified: false };
+    let row: any;
+    try { row = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { return { verified: false }; }
+    return {
+      verified: true,
+      sid: row?.type === 'session_meta' && typeof row.payload?.id === 'string'
+        ? row.payload.id
+        : null,
+    };
+  } catch { return { verified: false }; }
+  finally { if (fd !== undefined) closeSync(fd); }
+}
+
+function indexedCodexRollout(home: string, sessionsRoot: string, sid: string): string | undefined {
+  const dbPath = join(home, 'state_5.sqlite');
+  if (!existsSync(dbPath)) return undefined;
+  const db = openDatabaseSyncNow(dbPath, { readOnly: true });
+  if (!db) return undefined;
+  try {
+    const row = db.prepare('SELECT rollout_path FROM threads WHERE id = ?').get(sid) as { rollout_path?: unknown } | undefined;
+    const path = row?.rollout_path;
+    if (typeof path !== 'string' || !isAbsolute(path)
+      || codexGenerationSessionIdFromRolloutPath(path)?.toLowerCase() !== sid.toLowerCase()) return undefined;
+    const rel = relative(realpathSync(sessionsRoot), realpathSync(path));
+    if (!rel || rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return undefined;
+    if (!statSync(path).isFile()) return undefined;
+    // The index is only trusted when the pointed file positively identifies
+    // the session: a missing/partial/oversized first line is unverifiable and
+    // fails closed, same as a readable foreign session_meta id.
+    const header = rolloutHeaderCheck(path);
+    if (!header.verified || header.sid?.toLowerCase() !== sid.toLowerCase()) return undefined;
+    return path;
+  } catch { return undefined; }
+  finally { db.close(); }
+}
+
+/** Prefer Codex's exact thread index: resumed sessions can have several
+ * generations named rollout-<ts>-<sid>[_<generation>].jsonl. Without an index,
+ * choose the latest generation by filename creation order, never by mtime
+ * (copying/touching an old rollout must not make it active again). */
 export function findCodexRolloutBySessionId(
   cliSessionId: string,
   opts?: { codexHome?: string; noFollow?: boolean },
 ): string | undefined {
-  const sessionsRoot = opts?.codexHome
-    ? join(opts.codexHome, 'sessions')
-    : codexSessionsRoot();
+  const home = opts?.codexHome ?? codexHome();
+  const sessionsRoot = join(home, 'sessions');
   if (!cliSessionId) return undefined;
   try {
     // BOT_HOME is untrusted and requires no-follow roots. A normal CODEX_HOME
@@ -903,7 +1066,11 @@ export function findCodexRolloutBySessionId(
   } catch {
     return undefined;
   }
-  const suffix = `-${cliSessionId}.jsonl`;
+  // SQLite opens sidecars itself; no-follow BOT_HOME lookups deliberately use
+  // the bounded scan instead of trusting database/sidecar symlink traversal.
+  const indexed = opts?.noFollow ? undefined : indexedCodexRollout(home, sessionsRoot, cliSessionId);
+  if (indexed) return indexed;
+  let newest: string | undefined;
   const stack: Array<{ dir: string; depth: number }> = [{ dir: sessionsRoot, depth: 0 }];
   let visitedEntries = 0;
   while (stack.length > 0) {
@@ -941,10 +1108,31 @@ export function findCodexRolloutBySessionId(
           if (!opts?.noFollow || depth < UNTRUSTED_SESSION_SCAN_MAX_DEPTH) {
             stack.push({ dir: full, depth: depth + 1 });
           }
-        } else if (isFile && entry.name.endsWith(suffix)) {
+        } else if (isFile) {
+          // Keep the historical suffix contract for the canonical
+          // `-<sid>.jsonl` name (any sid shape, not only UUIDs); generation
+          // files (`-<sid>_<gen>.jsonl`) match through the UUID parser.
+          const canonicalSuffix = entry.name.endsWith(`-${cliSessionId}.jsonl`);
+          const sidInName = codexGenerationSessionIdFromRolloutPath(entry.name)?.toLowerCase() === cliSessionId.toLowerCase();
+          if (!canonicalSuffix && !sidInName) continue;
           try {
             const fileStat = opts?.noFollow ? lstatSync(full) : statSync(full);
-            if (fileStat.isFile()) return full;
+            if (!fileStat.isFile()) continue;
+            const header = rolloutHeaderCheck(full, opts?.noFollow);
+            if (header.verified) {
+              // A readable, positively foreign first line rejects the file
+              // whatever its name says. A readable non-meta first line is
+              // neutral: the name remains the evidence (fixtures and
+              // mid-creation files may not start with session_meta).
+              if (header.sid && header.sid.toLowerCase() !== cliSessionId.toLowerCase()) continue;
+            } else if (codexRolloutNameHasGeneration(entry.name)) {
+              // Several generations can share one sid; a candidate whose
+              // session_meta cannot be verified (missing/oversized first
+              // line, no-follow symlink) must not be selected. The canonical
+              // suffix name predates generations and stays name-trusted.
+              continue;
+            }
+            if (!newest || entry.name > basename(newest)) newest = full;
           } catch {
             continue;
           }
@@ -954,7 +1142,7 @@ export function findCodexRolloutBySessionId(
       try { directory.closeSync(); } catch { /* already closed */ }
     }
   }
-  return undefined;
+  return newest;
 }
 
 function codexHistoryCliSessionId(parsed: unknown): string | undefined {
@@ -1110,6 +1298,35 @@ function precedingTurnStartOffset(path: string, beforeOffset: number): number {
   } catch {
     return 0;
   }
+  return result;
+}
+
+/** Recover native execution context for a cold seek into a running rollout.
+ * Live drains carry it in their cursor state, so ordinary polling never
+ * rescans a growing transcript. Missing bounded evidence stays unattributed. */
+function precedingNativeTurn(path: string, beforeOffset: number): { turnId: string; offset: number } | undefined {
+  let result: { turnId: string; offset: number } | undefined;
+  try {
+    scanJsonlBackward(path, {
+      endOffset: beforeOffset,
+      floor: Math.max(0, beforeOffset - CODEX_RUNTIME_SCAN_MAX_BYTES),
+      dropPartialAtFloor: true,
+      onLine: (line, offset) => {
+        let obj: any;
+        try { obj = JSON.parse(line.toString('utf8')); } catch { return false; }
+        const p = obj?.payload;
+        if (obj?.type !== 'event_msg') return false;
+        if (p?.type === 'task_complete' || p?.type === 'turn_aborted') {
+          // Any terminal ends the preceding execution, even when Codex
+          // abandoned its start id and completed under a replacement id.
+          return true;
+        }
+        if (p?.type !== 'task_started' || typeof p.turn_id !== 'string' || !p.turn_id) return false;
+        result = { turnId: p.turn_id, offset };
+        return true;
+      },
+    });
+  } catch { /* no native proof */ }
   return result;
 }
 
@@ -1348,7 +1565,7 @@ function wrapperContainsCommand(input: string, command: string): boolean {
  * outer exec wrappers so native CommandExecution can replace only the exact
  * exec_command it represents. Non-command tools and unmatched commands are
  * restored at the terminal boundary. */
-type TerminalExecEntry = { offset: number; timestampMs: number; payload: any; type: string };
+type TerminalExecEntry = { offset: number; timestampMs: number; payload: any; type: string; rawId: string };
 
 function terminalExecFallbacks(
   path: string,
@@ -1372,7 +1589,7 @@ function terminalExecFallbacks(
           ))
             || (obj?.type === 'event_msg' && p?.type === 'item_completed')) {
             const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
-            relevant.push({ offset, timestampMs: Number.isFinite(ts) ? ts : Date.now(), payload: p, type: obj.type });
+            relevant.push({ offset, timestampMs: Number.isFinite(ts) ? ts : Date.now(), payload: p, type: obj.type, rawId: codexRolloutLineId(line) });
           }
         },
       });
@@ -1382,7 +1599,7 @@ function terminalExecFallbacks(
   }
 
   const calls: Array<{
-    id: string; name: string; input: string; output?: string; outputOffset?: number; outputTimestampMs?: number;
+    id: string; name: string; input: string; output?: string; outputOffset?: number; outputTimestampMs?: number; outputRawId?: string;
   }> = [];
   const nativeCommands: Array<{ id?: string; candidates: string[] }> = [];
   const orderedRelevant = knownRelevant ? relevant : relevant.reverse();
@@ -1402,6 +1619,7 @@ function terminalExecFallbacks(
         call.output = stringifyCodexToolOutput(p.output);
         call.outputOffset = entry.offset;
         call.outputTimestampMs = entry.timestampMs;
+        call.outputRawId = entry.rawId;
       }
     } else if (entry.type === 'event_msg' && p.type === 'item_completed') {
       if (p.item?.type === 'CommandExecution') {
@@ -1447,7 +1665,7 @@ function terminalExecFallbacks(
       },
     ]);
     return [{
-      uuid: `${path}:${call.outputOffset}`, timestampMs: call.outputTimestampMs ?? Date.now(),
+      uuid: `${path}:${call.outputOffset}`, rawId: call.outputRawId, timestampMs: call.outputTimestampMs ?? Date.now(),
       kind: 'cot' as const, text: '', cotEntries,
     }];
   });
@@ -1469,6 +1687,7 @@ export function drainCodexRollout(
   const reusableState = !step.reset && previousState?.nextOffset === start
     && previousState.turnStartOffset >= 0
     && previousState.turnStartOffset <= start
+    && (previousState.sourcePath === undefined || previousState.sourcePath === path)
     ? previousState
     : undefined;
   if (step.kind === 'idle') {
@@ -1498,6 +1717,9 @@ export function drainCodexRollout(
     return turnStartOffset;
   };
   const turnExecEntries: TerminalExecEntry[] = [];
+  let activeNativeTurnId = reusableState?.activeNativeTurnId;
+  let nativeContextKnown = start === 0 || reusableState?.activeNativeTurnId !== undefined;
+  let sourceSessionId = reusableState?.sourceSessionId;
   // Walk lines with their byte offsets so synthetic uuids are stable across
   // re-drains.
   for (const { line, lineStart, lineEnd } of iterateJsonlLines(completeText, start)) {
@@ -1519,8 +1741,10 @@ export function drainCodexRollout(
     }
     const p = obj?.payload;
     if (!p || typeof p !== 'object') continue;
+    if (obj.type === 'session_meta' && typeof p.id === 'string' && p.id) sourceSessionId = p.id;
     const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
+    const lineId = codexRolloutLineId(line);
     const subagentThreadId = spawnedSubagentThreadId(obj);
     if (subagentThreadId) spawnedSubagents.push({ threadId: subagentThreadId, startedAtMs: timestampMs });
     // Codex can persist task_started well before the matching response_item
@@ -1531,12 +1755,21 @@ export function drainCodexRollout(
       && p.type === 'task_started'
       && typeof p.turn_id === 'string'
       && p.turn_id.length > 0) {
+      activeNativeTurnId = p.turn_id;
+      nativeContextKnown = true;
+      turnStartOffset ??= lineStart;
+      if (!sourceSessionId && start > 0) {
+        const header = rolloutHeaderCheck(path);
+        if (header.verified && header.sid) sourceSessionId = header.sid;
+      }
       events.push({
         uuid: `${path}:${lineStart}`,
         timestampMs,
         kind: 'turn_started',
         text: '',
         sourceTurnId: p.turn_id,
+        ...(sourceSessionId ? { sourceSessionId } : {}),
+        rawId: lineId,
       });
       continue;
     }
@@ -1544,7 +1777,7 @@ export function drainCodexRollout(
       p.type === 'custom_tool_call' || p.type === 'custom_tool_call_output'
       || p.type === 'function_call' || p.type === 'function_call_output'
     )) || (obj.type === 'event_msg' && p.type === 'item_completed')) {
-      turnExecEntries.push({ offset: lineStart, timestampMs, payload: p, type: obj.type });
+      turnExecEntries.push({ offset: lineStart, timestampMs, payload: p, type: obj.type, rawId: lineId });
     }
     // User turn-start: response_item message role=user. Stable across every
     // codex version, and the ONLY event the RPC rollout-match probe reads
@@ -1554,7 +1787,22 @@ export function drainCodexRollout(
       const text = joinTextBlocks(p.content, 'input_text');
       if (!text) continue;
       if (isCodexEnvironmentUpdate(p.internal_chat_message_metadata_passthrough, text)) continue;
-      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
+      if (!nativeContextKnown) {
+        const native = precedingNativeTurn(path, start);
+        activeNativeTurnId = native?.turnId;
+        // Keep the proof in incremental cursor state even when this cold
+        // range contains only user records and no terminal/tool output.
+        if (native) turnStartOffset ??= native.offset;
+        nativeContextKnown = true;
+      }
+      if (activeNativeTurnId && !sourceSessionId && start > 0) {
+        const header = rolloutHeaderCheck(path);
+        if (header.verified && header.sid) sourceSessionId = header.sid;
+      }
+      events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'user', text,
+        ...(activeNativeTurnId ? { sourceTurnId: activeNativeTurnId, sourceMessageId: lineId } : {}),
+        ...(sourceSessionId ? { sourceSessionId } : {}),
+      });
       continue;
     }
     // Mid-turn thinking timeline: reasoning summaries and tool calls/outputs
@@ -1579,7 +1827,7 @@ export function drainCodexRollout(
       }
       const cotEntries = codexCotEntriesFromResponseItem(p);
       if (cotEntries.length > 0) {
-        events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'cot', text: '', cotEntries });
+        events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'cot', text: '', cotEntries });
         continue;
       }
     }
@@ -1598,7 +1846,21 @@ export function drainCodexRollout(
         .join('\n');
       const output = formatted || aggregated || streams;
       cotEntries.push({ kind: 'tool_result', id, result: truncateForCot(output, COT_TOOL_RESULT_MAX_CHARS) });
-      events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'cot', text: '', cotEntries });
+      events.push({ uuid: `${path}:${lineStart}`, rawId: lineId, timestampMs, kind: 'cot', text: '', cotEntries });
+      continue;
+    }
+    // A terminal without native identity cannot safely settle a queued turn.
+    // It still ends the parser's attribution evidence, matching cold seeks:
+    // later id-less inputs must not borrow the preceding execution's receipt.
+    if (obj.type === 'event_msg'
+      && (p.type === 'task_complete' || p.type === 'turn_aborted')
+      && (typeof p.turn_id !== 'string' || p.turn_id.length === 0)) {
+      activeNativeTurnId = undefined;
+      nativeContextKnown = true;
+      turnStartOffset = lineEnd;
+      turnFullyCovered = true;
+      turnExecEntries.length = 0;
+      toolCallDeferralById.clear();
       continue;
     }
     // Turn terminal: event_msg `task_complete` carries the final visible text
@@ -1628,6 +1890,7 @@ export function drainCodexRollout(
       ));
       events.push({
         uuid: `${path}:${lineStart}`,
+        rawId: lineId,
         timestampMs,
         kind: 'assistant_final',
         text: typeof p.last_agent_message === 'string' ? p.last_agent_message : '',
@@ -1638,7 +1901,10 @@ export function drainCodexRollout(
           ...(failureLimitKind ? { terminalLimitKind: failureLimitKind } : {}),
         } : {}),
         sourceTurnId: p.turn_id,
+        ...(sourceSessionId ? { sourceSessionId } : {}),
       });
+      activeNativeTurnId = undefined;
+      nativeContextKnown = true;
       turnStartOffset = lineEnd;
       turnFullyCovered = true;
       turnExecEntries.length = 0;
@@ -1663,13 +1929,17 @@ export function drainCodexRollout(
       ));
       events.push({
         uuid: `${path}:${lineStart}`,
+        rawId: lineId,
         timestampMs,
         kind: 'assistant_final',
         text: '',
         terminalStatus: 'ambiguous',
         terminalErrorCode: codexAbortErrorCode(p.reason),
         sourceTurnId: p.turn_id,
+        ...(sourceSessionId ? { sourceSessionId } : {}),
       });
+      activeNativeTurnId = undefined;
+      nativeContextKnown = true;
       turnStartOffset = lineEnd;
       turnFullyCovered = true;
       turnExecEntries.length = 0;
@@ -1690,7 +1960,11 @@ export function drainCodexRollout(
     latestReasoningEffort,
     ...(spawnedSubagents.length > 0 ? { spawnedSubagents } : {}),
     ...(turnStartOffset !== undefined ? {
-      state: { nextOffset: newOffset, turnStartOffset },
+      state: { nextOffset: newOffset, turnStartOffset,
+        ...(activeNativeTurnId ? { activeNativeTurnId } : {}),
+        ...(sourceSessionId ? { sourceSessionId } : {}),
+        ...(activeNativeTurnId || sourceSessionId ? { sourcePath: path } : {}),
+      },
     } : {}),
   };
 }

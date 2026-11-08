@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
 import type { VcMeetingDeliveryRequest } from '../src/services/vc-meeting-delivery-protocol.js';
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
@@ -8,8 +7,6 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 });
 
 import { __testOnly_vcMeetingReceiverRecovery as recovery } from '../src/daemon.js';
-
-const daemonSource = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
 
 function delivery(sessionId: string, memberId: string): VcMeetingDeliveryRequest {
   return {
@@ -148,32 +145,6 @@ describe('VC meeting receiver boot-recovery lifecycle', () => {
       ['sess_retire', 'delivery_retire', 5],
     ]);
     expect(recovery.snapshot(key)).toMatchObject({ ready: true, pending: false, timerArmed: false });
-  });
-
-  it('keeps the boot gate pending when reset IPC send throws', () => {
-    const failureLog = daemonSource.indexOf('failed to fence boot-ambiguous receiver');
-    expect(failureLog).toBeGreaterThanOrEqual(0);
-    const catchBlock = daemonSource.slice(failureLog, failureLog + 500);
-    expect(catchBlock).toContain('escalateVcMeetingBootRecovery(recoveryKey, ref.receiverSessionId)');
-    expect(catchBlock).not.toContain('clearVcMeetingReceiverRecoveryPending(recoveryKey)');
-  });
-
-  it('Plan B: boot-recovery eligibility is ledger-derived (ambiguous delivery receipts), not a session-marker scan', () => {
-    // Under Plan B the meeting agent is an ordinary chat-scope session, so the
-    // vcMeetingReceiver marker can no longer be the recovery predicate — a plain
-    // user turn carries the marker too. The recovery loop must iterate the
-    // reconciled delivery ledger (ambiguousOnBoot), which only ever contains
-    // stale durable delivery receipts, so a session that only ever ran plain user
-    // turns (no ledger receipt) is never fenced at boot.
-    const bootIdx = daemonSource.indexOf('const ambiguousOnBoot = reconcileVcMeetingDeliveriesOnBoot(');
-    expect(bootIdx).toBeGreaterThanOrEqual(0);
-    const loopIdx = daemonSource.indexOf('for (const ref of ambiguousOnBoot) {');
-    expect(loopIdx).toBeGreaterThan(bootIdx);
-    // The loop resolves the live session by sessionId (works regardless of the
-    // now-ordinary activeSessions key) and verifies the meeting identity — it does
-    // NOT scan sessions by the vcMeetingReceiver marker to decide eligibility.
-    const loopBlock = daemonSource.slice(loopIdx, loopIdx + 400);
-    expect(loopBlock).toContain('findActiveBySessionId(ref.receiverSessionId)');
   });
 
   it('Plan B: a session with no durable delivery receipt is not boot-recovery blocked', () => {

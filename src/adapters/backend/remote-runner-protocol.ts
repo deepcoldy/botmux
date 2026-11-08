@@ -31,6 +31,7 @@ export const REMOTE_RUNNER_TERMINAL_CAPABILITIES = [
 export const REMOTE_RUNNER_OUTBOUND_CAPABILITIES = [
   'outbound_message',
   'outbound_message_explicit_mention',
+  'outbound_message_final',
 ] as const;
 
 /** Optional provider-to-host access to a small BotMux session tool surface.
@@ -94,6 +95,9 @@ export interface RemoteRunnerUsageSnapshot {
   tokens: {
     in: number;
     out: number;
+    /** Optional cumulative cache reads / writes, both subsets of `in`. */
+    cacheReadTokens?: number;
+    cacheCreateTokens?: number;
   } | null;
   turnTokens?: {
     in: number;
@@ -117,6 +121,26 @@ export interface RemoteRunnerTrustedCaller {
   source?: 'schedule_creator' | 'failed_turn_recovery';
   taskId?: string;
   senderType?: 'user' | 'bot';
+  botOwner?: {
+    openId: string;
+    unionId: string;
+    email: string;
+    source: 'bot_config';
+  };
+}
+
+export function projectRemoteRunnerTrustedCaller(
+  caller: RemoteRunnerTrustedCaller & Record<string, unknown>,
+): RemoteRunnerTrustedCaller {
+  return {
+    ...(caller.requestUserOpenId ? { requestUserOpenId: caller.requestUserOpenId } : {}),
+    ...(caller.requestUserUnionId ? { requestUserUnionId: caller.requestUserUnionId } : {}),
+    ...(caller.requestLarkAppId ? { requestLarkAppId: caller.requestLarkAppId } : {}),
+    ...(caller.source ? { source: caller.source } : {}),
+    ...(caller.taskId ? { taskId: caller.taskId } : {}),
+    ...(caller.senderType ? { senderType: caller.senderType } : {}),
+    ...(caller.botOwner ? { botOwner: { ...caller.botOwner } } : {}),
+  };
 }
 
 export interface RemoteRunnerRecoveredTurn {
@@ -127,7 +151,7 @@ export interface RemoteRunnerRecoveredTurn {
   trustedCaller?: RemoteRunnerTrustedCaller;
 }
 
-export type RemoteRunnerOutboundResponseKind = 'progress' | 'auxiliary';
+export type RemoteRunnerOutboundResponseKind = 'progress' | 'auxiliary' | 'final';
 export type RemoteRunnerOutboundMention = 'none' | 'requester' | 'explicit';
 
 export interface RemoteRunnerOutboundImage {
@@ -136,9 +160,10 @@ export interface RemoteRunnerOutboundImage {
   dataBase64: string;
 }
 
-/** A non-terminal message request emitted by a provider for the active turn.
- * Routing is intentionally absent: BotMux derives the only legal destination
- * from the authenticated session/turn that owns the backend. */
+/** A message request emitted by a provider for the active turn. Routing is
+ * intentionally absent: BotMux derives the only legal destination from the
+ * authenticated session/turn that owns the backend. `final` additionally
+ * requires bilateral `outbound_message_final` negotiation. */
 export interface RemoteRunnerOutboundMessage {
   operationId: string;
   turnId: string;
@@ -196,6 +221,7 @@ export type RemoteRunnerSessionToolRequest =
   | {
       tool: 'schedule.update';
       taskId: string;
+      schedule?: string;
       prompt?: string;
       calendar?: string | null;
       calendarDayType?: 'workday' | 'restday';
@@ -350,7 +376,7 @@ export type RemoteRunnerEvent =
       generation: number;
       request: RemoteRunnerSessionToolRequest;
       /** Effective human Actor selected by a trusted provider policy for a
-       * bot-authored schedule.add turn. The host freezes all other scope. */
+       * bot-authored schedule mutation. The host freezes all other scope. */
       controllerOpenId?: string;
     })
   | (RemoteRunnerEventBase & {
@@ -398,6 +424,12 @@ const PROVIDER_RE = /^[a-z][a-z0-9._-]{0,63}$/;
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
 const REQUEST_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const ERROR_CODE_RE = /^[a-z][a-z0-9._-]{0,127}$/;
+const CLI_FLAG_SHAPED_VALUE_RE = /^--?\w/;
+
+export function isCliFlagShapedRemoteRunnerValue(value: string): boolean {
+  return CLI_FLAG_SHAPED_VALUE_RE.test(value.trim());
+}
+
 export const MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES = 32 * 1024;
 export const MAX_REMOTE_RUNNER_OUTBOUND_IMAGES = 4;
 export const MAX_REMOTE_RUNNER_OUTBOUND_IMAGE_BYTES = 2 * 1024 * 1024;
@@ -497,6 +529,17 @@ function nonNegativeInteger(value: unknown): number | undefined {
   return Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : undefined;
 }
 
+function normalizeBotOwner(value: unknown): RemoteRunnerTrustedCaller['botOwner'] | undefined | null {
+  if (value === undefined) return undefined;
+  const raw = record(value);
+  const openId = nonEmptyString(raw?.openId, 256);
+  const unionId = nonEmptyString(raw?.unionId, 256);
+  const email = nonEmptyString(raw?.email, 320)?.toLowerCase();
+  if (!raw || !openId?.startsWith('ou_') || !unionId?.startsWith('on_')
+      || !email || !email.includes('@') || raw.source !== 'bot_config') return null;
+  return { openId, unionId, email, source: 'bot_config' };
+}
+
 function normalizeRecoveredTurn(value: unknown): RemoteRunnerRecoveredTurn | undefined {
   const raw = record(value);
   if (!raw) return undefined;
@@ -517,9 +560,17 @@ function normalizeRecoveredTurn(value: unknown): RemoteRunnerRecoveredTurn | und
     const caller = record(raw.trustedCaller);
     const openId = nonEmptyString(caller?.requestUserOpenId, 256);
     const appId = nonEmptyString(caller?.requestLarkAppId, 256);
-    if (!caller || !openId || !appId || !['user', 'bot'].includes(String(caller.senderType))) {
+    const botOwner = normalizeBotOwner(caller?.botOwner);
+    if (!caller || !openId || !appId || !['user', 'bot'].includes(String(caller.senderType))
+      || botOwner === null || (botOwner !== undefined && caller.senderType !== 'bot')) {
       return undefined;
     }
+    // botOwner is host-attested: the daemon mints it only for an outbound turn
+    // command after roster + Contact API verification. A provider reporting it
+    // back inside recoveredTurn cannot be the source of truth, so the field is
+    // validated above (malformed shapes still reject the event) but never
+    // carried into the recovered caller. The next outbound turn command sends a
+    // freshly attested owner; host-side authorization never reads the field.
     trustedCaller = {
       requestUserOpenId: openId,
       requestLarkAppId: appId,
@@ -542,6 +593,22 @@ function normalizeTokenPair(value: unknown): { in: number; out: number } | undef
   const output = nonNegativeInteger(raw.out);
   if (input === undefined || output === undefined) return undefined;
   return { in: input, out: output };
+}
+
+/** Cumulative tokens: the in/out pair plus optional cache counters. A cache
+ *  counter that is present must be a non-negative integer no larger than `in`;
+ *  otherwise the whole snapshot is rejected, like any other malformed metric. */
+function normalizeCumulativeTokens(value: unknown): RemoteRunnerUsageSnapshot['tokens'] | undefined {
+  const tokens: RemoteRunnerUsageSnapshot['tokens'] | undefined = normalizeTokenPair(value);
+  if (!tokens) return undefined;
+  const raw = record(value)!;
+  for (const key of ['cacheReadTokens', 'cacheCreateTokens'] as const) {
+    if (raw[key] === undefined) continue;
+    const count = nonNegativeInteger(raw[key]);
+    if (count === undefined || count > tokens.in) return undefined;
+    tokens[key] = count;
+  }
+  return tokens;
 }
 
 export function normalizeRemoteRunnerUsageReport(
@@ -582,7 +649,7 @@ export function normalizeRemoteRunnerUsageReport(
   if (snapshotRaw.tokens === null) {
     tokens = null;
   } else {
-    tokens = normalizeTokenPair(snapshotRaw.tokens) ?? null;
+    tokens = normalizeCumulativeTokens(snapshotRaw.tokens) ?? null;
     if (tokens === null) return undefined;
   }
 
@@ -839,9 +906,10 @@ export function normalizeRemoteRunnerSessionToolRequest(
   }
 
   if (raw.tool === 'schedule.update') {
-    const allowed = new Set(['tool', 'taskId', 'prompt', 'calendar', 'calendarDayType']);
+    const allowed = new Set(['tool', 'taskId', 'schedule', 'prompt', 'calendar', 'calendarDayType']);
     if (Object.keys(raw).some(key => !allowed.has(key))) return undefined;
     const taskId = boundedUtf8String(raw.taskId, 8, true);
+    const schedule = raw.schedule === undefined ? undefined : boundedUtf8String(raw.schedule, 256, true);
     const prompt = raw.prompt === undefined ? undefined : boundedUtf8String(raw.prompt, 32 * 1024);
     const calendar = raw.calendar === undefined || raw.calendar === null
       ? raw.calendar
@@ -850,15 +918,17 @@ export function normalizeRemoteRunnerSessionToolRequest(
       ? undefined
       : String(raw.calendarDayType);
     if (!taskId || !SCHEDULE_TASK_ID_RE.test(taskId)
+      || (raw.schedule !== undefined && !schedule)
       || (raw.prompt !== undefined && !prompt)
       || (raw.calendar !== undefined && raw.calendar !== null && !calendar)
       || (calendarDayType !== undefined && !['workday', 'restday'].includes(calendarDayType))
-      || (prompt === undefined && raw.calendar === undefined && calendarDayType === undefined)) {
+      || (schedule === undefined && prompt === undefined && raw.calendar === undefined && calendarDayType === undefined)) {
       return undefined;
     }
     return {
       tool: 'schedule.update',
       taskId,
+      ...(schedule !== undefined ? { schedule } : {}),
       ...(prompt !== undefined ? { prompt } : {}),
       ...(raw.calendar !== undefined ? { calendar: calendar as string | null } : {}),
       ...(calendarDayType ? { calendarDayType: calendarDayType as 'workday' | 'restday' } : {}),
@@ -942,7 +1012,10 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
       : (Array.isArray(raw.mentions)
         && raw.mentions.length > 0
         && raw.mentions.every(value => (
-          typeof value === 'string' && value.trim() !== '' && !value.includes('\0')
+          typeof value === 'string'
+          && value.trim() !== ''
+          && !value.includes('\0')
+          && !isCliFlagShapedRemoteRunnerValue(value)
         ))
         && Buffer.byteLength(raw.mentions.join('\0'), 'utf8')
           <= MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES
@@ -959,7 +1032,7 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
         || typeof raw.content !== 'string'
         || !raw.content.trim()
         || Buffer.byteLength(raw.content, 'utf8') > MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES
-        || !['progress', 'auxiliary'].includes(String(raw.responseKind))
+        || !['progress', 'auxiliary', 'final'].includes(String(raw.responseKind))
         || !mentionShapeValid
         || images === undefined) {
       return undefined;

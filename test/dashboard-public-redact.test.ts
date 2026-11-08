@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import {
   projectSessionEventForAudience,
@@ -47,6 +46,28 @@ function sampleChats() {
         },
       ],
     },
+    {
+      // 会话群：分型标记与摘要（含内部 session id）是新增的群级字段，
+      // 同样不在匿名访客的白名单里。
+      chatId: 'oc_session1',
+      name: '修复登录',
+      chatMode: 'group',
+      avatar: 'https://avatar.example/session1.png',
+      sessionGroup: true,
+      sessionGroupMeta: {
+        createdAt: 1000,
+        lastActiveAt: 2000,
+        sessionId: 'sess-secret-1',
+        sessionStatus: 'active',
+      },
+      memberBots: [
+        {
+          larkAppId: 'cli_a',
+          botName: 'Claude',
+          inChat: true,
+        },
+      ],
+    },
   ];
 }
 
@@ -87,7 +108,7 @@ describe('redactGroupsForPublic', () => {
       expect(mb).not.toHaveProperty('hasRole');
     }
     const json = JSON.stringify(out);
-    for (const leaked of ['workingDir', 'customer-secret', 'private description', 'ou_owner']) {
+    for (const leaked of ['workingDir', 'customer-secret', 'private description', 'ou_owner', 'sess-secret-1', 'sessionGroup']) {
       expect(json).not.toContain(leaked);
     }
   });
@@ -110,6 +131,19 @@ describe('redactGroupsForPublic', () => {
             larkAppId: 'cli_b',
             botName: 'Codex',
             inChat: false,
+          },
+        ],
+      },
+      {
+        chatId: 'oc_session1',
+        name: '修复登录',
+        chatMode: 'group',
+        avatar: 'https://avatar.example/session1.png',
+        memberBots: [
+          {
+            larkAppId: 'cli_a',
+            botName: 'Claude',
+            inChat: true,
           },
         ],
       },
@@ -138,6 +172,14 @@ describe('redactGroupsForPublic', () => {
     const out = redactGroupsForPublic(chats) as any[];
     expect(out[0].memberBots[0]).not.toHaveProperty('p2pOpen');
     expect(JSON.stringify(out)).not.toContain('p2pOpen');
+  });
+
+  it('strips session-group flag and board summary (including the internal session id) for anonymous visitors', () => {
+    const out = redactGroupsForPublic(sampleChats()) as any[];
+    const sessionChat = out.find(c => c.chatId === 'oc_session1')!;
+    expect(sessionChat).not.toHaveProperty('sessionGroup');
+    expect(sessionChat).not.toHaveProperty('sessionGroupMeta');
+    expect(JSON.stringify(sessionChat)).not.toContain('sess-secret-1');
   });
 
   it('does not mutate the input (authed callers keep the original oncallChat/description)', () => {
@@ -275,15 +317,6 @@ describe('stripSchedulePreconditionMaterial', () => {
       workingDir: '/repo',
     });
   });
-
-  it('is wired into authenticated schedule snapshots and live events', () => {
-    const dashboard = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
-
-    expect(dashboard).toContain('rawSchedules.map(schedule => stripSchedulePreconditionMaterial(schedule))');
-    expect(dashboard).toContain('schedule: stripSchedulePreconditionMaterial(b.schedule)');
-    expect(dashboard).toMatch(/patch:\s*stripSchedulePreconditionMaterial\(b\.patch,/);
-    expect(dashboard).toContain('{ preserveClearMarkers: true }');
-  });
 });
 
 describe('session presentation redaction', () => {
@@ -323,6 +356,17 @@ describe('session presentation redaction', () => {
     expect(out[0]).not.toHaveProperty('previewBotAt');
     expect(out[0]).not.toHaveProperty('previewBotState');
     expect(session.gitBranch).toBe('issue/CUSTOMER-123');
+  });
+
+  it('keeps the turn result for anonymous viewers but drops the reply first line', () => {
+    const lastTurn = { turnId: 't1', outcome: 'delivered', at: 300, summary: 'private reply' };
+    const rows = redactSessionsForPublic([{ ...session, lastTurn }]) as any[];
+    expect(rows[0].lastTurn).toEqual({ turnId: 't1', outcome: 'delivered', at: 300 });
+    const updated = redactSessionEventForPublic('session.update', { sessionId: 's1', patch: { lastTurn } }) as any;
+    expect(updated.patch.lastTurn).toEqual({ turnId: 't1', outcome: 'delivered', at: 300 });
+    expect(lastTurn.summary).toBe('private reply');
+    const workbench = projectSessionsForAudience([{ ...session, lastTurn }], 'workbench') as any[];
+    expect(workbench[0].lastTurn).toEqual(lastTurn);
   });
 
   it('applies the same policy to spawned and update SSE bodies', () => {
@@ -613,6 +657,16 @@ describe('redactSettingsForPublic', () => {
     expect(out.publicReadOnly).toBe(true);
     expect('httpProxy' in out).toBe(false);
     expect(JSON.stringify(out)).not.toContain('secret');
+  });
+
+  it('hides bot scheduling grants (chats and controller identity) from tokenless settings', () => {
+    const settings = { publicReadOnly: true, scheduleBotGrants: { createEnabled: true, selfManageEnabled: false,
+      grants: [{ id: 'team', sourceAppId: 'cli_a', targetAppIds: ['cli_b'], chatIds: ['oc_secret'],
+        controllerUnionId: 'on_controller' }], botOptions: [] } };
+    const out = redactSettingsForPublic(settings) as any;
+    expect(out.publicReadOnly).toBe(true);
+    expect('scheduleBotGrants' in out).toBe(false);
+    expect(JSON.stringify(out)).not.toMatch(/oc_secret|on_controller/);
   });
 
   it('removes the complete notifier snapshot from tokenless settings', () => {

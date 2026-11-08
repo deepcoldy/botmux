@@ -22,8 +22,8 @@
  * assistant/message events and delivered to botmux as a `final` control
  * frame; tool calls render as progress lines.
  *
- * The SDK protocol has no cancel: a wedged turn is reaped by the turn
- * watchdog, which kills the child and exits so botmux restarts the runner
+ * The SDK protocol has no cancel: an explicitly configured turn watchdog
+ * reaps wedged turns, killing the child so botmux restarts the runner
  * (the in-memory session is lost; sessions persist on disk under
  * DSH_SESSION_ROOT but cross-process resume is not wired up yet).
  */
@@ -37,19 +37,32 @@ import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 import { larkToolPromptFromEnv } from './core/lark-tool-binding.js';
 import { JsonRpcStdioCore } from './utils/jsonrpc-stdio.js';
 import { errorMessage } from './utils/error-message.js';
-import { createRunnerTerminal, parseRunnerFlags } from './runner-common.js';
+import { createRunnerTerminal } from './runner-common.js';
+import { parseArgs, MAX_TURN_TIMEOUT_MS, type Args } from './dsh-runner-args.js';
+import { appendPendingNotification } from './dsh-runner-pending.js';
+import { resolveDshModel } from './dsh-runner-config.js';
+import { cotEntriesFromAssistantMessage, cotEntryFromToolCall, cotEntryFromToolResult } from './services/dsh-cot.js';
 
 const DSH_MARKER = '::botmux-dsh:';
-const DEFAULT_TURN_TIMEOUT_MS = 10 * 60 * 1000;
-// Node's setTimeout delay is a 32-bit signed int of ms; a larger value wraps to
-// ~1ms and warns. Upstream config/IPC/UI already clamp to this bound, but the
-// runner re-validates its own argv so a hand-crafted invocation can't arm an
-// overflowing (effectively ~1ms) turn timeout. Mirrors MAX_TURN_TIMEOUT_MS.
-const MAX_TURN_TIMEOUT_MS = 2_147_483_647;
+const EMPTY_TURN_REPLY = 'DeepSeek Harness 已结束本轮处理，但没有生成最终回复；无法确认任务是否成功，请查看会话执行记录。';
+/**
+ * Total-duration cap for an explicitly armed watchdog, as a multiple of the
+ * configured idle window. The idle timer alone is refreshable forever — a turn
+ * that emits a tool event every cycle would never be reaped — so the hard cap
+ * bounds even chatty turns. A surviving turn must produce at least one
+ * tool/assistant event per idle window, hence the cap is expressed in windows:
+ * 4 windows is the budget for a long but bounded tool chain (e.g. a 10-minute
+ * idle setting caps the turn at 40 minutes). The number is an operations
+ * ceiling, not a protocol constant: operators tighten it by configuring a
+ * smaller idle timeout, which shrinks the hard cap proportionally.
+ */
+const MAX_TURN_DURATION_MULTIPLIER = 4;
+/** Upper bound on notifications buffered while waiting for this turn's inbox
+ *  spliced receipt — see dsh-runner-pending.ts. */
 const HANDSHAKE_TIMEOUT_MS = 30_000;
+const INITIALIZE_RETRY_INTERVAL_MS = 1_000;
 const PROMPT_ACK_TIMEOUT_MS = 30_000;
 const SHUTDOWN_GRACE_MS = 2_000;
-const DEFAULT_MODEL = 'deepseek-v4-flash';
 const DEFAULT_MAX_TOKENS = 49152;
 
 /** Default dsh profile name used when none is specified. The profile lives
@@ -61,19 +74,6 @@ const DSH_TOOL_ASK_USER_PACKAGE = '@deepseek-ai/dsh-tool-ask-user';
 const DSH_SDK_JSONRPC_SERVER_DEP = '^0.1.1-rc.1';
 const DSH_TOOL_ASK_USER_DEP = '^0.1.1-rc.1';
 
-interface Args {
-  sessionId: string;
-  dshBin: string;
-  cwd?: string;
-  botName?: string;
-  botOpenId?: string;
-  locale?: string;
-  model?: string;
-  dshProfile?: string;
-  bridgePatch?: string;
-  turnTimeoutMs: number;
-}
-
 interface PendingTurn {
   resolve: () => void;
   reject: (err: Error) => void;
@@ -81,7 +81,8 @@ interface PendingTurn {
   textBuffer: string;
   usage?: DshUsage;
   toolNames: Map<string, string>;
-  timer: NodeJS.Timeout;
+  timer?: NodeJS.Timeout;
+  hardTimer?: NodeJS.Timeout;
   /** Set from the session/prompt ACK; the turn only owns events at/after
    *  the matching agent/inbox/spliced receipt. */
   messageId?: string;
@@ -102,30 +103,6 @@ interface DshUsage {
 
 const output = new RunnerControlWriter();
 const { emitMarker, writeLine, prompt } = createRunnerTerminal(output);
-
-function parseArgs(argv: string[]): Args {
-  const out: Args = { sessionId: '', dshBin: '', turnTimeoutMs: DEFAULT_TURN_TIMEOUT_MS };
-  parseRunnerFlags(argv, out, {
-    '--session-id': 'sessionId',
-    '--dsh-bin': 'dshBin',
-    '--cwd': 'cwd',
-    '--bot-name': 'botName',
-    '--bot-open-id': 'botOpenId',
-    '--locale': 'locale',
-    '--model': 'model',
-    '--dsh-profile': 'dshProfile',
-    '--bridge-patch': 'bridgePatch',
-    '--turn-timeout-ms': (target, val) => {
-      const n = Number(val);
-      // Accept only a positive integer within the arm-able bound; anything else
-      // (≤0, non-integer, over-bound) is ignored → falls back to the default.
-      if (Number.isInteger(n) && n > 0 && n <= MAX_TURN_TIMEOUT_MS) target.turnTimeoutMs = n;
-    },
-  });
-  if (!out.sessionId) throw new Error('--session-id is required');
-  if (!out.dshBin) throw new Error('--dsh-bin is required');
-  return out;
-}
 
 function truncate(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}…` : text;
@@ -170,7 +147,7 @@ function migrateGeneratedBotmuxProfile(name: string, pkgJson: string, cordisPatc
   const pkg = readJsonRecord(pkgJson);
   if (pkg) {
     const deps = isRecord(pkg.dependencies) ? { ...pkg.dependencies } : {};
-    if (deps[DSH_TOOL_ASK_USER_PACKAGE] !== DSH_TOOL_ASK_USER_DEP) {
+    if (deps[DSH_TOOL_ASK_USER_PACKAGE] === undefined) {
       deps[DSH_TOOL_ASK_USER_PACKAGE] = DSH_TOOL_ASK_USER_DEP;
       pkg.dependencies = deps;
       writeFileSync(pkgJson, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
@@ -216,20 +193,6 @@ function parsePromptMessageId(result: unknown): string {
     throw new Error(`dsh protocol error: session/prompt returned no message id: ${JSON.stringify(result)}`);
   }
   return result.messageId;
-}
-
-/** Native dsh config resolved from ~/.dsh (profile + settings.yaml + .credentials.yaml).
- *  The runner spawns `dsh --profile <name>`; the dsh CLI composes the full plugin tree
- *  from dsh-base bundles + the profile's cordis.patch.yml. */
-interface NativeDshConfig {
-  /** Profile name under ~/.dsh/profiles/ (passed to `dsh --profile`). */
-  profileName: string;
-  /** Provider route for SDK initialize. */
-  provider: string;
-  /** Model for SDK initialize (argv --model > settings.yaml > default). */
-  model: string;
-  /** Credentials injected into the runtime's environment (env wins on conflict). */
-  credentials: Record<string, string>;
 }
 
 function dshHomeDir(): string {
@@ -384,41 +347,6 @@ function loadCredentials(): Record<string, string> {
   return out;
 }
 
-/** Resolve the profile name, provider, model, and credentials.
- *
- *  Precedence:
- *  1. --dsh-profile (default "botmux") — profile name under ~/.dsh/profiles/.
- *  2. Provider & model from ~/.dsh/settings.yaml for the initialize RPC.
- *  3. Credentials from ~/.dsh/.credentials.yaml. */
-function resolveNativeDshConfig(): NativeDshConfig {
-  const profileName = args.dshProfile?.trim() || DEFAULT_DSH_PROFILE;
-
-  // Ensure the profile directory exists and dependencies are installed.
-  ensureProfileDir(profileName, args.dshBin);
-
-  // Resolve provider & model from ~/.dsh/settings.yaml for the initialize RPC.
-  //    The plugin composition is managed entirely by the profile's cordis.patch.yml.
-  const settingsPath = join(dshHomeDir(), 'settings.yaml');
-  let provider = 'deepseek-official';
-  let settingsModel = '';
-  if (existsSync(settingsPath)) {
-    const settings = parseYamlDocument(readFileSync(settingsPath, 'utf8')) as unknown;
-    const s = isRecord(settings) ? settings : {};
-    const defaultModel = isRecord(s['agent-default-model']) ? s['agent-default-model'] : {};
-    provider = typeof defaultModel.provider === 'string' && defaultModel.provider
-      ? defaultModel.provider
-      : provider;
-    settingsModel = typeof defaultModel.model === 'string' ? defaultModel.model : '';
-  }
-
-  return {
-    profileName,
-    provider,
-    model: args.model?.trim() || settingsModel || DEFAULT_MODEL,
-    credentials: loadCredentials(),
-  };
-}
-
 /** Map dsh's per-model-call usage onto botmux's four-bucket final usage.
  *  dsh reports cacheWriteTokens where botmux says cacheCreateTokens. The
  *  worker drops the whole usage unless every bucket is a non-negative
@@ -466,15 +394,13 @@ class DshJsonRpcClient {
 
   constructor(
     private readonly dshBin: string,
-    private readonly profileName: string,
+    private readonly launchArgs: string[],
     private readonly env: NodeJS.ProcessEnv,
     private readonly cwd: string,
   ) {}
 
   start(): void {
-    const dshArgs = ['--profile', this.profileName];
-    if (args.bridgePatch) dshArgs.push(`--patch=${args.bridgePatch}`);
-    this.child = spawn(this.dshBin, dshArgs, {
+    this.child = spawn(this.dshBin, this.launchArgs, {
       env: this.env,
       cwd: this.cwd,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -557,6 +483,7 @@ function buildPreamble(): string {
     '<botmux_identity>',
     `你是飞书群机器人「${name}」，通过 deepseek-harness 运行。`,
     '- 你的最终回复文本会被自动捕获并发送到群里，不要执行 botmux send 或任何发消息命令。',
+    '- 每轮任务结束时必须给出最终回复，明确成功、失败或待确认；部署成功必须有实际观测依据，未经核实不得宣称成功。',
     `- 工作目录：${cwd}。语言：${locale}。`,
     ...(() => {
       const prompt = larkToolPromptFromEnv(locale);
@@ -601,6 +528,8 @@ function handleSessionEvent(turn: PendingTurn, event: unknown): void {
       if (callId) turn.toolNames.set(callId, name);
       const argsText = typeof ev.data?.arguments === 'string' ? ev.data.arguments : '';
       writeLine(`🔧 ${name} ${truncate(argsText, 200)}`);
+      const entry = cotEntryFromToolCall(ev.data);
+      if (entry) emitMarker('cot', { entries: [entry] });
       break;
     }
     case 'tool/result': {
@@ -609,6 +538,8 @@ function handleSessionEvent(turn: PendingTurn, event: unknown): void {
       const name = turn.toolNames.get(callId) ?? 'tool';
       const isError = Array.isArray(message?.content) && message.content.some(c => c?.isError === true);
       writeLine(`${isError ? '✗' : '✓'} ${name}`);
+      const entry = cotEntryFromToolResult(ev.data);
+      if (entry) emitMarker('cot', { entries: [entry] });
       break;
     }
     case 'turn/end': {
@@ -635,6 +566,9 @@ function handleSessionEvent(turn: PendingTurn, event: unknown): void {
       // usage is per model call; accumulate across steps for a turn total.
       const usage = normalizeUsage(ev.data?.usage);
       if (usage) turn.usage = turn.usage ? addUsage(turn.usage, usage) : usage;
+      for (const entry of cotEntriesFromAssistantMessage(ev.data?.message)) {
+        emitMarker('cot', { entries: [entry] });
+      }
       break;
     }
     default:
@@ -644,12 +578,17 @@ function handleSessionEvent(turn: PendingTurn, event: unknown): void {
 
 function processTurnNotification(turn: PendingTurn, method: string, p: Record<string, unknown>): void {
   if (method === 'session.event') {
+    const type = (p.event as { type?: unknown } | undefined)?.type;
+    if (type === 'tool/call' || type === 'tool/result' || type === 'assistant/message') {
+      refreshTurnIdleWatchdog(turn);
+    }
     handleSessionEvent(turn, p.event);
     return;
   }
   if (method === 'session.status' && p.status === 'idle' && activeTurn === turn) {
     activeTurn = undefined;
     clearTimeout(turn.timer);
+    clearTimeout(turn.hardTimer);
     lastTurnText = turn.textBuffer;
     lastTurnUsage = turn.usage;
     lastTurnError = turn.turnError;
@@ -667,7 +606,9 @@ function handleNotification(method: string, params: unknown): void {
     // Buffer until the spliced receipt for our messageId: stale notifications
     // from a previous turn (notably a late idle) must not settle this one.
     if (!turn.receiptReceived) {
-      turn.pending.push({ method, params: p });
+      // Bound the buffer (protocol drift: receipt never comes). See
+      // appendPendingNotification for why the oldest entry is dropped.
+      appendPendingNotification(turn.pending, { method, params: p });
       tryClaimReceipt(turn);
       return;
     }
@@ -692,6 +633,24 @@ let lastTurnText = '';
 let lastTurnUsage: DshUsage | undefined;
 let lastTurnError: string | undefined;
 
+function timeoutTurn(turn: PendingTurn, timeoutMs: number, hardLimit: boolean): void {
+  if (activeTurn !== turn) return;
+  activeTurn = undefined;
+  clearTimeout(turn.timer);
+  clearTimeout(turn.hardTimer);
+  turn.reject(new Error(`dsh turn timed out after ${timeoutMs}ms${hardLimit ? ' (hard limit)' : ''}`));
+}
+
+function refreshTurnIdleWatchdog(turn: PendingTurn): void {
+  if (activeTurn !== turn || args.turnTimeoutMs === undefined) return;
+  clearTimeout(turn.timer);
+  const timeoutMs = args.turnTimeoutMs;
+  const timer = setTimeout(() => {
+    if (turn.timer === timer) timeoutTurn(turn, timeoutMs, false);
+  }, timeoutMs);
+  turn.timer = timer;
+}
+
 async function runTurn(content: string): Promise<void> {
   const startedAtMs = Date.now();
   writeLine();
@@ -703,11 +662,7 @@ async function runTurn(content: string): Promise<void> {
   const promptContent = firstTurn ? `${buildPreamble()}${content}` : content;
 
   const turnPromise = new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      if (activeTurn?.timer === timer) activeTurn = undefined;
-      reject(new Error(`dsh turn timed out after ${args.turnTimeoutMs}ms`));
-    }, args.turnTimeoutMs);
-    activeTurn = {
+    const turn: PendingTurn = {
       resolve,
       reject,
       startedAtMs,
@@ -715,8 +670,14 @@ async function runTurn(content: string): Promise<void> {
       toolNames: new Map(),
       pending: [],
       receiptReceived: false,
-      timer,
     };
+    activeTurn = turn;
+    if (args.turnTimeoutMs !== undefined) {
+      const timeoutMs = args.turnTimeoutMs;
+      const hardTimeoutMs = Math.min(MAX_TURN_TIMEOUT_MS, timeoutMs * MAX_TURN_DURATION_MULTIPLIER);
+      turn.timer = setTimeout(() => timeoutTurn(turn, timeoutMs, false), timeoutMs);
+      turn.hardTimer = setTimeout(() => timeoutTurn(turn, hardTimeoutMs, true), hardTimeoutMs);
+    }
   });
 
   try {
@@ -738,6 +699,7 @@ async function runTurn(content: string): Promise<void> {
   } catch (err) {
     if (activeTurn) {
       clearTimeout(activeTurn.timer);
+      clearTimeout(activeTurn.hardTimer);
       activeTurn = undefined;
     }
     throw err;
@@ -746,8 +708,9 @@ async function runTurn(content: string): Promise<void> {
   await turnPromise;
 
   const completedAtMs = Date.now();
-  const finalText = lastTurnText
-    || (lastTurnError ? `dsh 执行出错：${lastTurnError}` : '');
+  const finalText = lastTurnText.trim()
+    ? lastTurnText
+    : lastTurnError ? `dsh 执行出错：${lastTurnError}` : EMPTY_TURN_REPLY;
   const finalUsage = lastTurnUsage;
   emitMarker('final', {
     content: finalText,
@@ -755,7 +718,7 @@ async function runTurn(content: string): Promise<void> {
     startedAtMs,
     completedAtMs,
   });
-  if (!finalText.trim()) writeLine('[dsh] completed without text output.');
+  if (finalText === EMPTY_TURN_REPLY) writeLine('[dsh] completed without text output; sent a diagnostic reply.');
 }
 
 function isFatalRunnerError(err: unknown): boolean {
@@ -834,7 +797,8 @@ function handleInput(data: Buffer): void {
 }
 
 async function main(): Promise<void> {
-  const native = resolveNativeDshConfig();
+  const profileName = args.dshProfile?.trim() || DEFAULT_DSH_PROFILE;
+  ensureProfileDir(profileName, args.dshBin);
   // Sessions live under the native dsh home (~/.dsh/sessions/botmux/<id>),
   // not ~/.botmux — the adapter binds ~/.dsh into the sandbox.
   const sessionRoot = join(dshHomeDir(), 'sessions', 'botmux', args.sessionId);
@@ -843,13 +807,22 @@ async function main(): Promise<void> {
   // Credentials from ~/.dsh/.credentials.yaml fill gaps; the ambient
   // environment (bots.json env) wins on conflict, and the runner's
   // session/cwd always win.
-  client = new DshJsonRpcClient(args.dshBin, native.profileName, {
-    ...native.credentials,
+  const env: NodeJS.ProcessEnv = {
+    ...loadCredentials(),
     ...process.env,
     DSH_SESSION_ROOT: sessionRoot,
     DSH_CWD: cwd,
-    BOTMUX_DSH_ASK_TIMEOUT_MS: String(Math.max(1000, args.turnTimeoutMs - 5000)),
-  }, cwd);
+    ...(args.turnTimeoutMs !== undefined
+      ? { BOTMUX_DSH_ASK_TIMEOUT_MS: String(Math.max(1000, args.turnTimeoutMs - 5000)) }
+      : {}),
+  };
+  const launchArgs = ['--profile', profileName];
+  if (args.bridgePatch) launchArgs.push(`--patch=${args.bridgePatch}`);
+  const selection = resolveDshModel({
+    dshBin: args.dshBin, launchArgs, cwd, env, dshHome: dshHomeDir(), model: args.model,
+  });
+  process.stderr.write(`[botmux:dsh] ${JSON.stringify({ profile: profileName, ...selection })}\n`);
+  client = new DshJsonRpcClient(args.dshBin, launchArgs, env, cwd);
   client.onNotification = handleNotification;
   client.onExit = (code, signal) => {
     if (shuttingDown) return;
@@ -859,17 +832,32 @@ async function main(): Promise<void> {
       const turn = activeTurn;
       activeTurn = undefined;
       clearTimeout(turn.timer);
+      clearTimeout(turn.hardTimer);
       turn.reject(new Error(message));
     }
     setTimeout(() => process.exit(1), 100);
   };
   client.start();
 
-  const initializeResult = await client.request<unknown>(
-    'initialize',
-    { cwd, provider: native.provider, model: native.model, maxTokens: DEFAULT_MAX_TOKENS },
-    HANDSHAKE_TIMEOUT_MS,
-  );
+  // A plugin provider registers its models asynchronously after the plugin
+  // loader settles, so an initialize sent right after spawn can be rejected
+  // with "has no configured model" until that finishes.
+  const handshakeDeadline = Date.now() + HANDSHAKE_TIMEOUT_MS;
+  let initializeResult: unknown;
+  for (;;) {
+    try {
+      initializeResult = await client.request<unknown>(
+        'initialize',
+        { cwd, provider: selection.provider, model: selection.model, maxTokens: DEFAULT_MAX_TOKENS },
+        Math.max(1, handshakeDeadline - Date.now()),
+      );
+      break;
+    } catch (err) {
+      if (!errorMessage(err).includes('has no configured model')
+        || Date.now() + INITIALIZE_RETRY_INTERVAL_MS >= handshakeDeadline) throw err;
+      await new Promise(resolve => setTimeout(resolve, INITIALIZE_RETRY_INTERVAL_MS));
+    }
+  }
   const { serverInfo } = parseInitializeResult(initializeResult);
   writeLine(`dsh connected (${serverInfo.name} ${serverInfo.version}).`);
 

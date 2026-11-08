@@ -4,15 +4,43 @@ import { clearBridgeTurnJournal, readBridgeTurnJournal, selectRestorableBridgeTu
 
 /** Persist attribution only. Recovery never re-submits input to the CLI.
  * Durable deliveries have a separate recovery owner and are excluded. */
-export function checkpointCodexAdoptTurns(path: string, rolloutPath: string, queue: CodexBridgeQueue): void {
-  const entries = queue.peek().flatMap(turn => {
-    if (turn.isLocal || turn.dispatchAttempt !== undefined || turn.finalText !== undefined
-      || turn.markTimeMs === undefined || !turn.contentFingerprint) return [];
-    // Codex recovery drains from byte zero, then filters by timestamps rather than offsetAtMark.
-    return [{ turnId: turn.turnId, markTimeMs: turn.markTimeMs,
-      fingerprint: turn.contentFingerprint, jsonlPath: rolloutPath, offsetAtMark: 0 }];
-  });
+export function checkpointCodexAdoptTurns(
+  path: string,
+  rolloutPath: string,
+  queue: CodexBridgeQueue,
+  offsetAtMark: number = 0,
+): void {
   const previous = readBridgeTurnJournal(path);
+  const safeOffsetAtMark = Number.isSafeInteger(offsetAtMark) && offsetAtMark >= 0
+    ? offsetAtMark
+    : 0;
+  const entries = queue.peek().flatMap(turn => {
+    if (turn.isLocal || turn.dispatchAttempt !== undefined
+      || turn.markTimeMs === undefined || !turn.contentFingerprint) return [];
+    // Capture the cursor on the FIRST checkpoint for this pending turn. Later
+    // checkpoints can run after its user/progress records were ingested, so
+    // advancing the offset would make restart recovery skip the turn start.
+    const prior = previous.find(entry => entry.turnId === turn.turnId
+      && entry.dispatchAttempt === turn.dispatchAttempt
+      && entry.jsonlPath === rolloutPath);
+    const capturedOffset = turn.recoveryJsonlPathAtMark === rolloutPath
+      && Number.isSafeInteger(turn.recoveryOffsetAtMark)
+      && turn.recoveryOffsetAtMark! >= 0
+      ? turn.recoveryOffsetAtMark
+      : undefined;
+    const supersededTurnIds = turn.supersededTurns
+      ?.filter(identity => identity.dispatchAttempt === undefined)
+      .map(identity => identity.turnId);
+    return [{ turnId: turn.turnId, markTimeMs: turn.markTimeMs,
+      fingerprint: turn.contentFingerprint, jsonlPath: rolloutPath,
+      ...(turn.linkRefMode ? { linkRefMode: turn.linkRefMode } : {}),
+      ...(turn.sourceTurnId && supersededTurnIds?.length ? { mergedExecution: {
+        sourceTurnId: turn.sourceTurnId,
+        ...(turn.sourceSessionId ? { sourceSessionId: turn.sourceSessionId } : {}),
+        supersededTurnIds,
+      } } : {}),
+      offsetAtMark: prior?.offsetAtMark ?? capturedOffset ?? safeOffsetAtMark }];
+  });
   if (JSON.stringify(previous) === JSON.stringify(entries)) return;
   if (entries.length === 0) clearBridgeTurnJournal(path);
   else writeBridgeTurnJournal(path, entries);

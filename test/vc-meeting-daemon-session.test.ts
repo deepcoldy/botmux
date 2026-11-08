@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { __setLoopbackTransportForTests } from '../src/core/loopback-fetch.js';
 import { __testOnly_resetLarkGate } from '../src/im/lark/api-gate.js';
+import { parseVcMeetingPushEvent, VC_BOT_MEETING_INVITED_EVENT } from '../src/vc-agent/push-source.js';
+import { listChatMemberDisplays } from '../src/services/groups-store.js';
 
 const sentMessages = vi.hoisted(() => [] as Array<{ receiveId: string; msgType: string; content: string; uuid?: string }>);
 const patchedMessages = vi.hoisted(() => [] as Array<{ messageId: string; content: string }>);
@@ -66,6 +68,9 @@ function stubAllFetch(mock: unknown): void {
   __setLoopbackTransportForTests(mock as never);
 }
 
+const inviterMembers = vi.hoisted(() => new Set<string>());
+const inviterAdds = vi.hoisted(() => [] as string[]);
+const inviterAddFailure = vi.hoisted(() => ({ enabled: false }));
 const addBotToChatCalls = vi.hoisted(() => [] as Array<{ proxyLarkAppId: string; chatId: string; targetLarkAppIds: string[] }>);
 const addBotToChatFailures = vi.hoisted(() => ({ count: 0 }));
 const addBotToChatHolds = vi.hoisted(() => ({
@@ -212,6 +217,7 @@ vi.mock('../src/vc-agent/polling-source.js', () => ({
 vi.mock('../src/services/group-creator.js', () => ({
   createGroupWithBots: vi.fn(async (opts: Record<string, unknown>) => {
     groupCreateCalls.push(opts);
+    (opts.onChatCreated as ((chatId: string) => void) | undefined)?.(`oc_listener_${groupCreateCalls.length}`);
     if (groupCreateHolds.count > 0) {
       groupCreateHolds.count -= 1;
       await new Promise<void>(resolve => groupCreateHolds.resolvers.push(resolve));
@@ -240,6 +246,13 @@ vi.mock('../src/services/group-creator.js', () => ({
 
 vi.mock('../src/services/groups-store.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../src/services/groups-store.js')>()),
+  listChatMemberDisplays: vi.fn(async () => [...inviterMembers].map(openId => ({ openId, name: openId, memberType: 'user' }))),
+  addUsersToChatByOpenId: vi.fn(async (_app: string, _chat: string, ids: string[]) => {
+    inviterAdds.push(...ids);
+    if (inviterAddFailure.enabled) return { invalidUserIds: ids };
+    ids.forEach(id => inviterMembers.add(id));
+    return { invalidUserIds: [] };
+  }),
   addBotToChat: vi.fn(async (proxyLarkAppId: string, chatId: string, targetLarkAppIds: string[]) => {
     addBotToChatCalls.push({ proxyLarkAppId, chatId, targetLarkAppIds });
     if (addBotToChatHolds.count > 0) {
@@ -445,6 +458,21 @@ import {
   getVcMeetingHubCloseState,
   listVcMeetingHubMembers,
 } from '../src/services/vc-meeting-delivery-hub-store.js';
+import { getVcMeetingPreparation } from '../src/services/vc-meeting-preparations-store.js';
+import {
+  listVcMeetingRuntimeSessions,
+  listVcMeetingRuntimeSessionsByListenerAndAgent,
+  pruneExpiredVcMeetingRuntimeSessions,
+  recordVcMeetingRuntimeSession,
+} from '../src/services/vc-meeting-runtime-store.js';
+
+const QUARANTINED_RUNTIME_STORE_ERROR =
+  'vc meeting runtime session store has quarantined evidence for /data/vc-meeting-runtime-sessions.json';
+function failNextRuntimeStoreRead(): void {
+  vi.mocked(listVcMeetingRuntimeSessionsByListenerAndAgent).mockImplementationOnce(() => {
+    throw new Error(QUARANTINED_RUNTIME_STORE_ERROR);
+  });
+}
 
 const APP_ID = 'cli_vc_daemon_test';
 const OTHER_APP_ID = 'cli_vc_other_test';
@@ -835,6 +863,9 @@ function interactiveCardInputNames(card: any): string[] {
 describe('VC meeting daemon session lifecycle', () => {
   beforeEach(() => {
     __vcMeetingAgentTest.reset();
+    inviterMembers.clear();
+    inviterAdds.length = 0;
+    inviterAddFailure.enabled = false;
     dataDirBeforeTest = config.session.dataDir;
     testDataDir = mkdtempSync(join(tmpdir(), 'botmux-vc-daemon-session-'));
     config.session.dataDir = testDataDir;
@@ -945,7 +976,331 @@ describe('VC meeting daemon session lifecycle', () => {
     // beforeEach 注册的 APP_ID bot 只有 { enabled: true }，没有 larkCliProfile——
     // 正是 fleet 里 43/47 从没点过「配置权限」按钮的 bot 的形状。这批用例锁住：
     // 读路径把入会身份默认成 bot 自己的 appId，于是入会门禁不再以 no_profile 拒绝。
-    it('defaults larkCliProfile to the bot own appId when unset', () => {
+
+  describe('opt-in inviter management', () => {
+    const inviter = 'ou_inviterA';
+    const meetingNo = '191919191';
+    const actualMeetingId = 'm_joined_191919191';
+    const invite = (who = inviter, structured = true) => __vcMeetingAgentTest.handlePush(parseVcMeetingPushEvent({
+      larkAppId: APP_ID, kind: 'meeting_invited', eventType: VC_BOT_MEETING_INVITED_EVENT,
+      data: {
+        event_id: `evt_${who}`, meeting: { id: actualMeetingId, meeting_no: meetingNo, topic: 'inviter test' },
+        inviter: { id: structured ? { open_id: who, union_id: 'on_inviter', user_id: 'internal_user' } : who, user_type: 1 },
+        invite_time: String(Date.now()),
+      },
+    }));
+    function configure(enabled?: boolean, fixedChat = false) {
+      registerConsumerAgentBot();
+      return registerBot({ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code',
+        allowedUsers: [TARGET_OPEN_ID],
+        vcMeetingAgent: { enabled: true, larkCliProfile: APP_ID, attentionTargetOpenId: TARGET_OPEN_ID,
+          inviterManagementEnabled: enabled,
+          ...(fixedChat ? { listenerChatId: 'oc_fixed' } : {}),
+          meetingConsumer: { enabled: true, textOutputPolicy: 'approval', defaultMode: 'listenOnly',
+            agentCandidates: [{ larkAppId: AGENT_APP_ID, label: 'Claude Loopy' }] },
+        },
+      });
+    }
+    it.each([true, false])('takes native invitations through membership and usable management authority (structured=%s)', async structured => {
+      configure(true);
+      await invite(inviter, structured);
+      expect(inviterAdds).toEqual([inviter]);
+      expect(runtimeStoreRecords.at(-1)).toMatchObject({
+        inviterManagers: [{ openId: inviter, memberReady: true }],
+      });
+      expect((await selectConsumerAgentViaCard('Claude Loopy', inviter)).toast?.type).not.toBe('error');
+      expect(groupCreateCalls).toHaveLength(1);
+    });
+    it('does not add an inviter blocked while the dedicated group is being created', async () => {
+      vi.useFakeTimers();
+      const bot = configure(true);
+      groupCreateHolds.count = 1;
+      const started = invite();
+      for (let n = 0; n < 100 && !groupCreateHolds.resolvers.length; n++) await Promise.resolve();
+      expect(groupCreateHolds.resolvers).toHaveLength(1);
+      bot.resolvedBlockedUsers = [inviter];
+      groupCreateHolds.resolvers.shift()!();
+      await started;
+      expect(inviterAdds).toEqual([]);
+      expect(runtimeStoreRecords.at(-1)).toMatchObject({ inviterManagers: [{ memberReady: false }] });
+      expect((await selectConsumerAgentViaCard('Claude Loopy', inviter)).toast?.type).toBe('error');
+      bot.resolvedBlockedUsers = [];
+      vi.advanceTimersByTime(1);
+      await invite();
+      expect(inviterAdds).toEqual([inviter]);
+      expect(groupCreateCalls).toHaveLength(1);
+    });
+    it.each(['block', 'off'] as const)('rechecks %s after the membership read before adding an inviter', async change => {
+      vi.useFakeTimers();
+      const bot = configure(true);
+      let resumeRead!: () => void;
+      let readStarted!: () => void;
+      const hold = new Promise<void>(resolve => { resumeRead = resolve; });
+      const reading = new Promise<void>(resolve => { readStarted = resolve; });
+      vi.mocked(listChatMemberDisplays).mockImplementationOnce(async () => {
+        readStarted();
+        await hold;
+        return [];
+      });
+      const started = invite();
+      await reading;
+      if (change === 'block') bot.resolvedBlockedUsers = [inviter];
+      else bot.config.vcMeetingAgent!.inviterManagementEnabled = false;
+      resumeRead();
+      await started;
+      expect(inviterAdds).toEqual([]);
+      expect(runtimeStoreRecords.at(-1)).toMatchObject({ inviterManagers: [{ memberReady: false }] });
+      expect((await selectConsumerAgentViaCard('Claude Loopy', inviter)).toast?.type).toBe('error');
+    });
+    it('does not retry a persisted pending membership after the inviter is blocked and the daemon restarts', async () => {
+      vi.useFakeTimers();
+      const bot = configure(true);
+      inviterAddFailure.enabled = true;
+      await invite();
+      expect(inviterAdds).toEqual([inviter]);
+      expect(runtimeStoreRecords.at(-1)).toMatchObject({ inviterManagers: [{ memberReady: false }] });
+      inviterAddFailure.enabled = false;
+      bot.resolvedBlockedUsers = [inviter];
+      __vcMeetingAgentTest.reset();
+      __vcMeetingAgentTest.setGlobalVcMeetingAgentEnabledForTest(true);
+      __vcMeetingAgentTest.setGlobalVcMeetingListenerBotAppIdForTest(null);
+      __vcMeetingAgentTest.setCrossAppLocalReceiverForTest(true);
+      __vcMeetingAgentTest.setSelfDaemonLarkAppIdForTest(APP_ID);
+      __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID);
+      for (let n = 0; n < 100; n++) await Promise.resolve();
+      expect(inviterAdds).toEqual([inviter]);
+      expect(inviterMembers.has(inviter)).toBe(false);
+      expect(runtimeStoreRecords.at(-1)).toMatchObject({ inviterManagers: [{ memberReady: false }] });
+      expect(groupCreateCalls).toHaveLength(1);
+    });
+    it('does not let an inviter invalidated during the first sync wait abort a later valid inviter', async () => {
+      vi.useFakeTimers();
+      const bot = configure(true);
+      groupCreateHolds.count = 1;
+      const first = invite();
+      for (let n = 0; n < 100 && !groupCreateHolds.resolvers.length; n++) await Promise.resolve();
+      // The first inviter is blocked while group creation is in flight; the
+      // pending array for the next invitation's sync then contains both grants.
+      bot.resolvedBlockedUsers = [inviter];
+      groupCreateHolds.resolvers.shift()!();
+      await first;
+      expect(inviterAdds).toEqual([]);
+      await invite('ou_inviterC');
+      expect(inviterAdds).toEqual(['ou_inviterC']);
+      expect(runtimeStoreRecords.at(-1)).toMatchObject({ inviterManagers: [
+        { openId: inviter, memberReady: false },
+        { openId: 'ou_inviterC', memberReady: true },
+      ] });
+      expect((await selectConsumerAgentViaCard('Claude Loopy', 'ou_inviterC')).toast?.type).not.toBe('error');
+    });
+    it('logs invitation diagnostics as status/shape enums without id values, names or payload', async () => {
+      configure(true);
+      const lines: string[] = [];
+      const spy = vi.spyOn(process.stdout, 'write').mockImplementation(((chunk: unknown) => {
+        if (typeof chunk === 'string' && chunk.includes('invitation identity')) lines.push(chunk);
+        return true;
+      }) as never);
+      try {
+        await __vcMeetingAgentTest.handlePush(parseVcMeetingPushEvent({
+          larkAppId: APP_ID, kind: 'meeting_invited', eventType: VC_BOT_MEETING_INVITED_EVENT,
+          data: {
+            event_id: 'evt_log_probe',
+            meeting: { id: actualMeetingId, meeting_no: meetingNo, topic: 'diagnostic log probe' },
+            inviter: {
+              id: { open_id: 'ou_logprobe', union_id: 'on_logprobe', user_id: 'internal_logprobe' },
+              user_type: 1, user_name: 'Secret Logprobe Name',
+            },
+            invite_time: String(Date.now()),
+          },
+        }));
+      } finally {
+        spy.mockRestore();
+      }
+      const line = lines.join('\n');
+      expect(line).toContain('eventId=evt_log_probe');
+      expect(line).toContain('status=resolved');
+      expect(line).toContain('idShape=object');
+      expect(line).toContain('inviteTime=valid');
+      expect(line).not.toContain('ou_logprobe');
+      expect(line).not.toContain('on_logprobe');
+      expect(line).not.toContain('internal_logprobe');
+      expect(line).not.toContain('Secret Logprobe Name');
+    });
+    it('keeps default/off behavior; no invitee membership write or management grant', async () => {
+      configure();
+      await invite();
+      expect(inviterAdds).toEqual([]);
+      const result = await __vcMeetingAgentTest.handleCardAction({ operator: { open_id: inviter }, action: lastInteractiveCardSelectOption('Claude Loopy') }, APP_ID);
+      expect(result.toast.type).toBe('error');
+    });
+    it('lets a verified non-owner select agents and approve output, but revokes on off', async () => {
+      const bot = configure(true);
+      __vcMeetingAgentTest.setOutputTextSenderForTest(async (session, req) => {
+        meetingTextOutputs.push({ meetingId: session.state.meeting.id, text: req.content, channel: 'text' });
+      });
+      await invite();
+      expect(inviterAdds).toEqual([inviter]);
+      const chosen = await selectConsumerAgentViaCard('Claude Loopy', inviter);
+      expect(chosen.toast?.type).not.toBe('error');
+      const first = await __vcMeetingAgentTest.submitOutput({ larkAppId: APP_ID, meetingId: actualMeetingId, channel: 'text', content: 'hello' });
+      expect(first).toMatchObject({ ok: true, status: 'pending' });
+      const approved = await __vcMeetingAgentTest.handleCardAction({ operator: { open_id: inviter }, action: { value: lastInteractiveCardButton('发送会中弹幕') } }, APP_ID);
+      expect(approved.header.title.content).toBe('已发送会中弹幕');
+      expect(meetingTextOutputs.at(-1)?.text).toBe('hello');
+      await __vcMeetingAgentTest.submitOutput({ larkAppId: APP_ID, meetingId: actualMeetingId, channel: 'text', content: 'after off' });
+      bot.config.vcMeetingAgent!.inviterManagementEnabled = false;
+      const denied = await __vcMeetingAgentTest.handleCardAction({ operator: { open_id: inviter }, action: { value: lastInteractiveCardButton('发送会中弹幕') } }, APP_ID);
+      expect(denied.toast.type).toBe('error');
+      expect(meetingTextOutputs).toHaveLength(1);
+      const owner = await __vcMeetingAgentTest.handleCardAction({ operator: { open_id: TARGET_OPEN_ID }, action: { value: lastInteractiveCardButton('发送会中弹幕') } }, APP_ID);
+      expect(owner.header.title.content).toBe('已发送会中弹幕');
+    });
+    it('lets the inviter approve voice and manage temporary meeting instruction grants', async () => {
+      const bot = configure(true);
+      bot.config.vcMeetingAgent!.realtimeVoice = { enabled: true };
+      bot.config.vcMeetingAgent!.meetingConsumer!.voiceOutputPolicy = 'approval';
+      await invite();
+      await selectConsumerAgentViaCard('Claude Loopy', inviter);
+      realtimeVoiceEvents.length = 0;
+      const submitted = await __vcMeetingAgentTest.submitOutput({
+        larkAppId: APP_ID, meetingId: actualMeetingId, channel: 'voice', content: 'inviter approved voice',
+      });
+      expect(submitted).toMatchObject({ ok: true, status: 'pending' });
+      await __vcMeetingAgentTest.handleCardAction({ operator: { open_id: inviter },
+        action: { value: lastInteractiveCardButton('同意语音') } }, APP_ID);
+      await new Promise(resolve => setTimeout(resolve, 2));
+      expect(realtimeVoiceEvents).toContain('speak:inviter approved voice');
+      const handled = await __vcMeetingAgentTest.handleTemporaryAuthCommand({
+        larkAppId: APP_ID, chatId: 'oc_listener_1', commandContent: '/vc-auth @Guest',
+        mentions: [{ key: '@_user_1', name: 'Guest', openId: 'ou_guest' }], senderOpenId: inviter,
+      });
+      expect(handled).toBe(true);
+      expect(runtimeStoreRecords.at(-1)?.temporaryInstructionOpenIds).toEqual(['ou_guest']);
+    });
+    it('revokes already-granted inviter card authority immediately on block, preserving owner control', async () => {
+      const bot = configure(true);
+      __vcMeetingAgentTest.setOutputTextSenderForTest(async (session, req) => {
+        meetingTextOutputs.push({ meetingId: session.state.meeting.id, text: req.content, channel: 'text' });
+      });
+      await invite();
+      const selection = lastInteractiveCardSelectOption('Claude Loopy');
+      expect((await selectConsumerAgentViaCard('Claude Loopy', inviter)).toast?.type).not.toBe('error');
+      await __vcMeetingAgentTest.submitOutput({ larkAppId: APP_ID, meetingId: actualMeetingId,
+        channel: 'text', content: 'pending before block' });
+      const approval = { value: lastInteractiveCardButton('发送会中弹幕') };
+      bot.resolvedBlockedUsers = [inviter];
+      const deniedApproval = await __vcMeetingAgentTest.handleCardAction({ operator: { open_id: inviter }, action: approval }, APP_ID);
+      expect(deniedApproval.toast.type).toBe('error');
+      const deniedSelection = await __vcMeetingAgentTest.handleCardAction({ operator: { open_id: inviter }, action: selection }, APP_ID);
+      expect(deniedSelection.toast.type).toBe('error');
+      expect(meetingTextOutputs).toEqual([]);
+      await __vcMeetingAgentTest.handleCardAction({ operator: { open_id: TARGET_OPEN_ID }, action: approval }, APP_ID);
+      expect(meetingTextOutputs.map(output => output.text)).toEqual(['pending before block']);
+    });
+    it('revokes already-granted inviter union identity on block at the temporary-auth entry', async () => {
+      const bot = configure(true);
+      await invite();
+      await selectConsumerAgentViaCard('Claude Loopy', inviter);
+      await __vcMeetingAgentTest.handlePush({
+        larkAppId: APP_ID, kind: 'meeting_activity', eventType: 'vc.bot.meeting_activity_v1',
+        eventId: 'evt_inviter_identity', meeting: { id: actualMeetingId, meetingNo },
+        raw: { event: { meeting_activity_items: [{ activity_event_type: 'participant_joined',
+          meeting: { id: actualMeetingId, meeting_no: meetingNo },
+          participant_joined_items: [{ participant: { id: { open_id: inviter, union_id: 'on_inviterA' }, user_name: 'Inviter' } }],
+        }] } },
+      });
+      const grant = (guest: string) => __vcMeetingAgentTest.handleTemporaryAuthCommand({
+        larkAppId: APP_ID, chatId: 'oc_listener_1', commandContent: '/vc-auth @Guest',
+        mentions: [{ key: '@_user_1', name: 'Guest', openId: guest }],
+        senderOpenId: 'ou_otherAppScoped', senderUnionId: 'on_inviterA',
+      });
+      await grant('ou_beforeblock');
+      expect(runtimeStoreRecords.at(-1)?.temporaryInstructionOpenIds).toEqual(['ou_beforeblock']);
+      bot.resolvedBlockedUsers = [inviter];
+      await grant('ou_afterblock');
+      expect(runtimeStoreRecords.at(-1)?.temporaryInstructionOpenIds).toEqual(['ou_beforeblock']);
+      // Unblocking uses the same trusted identity and existing meeting grant.
+      bot.resolvedBlockedUsers = [];
+      await grant('ou_afterunblock');
+      expect(runtimeStoreRecords.at(-1)?.temporaryInstructionOpenIds).toEqual(['ou_beforeblock', 'ou_afterunblock']);
+    });
+    it('deduplicates repeated invitations and adds a second inviter without a second group', async () => {
+      configure(true);
+      await invite(); await invite(); await invite('ou_inviterB');
+      expect(groupCreateCalls).toHaveLength(1);
+      expect(inviterAdds).toEqual([inviter, 'ou_inviterB']);
+      expect(runtimeStoreRecords.at(-1)).toMatchObject({ inviterManagers: [
+        { openId: inviter, memberReady: true }, { openId: 'ou_inviterB', memberReady: true },
+      ] });
+    });
+    it('does not expand a fixed chat; existing members can acquire this meeting authority', async () => {
+      configure(true, true); await invite();
+      expect(inviterAdds).toEqual([]);
+      expect(runtimeStoreRecords.at(-1)).toMatchObject({ inviterManagers: [{ memberReady: false }] });
+      inviterMembers.add(inviter); await invite();
+      expect(inviterAdds).toEqual([]);
+      expect(runtimeStoreRecords.at(-1)).toMatchObject({ inviterManagers: [{ memberReady: true }] });
+    });
+    it('restores inviter authority and permits rejoin after a daemon restart without a new group', async () => {
+      const bot = configure(true); bot.botOpenId = LISTENER_BOT_OPEN_ID;
+      await invite();
+      await __vcMeetingAgentTest.handlePush(vcParticipantActivityPush({
+        type: 'participant_left', openId: LISTENER_BOT_OPEN_ID, occurredAtMs: Date.now(),
+        eventId: 'evt_removed', meetingId: actualMeetingId, meetingNo,
+      }));
+      const rejoin = lastInteractiveCardAction('vc_meeting_listener_rejoin');
+      __vcMeetingAgentTest.reset();
+      __vcMeetingAgentTest.setGlobalVcMeetingAgentEnabledForTest(true);
+      __vcMeetingAgentTest.setGlobalVcMeetingListenerBotAppIdForTest(null);
+      __vcMeetingAgentTest.setCrossAppLocalReceiverForTest(true);
+      __vcMeetingAgentTest.setSelfDaemonLarkAppIdForTest(APP_ID);
+      __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID);
+      await Promise.resolve();
+      const result = await __vcMeetingAgentTest.handleCardAction({ operator: { open_id: inviter }, action: { value: rejoin } }, APP_ID);
+      expect(result.header.title.content).toBe('会议监听已恢复');
+      expect(groupCreateCalls).toHaveLength(1);
+      expect(inviterAdds).toEqual([inviter]);
+    });
+    it('does not carry dedicated-chat membership into a preparation chat after rejoin', async () => {
+      const bot = configure(true); bot.botOpenId = LISTENER_BOT_OPEN_ID;
+      await invite();
+      await __vcMeetingAgentTest.handlePush(vcParticipantActivityPush({
+        type: 'participant_left', openId: LISTENER_BOT_OPEN_ID, occurredAtMs: Date.now(),
+        eventId: 'evt_rebind', meetingId: actualMeetingId, meetingNo,
+      }));
+      preparationRecords.push({ larkAppId: APP_ID, meetingNo, prepChatId: 'oc_shared_prep',
+        agentAppId: APP_ID, qaMode: 'off' });
+      inviterMembers.clear(); // The inviter is not a member of the new shared chat.
+      await __vcMeetingAgentTest.handleCardAction({ operator: { open_id: TARGET_OPEN_ID },
+        action: { value: lastInteractiveCardAction('vc_meeting_listener_rejoin') } }, APP_ID);
+      await invite('ou_inviterB');
+      expect(inviterAdds).toEqual([inviter]);
+      expect(runtimeStoreRecords.at(-1)).toMatchObject({ listenerChatId: 'oc_shared_prep',
+        inviterManagers: [{ memberReady: false }, { memberReady: false }] });
+    });
+    it('does not grant authority to a different meeting or to a blocked inviter', async () => {
+      const bot = configure(true); await invite();
+      await __vcMeetingAgentTest.handlePush({
+        larkAppId: APP_ID, kind: 'meeting_invited', eventType: 'vc.bot.meeting_invited_v1',
+        eventId: 'evt_other', meeting: { id: 'm_other', meetingNo: '292929292' }, raw: {},
+      });
+      const result = await __vcMeetingAgentTest.handleCardAction({ operator: { open_id: inviter }, action: lastInteractiveCardSelectOption('Claude Loopy') }, APP_ID);
+      expect(result.toast.type).toBe('error');
+      bot.resolvedBlockedUsers = ['ou_blocked'];
+      await invite('ou_blocked');
+      expect(inviterAdds).not.toContain('ou_blocked');
+    });
+    it('persists a pending member on failure and retries only membership, not group creation', async () => {
+      configure(true); inviterAddFailure.enabled = true;
+      await invite();
+      expect(runtimeStoreRecords.at(-1)).toMatchObject({ listenerChatId: 'oc_listener_1', inviterManagers: [{ memberReady: false }] });
+      inviterAddFailure.enabled = false; await invite();
+      expect(groupCreateCalls).toHaveLength(1);
+      expect(runtimeStoreRecords.at(-1)).toMatchObject({ inviterManagers: [{ memberReady: true }] });
+    });
+  });
+
+  it('defaults larkCliProfile to the bot own appId when unset', () => {
       const cfg = __vcMeetingAgentTest.effectiveConfig(APP_ID);
       expect(cfg?.larkCliProfile).toBe(APP_ID);
     });
@@ -1457,6 +1812,150 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_global_off')).toBe(false);
   });
 
+  describe('startup restore with unreadable meeting state', () => {
+    function registerListener(): void {
+      registerBot({
+        larkAppId: APP_ID,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+        vcMeetingAgent: { enabled: true, larkCliProfile: APP_ID, attentionTargetOpenId: TARGET_OPEN_ID },
+      });
+    }
+    function pushRuntimeRecord(meetingId: string): void {
+      runtimeStoreRecords.push({
+        larkAppId: APP_ID,
+        meeting: { id: meetingId, topic: meetingId },
+        listenerChatId: `oc_${meetingId}`,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+      });
+    }
+
+    it('logs and skips the bot instead of throwing out of daemon startup', () => {
+      registerListener();
+      pushRuntimeRecord('m_restore_store_down');
+      vi.mocked(listVcMeetingRuntimeSessions).mockImplementationOnce(() => {
+        throw new Error('vc meeting runtime session store has quarantined evidence for /data/vc-meeting-runtime-sessions.json');
+      });
+
+      // This runs inside startDaemon's per-bot loop: a throw here used to abort
+      // startup for every bot on the host.
+      expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_store_down')).toBe(false);
+
+      // Durable record untouched: the next start restores it.
+      expect(runtimeStoreRecords.some(r => r.meeting.id === 'm_restore_store_down')).toBe(true);
+      __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID);
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_store_down')).toBe(true);
+    });
+
+    it('a meeting whose state cannot be read does not block the other meetings', () => {
+      registerListener();
+      pushRuntimeRecord('m_restore_bad');
+      pushRuntimeRecord('m_restore_good');
+      const hubDir = join(config.session.dataDir, 'vc-meeting-delivery-hub');
+      mkdirSync(hubDir, { recursive: true });
+      // Quarantined hub evidence makes getVcMeetingHubCloseState throw for this meeting only.
+      writeFileSync(join(hubDir, `${APP_ID}__m_restore_bad.json.corrupt.1.1`), '{bad', 'utf-8');
+
+      expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_good')).toBe(true);
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_bad')).toBe(false);
+      expect(runtimeStoreRecords.some(r => r.meeting.id === 'm_restore_bad')).toBe(true);
+    });
+
+    it('still restores meetings when pruning expired records fails', () => {
+      registerListener();
+      pushRuntimeRecord('m_restore_prune_down');
+      vi.mocked(pruneExpiredVcMeetingRuntimeSessions).mockImplementationOnce(() => {
+        throw new Error('file-lock timeout');
+      });
+
+      expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_prune_down')).toBe(true);
+    });
+
+    it('stops the timers a meeting already armed when its restore fails late', () => {
+      vi.useFakeTimers();
+      registerListener();
+      preparationRecords.push({
+        larkAppId: APP_ID, meetingNo: '688542737', prepChatId: 'oc_m_restore_late', agentAppId: AGENT_APP_ID, qaMode: 'auto',
+      });
+      runtimeStoreRecords.push({
+        larkAppId: APP_ID,
+        meeting: { id: 'm_restore_late', topic: 'late' },
+        listenerChatId: 'oc_m_restore_late',
+        consumerMode: 'agent',
+        selectedAgentAppId: AGENT_APP_ID,
+        preparationMeetingNo: '688542737',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+      });
+      const timersBefore = vi.getTimerCount();
+      // The legacy prepared-consumer migration persists AFTER flush/tick timers are armed.
+      vi.mocked(recordVcMeetingRuntimeSession).mockImplementationOnce(() => {
+        throw new Error('ENOSPC: no space left on device');
+      });
+
+      expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_late')).toBe(false);
+      expect(vi.getTimerCount()).toBe(timersBefore);
+    });
+
+    it('drops a half-restored meeting session instead of leaving partial state behind', () => {
+      registerListener();
+      runtimeStoreRecords.push({
+        larkAppId: APP_ID,
+        meeting: { id: 'm_restore_half', topic: 'half' },
+        listenerChatId: 'oc_m_restore_half',
+        preparationMeetingNo: '688542737',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+      });
+      // Fails after the in-memory session was already created for this meeting.
+      vi.mocked(getVcMeetingPreparation).mockImplementationOnce(() => {
+        throw new Error('injected failure after session creation');
+      });
+
+      expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_half')).toBe(false);
+    });
+
+    it('keeps a healthy session that existed before restore when the same record fails again', () => {
+      vi.useFakeTimers();
+      registerListener();
+      preparationRecords.push({
+        larkAppId: APP_ID, meetingNo: '688542737', prepChatId: 'oc_m_restore_existing', agentAppId: AGENT_APP_ID, qaMode: 'auto',
+      });
+      runtimeStoreRecords.push({
+        larkAppId: APP_ID,
+        meeting: { id: 'm_restore_existing', topic: 'existing' },
+        listenerChatId: 'oc_m_restore_existing',
+        preparationMeetingNo: '688542737',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+      });
+      __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID);
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_existing')).toBe(true);
+      const timersAfterFirstRestore = vi.getTimerCount();
+      expect(timersAfterFirstRestore).toBeGreaterThan(0);
+
+      // The second restore fetches the already-restored session, then fails. The
+      // catch must only tear down entries THIS restore created, never the
+      // pre-existing healthy session or its timers.
+      vi.mocked(getVcMeetingPreparation).mockImplementationOnce(() => {
+        throw new Error('injected failure against existing session');
+      });
+      expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
+      expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_restore_existing')).toBe(true);
+      expect(vi.getTimerCount()).toBe(timersAfterFirstRestore);
+    });
+  });
+
   it('global VC switch blocks stale confirmation cards from starting a new listener', async () => {
     registerBot({
       larkAppId: APP_ID,
@@ -1843,6 +2342,71 @@ describe('VC meeting daemon session lifecycle', () => {
 
     expect(second.sent).toBe(0);
     expect(sentMessages).toHaveLength(1);
+  });
+
+  it('suppresses raw publication without losing transcript state or changing an in-flight policy', async () => {
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        listenerChatId: 'oc_listener',
+        stabilizeMs: 1,
+        listenerPolicy: { rawMessages: false },
+      },
+    });
+
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_activity',
+      eventType: 'vc.bot.meeting_activity_v1',
+      eventId: 'evt_activity_listener',
+      meeting: { id: 'm_listener', topic: 'Listener review' },
+      raw: {
+        event: {
+          meeting_actitivty_items: [
+            {
+              activity_event_type: 'chat_received',
+              meeting: { id: 'm_listener', topic: 'Listener review' },
+              chat_received_items: [
+                {
+                  message_id: 'msg_listener',
+                  sender: { open_id: 'ou_a', user_name: 'Alice' },
+                  text: 'please sync this chat',
+                  send_time: '2026-07-01T16:00:00+08:00',
+                },
+              ],
+            },
+            {
+              activity_event_type: 'transcript_received',
+              meeting: { id: 'm_listener', topic: 'Listener review' },
+              transcript_received_items: [
+                {
+                  sentence_id: 'sent_listener',
+                  speaker: { open_id: 'ou_b', user_name: 'Bob' },
+                  text: 'stable transcript',
+                  start_time_ms: '2026-07-01T16:00:01+08:00',
+                  end_time_ms: '2026-07-01T16:00:02+08:00',
+                },
+              ],
+            },
+          ],
+        },
+      },
+    });
+
+    await new Promise(resolve => setTimeout(resolve, 2));
+    const result = await __vcMeetingAgentTest.flushListener(APP_ID, 'm_listener');
+
+    expect(result).toMatchObject({ ok: true, sent: 0 });
+    expect(sentMessages).toHaveLength(0);
+    const state = __vcMeetingAgentTest.sessionState(APP_ID, 'm_listener')!;
+    expect(Object.keys(state.dedup.transcriptBySentenceId)).toHaveLength(1);
+    registerBot({ larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code',
+      vcMeetingAgent: { enabled: true, listenerChatId: 'oc_listener', listenerPolicy: { rawMessages: true } } });
+    expect(await __vcMeetingAgentTest.flushListener(APP_ID, 'm_listener')).toMatchObject({ ok: true, sent: 0 });
+    expect(sentMessages).toHaveLength(0);
   });
 
   it('reuses known actor names when chat push events only include operator ids', async () => {
@@ -5824,8 +6388,8 @@ describe('VC meeting daemon session lifecycle', () => {
     registerBot({
       larkAppId: AGENT_APP_ID,
       larkAppSecret: 'agent-secret',
-      name: 'Unsupported Gemini',
-      cliId: 'gemini',
+      name: 'Unsupported OpenCode',
+      cliId: 'opencode',
       sandbox: true,
       backendType: 'pty',
       workingDir: process.cwd(),
@@ -5841,7 +6405,7 @@ describe('VC meeting daemon session lifecycle', () => {
         meetingConsumer: {
           enabled: true,
           defaultMode: 'listenOnly',
-          agentCandidates: [{ larkAppId: AGENT_APP_ID, label: 'Unsupported Gemini' }],
+          agentCandidates: [{ larkAppId: AGENT_APP_ID, label: 'Unsupported OpenCode' }],
         },
       },
     });
@@ -5854,7 +6418,7 @@ describe('VC meeting daemon session lifecycle', () => {
       raw: { event: { meeting: { id: 'm_unsupported_terminal', meeting_no: '454545454' } } },
     });
 
-    const result = await selectConsumerAgentViaCard('Unsupported Gemini');
+    const result = await selectConsumerAgentViaCard('Unsupported OpenCode');
     expect(result.header.title.content).toBe('仅同步会议消息');
     expect(interactiveCardMarkdownContent(result)).toContain('选择 agent 失败，已回退只监听');
     expect(interactiveCardMarkdownContent(result)).toContain('reliable turn terminal contract');
@@ -7184,6 +7748,125 @@ describe('VC meeting daemon session lifecycle', () => {
     expect(triggerSessionCalls[0].req.envelope.payload.stream.final).toBe(true);
   });
 
+  it('a closing meeting whose restore fails leaves no closing entry behind and is restored on the next start', async () => {
+    vi.useFakeTimers();
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          minBatchItems: 1,
+          agentCandidates: [{ larkAppId: AGENT_APP_ID, label: 'Claude Loopy' }],
+        },
+      },
+    });
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_close_restore_fail',
+      meeting: { id: 'm_close_restore_fail', meetingNo: '585858587', topic: 'Close restore fail' },
+      raw: { event: { meeting: { id: 'm_close_restore_fail', meeting_no: '585858587' } } },
+    });
+    await selectConsumerAgentViaCard('Claude Loopy');
+    expect(__vcMeetingAgentTest.beginCloseIntentForTest(APP_ID, 'm_joined_585858587')).toBeTypeOf('number');
+
+    const restart = () => {
+      __vcMeetingAgentTest.reset();
+      __vcMeetingAgentTest.setGlobalVcMeetingAgentEnabledForTest(true);
+      __vcMeetingAgentTest.setGlobalVcMeetingListenerBotAppIdForTest(null);
+      __vcMeetingAgentTest.setCrossAppLocalReceiverForTest(true);
+      __vcMeetingAgentTest.setSelfDaemonLarkAppIdForTest(APP_ID);
+    };
+    restart();
+    // The closing path persists the runtime record; make that write fail once.
+    vi.mocked(recordVcMeetingRuntimeSession).mockImplementationOnce(() => {
+      throw new Error('ENOSPC: no space left on device');
+    });
+    const timersBefore = vi.getTimerCount();
+    expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
+    expect(__vcMeetingAgentTest.closingConsumerCount()).toBe(0);
+    expect(vi.getTimerCount()).toBe(timersBefore);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(triggerSessionCalls).toHaveLength(0);
+
+    restart();
+    meetingEventFetchResults.push({
+      raw: {},
+      batch: { source: 'polling', meeting: { id: 'm_joined_585858587' }, items: [] },
+    });
+    __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID);
+    expect(__vcMeetingAgentTest.closingConsumerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(triggerSessionCalls).toHaveLength(1);
+    expect(triggerSessionCalls[0].req.envelope.payload.stream.final).toBe(true);
+  });
+
+  it('keeps a closing entry restored earlier when a later restore of that meeting fails', async () => {
+    vi.useFakeTimers();
+    registerConsumerAgentBot();
+    registerBot({
+      larkAppId: APP_ID,
+      larkAppSecret: 'secret',
+      cliId: 'claude-code',
+      vcMeetingAgent: {
+        enabled: true,
+        larkCliProfile: APP_ID,
+        attentionTargetOpenId: TARGET_OPEN_ID,
+        meetingConsumer: {
+          enabled: true,
+          defaultMode: 'listenOnly',
+          minBatchItems: 1,
+          agentCandidates: [{ larkAppId: AGENT_APP_ID, label: 'Claude Loopy' }],
+        },
+      },
+    });
+    await __vcMeetingAgentTest.handlePush({
+      larkAppId: APP_ID,
+      kind: 'meeting_invited',
+      eventType: 'vc.bot.meeting_invited_v1',
+      eventId: 'evt_invite_close_restore_existing',
+      meeting: { id: 'm_close_restore_existing', meetingNo: '585858589', topic: 'Close restore existing' },
+      raw: { event: { meeting: { id: 'm_close_restore_existing', meeting_no: '585858589' } } },
+    });
+    await selectConsumerAgentViaCard('Claude Loopy');
+    expect(__vcMeetingAgentTest.beginCloseIntentForTest(APP_ID, 'm_joined_585858589')).toBeTypeOf('number');
+
+    const restart = () => {
+      __vcMeetingAgentTest.reset();
+      __vcMeetingAgentTest.setGlobalVcMeetingAgentEnabledForTest(true);
+      __vcMeetingAgentTest.setGlobalVcMeetingListenerBotAppIdForTest(null);
+      __vcMeetingAgentTest.setCrossAppLocalReceiverForTest(true);
+      __vcMeetingAgentTest.setSelfDaemonLarkAppIdForTest(APP_ID);
+    };
+    restart();
+    // First restore succeeds: the durable-close record becomes the live closing
+    // entry that a later (re-entrant) restore must not tear down.
+    __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID);
+    expect(__vcMeetingAgentTest.closingConsumerCount()).toBe(1);
+    expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_joined_585858589')).toBe(false);
+
+    // The next restore re-enters the durable-close branch and fails persisting
+    // after replacing the entry. The catch only removes entries IT created, so
+    // the pre-existing closing state stays and reconciliation is not dropped.
+    vi.mocked(recordVcMeetingRuntimeSession).mockImplementationOnce(() => {
+      throw new Error('ENOSPC: no space left on device');
+    });
+    expect(() => __vcMeetingAgentTest.restoreRuntimeSessions(APP_ID)).not.toThrow();
+    expect(__vcMeetingAgentTest.closingConsumerCount()).toBe(1);
+    // The session created by this failed restore is still cleaned up.
+    expect(__vcMeetingAgentTest.hasSession(APP_ID, 'm_joined_585858589')).toBe(false);
+    // The durable record is kept for another restart to retry from.
+    expect(runtimeStoreRecords.some(r => r.meeting.id === 'm_joined_585858589')).toBe(true);
+  });
+
   it('abandons and retires a frozen close epoch at the hard deadline when its body cannot be recovered', async () => {
     vi.useFakeTimers();
     __vcMeetingAgentTest.setConsumerCloseTimingForTest({
@@ -8161,6 +8844,40 @@ describe('VC meeting daemon session lifecycle', () => {
       },
     });
     expect(triggerSessionCalls).toHaveLength(0);
+
+    // The same chat now owns a dedicated receiver session. If the meeting store
+    // becomes unreadable, the @mention must be answered visibly and blocked —
+    // neither thrown away (the old behaviour) nor silently treated as ordinary.
+    failNextRuntimeStoreRead();
+    const sentBefore = sentMessages.length;
+    const unavailable = await __vcMeetingAgentTest.routeConsumerBeforeTurnForTest(
+      AGENT_APP_ID,
+      'oc_listener_1',
+    );
+    expect(unavailable.result).toEqual({ block: true });
+    expect(unavailable.ctx.vcMeetingImTurnOrigin).toBeUndefined();
+    const notices = sentMessages.slice(sentBefore);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({ receiveId: 'oc_listener_1', msgType: 'text' });
+    expect(triggerSessionCalls).toHaveLength(0);
+  });
+
+  it('handles an ordinary group @mention normally when the meeting runtime store is unreadable', async () => {
+    registerConsumerAgentBot();
+    failNextRuntimeStoreRead();
+    const sentBefore = sentMessages.length;
+
+    // Before the fix this rejected, and the dispatcher dropped the whole
+    // message with only "Error handling message event" in the err log.
+    const routed = await __vcMeetingAgentTest.routeConsumerBeforeTurnForTest(
+      AGENT_APP_ID,
+      'oc_plain_group_without_meeting',
+    );
+
+    expect(routed.result).toBeUndefined();
+    expect(routed.ctx.vcMeetingImTurnOrigin).toBeUndefined();
+    expect(sentMessages.slice(sentBefore)).toHaveLength(0);
+    expect(vi.mocked(listVcMeetingRuntimeSessionsByListenerAndAgent)).toHaveBeenCalled();
   });
 
   it('routes consumer catch-up to the listener daemon even when its bot config is shared locally', async () => {

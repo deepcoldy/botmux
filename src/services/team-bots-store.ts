@@ -118,14 +118,3 @@ export function listTeamBots(
   }
   return out;
 }
-
-/** Forget a learned teammate (explicit revoke). Returns true if removed. */
-export function removeTeamBot(dataDir: string, unionId: string | undefined): boolean {
-  const id = (unionId ?? '').trim();
-  if (!id) return false;
-  const data = readFile(dataDir);
-  if (!(id in data)) return false;
-  delete data[id];
-  atomicWriteFileSync(filePath(dataDir), JSON.stringify(data, null, 2) + '\n');
-  return true;
-}

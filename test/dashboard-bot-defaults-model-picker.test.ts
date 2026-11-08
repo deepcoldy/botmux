@@ -12,10 +12,7 @@ import { BotAgentSection } from '../src/dashboard/web/bot-defaults-page.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
-const page = readFileSync(new URL('../src/dashboard/web/bot-defaults-page.tsx', import.meta.url), 'utf8');
 const onboarding = readFileSync(new URL('../src/dashboard/web/bot-onboarding.tsx', import.meta.url), 'utf8');
-const fieldControls = readFileSync(new URL('../src/dashboard/web/field-controls.tsx', import.meta.url), 'utf8');
-const i18n = readFileSync(new URL('../src/dashboard/web/i18n.ts', import.meta.url), 'utf8');
 
 const cliState: CliOptionsState = {
   options: [],
@@ -23,42 +20,12 @@ const cliState: CliOptionsState = {
   ttadkModelSuggestions: ['ttadk-a', 'ttadk-b'],
 };
 
-// 源码断言：两处模型输入都换成 ModelPickerField，旧的裸文本框 + datalist 已移除。
-describe('ModelPickerField 源码接线', () => {
-  it('field-controls 导出 ModelPickerField，BotAgentSection 使用它', () => {
-    expect(fieldControls).toMatch(/export function ModelPickerField\b/);
-    const agentSection = page.slice(page.indexOf('export function BotAgentSection'));
-    expect(agentSection).toContain('<ModelPickerField');
-    expect(agentSection).toContain('dataInput="agentModel"');
-  });
-
-  it('Bot runtime 改变但 cliKey 不变时清空并重新探测模型目录', () => {
-    const agentSection = page.slice(page.indexOf('export function BotAgentSection'));
-    expect(agentSection).toContain('setDetectedModels(null);');
-    expect(agentSection).toContain('[cliKey, bot]');
-  });
-
-  it('onboarding 也使用 ModelPickerField，且不静态依赖懒加载的 bot-defaults-page', () => {
-    // onboarding 被 app.tsx 静态引入：若它从 bot-defaults-page 取控件，整页
-    // （8k 行）会被打进首屏 chunk，路由级懒加载失效。
-    expect(onboarding).toContain("import { ModelPickerField } from './field-controls.js';");
-    expect(onboarding).not.toContain("from './bot-defaults-page.js'");
-    expect(onboarding).toContain('<ModelPickerField');
-    expect(onboarding).toContain('dataInput="ob-model"');
-  });
-
-  it('旧的裸文本输入框与 datalist 已移除', () => {
-    // 旧标记是字面量 data-input="agentModel" 的 <input type="text">；新代码只有
-    // data-input={props.dataInput}（自定义模式真实输入框 + 下拉模式 hidden 锚点）。
-    expect(page).not.toMatch(/<input[^>]*data-input="agentModel"/);
-    expect(page).not.toContain('agent-model-suggestions');
-    expect(onboarding).not.toContain('ob-model-suggestions');
-  });
-
-  it('中英 i18n 都含 4 个 modelPicker key', () => {
-    for (const key of ['modelPickerDefault', 'modelPickerCustom', 'modelPickerBack', 'modelPickerDetected']) {
-      expect(i18n.match(new RegExp(`'botDefaults\\.${key}'`, 'g'))).toHaveLength(2);
-    }
+describe('bot-onboarding 的 import 边界', () => {
+  // 源码结构护栏(K1)：onboarding 被 app.tsx 静态引入，若它从 bot-defaults-page 取控件，
+  // 整页（8k 行）会被打进首屏 chunk，路由级懒加载失效——这是 import 依赖方向，只能读源码。
+  // 来历：#1850 把 ModelPickerField 挪进 field-controls 正是为了切断这条边。
+  it('does not statically import the lazily loaded bot-defaults-page', () => {
+    expect(onboarding).not.toMatch(/from\s+['"]\.\/bot-defaults-page(?:\.js)?['"]/);
   });
 });
 

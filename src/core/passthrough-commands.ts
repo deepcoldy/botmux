@@ -73,6 +73,22 @@ export const SLASH_COMMAND_SHAPE = /^\/[a-z0-9][a-z0-9:_-]*$/;
  * input` and drops it, while mira/mir enqueue the line as an ordinary USER
  * MESSAGE and burn a turn asking the model about it.
  *
+ * Riff has no local CLI: RiffBackend turns every write into a remote task
+ * prompt behind its system-prompt block, so the command text and the submit
+ * Enter become two separate remote tasks and no slash parser ever sees the
+ * command. A Riff session always carries cliId `riff` (spawn-time CLI/backend
+ * pairing, see remote-cli-ids), so the id stands for the backend here.
+ *
+ * Residual boundary: this predicate keys on cliId, so a historical session row
+ * persisted before the pairing invariant (cliId other than `riff` while
+ * backendType is `riff`) would not match. Such a pairing cannot be constructed
+ * by current code, and the next spawn reconciles it via
+ * resolvePairedSpawnBackendType (persistent-backend → reconcilePairedBackendId):
+ * that cliId is not remote while the resolved backend is, so the second branch
+ * discards the remote backend and falls back to the daemon default (or `pty`
+ * when the default is itself remote). Until then only that stale row keeps the
+ * old, already-broken raw-passthrough behaviour.
+ *
  * ⚠️ This set lives in this dependency-free leaf — not in command-handler — so
  * the Lark card builder can gate its own `/compact` affordance on the SAME
  * predicate the router uses. Importing command-handler from card-builder would
@@ -81,7 +97,7 @@ export const SLASH_COMMAND_SHAPE = /^\/[a-z0-9][a-z0-9:_-]*$/;
  * left 11 PTY quick-action buttons that silently did nothing. Any gate deciding
  * "can this CLI receive typed input" must call the predicate below, never
  * hand-write a member of this set. */
-const NO_RAW_PASSTHROUGH_CLI_IDS: ReadonlySet<string> = new Set(['codex-app', 'mira', 'mir', 'dsh', 'ebsd']);
+const NO_RAW_PASSTHROUGH_CLI_IDS: ReadonlySet<string> = new Set(['codex-app', 'mira', 'mir', 'dsh', 'ebsd', 'minimax', 'riff']);
 
 /**
  * True for a CLI with no raw-passthrough surface (see
@@ -119,31 +135,68 @@ export function cliHasNoRawPassthroughSurface(
  * checked BEFORE DAEMON_COMMANDS in the router). Returns null for anything that
  * doesn't qualify. Does NOT prepend the leading `/` — callers that accept bare
  * user input should add it first (see {@link parseCustomPassthroughInput}).
+ *
+ * Internal whitespace joins with `-`: CLI slash commands are single tokens
+ * (`/ultra-goal`) while users naturally type the name with a space
+ * (`/Ultra Goal`). Collapsing before the shape test keeps the grant gate and
+ * router seeing only one well-formed token.
  */
 export function normalizePassthroughCommand(cmd: unknown): string | null {
   if (typeof cmd !== 'string') return null;
-  const normalized = cmd.trim().toLowerCase();
+  const normalized = cmd.trim().toLowerCase().replace(/\s+/g, '-');
   if (!SLASH_COMMAND_SHAPE.test(normalized)) return null;
   if (DAEMON_COMMANDS.has(normalized)) return null;
   return normalized;
 }
 
 /**
- * Parse free-text dashboard / `/botconfig` input (comma, space or newline
- * separated) into a normalized, deduped custom passthrough command list. The
- * leading `/` is optional per token (so users can type `goal export` or
- * `/goal, /export`); illegal and daemon-shadowing tokens are dropped. Mirrors
- * the normalization {@link ../bot-registry.js}'s parseBotConfigsFromText applies
- * when loading bots.json, so a round-trip through the card is stable.
+ * Parse free-text dashboard / `/botconfig` input into a normalized, deduped
+ * custom passthrough command list. Separators are comma/newline, plus a space
+ * whose next token starts with `/` (`/goal /export`). A space before a bare
+ * word is NOT a separator — the word belongs to the command name and joins
+ * with `-` ({@link normalizePassthroughCommand}), so `/Ultra Goal` parses as
+ * one command `/ultra-goal` instead of `/ultra` + `/goal`. The leading `/` is
+ * optional per entry; illegal and daemon-shadowing entries are dropped.
+ * Mirrors the normalization {@link ../bot-registry.js}'s
+ * parseBotConfigsFromText applies when loading bots.json, so a round-trip
+ * through the card is stable.
+ *
+ * A greedy entry can glue neighboring words onto punctuation that is not a
+ * separator (`/goal ; /export` → token `/goal ;`). When the whole entry fails
+ * normalization, it is retried word-by-word on whitespace — but only when its
+ * first word is itself a valid command. That guard keeps malformed leaders
+ * (`/ Ultra Goal`, whose joined shape starts with `-`) dropped as a whole,
+ * while legal commands glued onto trailing punctuation (`/goal (note)`) are
+ * rescued. A spaced name that normalizes fine (`/Ultra Goal`) never reaches
+ * the fallback, so mixed input like `/Ultra Goal /bad (note)` keeps both
+ * entries.
  */
 export function parseCustomPassthroughInput(raw: string): string[] {
   const out: string[] = [];
-  for (const tok of String(raw ?? '').split(/[\s,]+/)) {
-    const trimmed = tok.trim();
-    if (!trimmed) continue;
-    const withSlash = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
-    const norm = normalizePassthroughCommand(withSlash);
-    if (norm) out.push(norm);
+  const normalize = (token: string) =>
+    normalizePassthroughCommand(token.startsWith('/') ? token : `/${token}`);
+  const add = (token: string) => {
+    const norm = normalize(token);
+    if (norm) {
+      out.push(norm);
+      return;
+    }
+    const parts = token.split(/\s+/).filter(Boolean);
+    const first = parts.length ? normalize(parts[0]) : null;
+    if (!first) return;
+    out.push(first);
+    for (const part of parts.slice(1)) {
+      const fallback = normalize(part);
+      if (fallback) out.push(fallback);
+    }
+  };
+  for (const segment of String(raw ?? '').split(/[,\r\n]+/)) {
+    // 一个 entry = 首个 token（带不带 `/` 都行）+ 后续「空白后不是 `/`」的词；
+    // 空白后的下一个 `/` 另起一条（`/goal /export`）。
+    for (const tok of segment.match(/\/?\S+(?:[^\S\r\n]+(?!\/)\S+)*/g) ?? []) {
+      const trimmed = tok.trim();
+      if (trimmed) add(trimmed);
+    }
   }
   return [...new Set(out)];
 }

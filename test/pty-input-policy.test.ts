@@ -1,8 +1,14 @@
 import { describe, expect, it } from 'vitest';
+import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
+import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 import { decideHardTimeoutAction, shouldWriteNow } from '../src/utils/input-gate.js';
 import { pendingInputAllowsTypeAhead, shouldStopPendingBatch } from '../src/utils/pending-input-queue.js';
-import { inspectPostTerminalComposer, resolvePtyInputPolicy } from '../src/utils/pty-input-policy.js';
+import {
+  inspectPostTerminalComposer,
+  isTypeAheadBlockedByBypass,
+  resolvePtyInputPolicy,
+} from '../src/utils/pty-input-policy.js';
 
 describe('resolvePtyInputPolicy', () => {
   it.each([
@@ -44,6 +50,50 @@ describe('resolvePtyInputPolicy', () => {
     expect(resolvePtyInputPolicy({ postTerminalPromptFence: true }, false, true)).toEqual({
       supportsTypeAhead: false, allowBackToBackWrites: false,
     });
+  });
+
+  it('keeps antigravity type-ahead only while the approval bypass is on', () => {
+    const adapter = createAntigravityAdapter('/bin/agy');
+    expect(isTypeAheadBlockedByBypass(adapter, undefined)).toBe(false);
+    expect(isTypeAheadBlockedByBypass(adapter, false)).toBe(false);
+    expect(isTypeAheadBlockedByBypass(adapter, true)).toBe(true);
+
+    const bypassed = resolvePtyInputPolicy(adapter, true, false, isTypeAheadBlockedByBypass(adapter, false));
+    const restricted = resolvePtyInputPolicy(adapter, true, false, isTypeAheadBlockedByBypass(adapter, true));
+    expect(bypassed).toEqual({ supportsTypeAhead: true, allowBackToBackWrites: true });
+    expect(restricted).toEqual({ supportsTypeAhead: false, allowBackToBackWrites: true });
+    expect(pendingInputAllowsTypeAhead(bypassed.supportsTypeAhead, false, { content: 'follow-up' })).toBe(true);
+    expect(pendingInputAllowsTypeAhead(restricted.supportsTypeAhead, false, { content: 'follow-up' })).toBe(false);
+    expect(shouldWriteNow({
+      isPromptReady: false, isFlushing: false,
+      supportsTypeAhead: bypassed.supportsTypeAhead, awaitingFirstPrompt: false,
+    })).toBe(true);
+    expect(shouldWriteNow({
+      isPromptReady: false, isFlushing: false,
+      supportsTypeAhead: restricted.supportsTypeAhead, awaitingFirstPrompt: false,
+    })).toBe(false);
+    expect(shouldWriteNow({
+      isPromptReady: true, isFlushing: false,
+      supportsTypeAhead: restricted.supportsTypeAhead, awaitingFirstPrompt: false,
+    })).toBe(true);
+    // Restricted antigravity bot falls back to mark-ready on first-prompt hard timeout.
+    expect(decideHardTimeoutAction(bypassed.supportsTypeAhead)).toBe('flush');
+    expect(decideHardTimeoutAction(restricted.supportsTypeAhead)).toBe('mark-ready');
+  });
+
+  it('does not take type-ahead away from other adapters when disableCliBypass is on', () => {
+    const traexAdapter = createTraexAdapter('/bin/traex');
+    const claudeAdapter = createClaudeCodeAdapter('/bin/claude');
+    expect(isTypeAheadBlockedByBypass(traexAdapter, true)).toBe(false);
+    expect(isTypeAheadBlockedByBypass(claudeAdapter, true)).toBe(false);
+    const traex = resolvePtyInputPolicy(
+      traexAdapter, true, false, isTypeAheadBlockedByBypass(traexAdapter, true),
+    );
+    const claude = resolvePtyInputPolicy(
+      claudeAdapter, true, false, isTypeAheadBlockedByBypass(claudeAdapter, true),
+    );
+    expect(traex.supportsTypeAhead).toBe(true);
+    expect(claude.supportsTypeAhead).toBe(true);
   });
 
   it('retains durable input barriers on a healthy type-ahead backend', () => {

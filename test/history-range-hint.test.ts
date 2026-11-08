@@ -33,7 +33,7 @@ function makeRangeHintFn(): (isChatScope: boolean, effectiveScope: string) => st
   const src = readFileSync(DIST_CLI, 'utf8');
   const start = src.indexOf('const rangeHint =');
   expect(start, 'rangeHint must be present in dist/cli.js — rebuild if this fails').toBeGreaterThan(-1);
-  const end = src.indexOf('console.log(JSON.stringify({', start);
+  const end = src.indexOf('const historyResult =', start);
   expect(end).toBeGreaterThan(start);
   const expr = src.slice(start, end).trim().replace(/;$/, '');
   // eslint-disable-next-line no-new-func

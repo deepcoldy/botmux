@@ -85,6 +85,11 @@ const CONSUMERS: Record<string, Rule> = {
     why: '/dismiss returns refusal/residual details to the command handler and '
       + 'preserves the group unless closure is known and clean; test/dismiss-command.test.ts covers both.',
   },
+  'core/dismiss-command.ts::closeOne::closeSession': {
+    category: 'user_surface',
+    why: '/dismiss co-resident sessions of this bot: a refusal, unknown session or residual is '
+      + 'reported per session and keeps both the resident session and the group.',
+  },
   'core/command-handler.ts::handleCommand::closeSession': {
     category: 'user_surface',
     why: '/close, /lane close, shared-adopt /detach and /disconnect, and same-daemon '
@@ -132,6 +137,11 @@ const CONSUMERS: Record<string, Rule> = {
   },
 
   // ── background: no UI, so refusal/residual must be logged ────────────────
+  'core/dismiss-command.ts::closeSessionsInGoneChat::closeSession': {
+    category: 'background',
+    why: 'The chat was disbanded or the bot was removed, so there is no surface left to report to; '
+      + 'a refusal or residual is logged per session and never counted as closed.',
+  },
   'core/session-manager.ts::closeActiveSessionIfCliMismatch::closeSession': {
     category: 'background',
     why: 'Returns close_failed / closed_with_residual to the sweep; a refusal is '
@@ -150,6 +160,12 @@ const CONSUMERS: Record<string, Rule> = {
       + 'the row back directly, so it cannot recursively wake a second provider.',
     count: 3,
   },
+  'core/session-manager.ts::reconcileStartedRemoteResumeExit::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'A provisional Remote Runner resume lost its provider before canonical activation. '
+      + 'The background wrapper logs refusals and residuals; durable control commits closed '
+      + 'only after the authoritative close is proven.',
+  },
   'core/session-manager.ts::spawnDashboardSession::closeSession': {
     category: 'impossible_by_invariant',
     why: 'Same scratch-placeholder eviction as resumeSession: no remote lineage.',
@@ -159,6 +175,28 @@ const CONSUMERS: Record<string, Rule> = {
     why: 'Scheduled-run teardown; a refusal leaves the row active and is logged by '
       + 'closeSession itself. No user surface at schedule time.',
     count: 2,
+  },
+  'core/session-manager.ts::deliverOwnerBatchTurn::closeSession': {
+    category: 'background',
+    why: 'Decision-board batch delivery reclaims either a disposable scratch at the '
+      + 'steward anchor or its own candidate that lost the active-session CAS. No user '
+      + 'surface: a refusal leaves the row active and is logged by closeSession itself.',
+    count: 2,
+  },
+  'core/session-manager.ts::deliverWorkflowNodeTurn::closeSession': {
+    category: 'background',
+    why: 'A workflow node turn the main bot starts for itself reclaims either a '
+      + 'disposable scratch at the node topic or its own candidate that lost the '
+      + 'active-session CAS (same shape as the decision-board batch). No user surface: '
+      + 'a refusal leaves the row active and is logged by closeSession itself; the '
+      + 'handoff is re-sent with the same keys or blocks for a human.',
+    count: 2,
+  },
+  'core/dashboard-ipc-server.ts::closeSession::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'A Dashboard workflow draft that is abandoned or deleted closes its clarify '
+      + 'headless session; nobody is waiting on that session, the wrapper logs refusal '
+      + 'and residual, and the draft is already marked so no turn can reach it again.',
   },
   'core/failed-turn-recovery.ts::recoverFailedTurn::closeSessionForBackgroundCleanup': {
     category: 'background',
@@ -189,6 +227,11 @@ const CONSUMERS: Record<string, Rule> = {
     category: 'infrastructure',
     why: 'Injects the raw typed close result into the durable card-control runtime; '
       + 'that runtime durably replies with refusal/residual details before settling.',
+  },
+  'daemon.ts::closeCompletedSession::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Listener auto-close waits for final delivery outside the Bot mutation gate; '
+      + 'the background wrapper logs refusal and residual, and refusal never reports success.',
   },
   'daemon.ts::cleanupFailedDelivery::closeSessionForBackgroundCleanup': {
     category: 'background',
@@ -389,6 +432,10 @@ const RESPONSE_CONSUMERS: Record<string, ResponseRule> = {
     why: 'Cross-daemon /close wt parses residual and refuses worktree removal when remote teardown is incomplete.',
     mustParse: true,
   },
+  'core/dismiss-command.ts::closeOne::close-route': {
+    why: '/dismiss closes peer bots\' sessions in the group; residual is reported and keeps the group.',
+    mustParse: true,
+  },
   'core/dashboard-ipc-server.ts::<module>::close-route': {
     why: 'Serves the route; replays the residual on the closed-row fast path.',
     mustParse: false,
@@ -465,6 +512,8 @@ function probe(code: string): ts.SourceFile {
   return ts.createSourceFile('probe.ts', code, ts.ScriptTarget.Latest, true);
 }
 
+// 源码结构护栏(K4)：src 里每个 close 调用点与 close 路由响应点都必须登记在矩阵里并归类；调用点散落在各处闭包里，
+// 只能扫源码核对（同文件下半部分的自检保证扫描器对别名 / 命名空间 / 动态 import 与注释字符串的判定）。
 describe('close consumer matrix (call-site)', () => {
   it('every close call site is classified', () => {
     const unclassified = [...new Set(

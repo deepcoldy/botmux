@@ -570,13 +570,8 @@ describe('zmx backend pure helpers', () => {
     // other backend PTY already forces — deterministic, invoker-independent.
     expect(zmxFreshSessionEnv({ ...opts, env: { PATH: '/bin', TERM: 'xterm-ghostty' } }).TERM)
       .toBe('xterm-256color');
-    // Source pin: only the one-shot create client (whose env becomes the
-    // session env) spawns with the pinned env; control clients (get/set/
-    // list/kill) keep the unpinned zmxControlEnv.
-    const src = readFileSync(new URL('../src/adapters/backend/zmx-backend.ts', import.meta.url), 'utf-8');
-    const spawnAt = src.indexOf("spawnSync('zmx', buildFreshAttachArgs(");
-    expect(spawnAt).toBeGreaterThan(-1);
-    expect(src.slice(spawnAt, src.indexOf('});', spawnAt))).toContain('env: zmxFreshSessionEnv(opts, this.opts.socketDir)');
+    // That only the create client spawns with this env (control clients keep
+    // zmxControlEnv) is covered behaviorally in zmx-backend-recovery.test.ts.
   });
 
   it('keeps the POSIX ZMX payload path sourced through the user shell with the argv sentinel', () => {

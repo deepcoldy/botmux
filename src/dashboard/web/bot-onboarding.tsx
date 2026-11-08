@@ -5,6 +5,7 @@ import { fetchDetectedModels, mergeModelCandidates, modelSuggestionsForOption } 
 import { ModelPickerField } from './field-controls.js';
 import { confirm } from './confirm-modal.js';
 import { t } from './ui.js';
+import { cliAvailabilityStatus, useCliAvailability } from './cli-availability.js';
 
 export const OPEN_BOT_ONBOARDING_EVENT = 'botmux:open-bot-onboarding';
 
@@ -74,6 +75,7 @@ type CliOption = {
   gateway?: 'ttadk';
   acceptsModel?: boolean;
   available?: boolean;
+  availabilityStatus?: import('../../setup/cli-availability.js').CliAvailabilityStatus;
   command?: string;
   availabilityReason?: string;
   cliLaunchMode?: 'forge-traex';
@@ -533,6 +535,7 @@ function OnboardingForm(props: {
   onClose(): void;
 }): React.JSX.Element {
   const selectedCli = props.cliState.options.find(option => option.id === props.form.cliId);
+  const availabilityStatus = useCliAvailability(props.form.cliId, selectedCli);
   const modelDisabled = selectedCli?.gateway === 'ttadk' && selectedCli.acceptsModel === false;
   // live 探测当前 CLI 的可用模型（ttadk 网关项保持现状，只用静态建议列表）。
   const [detectedModels, setDetectedModels] = useState<{ models: string[]; source: 'live' | 'static' } | null>(null);
@@ -562,7 +565,7 @@ function OnboardingForm(props: {
     .sort((a, b) => a.label.localeCompare(b.label, 'en', { sensitivity: 'base' }))
     .map(option => ({
       value: option.id,
-      label: option.available === false
+      label: (option.id === props.form.cliId ? availabilityStatus : cliAvailabilityStatus(option)) === 'unavailable'
         ? t('botOnboarding.cliMissingOption', { label: option.label, command: option.command ?? option.id })
         : option.label,
     }));
@@ -640,9 +643,9 @@ function OnboardingForm(props: {
             props.onFormChange(syncModelForCli(props.form, cliId, props.cliState));
           }}
         />
-        {selectedCli?.available === false ? (
+        {availabilityStatus === 'unavailable' ? (
           <small className="hint-warn">
-            {t('botOnboarding.cliMissingHint', { command: selectedCli.command ?? props.form.cliId })}
+            {t('botOnboarding.cliMissingHint', { command: selectedCli?.command ?? props.form.cliId })}
           </small>
         ) : <small className="onboarding-field-hint">{props.form.cliId}</small>}
       </div>
@@ -897,6 +900,10 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
   }, [applyJob]);
 
   const body = useMemo(() => {
+    // The dialog stays mounted in the shell from the first paint, before the
+    // visitor's auth state is known. The form's CLI probes are management reads,
+    // so they must not run while the dialog is closed.
+    if (!props.open) return null;
     if (view.kind === 'form') {
       return (
         <OnboardingForm
@@ -924,7 +931,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
         onClose={close}
       />
     );
-  }, [cliState, close, form, ownerIdInput, ownerInput, retry, sessionMode, submitForm, submitOwner, submitting, view]);
+  }, [cliState, close, form, ownerIdInput, ownerInput, props.open, retry, sessionMode, submitForm, submitOwner, submitting, view]);
 
   const canClose = view.kind === 'form' || (view.kind === 'job' && (view.job.status === 'completed' || view.job.status === 'failed'));
 

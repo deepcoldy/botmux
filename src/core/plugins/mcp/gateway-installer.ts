@@ -6,10 +6,12 @@ import { atomicWriteFileSync } from '../../../utils/atomic-write.js';
 import { expandHomePath } from '../../../utils/working-dir.js';
 import { readPluginRegistry } from '../../../services/plugin-registry-store.js';
 import { readMaterializedPlugin } from '../materializer.js';
+import { readGlobalConfig } from '../../../global-config.js';
 import {
   MCP_GATEWAY_FORWARDED_ENV_KEYS,
   MCP_GATEWAY_OWNER_ENV,
 } from './environment.js';
+import { effectiveMcpGatewayMaxToolTimeoutMs } from './runtime-options.js';
 
 const GATEWAY_START = '# >>> botmux mcp gateway';
 const GATEWAY_END = '# <<< botmux mcp gateway';
@@ -24,13 +26,14 @@ export interface GatewayEntryReport {
 export interface GatewayEntry {
   command: string;
   args: string[];
+  maxToolTimeoutMs?: number;
 }
 
 export function defaultGatewayEntry(): GatewayEntry {
   // Canonicalize $HOME: on a symlinked-home host (/home/u → /data00/home/u) the
   // lexical path is written into the CLI's MCP config, but the file sandbox binds
   // only CANONICAL exec dirs — the lexical /home/u prefix doesn't exist in the
-  // bwrap root, so codex/gemini's `botmux mcp serve` launch fails with
+  // bwrap root, so codex/opencode's `botmux mcp serve` launch fails with
   // "No such file or directory" and MCP startup aborts. realpath the home root
   // so the command path lands on a bound dir. Same file off-sandbox, so it's a
   // safe no-op on non-symlinked hosts.
@@ -39,6 +42,7 @@ export function defaultGatewayEntry(): GatewayEntry {
   return {
     command: process.env.BOTMUX_BIN_PATH ?? join(home, '.botmux', 'bin', 'botmux'),
     args: ['mcp', 'serve'],
+    maxToolTimeoutMs: effectiveMcpGatewayMaxToolTimeoutMs(readGlobalConfig().mcpGatewayMaxToolTimeoutMs),
   };
 }
 
@@ -225,6 +229,10 @@ function renderCodexEntry(entry: GatewayEntry): string {
     '[mcp_servers.botmux]',
     `command = ${JSON.stringify(entry.command)}`,
     `args = [${entry.args.map(value => JSON.stringify(value)).join(', ')}]`,
+    // The Gateway applies the tighter per-plugin value. Codex needs a matching
+    // outer ceiling so a valid long-running downstream call is not aborted by
+    // its default MCP timeout before the Gateway can return the result.
+    `tool_timeout_sec = ${Math.ceil(effectiveMcpGatewayMaxToolTimeoutMs(entry.maxToolTimeoutMs) / 1_000)}`,
     `env_vars = [${MCP_GATEWAY_FORWARDED_ENV_KEYS.map(value => JSON.stringify(value)).join(', ')}]`,
     GATEWAY_END,
   ].join('\n');
@@ -254,6 +262,7 @@ function gatewayJsonValue(entry: GatewayEntry): Record<string, unknown> {
     type: 'stdio',
     command: entry.command,
     args: entry.args,
+    timeout: effectiveMcpGatewayMaxToolTimeoutMs(entry.maxToolTimeoutMs),
     env: {
       [MCP_GATEWAY_OWNER_ENV]: '1',
       // Claude expands these from the owning CLI process when it starts the
@@ -276,33 +285,11 @@ function ensureClaudeEntry(path: string, entry: GatewayEntry): boolean {
   return true;
 }
 
-function removeCodexEntry(path: string): boolean {
-  if (!existsSync(path)) return false;
-  const current = readFileSync(path, 'utf-8');
-  const nextBody = stripCodexBotmuxSections(dropMarkerLines(current, GATEWAY_START, GATEWAY_END));
-  const next = nextBody ? `${nextBody}\n` : '';
-  if (next === current) return false;
-  atomicWriteFileSync(path, next, { mode: 0o600 });
-  return true;
-}
-
 function isOwnedJsonEntry(value: unknown): boolean {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const env = (value as Record<string, unknown>).env;
   return !!env && typeof env === 'object' && !Array.isArray(env)
     && (env as Record<string, unknown>)[MCP_GATEWAY_OWNER_ENV] === '1';
-}
-
-function removeClaudeEntry(path: string): boolean {
-  if (!existsSync(path)) return false;
-  const data = parseJsonConfig(path);
-  if (!data.mcpServers || typeof data.mcpServers !== 'object' || Array.isArray(data.mcpServers)) return false;
-  const servers = data.mcpServers as Record<string, unknown>;
-  if (!isOwnedJsonEntry(servers.botmux)) return false;
-  delete servers.botmux;
-  data.mcpServers = servers;
-  atomicWriteFileSync(path, `${JSON.stringify(data, null, 2)}\n`, { mode: 0o600 });
-  return true;
 }
 
 function configPath(spec: McpGatewayInstallSpec): string {
@@ -321,25 +308,6 @@ export function ensureGatewayEntry(
       ? ensureCodexEntry(path, entry)
       : ensureClaudeEntry(path, entry);
     return { cliId: adapter.id, state: changed ? 'installed' : 'unchanged', configPath: path };
-  } catch (err) {
-    return {
-      cliId: adapter.id,
-      state: 'adapter-required',
-      configPath: path,
-      warning: err instanceof Error ? err.message : String(err),
-    };
-  }
-}
-
-export function removeGatewayEntry(
-  adapter: Pick<CliAdapter, 'id' | 'mcpGateway'>,
-): GatewayEntryReport {
-  const spec = adapter.mcpGateway;
-  if (!spec) return { cliId: adapter.id, state: 'adapter-required' };
-  const path = configPath(spec);
-  try {
-    const removed = spec.format === 'codex-toml' ? removeCodexEntry(path) : removeClaudeEntry(path);
-    return { cliId: adapter.id, state: removed ? 'removed' : 'absent', configPath: path };
   } catch (err) {
     return {
       cliId: adapter.id,

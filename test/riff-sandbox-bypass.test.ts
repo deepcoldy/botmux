@@ -93,15 +93,20 @@ describe('autoWorktreeFallbackSandboxError (fork may only strengthen the gate ve
     expect(autoWorktreeFallbackSandboxError({ sandboxMode: 'oncall', workingDir: '/repo/x-wt', fallbackDir: '/repo/x' })).toBeUndefined();
     expect(autoWorktreeFallbackSandboxError({ sandboxMode: 'oncall', workingDir: '/repo/x', fallbackDir: undefined })).toBeUndefined();
   });
-  it('is wired: forkWorker forwards the session marker and the worker throws on the resolved sandboxMode', () => {
+  // 源码结构护栏(K2)：oncall 沙盒把 workingDir 读写绑定到真实目录，auto-worktree 失败回退到真实默认目录时
+  // 必须 fail-closed（2037a17db0，#921）。上面只测纯函数；真正的闸在 forkWorker 的 init 组装与 worker
+  // spawnCli 闭包里，没有 seam——任一侧断开（不再转发会话标记 / 不再按解析后的 sandboxMode 抛错），
+  // 沙盒 CLI 就静默拿到真实项目目录的写权限。
+  it('forwards the auto-worktree fallback marker into the worker, which refuses before spawning', () => {
     const wp = readFileSync('src/core/worker-pool.ts', 'utf8');
-    expect(wp).toContain('autoWorktreeFallbackDir: ds.session.autoWorktreeFallbackDir,');
+    expect(wp).toMatch(/autoWorktreeFallbackDir: ds\.session\.autoWorktreeFallbackDir\b/);
     const w = readFileSync('src/worker.ts', 'utf8');
-    const i = w.indexOf('const sandboxMode = resolveLocalSandboxMode(');
-    const j = w.indexOf('fallbackDir: cfg.autoWorktreeFallbackDir,');
-    expect(i).toBeGreaterThan(0);
-    expect(j).toBeGreaterThan(i);
-    expect(w.slice(j, j + 200)).toContain('if (fallbackError) throw new Error(fallbackError);');
+    const resolvedAt = w.search(/const sandboxMode = resolveLocalSandboxMode\(/);
+    const gate = w.match(/const (\w+) = autoWorktreeFallbackSandboxError\(\{[^}]*\bsandboxMode\b[^}]*cfg\.autoWorktreeFallbackDir[^}]*\}\);\s*if \(\1\) throw /);
+    expect(resolvedAt).toBeGreaterThan(0);
+    expect(gate).not.toBeNull();
+    expect(gate!.index!).toBeGreaterThan(resolvedAt);
+    expect(gate!.index!).toBeLessThan(w.search(/backend\.spawn\(spawnBin, spawnArgs\b/));
   });
 });
 

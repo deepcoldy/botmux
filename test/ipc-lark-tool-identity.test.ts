@@ -10,10 +10,20 @@ import * as tokens from '../src/utils/user-token.js';
 import { config } from '../src/config.js';
 import { prepareLarkToolEnv, larkToolBindingPath, type LarkToolBinding } from '../src/core/lark-tool-binding.js';
 import { fakeLarkHelpScript } from './helpers/lark-tool-help.js';
-import { spawnTsScript } from './helpers/ts-runner.js';
+import { spawnTsEvalWithRepoImports, spawnTsScript } from './helpers/ts-runner.js';
+import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { publishTurnCliIdentity } from '../src/core/turn-cli-identity.js';
+import { currentGatewayCallerOpenId } from '../src/core/gateway-turn-caller.js';
+import { buildDocCommentTurnInput } from '../src/core/doc-comment-prompt.js';
 import { clearLarkToolDelegations } from '../src/core/lark-tool-delegation.js';
 import { Client } from '@larksuiteoapi/node-sdk';
+import { createServer, type Server } from 'node:http';
+import { spawn, type ChildProcess } from 'node:child_process';
+import { __setPlatformCredentialDepsForTest } from '../src/core/platform-credential-source.js';
+import {
+  createProtectedLoopbackProxyAttestation,
+  PROTECTED_LOOPBACK_ATTESTATION_HEADER,
+} from '../src/core/protected-loopback-attestation.js';
 
 let dir: string, previousDataDir: string, ipc: IpcServerHandle | undefined, session: any, binding: LarkToolBinding;
 const botToken = vi.fn<() => Promise<unknown>>();
@@ -22,8 +32,11 @@ beforeEach(async () => {
   binding = prepareLarkToolEnv({ env: { PATH: '/usr/bin:/bin' }, dataDir: dir, sessionId: 'tool-session', appId: 'cli_bound' });
   session = {
     session: { sessionId: 'tool-session', status: 'active', replyTargets: { om_turn: { senderOpenId: 'ou_sender' } } },
-    larkAppId: 'cli_bound', chatId: 'oc_chat', worker: { killed: false },
-    managedTurnOrigin: { turnId: 'om_turn', capability: 'cap', callerOpenId: 'ou_sender' },
+    larkAppId: 'cli_bound', chatId: 'oc_chat', chatType: 'p2p', worker: { pid: process.pid, killed: false }, workerGeneration: 1,
+    localProcessAttestation: { backendType: 'pty', workerGeneration: 1,
+      cliPid: process.pid, cliProcStart: readProcessStartIdentity(process.pid) },
+    managedTurnOrigin: { turnId: 'om_turn', capability: 'cap', callerOpenId: 'ou_sender',
+      preexistingProcessIdentities: [`${process.pid}:${readProcessStartIdentity(process.pid)}`] },
   };
   vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 'tool-session' ? session : undefined);
   vi.spyOn(bots, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret' } } as any);
@@ -46,7 +59,59 @@ async function request(mode: string, accessKey = binding.accessKey) {
   });
 }
 describe('session application identity route', () => {
-  async function delegate(options: { tools?: ('lark-cli' | 'bytedcli')[]; denialReason?: 'target_access_denied' | 'target_validation_unavailable'; targetOpenId?: string; turnId?: string } = {}) {
+  it.skipIf(process.platform !== 'linux')('accepts a signed original peer through the trusted loopback proxy and binds it to the live turn', async () => {
+    const cliRoot: ChildProcess = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      stdio: 'ignore',
+    });
+    try {
+      if (!cliRoot.pid) throw new Error('fixture cli root did not start');
+      const cliProcStart = readProcessStartIdentity(cliRoot.pid);
+      session.localProcessAttestation = {
+        backendType: 'pty', workerGeneration: 1, cliPid: cliRoot.pid, cliProcStart,
+      };
+      session.managedTurnOrigin.preexistingProcessIdentities = [`${cliRoot.pid}:${cliProcStart}`];
+      session.protectedLoopbackProxyAttestation = {
+        secret: 'ab'.repeat(32), workerGeneration: 1,
+      };
+      const path = '/api/sessions/tool-session/lark-tool-identity';
+      const body = Buffer.from(JSON.stringify({ mode: 'user' }));
+      const headers = {
+        'content-type': 'application/json',
+        'x-botmux-lark-session': binding.accessKey,
+      };
+      const attestation = createProtectedLoopbackProxyAttestation(
+        session.protectedLoopbackProxyAttestation.secret,
+        {
+          sessionId: 'tool-session', serviceId: 'lark-tool-identity', workerGeneration: 1,
+          turnId: 'om_turn', peer: { pid: cliRoot.pid, procStart: cliProcStart },
+          method: 'POST', path, headers, body,
+        },
+      );
+
+      const direct = await request('user');
+      expect(direct.status).toBe(403);
+      const proxied = await fetch(`http://127.0.0.1:${ipc!.port}${path}`, {
+        method: 'POST',
+        headers: { ...headers, [PROTECTED_LOOPBACK_ATTESTATION_HEADER]: attestation },
+        body,
+      });
+      expect(proxied.status).toBe(200);
+      expect(await proxied.json()).toMatchObject({ mode: 'user', credential: 'bound-user-token' });
+
+      session.managedTurnOrigin.turnId = 'om_later';
+      const stale = await fetch(`http://127.0.0.1:${ipc!.port}${path}`, {
+        method: 'POST',
+        headers: { ...headers, [PROTECTED_LOOPBACK_ATTESTATION_HEADER]: attestation },
+        body,
+      });
+      expect(stale.status).toBe(403);
+      expect(await stale.json()).toMatchObject({ error: 'current_execution_unverified' });
+    } finally {
+      cliRoot.kill('SIGKILL');
+    }
+  });
+
+  async function delegate(options: { tools?: ('lark-cli' | 'bytedcli')[]; denialReason?: 'target_access_denied' | 'target_validation_unavailable'; targetOpenId?: string; turnId?: string; recheck?: () => string | undefined } = {}) {
     session.managedTurnOrigin.callerOpenId = 'ou_dispatch_bot';
     const botConfig = { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',
       larkToolBinding: true,
@@ -54,10 +119,62 @@ describe('session application identity route', () => {
     vi.mocked(bots.getBot).mockReturnValue({ config: botConfig } as any);
     await publishTurnCliIdentity({ botConfig, sessionDataDir: dir, sessionId: 'tool-session',
       senderOpenId: 'ou_dispatch_bot', turnId: options.turnId ?? 'om_turn', delegatedIdentity: {
-        credentialOpenId: 'ou_source_human', targetOpenId: options.targetOpenId ?? 'ou_target_human',
+        credentialOpenId: 'ou_source_human', targetOpenId: options.targetOpenId ?? 'ou_target_human', unionId: 'on_source_human',
         tools: options.tools ?? ['lark-cli'], dispatchRoot: 'om_dispatch_root', denialReason: options.denialReason,
+        ...(options.recheck ? { workflowHandoff: true as const, recheck: options.recheck } : {}),
       } });
   }
+  it('re-checks a workflow handoff delegation on every use; once it stops holding it is refused for good', async () => {
+    let refusal: string | undefined;
+    await delegate({ recheck: () => refusal });
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue('target-grant');
+    expect(await (await request('user')).json()).toMatchObject({ ok: true, credential: 'target-grant' });
+    refusal = 'attempt_inactive'; // e.g. the run was cancelled and the stop never arrived
+    const refused = await request('user');
+    expect(refused.status).toBe(403);
+    expect(await refused.json()).toMatchObject({ ok: false, error: expect.stringMatching(/delegation_inactive.*--dispatch-root om_dispatch_root/) });
+    expect(tokens.resolveUserToken).toHaveBeenCalledTimes(1);
+    refusal = undefined;
+    expect((await request('user')).status).toBe(403);
+  });
+  it('an inactive workflow delegation cannot start an authorization for its human either', async () => {
+    await delegate({ recheck: () => 'handoff_revoked' });
+    const requestAuth = vi.spyOn(tokens, 'requestUserAuthorization');
+    const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
+      body: JSON.stringify({ scopes: ['im:chat:read'] }),
+    });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ ok: false, error: 'current_actor_unverified' });
+    expect(requestAuth).not.toHaveBeenCalled();
+  });
+  it('serves a refusal instead of the published bytedcli identity once a workflow delegation stops holding', async () => {
+    const { writeSessionIdentity } = await import('../src/core/cli-identity.js');
+    const { rememberLarkToolDelegation } = await import('../src/core/lark-tool-delegation.js');
+    vi.spyOn(workerPool, 'identityStorageModelForDaemonSession').mockReturnValue('proven');
+    session.reportedIdentityModel = { model: 'proven' };
+    writeSessionIdentity(dir, 'tool-session', { tool: 'bytedcli', cloudJwt: 'alice-cloud', turnId: 'om_turn' } as any, 'proven');
+    let refusal: string | undefined;
+    rememberLarkToolDelegation(dir, 'tool-session', 'om_turn', {
+      credentialOpenId: 'ou_source_human', targetOpenId: 'ou_target_human', unionId: 'on_source_human',
+      tools: ['bytedcli'], dispatchRoot: 'om_handoff', workflowHandoff: true, recheck: () => refusal,
+    });
+    const identity = async () => (await fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: 'tool-session', tool: 'bytedcli' }),
+    })).json();
+    expect(await identity()).toMatchObject({ status: 'verified', env: expect.stringContaining('alice-cloud') });
+    refusal = 'handoff_revoked';
+    const after = await identity();
+    // Capture the primitive BEFORE the asymmetric-matcher assertion: Bun's
+    // toMatchObject replaces the matched nested field on the RECEIVED object
+    // with the matcher instance (measured on Bun 1.4), so reading after.env
+    // after the expectation hands back an ExpectStringContaining, not a string.
+    const afterEnv: string = after.env;
+    expect(after).toMatchObject({ status: 'verified', env: expect.stringContaining('no longer active') });
+    expect(afterEnv).not.toContain('alice-cloud');
+    expect(afterEnv).toContain('--dispatch-root om_handoff');
+  });
   it('uses the verified delegated human’s target-app authorization, never the dispatch bot or source token', async () => {
     await delegate();
     vi.mocked(tokens.resolveUserToken).mockImplementation(async (app, _secret, _brand, person) =>
@@ -133,7 +250,7 @@ describe('session application identity route', () => {
     await delegate({ targetOpenId: 'ou_later', turnId: 'om_queued' });
     await request('user');
     expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_target_human');
-    session.managedTurnOrigin = { turnId: 'om_direct', capability: 'cap', callerOpenId: 'ou_sender' };
+    session.managedTurnOrigin = { ...session.managedTurnOrigin, turnId: 'om_direct', capability: 'cap', callerOpenId: 'ou_sender' };
     await request('user');
     expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_sender');
   });
@@ -146,6 +263,51 @@ describe('session application identity route', () => {
     const user = await request('user');
     expect(await user.json()).toEqual({ ok: true, appId: 'cli_bound', mode: 'user', credentialType: 'user_access_token', credential: 'bound-user-token' });
     expect(tokens.resolveUserToken).toHaveBeenCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_sender');
+  });
+  it('uses each document turn author’s own grant without a normal message reply target', async () => {
+    session.session = {
+      sessionId: 'tool-session', status: 'active', ownerOpenId: 'ou_owner',
+      docCommentTargets: {
+        comment_a: { fileToken: 'file', fileType: 'docx', commentId: 'thread', turnId: 'comment_a', replyToOpenId: 'ou_author_a' },
+        comment_b: { fileToken: 'file', fileType: 'docx', commentId: 'thread', turnId: 'comment_b', replyToOpenId: 'ou_author_b' },
+      },
+    };
+    vi.mocked(identities.resolveVerifiedUserIdentity).mockImplementation(async (_app, person) => ({ openId: person, type: 'user' } as any));
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async (_app, _secret, _brand, person) => `grant:${person}`);
+    for (const [turnId, author] of [['comment_a', 'ou_author_a'], ['comment_b', 'ou_author_b'], ['comment_a', 'ou_author_a']]) {
+      const { cliInput } = buildDocCommentTurnInput({ ds: session,
+        promptInput: { fileToken: 'file', fileType: 'docx', question: 'Read the author profile', author },
+        botCliId: 'codex', sender: { openId: author, type: 'user' }, mode: 'live', turnId });
+      session.managedTurnOrigin = { ...session.managedTurnOrigin, turnId, capability: 'cap',
+        identityTurnId: turnId, trustedCaller: cliInput.trustedCaller ?? null,
+        callerOpenId: cliInput.trustedCaller?.requestUserOpenId };
+      expect(currentGatewayCallerOpenId(session, turnId)).toBe(author);
+      const response = await request('user');
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ appId: 'cli_bound', credential: `grant:${author}` });
+      expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', author);
+    }
+  });
+  it('does not resolve a comment author’s grant when the identity is not a verified user', async () => {
+    session.session.replyTargets = undefined;
+    session.session.docCommentTargets = {
+      comment_a: { fileToken: 'file', fileType: 'docx', commentId: 'thread', turnId: 'comment_a', replyToOpenId: 'ou_bot' },
+    };
+    session.managedTurnOrigin = { ...session.managedTurnOrigin, turnId: 'comment_a', capability: 'cap', callerOpenId: currentGatewayCallerOpenId(session, 'comment_a') };
+    vi.spyOn(identities, 'getIdentity').mockReturnValue(undefined);
+    vi.mocked(identities.resolveVerifiedUserIdentity).mockResolvedValue({ openId: 'ou_bot', type: 'bot' } as any);
+    expect((await request('user')).status).toBe(403);
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+  });
+  it('never substitutes the document session owner for an unknown comment author', async () => {
+    session.session.replyTargets = undefined;
+    session.session.ownerOpenId = 'ou_owner';
+    session.session.docCommentTargets = {
+      comment_a: { fileToken: 'file', fileType: 'docx', commentId: 'thread', turnId: 'comment_a' },
+    };
+    session.managedTurnOrigin = { ...session.managedTurnOrigin, turnId: 'comment_a', capability: 'cap', callerOpenId: currentGatewayCallerOpenId(session, 'comment_a') };
+    expect((await request('user')).status).toBe(403);
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
   });
   it('rejects another session key and an application mismatch', async () => {
     expect((await request('bot', '00'.repeat(32))).status).toBe(403);
@@ -229,6 +391,57 @@ describe('session application identity route', () => {
     const response = await request('user');
     expect(response.status).toBe(409); expect(await response.text()).not.toContain('wrong-turn-token');
   });
+  it.skipIf(process.platform !== 'linux')('allows a callerless scheduled execution with a scoped delegated user', async () => {
+    await delegate();
+    delete session.managedTurnOrigin.callerOpenId;
+    const response = await request('user');
+    expect(response.status).toBe(200);
+    expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_target_human');
+  });
+  it.skipIf(process.platform !== 'linux').each(['generation', 'attempt', 'capability', 'identity'])(
+    'withholds a token when the execution changes during resolution (%s)', async change => {
+      vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+        if (change === 'generation') session.workerGeneration++;
+        if (change === 'attempt') session.managedTurnOrigin.dispatchAttempt = 2;
+        if (change === 'capability') session.managedTurnOrigin.capability = 'next-capability';
+        if (change === 'identity') session.managedTurnOrigin.identityTurnId = 'other-identity';
+        return 'late-token';
+      });
+      const response = await request('user');
+      expect(response.status).toBe(409);
+      expect(await response.text()).not.toContain('late-token');
+    },
+  );
+  it.skipIf(process.platform !== 'linux')('rejects a new tool child of an old shell after another user takes over', async () => {
+    const url = `http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/lark-tool-identity`;
+    const source = `const response = await fetch(${JSON.stringify(url)}, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': ${JSON.stringify(binding.accessKey)} },
+      body: JSON.stringify({ mode: 'user' }) });
+      console.log(JSON.stringify({ status: response.status, body: await response.json() }));`;
+    const shell = spawnTsEvalWithRepoImports(`
+      import { spawnTsEval } from './test/helpers/ts-runner.js';
+      process.once('message', () => {
+        const tool = spawnTsEval(${JSON.stringify(source)}, { stdio: ['ignore', 'inherit', 'inherit'] });
+        tool.once('close', code => process.exit(code ?? 1));
+      });
+      process.send('ready');
+    `, { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+    let output = '';
+    shell.stdout!.on('data', data => { output += data; });
+    try {
+      await new Promise<void>((resolve, reject) => { shell.once('message', () => resolve()); shell.once('error', reject); });
+      session.managedTurnOrigin = { ...session.managedTurnOrigin, turnId: 'om_new', callerOpenId: 'ou_new',
+        capability: 'new-capability', preexistingProcessIdentities: [
+          ...session.managedTurnOrigin.preexistingProcessIdentities,
+          `${shell.pid}:${readProcessStartIdentity(shell.pid!)}`,
+        ] };
+      const finished = new Promise<number | null>(resolve => shell.once('close', resolve));
+      shell.send('run');
+      expect(await finished).toBe(0);
+      expect(JSON.parse(output)).toEqual({ status: 403, body: { ok: false, error: 'current_execution_unverified' } });
+      expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+    } finally { shell.kill(); }
+  });
   it('runs the real tool process with only the selected application credentials', async () => {
     const real = join(dir, 'real-lark');
     writeFileSync(real, '#!/usr/bin/env node\n' + fakeLarkHelpScript() + 'process.stdout.write([process.env.LARKSUITE_CLI_APP_ID,process.env.LARKSUITE_CLI_APP_SECRET,process.env.LARKSUITE_CLI_TENANT_ACCESS_TOKEN,process.env.LARKSUITE_CLI_USER_ACCESS_TOKEN,process.argv.slice(2).join(" ")].map(x=>x||"").join("|"));\n'); chmodSync(real, 0o755);
@@ -259,5 +472,163 @@ describe('session application identity route', () => {
     const res = await request('bot');
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ ok: true, appId: 'cli_bound', mode: 'bot', credential: 'bound-bot-token' });
+  });
+});
+
+describe('platform-issued user credentials in a bound session', () => {
+  // Nobody but the bot owner can grant the bot's own application (its
+  // availability range excludes them), so their --as user comes from the platform.
+  const PLATFORM = { platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' };
+  const platformBot = (credentialSource?: string) => ({ larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',
+    triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none', ...(credentialSource ? { credentialSource } : {}) } });
+  let grants: any[];
+  beforeEach(() => {
+    grants = [];
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => PLATFORM,
+      resolveUnionId: async () => 'on_sender',
+      requestGrant: async req => {
+        grants.push(req);
+        return { ok: true, value: { tool: 'lark-cli', unionId: 'on_sender', expiresAt: Date.now() + 3_600_000,
+          variables: { LARKSUITE_CLI_APP_ID: 'cli_platform', LARKSUITE_CLI_USER_ACCESS_TOKEN: 'platform-user-token' } } } as any;
+      },
+    });
+    vi.mocked(bots.getBot).mockReturnValue({ config: platformBot() } as any);
+  });
+  afterEach(() => __setPlatformCredentialDepsForTest(null));
+  const runTool = (args: string[], port: number) => new Promise<{ code: number | null; out: string; err: string }>((resolve, reject) => {
+    const child = spawnTsScript(join(process.cwd(), 'src/lark-tool-runner.ts'), ['--binding', larkToolBindingPath(dir, 'tool-session'), '--', ...args], {
+      env: { ...process.env, BOTMUX_DAEMON_IPC_PORT: String(port) }, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '', err = ''; child.stdout!.on('data', b => out += b); child.stderr!.on('data', b => err += b);
+    child.on('error', reject); child.on('close', code => resolve({ code, out, err }));
+  });
+  const installFakeTool = () => {
+    const real = join(dir, 'real-lark');
+    writeFileSync(real, '#!/usr/bin/env node\n' + fakeLarkHelpScript() + 'process.stdout.write([process.env.LARKSUITE_CLI_APP_ID,process.env.LARKSUITE_CLI_APP_SECRET,process.env.LARKSUITE_CLI_TENANT_ACCESS_TOKEN,process.env.LARKSUITE_CLI_USER_ACCESS_TOKEN,process.argv.slice(2).join(" ")].map(x=>x||"").join("|"));\n'); chmodSync(real, 0o755);
+    binding.realBinary = real; delete (binding as any).ipcPort;
+    writeFileSync(larkToolBindingPath(dir, 'tool-session'), JSON.stringify(binding), { mode: 0o600 });
+  };
+
+  it('serves a person without a bot-app grant from the platform, under the platform application', async () => {
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    const response = await request('user');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, appId: 'cli_platform', mode: 'user', credentialType: 'user_access_token',
+      credential: 'platform-user-token', issuer: 'platform' });
+    expect(grants[0]).toMatchObject({ tool: 'lark-cli', unionId: 'on_sender', appId: 'cli_bound', sessionId: 'tool-session', turnId: 'om_turn' });
+  });
+  it('keeps the bot-app grant for a person who has one, without asking the platform', async () => {
+    const response = await request('user');
+    expect(await response.json()).toEqual({ ok: true, appId: 'cli_bound', mode: 'user', credentialType: 'user_access_token', credential: 'bound-user-token' });
+    expect(grants).toHaveLength(0);
+  });
+  it('serves a delegated human from the platform by the union_id in the dispatch, with the contact API down', async () => {
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => PLATFORM,
+      resolveUnionId: async () => { throw new Error('contact API unavailable'); },
+      requestGrant: async req => {
+        grants.push(req);
+        return { ok: true, value: { tool: 'lark-cli', unionId: 'on_source_human', expiresAt: Date.now() + 3_600_000,
+          variables: { LARKSUITE_CLI_APP_ID: 'cli_platform', LARKSUITE_CLI_USER_ACCESS_TOKEN: 'delegated-platform-token' } } } as any;
+      },
+    });
+    session.managedTurnOrigin.callerOpenId = 'ou_dispatch_bot';
+    const botConfig = { ...platformBot('platform'), larkToolBinding: true } as any;
+    vi.mocked(bots.getBot).mockReturnValue({ config: botConfig } as any);
+    await publishTurnCliIdentity({ botConfig, sessionDataDir: dir, sessionId: 'tool-session',
+      senderOpenId: 'ou_dispatch_bot', turnId: 'om_turn', storageModel: 'proven', delegatedIdentity: {
+        credentialOpenId: 'ou_source_human', targetOpenId: 'ou_target_human', unionId: 'on_source_human',
+        tools: ['lark-cli'], dispatchRoot: 'om_dispatch_root',
+      } });
+    const response = await request('user');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ appId: 'cli_platform', credential: 'delegated-platform-token', issuer: 'platform' });
+    expect(grants.map(grant => grant.unionId)).toEqual(['on_source_human']);
+  });
+  it('platform mode ignores the bot-app grant', async () => {
+    vi.mocked(bots.getBot).mockReturnValue({ config: platformBot('platform') } as any);
+    expect(await (await request('user')).json()).toMatchObject({ appId: 'cli_platform', issuer: 'platform' });
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+  });
+  it('refuses with the platform page, not a bot-app login, when the platform has nothing for the person', async () => {
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => PLATFORM, resolveUnionId: async () => 'on_sender',
+      requestGrant: async () => ({ ok: false, reason: 'not_authorized', error: 'credential_not_found', authorizeUrl: 'https://platform.example.test/credentials' }) as any,
+    });
+    const response = await request('user');
+    expect(response.status).toBe(403);
+    expect(await response.json()).toMatchObject({ ok: false, authorizeUrl: 'https://platform.example.test/credentials' });
+  });
+  it('does not hand out a platform credential when the turn changes while it is being fetched', async () => {
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => PLATFORM, resolveUnionId: async () => 'on_sender',
+      requestGrant: async () => {
+        session.managedTurnOrigin.turnId = 'om_later';
+        return { ok: true, value: { tool: 'lark-cli', unionId: 'on_sender', expiresAt: Date.now() + 3_600_000,
+          variables: { LARKSUITE_CLI_APP_ID: 'cli_platform', LARKSUITE_CLI_USER_ACCESS_TOKEN: 'wrong-turn-token' } } } as any;
+      },
+    });
+    const response = await request('user');
+    expect(response.status).toBe(409);
+    expect(await response.text()).not.toContain('wrong-turn-token');
+  });
+  it('bot calls stay on the bound application', async () => {
+    expect(await (await request('bot')).json()).toMatchObject({ appId: 'cli_bound', mode: 'bot' });
+    expect(grants).toHaveLength(0);
+  });
+  it('auth request sends a person without a bot-app grant to the platform page instead of a bot-app device link', async () => {
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    const deviceFlow = vi.spyOn(tokens, 'requestUserAuthorization');
+    const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
+      body: JSON.stringify({ scopes: ['search:docs:read'] }),
+    });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ ok: false, error: 'platform_authorization_required',
+      authUrl: 'https://platform.example.test/credentials?scope=search%3Adocs%3Aread' });
+    expect(deviceFlow).not.toHaveBeenCalled();
+  });
+  it('auth request does not start a bot-app device flow for a turn that moved on during the platform check', async () => {
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => { session.managedTurnOrigin.turnId = 'om_later'; return 'bot-app-token'; });
+    const deviceFlow = vi.spyOn(tokens, 'requestUserAuthorization');
+    const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/sessions/tool-session/auth-request`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': binding.accessKey },
+      body: JSON.stringify({ scopes: ['search:docs:read'] }),
+    });
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ ok: false, error: 'current_actor_unverified' });
+    expect(deviceFlow).not.toHaveBeenCalled();
+  });
+  it('runs the real tool with the platform application for user calls and the bound one for bot calls', async () => {
+    installFakeTool();
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    const user = await runTool(['docs', '+fetch', '--as=user'], ipc!.port); expect(user.code, user.err).toBe(0);
+    expect(user.out).toBe('cli_platform|||platform-user-token|docs +fetch --as user');
+    const bot = await runTool(['docs', '+fetch'], ipc!.port); expect(bot.code, bot.err).toBe(0);
+    expect(bot.out).toBe('cli_bound||bound-bot-token||docs +fetch --as bot');
+  });
+  describe('the runner trusts a different application only for an explicit platform user grant', () => {
+    let fake: Server; let reply: Record<string, unknown>;
+    beforeEach(async () => {
+      fake = createServer((_req, res) => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify(reply)); });
+      await new Promise<void>(r => fake.listen(0, '127.0.0.1', r));
+      installFakeTool();
+    });
+    afterEach(() => new Promise<void>(r => fake.close(() => r())));
+    const port = () => (fake.address() as { port: number }).port;
+    it.each([
+      ['another application without the platform marker', { ok: true, appId: 'cli_other', mode: 'user', credentialType: 'user_access_token', credential: 'x' }, ['--as=user']],
+      ['a platform marker with a malformed application id', { ok: true, appId: 'not an app', mode: 'user', credentialType: 'user_access_token', credential: 'x', issuer: 'platform' }, ['--as=user']],
+      ['a platform marker on a bot call', { ok: true, appId: 'cli_other', mode: 'bot', credentialType: 'tenant_access_token', credential: 'x', issuer: 'platform' }, []],
+    ])('refuses %s', async (_label, body, extra) => {
+      reply = body;
+      const run = await runTool(['docs', '+fetch', ...extra as string[]], port());
+      expect(run.code).not.toBe(0);
+      expect(run.out).toBe('');
+    });
   });
 });

@@ -141,6 +141,38 @@ describe('user authorization device flow', () => {
     expect(grantedScope).toBe(auth.scopes.join(' '));
   });
 
+  it.each([undefined, 'base:field:read', 'base:record:read'])(
+    'bundles task scopes in one incremental grant and refuses missing %s', async missing => {
+      const path = join(tokenDir, `user-token-${APP}-${USER}.json`);
+      const existing = {
+        access_token: 'old-token', refresh_token: 'old-refresh', token_type: 'Bearer',
+        expires_at: '2026-09-19T01:00:00.000Z', refresh_expires_at: '2026-10-19T00:00:00.000Z',
+        scope: 'im:message:readonly im:resource offline_access', appId: APP, brand: 'feishu', openId: USER,
+      };
+      writeFileSync(path, JSON.stringify(existing));
+      const scopes = ['base:field:read', 'base:record:read'];
+      const auth = await requestUserAuthorization(APP, 'secret', 'feishu', scopes, USER, () => current);
+      expect(auth.scopes).toEqual([...existing.scope.split(' '), ...scopes]);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(new URLSearchParams(fetchMock.mock.calls[0][1].body as URLSearchParams).get('scope'))
+        .toBe(auth.scopes.join(' '));
+      expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(existing);
+      if (missing) tokenBody.scope = auth.scopes.filter(scope => scope !== missing).join(' ');
+      advance(5);
+      if (missing) {
+        expect(await auth.poll()).toEqual({ status: 'failed', error: 'authorization_scope_missing' });
+        expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(existing);
+      } else {
+        expect(await auth.poll()).toEqual({ status: 'ready', token: TOKEN });
+        expect(JSON.parse(readFileSync(path, 'utf8'))).toMatchObject({
+          openId: USER, appId: APP, scope: auth.scopes.join(' '),
+        });
+      }
+      expect(fetchMock.mock.calls.filter(([url]) => url.endsWith('/device_authorization'))).toHaveLength(1);
+      expect(existsSync(join(tokenDir, `user-token-${APP}-ou_other.json`))).toBe(false);
+    },
+  );
+
   it('does not overwrite a token whose scopes expanded while authorization was pending', async () => {
     const path = join(tokenDir, `user-token-${APP}-${USER}.json`);
     const oldToken = {

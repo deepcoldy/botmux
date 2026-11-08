@@ -6,6 +6,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  watch,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -46,6 +47,55 @@ describe('sandbox relay watcher host handoff', () => {
         'send', '--expected-link', first, '--expected-link', second, '--no-mention',
         '--content-file', expect.any(String), '--session-id', 'forced-source',
       ]);
+    } finally {
+      stop();
+    }
+  });
+
+  it('hands relayed images to the host send as --images staged outside the outbox, not as --files', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-image-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+    const fixture = join(root, 'send-echo-image.mjs');
+    writeFileSync(fixture, `
+      import { readFileSync } from 'node:fs';
+      const argv = process.argv.slice(2);
+      const imagePath = argv[argv.indexOf('--images') + 1];
+      process.stdout.write(JSON.stringify({ argv, imageBytes: readFileSync(imagePath, 'utf8') }));
+    `);
+    const id = 'image-1';
+    const imageName = `${id}-deadbeef-chart.png`;
+    writeFileSync(join(outbox, `${id}.content`), 'look at this chart');
+    writeFileSync(join(outbox, imageName), 'PNG-BYTES');
+    writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
+      contentFile: `${id}.content`,
+      images: [imageName],
+      flags: ['--no-mention'],
+    }));
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-source', { cliPath: fixture });
+    try {
+      const responsePath = join(outbox, `${id}.res.json`);
+      await vi.waitFor(() => expect(existsSync(responsePath)).toBe(true), { timeout: 5_000 });
+      const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
+      expect(response.code, response.stderr).toBe(0);
+      const argv = (JSON.parse(response.stdout) as { argv: string[] }).argv;
+      expect(argv).not.toContain('--files');
+      expect(argv).toEqual([
+        'send', '--no-mention',
+        '--content-file', expect.any(String),
+        '--images', expect.any(String),
+        '--session-id', 'forced-source',
+      ]);
+      const stagedImage = argv[argv.indexOf('--images') + 1];
+      expect(stagedImage.endsWith(`${id}-image0-${imageName}`)).toBe(true);
+      // The bytes cross via the host-private staging dir, a sibling of the outbox —
+      // never via a path that still names the sandbox-writable outbox. The fixture
+      // reads them while the child runs because finish() deletes staging right after.
+      expect(dirname(stagedImage)).toBe(join(root, 'relay-staging'));
+      expect(stagedImage.startsWith(outbox)).toBe(false);
+      const { imageBytes } = JSON.parse(response.stdout) as { imageBytes: string };
+      expect(imageBytes).toBe('PNG-BYTES');
     } finally {
       stop();
     }
@@ -159,6 +209,68 @@ describe('sandbox relay watcher host handoff', () => {
     const fixture = join(root, 'should-not-run.mjs');
     writeFileSync(fixture, `process.stdout.write('ran');`);
     const id = 'dispatch-into-reject';
+    writeFileSync(join(outbox, `${id}.content`), 'task');
+    writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
+      command: 'dispatch', contentFile: `${id}.content`, flags,
+    }));
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-source', { cliPath: fixture });
+    try {
+      const responsePath = join(outbox, `${id}.res.json`);
+      await vi.waitFor(() => expect(existsSync(responsePath)).toBe(true), { timeout: 5_000 });
+      const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
+      expect(response.code).toBe(1);
+      expect(response.stdout).toBe('');
+      expect(response.stderr).toContain(error);
+    } finally {
+      stop();
+    }
+  });
+
+  it('relays task-tree metadata flags (--kind/--task-id/--task-url) through to the host child', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-dispatch-tree-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+    const fixture = join(root, 'dispatch-tree-echo.mjs');
+    writeFileSync(fixture, `
+      process.stdout.write(JSON.stringify({ argv: process.argv.slice(2) }));
+    `);
+    const id = 'dispatch-tree';
+    writeFileSync(join(outbox, `${id}.content`), 'review task');
+    writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
+      command: 'dispatch',
+      contentFile: `${id}.content`,
+      flags: ['--title', 'work', '--bot-app', 'cli_target',
+        '--kind', 'review', '--task-id', 'REQ-1', '--task-url', 'https://example.com/req/1'],
+    }));
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-source', { cliPath: fixture });
+    try {
+      const responsePath = join(outbox, `${id}.res.json`);
+      await vi.waitFor(() => expect(existsSync(responsePath)).toBe(true), { timeout: 5_000 });
+      const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
+      expect(response.code, response.stderr).toBe(0);
+      const { argv } = JSON.parse(response.stdout) as { argv: string[] };
+      expect(argv).toContain('review');
+      expect(argv).toContain('REQ-1');
+      expect(argv).toContain('https://example.com/req/1');
+      expect(argv[argv.indexOf('--kind') + 1]).toBe('review');
+    } finally {
+      stop();
+    }
+  });
+
+  it.each([
+    ['a bad --kind enum', ['--title', 't', '--kind', 'bogus'], 'dispatch --kind must be task or review'],
+    ['a non-https --task-url', ['--title', 't', '--task-url', 'http://insecure/x'], 'dispatch --task-url must be an https URL'],
+    ['a javascript --task-url', ['--title', 't', '--task-url', 'javascript:alert(1)'], 'dispatch --task-url must be an https URL'],
+  ])('rejects task-tree metadata with %s before spawning the host child', async (_label, flags, error) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-dispatch-tree-reject-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+    const fixture = join(root, 'should-not-run.mjs');
+    writeFileSync(fixture, `process.stdout.write('ran');`);
+    const id = 'dispatch-tree-reject';
     writeFileSync(join(outbox, `${id}.content`), 'task');
     writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
       command: 'dispatch', contentFile: `${id}.content`, flags,
@@ -361,6 +473,44 @@ describe('sandbox relay watcher host handoff', () => {
       expect(authorize).toHaveBeenCalledWith({ capability: 'deadbeef'.repeat(4) });
     } finally {
       stop();
+    }
+  });
+});
+
+// inotify reports a directory's entries in the order they changed; macOS
+// FSEvents may coalesce them, so the ordering proof runs where workers run.
+describe.skipIf(process.platform !== 'linux')('sandbox relay watcher completion order', () => {
+  it.each([
+    ['served', JSON.stringify({ contentFile: 'order-1.content', flags: [] }), 0],
+    ['rejected', '{', 1],
+  ] as const)('consumes a %s request before its response becomes visible', async (_label, request, code) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-order-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+    const fixture = join(root, 'send-ok.mjs');
+    writeFileSync(fixture, `process.stdout.write('ok');`);
+    const id = 'order-1';
+    writeFileSync(join(outbox, `${id}.content`), 'pong');
+    writeFileSync(join(outbox, `${id}.req.json`), request);
+    // Armed after the request exists, so its only rename is its removal.
+    const renamed: string[] = [];
+    const observer = watch(outbox, (event, name) => {
+      if (event === 'rename' && name) renamed.push(String(name));
+    });
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-source', { cliPath: fixture });
+    try {
+      await vi.waitFor(() => expect(renamed).toEqual(
+        expect.arrayContaining([`${id}.req.json`, `${id}.res.json`]),
+      ), { timeout: 10_000 });
+      // Whoever sees the response must find its request already consumed: a
+      // watcher taking over this outbox would otherwise run it a second time.
+      expect(renamed.indexOf(`${id}.req.json`)).toBeLessThan(renamed.indexOf(`${id}.res.json`));
+      const response = JSON.parse(readFileSync(join(outbox, `${id}.res.json`), 'utf8')) as { code: number };
+      expect(response.code).toBe(code);
+    } finally {
+      stop();
+      observer.close();
     }
   });
 });

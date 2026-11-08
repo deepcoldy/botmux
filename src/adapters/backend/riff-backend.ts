@@ -12,11 +12,15 @@ import type {
 } from './types.js';
 import { logger } from '../../utils/logger.js';
 import { escapeXmlTagLikeTokens } from '../../utils/xml.js';
+import { detectImageFormat } from '../../core/attachment-image-format.js';
+import { shellQuote } from '../../core/cli-launch-mode.js';
+import type { RiffHostBinding } from '../../services/riff-host-tools.js';
+import { RIFF_HOST_UNREACHABLE_HINT } from '../../services/riff-host-hint.js';
 
 /**
  * Fallback system prompt injected into every riff task when no explicit
  * `systemPrompt` is configured. Mirrors the `<botmux_routing>` block that
- * codex/gemini/etc. get via buildBotmuxShellHints — the riff agent must use
+ * codex/opencode/etc. get via buildBotmuxShellHints — the riff agent must use
  * `botmux send` to reply (same as any other botmux-bridged CLI), not rely on
  * passive output capture. botmux is installed in the sandbox via setupCommands.
  */
@@ -43,7 +47,7 @@ const DEFAULT_RIFF_SYSTEM_PROMPT = [
   'COMPLETION CONTRACT: a turn is complete ONLY after `botmux send` actually ran and printed ✓ success. Writing the answer solely in your final report/output does NOT reach the user — always run `botmux send` first, then summarize in the report.',
   'Keep final answers concise. For images/files: write them to disk then send via `botmux send --images/--files`.',
   '',
-  'LAST-RESORT fallback (only if the npm install itself fails): call the Feishu Open API directly with the injected BOTMUX_LARK_APP_ID/SECRET — fetch a tenant_access_token, then POST im/v1/messages?receive_id_type=chat_id to BOTMUX_CHAT_ID. Still never use non-BOTMUX credentials.',
+  'LAST-RESORT fallback (only if no host-tools binding is provided and the npm install itself fails): call the Feishu Open API directly with the injected BOTMUX_LARK_APP_ID/SECRET — fetch a tenant_access_token, then POST im/v1/messages?receive_id_type=chat_id to BOTMUX_CHAT_ID. Still never use non-BOTMUX credentials.',
 ].join('\n');
 
 /**
@@ -72,6 +76,11 @@ const MANDATORY_SETUP_COMMANDS = [
 
 export interface RiffBackendConfig {
   baseUrl: string;
+  /** Optional externally reachable worker endpoint; otherwise use the existing
+   * terminal reverse proxy/platform URL, or the worker's advertised address. */
+  hostToolsUrl?: string;
+  /** Worker-only dispatch factory. Never supplied by the Riff API or sandbox. */
+  hostToolsBinding?: () => import('../../services/riff-host-tools.js').RiffHostBinding | undefined;
   templateId?: string;
   /** @deprecated riff 服务端已收敛仅支持 codex（其它值 400）；本字段不再被读取，
    *  任务一律以 agent=codex 创建。保留仅为兼容存量 bots.json。 */
@@ -214,6 +223,17 @@ export function isValidRiffBaseUrl(v: unknown): v is string {
   } catch {
     return false;
   }
+}
+
+/** Public host-tool endpoint, optionally containing a {sessionId} path template. */
+export function isValidRiffHostToolsUrl(v: unknown): v is string {
+  if (typeof v !== 'string' || !v || /[\s\x00-\x1f\x7f'"\\?#]/.test(v)) return false;
+  try {
+    const u = new URL(v);
+    return (u.protocol === 'http:' || u.protocol === 'https:')
+      && !u.username && !u.password && !u.search && !u.hash
+      && u.pathname.endsWith('/api/riff-host-tools');
+  } catch { return false; }
 }
 
 export function isValidRiffSandboxCluster(v: unknown): v is RiffSandboxCluster {
@@ -361,6 +381,47 @@ export async function cancelRiffTaskById(
       return false;
     }
   }
+}
+
+/**
+ * The one-line bootstrap the Riff agent runs before any botmux helper: make sure
+ * the sandbox CLI is the host's exact build, then write this turn's binding.
+ *
+ * `command -v botmux` is usually NOT the binary. npm links the `bin` entry
+ * (scripts/botmux-launcher.sh) and postinstall writes the ~/.botmux/bin/botmux
+ * wrapper `exec "<abs>/botmux-linux-x64/botmux" "$@"` (≈107 bytes). Hashing that
+ * file never matched, so every turn re-downloaded a build that was already
+ * installed — and when the host endpoint answered 502, `set -e` aborted the line
+ * before the bind, turning a clear transport error into `botmux send` ENOENT.
+ * So the check hashes every place the command can resolve to (the file, its
+ * symlink target, the wrapper's exec target, both npm platform-package layouts),
+ * and a failed download/verification falls back to the installed CLI when it
+ * speaks the host-tools protocol, so later helpers report the real HTTP error.
+ *
+ * Runs in a subshell: the agent's shell keeps no options or helper names, and
+ * the line's status is the bind's (or 1 with a named reason). Every value from
+ * the binding is shell-quoted; the checksum is also validated by the host.
+ */
+export function buildRiffHostBootstrap(binding: RiffHostBinding): string {
+  const bind = `BOTMUX_RIFF_HOST_TOOLS=1 botmux riff-host-bind ${Buffer.from(JSON.stringify(binding)).toString('base64url')}`;
+  if (!binding.cliSha256) return bind;
+  const download = shellQuote(`riff_host_cli_download_failed (see the curl error above): ${RIFF_HOST_UNREACHABLE_HINT}`);
+  const verify = shellQuote('riff_host_cli_checksum_mismatch: the downloaded CLI does not match the host build');
+  const fallback = shellQuote('riff_host_cli_not_updated: continuing with the installed botmux (it supports riff_host_tools_v1); botmux helpers may still fail with the same host error');
+  const unavailable = shellQuote('riff_host_cli_unavailable: no installed botmux supports riff_host_tools_v1, so botmux helpers cannot run in this turn; report this error');
+  return [
+    `( want=${shellQuote(binding.cliSha256)}`,
+    `target="$(command -v botmux || printf '%s/bin/botmux' "$(npm prefix -g 2>/dev/null)")"`,
+    `real="$(readlink -f "$target" 2>/dev/null || printf '%s' "$target")"`,
+    `pkg="$(dirname "$(dirname "$real")")"`,
+    // The postinstall wrapper's exact shape; anything else yields no candidate.
+    `wrapped="$(sed -n 's/^exec "\\(\\/[^"]*\\)" "\\$@"$/\\1/p' "$real" 2>/dev/null | head -n 1)"`,
+    'ok=0',
+    `for c in "$target" "$real" "$wrapped" "$pkg/node_modules/botmux-linux-x64/botmux" "$pkg/../botmux-linux-x64/botmux" "$pkg/node_modules/botmux-linux-x64-musl/botmux" "$pkg/../botmux-linux-x64-musl/botmux"; do if [ -n "$c" ] && [ -f "$c" ] && [ "$(sha256sum "$c" 2>/dev/null | cut -d' ' -f1)" = "$want" ]; then ok=1; break; fi; done`,
+    `if [ "$ok" != 1 ]; then artifact="$(mktemp)"; if ! curl --noproxy '*' --fail --silent --show-error --max-time 180 -H ${shellQuote(`x-riff-host-token: ${binding.token}`)} ${shellQuote(`${binding.url}?artifact=cli`)} -o "$artifact"; then printf '%s\\n' ${download} >&2; elif [ "$(sha256sum "$artifact" 2>/dev/null | cut -d' ' -f1)" != "$want" ]; then printf '%s\\n' ${verify} >&2; elif chmod 755 "$artifact" && mv -f "$artifact" "$target"; then ok=1; fi; rm -f "$artifact"; fi`,
+    `if [ "$ok" != 1 ]; then if botmux capabilities --json 2>/dev/null | grep -q '"riff_host_tools_v1": *true'; then printf '%s\\n' ${fallback} >&2; else printf '%s\\n' ${unavailable} >&2; exit 1; fi; fi`,
+    `${bind} )`,
+  ].join('; ');
 }
 
 /** Irreversible short hash of a sandbox URL for log correlation — the unique
@@ -2032,7 +2093,22 @@ export class RiffBackend implements SessionBackend {
     const sys = custom
       ? `${DEFAULT_RIFF_SYSTEM_PROMPT}\n\n<additional_instructions>\n${custom}\n</additional_instructions>`
       : DEFAULT_RIFF_SYSTEM_PROMPT;
-    return `<system>\n${sys}\n</system>\n\n${prompt}`;
+    let binding: RiffHostBinding | undefined;
+    let unavailable = false;
+    try { binding = this.config.hostToolsBinding?.(); }
+    catch {
+      // Binding is optional infrastructure. Never drop a user message because
+      // URL resolution, PID publication, CLI hashing or storage failed. Avoid
+      // logging the thrown value: it can contain credentials or a private URL.
+      logger.warn('[riff] host-tools binding unavailable; continuing task without host tools');
+      unavailable = true;
+    }
+    const host = binding
+      ? `\n\n<botmux_host_tools>\nBefore ANY botmux helper in this turn, run this exact bootstrap command once (also on follow-ups). It installs the verified host build before binding:\n${buildRiffHostBootstrap(binding)}\nFor EVERY following botmux helper, also use the explicit prefix BOTMUX_RIFF_HOST_TOOLS=1 (including in existing tasks whose creation-time environment cannot change).\nAll stateful botmux helpers execute on the owning host. Card stream open/write/snapshot/reanchor/finish are supported. Whiteboard supports status only; skip other whiteboard operations even if a generic skill describes them.\nNever print or forward this private binding. If the host is unavailable, report the error; do not call Lark directly or start a sandbox daemon.\n</botmux_host_tools>`
+      : unavailable
+        ? '\n\n<botmux_host_tools_unavailable>Host tools are unavailable for this turn. Continue processing the request, but report the delivery/tool failure in the task output. Do not use a previous binding, call Lark directly, seek other credentials, or start a sandbox daemon. This overrides the direct-API fallback above.</botmux_host_tools_unavailable>'
+        : '';
+    return `<system>\n${sys}${host}\n</system>\n\n${prompt}`;
   }
 
   /**
@@ -2141,7 +2217,10 @@ export class RiffBackend implements SessionBackend {
   private async readFileAsBlob(path: string): Promise<Blob> {
     const { readFile } = await import('node:fs/promises');
     const buf = await readFile(path);
-    return new Blob([buf]);
+    // Riff validates the multipart media type; synthetic filenames may have
+    // missing or incorrect extensions, so identify images from their bytes.
+    const type = detectImageFormat(buf)?.mimeType ?? 'application/octet-stream';
+    return new Blob([buf], { type });
   }
 
   /**

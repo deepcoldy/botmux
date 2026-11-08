@@ -52,6 +52,7 @@ import {
   type DeviceIsolationRuntimeSession,
 } from '../src/core/device-isolation-daemon.js';
 import { rememberAppliedUnprovableEnvKeys } from '../src/core/worker-pool.js';
+import { FileLockTimeoutError, withFileLockSync } from '../src/utils/file-lock.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const FILE = 'mojo-launcher-env-quarantine.json';
@@ -354,17 +355,18 @@ describe('quarantine durability and integrity', () => {
       .toThrow(MojoQuarantineUnavailableError);
   });
 
-  it('holds the cross-process lock while mutating', () => {
+  it('never mutates the ledger while another holder owns its cross-process lock', () => {
     // The lock is what makes the fresh RMW safe for several per-bot daemons on one
-    // data dir; assert the implementation still takes it.
-    const src = readFileSync(
-      new URL('../src/core/mojo-launcher-env-quarantine.ts', import.meta.url), 'utf8');
-    expect(src).toContain('withFileLockSync(path, () => {');
-    const mutate = src.slice(src.indexOf('export function recordQuarantinedLauncherEnvKeys'));
-    expect(mutate).toContain('withFileLockSync');
-    // …and that the read inside it is fresh, not a cached snapshot.
-    expect(mutate).toContain('const data = readStrict(dataDir);');
-  });
+    // data dir. Hold it the way another daemon would: the writer must give up
+    // (and the caller learn the risk was not recorded) rather than write past it.
+    recordQuarantinedLauncherEnvKeys('sid-seed', ['PATH'], dir);
+    const before = readFileSync(join(dir, FILE), 'utf8');
+    withFileLockSync(join(dir, FILE), () => {
+      expect(() => recordQuarantinedLauncherEnvKeys('sid-1', ['LD_PRELOAD'], dir))
+        .toThrow(FileLockTimeoutError);
+    });
+    expect(readFileSync(join(dir, FILE), 'utf8')).toBe(before);
+  }, 20_000);
 
   it('PROPAGATES a write failure instead of logging and swallowing it', () => {
     // Read-only dir => rename/write fails. The caller must learn the risk was not
@@ -393,15 +395,16 @@ describe('quarantine durability and integrity', () => {
   });
 
   it('uses a unique temp file so two writers cannot clobber each other', () => {
+    // Another writer's in-flight temp under the shared `<file>.tmp` name: a fixed
+    // temp name would overwrite it and rename it away.
+    const foreignTmp = join(dir, `${FILE}.tmp`);
+    writeFileSync(foreignTmp, 'other writer');
     recordQuarantinedLauncherEnvKeys('sid-1', ['LD_PRELOAD'], dir);
-    // A shared `<file>.tmp` name would race; assert none is left behind and that
-    // the implementation is not using the fixed name.
-    const leftovers = readdirSync(dir).filter((f) => f.endsWith('.tmp'));
+    expect(readFileSync(foreignTmp, 'utf8')).toBe('other writer');
+    expect(quarantinedLauncherEnvKeys('sid-1', dir)).toEqual(['LD_PRELOAD']);
+    // …and our own temp is not left behind.
+    const leftovers = readdirSync(dir).filter((f) => f.endsWith('.tmp') && f !== `${FILE}.tmp`);
     expect(leftovers).toEqual([]);
-    const src = readFileSync(
-      new URL('../src/core/mojo-launcher-env-quarantine.ts', import.meta.url), 'utf8');
-    expect(src).not.toContain('`${path}.tmp`');
-    expect(src).toContain('randomBytes');
   });
 
   it('writes nothing for an empty key set', () => {

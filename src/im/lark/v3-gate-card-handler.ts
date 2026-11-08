@@ -101,6 +101,19 @@ export async function handleV3GateAction(
       },
     };
   }
+  if (outcome.kind === 'voided' || (outcome.kind === 'already-settled' && outcome.status === 'voided')) {
+    // A runtime flow revision replaced this node before anyone decided: show
+    // the card frozen as void instead of a misleading "already decided" toast.
+    const wait = readWait(runDir, value.waitId);
+    return JSON.parse(buildV3GateCard({
+      runId: value.runId,
+      waitId: value.waitId,
+      nodeId: value.nodeId,
+      prompt: wait?.prompt ?? '',
+      ...(wait?.hostApproval ? { hostApproval: wait.hostApproval } : {}),
+      resolution: { kind: 'voided' },
+    }));
+  }
   if (outcome.kind === 'already-settled') {
     // Idempotent recovery (codex nit #14): if a prior click already APPROVED the
     // gate but its driveRun didn't land (transient), a re-click should re-drive

@@ -12,6 +12,7 @@ export async function collectNativePrint(executable: string, args: string[], run
   let pending = '';
   let failure: Error | undefined;
   let hardKill: ReturnType<typeof setTimeout> | undefined;
+  let stdinClosed = false;
   const decoder = new StringDecoder('utf8');
   const kill = (sig: NodeJS.Signals) => {
     if (!child.pid) return;
@@ -40,20 +41,46 @@ export async function collectNativePrint(executable: string, args: string[], run
     }
   });
   child.stderr.on('data', count);
-  child.stdin.on('error', () => fail(new Error('native_transport_closed')));
+  // EPIPE only arrives once the owner-guard shell itself has exited (it keeps
+  // stdin open while the native process runs), so its exit status is already
+  // final and — not the order in which the two events land — classifies the
+  // run: a missing executable exits 127 and is an inference failure (#2325).
+  // Still reap the group: a descendant left holding stdout would otherwise keep
+  // 'close' (which waits for every stdio pipe) from ever arriving.
+  child.stdin.on('error', () => {
+    stdinClosed = true;
+    kill('SIGTERM');
+    hardKill ??= setTimeout(() => kill('SIGKILL'), 1000);
+  });
   child.on('error', () => fail(new Error('native_spawn_failed')));
-  const exited = new Promise<number | null>(resolve => child.once('close', resolve));
+  // Classify on 'exit' ('close' still covers a failed spawn, which never exits):
+  // 'close' also waits for stdout/stderr, and a descendant left holding them
+  // keeps it from ever arriving.
+  const exited = new Promise<number | null>(resolve => { child.once('exit', resolve); child.once('close', resolve); });
+  const closed = new Promise<void>(resolve => child.once('close', () => resolve()));
   signal.addEventListener('abort', abort, { once: true });
   try {
     if (signal.aborted) abort(); else child.stdin.end(runtime.input);
     const code = await exited;
+    // Reap what the run left in its group, then drain the pipes, bounded in case
+    // a descendant escaped the group.
+    kill('SIGTERM');
+    hardKill ??= setTimeout(() => kill('SIGKILL'), 1000);
+    let drainTimer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([closed, new Promise<void>(resolve => { drainTimer = setTimeout(resolve, 2000); })]);
+    clearTimeout(drainTimer);
     if (failure) throw failure;
     if (code !== 0) throw new Error('native_inference_failed');
+    // 'close' does not wait for stdin, so EPIPE may not have landed yet: an
+    // unfinished write is undelivered input too.
+    if (stdinClosed || !child.stdin.writableFinished) throw new Error('native_transport_closed');
     output += decoder.end();
     if (runtime.onLine && pending.trim()) runtime.onLine(pending);
     return output;
   } finally {
     signal.removeEventListener('abort', abort);
     if (hardKill) clearTimeout(hardKill);
+    child.stdout.destroy();
+    child.stderr.destroy();
   }
 }

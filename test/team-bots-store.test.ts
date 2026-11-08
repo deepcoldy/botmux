@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
-  recordTeamBot, isTeamBot, listTeamBots, removeTeamBot, DEFAULT_EXPIRY_MS,
+  recordTeamBot, isTeamBot, listTeamBots, DEFAULT_EXPIRY_MS,
 } from '../src/services/team-bots-store.js';
 
 let dataDir: string;
@@ -50,13 +50,5 @@ describe('team-bots-store', () => {
     expect(listTeamBots(dataDir, DEFAULT_EXPIRY_MS, later)).toEqual([]);
     // still trusted just within the window
     expect(isTeamBot(dataDir, 'on_b', DEFAULT_EXPIRY_MS, t0 + DEFAULT_EXPIRY_MS)).toBe(true);
-  });
-
-  it('removeTeamBot forgets a teammate (explicit revoke)', () => {
-    recordTeamBot(dataDir, { unionId: 'on_b' });
-    expect(removeTeamBot(dataDir, 'on_b')).toBe(true);
-    expect(isTeamBot(dataDir, 'on_b')).toBe(false);
-    expect(removeTeamBot(dataDir, 'on_b')).toBe(false);
-    expect(removeTeamBot(dataDir, undefined)).toBe(false);
   });
 });

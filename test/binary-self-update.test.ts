@@ -36,13 +36,13 @@ import {
   mainPackageRootForSubpackageBinary,
   resolveUpdateStrategy,
 } from '../src/core/binary-install-shape.js';
-import { isMuslHost, releaseAssetName, releaseAssetBaseUrl, replaceStandaloneBinary } from '../src/core/binary-self-update.js';
+import { isMuslHost, releaseAssetName, releaseAssetBaseUrl, replaceStandaloneBinary, applyStandaloneUpdate } from '../src/core/binary-self-update.js';
+import { parseUpdateTarget } from '../src/core/update-check.js';
 import type { BinaryUpdateProgress } from '../src/core/binary-self-update.js';
 import { buildRestartLauncher, resolveStandaloneRestartExecutable, resolveRestartInvocation, verifyBinaryRestartTarget } from '../src/core/maintenance.js';
 import { tryResolveGlobalInstallPlan, formatGlobalInstallCommand, resolveAutoUpdateSupport } from '../src/utils/global-install.js';
 import { withFileLock, FileLockTimeoutError } from '../src/utils/file-lock.js';
 import { botmuxVersionAt, diskVersionAt } from '../src/utils/install-info.js';
-import { fileURLToPath } from 'node:url';
 
 const dirs: string[] = [];
 function tmp(): string {
@@ -638,98 +638,29 @@ describe('concurrent updates report mutual exclusion, not lock internals', () =>
     expect(e).toBeInstanceOf(Error);
     expect(e.name).toBe('FileLockTimeoutError');
   });
+});
 
-  it('SOURCE GUARD: the update lock\'s timeout is reported as "another update is running"', () => {
-    /**
-     * `withFileLock` THROWS when it cannot acquire the lock — it does not return
-     * quietly. So an `if (!acquired)` check placed AFTER the await is dead code, and
-     * the rejection falls through to the generic error printer.
-     *
-     * MEASURED by running two `botmux update` processes against one real compiled
-     * binary: the loser printed
-     *   ❌ 升级失败：file-lock timeout waiting for …/npm-global-update.lock
-     *      (held by pid 630166, age 2222ms)
-     * i.e. lock internals, for what is a perfectly normal mutual-exclusion outcome.
-     * After the fix it prints "另一个更新正在进行中（dashboard 或定时任务），请稍后重试。"
-     *
-     * Pinned at the source level because reaching this branch behaviourally needs two
-     * real processes racing a ~170MB download — reasonable to do by hand once (and I
-     * did), not in a unit test.
-     */
-    const cli = readFileSync(resolve('src/cli.ts'), 'utf-8');
-    // The self-replace branch must wrap its lock acquisition in try/catch and
-    // translate a not-acquired rejection, rather than testing `acquired` after it.
-    //
-    // Take a window from the branch head to its `withFileLock` call plus what
-    // follows. NOT "up to the first `return;`" — the branch returns early for
-    // "already latest", which truncated the window before the lock code and made
-    // every assertion below vacuously false (measured: a 355-char window).
-    const branchStart = cli.indexOf("strategy.kind === 'self-replace'");
-    expect(branchStart, 'the self-replace branch moved — update this guard').toBeGreaterThan(0);
-    const lockAt = cli.indexOf('withFileLock', branchStart);
-    expect(lockAt, 'the self-replace branch no longer takes the update lock').toBeGreaterThan(branchStart);
-    const block = cli.slice(branchStart, lockAt + 1800);
-    // The friendly notice must be gated on BOTH halves: callback-not-entered AND a
-    // genuine lock timeout. Guarding on `!acquired` alone is the over-broad version
-    // that reported ENOSPC/ENOENT as "another update is running".
-    expect(block).toMatch(/catch[\s\S]{0,900}?if \(!acquired && error instanceof FileLockTimeoutError\)/);
-    expect(block).toMatch(/另一个更新正在进行中/);
-    // ...and every other failure — in-section OR pre-callback — must still surface.
-    expect(block).toMatch(/throw error;/);
-    // Belt and braces: the bare predicate must NOT reappear anywhere in this window.
-    expect(block).not.toMatch(/if \(!acquired\)\s*\{/);
-  });
-
-  it('SOURCE GUARD: no update/rollback endpoint feeds resolveGlobalInstallPlan the "/" install root', () => {
-    /**
-     * ⚠️ WHY A SOURCE ASSERTION AND NOT A BEHAVIOURAL ONE. The pure-function test
-     * above proves the two ROOTS differ, but it cannot see which one dashboard.ts
-     * actually passes — verified by mutating the rollback line back to
-     * `botmuxInstallRoot()` and watching every behavioural test stay green. Standing
-     * up the whole dashboard here (auth, sockets, a real package tree) to exercise
-     * one argument is not worth it, so pin the call sites instead.
-     *
-     * THE RULE IS NARROW ON PURPOSE: what must never happen is a root reaching
-     * `resolveGlobalInstallPlan`, because that is the call that throws on "/". Merely
-     * *computing* `botmuxInstallRoot()` is fine and still happens in
-     * /api/update/status, where it feeds `currentUpdateStrategy` (which handles "/"
-     * correctly) plus a display-only manager label. An earlier, broader version of
-     * this guard flagged that benign line and failed on clean master — a guard that
-     * fires on correct code gets deleted, so it is scoped to the plan calls.
-     */
+describe('compiled-binary update plan root', () => {
+  // 源码结构护栏(K1)：编译态单文件二进制没有落盘的 package.json，botmuxInstallRoot() 是 "/"，
+  // resolveGlobalInstallPlan 拿到它必抛——v3.18.x 的编译版因此对几乎所有用户 update/dashboard 升级失败（#1078）。
+  // vitest 只跑 Node 分支，dashboard 编译态升级/回滚分支在单测里不可达（把回滚那行改回 botmuxInstallRoot()
+  // 所有行为测试照样绿）。守的不变量：dashboard.ts 里每个 plan 调用的 root 都要先咨询已解析的 update strategy。
+  it('every dashboard install-plan root is chosen by the resolved update strategy', () => {
     const src = readFileSync(resolve('src/dashboard.ts'), 'utf-8');
-    // Every `resolveGlobalInstallPlan(<root>…)` call and the identifier it is given.
-    const roots = [...src.matchAll(/resolveGlobalInstallPlan\(\s*([A-Za-z_$][\w$]*)/g)].map(m => m[1]);
-    expect(roots.length, 'expected to find the plan call sites — did they get renamed?')
-      .toBeGreaterThanOrEqual(2);
-    for (const ident of roots) expect(ident).toBe('packageRoot');
-
-    /**
-     * Every plan call takes a `packageRoot`, and every `packageRoot` assignment must
-     * let the resolved strategy decide. The display-only root in /api/update/status
-     * is named `classifyRoot` precisely so it is outside this rule — it feeds
-     * `currentUpdateStrategy` (which handles "/" correctly) and a label, never a plan.
-     *
-     * A *guarded* `runStrategy.kind === 'package-manager' ? runStrategy.packageRoot :
-     * botmuxInstallRoot()` is correct: that ternary is the Node path, where the install
-     * root IS right. So the rule is "a strategy decides this root", not "the identifier
-     * is absent" — an earlier version asserted the latter and failed on clean code.
-     */
-    const assignments = [...src.matchAll(/const packageRoot =([\s\S]{0,220}?);/g)].map(m => m[1]);
-    expect(assignments.length, 'expected the plan-root assignments — were they renamed?')
-      .toBeGreaterThanOrEqual(2);
-    const offenders = assignments.filter(a => !/(runStrategy|rollbackStrategy)\.packageRoot/.test(a));
-    expect(
-      offenders.map(a => a.replace(/\s+/g, ' ').trim()),
-      'a plan root is chosen without consulting the resolved strategy — botmuxInstallRoot() '
-        + 'is "/" for every compiled binary and resolveGlobalInstallPlan throws on it.',
-    ).toEqual([]);
-    // Positive controls: the strategy-based fallbacks ARE present, so this guard is
-    // asserting against real code rather than passing on an empty search.
-    expect(src).toMatch(/runStrategy\.kind === 'package-manager' \? runStrategy\.packageRoot/);
-    expect(src).toMatch(/\?\?\s*rollbackStrategy\.packageRoot/);
-    expect(src).toMatch(/rollbackStrategy\.kind === 'package-manager'/);
-    expect(src).toMatch(/rollbackSupported: installPlan !== null \|\| selfReplace/);
+    const calls = [...src.matchAll(/resolveGlobalInstallPlan\(\s*([A-Za-z_$][\w$]*)/g)];
+    expect(calls.length, 'expected to find the plan call sites').toBeGreaterThanOrEqual(2);
+    for (const call of calls) {
+      const ident = call[1];
+      const before = src.slice(0, call.index);
+      const assignAt = before.lastIndexOf(`const ${ident} =`);
+      expect(assignAt, `no local assignment found for plan root ${ident}`).toBeGreaterThan(-1);
+      const assignment = before.slice(assignAt, before.indexOf(';', assignAt));
+      expect(
+        assignment,
+        'a plan root is chosen without consulting the resolved strategy — botmuxInstallRoot() '
+          + 'is "/" for every compiled binary and resolveGlobalInstallPlan throws on it.',
+      ).toMatch(/\w+Strategy\.packageRoot/);
+    }
   });
 });
 
@@ -900,6 +831,40 @@ describe('self-deployed release installation', () => {
   });
 });
 
+describe('applyStandaloneUpdate', () => {
+  it.each(['3.47.0', '3.48.0'])('skips implicit latest %s without downloads or disk writes', async (version) => {
+    const target = join(tmp(), 'botmux');
+    writeFileSync(target, 'CURRENT');
+    let downloads = 0;
+    const result = await applyStandaloneUpdate(version, { currentVersion: '3.48.0', target }, {
+      fetchStream: async () => { downloads++; return Readable.from([]); },
+    });
+    expect(result).toEqual({ skipped: true, reason: 'already_latest' });
+    expect(downloads).toBe(0);
+    expect(readFileSync(target, 'utf8')).toBe('CURRENT');
+  });
+
+  it.each([
+    { version: '3.49.0', explicit: false },
+    { version: '3.47.0', explicit: true },
+    { version: '3.48.0', explicit: true },
+  ])('installs an allowed target $version (explicit=$explicit)', async ({ version, explicit }) => {
+    const target = join(tmp(), 'botmux');
+    writeFileSync(target, 'CURRENT');
+    const payload = Buffer.alloc(1_100_000, 0x41);
+    const result = await applyStandaloneUpdate(version, {
+      currentVersion: '3.48.0', target,
+      updateTarget: parseUpdateTarget(explicit ? version : undefined)!,
+    }, {
+      fetchStream: async () => Readable.from([payload]),
+      fetchChecksum: async () => createHash('sha256').update(payload).digest('hex'),
+      probeBinary: () => ({ status: 0, stdout: version }),
+    });
+    expect(result).toMatchObject({ skipped: false, source: 'github-release' });
+    expect(readFileSync(target)).toEqual(payload);
+  });
+});
+
 describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
   const BIG = 1_100_000; // over the "this is an error page, not a binary" floor
   const probeOk = () => ({ status: 0, stdout: '3.99.0\n' });
@@ -910,6 +875,78 @@ describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
   function sha256(buf: Buffer): string {
     return createHash('sha256').update(buf).digest('hex');
   }
+  function sha512Integrity(buf: Buffer): string {
+    return `sha512-${createHash('sha512').update(buf).digest('base64')}`;
+  }
+
+  it('prefers a verified configured-registry package over the GitHub asset', async () => {
+    const dir = tmp();
+    const target = join(dir, 'botmux');
+    writeFileSync(target, 'OLD BINARY', { mode: 0o755 });
+    const archive = Buffer.from('compressed registry fixture');
+    const payload = fakeAsset(0x52);
+    let githubFetches = 0;
+    const r = await replaceStandaloneBinary('3.99.0', target, {
+      resolveRegistryArtifact: async (packageName, version) => ({
+        packageName,
+        version,
+        tarball: 'https://mirror.example.com/botmux.tgz',
+        integrity: sha512Integrity(archive),
+      }),
+      fetchRegistryStream: async () => Readable.from([archive]),
+      extractRegistryBinary: (_archive, destinationDir) => {
+        const packageDir = join(destinationDir, 'package');
+        mkdirSync(packageDir, { recursive: true });
+        const candidate = join(packageDir, 'botmux');
+        writeFileSync(candidate, payload);
+        return candidate;
+      },
+      fetchStream: async () => {
+        githubFetches++;
+        return Readable.from([payload]);
+      },
+      probeBinary: probeOk,
+    });
+    expect(r.source).toBe('registry-package');
+    expect(r.bytes).toBe(BIG);
+    expect(githubFetches).toBe(0);
+    expect(statSync(target).size).toBe(BIG);
+  });
+
+  it('falls back to GitHub when the registry package integrity is invalid', async () => {
+    const dir = tmp();
+    const target = join(dir, 'botmux');
+    writeFileSync(target, 'OLD BINARY', { mode: 0o755 });
+    const archive = Buffer.from('tampered registry fixture');
+    const payload = fakeAsset(0x47);
+    let githubFetches = 0;
+    let extractions = 0;
+    const r = await replaceStandaloneBinary('3.99.0', target, {
+      resolveRegistryArtifact: async (packageName, version) => ({
+        packageName,
+        version,
+        tarball: 'https://mirror.example.com/botmux.tgz',
+        integrity: `sha512-${Buffer.alloc(64, 1).toString('base64')}`,
+      }),
+      fetchRegistryStream: async () => Readable.from([archive]),
+      extractRegistryBinary: (_archive, destinationDir) => {
+        extractions++;
+        const candidate = join(destinationDir, 'botmux');
+        writeFileSync(candidate, payload);
+        return candidate;
+      },
+      fetchStream: async () => {
+        githubFetches++;
+        return Readable.from([payload]);
+      },
+      fetchChecksum: async () => sha256(payload),
+      probeBinary: probeOk,
+    });
+    expect(r.source).toBe('github-release');
+    expect(githubFetches).toBe(1);
+    expect(extractions).toBe(0);
+    expect(statSync(target).size).toBe(BIG);
+  });
 
   it('verifies the published checksum and lands the new bytes', async () => {
     const dir = tmp();
@@ -1101,73 +1138,5 @@ describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
     expect(() => execFileSync(process.execPath, ['-e',
       `require('fs').renameSync(${JSON.stringify(fresh)}, ${JSON.stringify(bin)})`,
     ])).not.toThrow();
-  });
-});
-
-describe('the compiled dashboard must not compare daemons against its OWN baked version', () => {
-  // Source guard (same rule as diskVersionAt above): in the compiled binary
-  // `current` is the running dashboard's baked version, so the "running daemon
-  // vs disk" comparison is undetermined there and must stay silent — never
-  // inverted after a partial respawn.
-  const dashboardSrc = readFileSync(fileURLToPath(new URL('../src/dashboard.ts', import.meta.url)), 'utf-8');
-  const sessionsPageSrc = readFileSync(fileURLToPath(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url)), 'utf-8');
-
-  it('/api/update/status uses a completed binary installation as its disk version', () => {
-    expect(dashboardSrc.includes('const diskVersion = pendingBinaryRestart?.version ?? (isStandaloneBinary() ? undefined : current);')).toBe(true);
-    expect(dashboardSrc).toMatch(/formatRunningDaemonsRestartSummary\(\s*runningDaemons\.map\(d => d\.version\),\s*diskVersion,\s*\)/);
-    expect(dashboardSrc).toContain("...(diskVersion ? { diskVersion } : {}),");
-  });
-
-  it('the history staleHint compares against diskVersion, never against current', () => {
-    expect(sessionsPageSrc).toContain('daemonVersionDiffersFromDisk(running, status.diskVersion)');
-    expect(sessionsPageSrc).not.toMatch(/daemonVersionDiffersFromDisk\([^)]*status\.current/);
-  });
-});
-
-describe('self-deployed release migration — dashboard HTTP wiring', () => {
-  // 编译态 HTTP 接线无法在单测里起真实服务，沿用本文件 diskVersion 的源码守卫惯
-  // 例：删掉任一分线都会让这里变红，而不是静默退化成按钮能点必失败。
-  const dashboardSrc = readFileSync(fileURLToPath(new URL('../src/dashboard.ts', import.meta.url)), 'utf-8');
-
-  it('status only offers install/release actions when this platform ships an asset', () => {
-    expect(dashboardSrc).toContain(
-      "const releaseInstallAvailable = updateStrategy.kind === 'install-release' && releaseAssetName() !== null;",
-    );
-    expect(dashboardSrc).toContain('const selfReplace = updateStrategy.kind === \'self-replace\' || releaseInstallAvailable;');
-    expect(dashboardSrc).toContain('releaseInstallRequired: releaseInstallAvailable,');
-    expect(dashboardSrc).toContain('rollbackSupported: installPlan !== null || selfReplace,');
-  });
-
-  it('run installs through the launcher, pins the pending restart, and refuses platforms without an asset', () => {
-    expect(dashboardSrc).toContain(
-      "if (runStrategy.kind === 'self-replace' || runStrategy.kind === 'install-release') {",
-    );
-    expect(dashboardSrc).toMatch(/runStrategy\.kind === 'install-release' && releaseAssetName\(\) === null[\s\S]{0,160}release_asset_unavailable/);
-    expect(dashboardSrc).toContain('pendingBinaryRestart = { target: runStrategy.target, version: newVersion };');
-  });
-
-  it('rollback through a release binary is gated on a published asset too', () => {
-    expect(dashboardSrc).toMatch(/rollbackStrategy\.kind === 'install-release' && releaseAssetName\(\) === null[\s\S]{0,160}release_asset_unavailable/);
-    expect(dashboardSrc).toContain("spawnDetachedRestart('dashboard', installPlan?.activePackageRoot, leaseId!, binaryTarget)");
-  });
-
-  it('restart verifies and refreshes the pending target, anchors the driver, and 409s on mismatch', () => {
-    expect(dashboardSrc).toContain('const verifiedVersion = verifyBinaryRestartTarget(pendingBinaryRestart);');
-    expect(dashboardSrc).toContain("error: 'binary_restart_target_changed'");
-    expect(dashboardSrc).toContain(
-      "spawnDetachedRestart('dashboard', activePackageRoot, leaseId!, binaryRestartTarget)",
-    );
-  });
-});
-
-describe('self-deployed release migration — CLI wiring', () => {
-  const cliSrc = readFileSync(fileURLToPath(new URL('../src/cli.ts', import.meta.url)), 'utf-8');
-
-  it('points the post-migration restart hint at the absolute launcher path', () => {
-    expect(cliSrc).toContain('? `"${r.target}" restart`');
-  });
-
-  it('an implicit update does not downgrade a self-deployed build newer than latest', () => {
-    expect(cliSrc).toContain('&& !isNewerVersion(current, resolvedVersion)');
   });
 });

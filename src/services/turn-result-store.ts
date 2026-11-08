@@ -88,6 +88,8 @@ export class TurnResultStore {
     }
     entry.execution = {
       status: execution.status,
+      ...(execution.status !== 'completed' && execution.errorCode !== undefined
+        ? { errorCode: optionalText(execution.errorCode) } : {}),
       ...(execution.completedAt === undefined ? {} : { completedAt: execution.completedAt }),
       ...(execution.durationMs === undefined ? {} : { durationMs: execution.durationMs }),
     };

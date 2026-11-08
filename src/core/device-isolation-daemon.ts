@@ -287,7 +287,7 @@ export function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
     //
     // `ds.initConfig` is only assigned at spawn/refork, but a live-worker
     // `/restart` (operator, working-dir change, or cli_crash auto-restart) sends
-    // `{type:'restart', env: latestPerBotEnvForRestart(ds)}` — which reads
+    // `{type:'restart', env: latestSessionEnvForRestart(ds).env}` — which reads
     // getBot().config.env — and the worker overwrites its own lastInitConfig.env
     // before respawning. So after a restart the CHILD runs with the live env while
     // `ds.initConfig.env` still holds the stale spawn-time snapshot. Reading the
@@ -316,7 +316,7 @@ export function resolveRemoteExecutionProven(ds: DaemonSession): boolean {
     // hooked), then clear the config without restarting. Snapshot and live both
     // read clean while the child stays hooked. Hence the third input:
     // `mojoAppliedUnprovableEnvKeys`, the monotonic ledger of what this worker
-    // generation was actually handed (see latestPerBotEnvForRestart).
+    // generation was actually handed (see latestSessionEnvForRestart).
     let liveTopLevelEnv: Record<string, string>;
     try {
       liveTopLevelEnv = getBot(ds.larkAppId).config.env ?? {};

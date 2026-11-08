@@ -8,11 +8,28 @@ import {
   encodeRemoteRunnerCommand,
   normalizeRemoteRunnerBackendState,
   parseRemoteRunnerEventLine,
+  projectRemoteRunnerTrustedCaller,
   remoteRunnerCommand,
   type RemoteRunnerEvent,
 } from '../src/adapters/backend/remote-runner-protocol.js';
 
 describe('remote runner protocol', () => {
+  it('never serializes a verified local principal or capability to a remote provider', () => {
+    expect(projectRemoteRunnerTrustedCaller({
+      requestUserOpenId: 'ou_actor',
+      requestUserUnionId: 'on_actor',
+      verifiedEmail: 'actor@bytedance.com',
+      botmuxGrantedCapabilities: ['fixture.secret.v1'],
+      requestLarkAppId: 'cli_app',
+      senderType: 'user',
+    })).toEqual({
+      requestUserOpenId: 'ou_actor',
+      requestUserUnionId: 'on_actor',
+      requestLarkAppId: 'cli_app',
+      senderType: 'user',
+    });
+  });
+
   it('keeps remote compute and native agent lineage as separate state', () => {
     expect(normalizeRemoteRunnerBackendState({
       version: 1,
@@ -119,7 +136,7 @@ describe('remote runner protocol', () => {
   });
 
   it('validates a generation-fenced recovered turn on ready', () => {
-    expect(parseRemoteRunnerEventLine(JSON.stringify({
+    const recovered = parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,
       version: REMOTE_RUNNER_PROTOCOL_VERSION,
       type: 'ready',
@@ -132,17 +149,29 @@ describe('remote runner protocol', () => {
         startedAtMs: 1234,
         trustedCaller: {
           requestUserOpenId: 'ou_actor',
+          requestUserUnionId: 'on_bot',
           requestLarkAppId: 'cli_app',
-          senderType: 'user',
+          senderType: 'bot',
+          botOwner: {
+            openId: 'ou_owner',
+            unionId: 'on_owner',
+            email: 'owner@bytedance.com',
+            source: 'bot_config',
+          },
         },
       },
-    }))).toMatchObject({
+    }));
+    expect(recovered).toMatchObject({
       type: 'ready',
-      recoveredTurn: {
-        turnId: 'turn-survived',
-        generation: 7,
-        dispatchAttempt: 3,
-      },
+      recoveredTurn: { turnId: 'turn-survived', generation: 7, dispatchAttempt: 3 },
+    });
+    // botOwner is host-attested on outbound turn commands only. A provider
+    // reporting one back during recovery gets the shape validated but the field
+    // is stripped — it must never become the recovered turn's caller owner.
+    expect(recovered?.recoveredTurn?.trustedCaller).toEqual({
+      requestUserOpenId: 'ou_actor',
+      requestLarkAppId: 'cli_app',
+      senderType: 'bot',
     });
     expect(parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,
@@ -152,6 +181,82 @@ describe('remote runner protocol', () => {
       state: { version: 1, provider: 'reference', generation: 7 },
       recoveredTurn: { turnId: 'turn-survived', generation: -1 },
     }))).toBeUndefined();
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'ready',
+      requestId: 'resume-recovery-forged-owner',
+      state: { version: 1, provider: 'reference', generation: 7 },
+      recoveredTurn: {
+        turnId: 'turn-survived',
+        generation: 7,
+        trustedCaller: {
+          requestUserOpenId: 'ou_human',
+          requestLarkAppId: 'cli_app',
+          senderType: 'user',
+          botOwner: {
+            openId: 'ou_owner',
+            unionId: 'on_owner',
+            email: 'owner@bytedance.com',
+            source: 'bot_config',
+          },
+        },
+      },
+    }))).toBeUndefined();
+    // A well-formed bot caller still rejects the whole event when the owner's
+    // source tag is not the single host-minted value.
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'ready',
+      requestId: 'resume-recovery-forged-owner-source',
+      state: { version: 1, provider: 'reference', generation: 7 },
+      recoveredTurn: {
+        turnId: 'turn-survived',
+        generation: 7,
+        trustedCaller: {
+          requestUserOpenId: 'ou_bot',
+          requestLarkAppId: 'cli_app',
+          senderType: 'bot',
+          botOwner: {
+            openId: 'ou_owner',
+            unionId: 'on_owner',
+            email: 'owner@bytedance.com',
+            source: 'provider_self',
+          },
+        },
+      },
+    }))).toBeUndefined();
+  });
+
+  it('rejects the whole recovered turn when a provider echoes the legacy platform_team owner source', () => {
+    // The host mints botOwner only with source 'bot_config' (#2100 replaced the
+    // platform_team resolver). A provider echoing the legacy tag must not be
+    // normalized into the recovered caller at all: the whole event is rejected,
+    // not merely stripped.
+    const parsed = parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'ready',
+      requestId: 'resume-recovery-legacy-platform-team',
+      state: { version: 1, provider: 'reference', generation: 7 },
+      recoveredTurn: {
+        turnId: 'turn-survived',
+        generation: 7,
+        trustedCaller: {
+          requestUserOpenId: 'ou_bot',
+          requestLarkAppId: 'cli_app',
+          senderType: 'bot',
+          botOwner: {
+            openId: 'ou_owner',
+            unionId: 'on_owner',
+            email: 'owner@bytedance.com',
+            source: 'platform_team',
+          },
+        },
+      },
+    }));
+    expect(parsed).toBeUndefined();
   });
 
   it('validates generation-fenced terminal screen snapshots', () => {
@@ -183,7 +288,7 @@ describe('remote runner protocol', () => {
     }))).toBeUndefined();
   });
 
-  it('accepts only bounded non-terminal outbound message intents', () => {
+  it('accepts only bounded outbound message intents', () => {
     const png = Buffer.from([
       0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
       0x00, 0x00, 0x00, 0x00,
@@ -233,6 +338,10 @@ describe('remote runner protocol', () => {
       { mention: 'explicit', mentions: ['   '] },
       { mention: 'explicit', mentions: ['ou_target:Target', ''] },
       { mention: 'explicit', mentions: ['ou_target\0Target'] },
+      { mention: 'explicit', mentions: ['--help'] },
+      { mention: 'explicit', mentions: [' --help'] },
+      { mention: 'explicit', mentions: ['-h'] },
+      { mention: 'explicit', mentions: ['--dry-run'] },
       { mention: 'explicit', mentions: ['x'.repeat(33 * 1024)] },
     ]) {
       expect(parseRemoteRunnerEventLine(JSON.stringify({
@@ -254,10 +363,14 @@ describe('remote runner protocol', () => {
       operationId: 'outbound-2',
       turnId: 'turn-1',
       generation: 3,
-      content: 'not allowed',
+      content: 'final answer',
       responseKind: 'final',
       mention: 'none',
-    }))).toBeUndefined();
+    }))).toMatchObject({
+      type: 'outbound_message',
+      operationId: 'outbound-2',
+      responseKind: 'final',
+    });
     expect(parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,
       version: REMOTE_RUNNER_PROTOCOL_VERSION,
@@ -442,6 +555,7 @@ describe('remote runner protocol', () => {
     for (const request of [
       { tool: 'schedule.list' },
       { tool: 'schedule.update', taskId: 'deadbeef', prompt: '新提示' },
+      { tool: 'schedule.update', taskId: 'deadbeef', schedule: 'every 4h' },
       { tool: 'schedule.remove', taskId: 'deadbeef' },
       { tool: 'schedule.pause', taskId: 'self' },
       { tool: 'schedule.resume', taskId: 'deadbeef' },
@@ -465,6 +579,8 @@ describe('remote runner protocol', () => {
       { tool: 'schedule.add', schedule: '10m', prompt: 'x', position: 'top-level', followActive: true },
       { tool: 'schedule.add', schedule: '10m', prompt: 'x', position: 'new-topic', topicTitle: 'x'.repeat(201) },
       { tool: 'schedule.update', taskId: 'deadbeef' },
+      { tool: 'schedule.update', taskId: 'deadbeef', schedule: '' },
+      { tool: 'schedule.update', taskId: 'deadbeef', schedule: 4 },
       { tool: 'schedule.remove', taskId: 'not-an-id' },
       { tool: 'schedule.resume', taskId: 'self' },
     ]) {
@@ -518,6 +634,28 @@ describe('remote runner protocol', () => {
         snapshot: { context: { usedTokens: -1 }, tokens: null },
       },
     }))).toBeUndefined();
+  });
+
+  it('passes optional cumulative cache counters and rejects malformed ones', () => {
+    const base = {
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'final',
+      turnId: 'turn-usage',
+      content: 'done',
+    } as const;
+    const withTokens = (tokens: unknown) => parseRemoteRunnerEventLine(JSON.stringify({
+      ...base,
+      usage: { generation: 3, snapshot: { context: null, tokens } },
+    }));
+    expect(withTokens({ in: 7230, out: 44, cacheReadTokens: 6100, cacheCreateTokens: 1000 })).toMatchObject({
+      usage: { snapshot: { tokens: { in: 7230, out: 44, cacheReadTokens: 6100, cacheCreateTokens: 1000 } } },
+    });
+    const withoutCache = withTokens({ in: 7230, out: 44 }) as any;
+    expect(withoutCache.usage.snapshot.tokens).toEqual({ in: 7230, out: 44 });
+    expect(withTokens({ in: 7230, out: 44, cacheReadTokens: 7231 })).toBeUndefined();
+    expect(withTokens({ in: 7230, out: 44, cacheCreateTokens: -1 })).toBeUndefined();
+    expect(withTokens({ in: 7230, out: 44, cacheReadTokens: 1.5 })).toBeUndefined();
   });
 
   it('ships a runnable reference provider covering hello/start/turn/status/detach', async () => {

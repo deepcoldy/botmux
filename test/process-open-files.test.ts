@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { closeSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { listProcessOpenFiles } from '../src/utils/process-open-files.js';
@@ -62,22 +62,45 @@ describe('listProcessOpenFiles', () => {
   });
 });
 
-/**
- * Source lock: pid → open-file probes must go through the bounded helper.
- * Before it existed, five transcript services each carried their own
- * `execSync('lsof -p …')` with no timeout, so a stalled lsof froze the worker
- * event loop. Pin both the helper's bounds and the absence of raw copies.
- */
-describe('lsof probes stay bounded', () => {
-  const helperSource = readFileSync(new URL('../src/utils/process-open-files.ts', import.meta.url), 'utf8');
+// The lsof fallback, reachable on every platform: pid_max tops out at 2^22, so
+// this pid never has a /proc entry and Linux takes the path macOS always takes.
+describe('listProcessOpenFiles lsof fallback', () => {
+  const NO_PROCFS_PID = 2 ** 22 + 4242;
+  let originalPath: string | undefined;
+  beforeEach(() => { originalPath = process.env.PATH; });
+  afterEach(() => { process.env.PATH = originalPath; });
 
-  it('the helper runs lsof shell-free with a hard timeout and no name resolution', () => {
-    expect(helperSource).toContain("execFileSync('lsof', ['-n', '-P', '-p', String(pid), '-Fn'], LSOF_EXEC_OPTIONS)");
-    expect(helperSource).toMatch(/timeout: LSOF_TIMEOUT_MS/);
-    expect(helperSource).toMatch(/killSignal: 'SIGKILL'/);
-    expect(helperSource).not.toContain('execSync(');
+  function fakeLsof(body: string): void {
+    const bin = join(dir, 'bin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'lsof'), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+    process.env.PATH = `${bin}:${originalPath ?? ''}`;
+  }
+
+  it('asks lsof for numeric hosts/ports and keeps only path names', () => {
+    const argvFile = join(dir, 'argv');
+    fakeLsof(`printf '%s\\n' "$@" > '${argvFile}'\nprintf 'p1\\nn/tmp/held.jsonl\\nn->0xdead\\n'`);
+    expect(listProcessOpenFiles(NO_PROCFS_PID)).toEqual(['/tmp/held.jsonl']);
+    // Without -n/-P lsof resolves host and port names, which is what hangs it.
+    expect(readFileSync(argvFile, 'utf8').split('\n'))
+      .toEqual(expect.arrayContaining(['-n', '-P', '-p', String(NO_PROCFS_PID)]));
   });
 
+  it('kills a stalled lsof that ignores SIGTERM within the bound', () => {
+    fakeLsof(`trap '' TERM\nexec sleep 10`);
+    const startedAt = Date.now();
+    expect(listProcessOpenFiles(NO_PROCFS_PID)).toBeUndefined();
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+  }, 15_000);
+});
+
+/**
+ * pid → open-file probes must go through the bounded helper. Before it
+ * existed, five transcript services each carried their own
+ * `execSync('lsof -p …')` with no timeout, so a stalled lsof froze the worker
+ * event loop.
+ */
+describe('lsof probes stay bounded', () => {
   it('no service or core module spawns an unbounded lsof', () => {
     const offenders: string[] = [];
     for (const sub of ['services', 'core']) {

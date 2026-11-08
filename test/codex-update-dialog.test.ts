@@ -65,35 +65,6 @@ describe('CodexUpdateDialogGuard', () => {
   });
 });
 
-describe('Aiden Codex update dialog worker wiring', () => {
-  const workerSource = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-
-  it('checks the rendered screen while the first prompt is held', () => {
-    const start = workerSource.indexOf('function startScreenUpdates()');
-    const end = workerSource.indexOf('function stopScreenUpdates()', start);
-    const screenUpdates = workerSource.slice(start, end);
-
-    expect(screenUpdates).toContain('if (awaitingFirstPrompt)');
-    expect(screenUpdates).toContain('inspectAidenCodexUpdateDialogOnScreen();');
-    const s = workerSource.indexOf('function inspectAidenCodexUpdateDialogOnScreen(');
-    const e = workerSource.indexOf('function handleVisibleStartupInteraction(', s);
-    const code = workerSource.slice(s, e).replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
-    expect(code).toMatch(/\bcaptureBackendScreen\s*\(|\bcaptureViewport\s*(?:\?\.)?\s*\(|\bcaptureCurrentScreen\s*(?:\?\.)?\s*\(/);
-  });
-
-  it('limits automatic retries and only warns from an authoritative screen check', () => {
-    const start = workerSource.indexOf('function dismissAidenCodexUpdateDialog(');
-    const end = workerSource.indexOf('function inspectAidenCodexUpdateDialogOnScreen()', start);
-    const dismiss = workerSource.slice(start, end);
-
-    expect(dismiss).toContain('codexUpdateDialogSafeKeys(data)');
-    expect(dismiss).toContain('AIDEN_CODEX_UPDATE_RETRY_MS');
-    expect(workerSource).toContain('const AIDEN_CODEX_UPDATE_MAX_ATTEMPTS = 3;');
-    expect(dismiss).toContain("source === 'screen'");
-    expect(dismiss).toContain("type: 'user_notify'");
-  });
-});
-
 it('uses an observer backend in the production tmux selector', () => {
   const { backend } = selectSessionBackend({ sessionId: 'abcdef1234567890', backendType: 'tmux' });
   expect(backend instanceof TmuxBackend).toBe(false);

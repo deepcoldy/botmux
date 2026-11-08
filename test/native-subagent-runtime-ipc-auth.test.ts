@@ -9,6 +9,7 @@ import {
   verifyNativeSubagentRuntimeResponse,
   writeNativeSubagentRuntimeResponseProof,
 } from '../src/core/native-subagent-runtime-ipc-auth.js';
+import { __resetLoopbackPeersCacheForTest } from '../src/utils/loopback-peers.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -75,6 +76,28 @@ describe('native subagent runtime IPC authentication', () => {
     expect(verifyNativeSubagentRuntimeCapabilityRequest({
       ...BASE, capability: CAPABILITY, headers, remoteAddress: '10.0.0.8', nonceStore, nowMs: NOW,
     })).toEqual({ ok: false, reason: 'remote_not_loopback' });
+  });
+
+  it('honors BOTMUX_LOOPBACK_PEERS at the address ring without weakening header checks', () => {
+    const nonceStore = createNativeSubagentRuntimeNonceStore({ now: () => NOW });
+    const prev = process.env.BOTMUX_LOOPBACK_PEERS;
+    process.env.BOTMUX_LOOPBACK_PEERS = '10.0.0.8';
+    __resetLoopbackPeersCacheForTest();
+    try {
+      // configured LAN peer passes the origin ring, then dies at malformed
+      // headers — NOT at remote_not_loopback
+      expect(verifyNativeSubagentRuntimeCapabilityRequest({
+        ...BASE, capability: CAPABILITY, headers: {}, remoteAddress: '10.0.0.8', nonceStore, nowMs: NOW,
+      })).toEqual({ ok: false, reason: 'missing_or_malformed_header' });
+      // a different LAN address is still rejected at the ring
+      expect(verifyNativeSubagentRuntimeCapabilityRequest({
+        ...BASE, capability: CAPABILITY, headers: {}, remoteAddress: '10.0.0.9', nonceStore, nowMs: NOW,
+      })).toEqual({ ok: false, reason: 'remote_not_loopback' });
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_LOOPBACK_PEERS;
+      else process.env.BOTMUX_LOOPBACK_PEERS = prev;
+      __resetLoopbackPeersCacheForTest();
+    }
   });
 
   it.each([HOST_SECRET, CAPABILITY])(

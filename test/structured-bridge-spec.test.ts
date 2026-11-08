@@ -16,7 +16,7 @@ import type { CliId } from '../src/adapters/cli/types.js';
 // Absolute fake binary path: resolveCommand returns absolute paths verbatim, so
 // constructing pi / oh-my-pi (which resolve eagerly) never shells out.
 const FAKE_BIN = '/usr/local/bin/fake-cli';
-const FILE_BACKED: CliId[] = ['codex', 'traex', 'coco', 'cursor', 'antigravity', 'pi', 'oh-my-pi', 'ebsd', 'grok'];
+const FILE_BACKED: CliId[] = ['codex', 'traex', 'coco', 'cursor', 'antigravity', 'pi', 'oh-my-pi', 'ebsd', 'grok', 'doubao'];
 
 describe('bridgeSpecFor (static lookup) vs adapter.bridgeSpec', () => {
   it.each(FILE_BACKED)('%s: the adapter instance exposes exactly the spec the registry looks up', cliId => {
@@ -26,7 +26,7 @@ describe('bridgeSpecFor (static lookup) vs adapter.bridgeSpec', () => {
   });
 
   it('SQLite-backed hermes / mtr and non-bridge CLIs declare no spec', () => {
-    for (const id of ['hermes', 'mtr', 'claude-code', 'gemini', 'codex-app', 'mira'] as CliId[]) {
+    for (const id of ['hermes', 'mtr', 'claude-code', 'opencode', 'codex-app', 'mira'] as CliId[]) {
       expect(bridgeSpecFor(id)).toBeUndefined();
       expect(createCliAdapterSync(id, FAKE_BIN).bridgeSpec).toBeUndefined();
     }
@@ -65,16 +65,22 @@ describe('bridgeSpecFor (static lookup) vs adapter.bridgeSpec', () => {
     // The pid-probed id must come from traex's own (segment-aware) parser.
     // A resumed-segment rollout (#1854): the codex parser cannot read it, so
     // persisting through it silently dropped the session id on pid-probe adopt.
+    // This assertion is the load-bearing guard for the intentionally strict,
+    // zero-production-caller codexSessionIdFromRolloutPath — see its doc block
+    // in src/services/codex-transcript.ts for why it must not be deleted or
+    // relaxed (the same shape is a Codex generation, read only via
+    // codexGenerationSessionIdFromRolloutPath on Codex-scoped paths).
     const sid = '00000000-0000-7000-8000-000000000001';
     const segmented = `/h/.trae/sessions/2026/10/14/rollout-2026-10-14T08-00-00-${sid}_00000000-0000-7000-8000-000000000099.jsonl`;
     expect(codexSessionIdFromRolloutPath(segmented)).toBeUndefined();
     expect(traexSessionIdFromRolloutPath(segmented)).toBe(sid);
     expect(bridgeSpecFor('traex')?.adopt?.pidProbedSessionId?.(segmented)).toBe(sid);
-    // antigravity: held final committed on ingest only, birth-aware baseline, zero-prompt only, no adopt.
-    expect(bridgeSpecFor('antigravity')).toMatchObject({ stateCommit: 'ingest', spawn: { baseline: 'birth-aware', zeroPromptOnly: true } });
+    // antigravity: held final committed on ingest only, birth-aware baseline, no adopt.
+    expect(bridgeSpecFor('antigravity')).toMatchObject({ stateCommit: 'ingest', spawn: { baseline: 'birth-aware' } });
     expect(bridgeSpecFor('antigravity')?.adopt).toBeUndefined();
-    // cursor: no per-event timestamps → byte-offset baseline on adopt; zero-prompt only on spawn.
-    expect(bridgeSpecFor('cursor')).toMatchObject({ adopt: { attach: 'baseline-skip-tail' }, spawn: { zeroPromptOnly: true } });
+    // cursor: no per-event timestamps → byte-offset baseline on adopt; the
+    // spawn bridge is always-on (send-marker-gated) since #932.
+    expect(bridgeSpecFor('cursor')).toMatchObject({ adopt: { attach: 'baseline-skip-tail' }, spawn: { baseline: 'resume-aware' } });
     // id-addressed isolated sessions (no pid discovery) fall back to the adapter session id.
     for (const id of ['oh-my-pi', 'ebsd'] as const) {
       expect(bridgeSpecFor(id)?.locate.byPid).toBeUndefined();
@@ -83,6 +89,13 @@ describe('bridgeSpecFor (static lookup) vs adapter.bridgeSpec', () => {
     // coco keeps its dedicated spawn/adopt branches.
     expect(bridgeSpecFor('coco')?.spawn).toBeUndefined();
     expect(bridgeSpecFor('coco')?.adopt).toBeUndefined();
+    // doubao: two-file stateful drain (assignment.md + trajectory.jsonl),
+    // sid-only locate, and like coco it keeps dedicated spawn timing (the
+    // native snowflake id is unknown until the first submit).
+    expect(bridgeSpecFor('doubao')).toMatchObject({ stateCommit: 'drain' });
+    expect(bridgeSpecFor('doubao')?.spawn).toBeUndefined();
+    expect(bridgeSpecFor('doubao')?.adopt).toBeUndefined();
+    expect(bridgeSpecFor('doubao')?.locate.byPid).toBeUndefined();
   });
 });
 
@@ -91,7 +104,7 @@ describe('spec.drain threads driver state', () => {
   beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'bridge-spec-')); });
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
-  it.each(['oh-my-pi', 'ebsd', 'antigravity'] as const)('%s: drains a missing file without throwing and returns a state object', id => {
+  it.each(['oh-my-pi', 'ebsd', 'antigravity', 'doubao'] as const)('%s: drains a missing file without throwing and returns a state object', id => {
     const spec = bridgeSpecFor(id)!;
     const result = spec.drain(join(dir, 'nope.jsonl'), 0, { adoptMode: false, state: undefined });
     expect(result.events).toEqual([]);

@@ -27,7 +27,6 @@ import {
   buildCloseResultMessage,
   interpretAbortOutcome,
   mayRestoreWriteAdmission,
-  mayRetryClose,
   normalizeDestroyResult,
 } from '../src/adapters/backend/destroy-result.js';
 
@@ -123,7 +122,6 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-adm","warni
       recovery: 'retryable',
       admission: 'fenced',
     });
-    expect(mayRetryClose(result)).toBe(true);
     // The verdict the worker actually acts on.
     expect(mayRestoreWriteAdmission(result)).toBe(false);
 
@@ -319,12 +317,6 @@ describe('destroy-result reads admission, not retryability', () => {
       recovery: 'retryable',
       admission: 'fenced',
     })).toBe(false);
-    // ... while the close stays retryable.
-    expect(mayRetryClose({
-      ok: false,
-      recovery: 'retryable',
-      admission: 'fenced',
-    })).toBe(true);
   });
 
   it('derives admission from recovery only when it is absent', () => {
@@ -336,12 +328,6 @@ describe('destroy-result reads admission, not retryability', () => {
     // two fields cannot silently disagree in the unsafe direction only.
     expect(mayRestoreWriteAdmission({ ok: false, recovery: 'uncertain', admission: 'restorable' })).toBe(true);
     expect(mayRestoreWriteAdmission({ ok: true })).toBe(false);
-  });
-
-  it('never reports an irreversible close as retryable', () => {
-    expect(mayRetryClose({ ok: false, recovery: 'irreversible' })).toBe(false);
-    expect(mayRetryClose({ ok: false, recovery: 'uncertain' })).toBe(true);
-    expect(mayRetryClose({ ok: true })).toBe(false);
   });
 
   it('fences an unknown remote result on its own field', () => {

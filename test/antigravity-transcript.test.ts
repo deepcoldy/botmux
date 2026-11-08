@@ -1,12 +1,20 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  ANTIGRAVITY_TRUNCATED_REPLY_NOTICE,
   drainAntigravityTranscript,
   antigravityTranscriptPath,
+  mapAntigravityCompactOffsetToFull,
+  resolveAntigravityTranscriptPath,
   unwrapAntigravityUserInput,
+  type AntigravityTranscriptState,
 } from '../src/services/antigravity-transcript.js';
+import { resolveFileBridgePath } from '../src/services/file-bridge-path.js';
+import { resolveSessionTranscriptPath, __resetTranscriptResolverCacheForTest } from '../src/services/transcript-resolver.js';
+import { bridgeSpecFor } from '../src/adapters/cli/registry.js';
+import { jsonl, writeAntigravityTwoLogs } from './helpers/antigravity-two-logs.js';
 
 let dir: string;
 let path: string;
@@ -412,5 +420,218 @@ describe('drainAntigravityTranscript', () => {
     const r2 = drainAntigravityTranscript(path, r1.newOffset + 100, r1.state);
     expect(r2.events).toHaveLength(0);
     expect(r2.newOffset).toBe(r1.newOffset + 100);
+  });
+});
+
+describe('transcript_full.jsonl vs the compact transcript.jsonl', () => {
+  const CID = '00000000-0000-4000-8000-000000000025';
+  let home: string;
+  let savedHome: string | undefined;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'antigravity-two-logs-'));
+    savedHome = process.env.HOME;
+    process.env.HOME = home;
+  });
+
+  afterEach(() => {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  const brainDir = (): string => join(home, '.gemini', 'antigravity-cli', 'brain');
+
+  /** The worker's own path: resolveFileBridgePath → antigravity bridge spec
+   *  locate, then the spec's drain with the quiet-tick flush. */
+  function harvestFinal(): { path: string; final: string | undefined } {
+    const path = resolveFileBridgePath('antigravity', { sessionId: CID });
+    expect(path).toBeDefined();
+    const spec = bridgeSpecFor('antigravity')!;
+    const r = spec.drain(path!, 0, { adoptMode: false, state: undefined, flushTrailingFinal: true });
+    return { path: path!, final: r.events.find(e => e.kind === 'assistant_final')?.text };
+  }
+
+  it('harvests the complete final reply from the full log, not the head/tail the compact log kept', () => {
+    const logs = writeAntigravityTwoLogs(brainDir(), CID);
+    const { path, final } = harvestFinal();
+    expect(path).toBe(logs.fullPath);
+    expect(final).toBe(logs.finalText);
+    expect(final).toContain(logs.middleSentinel);
+    expect(final).not.toContain(ANTIGRAVITY_TRUNCATED_REPLY_NOTICE);
+  });
+
+  it('leaves the model-facing "truncated" text inside full-log tool records alone', () => {
+    const logs = writeAntigravityTwoLogs(brainDir(), CID);
+    // steps 12/13/14 still say "truncated" in the full log: that is what the
+    // model itself saw (agy's middle-cut tool output, a printing command), not
+    // log truncation — the user turn and final are unaffected.
+    const r = drainAntigravityTranscript(logs.fullPath, 0, {}, { flushTrailingFinal: true });
+    expect(r.events.map(e => e.kind)).toEqual(['user', 'assistant_final']);
+    expect(r.events[0].text).toBe(logs.userRequest);
+    expect(r.events[1].text).toBe(logs.finalText);
+  });
+
+  it('falls back to the compact log without a full one, and says the reply was cut', () => {
+    const logs = writeAntigravityTwoLogs(brainDir(), CID, { withFull: false });
+    const { path, final } = harvestFinal();
+    expect(path).toBe(logs.compactPath);
+    expect(final).toBe(`${logs.compactRecords[25].content}\n\n${ANTIGRAVITY_TRUNCATED_REPLY_NOTICE}`);
+    expect(final).not.toContain(logs.middleSentinel);
+  });
+
+  it('adds no notice to a compact-log final that was not cut', () => {
+    writeFileSync(path, line(userRecord('问题')) + line(plannerStep({ content: '短答案', step: 1 })));
+    const r = drainAntigravityTranscript(path, 0, {}, { flushTrailingFinal: true });
+    expect(r.events.at(-1)?.text).toBe('短答案');
+  });
+
+  it('resolves full first, then compact, then nothing, through the caller path map', () => {
+    expect(resolveAntigravityTranscriptPath(CID, { brainDir: brainDir() })).toBeNull();
+    const logs = writeAntigravityTwoLogs(brainDir(), CID, { withFull: false });
+    expect(resolveAntigravityTranscriptPath(CID, { brainDir: brainDir() })).toBe(logs.compactPath);
+    writeFileSync(logs.fullPath, jsonl(logs.fullRecords));
+    expect(resolveAntigravityTranscriptPath(CID, { brainDir: brainDir() })).toBe(logs.fullPath);
+    expect(resolveAntigravityTranscriptPath('../escape', { brainDir: brainDir() })).toBeNull();
+    const overlay = join(home, 'overlay');
+    const mapped = resolveAntigravityTranscriptPath(CID, { brainDir: brainDir(), mapPath: p => p.replace(home, overlay) });
+    expect(mapped).toBeNull();
+  });
+
+  it('points the session transcript resolver (Insight, todo, usage readers) at the full log too', () => {
+    __resetTranscriptResolverCacheForTest();
+    const logs = writeAntigravityTwoLogs(brainDir(), CID, { withFull: false });
+    const query = { cliId: 'antigravity' as const, sessionId: 'botmux-sid-agy-full', cliSessionId: CID };
+    expect(resolveSessionTranscriptPath(query)).toEqual({ path: logs.compactPath, kind: 'antigravity' });
+    writeFileSync(logs.fullPath, jsonl(logs.fullRecords));
+    expect(resolveSessionTranscriptPath(query)).toEqual({ path: logs.fullPath, kind: 'antigravity' });
+  });
+
+  it('drains the full log incrementally — uneven chunked growth — to exactly the one-shot events', () => {
+    const logs = writeAntigravityTwoLogs(brainDir(), CID);
+    const oneShot = drainAntigravityTranscript(logs.fullPath, 0, {}, { flushTrailingFinal: true });
+    const bytes = Buffer.from(jsonl(logs.fullRecords), 'utf8');
+    const growing = join(home, 'growing.jsonl');
+    writeFileSync(growing, '');
+    let offset = 0;
+    let state: AntigravityTranscriptState = {};
+    const texts: string[] = [];
+    // Uneven appends that split records (and multi-byte characters) mid-way.
+    for (let at = 0; at < bytes.length;) {
+      const next = Math.min(bytes.length, at + 997);
+      appendFileSync(growing, bytes.subarray(at, next));
+      at = next;
+      const r = drainAntigravityTranscript(growing, offset, state);
+      offset = r.newOffset;
+      state = r.state;
+      texts.push(...r.events.map(e => `${e.kind}:${e.text}`));
+    }
+    const flushed = drainAntigravityTranscript(growing, offset, state, { flushTrailingFinal: true });
+    texts.push(...flushed.events.map(e => `${e.kind}:${e.text}`));
+    expect(offset).toBe(bytes.length);
+    expect(texts).toEqual(oneShot.events.map(e => `${e.kind}:${e.text}`));
+  });
+
+  it('maps every compact record boundary to the same record boundary of the full log', () => {
+    const logs = writeAntigravityTwoLogs(brainDir(), CID);
+    let compactOffset = 0;
+    let fullOffset = 0;
+    expect(mapAntigravityCompactOffsetToFull(logs.compactPath, 0, logs.fullPath)).toBe(0);
+    for (let i = 0; i < logs.fullRecords.length; i++) {
+      compactOffset += Buffer.byteLength(jsonl([logs.compactRecords[i]]));
+      fullOffset += Buffer.byteLength(jsonl([logs.fullRecords[i]]));
+      expect(mapAntigravityCompactOffsetToFull(logs.compactPath, compactOffset, logs.fullPath)).toBe(fullOffset);
+    }
+  });
+
+  it('continues on the full log after a compact read with no record lost or repeated', () => {
+    const logs = writeAntigravityTwoLogs(brainDir(), CID);
+    // A bind made before agy created the full log has consumed records 0–11
+    // of the compact file; the move must resume at record 12 of the full file.
+    const compactPrefix = join(home, 'compact-prefix.jsonl');
+    writeFileSync(compactPrefix, jsonl(logs.compactRecords.slice(0, 12)));
+    const head = drainAntigravityTranscript(compactPrefix, 0);
+    expect(head.events.map(e => e.kind)).toEqual(['user']);
+    const mapped = mapAntigravityCompactOffsetToFull(logs.compactPath, head.newOffset, logs.fullPath);
+    expect(mapped).toBe(Buffer.byteLength(jsonl(logs.fullRecords.slice(0, 12))));
+    const rest = drainAntigravityTranscript(logs.fullPath, mapped!, head.state, { flushTrailingFinal: true });
+    expect([...head.events, ...rest.events].map(e => `${e.kind}:${e.text}`))
+      .toEqual([`user:${logs.userRequest}`, `assistant_final:${logs.finalText}`]);
+    expect(rest.newOffset).toBe(Buffer.byteLength(jsonl(logs.fullRecords)));
+  });
+
+  it('refuses to map while the full log trails, or when the records disagree', () => {
+    const logs = writeAntigravityTwoLogs(brainDir(), CID);
+    const compactAll = Buffer.byteLength(jsonl(logs.compactRecords));
+    // agy writes the full line a few ms after the compact one.
+    writeFileSync(logs.fullPath, jsonl(logs.fullRecords.slice(0, 25)) + JSON.stringify(logs.fullRecords[25]).slice(0, 40));
+    expect(mapAntigravityCompactOffsetToFull(logs.compactPath, compactAll, logs.fullPath)).toBeUndefined();
+    writeFileSync(logs.fullPath, jsonl(logs.fullRecords.slice(0, 24)) + jsonl([{ ...logs.fullRecords[25], step_index: 99 }]));
+    expect(mapAntigravityCompactOffsetToFull(logs.compactPath, Buffer.byteLength(jsonl(logs.compactRecords.slice(0, 25))), logs.fullPath)).toBeUndefined();
+    rmSync(logs.fullPath);
+    expect(mapAntigravityCompactOffsetToFull(logs.compactPath, compactAll, logs.fullPath)).toBeUndefined();
+  });
+
+  it('refuses to map from a compact log that was truncated or replaced under the consumed offset', () => {
+    const logs = writeAntigravityTwoLogs(brainDir(), CID);
+    const consumed = Buffer.byteLength(jsonl(logs.compactRecords.slice(0, 5)));
+    expect(mapAntigravityCompactOffsetToFull(logs.compactPath, consumed, logs.fullPath))
+      .toBe(Buffer.byteLength(jsonl(logs.fullRecords.slice(0, 5))));
+    // Cut back to one record: mapping would land after record 1 of the full
+    // log and replay records 2–5 as new.
+    writeFileSync(logs.compactPath, jsonl(logs.compactRecords.slice(0, 1)));
+    expect(mapAntigravityCompactOffsetToFull(logs.compactPath, consumed, logs.fullPath)).toBeUndefined();
+    // Emptied: mapping would land at byte 0 and replay the whole conversation.
+    writeFileSync(logs.compactPath, '');
+    expect(mapAntigravityCompactOffsetToFull(logs.compactPath, consumed, logs.fullPath)).toBeUndefined();
+    // Same length again but only blank lines before the offset: no record boundary.
+    writeFileSync(logs.compactPath, '\n'.repeat(consumed));
+    expect(mapAntigravityCompactOffsetToFull(logs.compactPath, consumed, logs.fullPath)).toBeUndefined();
+  });
+
+  it('refuses when the compact log is cut between the size probe and the scan', async () => {
+    const logs = writeAntigravityTwoLogs(brainDir(), CID);
+    const consumed = Buffer.byteLength(jsonl(logs.compactRecords.slice(0, 5)));
+    // The on-disk compact log still holds all consumed records, so the stat
+    // size probe passes; the scanner is redirected at a cut copy holding only
+    // the first three records. This is exactly the window between statSync
+    // and the scan opening: without re-checking the bytes actually read, the
+    // mapper would count three records and resume on the full log after
+    // record 3, replaying records 4–5.
+    const cutPath = join(logs.logsDir, 'transcript.cut.jsonl');
+    writeFileSync(cutPath, jsonl(logs.compactRecords.slice(0, 3)));
+    const cursor = await import('../src/services/jsonl-cursor.js');
+    const realScan = cursor.scanJsonlFromOffset;
+    const scan = vi.spyOn(cursor, 'scanJsonlFromOffset');
+    scan.mockImplementation((p, from, opts) =>
+      p === logs.compactPath ? realScan(cutPath, from, opts) : realScan(p, from, opts));
+    try {
+      expect(mapAntigravityCompactOffsetToFull(logs.compactPath, consumed, logs.fullPath)).toBeUndefined();
+    } finally {
+      scan.mockRestore();
+    }
+    // Once the scan reaches the consumed frontier again, it maps normally.
+    expect(mapAntigravityCompactOffsetToFull(logs.compactPath, consumed, logs.fullPath))
+      .toBe(Buffer.byteLength(jsonl(logs.fullRecords.slice(0, 5))));
+  });
+
+  it('refuses to map when the full log does not start at the same first record', () => {
+    const logs = writeAntigravityTwoLogs(brainDir(), CID);
+    // A full log that began mid-conversation can still agree on the N-th
+    // record by coincidence of shape; the first record anchors it.
+    const shifted = [{ ...logs.fullRecords[0], step_index: 40 }, ...logs.fullRecords.slice(1)];
+    writeFileSync(logs.fullPath, jsonl(shifted));
+    const consumed = Buffer.byteLength(jsonl(logs.compactRecords.slice(0, 12)));
+    expect(mapAntigravityCompactOffsetToFull(logs.compactPath, consumed, logs.fullPath)).toBeUndefined();
+  });
+
+  it('maps a consumed final record that has no trailing newline yet', () => {
+    const logs = writeAntigravityTwoLogs(brainDir(), CID);
+    const compactText = jsonl(logs.compactRecords).replace(/\n$/, '');
+    writeFileSync(logs.compactPath, compactText);
+    const consumed = drainAntigravityTranscript(logs.compactPath, 0).newOffset;
+    expect(consumed).toBe(Buffer.byteLength(compactText));
+    expect(mapAntigravityCompactOffsetToFull(logs.compactPath, consumed, logs.fullPath))
+      .toBe(Buffer.byteLength(jsonl(logs.fullRecords)));
   });
 });

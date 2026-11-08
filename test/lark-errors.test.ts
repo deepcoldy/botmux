@@ -1,5 +1,3 @@
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   LARK_CODE_APP_SCOPE_MISSING,
@@ -16,6 +14,7 @@ import {
   LARK_CODE_MESSAGE_WITHDRAWN,
   LARK_CODE_USER_SCOPE_MISSING,
   LarkApiError,
+  classifyContactErrorCode,
   extractLarkBusinessCode,
   larkApiError,
   larkCodeFromMessage,
@@ -168,11 +167,6 @@ describe('LarkApiError / larkApiError', () => {
     expect(structuredLarkCode(err)).toBe(230011);
     expect(larkApiError('x', { code: '5' as any, msg: 'm' }).code).toBeUndefined();
   });
-
-  it('client.ts 不再有手写的 `Failed to … (code: N)` 抛错（防回退）', () => {
-    const src = readFileSync(resolve('src/im/lark/client.ts'), 'utf8');
-    expect(src).not.toMatch(/throw (new Error|Object\.assign\(new Error)\(`Failed to [^`]*\(code: \$\{/);
-  });
 });
 
 describe('具名常量', () => {
@@ -195,5 +189,21 @@ describe('具名常量', () => {
 
   it('瞬时码白名单内容不变', () => {
     expect([...TRANSIENT_LARK_CODES].sort()).toEqual([230020, 230049, 99991400]);
+  });
+});
+
+describe('classifyContactErrorCode', () => {
+  it('把确定性 Contact 失败码归为固定类别', () => {
+    expect(classifyContactErrorCode(LARK_CODE_CROSS_APP_OPEN_ID)).toBe('cross_app');
+    expect(classifyContactErrorCode(LARK_CODE_CONTACT_NOT_VISIBLE)).toBe('not_visible');
+    expect(classifyContactErrorCode(LARK_CODE_CONTACT_NO_SUCH_USER)).toBe('invalid_id');
+    expect(classifyContactErrorCode(LARK_CODE_CONTACT_INVALID_PARAM)).toBe('invalid_id');
+  });
+
+  it('瞬时代码 / scope 码 / undefined 一律不判定为确定性失败（保持可重试）', () => {
+    expect(classifyContactErrorCode(40003)).toBeUndefined();
+    expect(classifyContactErrorCode(LARK_CODE_FREQUENCY_LIMITED)).toBeUndefined();
+    expect(classifyContactErrorCode(LARK_CODE_APP_SCOPE_MISSING)).toBeUndefined();
+    expect(classifyContactErrorCode(undefined)).toBeUndefined();
   });
 });

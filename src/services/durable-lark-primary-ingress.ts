@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import type {
   DurableFencedInboxStore,
+  DurableInboxEvent,
   DurableInsertResult,
   DurableSessionLeaseStore,
   SessionLease,
@@ -41,7 +42,25 @@ export interface DurableLarkPrimaryIngress {
     partitionKey: string;
     data: unknown;
   }): Promise<Exclude<DurableInsertResult, { kind: 'conflict' }>>;
+  /**
+   * Persist a realtime event received by any member of the Lark SDK connection
+   * cluster. Unlike recovery scans, realtime delivery must not depend on the
+   * single recovery-leader lease: Lark randomly selects one connected client,
+   * so rejecting a standby client's event would create a p2p/WS-only gap.
+   */
+  enqueueClusterBeforeAck(input: {
+    eventId: string;
+    eventType?: DurableLarkMessageEventType;
+    partitionKey: string;
+    data: unknown;
+  }): Promise<Exclude<DurableInsertResult, { kind: 'conflict' }>>;
   enqueueControlBeforeAck(input: {
+    eventId: string;
+    partitionKey: string;
+    data: unknown;
+  }): Promise<Exclude<DurableInsertResult, { kind: 'conflict' }>>;
+  /** Realtime counterpart of enqueueControlBeforeAck for every WS replica. */
+  enqueueClusterControlBeforeAck(input: {
     eventId: string;
     partitionKey: string;
     data: unknown;
@@ -110,6 +129,14 @@ function larkMessageId(value: unknown): string | undefined {
       ? (nested as Record<string, unknown>).message
       : undefined
   );
+  if (!message) {
+    const recalledMessageId = (
+      nested && typeof nested === 'object' && !Array.isArray(nested)
+        ? nested as Record<string, unknown>
+        : envelope
+    ).message_id;
+    return typeof recalledMessageId === 'string' ? recalledMessageId : undefined;
+  }
   if (!message || typeof message !== 'object' || Array.isArray(message)) return undefined;
   const messageId = (message as Record<string, unknown>).message_id;
   return typeof messageId === 'string' ? messageId : undefined;
@@ -286,7 +313,7 @@ export function startDurableLarkPrimaryIngress(
   const ready = tickElection().finally(installElectionTimer);
 
   const enqueueEventBeforeAck = (
-    event: ReturnType<typeof durableLarkMessageEvent>,
+    event: DurableInboxEvent,
     partitionKey: string,
   ): Promise<Exclude<DurableInsertResult, { kind: 'conflict' }>> => {
     if (stopped || !leadershipIsFresh()) {
@@ -333,72 +360,134 @@ export function startDurableLarkPrimaryIngress(
     );
   };
 
+  const enqueueClusterEventBeforeAck = (
+    event: DurableInboxEvent,
+    partitionKey: string,
+  ): Promise<Exclude<DurableInsertResult, { kind: 'conflict' }>> => {
+    if (stopped) {
+      return Promise.reject(new DurableLarkIngressNotLeaderError('durable Lark ingress is stopped'));
+    }
+    const previous = partitionTails.get(partitionKey) ?? Promise.resolve();
+    const operation = previous.catch(() => undefined).then(async () => {
+      if (stopped) {
+        throw new DurableLarkIngressNotLeaderError('durable Lark ingress is stopped');
+      }
+      const result = await options.store.enqueueInbox(event);
+      if (result.kind === 'conflict') {
+        throw new Error(`durable Lark ingress conflicting duplicate ${event.eventId}`);
+      }
+      return result;
+    });
+    const tail = operation.then(() => undefined, reportError);
+    partitionTails.set(partitionKey, tail);
+    void tail.finally(() => {
+      if (partitionTails.get(partitionKey) === tail) partitionTails.delete(partitionKey);
+    });
+    return waitWithTimeout(
+      operation,
+      ackTimeoutMs,
+      new DurableLarkIngressAckTimeoutError(`durable Lark ingress enqueue exceeded ${ackTimeoutMs}ms`),
+    );
+  };
+
+  const buildMessageEvent = (
+    input: Parameters<DurableLarkPrimaryIngress['enqueueBeforeAck']>[0],
+  ): { event: ReturnType<typeof durableLarkMessageEvent>; partitionKey: string } => {
+    const eventId = boundedIdentity(input.eventId, 'eventId', 1_024);
+    const partitionKey = boundedIdentity(input.partitionKey, 'partitionKey', 1_024);
+    if (!partitionKey.startsWith(`lark-message-routing:${larkAppId}:`)) {
+      throw new Error('durable Lark ingress partition does not match the application');
+    }
+    const messageId = larkMessageId(input.data);
+    const eventType = input.eventType ?? 'lark.im.message.receive_v1';
+    const expectedReceiveEventId = `im.message.receive_v1:${larkAppId}:${messageId}`;
+    const expectedUpdatedPrefix = `im.message.updated_v1:${larkAppId}:`;
+    if (!messageId || !messageId.startsWith('om_') || messageId.length > 256
+        || (eventType !== 'lark.im.message.receive_v1'
+          && eventType !== 'lark.im.message.updated_v1'
+          && eventType !== 'lark.im.message.recalled_v1')
+        || (eventType === 'lark.im.message.receive_v1' && eventId !== expectedReceiveEventId)
+        || (eventType === 'lark.im.message.updated_v1'
+          && (!eventId.startsWith(expectedUpdatedPrefix)
+            || eventId.length === expectedUpdatedPrefix.length))
+        || (eventType === 'lark.im.message.recalled_v1'
+          && (!eventId.startsWith(`im.message.recalled_v1:${larkAppId}:`)
+            || eventId.length === `im.message.recalled_v1:${larkAppId}:`.length))
+        || (eventType === 'lark.im.message.updated_v1'
+          && partitionKey === `lark-message-routing:${larkAppId}:__chatless__`)) {
+      throw new Error('durable Lark ingress event does not match the application message identity');
+    }
+    const wallNow = now();
+    if (!Number.isSafeInteger(wallNow) || wallNow < 0) {
+      throw new Error('durable Lark ingress clock is invalid');
+    }
+    const createdAt = Math.max(wallNow, lastCreatedAt + 1);
+    const event = durableLarkMessageEvent({
+      larkAppId,
+      eventType,
+      eventId,
+      partitionKey,
+      data: input.data,
+      now: createdAt,
+    });
+    lastCreatedAt = createdAt;
+    return { event, partitionKey };
+  };
+
   const enqueueBeforeAck: DurableLarkPrimaryIngress['enqueueBeforeAck'] = input => {
-    let event: ReturnType<typeof durableLarkMessageEvent>;
-    let partitionKey: string;
     try {
-      const eventId = boundedIdentity(input.eventId, 'eventId', 1_024);
-      partitionKey = boundedIdentity(input.partitionKey, 'partitionKey', 1_024);
-      if (!partitionKey.startsWith(`lark-message-routing:${larkAppId}:`)) {
-        throw new Error('durable Lark ingress partition does not match the application');
-      }
-      const messageId = larkMessageId(input.data);
-      const eventType = input.eventType ?? 'lark.im.message.receive_v1';
-      const expectedReceiveEventId = `im.message.receive_v1:${larkAppId}:${messageId}`;
-      const expectedUpdatedPrefix = `im.message.updated_v1:${larkAppId}:`;
-      if (!messageId || !messageId.startsWith('om_') || messageId.length > 256
-          || (eventType !== 'lark.im.message.receive_v1'
-            && eventType !== 'lark.im.message.updated_v1')
-          || (eventType === 'lark.im.message.receive_v1' && eventId !== expectedReceiveEventId)
-          || (eventType === 'lark.im.message.updated_v1'
-            && (!eventId.startsWith(expectedUpdatedPrefix)
-              || eventId.length === expectedUpdatedPrefix.length))
-          || (eventType === 'lark.im.message.updated_v1'
-            && partitionKey === `lark-message-routing:${larkAppId}:__chatless__`)) {
-        throw new Error('durable Lark ingress event does not match the application message identity');
-      }
-      const wallNow = now();
-      if (!Number.isSafeInteger(wallNow) || wallNow < 0) {
-        throw new Error('durable Lark ingress clock is invalid');
-      }
-      const createdAt = Math.max(wallNow, lastCreatedAt + 1);
-      event = durableLarkMessageEvent({
-        larkAppId,
-        eventType,
-        eventId,
-        partitionKey,
-        data: input.data,
-        now: createdAt,
-      });
-      lastCreatedAt = createdAt;
+      const { event, partitionKey } = buildMessageEvent(input);
+      return enqueueEventBeforeAck(event, partitionKey);
     } catch (error) {
       return Promise.reject(error);
     }
-    return enqueueEventBeforeAck(event, partitionKey);
+  };
+
+  const enqueueClusterBeforeAck: DurableLarkPrimaryIngress['enqueueClusterBeforeAck'] = input => {
+    try {
+      const { event, partitionKey } = buildMessageEvent(input);
+      return enqueueClusterEventBeforeAck(event, partitionKey);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  };
+
+  const buildControlEvent = (
+    input: Parameters<DurableLarkPrimaryIngress['enqueueControlBeforeAck']>[0],
+  ): { event: ReturnType<typeof durableLarkSessionControlEvent>; partitionKey: string } => {
+    const partitionKey = boundedIdentity(input.partitionKey, 'partitionKey', 1_024);
+    const wallNow = now();
+    if (!Number.isSafeInteger(wallNow) || wallNow < 0) {
+      throw new Error('durable Lark ingress clock is invalid');
+    }
+    const createdAt = Math.max(wallNow, lastCreatedAt + 1);
+    const event = durableLarkSessionControlEvent({
+      larkAppId,
+      eventId: boundedIdentity(input.eventId, 'eventId', 1_024),
+      partitionKey,
+      data: input.data,
+      now: createdAt,
+    });
+    lastCreatedAt = createdAt;
+    return { event, partitionKey };
   };
 
   const enqueueControlBeforeAck: DurableLarkPrimaryIngress['enqueueControlBeforeAck'] = input => {
-    let event: ReturnType<typeof durableLarkSessionControlEvent>;
-    let partitionKey: string;
     try {
-      partitionKey = boundedIdentity(input.partitionKey, 'partitionKey', 1_024);
-      const wallNow = now();
-      if (!Number.isSafeInteger(wallNow) || wallNow < 0) {
-        throw new Error('durable Lark ingress clock is invalid');
-      }
-      const createdAt = Math.max(wallNow, lastCreatedAt + 1);
-      event = durableLarkSessionControlEvent({
-        larkAppId,
-        eventId: boundedIdentity(input.eventId, 'eventId', 1_024),
-        partitionKey,
-        data: input.data,
-        now: createdAt,
-      });
-      lastCreatedAt = createdAt;
+      const { event, partitionKey } = buildControlEvent(input);
+      return enqueueEventBeforeAck(event, partitionKey);
     } catch (error) {
       return Promise.reject(error);
     }
-    return enqueueEventBeforeAck(event, partitionKey);
+  };
+
+  const enqueueClusterControlBeforeAck: DurableLarkPrimaryIngress['enqueueClusterControlBeforeAck'] = input => {
+    try {
+      const { event, partitionKey } = buildControlEvent(input);
+      return enqueueClusterEventBeforeAck(event, partitionKey);
+    } catch (error) {
+      return Promise.reject(error);
+    }
   };
 
   const terminate = (): void => {
@@ -413,7 +502,9 @@ export function startDurableLarkPrimaryIngress(
     leaseKey,
     ready,
     enqueueBeforeAck,
+    enqueueClusterBeforeAck,
     enqueueControlBeforeAck,
+    enqueueClusterControlBeforeAck,
     status: () => stopped
       ? { kind: 'stopped' }
       : leadershipIsFresh() && lease

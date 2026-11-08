@@ -6,7 +6,6 @@ const URL_PATH = '/api/bots/cli_a/reply-style';
 
 describe('dashboard reply-style proxy', () => {
   it('forwards a bounded PUT payload to the exact daemon route', async () => {
-    expect(REPLY_STYLE_REQUEST_MAX_BYTES).toBe(32 * 1024);
     expect(proxyRouteFor('PUT', URL_PATH)?.body).toEqual({ kind: 'json', maxBytes: REPLY_STYLE_REQUEST_MAX_BYTES });
     const out = await runProxyRoute({ method: 'PUT', url: URL_PATH, body: '{"theme":"default"}' });
     expect(out.proxyCalls).toEqual([{

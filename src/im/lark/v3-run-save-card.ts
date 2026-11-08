@@ -126,6 +126,8 @@ export function buildV3RunSavedCard(input: {
   scope: V3RunSaveScope;
   /** When a replay requested another scope, first valid commit still wins. */
   requestedScope?: V3RunSaveScope;
+  /** Runtime flow revisions in the source run (design §13.8). */
+  runtimeRevisions?: number;
 }): string {
   const runCommand = `/workflow run ${input.workflowId}`;
   return JSON.stringify({
@@ -148,6 +150,13 @@ export function buildV3RunSavedCard(input: {
         tag: 'div',
         text: { tag: 'lark_md', content: `下次运行：\`${escapeMd(runCommand)}\`` },
       },
+      ...(input.runtimeRevisions && input.runtimeRevisions > 0 ? [{
+        tag: 'note',
+        elements: [{
+          tag: 'plain_text',
+          content: `本流程在运行中修改过 ${input.runtimeRevisions} 次，保存的是最终生效的版本，请核对节点与审批设置。`,
+        }],
+      }] : []),
       ...(input.requestedScope && input.requestedScope !== input.scope ? [{
         tag: 'note',
         elements: [{

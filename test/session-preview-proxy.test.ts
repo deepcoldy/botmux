@@ -460,8 +460,8 @@ describe('session preview same-origin reverse proxy', () => {
     });
     const foreign = [
       '/api/sessions',
-      '/api/debug-terminal',
-      '/debug-terminal/abc/ws',
+      '/api/host-terminal',
+      '/host-terminal/abc/ws',
       '/events',
       '/s/sess-1/ws',
       '/previewer/s1/',

@@ -72,7 +72,9 @@ describe('host session scope reaches the pane', () => {
   it.skipIf(!hasTmux)('replaces stale server scope for thread and chat panes and clears it for an unscoped pane', () => {
     const dir = mkdtempSync(join(tmpdir(), 'session-scope-tmux-'));
     const socket = `bmx-scope-${process.pid}-${Date.now()}`;
-    const clientEnv = { PATH: process.env.PATH, HOME: dir };
+    // Keep the fence's private socket root: a hand-built env without
+    // TMUX_TMPDIR puts this server in the HOST socket directory.
+    const clientEnv = { PATH: process.env.PATH, HOME: dir, TMUX_TMPDIR: process.env.TMUX_TMPDIR };
     const runTmux = (args: string[], env: NodeJS.ProcessEnv = clientEnv) => {
       const result = spawnSync('tmux', ['-L', socket, ...args], { env, encoding: 'utf8', timeout: 10_000 });
       expect(result.status, result.stderr || String(result.error ?? '')).toBe(0);
@@ -293,6 +295,19 @@ describe('buildBotmuxEnvAssignments()', () => {
     expect(out).toContain('BOTMUX_OWNER_OPEN_ID=ou_owner');
     // Ownerless sessions (foreign-bot auto-create) don't set it → absent.
     expect(buildBotmuxEnvAssignments({ BOTMUX: '1' }).some(s => s.startsWith('BOTMUX_OWNER_OPEN_ID='))).toBe(false);
+  });
+
+  it('forwards the host-resolved dispatch task-tree card switch into panes', () => {
+    // The file-sandboxed CLI cannot read ~/.botmux/config.json; the daemon
+    // projects the resolved value and it reaches the pane only because it is on
+    // the injected-keys allowlist. Removing it from the allowlist drops this.
+    const on = buildBotmuxEnvAssignments({ BOTMUX: '1', BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED: 'true' });
+    expect(on).toContain('BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED=true');
+    const off = buildBotmuxEnvAssignments({ BOTMUX: '1', BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED: 'false' });
+    expect(off).toContain('BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED=false');
+    // A non-allowlisted BOTMUX_* knob is not forwarded just by sharing the prefix.
+    expect(buildBotmuxEnvAssignments({ BOTMUX: '1', BOTMUX_NOT_A_REAL_KNOB: 'x' }))
+      .not.toContain('BOTMUX_NOT_A_REAL_KNOB=x');
   });
 
   it('forwards the reply-card usage visibility into persistent CLI panes', () => {

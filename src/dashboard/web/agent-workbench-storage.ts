@@ -114,10 +114,6 @@ export interface WorkbenchSeenLedger {
   unread: Record<string, number>;
 }
 
-export function emptyWorkbenchSeenLedger(): WorkbenchSeenLedger {
-  return { seen: {}, unread: {} };
-}
-
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }

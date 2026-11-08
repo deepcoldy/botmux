@@ -162,11 +162,30 @@ describe('isForkCapableSession', () => {
     } as any);
   });
 
-  it('accepts claude-code / seed / relay / codex / traex / grok (terminal)', () => {
-    for (const cliId of ['claude-code', 'seed', 'relay', 'codex', 'traex', 'grok'] as const) {
+  it('accepts native fork-capable CLIs on a local terminal', () => {
+    for (const cliId of ['claude-code', 'seed', 'relay', 'codex', 'traex', 'grok', 'antigravity'] as const) {
       const ds = makeSourceDs({ cliId });
       expect(isForkCapableSession(ds)).toBe(true);
     }
+  });
+
+  it('refuses Antigravity on a remote backend without a local native terminal', () => {
+    expect(isForkCapableSession(makeSourceDs({ cliId: 'antigravity', backendType: 'remote-runner' }))).toBe(false);
+  });
+
+  it('refuses Antigravity in the scratch sandbox, whose fork receipt the worker cannot read', () => {
+    expect(isForkCapableSession(makeSourceDs({ cliId: 'antigravity', sandbox: 'scratch' }))).toBe(false);
+    vi.stubEnv('BOTMUX_SANDBOX', 'scratch');
+    try {
+      expect(isForkCapableSession(makeSourceDs({ cliId: 'antigravity', sandbox: false }))).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('keeps Antigravity forkable under the oncall sandbox and other CLIs under scratch', () => {
+    expect(isForkCapableSession(makeSourceDs({ cliId: 'antigravity', sandbox: true }))).toBe(true);
+    expect(isForkCapableSession(makeSourceDs({ cliId: 'claude-code', sandbox: 'scratch' }))).toBe(true);
   });
 
   it('refuses aiden because its adapter has no native fork contract', () => {
@@ -212,8 +231,8 @@ describe('isForkCapableSession', () => {
     expect(isForkCapableSession(ds)).toBe(false);
   });
 
-  it('refuses a non-forkable CLI (e.g. gemini)', () => {
-    const ds = makeSourceDs({ cliId: 'gemini' });
+  it('refuses a non-forkable CLI (e.g. opencode)', () => {
+    const ds = makeSourceDs({ cliId: 'opencode' });
     expect(isForkCapableSession(ds)).toBe(false);
   });
 });
@@ -236,6 +255,33 @@ describe('turnStartingCardStatus', () => {
       usageLimit: { retryLabel: 'later' } as DaemonSession['usageLimit'],
     });
     expect(turnStartingCardStatus(limited, 'grok')).toBe('limited');
+  });
+
+  // Repro: a Lark message steered into a RUNNING Codex App turn posts a fresh
+  // status card. Same-turn screen_updates only PATCH on a status edge
+  // (prevStatus !== lastScreenStatus), and the worker is already `working`, so
+  // working→working never edges and a card posted as `starting` stays at
+  // 「启动中…」 for the rest of the turn.
+  it('starts a steered Codex App turn as working when the worker is already working', () => {
+    const steered = makeSourceDs({ cliId: 'codex-app' }, { workerReady: true, lastScreenStatus: 'working' });
+    expect(turnStartingCardStatus(steered, 'codex-app')).toBe('working');
+  });
+
+  // Unlike Grok (which projects working after init regardless of status),
+  // Codex App must additionally observe `working`: a fresh turn on an
+  // initialized-but-idle worker is a real cold turn and stays `starting` until
+  // its first status edge.
+  it('keeps an initialized but idle Codex App turn on starting', () => {
+    const initializedIdle = makeSourceDs({ cliId: 'codex-app' }, { workerReady: true, lastScreenStatus: 'idle' });
+    expect(turnStartingCardStatus(initializedIdle, 'codex-app')).toBe('starting');
+  });
+
+  // A cached `working` status left by a previous generation must not project
+  // onto a card before the worker has initialized.
+  it('keeps Codex App on starting before worker init even with a cached working status', () => {
+    const coldCachedWorking = makeSourceDs({ cliId: 'codex-app' }, { workerReady: false, lastScreenStatus: 'working' });
+    expect(coldCachedWorking.workerReady).toBe(false);
+    expect(turnStartingCardStatus(coldCachedWorking, 'codex-app')).toBe('starting');
   });
 });
 
@@ -331,8 +377,9 @@ describe('forkSession — frozen launch posture inheritance', () => {
     expect(child.sandbox).toBe(false);
   });
 
-  it('preserves scratch storage, denied paths and the worktree admission decision without shared objects', async () => {
+  it('preserves service tier, scratch storage, denied paths and the worktree admission decision without shared objects', async () => {
     const src = makeSourceDs({ sandbox: 'scratch',
+      serviceTier: 'priority',
       sandboxScratch: { storage: 'tmpfs', tmpfsSizeMb: 192, denyPaths: ['/private'], network: false },
       autoWorktreeFallbackDir: '/tmp/project' });
     registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
@@ -341,6 +388,7 @@ describe('forkSession — frozen launch posture inheritance', () => {
     expect(child.sandbox).toBe('scratch');
     expect(child.sandboxScratch).toEqual(src.session.sandboxScratch);
     expect(child.sandboxScratch).not.toBe(src.session.sandboxScratch);
+    expect(child.serviceTier).toBe(src.session.serviceTier);
     expect(child.autoWorktreeFallbackDir).toBe('/tmp/project');
     child.sandboxScratch!.denyPaths!.push('/child-only');
     expect(src.session.sandboxScratch!.denyPaths).toEqual(['/private']);
@@ -405,6 +453,14 @@ describe('forkSession — frozen launch posture inheritance', () => {
   // ── An EXPLICIT per-trigger override, however, must reach the clone: it lives
   //    on the runtime session (in-memory, never persisted), so forkSession has
   //    to hand it to the child ds or the fork silently drops to the bot default. ──
+  it('inherits only an explicit topic pin, preserving provenance without aliasing', async () => {
+    const pin = { model: 'sonnet', effort: 'high' as const, source: 'topic-header' as const, setBy: 'owner', setAt: '2026-11-06T00:00:00Z' };
+    const src = makeSourceDs({ modelPin: pin }); registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+    expect((await callFork(src)).ok).toBe(true);
+    const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
+    expect(child.modelPin).toEqual(pin); expect(child.modelPin).not.toBe(src.session.modelPin);
+  });
+
   it('carries an explicit per-trigger model override onto the child runtime session', async () => {
     const src = makeSourceDs({}, { spawnModelOverride: 'gpt-5.6-terra' });
     registry.set(sessionKey('om_source_root', 'cli_app_test'), src);

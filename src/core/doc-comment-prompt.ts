@@ -289,6 +289,14 @@ export function buildDocCommentTurnInput(args: {
     codexAppApplicationContext: buildDocCommentApplicationContext(promptInput),
     codexAppMessageContext: buildDocCommentMessageContext(promptInput),
   };
+  // The current comment sender was resolved by the daemon in this application.
+  // Pass it as execution identity, not just model-visible sender text: modern
+  // workers explicitly publish callerless turns when this field is absent.
+  const trustedCaller = !ds.adoptedFrom && args.turnId && args.sender?.openId ? {
+    requestLarkAppId: ds.larkAppId,
+    requestUserOpenId: args.sender.openId,
+    senderType: args.sender.type,
+  } : undefined;
   if (args.mode === 'live') {
     return {
       promptContent,
@@ -297,6 +305,7 @@ export function buildDocCommentTurnInput(args: {
         cliId,
         cliPathOverride,
         sender: args.sender,
+        trustedCaller,
         larkAppId: ds.larkAppId,
         sessionBackendType: ds.session.backendType,
         promptInjection: sessionPromptInjection(ds),
@@ -307,15 +316,13 @@ export function buildDocCommentTurnInput(args: {
       }),
     };
   }
-  return {
-    promptContent,
-    cliInput: buildReforkCliInput(ds, promptContent, {
-      cliId,
-      cliPathOverride,
-      selfMention: args.botIdentity,
-      sender: args.sender,
-      turnId: args.turnId,
-      ...cleanContext,
-    }),
-  };
+  const cliInput = buildReforkCliInput(ds, promptContent, {
+    cliId,
+    cliPathOverride,
+    selfMention: args.botIdentity,
+    sender: args.sender,
+    turnId: args.turnId,
+    ...cleanContext,
+  });
+  return { promptContent, cliInput: { ...cliInput, ...(trustedCaller ? { trustedCaller } : {}) } };
 }

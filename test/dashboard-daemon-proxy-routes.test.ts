@@ -15,6 +15,7 @@ const JSON_HEAD = { 'content-type': 'application/json' };
 const EXPECTED: ReadonlyArray<readonly [ProxyMethod, string, string, string]> = [
   ['PUT', '/api/bots/cli_a/working-dir-mode', '/api/bot-working-dir-mode', 'raw'],
   ['PUT', '/api/bots/cli_a/agent', '/api/bot-agent', 'raw'],
+  ['GET', '/api/bots/cli_a/codex-profiles', '/api/bot-codex-profiles', 'none'],
   ['PUT', '/api/bots/cli_a/skills', '/api/bot-skills', 'raw'],
   ['PUT', '/api/bots/cli_a/brand-label', '/api/bot-brand-label', 'raw'],
   ['PUT', '/api/bots/cli_a/reply-style', '/api/bot-reply-style', 'json'],
@@ -24,16 +25,21 @@ const EXPECTED: ReadonlyArray<readonly [ProxyMethod, string, string, string]> = 
   ['PUT', '/api/bots/cli_a/cantalk-daemon-commands', '/api/bot-cantalk-daemon-commands', 'raw'],
   ['PUT', '/api/bots/cli_a/launch-shell', '/api/bot-launch-shell', 'raw'],
   ['PUT', '/api/bots/cli_a/oncall-group', '/api/bot-oncall-group', 'raw'],
+  ['PUT', '/api/bots/cli_a/steward', '/api/bot-steward', 'json'],
+  ['PUT', '/api/bots/cli_a/actor-owner-bindings', '/api/bot-actor-owner-bindings', 'raw'],
   ['PUT', '/api/bots/cli_a/feedback', '/api/bot-feedback', 'raw'],
   ['PUT', '/api/bots/cli_a/chats/oc_1/feedback', '/api/chat-feedback/oc_1', 'raw'],
   ['GET', '/api/bots/cli_a/feedback/effective', '/api/feedback-effective', 'none'],
   ['PUT', '/api/bots/cli_a/env', '/api/bot-env', 'raw'],
   ['PUT', '/api/bots/cli_a/env-policy', '/api/bot-env-policy', 'raw'],
   ['PUT', '/api/bots/cli_a/codex-auth-sync', '/api/bot-codex-auth-sync', 'raw'],
+  ['GET', '/api/bots/cli_a/codex-config', '/api/bot-codex-config', 'none'],
+  ['POST', '/api/bots/cli_a/codex-config/resync', '/api/bot-codex-config/resync', 'raw'],
   ['PUT', '/api/bots/cli_a/trigger-user-auth', '/api/bot-trigger-user-auth', 'raw'],
   ['PUT', '/api/bots/cli_a/lark-tool-binding', '/api/bot-lark-tool-binding', 'raw'],
   ['GET', '/api/bots/cli_a/trigger-user-auth-status', '/api/bot-trigger-user-auth-status', 'none'],
   ['PUT', '/api/bots/cli_a/riff', '/api/bot-riff', 'raw'],
+  ['PUT', '/api/bots/cli_a/herdr', '/api/bot-herdr', 'raw'],
   ['PUT', '/api/bots/cli_a/sandbox-network-policy', '/api/bot-sandbox-network-policy', 'raw'],
   ['PUT', '/api/bots/cli_a/sandbox-paths', '/api/bot-sandbox-paths', 'raw'],
   ['PUT', '/api/bots/cli_a/sandbox', '/api/bot-sandbox', 'raw'],
@@ -43,6 +49,8 @@ const EXPECTED: ReadonlyArray<readonly [ProxyMethod, string, string, string]> = 
   ['PUT', '/api/bots/cli_a/substitute-mode', '/api/bot-substitute-mode', 'raw'],
   ['POST', '/api/bots/cli_a/substitute-targets/resolve', '/api/bot-substitute-targets/resolve', 'raw'],
   ['PUT', '/api/bots/cli_a/summary-range', '/api/bot-summary-range', 'raw'],
+  ['GET', '/api/bots/cli_a/session-group-naming-config', '/api/session-group-naming-config', 'none'],
+  ['PUT', '/api/bots/cli_a/session-group-naming-config', '/api/session-group-naming-config', 'raw'],
   ['GET', '/api/bots/cli_a/session-group-tag-status', '/api/session-group-tag-status', 'none'],
   ['POST', '/api/bots/cli_a/session-group-tag-auth', '/api/session-group-tag-auth', 'raw'],
   ['PUT', '/api/bots/cli_a/session-group-tag-config', '/api/session-group-tag-config', 'raw'],
@@ -59,8 +67,10 @@ const EXPECTED: ReadonlyArray<readonly [ProxyMethod, string, string, string]> = 
   ['PUT', '/api/bots/cli_a/avatar', '/api/bot-avatar', 'raw'],
   ['PUT', '/api/bots/cli_a/max-live-workers', '/api/bot-max-live-workers', 'raw'],
   ['PUT', '/api/bots/cli_a/no-progress-notify', '/api/bot-no-progress-notify', 'raw'],
+  ['PUT', '/api/bots/cli_a/prompt-cache', '/api/bot-prompt-cache', 'raw'],
   ['PUT', '/api/bots/cli_a/idle-suspend-minutes', '/api/bot-idle-suspend-minutes', 'raw'],
   ['PUT', '/api/bots/cli_a/session-owner-reminder', '/api/bot-session-owner-reminder', 'raw'],
+  ['PUT', '/api/bots/cli_a/long-task-reminder', '/api/bot-long-task-reminder', 'raw'],
   ['GET', '/api/bots/cli_a/blocked-users', '/api/blocked-users', 'none'],
   ['PUT', '/api/bots/cli_a/blocked-users', '/api/blocked-users', 'raw'],
   ['POST', '/api/bots/cli_a/grants/chat', '/api/grants/chat', 'raw'],
@@ -280,6 +290,19 @@ describe('handleDaemonProxyRoute: body-less and path-rewriting routes', () => {
     }
   });
 
+  it('forwards a trigger-user-auth-status openId query and nothing else changes', async () => {
+    const out = await runProxyRoute({
+      method: 'GET',
+      url: '/api/bots/cli_a/trigger-user-auth-status?openId=ou_status_probe',
+    });
+    expect(out.proxyCalls).toEqual([{
+      appId: 'cli_a',
+      path: '/api/bot-trigger-user-auth-status?openId=ou_status_probe',
+      init: { method: 'GET' },
+    }]);
+    expect(out.bodyConsumed).toBe(false);
+  });
+
   it('session-group-tag-status keeps the content-type header on GET, the other GETs do not', async () => {
     const out = await runProxyRoute({ method: 'GET', url: '/api/bots/cli_a/session-group-tag-status' });
     expect(out.proxyCalls[0]!.init).toEqual({ method: 'GET', headers: JSON_HEAD });
@@ -384,40 +407,26 @@ describe('handleDaemonProxyRoute: when the appId is url-decoded', () => {
   });
 });
 
-describe('dashboard.ts wiring', () => {
+describe('dashboard.ts hand-written /api/bots routes', () => {
   const source = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
 
-  it('dispatches the table from the request closure', () => {
-    expect(source).toContain('handleDaemonProxyRoute(BOT_PROXY_ROUTES, req, res, url, daemonProxyDeps)');
-  });
-
-  it('maps the proxy 413 to the same error class readJsonBody throws', () => {
-    expect(source).toContain('isBodyTooLarge: err => err instanceof DashboardJsonBodyTooLargeError');
-    expect(source).toContain('throw new DashboardJsonBodyTooLargeError(');
-  });
-
-  it('keeps the table order-independent of the hand-written /api/bots routes that remain in dashboard.ts', () => {
-    // 表在请求闭包里一次性匹配，位置在原先那批手写块中靠后的一处。原先位置更靠前的几条
-    // （blocked-users / grants/chat / chat-group-grant）因此被后移，等价的前提是：夹在中间的
-    // 路由与表内任何一条都不会命中同一个 URL。dashboard.ts 里仍手写的 /api/bots 路由必须与表互斥。
+  // 源码结构护栏(K4)：dashboard.ts 请求闭包里仍手写（未导出）的 /api/bots 路由必须与
+  // BOT_PROXY_ROUTES 表互斥，表的分发位置才不影响匹配结果；quota-fallback 带 daemon 离线时的
+  // 本地 bots.json 兜底，不能并进纯转发表。一份事实只存在于闭包源码，无法 import 双方比较。
+  // 来源：#1902 把纯转发路由改为表驱动时的等价前提。
+  it('stay disjoint from the proxy table, and quota-fallback stays out of the table', () => {
     const handWritten = [...source.matchAll(/url\.pathname\.match\((\/\^\\\/api\\\/bots\\\/[^\n]*?\$\/)\)/g)]
       .map(m => m[1]);
     const exact = [...source.matchAll(/url\.pathname === '(\/api\/bots[^']*)'/g)].map(m => m[1]);
-    expect(handWritten).toEqual(['/^\\/api\\/bots\\/([^/]+)\\/quota-fallback$/']);
-    expect(exact).toEqual(['/api/bots']);
+    // 非空：提取正则一旦失配，下面的互斥循环会空转变绿。
+    expect(handWritten.length).toBeGreaterThan(0);
     for (const literal of handWritten) {
-      const body = literal.slice(1, literal.lastIndexOf('/'));
-      const re = new RegExp(body);
+      const re = new RegExp(literal.slice(1, literal.lastIndexOf('/')));
       for (const route of BOT_PROXY_ROUTES) {
         expect(re.test(samplePathname(route)), `${literal} vs ${route.path.source}`).toBe(false);
       }
     }
-    for (const route of BOT_PROXY_ROUTES) expect(samplePathname(route)).not.toBe('/api/bots');
-  });
-
-  it('keeps quota-fallback hand-written: it has a local bots.json fallback when the daemon is offline', () => {
-    expect(source).toContain('quota-fallback$/');
-    expect(source).toContain('rmwBotEntry');
+    for (const route of BOT_PROXY_ROUTES) expect(exact).not.toContain(samplePathname(route));
     expect(BOT_PROXY_ROUTES.some(route => route.path.test('/api/bots/cli_a/quota-fallback'))).toBe(false);
   });
 });

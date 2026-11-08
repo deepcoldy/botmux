@@ -612,18 +612,6 @@ export function codexAppControlStatePath(sessionDataDir: string, sessionId: stri
   return join(sessionDataDir, 'codex-app-control', `${sessionKey(sessionId)}.json`);
 }
 
-export function codexAppControlStatePathForPlatform(
-  sessionDataDir: string,
-  sessionId: string,
-  options: CodexAppControlPathOptions = {},
-): string {
-  const platform = options.platform ?? process.platform;
-  if (platform === 'win32') {
-    return win32.join(codexAppWindowsControlRoot(options), 'state', `${sessionKey(sessionId)}.json`);
-  }
-  return join(sessionDataDir, 'codex-app-control', `${sessionKey(sessionId)}.json`);
-}
-
 export function codexAppControlSocketPath(directory: string, sessionId: string): string {
   // Unix-domain paths are short on macOS. A fixed 32-hex leaf keeps the path
   // comfortably below the platform limit for normal BOT_HOME/tmp roots.

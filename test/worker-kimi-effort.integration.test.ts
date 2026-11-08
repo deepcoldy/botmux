@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { expect, it } from 'vitest';
 import { spawnTsScript } from './helpers/ts-runner.js';
+import { killProcessTree } from './helpers/process-tree.js';
 
 it.skipIf(spawnSync('tmux', ['-V']).status !== 0)('Kimi effort reaches its pane without leaking into the next session', async () => {
   const root = mkdtempSync(join(tmpdir(), 'botmux-kimi-env-'));
@@ -56,7 +57,8 @@ it.skipIf(spawnSync('tmux', ['-V']).status !== 0)('Kimi effort reaches its pane 
         expect(readFileSync(output, 'utf8'), logs).toBe(expected);
       } finally {
         if (child.connected) child.send!({ type: 'close' });
-        const timer = setTimeout(() => child.kill('SIGKILL'), 5000);
+        // With any tmux call still in flight: TMUX_TMPDIR (root) goes below.
+        const timer = setTimeout(() => { void killProcessTree(child); }, 5000);
         await exited;
         clearTimeout(timer);
       }

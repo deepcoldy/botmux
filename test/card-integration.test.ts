@@ -153,8 +153,10 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
     initWorkerPool: vi.fn(),
     isSessionTransferring: vi.fn((...args: Parameters<typeof orig.isSessionTransferring>) => orig.isSessionTransferring(...args)),
     requestSessionRestart: vi.fn((_ds: any, observer: any) => {
-      void observer.notify('in_progress');
-      return { attemptId: 'attempt-card', joined: false };
+      // Fresh attempt per call: the restart status card is shared per attempt.
+      const attemptId = `attempt-card-${Math.random().toString(36).slice(2)}`;
+      void observer.notify('in_progress', attemptId);
+      return { attemptId, joined: false };
     }),
   };
 });
@@ -617,12 +619,13 @@ describe('Card integration: full event flow', () => {
       await handleCardAction(makeRestartEvent(ROOT_ID), deps, APP_ID);
 
       expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'card' }));
-      // The confirmation is delivered ephemeral to the clicker (group chat + an
-      // operator open_id), not as a visible group reply.
-      expect(vi.mocked(clientMod.sendEphemeralCard)).toHaveBeenCalledWith(
-        APP_ID, ds.chatId, 'ou_user', expect.stringContaining('重启'),
+      // One public status card that later restart results patch in place —
+      // the whole chat sees why the CLI restarted, not only the clicker.
+      expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledTimes(1);
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID, expect.stringContaining('正在重启'), 'interactive', APP_ID,
       );
-      expect(deps.sessionReply).not.toHaveBeenCalled();
     });
 
     it('restart from a stale Riff card should explain close-and-recreate without IPC', async () => {
@@ -1094,7 +1097,8 @@ describe('Card integration: full event flow', () => {
   // thread-scope session inside a 普通群) must NOT use ephemeral — the
   // restart/close/resume confirmation has to stay in the topic via the visible
   // in-thread reply (sessionReply → reply_in_thread). Flat 普通群 (scope:'chat',
-  // tested in Scenario 4) keeps the ephemeral "visible-to-you" behaviour.
+  // tested in Scenario 4) keeps the ephemeral "visible-to-you" behaviour for
+  // close/resume; restart posts a public status card in both scopes.
 
   describe('Scenario 4b: thread-scope status cards stay in the thread', () => {
     it('restart confirmation in a thread-scope session is a visible in-thread reply, never ephemeral', async () => {
@@ -1113,7 +1117,7 @@ describe('Card integration: full event flow', () => {
       expect(requestSessionRestart).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'card' }));
       expect(vi.mocked(clientMod.sendEphemeralCard)).not.toHaveBeenCalled();
       expect(deps.sessionReply).toHaveBeenCalledWith(
-        ROOT_ID, expect.stringContaining('重启'), undefined, APP_ID,
+        ROOT_ID, expect.stringContaining('正在重启'), 'interactive', APP_ID,
       );
     });
 
@@ -1903,6 +1907,37 @@ describe('Card integration: full event flow', () => {
       }
     });
 
+    it('renders a waiting current target with the predecessor preview when expanded', async () => {
+      const ds = makeDaemonSession({
+        streamCardId: 'om_waiting_B',
+        streamCardNonce: NONCE_CURRENT,
+        displayMode: 'hidden',
+        currentTurnId: 'om_turn_B',
+        streamCardDisplayTarget: {
+          messageId: 'om_waiting_B', publication: 2,
+          mode: 'waiting-exact-turn', turnId: 'om_turn_B',
+        },
+        waitingTurnPreview: { imageKey: 'img_turn_A', turnId: 'om_turn_A' },
+        captureIdentity: {
+          workerGeneration: 1, revision: 1, turnId: 'om_turn_A',
+          lastSource: { turnId: 'om_turn_A' },
+        },
+        workerGeneration: 1,
+        retainedCaptureSource: { turnId: 'om_turn_A' },
+      });
+      const sessions = new Map([[sessionKey(ROOT_ID, APP_ID), ds]]);
+      await handleCardAction(
+        makeToggleEvent(ROOT_ID, NONCE_CURRENT, 'ou_user', 'om_waiting_B'),
+        makeDeps(sessions),
+        APP_ID,
+      );
+      await flush();
+      expect(fakeLark.patches).toHaveLength(1);
+      expect(parseCard(fakeLark.patches[0].args[2])).toMatchObject({
+        status: 'working', expanded: true, imageKey: 'img_turn_A',
+      });
+    });
+
     it('a cached frame from a silent scheduled turn is not shown; the card says unavailable instead', async () => {
       const ds = makeDaemonSession({
         streamCardId: 'om_live_silent',
@@ -2063,6 +2098,7 @@ describe('Card integration: full event flow', () => {
         },
         lastUserPrompt: '继续',
         lastCliInput: '<user_message>继续</user_message>',
+        lastCliInputTurnId: 'om_limited_turn',
         currentImageKey: 'img_old',
       });
       const sessions = new Map<string, DaemonSession>();
@@ -2071,9 +2107,19 @@ describe('Card integration: full event flow', () => {
 
       await handleCardAction(makeRetryLastTaskEvent(ROOT_ID), deps, APP_ID);
 
+      const { rememberLastCliInput } = await import('../src/core/session-manager.js');
+      const retryTurnId = vi.mocked(rememberLastCliInput).mock.calls.at(-1)?.[3];
+      expect(retryTurnId).toEqual(expect.any(String));
+      expect(retryTurnId).not.toBe('');
+      expect(retryTurnId).not.toBe('om_limited_turn');
+      expect(rememberLastCliInput).toHaveBeenCalledWith(
+        ds, '继续', { content: '<user_message>继续</user_message>' }, retryTurnId,
+      );
+      expect((ds.worker as any).send).toHaveBeenCalledTimes(1);
       expect((ds.worker as any).send).toHaveBeenCalledWith({
         type: 'message',
         content: '<user_message>继续</user_message>',
+        turnId: retryTurnId,
       });
       expect(ds.usageLimit).toBeUndefined();
       expect(ds.usageLimitRetryTimer).toBeUndefined();
@@ -2174,7 +2220,7 @@ describe('Independent review R2: capture identity vs display target', () => {
     return { pool, ds, worker };
   }
 
-  it('REVIEW R2 running predecessor must not paint a posted type-ahead successor', async () => {
+  it('REVIEW R2 running predecessor is preview-only and never the successor cache', async () => {
     const { pool, ds, worker } = await livePool({
       streamCardId: 'om_review_card_A', streamCardNonce: 'nonce_review_A',
       currentTurnId: 'om_review_turn_A', streamCardTurnGeneration: 1, frozenCards: new Map(),
@@ -2205,9 +2251,17 @@ describe('Independent review R2: capture identity vs display target', () => {
       status: 'working', turnId: 'om_review_turn_A', captureRevision: 1,
     });
     await flush();
-    expect(fakeLark.patches.map(call => ({ messageId: call.args[1], imageKey: parseCard(call.args[2]).imageKey })))
-      .not.toContainEqual({ messageId: 'om_review_card_B', imageKey: 'img_review_predecessor_A' });
+    expect(fakeLark.patches.map(call => ({
+      messageId: call.args[1],
+      imageKey: parseCard(call.args[2]).imageKey,
+      status: parseCard(call.args[2]).status,
+    }))).toContainEqual({
+      messageId: 'om_review_card_B', imageKey: 'img_review_predecessor_A', status: 'working',
+    });
     expect(ds.currentImageKey).toBeUndefined();
+    expect(ds.waitingTurnPreview).toMatchObject({
+      imageKey: 'img_review_predecessor_A', turnId: 'om_review_turn_A',
+    });
 
     // B's own write unlocks B's card.
     worker.emit('message', { type: 'capture_identity', revision: 2, turnId: 'om_review_turn_B' });
@@ -2217,6 +2271,7 @@ describe('Independent review R2: capture identity vs display target', () => {
     });
     await flush();
     expect(ds.currentImageKey).toBe('img_review_B');
+    expect(ds.waitingTurnPreview).toBeUndefined();
   });
 
   it('REVIEW R2 untagged frame must not expose a known suppressed managed attempt', async () => {
@@ -2293,7 +2348,7 @@ describe('Independent review: R3 identity lifetime boundaries', () => {
     expect(fakeLark.patches).toHaveLength(0);
   });
 
-  it('REVIEW R3 missing current ID must not bypass a waiting target before proven recovery', async () => {
+  it('REVIEW R3 missing current ID keeps predecessor pixels preview-only before proven recovery', async () => {
     fakeLark.reset(); vi.clearAllMocks();
     const pool=await vi.importActual<typeof import('../src/core/worker-pool.js')>('../src/core/worker-pool.js');
     const ds=makeDaemonSession({streamCardId:'om_review_original_A',streamCardNonce:'nonce_A',displayMode:'hidden',workerReady:true,currentTurnId:'om_review_turn_A',streamCardTurnGeneration:1,frozenCards:new Map()});
@@ -2315,8 +2370,16 @@ describe('Independent review: R3 identity lifetime boundaries', () => {
     (event.action.value as any).session_id=ds.session.sessionId;
     await handleCardAction(event,makeDeps(sessions),APP_ID);await flush();
     expect(ds.streamCardId).toBe(proof.messageId);
-    expect(fakeLark.patches.map(call=>({messageId:call.args[1],imageKey:parseCard(call.args[2]).imageKey})))
-      .not.toContainEqual({messageId:proof.messageId,imageKey:'img_predecessor_during_missing_id'});
+    expect(fakeLark.patches.map(call=>({
+      messageId:call.args[1],
+      imageKey:parseCard(call.args[2]).imageKey,
+      status:parseCard(call.args[2]).status,
+    }))).toContainEqual({
+      messageId:proof.messageId,
+      imageKey:'img_predecessor_during_missing_id',
+      status:'working',
+    });
+    expect(ds.currentImageKey).toBeUndefined();
   });
 });
 

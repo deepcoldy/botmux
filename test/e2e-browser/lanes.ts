@@ -45,6 +45,23 @@ export function selectedCaseFiles(selection?: string): string[] {
   return [...lanes.map((file) => `cases/${file}`), ...optIn.map((stem) => OPT_IN_LANES[stem])];
 }
 
+/**
+ * Lanes that start before the others. Midscene starts projects in list order,
+ * `maxConcurrency` at a time, so a long serial lane listed late finishes the
+ * whole job late: the group-mode lane (16 cases, one group, ~65–75 min) began
+ * 8–25 min after the others and alone decided when the job ended.
+ */
+export const LONG_LANES_FIRST: readonly string[] = ['core-group-modes'];
+
+/** `files` (selectedCaseFiles output) in the order the lanes should start. */
+export function laneStartOrder(files: readonly string[]): string[] {
+  const rank = (file: string) => {
+    const index = LONG_LANES_FIRST.indexOf(laneStem(file));
+    return index < 0 ? LONG_LANES_FIRST.length : index;
+  };
+  return [...files].sort((a, b) => rank(a) - rank(b));
+}
+
 export function listLaneFiles(dir = CASES_DIR): string[] {
   return readdirSync(dir)
     .filter((name) => /\.ya?ml$/i.test(name))

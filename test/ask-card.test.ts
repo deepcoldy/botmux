@@ -35,7 +35,7 @@ import {
   normalizeAskOptionLayout,
   setAskOptionLayoutLookup,
 } from '../src/im/lark/ask-option-layout.js';
-import { getDefaultLocale, setDefaultLocale } from '../src/i18n/index.js';
+import { getDefaultLocale, setDefaultLocale, t as tr } from '../src/i18n/index.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
 
 const mockedSubmitAsk = vi.mocked(submitAsk);
@@ -176,6 +176,17 @@ describe('buildAskCard', () => {
     expect(text).not.toContain('指定成员（仅本人可操作）');
   });
 
+  it('异步文档提问保留私信答复提示，普通异步提问提示引用本卡片', () => {
+    const ask = makePending({ originKind: 'native-user-input-async', answererOpenId: 'ou_owner' });
+    expect(buildAskCard(ask)).toContain('引用');
+    const documentAsk = buildAskCard({ ...ask, deliveryTarget: {
+      kind: 'document-author', openId: 'ou_owner', turnId: 'document-turn', fileToken: 'file', commentId: 'comment',
+    } });
+    expect(documentAsk).toContain('文档评论任务');
+    expect(documentAsk).not.toContain('只有一张待答卡');
+    expect(documentAsk).not.toContain('card.ask.async_reply_hint');
+  });
+
   it('未 settle 卡片：含自定义回复提示（直接在话题里回复）', () => {
     const text = buildAskCard(makePending());
     expect(text).toContain('直接在话题');
@@ -269,6 +280,25 @@ describe('buildAskCard', () => {
     });
     expect(text).toContain('超时');
   });
+
+  it.each(['claimant_gone', 'answer_undelivered'] as const)(
+    'settled 态（invalidated:%s）：渲染该失效原因的本地化说明，不贴内部 reason、不留按钮',
+    (failureCode) => {
+      const text = buildAskCard(makePending(), {
+        kind: 'invalidated',
+        reason: 'internal reason text',
+        failureCode,
+        selected: null,
+        by: null,
+        comment: null,
+        timedOut: false,
+      });
+      expect(text).toContain(tr('card.ask.invalidated'));
+      expect(text).toContain(tr(`card.ask.invalidated_${failureCode}`));
+      expect(text).not.toContain('internal reason text');
+      expect(text).not.toContain('ask_submit');
+    },
+  );
 
   it('长问题正文（>512 字符）完整渲染，不附加截断标记', () => {
     // 回归：ask 卡片曾对每个 q.prompt 做 512 字符截断（无飞书硬限制依据），
@@ -535,8 +565,8 @@ describe('handleAskCardAction', () => {
       },
     });
 
-    expect(JSON.stringify(patch)).toContain('☑ A');
-    expect(JSON.stringify(patch)).toContain('☐ B');
+    expect(JSON.stringify(patch)).toContain('custom_0');
+    expect(JSON.stringify(patch)).toContain('\"type\":\"primary\"');
   });
 });
 
@@ -835,7 +865,7 @@ describe('handleAskCardAction: ask_submit 路径', () => {
     const result = await handleAskCardAction({
       operator: { open_id: 'ou_owner' },
       action: {
-        value: { action: ASK_SUBMIT_ACTION, ask_id: captured!.askId, nonce: captured!.nonce },
+        value: { action: ASK_SUBMIT_ACTION, ask_id: captured!.askId, nonce: captured!.nonce, custom_form: 'v1', revision: '1' },
       },
     });
 
@@ -860,7 +890,7 @@ describe('handleAskCardAction: 空多选提交二次确认', () => {
       rootMessageId: 'om_root',
       sessionId: 'sess-1',
       questions: [
-        { prompt: 'q', multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
+        { prompt: 'q', multiSelect: true, allowCustom: false, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
       ],
       timeoutMs: 10_000,
       ...overrides,
@@ -881,7 +911,7 @@ describe('handleAskCardAction: 空多选提交二次确认', () => {
     // 关键（外层整形契约）：arm 响应必须包成 { card: { type:'raw', data }, toast }，
     // 不能把 card 字段摊在顶层——否则 event-dispatcher 只认 toast、raw card 不 patch。
     expect(r.card?.type).toBe('raw');
-    expect(r.card?.data?.elements).toBeDefined();
+    expect(r.card?.data?.body?.elements ?? r.card?.data?.elements).toBeDefined();
     expect('elements' in r).toBe(false); // 顶层不得直接暴露 card 字段
     expect(r.toast?.type).toBe('warning');
     // arm 卡片里有红色「确认空提交」按钮 + confirm_empty 标志 + 警示文案
@@ -1072,6 +1102,24 @@ describe('createLarkAskCardDispatcher', () => {
     // 用真实 uuid 测量截断卡，两种信封都必须 ≤ 30KB
     expect(turnReplyCardRequestBytes(calls[1]!.content, ask.chatId, realUuid)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
     expect(calls[1]!.content).toContain('完整内容见本话题中的附件文件');
+  });
+
+  it('chat-scope 提问跟随发起 turn 的话题时，超长正文的附件和截断卡都回复进该话题', async () => {
+    const roots: Array<{ type: string; root: string }> = [];
+    const reply = vi.fn(async (_app: string, root: string, _content: string, type: string) => {
+      roots.push({ type, root });
+      return type === 'file' ? 'om_file' : 'om_card';
+    });
+    const send = vi.fn(async () => 'om_top_level');
+    const upload = vi.fn(async () => 'file_key_1');
+    const dispatcher = createLarkAskCardDispatcher({ replyMessage: reply as any, sendMessage: send as any, uploadFile: upload as any });
+    const ask = makePending({ rootMessageId: null, cardRootMessageId: 'om_turn_topic', questions: [
+      { prompt: '长'.repeat(20_000), multiSelect: false, options: [{ key: 'y', label: '是' }] },
+    ] });
+
+    await expect(dispatcher.send(ask)).resolves.toEqual({ messageId: 'om_card' });
+    expect(roots).toEqual([{ type: 'file', root: 'om_turn_topic' }, { type: 'interactive', root: 'om_turn_topic' }]);
+    expect(send).not.toHaveBeenCalled();
   });
 
   it('P2 回归：send 信封（root=null）截断卡真实请求体 ≤ 30KB，不少算 8 字节', async () => {

@@ -61,6 +61,32 @@ describe('dashboard update and restart action', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
+  it('returns without restarting when the server skipped an implicit update', async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(json(200, {
+        ok: true, oldVersion: '3.48.0', newVersion: '3.48.0',
+        changed: false, skipped: 'already_latest', restartRequired: false,
+      }))
+      .mockResolvedValueOnce(json(202, { ok: true }));
+    const phases: string[] = [];
+    await expect(updateAndRestartBotmux(fetchImpl, phase => phases.push(phase))).resolves.toEqual({
+      oldVersion: '3.48.0', newVersion: '3.48.0', changed: false, restarted: false,
+    });
+    expect(phases).toEqual(['updating']);
+    expect(fetchImpl).toHaveBeenCalledExactlyOnceWith('/api/update/run', { method: 'POST' });
+  });
+
+  it('still restarts a same-version rebuild that requires a restart', async () => {
+    const fetchImpl = vi.fn()
+      .mockResolvedValueOnce(json(200, {
+        ok: true, oldVersion: '3.48.0', newVersion: '3.48.0',
+        changed: false, restartRequired: true,
+      }))
+      .mockResolvedValueOnce(json(202, { ok: true }));
+    await expect(updateAndRestartBotmux(fetchImpl)).resolves.toMatchObject({ changed: false, restarted: true });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
   it('installs an allow-listed rollback version before restarting', async () => {
     const fetchImpl = vi.fn().mockResolvedValueOnce(json(202, {
       ok: true,

@@ -1,5 +1,5 @@
 import { constants, closeSync, fstatSync, lstatSync, openSync, readSync, realpathSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { detectImageFormat } from '../../core/attachment-image-format.js';
@@ -22,17 +22,19 @@ function isWithin(root: string, path: string): boolean {
 }
 
 /** Read a bounded, pinned regular file. Both lexical and real paths must stay
- * inside this session's workspace; symlinks/hardlinks cannot grant access to
- * unrelated host files. Upload the inspected bytes, never reopen the pathname. */
-function readWorkspaceImage(root: string, workingDir: string, source: string): Buffer | undefined {
+ * inside the workspace or an explicitly enabled temporary directory. Temporary
+ * images must belong to the daemon user. Upload pinned bytes, not a pathname. */
+function readWorkspaceImage(root: string, workingDir: string, source: string, temporaryRoots: readonly string[]): Buffer | undefined {
   const decoded = source.startsWith('file:') ? fileURLToPath(source) : decodeURIComponent(source);
   if ((!isAbsolute(decoded) && /^[a-z][a-z\d+.-]*:/i.test(decoded))
     || decoded.startsWith('//') || decoded.startsWith('\\\\')) return;
   const candidate = resolve(workingDir, decoded);
-  if (!isWithin(root, candidate) && !isWithin(resolve(workingDir), candidate)) return;
+  if (!isWithin(root, candidate) && !isWithin(resolve(workingDir), candidate)
+    && !temporaryRoots.some(dir => isWithin(dir, candidate))) return;
   const path = realpathSync(candidate);
-  if (!isWithin(root, path)) return;
+  if (!isWithin(root, path) && !temporaryRoots.some(dir => isWithin(dir, path))) return;
   const observed = lstatSync(path);
+  if (!isWithin(root, path) && process.getuid && observed.uid !== process.getuid()) return;
   if (!observed.isFile() || observed.nlink !== 1 || observed.size <= 0 || observed.size > MAX_IMAGE_BYTES) return;
   const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
@@ -58,6 +60,7 @@ export async function resolveReplyImages(
   markdown: string,
   options: {
     workingDir: string;
+    allowTemporaryImages?: boolean;
     state: ReplyImageState;
     upload: (bytes: Buffer) => Promise<string>;
     owns: () => boolean;
@@ -70,6 +73,17 @@ export async function resolveReplyImages(
     // A home or filesystem root is not a bounded project workspace.
     if (resolve(root, '..') === root || root === realpathSync(homedir())) return markdown;
   } catch { return markdown; }
+  const temporaryRoots: string[] = [];
+  if (options.allowTemporaryImages) {
+    for (const dir of new Set([tmpdir(), ...(process.platform === 'win32' ? [] : ['/tmp'])])) {
+      try {
+        const resolved = realpathSync(dir);
+        if (resolve(resolved, '..') !== resolved && resolved !== realpathSync(homedir())) {
+          temporaryRoots.push(resolve(dir), resolved);
+        }
+      } catch { /* A missing temporary directory cannot contain this image. */ }
+    }
+  }
   const uploads = options.state.uploads ??= new Map();
   return resolveCardMarkdownImages(markdown, async source => {
     if (!options.owns()) return;
@@ -78,7 +92,7 @@ export async function resolveReplyImages(
     if ((options.state.uploadCount ?? 0) >= MAX_REPLY_IMAGES) return;
     const pending = (async () => {
       try {
-        const image = readWorkspaceImage(root, options.workingDir, source);
+        const image = readWorkspaceImage(root, options.workingDir, source, temporaryRoots);
         if (!image || !options.owns()) return;
         options.state.uploadCount = (options.state.uploadCount ?? 0) + 1;
         return await options.upload(image);

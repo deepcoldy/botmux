@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -36,6 +36,7 @@ import { createDispatchReportBinding, dispatchReportBindingSecretPath, DISPATCH_
 import { DISPATCH_USER_DELIVERY_ROUTE } from '../src/core/dispatch-user-delegation.js';
 import { REPORT_SESSION_RELAY_ROUTE } from '../src/core/report-session-relay.js';
 import { loadOrCreateDashboardSecret } from '../src/dashboard/auth.js';
+import * as sessionStore from '../src/services/session-store.js';
 
 const APP = 'cli_topic_source';
 const oldDataDir = config.session.dataDir;
@@ -98,6 +99,40 @@ function seedReportBinding() {
 }
 
 describe('daemon dispatch and report source topics', () => {
+  function humanReplyDispatch() {
+    ds.managedTurnOrigin!.turnId = 'om_request';
+    ds.session.quoteTargetId = 'om_request';
+    ds.session.replyTargets = { om_request: { updatedAt: new Date().toISOString(),
+      senderOpenId: 'ou_human', participants: [{ openId: 'ou_human', isBot: false }] } };
+    return { ...registerBody(), resultDelivery: 'reply', targetAppIds: ['cli_project'], acceptanceRequested: true };
+  }
+  it('freezes the original source input when a new input arrives during seed publication', async () => {
+    sessionStore.init(APP);
+    sessionStore.updateSession(ds.session);
+    const body = humanReplyDispatch();
+    mocks.create.mockImplementationOnce(async () => {
+      ds.managedTurnOrigin!.turnId = 'om_followup';
+      ds.session.quoteTargetId = 'om_followup';
+      ds.session.reportReplyInputId = 'om_followup';
+      return { code: 0, data: { message_id: 'om_sent' } };
+    });
+    expect((await invoke(DISPATCH_REPORT_REGISTER_ROUTE, body)).status).toBe(201);
+    const registry = JSON.parse(readFileSync(join(root, 'orchestrate-dispatch.json'), 'utf8'));
+    expect(registry.om_sent.reportBinding.payload.reply.sourceTurnId).toBe('om_request');
+    expect(ds.session.reportReplyInputId).toBe('om_followup');
+  });
+  it.each(['bot', 'multiple', 'stopped', 'chat', 'launch', 'private'] as const)('rejects unsupported direct reply registration: %s', async scenario => {
+    const body: Record<string, unknown> = humanReplyDispatch();
+    if (scenario === 'bot') ds.session.replyTargets!.om_request!.participants![0]!.isBot = true;
+    if (scenario === 'multiple') body.targetAppIds = ['cli_project', 'cli_second'];
+    if (scenario === 'stopped') ds.session.reportReplyInputId = 'om_stop';
+    if (scenario === 'chat') ds.scope = 'chat';
+    if (scenario === 'launch') body.requestedLaunch = { model: 'other' };
+    if (scenario === 'private') registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'claude-code', privateCard: true });
+    const result = await invoke(DISPATCH_REPORT_REGISTER_ROUTE, body);
+    expect(result).toMatchObject({ status: 400, body: { error: 'reply_requires_single_human_topic_dispatch' } });
+    expect(mocks.create).not.toHaveBeenCalled();
+  });
   it('does not create a dispatch seed or registry entry after the source was withdrawn', async () => {
     unavailable = true;
     const result = await invoke(DISPATCH_REPORT_REGISTER_ROUTE, registerBody());
@@ -208,6 +243,20 @@ describe('daemon dispatch and report source topics', () => {
     const result = await invoke(REPORT_SESSION_RELAY_ROUTE, { dispatchRoot: 'om_source', content: 'result' });
     expect(result.status).toBe(502); expect(result.body.error).toBe('TOPIC_SEND_BLOCKED');
     expect(mocks.create).not.toHaveBeenCalled(); expect(mocks.fetchTarget).not.toHaveBeenCalled();
+  });
+  it('does not publish a relay fallback into a withdrawn source topic either', async () => {
+    seedReportBinding(); unavailable = true;
+    mocks.fetchTarget.mockResolvedValue({ ok: false, status: 500,
+      json: async () => ({ ok: false, errorCode: 'session_not_runnable', error: 'not runnable' }) });
+    const fallback = { relayFallback: 'publish', explicitDispatchRoot: true };
+    const relayed = await invoke(REPORT_SESSION_RELAY_ROUTE, { dispatchRoot: 'om_source', content: 'result', ...fallback });
+    expect(relayed.status).toBe(502); expect(relayed.body.error).toBe('TOPIC_SEND_BLOCKED');
+    writeFileSync(join(root, 'orchestrate-dispatch.json'), '{}');
+    const missing = await invoke(REPORT_SESSION_RELAY_ROUTE, { dispatchRoot: 'om_source', content: 'result', ...fallback });
+    expect(missing.body.relayFallback).toMatchObject({ reason: 'dispatch_target_gone', published: false,
+      publicationError: 'report_publication_rejected' });
+    expect(mocks.create).not.toHaveBeenCalled(); expect(mocks.reply).not.toHaveBeenCalled();
+    expect(mocks.fetchTarget).not.toHaveBeenCalled();
   });
   it('does not add source queries under legacy policy', async () => {
     registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'claude-code', topicUnavailablePolicy: 'legacy' });

@@ -73,6 +73,17 @@ describe('getDaemonStreamingCardUsageSnapshot: model fallback', () => {
     }
   });
 
+  it('keeps a live fallback notice off the final reply card snapshot', () => {
+    // The final reply card is the answer; the notice belongs on the live status
+    // card only — whichever card shows the usage footer.
+    for (const mode of ['streaming', 'footer', 'off']) {
+      usageDisplay.mode = mode;
+      const ds = makeSession(BOUND);
+      expect(getDaemonStreamingCardUsageSnapshot(ds).modelFallback, mode).toEqual(BOUND);
+      expect(getDaemonReplyCardUsageSnapshot(ds), mode).not.toHaveProperty('modelFallback');
+    }
+  });
+
   it('omits the key entirely when there is no fallback', () => {
     for (const mode of ['streaming', 'off']) {
       usageDisplay.mode = mode;

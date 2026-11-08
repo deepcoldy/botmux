@@ -163,11 +163,11 @@ describe('parseBotConfigsFromText · customPassthroughCommands', () => {
     expect(cfg.customPassthroughCommands).toEqual(['/status', '/export']);
   });
 
-  it('drops malformed entries (spaces, bad chars, non-strings)', () => {
+  it('joins internal whitespace with "-" and drops bad chars / non-strings', () => {
     const [cfg] = parseBotConfigsFromText(
-      JSON.stringify([{ ...base, customPassthroughCommands: ['/ok-cmd', '/bad cmd', '/!nope', 42, '/UPPER:lower'] }]),
+      JSON.stringify([{ ...base, customPassthroughCommands: ['/ok-cmd', '/Ultra Goal', '/bad@cmd', 42, '/UPPER:lower'] }]),
     );
-    expect(cfg.customPassthroughCommands).toEqual(['/ok-cmd', '/upper:lower']);
+    expect(cfg.customPassthroughCommands).toEqual(['/ok-cmd', '/ultra-goal', '/upper:lower']);
   });
 
   it('is undefined when unset or all-invalid', () => {

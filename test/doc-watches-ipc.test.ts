@@ -5,7 +5,7 @@
 // 的价值就在「dashboard 改的和 daemon 读的是同一份盘上数据」。
 // resolveDocFile / fetchDocTitle / unsubscribeDocFile 会打真飞书，按需 spy 掉。
 import { describe, it, expect, afterEach, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startIpcServer, setLarkAppId, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
@@ -17,6 +17,7 @@ import {
   docWatchAnchor,
   type DocSubscription,
 } from '../src/services/doc-subs-store.js';
+import * as docSubsStore from '../src/services/doc-subs-store.js';
 import * as docComment from '../src/im/lark/doc-comment.js';
 
 const APP = 'cli_docwatchapp';
@@ -372,22 +373,26 @@ describe('POST /api/doc-watches（登记）', () => {
   });
 });
 
-describe('PUT 基线重置的写入顺序（源码形状）', () => {
-  // 行为测试只能看到两次同步写之后的最终状态，观测不到先后；但顺序是承重的安全
-  // 性质：必须**先清游标、后改 mode**。反过来（f9161c850 修掉的回归）一旦清游标
-  // 失败，会留下「mode=all + 陈旧游标 + baselineReady=true」让 poller 重放全部历史。
-  const ipcSrc = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf-8');
-  const putRoute = ipcSrc.slice(
-    ipcSrc.indexOf("ipcRoute('PUT', '/api/doc-watches/:fileToken'"),
-    ipcSrc.indexOf("ipcRoute('DELETE', '/api/doc-watches/:fileToken'"),
-  );
-
-  it('清游标 setDocCommentPollCursor 必须在 setCommentTriggerMode 之前', () => {
-    const clearIdx = putRoute.indexOf('setDocCommentPollCursor(config.session.dataDir, cachedLarkAppId, p.fileToken, undefined, false)');
-    const modeIdx = putRoute.indexOf('setCommentTriggerMode(config.session.dataDir, cachedLarkAppId, p.fileToken, mode)');
-    expect(clearIdx).toBeGreaterThan(-1);
-    expect(modeIdx).toBeGreaterThan(-1);
-    expect(clearIdx).toBeLessThan(modeIdx);
+describe('PUT 基线重置的写入顺序', () => {
+  // 必须**先清游标、后改 mode**：反过来（f9161c850 修掉的回归）一旦清游标失败，会留下
+  // 「mode=all + 陈旧游标 + baselineReady=true」让 poller 重放全部历史。
+  it('清游标写盘失败时 mode 保持 mention-only，不留下可重放的陈旧游标', async () => {
+    const base = await server();
+    putDocSubscription(dir, APP, sub({
+      commentTriggerMode: 'mention-only',
+      pollCursorAt: 1, pollCursorReplyId: 'ancient', pollBaselineReady: true,
+    }));
+    vi.spyOn(docSubsStore, 'setDocCommentPollCursor').mockImplementation(() => {
+      throw new Error('ENOSPC: no space left on device');
+    });
+    const r = await fetch(`${base}/api/doc-watches/${TOKEN}`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ commentTriggerMode: 'all' }),
+    });
+    expect(r.ok).toBe(false);
+    expect(getDocSubscription(dir, APP, TOKEN)).toMatchObject({
+      commentTriggerMode: 'mention-only', pollCursorReplyId: 'ancient', pollBaselineReady: true,
+    });
   });
 });
 

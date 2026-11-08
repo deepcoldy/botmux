@@ -161,11 +161,6 @@ describe('fixed-grid font fitting', () => {
     expect(page.apply()).toBe(false);
     expect(page.term.options).toMatchObject({ fontSize: 14, lineHeight: 1, letterSpacing: 0 });
   });
-
-  it('re-fits a fixed grid when the line height changes', () => {
-    expect(source).toContain('if(!fixedSize)fit.fit();\n    else _wbApplyAutoFontSize();');
-    expect(source).toContain("term.options.lineHeight=_d.termStyle==='reader'?1.15:1;\n    _wbLineHeightBase=term.options.lineHeight;");
-  });
 });
 
 describe('fixed-grid spacing fill', () => {

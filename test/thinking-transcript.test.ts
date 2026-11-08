@@ -2,15 +2,13 @@
  * Thinking (CoT) transcript plumbing — unit tests.
  *
  * Covers the worker-side pieces feeding the native CoT message channel:
- *   1. extractAssistantThinking — thinking-block extraction from transcript
- *      assistant events (joined, text-only events yield '').
- *   2. BridgeTurnQueue.ingest observer — thinking events reach the observer
+ *   1. BridgeTurnQueue.ingest observer — thinking events reach the observer
  *      with the attributed turn; history/unattributed events don't; observer
  *      errors never break attribution.
  */
 import { describe, it, expect } from 'vitest';
 
-import { extractAssistantThinking, extractCotEntries, type TranscriptEvent } from '../src/services/claude-transcript.js';
+import { extractCotEntries, type TranscriptEvent } from '../src/services/claude-transcript.js';
 import { BridgeTurnQueue, type BridgePendingTurn } from '../src/services/bridge-turn-queue.js';
 
 function user(uuid: string, content: string): TranscriptEvent {
@@ -30,29 +28,6 @@ function textEvent(uuid: string, text: string): TranscriptEvent {
     message: { role: 'assistant', content: [{ type: 'text', text }] },
   };
 }
-
-describe('extractAssistantThinking', () => {
-  it('joins thinking blocks and ignores text blocks', () => {
-    const ev: TranscriptEvent = {
-      type: 'assistant',
-      uuid: 'a1',
-      message: {
-        role: 'assistant',
-        content: [
-          { type: 'thinking', thinking: 'step one' } as any,
-          { type: 'text', text: 'visible answer' },
-          { type: 'thinking', thinking: 'step two' } as any,
-        ],
-      },
-    };
-    expect(extractAssistantThinking(ev)).toBe('step one\n\nstep two');
-  });
-
-  it('returns empty for text-only and string-content events', () => {
-    expect(extractAssistantThinking(textEvent('a1', 'hi'))).toBe('');
-    expect(extractAssistantThinking({ type: 'assistant', uuid: 'a2', message: { role: 'assistant', content: 'hi' } })).toBe('');
-  });
-});
 
 describe('extractCotEntries', () => {
   it('extracts thinking, text and tool_use blocks in content order', () => {

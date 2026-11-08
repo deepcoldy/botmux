@@ -1,181 +1,233 @@
 /**
- * worker.ts is a process entrypoint, so pin the exact three-way expiry wiring
- * rather than importing it and installing IPC/signal handlers in Vitest.
+ * Executes the worker's real restartCliProcess (extracted from src/worker.ts,
+ * see helpers/worker-function-harness.ts) with the teardown/spawn boundaries
+ * stubbed. #570: a restart must keep the input fence armed until the
+ * replacement exists, and must not type ahead into a replacement whose TUI
+ * input box is not ready yet ("Enter 丢进未就绪 TUI" → the session goes silent).
+ * flushPending's own `cliRestartInProgress` early return is executed in
+ * worker-codex-session-upgrade.test.ts.
  */
-import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { classifyRestartTeardown } from '../src/adapters/backend/destroy-result.js';
+import { isRemoteBackendType } from '../src/core/persistent-backend.js';
+import { decideRestartFollowup, restartLaunchSettings } from '../src/core/restart-followup-policy.js';
+import { protectedMcpRedactedEnvKeys } from '../src/core/protected-mcp-capabilities.js';
+import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
+import { restartSpendsFreshBudget, exitMarksServerReplaced } from '../src/core/restart-fresh-budget.js';
+import { join } from 'node:path';
 
-const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+type Restart = (reason: string, opts?: { immediate?: boolean; preservePending?: boolean; restartCause?: 'traex-auto-model' }) => Promise<void>;
 
-describe('worker durable lease expiry ordering', () => {
-  it('durably retires exact queued attempt N behind an ordinary current turn before ACKing', () => {
-    const start = workerSource.indexOf("case 'expire_durable_turn':");
-    const end = workerSource.indexOf("case 'reset_ambiguous_receiver':", start);
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(end).toBeGreaterThan(start);
-    const branch = workerSource.slice(start, end);
+function restartHarness(opts: { replacementPromptReadyDuringSpawn: boolean }) {
+  const timers: Array<() => unknown> = [];
+  const observed: Record<string, unknown> = {};
+  const scope: Record<string, any> = {
+    codexAutoUpgrade: undefined,
+    lastInitConfig: { cliId: 'claude-code', sessionId: 'sid', workingDir: '/project', resume: false },
+    cliSpawnGeneration: 1,
+    submitFailureChains: { clear: vi.fn() },
+    inputDeliveryEvidence: new InputDeliveryEvidenceTracker(),
+    queuedActivationReceipts: { clear: vi.fn() },
+    cliRestartInProgress: false,
+    replacementSpawnInProgress: false,
+    restartWindowLaunch: undefined,
+    rawInputRestartGate: false,
+    consecutiveInWorkerRestarts: 0,
+    lastCliExitServerReplaced: false,
+    restartSpendsFreshBudget,
+    tmuxRestartTimer: null,
+    remoteThreadId: undefined,
+    intentionalRestartBackend: undefined,
+    effectiveBackendType: 'pty',
+    awaitingFirstPrompt: false,
+    isPromptReady: true,
+    pendingLaunchConvergence: undefined,
+    codexRpcEngine: undefined,
+    classifyRestartTeardown,
+    isRemoteBackendType,
+    decideRestartFollowup,
+    restartLaunchSettings,
+    CliSpawnSupersededError: class extends Error {},
+    log: vi.fn(),
+    revokeManagedTurnOriginForRestart: vi.fn(),
+    traexAutoModelController: { noteProcessExited: vi.fn() },
+    stopOwnedSessionScope: vi.fn(),
+    startScreenUpdates: vi.fn(),
+    startStuckDetector: vi.fn(),
+    adoptPendingLaunchConvergence: vi.fn(),
+    codexRpcEligible: () => false,
+    traexAutoModelRuntimeEligible: () => false,
+    traexAutoModelSwitching: false,
+    sandboxEnabled: () => false,
+    prepareCodexNativeTitleGeneration: vi.fn(async () => {}),
+    settleRestartAttemptOnReady: vi.fn(),
+    releaseRawInputRestartGate: vi.fn(),
+    flushPending: vi.fn(async () => {}),
+    sendFatalWorkerErrorAndExit: vi.fn(async () => {}),
+    setTimeout: (fn: () => unknown) => { timers.push(fn); return { unref() {} }; },
+  };
+  scope.backend = { destroySession: vi.fn() };
+  scope.killCli = vi.fn(() => {
+    scope.backend = null;
+    scope.isPromptReady = false;
+  });
+  scope.spawnCli = vi.fn(async () => {
+    observed.fenceArmedDuringSpawn = scope.cliRestartInProgress && scope.rawInputRestartGate;
+    scope.backend = { generation: 'replacement' };
+    scope.isPromptReady = opts.replacementPromptReadyDuringSpawn;
+  });
+  const restart = loadWorkerFunction<Restart>('restartCliProcess', scope);
+  const runSpawnTimer = async () => {
+    const timer = timers.shift();
+    expect(timer, 'restart did not schedule the replacement spawn').toBeTypeOf('function');
+    await timer!();
+    expect(scope.sendFatalWorkerErrorAndExit).not.toHaveBeenCalled();
+  };
+  return { scope, observed, restart, runSpawnTimer };
+}
 
-    const currentExact = branch.indexOf('const currentExact = durableTurnInFlight');
-    const pendingCount = branch.indexOf('const removedPending = pendingMessages.filter(');
-    const retire = branch.indexOf('await retireCodexAppDispatchForDurableReplay(', pendingCount);
-    const pendingAck = branch.indexOf("acknowledge('queued_removed');", retire);
-    const noProof = branch.indexOf('withholding ACK for daemon fencing', pendingAck);
+describe('worker restart input fence', () => {
+  it('forgets old input and terminal evidence before restarting the CLI', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    const old = { turnId: 'old-turn', dispatchAttempt: 2, cliGeneration: 1 };
+    h.scope.inputDeliveryEvidence.start(old, 100);
+    h.scope.inputDeliveryEvidence.observeStructuredTerminal(old);
+    expect(h.scope.inputDeliveryEvidence.hasStructuredTerminal(old)).toBe(true);
 
-    expect(currentExact).toBeGreaterThanOrEqual(0);
-    expect(pendingCount).toBeGreaterThan(currentExact);
-    expect(retire).toBeGreaterThan(pendingCount);
-    expect(pendingAck).toBeGreaterThan(retire);
-    expect(noProof).toBeGreaterThan(pendingAck);
+    await h.restart('daemon request', { preservePending: true });
 
-    const retireStart = workerSource.indexOf('async function retireCodexAppDispatchForDurableReplay(');
-    const retireEnd = workerSource.indexOf('\nfunction ', retireStart + 1);
-    const retireHelper = workerSource.slice(retireStart, retireEnd);
-    const persist = retireHelper.indexOf("requestCodexAppDispatchTransition('cancel'");
-    const localQueueCancel = retireHelper.indexOf('codexAppTurnDispatchQueue.cancelExact(', persist);
-    const localPendingRemove = retireHelper.indexOf('pendingMessages.splice(index, 1)', persist);
-    expect(persist).toBeGreaterThanOrEqual(0);
-    expect(localQueueCancel).toBeGreaterThan(persist);
-    expect(localPendingRemove).toBeGreaterThan(persist);
+    expect(h.scope.inputDeliveryEvidence.hasStructuredTerminal(old)).toBe(false);
+    expect(h.scope.inputDeliveryEvidence.writeStartedAtMs(old)).toBeUndefined();
+    await h.runSpawnTimer();
   });
 
-  it('ACKs active exact expiry only after synchronous owned-CLI restart fencing', () => {
-    const start = workerSource.indexOf("case 'expire_durable_turn':");
-    const end = workerSource.indexOf("case 'reset_ambiguous_receiver':", start);
-    const branch = workerSource.slice(start, end);
-    const exactBranch = branch.indexOf('if (currentExact)');
-    const retire = branch.indexOf('await retireCodexAppDispatchForDurableReplay(', exactBranch);
-    const restart = branch.indexOf("restartCliProcess('durable lease expiry'", retire);
-    const ack = branch.indexOf("acknowledge('cli_fenced');", restart);
+  it('forgets old evidence when a new spawn fails before creating a replacement', async () => {
+    const inputDeliveryEvidence = new InputDeliveryEvidenceTracker();
+    const old = { turnId: 'old-turn', dispatchAttempt: 2, cliGeneration: 7 };
+    inputDeliveryEvidence.start(old, 100);
+    inputDeliveryEvidence.observeStructuredTerminal(old);
+    const scope = {
+      cliSpawnGeneration: 7,
+      inputDeliveryEvidence,
+      networkPolicySupportError: () => undefined,
+      networkProxyLaunchError: async () => undefined,
+      protectedHttpEgressCliSupportError: () => undefined,
+      protectedMcpRedactedEnvKeys,
+      resetCodexModelMigrationState: vi.fn(),
+      backgroundTaskTracker: { reset: vi.fn() },
+      join,
+      homedir: () => '/fixture',
+      tmpdir: () => '/fixture/tmp',
+      ensureSessionTempDir: () => '/fixture/session',
+      pinSessionMcpGatewaySocketRoot: vi.fn(),
+      applySessionTempEnv: vi.fn(),
+      process: { platform: process.platform, env: {} },
+      submitFailureChains: { clear: vi.fn() },
+      queuedActivationReceipts: { clear: vi.fn() },
+      // spawnCli's entry points the worker's TRAE readers at the bot's
+      // TRAE_HOME before any of the gates below run. It is a no-op for this
+      // non-traex assertion, but the real worker global must be present or the
+      // harness throws a TypeError before reaching the expected rejection.
+      followBotTraeHome: vi.fn(),
+    };
+    const spawn = loadWorkerFunction<(cfg: unknown) => Promise<void>>('spawnCli', scope);
 
-    expect(exactBranch).toBeGreaterThanOrEqual(0);
-    expect(retire).toBeGreaterThan(exactBranch);
-    expect(restart).toBeGreaterThan(retire);
-    expect(ack).toBeGreaterThan(restart);
+    await expect(spawn({ sessionId: 'sid', cliId: 'traex', existingAppServerEndpoint: 'ws://localhost' }))
+      .rejects.toThrow('existing App Server attachment requires cliId');
+
+    expect(scope.cliSpawnGeneration).toBe(8);
+    expect(inputDeliveryEvidence.hasStructuredTerminal(old)).toBe(false);
+    expect(inputDeliveryEvidence.writeStartedAtMs(old)).toBeUndefined();
   });
 
-  it('holds new input for the full async teardown window and wakes it only after replacement spawn', () => {
-    const restartStart = workerSource.indexOf('async function restartCliProcess(');
-    const restartEnd = workerSource.indexOf('// ─── HTTP + WebSocket Server', restartStart);
-    const restart = workerSource.slice(restartStart, restartEnd);
-    const arm = restart.indexOf('cliRestartInProgress = true;');
-    const rawArm = restart.indexOf('rawInputRestartGate = true;', arm);
-    const revoke = restart.indexOf('revokeManagedTurnOriginForRestart();', rawArm);
-    const destroy = restart.indexOf('destroySession?.()', arm);
-    const kill = restart.indexOf(
-      'killCli({\n        preservePending: opts.preservePending,\n        preservePolicyCapability: true,',
-      destroy,
-    );
-    const spawn = restart.indexOf('await spawnCli(restartCfg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });', destroy);
-    const release = restart.indexOf('cliRestartInProgress = false;', spawn);
-    const riffRawRelease = restart.indexOf(
-      // Widened from a riff-only check to every remote backend (riff / mojo):
-      // both mark themselves prompt-ready inside spawnCli(), so both need the
-      // raw-input fence released here rather than at a later markPromptReady().
-      "if (isRemoteBackendType(effectiveBackendType) && isPromptReady) releaseRawInputRestartGate();",
-      release,
-    );
-    const guardedWake = restart.indexOf('if (isPromptReady) void flushPending();', riffRawRelease);
+  it('preserves the activity latch only for a capacity-model rotation', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    await h.restart('capacity rotation', { preservePending: true, restartCause: 'traex-auto-model' });
+    await h.runSpawnTimer();
+    expect(h.scope.traexAutoModelController.noteProcessExited).toHaveBeenCalledWith(true);
+  });
 
-    expect(restartStart).toBeGreaterThanOrEqual(0);
-    expect(restartEnd).toBeGreaterThan(restartStart);
-    expect(arm).toBeGreaterThanOrEqual(0);
-    expect(rawArm).toBeGreaterThan(arm);
-    expect(revoke).toBeGreaterThan(rawArm);
-    expect(revoke).toBeLessThan(destroy);
-    expect(destroy).toBeGreaterThan(arm);
-    expect(kill).toBeGreaterThan(destroy);
-    expect(spawn).toBeGreaterThan(kill);
-    expect(release).toBeGreaterThan(spawn);
-    expect(riffRawRelease).toBeGreaterThan(release);
-    // A replacement CoCo/Codex process may exist before its TUI input box
-    // exists. Restart completion must not use type-ahead to flush into that
-    // startup window; only a prompt already observed during the restart fence
-    // needs an explicit wake after the fence drops. Assert the wake exists AND
-    // that every flushPending() the restart closure runs is the guarded
-    // `if (isPromptReady)` form — never a bare re-kick that would type-ahead
-    // into the not-yet-ready TUI. Counting both guards against a future edit
-    // reintroducing an unguarded flush anywhere in the closure.
-    expect(guardedWake).toBeGreaterThan(riffRawRelease);
-    const totalFlushes = restart.match(/void flushPending\(\);/g)?.length ?? 0;
-    const guardedFlushes = restart.match(/if \(isPromptReady\) void flushPending\(\);/g)?.length ?? 0;
-    expect(totalFlushes).toBeGreaterThan(0);
-    expect(guardedFlushes).toBe(totalFlushes);
+  it('keeps the input fence armed through teardown and spawn, then leaves the first flush to markPromptReady', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
 
-    const promptStart = workerSource.indexOf('function markPromptReady(): void');
-    const promptEnd = workerSource.indexOf('\nfunction persistCliSessionId(', promptStart);
-    const promptReady = workerSource.slice(promptStart, promptEnd);
-    expect(promptReady).toContain('if (!cliRestartInProgress) releaseRawInputRestartGate();');
+    await h.restart('daemon request', { preservePending: true });
+    // Old backend torn down, replacement not spawned yet: fence still armed.
+    expect(h.scope.killCli).toHaveBeenCalledWith({ preservePending: true, preservePolicyCapability: true });
+    expect(h.scope.cliRestartInProgress).toBe(true);
+    expect(h.scope.rawInputRestartGate).toBe(true);
 
-    const flushStart = workerSource.indexOf('async function flushPending(): Promise<void>');
-    const flushEnd = workerSource.indexOf('\nfunction sendToPty(', flushStart);
-    const flush = workerSource.slice(flushStart, flushEnd);
-    expect(flush.indexOf('if (cliRestartInProgress) return;')).toBeGreaterThanOrEqual(0);
-    expect(flush.indexOf('if (cliRestartInProgress) return;')).toBeLessThan(
-      flush.indexOf('if (!backend || !cliAdapter) return;'),
-    );
+    await h.runSpawnTimer();
+    expect(h.scope.spawnCli).toHaveBeenCalledTimes(1);
+    expect(h.scope.traexAutoModelController.noteProcessExited).toHaveBeenCalledWith(false);
+    expect(h.observed.fenceArmedDuringSpawn).toBe(true);
+    expect(h.scope.cliRestartInProgress).toBe(false);
+    // The replacement process exists but its prompt is not ready: no
+    // type-ahead wake from the restart continuation.
+    expect(h.scope.flushPending).not.toHaveBeenCalled();
+  });
 
-    const sendStart = flushEnd + 1;
-    const sendEnd = workerSource.indexOf('// ─── Screen Update Timer', sendStart);
-    const sendToPty = workerSource.slice(sendStart, sendEnd);
-    expect(sendToPty).toContain('if (cliRestartInProgress || !backend)');
-    expect(sendToPty.indexOf('if (cliRestartInProgress || !backend)')).toBeLessThan(
-      sendToPty.indexOf('pendingInputAllowsTypeAhead'),
-    );
+  it('wakes queued input once when the replacement prompt became ready during the fence', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: true });
 
-    const rawStart = workerSource.indexOf("case 'raw_input':");
-    const rawEnd = workerSource.indexOf("case 'rename_session':", rawStart);
-    const rawInput = workerSource.slice(rawStart, rawEnd);
-    // PR #441 起入队条件还含注入围栏（injectionFlushing / barrier）——本测试只钉
-    // restart/rename 三因子仍在场且顺序不变，不钉整行。
-    const rawGate = rawInput.indexOf(
-      'if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight()',
-    );
-    const rawQueue = rawInput.indexOf('freshnessInputQueue.enqueueRaw(msg)', rawGate);
-    const rawDeliver = rawInput.indexOf('await deliverRawInput(msg)', rawQueue);
-    expect(rawGate).toBeGreaterThanOrEqual(0);
-    expect(rawQueue).toBeGreaterThan(rawGate);
-    expect(rawDeliver).toBeGreaterThan(rawQueue);
-    expect(rawInput).not.toContain('isPromptReady');
+    await h.restart('daemon request', { preservePending: true });
+    await h.runSpawnTimer();
 
-    const killStart = workerSource.indexOf('function killCli(');
-    const killEnd = workerSource.indexOf('async function restartCliProcess(', killStart);
-    const killCli = workerSource.slice(killStart, killEnd);
-    for (const clear of [
-      // V3: turn + attempt are cleared together through the single capture
-      // identity writer (which also announces the cleared identity).
-      'setCaptureIdentity(undefined, undefined);',
-      'currentVcMeetingImTurnOrigin = undefined;',
-    ]) {
-      expect(killCli).toContain(clear);
-    }
+    expect(h.scope.cliRestartInProgress).toBe(false);
+    expect(h.scope.settleRestartAttemptOnReady).toHaveBeenCalledTimes(1);
+    expect(h.scope.flushPending).toHaveBeenCalledTimes(1);
+  });
 
-    const revokeStart = workerSource.indexOf('function revokeManagedTurnOriginForRestart()');
-    const revokeEnd = workerSource.indexOf('function authorizeManagedSend(', revokeStart);
-    const revokeAuthority = workerSource.slice(revokeStart, revokeEnd);
-    const commonRevokeStart = workerSource.indexOf('function completeManagedTurnOriginRevocation(');
-    const commonRevoke = workerSource.slice(commonRevokeStart, revokeStart);
-    expect(commonRevoke).toContain('sandboxRelayCapability = null;');
-    expect(commonRevoke).toContain('currentVcMeetingImTurnOrigin = undefined;');
-    expect(commonRevoke).toContain("type: 'managed_turn_origin_revoked'");
-    expect(revokeAuthority).not.toContain('currentBotmuxTurnId = undefined;');
-    expect(revokeAuthority).not.toContain('currentBotmuxDispatchAttempt = undefined;');
+  // 2026-11-06: a tmux server loss took respawned panes down a second time and
+  // tier-2 forced 71 sessions to a FRESH conversation.
+  it('does not spend the fresh-session budget when the previous exit was a tmux server loss', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    h.scope.consecutiveInWorkerRestarts = 1;
+    h.scope.lastCliExitServerReplaced = true;
+    await h.restart('daemon request');
+    expect(h.scope.consecutiveInWorkerRestarts).toBe(1);
+    // consumed: the next restart is judged on its own exit
+    expect(h.scope.lastCliExitServerReplaced).toBe(false);
+  });
 
-    const terminalStart = workerSource.indexOf('function emitTurnTerminal(');
-    const terminalEnd = workerSource.indexOf('\nfunction workerIpcPayload(', terminalStart);
-    const terminal = workerSource.slice(terminalStart, terminalEnd);
-    expect(terminal).toContain("releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });");
-    expect(terminal.indexOf("releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });"))
-      .toBeLessThan(terminal.indexOf("type: 'turn_terminal'"));
+  it('still spends the budget for an ordinary CLI exit', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    h.scope.consecutiveInWorkerRestarts = 1;
+    await h.restart('daemon request');
+    expect(h.scope.consecutiveInWorkerRestarts).toBe(2);
+  });
 
-    const flushStartForRotation = workerSource.indexOf('async function flushPending(): Promise<void>');
-    const flushEndForRotation = workerSource.indexOf('\nfunction sendToPty(', flushStartForRotation);
-    const flushForRotation = workerSource.slice(flushStartForRotation, flushEndForRotation);
-    // V3: bound through the single capture identity writer.
-    const assignNextTurn = flushForRotation.indexOf(
-      'item.turnCallerOpenId ?? item.trustedCaller?.requestUserOpenId',
-    );
-    const republish = flushForRotation.indexOf('publishSandboxRelayCapability();', assignNextTurn);
-    expect(assignNextTurn).toBeGreaterThanOrEqual(0);
-    expect(republish).toBeGreaterThan(assignNextTurn);
+  it('clears a stale server-loss marker when the restart is abandoned for a codex auto-upgrade', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    const reject = vi.fn();
+    h.scope.codexAutoUpgrade = { reject };
+    h.scope.lastCliExitServerReplaced = true;
+    await h.restart('daemon request');
+    expect(reject).toHaveBeenCalledOnce();
+    expect(h.scope.lastCliExitServerReplaced).toBe(false);
+  });
+
+  it('clears a stale server-loss marker when restart is ignored in adopt mode', async () => {
+    const h = restartHarness({ replacementPromptReadyDuringSpawn: false });
+    h.scope.lastInitConfig = { adoptMode: true };
+    h.scope.lastCliExitServerReplaced = true;
+    await h.restart('daemon request');
+    expect(h.scope.lastCliExitServerReplaced).toBe(false);
+  });
+});
+
+describe('restart fresh-budget policy', () => {
+  it('marks only an unintentional exit that the backend attributes to a server replacement', () => {
+    expect(exitMarksServerReplaced({ intentionalRestart: false, backendReportsServerReplaced: true })).toBe(true);
+    expect(exitMarksServerReplaced({ intentionalRestart: true, backendReportsServerReplaced: true })).toBe(false);
+    expect(exitMarksServerReplaced({ intentionalRestart: false, backendReportsServerReplaced: false })).toBe(false);
+    expect(exitMarksServerReplaced({ intentionalRestart: true, backendReportsServerReplaced: false })).toBe(false);
+  });
+
+  it('spends the budget for a normal exit but not for a server loss or a user-initiated respawn', () => {
+    expect(restartSpendsFreshBudget({ previousExitServerReplaced: false })).toBe(true);
+    expect(restartSpendsFreshBudget({ previousExitServerReplaced: true })).toBe(false);
+    expect(restartSpendsFreshBudget({ skipRestartBudget: true, previousExitServerReplaced: false })).toBe(false);
+    expect(restartSpendsFreshBudget({ skipRestartBudget: true, previousExitServerReplaced: true })).toBe(false);
   });
 });

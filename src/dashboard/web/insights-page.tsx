@@ -1922,12 +1922,8 @@ function InsightsPage() {
   }, [modal.turnIndex, palette.open]);
 
   useEffect(() => {
+    // ⌘K 归全局搜索（command-palette）；本页的跳转面板只从标题区「跳转」按钮打开。
     const onKey = (event: KeyboardEvent) => {
-      if ((event.key === 'k' || event.key === 'K') && (event.metaKey || event.ctrlKey)) {
-        event.preventDefault();
-        setPalette(p => p.open ? { open: false, q: '', idx: 0 } : { open: true, q: '', idx: 0, anchor: undefined });
-        return;
-      }
       if (palette.open) {
         if (event.isComposing || event.keyCode === 229) return;
         if (event.key === 'Escape') {
@@ -1996,7 +1992,7 @@ function InsightsPage() {
         <input type="search" name="q" placeholder={tr('insights.search')} value={q} onChange={event => setQ(event.currentTarget.value)} />
         <DropdownMenu
           id="insight-project"
-          className="insight-filter-menu"
+          className="insight-filter-menu dashboard-toolbar-menu"
           ariaLabel={tr('insights.projectAll')}
           label={projectLabel}
           value={project}
@@ -2005,7 +2001,7 @@ function InsightsPage() {
         />
         <DropdownMenu
           id="insight-time"
-          className="insight-filter-menu"
+          className="insight-filter-menu dashboard-toolbar-menu"
           ariaLabel={tr('insights.timeAll')}
           label={timeLabel}
           value={timeWin}
@@ -2014,7 +2010,7 @@ function InsightsPage() {
         />
         <DropdownMenu
           id="insight-review-filter"
-          className="insight-filter-menu insight-review-menu"
+          className="insight-filter-menu dashboard-toolbar-menu insight-review-menu"
           ariaLabel={tr('insights.filter')}
           label={reviewLabel}
           value={filter}
@@ -2023,7 +2019,7 @@ function InsightsPage() {
         />
         <DropdownMenu
           id="insight-cli-filter"
-          className="insight-filter-menu insight-cli-menu"
+          className="insight-filter-menu dashboard-toolbar-menu insight-cli-menu"
           ariaLabel={tr('insights.filter')}
           label={cliFilterLabel}
           value={cliFilterValue}

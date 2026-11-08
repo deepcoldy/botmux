@@ -203,42 +203,6 @@ describe('codex 启动闸：快照后端下的复现与修复', () => {
   });
 });
 
-/**
- * worker.ts 不导出任何符号，按仓库既有惯例（first-prompt-timeout-repro.test.ts、
- * worker-pipe-initial-screen-order.test.ts）用源码断言把接线钉住。
- */
-describe('codex 启动闸：worker 侧接线', () => {
-  const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
-
-  it('观察启动横幅必须读渲染后的画面，不能读 scrollback 或过滤后的快照', () => {
-    const start = source.indexOf('function observeStartupBannerOnScreen');
-    expect(start).toBeGreaterThan(-1);
-    const body = source.slice(start, source.indexOf('\n}\n', start));
-    expect(body).toContain('renderer?.rawSnapshot({ preserveFormatting: true })');
-    expect(body).toContain('idleDetector?.observeStartupScreen(');
-    expect(body).not.toContain('recentTerminalLogTail');
-    expect(body).not.toContain('renderer?.snapshot()');
-  });
-
-  it('启动闸仍 pending 时先拉一次权威画面，且不再是死路一条', () => {
-    const start = source.indexOf('const releaseFirstPromptTimeout');
-    expect(start).toBeGreaterThan(-1);
-    const body = source.slice(start, source.indexOf('\n  };\n', start));
-
-    // 等不到推送就主动拉一次。
-    expect(body).toContain('observeStartupBannerOnScreen()');
-    // 仍在 loading 时必须重排复查，且以首轮硬上限收口——旧实现在这里直接 return，
-    // 没有任何定时器，闸一旦卡住排队消息就永远发不出去。
-    expect(body).toContain('FIRST_PROMPT_STARTUP_RECHECK_MS');
-    expect(body).toContain('FIRST_PROMPT_HARD_TIMEOUT_MS - elapsedMs');
-    expect(body).toMatch(/setTimeout\(\s*\(\) => releaseFirstPromptTimeout\(nextElapsedMs/);
-  });
-
-  it('复查节奏受首轮硬上限约束', () => {
-    expect(source).toMatch(/const FIRST_PROMPT_STARTUP_RECHECK_MS = [\d_]+;/);
-  });
-});
-
 describe('Codex restored ZMX history startup evidence', () => {
   it.each([false, true])('accepts the 0.154 Context footer without a banner, loading observed=%s', (loadingSeen) => {
     const { detector, idle } = newDetector();

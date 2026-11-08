@@ -25,6 +25,9 @@ async function probe(runtime: 'node' | 'bun', mode: string) {
   return JSON.parse(output.trim());
 }
 
+/** What the exit-* probes write right before exiting (see the fixture). */
+const EXIT_OUTPUT = Array.from({ length: 256 }, (_, i) => String(i).padStart(62, '0') + '\r\n').join('') + 'TAIL';
+
 describe.skipIf(process.platform === 'win32')('PTY nonblocking reader compatibility', () => {
   for (const runtime of ['node', 'bun'] as const) {
     describe.skipIf(runtime === 'bun' && !resolveBunExecutable())(runtime, () => {
@@ -46,9 +49,37 @@ describe.skipIf(process.platform === 'win32')('PTY nonblocking reader compatibil
         expect(result.output).toBe('READY');
         expect(result.exit.signal).toBe(15);
       });
+      it('nudgeRead keeps keystroke echo off the 20ms idle retry', async () => {
+        // Each round trip starts after an idle gap, so without a nudge the Bun
+        // reader is parked in its 20ms retry and roughly every other echo pays
+        // it. With the nudge the echo is picked up by the fast-poll window.
+        const result = await probe(runtime, 'echo-nudge');
+        expect(result.output).toContain('r:11;');
+        const slow = (result.echoLatencies as number[]).filter(ms => ms >= 15);
+        expect(slow.length, JSON.stringify(result.echoLatencies)).toBeLessThanOrEqual(2);
+      });
       it('preserves buffered output across pause/resume and large bursts', async () => {
         const result = await probe(runtime, 'pause');
         expect(result.output).toBe('first' + 'A'.repeat(262144) + 'last');
+        expect(result.exit).toEqual({ exitCode: 0, signal: 0 });
+      });
+      it('keeps output the child wrote before exiting when the reader had not caught up', async () => {
+        // Node's libuv reader took POLLHUP plus one short read as the end and
+        // dropped the rest; a busy host hits the same with a short tail.
+        const result = await probe(runtime, 'exit-burst');
+        expect(result.output.length).toBe(EXIT_OUTPUT.length);
+        expect(result.output).toBe(EXIT_OUTPUT);
+        expect(result.exit).toEqual({ exitCode: 0, signal: 0 });
+      });
+      it('keeps queued output when node-pty tears the reader down after exit', async () => {
+        const result = await probe(runtime, 'exit-stall');
+        // The injected stall hit node-pty's teardown timer.
+        expect(result.teardownStalls).toBe(1);
+        const output = String(result.output).replace(/^\d+:/, '');
+        expect(output.length).toBe(EXIT_OUTPUT.length);
+        expect(output).toBe(EXIT_OUTPUT);
+        // The exit arrived while a background process still held the terminal.
+        expect(result.heldOpen).toBe(true);
         expect(result.exit).toEqual({ exitCode: 0, signal: 0 });
       });
     });

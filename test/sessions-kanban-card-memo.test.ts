@@ -42,7 +42,6 @@ const EMPTY_SELECTION: ReadonlySet<string> = new Set<string>();
 const CAN_RESTART = (): boolean => true;
 const LOCK_LABEL = (): string => 'lock';
 const STATUS_TEXT = (): string => 'running';
-const GET_TEAM_CHAT_IDS = (): Set<string> => new Set<string>();
 
 const ROW = {
   sessionId: 's_memo', chatId: 'oc_memo', title: '看板卡片 memo 用例',
@@ -52,13 +51,12 @@ const ROW = {
 
 function makeProps(namesVersion: number): Record<string, unknown> {
   return {
-    rows: [ROW], groupBy: 'chat', teams: [], teamsLoaded: true, teamKey: '',
-    teamBoardData: null, teamBoardKey: '', host: null,
-    canRestartSession: CAN_RESTART, getTeamChatIds: GET_TEAM_CHAT_IDS,
+    rows: [ROW], host: null,
+    canRestartSession: CAN_RESTART,
     icons: ICONS, lockActionLabel: LOCK_LABEL, sessionStatusText: STATUS_TEXT,
     selectedSessionIds: EMPTY_SELECTION,
-    onDetails: NOOP, onHistory: NOOP, onMoveRows: NOOP, onNeedTeamBoard: NOOP,
-    onNeedTeams: NOOP, onRename: NOOP, onRestart: NOOP, onTeamScope: NOOP,
+    onDetails: NOOP, onHistory: NOOP, onMoveRows: NOOP,
+    onRename: NOOP, onRestart: NOOP,
     onToggleLock: NOOP, onToggleSelect: NOOP,
     namesVersion,
   };

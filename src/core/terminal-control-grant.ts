@@ -193,6 +193,59 @@ export function verifyTerminalViewForward(
   return provided.length === wanted.length && timingSafeEqual(provided, wanted);
 }
 
+/**
+ * #2004 — proof that the central dashboard front proxy AUTHENTICATED the
+ * requester of `/s/<sessionId>`: a local Dashboard login, an H5 workbench
+ * login, or a central-platform visitor signed in through SSO (platform owner,
+ * or a guest carrying an `X-Botmux-Actor`). The platform's anonymous read-only
+ * visitors never get one.
+ *
+ * The daemon's terminal proxy reads it for ONE decision only: may this request
+ * wake a session that has no live worker? The worker never reads it — terminal
+ * access stays exactly what the query capability / control grant decide, so an
+ * explicit `?viewToken=` link keeps P1-6's "the capability is the sole
+ * authorization basis" while a signed-in viewer can still wake a suspended
+ * session.
+ *
+ * Distinct HMAC domain, so it can never be replayed as a control grant or a view
+ * forward proof. Like the forward proof it only travels on the 127.0.0.1 hops;
+ * the timestamp bounds how long a copied value would stay usable at all.
+ */
+export const TERMINAL_WAKE_HEADER = 'x-botmux-terminal-wake';
+const WAKE_PROOF_DOMAIN = 'botmux-terminal-wake-v1\0';
+export const TERMINAL_WAKE_PROOF_TTL_MS = 60_000;
+
+function wakeProofMac(secret: string, sessionId: string, issuedAt: string): string {
+  return createHmac('sha256', secret)
+    .update(WAKE_PROOF_DOMAIN)
+    .update(sessionId)
+    .update('\0')
+    .update(issuedAt)
+    .digest('base64url');
+}
+
+export function signTerminalWakeProof(secret: string, sessionId: string, now = Date.now()): string | null {
+  if (!secret || !sessionId || sessionId.length > 512 || !Number.isSafeInteger(now) || now < 0) return null;
+  const issuedAt = String(now);
+  return `${issuedAt}.${wakeProofMac(secret, sessionId, issuedAt)}`;
+}
+
+export function verifyTerminalWakeProof(
+  secret: string,
+  sessionId: string,
+  proof: string | string[] | undefined,
+  now = Date.now(),
+): boolean {
+  if (!secret || !sessionId || typeof proof !== 'string' || proof.length > 128) return false;
+  const match = /^(\d{1,16})\.([A-Za-z0-9_-]{43})$/.exec(proof);
+  if (!match) return false;
+  const issuedAt = Number(match[1]);
+  if (!Number.isSafeInteger(issuedAt) || Math.abs(now - issuedAt) > TERMINAL_WAKE_PROOF_TTL_MS) return false;
+  const provided = Buffer.from(match[2], 'utf8');
+  const wanted = Buffer.from(wakeProofMac(secret, sessionId, match[1]), 'utf8');
+  return provided.length === wanted.length && timingSafeEqual(provided, wanted);
+}
+
 export function verifyTerminalControlGrant(
   secret: string,
   token: string | string[] | undefined,

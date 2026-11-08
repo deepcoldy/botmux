@@ -92,6 +92,29 @@ async function waitFor(check: () => boolean): Promise<void> {
 
 describe('worker final-output topic transport', () => {
   it.each([
+    ['turn_budget_exhausted', false], ['execution_failed', false],
+    ['turn_budget_exhausted', true], ['execution_failed', true],
+  ] as const)(
+    'renders MiniMax %s on the actual reply card and retains it in the result (snapshot: %s)', async (errorCode, snapshot) => {
+      registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: snapshot ? 'codex' : 'minimax',
+        turnResults: { enabled: true }, replyCardMode: 'legacy' });
+      ds.session.cliId = snapshot ? 'codex' : 'minimax';
+      if (snapshot) ds.session.cliLaunchSnapshot = { cliId: 'minimax' } as any;
+      observeTurnResultTerminal(ds, { type: 'turn_terminal', sessionId: ds.session.sessionId,
+        turnId: 'om_turn_old', status: 'failed', errorCode }, 1);
+      await new Promise<void>(resolve => deliverFinalOutput(ds, {
+        type: 'final_output', turnId: 'om_turn_old', content: 'native diagnostic', lastUuid: 'output-failure',
+        turnFailed: true, turnFailureCode: errorCode,
+      }, 'fixture', 0, () => resolve(), () => true, { mode: 'thread', rootMessageId: 'om_source' }));
+      const sent = JSON.parse(mocks.reply.mock.calls.at(-1)![0].data.content);
+      expect(sent.body.elements.find((element: any) => element.element_id === 'botmux_turn_error')?.content).toContain(errorCode);
+      const lookup = getTurnResultRuntime()?.read(APP, ds.session.sessionId, 'om_turn_old');
+      expect(lookup).toMatchObject({ status: 'ready', result: {
+        execution: { status: 'failed', errorCode }, output: { status: 'unavailable' },
+      } });
+    },
+  );
+  it.each([
     ['stale_worker', 'stale'],
     ['delivery_suppressed_for_turn', 'suppressed'],
     ['trusted_caller_mismatch', 'caller'],
@@ -133,7 +156,7 @@ describe('worker final-output topic transport', () => {
     ['sentinel terminal', 'nothing_to_send' as const],
     ['ordinary terminal', undefined],
   ])('records trusted plugin delivery before the %s result terminal', async (_label, outputDisposition) => {
-    registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'claude-code',
+    registerBot({ larkAppId: APP, larkAppSecret: 'test-secret', cliId: 'claude-code', brand: 'lark',
       turnResults: { enabled: true }, replyCardMode: 'legacy' });
     ds.session.turnReplyContexts!.om_turn_old = {
       target: { mode: 'thread', rootMessageId: 'om_source' },
@@ -159,6 +182,13 @@ describe('worker final-output topic transport', () => {
       expiresAt: '2099-10-16T00:00:00.000Z', fileCount: 1, responseKind: 'final',
     });
     await waitFor(() => sent.some(message => (message as any)?.type === 'plugin_result_delivery_result'));
+    const entryReply = mocks.reply.mock.calls.find(([input]) => input.data.msg_type === 'interactive');
+    const entryCard = JSON.parse(entryReply?.[0].data.content ?? '{}');
+    const entryLinks = entryCard.elements?.[1]?.actions?.[0]?.multi_url;
+    expect(entryLinks?.url).toMatch(/^https:\/\/applink\.larksuite\.com\/client\/web_url\/open\?/);
+    expect(entryLinks?.pc_url).toBe(entryLinks?.url);
+    expect(entryLinks?.android_url).toContain('/plugin-result-access/view_token_abcdefghijklmnopqrstuvwxyz');
+    expect(entryLinks?.ios_url).toBe(entryLinks?.android_url);
     worker.emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId,
       turnId: 'om_turn_old', status: 'completed', ...(outputDisposition ? { outputDisposition } : {}) });
     await waitFor(() => getTurnResultRuntime()?.read(APP, ds.session.sessionId, 'om_turn_old').status === 'ready');

@@ -30,7 +30,6 @@ import { canonicalScheduleInput } from './schedule-store.js';
 
 const ROOT_DIRECTORY = 'schedule-preconditions';
 const TRUSTED_FILES_DIRECTORY = 'trusted-files';
-const TRUSTED_FILE_EXAMPLE = 'check-ready.sh';
 const RECORD_SCHEMA_VERSION = 2;
 const REF_PATTERN = /^spc_[A-Za-z0-9_-]{43}$/;
 const HASH_PATTERN = /^sha256:[a-f0-9]{64}$/;
@@ -249,13 +248,6 @@ export function schedulePreconditionTrustedFilesRoot(
   // embedding caller supplied a relative dataDir. Runtime dataDir is already
   // absolute, so this does not change the daemon layout.
   return resolve(schedulePreconditionRoot(dataDir), TRUSTED_FILES_DIRECTORY);
-}
-
-/** Copyable starter path shown by Dashboard and documentation. */
-export function schedulePreconditionTrustedFileExamplePath(
-  dataDir: string = config.session.dataDir,
-): string {
-  return join(schedulePreconditionTrustedFilesRoot(dataDir), TRUSTED_FILE_EXAMPLE);
 }
 
 function ownerDirectory(appId: string, dataDir?: string): string {

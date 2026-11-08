@@ -1,8 +1,29 @@
 import { describe, it, expect } from 'vitest';
 import { Aggregator, subscribeDaemon } from '../src/dashboard/aggregator.js';
-import { reconcileDaemonSnapshot } from '../src/dashboard/daemon-reconcile.js';
+import { reconcileAllDaemonSessions, reconcileDaemonSessions, reconcileDaemonSnapshot } from '../src/dashboard/daemon-reconcile.js';
 
 describe('Aggregator cache merge', () => {
+  it('keeps a dormant row routable for cold start and reports worker liveness separately (#2062 F1)', () => {
+    const a = new Aggregator();
+    a.hydrateSessions('cli_test', [{
+      sessionId: 'session-1',
+      larkAppId: 'cli_test',
+      status: 'dormant',
+      webPort: null,
+      proxyPort: 10054,
+    }]);
+    // The daemon proxy behind this port cold-starts the worker on demand.
+    expect(a.terminalProxyPortOf('session-1')).toBe(10054);
+    expect(a.hasLiveTerminalWorker('session-1')).toBe(false);
+    a.applyEvent('cli_test', {
+      type: 'session.update',
+      body: { sessionId: 'session-1', patch: { status: 'working', webPort: 44995 } },
+    } as any);
+    expect(a.hasLiveTerminalWorker('session-1')).toBe(true);
+    a.applyEvent('cli_test', { type: 'session.exited', body: { sessionId: 'session-1' } });
+    expect(a.hasLiveTerminalWorker('session-1')).toBe(false);
+  });
+
   it('upsert via session.spawned and session.update', () => {
     const a = new Aggregator();
     a.applyEvent('appA', {
@@ -205,6 +226,73 @@ describe('Aggregator cache merge', () => {
     expect(seen).toHaveLength(1);
     expect(seen[0].larkAppId).toBe('appB');
     expect(seen[0].type).toBe('session.spawned');
+  });
+});
+
+describe('primary dashboard Session refresh', () => {
+  const daemon = { larkAppId: 'appA', ipcPort: 19999, botName: 'A' } as any;
+
+  it('hydrates a canonical Session that this replica never observed locally', async () => {
+    const agg = new Aggregator();
+    const rows = await reconcileDaemonSessions(
+      daemon,
+      agg,
+      new AbortController().signal,
+      async () => ({ sessions: [{ sessionId: 'canonical-only', status: 'idle' }] }),
+    );
+
+    expect(rows).toEqual([{ sessionId: 'canonical-only', status: 'idle' }]);
+    expect(agg.getSession('canonical-only')).toMatchObject({
+      sessionId: 'canonical-only',
+      larkAppId: 'appA',
+      status: 'idle',
+    });
+  });
+
+  it('does not clobber the cache when the request is aborted in flight', async () => {
+    const agg = new Aggregator();
+    agg.hydrateSessions('appA', [{ sessionId: 'new', status: 'idle' } as any]);
+    const controller = new AbortController();
+    const refresh = reconcileDaemonSessions(
+      daemon,
+      agg,
+      controller.signal,
+      async () => {
+        await new Promise(resolve => setTimeout(resolve, 20));
+        return { sessions: [{ sessionId: 'stale', status: 'working' }] };
+      },
+    );
+    controller.abort();
+
+    await expect(refresh).resolves.toBeUndefined();
+    expect(agg.getSession('new')).toBeDefined();
+    expect(agg.getSession('stale')).toBeUndefined();
+  });
+
+  it('serves healthy replicas when another one times out, keeping its last known rows (#2023)', async () => {
+    const healthy = { larkAppId: 'appA', ipcPort: 19001, botName: 'A' } as any;
+    const restarting = { larkAppId: 'appB', ipcPort: 19002, botName: 'B' } as any;
+    const agg = new Aggregator();
+    agg.hydrateSessions('appB', [{ sessionId: 'b-known', status: 'idle' } as any]);
+    const refreshed = await reconcileAllDaemonSessions([healthy, restarting], agg, 50, async (port, signal) => {
+      if (port === 19001) return { sessions: [{ sessionId: 'a-fresh', status: 'working' }] };
+      return new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason)));
+    });
+
+    expect(refreshed).toEqual([{ daemon: healthy, rows: [{ sessionId: 'a-fresh', status: 'working' }] }]);
+    expect(agg.getSession('a-fresh')).toMatchObject({ larkAppId: 'appA', status: 'working' });
+    expect(agg.getSession('b-known')).toMatchObject({ larkAppId: 'appB', status: 'idle' });
+  });
+
+  it('reports nothing to serve only when every replica failed', async () => {
+    const agg = new Aggregator();
+    const daemons = [
+      { larkAppId: 'appA', ipcPort: 19001, botName: 'A' },
+      { larkAppId: 'appB', ipcPort: 19002, botName: 'B' },
+    ] as any[];
+    await expect(reconcileAllDaemonSessions(daemons, agg, 50, async () => { throw new Error('ECONNREFUSED'); }))
+      .resolves.toBeUndefined();
+    await expect(reconcileAllDaemonSessions([], agg, 50)).resolves.toBeUndefined();
   });
 });
 

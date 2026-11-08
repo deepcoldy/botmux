@@ -1,7 +1,8 @@
 /**
- * Same-deployment peer identity is talk-only: isKnownPeerBot / cross-ref may
- * route a sibling's prompt, but it must never confer management-command
- * permission. Explicit operate-capable sources remain authoritative.
+ * Same-deployment cross-ref identity is talk-only: isKnownPeerBot / cross-ref
+ * (learned from display names) may route a sibling's prompt, but it must never
+ * confer management-command permission on its own. Operate needs the sibling's
+ * Lark-stamped union_id plus a matching owner — see same-owner-bot-trust.test.ts.
  *
  * Run: pnpm vitest run test/peer-bot-operate.test.ts
  */

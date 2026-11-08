@@ -11,6 +11,7 @@ import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBy
 import {
   __resetTranscriptResolverCacheForTest,
   cachedTranscriptPathLookup,
+  kimiEnvForBot,
   resolveSessionTranscriptPath,
 } from '../services/transcript-resolver.js';
 import { scanJsonlFromFd, scanJsonlFromOffset, type JsonlCursor } from '../services/jsonl-cursor.js';
@@ -20,10 +21,16 @@ import {
   isMeaningfulUserEvent,
   type TranscriptEvent,
 } from '../services/claude-transcript.js';
+import { __resetCodexCompactionCountForTest, readCodexCompactionCount } from '../services/codex-compaction-count.js';
 import { readAntigravityTokenUsage } from '../services/antigravity-usage.js';
+import { readZcodeUsage } from '../services/zcode-usage.js';
+import { readZcodeSessionMarker, zcodeSessionDbPath } from '../services/zcode-session.js';
 import { readMinimaxUsage } from '../services/minimax-usage.js';
 import { readCursorUsage } from '../services/cursor-usage.js';
+import { readKimiModelContextWindow } from '../services/kimi-transcript.js';
 import { cursorConfigDirForBot } from '../services/cursor-paths.js';
+import { getBot } from '../bot-registry.js';
+import { botOneShotEnv } from './session-env-resolve.js';
 import { config } from '../config.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -69,6 +76,18 @@ export interface SessionUsageSnapshot {
   costCny?: number;
 }
 
+/** What `SessionUsageSnapshot.context` was measured from, for `botmux observe`
+ *  (Claude Code and Codex only). Kept out of the snapshot itself so the card
+ *  pipeline keeps seeing exactly the shape it always did. `measuredAtMs` is the
+ *  transcript entry's own timestamp (file mtime only when the entry carries
+ *  none). `compactions` is null when it cannot be counted reliably (e.g. an
+ *  oversized Codex rollout with no incremental cursor yet) — unknown, never 0. */
+export interface SessionContextObservation {
+  measuredAtMs: number;
+  compactions: number | null;
+  source: 'claude-transcript' | 'codex-rollout';
+}
+
 export interface SessionTokenUsageQuery {
   cliId?: CliId | 'unknown';
   sessionId: string;
@@ -103,6 +122,17 @@ export function getSessionCost(sessionId: string, cwd: string): SessionCost | nu
 
 function num(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+}
+
+/** Transcript entry `timestamp` (ISO string, or epoch ms) → epoch ms; null when absent/unparseable. */
+function entryTimestampMs(entry: any): number | null {
+  const raw = entry?.timestamp;
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) return raw;
+  if (typeof raw === 'string' && raw) {
+    const ms = Date.parse(raw);
+    if (Number.isFinite(ms) && ms > 0) return ms;
+  }
+  return null;
 }
 
 function firstNonEmptyString(...values: unknown[]): string {
@@ -235,6 +265,12 @@ interface TokenUsageAggregate {
   turns: number;
   latestCodexUsage: SessionTokenUsage | null;
   latestContextUsage: SessionContextUsage | null;
+  /** Epoch ms of the transcript entry `latestContextUsage` came from (null when
+   *  the entry carried no parseable timestamp). Claude Code / Codex only. */
+  latestContextAtMs: number | null;
+  /** `system/compact_boundary` entries seen (Claude Code). Codex compactions are
+   *  counted separately — see services/codex-compaction-count.ts. */
+  compactions: number;
   latestCodexUsageSource: UsageSourceRecord | null;
   latestContextUsageSource: UsageSourceRecord | null;
   modelSource: UsageSourceRecord | null;
@@ -248,7 +284,7 @@ interface TokenUsageAggregate {
 
 /** Per-CLI transcript dialect. Each kind only counts the events that dialect
  *  defines as billable turns — no cross-CLI guessing on usage-shaped lines. */
-type UsageKind = 'claude' | 'codex' | 'coco' | 'pi' | 'grok' | 'generic';
+type UsageKind = 'claude' | 'codex' | 'coco' | 'pi' | 'grok' | 'kimi' | 'generic';
 
 interface UsageSourceRecord {
   offset: number;
@@ -286,6 +322,8 @@ function usageKindForCli(cliId: SessionTokenUsageQuery['cliId']): UsageKind {
       return 'pi';
     case 'grok':
       return 'grok';
+    case 'kimi':
+      return 'kimi';
     default:
       return 'generic';
   }
@@ -301,6 +339,8 @@ function newTokenUsageAggregate(): TokenUsageAggregate {
     turns: 0,
     latestCodexUsage: null,
     latestContextUsage: null,
+    latestContextAtMs: null,
+    compactions: 0,
     latestCodexUsageSource: null,
     latestContextUsageSource: null,
     modelSource: null,
@@ -313,6 +353,14 @@ function newTokenUsageAggregate(): TokenUsageAggregate {
 /** Claude Code / Seed: one JSONL line per content block; blocks of the same
  *  turn repeat the same message.id and usage snapshot — count once per id. */
 function foldClaudeLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, entry: any): void {
+  // A compaction leaves exactly one system/compact_boundary marker (the summary
+  // and the post-compact messages are separate lines), so each marker is one
+  // compaction. It does not touch the latest context measurement: the next
+  // assistant message supersedes it.
+  if (entry?.type === 'system' && entry?.subtype === 'compact_boundary') {
+    agg.compactions++;
+    return;
+  }
   // A *real* new prompt starts a new user turn → reset the per-turn delta.
   // Reuse the single source of truth the bridge attribution queue uses
   // (claude-transcript.ts) so "本轮" agrees with what counts as a turn start:
@@ -357,9 +405,11 @@ function foldClaudeLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, e
   agg.turnInputTokens += num(u.input_tokens) + num(u.cache_creation_input_tokens);
   agg.turnOutputTokens += num(u.output_tokens);
   // Synthetic/empty assistant records around compaction must not erase the
-  // last native context measurement.
-  if (contextTokens > 0) {
+  // last native context measurement. A sidechain (subagent) message carries the
+  // subagent's own prompt size, not the main conversation's.
+  if (contextTokens > 0 && entry.isSidechain !== true) {
     agg.latestContextUsage = { usedTokens: contextTokens };
+    agg.latestContextAtMs = entryTimestampMs(entry);
   }
   if (!agg.model && typeof msg.model === 'string') agg.model = msg.model;
   agg.turns++;
@@ -377,6 +427,7 @@ function foldCodexLine(agg: TokenUsageAggregate, entry: any, getSource: UsageSou
   };
   if (contextUsage) {
     agg.latestContextUsage = contextUsage;
+    agg.latestContextAtMs = entryTimestampMs(entry);
     agg.latestContextUsageSource = sourceForTrackedMetric();
   }
 
@@ -553,6 +604,65 @@ function foldGrokLine(agg: TokenUsageAggregate, entry: any): void {
   agg.turns++;
 }
 
+/** Kimi Code main-agent wire log (`agents/main/wire.jsonl`, see
+ *  services/kimi-transcript.ts). `usage.record` is the single billed source:
+ *  one record per model call, including the compaction call
+ *  (`usageScope: "session"`). The same numbers are mirrored on `step.end` and
+ *  message metadata and must not be added again. Sub-agents log to their own
+ *  files and are not counted, like the other CLIs' main-transcript totals.
+ *  `token_counting.measured` / `.rebased` (after compaction) carry the current
+ *  context size; `llm.request` the model alias and thinking effort. */
+function foldKimiLine(agg: TokenUsageAggregate, entry: any): void {
+  if (!entry || typeof entry !== 'object') return;
+  if (typeof entry.agentId === 'string' && entry.agentId !== 'main') return;
+  switch (entry.type) {
+    case 'turn.prompt':
+      agg.turnInputTokens = 0;
+      agg.turnOutputTokens = 0;
+      return;
+    case 'llm.request': {
+      if (entry.kind !== undefined && entry.kind !== 'loop') return;
+      const model = firstNonEmptyString(entry.modelAlias, entry.model);
+      if (model) agg.model = model;
+      const effort = firstNonEmptyString(entry.thinkingEffort);
+      if (effort) agg.reasoningEffort = effort;
+      return;
+    }
+    case 'token_counting.measured':
+    case 'token_counting.rebased': {
+      const tokens = num(entry.tokens);
+      if (tokens > 0) {
+        agg.latestContextUsage = { usedTokens: tokens };
+        agg.latestContextAtMs = num(entry.time) > 0 ? num(entry.time) : null;
+      }
+      return;
+    }
+    case 'usage.record': {
+      const u = entry.usage;
+      if (!u || typeof u !== 'object') return;
+      const input = num(u.inputOther);
+      const output = num(u.output);
+      const cacheRead = num(u.inputCacheRead);
+      const cacheCreate = num(u.inputCacheCreation);
+      agg.inputTokens += input;
+      agg.outputTokens += output;
+      agg.cacheReadTokens += cacheRead;
+      agg.cacheCreateTokens += cacheCreate;
+      // Same "this turn" convention as Claude: new prompt-side tokens (cache
+      // reads only re-read context) plus output.
+      agg.turnInputTokens += input + cacheCreate;
+      agg.turnOutputTokens += output;
+      const model = firstNonEmptyString(entry.model);
+      if (model && !agg.model) agg.model = model;
+      agg.turns++;
+      return;
+    }
+  }
+}
+
+/** Wire records the Kimi fold reads; other (often large) lines skip JSON.parse. */
+const KIMI_USAGE_LINE_RE = /"(?:usage\.record|turn\.prompt|token_counting\.(?:measured|rebased)|llm\.request)"/;
+
 function foldPiLine(agg: TokenUsageAggregate, seenMessageIds: Set<string>, entry: any): void {
   if (entry?.type !== 'message' || entry?.message?.role !== 'assistant') return;
   const msg = entry.message;
@@ -628,6 +738,8 @@ function foldUsageLine(
       return foldPiLine(agg, seenMessageIds, entry);
     case 'grok':
       return foldGrokLine(agg, entry);
+    case 'kimi':
+      return foldKimiLine(agg, entry);
     case 'generic':
       return foldGenericLine(agg, seenMessageIds, entry);
   }
@@ -733,6 +845,7 @@ export function __resetSessionUsageCachesForTest(): void {
   usageFileCache.clear();
   warnedOversizedUsageFiles.clear();
   piModelsCache = null;
+  __resetCodexCompactionCountForTest();
   __resetTranscriptResolverCacheForTest();
 }
 
@@ -757,6 +870,7 @@ function foldUsageJsonLine(
   lineStart?: number,
 ): void {
   if (!line.trim()) return;
+  if (kind === 'kimi' && !KIMI_USAGE_LINE_RE.test(line)) return;
   try {
     const entry = JSON.parse(line);
     if (kind !== 'codex') {
@@ -809,6 +923,8 @@ function aggregateHasAllCodexMetrics(agg: TokenUsageAggregate): boolean {
 interface UsageReadResult {
   agg: TokenUsageAggregate;
   result: SessionTokenUsage | null;
+  /** Resolved transcript the numbers came from (file-backed CLIs only). */
+  transcriptPath?: string;
 }
 
 function ensureUsageFileCacheCapacity(key: string): void {
@@ -1300,7 +1416,66 @@ function readTokenUsageFromAidenCheckpoint(path: string): SessionTokenUsage | nu
   };
 }
 
+/** The same inheritance policy, global/bot overlay and removals as the CLI
+ *  child. Unknown/unregistered bot falls back to ambient: a read must not throw. */
+function resolveZcodeUsageEnv(larkAppId?: string): NodeJS.ProcessEnv {
+  if (!larkAppId) return process.env;
+  try {
+    const bot = getBot(larkAppId);
+    return botOneShotEnv(process.env, bot.config);
+  } catch {
+    return process.env;
+  }
+}
+
 function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
+  if (q.cliId === 'zcode') {
+    // ZCode keeps no transcript botmux can parse; its own `model_usage` ledger
+    // is the source of truth. The native id is persisted on the session after
+    // the first turn, and read back from the hook marker until then. The marker
+    // lives under the session data root, which is NOT always ~/.botmux/data:
+    // pass the same dir the worker writes it to or a custom SESSION_DATA_DIR
+    // silently loses usage and context.
+    const native = q.cliSessionId
+      || readZcodeSessionMarker(q.sessionId, { dataDir: config.session.dataDir })?.cliSessionId;
+    if (!native) return null;
+    // The worker resolves ZCODE_SESSION_DB_PATH / ZCODE_SESSION_DB from the
+    // bot's own env (worker.ts `zcodeResumeDbPath`); neither key is reserved,
+    // so a bot may legitimately point its ledger elsewhere. Reading the ledger
+    // through the ambient env alone would then find the session at spawn but
+    // show no tokens or model on the card, silently. Resolve both the path and
+    // the context-window config from the same per-bot env the worker uses.
+    const zcodeEnv = resolveZcodeUsageEnv(q.larkAppId);
+    const usage = readZcodeUsage(native, zcodeSessionDbPath(zcodeEnv), zcodeEnv);
+    if (!usage) return null;
+    const agg = newTokenUsageAggregate();
+    agg.inputTokens = usage.inputTokens;
+    agg.outputTokens = usage.outputTokens;
+    agg.cacheReadTokens = usage.cacheReadTokens;
+    agg.cacheCreateTokens = usage.cacheCreateTokens;
+    agg.turns = usage.turns;
+    agg.turnInputTokens = usage.turnInputTokens;
+    agg.turnOutputTokens = usage.turnOutputTokens;
+    if (usage.modelId) agg.model = usage.modelId;
+    if (usage.reasoningLevel) agg.reasoningEffort = usage.reasoningLevel;
+    // A request that failed is already excluded; the newest successful prompt
+    // size is the live context gauge. When the provider reported no token
+    // counts at all, omit context entirely — a `0/1M (0%)` reading would claim
+    // a measurement the CLI never made (the card then shows model/level only).
+    if (usage.hasTokenEvidence) {
+      const percentUsed = usage.contextWindow && usage.contextWindow > 0
+        ? Math.round(Math.max(0, Math.min(1, usage.contextUsed / usage.contextWindow)) * 100)
+        : undefined;
+      agg.latestContextUsage = {
+        usedTokens: usage.contextUsed,
+        ...(usage.contextWindow ? { windowTokens: usage.contextWindow } : {}),
+        ...(percentUsed !== undefined ? { percentUsed } : {}),
+      };
+    }
+    // `result` stays null: ZCode has no pricing entry and botmux does not write
+    // a cost ledger for it, so only context + this-turn deltas reach the card.
+    return { agg, result: null };
+  }
   if (q.cliId === 'aiden') {
     const sid = q.cliSessionId || q.sessionId;
     const checkpointPath = cachedTranscriptPathLookup(
@@ -1321,7 +1496,9 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
   }
   const resolved = resolveSessionTranscriptPath(q);
   if (!resolved || !existsSync(resolved.path)) return null;
-  const read = readSessionTokenAggregateCached(resolved.path, usageKindForCli(q.cliId), { fresh: q.fresh });
+  const cached = readSessionTokenAggregateCached(resolved.path, usageKindForCli(q.cliId), { fresh: q.fresh });
+  const read = cached ? { ...cached, transcriptPath: resolved.path } : cached;
+  if (q.cliId === 'kimi' && read) return withKimiContextWindow(read, kimiEnvForBot(q.larkAppId));
   if (q.cliId !== 'grok' || !read) return read;
   // signals.json is a small rewritten snapshot beside updates.jsonl. Read it
   // on every card refresh: the append-only JSONL cache may legitimately be
@@ -1373,12 +1550,52 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
   } catch {
     // summary.json is also created lazily; reasoning effort is optional.
   }
-  return { agg, result };
+  return { agg, result, transcriptPath: resolved.path };
+}
+
+/** Kimi's context window is per model in its config.toml; read it on every
+ *  refresh (small file) so a model switch is reflected immediately. */
+function withKimiContextWindow(read: UsageReadResult, env: NodeJS.ProcessEnv): UsageReadResult {
+  const used = read.agg.latestContextUsage?.usedTokens;
+  if (!used || used <= 0) return read;
+  const windowTokens = readKimiModelContextWindow(read.agg.model || undefined, env);
+  if (!windowTokens) return read;
+  const agg = cloneAggregate(read.agg);
+  agg.latestContextUsage = {
+    usedTokens: used,
+    windowTokens,
+    percentUsed: Math.round(Math.max(0, Math.min(1, used / windowTokens)) * 100),
+  };
+  return { ...read, agg };
 }
 
 export function getSessionTokenUsage(q: SessionTokenUsageQuery): SessionTokenUsage | null {
   if (q.cliId === 'minimax' || q.cliId === 'cursor') return getSessionUsageSnapshot(q).tokens;
   return readSessionUsage(q)?.result ?? null;
+}
+
+/** Provenance of the latest context measurement for `botmux observe`: only the
+ *  two CLIs whose "latest prompt size" is a native, absolute measurement
+ *  (Claude Code transcript usage, Codex `last_token_usage`). Everything else
+ *  stays unreported rather than guessed. */
+function observeContext(q: SessionTokenUsageQuery, read: UsageReadResult): SessionContextObservation | undefined {
+  const agg = read.agg;
+  if (!agg.latestContextUsage || agg.latestContextUsage.usedTokens <= 0) return undefined;
+  if (q.cliId !== 'claude-code' && q.cliId !== 'codex') return undefined;
+  let measuredAtMs = agg.latestContextAtMs;
+  if (measuredAtMs === null && read.transcriptPath) {
+    // The entry carried no timestamp: the file's last write is the tightest
+    // bound we can prove, and it can only be later than the measurement.
+    try { measuredAtMs = statSync(read.transcriptPath).mtimeMs; } catch { /* unknown */ }
+  }
+  if (measuredAtMs === null || !Number.isFinite(measuredAtMs) || measuredAtMs <= 0) return undefined;
+  if (q.cliId === 'claude-code') {
+    return { measuredAtMs: Math.round(measuredAtMs), compactions: agg.compactions, source: 'claude-transcript' };
+  }
+  const compactions = read.transcriptPath
+    ? readCodexCompactionCount(read.transcriptPath, { maxColdScanBytes: MAX_USAGE_TRANSCRIPT_BYTES })
+    : null;
+  return { measuredAtMs: Math.round(measuredAtMs), compactions, source: 'codex-rollout' };
 }
 
 export function getSessionUsageSnapshot(q: SessionTokenUsageQuery): SessionUsageSnapshot {
@@ -1393,7 +1610,27 @@ export function getSessionUsageSnapshot(q: SessionTokenUsageQuery): SessionUsage
     return { ...(snapshot ?? { context: null, tokens: null, turnTokens: null }),
       ...(costCny !== null && Number.isFinite(costCny) ? { costCny } : {}) };
   }
+  return usageSnapshotFromRead(q, readSessionUsage(q));
+}
+
+/** One transcript read feeding BOTH the cumulative token totals and the
+ *  context gauge plus its provenance (`botmux observe` rows). Same file cache
+ *  as getSessionUsageSnapshot, so asking for the extra provenance never costs a
+ *  second scan. CLIs other than Claude Code / Codex get no observation. */
+export function getSessionUsageWithContext(q: SessionTokenUsageQuery): {
+  snapshot: SessionUsageSnapshot;
+  contextObservation?: SessionContextObservation;
+} {
+  if (q.cliId === 'cursor' || q.cliId === 'minimax') return { snapshot: getSessionUsageSnapshot(q) };
   const read = readSessionUsage(q);
+  const contextObservation = read ? observeContext(q, read) : undefined;
+  return {
+    snapshot: usageSnapshotFromRead(q, read),
+    ...(contextObservation ? { contextObservation } : {}),
+  };
+}
+
+function usageSnapshotFromRead(q: SessionTokenUsageQuery, read: UsageReadResult | null): SessionUsageSnapshot {
   const agg = read?.agg;
   // Per-turn delta only for dialects that track it (Claude family). Codex/coco
   // fold to a cumulative-only latestCodexUsage and leave turn counters at 0, so
@@ -1412,12 +1649,8 @@ export function getSessionUsageSnapshot(q: SessionTokenUsageQuery): SessionUsage
     // Grok exposes a stable user-facing primaryModelId in signals.json.
     // Keep other CLIs unchanged: Relay-family transcript model strings may
     // be internal routing codes and intentionally never surface on cards.
-    ...(q.cliId === 'grok' && agg?.model ? { model: agg.model } : {}),
-    ...(q.cliId === 'grok' && agg?.reasoningEffort ? { reasoningEffort: agg.reasoningEffort } : {}),
+    ...((q.cliId === 'grok' || q.cliId === 'zcode' || q.cliId === 'kimi') && agg?.model ? { model: agg.model } : {}),
+    ...((q.cliId === 'grok' || q.cliId === 'zcode' || q.cliId === 'kimi') && agg?.reasoningEffort ? { reasoningEffort: agg.reasoningEffort } : {}),
     ...(costCny !== null && Number.isFinite(costCny) ? { costCny } : {}),
   };
-}
-
-export function formatNumber(n: number): string {
-  return n.toLocaleString('en-US');
 }

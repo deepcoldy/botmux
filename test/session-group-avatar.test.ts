@@ -366,4 +366,18 @@ describe('session-group-avatar', () => {
       [secondVariantId]: 'img_2',
     });
   });
+
+  it('applyLogoGroupAvatar throws on Lark errors while the session-group wrapper stays best-effort', async () => {
+    const mod = await import('../src/services/session-group-avatar.js');
+    const chat = 'oc_slash_group';
+    chatUpdateMock.mockResolvedValueOnce({ code: 232014, msg: 'no permission' } as any);
+    await expect(mod.applyLogoGroupAvatar(APP, chat)).rejects.toThrow(/code 232014/);
+
+    chatUpdateMock.mockResolvedValueOnce({ code: 232014, msg: 'no permission' } as any);
+    await expect(mod.applySessionGroupAvatar(APP, chat)).resolves.toBeUndefined();
+
+    await expect(mod.applyLogoGroupAvatar(APP, chat)).resolves.toBe(mod.pickSessionGroupAvatarVariant(chat).id);
+    // Same bot×variant cache as session groups: one upload for all three calls.
+    expect(imageCreateMock).toHaveBeenCalledTimes(1);
+  });
 });

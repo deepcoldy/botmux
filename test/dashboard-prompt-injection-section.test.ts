@@ -4,8 +4,6 @@
  * per-bot route and is locked when a linked Agent manages the section.
  */
 import React from 'react';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
 import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, expect, it, vi } from 'vitest';
 import { PromptInjectionSection, zeroPromptSupportedFor } from '../src/dashboard/web/bot-defaults-page.js';
@@ -46,11 +44,11 @@ it('refreshes the effective reply delivery shown next to it when zero injection 
 });
 
 it('cannot be turned on for an unsupported CLI, but an enabled one can still be turned off', () => {
-  const off = render({ cliId: 'gemini', promptInjection: 'default' });
+  const off = render({ cliId: 'opencode', promptInjection: 'default' });
   expect(toggle(off).props.disabled).toBe(true);
   expect(JSON.stringify(off.toJSON())).toContain('不支持零注入');
   act(() => off.unmount());
-  const on = render({ cliId: 'gemini', promptInjection: 'none' });
+  const on = render({ cliId: 'opencode', promptInjection: 'none' });
   expect(toggle(on).props.disabled).toBe(false);
   act(() => on.unmount());
 });
@@ -68,6 +66,10 @@ it('follows the row’s current CLI / backend / sandbox instead of a load-time s
   expect(zeroPromptSupportedFor({ cliId: 'cursor', sandboxMode: 'scratch' })).toBe(false);
   expect(zeroPromptSupportedFor({ cliId: 'cursor', sandboxMode: 'off' })).toBe(true);
   expect(zeroPromptSupportedFor({ cliId: 'cursor', sandbox: true })).toBe(true);
+  // #2828：doubao 的 .sessions 在 scratch merged 树里，零注入与 transcript 同样被锁
+  expect(zeroPromptSupportedFor({ cliId: 'doubao', sandboxMode: 'scratch' })).toBe(false);
+  expect(zeroPromptSupportedFor({ cliId: 'doubao', sandboxMode: 'off' })).toBe(true);
+  expect(zeroPromptSupportedFor({ cliId: 'doubao', sandbox: true })).toBe(true);
   // A local CLI never spawns on a remote backend (paired back to a local one), so
   // a stale riff override does not block it; antigravity on zmx is unsupported.
   expect(zeroPromptSupportedFor({ cliId: 'claude-code', backendType: 'riff' })).toBe(true);
@@ -87,11 +89,4 @@ it('follows the row’s current CLI / backend / sandbox instead of a load-time s
   })));
   expect(toggle(scratch).props.disabled).toBe(false);
   act(() => scratch.unmount());
-});
-
-it('lives in the Bot config advanced tab, next to reply delivery', () => {
-  const page = readFileSync(join(process.cwd(), 'src/dashboard/web/bot-defaults-page.tsx'), 'utf8');
-  const advanced = page.slice(page.indexOf('aria-labelledby="bd-tab-advanced"'));
-  expect(advanced.indexOf('<PromptInjectionSection')).toBeGreaterThan(-1);
-  expect(advanced.indexOf('<PromptInjectionSection')).toBeLessThan(advanced.indexOf('<ReplyDeliverySection'));
 });

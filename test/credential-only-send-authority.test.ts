@@ -356,7 +356,9 @@ describe('credential-only pane on the default tmux backend', () => {
     () => {
       const root = realpathSync(mkdtempSync(join(tmpdir(), 'credonly-tmux-')));
       const socket = `bmx-credonly-${process.pid}-${Date.now()}`;
-      const clientBase: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: root };
+      // Keep the fence's private socket root: a hand-built env without
+      // TMUX_TMPDIR puts this server in the HOST socket directory.
+      const clientBase: NodeJS.ProcessEnv = { PATH: process.env.PATH, HOME: root, TMUX_TMPDIR: process.env.TMUX_TMPDIR };
       const runTmux = (args: string[], env: NodeJS.ProcessEnv) => {
         const r = spawnSync('tmux', ['-L', socket, ...args], { env, encoding: 'utf8', timeout: 10_000 });
         expect(r.status, r.stderr || String(r.error ?? '')).toBe(0);
@@ -491,74 +493,20 @@ describe('credential-only relay on warm reattach', () => {
   );
 });
 
-/** The worker half of the fix. The spawn-path tests above drive the CLI directly
- *  and therefore cannot observe worker.ts at all — without these assertions,
- *  deleting the worker's relay wiring leaves the whole suite green while every
- *  real credential-only send breaks again (measured). Source-text assertions are
- *  the existing idiom for this file (see read-isolation.test.ts). */
-describe('worker wiring for the credential-only relay', () => {
+describe('credential-only relay sandbox masks', () => {
   const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
 
-  it('provisions the outbox, injects BOTMUX_SEND_RELAY, and starts the host watcher', () => {
-    const provisionAt = source.indexOf('const credentialRelay = prepareCredentialOnlyRelayOutbox({');
-    expect(provisionAt).toBeGreaterThanOrEqual(0);
-    // Fail CLOSED: an outbox that cannot be prepared must abort the spawn rather
-    // than silently launch a pane whose every send will be refused.
-    const failClosedAt = source.indexOf('credential-only relay outbox could not be prepared', provisionAt);
-    expect(failClosedAt).toBeGreaterThan(provisionAt);
-    // The child must be TOLD about the relay; the outbox alone routes nothing.
-    const envAt = source.indexOf('childEnv.BOTMUX_SEND_RELAY = credentialRelay.outbox;', provisionAt);
-    expect(envAt).toBeGreaterThan(provisionAt);
-    // And a host watcher must service it, with the session id forced.
-    const watcherAt = source.indexOf('sandboxStopWatcher = startOutboxWatcher(', envAt);
-    expect(watcherAt).toBeGreaterThan(envAt);
-    expect(source.indexOf('credentialRelay.outbox', watcherAt)).toBeGreaterThan(watcherAt);
-    // Teardown must be owned, or the session tree leaks.
-    expect(source.indexOf('sandboxCleanup = credentialRelay.cleanup;', provisionAt))
-      .toBeGreaterThan(provisionAt);
-    // The bwrap wrapper has to receive the outbox as a writable bind.
-    expect(source.indexOf('writableOutbox: credentialRelay.outbox', provisionAt))
-      .toBeGreaterThan(provisionAt);
-    // Sibling sessions' outboxes (each holding a live relay token) must be
-    // masked, or this pane could forge requests into them.
-    expect(source.indexOf('credentialRelay.sessionsRoot]', provisionAt))
-      .toBeGreaterThan(provisionAt);
-  });
-
-  it('re-serves the relay on warm reattach instead of skipping it', () => {
-    const armAt = source.indexOf('} else if (willReattachPersistent && credentialOnlyBwrap) {');
-    expect(armAt).toBeGreaterThanOrEqual(0);
-    const armEnd = source.indexOf('\n  }\n', armAt);
-    const arm = source.slice(armAt, armEnd);
-    // Never recreate (a new inode is invisible to the live pane).
-    expect(arm).toContain('attachCredentialOnlyRelayOutbox({');
-    expect(arm).not.toContain('prepareCredentialOnlyRelayOutbox(');
-    expect(arm).toContain('sandboxRelayOutbox = credentialRelay.outbox;');
-    expect(arm).toContain('sandboxStopWatcher = startOutboxWatcher(');
-    expect(arm).toContain('sandboxCleanup = credentialRelay.cleanup;');
-    // The previous worker revoked the leaf; without a fresh publish every send
-    // is refused as stale/missing.
-    expect(arm.indexOf('publishSandboxRelayCapability(')).toBeGreaterThan(
-      arm.indexOf('sandboxStopWatcher = startOutboxWatcher('),
-    );
-  });
-
-  it('cold-spawns instead of reattaching a credential-only pane whose outbox is gone', () => {
-    expect(source).toContain(
-      'const isolationMarkerReattachSafe = isolationMarkerMatches && credentialOnlyRelayReattachable;',
-    );
-    const gateAt = source.indexOf('const credentialOnlyRelayReattachable = !credentialOnlyBwrap');
-    expect(gateAt).toBeGreaterThanOrEqual(0);
-    expect(source.indexOf('attachCredentialOnlyRelayOutbox({', gateAt)).toBeGreaterThan(gateAt);
-  });
-
-  it('re-publishes the capability so the outbox leaf exists for the relay reader', () => {
-    // The earlier credential-only publish runs before any outbox exists and so
-    // writes only the managed-origin copy; `botmux send` in relay mode reads the
-    // OUTBOX leaf, so a second publish after wiring is required.
-    const provisionAt = source.indexOf('const credentialRelay = prepareCredentialOnlyRelayOutbox({');
-    const watcherAt = source.indexOf('sandboxStopWatcher = startOutboxWatcher(', provisionAt);
-    const publishAt = source.indexOf('publishSandboxRelayCapability({ failClosed: true })', watcherAt);
-    expect(publishAt).toBeGreaterThan(watcherAt);
+  // 源码结构护栏(K2)：每个会话的 relay outbox 里都放着一枚活的 relay capability；credential-only pane 的 bwrap 必须
+  // 遮住全部会话的 outbox 根，只把本会话 outbox 重新 bind 回来，否则本 pane 能读兄弟会话的 capability、往它们的
+  // outbox 伪造发送（#1321）。遮罩列表在 worker spawnCli 闭包里组装，没有行为 seam；
+  // credential-only-relay-lifecycle.integration.test.ts 只验证本会话 outbox 可用，验证不到兄弟会话被遮住。
+  it('hides every session outbox root and re-binds only its own outbox', () => {
+    const provisionAt = source.indexOf('= prepareCredentialOnlyRelayOutbox({');
+    const sandboxAt = source.indexOf('prepareCredentialOnlySandbox({', provisionAt);
+    expect(provisionAt).toBeGreaterThan(-1);
+    expect(sandboxAt).toBeGreaterThan(provisionAt);
+    const call = source.slice(sandboxAt, source.indexOf('});', sandboxAt));
+    expect(call).toMatch(/hideDirectories:[^\n]*credentialRelay\.sessionsRoot/);
+    expect(call).toMatch(/writableOutbox:\s*credentialRelay\.outbox/);
   });
 });

@@ -55,241 +55,145 @@ function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<{
   });
 }
 
+const replyCaptureFixture = join(__dirname, 'fixtures', 'send-reply-card-capture.ts');
+
+/** Run `botmux send` through the real CLI with Lark HTTP captured (no network). */
+function runCapturedSend(args: string[], session: Record<string, unknown>, turnId = 'om_turn_capture') {
+  const root = mkdtempSync(join(tmpdir(), 'botmux-send-capture-'));
+  const dataDir = join(root, 'data');
+  try {
+    mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+    writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: 'sid_capture', turnId }));
+    writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+      larkAppId: 'cli_test', larkAppSecret: 'test-secret', cliId: 'codex', replyCardMode: 'legacy',
+    }]));
+    seedPersistedSessionRows(dataDir, 'cli_test', { sid_capture: {
+      sessionId: 'sid_capture', status: 'active', cliId: 'codex', larkAppId: 'cli_test',
+      chatId: 'oc_test', rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root,
+      ...session,
+    } });
+    const result = spawnSyncTsScript(replyCaptureFixture, ['send', ...args], {
+      cwd: join(__dirname, '..'),
+      encoding: 'utf8',
+      timeout: 30_000,
+      env: {
+        PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
+        BOTMUX_SESSION_ID: 'sid_capture', BOTMUX_TURN_ID: turnId, BOTMUX_LARK_APP_ID: 'cli_test',
+      },
+    });
+    const requests = String(result.stdout).split('\n')
+      .filter(line => line.startsWith('CAPTURE_REPLY='))
+      .map(line => JSON.parse(line.slice('CAPTURE_REPLY='.length)));
+    return { status: result.status, stderr: String(result.stderr), requests };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 describe('cmdSend hook context wiring', () => {
-  it('passes Lark business error details through every cmdSend failure exit', () => {
-    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
-    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
-    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
-    expect(cliSource).toContain('describeSendFailure');
-    expect(cmdSend).toContain('语音发送失败：${describeSendFailure(e)}');
-    expect(cmdSend).toContain('文档评论发送失败：${describeSendFailure(e)}');
-    expect(cmdSend).toContain('发送失败: ${describeSendFailure(err)}');
-  });
-
-  it('prints only whitelisted session lookup diagnostics before send exits missing-session', () => {
-    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
-    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
-    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
-
-    expect(cmdSend).toContain('[botmux send diagnostic] session_lookup_miss');
-    expect(cmdSend).toContain('source=${sessionIdSource}');
-    expect(cmdSend).toContain('dataDir=${sendDataDir}');
-    expect(cmdSend).toContain('envSessionId=${process.env.BOTMUX_SESSION_ID ??');
-    expect(cmdSend).toContain('envLarkAppId=${process.env.BOTMUX_LARK_APP_ID ??');
-    expect(cmdSend).toContain('originSessionId=${originSessionId ??');
-    expect(cmdSend).toContain('reason=${resolved.reason}');
-    expect(cmdSend).toContain("relayDir=${relayDir ? 'present' : 'absent'}");
-    expect(cmdSend).toContain('readIsolation=${isolatedSendRequired ?');
-    expect(cmdSend).toContain("capability=${isolatedCapabilityCtx ? 'present' : 'absent'}");
-
-    const diagnosticStart = cmdSend.indexOf('session_lookup_miss');
-    expect(diagnosticStart).toBeGreaterThanOrEqual(0);
-    const missingSessionAt = cmdSend.indexOf('console.error(resolved.message)', diagnosticStart);
-    expect(missingSessionAt).toBeGreaterThan(diagnosticStart);
-    const diagnosticBlock = cmdSend.slice(diagnosticStart, missingSessionAt);
-
-    expect([...diagnosticBlock.matchAll(/\$\{([^}]*)\}/g)].map(m => m[1].trim())).toEqual([
-      'sid',
-      'sessionIdSource',
-      'sendDataDir',
-      "process.env.BOTMUX_SESSION_ID ?? '-'",
-      "process.env.BOTMUX_LARK_APP_ID ?? '-'",
-      "originSessionId ?? '-'",
-      'resolved.reason',
-      "relayDir ? 'present' : 'absent'",
-      "isolatedSendRequired ? 'required' : kernelReadIsolationDetected ? 'detected' : 'off'",
-      "isolatedCapabilityCtx ? 'present' : 'absent'",
-    ]);
-    expect([...diagnosticBlock.matchAll(/process\.env(\.[A-Za-z0-9_]+)?/g)].map(m => m[0])).toEqual([
-      'process.env.BOTMUX_SESSION_ID',
-      'process.env.BOTMUX_LARK_APP_ID',
-    ]);
-  });
-
-  it('parses and relays an explicit layout before building the canonical reply card', () => {
-    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
-    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
-    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
-    const parseAt = cmdSend.indexOf('const replyLayoutRequest = parseReplyLayoutRequest(rest);');
-    const relayAt = cmdSend.indexOf('await relaySend(rest, relayDir, replyLayout);');
-
-    expect(parseAt).toBeGreaterThanOrEqual(0);
-    expect(relayAt).toBeGreaterThan(parseAt);
-    expect(cmdSend).toContain('let replyLayout = replyLayoutRequest.layout;');
-    expect(cmdSend).toContain('extractFirstReplyCardHeading(cardText)');
-    expect(cmdSend).toContain('buildReplyLayoutHeader(replyLayout, layoutBody.heading, replyStyle)');
-    expect(cmdSend).toContain('resolveReplyStyle(resolveReplyStyleConfig(s.larkAppId))');
-    expect(cmdSend).toContain('createReplyCard([...elements], layoutHeader)');
-    expect(cmdSend).toContain('composeFinalCardSections(canonicalCard');
-    expect(cliSource).toContain('--layout result|progress|risk|blocked|handoff');
-  });
-
-  it('preserves plugin-card ownership across the sandbox host relay', () => {
-    const relayStart = cliSource.indexOf('async function relaySend(');
-    const relayEnd = cliSource.indexOf('\nasync function relayDispatch(', relayStart);
-    const relaySend = cliSource.slice(relayStart, relayEnd);
-    expect(relaySend).toContain("'--plugin-card-action'");
-  });
-
-  it('finishes a scheduled task only after final delivery and before turn advancement', () => {
-    const relayStart = cliSource.indexOf('async function relaySend(');
-    const relayEnd = cliSource.indexOf('\nasync function relayDispatch(', relayStart);
-    const relaySend = cliSource.slice(relayStart, relayEnd);
-    const sendStart = cliSource.indexOf('async function cmdSend(');
-    const sendEnd = cliSource.indexOf('\n// ─── Card subcommand', sendStart);
-    const cmdSend = cliSource.slice(sendStart, sendEnd);
-
-    expect(cliSource).toContain('--schedule-remove-self');
-    expect(relaySend).toContain("'--schedule-remove-self'");
-    expect(cmdSend).toContain("responseKind !== 'final'");
-    expect(cmdSend).toContain('planScheduleFinalCleanup({');
-    expect(cmdSend).toContain("action: 'remove', id: scheduleRemoveSelfTaskId");
-    expect(cmdSend).toContain('while (!scheduleRemoveSelfRequested');
-    expect(cmdSend).toContain("...(isSlashSend ? ['--slash'] : [])");
-    expect(cmdSend).toContain('scheduleSelfCleanup?.removed === true');
-    expect(cmdSend).toContain('--schedule-remove-self 只支持当前会话内的标准 final 卡，不支持文档评论回复');
-    const primarySend = cmdSend.indexOf('messageId = await dispatchPrimary');
-    const cleanup = cmdSend.indexOf('await removeScheduleSelfAfterFinal();', primarySend);
-    const advance = cmdSend.indexOf('advanceAncestorSessionTurn(', cleanup);
-    expect(primarySend).toBeGreaterThanOrEqual(0);
-    expect(cleanup).toBeGreaterThan(primarySend);
-    expect(advance).toBeGreaterThan(cleanup);
-  });
-
-  it('keeps completion proposals on the canonical final-card and sandbox outbox paths', () => {
-    const relayStart = cliSource.indexOf('async function relaySend(');
-    const relayEnd = cliSource.indexOf('\nasync function relayDispatch(', relayStart);
-    const relaySend = cliSource.slice(relayStart, relayEnd);
-    const sendStart = cliSource.indexOf('async function cmdSend(');
-    const sendEnd = cliSource.indexOf('\n// ─── Card subcommand', sendStart);
-    const cmdSend = cliSource.slice(sendStart, sendEnd);
-
-    expect(cliSource).toContain('--completion-proposal-file <path>');
-    expect(relaySend).toContain('completionProposalFile: completionProposalBase');
-    expect(cmdSend).toContain('normalizeCompletionProposalInput(raw)');
-    expect(cmdSend).toContain('participant.isBot === false');
-    expect(cmdSend).toContain("isSuspendableBackendType(s.backendType)");
-    expect(cmdSend).toContain('不能超过 8 KiB');
-    expect(cmdSend).toContain('completionProposalStore.bindMessage(');
-    expect(cmdSend).toContain('completionProposalCardDispatchUuid(completionProposalRecord)');
-    expect(cmdSend).toContain('buildCompletionProposalElement(completionProposalRecord)');
-  });
-
-  it('strips trailing memory citations before relay and direct-send rendering', () => {
-    const relayStart = cliSource.indexOf('async function relaySend(');
-    const relayEnd = cliSource.indexOf('\nfunction currentBotIsApiOnly', relayStart);
-    const relaySend = cliSource.slice(relayStart, relayEnd);
-    expect(relaySend).toContain('content = stripTrailingOaiMemoryCitation(content);');
-    expect(relaySend.indexOf('content = stripTrailingOaiMemoryCitation(content);'))
-      .toBeLessThan(relaySend.indexOf('prepareCardMarkdown('));
-
-    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
-    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
-    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
-    expect(cmdSend).toContain('content = stripTrailingOaiMemoryCitation(content);');
-    expect(cmdSend.indexOf('content = stripTrailingOaiMemoryCitation(content);'))
-      .toBeLessThan(cmdSend.indexOf('const managedPayloadError = managedVcSendPayloadError({'));
-  });
-
-  it('delegates CLI session snapshot loading to the session-store gate (scope repair lives behind it)', () => {
-    const loadSessionsStart = cliSource.indexOf('function loadSessions()');
-    expect(loadSessionsStart).toBeGreaterThanOrEqual(0);
-    const loadSessionsEnd = cliSource.indexOf('\nfunction ', loadSessionsStart);
-    const loadSessions = cliSource.slice(loadSessionsStart, loadSessionsEnd);
-
-    // The scope repair moved behind the store gate together with the loader
-    // itself — repair-on-load behavior is asserted in test/session-store.test.ts
-    // (loadAllSessionsSnapshot). The CLI must not regrow a parallel reader or
-    // the unlocked whole-file writer it once had.
-    expect(loadSessions).toContain('loadAllSessionsSnapshot(');
-    expect(loadSessions).not.toContain('readFileSync');
-    expect(cliSource).not.toContain('function saveSession(');
-  });
-
-  it('passes the current session id into outbound send/reply hooks', () => {
-    expect(cliSource).toContain('const hookContext = {');
-    expect(cliSource).toMatch(/sendMessage\(\s*appId,\s*sendTarget\.chatId,\s*content,\s*msgType,\s*uuid,\s*hookContext,/);
-    expect(cliSource).toMatch(/replyMessage\(\s*appId,\s*sendTarget\.rootMessageId,\s*content,\s*msgType,\s*sendTarget\.mode === 'thread',\s*uuid,\s*hookContext,/);
-  });
-
-  it('resolves mention-back from the exact turn instead of the latest queued sender', () => {
-    expect(cliSource).toContain(
-      'const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId',
+  it('strips a trailing memory citation before the direct send renders the reply', () => {
+    const citation = [
+      '<oai-mem-citation>', '<citation_entries>', 'MEMORY.md:10-12|note=[routing context]',
+      '</citation_entries>', '<rollout_ids>', '019c1234', '</rollout_ids>', '</oai-mem-citation>',
+    ].join('\n');
+    const result = runCapturedSend(
+      ['--no-mention', '--response-kind', 'final', `Visible answer.\n\n${citation}`],
+      {},
     );
-    expect(cliSource).toContain('?? turnReplyTarget?.senderOpenId');
-    expect(cliSource).toContain('hasQuoteTargetSender: !!replyTargetSenderOpenId');
-    expect(cliSource).toMatch(/mentions\.push\(\{ open_id: replyTargetSenderOpenId, name: '' \}\)/);
-  });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.requests).toHaveLength(1);
+    const body = JSON.stringify(result.requests[0].body);
+    expect(body).toContain('Visible answer.');
+    expect(body).not.toContain('oai-mem-citation');
+    expect(body).not.toContain('MEMORY.md:10-12');
+  }, 40_000);
 
-  it('lets explicit recipients replace the implicit reply target in quote and footer routing', () => {
-    expect(cliSource).toContain('shouldSuppressImplicitReplyTarget({');
-    expect(cliSource).toContain('if (suppressImplicitReplyTarget) effectiveQuoteTargetId = undefined');
-    expect(cliSource).toContain('hasExplicitMention: mentions.length > 0');
-  });
+  // #750: --mention-back @s the sender of the EXACT current turn. An evicted
+  // exact-turn record must resolve to no sender — never the global latest slot,
+  // which may already belong to a different turn B.
+  it.each([
+    [
+      'mentions the exact turn sender even after the global slot advanced to another turn',
+      {
+        quoteTargetId: 'om_turn_b', quoteTargetSenderOpenId: 'ou_turn_b',
+        replyTargets: { om_turn_a: {
+          updatedAt: new Date().toISOString(), senderOpenId: 'ou_turn_a',
+          participants: [{ openId: 'ou_turn_a', isBot: false }],
+        } },
+      },
+      'ou_turn_a',
+    ],
+    [
+      'does not borrow the advanced global slot when the exact turn record is gone',
+      {
+        chatType: 'p2p', scope: 'chat',
+        quoteTargetId: 'om_turn_b', quoteTargetSenderOpenId: 'ou_turn_b',
+      },
+      null,
+    ],
+    [
+      'refuses --mention-back when the turn window has more than one counterpart',
+      {
+        replyTargets: { om_turn_a: {
+          updatedAt: new Date().toISOString(), senderOpenId: 'ou_turn_a',
+          participants: [{ openId: 'ou_turn_a', isBot: false }, { openId: 'ou_turn_c', isBot: false }],
+        } },
+      },
+      null,
+    ],
+  ] as const)('%s', (_name, session, sent) => {
+    const result = runCapturedSend(['--mention-back', '--response-kind', 'final', 'answer'], session, 'om_turn_a');
+    const captured = JSON.stringify(result.requests);
+    expect(captured).not.toContain('ou_turn_b');
+    expect(captured).not.toContain('ou_turn_c');
+    if (sent) {
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.requests).toHaveLength(1);
+      expect(captured).toContain(sent);
+    } else {
+      expect(result.status).toBe(2);
+      expect(result.requests).toEqual([]);
+    }
+  }, 40_000);
 
-  it('gates the legacy global quote-sender fallback on NO currentTurnId — an exact-turn miss never borrows the advanced global slot (#750 cross-turn guard)', () => {
-    // The reply-target sender chain is: VC → #597 frozen dispatch → exact
-    // turnReplyTarget.senderOpenId → (ONLY when no currentTurnId) legacy global
-    // s.quoteTargetSenderOpenId. The last hop MUST be gated on `currentTurnId`:
-    // with a turnId, an exact-turn map miss/eviction resolves to NO sender, never
-    // the global latest slot (which may have advanced to a DIFFERENT turn B). An
-    // unconditional `?? s.quoteTargetSenderOpenId` would re-introduce the
-    // cross-turn --mention-back bug #750 fixed (A evicted, global sender = B →
-    // B wrongly @-ed as A's reply target). This is a precise structural guard;
-    // pickTurnReplyTarget's own hit already enforces quoteTargetId===currentTurnId.
-    // frozen dispatch and exact-turn hops precede the gated legacy fallback.
-    expect(cliSource).toContain('?? frozenTurnDispatch?.replyTargetSenderOpenId');
-    expect(cliSource).toContain('?? turnReplyTarget?.senderOpenId');
-    // The legacy global slot is reachable ONLY behind the no-turn gate — assert
-    // the exact gated form and FORBID any unconditional `?? s.quoteTargetSenderOpenId`.
-    expect(cliSource).toContain('?? (currentTurnId ? undefined : s.quoteTargetSenderOpenId)');
-    expect(cliSource).not.toMatch(/\?\?\s*s\.quoteTargetSenderOpenId\s*;/);
-  });
-
-  it('prefers the current Codex App ledger entry over mutable shared-chat reply state', () => {
-    expect(cliSource).toContain(
-      'originSession?.codexAppDispatchLedger',
-    );
-    expect(cliSource).toContain("turnMatches.filter(entry => entry.dispatchAttempt === originDispatchAttempt)");
-    expect(cliSource).toContain('if (exactMatches.length !== 1)');
-    expect(cliSource).toContain('const frozenTurnDispatch = originSessionId === sid');
-    expect(cliSource).toMatch(
-      /const sendTarget = !sendInto && !sendTopLevel && !overrideChatId && frozenTurnReplyTarget\s*\? frozenTurnReplyTarget/,
-    );
-    expect(cliSource).toContain('?? frozenTurnDispatch?.replyTargetSenderOpenId');
-    expect(cliSource).toContain('?? frozenTurnDispatch?.quoteTargetId');
-    expect(cliSource).toContain('lastCallerOpenId: frozenTurnDispatch.replyTargetSenderOpenId');
-    expect(cliSource).toContain('lastCallerIsBot: frozenTurnDispatch.replyTargetSenderIsBot');
-  });
-
-  it('fails closed when a durable turn is bound to a non-Lark delivery sink', () => {
-    expect(cliSource).toContain("exactOriginDispatch?.deliverySink === 'http_wait'");
-    expect(cliSource).toContain("exactOriginDispatch?.deliverySink === 'http_async'");
-    expect(cliSource).toContain("exactOriginDispatch?.deliverySink === 'suppressed'");
-    expect(cliSource).toContain("exactOriginDispatch?.deliverySink === 'doc_comment'");
-    expect(cliSource).toContain('a document-comment turn supports only its exact plain-text comment reply');
-  });
-
-  it('retains per-turn document-comment routing for non-Codex CLI adapters only', () => {
-    expect(cliSource).toContain("originSession?.cliId !== 'codex-app' && !!docTarget");
-    expect(cliSource).toContain('const isOriginDocCommentTurn =');
-    expect(cliSource.match(/if \(isOriginDocCommentTurn\)/g)).toHaveLength(2);
-  });
-
-  it('binds delivery-sink authority to the trusted origin, not --session-id destination', () => {
-    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
-    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
-    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
-    expect(cmdSend).toContain('const originSessionId = trustedRelayCtx?.sessionId');
-    expect(cmdSend).toContain('const authoritativeOriginTurnCtx = trustedRelayCtx');
-    expect(cmdSend).toContain(': (liveMarkerCtx?.turnId');
-    expect(cmdSend).toContain(': isolatedManagedOriginCtx?.turnId');
-    expect(cmdSend).not.toMatch(/const originSessionId =[\s\S]{0,200}sessionIdArg/);
-    expect(cmdSend).toContain('const sid = sessionIdArg ?? ancestorCtx?.sessionId');
-    expect(cmdSend).toContain('const exactOriginDispatch = (() => {');
-    expect(cmdSend).toContain('if (sid !== originSessionId');
-    expect(cmdSend).toContain('const exactDocSession = originSession!;');
-  });
+  it.each(['http_async', 'suppressed'] as const)(
+    'fails closed when the live durable turn is bound to the %s sink',
+    async sink => {
+      const root = mkdtempSync(join(tmpdir(), 'botmux-send-non-lark-sink-'));
+      const dataDir = join(root, 'data');
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+        sessionId: 'session', turnId: 'turn-live',
+      }));
+      seedPersistedSessionRows(dataDir, 'app-a', {
+        session: {
+          sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
+          title: 'host', status: 'active', createdAt: new Date(0).toISOString(),
+          larkAppId: 'app-a', cliId: 'codex-app',
+          codexAppDispatchLedger: [{
+            dispatchId: 'dispatch-live', turnId: 'turn-live',
+            state: 'prepared', content: 'prompt', deliverySink: sink,
+          }],
+        },
+      });
+      try {
+        const result = await runCli(['send', 'must not send', '--session-id', 'session', '--no-mention'], {
+          ...process.env,
+          SESSION_DATA_DIR: dataDir,
+          BOTMUX_SESSION_ID: 'session',
+          BOTMUX_SEND_RELAY: '',
+          BOTMUX_HOST_RELAY_AUTHORIZED: '',
+          BOTMUX_WORKFLOW: '',
+          BOTMUX_LARK_APP_ID: '', BOTMUX_LARK_APP_SECRET: '',
+        });
+        expect(result.code).toBe(2);
+        expect(result.stderr).toContain(`bound to the ${sink} host sink`);
+        expect(result.stderr).not.toContain('must not send');
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it('does not promote detached spawn-time turn env while durable output is unsettled', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-send-stale-origin-'));
@@ -798,41 +702,15 @@ describe('cmdSend hook context wiring', () => {
     }
   });
 
-  it('authorizes a host relay from its forced trusted origin before any provider side effect', () => {
-    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
-    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
-    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
-    expect(cmdSend).toContain("const trustedHostRelay = process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1';");
-    expect(cmdSend).toContain('isTrustedVcMeetingHostRelayParent(');
-    expect(cmdSend).toContain("BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER === '1'");
-    expect(cmdSend.indexOf('const exactOriginDispatch = (() => {'))
-      .toBeLessThan(cmdSend.indexOf("const { synthesizeVoiceOpus }"));
-    expect(cmdSend.indexOf("exactOriginDispatch?.deliverySink === 'http_wait'"))
-      .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage"));
-  });
-
-  it('keeps Remote Runner outbound sends host-only, route-frozen, and non-terminal', () => {
-    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
-    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
-    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
-    const guard = cmdSend.indexOf('if (remoteRunnerOutbound)');
-    const providerImport = cmdSend.indexOf("const { sendMessage, replyMessage");
-    expect(guard).toBeGreaterThan(0);
-    expect(guard).toBeLessThan(providerImport);
-    const remoteGuard = cmdSend.slice(guard, cmdSend.indexOf('// A proof is a point-in-time', guard));
-    expect(remoteGuard).toContain('trustedRelayCtx.sessionId !== sid');
-    expect(remoteGuard).toContain("['progress', 'auxiliary']");
-    expect(remoteGuard).toContain('sendTopLevel || overrideChatId || sendInto');
-    expect(remoteGuard).toContain('Number(mentionArgs.length > 0)');
-    expect(remoteGuard).not.toContain('|| mentionArgs.length > 0');
-    expect(remoteGuard).not.toContain('images.length > 0');
-    expect(remoteGuard).toContain('files.length > 0');
-    expect(cmdSend).toContain('...(remoteRunnerOutbound ? { terminalIndependent: true } : {})');
-  });
-
   it.each([
     ['explicit plus none mention decisions', ['--no-mention', '--mention', 'ou_forbidden']],
     ['two mention decisions', ['--no-mention', '--mention-back']],
+    // The relay event carries no destination override or richer payload: a
+    // forged flag must not turn it into cross-chat delivery or an upload.
+    ['a top-level route override', ['--no-mention', '--top-level']],
+    ['a cross-chat route override', ['--no-mention', '--chat-id', 'oc_other']],
+    ['a file attachment', ['--no-mention', '--file', join(__dirname, '..', 'package.json')]],
+    ['a voice reply', ['--no-mention', '--voice']],
   ])('rejects Remote Runner outbound sends with %s through the real CLI', async (_name, mentionArgs) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-outbound-guard-'));
     const dataDir = join(root, 'data');
@@ -870,95 +748,119 @@ describe('cmdSend hook context wiring', () => {
     }
   });
 
-  it('accepts one explicit Remote Runner recipient before ordinary content validation', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-outbound-explicit-'));
-    const dataDir = join(root, 'data');
-    writeFileSync(join(root, 'bots.json'), JSON.stringify([{
-      larkAppId: 'app-a', larkAppSecret: 'test', cliId: 'remote-runner',
-    }]));
-    seedPersistedSessionRows(dataDir, 'app-a', {
-      session: {
-        sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
-        title: 'remote', status: 'active', createdAt: new Date(0).toISOString(),
-        larkAppId: 'app-a', cliId: 'remote-runner', pid: process.pid,
-      },
-    });
-    try {
-      const missingContent = join(root, 'missing.md');
-      const result = await runCli([
-        'send', '--remote-runner-outbound', '--response-kind', 'auxiliary',
-        '--session-id', 'session', '--mention', 'ou_target:Target',
-        '--content-file', missingContent,
-      ], {
-        ...process.env,
-        HOME: root,
-        SESSION_DATA_DIR: dataDir,
-        BOTS_CONFIG: join(root, 'bots.json'),
-        BOTMUX_SESSION_ID: 'session',
-        BOTMUX_TURN_ID: 'turn-live',
-        BOTMUX_HOST_RELAY_AUTHORIZED: '1',
-        BOTMUX_SEND_RELAY: '',
-        BOTMUX_WORKFLOW: '',
-        BOTMUX_LARK_APP_ID: '',
-        BOTMUX_LARK_APP_SECRET: '',
+  it.each(['auxiliary', 'final'] as const)(
+    'accepts one explicit Remote Runner recipient for %s before ordinary content validation',
+    async responseKind => {
+      const root = mkdtempSync(join(tmpdir(), 'botmux-remote-outbound-explicit-'));
+      const dataDir = join(root, 'data');
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: 'app-a', larkAppSecret: 'test', cliId: 'remote-runner',
+      }]));
+      seedPersistedSessionRows(dataDir, 'app-a', {
+        session: {
+          sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
+          title: 'remote', status: 'active', createdAt: new Date(0).toISOString(),
+          larkAppId: 'app-a', cliId: 'remote-runner', pid: process.pid,
+        },
       });
-      expect(result.code).toBe(1);
-      expect(result.stderr).toContain(`文件不存在: ${missingContent}`);
-      expect(result.stderr).not.toContain('--remote-runner-outbound supports only');
+      try {
+        const missingContent = join(root, 'missing.md');
+        const result = await runCli([
+          'send', '--remote-runner-outbound', '--response-kind', responseKind,
+          '--session-id', 'session', '--mention', 'ou_target:Target',
+          '--content-file', missingContent,
+        ], {
+          ...process.env,
+          HOME: root,
+          SESSION_DATA_DIR: dataDir,
+          BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: 'session',
+          BOTMUX_TURN_ID: 'turn-live',
+          BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+          BOTMUX_SEND_RELAY: '',
+          BOTMUX_WORKFLOW: '',
+          BOTMUX_LARK_APP_ID: '',
+          BOTMUX_LARK_APP_SECRET: '',
+        });
+        expect(result.code).toBe(1);
+        expect(result.stderr).toContain(`文件不存在: ${missingContent}`);
+        expect(result.stderr).not.toContain('--remote-runner-outbound supports only');
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each([
+    ['a voice reply', ['--voice']],
+    ['a top-level route override', ['--top-level']],
+    ['a cross-chat route override', ['--chat-id', 'oc_other']],
+  ])('rejects %s on a document-comment turn before reading content', async (_name, extraArgs) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-doc-comment-plain-only-'));
+    const dataDir = join(root, 'data');
+    const sessionId = 'sid_doc_comment_plain_only';
+    const turnId = 'turn_doc_comment_plain_only';
+    mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+    writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId, turnId }));
+    writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+      larkAppId: 'cli_test', larkAppSecret: 'test-secret', cliId: 'codex', replyCardMode: 'legacy',
+    }]));
+    seedPersistedSessionRows(dataDir, 'cli_test', { [sessionId]: {
+      sessionId, status: 'active', cliId: 'codex', larkAppId: 'cli_test',
+      chatId: 'doc:doc_test', rootMessageId: 'om_root', scope: 'thread', workingDir: root,
+      docCommentTargets: { [turnId]: { fileToken: 'doc_test', fileType: 'docx', commentId: 'comment_test', turnId } },
+    } });
+    // The content file does not exist: reaching the content read would exit 1
+    // with a missing-file error instead of the document-comment refusal.
+    const missingContent = join(root, 'missing.md');
+    try {
+      const result = await runCli(
+        ['send', '--no-mention', '--response-kind', 'final', '--content-file', missingContent, ...extraArgs],
+        {
+          ...process.env,
+          HOME: root,
+          SESSION_DATA_DIR: dataDir,
+          BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: sessionId,
+          BOTMUX_LARK_APP_ID: 'cli_test',
+          BOTMUX_HOST_RELAY_AUTHORIZED: '',
+          BOTMUX_SEND_RELAY: '',
+          BOTMUX_WORKFLOW: '',
+        },
+      );
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain('a document-comment turn supports only its exact plain-text comment reply');
+      expect(result.stderr).not.toContain(missingContent);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
 
-  it('validates the exact document text path before reading content or invoking TTS/uploads', () => {
+  // 源码结构护栏(K3)：轮次 final 的非幂等投递收口（41cec7ec9「轮次发送幂等收口」）。文档评论的
+  // 每个分块都必须走 executeNonIdempotentSequence 的 checkpoint，否则「结果未知」后的重试会重复
+  // 发评论；并发重试里输掉发布锁的进程（turnPrimaryReplayed）必须在主投递后立刻 return，不得重复
+  // 索引、附件、加急、oncall 投递等副作用。两条都在 cmdSend 巨型函数里，现有 capture fixture 无法
+  // 制造「请求已发出但结果未知」或两个进程的发布锁竞争，只能钉住调用的相对位置。
+  it('never repeats non-idempotent provider effects on a retried or concurrently replayed final', () => {
     const cmdSendStart = cliSource.indexOf('async function cmdSend(');
     const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
     const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
-    const docGuard = cmdSend.indexOf('if (isOriginDocCommentTurn)');
-    expect(docGuard).toBeGreaterThan(-1);
-    expect(docGuard).toBeLessThan(cmdSend.indexOf('// Read content from:'));
-    expect(docGuard).toBeLessThan(cmdSend.indexOf('content = readFileSync(contentFile'));
-    expect(docGuard).toBeLessThan(cmdSend.indexOf('content = await readStdin()'));
-    expect(docGuard).toBeLessThan(cmdSend.indexOf("const { synthesizeVoiceOpus }"));
-    const guardSource = cmdSend.slice(docGuard, cmdSend.indexOf('// Read content from:'));
-    for (const forbidden of [
-      'asVoice',
-      'images.length > 0',
-      'files.length > 0',
-      'videoAttachments.length > 0',
-      'videoCovers.length > 0',
-      'customCardRequested',
-      'sendTopLevel',
-      'overrideChatId',
-      'sendInto',
-    ]) {
-      expect(guardSource).toContain(forbidden);
-    }
-  });
 
-  it('never writes the startup session snapshot after an async document reply', () => {
-    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
-    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
-    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
     const docSendStart = cmdSend.indexOf('if (isOriginDocCommentTurn)', cmdSend.indexOf('// Read content from:'));
-    const mentionParsing = cmdSend.indexOf('// Parse mentions:', docSendStart);
-    const docSend = cmdSend.slice(docSendStart, mentionParsing);
-    expect(docSend).toContain('Daemon settlement owns exact target retirement.');
-    expect(docSend).not.toContain('saveSession(');
-    expect(docSend).not.toMatch(/delete\s+exactDocSession\.docCommentTargets/);
-  });
+    const docSend = cmdSend.slice(docSendStart, cmdSend.indexOf('// Parse mentions:', docSendStart));
+    const checkpoint = docSend.indexOf('executeNonIdempotentSequence(');
+    expect(docSendStart).toBeGreaterThan(-1);
+    expect(checkpoint).toBeGreaterThan(-1);
+    expect(docSend.indexOf('replyToDocComment(')).toBeGreaterThan(checkpoint);
+    expect(docSend.indexOf('removeCommentReaction(')).toBeGreaterThan(checkpoint);
 
-  it('checkpoints document comment chunks before each non-idempotent provider call', () => {
-    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
-    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
-    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
-    const docSendStart = cmdSend.indexOf('if (isOriginDocCommentTurn)', cmdSend.indexOf('// Read content from:'));
-    const mentionParsing = cmdSend.indexOf('// Parse mentions:', docSendStart);
-    const docSend = cmdSend.slice(docSendStart, mentionParsing);
-
-    expect(docSend).toContain('executeNonIdempotentSequence(');
-    expect(docSend).not.toMatch(/executeTurnPrimary\([\s\S]*?for \(let i = 0; i < chunks\.length; i\+\+\)/);
-    expect(docSend.indexOf('removeCommentReaction(')).toBeGreaterThan(docSend.indexOf('executeNonIdempotentSequence('));
+    const primarySend = cmdSend.indexOf('messageId = await dispatchPrimary');
+    const replayReturn = cmdSend.indexOf('if (turnPrimaryReplayed) {', primarySend);
+    const oncallDelivery = cmdSend.indexOf('if (oncallGroupCard && messageId)', replayReturn);
+    expect(primarySend).toBeGreaterThan(-1);
+    expect(replayReturn).toBeGreaterThan(primarySend);
+    expect(oncallDelivery).toBeGreaterThan(replayReturn);
+    expect(cmdSend.slice(replayReturn, oncallDelivery)).toMatch(/\breturn;/);
   });
 
   it('rejects a non-final document-comment reply with actionable guidance before provider effects', async () => {
@@ -1004,153 +906,31 @@ describe('cmdSend hook context wiring', () => {
     }
   });
 
-  it('gates --mention-back by turn-window participant ambiguity (no group-stats round-trip)', () => {
-    // 2+ distinct counterparts OR an incomplete window → block --mention-back and
-    // hand the model explicit --mention candidates. Reads the persisted
-    // participant window; no getGroupStats fetch. Explicit VC turns skip it.
-    expect(cliSource).toContain('collectTurnWindowParticipants(s, currentTurnId)');
-    expect(cliSource).toContain('mentionBackAmbiguity({ chatType: s.chatType, participants: window.participants, incomplete: window.incomplete })');
-    expect(cliSource).toMatch(/if \(mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel\)/);
-    expect(cliSource).toContain('console.error(mentionBackAmbiguityError(ambiguity.candidates, ambiguity.incomplete))');
-    // The old asymmetric/group-stats gate is fully gone.
-    expect(cliSource).not.toContain('shouldBlockMentionBackByParticipants');
-    expect(cliSource).not.toMatch(/mentionBack[\s\S]{0,300}getGroupStats/);
-  });
-
-  it('freezes VC listener replay content and indexes only the successful primary output', () => {
+  // 源码结构护栏(K2)：会议托管 Agent（vcMeetingManagedSendOrigin）的出站围栏——路由/提及/附件/
+  // 原生 @ 的限制必须在任何 provider 动作之前判定（fa9914f20 #470）。各判定是 send-policy.ts 的纯
+  // 函数并由 test/send-policy.test.ts 行为覆盖；cmdSend 巨型函数里「先判后发」的接线没有 seam，
+  // 制造托管会议 origin 又要整套 VC 投递存储，这里只钉判定与首个 provider 动作的相对顺序。
+  it('decides managed VC meeting send restrictions before any provider effect', () => {
     const cmdSendStart = cliSource.indexOf('async function cmdSend(');
     const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
     const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
-    expect(cmdSend).toContain('const canonicalOutput = prepared?.canonicalOutput ?? proposedOutput;');
-    expect(cmdSend).toContain('prepareVcMeetingDeliveryReply(');
-    expect(cmdSend).toContain('vcMeetingDeliveryReplyOrigin');
-    expect(cmdSend).toContain('content: canonicalOutput.content');
-    expect(cmdSend).toContain('msgType: canonicalOutput.msgType');
-    expect(cmdSend).toContain('quoteTargetId: canonicalOutput.quoteTargetId');
-    expect(cmdSend).toMatch(
-      /const dispatchAfterOriginGate = async \([^)]*\): Promise<string> => \{[\s\S]*?revalidateVcMeetingManagedSend\(\);/,
+    const at = (needle: string, from = 0) => {
+      const i = cmdSend.indexOf(needle, from);
+      expect(i, needle).toBeGreaterThan(-1);
+      return i;
+    };
+    const firstProviderEffect = Math.min(
+      at("const { sendMessage, replyMessage"),
+      at("const { synthesizeVoiceOpus }"),
     );
-    expect(cmdSend).toMatch(/const dispatch = async \([^)]*\): Promise<string> => \{[\s\S]*?dispatchAfterOriginGate\(/);
-    expect(cmdSend).toMatch(
-      /const dispatchPrimaryUnlocked = async \([^)]*\): Promise<string> => \{\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*revalidateVcMeetingManagedSend\(\);/,
-    );
-    expect(cmdSend).toContain('recordVcMeetingPrimaryOutput(result.messageId, canonicalOutput.targetChatId);');
-    expect(cmdSend.indexOf('recordVcMeetingPrimaryOutput(result.messageId'))
-      .toBeGreaterThan(cmdSend.indexOf('const result = await dispatchPrimaryMessage('));
-    expect(cmdSend).toContain('const managedControlError = managedVcSendControlError({');
-    expect(cmdSend).toContain('const managedPayloadError = managedVcSendPayloadError({');
-    expect(cmdSend).toContain('fileCount: files.length');
-    expect(cmdSend).toContain('videoCount: videoAttachments.length');
-    expect(cmdSend).toContain('containsNativeAtTag: containsLarkAtTag(content)');
-    expect(cmdSend).toContain('const managedRenderedPayloadError = managedVcSendPayloadError({');
-    expect(cmdSend).toContain('containsNativeAtTag: containsLarkAtTag(text)');
-    expect(cmdSend).toContain('if (!noMention && !isSlashSend && !vcMeetingManagedSendOrigin)');
-    expect(cmdSend).toContain('if (!sendTopLevel && !vcMeetingManagedSendOrigin)');
-    expect(cmdSend.indexOf('const managedPayloadError = managedVcSendPayloadError({'))
-      .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage"));
-    expect(cmdSend.indexOf('const managedPayloadError = managedVcSendPayloadError({'))
-      .toBeLessThan(cmdSend.indexOf("const { synthesizeVoiceOpus }"));
-    expect(cmdSend.indexOf('const managedRenderedPayloadError = managedVcSendPayloadError({'))
-      .toBeGreaterThan(cmdSend.indexOf('BOTMUX_CARD_PREPARED_CONTENT_FILE'));
-    expect(cmdSend.indexOf('const managedRenderedPayloadError = managedVcSendPayloadError({'))
-      .toBeLessThan(cmdSend.indexOf('imageKeys.push(await uploadImage'));
-    expect(cmdSend).toContain('const managedQuoteError = managedVcQuoteError({');
-    expect(cmdSend).toContain('const managedCustomCardError = managedVcCustomCardError(');
-    expect(cmdSend).toMatch(/sessionQuoteTargetId: vcMeetingDeliveryReplyOrigin\s*\? undefined/);
-    expect(cmdSend).toContain('const prepared = prepareVcMeetingListenerReply(proposedOutput);');
-    expect(cmdSend).toContain('const deliveryUuid = prepared?.providerKey ?? providerUuid;');
-    expect(cmdSend).toContain('voicePrimaryOutputChatId = canonicalOutput.targetChatId;');
-    expect(cmdSend).toContain('recordVcMeetingPrimaryOutput(messageId, voicePrimaryOutputChatId);');
-    expect(cmdSend).not.toContain('recordVcMeetingPrimaryOutput(messageId, targetChatId);');
-    expect(cmdSend).toMatch(/canonicalOutput\.msgType,[\s\S]*?deliveryUuid/);
-    expect(cmdSend).toContain('...(prepared ? { suppressHook: true } : {})');
-    expect(cmdSend).toContain('const managedProviderOptions = outboundMessageOptions(!!prepared);');
-    expect(cmdSend).toContain('...(vcMeetingManagedSendOrigin ? { maxMessages: 1 } : {})');
-  });
-
-  it('defaults an omitted response kind to non-final while keeping feedback indexing final-only', () => {
-    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
-    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
-    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
-    expect(cmdSend).toContain("const responseKindOccurrences = rest.filter(token => token === '--response-kind' || token.startsWith('--response-kind=')).length");
-    expect(cmdSend).toContain("responseKindOccurrences > 1");
-    expect(cmdSend).toContain("flagPresentButValueMissing(rest, '--response-kind')");
-    expect(cmdSend).toMatch(/let effectiveResponseKind(?:: TurnSendKind)? = responseKind \?\? 'progress'/);
-    expect(cmdSend).toContain("if (responseKind === undefined) effectiveResponseKind = 'final'");
-    expect(cmdSend).not.toContain('启用最终回答反馈后，必须显式指定 --response-kind progress|final');
-    expect(cmdSend).toContain('无法确认本次提问者身份，不能发送带反馈控件的最终回答');
-    // The requester-identity gate is scoped to the `requester` audience only.
-    // `reviewers`/`everyone` authorize clicks without a human requester (a
-    // bot-triggered ownerless session), so re-widening this gate to every
-    // audience would silently make those cards unsendable.
-    expect(cmdSend).toContain("feedbackPolicy.audience === 'requester' && !feedbackRequesterSubjectId");
-    expect(cmdSend).toContain('requesterSubjectId: feedbackRequesterSubjectId');
-    expect(cmdSend).not.toContain("feedbackPolicy && responseKind === 'final'");
-    expect(cmdSend).toContain("feedbackPolicy && effectiveResponseKind === 'final'");
-    expect(cmdSend).toContain('const deliveryTurnId = currentTurnId ?? `send:${messageId}`');
-    expect(cmdSend).toContain('const correlationDiscriminator = currentTurnId ? messageId : undefined');
-    expect(cmdSend).toContain('turnId: deliveryTurnId');
-    expect(cmdSend).toContain('correlationDiscriminator,');
-    expect(cmdSend).not.toContain('const deliveryTurnId = `send:${messageId}`');
-    expect(cmdSend).not.toContain('--feedback-level');
-    const primarySend = cmdSend.indexOf('messageId = await dispatchPrimary');
-    const deliveryIndex = cmdSend.indexOf('turn delivery indexing failed after delivery');
-    expect(primarySend).toBeGreaterThanOrEqual(0);
-    // The delivery record is written AFTER the message is actually sent.
-    expect(deliveryIndex).toBeGreaterThan(primarySend);
-    const storeWrite = cmdSend.indexOf('getSkillFeedbackStore(resolveDataDir())', primarySend);
-    expect(storeWrite).toBeGreaterThan(primarySend);
-    expect(deliveryIndex).toBeGreaterThan(storeWrite);
-    // Turn-completion recording is gated on the response KIND, not on the
-    // feedback policy — feedback off must still produce a correlatable record.
-    expect(cmdSend).toContain("if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
-    const oncallIndex = cmdSend.indexOf('recordOncallGroupDelivery(resolveDataDir()');
-    const completionIndex = cmdSend.indexOf("if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
-    expect(oncallIndex).toBeGreaterThan(primarySend);
-    expect(oncallIndex).toBeLessThan(completionIndex);
-    // The feedback control (policy + card snapshot) rides along only when a
-    // policy actually applies; the record itself is unconditional.
-    expect(cmdSend).toContain('const carriesFeedbackControl = !!feedbackPolicy;');
-    expect(cmdSend).toContain("cardMode: carriesFeedbackControl ? 'feedback' : 'card'");
-    expect(cmdSend).toContain('...(carriesFeedbackControl ? { policy: feedbackPolicy } : {})');
-    expect(cmdSend).toContain('...(carriesFeedbackControl && feedbackBaseCard ? { baseCard: feedbackBaseCard } : {})');
-    expect(cmdSend).toContain('buildFeedbackElement(feedbackPolicy)');
-  });
-
-  it('falls back to daemon indexing only when an isolated CLI cannot open the shared feedback store', () => {
-    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
-    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
-    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
-    const completionIndex = cmdSend.indexOf("if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
-    const block = cmdSend.slice(completionIndex, cmdSend.indexOf('turn delivery indexing failed after delivery', completionIndex));
-    const localWrite = block.indexOf('getSkillFeedbackStore(resolveDataDir())');
-    const fallback = block.indexOf('if (indexError !== undefined) {');
-    // The local write is always tried first; wherever the store is writable
-    // nothing changes and no IPC is made.
-    expect(localWrite).toBeGreaterThan(0);
-    expect(fallback).toBeGreaterThan(localWrite);
-    const relay = block.slice(fallback);
-    // Isolation is decided the same way postSessionCliIpc decides it.
-    expect(relay).toContain('let isolated = !!process.env.BOTMUX_SEND_RELAY;');
-    expect(relay).toContain('try { loadDaemonIpcSecret(); } catch { isolated = true; }');
-    expect(relay).toContain('const deliveryIpcPort = isolated');
-    // Only the delivered message id + text cross: every correlation field is
-    // the daemon's to derive from the live session.
-    expect(relay).toContain("postSessionCliIpc(deliveryIpcPort, sid, 'turn-delivery', { messageId, content: text })");
-    expect(relay).toContain('if (deliveryIpcPort && currentTurnId && targetChatId === s.chatId)');
-    expect(relay).not.toContain('getSkillFeedbackStore');
-  });
-
-  it('returns after a concurrent final replay before any post-primary side effects', () => {
-    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
-    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
-    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
-    const replayReturn = cmdSend.indexOf('if (turnPrimaryReplayed) {');
-    const oncallDelivery = cmdSend.indexOf('if (oncallGroupCard && messageId)');
-
-    expect(replayReturn).toBeGreaterThan(cmdSend.indexOf('messageId = await dispatchPrimary'));
-    expect(replayReturn).toBeLessThan(oncallDelivery);
-    expect(cmdSend.slice(replayReturn, oncallDelivery)).toContain('replayed: true');
-    expect(cmdSend.slice(replayReturn, oncallDelivery)).toContain('return;');
+    expect(at('managedVcSendControlError(')).toBeLessThan(firstProviderEffect);
+    expect(at('managedVcSendPayloadError(')).toBeLessThan(firstProviderEffect);
+    expect(at('managedVcQuoteError(')).toBeLessThan(firstProviderEffect);
+    expect(at('managedVcCustomCardError(')).toBeLessThan(firstProviderEffect);
+    // The rendered payload is re-checked after card preparation, before uploads.
+    const payloadChecks = [...cmdSend.matchAll(/managedVcSendPayloadError\(/g)].map(m => m.index!);
+    expect(payloadChecks.length).toBeGreaterThanOrEqual(2);
+    const renderedCheck = payloadChecks[payloadChecks.length - 1]!;
+    expect(renderedCheck).toBeLessThan(at('await uploadImage(', renderedCheck));
   });
 });

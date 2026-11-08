@@ -6,7 +6,7 @@
  * file. That makes two properties worth pinning:
  *
  *   1. It reaches BOTH prompt paths. Claude-family adapters build their own
- *      system prompt; codex/gemini get an inline one. A block present in only
+ *      system prompt; codex/opencode get an inline one. A block present in only
  *      one is a silent hole in whichever CLI the operator happens to run.
  *   2. It says what not to do AND what to do instead. "Don't read those files"
  *      alone leaves an agent debugging an auth failure with no alternative —
@@ -86,6 +86,18 @@ describe('buildCredentialBoundaryBlock', () => {
   it('tells the agent what to do instead of hunting for credentials', () => {
     const zh = buildCredentialBoundaryBlock(policy, 'zh');
     expect(zh).toContain('/login');
+  });
+
+  it.each(['zh', 'en'] as const)('bundles only the planned task permissions after missing_scope in %s', locale => {
+    const prompt = buildCredentialBoundaryBlock({ ...policy, tools: ['lark-cli'] }, locale);
+    expect(prompt).not.toContain('base:field:read base:record:read');
+    // The contributor guide does not ship in the npm package, so the injected
+    // prompt must not point users at a path they cannot open.
+    expect(prompt).not.toContain('docs/guide/lark-device-authorization.md');
+    expect(prompt).toContain(locale === 'zh' ? '不要重跑普通 /login' : 'do not repeat ordinary /login');
+    expect(prompt).toContain(locale === 'zh' ? '一次合并所需权限' : 'request them together');
+    expect(prompt).toContain(locale === 'zh' ? '不申请无关或未经核实的权限' : 'never request unrelated or unverified scopes');
+    expect(prompt).toContain('botmux auth wait --request-id &lt;requestId&gt; --json');
   });
 
   it('covers forwarding, not just reading', () => {
@@ -221,7 +233,7 @@ describe('buildBotmuxSystemPromptText — claude-family path', () => {
  * covered.
  *
  * The claude-family assertions above go through buildBotmuxSystemPromptText.
- * codex/gemini/… never call it: they get the block inline, from
+ * codex/opencode/… never call it: they get the block inline, from
  * buildNewTopicPrompt. Until this suite existed, deleting the inline push left
  * every test green — and the inline CLIs then ran with no credential constraint
  * at all, which in a release with no kernel-level isolation is the whole

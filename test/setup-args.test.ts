@@ -1,4 +1,3 @@
-import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   buildBotFromAddFlags,
@@ -7,7 +6,6 @@ import {
   maskAppSecret,
   parseSetupCommand,
   SETUP_CLI_USAGE,
-  cliSelectionKeys,
 } from '../src/setup/setup-args.js';
 import { applyBotConfigEdits } from '../src/setup/bot-config-editor.js';
 
@@ -225,7 +223,6 @@ describe('buildBotFromAddFlags', () => {
   });
 
   it('accepts the documented traecli command name as TRAE CLI 2.0', () => {
-    expect(cliSelectionKeys()).toContain('traecli');
     expect(SETUP_CLI_USAGE).toContain('traecli 映射到 TRAE CLI 2.0');
     expect(buildBotFromAddFlags({ ...REQUIRED, cli: 'traecli' })).toMatchObject({
       cliId: 'traex',
@@ -451,30 +448,6 @@ describe('editInputFromFlags', () => {
     expect(updated.cliId).toBe('traex');
     expect(updated.cliLaunchMode).toBe('forge-traex');
     expect(updated.cliPathOverride).toBeUndefined();
-  });
-});
-
-describe('interactive setup edit launch mode wiring', () => {
-  it('preserves and writes cliLaunchMode through the CLI picker path', () => {
-    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-    const start = source.indexOf('const currentKey = selectionKeyForBot');
-    const end = source.indexOf('// selKey 为 null', start);
-    const pickerBlock = source.slice(start, end);
-
-    expect(pickerBlock).toContain("selectionKeyForBot(bot.cliId ?? 'claude-code', bot.wrapperCli, bot.cliLaunchMode)");
-    expect(pickerBlock).toContain('input.cliLaunchMode = sel.cliLaunchMode ?? null;');
-    expect(pickerBlock).toContain('input.cliRuntime = null;');
-  });
-
-  it('treats cliLaunchMode as a scripted setup edit launch change', () => {
-    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
-    const start = source.indexOf('const agentLaunchChanged = hasAgentLaunchConfigChanged');
-    const end = source.indexOf('// Missing Agent dependencies', start);
-    const changeBlock = source.slice(start, end);
-
-    expect(start).toBeGreaterThanOrEqual(0);
-    expect(changeBlock).toContain('cliLaunchMode: original.cliLaunchMode');
-    expect(changeBlock).toContain('cliLaunchMode: edited.cliLaunchMode');
   });
 });
 

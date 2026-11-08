@@ -24,6 +24,7 @@ import {
   type WorkbenchCapabilities,
 } from './agent-workbench-capabilities.js';
 import { larkHosts, normalizeBrand } from '../../im/lark/lark-hosts.js';
+import { deriveSessionTaskStatus, type NeedsYouReason } from '../../core/session-task-status.js';
 
 type UiListener = () => void;
 
@@ -51,6 +52,10 @@ class DashboardUiState {
   // Effective dashboard sharing policy. When enabled, tokenless visitors may
   // read allow-listed dashboard data; it does not downgrade authenticated users.
   publicReadOnly = false;
+  // 「终端」页（宿主 shell）只对本机 legacy 管理身份开放——比 `authed` 窄：带平台角色头
+  // 的协管者 authed 但不能拿宿主 shell（平台机器 Dashboard `m-` 反代不带角色头，那里进来
+  // 的机器主人和协管者就是 legacy 身份）。服务端 /api/settings 的 `hostTerminal` 写入，默认关。
+  hostTerminal = false;
   private listeners = new Set<UiListener>();
   private translate = createDashboardTranslator(this.locale);
   private mediaQuery: MediaQueryList | null = null;
@@ -278,6 +283,8 @@ export function chatAvatarHtml(opts: ChatAvatarOpts): string {
 // /api/groups 的注册表 + 群列表把 id 解析成人话。加载失败静默降级显示原值——
 // 纯展示增强，不挡核心功能。
 const botNameByAppId = new Map<string, string>();
+/** 注册表里出现过的全部 bot（含还没拿到友好名的），⌘K 按 app id 也要能直达。 */
+const registryBotAppIds = new Set<string>();
 const chatNameById = new Map<string, string>();
 const chatAvatarById = new Map<string, string>();
 let nameMapsPromise: Promise<void> | null = null;
@@ -333,7 +340,14 @@ export function overrideBotAvatar(larkAppId: string, name: string | undefined, u
   persistAvatarCache();
 }
 
-export function loadNameMaps(): Promise<void> {
+/** 名称 / 头像映射每次从服务端刷新成功就 +1；按会话行缓存展示文本的地方（⌘K 面板）据此失效。 */
+let nameMapsGeneration = 0;
+
+export function nameMapsVersion(): number {
+  return nameMapsGeneration;
+}
+
+export function loadNameMaps(options: { force?: boolean } = {}): Promise<void> {
   nameMapsPromise ??= (async () => {
     try {
       // 轻量视图：只要 bots 的名称/头像 + chats 的 chatId/name/avatar。完整矩阵
@@ -346,8 +360,15 @@ export function loadNameMaps(): Promise<void> {
       // 既有行为，不是本次引入的：bot 名称另有更快通路（/api/bots 每次刷新都带
       // botName，Bot 配置页优先用它），头像则由 overrideBotAvatar() 在改完后
       // 就地写内存+localStorage 生效，都不依赖本函数重跑。
-      const data = await fetchGroupsNamesSnapshot();
+      const data = await fetchGroupsNamesSnapshot(options.force ? { force: true } : {});
+      // localStorage 回灌的名字只是首屏占位：服务端这次没确认的（下线 bot、已删
+      // bot）一律丢掉，免得一个旧名永远盖过服务端按 appId 现查好的行内名字。
+      const confirmed = new Set((data.bots ?? []).map(b => String(b.larkAppId ?? '')).filter(Boolean));
+      for (const appId of [...botNameByAppId.keys()]) {
+        if (!confirmed.has(appId)) botNameByAppId.delete(appId);
+      }
       for (const b of data.bots ?? []) {
+        if (b.larkAppId) registryBotAppIds.add(String(b.larkAppId));
         if (b.larkAppId && b.botName && b.botName !== b.larkAppId) {
           botNameByAppId.set(b.larkAppId, String(b.botName));
         }
@@ -361,6 +382,7 @@ export function loadNameMaps(): Promise<void> {
         if (c.chatId && c.avatar) chatAvatarById.set(c.chatId, String(c.avatar));
       }
       persistAvatarCache(); // 刷新本地缓存，下次冷加载首屏即出头像
+      nameMapsGeneration += 1;
     } catch {
       // 失败不缓存（dashboard 刚启动 /api/groups 可能短暂 503）——
       // 清掉 memo，下一个页面 mount / strip 重绘再重试；期间显示原始 id。
@@ -370,9 +392,28 @@ export function loadNameMaps(): Promise<void> {
   return nameMapsPromise;
 }
 
+/**
+ * Bot 名册变了（SSE `bots.changed`：改名 / 增删 bot，daemon 每次刷新飞书名片后
+ * descriptor 的 botName 变化都会触发）→ 丢掉本页的名称映射 memo 并强制重拉，
+ * 让长时间开着的页面也在一个刷新周期内换成新名字，而不是等到下次整页加载。
+ */
+export function reloadNameMaps(): Promise<void> {
+  nameMapsPromise = null;
+  return loadNameMaps({ force: true });
+}
+
 /** 按 larkAppId 查注册表友好名（含 localStorage 回灌的缓存）；查不到返回 undefined。 */
 export function botNameForAppId(appId?: string): string | undefined {
   return appId ? botNameByAppId.get(appId) : undefined;
+}
+
+/**
+ * 已知的全部 bot（⌘K 面板的「机器人」条目）：有友好名的用友好名，注册表里还没友好名的以 app id 充当
+ * 名字。来自 loadNameMaps / 本地缓存回灌，所以首屏名称映射到达前可能只有缓存里的那部分。
+ */
+export function knownBots(): Array<{ larkAppId: string; name: string }> {
+  const appIds = new Set([...botNameByAppId.keys(), ...registryBotAppIds]);
+  return [...appIds].map(larkAppId => ({ larkAppId, name: botNameByAppId.get(larkAppId) ?? larkAppId }));
 }
 
 /** 会话所属 bot 的显示名：注册表友好名 → 会话自带 botName（非 id 时）→ id。 */
@@ -398,20 +439,32 @@ export function stripMentionPrefix(title: unknown): string {
   return out || raw;
 }
 
-/** 会话当前是否卡在等人，以及等什么（全局 strip 和工作台共用同一判定）。 */
+const NEEDS_YOU_REASON_KEYS: Record<NeedsYouReason, string> = {
+  attention: 'sessions.task.reasonAttention',
+  tui_prompt: 'sessions.task.reasonPrompt',
+  pending_repo: 'sessions.board.signalRepo',
+  limited: 'sessions.board.signalLimited',
+  stalled: 'sessions.board.signalStalled',
+  interrupted: 'sessions.task.reasonInterrupted',
+};
+
+/** 「需要你」的原因短语（等你拍板或回答 / 等你选 / 待选仓库 / … / 本轮中断）。 */
+export function needsYouReasonLabel(reason: NeedsYouReason): string {
+  return t(NEEDS_YOU_REASON_KEYS[reason]);
+}
+
+/** 会话当前是否卡在等人，以及等什么（全局 strip、工作台、看板共用会话任务状态）。 */
 export function attentionReason(s: Record<string, any>): string | null {
-  if (s.status === 'closed') return null;
-  if (s.agentAttention?.reason) return s.agentAttention.reason;
-  if (s.agentAttention) return t('sessions.board.signalAgent');
-  if (s.pendingRepo) return t('sessions.board.signalRepo');
-  if (s.tuiPromptActive) return t('sessions.board.signalPrompt');
-  if (s.status === 'limited') return t('sessions.board.signalLimited');
-  if (s.status === 'stalled') return t('sessions.board.signalStalled');
-  return null;
+  const status = deriveSessionTaskStatus(s);
+  if (status.kind !== 'needs_you') return null;
+  if (status.reason === 'attention') return status.detail ?? needsYouReasonLabel(status.reason);
+  const label = needsYouReasonLabel(status.reason);
+  return status.detail ? `${label} · ${status.detail}` : label;
 }
 
 export function attentionWaitSince(s: Record<string, any>): number {
-  const ms = Number(s.agentAttention?.at ?? s.lastMessageAt ?? 0);
+  const status = deriveSessionTaskStatus(s);
+  const ms = Number((status.kind === 'needs_you' ? status.at : undefined) ?? s.agentAttention?.at ?? s.lastMessageAt ?? 0);
   if (Number.isFinite(ms)) return ms;
   const fallback = Number(s.lastMessageAt ?? 0);
   return Number.isFinite(fallback) ? fallback : 0;

@@ -1,7 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
   parseDumpLayoutPanes,
-  parseDumpLayoutLeafPanes,
   parseListPanesJson,
   joinPanes,
 } from '../src/core/zellij-session-discovery.js';
@@ -120,71 +119,6 @@ describe('parseDumpLayoutPanes', () => {
     expect(p.command).toBe('my cli');
     expect(p.cwd).toBe('/p/a b');
     expect(p.args).toEqual(['--msg', 'say "hi"', 'back\\slash']);
-  });
-});
-
-// Real dump-layout (zellij 0.44.1) for an idle bare SHELL pane (terminal_0)
-// split with a CLI pane (terminal_1) — the exact shape Codex reproduced where
-// the command-only parser drops the shell and the positional join shifts the
-// CLI onto terminal_0. The leaf parser must keep the bare shell as a placeholder.
-const DUMP_LAYOUT_BARE_SHELL = `layout {
-    cwd "/"
-    tab name="Tab #1" hide_floating_panes=true {
-        pane size=1 borderless=true {
-            plugin location="zellij:tab-bar"
-        }
-        pane split_direction="vertical" {
-            pane cwd="home/u/work" size="50%"
-            pane command="/opt/claude" name="/opt/claude 300" cwd="tmp/projA" size="50%" {
-                args "300"
-                start_suspended true
-            }
-        }
-        pane size=1 borderless=true {
-            plugin location="zellij:status-bar"
-        }
-        floating_panes {
-            pane {
-                height 20
-                plugin location="zellij:about" {
-                    is_startup_tip "true"
-                }
-            }
-        }
-    }
-    new_tab_template {
-        pane
-    }
-}`;
-
-describe('parseDumpLayoutLeafPanes', () => {
-  it('keeps bare shell panes as placeholders so the positional join aligns', () => {
-    const leaves = parseDumpLayoutLeafPanes(DUMP_LAYOUT_BARE_SHELL);
-    // shell (bare) + claude (command) — NOT the plugins, container, or floating.
-    expect(leaves).toHaveLength(2);
-    expect(leaves[0]).toMatchObject({ command: undefined, cwd: '/home/u/work', args: [] });
-    expect(leaves[1]).toMatchObject({ command: '/opt/claude', cwd: '/tmp/projA', args: ['300'] });
-  });
-
-  it('aligns the CLI to the RIGHT pane id (terminal_1, not terminal_0)', () => {
-    const leaves = parseDumpLayoutLeafPanes(DUMP_LAYOUT_BARE_SHELL);
-    // list-panes for the same session: shell=terminal_0, claude=terminal_1
-    const terminals = parseListPanesJson(JSON.stringify([
-      { id: 0, is_plugin: false, is_floating: false, title: 'Pane #1' },
-      { id: 1, is_plugin: false, is_floating: false, title: '/opt/claude 300' },
-    ])).filter(p => !p.isPlugin && !p.isFloating);
-    expect(leaves.length).toBe(terminals.length); // count guard passes
-    // command leaf at index 1 ↔ terminals[1] = terminal_1 (the actual CLI pane)
-    const cmdIndex = leaves.findIndex(l => l.command);
-    expect(cmdIndex).toBe(1);
-    expect(terminals[cmdIndex]!.paneId).toBe('terminal_1');
-  });
-
-  it('excludes floating panes from the leaf set', () => {
-    const leaves = parseDumpLayoutLeafPanes(DUMP_LAYOUT_BARE_SHELL);
-    // the floating "about" plugin pane must not appear
-    expect(leaves.every(l => l.cwd !== undefined || l.command !== undefined)).toBe(true);
-    expect(leaves).toHaveLength(2);
   });
 });
 

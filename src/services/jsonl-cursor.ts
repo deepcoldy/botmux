@@ -156,12 +156,15 @@ export function baselineJsonlCursor(path: string): JsonlCursor {
 // Whole-window forward drain
 //
 // The `drain*Transcript` functions of the structured-bridge CLIs (claude /
-// codex / traex / cursor / antigravity / ebsd / omp / pi / grok) all open with
-// the same preamble: stat the file, decide what a shrunk file means, read
+// codex / traex / antigravity / ebsd / omp / pi / grok) all open with the same
+// preamble: stat the file, decide what a shrunk file means, read
 // `[start, size)` in one go, cut it at the last '\n' and walk the complete
 // lines with a running byte cursor. It lives here so the contract (byte-offset
 // frontier, partial tail, offset arithmetic for non-ASCII lines) has exactly
-// one implementation.
+// one implementation. Cursor is the exception: its mirror truncates and
+// rewrites a trailing status footer, so a stale offset can land inside a
+// multi-byte character — drainCursorTranscript walks raw 0x0a positions
+// instead of re-encoding decoded text.
 //
 // Deliberately kept apart from `scanJsonlFromOffset`: that scanner is chunked,
 // opens with O_NONBLOCK and fails closed to `null`; these drains read the

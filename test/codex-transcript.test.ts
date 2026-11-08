@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { shouldSuppressStructuredFallback, structuredFallbackKind, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, CODEX_TASK_FAILED_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, codexTaskFailureCode, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, isExactCodexOutputLimitError, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, codexCotEntriesFromResponseItem, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
@@ -59,6 +60,40 @@ function assistantMessageResponseItem(text: string, phase?: string, ts = '2026-0
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'codex-transcript-'));
   path = join(dir, 'rollout.jsonl');
+});
+
+describe('post-delivery provider failure notification', () => {
+  it.each([false, true])('keeps the delivered final after an empty 527 terminal (incremental=%s)', incremental => {
+    const start = Date.parse('2026-04-29T07:00:00.000Z');
+    const queue = new CodexBridgeQueue(() => start);
+    queue.mark('lark-delivered-turn', 'Run the probe', start);
+    writeFileSync(path, ev(userResponseItem('Run the probe')));
+    const first = incremental ? drainCodexRollout(path, 0) : undefined;
+    if (first) queue.ingest(first.events);
+    const delivered: BridgeSendMarker = {
+      sentAtMs: start + 1_000, messageId: 'om_success', responseKind: 'final',
+      turnId: 'lark-delivered-turn', terminalCarrier: 'standard_reply_card',
+    };
+    appendFileSync(path, ev({
+      timestamp: '2026-04-29T07:02:44.000Z', type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: 'native-provider-turn', last_agent_message: null,
+        error: { message: 'unexpected status 527: empty provider response',
+          codex_error_info: { http_connection_failed: { http_status_code: 527 } } } },
+    }));
+    queue.ingest(drainCodexRollout(path, first?.newOffset ?? 0, first?.state).events);
+    const [ready] = queue.drainEmittable();
+    expect(ready).toMatchObject({ turnId: 'lark-delivered-turn', finalText: '',
+      terminalStatus: 'failed', terminalErrorCode: CODEX_CONNECTION_ERROR_CODE });
+    const gate = { ...ready, markTimeMs: ready.markTimeMs, isLocal: ready.isLocal };
+    const kind = structuredFallbackKind(gate, undefined, [delivered], false, true);
+    // Default (experimental opt-in absent): the legacy failure notice is unchanged.
+    expect(shouldSuppressStructuredFallback(kind, gate, undefined, [delivered], false)).toBe(false);
+    expect(shouldSuppressStructuredFallback(kind, gate, undefined, [delivered], false, 'send', true)).toBe(true);
+    // Progress is not a final: the same real provider failure still reaches the user.
+    expect(shouldSuppressStructuredFallback(kind, gate, undefined,
+      [{ ...delivered, responseKind: 'progress' }], false, 'send', true)).toBe(false);
+    expect(ready.terminalStatus).toBe('failed');
+  });
 });
 
 describe('Codex environment updates in adopted turns', () => {

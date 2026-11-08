@@ -28,51 +28,68 @@
  *
  * 不从 worker-pool 导入，也不从 adapter 导入 worker-pool——避免循环依赖。
  */
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+import { shellQuote } from '../core/cli-launch-mode.js';
 import { isStandaloneBinary } from '../core/self-spawn.js';
 import { resolveNativeSubagentRuntimeHookWrapperPath } from '../core/botmux-wrapper.js';
+import { STATUSLINE_BUN_THREAD_ENV } from '../services/statusline-command.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+const require = createRequire(import.meta.url);
 
 /**
  * 一条 botmux 子命令的 argv 形式。
  *
  * 编译态：`[<binary>, ...subcommand]`——没有脚本路径这一项。
- * Node 态：`[<node>, <dist/cli.js>, ...subcommand]`。
+ * Bun 源码态：`[<bun>, <src/cli.ts>, ...subcommand]`。
+ * Node 编译态：`[<node>, <dist/cli.js>, ...subcommand]`。
  *
- * 单一出口：三个导出全部经由它，避免「同一个判据三份实现各自漂移」——
- * 本文件此前正是三处各拼一遍 `join(__dirname,'..','cli.js')`。
+ * 可注入 moduleUrl/runtime 让测试验证源码态与 dist 态路径，而不改全局 argv。
  */
-function botmuxInvocation(
+export function botmuxInvocation(
   subcommand: string[],
   standalone: boolean = isStandaloneBinary(),
+  moduleUrl: string = import.meta.url,
+  bunRuntime: boolean = 'Bun' in globalThis,
 ): { cmd: string; args: string[] } {
   if (standalone) {
     // process.execPath 是**真实磁盘路径**（编译态下也是），所以对别的进程有效。
     return { cmd: process.execPath, args: [...subcommand] };
   }
-  return { cmd: process.execPath, args: [join(__dirname, '..', 'cli.js'), ...subcommand] };
+  if (moduleUrl.endsWith('.ts')) {
+    const cli = fileURLToPath(new URL('../cli.ts', moduleUrl));
+    // `tsx src/index-daemon.ts` is also a supported source-mode daemon. A Node
+    // parent therefore must carry the loader into the hook child; Bun can run
+    // the TypeScript entry directly.
+    return bunRuntime
+      ? { cmd: process.execPath, args: [cli, ...subcommand] }
+      : { cmd: process.execPath, args: ['--import', require.resolve('tsx'), cli, ...subcommand] };
+  }
+  const moduleDir = dirname(fileURLToPath(moduleUrl));
+  return { cmd: process.execPath, args: [join(moduleDir, '..', 'cli.js'), ...subcommand] };
+}
+
+export function botmuxShellCommand(
+  subcommand: string[],
+  standalone: boolean = isStandaloneBinary(),
+  moduleUrl: string = import.meta.url,
+  bunRuntime: boolean = 'Bun' in globalThis,
+): string {
+  const { cmd, args } = botmuxInvocation(subcommand, standalone, moduleUrl, bunRuntime);
+  const prefix = [cmd, ...args.slice(0, args.length - subcommand.length)];
+  const suffix = subcommand.map(arg => /^[A-Za-z0-9_-]+$/.test(arg) ? arg : shellQuote(arg));
+  return [...prefix.map(shellQuote), ...suffix].join(' ');
 }
 
 /**
- * 把一条调用渲染成 **shell 命令字符串**：只给可执行路径与脚本路径加引号（容忍空格），
- * 子命令名与其参数不加引号。
+ * 把一条调用渲染成 **POSIX shell 命令字符串**。可执行文件和每个参数都独立引用，
+ * 使空格及 shell 元字符保持为字面值，同时保留 argv 边界。
  *
- * 用于「按 shell 字符串执行」的场景（Claude 家族的 settings.json `command` 字段）。
- * 需要 argv 的场景请用 `hookCommandParts`，切勿对本字符串再 `.split(' ')`。
+ * 用于 CLI 配置里的 shell command 字段；有 argv API 的调用方应直接用 hookCommandParts。
  */
 function renderShellCommand(cliId?: string, ...subcommand: string[]): string {
-  // 判一次形态两处用：`botmuxInvocation` 决定 argv 里有没有脚本路径，这里决定给不给
-  // 它加引号——两者必须看到同一个答案，各调一次 `isStandaloneBinary()` 只是让同一个
-  // 判据有两个求值点。
-  const standalone = isStandaloneBinary();
-  const { cmd, args } = botmuxInvocation(cliId === undefined ? subcommand : [...subcommand, cliId], standalone);
-  if (standalone) {
-    // 只有可执行路径需要引号；子命令是字面量 token。
-    return `"${cmd}" ${args.join(' ')}`;
-  }
-  return `"${cmd}" "${args[0]}" ${args.slice(1).join(' ')}`;
+  return botmuxShellCommand(cliId === undefined ? subcommand : [...subcommand, cliId]);
 }
 
 /**
@@ -103,6 +120,18 @@ export function hookCommandFor(cliId: string): string {
  */
 export function sessionReadyHookCommand(): string {
   return renderShellCommand(undefined, 'session-ready');
+}
+
+/**
+ * 构造 `botmux zcode-session-hook` 的 **argv 形式** `{ cmd, args }`。
+ *
+ * 与 `hookCommandParts`（`botmux hook <cliId>`，走 askUserQuestion 转发）不同，
+ * 这个子命令是 ZCode 的生命周期桥：只记录 native session id 与每轮提交回执，
+ * 不参与 ask。它必须按 argv 写入 ZCode 的 `hooks.events.*.hooks[]`
+ * （`{type:'process', command, args}`），因为 ZCode 直接 exec 数组、不过 shell。
+ */
+export function zcodeSessionHookCommandParts(): { cmd: string; args: string[] } {
+  return botmuxInvocation(['zcode-session-hook']);
 }
 
 /**
@@ -148,14 +177,52 @@ export function userPromptHookCommand(): string {
 }
 
 /**
- * 构造 Claude Code `statusLine.command` 的 shell 命令字符串 → `botmux statusline`。
- * 与 sessionReadyHookCommand 同策略，但写进**进程级** `--settings`（不写全局：全局只能
- * 有一个 statusLine，写进去会覆盖用户自己的；被 wrapperCli 剥掉时卡片省略即可）。
- * 子进程靠继承的 BOTMUX_SESSION_ID 定位落盘目录、靠 BOTMUX_STATUSLINE_CHAIN 转发
- * 用户原有的 statusline 命令；缺 env 时静默 exit 0。
+ * 构造 Claude Code `StopFailure` hook 的 shell 命令字符串 → `botmux __claude-stop-failure-v1`。
+ * 与 userPromptHookCommand 同策略写全局 settings.json。Claude 只在回合因 API 错误结束时
+ * 跑它（这条路径不跑 Stop hook），hook 子进程靠继承的 BOTMUX_SESSION_ID /
+ * BOTMUX_LARK_APP_ID 上报给本会话 worker，worker 在 transcript 没收口该回合时兜底。
+ * 缺 env / daemon 不可达时静默 exit 0；StopFailure 的输出与退出码 Claude 本就忽略。
+ * 子命令名带版本、`__` 前缀，与 `__turn-idle-v2` 同理：载荷形状变了就换名字，
+ * 新旧混装时旧 CLI 不认识新名字，一个请求都不发。
  */
-export function statuslineHookCommand(): string {
-  return renderShellCommand(undefined, 'statusline');
+export function claudeStopFailureHookCommand(): string {
+  return renderShellCommand(undefined, '__claude-stop-failure-v1');
+}
+
+/**
+ * 构造 Claude Code `statusLine.command` 的 shell 命令字符串。
+ * 写进**进程级** `--settings`（不写全局：全局只能有一个 statusLine，写进去会覆盖用户自己的；
+ * 被 wrapperCli 剥掉时卡片省略即可）。子进程靠继承的 BOTMUX_SESSION_ID 定位落盘目录、靠
+ * BOTMUX_STATUSLINE_CHAIN 转发用户原有的 statusline 命令；缺 env 时静默 exit 0。
+ *
+ * 与其它 hook 不同，这条命令每条 assistant 消息都会被调一次，所以走轻量形态：
+ *   - Node/Bun 态指向 `statusline-entry.{js,ts}`（只加载叶子模块），不经 cli.js；
+ *     编译态仍是 `<binary> statusline`，由 standalone-entry 在加载 cli.js 前分流。
+ *   - Bun 运行时（非 Windows）在命令前加 JSC 线程限制（STATUSLINE_BUN_THREAD_ENV）：
+ *     Bun 默认按核数开 GC marker 与并发 JIT 线程，64 核机器上一个短命进程就是几十个线程。
+ *     Node 不认这两个变量，所以只在 Bun 下加；Windows 的 shell 不支持 `A=b cmd` 前缀。
+ */
+export function statuslineHookCommand(
+  standalone: boolean = isStandaloneBinary(),
+  moduleUrl: string = import.meta.url,
+  bunRuntime: boolean = 'Bun' in globalThis,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  let parts: string[];
+  if (standalone) {
+    parts = [shellQuote(process.execPath), 'statusline'];
+  } else {
+    const entryUrl = new URL(moduleUrl.endsWith('.ts') ? '../statusline-entry.ts' : '../statusline-entry.js', moduleUrl);
+    const entry = fileURLToPath(entryUrl);
+    const runtime = moduleUrl.endsWith('.ts') && !bunRuntime
+      ? [process.execPath, '--import', require.resolve('tsx'), entry]
+      : [process.execPath, entry];
+    parts = runtime.map(shellQuote);
+  }
+  const envPrefix = bunRuntime && platform !== 'win32'
+    ? Object.entries(STATUSLINE_BUN_THREAD_ENV).map(([k, v]) => `${k}=${v}`)
+    : [];
+  return [...envPrefix, ...parts].join(' ');
 }
 
 /**

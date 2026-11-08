@@ -161,6 +161,14 @@ export type VcMeetingPushEventKind =
   | 'participant_meeting_joined';
 
 export interface VcMeetingPushContext {
+  /** Only extracted from the native bot invitation event; app-scoped human identity. */
+  inviter?: { openId: string; invitedAt?: number };
+  /** Shape/status only: never log the invitation payload or personal identifiers. */
+  invitationDiagnostics?: {
+    inviterStatus: 'resolved' | 'missing_inviter' | 'invalid_user_type' | 'missing_open_id' | 'invalid_open_id';
+    inviterIdShape: 'string' | 'object' | 'missing' | 'other';
+    inviteTimeStatus: 'valid' | 'missing' | 'invalid';
+  };
   larkAppId: string;
   kind: VcMeetingPushEventKind;
   eventType: string;

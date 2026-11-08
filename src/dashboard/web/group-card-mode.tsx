@@ -5,6 +5,8 @@ type Props = {
   chatId: string;
   appId: string;
   botName: string;
+  /** 可见标题；按 bot 分栏展示时传设置名，缺省显示 botName。 */
+  label?: string;
   /** Chat override: false == in-chat `/card off`; true inherits the bot-level setting. */
   chatEnabled: boolean;
   /** Bot-level run-process card switch (`!disableStreamingCard`). */
@@ -77,7 +79,7 @@ export function GroupCardModeRow(props: Props) {
         aria-label={tr('groups.cardModeToggle', { bot: props.botName })}
         onChange={event => { void save(event.currentTarget.checked); }} />
       <span className="switch" aria-hidden="true" />
-      <span className="toggle-tx"><strong>{props.botName}</strong></span>
+      <span className="toggle-tx"><strong>{props.label ?? props.botName}</strong></span>
     </label>
     <small className={state === 'inherit-off' ? 'hint-warn-inline' : undefined} data-card-mode-state={state}>{detail}</small>
     <small role="status" aria-live="polite">{status}</small>

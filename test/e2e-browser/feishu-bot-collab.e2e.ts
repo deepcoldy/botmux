@@ -14,23 +14,16 @@
 import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
-import { existsSync } from 'node:fs';
 import {
-  createBrowser,
-  createPage,
-  createAgent,
-  checkPrerequisites,
-  STORAGE_STATE_PATH,
   testMessage,
   sendMentionMessage,
-  navigateToMessenger,
   openGroupChat,
   getGroupChatName,
   scrollThreadToBottom,
   waitForStreamingCard,
   waitForModelTextReply,
-  closeSession,
 } from './helpers.js';
+import { openFeishuSession, releaseFeishuSession } from './feishu-session.js';
 
 export function registerMidsceneSuites(): void {
   describe('bot-to-bot collaboration (@Aiden ↔ @CoCo)', () => {
@@ -40,28 +33,11 @@ export function registerMidsceneSuites(): void {
     let agent: PlaywrightAgent;
 
     beforeAll(async () => {
-      checkPrerequisites();
-      if (!existsSync(STORAGE_STATE_PATH)) {
-        throw new Error(
-          'storageState.json not found. Run: pnpm test:e2e-browser:setup',
-        );
-      }
-      browser = await createBrowser();
-      ({ context, page } = await createPage(browser));
-      agent = createAgent(page);
-
-      await navigateToMessenger(page);
-      await openGroupChat(page, agent, getGroupChatName());
+      ({ browser, context, page, agent } = await openFeishuSession((p, a) => openGroupChat(p, a, getGroupChatName())));
     });
 
     afterAll(async () => {
-      // Try to close any open sessions
-      try {
-        await closeSession(agent, page);
-      } catch { /* ignore */ }
-      await agent?.destroy();
-      await context?.close();
-      await browser?.close();
+      await releaseFeishuSession({ browser, context, page, agent }, { closeBotSession: true, publishVideo: false });
     });
 
     it('Aiden and CoCo collaborate with 3+ rounds of back-and-forth', async () => {

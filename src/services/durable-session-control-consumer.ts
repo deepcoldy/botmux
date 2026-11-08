@@ -5,9 +5,10 @@ import {
   type InboxClaim,
 } from './durable-coordination.js';
 import {
-  parseDurableLarkSessionControlClaim,
+  parseDurableSessionControlClaim,
   type DurableLarkSessionControlClaim,
 } from './durable-lark-session-control.js';
+import { DurableSessionControlOwnerHandoffError } from './durable-session-control-errors.js';
 
 export type DurableSessionControlDispatchResult =
   | { kind: 'settled' }
@@ -37,6 +38,17 @@ export interface DurableSessionControlConsumerOptions {
   leaseDurationMs?: number;
   renewalIntervalMs?: number;
   retryDelayMs?: number;
+  /** Fast requeue used only when a prefix failover raced the exact owner. */
+  ownerHandoffRetryDelayMs?: number;
+  /**
+   * Per-control claim budget. undefined (the default, and the answer for
+   * lifecycle controls) keeps retrying until the control settles; a number
+   * settles the control as ignored once that many claims have failed, so a
+   * best-effort control cannot block its partition's FIFO forever.
+   */
+  maxAttemptsFor?(control: DurableLarkSessionControlClaim): number | undefined;
+  /** Give an exact local owner time to claim before cluster-prefix failover. */
+  fallbackClaimIntervalMs?: number;
   concurrency?: number;
   batchSize?: number;
   shutdownMs?: number;
@@ -133,6 +145,18 @@ export function startDurableSessionControlConsumer(
     leaseDurationMs - 1,
   );
   const retryDelayMs = boundedInteger(options.retryDelayMs ?? 5_000, 'retryDelayMs', 100, 3_600_000);
+  const ownerHandoffRetryDelayMs = boundedInteger(
+    options.ownerHandoffRetryDelayMs ?? 100,
+    'ownerHandoffRetryDelayMs',
+    10,
+    5_000,
+  );
+  const fallbackClaimIntervalMs = boundedInteger(
+    options.fallbackClaimIntervalMs ?? 1_000,
+    'fallbackClaimIntervalMs',
+    0,
+    60_000,
+  );
   const concurrency = boundedInteger(options.concurrency ?? 4, 'concurrency', 1, 32);
   const batchSize = boundedInteger(options.batchSize ?? 32, 'batchSize', 1, 1_000);
   const shutdownMs = boundedInteger(options.shutdownMs ?? 5_000, 'shutdownMs', 0, 300_000);
@@ -148,6 +172,7 @@ export function startDurableSessionControlConsumer(
   let timer: NodeJS.Timeout | undefined;
   let stopPromise: Promise<DurableSessionControlConsumerStopResult> | undefined;
   let partitionCursor = 0;
+  let lastFallbackClaimAt = now();
 
   const reportError = (error: unknown): void => {
     try { options.onError?.(error); } catch { /* observers cannot alter claim state */ }
@@ -202,7 +227,7 @@ export function startDurableSessionControlConsumer(
 
     let control: DurableLarkSessionControlClaim | undefined;
     try {
-      control = parseDurableLarkSessionControlClaim(claim);
+      control = parseDurableSessionControlClaim(claim);
       const result = await options.dispatch(control, { claim, signal: controller.signal });
       clearInterval(renewalTimer);
       if (renewing) await renewing;
@@ -225,9 +250,30 @@ export function startDurableSessionControlConsumer(
       if (renewing) await renewing;
       if (ownershipLost || controller.signal.aborted) return;
       reportError(error);
+      const maxAttempts = control ? options.maxAttemptsFor?.(control) : undefined;
+      if (control && maxAttempts !== undefined && claim.attempts >= maxAttempts) {
+        const completed = await options.store.completeInboxClaim(claim);
+        if (completed.kind === 'stale') {
+          reportError(new Error(`durable session control retry limit lost ${claim.event.eventId}`));
+          return;
+        }
+        reportError(new Error(
+          `durable session control retry limit reached for ${claim.event.eventId} after ${claim.attempts} attempts`,
+        ));
+        try {
+          options.onSettled?.({
+            control,
+            result: { kind: 'ignored', reason: 'durable session control retry limit reached' },
+          });
+        } catch (observerError) { reportError(observerError); }
+        return;
+      }
+      const delayMs = error instanceof DurableSessionControlOwnerHandoffError
+        ? ownerHandoffRetryDelayMs
+        : retryDelayMs;
       const retried = await options.store.retryInboxClaim({
         claim,
-        visibleAt: now() + retryDelayMs,
+        visibleAt: now() + delayMs,
       });
       if (retried.kind === 'stale') {
         reportError(new Error(`durable session control retry lost ${claim.event.eventId}`));
@@ -252,7 +298,11 @@ export function startDurableSessionControlConsumer(
             leaseDurationMs,
           });
         }
-        if (!claim && partitionKeyPrefix) {
+        if (!claim && partitionKeyPrefix
+            && now() - lastFallbackClaimAt >= fallbackClaimIntervalMs) {
+          // Prefix fallback is a failover path, not an equal-priority race with
+          // the exact owner. Only one slot probes it per interval.
+          lastFallbackClaimAt = now();
           claim = await options.store.claimNextInbox({
             workerId: slotWorkerId,
             lane: DURABLE_INBOX_LANE_SESSION_CONTROL,

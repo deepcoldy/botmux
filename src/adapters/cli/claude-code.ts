@@ -23,7 +23,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { shellQuote } from '../../core/cli-launch-mode.js';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
-import { sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
+import { claudeStopFailureHookCommand, sessionReadyHookCommand, statuslineHookCommand, userPromptHookCommand } from '../hook-command.js';
 import type { CliAdapter, CliId, PtyHandle } from './types.js';
 import { findJsonlContainingFingerprint, jsonlContainsFingerprint, normaliseForFingerprint } from '../../services/claude-transcript.js';
 import { CLAUDE_REASONING_EFFORTS } from '../../services/codex-reasoning-effort.js';
@@ -32,6 +32,8 @@ import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import { wrapBracketedPaste } from './tui-input.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
+import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
+import { decideStartupSwitchConfirm } from '../../utils/claude-switch-confirm.js';
 
 /** Resolve cwd to its canonical (symlink-free) absolute path for project-hash
  *  computation. Claude Code itself runs `process.cwd()` which the kernel returns
@@ -99,8 +101,11 @@ export function claudeJsonlPathForSession(sessionId: string, cwd: string, dataDi
  *  exact slug path when it exists (normal case), the unique glob hit for long
  *  slugs, or null when absent/ambiguous. */
 export function resolveClaudeJsonlPath(sessionId: string, cwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): string | null {
+  const isFile = (path: string): boolean => {
+    try { return statSync(path).isFile(); } catch { return false; }
+  };
   const exact = claudeJsonlPathForSession(sessionId, cwd, dataDir);
-  if (existsSync(exact)) return exact;
+  if (isFile(exact)) return exact;
   const projectHash = realpathCwd(cwd).replace(/[^A-Za-z0-9-]/g, '-');
   if (projectHash.length <= 200) return null;
   const projectsDir = join(dataDir, 'projects');
@@ -111,7 +116,7 @@ export function resolveClaudeJsonlPath(sessionId: string, cwd: string, dataDir: 
   const hits = entries
     .filter(name => name === projectHash || name.startsWith(`${prefix}-`))
     .map(name => join(projectsDir, name, target))
-    .filter(p => existsSync(p));
+    .filter(isFile);
   return hits.length === 1 ? hits[0]! : null;
 }
 
@@ -412,11 +417,11 @@ function currentFileSize(path: string): number {
   try { return statSync(path).size; } catch { return 0; }
 }
 
-function deltaHasSubmit(path: string, fromByte: number): boolean {
-  if (!existsSync(path)) return false;
+function readDeltaText(path: string, fromByte: number): string | undefined {
+  if (!existsSync(path)) return undefined;
   let size: number;
-  try { size = statSync(path).size; } catch { return false; }
-  if (size <= fromByte) return false;
+  try { size = statSync(path).size; } catch { return undefined; }
+  if (size <= fromByte) return undefined;
   const len = size - fromByte;
   const buf = Buffer.alloc(len);
   const fd = openSync(path, 'r');
@@ -425,8 +430,24 @@ function deltaHasSubmit(path: string, fromByte: number): boolean {
   } finally {
     closeSync(fd);
   }
-  const text = buf.toString('utf8');
-  return SUBMIT_MARKERS.some(m => text.includes(m));
+  return buf.toString('utf8');
+}
+
+function deltaHasSubmit(path: string, fromByte: number): boolean {
+  const text = readDeltaText(path, fromByte);
+  return !!text && SUBMIT_MARKERS.some(m => text.includes(m));
+}
+
+/** Transcript marker of an executed slash command. Claude Code records every
+ *  command it runs as a user line carrying `<command-name>/name</command-name>`:
+ *  local commands (`/effort`, `/model`, `/rename`, `/clear`…) together with
+ *  their `<local-command-stdout>`, prompt commands as the submitted message.
+ *  A line left in the composer (its Enter coalesced into a paste burst) or
+ *  still buffered by a CLI that is not reading input yet records nothing. */
+export function claudeCommandRecordMarker(commandLine: string): string | undefined {
+  const name = commandLine.trim().split(/\s+/, 1)[0] ?? '';
+  if (!/^\/[\w:.-]+$/.test(name)) return undefined;
+  return `<command-name>${name}</command-name>`;
 }
 
 async function waitForSubmit(path: string, baseByte: number, timeoutMs: number): Promise<boolean> {
@@ -478,6 +499,7 @@ const BOTMUX_ENVELOPE_TAGS = new Set([
   'role',
   'summary_memory',
   'botmux_reminder',
+  'botmux_formatting',
   'whiteboard',
   'chat_context_policy',
   'chat_context',
@@ -616,7 +638,9 @@ export function makeSubmitFingerprint(content: string, len = 30): string | undef
  *  `sessionId` even though it rotates the on-disk jsonl. Callers that
  *  rely on this for rotation tracking must therefore treat a "matching
  *  sessionId" answer as "no spawn-time rotation observed", not "no
- *  rotation at all" — the latter requires fingerprint corroboration. */
+ *  rotation at all" — the latter requires fingerprint corroboration.
+ *  Claude Code 2.1.305/2.1.306 rewrite `sessionId` on `/clear` as well
+ *  (observed 2026-10-22: the record named the post-clear transcript). */
 export function claudePidStatePath(pid: number, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): string {
   return join(dataDir, 'sessions', `${pid}.json`);
 }
@@ -639,6 +663,53 @@ function readProcStarttime(pid: number): string | null {
   }
 }
 
+/** Re-read delays for a pid-state record caught mid-rewrite. Claude rewrites
+ *  the record in place — never through a rename — on every state change,
+ *  including the busy→idle edge the worker judges a finished turn on:
+ *    - the native build opens it without O_TRUNC, writes, then ftruncates
+ *      (strace, 2.1.309): a record that shrinks reads as the new JSON followed
+ *      by the old record's tail until the ftruncate lands;
+ *    - a writer that truncates first (Node's writeFileSync: O_TRUNC → write)
+ *      leaves it empty until the write lands.
+ *  Either window lies between two consecutive syscalls of the writer and stays
+ *  open only while it waits to be scheduled again; 45ms of re-reads outlasts
+ *  that on a loaded host. Read once, such a record made the unread-turn check
+ *  tell the group a reply was lost that the next bridge tick delivered. */
+const PID_STATE_REREAD_DELAYS_MS = [5, 15, 25];
+
+function sleepSyncMs(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+let pidStateRereadSleepFn: (ms: number) => void = sleepSyncMs;
+
+/** Test seam: the re-reads sleep SYNCHRONOUSLY, so a test cannot finish the
+ *  rewrite from a timer; it passes a sleep that does. Pass null to restore the
+ *  real sleep. */
+export function setClaudePidStateRereadSleepForTests(fn: ((ms: number) => void) | null): void {
+  pidStateRereadSleepFn = fn ?? sleepSyncMs;
+}
+
+/** The parsed pid-state record; undefined when there is none or it never
+ *  parses. Only a record that exists but does not parse is re-read: a missing
+ *  one is the common answer for a pid that is not Claude, polled every tick. */
+function readClaudePidState(path: string): unknown {
+  for (let attempt = 0; ; attempt++) {
+    let text: string;
+    try {
+      text = readFileSync(path, 'utf8');
+    } catch {
+      return undefined;
+    }
+    try {
+      return JSON.parse(text);
+    } catch {
+      if (attempt >= PID_STATE_REREAD_DELAYS_MS.length) return undefined;
+      pidStateRereadSleepFn(PID_STATE_REREAD_DELAYS_MS[attempt]!);
+    }
+  }
+}
+
 /** Resolve Claude Code's authoritative current session id via
  *  ~/.claude/sessions/<pid>.json. Validates pid + sessionId UUID + cwd so a
  *  stale or unrelated pid file can't redirect us to the wrong jsonl. On Linux
@@ -647,12 +718,7 @@ function readProcStarttime(pid: number): string | null {
  *  fall back to fingerprint detection. */
 export function resolveJsonlFromPid(pid: number, expectedCwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): { path: string; cliSessionId: string } | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
-  let parsed: any;
-  try {
-    parsed = JSON.parse(readFileSync(claudePidStatePath(pid, dataDir), 'utf8'));
-  } catch {
-    return null;
-  }
+  const parsed: any = readClaudePidState(claudePidStatePath(pid, dataDir));
   if (!parsed || typeof parsed !== 'object') return null;
   if (parsed.pid !== pid) return null;
   if (typeof parsed.sessionId !== 'string' || !SESSION_UUID_RE.test(parsed.sessionId)) return null;
@@ -677,10 +743,11 @@ export function resolveJsonlFromPid(pid: number, expectedCwd: string, dataDir: s
     }
   }
   if (!procStartVerified && realpathCwd(parsed.cwd) !== realpathCwd(expectedCwd)) return null;
-  return {
-    path: claudeJsonlPathForSession(parsed.sessionId, parsed.cwd, dataDir),
-    cliSessionId: parsed.sessionId,
-  };
+  // An in-session cwd change updates the pid record, not the transcript's original bucket.
+  const path = resolveClaudeJsonlPath(parsed.sessionId, parsed.cwd, dataDir)
+    ?? resolveClaudeJsonlPath(parsed.sessionId, expectedCwd, dataDir)
+    ?? claudeJsonlPathForSession(parsed.sessionId, parsed.cwd, dataDir);
+  return { path, cliSessionId: parsed.sessionId };
 }
 
 /** Linux-only: probe `/proc/<pid>/fd` for any signal that reveals Claude's
@@ -1106,6 +1173,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         // projectDir means no resume target could possibly exist — Claude
         // writes `<sid>.jsonl` there on first submit and never moves it.
         if (!existsSync(dirname(p))) return false;
+        // No CLI-native id was ever recorded, so the only resumable transcript
+        // is the botmux id's own, which Claude writes on the first submit. Its
+        // absence means a launch that died before any turn landed; `--resume`
+        // would only exit with "No conversation found".
+        if (!cliSessionId) return false;
         // Project dir exists but this specific sid doesn't. Could be a
         // mid-session rotation the adapter's pid resolver would catch — don't
         // block, let spawn try; the secondary guard still covers it.
@@ -1132,7 +1204,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, promptInjection }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, larkToolAppId, settingsEnv, settingsFilePath, replyDelivery, solo, promptInjection, promptCacheTtl }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -1209,6 +1281,12 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       if (variant.id === 'claude-code') {
         inlineSettings.statusLine = { type: 'command', command: statuslineHookCommand(), refreshInterval: 60 };
       }
+      // Prompt-cache lifetime (bots.json / config.json `promptCache.ttl`). Through a
+      // gateway Claude Code treats itself as an API-key client and asks for 5m;
+      // `promptCacheTtl` makes it request the lifetime the operator chose.
+      if (variant.id === 'claude-code' && promptCacheTtl) {
+        inlineSettings.promptCacheTtl = promptCacheTtl;
+      }
       // claude-code 恒传 --settings（statusLine 总在）；其它 variant 仅在有内容（bypass
       // 键 / env）时才传，disableCliBypass 且无 env 下没东西可传就不传。
       // （读隔离由 worker 的整进程 Seatbelt wrapper 强制，这里不注入任何 sandbox 设置——
@@ -1240,18 +1318,49 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // Keeps them out of the user's global ~/.claude/skills so a standalone
       // `claude` never surfaces/mis-fires `botmux send` etc.
       if (promptInjection === 'none') return args;
-      args.push('--plugin-dir', CLAUDE_PLUGIN_DIR);
+      args.push('--plugin-dir', builtinPluginDirForSession(CLAUDE_PLUGIN_DIR));
       if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
       // replyDelivery=transcript：系统提示改口为「最终回复由 botmux 自动转发」。v3 workflow
       // 子会话（GOAL_ENV.V3_MARKER）的收口靠 botmux send，强制保持 send 措辞。
       const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, larkToolAppId, replyDelivery: effectiveReplyDelivery, solo }));
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, larkToolAppId, replyDelivery: effectiveReplyDelivery, solo, cliId: 'claude-code' }));
       return args;
     },
 
     injectsSessionContext: true,
 
+    commandExecutionProbe(pty, commandLine) {
+      const marker = claudeCommandRecordMarker(commandLine);
+      if (!marker) return undefined;
+      const resolvePath = (): string | undefined => {
+        if (pty.cliPid && pty.cliCwd) {
+          const resolved = resolveJsonlFromPid(pty.cliPid, pty.cliCwd, variant.dataDir);
+          if (resolved) return resolved.path;
+        }
+        return pty.claudeJsonlPath;
+      };
+      const path = resolvePath();
+      if (!path) return undefined;
+      const baseByte = currentFileSize(path);
+      return () => {
+        if (readDeltaText(path, baseByte)?.includes(marker)) return true;
+        // `/clear` & co. move Claude onto a new transcript and record the
+        // command there; that file did not exist at baseline time.
+        const current = resolvePath();
+        return !!current && current !== path && !!readDeltaText(current, 0)?.includes(marker);
+      };
+    },
+
+    // `/effort <level>` / `/model <name>` replayed into a resumed conversation
+    // whose prompt cache may still be warm: Claude asks before re-reading the
+    // history, and records the command only once that is answered.
+    startupCommandConfirmation: decideStartupSwitchConfirm,
+
     async writeInput(pty, content) {
+      // HERDR advertises an explicit bracketed-paste frame: send the complete
+      // payload once so newlines stay literal rather than depending on per-line
+      // backslash + Enter behavior. Keep the existing JSONL receipt gate below.
+      // Other keyed transports retain their established typing strategy:
       // Type content like a human: literal text via send-keys -l, and each
       // newline replaced by `\` + Enter (Claude Code's documented soft-newline
       // idiom — keeps content in the input box without submitting). The final
@@ -1290,12 +1399,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
 
       const sendSubmit = (): boolean => {
         if (pty.sendSpecialKeys && keybindings.submitKeys) {
-          pty.sendSpecialKeys(...keybindings.submitKeys);
-          return true;
+          return pty.sendSpecialKeys(...keybindings.submitKeys) !== false;
         }
         if (!pty.sendSpecialKeys && keybindings.rawSubmitSequence) {
-          pty.write(keybindings.rawSubmitSequence);
-          return true;
+          return pty.write(keybindings.rawSubmitSequence) !== false;
         }
         return false;
       };
@@ -1333,6 +1440,35 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
           : { submitted };
         return failureReason ? { ...result, failureReason } : result;
       };
+      const recheck = (): boolean => {
+        if (!submitFingerprint) return false;
+        // Latest pid → path; covers post-failure rotations (/clear, /resume).
+        if (pty.cliPid && pty.cliCwd) {
+          const resolved = resolveJsonlFromPid(pty.cliPid, pty.cliCwd, variant.dataDir);
+          if (resolved) applyResolved(resolved);
+        }
+        const currentPath = pty.claudeJsonlPath;
+        if (currentPath && jsonlContainsFingerprint(currentPath, submitFingerprint, {
+          includeQueueOperations: true,
+          minEventTimestampMs: submitSearchMinMtime,
+        })) {
+          return true;
+        }
+        // Fan out to sibling jsonls in the project dir, then across every
+        // sibling project dir under `~/.claude/projects/` (catches workingDir
+        // drift like worker thinking `-foo-bar/` while Claude actually appends
+        // to `-foo-bar-baz/`). Same minMtime guard as the in-band fingerprint
+        // fallback so a stale historical match can't suppress the warning.
+        const searchPath = currentPath ?? pty.claudeJsonlPath;
+        if (!searchPath) return false;
+        const matched = findJsonlAcrossProjectsRoot(searchPath, submitFingerprint, {
+          minMtimeMs: submitSearchMinMtime,
+          minEventTimestampMs: submitSearchMinMtime,
+          includeQueueOperations: true,
+        });
+        return !!matched;
+      };
+      const unconfirmed = () => ({ ...buildResult(false), recheck });
       const submitKeySupportedByBackend = pty.sendSpecialKeys
         ? !!keybindings.submitKeys
         : !!keybindings.rawSubmitSequence;
@@ -1340,12 +1476,14 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         return buildResult(false, keybindings.failureReason ?? UNSUPPORTED_SUBMIT_KEY_FAILURE);
       }
 
-      if (pty.sendText && pty.sendSpecialKeys) {
+      if (pty.sendBracketedPaste) {
+        if (pty.sendBracketedPaste(sanitizedContent) === false) return unconfirmed();
+      } else if (pty.sendText && pty.sendSpecialKeys) {
         const lines = sanitizedContent.split('\n');
         for (let i = 0; i < lines.length; i++) {
           if (lines[i].length > 0) {
             for (const chunk of chunkTextByUtf8Bytes(lines[i])) {
-              pty.sendText(chunk);
+              if (pty.sendText(chunk) === false) return unconfirmed();
               await tick();
             }
           }
@@ -1353,21 +1491,21 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
             if (!keybindings.enterIsNewline) {
               // Soft-newline: backslash + Enter inserts a newline in Claude
               // Code's input box without submitting.
-              pty.sendText('\\');
+              if (pty.sendText('\\') === false) return unconfirmed();
               await tick();
             }
-            pty.sendSpecialKeys('Enter');
+            if (pty.sendSpecialKeys('Enter') === false) return unconfirmed();
             await tick();
           }
         }
       } else {
         // Non-tmux fallback (raw PTY): bracketed paste is reliable here since
         // we control the markers directly.
-        pty.write(wrapBracketedPaste(sanitizedContent));
+        if (pty.write(wrapBracketedPaste(sanitizedContent)) === false) return unconfirmed();
       }
       await delay(submitDelay);
       if (!sendSubmit()) {
-        return buildResult(false, keybindings.failureReason ?? UNSUPPORTED_SUBMIT_KEY_FAILURE);
+        return unconfirmed();
       }
 
       // Without a JSONL path we can't verify — trust the fixed delay and return.
@@ -1492,35 +1630,29 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // UserPromptSubmit / SessionStart hook (e.g. superpowers) defers Claude's
       // jsonl append by 5–15s. The worker calls recheck() after a delay, and
       // suppresses the user-facing warning when the line shows up by then.
-      const recheck = (): boolean => {
-        if (!submitFingerprint) return false;
-        // Latest pid → path; covers post-failure rotations (/clear, /resume).
-        if (pty.cliPid && pty.cliCwd) {
-          const resolved = resolveJsonlFromPid(pty.cliPid, pty.cliCwd, variant.dataDir);
-          if (resolved) applyResolved(resolved);
-        }
-        const currentPath = pty.claudeJsonlPath;
-        if (currentPath && jsonlContainsFingerprint(currentPath, submitFingerprint, {
-          includeQueueOperations: true,
-          minEventTimestampMs: submitSearchMinMtime,
-        })) {
-          return true;
-        }
-        // Fan out to sibling jsonls in the project dir, then across every
-        // sibling project dir under `~/.claude/projects/` (catches workingDir
-        // drift like worker thinking `-foo-bar/` while Claude actually appends
-        // to `-foo-bar-baz/`). Same minMtime guard as the in-band fingerprint
-        // fallback so a stale historical match can't suppress the warning.
-        const searchPath = currentPath ?? pty.claudeJsonlPath;
-        if (!searchPath) return false;
-        const matched = findJsonlAcrossProjectsRoot(searchPath, submitFingerprint, {
-          minMtimeMs: submitSearchMinMtime,
-          minEventTimestampMs: submitSearchMinMtime,
-          includeQueueOperations: true,
-        });
-        return !!matched;
-      };
       return { ...buildResult(false), recheck };
+    },
+
+    // One-shot re-submit for a draft parked in the composer (the cold-start
+    // late-SessionStart rescue in scheduleSubmitFailureNotify). Uses the SAME
+    // submit-key resolution as writeInput: with a remapped submit
+    // (keybindings.json / CLAUDE_CODE_SUBMIT_KEY, Enter possibly bound to
+    // chat:newline) plain Enter would only insert a newline and strand the
+    // draft again. False means no terminal-sendable submit key or an
+    // unconfirmed backend send — the caller must not guess with another key.
+    pressComposerSubmit(pty) {
+      const keybindings = resolveClaudeChatKeybindings(join(variant.dataDir, 'keybindings.json'));
+      try {
+        if (pty.sendSpecialKeys && keybindings.submitKeys) {
+          return pty.sendSpecialKeys(...keybindings.submitKeys) !== false;
+        }
+        if (!pty.sendSpecialKeys && keybindings.rawSubmitSequence) {
+          return pty.write(keybindings.rawSubmitSequence) !== false;
+        }
+      } catch {
+        return false;
+      }
+      return false;
     },
 
     completionPattern: COMPLETION_RE,
@@ -1589,6 +1721,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // variant 不装（supportsInvisiblePromptHook 也只对 claude-code 为 true，
       // 装了也是每轮空跑一个子进程）。
       userPromptSubmitCommand: variant.id === 'claude-code' ? userPromptHookCommand() : undefined,
+      // StopFailure 兜底（API 错误结束的回合不跑 Stop hook，transcript 跟丢时没人收口）：
+      // 同样写全局 settings.json。只给 claude-code：该事件在 Claude Code 2.1.x 实测存在，
+      // seed/relay 等共享 adapter 的 variant 未验证。
+      stopFailureCommand: variant.id === 'claude-code' ? claudeStopFailureHookCommand() : undefined,
     },
     // Claude Code 把 UserPromptSubmit 的 additionalContext 注入为不可见的
     // system-reminder（TUI transcript 不可见，仅落 JSONL）。codex 会渲染成可见的

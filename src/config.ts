@@ -1,5 +1,6 @@
 import { networkInterfaces } from 'node:os';
 import type { BackendType } from './adapters/backend/types.js';
+import { normalizeHerdrBackendConfig } from './adapters/backend/types.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { resolveWorkerHttpHost } from './utils/worker-http.js';
 import {
@@ -296,6 +297,14 @@ export const config = {
     forwardFollowupWaitMs: resolveForwardFollowupWaitMs(),
     workingDir: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean)[0] || '~',
     workingDirs: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean),
+    herdr: normalizeHerdrBackendConfig({
+      sessionName: process.env.BOTMUX_HERDR_SESSION_NAME,
+      placement: process.env.BOTMUX_HERDR_PLACEMENT,
+      workspace: process.env.BOTMUX_HERDR_WORKSPACE,
+      tab: process.env.BOTMUX_HERDR_TAB,
+      splitDirection: process.env.BOTMUX_HERDR_SPLIT_DIRECTION,
+      chatTypes: process.env.BOTMUX_HERDR_CHAT_TYPES,
+    }),
   },
   web: {
     host: process.env.WEB_HOST ?? '0.0.0.0',
@@ -391,8 +400,8 @@ export const config = {
   get chatBotDiscovery() { return resolveChatBotDiscoveryConfig(); },
   // Live getter (like chatBotDiscovery): re-reads the experimental global toggle
   // so a Settings change enables/disables RPC input mode for new codex-family
-  // sessions without a daemon restart. The daemon ORs this with each bot's own
-  // `codexRpcInput` flag when building the worker init message.
+  // sessions without a daemon restart. A bot's explicit true/false overrides
+  // this default; only an absent bot setting inherits it.
   // Default OFF (absent ⇒ disabled): the hybrid RPC pane lifecycle (resume
   // respawn + ready-gate) must be live-verified before the fleet default flips
   // ON. A per-bot codexRpcInput:true still force-enables; the dashboard toggle
@@ -410,6 +419,22 @@ export const config = {
   // thinking-only nudge as a send failure; it is harmless but unnecessary for the
   // common all-Claude setup, so operators opt in explicitly.
   get noVisibleOutputHint(): boolean { return readGlobalConfig().dashboard?.noVisibleOutputHint === true; },
+  // Live getter (like noVisibleOutputHint): the experimental switch for reaping
+  // tmux SERVERS orphaned by a previous daemon generation (see
+  // core/orphan-tmux-reaper.ts). This performs automatic process kills, so it is
+  // default OFF and an operator enables it explicitly from the Dashboard
+  // experimental settings; read live so a flip applies to the next daemon restart
+  // without a rebuild. BOTMUX_DISABLE_ORPHAN_TMUX_REAP=1 remains an emergency
+  // kill-switch checked inside the reaper itself.
+  get reapOrphanTmuxServers(): boolean { return readGlobalConfig().dashboard?.reapOrphanTmuxServers === true; },
+  // Periodic orphan-tmux SESSION sweep. Default ON but REPORT-ONLY: on a timer
+  // it logs displaced botmux servers/panes and never signals anything. Read
+  // live so a Dashboard flip applies to the next tick without a restart.
+  get tmuxOrphanSessionSweep(): boolean { return readGlobalConfig().dashboard?.tmuxOrphanSessionSweep !== false; },
+  // Narrow destructive arm of the session sweep: signal only a proven
+  // taken-over bare-wrapper pane. Default OFF — even with the report sweep on,
+  // no process is killed without an explicit opt-in.
+  get tmuxOrphanSessionBareWrapperKill(): boolean { return readGlobalConfig().dashboard?.tmuxOrphanSessionBareWrapperKill === true; },
   // Live getter (like noVisibleOutputHint): the experimental cross-principal
   // interruption (XPI) switch. Default OFF (absent ⇒ disabled) — with it off the
   // daemon delivers another principal's message normally instead of diverting it
@@ -426,6 +451,11 @@ export const config = {
   // `!disableCliBypass` before handing it to the adapter (see worker init).
   get bypassCodexHookTrust(): boolean { return readGlobalConfig().dashboard?.bypassCodexHookTrust !== false; },
   get hideCodexRateLimitModelNudge(): boolean { return readGlobalConfig().dashboard?.hideCodexRateLimitModelNudge !== false; },
+  // Live getter: whether the turn initiator may press the `initiator` (decline /
+  // skip) keys on a "CLI is stuck" card. Default ON (absent ⇒ true); an explicit
+  // stored `false` limits every key to bot operators. Read at click time by the
+  // stuck_key gate and at card build time for the who-may-press hint.
+  get stuckCardInitiatorKeys(): boolean { return readGlobalConfig().dashboard?.stuckCardInitiatorKeys !== false; },
 };
 
 export type Config = typeof config;

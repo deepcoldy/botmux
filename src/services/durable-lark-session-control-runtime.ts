@@ -7,10 +7,11 @@ import type { DurableCoordinationStore, DurableJson } from './durable-coordinati
 import { durableLarkOutboxMessage } from './durable-lark-outbox.js';
 import { durableLarkSessionControlPartition } from './durable-lark-session-control.js';
 import type { DurableSessionControlDispatchOptions } from './durable-session-control-dispatch.js';
+import { DurableSessionControlOwnerHandoffError } from './durable-session-control-errors.js';
 import type { DurableSessionFacade } from './durable-session-facade.js';
 import {
+  canonicalPrimarySession,
   commitDurableLarkSessionControl,
-  parseDurablePrimarySessionRecord,
 } from './durable-session-primary.js';
 
 interface CloseResult {
@@ -48,20 +49,40 @@ export interface DurableLarkSessionControlRuntimeOptions {
   getPersistedSession(sessionId: string): Session | undefined;
   /** Import a canonical closed snapshot into this replica's local runtime store. */
   materializeClosedSession(session: Session): Session;
+  /**
+   * Claim and materialize a canonical active Session on this replica before a
+   * lifecycle operation. The callback must cross the distributed Session lease
+   * fence before installing any local runtime state.
+   */
+  takeOverActiveSession?(
+    sessionKey: string,
+    canonical: Session,
+  ): Promise<Session | { kind: 'retry'; reason: string } | undefined>;
   canOperate(chatId: string, operatorOpenId: string): boolean;
   closeSession(sessionId: string): Promise<CloseResult>;
   resumeSession(sessionId: string): Promise<ResumeResult>;
+  /** Execute an idempotent card-presentation action on the replica that owns
+   * the live worker. The callback returns the same shape as handleCardAction. */
+  handlePresentationControl?(data: DurableJson): Promise<unknown>;
+  /** Process-level proof that the admitted provider worker is still usable. */
+  isResumeReady?(session: DaemonSession): boolean;
   buildClosedCard(session: DaemonSession | Session): string;
   buildActiveCard(session: DaemonSession): string;
+  buildPendingCard?(action: 'close' | 'resume', session: Session): string;
   closeResidualText(residual: { reason?: string; taskId?: string }): string;
   closeRefusedText(error: string, taskId?: string): string;
   resumeRefusedText(error: string, activeSessionId?: string, sessionId?: string): string;
+  resumeReadinessPollMs?: number;
+  resumeReadinessStabilityMs?: number;
+  resumeReadinessTimeoutMs?: number;
   now?: () => number;
+  wait?: (ms: number, signal: AbortSignal) => Promise<void>;
 }
 
 export interface DurableLarkSessionControlRuntime {
   ownedPartitionKeys(): string[];
   authorizeBeforeAck(data: unknown): Promise<boolean>;
+  pendingCardBeforeAck(data: unknown): Promise<Record<string, unknown> | undefined>;
   resolve: DurableSessionControlDispatchOptions['resolve'];
 }
 
@@ -71,11 +92,67 @@ function record(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
+function presentationCardJson(value: unknown): string | undefined {
+  if (typeof value === 'string') return value.trim() ? value : undefined;
+  const object = record(value);
+  if (!object) return undefined;
+  const shaped = record(object.card) ?? record(object.deferredCard);
+  if (shaped) {
+    const raw = shaped.type === 'raw' ? shaped.data : shaped;
+    return typeof raw === 'string' ? raw : JSON.stringify(raw);
+  }
+  // Raw card responses are not wrapped until event-dispatcher ACK shaping.
+  if (object.toast || object.afterAck) return undefined;
+  return JSON.stringify(object);
+}
+
+function boundedInteger(value: number, name: string, minimum: number, maximum: number): number {
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+  }
+  return value;
+}
+
+function abortableWait(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    timer.unref?.();
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(signal.reason);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 /** Daemon-facing lifecycle adapter; keeps the daemon itself as thin wiring. */
 export function createDurableLarkSessionControlRuntime(
   options: DurableLarkSessionControlRuntimeOptions,
 ): DurableLarkSessionControlRuntime {
   const now = options.now ?? Date.now;
+  const wait = options.wait ?? abortableWait;
+  const resumeReadinessPollMs = boundedInteger(
+    options.resumeReadinessPollMs ?? 100,
+    'resumeReadinessPollMs',
+    10,
+    5_000,
+  );
+  const resumeReadinessStabilityMs = boundedInteger(
+    options.resumeReadinessStabilityMs ?? 750,
+    'resumeReadinessStabilityMs',
+    0,
+    10_000,
+  );
+  const resumeReadinessTimeoutMs = boundedInteger(
+    options.resumeReadinessTimeoutMs ?? 45_000,
+    'resumeReadinessTimeoutMs',
+    100,
+    300_000,
+  );
 
   const ownedPartitionKeys = (): string[] => {
     const sessionIds = new Set<string>();
@@ -104,37 +181,76 @@ export function createDurableLarkSessionControlRuntime(
     const rootId = value?.root_id;
     const operatorOpenId = operator?.open_id;
     const cardMessageId = context?.open_message_id ?? data?.open_message_id;
-    if ((actionType !== 'close' && actionType !== 'resume')
+    if ((actionType !== 'close' && actionType !== 'resume' && actionType !== 'toggle_display')
         || typeof sessionId !== 'string'
         || typeof rootId !== 'string'
         || typeof operatorOpenId !== 'string'
         || typeof cardMessageId !== 'string'
         || options.privateCard
         || value?.visibility === 'private') return false;
-    const canonical = await options.store.readSession(sessionKey(rootId, options.larkAppId));
-    if (!canonical) return false;
-    const session = parseDurablePrimarySessionRecord(canonical).session;
+    const session = canonicalPrimarySession(
+      await options.store.readSession(sessionKey(rootId, options.larkAppId)));
     if (!session || session.larkAppId !== options.larkAppId
         || session.sessionId !== sessionId
         || session.streamCardId !== cardMessageId
         || (actionType === 'close' && session.status !== 'active')
-        || (actionType === 'resume' && session.status !== 'closed')) return false;
+        || (actionType === 'resume' && session.status !== 'closed')
+        || (actionType === 'toggle_display'
+          && (session.status !== 'active'
+            || (value?.target_display_mode !== 'hidden'
+              && value?.target_display_mode !== 'screenshot')))) return false;
+    // toggle_display is a SENSITIVE_CARD_ACTIONS member: the same canOperate
+    // gate the card handler applies, moved before ACK so a click it would drop
+    // never enters the durable lane (#2062 F2, defence in depth).
     return options.canOperate(session.chatId, operatorOpenId);
   };
 
+  const pendingCardBeforeAck = async (
+    raw: unknown,
+  ): Promise<Record<string, unknown> | undefined> => {
+    if (!options.buildPendingCard) return undefined;
+    const data = record(raw);
+    const action = record(data?.action);
+    const value = record(action?.value);
+    const operator = record(data?.operator);
+    const context = record(data?.context);
+    const actionType = value?.action;
+    const sessionId = value?.session_id;
+    const rootId = value?.root_id;
+    const operatorOpenId = operator?.open_id;
+    const cardMessageId = context?.open_message_id ?? data?.open_message_id;
+    if ((actionType !== 'close' && actionType !== 'resume')
+        || typeof sessionId !== 'string'
+        || typeof rootId !== 'string'
+        || typeof operatorOpenId !== 'string'
+        || typeof cardMessageId !== 'string') return undefined;
+    const session = canonicalPrimarySession(
+      await options.store.readSession(sessionKey(rootId, options.larkAppId)));
+    if (!session
+        || session.larkAppId !== options.larkAppId
+        || session.sessionId !== sessionId
+        || session.streamCardId !== cardMessageId
+        || (actionType === 'close' && session.status !== 'active')
+        || (actionType === 'resume' && session.status !== 'closed')
+        || !options.canOperate(session.chatId, operatorOpenId)) return undefined;
+    const card = record(JSON.parse(options.buildPendingCard(actionType, session)));
+    if (!card) throw new Error('durable lifecycle pending card is invalid');
+    return card;
+  };
+
   const resolve: DurableSessionControlDispatchOptions['resolve'] = async (control, context) => {
+    const source = control.source ?? 'lark-card';
+    const trustedHost = source === 'trusted-host';
     if (control.larkAppId !== options.larkAppId) {
       return { kind: 'ignored', reason: 'control belongs to another Lark application' };
     }
     const value = record(record(control.data)?.action)?.value;
-    if (options.privateCard || record(value)?.visibility === 'private') {
+    if (!trustedHost && source === 'lark-card'
+        && (options.privateCard || record(value)?.visibility === 'private')) {
       return { kind: 'ignored', reason: 'private lifecycle cards are not durable yet' };
     }
     const canonicalKey = sessionKey(control.rootId, options.larkAppId);
-    const canonical = await options.store.readSession(canonicalKey);
-    const canonicalSession = canonical
-      ? parseDurablePrimarySessionRecord(canonical).session
-      : undefined;
+    const canonicalSession = canonicalPrimarySession(await options.store.readSession(canonicalKey));
     if (!canonicalSession
         || canonicalSession.larkAppId !== options.larkAppId
         || canonicalSession.sessionId !== control.sessionId) {
@@ -147,36 +263,70 @@ export function createDurableLarkSessionControlRuntime(
         && canonicalSession.status !== 'closed') {
       return { kind: 'ignored', reason: 'canonical Session cannot be closed' };
     }
-    if (canonicalSession.streamCardId !== control.cardMessageId) {
+    if (control.action === 'toggle_display' && canonicalSession.status !== 'active') {
+      return { kind: 'ignored', reason: 'canonical Session is not active' };
+    }
+    if (source === 'lark-card' && canonicalSession.streamCardId !== control.cardMessageId) {
       return {
         kind: 'ignored',
         reason: `${control.action} card no longer owns the canonical Session lifecycle`,
       };
     }
-    if (!options.canOperate(canonicalSession.chatId, control.operatorOpenId)) {
+    // toggle_display is gated twice already: before ACK (authorizeBeforeAck)
+    // and by the card handler's SENSITIVE_CARD_ACTIONS check during execute,
+    // whose refusal settles the control (see execute below).
+    if (!trustedHost && control.action !== 'toggle_display'
+        && !options.canOperate(canonicalSession.chatId, control.operatorOpenId)) {
       return { kind: 'ignored', reason: 'operator is not allowed to control this Session' };
     }
-    if (canonicalSession.title?.startsWith('Adopt:') || canonicalSession.adoptedFrom) {
+    if (control.action !== 'toggle_display'
+        && (canonicalSession.title?.startsWith('Adopt:') || canonicalSession.adoptedFrom)) {
       return { kind: 'ignored', reason: 'adopted Sessions do not support durable lifecycle control' };
     }
 
-    const live = options.findActiveSession(control.sessionId);
+    let live = options.findActiveSession(control.sessionId);
     let persisted = options.getPersistedSession(control.sessionId);
+    if (control.action === 'toggle_display' && !live) {
+      throw new Error('active presentation target is owned by another replica');
+    }
+    if (control.action === 'close' && canonicalSession.status === 'active') {
+      if (!live) {
+        const remote = normalizeRemoteRunnerBackendState(canonicalSession.remoteBackendState);
+        const neverStartedRemote = remote?.generation === 0
+          && !remote.remoteSessionId
+          && !remote.agentThreadId;
+        if (persisted?.status !== 'closed' && neverStartedRemote) {
+          persisted = options.materializeClosedSession({
+            ...structuredClone(canonicalSession),
+            status: 'closed',
+            closedAt: new Date(now()).toISOString(),
+          });
+        }
+        // Prefix fallback may discover an active Session whose prior owner is
+        // gone. Cross the same Session lease + Remote Runner takeover boundary
+        // as a normal follow-up before exposing closeSession to local state.
+        // While the old owner is still live this remains retryable; once its
+        // lease expires, any replica can materialize and apply the control.
+        if (persisted?.status !== 'closed') {
+          const takeover = await options.takeOverActiveSession?.(canonicalKey, canonicalSession);
+          if (takeover && 'kind' in takeover && takeover.kind === 'retry') {
+            throw new DurableSessionControlOwnerHandoffError(takeover.reason);
+          }
+          live = options.findActiveSession(control.sessionId);
+          persisted = options.getPersistedSession(control.sessionId);
+          if (!live || live.session.sessionId !== canonicalSession.sessionId) {
+            throw new Error('active control target could not be taken over by this replica');
+          }
+        }
+      }
+      if (source === 'lark-card' && live && live.streamCardId !== control.cardMessageId) {
+        return { kind: 'ignored', reason: 'close card no longer owns the active Session lifecycle' };
+      }
+    }
     if (control.action === 'resume' && !persisted) {
       persisted = options.materializeClosedSession(structuredClone(canonicalSession));
     }
     const session = live?.session ?? persisted ?? canonicalSession;
-    if (control.action === 'close' && canonicalSession.status === 'active') {
-      if (!live) {
-        // Prefix fallback may discover an active Session owned by another Pod.
-        // Keep the Inbox row retryable; completing it as ignored would lose the
-        // user's close request before the exact runtime owner can claim it.
-        throw new Error('active control target is not local to this replica');
-      }
-      if (live.streamCardId !== control.cardMessageId) {
-        return { kind: 'ignored', reason: 'close card no longer owns the active Session lifecycle' };
-      }
-    }
     if (control.action === 'resume' && !live && persisted?.status !== 'closed') {
       throw new Error('canonical closed Session could not be materialized locally');
     }
@@ -193,8 +343,14 @@ export function createDurableLarkSessionControlRuntime(
       operatorOpenId: control.operatorOpenId,
       cardMessageId: control.cardMessageId,
     } as unknown as DurableJson;
-    const closeCard = control.action === 'close' && live
-      ? options.buildClosedCard(live)
+    const effectiveCardMessageId = source === 'lark-card'
+      ? control.cardMessageId
+      : canonicalSession.streamCardId;
+    const closeCard = control.action === 'close'
+      && !options.privateCard
+      && typeof effectiveCardMessageId === 'string'
+      && effectiveCardMessageId.startsWith('om_')
+      ? options.buildClosedCard(live ?? session)
       : undefined;
     // A Remote Runner resume may briefly reactivate its local Session while the
     // replacement provider generation is still starting. If startup later
@@ -224,6 +380,16 @@ export function createDurableLarkSessionControlRuntime(
     ): { result: DurableJson; evidence: DurableJson } | undefined => {
       const current = options.getPersistedSession(control.sessionId);
       if (!current) return undefined;
+      if (control.action === 'toggle_display') {
+        const target = record(value)?.target_display_mode;
+        const active = options.findActiveSession(control.sessionId);
+        if (!active || (target !== 'hidden' && target !== 'screenshot')) return undefined;
+        if (active.displayMode !== target) return undefined;
+        return {
+          result: result('active', options.buildActiveCard(active), { displayMode: target }),
+          evidence: { source: 'active-session', status: 'active', displayMode: target },
+        };
+      }
       if (control.action === 'close' && current.status === 'closed') {
         return {
           result: result('closed', closeCard),
@@ -261,6 +427,7 @@ export function createDurableLarkSessionControlRuntime(
               || recoveredState.generation <= resumeBaselineState.generation
               || !recoveredState.remoteSessionId) return undefined;
         }
+        if (!active || (options.isResumeReady && !options.isResumeReady(active))) return undefined;
         return {
           result: result('active', active ? options.buildActiveCard(active) : undefined),
           evidence: {
@@ -278,6 +445,40 @@ export function createDurableLarkSessionControlRuntime(
       return undefined;
     };
 
+    const waitForResumeReadiness = async (
+      signal: AbortSignal,
+    ): Promise<
+      | { kind: 'completed'; result: DurableJson }
+      | { kind: 'ambiguous'; error: string }
+    > => {
+      const deadline = now() + resumeReadinessTimeoutMs;
+      let stableSince: number | undefined;
+      for (;;) {
+        if (signal.aborted) throw signal.reason;
+        const recovered = observed(true);
+        const status = record(recovered?.result)?.status;
+        if (recovered && status === 'closed') {
+          return { kind: 'completed', result: recovered.result };
+        }
+        if (recovered && status === 'active') {
+          stableSince ??= now();
+          if (now() - stableSince >= resumeReadinessStabilityMs) {
+            return { kind: 'completed', result: recovered.result };
+          }
+        } else {
+          stableSince = undefined;
+        }
+        const remaining = deadline - now();
+        if (remaining <= 0) {
+          return {
+            kind: 'ambiguous',
+            error: 'remote resume recovery readiness timed out',
+          };
+        }
+        await wait(Math.min(resumeReadinessPollMs, remaining), signal);
+      }
+    };
+
     return {
       kind: 'target',
       target: {
@@ -289,6 +490,48 @@ export function createDurableLarkSessionControlRuntime(
           }
           const already = observed();
           if (already) return { kind: 'completed', result: already.result };
+          if (control.action === 'toggle_display') {
+            if (!options.handlePresentationControl) {
+              return { kind: 'not_applied', error: 'presentation control is unavailable' };
+            }
+            const handled = await options.handlePresentationControl(control.data);
+            // The Lark ACK already went out on the receiving replica, so a
+            // post-ACK continuation the handler returned must run here.
+            const afterAck = record(handled)?.afterAck;
+            if (typeof afterAck === 'function') await (afterAck as () => Promise<void>)();
+            const target = record(value)?.target_display_mode;
+            const current = options.findActiveSession(control.sessionId);
+            if (!current) {
+              // The live owner moved while the handler ran: another replica
+              // may still apply this click.
+              return { kind: 'not_applied', error: 'presentation target left this replica' };
+            }
+            if (current.displayMode !== target) {
+              // The handler declined (operator gate, stale card, busy PATCH,
+              // closed transport, ...). Retrying the same click cannot change
+              // that verdict, so settle it instead of blocking the partition's
+              // FIFO (#2062 F2). No notice: the non-durable path is silent too.
+              const mode = current.displayMode === 'hidden' || current.displayMode === 'screenshot'
+                ? current.displayMode
+                : undefined;
+              return {
+                kind: 'completed',
+                result: result('active', undefined, {
+                  applied: false,
+                  ...(mode ? { displayMode: mode } : {}),
+                }),
+              };
+            }
+            // A raw/shaped card is the callback response the original ACK
+            // never carried, so the outbox must deliver it. A `{ toast }`
+            // reply means the handler already queued its own PATCH: carrying
+            // a second card here would write the same message twice (#2062 F3).
+            const cardJson = presentationCardJson(handled);
+            return {
+              kind: 'completed',
+              result: result('active', cardJson, { displayMode: target }),
+            };
+          }
           if (control.action === 'close') {
             const closed = await options.closeSession(control.sessionId);
             if (closed.ok) {
@@ -328,12 +571,7 @@ export function createDurableLarkSessionControlRuntime(
           const resumed = await options.resumeSession(control.sessionId);
           if (resumed.ok) {
             if (resumed.recoveryPending === true) {
-              const recovered = observed(true);
-              if (recovered) return { kind: 'completed', result: recovered.result };
-              return {
-                kind: 'ambiguous',
-                error: 'remote resume recovery is pending durable readiness',
-              };
+              return waitForResumeReadiness(signal);
             }
             return {
               kind: 'completed',
@@ -376,11 +614,40 @@ export function createDurableLarkSessionControlRuntime(
             error: `resume result requires reconciliation: ${resumed.error}`,
           };
         },
-        reconcile: async () => {
-          const reconciled = observed(true);
-          return reconciled
-            ? { kind: 'completed', ...reconciled }
-            : { kind: 'unknown', error: 'backend cannot yet prove the lifecycle outcome' };
+        reconcile: async signal => {
+          if (control.action === 'toggle_display') {
+            const reconciled = observed();
+            return reconciled
+              ? { kind: 'completed', ...reconciled }
+              : {
+                  kind: 'not_applied',
+                  error: 'presentation target mode is not installed',
+                  evidence: { source: 'active-session', status: 'active' } as DurableJson,
+                };
+          }
+          if (control.action === 'close') {
+            const reconciled = observed(true);
+            return reconciled
+              ? { kind: 'completed', ...reconciled }
+              : { kind: 'unknown', error: 'backend cannot yet prove the lifecycle outcome' };
+          }
+          const reconciled = await waitForResumeReadiness(signal);
+          if (reconciled.kind !== 'completed') {
+            return { kind: 'unknown', error: reconciled.error };
+          }
+          const status = record(reconciled.result)?.status;
+          if (status !== 'active' && status !== 'closed') {
+            return { kind: 'unknown', error: 'reconciled resume result has an invalid status' };
+          }
+          return {
+            kind: 'completed',
+            result: reconciled.result,
+            evidence: {
+              source: 'session-store',
+              status,
+              recovery: status === 'active' ? 'ready' : 'rolled-back',
+            },
+          };
         },
         commit: async (rawResult, signal) => {
           if (signal.aborted) throw signal.reason;
@@ -397,6 +664,10 @@ export function createDurableLarkSessionControlRuntime(
               || (control.action === 'resume'
                 && status !== 'active'
                 && !(status === 'closed' && parsed.applied === false))
+              || (control.action === 'toggle_display'
+                && (status !== 'active'
+                  || (parsed.applied !== false
+                    && parsed.displayMode !== 'hidden' && parsed.displayMode !== 'screenshot')))
               || (parsed.cardJson !== undefined && typeof parsed.cardJson !== 'string')
               || (parsed.noticeText !== undefined && typeof parsed.noticeText !== 'string')) {
             throw new Error('durable lifecycle control result is invalid');
@@ -431,12 +702,14 @@ export function createDurableLarkSessionControlRuntime(
               throw new Error(`durable control ${label} output failed: ${enqueued.kind}`);
             }
           };
-          if (typeof parsed.cardJson === 'string' && parsed.cardJson) {
+          if (typeof parsed.cardJson === 'string' && parsed.cardJson
+              && typeof effectiveCardMessageId === 'string'
+              && effectiveCardMessageId.startsWith('om_')) {
             await enqueue(durableLarkOutboxMessage({
               messageId: `control_update_${digest}`,
               sessionKey: canonicalKey,
               larkAppId: options.larkAppId,
-              target: { kind: 'update', messageId: control.cardMessageId },
+              target: { kind: 'update', messageId: effectiveCardMessageId },
               content: parsed.cardJson,
               msgType: 'interactive',
               providerUuid: `bct_${digest.slice(0, 40)}`,
@@ -467,5 +740,5 @@ export function createDurableLarkSessionControlRuntime(
     };
   };
 
-  return { ownedPartitionKeys, authorizeBeforeAck, resolve };
+  return { ownedPartitionKeys, authorizeBeforeAck, pendingCardBeforeAck, resolve };
 }

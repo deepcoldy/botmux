@@ -7,12 +7,30 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { larkTransportEnabled } from './types.js';
 import { isRemoteBackendId } from './remote-cli-ids.js';
 import { normalizeBrand, type Brand } from '../im/lark/lark-hosts.js';
-import { findRealToolBinary, installLoginShellPathShim, sessionIdentityDataDir, sessionIdentityBinDir } from './cli-identity.js';
+import { findRealToolBinary, installLoginShellPathShim, sessionIdentityDataDir, sessionIdentityBinDir, sessionVisiblePath } from './cli-identity.js';
 import { resolveEntrySpawn } from './self-spawn.js';
+import { resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
+import type { ProtectedLoopbackService } from './protected-http-egress-host.js';
 
 export const LARK_TOOL_BINDING_FILE = 'lark-tool-binding.json';
 export const LARK_TOOL_ROUTE = 'lark-tool-identity';
+
+export function larkToolLoopbackService(sessionId: string, ipcPort: number): ProtectedLoopbackService {
+  if (!/^[A-Za-z0-9._-]{1,200}$/.test(sessionId) || /^\.+$/.test(sessionId)
+    || !Number.isSafeInteger(ipcPort) || ipcPort < 1 || ipcPort > 65535) {
+    throw new Error('invalid_lark_tool_loopback_service');
+  }
+  return {
+    id: LARK_TOOL_ROUTE,
+    listenPort: ipcPort,
+    upstreamPort: ipcPort,
+    method: 'POST',
+    path: `/api/sessions/${sessionId}/${LARK_TOOL_ROUTE}`,
+    forwardHeaders: ['content-type', 'x-botmux-lark-session'],
+    attestProcessPeer: true,
+  };
+}
 export interface LarkToolBinding {
   version: 2;
   sessionId: string;
@@ -67,6 +85,66 @@ export function usesLarkToolBinding(config: {
   return config.larkToolBinding !== false;
 }
 
+/**
+ * Which identity publication model a spawn runs.
+ *
+ * - `proven`: the Linux managed entry proves its execution over the loopback
+ *   current-execution channel and receives the identity CONTENT in memory; no
+ *   token is written to disk. Requires the daemon loopback to be reachable
+ *   inside the sandbox, so network-isolated sandboxes (`--unshare-net`, or a
+ *   slirp policy that does not share host loopback) are excluded.
+ * - `single`: every other path (adopt / remote / external app-server /
+ *   workflow / non-Lark transport / non-Linux / loopback-isolated sandbox)
+ *   keeps the legacy single-snapshot file that is overwritten or removed on
+ *   every turn.
+ *
+ * SINGLE SOURCE OF TRUTH: the WORKER computes this from the actual spawn
+ * decision — resolveLocalSandboxMode (including the BOTMUX_SANDBOX operator
+ * override and remote-backend bypass) plus the spawn's real loopback
+ * reachability (resolveSpawnNetworkShape, the same facts that compile the
+ * bwrap/Seatbelt argv) — renders the wrapper from it and reports it to the
+ * daemon. The daemon consumes ONLY that report; it must not re-derive the
+ * sandbox or network side from frozen config or its own environment, or the
+ * two sides can silently pick different models for one session.
+ */
+export type IdentityStorageModel = 'single' | 'proven';
+
+export function resolveIdentityStorageModel(input: {
+  platform: NodeJS.Platform;
+  binding: boolean;
+  /** Whether a local sandbox actually wraps the spawn (worker spawn fact). */
+  sandboxEngaged: boolean;
+  /** Whether the daemon loopback is reachable inside the spawn (worker spawn
+   *  fact: false under --unshare-net and under a slirp policy). */
+  loopbackShared: boolean;
+}): IdentityStorageModel {
+  if (input.platform !== 'linux' || !input.binding) return 'single';
+  if (input.sandboxEngaged && !input.loopbackShared) return 'single';
+  return 'proven';
+}
+
+/** Structural half the daemon can check independently of the worker: proven
+ *  requires Linux and the managed lark-tool binding (adopt / remote / external
+ *  app-server / workflow / apiOnly / disabled transport are structurally
+ *  single). Sandbox engagement and loopback reachability are deliberately NOT
+ *  inputs here — they are spawn-time facts only the worker has. The daemon
+ *  uses this solely to fail closed when a worker reports `proven` for a
+ *  session whose structure cannot run proven (e.g. binding disabled after a
+ *  daemon restart with newer config). */
+export function identityBindingAllowsProven(input: {
+  platform: NodeJS.Platform;
+  sessionId: string;
+  larkAppId: string;
+  chatId: string;
+  apiOnly?: boolean;
+  adoptMode?: boolean;
+  existingAppServerEndpoint?: string;
+  backendType: import('../adapters/backend/types.js').BackendType;
+  larkToolBinding?: boolean;
+}): boolean {
+  return input.platform === 'linux' && usesLarkToolBinding(input);
+}
+
 /** Clean up managed lark-cli binding files and wrappers when binding is disabled. */
 export function cleanupLarkToolBinding(dataDir: string, sessionId: string): void {
   try {
@@ -99,6 +177,33 @@ export function isLarkToolBound(
   return botConfig?.larkToolBinding !== false && hasLarkToolBinding(dataDir, sessionId);
 }
 
+/**
+ * Which lark-cli identity a session's `/login` should authorize.
+ *
+ * The binding file is written when the worker spawns, but `/login` is often the
+ * very first message of a new topic — no worker yet. Keying on the file alone
+ * sent that first `/login` down the legacy device-code flow (an issuer app the
+ * person may not even be allowed to use), and the same command answered with
+ * the bot-app OAuth a message later. Before the first spawn, decide from the
+ * same session facts the worker will use (usesLarkToolBinding). A live worker
+ * without the file is a session that runs the legacy wrapper: keep it there.
+ */
+export function sessionLarkToolBound(input: {
+  botConfig: { larkToolBinding?: boolean } | undefined;
+  dataDir: string;
+  sessionId: string;
+  /** A worker process is running for this session right now. */
+  workerLive: boolean;
+  /** The facts the worker's own usesLarkToolBinding decision reads. */
+  spawnFacts: Parameters<typeof usesLarkToolBinding>[0];
+  workflow?: boolean;
+}): boolean {
+  if (input.botConfig?.larkToolBinding === false) return false;
+  if (hasLarkToolBinding(input.dataDir, input.sessionId)) return true;
+  if (input.workerLive) return false;
+  return usesLarkToolBinding(input.spawnFacts, input.dataDir, input.workflow ?? false);
+}
+
 /** Bind only this session's tool. No global profile, account or user token is read. */
 export function prepareLarkToolEnv(input: {
   env: NodeJS.ProcessEnv;
@@ -109,6 +214,9 @@ export function prepareLarkToolEnv(input: {
   defaultAs?: 'bot' | 'user';
   effectivePath?: string;
   runner?: { command: string; args: string[] };
+  /** Sandboxed session: the wrapper must name its runner by realpath, since a
+   *  fresh bwrap root has no alias for a symlinked home. */
+  canonicalPaths?: boolean;
 }): LarkToolBinding {
   const rootDir = resolveLarkToolDataDir(input.dataDir);
   const binDir = sessionIdentityBinDir(rootDir, input.sessionId);
@@ -147,11 +255,12 @@ export function prepareLarkToolEnv(input: {
   const quote = (v: string) => `'${v.replaceAll("'", "'\\''")}'`;
   atomicWriteFileSync(join(binDir, 'lark-cli'), [
     '#!/bin/sh', '# botmux managed lark-cli — application and caller are host-bound.',
-    `exec ${[runner.command, ...runner.args, '--binding', bindingPath, '--'].map(quote).join(' ')} "$@"`, '',
+    `exec ${[...[runner.command, ...runner.args].map(p => sessionVisiblePath(p, input.canonicalPaths)), '--binding', bindingPath, '--'].map(quote).join(' ')} "$@"`, '',
   ].join('\n'), { mode: 0o755 });
   const { zdotdir, bashEnv } = installLoginShellPathShim(binDir);
   input.env.PATH = [binDir, ...(input.env.PATH ?? '').split(':').filter(p => p !== binDir)].join(':');
   input.env.BOTMUX_IDENTITY_BIN = binDir;
+  input.env.BOTMUX_WRAPPER_BIN = resolveBotmuxWrapperBinDir(input.env);
   input.env.ZDOTDIR = zdotdir;
   input.env.BASH_ENV = bashEnv;
   input.env.SESSION_DATA_DIR = rootDir;
@@ -167,8 +276,8 @@ export function hasLarkToolBinding(dataDir: string, sessionId: string): boolean 
 
 export function larkToolPrompt(appId: string, locale?: string): string {
   return locale === 'en'
-    ? `lark-cli uses application ${appId} by default and calls default to this bot. For personal resources or a bot permission denial, use --as user with the current user's authorization to this same application. To use a different application or profile, specify --profile <profile>. If needed, run botmux auth request --scope "<required scopes>" --json. Do not repeat writes whose result is uncertain.`
-    : `lark-cli 固定使用当前机器人的应用 ${appId} 作为默认，默认以 bot 身份调用。需要个人资源或 bot 无权时，可用 --as user 使用当前用户对同一应用的授权；若需使用其他应用或 profile，可显式指定 --profile <profile>。缺授权时运行 botmux auth request --scope "<所需权限>" --json。不要重复执行结果尚不确定的写操作。`;
+    ? `lark-cli uses application ${appId} by default and calls default to this bot. For personal resources or a bot permission denial, use --as user to act as the current user; botmux picks that person's authorization (their grant to this application, or their botmux platform authorization). To use a different application or profile, specify --profile <profile>. When a read with --as user lacks a permission but the data is in a chat or document this bot can access (for example messages of a group the bot is in), retry that read with --as bot; never switch a write to --as bot. If the read also fails as bot, or the action must be done as the user, run botmux auth request --scope "<required scopes>" --json for the user's authorization and pass the link or platform page it returns to the user (in a group botmux sends authorization links privately to the requester itself; never post one in the group). Do not repeat writes whose result is uncertain.`
+    : `lark-cli 固定使用当前机器人的应用 ${appId} 作为默认，默认以 bot 身份调用。需要个人资源或 bot 无权时，可用 --as user 以当前用户身份调用，用谁的哪份授权由 botmux 决定（该用户对本应用的授权，或其在 botmux 中心化平台的授权）；若需使用其他应用或 profile，可显式指定 --profile <profile>。以 --as user 读取时缺权限、但数据在本机器人能访问的群或文档里（例如本机器人所在群的消息），改用 --as bot 重试这次读取；写操作不得改用 --as bot。bot 身份也读不到、或这件事必须以用户身份完成时，再运行 botmux auth request --scope "<所需权限>" --json 申请用户授权，把返回的链接或平台页面发给用户（群聊里 botmux 会自己私聊发起人发授权链接，不要在群里贴授权链接）。不要重复执行结果尚不确定的写操作。`;
 }
 
 export function larkToolPromptFromEnv(
@@ -192,7 +301,8 @@ export function larkToolPassthroughEnv(inherited: NodeJS.ProcessEnv): NodeJS.Pro
 
 export function larkToolChildEnv(
   inherited: NodeJS.ProcessEnv, binding: LarkToolBinding,
-  identity?: { mode: 'bot' | 'user'; credential: string },
+  /** `appId` is set only for a platform-issued user grant (a different application by design). */
+  identity?: { mode: 'bot' | 'user'; credential: string; appId?: string },
 ): NodeJS.ProcessEnv {
   const env = { ...inherited };
   for (const key of Object.keys(env)) {
@@ -201,7 +311,7 @@ export function larkToolChildEnv(
   }
   env.LARKSUITE_CLI_CONFIG_DIR = binding.configDir;
   env.LARKSUITE_CLI_DATA_DIR = join(binding.configDir, 'data');
-  env.LARKSUITE_CLI_APP_ID = binding.appId;
+  env.LARKSUITE_CLI_APP_ID = identity?.mode === 'user' && identity.appId ? identity.appId : binding.appId;
   env.LARKSUITE_CLI_BRAND = binding.brand;
   env.LARKSUITE_CLI_NO_UPDATE_NOTIFIER = '1';
   env.LARKSUITE_CLI_NO_SKILLS_NOTIFIER = '1';

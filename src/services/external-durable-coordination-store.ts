@@ -10,6 +10,7 @@ import type {
   CompleteControlOperationAttemptInput,
   CompleteOutboxAttemptInput,
   ControlOperationMutationResult,
+  DurableAuxiliaryStateRecord,
   DurableCoordinationStore,
   DurableControlOperationRecord,
   DurableInboxEvent,
@@ -38,6 +39,8 @@ import type {
   SessionLeaseAcquisition,
   WriteSessionInput,
   WriteSessionResult,
+  WriteAuxiliaryStateInput,
+  WriteAuxiliaryStateResult,
 } from './durable-coordination.js';
 import {
   MAX_DURABLE_COORDINATION_PROVIDER_LINE_BYTES,
@@ -123,6 +126,13 @@ export class ExternalDurableCoordinationStore implements DurableCoordinationStor
     // Provider stderr may contain deployment-specific details. Drain it so the
     // pipe cannot block, but never copy it into BotMux logs or protocol errors.
     this.child.stderr.on('data', () => {});
+    // A provider that stops reading (crashed, closed stdin) makes the next
+    // write fail asynchronously with EPIPE. The write callback rejects that one
+    // request, but the stream also emits 'error'; unhandled, that is thrown at
+    // process level, and the daemon has no uncaughtException trap. Nothing can
+    // reach the provider any more, so fail the store like any other provider
+    // loss.
+    this.child.stdin.on('error', error => this.fail(new Error(`durable coordination provider stdin error: ${error.message}`)));
     this.child.on('error', error => this.fail(new Error(`durable coordination provider process error: ${error.message}`)));
     this.child.on('exit', (code, signal) => {
       if (this.closing || this.closed) return;
@@ -278,8 +288,27 @@ export class ExternalDurableCoordinationStore implements DurableCoordinationStor
     return result === null ? undefined : result as unknown as DurableSessionRecord;
   }
 
+  async listSessions(input: {
+    afterSessionKey?: string;
+    limit: number;
+  }): Promise<{ records: DurableSessionRecord[]; nextSessionKey?: string }> {
+    return await this.call('listSessions', input) as unknown as {
+      records: DurableSessionRecord[];
+      nextSessionKey?: string;
+    };
+  }
+
   async writeSession(input: WriteSessionInput): Promise<WriteSessionResult> {
     return await this.call('writeSession', input) as unknown as WriteSessionResult;
+  }
+
+  async readAuxiliaryState(stateKey: string): Promise<DurableAuxiliaryStateRecord | undefined> {
+    const result = await this.call('readAuxiliaryState', stateKey);
+    return result === null ? undefined : result as unknown as DurableAuxiliaryStateRecord;
+  }
+
+  async writeAuxiliaryState(input: WriteAuxiliaryStateInput): Promise<WriteAuxiliaryStateResult> {
+    return await this.call('writeAuxiliaryState', input) as unknown as WriteAuxiliaryStateResult;
   }
 
   async enqueueInbox(event: DurableInboxEvent): Promise<DurableInsertResult> {

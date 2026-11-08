@@ -10,13 +10,8 @@ import { readRequestBodyJson } from './helpers/read-request-body.js';
 import { managedOriginCapabilityPath, replaceManagedOriginCapabilityFile } from '../src/core/managed-origin-capability.js';
 import { MANAGED_ORIGIN_PROOF_DOMAIN, writeManagedOriginAttestationProof, type ManagedOriginAttestation } from '../src/core/managed-origin-attestation.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
-import { readSchedulePromptUpdate } from '../src/cli/schedule-update.js';
+import { readScheduleUpdate } from '../src/cli/schedule-update.js';
 import { SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from '../src/core/dispatch-user-delegation.js';
-import {
-  activateSchedulePrecondition,
-  resolveSchedulePrecondition,
-  stageSchedulePrecondition,
-} from '../src/services/schedule-precondition-store.js';
 
 const app = 'cli_schedule';
 const sid = 'schedule-session';
@@ -54,7 +49,10 @@ function fixture() {
       child.on('error', reject); child.on('close', code => resolve({ code, output }));
     });
   };
-  return { root, dataDir, path, task, env, run, read: () => JSON.parse(readFileSync(path, 'utf8')) };
+  return { root, dataDir, path, task, env, run, read: () => JSON.parse(readFileSync(path, 'utf8')),
+    /** Answer `update` like a daemon from before frequency edits: ignore the
+     *  `schedule` field and reply without a task receipt. */
+    preFrequencyDaemon: false };
 }
 
 async function managed(
@@ -62,6 +60,7 @@ async function managed(
   customize?: (proof: ManagedOriginAttestation, index: number) => void,
   managedTurnId = 'om_live',
   observedRequests?: Array<Record<string, unknown>>,
+  refuseWith?: string,
 ) {
   seedPersistedSessionRows(f.dataDir, app, { [sid]: {
     sessionId: sid, status: 'active', larkAppId: app, chatId: 'oc_chat', rootMessageId: 'om_root',
@@ -74,9 +73,14 @@ async function managed(
     if (!request) { res.statusCode = 400; return res.end(JSON.stringify({ ok: false, error: 'bad_json' })); }
     observedRequests?.push(request);
     const proof: ManagedOriginAttestation = { sessionId: sid, turnId: managedTurnId, callerOpenId: 'ou_owner',
-      larkAppId: app, requiresCodexAppLedger: false, scheduleCreator: { ok: true, ownerUnionId: 'on_owner' } };
+      larkAppId: app, requiresCodexAppLedger: false, scheduleCreator: { ok: true, ownerUnionId: 'on_owner' },
+      scheduleOperator: { ok: true } };
     calls++;
     customize?.(proof, calls);
+    if (refuseWith && (req.url === SCHEDULE_DELEGATED_ADD_ROUTE || req.url === SCHEDULE_MANAGED_MUTATE_ROUTE)) {
+      res.statusCode = 403;
+      return res.end(JSON.stringify({ ok: false, error: refuseWith }));
+    }
     if (req.url === SCHEDULE_DELEGATED_ADD_ROUTE) {
       if (proof.turnId !== managedTurnId) {
         res.statusCode = 409;
@@ -106,7 +110,7 @@ async function managed(
         res.statusCode = 403;
         return res.end(JSON.stringify({ ok: false, error: 'schedule creator bot does not match the session' }));
       }
-      if (proof.scheduleCreator?.ok !== true) {
+      if (proof.scheduleOperator?.ok !== true) {
         res.statusCode = 403;
         return res.end(JSON.stringify({ ok: false, error: 'current turn caller is not an allowed bot operator' }));
       }
@@ -119,10 +123,6 @@ async function managed(
         res.statusCode = 404;
         return res.end(JSON.stringify({ ok: false, error: 'schedule_not_found' }));
       }
-      if (current.preconditionRef) {
-        res.statusCode = 409;
-        return res.end(JSON.stringify({ ok: false, error: 'schedule_precondition_dashboard_update_required' }));
-      }
       if (request.action === 'remove') delete rows[taskId!];
       else if (request.action === 'pause') rows[taskId!] = { ...current, enabled: false, disabledReason: 'manual', manualRunRequested: undefined };
       else if (request.action === 'resume') rows[taskId!] = { ...current, enabled: true, disabledReason: undefined, manualRunRequested: undefined };
@@ -133,7 +133,8 @@ async function managed(
         }
         rows[taskId!] = { ...current, manualRunRequested: true };
       } else {
-        // update: prompt and/or work-calendar fields, mirroring daemon normalization
+        // update: prompt and/or work-calendar fields, mirroring daemon normalization;
+        // like the daemon, only an expression that differs is re-parsed
         const patch: Record<string, unknown> = {};
         if (typeof request.prompt === 'string') patch.prompt = request.prompt;
         if (request.calendar !== undefined) {
@@ -143,10 +144,20 @@ async function managed(
         if (request.calendarDayType !== undefined) {
           patch.calendarDayType = current.calendar ? request.calendarDayType : undefined;
         }
+        if (typeof request.schedule === 'string' && !f.preFrequencyDaemon && request.schedule !== current.schedule) {
+          patch.schedule = request.schedule;
+          patch.parsed = { kind: 'interval', minutes: 240, display: '每 4 小时' };
+          patch.nextRunAt = '2030-01-01T08:00:00.000Z';
+        }
         rows[taskId!] = { ...current, ...patch };
       }
       writeFileSync(f.path, JSON.stringify(rows));
-      return res.end(JSON.stringify({ ok: true }));
+      const updated = rows[taskId!];
+      return res.end(JSON.stringify(request.action === 'update' && !f.preFrequencyDaemon
+        ? { ok: true, task: { schedule: updated.schedule, display: updated.parsed?.display,
+          nextRunAt: updated.nextRunAt ?? null, enabled: updated.enabled,
+          ...(!updated.enabled && updated.disabledReason ? { disabledReason: updated.disabledReason } : {}) } }
+        : { ok: true }));
     }
     writeManagedOriginAttestationProof({ dataDir: f.dataDir, proof: {
       ...proof, domain: MANAGED_ORIGIN_PROOF_DOMAIN, version: 1, nonce: request.nonce,
@@ -165,7 +176,119 @@ async function managed(
   return () => calls;
 }
 
+/** Host-terminal shape: no session, a real loopback daemon IPC port and the
+ *  host secret on disk. The route itself is covered by
+ *  schedule-delegation-route.test.ts; what this pins is the CLI half — whether
+ *  `--run-as` actually reaches the request body in each flag form. */
+async function hostDaemon(f: ReturnType<typeof fixture>, observed: Array<Record<string, unknown>>) {
+  mkdirSync(join(f.root, '.botmux'), { recursive: true, mode: 0o700 });
+  writeFileSync(join(f.root, '.botmux', '.dashboard-secret'), 'host-secret', { mode: 0o600 });
+  const server = createServer(async (req, res) => {
+    const request = await readRequestBodyJson<Record<string, unknown>>(req, { strict: true });
+    if (!request) { res.statusCode = 400; return res.end(JSON.stringify({ ok: false, error: 'bad_json' })); }
+    observed.push(request);
+    res.statusCode = 201;
+    res.end(JSON.stringify({ ok: true, task: { ...(request.task as Record<string, unknown>), nextRunAt: null } }));
+  });
+  servers.push(server);
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  f.env.BOTMUX_DAEMON_IPC_PORT = String((server.address() as { port: number }).port);
+}
+
 describe('schedule CLI prompt updates', () => {
+  it.each([
+    ['add', 'schedule_working_dir_forbidden', '当前工作目录'],
+    ['add', 'schedule_direct_task_limit', '已达上限'],
+    ['update', 'schedule_mutation_scope_forbidden', '本会话所在群'],
+    ['update', 'schedule_working_dir_forbidden', '当前工作目录'],
+  ] as const)('turns a sandbox %s refusal %s into actionable text', async (action, code, text) => {
+    const f = fixture();
+    await managed(f, undefined, 'om_live', undefined, code);
+    const result = action === 'add'
+      ? await f.run(['add', '0 12 * * *', 'new task', '--id', '11223344'])
+      : await f.run(['update', f.task.id, '--prompt', 'changed']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain(text);
+    expect(result.output).not.toContain(code);
+  });
+
+  it.each([
+    ['spaced', ['--run-as', 'ou_victim']],
+    ['equals', ['--run-as=ou_victim']],
+  ])('refuses %s --run-as inside a session before reaching the delegated add route', async (_label, flag) => {
+    const f = fixture();
+    const observed: Array<Record<string, unknown>> = [];
+    await managed(f, undefined, 'om_live', observed);
+    const result = await f.run(['add', '0 12 * * *', 'new task', ...flag, '--id', '11223344']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('只能在宿主终端');
+    expect(f.read()['11223344']).toBeUndefined();
+    // Session detection may hit the attestation endpoint, but the task body
+    // must never reach SCHEDULE_DELEGATED_ADD_ROUTE.
+    expect(observed.some(request => 'task' in request)).toBe(false);
+  });
+
+  it.each([
+    ['spaced', ['--run-as', 'ou_runner'], 'ou_runner'],
+    ['equals', ['--run-as=ou_runner'], 'ou_runner'],
+  ])('sends the host-terminal %s --run-as to the delegated add route', async (_label, flag, expected) => {
+    const f = fixture();
+    const observed: Array<Record<string, unknown>> = [];
+    await hostDaemon(f, observed);
+    const result = await f.run(['add', '0 12 * * *', 'new task', '--chat-id', 'oc_chat', ...flag, '--id', '11223344']);
+    expect(result.code, result.output).toBe(0);
+    expect(observed).toHaveLength(1);
+    expect((observed[0].task as Record<string, unknown>).runAs).toBe(expected);
+  });
+
+  it('omits runAs entirely when the host terminal names nobody', async () => {
+    const f = fixture();
+    const observed: Array<Record<string, unknown>> = [];
+    await hostDaemon(f, observed);
+    expect((await f.run(['add', '0 12 * * *', 'new task', '--chat-id', 'oc_chat', '--id', '11223344'])).code).toBe(0);
+    expect(observed[0].task as Record<string, unknown>).not.toHaveProperty('runAs');
+  });
+
+  it.each(['--topic', '--follow-active'])('binds %s to the current topic in a reused chat session', async flag => {
+    const f = fixture();
+    await managed(f);
+    const rows = readPersistedSessionRows(f.dataDir, app);
+    rows[sid] = { ...rows[sid], scope: 'chat', rootMessageId: 'om_unrelated_first_message',
+      replyTargets: { om_live: { rootMessageId: 'om_current_topic', updatedAt: new Date().toISOString() } },
+      currentReplyTarget: { turnId: 'om_queued', rootMessageId: 'om_queued_topic', updatedAt: new Date().toISOString() },
+    };
+    seedPersistedSessionRows(f.dataDir, app, rows);
+    const result = await f.run(['add', '0 12 * * *', 'new task', flag, '--id', '11223344']);
+    expect(result.code, result.output).toBe(0);
+    expect(f.read()['11223344']).toMatchObject({ executionPosition: 'topic', rootMessageId: 'om_current_topic' });
+  });
+
+  it.each(['missing', 'plain'])('refuses implicit --topic when the exact chat turn is %s', async mode => {
+    const f = fixture();
+    await managed(f);
+    const rows = readPersistedSessionRows(f.dataDir, app);
+    rows[sid] = { ...rows[sid], scope: 'chat', rootMessageId: 'om_unrelated_first_message',
+      replyTargets: mode === 'plain' ? { om_live: { updatedAt: new Date().toISOString() } } : {},
+      currentReplyTarget: { turnId: 'om_other', rootMessageId: 'om_other_topic', updatedAt: new Date().toISOString() },
+    };
+    seedPersistedSessionRows(f.dataDir, app, rows);
+    const result = await f.run(['add', '0 12 * * *', 'new task', '--topic', '--id', '11223344']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('话题下执行需要');
+    expect(f.read()['11223344']).toBeUndefined();
+    const explicit = await f.run(['add', '0 12 * * *', 'new task', '--topic', '--root-msg-id', 'om_explicit', '--id', '11223344']);
+    expect(explicit.code, explicit.output).toBe(0);
+    expect(f.read()['11223344'].rootMessageId).toBe('om_explicit');
+  });
+
+  it('keeps the bound root for an ordinary thread session', async () => {
+    const f = fixture();
+    await managed(f);
+    const result = await f.run(['add', '0 12 * * *', 'new task', '--topic', '--id', '11223344']);
+    expect(result.code, result.output).toBe(0);
+    expect(f.read()['11223344'].rootMessageId).toBe('om_root');
+  });
+
   it('documents both update inputs without requiring a configured bot', async () => {
     const f = fixture();
     const result = await f.run(['update', '--help']);
@@ -194,8 +317,8 @@ describe('schedule CLI prompt updates', () => {
     expect(f.read()).toEqual({ [f.task.id]: f.task });
   });
   it('supports literal prompt values and rejects duplicate flags', () => {
-    expect(readSchedulePromptUpdate(['id', '--prompt=--literal\nbody'])).toBe('--literal\nbody');
-    expect(() => readSchedulePromptUpdate(['id', '--prompt', 'a', '--prompt', 'b'])).toThrow('duplicate');
+    expect(readScheduleUpdate(['id', '--prompt=--literal\nbody']).prompt).toBe('--literal\nbody');
+    expect(() => readScheduleUpdate(['id', '--prompt', 'a', '--prompt', 'b'])).toThrow('duplicate');
   });
   it('creates and updates from an ownerless managed session with no bots.json', async () => {
     const f = fixture(); const calls = await managed(f);
@@ -207,6 +330,19 @@ describe('schedule CLI prompt updates', () => {
     expect(f.read()[f.task.id]).toEqual({ ...f.task, prompt: 'new prompt' });
     expect(calls()).toBe(4);
     expect(readPersistedSessionRows(f.dataDir, app)[sid].ownerOpenId).toBeUndefined();
+  });
+  it('runs an existing protected task with same-app open-id admission and no creator union id', async () => {
+    const f = fixture();
+    await managed(f, proof => { proof.scheduleCreator = { ok: false, error: 'caller_union_id_unresolved' }; });
+    writeFileSync(f.path, JSON.stringify({ [f.task.id]: { ...f.task, enabled: true, preconditionRef: 'host-owned' } }));
+    const result = await f.run(['run', f.task.id]);
+    expect(result.code, result.output).toBe(0);
+    expect(f.read()[f.task.id]).toMatchObject({ manualRunRequested: true, preconditionRef: 'host-owned' });
+    expect(readPersistedSessionRows(f.dataDir, app)[sid].ownerOpenId).toBeUndefined();
+    const create = await f.run(['add', '0 12 * * *', 'new task', '--id', '11223344']);
+    expect(create.code, create.output).not.toBe(0);
+    expect(create.output).toContain('cannot resolve the current turn caller union_id');
+    expect(f.read()['11223344']).toBeUndefined();
   });
   it('lets the worker-owned Remote Runner relay reach daemon authorization without a CLI pid marker', async () => {
     const f = fixture(); const calls = await managed(f);
@@ -274,6 +410,29 @@ describe('schedule CLI prompt updates', () => {
       remoteRunnerSessionTool: true,
       remoteRunnerControllerOpenId: 'ou_developer',
     }));
+  });
+  it('forwards the frozen Remote Runner controller on a structured mutation', async () => {
+    const f = fixture(); const requests: Array<Record<string, unknown>> = [];
+    await managed(f, undefined, 'om_live', requests);
+    delete f.env.BOTMUX_ORIGIN_CHANNEL_ID;
+    delete f.env.BOTMUX_READ_ISOLATION;
+    Object.assign(f.env, {
+      BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+      BOTMUX_SESSION_ID: sid,
+      BOTMUX_TURN_ID: 'om_live',
+      BOTMUX_REMOTE_RUNNER_CONTROLLER_OPEN_ID: 'ou_developer',
+    });
+    const result = await f.run([
+      'remove', f.task.id, '--remote-runner-session-tool',
+    ]);
+    expect(result.code, result.output).toBe(0);
+    expect(requests).toContainEqual(expect.objectContaining({
+      action: 'remove',
+      id: f.task.id,
+      remoteRunnerSessionTool: true,
+      remoteRunnerControllerOpenId: 'ou_developer',
+    }));
+    expect(f.read()[f.task.id]).toBeUndefined();
   });
   it('rejects an invalid Remote Runner controller before contacting the daemon', async () => {
     const f = fixture(); const requests: Array<Record<string, unknown>> = [];
@@ -370,35 +529,15 @@ describe('schedule CLI prompt updates', () => {
     expect(calls()).toBe(2);
     expect(f.read()[f.task.id].prompt).toBe('host-visible ancestry');
   });
-  it('refuses to touch a task bound to a protected precondition and keeps the binding valid', async () => {
-    // A CLI prompt rewrite changes canonical schedule input. The host-only
-    // precondition sidecar is unreadable inside the worker sandbox, so the CLI
-    // cannot rebind it; a successful update here would leave every future fire
-    // failing resolution with canonical_input_mismatch and the task silently
-    // never running again.
-    const f = fixture(); await managed(f);
-    const staged = stageSchedulePrecondition(app, f.task.id, {
-      enabled: true, source: { kind: 'inline', script: 'exit 0' },
-    }, { dataDir: f.dataDir });
-    const bound = { ...f.task, preconditionRef: staged.preconditionRef };
-    writeFileSync(f.path, JSON.stringify({ [f.task.id]: bound }));
-    activateSchedulePrecondition(bound, app, { dataDir: f.dataDir });
-    const before = readFileSync(f.path, 'utf8');
-
-    const result = await f.run(['update', f.task.id, '--prompt', 'new prompt']);
-    expect(result.code, result.output).not.toBe(0);
-    expect(result.output).toMatch(/precondition|前置条件/);
-    expect(readFileSync(f.path, 'utf8')).toBe(before);
-
-    const resolved = resolveSchedulePrecondition(f.read()[f.task.id], app, { dataDir: f.dataDir });
-    expect(resolved).toMatchObject({ kind: 'configured', enabled: true });
-  });
   it.each(['denied', 'old-daemon', 'turn-rotated', 'permission-revoked', 'cross-bot'] as const)(
     'preserves the old task when authorization is %s', async mode => {
       const f = fixture();
       await managed(f, (proof, index) => {
-        if (mode === 'denied' || (mode === 'permission-revoked' && index > 1)) proof.scheduleCreator = { ok: false, error: 'caller_not_allowed' };
-        if (mode === 'old-daemon') delete proof.scheduleCreator;
+        if (mode === 'denied' || (mode === 'permission-revoked' && index > 1)) {
+          proof.scheduleCreator = { ok: false, error: 'caller_not_allowed' };
+          proof.scheduleOperator = { ok: false, error: 'caller_not_allowed' };
+        }
+        if (mode === 'old-daemon') delete proof.scheduleOperator;
         if (mode === 'turn-rotated' && index > 1) proof.turnId = 'om_next';
         if (mode === 'cross-bot') proof.larkAppId = 'cli_other';
       });
@@ -411,6 +550,162 @@ describe('schedule CLI prompt updates', () => {
       expect(result.output).toContain(errors[mode]);
       expect(readFileSync(f.path, 'utf8')).toBe(before);
     });
+});
+
+const STACK_FRAME = /^\s+at /m;
+
+describe('schedule CLI frequency updates', () => {
+  it('sends the new frequency with the prompt and prints the new rule and next run', async () => {
+    const f = fixture();
+    writeFileSync(f.path, JSON.stringify({ [f.task.id]: { ...f.task, enabled: true, disabledReason: undefined } }));
+    const observed: Array<Record<string, unknown>> = [];
+    await managed(f, undefined, 'om_live', observed);
+    const result = await f.run(['update', f.task.id, '--schedule', ' every 4h ', '--prompt', 'new prompt']);
+    expect(result.code, result.output).toBe(0);
+    expect(observed.find(r => r.action === 'update')).toMatchObject({ schedule: 'every 4h', prompt: 'new prompt' });
+    expect(f.read()[f.task.id]).toMatchObject({ id: f.task.id, schedule: 'every 4h', prompt: 'new prompt',
+      lastRunAt: f.task.lastRunAt, ownerOpenId: 'ou_owner' });
+    expect(result.output).toContain('every 4h');
+    expect(result.output).toMatch(/下次执行: \S+/);
+  });
+
+  it('tells the user a paused task stays paused', async () => {
+    const f = fixture(); await managed(f);
+    const result = await f.run(['update', f.task.id, '--schedule=0 */4 * * *']);
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain('任务已暂停');
+  });
+
+  it('points a finished one-shot at resume only when the daemon gave it a new frequency', async () => {
+    const f = fixture();
+    const { nextRunAt: _cleared, ...finished } = f.task;
+    writeFileSync(f.path, JSON.stringify({ [f.task.id]: { ...finished, schedule: '30m',
+      parsed: { kind: 'once', runAt: '2026-01-01T04:00:00.000Z', display: '30m' }, disabledReason: 'once_completed' } }));
+    await managed(f);
+    // Sent again unchanged, the expression is not re-registered: resume would
+    // enable a task with no next run.
+    const resent = await f.run(['update', f.task.id, '--schedule', '30m']);
+    expect(resent.code, resent.output).toBe(0);
+    expect(resent.output).toContain('任务已结束，不会自动执行');
+    expect(resent.output).not.toContain('schedule resume');
+    const rescheduled = await f.run(['update', f.task.id, '--schedule', 'every 4h']);
+    expect(rescheduled.code, rescheduled.output).toBe(0);
+    expect(rescheduled.output).toContain(`botmux schedule resume ${f.task.id}`);
+    const promptOnly = await f.run(['update', f.task.id, '--prompt', 'new prompt']);
+    expect(promptOnly.code, promptOnly.output).toBe(0);
+    expect(promptOnly.output).toContain('任务已结束，不会自动执行');
+    expect(promptOnly.output).not.toContain('schedule resume');
+  });
+
+  it.each([
+    ['calendar_once_unsupported', '--calendar none'],
+    ['schedule_precondition_update_failed', '已全部回滚'],
+    ['until_done_retry_requires_once', '--retry-every 只用于一次性任务'],
+    ['until_done_deadline_before_first_run', '--deadline 早于任务第一次执行的时间'],
+  ])('turns the frequency refusal %s into Chinese text', async (code, text) => {
+    const f = fixture();
+    await managed(f, undefined, 'om_live', undefined, code);
+    const result = await f.run(['update', f.task.id, '--schedule', 'every 4h']);
+    expect(result.code, result.output).toBe(1);
+    expect(result.output).toContain(text);
+    expect(result.output).not.toContain(code);
+  });
+
+  it.each(['sometimes', '25:99', '* * *'])('refuses the unreadable frequency %s before contacting the daemon', async raw => {
+    const f = fixture(); const calls = await managed(f);
+    const before = readFileSync(f.path, 'utf8');
+    const result = await f.run(['update', f.task.id, '--schedule', raw]);
+    expect(result.code, result.output).toBe(2);
+    expect(result.output).toContain(`无法解析频率 "${raw}"`);
+    expect(result.output).toContain('every 2h');
+    expect(result.output).not.toMatch(STACK_FRAME);
+    expect(calls()).toBe(0);
+    expect(readFileSync(f.path, 'utf8')).toBe(before);
+  });
+
+  it('reports a daemon refusal as one line and leaves the task as it was', async () => {
+    const f = fixture();
+    await managed(f, undefined, 'om_live', undefined, 'schedule_mutation_current_human_required');
+    const before = readFileSync(f.path, 'utf8');
+    const result = await f.run(['update', f.task.id, '--schedule', 'every 4h']);
+    expect(result.code, result.output).toBe(1);
+    expect(result.output).toContain('schedule_mutation_current_human_required');
+    expect(result.output).not.toMatch(STACK_FRAME);
+    expect(readFileSync(f.path, 'utf8')).toBe(before);
+  });
+
+  it('does not claim a frequency change a pre-upgrade daemon ignored', async () => {
+    const f = fixture(); await managed(f);
+    f.preFrequencyDaemon = true;
+    const result = await f.run(['update', f.task.id, '--schedule', 'every 4h', '--prompt', 'new prompt']);
+    expect(result.code, result.output).toBe(1);
+    expect(result.output).toContain('未修改执行频率');
+    expect(result.output).not.toContain('✅');
+    expect(f.read()[f.task.id]).toMatchObject({ schedule: f.task.schedule, prompt: 'new prompt' });
+  });
+
+  it.each([
+    [['update', '--help']],
+    [['update', '-h']],
+    [['update', 'aabbccdd', '--schedule', 'every 4h', '--help']],
+  ])('prints the update usage for %j without touching anything', async args => {
+    const f = fixture(); const before = readFileSync(f.path, 'utf8');
+    const result = await f.run(args);
+    expect(result.code, result.output).toBe(0);
+    for (const field of ['--schedule', '--prompt', '--prompt-file', '--calendar', '--calendar-day-type']) {
+      expect(result.output).toContain(field);
+    }
+    expect(result.output).not.toMatch(STACK_FRAME);
+    expect(readFileSync(f.path, 'utf8')).toBe(before);
+  });
+
+  it.each([
+    [['update', 'aabbccdd', '--every', '4h'], '--every'],
+    [['update', 'aabbccdd'], '没有要修改的字段'],
+    [['update', 'aabbccdd', '--schedule'], '--schedule'],
+  ])('answers bad update arguments %j with the reason and the usage', async (args, reason) => {
+    const f = fixture();
+    const result = await f.run(args);
+    expect(result.code, result.output).toBe(2);
+    expect(result.output).toContain(reason);
+    expect(result.output).toContain('botmux schedule update <id>');
+    expect(result.output).not.toMatch(STACK_FRAME);
+  });
+
+  it('answers an unknown schedule subcommand with the usage', async () => {
+    const f = fixture();
+    const result = await f.run(['frobnicate', 'aabbccdd']);
+    expect(result.code, result.output).toBe(2);
+    expect(result.output).toContain('未知子命令: frobnicate');
+    expect(result.output).toContain('schedule update');
+  });
+
+  it.each([[['--help']], [['-h']], [['help']]])('prints the schedule usage for schedule %j', async args => {
+    const f = fixture();
+    const result = await f.run(args);
+    expect(result.code, result.output).toBe(0);
+    for (const sub of ['schedule add', 'schedule update', 'schedule remove', '--schedule']) {
+      expect(result.output).toContain(sub);
+    }
+  });
+});
+
+describe('schedule CLI pause/remove admission', () => {
+  // A bot turn cannot prove a current human operator, yet it may be cleaning
+  // up a bot-policy task in that task's original topic. Only the owning daemon
+  // can tell, so pause/remove must reach it instead of stopping at the CLI's
+  // human-operator check; other management actions still stop there.
+  it('leaves pause and remove from a turn without a human operator to the daemon', async () => {
+    const f = fixture();
+    const observed: Array<Record<string, unknown>> = [];
+    await managed(f, proof => { proof.scheduleOperator = { ok: false, error: 'caller_not_allowed' }; }, 'om_live', observed);
+    await f.run(['pause', f.task.id]);
+    await f.run(['remove', f.task.id]);
+    const resumed = await f.run(['resume', f.task.id]);
+    expect(resumed.code, resumed.output).not.toBe(0);
+    expect(observed.filter(request => typeof request.action === 'string').map(request => request.action))
+      .toEqual(['pause', 'remove']);
+  });
 });
 
 describe('work calendar CLI configuration and persisted manual intent', () => {

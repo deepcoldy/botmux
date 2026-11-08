@@ -20,7 +20,6 @@ import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
 import { zmxEnv } from '../setup/ensure-zmx.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from '../adapters/backend/types.js';
 import type { DaemonSession } from './types.js';
-import type { Session } from '../types.js';
 
 export type PersistentBackendType = Extract<BackendType, 'tmux' | 'herdr' | 'zellij' | 'zmx'>;
 
@@ -212,10 +211,17 @@ export function resolvePersistentBackendTarget(
 ): PersistentBackendTarget {
   if (persisted?.backendType === backendType && persisted.sessionName.trim()) {
     if (persisted.backendType !== 'herdr' || persisted.agentName === undefined || persisted.agentName.trim()) {
-      return persisted;
+      // Herdr's old exclusive host carries no agent identity. Keep the complete
+      // owner beside the resolved (ephemeral) target so destructive lifecycle
+      // work can distinguish `bmx-<sid8>` from shared/custom host sessions.
+      return persisted.backendType === 'herdr' && persisted.agentName === undefined
+        ? { ...persisted, sessionId }
+        : persisted;
     }
   }
-  return { backendType, sessionName: persistentSessionName(backendType, sessionId) };
+  const sessionName = persistentSessionName(backendType, sessionId);
+  if (backendType === 'herdr') return { backendType, sessionName, sessionId };
+  return { backendType, sessionName };
 }
 
 export function persistentBackendTargetForSession(ds: DaemonSession): PersistentBackendTarget | undefined {
@@ -228,28 +234,37 @@ export function persistentBackendTargetForSession(ds: DaemonSession): Persistent
   );
 }
 
-/** Exact managed resources to remove when a single-bot CLI changes.
- * Adopted panes are user-owned; machine-wide Herdr agents must be returned as
- * agent-scoped targets rather than collapsing to the shared host session. */
-export function managedTargetsForCliChange(
-  backendType: PersistentBackendType,
-  sessions: readonly Pick<Session, 'sessionId' | 'adoptedFrom' | 'persistentBackendTarget'>[],
-): PersistentBackendTarget[] {
-  return sessions
-    .filter(session => !session.adoptedFrom)
-    .map(session => resolvePersistentBackendTarget(
-      backendType,
-      session.sessionId,
-      session.persistentBackendTarget,
-    ));
+/**
+ * The only agent-less Herdr target that Botmux may own as a whole session is
+ * its deterministic legacy host. Shared `botmux` / custom hosts and malformed
+ * rows stay fail-closed even when their names merely resemble a managed name.
+ */
+function isExclusiveAgentlessHerdrTarget(
+  target: Extract<PersistentBackendTarget, { backendType: 'herdr' }>,
+): boolean {
+  return target.agentName === undefined
+    && typeof target.sessionId === 'string'
+    && target.sessionId.length > 0
+    && target.sessionId === target.sessionId.trim()
+    && target.sessionName === persistentSessionName('herdr', target.sessionId);
 }
 
 export function probePersistentBackendTarget(target: PersistentBackendTarget): SessionProbe {
+  if (target.backendType === 'tmux' && target.socketName !== undefined) {
+    return TmuxBackend.probeSession(target.sessionName, target.socketName);
+  }
   if (target.backendType === 'zmx' && target.socketDir !== undefined) {
     return ZmxBackend.probeSession(target.sessionName, zmxEnv(process.env, target.socketDir));
   }
-  if (target.backendType === 'herdr' && target.agentName) {
-    return HerdrBackend.probeAgent(target.sessionName, target.agentName);
+  if (target.backendType === 'herdr') {
+    if (target.agentName?.trim()) {
+      return HerdrBackend.probeAgent(target.sessionName, target.agentName);
+    }
+    // Legacy exclusive hosts are safe to probe as a whole session only with
+    // complete ownership proof. Shared/custom/malformed targets stay unknown.
+    return isExclusiveAgentlessHerdrTarget(target)
+      ? HerdrBackend.probeSession(target.sessionName)
+      : 'unknown';
   }
   return probePersistentSession(target.backendType, target.sessionName);
 }
@@ -269,8 +284,20 @@ export function killPersistentBackendTarget(
     ZmxBackend.killManagedSession(target.sessionName, sessionId, undefined, zmxEnv(process.env, target.socketDir));
     return;
   }
-  if (target.backendType === 'herdr' && target.agentName) {
-    HerdrBackend.killAgent(target.sessionName, target.agentName);
+  if (target.backendType === 'herdr') {
+    if (target.agentName?.trim()) {
+      HerdrBackend.killAgent(target.sessionName, target.agentName);
+      return;
+    }
+    if (!isExclusiveAgentlessHerdrTarget(target)
+      || (sessionId !== undefined && sessionId !== target.sessionId)) {
+      throw new Error('Herdr whole-session teardown requires an exact exclusive owner target');
+    }
+    HerdrBackend.killSession(target.sessionName);
+    return;
+  }
+  if (target.backendType === 'tmux' && target.socketName !== undefined) {
+    TmuxBackend.killSession(target.sessionName, target.socketName);
     return;
   }
   killPersistentSession(target.backendType, target.sessionName, sessionId);
@@ -338,7 +365,11 @@ export function persistentBackendTargetKey(target: PersistentBackendTarget): str
     target.backendType,
     target.sessionName,
     target.backendType === 'herdr' ? target.agentName ?? '' : '',
+    target.backendType === 'herdr' && target.agentName === undefined ? target.sessionId ?? '' : '',
     target.backendType === 'zmx' ? target.socketDir ?? '' : '',
+    // Appended only when set so default-server keys stay byte-identical to the
+    // keys older code computed (caches/batches compare them across call sites).
+    ...(target.backendType === 'tmux' && target.socketName !== undefined ? [target.socketName] : []),
   ]);
 }
 
@@ -350,7 +381,14 @@ export function probePersistentBackendTargets(
   const groups = new Map<string, Map<string, PersistentBackendTarget>>();
   for (const target of targets) {
     const key = persistentBackendTargetKey(target);
-    if (target.backendType === 'herdr' && target.agentName) {
+    // Both agent-scoped and legacy exclusive Herdr targets require the same
+    // ownership-aware single-target classifier. Never downgrade either kind to
+    // the name-only batch probe used by whole-session backends.
+    if (target.backendType === 'herdr') {
+      if (!result.has(key)) result.set(key, probePersistentBackendTarget(target));
+      continue;
+    }
+    if (target.backendType === 'tmux' && target.socketName !== undefined) {
       if (!result.has(key)) result.set(key, probePersistentBackendTarget(target));
       continue;
     }
@@ -391,4 +429,49 @@ export function killPersistentSession(
     ZmxBackend.killManagedSession(name, sessionId);
   }
   else HerdrBackend.killSession(name);
+}
+
+/**
+ * {@link probePersistentBackendTarget} for verifying a kill that just went
+ * through. Killing the last session on a tmux server makes that server exit,
+ * and a probe that connects while it is still going down reads "server exited
+ * unexpectedly" — a server-level error, so 'unknown' — although tmux gives its
+ * own answer a moment later. Only 'unknown' is re-probed, with the same short
+ * backoff as {@link TmuxBackend.probeSessionWithRetry} (at most ~0.75s of
+ * sleep over the default three attempts, on top of each probe's own deadline
+ * — 3s for tmux); 'exists' / 'missing' return at once, and a backing that
+ * stays indeterminate is still 'unknown' for the caller to fail closed on.
+ * A target that is unknown by construction is not re-probed at all.
+ */
+export function probePersistentBackendTargetAfterKill(
+  target: PersistentBackendTarget,
+  opts: {
+    attempts?: number;
+    baseDelayMs?: number;
+    /** Test seams. */
+    probe?: (target: PersistentBackendTarget) => SessionProbe;
+    sleep?: (ms: number) => void;
+  } = {},
+): SessionProbe {
+  const attempts = Math.max(1, Math.floor(opts.attempts ?? 3));
+  const baseDelayMs = Math.max(0, Math.floor(opts.baseDelayMs ?? 150));
+  // A shared/custom agentless herdr target is never asked (see
+  // probePersistentBackendTarget): waiting cannot change its answer.
+  if (target.backendType === 'herdr' && !target.agentName?.trim() && !isExclusiveAgentlessHerdrTarget(target)) {
+    return 'unknown';
+  }
+  const probe = opts.probe ?? probePersistentBackendTarget;
+  const sleep = opts.sleep ?? ((ms: number) => {
+    try {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    } catch { /* SharedArrayBuffer unavailable: retry immediately */ }
+  });
+  let result = probe(target);
+  for (let completed = 1; result === 'unknown' && completed < attempts; completed += 1) {
+    const backoff = baseDelayMs * (2 ** (completed - 1));
+    const jitter = baseDelayMs > 0 ? Math.floor(Math.random() * baseDelayMs) : 0;
+    sleep(backoff + jitter);
+    result = probe(target);
+  }
+  return result;
 }

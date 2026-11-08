@@ -13,6 +13,7 @@ import { appendFileSync } from 'node:fs';
  *
  * Scenarios via FAKE_DSH_SCENARIO:
  *   happy (default) - full event stream with assistant text + usage
+ *   reasoning       - real DSH reasoning, interim text, tool call/result, then final text + usage
  *   multi-step      - two assistant/message events; only the last is the final
  *                     answer, usage accumulates, and its two text blocks join
  *                     with no separator
@@ -25,12 +26,18 @@ import { appendFileSync } from 'node:fs';
  *   bad-prompt-ack  - first session/prompt returns no messageId, the second
  *                     runs the happy path (preamble must survive)
  *   bad-initialize  - initialize returns no server identity
+ *   model-not-ready - the first two initialize calls fail with "has no configured
+ *                     model" (a plugin provider still registering its models)
+ *   initialize-error - every initialize fails with an unrelated JSON-RPC error
  *   error           - session/prompt fails with a JSON-RPC error
  *   turn-error      - prompt accepted, but the turn ends with an LLM error
  *                     (like the real 401 path): no assistant/message, a
  *                     turn/end with reason.error — the runner must surface it
  *   empty           - tool calls only, no assistant text (empty final)
  *   hang            - never goes idle (exercises the turn watchdog)
+ *   progressive     - tool progress outlasts the idle watchdog, then completes
+ *   endless-progress - tool progress never completes (exercises the hard limit)
+ *   unclaimed-progress - tool notifications without a matching inbox receipt
  */
 
 const scenario = process.env.FAKE_DSH_SCENARIO ?? 'happy';
@@ -40,7 +47,6 @@ const logPath = process.env.FAKE_DSH_LOG;
 if (process.argv[2] === 'plugin') {
   process.exit(0);
 }
-if (logPath) appendFileSync(logPath, JSON.stringify({ argv: process.argv.slice(2) }) + '\n');
 const expectedEnv = process.env.FAKE_DSH_EXPECT_ENV_JSON
   ? JSON.parse(process.env.FAKE_DSH_EXPECT_ENV_JSON)
   : {};
@@ -62,8 +68,28 @@ for (const name of expectedAbsentEnv) {
   }
 }
 
+const launch = {
+  argv: process.argv.slice(2),
+  cwd: process.cwd(),
+  dshHome: process.env.DSH_HOME,
+  sessionRoot: process.env.DSH_SESSION_ROOT,
+  askTimeout: process.env.BOTMUX_DSH_ASK_TIMEOUT_MS,
+};
+if (process.argv.includes('--dump-config')) {
+  if (logPath) appendFileSync(logPath, JSON.stringify({ dump: launch }) + '\n');
+  if (process.env.FAKE_DSH_CONFIG_ERROR) {
+    process.stdout.write(process.env.FAKE_DSH_CONFIG ?? '[]\n');
+    process.stderr.write(process.env.FAKE_DSH_CONFIG_ERROR);
+    process.exit(2);
+  }
+  process.stdout.write(process.env.FAKE_DSH_CONFIG ?? '[]\n');
+  process.exit(0);
+}
+if (logPath) appendFileSync(logPath, JSON.stringify(launch) + '\n');
+
 let inputBuffer = '';
 let promptCount = 0;
+let initializeCount = 0;
 
 function send(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n');
@@ -111,6 +137,52 @@ function runHappyTurn(sessionId, messageId) {
         source: { callId },
         content: [{ type: 'tool-result', content: [{ type: 'text', text: 'hi\n' }], isError: false }],
       },
+    },
+  });
+  notify('session.status', { sessionId, status: 'idle' });
+}
+
+function runReasoningTurn(sessionId, messageId) {
+  sendInboxReceipt(sessionId, messageId);
+  const callId = 'call_cot_1';
+  const args = '{"command":"echo cot-probe"}';
+  sessionEvent(sessionId, {
+    type: 'assistant/message',
+    data: {
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: '先确认命令' },
+          { type: 'text', text: '先执行一下命令。' },
+          { type: 'tool-call', id: callId, name: 'bash', arguments: args },
+        ],
+      },
+    },
+  });
+  sessionEvent(sessionId, {
+    type: 'tool/call',
+    data: { callId, name: 'bash', arguments: args },
+  });
+  sessionEvent(sessionId, {
+    type: 'tool/result',
+    data: {
+      message: {
+        role: 'tool', source: { kind: 'tool', callId }, toolCallId: callId,
+        content: [{ type: 'text', text: 'cot-probe\n' }], isError: false,
+      },
+    },
+  });
+  sessionEvent(sessionId, {
+    type: 'assistant/message',
+    data: {
+      message: {
+        role: 'assistant',
+        content: [
+          { type: 'reasoning', text: '输出已确认' },
+          { type: 'text', text: finalText },
+        ],
+      },
+      usage: { inputTokens: 100, outputTokens: 42, cacheReadTokens: 10, reasoningTokens: 8 },
     },
   });
   notify('session.status', { sessionId, status: 'idle' });
@@ -202,6 +274,45 @@ function runEmptyTurn(sessionId, messageId) {
   notify('session.status', { sessionId, status: 'idle' });
 }
 
+function runProgressiveTurn(sessionId, messageId, endless = false) {
+  sendInboxReceipt(sessionId, messageId);
+  let count = 0;
+  const interval = setInterval(() => {
+    const callId = `call_progress_${++count}`;
+    sessionEvent(sessionId, {
+      type: 'tool/call',
+      data: { callId, name: 'bash', arguments: '{"command":"echo progress"}' },
+    });
+    sessionEvent(sessionId, {
+      type: 'tool/result',
+      data: {
+        message: {
+          source: { callId },
+          content: [{ type: 'tool-result', content: [], isError: false }],
+        },
+      },
+    });
+    if (count === 9 && !endless) {
+      clearInterval(interval);
+      sessionEvent(sessionId, {
+        type: 'assistant/message',
+        data: { message: { role: 'assistant', content: [{ type: 'text', text: finalText }] } },
+      });
+      notify('session.status', { sessionId, status: 'idle' });
+    }
+  }, 90);
+}
+
+function runUnclaimedProgress(sessionId) {
+  let count = 0;
+  setInterval(() => {
+    sessionEvent(sessionId, {
+      type: 'tool/call',
+      data: { callId: `unclaimed_${++count}`, name: 'bash', arguments: '{}' },
+    });
+  }, 90);
+}
+
 function handleLine(line) {
   let msg;
   try {
@@ -211,6 +322,19 @@ function handleLine(line) {
   }
   if (msg.method === 'initialize') {
     if (logPath) appendFileSync(logPath, JSON.stringify({ initialize: msg.params }) + '\n');
+    initializeCount++;
+    if (scenario === 'model-not-ready' && initializeCount <= 2) {
+      send({
+        jsonrpc: '2.0',
+        id: msg.id,
+        error: { code: -32000, message: `pi-ai provider "${msg.params?.provider}" has no configured model "${msg.params?.model}"` },
+      });
+      return;
+    }
+    if (scenario === 'initialize-error') {
+      send({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'boom' } });
+      return;
+    }
     if (scenario === 'bad-initialize') {
       send({ jsonrpc: '2.0', id: msg.id, result: {} });
       return;
@@ -255,9 +379,14 @@ function handleLine(line) {
     // Notifications land after the enqueue receipt, like the real server.
     setImmediate(() => {
       if (scenario === 'empty') runEmptyTurn(sessionId, messageId);
+      else if (scenario === 'reasoning') runReasoningTurn(sessionId, messageId);
       else if (scenario === 'multi-step') runMultiStepTurn(sessionId, messageId);
       else if (scenario === 'stale') runStaleTurn(sessionId, messageId);
       else if (scenario === 'turn-error') runTurnErrorTurn(sessionId, messageId);
+      else if (scenario === 'progressive' || scenario === 'endless-progress') {
+        runProgressiveTurn(sessionId, messageId, scenario === 'endless-progress');
+      }
+      else if (scenario === 'unclaimed-progress') runUnclaimedProgress(sessionId);
       else runHappyTurn(sessionId, messageId);
     });
     return;

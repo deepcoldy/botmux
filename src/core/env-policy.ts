@@ -1,5 +1,10 @@
 import { sanitizePerBotEnv, isReservedPerBotEnvKey } from './per-bot-env.js';
 import { BOTMUX_INJECTED_ENV_KEYS, WORKFLOW_WORKER_ENV_KEYS, redactChildEnv } from '../utils/child-env.js';
+import { applySessionEnvUnset } from './session-env.js';
+import {
+  protectedMcpRedactedEnvKeys,
+  type ProtectedMcpWorkerPolicy,
+} from './protected-mcp-capabilities.js';
 
 /** Secret-free per-bot inheritance policy. Missing means historical inheritance. */
 export interface EnvPolicy {
@@ -48,8 +53,18 @@ export function inheritBotEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): Node
   return out;
 }
 
-/** CLI boundary. Keep only the fixed host-owned session/workflow contract. */
-export function buildSessionChildEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): NodeJS.ProcessEnv {
+/**
+ * CLI boundary. Keep only the fixed host-owned session/workflow contract.
+ * `unset` is the composed session-env overlay's removal list
+ * (core/session-env.ts): applied here, BEFORE every trusted botmux injection,
+ * so it can only ever remove inherited user variables.
+ */
+export function buildSessionChildEnv(
+  base: NodeJS.ProcessEnv,
+  policy?: EnvPolicy,
+  unset?: readonly string[],
+  protectedMcpPolicy?: ProtectedMcpWorkerPolicy,
+): NodeJS.ProcessEnv {
   const inherited = inheritBotEnv(base, policy);
   if (policy?.mode === 'strict') {
     for (const key of [...BOTMUX_INJECTED_ENV_KEYS, ...WORKFLOW_WORKER_ENV_KEYS]) {
@@ -59,11 +74,17 @@ export function buildSessionChildEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy
       if (base[key] !== undefined) inherited[key] = base[key];
     }
   }
-  return redactChildEnv(inherited);
+  const env = redactChildEnv(inherited, protectedMcpRedactedEnvKeys(protectedMcpPolicy));
+  applySessionEnvUnset(env, unset);
+  return env;
 }
 
 /** Worker control process retains Botmux control knobs, never business env. */
-export function buildBotWorkerEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): NodeJS.ProcessEnv {
+export function buildBotWorkerEnv(
+  base: NodeJS.ProcessEnv,
+  policy?: EnvPolicy,
+  protectedMcpPolicy?: ProtectedMcpWorkerPolicy,
+): NodeJS.ProcessEnv {
   const env = inheritBotEnv(base, policy);
   if (policy?.mode === 'strict') {
     for (const key of [...BOTMUX_INJECTED_ENV_KEYS, ...WORKFLOW_WORKER_ENV_KEYS,
@@ -79,16 +100,37 @@ export function buildBotWorkerEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): 
   if (policy?.mode === 'strict') {
     // Host-owned worker HTTP/watchdog settings are control-plane only. The
     // CLI boundary does not retain them without an explicit user grant.
+    // BOTMUX_TMUX_SOCKET: which tmux server the worker creates managed panes on
+    // (tmux-socket.ts) — dropping it would undo an operator's opt-out per bot.
     for (const key of ['WEB_HOST', 'WEB_EXTERNAL_HOST', 'WEB_EXTERNAL_PORT',
-      'STUCK_DETECTOR_ENABLED', 'STUCK_DETECTOR_TIMEOUT_MS']) {
+      'STUCK_DETECTOR_ENABLED', 'STUCK_DETECTOR_TIMEOUT_MS', 'BOTMUX_TMUX_SOCKET']) {
       if (base[key] !== undefined) env[key] = base[key];
     }
   }
+  // Apply dynamic capability redaction last: a protected source may share a
+  // name with a normally retained worker control key (for example under a
+  // strict policy), and the protected boundary must win that collision.
+  for (const key of protectedMcpRedactedEnvKeys(protectedMcpPolicy)) delete env[key];
   return env;
 }
 
-/** Explicit values still obey the mandatory CLI secret/session scrub. */
-export function botInjectedEnv(raw: unknown, policy?: EnvPolicy): Record<string, string> {
-  const env = sanitizePerBotEnv(raw);
+/**
+ * Explicit values still obey the mandatory CLI secret/session scrub.
+ *
+ * This does NOT filter the git command-line config channel: a configured
+ * `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_n` / `GIT_CONFIG_VALUE_n` passes
+ * through. Spawn paths that reach git must neutralize it afterwards —
+ * pane/PTY/strict do it in their own env builder, the identity-wrapped spawns
+ * and the RPC app-server via prepareTurnGitConfigEnv. Callers that hand this
+ * env to a direct git-running process without that step are known uncovered
+ * one-shot/probe paths (follow-up after #2203).
+ */
+export function botInjectedEnv(
+  raw: unknown,
+  policy?: EnvPolicy,
+  protectedMcpPolicy?: ProtectedMcpWorkerPolicy,
+): Record<string, string> {
+  const protectedKeys = protectedMcpRedactedEnvKeys(protectedMcpPolicy);
+  const env = sanitizePerBotEnv(raw, protectedKeys);
   return (policy?.mode === 'strict' ? redactChildEnv(env) : env) as Record<string, string>;
 }

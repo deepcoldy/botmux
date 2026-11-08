@@ -89,15 +89,6 @@ function creatingExpired(record: WebhookLifecycleRecord, nowMs: number): boolean
   return Number.isFinite(expiresAt) && expiresAt <= nowMs;
 }
 
-export function listWebhookLifecycleRecords(
-  opts: { connectorId?: string; status?: WebhookLifecycleStatus } = {},
-  dataDir: string = config.session.dataDir,
-): WebhookLifecycleRecord[] {
-  return readStore(dataDir).records.filter(r =>
-    (!opts.connectorId || r.connectorId === opts.connectorId)
-    && (!opts.status || r.status === opts.status));
-}
-
 export async function beginWebhookLifecycleFiring(
   connectorId: string,
   dedupKey: string,
@@ -188,27 +179,5 @@ export async function failWebhookLifecycleGroup(
       store.records.splice(idx, 1);
       writeStore(dataDir, store);
     }
-  });
-}
-
-export async function resolveWebhookLifecycleGroup(
-  connectorId: string,
-  dedupKey: string,
-  dataDir: string = config.session.dataDir,
-): Promise<{ action: 'close' | 'pending' | 'noop'; record?: WebhookLifecycleRecord }> {
-  const fp = storePath(dataDir);
-  return withFileLock(fp, async () => {
-    const store = readStore(dataDir);
-    const idx = findIndex(store, connectorId, dedupKey);
-    const existing = idx >= 0 ? store.records[idx] : undefined;
-    if (!existing || existing.status === 'resolved') return { action: 'noop' };
-
-    const now = new Date().toISOString();
-    const next: WebhookLifecycleRecord = existing.status === 'creating'
-      ? { ...existing, pendingResolved: true, updatedAt: now }
-      : { ...existing, status: 'resolved', updatedAt: now, resolvedAt: now };
-    store.records[idx] = next;
-    writeStore(dataDir, store);
-    return { action: existing.status === 'creating' ? 'pending' : 'close', record: next };
   });
 }

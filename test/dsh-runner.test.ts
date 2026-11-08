@@ -5,11 +5,12 @@
  * Run: pnpm vitest run test/dsh-runner.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
+import { spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readJsonLines } from './helpers/read-json-lines.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 
 const RUNNER_PATH = resolve('src/dsh-runner.ts');
@@ -89,8 +90,7 @@ function spawnRunner(
 }
 
 function readLog(h: Harness): any[] {
-  if (!existsSync(h.logPath)) return [];
-  return readFileSync(h.logPath, 'utf8').trim().split('\n').filter(Boolean).map(JSON.parse);
+  return readJsonLines(h.logPath);
 }
 
 /** Only the session/prompt entries (initialize and phase markers filtered out). */
@@ -124,6 +124,18 @@ agent-default-model:
   model: model_hub/es1_orange_o48
 `;
 
+const PROFILE_MODEL = `
+- id: agent-default-model
+  name: '@deepseek-ai/dsh-agent-default-model'
+  config:
+    provider: flatkey
+    model: deepseek-v4-1-flash-1017
+- id: unrelated-plugin
+  config:
+    value: !!js "(() => { throw new Error('must not execute'); })()"
+    apiKey: config-secret-must-not-be-logged
+`;
+
 describe('dsh-runner', () => {
   let h: Harness | undefined;
 
@@ -155,6 +167,9 @@ describe('dsh-runner', () => {
       cacheReadTokens: 10,
       cacheCreateTokens: 0,
     });
+    const entries = parseMarkers(h.stdout).filter(m => m.kind === 'cot').flatMap(m => m.payload.entries);
+    expect(entries.filter(entry => entry.kind === 'thinking')).toEqual([{ kind: 'thinking', text: 'thinking...' }]);
+    expect(entries.some(entry => entry.kind === 'text')).toBe(false);
     // Tool calls render as progress lines.
     expect(h.stdout).toContain('🔧 bash');
     expect(h.stdout).toContain('✓ bash');
@@ -162,6 +177,36 @@ describe('dsh-runner', () => {
     expect(existsSync(join(h.home, '.dsh', 'profiles', 'botmux'))).toBe(true);
     // The legacy ~/.botmux/dsh path must not be created anymore.
     expect(existsSync(join(h.home, '.botmux', 'dsh'))).toBe(false);
+  });
+
+  it('emits ordered CoT entries for reasoning without duplicating the final reply', async () => {
+    const finalText = 'cot 最终回复';
+    h = spawnRunner('reasoning', [], { FAKE_DSH_FINAL_TEXT: finalText });
+    await waitFor(() => h!.stdout.includes('›'), { label: 'ready marker' });
+    h.child.stdin.write(makeFrame('检查命令输出'));
+    await waitFor(() => parseMarkers(h!.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
+
+    const markers = parseMarkers(h.stdout);
+    const cot = markers.filter(m => m.kind === 'cot');
+    expect(cot).toHaveLength(5);
+    for (const marker of cot) expect(marker.payload.entries).toHaveLength(1);
+    const entries = cot.flatMap(m => m.payload.entries);
+    expect(entries).toEqual([
+      { kind: 'thinking', text: '先确认命令' },
+      { kind: 'text', text: '先执行一下命令。' },
+      { kind: 'tool_call', id: 'call_cot_1', name: 'bash', args: '{"command":"echo cot-probe"}', subject: 'echo cot-probe' },
+      { kind: 'tool_result', id: 'call_cot_1', result: 'cot-probe\n' },
+      { kind: 'thinking', text: '输出已确认' },
+    ]);
+    expect(JSON.stringify(entries)).not.toContain(finalText);
+    const finals = markers.filter(m => m.kind === 'final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].payload.content).toBe(finalText);
+    expect(finals[0].payload.usage).toEqual({
+      inputTokens: 100, outputTokens: 42, cacheReadTokens: 10, cacheCreateTokens: 0,
+    });
+    expect(h.stdout).toContain('🔧 bash {"command":"echo cot-probe"}');
+    expect(h.stdout).toContain('✓ bash');
   });
 
   it('passes the question bridge patch to the dsh profile launch', async () => {
@@ -270,6 +315,41 @@ describe('dsh-runner', () => {
     expect(migratedPatch.indexOf('id: tool-ask-user')).toBeLessThan(migratedPatch.indexOf('id: sdk-jsonrpc-server'));
   });
 
+  it('keeps an ask-user version the user already set in the botmux profile', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-test-'));
+    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS);
+    const profileDir = join(home, '.dsh', 'profiles', 'botmux');
+    mkdirSync(join(profileDir, 'node_modules', '@deepseek-ai', 'dsh-tool-ask-user'), { recursive: true });
+    writeFileSync(join(profileDir, 'node_modules', '@deepseek-ai', 'dsh-tool-ask-user', 'package.json'), '{}\n', 'utf8');
+    const pkgText = JSON.stringify({
+      name: 'dsh-profile-botmux',
+      private: true,
+      dependencies: {
+        '@deepseek-ai/dsh-sdk-jsonrpc-server': '^0.2.0-rc.2',
+        '@deepseek-ai/dsh-sdk-protocol': '^0.2.0-rc.2',
+        '@deepseek-ai/dsh-tool-ask-user': '^0.2.0-rc.2',
+      },
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base'] } },
+    }, null, 2) + '\n';
+    writeFileSync(join(profileDir, 'package.json'), pkgText, 'utf8');
+    writeFileSync(join(profileDir, 'cordis.yml'), '[]\n', 'utf8');
+    writeFileSync(join(profileDir, 'cordis.patch.yml'), [
+      '# DSH profile: botmux (headless JSON-RPC server)',
+      '# Auto-generated by botmux. dsh-base provides the full plugin tree;',
+      '- insert:',
+      '    - id: tool-ask-user',
+      "      name: '@deepseek-ai/dsh-tool-ask-user'",
+      '    - id: sdk-jsonrpc-server',
+      "      name: '@deepseek-ai/dsh-sdk-jsonrpc-server'",
+      '',
+    ].join('\n'), 'utf8');
+
+    h = spawnRunner('happy', [], {}, home);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    expect(readFileSync(join(profileDir, 'package.json'), 'utf8')).toBe(pkgText);
+  });
+
   it('injects the identity preamble only on the first turn (multi-turn)', async () => {
     h = spawnRunner('happy');
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
@@ -285,6 +365,7 @@ describe('dsh-runner', () => {
     const secondText = prompts[1].prompt.contentBlocks[0].text;
     expect(firstText).toContain('<botmux_identity>');
     expect(firstText).toContain('TestBot');
+    expect(firstText).toContain('部署成功必须有实际观测依据');
     expect(firstText).toContain('第一句');
     expect(secondText).not.toContain('<botmux_identity>');
     expect(secondText).toBe('第二句');
@@ -301,7 +382,7 @@ describe('dsh-runner', () => {
     expect(final.payload.content).toContain('boom');
   });
 
-  it('emits an empty final when the agent produces no text', async () => {
+  it('sends a diagnostic final when the agent produces no text', async () => {
     h = spawnRunner('empty');
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
 
@@ -309,8 +390,9 @@ describe('dsh-runner', () => {
     await waitFor(() => parseMarkers(h.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
 
     const final = parseMarkers(h.stdout).find(m => m.kind === 'final')!;
-    expect(final.payload.content).toBe('');
-    expect(h.stdout).toContain('completed without text output');
+    expect(final.payload.content).toContain('没有生成最终回复');
+    expect(final.payload.content).toContain('无法确认任务是否成功');
+    expect(h.stdout).toContain('sent a diagnostic reply');
   });
 
   it('takes only the last assistant message as the final text and accumulates usage', async () => {
@@ -368,6 +450,9 @@ describe('dsh-runner', () => {
     const final = parseMarkers(h.stdout).find(m => m.kind === 'final')!;
     expect(final.payload.content).toContain('你好，我是 dsh。');
     // The fixture logs phase markers: notifications must precede the response.
+    // It logs the response phase only after sending the response, so the final
+    // marker can show up before that line is written.
+    await waitFor(() => readLog(h!).some((r: any) => r.phase === 'response'), { label: 'response phase logged' });
     const phases = readLog(h).filter((r: any) => r.phase).map((r: any) => r.phase);
     expect(phases).toEqual(['notifications', 'response']);
   });
@@ -424,6 +509,23 @@ describe('dsh-runner', () => {
     expect(h.stdout).not.toContain('›');
   });
 
+  it('retries initialize while a plugin provider has not registered its model yet', async () => {
+    h = spawnRunner('model-not-ready');
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    expect(h.stdout).toContain('dsh connected');
+    expect(readLog(h).filter((r: any) => r.initialize)).toHaveLength(3);
+  }, 30_000);
+
+  it('fails at once on any other initialize error', async () => {
+    h = spawnRunner('initialize-error');
+    const code = await new Promise<number | null>(resolve => h!.child.on('exit', resolve));
+
+    expect(code).toBe(1);
+    expect(h.stderr).toContain('boom');
+    expect(readLog(h).filter((r: any) => r.initialize)).toHaveLength(1);
+  });
+
   it('reaps a wedged turn with the watchdog and exits for restart', async () => {
     h = spawnRunner('hang', ['--turn-timeout-ms', '500']);
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
@@ -435,6 +537,57 @@ describe('dsh-runner', () => {
 
     const final = parseMarkers(h.stdout).find(m => m.kind === 'final')!;
     expect(final.payload.content).toContain('timed out');
+  }, 30_000);
+
+  it('does not arm a watchdog when the turn timeout is not configured', async () => {
+    h = spawnRunner('hang');
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    h.child.stdin.write(makeFrame('等待外部部署'));
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 750));
+
+    expect(parseMarkers(h.stdout).filter(m => m.kind === 'final')).toHaveLength(0);
+    expect(h.child.exitCode).toBeNull();
+  }, 30_000);
+
+  it('keeps an active turn alive while its correlated tools make progress', async () => {
+    h = spawnRunner('progressive', ['--turn-timeout-ms', '300']);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    h.child.stdin.write(makeFrame('long-running task'));
+    await waitFor(() => parseMarkers(h!.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
+
+    const finals = parseMarkers(h.stdout).filter(m => m.kind === 'final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].payload.content).toContain('你好，我是 dsh。');
+    expect(h.child.exitCode).toBeNull();
+  }, 30_000);
+
+  it('still terminates a turn that emits progress forever', async () => {
+    h = spawnRunner('endless-progress', ['--turn-timeout-ms', '300']);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
+    h.child.stdin.write(makeFrame('never-ending task'));
+    expect(await exitPromise).toBe(1);
+
+    const finals = parseMarkers(h.stdout).filter(m => m.kind === 'final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].payload.content).toContain('hard limit');
+  }, 30_000);
+
+  it('does not extend the watchdog for notifications without this turn receipt', async () => {
+    h = spawnRunner('unclaimed-progress', ['--turn-timeout-ms', '300']);
+    await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
+
+    const exitPromise = new Promise<number | null>(resolve => h!.child.on('exit', resolve));
+    h.child.stdin.write(makeFrame('unclaimed events'));
+    expect(await exitPromise).toBe(1);
+
+    const finals = parseMarkers(h.stdout).filter(m => m.kind === 'final');
+    expect(finals).toHaveLength(1);
+    expect(finals[0].payload.content).toContain('timed out after 300ms');
+    expect(finals[0].payload.content).not.toContain('hard limit');
   }, 30_000);
 
   // -------------------------------------------------------------------------
@@ -504,11 +657,14 @@ records:
     await waitFor(() => h.stdout.includes('›'), { label: 'ready marker' });
   });
 
+  // 源码结构护栏(K1)：`bun build --compile` 只打包能静态解析的依赖；经 createRequire 得到的
+  // `req('yaml')` 在编译态单文件二进制里解析不到，曾因此退回手写 fallback 解析器。源码态
+  // node_modules 在盘上照样能跑，行为测试测不出来。来历：#1220 改回静态 import，并在编译态二进制
+  // 实测凭据解析。
   it('keeps yaml as a static import so bun --compile bundles the real parser', () => {
     const source = readFileSync(RUNNER_PATH, 'utf8');
-    expect(source).toContain("from 'yaml'");
-    expect(source).not.toContain("req('yaml')");
-    expect(source).not.toContain('parseMinimalYaml');
+    expect(source).toMatch(/^import\s[^;]*\bfrom\s+['"]yaml['"]/m);
+    expect(source).not.toMatch(/\b(?:req|require)\(\s*['"]yaml['"]\s*\)/);
   });
 
   it('lets ambient credentials override the versioned credential file', async () => {
@@ -592,5 +748,174 @@ agent-default-model:
     const initEntry = entries.find((r: any) => r.initialize);
     expect(initEntry.initialize.provider).toBe('deepseek-official');
     expect(initEntry.initialize.model).toBe('deepseek-v4-pro');
+  });
+
+  it('uses the composed profile model after legacy settings have been imported', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
+    mkdirSync(join(home, '.dsh'), { recursive: true });
+    writeFileSync(join(home, '.dsh', 'settings.yaml.imported'), SUPER_RELAY_SETTINGS);
+    h = spawnRunner('happy', [], { FAKE_DSH_CONFIG: PROFILE_MODEL }, home);
+    await waitFor(() => h!.stdout.includes('›'), { label: 'ready marker' });
+
+    expect(readLog(h).find(entry => entry.initialize)?.initialize).toMatchObject({
+      provider: 'flatkey', model: 'deepseek-v4-1-flash-1017',
+    });
+    h.child.stdin.write(makeFrame('你好'));
+    await waitFor(() => parseMarkers(h!.stdout).some(m => m.kind === 'final'), { label: 'final marker' });
+    expect(h.stdout + h.stderr).not.toContain('config-secret-must-not-be-logged');
+    const diagnostic = h.stderr.split('\n').find(line => line.startsWith('[botmux:dsh] {'))!;
+    expect(JSON.parse(diagnostic.slice('[botmux:dsh] '.length))).toEqual({
+      profile: 'botmux', provider: 'flatkey', model: 'deepseek-v4-1-flash-1017',
+      providerSource: 'profile', modelSource: 'profile',
+    });
+  });
+
+  it.each([undefined, 'explicit-model'])('preserves pending legacy settings with model override %s', async model => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
+    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS);
+    h = spawnRunner('happy', model ? ['--model', model] : [], { FAKE_DSH_CONFIG: PROFILE_MODEL }, home);
+    await waitFor(() => h!.stdout.includes('›'), { label: 'ready marker' });
+
+    expect(readLog(h).find(entry => entry.initialize)?.initialize).toMatchObject({
+      provider: 'super-relay', model: model ?? 'model_hub/es1_orange_o48',
+    });
+  });
+
+  it('queries and launches the same profile, patch, cwd and environment', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
+    h = spawnRunner('happy', [
+      '--dsh-profile', 'custom-profile', '--bridge-patch', './overlay with spaces.yml',
+      '--turn-timeout-ms', '10000',
+    ], { DSH_HOME: join(home, 'custom-dsh'), FAKE_DSH_CONFIG: PROFILE_MODEL }, home);
+    await waitFor(() => h!.stdout.includes('›'), { label: 'ready marker' });
+
+    const entries = readLog(h);
+    const launch = entries.find(entry => entry.argv);
+    expect(launch).toMatchObject({
+      argv: ['--profile', 'custom-profile', '--patch=./overlay with spaces.yml'],
+      cwd: realpathSync(home), dshHome: join(home, 'custom-dsh'),
+      sessionRoot: join(home, 'custom-dsh', 'sessions', 'botmux', 'test-session'),
+      askTimeout: '5000',
+    });
+    expect(entries.find(entry => entry.dump)?.dump).toEqual({
+      ...launch, argv: [...launch.argv, '--dump-config'],
+    });
+  });
+
+  it('uses profile fields that are absent from pending legacy settings', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
+    writeNativeDshConfig(home, 'agent-default-model:\n  model: saved-model\n');
+    h = spawnRunner('happy', [], { FAKE_DSH_CONFIG: PROFILE_MODEL }, home);
+    await waitFor(() => h!.stdout.includes('›'), { label: 'ready marker' });
+
+    expect(readLog(h).find(entry => entry.initialize)?.initialize).toMatchObject({
+      provider: 'flatkey', model: 'saved-model',
+    });
+  });
+
+  it.each(['', 'null'])('uses profile settings when the legacy document is empty (%j)', async settings => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
+    writeNativeDshConfig(home, settings);
+    h = spawnRunner('happy', [], { FAKE_DSH_CONFIG: PROFILE_MODEL }, home);
+    await waitFor(() => h!.stdout.includes('›') || h!.child.exitCode !== null, { label: 'configuration result' });
+    expect(readLog(h).find(entry => entry.initialize)?.initialize).toMatchObject({
+      provider: 'flatkey', model: 'deepseek-v4-1-flash-1017',
+    });
+  });
+
+  it.each(['group: true', 'name: cordis:group', 'name: "@deepseek-ai/cordis-plugin-group"'])('reads default model settings through nested groups (%s)', async group => {
+    const config = `
+- id: outer-group
+  ${group}
+  config:
+    - id: inner-group
+      group: true
+      config:
+        - id: agent-default-model
+          config:
+            provider: nested-provider
+            model: nested-model
+- id: unrelated-plugin
+  config:
+    - id: agent-default-model
+      config:
+        provider: not-a-plugin-entry
+        model: not-a-model
+- id: empty-group
+  name: cordis:group
+`;
+    h = spawnRunner('happy', [], { FAKE_DSH_CONFIG: config });
+    await waitFor(() => h!.stdout.includes('›') || h!.child.exitCode !== null, { label: 'configuration result' });
+
+    expect(readLog(h).find(entry => entry.initialize)?.initialize).toMatchObject({
+      provider: 'nested-provider', model: 'nested-model',
+    });
+  });
+
+  it.each(['true', '!!js process.env.DISABLED'])('rejects a default model inside a group with disabled=%s', async disabled => {
+    h = spawnRunner('happy', [], { FAKE_DSH_CONFIG: `
+- id: model-group
+  group: true
+  disabled: ${disabled}
+  config:
+${PROFILE_MODEL.trim().split('\n').map(line => `    ${line}`).join('\n')}
+` });
+    await waitFor(() => h!.child.exitCode !== null || h!.stdout.includes('›'), { label: 'group configuration result' });
+    expect(h.child.exitCode).toBe(1);
+    expect(readLog(h).some(entry => entry.initialize || entry.argv)).toBe(false);
+  });
+
+  it('rejects duplicate default models across group boundaries', async () => {
+    h = spawnRunner('happy', [], { FAKE_DSH_CONFIG: `${PROFILE_MODEL}
+- id: model-group
+  group: true
+  config:
+${PROFILE_MODEL.trim().split('\n').map(line => `    ${line}`).join('\n')}
+` });
+    await waitFor(() => h!.child.exitCode !== null || h!.stdout.includes('›'), { label: 'duplicate configuration result' });
+    expect(h.child.exitCode).toBe(1);
+    expect(readLog(h).some(entry => entry.initialize || entry.argv)).toBe(false);
+  });
+
+  it.each<[NodeJS.ProcessEnv, string]>([
+    [{ FAKE_DSH_CONFIG_ERROR: 'query-secret-must-not-be-logged', FAKE_DSH_CONFIG: PROFILE_MODEL }, 'dsh --dump-config failed (exit 2)'],
+    [{ FAKE_DSH_CONFIG: 'not-an-entry-list' }, 'expected a literal YAML entry list'],
+    [{ FAKE_DSH_CONFIG: '- config: [yaml-secret-must-not-be-logged' }, 'invalid YAML'],
+    [{ FAKE_DSH_CONFIG: PROFILE_MODEL.replace('provider: flatkey', 'provider: !!js process.env.PROVIDER') }, 'agent-default-model.provider must be'],
+    [{ FAKE_DSH_CONFIG: PROFILE_MODEL.replace('model: deepseek-v4-1-flash-1017', 'model: !!js process.env.MODEL') }, 'agent-default-model.model must be'],
+    [{ FAKE_DSH_CONFIG: PROFILE_MODEL.replace('provider: flatkey', 'provider: ""') }, 'agent-default-model.provider must be'],
+    [{ FAKE_DSH_CONFIG: PROFILE_MODEL.replace('provider: flatkey', 'provider: 42') }, 'agent-default-model.provider must be'],
+    [{ FAKE_DSH_CONFIG: '- id: agent-default-model\n  config: !!js process.env.MODEL_CONFIG' }, 'agent-default-model.config must be a literal mapping'],
+    [{ FAKE_DSH_CONFIG: PROFILE_MODEL.replace('    provider: flatkey', '    __jsExpr: process.env.MODEL_CONFIG\n    provider: flatkey') }, 'agent-default-model.config must be a literal mapping'],
+    [{ FAKE_DSH_CONFIG: PROFILE_MODEL.replace('  name:', '  disabled: true\n  name:') }, 'agent-default-model or its group is disabled'],
+    [{ FAKE_DSH_CONFIG: PROFILE_MODEL.replace('  name:', '  disabled: !!js process.env.DISABLED\n  name:') }, 'agent-default-model or its group is disabled'],
+    [{ FAKE_DSH_CONFIG: PROFILE_MODEL + PROFILE_MODEL }, 'duplicate agent-default-model entries'],
+  ])('fails before SDK initialization when the profile cannot be resolved: %j', async (env, reason) => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
+    writeNativeDshConfig(home, SUPER_RELAY_SETTINGS);
+    h = spawnRunner('happy', [], env, home);
+    await waitFor(() => h!.child.exitCode !== null, { label: 'configuration failure' });
+
+    expect(h.child.exitCode).toBe(1);
+    expect(readLog(h).some(entry => entry.initialize || entry.argv)).toBe(false);
+    expect(h.stdout + h.stderr).not.toContain('secret-must-not-be-logged');
+    expect(h.stdout + h.stderr).toContain(reason);
+  });
+
+  it('prints a command that reproduces the failed configuration query', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'dsh-runner-profile-'));
+    h = spawnRunner('happy', ['--dsh-profile', 'custom-profile', '--bridge-patch', `${home}/it's overlay.yml`], {
+      DSH_HOME: join(home, 'custom dsh'), FAKE_DSH_CONFIG_ERROR: 'query failed',
+    }, home);
+    await waitFor(() => h!.child.exitCode !== null, { label: 'configuration failure' });
+    const command = /run this to see the error: (.+)/.exec(h.stderr)?.[1];
+    expect(command).toBeDefined();
+
+    // Without the runner's DSH_HOME, the printed command must carry everything itself.
+    const { DSH_HOME: _, ...ambient } = process.env;
+    const rerunLog = join(home, 'rerun.jsonl');
+    spawnSync('sh', ['-c', command!], { cwd: tmpdir(), env: { ...ambient, FAKE_DSH_LOG: rerunLog } });
+    const { argv, dshHome } = readLog(h).find(entry => entry.dump).dump;
+    expect(readJsonLines(rerunLog).find(entry => entry.dump)?.dump).toMatchObject({ argv, dshHome });
   });
 });

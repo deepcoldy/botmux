@@ -1,16 +1,32 @@
+import { resolveSessionModelPinView } from './session-model.js';
+import { isWorkflowNodeSessionMarker } from './workflow-node-session.js';
+import { stageOrdinaryTurnRecoveryTerminal, reconcileOrdinaryTurnRecoveryTerminalReceipt } from '../services/ordinary-turn-recovery.js';
+import { codexAppRecoveryCaller, codexCapacityRecoveryCli } from '../services/codex-app-failure.js';
+import { codexAppSettlementOutcome } from '../services/runner-final-outcome.js';
+import { turnFailureDiagnostics } from '../services/turn-failure-diagnostics.js';
+import { canTalk, evaluateTalk } from '../im/lark/event-dispatcher.js';
+import { cancelDeploymentContinuation, deploymentContinuationClaimCurrent } from '../services/deployment-continuation.js';
+import { deploymentContinuationAuthority } from './deployment-continuation-authority.js';
+import { CliProgressNotifier, cliProgressNoticeCard } from '../services/cli-progress-notice.js';
+import { traexStreamCardActivity } from './stream-card-activity.js';
+import { listPendingAsks } from './ask-broker.js';
+import { PERMISSION_ALLOW_KEY, PERMISSION_DENY_KEY } from './ask-hook/types.js';
 import { captureCodexCleanupRelease, type CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
 import { removeP2pForceTopicRoot } from '../services/p2p-force-topic-store.js';
 import { archiveCodexForCleanup, ownedLocalCodex } from '../services/codex-cleanup-archive.js';
 import { trackStartingCardPublication } from './starting-card-publication.js';
 import { privateReplyEnabled } from './private-reply.js';
+import { currentGatewayCallerOpenId } from './gateway-turn-caller.js';
+export { currentGatewayCallerOpenId } from './gateway-turn-caller.js';
 import { handoffCardClosed, handoffCardBlocksStreaming, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';
 import { assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../cli/topic-send-guard.js';
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from '../im/lark/reply-card-footer-signature.js';
 import { getMessageDetail as getTopicMessageDetail, patchCardStreamElement, resolveCardKitId, uploadImage } from '../im/lark/client.js';
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
+import { modelPinView, retainPinEffort, samePinModel, validateModelPin, type ModelPin } from './model-pin.js';
 import { sessionPromptInjection } from './prompt-injection.js';
 import { inheritSessionLaunchConfiguration } from './session-launch-inheritance.js';
-import { sandboxBoolValue, normalizeSandboxMode, normalizeScratchStorage } from '../adapters/cli/sandbox-mode.js';
+import { sandboxBoolValue, normalizeScratchStorage, frozenSessionSandboxMode, sessionCardSandboxMode, botConfigSandboxMode } from '../adapters/cli/sandbox-mode.js';
 /**
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
  * Extracted from daemon.ts for modularity.
@@ -19,20 +35,24 @@ import { execSync, type ChildProcess } from 'node:child_process';
 import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { installCursorUsageHook } from '../services/cursor-usage-hook.js';
-import { statSync, readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
+import { statSync, lstatSync, readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, ensureWorkflowSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
+import { fileURLToPath } from 'node:url';
+import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, ensureChatManagerSkill, removeWorkflowSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
 import { readStatuslineSnapshot, toCardQuota } from '../services/statusline-snapshot.js';
+import { notePromptCacheKeepaliveResult, notePromptCacheKeepaliveScreenStatus, resolvedPromptCacheTtl } from './prompt-cache-keepalive.js';
+import { settleAutoCompactSafeComposerRefusal } from './auto-compact.js';
+import { clearIdleAutoCompactStretch, idleAutoCompactMinutes, noteIdleAutoCompactRefused, noteIdleAutoCompactScreenStatus, noteIdleAutoCompactTurnEnded, supportsIdleAutoCompact } from './idle-auto-compact.js';
+import { getCardFooterExtensionSegments } from '../services/card-footer-extension.js';
 import { cleanupTraexAskHooks, installHook } from '../adapters/hook-installer.js';
 import { cursorUsageHookCommand, hookCommandFor } from '../adapters/hook-command.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js';
 import { config } from '../config.js';
-import { readGlobalConfig, isWorkflowFeatureEnabled } from '../global-config.js';
+import { readGlobalConfig, configuredProtectedMcpEnvKeys } from '../global-config.js';
 import { workerExitDashboardEvent } from './worker-exit-dashboard-event.js';
 import { checkWorkerAdmission, formatMemoryBytes, tierWorkerAdmission, type WorkerAdmissionDecision } from './worker-budget.js';
 import { coalesceMarginalAdmissionRetry } from './admission-reclaim.js';
@@ -48,21 +68,30 @@ import {
   markMessageListenerRunPreviewRunning,
 } from '../services/message-listener-run-preview-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
-import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
-import { resolveSessionLaunchModel, resolveSessionGroupSettings } from './session-model.js';
+import { MissingWorkingDirError } from './working-dir-recovery.js';
+import { spawnWorker, isStandaloneBinary, preloadImportSpecifier, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
+import {
+  resolveSessionLaunchModel,
+  resolveSessionLaunchModelChoice,
+  resolveSessionGroupSettings,
+  resolveTopicReasoningEffort,
+  resolveSessionLaunchEffort,
+} from './session-model.js';
 import {
   initialNativeRenameStartupCommand,
   initialPiLaunchSessionTitle,
 } from './initial-native-rename.js';
 import { effectiveReplyDelivery } from './reply-delivery.js';
-import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
-import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
-import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
+import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, normalizeBackgroundTaskPins, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
+import { updateMessage, deleteMessage, listChatMessages, listThreadMessages, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
+import { buildTurnTerminalFooterPatch, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildStuckPageCard, buildStuckKeyResultCard, buildInputNotSubmittedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildRecoveryFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type StreamCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
+import { cardMessageTitle, staleWorkingCardIds, streamingCardTitleClaimsWork } from './restored-card-status.js';
 import { codexServiceTierBadge, isCodexServiceTierCliId, type CodexServiceTier } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
 import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../services/codex-reasoning-effort.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
+import { resolveCodexRpcInput } from '../services/codex-rpc-input-policy.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
 import { cancelMojoSessionById } from '../adapters/backend/mojo-backend.js';
@@ -82,7 +111,25 @@ import {
   type MojoLivePatch,
 } from '../adapters/backend/mojo-types.js';
 import { sanitizePerBotEnv } from './per-bot-env.js';
-import { buildBotWorkerEnv } from './env-policy.js';
+import { resolveEffectivePluginIds } from './plugins/effective.js';
+import { buildBotWorkerEnv, type EnvPolicy } from './env-policy.js';
+import {
+  PROTECTED_MCP_SECRET_FD_ENV,
+  prepareProtectedMcpWorkerProvisioning,
+  protectedMcpCurrentRedactedEnvKeys,
+  protectedMcpContainmentConfigured,
+  serveProtectedMcpSecrets,
+} from './protected-mcp-capabilities.js';
+import {
+  collectProtectedHttpEgressPolicies,
+  resolveProtectedHttpEgressTargets,
+  type ProtectedHttpEgressWorkerPolicy,
+} from './protected-http-egress.js';
+import {
+  PROTECTED_HTTP_EGRESS_SOCKET_ENV,
+} from './protected-http-egress-host.js';
+import { resolveSessionEnv, type ResolvedSessionEnv } from './session-env-resolve.js';
+import { sessionEnvFingerprint } from '../services/session-env-stamp.js';
 import { normalizeExistingAppServerEndpoint } from './existing-app-server.js';
 import { PROCESS_TABLE_MAX_BUFFER } from '../utils/exec-limits.js';
 import {
@@ -105,6 +152,10 @@ import {
 import type { CliLaunchMode } from './cli-launch-mode.js';
 import { traeHome } from '../services/traex-paths.js';
 import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
+import { isStuckPageType } from './stuck-page-catalog.js';
+import { stuckCardFallbackText, stuckCardInitiatorOpenId, stuckCardPostErrorMeansUnsent, stuckKeyResultText } from './stuck-warning-card.js';
+
+import { sandboxNamespaceNotice } from './system-bwrap.js';
 import { claudeJsonlPathForSession } from '../adapters/cli/claude-code.js';
 import { findUniqueClaudeSessionByCwd } from './session-discovery.js';
 import {
@@ -120,8 +171,8 @@ import { resolveReplyImages, type ReplyImageState } from '../im/lark/reply-image
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
-import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, abortCotMessage } from '../im/lark/cot-message.js';
-import { replyCardModeFor, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards } from './turn-reply-card.js';
+import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, abortCotMessage, resumeCotMessage } from '../im/lark/cot-message.js';
+import { replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
 import { ReplyCardWithdrawnError } from '../services/turn-reply-card.js';
 import { readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
@@ -130,38 +181,72 @@ import { groupContextEpoch, commitGroupContextDispatchIntoPayload } from '../ser
 import { replyToDocComment, chunkCommentText, unsubscribeDocFile, removeCommentReaction } from '../im/lark/doc-comment.js';
 import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
+import { managedTmuxCandidateSockets, preferredManagedTmuxSocket, tmuxServerLabel } from '../adapters/backend/tmux-socket.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
 import { zmxEnv } from '../setup/ensure-zmx.js';
-import type { PersistentBackendTarget } from '../adapters/backend/types.js';
+import type { BackendType, PersistentBackendTarget, SessionProbe } from '../adapters/backend/types.js';
+import { resolveHerdrBackendConfig } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
 import {
   normalizeRemoteRunnerBackendState,
   normalizeRemoteRunnerUsageReport,
 } from '../adapters/backend/remote-runner-protocol.js';
 import type { RemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
+import { normalizeReplyFooter } from '../services/reply-footer.js';
+import { measureReplyTiming, type ReplyCardRenderSnapshot } from '../services/reply-card-render.js';
+import { buildReplyConsoleUrl } from './dashboard-url.js';
+import type { TraexAutoModelConfig } from '../services/traex-auto-model.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
+import { teardownSessionSandboxTree } from '../adapters/backend/sandbox-tree-teardown.js';
 import {
   isStrongManagedHerdrAgentName,
   managedHerdrAgentName,
 } from '../adapters/backend/session-backend-selector.js';
-import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, probePersistentBackendTarget, resolvePairedSpawnBackendType, resolvePersistentBackendTarget, persistentBackendTargetKey } from './persistent-backend.js';
+import { isRemoteBackendSession, isRemoteBackendType, isSuspendableBackendType, getSessionPersistentBackendType, persistentBackendTargetForSession, killPersistentBackendTarget, probePersistentBackendTarget, probePersistentBackendTargetAfterKill, probePersistentBackendTargets, resolvePairedSpawnBackendType, resolvePersistentBackendTarget, persistentBackendTargetKey } from './persistent-backend.js';
 import { withBotTurnMutation } from './bot-turn-mutation-gate.js';
 import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
-import { getBot, getAllBots, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
+import { getBot, getAllBots, getBotBrand, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
+import { resolveSubstituteCardControl, type SubstituteCardControl } from '../im/lark/substitute-card-control.js';
 import { isLarkContentAuditError, larkErrorCode } from '../im/lark/content-audit.js';
+import { contentAuditRedactionOutcome, sendWithContentAuditRedaction } from '../im/lark/content-audit-redaction.js';
+import { LARK_CODE_CARD_CONTENT_REJECTED, LARK_CODE_MESSAGE_CONTENT_TOO_LONG } from '../im/lark/lark-errors.js';
+import { isRetryableLarkError } from '../im/lark/api-gate.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from '../services/model-pricing.js';
 import type { BotConfig } from '../bot-registry.js';
-import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
+import { RestartCoordinator, type RestartObserver, type RestartSource } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
+import { getLinkRefRuntime } from '../services/link-ref-runtime.js';
+import { prepareLinkRefTurnPayload } from './link-ref-turn.js';
+import { resolveEffectiveLinkRefMode } from '../services/link-ref-config.js';
+import type { LinkRefMode } from '../services/link-ref-types.js';
+import {
+  registerMcpLinkRefsFromWorker,
+  resolveMcpHostDeliveryLinkRefsFromWorker,
+} from './link-ref-ipc.js';
 import { cleanupSessionTempDirAfterExit } from './session-temp.js';
+import { removeSessionMcpGatewayDir } from './plugins/mcp/socket-dir.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
+import { materializeFeedbackPolicyForDelivery } from '../services/feedback-reviewer-delivery.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
+import { attachWorkflowSidebarEntry, workflowNodeSessionEntry } from '../im/lark/workflow-sidebar-entry.js';
+import { resolveWorkflowEntryLink } from './workflow-entry-link.js';
 import { beginFinalOutputDelivery, waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
+import { BUSY_RUNTIME_STATUSES } from './session-task-status.js';
+import { isMaintenanceTurnId, noteDiagnosticFinal, noteFinalReplyText, noteLateFinalReply, recordTurnOutcome } from './turn-outcome.js';
+import { validateFinalOutputSnapshot, type FinalOutputOffer } from '../services/final-output-handoff.js';
+import { FinalOutputHandoffStore, type StoredFinalOutput } from '../services/final-output-handoff-store.js';
+import { FinalOutputHandoffHost, FinalOutputRejectedError, type FinalOutputDeliveryControl } from '../services/final-output-handoff-host.js';
+import { readBridgeTurnJournal } from '../services/bridge-turn-journal.js';
+import { setFinalOutputOriginRecorder } from './reply-target.js';
+import { outputSnapshot } from '../services/universal-output-handoff.js';
+import { outputDeliveryJournal, type OutputDeliveryRecord, type OutputReceipt, type OutputSink } from '../services/output-delivery-journal.js';
+import { OutputDeliveryCoordinator, OutputDeliveryTerminalError, type OutputDeliveryControl } from '../services/output-delivery-coordinator.js';
+import { TurnSendLedger, FinalPublicationUnknownError } from '../services/turn-send-ledger.js';
 import { createTurnResultRuntime, setTurnResultRuntime } from './turn-result-runtime.js';
 import { TurnResultStore } from '../services/turn-result-store.js';
 import type { TurnResult, TurnDeliveryReceipt } from '../services/turn-result.js';
@@ -172,13 +257,29 @@ import { turnResultEnabled, turnResultBinding, turnResultSessionEligible, observ
  *  distinguishable from a pane surviving a daemon restart (different id). */
 const DAEMON_BOOT_ID = randomBytes(32).toString('base64url');
 const restartCoordinator = new RestartCoordinator();
+const topicEffortRestartReadiness = new Map<string, { attemptId: string; worker: DaemonSession['worker']; workerGeneration?: number; workerReady: boolean; cliReady: boolean; requested: import('../utils/traex-session-effort.js').TraexTopicEffortRestart }>();
 const hostPressureWarningsLogged = new Set<string>();
 const lifecycleRetiringWorkers = new WeakMap<DaemonSession, Set<ChildProcess>>();
+
+/** Nonce of the keyed stuck card whose POST is in flight for a session (no
+ *  card id yet). A second warning for the same page while it is in flight is
+ *  deduped instead of posting a second card. Kept beside — not derived from —
+ *  ds.stuckWarningNonce: that nonce also stays set when the card was
+ *  suppressed (managedAuxUiSuppressed) and nothing is in flight. */
+const stuckCardPostInFlight = new WeakMap<DaemonSession, {
+  nonce: number;
+  /** Same-page warnings folded into this POST: if it is refused, each still
+   *  owes its own text notice (the worker will not re-send them). */
+  deduped: Array<Extract<WorkerToDaemon, { type: 'stuck_warning' }>>;
+}>();
 const transferRetiringWorkers = new WeakSet<ChildProcess>();
 
 type WorkerIpcBootstrapState = {
   ready: boolean;
-  pending: Array<() => void>;
+  pending: Array<{
+    dispatch: () => void;
+    onAbort?: () => void;
+  }>;
   timer: ReturnType<typeof setTimeout>;
 };
 
@@ -206,8 +307,20 @@ function initializeWorkerIpcBootstrap(worker: ChildProcess): void {
   worker.once('exit', () => {
     worker.off('message', onMessage);
     clearTimeout(state.timer);
-    state.pending.length = 0;
+    if (workerIpcBootstrapStates.get(worker) !== state || state.ready) return;
     workerIpcBootstrapStates.delete(worker);
+    const pending = state.pending.splice(0);
+    for (const entry of pending) {
+      try {
+        entry.onAbort?.();
+      } catch (error) {
+        logger.error(
+          `Failed to abort standalone worker IPC bootstrap queue entry: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
   });
   worker.send({ type: 'worker_ipc_probe' } satisfies DaemonToWorker);
 }
@@ -221,9 +334,9 @@ function releaseWorkerIpcBootstrap(
   clearTimeout(state.timer);
   workerIpcBootstrapStates.delete(worker);
   const pending = state.pending.splice(0);
-  for (const dispatch of pending) {
+  for (const entry of pending) {
     try {
-      dispatch();
+      entry.dispatch();
     } catch (error) {
       logger.error(
         `Failed to flush standalone worker IPC bootstrap queue: ${
@@ -234,14 +347,18 @@ function releaseWorkerIpcBootstrap(
   }
 }
 
-function afterWorkerIpcBootstrap(worker: ChildProcess, dispatch: () => void): boolean {
+function afterWorkerIpcBootstrap(
+  worker: ChildProcess,
+  dispatch: () => void,
+  onAbort?: () => void,
+): boolean {
   const state = workerIpcBootstrapStates.get(worker);
   if (!state || state.ready) {
     dispatch();
     return true;
   }
   if (worker.killed || worker.connected === false) return false;
-  state.pending.push(dispatch);
+  state.pending.push({ dispatch, onAbort });
   return true;
 }
 
@@ -252,9 +369,9 @@ function resolvePricingForBot(larkAppId?: string): ResolvedModelPricing | undefi
 }
 
 /** 在完整 Worker 模块加载前接住首条 IPC，避免冷启动耗时被误判为投递失败。 */
-function workerForkExecArgv(): string[] {
+export function workerForkExecArgv(bun: boolean = Boolean(process.versions.bun)): string[] {
   const preloadPath = join(__dirname, '..', 'worker-ipc-preload.js');
-  return [...process.execArgv, '--import', pathToFileURL(preloadPath).href];
+  return [...process.execArgv, '--import', preloadImportSpecifier(preloadPath, bun)];
 }
 
 /** Secondary index of the same retirements by session id: the WeakMap above is
@@ -382,7 +499,7 @@ function daemonCardLocalHomeLinkMode(ds: DaemonSession): LocalHomeLinkMode {
     : 'filesystem';
 }
 
-function prepareAdoptedReplyImages(
+function prepareLocalReplyImages(
   ds: DaemonSession,
   markdown: string,
   state: ReplyImageState,
@@ -390,12 +507,20 @@ function prepareAdoptedReplyImages(
 ): Promise<string> {
   const botCfg = getBot(ds.larkAppId).config;
   const workingDir = ds.workingDir ?? ds.session.workingDir ?? ds.adoptedFrom?.cwd;
-  if (!(ds.adoptedFrom || ds.session.adoptedFrom) || !workingDir || ds.session.vcMeetingReceiver
+  const codexApp = isCodexAppCliId(sessionCliId(ds, botCfg));
+  // Temporary-image roots (os.tmpdir() + POSIX /tmp) are computed from the
+  // DAEMON's environment. A worker pins its own TMPDIR/TMP/TEMP to its
+  // per-session scratch dir (~/.cache/botmux/session-tmp/…); images a CLI only
+  // ever writes under that worker TMPDIR stay outside this allowlist and are
+  // left as text. That is intentional (the scratch dir is not a stable host
+  // location) and degrades to the permanent-rejection notice below.
+  if (!(ds.adoptedFrom || ds.session.adoptedFrom || codexApp) || !workingDir || ds.session.vcMeetingReceiver
     || botCfg.apiOnly || daemonCardLocalHomeLinkMode(ds) !== 'filesystem'
     || sandboxBoolValue(ds.session.sandbox ?? ds.initConfig?.sandbox ?? botCfg.sandbox)
     || (ds.initConfig?.readIsolation ?? botCfg.readIsolation)) return Promise.resolve(markdown);
   return resolveReplyImages(markdown, {
     workingDir, state,
+    allowTemporaryImages: codexApp,
     owns: () => owns() && ds.session.status !== 'closed',
     upload: bytes => uploadImage(ds.larkAppId, bytes),
   });
@@ -405,6 +530,30 @@ function prepareAdoptedReplyImages(
  * remains best-effort even when a CLI has no supported transcript or a usage
  * resolver fails. */
 export function getDaemonSessionUsageSnapshot(
+  ds: DaemonSession,
+  effectiveCliId?: CliId,
+  opts?: { fresh?: boolean },
+): CardUsageSnapshot {
+  const snapshot = readDaemonSessionUsageSnapshot(ds, effectiveCliId, opts);
+  // bots.json `cardFooterExtension`：按 bot 缓存的外部命令输出，追加在用量段末尾。
+  // 只读缓存、不等命令；与 CLI / 后端无关，所以放在所有分支之后统一合并。
+  try {
+    const larkAppId = ds.larkAppId ?? ds.session.larkAppId;
+    if (larkAppId) {
+      const bot = getBot(larkAppId);
+      const extensionSegments = getCardFooterExtensionSegments(
+        // 结果按 bot（larkAppId）共享：环境也必须是 bot 级的，不能取本会话的
+        // effectiveCliId——同一 bot 不同会话用不同 CLI 时，变量会在刷新间跳变。
+        { larkAppId, cliId: bot.config.cliId, botName: bot.config.name },
+        bot.config.cardFooterExtension,
+      );
+      if (extensionSegments) return { ...snapshot, extensionSegments };
+    }
+  } catch { /* best-effort */ }
+  return snapshot;
+}
+
+function readDaemonSessionUsageSnapshot(
   ds: DaemonSession,
   effectiveCliId?: CliId,
   opts?: { fresh?: boolean },
@@ -486,6 +635,34 @@ export function getDaemonReplyCardUsageSnapshot(
     : { context: null, tokens: null }, effectiveCliId);
 }
 
+/** Presentation and timing have their own IPC/snapshot contract, separate from /usage. */
+export function getDaemonReplyCardRenderSnapshot(
+  ds: DaemonSession,
+  options: { turnId?: string; dispatchAttempt?: number; finalTiming?: { durationMs?: number; executionStartedAtMs?: number } } = {},
+  effectiveCliId?: CliId,
+): ReplyCardRenderSnapshot {
+  let cfg: { showReplyTiming?: boolean } = {};
+  try { cfg = getBot(ds.larkAppId).config; } catch { /* offline defaults */ }
+  const observation = options.turnId ? ds.replyExecutionStarts?.get(JSON.stringify([options.turnId, options.dispatchAttempt ?? null])) : undefined;
+  const startedAtMs = options.finalTiming ? options.finalTiming.executionStartedAtMs
+    : observation?.workerGeneration === ds.workerGeneration ? observation?.startedAtMs : undefined;
+  const timing = cfg.showReplyTiming === true ? measureReplyTiming({
+    startedAtMs,
+    receivedAtMs: options.dispatchAttempt === undefined && options.turnId ? ds.turnReceivedAtMs?.get(options.turnId) : undefined,
+    durationMs: options.finalTiming?.durationMs, completed: options.finalTiming !== undefined, nowMs: Date.now(),
+  }) : undefined;
+  const consoleUrl = buildReplyConsoleUrl();
+  return { usage: getDaemonReplyCardUsageSnapshot(ds, effectiveCliId), footerPreferences: normalizeReplyFooter(cfg),
+    ...(consoleUrl ? { consoleUrl } : {}), ...(timing ? { timing } : {}) };
+}
+
+function sessionModelPinView(ds: DaemonSession): ReturnType<typeof modelPinView> {
+  if (!ds.session.modelPin) return undefined;
+  let cfg: Parameters<typeof resolveSessionModelPinView>[1];
+  try { cfg = getBot(ds.larkAppId).config; } catch { /* bot removed */ }
+  return resolveSessionModelPinView(ds, cfg);
+}
+
 /** Streaming-card metrics obey usageDisplay; known model/effort do not depend
  * on transcript availability. Hidden metrics must not trigger transcript I/O. */
 export function getDaemonStreamingCardUsageSnapshot(
@@ -501,11 +678,37 @@ export function getDaemonStreamingCardUsageSnapshot(
   // The fallback warning and effort controls belong to the live status card.
   const modelFallback = ds.modelFallback;
   const reasoningControl = sessionReasoningControl(ds);
+  const idleAutoCompact = idleAutoCompactCardState(ds);
   return {
     ...withCardRuntimeIdentity(ds, snapshot, effectiveCliId),
     ...(modelFallback ? { modelFallback } : {}),
+    modelPin: sessionModelPinView(ds),
     ...(reasoningControl ? { reasoningControl } : {}),
+    ...(idleAutoCompact ? { idleAutoCompact } : {}),
   };
+}
+
+/** Whether this session can take the per-session idle auto-compact
+ *  (core/idle-auto-compact.ts): same CLI/runtime set as unattended native
+ *  compaction, and only sessions botmux owns. */
+export function sessionSupportsIdleAutoCompact(ds: DaemonSession): boolean {
+  try {
+    return supportsIdleAutoCompact({
+      cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId,
+      backendType: ds.initConfig?.backendType ?? ds.session.backendType,
+      codexRpcInput: ds.initConfig?.codexRpcInput === true,
+      adopted: !!ds.adoptedFrom || !!ds.session.adoptedFrom || ds.initConfig?.adoptMode === true,
+      headless: !!ds.session.headless,
+      vcMeetingReceiver: !!ds.session.vcMeetingReceiver,
+    });
+  } catch { return false; }
+}
+
+/** Live-card toggle state; absent ⇒ the toggle is not rendered. */
+export function idleAutoCompactCardState(ds: DaemonSession): CardUsageSnapshot['idleAutoCompact'] {
+  if (!sessionSupportsIdleAutoCompact(ds)) return undefined;
+  const setting = ds.session.idleAutoCompact;
+  return { enabled: setting?.enabled === true, minutes: idleAutoCompactMinutes(setting) };
 }
 
 /**
@@ -590,24 +793,44 @@ export function mergeModelFallbackObservation(
 
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { dashboardEventBus } from './dashboard-events.js';
+import { publishTurnFinished } from './turn-finished-event.js';
 import {
   publishSessionPreviewCleared,
   takeSessionPreviewTarget,
 } from './session-preview-registry.js';
 import { composeRowFromActive } from './dashboard-rows.js';
-import { publishAttentionPatch, publishClosedSessionPatch } from './session-activity.js';
+import { publishAttentionPatch, publishClosedSessionPatch, raiseDaemonAttention } from './session-activity.js';
+import { isOrdinaryImTurnId } from './ordinary-im-turn.js';
 import { isSerialGroupInput, trustedSessionController } from './trusted-session-controller.js';
 import {
   attachOrdinaryTurnRecovery,
   beginOrdinaryTurnRecovery,
   ordinaryTurnRecoverySilentTurnIds,
   cancelOrdinaryTurnRecoveryForUserInput as cancelOrdinaryRecoveryForUserInput,
+  cancelOrdinaryTurnRecoveryForStop,
   disposeOrdinaryTurnRecovery,
   handleOrdinaryTurnRecoveryTerminal,
+  noteOrdinaryTurnRecoveryCliIdle,
   ordinaryTurnRecoveryHandlesTerminal,
   requireOrdinaryTurnRecoveryAttention,
   type OrdinaryTurnRecoveryDispatch,
+  type OrdinaryTurnRetryInput,
 } from '../services/ordinary-turn-recovery.js';
+import {
+  isRecoveryRetryTurnId,
+  recordAndDeliverOrdinaryRecoveryNotice,
+  recoveryCauseI18nKey,
+  recoveryNoticeInitiator,
+  recoveryOutcomeI18nKey,
+  RecoveryNoticeOutbox,
+  addTurnNotice,
+  recoveryNoticeRetryDelayMs,
+  recoveryNoticeSendNeverLanded,
+  recoveryNoticeSendOutcomeUnknown,
+  type OrdinaryRecoveryNoticeRecord,
+  type RecoveryNoticeHost,
+  type TurnNoticeRecord,
+} from '../services/ordinary-recovery-notice.js';
 import {
   attachReadonlyTaskContinuation,
   beginReadonlyTaskContinuationDelivery,
@@ -628,7 +851,7 @@ import {
   type ReadonlyTaskContinuationState,
 } from '../services/readonly-task-continuation.js';
 import { turnRetryOffer, shouldNotifyTurnFailure } from '../services/turn-failure-notice.js';
-import { knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
+import { isBotMentionEntry, knownBotOpenIdsFromCrossRef, type BotMentionEntry } from '../utils/bot-routing.js';
 import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../services/session-lifecycle-hooks.js';
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
 import { isCodexAppCliId, type CliId } from '../adapters/cli/types.js';
@@ -636,6 +859,7 @@ import { isStructuredBridgeAdoptCli } from '../services/structured-bridge-clis.j
 import { ensureGatewayEntry } from './plugins/mcp/gateway-installer.js';
 import { readPeerCrossRef } from '../services/peer-cross-ref-store.js';
 import { readBotsInfoJson } from '../services/bots-info-cache.js';
+import { applyInlineMentions } from '../im/lark/inline-mentions.js';
 import {
   claimQuotaFallbackEvent,
   resolveQuotaFallbackTarget,
@@ -649,6 +873,7 @@ import type {
   DaemonToWorker,
   ModelFallbackState,
   TrustedCaller,
+  ScheduledTask,
   WorkerToDaemon,
   Session,
   DisplayMode,
@@ -673,20 +898,26 @@ import {
   storedSessionAnchorId,
   isDocNativeSession,
   isHttpVirtualSession,
+  isHeadlessSessionChatId,
   larkTransportEnabled,
   remoteRetirementAdmissionPhase,
   type DaemonSession,
+  type TurnTerminalCarrier,
 } from './types.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
+import { decideAutoRestart, type RestartCounter } from './restart-policy.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
+import { acceptSessionGroupTitle } from '../services/session-group-title.js';
 import { freezePrincipalLaneTurnBinding, readPrincipalLaneTurnBinding } from './principal-lane-turn.js';
 import { settlePrincipalLaneOutboundProvenance } from './principal-lane-outbound-provenance.js';
 import { hasPendingSessionTurns } from './session-turn-queue.js';
 import { DONE_REACTION_EMOJI_TYPE } from './pending-response.js';
-import { buildTerminalUrl } from './terminal-url.js';
+import { buildTerminalUrl, getTerminalProxyPort } from './terminal-url.js';
 import { prependBotmuxBin, resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { snapshotProcessIdentities } from './current-actor-attestation.js';
-import { usageLimitStateKey, isActiveWorkRuntimeStatus, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
+import { sameTrustedPrincipal } from './active-turn-authority.js';
+import { usageLimitStateKey, reconcileUsageLimitState, isActiveWorkRuntimeStatus, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
+import { isAntigravityWorkingScreen } from '../adapters/cli/antigravity.js';
 import {
   evaluateVcMeetingManagedSend,
   resolveVcMeetingImTurnOrigin,
@@ -706,11 +937,10 @@ import {
 import { parseVcMeetingListenerOutput } from '../services/vc-meeting-listener-output-protocol.js';
 import { isLocalCliOpenEnabled, isLocalCliOpenReady } from '../services/local-cli-opener.js';
 import { sessionConfiguredRuntimeDisplayName } from './cli-runtime-display.js';
-import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn } from './silent-schedule-turns.js';
+import { armSilentScheduledTurn, disarmSilentScheduledTurn, isSilentScheduledTurn, resolveDeferredScheduledTurnId } from './silent-schedule-turns.js';
 import {
   mintScheduledContinuationTurnId,
   parseScheduledTurnId,
-  readScheduledTaskForProvenance,
   trustedCallerForScheduledTask,
 } from './scheduled-turn-provenance.js';
 import { inheritActiveTurnFinalSuppression, isTriggerFinalSuppressed } from './trigger-final-suppression.js';
@@ -724,10 +954,22 @@ import {
   extractBotmuxLarkNativeSessionTitlePrompt,
 } from './session-title.js';
 import { acknowledgeSessionReady } from './session-ready-handshake.js';
-import { recordDispatchInputCommit } from './dispatch.js';
+import { recordDispatchInputCommit, resolveProseBotMentions, unboundInputCommitLogLevel } from './dispatch.js';
+import { loadOrCreateDispatchReportBindingSecret, resolveVerifiedDispatchReportTarget } from './dispatch-report-binding.js';
 import { sendWorkerIpc } from './worker-ipc.js';
 import { cleanupExplicitSessionBacking } from './explicit-session-backing-cleanup.js';
-import { clearAllSessionIdentities } from './cli-identity.js';
+import {
+  activeIdentityTurns,
+  clearActiveIdentityTurns,
+  releaseActiveIdentityTurn,
+} from './active-identity-turns.js';
+import { clearAllSessionIdentities, collectProvenIdentityContents } from './cli-identity.js';
+import {
+  identityBindingAllowsProven,
+  type IdentityStorageModel,
+} from './lark-tool-binding.js';
+import { larkToolDelegationTurnIds } from './lark-tool-delegation.js';
+import { sessionAuthRequests } from './session-auth-requests.js';
 import { REMOTE_ADMISSION_RESTORE_TIMEOUT_MS } from './shutdown-budgets.js';
 import {
   MAX_STARTUP_AUTO_RETRIES,
@@ -738,6 +980,15 @@ import {
   managedOriginCapabilityPath,
   replaceManagedOriginCapabilityFile,
 } from './managed-origin-capability.js';
+import { truncateUtf16WellFormed } from '../utils/unicode.js';
+import { recentCliUpgrade } from './cli-version-history.js';
+import {
+  inspectRecordedSessionWorker,
+  readWorkerProcessStart,
+  sessionWorkerProcessRuntime,
+  signalRecordedSessionWorker,
+  type SessionWorkerProcessRuntime,
+} from './session-worker-identity.js';
 
 type WorkerStartupState = {
   ready: boolean;
@@ -745,9 +996,10 @@ type WorkerStartupState = {
   onPreReadyExit?: () => void;
   /** Explicit Remote Runner rebuilds cross two readiness boundaries: the Node
    * worker can initialize before the provider returns its rebuild `ready`
-   * state. Keep this callback armed across worker `ready` and consume it only
-   * when the backend either publishes that state or exits first. */
-  onRemoteBackendStartupExit?: () => boolean;
+   * state. Keep this callback armed across worker `ready` and backend-state
+   * publication; canonical lifecycle commit releases it through the recovery
+   * presentation gate, while an earlier backend exit consumes it. */
+  onRemoteBackendStartupExit?: () => boolean | Promise<boolean>;
   /** Init turn attribution frozen at fork. A durable VC delivery is dispatched
    *  (queued) into a not-yet-ready worker; if that worker dies before ready
    *  (fork ENOENT, syntax/import crash, abrupt exit) the fork-level `error` and
@@ -770,6 +1022,8 @@ const CLOSE_FENCE_WARN_MS = 8_000;
 // the leader already reported failure (split-brain; see the busy-refuse comment
 // in transferSession). In-process callers have no such ceiling.
 const TRANSFER_DETACH_FENCE_MS = 3_500;
+// Claude Code `/btw` answers are capped before rendering (see 'btw_answer').
+const BTW_ANSWER_MAX_CHARS = 6_000;
 // In-process picker relay (card-handler relay_confirm) runs with no HTTP abort
 // above it — its card ACK already degrades to a background "处理中" toast at 2.5s
 // and the real result is delivered as a visible message. So it can afford a
@@ -796,16 +1050,109 @@ const TRANSFER_FORCE_EXIT_MS = 500;
 // pm2-graceful-exit.ts): a worker (or the CLI child it forks — redactChildEnv
 // strips it there too) that inherited it would exit 90 instead of 0 on a
 // clean foreground stop, which a supervisor reads as a crash.
-const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE'] as const;
+const WORKER_REDACTED_ENV_KEYS = ['GITHUB_TOKEN', 'GH_TOKEN', 'BOTMUX_PM2_GRACEFUL_EXIT_CODE', 'BOTMUX_LINK_REFS_MODE', 'BOTMUX_LINK_REF_TURN_MODE', 'BOTMUX_HOST_RELAY_AUTHORIZED', PROTECTED_HTTP_EGRESS_SOCKET_ENV, PROTECTED_MCP_SECRET_FD_ENV] as const;
 
-function workerForkEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+function workerForkEnv(base: NodeJS.ProcessEnv, protectedEnvKeys: readonly string[] = []): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   for (const key of WORKER_REDACTED_ENV_KEYS) delete env[key];
+  for (const key of protectedEnvKeys) delete env[key];
   // Defense in depth for a daemon started from a contaminated PM2 snapshot.
   // Genuine workflow workers bypass this pool and receive their markers from
   // workflows/v3/ephemeral-pool.ts.
   scrubWorkflowWorkerEnv(env);
   return env;
+}
+
+/** The env a worker for a bot with `policy` is forked with — the input of the
+ *  worker's `buildSessionChildEnv` (Dashboard「继承基线」preview). */
+export function sessionEnvWorkerBase(policy?: EnvPolicy): NodeJS.ProcessEnv {
+  return workerForkEnv(buildBotWorkerEnv(process.env, policy));
+}
+
+function prepareAdmittedLinkRefPayload(input: {
+  ds: DaemonSession;
+  payload: CliTurnPayload;
+  turnId?: string;
+  dispatchAttempt?: number;
+  frozenMode?: LinkRefMode;
+}): { payload: CliTurnPayload; mode: LinkRefMode } {
+  const declaredMode = input.payload.linkRefs?.mode;
+  // `sources` exist only before the real admission boundary, so their mode is
+  // a builder placeholder and must not freeze an earlier config snapshot. A
+  // source-free envelope is already admitted (queued/recovered) and its typed
+  // mode is copied verbatim even if live configuration changed meanwhile.
+  const pendingMode = input.ds.pendingLinkRefMode;
+  const mode = input.frozenMode ?? pendingMode
+    ?? (input.payload.linkRefs?.sources === undefined && declaredMode
+    ? declaredMode
+    : resolveEffectiveLinkRefMode({
+        env: process.env,
+        bot: getBot(input.ds.larkAppId).config.linkRefs,
+        global: readGlobalConfig().linkRefs,
+      }));
+  if (!input.turnId || mode === 'disabled') {
+    const { linkRefs: _linkRefs, ...legacy } = input.payload;
+    return { payload: legacy, mode: 'disabled' };
+  }
+  if (input.payload.linkRefs?.sources === undefined && declaredMode) {
+    return { payload: input.payload, mode };
+  }
+  const runtime = getLinkRefRuntime();
+  if (!runtime) {
+    return { payload: { ...input.payload, linkRefs: { mode } }, mode };
+  }
+  return {
+    payload: prepareLinkRefTurnPayload({
+      runtime,
+      key: {
+        appId: input.ds.larkAppId,
+        sessionId: input.ds.session.sessionId,
+        turnId: input.turnId,
+        dispatchAttempt: input.dispatchAttempt,
+      },
+      mode,
+      payload: input.payload,
+    }),
+    mode,
+  };
+}
+
+function freezeDeferredLinkRefPayload(input: {
+  ds: DaemonSession;
+  payload: CliTurnPayload;
+}): { payload: CliTurnPayload; mode: LinkRefMode } {
+  const declaredMode = input.payload.linkRefs?.mode;
+  const mode = input.ds.pendingLinkRefMode
+    ?? (input.payload.linkRefs?.sources === undefined && declaredMode
+      ? declaredMode
+      : resolveEffectiveLinkRefMode({
+          env: process.env,
+          bot: getBot(input.ds.larkAppId).config.linkRefs,
+          global: readGlobalConfig().linkRefs,
+        }));
+  if (mode === 'disabled') {
+    const { linkRefs: _linkRefs, ...legacy } = input.payload;
+    return { payload: legacy, mode };
+  }
+  return {
+    payload: {
+      ...input.payload,
+      linkRefs: {
+        mode,
+        ...(input.payload.linkRefs?.sources
+          ? { sources: input.payload.linkRefs.sources }
+          : {}),
+      },
+    },
+    mode,
+  };
+}
+
+function freezeAdmittedPayloadInPlace(target: CliTurnPayload, admitted: CliTurnPayload): CliTurnPayload {
+  if (target === admitted) return target;
+  for (const key of Object.keys(target) as Array<keyof CliTurnPayload>) delete target[key];
+  Object.assign(target, admitted);
+  return target;
 }
 
 /** Fresh workers always start with hidden output, so restore the daemon-owned mode. */
@@ -835,6 +1182,8 @@ export interface WorkerSessionReplyOptions {
   sourceSessionId?: string;
   /** Exact daemon-frozen destination for a durable turn. */
   replyTarget?: FrozenSessionReplyTarget;
+  /** Sender captured with the original output route, including private replies. */
+  replyContext?: import('../types.js').FrozenSessionReplyContext;
   /** Automatic VC delivery presentation. Explicit human IM replies omit this
    * and continue to follow their quote/thread context. */
   placement?: 'auto' | 'chat' | 'topic';
@@ -842,6 +1191,8 @@ export interface WorkerSessionReplyOptions {
 }
 
 export interface WorkerPoolCallbacks {
+  /** Exact store-owning app, including boot with no live sessions. */
+  larkAppId?: string;
   onTurnResult?: (result: Readonly<TurnResult>) => void | Promise<void>;
   /** Host-owned return path for zero-injection sub-bots. */
   onZeroPromptFinal?: (ds: DaemonSession, input: {
@@ -856,9 +1207,17 @@ export interface WorkerPoolCallbacks {
     opts?: WorkerSessionReplyOptions,
   ) => Promise<string>;
   getSessionWorkingDir: (ds?: DaemonSession) => string;
+  /** forkWorker refused a start because the session's working directory is
+   *  gone; tell the chat and offer recovery. Fired just before the
+   *  {@link MissingWorkingDirError} is thrown, so callers need not reply. */
+  onMissingWorkingDir?: (ds: DaemonSession, path: string, ctx: { turnId?: string }) => void;
   getActiveCount: () => number;
   /** Prepare trigger-user CLI identity before a delayed raw-input turn. */
   prepareRawInputTurn?: (ds: DaemonSession, turnId: string) => void | Promise<void>;
+  /** A scheduled task as the host authority store holds it, for deciding who a
+   *  scheduled turn runs as. Never backed by schedules.json (agent-writable
+   *  inside a sandbox). Absent or undefined → the turn carries no identity. */
+  loadScheduledTaskForIdentity?: (larkAppId: string, taskId: string) => ScheduledTask | undefined;
   /** Connector-owned live card for a handoff whose exact input has started. */
   onTriggerTurnStarted?: (ds: DaemonSession, title: string, turnId: string) => void;
   /** Close a stale session (message withdrawn, etc.). `false` means the
@@ -891,9 +1250,17 @@ export interface WorkerPoolCallbacks {
     receipt: Extract<WorkerToDaemon, { type: 'native_input_consumed' }>,
     context: { workerGeneration: number },
   ) => void;
+  /** Provider submission proof for one durable-primary Lark Inbox turn. */
+  onTurnInputCommitted?: (
+    ds: DaemonSession,
+    receipt: Extract<WorkerToDaemon, { type: 'turn_input_committed' }>,
+    context: { workerGeneration: number },
+  ) => void;
   /** Worker-authoritative deterministic rejection handoff. Returning true
    * means the daemon durably took ownership, so the original delivery record
-   * may be cleared without emitting the ambiguous-failure terminal. */
+   * may be cleared without emitting the ambiguous-failure terminal.
+   * Returning `'not_executed'` means a retry would be rejected the same way:
+   * the delivery fails at once with the known non-execution notice. */
   onOrdinaryImInputRejected?: (
     ds: DaemonSession,
     context: {
@@ -905,13 +1272,44 @@ export interface WorkerPoolCallbacks {
       activeCaller?: TrustedCaller;
       activeController?: TrustedCaller;
     },
-  ) => boolean | Promise<boolean>;
+  ) => boolean | 'not_executed' | Promise<boolean | 'not_executed'>;
+  /** A decision-board batch turn (`board:<app>:<batchId>`) never got a
+   * confirmed worker receipt (watchdog expiry or authoritative rejection).
+   * The pool does NOT post its usual group failure card for these turns:
+   * the owner is on the dashboard, where the batch row carries the failure
+   * and the re-deliver action. The daemon marks the batch failed here. */
+  onBoardTurnDeliveryFailed?: (
+    ds: DaemonSession,
+    context: { turnId: string; reason: string; messageKey: string },
+  ) => void;
   /** A hidden fresh-topic schedule can be reclaimed once its exact turn is
    * settled. Transcript-backed CLIs report `terminal`; screen-only/remote
    * adapters use the existing debounced idle edge as a compatibility fallback. */
   onDeferredScheduleTurnSettled?: (
     ds: DaemonSession,
-    context: { turnId: string; source: 'terminal' | 'idle' },
+    context: { turnId: string; source: 'terminal' | 'idle'; errorCode?: string },
+  ) => void | Promise<void>;
+  /** Workflow node session (design 2026-11-03 §6.3): a turn was committed to
+   *  the CLI input queue — the handoff's own turn is the acceptance, a later
+   *  one means the bot works again. Only fired for sessions carrying a
+   *  verified `workflowNode` marker. */
+  onWorkflowNodeInputCommitted?: (ds: DaemonSession, context: { turnId: string; committedAt: number }) => void;
+  /** Workflow node session (§5.5): a turn's input was literally written to
+   *  the CLI (`turn_execution_started`) — for a main-topic handoff queued
+   *  behind another turn, the moment its own turn really starts. Only fired
+   *  for sessions carrying a verified `workflowNode` marker. */
+  onWorkflowNodeTurnStarted?: (ds: DaemonSession, context: { turnId: string; startedAt: number }) => void;
+  /** Workflow node session (§8): a turn went from working to idle while the
+   *  node's handoff has no accepted submission — shown as "Bot 已停下，未提交". */
+  onWorkflowNodeTurnSettled?: (ds: DaemonSession, context: { turnId?: string; at: number }) => void;
+  /** The worker reported its identity storage decision for the current spawn.
+   *  `flipped` means the daemon's last actual publication used the other model
+   *  (cold start / restart window): the daemon must discard the wrong-model
+   *  material and replay the still-live opening turn under the reported model.
+   *  Only called for the CURRENT worker generation. */
+  onIdentityDecision?: (
+    ds: DaemonSession,
+    context: { model: IdentityStorageModel; flipped: boolean; turnId?: string },
   ) => void | Promise<void>;
   /** A process exit makes every unresolved receipt dispatched to this exact
    *  worker generation ambiguous; the receiver decides retry policy. */
@@ -974,6 +1372,16 @@ let callbacks: WorkerPoolCallbacks | undefined;
  */
 export function initWorkerPool(cb: WorkerPoolCallbacks): void {
   callbacks = cb;
+  setFinalOutputOriginRecorder((ds, turnId, context) => {
+    if (context.requesterOpenId && finalOutputHandoffAdmitNew(ds)) {
+      const journal = outputDeliveryJournal(config.session.dataDir, ds.larkAppId);
+      if (!ds.pendingWaitPromises?.has(turnId) && !ds.asyncTriggerResults?.has(turnId) && !resolveDocCommentTarget(ds, turnId)
+        && !ds.session.vcMeetingReceiver && !isMeetingDrivenTurn(ds, turnId)) journal.rememberSink(ds.session.sessionId, turnId,
+          { kind: 'im', context, chatId: ds.chatId, chatType: ds.chatType, privateReply: privateReplyEnabled(ds.session) });
+      new TurnSendLedger(config.session.dataDir).enableHandoffFence({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId });
+      if (turnId.startsWith('om_')) finalOutputHandoffHost(ds.larkAppId).store.rememberOrigin(ds.session.sessionId, turnId, context.target, context.requesterOpenId, Date.now(), { chatId: ds.chatId, chatType: ds.chatType });
+    }
+  });
   setTurnResultRuntime(createTurnResultRuntime({
     store: new TurnResultStore(),
     enabled: turnResultEnabled,
@@ -1027,7 +1435,136 @@ const pendingRemoteWorkerCloses = new Map<string, {
 
 export function setActiveSessionsRegistry(m: Map<string, DaemonSession> | undefined): void {
   activeSessionsRegistry = m;
+  if (!m && finalOutputHandoffTimer) { clearInterval(finalOutputHandoffTimer); finalOutputHandoffTimer = undefined; }
+  if (m && !finalOutputHandoffTimer) {
+    finalOutputHandoffTimer = setInterval(() => { void pumpFinalOutputHandoffs(); }, 5_000);
+    finalOutputHandoffTimer.unref?.();
+  }
 }
+
+let finalOutputHandoffTimer: ReturnType<typeof setInterval> | undefined;
+const finalOutputHandoffHosts = new Map<string, FinalOutputHandoffHost>();
+export const FINAL_HANDOFF_WAIT_REASON = '最终答复等待交接：原请求身份或持久存储尚未验证，恢复记录已保留';
+export const FINAL_HANDOFF_DELIVERY_REASON = '最终答复交接或投递未完成，请核对输出记录';
+
+function finalOutputHandoffSupported(_ds: DaemonSession): boolean { return true; }
+function finalOutputHandoffAdmitNew(_ds: DaemonSession): boolean {
+  return process.env.BOTMUX_FINAL_OUTPUT_HANDOFF === '1';
+}
+
+const universalOutputProcessors = new Map<string, { worker: ChildProcess; run(record: OutputDeliveryRecord): Promise<void> }>();
+function outputProcessorKey(ds: DaemonSession): string { return `${ds.larkAppId}:${ds.session.sessionId}`; }
+
+function freezeOutputSink(ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'final_output' }>): OutputSink {
+  const journal = outputDeliveryJournal(config.session.dataDir, ds.larkAppId);
+  const origin = journal.sink(ds.session.sessionId, msg.turnId);
+  if (origin && origin.kind !== 'im') return origin;
+  if (ds.session.vcMeetingReceiver || isMeetingDrivenTurn(ds, msg.turnId, msg.dispatchAttempt)) return { kind: 'managed' };
+  const native = ds.session.codexAppDispatchLedger?.find(entry => entry.dispatchId === msg.codexAppSettlement?.dispatchId);
+  if (native?.deliverySink === 'suppressed' || msg.suppressDelivery || isTriggerFinalSuppressed(ds, msg.turnId)
+    || isSilentScheduledTurn(ds, msg.turnId)) return { kind: 'suppressed', reason: 'admission_suppressed' };
+  const doc = resolveDocCommentTarget(ds, msg.turnId);
+  if (doc) return { kind: 'doc', context: { ...doc } };
+  if (isDocNativeSession(ds) || native?.deliverySink === 'doc_comment') return { kind: 'suppressed', reason: 'doc_target_unavailable' };
+  if (ds.pendingWaitPromises?.has(msg.turnId) || native?.deliverySink === 'http_wait' || ds.chatId.startsWith('http_wait_')) return { kind: 'http', mode: 'wait' };
+  const asyncRecord = asyncTriggerStore.lookupStrict(ds.session.sessionId, msg.turnId);
+  if (asyncRecord && asyncRecord.ownerLarkAppId !== ds.larkAppId) throw new Error('output_http_owner_mismatch');
+  if (asyncRecord || ds.asyncTriggerResults?.has(msg.turnId) || native?.deliverySink === 'http_async' || isHttpVirtualSession(ds.chatId)) return { kind: 'http', mode: 'async' };
+  if (origin) return origin;
+  return { kind: 'im', context: frozenReplyContextForTurn(ds, fallbackTurnId(ds, msg.replyTurnId ?? msg.turnId)),
+    chatId: ds.chatId, chatType: ds.chatType, privateReply: privateReplyEnabled(ds.session) };
+}
+
+function finalOutputHandoffHost(appId: string): FinalOutputHandoffHost {
+  const key = `${config.session.dataDir}:${appId}`;
+  const existing = finalOutputHandoffHosts.get(key);
+  if (existing) return existing;
+  const store = new FinalOutputHandoffStore(config.session.dataDir, appId);
+  const host = new FinalOutputHandoffHost(store, {
+    settled: record => {
+      const ds = findActiveBySessionId(record.output.sessionId);
+      if (!ds || ds.larkAppId !== appId || ![FINAL_HANDOFF_WAIT_REASON, FINAL_HANDOFF_DELIVERY_REASON].includes(ds.agentAttention?.reason ?? '')) return;
+      if (store.attentionPending(record.output.sessionId)) return;
+      const pending = readBridgeTurnJournal(join(config.session.dataDir, 'turn-marks', `${record.output.sessionId}.json`));
+      if (pending.some(entry => !!entry.pendingFinal)) return;
+      ds.agentAttention = undefined;
+      publishAttentionPatch(ds);
+    },
+    knownReceipt: record => {
+      const final = new TurnSendLedger(config.session.dataDir).read({ larkAppId: appId, sessionId: record.output.sessionId, turnId: record.output.turnId })?.final;
+      return final ? { messageId: final.messageId, suppressed: true } : undefined;
+    },
+    available: record => {
+      const ds = findActiveBySessionId(record.output.sessionId);
+      if (!ds) return sessionStore.getSession(record.output.sessionId)?.status === 'closed' ? 'cancelled' : 'wait';
+      if (ds.larkAppId !== appId || ds.session.status === 'closed' || getBot(appId).config.apiOnly
+        || !canTalk(appId, record.chatId ?? ds.chatId, record.actorOpenId, undefined, undefined, record.chatType ?? ds.chatType)) return 'cancelled';
+      return isSessionTransferring(ds) ? 'wait' : 'ready';
+    },
+    deliver: (record, control) => {
+      const ds = findActiveBySessionId(record.output.sessionId)!;
+      const finish = beginFinalOutputDelivery(ds, record.output.turnId);
+      const context: HandoffDeliveryContext = { record, store, control, suppressed: false };
+      return new Promise<{ messageId: string; suppressed?: boolean }>((resolve, reject) => {
+        try {
+          deliverFinalOutput(ds, { type: 'final_output', ...record.output }, tag(ds), 0,
+            (ok, messageId) => { finish(); context.rejectedReason ? reject(new FinalOutputRejectedError(context.rejectedReason))
+              : ok && messageId ? resolve({ messageId, suppressed: context.suppressed }) : reject(new Error('final_output_delivery_unconfirmed')); },
+            control.owns, record.target, undefined, undefined, { omitImages: true }, context);
+        } catch (error) { finish(); reject(error); }
+      });
+    },
+    error: (record, error) => {
+      logger.warn(`[final-handoff] ${record.intentId} ${String(error)}`);
+      if (['delivered', 'suppressed'].includes(store.read(record.intentId)?.state ?? '')) return;
+      const ds = findActiveBySessionId(record.output.sessionId);
+      if (ds?.larkAppId === appId && raiseDaemonAttention(ds, 'blocked', FINAL_HANDOFF_DELIVERY_REASON, record.output.turnId)) {
+        publishAttentionPatch(ds);
+      }
+    },
+  });
+  finalOutputHandoffHosts.set(key, host);
+  return host;
+}
+
+async function pumpFinalOutputHandoffs(): Promise<void> {
+  if (!callbacks) return;
+  for (const appId of new Set([...listActiveSessions().map(ds => ds.larkAppId), ...(callbacks.larkAppId ? [callbacks.larkAppId] : []), ...[...finalOutputHandoffHosts.values()].map(host => host.store.appId)])) {
+    if (!FinalOutputHandoffStore.exists(config.session.dataDir, appId)) continue;
+    try { await finalOutputHandoffHost(appId).pump(); }
+    catch (error) { logger.warn(`[final-handoff] recovery deferred: ${String(error)}`); }
+  }
+  for (const ds of listActiveSessions()) {
+    const processor = universalOutputProcessors.get(outputProcessorKey(ds));
+    if (!processor || processor.worker !== ds.worker) continue;
+    try { for (const record of outputDeliveryJournal(config.session.dataDir, ds.larkAppId).pending(ds.session.sessionId)) await processor.run(record); }
+    catch (error) { logger.warn(`[${tag(ds)}] Universal output recovery waiting: ${String(error)}`); }
+  }
+}
+
+function acceptFinalOutputOffer(ds: DaemonSession, offer: FinalOutputOffer): void {
+  const snapshot = validateFinalOutputSnapshot(ds.larkAppId, offer);
+  if (!finalOutputHandoffSupported(ds) || offer.version !== 1 || offer.token !== ds.initConfig?.finalOutputHandoff?.token
+    || snapshot.output.sessionId !== ds.session.sessionId || ds.session.status !== 'active') throw new Error('final_output_handoff_not_authorized');
+  const host = finalOutputHandoffHost(ds.larkAppId);
+  const existing = host.store.read(snapshot.intentId);
+  const origin = existing ?? host.store.readOrigin(ds.session.sessionId, snapshot.output.turnId);
+  const frozen = origin ? { target: origin.target, requesterOpenId: origin.actorOpenId } : ds.session.turnReplyContexts?.[snapshot.output.turnId];
+  const actor = frozen?.requesterOpenId ?? ds.session.replyTargets?.[snapshot.output.turnId]?.senderOpenId;
+  if (!frozen || !actor) throw new Error('final_output_handoff_origin_unproven');
+  if (ds.initConfig?.finalOutputHandoff?.admitNew !== true && !existing
+    && !readBridgeTurnJournal(join(config.session.dataDir, 'turn-marks', `${ds.session.sessionId}.json`))
+      .some(entry => entry.pendingFinal?.intentId === snapshot.intentId && entry.pendingFinal.fingerprint === snapshot.fingerprint)) {
+    throw new Error('final_output_handoff_not_admitted');
+  }
+  host.store.accept(snapshot, frozen.target, actor, Date.now(), { chatId: origin?.chatId ?? ds.chatId, chatType: origin?.chatType ?? ds.chatType });
+  // The row is already committed, so the worker may now retire its journal.
+  ds.worker?.send({ type: 'final_output_accepted', intentId: snapshot.intentId, fingerprint: snapshot.fingerprint, token: offer.token } as DaemonToWorker);
+  void host.run(snapshot.intentId).catch(error => logger.warn(`[final-handoff] recovery deferred: ${String(error)}`));
+}
+
+export const __testOnly_acceptFinalOutputOffer = acceptFinalOutputOffer;
+export const __testOnly_pumpFinalOutputHandoffs = pumpFinalOutputHandoffs;
 
 export function listActiveSessions(): DaemonSession[] {
   return activeSessionsRegistry ? [...activeSessionsRegistry.values()] : [];
@@ -1040,6 +1577,161 @@ export function findActiveBySessionId(sessionId: string): DaemonSession | undefi
   if (!activeSessionsRegistry) return undefined;
   for (const s of activeSessionsRegistry.values()) if (s.session.sessionId === sessionId) return s;
   return undefined;
+}
+
+/** Identity storage model the daemon publishes a managed session with.
+ *
+ * Single source of truth: the CURRENT worker generation's
+ * `session_identity_decision` report, computed from the actual spawn (env
+ * override, remote bypass, real bwrap/Seatbelt engagement, loopback sharing).
+ * The daemon deliberately does NOT re-derive sandbox/network facts from frozen
+ * config — that re-derivation is the split-brain this removes.
+ *
+ * Fail-closed defaults:
+ *  - no report yet (cold start, daemon restart before the worker re-reported):
+ *    'single'. A proven wrapper cannot exist before its decision was reported,
+ *    and the proven content route refuses non-proven sessions.
+ *  - a report structurally impossible on the daemon side (conflict): 'single',
+ *    and identityDecisionConflict() withholds publication on BOTH models. */
+export function identityStorageModelForDaemonSession(ds: DaemonSession): IdentityStorageModel {
+  const report = ds.reportedIdentityModel;
+  if (!report) return 'single';
+  if (identityDecisionConflict(ds)) return 'single';
+  return report.model;
+}
+
+/** Whether an identity-decision report's turn may be replayed on a flip.
+ *
+ * The decision arrives over the CURRENT worker generation's private IPC (that
+ * gate already ran in the message switch) and is emitted synchronously at
+ * spawn for the turn that generation runs — so the reported turn is
+ * authoritative even at the opening-turn boundary, when the daemon's own
+ * live-turn fields (currentTurnId is assigned later, the opening uses
+ * pendingTurnId) do not point at it yet. The one thing that permanently retires
+ *  a turn is an observed turn_terminal, and that set is checked explicitly. */
+export function identityDecisionTurnIsLive(ds: DaemonSession, turnId: string): boolean {
+  if (ds.session.status !== 'active' || !ds.worker || ds.worker.killed) return false;
+  if (ds.terminalIdentityTurnIds?.has(turnId)) return false;
+  return true;
+}
+
+/** Env-independent structural half the daemon can check against a report:
+ *  Linux + managed lark-tool binding on the frozen session shape. Sandbox and
+ *  loopback facts are NOT re-derived here (the worker owns those). */
+function provenStructurallyPossible(ds: DaemonSession): boolean {
+  const bot = getBot(ds.larkAppId).config;
+  return identityBindingAllowsProven({
+    platform: process.platform,
+    sessionId: ds.session.sessionId,
+    larkAppId: ds.larkAppId,
+    chatId: ds.chatId,
+    apiOnly: bot.apiOnly,
+    adoptMode: !!ds.session.adoptedFrom,
+    existingAppServerEndpoint: ds.session.existingAppServerEndpoint,
+    backendType: ds.session.backendType ?? bot.backendType ?? config.daemon.backendType,
+    larkToolBinding: true,
+  });
+}
+
+/** Non-undefined when the worker's reported identity decision cannot be
+ *  honored: either the report is for a session whose structure forbids proven
+ *  on the daemon side (binding disabled after a config change, adopt/remote/
+ *  apiOnly — the env-independent half the daemon CAN check), or the report's
+ *  shape is malformed. Publication is withheld and the proven route refuses
+ *  until a live worker reports again. */
+export function identityDecisionConflict(ds: DaemonSession): string | undefined {
+  const report = ds.reportedIdentityModel;
+  if (!report) return undefined;
+  if (report.conflict) return report.conflict;
+  if (report.model === 'proven' && !provenStructurallyPossible(ds)) {
+    return 'worker reported the proven identity model for a session that structurally cannot run proven';
+  }
+  return undefined;
+}
+
+/** Store a fresh worker identity decision. Called only from the private worker
+ *  IPC channel (already gated to the current worker generation). Returns the
+ *  effective model and whether it FLIPPED relative to the daemon's last actual
+ *  publication (see lastPublishedIdentityModel — the post-restart accept
+ *  publication is the baseline, not a previous report). */
+export function recordWorkerIdentityDecision(
+  ds: DaemonSession,
+  worker: ChildProcess,
+  workerGeneration: number,
+  report: { model: IdentityStorageModel; sandboxEngaged: boolean; loopbackShared: boolean },
+): { model: IdentityStorageModel; flipped: boolean } {
+  let conflict: string | undefined;
+  if (report.model !== 'single' && report.model !== 'proven') {
+    conflict = `malformed identity model report: ${String(report.model)}`;
+  } else if (typeof report.sandboxEngaged !== 'boolean' || typeof report.loopbackShared !== 'boolean') {
+    conflict = 'malformed identity decision report: spawn facts are not booleans';
+  } else if (report.model === 'proven' && !provenStructurallyPossible(ds)) {
+    conflict = 'worker reported the proven identity model for a session that structurally cannot run proven';
+  }
+  if (conflict) {
+    logger.error(`[${ds.session.sessionId}] ${conflict}; withholding identity publication until a live worker reports again`);
+  }
+  const model: IdentityStorageModel = conflict ? 'single' : report.model;
+  const flipped = ds.lastPublishedIdentityModel !== undefined
+    && ds.lastPublishedIdentityModel !== model;
+  ds.reportedIdentityModel = {
+    model,
+    sandboxEngaged: report.sandboxEngaged === true,
+    loopbackShared: report.loopbackShared === true,
+    workerPid: worker.pid ?? -1,
+    workerGeneration,
+    reportedAt: Date.now(),
+    ...(conflict ? { conflict } : {}),
+  };
+  return { model, flipped };
+}
+
+/**
+ * Identity turns whose proven material must survive terminal collection.
+ *
+ * Computed ONLY from daemon-owned state, never from the CLI-writable PID marker
+ * or session files:
+ *  1. the current execution identity (stays on the opening principal across the
+ *     isolation-off envelope adoption chain);
+ *  2. turns dispatched but not started, and the prepare→publish window;
+ *  3. scheduled runs and failed-turn/readonly continuations;
+ *  4. turns with a pending authorization request (the grant lands after the
+ *     human taps the link, potentially several turns later);
+ *  5. turns still referenced by an in-memory lark-tool delegation;
+ * plus every accepted turn that has not produced an exact terminal/rejection
+ * (covers the worker's type-ahead queue, which is otherwise daemon-invisible).
+ */
+function retainedIdentityTurns(ds: DaemonSession): Set<string> | 'all' {
+  const retain = new Set<string>();
+  const add = (turnId?: string | null): void => { if (turnId) retain.add(turnId); };
+  add(ds.managedTurnOrigin?.identityTurnId ?? ds.managedTurnOrigin?.turnId);
+  add(ds.session.queuedActivationTurnId);
+  add(ds.pendingRawTurnId);
+  for (const turnId of ds.scheduledTurnCallers?.keys() ?? []) add(turnId);
+  for (const turnId of ds.silentScheduledTurns?.keys() ?? []) add(turnId);
+  add(ds.session.deferredScheduleRun?.turnId);
+  add(ds.session.ordinaryTurnRecovery?.currentTurnId);
+  add(ds.session.readonlyTaskContinuation?.currentTurnId);
+  for (const entry of ds.session.codexAppDispatchLedger ?? []) {
+    if (entry.state === 'accepted' || entry.state === 'prepared') add(entry.turnId);
+  }
+  for (const turnId of sessionAuthRequests.identityTurnsFor(ds.session.sessionId)) add(turnId);
+  for (const turnId of larkToolDelegationTurnIds(config.session.dataDir, ds.session.sessionId)) add(turnId);
+  // A saturated accept ledger cannot distinguish queued from dead: retain
+  // every proven turn for the session rather than risk collecting in-flight.
+  const acceptedTurns = activeIdentityTurns(config.session.dataDir, ds.session.sessionId);
+  if (acceptedTurns === null) return 'all';
+  for (const turnId of acceptedTurns) add(turnId);
+  return retain;
+}
+
+/** Forget proven identity contents for turns no longer referenced by any live
+ *  session state. No-op for single-model sessions (they keep no in-memory
+ *  contents). Returns the removed turn ids. */
+export function collectSessionTurnGarbage(ds: DaemonSession): string[] {
+  const retained = retainedIdentityTurns(ds);
+  if (retained === 'all') return [];
+  return collectProvenIdentityContents(config.session.dataDir, ds.session.sessionId, retained);
 }
 
 /** Direct access to the active-sessions Map. Reserved for callers that need
@@ -1158,7 +1850,11 @@ function doneReactionEmojiFor(ds: DaemonSession): string {
 
 /** Worker lifecycle readiness is independent from Web Terminal availability.
  * Legacy/test sessions predate workerReady, so retain the old port inference
- * only while the explicit flag is absent. */
+ * only while the explicit flag is absent. A session restored after a daemon
+ * restart has no explicit flag either, and its persisted port outlives the
+ * worker that served it, so this also passes with no worker at all. Callers
+ * only re-render cached card state on that path; anything that needs a live
+ * worker checks `ds.worker` itself. */
 export function workerHasInitialized(ds: DaemonSession): boolean {
   return ds.workerReady === true
     || (ds.workerReady === undefined
@@ -1173,11 +1869,34 @@ export function sessionSupportsWebTerminal(ds: DaemonSession): boolean {
   return backendType === undefined || backendSupportsWebTerminal(backendType);
 }
 
-/** Empty means this session intentionally has no Web Terminal surface. */
+/** Empty means this session has no Web Terminal entry to offer.
+ *  Through the terminal proxy the link names only the session: the proxy routes
+ *  to the live worker or wakes one, so a session that has served a terminal
+ *  keeps its entry after a restart. A direct link embeds the port itself, and a
+ *  persisted port belongs to the current generation only while a worker exists
+ *  to listen on it (it is that worker's preferred port) — once restored without
+ *  one, it is the previous daemon's and nothing listens there. */
 export function readableTerminalUrlFor(ds: DaemonSession): string {
-  return sessionSupportsWebTerminal(ds) && (ds.workerPort ?? ds.session.webPort)
-    ? buildTerminalUrl(ds)
-    : '';
+  if (!sessionSupportsWebTerminal(ds)) return '';
+  const port = getTerminalProxyPort()
+    ? ds.workerPort ?? ds.session.webPort
+    : ds.workerPort ?? (ds.worker ? ds.session.webPort : undefined);
+  return port ? buildTerminalUrl(ds) : '';
+}
+
+/** Empty means the live streaming card should not offer a Web Terminal button.
+ *  Session-level terminal URLs may intentionally route through the proxy and
+ *  wake/recover a session from a persisted `webPort`, but a live status card is
+ *  stronger UI: "working" plus a terminal button implies a currently attached
+ *  worker with a current terminal backend. Do not let a restored row's stale
+ *  port render as an empty terminal shell. */
+export function liveReadableTerminalUrlFor(ds: DaemonSession): string {
+  if (!sessionSupportsWebTerminal(ds)) return '';
+  if (!ds.worker || ds.worker.killed) return '';
+  // The terminal server outlives the CLI during restart/diagnostic parking.
+  // Prompt readiness does not determine whether the worker's port is usable.
+  if (!ds.workerPort) return '';
+  return buildTerminalUrl(ds);
 }
 
 // Per-bot opt-in: the writable terminal link to embed directly in the streaming
@@ -1212,14 +1931,14 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
-    readableTerminalUrlFor(ds),
+    liveReadableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
     status,
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -1229,9 +1948,11 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    idleCardLabel(ds),
+    streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1244,7 +1965,7 @@ function flushPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
 
 /** PATCH the live card when the executor reports a different active runtime.
  * Runtime identity stays attached to the streaming usage line. */
-function scheduleActiveRuntimePatch(ds: DaemonSession): boolean {
+export function scheduleActiveRuntimePatch(ds: DaemonSession): boolean {
   if (streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
     ds.pendingActiveRuntimeCardRefresh = undefined;
     return false;
@@ -1268,14 +1989,14 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): boolean {
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
-    readableTerminalUrlFor(ds),
+    liveReadableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
     status,
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -1285,9 +2006,11 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): boolean {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    idleCardLabel(ds),
+    streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
   return scheduleCardPatch(ds, cardJson);
 }
@@ -1319,6 +2042,29 @@ export function idleCardLabel(ds: DaemonSession): IdleCardLabel | undefined {
   return undefined;
 }
 
+/** 活卡卡头标签（重建活卡的 buildStreamingCard 调用点统一从这里取）：主回合已结束
+ *  但仍有后台子任务在跑时为「后台子任务运行中（N）」，盖过 idle 标签；否则同
+ *  {@link idleCardLabel}。冻结卡不用它——后台计数只描述当下。 */
+export function streamCardLabel(ds: DaemonSession): StreamCardLabel | undefined {
+  if (ds.backgroundTaskCount && (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'idle')) {
+    return { backgroundTasks: ds.backgroundTaskCount };
+  }
+  const source = currentCaptureIdentity(ds) ?? ds.managedTurnOrigin;
+  const highWater = ds.turnDispatchAttemptHighWater;
+  const currentSource = source?.turnId === ds.currentTurnId && source?.turnId
+    && (highWater?.turnId !== source.turnId || (source.dispatchAttempt !== undefined
+      && source.dispatchAttempt >= highWater.dispatchAttempt)) ? source : undefined;
+  const activity = currentSource ? traexStreamCardActivity({
+    cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId,
+    status: ds.lastScreenStatus,
+    content: ds.lastScreenContent,
+    execution: ds.replyExecutionStarts?.get(JSON.stringify([currentSource.turnId, currentSource.dispatchAttempt ?? null])),
+    workerGeneration: ds.workerGeneration,
+    nowMs: Date.now(),
+  }) : undefined;
+  return activity ?? idleCardLabel(ds);
+}
+
 const TURN_EXPLICIT_MENTION_MAX = 64;
 /** Posted-receipt memory. Bounded for the same reason as the origin FIFO, and
  *  larger than any plausible replay window within one session's lifetime. */
@@ -1327,13 +2073,29 @@ const TERMINAL_RECEIPT_DEDUPE_MAX = 64;
 const TERMINAL_RECEIPT_RETRY_BACKOFF_MS = [0, 1000, 5000] as const;
 const TURN_TERMINAL_CARRIER_MAX = 64;
 
+function isFinalTurnTerminalCarrier(
+  carrier: TurnTerminalCarrier | undefined,
+): carrier is TurnTerminalCarrier {
+  return !!carrier
+    && carrier.responseKind !== 'progress'
+    && carrier.responseKind !== 'auxiliary';
+}
+
 function recordTurnTerminalCarrier(
   ds: DaemonSession,
   turnId: string,
-  carrier: { messageId: string; kind: 'standard_reply_card' | 'non_patchable' },
+  carrier: TurnTerminalCarrier,
 ): void {
   if (!turnId || !carrier.messageId) return;
   const carriers = ds.turnTerminalCarriers ?? (ds.turnTerminalCarriers = new Map());
+  const previous = carriers.get(turnId);
+  // A final is the authoritative completion carrier. Later auxiliary/progress
+  // sends are supplemental and must neither steal its footer patch nor turn
+  // themselves into a completed-turn strip. Undefined preserves rolling
+  // compatibility with workers that predate responseKind propagation.
+  const previousIsFinal = isFinalTurnTerminalCarrier(previous);
+  const nextIsFinal = isFinalTurnTerminalCarrier(carrier);
+  if (previousIsFinal && !nextIsFinal) return;
   carriers.delete(turnId);
   carriers.set(turnId, carrier);
   while (carriers.size > TURN_TERMINAL_CARRIER_MAX) {
@@ -1457,14 +2219,14 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
-    buildTerminalUrl(ds),
+    liveReadableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || getCliDisplayName(effectiveCliId),
     ds.lastScreenContent ?? '',
     status,
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -1474,9 +2236,11 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    idleCardLabel(ds),
+    streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1493,9 +2257,10 @@ export const USAGE_REFRESH_INTERVAL_MS = 12_000;
  *  the interval tick so arm/clear is a state-boundary invariant, not tied to one
  *  PATCH path. Requires: an actively-working turn, a live (non-sentinel, not a
  *  new-turn handoff) streaming card, the worker initialized (NOT a Web-Terminal
- *  port — ZMX reports ready with port=0), usageDisplay='streaming', and a CLI
- *  that actually has a native-usage transcript (gemini/opencode/pi/… have none
- *  → nothing to show). */
+ *  port — ZMX reports ready with port=0), and a CLI
+ *  that actually has a native-usage transcript (opencode/pi/… have none
+ *  → nothing to show). Non-streaming usage display requires a rendered
+ *  activity label; a background-task label alone does not enable refresh. */
 export function usageRefreshShouldRun(ds: DaemonSession): boolean {
   if (ds.lastScreenStatus !== 'working') return false;
   if (streamingCardDisabled(ds) || ds.suppressRecoveryCard) return false;
@@ -1509,7 +2274,10 @@ export function usageRefreshShouldRun(ds: DaemonSession): boolean {
   if (!workerHasInitialized(ds)) return false;
   if (!cliSupportsNativeUsage(sessionCliId(ds, getBot(ds.larkAppId).config))) return false;
   try {
-    if (resolveUsageDisplay(ds.larkAppId) !== 'streaming') return false;
+    if (resolveUsageDisplay(ds.larkAppId) !== 'streaming') {
+      const label = streamCardLabel(ds);
+      return !!label && typeof label === 'object' && 'activity' in label;
+    }
   } catch { /* missing config → default streaming → allowed */ }
   return true;
 }
@@ -1529,18 +2297,18 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
-    // readableTerminalUrlFor (NOT raw buildTerminalUrl): now that this tick can
+    // liveReadableTerminalUrlFor (NOT raw buildTerminalUrl): now that this tick can
     // run for a port=0 backend (ZMX reports ready without a Web Terminal), a raw
     // URL would render a fake `:undefined`/backend-less link. Mirror every other
     // card path — empty string when there is no real terminal.
-    readableTerminalUrlFor(ds),
+    liveReadableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
     ds.lastScreenStatus ?? 'working',
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -1555,9 +2323,11 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     // path fires every 12s while a turn works, so omitting it would drop the
     // ⚡ badge until the next status-edge PATCH.
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    idleCardLabel(ds),
+    streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1623,14 +2393,14 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
-    buildTerminalUrl(ds),
+    liveReadableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
     status,
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -1640,9 +2410,11 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    idleCardLabel(ds),
+    streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1661,6 +2433,17 @@ function clearPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
 
 function tag(ds: DaemonSession): string {
   return ds.session.sessionId.substring(0, 8);
+}
+
+/** 「会话启动失败」notice: the reason plus where to look. The session tag is
+ *  what this daemon's log lines are prefixed with, and the worker writes the
+ *  full failing command there (never into the chat). */
+function startupFailureNotice(ds: DaemonSession, cliName: string, reason: string, loc: ReturnType<typeof botLocale>): string {
+  const botIndex = process.env.BOTMUX_BOT_INDEX;
+  const logPath = botIndex !== undefined && /^\d+$/.test(botIndex)
+    ? `~/.botmux/logs/daemon-${botIndex}-*.log`
+    : tr('worker.start_failed_log_fallback', {}, loc);
+  return tr('worker.start_failed', { cliName, reason, sessionId: tag(ds), logPath }, loc);
 }
 
 /** Live per-bot `dshRuntime` for a session's card. Only meaningful for cliId
@@ -1694,12 +2477,17 @@ function supportsBotmuxLarkNativeSessionTitle(cliId: CliId): boolean {
   return cliId === 'codex' || cliId === 'traex';
 }
 
+/** Idle grace before a delivered continuation without a terminal is declared
+ *  unverifiable. Comfortably above the worker's own late-terminal windows
+ *  (StopFailure settles within ~5s of the idle prompt). */
+const ORDINARY_RECOVERY_LOST_CONTINUATION_GRACE_MS = 60_000;
+
 function ordinaryTurnRecoveryEligible(
   ds: DaemonSession,
   botCfg = getBot(ds.larkAppId).config,
 ): boolean {
   const cliId = sessionCliId(ds, botCfg);
-  return (cliId === 'claude-code' || (cliId === 'codex' && botCfg.codexCapacityRecovery === true && !ds.adoptedFrom && !ds.session.adoptedFrom))
+  return (cliId === 'claude-code' || (codexCapacityRecoveryCli(cliId) && botCfg.codexCapacityRecovery === true && !ds.adoptedFrom && !ds.session.adoptedFrom))
     && ds.session.status === 'active'
     && !isSharedAdoptSession(ds)
     && !ds.session.vcMeetingReceiver
@@ -1711,21 +2499,27 @@ function ordinaryTurnRecoveryEligible(
  *  Scheduled turns used to be excluded by an `om_` prefix check, so a transient
  *  provider failure inside an hourly task never auto-continued and only raised
  *  the「未启动自动续跑」card — the most frequent shape of that card on a box that
- *  runs recurring tasks. Everything else (durable replays, HTTP triggers,
- *  meeting deliveries, `bmx-recovery-*` continuations themselves) stays out. */
+ *  runs recurring tasks. A failure card's「重试」re-delivery
+ *  (`bmx-recovery-retry-*`) is a fresh logical turn of the same message and gets
+ *  the same ladder (and, if that also fails, its own failure card). Everything
+ *  else (durable replays, HTTP triggers, meeting deliveries, `bmx-recovery-*`
+ *  continuations themselves) stays out. */
 function isOrdinaryRecoveryTurnId(turnId: string | undefined): turnId is string {
-  return !!turnId && (turnId.startsWith('om_') || parseScheduledTurnId(turnId) !== null);
+  return !!turnId && (turnId.startsWith('om_') || parseScheduledTurnId(turnId) !== null
+    || isRecoveryRetryTurnId(turnId));
 }
 
 /** The identity a scheduled continuation runs as — the task creator, exactly as
  *  the original fire resolved it (see trustedCallerForScheduledTask). Reads the
- *  task back from the bot's schedules store; a deleted task yields no identity,
- *  which is the same fail-closed outcome the fire path has. */
+ *  task back from the host authority store, never from schedules.json (a
+ *  sandboxed CLI can rewrite that projection to borrow someone else's
+ *  identity); a deleted task yields no identity, which is the same
+ *  fail-closed outcome the fire path has. */
 function scheduledContinuationTrustedCaller(
   ds: DaemonSession,
   taskId: string,
 ): TrustedCaller | undefined {
-  const task = readScheduledTaskForProvenance(config.session.dataDir, ds.larkAppId, taskId);
+  const task = callbacks?.loadScheduledTaskForIdentity?.(ds.larkAppId, taskId);
   return task ? trustedCallerForScheduledTask(task, ds.larkAppId) : undefined;
 }
 
@@ -1741,7 +2535,7 @@ function ordinaryTurnRecoveryWarning(
   cliName = 'Claude',
   cliId: CliId = 'claude-code',
 ): string {
-  if (cliId === 'codex' && state.status === 'exhausted') {
+  if (codexCapacityRecoveryCli(cliId) && state.status === 'exhausted') {
     return tr('worker.codex_capacity_recovery_stopped', { cliName }, locale);
   }
   if (state.status === 'exhausted' && state.continuationsStarted >= 2) {
@@ -1764,6 +2558,12 @@ function ordinaryTurnRecoveryWarning(
   }
   if (state.lastErrorCode === 'recovery_persist_failed') {
     return tr('worker.ordinary_recovery_persist_failed', { cliName }, locale);
+  }
+  if (state.lastErrorCode === 'recovery_outcome_unverified') {
+    return tr('worker.ordinary_recovery_outcome_unverified', { cliName }, locale);
+  }
+  if (state.lastErrorCode === 'recovery_queued_unrecovered') {
+    return tr('worker.ordinary_recovery_queued_unrecovered', { cliName }, locale);
   }
   return tr('worker.ordinary_recovery_non_retryable', { cliName }, locale);
 }
@@ -1833,25 +2633,246 @@ function notifyOrdinaryTurnRecoveryFailure(
     errorCode: state.lastErrorCode,
     logicalTurnId: state.logicalTurnId,
   });
-  void requireCallbacks().sessionReply(
-    sessionAnchorId(ds),
-    buildSessionTurnFailedCard(ds, {
-      status: 'failed',
-      reason: warning,
-      ...(state.lastErrorCode !== undefined ? { errorCode: state.lastErrorCode } : {}),
-      // Include attempted continuations for both exhausted and opted-out
-      // recovery, so the user can see how far automatic handling got.
-      continuations: state.continuationsStarted,
-      // A recovery failure or opt-out does not prove that no side effects
-      // ran. Leave retry safety to the shared error-code policy.
-    }),
-    'interactive',
-    ds.larkAppId,
-    state.logicalTurnId,
-  ).catch(err => logger.error(
-    `[${tag(ds)}] Failed to deliver ordinary-turn recovery warning: `
-    + `${err instanceof Error ? err.message : String(err)}`,
-  ));
+  // The live status card follows the recovery into its failed end state
+  // (「执行失败」 instead of 「等待输入」) — only while it still shows this turn.
+  markFailedTurnIdle(ds, state.logicalTurnId);
+  enqueueOrdinaryRecoveryNotice(ds, state, botCfg);
+}
+
+/** Durable delivery of the one failure card per logical turn. The record is
+ *  persisted before the first send; the outbox retries until Feishu accepts it
+ *  (10-31: the Feishu API itself was failing DNS, and the single-shot notice
+ *  was dropped) and a restart resumes pending records instead of re-sending
+ *  delivered ones. */
+const ordinaryRecoveryNoticeOutbox = new RecoveryNoticeOutbox<ReturnType<typeof setTimeout>>({
+  schedule: (delayMs, run) => {
+    const timer = setTimeout(run, delayMs);
+    timer.unref?.();
+    return timer;
+  },
+  cancel: timer => clearTimeout(timer),
+  log: (level, message) => logger[level](`[recovery-notice] ${message}`),
+});
+
+/** A transport failure, or a rate limit / server error Feishu reports as
+ *  transient. A send stopped by a pre-send topic check is judged by the error
+ *  that made the check fail. */
+const turnNoticeSendRetryable = (error: unknown): boolean => {
+  const transient = (e: unknown) =>
+    recoveryNoticeSendNeverLanded(e) || recoveryNoticeSendOutcomeUnknown(e) || isRetryableLarkError(e);
+  const cause = (error as { cause?: unknown } | null | undefined)?.cause;
+  return transient(error) || (cause !== undefined && transient(cause));
+};
+
+/** Re-sends a failure card / worker notice whose first send failed
+ *  transiently, with the same backoff, 24h cap and fixed uuid as the recovery
+ *  card. Any other failure ends the retries. */
+const turnNoticeOutbox = new RecoveryNoticeOutbox<ReturnType<typeof setTimeout>, TurnNoticeRecord>({
+  schedule: (delayMs, run) => {
+    const timer = setTimeout(run, delayMs);
+    timer.unref?.();
+    return timer;
+  },
+  cancel: timer => clearTimeout(timer),
+  log: (level, message) => logger[level](`[turn-notice] ${message}`),
+  retryable: turnNoticeSendRetryable,
+});
+
+function turnNoticeHost(ds: DaemonSession): RecoveryNoticeHost<TurnNoticeRecord> {
+  const find = (uuid: string) => ds.session.turnNotices?.find(entry => entry.delivery.uuid === uuid);
+  return {
+    key: ds.session.sessionId,
+    list: () => ds.session.turnNotices ?? [],
+    update: (uuid, mutate) => {
+      const record = find(uuid);
+      if (!record) return undefined;
+      mutate(record);
+      sessionStore.updateSession(ds.session);
+      return find(uuid);
+    },
+    send: record => requireCallbacks().sessionReply(
+      sessionAnchorId(ds),
+      record.content,
+      record.msgType,
+      ds.larkAppId,
+      record.turnId,
+      { uuid: record.delivery.uuid, sourceSessionId: ds.session.sessionId },
+    ),
+    canDeliver: () => ordinaryTurnRecoveryStillOwnsSession(ds),
+  };
+}
+
+/** Re-arm notices still owed from before a daemon restart or worker respawn. */
+export function resumeTurnNotices(ds: DaemonSession): void {
+  turnNoticeOutbox.resume(turnNoticeHost(ds));
+}
+
+/** Send a failure card / worker notice. When the send fails transiently (see
+ *  turnNoticeSendRetryable) the notice is kept on the session and retried with
+ *  the same uuid; any other failure is thrown as before. */
+async function sendTurnNotice(
+  ds: DaemonSession,
+  notice: Pick<TurnNoticeRecord, 'kind' | 'turnId' | 'msgType' | 'content'>,
+): Promise<void> {
+  const uuid = randomUUID();
+  try {
+    await requireCallbacks().sessionReply(
+      sessionAnchorId(ds),
+      notice.content,
+      notice.msgType,
+      ds.larkAppId,
+      notice.turnId,
+      { uuid, sourceSessionId: ds.session.sessionId },
+    );
+  } catch (err) {
+    if (!turnNoticeSendRetryable(err)) throw err;
+    const now = Date.now();
+    const delayMs = recoveryNoticeRetryDelayMs(1);
+    const lastError = err instanceof Error ? err.message : String(err);
+    const list = addTurnNotice(ds.session.turnNotices, {
+      ...notice,
+      createdAt: now,
+      delivery: {
+        state: 'pending',
+        attempts: 1,
+        uuid,
+        nextAttemptAt: now + delayMs,
+        lastError,
+        ...(recoveryNoticeSendNeverLanded(err) ? {} : { uncertainSince: now }),
+      },
+    });
+    ds.session.turnNotices = list;
+    try {
+      sessionStore.updateSession(ds.session);
+    } catch (persistErr) {
+      // A failed write reloads the durable row; this process still retries
+      // from memory (a restart then cannot resume it).
+      ds.session.turnNotices = list;
+      logger.error(`[${tag(ds)}] Failed to persist owed ${notice.kind} notice: `
+        + `${persistErr instanceof Error ? persistErr.message : String(persistErr)}`);
+    }
+    logger.warn(`[${tag(ds)}] Failed to deliver ${notice.kind} notice (${lastError}); `
+      + `retrying in ${Math.round(delayMs / 1000)}s`);
+    resumeTurnNotices(ds);
+  }
+}
+
+function enqueueOrdinaryRecoveryNotice(
+  ds: DaemonSession,
+  state: NonNullable<Session['ordinaryTurnRecovery']>,
+  botCfg = getBot(ds.larkAppId).config,
+): void {
+  const replyTarget = pickTurnReplyTarget(ds.session, state.logicalTurnId);
+  const initiator = recoveryNoticeInitiator(state, {
+    larkAppId: ds.larkAppId,
+    ...(replyTarget ? { replyTarget } : {}),
+  });
+  const admittedAt = Date.parse(replyTarget?.updatedAt ?? '');
+  recordAndDeliverOrdinaryRecoveryNotice({
+    state,
+    context: {
+      now: Date.now(),
+      ...(initiator.openId ? { initiatorOpenId: initiator.openId } : {}),
+      ...(initiator.caller ? { retryCaller: initiator.caller } : {}),
+      // Re-delivery replays a Claude CLI envelope verbatim; scheduled fires and
+      // other CLIs keep the card without a retry button.
+      retrySupported: sessionCliId(ds, botCfg) === 'claude-code' && !parseScheduledTurnId(state.logicalTurnId),
+      ...(Number.isFinite(admittedAt) ? { turnAdmittedAt: admittedAt } : {}),
+    },
+    host: ordinaryRecoveryNoticeHost(ds),
+    outbox: ordinaryRecoveryNoticeOutbox,
+    saveList: list => {
+      ds.session.ordinaryRecoveryNotices = list;
+      try {
+        sessionStore.updateSession(ds.session);
+      } catch (err) {
+        // A failed write reloads the durable row; keep the notice in memory so
+        // this process still delivers it (a restart then cannot resume it).
+        ds.session.ordinaryRecoveryNotices = list;
+        throw err;
+      }
+    },
+    log: (level, message) => logger[level](`[${tag(ds)}] [recovery-notice] ${message}`),
+  });
+}
+
+function ordinaryRecoveryNoticeHost(ds: DaemonSession): RecoveryNoticeHost {
+  const find = (logicalTurnId: string) => ds.session.ordinaryRecoveryNotices
+    ?.find(entry => entry.logicalTurnId === logicalTurnId);
+  return {
+    key: ds.session.sessionId,
+    list: () => ds.session.ordinaryRecoveryNotices ?? [],
+    update: (logicalTurnId, mutate) => {
+      const record = find(logicalTurnId);
+      if (!record) return undefined;
+      mutate(record);
+      sessionStore.updateSession(ds.session);
+      return find(logicalTurnId);
+    },
+    send: record => requireCallbacks().sessionReply(
+      sessionAnchorId(ds),
+      buildOrdinaryRecoveryNoticeCard(ds, record),
+      'interactive',
+      ds.larkAppId,
+      record.logicalTurnId,
+      { uuid: record.delivery.uuid },
+    ),
+    canDeliver: () => ds.session.status === 'active' && ordinaryTurnRecoveryStillOwnsSession(ds),
+  };
+}
+
+/** Render the failure card for one notice record — the first delivery, every
+ *  delivery retry, and the in-place「已重试」patch all build from the record. */
+export function buildOrdinaryRecoveryNoticeCard(
+  ds: DaemonSession,
+  record: OrdinaryRecoveryNoticeRecord,
+): string {
+  const botCfg = getBot(ds.larkAppId).config;
+  const cliId = sessionCliId(ds, botCfg);
+  const mentionOpenId = record.initiatorOpenId
+    ?? daemonCardFooterRecipientOpenId(ds, cliId)
+    ?? failureNoticeFallbackMentionOpenId(ds);
+  const retried = record.retried?.state === 'accepted' ? record.retried : undefined;
+  return buildRecoveryFailedCard({
+    rootId: sessionAnchorId(ds),
+    sessionId: ds.session.sessionId,
+    cliId,
+    cliName: sessionRuntimeDisplayName(ds) ?? getCliDisplayName(cliId),
+    logicalTurnId: record.logicalTurnId,
+    ...(mentionOpenId ? { mentionOpenId } : {}),
+    causeKey: recoveryCauseI18nKey(record.causeErrorCode ?? record.errorCode),
+    outcomeKey: recoveryOutcomeI18nKey(record),
+    continuations: record.continuations,
+    errorCodes: [record.causeErrorCode, record.errorCode].filter((code): code is string => !!code),
+    ...(record.task ? { task: record.task } : {}),
+    failedAt: new Date(record.createdAt),
+    retry: retried
+      ? { kind: 'retried', byOpenId: retried.byOpenId, at: new Date(retried.at) }
+      : record.retry
+        ? { kind: 'available' }
+        : ds.session.lastFailedTurn?.turnId === record.logicalTurnId
+          // Pre-existing behaviour for recoveries without re-delivery material
+          // (other CLIs, pre-upgrade turns): the admin continue button, pinned
+          // to this exact turn so it can never replay a different message.
+          ? { kind: 'continue_legacy', turnId: record.logicalTurnId }
+          : {
+            kind: 'none',
+            reason: parseScheduledTurnId(record.logicalTurnId)
+              ? 'scheduled'
+              : cliId === 'claude-code' ? 'no_input' : 'unsupported',
+          },
+    terminalUrl: readableTerminalUrlFor(ds),
+    locale: localeForBot(ds.larkAppId),
+  });
+}
+
+/** Persist one mutation of a notice record (used by the card's retry flow). */
+export function updateOrdinaryRecoveryNotice(
+  ds: DaemonSession,
+  logicalTurnId: string,
+  mutate: (record: OrdinaryRecoveryNoticeRecord) => void,
+): OrdinaryRecoveryNoticeRecord | undefined {
+  return ordinaryRecoveryNoticeHost(ds).update(logicalTurnId, mutate);
 }
 
 /** Opting out settles a pending failure before removing its runtime owner.
@@ -1863,7 +2884,7 @@ function disposeIneligibleOrdinaryTurnRecovery(
 ): void {
   try {
     const current = ds.session.ordinaryTurnRecovery;
-    if (sessionCliId(ds, botCfg) === 'codex' && botCfg.codexCapacityRecovery !== true
+    if (codexCapacityRecoveryCli(sessionCliId(ds, botCfg)) && botCfg.codexCapacityRecovery !== true
       && ordinaryTurnRecoveryEligible(ds, { ...botCfg, codexCapacityRecovery: true })
       && ordinaryTurnRecoveryStillOwnsSession(ds)
       && current && (['backoff', 'dispatching'].includes(current.status)
@@ -1873,6 +2894,7 @@ function disposeIneligibleOrdinaryTurnRecovery(
         ...current, status: 'cancelled' as const, nextAttemptAt: undefined,
         cancelledByTurnId: 'recovery_disabled', lastErrorCode: 'recovery_disabled',
         alertSentAt: current.alertSentAt ?? Date.now(), warningDispatched: true,
+        failureNoticeOwed: true as const,
       };
       // Keep the cancellation/notice fence in memory even if disk is full.
       ds.session.ordinaryTurnRecovery = cancelled;
@@ -1915,12 +2937,30 @@ export function ensureOrdinaryTurnRecoveryAttached(
   };
   attachOrdinaryTurnRecovery(ds.session, {
     onError: onRecoveryError,
-    ...(sessionCliId(ds, botCfg) === 'codex' ? {
+    ...(codexCapacityRecoveryCli(sessionCliId(ds, botCfg)) ? {
       recoverableErrorCodes: [CODEX_CAPACITY_ERROR_CODE],
       supersedeOnUserInput: true,
       resumeRecoveryOnRestore: false,
       backoffMs: [15_000, 45_000],
-    } : {}),
+    } : {
+      // Claude keeps a running recovery across newer input, so a continuation
+      // whose terminal is lost would otherwise own the slot forever. Once the
+      // CLI has been idle this long with no terminal for it, settle failed.
+      lostContinuationGraceMs: ORDINARY_RECOVERY_LOST_CONTINUATION_GRACE_MS,
+      // A usage-limit pause keeps the recovery deliberately `running` until
+      // the limit resets (rate-limited terminals are not failures) — never
+      // settle it as lost while the CLI is limited or back at work.
+      isCliBusy: () => ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'analyzing'
+        || ds.lastScreenStatus === 'stalled' || ds.lastScreenStatus === 'limited'
+        || ds.usageLimit?.limited === true,
+      // A type-ahead follow-up that fails while the earlier turn's recovery is
+      // in flight gets its own durable failure card — the same failures the
+      // fallback card would have announced, without its single-shot delivery.
+      ownsQueuedFailure: terminal => shouldNotifyTurnFailure({
+        status: terminal.status,
+        ...(terminal.errorCode !== undefined ? { errorCode: terminal.errorCode } : {}),
+      }),
+    }),
     schedule: (delayMs, run) => {
       const timer = setTimeout(() => {
         try {
@@ -1937,9 +2977,25 @@ export function ensureOrdinaryTurnRecoveryAttached(
     cancel: timer => clearTimeout(timer),
     persist: () => sessionStore.updateSession(ds.session),
     mintContinuationTurnId: logicalTurnId => mintScheduledContinuationTurnId(logicalTurnId),
-    prepare: dispatch => parseScheduledTurnId(dispatch.logicalTurnId)
-      ? callbacks?.prepareRawInputTurn?.(ds, dispatch.turnId)
-      : undefined,
+    prepare: dispatch => {
+      if (isCodexAppCliId(sessionCliId(ds, botCfg)) && !parseScheduledTurnId(dispatch.logicalTurnId)) {
+        if (!codexAppRecoveryCaller(ds.session, ds.larkAppId, dispatch.logicalTurnId)) {
+          throw new Error('recovery_original_human_unverified');
+        }
+        // Identity preparation reads exact per-turn reply provenance. Copy it
+        // before awaiting publication, never from the latest chat sender.
+        const context = ds.session.turnReplyContexts?.[dispatch.logicalTurnId];
+        const target = ds.session.replyTargets?.[dispatch.logicalTurnId];
+        if (context) ds.session.turnReplyContexts = { ...ds.session.turnReplyContexts,
+          [dispatch.turnId]: structuredClone(context) };
+        if (target) ds.session.replyTargets = { ...ds.session.replyTargets,
+          [dispatch.turnId]: structuredClone(target) };
+        sessionStore.updateSession(ds.session);
+        return callbacks?.prepareRawInputTurn?.(ds, dispatch.turnId);
+      }
+      return parseScheduledTurnId(dispatch.logicalTurnId)
+        ? callbacks?.prepareRawInputTurn?.(ds, dispatch.turnId) : undefined;
+    },
     enqueue: (dispatch: OrdinaryTurnRecoveryDispatch) => {
       if (!ordinaryTurnRecoveryEligible(ds) || !ordinaryTurnRecoveryStillOwnsSession(ds)) return false;
       // A scheduled logical turn continues as the same scheduled turn: same
@@ -1948,9 +3004,11 @@ export function ensureOrdinaryTurnRecoveryAttached(
       // stays silent. Ordinary IM turns take none of this and keep their
       // inherited reply context alone.
       const scheduledTaskId = parseScheduledTurnId(dispatch.logicalTurnId);
+      const appRecovery = isCodexAppCliId(sessionCliId(ds, botCfg));
       const trustedCaller = scheduledTaskId
         ? scheduledContinuationTrustedCaller(ds, scheduledTaskId)
-        : undefined;
+        : appRecovery ? codexAppRecoveryCaller(ds.session, ds.larkAppId, dispatch.logicalTurnId) : undefined;
+      if (appRecovery && !trustedCaller) return false;
       // Silence comes from the frozen per-turn attribute in the persisted
       // state, not from the runtime registry (which a daemon restart empties).
       const silent = dispatch.silent;
@@ -1983,6 +3041,18 @@ export function ensureOrdinaryTurnRecoveryAttached(
     },
     warn: state => notifyOrdinaryTurnRecoveryFailure(ds, state, botCfg),
   });
+  // The failed state and its notice record are two writes: a process that
+  // died between them left the notice owed but unrecorded — re-create it.
+  // Pre-upgrade states carry no marker (the old code already sent theirs).
+  const settled = ds.session.ordinaryTurnRecovery;
+  if (settled?.failureNoticeOwed && settled.warningDispatched
+    && !(ds.session.ordinaryRecoveryNotices ?? []).some(entry => entry.logicalTurnId === settled.logicalTurnId)) {
+    enqueueOrdinaryRecoveryNotice(ds, settled, botCfg);
+  }
+  // A failure card that could not reach Feishu before a restart (or before
+  // this worker generation) continues from its persisted next attempt;
+  // delivered/abandoned records stay inert.
+  ordinaryRecoveryNoticeOutbox.resume(ordinaryRecoveryNoticeHost(ds));
   const restored = ds.session.ordinaryTurnRecovery;
   if (restored?.alertSentAt
     && (restored.status === 'exhausted' || restored.status === 'attention_required')) {
@@ -2346,7 +3416,7 @@ export function ensureReadonlyTaskContinuationAttached(
           content: dispatch.prompt,
           turnId: dispatch.turnId,
           dispatchAttempt: dispatch.dispatchAttempt,
-          ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
+          ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds), ...latestLaunchCommandsForRespawn(ds), ...latestPinEffortForRespawn(ds) } : {}),
           trustedCaller: current.trustedCaller,
           ...(turnCallerOpenIdFor(ds, dispatch.turnId)
             ? { turnCallerOpenId: turnCallerOpenIdFor(ds, dispatch.turnId)! }
@@ -2470,11 +3540,12 @@ function sessionServiceTier(ds: DaemonSession, cliId: CliId): CodexServiceTier |
 
 function sessionAgentConfig(
   ds: DaemonSession,
-  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; cliConfigDir?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[]; env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean },
-): { cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; cliConfigDir?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; serviceTier?: CodexServiceTier; launchShell?: string; startupCommands?: string[] } {
+  botCfg: { cliId: CliId; cliRuntime?: CliRuntimeConfig; cliPathOverride?: string; cliConfigDir?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; traexAutoModel?: TraexAutoModelConfig; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; launchShell?: string; startupCommands?: string[]; env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean },
+): { codexProfile?: string; codexProfileHome?: string; cliId: CliId; cliRuntime?: CliRuntimeSnapshot; cliPathOverride?: string; cliConfigDir?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; model?: string; traexAutoModel?: TraexAutoModelConfig; modelBackendVariant?: 'standard' | 'max'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; serviceTier?: CodexServiceTier; launchShell?: string; startupCommands?: string[] } {
   const selected = ds.session.cliLaunchSnapshot;
   const groupEffort = resolveSessionGroupSettings(ds, selected?.cliId ?? ds.session.cliId ?? botCfg.cliId).reasoningEffort;
   if (selected) {
+    if (ds.session.codexProfile) throw new Error('Codex profile does not support per-session CLI selection');
     if (selected.cliId.toLowerCase() === 'riff') throw new Error('CLI selection rejected: Riff requires bot-level backend configuration and cannot be selected per session');
     if (botCfg.env && Object.keys(botCfg.env).length > 0) throw new Error('CLI selection rejected: bot env is configured');
     if (botCfg.backendType === 'riff' || botCfg.riff !== undefined) throw new Error('CLI selection rejected: Riff is configured');
@@ -2509,12 +3580,13 @@ function sessionAgentConfig(
     // is false → no bot model leaks to a different CLI; same-CLI keeps the bot's model
     // and stays consistent with in-place restarts (latestModelForRespawn), which never
     // pass through this snapshot branch. spawnModelOverride is honored automatically.
-    const model = resolveSessionLaunchModel(ds, botCfg);
+    const modelChoice = resolveSessionLaunchModelChoice(ds, botCfg);
+    const model = modelChoice.model;
     recordLaunchModel(ds, model);
     // A per-session `/cli` selection launches the stock CLI: like bot env (rejected
     // above), the bot's config profile belongs to the bot's own CLI, not the
     // selected one. ds.session.cliConfigDir stays unset for these sessions.
-    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, cliLaunchMode, model, modelBackendVariant, reasoningEffort, serviceTier: sessionServiceTier(ds, selected.cliId), launchShell, startupCommands };
+    return { cliId: selected.cliId, cliRuntime: runtime, cliPathOverride: legacyPath, wrapperCli, cliLaunchMode, model, traexAutoModel: modelChoice.traexAutoModel, modelBackendVariant, reasoningEffort: resolveSessionLaunchEffort(ds, botCfg, model, reasoningEffort), serviceTier: sessionServiceTier(ds, selected.cliId), launchShell, startupCommands };
   }
   if (groupEffort && !ds.session.reasoningEffort) {
     ds.session.reasoningEffort = groupEffort;
@@ -2613,11 +3685,14 @@ function sessionAgentConfig(
     if (repaired) sessionStore.updateSession(ds.session);
   }
   // Resolved at EVERY spawn, resume included — see resolveSessionLaunchModel.
-  const model = resolveSessionLaunchModel(ds, botCfg);
+  const modelChoice = resolveSessionLaunchModelChoice(ds, botCfg);
+  const model = modelChoice.model;
   recordLaunchModel(ds, model);
   // Effort is frozen per session, but whether it is *supported* depends on the
   // model this spawn actually uses — which is resolved live above, not frozen.
-  if (ds.session.reasoningEffort
+  // TraeX efforts are syntax-checked at load time; its live catalog owns capability.
+  if (ds.session.reasoningEffort && !modelChoice.traexAutoModel
+      && ds.session.cliId !== 'traex'
       && !cliModelSupportsReasoningEffort(ds.session.cliId, model, ds.session.reasoningEffort)) {
     ds.session.reasoningEffort = undefined;
     sessionStore.updateSession(ds.session);
@@ -2626,12 +3701,15 @@ function sessionAgentConfig(
     cliId: ds.session.cliId ?? botCfg.cliId,
     cliRuntime: ds.session.cliRuntime,
     cliPathOverride: ds.session.cliPathOverride,
+    codexProfile: ds.session.codexProfile ?? undefined,
+    codexProfileHome: ds.session.codexProfileHome,
     cliConfigDir: ds.session.adoptedFrom ? undefined : ds.session.cliConfigDir,
     wrapperCli: ds.session.wrapperCli,
     cliLaunchMode: ds.session.cliLaunchMode,
     model,
+    traexAutoModel: modelChoice.traexAutoModel,
     modelBackendVariant: ds.session.modelBackendVariant,
-    reasoningEffort: ds.session.reasoningEffort,
+    reasoningEffort: resolveSessionLaunchEffort(ds, botCfg, model, ds.session.reasoningEffort),
     serviceTier: sessionServiceTier(ds, ds.session.cliId ?? botCfg.cliId),
     launchShell: botCfg.launchShell,
     startupCommands: botCfg.startupCommands,
@@ -2862,7 +3940,7 @@ function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
   // Runs on every turn's final output; the cached read only re-parses when
   // a sibling daemon actually rewrote bots-info.json.
   const parsed = readBotsInfoJson(dataDir);
-  const botEntries: BotMentionEntry[] = Array.isArray(parsed) ? parsed as BotMentionEntry[] : [];
+  const botEntries: BotMentionEntry[] = Array.isArray(parsed) ? parsed.filter(isBotMentionEntry) : [];
 
   return knownBotOpenIdsFromCrossRef(crossRef, botEntries, larkAppId);
 }
@@ -2875,6 +3953,23 @@ function isRunnerDeliveryCli(cliId?: string): boolean {
   return cliId === 'mira' || cliId === 'mir' || cliId === 'dsh';
 }
 
+/** A topic opened by `botmux dispatch` carries a verified report binding: its
+ *  brief asks the worker to `botmux report --dispatch-root`, which reaches the
+ *  dispatcher's own session outside this topic. Addressing the dispatcher in
+ *  this topic instead starts a fresh dispatcher session with no context (#1887). */
+function topicReportsToDispatcher(ds: DaemonSession, dispatchRoot: string | undefined = ds.session.rootMessageId): boolean {
+  if (!dispatchRoot) return false;
+  try {
+    const registry = JSON.parse(readFileSync(join(config.session.dataDir, 'orchestrate-dispatch.json'), 'utf8'));
+    return resolveVerifiedDispatchReportTarget({
+      registry, dispatchRoot,
+      secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
+    }).ok;
+  } catch {
+    return false;
+  }
+}
+
 function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: string): string | undefined {
   const owner = ds.session.ownerOpenId;
   if (!owner) {
@@ -2882,7 +3977,8 @@ function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: str
     // `botmux send` to @-trigger a peer bot. For bot-to-bot handoffs, address
     // the daemon fallback card back to the original dispatcher so orchestration
     // resumes (the card's real <at> is what re-wakes the dispatching bot).
-    if (isRunnerDeliveryCli(effectiveCliId) && ds.session.quoteTargetSenderIsBot && ds.session.creatorOpenId) {
+    if (isRunnerDeliveryCli(effectiveCliId) && ds.session.quoteTargetSenderIsBot && ds.session.creatorOpenId
+      && !topicReportsToDispatcher(ds)) {
       return ds.session.creatorOpenId;
     }
     return undefined;
@@ -2894,7 +3990,7 @@ function daemonCardFooterRecipientOpenId(ds: DaemonSession, effectiveCliId?: str
       // senders). Same constraint for the stdout-runner CLIs (mira/mir): the
       // daemon fallback card is their only @-trigger channel, so address the
       // dispatcher bot here too.
-      return isRunnerDeliveryCli(effectiveCliId) ? owner : undefined;
+      return isRunnerDeliveryCli(effectiveCliId) && !topicReportsToDispatcher(ds) ? owner : undefined;
     }
     return owner;
   } catch {
@@ -2932,6 +4028,53 @@ function zeroPromptFinalInitiator(
   if (isBot !== undefined) return { openId, isBot };
   try { return { openId, isBot: loadKnownBotOpenIdsForApp(ds.larkAppId).has(openId) }; }
   catch { return { openId, isBot: false }; }
+}
+
+/** Zero-injection workers cannot pass `--mention` either, so a peer bot the
+ * reply names in prose (`@Dev(Claude) 请合并`) is resolved exactly as
+ * `botmux send` resolves it and rewritten in place into a real <at>; without
+ * that the named bot never wakes up. Once the body names a bot, the reply is
+ * addressed to it, not to a human initiator: the footer @ of the human is
+ * dropped, and when the name cannot be resolved nobody is @-ed rather than the
+ * wrong person. A bot initiator keeps its @, since that @ is how it receives
+ * the result (see the automatic report below). Only full display names count:
+ * cliId aliases are gated on the cross-bot session table, which only `botmux
+ * send` reads. `dispatcherOpenId` is never @-ed: a dispatched topic reports to
+ * its dispatcher instead (#1887). */
+function addressZeroPromptReply(
+  ds: DaemonSession,
+  text: string,
+  initiator: ZeroPromptFinalInitiator | null,
+  recipientOpenId: string | undefined,
+  dispatcherOpenId: string | undefined,
+  t: string,
+  turnId: string,
+): { text: string; recipientOpenId: string | undefined } {
+  if (ds.chatType === 'p2p' || !text.includes('@')) return { text, recipientOpenId };
+  let prose: ReturnType<typeof resolveProseBotMentions>;
+  try {
+    const dataDir = config.session.dataDir;
+    const parsed = readBotsInfoJson(dataDir);
+    prose = resolveProseBotMentions({
+      text,
+      botEntries: Array.isArray(parsed) ? parsed.filter(isBotMentionEntry) : [],
+      crossRef: readPeerCrossRef(dataDir, ds.larkAppId),
+      selfAppId: ds.larkAppId,
+      convoBotAppIds: new Set(),
+    });
+  } catch {
+    return { text, recipientOpenId };
+  }
+  if (prose.mentions.length === 0 && prose.unresolved.length === 0) return { text, recipientOpenId };
+  if (prose.unresolved.length > 0) {
+    logger.warn(
+      `[${t}] Zero-prompt final names bot(s) with no cross-ref open_id, not @-ing them `
+      + `(${prose.unresolved.join(', ')}; turn ${turnId.substring(0, 8)})`,
+    );
+  }
+  const inline = applyInlineMentions(text, prose.mentions.filter(m => m.open_id !== dispatcherOpenId));
+  const keepInitiator = initiator?.isBot === true && !!recipientOpenId && !inline.usedIds.has(recipientOpenId);
+  return { text: inline.text, recipientOpenId: keepInitiator ? recipientOpenId : undefined };
 }
 
 /** 失败兜底卡片（turnFailed final_output）的兜底 @ 对象。仅当会话没有任何真人
@@ -2989,6 +4132,7 @@ export function clearUsageLimitState(ds: DaemonSession): void {
     ds.usageLimitRetryTimer = undefined;
   }
   ds.usageLimit = undefined;
+  ds.usageLimitPersistPending = false;
   // Re-arm the proactive rate-limit notification latch: the next limit episode
   // (even one with the same usageLimitStateKey) must notify the owner again.
   ds.rateLimitNotifiedKey = undefined;
@@ -3002,13 +4146,40 @@ export function cardUsageLimit(ds: DaemonSession): CliUsageLimitState | undefine
   return ds.lastScreenStatus === 'limited' ? ds.usageLimit : undefined;
 }
 
+/** Status for a streaming card re-rendered from cached daemon state alone (the
+ *  显示/隐藏输出 toggle). `lastScreenStatus` is runtime-only: a restored session
+ *  has none, and a worker that died keeps the last one it reported. With no
+ *  worker and no transfer bringing one, no CLI is running under this daemon,
+ *  so the card must not claim work — 「工作中」 also brings back a 「⏹ 停止」
+ *  that has nothing to stop. A usage limit is persisted and its retry revives
+ *  the CLI, so it keeps its own state. A worker that has not reported yet gets
+ *  what the turn's starting card shows. The field itself is left alone:
+ *  suspendWorker clears it on purpose, and the next turn's card and the idle
+ *  sweepers read it. */
+export function cachedStreamingCardStatus(ds: DaemonSession): StreamStatus {
+  if (hasNoCliUnderDaemon(ds)) return ds.usageLimit ? 'limited' : 'idle';
+  return ds.lastScreenStatus
+    ?? turnStartingCardStatus(ds, sessionCliId(ds, getBot(ds.larkAppId).config));
+}
+
+/** Header label paired with {@link cachedStreamingCardStatus}. Background
+ *  subtasks ran under the worker too, so a stale count is dropped with it;
+ *  the turn's own outcome labels still apply. */
+export function cachedStreamCardLabel(ds: DaemonSession): StreamCardLabel | undefined {
+  return hasNoCliUnderDaemon(ds) ? idleCardLabel(ds) : streamCardLabel(ds);
+}
+
+function hasNoCliUnderDaemon(ds: DaemonSession): boolean {
+  return !ds.worker && !isSessionTransferring(ds);
+}
+
 function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
   if (ds.lastScreenStatus !== 'limited') return;
   if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !workerHasInitialized(ds)) return;
 
   const bot = getBot(ds.larkAppId);
   const effectiveCliId = sessionCliId(ds, bot.config);
-  const readUrl = readableTerminalUrlFor(ds);
+  const readUrl = liveReadableTerminalUrlFor(ds);
   const turnTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, bot.config);
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
@@ -3020,7 +4191,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -3030,9 +4201,11 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, bot.config),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    idleCardLabel(ds),
+    streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -3048,17 +4221,31 @@ function armUsageLimitRetryTimer(ds: DaemonSession, previous?: CliUsageLimitStat
   if (ds.usageLimit.retryReady || ds.usageLimit.retryAtMs <= Date.now()) {
     const wasReady = !!previous?.retryReady;
     ds.usageLimit = { ...ds.usageLimit, retryReady: true };
+    ds.usageLimitPersistPending = true;
     persistStreamCardState(ds);
+    ds.usageLimitPersistPending = false;
     if (!wasReady) scheduleUsageLimitCardPatch(ds);
     return;
   }
 
   const key = usageLimitStateKey(ds.usageLimit);
-  const delayMs = Math.max(0, ds.usageLimit.retryAtMs - Date.now());
+  // Node/Bun timers overflow above a signed 32-bit delay. Long relative quota
+  // windows must wait in chunks rather than become immediately retry-ready.
+  const delayMs = Math.min(0x7fffffff, Math.max(0, ds.usageLimit.retryAtMs - Date.now()));
   ds.usageLimitRetryTimer = setTimeout(() => {
     if (!ds.usageLimit || usageLimitStateKey(ds.usageLimit) !== key) return;
+    if (ds.usageLimit.retryAtMs > Date.now()) {
+      armUsageLimitRetryTimer(ds);
+      return;
+    }
     ds.usageLimit = { ...ds.usageLimit, retryReady: true };
-    persistStreamCardState(ds);
+    try {
+      ds.usageLimitPersistPending = true;
+      persistStreamCardState(ds);
+      ds.usageLimitPersistPending = false;
+    } catch (error) {
+      logger.warn(`Usage-limit retry state persistence failed: ${error instanceof Error ? error.message : error}`);
+    }
     scheduleUsageLimitCardPatch(ds);
   }, delayMs);
 }
@@ -3073,16 +4260,21 @@ function updateUsageLimitState(ds: DaemonSession, usageLimit?: CliUsageLimitStat
   if (!usageLimit) return;
 
   const previous = ds.usageLimit;
+  usageLimit = reconcileUsageLimitState(previous, usageLimit);
   // Screen updates repeat the same limit every tick while a session sits
   // blocked. Skip the persist + timer re-arm churn unless the limit changed.
   if (
     previous &&
+    !ds.usageLimitPersistPending &&
     usageLimitStateKey(previous) === usageLimitStateKey(usageLimit) &&
-    previous.retryReady === usageLimit.retryReady
+    previous.retryReady === usageLimit.retryReady &&
+    previous.source === usageLimit.source
   ) return;
 
   ds.usageLimit = usageLimit;
+  ds.usageLimitPersistPending = true;
   persistStreamCardState(ds);
+  ds.usageLimitPersistPending = false;
   armUsageLimitRetryTimer(ds, previous);
 }
 
@@ -3106,9 +4298,12 @@ function resolveUsageAwareScreenStatus(
   ds: DaemonSession,
   workerStatus: ScreenStatus,
   freshUsageLimit: CliUsageLimitState | undefined,
+  content?: string,
 ): ScreenStatus {
   if (freshUsageLimit) return 'limited';
   if (ds.usageLimit && isActiveWorkRuntimeStatus(workerStatus)) {
+    if (ds.usageLimit.source === 'antigravity-error-composer'
+      && (!content || !isAntigravityWorkingScreen(content))) return 'limited';
     clearUsageLimitState(ds);
     return workerStatus;
   }
@@ -3643,6 +4838,7 @@ export function bindStreamCardDisplayTarget(
   newTurnId?: string,
 ): void {
   if (!isRealStreamingCardId(messageId) || ds.streamCardId !== messageId) return;
+  ds.waitingTurnPreview = undefined;
   const publication = ++streamCardPublicationSeq;
   const identity = currentCaptureIdentity(ds);
   ds.streamCardDisplayTarget = newTurnId === undefined || identity?.turnId === newTurnId
@@ -3681,13 +4877,18 @@ function promoteWaitingStreamCardTarget(ds: DaemonSession): void {
   if (!identity || identity.turnId !== target.turnId) return;
   // CAS on the exact publication: never upgrade a replaced target.
   if (ds.streamCardDisplayTarget !== target) return;
+  ds.waitingTurnPreview = undefined;
   ds.streamCardDisplayTarget = { ...target, mode: 'follow-live' };
 }
 
 /** Drop the display target (optionally only when it names `messageId`). */
 export function forgetStreamCardDisplayTarget(ds: DaemonSession, messageId?: string): void {
-  if (!ds.streamCardDisplayTarget) return;
+  if (!ds.streamCardDisplayTarget) {
+    ds.waitingTurnPreview = undefined;
+    return;
+  }
   if (messageId !== undefined && ds.streamCardDisplayTarget.messageId !== messageId) return;
+  ds.waitingTurnPreview = undefined;
   ds.streamCardDisplayTarget = undefined;
 }
 
@@ -3710,6 +4911,30 @@ export function currentStreamCardDisplayTarget(
   return { messageId: ds.streamCardId, publication: 0, mode: 'follow-live' };
 }
 
+/** True when the visible card belongs to a turn that the terminal has not
+ * started producing yet. `turnId` covers the short POST window before the
+ * card's display target is bound; afterwards the persisted target is the
+ * authority. A missing capture identity is inconclusive, so fresh-session
+ * startup keeps its normal `starting` presentation. */
+export function streamingCardTurnQueued(ds: DaemonSession, turnId?: string): boolean {
+  if (currentStreamCardDisplayTarget(ds)?.mode === 'waiting-exact-turn') return true;
+  if (!turnId) return false;
+  const identity = currentCaptureIdentity(ds);
+  return identity?.turnId !== undefined && identity.turnId !== turnId;
+}
+
+/** Image for the card's presentation layer. A waiting card may show the live
+ * predecessor frame only through the explicit in-memory preview slot; it is
+ * never promoted into this turn's currentImageKey. */
+export function streamingCardPresentationImageKey(ds: DaemonSession): string | undefined {
+  if (!streamingCardTurnQueued(ds)) return ds.currentImageKey;
+  const preview = ds.waitingTurnPreview;
+  if (!preview) return undefined;
+  if (screenshotSourceSuppressed(ds, preview.turnId, preview.dispatchAttempt)) return undefined;
+  if (currentCaptureSourcesSuppressed(ds)) return undefined;
+  return preview.imageKey;
+}
+
 /** May a cached image with this source be rendered for the current target? A
  * waiting-exact-turn(T) target accepts only a frame positively from T — never
  * a predecessor's frame and never a source-less cache. */
@@ -3721,9 +4946,10 @@ function cachedImageAllowedByDisplayTarget(ds: DaemonSession, source: CaptureTup
 
 export type ScreenshotFrameVerdict =
   | { ok: true; source: CaptureTuple }
+  | { ok: false; reason: 'target-waiting'; source: CaptureTuple }
   | { ok: false; reason:
       | 'invalid-revision' | 'unknown-revision' | 'superseded-revision' | 'tuple-mismatch'
-      | 'protocol-downgrade' | 'superseded-attempt' | 'source-suppressed' | 'target-waiting' };
+      | 'protocol-downgrade' | 'superseded-attempt' | 'source-suppressed' };
 
 /** Producer (source) and display-target verdict for one worker frame. Both
  * must pass before the frame may enter the cache or be PATCHed.
@@ -3778,7 +5004,10 @@ export function evaluateScreenshotFrame(
   if (anyCaptureSourceSuppressed(ds, tuples)) return { ok: false, reason: 'source-suppressed' };
   const target = currentStreamCardDisplayTarget(ds);
   if (target?.mode === 'waiting-exact-turn' && source.turnId !== target.turnId) {
-    return { ok: false, reason: 'target-waiting' };
+    // Source/auth/suppression checks already passed. The frame still cannot
+    // enter this turn's durable image cache, but callers may show it through
+    // the isolated, in-memory preview slot to preserve legacy card behavior.
+    return { ok: false, reason: 'target-waiting', source };
   }
   return { ok: true, source };
 }
@@ -3819,6 +5048,7 @@ function currentCaptureSourcesSuppressed(ds: DaemonSession): boolean {
  * provenance (legacy/disk-restored cache) the frame is only shown while no
  * known current source is suppressed. */
 export function displayableStreamingCardImageKey(ds: DaemonSession): string | undefined {
+  if (streamingCardTurnQueued(ds)) return streamingCardPresentationImageKey(ds);
   const key = ds.currentImageKey;
   if (!key) return undefined;
   const source = ds.currentImageSource?.imageKey === key ? ds.currentImageSource : undefined;
@@ -4491,6 +5721,168 @@ export function reconcileRestoredStreamingCardPins(larkAppId: string): void {
   trackPinStreamingCardTask(drainBotStreamingCardReconcileQueue(larkAppId));
 }
 
+const RESTORED_CARD_STATUS_CONCURRENCY = 4;
+
+/** Which restored, worker-less sessions' CLI is provably not running, so a card
+ *  claiming 「工作中」 is wrong. A pty CLI dies with its worker; a pane the probe
+ *  reports missing took its CLI with it (one batched probe for all of them). An
+ *  inconclusive probe, an adopted foreign process or a remote runner may still
+ *  be working — those are left out. */
+function restoredSessionsWithCliGone(sessions: readonly DaemonSession[]): Set<DaemonSession> {
+  const gone = new Set<DaemonSession>();
+  const targets = new Map<DaemonSession, PersistentBackendTarget>();
+  for (const ds of sessions) {
+    if (ds.worker || ds.adoptedFrom || isRemoteBackendSession(ds)) continue;
+    if (!getSessionPersistentBackendType(ds)) {
+      gone.add(ds);
+      continue;
+    }
+    try {
+      const target = persistentBackendTargetForSession(ds);
+      if (target) targets.set(ds, target);
+    } catch { /* unresolvable target: not provably gone */ }
+  }
+  if (targets.size === 0) return gone;
+  let probes: ReadonlyMap<string, SessionProbe>;
+  try {
+    probes = probePersistentBackendTargets(targets.values());
+  } catch {
+    return gone;
+  }
+  for (const [ds, target] of targets) {
+    if (probes.get(persistentBackendTargetKey(target)) === 'missing') gone.add(ds);
+  }
+  return gone;
+}
+
+/** Restart-time status alignment for surviving cards whose CLI did not come
+ *  back. Re-attached sessions need nothing here: their first screen_update
+ *  re-renders the card even under suppressRecoveryCard. For the rest the card
+ *  header is read back from Lark, and only a card still claiming work is
+ *  touched — PATCHed to 「等待输入」, or withdrawn once Lark's 14-day edit window
+ *  has closed (the next turn's card would withdraw it anyway). No card is
+ *  posted and nobody is mentioned. */
+export async function reconcileRestoredStreamingCardStatus(larkAppId: string): Promise<void> {
+  if (!activeSessionsRegistry) return;
+  const candidates = [...new Set(activeSessionsRegistry.values())].filter(ds =>
+    ds.larkAppId === larkAppId
+    && ds.session.status === 'active'
+    && isRealStreamingCardId(ds.streamCardId)
+    && !ds.streamCardPending);
+  const owns = (ds: DaemonSession, messageId: string): boolean =>
+    ds.session.status === 'active'
+    && ds.streamCardId === messageId
+    && !ds.streamCardPending
+    && !ds.worker
+    && !isSessionTransferring(ds)
+    && activeSessionsRegistry?.get(activeSessionKey(ds)) === ds
+    && retainsLarkStreamingCardTransport(ds)
+    && !streamingCardDisabled(ds);
+  const cliGone = restoredSessionsWithCliGone(candidates.filter(ds => owns(ds, ds.streamCardId!)));
+  const reconcileOne = async (ds: DaemonSession): Promise<void> => {
+    const messageId = ds.streamCardId!;
+    if (!cliGone.has(ds) || !owns(ds, messageId)) return;
+    let title: string | undefined;
+    try {
+      title = cardMessageTitle(await getTopicMessageDetail(ds.larkAppId, messageId, { timeoutMs: 10_000 }));
+    } catch (err) {
+      logger.debug(`[${tag(ds)}] restored card status read failed: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    if (!streamingCardTitleClaimsWork(title) || !owns(ds, messageId)) return;
+    try {
+      await updateMessage(ds.larkAppId, messageId, buildStreamingCardJson(ds, 'idle'), { beforeWrite: () => {
+        if (!owns(ds, messageId)) throw new Error('Restored card no longer owned by a worker-less session');
+      } });
+      logger.info(`[${tag(ds)}] Restored card ${messageId.substring(0, 12)} still claimed work with no CLI running — set to idle`);
+    } catch (err) {
+      if (!(err instanceof MessageUpdateExpiredError) && !(err instanceof MessageWithdrawnError)) {
+        logger.debug(`[${tag(ds)}] restored card status PATCH failed: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+      if (err instanceof MessageUpdateExpiredError && owns(ds, messageId)) {
+        await deleteMessage(ds.larkAppId, messageId).catch(() => { /* best-effort */ });
+        logger.info(`[${tag(ds)}] Withdrew restored card ${messageId.substring(0, 12)}: claims work, past Lark's edit window`);
+      }
+      if (ds.streamCardId === messageId) {
+        forgetPublishedStreamingCardIdentity(ds, messageId);
+        forgetStreamCardDisplayTarget(ds, messageId);
+        ds.streamCardId = undefined;
+        persistStreamCardState(ds);
+      }
+    }
+  };
+  for (let offset = 0; offset < candidates.length; offset += RESTORED_CARD_STATUS_CONCURRENCY) {
+    await Promise.allSettled(candidates.slice(offset, offset + RESTORED_CARD_STATUS_CONCURRENCY).map(reconcileOne));
+  }
+}
+
+/** Messages scanned per session container by the one-time stale-card sweep. */
+const STALE_WORKING_CARD_SCAN = 300;
+const STALE_WORKING_CARD_SWEEP_CONCURRENCY = 2;
+
+function staleWorkingCardSweepMarker(larkAppId: string): string {
+  return join(config.session.dataDir, 'card-sweeps', `${larkAppId}.stale-working-v1`);
+}
+
+/** One-time cleanup (per bot, marker file) of streaming cards older builds left
+ *  in active sessions' threads still reading 「工作中」 although no session owns
+ *  them any more — see staleWorkingCardIds. Each is withdrawn, as the normal
+ *  flow withdraws an old turn's card once its successor is live. Live and
+ *  frozen (to-be-recalled) cards of every session of this bot are kept, and so
+ *  is anything posted at or after `postedBefore` (the restore boundary).
+ *
+ *  This is a migration, not a continuous sweep: the marker is written after the
+ *  first pass whatever it found, so it never runs again for this bot. That pass
+ *  only sees the containers of sessions active at that startup, the newest
+ *  STALE_WORKING_CARD_SCAN messages of each, and skips a container whose listing
+ *  fails. The fixes in this change stop new orphans from being produced. */
+export async function sweepStaleWorkingCards(larkAppId: string, postedBefore: number = Date.now()): Promise<void> {
+  if (!activeSessionsRegistry) return;
+  const marker = staleWorkingCardSweepMarker(larkAppId);
+  if (existsSync(marker)) return;
+  const sessions = [...new Set(activeSessionsRegistry.values())].filter(ds =>
+    ds.larkAppId === larkAppId && ds.session.status === 'active');
+  const liveCardIds = new Set<string>();
+  for (const ds of sessions) {
+    for (const id of snapshotStreamingCardIds(ds)) liveCardIds.add(id);
+  }
+  const containers = new Map<string, () => Promise<unknown[]>>();
+  for (const ds of sessions) {
+    if (!retainsLarkStreamingCardTransport(ds) || ds.session.deferredScheduleRun) continue;
+    if (ds.scope === 'chat') {
+      containers.set(`chat:${ds.chatId}`, () => listChatMessages(larkAppId, ds.chatId, STALE_WORKING_CARD_SCAN));
+    } else if (ds.session.rootMessageId) {
+      const rootId = ds.session.rootMessageId;
+      containers.set(`thread:${rootId}`, () => listThreadMessages(larkAppId, ds.chatId, rootId, STALE_WORKING_CARD_SCAN));
+    }
+  }
+  let withdrawn = 0;
+  const sweepOne = async ([key, list]: [string, () => Promise<unknown[]>]): Promise<void> => {
+    let ids: string[];
+    try {
+      ids = staleWorkingCardIds(await list(), { larkAppId, liveCardIds, postedBefore });
+    } catch (err) {
+      logger.debug(`[${larkAppId}] stale-card sweep list failed for ${key}: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    for (const id of ids) {
+      if (await deleteMessage(larkAppId, id).catch(() => false)) withdrawn++;
+    }
+  };
+  const entries = [...containers.entries()];
+  for (let offset = 0; offset < entries.length; offset += STALE_WORKING_CARD_SWEEP_CONCURRENCY) {
+    await Promise.allSettled(entries.slice(offset, offset + STALE_WORKING_CARD_SWEEP_CONCURRENCY).map(sweepOne));
+  }
+  try {
+    mkdirSync(dirname(marker), { recursive: true });
+    atomicWriteFileSync(marker, JSON.stringify({ sweptAt: new Date(postedBefore).toISOString(), containers: entries.length, withdrawn }));
+  } catch (err) {
+    logger.debug(`[${larkAppId}] stale-card sweep marker write failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (withdrawn > 0) logger.info(`[${larkAppId}] Withdrew ${withdrawn} stale 「工作中」 streaming card(s) left by earlier builds`);
+}
+
 export function __testOnly_resetPinStreamingCardReconcileQueue(): void {
   pendingBotStreamingCardReconciles.clear();
   ownedStreamingCardRegistryEpoch += 1;
@@ -4511,10 +5903,20 @@ export async function __testOnly_waitForPinStreamingCardIdle(): Promise<void> {
  * accepts another turn is already past startup, so surface the turn as working
  * immediately. The worker's structured lifecycle gate will later publish the
  * authoritative terminal state from updates.jsonl.
+ *
+ * Codex App projects the card from the OBSERVED worker state: a fresh card can
+ * be posted for a message steered into the running turn, a serially queued
+ * follow-up (/queue, multi-human serial groups), or a fresh-ready repost, all
+ * while the worker is already `working`. Same-turn screen_updates only PATCH on
+ * a status edge, so working→working produces no patch and a card posted as
+ * `starting` stays 「启动中…」 for the rest of the turn. Unlike Grok, gate on
+ * `lastScreenStatus === 'working'` so a genuinely cold turn still renders
+ * `starting`; a queued turn gets a real edge when the preceding turn settles.
  */
 export function turnStartingCardStatus(ds: DaemonSession, effectiveCliId: CliId): 'limited' | 'working' | 'starting' {
   if (ds.usageLimit) return 'limited';
   if (effectiveCliId === 'grok' && workerHasInitialized(ds)) return 'working';
+  if (isCodexAppCliId(effectiveCliId) && workerHasInitialized(ds) && ds.lastScreenStatus === 'working') return 'working';
   return 'starting';
 }
 
@@ -4529,23 +5931,29 @@ function bumpStreamCardStatusRevision(ds: DaemonSession): void {
 /** Re-render a just-created starting card when a newer worker status arrived
  * during its POST. The turn id is forwarded to scheduleCardPatch so a late
  * patch from turn N cannot overwrite turn N+1's card. */
-function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefined, revisionAtPost: number): void {
+function reconcilePostedStartingCard(
+  ds: DaemonSession,
+  turnId: string | undefined,
+  revisionAtPost: number,
+  statusOverride?: StreamStatus,
+): void {
   if ((ds.streamCardStatusRevision ?? 0) === revisionAtPost) return;
   if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || ds.streamCardPending) return;
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
-  const status = ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? turnStartingCardStatus(ds, effectiveCliId));
+  const status = statusOverride
+    ?? (ds.usageLimit ? 'limited' : (ds.lastScreenStatus ?? turnStartingCardStatus(ds, effectiveCliId)));
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
-    readableTerminalUrlFor(ds),
+    liveReadableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
     status,
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -4555,9 +5963,11 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefin
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: status === 'idle' }),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    idleCardLabel(ds),
+    streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
   scheduleCardPatch(ds, cardJson, turnId);
 }
@@ -4655,7 +6065,7 @@ async function postTurnStartingStatusCard(
   const cardJson = buildStreamingCard(
     ds.session.sessionId,
     displayAnchorAtPost,
-    readableTerminalUrlFor(ds),
+    liveReadableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     '',
     status,
@@ -4672,9 +6082,11 @@ async function postTurnStartingStatusCard(
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    idleCardLabel(ds),
+    streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
 
   ds.streamCardNonce = nonce;
@@ -4780,7 +6192,7 @@ export async function postFreshStreamingCard(
   if (!retainsLarkStreamingCardTransport(ds)) return false;
   const botCfg = getBot(ds.larkAppId).config;
   const effectiveCliId = sessionCliId(ds, botCfg);
-  const readUrl = readableTerminalUrlFor(ds);
+  const readUrl = liveReadableTerminalUrlFor(ds);
   const title = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
   const status = ds.lastScreenStatus ?? 'idle';
 
@@ -4815,7 +6227,7 @@ export async function postFreshStreamingCard(
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -4825,9 +6237,11 @@ export async function postFreshStreamingCard(
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    idleCardLabel(ds),
+    streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   const ownsPost = (): boolean =>
@@ -5066,6 +6480,8 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
       localeForBot(ds.larkAppId),
       false,
       sessionRuntimeDisplayName(ds, botCfg),
+      sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
+      sessionModelPinView(ds),
     );
   }
   const port = ds.workerPort ?? ds.session.webPort;
@@ -5083,6 +6499,8 @@ export function buildWritableTerminalCard(ds: DaemonSession): string | null {
     localeForBot(ds.larkAppId),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     sessionRuntimeDisplayName(ds, botCfg),
+    sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
+    sessionModelPinView(ds),
   );
 }
 
@@ -5172,6 +6590,8 @@ function buildSubstituteControlCard(ds: DaemonSession): string | null {
     localeForBot(ds.larkAppId),
     isLocalCliOpenReady(ds, { cliId: effectiveCliId }),
     sessionRuntimeDisplayName(ds, botCfg),
+    sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
+    sessionModelPinView(ds),
   );
 }
 
@@ -5460,7 +6880,7 @@ async function closeWithdrawnSessionIfLedgerEmpty(
 
 // ─── Restart rate-limiting ──────────────────────────────────────────────────
 
-export const restartCounts = new Map<string, { count: number; lastAt: number }>();
+export const restartCounts = new Map<string, RestartCounter>();
 
 // ─── Skills installation ────────────────────────────────────────────────────
 
@@ -5496,14 +6916,17 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string, opts?: C
   // Claude-family CLIs deliver skills per-session via `--plugin-dir` (no global
   // leak), so they always materialise their plugin dir — the builtin-injection
   // mode does not apply to them. Everything below the branch is the global-dir
-  // path (codex/gemini/opencode/…) where the mode decides whether we install.
+  // path (codex/opencode/…) where the mode decides whether we install.
   if (adapter.pluginDir) {
     const pluginSkillsDir = join(adapter.pluginDir, 'skills');
     // 白板 skill 每次 spawn 重新评估（跟随运行时开关），不进 once-cache。
     ensureWhiteboardSkill(cliId, pluginSkillsDir, whiteboardEnabled());
-    // Workflow skill 家族同理：跟随机器级 workflow 开关，每次 spawn 重新评估，
-    // 关闭时删除已装的三个 skill，下一个会话即生效。
-    ensureWorkflowSkills(cliId, pluginSkillsDir, isWorkflowFeatureEnabled());
+    // 群负责人 skill：plugin-dir 机器共享，任一 bot 开启即落盘；真正 per-bot
+    // 授权在 daemon IPC，关闭开关的 bot 调 set 会被拒。每次 spawn 重新评估。
+    ensureChatManagerSkill(cliId, pluginSkillsDir, getAllBots().some(b => b.config.chatManagerEnabled === true));
+    // Workflow skill 家族不常驻：只在确定要用工作流时由 agent 按需
+    // `botmux skill show`。每次 spawn 清掉旧版本写进插件目录的残留。
+    removeWorkflowSkills(cliId, pluginSkillsDir);
     // 内置 skill 文件跟随用户自定义（正文覆盖 / 停用），必须每次 spawn 重新落盘
     // ——与上面白板 / workflow 同样放在 once-cache 之前，否则改了 skill 正文或
     // 停用某 skill 后，claude 家族（--plugin-dir）的新会话仍读旧文件、要等 daemon
@@ -5527,7 +6950,7 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string, opts?: C
 
   // Global-skillsDir CLIs: only write the shared dir when SOME bot on that dir
   // resolves to `global` mode. `prompt`/`off` keep the dir clean so the user's
-  // own standalone `codex`/`gemini` never sees (and mis-fires) botmux skills —
+  // own standalone `codex`/`opencode` never sees (and mis-fires) botmux skills —
   // those modes deliver the skills via the session prompt instead (see
   // session-manager buildNewTopicPrompt + skills/injection-mode.ts).
   const skillsDir = adapter.skillsDir;
@@ -5537,13 +6960,15 @@ export function ensureCliSkills(cliId: CliId, cliPathOverride?: string, opts?: C
   //  - 白板：跟随运行时开关，仅 global 模式落全局盘。
   //  - prompt/off 泄漏清理：每个新会话拉起 CLI 前，把共享 skills 目录里的 botmux
   //    技能清掉。这样「运行时从 global 切到 prompt/off」「旧版本或外部重新写入的
-  //    残留」都会在下一个会话的 CLI 启动前被扫干净，用户手动跑的独立 codex/gemini
+  //    残留」都会在下一个会话的 CLI 启动前被扫干净，用户手动跑的独立 codex/opencode
   //    立刻不再看到 botmux 技能，无需等 daemon 重启。只动 `botmux-` 命名空间，
   //    绝不碰用户自定义 skill。
   ensureWhiteboardSkill(cliId, skillsDir, globalInstall && whiteboardEnabled());
-  // Workflow skill 家族：仅 global 模式落全局盘，且跟随机器级 workflow 开关。
-  // 非 global（prompt/off）由上面的 removeGlobalBotmuxSkills 前缀清理兜底。
-  ensureWorkflowSkills(cliId, skillsDir, globalInstall && isWorkflowFeatureEnabled());
+  // 群负责人 skill 同理：仅 global 模式落共享盘，且任一 bot 开启才落。
+  ensureChatManagerSkill(cliId, skillsDir, globalInstall && getAllBots().some(b => b.config.chatManagerEnabled === true));
+  // Workflow skill 家族不常驻（global 模式也不落盘），按需 `botmux skill show`；
+  // 清掉旧版本在 global 模式下写进共享目录的残留。
+  removeWorkflowSkills(cliId, skillsDir);
   if (!globalInstall && skillsDir) removeGlobalBotmuxSkills(skillsDir);
   // 内置 skill 文件跟随用户自定义（正文覆盖 / 停用），必须每次 spawn 重新落盘
   // ——同白板 / workflow 放在 once-cache 之前。global 模式落全局盘；幂等（内容相同
@@ -5713,6 +7138,7 @@ export function killWorker(
   ds.cliReady = false;
   clearUsageRefreshTimer(ds);
   ds.localProcessAttestation = undefined;
+  ds.protectedLoopbackProxyAttestation = undefined;
   // A managed-turn capability belongs to one concrete worker generation.
   // Retiring (or observing the absence of) that generation must revoke the
   // daemon-side copy synchronously; the worker may never get a chance to send
@@ -5797,6 +7223,7 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
   ds.cliReady = false;
   clearUsageRefreshTimer(ds);
   ds.localProcessAttestation = undefined;
+  ds.protectedLoopbackProxyAttestation = undefined;
   ds.managedTurnOrigin = undefined;
   invalidateStuckWarning(ds, reason);
   invalidateTuiPrompt(ds, reason);
@@ -5825,6 +7252,7 @@ function clearTransferWorkerState(
   // readiness with its own prompt_ready.
   ds.cliReady = false;
   ds.localProcessAttestation = undefined;
+  ds.protectedLoopbackProxyAttestation = undefined;
   ds.managedTurnOrigin = undefined;
   invalidateStuckWarning(ds, reason);
   invalidateTuiPrompt(ds, reason);
@@ -6005,6 +7433,9 @@ function destroyLivePaneBeforeRestart(ds: DaemonSession): void {
   };
 
   killOnce();
+  // Deliberately not probePaneAfterKill: this is the /restart path rather than
+  // cold spawn, and an 'unknown' probe deliberately does not block the refork
+  // (stranding the session is worse than a best-effort reattach).
   // Advance a single probe result monotonically through the real retry path so
   // an 'unknown' first probe is never mislabelled as a post-retry survivor:
   //  - 'missing' → gone, fork is genuinely fresh.
@@ -6041,35 +7472,84 @@ function destroyLivePaneBeforeRestart(ds: DaemonSession): void {
   }
 }
 
+/** The backend a session's CLI actually runs on (worker-reported first). */
+function sessionEnvBackendType(ds: DaemonSession, botCfg: BotConfig): BackendType {
+  return ds.initConfig?.backendType ?? ds.session?.backendType ?? botCfg.backendType ?? 'pty';
+}
+
 /**
- * Live-worker /restart 携带的最新 per-bot env（bots.json `env`）。worker 收到
- * restart 时在 respawn 前全量覆盖 lastInitConfig.env —— 否则 live-worker 重启
- * 一直用 fork 时刻的旧快照，dashboard 改完 env（如切 provider 的
- * ANTHROPIC_BASE_URL/TOKEN）后 /restart 并不会生效（只有 refork 路径生效）。
- * 三分态返回：对象 = 最新 env；null = 明确清空（dashboard 已删）；
- * undefined = 取不到（bot 已注销等异常），让 worker 保持快照不动（=旧行为）。
- * 只热更 env / model 两个字段：sandbox/backendType 是刻意 freeze-once 的设计（见
- * forkWorker init 注释），cliId 换 CLI 会踩 resume transcript 对齐，均不带。
+ * The session-env overlay (core/session-env.ts) this session would be launched
+ * with NOW. Shared by init, restart and the Dashboard staleness check so all
+ * three agree on what "the current environment" is. /cli-selected and
+ * Codex-instance-bound sessions never receive the bot's own `env`.
  */
-export function latestPerBotEnvForRestart(ds: DaemonSession): Record<string, string> | null | undefined {
+export function resolveSessionEnvForSession(
+  ds: DaemonSession,
+  botCfg: BotConfig,
+  backendType: BackendType = sessionEnvBackendType(ds, botCfg),
+): ResolvedSessionEnv {
+  const resolved = resolveSessionEnv({
+    bot: botCfg,
+    backendType,
+    skipBotSet: !!(ds.session?.cliLaunchSnapshot || ds.session?.cliInstanceBinding),
+    // Same session facts the worker's usesLarkToolBinding sees.
+    facts: {
+      larkBindingOff: !larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly })
+        || ds.session?.existingAppServerEndpoint !== undefined,
+    },
+  });
+  const protectedKeys = new Set(protectedMcpCurrentRedactedEnvKeys(
+    readGlobalConfig().protectedMcpCapabilities,
+    configuredProtectedMcpEnvKeys(),
+  ));
+  const set = Object.fromEntries(
+    Object.entries(resolved.composed.set).filter(([key]) => !protectedKeys.has(key)),
+  );
+  const unset = resolved.composed.unset.filter(key => !protectedKeys.has(key));
+  if (Object.keys(set).length === Object.keys(resolved.composed.set).length
+    && unset.length === resolved.composed.unset.length) return resolved;
+  const composed = { set, unset };
+  return {
+    composed,
+    ...(Object.keys(set).length ? { env: set } : {}),
+    ...(unset.length ? { envUnset: unset } : {}),
+    fingerprint: sessionEnvFingerprint(composed, botCfg.envPolicy),
+  };
+}
+
+/**
+ * Live-worker /restart 携带的最新会话环境（组合后的 `env` = 设置、`envUnset` =
+ * 去掉，见 core/session-env.ts）。worker 收到 restart 时在 respawn 前全量覆盖
+ * lastInitConfig 里的这两项 —— 否则 live-worker 重启一直用 fork 时刻的旧快照，
+ * dashboard 改完环境（如切 provider 的 ANTHROPIC_BASE_URL/TOKEN）后 /restart
+ * 并不会生效（只有 refork 路径生效）。
+ * 三分态：对象 = 最新值；null = 明确清空；整体 undefined = 取不到（bot 已注销等
+ * 异常），让 worker 保持快照不动（=旧行为）。`envFingerprint` 让 worker 给重新拉起
+ * 的 CLI 写指纹。只热更环境 / model：sandbox/backendType 是刻意 freeze-once 的
+ * 设计（见 forkWorker init 注释），cliId 换 CLI 会踩 resume transcript 对齐，均不带。
+ */
+export function latestSessionEnvForRestart(ds: DaemonSession):
+  { env: Record<string, string> | null; envUnset: string[] | null; envFingerprint: string } | undefined {
   // Two failure modes that must NOT be conflated. The old single try/catch
   // swallowed both, so a quarantine write failure silently returned `undefined`
   // (restart proceeds, risk unrecorded) — the exact fail-open this ledger exists
   // to prevent.
-  let env: Record<string, string> | null;
+  let resolved: ResolvedSessionEnv;
   try {
-    env = getBot(ds.larkAppId).config.env ?? null;
+    resolved = resolveSessionEnvForSession(ds, getBot(ds.larkAppId).config);
   } catch {
     // Bot deregistered: nothing to hot-update. Keep the worker's snapshot (legacy
     // behaviour) — this is a benign, expected state.
     return undefined;
   }
+  const env = resolved.env ?? null;
   // Record what this generation is being handed BEFORE the restart is sent.
   //
-  // This is the single choke point all four restart senders share (dashboard-ipc
-  // operator + working-dir, requestSessionRestart, cli_crash auto-restart), so
-  // recording here cannot be missed by adding a fifth caller — which is exactly
-  // how the device-isolation proof lost track of the env the running child had
+  // This is the single choke point every restart sender shares (all of them —
+  // IM /restart, card button, dashboard operator + working-dir move, cli_crash
+  // auto-restart — now go through requestSessionRestart), so recording here
+  // cannot be missed by adding another caller — which is exactly how the
+  // device-isolation proof lost track of the env the running child had
   // actually been given.
   //
   // Accumulate, never replace: the restart may fail or be coalesced, so a later
@@ -6078,7 +7558,12 @@ export function latestPerBotEnvForRestart(ds: DaemonSession): Record<string, str
   // Any throw here propagates on purpose: the caller must not send a restart while
   // believing a risk was recorded when it was not.
   rememberAppliedUnprovableEnvKeys(ds, env ?? undefined);
-  return env;
+  return { env, envUnset: resolved.envUnset ?? null, envFingerprint: resolved.fingerprint };
+}
+
+function restartSessionEnvFields(ds: DaemonSession): { env?: Record<string, string> | null; envUnset?: string[] | null; envFingerprint?: string } {
+  const latest = latestSessionEnvForRestart(ds);
+  return latest ? { env: latest.env, envUnset: latest.envUnset, envFingerprint: latest.envFingerprint } : { env: undefined };
 }
 
 /**
@@ -6170,6 +7655,70 @@ export function latestModelForRespawn(ds: DaemonSession): string | null | undefi
   }
 }
 
+export function latestPinEffortForRespawn(ds: DaemonSession): { reasoningEffort?: import('../services/codex-reasoning-effort.js').CodexReasoningEffort | null } {
+  if (!ds.session.modelPin && !ds.modelPinCleared) return {};
+  try {
+    const cfg = getBot(ds.larkAppId).config;
+    const model = resolveSessionLaunchModel(ds, cfg);
+    const effort = resolveSessionLaunchEffort(ds, cfg, model, ds.session.reasoningEffort);
+    return { reasoningEffort: effort ?? null };
+  } catch { return {}; } // deregistered bot: keep the worker's existing snapshot
+}
+
+/** Persist first; a failed runtime apply must never claim that the pin was lost. */
+export function writeSessionModelPin(ds: DaemonSession, pin: ModelPin | undefined): boolean {
+  if (!pin && !ds.session.modelPin) return false;
+  if (pin) pin = retainPinEffort(pin, ds.session.modelPin);
+  if (isSessionTransferring(ds) || isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds)) throw new Error('会话正在迁移、重启或修改推理强度，请稍后重试');
+  if (ds.session.dispatchLaunchSpec) throw new Error('dispatch 会话使用冻结的启动规格，不支持话题固定');
+  // An adopted CLI is owned by the user outside BotMux: it is never respawned
+  // with launch args (traditional adopted pane AND a codex --remote viewer of
+  // an existing App Server thread — isSharedAdoptSession covers all four
+  // shapes including session.existingAppServerEndpoint), so a saved pin could
+  // never apply while presenting as active. Clearing stays allowed (a row may
+  // already carry one). Remote BACKENDS (mojo/remote-runner) are NOT blocked —
+  // their cold spawn really consumes --model.
+  if (pin && isSharedAdoptSession(ds)) {
+    throw new Error('接管（adopt）的会话由外部 CLI 自己管理模型，不能设置话题固定');
+  }
+  const cfg = getBot(ds.larkAppId).config;
+  if (pin) {
+    const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? cfg.cliId;
+    if (cfg.cliId && cliId !== cfg.cliId) throw new Error('会话 CLI 与 bot CLI 不匹配，不能设置固定');
+    const error = validateModelPin(pin, { cliId, backendType: ds.initConfig?.backendType ?? ds.session.backendType ?? cfg.backendType });
+    if (error) throw new Error(error);
+  }
+  const before = ds.session.modelPin;
+  ds.session.modelPin = pin;
+  try { sessionStore.updateSession(ds.session, { modelPinWrite: true }); }
+  catch (error) { ds.session.modelPin = before; throw error; }
+  if (!pin) ds.modelPinCleared = true;
+  else delete ds.modelPinCleared;
+  dashboardEventBus.publish({ type: 'session.update', body: { sessionId: ds.session.sessionId,
+    patch: { modelPin: resolveSessionModelPinView(ds, cfg) ?? null } } });
+  try { scheduleActiveRuntimePatch(ds); } catch (error) { logger.warn(`[${tag(ds)}] Pin card refresh failed: ${String(error)}`); }
+  return true;
+}
+
+function latestTraexAutoModelForRespawn(ds: DaemonSession): TraexAutoModelConfig | null | undefined {
+  try {
+    const policy = resolveSessionLaunchModelChoice(ds, getBot(ds.larkAppId).config).traexAutoModel;
+    return policy ?? null;
+  } catch { return undefined; }
+}
+
+function latestCodexRpcInputForRespawn(ds: DaemonSession): boolean | undefined {
+  try {
+    const botCfg = getBot(ds.larkAppId).config;
+    return resolveCodexRpcInput(
+      sessionCliId(ds, botCfg), botCfg.codexRpcInput, config.codexRpcInputDefault,
+      ds.session.existingAppServerEndpoint,
+      !ds.session.adoptedFrom && !ds.session.wrapperCli && !ds.session.cliLaunchMode
+        ? resolveSessionLaunchModelChoice(ds, botCfg).traexAutoModel : undefined,
+    );
+  } catch { return undefined; }
+}
+
 /**
  * Live-worker /restart 或崩溃恢复携带的最新 larkToolBinding 开关。
  * 三分态返回：true = 开启/默认（未配置视为开启）；null = 明确关闭；undefined = 异常保持快照不动。
@@ -6183,36 +7732,175 @@ export function latestLarkToolBindingForRespawn(ds: DaemonSession): boolean | nu
   }
 }
 
-/** Join or start one correlated physical restart for a session. */
+/**
+ * Live-worker respawn 携带的最新 startupCommands / launchShell（与 env / model 同一条
+ * 通道、同一套三分态，worker 侧语义见 core/respawn-config-patch.ts）。
+ *
+ * 两者都是「下次 spawn 生效」的 Bot 配置，fork 时由 sessionAgentConfig 实时取，
+ * 但 `/restart`、卡片 / Dashboard 重启、CLI 崩溃自动重启都**不 refork**：worker 用
+ * fork 时刻的 `lastInitConfig` 原地 respawn。不捎带的话，Dashboard 改完启动命令再
+ * 重启，重放的还是旧命令。
+ *
+ * 与 sessionAgentConfig 同口径：per-session `/cli` 选择（cliLaunchSnapshot）冻结了
+ * 自己的启动命令与 shell，原样返回快照，不被 Bot 级改动覆盖。adopt 会话只观察不驱动
+ * （forkAdoptWorker 本就不下发），不携带。
+ * Codex profile 会话也不携带（见函数内注释）。
+ * 三分态：值 = 用它；null = 明确清空；undefined = 不携带 / 取不到，worker 保持快照。
+ */
+export function latestLaunchCommandsForRespawn(ds: DaemonSession): {
+  startupCommands: string[] | null | undefined;
+  launchShell: string | null | undefined;
+} {
+  if (ds.session.adoptedFrom) return { startupCommands: undefined, launchShell: undefined };
+  // Codex profile launches reject startup commands outright (assertCodexProfileRuntime
+  // → unsupported_launch) and the session froze its profile at creation. A later
+  // bot edit must not turn a working session's restart into a fatal launch: keep
+  // the fork-time snapshot, which already passed that gate.
+  if (ds.session.codexProfile) return { startupCommands: undefined, launchShell: undefined };
+  const selected = ds.session.cliLaunchSnapshot;
+  if (selected) {
+    return {
+      startupCommands: selected.startupCommands.length ? [...selected.startupCommands] : null,
+      launchShell: selected.launchShell || null,
+    };
+  }
+  try {
+    const botCfg = getBot(ds.larkAppId).config;
+    return {
+      startupCommands: botCfg.startupCommands?.length ? [...botCfg.startupCommands] : null,
+      launchShell: botCfg.launchShell || null,
+    };
+  } catch {
+    return { startupCommands: undefined, launchShell: undefined };
+  }
+}
+
+export interface SessionRestartOptions {
+  topicEffort?: import('../utils/traex-session-effort.js').TraexTopicEffortRestart;
+  /**
+   * Role-switch cwd move: the worker converges `lastInitConfig.workingDir` to
+   * this path before respawning (`restart.updateWorkingDir`). The caller must
+   * already have repinned the session record — the record is the source of
+   * truth, the respawn only makes the live CLI catch up — and must have
+   * refused while another restart was in flight (a join would not deliver it).
+   */
+  updateWorkingDir?: string;
+}
+
+export interface SessionRestartRequest {
+  attemptId: string;
+  joined: boolean;
+  /**
+   * The restart could not be handed to the worker (e.g. the IPC channel is
+   * already closed). A fresh attempt has already settled `failed`, so the
+   * workerReady fence stays down; callers that must not leave a half-applied
+   * mutation behind (cwd move) react to this synchronously.
+   */
+  startFailure?: { error: unknown };
+}
+
+/**
+ * Audit label carried on the restart IPC so an operator / crash-recovery
+ * restart stays distinguishable from IM `/restart` in the worker's message.
+ * The worker does not branch on it.
+ */
+function restartIpcReason(source: RestartSource): { reason?: 'operator' | 'cli_crash' } {
+  if (source === 'cli_crash') return { reason: 'cli_crash' };
+  if (source === 'dashboard') return { reason: 'operator' };
+  return {};
+}
+
+/** A correlated restart attempt for this session is still in flight. */
+export function isSessionRestartInFlight(ds: DaemonSession): boolean {
+  return restartCoordinator.activeAttemptId(ds.session.sessionId) !== undefined;
+}
+
+/**
+ * Join or start one correlated physical restart for a session.
+ *
+ * This is the ONLY daemon-side sender of the in-worker `restart` IPC. The
+ * live-worker branch clears `ds.workerReady` (the lifecycle fence), and the
+ * worker's in-place respawn never re-emits the process-level `ready`, so the
+ * attemptId-matched `restart_result: succeeded` is the sole edge that lifts the
+ * fence again. A restart sent without an attemptId gets no receipt and leaves
+ * fork / relay / dashboard lifecycle operations `worker_busy` forever (#1863).
+ *
+ * Joining an in-flight attempt sends nothing: the worker is already
+ * respawning on the launch snapshot that attempt carried. Callers whose
+ * request CHANGES that snapshot (dashboard operator restart after a config
+ * edit, role-switch cwd move) must not join — they check
+ * isSessionRestartInFlight() first (before any side effect) and refuse.
+ */
 export function requestSessionRestart(
   ds: DaemonSession,
   observer: RestartObserver,
-): { attemptId: string; joined: boolean } | undefined {
+  opts: SessionRestartOptions = {},
+): SessionRestartRequest | undefined {
   if (isSessionTransferring(ds)) {
     logger.warn(`[${tag(ds)}] Restart refused while routing transfer is in progress`);
     return undefined;
   }
-  return restartCoordinator.request(ds.session.sessionId, observer, attemptId => {
-    if (ds.worker && !ds.worker.killed) {
-      ds.workerReady = false;
-      // In-worker respawn: the next prompt belongs to a NEW CLI generation.
-      ds.cliReady = false;
-      ds.worker.send({ type: 'restart', attemptId, env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds), larkToolBinding: latestLarkToolBindingForRespawn(ds) } as DaemonToWorker);
-      return;
+  if (opts.topicEffort && (isSessionRestartInFlight(ds) || !ds.worker || ds.worker.killed)) return undefined;
+  const start: { failure?: { error: unknown } } = {};
+  const cwdMove = opts.updateWorkingDir ? { updateWorkingDir: opts.updateWorkingDir } : {};
+  let settingAttempt: string | undefined;
+  const restartObserver: RestartObserver = opts.topicEffort ? {
+    source: observer.source,
+    notify: async (status, attemptId) => {
+      if (status !== 'in_progress' && topicEffortRestartReadiness.get(ds.session.sessionId)?.attemptId === settingAttempt) {
+        topicEffortRestartReadiness.delete(ds.session.sessionId);
+      }
+      await observer.notify(status, attemptId);
+    },
+  } : observer;
+  const result = restartCoordinator.request(ds.session.sessionId, restartObserver, attemptId => {
+    settingAttempt = attemptId;
+    try {
+      if (ds.worker && !ds.worker.killed) {
+        if (opts.topicEffort) topicEffortRestartReadiness.set(ds.session.sessionId, { attemptId, worker: ds.worker, workerGeneration: ds.workerGeneration, workerReady: !!ds.workerReady, cliReady: !!ds.cliReady, requested: opts.topicEffort });
+        ds.workerReady = false;
+        // In-worker respawn: the next prompt belongs to a NEW CLI generation.
+        ds.cliReady = false;
+        ds.worker.send({ type: 'restart', attemptId, ...restartIpcReason(observer.source), ...cwdMove,
+          ...(opts.topicEffort ? {} : { ...restartSessionEnvFields(ds), ...latestPinEffortForRespawn(ds) }), model: opts.topicEffort?.model ?? latestModelForRespawn(ds),
+          ...(opts.topicEffort ? { topicEffort: opts.topicEffort } : {}),
+          traexAutoModel: opts.topicEffort ? null : latestTraexAutoModelForRespawn(ds),
+          ...(opts.topicEffort ? {} : { codexRpcInput: latestCodexRpcInputForRespawn(ds),
+            larkToolBinding: latestLarkToolBindingForRespawn(ds),
+            ...latestLaunchCommandsForRespawn(ds) }) } as DaemonToWorker);
+        return;
+      }
+      // No live worker but the persistent pane may still be alive (e.g. after a
+      // daemon restart). Tear it down first so forkWorker → spawnCli spawns a
+      // fresh CLI instead of reattaching the old one and falsely reporting a
+      // successful restart. Not when the working directory is gone: forkWorker
+      // refuses that start (and offers recovery), so killing the CLI first
+      // would only lose it for nothing.
+      const restartCwd = callbacks?.getSessionWorkingDir(ds);
+      if (!restartCwd || existsSync(restartCwd)) destroyLivePaneBeforeRestart(ds);
+      forkWorker(ds, '', {
+        resume: ds.hasHistory,
+        restartAttemptId: attemptId,
+      });
+    } catch (error) {
+      start.failure = { error };
+      const before = topicEffortRestartReadiness.get(ds.session.sessionId);
+      if (opts.topicEffort && before?.attemptId === attemptId && before.worker === ds.worker
+        && before.workerGeneration === ds.workerGeneration) {
+        ds.workerReady = before.workerReady;
+        ds.cliReady = before.cliReady;
+        topicEffortRestartReadiness.delete(ds.session.sessionId);
+      }
+
+      // Rethrow: the coordinator settles this fresh attempt as `failed`.
+      throw error;
     }
-    // No live worker but the persistent pane may still be alive (e.g. after a
-    // daemon restart). Tear it down first so forkWorker → spawnCli spawns a
-    // fresh CLI instead of reattaching the old one and falsely reporting a
-    // successful restart.
-    destroyLivePaneBeforeRestart(ds);
-    forkWorker(ds, '', {
-      resume: ds.hasHistory,
-      restartAttemptId: attemptId,
-    });
   });
+  return start.failure ? { ...result, startFailure: start.failure } : result;
 }
 
 export function __testOnly_resetRestartCoordinator(): void {
+  topicEffortRestartReadiness.clear();
   restartCoordinator.reset();
 }
 
@@ -6378,11 +8066,41 @@ function destroyOrphanedBackingSession(
   }
   const backendType = getSessionPersistentBackendType(ds);
   if (!backendType) return;
+  const target = persistentBackendTargetForSession(ds)!;
   try {
-    killPersistentBackendTarget(persistentBackendTargetForSession(ds)!, ds.session.sessionId);
+    killPersistentBackendTarget(target, ds.session.sessionId);
     logger.info(`[${tag(ds)}] killWorker: no live worker — destroyed orphaned ${backendType} backing session`);
   } catch (err) {
     logger.warn(`[${tag(ds)}] killWorker: failed to destroy orphaned ${backendType} backing session: ${err}`);
+    return;
+  }
+  retireOrphanedSandboxTree(ds, target);
+}
+
+/**
+ * A worker whose persistent pane outlived it (crash, daemon restart) keeps the
+ * session's sandbox tree for a successor. With no worker left to run the
+ * close-time cleanup a live worker would have run, tear the tree down here —
+ * with each flavour's own teardown (a scratch tree is UNMOUNTED first; a blind
+ * recursive rm of a still-mounted full-root COW view walks the whole host).
+ * Only once the pane is proven gone: a possibly-live pane still runs against
+ * the tree, and the periodic sweep reclaims it once the session is inactive.
+ */
+function retireOrphanedSandboxTree(ds: DaemonSession, target: PersistentBackendTarget): void {
+  const sessionId = ds.session.sessionId;
+  try { lstatSync(join(config.session.dataDir, 'sandboxes', sessionId)); } catch { return; } // never sandboxed
+  let probe: string;
+  // Right after the kill: the server may still be exiting (see the helper).
+  try { probe = probePersistentBackendTargetAfterKill(target); } catch (err) { probe = `unknown (${err})`; }
+  if (probe !== 'missing') {
+    logger.warn(`[${tag(ds)}] killWorker: keeping the sandbox tree — backing session not proven gone (probe: ${probe})`);
+    return;
+  }
+  try {
+    teardownSessionSandboxTree(sessionId, config.session.dataDir);
+    logger.info(`[${tag(ds)}] killWorker: tore down the orphaned sandbox tree`);
+  } catch (err) {
+    logger.warn(`[${tag(ds)}] killWorker: sandbox tree teardown failed: ${err}`);
   }
 }
 
@@ -7065,7 +8783,11 @@ async function prepareLiveRemoteWorkerClose(
       await abortLiveRemoteWorkerClose(ds, requestId, {
         allowAbsentAfterProvenRestore: matchedCloseResult,
       });
-    } else {
+    } else if (ds.remoteCloseState?.requestId === requestId) {
+      // A Remote Runner provider exit retires this worker and clears the
+      // process-local fence so a fresh control provider can reconcile from the
+      // durable backend state. Do not let this stale prepare continuation put
+      // the fence back after that authoritative retirement.
       ds.remoteCloseState = { phase: 'uncertain', requestId };
     }
     logger.warn(
@@ -7076,7 +8798,9 @@ async function prepareLiveRemoteWorkerClose(
       ok: false,
       error: backendType === 'riff'
         ? 'riff_worker_close_failed'
-        : 'remote_runner_close_reconciliation_required',
+        : result.recovery === 'retryable'
+          ? 'remote_runner_worker_close_failed'
+          : 'remote_runner_close_reconciliation_required',
       retryable: backendType === 'riff' || mayRestore,
       ...(result.recovery ? { recovery: result.recovery } : {}),
       ...(taskId ? { taskId } : {}),
@@ -7116,7 +8840,26 @@ async function wakeRemoteRunnerWorkerForExplicitClose(
   wakeRequestId: string,
   forkImpl: RemoteRunnerCloseFork = forkWorker,
 ): Promise<boolean> {
-  if (ds.worker && !ds.worker.killed) return true;
+  if (ds.worker && !ds.worker.killed) {
+    // Active-session takeover publishes the local DaemonSession immediately
+    // after fork admission, before the replacement worker has necessarily
+    // completed its provider handshake. Sending `close` in that gap races the
+    // worker's async init and can make it exit without a close_result. Wait for
+    // the exact admitted generation instead of treating mere process existence
+    // as control readiness.
+    const worker = ds.worker;
+    const deadline = Date.now() + REMOTE_RUNNER_CLOSE_WAKE_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+      if (findActiveBySessionId(ds.session.sessionId) !== ds
+          || ds.session.status !== 'active'
+          || ds.worker !== worker
+          || worker.killed) return false;
+      if (ds.workerReady === true) return true;
+      await new Promise(resolve => setTimeout(resolve, REMOTE_RUNNER_CLOSE_WAKE_POLL_MS));
+    }
+    logger.warn(`[${tag(ds)}] Timed out waiting for existing takeover worker readiness`);
+    return false;
+  }
   if (findActiveBySessionId(ds.session.sessionId) !== ds) return false;
   if (!normalizeRemoteRunnerBackendState(ds.session.remoteBackendState)) return false;
   if (isSessionTransferring(ds)
@@ -7229,7 +8972,7 @@ async function prepareRemoteRunnerExplicitClose(
       retryable: true,
     };
   }
-  if (!ds?.worker || ds.worker.killed) {
+  if (!ds?.worker || ds.worker.killed || ds.workerReady !== true) {
     if (!ds) {
       return {
         ok: false,
@@ -7242,7 +8985,8 @@ async function prepareRemoteRunnerExplicitClose(
     // A worker-less wake has no such runtime authority, so it must start only
     // from a valid opaque durable state and must never create a new provider
     // session merely to close it.
-    if (!normalizeRemoteRunnerBackendState(stored.remoteBackendState)) {
+    if ((!ds.worker || ds.worker.killed)
+        && !normalizeRemoteRunnerBackendState(stored.remoteBackendState)) {
       return {
         ok: false,
         error: 'remote_runner_row_inconsistent',
@@ -7904,7 +9648,13 @@ function liveLocalResidual(
  */
 function reclaimParkedCrashDiagnostic(ds: DaemonSession): void {
   if (getSessionPersistentBackendType(ds) !== 'tmux') return;
-  try { TmuxBackend.killSession(TmuxBackend.diagnosticSessionName(ds.session.sessionId)); } catch { /* benign */ }
+  // The worker parks it next to the managed session, whose server may have
+  // changed since (legacy default → dedicated socket), so sweep every candidate.
+  const target = ds.session.persistentBackendTarget;
+  const recordedSocket = target?.backendType === 'tmux' ? target.socketName : undefined;
+  for (const socketName of managedTmuxCandidateSockets(recordedSocket, preferredManagedTmuxSocket())) {
+    try { TmuxBackend.killSession(TmuxBackend.diagnosticSessionName(ds.session.sessionId), socketName); } catch { /* benign */ }
+  }
   try { unlinkSync(join(config.session.dataDir, 'crash-diagnostics', `${ds.session.sessionId}.ansi`)); } catch { /* absent — benign */ }
 }
 
@@ -7932,6 +9682,63 @@ function clearPendingSuspendClaim(ds: DaemonSession, why: string): void {
   logger.debug(`[${tag(ds)}] Cleared queued suspend claim (${reason ?? 'none'}): ${why}`);
 }
 
+type PinEffortActor = { source: 'command' | 'card'; setBy: string };
+
+function currentEffortModel(ds: DaemonSession): string | undefined {
+  return ds.activeModel?.trim() || ds.initConfig?.model?.trim() || ds.session.model?.trim();
+}
+
+/** One row write commits the preference and its matching pin together. */
+function persistEffortSelection(ds: DaemonSession, effort: NonNullable<Session['reasoningEffort']>, model: string | undefined, actor?: PinEffortActor, topic = false): void {
+  const beforePin = ds.session.modelPin;
+  const beforeEffort = ds.session.reasoningEffort;
+  const beforeTopic = ds.session.topicReasoningEffort;
+  const snapshot = ds.session.cliLaunchSnapshot;
+  const beforeSnapshot = snapshot?.reasoningEffort ?? null;
+  const matched = !!beforePin && samePinModel(beforePin.model, model);
+  if (matched) {
+    // Read and compare inside the write transaction. A detached/stale session
+    // must never resurrect a cleared pin or replace a newer explicit choice.
+    const { rows } = sessionStore.mutateOwnedSessionsAtomically([ds.session.sessionId], fresh => {
+      const row = fresh.get(ds.session.sessionId)!;
+      if (JSON.stringify(row.modelPin) !== JSON.stringify(beforePin)) throw new Error('model_pin_changed');
+      row.modelPin = { ...row.modelPin!, effort, ...actor, setAt: new Date().toISOString() };
+      if (topic && model) row.topicReasoningEffort = { model, effort };
+      else {
+        row.reasoningEffort = effort;
+        if (row.cliLaunchSnapshot) row.cliLaunchSnapshot.reasoningEffort = effort;
+      }
+    }, { modelPinWrite: true });
+    Object.assign(ds.session, rows.get(ds.session.sessionId)!);
+  } else {
+    if (topic && model) ds.session.topicReasoningEffort = { model, effort };
+    else {
+      ds.session.reasoningEffort = effort;
+      if (snapshot) snapshot.reasoningEffort = effort;
+    }
+    try { sessionStore.updateSession(ds.session); }
+    catch (error) {
+      ds.session.modelPin = beforePin;
+      ds.session.reasoningEffort = beforeEffort;
+      ds.session.topicReasoningEffort = beforeTopic;
+      if (ds.session.cliLaunchSnapshot) ds.session.cliLaunchSnapshot.reasoningEffort = beforeSnapshot;
+      throw error;
+    }
+  }
+  if (matched) {
+    dashboardEventBus.publish({ type: 'session.update', body: { sessionId: ds.session.sessionId, patch: { modelPin: sessionModelPinView(ds) } } });
+    try { scheduleActiveRuntimePatch(ds); } catch { /* saved selection remains authoritative */ }
+  }
+}
+
+function effortAuthorityAllowed(check: () => boolean): boolean {
+  try { return check(); } catch { return false; }
+}
+
+function effortSelectionStamp(ds: DaemonSession): string {
+  return JSON.stringify([ds.session.modelPin, ds.session.reasoningEffort, currentEffortModel(ds)]);
+}
+
 /** Only managed local Codex TUI sessions have a verified cold-resume effort path. */
 export function sessionReasoningControl(ds: DaemonSession): CardUsageSnapshot['reasoningControl'] {
   const cfg = ds.initConfig ?? ds.session;
@@ -7941,21 +9748,73 @@ export function sessionReasoningControl(ds: DaemonSession): CardUsageSnapshot['r
     || cfg.backendType !== 'tmux' || ds.initConfig?.codexRpcInput
     || ds.session.sandbox || ds.initConfig?.sandbox || ds.initConfig?.readIsolation || sandboxEnabled()
     || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) return undefined;
+  const model = ds.activeModel ?? cfg.model;
+  let selected = ds.session.reasoningEffort;
+  if (ds.session.modelPin) {
+    try { selected = resolveSessionLaunchEffort(ds, getBot(ds.larkAppId).config, model, selected); } catch { /* retain legacy choice */ }
+  }
   return {
     choices: reasoningEffortsForCliModel('codex', ds.activeModel ?? cfg.model),
-    selected: ds.session.reasoningEffort,
-    pending: !!ds.session.reasoningEffort && (!!ds.session.suspendedColdResume
-      || ds.session.reasoningEffort !== (ds.activeReasoningEffort ?? ds.initConfig?.reasoningEffort)),
+    selected,
+    ...(ds.codexCliEffortConfirmed?.effort === selected
+      && ds.codexCliEffortConfirmed?.workerGeneration === ds.workerGeneration
+      && ds.codexCliEffortConfirmed ? { nextTurn: true } : {}),
+    pending: !!selected && (!!ds.session.suspendedColdResume
+      || selected !== (ds.activeReasoningEffort ?? ds.initConfig?.reasoningEffort)),
   };
 }
 
+/** Topic settings for a managed local TraeX runtime. Native /model persists shared defaults. */
+export function topicReasoningControl(ds: DaemonSession): { model: string; choices: readonly string[]; selected?: string; active?: string; pending: boolean } | undefined {
+  const cfg = ds.initConfig ?? ds.session;
+  if ((ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? cfg.cliId) !== 'traex'
+    || !['pty', 'tmux'].includes(cfg.backendType ?? '') || cfg.wrapperCli || ds.initConfig?.traexAutoModel?.enabled
+    || ds.initConfig?.workflowNodeSession || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode
+    || sandboxBoolValue(cfg.sandbox) || sandboxEnabled() || ds.initConfig?.readIsolation) return;
+  const model = ds.activeModel?.trim() || cfg.model?.trim();
+  if (!model) return;
+  const choices = reasoningEffortsForCliModel('traex', model);
+  const saved = ds.session.modelPin ? resolveSessionLaunchEffort(ds, getBot(ds.larkAppId).config, model, undefined)
+    : resolveTopicReasoningEffort(ds.session, 'traex', model, undefined);
+  const active = ds.activeReasoningEffort ?? ds.initConfig?.reasoningEffort;
+  return { model, choices, selected: saved ?? active, active, pending: !!saved && saved !== active };
+}
+
+/** Save only the model-bound topic preference; physical application is an explicit restart. */
+export function setTopicReasoningEffort(ds: DaemonSession, effort: unknown, actor?: PinEffortActor): 'saved' | 'busy' | 'unsupported' | 'invalid' {
+  const control = topicReasoningControl(ds);
+  if (!control) return 'unsupported';
+  const selected = control.choices.find(value => value === effort);
+  if (!selected) return 'invalid';
+  if (!sessionAcceptsDirectCommand(ds) || isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds)) return 'busy';
+  persistEffortSelection(ds, selected as NonNullable<Session['reasoningEffort']>, control.model, actor, true);
+  return 'saved';
+}
+
+/** Whether accepted ordinary IM input still awaits worker admission. */
+export function hasPendingOrdinaryImInput(ds: DaemonSession): boolean {
+  return [...pendingOrdinaryImDeliveries.values()].some(delivery => delivery.ds === ds);
+}
+
+/** Whether a direct keystroke command (e.g. `/model <value>`) may be injected
+ * right now: same idle-boundary guarantees as reasoning-effort CAS minus the
+ * codex transcript turn-boundary probe. Cold/suspended sessions and non-live
+ * backends are accepted (the command queues until the worker consumes it). */
+export function sessionAcceptsDirectCommand(ds: DaemonSession): boolean {
+  if (ds.session.status !== 'active' || isSessionTransferring(ds)
+    || hasProtectedSessionMutationOwnership(ds) || ds.pendingRawInput || ds.pendingFollowUpInput
+    || hasPendingOrdinaryImInput(ds)) return false;
+  if (ds.worker && !ds.worker.killed && (ds.lastScreenStatus !== 'idle' || !ds.workerReady)) return false;
+  return true;
+}
+
 /** Caller holds the bot mutation gate. Never interrupt or replay a business turn. */
-export function setSessionReasoningEffort(ds: DaemonSession, effort: unknown): 'saved' | 'busy' | 'unsupported' | 'invalid' {
+export function setSessionReasoningEffort(ds: DaemonSession, effort: unknown, actor?: PinEffortActor): 'saved' | 'busy' | 'unsupported' | 'invalid' {
   const control = sessionReasoningControl(ds);
   if (!control) return 'unsupported';
   const selected = control.choices.find(candidate => candidate === effort);
   if (!selected) return 'invalid';
-  if (ds.session.status !== 'active' || isSessionTransferring(ds)
+  if (ds.session.status !== 'active' || isSessionTransferring(ds) || isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds)
     || hasProtectedSessionMutationOwnership(ds) || ds.pendingRawInput || ds.pendingFollowUpInput
     || [...pendingOrdinaryImDeliveries.values()].some(delivery => delivery.ds === ds)) return 'busy';
   const live = ds.worker && !ds.worker.killed;
@@ -7987,22 +9846,127 @@ export function setSessionReasoningEffort(ds: DaemonSession, effort: unknown): '
     } catch { return 'busy'; }
   }
   if (ds.session.reasoningEffort === selected
+    && (!ds.session.modelPin || !samePinModel(ds.session.modelPin.model, currentEffortModel(ds)) || ds.session.modelPin.effort === selected)
     && (!live || ds.activeReasoningEffort === selected)) return 'saved';
-  const previous = ds.session.reasoningEffort;
-  const snapshot = ds.session.cliLaunchSnapshot;
-  const previousSnapshotEffort = snapshot?.reasoningEffort ?? null;
-  ds.session.reasoningEffort = selected;
-  if (snapshot) snapshot.reasoningEffort = selected;
-  try {
-    // Persist only the next launch preference. Keep the live CLI, preview and
-    // owned services intact; a normal cold resume will consume this setting.
-    sessionStore.updateSession(ds.session);
-  } catch (error) {
-    ds.session.reasoningEffort = previous;
-    if (snapshot) snapshot.reasoningEffort = previousSnapshotEffort;
-    throw error;
-  }
+  persistEffortSelection(ds, selected, currentEffortModel(ds), actor);
   return 'saved';
+}
+
+export interface SuspendBackingVerificationOps {
+  kill(target: PersistentBackendTarget, sessionId: string): void;
+  probe(target: PersistentBackendTarget): ReturnType<typeof probePersistentBackendTarget>;
+  killDiagnostic?(sessionName: string, socketName?: string): void;
+  probeDiagnostic?(sessionName: string, socketName?: string): ReturnType<typeof TmuxBackend.probeSession>;
+}
+
+/**
+ * Destroy and positively verify the exact persistent backing before a logical
+ * session is committed as dormant. Worker IPC is deliberately not the authority
+ * here: if the worker is wedged or its IPC channel is already closed, killing
+ * only that process detaches tmux/herdr/zellij/zmx and leaves the memory-heavy
+ * CLI alive. Unknown probe results fail closed, so dormant is never persisted
+ * on an unverified teardown.
+ */
+export function destroySuspendBackingVerified(
+  ds: DaemonSession,
+  ops: SuspendBackingVerificationOps = {
+    kill: killPersistentBackendTarget,
+    probe: probePersistentBackendTarget,
+  },
+): boolean {
+  if (ds.crashDiagnosticParked) {
+    const diagnosticName = TmuxBackend.diagnosticSessionName(ds.session.sessionId);
+    // The worker parks it next to the managed session, whose server may have
+    // changed since (legacy default → dedicated socket): every candidate server
+    // must positively read 'missing', same set reclaimParkedCrashDiagnostic sweeps
+    // (recorded socket first). Each attempt kills on EVERY candidate before
+    // probing, so one unanswerable server never spares a live shell elsewhere.
+    const recorded = ds.session.persistentBackendTarget;
+    const sockets = managedTmuxCandidateSockets(
+      recorded?.backendType === 'tmux' ? recorded.socketName : undefined,
+      preferredManagedTmuxSocket(),
+    );
+    let unverified: { socketName: string | undefined; probe: ReturnType<typeof TmuxBackend.probeSession> } | null = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      for (const socketName of sockets) {
+        try { (ops.killDiagnostic ?? TmuxBackend.killSession)(diagnosticName, socketName); }
+        catch { /* the post-probe below is authoritative */ }
+      }
+      unverified = null;
+      for (const socketName of sockets) {
+        let probe: ReturnType<typeof TmuxBackend.probeSession>;
+        try {
+          // Teardown-grade: a server that has never run (the default one on a
+          // host whose managed sessions all moved to `-L botmux`) cannot hold
+          // the shell, while a running server that cannot answer — including
+          // one whose socket file was unlinked under it — still fails closed.
+          probe = (ops.probeDiagnostic ?? TmuxBackend.probeSessionForTeardown)(diagnosticName, socketName);
+        } catch { probe = 'unknown'; }
+        if (probe !== 'missing') { unverified = { socketName, probe }; break; }
+      }
+      if (!unverified) break;
+    }
+    if (unverified) {
+      logger.error(
+        `[${tag(ds)}] Suspend refused: crash diagnostic teardown unverified on ${tmuxServerLabel(unverified.socketName)} probe=${unverified.probe}`,
+      );
+      return false;
+    }
+    try { unlinkSync(join(config.session.dataDir, 'crash-diagnostics', `${ds.session.sessionId}.ansi`)); }
+    catch { /* absent — benign */ }
+  }
+
+  const target = persistentBackendTargetForSession(ds);
+  if (!target) {
+    logger.error(`[${tag(ds)}] Suspend refused: persistent backing target is unavailable`);
+    return false;
+  }
+
+  let probe: ReturnType<typeof probePersistentBackendTarget> = 'unknown';
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      ops.kill(target, ds.session.sessionId);
+    } catch (error) {
+      logger.warn(
+        `[${tag(ds)}] Suspend backing kill attempt ${attempt} threw: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    try { probe = ops.probe(target); }
+    catch (error) {
+      probe = 'unknown';
+      logger.warn(
+        `[${tag(ds)}] Suspend backing probe attempt ${attempt} threw: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (probe === 'missing') {
+      logger.info(
+        `[${tag(ds)}] Suspend backing verified missing backend=${target.backendType} attempt=${attempt}`,
+      );
+      return true;
+    }
+    if (attempt < 2) {
+      logger.warn(
+        `[${tag(ds)}] Suspend backing teardown not yet verified `
+        + `backend=${target.backendType} probe=${probe}; retrying`,
+      );
+    }
+  }
+  logger.error(
+    `[${tag(ds)}] Suspend refused: backing teardown unverified `
+    + `backend=${target.backendType} probe=${probe}`,
+  );
+  return false;
+}
+
+let suspendBackingVerifier: (ds: DaemonSession) => boolean = destroySuspendBackingVerified;
+
+/** Unit-test seam; production never overrides the exact kill + post-probe path. */
+export function __testOnly_setSuspendBackingVerifier(
+  verifier?: (ds: DaemonSession) => boolean,
+): void {
+  suspendBackingVerifier = verifier ?? destroySuspendBackingVerified;
 }
 
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
@@ -8027,6 +9991,13 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
 
   const w = ds.worker;
   trackLifecycleRetirement(ds, w);
+  if (!suspendBackingVerifier(ds)) {
+    clearLifecycleRetirement(ds, w);
+    return false;
+  }
+  // This worker generation is being retired: an in-flight restart of it can
+  // no longer report a result. Same as killWorker / retireWorkerProcessOnly.
+  restartCoordinator.cancelSession(ds.session.sessionId);
   try {
     w.send({ type: 'suspend' } as DaemonToWorker);
   } catch {
@@ -8039,6 +10010,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   // The CLI is destroyed by the suspend; the cold resume brings a new one.
   ds.cliReady = false;
   ds.localProcessAttestation = undefined;
+  ds.protectedLoopbackProxyAttestation = undefined;
   ds.workerPort = null;
   ds.workerToken = null;
   ds.workerViewToken = null;
@@ -8052,14 +10024,23 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   // Screen state describes the process we just stopped. Keeping it would make
   // the dashboard hydrate this process-less logical session as idle/working.
   ds.lastScreenStatus = undefined;
+  ds.backgroundTaskCount = undefined;
   // Drop the TTL clock with it: a cold-resumed worker starts from a fresh idle
   // edge, otherwise a stale stamp could get the new worker TTL-suspended almost
   // immediately after resume.
   ds.idleSinceAt = undefined;
+  // Drop the persisted idle auto-compact stretch too: a message-less cold
+  // resume must not immediately /compact a freshly started CLI reading its
+  // whole context without a warm prompt cache (core/idle-auto-compact.ts).
+  clearIdleAutoCompactStretch(ds.session);
+  ds.idleAutoCompactPendingNotice = undefined;
+  ds.idleAutoCompactDispatchedTurnId = undefined;
   ds.session.webPort = undefined;
-  // The worker's suspend handler destroys the backing session + CLI (frees
-  // memory), so there is no live CLI to reattach to: the next turn MUST
-  // cold-resume from the on-disk transcript. forkWorker(resume=true) builds the
+  // The daemon already destroyed the exact backing session + CLI and verified
+  // it missing before reaching this state. The worker's suspend handler now
+  // performs its idempotent local cleanup and exits; there is no live CLI to
+  // reattach to, so the next turn MUST cold-resume from the on-disk transcript.
+  // forkWorker(resume=true) builds the
   // CLI's `--resume <cliSessionId>` args, so mark this session as having history
   // (the normal `claude_exit` path that sets this never fires on suspend —
   // process.exit(0) races it). Also persist `suspendedColdResume` to record the
@@ -8141,6 +10122,9 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
  * the flag with no later checkpoint to revive it — hence the explicit
  * transfer-settled retry below.
  */
+/** Queued-suspend reason for a CLI whose install changed under it. */
+const CLI_INSTALL_CHANGED_SUSPEND = 'cli_install_changed';
+
 function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => boolean): void {
   const reason = ds.pendingSuspendReason;
   if (!reason) return;
@@ -8176,6 +10160,19 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
     // here keeps the "fulfilled by the deferred path" signal distinguishable
     // from a suspend that came from anywhere else.
     logger.info(`[${tag(ds)}] Deferred suspend fulfilled (${reason}) after turn completed`);
+    return;
+  }
+  // A pty backend cannot go dormant, yet a CLI running from a replaced install
+  // still has to be left behind: retire the worker like `/cd` does there, so
+  // the next message cold-starts it with resume.
+  if (reason === CLI_INSTALL_CHANGED_SUSPEND
+    && !isSuspendableBackendType(ds.initConfig?.backendType)
+    && !isSessionTransferring(ds)
+    && !hasProtectedSessionMutationOwnership(ds)) {
+    ds.hasHistory = true;
+    clearPendingSuspendClaim(ds, 'pty worker retired for install change');
+    killWorker(ds);
+    logger.info(`[${tag(ds)}] Retired pty worker after its CLI install changed`);
     return;
   }
   // Refused by an in-flight transfer: keeping the flag is not enough on its own.
@@ -8328,6 +10325,48 @@ function consumeDocCommentTurn(ds: DaemonSession, turnId: string): void {
   }
 }
 
+/** A document turn refused before admission never runs and never emits
+ * final_output, so nothing else would answer its comment or clear its Typing
+ * marker. The route is consumed synchronously before any await: a duplicate
+ * rejection frame then finds no target and cannot post a second notice.
+ * A pending queued activation and a Codex App accepted ledger entry are both
+ * replayed by the next fork; unless that entry is cancelled, the turn may
+ * still run, so it must not be reported as not executed. */
+function rejectDocCommentTurnBeforeAdmission(ds: DaemonSession, turnId: string, reason: string): void {
+  const docTurn = resolveDocCommentTarget(ds, turnId);
+  if (!docTurn) return;
+  if (ds.session.queuedActivationPending && ds.session.queuedActivationTurnId === turnId) return;
+  const ledgerEntries = ds.session.codexAppDispatchLedger?.filter(entry => entry.turnId === turnId) ?? [];
+  if (ledgerEntries.length > 0) {
+    const accepted = ledgerEntries.length === 1 && ledgerEntries[0]!.state === 'accepted' ? ledgerEntries[0]! : undefined;
+    if (!accepted || !rollbackAcceptedCodexAppDispatch(ds, accepted.dispatchId, turnId, accepted.dispatchAttempt)) return;
+  }
+  consumeDocCommentTurn(ds, turnId);
+  logger.warn(`[${tag(ds)}] doc-comment turn rejected before admission turn=${turnId.substring(0, 16)} reason=${reason}`);
+  const file = { fileToken: docTurn.fileToken, fileType: docTurn.fileType };
+  const notice = tr(
+    'worker.input_rejected_before_admission',
+    { turnId: turnId.substring(0, 16), reason },
+    botLocale(getBot(ds.larkAppId).config),
+  );
+  void (async () => {
+    try {
+      await replyToDocComment(ds.larkAppId, file, docTurn.commentId, notice, docTurn.replyToOpenId);
+    } catch (err: any) {
+      logger.error(`[doc-comment] failed to report rejected turn ${turnId.substring(0, 16)}: ${err?.message ?? err}`);
+    }
+    const reactionType = docTurn.reactionType ?? (docTurn.replyId ? 'Typing' : undefined);
+    if (reactionType && docTurn.replyId) {
+      try {
+        await removeCommentReaction(ds.larkAppId, file, docTurn.commentId, docTurn.replyId, reactionType,
+          { identity: docTurn.reactionIdentity });
+      } catch (err: any) {
+        logger.debug(`[doc-comment] failed to remove rejected reaction ${reactionType}: ${err?.message ?? err}`);
+      }
+    }
+  })();
+}
+
 function collectDocCommentReactionTargets(
   ds: DaemonSession | undefined,
   stored: Session | undefined,
@@ -8419,6 +10458,18 @@ export function teardownAuthoritativePersistentBackingBeforeClose(
   teardownAuthoritativePersistentBackingBeforeCloseImpl(target, false);
 }
 
+/** Live per-chat substitute toggle for a session's group, or undefined when the
+ *  button must not render. Reads the real toggle store + strict chat-mode cache
+ *  so every card re-render reflects the current state. */
+export function substituteCardControlFor(ds: DaemonSession): SubstituteCardControl | undefined {
+  return resolveSubstituteCardControl(
+    ds.larkAppId,
+    ds.chatId,
+    ds.chatType,
+    getBot(ds.larkAppId).config.substituteMode,
+  );
+}
+
 /** Render the live streaming-card JSON for `ds` (🖥️ header + usage line +
  *  显示输出/终端/关闭会话 buttons). Factored so callers outside the normal
  *  screen-update flow — notably the Lark 恢复会话 button — can restore the SAME
@@ -8430,14 +10481,14 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
   return buildStreamingCard(
     ds.session.sessionId,
     sessionAnchorId(ds),
-    readableTerminalUrlFor(ds),
+    liveReadableTerminalUrlFor(ds),
     ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg),
     ds.lastScreenContent ?? '',
     status ?? ds.lastScreenStatus ?? 'starting',
     effectiveCliId,
     ds.displayMode ?? 'hidden',
     ds.streamCardNonce,
-    ds.currentImageKey,
+    streamingCardPresentationImageKey(ds),
     isSharedAdoptSession(ds),
     false,
     localeForBot(ds.larkAppId),
@@ -8447,9 +10498,11 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
     sessionRuntimeDisplayName(ds, botCfg),
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-    idleCardLabel(ds),
+    streamCardLabel(ds),
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    false,
+    substituteCardControlFor(ds),
   );
 }
 
@@ -8538,8 +10591,9 @@ export type CloseSessionResult =
 export async function closeSessionForBackgroundCleanup(
   sessionId: string,
   context: string,
+  opts?: { backgroundExecutionCleanup?: boolean },
 ): Promise<CloseSessionResult> {
-  const result = await closeSession(sessionId);
+  const result = await closeSession(sessionId, opts);
   const tagId = sessionId.slice(0, 8);
   if (!result.ok) {
     logger.error(
@@ -8563,7 +10617,7 @@ export async function closeSessionForBackgroundCleanup(
 
 export async function closeSession(
   sessionId: string,
-  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public'; explicitClose?: boolean; onArchiveError?: (error: string) => Promise<unknown>; onCodexCleanupRelease?: (ticket: CodexCleanupReleaseTicket) => void },
+  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public'; explicitClose?: boolean; backgroundExecutionCleanup?: boolean; onArchiveError?: (error: string) => Promise<unknown>; onCodexCleanupRelease?: (ticket: CodexCleanupReleaseTicket) => void },
 ): Promise<CloseSessionResult> {
   // `awaitWorkerExit` (default true): whether to block on the worker process
   // actually exiting before returning. A busy CLI wedges in node-pty teardown
@@ -8706,7 +10760,7 @@ export async function closeSession(
 
   // Mutations are bot-owner scoped. getSession() has a read-only cross-file
   // fallback for agent CLI discovery, so it must not authorize close.
-  if (wasOpen) {
+  if (wasOpen || (stored?.backgroundExecutionCleanupClosedAt && !opts?.backgroundExecutionCleanup)) {
     if (!ds && stored && !isOwnedRiffClose) destroyUnregisteredPersistentBacking(stored);
     try {
       // Parking is handed to the store as part of ITS transaction rather than
@@ -8715,6 +10769,7 @@ export async function closeSession(
       // a field it never set). Same mistake as the early lineage clear fixed
       // earlier — one layer up.
       sessionStore.closeSession(sessionId, {
+        ...(opts?.backgroundExecutionCleanup ? { backgroundExecutionCleanup: true } : {}),
         cleanupBridgeMarkers: !hadLiveWorker,
         ...(opts?.workspaceRetirement ? { workspaceRetirement: opts.workspaceRetirement } : {}),
         ...(prepared.parkMojoLineage ? { parkMojoLineage: prepared.parkMojoLineage } : {}),
@@ -8806,6 +10861,16 @@ export async function closeSession(
         closedForkP2pTopic.chatId,
       );
     }
+    if (closeAppId) {
+      try {
+        getLinkRefRuntime()?.deleteSession(closeAppId, sessionId);
+      } catch {
+        logger.warn(
+          `[${sessionId.slice(0, 8)}] LinkRef session cleanup failed `
+          + 'code=link_ref_ledger_unavailable',
+        );
+      }
+    }
     const closeStreamingOwner = ds ?? closeStoredOwner;
     if (closeAppId && closeStreamingOwner && closePinnedStreamingTargets.length > 0) {
       void unpinProvenStreamingCardTargets(closeAppId, closePinnedStreamingTargets);
@@ -8894,7 +10959,7 @@ export async function closeSession(
   if (known) {
     cleanupSessionTempDirAfterExit(config.session.dataDir, sessionId, closingWorker, (error) => {
       logger.warn(
-        `[${sessionId.slice(0, 8)}] failed to clean session scratch: `
+        `[${sessionId.slice(0, 8)}] failed to clean session scratch / Gateway dir: `
         + `${error instanceof Error ? error.message : String(error)}`,
       );
     }, () => {
@@ -8903,7 +10968,7 @@ export async function closeSession(
       if (findActiveBySessionId(sessionId)) return false;
       if (retiringWorkersForSession(sessionId).some(worker => worker !== closingWorker)) return false;
       return sessionStore.getOwnedSession(sessionId)?.status === 'closed';
-    });
+    }, () => removeSessionMcpGatewayDir(sessionId, config.session.dataDir));
   }
   const runClosedLifecycle = async (workerExitProven: boolean): Promise<void> => {
     if (!closedSnapshot || !callbacks?.onSessionClosed) return;
@@ -8964,7 +11029,10 @@ export async function closeSession(
   // Trigger-user credentials die with the session. These files hold a live user
   // token, so a closed session must not leave one on disk for a future session
   // (or an operator inspecting the data dir) to pick up.
-  try { clearAllSessionIdentities(config.session.dataDir, sessionId); }
+  try {
+    clearAllSessionIdentities(config.session.dataDir, sessionId);
+    clearActiveIdentityTurns(config.session.dataDir, sessionId);
+  }
   catch { /* best-effort; absence is the desired state */ }
 
   const cleanupAppId = ds?.larkAppId ?? stored?.larkAppId;
@@ -9572,7 +11640,7 @@ type OrdinaryImDelivery = {
   /** At most one daemon ownership handoff may run for a logical delivery.
    * Duplicate worker reject events join this promise instead of creating a
    * second durable record. */
-  rejectionHandoff?: Promise<boolean>;
+  rejectionHandoff?: Promise<boolean | 'not_executed'>;
   timer?: ReturnType<typeof setTimeout>;
 };
 
@@ -9630,12 +11698,36 @@ function failOrdinaryImDelivery(
     + `turn=${record.turnId.substring(0, 16)} generation=${record.workerGeneration} `
     + `attempts=${record.attempt} reason=${reason}`,
   );
-  if (record.turnId.startsWith('bmx-recovery-')) {
+  if (record.turnId.startsWith('bmx-recovery-')
+    && (!isRecoveryRetryTurnId(record.turnId)
+      || record.ds.session.ordinaryTurnRecovery?.currentTurnId === record.turnId)) {
     requireOrdinaryTurnRecoveryAttention(
       record.ds.session,
       record.turnId,
       'recovery_delivery_failed',
     );
+    return;
+  }
+  // A failure card's re-delivery that the recovery does not own (it queued
+  // behind another live turn) still gets the ordinary delivery-failure notice.
+
+  // 决策看板批次（board:<app>:<batchId>）是 owner 在看板前触发的后台投递，不是群里
+  // 等来的真人消息：失败不往管家群贴卡片（owner 看不到，横幅还会造成困惑），交给
+  // daemon 的回调把批次退回 failed——Dashboard 批次行显示原因并用同一稳定 turnId 重投。
+  if (record.turnId.startsWith('board:')) {
+    try {
+      const handled = requireCallbacks().onBoardTurnDeliveryFailed?.(
+        record.ds,
+        { turnId: record.turnId, reason, messageKey },
+      );
+      void Promise.resolve(handled).catch(err => logger.error(
+        `[${tag(record.ds)}] board delivery failure callback errored: ${err instanceof Error ? err.message : String(err)}`,
+      ));
+    } catch (err) {
+      logger.error(
+        `[${tag(record.ds)}] board delivery failure callback threw: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
     return;
   }
   // Plan B: a meeting agent is an ordinary chat-scope session. This tracker only
@@ -9801,12 +11893,18 @@ function sendOrdinaryImDeliveryTracked(
   return sendOrdinaryImDeliveryAttempt(record);
 }
 
+/**
+ * 哪些回合走「ordinary turn 投递协议」：daemon 侧 begin/complete 投递追踪（收据
+ * ACK + 同代重试 + 终态失败上报），worker 侧收到/提交内存去重，冷启动 preload 补
+ * 收据。前缀族只有 isOrdinaryImTurnId 这一处定义：真人 om_ 消息、bmx-recovery-
+ * 恢复回合、board: 决策看板批次（id 按批次稳定）。名字保留 "Im" 是因为整套协议
+ * 是按「owner 的一条普通消息」建模的——看板批次在 daemon 里也正是这种身份。
+ */
 function shouldTrackOrdinaryImDelivery(
   ds: DaemonSession,
   message: Extract<DaemonToWorker, { type: 'message' | 'init' }>,
 ): boolean {
-  return !!message.turnId
-    && (message.turnId.startsWith('om_') || message.turnId.startsWith('bmx-recovery-'))
+  return isOrdinaryImTurnId(message.turnId)
     && message.dispatchAttempt === undefined
     && (message.type !== 'init' || (!!message.prompt && !message.adoptMode))
     && !isSharedAdoptSession(ds)
@@ -9895,8 +11993,16 @@ async function rejectOrdinaryImDelivery(
     }));
     record.rejectionHandoff = handoff;
     try {
-      const accepted = await handoff;
-      if (accepted) {
+      const outcome = await handoff;
+      if (outcome === 'not_executed') {
+        failOrdinaryImDelivery(
+          record,
+          `worker_rejected:${rejection.reason}`,
+          'worker.input_rejected_before_admission',
+        );
+        return;
+      }
+      if (outcome) {
         clearOrdinaryImDelivery(record);
         logger.info(
           `[${tag(ds)}] Ordinary IM rejection durably handed back to daemon `
@@ -10066,10 +12172,24 @@ export function sendWorkerSessionInput(
   // Evaluate the cheap message-shape guards FIRST: getBot() THROWS for an
   // unregistered app (IPC tests / in-flight teardown), and every other input
   // type (inject_command, set_display_mode, …) must reach worker.send without
-  // this registry lookup at all. Only a Codex Ctrl+C/ESC needs the cancel.
-  if (message.type === 'term_action' && (message.key === 'ctrlc' || message.key === 'esc')
-    && sessionCliId(ds, getBot(ds.larkAppId).config) === 'codex') {
-    cancelOrdinaryRecoveryForUserInput(ds.session, ds.session.ordinaryTurnRecovery?.currentTurnId ?? 'stop');
+  // this registry lookup at all. Only a Ctrl+C/ESC needs the recovery cancel.
+  if (message.type === 'term_action' && (message.key === 'ctrlc' || message.key === 'esc')) {
+    const stopCliId = sessionCliId(ds, getBot(ds.larkAppId).config);
+    if (codexCapacityRecoveryCli(stopCliId)) {
+      cancelOrdinaryRecoveryForUserInput(ds.session, ds.session.ordinaryTurnRecovery?.currentTurnId ?? 'stop');
+    } else if (stopCliId === 'claude-code') {
+      // The stopped turn's pending/in-flight continuation must neither run
+      // afterwards nor later settle as an "outcome unverified" failure card.
+      try { cancelOrdinaryTurnRecoveryForStop(ds.session); }
+      catch (err) { logger.error(`[${tag(ds)}] Could not cancel recovery on stop: ${err instanceof Error ? err.message : String(err)}`); }
+    }
+  }
+  if ((message.type === 'term_action' && (message.key === 'ctrlc' || message.key === 'esc'))
+    || message.type === 'raw_input' || message.type === 'inject_command') {
+    cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous),
+      deploymentContinuationAuthority(ds)?.turnId, true);
+  } else if (message.type === 'message') {
+    cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
   }
   const annotated = withTurnCaller(ds, message);
   if (bufferTransferInput(ds, annotated)) return true;
@@ -10078,15 +12198,123 @@ export function sendWorkerSessionInput(
   return afterWorkerIpcBootstrap(worker, () => worker.send(annotated));
 }
 
+/** Prompt-cache keep-alive delivery. Deliberately NOT routed through the
+ *  transfer buffer: a keep-alive is only worth sending to the CLI that holds
+ *  the warm cache right now, never replayed into a replacement worker. */
+export function sendPromptCacheKeepalive(ds: DaemonSession, text: string): boolean {
+  const worker = ds.worker;
+  if (!worker || worker.killed || transferInputGates.has(ds)) return false;
+  const message: DaemonToWorker = { type: 'prompt_cache_keepalive', text };
+  try {
+    return afterWorkerIpcBootstrap(worker, () => worker.send(message));
+  } catch {
+    return false;
+  }
+}
+
 export type ExactTurnInterruptResult =
   | { ok: true }
-  | { ok: false; reason: 'no_worker' | 'stale_turn' | 'unsupported' | 'delivery_failed' | 'timeout' };
+  | { ok: false; reason: 'no_worker' | 'stale_turn' | 'unsupported' | 'delivery_failed' | 'timeout' | 'fork_pending' };
 
 /** Native settings use their own receipt, without rotating business-turn state. */
+const pendingCodexCliEffort = new WeakSet<DaemonSession>();
+const pendingCodexAppEffort = new WeakSet<DaemonSession>();
+export function isSessionEffortChangeInFlight(ds: DaemonSession): boolean {
+  return pendingCodexCliEffort.has(ds) || pendingCodexAppEffort.has(ds);
+}
+
+/** A native menu receipt saves a future-turn preference, never activeRuntime. */
+export function updateCodexCliEffort(
+  ds: DaemonSession, effort: string, timeoutMs = 35_000, canApply: () => boolean = () => true, actor?: PinEffortActor,
+): Promise<import('../types.js').CodexAppEffortResult> {
+  const worker = ds.worker;
+  const cfg = ds.initConfig ?? ds.session;
+  // codexRpcInput is a requested launch preference: legacy runtimes and failed
+  // RPC startup can still use terminal input. The current worker checks its
+  // actual codexRpcEngine before opening a menu and returns an explicit refusal.
+  // cliReady records an idle prompt in this worker generation. After a warm
+  // reattach, the native CLI may still be working and able to open /model
+  // without having emitted that prompt. Let its current screen and input
+  // ownership checks in the worker decide; do not manufacture prompt-ready.
+  if ((ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId) !== 'codex'
+    || !worker || worker.killed || !ds.workerReady
+    || ds.session.status !== 'active' || isSessionTransferring(ds)
+    || !['pty', 'tmux'].includes(cfg.backendType ?? '') || cfg.wrapperCli
+    || sandboxBoolValue(cfg.sandbox) || sandboxEnabled() || ds.initConfig?.readIsolation
+    || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode
+    || isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds) || !effortAuthorityAllowed(canApply)) {
+    logger.info(`[${tag(ds)}] Codex CLI effort unavailable at daemon admission: ${JSON.stringify({
+      workerReady: !!ds.workerReady, cliReady: !!ds.cliReady,
+      workerAlive: !!worker && !worker.killed, status: ds.session.status,
+      backend: cfg.backendType, wrapped: !!cfg.wrapperCli,
+      sandbox: sandboxBoolValue(cfg.sandbox) || sandboxEnabled(),
+      isolated: !!ds.initConfig?.readIsolation,
+      adopted: !!(ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode),
+      transferring: isSessionTransferring(ds), pending: pendingCodexCliEffort.has(ds),
+    })}`);
+    return Promise.resolve({ status: 'unavailable', reason: 'cli_menu_unavailable' });
+  }
+  if (!/^(low|medium|high|xhigh|max|ultra)$/.test(effort)) return Promise.resolve({ status: 'invalid' });
+  const generation = ds.workerGeneration;
+  const nativeId = ds.session.cliSessionId;
+  const sessionGeneration = ds.session.workerGeneration;
+  const stamp = effortSelectionStamp(ds);
+  const selectedModel = currentEffortModel(ds);
+  const requestId = randomUUID();
+  pendingCodexCliEffort.add(ds);
+  return new Promise(resolve => {
+    let settled = false;
+    const current = () => ds.worker === worker && ds.workerGeneration === generation
+      && ds.session.workerGeneration === sessionGeneration
+      && ds.session.cliSessionId === nativeId && ds.session.status === 'active'
+      && !isSessionRestartInFlight(ds) && effortAuthorityAllowed(canApply) && effortSelectionStamp(ds) === stamp;
+    const finish = (result: import('../types.js').CodexAppEffortResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      worker.off('message', onMessage);
+      worker.off('exit', onExit);
+      pendingCodexCliEffort.delete(ds);
+      resolve(result);
+    };
+    const onMessage = (msg: WorkerToDaemon): void => {
+      if (msg.type !== 'codex_cli_effort_result' || msg.requestId !== requestId) return;
+      if (!current()) return finish({ status: 'error' });
+      if (msg.status === 'future_only' && msg.reason === 'cli_next_turn') {
+        const selected = effort as NonNullable<Session['reasoningEffort']>;
+        try { persistEffortSelection(ds, selected, selectedModel, actor); }
+        catch { return finish({ status: 'error' }); }
+        if (ds.initConfig) ds.initConfig.reasoningEffort = selected;
+        ds.codexCliEffortConfirmed = { effort: selected, workerGeneration: generation };
+        scheduleActiveRuntimePatch(ds);
+      }
+      finish(msg);
+    };
+    const onExit = (): void => finish({ status: 'error' });
+    const timer = setTimeout(() => {
+      try { if (current()) worker.send({ type: 'codex_cli_effort_cancel', requestId } satisfies DaemonToWorker); } catch { /* exited */ }
+      finish({ status: 'error' });
+    }, timeoutMs);
+    timer.unref?.();
+    worker.on('message', onMessage);
+    worker.once('exit', onExit);
+    try {
+      if (!afterWorkerIpcBootstrap(worker, () => {
+        if (settled) return;
+        if (!current()) return finish({ status: 'unavailable' });
+        worker.send({ type: 'codex_cli_effort', requestId, effort,
+          deadline: Date.now() + Math.max(1, timeoutMs - 2_000) } satisfies DaemonToWorker);
+      })) finish({ status: 'unavailable' });
+    } catch { finish({ status: 'error' }); }
+  });
+}
+
 export function updateCodexAppEffort(
   ds: DaemonSession,
   effort: string,
   timeoutMs = 35_000,
+  canApply: () => boolean = () => true,
+  actor?: PinEffortActor,
 ): Promise<import('../types.js').CodexAppEffortResult> {
   const worker = ds.worker;
   // 优先级 snapshot ?? session.cliId（刻意不回落到 bot 配置）：只对已有 live worker 的
@@ -10094,9 +12322,15 @@ export function updateCodexAppEffort(
   if (!isCodexAppCliId(ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId)
     || !worker || worker.killed || !ds.workerReady || !ds.cliReady
     || ds.session.status !== 'active' || isSessionTransferring(ds)
-    || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) {
+    || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode
+    || isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds) || !effortAuthorityAllowed(canApply)) {
     return Promise.resolve({ status: 'unavailable' });
   }
+  const stamp = effortSelectionStamp(ds);
+  const generation = ds.workerGeneration;
+  const nativeId = ds.session.cliSessionId;
+  const selectedModel = currentEffortModel(ds);
+  pendingCodexAppEffort.add(ds);
   const requestId = randomUUID();
   return new Promise(resolve => {
     let settled = false;
@@ -10106,11 +12340,19 @@ export function updateCodexAppEffort(
       clearTimeout(timer);
       worker.off('message', onMessage);
       worker.off('exit', onExit);
+      pendingCodexAppEffort.delete(ds);
       resolve(result);
     };
     const onMessage = (msg: WorkerToDaemon): void => {
       if (msg.type !== 'codex_app_effort_result' || msg.requestId !== requestId) return;
-      finish(ds.worker === worker ? msg : { status: 'error' });
+      if (ds.worker !== worker || ds.workerGeneration !== generation || ds.session.cliSessionId !== nativeId
+        || ds.session.status !== 'active' || isSessionRestartInFlight(ds) || !effortAuthorityAllowed(canApply) || effortSelectionStamp(ds) !== stamp) return finish({ status: 'error' });
+      if (ds.session.modelPin && (msg.status === 'applied' || msg.status === 'future_only')) {
+        try { persistEffortSelection(ds, effort as NonNullable<Session['reasoningEffort']>, selectedModel, actor); }
+        catch { return finish({ status: 'error' }); }
+        if (ds.initConfig) ds.initConfig.reasoningEffort = effort as NonNullable<Session['reasoningEffort']>;
+      }
+      finish(msg);
     };
     const onExit = (): void => finish({ status: 'error' });
     const timer = setTimeout(() => finish({ status: 'error' }), timeoutMs);
@@ -10141,6 +12383,7 @@ export function interruptExactWorkerTurn(
 ): Promise<ExactTurnInterruptResult> {
   const worker = ds.worker;
   if (!worker || worker.killed) return Promise.resolve({ ok: false, reason: 'no_worker' });
+  cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous), turnId, true);
   const requestId = randomUUID();
   return new Promise(resolve => {
     let settled = false;
@@ -10801,15 +13044,15 @@ export async function transferSession(
   }
 }
 
-/** Backends whose conversation state is a local, copyable transcript file and
- *  whose CLI exposes a native "fork/branch this session" primitive that botmux
- *  can drive at cold spawn (Claude family / Grok: `--fork-session`; Codex/TraeX
+/** CLIs whose native fork primitive creates an independent conversation.
+ *  Antigravity runs its interactive /fork before the first ready/input edge;
+ *  the others can drive it at cold spawn (Claude family / Grok: `--fork-session`; Codex/TraeX
  *  terminal: `<cli> fork <id>`). App-server backends (codex-app, or a Codex-family CLI running in
  *  Hybrid RPC mode) keep state in a live app-server process + SQLite and have no
  *  byte-level fork we can reproduce — they are refused. Riff / other pure-remote
  *  backends have no local rollout to fork either. */
 const FORK_CAPABLE_CLI_IDS: ReadonlySet<CliId> = new Set<CliId>([
-  'claude-code', 'seed', 'relay', 'codex', 'traex', 'grok',
+  'claude-code', 'seed', 'relay', 'codex', 'traex', 'grok', 'antigravity',
 ]);
 
 /** True when this session can be byte-level forked via a CLI-native primitive.
@@ -10820,6 +13063,11 @@ export function isForkCapableSession(ds: DaemonSession): boolean {
   const botCfg = getBot(ds.larkAppId).config;
   const cliId = sessionCliId(ds, botCfg);
   if (!FORK_CAPABLE_CLI_IDS.has(cliId)) return false;
+  if (cliId === 'antigravity' && isRemoteBackendSession(ds)) return false;
+  // agy writes its fork receipt to --log-file under ~/.gemini; the scratch
+  // overlay keeps that write out of the host path the worker tails.
+  if (cliId === 'antigravity'
+    && sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged) === 'scratch') return false;
   // An external App Server thread is not a local rollout. `codex fork` would
   // resolve against the terminal client's own CODEX_HOME and could fork an
   // unrelated/empty local session, so refuse rather than claiming a copy was
@@ -10838,7 +13086,7 @@ export function isForkCapableSession(ds: DaemonSession): boolean {
   // ORing the frozen init flag closes that window (over-refuse, never leak).
   const rpcAtSpawn = ds.initConfig?.codexRpcInput === true;
   if ((cliId === 'codex' || cliId === 'traex')
-    && (rpcAtSpawn || botCfg.codexRpcInput === true || config.codexRpcInputDefault)) {
+    && (rpcAtSpawn || latestCodexRpcInputForRespawn(ds))) {
     return false;
   }
   return true;
@@ -11075,7 +13323,7 @@ async function forkFromSource(
     childSession.promptInjection = sessionPromptInjection(ds);
     childSession.nativeSessionTitle = childTitle;
     childSession.nativeSessionTitleUserDefined = true;
-    sessionStore.updateSession(childSession);
+    sessionStore.updateSession(childSession, { modelPinWrite: true });
 
     // ── Build the child runtime DaemonSession (mirrors the restore-path literal;
     //    worker:null → forkWorker cold-spawns a fresh worker for it) ──
@@ -11138,7 +13386,7 @@ async function forkFromSource(
         rememberLastCliInput(
           childDs,
           opts?.forkTaskText ?? (typeof initialPrompt === 'string' ? initialPrompt : initialPrompt.content),
-          initialPrompt,
+          initialPrompt, opts?.turnId,
         );
       }
       fkw(
@@ -11280,6 +13528,7 @@ function acceptCodexAppDispatch(
     replyTargetSenderIsBot?: boolean;
     queuedActivationToken?: string;
     codexAppSteerable?: true;
+    linkRefMode?: 'observe' | 'enabled';
   },
   turnId: string | undefined,
   dispatchAttempt: number | undefined,
@@ -11313,6 +13562,7 @@ function acceptCodexAppDispatch(
       deliverySink: codexAppDeliverySinkForTurn(ds, turnId, dispatchAttempt),
       ...(payload.codexAppSteerable ? { codexAppSteerable: true } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      ...(payload.linkRefMode ? { linkRefMode: payload.linkRefMode } : {}),
       content: payload.content,
       ...(payload.codexAppInput ? { codexAppInput: payload.codexAppInput } : {}),
       ...(vcMeetingImTurnOrigin ? { vcMeetingImTurnOrigin } : {}),
@@ -11334,14 +13584,14 @@ function rollbackAcceptedCodexAppDispatch(
   dispatchId: string | undefined,
   turnId: string | undefined,
   dispatchAttempt: number | undefined,
-): void {
-  if (!dispatchId || !turnId) return;
+): boolean {
+  if (!dispatchId || !turnId) return false;
   const cancelled = cancelCodexAppDispatch(ds.session.codexAppDispatchLedger ?? [], {
     dispatchId,
     turnId,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
   });
-  if (!cancelled.ok) return;
+  if (!cancelled.ok) return false;
   const priorLedger = ds.session.codexAppDispatchLedger;
   ds.session.codexAppDispatchLedger = cancelled.ledger;
   try {
@@ -11356,7 +13606,9 @@ function rollbackAcceptedCodexAppDispatch(
     }
   } catch {
     ds.session.codexAppDispatchLedger = priorLedger;
+    return false;
   }
+  return true;
 }
 
 /**
@@ -11620,7 +13872,7 @@ function rollbackWorkerForkPreInit(
 function recordAdmittedOrdinaryUserTurn(
   ds: DaemonSession,
   turnId: string,
-  opts: { beginRecovery: boolean; dispatchAttempt?: number },
+  opts: { beginRecovery: boolean; dispatchAttempt?: number; input?: OrdinaryTurnRetryInput },
 ): void {
   const priorRecoveryStatus = ds.session.ordinaryTurnRecovery?.status;
   const priorReadonlyStatus = ds.session.readonlyTaskContinuation?.status;
@@ -11630,9 +13882,11 @@ function recordAdmittedOrdinaryUserTurn(
       if (opts.beginRecovery) {
         // Freeze the fire's silent attribute onto the logical turn now: the
         // scheduler arms the runtime registry before dispatch, so it is readable
-        // here, and only the persisted copy survives a restart.
+        // here, and only the persisted copy survives a restart. The exact input
+        // is frozen alongside for a failure card's re-delivery.
         const state = beginOrdinaryTurnRecovery(ds.session, turnId, {
           silent: isSilentScheduledTurn(ds, turnId),
+          ...(opts.input?.cliInput ? { input: opts.input } : {}),
         });
         recoveryBookkeepingSucceeded = state?.logicalTurnId === turnId
           && state.currentTurnId === turnId;
@@ -11683,9 +13937,7 @@ function rememberScheduledTurnCaller(
   if (!turnId || !caller || caller.source !== 'schedule_creator') return;
   const taskId = parseScheduledTurnId(turnId);
   if (!taskId || caller.taskId !== taskId) return;
-  const task = readScheduledTaskForProvenance(
-    config.session.dataDir, ds.larkAppId, taskId,
-  );
+  const task = callbacks?.loadScheduledTaskForIdentity?.(ds.larkAppId, taskId);
   const expected = task ? trustedCallerForScheduledTask(task, ds.larkAppId) : undefined;
   if (!expected
     || expected.requestLarkAppId !== ds.larkAppId
@@ -11717,9 +13969,10 @@ export function sendWorkerInput(
   turnId?: string,
   opts: {
     dispatchAttempt?: number;
+    durablePrimaryInbox?: true;
     /** A command handler may own its single rejection reply. */
     notifyRejection?: false;
-    /** Explicit positive steer authorization (plain-human-interactive only).
+    /** Explicit positive steer authorization (ordinary human input or a correlated human answer).
      * Persisted on the accepted ledger entry and forwarded to the worker so the
      * serial runner may steer this turn into an active one. */
     codexAppSteerable?: true;
@@ -11729,8 +13982,13 @@ export function sendWorkerInput(
      * The dormant-fork path rides `atMostOnce` on the fork init instead. */
     atMostOnce?: true;
     trustedCaller?: TrustedCaller;
+    /** Queue behind a running turn instead of folding into it (type-ahead):
+     *  the input must start as a turn of its own. */
+    queueAfterActiveTurn?: true;
   } = {},
 ): boolean {
+  cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
+  if (feedbackMaintenanceActive(config.session.dataDir)) return false;
   const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
   if (remoteRetirementPhase) {
     const remoteBackend = (ds.initConfig?.backendType ?? ds.session.backendType) === 'mojo'
@@ -11755,7 +14013,7 @@ export function sendWorkerInput(
   }
   const transferGate = transferInputGates.get(ds);
   if ((!ds.worker || ds.worker.killed) && !transferGate) return false;
-  const normalized = typeof payload === 'string' ? { content: payload } : payload;
+  let normalized = typeof payload === 'string' ? { content: payload } : payload;
   const trustedController = trustedSessionController(ds);
   const bot = getBot(ds.larkAppId);
   const effectiveCliId = sessionCliId(ds, bot.config);
@@ -11799,6 +14057,7 @@ export function sendWorkerInput(
           ...(normalized.codexAppInput
             ? { codexAppInput: normalized.codexAppInput }
             : {}),
+          ...(normalized.linkRefs ? { linkRefs: normalized.linkRefs } : {}),
           // R4-B1: freeze the admission-time steer authorization into the queued
           // tail's frozen payload so promote/repark/restore COPY it verbatim
           // (admission computed once; never re-inferred downstream).
@@ -11831,8 +14090,19 @@ export function sendWorkerInput(
   }
 
   // Real delivery boundary: subtract background sources covered while this
-  // turn waited (FIFO / staged tail) and freeze what is actually sent.
+  // turn waited (FIFO / staged tail) and freeze what is actually sent. LinkRef
+  // admission must follow this rewrite so its companion/ledger describe only
+  // the group context that really crosses worker IPC.
   commitGroupContextDispatch(ds, normalized, effectiveTurnId);
+  const admittedLinkRefs = prepareAdmittedLinkRefPayload({
+    ds,
+    payload: normalized,
+    turnId: effectiveTurnId,
+    dispatchAttempt: opts.dispatchAttempt,
+  });
+  normalized = typeof payload === 'string'
+    ? admittedLinkRefs.payload
+    : freezeAdmittedPayloadInPlace(payload, admittedLinkRefs.payload);
   const codexAppInput = codexAppInputForSession(
     ds,
     normalized.codexAppInput,
@@ -11853,6 +14123,9 @@ export function sendWorkerInput(
         ? { replyTargetSenderIsBot: replyContext.replyTargetSenderIsBot }
         : {}),
       ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
+      ...(admittedLinkRefs.mode === 'disabled'
+        ? {}
+        : { linkRefMode: admittedLinkRefs.mode }),
     },
     effectiveTurnId,
     opts.dispatchAttempt,
@@ -11869,21 +14142,26 @@ export function sendWorkerInput(
     // refresh its launch snapshot — so carry the current model on the message
     // itself. Only while parked: an ordinary turn changes no launch config, and
     // an unconditional field would be pure noise on every message.
-    ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
+    ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds), ...latestPinEffortForRespawn(ds) } : {}),
     ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
+    ...(ds.crashDiagnosticParked ? latestLaunchCommandsForRespawn(ds) : {}),
     ...(codexAppInput ? { codexAppInput } : {}),
+    ...(admittedLinkRefs.mode === 'disabled' ? {} : { linkRefMode: admittedLinkRefs.mode }),
     ...(nativeSessionTitle ? { nativeSessionTitle } : {}),
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     ...(effectiveTurnId ? { turnId: effectiveTurnId } : {}),
     ...(replyTurnId ? { replyTurnId } : {}),
     ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
+    ...(opts.durablePrimaryInbox ? { durablePrimaryInbox: true } : {}),
     ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
     ...(opts.atMostOnce ? { atMostOnce: true } : {}),
     ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
-    ...(opts.dispatchAttempt === undefined && isSerialGroupInput(ds, opts.trustedCaller)
+    ...(opts.queueAfterActiveTurn || (opts.dispatchAttempt === undefined
+      && (opts.trustedCaller?.source === 'schedule_creator'
+        || isSerialGroupInput(ds, opts.trustedCaller)))
       ? { queueAfterActiveTurn: true as const } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
@@ -11928,6 +14206,10 @@ export function sendWorkerInput(
     recordAdmittedOrdinaryUserTurn(ds, admittedTurnId, {
       beginRecovery: true,
       ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
+      input: {
+        cliInput: normalized.content,
+        ...(opts.trustedCaller ? { trustedCaller: { ...opts.trustedCaller } } : {}),
+      },
     });
   }
   return true;
@@ -12193,13 +14475,14 @@ export function promoteQueuedActivationTail(
   // a true→false toggle between N+1 admission and N's ACK would otherwise
   // discard N+1's exact sidecar/hidden context. Only fill the deterministic id
   // for legacy entries persisted before admission began stamping it.
-  const codexAppInput = cloneFrozenCodexAppInput(
+  let codexAppInput = cloneFrozenCodexAppInput(
     head.cliInput.codexAppInput,
     head.turnId,
   );
-  const exactInput: CliTurnPayload = {
+  let exactInput: CliTurnPayload = {
     content: head.cliInput.content,
     ...(codexAppInput ? { codexAppInput } : {}),
+    ...(head.cliInput.linkRefs ? { linkRefs: head.cliInput.linkRefs } : {}),
     // R5-B1-2: preserve the frozen steer authorization onto the promoted
     // queuedActivationInput so the ensuing fork/accept-ledger COPY (below) sees
     // it. Only `=== true`; a missing/false tail head stays forced-serial.
@@ -12208,6 +14491,23 @@ export function promoteQueuedActivationTail(
     ...(head.cliInput.trustedController ? { trustedController: head.cliInput.trustedController } : {}),
   };
   const vcMeetingImTurnOrigin = resolveVcMeetingImTurnOrigin(ds.session, head.turnId);
+  // A queued successor can wait long enough for earlier native-input receipts
+  // to cover part of its frozen group background. Commit that exact dispatch
+  // first, then register LinkRefs using the mode frozen when the tail entry was
+  // admitted. This prevents stale, never-delivered group URLs entering the
+  // companion/ledger while keeping rollout changes from mutating queued work.
+  commitGroupContextDispatch(ds, exactInput, head.turnId);
+  const admittedLinkRefs = exactInput.linkRefs
+    ? prepareAdmittedLinkRefPayload({
+        ds,
+        payload: exactInput,
+        turnId: head.turnId,
+        dispatchAttempt: head.dispatchAttempt,
+        frozenMode: exactInput.linkRefs.mode,
+      })
+    : { payload: exactInput, mode: 'disabled' as const };
+  exactInput = freezeAdmittedPayloadInPlace(exactInput, admittedLinkRefs.payload);
+  codexAppInput = cloneFrozenCodexAppInput(exactInput.codexAppInput, head.turnId);
 
   ds.session.queued = false;
   ds.session.queuedActivationPending = true;
@@ -12243,6 +14543,9 @@ export function promoteQueuedActivationTail(
         // entry's payload onto the accept-ledger (admission computed once; never
         // re-inferred at promote time).
         ...(exactInput.codexAppSteerable ? { codexAppSteerable: true } : {}),
+        ...(admittedLinkRefs.mode !== 'disabled'
+          ? { linkRefMode: admittedLinkRefs.mode }
+          : {}),
       },
       head.turnId,
       head.dispatchAttempt,
@@ -12268,9 +14571,13 @@ export function promoteQueuedActivationTail(
       type: 'message',
       content: exactInput.content,
       // Same parked-worker launch-snapshot refresh as the ordinary send.
-      ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds) } : {}),
+      ...(ds.crashDiagnosticParked ? { model: latestModelForRespawn(ds), ...latestPinEffortForRespawn(ds) } : {}),
       ...(ds.crashDiagnosticParked ? { larkToolBinding: latestLarkToolBindingForRespawn(ds) } : {}),
+      ...(ds.crashDiagnosticParked ? latestLaunchCommandsForRespawn(ds) : {}),
       ...(codexAppInput ? { codexAppInput } : {}),
+      ...(admittedLinkRefs.mode !== 'disabled'
+        ? { linkRefMode: admittedLinkRefs.mode }
+        : {}),
       turnId: head.turnId,
       ...(head.dispatchAttempt !== undefined
         ? { dispatchAttempt: head.dispatchAttempt }
@@ -12300,6 +14607,10 @@ export function promoteQueuedActivationTail(
       ...(head.dispatchAttempt !== undefined
         ? { dispatchAttempt: head.dispatchAttempt }
         : {}),
+      input: {
+        cliInput: exactInput.content,
+        ...(exactInput.trustedCaller ? { trustedCaller: { ...exactInput.trustedCaller } } : {}),
+      },
     });
   } catch (err) {
     // Durable ownership already moved to the journal (and Codex ledger). Never
@@ -12346,24 +14657,32 @@ export function admitQueuedActivationTail(
   reservation: QueuedActivationTailReservation = reserveQueuedActivationTailAdmission(ds),
   opts: { codexAppInputGateFrozen?: boolean } = {},
 ): QueuedActivationTailEntry {
+  const admittedLinkRefs = entry.cliInput.linkRefs
+    ? freezeDeferredLinkRefPayload({
+        ds,
+        payload: entry.cliInput,
+      })
+    : { payload: entry.cliInput, mode: 'disabled' as const };
+  const frozenInput = admittedLinkRefs.payload;
   const acceptedCodexAppInput = opts.codexAppInputGateFrozen === true
-    ? cloneFrozenCodexAppInput(entry.cliInput.codexAppInput, entry.turnId)
+    ? cloneFrozenCodexAppInput(frozenInput.codexAppInput, entry.turnId)
     : reservation.codexAppInputAccepted === true
-      ? cloneFrozenCodexAppInput(entry.cliInput.codexAppInput, entry.turnId)
+      ? cloneFrozenCodexAppInput(frozenInput.codexAppInput, entry.turnId)
       : undefined;
   const admitted: QueuedActivationTailEntry = {
     id: reservation.id,
     order: reservation.order,
     ...entry,
     cliInput: {
-      content: entry.cliInput.content,
+      content: frozenInput.content,
       ...(acceptedCodexAppInput ? { codexAppInput: acceptedCodexAppInput } : {}),
+      ...(frozenInput.linkRefs ? { linkRefs: frozenInput.linkRefs } : {}),
       // R5-B1-2: preserve the frozen steer authorization across the tail rebuild
       // (only `=== true`, never truthy). Dropping it here silently un-authorized
       // every queued/opening turn — the strip point that defeated the R4 fix.
-      ...(entry.cliInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
-      ...(entry.cliInput.trustedCaller ? { trustedCaller: entry.cliInput.trustedCaller } : {}),
-      ...(entry.cliInput.trustedController ? { trustedController: entry.cliInput.trustedController } : {}),
+      ...(frozenInput.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
+      ...(frozenInput.trustedCaller ? { trustedCaller: frozenInput.trustedCaller } : {}),
+      ...(frozenInput.trustedController ? { trustedController: frozenInput.trustedController } : {}),
     },
   };
   const priorTail = ds.session.queuedActivationTail;
@@ -12400,6 +14719,9 @@ export type ForkResumeOrTurnId = boolean | string | {
   remoteResumeMode?: 'reattach' | 'rebuild';
   turnId?: string;
   dispatchAttempt?: number;
+  /** The opening prompt is a claimed durable-primary Inbox row and must ACK
+   * only after the adapter/provider proves submission. */
+  durablePrimaryInbox?: true;
   /** The payload is an exact retained activation journal. Do not re-read the
    * live clean-input feature flag on retry/replay. */
   codexAppInputGateFrozen?: boolean;
@@ -12429,6 +14751,7 @@ export interface WorkerAdmissionBlockedNotice {
   turnId?: string;
 }
 export type ForkWorkerOptions = {
+  deploymentContinuation?: import('../services/deployment-continuation.js').DeploymentContinuation;
   onAdmission?: (admission: WorkerForkAdmission) => void;
   /** Replace the direct provider reply when the caller owns a durable output lane. */
   onAdmissionBlocked?: (notice: WorkerAdmissionBlockedNotice) => void;
@@ -12436,8 +14759,14 @@ export type ForkWorkerOptions = {
   onPreReadyExit?: () => void;
   /** Called once when an admitted Remote Runner worker survives startup but
    * its backend exits before publishing the rebuilt backend state. */
-  onRemoteBackendStartupExit?: () => boolean;
+  onRemoteBackendStartupExit?: () => boolean | Promise<boolean>;
   deferDuringDeviceIsolation?: boolean;
+  /**
+   * Restore re-attach to a backing session probed alive: its CLI is already
+   * running and will not be respawned, so a deleted working directory does not
+   * refuse the fork (the worker process itself starts in $HOME instead).
+   */
+  reattachLiveBackend?: boolean;
   /**
    * Internal: this call is the single re-entry after a marginal-admission
    * reclaim+recheck. A still-blocked decision is rejected immediately instead
@@ -12478,7 +14807,7 @@ const marginalAdmissionRetries = new WeakMap<DaemonSession, Promise<import('./ad
  * screenshot_uploaded, crash diagnostic park, limited→idle recovery) so the TTL
  * clock cannot be missed.
  */
-function stampIdleSinceAt(
+export function stampIdleSinceAt(
   ds: DaemonSession,
   prev: DaemonSession['lastScreenStatus'],
   now: number = Date.now(),
@@ -12487,6 +14816,19 @@ function stampIdleSinceAt(
     if (prev !== 'idle') ds.idleSinceAt = now;
   } else if (ds.idleSinceAt !== undefined) {
     ds.idleSinceAt = undefined;
+  }
+  const busy = BUSY_RUNTIME_STATUSES.has(ds.lastScreenStatus ?? '');
+  if (busy && !BUSY_RUNTIME_STATUSES.has(prev ?? '')) ds.busySinceAt = now;
+  else if (!busy) ds.busySinceAt = undefined;
+  // A prompt-cache keep-alive's own busy period is not activity: restore the
+  // idle stretch's original start so idleSuspendMinutes keeps counting.
+  notePromptCacheKeepaliveScreenStatus(ds, prev, now);
+  // Idle auto-compact stretch bookkeeping (after the keep-alive restore so a
+  // keep-alive never looks like a new stretch). Persisted only while opted in.
+  if (noteIdleAutoCompactScreenStatus(ds, prev, now)) {
+    try { sessionStore.updateSession(ds.session); } catch (err) {
+      logger.warn(`[${ds.session.sessionId.slice(0, 8)}] idle auto-compact state save failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 }
 
@@ -12595,7 +14937,7 @@ export function freezeSessionSandboxDecision(
 ): void {
   if (ds.session.sandbox !== undefined) return;
   if (!opts.resume) {
-    const resolved = botCfg.readIsolation === true ? 'oncall' : normalizeSandboxMode(botCfg.sandbox);
+    const resolved = botConfigSandboxMode(botCfg);
     ds.session.sandbox = resolved === 'scratch' ? 'scratch' : resolved === 'oncall' ? true : false;
     ds.session.sandboxPaths = botCfg.sandboxPaths;
     ds.session.sandboxHidePaths = botCfg.sandboxHidePaths ?? [];
@@ -12629,18 +14971,523 @@ export function freezeSessionSandboxDecision(
  * staged behind an ACK, routed through a live owner, or spawn-deferred during
  * device isolation — returns `true`.
  */
+interface PendingProtectedHttpEgressFork {
+  pluginId: string;
+  policyDigest: string;
+  abortCleanupPending?: boolean;
+  abortCleanupError?: unknown;
+  retryAbortCleanup?: () => boolean;
+  waiters: Array<{
+    resumeOrTurnId: ForkResumeOrTurnId;
+    opts: ForkWorkerOptions;
+    queuedActivationTailId?: string;
+  }>;
+}
+
+const pendingProtectedHttpEgressForks = new Map<string, PendingProtectedHttpEgressFork>();
+
+function protectedHttpEgressForkTurn(
+  resumeOrTurnId: ForkResumeOrTurnId,
+): { turnId?: string; dispatchAttempt?: number } {
+  if (typeof resumeOrTurnId === 'string') return { turnId: resumeOrTurnId };
+  if (typeof resumeOrTurnId !== 'object' || resumeOrTurnId === null) return {};
+  return {
+    ...(resumeOrTurnId.turnId ? { turnId: resumeOrTurnId.turnId } : {}),
+    ...(resumeOrTurnId.dispatchAttempt !== undefined
+      ? { dispatchAttempt: resumeOrTurnId.dispatchAttempt }
+      : {}),
+  };
+}
+
+function protectedHttpEgressForkIsResume(resumeOrTurnId: ForkResumeOrTurnId): boolean {
+  if (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null) {
+    return resumeOrTurnId.resume === true;
+  }
+  return resumeOrTurnId === true;
+}
+
+function freezeSessionProtectedHttpEgressPolicy(
+  ds: DaemonSession,
+  policy: ProtectedHttpEgressWorkerPolicy | undefined,
+): ProtectedHttpEgressWorkerPolicy | undefined {
+  if (ds.session.protectedHttpEgressPolicy !== undefined) {
+    return ds.session.protectedHttpEgressPolicy ?? undefined;
+  }
+  const candidate = policy ? structuredClone(policy) : null;
+  ds.session.protectedHttpEgressPolicy = candidate;
+  try {
+    sessionStore.updateSession(ds.session);
+  } catch (error) {
+    if (ds.session.protectedHttpEgressPolicy === candidate) {
+      let durablePolicy: DaemonSession['session']['protectedHttpEgressPolicy'];
+      try {
+        durablePolicy = sessionStore.getSessionFresh(ds.session.sessionId)
+          ?.protectedHttpEgressPolicy;
+      } catch {
+        durablePolicy = undefined;
+      }
+      if (durablePolicy !== undefined) {
+        ds.session.protectedHttpEgressPolicy = durablePolicy === null
+          ? null
+          : structuredClone(durablePolicy);
+      } else {
+        delete ds.session.protectedHttpEgressPolicy;
+      }
+    }
+    throw error;
+  }
+  return ds.session.protectedHttpEgressPolicy ?? undefined;
+}
+
+function reportProtectedHttpEgressForkFailure(
+  ds: DaemonSession,
+  bot: ReturnType<typeof getBot>,
+  resumeOrTurnId: ForkResumeOrTurnId,
+  opts: ForkWorkerOptions,
+  error: unknown,
+  phase: 'dns' | 'preparation',
+  reportAdmission = true,
+): void {
+  const rawReason = error instanceof Error ? error.message : String(error);
+  const reason = phase === 'preparation'
+    ? `Worker preparation failed after protected egress freeze: ${rawReason}`
+    : rawReason;
+  logger.error(phase === 'preparation'
+    ? `[${tag(ds)}] Worker preparation after protected HTTP egress freeze failed: ${rawReason}`
+    : `[${tag(ds)}] Protected HTTP egress target freeze failed: ${rawReason}`);
+  if (canForkRegisteredSession(ds)) {
+    const { turnId, dispatchAttempt } = protectedHttpEgressForkTurn(resumeOrTurnId);
+    const blockedTurnId = fallbackTurnId(ds, turnId);
+    const message = startupFailureNotice(
+      ds,
+      sessionCliDisplayName(ds, bot.config),
+      reason,
+      botLocale(bot.config),
+    );
+    emitSessionLifecycleHook(ds, 'session.requires_attention', {
+      reason: 'worker_fork_error',
+      message: reason,
+    });
+    if (opts.onAdmissionBlocked) {
+      opts.onAdmissionBlocked({
+        content: message,
+        ...(blockedTurnId === undefined ? {} : { turnId: blockedTurnId }),
+      });
+    } else {
+      const meetingDriven = !!ds.session.vcMeetingReceiver
+        && (dispatchAttempt !== undefined
+          || resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined);
+      if (meetingDriven || isSilentScheduledTurn(ds, turnId)) {
+        logger.info(
+          `[${tag(ds)}] Managed/silent protected egress ${phase} failure kept out of auxiliary Lark UI: ${rawReason}`,
+        );
+      } else {
+        const cb = requireCallbacks();
+        void cb.sessionReply(
+          sessionAnchorId(ds),
+          message,
+          'text',
+          ds.larkAppId,
+          blockedTurnId,
+          { sourceSessionId: ds.session.sessionId },
+        ).catch(replyError => logger.error(
+          `[${tag(ds)}] Failed to report protected egress ${phase} failure: `
+          + `${replyError instanceof Error ? replyError.message : String(replyError)}`,
+        ));
+      }
+    }
+  }
+  if (reportAdmission) opts.onAdmission?.('rejected');
+}
+
+function reportProtectedHttpEgressAbortCleanupFailure(
+  ds: DaemonSession,
+  bot: ReturnType<typeof getBot>,
+  waiters: PendingProtectedHttpEgressFork['waiters'],
+  error: unknown,
+  opts: { rejectAdmissions?: boolean } = {},
+): void {
+  const rawReason = error instanceof Error ? error.message : String(error);
+  const reason = `Protected egress follower cleanup persistence failed: ${rawReason}`;
+  logger.error(
+    `[${tag(ds)}] Protected HTTP egress follower cleanup persistence failed; `
+    + `admission remains blocked: ${rawReason}`,
+  );
+  if (canForkRegisteredSession(ds)) {
+    emitSessionLifecycleHook(ds, 'session.requires_attention', {
+      reason: 'worker_fork_error',
+      message: reason,
+    });
+    for (const waiter of waiters) {
+      const { turnId, dispatchAttempt } = protectedHttpEgressForkTurn(waiter.resumeOrTurnId);
+      const blockedTurnId = fallbackTurnId(ds, turnId);
+      const message = startupFailureNotice(
+        ds,
+        sessionCliDisplayName(ds, bot.config),
+        reason,
+        botLocale(bot.config),
+      );
+      if (waiter.opts.onAdmissionBlocked) {
+        waiter.opts.onAdmissionBlocked({
+          content: message,
+          ...(blockedTurnId === undefined ? {} : { turnId: blockedTurnId }),
+        });
+      } else {
+        const meetingDriven = !!ds.session.vcMeetingReceiver
+          && (dispatchAttempt !== undefined
+            || resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined);
+        if (meetingDriven || isSilentScheduledTurn(ds, turnId)) {
+          logger.info(
+            `[${tag(ds)}] Managed/silent protected egress cleanup persistence failure kept out `
+            + `of auxiliary Lark UI: ${rawReason}`,
+          );
+        } else {
+          const cb = requireCallbacks();
+          void cb.sessionReply(
+            sessionAnchorId(ds),
+            message,
+            'text',
+            ds.larkAppId,
+            blockedTurnId,
+            { sourceSessionId: ds.session.sessionId },
+          ).catch(replyError => logger.error(
+            `[${tag(ds)}] Failed to report protected egress cleanup persistence failure: `
+            + `${replyError instanceof Error ? replyError.message : String(replyError)}`,
+          ));
+        }
+      }
+      if (opts.rejectAdmissions) waiter.opts.onAdmission?.('rejected');
+    }
+  } else if (opts.rejectAdmissions) {
+    for (const waiter of waiters) waiter.opts.onAdmission?.('rejected');
+  }
+}
+
+function queueBehindPendingProtectedHttpEgressFork(
+  pending: PendingProtectedHttpEgressFork,
+  ds: DaemonSession,
+  promptInput: string | CliTurnPayload,
+  resumeOrTurnId: ForkResumeOrTurnId,
+  opts: ForkWorkerOptions,
+): boolean {
+  const payload = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
+  const { turnId, dispatchAttempt } = protectedHttpEgressForkTurn(resumeOrTurnId);
+  let queuedActivationTailId: string | undefined;
+  if (payload.content.length > 0) {
+    const queuedTurnId = turnId ?? `queued-protected-egress-${randomUUID()}`;
+    const trustedCaller = payload.trustedCaller
+      ?? (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.trustedCaller
+        : undefined);
+    const trustedController = trustedSessionController(ds);
+    try {
+      const admitted = admitQueuedActivationTail(ds, {
+        userPrompt: payload.content,
+        cliInput: {
+          content: payload.content,
+          ...(payload.codexAppInput ? { codexAppInput: payload.codexAppInput } : {}),
+          ...(payload.linkRefs ? { linkRefs: payload.linkRefs } : {}),
+          ...(payload.codexAppSteerable === true ? { codexAppSteerable: true as const } : {}),
+          ...(trustedCaller ? { trustedCaller } : {}),
+          ...(trustedController ? { trustedController } : {}),
+        },
+        turnId: queuedTurnId,
+        ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      }, undefined, {
+        codexAppInputGateFrozen: typeof resumeOrTurnId === 'object'
+          && resumeOrTurnId !== null
+          && resumeOrTurnId.codexAppInputGateFrozen === true,
+      });
+      queuedActivationTailId = admitted.id;
+    } catch (error) {
+      logger.error(
+        `[${tag(ds)}] Failed to durably queue input behind protected egress DNS freeze: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+      opts.onAdmission?.('rejected');
+      return true;
+    }
+  }
+  pending.waiters.push({ resumeOrTurnId, opts, queuedActivationTailId });
+  opts.onAdmission?.('deferred');
+  return true;
+}
+
 export function forkWorker(
   ds: DaemonSession,
   promptInput: string | CliTurnPayload,
   resumeOrTurnId: ForkResumeOrTurnId = false,
   opts: ForkWorkerOptions = {},
 ): boolean {
+  if (feedbackMaintenanceActive(config.session.dataDir)) {
+    opts.onAdmission?.('rejected');
+    return false;
+  }
+  // Preserve the original first external fork boundary before asynchronous DNS
+  // freezing. Device activation must be able to defer a spawn without reading
+  // live Bot/plugin configuration or starting any resolver work. The prepared
+  // continuation repeats this gate after DNS so a freeze that begins while the
+  // lease is inactive still cannot race a newly-started activation.
+  if (opts.deferDuringDeviceIsolation === false && currentDeviceIsolationFreezeLease()) {
+    logger.info(`[${tag(ds)}] worker spawn left retryable during device credential activation`);
+    opts.onAdmission?.('rejected');
+    return true;
+  }
+  if (deferWorkerSpawnDuringDeviceIsolation(ds.session.sessionId, () => {
+    if (findActiveBySessionId(ds.session.sessionId) === ds) {
+      forkWorker(ds, promptInput, resumeOrTurnId);
+    }
+  })) {
+    logger.info(`[${tag(ds)}] worker spawn deferred during device credential activation`);
+    opts.onAdmission?.('deferred');
+    return true;
+  }
+
+  const bot = getBot(ds.larkAppId);
+  let pending = pendingProtectedHttpEgressForks.get(ds.session.sessionId);
+  if (pending?.abortCleanupPending) {
+    const cleanupRetried = pending.retryAbortCleanup?.() === true;
+    if (!cleanupRetried) {
+      reportProtectedHttpEgressAbortCleanupFailure(
+        ds,
+        bot,
+        [{ resumeOrTurnId, opts }],
+        pending.abortCleanupError ?? new Error('protected egress cleanup retry unavailable'),
+        { rejectAdmissions: true },
+      );
+      return true;
+    }
+    pending = undefined;
+  }
+  const frozenSessionPolicy = ds.session.protectedHttpEgressPolicy;
+  if (frozenSessionPolicy !== undefined) {
+    if (pending) {
+      if (frozenSessionPolicy === null
+        || pending.pluginId !== frozenSessionPolicy.pluginId
+        || pending.policyDigest !== frozenSessionPolicy.policyDigest) {
+        throw new Error('protected_http_egress_policy_changed_during_freeze');
+      }
+      return queueBehindPendingProtectedHttpEgressFork(
+        pending,
+        ds,
+        promptInput,
+        resumeOrTurnId,
+        opts,
+      );
+    }
+    return forkWorkerPrepared(
+      ds,
+      promptInput,
+      resumeOrTurnId,
+      opts,
+      frozenSessionPolicy ?? undefined,
+      bot,
+    );
+  }
+  if (protectedHttpEgressForkIsResume(resumeOrTurnId)) {
+    // A resume shares an opening that is still freezing its DNS targets. Only
+    // a legacy session without a pending opening may freeze policy absence;
+    // re-reading live plugin config here would replace the opening's snapshot.
+    if (pending) {
+      return queueBehindPendingProtectedHttpEgressFork(
+        pending,
+        ds,
+        promptInput,
+        resumeOrTurnId,
+        opts,
+      );
+    }
+    return forkWorkerPrepared(ds, promptInput, resumeOrTurnId, opts, undefined, bot);
+  }
+
+  const globalConfig = readGlobalConfig();
+  const collected = collectProtectedHttpEgressPolicies(
+    resolveEffectivePluginIds(bot.config, globalConfig),
+  );
+  if (collected.length > 1) throw new Error('multiple_protected_http_egress_policies');
+  if (collected.length === 0) {
+    if (pending) throw new Error('protected_http_egress_policy_changed_during_freeze');
+    return forkWorkerPrepared(ds, promptInput, resumeOrTurnId, opts, undefined, bot);
+  }
+
+  const collectedPolicy = collected[0]!;
+  if (pending) {
+    if (pending.pluginId !== collectedPolicy.pluginId
+      || pending.policyDigest !== collectedPolicy.policyDigest) {
+      throw new Error('protected_http_egress_policy_changed_during_freeze');
+    }
+    return queueBehindPendingProtectedHttpEgressFork(
+      pending,
+      ds,
+      promptInput,
+      resumeOrTurnId,
+      opts,
+    );
+  }
+  const activePending: PendingProtectedHttpEgressFork = {
+    pluginId: collectedPolicy.pluginId,
+    policyDigest: collectedPolicy.policyDigest,
+    waiters: [],
+  };
+  pendingProtectedHttpEgressForks.set(ds.session.sessionId, activePending);
+  let activePendingSettled = false;
+  const clearActivePending = () => {
+    if (pendingProtectedHttpEgressForks.get(ds.session.sessionId) === activePending) {
+      pendingProtectedHttpEgressForks.delete(ds.session.sessionId);
+    }
+  };
+  const abortActivePending = (): boolean => {
+    if (activePendingSettled) return true;
+    const queuedTailIds = new Set(activePending.waiters.flatMap(waiter =>
+      waiter.queuedActivationTailId ? [waiter.queuedActivationTailId] : []));
+    if (queuedTailIds.size > 0) {
+      const priorTail = ds.session.queuedActivationTail;
+      const retainedTail = (ds.session.queuedActivationTail ?? [])
+        .filter(entry => !queuedTailIds.has(entry.id));
+      ds.session.queuedActivationTail = retainedTail.length > 0 ? retainedTail : undefined;
+      try {
+        sessionStore.updateSession(ds.session);
+      } catch (error) {
+        ds.session.queuedActivationTail = priorTail;
+        const firstFailure = activePending.abortCleanupPending !== true;
+        activePending.abortCleanupPending = true;
+        activePending.abortCleanupError = error;
+        if (firstFailure) {
+          reportProtectedHttpEgressAbortCleanupFailure(ds, bot, activePending.waiters, error);
+        } else {
+          logger.error(
+            `[${tag(ds)}] Protected HTTP egress follower cleanup persistence retry failed; `
+            + `admission remains blocked: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+        return false;
+      }
+    }
+    activePendingSettled = true;
+    activePending.abortCleanupPending = undefined;
+    activePending.abortCleanupError = undefined;
+    clearActivePending();
+    for (const waiter of activePending.waiters) {
+      waiter.opts.onAdmission?.('rejected');
+    }
+    return true;
+  };
+  activePending.retryAbortCleanup = abortActivePending;
+  const failActivePending = (
+    error: unknown,
+    phase: 'dns' | 'preparation',
+  ): void => {
+    const waiters = [...activePending.waiters];
+    const cleaned = abortActivePending();
+    reportProtectedHttpEgressForkFailure(
+      ds,
+      bot,
+      resumeOrTurnId,
+      opts,
+      error,
+      phase,
+    );
+    if (!cleaned) return;
+    for (const waiter of waiters) {
+      reportProtectedHttpEgressForkFailure(
+        ds,
+        bot,
+        waiter.resumeOrTurnId,
+        waiter.opts,
+        error,
+        phase,
+        false,
+      );
+    }
+  };
+  void resolveProtectedHttpEgressTargets(collectedPolicy.policy).then(
+    frozenAddresses => {
+      const policy: ProtectedHttpEgressWorkerPolicy = {
+        ...collectedPolicy,
+        frozenAddresses,
+      };
+      try {
+        const started = forkWorkerPrepared(
+          ds,
+          promptInput,
+          resumeOrTurnId,
+          opts,
+          policy,
+          bot,
+        );
+        if (started) {
+          const worker = ds.worker;
+          const promoteAfterOpeningInit = () => {
+            if (activePendingSettled) return;
+            activePendingSettled = true;
+            const waiters = [...activePending.waiters];
+            // Admission callbacks may synchronously admit another turn. It
+            // belongs to the live worker's ordinary FIFO, not this already
+            // settled DNS opening or its one-time promotion decision.
+            clearActivePending();
+            try {
+              const promoted = !waiters.some(waiter => waiter.queuedActivationTailId)
+                || promoteQueuedActivationTail(ds);
+              for (const waiter of waiters) {
+                waiter.opts.onAdmission?.(!waiter.queuedActivationTailId || promoted
+                  ? 'accepted' : 'rejected');
+              }
+            } catch (error) {
+              logger.error(
+                `[${tag(ds)}] Failed to promote protected egress DNS waiters after opening init: `
+                + `${error instanceof Error ? error.message : String(error)}`,
+              );
+              for (const waiter of waiters) {
+                waiter.opts.onAdmission?.(waiter.queuedActivationTailId ? 'rejected' : 'accepted');
+              }
+            }
+          };
+          if (!worker || !afterWorkerIpcBootstrap(
+            worker,
+            promoteAfterOpeningInit,
+            abortActivePending,
+          )) {
+            abortActivePending();
+          }
+        } else if (!started) {
+          abortActivePending();
+        }
+      } catch (error) {
+        failActivePending(error, 'preparation');
+      }
+    },
+    error => {
+      failActivePending(error, 'dns');
+    },
+  );
+  return true;
+}
+
+function forkWorkerPrepared(
+  ds: DaemonSession,
+  promptInput: string | CliTurnPayload,
+  resumeOrTurnId: ForkResumeOrTurnId = false,
+  opts: ForkWorkerOptions = {},
+  protectedHttpEgressPolicy?: ProtectedHttpEgressWorkerPolicy,
+  preparedBot?: ReturnType<typeof getBot>,
+): boolean {
+  if (feedbackMaintenanceActive(config.session.dataDir)) {
+    opts.onAdmission?.('rejected');
+    return false;
+  }
   let admissionReported = false;
   const reportAdmission = (admission: WorkerForkAdmission): void => {
     if (admissionReported) return;
     admissionReported = true;
     opts.onAdmission?.(admission);
   };
+  const continuationStillAllowed = (): boolean => {
+    const claim = opts.deploymentContinuation;
+    return !claim || (deploymentContinuationClaimCurrent(ds.session, claim)
+      && canTalk(ds.larkAppId, ds.chatId, claim.caller.requestUserOpenId, undefined,
+        claim.caller.requestUserUnionId, ds.chatType));
+  };
+  if (!continuationStillAllowed()) { reportAdmission('rejected'); return false; }
   const gatedPrompt = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
   const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
   if (remoteRetirementPhase) {
@@ -12657,10 +15504,14 @@ export function forkWorker(
       const gatedDispatchAttempt = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
         ? resumeOrTurnId.dispatchAttempt
         : undefined;
+      const gatedDurablePrimaryInbox = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.durablePrimaryInbox
+        : undefined;
       sendWorkerInput(ds, promptInput, gatedTurnId, {
         ...(gatedDispatchAttempt !== undefined
           ? { dispatchAttempt: gatedDispatchAttempt }
           : {}),
+        ...(gatedDurablePrimaryInbox ? { durablePrimaryInbox: true as const } : {}),
         ...(gatedPrompt.codexAppSteerable === true
           ? { codexAppSteerable: true as const }
           : {}),
@@ -12685,6 +15536,9 @@ export function forkWorker(
       const gatedDispatchAttempt = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
         ? resumeOrTurnId.dispatchAttempt
         : undefined;
+      const gatedDurablePrimaryInbox = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+        ? resumeOrTurnId.durablePrimaryInbox
+        : undefined;
       const gatedAtMostOnce = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
         ? resumeOrTurnId.atMostOnce
         : undefined;
@@ -12696,6 +15550,7 @@ export function forkWorker(
         ...(gatedDispatchAttempt !== undefined
           ? { dispatchAttempt: gatedDispatchAttempt }
           : {}),
+        ...(gatedDurablePrimaryInbox ? { durablePrimaryInbox: true as const } : {}),
         // R6-B3 (transfer-gate sibling): sendWorkerInput reads steer
         // authorization from OPTS, not the payload. A steerable opening/refork
         // rerouted through the transfer gate must carry the flag here too, or it
@@ -12741,6 +15596,8 @@ export function forkWorker(
   }
   if (deferWorkerSpawnDuringDeviceIsolation(ds.session.sessionId, () => {
     if (findActiveBySessionId(ds.session.sessionId) === ds) {
+      // Deliberately do not replay opts.deploymentContinuation: a deferred
+      // device-isolation spawn cannot carry an earlier claim into a new owner.
       forkWorker(ds, promptInput, resumeOrTurnId);
     }
   })) {
@@ -12767,7 +15624,7 @@ export function forkWorker(
     return false;
   }
 
-  const promptPayload = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
+  let promptPayload = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
   // Re-read after the group background is committed at the real execution
   // boundary below (after every defer/queue/admission return).
   let prompt = promptPayload.content;
@@ -12781,6 +15638,7 @@ export function forkWorker(
   let remoteResumeMode: 'reattach' | 'rebuild' | undefined;
   let initTurnId: string | undefined;
   let initDispatchAttempt: number | undefined;
+  let initDurablePrimaryInbox: true | undefined;
   let restartAttemptId: string | undefined;
   let initCodexAppInputGateFrozen = promptInput === ds.session.queuedActivationInput;
   let initAtMostOnce: boolean | undefined;
@@ -12793,6 +15651,7 @@ export function forkWorker(
     remoteResumeMode = resumeOrTurnId.remoteResumeMode;
     initTurnId = resumeOrTurnId.turnId;
     initDispatchAttempt = resumeOrTurnId.dispatchAttempt;
+    initDurablePrimaryInbox = resumeOrTurnId.durablePrimaryInbox;
     restartAttemptId = resumeOrTurnId.restartAttemptId;
     initCodexAppInputGateFrozen ||= resumeOrTurnId.codexAppInputGateFrozen === true;
     initAtMostOnce = resumeOrTurnId.atMostOnce;
@@ -12801,6 +15660,7 @@ export function forkWorker(
   } else {
     resume = resumeOrTurnId;
   }
+  if (prompt.length > 0) cancelDeploymentContinuation(ds.session, previous => sessionStore.updateDeploymentContinuation(ds.session, previous));
   const initTrustedCaller = promptPayload.trustedCaller
     ?? (typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
       ? resumeOrTurnId.trustedCaller
@@ -12835,6 +15695,7 @@ export function forkWorker(
           ...(promptPayload.codexAppInput
             ? { codexAppInput: promptPayload.codexAppInput }
             : {}),
+          ...(promptPayload.linkRefs ? { linkRefs: promptPayload.linkRefs } : {}),
           // R5-B1-2: preserve the frozen steer authorization on the double-fork
           // staged tail entry (only `=== true`).
           ...(initCodexAppSteerable ? { codexAppSteerable: true as const } : {}),
@@ -12864,6 +15725,7 @@ export function forkWorker(
     }
     const routed = sendWorkerInput(ds, promptPayload, initTurnId, {
       ...(initDispatchAttempt !== undefined ? { dispatchAttempt: initDispatchAttempt } : {}),
+      ...(initDurablePrimaryInbox ? { durablePrimaryInbox: true as const } : {}),
       // R6-B3: sendWorkerInput reads steer authorization from OPTS (not the
       // payload), so the direct-route double-fork (protected ownership, no
       // activation gate — e.g. only an unsettled ledger) must pass it through
@@ -12880,7 +15742,7 @@ export function forkWorker(
   }
 
   const cb = requireCallbacks();
-  const bot = getBot(ds.larkAppId);
+  const bot = preparedBot ?? getBot(ds.larkAppId);
   const botCfg = bot.config;
   const admission = checkWorkerAdmission(readGlobalConfig().worker);
   for (const warning of admission.pressure.warnings) {
@@ -12980,6 +15842,7 @@ export function forkWorker(
           if (prompt.length > 0) {
             const routed = sendWorkerInput(ds, promptPayload, initTurnId, {
               ...(initDispatchAttempt !== undefined ? { dispatchAttempt: initDispatchAttempt } : {}),
+              ...(initDurablePrimaryInbox ? { durablePrimaryInbox: true as const } : {}),
               ...(initCodexAppSteerable ? { codexAppSteerable: true as const } : {}),
               ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
               ...(initAtMostOnce ? { atMostOnce: true as const } : {}),
@@ -13101,6 +15964,7 @@ export function forkWorker(
   let agentCfg!: ReturnType<typeof sessionAgentConfig>;
   const t = tag(ds);
   ds.localProcessAttestation = undefined;
+  ds.protectedLoopbackProxyAttestation = undefined;
   try {
   // Per-turn authority is never inferred from mutable session state. Human
   // message routes pass their accepted Lark message id explicitly; restore,
@@ -13116,12 +15980,24 @@ export function forkWorker(
     ? frozenReplyContextForTurn(ds, initReplyTurnId)
     : undefined;
 
-  // A fork() whose cwd no longer exists emits an unhandled 'error' (spawn
-  // ENOENT) that crashes the WHOLE daemon (→ pm2 crash-loop). Fall back to
-  // home so a stale session workingDir can never take the daemon down.
+  // A session whose working directory is gone (a PR worktree removed after
+  // merge, say) must not start its CLI somewhere else: it would run in $HOME
+  // with none of the session's context. Refuse before any mutation below and
+  // let the chat offer recovery (rebuild the worktree / switch directories).
+  // Only re-attaching a backing session that is still alive goes ahead — that
+  // CLI keeps running where it was and is not respawned.
   const rawCwd = cb.getSessionWorkingDir(ds);
-  const cwd = rawCwd && existsSync(rawCwd) ? rawCwd : homedir();
-  if (cwd !== rawCwd) logger.warn(`[${t}] workingDir "${rawCwd}" does not exist — falling back to ${cwd}`);
+  const workingDirMissing = !!rawCwd && !existsSync(rawCwd);
+  if (workingDirMissing && !opts.reattachLiveBackend) {
+    logger.warn(`[${t}] workingDir "${rawCwd}" does not exist — refusing to start the CLI elsewhere`);
+    cb.onMissingWorkingDir?.(ds, rawCwd, { turnId: initAttributionTurnId });
+    throw new MissingWorkingDirError(rawCwd);
+  }
+  // A fork() whose cwd no longer exists emits an unhandled 'error' (spawn
+  // ENOENT) that crashes the WHOLE daemon (→ pm2 crash-loop), so the worker
+  // process of such a re-attach starts in home.
+  const cwd = rawCwd && !workingDirMissing ? rawCwd : homedir();
+  if (cwd !== rawCwd) logger.warn(`[${t}] workingDir "${rawCwd}" does not exist — re-attaching with the worker in ${cwd}`);
 
   // Materialise the resolved launch dir on the live session. getSessionWorkingDir()
   // falls back to the bot-default workingDir, but the usage ledger and dashboard read
@@ -13131,8 +16007,10 @@ export function forkWorker(
   // locate the CLI transcript, and the session's token usage silently never records.
   // Pinning the resolved cwd here (it equals what the worker actually forked into) closes
   // that gap without touching the persisted session.workingDir "unset = follow default"
-  // semantics: this is re-derived on every fork/restore.
-  ds.workingDir = cwd;
+  // semantics: this is re-derived on every fork/restore. A re-attach past a
+  // deleted directory keeps the real one, so the next cold start still sees
+  // it missing instead of inheriting the worker's $HOME.
+  if (!workingDirMissing) ds.workingDir = cwd;
 
   // Also persist the effective launch dir onto the SESSION record so a sibling
   // bot @-ed into the same anchor can inherit it (inherit-peer reads the
@@ -13152,6 +16030,17 @@ export function forkWorker(
     sessionStore.updateSession(ds.session);
   }
 
+  // Freeze the complete target-address policy (or its explicit absence) on
+  // the session after every side-effect-free refusal/defer gate, but before a
+  // worker generation is reserved or an existing worker can be terminated. A
+  // legacy resume reaches this point with no supplied policy and is durably
+  // marked null, so enabling a plugin later cannot retrofit restrictions onto
+  // its old backend.
+  protectedHttpEgressPolicy = freezeSessionProtectedHttpEgressPolicy(
+    ds,
+    protectedHttpEgressPolicy,
+  );
+
   // Sandbox decision is RECORDED ON THE SESSION at creation and reused on
   // restore — so toggling the live bot flag never retroactively (un)sandboxes a
   // historical session. A brand-new session (resume=false) with no recorded
@@ -13166,12 +16055,10 @@ export function forkWorker(
   // existing worker. A failed reservation leaves the old worker untouched;
   // a successful reservation immediately invalidates any late old-worker ACK.
   const workerGeneration = reserveWorkerGeneration(ds);
+  const protectedLoopbackProxyAttestation = protectedHttpEgressPolicy
+    ? { secret: randomBytes(32).toString('hex'), workerGeneration }
+    : undefined;
   bindPreparedGroupContextWorker(ds, initAttributionTurnId, workerGeneration);
-  // A fork carries the opening/queued input straight into the worker init, so
-  // this (past every XPI/defer/admission return, at the reserved generation)
-  // is its delivery boundary; sendWorkerInput is not on this path.
-  commitGroupContextDispatch(ds, promptPayload, initAttributionTurnId);
-  prompt = promptPayload.content;
   onWorkerGenerationReserved?.(workerGeneration);
   if (initAttributionTurnId?.startsWith('om_')) {
     ensurePrincipalLaneInboundTurnBinding(ds, initAttributionTurnId, workerGeneration);
@@ -13211,6 +16098,21 @@ export function forkWorker(
   if (!initTurnId && prompt.length > 0 && isCodexAppCliId(agentCfg.cliId)) {
     initAttributionTurnId = `codex-app-dispatch-${randomUUID()}`;
   }
+  // A fork carries the opening/queued input straight into worker init. Freeze
+  // the exact group background after every defer/refusal seam, then admit
+  // LinkRefs from that final payload immediately before irreversible
+  // child-launch preparation.
+  commitGroupContextDispatch(ds, promptPayload, initAttributionTurnId);
+  const admittedOpeningLinkRefs = prepareAdmittedLinkRefPayload({
+    ds,
+    payload: promptPayload,
+    turnId: initAttributionTurnId,
+    dispatchAttempt: initDispatchAttempt,
+  });
+  promptPayload = typeof promptInput === 'string'
+    ? admittedOpeningLinkRefs.payload
+    : freezeAdmittedPayloadInPlace(promptInput, admittedOpeningLinkRefs.payload);
+  prompt = promptPayload.content;
   ensureCliEnv(agentCfg.cliId, agentCfg.cliPathOverride, { configDir: agentCfg.cliConfigDir });
   let nativeSessionTitle: string | undefined;
   let nativeSessionTitlePrompt: string | undefined;
@@ -13273,6 +16175,7 @@ export function forkWorker(
     ds.session.backendType = resolvedBackendType;
     sessionStore.updateSession(ds.session);
   }
+  const initSessionEnv = resolveSessionEnvForSession(ds, botCfg, resolvedBackendType);
 
   // Prepend the botmux wrapper bin dir to PATH so CLIs can call `botmux send` etc.
   // Single source of truth (resolveBotmuxWrapperBinDir): core-only → dedicated
@@ -13282,7 +16185,31 @@ export function forkWorker(
   const botmuxBinDir = resolveBotmuxWrapperBinDir(process.env);
   const pathWithBotmux = prependBotmuxBin(botmuxBinDir, process.env.PATH);
 
-  const forkEnv = workerForkEnv(buildBotWorkerEnv(process.env, botCfg.envPolicy));
+  const globalConfig = readGlobalConfig();
+  const protectedMcpProvisioning = prepareProtectedMcpWorkerProvisioning(
+    resolveEffectivePluginIds(botCfg, globalConfig),
+    homedir(),
+    globalConfig.protectedMcpCapabilities,
+    protectedMcpContainmentConfigured({
+      platform: process.platform,
+      backendType: resolvedBackendType,
+      sandboxMode: frozenSessionSandboxMode(ds.session.sandbox),
+      networkPolicy: ds.session.sandboxNetworkPolicy,
+      protectedHttpEgressPolicy,
+      adopt: false,
+    }),
+    protectedHttpEgressPolicy,
+  );
+  // Rejected legacy env-source records grant no capability, but their safe
+  // names must also reach fork inheritance and the worker's child-env policy.
+  protectedMcpProvisioning.workerPolicy.redactEnv = protectedMcpCurrentRedactedEnvKeys(
+    globalConfig.protectedMcpCapabilities,
+    configuredProtectedMcpEnvKeys(),
+  );
+  const forkEnv = workerForkEnv(
+    buildBotWorkerEnv(process.env, botCfg.envPolicy, protectedMcpProvisioning.workerPolicy),
+    protectedMcpProvisioning.workerPolicy.redactEnv,
+  );
   // Dequeue only after every earlier launch-preparation write has finished.
   // The exact input remains journaled until the worker confirms its adapter
   // submission boundary; daemon send/ready are intentionally too early.
@@ -13354,9 +16281,13 @@ export function forkWorker(
     ds.session.queuedActivationInput = {
       content: prompt,
       ...(promptCodexAppInput ? { codexAppInput: promptCodexAppInput } : {}),
+      ...(promptPayload.linkRefs ? { linkRefs: promptPayload.linkRefs } : {}),
       // R4-B1: preserve the frozen steer authorization when re-parking N+1 behind
       // a recovery fork (COPY, never re-infer).
       ...(initCodexAppSteerable ? { codexAppSteerable: true } : {}),
+      ...(admittedOpeningLinkRefs.mode === 'disabled'
+        ? {}
+        : { linkRefMode: admittedOpeningLinkRefs.mode }),
       ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
       ...(initTrustedController ? { trustedController: initTrustedController } : {}),
     };
@@ -13391,6 +16322,9 @@ export function forkWorker(
           // accept-ledger entry so a recovered/opening first turn is steerable
           // exactly as the daemon admitted it (admission computed once; COPIED).
           ...(initCodexAppSteerable ? { codexAppSteerable: true } : {}),
+          ...(admittedOpeningLinkRefs.mode === 'disabled'
+            ? {}
+            : { linkRefMode: admittedOpeningLinkRefs.mode }),
         },
         initAttributionTurnId,
         initDispatchAttempt,
@@ -13432,6 +16366,7 @@ export function forkWorker(
       LARK_APP_SECRET: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     } as NodeJS.ProcessEnv,
   });
+  serveProtectedMcpSecrets(worker, protectedMcpProvisioning.secrets);
   spawnedWorker = worker;
   startupState = {
     ready: false, failureNotified: false,
@@ -13495,8 +16430,7 @@ export function forkWorker(
       );
       return;
     }
-    const cliName = sessionCliDisplayName(ds, botCfg);
-    const message = tr('worker.start_failed', { cliName, reason }, botLocale(botCfg));
+    const message = startupFailureNotice(ds, sessionCliDisplayName(ds, botCfg), reason, botLocale(botCfg));
     void cb.sessionReply(
       sessionAnchorId(ds),
       message,
@@ -13569,6 +16503,7 @@ export function forkWorker(
   initMsg = {
     type: 'init',
     sessionId: ds.session.sessionId,
+    ...(finalOutputHandoffSupported(ds) ? { finalOutputHandoff: { version: 2 as const, token: randomUUID(), admitNew: finalOutputHandoffAdmitNew(ds) } } : {}),
     chatId: ds.chatId,
     chatType: ds.chatType,
     rootMessageId: sessionAnchorId(ds),
@@ -13577,12 +16512,22 @@ export function forkWorker(
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
     cliConfigDir: agentCfg.cliConfigDir,
+    // Lets a startup-stall notice say "just upgraded to x.y.z".
+    cliUpgrade: recentCliUpgrade(runtimeInstallationKey({
+      cliId: agentCfg.cliId,
+      cliRuntime: agentCfg.cliRuntime,
+      cliPathOverride: agentCfg.cliPathOverride,
+    })),
     wrapperCli: agentCfg.wrapperCli,
     cliLaunchMode: agentCfg.cliLaunchMode,
     launchShell: agentCfg.launchShell,
     model: agentCfg.model,
+    traexAutoModel: agentCfg.traexAutoModel,
+    traexAutoModelRuntime: ds.session.traexAutoModelRuntime,
     modelBackendVariant: agentCfg.modelBackendVariant,
     reasoningEffort: agentCfg.reasoningEffort,
+    codexProfile: agentCfg.codexProfile,
+    codexProfileHome: agentCfg.codexProfileHome,
     serviceTier: agentCfg.serviceTier,
     // dsh runner turn timeout: read live from bot config so tuning bots.json
     // takes effect on the next worker fork without recreating the session.
@@ -13596,14 +16541,16 @@ export function forkWorker(
     // Codex App no-progress nudge tuning: read live from bot config so
     // /config set noProgressNotify takes effect on the next worker fork
     // without recreating the session (same pattern as turnTimeoutMs).
-    noProgressNotify: isCodexAppCliId(agentCfg.cliId) ? botCfg.noProgressNotify : undefined,
+    noProgressNotify: isCodexAppCliId(agentCfg.cliId) || agentCfg.cliId === 'codex' ? botCfg.noProgressNotify : undefined,
     codexBrowser: botCfg.codexBrowser,
     // Existing App Server attachment owns neither an app-server nor a JSON-RPC
     // input channel. It is a normal official remote TUI, so all user input goes
     // through its terminal and must never trigger BotMux's self-owned RPC engine.
-    codexRpcInput: existingAppServerEndpoint
-      ? false
-      : (botCfg.codexRpcInput === true && RPC_CAPABLE_CLIS.has(agentCfg.cliId)) || config.codexRpcInputDefault,
+    codexRpcInput: resolveCodexRpcInput(
+      agentCfg.cliId, botCfg.codexRpcInput, config.codexRpcInputDefault, existingAppServerEndpoint,
+      !ds.session.adoptedFrom && !agentCfg.wrapperCli && !agentCfg.cliLaunchMode
+        ? agentCfg.traexAutoModel : undefined,
+    ),
     ...(existingAppServerEndpoint ? { existingAppServerEndpoint } : {}),
     codexAuthSync: ds.session.cliInstanceBinding
       ? (ds.session.cliInstanceBinding.authMode === 'isolated' ? 'isolated' : 'shared')
@@ -13628,7 +16575,12 @@ export function forkWorker(
     // Per-bot env (bots.json `env`) — injected into the CLI process only (e.g.
     // ANTHROPIC_BASE_URL/AUTH_TOKEN for a GLM/3rd-party bot). Adopt sessions are
     // observed, not driven, so forkAdoptWorker intentionally omits it.
-    env: ds.session.cliLaunchSnapshot || ds.session.cliInstanceBinding ? undefined : botCfg.env,
+    // Session environment overlay (global layer → bot layer, core/session-env.ts)
+    // composed for THIS session; /cli-selected and Codex-instance-bound sessions
+    // keep receiving no bot `env`, only removals.
+    env: initSessionEnv.env,
+    envUnset: initSessionEnv.envUnset,
+    envFingerprint: initSessionEnv.fingerprint,
     envPolicy: botCfg.envPolicy,
     // Freeze the normalized sparse reply style at worker spawn. Both the
     // session-rendered botmux-send guide and the CLI card renderer consume the
@@ -13683,7 +16635,7 @@ export function forkWorker(
     // the real persistent pane (the stamp is written below; restore reads it via
     // getSessionPersistentBackendType). A brand-new session (no stamp) resolves
     // from live config, so a dashboard backend switch only affects NEW sessions.
-    backendType: resolvePairedSpawnBackendType(agentCfg.cliId, ds.session.backendType, botCfg.backendType, config.daemon.backendType),
+    backendType: resolvedBackendType,
     // Shared Herdr is not derivable from sessionId: preserve the exact host +
     // managed-agent affinity across daemon/worker replacement.
     persistentBackendTarget: ds.session.persistentBackendTarget,
@@ -13700,7 +16652,11 @@ export function forkWorker(
       ? botCfg.remoteRunner
       : botCfg.backendType === 'mojo' || agentCfg.cliId === 'mojo'
         ? sessionMojoConfig(ds, botCfg, { freeze: true }).config
-        : botCfg.riff,
+        // Decide herdr from the resolved backend: it can come from the session
+        // stamp or the daemon-wide BACKEND_TYPE, not only the bot's own field.
+        : resolvedBackendType === 'herdr'
+          ? resolveHerdrBackendConfig(config.daemon.herdr, botCfg.herdr)
+          : botCfg.riff,
     remoteBackendState: ds.session.remoteBackendState,
     ...(remoteResumeMode ? { remoteResumeMode } : {}),
     riffParentTaskId: ds.session.riffParentTaskId,
@@ -13710,6 +16666,9 @@ export function forkWorker(
     ...(nativeSessionTitlePrompt ? { nativeSessionTitlePrompt } : {}),
     prompt,
     ...(promptCodexAppInput ? { promptCodexAppInput } : {}),
+    ...(admittedOpeningLinkRefs.mode === 'disabled'
+      ? {}
+      : { linkRefMode: admittedOpeningLinkRefs.mode }),
     ...(queuedActivationToken ? { queuedActivationToken } : {}),
     resume,
     // One-shot native fork intent (see Session.pendingForkSession). Only the
@@ -13733,8 +16692,31 @@ export function forkWorker(
     // injectsSessionContext 适配器选系统提示措辞；solo 由 daemon 在 fork 前按轮算好
     // 写在 ds 上（resolveSoloSessionForTurn），缺省非 solo。
     replyDelivery: effectiveReplyDelivery(botCfg.larkAppId, agentCfg.cliId, sessionPromptInjection(ds)),
+    // 实验性、默认关闭：只有显式 true 才下发，worker 读不到即保持旧的失败通知。
+    // adopt init 不带它：adopt 的失败兜底本就由 adoptMode 门禁抑制。
+    ...(botCfg.suppressDeliveredFinalFailureNotice === true ? { suppressDeliveredFinalFailureNotice: true } : {}),
     promptInjection: sessionPromptInjection(ds),
+    // Claude Code prompt-cache lifetime (global promptCache ⊕ bot override),
+    // frozen at spawn; the adapter writes it into its process-level --settings.
+    ...(() => {
+      const ttl = agentCfg.cliId === 'claude-code' ? resolvedPromptCacheTtl(botCfg) : undefined;
+      return ttl ? { promptCacheTtl: ttl } : {};
+    })(),
     solo: ds.soloSession === true,
+    // Workflow node session (design 2026-11-03 §4.2): the worker exports the
+    // marker so its CLI system prompt and `botmux skill show` skip workflow.
+    // A main-topic handoff's marker (§5.5) leaves the ordinary session as is.
+    ...(isWorkflowNodeSessionMarker(ds.session.workflowNode) ? { workflowNodeSession: true as const } : {}),
+    // A workflow draft's clarify session (persisted on the session, so every
+    // fork — restore, resume, cold resume after an idle release — carries it):
+    // only its failed turns capture the provider's error and the screen tail.
+    // Once moved into its topic (拉群开始), the draft's panel no longer reads
+    // it: the session's chat is then the topic's, already when the transfer
+    // forks the topic's worker (before the binding is recorded, or if it never
+    // is), so the chat — not the binding record — decides.
+    ...(ds.session.headless?.failureDiagnostics === true && isHeadlessSessionChatId(ds.session.chatId)
+      ? { captureTurnFailureDiagnostics: true as const }
+      : {}),
     feedback: feedbackPolicy,
     terminalCardEpoch: ds.session.terminalCardEpoch,
     // Freeze the ACTUAL loaded bots-config path (getLoadedConfigPath) so a
@@ -13757,6 +16739,7 @@ export function forkWorker(
     turnId: initAttributionTurnId,
     ...(initReplyTurnId ? { replyTurnId: initReplyTurnId } : {}),
     dispatchAttempt: initDispatchAttempt,
+    ...(initDurablePrimaryInbox ? { durablePrimaryInbox: true as const } : {}),
     ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
     // R4-B1: COPY the frozen steer authorization onto the first-turn init so the
     // worker can fold follow-ups into this opening turn (canSteer requires the
@@ -13771,10 +16754,14 @@ export function forkWorker(
     // At-most-once (idempotency lease): ride the flag on the init message so the
     // worker tags the keyed init prompt no-replay (codex #776 round-7 #1).
     ...(initAtMostOnce ? { atMostOnce: true } : {}),
+    ...(opts.deploymentContinuation ? { deploymentContinuation: opts.deploymentContinuation } : {}),
     vcMeetingImTurnOrigin: initVcMeetingImTurnOrigin,
     ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
     ...(initTrustedController ? { trustedController: initTrustedController } : {}),
     pluginBindings: botCfg.plugins,
+    protectedMcpPolicy: protectedMcpProvisioning.workerPolicy,
+    protectedHttpEgressPolicy,
+    protectedLoopbackProxyAttestation,
     skillPolicy: botCfg.skills,
     ...(runtimeIdentity.status === 'known'
       ? { runnerBuildId: runtimeIdentity.id }
@@ -13833,6 +16820,7 @@ export function forkWorker(
   // refork, restore, cold resume, queued activation — clears it exactly once.
   ds.cliReady = false;
   ds.worker = worker;
+  ds.protectedLoopbackProxyAttestation = protectedLoopbackProxyAttestation;
   initializeWorkerIpcBootstrap(worker);
   rememberScheduledTurnCaller(ds, initAttributionTurnId, initTrustedCaller);
   {
@@ -13843,6 +16831,9 @@ export function forkWorker(
     sendOrdinaryImDeliveryTracked(ds, initMsg, onIpcDispatchAttempted);
   } else {
     afterWorkerIpcBootstrap(worker, () => {
+      // Bootstrap may wait while a human stops or supersedes the task. A blank
+      // worker can still serve that new input, but must not inherit the claim.
+      if (!continuationStillAllowed()) delete initMsg.deploymentContinuation;
       onIpcDispatchAttempted?.();
       worker.send(initMsg);
     });
@@ -13853,6 +16844,10 @@ export function forkWorker(
       ...(initDispatchAttempt !== undefined
         ? { dispatchAttempt: initDispatchAttempt }
         : {}),
+      input: {
+        cliInput: prompt,
+        ...(initTrustedCaller ? { trustedCaller: { ...initTrustedCaller } } : {}),
+      },
     });
   }
   ds.spawnedAt = Date.now();
@@ -13898,7 +16893,7 @@ export function forkWorker(
   // kills asynchronously and spawns the replacement synchronously.
   startNewGenerationEnvLedger(ds, initMsg.env);
   try {
-    sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
+    sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null, readWorkerProcessStart(worker.pid));
   } catch (err) {
     // Init may already be executing. PID bookkeeping failure must not turn an
     // accepted activation into a retryable error or orphan the attached child.
@@ -13965,6 +16960,7 @@ export function clearStuckWarningAuthority(ds: DaemonSession): void {
   ds.stuckWarningPageType = undefined;
   ds.stuckWarningProcessing = false;
   ds.stuckWarningCliLifetime = undefined;
+  ds.stuckWarningInitiatorOpenId = undefined;
 }
 
 /**
@@ -14064,31 +17060,6 @@ function isMeetingDrivenTurn(
   return resolveVcMeetingImTurnOrigin(ds.session, turnId) !== undefined;
 }
 
-function currentGatewayCallerOpenId(ds: DaemonSession, turnId: string): string | undefined {
-  // The daemon owns this per-turn sender map. The worker contributes only the
-  // turn id over private IPC; it can never choose which human that id denotes.
-  const replyTargetCaller = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
-  if (replyTargetCaller) return replyTargetCaller;
-  const recovered = ds.session.failedTurnRecovery;
-  if (recovered?.turnId === turnId && recovered.caller.requestLarkAppId === ds.larkAppId
-      && recovered.caller.senderType === 'user') return recovered.caller.requestUserOpenId;
-  const scheduledCaller = ds.scheduledTurnCallers?.get(turnId);
-  if (scheduledCaller) {
-    // The worker publishes the same turn more than once: first at init, then
-    // again after the CLI PID attestation exists. Keep the exact-turn caller
-    // until terminal/revoke/worker-exit so the second publication cannot
-    // overwrite a correctly-bound origin with an anonymous one.
-    return scheduledCaller.requestUserOpenId;
-  }
-  const continuation = ds.session.readonlyTaskContinuation;
-  return continuation?.authorizationMode === 'inherited'
-    && continuation.currentTurnId === turnId
-    && continuation.trustedCaller?.requestLarkAppId === ds.larkAppId
-    && continuation.trustedCaller.senderType === 'user'
-    ? continuation.trustedCaller.requestUserOpenId
-    : undefined;
-}
-
 function currentTurnProcessIdentities(
   ds: DaemonSession,
   turnId: string | undefined,
@@ -14106,6 +17077,18 @@ function currentTurnProcessIdentities(
     for (const identity of snapshot) identities.add(identity);
   }
   return [...identities].sort();
+}
+
+/** The PermissionRequest hook posts its card around the time Claude renders the
+ *  dialog, while the worker samples the screen every 2s: its notice can arrive
+ *  before the card is registered. */
+const PERMISSION_CARD_GRACE_MS = 3_000;
+
+/** The hook's allow/deny card for a Claude permission dialog, still unanswered. */
+function permissionCardPending(ds: DaemonSession): boolean {
+  return listPendingAsks().some(a => a.larkAppId === ds.larkAppId && a.sessionId === ds.session.sessionId
+    && a.originKind === 'hook' && a.questions.length === 1
+    && a.questions[0].options.map(o => o.key).join('\n') === `${PERMISSION_ALLOW_KEY}\n${PERMISSION_DENY_KEY}`);
 }
 
 function setupWorkerHandlers(
@@ -14126,6 +17109,12 @@ function setupWorkerHandlers(
     throw new Error('worker generation reservation changed before IPC setup');
   }
   ds.taskContinuationRpcProof = undefined;
+  // 新 Node worker 代次绑定即作废旧崩溃连胜：上一 worker 代次（OOM/管控死亡、
+  // 或 killWorker/retire 后由任务续跑/用户消息拉起的替代进程）锚定的 readyAt
+  // 不能连坐新一代——否则新 CLI 在旧 readyAt 的 60s 窗口内第一次永久退出
+  // （127/77）就会被直接熔断，连自己唯一的一次重启机会都拿不到。in-worker 的
+  // CLI 崩溃自动重启不换 worker、不经过这里，#2551 的快速退出循环熔断照常。
+  restartCounts.delete(ds.session.sessionId);
   // Tier authority belongs to this exact worker generation. Start unknown and
   // wait for the new worker's rollout-bound observation; this also clears a
   // Codex badge before a role switch starts a non-Codex worker.
@@ -14137,6 +17126,7 @@ function setupWorkerHandlers(
   // cannot leave a stale model/effort tail on the card.
   ds.activeModel = undefined;
   ds.activeReasoningEffort = undefined;
+  ds.activeModelBackendVariant = undefined;
   // The model-fallback notice is the ONE runtime fact a worker generation does
   // NOT own: it must survive every respawn and stay visible each round until
   // Claude is observed answering on a different model. Clearing it here and
@@ -14189,6 +17179,7 @@ function setupWorkerHandlers(
   if (ds.session.cliId === 'hermes' && ds.worker !== worker) {
     ds.hermesBridgeSourceSessionIds = undefined;
   }
+  let deferredScheduleIdleTurnId: string | undefined;
   // Worker messages without a turn of their own (first streaming card, crash
   // notices) anchor to the session's current reply-target turn so a shared
   // fold-back topic keeps them in-thread instead of leaking top-level.
@@ -14250,6 +17241,64 @@ function setupWorkerHandlers(
     if (isMeetingDrivenTurn(ds, turnId, dispatchAttempt)) return true;
     return ordinaryManagedSuppression(turnId, dispatchAttempt);
   };
+  // Opt-in, daemon-owned watchdog: it still ticks when the CLI/model stops
+  // producing events. Never run it for App, synthetic turns or silent listeners.
+  const cliNoticeEnabled = () => ds.session.cliId === 'codex'
+    && getBot(ds.larkAppId).config.noProgressNotify?.cliEnabled === true
+    && getBot(ds.larkAppId).config.noProgressNotify?.enabled !== false;
+  // A retiring owner may only finish known cards during its bounded drain.
+  // Never adopt old records on attach, or allow this lease to survive takeover.
+  let cliNoticeExitGeneration: number | undefined;
+  const ownsCliNoticeExitCleanup = () => cliNoticeExitGeneration !== undefined
+    && ds.worker === null && ds.workerGeneration === cliNoticeExitGeneration
+    && ds.session.workerGeneration === cliNoticeExitGeneration
+    && ds.session === handlerSession && ds.session.status === 'active'
+    && ds.larkAppId === handlerLarkAppId && sessionAnchorId(ds) === handlerAnchor
+    && !isSessionTransferring(ds)
+    && (!activeSessionsRegistry || activeSessionsRegistry.get(activeSessionKey(ds)) === ds);
+  const cliNotices = new CliProgressNotifier({
+    records: create => ds.session.cliProgressNotices ?? (create ? (ds.session.cliProgressNotices = []) : []),
+    now: Date.now,
+    persist: () => sessionStore.updateSession(ds.session),
+    allowed: r => (ownsLifecycleMutation() || (r.settled === true && ownsCliNoticeExitCleanup())) && cliNoticeEnabled()
+      && r.generation === workerGeneration
+      && !managedAuxUiSuppressed(r.turnId, r.attempt)
+      && !isSubstituteTurn(ds, r.turnId) && !privateReplyEnabled(ds.session)
+      && !isDocNativeSession(ds),
+    waiting: () => !!ds.agentAttention || !!ds.tuiPromptCardId
+      || listPendingAsks().some(a => a.larkAppId === ds.larkAppId && a.sessionId === ds.session.sessionId),
+    timeout: () => getBot(ds.larkAppId).config.noProgressNotify?.timeoutMs ?? 300_000,
+    send: (r, level, beforeWrite) => scopedReply(
+      cliProgressNoticeCard(r, Date.now(), level, localeForBot(ds.larkAppId) === 'en'), 'interactive', r.turnId,
+      { replyTarget: r.target, uuid: createHash('sha256').update(`cli-stall:${ds.session.sessionId}:${r.turnId}:${r.attempt ?? ''}:${level}`)
+          .digest('hex').slice(0, 40), beforeWrite, suppressHook: true }),
+    update: async (r, id, beforeWrite) => {
+      await updateMessage(ds.larkAppId, id, cliProgressNoticeCard(r, Date.now(), r.claimed, localeForBot(ds.larkAppId) === 'en'), { beforeWrite });
+    },
+    error: () => logger.warn(`[${t}] CLI progress notice delivery/update not confirmed; no automatic repost`),
+    warn: message => logger.warn(`[${t}] ${message}`),
+  });
+  const beginCliNotice = (turnId: string, attempt?: number) => {
+    if (!ownsLifecycleMutation() || !cliNoticeEnabled() || ds.adoptedFrom || ds.session.adoptedFrom
+      || ds.session.vcMeetingReceiver || !turnId.startsWith('om_')
+      || managedAuxUiSuppressed(turnId, attempt) || isSubstituteTurn(ds, turnId)
+      || isTriggerFinalSuppressed(ds, turnId) || privateReplyEnabled(ds.session) || isDocNativeSession(ds)) return;
+    const frozen = ds.session.turnReplyContexts?.[turnId];
+    const existing = ds.session.cliProgressNotices?.find(r => r.turnId === turnId && r.attempt === attempt);
+    // Durable admission can survive reconnect, but an unproven sender cannot
+    // be replaced by the session owner or the most recent follow-up sender.
+    // If a settled record was evicted after terminal consumed the @ marker,
+    // fail closed. Frozen sender/target alone cannot prove an explicit mention.
+    if (!existing && ds.chatType !== 'p2p' && !ds.turnExplicitMentions?.has(turnId)) return;
+    const caller = existing?.caller ?? (frozen?.replyTargetSenderIsBot === false ? frozen.replyTargetSenderOpenId : undefined);
+    if (!caller || !/^ou_[a-zA-Z0-9]+$/.test(caller)) return;
+    cliNotices.begin(turnId, attempt, caller, workerGeneration, existing?.target ?? frozen?.target);
+  };
+  const cliNoticeTimer = cliNoticeEnabled() ? setInterval(() => {
+    if (!ownsLifecycleMutation()) { clearInterval(cliNoticeTimer); cliNotices.dispose(); return; }
+    void cliNotices.poll().catch(() => logger.warn(`[${t}] CLI progress notice state could not be persisted`));
+  }, 15_000) : undefined;
+  cliNoticeTimer?.unref();
   /** final_output is the sole exception: listener_thread and exact IM replies
    * may proceed into the durable action ledger; silent/stale attempts do not. */
   const managedFinalOutputSuppressed = (
@@ -14286,12 +17335,29 @@ function setupWorkerHandlers(
   const loc = botLocale(botCfg);
   ensureOrdinaryTurnRecoveryAttached(ds, botCfg);
   ensureReadonlyTaskContinuationAttached(ds, botCfg);
+  resumeTurnNotices(ds);
   const notifyStartupFailure = async (
     reason: string,
     turnId?: string,
     dispatchAttempt?: number,
   ): Promise<void> => {
     if (startupState.failureNotified) return;
+    // Restart recovery (daemon restart batch-restore): stay silent in the chat.
+    // Without this guard every restored session whose worker fails to start
+    // posts a "会话启动失败" card into its own topic — a broadcast storm during
+    // bulk restore. The failure still lands in the daemon log below; the next
+    // real user turn surfaces it via the ordinary ingress-failure notice, and
+    // the next successful CLI input clears suppressRecoveryCard
+    // (rememberLastCliInput) so later failures notify normally. Do NOT set
+    // failureNotified here: a later generation failing after the flag clears
+    // must still surface.
+    if (ds.suppressRecoveryCard) {
+      logger.warn(
+        `[${t}] Startup failure notification suppressed by suppressRecoveryCard `
+        + `(session recovery mode) sid=${ds.session.sessionId}: ${reason}`,
+      );
+      return;
+    }
     startupState.failureNotified = true;
     emitSessionLifecycleHook(ds, 'session.requires_attention', {
       reason: 'worker_start_failed',
@@ -14309,8 +17375,7 @@ function setupWorkerHandlers(
       );
       return;
     }
-    const cliName = sessionCliDisplayName(ds, botCfg);
-    const message = tr('worker.start_failed', { cliName, reason }, loc);
+    const message = startupFailureNotice(ds, sessionCliDisplayName(ds, botCfg), reason, loc);
     try {
       await scopedReply(message, 'text', turnId);
     } catch (err: any) {
@@ -14386,6 +17451,441 @@ function setupWorkerHandlers(
   const isAdopt = isSharedAdoptSession(ds);
   const showTakeover = false;
 
+  const processFinalOutput = async (msg: Extract<WorkerToDaemon, { type: 'final_output' }>, outputControl?: OutputDeliveryControl): Promise<OutputReceipt | undefined> => {
+        const continuation = ds.session.readonlyTaskContinuation;
+        const exactContinuationFinal = continuation
+          && ['active', 'backoff'].includes(continuation.status)
+          && msg.turnId.startsWith('bmx-continuation-')
+          && msg.dispatchAttempt !== undefined
+          && continuation.currentTurnId === msg.turnId
+          && continuation.currentDispatchAttempt === msg.dispatchAttempt
+          && continuation.currentWorkerGeneration === workerGeneration;
+        if (exactContinuationFinal) {
+          // MR1 deliberately surfaces failed-turn fallback text before the
+          // structured terminal. For a synthetic continuation that text is a
+          // transport diagnostic, not the model's strict JSON business result;
+          // let the following terminal decide whether the allowlisted output
+          // limit should continue or another failure should stop visibly.
+          if (msg.turnFailed) return { status: 'suppressed' };
+          const output = parseReadonlyContinuationOutput(msg.content);
+          if (!output) {
+            failReadonlyTaskContinuationVisible(
+              ds.session, msg.turnId, msg.dispatchAttempt, workerGeneration,
+              'readonly_continuation_invalid_output',
+            );
+            return { status: 'suppressed' };
+          }
+          if (output.status === 'continue') return { status: 'suppressed' };
+          const deliveryState = beginReadonlyTaskContinuationDelivery(
+            ds.session, msg.turnId, msg.dispatchAttempt, workerGeneration,
+            { kind: output.status, content: output.content },
+          );
+          if (deliveryState?.status !== 'delivering') return { status: 'suppressed' };
+          deliverReadonlyTaskContinuationPending(ds, deliveryState);
+          return { status: 'suppressed' };
+        }
+        if (msg.turnId.startsWith('bmx-continuation-')) {
+          logger.warn(`[${t}] Dropped stale/unbound task continuation final_output`);
+          return { status: 'suppressed' };
+        }
+        const originalContinuation = ds.session.readonlyTaskContinuation;
+        if (originalContinuation?.logicalTurnId === msg.turnId
+          && originalContinuation.currentTurnId === msg.turnId
+          && originalContinuation.currentDispatchAttempt === undefined
+          && msg.turnFailed !== true) {
+          try {
+            completeReadonlyTaskContinuationOriginalBusinessFinal(
+              ds.session, msg.turnId, workerGeneration, msg.lastUuid,
+            );
+          } catch (err) {
+            logger.error(
+              `[${t}] Failed to persist original-turn final output for task continuation `
+              + `${msg.turnId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
+        if (msg.codexAppSettlement) {
+          const settlement = msg.codexAppSettlement;
+          const acknowledge = (ok: boolean, error?: string): void => {
+            try {
+              worker.send({
+                type: 'codex_app_dispatch_persisted',
+                requestId: settlement.requestId,
+                ok,
+                ...(error ? { error } : {}),
+              } as DaemonToWorker);
+            } catch { /* runner keeps the final unacknowledged for replacement */ }
+          };
+          if (ds.worker !== worker) {
+            acknowledge(false, 'stale_worker_generation');
+            return undefined;
+          }
+          if (msg.sessionId !== ds.session.sessionId) {
+            acknowledge(false, 'session_mismatch');
+            return undefined;
+          }
+          if (committedCodexAppSequence(
+            ds.session.codexAppGenerationCommits ?? [],
+            settlement.generation,
+            settlement.seq,
+          )) {
+            try { reconcileOrdinaryTurnRecoveryTerminalReceipt(ds.session); }
+            catch (error) {
+              acknowledge(false, 'recovery_receipt_persist_failed');
+              return undefined;
+            }
+            acknowledge(true);
+            if (!hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
+              try { await cb.onCodexAppLedgerDrained?.(ds); }
+              catch (err) { logger.error(`[${t}] post-drain cleanup failed: ${err instanceof Error ? err.message : String(err)}`); }
+            }
+            return { status: 'delegated', owner: 'codex_app_dispatch_persisted' };
+          }
+          const identity = {
+            dispatchId: settlement.dispatchId,
+            turnId: msg.turnId,
+            ...(msg.dispatchAttempt !== undefined
+              ? { dispatchAttempt: msg.dispatchAttempt }
+              : {}),
+          };
+          const preview = settleCodexAppDispatch(
+            ds.session.codexAppDispatchLedger ?? [],
+            ds.session.codexAppGenerationCommits ?? [],
+            identity,
+            settlement.generation,
+            settlement.seq,
+          );
+          if (!preview.ok) {
+            acknowledge(false, preview.error);
+            return undefined;
+          }
+          // R4/R5-B4 defense-in-depth: a `steer_superseded` settlement silently
+          // advances the FIFO without delivering, so it is ONLY legitimate for a
+          // genuine plain-Lark steerable head that STILL has a successor. Reject
+          // (ACK=false, no pop, no receiver completion, no mutation) BEFORE the
+          // commit block below if the settled entry is not steerable, not an
+          // explicit Lark sink, belongs to a VC / durable-receiver / special
+          // channel, or is the SOLE remaining head. R5: `deliverySink` must be
+          // exactly 'lark' — admission always writes both sink and steerable
+          // together, so "steerable=true + sink missing" can only be a
+          // mixed/corrupt/legacy ledger and must fail closed, not be treated as
+          // safe Lark. And a lone forged superseded (no successor) must never
+          // silently commit the only head — the real final would then find no
+          // pending turn. preview.ledger is the post-settle remainder.
+          if (msg.disposition === 'steer_superseded') {
+            const entry = preview.settledEntry;
+            // HTTP steer members (options.steer) carry an http_async / http_wait
+            // sink: unlike a Lark member (which simply skips delivery) they are
+            // PARKED here and resolved with the group's real final after the
+            // commit below — see parkSteerFanoutMember / fanOutSteerGroupFinal.
+            // doc_comment / suppressed / VC / legacy-undefined sinks remain
+            // rejected exactly as before.
+            const supersededSink = entry.deliverySink;
+            const supersededHeadOk = entry.codexAppSteerable === true
+              && (supersededSink === 'lark'
+                || supersededSink === 'http_async'
+                || supersededSink === 'http_wait')
+              && entry.vcMeetingImTurnOrigin === undefined
+              && ds.session.vcMeetingReceiver === undefined
+              && preview.ledger.length > 0;
+            if (!supersededHeadOk) {
+              logger.warn(
+                `[${t}] Rejected steer_superseded for non-steerable/special/last head `
+                + `(turn ${msg.turnId.substring(0, 8)}, sink=${entry.deliverySink ?? 'legacy'}, `
+                + `steerable=${entry.codexAppSteerable === true}, successors=${preview.ledger.length})`,
+              );
+              acknowledge(false, 'superseded_head_not_authorized_sink_with_successor');
+              return undefined;
+            }
+          }
+          const key = `${ds.session.sessionId}:${settlement.generation}:${settlement.seq}`;
+          let inFlight = codexAppFinalSettlementInFlight.get(key);
+          if (!inFlight) {
+            inFlight = (async () => {
+              const unavailableSinkFailClosed = codexAppDeliveryMustFailClosed(
+                ds,
+                preview.settledEntry,
+              );
+              const deliverySuppressed = outputControl?.record.sink.kind === 'suppressed' || msg.suppressDelivery === true
+                || managedFinalOutputSuppressed(msg.turnId, msg.dispatchAttempt)
+                || unavailableSinkFailClosed;
+              if (unavailableSinkFailClosed
+                && preview.settledEntry.deliverySink !== 'suppressed'
+                && msg.suppressDelivery !== true) {
+                logger.warn(
+                  `[${t}] Codex App recovery suppressed unavailable `
+                  + `${preview.settledEntry.deliverySink ?? 'legacy non-Lark'} sink `
+                  + `(turn ${msg.turnId.substring(0, 8)})`,
+                );
+              }
+              const alreadyDelivered = ds.lastBridgeEmittedUuid === finalOutputDedupeKey(ds, msg);
+              const owned = deliverySuppressed || !msg.content.trim() || alreadyDelivered
+                ? true
+                : outputControl
+                  ? !!await deliverFinalOutputWithOutputControl(ds, msg, t, outputControl,
+                      outputControl.record.sink.kind === 'im' ? outputControl.record.sink.context.target : preview.settledEntry.replyTarget)
+                  : await new Promise<boolean>(resolve => {
+                    deliverFinalOutput(ds, msg, t, 0, resolve,
+                      () => ownsLifecycleMutation() && ds.session.sessionId === msg.sessionId,
+                      preview.settledEntry.replyTarget);
+                  });
+              if (!owned) return false;
+
+              // Re-read after the asynchronous external delivery. A concurrent
+              // replacement may already have committed this signed sequence;
+              // that is idempotent success, never a second FIFO pop.
+              if (committedCodexAppSequence(
+                ds.session.codexAppGenerationCommits ?? [],
+                settlement.generation,
+                settlement.seq,
+              )) return true;
+              const committed = settleCodexAppDispatch(
+                ds.session.codexAppDispatchLedger ?? [],
+                ds.session.codexAppGenerationCommits ?? [],
+                identity,
+                settlement.generation,
+                settlement.seq,
+              );
+              if (!committed.ok) return false;
+              if (msg.dispatchAttempt !== undefined) {
+                try {
+                  // Durable receivers must not depend on the worker surviving
+                  // the daemon ACK long enough to emit a later terminal IPC.
+                  // Persist the exact completed attempt first; the worker's
+                  // ordered duplicate terminal remains idempotent. The
+                  // turn.finished notice waits until this write and the ledger
+                  // write below both succeed.
+                  await cb.onTurnTerminal?.(ds, {
+                    type: 'turn_terminal',
+                    sessionId: ds.session.sessionId,
+                    turnId: msg.turnId,
+                    dispatchAttempt: msg.dispatchAttempt,
+                    ...codexAppSettlementOutcome(msg),
+                    // The worker measured this turn; carry its numbers onto the
+                    // synthesized terminal. This row is written FIRST and the
+                    // store's INSERT OR IGNORE keeps it, so omitting the timing
+                    // here would permanently shadow the worker's real terminal.
+                    ...(settlement.completedAtMs !== undefined
+                      ? { completedAtMs: settlement.completedAtMs }
+                      : {}),
+                    ...(settlement.durationMs !== undefined
+                      ? { durationMs: settlement.durationMs }
+                      : {}),
+                  }, { workerGeneration });
+                } catch (err) {
+                  logger.error(`[${t}] Failed to persist Codex App settlement terminal: ${err instanceof Error ? err.message : String(err)}`);
+                  return false;
+                }
+              }
+              try {
+                persistCodexAppRecoverySettlement(ds, committed, msg, preview.settledEntry.deliverySink);
+                if (msg.dispatchAttempt !== undefined) {
+                  // Both durable writes succeeded. The frozen ledger sender is
+                  // the attribution captured at acceptance; the live reply
+                  // target may already belong to a later steer.
+                  const frozenSender = preview.settledEntry.replyTargetSenderOpenId;
+                  publishTurnFinished(ds, {
+                    turnId: msg.turnId,
+                    dispatchAttempt: msg.dispatchAttempt,
+                    ...codexAppSettlementOutcome(msg),
+                    ...(frozenSender ? { senderOpenId: frozenSender } : {}),
+                  });
+                }
+                return true;
+              } catch (err) {
+                logger.error(`[${t}] Failed to persist Codex App final settlement: ${err instanceof Error ? err.message : String(err)}`);
+                return false;
+              }
+            })().finally(() => codexAppFinalSettlementInFlight.delete(key));
+            codexAppFinalSettlementInFlight.set(key, inFlight);
+          }
+          const persisted = await inFlight;
+          acknowledge(persisted, persisted ? undefined : 'final_settlement_failed');
+          if (persisted) {
+            // HTTP steer group settlement (options.steer). An earlier member's
+            // empty superseded final is parked behind its successor; the real
+            // final fans the merged answer back to every parked member. Runs
+            // AFTER the durable FIFO commit so a parked/resolved member can
+            // never disagree with the ledger.
+            const settledSink = preview.settledEntry.deliverySink;
+            if (msg.disposition === 'steer_superseded'
+              && (settledSink === 'http_async' || settledSink === 'http_wait')) {
+              parkSteerFanoutMember(
+                ds,
+                settlement.generation,
+                { turnId: msg.turnId, sink: settledSink },
+                preview.ledger[0]?.turnId,
+              );
+            } else if (msg.disposition !== 'steer_superseded') {
+              fanOutSteerGroupFinal(ds, settlement.generation, msg.content, Date.now(), msg);
+            }
+          }
+          if (persisted && !hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
+            try { await cb.onCodexAppLedgerDrained?.(ds); }
+            catch (err) { logger.error(`[${t}] post-drain cleanup failed: ${err instanceof Error ? err.message : String(err)}`); }
+          }
+          return persisted ? { status: 'delegated', owner: 'codex_app_dispatch_persisted' } : undefined;
+        }
+
+        // Adopt-bridge: worker harvested the assistant turn from Claude Code's
+        // transcript JSONL and forwarded it to us. Dedup with a session-scoped
+        // key so a re-drain can't re-send the same answer or cross-suppress
+        // another session.
+        if (!msg.content || !msg.content.trim()) return { status: 'suppressed' };
+        if (shouldDropMismatchedFinalOutput(ds, msg, t)) return undefined;
+        if (shouldDropMismatchedHermesFinalOutput(ds, msg, t)) return undefined;
+        const triggerFailureNotice = msg.turnFailed === true
+          && isTriggerFinalSuppressed(ds, msg.turnId)
+          ? msg.turnFailureNotice?.trim()
+          : undefined;
+        if (managedFinalOutputSuppressed(msg.turnId, msg.dispatchAttempt, Boolean(triggerFailureNotice))
+          || (triggerFailureNotice && managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt))) {
+          logger.debug(`[${t}] final_output captured/discarded for silent turn ${msg.turnId.substring(0, 8)}`);
+          return { status: 'suppressed' };
+        }
+        // Keep suppressed partial answers and machine receipts out of chat.
+        // Older workers lacking a separate diagnostic retain fail-closed silence.
+        const finalOutput = triggerFailureNotice ? { ...msg, content: triggerFailureNotice } : msg;
+        if (!msg.sessionId) {
+          logger.warn(`[${t}] final_output missing sessionId; accepting for compatibility (session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`);
+        }
+        const dedupeKey = finalOutputDedupeKey(ds, msg);
+        if (ds.lastBridgeEmittedUuid === dedupeKey) {
+          logger.debug(`[${t}] final_output deduped (key ${dedupeKey.substring(0, 48)})`);
+          return { status: 'suppressed' };
+        }
+        // Worker pops the turn off its queue right after emit, so it will
+        // NOT re-send this payload on its own. Daemon owns retry on
+        // transient Lark failures.
+        // A real harvested answer is a definitive self-heal signal: if the
+        // session was parked in `limited` by a structured rate-limit emit
+        // (Claude adopt/bridge sessions where the user recovers in their own
+        // terminal — no Lark turn, retry button, or kill to clear it), the
+        // model is plainly working again. Clear the stale limit so the card /
+        // Dashboard「需要你」 don't stay pinned with a dead retry countdown.
+        if (ds.usageLimit) {
+          clearUsageLimitState(ds);
+          if (ds.lastScreenStatus === 'limited') {
+            ds.lastScreenStatus = 'idle';
+            stampIdleSinceAt(ds, 'limited');
+          }
+        }
+        if (msg.turnId.startsWith('mlrp_turn_')) {
+          markMessageListenerRunPreviewRunning(msg.turnId);
+        }
+        if (!outputControl) { deliverFinalOutputWithShutdownDrain(ds, finalOutput, t, ownsLifecycleMutation); return undefined; }
+        return deliverFinalOutputWithOutputControl(ds, finalOutput, t, outputControl,
+          outputControl.record.sink.kind === 'im' ? outputControl.record.sink.context.target : undefined);
+
+  };
+  const journal = ds.initConfig?.finalOutputHandoff?.version === 2 ? outputDeliveryJournal(config.session.dataDir, ds.larkAppId) : undefined;
+  const coordinator = journal ? new OutputDeliveryCoordinator(journal) : undefined;
+  const runOutput = async (record: OutputDeliveryRecord): Promise<void> => {
+    if (!journal || !coordinator) return;
+    // Claim authority tracks live worker generation only. Structural sink
+    // mismatches (channel/private-reply policy/HTTP owner gone) must be
+    // classified INSIDE process so they become terminal `rejected`, instead of
+    // leaving the row in pending where a permanently-false owns() predicate
+    // silently parks it (and the session attention) forever.
+    const authority = (): boolean => ownsLifecycleMutation();
+    await coordinator.deliver(record, {
+      owns: authority,
+      process: async (record, control) => {
+        const sink = record.sink;
+        if (sink.kind === 'im') {
+          if (ds.chatId !== sink.chatId || ds.chatType !== sink.chatType || privateReplyEnabled(ds.session) !== !!sink.privateReply) throw new OutputDeliveryTerminalError('output_original_channel_changed');
+          const actor = sink.context.requesterOpenId ?? sink.context.replyTargetSenderOpenId;
+          if (actor) {
+            // Distinguish a governance blocklist decision (irrecoverable) from
+            // a not-yet-resolved allowlist (reason 'none': sidecar/grant still
+            // loading during the startup window, API hiccup) which self-heals.
+            const talk = evaluateTalk(ds.larkAppId, sink.chatId, actor, undefined, undefined, sink.chatType);
+            if (!talk.allowed) {
+              if (talk.reason === 'blocked') throw new OutputDeliveryTerminalError('output_permission_revoked');
+              throw new Error('output_permission_pending');
+            }
+          }
+        }
+        if (sink.kind === 'http') {
+          if (sink.mode === 'wait' && !ds.pendingWaitPromises?.has(record.output.turnId) && !record.output.codexAppSettlement) return { status: 'captured', owner: 'expired_http_wait' };
+          if (sink.mode === 'async' && !ds.asyncTriggerResults?.has(record.output.turnId)) {
+            const saved = asyncTriggerStore.lookupStrict(ds.session.sessionId, record.output.turnId);
+            if ((!saved || saved.ownerLarkAppId !== ds.larkAppId) && !record.output.codexAppSettlement) throw new OutputDeliveryTerminalError('output_http_owner_unavailable');
+            if (saved && saved.ownerLarkAppId === ds.larkAppId) { ds.asyncTriggerResults ??= new Map(); ds.asyncTriggerResults.set(record.output.turnId, { ...saved.result, errorCode: saved.result.errorCode ? 'trigger_failed' as const : undefined }); }
+          }
+        }
+        if (sink.kind === 'doc') {
+          ds.docCommentTurns ??= new Map();
+          ds.docCommentTurns.set(record.output.turnId, sink.context as unknown as NonNullable<DaemonSession['docCommentTurns']> extends Map<string, infer T> ? T : never);
+        }
+        if (sink.kind === 'suppressed' && !record.output.codexAppSettlement) return { status: 'suppressed' };
+        let receipt: OutputReceipt | undefined;
+        try {
+          receipt = await processFinalOutput(record.output, control);
+        } catch (error) {
+          // Past the provider UUID dedupe window the ledger forbids any retry:
+          // the answer is permanently human-to-verify, not a transient block.
+          if (error instanceof FinalPublicationUnknownError
+            || String((error as Error)?.message).includes('final_publication_ambiguous')) {
+            throw new OutputDeliveryTerminalError(String((error as Error)?.message ?? 'final_publication_ambiguous'));
+          }
+          throw error;
+        }
+        if (record.output.codexAppSettlement) {
+          // Native FIFO ACK still pending: genuinely in flight, never terminal.
+          if (receipt?.owner !== 'codex_app_dispatch_persisted') return undefined;
+          return receipt;
+        }
+        // An undefined receipt is terminal ONLY for a deterministic drop that
+        // provably never posted (session/Hermes binding mismatch). Every other
+        // false completion is recoverable — transfer/generation change, a doc
+        // 5xx, an async-store EIO, an image-prep ownership loss, a withdrawn
+        // ledger owner — and must stay blocked so the next pump self-heals
+        // instead of latching a false terminal on an in-flight answer.
+        if (!receipt
+          && (shouldDropMismatchedFinalOutput(ds, record.output, t)
+            || shouldDropMismatchedHermesFinalOutput(ds, record.output, t))) {
+          throw new OutputDeliveryTerminalError('output_dropped_without_receipt');
+        }
+        return receipt;
+      },
+      settled: record => {
+        const claim = { type: 'final_output_settled' as const, id: record.id, fingerprint: record.fingerprint, token: ds.initConfig?.finalOutputHandoff?.token ?? '' };
+        if (ownsLifecycleMutation()) { try {
+          if (record.output.codexAppSettlement && record.receipt?.owner === 'codex_app_dispatch_persisted') worker.send({ type: 'codex_app_dispatch_persisted', requestId: record.output.codexAppSettlement.requestId, ok: true });
+          worker.send(claim);
+        } catch { /* worker retains its journal until receipt */ } }
+        // A transient failure sets FINAL_HANDOFF_* attention; the replacement
+        // delivery that settles must release it again, otherwise the session is
+        // permanently pinned out of idle reclaim/auto-close/auto-compact even
+        // though the answer actually landed. Clear only when nothing still
+        // needs attention: no self-healing V2 row, no terminal rejected row
+        // (an answer that can never reach its frozen target stays visible for
+        // human inspection), no V1 ambiguous/rejected row, no bridge mark.
+        if ([FINAL_HANDOFF_WAIT_REASON, FINAL_HANDOFF_DELIVERY_REASON].includes(ds.agentAttention?.reason ?? '')) {
+          try {
+            const sessionId = record.output.sessionId;
+            if (!sessionId) return;
+            const v1Attention = FinalOutputHandoffStore.exists(config.session.dataDir, ds.larkAppId)
+              ? finalOutputHandoffHost(ds.larkAppId).store.attentionPending(sessionId) !== undefined
+              : false;
+            const bridgePending = readBridgeTurnJournal(join(config.session.dataDir, 'turn-marks', `${sessionId}.json`)).some(entry => !!entry.pendingFinal);
+            const stillPending = journal.hasUnsettled(sessionId)
+              || journal.hasTerminalRejection(sessionId)
+              || v1Attention
+              || bridgePending;
+            if (!stillPending) { ds.agentAttention = undefined; publishAttentionPatch(ds); }
+          } catch (error) { logger.warn(`[${t}] Final output attention clear deferred: ${String(error)}`); }
+        }
+      },
+      error: (error, terminal) => {
+        if (raiseDaemonAttention(ds, 'blocked', FINAL_HANDOFF_DELIVERY_REASON, record.output.turnId)) publishAttentionPatch(ds);
+        logger.warn(`[${t}] Universal output ${terminal ? 'terminally rejected' : 'remains durable'}: ${String(error)}`);
+      },
+    });
+  };
+  if (journal) universalOutputProcessors.set(outputProcessorKey(ds), { worker, run: runOutput });
+
   worker.on('message', async (msg: WorkerToDaemon) => {
     // Every IPC message is scoped to the child generation that emitted it.
     // A replaced worker can drain queued messages after the new child has been
@@ -14408,6 +17908,77 @@ function setupWorkerHandlers(
     }
     const effectiveCliId = sessionCliId(ds, botCfg);
     switch (msg.type) {
+      case 'link_ref_register': {
+        const runtime = getLinkRefRuntime();
+        const result = runtime
+          ? registerMcpLinkRefsFromWorker({
+              ownsWorkerSession: ownsWorkerSession(),
+              daemonSession: {
+                appId: ds.larkAppId,
+                sessionId: ds.session.sessionId,
+                managedTurnOrigin: ds.managedTurnOrigin,
+              },
+              runtime,
+              request: msg,
+            })
+          : { ok: false as const, error: 'link_ref_ledger_unavailable' };
+        if (worker.connected) worker.send({
+          type: 'link_ref_register_result',
+          requestId: msg.requestId,
+          ...result,
+        } satisfies DaemonToWorker);
+        break;
+      }
+      case 'link_ref_resolve': {
+        const runtime = getLinkRefRuntime();
+        const result = runtime
+          ? resolveMcpHostDeliveryLinkRefsFromWorker({
+              ownsWorkerSession: ownsWorkerSession(),
+              daemonSession: {
+                appId: ds.larkAppId,
+                sessionId: ds.session.sessionId,
+                managedTurnOrigin: ds.managedTurnOrigin,
+              },
+              runtime,
+              request: msg,
+            })
+          : { ok: false as const, error: 'link_ref_ledger_unavailable' };
+        if (worker.connected) worker.send({
+          type: 'link_ref_resolve_result',
+          requestId: msg.requestId,
+          ...result,
+        } satisfies DaemonToWorker);
+        break;
+      }
+      case 'link_ref_restore_mode': {
+        let mode: 'enabled' | undefined;
+        let error: string | undefined;
+        if (!ownsWorkerSession()
+          || msg.sessionId !== ds.session.sessionId
+          || !msg.turnId) {
+          error = 'link_ref_identity_mismatch';
+        } else {
+          try {
+            mode = getLinkRefRuntime()?.restoreMode({
+              appId: ds.larkAppId,
+              sessionId: ds.session.sessionId,
+              turnId: msg.turnId,
+              ...(msg.dispatchAttempt !== undefined
+                ? { dispatchAttempt: msg.dispatchAttempt }
+                : {}),
+            });
+          } catch {
+            error = 'link_ref_ledger_unavailable';
+          }
+        }
+        if (worker.connected) worker.send({
+          type: 'link_ref_restore_mode_result',
+          requestId: msg.requestId,
+          ...(mode ? { mode } : {}),
+          ...(error ? { error } : {}),
+        } satisfies DaemonToWorker);
+        break;
+      }
       case 'active_turn_envelope_changed':
         inheritActiveTurnFinalSuppression(ds, msg.previousTurnId, msg.turnId);
         break;
@@ -14415,11 +17986,18 @@ function setupWorkerHandlers(
         // Committed synchronously (no await before this point) so no later
         // frame of this worker can be judged against an older identity.
         if (ds.workerGeneration !== workerGeneration) break;
+        const cardWasWaiting = streamingCardTurnQueued(ds);
         if (!commitCaptureIdentity(ds, workerGeneration, msg)) {
           logger.debug(
             `[${t}] Rejected capture_identity rev=${String(msg.revision)} `
             + `(current rev=${String(currentCaptureIdentity(ds, workerGeneration)?.revision ?? '-')})`,
           );
+        } else if (cardWasWaiting && !streamingCardTurnQueued(ds)) {
+          // The waiting turn has become the terminal producer. Repaint even
+          // when the worker remains working→working and no status edge would
+          // otherwise wake the card: this immediately removes the predecessor
+          // preview, before the first screenshot from the new turn arrives.
+          reconcilePostedStartingCard(ds, msg.turnId, -1, 'working');
         }
         break;
       }
@@ -14454,6 +18032,16 @@ function setupWorkerHandlers(
         sessionStore.updateSession(ds.session);
         break;
       }
+      case 'background_task_pins_sync': {
+        // Same eviction exemption for the launching turns of this worker's
+        // running Claude background tasks, so a wake answer forwarded long
+        // after launch still resolves to its topic. In-memory only: the
+        // worker holds the task→turn anchors in memory, and the exit handler
+        // drops these pins with it. Stale generations are rejected by the
+        // enclosing `ds.worker !== worker` guard.
+        ds.backgroundTaskPinnedTurnIds = normalizeBackgroundTaskPins(msg.turnIds);
+        break;
+      }
       case 'persistent_backend_target': {
         ds.session.persistentBackendTarget = msg.target;
         sessionStore.updateSession(ds.session);
@@ -14481,7 +18069,31 @@ function setupWorkerHandlers(
           break;
         }
         discardTriggerStreamingCard(ds, msg.turnId);
+        if (msg.rejectedBeforeAdmission) rejectDocCommentTurnBeforeAdmission(ds, msg.turnId, msg.reason);
         await rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg);
+        // The turn never started and will never terminal. Run GC, but do NOT
+        // release this turn's own ledger anchor here: a same-turnId redelivery
+        // to a new dispatch attempts re-registers on accept, and the rejected
+        // message carries no dispatchAttempt to prove it is not stale. Dropping
+        // the anchor before that re-register lands could let a periodic sweep
+        // collect the re-accepted material. The rejected turn is collected on
+        // a later terminal GC once no live structure names it (and always on
+        // teardown); a small retention lag beats a fail-closed 77 window.
+        collectSessionTurnGarbage(ds);
+        break;
+      }
+      case 'cancel_deployment_continuation': {
+        let ok = false;
+        if (ds.worker === worker && ds.workerGeneration === workerGeneration) {
+          try {
+            cancelDeploymentContinuation(ds.session,
+              previous => sessionStore.updateDeploymentContinuation(ds.session, previous), deploymentContinuationAuthority(ds)?.turnId, true);
+            ok = true;
+          } catch (error) {
+            logger.warn(`[restart] Manual input blocked: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        worker.send({ type: 'deployment_continuation_cancelled', requestId: msg.requestId, ok } satisfies DaemonToWorker);
         break;
       }
       case 'native_input_consumed': {
@@ -14502,6 +18114,49 @@ function setupWorkerHandlers(
         }
         break;
       }
+      case 'turn_progress': {
+        if (!ownsLifecycleMutation() || (msg.stage !== 'model_output'
+          && msg.stage !== 'tool_started' && msg.stage !== 'tool_returned')) break;
+        const execution = ds.replyExecutionStarts?.get(JSON.stringify([msg.turnId, msg.dispatchAttempt ?? null]));
+        if (execution?.workerGeneration === workerGeneration) {
+          const changed = execution.stage !== msg.stage;
+          execution.stage = msg.stage;
+          execution.lastProgressAtMs = Date.now();
+          if (changed && sessionCliId(ds, getBot(ds.larkAppId).config) === 'traex') {
+            syncUsageRefreshTimer(ds);
+            refreshStreamingCardUsage(ds);
+          }
+        }
+        cliNotices.progress(msg.turnId, msg.dispatchAttempt, workerGeneration, msg.stage);
+        break;
+      }
+      case 'turn_execution_started': {
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration || !msg.turnId
+          || !Number.isFinite(msg.startedAtMs) || msg.startedAtMs < 0 || msg.startedAtMs > Date.now()) break;
+        /** Bounded native-write observations used by timing and long-task reminders. */
+        const starts = ds.replyExecutionStarts ??= new Map();
+        /** Each dispatch attempt has an independent execution lifetime. */
+        const key = JSON.stringify([msg.turnId, msg.dispatchAttempt ?? null]);
+        /** A duplicate late start cannot revive an exact attempt already retired by its terminal. */
+        const previousExecution = starts.get(key);
+        /** Exact terminals survive even when their native start has not arrived yet. */
+        const exactTerminal = ds.replyExecutionTerminals?.has(JSON.stringify([workerGeneration, msg.turnId, msg.dispatchAttempt ?? null]));
+        /** A legacy terminal without an attempt also retires starts timestamped before its receipt. */
+        const legacyTerminalAt = ds.replyExecutionTerminals?.get(JSON.stringify([workerGeneration, msg.turnId, null]));
+        /** A new attempt beginning after a legacy terminal is a fresh execution. */
+        const predatesLegacyTerminal = legacyTerminalAt !== undefined && msg.startedAtMs < legacyTerminalAt;
+        if (exactTerminal || predatesLegacyTerminal
+          || (previousExecution?.completed && previousExecution.workerGeneration === workerGeneration)) {
+          break;
+        }
+        beginCliNotice(msg.turnId, msg.dispatchAttempt);
+        starts.delete(key);
+        starts.set(key, { startedAtMs: msg.startedAtMs, workerGeneration, lastProgressAtMs: msg.startedAtMs });
+        if (starts.size > 512) starts.delete(starts.keys().next().value!);
+        if (ds.session.workflowNode) cb.onWorkflowNodeTurnStarted?.(ds, { turnId: msg.turnId, startedAt: msg.startedAtMs });
+        break;
+      }
       case 'turn_input_committed': {
         // Bind the receipt to the exact live worker generation. A late ACK
         // from a replaced worker cannot make the replacement appear to have
@@ -14513,6 +18168,16 @@ function setupWorkerHandlers(
         ) {
           logger.warn(`[${t}] Ignored turn_input_committed from stale worker generation`);
           break;
+        }
+        if (msg.durablePrimaryInbox) {
+          try {
+            cb.onTurnInputCommitted?.(ds, msg, { workerGeneration });
+          } catch (err) {
+            logger.warn(
+              `[${t}] durable-primary input commit handler failed: `
+              + `${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
         }
         // Compatibility/fallback: a commit also proves receipt if the earlier
         // receipt ACK was delayed or dropped on the reverse IPC channel.
@@ -14550,8 +18215,11 @@ function setupWorkerHandlers(
           if (msg.turnId.startsWith('mlrp_turn_')) {
             markMessageListenerRunPreviewRunning(msg.turnId);
           }
+          if (ds.session.workflowNode) {
+            cb.onWorkflowNodeInputCommitted?.(ds, { turnId: msg.turnId, committedAt: Date.now() });
+          }
         } else {
-          logger.warn(`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
+          logger[unboundInputCommitLogLevel(msg.turnId, frozenReplyContextForTurn(ds, msg.turnId))](`[${t}] Ignored unbound input commit turn=${msg.turnId.slice(0, 16)}`);
         }
         if (!managedAuxUiSuppressed(msg.turnId)) {
           ds.replyCardRunningTurnId = msg.turnId;
@@ -14660,6 +18328,7 @@ function setupWorkerHandlers(
         startupState.ready = true;
         startupState.onPreReadyExit = undefined;
         ds.workerReady = true;
+        resumeCotMessage(ds);
         // A generation reached ready: the transient-startup failing streak is
         // over. Clear the budget and any still-pending retry timer (an inbound
         // message may have revived the session while a retry slept).
@@ -14709,7 +18378,7 @@ function setupWorkerHandlers(
         // （reattach 不代表本次新算命令真的执行了）。worker 每次 ready 会重报。
         ds.spawnCommand = msg.spawnCommand;
         sessionStore.updateSession(ds.session);
-        const readOnlyUrl = readableTerminalUrlFor(ds);
+        const readOnlyUrl = liveReadableTerminalUrlFor(ds);
         if (readOnlyUrl) {
           logger.info(`[${t}] Worker ready, terminal at ${readOnlyUrl.replace(/\?.*$/, '?viewToken=[redacted]')}`);
         } else {
@@ -14771,9 +18440,10 @@ function setupWorkerHandlers(
         }
 
         // Restart recovery: stay silent in the group. The session was restored
-        // after a daemon restart; don't auto-post/patch a streaming card here.
-        // The owner gets a private DM summary instead, and the surviving card
-        // (if any) is left untouched. The next real user turn clears this flag
+        // after a daemon restart; don't post a streaming card or re-render the
+        // surviving one as 「启动中」 here. The owner gets a private DM summary
+        // instead; the surviving card (if any) is brought to the real status
+        // by the first screen_update. The next real user turn clears this flag
         // (rememberLastCliInput) and the normal card flow resumes.
         if (ds.suppressRecoveryCard) {
           // Startup Pin recovery owns the only safe provenance decision for a
@@ -14830,7 +18500,7 @@ function setupWorkerHandlers(
               effectiveCliId,
               ds.displayMode ?? 'hidden',
               ds.streamCardNonce,
-              ds.currentImageKey,
+              streamingCardPresentationImageKey(ds),
               isAdopt,
               showTakeover,
               loc,
@@ -14840,9 +18510,11 @@ function setupWorkerHandlers(
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
               sessionRuntimeDisplayName(ds, botCfg),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-              idleCardLabel(ds),
+              streamCardLabel(ds),
               dshRuntimeForSession(ds),
               resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+              false,
+              substituteCardControlFor(ds),
             );
             if (!ownsLifecycleMutation() || !ownsRestoredCard() || !ownsRestoredWrite()) break;
             await updateMessage(restoredAppId, restoredCardId, streamCardJson, { beforeWrite: () => {
@@ -14956,7 +18628,7 @@ function setupWorkerHandlers(
             effectiveCliId,
             ds.displayMode ?? 'hidden',
             ds.streamCardNonce,
-            ds.currentImageKey,
+            streamingCardPresentationImageKey(ds),
             isAdopt,
             showTakeover,
             loc,
@@ -14966,9 +18638,11 @@ function setupWorkerHandlers(
             getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-            idleCardLabel(ds),
+            streamCardLabel(ds),
             dshRuntimeForSession(ds),
             resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+            false,
+            substituteCardControlFor(ds),
           );
           if (!ownsLifecycleMutation() || !stillOwnsFreshReadyPost()) break;
           const readyPost = scopedReplyTo(
@@ -15069,6 +18743,8 @@ function setupWorkerHandlers(
               loc,
               localCliReadyAtBuild,
               sessionRuntimeDisplayName(ds, botCfg),
+              sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
+              sessionModelPinView(ds),
             );
             const fallbackPost = scopedReplyTo(postingDisplayAnchor, postingAppId, cardJson,
               'interactive', cardReplyTarget.turnId, { replyTarget: cardReplyTarget.target, beforeWrite: beforeFallbackWrite });
@@ -15091,6 +18767,8 @@ function setupWorkerHandlers(
                 loc,
                 true,
                 sessionRuntimeDisplayName(ds, botCfg),
+                sessionCardSandboxMode(ds.session.sandbox, ds.reportedIdentityModel?.sandboxEngaged),
+                sessionModelPinView(ds),
               );
               try {
                 await updateMessage(postingAppId, fallbackCardId, readyCardJson, { beforeWrite: beforeFallbackWrite });
@@ -15104,13 +18782,22 @@ function setupWorkerHandlers(
               await closeWithdrawnSessionIfLedgerEmpty(ds, 'Root message withdrawn while creating fallback worker-ready card');
               break;
             }
-            throw fallbackErr;
+            // This handler is fire-and-forget (worker IPC), so a rethrow only
+            // surfaces as a daemon-level unhandled rejection. Log and leave
+            // streamCardId cleared so a later screen_update can retry the card.
+            logger.warn(`[${t}] Failed to send static fallback card: ${fallbackErr}`);
           }
         }
 
         break;
       }
 
+      case 'prompt_cache_keepalive_result': {
+        if (!ownsLifecycleMutation()) break;
+        notePromptCacheKeepaliveResult(ds, msg.injected === true);
+        if (!msg.injected) logger.info(`[${t}] prompt-cache keep-alive refused by worker: ${msg.reason ?? 'unknown'}`);
+        break;
+      }
       case 'prompt_ready': {
         if (ds.worker !== worker) break;
         // The ONLY set point for the in-memory readiness flag (design
@@ -15120,6 +18807,15 @@ function setupWorkerHandlers(
         ds.cliReady = true;
         ds.cliReadyGeneration = (ds.cliReadyGeneration ?? 0) + 1;
         logger.info(`[${t}] ${sessionCliDisplayName(ds, botCfg)} is ready for input`);
+        // 到了 prompt 不等于恢复健康：CLI 可能每收到一条（被重投的）输入就退出，
+        // 在这里清零会让熔断永远不触发。只记下本轮崩溃后首次 ready 的时间，ready
+        // 后稳定存活满一个窗口再崩溃才算新一轮——一次历史性永久退出（127/77）因此
+        // 也不会让这条会话此后任何一次永久退出都立即放弃自动重启。见 restart-policy。
+        const restartStreak = restartCounts.get(ds.session.sessionId);
+        if (restartStreak && restartStreak.readyAt === undefined) {
+          restartStreak.readyAt = Date.now();
+          logger.info(`[${t}] CLI ready after ${restartStreak.count} crash(es); the restart streak resets only if it stays up`);
+        }
         // A live prompt means a (re)spawn reached a working CLI — clear the lazy
         // cold-resume marker set when we parked a crash diagnostic shell. The
         // common retry path respawns IN-PLACE (worker.ts case 'message'), not via
@@ -15172,11 +18868,15 @@ function setupWorkerHandlers(
           if (followUp) rememberLastCliInput(ds, followUp.userPrompt, {
             content: followUp.cliInput,
             ...(followUpCodexAppInput ? { codexAppInput: followUpCodexAppInput } : {}),
-          }, { codexAppInputAccepted: !!followUpCodexAppInput });
+          }, followUp.turnId, { codexAppInputAccepted: !!followUpCodexAppInput });
         }
         // CLI reached its prompt — any previously posted stuck warning is stale.
         invalidateStuckWarning(ds, 'prompt_ready');
         invalidateTuiPrompt(ds, 'prompt_ready', 'resolved');
+        // A delivered recovery continuation that never reported its terminal
+        // must not hold the recovery in `running` forever (10-31: it was
+        // attributed to a synthesised local turn and silenced).
+        noteOrdinaryTurnRecoveryCliIdle(ds.session);
         break;
       }
 
@@ -15190,6 +18890,37 @@ function setupWorkerHandlers(
             patch: { cliVersion: msg.version },
           },
         });
+        break;
+      }
+
+      case 'cli_install_changed': {
+        if (!ownsLifecycleMutation()) break;
+        const cliId = sessionCliId(ds, getBot(ds.larkAppId).config);
+        logger.warn(
+          `[${t}] ${cliId} install changed under the running process `
+          + `(running ${msg.runningVersion}, installed ${msg.installedVersion}) — `
+          + 'suspending once the turn settles so the next one cold-starts on the new install',
+        );
+        // Same queued suspend as `botmux suspend` on a busy session: fulfilled
+        // at the next idle edge, then the next message cold-resumes. A manual
+        // request already queued for this generation wins.
+        if (!ds.pendingSuspendReason) {
+          ds.pendingSuspendReason = CLI_INSTALL_CHANGED_SUSPEND;
+          ds.pendingSuspendGeneration = ds.workerGeneration;
+        }
+        void cb.sessionReply(
+          sessionAnchorId(ds),
+          tr('worker.cli_install_changed', {
+            cli: getCliDisplayName(cliId),
+            running: msg.runningVersion,
+            installed: msg.installedVersion,
+          }, localeForBot(ds.larkAppId)),
+          'text',
+          ds.larkAppId,
+          undefined,
+          { sourceSessionId: ds.session.sessionId },
+        ).catch(err => logger.warn(`[${t}] install-change notice failed: ${err instanceof Error ? err.message : String(err)}`));
+        runPendingSuspendIfSettled(ds, ownsLifecycleMutation);
         break;
       }
 
@@ -15214,10 +18945,16 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored restart_result from stale worker generation`);
           break;
         }
+        const savedReadiness = topicEffortRestartReadiness.get(ds.session.sessionId);
+        const currentSettingsAttempt = savedReadiness?.attemptId === msg.attemptId && savedReadiness.worker === worker
+          && savedReadiness.workerGeneration === ds.workerGeneration;
+        const validSettingReceipt = !currentSettingsAttempt || msg.status !== 'succeeded'
+          || (!!msg.topicEffort && msg.topicEffort.model === savedReadiness.requested.model
+            && msg.topicEffort.effort === savedReadiness.requested.effort);
         const restartSettled = restartCoordinator.resolve(
           ds.session.sessionId,
           msg.attemptId,
-          msg.status,
+          validSettingReceipt ? msg.status : 'failed',
         );
         // requestSessionRestart() fences the live generation by clearing
         // workerReady before asking the worker to respawn its CLI in place. An
@@ -15226,13 +18963,34 @@ function setupWorkerHandlers(
         // that must release that fence. Without this assignment the terminal
         // can be prompt-ready/idle while relay and fork remain permanently
         // blocked as `worker_busy`.
-        if (restartSettled && msg.status === 'succeeded') {
+        if (restartSettled && validSettingReceipt && msg.status === 'succeeded') {
           ds.workerReady = true;
         }
+        if (restartSettled && currentSettingsAttempt) {
+          if (msg.untouched) {
+            ds.workerReady = savedReadiness.workerReady;
+            ds.cliReady = savedReadiness.cliReady;
+          }
+          if (validSettingReceipt && msg.status === 'succeeded' && msg.topicEffort) {
+            ds.activeModel = msg.topicEffort.model;
+            ds.activeReasoningEffort = msg.topicEffort.effort;
+            ds.activeModelBackendVariant = msg.topicEffort.variant;
+            if (ds.initConfig) {
+              ds.initConfig.model = msg.topicEffort.model;
+              ds.initConfig.reasoningEffort = msg.topicEffort.effort;
+              ds.initConfig.modelBackendVariant = msg.topicEffort.variant;
+            }
+          }
+          topicEffortRestartReadiness.delete(ds.session.sessionId);
+        }
+
         break;
       }
 
       case 'cli_session_id': {
+        // Interactive fork launches briefly hold the parent's id. Such an
+        // observation is not a completed fork and must leave the intent intact.
+        if (ds.session.pendingForkSession && msg.cliSessionId === ds.session.cliSessionId) break;
         const wasLocalCliOpenReady = isLocalCliOpenReady(ds, { cliId: effectiveCliId });
         ds.session.cliSessionId = msg.cliSessionId;
         ds.session.codexCleanupTarget = ['codex', 'codex-app'].includes(effectiveCliId)
@@ -15272,6 +19030,9 @@ function setupWorkerHandlers(
           ds.initConfig.nativeSessionTitlePrompt = undefined;
         }
         sessionStore.updateSession(ds.session);
+        if (ds.scope === 'chat' && ds.chatType === 'group') {
+          acceptSessionGroupTitle(ds.larkAppId, ds.session, title);
+        }
         break;
       }
 
@@ -15286,14 +19047,26 @@ function setupWorkerHandlers(
         }
         const model = msg.model?.trim() || undefined;
         const reasoningEffort = msg.reasoningEffort?.trim() || undefined;
+        const variant = msg.modelBackendVariant;
+        if (msg.traexAutoModelRuntime
+          && effectiveCliId === 'traex'
+          && msg.traexAutoModelRuntime.model.toLowerCase() === model?.toLowerCase()
+          && msg.traexAutoModelRuntime.nativeSessionId === ds.session.cliSessionId
+          && JSON.stringify(ds.session.traexAutoModelRuntime) !== JSON.stringify(msg.traexAutoModelRuntime)) {
+          ds.session.traexAutoModelRuntime = msg.traexAutoModelRuntime;
+          sessionStore.updateSession(ds.session);
+        }
         if (
           ds.activeModel === model
           && ds.activeReasoningEffort === reasoningEffort
+          && (variant === undefined || ds.activeModelBackendVariant === variant)
         ) {
           break;
         }
         ds.activeModel = model;
         ds.activeReasoningEffort = reasoningEffort;
+        if (ds.codexCliEffortConfirmed?.effort === reasoningEffort) ds.codexCliEffortConfirmed = undefined;
+        if (variant !== undefined) ds.activeModelBackendVariant = variant;
         if (ds.session.dispatchLaunchSpec && model) {
           ds.session.dispatchLaunchSpec.effectiveRuntime = {
             model, ...(reasoningEffort ? { reasoningEffort } : {}),
@@ -15365,8 +19138,14 @@ function setupWorkerHandlers(
 
       case 'thinking_superseded': {
         if (!ownsLifecycleMutation()) break;
+        cliNotices.finish(msg.turnId, msg.dispatchAttempt);
         if (msg.sessionId !== ds.session.sessionId) break;
         handleCotThinkingSuperseded(ds, msg);
+        if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          void supersedeTurnReplyCard(ds, msg,
+            (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }),
+            ownsLifecycleMutation).catch(error => logger.warn(`[${t}] reply-card superseded: ${error.message}`));
+        }
         break;
       }
 
@@ -15387,7 +19166,11 @@ function setupWorkerHandlers(
           }
           break;
         }
-        handleCotThinkingUpdate(ds, msg);
+        // Grok public activity is enabled for dynamic replies. Preserve its
+        // legacy message layout unless the user explicitly requests /cot show.
+        if (effectiveCliId !== 'grok' || ds.cotForced) {
+          handleCotThinkingUpdate(ds, msg);
+        }
         break;
       }
 
@@ -15398,9 +19181,14 @@ function setupWorkerHandlers(
         // screenshots and idle/status transitions must keep flowing.
         if (!startupState.ready && !workerHasInitialized(ds)) break;
         const prevStatus = ds.lastScreenStatus;
+        const prevBackgroundTaskCount = ds.backgroundTaskCount;
         updateUsageLimitState(ds, msg.usageLimit);
         ds.lastScreenContent = msg.content;
-        ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit);
+        ds.lastScreenStatus = resolveUsageAwareScreenStatus(ds, msg.status, msg.usageLimit, msg.content);
+        ds.backgroundTaskCount = (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'idle')
+          && typeof msg.backgroundTasks === 'number' && msg.backgroundTasks > 0
+          ? Math.floor(msg.backgroundTasks)
+          : undefined;
         stampIdleSinceAt(ds, prevStatus);
         bumpStreamCardStatusRevision(ds);
         try {
@@ -15457,6 +19245,7 @@ function setupWorkerHandlers(
                 // 任务态随运行态边沿一起推：working→idle 时 todo 往往刚变化，
                 // 不带上会让看板「待办」列停在旧值。?? null 让清空也能同步（patch 合并）。
                 openTodos: dashboardRow.openTodos ?? null,
+                busySinceAt: ds.busySinceAt ?? null,
               },
             },
           });
@@ -15479,14 +19268,10 @@ function setupWorkerHandlers(
             recordUsageForDaemonSession(ds);
             if (ds.lastScreenStatus === 'idle' && (prevStatus === 'working' || prevStatus === 'analyzing')) {
               void finishTurnReactions(ds);
+              if (ds.session.workflowNode && !ds.session.workflowNode.submittedAt) {
+                cb.onWorkflowNodeTurnSettled?.(ds, { ...(msg.turnId ? { turnId: msg.turnId } : {}), at: Date.now() });
+              }
             }
-          }
-          if (
-            ds.lastScreenStatus === 'idle'
-            && msg.turnId
-            && ds.session.deferredScheduleRun?.turnId === msg.turnId
-          ) {
-            void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: msg.turnId, source: 'idle' });
           }
           // If every over-cap process was busy, the earlier check deliberately
           // left them alone. Re-check on the first idle edge so capacity is
@@ -15496,6 +19281,22 @@ function setupWorkerHandlers(
             // The newly-idle session itself may be the oldest eviction target.
             queueMicrotask(cb.enforceLiveSessionCap);
           }
+        }
+
+        // The dedicated hidden run retains its identity after the worker retires
+        // its capture turn. Never borrow a shared session's current/queued turn.
+        // Notify once per idle episode, including a first frame already at idle,
+        // so repeated snapshots cannot keep resetting the settlement debounce.
+        const deferredTurnId = resolveDeferredScheduledTurnId(ds, msg.turnId);
+        if (msg.turnId && msg.turnId === ds.deferredScheduleUnconfirmedTurnId) {
+          ds.deferredScheduleUnconfirmedTurnId = undefined;
+        }
+        if (ds.lastScreenStatus !== 'idle') deferredScheduleIdleTurnId = undefined;
+        if (ds.lastScreenStatus === 'idle' && deferredTurnId
+          && deferredScheduleIdleTurnId !== deferredTurnId
+          && (msg.turnId || deferredTurnId !== ds.deferredScheduleUnconfirmedTurnId)) {
+          deferredScheduleIdleTurnId = deferredTurnId;
+          void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: deferredTurnId, source: 'idle' });
         }
 
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) { clearUsageRefreshTimer(ds); break; }
@@ -15632,12 +19433,17 @@ function setupWorkerHandlers(
         if (hasPendingTriggerStreamingCard(ds, msg.turnId)) break;
         if (streamingCardDisabled(ds, msg.turnId)) { clearUsageRefreshTimer(ds); break; }
 
-        // Restart recovery: a restored worker may emit screen updates as the CLI
-        // redraws on resume. Stay silent (no post/patch) until the first real
-        // user turn clears the flag. Dashboard SSE above still reflects status.
-        if (ds.suppressRecoveryCard) { clearUsageRefreshTimer(ds); break; }
+        // Restart recovery: silent means no NEW card until the first real user
+        // turn clears the flag. The surviving card still follows status edges
+        // (same-turn PATCH below) — otherwise a card left at 「工作中」 by the
+        // restart stays there until the next human message.
+        if (ds.suppressRecoveryCard
+          && (ds.streamCardPending || !ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL)) {
+          clearUsageRefreshTimer(ds);
+          break;
+        }
 
-        const readUrl = readableTerminalUrlFor(ds);
+        const readUrl = liveReadableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
         const mode: DisplayMode = ds.displayMode ?? 'hidden';
 
@@ -15664,7 +19470,7 @@ function setupWorkerHandlers(
             effectiveCliId,
             mode,
             ds.streamCardNonce,
-            ds.currentImageKey,
+            streamingCardPresentationImageKey(ds),
             isAdopt,
             showTakeover,
             loc,
@@ -15674,9 +19480,11 @@ function setupWorkerHandlers(
             getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-            idleCardLabel(ds),
+            streamCardLabel(ds),
             dshRuntimeForSession(ds),
             resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+            false,
+            substituteCardControlFor(ds),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -15776,10 +19584,11 @@ function setupWorkerHandlers(
               }
             });
         } else {
-          // Same turn — PATCH only on status change. Image PATCHes go through
-          // the screenshot_uploaded path; text is no longer a card body mode.
+          // Same turn — PATCH only on a header change: the status, or the
+          // background-task count it shows. Image PATCHes go through the
+          // screenshot_uploaded path; text is no longer a card body mode.
           const statusChanged = prevStatus !== ds.lastScreenStatus;
-          if (!statusChanged) break;
+          if (!statusChanged && prevBackgroundTaskCount === ds.backgroundTaskCount) break;
           const cardJson = buildStreamingCard(
             ds.session.sessionId,
             sessionAnchorId(ds),
@@ -15790,7 +19599,7 @@ function setupWorkerHandlers(
             effectiveCliId,
             mode,
             ds.streamCardNonce,
-            ds.currentImageKey,
+            streamingCardPresentationImageKey(ds),
             isAdopt,
             showTakeover,
             loc,
@@ -15804,9 +19613,11 @@ function setupWorkerHandlers(
             }),
             sessionRuntimeDisplayName(ds, botCfg),
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-            idleCardLabel(ds),
+            streamCardLabel(ds),
             dshRuntimeForSession(ds),
             resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+            false,
+            substituteCardControlFor(ds),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
           // Keep the live usage climbing during a long working phase; stop once
@@ -15828,8 +19639,31 @@ function setupWorkerHandlers(
         // target must accept it (a new-turn card waits for its exact turn).
         const frameVerdict = evaluateScreenshotFrame(ds, workerGeneration, msg);
         if (!frameVerdict.ok) {
+          let shownAsWaitingPreview = false;
+          if (frameVerdict.reason === 'target-waiting'
+            && frameVerdict.source.turnId !== undefined) {
+            const target = currentStreamCardDisplayTarget(ds);
+            if (target?.mode === 'waiting-exact-turn') {
+              // Keep predecessor pixels observable without laundering them into
+              // the waiting turn's durable cache. This slot is in-memory only,
+              // preserves the legacy card presentation, and is cleared on
+              // target activation/publication or worker replacement.
+              ds.waitingTurnPreview = {
+                imageKey: msg.imageKey,
+                ...frameVerdict.source,
+              };
+              shownAsWaitingPreview = true;
+              if ((ds.displayMode ?? 'hidden') === 'screenshot'
+                && ds.streamCardId
+                && ds.streamCardId !== CARD_POSTING_SENTINEL
+                && workerHasInitialized(ds)) {
+                scheduleCardPatch(ds, buildStreamingCardJson(ds), target.turnId);
+              }
+            }
+          }
           logger.debug(
-            `[${t}] Dropped screenshot (${frameVerdict.reason}) turn=${msg.turnId?.substring(0, 12) ?? '-'} `
+            `[${t}] ${shownAsWaitingPreview ? 'Previewed' : 'Dropped'} screenshot (${frameVerdict.reason}) `
+            + `turn=${msg.turnId?.substring(0, 12) ?? '-'} `
             + `attempt=${msg.dispatchAttempt ?? '-'} rev=${msg.captureRevision ?? '-'}`,
           );
           break;
@@ -15884,7 +19718,7 @@ function setupWorkerHandlers(
         persistStreamCardState(ds);
         if ((ds.displayMode ?? 'hidden') !== 'screenshot') break;
         if (!ds.streamCardId || ds.streamCardId === CARD_POSTING_SENTINEL || !workerHasInitialized(ds)) break;
-        const readUrl = readableTerminalUrlFor(ds);
+        const readUrl = liveReadableTerminalUrlFor(ds);
         const turnTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
         const cardJson = buildStreamingCard(
           ds.session.sessionId,
@@ -15896,7 +19730,7 @@ function setupWorkerHandlers(
           effectiveCliId,
           'screenshot',
           ds.streamCardNonce,
-          ds.currentImageKey,
+          streamingCardPresentationImageKey(ds),
           isAdopt,
           showTakeover,
           loc,
@@ -15906,9 +19740,11 @@ function setupWorkerHandlers(
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId, { fresh: ds.lastScreenStatus === 'idle' }),
           sessionRuntimeDisplayName(ds, botCfg),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-          idleCardLabel(ds),
+          streamCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          false,
+          substituteCardControlFor(ds),
         );
         scheduleCardPatch(ds, cardJson, msg.turnId);
         break;
@@ -16000,12 +19836,49 @@ function setupWorkerHandlers(
         // Ignore stuck_warning from a stale worker generation — the CLI may have
         // been replaced and a new worker owns the session now.
         if (ds.worker !== worker) break;
-        // AI-free StuckDetector fired: a written input hasn't produced a
-        // completed turn within the timeout AND the PTY has been quiet, AND the
-        // snapshot matches a known Codex hook-review screen. The detector only
-        // emits when it matches level 1 or level 2 — there is no "unknown
-        // stall" path, so we always build an interactive card with the exact
-        // keys the screen documents.
+        // Plain-text stand-in when no card carries this warning's news.
+        //  - 'deduped': a keyed card for the page is already on screen (or
+        //    being posted); only an unconfirmed submit is news of its own.
+        //  - 'refused_unknown': the button-less card for an unrecognised page
+        //    was refused; the worker's notice (if any) still lands.
+        //  - 'refused_keyed': the keyed card was refused; every reason gets a
+        //    text notice without the screen tail (stuckCardFallbackText).
+        // A refusal only counts when the card did not reach the chat
+        // (stuckCardPostErrorMeansUnsent) — otherwise the text would duplicate it.
+        const deliverStuckNoticeAsText = async (
+          m: typeof msg,
+          why: 'deduped' | 'refused_unknown' | 'refused_keyed',
+          postErr?: unknown,
+        ): Promise<void> => {
+          if (why !== 'deduped' && !stuckCardPostErrorMeansUnsent(postErr)) {
+            logger.warn(`[${t}] Stuck card POST failed after the card was sent — no text fallback`);
+            return;
+          }
+          const text = why === 'refused_keyed'
+            ? stuckCardFallbackText(m, sessionCliDisplayName(ds, botCfg), loc)
+            : (m.reason === 'submit_unconfirmed' ? m.noticeText : undefined);
+          if (!text) return;
+          if (managedAuxUiSuppressed(m.turnId, m.dispatchAttempt)) return;
+          try {
+            await scopedReply(text, 'text', m.turnId);
+          } catch (fallbackErr: any) {
+            logger.error(`[${t}] Failed to deliver stuck notice text fallback: ${fallbackErr?.message ?? fallbackErr}`);
+          }
+        };
+        // A submit_unconfirmed card replaces the worker's input_not_submitted
+        // user_notify, so it owes the same status-card re-render: a single
+        // working→idle PATCH may have been lost while the input never landed.
+        if (msg.reason === 'submit_unconfirmed'
+          && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)
+          && ownsLifecycleMutation()
+          && (!msg.turnId || !ds.currentTurnId || ds.currentTurnId === msg.turnId)) {
+          scheduleActiveRuntimePatch(ds);
+        }
+        // The worker saw the CLI sit on a blocking page: the AI-free
+        // StuckDetector (a written turn stalled on a classified page), a
+        // message held off such a page, or an unconfirmed submit whose screen
+        // explains why. The keyed card is built from STUCK_PAGE_CATALOG for
+        // the classified page type; the buttons carry only an index + nonce.
         // Dedup: skip if we already posted a warning for THIS turn, OR if a
         // stuck-warning card is already active (covers the no-turnId case where
         // a second stall fires before the first card is resolved).
@@ -16013,6 +19886,54 @@ function setupWorkerHandlers(
         const hasActiveCard = !!ds.stuckWarningCardId;
         if (isDuplicateTurn || hasActiveCard) {
           logger.debug(`[${t}] Stuck warning dedup skipped (turn=${msg.turnId ?? 'none'}, activeCard=${hasActiveCard})`);
+          // The keyed card already on screen covers the page, but an
+          // unconfirmed submit is news of its own: never drop the notice the
+          // worker would otherwise have sent as text.
+          await deliverStuckNoticeAsText(msg, 'deduped');
+          break;
+        }
+        const secs = Math.round(msg.elapsedMs / 1000);
+        const knownPage = isStuckPageType(msg.matchedPattern);
+        if (!knownPage) {
+          // Not a page we have safe keys for: never register key authority.
+          // When the worker sent something to show, post the same card
+          // WITHOUT buttons (informational, not tracked); otherwise drop.
+          logger.info(`[${t}] Stuck warning for unrecognised page (${msg.matchedPattern ?? 'none'}, reason=${msg.reason ?? 'turn_stalled'}) — no keyed card`);
+          emitSessionLifecycleHook(ds, 'session.requires_attention', {
+            reason: 'stuck_warning',
+            elapsedMs: msg.elapsedMs,
+            matchedPattern: msg.matchedPattern,
+          });
+          if (!msg.screenTail && !msg.noticeText) break;
+          if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+          try {
+            await scopedReply(buildStuckPageCard({
+              rootId: sessionAnchorId(ds),
+              sessionId: ds.session.sessionId,
+              nonce: 0,
+              pageType: undefined,
+              cliName: sessionCliDisplayName(ds, botCfg),
+              ...(msg.noticeText ? { noticeText: msg.noticeText } : {}),
+              ...(!msg.reason || msg.reason === 'turn_stalled' ? { stalledSecs: secs } : {}),
+              ...(msg.screenTail ? { screenTail: msg.screenTail } : {}),
+              hasInitiator: false,
+              locale: loc,
+            }), 'interactive', msg.turnId);
+          } catch (err: any) {
+            logger.warn(`[${t}] Failed to post unrecognised-page stuck card: ${err}`);
+            await deliverStuckNoticeAsText(msg, 'refused_unknown', err);
+          }
+          break;
+        }
+        // A keyed card for this very page is being POSTed (another turn, or no
+        // turn id, so the turn dedup above missed it): one card per page, not two.
+        const inFlight = stuckCardPostInFlight.get(ds);
+        if (inFlight && inFlight.nonce === ds.stuckWarningNonce
+          && ds.stuckWarningNonce !== undefined
+          && ds.stuckWarningPageType === msg.matchedPattern) {
+          logger.debug(`[${t}] Stuck warning dedup skipped (card POST in flight for ${msg.matchedPattern}, nonce=${ds.stuckWarningNonce})`);
+          inFlight.deduped.push(msg);
+          await deliverStuckNoticeAsText(msg, 'deduped');
           break;
         }
         // Allocate a daemon-side nonce for this warning (NOT the worker's
@@ -16035,7 +19956,17 @@ function setupWorkerHandlers(
         ds.stuckWarningCliLifetime = msg.cliLifetime;
         const pageType = msg.matchedPattern;
         ds.stuckWarningPageType = pageType;
-        const secs = Math.round(msg.elapsedMs / 1000);
+        // Freeze who may press the card's `initiator` keys now, from the exact
+        // turn the warning names — the in-memory caller may be cleared by the
+        // turn's terminal before anyone clicks. Same rule as the recovery-retry
+        // card; no turn id → operators only.
+        const initiatorOpenId = stuckCardInitiatorOpenId({
+          turnId: msg.turnId,
+          larkAppId: ds.larkAppId,
+          activeTurn: ds.activeInteractiveTurn,
+          replyTarget: msg.turnId ? pickTurnReplyTarget(ds.session, msg.turnId) : undefined,
+        });
+        ds.stuckWarningInitiatorOpenId = initiatorOpenId;
         logger.info(`[${t}] Stuck warning: turn unresolved for ${secs}s (${pageType}) nonce=${nonce}`);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
           reason: 'stuck_warning',
@@ -16044,35 +19975,36 @@ function setupWorkerHandlers(
         });
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
 
-        let description: string;
-        let options: Array<{ label: string; text: string; selected: boolean; type: 'confirm' | 'select'; keys: string[] }>;
-        if (pageType === 'hook review level 2') {
-          // Level 2 — per-hook review: t=trust, Esc=go back. No Enter here.
-          description = `⚠️ Codex 卡在单项 hook 审核界面——消息已写入但 ${secs}s 未完成处理。\n\n选择操作以继续，或打开终端手动处理：`;
-          options = [
-            { label: 't', text: '信任 (trust)', selected: false, type: 'confirm' as const, keys: ['t'] },
-            { label: 'Esc', text: '返回 (go back)', selected: false, type: 'select' as const, keys: ['Escape'] },
-          ];
-        } else {
-          // Level 1 — hooks browser: t=trust all, Enter=review hooks, Esc=close.
-          description = `⚠️ Codex 卡在 hook 审核界面——消息已写入但 ${secs}s 未完成处理。\n\n选择操作以继续，或打开终端手动处理：`;
-          options = [
-            { label: 't', text: '信任全部 (trust all)', selected: false, type: 'confirm' as const, keys: ['t'] },
-            { label: 'Enter', text: '逐项审核 (review hooks)', selected: false, type: 'select' as const, keys: ['Enter'] },
-            { label: 'Esc', text: '关闭 (close)', selected: false, type: 'select' as const, keys: ['Escape'] },
-          ];
-        }
         try {
-          const cardJson = buildTuiPromptCard(
-            sessionAnchorId(ds),
-            ds.session.sessionId,
-            description,
-            options,
-            false,
-            undefined,
-            loc,
-          );
-          const cardMsgId = await scopedReply(cardJson, 'interactive', msg.turnId);
+          const cardJson = buildStuckPageCard({
+            rootId: sessionAnchorId(ds),
+            sessionId: ds.session.sessionId,
+            nonce,
+            pageType,
+            cliName: sessionCliDisplayName(ds, botCfg),
+            ...(msg.noticeText ? { noticeText: msg.noticeText } : {}),
+            ...(!msg.reason || msg.reason === 'turn_stalled' ? { stalledSecs: secs } : {}),
+            ...(msg.screenTail ? { screenTail: msg.screenTail } : {}),
+            hasInitiator: !!initiatorOpenId,
+            initiatorKeysEnabled: config.stuckCardInitiatorKeys !== false,
+            locale: loc,
+          });
+          const flight = { nonce, deduped: [] as Array<typeof msg> };
+          stuckCardPostInFlight.set(ds, flight);
+          let cardMsgId: string;
+          try {
+            cardMsgId = await scopedReply(cardJson, 'interactive', msg.turnId);
+          } catch (postErr) {
+            // Warnings folded into this POST would otherwise never be told:
+            // give each its own text notice ('deduped' already sent the
+            // submit_unconfirmed ones).
+            for (const folded of flight.deduped) {
+              if (folded.reason !== 'submit_unconfirmed') await deliverStuckNoticeAsText(folded, 'refused_keyed', postErr);
+            }
+            throw postErr;
+          } finally {
+            if (stuckCardPostInFlight.get(ds) === flight) stuckCardPostInFlight.delete(ds);
+          }
           // Authority check: if the warning was invalidated (prompt_ready,
           // CLI exit, worker replace) OR the worker was replaced while the POST
           // was in flight, resolve the card immediately and do NOT register it
@@ -16082,7 +20014,7 @@ function setupWorkerHandlers(
           if (ds.worker !== worker || ds.workerGeneration !== workerGeneration || ds.stuckWarningNonce !== nonce) {
             logger.debug(`[${t}] Stuck warning card POSTed but authority stale (nonce=${nonce}, current=${ds.stuckWarningNonce ?? 'none'}, workerGen=${workerGeneration}) — resolving`);
             const locDs = localeForBot(ds.larkAppId);
-            const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+            const resolvedCard = buildTuiPromptResolvedCard(tr('card.stuck.expired', undefined, locDs), locDs);
             updateMessage(ds.larkAppId, cardMsgId, resolvedCard).catch(err =>
               logger.debug(`[${t}] Failed to resolve stale stuck-warning card: ${err}`),
             );
@@ -16092,6 +20024,9 @@ function setupWorkerHandlers(
           publishAttentionPatch(ds);
         } catch (err: any) {
           logger.warn(`[${t}] Failed to post stuck warning card: ${err}`);
+          // The card replaced the worker's plain-text submit notice: if the
+          // card is refused (content audit, size), the notice must still land.
+          await deliverStuckNoticeAsText(msg, 'refused_keyed', err);
           // Card send failed — clear markers ONLY if this nonce is still
           // current AND we still own the worker. A newer warning (nonce+1) may
           // have started while this POST was in flight; we must not wipe the
@@ -16112,7 +20047,7 @@ function setupWorkerHandlers(
         // action was NOT performed, then clear the authority.
         if (ds.stuckWarningNonce === msg.nonce && ds.stuckWarningCardId) {
           const locDs = localeForBot(ds.larkAppId);
-          const resolvedCard = buildTuiPromptResolvedCard('页面已变化，未发送按键', locDs);
+          const resolvedCard = buildTuiPromptResolvedCard(tr('card.stuck.expired', undefined, locDs), locDs);
           updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
             logger.debug(`[${t}] Failed to update stuck-warning card on expired: ${err}`),
           );
@@ -16130,7 +20065,17 @@ function setupWorkerHandlers(
         // falsely report success.
         if (ds.stuckWarningNonce === msg.nonce && ds.stuckWarningCardId) {
           const locDs = localeForBot(ds.larkAppId);
-          const resolvedCard = buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
+          // Report what was sent and what the worker's post-key capture saw.
+          // Still on a blocking page → the worker raises a fresh card (this
+          // one's authority is cleared below, so the dedup lets it through).
+          const resolvedCard = msg.key
+            ? buildStuckKeyResultCard(
+              stuckKeyResultText(msg, locDs),
+              msg.afterObserved === false ? undefined : msg.afterScreenTail,
+              !!msg.afterPageType || msg.afterObserved === false,
+              locDs,
+            )
+            : buildTuiPromptResolvedCard(tr('card.action.tui_done', undefined, locDs), locDs);
           updateMessage(ds.larkAppId, ds.stuckWarningCardId, resolvedCard).catch(err =>
             logger.debug(`[${t}] Failed to resolve stuck-warning card on delivered: ${err}`),
           );
@@ -16222,17 +20167,28 @@ function setupWorkerHandlers(
           break;
         }
         let remoteBackendStartupReconciled = false;
-        if (isRemoteBackendSession(ds) && startupState.onRemoteBackendStartupExit) {
+        if (isRemoteBackendSession(ds)
+            && startupState.onRemoteBackendStartupExit
+            && ds.suppressRecoveryCard === true) {
           const reconcile = startupState.onRemoteBackendStartupExit;
           startupState.onRemoteBackendStartupExit = undefined;
+          // The provider child is already gone. Retire the stale Node worker
+          // before reconciliation so an authoritative close can materialize a
+          // fresh control-only provider from durable state instead of asking
+          // the dead backend for an ACK.
+          retireWorkerProcessOnly(ds, 'remote_rebuild_provider_exit');
           try {
-            remoteBackendStartupReconciled = reconcile() === true;
+            remoteBackendStartupReconciled = await reconcile() === true;
           } catch (error) {
             logger.error(
               `[${t}] Failed to reconcile remote backend startup exit: `
               + `${error instanceof Error ? error.message : String(error)}`,
             );
           }
+        } else if (isRemoteBackendSession(ds) && startupState.onRemoteBackendStartupExit) {
+          // Canonical activation already cleared the recovery presentation gate.
+          // The rollback belongs only to that provisional lifecycle.
+          startupState.onRemoteBackendStartupExit = undefined;
         }
         const suppressExitUi = managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
 
@@ -16279,7 +20235,7 @@ function setupWorkerHandlers(
           logger.info(`[${t}] Shared adopted session ended`);
           // Freeze the streaming card
           if (!suppressExitUi && ds.streamCardId && workerHasInitialized(ds)) {
-            const readUrl = readableTerminalUrlFor(ds);
+            const readUrl = '';
             const turnTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
             const frozenCard = buildStreamingCard(
               ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,
@@ -16293,6 +20249,8 @@ function setupWorkerHandlers(
               idleCardLabel(ds),
               dshRuntimeForSession(ds),
               resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+              false,
+              substituteCardControlFor(ds),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -16328,6 +20286,23 @@ function setupWorkerHandlers(
             break;
           }
           const retirementPhase = remoteRetirementAdmissionPhase(ds);
+          // A remote provider cannot restart inside the same worker without
+          // replacing its lineage. Keeping that worker registered leaves the
+          // Session looking active while every later close talks to a dead
+          // backend and latches `uncertain`. Retire it; explicit close can then
+          // reattach a fresh control provider to the same durable state.
+          if (ds.worker === worker) {
+            retireWorkerProcessOnly(ds, 'remote_backend_exit');
+          }
+          const remoteClosePhase = ds.remoteCloseState?.phase;
+          if ((ds.initConfig?.backendType ?? ds.session.backendType) === 'remote-runner'
+              && (remoteClosePhase === 'preparing' || remoteClosePhase === 'uncertain')) {
+            logger.warn(
+              `[${t}] Clearing process-local Remote Runner close fence after provider exit; `
+              + 'the next close will reconcile through a fresh control provider',
+            );
+            ds.remoteCloseState = undefined;
+          }
           logger.warn(
             `[${t}] Remote backend exited; automatic restart is unsupported`
             + (retirementPhase ? ` (${retirementPhase})` : ''),
@@ -16347,24 +20322,31 @@ function setupWorkerHandlers(
           break;
         }
 
-        // Rate-limit auto-restart to prevent crash loops
+        // Rate-limit auto-restart to prevent crash loops. 判定纳入退出码语义：
+        // 永久失败（身份 77/命令缺失 127）只给一次重启且不被 60s 时间窗豁免，
+        // 避免慢启动 CLI 的确定性失败无限静默重启（见 restart-policy）。
         const key = ds.session.sessionId;
-        const rc = restartCounts.get(key) ?? { count: 0, lastAt: 0 };
-        const now = Date.now();
-        if (now - rc.lastAt > 60_000) rc.count = 0; // reset after 1 min
-        rc.count++;
-        rc.lastAt = now;
-        restartCounts.set(key, rc);
-
-        if (rc.count > 3) {
+        const decision = decideAutoRestart({
+          prev: restartCounts.get(key),
+          now: Date.now(),
+          code: msg.code,
+        });
+        if (decision.shouldRestart) {
+          restartCounts.set(key, decision.next);
+        } else {
+          const rc = decision.next;
+          restartCounts.set(key, rc);
           ds.managedTurnOrigin = undefined;
-          logger.warn(`[${t}] ${sessionCliDisplayName(ds, botCfg)} crashed ${rc.count} times in 1 min, not auto-restarting`);
+          const reasonText = decision.reason === 'permanent_exit'
+            ? `exited with permanent code ${msg.code ?? '?'} after ${rc.count} attempt(s)`
+            : `crashed ${rc.count} times in 1 min`;
+          logger.warn(`[${t}] ${sessionCliDisplayName(ds, botCfg)} ${reasonText}, not auto-restarting`);
           const keepDiagnosticWorker = !!msg.canParkDiagnostic && !!ds.worker && !ds.worker.killed;
           // Freeze the last streaming card so it doesn't stay at "working"
           // forever. Backends without a Web Terminal pass an empty read URL;
           // the card keeps snapshot/manage controls and omits terminal links.
           if (!suppressExitUi && ds.streamCardId && workerHasInitialized(ds)) {
-            const readUrl = readableTerminalUrlFor(ds);
+            const readUrl = keepDiagnosticWorker ? liveReadableTerminalUrlFor(ds) : '';
             const turnTitle = ds.currentTurnTitle || ds.session.title || sessionCliDisplayName(ds, botCfg);
             const frozenCard = buildStreamingCard(
               ds.session.sessionId, sessionAnchorId(ds), readUrl, turnTitle,
@@ -16378,6 +20360,8 @@ function setupWorkerHandlers(
               idleCardLabel(ds),
               dshRuntimeForSession(ds),
               resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+              false,
+              substituteCardControlFor(ds),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -16417,10 +20401,15 @@ function setupWorkerHandlers(
             killWorker(ds);
           }
           const cliName = sessionCliDisplayName(ds, botCfg);
-          const parts = [tr('worker.crash_loop_stopped', { cliName, count: rc.count }, loc)];
+          // 卡片文案按停止原因分流：永久退出通道刻意跨 60s 窗口累计，两次崩溃
+          // 可能相隔很久，沿用「1 分钟内崩溃 N 次」会是假话。
+          const parts = [decision.reason === 'permanent_exit'
+            ? tr('worker.crash_permanent_exit_stopped', { cliName, code: msg.code ?? '?' }, loc)
+            : tr('worker.crash_loop_stopped', { cliName, count: rc.count }, loc)];
           if (keepDiagnosticWorker) {
             parts.push(tr('worker.crash_diagnostic_terminal', undefined, loc));
           }
+          if (msg.sandboxNamespace) parts.push(sandboxNamespaceNotice(msg.sandboxNamespace, loc));
           if (msg.logTail?.trim()) {
             parts.push(`${tr('worker.crash_recent_output', undefined, loc)}\n${msg.logTail.trim()}`);
           } else {
@@ -16446,10 +20435,32 @@ function setupWorkerHandlers(
         // Auto-restart CLI within the same worker. 捎带最新 per-bot env：崩溃
         // 往往正是旧 env 配的错（如过期 token / 失效 proxy），用户改完 env 后
         // 下一轮 auto-restart 直接用新值恢复，不必再手工 /close。
+        //
+        // Through the restart coordinator, never a bare restart IPC: the
+        // in-worker respawn emits no second process-level `ready`, so only the
+        // attemptId-matched `restart_result` can lift the workerReady fence
+        // requestSessionRestart lowers. A bare restart left fork / relay /
+        // dashboard lifecycle ops `worker_busy` until a manual /restart (#1863).
+        // The crash-loop budget above is unchanged: every failed respawn reports
+        // `restart_result: failed` (settling its attempt) BEFORE its own
+        // claude_exit, so each crash lands here again and mints a new attempt.
+        // A crash while another restart attempt is still in flight joins it
+        // instead of stacking a second respawn on top.
         if (ds.worker && !ds.worker.killed) {
           logger.info(`[${t}] Auto-restarting ${sessionCliDisplayName(ds, botCfg)}...`);
-          ds.workerReady = false;
-          ds.worker.send({ type: 'restart', reason: 'cli_crash', env: latestPerBotEnvForRestart(ds), model: latestModelForRespawn(ds), larkToolBinding: latestLarkToolBindingForRespawn(ds) } as DaemonToWorker);
+          const restart = requestSessionRestart(ds, {
+            source: 'cli_crash',
+            notify: status => {
+              if (status === 'failed' || status === 'timed_out') {
+                logger.warn(`[${t}] CLI crash auto-restart ${status}`);
+              }
+            },
+          });
+          if (!restart) {
+            ds.managedTurnOrigin = undefined;
+          } else if (restart.joined) {
+            logger.info(`[${t}] Crash auto-restart joined in-flight restart attempt ${restart.attemptId}`);
+          }
         } else {
           ds.managedTurnOrigin = undefined;
         }
@@ -16465,7 +20476,13 @@ function setupWorkerHandlers(
         // a bounded silent re-fork self-heals without waking anyone (08-23:
         // idle sessions got "会话启动失败" cards while their panes were alive).
         if (scheduleTransientStartupRetry(msg.message, msg.turnId, msg.dispatchAttempt)) break;
-        await notifyStartupFailure(msg.message, msg.turnId, msg.dispatchAttempt);
+        await notifyStartupFailure(
+          msg.sandboxNamespace
+            ? `${msg.message}\n${sandboxNamespaceNotice(msg.sandboxNamespace, loc)}`
+            : msg.message,
+          msg.turnId,
+          msg.dispatchAttempt,
+        );
         break;
       }
 
@@ -16546,9 +20563,6 @@ function setupWorkerHandlers(
           break;
         }
         const prior = ds.session.remoteBackendState;
-        const rebuildGenerationAdvanced = startupState.onRemoteBackendStartupExit !== undefined
-          && prior !== undefined
-          && state.generation > prior.generation;
         if (prior && state.provider !== prior.provider) {
           logger.error(`[${t}] Ignored remote backend state from a different provider`);
           break;
@@ -16572,15 +20586,12 @@ function setupWorkerHandlers(
         try {
           sessionStore.updateSession(ds.session);
           // RemoteRunnerBackend publishes its normalized ready state before
-          // firing onReady. For an explicit rebuild this is the durable proof
-          // that the provider crossed its second (backend) startup boundary.
-          // onBackendState immediately replays the CONSTRUCTOR'S initial state
-          // when the callback is registered. That same-generation replay is not
-          // provider readiness and must not disarm rollback: otherwise a child
-          // exit during resume leaves the Session ghost-active with no backend.
-          if (rebuildGenerationAdvanced) {
-            startupState.onRemoteBackendStartupExit = undefined;
-          }
+          // firing onReady. The advanced generation proves startup progress,
+          // but not stability: keep the rollback callback armed while the
+          // durable-control presentation gate is still set. Canonical commit
+          // clears suppressRecoveryCard; a later provider exit then follows the
+          // ordinary retire-and-reconcile path instead of rolling back a
+          // committed lifecycle.
         } catch (err) {
           ds.session.remoteBackendState = prior;
           ds.session.remoteRunnerUsage = priorUsage;
@@ -16711,11 +20722,14 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored explicit_reply_observed from stale worker generation`);
           break;
         }
+        if (ownsLifecycleMutation() && msg.messageId) cliNotices.reply(msg.turnId, msg.responseKind === 'final');
         if (msg.messageId && msg.terminalCarrier) {
           recordTurnTerminalCarrier(ds, msg.turnId, {
             messageId: msg.messageId,
             kind: msg.terminalCarrier,
+            ...(msg.responseKind ? { responseKind: msg.responseKind } : {}),
           });
+          if (msg.responseKind === 'final') noteLateFinalReply(ds, msg.turnId);
         }
         if (ds.session.principalLane && msg.messageId) {
           const binding = readPrincipalLaneTurnBinding(ds, msg.turnId);
@@ -16850,7 +20864,11 @@ function setupWorkerHandlers(
           }
           const accessUrl = resolvePluginResultAccessUrl(msg.viewToken);
           if (!accessUrl) throw new Error('plugin_result_access_url_unavailable');
-          const card = buildTrustedResultDeliveryCard({ accessUrl, expiresAt: msg.expiresAt });
+          const card = buildTrustedResultDeliveryCard({
+            accessUrl,
+            expiresAt: msg.expiresAt,
+            brand: getBotBrand(ds.larkAppId),
+          });
           const messageId = await scopedReply(card, 'interactive', msg.turnId, {
             uuid: deliveryUuid('entry'),
             replyTarget: frozen.target,
@@ -16889,7 +20907,20 @@ function setupWorkerHandlers(
           reason: 'user_notify',
           message: msg.message,
         });
+        // The card already asks about this dialog. Fork agents and sessions
+        // without the hook get no card and keep this notice.
+        if (msg.kind === 'claude_permission_prompt') {
+          if (!permissionCardPending(ds)) await new Promise(resolve => setTimeout(resolve, PERMISSION_CARD_GRACE_MS));
+          if (permissionCardPending(ds)) {
+            logger.info(`[${t}] Claude permission dialog notice skipped: PermissionRequest card pending`);
+            break;
+          }
+        }
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        if (msg.kind === 'input_not_submitted' && ownsLifecycleMutation()
+          && (!msg.turnId || !ds.currentTurnId || ds.currentTurnId === msg.turnId)) {
+          scheduleActiveRuntimePatch(ds);
+        }
         // Mute ONLY the Lark push for the per-bot opt-out: checked against the
         // LIVE registry so an already-stalled turn is silenced the moment the
         // config lands. The lifecycle hook above and the dashboard stalled
@@ -16906,7 +20937,20 @@ function setupWorkerHandlers(
           }
         }
         try {
-          await scopedReply(msg.message, 'text', msg.turnId);
+          // An unsubmitted input with a readable screen goes out as a card with
+          // the bottom of the terminal; everything else stays plain text.
+          if (msg.kind === 'input_not_submitted' && msg.screenTail) {
+            try {
+              await scopedReply(buildInputNotSubmittedCard(msg.message, msg.screenTail, loc), 'interactive', msg.turnId);
+            } catch (err: any) {
+              // A refused card (content audit on the screen text, size) must
+              // not swallow the notice the text path always delivered.
+              logger.warn(`[${t}] input_not_submitted card refused, falling back to text: ${err?.message ?? err}`);
+              await sendTurnNotice(ds, { kind: 'user_notify', turnId: fallbackTurnId(ds, msg.turnId), msgType: 'text', content: msg.message });
+            }
+          } else {
+            await sendTurnNotice(ds, { kind: 'user_notify', turnId: fallbackTurnId(ds, msg.turnId), msgType: 'text', content: msg.message });
+          }
         } catch (err: any) {
           logger.error(`[${t}] Failed to deliver user_notify to Lark: ${err.message}`);
         }
@@ -16922,7 +20966,7 @@ function setupWorkerHandlers(
           `[${t}] Codex App steer accepted `
           + `appTurn=${msg.appTurnId.slice(0, 12)} replyTurn=${msg.turnId.slice(0, 12)}`,
         );
-        if (managedAuxUiSuppressed(msg.turnId, undefined)) break;
+        if (managedAuxUiSuppressed(msg.turnId, undefined) || silentTurnReactions(ds)) break;
         try {
           await scopedReply(tr('worker.steer_accepted', undefined, loc), 'text', msg.turnId);
         } catch {
@@ -16947,8 +20991,83 @@ function setupWorkerHandlers(
           );
           break;
         }
+        try {
+          getLinkRefRuntime()?.settleTurn({
+            appId: ds.larkAppId,
+            sessionId: ds.session.sessionId,
+            turnId: msg.turnId,
+            ...(msg.dispatchAttempt !== undefined
+              ? { dispatchAttempt: msg.dispatchAttempt }
+              : {}),
+          });
+        } catch {
+          logger.warn(
+            `[${t}] LinkRef turn settlement failed `
+            + `(turn=${msg.turnId.substring(0, 8)}, code=link_ref_ledger_unavailable)`,
+          );
+        }
+        if (ownsLifecycleMutation()) cliNotices.finish(msg.turnId, msg.dispatchAttempt);
         forgetScheduledTurnCaller(ds, msg.turnId);
+        // Mark the turn terminal for identity-decision replay gating (bounded;
+        // the generation gate above makes stale-worker terminals harmless).
+        const terminalSet = ds.terminalIdentityTurnIds ?? (ds.terminalIdentityTurnIds = new Set());
+        terminalSet.add(msg.turnId);
+        trimOldest(terminalSet, TERMINAL_RECEIPT_DEDUPE_MAX);
+        /** Retirement is independent of whether this exact start was observed yet. */
+        const executionTerminals = ds.replyExecutionTerminals ??= new Map();
+        /** Receipt time supplies an upper bound for attempt-less compatibility terminals. */
+        const executionTerminalAt = Date.now();
+        executionTerminals.set(JSON.stringify([workerGeneration, msg.turnId, msg.dispatchAttempt ?? null]), executionTerminalAt);
+        // Legacy terminals may omit dispatchAttempt. Retire this turn's observed
+        // clocks in the current worker, while keeping their original render timing.
+        for (const [executionKey, execution] of ds.replyExecutionStarts ?? []) {
+          /** Native start keys carry the exact logical turn and optional retry attempt. */
+          const [executionTurnId, executionAttempt] = JSON.parse(executionKey) as [string, number | null];
+          if (execution.workerGeneration === workerGeneration && executionTurnId === msg.turnId
+            && (msg.dispatchAttempt === undefined || executionAttempt === msg.dispatchAttempt)) {
+            execution.completed = true;
+            executionTerminals.set(JSON.stringify([workerGeneration, executionTurnId, executionAttempt]), executionTerminalAt);
+          }
+        }
+        // Keep the same bound as native start observations; generations never share a key.
+        while (executionTerminals.size > 512) {
+          /** Retire the oldest dedupe fact once it leaves the bounded observation window. */
+          const oldestTerminalKey = executionTerminals.keys().next().value;
+          if (oldestTerminalKey !== undefined) {
+            executionTerminals.delete(oldestTerminalKey);
+          }
+        }
+        // Auto-compact and HTTP-caller turns never reach the group, so they
+        // must not replace the session's last user-visible turn result.
+        const outcomeExcluded = isMaintenanceTurnId(msg.turnId)
+          || ds.session.idleAutoCompact?.inFlight?.turnId === msg.turnId
+          || ds.idleAutoCompactDispatchedTurnId === msg.turnId
+          || !!ds.pendingWaitPromises?.has(msg.turnId)
+          || !!ds.asyncTriggerResults?.has(msg.turnId)
+          || !!ds.settledHttpTerminalTurns?.has(msg.turnId);
         observeTurnResultTerminal(ds, msg, workerGeneration);
+        if (settleAutoCompactSafeComposerRefusal(ds, msg)) {
+          if (noteIdleAutoCompactRefused(ds, msg.turnId)) {
+            try { sessionStore.updateSession(ds.session); } catch { /* next status edge re-saves */ }
+          }
+          // The worker deliberately refused an unattended maintenance write.
+          // Clear this synthetic turn's pending-card marker immediately and
+          // surface one cooldown-bounded operational warning; do not wait for
+          // a later human turn to repair the projection.
+          persistStreamCardState(ds);
+          if (ds.lastScreenStatus === 'idle') scheduleActiveRuntimePatch(ds);
+          logger.warn(
+            `[${t}] Auto compact skipped: live empty composer evidence was unavailable `
+            + `(turn=${msg.turnId.substring(0, 20)})`,
+          );
+        }
+        // Any other non-completed end of our idle auto-compact turn (Ctrl-C,
+        // crash, ambiguous) must not be announced as a successful compact. The
+        // refusal branch above already settled the safe-composer case, so this
+        // is a no-op for it.
+        if (noteIdleAutoCompactTurnEnded(ds, msg.turnId, msg.status)) {
+          try { sessionStore.updateSession(ds.session); } catch { /* next status edge re-saves */ }
+        }
         // Defense in depth: the worker sends a token-matched revoke before the
         // terminal IPC, but an older/mixed worker must still lose authority at
         // this exact terminal edge. Tuple-match prevents a late turn N event
@@ -16982,9 +21101,17 @@ function setupWorkerHandlers(
             { dispatchAttempt: msg.dispatchAttempt, owns: ownsLifecycleMutation });
           })().catch(error => logger.warn(`[${t}] reply-card terminal: ${error.message}`));
         }
-        finalizeCotMessage(ds, msg.turnId, msg.status);
+        finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
         ds.cotForced = undefined;
         ds.lastThinkingUpdate = undefined;
+        // 「执行失败」只在下一条 IM 消息入轮时清（beginNewTurn / 输入提交）。在
+        // Web 终端里直接敲「继续」的轮次不过这两道门，跑完后卡片仍停在失败。
+        // 终态按 transcript 顺序到达，失败之后完成的轮次一定更新，足以说明会话
+        // 已经走出那次失败。
+        if (msg.status === 'completed' && ds.failedIdleTurnId && ds.failedIdleTurnId !== msg.turnId) {
+          ds.failedIdleTurnId = undefined;
+          if (ds.lastScreenStatus === 'idle') scheduleActiveRuntimePatch(ds);
+        }
         const isClaudeProviderFailure = msg.status !== 'completed'
           && sessionCliId(ds, botCfg) === 'claude-code'
           && (msg.errorCode?.startsWith('provider_') ?? false);
@@ -16993,7 +21120,7 @@ function setupWorkerHandlers(
           ds.session,
           readonlyTerminal,
         );
-        const ordinaryHttpTerminal = sessionCliId(ds, botCfg) === 'codex' && (ds.pendingWaitPromises?.has(msg.turnId)
+        const ordinaryHttpTerminal = codexCapacityRecoveryCli(sessionCliId(ds, botCfg)) && (ds.pendingWaitPromises?.has(msg.turnId)
           || ds.asyncTriggerResults?.has(msg.turnId)
           || ds.settledHttpTerminalTurns?.has(msg.turnId));
         if (ordinaryHttpTerminal && ds.session.ordinaryTurnRecovery?.currentTurnId === msg.turnId) {
@@ -17007,13 +21134,20 @@ function setupWorkerHandlers(
         const recoveryOwnsTerminal = (!ordinaryHttpTerminal && ordinaryTurnRecoveryHandlesTerminal(ds.session, msg))
           || readonlyContinuationOwnsTerminal;
         let recoveryHandled = false;
+        // `turn.finished` means this durable callback accepted the worker
+        // terminal, not merely that the IPC arrived. A thrown persist is not
+        // success and does not consume the in-process dedupe key, so a later
+        // replay can still emit. Same rule as the Codex App settlement below.
+        let terminalPersisted = true;
         try {
           await cb.onTurnTerminal?.(ds, msg, { workerGeneration });
         } catch (err: any) {
+          terminalPersisted = false;
           // The durable receipt remains non-terminal and can be reconciled;
           // never let a projection/store failure crash the worker IPC loop.
           logger.error(`[${t}] Failed to persist turn_terminal for ${msg.turnId.substring(0, 8)}: ${err.message}`);
         }
+        if (terminalPersisted) publishTurnFinished(ds, msg);
         try {
           if (!ordinaryHttpTerminal) handleOrdinaryTurnRecoveryTerminal(ds.session, msg);
           recoveryHandled = recoveryOwnsTerminal;
@@ -17039,7 +21173,7 @@ function setupWorkerHandlers(
           );
         }
         let nonLarkFailureHandled = false;
-        if ((isClaudeProviderFailure || msg.status === 'failed' || msg.status === 'ambiguous')
+        if ((isClaudeProviderFailure || msg.status === 'failed' || msg.status === 'ambiguous' || msg.status === 'cancelled')
           && !ds.session.vcMeetingReceiver) {
           const failureCode = msg.errorCode ?? msg.status;
           const waitPromise = ds.pendingWaitPromises?.get(msg.turnId);
@@ -17073,15 +21207,37 @@ function setupWorkerHandlers(
                 `[${t}] Ignored failed terminal for completed async HTTP turn `
                 + msg.turnId.substring(0, 8),
               );
-            } else {
-              if (asyncResult?.status === 'pending') {
-                asyncResult.status = 'failed';
-                asyncResult.failedAt = failedAt;
-                asyncResult.errorCode = 'trigger_failed';
-                asyncResult.terminalErrorCode = failureCode;
+            } else if (msg.status !== 'cancelled'
+              || asyncResult?.status === 'pending' || asyncResult?.status === 'failed') {
+              // MiniMax's bare cancellation interrupts a pending trigger only.
+              // remote-runner sends turnFailed first: retain that failure and
+              // upgrade its generic code with this terminal's provider code.
+              // Use the same snapshot for memory and disk; a virtual/headless
+              // sink alone must not create a cancelled trigger out of nothing.
+              const interrupted = msg.status === 'cancelled' && asyncResult?.status === 'pending';
+              if (asyncResult?.status === 'pending' || asyncResult?.status === 'failed') {
+                if (interrupted) {
+                  asyncResult.status = 'interrupted';
+                  asyncResult.interruptedAt = failedAt;
+                } else {
+                  asyncResult.status = 'failed';
+                  asyncResult.failedAt = failedAt;
+                  asyncResult.errorCode = 'trigger_failed';
+                  asyncResult.terminalErrorCode = failureCode;
+                  // Re-masked here: an older or foreign worker may not have.
+                  // Both are this terminal's, like the code: a later terminal
+                  // (another attempt) never shows under an earlier one's text.
+                  const diagnostics = turnFailureDiagnostics({ errorDetail: msg.errorDetail, screen: msg.screenTail });
+                  if (diagnostics.errorDetail) asyncResult.terminalErrorDetail = diagnostics.errorDetail;
+                  else delete asyncResult.terminalErrorDetail;
+                  if (diagnostics.screenTail) asyncResult.terminalScreenTail = diagnostics.screenTail;
+                  else delete asyncResult.terminalScreenTail;
+                }
               }
               try {
-                const outcome = asyncTriggerStore.recordTerminalFailureStrict(
+                const outcome = interrupted
+                  ? asyncTriggerStore.recordInterruptedStrict(ds.session.sessionId, msg.turnId, failedAt, ds.larkAppId)
+                  : asyncTriggerStore.recordTerminalFailureStrict(
                   ds.session.sessionId,
                   msg.turnId,
                   failedAt,
@@ -17106,7 +21262,7 @@ function setupWorkerHandlers(
               ds.idempotentAsyncTurns?.delete(msg.turnId);
               logger.info(
                 `[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} `
-                + `failed (${failureCode})`,
+                + `${interrupted ? 'interrupted' : 'failed'} (${failureCode})`,
               );
             }
           }
@@ -17149,21 +21305,30 @@ function setupWorkerHandlers(
             turnId: msg.turnId,
           });
           try {
-            await scopedReply(
-              buildSessionTurnFailedCard(ds, {
+            await sendTurnNotice(ds, {
+              kind: 'turn_failure',
+              turnId: fallbackTurnId(ds, msg.turnId),
+              msgType: 'interactive',
+              content: buildSessionTurnFailedCard(ds, {
                 status: msg.status === 'ambiguous' ? 'ambiguous' : 'failed',
                 ...(msg.errorCode !== undefined ? { errorCode: msg.errorCode } : {}),
                 ...(msg.retryable !== undefined ? { retryable: msg.retryable } : {}),
               }),
-              'interactive',
-              msg.turnId,
-            );
+            });
           } catch (err) {
             logger.error(
               `[${t}] Failed to deliver turn failure card: `
               + `${err instanceof Error ? err.message : String(err)}`,
             );
           }
+        }
+        if (!outcomeExcluded && !nonLarkFailureHandled && !ordinaryHttpTerminal) {
+          void recordTurnOutcome(ds, msg, {
+            recoveryHandled,
+            isFinalDelivered: () => isFinalTurnTerminalCarrier(ds.turnTerminalCarriers?.get(msg.turnId)),
+          }).catch((err: unknown) => {
+            logger.warn(`[${t}] turn outcome: ${err instanceof Error ? err.message : String(err)}`);
+          });
         }
         // Async-HTTP settle-on-terminal (core-only completion bug #70): a turn
         // the worker's bridge gate suppressed as GENUINE SILENCE (the model
@@ -17210,22 +21375,49 @@ function setupWorkerHandlers(
         // must retain their pre-existing explicit-@ text receipt instead;
         // managed turns remain suppressed by the existing gate below.
         const terminalReplyContext = ds.session.turnReplyContexts?.[msg.turnId];
-        const terminalCarrier = ds.turnTerminalCarriers?.get(msg.turnId);
-        const terminalReceiptKind: TurnTerminalReceiptKind | undefined = msg.status === 'completed'
+        const visibleCarrier = ds.turnTerminalCarriers?.get(msg.turnId);
+        const terminalCarrier = isFinalTurnTerminalCarrier(visibleCarrier)
+          ? visibleCarrier
+          : undefined;
+        // Positive evidence that the card observed so far is interim output.
+        // The worker queues final_output BEFORE turn_terminal, while the
+        // daemon records a transcript fallback final's carrier only AFTER the
+        // Lark send round-trip — so at this synchronous point an in-flight
+        // fallback still looks like an interim-only turn.
+        const interimCarrierOnly = msg.status === 'completed'
+          && !!visibleCarrier
+          && !terminalCarrier;
+        let terminalReceiptKind: TurnTerminalReceiptKind | undefined;
+        // An explicit progress/auxiliary send is positive proof that the
+        // visible card is non-final. The CLI already persists responseKind;
+        // never overwrite that contract with a mechanical completion footer.
+        if (msg.status === 'completed' && !interimCarrierOnly) {
           // A successful explicit send is visible output even though the
           // model's final assistant block is the required suppression sentinel.
           // Only a genuinely bodyless turn may claim "AI determined no reply".
-          ? (msg.outputDisposition === 'nothing_to_send' && !terminalCarrier ? 'silent' : 'completed')
-          : undefined;
-        const shouldPostTerminalReceipt = terminalReceiptKind !== undefined
-          && !!terminalReplyContext
+          terminalReceiptKind = msg.outputDisposition === 'nothing_to_send' && !terminalCarrier
+            ? 'silent'
+            : 'completed';
+        }
+        const terminalReceiptRouteEligible = !!terminalReplyContext
           && !recoveryHandled
           && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)
           && !ds.session.vcMeetingReceiver
           && !streamingCardDisabled(ds, msg.turnId)
           && !botCfg.privateCard
           && replyCardModeFor(ds, msg.turnId) === 'legacy'
-          && effectiveReplyDelivery(ds.larkAppId, effectiveCliId, sessionPromptInjection(ds)) === 'send';
+          // 按本会话冻结沙箱判：续轮信封与回执口径必须同源于该 worker 的真实
+          // 采集能力（sandbox 改动 next-session-only，live 可能已翻转）。
+          && effectiveReplyDelivery(ds.larkAppId, effectiveCliId, sessionPromptInjection(ds), { sessionSandbox: ds.session.sandbox }) === 'send';
+        const shouldPostTerminalReceipt = terminalReceiptKind !== undefined
+          && terminalReceiptRouteEligible;
+        // Interim-only turns get no synchronous footer decision. Wait for the
+        // turn's final-output drain and re-read the carrier: a fallback final
+        // landing in that window is the authoritative completion card and must
+        // still receive its footer; without one the interim card stays
+        // footerless by design (and no claim is left behind).
+        const awaitInterimFinalCarrier = interimCarrierOnly
+          && terminalReceiptRouteEligible;
         // Deliberate-silence closure (positive evidence only — the same
         // 'nothing_to_send' contract as the async settle above):
         //   ① mark the session so every idle-card rebuild renders
@@ -17239,7 +21431,7 @@ function setupWorkerHandlers(
         //     it must never re-trigger the bot (or a peer bot) that went quiet.
         if (msg.status === 'completed'
           && msg.outputDisposition === 'nothing_to_send'
-          && !terminalCarrier
+          && !visibleCarrier
           && !ds.session.vcMeetingReceiver) {
           // Consume the origin record ONLY when this attempt could actually post:
           // a suppressed attempt that ate the record would leave a later,
@@ -17293,133 +21485,172 @@ function setupWorkerHandlers(
         // The exact inbound reply context proves this was a Lark turn; unified,
         // card-off/private/doc/meeting/silent-schedule paths keep their existing
         // behavior and failed/ambiguous/cancelled never enter this branch.
-        if (shouldPostTerminalReceipt && terminalReplyContext && terminalReceiptKind) {
+        if (terminalReplyContext && (shouldPostTerminalReceipt || awaitInterimFinalCarrier)) {
           const settled = ds.terminalReceiptTurnIds ?? (ds.terminalReceiptTurnIds = new Set());
-          if (!settled.has(msg.turnId)) {
-            // Claim before waiting: duplicate terminal IPC and dispatchAttempt
-            // replay cannot race two strips into the same thread.
-            settled.add(msg.turnId);
-            trimOldest(settled, TERMINAL_RECEIPT_DEDUPE_MAX);
-            const replyTarget = { ...terminalReplyContext.target };
-            const receiptUuid = turnTerminalReceiptUuid(ds.session.sessionId, msg.turnId);
-            // Keep graceful shutdown fenced across the answer drain and the
-            // receipt's own bounded retry pipeline. This registration is
-            // intentionally session-only; adding it to the same per-turn set
-            // would make the receipt wait on itself forever.
-            const finishReceiptDrain = beginFinalOutputDelivery(ds);
-            void (async () => {
-              try {
-                // A transcript fallback final can still be in-flight when the
-                // ordered terminal IPC arrives. Never settle the UI before its
-                // delivery has either succeeded or exhausted retries.
-                await waitForTurnFinalOutputDeliveryDrain(ds, msg.turnId);
+          const replyTarget = { ...terminalReplyContext.target };
+          const receiptUuid = turnTerminalReceiptUuid(ds.session.sessionId, msg.turnId);
+          // Carrier routing after the answer drain, shared by the immediate
+          // receipt and the deferred interim decision. The caller owns the
+          // claim, the drain fence and error handling.
+          const routeAfterDrain = async (kind: TurnTerminalReceiptKind): Promise<void> => {
+            const carrier = ds.turnTerminalCarriers?.get(msg.turnId);
+            if (carrier?.kind === 'standard_reply_card') {
+              for (let attempt = 0; attempt < TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length; attempt++) {
+                const delayMs = TERMINAL_RECEIPT_RETRY_BACKOFF_MS[attempt];
+                if (delayMs > 0) await new Promise<void>(resolve => setTimeout(resolve, delayMs));
                 if (!ownsLifecycleMutation()) return;
-
-                const carrier = ds.turnTerminalCarriers?.get(msg.turnId);
-                if (carrier?.kind === 'standard_reply_card') {
-                  for (let attempt = 0; attempt < TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length; attempt++) {
-                    const delayMs = TERMINAL_RECEIPT_RETRY_BACKOFF_MS[attempt];
-                    if (delayMs > 0) await new Promise<void>(resolve => setTimeout(resolve, delayMs));
-                    if (!ownsLifecycleMutation()) return;
-                    try {
-                      if (await patchTurnTerminalCarrier(
-                        ds,
-                        carrier.messageId,
-                        terminalReceiptKind,
-                      )) return;
-                      // A marker can outlive a manually replaced/non-card
-                      // message. Fall through to the independent strip rather
-                      // than retrying a structurally unpatchable payload.
-                      break;
-                    } catch (err) {
-                      if (attempt + 1 === TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length) {
-                        logger.warn(
-                          `[${t}] Terminal carrier PATCH exhausted for `
-                          + `${msg.turnId.substring(0, 8)}: `
-                          + `${err instanceof Error ? err.message : String(err)}`,
-                        );
-                        break;
-                      }
-                      logger.warn(
-                        `[${t}] Terminal carrier PATCH retry ${attempt + 1} for `
-                        + `${msg.turnId.substring(0, 8)}: `
-                        + `${err instanceof Error ? err.message : String(err)}`,
-                      );
-                    }
-                  }
-                }
-
-                // With no explicit/fallback body, the live streaming card is
-                // already the last visible carrier. Keep the thread quiet and
-                // render the terminal wording there. CARD_POSTING_SENTINEL is
-                // also accepted: scheduleActiveRuntimePatch records a pending
-                // refresh that the POST completion immediately reconciles.
-                if (!carrier
-                  && (!ds.currentTurnId || ds.currentTurnId === msg.turnId)
-                  && !!ds.streamCardId) {
-                  if (terminalReceiptKind === 'silent') {
-                    ds.silentIdleTurnId = msg.turnId;
-                    ds.completedIdleTurnId = undefined;
-                  } else {
-                    ds.completedIdleTurnId = msg.turnId;
-                    ds.silentIdleTurnId = undefined;
-                  }
-                  if (scheduleActiveRuntimePatch(ds)) return;
-                }
-
-                // An independent strip is meaningful only while this remains
-                // the newest turn. A standard card can still be patched safely
-                // after type-ahead because it is bound to the old turn itself;
-                // a new bottom-of-thread strip would incorrectly claim that the
-                // newer turn is awaiting input.
-                if (ds.currentTurnId && ds.currentTurnId !== msg.turnId) {
-                  logger.debug(
-                    `[${t}] Skipped stale terminal receipt for ${msg.turnId.substring(0, 8)}`,
-                  );
-                  return;
-                }
-
-                for (let attempt = 0; attempt < TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length; attempt++) {
-                  const delayMs = TERMINAL_RECEIPT_RETRY_BACKOFF_MS[attempt];
-                  if (delayMs > 0) await new Promise<void>(resolve => setTimeout(resolve, delayMs));
-                  if (!ownsLifecycleMutation()
-                    || (ds.currentTurnId && ds.currentTurnId !== msg.turnId)) {
-                    logger.debug(
-                      `[${t}] Skipped stale terminal receipt for ${msg.turnId.substring(0, 8)}`,
-                    );
-                    return;
-                  }
-                  try {
-                    await scopedReply(
-                      buildTurnTerminalReceiptCard(
-                        terminalReceiptKind,
-                        localeForBot(ds.larkAppId),
-                      ),
-                      'interactive',
-                      msg.turnId,
-                      { uuid: receiptUuid, replyTarget },
-                    );
-                    return;
-                  } catch (err) {
-                    if (attempt + 1 === TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length) throw err;
+                try {
+                  if (await patchTurnTerminalCarrier(
+                    ds,
+                    carrier.messageId,
+                    kind,
+                  )) return;
+                  // A marker can outlive a manually replaced/non-card
+                  // message. Fall through to the independent strip rather
+                  // than retrying a structurally unpatchable payload.
+                  break;
+                } catch (err) {
+                  if (attempt + 1 === TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length) {
                     logger.warn(
-                      `[${t}] Terminal receipt retry ${attempt + 1} for `
+                      `[${t}] Terminal carrier PATCH exhausted for `
                       + `${msg.turnId.substring(0, 8)}: `
                       + `${err instanceof Error ? err.message : String(err)}`,
                     );
+                    break;
                   }
+                  logger.warn(
+                    `[${t}] Terminal carrier PATCH retry ${attempt + 1} for `
+                    + `${msg.turnId.substring(0, 8)}: `
+                    + `${err instanceof Error ? err.message : String(err)}`,
+                  );
                 }
+              }
+            }
+
+            // With no explicit/fallback body, the live streaming card is
+            // already the last visible carrier. Keep the thread quiet and
+            // render the terminal wording there. CARD_POSTING_SENTINEL is
+            // also accepted: scheduleActiveRuntimePatch records a pending
+            // refresh that the POST completion immediately reconciles.
+            if (!carrier
+              && (!ds.currentTurnId || ds.currentTurnId === msg.turnId)
+              && !!ds.streamCardId) {
+              if (kind === 'silent') {
+                ds.silentIdleTurnId = msg.turnId;
+                ds.completedIdleTurnId = undefined;
+              } else {
+                ds.completedIdleTurnId = msg.turnId;
+                ds.silentIdleTurnId = undefined;
+              }
+              if (scheduleActiveRuntimePatch(ds)) return;
+            }
+
+            // An independent strip is meaningful only while this remains
+            // the newest turn. A standard card can still be patched safely
+            // after type-ahead because it is bound to the old turn itself;
+            // a new bottom-of-thread strip would incorrectly claim that the
+            // newer turn is awaiting input.
+            if (ds.currentTurnId && ds.currentTurnId !== msg.turnId) {
+              logger.debug(
+                `[${t}] Skipped stale terminal receipt for ${msg.turnId.substring(0, 8)}`,
+              );
+              return;
+            }
+
+            for (let attempt = 0; attempt < TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length; attempt++) {
+              const delayMs = TERMINAL_RECEIPT_RETRY_BACKOFF_MS[attempt];
+              if (delayMs > 0) await new Promise<void>(resolve => setTimeout(resolve, delayMs));
+              if (!ownsLifecycleMutation()
+                || (ds.currentTurnId && ds.currentTurnId !== msg.turnId)) {
+                logger.debug(
+                  `[${t}] Skipped stale terminal receipt for ${msg.turnId.substring(0, 8)}`,
+                );
+                return;
+              }
+              try {
+                await scopedReply(
+                  buildTurnTerminalReceiptCard(
+                    kind,
+                    localeForBot(ds.larkAppId),
+                  ),
+                  'interactive',
+                  msg.turnId,
+                  { uuid: receiptUuid, replyTarget },
+                );
+                return;
               } catch (err) {
-                // No attempt was confirmed. Release the in-memory claim so a
-                // durable replay may compensate; the stable provider UUID
-                // collapses commit-unknown retries at Lark.
+                if (attempt + 1 === TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length) throw err;
+                logger.warn(
+                  `[${t}] Terminal receipt retry ${attempt + 1} for `
+                  + `${msg.turnId.substring(0, 8)}: `
+                  + `${err instanceof Error ? err.message : String(err)}`,
+                );
+              }
+            }
+          };
+          if (shouldPostTerminalReceipt && terminalReceiptKind) {
+            if (!settled.has(msg.turnId)) {
+              // Claim before waiting: duplicate terminal IPC and dispatchAttempt
+              // replay cannot race two strips into the same thread.
+              settled.add(msg.turnId);
+              trimOldest(settled, TERMINAL_RECEIPT_DEDUPE_MAX);
+              // Keep graceful shutdown fenced across the answer drain and the
+              // receipt's own bounded retry pipeline. This registration is
+              // intentionally session-only; adding it to the same per-turn set
+              // would make the receipt wait on itself forever.
+              const finishReceiptDrain = beginFinalOutputDelivery(ds);
+              void (async () => {
+                try {
+                  // A transcript fallback final can still be in-flight when the
+                  // ordered terminal IPC arrives. Never settle the UI before its
+                  // delivery has either succeeded or exhausted retries.
+                  await waitForTurnFinalOutputDeliveryDrain(ds, msg.turnId);
+                  if (!ownsLifecycleMutation()) return;
+                  await routeAfterDrain(terminalReceiptKind);
+                } catch (err) {
+                  // No attempt was confirmed. Release the in-memory claim so a
+                  // durable replay may compensate; the stable provider UUID
+                  // collapses commit-unknown retries at Lark.
+                  settled.delete(msg.turnId);
+                  logger.warn(
+                    `[${t}] Failed to post terminal receipt for ${msg.turnId.substring(0, 8)}: `
+                    + `${err instanceof Error ? err.message : String(err)}`,
+                  );
+                } finally {
+                  finishReceiptDrain();
+                }
+              })();
+            }
+          }
+          if (awaitInterimFinalCarrier) {
+            // No synchronous claim: a turn whose fallback final never lands
+            // must leave no receipt marker behind. The fence is still needed so
+            // graceful shutdown waits for the deferred decision.
+            const finishInterimDrain = beginFinalOutputDelivery(ds);
+            void (async () => {
+              try {
+                await waitForTurnFinalOutputDeliveryDrain(ds, msg.turnId);
+                if (!ownsLifecycleMutation()) return;
+                // Re-decide against the carrier as it stands after the drain.
+                // Only an authoritative final that actually landed may receive
+                // the completion footer; a still-interim turn stays quiet.
+                const settledCarrier = ds.turnTerminalCarriers?.get(msg.turnId);
+                if (!isFinalTurnTerminalCarrier(settledCarrier)) return;
+                // A replayed terminal IPC on the immediate path may already own
+                // the claim; its footer patch is idempotent via the stable UUID.
+                if (settled.has(msg.turnId)) return;
+                settled.add(msg.turnId);
+                trimOldest(settled, TERMINAL_RECEIPT_DEDUPE_MAX);
+                await routeAfterDrain('completed');
+              } catch (err) {
+                // Release a claim taken after the drain so a replay can retry.
                 settled.delete(msg.turnId);
                 logger.warn(
-                  `[${t}] Failed to post terminal receipt for ${msg.turnId.substring(0, 8)}: `
+                  `[${t}] Failed to post deferred terminal receipt for ${msg.turnId.substring(0, 8)}: `
                   + `${err instanceof Error ? err.message : String(err)}`,
                 );
               } finally {
-                finishReceiptDrain();
+                finishInterimDrain();
               }
             })();
           }
@@ -17431,10 +21662,27 @@ function setupWorkerHandlers(
           });
         }
         try {
-          await cb.onDeferredScheduleTurnSettled?.(ds, { turnId: msg.turnId, source: 'terminal' });
+          await cb.onDeferredScheduleTurnSettled?.(ds, {
+            turnId: msg.turnId,
+            source: 'terminal',
+            ...(msg.status !== 'completed' && msg.errorCode ? { errorCode: msg.errorCode } : {}),
+          });
         } catch (err: any) {
           logger.error(`[${t}] Failed to settle deferred schedule turn ${msg.turnId.substring(0, 8)}: ${err.message}`);
         }
+        // The turn reached a terminal boundary; release its publication anchor
+        // and forget proven material for every turn no live state still names
+        // (queued turns and continuations stay retained). No-op for sessions on
+        // the single-snapshot model. When cross-principal isolation is off, an
+        // adoption chain keeps the OPENING turn's identity for the whole chain
+        // (envelope=B executes as A); release that retained anchor here too —
+        // GC re-pins it if any still-live origin references the same id.
+        releaseActiveIdentityTurn(config.session.dataDir, msg.sessionId, msg.turnId);
+        const terminalIdentityTurn = ds.managedTurnOrigin?.identityTurnId;
+        if (terminalIdentityTurn && terminalIdentityTurn !== msg.turnId) {
+          releaseActiveIdentityTurn(config.session.dataDir, msg.sessionId, terminalIdentityTurn);
+        }
+        collectSessionTurnGarbage(ds);
         break;
       }
 
@@ -17462,6 +21710,26 @@ function setupWorkerHandlers(
           dispatchAttempt: msg.dispatchAttempt,
           workerGeneration,
           disposition: msg.disposition,
+        });
+        break;
+      }
+
+      case 'session_identity_decision': {
+        if (ds.worker !== worker) {
+          logger.warn(`[${t}] Ignored session_identity_decision from stale worker generation`);
+          break;
+        }
+        if (msg.sessionId !== ds.session.sessionId) {
+          logger.warn(`[${t}] Dropped session_identity_decision with mismatched sessionId`);
+          break;
+        }
+        const decision = recordWorkerIdentityDecision(ds, worker, workerGeneration, {
+          model: msg.model,
+          sandboxEngaged: msg.sandboxEngaged,
+          loopbackShared: msg.loopbackShared,
+        });
+        await cb.onIdentityDecision?.(ds, {
+          model: decision.model, flipped: decision.flipped, turnId: msg.turnId,
         });
         break;
       }
@@ -17509,6 +21777,7 @@ function setupWorkerHandlers(
                 ...(msg.dispatchAttempt !== undefined
                   ? { dispatchAttempt: msg.dispatchAttempt }
                   : {}),
+                ...(msg.linkRefMode ? { linkRefMode: msg.linkRefMode } : {}),
               }),
             );
           } catch (err) {
@@ -17517,19 +21786,39 @@ function setupWorkerHandlers(
             break;
           }
         }
-        const callerOpenId = msg.turnId
-          ? currentGatewayCallerOpenId(ds, msg.turnId)
-          : undefined;
-        const preexistingProcessIdentities = currentTurnProcessIdentities(ds, msg.turnId);
+        const callerOpenId = msg.trustedCaller !== undefined
+          ? msg.trustedCaller?.requestUserOpenId
+          : msg.turnId ? currentGatewayCallerOpenId(ds, msg.turnId) : undefined;
+        const identityTurnId = msg.identityTurnId ?? msg.turnId;
+        const previousOrigin = ds.managedTurnOrigin;
+        const sameExecution = previousOrigin?.capability && identityTurnId
+          && (previousOrigin.identityTurnId ?? previousOrigin.turnId) === identityTurnId
+          && (previousOrigin.turnId !== msg.turnId || previousOrigin.dispatchAttempt === msg.dispatchAttempt)
+          && previousOrigin.callerOpenId === callerOpenId
+          && (previousOrigin.trustedCaller === msg.trustedCaller
+            || sameTrustedPrincipal(previousOrigin.trustedCaller ?? undefined, msg.trustedCaller ?? undefined));
+        const preexistingProcessIdentities = (sameExecution ? previousOrigin.preexistingProcessIdentities : undefined)
+          ?? currentTurnProcessIdentities(ds, msg.turnId);
         noteTurnDispatchAttempt(ds, msg.turnId, msg.dispatchAttempt);
         ds.managedTurnOrigin = {
           capability: msg.capability,
           ...(msg.policyCapability ? { policyCapability: msg.policyCapability } : {}),
           ...(msg.originChannelId ? { originChannelId: msg.originChannelId } : {}),
           ...(msg.turnId ? { turnId: msg.turnId } : {}),
+          ...(msg.identityTurnId ? { identityTurnId: msg.identityTurnId } : {}),
           ...(msg.dispatchAttempt !== undefined
             ? { dispatchAttempt: msg.dispatchAttempt }
             : {}),
+          // A republication of the SAME execution that omits the field (an
+          // older worker in a mixed fleet) carries forward the previous
+          // frame's value, so an explicit callerless null is not lost to a
+          // reply-target fallback. A different turn starts without one.
+          ...(msg.trustedCaller !== undefined
+            ? { trustedCaller: msg.trustedCaller }
+            : previousOrigin && previousOrigin.turnId === msg.turnId
+              ? { trustedCaller: previousOrigin.trustedCaller }
+              : {}),
+          ...(msg.linkRefMode ? { linkRefMode: msg.linkRefMode } : {}),
           ...(callerOpenId ? { callerOpenId } : {}),
           ...(preexistingProcessIdentities
             ? { preexistingProcessIdentities }
@@ -17712,326 +22001,63 @@ function setupWorkerHandlers(
         break;
       }
 
-      case 'final_output': {
-        const continuation = ds.session.readonlyTaskContinuation;
-        const exactContinuationFinal = continuation
-          && ['active', 'backoff'].includes(continuation.status)
-          && msg.turnId.startsWith('bmx-continuation-')
-          && msg.dispatchAttempt !== undefined
-          && continuation.currentTurnId === msg.turnId
-          && continuation.currentDispatchAttempt === msg.dispatchAttempt
-          && continuation.currentWorkerGeneration === workerGeneration;
-        if (exactContinuationFinal) {
-          // MR1 deliberately surfaces failed-turn fallback text before the
-          // structured terminal. For a synthetic continuation that text is a
-          // transport diagnostic, not the model's strict JSON business result;
-          // let the following terminal decide whether the allowlisted output
-          // limit should continue or another failure should stop visibly.
-          if (msg.turnFailed) break;
-          const output = parseReadonlyContinuationOutput(msg.content);
-          if (!output) {
-            failReadonlyTaskContinuationVisible(
-              ds.session, msg.turnId, msg.dispatchAttempt, workerGeneration,
-              'readonly_continuation_invalid_output',
-            );
-            break;
-          }
-          if (output.status === 'continue') break;
-          const deliveryState = beginReadonlyTaskContinuationDelivery(
-            ds.session, msg.turnId, msg.dispatchAttempt, workerGeneration,
-            { kind: output.status, content: output.content },
-          );
-          if (deliveryState?.status !== 'delivering') break;
-          deliverReadonlyTaskContinuationPending(ds, deliveryState);
-          break;
-        }
-        if (msg.turnId.startsWith('bmx-continuation-')) {
-          logger.warn(`[${t}] Dropped stale/unbound task continuation final_output`);
-          break;
-        }
-        const originalContinuation = ds.session.readonlyTaskContinuation;
-        if (originalContinuation?.logicalTurnId === msg.turnId
-          && originalContinuation.currentTurnId === msg.turnId
-          && originalContinuation.currentDispatchAttempt === undefined
-          && msg.turnFailed !== true) {
-          try {
-            completeReadonlyTaskContinuationOriginalBusinessFinal(
-              ds.session, msg.turnId, workerGeneration, msg.lastUuid,
-            );
-          } catch (err) {
-            logger.error(
-              `[${t}] Failed to persist original-turn final output for task continuation `
-              + `${msg.turnId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
-            );
+      case 'final_output_offer': {
+        if (ds.worker !== worker) break;
+        try { acceptFinalOutputOffer(ds, msg); }
+        catch (error) {
+          logger.warn(`[${t}] Final handoff not acknowledged: ${String(error)}`);
+          const reason = FINAL_HANDOFF_WAIT_REASON;
+          if (ds.agentAttention?.reason !== reason) {
+            ds.agentAttention = { kind: 'blocked', reason, at: Date.now() };
+            publishAttentionPatch(ds);
           }
         }
-        if (msg.codexAppSettlement) {
-          const settlement = msg.codexAppSettlement;
-          const acknowledge = (ok: boolean, error?: string): void => {
-            try {
-              worker.send({
-                type: 'codex_app_dispatch_persisted',
-                requestId: settlement.requestId,
-                ok,
-                ...(error ? { error } : {}),
-              } as DaemonToWorker);
-            } catch { /* runner keeps the final unacknowledged for replacement */ }
-          };
-          if (ds.worker !== worker) {
-            acknowledge(false, 'stale_worker_generation');
-            break;
-          }
-          if (msg.sessionId !== ds.session.sessionId) {
-            acknowledge(false, 'session_mismatch');
-            break;
-          }
-          if (committedCodexAppSequence(
-            ds.session.codexAppGenerationCommits ?? [],
-            settlement.generation,
-            settlement.seq,
-          )) {
-            acknowledge(true);
-            if (!hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
-              try { await cb.onCodexAppLedgerDrained?.(ds); }
-              catch (err) { logger.error(`[${t}] post-drain cleanup failed: ${err instanceof Error ? err.message : String(err)}`); }
-            }
-            break;
-          }
-          const identity = {
-            dispatchId: settlement.dispatchId,
-            turnId: msg.turnId,
-            ...(msg.dispatchAttempt !== undefined
-              ? { dispatchAttempt: msg.dispatchAttempt }
-              : {}),
-          };
-          const preview = settleCodexAppDispatch(
-            ds.session.codexAppDispatchLedger ?? [],
-            ds.session.codexAppGenerationCommits ?? [],
-            identity,
-            settlement.generation,
-            settlement.seq,
-          );
-          if (!preview.ok) {
-            acknowledge(false, preview.error);
-            break;
-          }
-          // R4/R5-B4 defense-in-depth: a `steer_superseded` settlement silently
-          // advances the FIFO without delivering, so it is ONLY legitimate for a
-          // genuine plain-Lark steerable head that STILL has a successor. Reject
-          // (ACK=false, no pop, no receiver completion, no mutation) BEFORE the
-          // commit block below if the settled entry is not steerable, not an
-          // explicit Lark sink, belongs to a VC / durable-receiver / special
-          // channel, or is the SOLE remaining head. R5: `deliverySink` must be
-          // exactly 'lark' — admission always writes both sink and steerable
-          // together, so "steerable=true + sink missing" can only be a
-          // mixed/corrupt/legacy ledger and must fail closed, not be treated as
-          // safe Lark. And a lone forged superseded (no successor) must never
-          // silently commit the only head — the real final would then find no
-          // pending turn. preview.ledger is the post-settle remainder.
-          if (msg.disposition === 'steer_superseded') {
-            const entry = preview.settledEntry;
-            // HTTP steer members (options.steer) carry an http_async / http_wait
-            // sink: unlike a Lark member (which simply skips delivery) they are
-            // PARKED here and resolved with the group's real final after the
-            // commit below — see parkSteerFanoutMember / fanOutSteerGroupFinal.
-            // doc_comment / suppressed / VC / legacy-undefined sinks remain
-            // rejected exactly as before.
-            const supersededSink = entry.deliverySink;
-            const supersededHeadOk = entry.codexAppSteerable === true
-              && (supersededSink === 'lark'
-                || supersededSink === 'http_async'
-                || supersededSink === 'http_wait')
-              && entry.vcMeetingImTurnOrigin === undefined
-              && ds.session.vcMeetingReceiver === undefined
-              && preview.ledger.length > 0;
-            if (!supersededHeadOk) {
-              logger.warn(
-                `[${t}] Rejected steer_superseded for non-steerable/special/last head `
-                + `(turn ${msg.turnId.substring(0, 8)}, sink=${entry.deliverySink ?? 'legacy'}, `
-                + `steerable=${entry.codexAppSteerable === true}, successors=${preview.ledger.length})`,
-              );
-              acknowledge(false, 'superseded_head_not_authorized_sink_with_successor');
-              break;
-            }
-          }
-          const key = `${ds.session.sessionId}:${settlement.generation}:${settlement.seq}`;
-          let inFlight = codexAppFinalSettlementInFlight.get(key);
-          if (!inFlight) {
-            inFlight = (async () => {
-              const unavailableSinkFailClosed = codexAppDeliveryMustFailClosed(
-                ds,
-                preview.settledEntry,
-              );
-              const deliverySuppressed = msg.suppressDelivery === true
-                || managedFinalOutputSuppressed(msg.turnId, msg.dispatchAttempt)
-                || unavailableSinkFailClosed;
-              if (unavailableSinkFailClosed
-                && preview.settledEntry.deliverySink !== 'suppressed'
-                && msg.suppressDelivery !== true) {
-                logger.warn(
-                  `[${t}] Codex App recovery suppressed unavailable `
-                  + `${preview.settledEntry.deliverySink ?? 'legacy non-Lark'} sink `
-                  + `(turn ${msg.turnId.substring(0, 8)})`,
-                );
-              }
-              const alreadyDelivered = ds.lastBridgeEmittedUuid === finalOutputDedupeKey(ds, msg);
-              const owned = deliverySuppressed || !msg.content.trim() || alreadyDelivered
-                ? true
-                : await new Promise<boolean>(resolve => {
-                    deliverFinalOutput(
-                      ds,
-                      msg,
-                      t,
-                      0,
-                      resolve,
-                      () => ds.worker === worker
-                        && ds.session.sessionId === msg.sessionId,
-                      preview.settledEntry.replyTarget,
-                    );
-                  });
-              if (!owned) return false;
-
-              // Re-read after the asynchronous external delivery. A concurrent
-              // replacement may already have committed this signed sequence;
-              // that is idempotent success, never a second FIFO pop.
-              if (committedCodexAppSequence(
-                ds.session.codexAppGenerationCommits ?? [],
-                settlement.generation,
-                settlement.seq,
-              )) return true;
-              const committed = settleCodexAppDispatch(
-                ds.session.codexAppDispatchLedger ?? [],
-                ds.session.codexAppGenerationCommits ?? [],
-                identity,
-                settlement.generation,
-                settlement.seq,
-              );
-              if (!committed.ok) return false;
-              if (msg.dispatchAttempt !== undefined) {
-                try {
-                  // Durable receivers must not depend on the worker surviving
-                  // the daemon ACK long enough to emit a later terminal IPC.
-                  // Persist the exact completed attempt first; the worker's
-                  // ordered duplicate terminal remains idempotent.
-                  await cb.onTurnTerminal?.(ds, {
-                    type: 'turn_terminal',
-                    sessionId: ds.session.sessionId,
-                    turnId: msg.turnId,
-                    dispatchAttempt: msg.dispatchAttempt,
-                    status: 'completed',
-                    // The worker measured this turn; carry its numbers onto the
-                    // synthesized terminal. This row is written FIRST and the
-                    // store's INSERT OR IGNORE keeps it, so omitting the timing
-                    // here would permanently shadow the worker's real terminal.
-                    ...(settlement.completedAtMs !== undefined
-                      ? { completedAtMs: settlement.completedAtMs }
-                      : {}),
-                    ...(settlement.durationMs !== undefined
-                      ? { durationMs: settlement.durationMs }
-                      : {}),
-                  }, { workerGeneration });
-                } catch (err) {
-                  logger.error(`[${t}] Failed to persist Codex App settlement terminal: ${err instanceof Error ? err.message : String(err)}`);
-                  return false;
-                }
-              }
-              const priorLedger = ds.session.codexAppDispatchLedger;
-              const priorCommits = ds.session.codexAppGenerationCommits;
-              ds.session.codexAppDispatchLedger = committed.ledger;
-              ds.session.codexAppGenerationCommits = committed.commits;
-              try {
-                // One atomic sessions-file replacement owns both the exact FIFO
-                // pop and cumulative runner ACK boundary. Only after this write
-                // may the worker acknowledge final-end to the runner.
-                sessionStore.updateSession(ds.session);
-                return true;
-              } catch (err) {
-                ds.session.codexAppDispatchLedger = priorLedger;
-                ds.session.codexAppGenerationCommits = priorCommits;
-                logger.error(`[${t}] Failed to persist Codex App final settlement: ${err instanceof Error ? err.message : String(err)}`);
-                return false;
-              }
-            })().finally(() => codexAppFinalSettlementInFlight.delete(key));
-            codexAppFinalSettlementInFlight.set(key, inFlight);
-          }
-          const persisted = await inFlight;
-          acknowledge(persisted, persisted ? undefined : 'final_settlement_failed');
-          if (persisted) {
-            // HTTP steer group settlement (options.steer). An earlier member's
-            // empty superseded final is parked behind its successor; the real
-            // final fans the merged answer back to every parked member. Runs
-            // AFTER the durable FIFO commit so a parked/resolved member can
-            // never disagree with the ledger.
-            const settledSink = preview.settledEntry.deliverySink;
-            if (msg.disposition === 'steer_superseded'
-              && (settledSink === 'http_async' || settledSink === 'http_wait')) {
-              parkSteerFanoutMember(
-                ds,
-                settlement.generation,
-                { turnId: msg.turnId, sink: settledSink },
-                preview.ledger[0]?.turnId,
-              );
-            } else if (msg.disposition !== 'steer_superseded') {
-              fanOutSteerGroupFinal(ds, settlement.generation, msg.content, Date.now());
-            }
-          }
-          if (persisted && !hasUnsettledCodexAppDispatch(ds.session.codexAppDispatchLedger)) {
-            try { await cb.onCodexAppLedgerDrained?.(ds); }
-            catch (err) { logger.error(`[${t}] post-drain cleanup failed: ${err instanceof Error ? err.message : String(err)}`); }
-          }
-          break;
-        }
-
-        // Adopt-bridge: worker harvested the assistant turn from Claude Code's
-        // transcript JSONL and forwarded it to us. Dedup with a session-scoped
-        // key so a re-drain can't re-send the same answer or cross-suppress
-        // another session.
-        if (!msg.content || !msg.content.trim()) break;
-        if (shouldDropMismatchedFinalOutput(ds, msg, t)) break;
-        if (shouldDropMismatchedHermesFinalOutput(ds, msg, t)) break;
-        const triggerFailureNotice = msg.turnFailed === true
-          && isTriggerFinalSuppressed(ds, msg.turnId)
-          ? msg.turnFailureNotice?.trim()
-          : undefined;
-        if (managedFinalOutputSuppressed(msg.turnId, msg.dispatchAttempt, Boolean(triggerFailureNotice))
-          || (triggerFailureNotice && managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt))) {
-          logger.debug(`[${t}] final_output captured/discarded for silent turn ${msg.turnId.substring(0, 8)}`);
-          break;
-        }
-        // Keep suppressed partial answers and machine receipts out of chat.
-        // Older workers lacking a separate diagnostic retain fail-closed silence.
-        const finalOutput = triggerFailureNotice ? { ...msg, content: triggerFailureNotice } : msg;
-        if (!msg.sessionId) {
-          logger.warn(`[${t}] final_output missing sessionId; accepting for compatibility (session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`);
-        }
-        const dedupeKey = finalOutputDedupeKey(ds, msg);
-        if (ds.lastBridgeEmittedUuid === dedupeKey) {
-          logger.debug(`[${t}] final_output deduped (key ${dedupeKey.substring(0, 48)})`);
-          break;
-        }
-        // Worker pops the turn off its queue right after emit, so it will
-        // NOT re-send this payload on its own. Daemon owns retry on
-        // transient Lark failures.
-        // A real harvested answer is a definitive self-heal signal: if the
-        // session was parked in `limited` by a structured rate-limit emit
-        // (Claude adopt/bridge sessions where the user recovers in their own
-        // terminal — no Lark turn, retry button, or kill to clear it), the
-        // model is plainly working again. Clear the stale limit so the card /
-        // Dashboard「需要你」 don't stay pinned with a dead retry countdown.
-        if (ds.usageLimit) {
-          clearUsageLimitState(ds);
-          if (ds.lastScreenStatus === 'limited') {
-            ds.lastScreenStatus = 'idle';
-            stampIdleSinceAt(ds, 'limited');
-          }
-        }
-        if (msg.turnId.startsWith('mlrp_turn_')) {
-          markMessageListenerRunPreviewRunning(msg.turnId);
-        }
-        deliverFinalOutputWithShutdownDrain(ds, finalOutput, t, ownsLifecycleMutation);
         break;
       }
 
+      case 'final_output': {
+        if (!msg.handoff) { await processFinalOutput(msg); break; }
+        try {
+          if (!journal || msg.handoff.version !== 2 || msg.handoff.token !== ds.initConfig?.finalOutputHandoff?.token || msg.sessionId !== ds.session.sessionId) throw new Error('output_handoff_not_authorized');
+          const snapshot = outputSnapshot(ds.larkAppId, msg);
+          if (snapshot.id !== msg.handoff.id || snapshot.fingerprint !== msg.handoff.fingerprint) throw new Error('output_handoff_conflict');
+          const existing = journal.read(snapshot.id);
+          const record = journal.accept(snapshot, existing?.sink ?? freezeOutputSink(ds, msg));
+          await runOutput(record);
+        } catch (error) { logger.warn(`[${t}] Universal output not acknowledged: ${String(error)}`); }
+        break;
+      }
+
+      case 'btw_answer': {
+        // Claude Code `/btw` side answer captured from its overlay. Rendered
+        // like the adopt preamble (question + Markdown answer) and replied
+        // under the `/btw` turn.
+        if (managedAuxUiSuppressed(msg.turnId)) break;
+        if (!msg.answer.trim()) break;
+        const loc = localeForBot(ds.larkAppId);
+        // Feishu cards cap at ~30KB; a side answer is short, so a plain
+        // character cap (CJK is 3 bytes) is enough instead of a file fallback.
+        let btwAnswer = msg.answer.length > BTW_ANSWER_MAX_CHARS
+          ? `${truncateUtf16WellFormed(msg.answer, BTW_ANSWER_MAX_CHARS)}\n\n${tr('card.btw_answer_truncated', undefined, loc)}`
+          : msg.answer;
+        if (msg.source === 'screen') btwAnswer += `\n\n${tr('card.btw_answer_from_screen', undefined, loc)}`;
+        const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
+        const cardJson = buildContextualReplyCard({
+          title: tr('card.btw_answer', undefined, loc),
+          userText: msg.question,
+          assistantText: repairReplyMarkdown(btwAnswer),
+          assistantLabel: sessionCliDisplayName(ds, botCfg),
+          recipientOpenId,
+          brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),
+          locale: loc,
+          workingDir: ds.workingDir,
+          localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
+        });
+        scopedReply(cardJson, 'interactive', msg.turnId).catch((err: unknown) => {
+          logger.error(`[${t}] Failed to deliver /btw answer: ${err instanceof Error ? err.message : String(err)}`);
+        });
+        break;
+      }
       case 'adopt_preamble': {
         // Adopt-bridge: surface the last completed user/assistant exchange
         // from the adopted CLI session so the Lark thread has context to
@@ -18046,9 +22072,12 @@ function setupWorkerHandlers(
         }
         if (managedAuxUiSuppressed(msg.turnId)) break;
         if (!msg.userText.trim() && !msg.assistantText.trim()) break;
-        const assistantText = await prepareAdoptedReplyImages(ds, msg.assistantText, { omitImages: false }, ownsLifecycleMutation);
+        const assistantText = await prepareLocalReplyImages(ds, msg.assistantText, { omitImages: false }, ownsLifecycleMutation);
         if (!ownsLifecycleMutation()) break;
         const recipientOpenId = daemonCardFooterRecipientOpenId(ds, effectiveCliId);
+        // This is a historical exchange, so carry the current display policy
+        // without attributing the active turn's execution timing to it.
+        const renderSnapshot = getDaemonReplyCardRenderSnapshot(ds, {}, effectiveCliId);
         const cardJson = buildContextualReplyCard({
           title: tr('card.adopt_last_round', undefined, localeForBot(ds.larkAppId)),
           userText: msg.userText,
@@ -18059,7 +22088,8 @@ function setupWorkerHandlers(
           locale: localeForBot(ds.larkAppId),
           workingDir: ds.workingDir,
           localHomeLinkMode: daemonCardLocalHomeLinkMode(ds),
-          usage: getDaemonReplyCardUsageSnapshot(ds, effectiveCliId),
+          usage: renderSnapshot.usage,
+          presentation: renderSnapshot,
         });
         replyWithImageFallback(cardJson, 'interactive', content => {
           if (!ownsLifecycleMutation()) return Promise.reject(new Error('Adopt worker ownership changed'));
@@ -18073,6 +22103,13 @@ function setupWorkerHandlers(
   });
 
   worker.on('exit', (code, signal) => {
+    clearInterval(cliNoticeTimer);
+    if (ownsLifecycleMutation()) {
+      cliNoticeExitGeneration = workerGeneration + 1;
+      // Do not await in the exit handler: dead IPC/lifecycle fencing below must
+      // happen immediately. close() drains only PATCH, for at most two seconds.
+      void cliNotices.close().catch(() => logger.warn(`[${t}] CLI progress exit cleanup not confirmed`));
+    } else cliNotices.dispose();
     const transferRetirement = transferRetiringWorkers.has(worker);
     const lifecycleRetirement = lifecycleRetiringWorkers.get(ds)?.has(worker) === true;
     const unexpectedWorkerExit = !transferRetirement
@@ -18147,6 +22184,9 @@ function setupWorkerHandlers(
       ds.workerReady = false;
       // The worker process died; its CLI died with it.
       ds.cliReady = false;
+      // Its background-task anchors died with it: nothing can forward a wake
+      // to those turns any more, so they stop holding their records.
+      ds.backgroundTaskPinnedTurnIds = undefined;
       ds.workerPort = null;
       // A dead worker can no longer refresh its card/usage view.
       clearUsageRefreshTimer(ds);
@@ -18196,10 +22236,20 @@ function setupWorkerHandlers(
       ds.workerGeneration = fencedGeneration;
       ds.session.workerGeneration = fencedGeneration;
       ds.session.pid = undefined;
+      ds.session.pidProcStart = undefined;
       // P1-13：worker 退出（崩溃、被杀、正常结束）同样是权威换代——它带走整棵 CLI
       // 进程树，包括那一代注册的 dev server。与代次围栏并进同一次落盘。
       const exitedPreviewTarget = takeSessionPreviewTarget(ds.session);
-      sessionStore.updateSession(ds.session);
+      // Isolate ONLY this persistence write: a failure here (lock timeout,
+      // disk full, serialization) must not skip the durable exit
+      // reconciliation (cb.onWorkerExit) and lifecycle notifications below,
+      // otherwise incomplete idempotent turns stay `running` and VC receipts
+      // stay dispatched indefinitely.
+      try {
+        sessionStore.updateSession(ds.session);
+      } catch (err) {
+        logger.error(`[${t}] Failed to persist worker exit generation ${workerGeneration}: ${err instanceof Error ? err.message : String(err)}`);
+      }
       if (continuationRecovery?.action === 'resume') {
         const terminal = {
           turnId: continuationRecovery.turnId,
@@ -18369,6 +22419,45 @@ function deliverFinalOutputWithShutdownDrain(
   }
 }
 
+/** Acquire publication before the reply-card lock. Explicit CLI finals and
+ * all automatic IM final producers therefore share one publication authority. */
+async function deliverFinalOutputWithOutputControl(
+  ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'final_output' }>, t: string,
+  control: OutputDeliveryControl, target?: FrozenSessionReplyTarget,
+): Promise<OutputReceipt | undefined> {
+  const dispatch = async (): Promise<OutputReceipt | undefined> => {
+    const finish = beginFinalOutputDelivery(ds, msg.turnId);
+    let frozenInitiator: ZeroPromptFinalInitiator | undefined;
+    if (control.record.sink.kind === 'im' && sessionPromptInjection(ds) === 'none') {
+      const context = control.record.sink.context;
+      const openId = context.requesterOpenId ?? context.replyTargetSenderOpenId;
+      if (openId) {
+        let isBot = context.requesterIsBot ?? (openId === context.replyTargetSenderOpenId ? context.replyTargetSenderIsBot : undefined);
+        if (isBot === undefined) { try { isBot = loadKnownBotOpenIdsForApp(ds.larkAppId).has(openId); } catch { isBot = false; } }
+        frozenInitiator = { openId, isBot };
+      }
+    }
+    return new Promise((resolve, reject) => {
+      try { deliverFinalOutput(ds, msg, t, 0, (ok, messageId) => {
+        finish(); resolve(ok ? { status: control.rejectedReason ? 'suppressed' : messageId || control.record.sink.kind === 'doc' ? 'delivered' : control.record.sink.kind === 'http' ? 'captured' : 'suppressed', ...(messageId ? { messageId } : {}), ...(control.rejectedReason ? { owner: `rejected:${control.rejectedReason}` } : {}) } : undefined);
+      }, control.owns, target, undefined, frozenInitiator, undefined, undefined, control); }
+      catch (error) { finish(); reject(error); }
+    });
+  };
+  if (control.record.sink.kind !== 'im') return dispatch();
+  let receipt: OutputReceipt | undefined;
+  const ledger = new TurnSendLedger(config.session.dataDir);
+  const publication = await ledger.execute({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt },
+    'final', JSON.stringify([control.record.sink, control.record.fingerprint]), async uuid => {
+      control.publicationUuid = uuid;
+      receipt = await dispatch();
+      if (!receipt?.messageId) throw new Error('output_publication_unconfirmed');
+      return receipt.messageId;
+    }, { fenced: true, providerUuid: msg.codexAppSettlement ? `ca_${msg.codexAppSettlement.dispatchId}`.slice(0, 50) : bridgeFinalOutputUuid(ds, msg), reuseExistingFinal: true,
+      beforeDispatch: () => { if (!control.owns()) throw new Error('output_authority_changed'); } });
+  return receipt ?? { status: 'delivered', messageId: publication.messageId };
+}
+
 // ─── HTTP steer-group fan-out (options.steer → codex-app native turn/steer) ──
 //
 // A steered group settles as N finals: each earlier member gets an EMPTY
@@ -18437,6 +22526,34 @@ function parkSteerFanoutMember(
   }
 }
 
+/** One sessions-file commit owns the signed high-water AND its recovery
+ * receipt. Recovery projection may fail later without losing the terminal. */
+function persistCodexAppRecoverySettlement(
+  ds: DaemonSession,
+  committed: { ledger: NonNullable<Session['codexAppDispatchLedger']>; commits: NonNullable<Session['codexAppGenerationCommits']> },
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  sink: string | undefined,
+): void {
+  const priorLedger = ds.session.codexAppDispatchLedger;
+  const priorCommits = ds.session.codexAppGenerationCommits;
+  const priorRecovery = ds.session.ordinaryTurnRecovery;
+  ds.session.codexAppDispatchLedger = committed.ledger;
+  ds.session.codexAppGenerationCommits = committed.commits;
+  if (sink === 'lark' && ordinaryTurnRecoveryEligible(ds)) {
+    stageOrdinaryTurnRecoveryTerminal(ds.session, { turnId: msg.turnId, ...codexAppSettlementOutcome(msg) });
+  }
+  try { sessionStore.updateSession(ds.session); }
+  catch (error) {
+    ds.session.codexAppDispatchLedger = priorLedger;
+    ds.session.codexAppGenerationCommits = priorCommits;
+    ds.session.ordinaryTurnRecovery = priorRecovery;
+    throw error;
+  }
+  // A failure here keeps the committed ledger and pending receipt. Both daemon
+  // replay and startup reconcile it, without requiring the worker's later IPC.
+  reconcileOrdinaryTurnRecoveryTerminalReceipt(ds.session);
+}
+
 /** Resolve every parked earlier member of a steer group with the group's real
  *  final. Called exactly once, after the REAL final's durable commit. No usage
  *  is forwarded: the merged turn's token usage belongs solely to the group's
@@ -18447,12 +22564,41 @@ function fanOutSteerGroupFinal(
   generation: string,
   content: string,
   completedAt: number,
+  outcome?: { turnFailed?: boolean; turnFailureCode?: string },
 ): void {
   const sessionId = ds.session.sessionId;
   const parked = steerFanoutBySession.get(sessionId);
   if (!parked || parked.generation !== generation) return;
   steerFanoutBySession.delete(sessionId);
   for (const member of parked.members) {
+    if (outcome?.turnFailed) {
+      const failureCode = outcome.turnFailureCode ?? 'codex_app_turn_failed';
+      const wait = ds.pendingWaitPromises?.get(member.turnId);
+      if (wait) {
+        const error = new Error(`Worker turn failed: ${failureCode}`);
+        if (wait.reject) wait.reject(error); else wait.resolve(`ERROR: ${error.message}`);
+        ds.pendingWaitPromises?.delete(member.turnId);
+      }
+      if (member.sink === 'http_wait') continue;
+      const result = ds.asyncTriggerResults?.get(member.turnId);
+      try {
+        const written = asyncTriggerStore.recordTerminalFailureStrict(
+          sessionId, member.turnId, completedAt, ds.larkAppId, failureCode);
+        if (written === 'already_completed') {
+          ds.asyncTriggerResults?.delete(member.turnId);
+          ds.idempotentAsyncTurns?.delete(member.turnId);
+          continue;
+        }
+      } catch (error) {
+        logger.error(`[${tag(ds)}] Failed to persist steer failure: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (result?.status === 'pending') {
+        result.status = 'failed'; result.failedAt = completedAt;
+        result.errorCode = 'trigger_failed'; result.terminalErrorCode = failureCode;
+      }
+      ds.idempotentAsyncTurns?.delete(member.turnId);
+      continue;
+    }
     if (member.sink === 'http_wait') {
       const waitPromise = ds.pendingWaitPromises?.get(member.turnId);
       if (waitPromise) {
@@ -18664,8 +22810,8 @@ async function persistFinalOutputDelivery(
   try {
     const { getSkillFeedbackStore } = await import('../services/skill-feedback-store.js');
     const feedbackStore = await getSkillFeedbackStore(config.session.dataDir);
-    if (feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, messageId)) return;
-    feedbackStore.recordTurnDelivery({
+    if (await feedbackStore.findDeliveryByPlatformMessage('lark', ds.larkAppId, messageId)) return;
+    await feedbackStore.recordTurnDelivery({
       botAppId: ds.larkAppId,
       sessionId: ds.session.sessionId,
       turnId: msg.turnId,
@@ -18713,7 +22859,9 @@ function markTurnReplyDelivered(
   if (msg.turnFailed) return;
   if (msg.kind && msg.kind !== 'bridge') return;
   if (ds.session.vcMeetingReceiver) return;
-  if (effectiveReplyDelivery(ds.larkAppId, effectiveCliId, sessionPromptInjection(ds)) !== 'transcript') return;
+  // 冻结沙箱口径：final_output 是这个 worker 产的，投递模式必须按它 spawn 时的
+  // 采集能力判，不能看可能已翻转的 live config。
+  if (effectiveReplyDelivery(ds.larkAppId, effectiveCliId, sessionPromptInjection(ds), { sessionSandbox: ds.session.sandbox }) !== 'transcript') return;
   if (ds.currentTurnId && ds.currentTurnId !== msg.turnId) return;
   ds.completedIdleTurnId = msg.turnId;
   // 卡已 idle 就立即重刷卡头；仍在 working 则等下一次状态边沿自然带上标签。
@@ -18735,6 +22883,15 @@ function markFailedTurnIdle(ds: DaemonSession, turnId: string): void {
   if (ds.lastScreenStatus === 'idle') scheduleActiveRuntimePatch(ds);
 }
 
+interface HandoffDeliveryContext {
+  record: StoredFinalOutput;
+  store: FinalOutputHandoffStore;
+  control: FinalOutputDeliveryControl;
+  suppressed: boolean;
+  auxiliary?: boolean;
+  rejectedReason?: string;
+}
+
 function deliverFinalOutput(
   ds: DaemonSession,
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
@@ -18743,15 +22900,72 @@ function deliverFinalOutput(
   onComplete?: (owned: boolean, messageId?: string) => void,
   isStillOwned: () => boolean = () => true,
   frozenReplyTarget?: FrozenSessionReplyTarget,
-  frozenUsage?: CardUsageSnapshot,
+  frozenRenderSnapshot?: ReplyCardRenderSnapshot,
   frozenInitiator?: ZeroPromptFinalInitiator | null,
   imageFallback: ReplyImageState = { omitImages: false },
+  handoff?: HandoffDeliveryContext,
+  outputControl?: OutputDeliveryControl,
 ): void {
   if (!isStillOwned()) {
     onComplete?.(false);
     return;
   }
-  let cardUsage = frozenUsage;
+  const unresolvedMsg = msg;
+  const linkRefKey = {
+    appId: ds.larkAppId,
+    sessionId: ds.session.sessionId,
+    turnId: msg.turnId,
+    dispatchAttempt: msg.dispatchAttempt,
+  };
+  const linkRefRuntime = msg.linkRefMode ? getLinkRefRuntime() : undefined;
+  let linkRefDraftPending = false;
+  if (msg.linkRefMode === 'enabled') {
+    try {
+      if (!linkRefRuntime) throw new Error('link_ref_ledger_unavailable');
+      const prepared = linkRefRuntime.prepareFinalDraft({
+        key: linkRefKey,
+        mode: msg.linkRefMode,
+        content: msg.content,
+      });
+      linkRefDraftPending = prepared.draftPending;
+      if (prepared.content !== msg.content) msg = { ...msg, content: prepared.content };
+    } catch (error) {
+      const errorCode = typeof error === 'object' && error && 'code' in error
+        ? String((error as { code: unknown }).code)
+        : 'link_ref_ledger_unavailable';
+      const next = attempt + 1;
+      if (next >= FINAL_OUTPUT_RETRY_BACKOFF_MS.length) {
+        logger.error(
+          `[${t}] LinkRef final preparation gave up after ${next} attempts `
+          + `(turn ${msg.turnId.substring(0, 8)}, code=${errorCode})`,
+        );
+        onComplete?.(false);
+        return;
+      }
+      logger.warn(
+        `[${t}] LinkRef final preparation attempt ${next} failed `
+        + `(turn ${msg.turnId.substring(0, 8)}, code=${errorCode}); retrying`,
+      );
+      setTimeout(() => deliverFinalOutput(
+        ds, unresolvedMsg, t, next, onComplete, isStillOwned,
+        frozenReplyTarget, frozenRenderSnapshot, frozenInitiator, imageFallback, handoff, outputControl,
+      ), FINAL_OUTPUT_RETRY_BACKOFF_MS[next] ?? 0);
+      return;
+    }
+  }
+  const confirmLinkRefDraft = (): void => {
+    if (!linkRefDraftPending || !linkRefRuntime) return;
+    try {
+      linkRefRuntime.clearPendingDraft(linkRefKey);
+      linkRefDraftPending = false;
+    } catch {
+      logger.warn(
+        `[${t}] LinkRef final draft cleanup failed `
+        + `(turn ${msg.turnId.substring(0, 8)}, code=link_ref_ledger_unavailable)`,
+      );
+    }
+  };
+  let renderSnapshot = frozenRenderSnapshot;
   const managedReceiver = !!ds.session.vcMeetingReceiver;
   const zeroPromptReply = !managedReceiver && (!msg.kind || msg.kind === 'bridge')
     && sessionPromptInjection(ds) === 'none';
@@ -18810,19 +23024,21 @@ function deliverFinalOutput(
           }
         } catch (error) {
           logger.error(`[${t}] Failed to persist structured failure: ${error instanceof Error ? error.message : String(error)}`);
+          onComplete?.(false); return;
         }
       }
       if (!completedAlready) markFailedTurnIdle(ds, msg.turnId);
       rememberHttpTerminal(ds, msg.turnId);
       ds.idempotentAsyncTurns?.delete(msg.turnId);
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+      confirmLinkRefDraft();
       onComplete?.(true);
       return;
     }
     // The ordered terminal IPC owns persistence and the backoff decision. Hide
     // only the diagnostic for a live, exact capacity-recovery owner; HTTP,
     // adopted, superseded and unrelated failure paths keep their normal UI.
-    const capacityDiagnostic = sessionCliId(ds, getBot(ds.larkAppId).config) === 'codex'
+    const capacityDiagnostic = codexCapacityRecoveryCli(sessionCliId(ds, getBot(ds.larkAppId).config))
       && msg.turnFailureCode === CODEX_CAPACITY_ERROR_CODE;
     const terminal = { turnId: msg.turnId, status: 'failed' as const, errorCode: msg.turnFailureCode };
     if (capacityDiagnostic && !ordinaryTurnRecoveryEligible(ds)
@@ -18850,6 +23066,7 @@ function deliverFinalOutput(
     waitPromise.resolve(msg.content);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Intercepted final_output for Wait Mode HTTP request (turn ${msg.turnId.substring(0, 8)})`);
+    confirmLinkRefDraft();
     onComplete?.(true);
     return;
   }
@@ -18867,6 +23084,10 @@ function deliverFinalOutput(
       return;
     }
     const completedAt = Date.now();
+    let completedOutcome: 'completed' | 'terminal';
+    try { completedOutcome = asyncTriggerStore.recordCompletedStrict(ds.session.sessionId, msg.turnId, msg.content, completedAt, ds.larkAppId, msg.usage); }
+    catch (error) { logger.warn(`[${t}] HTTP result remains pending: ${String(error)}`); onComplete?.(false); return; }
+    if (completedOutcome === 'terminal') { onComplete?.(true); return; }
     asyncResult.status = 'completed';
     asyncResult.content = msg.content;
     asyncResult.completedAt = completedAt;
@@ -18874,7 +23095,7 @@ function deliverFinalOutput(
     // Durably persist the outcome so trigger-result can rebuild `completed`
     // (with content + usage) after a daemon restart drops the in-memory Map.
     // Stamp the owning bot for cross-bot isolation.
-    asyncTriggerStore.recordCompleted(ds.session.sessionId, msg.turnId, msg.content, completedAt, ds.larkAppId, msg.usage);
+
     // This idempotent async turn produced its terminal output — drop its
     // worker-exit convergence entry so a later graceful exit of this generation
     // is not retro-failed (codex #776 round-6 finding #1). Per-triggerId delete so
@@ -18883,6 +23104,7 @@ function deliverFinalOutput(
     ds.idempotentAsyncTurns?.delete(msg.turnId);
     ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
     logger.info(`[${t}] Captured final_output for Async HTTP request (turn ${msg.turnId.substring(0, 8)})`);
+    confirmLinkRefDraft();
     onComplete?.(true);
     return;
   }
@@ -18895,7 +23117,7 @@ function deliverFinalOutput(
     ).target) };
   }
   const cb = requireCallbacks();
-  const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  const effectiveCliId = sessionCliId(ds, getBot(ds.larkAppId).config);
   const groupContextAuthorOrigin = !msg.turnFailed && (!msg.kind || msg.kind === 'bridge')
     ? readGroupContextAuthorOrigin({
         appId: ds.larkAppId, chatId: ds.chatId, sessionId: ds.session.sessionId, turnId: msg.turnId,
@@ -18915,6 +23137,14 @@ function deliverFinalOutput(
   const partialResultMessages = (): TurnDeliveryReceipt['messages'] => {
     return finalPublication?.receipt.messages ?? [];
   };
+  // 内容安全审计拒收（230028 等）→ 打码发送副本后重发一次。零注入 / 转写回复
+  // 模式下模型看不到发送失败，只能由这里兜住；transcript 与终端原文不受影响。
+  const withAuditRedaction = (content: string, msgType: string | undefined, send: (body: string) => Promise<string>) =>
+    sendWithContentAuditRedaction({
+      content, msgType, send,
+      note: tr('worker.final_output_content_audit_redacted_note', undefined, localeForBot(ds.larkAppId)),
+      log: line => logger.warn(`[${t}] Bridge final_output ${line} (turn ${msg.turnId.substring(0, 8)})`),
+    });
   const scopedReply = (
     content: string,
     msgType?: string,
@@ -18924,19 +23154,42 @@ function deliverFinalOutput(
     if (!isStillOwned() || ds.session.status === 'closed') {
       return Promise.reject(new Error('Final output ownership changed or session closed'));
     }
-    return cb.sessionReply(
+    if (handoff && !handoff.auxiliary) {
+      const transport = handoff.store.freezeTransport(handoff.record.intentId, handoff.record.claim!, {
+        content, msgType: msgType ?? 'interactive', providerUuid: opts?.uuid ?? bridgeFinalOutputUuid(ds, msg),
+      });
+      const ledger = new TurnSendLedger(config.session.dataDir);
+      return ledger.execute({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: msg.turnId }, 'final',
+        JSON.stringify([handoff.record.target, transport.msgType, transport.content]),
+        uuid => withAuditRedaction(transport.content, transport.msgType, body => cb.sessionReply(sessionAnchorId(ds), body, transport.msgType, ds.larkAppId, msg.turnId,
+          { ...opts, uuid, beforeWrite: handoff.control.beforeEffect, replyTarget: handoff.record.target, sourceSessionId: ds.session.sessionId })),
+        { fenced: true, providerUuid: transport.providerUuid, reuseExistingFinal: true, beforeDispatch: handoff.control.beforeEffect,
+          noSideEffect: error => isLarkContentAuditError(error) || [LARK_CODE_CARD_CONTENT_REJECTED, LARK_CODE_MESSAGE_CONTENT_TOO_LONG].includes(larkErrorCode(error) ?? -1) },
+      ).then(result => { handoff.suppressed = result.replayed; return result.messageId; });
+    }
+    if (outputControl?.record.sink.kind === 'im' && replyCardModeFor(ds, msg.turnId) === 'legacy') {
+      const providerUuid = opts?.uuid ?? outputControl.publicationUuid ?? bridgeFinalOutputUuid(ds, msg);
+      const transport = outputControl.freezeTransport(`${msgType ?? 'interactive'}:${providerUuid}:${imageFallback.omitImages ? 'omit-images' : 'images'}`,
+        { content, msgType: msgType ?? 'interactive', providerUuid });
+      content = transport.content; msgType = transport.msgType;
+      opts = { ...opts, uuid: transport.providerUuid };
+    }
+    const replyMsgType = msgType;
+    return withAuditRedaction(content, replyMsgType, body => cb.sessionReply(
       sessionAnchorId(ds),
-      content,
-      msgType,
+      body,
+      replyMsgType,
       ds.larkAppId,
       fallbackTurnId(ds, turnId),
-      { ...opts, sourceSessionId: ds.session.sessionId, ...(topicMessageLookup ? { topicMessageLookup } : {}),
+      { ...opts, ...(outputControl?.record.sink.kind === 'im' ? { replyContext: outputControl.record.sink.context } : {}), sourceSessionId: ds.session.sessionId,
+        ...(handoff ? { beforeWrite: async () => { if (!handoff.control.owns()) throw new Error('final_output_authority_changed'); await opts?.beforeWrite?.(); } } : {}),
+        ...(topicMessageLookup ? { topicMessageLookup } : {}),
         beforeWrite: async () => {
           if (opts?.beforeWrite) await opts.beforeWrite();
           if (!isStillOwned() || ds.session.status === 'closed') throw new Error('Final output no longer owns delivery');
         },
         ...(groupContextAuthorOrigin ? { groupContextAuthorOrigin } : {}) },
-    );
+    ));
   };
   setTimeout(async () => {
     if (!isStillOwned()) {
@@ -18962,7 +23215,9 @@ function deliverFinalOutput(
         const chunks = chunkCommentText(msg.content);
         for (let i = 0; i < chunks.length; i++) {
           if (!isStillOwned()) { onComplete?.(false); return; }
-          await replyToDocComment(ds.larkAppId, { fileToken: docTurn.fileToken, fileType: docTurn.fileType }, docTurn.commentId, chunks[i], i === 0 ? docTurn.replyToOpenId : undefined);
+          const write = (hooks?: import('../services/output-delivery-journal.js').OutputProviderEffectHooks) => replyToDocComment(ds.larkAppId, { fileToken: docTurn.fileToken, fileType: docTurn.fileType }, docTurn.commentId, chunks[i], i === 0 ? docTurn.replyToOpenId : undefined, hooks);
+          if (outputControl) await outputControl.effect(`doc:${i}`, write);
+          else await write();
           if (!isStillOwned()) { onComplete?.(false); return; }
         }
         // The user-visible reply is committed. Consume the route and dedupe
@@ -18984,6 +23239,7 @@ function deliverFinalOutput(
           }
         }
         logger.info(`[${t}] doc-comment final_output → posted ${chunks.length} comment(s) on file=${docTurn.fileToken.slice(0, 12)} (turn ${msg.turnId.substring(0, 8)})`);
+        confirmLinkRefDraft();
         onComplete?.(true);
         return;
       }
@@ -19102,8 +23358,8 @@ function deliverFinalOutput(
       } else if (!imOrigin
         && listenerOutputOwner
         && msg.dispatchAttempt !== undefined
-        && listenerOutputProtocol === 'decision_v1') {
-        const controlledOutput = parseVcMeetingListenerOutput(msg.content);
+        && (listenerOutputProtocol === 'decision_v1' || listenerOutputProtocol === 'final_summary_v1')) {
+        const controlledOutput = parseVcMeetingListenerOutput(msg.content, listenerOutputProtocol === 'final_summary_v1');
         if (!controlledOutput.ok) {
           ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
           logger.error(
@@ -19131,12 +23387,26 @@ function deliverFinalOutput(
       const safeUserText = managedReceiver && msg.userText !== undefined
         ? neutralizeLarkAtTags(msg.userText)
         : msg.userText;
-      const renderedAssistantText = await prepareAdoptedReplyImages(ds, safeAssistantText, imageFallback, isStillOwned);
+      const renderedAssistantText = await prepareLocalReplyImages(ds, safeAssistantText, imageFallback, isStillOwned);
       if (!isStillOwned()) { onComplete?.(false); return; }
-      const recipientOpenId = managedReceiver
+      const zeroPromptDispatchRoot = frozenReplyTarget?.mode === 'thread' ? frozenReplyTarget.rootMessageId
+        : ds.scope === 'chat' ? ds.session.replyTargets?.[msg.turnId]?.rootMessageId
+          : ds.session.rootMessageId;
+      // In a dispatched topic a bot initiator is the dispatcher: the automatic
+      // report below returns the result to its own session, so no @ here.
+      const reportInsteadOfAt = zeroPromptReply && initiator?.isBot === true
+        && topicReportsToDispatcher(ds, zeroPromptDispatchRoot);
+      const requesterOpenId = managedReceiver || (zeroPromptReply && reportInsteadOfAt)
         ? undefined
-        : imOrigin?.replyTargetSenderOpenId
-          ?? (zeroPromptReply ? initiator?.openId : daemonCardFooterRecipientOpenId(ds, effectiveCliId));
+        : handoff?.record.actorOpenId ?? (outputControl?.record.sink.kind === 'im' ? outputControl.record.sink.context.requesterOpenId ?? outputControl.record.sink.context.replyTargetSenderOpenId : undefined) ?? imOrigin?.replyTargetSenderOpenId
+          ?? (zeroPromptReply
+            ? (reportInsteadOfAt ? undefined : initiator?.openId)
+            : daemonCardFooterRecipientOpenId(ds, effectiveCliId));
+      const zeroPromptAddressed = zeroPromptReply && !imOrigin && msg.turnFailed !== true
+        ? addressZeroPromptReply(ds, renderedAssistantText, initiator, requesterOpenId,
+          reportInsteadOfAt ? initiator?.openId : undefined, t, msg.turnId)
+        : undefined;
+      const recipientOpenId = zeroPromptAddressed ? zeroPromptAddressed.recipientOpenId : requesterOpenId;
       // 失败兜底通知正文 @ 真人。有 footer 收件人（真人 owner / 触发者）时其 <at>
       // 已经会提醒，不重复；仅当没有任何真人收件人时（bot-to-bot 派发的会话）回退
       // @ bot 管理员，让模型网关类故障有人看见而不是静默滑过。
@@ -19145,35 +23415,34 @@ function deliverFinalOutput(
         : undefined;
       const deliveredAssistantText = failureMentionOpenId
         ? `<at id=${failureMentionOpenId}></at> ${renderedAssistantText}`
-        : renderedAssistantText;
+        : zeroPromptAddressed?.text ?? renderedAssistantText;
       const localHomeLinkMode = daemonCardLocalHomeLinkMode(ds);
       // forkWorker snapshots the effective policy for this worker lifetime.
       // Keep daemon fallback delivery aligned with the same frozen policy the
       // worker/Riff environment received; live config applies on the next fork.
       let feedbackPolicy = managedReceiver ? undefined : ds.feedbackPolicy;
       // Freeze email reviewers into this bot's app-scoped open_id so the
-      // card callback can match network-free against the delivery snapshot. Pure
-      // ou_/on_ lists (and requester/everyone) skip the lookup. If resolution
-      // empties the list, fail closed (drop the feedback control).
+      // card callback can match network-free against the delivery snapshot.
+      // Pure ou_/on_ lists (and requester/everyone) skip the lookup. A
+      // definitive empty list keeps the control visible while the callback
+      // rejects every operator; a TRANSIENT failure reuses last-known-good
+      // rather than shipping an empty snapshot, and with no cache the control
+      // is dropped for this delivery.
       if (feedbackPolicy && feedbackPolicy.audience === 'reviewers') {
         try {
-          const { materializeFeedbackReviewers } = await import('../services/feedback-policy.js');
           const { resolveAllowedUsersWithMap } = await import('../im/lark/client.js');
-          feedbackPolicy = await materializeFeedbackReviewers(feedbackPolicy, async entries => {
-            const { map } = await resolveAllowedUsersWithMap(ds.larkAppId, entries);
-            const resolved = new Map<string, string>();
-            for (const entry of entries) {
-              const id = map.get(entry);
-              if (id && id.startsWith('ou_')) resolved.set(entry, id);
-            }
-            return resolved;
+          feedbackPolicy = await materializeFeedbackPolicyForDelivery({
+            policy: feedbackPolicy,
+            larkAppId: ds.larkAppId,
+            dataDir: config.session.dataDir,
+            resolveAllowedUsersWithMap,
           });
         } catch {
           feedbackPolicy = undefined;
         }
-        if (feedbackPolicy && feedbackPolicy.reviewers.length === 0) feedbackPolicy = undefined;
       }
-      const feedbackRequesterSubjectId = recipientOpenId;
+      // The turn's requester, even when the body addressed the reply elsewhere.
+      const feedbackRequesterSubjectId = requesterOpenId;
       // `reviewers`/`everyone` audiences gate clicks without a human requester,
       // so the control is valid even for an ownerless bot-triggered session with
       // no human recipient; `requester` audience still needs the recipient to be
@@ -19183,19 +23452,33 @@ function deliverFinalOutput(
         && (feedbackPolicy.audience !== 'requester' || feedbackRequesterSubjectId)
         ? { policy: feedbackPolicy }
         : undefined;
-      cardUsage ??= getDaemonReplyCardUsageSnapshot(ds, effectiveCliId);
+      renderSnapshot ??= getDaemonReplyCardRenderSnapshot(ds, {
+        turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
+        finalTiming: { durationMs: msg.durationMs ?? msg.codexAppSettlement?.durationMs, executionStartedAtMs: msg.executionStartedAtMs },
+      }, effectiveCliId);
       const localTurnTitle = msg.kind === 'local-turn-headless'
         ? tr('card.local_turn_resumed', undefined, localeForBot(ds.larkAppId))
         : isExistingAppServerSharedAdoptPersistedSession(ds.session)
           ? tr('card.codex_app_shared_turn', undefined, localeForBot(ds.larkAppId))
           : tr('card.local_turn', undefined, localeForBot(ds.larkAppId));
-      const executionDurationMs = getBot(ds.larkAppId).config.showReplyTiming === true
-        ? msg.durationMs ?? msg.codexAppSettlement?.durationMs
-        : undefined;
-      const receivedAtMs = ds.turnReceivedAtMs?.get(msg.turnId);
-      const waitingDurationMs = executionDurationMs !== undefined && msg.dispatchAttempt === undefined
-        && receivedAtMs !== undefined && msg.executionStartedAtMs !== undefined
-        ? msg.executionStartedAtMs - receivedAtMs : undefined;
+      const replyCardActionBinding = (() => {
+        // Managed VC receiver cards carry no callback controls (same boundary
+        // that drops feedback and the on-call button). Sandboxed/read-isolated
+        // sessions have no control-card surface at all (see replyCardModeFor);
+        // headless sessions have no IM-driven terminal to act on.
+        if (managedReceiver || replyCardSandboxBlocked(ds) || ds.session.headless
+          || getBot(ds.larkAppId).config.replyCardActions !== true) return undefined;
+        const rootId = sessionAnchorId(ds);
+        const sessionId = ds.session?.sessionId;
+        if (!rootId || !sessionId) return undefined;
+        return {
+          larkAppId: ds.larkAppId,
+          chatId: ds.chatId,
+          rootId,
+          sessionId,
+          adopt: isSharedAdoptSession(ds),
+        };
+      })();
       let cardJson = msg.kind === 'local-turn' || msg.kind === 'local-turn-headless'
         ? buildContextualReplyCard({
             title: localTurnTitle,
@@ -19207,10 +23490,10 @@ function deliverFinalOutput(
             locale: localeForBot(ds.larkAppId),
             workingDir: ds.workingDir,
             localHomeLinkMode,
-            usage: cardUsage,
-            executionDurationMs,
-            waitingDurationMs,
+            usage: renderSnapshot.usage,
+            presentation: renderSnapshot,
             ...(feedback ? { feedback } : {}),
+            ...(replyCardActionBinding ? { cardActions: replyCardActionBinding } : {}),
           })
         : buildCanonicalFinalReplyCard({
             markdown: repairReplyMarkdown(deliveredAssistantText),
@@ -19220,13 +23503,36 @@ function deliverFinalOutput(
             locale: localeForBot(ds.larkAppId),
             workingDir: ds.workingDir,
             localHomeLinkMode,
-            usage: cardUsage,
-            executionDurationMs,
-            waitingDurationMs,
+            usage: renderSnapshot.usage,
+            presentation: renderSnapshot,
+            ...(replyCardActionBinding ? { cardActions: replyCardActionBinding } : {}),
           });
+      if (effectiveCliId === 'minimax' && msg.turnFailed
+          && ['turn_budget_exhausted', 'execution_failed'].includes(msg.turnFailureCode ?? '')) {
+        // MiniMax uses the legacy reply-card path. Keep the machine-readable
+        // reason visible on that actual carrier, even when the native message
+        // is generic; the ordered terminal independently owns settlement.
+        // This bounded, allowlisted code row fits within fitBuiltCard's
+        // CARD_LATE_CHROME_RESERVE_BYTES (2000) for late card chrome.
+        const failedCard = JSON.parse(cardJson);
+        failedCard.body.elements.unshift({ tag: 'markdown', element_id: 'botmux_turn_error',
+          content: tr('card.turn_failed.field_error', { errorCode: `\`${msg.turnFailureCode}\`` }, localeForBot(ds.larkAppId)) });
+        cardJson = JSON.stringify(failedCard);
+      }
       if (!managedReceiver) {
         cardJson = attachOncallGroupButton(cardJson, getBot(ds.larkAppId).config.oncallGroup, ds.chatId, ds.chatType);
       }
+      // §11 / §5.5: a node session's replies carry the run's「工作流 ›」entry
+      // at the signature row's right end (after the on-call button).
+      cardJson = attachWorkflowSidebarEntry(cardJson, workflowNodeSessionEntry(
+        ds.session.workflowNode,
+        (mainLarkAppId, runId) => resolveWorkflowEntryLink({
+          mainLarkAppId,
+          runId,
+          brand: getBotBrand(ds.larkAppId),
+          locale: localeForBot(ds.larkAppId),
+        }),
+      ));
       const baseFeedbackCard = feedback ? JSON.parse(cardJson) as Record<string, unknown> : undefined;
 
       const proposedOutput = {
@@ -19327,6 +23633,7 @@ function deliverFinalOutput(
           `[${t}] VC listener fallback replayed existing provider result `
           + `(turn ${msg.turnId.substring(0, 8)})`,
         );
+        confirmLinkRefDraft();
         onComplete?.(true, preparedListenerReply.messageId);
         return;
       }
@@ -19390,17 +23697,12 @@ function deliverFinalOutput(
           })
         : undefined;
       if (durableDelivery?.kind === 'ambiguous') {
-        ds.agentAttention = {
-          kind: 'blocked',
-          reason: `Durable final output is ambiguous: ${durableDelivery.error}`,
-          at: Date.now(),
-        };
-        publishAttentionPatch(ds);
+        if (raiseDaemonAttention(ds, 'blocked', `Durable final output is ambiguous: ${durableDelivery.error}`, msg.turnId)) publishAttentionPatch(ds);
         logger.error(`[${t}] Durable final_output ambiguous: ${durableDelivery.error}`);
         onComplete?.(false);
         return;
       }
-      const unifiedReply = durableDelivery
+      const unifiedReply = durableDelivery || handoff
         ? undefined
         : !managedReceiver && (!msg.kind || msg.kind === 'bridge')
           ? await updateTurnReplyCard(ds, msg.turnId, {
@@ -19424,15 +23726,43 @@ function deliverFinalOutput(
       const messageId = durableDelivery?.messageId ?? unifiedReply?.messageId ?? await (managedReceiver
         ? sendFinal(canonicalOutput.content)
         : replyWithImageFallback(canonicalOutput.content, canonicalOutput.msgType, sendFinal, imageFallback));
-      if (!isStillOwned()) { onComplete?.(true); return; }
+      if (!isStillOwned()) {
+        // The provider already returned its stable message id. Ownership loss
+        // only suppresses later local bookkeeping; it cannot make that external
+        // effect un-happen, so the exact unresolved retry draft is confirmed.
+        confirmLinkRefDraft();
+        onComplete?.(true, messageId);
+        return;
+      }
       if (messageId && !managedReceiver) {
+        if (handoff?.suppressed) {
+          ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+          onComplete?.(true, messageId);
+          return;
+        }
+        // Explicitly record as 'final' because deliverFinalOutput produces the
+        // authoritative completion carrier for this turn. While 'final' and
+        // undefined are currently equivalent in isFinalTurnTerminalCarrier (for
+        // rolling compatibility with older workers that omit responseKind),
+        // explicitly specifying 'final' here is an intentional forward-compatible
+        // contract to preserve deliberate intent when legacy worker semantics
+        // are eventually decoupled.
         recordTurnTerminalCarrier(ds, msg.turnId, {
           messageId,
           kind: 'standard_reply_card',
+          responseKind: 'final',
         });
       }
       recordPrimaryOutput(messageId);
       const explicit = unifiedReply?.record.finalSource === 'explicit' ? unifiedReply.record : undefined;
+      if (messageId && !managedReceiver && !msg.turnFailed) {
+        if (msg.emptyCompletedNotice) {
+          noteDiagnosticFinal(ds, msg.turnId);
+        } else {
+          noteFinalReplyText(ds, msg.turnId, explicit?.finalText ?? safeAssistantText);
+          noteLateFinalReply(ds, msg.turnId);
+        }
+      }
       if (!managedReceiver) {
         recordOncallGroupDelivery(config.session.dataDir, {
           appId: ds.larkAppId, chatId: ds.chatId, messageId,
@@ -19450,17 +23780,15 @@ function deliverFinalOutput(
         finishVcMeetingImReply(config.session.dataDir, preparedListenerReply.ref, messageId);
       }
       if (!managedReceiver && (!msg.kind || msg.kind === 'bridge')
-        && sessionPromptInjection(ds) === 'none' && !(initiator?.isBot && !explicit)) {
+        && sessionPromptInjection(ds) === 'none' && !(initiator?.isBot && !explicit && !reportInsteadOfAt)) {
         // A real @ already returns this result to the initiating bot. Do not
         // also inject an HTTP report and make it process the same result twice.
+        // In a dispatched topic that @ was dropped above, so the report is the path.
         // Reporting is a separate sink. Its bounded retries must not resend
         // the already-delivered card or delay this sub-session's settlement.
         const report = cb.onZeroPromptFinal;
         const input = {
-          turnId: msg.turnId, content: safeAssistantText,
-          dispatchRoot: frozenReplyTarget?.mode === 'thread' ? frozenReplyTarget.rootMessageId
-            : ds.scope === 'chat' ? ds.session.replyTargets?.[msg.turnId]?.rootMessageId
-              : ds.session.rootMessageId,
+          turnId: msg.turnId, content: safeAssistantText, dispatchRoot: zeroPromptDispatchRoot,
         };
         if (report) void Promise.resolve().then(() => report(ds, input)).catch(error => {
           logger.warn(`[${t}] Automatic dispatch report failed (turn ${msg.turnId}): ${error}`);
@@ -19489,8 +23817,10 @@ function deliverFinalOutput(
         ...(unifiedReply?.record.overflowMessageId
           ? [{ kind: 'attachment' as const, messageId: unifiedReply.record.overflowMessageId }] : []),
       ]), finalPublication?.receipt.reason));
+      confirmLinkRefDraft();
       onComplete?.(true, messageId);
     } catch (err: any) {
+      if (outputControl && resolveDocCommentTarget(ds, msg.turnId)) { onComplete?.(false); return; }
       if (!isStillOwned()) { onComplete?.(false); return; }
       if (err instanceof ReplyCardWithdrawnError) {
         const deliveredParts = partialResultMessages();
@@ -19502,29 +23832,45 @@ function deliverFinalOutput(
         onComplete?.(true);
         return;
       }
-      if (isLarkContentAuditError(err)) {
+      // 230099: card content rejected (the image downgrade above already ran).
+      // 230025: the reply is over Feishu's message length cap, so the same
+      // payload can never be delivered — a long transcript final (Antigravity
+      // reads its untruncated log) reaches it, and retrying only ends in a
+      // silent give-up with nothing in the chat.
+      const rejectedCode = larkErrorCode(err);
+      const cardRejected = !managedReceiver && !resolveDocCommentTarget(ds, msg.turnId)
+        && (rejectedCode === LARK_CODE_CARD_CONTENT_REJECTED || rejectedCode === LARK_CODE_MESSAGE_CONTENT_TOO_LONG);
+      if (isLarkContentAuditError(err) || cardRejected) {
         const deliveredParts = partialResultMessages();
-        observeTurnResultDelivery(resultBinding, { status: 'unavailable', reason: 'content_audit_blocked' },
-          resultReceipt(deliveredParts.length ? 'partial' : 'failed', deliveredParts, 'content_audit_blocked'));
-        // The platform PERMANENTLY rejected this payload (tenant DLP / content
-        // audit: e.g. an email address or phone number in the answer). Retrying
-        // unchanged cannot succeed and only burns 22s of backoff while leaving
-        // the thread with zero signal — the CoT bubble already says "done".
-        // Post a fixed, audit-safe notice (never the rejected body), settle the
-        // turn, and light the dashboard attention row.
+        const permanentReason = cardRejected ? 'card_content_rejected' : 'content_audit_blocked';
+        if (handoff) { handoff.auxiliary = true; handoff.rejectedReason = permanentReason; }
+        if (outputControl) outputControl.rejectedReason = permanentReason;
+        observeTurnResultDelivery(resultBinding, { status: 'unavailable', reason: permanentReason },
+          resultReceipt(deliveredParts.length ? 'partial' : 'failed', deliveredParts, permanentReason));
+        // Image downgrade already ran above. A remaining card-content or audit
+        // rejection is permanent for this payload. Retrying it leaves the
+        // Codex runner unacknowledged and restarts the entire retry loop.
+        // Send a fixed notice, settle this output, and preserve the session.
         const auditCode = larkErrorCode(err);
+        const rejection = cardRejected ? 'card content' : 'content audit';
         logger.error(
-          `[${t}] Bridge final_output rejected by Lark content audit code=${auditCode ?? 'unknown'} `
+          `[${t}] Bridge final_output rejected by Lark ${rejection} code=${auditCode ?? 'unknown'} `
           + `(turn ${msg.turnId.substring(0, 8)}); not retrying`,
         );
         const locale = localeForBot(ds.larkAppId);
-        const notice = tr('worker.final_output_content_audit_blocked', { code: String(auditCode ?? 'unknown') }, locale);
+        // 自动打码重发过仍被拒 / 找不到可打码的内容，分别给出如实的说明；两者都
+        // 不要求用户操作——这是模型输出触发的拦截，完整回复在 Web 终端里。
+        const redaction = cardRejected ? undefined : contentAuditRedactionOutcome(err);
+        const notice = tr(cardRejected ? 'worker.final_output_card_rejected'
+          : redaction?.retried ? 'worker.final_output_content_audit_blocked'
+            : 'worker.final_output_content_audit_blocked_unredacted',
+          { code: String(auditCode ?? 'unknown') }, locale);
         // Feishu IM uuid hard cap is 50 chars; raw sessionId(36)+turnId(~35)
         // concatenation is 80+ and would itself be rejected (silently defeating
         // this very notice) or truncated so multiple blocks share one dedupe key.
         // Hash the composite to a stable 50-char token.
         const noticeUuid = `ab_${createHash('sha256')
-          .update(`audit-blocked:${ds.session.sessionId}:${msg.turnId}`)
+          .update(`${cardRejected ? 'card-rejected' : 'audit-blocked'}:${ds.session.sessionId}:${msg.turnId}`)
           .digest('hex')
           .slice(0, 47)}`;
         try {
@@ -19532,16 +23878,16 @@ function deliverFinalOutput(
             notice,
             'text',
             msg.replyTurnId ?? msg.turnId,
-            { uuid: noticeUuid },
+            { uuid: noticeUuid, ...(frozenReplyTarget ? { replyTarget: frozenReplyTarget } : {}) },
           );
         } catch (noticeError) {
-          logger.warn(`[${t}] content-audit notice delivery failed: ${noticeError instanceof Error ? noticeError.message : String(noticeError)}`);
+          logger.warn(`[${t}] ${rejection} notice delivery failed: ${noticeError instanceof Error ? noticeError.message : String(noticeError)}`);
         }
-        ds.agentAttention = { kind: 'blocked', reason: `content audit ${auditCode ?? 'unknown'}`, at: Date.now() };
+        ds.agentAttention = { kind: 'blocked', reason: `${rejection} ${auditCode ?? 'unknown'}`, at: Date.now() };
         publishAttentionPatch(ds);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
-          reason: 'content_audit_blocked',
-          message: `Lark content audit ${auditCode ?? 'unknown'} rejected the final reply`,
+          reason: cardRejected ? 'card_content_rejected' : 'content_audit_blocked',
+          message: `Lark ${rejection} ${auditCode ?? 'unknown'} rejected the final reply`,
           turnId: msg.turnId,
         });
         // Same content can never be delivered as-is; settle like an explicit
@@ -19556,11 +23902,10 @@ function deliverFinalOutput(
           resultReceipt(deliveredParts.length ? 'partial' : 'failed', deliveredParts, 'topic_send_blocked'));
         // The original topic cannot receive a notice. Surface the failure on the
         // existing Dashboard attention channel without changing the send route.
-        ds.agentAttention = { kind: 'blocked', reason: err.message, at: Date.now() };
         // Push the needs-you row immediately; the owner-reminder sweep would
         // surface it eventually, but the Dashboard must not wait for the next
         // row refresh to light up.
-        publishAttentionPatch(ds);
+        if (raiseDaemonAttention(ds, 'blocked', err.message, msg.turnId)) publishAttentionPatch(ds);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
           reason: 'topic_send_blocked', message: err.message, turnId: msg.turnId,
         });
@@ -19604,7 +23949,7 @@ function deliverFinalOutput(
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage, initiator, imageFallback);
+      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, renderSnapshot, initiator, imageFallback, handoff, outputControl);
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }
@@ -19633,11 +23978,20 @@ function commitGroupContextDispatch(ds: DaemonSession, payload: CliTurnPayload, 
   try {
     if (!hasPreparedGroupContext(ds.larkAppId, ds.chatId, turnId)) return;
     const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
-    commitGroupContextDispatchIntoPayload(payload, {
+    const committed = commitGroupContextDispatchIntoPayload(payload, {
       appId: ds.larkAppId, chatId: ds.chatId, turnId, sessionId: ds.session.sessionId,
       epoch: groupContextEpoch(ds.session.sessionId, ds.session.cliSessionId, cliId, turnId),
       ...(ds.session.workerGeneration !== undefined ? { workerGeneration: ds.session.workerGeneration } : {}),
     });
+    if (committed && payload.linkRefs?.sources) {
+      const sources = payload.linkRefs.sources.flatMap(source => {
+        if (source.sourceType !== 'group_context' || source.kind !== 'text') return [source];
+        return committed.dispatched.body
+          ? [{ ...source, text: committed.dispatched.body }]
+          : [];
+      });
+      payload.linkRefs = { ...payload.linkRefs, sources };
+    }
   } catch (error) {
     logger.warn(`[${tag(ds)}] group-context dispatch commit skipped: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -19668,6 +24022,7 @@ export function reserveWorkerGeneration(ds: DaemonSession): number {
   ) + 1;
   ds.workerGeneration = workerGeneration;
   ds.session.workerGeneration = workerGeneration;
+  ds.waitingTurnPreview = undefined;
   // P1-13：换代边界统一清 previewTarget。fork / refork / 切 CLI / adopt 全部经由这里
   // 预留代次，所以这一处就是「上一代 CLI 起的 dev server 已经失去权威」的唯一判据。
   // 并进同一次 updateSession，代次推进与预览清空要么一起落盘、要么一起回滚——否则
@@ -19732,6 +24087,7 @@ export function forkAdoptWorker(
   opts?: {
     restoredFromMetadata?: boolean;
     prompt?: string;
+    payload?: CliTurnPayload;
     turnId?: string;
     atMostOnce?: boolean;
     trustedCaller?: TrustedCaller;
@@ -19757,6 +24113,9 @@ export function forkAdoptWorker(
   const bot = getBot(ds.larkAppId);
   const botCfg = bot.config;
   const agentCfg = sessionAgentConfig(ds, botCfg);
+  const globalConfig = readGlobalConfig();
+  const effectivePluginIds = resolveEffectivePluginIds(botCfg, globalConfig);
+  const protectedHttpEgressPolicies = collectProtectedHttpEgressPolicies(effectivePluginIds);
 
   // A file sandbox cannot be applied to an already-running CLI: adopt ATTACHES
   // to an existing host pane/process, and confinement (bwrap wrap on Linux /
@@ -19768,8 +24127,10 @@ export function forkAdoptWorker(
   // session-manager restore branch converts a sandbox adopt to a cold-start
   // before it ever reaches here; this is the last-line fail-closed backstop,
   // which also strips any stale adopt metadata it is handed.
-  if (adoptSandboxBlocked(botCfg, ds.session)) {
-    logger.warn(`[${t}] sandbox-enabled session: refusing to adopt existing CLI (would run unsandboxed)`);
+  if (adoptSandboxBlocked(botCfg, ds.session) || protectedHttpEgressPolicies.length > 0) {
+    logger.warn(protectedHttpEgressPolicies.length > 0
+      ? `[${t}] protected HTTP egress policy: refusing to adopt existing CLI (cannot install frozen network boundary)`
+      : `[${t}] sandbox-enabled session: refusing to adopt existing CLI (would run unsandboxed)`);
     // Strip stale adopt state so the session doesn't linger as a worker=null
     // pseudo-adopt whose NEXT message
     // would still be routed as a bridge/adopt session. It cold-starts sandboxed
@@ -19811,7 +24172,20 @@ export function forkAdoptWorker(
   const rawAdoptCwd = adopted.cwd ?? ds.workingDir ?? process.cwd();
   const adoptCwd = rawAdoptCwd && existsSync(rawAdoptCwd) ? rawAdoptCwd : homedir();
   if (adoptCwd !== rawAdoptCwd) logger.warn(`[${t}] adopt cwd "${rawAdoptCwd}" does not exist — falling back to ${adoptCwd}`);
-  const forkEnv = workerForkEnv(buildBotWorkerEnv(process.env, botCfg.envPolicy));
+  const protectedMcpProvisioning = prepareProtectedMcpWorkerProvisioning(
+    effectivePluginIds,
+    homedir(),
+    globalConfig.protectedMcpCapabilities,
+    false,
+  );
+  protectedMcpProvisioning.workerPolicy.redactEnv = protectedMcpCurrentRedactedEnvKeys(
+    globalConfig.protectedMcpCapabilities,
+    configuredProtectedMcpEnvKeys(),
+  );
+  const forkEnv = workerForkEnv(
+    buildBotWorkerEnv(process.env, botCfg.envPolicy, protectedMcpProvisioning.workerPolicy),
+    protectedMcpProvisioning.workerPolicy.redactEnv,
+  );
   // Node: fork `dist/worker.js`. Standalone binary: re-exec THIS binary with the
   // hidden `__worker` subcommand over the same IPC channel (see self-spawn.ts).
   const worker = spawnWorker({
@@ -19829,6 +24203,7 @@ export function forkAdoptWorker(
       LARK_APP_SECRET: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     } as NodeJS.ProcessEnv,
   });
+  serveProtectedMcpSecrets(worker, protectedMcpProvisioning.secrets);
   const startupState: WorkerStartupState = { ready: false, failureNotified: false };
   const adoptedCliId = adopted.cliId ?? 'claude-code';
   let initMsg!: DaemonToWorker;
@@ -19842,10 +24217,7 @@ export function forkAdoptWorker(
     logger.error(`[${t}] Adopt worker fork error: ${reason}`);
     if (startupState.failureNotified) return;
     startupState.failureNotified = true;
-    const message = tr('worker.start_failed', {
-      cliName: sessionCliDisplayName(ds, botCfg),
-      reason,
-    }, botLocale(botCfg));
+    const message = startupFailureNotice(ds, sessionCliDisplayName(ds, botCfg), reason, botLocale(botCfg));
     emitSessionLifecycleHook(ds, 'session.requires_attention', {
       reason: 'worker_fork_error',
       message: reason,
@@ -19929,9 +24301,23 @@ export function forkAdoptWorker(
   const isStructuredBridge = isStructuredBridgeAdoptCli(adoptedCliId);
   // Adopt re-forks carry the turn's bridge-formatted input in the init
   // message; this is that path's delivery boundary for group background.
-  const adoptPrompt = { content: opts?.prompt ?? '' };
+  let adoptPrompt: CliTurnPayload = opts?.payload ?? { content: opts?.prompt ?? '' };
   commitGroupContextDispatch(ds, adoptPrompt, opts?.turnId);
-  const adoptBackendType = adopted.source === 'herdr' ? 'herdr' : adopted.zellijPaneId ? 'zellij' : 'tmux';
+  const adoptBackendType = adopted.source === 'orca'
+    ? 'orca'
+    : adopted.source === 'herdr' ? 'herdr' : adopted.zellijPaneId ? 'zellij' : 'tmux';
+  const adoptHasUsefulPid = adoptedCliId === 'claude-code'
+    || isStructuredBridge
+    || !!adopted.zellijPaneId
+    || adopted.source === 'orca';
+  const admittedLinkRefs = prepareAdmittedLinkRefPayload({
+    ds,
+    payload: adoptPrompt,
+    turnId: opts?.turnId,
+  });
+  adoptPrompt = opts?.payload
+    ? freezeAdmittedPayloadInPlace(opts.payload, admittedLinkRefs.payload)
+    : admittedLinkRefs.payload;
 
   if (!ds.session.terminalCardEpoch) {
     ds.session.terminalCardEpoch = randomUUID();
@@ -19946,6 +24332,8 @@ export function forkAdoptWorker(
     terminalCardEpoch: ds.session.terminalCardEpoch,
     workingDir: adopted.cwd,
     cliId: adoptedCliId,
+    codexProfile: agentCfg.codexProfile,
+    codexProfileHome: agentCfg.codexProfileHome,
     cliRuntime: agentCfg.cliRuntime,
     cliPathOverride: agentCfg.cliPathOverride,
     cliSessionId: isStructuredBridge ? adopted.sessionId : undefined,
@@ -19958,7 +24346,7 @@ export function forkAdoptWorker(
     // Same live-read pattern as the primary init: adopt re-forks gate on the
     // adopted CLI id.
     noProgressNotify: isCodexAppCliId(adoptedCliId) ? botCfg.noProgressNotify : undefined,
-    codexRpcInput: botCfg.codexRpcInput === true || config.codexRpcInputDefault,
+    codexRpcInput: resolveCodexRpcInput(adoptedCliId, botCfg.codexRpcInput, config.codexRpcInputDefault),
     // Adopt is normally observe-only (prompt=''), driven later by 'message'
     // IPCs. But a re-fork triggered by an incoming Lark turn (worker had exited
     // — crash, or the "adopted session ended" kill path) must carry that turn's
@@ -19972,6 +24360,7 @@ export function forkAdoptWorker(
     // wrapper leaks into the user's un-injected external CLI.
     prompt: adoptPrompt.content,
     turnId: opts?.turnId,
+    ...(admittedLinkRefs.mode === 'disabled' ? {} : { linkRefMode: admittedLinkRefs.mode }),
     ...(opts?.atMostOnce ? { atMostOnce: true } : {}),
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     ...(trustedSessionController(ds)
@@ -19993,12 +24382,12 @@ export function forkAdoptWorker(
     botName: bot.botName,
     botOpenId: bot.botOpenId,
     locale: botLocale(botCfg),
-    // Zellij adopt targets carry zellijSession+zellijPaneId (observe via
-    // dump-screen / drive via action); tmux carries tmuxTarget (pipe-pane).
-    // The worker's adopt branch picks the backend from whichever is present.
+    // Each adopt source carries its own stable identity. The worker selects the
+    // matching observe backend from adoptSource and those source-specific fields.
     backendType: adoptBackendType,
     adoptMode: true,
     envPolicy: botCfg.envPolicy,
+    protectedMcpPolicy: protectedMcpProvisioning.workerPolicy,
     adoptSource: adopted.source ?? adoptBackendType,
     adoptTmuxTarget: adopted.tmuxTarget,
     adoptHerdrSessionName: adopted.herdrSessionName,
@@ -20006,18 +24395,26 @@ export function forkAdoptWorker(
     adoptHerdrPaneId: adopted.herdrPaneId,
     adoptZellijSession: adopted.zellijSession,
     adoptZellijPaneId: adopted.zellijPaneId,
+    adoptOrcaIdentity: adopted.source === 'orca' ? {
+      terminalHandle: adopted.orcaTerminalHandle!,
+      ptyId: adopted.orcaPtyId,
+      incarnationId: adopted.orcaIncarnationId,
+      executionHostId: adopted.orcaExecutionHostId,
+      worktreeId: adopted.orcaWorktreeId!,
+      agentIdentity: adopted.orcaAgentIdentity!,
+      instance: adopted.orcaInstance ?? 'relay',
+    } : undefined,
+    adoptOrcaSizeVerified: adopted.orcaPaneSizeVerified === true,
     adoptPaneCols: adopted.paneCols,
     adoptPaneRows: adopted.paneRows,
     bridgeJsonlPath,
     // PID + cwd: claude uses for `~/.claude/sessions/<pid>.json` resolver;
     // codex uses for `/proc/<pid>/fd` rollout discovery (works even if
     // session-discovery couldn't probe sessionId up-front). zellij adopt ALSO
-    // needs the pid unconditionally: ZellijObserveBackend's liveness watches
-    // the CLI pid (process.kill(pid,0)) so the worker onExit's when a user-typed
-    // CLI exits back to a shell — without it, aiden/gemini/opencode/hermes would
-    // fall back to pane-only liveness and keep routing input into the shell.
-    adoptCliPid: hasCliPid && (adoptedCliId === 'claude-code' || isStructuredBridge || !!adopted.zellijPaneId) ? adopted.originalCliPid : undefined,
-    adoptCwd: hasCliPid && (adoptedCliId === 'claude-code' || isStructuredBridge || !!adopted.zellijPaneId) ? adopted.cwd : undefined,
+    // needs the pid unconditionally: Zellij watches it for liveness, while Orca
+    // uses a relay- or daemon-attested local PID for transcript binding.
+    adoptCliPid: hasCliPid && adoptHasUsefulPid ? adopted.originalCliPid : undefined,
+    adoptCwd: hasCliPid && adoptHasUsefulPid ? adopted.cwd : undefined,
     // Restored-from-metadata: this fork is recreating an /adopt session after
     // a daemon restart, NOT a fresh /adopt command. The Lark thread already
     // has every prior turn pushed as cards, so the worker should skip the
@@ -20063,11 +24460,11 @@ export function forkAdoptWorker(
   ds.spawnedAt = Date.now();
   ds.cliVersion = '';
   try {
-    sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null);
+    sessionStore.updateSessionPid(ds.session.sessionId, worker.pid ?? null, readWorkerProcessStart(worker.pid));
   } catch (err) {
     logger.error(`[${t}] Failed to persist adopt worker pid: ${err instanceof Error ? err.message : String(err)}`);
   }
-  logger.info(`[${t}] Adopt worker forked (pid: ${worker.pid}, target: ${adopted.tmuxTarget ?? `${adopted.zellijSession}/${adopted.zellijPaneId}`})`);
+  logger.info(`[${t}] Adopt worker forked (pid: ${worker.pid}, target: ${adopted.orcaTerminalHandle ?? adopted.tmuxTarget ?? `${adopted.zellijSession}/${adopted.zellijPaneId}`})`);
 
   ds.exitEventEmitted = false;
   try {
@@ -20268,10 +24665,19 @@ export function reapOrphanWorkers(opts: {
 
 // ─── Kill stale PIDs ────────────────────────────────────────────────────────
 
-export function killStalePids(
+/**
+ * Signal workers the previous daemon run left behind, by the pids its rows
+ * recorded. A recorded pid is addressed only when it is still the exact worker
+ * it was recorded for (see core/session-worker-identity.ts); a reused pid, a
+ * legacy row without a recorded birth identity, or a process botmux cannot be
+ * shown to have launched is logged and left alone. Records whose worker is
+ * provably gone (or was just signalled) are cleared so they cannot outlive it.
+ */
+export function sweepStaleSessionWorkerPids(
   activeSessions_: Session[],
   runtimeSessions?: ReadonlyMap<string, DaemonSession>,
-): void {
+  runtime: SessionWorkerProcessRuntime = sessionWorkerProcessRuntime,
+): { signalled: number; cleared: number } {
   // Startup restore runs concurrently with the already-live dispatcher. A
   // message may create/register a fresh worker for a snapshot row before this
   // stale-process sweep starts. Treat the runtime registry as authoritative:
@@ -20279,33 +24685,71 @@ export function killStalePids(
   const runtimeSessionIds = new Set(
     runtimeSessions ? [...runtimeSessions.values()].map(ds => ds.session.sessionId) : [],
   );
+  const clear: Array<{ sessionId: string; pid: number; procStart: string | undefined }> = [];
+  let signalled = 0;
+  let gone = 0;
   for (const session of activeSessions_) {
     if (runtimeSessionIds.has(session.sessionId)) continue;
-    if (!session.pid) continue;
-    try {
-      // Check if process exists (signal 0 doesn't kill, just checks)
-      process.kill(session.pid, 0);
-      // Existing-App-Server share: the worker and its BotMux-owned remote TUI
-      // can be in one process group. Reap only the stale worker PID; killing
-      // the group would also terminate `codex --remote`, even though the
-      // replacement daemon is expected to reattach that client. The external
-      // App Server itself is never ours to signal.
-      if (isExistingAppServerSharedAdoptPersistedSession(session)) {
-        logger.info(`Killing stale shared-App-Server worker only (pid: ${session.pid}, session: ${session.sessionId})`);
-        try { process.kill(session.pid, 'SIGTERM'); } catch { /* already gone */ }
-        continue;
+    const pid = session.pid;
+    if (!pid) continue;
+    const record = { sessionId: session.sessionId, pid, procStart: session.pidProcStart };
+    const inspection = inspectRecordedSessionWorker(session, runtime);
+    switch (inspection.status) {
+      case 'exact': {
+        // Existing-App-Server share: the worker and its BotMux-owned remote TUI
+        // can be in one process group. Reap only the stale worker PID; killing
+        // the group would also terminate `codex --remote`, even though the
+        // replacement daemon is expected to reattach that client. The external
+        // App Server itself is never ours to signal. Ordinary managed sessions
+        // own their complete process group.
+        const shared = isExistingAppServerSharedAdoptPersistedSession(session);
+        logger.info(shared
+          ? `Killing stale shared-App-Server worker only (pid: ${pid}, session: ${session.sessionId})`
+          : `Killing stale CLI process (pid: ${pid}, session: ${session.sessionId})`);
+        if (signalRecordedSessionWorker(inspection, 'SIGTERM', { processGroup: !shared }, runtime)) {
+          signalled++;
+          clear.push(record);
+        }
+        break;
       }
-      // Ordinary managed sessions own their complete process group.
-      logger.info(`Killing stale CLI process (pid: ${session.pid}, session: ${session.sessionId})`);
-      try {
-        process.kill(-session.pid, 'SIGTERM');
-      } catch {
-        try { process.kill(session.pid, 'SIGTERM'); } catch { /* already gone */ }
-      }
-    } catch {
-      // Process doesn't exist, nothing to clean up
+      case 'gone':
+        gone++;
+        clear.push(record);
+        break;
+      case 'reused':
+        logger.warn(`Not signalling pid ${pid} recorded for session ${session.sessionId}: it now belongs to a process born after the recorded worker (pid reused)`);
+        clear.push(record);
+        break;
+      case 'unrecorded':
+        logger.warn(`Not signalling pid ${pid} recorded for session ${session.sessionId}: the row has no recorded worker birth identity, so the live process cannot be proven to be that worker`);
+        break;
+      case 'unproven':
+        logger.warn(`Not signalling pid ${pid} recorded for session ${session.sessionId}: its birth identity matches, but neither its command line nor its cgroup shows a botmux worker`);
+        break;
+      case 'unverifiable':
+        logger.warn(`Not signalling pid ${pid} recorded for session ${session.sessionId}: its process identity could not be read`);
+        break;
     }
   }
+  let cleared = 0;
+  if (clear.length > 0) {
+    try {
+      cleared = sessionStore.clearSessionPidsIfUnchanged(clear);
+    } catch (err) {
+      logger.warn(`Failed to clear stale worker pid records: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  if (gone > 0 || cleared > 0) {
+    logger.info(`Stale worker pid sweep: ${gone} recorded worker(s) already gone, ${cleared} stale pid record(s) cleared`);
+  }
+  return { signalled, cleared };
+}
+
+export function killStalePids(
+  activeSessions_: Session[],
+  runtimeSessions?: ReadonlyMap<string, DaemonSession>,
+): void {
+  sweepStaleSessionWorkerPids(activeSessions_, runtimeSessions);
 
   cleanupPersistentBackendSessions('tmux', activeSessions_, runtimeSessions);
   cleanupPersistentBackendSessions('herdr', activeSessions_, runtimeSessions);
@@ -20425,6 +24869,20 @@ function cleanupPersistentBackendSessions(
   }
   const ownedTargetKeys = new Set(ownedIdsByTarget.keys());
   const listBackingTargets = (): PersistentBackendTarget[] => {
+    if (backendType === 'tmux') {
+      // Managed sessions span the default server (pre-isolation rows / opt-out)
+      // and the dedicated socket(s). Ownership below stays name-keyed, so a row
+      // whose recorded server is stale still protects / releases its pane.
+      const sockets = new Set<string | undefined>([undefined, preferredManagedTmuxSocket()]);
+      for (const session of ownedSessions.concat(runtimeSessionRows.filter(belongsToBackend))) {
+        const target = session.persistentBackendTarget;
+        if (target?.backendType === 'tmux' && target.socketName !== undefined) sockets.add(target.socketName);
+      }
+      return [...sockets].flatMap(socketName => TmuxBackend.listBotmuxSessions(socketName)
+        .map((sessionName): PersistentBackendTarget => (socketName === undefined
+          ? { backendType: 'tmux', sessionName }
+          : { backendType: 'tmux', sessionName, socketName })));
+    }
     if (backendType !== 'zmx') {
       return backend.listBotmuxSessions().map(sessionName => ({ backendType, sessionName }));
     }
@@ -20526,6 +24984,10 @@ function cleanupPersistentBackendSessions(
   };
   const killOwnedBackendSession = (target: PersistentBackendTarget, exactSessionId?: string): void => {
     const name = target.sessionName;
+    if (target.backendType === 'tmux') {
+      TmuxBackend.killSession(name, target.socketName);
+      return;
+    }
     if (backendType !== 'zmx') {
       backend.killSession(name);
       return;
@@ -20651,3 +25113,4 @@ export function setCurrentCliVersion(v: string, runtimeKey?: string): void {
 export function getCurrentCliVersion(runtimeKey?: string): string {
   return runtimeKey ? currentCliVersions.get(runtimeKey) ?? 'unknown' : currentCliVersion;
 }
+import { feedbackMaintenanceActive } from '../services/feedback-maintenance.js';

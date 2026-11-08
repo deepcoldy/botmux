@@ -10,7 +10,8 @@ export interface McodeExecOptions {
   model?: string;
   effort?: string;
   permission: 'full' | 'smart';
-  timeoutMs: number;
+  /** Native exec wall-clock limit. This one-way transport does not bridge human input. */
+  timeoutMs?: number;
   onEvent?: (event: Record<string, any>) => void;
 }
 
@@ -24,7 +25,8 @@ export interface McodeExecResult {
  * answer; item/turn completion and a clean process exit alone are insufficient. */
 export async function runMcodeExec(opts: McodeExecOptions, signal: AbortSignal): Promise<McodeExecResult> {
   const args = ['exec', '--input', '-', '--cwd', opts.cwd, '--output-format', 'stream-json',
-    '--permission', opts.permission, '--timeout', `${opts.timeoutMs}ms`];
+    '--permission', opts.permission];
+  if (opts.timeoutMs !== undefined) args.push('--timeout', `${opts.timeoutMs}ms`);
   if (opts.nativeSessionId) args.push('--session', opts.nativeSessionId);
   if (opts.model) args.push('--model', opts.model);
   if (opts.effort) args.push('--effort', opts.effort);

@@ -9,8 +9,16 @@ import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { readRequestBodyJson } from './helpers/read-request-body.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
+import {
+  describeReportRelayFallback,
+  UNDELIVERED_REPORT_RELAY_REASON_TEXT,
+} from '../src/core/report-session-relay.js';
 import { composeRowFromPersistedActive } from '../src/core/dashboard-rows.js';
 import { createBinding, updateBinding } from '../src/services/issue-board-store.js';
+import {
+  shouldEmitEmptyCompletedBridgeFallback,
+  type BridgeSendMarker,
+} from '../src/services/bridge-fallback-gate.js';
 import type { Session } from '../src/types.js';
 
 const APP_ID = 'cli_report_worker';
@@ -136,7 +144,11 @@ async function runReport(options: {
   if (options.turnPlacement) {
     const markers = join(data, '.botmux-cli-pids');
     mkdirSync(markers);
-    writeFileSync(join(markers, String(process.pid)), JSON.stringify({ sessionId: options.chatScope ? source.sessionId : current.sessionId, turnId: 'turn-report' }));
+    writeFileSync(join(markers, String(process.pid)), JSON.stringify({
+      sessionId: options.chatScope ? source.sessionId : current.sessionId,
+      turnId: 'turn-report',
+      dispatchAttempt: 2,
+    }));
   }
   const captureFile = join(root, 'outbound.json');
   const topicReadsFile = join(root, 'topic-reads.json');
@@ -195,10 +207,15 @@ async function runReport(options: {
       child.once('close', status => done({ status, stdout, stderr }));
     });
     const outputLine = result.stdout.split('\n').find(line => line.startsWith('{"success":'));
+    const markerPath = join(data, 'turn-sends', `${options.chatScope ? source.sessionId : current.sessionId}.jsonl`);
     return {
       topicReads: existsSync(topicReadsFile) ? JSON.parse(readFileSync(topicReadsFile, 'utf8')) as string[] : [],
       ...result, output: outputLine ? JSON.parse(outputLine) : undefined, requests, lookups,
       outbound: existsSync(captureFile) ? JSON.parse(readFileSync(captureFile, 'utf8')) : undefined,
+      bridgeMarkers: existsSync(markerPath)
+        ? readFileSync(markerPath, 'utf8').trim().split('\n').filter(Boolean)
+          .map(line => JSON.parse(line) as BridgeSendMarker)
+        : [],
     };
   } finally {
     server.closeAllConnections();
@@ -216,15 +233,84 @@ function expectRecipient(result: Awaited<ReturnType<typeof runReport>>, openId: 
 }
 
 describe('report CLI recipient root and authenticated relay', () => {
+  it.each(['thread', 'chat'] as const)('publishes through the daemon with an accurate %s receipt', async publishTo => {
+    const publicationTarget = publishTo === 'chat'
+      ? { mode: 'top-level', chatId: CHAT }
+      : { mode: 'thread', rootMessageId: THREAD, chatId: CHAT };
+    const result = await runReport({
+      args: ['--dispatch-root', THREAD, '--delivery', 'publish', '--publish-to', publishTo],
+      relayStatus: 200, relayBody: { ok: true, publishedMessageId: 'om_result', publicationTarget },
+    });
+    expect(result.status).toBe(0);
+    expect(result.requests[0].body).toMatchObject({ delivery: 'publish', publishTo, dispatchRoot: THREAD });
+    expect(result.output).toMatchObject({
+      delivery: 'lark-message', reportedTo: 'om_result', recipient: { kind: 'chat', chatId: CHAT },
+      messageTarget: publicationTarget, publicationTarget,
+    });
+    expect(result.output.recipient.sessionId).toBeUndefined();
+    expect(result.outbound).toBeUndefined();
+  });
+
+  it('reports the source-topic receipt after a direct reply without sending another copy', async () => {
+    const publicationTarget = { mode: 'thread', rootMessageId: 'om_source', chatId: 'oc_source' };
+    const result = await runReport({ args: ['--dispatch-root', THREAD], relayStatus: 200,
+      relayBody: { ok: true, delivery: 'reply', publishedMessageId: 'om_answer', publicationTarget,
+        reportTarget: { sessionId: 'orchestrator', larkAppId: 'cli_reviewer' } } });
+    expect(result.status).toBe(0);
+    expect(result.output).toMatchObject({ deliveryMode: 'reply', reportedTo: 'om_answer',
+      messageTarget: publicationTarget, relayDelivered: false });
+    expect(result.outbound).toBeUndefined();
+  });
+
+  it('returns both destinations when publishing and relaying', async () => {
+    const result = await runReport({
+      args: ['--dispatch-root', THREAD, '--delivery', 'publish-and-relay'],
+      relayStatus: 200, relayBody: {
+        ok: true, publishedMessageId: 'om_result',
+        publicationTarget: { mode: 'thread', rootMessageId: THREAD, chatId: CHAT },
+        reportTarget: { sessionId: 'orchestrator', larkAppId: 'cli_reviewer' },
+      },
+    });
+    expect(result.status).toBe(0);
+    expect(result.requests[0].body).toMatchObject({ delivery: 'publish-and-relay' });
+    expect(result.output).toMatchObject({ reportedTo: 'orchestrator', publishedMessageId: 'om_result', deliveryMode: 'publish-and-relay' });
+    expect(result.outbound).toBeUndefined();
+  });
+
+  it('preserves the published receipt when relay fails and never falls back to another send', async () => {
+    const result = await runReport({
+      args: ['--dispatch-root', THREAD, '--delivery', 'publish-and-relay'],
+      relayStatus: 502, relayBody: { ok: false, error: 'report_relay_failed', publishedMessageId: 'om_result', deliveryKey: 'delivery-key' },
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('"publishedMessageId":"om_result"');
+    expect(result.stderr).toContain('"deliveryKey":"delivery-key"');
+    expect(result.outbound).toBeUndefined();
+  });
+
+  it.each([
+    ['--delivery'], ['--delivery', 'invalid'], ['--delivery', 'publish'],
+    ['--publish-to', 'chat'], ['--dispatch-root', THREAD, '--delivery', 'publish', '--publish-to', 'other'],
+    ...['--top-level', '--legacy-dispatch', '--into=om_other'].map(flag => ['--dispatch-root', THREAD, '--delivery', 'publish', flag]),
+  ])('rejects invalid publication arguments before delivery: %j', async (...args) => {
+    const result = await runReport({ args });
+    expect(result.status).toBe(1);
+    expect(result.requests).toHaveLength(0);
+    expect(result.outbound).toBeUndefined();
+  });
+
   it('mentions the task reviewer while staying in the user-created thread after implicit relay miss', async () => {
     const result = await runReport({ recipientRoot: SEED });
     expectRecipient(result, REVIEWER);
     expect(result.outbound).toMatchObject({ method: 'reply', request: { path: { message_id: THREAD }, data: { reply_in_thread: true } } });
     expect(result.output.messageTarget).toEqual({ mode: 'thread', rootMessageId: THREAD });
     expect(result.output.recipient).toMatchObject({ source: 'recipient-root-chat-creator', sourceSessionId: 'source-chat' });
+    // An implicit root opts into the relay fallback, but never claims the root
+    // was named: the daemon must keep answering a registry miss with 404.
     expect(result.requests).toEqual([{ url: '/api/report-relay', body: {
       sessionId: 'current-thread', dispatchRoot: THREAD, content: 'Ready for review',
       originCapability: CAPABILITY, originTurnId: 'turn-report', originDispatchAttempt: 2,
+      relayFallback: 'publish',
     } }]);
   });
 
@@ -381,6 +467,40 @@ describe('report CLI recipient root and authenticated relay', () => {
     expect(result.outbound).toBeUndefined();
   });
 
+  it('records a successful --dispatch-root relay against the exact source turn', async () => {
+    const result = await runReport({
+      turnPlacement: 'thread',
+      recipientRoot: SEED,
+      args: ['--dispatch-root', 'om_relay_seed'],
+      relayStatus: 200,
+      relayBody: {
+        ok: true,
+        triggerId: 'trigger-report',
+        reportTarget: { sessionId: 'orchestrator', larkAppId: 'cli_reviewer' },
+      },
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.bridgeMarkers).toHaveLength(1);
+    expect(result.bridgeMarkers[0]).toMatchObject({
+      sessionId: 'current-thread',
+      turnId: 'turn-report',
+      dispatchAttempt: 2,
+      deliveryKind: 'dispatch_report',
+      deliveryId: 'trigger-report',
+      targetSessionId: 'orchestrator',
+      dispatchRootId: 'om_relay_seed',
+    });
+    expect(shouldEmitEmptyCompletedBridgeFallback({
+      sessionId: 'current-thread',
+      turnId: 'turn-report',
+      dispatchAttempt: 2,
+      markTimeMs: undefined,
+      isLocal: false,
+      finalText: 'BOTMUX_NOTHING_TO_SEND',
+      terminalStatus: 'completed',
+    }, undefined, result.bridgeMarkers, false)).toBe(false);
+  });
+
   it('retains authenticated orchestrator relay without a Lark fallback', async () => {
     const result = await runReport({ recipientRoot: SEED, relayStatus: 200, relayBody: {
       ok: true, triggerId: 'trigger-report', reportTarget: { sessionId: 'orchestrator', larkAppId: 'cli_reviewer' },
@@ -470,6 +590,57 @@ describe('report source topic preservation', () => {
 
 
 describe('report issue notice source', () => {
+  it('records an exact visible-reply marker only after the issue card reaches Lark', async () => {
+    const result = await runReport({
+      issueInReview: true,
+      topicPolicy: 'legacy',
+      turnPlacement: 'thread',
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output).toMatchObject({
+      delivery: 'issue-in-review',
+      alreadyInReview: true,
+      reportPostedToChat: true,
+    });
+    expect(result.bridgeMarkers).toHaveLength(1);
+    expect(result.bridgeMarkers[0]).toMatchObject({
+      sessionId: 'current-thread',
+      turnId: 'turn-report',
+      dispatchAttempt: 2,
+      deliveryKind: 'dispatch_report',
+      messageId: 'om_report_sent',
+      deliveryId: 'fixture-issue',
+      targetChatId: CHAT,
+    });
+  });
+
+  it('does not record a visible-reply marker when the issue state changed but the Lark card failed', async () => {
+    const result = await runReport({
+      issueInReview: true,
+      topicPolicy: 'stop',
+      unavailableMessage: THREAD,
+      turnPlacement: 'thread',
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output).toMatchObject({
+      success: true,
+      delivery: 'issue-in-review',
+      alreadyInReview: true,
+      reportPostedToChat: false,
+    });
+    expect(result.stderr).toContain('TOPIC_SEND_BLOCKED');
+    expect(result.bridgeMarkers).toEqual([]);
+    expect(shouldEmitEmptyCompletedBridgeFallback({
+      sessionId: 'current-thread',
+      turnId: 'turn-report',
+      dispatchAttempt: 2,
+      markTimeMs: 100,
+      isLocal: false,
+      finalText: '',
+      terminalStatus: 'completed',
+    }, undefined, result.bridgeMarkers, false)).toBe(true);
+  });
+
   it('retains the settled issue receipt but does not publish its notice after source withdrawal', async () => {
     const result = await runReport({ issueInReview: true, topicPolicy: 'stop', unavailableMessage: THREAD });
     expect(result.status).toBe(0);
@@ -490,5 +661,102 @@ describe('report issue notice source', () => {
     expect(result.output).toMatchObject({ delivery: 'issue-in-review', alreadyInReview: true, reportPostedToChat: true });
     expect(result.outbound).toMatchObject({ method: 'create', request: { data: { receive_id: CHAT } } });
     expect(result.topicReads).toEqual(topicPolicy === 'stop' ? [THREAD] : []); expect(result.requests).toEqual([]);
+  });
+});
+
+describe('report CLI relay fallback (#2262)', () => {
+  const failureLine = (stderr: string) => {
+    const line = stderr.split('\n').find(entry => entry.startsWith('{"success":false'));
+    return line ? JSON.parse(line) : undefined;
+  };
+
+  it('asks for the visible fallback on default relay and names an explicit root', async () => {
+    const result = await runReport({ args: ['--dispatch-root', 'om_relay_seed'], relayStatus: 200, relayBody: {
+      ok: true, triggerId: 'trigger-report', reportTarget: { sessionId: 'orchestrator', larkAppId: 'cli_reviewer' },
+    } });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.requests[0].body).toMatchObject({ relayFallback: 'publish', explicitDispatchRoot: true });
+    expect(result.output).toMatchObject({ delivery: 'orchestrator-session', reportedTo: 'orchestrator' });
+    expect(result.output).not.toHaveProperty('relayDelivered');
+  });
+
+  it('does not ask for the fallback when the report is published anyway', async () => {
+    const result = await runReport({
+      args: ['--dispatch-root', THREAD, '--delivery', 'publish'],
+      relayStatus: 200, relayBody: { ok: true, publishedMessageId: 'om_result',
+        publicationTarget: { mode: 'thread', rootMessageId: THREAD, chatId: CHAT } },
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.requests[0].body).not.toHaveProperty('relayFallback');
+    expect(result.requests[0].body).not.toHaveProperty('explicitDispatchRoot');
+  });
+
+  it('reports a published fallback as a visible delivery the orchestrator did not get', async () => {
+    const relayFallback = {
+      reason: 'orchestrator_offline', reasonText: UNDELIVERED_REPORT_RELAY_REASON_TEXT.orchestrator_offline,
+      relayStatus: 503, relayError: 'orchestrator_daemon_offline', published: true,
+    };
+    const publicationTarget = { mode: 'thread', rootMessageId: 'om_relay_seed', chatId: CHAT };
+    const result = await runReport({
+      turnPlacement: 'thread',
+      args: ['--dispatch-root', 'om_relay_seed'],
+      relayStatus: 200,
+      relayBody: { ok: true, delivery: 'publish', publishedMessageId: 'om_fallback', deliveryKey: 'f'.repeat(64),
+        projectSynced: false, publicationTarget, relayFallback },
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.output).toMatchObject({
+      success: true, delivery: 'lark-message', reportedTo: 'om_fallback', placementSource: 'relay-fallback',
+      relayDelivered: false, publishedMessageId: 'om_fallback', publicationTarget, messageTarget: publicationTarget,
+      relayFailure: { reason: 'orchestrator_offline', status: 503, error: 'orchestrator_daemon_offline' },
+      notice: describeReportRelayFallback(relayFallback),
+    });
+    expect(result.output.notice).toContain(UNDELIVERED_REPORT_RELAY_REASON_TEXT.orchestrator_offline);
+    // The daemon already published it; the CLI must not post a second copy.
+    expect(result.outbound).toBeUndefined();
+    expect(result.bridgeMarkers).toHaveLength(1);
+    expect(result.bridgeMarkers[0]).toMatchObject({
+      sessionId: 'current-thread', turnId: 'turn-report', deliveryKind: 'dispatch_report',
+      messageId: 'om_fallback', targetChatId: CHAT, targetRootMessageId: 'om_relay_seed',
+      dispatchRootId: 'om_relay_seed',
+    });
+    expect(result.bridgeMarkers[0]).not.toHaveProperty('targetSessionId');
+  });
+
+  it('fails loudly with the reason when the fallback could not be published', async () => {
+    const relayFallback = {
+      reason: 'orchestrator_session_closed', relayStatus: 409, relayError: 'fallback_scope_unsupported',
+      published: false, publicationError: 'report_publication_unavailable', blockedBy: 'private_card',
+    };
+    const result = await runReport({
+      turnPlacement: 'thread',
+      args: ['--dispatch-root', 'om_relay_seed'],
+      relayStatus: 409,
+      relayBody: { ok: false, error: 'fallback_scope_unsupported', relayFallback },
+    });
+    expect(result.status).toBe(1);
+    expect(result.output).toBeUndefined();
+    expect(failureLine(result.stderr)).toMatchObject({
+      success: false, error: 'fallback_scope_unsupported',
+      notice: describeReportRelayFallback(relayFallback),
+      relayFailure: { reason: 'orchestrator_session_closed', status: 409, error: 'fallback_scope_unsupported' },
+      publicationError: 'report_publication_unavailable', publicationBlockedBy: 'private_card',
+    });
+    expect(result.outbound).toBeUndefined();
+    expect(result.bridgeMarkers).toEqual([]);
+  });
+
+  it('does not trust a fallback that claims publication without a message id', async () => {
+    const result = await runReport({
+      turnPlacement: 'thread',
+      args: ['--dispatch-root', 'om_relay_seed'],
+      relayStatus: 200,
+      relayBody: { ok: true, relayFallback: { reason: 'orchestrator_offline', relayStatus: 503, published: true } },
+    });
+    expect(result.status).toBe(1);
+    expect(failureLine(result.stderr).notice).not.toBe(describeReportRelayFallback({
+      reason: 'orchestrator_offline', published: true,
+    }));
+    expect(result.bridgeMarkers).toEqual([]);
   });
 });

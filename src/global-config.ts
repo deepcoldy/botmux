@@ -1,3 +1,4 @@
+import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 /**
  * Global botmux configuration stored at `~/.botmux/config.json`.
  *
@@ -14,12 +15,25 @@
  */
 import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs';
 import type { ProjectScanOptions } from './services/project-scanner.js';
-import { join, dirname } from 'node:path';
+import { join, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { isLocale, type Locale } from './i18n/types.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import { parseVolcengineConfig } from './services/voice/volcengine-config.js';
 import type { VcMeetingConsumerProfileConfig } from './types.js';
 import { normalizePluginIdList } from './core/plugins/ids.js';
+import { assertDurableConfigMutationAllowed } from './services/durable-config-mutation.js';
+import { normalizeLinkRefConfig } from './services/link-ref-config.js';
+import type { LinkRefConfig } from './services/link-ref-types.js';
+import { applyEnvOps, envLayerWithinBudget, globalEnvLayer, isEmptyEnvLayer, type EnvLayer, type EnvOp } from './core/session-env.js';
+import { readPromptCacheConfig, type PromptCacheConfig } from './services/prompt-cache-policy.js';
+import { normalizeMcpGatewayMaxToolTimeoutMs } from './core/plugins/mcp/runtime-options.js';
+import { canonicalScheduleBotGrant, isScheduleBotGrant } from './core/schedule-bot-grant.js';
+import {
+  normalizeProtectedMcpCapabilities,
+  protectedMcpConfiguredEnvKeys,
+  type ProtectedMcpCapabilityConfigMap,
+} from './core/protected-mcp-capabilities.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';
@@ -106,6 +120,8 @@ export interface VcMeetingSharedConsumerCatalog {
 }
 
 export interface VcMeetingAgentGlobalConfig {
+  /** Defaults for future meetings; each meeting freezes its effective policy. */
+  listenerPolicy?: Partial<VcMeetingListenerPolicy>;
   /** Machine-wide VC meeting listener kill-switch. Missing means enabled for
    *  backwards compatibility; per-bot vcMeetingAgent.enabled still controls
    *  whether a given bot responds to meetings. */
@@ -122,20 +138,62 @@ export interface WorkflowFeatureGlobalConfig {
   /** Machine-wide v3 Workflow kill-switch. Missing / `enabled !== true`
    *  keeps the feature OFF (disabled by default). Set true to turn the whole
    *  workflow feature on for this host: the `/workflow` grill + Saved-Workflow
-   *  run/save entries are accepted, the `botmux-workflow` family of skills is
-   *  advertised/installed, and the CLI authoring/run subcommands work.
+   *  run/save entries are accepted, the `botmux-workflow` family of skills can
+   *  be read on demand (`botmux skill show`; never resident in session prompts),
+   *  and the CLI authoring/run subcommands work.
    *  In-flight run management (cancel / retry / grant) stays available so a run
    *  started before a flip can still be wound down. The multi-bot
    *  `botmux-orchestrate` skill is intentionally NOT gated by this — it is a
    *  separate long-running-orchestration capability, not a v3 workflow. */
   enabled?: boolean;
+  /** Experimental (design 2026-11-03 §15.5): who executes goal nodes of runs
+   *  authorized from now on. Absent = `ephemeral` (today's temporary CLI
+   *  workers). `bot` hands each node to a bot's own session in the run's chat.
+   *  Frozen into `run.json` at authorization, so flipping it never changes a
+   *  run that already started. Only the non-default value is ever stored. */
+  nodeExecutor?: 'bot';
+  /** Experimental (design 2026-11-03 §10, §15.5, D5): a bot-executed run
+   *  authorized from now on freezes its initiator's identity, and every
+   *  handoff of that run carries a delegation signed from it, so the node bot
+   *  runs its `triggerUserAuth` tools as the initiator. Absent = off (the node
+   *  bot runs as itself). Frozen into `run.json` at authorization; only `true`
+   *  is ever stored. */
+  handoffIdentity?: true;
+  /** v3 runtime concurrency caps, per run (design 2026-06-01 Q5/R3:
+   *  "conservative defaults, configurable"). Every field is optional; a
+   *  missing field keeps the code default (V3_DEFAULT_CONCURRENCY). Read
+   *  when a run is driven, so a change applies to the next drive. Invalid
+   *  values are dropped on read, so a later Dashboard write of the workflow
+   *  block does not keep them. */
+  concurrency?: WorkflowConcurrencyConfig;
 }
+
+export interface WorkflowConcurrencyConfig {
+  /** Max nodes (goal, gate and host) in flight for one run. */
+  global?: number;
+  /** Max nodes in flight on the same bot (Lark app). */
+  perBot?: number;
+  /** Max nodes in flight on the same CLI type, for any CLI not listed in
+   *  `perCliById`. */
+  perCli?: number;
+  /** Per-CLI override keyed by cliId (e.g. `{ "claude-code": 8 }`) — an
+   *  API-billed CLI can run wide while a subscription CLI stays at 2. */
+  perCliById?: Record<string, number>;
+}
+
+export type WorkflowNodeExecutorMode = 'ephemeral' | 'bot';
 
 export interface MultiTopicGlobalConfig {
   /** Machine-wide multi-topic orchestration switch. Missing means enabled for
    *  backwards compatibility. When disabled, botmux-orchestrate is hidden and
    *  `botmux dispatch` may only append to an existing topic via `--into`. */
   enabled?: boolean;
+  /** Dispatch task-tree card. Default OFF (missing !== true): the first
+   *  dispatch posts no card, no dispatch-task-tree-cards.json is written, and
+   *  reports record nothing — exactly the pre-card behaviour. Opt in from
+   *  Dashboard 全局设置 → 多话题编排 → 任务树卡片. Read live, so turning it
+   *  off stops new card posts/updates immediately (a kill switch). */
+  taskTreeCard?: boolean;
 }
 
 export interface WorkerConfig {
@@ -149,9 +207,12 @@ export interface WorkerConfig {
   sessionMemoryMaxBytes?: number;
 }
 
-/** Supported idle thresholds (hours) for both the manual「清理空闲」button and
- *  scheduled auto-cleanup. Kept in lockstep with session-cleanup's
- *  IDLE_CLEANUP_HOUR_OPTIONS so the two paths never diverge. */
+/** Supported idle thresholds (hours) for scheduled auto-cleanup ONLY.
+ *  Deliberately a strict subset of the manual button's options
+ *  (session-cleanup IDLE_CLEANUP_HOUR_OPTIONS additionally offers 1 and 0 =
+ *  "all"); never align the two — a 0 leaking into unattended sweeps means
+ *  "close every eligible session". The invariant is
+ *  AUTO_CLEANUP_HOUR_OPTIONS === SESSION_CLEANUP_HOUR_OPTIONS (unit-tested). */
 export const SESSION_CLEANUP_HOUR_OPTIONS = [24, 72, 168] as const;
 export type SessionCleanupHours = typeof SESSION_CLEANUP_HOUR_OPTIONS[number];
 /** Bounds for the check cadence. A 5-minute floor keeps a hand-edited config
@@ -165,10 +226,24 @@ export interface SessionCleanupGlobalConfig {
   archiveCodex?: boolean;
   /** 定时自动清理空闲会话开关。缺省关闭 —— 不开启则完全保持既有（纯手动）行为。 */
   enabled?: boolean;
-  /** 空闲阈值（小时）。仅接受 24 / 72 / 168，与手动清理按钮完全一致。缺省 168（7 天）。 */
+  /** 空闲阈值（小时）。定时自动清理仅接受 24 / 72 / 168；手动清理按钮另提供
+   *  1 与 0（全部）。缺省 168（7 天）。 */
   olderThanHours?: SessionCleanupHours;
   /** 检查频率（分钟）。缺省 60，最小 5（低于则回退到最小值）。 */
   intervalMinutes?: number;
+}
+
+/** Host service authority letting one bot request schedule:create for others,
+ * without a human administrator driving the turn. It conveys scheduling only:
+ * no personal tool credentials, no persistent run scopes. */
+export interface ScheduleBotGrant {
+  /** Stable host-managed grant id; never supplied by a worker. */
+  id: string;
+  sourceAppId: string;
+  targetAppIds: string[];
+  chatIds: string[];
+  /** Accountable administrator, resolved separately in each app. No tool credentials are delegated. */
+  controllerUnionId: string;
 }
 
 /** Host policy for delegating creation of persistent scheduled work across bots.
@@ -176,7 +251,22 @@ export interface SessionCleanupGlobalConfig {
  * is a separate emergency revocation switch so stopping new grants does not
  * silently change the meaning of already committed tasks. */
 export interface ScheduleDelegationGlobalConfig {
-  /** Allow a directly authenticated human turn to request schedule:create. Default off. */
+  /** Explicit bot service grants. Default empty; effective only while
+   *  `createEnabled` is on. A grant matches on source app, every target app and
+   *  chat — not on who drives the source turn — and applies only to a dispatch
+   *  made from one of its chats into one of them. The dispatch route sets it aside
+   *  only for a source-bot administrator's own turn, which keeps its own
+   *  identity and rules. Every other turn in a granted chat gets it: bot,
+   *  report and scheduled turns, and also any person who is not an
+   *  administrator but can talk to the source bot there. Their dispatch is then
+   *  signed for `controllerUnionId` with no personal tool credentials (a bot
+   *  turn's inherited delegation included), and requests schedule:create
+   *  unless it passes `--no-delegate schedule:create`. */
+  botGrants?: ScheduleBotGrant[];
+  /** Allow schedule:create via a current human administrator or an explicit
+   *  bot grant. Default off. Turning it off also stops later admission of
+   *  already committed bot-grant tasks (their grant no longer matches);
+   *  `runEnabled` remains the one emergency stop for every delegated task. */
   createEnabled?: boolean;
   /** Allow already committed delegated schedules to run. Missing means on. */
   runEnabled?: boolean;
@@ -194,6 +284,8 @@ export const SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN = 64;
 
 export interface GlobalConfig {
   lang?: Locale;
+  /** Machine-wide LinkRef rollout setting. Missing keeps legacy behavior. */
+  linkRefs?: LinkRefConfig;
   /** Machine-wide default prefix for groups created via `/group` or `/g`.
    *  Other creation paths intentionally ignore it. Missing means disabled. */
   groupNamePrefix?: string;
@@ -224,6 +316,11 @@ export interface GlobalConfig {
    *  聚合进程周期性调用与手动「清理空闲」按钮完全相同的判定/关闭逻辑
    *  （dashboard/session-cleanup.ts），无人值守地关掉空闲超过阈值的会话。 */
   sessionCleanup?: SessionCleanupGlobalConfig;
+  /** Claude Code prompt-cache defaults (TTL + idle keep-alive) for every bot.
+   *  Machine-level, default OFF, managed from the Dashboard; a bot's own
+   *  `promptCache` in bots.json overrides it field by field
+   *  (services/prompt-cache-policy.ts). */
+  promptCache?: PromptCacheConfig;
   /** Machine-wide meeting listener kill-switch. Missing / enabled !== false
    *  preserves legacy behavior; set false to stop accepting new VC meetings
    *  and skip restore/readiness for this host. */
@@ -235,10 +332,11 @@ export interface GlobalConfig {
   /** Machine-wide multi-topic orchestration switch. Missing / enabled !== false
    *  preserves legacy behavior. `BOTMUX_MULTI_TOPIC_ENABLED` overrides it. */
   multiTopic?: MultiTopicGlobalConfig;
-  /** Optional HTTP(S) proxy for the daemon's own outbound downloads (e.g. the
-   *  binary self-update release asset). Node's global fetch ignores HTTP_PROXY/HTTPS_PROXY,
-   *  so hosts behind a proxy must set this (or the env vars, which we read as a
-   *  fallback). Form: `http://host:port` or `http://user:pass@host:port`. */
+  /** Optional proxy for GitHub release assets and checksums, preferred over
+   *  HTTP_PROXY/HTTPS_PROXY. Registry metadata and platform-package downloads
+   *  use only environment proxies + NO_PROXY; package-manager installs use
+   *  the manager's own proxy settings. Form: `http://host:port` or
+   *  `http://user:pass@host:port`. */
   httpProxy?: string;
   /** OAuth redirect base for user authorization (/login). When set (e.g.
    *  `http://10.1.2.3:7891`, typically this host's dashboard origin), auth
@@ -252,6 +350,10 @@ export interface GlobalConfig {
   skills?: GlobalSkillConfig;
   /** Plugin ids enabled for every bot. Per-bot plugin ids are additive. */
   plugins?: string[];
+  /** Operator-owned bindings for optional protected local MCP capabilities. */
+  protectedMcpCapabilities?: ProtectedMcpCapabilityConfigMap;
+  /** Host-wide ceiling for per-plugin MCP tool calls. Missing defaults to 10 minutes. */
+  mcpGatewayMaxToolTimeoutMs?: number;
   /** 远程访问. When true (and this machine is bound to the central platform),
    *  session web-terminal links, Feishu card terminal buttons, and connector
    *  webhook URLs use the central-platform machine subdomain instead of local
@@ -267,6 +369,10 @@ export interface GlobalConfig {
   scheduleTimeZone?: string;
   /** Machine-wide cross-bot schedule delegation policy. */
   scheduleDelegation?: ScheduleDelegationGlobalConfig;
+  /** Session environment overlay for every bot's sessions, applied after the
+   *  inherited baseline and before each bot's own layer (core/session-env.ts).
+   *  Managed from Dashboard「设置 → 会话环境变量」. Values may be credentials. */
+  sessionEnv?: EnvLayer;
 }
 
 export interface GlobalSkillConfig {
@@ -274,11 +380,11 @@ export interface GlobalSkillConfig {
   delivery?: 'auto' | 'prompt' | 'native';
   /** Machine-wide default for how botmux's **built-in bridge skills**
    *  (botmux-send / botmux-schedule / …) reach CLIs that only support a GLOBAL
-   *  skills directory (codex/gemini/opencode/… — everything with `skillsDir`,
+   *  skills directory (codex/opencode/… — everything with `skillsDir`,
    *  i.e. no per-session `--plugin-dir` injection like Claude Code):
    *   - `global`: install the skill files into the CLI's shared global dir
    *     (e.g. `~/.codex/skills`). Full native experience, but the user's own
-   *     standalone `codex`/`gemini` sees & can mis-fire them. Right for hosts
+   *     standalone `codex`/`opencode` sees & can mis-fire them. Right for hosts
    *     whose users NEVER run those CLIs by hand.
    *   - `prompt` (default): don't touch the global dir; inject a compact skill
    *     catalog into the session prompt and let the model pull full instructions
@@ -355,13 +461,28 @@ export interface DashboardGlobalConfig {
    *  instead of a tmux paste, bypassing codex's terminal paste-drop. Default OFF
    *  (absent ⇒ off); flip on to enable fleet-wide. Read live by the daemon —
    *  see config.ts `codexRpcInputDefault`. A per-bot `codexRpcInput: true` still
-   *  force-enables regardless of this global default. */
+   *  force-enables regardless of this global default; false explicitly keeps
+   *  that bot on terminal input. */
   codexRpcInput?: boolean;
   /** Automatically replace outdated Codex session processes when safely idle
    *  and resume the same thread without sending a new prompt. Experimental,
    *  default OFF; read live so an explicit true starts scheduling upgrades and
    *  removing it stops them, both without restarting the daemon. */
   autoUpgradeCodexSessions?: boolean;
+  /** Experimental: at daemon startup, SIGTERM tmux SERVERS orphaned by a
+   *  previous daemon generation (a displaced server whose socket was rebound
+   *  still hosts the old managed CLIs holding per-session file locks). This is
+   *  an automatic process kill, so it is default OFF and must be enabled
+   *  explicitly from the Dashboard experimental settings; read live by the
+   *  daemon gate (config.ts `reapOrphanTmuxServers`). BOTMUX_DISABLE_ORPHAN_TMUX_REAP=1
+   *  remains an independent emergency kill-switch. */
+  reapOrphanTmuxServers?: boolean;
+  /** Periodic orphan-tmux SESSION sweep. Default ON but REPORT-ONLY (logs
+   *  displaced servers/panes, never signals). Read live by the daemon timer. */
+  tmuxOrphanSessionSweep?: boolean;
+  /** Destructive arm of the periodic session sweep: signal only a proven
+   *  taken-over bare-wrapper pane. Default OFF. */
+  tmuxOrphanSessionBareWrapperKill?: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate ("Press t
    *  to trust") for Codex-family plain-TUI launches (codex / traex). Codex 0.14x
    *  gates the botmux-installed ~/.codex/hooks.json behind a manual trust prompt,
@@ -402,12 +523,22 @@ export interface DashboardGlobalConfig {
   /** 流式卡片上下文占用百分比变色/高亮阈值（1-100 整数）。缺省 80。由 card-builder
    *  在构建时读取（readGlobalConfig 2s TTL 缓存），低于阈值灰色、≥阈值红色并提示压缩。 */
   contextCompactThreshold?: number;
+  /** Automatically send the native `/compact` command after an idle session
+   *  reaches this context percentage. Disabled unless autoCompactEnabled=true. */
+  autoCompactThreshold?: number;
+  /** Machine-wide opt-in for idle, debounced native context compaction. */
+  autoCompactEnabled?: boolean;
   /** 机器级总开关：是否在回复卡片页脚渲染品牌签名（默认 botmux 链接 / 各 bot 自定义
    *  brandLabel）。缺省 ON（absent ⇒ 显示）；显式 `false` 时**所有** bot 的页脚品牌
    *  签名一律不渲染（等价于每 bot brandLabel 被置空），Dashboard 每个 bot 的签名
    *  编辑框随之置灰。只影响品牌签名这一段，页脚的用量/耗时/发送给等不受影响。
    *  Live 读取（见 bot-registry.ts `isCardBrandLabelEnabled`），Settings 翻转后无需重启。 */
   cardBrandLabel?: boolean;
+  /** 「CLI 卡住」卡片上，本轮发起人能否按只做拒绝/跳过的安全键（core/stuck-page-catalog.ts
+   *  里 audience='initiator' 的键，如 Esc 不信任继续 / 暂不迁移）。缺省 ON（absent ⇒ 允许）；
+   *  显式 `false` 时只有 Bot 管理员（canOperate）能按卡片上的任何键。与默认值相同的 `true`
+   *  不落盘（Dashboard 写入时删键）。点击时 live 读取（见 config.ts `stuckCardInitiatorKeys`）。 */
+  stuckCardInitiatorKeys?: boolean;
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
@@ -417,9 +548,11 @@ export interface DashboardGlobalConfig {
 function readVoice(raw: unknown): VoiceConfig | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const v = raw as Record<string, unknown>;
-  const engineOk = v.engine === 'sami' || v.engine === 'openai' || v.engine === 'minimax' || v.engine === undefined;
+  const engineOk = v.engine === 'sami' || v.engine === 'openai' || v.engine === 'minimax' || v.engine === 'volcengine' || v.engine === undefined;
   if (!engineOk) return undefined;
-  if (!v.sami && !v.openai && !v.minimax && !v.engine && !v.asr) return undefined;
+  if (!v.sami && !v.openai && !v.minimax && !v.engine && !v.asr && v.volcengine === undefined
+    && typeof v.speaker !== 'string' && typeof v.rate !== 'number') return undefined;
+  if (v.volcengine !== undefined) v.volcengine = parseVolcengineConfig(v.volcengine);
   // 与 bot-registry 的 per-bot 解析对齐：minimax.region 只接受 'cn'/'global'，
   // 拼错/其它值一律删掉（适配器再兜底 global），避免脏值静默落到海外端点、还被
   // `voice status` 原样显示。
@@ -542,6 +675,9 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   if (herdrTraexPlugin) out.herdrTraexPlugin = herdrTraexPlugin;
   if (typeof d.codexRpcInput === 'boolean') out.codexRpcInput = d.codexRpcInput;
   if (typeof d.autoUpgradeCodexSessions === 'boolean') out.autoUpgradeCodexSessions = d.autoUpgradeCodexSessions;
+  if (typeof d.reapOrphanTmuxServers === 'boolean') out.reapOrphanTmuxServers = d.reapOrphanTmuxServers;
+  if (typeof d.tmuxOrphanSessionSweep === 'boolean') out.tmuxOrphanSessionSweep = d.tmuxOrphanSessionSweep;
+  if (typeof d.tmuxOrphanSessionBareWrapperKill === 'boolean') out.tmuxOrphanSessionBareWrapperKill = d.tmuxOrphanSessionBareWrapperKill;
   // Round-trip an explicit boolean either way. Absent stays absent — the live
   // getter (config.ts `bypassCodexHookTrust`) treats absent as ON, so we must
   // preserve a stored `false` to let an operator disable it.
@@ -555,10 +691,18 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
     && d.contextCompactThreshold >= 1 && d.contextCompactThreshold <= 100) {
     out.contextCompactThreshold = Math.round(d.contextCompactThreshold);
   }
+  if (typeof d.autoCompactEnabled === 'boolean') out.autoCompactEnabled = d.autoCompactEnabled;
+  if (typeof d.autoCompactThreshold === 'number'
+    && Number.isFinite(d.autoCompactThreshold)
+    && d.autoCompactThreshold >= 1 && d.autoCompactThreshold <= 100) {
+    out.autoCompactThreshold = Math.round(d.autoCompactThreshold);
+  }
   // Round-trip an explicit boolean either way. Absent stays absent — the live
   // reader (bot-registry.ts `isCardBrandLabelEnabled`) treats absent as ON, so a stored
   // `false` must be preserved to let an operator suppress footer brands fleet-wide.
   if (typeof d.cardBrandLabel === 'boolean') out.cardBrandLabel = d.cardBrandLabel;
+  // Default ON: only an explicit stored false disables (config.ts getter).
+  if (typeof d.stuckCardInitiatorKeys === 'boolean') out.stuckCardInitiatorKeys = d.stuckCardInitiatorKeys;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -604,6 +748,12 @@ function readScheduleDelegation(raw: unknown): ScheduleDelegationGlobalConfig | 
       (item): item is string => typeof item === 'string' && /^cli_[A-Za-z0-9_-]{1,128}$/.test(item),
     ))];
     if (appIds.length > 0) out.defaultOnDispatchFromBotAppIds = appIds;
+  }
+  if (Array.isArray(value.botGrants)) {
+    const grants = value.botGrants.filter(isScheduleBotGrant);
+    // Ambiguous grant ids fail closed, rather than choosing an arbitrary scope.
+    out.botGrants = grants.filter(g => grants.filter(other => other.id === g.id).length === 1)
+      .map(canonicalScheduleBotGrant);
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -675,9 +825,11 @@ function readHostOverloadAlert(raw: unknown): HostOverloadAlertGlobalConfig | un
 
 /** Parse `sessionCleanup` from config. Whitelist known keys; drop invalid
  *  values so a hand-edited config degrades to defaults rather than crashing.
- *  `olderThanHours` accepts only the three supported thresholds (same set as the
- *  manual button); `intervalMinutes` is clamped to a 5-minute floor. The tick
- *  (dashboard/auto-cleanup.ts) layers defaults over whatever survives here. */
+ *  `olderThanHours` accepts only the three scheduled-sweep thresholds
+ *  24 / 72 / 168 — deliberately NOT the manual button's full set (which also
+ *  offers 1 and 0 = all); `intervalMinutes` is clamped to a 5-minute floor. The
+ *  tick (dashboard/auto-cleanup.ts) layers defaults over whatever survives
+ *  here. */
 function readSessionCleanup(raw: unknown): SessionCleanupGlobalConfig | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const value = raw as Record<string, unknown>;
@@ -753,6 +905,15 @@ function readVcMeetingAgent(raw: unknown): VcMeetingAgentGlobalConfig | undefine
   if (!raw || typeof raw !== 'object') return undefined;
   const v = raw as Record<string, unknown>;
   const out: VcMeetingAgentGlobalConfig = {};
+  try {
+    const listenerPolicy = normalizeVcMeetingListenerPolicy(v.listenerPolicy);
+    if (listenerPolicy) out.listenerPolicy = listenerPolicy;
+  } catch {
+    // A typo in this optional feature must not break unrelated global config
+    // reads or silently fall back to publishing raw meeting text.
+    console.warn('[botmux] Invalid vcMeetingAgent.listenerPolicy; disabling its publication/sharing flags.');
+    out.listenerPolicy = { rawMessages: false, finalSummary: false, allowSummarySharing: false };
+  }
   if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
   if (typeof v.listenerBotAppId === 'string' && v.listenerBotAppId.trim()) {
     out.listenerBotAppId = v.listenerBotAppId.trim();
@@ -767,6 +928,41 @@ function readWorkflowFeature(raw: unknown): WorkflowFeatureGlobalConfig | undefi
   const v = raw as Record<string, unknown>;
   const out: WorkflowFeatureGlobalConfig = {};
   if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
+  if (v.nodeExecutor === 'bot') out.nodeExecutor = 'bot';
+  if (v.handoffIdentity === true) out.handoffIdentity = true;
+  const concurrency = readWorkflowConcurrency(v.concurrency);
+  if (concurrency) out.concurrency = concurrency;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Upper bound for any single concurrency cap: a typo like 1000 must not fork
+ *  a thousand CLI workers. */
+export const WORKFLOW_CONCURRENCY_MAX = 64;
+
+function readConcurrencyCap(raw: unknown): number | undefined {
+  return typeof raw === 'number' && Number.isInteger(raw) && raw >= 1 && raw <= WORKFLOW_CONCURRENCY_MAX
+    ? raw
+    : undefined;
+}
+
+function readWorkflowConcurrency(raw: unknown): WorkflowConcurrencyConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const v = raw as Record<string, unknown>;
+  const out: WorkflowConcurrencyConfig = {};
+  const global = readConcurrencyCap(v.global);
+  if (global !== undefined) out.global = global;
+  const perBot = readConcurrencyCap(v.perBot);
+  if (perBot !== undefined) out.perBot = perBot;
+  const perCli = readConcurrencyCap(v.perCli);
+  if (perCli !== undefined) out.perCli = perCli;
+  if (v.perCliById && typeof v.perCliById === 'object' && !Array.isArray(v.perCliById)) {
+    const byId: Record<string, number> = {};
+    for (const [cliId, cap] of Object.entries(v.perCliById as Record<string, unknown>)) {
+      const n = readConcurrencyCap(cap);
+      if (cliId && n !== undefined) byId[cliId] = n;
+    }
+    if (Object.keys(byId).length > 0) out.perCliById = byId;
+  }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -775,10 +971,16 @@ function readMultiTopic(raw: unknown): MultiTopicGlobalConfig | undefined {
   const v = raw as Record<string, unknown>;
   const out: MultiTopicGlobalConfig = {};
   if (typeof v.enabled === 'boolean') out.enabled = v.enabled;
+  if (typeof v.taskTreeCard === 'boolean') out.taskTreeCard = v.taskTreeCard;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
 export function globalConfigPath(): string {
+  const configured = process.env.BOTMUX_GLOBAL_CONFIG_FILE?.trim();
+  if (configured) {
+    if (!isAbsolute(configured)) throw new Error('BOTMUX_GLOBAL_CONFIG_FILE must be absolute');
+    return configured;
+  }
   return join(homedir(), '.botmux', 'config.json');
 }
 
@@ -815,6 +1017,11 @@ function readRawConfig(): Record<string, unknown> {
 const READ_CACHE_TTL_MS = 2_000;
 let readCache: { path: string; value: GlobalConfig; at: number } | null = null;
 let vcMeetingAgentLiveCache: { path: string; mtimeMs: number; config: VcMeetingAgentGlobalConfig } | null = null;
+let lastConfiguredProtectedMcpEnvKeys: string[] = [];
+
+export function configuredProtectedMcpEnvKeys(): string[] {
+  return [...lastConfiguredProtectedMcpEnvKeys];
+}
 
 /** Typed view of the global config. Validates `lang` so a malformed file
  *  can't propagate a bad value into the i18n module. */
@@ -824,8 +1031,11 @@ export function readGlobalConfig(): GlobalConfig {
     return readCache.value;
   }
   const raw = readRawConfig();
+  lastConfiguredProtectedMcpEnvKeys = protectedMcpConfiguredEnvKeys(raw.protectedMcpCapabilities);
   const out: GlobalConfig = {};
   if (isLocale(raw.lang)) out.lang = raw.lang;
+  const linkRefs = normalizeLinkRefConfig(raw.linkRefs);
+  if (linkRefs) out.linkRefs = linkRefs;
   const groupNamePrefix = normalizeGroupNamePrefix(raw.groupNamePrefix);
   if (groupNamePrefix) out.groupNamePrefix = groupNamePrefix;
   const repoPickerMode = readRepoPickerMode(raw.repoPickerMode);
@@ -846,6 +1056,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (hostOverloadAlert) out.hostOverloadAlert = hostOverloadAlert;
   const sessionCleanup = readSessionCleanup(raw.sessionCleanup);
   if (sessionCleanup) out.sessionCleanup = sessionCleanup;
+  const promptCache = readPromptCacheConfig(raw.promptCache);
+  if (promptCache) out.promptCache = promptCache;
   const vcMeetingAgent = readVcMeetingAgent(raw.vcMeetingAgent);
   if (vcMeetingAgent) out.vcMeetingAgent = vcMeetingAgent;
   const workflow = readWorkflowFeature(raw.workflow);
@@ -861,6 +1073,10 @@ export function readGlobalConfig(): GlobalConfig {
   if (skills) out.skills = skills;
   const plugins = normalizePluginIdList(raw.plugins);
   if (plugins) out.plugins = plugins;
+  const protectedMcpCapabilities = normalizeProtectedMcpCapabilities(raw.protectedMcpCapabilities);
+  if (protectedMcpCapabilities) out.protectedMcpCapabilities = protectedMcpCapabilities;
+  const mcpGatewayMaxToolTimeoutMs = normalizeMcpGatewayMaxToolTimeoutMs(raw.mcpGatewayMaxToolTimeoutMs);
+  if (mcpGatewayMaxToolTimeoutMs !== undefined) out.mcpGatewayMaxToolTimeoutMs = mcpGatewayMaxToolTimeoutMs;
   if (typeof raw.remoteAccess === 'boolean') out.remoteAccess = raw.remoteAccess;
   // Lenient: keep any non-empty string. IANA validity is enforced on write and
   // re-checked in scheduleTimeZone() (invalid ⇒ falls back to the host zone),
@@ -870,6 +1086,8 @@ export function readGlobalConfig(): GlobalConfig {
   }
   const scheduleDelegation = readScheduleDelegation(raw.scheduleDelegation);
   if (scheduleDelegation) out.scheduleDelegation = scheduleDelegation;
+  const sessionEnv = globalEnvLayer(raw.sessionEnv);
+  if (!isEmptyEnvLayer(sessionEnv)) out.sessionEnv = sessionEnv;
   readCache = { path, value: out, at: Date.now() };
   return out;
 }
@@ -913,6 +1131,7 @@ export function globalVcMeetingAgentConfigLive(): VcMeetingAgentGlobalConfig {
     enabled: parsed?.enabled !== false,
     ...(parsed?.listenerBotAppId ? { listenerBotAppId: parsed.listenerBotAppId } : {}),
     ...(parsed?.consumerCatalog ? { consumerCatalog: parsed.consumerCatalog } : {}),
+    ...(parsed?.listenerPolicy ? { listenerPolicy: parsed.listenerPolicy } : {}),
   };
   vcMeetingAgentLiveCache = { path, mtimeMs, config };
   return config;
@@ -1021,6 +1240,28 @@ export function isCrossPrincipalInterruptionEnabled(
   return readGlobalConfig().dashboard?.crossPrincipalInterruption === true;
 }
 
+/** Experimental Workflow switch (Dashboard 全局设置 → 实验性配置 → Workflow):
+ *  who executes goal nodes of runs authorized from now on. Read live like the
+ *  other dashboard toggles; the value only matters at authorization, where it
+ *  is frozen into `run.json`. */
+export function workflowNodeExecutorMode(): WorkflowNodeExecutorMode {
+  return readGlobalConfig().workflow?.nodeExecutor === 'bot' ? 'bot' : 'ephemeral';
+}
+
+/** Configured v3 concurrency caps (`workflow.concurrency`), or undefined when
+ *  none are set — callers then keep the runtime's code defaults. */
+export function workflowConcurrencyConfig(): WorkflowConcurrencyConfig | undefined {
+  return readGlobalConfig().workflow?.concurrency;
+}
+
+/** Experimental Workflow switch (Dashboard 全局设置 → 实验性配置 → Workflow):
+ *  whether bot-executed runs authorized from now on hand their initiator's
+ *  identity to the node bots. Read live; only consulted at authorization,
+ *  where the outcome is frozen into `run.json`. */
+export function workflowHandoffIdentityEnabled(): boolean {
+  return readGlobalConfig().workflow?.handoffIdentity === true;
+}
+
 /** Machine-wide multi-topic orchestration switch. Defaults ON for backwards
  * compatibility. The env override is also injected into managed CLI sessions
  * so sandboxed commands agree with the host daemon. */
@@ -1031,6 +1272,45 @@ export function isMultiTopicOrchestrationEnabled(env: NodeJS.ProcessEnv = proces
     return v === 'true' || v === '1' || v === 'yes' || v === 'on';
   }
   return readGlobalConfig().multiTopic?.enabled !== false;
+}
+
+/** Machine-wide dispatch task-tree card switch. Defaults OFF: a fresh install
+ *  sends no task-tree card (3.2(c) — a feature that adds a message must be
+ *  opted in). `BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED` wins when set, otherwise
+ *  the Dashboard toggle `multiTopic.taskTreeCard`. The DAEMON side (card post /
+ *  patch, report recording) reads it live from the short-TTL (~2s) global-config
+ *  cache, each daemon expiring its own (a Dashboard write invalidates only its
+ *  own process), so card behaviour follows the toggle within ~2s without a
+ *  restart. A CLI inside a sandboxed/file-isolated pane cannot read the config
+ *  file; the worker projects the value into spawn-time env, so the in-pane
+ *  `attemptAt` decision for an already-running session follows the NEXT session
+ *  (new spawn), while new dispatch-time card gating on the daemon is live. */
+export function isDispatchTaskTreeCardEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const flag = env.BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED;
+  if (flag != null && flag !== '') {
+    const v = flag.trim().toLowerCase();
+    return v === 'true' || v === '1' || v === 'yes' || v === 'on';
+  }
+  return readGlobalConfig().multiTopic?.taskTreeCard === true;
+}
+
+/**
+ * Host-resolved machine-wide on/off switches the daemon projects into spawned
+ * panes as `'true'`/`'false'` strings. This is the single step that turns the
+ * daemon-side config value into the env a file-sandboxed CLI reads (the child-env
+ * allowlist alone only forwards whatever stale value is already present). Pass
+ * the resolved env explicitly so tests can stub it instead of process.env.
+ * Covers the workflow feature, multi-topic orchestration and dispatch
+ * task-tree card switches (the latter two default the opposite way: multiTopic
+ * is on unless false, the card is off unless true — the readers already encode
+ * that, so this only stringifies their result).
+ */
+export function paneSwitchEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  return {
+    BOTMUX_WORKFLOW_ENABLED: isWorkflowFeatureEnabled(env) ? 'true' : 'false',
+    BOTMUX_MULTI_TOPIC_ENABLED: isMultiTopicOrchestrationEnabled(env) ? 'true' : 'false',
+    BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED: isDispatchTaskTreeCardEnabled(env) ? 'true' : 'false',
+  };
 }
 
 /** Derive repo-picker scan options from the machine-wide `repoPickerMode`.
@@ -1045,6 +1325,7 @@ export function repoPickerScanOptions(): ProjectScanOptions {
  *  the file (and parent dir) on first write. Use `null` to explicitly delete
  *  a known key from the file. */
 export function mergeGlobalConfig(patch: Partial<Record<keyof GlobalConfig, GlobalConfig[keyof GlobalConfig] | null>>): void {
+  assertDurableConfigMutationAllowed('global');
   const path = globalConfigPath();
   const dir = dirname(path);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
@@ -1067,6 +1348,21 @@ export function mergeGlobalConfig(patch: Partial<Record<keyof GlobalConfig, Glob
   // (e.g. dashboard PUT /api/settings responds with the resolved config).
   readCache = null;
   vcMeetingAgentLiveCache = null;
+}
+
+/** The stored `sessionEnv` exactly as written (for hand-edit diagnostics). */
+export function readRawGlobalSessionEnv(): unknown {
+  return readRawConfig().sessionEnv;
+}
+
+/** Apply validated ops to the global session-env layer; an empty result
+ *  removes the key so an untouched install keeps no trace of the feature. */
+export function applyGlobalSessionEnvOps(ops: readonly EnvOp[]): { ok: true; layer: EnvLayer } | { ok: false; error: 'layer_too_large' } {
+  const prev = globalEnvLayer(readRawConfig().sessionEnv);
+  const next = applyEnvOps(prev, ops);
+  if (!envLayerWithinBudget(prev, next)) return { ok: false, error: 'layer_too_large' };
+  mergeGlobalConfig({ sessionEnv: isEmptyEnvLayer(next) ? null : next });
+  return { ok: true, layer: next };
 }
 
 /** Merge only the dashboard sub-config, preserving unknown keys inside that
@@ -1131,6 +1427,42 @@ export function writeHostOverloadAlertConfig(config: HostOverloadAlertGlobalConf
   delete existing.enterMemUsedFrac;
   mergeGlobalConfig({ hostOverloadAlert: { ...existing, ...config } as HostOverloadAlertGlobalConfig });
   return readGlobalConfig().hostOverloadAlert ?? {};
+}
+
+/** Hand-edited grants the reader drops (bad shape or a repeated id). The
+ *  Dashboard shows the count: saving its list writes back only valid grants. */
+export function ignoredScheduleBotGrantCount(): number {
+  const raw = readRawConfig().scheduleDelegation;
+  const list = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>).botGrants
+    : undefined;
+  if (!Array.isArray(list)) return 0;
+  return list.length - (readGlobalConfig().scheduleDelegation?.botGrants?.length ?? 0);
+}
+
+/** Dashboard write for the bot-grant entry (`createEnabled`, `selfManageEnabled`,
+ *  `botGrants`). A value equal to its default (off / empty) removes the key
+ *  instead of being stored, an emptied block is dropped, and every other
+ *  scheduleDelegation key on disk is left exactly as it was. */
+export function writeScheduleBotGrantConfig(patch: {
+  createEnabled?: boolean;
+  selfManageEnabled?: boolean;
+  botGrants?: ScheduleBotGrant[];
+}): ScheduleDelegationGlobalConfig | undefined {
+  const raw = readRawConfig();
+  const next = raw.scheduleDelegation && typeof raw.scheduleDelegation === 'object' && !Array.isArray(raw.scheduleDelegation)
+    ? { ...raw.scheduleDelegation as Record<string, unknown> }
+    : {};
+  for (const key of ['createEnabled', 'selfManageEnabled'] as const) {
+    if (patch[key] === true) next[key] = true;
+    else if (patch[key] === false) delete next[key];
+  }
+  if (patch.botGrants?.length) next.botGrants = patch.botGrants.map(canonicalScheduleBotGrant);
+  else if (patch.botGrants) delete next.botGrants;
+  mergeGlobalConfig({
+    scheduleDelegation: Object.keys(next).length > 0 ? next as ScheduleDelegationGlobalConfig : null,
+  });
+  return readGlobalConfig().scheduleDelegation;
 }
 
 /** Merge only the maintenance sub-config, preserving unknown sibling keys.

@@ -258,7 +258,7 @@ describe('resolveRemoteExecutionProven — launcher env voids the proof on all b
  *
  * `ds.initConfig` is written only at spawn/refork, but a live-worker `/restart`
  * (operator, working-dir change, cli_crash auto-restart) ships
- * `latestPerBotEnvForRestart(ds)` — i.e. live `getBot().config.env` — and the
+ * `latestSessionEnvForRestart(ds).env` — i.e. live `getBot().config.env` — and the
  * worker overwrites its own copy before respawning. So the child can be running
  * an env the daemon's snapshot has never seen.
  *
@@ -444,7 +444,12 @@ describe('worker-generation boundaries all maintain the env ledger', () => {
     'utf8',
   );
 
-  it('pairs every `ds.initConfig = initMsg` with a ledger handoff', () => {
+  // 源码结构护栏(K2)：代际边界散落在 worker-pool 的 fork/adopt 闭包里，没有可单独调用的 seam
+  // （helper 本身的停放语义由下方 startNewGenerationEnvLedger 行为用例覆盖）。守的不变量：每个
+  // `ds.initConfig = initMsg` 都把 env ledger 交给唯一 helper；调用点不手写重置；停放的
+  // retiring 键没有任何释放路径——否则 resolveRemoteExecutionProven 会在旧凭证子树可能仍存活时
+  // 判成 safe_remote。删掉三处调用点曾让 4 个文件 109 个用例全绿（mojo 后端 #803）。
+  it('pairs every generation boundary with the single ledger helper, which alone resets or parks it', () => {
     const lines = pool.split('\n');
     const boundaries = lines
       .map((line, i) => ({ line: line.trim(), i }))
@@ -460,32 +465,19 @@ describe('worker-generation boundaries all maintain the env ledger', () => {
       expect(window, `generation boundary at line ${i + 1} must hand off the env ledger`)
         .toContain('startNewGenerationEnvLedger(ds, initMsg.env)');
     }
-  });
 
-  it('keeps the ledger reset out of the call sites (single implementation)', () => {
-    // A hand-written `= undefined` at a call site would bypass the parking rule
-    // and reopen the double-fork window; only the helper may clear it.
-    const resets = pool.split('\n')
-      .filter((l) => l.includes('mojoAppliedUnprovableEnvKeys = undefined'));
-    expect(resets).toHaveLength(1);
-    const helperBody = pool.slice(pool.indexOf('export function startNewGenerationEnvLedger'));
-    expect(helperBody).toContain('ds.mojoAppliedUnprovableEnvKeys = undefined;');
-  });
+    // A hand-written reset at a call site would bypass the parking rule and
+    // reopen the double-fork window; only the helper may clear the applied set.
+    const helperAt = pool.indexOf('export function startNewGenerationEnvLedger');
+    expect(helperAt).toBeGreaterThan(-1);
+    const appliedResets = [...pool.matchAll(/mojoAppliedUnprovableEnvKeys\s*=\s*undefined/g)];
+    expect(appliedResets).toHaveLength(1);
+    expect(appliedResets[0]!.index).toBeGreaterThan(helperAt);
 
-  it('never releases parked keys from an exit signal', () => {
-    // A worker exit does not prove the mojo CHILD died: kill() is a bare SIGTERM
-    // (no escalation, no wait), the worker exits without awaiting it, and the
-    // child may have detached descendants. Any exit-anchored release therefore
-    // reopens the credential window, so there must be no release path at all.
-    const clears = pool.split('\n')
-      .filter((l) => l.includes('mojoRetiringUnprovableEnvKeys = undefined'));
-    expect(clears).toHaveLength(0);
-    expect(pool).not.toContain('releaseRetiringEnvLedgerIfSettled');
-
-    // The only writer is the generation-boundary helper, and it assigns a parked
-    // set rather than clearing.
-    const helper = pool.slice(pool.indexOf('export function startNewGenerationEnvLedger'));
-    expect(helper).toContain('ds.mojoRetiringUnprovableEnvKeys = parked.size > 0');
+    // A worker exit does not prove the mojo CHILD died (kill() is a bare SIGTERM,
+    // not awaited), so parked keys must have no release path at all.
+    expect(pool).not.toMatch(/mojoRetiringUnprovableEnvKeys\s*=\s*undefined/);
+    expect(pool).not.toMatch(/delete\s+\w+\.mojoRetiringUnprovableEnvKeys/);
   });
 });
 

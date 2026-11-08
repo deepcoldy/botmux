@@ -25,6 +25,11 @@ import {
   __testOnly_closeSkillFeedbackStores,
 } from '../src/services/skill-feedback-store.js';
 import { RELAYED_TURN_DELIVERY_MAX_BYTES } from '../src/core/relayed-turn-delivery.js';
+import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
+import * as larkClient from '../src/im/lark/client.js';
+import { FeedbackExtensionStore } from '../src/services/feedback-extension-store.js';
+import { readFeedbackExtensionConfig, saveFeedbackExtensionConfig } from '../src/services/feedback-extension-config.js';
+import * as registry from '../src/bot-registry.js';
 
 const SECRET = 'turn-delivery-narrow-secret';
 const CAP_A = 'ab12cd34'.repeat(8);
@@ -90,6 +95,35 @@ async function rowFor(messageId: string) {
 }
 
 describe('POST /api/sessions/:sessionId/turn-delivery', () => {
+  it('freezes the host policy for a relayed surface without accepting caller-supplied policy or owner', async () => {
+    const session = liveSession('sess-a', CAP_A, 'turn-a');
+    session.managedTurnOrigin.callerOpenId = 'ou_verified';
+    await setup({ 'sess-a': session });
+    vi.spyOn(registry, 'getBot').mockReturnValue({ config: { feedback: { enabled: true, audience: 'requester' } } } as any);
+    const initial = await readFeedbackExtensionConfig(dataDir!);
+    await saveFeedbackExtensionConfig(dataDir!, initial.version, {
+      ...initial, presentations: { cli_app: { default: { enabled: true }, rules: [] } },
+    }, 'test-admin');
+    const response = await post('sess-a', { originCapability: CAP_A, messageId: 'om_answer', content: 'answer',
+      requesterSubjectId: 'ou_forged', policy: { enabled: true, audience: 'everyone' } });
+    expect(response.status).toBe(200);
+    expect(await rowFor('om_answer')).toMatchObject({ cardMode: 'card', requesterSubjectId: 'ou_verified', policy: { audience: 'requester' } });
+  });
+  it('binds feedback only with the current turn capability and same-chat source', async () => {
+    await setup({ 'sess-a': liveSession('sess-a', CAP_A, 'turn-a') });
+    vi.spyOn(larkClient, 'getMessageDetail').mockResolvedValue({ items: [{ chat_id: 'oc_sess-a' }] } as any);
+    const request = (capability: string, expectedTurnId: string) => fetch(
+      `http://127.0.0.1:${handle!.port}/api/sessions/sess-a/feedback-bind`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ originCapability: capability, expectedTurnId, sourceMessageId: 'om_root_sess-a', answerKind: 'substantive' }),
+      });
+    expect((await request(CAP_B, 'turn-a')).status).toBe(403);
+    expect((await request(CAP_A, 'old-turn')).status).toBe(409);
+    expect((await request(CAP_A, 'turn-a')).status).toBe(200);
+    const extensions = await FeedbackExtensionStore.open(dataDir!);
+    try { expect(extensions.subject('cli_app', 'sess-a', 'turn-a')).toEqual({ sourceMessageId: 'om_root_sess-a', answerKind: 'substantive' }); }
+    finally { extensions.close(); }
+  });
   it('records the row from the live session, ignoring body-supplied correlation fields', async () => {
     await setup({ 'sess-a': liveSession('sess-a', CAP_A, 'turn-a') });
     const res = await post('sess-a', {
@@ -150,6 +184,24 @@ describe('POST /api/sessions/:sessionId/turn-delivery', () => {
     expect(res.status).toBe(409);
     expect(await res.json()).toMatchObject({ ok: false, error: 'turn_unbound' });
     expect(await rowFor('om_unbound')).toBeUndefined();
+  });
+
+  it('a trusted host request is indexed only under the turn the CLI says it answered', async () => {
+    // A host CLI whose own sandbox denies the store write: authenticated by the
+    // host secret, no capability pins the turn, and the daemon may already be
+    // on the next queued turn.
+    await setup({ 'sess-a': liveSession('sess-a', CAP_B, 'turn-2') });
+    const hostPost = (body: Record<string, unknown>) => fetchDaemonIpc(handle!.port,
+      '/api/sessions/sess-a/turn-delivery',
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) },
+      SECRET);
+    const stale = await hostPost({ messageId: 'om_prev_turn', content: 'answer to turn-1', expectedTurnId: 'turn-1' });
+    expect(stale.status).toBe(409);
+    expect(await stale.json()).toMatchObject({ ok: false, error: 'turn_mismatch' });
+    expect(await rowFor('om_prev_turn')).toBeUndefined();
+    const current = await hostPost({ messageId: 'om_this_turn', content: 'answer to turn-2', expectedTurnId: 'turn-2' });
+    expect(current.status).toBe(200);
+    expect(await rowFor('om_this_turn')).toMatchObject({ sessionId: 'sess-a', turnId: 'turn-2' });
   });
 
   it('404s a closed session', async () => {

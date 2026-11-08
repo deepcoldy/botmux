@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="360" viewBox="0 0 960 360">
+  <rect width="960" height="360" rx="16" fill="#f3f5f8"/>
+  <g font-family="sans-serif" fill="#172b4d">
+    <text x="32" y="38" font-size="20" font-weight="bold">Codex async question → existing Feishu Ask card</text>
+    <text x="32" y="66" font-size="13" fill="#5e6c84">Illustration with synthetic content; existing card UI is reused.</text>
+    <rect x="32" y="92" width="248" height="188" rx="12" fill="white" stroke="#dfe4eb"/>
+    <text x="50" y="126" font-size="16" font-weight="bold">Native async question</text>
+    <text x="50" y="160" font-size="14">delivery: async</text>
+    <text x="50" y="186" font-size="14">questions: [...]</text>
+    <text x="50" y="224" font-size="14" fill="#5e6c84">Current turn keeps running.</text>
+    <text x="50" y="248" font-size="14" fill="#5e6c84">Card remains after completion.</text>
+    <path d="M292 186H326l-8-6m8 6-8 6" fill="none" stroke="#3366cc" stroke-width="2"/>
+    <rect x="338" y="92" width="284" height="188" rx="12" fill="white" stroke="#dfe4eb"/>
+    <path d="M350 92h260q12 0 12 12v32H338v-32q0-12 12-12" fill="#dce9ff"/>
+    <text x="356" y="121" font-size="16" font-weight="bold">Question card</text>
+    <text x="356" y="162" font-size="15">Which environment?</text>
+    <rect x="356" y="178" width="246" height="32" rx="6" fill="#f3f5f8"/>
+    <text x="368" y="199" font-size="14">○ Staging     ○ Production</text>
+    <rect x="356" y="228" width="92" height="32" rx="6" fill="#3366cc"/>
+    <text x="377" y="249" font-size="14" fill="white">Submit</text>
+    <path d="M634 186H668l-8-6m8 6-8 6" fill="none" stroke="#3366cc" stroke-width="2"/>
+    <rect x="680" y="92" width="248" height="188" rx="12" fill="white" stroke="#dfe4eb"/>
+    <text x="698" y="126" font-size="16" font-weight="bold">Answer → same thread</text>
+    <text x="698" y="160" font-size="14">Original question ID retained</text>
+    <text x="698" y="186" font-size="14">Frozen initiator / canTalk</text>
+    <text x="698" y="224" font-size="14" fill="#5e6c84">Admitted through worker FIFO</text>
+    <text x="698" y="248" font-size="14" fill="#5e6c84">as a subsequent native turn.</text>
+    <text x="32" y="326" font-size="14" fill="#5e6c84">Quote the intended card when several are pending. Silent schedules do not post cards.</text>
+  </g>
+</svg>

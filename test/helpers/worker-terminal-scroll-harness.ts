@@ -18,7 +18,7 @@ export const FORGED_INPUT_HEX = Buffer.from(FORGED_INPUT).toString('hex');
 
 type ReadyMessage = Extract<WorkerToDaemon, { type: 'ready' }>;
 type ErrorMessage = Extract<WorkerToDaemon, { type: 'error' }>;
-type TestCliId = 'opencode' | 'opencode2';
+type TestCliId = 'opencode' | 'opencode2' | 'pi';
 
 type WorkerHarness = {
   readonly child: ChildProcess;
@@ -90,7 +90,7 @@ function waitForReady(child: ChildProcess, logs: readonly string[]): Promise<Rea
   });
 }
 
-export async function startOpenCodeWorker(cliId: TestCliId = 'opencode'): Promise<WorkerHarness> {
+export async function startReadOnlyScrollWorker(cliId: TestCliId = 'opencode'): Promise<WorkerHarness> {
   const root = mkdtempSync(join(tmpdir(), 'botmux-readonly-scroll-'));
   tempDirs.add(root);
   const dataDir = join(root, 'session');
@@ -100,7 +100,7 @@ export async function startOpenCodeWorker(cliId: TestCliId = 'opencode'): Promis
   mkdirSync(botmuxDir, { recursive: true });
   writeFileSync(join(botmuxDir, '.dashboard-secret'), 'integration-host-dashboard-secret', { mode: 0o600 });
 
-  const fakeCli = join(root, 'fake-opencode');
+  const fakeCli = join(root, `fake-${cliId}`);
   const inputLog = join(root, 'terminal-input.hex');
   writeFileSync(fakeCli, `#!/usr/bin/env node
 const { appendFileSync } = require('node:fs');

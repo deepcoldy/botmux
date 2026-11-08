@@ -1,3 +1,4 @@
+import { matchingScheduleBotGrant, botScheduleAuthority } from '../src/core/schedule-bot-grant.js';
 /**
  * The two daemon routes through which `botmux dispatch` writes to Lark — the
  * new-topic seed registration and the kickoff delivery — must apply the same
@@ -19,7 +20,7 @@ import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.j
 import { readJsonBody, JsonBodyTooLargeError } from '../src/core/dashboard-ipc-server.js';
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import { validateCodexAppManagedSendOrigin } from '../src/utils/codex-app-dispatch-ledger.js';
-import { DISPATCH_USER_DELIVERY_MAX_BYTES } from '../src/core/dispatch-user-delegation.js';
+import { DISPATCH_USER_DELIVERY_MAX_BYTES, dispatchCallerFromReply } from '../src/core/dispatch-user-delegation.js';
 import { fallbackTurnId, frozenReplyContextForTurn } from '../src/core/reply-target.js';
 import {
   isDispatchOriginNotSendableError,
@@ -74,7 +75,7 @@ function run(
   ds: any,
   body: Record<string, unknown>,
   trustedHost: boolean,
-  hooks: { beforeProviderWrite?: () => void; duringLookup?: () => void } = {},
+  hooks: { beforeProviderWrite?: () => void; duringLookup?: () => void; multiTopicEnabled?: boolean } = {},
 ) {
   // Provider seams behave like the real Lark client: whatever happens inside
   // the provider call (token fetch, retry wait) comes first, then the caller's
@@ -100,7 +101,7 @@ function run(
     validateCodexAppManagedSendOrigin, isCodexAppCliId,
     isolatedDispatchOutputSinkAllowed, withIsolatedDispatchSinkFence, isDispatchOriginNotSendableError,
     jsonRes: (_res: unknown, status: number, value: any) => ({ status, value }),
-    isMultiTopicOrchestrationEnabled: () => true,
+    isMultiTopicOrchestrationEnabled: () => hooks.multiTopicEnabled ?? true,
     readGroupCollaborationMode: () => undefined,
     evaluateProjectDispatchPolicy: () => ({ ok: true }),
     lookupMessageChatId: async () => {
@@ -115,10 +116,11 @@ function run(
     initialDispatchLifecycle: () => ({}),
     projectCoordinator: { run: async () => undefined },
     getBot: () => ({ config: {} }),
+    matchingScheduleBotGrant, botScheduleAuthority,
     readGlobalConfig: () => ({}),
     getDashboardAdminOpenIds: () => [],
     dispatchUserForTurn: async () => undefined,
-    pickTurnReplyTarget: () => undefined,
+    pickTurnReplyTarget: () => undefined, dispatchCallerFromReply,
     fallbackTurnId, frozenReplyContextForTurn,
     config: { session: { dataDir: '/nonexistent' } },
     join, logger: { info: vi.fn(), warn: vi.fn() },
@@ -261,5 +263,32 @@ describe('dispatch-policy route: origin claim and output-sink gate', () => {
   it('allows a live Lark-bound claim and leaves trusted-host callers unchanged', async () => {
     expect((await policy(session({ sink: 'lark' }), policyBody, false)).status).toBe(200);
     expect((await policy(session({ sink: 'http_wait' }), policyBody, true)).status).toBe(200);
+  });
+});
+
+// The multi-topic kill-switch sits on the daemon route that performs the
+// authoritative seed send: a pane holding its session capability can POST it
+// directly, so the CLI-side refusal (multi-topic-feature-gate.test.ts) cannot be
+// the only enforcement point.
+describe('dispatch routes: multi-topic orchestration kill-switch', () => {
+  it('refuses new-topic seed registration with 409 before any Lark write', async () => {
+    const call = run(registerCode, session({ cliId: 'claude-code' }), registerBody, false, { multiTopicEnabled: false });
+    expect(await call.result).toMatchObject({ status: 409, value: { error: 'multi_topic_disabled' } });
+    expect(call.sendMessage).not.toHaveBeenCalled();
+    expect(call.writes).toEqual([]);
+  });
+
+  it('authenticates the pane claim before the kill-switch answers', async () => {
+    const forged = { ...registerBody, originCapability: 'f'.repeat(64) };
+    const call = run(registerCode, session({ cliId: 'claude-code' }), forged, false, { multiTopicEnabled: false });
+    const { status, value } = await call.result;
+    expect(status).toBe(403);
+    expect(value.error).not.toBe('multi_topic_disabled');
+  });
+
+  it('leaves kickoff delivery into an existing topic (--into) ungated', async () => {
+    const call = run(deliverCode, session({ cliId: 'claude-code' }), deliverBody, false, { multiTopicEnabled: false });
+    expect((await call.result).status).toBeLessThan(300);
+    expect(call.replyMessage).toHaveBeenCalled();
   });
 });

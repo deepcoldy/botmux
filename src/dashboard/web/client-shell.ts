@@ -124,10 +124,11 @@ export function isWorkflowDashboardHash(hash: string): boolean {
   );
 }
 
-/** Monitor Room is a web-terminal surface and is owned by the native client. */
+/** Monitor Room and the host Terminal page are web-terminal surfaces owned by the native client. */
 export function isWebTerminalDashboardHash(hash: string): boolean {
   const path = (hash.split('?')[0] || '#/').toLowerCase();
-  return path === '#/monitor-room' || path.startsWith('#/monitor-room/');
+  return path === '#/monitor-room' || path.startsWith('#/monitor-room/')
+    || path === '#/terminal' || path.startsWith('#/terminal/');
 }
 
 /**

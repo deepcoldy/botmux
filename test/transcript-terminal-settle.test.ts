@@ -34,6 +34,24 @@ describe('createTranscriptTerminalSettle', () => {
     expect(proceed).toHaveBeenCalledTimes(1);
   });
 
+  it('reports a bound that ran out, and only that', () => {
+    const proceed = vi.fn();
+    const onTimeout = vi.fn(() => { expect(proceed).not.toHaveBeenCalled(); });
+    let awaiting = true;
+    const settle = createTranscriptTerminalSettle({ awaitingTerminal: () => awaiting, onTimeout, timeoutMs: 2_000, pollMs: 100 });
+    settle.request(proceed);
+    vi.advanceTimersByTime(2_100);
+    expect(onTimeout).toHaveBeenCalledTimes(1);
+    expect(proceed).toHaveBeenCalledTimes(1);
+
+    settle.request(proceed);
+    vi.advanceTimersByTime(300);
+    awaiting = false;
+    vi.advanceTimersByTime(100);
+    expect(proceed).toHaveBeenCalledTimes(2);
+    expect(onTimeout).toHaveBeenCalledTimes(1);
+  });
+
   it('does not finalize when the agent goes back to work', () => {
     const proceed = vi.fn();
     const settle = createTranscriptTerminalSettle({ awaitingTerminal: () => true });

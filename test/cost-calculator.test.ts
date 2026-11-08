@@ -1,8 +1,11 @@
 /**
- * Unit tests for cost-calculator: getSessionJsonlPath, getSessionCost, formatNumber.
+ * Unit tests for cost-calculator: getSessionJsonlPath, getSessionCost.
  *
  * Run:  pnpm vitest run test/cost-calculator.test.ts
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { join } from 'node:path';
 
@@ -18,6 +21,9 @@ vi.mock('node:os', async (importOriginal) => ({
 vi.mock('node:fs', async (importOriginal) => {
   const original = await importOriginal<typeof import('node:fs')>();
   const readFileSyncMock = vi.fn(() => '');
+  // statSync consults this as its existence oracle, mirroring the real fs:
+  // tests flip existence via the imported existsSync mock and statSync follows.
+  const existsSyncMock = vi.fn(() => false);
   const fdContent = new Map<number, string>();
   let nextFd = 10_000;
   const statsForContent = (content: string) => ({
@@ -31,7 +37,7 @@ vi.mock('node:fs', async (importOriginal) => {
   return {
     ...original,
     closeSync: vi.fn((fd: number) => { fdContent.delete(fd); }),
-    existsSync: vi.fn(() => false),
+    existsSync: existsSyncMock,
     fstatSync: vi.fn((fd: number) => statsForContent(fdContent.get(fd) ?? '')),
     lstatSync: vi.fn(() => ({
       isFile: () => true,
@@ -50,7 +56,17 @@ vi.mock('node:fs', async (importOriginal) => {
       slice.copy(buffer, offset);
       return slice.length;
     }),
-    statSync: vi.fn((path: string) => statsForContent(String(readFileSyncMock(path, 'utf-8') ?? ''))),
+    // Mimic the real fs: statSync throws ENOENT for paths that don't exist.
+    // The transcript resolver now gates on statSync().isFile() (not
+    // existsSync); a statSync that never throws would make every path "exist".
+    statSync: vi.fn((path: string) => {
+      if (!existsSyncMock(path)) {
+        const err = new Error(`ENOENT: no such file or directory, stat '${path}'`) as NodeJS.ErrnoException;
+        err.code = 'ENOENT';
+        throw err;
+      }
+      return statsForContent(String(readFileSyncMock(path, 'utf-8') ?? ''));
+    }),
   };
 });
 
@@ -115,7 +131,7 @@ vi.mock('../src/services/session-store.js', () => ({
   getSession: vi.fn(() => undefined),
 }));
 
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
 import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBySessionId } from '../src/services/aiden-checkpoints.js';
 import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from '../src/services/codex-transcript.js';
 import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from '../src/services/traex-transcript.js';
@@ -125,7 +141,6 @@ import {
   getSessionCost,
   getSessionUsageSnapshot,
   getSessionTokenUsage,
-  formatNumber,
   __resetSessionUsageCachesForTest,
   type SessionCost,
 } from '../src/core/cost-calculator.js';
@@ -197,7 +212,7 @@ describe('getSessionJsonlPath', () => {
       'abc-123.jsonl',
     );
     expect(result).toBe(expectedPath);
-    expect(existsSync).toHaveBeenCalledWith(expectedPath);
+    expect(statSync).toHaveBeenCalledWith(expectedPath);
   });
 
   it('returns null when the jsonl file does not exist', () => {
@@ -589,7 +604,7 @@ describe('getSessionTokenUsage', () => {
     vi.mocked(existsSync).mockReturnValue(false);
 
     expect(getSessionTokenUsage({
-      cliId: 'gemini',
+      cliId: 'opencode',
       sessionId: 's1',
       cwd: '/tmp',
     })).toBeNull();
@@ -1514,25 +1529,5 @@ describe('getSessionTokenUsage', () => {
       turns: 2,
       model: 'claude-sonnet-4-20250514',
     });
-  });
-});
-
-// ── formatNumber ────────────────────────────────────────────────────────
-
-describe('formatNumber', () => {
-  it('formats small numbers without commas', () => {
-    expect(formatNumber(42)).toBe('42');
-  });
-
-  it('formats thousands with commas', () => {
-    expect(formatNumber(1_234)).toBe('1,234');
-  });
-
-  it('formats millions with commas', () => {
-    expect(formatNumber(1_234_567)).toBe('1,234,567');
-  });
-
-  it('formats zero', () => {
-    expect(formatNumber(0)).toBe('0');
   });
 });

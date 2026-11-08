@@ -16,6 +16,7 @@
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withManagedDirectories } from './managed-directory-retention.js';
 
 /**
  * 评论触发范围：
@@ -122,19 +123,8 @@ export type DocWatchOutcome =
   | 'not-mentioned'
   | 'self-authored'
   | 'audit-rejected'
-  | 'poll-failed';
-
-const DOC_WATCH_OUTCOMES: ReadonlySet<string> = new Set<DocWatchOutcome>([
-  'dispatched', 'no-comment', 'trigger-missing', 'empty-text',
-  'not-mentioned', 'self-authored', 'audit-rejected', 'poll-failed',
-]);
-
-/** 收窄未知字符串到 `DocWatchOutcome`。读旧文件/跨版本时用。 */
-export function asDocWatchOutcome(raw: unknown): DocWatchOutcome | undefined {
-  return typeof raw === 'string' && DOC_WATCH_OUTCOMES.has(raw)
-    ? raw as DocWatchOutcome
-    : undefined;
-}
+  | 'poll-failed'
+  | 'poll-circuit-open';
 
 /** `lastError` 落盘上限，避免一条长报错把订阅表撑大。 */
 export const DOC_WATCH_LAST_ERROR_MAX = 300;
@@ -198,7 +188,8 @@ function readFile(dataDir: string, larkAppId: string): FileShape {
 
 function writeFile(dataDir: string, larkAppId: string, data: FileShape): void {
   if (!existsSync(dataDir)) mkdirSync(dataDir, { recursive: true });
-  atomicWriteFileSync(filePath(dataDir, larkAppId), JSON.stringify(data, null, 2) + '\n');
+  withManagedDirectories(Object.values(data), () =>
+    atomicWriteFileSync(filePath(dataDir, larkAppId), JSON.stringify(data, null, 2) + '\n'));
 }
 
 /**

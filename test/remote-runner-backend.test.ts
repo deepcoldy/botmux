@@ -9,6 +9,7 @@ import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 
 const referenceRunner = resolve('examples/remote-runner/reference-runner.mjs');
 const stalledCloseRunner = resolve('test/fixtures/remote-runner-stalled-close.mjs');
+const retryableCloseRunner = resolve('test/fixtures/remote-runner-retryable-close.mjs');
 const stalledReattachRunner = resolve('test/fixtures/remote-runner-stalled-reattach.mjs');
 const preAckFailureRunner = resolve('test/fixtures/remote-runner-pre-ack-failure.mjs');
 const outboundRunner = resolve('test/fixtures/remote-runner-outbound.mjs');
@@ -16,6 +17,7 @@ const sessionToolRunner = resolve('test/fixtures/remote-runner-session-tool.mjs'
 const delayedTurnRunner = resolve('test/fixtures/remote-runner-delayed-turn.mjs');
 const reviewCasesRunner = resolve('test/fixtures/remote-runner-review-cases.mjs');
 const recoveredTurnRunner = resolve('test/fixtures/remote-runner-recovered-turn.mjs');
+const stdinClosedRunner = resolve('test/fixtures/remote-runner-stdin-closed.mjs');
 const children: RemoteRunnerBackend[] = [];
 
 function createBackend(initialState?: RemoteRunnerBackendState): RemoteRunnerBackend {
@@ -62,8 +64,15 @@ describe('RemoteRunnerBackend', () => {
       content: 'hello',
       trustedCaller: {
         requestUserOpenId: 'ou_test',
+        requestUserUnionId: 'on_test_bot',
         requestLarkAppId: 'cli_test',
-        senderType: 'user',
+        senderType: 'bot',
+        botOwner: {
+          openId: 'ou_owner',
+          unionId: 'on_owner',
+          email: 'owner@bytedance.com',
+          source: 'bot_config',
+        },
       },
     })).resolves.toEqual({ submitted: true });
 
@@ -112,6 +121,85 @@ describe('RemoteRunnerBackend', () => {
       operationId: 'reference-outbound-1',
       content: 'reference progress',
     }]);
+  });
+
+  it('accepts a final outbound message only after bilateral capability negotiation', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'outbound-test',
+      requiredCapabilities: ['outbound_message', 'outbound_message_final'],
+    }, 'session-final-outbound');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const delivery = vi.fn(async () => ({
+      outcome: 'delivered' as const,
+      messageId: 'om_final_outbound',
+    }));
+    backend.onOutboundMessage(delivery);
+    spawnBackend(backend, outboundRunner);
+    await ready;
+
+    const final = once<{ text: string; turnId?: string }>(cb => {
+      backend.onTurnFinal((text, turnId) => cb({ text, turnId }));
+    });
+    await backend.submitTurn({ turnId: 'turn-final-outbound', content: 'final-outbound' });
+    await expect(final).resolves.toEqual({ text: '', turnId: 'turn-final-outbound' });
+    expect(delivery).toHaveBeenCalledWith(expect.objectContaining({
+      responseKind: 'final',
+      mention: 'explicit',
+      mentions: ['ou_target:Target'],
+      content: 'final payload',
+    }), {});
+  });
+
+  it('keeps the provider final when a negotiated final outbound delivery is rejected', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'outbound-test',
+      requiredCapabilities: ['outbound_message', 'outbound_message_final'],
+    }, 'session-final-outbound-rejected');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    backend.onOutboundMessage(async () => ({
+      outcome: 'rejected',
+      code: 'outbound_rejected',
+      message: 'rejected for test',
+    }));
+    spawnBackend(backend, outboundRunner);
+    await ready;
+
+    const final = once<string>(cb => backend.onTurnFinal(cb));
+    await backend.submitTurn({ turnId: 'turn-final-rejected', content: 'final-outbound' });
+    const providerFinal = JSON.parse(await final) as Array<{
+      operationId: string;
+      result: { outcome: string; code?: string };
+    }>;
+    expect(providerFinal).toEqual([{
+      operationId: 'final-operation',
+      result: expect.objectContaining({
+        outcome: 'rejected',
+        code: 'outbound_rejected',
+      }),
+    }]);
+  });
+
+  it('rejects a final outbound message when the host did not require it', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'outbound-test',
+      requiredCapabilities: ['outbound_message'],
+    }, 'session-final-outbound-host-disabled');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const failures: Array<{ code: string }> = [];
+    const delivery = vi.fn();
+    backend.onTurnFailure(failure => failures.push(failure));
+    backend.onOutboundMessage(delivery);
+    spawnBackend(backend, outboundRunner);
+    await ready;
+
+    await backend.submitTurn({ turnId: 'turn-final-outbound', content: 'final-outbound' });
+    await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
+      code: 'remote_runner_protocol_error',
+    })]));
+    expect(delivery).not.toHaveBeenCalled();
   });
 
   it('returns a host-governed result for a read-only session tool', async () => {
@@ -236,6 +324,35 @@ describe('RemoteRunnerBackend', () => {
     expect(execute).toHaveBeenCalledWith(expect.objectContaining({
       controllerOpenId: 'ou_developer',
       request: { tool: 'schedule.add', schedule: '10m', prompt: 'check' },
+    }));
+  });
+
+  it('accepts the negotiated schedule Actor on a structured mutation', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'session-tool-test',
+      requiredCapabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status',
+        'session_tool', 'session_tool_schedule', 'session_tool_schedule_actor',
+      ],
+    }, 'session-schedule-actor-mutation');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const execute = vi.fn(async () => ({
+      outcome: 'completed' as const,
+      exitCode: 0,
+      stdout: '',
+      stderr: '',
+    }));
+    backend.onSessionTool(execute);
+    spawnBackend(backend, sessionToolRunner);
+    await ready;
+
+    const final = once<string>(cb => backend.onTurnFinal(cb));
+    await backend.submitTurn({ turnId: 'turn-schedule-actor-mutation', content: 'schedule-actor-mutate' });
+    await final;
+    expect(execute).toHaveBeenCalledWith(expect.objectContaining({
+      controllerOpenId: 'ou_developer',
+      request: { tool: 'schedule.remove', taskId: 'a1b2c3d4' },
     }));
   });
 
@@ -448,6 +565,7 @@ describe('RemoteRunnerBackend', () => {
       turnId: 'turn-survived',
       dispatchAttempt: 4,
     });
+    expect(backend.setRecoveredTurnHostContext('turn-survived', {})).toBe(true);
     expect(progress.join('')).toContain('recovered progress');
     await expect(backend.submitTurn({ turnId: 'turn-new', content: 'must not run' }))
       .resolves.toMatchObject({ submitted: false });
@@ -636,6 +754,32 @@ describe('RemoteRunnerBackend', () => {
     });
   });
 
+  it('preserves a provider-proven retryable close and restores admission', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'retryable-close',
+      operationTimeoutMs: 100,
+    }, 'session-retryable-close');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    spawnBackend(backend, retryableCloseRunner);
+    await ready;
+
+    await expect(backend.destroySession()).resolves.toEqual({
+      ok: false,
+      error: 'remote_close_not_applied: remote target remains live',
+      recovery: 'retryable',
+      admission: 'restorable',
+    });
+    await expect(backend.abortDestroySession()).resolves.toEqual({
+      admissionRestored: true,
+    });
+
+    const final = once<string>(cb => backend.onTurnFinal(cb));
+    await expect(backend.submitTurn({ turnId: 'turn-after-retryable-close', content: 'still live' }))
+      .resolves.toEqual({ submitted: true });
+    await expect(final).resolves.toBe('still live');
+  });
+
   it('classifies a missing turn ACK as ambiguous and retires the provider', async () => {
     const backend = new RemoteRunnerBackend({
       expectedProvider: 'stalled-close',
@@ -661,6 +805,47 @@ describe('RemoteRunnerBackend', () => {
       turnId: 'turn-stalled',
       status: 'ambiguous',
     });
+  });
+
+  it('fails a turn the provider can no longer read without crashing the host process', async () => {
+    const escaped: unknown[] = [];
+    const onUncaught = (error: unknown) => escaped.push(error);
+    process.on('uncaughtException', onUncaught);
+    try {
+      const backend = new RemoteRunnerBackend({
+        expectedProvider: 'stdin-closed',
+        requiredCapabilities: ['start', 'resume', 'turn', 'cancel', 'detach', 'status'],
+      }, 'session-stdin-closed');
+      children.push(backend);
+      const ready = once<void>(cb => backend.onReady(cb));
+      const failure = once<{ status: string; turnId: string }>(cb => {
+        backend.onTurnFailure(value => cb(value));
+      });
+      const exited = once<void>(cb => backend.onExit(() => cb()));
+      spawnBackend(backend, stdinClosedRunner);
+      await ready;
+
+      // The provider closed its stdin before reporting ready, so the turn hits
+      // a pipe nobody reads: EPIPE. The write callback fails the turn, but the
+      // stream also emits 'error'; without a listener that is thrown at process
+      // level. Bun only reports EPIPE for writes the pipe buffer cannot absorb,
+      // so the turn is made larger than that.
+      await expect(backend.submitTurn({
+        turnId: 'turn-stdin-closed',
+        content: 'x'.repeat(256 * 1024),
+      })).resolves.toMatchObject({
+        submitted: false,
+        submissionDisposition: 'dirty_unknown',
+      });
+      await expect(failure).resolves.toMatchObject({
+        turnId: 'turn-stdin-closed',
+        status: 'ambiguous',
+      });
+      await exited;
+      expect(escaped).toEqual([]);
+    } finally {
+      process.removeListener('uncaughtException', onUncaught);
+    }
   });
 
   it('correlates a provider failure before the busy ACK and keeps the generation usable', async () => {

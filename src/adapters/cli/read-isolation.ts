@@ -156,8 +156,9 @@ export function isCredentialIsolationReservedBasename(name: string): boolean {
 export function credentialIsolationRequired(input: {
   markerExists: boolean;
   deviceCredentialExists: boolean;
+  protectedHomePaths?: readonly string[];
 }): boolean {
-  return input.markerExists || input.deviceCredentialExists;
+  return input.markerExists || input.deviceCredentialExists || !!input.protectedHomePaths?.length;
 }
 
 export type CredentialOnlyIsolationGate =
@@ -182,6 +183,7 @@ export type CredentialOnlyIsolationGate =
 export function evaluateCredentialOnlyIsolationGate(input: {
   markerExists: boolean;
   deviceCredentialExists: boolean;
+  protectedHomePaths?: readonly string[];
   remoteBackend: boolean;
   platform: string;
   mechanismAvailable: boolean;
@@ -222,7 +224,10 @@ function escapeForRegex(p: string): string {
 
 /** Legacy credential-only Seatbelt/bwrap rule shape. Full fs-policy sessions
  * consume the same authority paths through buildFsPolicy instead. */
-export function buildCredentialIsolationRules(ctx: CredentialIsolationContext): {
+export function buildCredentialIsolationRules(
+  ctx: CredentialIsolationContext,
+  protectedPaths: readonly string[] = [],
+): {
   roots: string[];
   denyPaths: string[];
   denyRegexes: string[];
@@ -236,17 +241,21 @@ export function buildCredentialIsolationRules(ctx: CredentialIsolationContext): 
   const roots = dedupe([defaultBh, bh]);
   const credentialPaths = roots.flatMap(hostDeviceAuthorityPaths);
   const markerPath = `${defaultBh}/${DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME}`;
+  const protectedHomePaths = dedupe(protectedPaths
+    .map(normalizeIsolationPath)
+    .filter((path): path is string => !!path && path.startsWith(`${h}/`)));
   const denyRegexes = roots.flatMap(root =>
     HOST_DEVICE_CREDENTIAL_FILES.map(file =>
       `^${escapeForRegex(root)}/${escapeForRegex(file)}(?:\\.|$)`));
   denyRegexes.push(
     `^${escapeForRegex(defaultBh)}/${escapeForRegex(DEVICE_CREDENTIAL_ISOLATION_MARKER_BASENAME)}(?:\\.|$)`,
+    ...protectedHomePaths.map(path => `^${escapeForRegex(path)}(?:\\.|$)`),
   );
   return {
     roots,
-    denyPaths: dedupe([...credentialPaths, markerPath]),
+    denyPaths: dedupe([...credentialPaths, markerPath, ...protectedHomePaths]),
     denyRegexes: dedupe(denyRegexes),
-    denyWritePaths: dedupe([...credentialPaths, markerPath]),
+    denyWritePaths: dedupe([...credentialPaths, markerPath, ...protectedHomePaths]),
     denyWriteRegexes: dedupe(denyRegexes),
     denyWriteLiterals: roots,
   };
@@ -386,7 +395,13 @@ export function buildSeatbeltProfile(
 // (cmdDispatch routes by shape on it). A v16 pane never got it, so a warm
 // reattach would keep refusing the legacy --bot / --repo / --standby dispatch
 // forms; it must cold-spawn once.
-export const ISOLATION_PANE_MARKER_VERSION = 17;
+// 18 binds a sandboxed pane's OWN skill manifest (`skill-manifests/<sid>.json`)
+// and its per-session skill SNAPSHOT dir (`runtime-skills/<sid>/snapshot`),
+// read-only, at spawn time (`botmux skill show/read/resources` under
+// sandbox=true). Both are new mounts: a warm reattach keeps the v17 process with
+// its ORIGINAL mount set and skips skill generation, so such a pane could never
+// read either — it must cold-spawn once.
+export const ISOLATION_PANE_MARKER_VERSION = 18;
 
 export type IsolationCapability = 'credential' | 'read' | 'write';
 

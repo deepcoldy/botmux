@@ -5,6 +5,7 @@ import type {
   VcMeetingImTurnOrigin,
 } from '../types.js';
 import { sameTrustedPrincipal } from '../core/active-turn-authority.js';
+import type { LinkRefMode } from '../services/link-ref-types.js';
 
 export interface PendingCliInput {
   queueAfterActiveTurn?: true;
@@ -16,6 +17,10 @@ export interface PendingCliInput {
   turnId?: string;
   replyTurnId?: string;
   dispatchAttempt?: number;
+  /** This item belongs to the durable-primary Lark Inbox commit protocol. */
+  durablePrimaryInbox?: true;
+  /** Admission-frozen mode for the exact queued turn. */
+  linkRefMode?: Exclude<LinkRefMode, 'disabled'>;
   /** Open id of the human whose turn this is. The worker publishes it beside
    *  the live-turn marker so the identity wrapper can keep a same-principal
    *  credential across consecutive turns. */
@@ -55,7 +60,19 @@ export interface PendingCliInput {
    *  session is NOT dropped (codex #776 round-8). The worker's CLI-exit carry
    *  predicate and pending-drop both honor it. */
   noReplay?: boolean;
+  /** Worker-authored continuation after a TraeX capacity model switch. It keeps
+   * the original turn id for reply attribution but is never merged with a
+   * later user input. */
+  traexAutoModelRecovery?: true;
+  /** This still-queued independent turn has completed its read-only TraeX load
+   * admission. It survives an intentional exact-resume model restart so the
+   * original prompt is submitted once without repeating the preflight. */
+  traexAutoModelPreflightDone?: true;
   taskContinuation?: TaskContinuationDispatchMarker;
+  /** `content` as it was before a restart note was put in front of it (see
+   *  services/restart-interruption.ts). Lets a replay of this input after a
+   *  second restart carry only the newest note. */
+  restartNoteOriginalContent?: string;
 }
 
 /**
@@ -114,6 +131,7 @@ export function mergeQueuedCliInput(
   if (tail.queueAfterActiveTurn || next.queueAfterActiveTurn
     || tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
     || tail.codexAppDispatchId || next.codexAppDispatchId
+    || tail.traexAutoModelRecovery || next.traexAutoModelRecovery
     || tail.queuedActivationToken || next.queuedActivationToken
     || tail.vcMeetingImTurnOrigin || next.vcMeetingImTurnOrigin
     || tail.codexAppInput || next.codexAppInput
@@ -246,7 +264,7 @@ export function shouldTrackArgvBakedFirstPrompt(opts: {
  * Riff (and any queue-after-spawn adapter) has passesInitialPromptViaArgs=false
  * — must return false, or the first markPromptReady would clear isPromptReady
  * and leave the post-spawn queue flush never firing.
- * Gemini/Pi/MTR/OpenCode pass prompt via argv but use quiescence as the sole
+ * Pi/MTR/OpenCode pass prompt via argv but use quiescence as the sole
  * idle signal — first ready IS completion; must return false or they stick
  * (use {@link shouldTrackArgvBakedFirstPrompt} + seed working→idle instead).
  *
@@ -298,4 +316,32 @@ export function terminalReleasesDurableTurn(
   return terminal.dispatchAttempt !== undefined
     && current.turnId === terminal.turnId
     && current.dispatchAttempt === terminal.dispatchAttempt;
+}
+
+/** A serial schedule prefix may wait indefinitely behind an active task.
+ * Let its authenticated human controller steer without changing the order of
+ * other user messages or crossing a durable/group/continuation boundary. */
+export function promoteInteractiveInputPastSchedules(
+  pending: PendingCliInput[],
+  mayControlActiveTurn: (input: PendingCliInput) => boolean,
+): boolean {
+  let index = 0;
+  while (index < pending.length) {
+    const item = pending[index]!;
+    if (item.trustedCaller?.source !== 'schedule_creator'
+      || !item.queueAfterActiveTurn || item.dispatchAttempt !== undefined
+      || item.durablePrimaryInbox || item.queuedActivationToken
+      || item.vcMeetingImTurnOrigin || item.taskContinuation || item.noReplay) break;
+    index++;
+  }
+  if (index === 0 || index === pending.length) return false;
+  const input = pending[index]!;
+  if (input.trustedCaller?.senderType !== 'user' || input.trustedCaller.source !== undefined
+    || input.queueAfterActiveTurn || input.dispatchAttempt !== undefined
+    || input.durablePrimaryInbox || input.codexAppDispatchId || input.queuedActivationToken
+    || input.vcMeetingImTurnOrigin || input.taskContinuation || input.noReplay
+    || input.traexAutoModelRecovery || !mayControlActiveTurn(input)) return false;
+  pending.splice(index, 1);
+  pending.unshift(input);
+  return true;
 }

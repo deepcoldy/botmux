@@ -1,8 +1,9 @@
 import { parseScheduledTurnId } from '../core/scheduled-turn-provenance.js';
+import type { TurnSendKind } from '../services/turn-send-ledger.js';
 
 export interface ScheduleFinalCleanupPlanInput {
   requested: boolean;
-  responseKind?: 'progress' | 'final' | 'auxiliary';
+  responseKind?: TurnSendKind;
   turnId?: string;
   incompatible: readonly string[];
 }

@@ -6,7 +6,7 @@
  * locally while a live owner daemon is authoritative, carries the current
  * session capability, and retains an offline fallback.
  */
-import { type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createServer, type IncomingMessage } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
@@ -58,6 +58,16 @@ afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+/** A pid that certainly belonged to a process which has already exited and
+ *  been reaped. Expired-lease cases must seed this instead of a hardcoded pid:
+ *  hostOccupancyLeaseHeld() fails closed on a LIVE owner even past the TTL, and
+ *  a fixed number (e.g. 4242) occasionally belongs to a real CI-runner process. */
+function deadPid(): number {
+  const child = spawnSync(process.execPath, ['-e', '0'], { stdio: 'ignore' });
+  if (!child.pid) throw new Error('could not spawn a throwaway child');
+  return child.pid;
+}
 
 function makeSession(sessionId: string, overrides: Partial<StoredSession> = {}): StoredSession {
   return {
@@ -387,7 +397,7 @@ describe('botmux delete — daemon-first close', () => {
     tempDirs.push(dataDir, relayDir);
     const session = makeSession('sess-delete-rejected-expired-lease');
     writeSessions(dataDir, [session]);
-    seedOccupancyLease(dataDir, APP_ID, { ownerPid: 4242, bootId: 'boot-lapsed', leaseUntil: Date.now() - 1 });
+    seedOccupancyLease(dataDir, APP_ID, { ownerPid: deadPid(), bootId: 'boot-lapsed', leaseUntil: Date.now() - 1 });
     writeRelayCapability(relayDir);
 
     const server = createServer(async (req, res) => {
@@ -444,7 +454,7 @@ describe('botmux delete — daemon-first close', () => {
     tempDirs.push(dataDir);
     const session = makeSession('sess-delete-lease-lapsed');
     writeSessions(dataDir, [session]);
-    seedOccupancyLease(dataDir, APP_ID, { ownerPid: 4242, bootId: 'boot-gone', leaseUntil: Date.now() - 1 });
+    seedOccupancyLease(dataDir, APP_ID, { ownerPid: deadPid(), bootId: 'boot-gone', leaseUntil: Date.now() - 1 });
 
     const result = await runDelete(dataDir, [session.sessionId], {
       BOTMUX_SESSION_ID: undefined,

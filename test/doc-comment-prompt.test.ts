@@ -85,6 +85,52 @@ describe('clean Codex App document-comment input', () => {
     },
   } as any);
 
+  it.each(['live', 'refork'] as const)('carries the current author as the execution principal on %s input', mode => {
+    const ds = frozenCodexSession();
+    const { cliInput } = buildDocCommentTurnInput({ ds, promptInput,
+      botCliId: 'codex', sender, mode, turnId: 'comment_a' });
+    expect(cliInput.trustedCaller).toEqual({
+      requestLarkAppId: 'cli_app', requestUserOpenId: 'ou_author', senderType: 'user',
+    });
+  });
+
+  it.each(['codex', 'claude-code'] as const)('carries the comment principal for %s without changing visible content', cliId => {
+    const ds = frozenCodexSession();
+    ds.session.cliId = cliId;
+    const { cliInput } = buildDocCommentTurnInput({ ds, promptInput,
+      botCliId: cliId, sender, mode: 'live', turnId: 'comment_a' });
+    expect(cliInput.trustedCaller).toMatchObject({ requestLarkAppId: 'cli_app', requestUserOpenId: 'ou_author', senderType: 'user' });
+    expect(cliInput.content).toContain(promptInput.question);
+  });
+
+  it.each(['live', 'refork'] as const)('does not substitute the owner when %s input has no author', mode => {
+    const ds = frozenCodexSession();
+    ds.session.ownerOpenId = 'ou_owner';
+    const { cliInput } = buildDocCommentTurnInput({ ds, promptInput,
+      botCliId: 'codex', mode, turnId: 'comment_a' });
+    expect(cliInput.trustedCaller).toBeUndefined();
+  });
+
+  it('does not label a resolved bot author as a human', () => {
+    const { cliInput } = buildDocCommentTurnInput({ ds: frozenCodexSession(), promptInput,
+      botCliId: 'codex', sender: { openId: 'ou_peer', type: 'bot' }, mode: 'live', turnId: 'comment_a' });
+    expect(cliInput.trustedCaller).toEqual({ requestLarkAppId: 'cli_app', requestUserOpenId: 'ou_peer', senderType: 'bot' });
+  });
+
+  it.each(['live', 'refork'] as const)('keeps legacy adopted %s input without an execution principal', mode => {
+    const ds = frozenCodexSession();
+    ds.adoptedFrom = { session: 'adopted' };
+    const { cliInput } = buildDocCommentTurnInput({ ds, promptInput,
+      botCliId: 'codex', sender, mode, turnId: 'comment_a' });
+    expect(cliInput.trustedCaller).toBeUndefined();
+  });
+
+  it('does not manufacture a principal without an exact turn id', () => {
+    const { cliInput } = buildDocCommentTurnInput({ ds: frozenCodexSession(), promptInput,
+      botCliId: 'codex', sender, mode: 'live' });
+    expect(cliInput.trustedCaller).toBeUndefined();
+  });
+
   it('separates trusted rules from untrusted document/thread references without repeating the current comment', () => {
     const application = buildDocCommentApplicationContext(promptInput);
     const message = buildDocCommentMessageContext(promptInput);

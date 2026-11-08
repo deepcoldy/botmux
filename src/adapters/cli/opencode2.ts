@@ -82,6 +82,8 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
       return `opencode2 -s ${sid}`;
     },
 
+    resumeFindsOwnSession: true,
+
     /** Resume 目标预检：id 不在 session_v2 表 → false
      *  （worker 落回全新会话并提示），避免 `Session not found` exit 1 被放大成
      *  daemon 自动重启 crash-loop。DB 读不了 → undefined，交给 worker 二级护栏。 */
@@ -142,12 +144,12 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
     // TUI; later cycles return to the normal 2s window.
     firstPromptQuiescenceMs: 4_000,
     busyPattern: undefined,
-    isSessionBusy({ sessionId, cliSessionId }) {
+    isSessionBusy({ sessionId, cliSessionId, isCliProcessAlive }) {
       const sid = isOpenCodeSessionId(cliSessionId)
         ? cliSessionId
         : latestOpenCodeSessionForBotmuxSession(sessionId, 'v2');
       if (!sid) return false;
-      return isOpenCodeSessionBusy(sid, 'v2');
+      return isOpenCodeSessionBusy(sid, 'v2', undefined, undefined, isCliProcessAlive);
     },
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,                // V2 TUI 仍渲染在 alternate screen buffer（实测 \x1b[?1049h）

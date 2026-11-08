@@ -22,26 +22,19 @@
 import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
-import { existsSync } from 'node:fs';
 import {
-  createBrowser,
-  createPage,
-  createAgent,
-  checkPrerequisites,
   getRequiredEnv,
-  STORAGE_STATE_PATH,
   testMessage,
   expectedReplyMarker,
   sendMessage,
   sendThreadReply,
-  navigateToMessenger,
   openGroupChat,
   openThreadForMessage,
   scrollThreadToBottom,
   waitForModelTextReply,
   waitForCardStatus,
-  closeSession,
 } from './helpers.js';
+import { openFeishuSession, releaseFeishuSession } from './feishu-session.js';
 
 export function registerMidsceneSuites(): void {
   describe('TraeX ambient mode continuity', () => {
@@ -52,25 +45,13 @@ export function registerMidsceneSuites(): void {
     let botName: string;
 
     beforeAll(async () => {
-      checkPrerequisites();
-      if (!existsSync(STORAGE_STATE_PATH)) {
-        throw new Error('storageState.json not found. Run: bun run test:e2e-browser:setup');
-      }
       const chatName = getRequiredEnv('FEISHU_TRAEX_AMBIENT_CHAT_NAME');
       botName = getRequiredEnv('FEISHU_TRAEX_BOT_NAME');
-      browser = await createBrowser();
-      ({ context, page } = await createPage(browser));
-      agent = createAgent(page);
-
-      await navigateToMessenger(page);
-      await openGroupChat(page, agent, chatName);
+      ({ browser, context, page, agent } = await openFeishuSession((p, a) => openGroupChat(p, a, chatName)));
     });
 
     afterAll(async () => {
-      await closeSession(agent, page);
-      await agent?.destroy();
-      await context?.close();
-      await browser?.close();
+      await releaseFeishuSession({ browser, context, page, agent }, { closeBotSession: true, publishVideo: false });
     });
 
     it('answers every un-@ message across consecutive turns without wedging', async () => {
