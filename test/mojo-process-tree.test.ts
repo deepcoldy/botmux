@@ -166,15 +166,19 @@ describe('a truncated non-empty environ is re-read but never falsely claimed', (
   });
 });
 
-describe('an empty environ read from a live process is not final', () => {
+describe('an incomplete environ read from a live process is not final', () => {
   // exec installs the new address space before it writes the new environment,
-  // and /proc/<pid>/environ reads empty in between. A FIFO stands in for that
-  // file: the child serves one empty read, waits for the reader to close it,
-  // then serves the nonce to the next open.
+  // and /proc/<pid>/environ reads empty in between; a read split across
+  // buffers can also come back cut short. A FIFO stands in for that file: the
+  // child serves one incomplete read (empty unless `first` is set), waits for
+  // the reader to close it, then serves CONTENT to the next open.
   const SERVE = `
     const fs = require('node:fs');
-    const { FIFO, CONTENT } = process.env;
-    fs.closeSync(fs.openSync(FIFO, 'w'));
+    const { FIFO, FIRST, CONTENT } = process.env;
+    const first = fs.openSync(FIFO, 'w');
+    const firstText = JSON.parse(FIRST);
+    if (firstText) fs.writeSync(first, firstText);
+    fs.closeSync(first);
     for (;;) {
       try { fs.closeSync(fs.openSync(FIFO, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK)); }
       catch (err) { if (err.code === 'ENXIO') break; throw err; }
@@ -183,13 +187,13 @@ describe('an empty environ read from a live process is not final', () => {
   `;
   // Serves the first empty read, then replaces the FIFO with whatever `swap`
   // leaves behind. The held open blocks until the first re-read opens the FIFO,
-  // so that re-read always lands on the old inode and reads EOF when the fd
-  // closes; by then the swap is done, so later re-reads see the replacement and
-  // none is left blocked on a FIFO that has no writer.
+  // so that re-read always lands on the old inode and reads `held` then EOF
+  // when the fd closes; by then the swap is done, so later re-reads see the
+  // replacement and none is left blocked on a FIFO that has no writer.
   const serveThenSwap = (swap: string): string => `
     const fs = require('node:fs');
     const path = require('node:path');
-    const { FIFO } = process.env;
+    const { FIFO, HELD, CONTENT } = process.env;
     fs.closeSync(fs.openSync(FIFO, 'w'));
     for (;;) {
       try { fs.closeSync(fs.openSync(FIFO, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK)); }
@@ -197,6 +201,8 @@ describe('an empty environ read from a live process is not final', () => {
     }
     const held = fs.openSync(FIFO, 'w');
     ${swap}
+    const heldText = JSON.parse(HELD);
+    if (heldText) fs.writeSync(held, heldText);
     fs.closeSync(held);
   `;
   // EISDIR: a non-vanished, non-permission error that can also be manufactured
@@ -204,20 +210,33 @@ describe('an empty environ read from a live process is not final', () => {
   const SERVE_ERROR = serveThenSwap('fs.rmSync(FIFO); fs.mkdirSync(FIFO);');
   // The whole /proc/<pid> entry disappears: the process exited mid re-read.
   const SERVE_GONE = serveThenSwap('fs.rmSync(path.dirname(FIFO), { recursive: true });');
+  // From the second re-read on, environ is a regular file holding CONTENT.
+  const SERVE_THEN_FILE = serveThenSwap(
+    'fs.writeFileSync(FIFO + ".next", CONTENT + "\\0"); fs.renameSync(FIFO + ".next", FIFO);',
+  );
+  const NUL = String.fromCharCode(0);
+  // A read cut short by exec: no trailing NUL.
+  const CUT_SHORT = `PATH=/bin${NUL}BIG_0=${'x'.repeat(40)}`;
   const servers: ChildProcess[] = [];
   afterEach(() => { for (const s of servers.splice(0)) s.kill('SIGKILL'); });
 
   function environMidExec(
     pid: number,
     opts: { ppid: number; pgid: number; state?: string; stat?: string },
-    serve: string = SERVE,
+    {
+      serve = SERVE,
+      first = '',
+      held = '',
+      content = `${MOJO_TREE_NONCE_ENV}=${NONCE}`,
+    }: { serve?: string; first?: string; held?: string; content?: string } = {},
   ): void {
     proc(pid, opts);
     const fifo = join(procRoot, String(pid), 'environ');
     rmSync(fifo);
     expect(spawnSync('mkfifo', [fifo]).status).toBe(0);
     servers.push(spawn(process.execPath, ['-e', serve], {
-      env: { ...process.env, FIFO: fifo, CONTENT: `${MOJO_TREE_NONCE_ENV}=${NONCE}` },
+      // Environment values cannot hold NUL, so payloads that need it go as JSON.
+      env: { ...process.env, FIFO: fifo, FIRST: JSON.stringify(first), HELD: JSON.stringify(held), CONTENT: content },
       stdio: 'ignore',
     }));
   }
@@ -225,6 +244,35 @@ describe('an empty environ read from a live process is not final', () => {
   it('claims a setsid escapee whose first environ read landed mid-exec', () => {
     proc(100, { ppid: 1, pgid: 100 });
     environMidExec(300, { ppid: 1, pgid: 300 });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members.find(m => m.pid === 300)?.via).toBe('env');
+  });
+
+  it('claims a setsid escapee whose first environ read was cut short mid-exec', () => {
+    proc(100, { ppid: 1, pgid: 100 });
+    environMidExec(300, { ppid: 1, pgid: 300 }, { first: CUT_SHORT });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members.find(m => m.pid === 300)?.via).toBe('env');
+  });
+
+  it('keeps re-reading while a re-read still comes back cut short', () => {
+    proc(100, { ppid: 1, pgid: 100 });
+    environMidExec(300, { ppid: 1, pgid: 300 }, { serve: SERVE_THEN_FILE, held: CUT_SHORT });
+    const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
+    if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
+    expect(scan.members.find(m => m.pid === 300)?.via).toBe('env');
+  });
+
+  it('never un-claims a pid whose cut-short read already carried the nonce', () => {
+    proc(100, { ppid: 1, pgid: 100 });
+    // A shell reorders envp, so in a descendant the nonce need not be last and a
+    // cut-short block can hold it. The process then execs into a scrubbed env.
+    environMidExec(300, { ppid: 1, pgid: 300 }, {
+      first: `PATH=/bin${NUL}${MOJO_TREE_NONCE_ENV}=${NONCE}${NUL}BIG_0=${'x'.repeat(40)}`,
+      content: 'PATH=/bin',
+    });
     const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
     if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);
     expect(scan.members.find(m => m.pid === 300)?.via).toBe('env');
@@ -243,7 +291,7 @@ describe('an empty environ read from a live process is not final', () => {
 
   it('fails the whole scan when a re-read of an empty environ errors, instead of keeping the non-member verdict', () => {
     proc(100, { ppid: 1, pgid: 100 });
-    environMidExec(300, { ppid: 1, pgid: 300 }, SERVE_ERROR);
+    environMidExec(300, { ppid: 1, pgid: 300 }, { serve: SERVE_ERROR });
     const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
     expect(scan.ok).toBe(false);
     if (scan.ok) throw new Error('expected the re-read error to fail the whole scan');
@@ -255,7 +303,7 @@ describe('an empty environ read from a live process is not final', () => {
     proc(100, { ppid: 1, pgid: 100 });
     // Left the group, was caught mid-exec, then exited while being re-read; the
     // child it forked earlier is still running and hangs off it by ppid.
-    environMidExec(200, { ppid: 100, pgid: 200 }, SERVE_GONE);
+    environMidExec(200, { ppid: 100, pgid: 200 }, { serve: SERVE_GONE });
     proc(300, { ppid: 200, pgid: 300 });
     const scan = scanMojoTree(100, NONCE, { procRoot, rootIdentity: ID100 });
     if (!scan.ok) throw new Error(`scan failed: ${scan.reason}`);

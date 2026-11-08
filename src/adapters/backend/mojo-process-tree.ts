@@ -448,9 +448,10 @@ function sleepSyncMs(ms: number): void {
  * the last, ends in NUL. A missing trailing NUL means exec cut the read, in
  * one of two shapes: 0 bytes (the new address space is installed before the
  * env is written), or a non-empty truncated block when a read crosses a buffer
- * boundary while the env is being populated. The tree nonce is appended to
- * envp LAST, so a truncated block can never contain it — treating that first
- * read as final loses a setsid escapee exactly the way the empty-read case did.
+ * boundary while the env is being populated. The backend appends the tree
+ * nonce to envp LAST, so a block cut short usually misses it — treating that
+ * first read as final loses a setsid escapee exactly the way the empty-read
+ * case did.
  * A genuinely empty environ (`env -i`, size 0) reads as `''` on every attempt,
  * exhausts the re-read budget and stays unclaimed, as before.
  */
@@ -534,7 +535,13 @@ function readProcTable(
       hasNonce: environ.state === 'read' && environ.text.includes(nonce),
     };
     table.push(entry);
-    if (environ.state === 'read' && isIncompleteEnvironRead(environ.text) && !entry.zombie && (parsed.flags & PF_KTHREAD) === 0) {
+    // A re-read may only add a claim. A shell reorders envp, so in a descendant
+    // a cut-short block can already hold the nonce, and that claim must survive
+    // the process exec'ing into an env without it.
+    if (
+      environ.state === 'read' && !entry.hasNonce && isIncompleteEnvironRead(environ.text)
+      && !entry.zombie && (parsed.flags & PF_KTHREAD) === 0
+    ) {
       incompleteEnviron.push(entry);
     }
   }
