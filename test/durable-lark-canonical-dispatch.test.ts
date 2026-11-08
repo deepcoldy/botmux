@@ -1,3 +1,7 @@
+// 第一个 import：测试围栏（unit-setup / bun-test-fence）没生效时整个文件直接拒跑。
+// 本文件有用例在 homedir()/temp 下建 SQLite 临时目录；2026-11-06 一次绕过 setupFiles 的全量运行里，
+// 这些目录建在了真实的 ~/temp 下。
+import { isInsideDir } from './helpers/require-fenced-data-dir.js';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -22,6 +26,11 @@ import {
   admitDurableLarkSession,
   parseDurablePrimarySessionRecord,
 } from '../src/services/durable-session-primary.js';
+
+// SQLite 临时目录建在 homedir()/temp 下：HOME 不在本文件的测试围栏内就拒绝加载，一个文件都不写。
+if (!isInsideDir(homedir(), process.env.__TEST_DATA_DIR_FENCE)) {
+  throw new Error(`refusing to run: HOME ${homedir()} is not inside the test fence`);
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;

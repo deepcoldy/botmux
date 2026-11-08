@@ -8,7 +8,6 @@ import { resolveDaemonCurrentActor, snapshotProcessIdentities } from '../src/cor
 import { resolveDaemonCurrentExecution } from '../src/core/current-execution.js';
 import { readComm } from '../src/core/session-discovery.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
-import { stopSessionScope } from '../src/core/session-scope.js';
 import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
@@ -183,7 +182,6 @@ exec '${node}' '${launcherScript}'
     for (const pid of [peerPid, cliPids?.native, cliPids?.launcher]) {
       if (pid) try { process.kill(pid, 'SIGKILL'); } catch { /* exited */ }
     }
-    stopSessionScope(sessionId);
     if (backendType === 'tmux') {
       try { execFileSync('tmux', ['kill-server'], { env: privateTmuxEnv(root), stdio: 'ignore' }); } catch { /* exited */ }
     }
