@@ -443,6 +443,7 @@ import { platformTerminalBaseUrl, publicReverseProxyBaseUrl } from './platform/b
 import { createServer as createNetServer, type Server as NetServer, type Socket } from 'node:net';
 import { WebSocketServer, WebSocket } from 'ws';
 import { listenWebTerminalWithFallback } from './utils/web-terminal-listen.js';
+import { startWsHeartbeat, type WsHeartbeat } from './utils/ws-heartbeat.js';
 import { HerdrWebTerminalBinding } from './utils/herdr-web-terminal-binding.js';
 import { TERMINAL_FAVICON_DATA_URI } from './utils/terminal-favicon.js';
 import type {
@@ -2989,6 +2990,7 @@ let shutdownDetachPhase: 'preparing' | 'prepared' | null = null;
 let httpServer: ReturnType<typeof createHttpServer> | null = null;
 const riffHostTools = new RiffHostTools();
 let wss: WebSocketServer | null = null;
+let wsHeartbeat: WsHeartbeat | null = null;
 const wsClients = new Set<WebSocket>();
 const authedClients = new WeakSet<WebSocket>();
 /** Per-WS-client tmux/zellij attach PTYs. */
@@ -4368,7 +4370,7 @@ const STARTUP_CMD_CAP_MS = 4_000;
 async function sendRawCommandLine(
   be: NonNullable<typeof backend>,
   content: string,
-  opts: { submit?: boolean } = {},
+  opts: { submit?: boolean; turnId?: string } = {},
 ): Promise<void> {
   // Long-lived framed runners (minimax, …) must receive even raw passthrough
   // lines through their frame protocol's full submit transaction. The generic
@@ -4380,7 +4382,9 @@ async function sendRawCommandLine(
   // frame never buffered (clean failure); dirty_unknown proves nothing (hold,
   // never replay in this generation).
   if (cliAdapter?.runnerFramedInput === true) {
-    const result = await cliAdapter.writeInput(be, content);
+    const result = opts.turnId
+      ? await cliAdapter.writeInput(be, content, { turnId: opts.turnId })
+      : await cliAdapter.writeInput(be, content);
     if (result && result.submitted === false) {
       const ambiguous = result.submissionDisposition === 'dirty_unknown';
       // submissionStarted=false only when no frame byte could have reached the
@@ -4571,8 +4575,10 @@ class SubmissionWriteError extends Error {
   constructor(
     message: string,
     readonly recoveryFailureReason?: string,
-    /** False only when the logical transaction was rejected before its write
-     * callback ran, so the current input is known not to have reached the PTY. */
+    /** False only when the current input is known not to have reached the
+     * PTY: the logical transaction was rejected before its write callback ran,
+     * or the writer itself proved no byte left (a framed runner refusing the
+     * line before buffering it). rewrapSubmissionFailure keeps the latter. */
     readonly submissionStarted = true,
     /** True when a framed stdin runner may already hold part/all of the line in
      *  its own buffer (dirty_unknown submit). The CLI runner generation is then
@@ -4590,6 +4596,7 @@ async function sendRawCommandLineWithRecoveryFence(
   be: NonNullable<typeof backend>,
   content: string,
   beforeWrite?: () => void,
+  turnId?: string,
 ): Promise<void> {
   const previous = commandLineWriteTail;
   let release!: () => void;
@@ -4599,7 +4606,7 @@ async function sendRawCommandLineWithRecoveryFence(
   try {
     const transaction = await runAmbiguousSubmissionTransaction(
       be,
-      () => sendRawCommandLine(be, content),
+      () => sendRawCommandLine(be, content, { turnId }),
       undefined,
       beforeWrite,
     );
@@ -5220,6 +5227,14 @@ function armSessionRenameIdleTimeout(): void {
  * Commands received while /rename owns the TUI are deferred by the IPC handler
  * and come through this same function after the prompt returns. */
 async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' }>): Promise<void> {
+  // Daemon/card readiness can lag behind a committed ordinary input. MiniMax
+  // queues native turns, so changing capture ownership while it is busy would
+  // discard that ordinary turn's final. Keep ownership until the real prompt.
+  if (lastInitConfig?.cliId === 'minimax' && msg.content.trim() === '/compact'
+    && (!isPromptReady || commandLineWritesPending > 0)) {
+    pendingRawInputs.push(msg);
+    return;
+  }
   const writeRawInput = async (
     targetBackend: SessionBackend,
     fence?: AdoptWriteFence,
@@ -5270,7 +5285,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
         // transcript; arm the capture before the bytes land.
         const btwQuestion = claudeBtwQuestion(msg.content);
         if (btwQuestion) armBtwCapture(btwQuestion, msg.turnId);
-      });
+      }, msg.turnId);
       sent = true;
       if (fence && !adoptWriteFenceIsCurrent(fence)) {
         send({
@@ -5309,6 +5324,21 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
       // Do not send a bundled follow-up or another queued command against a
       // backend whose literal command write failed.
       log(`Passthrough slash command failed (${msg.content}): ${err?.message ?? err}`);
+      // A MiniMax card fences repeat clicks at IPC acceptance. A proven
+      // untouched frame leaves the native prompt unchanged, so there will be
+      // no new ready edge to release that fence. Reannounce only this exact
+      // idle backend/turn; dirty frames already take the generation-fence path.
+      // On a fence-capable backend (ZMX) the submission journal must also have
+      // been cancelled cleanly: one that could not be is left to ZMX recovery
+      // (the notice below says so), and reannouncing ready would invite the
+      // very input that backend now refuses.
+      const untouchedCompact = lastInitConfig?.cliId === 'minimax'
+        && msg.content.trim() === '/compact'
+        && err instanceof SubmissionWriteError && !err.submissionStarted
+        && !recoveryFailureReason
+        && !!msg.turnId && currentBotmuxTurnId === msg.turnId
+        && targetBackend === backend && isPromptReady
+        && !cliRestartInProgress && commandLineWritesPending === 0;
       const failedTurnId = msg.followUpTurnId ?? msg.turnId;
       if (failedTurnId && !recoveryFailureReason) {
         emitTurnTerminal(failedTurnId, 'ambiguous', 'raw_input_write_failed');
@@ -5323,6 +5353,14 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
           reason: recoveryFailureReason ?? '',
         }),
       });
+      if (untouchedCompact) {
+        send({ type: 'prompt_ready' });
+        // A queued command owns isFlushing until its caller's finally runs.
+        // With no native idle edge after rejection, admitted follower messages
+        // need one fresh drain after that mutex is released (never a replay of
+        // this already-dequeued command, nor recovery for an ambiguous frame).
+        setImmediate(() => { void flushPending(); });
+      }
     }
 
     const accepted = finalizeRawCommandDelivery({
@@ -19546,7 +19584,13 @@ function markPromptReady(): void {
   sandboxWrapperAwaitingFirstPrompt = undefined;
   // Kimi: publish the finished turn's last activity before its idle edge.
   if (kimiActivityObserver) settleKimiActivityBeforeIdle();
-  send({ type: 'prompt_ready' });
+  // A compact click already owns the daemon's readiness fence. The prompt
+  // between the preceding business turn and this queued command must drain
+  // the command without making the button accept another click.
+  if (!(lastInitConfig?.cliId === 'minimax'
+    && pendingRawInputs.some(input => input.content.trim() === '/compact'))) {
+    send({ type: 'prompt_ready' });
+  }
   if (codexAutoUpgrade?.stage === 'restoring') codexAutoUpgrade.ready?.();
   if (codexUpgradeTimer && codexRuntimeObservedGeneration !== cliSpawnGeneration) {
     // Record the actual running version while its executable is still present.
@@ -29596,8 +29640,16 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         done(true);
       },
     });
+    wsHeartbeat?.stop();
+    const heartbeat = startWsHeartbeat();
+    wsHeartbeat = heartbeat;
 
     wss.on('connection', (ws, req: IncomingMessage) => {
+      // Must precede every early return. Since bun 1.4.4 a malformed client frame
+      // (bad UTF-8, unmasked, oversize, RSV1) emits 'error' on the socket; with no
+      // listener that is an uncaughtException, and the worker's handler exits the
+      // whole session for it. The 'close' handlers below still do the cleanup.
+      ws.on('error', (err: NodeJS.ErrnoException) => log(`WS client error: ${err.code ?? err.message}`));
       if (codexAutoUpgrade) {
         ws.close(1013, 'Codex session is restarting');
         return;
@@ -29633,6 +29685,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         return;
       }
       wsClients.add(ws);
+      heartbeat.watch(ws);
       const allowReadOnlyRemoteScroll = canHandleReadOnlyRemoteScroll();
       if (hasWrite) authedClients.add(ws);
       log(`WS client connected (total: ${wsClients.size}, write: ${hasWrite})`);
@@ -33257,6 +33310,8 @@ process.on('message', async (raw: unknown, handle: unknown) => {
         || injectionFlushing || shouldDeferUserFlush(pendingInjections)
         || bareShellCheckInProgress || bareShellLaunchBlocked
         || startupInputGateHolds
+        || (lastInitConfig?.cliId === 'minimax' && msg.content.trim() === '/compact'
+          && isFlushing)
         || hookReviewInputHold || codexModelMigrationHoldsRawInput()) {
         freshnessInputQueue.enqueueRaw(msg);
         if (hookReviewInputHold) {
@@ -34357,6 +34412,7 @@ function cleanup(): void {
   for (const ws of wsClients) ws.close();
   wsClients.clear();
   herdrWebBindings.clear();
+  if (wsHeartbeat) { wsHeartbeat.stop(); wsHeartbeat = null; }
   if (wss) { wss.close(); wss = null; }
   if (httpServer) { httpServer.close(); httpServer = null; }
   if (workflowPtyLogStream) {
