@@ -7,7 +7,7 @@ import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } 
 import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
 import { boardErrorStatus, type BoardCliRequest, type DecisionBoardService } from './decision-board/service.js';
 import type { CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
-import { botHomeForSessionDataDir, botUsesIsolatedCodexHome, hostCodexConfigPath, isolatedCodexConfigPath, resyncIsolatedCodexConfig } from '../services/codex-isolated-config.js';
+import { botHomeForSessionDataDir, botUsesIsolatedCodexHome, hostCodexAgentsPath, hostCodexConfigPath, isolatedCodexAgentsPath, isolatedCodexConfigPath, resyncIsolatedCodexConfig } from '../services/codex-isolated-config.js';
 import { readTurnRegistration } from './trigger-registration.js';
 import { lookupTurnResultRequest } from './turn-result-routes.js';
 import { normalizeCalendarBinding, normalizeCalendarDayType, listWorkCalendars, previewTaskCalendar } from '../services/work-calendar.js';
@@ -606,6 +606,7 @@ import {
 } from './session-preview.js';
 import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { ChatRenameCooldown, chatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
+import { isSilentMessageListenerSession } from './message-listener-silence.js';
 import { executeChatRename } from './chat-rename-operation.js';
 import { authorizeHumanManager } from './human-manager-authorization.js';
 import { changeChatManager, getChatManagerStatus } from '../services/chat-manager.js';
@@ -4038,6 +4039,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   if (sessionTransportDisabled(ds)) return jsonRes(res, 200, { ok: false, error: 'no_feishu_transport' });
   if (ds.chatType !== 'group') return jsonRes(res, 400, { ok: false, error: 'not_group_chat' });
+  // Renaming the session's own group is a visible source-group write; a silent
+  // listener task must not change its source group. Human dashboard management
+  // still uses the host-only PUT /api/groups/:chatId/name route.
+  if (isSilentMessageListenerSession(ds.session)) {
+    return jsonRes(res, 403, { ok: false, error: 'silent_message_listener' });
+  }
   const normalized = normalizeLarkChatName(body.name);
   if (!normalized.ok) return jsonRes(res, 400, normalized);
 
@@ -8104,6 +8111,9 @@ ipcRoute('POST', '/api/message-listeners/:chatId/run-preview', requireBoundBot(a
     const results = [];
     for (const match of matches) {
       const triggerId = createMessageListenerRunPreviewTurnId();
+      // Register before worker IPC: even an immediately completed turn must
+      // find its preview record.
+      markMessageListenerRunPreviewTriggered(run.runId, match.messageId, { triggerId });
       try {
         const result = await triggerSessionTurn({
           source: {
@@ -8127,7 +8137,11 @@ ipcRoute('POST', '/api/message-listeners/:chatId/run-preview', requireBoundBot(a
           },
           instruction: renderMessageListenerInstruction(match),
           presentation: { topicMessage: null },
-        }, { larkAppId: cachedLarkAppId, activeSessions }, { stableTurnId: triggerId });
+        }, { larkAppId: cachedLarkAppId, activeSessions }, {
+          stableTurnId: triggerId,
+          ...(match.replyMode === 'none' ? { messageListenerRun: { sourceMessageId: match.messageId, replyMode: 'none' as const } } : {}),
+          messageListenerAutoClose: match.autoCloseAfterCompletion,
+        });
         const tracked = result.ok
           ? markMessageListenerRunPreviewTriggered(run.runId, match.messageId, {
               action: result.action,
@@ -10910,14 +10924,16 @@ ipcRoute('PUT', '/api/bot-codex-auth-sync', requireBoundBot(async (req, res) => 
   jsonRes(res, 200, { ok: true, codexAuthSync: body.codexAuthSync });
 }));
 
-// GET /api/bot-codex-config — where this bot's isolated Codex config.toml lives
-// (`<BOT_HOME>/codex/config.toml`, seeded ONCE from ~/.codex/config.toml by the
-// worker) and whether new sessions use it. Paths only, never file contents.
+// GET /api/bot-codex-config — where this bot's isolated Codex config.toml and
+// AGENTS.md live (`<BOT_HOME>/codex/`, seeded ONCE from ~/.codex by the worker)
+// and whether new sessions use them. Paths only, never file contents.
 ipcRoute('GET', '/api/bot-codex-config', requireBoundBot(async (_req, res) => {
   let cfg;
   try { cfg = getBot(cachedLarkAppId).config; } catch { return jsonRes(res, 404, { ok: false, error: 'bot_not_found' }); }
   const path = isolatedCodexConfigPath(config.session.dataDir, cachedLarkAppId);
   const hostPath = hostCodexConfigPath();
+  const agentsPath = isolatedCodexAgentsPath(config.session.dataDir, cachedLarkAppId);
+  const hostAgentsPath = hostCodexAgentsPath();
   jsonRes(res, 200, {
     ok: true,
     isolated: botUsesIsolatedCodexHome(cfg),
@@ -10925,11 +10941,16 @@ ipcRoute('GET', '/api/bot-codex-config', requireBoundBot(async (_req, res) => {
     exists: existsSync(path),
     hostPath,
     hostExists: existsSync(hostPath),
+    agentsPath,
+    agentsExists: existsSync(agentsPath),
+    hostAgentsPath,
+    hostAgentsExists: existsSync(hostAgentsPath),
   });
 }));
 
 // POST /api/bot-codex-config/resync — back the per-bot config.toml up to
-// `config.toml.bak-<timestamp>` and replace it with the host copy (both 0600).
+// `config.toml.bak-<timestamp>` and replace it with the host copy (both 0600);
+// AGENTS.md likewise when the host has one.
 // Only for bots whose new sessions use the isolated CODEX_HOME; running
 // sessions keep the config their Codex already loaded.
 ipcRoute('POST', '/api/bot-codex-config/resync', requireBoundBot(async (_req, res) => {

@@ -140,6 +140,22 @@ describe('message-listener page', () => {
   beforeEach(() => { confirmMock.mockReset(); confirmMock.mockResolvedValue(true); });
   afterEach(() => vi.restoreAllMocks());
 
+  it('saves silent execution selected in the editor and restores the hidden card title when switched back', async () => {
+    const requests = mockApi({ global: savedGlobal({ replyCardTitle: 'saved title' }) });
+    const renderer = await renderPage();
+    const root = renderer.root;
+    await click(tab(root, 'global'));
+    const placement = () => byClass(panel(root, 'global'), 'roles-listener-reply-placement')[0]!.findByType('select');
+    await act(async () => placement().props.onChange({ currentTarget: { value: 'none' } }));
+    expect(placement().props.value).toBe('none');
+    expect(panel(root, 'global').findAll(node => node.type === 'input' && node.props.value === 'saved title')).toHaveLength(0);
+    await click(globalSave(root));
+    expect(puts(requests, GLOBAL_URL).at(-1)?.body.replyPolicy?.mode).toBe('none');
+    await act(async () => placement().props.onChange({ currentTarget: { value: 'thread' } }));
+    expect(panel(root, 'global').findAll(node => node.type === 'input' && node.props.value === 'saved title')).toHaveLength(1);
+    await act(async () => renderer.unmount());
+  });
+
   it('puts group settings first and opens on them, keeping the global panel mounted but hidden', async () => {
     mockApi();
     const renderer = await renderPage();

@@ -28,7 +28,7 @@ import { prepareZcodeSessionModel } from './services/zcode-model-config.js';
 import { archiveZcodeSessionMarker, readZcodeSessionMarker, zcodeSessionDbPath } from './services/zcode-session.js';
 import {claudeActionPrompt} from './services/claude-action-prompt.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
-import { CODEX_CONFIG_FILE, hostCodexConfigPath } from './services/codex-isolated-config.js';
+import { CODEX_CONFIG_FILE, seedIsolatedCodexHome } from './services/codex-isolated-config.js';
 import { supportsZeroPromptInjection } from './core/prompt-injection.js';
 import { SCHEDULE_PROMPT_UNDELIVERED_ERROR_CODE } from './core/deferred-schedule-settlement.js';
 import { supportsTranscriptReplyDeliveryForBot } from './core/reply-delivery.js';
@@ -49,7 +49,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
  *   7. On 'restart', kills CLI and re-spawns with --resume
  */
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, copyFileSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
+import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
@@ -485,7 +485,7 @@ import {
   upgradeRequired, waitForCodexExit,
   type CodexExecutable, type CodexProcess,
 } from './services/codex-session-upgrade.js';
-import { buildWrappedLaunch, parseWrapperCli, isTtadkWrapper, wrapperLaunchEnv } from './setup/cli-selection.js';
+import { buildWrappedLaunch, isTtadkWrapper, wrapperIdentityTokens, wrapperLaunchEnv } from './setup/cli-selection.js';
 import { buildForgeTraexLaunch, validateCliLaunchModeConfig } from './core/cli-launch-mode.js';
 import { cliUnavailableMessageAfterRetry, createAdapterAfterMissingCliWait } from './setup/cli-availability.js';
 import {
@@ -698,6 +698,7 @@ import {
   runAdoptSessionRenameSequence,
 } from './services/adopt-input-sequence.js';
 import { config, resolveChatBotDiscoveryConfig } from './config.js';
+import { isMessageListenerTaskAnchor } from './core/message-listener-silence.js';
 import { forbiddenReadWriteMessage, defaultProtectedRoots, readOnlyLauncherMountMessage, resolveStoredSandboxPaths } from './services/sandbox-path-guard.js';
 import * as sessionStore from './services/session-store.js';
 import * as pty from './utils/pty.js';
@@ -773,7 +774,7 @@ import {
   projectRuntimeScreenStatus,
 } from './utils/runtime-screen-status.js';
 import { AsyncSerialQueue } from './utils/async-serial-queue.js';
-import { provisionCodexAuth, type CodexAuthSyncMode } from './services/codex-auth-sync.js';
+import { type CodexAuthSyncMode } from './services/codex-auth-sync.js';
 import {
   CLAUDE_AUTH_OVERRIDE_ENV_KEYS,
   claudeAuthOverrideKeys,
@@ -2601,13 +2602,10 @@ function provisionIsolatedBotHome(
         claudeProfileDir ? join(claudeProfileDir, '.claude.json') : undefined,
       );
     } else {
-      const cdir = provisionCodexAuth({ botHome, mode: codexAuthSync, log });
-      // config.toml: seed ONCE (it may carry per-bot customizations afterwards).
-      // The Dashboard's "re-sync from host" (services/codex-isolated-config.ts)
-      // is the explicit way to refresh it later.
-      const cfgDst = join(cdir, CODEX_CONFIG_FILE);
-      const cfgSrc = hostCodexConfigPath();
-      if (!existsSync(cfgDst) && existsSync(cfgSrc)) copyFileSync(cfgSrc, cfgDst);
+      // config.toml / AGENTS.md: seed ONCE (they may carry per-bot customizations
+      // afterwards). The Dashboard's "re-sync from host" is the explicit way to
+      // refresh them later.
+      seedIsolatedCodexHome({ botHome, mode: codexAuthSync, log });
     }
   } catch (e) {
     log(`[read-isolation] WARN provisioning bot home failed: ${(e as Error).message}`);
@@ -16740,7 +16738,7 @@ function dismissAidenCodexUpdateDialog(data: string, source: 'stream' | 'screen'
     lastInitConfig?.cliId !== 'codex'
     || lastInitConfig.adoptMode
     || !lastInitConfig.wrapperCli
-    || parseWrapperCli(lastInitConfig.wrapperCli)[0] !== 'aiden'
+    || wrapperIdentityTokens(lastInitConfig.wrapperCli)[0] !== 'aiden'
     || !awaitingFirstPrompt
   ) {
     return false;
@@ -16797,7 +16795,7 @@ function inspectAidenCodexUpdateDialogOnScreen(): boolean {
     lastInitConfig?.cliId !== 'codex'
     || lastInitConfig.adoptMode
     || !lastInitConfig.wrapperCli
-    || parseWrapperCli(lastInitConfig.wrapperCli)[0] !== 'aiden'
+    || wrapperIdentityTokens(lastInitConfig.wrapperCli)[0] !== 'aiden'
     || !awaitingFirstPrompt
   ) return false;
 
@@ -23407,8 +23405,9 @@ async function spawnCli(
     // passing it as BOTMUX_ROOT_MESSAGE_ID would break reply threading, so
     // only forward real message ids and tell the sandbox the scope explicitly.
     const rootIsMessage = cfg.rootMessageId?.startsWith('om_') === true;
-    sessionEnv.BOTMUX_SESSION_SCOPE = rootIsMessage ? 'thread' : 'chat';
-    if (rootIsMessage) sessionEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+    const silentListener = isMessageListenerTaskAnchor(cfg.rootMessageId);
+    sessionEnv.BOTMUX_SESSION_SCOPE = rootIsMessage || silentListener ? 'thread' : 'chat';
+    if (rootIsMessage || silentListener) sessionEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
     if (cfg.turnId) sessionEnv.BOTMUX_TURN_ID = cfg.turnId;
     if (cfg.deferredScheduleRun) {
       sessionEnv.BOTMUX_DEFERRED_SCHEDULE_TASK_ID = cfg.deferredScheduleRun.taskId;
@@ -23439,6 +23438,12 @@ async function spawnCli(
       ...botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy),
       ...riffCfg.env,
     };
+    if (silentListener) {
+      mergedEnv.BOTMUX_SESSION_ID = cfg.sessionId;
+      mergedEnv.BOTMUX_CHAT_ID = cfg.chatId;
+      mergedEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+      mergedEnv.BOTMUX_SESSION_SCOPE = 'thread';
+    }
     // The effective policy is a host-resolved snapshot, not a user-overridable
     // backend env knob. Re-freeze it after config.env/per-bot env merge.
     if (cfg.feedback) mergedEnv.BOTMUX_FEEDBACK_POLICY = JSON.stringify(cfg.feedback);
@@ -23515,7 +23520,7 @@ async function spawnCli(
           : `http://${host.includes(':') ? `[${host}]` : host}:${address.port}${RIFF_HOST_TOOLS_ROUTE}`);
         if (!isValidRiffHostToolsUrl(url)) throw new Error('riff_host_endpoint_invalid');
         const env: NodeJS.ProcessEnv = { ...process.env, BOTMUX_LARK_APP_ID: cfg.larkAppId, BOTMUX_CHAT_ID: cfg.chatId,
-          BOTMUX_ROOT_MESSAGE_ID: cfg.rootMessageId, BOTMUX_SESSION_SCOPE: rootIsMessage ? 'thread' : 'chat',
+          BOTMUX_ROOT_MESSAGE_ID: cfg.rootMessageId, BOTMUX_SESSION_SCOPE: rootIsMessage || silentListener ? 'thread' : 'chat',
           BOTMUX_LINK_REF_TURN_MODE: currentBotmuxLinkRefMode };
         delete env.BOTMUX_LARK_TOOL_BINDING;
         if (cfg.larkToolBinding !== false) {
@@ -25169,10 +25174,10 @@ async function spawnCli(
     BOTMUX_SESSION_ID: cfg.sessionId,
     BOTMUX_CHAT_ID: cfg.chatId,
     BOTMUX_LARK_APP_ID: cfg.larkAppId,
-    BOTMUX_SESSION_SCOPE: cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat',
+    BOTMUX_SESSION_SCOPE: cfg.rootMessageId?.startsWith('om_') || isMessageListenerTaskAnchor(cfg.rootMessageId) ? 'thread' : 'chat',
   };
   if (cfg.chatType) identityShellEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
-  if (cfg.rootMessageId?.startsWith('om_')) identityShellEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+  if (cfg.rootMessageId?.startsWith('om_') || isMessageListenerTaskAnchor(cfg.rootMessageId)) identityShellEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
   if ((cfg.triggerUserAuth?.enabled || boundLark) && process.env.SESSION_DATA_DIR) {
     const dir = sessionIdentityBinDir(identityDataDir!, cfg.sessionId);
     identityShellEnv.SESSION_DATA_DIR = identityDataDir!;
@@ -27016,7 +27021,7 @@ async function spawnCli(
       resolveBin: (b: string) => locateOnEffectiveChildPath(b, effectiveChildEnv) ?? b,
       realCliBin: cliAdapter!.resolvedBin,
     });
-    if (parseWrapperCli(cfg.wrapperCli).slice(0, 3).join(' ') === 'aiden x codex') {
+    if (wrapperIdentityTokens(cfg.wrapperCli).slice(0, 3).join(' ') === 'aiden x codex') {
       try {
         accessSync(cliAdapter!.resolvedBin, fsConstants.X_OK);
         if (!wiring.shimDataDir) throw new Error('SESSION_DATA_DIR is unavailable');
@@ -28901,7 +28906,7 @@ async function spawnCli(
       observeRestoredStartupHistoryOnScreen();
     }
     if (idleDetector?.isStartupPending()) {
-      if (cfg.resume && cfg.cliId === 'codex' && cfg.wrapperCli?.trim() === 'aiden x codex'
+      if (cfg.resume && cfg.cliId === 'codex' && wrapperIdentityTokens(cfg.wrapperCli).join(' ') === 'aiden x codex'
         && !isPersistentBackendReattach && !requestedAidenResumeRedraw && firstPromptBackend
         && aidenCodexResumeNeedsRedraw(renderer?.rawSnapshot({ preserveFormatting: true }) ?? '')) {
         requestedAidenResumeRedraw = true;
