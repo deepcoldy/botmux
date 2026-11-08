@@ -7,7 +7,7 @@ import * as sessionStore from '../services/session-store.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActive } from './dashboard-rows.js';
 import { buildSessionMessagePreview } from './session-message-preview.js';
-import { latestTurnStartedAt } from './turn-outcome.js';
+import { turnStartedAt } from './turn-outcome.js';
 import type { DaemonSession } from './types.js';
 import type { Session } from '../types.js';
 import { emitSessionTaskEvent } from './session-task-events.js';
@@ -193,15 +193,25 @@ export function publishAttentionPatch(ds: DaemonSession): void {
   });
 }
 
-/** Raise the daemon's own hand for a delivery that keeps failing. Retries land
- *  here every few seconds; while a daemon raise is still up, keep its original
- *  `at` so the board, owner reminders and steward alerts see one raise, not a
- *  fresh one per retry. A raise older than the latest turn start belongs to an
- *  earlier turn (bot-only groups never clear it): the board reads such an `at`
- *  as superseded, so a new failure gets its own. Returns whether anything changed. */
-export function raiseDaemonAttention(ds: DaemonSession, kind: string, reason: string, now: number = Date.now()): boolean {
+/** Raise the daemon's own hand for `turnId`'s delivery that keeps failing.
+ *  Pending deliveries of every unsettled turn are retried every few seconds,
+ *  long after newer turns started. While a daemon raise is up, keep its
+ *  original `at` so the board, owner reminders and steward alerts see one raise,
+ *  not a fresh one per retry. Only a failing turn that started after that raise
+ *  gets its own `at`: the board reads a raise older than a newer turn's start as
+ *  superseded (bot-only groups never clear it), so the newer failure must not
+ *  inherit it, and an older turn's retry must not push it past the newer turn.
+ *  Returns whether anything changed. */
+export function raiseDaemonAttention(
+  ds: DaemonSession,
+  kind: string,
+  reason: string,
+  turnId: string | undefined,
+  now: number = Date.now(),
+): boolean {
   const current = ds.agentAttention;
-  if (current && current.source !== 'agent' && (latestTurnStartedAt(ds) ?? 0) <= current.at) {
+  const startedAt = turnId ? turnStartedAt(ds, turnId) : undefined;
+  if (current && current.source !== 'agent' && !(startedAt !== undefined && startedAt > current.at)) {
     if (current.kind === kind && current.reason === reason) return false;
     ds.agentAttention = { kind, reason, at: current.at };
     return true;

@@ -1563,6 +1563,7 @@ function SchedulesPage() {
         />
         <DropdownMenu
           id="sched-kind-menu"
+          className="dashboard-toolbar-menu"
           ariaLabel={tr('schedules.anyKind')}
           label={filters.kind || tr('schedules.anyKind')}
           value={filters.kind}

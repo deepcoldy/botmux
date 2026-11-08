@@ -77,11 +77,9 @@ export function noteTurnStarted(ds: DaemonSession, turnId: string, at: number = 
   if (turnId) remember(turnStarts, ds, turnId, at);
 }
 
-/** 最近一次开始新一轮的时刻；daemon 重启后还没开过新一轮时没有。 */
-export function latestTurnStartedAt(ds: DaemonSession): number | undefined {
-  let latest: number | undefined;
-  for (const at of turnStarts.get(ds)?.values() ?? []) latest = latest === undefined ? at : Math.max(latest, at);
-  return latest;
+/** 这一轮开始的时刻；daemon 重启前开始的、或已被挤出记录窗口的轮没有。 */
+export function turnStartedAt(ds: DaemonSession, turnId: string): number | undefined {
+  return turnStarts.get(ds)?.get(turnId);
 }
 
 let restoredNotices: string[] | undefined;

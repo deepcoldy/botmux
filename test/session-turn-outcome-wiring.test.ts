@@ -61,10 +61,10 @@ describe('turn outcome wiring', () => {
     expect(daemon.slice(begin, begin + 160)).toContain('noteTurnStarted(ds, turnId);');
   });
 
-  it('final delivery retries keep the first raise instead of re-stamping it', () => {
+  it('final delivery retries keep the first raise and name the turn whose delivery failed', () => {
     expect(pool).not.toMatch(/reason: FINAL_HANDOFF_DELIVERY_REASON, at: Date\.now\(\)/);
-    expect(pool.match(/raiseDaemonAttention\(ds, 'blocked', FINAL_HANDOFF_DELIVERY_REASON\)/g) ?? []).toHaveLength(2);
-    expect(pool).toContain('raiseDaemonAttention(ds, \'blocked\', `Durable final output is ambiguous: ${durableDelivery.error}`)');
-    expect(pool).toContain("if (raiseDaemonAttention(ds, 'blocked', err.message)) publishAttentionPatch(ds);");
+    expect(pool.match(/raiseDaemonAttention\(ds, 'blocked', FINAL_HANDOFF_DELIVERY_REASON, record\.output\.turnId\)/g) ?? []).toHaveLength(2);
+    expect(pool).toContain('raiseDaemonAttention(ds, \'blocked\', `Durable final output is ambiguous: ${durableDelivery.error}`, msg.turnId)');
+    expect(pool).toContain("if (raiseDaemonAttention(ds, 'blocked', err.message, msg.turnId)) publishAttentionPatch(ds);");
   });
 });
