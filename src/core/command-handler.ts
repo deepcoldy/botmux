@@ -110,6 +110,7 @@ import { buildClosedSessionCard } from './closed-session-card.js';
 import { ttadkConfigModelChoices } from '../setup/cli-selection.js';
 import { publishAttentionPatch, announcePendingRepoSession } from './session-activity.js';
 import { setCardMode } from '../services/card-mode-store.js';
+import { clearChatReplyMode, resolveRegularGroupMode, setChatReplyMode } from '../services/chat-reply-mode-store.js';
 import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
 import { setCotMode } from '../services/cot-mode-store.js';
 import { handleCotThinkingUpdate } from '../im/lark/cot-message.js';
@@ -140,7 +141,8 @@ import { runSkillsImCommand } from './skills/im-command.js';
 import { fetchDaemonIpc } from './daemon-ipc-auth.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { modelPinText } from './model-pin.js';
-import { writeSessionModelPin, sessionAcceptsDirectCommand } from './worker-pool.js';
+import { writeSessionModelPin, sessionAcceptsDirectCommand, recordTurnExplicitMention } from './worker-pool.js';
+import { messageMentionsBot } from '../im/lark/message-parser.js';
 import { updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
@@ -3299,6 +3301,15 @@ export async function handleCommand(
             // markInitialUserTurnPending below.
             const emptyStart = !pendingRawInput && !hasBufferedInput;
             if (!emptyStart && pendingTurnId) await deps.prepareTurn?.(current, pendingTurnId);
+            // 被 @ 回执的来源记录挂在交给 forkWorker 的同一 turnId 上（turn_terminal 带回的就是它）；
+            // raw 冷启动的 turnId 不经 forkWorker，而是在 prompt_ready 随 raw_input 下发，这里不记。
+            if (!emptyStart && !pendingRawInput && pendingTurnId) {
+              recordTurnExplicitMention(current, pendingTurnId, messageMentionsBot(
+                { mentions: current.pendingMentions },
+                current.larkAppId,
+                selfBot.botOpenId,
+              ));
+            }
             forkWorker(
               current,
               pendingRawInput ? '' : (wrappedInput ?? ''),
@@ -6654,6 +6665,20 @@ export async function handleCommand(
           break;
         }
 
+        // 分身登记在新群 chatId 上（chat-scope），而 new-topic 下顶层消息按 thread/messageId
+        // 路由，永远命不中它。只给这个新群写群级 chat-topic 覆盖（不动 Bot 默认）：顶层
+        // 平铺命中分身，群内原生话题仍各自独立。必须在 forkSession 登记之前写入。
+        let forkReplyModePinned = false;
+        if (resolveRegularGroupMode(forkAppId, forkChatId) === 'new-topic') {
+          try {
+            const pin = await setChatReplyMode(forkAppId, forkChatId, 'chat-topic');
+            forkReplyModePinned = pin.ok;
+            if (!pin.ok) logger.warn(`[${logTag}] /fork --create: pin chat-topic on ${forkChatId} failed: ${pin.reason}`);
+          } catch (err: any) {
+            logger.warn(`[${logTag}] /fork --create: pin chat-topic on ${forkChatId} threw: ${err?.message ?? err}`);
+          }
+        }
+
         // Fork the session into the new chat (chat-scope, group). The new chat
         // is empty by construction, so no target-anchor conflict. Source is
         // never touched.
@@ -6680,6 +6705,14 @@ export async function handleCommand(
             if (!dis.ok) logger.warn(`[${logTag}] /fork --create: orphan group ${forkChatId} disband failed: ${dis.error}`);
           } catch (e: any) {
             logger.warn(`[${logTag}] /fork --create: orphan group ${forkChatId} disband threw: ${e?.message ?? e}`);
+          }
+          if (forkReplyModePinned) {
+            try {
+              const unpin = await clearChatReplyMode(forkAppId, forkChatId);
+              if (!unpin.ok) logger.warn(`[${logTag}] /fork --create: unpin reply mode on ${forkChatId} failed: ${unpin.reason}`);
+            } catch (e: any) {
+              logger.warn(`[${logTag}] /fork --create: unpin reply mode on ${forkChatId} threw: ${e?.message ?? e}`);
+            }
           }
           const errKey = forkResult.error === 'worker_busy' ? 'cmd.fork.mid_turn'
             : forkResult.error === 'adopt_not_forkable' ? 'cmd.fork.adopt_not_forkable'

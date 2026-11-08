@@ -10,6 +10,7 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import {
+  bunWsIgnoresCustomAgents,
   describeLarkWsProxy,
   describeWsRuntime,
   larkWsAgentFor,
@@ -100,13 +101,21 @@ describe('larkWsAgentFor', () => {
     expect(mockWarn).not.toHaveBeenCalled();
   });
 
-  it('keeps the legacy ProxyAgent for non-HTTP proxies and warns only on Bun', () => {
+  it('keeps the legacy ProxyAgent for non-HTTP proxies and warns only where Bun ignores it', () => {
     process.env.https_proxy = 'socks5://127.0.0.1:1080';
     const agent = createLarkWsAgent(DOMAIN);
     expect(agent).toBeInstanceOf(ProxyAgent);
-    const onBun = Boolean((process.versions as Record<string, string | undefined>).bun);
-    expect(mockWarn).toHaveBeenCalledTimes(onBun ? 1 : 0);
-    if (onBun) expect(String(mockWarn.mock.calls[0][0])).toContain('socks5://127.0.0.1:1080');
+    const ignored = bunWsIgnoresCustomAgents();
+    expect(mockWarn).toHaveBeenCalledTimes(ignored ? 1 : 0);
+    if (ignored) expect(String(mockWarn.mock.calls[0][0])).toContain('socks5://127.0.0.1:1080');
+  });
+
+  it('only treats Bun before 1.4.4 as ignoring custom agents', () => {
+    expect(bunWsIgnoresCustomAgents('1.3.9')).toBe(true);
+    expect(bunWsIgnoresCustomAgents('1.4.3')).toBe(true);
+    expect(bunWsIgnoresCustomAgents('1.4.4')).toBe(false);
+    expect(bunWsIgnoresCustomAgents('1.5.0')).toBe(false);
+    expect(bunWsIgnoresCustomAgents('2.0.0')).toBe(false);
   });
 
   it('is a no-op for a direct resolution', () => {

@@ -46,6 +46,7 @@ import {
   isTranscriptRateLimitEvent,
   isSyntheticNoModelReplyEvent,
   classifyClaudeTerminalEvent,
+  apiErrorMessageText,
   type ClaudeTerminalOutcome,
   type TranscriptEvent,
 } from './claude-transcript.js';
@@ -93,6 +94,9 @@ export interface BridgePendingTurn {
    * terminalOutcome. Tells a failure the worker watched happen from one it is
    * replaying out of an earlier generation's history. */
   terminalOutcomeAtMs?: number;
+  /** Text of the API-error record that set a non-completed terminalOutcome
+   *  (unmasked; the worker masks and clips it before it leaves). */
+  terminalErrorDetail?: string;
   /** Structured 429 observed for this turn. It remains owned by the existing
    * limited/reset path and must not be converted into ordinary ambiguity when
    * the following turn_duration closes the transcript boundary. */
@@ -768,6 +772,9 @@ export class BridgeTurnQueue {
               // continuation). Unconditional assignment, therefore.
               this.collecting.terminalOutcome = terminalOutcome;
               this.collecting.terminalOutcomeAtMs = eventTimeMs(ev);
+              const detail = apiErrorMessageText(ev).trim();
+              if (detail) this.collecting.terminalErrorDetail = detail;
+              else delete this.collecting.terminalErrorDetail;
             } else {
               // The `<synthetic>` placeholder is the WEAKEST terminal signal
               // there is - no model call happened at all (no requestId, usage
@@ -1347,7 +1354,10 @@ export class BridgeTurnQueue {
         this.queue.splice(idx, 1);
         if (this.collecting === absorbed) this.collecting = null;
         absorbed.terminalObserved = head.terminalObserved;
-        if (head.terminalOutcome) absorbed.terminalOutcome ??= head.terminalOutcome;
+        if (head.terminalOutcome && absorbed.terminalOutcome === undefined) {
+          absorbed.terminalOutcome = head.terminalOutcome;
+          if (head.terminalErrorDetail) absorbed.terminalErrorDetail = head.terminalErrorDetail;
+        }
         if (head.rateLimited) absorbed.rateLimited = true;
         out.push(absorbed);
       }

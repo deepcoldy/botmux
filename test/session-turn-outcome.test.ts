@@ -1,0 +1,338 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const h = vi.hoisted(() => ({
+  stored: new Map<string, { status: string }>(),
+  failNextUpdate: false,
+  writes: [] as unknown[],
+}));
+
+vi.mock('../src/utils/logger.js', () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
+vi.mock('../src/config.js', () => ({ config: { session: { dataDir: '/nonexistent-test-data-dir' } } }));
+vi.mock('../src/services/session-store.js', () => ({
+  getSession: (id: string) => h.stored.get(id),
+  updateSession: (session: { sessionId: string; lastTurn?: unknown }) => {
+    if (h.failNextUpdate) {
+      h.failNextUpdate = false;
+      throw new Error('disk full');
+    }
+    h.writes.push(structuredClone(session.lastTurn));
+  },
+}));
+
+import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
+import { deriveSessionTaskStatus } from '../src/core/session-task-status.js';
+import {
+  classifyTurnOutcome,
+  holdLastTurnThrough,
+  isMaintenanceTurnId,
+  noteDiagnosticFinal,
+  noteFinalReplyText,
+  noteLateFinalReply,
+  noteTurnStarted,
+  readFinalSendPreview,
+  recordTurnOutcome,
+} from '../src/core/turn-outcome.js';
+import { messages as zhMessages } from '../src/i18n/zh.js';
+import type { DaemonSession } from '../src/core/types.js';
+
+const dataDir = mkdtempSync(join(tmpdir(), 'turn-outcome-'));
+afterAll(() => rmSync(dataDir, { recursive: true, force: true }));
+
+let clock = 1_800_000_000_000;
+const now = () => clock;
+
+function makeDs(sessionId: string, extra: Record<string, unknown> = {}): DaemonSession {
+  h.stored.set(sessionId, { status: 'active' });
+  return {
+    session: { sessionId, status: 'active', ...extra },
+    lastMessageAt: clock - 1_000,
+  } as unknown as DaemonSession;
+}
+
+const patches: Array<{ sessionId: string; patch: Record<string, unknown> }> = [];
+dashboardEventBus.subscribe(event => {
+  if (event.type === 'session.update') patches.push(event.body as never);
+});
+
+beforeEach(() => {
+  h.stored.clear();
+  h.writes.length = 0;
+  h.failNextUpdate = false;
+  patches.length = 0;
+  clock += 60_000;
+});
+
+describe('classifyTurnOutcome', () => {
+  it('completed is delivered only with a final reply receipt', () => {
+    expect(classifyTurnOutcome({ turnId: 't', status: 'completed' }, { recoveryHandled: false, finalDelivered: true })).toBe('delivered');
+    expect(classifyTurnOutcome({ turnId: 't', status: 'completed' }, { recoveryHandled: false, finalDelivered: false })).toBe('no_output');
+  });
+
+  it('failures the group is told about are interrupted; recovery-owned and user aborts are not', () => {
+    expect(classifyTurnOutcome({ turnId: 't', status: 'failed', errorCode: 'api_error' }, { recoveryHandled: false, finalDelivered: false })).toBe('interrupted');
+    expect(classifyTurnOutcome({ turnId: 't', status: 'failed' }, { recoveryHandled: true, finalDelivered: false })).toBe('no_output');
+    expect(classifyTurnOutcome({ turnId: 't', status: 'cancelled' }, { recoveryHandled: false, finalDelivered: false })).toBe('no_output');
+    expect(classifyTurnOutcome({ turnId: 't', status: 'ambiguous', errorCode: 'pi_turn_aborted' }, { recoveryHandled: false, finalDelivered: false })).toBe('no_output');
+    expect(classifyTurnOutcome({ turnId: 't', status: 'ambiguous' }, { recoveryHandled: false, finalDelivered: false })).toBe('interrupted');
+  });
+});
+
+describe('recordTurnOutcome', () => {
+  it('waits for the daemon final delivery of the same turn before deciding', async () => {
+    const ds = makeDs('s-drain');
+    let delivered = false;
+    const finish = beginFinalOutputDelivery(ds, 't1');
+    const pending = recordTurnOutcome(ds, { turnId: 't1', status: 'completed' }, {
+      recoveryHandled: false, isFinalDelivered: () => delivered, now, dataDir,
+    });
+    await new Promise(r => setTimeout(r, 5));
+    expect(ds.session.lastTurn).toBeUndefined();
+    noteFinalReplyText(ds, 't1', '## 已修好登录超时\n细节…');
+    delivered = true;
+    finish();
+    const lastTurn = await pending;
+    expect(lastTurn).toEqual({ turnId: 't1', outcome: 'delivered', at: clock, summary: '已修好登录超时' });
+    expect(ds.session.lastTurn).toEqual(lastTurn);
+    expect(h.writes).toEqual([lastTurn]);
+    expect(patches).toEqual([{ sessionId: 's-drain', patch: { lastTurn } }]);
+  });
+
+  it('records no output when the final reply never lands within the wait', async () => {
+    const ds = makeDs('s-timeout');
+    beginFinalOutputDelivery(ds, 't1');
+    const lastTurn = await recordTurnOutcome(ds, { turnId: 't1', status: 'completed' }, {
+      recoveryHandled: false, isFinalDelivered: () => false, drainTimeoutMs: 20, dataDir,
+    });
+    expect(lastTurn?.outcome).toBe('no_output');
+    expect(deriveSessionTaskStatus({ status: 'idle', lastTurn }).kind).toBe('idle');
+  });
+
+  it('an older terminal finishing its wait late does not overwrite a newer turn', async () => {
+    const ds = makeDs('s-seq');
+    const finish = beginFinalOutputDelivery(ds, 't1');
+    const older = recordTurnOutcome(ds, { turnId: 't1', status: 'completed' }, {
+      recoveryHandled: false, isFinalDelivered: () => true, now, dataDir,
+    });
+    const newer = await recordTurnOutcome(ds, { turnId: 't2', status: 'failed', errorCode: 'api_error' }, {
+      recoveryHandled: false, isFinalDelivered: () => false, now, dataDir,
+    });
+    finish();
+    expect(await older).toBeUndefined();
+    expect(newer).toMatchObject({ turnId: 't2', outcome: 'interrupted', errorCode: 'api_error' });
+    expect(ds.session.lastTurn).toEqual(newer);
+  });
+
+  it('does not write into a session that closed while waiting', async () => {
+    const ds = makeDs('s-closed');
+    const finish = beginFinalOutputDelivery(ds, 't1');
+    const pending = recordTurnOutcome(ds, { turnId: 't1', status: 'completed' }, {
+      recoveryHandled: false, isFinalDelivered: () => true, now, dataDir,
+    });
+    h.stored.set('s-closed', { status: 'closed' });
+    finish();
+    expect(await pending).toBeUndefined();
+    expect(ds.session.lastTurn).toBeUndefined();
+    expect(h.writes).toEqual([]);
+    expect(patches).toEqual([]);
+  });
+
+  it('rolls back the in-memory result when saving fails', async () => {
+    const previous = { turnId: 't0', outcome: 'delivered', at: clock - 5 };
+    const ds = makeDs('s-fail', { lastTurn: previous });
+    h.failNextUpdate = true;
+    const lastTurn = await recordTurnOutcome(ds, { turnId: 't1', status: 'failed' }, {
+      recoveryHandled: false, isFinalDelivered: () => false, now, dataDir,
+    });
+    expect(lastTurn).toBeUndefined();
+    expect(ds.session.lastTurn).toEqual(previous);
+    expect(patches).toEqual([]);
+  });
+
+  it('falls back to the final send preview recorded for the same turn', async () => {
+    const ds = makeDs('s-preview');
+    mkdirSync(join(dataDir, 'turn-sends'), { recursive: true });
+    writeFileSync(join(dataDir, 'turn-sends', 's-preview.jsonl'), [
+      JSON.stringify({ turnId: 't1', responseKind: 'progress', previewText: '进度' }),
+      JSON.stringify({ turnId: 't1', responseKind: 'final', previewText: '**结论**：可以合入' }),
+      JSON.stringify({ turnId: 't0', responseKind: 'final', previewText: '上一轮' }),
+      '{"turnId":"t1","respo',
+    ].join('\n'));
+    expect(readFinalSendPreview(dataDir, 's-preview', 't1')).toBe('结论：可以合入');
+    expect(readFinalSendPreview(dataDir, 's-preview', 't9')).toBeUndefined();
+    expect(readFinalSendPreview(dataDir, 's-missing', 't1')).toBeUndefined();
+    const lastTurn = await recordTurnOutcome(ds, { turnId: 't1', status: 'completed' }, {
+      recoveryHandled: false, isFinalDelivered: () => true, now, dataDir,
+    });
+    expect(lastTurn?.summary).toBe('结论：可以合入');
+  });
+
+  it('a completed turn whose only final is the empty-completion diagnostic is not delivered', async () => {
+    const ds = makeDs('s-diag');
+    noteDiagnosticFinal(ds, 't1');
+    const lastTurn = await recordTurnOutcome(ds, { turnId: 't1', status: 'completed' }, {
+      recoveryHandled: false, isFinalDelivered: () => true, now, dataDir,
+    });
+    expect(lastTurn?.outcome).toBe('no_output');
+    // 模型自己的最终回复晚到，仍然补登成已交付。
+    expect(noteLateFinalReply(ds, 't1', { now, dataDir })?.outcome).toBe('delivered');
+  });
+
+  it('a diagnostic after the real answer of the same turn does not take the receipt away', async () => {
+    const ds = makeDs('s-diag-after');
+    noteFinalReplyText(ds, 't1', '结论：可以合入');
+    noteDiagnosticFinal(ds, 't1');
+    const lastTurn = await recordTurnOutcome(ds, { turnId: 't1', status: 'completed' }, {
+      recoveryHandled: false, isFinalDelivered: () => true, now, dataDir,
+    });
+    expect(lastTurn).toMatchObject({ outcome: 'delivered', summary: '结论：可以合入' });
+  });
+
+  it('the summary of a reply recovered after restart skips the recovery notice line', async () => {
+    const ds = makeDs('s-restored');
+    noteFinalReplyText(ds, 't1', `${zhMessages['worker.bridge_restored_turn_notice']}\n\n## 登录超时已修好`);
+    const lastTurn = await recordTurnOutcome(ds, { turnId: 't1', status: 'completed' }, {
+      recoveryHandled: false, isFinalDelivered: () => true, now, dataDir,
+    });
+    expect(lastTurn?.summary).toBe('登录超时已修好');
+  });
+
+  it('a turn that ends with no output and no new message keeps the current result', async () => {
+    const delivered = { turnId: 't1', outcome: 'delivered', at: clock - 10, summary: '上一轮结论' };
+    const ds = makeDs('s-keepalive', { lastTurn: delivered });
+    expect(await recordTurnOutcome(ds, { turnId: 'local-keepalive', status: 'completed' }, {
+      recoveryHandled: false, isFinalDelivered: () => false, now, dataDir,
+    })).toBeUndefined();
+    expect(ds.session.lastTurn).toEqual(delivered);
+    expect(h.writes).toEqual([]);
+  });
+
+  it('after a new message a no-output turn does replace the old result', async () => {
+    const ds = makeDs('s-new-input', { lastTurn: { turnId: 't1', outcome: 'delivered', at: clock - 10 } });
+    ds.lastMessageAt = clock - 5;
+    const lastTurn = await recordTurnOutcome(ds, { turnId: 't2', status: 'completed' }, {
+      recoveryHandled: false, isFinalDelivered: () => false, now, dataDir,
+    });
+    expect(lastTurn).toMatchObject({ turnId: 't2', outcome: 'no_output' });
+  });
+
+  it('a held-back no-output turn is still upgraded when its final reply arrives late', async () => {
+    const ds = makeDs('s-held-late', { lastTurn: { turnId: 't1', outcome: 'delivered', at: clock - 10 } });
+    await recordTurnOutcome(ds, { turnId: 'scheduled-1', status: 'completed' }, {
+      recoveryHandled: false, isFinalDelivered: () => false, now, dataDir,
+    });
+    noteFinalReplyText(ds, 'scheduled-1', '定时巡检：一切正常');
+    expect(noteLateFinalReply(ds, 'scheduled-1', { now, dataDir })).toMatchObject({
+      turnId: 'scheduled-1', outcome: 'delivered', summary: '定时巡检：一切正常',
+    });
+  });
+
+  it('skips meeting receiver sessions', async () => {
+    const ds = makeDs('s-vc', { vcMeetingReceiver: true });
+    expect(await recordTurnOutcome(ds, { turnId: 't1', status: 'failed' }, {
+      recoveryHandled: false, isFinalDelivered: () => false, now, dataDir,
+    })).toBeUndefined();
+  });
+
+  it('a follow-up that started before the previous result settled replaces it even with no output', async () => {
+    const ds = makeDs('s-follow-up');
+    noteTurnStarted(ds, 't1', clock - 30);
+    const finish = beginFinalOutputDelivery(ds, 't1');
+    const first = recordTurnOutcome(ds, { turnId: 't1', status: 'completed' }, {
+      recoveryHandled: false, isFinalDelivered: () => true, now, dataDir,
+    });
+    // 上一轮还在等投递落地时，用户追发了一句，开了新一轮。
+    ds.lastMessageAt = clock - 5;
+    noteTurnStarted(ds, 't2', clock - 5);
+    finish();
+    expect(await first).toMatchObject({ turnId: 't1', outcome: 'delivered', startedAt: clock - 30, at: clock });
+    clock += 1_000;
+    const second = await recordTurnOutcome(ds, { turnId: 't2', status: 'completed' }, {
+      recoveryHandled: false, isFinalDelivered: () => false, now, dataDir,
+    });
+    expect(second).toEqual({ turnId: 't2', outcome: 'no_output', at: clock, startedAt: clock - 1_005 });
+    expect(deriveSessionTaskStatus({ status: 'idle', lastMessageAt: ds.lastMessageAt, lastTurn: second }).kind).toBe('idle');
+  });
+
+  it('a turn started after the current result with no new message is still held back', async () => {
+    const delivered = { turnId: 't1', outcome: 'delivered', at: clock - 10, summary: '上一轮结论' };
+    const ds = makeDs('s-later-start', { lastTurn: delivered });
+    noteTurnStarted(ds, 'scheduled-2', clock - 5);
+    expect(await recordTurnOutcome(ds, { turnId: 'scheduled-2', status: 'completed' }, {
+      recoveryHandled: false, isFinalDelivered: () => false, now, dataDir,
+    })).toBeUndefined();
+    expect(ds.session.lastTurn).toEqual(delivered);
+  });
+});
+
+describe('noteLateFinalReply', () => {
+  it('upgrades the same completed turn from no output to delivered', async () => {
+    const ds = makeDs('s-late');
+    await recordTurnOutcome(ds, { turnId: 't1', status: 'completed' }, {
+      recoveryHandled: false, isFinalDelivered: () => false, now, dataDir,
+    });
+    clock += 1_000;
+    noteFinalReplyText(ds, 't1', '补发的结论');
+    const lastTurn = noteLateFinalReply(ds, 't1', { now, dataDir });
+    expect(lastTurn).toEqual({ turnId: 't1', outcome: 'delivered', at: clock, summary: '补发的结论' });
+    expect(patches).toHaveLength(2);
+  });
+
+  it('leaves other turns, other outcomes and superseded turns alone', async () => {
+    const record = (ds: DaemonSession, status: 'completed' | 'failed', errorCode?: string) => recordTurnOutcome(ds, {
+      turnId: 't1', status, ...(errorCode ? { errorCode } : {}),
+    }, { recoveryHandled: false, isFinalDelivered: () => false, now, dataDir });
+    const other = makeDs('s-other');
+    await record(other, 'completed');
+    expect(noteLateFinalReply(other, 't2', { now, dataDir })).toBeUndefined();
+    const interrupted = makeDs('s-int');
+    await record(interrupted, 'failed', 'api_error');
+    expect(noteLateFinalReply(interrupted, 't1', { now, dataDir })).toBeUndefined();
+    const superseded = makeDs('s-new-msg');
+    await record(superseded, 'completed');
+    superseded.lastMessageAt = clock + 1;
+    expect(noteLateFinalReply(superseded, 't1', { now, dataDir })).toBeUndefined();
+    expect(h.writes.every(w => (w as { outcome: string }).outcome !== 'delivered')).toBe(true);
+  });
+
+  it('a reply landing for a failed turn is not upgraded to delivered', async () => {
+    const ds = makeDs('s-late-failed');
+    // 续跑接管的失败记成「无最终输出」；之后送达的是失败提示，不是交付。
+    expect(await recordTurnOutcome(ds, { turnId: 't1', status: 'failed', errorCode: 'api_error' }, {
+      recoveryHandled: true, isFinalDelivered: () => false, now, dataDir,
+    })).toMatchObject({ outcome: 'no_output' });
+    expect(noteLateFinalReply(ds, 't1', { now, dataDir })).toBeUndefined();
+    expect(ds.session.lastTurn).toMatchObject({ turnId: 't1', outcome: 'no_output' });
+  });
+
+  it('without the terminal of that turn (daemon restarted) nothing is upgraded', () => {
+    const ds = makeDs('s-late-restart', { lastTurn: { turnId: 't1', outcome: 'no_output', at: clock - 10 } });
+    expect(noteLateFinalReply(ds, 't1', { now, dataDir })).toBeUndefined();
+  });
+});
+
+describe('holdLastTurnThrough', () => {
+  it('auto-compact activity does not push the current result out', () => {
+    const ds = makeDs('s-hold', { lastTurn: { turnId: 't1', outcome: 'delivered', at: clock - 10 } });
+    expect(isMaintenanceTurnId('auto-compact:lx1')).toBe(true);
+    expect(isMaintenanceTurnId('auto-compact:idle:lx1')).toBe(true);
+    expect(isMaintenanceTurnId('om_123')).toBe(false);
+    const held = holdLastTurnThrough(ds, clock);
+    expect(held).toEqual({ turnId: 't1', outcome: 'delivered', at: clock - 10, heldThrough: clock });
+    expect(patches).toEqual([{ sessionId: 's-hold', patch: { lastTurn: held } }]);
+    expect(deriveSessionTaskStatus({ status: 'idle', lastMessageAt: clock, lastTurn: held }).kind).toBe('delivered');
+    expect(deriveSessionTaskStatus({ status: 'idle', lastMessageAt: clock + 1, lastTurn: held }).kind).toBe('idle');
+  });
+
+  it('does not revive a result that a newer message already superseded', () => {
+    const ds = makeDs('s-hold-stale', { lastTurn: { turnId: 't1', outcome: 'delivered', at: clock - 10 } });
+    ds.lastMessageAt = clock - 5;
+    expect(holdLastTurnThrough(ds, clock)).toBeUndefined();
+    expect(h.writes).toEqual([]);
+  });
+});

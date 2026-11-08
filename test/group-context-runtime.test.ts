@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 const network = vi.hoisted(() => ({ history: vi.fn(), thread: vi.fn(), threadContext: vi.fn(), byThreadId: vi.fn(), download: vi.fn(), detail: vi.fn(), update: vi.fn() }));
 vi.mock('../src/im/lark/client.js', () => ({
   listChatMessagesUntil: network.history,
@@ -516,5 +516,63 @@ describe('group context platform integration', () => {
     expect((await preparing)?.body).toContain('choice 104');
     expect(getGroupContextMessage('cli_b', 'oc_room', 'om_stream_104')).toBeDefined();
     expect(getGroupContextMessage('cli_b', 'oc_room', 'om_stream_0')).toBeUndefined();
+  });
+});
+
+describe('group context history attachments', () => {
+  it.each([
+    ['a video (current classification)', 'video'],
+    ['a video stored as a file before the reclassification', 'file'],
+  ] as const)('delivers %s quoted from history', async (_, type) => {
+    const now = Date.now();
+    network.history.mockResolvedValue([]);
+    network.download.mockImplementation(async (_app, _id, _key, _type, path) => { writeFileSync(path, 'video-bytes'); });
+    upsertGroupContextMessage('cli_b', { messageId: 'om_clip', chatId: 'oc_room', conversationScope: 'main', senderId: 'ou_user',
+      senderType: 'user', msgType: type === 'video' ? 'media' : 'file', text: '[视频: demo.mp4]', createTime: now - 10,
+      resourceRefs: [{ type, key: 'file_v3_clip', name: 'demo.mp4' }], sourceAppId: 'cli_b' });
+    const prepared = await prepareGroupContextForTurn({ appId: 'cli_b', chatId: 'oc_room', turnId: 'om_next', createTime: now, query: '看看上面的附件' });
+    expect(prepared?.attachments).toEqual([expect.objectContaining({ type, name: 'demo.mp4', resourceKey: 'file_v3_clip' })]);
+    expect(network.download).toHaveBeenCalledWith('cli_b', 'om_clip', 'file_v3_clip', type, expect.any(String), undefined, { allowUserTokenFallback: false });
+  });
+
+  const shot = (now: number) => upsertGroupContextMessage('cli_b', { messageId: 'om_shot', chatId: 'oc_room', conversationScope: 'main', senderId: 'ou_user',
+    senderType: 'user', msgType: 'image', text: '[图片]', createTime: now - 20, resourceRefs: [{ type: 'image', key: 'img_shot', name: 'shot.png' }], sourceAppId: 'cli_b' });
+  const clip = (now: number) => upsertGroupContextMessage('cli_b', { messageId: 'om_clip', chatId: 'oc_room', conversationScope: 'main', senderId: 'ou_user',
+    senderType: 'user', msgType: 'media', text: '[视频: clip.mp4]', createTime: now - 10, resourceRefs: [{ type: 'video', key: 'file_v3_clip', name: 'clip.mp4' }], sourceAppId: 'cli_b' });
+
+  it.each([
+    ['after', [shot, clip]],
+    ['before', [clip, shot]],
+  ] as const)('keeps a history image when a video posted %s it is still downloading at the budget', async (_, order) => {
+    vi.useFakeTimers();
+    const now = Date.now();
+    network.history.mockResolvedValue([]);
+    let videoRequested!: () => void;
+    const requested = new Promise<void>(resolve => { videoRequested = resolve; });
+    network.download.mockImplementation(async (_app, _id, key, _type, path) => {
+      if (key === 'file_v3_clip') { videoRequested(); return new Promise(() => {}); }
+      writeFileSync(path, 'image-bytes');
+    });
+    for (const seed of order) seed(now);
+    const preparing = prepareGroupContextForTurn({ appId: 'cli_b', chatId: 'oc_room', turnId: 'om_next', createTime: now, query: '看看上面的图片' });
+    await requested;
+    await vi.advanceTimersByTimeAsync(3100);
+    const prepared = await preparing;
+    expect(prepared?.attachments).toEqual([expect.objectContaining({ type: 'image', resourceKey: 'img_shot' })]);
+    expect(prepared?.incomplete).toBe(true);
+  });
+
+  it('downloads a cut-off history video again instead of reusing the partial file', async () => {
+    const now = Date.now();
+    network.history.mockResolvedValue([]);
+    network.download.mockImplementationOnce(async (_app, _id, _key, _type, path) => { writeFileSync(path, 'PARTIAL'); throw new Error('stream reset'); });
+    clip(now);
+    const first = await prepareGroupContextForTurn({ appId: 'cli_b', chatId: 'oc_room', turnId: 'om_t1', createTime: now, query: '看看上面的附件' });
+    expect(first?.attachments ?? []).toEqual([]);
+    network.download.mockImplementation(async (_app, _id, _key, _type, path) => { writeFileSync(path, 'FULL'); });
+    const second = await prepareGroupContextForTurn({ appId: 'cli_b', chatId: 'oc_room', turnId: 'om_t2', createTime: now + 1, query: '看看上面的附件' });
+    const [video] = second?.attachments ?? [];
+    expect(readFileSync(video.path, 'utf8')).toBe('FULL');
+    expect(readdirSync(dirname(video.path))).toEqual([basename(video.path)]);
   });
 });

@@ -151,7 +151,7 @@ function LogFilterMenu<T extends string>(props: {
   return (
     <DropdownMenu
       id={props.id}
-      className="webhook-log-filter-menu"
+      className="webhook-log-filter-menu dashboard-toolbar-menu"
       ariaLabel={props.label}
       style={{ width: '100%', minWidth: 0 }}
       value={props.value}

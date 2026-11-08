@@ -4756,7 +4756,11 @@ function makeSessionGroupBoardFields(): (chatId: string) => { sessionGroup?: tru
  *
  *  Legacy `action`/`async` fields are still populated so existing webhook
  *  consumers keep working; new callers branch on `state`. */
-function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string): TriggerResponse {
+function buildAsyncTriggerLookupResponse(
+  sessionId: string,
+  triggerId?: string,
+  opts: { includeFailureDiagnostics?: boolean } = {},
+): TriggerResponse {
   const ds = findActiveBySessionId(sessionId);
   const storedRaw = ds?.session ?? sessionStore.getSession(sessionId);
   const persistedRaw = asyncTriggerStore.lookup(sessionId, triggerId);
@@ -4886,10 +4890,13 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
       failedAt: memResult.failedAt,
       errorCode: memResult.errorCode,
       terminalErrorCode: memResult.terminalErrorCode,
+      terminalErrorDetail: memResult.terminalErrorDetail,
+      terminalScreenTail: memResult.terminalScreenTail,
       usage: memResult.usage,
       interruptedAt: memResult.interruptedAt,
     } : undefined,
     memTriggerId: memResult ? memTriggerId : undefined,
+    ...(opts.includeFailureDiagnostics ? { includeFailureDiagnostics: true } : {}),
     persisted,
     storedStatus: stored ? (stored.status === 'closed' ? 'closed' : 'open') : undefined,
     closedAt: stored?.closedAt,
@@ -4939,6 +4946,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/board', async (req, res, params) => {
     activationTransferred = true;
   } else if (column) {
     currentSession.kanbanColumn = column;
+    currentSession.kanbanColumnAt = Date.now();
   }
   if (position !== null) currentSession.kanbanPosition = position;
   try {
@@ -4956,7 +4964,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/board', async (req, res, params) => {
       sessionId: params.sessionId,
       // queued 一并下发：激活后 session.queued 已为 false，前端浅合并若不带这个字段
       // 会残留 queued=true（卡片仍显示「开始」、再点 409）。!!session.queued 始终反映现态。
-      patch: { kanbanColumn: currentSession.kanbanColumn, kanbanPosition: currentSession.kanbanPosition, queued: !!currentSession.queued },
+      patch: {
+        kanbanColumn: currentSession.kanbanColumn,
+        kanbanColumnAt: currentSession.kanbanColumnAt,
+        kanbanPosition: currentSession.kanbanPosition,
+        queued: !!currentSession.queued,
+      },
     },
   });
   jsonRes(res, 200, { ok: true });
@@ -6862,7 +6875,9 @@ export function productionWorkflowDraftClarifier(): DraftClarifier {
     activeSessions: getActiveSessionsRegistry,
     createHeadlessSession: (active, args) => withBotTurnAdmission(args.larkAppId, () => createHeadlessSession(active, undefined, args)),
     triggerSessionTurn,
-    lookupTriggerResult: buildAsyncTriggerLookupResponse,
+    // In-process: the draft's failure panel shows the raw error and screen.
+    lookupTriggerResult: (sessionId, triggerId) =>
+      buildAsyncTriggerLookupResponse(sessionId, triggerId, { includeFailureDiagnostics: true }),
     sessionStatus: (sessionId) => (findActiveBySessionId(sessionId)?.session ?? sessionStore.getOwnedSession(sessionId))?.status,
     suspendWorker,
     isSuspendable: (ds) => isSuspendableBackendType(ds.initConfig?.backendType),
@@ -9382,6 +9397,7 @@ ipcRoute('PUT', '/api/bot-substitute-mode', requireBoundBot(async (req, res) => 
   const r = await substituteModeStore.updateBotSubstituteMode(cachedLarkAppId, {
     enabled: rec.enabled === true,
     targets,
+    keywords: rec.keywords,
     disclosure: rec.disclosure === 'none' ? 'none' : 'prefix',
     replyMode: rec.replyMode === 'quote' ? 'quote' : 'thread',
     disableControlCard: rec.disableControlCard === true,

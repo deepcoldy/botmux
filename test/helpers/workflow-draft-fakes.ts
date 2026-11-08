@@ -82,12 +82,15 @@ export function fakeArchitect() {
   const calls: RunArchitectInput[] = [];
   let mode: 'ok' | 'fail' | 'hang' = 'ok';
   let nodes: unknown[] = DAG_NODES;
+  /** Called with the attempt dir before the fake worker answers (to leave logs). */
+  let onRun: ((attemptDir: string) => void) | undefined;
   const run: ArchitectDeps['runArchitect'] = async (input) => {
     calls.push(input);
     return runArchitect({
       ...input,
       runNode: async (req) => {
         const manifestPath = req.env[GOAL_ENV.MANIFEST_PATH]!;
+        onRun?.(req.attemptDir);
         if (mode === 'hang') {
           await new Promise<void>((resolve) => {
             if (req.cancelSignal?.aborted) return resolve();
@@ -110,6 +113,7 @@ export function fakeArchitect() {
     calls,
     set mode(next: 'ok' | 'fail' | 'hang') { mode = next; },
     set nodes(next: unknown[]) { nodes = next; },
+    set onRun(next: ((attemptDir: string) => void) | undefined) { onRun = next; },
   };
 }
 
@@ -121,8 +125,11 @@ export function fakeClarifier() {
   const turns = new Map<string, { sessionId: string; result: DraftClarifyResult }>();
   const suspended: string[] = [];
   const order: string[] = [];
+  const controls = { createError: undefined as string | undefined, closeError: undefined as string | undefined, creates: 0, closes: [] as string[] };
   const clarifier: DraftClarifier = {
     async create() {
+      controls.creates += 1;
+      if (controls.createError) return { ok: false, error: controls.createError };
       n += 1;
       const sessionId = `sess-${n}`;
       sessions.set(sessionId, { headlessId: `hl_draft_${String(n).padStart(8, '0')}`, prompts: [], closed: false, gone: false });
@@ -148,6 +155,8 @@ export function fakeClarifier() {
       return true;
     },
     async close({ sessionId }) {
+      if (controls.closeError) throw new Error(controls.closeError);
+      controls.closes.push(sessionId);
       const session = sessions.get(sessionId);
       if (session) session.closed = true;
     },
@@ -164,6 +173,23 @@ export function fakeClarifier() {
     },
     /** The session disappears (e.g. its record was lost). */
     lose(sessionId: string) { sessions.get(sessionId)!.gone = true; },
+    /** End the latest running turn with exactly this result (e.g. what the
+     *  production clarifier made of a real trigger result). */
+    settle(result: DraftClarifyResult) {
+      const triggerId = order[order.length - 1]!;
+      turns.get(triggerId)!.result = result;
+    },
+    /** Fail the latest running turn as the worker reports it. */
+    fail(errorCode?: string, error?: string) {
+      const triggerId = order[order.length - 1]!;
+      turns.get(triggerId)!.result = { state: 'failed', ...(error ? { error } : {}), ...(errorCode ? { errorCode } : {}) };
+    },
+    /** create() answers this error (undefined: works again). */
+    set createError(value: string | undefined) { controls.createError = value; },
+    /** close() throws this (undefined: works again). */
+    set closeError(value: string | undefined) { controls.closeError = value; },
+    get creates() { return controls.creates; },
+    get closes() { return controls.closes; },
   };
 }
 

@@ -16,9 +16,23 @@ import { resolveAntigravityTranscriptPath } from './antigravity-transcript.js';
 import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from './traex-transcript.js';
 import { findPiTranscriptBySessionId } from './pi-transcript.js';
 import { findGrokUpdatesBySessionId } from './grok-transcript.js';
+import { findKimiWireBySessionId, findKimiWireForBotmuxSession, kimiSessionIndexStamp } from './kimi-transcript.js';
+import { isKimiSessionId } from '../adapters/cli/kimi-session.js';
 import { minimaxDataDirForBot } from './minimax-paths.js';
+import { getBot } from '../bot-registry.js';
+import { botOneShotEnv } from '../core/session-env-resolve.js';
 
-export type TranscriptKind = 'claude' | 'codex' | 'coco' | 'cursor' | 'traex' | 'pi' | 'grok' | 'antigravity' | 'minimax';
+/** Kimi path hits are re-validated after this long (see the `kimi` case). */
+const KIMI_PATH_HIT_TTL_MS = 30_000;
+
+/** The env a bot's Kimi runs with (a bot may relocate KIMI_CODE_HOME in its
+ *  bots.json `env`), so usage reads the same data dir the worker spawned on. */
+export function kimiEnvForBot(larkAppId?: string): NodeJS.ProcessEnv {
+  if (!larkAppId) return process.env;
+  try { return botOneShotEnv(process.env, getBot(larkAppId).config); } catch { return process.env; }
+}
+
+export type TranscriptKind = 'claude' | 'codex' | 'coco' | 'cursor' | 'traex' | 'pi' | 'grok' | 'kimi' | 'antigravity' | 'minimax';
 
 export interface TranscriptPathQuery {
   cliId?: CliId | 'unknown';
@@ -323,7 +337,7 @@ function codexRolloutInHome(
  *  surface usage, so UI should hide usage-display options for it rather than
  *  offer a control that is always empty. */
 const USAGE_RESOLVABLE_CLI_IDS: ReadonlySet<string> = new Set([
-  'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'pi', 'grok', 'antigravity', 'minimax',
+  'claude-code', 'aiden', 'seed', 'relay', 'codex', 'coco', 'cursor', 'traex', 'pi', 'grok', 'kimi', 'antigravity', 'minimax',
   // ZCode reports usage from its own ledger (services/zcode-usage.ts), not a transcript.
   'zcode',
 ]);
@@ -464,6 +478,32 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
         { retryMiss: q.fresh },
       );
       return path ? { path, kind: 'grok' } : null;
+    }
+    case 'kimi': {
+      // Kimi mints its own `session_<uuid>` ids. Without a persisted one, the
+      // session is the newest one in this cwd carrying this botmux session's
+      // routing marker. Kimi indexes every new session (fresh spawn, `/new`),
+      // so the index stamp in the key makes a new generation take over at
+      // once; the TTL only re-checks a hit whose marker evidence moved.
+      //
+      // The stamp only watches the NEWEST index entry's state.json, so a
+      // sibling conversation that creates a session after ours hides our
+      // generation's prompt writes from it. Fresh reads (turn boundaries AND
+      // the streaming-card tick) therefore bypass the hit TTL and re-run the
+      // marker lookup over every entry; only non-fresh callers (dashboard
+      // rows and the like) ride the TTL. Wire-log misses are cached per log
+      // size/mtime inside the lookup, so the repeated scan stays cheap.
+      const kimiSid = q.cliSessionId && isKimiSessionId(q.cliSessionId) ? q.cliSessionId : undefined;
+      const kimiEnv = kimiEnvForBot(q.larkAppId);
+      const path = cachedTranscriptPathLookup(
+        `kimi:${q.sessionId}:${kimiSid ?? ''}:${q.cwd ?? ''}:${kimiEnv.KIMI_CODE_HOME ?? ''}:${kimiSessionIndexStamp(kimiEnv)}`,
+        KIMI_PATH_HIT_TTL_MS,
+        () => foundWrap(kimiSid
+          ? findKimiWireBySessionId(kimiSid, kimiEnv)
+          : findKimiWireForBotmuxSession(q.sessionId, q.cwd, { env: kimiEnv }), v),
+        { retryMiss: q.fresh, refreshHit: q.fresh },
+      );
+      return path ? { path, kind: 'kimi' } : null;
     }
     case 'pi': {
       const path = cachedTranscriptPathLookup(`pi:${sid}:${q.cwd ?? ''}`, null, () => foundWrap(findPiTranscriptBySessionId(sid, q.cwd), v), { retryMiss: q.fresh });

@@ -44,7 +44,7 @@ function loadSender(deps: SendRawDeps) {
     log: vi.fn(),
   };
   return {
-    sendRaw: loadWorkerFunction<(be: unknown, content: string) => Promise<void>>(
+    sendRaw: loadWorkerFunction<(be: unknown, content: string, opts?: { submit?: boolean; turnId?: string }) => Promise<void>>(
       'sendRawCommandLine',
       scope,
     ),
@@ -54,6 +54,12 @@ function loadSender(deps: SendRawDeps) {
 }
 
 describe('sendRawCommandLine — framed stdin runner isolation', () => {
+  it('preserves the MiniMax compact turn ID in the submitted frame context', async () => {
+    const { sendRaw, writeInput } = loadSender({ runnerFramedInput: true });
+    const backend = { id: 'pane' };
+    await sendRaw(backend, '/compact', { turnId: 'compact-click' });
+    expect(writeInput).toHaveBeenCalledWith(backend, '/compact', { turnId: 'compact-click' });
+  });
   it('frames through adapter.writeInput and never types the line literally', async () => {
     const { sendRaw, writeInput, genericWrite } = loadSender({ runnerFramedInput: true });
     const backend = { id: 'pane' };

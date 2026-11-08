@@ -29,6 +29,18 @@ import {
   activeQuestion,
   assignableRows,
   autoFinalizeCandidate,
+  botModelSettingsHref,
+  canSwitchOrchestrator,
+  draftFailureCodeLine,
+  draftFailureFacts,
+  draftFailureTerminal,
+  handoffHistoryRows,
+  draftFailureMessage,
+  draftFailureOf,
+  recentFailureHint,
+  type BotChoice,
+  type DraftFailureDisplay,
+  type OrchestratorOptionState,
   canChat,
   copyHasConversation,
   canStartDraft,
@@ -65,6 +77,9 @@ import type { WorkflowDraftSummary } from '../../workflows/v3/draft-store.js';
 import type { WorkflowOrchestratorBotOption } from '../workflow-drafts-api.js';
 import { SaveTemplateDialog, TEMPLATE_GROUP_SETUP_KEY, TemplateRunInfo } from './workflow-library-page.js';
 import { CopyInfoPanel, CopyNodeTextEditor } from './workflow-copy.js';
+import { BotSearchPicker } from './bot-search-picker.js';
+import type { BotSearchOption } from './bot-search-model.js';
+import { createWorkbenchApi } from './agent-workbench-api.js';
 
 type Translate = ReturnType<typeof useT>;
 
@@ -321,19 +336,21 @@ export function WorkflowNewPage(): React.JSX.Element {
       ) : (
         <section className="overview-block wfd-panel wfd-new-form">
           <SectionHeader title={tr('workflow.draft.startTitle')} hint={tr('workflow.draft.startHint')} />
-          <label className="wfd-field" htmlFor="wfd-bot">
-            <span className="wfd-label">{tr('workflow.draft.orchestrator')}</span>
-            <select id="wfd-bot" value={selected} onChange={(event) => choose(event.target.value)} disabled={!bots} aria-describedby="wfd-bot-help">
-              <option value="">{bots ? tr('workflow.draft.pickBot') : tr('workflow.draft.loading')}</option>
-              {options.map((option) => (
-                <option key={option.larkAppId} value={option.larkAppId} disabled={!!option.disabledReason}>
-                  {option.disabledReason
-                    ? `${option.label} — ${localized(tr, option.disabledReason.key, option.disabledReason.fallback)}`
-                    : option.label}
-                </option>
-              ))}
-            </select>
-          </label>
+          <div className="wfd-field">
+            <span className="wfd-label" id="wfd-bot-label">{tr('workflow.draft.orchestrator')}</span>
+            <BotSearchPicker
+              id="wfd-bot"
+              label={tr('workflow.draft.orchestrator')}
+              options={orchestratorSearchOptions(tr, options, bots ?? [])}
+              value={selected}
+              disabled={!bots}
+              placeholder={bots ? tr('workflow.draft.pickBot') : tr('workflow.draft.loading')}
+              searchPlaceholder={tr('workflow.draft.botSearch.placeholder')}
+              emptyLabel={tr('workflow.draft.botSearch.empty')}
+              describedBy="wfd-bot-help"
+              onChange={choose}
+            />
+          </div>
           <p id="wfd-bot-help" className="wfd-help">{tr('workflow.draft.orchestratorHelp')}</p>
           {options.some((option) => option.disabledReason) ? (
             <details className="wfd-unavailable">
@@ -364,6 +381,36 @@ export function WorkflowNewPage(): React.JSX.Element {
       )}
     </>
   );
+}
+
+/** 编排 Bot 选择器的选项：不能用的带原因（不可选），最近一次调用模型失败的带提示（可选）。 */
+function orchestratorSearchOptions(
+  tr: Translate,
+  options: readonly OrchestratorOptionState[],
+  bots: readonly WorkflowOrchestratorBotOption[],
+): BotSearchOption[] {
+  const byId = new Map(bots.map((bot) => [bot.larkAppId, bot]));
+  return options.map((option) => {
+    const hint = recentFailureHint(byId.get(option.larkAppId)?.recentFailure);
+    return {
+      larkAppId: option.larkAppId,
+      name: option.name,
+      ...(option.cliId ? { cliId: option.cliId } : {}),
+      ...(option.disabledReason ? { disabledWhy: localized(tr, option.disabledReason.key, option.disabledReason.fallback) } : {}),
+      ...(hint ? { hint: tr('workflow.draft.recentFailure', { reason: tr(hint.key), at: hint.at }) } : {}),
+    };
+  });
+}
+
+/** 执行 Bot 选择器的选项（流程图节点、拉群第 5 步）。 */
+function executorSearchOptions(choices: readonly BotChoice[]): BotSearchOption[] {
+  return choices.map((choice) => ({
+    larkAppId: choice.larkAppId,
+    name: choice.name,
+    ...(choice.cliId ? { cliId: choice.cliId } : {}),
+    ...(choice.suffix ? { suffix: choice.suffix } : {}),
+    ...(choice.disabledWhy ? { disabledWhy: choice.disabledWhy } : {}),
+  }));
 }
 
 /** 文案键存在就翻译，否则用服务端给的原文。 */
@@ -429,10 +476,14 @@ export function WorkflowDraftPage(props: { runId: string }): React.JSX.Element {
   const attempted = useRef(new Set<string>());
   const autoFailures = useRef(0);
   const [botNames, setBotNames] = useState<Map<string, string>>(() => new Map());
+  const [orchestratorBots, setOrchestratorBots] = useState<WorkflowOrchestratorBotOption[]>([]);
   const [saving, setSaving] = useState(false);
+  const [switching, setSwitching] = useState(false);
   useEffect(() => {
     void fetchOrchestratorBots().then((result) => {
-      if (result.ok) setBotNames(new Map(result.bots.map((bot) => [bot.larkAppId, bot.name])));
+      if (!result.ok) return;
+      setBotNames(new Map(result.bots.map((bot) => [bot.larkAppId, bot.name])));
+      setOrchestratorBots(result.bots);
     });
   }, []);
 
@@ -490,6 +541,16 @@ export function WorkflowDraftPage(props: { runId: string }): React.JSX.Element {
 
   const sections = draftSections(view);
   const readOnly = !isInitiator;
+  const failure = draftFailureOf(view);
+  const switchable = isInitiator && canSwitchOrchestrator(view) && !view.handoff;
+  /** 换编排 Bot：Dashboard 依次问新 Bot、让现编排 Bot 交出、新 Bot 接管。 */
+  const switchTo = async (larkAppId: string) => {
+    const result = await act({ kind: 'orchestrator', larkAppId }, 'orchestrator');
+    if (result?.ok) {
+      setSwitching(false);
+      setNotice({ text: tr('workflow.draft.switch.done', { bot: botNames.get(larkAppId) ?? larkAppId }), error: false });
+    }
+  };
   const ended = view.phase === 'abandoned' || view.phase === 'committed' || view.phase === 'started';
   // A running launch step or a written run.json: only 「继续」 (the daemon refuses abandon).
   const abandonable = !ended && !view.launch?.running && !view.launch?.commit;
@@ -530,17 +591,58 @@ export function WorkflowDraftPage(props: { runId: string }): React.JSX.Element {
         ) : null}
       />
       <div className="wfd-meta">
-        <span><span className="wfd-label">{tr('workflow.draft.orchestrator')}</span>{botNames.get(view.orchestratorAppId) ?? <code>{view.orchestratorAppId}</code>}</span>
+        <span>
+          <span className="wfd-label">{tr('workflow.draft.orchestrator')}</span>{botNames.get(view.orchestratorAppId) ?? <code>{view.orchestratorAppId}</code>}
+          {switchable && !failure && !switching
+            ? <button type="button" className="btn-link wfd-small" disabled={!!busy} onClick={() => setSwitching(true)}>{tr('workflow.draft.switch.title')}</button>
+            : null}
+        </span>
         <span><span className="wfd-label">{tr('workflow.draft.initiator')}</span>{tr(initiatorSourceKey(view.initiator))}{isInitiator ? <small className="wfd-me">{tr('workflow.draft.you')}</small> : null}</span>
         <span><span className="wfd-label">{tr('workflow.draft.colUpdated')}</span><time dateTime={view.updatedAt}>{formatDraftTime(view.updatedAt)}</time></span>
       </div>
+      <HandoffHistory view={view} botNames={botNames} />
       {me?.state === 'ok' && readOnly ? <p className="wfd-notice" role="status">{tr('workflow.draft.readOnly')}</p> : null}
       {me?.state === 'failed' ? <p className="wfd-notice" role="status">{tr('workflow.draft.readOnly')}（{describeError(tr, me)}）</p> : null}
       {notice ? <p className={`wfd-notice${notice.error ? ' wfd-error' : ''}`} role={notice.error ? 'alert' : 'status'}>{notice.text}</p> : null}
+      {view.handoff ? (
+        <div className="wfd-notice wfd-handoff" role="status">
+          <span>{tr('workflow.draft.switch.pending', { bot: botNames.get(view.handoff.toAppId) ?? view.handoff.toAppId })}</span>
+          {isInitiator ? (
+            <span className="wfd-actions">
+              <button type="button" className="primary" disabled={!!busy} onClick={() => { void switchTo(view.handoff!.toAppId); }}>
+                {busy === 'orchestrator' ? tr('workflow.draft.switch.switching') : tr('workflow.draft.switch.resume')}
+              </button>
+              <button type="button" disabled={!!busy} onClick={() => { void act({ kind: 'handoff-cancel' }, 'handoff-cancel', { pin: false }); }}>
+                {tr('workflow.draft.switch.abort')}
+              </button>
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+      {failure ? (
+        <FailurePanel
+          failure={failure}
+          botName={botNames.get(failure.larkAppId) ?? failure.larkAppId}
+          canSwitch={switchable}
+          busy={busy}
+          onSwitch={() => setSwitching(true)}
+        />
+      ) : null}
+      {switching && switchable ? (
+        <SwitchOrchestratorPanel
+          current={view.orchestratorAppId}
+          bots={orchestratorBots}
+          checks={checks}
+          check={check}
+          busy={busy}
+          onCancel={() => setSwitching(false)}
+          onSwitch={(larkAppId) => { void switchTo(larkAppId); }}
+        />
+      ) : null}
       {sections.copy ? <CopyInfoPanel view={view} canWrite={isInitiator} busy={busy} act={act} botNames={botNames} /> : null}
       {sections.template && view.template ? <TemplateRunInfo template={view.template} isOwner={me?.state === 'ok' && me.initiator.openId === view.template.ownerOpenId} /> : null}
       {sections.chat || sections.spec ? <div className={`wfd-layout${sections.spec && sections.chat ? ' wfd-two' : ''}`}>
-        {sections.chat ? <ChatPanel view={view} canWrite={isInitiator} busy={busy} act={act} /> : null}
+        {sections.chat ? <ChatPanel view={view} canWrite={isInitiator && !view.handoff} busy={busy} act={act} failureShown={!!failure} /> : null}
         {sections.spec ? (
           <SpecPanel
             view={view}
@@ -586,9 +688,167 @@ function DraftHeading(props: { title: string; phase?: WorkflowDraftView['phase']
 
 type Act = (action: DraftAction, label: string, opts?: { pin?: boolean }) => Promise<unknown>;
 
+// ─── 编排失败与换编排 Bot ────────────────────────────────────────────────
+
+/** 哪个 Bot、什么原因（封闭集合的人话），最多一行错误码；两个出路。 */
+function FailurePanel(props: {
+  failure: DraftFailureDisplay;
+  botName: string;
+  canSwitch: boolean;
+  busy: string | null;
+  onSwitch: () => void;
+}): React.JSX.Element {
+  const tr = useT();
+  const { failure } = props;
+  const message = draftFailureMessage(failure, props.botName);
+  const code = draftFailureCodeLine(failure);
+  const facts = draftFailureFacts(failure, props.botName);
+  const terminal = draftFailureTerminal(failure);
+  const terminalLink = useTerminalViewLink(terminal.sessionId);
+  return (
+    <section className="overview-block wfd-panel wfd-failure" aria-labelledby="wfd-failure-title" role="alert">
+      <div className="sect-head overview-panel-head">
+        <h2 id="wfd-failure-title">
+          {tr(`workflow.draft.failure.step.${failure.step}`)}：{tr(`workflow.draft.failure.short.${failure.category}`)}
+        </h2>
+        {failure.at ? <span className="sect-head-hint"><time dateTime={failure.at}>{formatDraftTime(failure.at)}</time></span> : null}
+      </div>
+      <p className="wfd-failure-cause">{tr(message.key, message.params)}</p>
+      <dl className="wfd-failure-facts">
+        {facts.map((fact) => (
+          <div key={fact.key}>
+            <dt className="wfd-label">{tr(`workflow.draft.failure.fact.${fact.key}`)}</dt>
+            <dd>{fact.key === 'model' ? <code>{fact.value}</code> : fact.value}</dd>
+          </div>
+        ))}
+        {code ? (
+          <div>
+            <dt className="wfd-label">{tr('workflow.draft.failure.code')}</dt>
+            <dd><code>{code}</code></dd>
+          </div>
+        ) : null}
+      </dl>
+      {failure.legacy ? <p className="wfd-help">{tr('workflow.draft.failure.legacy')}</p> : null}
+      {failure.detail ? (
+        <details className="wfd-failure-raw">
+          <summary>{tr('workflow.draft.failure.raw')}</summary>
+          <pre>{failure.detail}</pre>
+        </details>
+      ) : null}
+      {terminal.tail ? (
+        <details className="wfd-failure-raw" open>
+          <summary>{tr('workflow.draft.failure.terminal')}</summary>
+          <pre>{terminal.tail}</pre>
+        </details>
+      ) : null}
+      {terminalLink ? (
+        <p className="wfd-help">
+          <a className="btn-link" href={terminalLink} target="_blank" rel="noopener noreferrer">{tr('workflow.draft.failure.openTerminal')}</a>
+        </p>
+      ) : null}
+      <p className="wfd-help">{tr('workflow.draft.failure.help')}</p>
+      <div className="wfd-actions">
+        {props.canSwitch ? (
+          <button type="button" className="primary" disabled={!!props.busy} onClick={props.onSwitch}>{tr('workflow.draft.failure.switch')}</button>
+        ) : null}
+        <a className="btn-link" href={botModelSettingsHref(failure.larkAppId)}>{tr('workflow.draft.failure.fixModel')}</a>
+      </div>
+    </section>
+  );
+}
+
+/**
+ * 出错会话的只读终端链接：复用会话页 / 工作台同一条 `GET /api/sessions/:id/view-link`
+ * （Dashboard 按登录身份鉴权、签短时只读能力、只回同源 `/s/<id>` 路径）。拿不到
+ * （没有查看终端的权限、会话已关）就不给链接。
+ */
+function useTerminalViewLink(sessionId: string | undefined): string | null {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    setUrl(null);
+    if (!sessionId) return undefined;
+    let live = true;
+    const api = createWorkbenchApi((input, init) => fetch(input, init));
+    void api.getTerminalViewLink(sessionId).then((link) => { if (live) setUrl(link?.url ?? null); }).catch(() => {});
+    return () => { live = false; };
+  }, [sessionId]);
+  return url;
+}
+
+/** 编排 Bot 交接记录：何时、从哪个 Bot 到哪个 Bot、登录方式、「确认需求」的确认人改到哪个应用下。 */
+function HandoffHistory(props: { view: WorkflowDraftView; botNames: Map<string, string> }): React.JSX.Element | null {
+  const tr = useT();
+  const rows = handoffHistoryRows(props.view.handoffs, (appId) => props.botNames.get(appId) ?? appId);
+  if (rows.length === 0) return null;
+  return (
+    <details className="wfd-handoffs">
+      <summary>{tr('workflow.draft.handoffs.title', { count: String(rows.length) })}</summary>
+      <ul>
+        {rows.map((row, index) => (
+          <li key={index}>
+            <time>{row.at}</time> {tr('workflow.draft.handoffs.moved', { from: row.from, to: row.to })}
+            {row.source ? `（${tr(initiatorSourceKey({ source: row.source }))}）` : ''}
+            {row.confirmerRewritten ? (
+              <span className="wfd-help">{tr('workflow.draft.handoffs.confirmer', { to: row.to })}</span>
+            ) : null}
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
+/** 选新的编排 Bot：可搜索，带「最近一次调用模型失败」提示；选中后先查发起人（I1）。 */
+function SwitchOrchestratorPanel(props: {
+  current: string;
+  bots: readonly WorkflowOrchestratorBotOption[];
+  checks: Map<string, InitiatorCheck>;
+  check: (larkAppId: string, force?: boolean) => void;
+  busy: string | null;
+  onCancel: () => void;
+  onSwitch: (larkAppId: string) => void;
+}): React.JSX.Element {
+  const tr = useT();
+  const [selected, setSelected] = useState('');
+  const others = useMemo(() => props.bots.filter((bot) => bot.larkAppId !== props.current), [props.bots, props.current]);
+  const options = useMemo(() => orchestratorSearchOptions(tr, orchestratorOptionStates(others, props.checks), others), [others, props.checks, tr]);
+  const bot = others.find((candidate) => candidate.larkAppId === selected);
+  const currentCheck = selected ? props.checks.get(selected) : undefined;
+  const ready = !!bot && !bot.unavailable && currentCheck?.state === 'ok' && !props.busy;
+  return (
+    <section className="overview-block wfd-panel wfd-switch" aria-labelledby="wfd-switch-title">
+      <div className="sect-head overview-panel-head">
+        <h2 id="wfd-switch-title">{tr('workflow.draft.switch.title')}</h2>
+      </div>
+      <div className="wfd-field">
+        <span className="wfd-label">{tr('workflow.draft.switch.pick')}</span>
+        <BotSearchPicker
+          id="wfd-switch-bot"
+          label={tr('workflow.draft.switch.pick')}
+          options={options}
+          value={selected}
+          placeholder={tr('workflow.draft.pickBot')}
+          searchPlaceholder={tr('workflow.draft.botSearch.placeholder')}
+          emptyLabel={tr('workflow.draft.botSearch.empty')}
+          describedBy="wfd-switch-help"
+          onChange={(larkAppId) => { setSelected(larkAppId); props.check(larkAppId); }}
+        />
+      </div>
+      <p id="wfd-switch-help" className="wfd-help">{tr('workflow.draft.switch.help')}</p>
+      <InitiatorLine check={currentCheck} />
+      <div className="wfd-actions">
+        <button type="button" className="primary" disabled={!ready} onClick={() => props.onSwitch(selected)}>
+          {props.busy === 'orchestrator' ? tr('workflow.draft.switch.switching') : tr('workflow.draft.switch.confirm')}
+        </button>
+        <button type="button" disabled={!!props.busy} onClick={props.onCancel}>{tr('workflow.draft.switch.cancel')}</button>
+      </div>
+    </section>
+  );
+}
+
 // ─── 澄清（§4.2）────────────────────────────────────────────────────────
 
-function ChatPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: string | null; act: Act }): React.JSX.Element {
+function ChatPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: string | null; act: Act; failureShown?: boolean }): React.JSX.Element {
   const tr = useT();
   const { view } = props;
   const [text, setText] = useState('');
@@ -660,7 +920,7 @@ function ChatPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: st
             {tr('workflow.draft.continue')}
           </button>
         </div>
-      ) : view.clarify.error ? <p className="wfd-error" role="alert">{view.clarify.error}</p> : null}
+      ) : view.clarify.error && !props.failureShown ? <p className="wfd-error" role="alert">{view.clarify.error}</p> : null}
       <form className="wfd-composer" onSubmit={(event) => { event.preventDefault(); void send(text); }}>
         <label htmlFor="wfd-message" className="wfd-sr-only">{tr('workflow.draft.message')}</label>
         <textarea
@@ -842,7 +1102,10 @@ function FlowPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: st
   }, [flow.dag.nodes]);
   const selected = flow.dag.nodes.find((node) => node.id === selectedId);
   const rows = selected ? assignableRows(selected.id, flow.plan.rows, flow.dag) : [];
-  const choices = executorBotChoices(flow.roster, tr('workflow.draft.orchestratorSuffix'));
+  const searchChoices = useMemo(
+    () => executorSearchOptions(executorBotChoices(flow.roster, tr('workflow.draft.orchestratorSuffix'))),
+    [flow.roster, tr],
+  );
   const summary = flowSummarySections(flow);
   const seenConfirmed = useRef(false);
   if (props.view.flowConfirmation?.valid) seenConfirmed.current = true;
@@ -903,27 +1166,21 @@ function FlowPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: st
                 const selectId = `wfd-node-bot-${row.nodeId.replace(/[^A-Za-z0-9_-]/g, '_')}`;
                 return (
                   <div key={row.nodeId} className="wfd-node-bot">
-                    <label htmlFor={selectId} className="wfd-label">
+                    <span className="wfd-label">
                       {rows.length > 1 || row.nodeId !== selected.id ? tr('workflow.draft.botFor', { node: row.nodeId }) : tr('workflow.draft.executor')}
-                    </label>
-                    <select
+                    </span>
+                    <BotSearchPicker
                       id={selectId}
+                      label={rows.length > 1 || row.nodeId !== selected.id ? tr('workflow.draft.botFor', { node: row.nodeId }) : tr('workflow.draft.executor')}
+                      options={searchChoices}
                       value={row.larkAppId}
+                      valueLabel={row.name}
                       disabled={swapDisabled}
-                      onChange={(event) => {
-                        const larkAppId = event.target.value;
-                        if (larkAppId && larkAppId !== row.larkAppId) {
-                          void props.act({ kind: 'node-bot', nodeId: row.nodeId, larkAppId }, 'node-bot');
-                        }
-                      }}
-                    >
-                      {choices.some((choice) => choice.larkAppId === row.larkAppId) ? null : <option value={row.larkAppId}>{row.name}</option>}
-                      {choices.map((choice) => (
-                        <option key={choice.larkAppId} value={choice.larkAppId} disabled={!!choice.disabledWhy}>
-                          {choice.disabledWhy ? `${choice.label}：${choice.disabledWhy}` : choice.label}
-                        </option>
-                      ))}
-                    </select>
+                      placeholder={row.name}
+                      searchPlaceholder={tr('workflow.draft.botSearch.placeholder')}
+                      emptyLabel={tr('workflow.draft.botSearch.empty')}
+                      onChange={(larkAppId) => { void props.act({ kind: 'node-bot', nodeId: row.nodeId, larkAppId }, 'node-bot'); }}
+                    />
                     {row.reason ? <p className="wfd-reason"><span className="wfd-label">{tr('workflow.draft.reason')}</span>{row.reason}</p> : null}
                     {row.missedAssignee ? (
                       <p className="wfd-warning">⚠️ {tr('workflow.draft.assigneeMissed', { bot: row.missedAssignee.assignee })}{row.missedAssignee.why ? `（${row.missedAssignee.why}）` : ''}</p>
@@ -1088,7 +1345,7 @@ function LaunchPanel(props: {
   const controls = launchControls(view, props.canWrite);
   const disabled = !!props.busy;
   const nameOf = (appId: string) => props.botNames.get(appId) ?? appId;
-  const choices = view.flow ? executorBotChoices(view.flow.roster, tr('workflow.draft.orchestratorSuffix')) : [];
+  const choices = view.flow ? executorSearchOptions(executorBotChoices(view.flow.roster, tr('workflow.draft.orchestratorSuffix'))) : [];
   const rowOf = new Map((view.flow?.plan.rows ?? []).map((row) => [row.nodeId, row]));
 
   // 已启动：去运行详情页（一次）。
@@ -1166,20 +1423,20 @@ function LaunchPanel(props: {
                   <p><code>{problem.nodeId}</code> → <b>{nameOf(problem.larkAppId)}</b>：{localized(tr, `workflow.draft.botProblem.${problem.code}`, problem.why)}{problem.detail ? `（${problem.detail}）` : ''}</p>
                   {problem.code !== 'DIRECTORY_OUTPUT' && rowOf.has(problem.nodeId) ? (
                     <>
-                      <label htmlFor={selectId} className="wfd-label">{tr('workflow.draft.launch.swapBot')}</label>
-                      <select id={selectId} value={current} disabled={!controls.canSwapBots || disabled}
-                        aria-describedby="wfd-launch-swap-help"
-                        onChange={(event) => {
-                          const larkAppId = event.target.value;
-                          if (larkAppId && larkAppId !== current) void props.act({ kind: 'node-bot', nodeId: problem.nodeId, larkAppId }, 'node-bot');
-                        }}>
-                        {choices.some((choice) => choice.larkAppId === current) ? null : <option value={current}>{nameOf(current)}</option>}
-                        {choices.map((choice) => (
-                          <option key={choice.larkAppId} value={choice.larkAppId} disabled={!!choice.disabledWhy}>
-                            {choice.disabledWhy ? `${choice.label}：${choice.disabledWhy}` : choice.label}
-                          </option>
-                        ))}
-                      </select>
+                      <span className="wfd-label">{tr('workflow.draft.launch.swapBot')}</span>
+                      <BotSearchPicker
+                        id={selectId}
+                        label={`${tr('workflow.draft.launch.swapBot')} ${problem.nodeId}`}
+                        options={choices}
+                        value={current}
+                        valueLabel={nameOf(current)}
+                        disabled={!controls.canSwapBots || disabled}
+                        placeholder={nameOf(current)}
+                        searchPlaceholder={tr('workflow.draft.botSearch.placeholder')}
+                        emptyLabel={tr('workflow.draft.botSearch.empty')}
+                        describedBy="wfd-launch-swap-help"
+                        onChange={(larkAppId) => { void props.act({ kind: 'node-bot', nodeId: problem.nodeId, larkAppId }, 'node-bot'); }}
+                      />
                     </>
                   ) : null}
                 </li>

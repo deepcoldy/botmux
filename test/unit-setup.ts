@@ -1,8 +1,9 @@
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { inject, vi } from 'vitest';
+import { afterAll, afterEach, inject, vi } from 'vitest';
 import { fenceHomeRootedEnv } from './helpers/fence-home-env.js';
 import { installSessionDataDirFence } from './helpers/session-data-dir-fence.js';
+import { installSystemdFence, systemdFenceError, takeSystemdFenceViolations } from './helpers/systemd-fence.js';
 
 // Disposable SESSION_DATA_DIR / mojo workspace root for this file (shared with
 // the e2e project's setup file).
@@ -23,6 +24,16 @@ process.env.USERPROFILE = fileHome;
 // at a live home that never go through `homedir()`, and a normal Botmux shell has
 // them set to the real fleet.
 fenceHomeRootedEnv(fileHome);
+
+// No test may reach the host's systemd (test/helpers/systemd-fence.ts). A call
+// the code under test caught still fails the test that made it.
+installSystemdFence(fileRoot);
+const failOnSystemdFenceViolations = (): void => {
+  const attempts = takeSystemdFenceViolations();
+  if (attempts.length > 0) throw systemdFenceError(attempts);
+};
+afterEach(failOnSystemdFenceViolations);
+afterAll(failOnSystemdFenceViolations);
 
 vi.mock('node:os', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:os')>();

@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../src/config.js';
-import { __setScheduleStoreBeforeRenameTestHook, getTask, setScheduleScope, updateTask as updateStoredTask } from '../src/services/schedule-store.js';
+import { __setScheduleStoreBeforeRenameTestHook, getTask, markRun, setScheduleScope, updateTask as updateStoredTask } from '../src/services/schedule-store.js';
 import { resolveSchedulePrecondition, schedulePreconditionPath } from '../src/services/schedule-precondition-store.js';
 import { createTaskWithOptionalPrecondition } from '../src/core/schedule-precondition-config.js';
 import { applyManagedScheduleUpdate } from '../src/core/schedule-managed-update.js';
@@ -141,6 +141,36 @@ describe('managed schedule frequency update', () => {
     const result = applyManagedScheduleUpdate(before.id, APP_ID, { schedule: 'every 4h' });
     expect(result).toMatchObject({ ok: true, task: { enabled: false } });
     expect(getTask(before.id, APP_ID)).toMatchObject({ enabled: false, disabledReason: 'manual', schedule: 'every 4h' });
+  });
+
+  it('gives a finished one-shot a next run only for a new expression, the same one resume then schedules', () => {
+    // The CLI points a finished one-shot at `schedule resume` only when the
+    // update receipt carries a next run, so the receipt has to agree with what
+    // resume actually schedules.
+    const finishedOneShot = () => {
+      const created = scheduler.addTask({
+        name: 'once', schedule: '30m', prompt: 'p', workingDir: tempDir, chatId: 'oc_patrol', larkAppId: APP_ID,
+      });
+      markRun(created.id, true);
+      return created.id;
+    };
+    const resent = finishedOneShot();
+    const changed = finishedOneShot();
+    vi.setSystemTime(new Date(NOW.getTime() + 24 * 3600_000));
+    const fourHoursOn = new Date(NOW.getTime() + 28 * 3600_000).toISOString();
+
+    expect(applyManagedScheduleUpdate(resent, APP_ID, { schedule: '30m' })).toMatchObject({
+      ok: true, task: { schedule: '30m', nextRunAt: null, enabled: false, disabledReason: 'once_completed' },
+    });
+    expect(applyManagedScheduleUpdate(changed, APP_ID, { schedule: 'every 4h' })).toMatchObject({
+      ok: true, task: { schedule: 'every 4h', nextRunAt: fourHoursOn, enabled: false, disabledReason: 'once_completed' },
+    });
+
+    expect(scheduler.enableTask(resent)).toBe(true);
+    expect(scheduler.enableTask(changed)).toBe(true);
+    expect(getTask(resent, APP_ID)).toMatchObject({ enabled: true });
+    expect(getTask(resent, APP_ID)!.nextRunAt).toBeUndefined();
+    expect(getTask(changed, APP_ID)).toMatchObject({ enabled: true, nextRunAt: fourHoursOn });
   });
 
   it('keeps the until-done retry rule tied to a one-shot', () => {
