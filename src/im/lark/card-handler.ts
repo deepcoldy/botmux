@@ -2061,7 +2061,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
     // card first, then run the same path as a typed `/dismiss --confirm=`,
     // which re-checks permission and state and reports into the group.
     return {
-      card: { type: 'raw', data: buildDismissSubmittedCard(loc) },
+      card: { type: 'raw', data: buildDismissSubmittedCard(loc, String(value.ordinary_group) === 'true') },
       afterAck: () => handleCommand('/dismiss', chatId, {
         messageId: cardMessageId ?? `dismiss-confirm-${chatId}`,
         rootId: chatId,
