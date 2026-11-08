@@ -7,6 +7,7 @@ import * as sessionStore from '../services/session-store.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActive } from './dashboard-rows.js';
 import { buildSessionMessagePreview } from './session-message-preview.js';
+import { latestTurnStartedAt } from './turn-outcome.js';
 import type { DaemonSession } from './types.js';
 import type { Session } from '../types.js';
 
@@ -175,10 +176,12 @@ export function publishAttentionPatch(ds: DaemonSession): void {
 /** Raise the daemon's own hand for a delivery that keeps failing. Retries land
  *  here every few seconds; while a daemon raise is still up, keep its original
  *  `at` so the board, owner reminders and steward alerts see one raise, not a
- *  fresh one per retry. Returns whether anything changed. */
+ *  fresh one per retry. A raise older than the latest turn start belongs to an
+ *  earlier turn (bot-only groups never clear it): the board reads such an `at`
+ *  as superseded, so a new failure gets its own. Returns whether anything changed. */
 export function raiseDaemonAttention(ds: DaemonSession, kind: string, reason: string, now: number = Date.now()): boolean {
   const current = ds.agentAttention;
-  if (current && current.source !== 'agent') {
+  if (current && current.source !== 'agent' && (latestTurnStartedAt(ds) ?? 0) <= current.at) {
     if (current.kind === kind && current.reason === reason) return false;
     ds.agentAttention = { kind, reason, at: current.at };
     return true;
