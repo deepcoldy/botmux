@@ -282,7 +282,9 @@ export function buildManagedLarkToolPromptBlocks(
   policy: TriggerUserAuthConfig | undefined,
   larkToolAppId: string | undefined,
   locale?: Locale,
-  noTransport = false,
+  /** Only takes effect with larkToolAppId set; the only transport-less
+   *  sessions that get a managed binding are verified headless sessions. */
+  headlessNoUserChannel = false,
 ): string {
   const effectivePolicy = larkToolAppId && policy
     ? { ...policy, tools: policy.tools.filter(tool => tool !== 'lark-cli') }
@@ -294,7 +296,7 @@ export function buildManagedLarkToolPromptBlocks(
   const larkToolBoundary = larkToolAppId
     ? [
       '<botmux_lark_tool>',
-      `  ${escapeXmlTagLikeTokens(larkToolPrompt(larkToolAppId, locale, noTransport))}`,
+      `  ${escapeXmlTagLikeTokens(larkToolPrompt(larkToolAppId, locale, headlessNoUserChannel))}`,
       '</botmux_lark_tool>',
     ].join('\n')
     : '';

@@ -28,14 +28,14 @@ const assembly = ts.transpileModule(worker.slice(start, end), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
 const assemble = new Function('cfg', 'process', 'sessionIdentityBinDir', 'join', 'GIT_ASKPASS_BASENAME',
-  'perBotInjectEnv', 'sandboxRequested',
+  'perBotInjectEnv', 'sandboxRequested', 'effectiveResume',
   'effectiveAdapterSessionId', 'boundLark', 'larkToolBindingPath', 'identityDataDir', `${assembly}\nreturn identityShellEnv;`);
 
 function workerShellEnv(sessionDataDir: string | undefined, enabled = true, tools = ['bytedcli'], boundLark = false, path?: string, sandboxRequested = false, launch: { cliId?: string; wrapperCli?: string; path?: string } = {}): Record<string, string> {
   return assemble(
     { sessionId: 'botmux-session', chatId: 'oc_chat', larkAppId: 'cli_app', cliId: launch.cliId ?? 'traex', wrapperCli: launch.wrapperCli, triggerUserAuth: { enabled, tools } },
     { env: { PATH: path, ...(sessionDataDir === undefined ? {} : { SESSION_DATA_DIR: sessionDataDir, BOTMUX_DAEMON_IPC_PORT: '12345' }) } },
-    sessionIdentityBinDir, join, GIT_ASKPASS_BASENAME, { PATH: launch.path }, sandboxRequested, 'native-session', boundLark, larkToolBindingPath, sessionDataDir,
+    sessionIdentityBinDir, join, GIT_ASKPASS_BASENAME, { PATH: launch.path }, sandboxRequested, false, 'native-session', boundLark, larkToolBindingPath, sessionDataDir,
   );
 }
 
