@@ -80,6 +80,18 @@ describe('codex writeInput history match tolerates Codex trimming', () => {
     expect(result.recheck()).toBe(false);
   });
 
+  it('does not relax whitespace INSIDE the message', async () => {
+    // Edge trimming must not also fold interior whitespace: a record that only
+    // matches after collapsing internal runs is a different message.
+    const adapter = createCodexAdapter();
+    const result = await adapter.writeInput!(
+      fakePty(() => appendFileSync(historyPath, historyLine('a b'))),
+      'a  b\n',
+    ) as any;
+    expect(result.submitted).toBe(false);
+    expect(result.recheck()).toBe(false);
+  });
+
   it('whitespace-only input never matches an empty history line', async () => {
     const adapter = createCodexAdapter();
     const result = await adapter.writeInput!(
