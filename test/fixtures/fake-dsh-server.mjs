@@ -26,6 +26,9 @@ import { appendFileSync } from 'node:fs';
  *   bad-prompt-ack  - first session/prompt returns no messageId, the second
  *                     runs the happy path (preamble must survive)
  *   bad-initialize  - initialize returns no server identity
+ *   model-not-ready - the first two initialize calls fail with "has no configured
+ *                     model" (a plugin provider still registering its models)
+ *   initialize-error - every initialize fails with an unrelated JSON-RPC error
  *   error           - session/prompt fails with a JSON-RPC error
  *   turn-error      - prompt accepted, but the turn ends with an LLM error
  *                     (like the real 401 path): no assistant/message, a
@@ -86,6 +89,7 @@ if (logPath) appendFileSync(logPath, JSON.stringify(launch) + '\n');
 
 let inputBuffer = '';
 let promptCount = 0;
+let initializeCount = 0;
 
 function send(obj) {
   process.stdout.write(JSON.stringify(obj) + '\n');
@@ -318,6 +322,19 @@ function handleLine(line) {
   }
   if (msg.method === 'initialize') {
     if (logPath) appendFileSync(logPath, JSON.stringify({ initialize: msg.params }) + '\n');
+    initializeCount++;
+    if (scenario === 'model-not-ready' && initializeCount <= 2) {
+      send({
+        jsonrpc: '2.0',
+        id: msg.id,
+        error: { code: -32000, message: `pi-ai provider "${msg.params?.provider}" has no configured model "${msg.params?.model}"` },
+      });
+      return;
+    }
+    if (scenario === 'initialize-error') {
+      send({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: 'boom' } });
+      return;
+    }
     if (scenario === 'bad-initialize') {
       send({ jsonrpc: '2.0', id: msg.id, result: {} });
       return;

@@ -73,6 +73,12 @@ export const SLASH_COMMAND_SHAPE = /^\/[a-z0-9][a-z0-9:_-]*$/;
  * input` and drops it, while mira/mir enqueue the line as an ordinary USER
  * MESSAGE and burn a turn asking the model about it.
  *
+ * Riff has no local CLI: RiffBackend turns every write into a remote task
+ * prompt behind its system-prompt block, so the command text and the submit
+ * Enter become two separate remote tasks and no slash parser ever sees the
+ * command. A Riff session always carries cliId `riff` (spawn-time CLI/backend
+ * pairing, see remote-cli-ids), so the id stands for the backend here.
+ *
  * ⚠️ This set lives in this dependency-free leaf — not in command-handler — so
  * the Lark card builder can gate its own `/compact` affordance on the SAME
  * predicate the router uses. Importing command-handler from card-builder would
@@ -81,7 +87,7 @@ export const SLASH_COMMAND_SHAPE = /^\/[a-z0-9][a-z0-9:_-]*$/;
  * left 11 PTY quick-action buttons that silently did nothing. Any gate deciding
  * "can this CLI receive typed input" must call the predicate below, never
  * hand-write a member of this set. */
-const NO_RAW_PASSTHROUGH_CLI_IDS: ReadonlySet<string> = new Set(['codex-app', 'mira', 'mir', 'dsh', 'ebsd', 'minimax']);
+const NO_RAW_PASSTHROUGH_CLI_IDS: ReadonlySet<string> = new Set(['codex-app', 'mira', 'mir', 'dsh', 'ebsd', 'minimax', 'riff']);
 
 /**
  * True for a CLI with no raw-passthrough surface (see
