@@ -1208,7 +1208,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // forge readiness or an ask for that session.
   if (method === 'POST' && pathname === '/api/session-ready') return true;
   if (method === 'POST' && pathname === '/api/claude-compaction-start-v1') return true;
-  if (method === 'POST' && (pathname === '/api/asks' || pathname === '/api/asks/form-v1')) return true;
+  if (method === 'POST' && (pathname === '/api/asks' || pathname === '/api/asks/form-v1' || pathname === '/api/asks/cli-resolved')) return true;
   // The dsh-tui wrapper plugin's structured end-of-turn report (`botmux
   // __turn-idle-v2`) runs INSIDE the CLI process, so it cannot read the host
   // secret either. The handler verifies this session's rotating per-turn
@@ -9111,6 +9111,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     autoStartOnGroupJoinSeedDefault: t('daemon.auto_start_join_seed', undefined, localeForBot(cachedLarkAppId)),
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
     chatManagerEnabled: cardPrefs.chatManagerEnabled,
+    groupSecretaryEnabled: cardPrefs.groupSecretaryEnabled,
     autoStartExcludedChats: cardPrefs.autoStartExcludedChats,
     groupJoinCommandEnabled: cardPrefs.groupJoinCommandEnabled,
     groupJoinCommand: cardPrefs.groupJoinCommand,
@@ -9259,6 +9260,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
     chatManagerEnabled?: unknown;
+    groupSecretaryEnabled?: unknown;
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
     senderTag?: unknown;
     senderTagHideEmail?: unknown;
@@ -9278,6 +9280,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
     chatManagerEnabled?: boolean;
+    groupSecretaryEnabled?: boolean;
     overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
     senderTag?: boolean;
     senderTagHideEmail?: boolean;
@@ -9365,6 +9368,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   }
   if (typeof body.autoStartOnNewTopic === 'boolean') patch.autoStartOnNewTopic = body.autoStartOnNewTopic;
   if (typeof body.chatManagerEnabled === 'boolean') patch.chatManagerEnabled = body.chatManagerEnabled;
+  if (typeof body.groupSecretaryEnabled === 'boolean') patch.groupSecretaryEnabled = body.groupSecretaryEnabled;
   if (body.autoStartExcludedChats !== undefined) {
     if (!Array.isArray(body.autoStartExcludedChats) || body.autoStartExcludedChats.some(id => typeof id !== 'string' || !/^oc_[a-zA-Z0-9]+$/.test(id.trim()))) {
       return jsonRes(res, 400, { ok: false, error: 'invalid_auto_start_excluded_chats' });

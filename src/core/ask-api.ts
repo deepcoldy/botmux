@@ -6,10 +6,13 @@
  */
 
 import type { ServerResponse } from 'node:http';
-import { registerAsk } from './ask-broker.js';
+import { registerAsk, resolveHookAskFromCli } from './ask-broker.js';
 import { parseOption, parseAskQuestions } from './ask-questions.js';
 export { parseAskQuestions } from './ask-questions.js';
-import type { CreateAskInput, AskResult, AskOption, AskQuestion } from './ask-types.js';
+import type { CreateAskInput, AskResult, AskOption, AskQuestion, CliPermissionOutcome } from './ask-types.js';
+import { isCliPermissionOutcome, shouldReturnAskStartupNotReady } from './ask-types.js';
+import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
+import type { VcMeetingLiveManagedOrigin } from '../services/vc-meeting-send-policy.js';
 import { CODEX_ASYNC_ASK_ORIGIN, parseCodexAsyncUserInput, type CodexAsyncUserInput } from '../services/codex-async-user-input.js';
 
 export interface AskApiBody {
@@ -174,6 +177,77 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     return { error: 'unsupported_fields' };
   }
   return parsed;
+}
+
+/** Body of `POST /api/asks/cli-resolved`: which hook ask (by its per-invocation
+ *  requestId) the asking CLI ended itself, and how. Session ownership is proven
+ *  by the route's auth, not by these fields. */
+export function parseCliResolvedBody(raw: unknown):
+  { sessionId: string; requestId: string; outcome: CliPermissionOutcome } | { error: 'bad_body' } {
+  const body = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
+  const { sessionId, requestId, outcome } = body;
+  if (typeof sessionId !== 'string' || !sessionId || typeof requestId !== 'string' || !requestId
+    || !isCliPermissionOutcome(outcome)) {
+    return { error: 'bad_body' };
+  }
+  return { sessionId, requestId, outcome };
+}
+
+/** The daemon session a `cli-resolved` report names, as the route sees it. */
+export interface CliResolvedSession {
+  larkAppId: string;
+  sessionId: string;
+  receiverSession: boolean;
+  liveOrigin?: VcMeetingLiveManagedOrigin;
+}
+
+/**
+ * `POST /api/asks/cli-resolved`. Gated in the same order as `/api/asks`: the
+ * startup window first, then host HMAC or the named session's live origin
+ * capability, and only after that is a missing session revealed. The ask is
+ * looked up under the authenticated session, never a caller-supplied app id.
+ * An ask the daemon doesn't know (yet) answers 409 so the hook can retry while
+ * the card's own POST is still registering.
+ */
+export function handleCliResolvedRequest(raw: unknown, ctx: {
+  trustedHost: boolean;
+  sessionsRestored: boolean;
+  findSession: (sessionId: string) => CliResolvedSession | undefined;
+}): { status: number; body: Record<string, unknown> } {
+  const parsed = parseCliResolvedBody(raw);
+  if ('error' in parsed) return { status: 400, body: { ok: false, error: parsed.error } };
+  const claims = raw as Record<string, unknown>;
+  const session = ctx.findSession(parsed.sessionId);
+  if (shouldReturnAskStartupNotReady({ hasSession: !!session, sessionsRestored: ctx.sessionsRestored })) {
+    return { status: 503, body: { ok: false, error: 'startup_not_ready' } };
+  }
+  if (!ctx.trustedHost) {
+    const claimedAttempt = typeof claims.originDispatchAttempt === 'number'
+      && Number.isSafeInteger(claims.originDispatchAttempt) && claims.originDispatchAttempt > 0
+      ? claims.originDispatchAttempt
+      : undefined;
+    const verified = authorizeSessionScopedIpc({
+      trustedHost: false,
+      sessionExists: !!session,
+      receiverSession: !!session?.receiverSession,
+      allowReceiver: false,
+      sessionId: parsed.sessionId,
+      liveOrigin: session?.liveOrigin,
+      claimedCapability: typeof claims.originCapability === 'string' ? claims.originCapability : undefined,
+      claimedTurnId: typeof claims.originTurnId === 'string' ? claims.originTurnId : undefined,
+      claimedDispatchAttempt: claimedAttempt,
+    });
+    if (!verified.ok) return { status: 403, body: { ok: false, error: verified.error } };
+  }
+  if (!session) return { status: 404, body: { ok: false, error: 'session_not_found' } };
+  const outcome = resolveHookAskFromCli({
+    larkAppId: session.larkAppId,
+    sessionId: session.sessionId,
+    requestId: parsed.requestId,
+    outcome: parsed.outcome,
+  });
+  if (outcome === 'not_found') return { status: 409, body: { ok: false, error: 'ask_not_found' } };
+  return { status: 200, body: { ok: true, outcome } };
 }
 
 /** The response, not IncomingMessage.close, tracks the long-poll lifetime:

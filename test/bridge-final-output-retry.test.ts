@@ -23,6 +23,9 @@ import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { outputSnapshot } from '../src/services/universal-output-handoff.js';
 import { OutputDeliveryJournal, outputDeliveryJournal } from '../src/services/output-delivery-journal.js';
 import { OutputDeliveryCoordinator } from '../src/services/output-delivery-coordinator.js';
+import { LocalAddressOutboundError, prepareLocalAddressContent } from '../src/im/lark/local-address-policy.js';
+import { localAddressContextForBot } from '../src/im/lark/local-address-context.js';
+import { localHttpOrigin } from '../src/core/dashboard-url.js';
 import { finalOutputSnapshot } from '../src/services/final-output-handoff.js';
 import { FinalOutputHandoffStore } from '../src/services/final-output-handoff-store.js';
 import { FinalOutputHandoffHost, FinalOutputRejectedError } from '../src/services/final-output-handoff-host.js';
@@ -102,6 +105,7 @@ vi.mock('../src/config.js', async () => {
   return {
     config: {
       web: { externalHost: 'localhost' },
+      dashboard: { externalHost: 'localhost', port: 7891 },
       // Concurrent checkouts/processes must never reset each other's journals.
       session: { dataDir: mkdtempSync(join(tmpdir(), 'bridge-final-output-')) },
       daemon: { backendType: 'tmux', cliId: 'claude-code' },
@@ -609,7 +613,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       deliver(ds, { ...finalOutputMsg(), content: `Submitted. ![Receipt](${path})` }, 'tag', 0);
       await vi.advanceTimersByTimeAsync(30_000);
       expect(uploadImageMock).not.toHaveBeenCalled();
-      expect(sessionReply.mock.calls[0][1]).toContain(path);
+      expect(sessionReply.mock.calls[0][1]).not.toContain(path);
+      expect(sessionReply.mock.calls[0][1]).toContain('Receipt');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -2161,6 +2166,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       closeSession: vi.fn(),
     });
     const ds = makeDs();
+    ds.workingDir = ds.session.workingDir = '/custom/project';
     const target = {
       fileToken: 'doc-token-230099',
       fileType: 'docx',
@@ -2173,13 +2179,21 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       'turn-1': { ...target, turnId: 'turn-1' },
     };
     const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
-    deliver(ds, finalOutputMsg(), 'tag', 0);
+    const content = '[协作技能](/home/alice/.agents/skills/a/SKILL.md)\n/custom/project/src/index.ts\nhttp://localhost:3000/report\nhttps://example.com/home/page?file=/tmp/x';
+    deliver(ds, { ...finalOutputMsg(), content }, 'tag', 0);
     await vi.advanceTimersByTimeAsync(30_000);
 
     // The comment is retried on the document surface; no IM notice is posted.
     expect(replyToDocCommentMock).toHaveBeenCalledTimes(2);
     expect(replyToDocCommentMock.mock.calls[0][0]).toBe('app_test');
     expect(replyToDocCommentMock.mock.calls[1][0]).toBe('app_test');
+    const published = replyToDocCommentMock.mock.calls[0][3];
+    expect(published).not.toContain('/home/alice/');
+    expect(published).not.toContain('/custom/project/');
+    expect(published).not.toContain('localhost');
+    expect(published).toContain('src/index.ts');
+    expect(published).toContain('https://example.com/home/page?file=/tmp/x');
+    expect(replyToDocCommentMock.mock.calls[1][3]).toBe(published);
     expect(sessionReply).not.toHaveBeenCalled();
     expect(ds.agentAttention).not.toMatchObject({ kind: 'blocked' });
   });
@@ -2734,19 +2748,21 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(clearPendingDraft).toHaveBeenCalledOnce();
   });
 
-  it.each(['revoked_after_receipt', 'card_rejected'] as const)('settles the real handoff delivery pipeline for %s', async scenario => {
+  it.each(['revoked_after_receipt', 'card_rejected', 'local_address_rejected'] as const)('settles the real handoff delivery pipeline for %s', async scenario => {
     const previousDir = config.session.dataDir;
     const directory = mkdtempSync(join(tmpdir(), 'handoff-real-pool-'));
     (config.session as any).dataDir = directory;
     const store = new FinalOutputHandoffStore(directory, 'cli_test');
     try {
       const ds = makeDs(); ds.adoptedFrom = undefined; ds.larkAppId = 'cli_test'; ds.scope = 'thread';
-      const output = { sessionId: ds.session.sessionId, turnId: 'om_handoff', lastUuid: 'handoff-native', content: 'final answer' };
+      ds.workingDir = '/custom/project';
+      const output = { sessionId: ds.session.sessionId, turnId: 'om_handoff', lastUuid: 'handoff-native', content: 'final answer /custom/project/src/index.ts' };
       const snapshot = finalOutputSnapshot(ds.larkAppId, output);
       store.accept(snapshot, { mode: 'thread', rootMessageId: 'om_original_target' }, 'ou_original_requester');
       let allowed = true;
       const sessionReply = vi.fn(async (_root: string, body: string, kind: string) => {
         if (scenario === 'card_rejected' && kind === 'interactive') throw { response: { data: { code: 230099, msg: 'rejected card' } } };
+        if (scenario === 'local_address_rejected' && kind === 'interactive') throw new LocalAddressOutboundError();
         if (scenario === 'revoked_after_receipt') allowed = false;
         return kind === 'text' ? 'om_aux_notice' : 'om_known_final';
       });
@@ -2767,6 +2783,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       const run = host.pump();
       await vi.advanceTimersByTimeAsync(100);
       await run;
+      expect(sessionReply.mock.calls[0][1]).not.toContain('/custom/project/');
+      expect(sessionReply.mock.calls[0][1]).toContain('src/index.ts');
       if (scenario === 'revoked_after_receipt') {
         expect(sessionReply).toHaveBeenCalledTimes(1);
         expect(store.read(snapshot.intentId)).toMatchObject({ state: 'delivered', messageId: 'om_known_final' });
@@ -2779,6 +2797,102 @@ describe('Bridge final_output delivery (P2 retry)', () => {
         expect(ledger.read({ larkAppId: ds.larkAppId, sessionId: output.sessionId, turnId: output.turnId })?.publication).toBeUndefined();
       }
     } finally { store.close(); (config.session as any).dataDir = previousDir; rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  // Feishu's write boundary judges every body; this stands in for it here.
+  const providerBoundary = async (_root: string, body: string, kind: string, appId: string) => {
+    prepareLocalAddressContent(body, kind, localAddressContextForBot(appId));
+    return 'om_frozen_final';
+  };
+  // A Dashboard root is a host page only on the Dashboard's own port.
+  const dashboardRoot = () => `${localHttpOrigin(config.dashboard.externalHost, config.dashboard.port)}/`;
+  const dashboardPort = config.dashboard.port;
+  const moveDashboard = () => { (config.dashboard as any).port = dashboardPort + 1; };
+
+  it('replays a frozen handoff card whose Dashboard link was vetted before the Dashboard moved', async () => {
+    const previousDir = config.session.dataDir;
+    const directory = mkdtempSync(join(tmpdir(), 'handoff-host-link-'));
+    (config.session as any).dataDir = directory;
+    vi.stubEnv('HOME', directory);
+    const store = new FinalOutputHandoffStore(directory, 'cli_test');
+    try {
+      const ds = makeDs(); ds.adoptedFrom = undefined; ds.larkAppId = 'cli_test'; ds.scope = 'thread';
+      const output = { sessionId: ds.session.sessionId, turnId: 'om_host_link', lastUuid: 'host-link-native', content: 'final answer' };
+      const snapshot = finalOutputSnapshot(ds.larkAppId, output);
+      store.accept(snapshot, { mode: 'thread', rootMessageId: 'om_original_target' }, 'ou_original_requester');
+      // The previous daemon froze a card with its Dashboard button and exited before writing it.
+      const frozen = JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'final answer' },
+        { tag: 'button', text: { tag: 'plain_text', content: 'Dashboard' }, behaviors: [{ type: 'open_url', default_url: dashboardRoot() }] }] } });
+      const prior = store.claim(snapshot.intentId)!;
+      store.freezeTransport(snapshot.intentId, prior.claim!, { content: frozen, msgType: 'interactive', providerUuid: 'frozen-final-uuid' });
+      store.release(snapshot.intentId, prior.claim!, Date.now());
+      moveDashboard();
+      expect(() => prepareLocalAddressContent(frozen, 'interactive', localAddressContextForBot(ds.larkAppId))).toThrow(LocalAddressOutboundError);
+      const sessionReply = vi.fn(providerBoundary);
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js');
+      const host = new FinalOutputHandoffHost(store, {
+        available: () => 'ready', error: vi.fn(), knownReceipt: () => undefined,
+        deliver: (record, control) => {
+          const context: any = { record, store, control, suppressed: false };
+          return new Promise((resolve, reject) => __testOnly_deliverFinalOutput(ds, { type: 'final_output', ...output }, 'handoff-test', 0,
+            (ok, id) => context.rejectedReason ? reject(new FinalOutputRejectedError(context.rejectedReason))
+              : ok && id ? resolve({ messageId: id }) : reject(new Error('unconfirmed')),
+            control.owns, record.target, undefined, undefined, undefined, context));
+        },
+      });
+      const run = host.pump();
+      await vi.advanceTimersByTimeAsync(100);
+      await run;
+      expect(sessionReply).toHaveBeenCalledOnce();
+      expect(sessionReply.mock.calls[0][1]).toBe(frozen);
+      expect(store.read(snapshot.intentId)).toMatchObject({ state: 'delivered', messageId: 'om_frozen_final' });
+    } finally {
+      (config.dashboard as any).port = dashboardPort; vi.unstubAllEnvs();
+      store.close(); (config.session as any).dataDir = previousDir; rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('replays a frozen legacy final whose Dashboard link was vetted before the Dashboard moved', async () => {
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    const ds = makeDs(); ds.larkAppId = 'cli_test';
+    const home = mkdtempSync(join(tmpdir(), 'legacy-host-link-'));
+    vi.stubEnv('HOME', home);
+    let restarted = false;
+    const sessionReply = vi.fn(async (root: string, body: string, kind: string, appId: string) => {
+      if (!restarted) throw new Error('socket hang up');
+      return providerBoundary(root, body, kind, appId);
+    });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const message = { ...finalOutputMsg(), sessionId: ds.session.sessionId };
+    const journal = new OutputDeliveryJournal(config.session.dataDir, 'cli_test');
+    try {
+      const record = journal.accept(outputSnapshot('cli_test', message), { kind: 'im', context: { target: { mode: 'thread', rootMessageId: 'om_root' } }, chatId: ds.chatId, chatType: ds.chatType });
+      const coordinator = new OutputDeliveryCoordinator(journal);
+      const dashboardUrl = dashboardRoot();
+      const withButton = (content: string) => {
+        const card = JSON.parse(content);
+        (card.body?.elements ?? card.elements).push({ tag: 'button', url: dashboardUrl });
+        return JSON.stringify(card);
+      };
+      const attempt = (control: (control: any) => any) => coordinator.deliver(record, { owns: () => true, settled: vi.fn(), error: vi.fn(),
+        process: (_record, base) => new Promise(resolve => deliver(ds, message, 'probe', 0,
+          (ok, id) => resolve(ok ? { status: 'delivered', messageId: id! } : undefined), base.owns,
+          { mode: 'thread', rootMessageId: 'om_root' }, undefined, undefined, undefined, undefined, control(base))) });
+      // The previous daemon's card carried the Dashboard button; every write failed before it exited.
+      const first = attempt(base => ({ ...base, freezeTransport: (key: string, proposed: any) => base.freezeTransport(key, { ...proposed, content: withButton(proposed.content) }) }));
+      for (const ms of [0, 5_000, 15_000, 100]) await vi.advanceTimersByTimeAsync(ms);
+      await first;
+      expect(journal.read(record.id)?.state).toBe('blocked');
+      moveDashboard(); restarted = true;
+      await vi.advanceTimersByTimeAsync(6_000);
+      const callsBefore = sessionReply.mock.calls.length;
+      const second = attempt(base => base);
+      await vi.advanceTimersByTimeAsync(100); await second;
+      expect(sessionReply.mock.calls.length).toBe(callsBefore + 1);
+      expect(sessionReply.mock.lastCall![1]).toContain(dashboardUrl);
+      expect(journal.read(record.id)?.state).toBe('settled');
+    } finally { (config.dashboard as any).port = dashboardPort; vi.unstubAllEnvs(); journal.close(); rmSync(home, { recursive: true, force: true }); }
   });
 
   it('keeps a shutdown drain registration until an ordinary bridge final finishes delivery', async () => {
@@ -3785,7 +3899,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(cardJson).toContain('<at id=ou_human></at>');
   });
 
-  it('uses probe-free lexical link repair for sandboxed bridge fallback output', async () => {
+  it('removes local file destinations from sandboxed bridge fallback output', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
@@ -3809,10 +3923,12 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     const cardJson = sessionReply.mock.calls[0][1] as string;
-    expect(cardJson).toContain(`[file](/${missing})`);
+    expect(cardJson).toContain('file');
+    expect(cardJson).not.toContain(missing);
+    expect(cardJson).not.toContain('[file](');
   });
 
-  it('preserves a real home-shaped relative link in a non-isolated bridge fallback', async () => {
+  it('removes an inaccessible home-shaped relative link from non-isolated bridge output', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
@@ -3838,14 +3954,15 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       await vi.advanceTimersByTimeAsync(10);
 
       const cardJson = sessionReply.mock.calls[0][1] as string;
-      expect(cardJson).toContain(`[file](${relativeFile})`);
-      expect(cardJson).not.toContain(`[file](/${relativeFile})`);
+      expect(cardJson).toContain('file');
+      expect(cardJson).not.toContain(relativeFile);
+      expect(cardJson).not.toContain('[file](');
     } finally {
       rmSync(cwd, { recursive: true, force: true });
     }
   });
 
-  it('uses probe-free lexical link repair for read-isolated bridge fallback output', async () => {
+  it('removes local file destinations from read-isolated bridge fallback output', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
@@ -3869,7 +3986,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     const cardJson = sessionReply.mock.calls[0][1] as string;
-    expect(cardJson).toContain(`[file](/${missing})`);
+    expect(cardJson).toContain('file');
+    expect(cardJson).not.toContain(missing);
+    expect(cardJson).not.toContain('[file](');
   });
 
   it.each([
@@ -3878,7 +3997,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       ds.session.backendType = 'tmux';
       ds.initConfig = { backendType: 'riff' } as any;
     }],
-  ])('uses probe-free lexical link repair for Riff via %s', async (_source, configure) => {
+  ])('removes local file destinations for Riff via %s', async (_source, configure) => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({
       sessionReply,
@@ -3902,10 +4021,12 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.advanceTimersByTimeAsync(10);
 
     const cardJson = sessionReply.mock.calls[0][1] as string;
-    expect(cardJson).toContain(`[file](/${missing})`);
+    expect(cardJson).toContain('file');
+    expect(cardJson).not.toContain(missing);
+    expect(cardJson).not.toContain('[file](');
   });
 
-  it('uses lexical link repair when sandboxing is forced globally', async () => {
+  it('removes local file destinations when sandboxing is forced globally', async () => {
     const previous = process.env.BOTMUX_SANDBOX;
     process.env.BOTMUX_SANDBOX = '1';
     try {
@@ -3931,7 +4052,9 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       await vi.advanceTimersByTimeAsync(10);
 
       const cardJson = sessionReply.mock.calls[0][1] as string;
-      expect(cardJson).toContain(`[file](/${missing})`);
+      expect(cardJson).toContain('file');
+      expect(cardJson).not.toContain(missing);
+      expect(cardJson).not.toContain('[file](');
     } finally {
       if (previous === undefined) delete process.env.BOTMUX_SANDBOX;
       else process.env.BOTMUX_SANDBOX = previous;
