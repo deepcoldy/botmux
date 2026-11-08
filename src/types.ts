@@ -1590,6 +1590,7 @@ export interface ChatContext {
 }
 
 export interface SubstituteTriggerIdentity {
+  appId?: string;
   name?: string;
   openId?: string;
   userId?: string;
@@ -2102,7 +2103,7 @@ type DaemonToWorkerBase =
    *  the next message, with no restart IPC to refresh the snapshot. Same
    *  three-state contract (undefined = not carried → keep snapshot; null = launch
    *  with no model). It never affects the CLI already running. */
-  | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; startupCommands?: string[] | null; launchShell?: string | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string }
+  | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; linkRefMode?: 'observe' | 'enabled'; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; durablePrimaryInbox?: true; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; reasoningEffort?: import('./services/codex-reasoning-effort.js').CodexReasoningEffort | null; larkToolBinding?: boolean | null; startupCommands?: string[] | null; launchShell?: string | null; taskContinuation?: TaskContinuationDispatchMarker; turnCallerOpenId?: string; purgeUndersizedImages?: true }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
@@ -2129,7 +2130,9 @@ type DaemonToWorkerBase =
   * worker to reattach; PTY keeps its historical cold-resume behavior. */
   | { type: 'detach_for_transfer'; requestId: string }
   | { type: 'suspend' }
-  | { type: 'prompt_submitted' }
+  /** The CLI's UserPromptSubmit hook ran; the fingerprint and prefix of the
+   *  prompt it submitted, as the hook reported them. */
+  | { type: 'prompt_submitted'; fingerprint?: string; prefix?: string }
   /** Kill the CLI and respawn it with --resume. `updateWorkingDir`（可选）
    *  用于角色切换的 cwd-move respawn：respawn 前把 worker 侧 lastInitConfig
    *  收敛到新目录，让 CLI 在新 cwd 冷启动（新 CLAUDE.md/记忆索引开场注入）
@@ -2199,6 +2202,7 @@ type DaemonToWorkerBase =
   // 证据再回复 hook，避免 Claude 在 worker 重置前继续渲染真正输入框。
   // source = SessionStart 的 startup/resume/… 。
   | { type: 'session_ready'; source?: string; requestId?: string }
+  | { type: 'claude_compaction_start'; startedAtMs: number; requestId?: string }
   // 结构化「回合空闲」信号：CLI 进程内的集成（当前只有 dsh-tui 的 cordis
   // wrapper 插件，在 agent/status 落到 idle 时）经 `botmux __turn-idle-v2` 调到
   // daemon，daemon 再转给该会话的 worker → idleDetector.fireIdle()。
@@ -2236,6 +2240,8 @@ export type DaemonToWorker = DaemonToWorkerBase extends infer Message
         feedback?: import('./services/feedback-policy.js').FeedbackPolicy;
         cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1;
         terminalCardEpoch?: string;
+        /** Daemon-owned durable headless provenance, never taken from CLI env. */
+        headless?: Pick<NonNullable<Session['headless']>, 'id' | 'source'>;
         traexAutoModelRuntime?: import('./services/traex-auto-model.js').TraexAutoModelRuntimeState;
         /** Experimental, off by default: only an explicit true lets the worker
          *  suppress a failure notice after an exact acknowledged final. */
@@ -2445,6 +2451,10 @@ export type WorkerToDaemon =
    * adapter `submitted` flag qualifies. The daemon covers shared group
    * background at this boundary; terminal completion stays the fallback. */
   | { type: 'native_input_consumed'; ordinaryInteractive?: true; turnId: string; proofKind: 'codex_history_match' | 'codex_rpc_turn_start' | 'claude_transcript_user_record'; nativeSessionId?: string; nativeTurnId?: string }
+  /** The CLI's UserPromptSubmit hook submitted a prompt that is, or starts
+   * with, the text this worker wrote for this turn. Read before the model
+   * starts on it; no stand-in for `native_input_consumed`. */
+  | { type: 'prompt_submitted_input'; turnId: string }
   /** A live native terminal turn in a zero-injection session. Freeze its
    * reply destination before newer IM inputs can replace the sender. */
   | { type: 'terminal_turn_started'; turnId: string; startedAtMs: number; replyContextTurnId?: string }

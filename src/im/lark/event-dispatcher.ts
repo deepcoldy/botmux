@@ -59,7 +59,10 @@ import { autoInviteOwnerOnGroupJoin } from '../../services/groups-store.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
 import { tryHandleChatTabsCommand } from './chat-tabs-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
+import { tryHandleSecretaryCommand } from './secretary-command.js';
+import { observeGroupSecretaryMessage } from '../../services/group-secretary-runtime.js';
 import { isChatManager } from '../../services/chat-manager.js';
+import { resolveSubstituteAppMentions, substituteMentionIdentities } from './substitute-app-mentions.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled, clearPending, markPendingDelivered, tryReserveOwnerDmSlot, releaseOwnerDmSlot, claimThrottleNotice, holdPendingMessage } from './grant-pending.js';
@@ -1946,10 +1949,12 @@ export function mentionsAnotherMember(larkAppId: string, message: any): boolean 
 }
 
 function substituteTargetMatchesMention(target: {
+  appId?: string;
   openId?: string;
   userId?: string;
   unionId?: string;
 }, mention: MentionIdentity): boolean {
+  if (target.appId) return mention.appId === target.appId;
   return Boolean(
     (target.openId && mention.openId === target.openId) ||
     (target.userId && mention.userId === target.userId) ||
@@ -1979,23 +1984,28 @@ export function resolveSubstituteTrigger(
 function resolveSubstituteMention(
   cfg: SubstituteModeConfig | undefined,
   message: any,
+  botTargetsOnly = false,
 ): import('../../types.js').SubstituteTrigger | undefined {
   if (!cfg?.enabled || !cfg.targets?.length) return undefined;
   const messageType = message?.message_type ?? message?.msg_type;
   if (!SUBSTITUTE_TRIGGER_MESSAGE_TYPES.has(messageType)) return undefined;
-  const mentions = extractMentionIdentities(message);
+  const mentions = substituteMentionIdentities(message);
   for (const mention of mentions) {
-    const target = cfg.targets.find(t => substituteTargetMatchesMention(t, mention));
+    const target = cfg.targets.find(t =>
+      (!botTargetsOnly || !!t.appId)
+      && substituteTargetMatchesMention(t, mention));
     if (!target) continue;
     return {
       target: {
         name: target.name,
+        ...(target.appId ? { appId: target.appId } : {}),
         openId: target.openId,
         userId: target.userId,
         unionId: target.unionId,
       },
       observedMention: {
         name: mention.name,
+        ...(mention.appId ? { appId: mention.appId } : {}),
         openId: mention.openId,
         userId: mention.userId,
         unionId: mention.unionId,
@@ -2017,6 +2027,74 @@ function isSubstituteAllowedChat(cfg: { chats?: string[]; excludedChats?: string
   if (isSubstituteExcludedChat(cfg, chatId)) return false;
   if (!cfg?.chats?.length) return true;
   return cfg.chats.includes(chatId);
+}
+
+/** App ID targets only match after REST maps the event's observer open_ids.
+ *  Look them up wherever an open_id target would reach a substitute gate:
+ *  the excluded / per-chat off / keyword-miss hard drops, or a trigger. */
+function needsSubstituteAppLookup(
+  larkAppId: string,
+  cfg: SubstituteModeConfig,
+  message: any,
+  explicitlyMentionedThisBot: boolean,
+  botSender: boolean,
+): boolean {
+  const chatId = message.chat_id;
+  if (isSubstituteExcludedChat(cfg, chatId)) return !explicitlyMentionedThisBot;
+  const keywordsHit = matchesSubstituteKeywords(cfg.keywords, message);
+  if (!isSubstituteAllowedChat(cfg, chatId)) return !explicitlyMentionedThisBot && !keywordsHit;
+  if (!explicitlyMentionedThisBot) return true;
+  // Bot senders that @ this bot keep the ordinary bot-to-bot path.
+  return !botSender && keywordsHit && isSubstituteEnabledForChat(larkAppId, chatId);
+}
+
+type SubstituteMessageRouteInput = {
+  larkAppId: string;
+  message: any;
+  chatType: string;
+  ownsSession: () => boolean;
+};
+
+type SubstituteMessageRoute =
+  | { kind: 'skip' }
+  | { kind: 'drop'; reason: string }
+  | { kind: 'trigger'; trigger: import('../../types.js').SubstituteTrigger; chatMode: 'group' | 'topic' };
+
+/** Bot senders that did not @ this bot, App ID targets only. Gates and their
+ *  order mirror the human path: excluded, per-chat off and keyword-miss drops
+ *  come before the slash exemption, the allowlist and the chat mode. Only the
+ *  chat mode needs I/O, so the queue re-runs this before delivery. */
+function decideSubstituteMessageRoute(
+  input: SubstituteMessageRouteInput,
+  chatMode?: string,
+): SubstituteMessageRoute | { kind: 'needs-chat-mode' } {
+  const { larkAppId, message } = input;
+  const chatId = message.chat_id;
+  const cfg = getBot(larkAppId).config.substituteMode;
+  const mention = input.chatType === 'group' ? resolveSubstituteMention(cfg, message, true) : undefined;
+  if (!cfg || !mention) return { kind: 'skip' };
+  if (isSubstituteExcludedChat(cfg, chatId)) return { kind: 'drop', reason: 'excluded chat' };
+  const allowed = isSubstituteAllowedChat(cfg, chatId);
+  if (allowed && !isSubstituteEnabledForChat(larkAppId, chatId)) return { kind: 'drop', reason: 'per-chat off' };
+  const rawText = extractMessageTextForRouting(message);
+  const stripped = rawText ? stripLeadingMentions(rawText.trim(), message.mentions ?? []).trim() : '';
+  if (stripped.startsWith('/')) return { kind: 'skip' };
+  if (!matchesSubstituteKeywords(cfg.keywords, message)) return { kind: 'drop', reason: 'keyword miss' };
+  if (!allowed) return { kind: 'skip' };
+  if (chatMode === undefined) return { kind: 'needs-chat-mode' };
+  if (chatMode !== 'group' && (chatMode !== 'topic' || cfg.topicGroups === false)) return { kind: 'skip' };
+  if (chatMode === 'topic' && cfg.topicActiveSessionTrigger === false && input.ownsSession()) {
+    return { kind: 'drop', reason: 'active topic' };
+  }
+  return { kind: 'trigger', trigger: mention, chatMode };
+}
+
+async function resolveSubstituteMessageRoute(input: SubstituteMessageRouteInput): Promise<SubstituteMessageRoute> {
+  const route = decideSubstituteMessageRoute(input);
+  if (route.kind !== 'needs-chat-mode') return route;
+  // Re-run every gate on the config current after the live lookup.
+  const current = decideSubstituteMessageRoute(input, await getChatMode(input.larkAppId, input.message.chat_id));
+  return current.kind === 'needs-chat-mode' ? { kind: 'skip' } : current;
 }
 
 // ─── Permission gates ────────────────────────────────────────────────────
@@ -5221,7 +5299,7 @@ export function createLarkEventDispatcherRuntime(
     if (!rawText) return false;
     const text = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
     if (/^\/introduce(?:\s|$)/i.test(text)) return true;
-    const match = /^\/(reply-mode|tabs?|mention-mode|substitute|grant|revoke|invite)(?:\s|$)/i.exec(text);
+    const match = /^\/(reply-mode|tabs?|mention-mode|secretary|substitute|grant|revoke|invite)(?:\s|$)/i.exec(text);
     if (!match) return false;
     const command = match[1]!.toLowerCase();
     if (message.chat_type !== 'p2p' && !isBotMentioned(larkAppId, message, senderOpenId)) {
@@ -5244,7 +5322,7 @@ export function createLarkEventDispatcherRuntime(
     primary?: PrimaryProcessContext,
   ): Promise<DurableLarkCanonicalHandlerResult | void> {
     try {
-      const message = data.message;
+      let message = data.message;
       const sender = data.sender;
       if (!message) return;
 
@@ -5288,6 +5366,8 @@ export function createLarkEventDispatcherRuntime(
       // 编辑事件走 processMessageUpdatedEvent 时已按「确认过的群类型」采集过（或判定不采集），
       // 这里不再二次处理，避免用回落猜测的 chat_type 把查不到群类型的编辑也收进去。
       if (chatType === 'group' && !data.__groupContextHandled) ingestGroupContextEvent(larkAppId, data);
+      // 群秘书旁听（/secretary on 的群）：只喂判定引擎，不改变下面的唤醒 / 权限判定，永不抛出。
+      if (chatType === 'group') observeGroupSecretaryMessage(data);
 
       // Bot-originated messages — bots historically only post inside threads
       // (their own thread replies). With chat-scope sessions a bot can also
@@ -5301,6 +5381,21 @@ export function createLarkEventDispatcherRuntime(
       // 日志。
       const senderType = sender?.sender_type;
       const isBotSenderType = senderType === 'app' || senderType === 'bot';
+      const appTargets = getBot(larkAppId).config.substituteMode;
+      const selfOpenId = getBot(larkAppId).botOpenId;
+      if (appTargets?.enabled && appTargets.targets.some(target => target.appId)
+          && chatType === 'group'
+          && sender?.sender_id?.open_id !== selfOpenId
+          && sender?.sender_id?.app_id !== larkAppId
+          && SUBSTITUTE_TRIGGER_MESSAGE_TYPES.has(message.message_type ?? message.msg_type)
+          && extractMentionIdentities(message).some(mention =>
+            mention.openId && !mention.appId && mention.openId !== 'all' && mention.openId !== selfOpenId)
+          && needsSubstituteAppLookup(
+            larkAppId, appTargets, message,
+            isBotMentioned(larkAppId, message, sender?.sender_id?.open_id), isBotSenderType)) {
+        message = await resolveSubstituteAppMentions(larkAppId, message);
+        data = { ...data, message };
+      }
       if (isBotSenderType) {
         const senderOpenId = sender.sender_id?.open_id ?? sender.sender_id?.app_id;
         // When Feishu gave us only an app_id (no open_id), this bot sender's
@@ -5308,7 +5403,7 @@ export function createLarkEventDispatcherRuntime(
         // the matcher must fail closed on open_id-based exclusion. Realtime
         // events normally carry open_id; the app_id fallback is the rare case.
         const senderIdentityUnverified = !sender.sender_id?.open_id && !!sender.sender_id?.app_id;
-        const isSelfMessage = senderOpenId === getBot(larkAppId).botOpenId;
+        const isSelfMessage = senderOpenId === getBot(larkAppId).botOpenId || senderOpenId === larkAppId;
         // Self messages: learn our OWN union_id from the echo first (the only
         // reliable source — see bot-union-ids-store; reported to the platform
         // on heartbeat for the team roster), then only echoed `/close` matters.
@@ -5388,7 +5483,27 @@ export function createLarkEventDispatcherRuntime(
             .catch(err => logger.error(`Error handling bot message listener event: ${err}`));
           return;
         }
-        // Foreign bot: only route on @mention of us — with one exception.
+        const explicitlyMentionedThisBot = isBotMentioned(larkAppId, message, undefined);
+        const substituteDecision = !explicitlyMentionedThisBot && chatType === 'group'
+            && resolveSubstituteMention(getBot(larkAppId).config.substituteMode, message, true)
+          ? await decideRoutingWithSource(larkAppId, message)
+          : undefined;
+        const substituteRoute = substituteDecision
+          ? await resolveSubstituteMessageRoute({
+              larkAppId, message, chatType,
+              ownsSession: () => handlers.isSessionOwner?.(substituteDecision.anchor, larkAppId) ?? false,
+            })
+          : undefined;
+        if (substituteRoute?.kind === 'drop') {
+          logger.info(
+            `[substitute:${larkAppId}] ${substituteRoute.reason} — dropping bot @App ID target message ` +
+            `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
+          );
+          return;
+        }
+        const substituteTrigger = substituteRoute?.kind === 'trigger' ? substituteRoute.trigger : undefined;
+        // Direct mentions and configured bot substitutes share sender authorization.
+        // Other messages may still opt into new-topic auto-start below.
         //
         // 主动开工 — 场景② (bot sender): 「话题群新话题自动开工」(autoStartOnNewTopic)
         // 覆盖到「其他机器人开的新话题」。人分支在 3271 对非 @ 的话题群新话题种子做
@@ -5404,7 +5519,7 @@ export function createLarkEventDispatcherRuntime(
         //
         // 收到 im:message.group_msg.include_bot:read 推来的「其他用户/机器人发的群消息」后，
         // 只有满足形态门才免 @ 自动开工；否则保持原有「未 @ 即忽略」语义。
-        if (!isBotMentioned(larkAppId, message, undefined)) {
+        if (!explicitlyMentionedThisBot && !substituteTrigger) {
           if (getBot(larkAppId).config.autoStartOnNewTopic === true && !getBot(larkAppId).config.autoStartExcludedChats?.includes(chatId) && chatType === 'group') {
             const seedDecision = await decideRoutingWithSource(larkAppId, message);
             // P3 — 镜像人分支「话题群 → 普通群 (reverse conversion)」那道 forceRefresh
@@ -5498,7 +5613,7 @@ export function createLarkEventDispatcherRuntime(
           }
           return;
         }
-        const decision = await decideRoutingWithSource(larkAppId, message);
+        const decision = substituteDecision ?? await decideRoutingWithSource(larkAppId, message);
         const ctx = { scope: decision.scope, anchor: decision.anchor };
         // Legacy /t provenance backfill reads an immutable root message and may
         // persist a marker. Keep that state mutation behind the same talk gate
@@ -5514,7 +5629,7 @@ export function createLarkEventDispatcherRuntime(
         // 写入，顺序反了会给本就能说话的人白落一条授权 + 一张「已获授权」卡。排在发送方自己的
         // talk 闸之前：授权对象是被点名者，与这条 bot 消息能否路由无关。durable primary 不做
         // 授权类副作用（与授权申请卡同口径），跳过。
-        if (!primary) {
+        if (!primary && !substituteTrigger) {
           await applyDelegatedGrants(larkAppId, message, {
             chatType,
             senderIds: [sender.sender_id?.open_id, sender.sender_id?.app_id],
@@ -5537,21 +5652,26 @@ export function createLarkEventDispatcherRuntime(
         // brand-new {thread, messageId} anchor. forceTopicApplied also suppresses
         // the shared-topic fold below — a `/t` seed wins over shared, same
         // precedence as the human path.
-        const forcedTopic = await maybeApplyForceTopicOverride(ctx, message, messageId, larkAppId, handlers.validateTopicHeader);
+        const forcedTopic = substituteTrigger
+          ? false
+          : await maybeApplyForceTopicOverride(ctx, message, messageId, larkAppId, handlers.validateTopicHeader);
         if (forcedTopic) {
           logger.info(`[/t] Force-topic override (bot sender): msg=${messageId.substring(0, 12)} → thread-scope, anchor=msg`);
         }
         const ownsThreadSession = ctx.scope === 'thread'
           ? (handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false)
           : false;
-        let replyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
-          larkAppId, chatId, chatType, message, routing: ctx, forceTopicApplied: forcedTopic, mentionedThisBot: botTalk.allowed, ownsThreadSession,
-          answeredRootAtTopLevel: root => handlers.chatSessionAnsweredRootAtTopLevel?.(root, chatId, larkAppId) ?? false,
-        });
-        if (!replyRootId) {
-          replyRootId = await maybeApplySharedTopicSeed({
-            larkAppId, chatId, chatType, message, senderOpenId, messageId, routing: ctx, forceTopicApplied: forcedTopic,
+        let replyRootId: string | undefined;
+        if (!substituteTrigger) {
+          replyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
+            larkAppId, chatId, chatType, message, routing: ctx, forceTopicApplied: forcedTopic, mentionedThisBot: botTalk.allowed, ownsThreadSession,
+            answeredRootAtTopLevel: root => handlers.chatSessionAnsweredRootAtTopLevel?.(root, chatId, larkAppId) ?? false,
           });
+          if (!replyRootId) {
+            replyRootId = await maybeApplySharedTopicSeed({
+              larkAppId, chatId, chatType, message, senderOpenId, messageId, routing: ctx, forceTopicApplied: forcedTopic,
+            });
+          }
         }
         // Foreign-bot @mention gate: apply the same vetted-peer/talk-only
         // boundary to chat scope, regular-group threads, and native topic
@@ -5569,6 +5689,7 @@ export function createLarkEventDispatcherRuntime(
         //
         // 唯一留在闸门里的 bot 专属逻辑是下面的 cross-ref 冷启动自愈：它不是一条
         // 授权来源，而是「同部署兄弟 bot 的身份还没学到」这个**识别**问题的补救。
+        let siblingAuthorized = false;
         if (!botTalk.allowed) {
           // 黑名单 bot：静默 return，不做 sibling 冷启动自愈（否则被黑的同部署
           // 兄弟 bot 会经这条识别补救旁路绕过否决腿直接路由）、不发授权卡。
@@ -5588,6 +5709,7 @@ export function createLarkEventDispatcherRuntime(
           const sibling = await resolveSiblingBotBySenderOpenId(larkAppId, chatId, senderOpenId)
             .catch((err): { ok: false; reason: string } => ({ ok: false, reason: `resolve_threw: ${err?.message ?? String(err)}` }));
           if (sibling.ok) {
+            siblingAuthorized = true;
             // Persist the newly-proven mapping so subsequent @s from this
             // sibling hit isKnownPeerBot directly (no live API roundtrip).
             updateBotOpenIdCrossRef(config.session.dataDir, larkAppId, [
@@ -5601,23 +5723,46 @@ export function createLarkEventDispatcherRuntime(
             return;
           }
         }
+        if (substituteTrigger && substituteRoute?.kind === 'trigger' && substituteRoute.chatMode === 'group') {
+          ctx.scope = 'chat';
+          ctx.anchor = chatId;
+          replyRootId = (message.root_id && message.thread_id) ? message.root_id : messageId;
+        }
         if (chatType === 'p2p' && forcedTopic) {
           recordP2pForceTopicRoot(larkAppId, messageId, chatId);
         }
         logger.info(`Bot-to-bot @mention detected (scope=${ctx.scope}): routing to handleThreadReply`);
-        const routedCtx = { ...ctx, chatId, messageId, chatType, larkAppId, replyRootId };
-        // Serialize per anchor — a sub-bot dispatched a /repo prime + kickoff
-        // back-to-back into this thread must be handled in order, not raced.
+        const routedCtx = { ...ctx, chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger };
+        // Only substitute turns add a post-wait check; ordinary direct mentions
+        // retain their existing delivery path and downstream permission gates.
+        const deliverBotMessage = async () => {
+          if (substituteRoute?.kind === 'trigger') {
+            const currentTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
+            if (currentTalk.reason === 'blocked' || (!currentTalk.allowed && !siblingAuthorized)) {
+              logger.info(`[substitute:${larkAppId}] sender lost talk access while queued msg=${messageId.substring(0, 12)}`);
+              return;
+            }
+            const current = decideSubstituteMessageRoute({
+              larkAppId, message, chatType,
+              ownsSession: () => handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false,
+            }, substituteRoute.chatMode);
+            if (current.kind !== 'trigger') {
+              logger.info(`[substitute:${larkAppId}] App ID route changed while queued (${current.kind}) msg=${messageId.substring(0, 12)}`);
+              return;
+            }
+            routedCtx.substituteTrigger = current.trigger;
+          }
+          await handlers.handleThreadReply(data, routedCtx);
+        };
         if (primary) {
           preparePrimaryRoutingContext(routedCtx, primary);
           if (await assertPrimaryRouteOwner(routedCtx, primary) === 'retry') {
             return primaryResult(routedCtx, primary);
           }
-          await serializeByAnchor(ctx.anchor, () => handlers.handleThreadReply(data, routedCtx), 0);
+          await serializeByAnchor(ctx.anchor, deliverBotMessage, 0);
           return primaryResult(routedCtx, primary);
         }
-        void serializeByAnchor(ctx.anchor, () =>
-          handlers.handleThreadReply(data, routedCtx), 0)
+        void serializeByAnchor(ctx.anchor, deliverBotMessage, 0)
           .catch(err => logger.error(`Error handling bot @mention: ${err}`));
         return;
       }
@@ -5678,6 +5823,10 @@ export function createLarkEventDispatcherRuntime(
       }
 
       if (await tryHandleMentionModeCommand(larkAppId, message, senderOpenId, isAllowed)) {
+        return;
+      }
+
+      if (await tryHandleSecretaryCommand(larkAppId, message, senderOpenId, isAllowed)) {
         return;
       }
 
@@ -5872,7 +6021,8 @@ export function createLarkEventDispatcherRuntime(
         // 话题群：保持 decideRouting 的 thread-scope/话题锚点不动——替身回合
         // 直接搭该话题自己的会话（无会话则由 handleNewTopic 新开），与普通群
         // 「搭群 chat-scope 会话」同构；回复天然落回本话题，无需 replyRootId。
-        const configuredTargetId = substituteTrigger.target.openId
+        const configuredTargetId = substituteTrigger.target.appId
+          ?? substituteTrigger.target.openId
           ?? substituteTrigger.target.userId
           ?? substituteTrigger.target.unionId
           ?? 'unknown';

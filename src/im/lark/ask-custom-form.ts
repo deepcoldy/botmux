@@ -1,11 +1,15 @@
 import type { PendingAsk } from '../../core/ask-types.js';
 import { ASK_CUSTOM_MAX_LENGTH } from '../../core/ask-custom-input.js';
 import { t, type Locale } from '../../i18n/index.js';
+import { optionDescriptions } from './ask-option-descriptions.js';
 
 /** Card JSON 2.0 form: every button submits the entire draft, so changing one
- * question cannot erase text typed in another. No select_static controls. */
+ * question cannot erase text typed in another. No select_static controls.
+ * `mention` is a ready `<at>` tag placed before the first question; `descriptionCap`
+ * limits each option description (the standalone card's byte budget). */
 export function buildAskCustomForm(ask: PendingAsk, locale: Locale, confirmEmpty = false,
   prompt: (text: string) => string = text => text.replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+  extras: { mention?: string; descriptionCap?: number } = {},
 ): Record<string, unknown> {
   const elements: Array<Record<string, unknown>> = [];
   const button = (label: string, name: string, value: Record<string, string>, type = 'default') => ({
@@ -13,7 +17,7 @@ export function buildAskCustomForm(ask: PendingAsk, locale: Locale, confirmEmpty
     value: { ...value, ask_id: ask.askId, nonce: ask.nonce, custom_form: 'v1', revision: String(ask.customRevision ?? 0) },
   });
   ask.questions.forEach((q, i) => {
-    elements.push({ tag: 'markdown', content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${prompt(q.prompt)}` });
+    elements.push({ tag: 'markdown', content: `${i === 0 && extras.mention ? `${extras.mention}\n` : ''}**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${prompt(q.prompt)}` });
     const customSelected = ask.customAnswers?.[i] != null;
     const selected = new Set(customSelected ? [] : ask.selections?.[i]);
     const mark = (on: boolean) => q.multiSelect ? (on ? '☑' : '☐') : (on ? '◉' : '○');
@@ -24,6 +28,8 @@ export function buildAskCustomForm(ask: PendingAsk, locale: Locale, confirmEmpty
     if (buttons.length) elements.push({ tag: 'column_set', flex_mode: 'none', columns: [
       { tag: 'column', width: 'weighted', weight: 1, elements: buttons },
     ] });
+    const details = optionDescriptions(q, locale, extras.descriptionCap);
+    if (details) elements.push({ tag: 'markdown', text_size: 'notation', content: details.content });
     if (q.allowCustom !== false) {
       const input = { tag: 'input', name: `custom_${i}`, width: 'fill',
         max_length: ASK_CUSTOM_MAX_LENGTH, default_value: ask.customAnswers?.[i] ?? '',

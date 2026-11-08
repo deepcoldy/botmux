@@ -222,6 +222,11 @@ export interface BotConfigEditInput {
    *   - null      → 清空（删字段，回到 CLI 默认）
    */
   model?: string | null;
+  /**
+   * 机器人首次上线后私聊 owner 的欢迎语（只发一次）。undefined 不动；
+   * '-' 或空串清空。
+   */
+  welcomeMessage?: string;
   backendType?: string;
   workingDir?: string;
   /**
@@ -655,6 +660,12 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
     if (v === '-') delete out.model;
     else if (v) out.model = v;
     else delete out.model;
+  }
+
+  if (input.welcomeMessage !== undefined) {
+    const v = input.welcomeMessage.trim();
+    if (!v || v === '-') delete out.welcomeMessage;
+    else out.welcomeMessage = v;
   }
 
   if (input.backendType !== undefined) {

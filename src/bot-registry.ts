@@ -1293,6 +1293,7 @@ export interface BotDefaultOncall {
 }
 
 export interface SubstituteTarget {
+  appId?: string;
   /** App-scoped open_id. Directly comparable with Lark mention payloads. */
   openId?: string;
   /** Tenant user_id. Preferred for hand-authored config when available. */
@@ -1947,6 +1948,8 @@ export interface BotConfig {
    * identity, simply have none and fall back to the resolved allowlist.
    */
   ownerOpenId?: string;
+  /** 首次成功上线后私聊 owner 一次的欢迎语；已发送记录在 dataDir，见 services/welcome-message.ts。 */
+  welcomeMessage?: string;
   allowedChatGroups?: string[];
   /** Oncall bindings: chat_id → default workingDir. Any group member can talk; allowedUsers still gates card buttons / daemon commands. */
   oncallChats?: OncallChat[];
@@ -2418,6 +2421,12 @@ export interface BotConfig {
    * 不被此开关阻断（拆除与只读始终允许）。
    */
   chatManagerEnabled?: boolean;
+  /**
+   * 群秘书（`/secretary on`）总开关。仅当显式为 true 时，群里才能用 `/secretary on|takeover`
+   * 把本 bot 设为群秘书，后台旁听与巡检才运行。默认（undefined/false）= 关闭，老用户行为不变；
+   * `/secretary off|status` 不被此开关阻断。
+   */
+  groupSecretaryEnabled?: boolean;
   /**
    * 管家（决策看板）配置。仅 `enabled === true` 时本 bot 是管家：它的会话能用
    * `botmux board` 写看板，owner 在 Dashboard 提交的批次送进 `chatId` 群的 chat 级会话，
@@ -3649,6 +3658,10 @@ export function loadBotConfigsCached(): readonly BotConfig[] {
 }
 
 /** Pure parser: bots.json text → BotConfig[]. Exported for testing & reuse. */
+// Uncached config loads re-parse bots.json several times per turn; warn once
+// per bot and value for the life of the process.
+const warnedInvalidSubstituteAppIds = new Set<string>();
+
 export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
   let parsed: unknown;
   try {
@@ -3893,7 +3906,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // Shared normalizer (with substitute-mode-store): keeps a disabled config's
     // target list so the dashboard toggle can flip without re-entering everyone;
     // only an enabled-but-unmatchable config collapses to undefined.
-    const substituteMode: SubstituteModeConfig | undefined = normalizeSubstituteMode(entry.substituteMode);
+    const substituteMode: SubstituteModeConfig | undefined = normalizeSubstituteMode(entry.substituteMode, value => {
+      const shown = JSON.stringify(value)?.slice(0, 80);
+      const key = `${entry.larkAppId}\0${shown}`;
+      if (warnedInvalidSubstituteAppIds.has(key)) return;
+      warnedInvalidSubstituteAppIds.add(key);
+      logger.warn(`[substitute:${entry.larkAppId}] ignoring substitute target with invalid appId ${shown}`);
+    });
 
     // chatReplyModes：只保留每群显式设置，非法值丢弃。四态 chat｜chat-topic｜
     // new-topic｜shared 都保留解析。显式设置即使与当前 per-bot 默认相同也保留为覆盖；
@@ -4364,6 +4383,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       ownerOpenId: typeof entry.ownerOpenId === 'string' && entry.ownerOpenId.startsWith('ou_')
         ? entry.ownerOpenId
         : undefined,
+      welcomeMessage: typeof entry.welcomeMessage === 'string' && entry.welcomeMessage.trim()
+        ? entry.welcomeMessage.trim()
+        : undefined,
       allowedChatGroups,
       oncallChats,
       defaultOncall,
@@ -4493,6 +4515,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
       chatManagerEnabled: entry.chatManagerEnabled === true || undefined,
+      groupSecretaryEnabled: entry.groupSecretaryEnabled === true || undefined,
       // 非法的 steward 配置按关处理（不阻断 bot 启动）；Dashboard / /config 写入时已校验。
       steward: (() => {
         const parsed = normalizeStewardConfig(entry.steward);

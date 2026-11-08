@@ -12,6 +12,7 @@ import { deploymentContinuationAuthority } from '../src/core/deployment-continua
 import { ActiveTurnAuthority, sameTrustedPrincipal } from '../src/core/active-turn-authority.js';
 import { currentGatewayCallerOpenId } from '../src/core/gateway-turn-caller.js';
 import { isUnsentInputReplayable } from '../src/services/unsent-input-journal.js';
+import { WrittenInputLedger } from '../src/services/prompt-submission-match.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { loadWorkerPoolMessageHandlers } from './helpers/worker-pool-message-harness.js';
 import { cancelDeploymentContinuation, claimDeploymentContinuation, deploymentContinuationCandidate, recordDeploymentContinuation } from '../src/services/deployment-continuation.js';
@@ -44,7 +45,7 @@ const nativeId = 'native-original';
 const receive = callback({ recordDeploymentContinuation, failedTurnCaller, deploymentContinuationAuthority, sessionStore: store,
   logger: { warn: vi.fn(), error: (message: string) => { throw new Error(message); } },
   trustedSessionController: () => undefined, ensureAutomaticTaskContinuationLease: () => {},
-  confirmNativeGroupContextInput: () => {},
+  confirmNativeGroupContextInput: () => {}, workflowMainWake: { onInputAccepted: () => {} },
 });
 function receipt(turnId: string) {
   receive(ds, { type: 'native_input_consumed', ordinaryInteractive: true, turnId,
@@ -100,7 +101,7 @@ function freshNativeTurn(turnId = 'om_first') {
     readIsolationOriginChannelId: undefined, sandboxRelayOutbox: undefined, currentVcMeetingImTurnOrigin: undefined,
     currentBotmuxTurnId: turnId, currentBotmuxDispatchAttempt: undefined, currentBotmuxLinkRefMode: undefined,
     randomBytes, parseDaemonIpcPort: () => undefined, writeCliPidMarker: () => {}, log: () => {}, flushPending: () => {},
-    inflightInputs: { onTurnStarted: () => {} }, isUnsentInputReplayable, restoredUnsentInputs: new Set(),
+    inflightInputs: { onTurnStarted: () => {} }, isUnsentInputReplayable, restoredUnsentInputs: new Set(), writtenInputs: new WrittenInputLedger(),
     send: (message: any) => {
       if (message.type.startsWith('managed_turn_origin')) handlePoolMessage(message);
       if (message.type === 'native_input_consumed') receive(ds, message, { workerGeneration: 1 });

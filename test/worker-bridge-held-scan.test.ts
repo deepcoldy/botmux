@@ -5,6 +5,7 @@ import {
   BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS,
   BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS,
   isHeldInCliQueue,
+  isHeldPendingMark,
   makeFingerprint,
   normaliseForFingerprint,
 } from '../src/services/bridge-turn-queue.js';
@@ -32,7 +33,7 @@ function fixture(held: boolean) {
     // worker's own values drifted (the harness resolves free names from scope).
     BRIDGE_FINGERPRINT_SCAN_MIN_INTERVAL_MS,
     BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS,
-    isHeldInCliQueue, bridgeKnownSessionIds: new Set<string>(),
+    isHeldPendingMark, bridgeKnownSessionIds: new Set<string>(),
     decideFingerprintSwitch: () => { scans += 1; return { action: 'no-match' }; },
     findJsonlContainingFingerprint: () => null, findJsonlsContainingExactContent: () => [],
     bridgeApplyFingerprintSwitch: () => {}, log: () => {},

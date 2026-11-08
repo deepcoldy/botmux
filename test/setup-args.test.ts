@@ -5,6 +5,7 @@ import {
   isScriptedSetupInvocation,
   maskAppSecret,
   parseSetupCommand,
+  resolveWelcomeMessageFile,
   SETUP_CLI_USAGE,
 } from '../src/setup/setup-args.js';
 import { applyBotConfigEdits } from '../src/setup/bot-config-editor.js';
@@ -331,6 +332,14 @@ describe('buildBotFromAddFlags', () => {
 });
 
 describe('editInputFromFlags', () => {
+  it('accepts --app-icon only with add --create-app (not compat mode, not edit)', () => {
+    expect(parseSetupCommand(['add', '--create-app', '--app-icon', '/tmp/a.png', '--allowed-users', 'o@example.com']))
+      .toMatchObject({ action: 'add', createApp: true, flags: { appIcon: '/tmp/a.png' } });
+    expect(() => parseSetupCommand(['add', '--app-icon', '/tmp/a.png'])).toThrow(/必须与 add --create-app/);
+    expect(() => parseSetupCommand(['add', '--create-app', '--compatibility-mode', '--app-icon', '/tmp/a.png'])).toThrow(/不支持 --app-icon/);
+    expect(() => editInputFromFlags({ appIcon: '/tmp/a.png' })).toThrow(/仅与 add --create-app/);
+  });
+
   it('rejects --app-name outside add --create-app', () => {
     expect(() => editInputFromFlags({ appName: 'Bot' })).toThrow(/仅与 add --create-app/);
   });
@@ -515,5 +524,51 @@ describe('parseSetupCommand --extra-scopes-file', () => {
       'add', '--app-id', 'cli_x', '--app-secret', 's', '--allowed-users', 'a@b.com', '--brand', 'feishu',
       '--open-platform-auto', '--extra-scopes-file', 's.json',
     ])).toMatchObject({ extraScopesFile: 's.json' });
+  });
+});
+
+describe('--welcome-message', () => {
+  it('is stored on add and can be set / cleared on edit', () => {
+    const add = parseSetupCommand(['add', '--create-app', '--allowed-users', 'a@b.com', '--welcome-message', '回复 /init 开始']);
+    expect(add).toMatchObject({ action: 'add', flags: { welcomeMessage: '回复 /init 开始' } });
+    const bot = buildBotFromAddFlags({ appId: 'cli_x', appSecret: 's', allowedUsers: 'a@b.com', welcomeMessage: '  hi  ' });
+    expect(bot.welcomeMessage).toBe('hi');
+
+    const base = { larkAppId: 'cli_x', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['a@b.com'], welcomeMessage: 'old' };
+    expect(applyBotConfigEdits(base, editInputFromFlags({ welcomeMessage: 'new' })).welcomeMessage).toBe('new');
+    expect(applyBotConfigEdits(base, editInputFromFlags({ welcomeMessage: '-' }))).not.toHaveProperty('welcomeMessage');
+    expect(applyBotConfigEdits(base, editInputFromFlags({ model: 'm' })).welcomeMessage).toBe('old');
+  });
+
+  it('takes a value starting with @ literally', () => {
+    const add = parseSetupCommand(['add', '--create-app', '--allowed-users', 'a@b.com', '--welcome-message', '@张三 你好']);
+    expect(add).toMatchObject({ action: 'add', flags: { welcomeMessage: '@张三 你好' } });
+    if (add.action !== 'add') throw new Error('expected add');
+    const readText = (_path: string): string => { throw new Error('should not read'); };
+    expect(resolveWelcomeMessageFile(add.flags, readText).welcomeMessage).toBe('@张三 你好');
+  });
+});
+
+describe('--welcome-message-file', () => {
+  it('is parsed on edit and read into welcomeMessage', () => {
+    const edit = parseSetupCommand(['edit', 'cli_x', '--welcome-message-file', '~/welcome.txt']);
+    expect(edit).toMatchObject({ action: 'edit', flags: { welcomeMessageFile: '~/welcome.txt' } });
+    if (edit.action !== 'edit') throw new Error('expected edit');
+    const reads: string[] = [];
+    const resolved = resolveWelcomeMessageFile(edit.flags, path => { reads.push(path); return '第一行\n第二行\n'; });
+    expect(reads).toEqual(['~/welcome.txt']);
+    expect(resolved.welcomeMessage).toBe('第一行\n第二行\n');
+    expect(resolved).not.toHaveProperty('welcomeMessageFile');
+  });
+
+  it('rejects combining it with --welcome-message, an empty file, or an unreadable file', () => {
+    expect(() => resolveWelcomeMessageFile({ welcomeMessage: 'hi', welcomeMessageFile: 'w.txt' }, () => 'x')).toThrow();
+    expect(() => resolveWelcomeMessageFile({ welcomeMessageFile: 'w.txt' }, () => ' \n ')).toThrow();
+    expect(() => resolveWelcomeMessageFile({ welcomeMessageFile: 'w.txt' }, () => { throw new Error('ENOENT'); })).toThrow('ENOENT');
+  });
+
+  it('leaves flags without a file untouched', () => {
+    const flags = { welcomeMessage: 'hi' };
+    expect(resolveWelcomeMessageFile(flags, () => { throw new Error('should not read'); })).toBe(flags);
   });
 });
