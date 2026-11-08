@@ -230,6 +230,18 @@ describe('拉群开始: the 8 steps', () => {
     expect(launch.count('createGroup')).toBe(0);
   });
 
+  it('a start failure carrying a credential is masked in the launch record and the view', async () => {
+    const { h, launch } = setup();
+    const runId = await confirmed(h);
+    const secret = 'abcdefghijklmnopqrstuvwxyz0123456789SECRET';
+    launch.failNext('startRun', new Error(`upstream said Authorization: Bearer ${secret} rejected`));
+    await h.service.launch(runId, OWNER, {});
+    const view = await settled(h.service, runId);
+    expect(view.launch!.error).toMatchObject({ step: 'start', retryable: true });
+    expect(JSON.stringify(view)).not.toContain(secret);
+    expect(readFileSync(join(base, runId, 'draft.json'), 'utf8')).not.toContain(secret);
+  });
+
   it('a clarify session that cannot be moved does not hold the launch up: run.json then names no session', async () => {
     const { h, launch } = setup();
     const runId = await confirmed(h);

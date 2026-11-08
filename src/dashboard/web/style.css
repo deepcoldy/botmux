@@ -35723,6 +35723,32 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .wfc-needs-bot ul { margin: 0; padding-left: 18px; font-size: 13px; }
 .wfc-stale { margin: 0; }
 
+/* 可搜索的 Bot 选择器（工作流草稿页）：沿用 connector-group-picker 的外观。 */
+.bot-search-picker { max-width: 420px; }
+/* 选项可能有三行（名称、CLI · appId、原因/提示）：按内容撑高，不压成等高行。 */
+.bot-search-popover .connector-group-options { display: flex; flex-direction: column; max-height: 320px; }
+.bot-search-popover .bot-search-option { flex: none; }
+.bot-search-option[data-disabled] { cursor: not-allowed; opacity: 0.62; }
+.bot-search-option[data-disabled][data-highlighted] { background: transparent; box-shadow: none; color: var(--fg); }
+.connector-group-option small.bot-search-why { color: var(--danger); white-space: normal; }
+.connector-group-option small.bot-search-hint { color: var(--warning); white-space: normal; }
+.wfd-node-bot .bot-search-picker,
+.wfd-launch-problem .bot-search-picker { margin: 4px 0; }
+
+/* 编排失败：哪个 Bot、什么原因、出路。 */
+.wfd-failure { border-color: color-mix(in srgb, var(--danger) 40%, var(--border-soft)); }
+.wfd-failure .wfd-failure-cause { margin: 0 0 6px; color: var(--danger); font-weight: 600; }
+.wfd-failure .wfd-failure-code code { font-size: 12px; }
+.wfd-failure .wfd-failure-facts { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 0 0 6px; }
+.wfd-failure .wfd-failure-facts > div { display: flex; gap: 6px; align-items: baseline; }
+.wfd-failure .wfd-failure-facts dd { margin: 0; }
+.wfd-failure .wfd-failure-raw { margin: 6px 0; }
+.wfd-failure .wfd-failure-raw pre { max-height: 240px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-size: 12px; margin: 4px 0 0; padding: 8px; background: var(--bg-soft, rgba(127,127,127,.08)); border-radius: 6px; }
+.wfd-handoffs { margin: 4px 0 8px; font-size: 13px; }
+.wfd-handoffs ul { margin: 4px 0 0; padding-left: 18px; }
+.wfd-handoff { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.wfd-handoff .wfd-actions { margin: 0; }
+
 /* 撤回区域使用独立滚动列表，避免撑长群管理面板或影响其它页面的表单样式。 */
 .group-message-recall {
   display: grid; gap: 16px; padding: 20px;

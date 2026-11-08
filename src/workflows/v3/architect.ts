@@ -244,8 +244,14 @@ function architectPlacementLines(assignment: V3ArchitectBotAssignment): string[]
   ];
 }
 
+/** Where the Architect's (only) attempt writes: its worker's pty.log,
+ *  stdout.log and stderr.log live here until the next attempt wipes it. */
+export function architectAttemptDir(runDir: string): string {
+  return join(runDir, 'architect', 'attempts', '001');
+}
+
 export async function runArchitect(input: RunArchitectInput): Promise<RunArchitectResult> {
-  const attemptDir = join(input.runDir, 'architect', 'attempts', '001');
+  const attemptDir = architectAttemptDir(input.runDir);
   const outputDir = join(attemptDir, 'work');
   const inputsPath = join(attemptDir, 'inputs.json');
   const manifestPath = join(attemptDir, 'manifest.json');

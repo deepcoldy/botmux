@@ -10207,3 +10207,36 @@ describe('worker pid record', () => {
     });
   });
 });
+
+describe('turn failure diagnostics: only a workflow draft clarify session asks its worker for them', () => {
+  const headless = { id: 'hl_draft', createdAt: '2026-11-06T00:00:00.000Z', source: 'cli' as const };
+  const initOf = () => {
+    const worker = forkMock.mock.results.at(-1)!.value;
+    return vi.mocked(worker.send).mock.calls.map(call => call[0]).find(message => message.type === 'init');
+  };
+
+  it('a draft clarify session (marker persisted on session.headless): the init asks for them', () => {
+    const ds = makeDs({ hasHistory: true, chatId: 'headless_hl_draft' });
+    ds.session.chatId = 'headless_hl_draft';
+    ds.session.headless = { ...headless, failureDiagnostics: true };
+    expect(forkWorker(ds, '', true)).toBe(true);
+    expect(initOf()).toMatchObject({ type: 'init', captureTurnFailureDiagnostics: true });
+  });
+
+  it.each([
+    ['an ordinary topic session', undefined, 'oc_chat'],
+    ['a `botmux headless` session', headless, 'headless_hl_draft'],
+    // The transfer into the main topic forks the topic's worker before the
+    // binding is recorded (or the recording never lands): the chat decides.
+    ['a draft clarify session whose transfer into its topic forks the worker', { ...headless, failureDiagnostics: true as const }, 'oc_topic'],
+    ['a draft clarify session already bound into its topic', { ...headless, failureDiagnostics: true as const, boundChatId: 'oc_topic' }, 'oc_topic'],
+  ] as const)('%s: the init does not carry the field at all', (_name, headlessBlock, chatId) => {
+    const ds = makeDs({ hasHistory: true, chatId });
+    ds.session.chatId = chatId;
+    if (headlessBlock) ds.session.headless = { ...headlessBlock };
+    expect(forkWorker(ds, '', true)).toBe(true);
+    const init = initOf();
+    expect(init).toMatchObject({ type: 'init' });
+    expect(Object.keys(init)).not.toContain('captureTurnFailureDiagnostics');
+  });
+});
