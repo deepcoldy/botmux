@@ -40,6 +40,14 @@ function capture() {
   } as any;
   return { app, writes };
 }
+/** Under bun, one large advance can elapse before the first attempt has scheduled its
+ * backoff timer; stepping keeps the clock moving until the send settles. */
+async function settleOnFakeClock<T>(promise: Promise<T>): Promise<T> {
+  let settled = false;
+  promise.then(() => { settled = true; }, () => { settled = true; });
+  for (let step = 0; step < 40 && !settled; step++) await vi.advanceTimersByTimeAsync(250);
+  return promise;
+}
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
 describe('local addresses at the real Lark SDK write boundary', () => {
@@ -119,8 +127,7 @@ describe('local addresses at the real Lark SDK write boundary', () => {
         : { code: 0, data: { message_id: 'om_retry' } };
     };
     const publishing = sendMessage(app, 'oc_chat', JSON.stringify(card()), 'interactive', 'stable-local-uuid');
-    await vi.advanceTimersByTimeAsync(2_000);
-    await expect(publishing).resolves.toBe('om_retry');
+    await expect(settleOnFakeClock(publishing)).resolves.toBe('om_retry');
     expect(writes).toHaveLength(2);
     expect(writes[0].data.content).not.toContain('/data00/');
     expect(writes[1].data).toEqual(writes[0].data);
