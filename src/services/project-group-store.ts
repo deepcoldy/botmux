@@ -125,6 +125,14 @@ export function projectOverallProgress(project: ProjectGroupState): number {
   return Math.round(total / project.workstreams.length);
 }
 
+const TASK_TITLE_MARKER_RE = /\s*\[task:[a-f0-9]{32}\]\s*$/i;
+
+/** The title as shown in the group: without the trailing `[task:<32 hex>]` id
+ *  some coordinators append. The stored title keeps it. */
+export function projectTitleWithoutTaskMarker(title: string): string {
+  return title.replace(TASK_TITLE_MARKER_RE, '').trim();
+}
+
 export function projectRemainingSummary(project: ProjectGroupState): string {
   if (project.remaining?.trim()) return project.remaining.trim();
   if (project.workstreams.length === 0) return project.status === 'completed' ? '无' : '待拆解';

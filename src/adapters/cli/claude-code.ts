@@ -33,6 +33,7 @@ import { wrapBracketedPaste } from './tui-input.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
 import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
+import { decideStartupSwitchConfirm } from '../../utils/claude-switch-confirm.js';
 
 /** Resolve cwd to its canonical (symlink-free) absolute path for project-hash
  *  computation. Claude Code itself runs `process.cwd()` which the kernel returns
@@ -1349,6 +1350,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         return !!current && current !== path && !!readDeltaText(current, 0)?.includes(marker);
       };
     },
+
+    // `/effort <level>` / `/model <name>` replayed into a resumed conversation
+    // whose prompt cache may still be warm: Claude asks before re-reading the
+    // history, and records the command only once that is answered.
+    startupCommandConfirmation: decideStartupSwitchConfirm,
 
     async writeInput(pty, content) {
       // HERDR advertises an explicit bracketed-paste frame: send the complete

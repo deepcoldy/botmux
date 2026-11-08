@@ -298,7 +298,7 @@ import {
 } from '../src/vc-agent/push-source.js';
 // grant-pending is a real (unmocked) module-level table; reset it per test so the
 // grant-card throttle state never leaks across cases (it backs the @blocked card path).
-import { getPendingGrantLimits, _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
+import { claimPendingGrant, getPendingGrantLimits, _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
 import { localeForBot, t } from '../src/i18n/index.js';
 import { hasTriggeredMessage } from '../src/services/triggered-message-store.js';
 import { logger } from '../src/utils/logger.js';
@@ -4937,6 +4937,55 @@ describe('message listener polling backfill', () => {
     // 两个群都熔断（各请求 3 次），但同一 app 一个窗口只私信一次。
     expect(mockListChatMessagesUntil).toHaveBeenCalledTimes(6);
     expect(mockSendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('tells the admin a log search term that finds the chats circuit-opened without their own DM', async () => {
+    mockSendUserMessage.mockClear();
+    vi.mocked(logger.warn).mockClear();
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      messageListeners: {
+        chat_one: {
+          enabled: true,
+          prompt: 'p1',
+          senderPolicy: { mode: 'include_only', includeSenderOpenIds: [OTHER_BOT_APP_ID], includeSenderTypes: ['bot'] },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+        chat_two: {
+          enabled: true,
+          prompt: 'p2',
+          senderPolicy: { mode: 'include_only', includeSenderOpenIds: [OTHER_BOT_APP_ID], includeSenderTypes: ['bot'] },
+          messagePolicy: { includeMsgTypes: ['interactive'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    handlers = makeHandlers();
+    mockListChatMessagesUntil.mockReset().mockRejectedValue({
+      message: 'Request failed with status code 400',
+      response: { status: 400, data: { code: 230002 } },
+    });
+    for (let i = 0; i < 3; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await __pollMessageListenersOnceForTest(MY_APP_ID, handlers);
+    }
+
+    expect(mockSendUserMessage).toHaveBeenCalledTimes(1);
+    const dm = String((mockSendUserMessage.mock.calls[0] as unknown[])[2]);
+    const alerted = ['chat_one', 'chat_two'].filter((id) => dm.includes(id));
+    expect(alerted).toHaveLength(1);
+    expect(dm).toContain('230002');
+    const silent = alerted[0] === 'chat_one' ? 'chat_two' : 'chat_one';
+    const silentLogLines = vi.mocked(logger.warn).mock.calls
+      .map((call) => String(call[0]))
+      .filter((line) => line.includes(`chat=${silent.substring(0, 12)}`));
+    expect(silentLogLines.length).toBeGreaterThan(0);
+    const searchTerms = [...dm.matchAll(/「([^」]+)」/g)].map((match) => match[1]!);
+    expect(searchTerms.some((term) => silentLogLines.some((line) => line.includes(term)))).toBe(true);
+    // lark-gate（api-gate.ts）与 doc-comment-poll（daemon.ts）也有同名「circuit OPEN」日志行，
+    // 私信给的搜索词必须带本链路独有的 "for chat=" 段，否则管理员会搜出无关链路的行。
+    expect(searchTerms).toContain('circuit OPEN for chat=');
   });
 });
 
@@ -10080,6 +10129,43 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
 
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     // 同 (chat, sender) 在节流窗口内只发一次卡（isThrottled 复用人分支同款节流表）
+    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('待批期间被节流的第 2 条挂在申请卡上，批准后与第 1 条按到达顺序串行重放', async () => {
+    setupAutoTopicBotSender(true, false);
+    const e1 = makeBotTopicSeed('msg-bot-hold-1', 'chat-bot-hold');
+    const e2 = makeBotTopicSeed('msg-bot-hold-2', 'chat-bot-hold');
+    await capturedHandlers['im.message.receive_v1'](e1);
+    await flushEventWork();
+    await capturedHandlers['im.message.receive_v1'](e2);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+
+    // 管理员点「授权」：核销卡上的 pending，再把授权写进本群 chatGrants。
+    const nonce = String(mockReplyMessage.mock.calls[0]![2])
+      .match(/nonce[^0-9a-z]{1,12}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/)?.[1];
+    const claim = claimPendingGrant(MY_APP_ID, 'chat-bot-hold', [OTHER_BOT_OPEN_ID], nonce ?? '');
+    expect(claim.ok).toBe(true);
+    if (!claim.ok) return;
+    const replay = [claim.messageData, ...(claim.heldMessages ?? [])];
+    expect(replay.map(d => d?.message?.message_id)).toEqual(['msg-bot-hold-1', 'msg-bot-hold-2']);
+    mockGetBot().config.chatGrants = { 'chat-bot-hold': [OTHER_BOT_OPEN_ID] };
+
+    // 第 1 条的会话还在建：第 2 条必须等它处理完才进 handler。
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    handlers.handleNewTopic.mockImplementationOnce(async () => { await gate; });
+    for (const data of replay) handlers.replayMessageEvent!(data);
+    await flushEventWork();
+    await flushEventWork();
+    expect(handlers.handleNewTopic.mock.calls.map((c: any[]) => c[0].message.message_id)).toEqual(['msg-bot-hold-1']);
+
+    release();
+    await vi.waitFor(() => expect(handlers.handleNewTopic).toHaveBeenCalledTimes(2));
+    expect(handlers.handleNewTopic.mock.calls.map((c: any[]) => c[0].message.message_id))
+      .toEqual(['msg-bot-hold-1', 'msg-bot-hold-2']);
     expect(mockReplyMessage).toHaveBeenCalledTimes(1);
   });
 

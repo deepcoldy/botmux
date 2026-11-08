@@ -318,7 +318,7 @@ import {
 import { DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_MENTION_PREPARE_ROUTE, DISPATCH_USER_MENTION_BIND_ROUTE, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { SANDBOX_RELAY_ROUTE_GATE_ENV, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } from './core/sandbox-send-route.js';
 import { scheduleIpcErrorMessage } from './core/schedule-ipc-errors.js';
-import { DISPATCH_REPORT_REGISTER_ROUTE } from './core/dispatch-report-binding.js';
+import { DISPATCH_REPORT_REGISTER_ROUTE, readDispatchReportBindingSecret, resolveVerifiedDispatchReportTarget } from './core/dispatch-report-binding.js';
 import { isRetryableAskHttpStatus } from './core/ask-types.js';
 import { PERMISSION_ALLOW_KEY } from './core/ask-hook/types.js';
 import { linuxIsolationDetected } from './core/linux-isolation.js';
@@ -367,6 +367,7 @@ import {
   loadBotMentionIdentityMap,
   mentionedBotAppIds,
   orderedFooterRecipients,
+  withoutDispatchDispatcherAddressing,
 } from './utils/bot-routing.js';
 import { botsInfoObjectEntries, isBotsInfoRouteEntry, normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
 import { getDefaultLocale, isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
@@ -10849,6 +10850,35 @@ async function sendDryRun(rest: string[], preflightPlan?: ClientSendPlan): Promi
   console.log(JSON.stringify({ dryRun: true, bytes: budget.bytes, fits: budget.fits, diagnostics, ...(rendered ? { diff: { stats: rendered.stats, statsScope: rendered.statsScope, preview: rendered.preview } } : {}), card }, null, 2));
 }
 
+/**
+ * The dispatching app id for a topic whose `botmux dispatch` report binding
+ * verifies, else undefined. An absent/tampered/unreadable binding yields
+ * undefined so the historical addressing stays exactly as it was.
+ */
+function resolveDispatchDispatcherAppId(input: {
+  dataDir: string;
+  dispatchRoot: string | undefined;
+  selfAppId: string;
+}): string | undefined {
+  const dispatchRoot = input.dispatchRoot;
+  if (!dispatchRoot) return undefined;
+  let resolved: ReturnType<typeof resolveVerifiedDispatchReportTarget>;
+  try {
+    resolved = resolveVerifiedDispatchReportTarget({
+      registry: JSON.parse(readFileSync(join(input.dataDir, 'orchestrate-dispatch.json'), 'utf-8')),
+      dispatchRoot,
+      secret: readDispatchReportBindingSecret(input.dataDir) ?? '',
+    });
+  } catch {
+    // Missing/corrupt registry or unreadable secret: the binding is unproven,
+    // so the old behaviour (address the dispatcher) stays.
+    return undefined;
+  }
+  if (!resolved.ok) return undefined;
+  const dispatcherAppId = resolved.binding.targetLarkAppId;
+  return !dispatcherAppId || dispatcherAppId === input.selfAppId ? undefined : dispatcherAppId;
+}
+
 async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflight?: SendPreflight): Promise<void> {
   const resolved = preflight ?? await preflightSendInvocation(rest);
   if (resolved.kind === 'help') {
@@ -12860,7 +12890,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // (default-deny: the model can't @ arbitrary people).
   // Splitting on the FIRST ':' is safe: open_id / union_id / email / mobile
   // never contain ':', only the optional trailing Display Name might.
-  const mentions: Array<{ open_id: string; name: string }> = [];
+  let mentions: Array<{ open_id: string; name: string }> = [];
   const rawMentions: Array<{ identifier: string; name: string }> = [];
   for (const m of mentionArgs) {
     const idx = m.indexOf(':');
@@ -13733,6 +13763,37 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     } catch { /* best-effort */ }
 
     const explicitKnownBotMention = hasKnownBotMention(text, mentions, botEntries, crossRef, appId);
+    // A topic opened by `botmux dispatch` returns its result through
+    // `botmux report --dispatch-root`; @-ing the dispatcher here instead starts
+    // a second, context-free dispatcher session inside this very sub-topic
+    // (#1887, #2001). The daemon's own fallback cards already drop that @, so
+    // this is the model-sent reply the same rule was missing.
+    //
+    // Two boundaries keep this from eating legitimate addressing:
+    //  - it only applies when THIS message lands in the dispatched topic, so
+    //    `--into <other topic>`, `--top-level` and `--chat-id` keep whatever the
+    //    caller asked for (mentioning the lead in the main conversation is a
+    //    supported workflow);
+    //  - the dispatcher id comes from a VERIFIED binding read with a read-only
+    //    secret, so a missing/tampered/unreadable binding changes nothing and
+    //    this CLI never mints signing authority.
+    // The binding is signed per root, so a root that verifies IS this topic: look
+    // it up with the root the message actually lands on, never the session's.
+    const dispatchDispatcherAppId = sendTarget.mode === 'thread'
+      && !sendInto && !sendTopLevel && !overrideChatId
+      ? resolveDispatchDispatcherAppId({ dataDir, dispatchRoot: sendTarget.rootMessageId, selfAppId: appId })
+      : undefined;
+    if (dispatchDispatcherAppId) {
+      const addressedMentions = withoutDispatchDispatcherAddressing({
+        dispatcherAppId: dispatchDispatcherAppId,
+        entries: botEntries, crossRef, selfAppId: appId,
+        mentionIds: mentions.map(mention => mention.open_id),
+      });
+      if (addressedMentions.length !== mentions.length) {
+        mentions = mentions.filter(mention => addressedMentions.includes(mention.open_id));
+        console.error('botmux send: 本话题是派单话题，结果已由 botmux report 交回原会话；已去掉对派单 Bot 的 @。');
+      }
+    }
     const knownBotOpenIds = knownBotOpenIdsFromCrossRef(crossRef, botEntries, appId);
     const suppressImplicitReplyTarget = shouldSuppressImplicitReplyTarget({
       explicitQuote,
@@ -15570,7 +15631,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     const appIds = parsedBotApps.map(item => item.appId);
     const resolved = await resolveCurrentChatBotOpenIdsByLarkAppIds(appId, targetChatId, appIds);
     if (!resolved.ok) {
-      console.error(`dispatch 协作身份解析失败: ${resolved.error}: ${resolved.message}`);
+      const timeoutHint = resolved.timeoutMs !== undefined
+        ? `\n群成员实时查询在 ${resolved.timeoutMs}ms 内未返回；网络较慢时可调大环境变量 BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS（毫秒）后重试。`
+        : '';
+      console.error(`dispatch 协作身份解析失败: ${resolved.error}: ${resolved.message}${timeoutHint}`);
       process.exit(1);
     }
     let botInfo: Array<{ larkAppId: string; botName: string | null }> = [];
@@ -19210,6 +19274,9 @@ if (__entrySubcommand) {
     process.exit(process.exitCode ?? 0);
   }
   else if (__entrySubcommand === 'plugin-supervisor') await import('./index-plugin-supervisor.js');
+  else if (__entrySubcommand === 'zellij-socket-probe') {
+    (await import('./adapters/backend/zellij-socket-probe.js')).runZellijSocketProbe(process.argv.slice(3));
+  }
   // CLI-adapter runners. Same mechanism, different role: these ARE the CLI session
   // process an adapter launches, not a fleet member. Without these branches the
   // compiled binary re-execed itself with a `/$bunfs/…-runner.js` argv[0] that

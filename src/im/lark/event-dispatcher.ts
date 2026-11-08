@@ -61,7 +61,7 @@ import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { isChatManager } from '../../services/chat-manager.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
-import { openPending, isThrottled, clearPending, markPendingDelivered, tryReserveOwnerDmSlot, releaseOwnerDmSlot, claimThrottleNotice } from './grant-pending.js';
+import { openPending, isThrottled, clearPending, markPendingDelivered, tryReserveOwnerDmSlot, releaseOwnerDmSlot, claimThrottleNotice, holdPendingMessage } from './grant-pending.js';
 import { resolveGrantApprover, resolveGrantRequestRoute, type GrantRequestRoute } from './grant-owner.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import {
@@ -2584,8 +2584,8 @@ export function humanCanRunDaemonCommand(
  * 受 grant-pending 节流：pending 中 / deny 冷却期内不再发卡。真人路径的调用方传
  * `notifyThrottledRequester`，申请人在这期间再来找 bot 时回一句原因（同一张卡 / 同一次拒绝
  * 只回一次，见 claimThrottleNotice）；卡片就回复在申请人自己消息下面时不回（卡片本身就是说明），
- * 只有转投管理员私聊、申请人看不见卡的情况才提示「还在等」。bot 发送方不传，保持静默，免得两个
- * bot 互相回话。
+ * 只有转投管理员私聊、申请人看不见卡的情况才提示「还在等」。bot 发送方不传：不回话（免得两个
+ * bot 互相回话），把消息挂到待处理的申请卡上，批准后按到达顺序重放；挂不上（已被拒绝 / 暂存已满）时记日志。
  * 开放模式（无 owner）兜底不发。关了 autoGrantRequestCards 是文档写明的静默拦截，不回话。
  *
  * 默认（grantRequestToOwnerDm 未开）：卡片回复在原会话、正文 @ resolveGrantApprover 选出的管理员；
@@ -2614,7 +2614,16 @@ export async function maybeSendGrantRequestCard(
     return;
   }
   if (isThrottled(larkAppId, chatId, requesterOpenId)) {
-    if (opts?.notifyThrottledRequester) await replyThrottledRequester(larkAppId, message, chatId, requesterOpenId);
+    if (opts?.notifyThrottledRequester) {
+      await replyThrottledRequester(larkAppId, message, chatId, requesterOpenId);
+      return;
+    }
+    const held = messageData === undefined ? 'no_message' : holdPendingMessage(larkAppId, chatId, requesterOpenId, messageData);
+    if (held === 'held') {
+      logger.info(`[grant:${larkAppId}] holding message ${String(message?.message_id ?? '?').substring(0, 12)} from ${requesterOpenId.substring(0, 12)} in ${chatId.substring(0, 12)} until the request card is handled`);
+    } else if (held !== 'duplicate') {
+      logSilentGrantDrop(larkAppId, chatId, requesterOpenId, `request throttled, message not held: ${held}`);
+    }
     return;
   }
   const chatType: 'p2p' | 'group' = message?.chat_type === 'p2p' ? 'p2p' : 'group';
@@ -3129,10 +3138,12 @@ async function listenerChatFailed(
   if (!adminOpenId) return;
   const dm =
     `[botmux] 群消息监听已自动熔断：${chatId}\n` +
-    `该群连续 ${LISTENER_PERMANENT_THRESHOLD} 次返回永久错误${codePart}（${classified.message.slice(0, 120)}），` +
-    `通常是 bot 被移出群或群已解散。已停止对该群的高频轮询并转为 10 分钟慢探测；` +
-    `bot 被重新拉回后会自动恢复。如不再需要该监听，可在工作台关闭对应群监听。` +
-    `（同一应用其它群也在窗口内熔断时不重复私信，请以工作台监听状态为准。）`;
+    `原因：该群连续 ${LISTENER_PERMANENT_THRESHOLD} 次返回永久错误${codePart}（${classified.message.slice(0, 120)}），` +
+    `通常是 bot 被移出群或群已解散。\n` +
+    `现状：已停止对该群的常规轮询，改为每 ${Math.round(LISTENER_PROBE_INTERVAL_MS / 60_000)} 分钟探测一次。\n` +
+    `恢复：把 bot 重新拉回该群，下一次探测成功后自动恢复监听，无需重启；如不再需要该监听，可在工作台关闭该群的监听。\n` +
+    `${Math.round(LISTENER_ALERT_DEDUPE_MS / 60_000)} 分钟内同一应用其它群也熔断时不再逐条私信，` +
+    `可在 daemon 日志（botmux logs）中搜索「circuit OPEN for chat=」找到这些群。`;
   lastListenerAlertAt.set(larkAppId, now);
   try {
     await dmAdmin(larkAppId, adminOpenId, dm, `listener circuit open ${chatId.substring(0, 12)}`);
@@ -6416,8 +6427,10 @@ export function createLarkEventDispatcherRuntime(
       logger.info(`[grant:${larkAppId}] durable primary: not replaying granted message ${String(data?.message?.message_id ?? '').substring(0, 12)} outside the durable inbox`);
       return;
     }
+    // 批准时会连着重放多条（原消息 + 待批期间暂存的消息）：与实时入站走同一条按会话的入站串行道，
+    // 否则 processMessageEvent 内的异步路由会让后一条先投到会话。setImmediate 是 FIFO，调用顺序即入道顺序。
     setImmediate(() => {
-      void processMessageEvent(data)
+      void serializeByAnchor(rawMessageIngressAnchor(larkAppId, data?.message), () => processMessageEvent(data))
         .catch(err => logger.error(`Error replaying message event after grant: ${err}`));
     });
   }

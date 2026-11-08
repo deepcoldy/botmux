@@ -172,6 +172,7 @@ import {
 } from './services/durable-lark-outbox.js';
 import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-output.js';
 import {
+  canonicalPrimarySession,
   claimDurableLarkActiveSession,
   listValidDurablePrimarySessions,
   parseDurablePrimarySessionRecord,
@@ -243,6 +244,7 @@ import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMent
 import { buildQuoteHint } from './im/lark/quote-hint.js';
 import { buildTopicThreadContext } from './im/lark/topic-root-context.js';
 import { logger } from './utils/logger.js';
+import { errorMessage } from './utils/error-message.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
 import { applyAllowedUsersResolve, shouldSilenceAllowedUsersOwnerDm, classifyAllowedUsersTerminalNotice } from './utils/allowed-users-apply.js';
 import { withFileLock, withFileLockSync } from './utils/file-lock.js';
@@ -669,6 +671,7 @@ import {
   cancelCrossPrincipalInterruptionsForFeatureDisable,
   continueCrossPrincipalOwnerWait,
   crossPrincipalOwnerWaitDisposition,
+  crossPrincipalRerouteGaps,
   markCrossPrincipalSuggestionWaiting,
   stageCrossPrincipalInterruptionRecord,
 } from './core/cross-principal-interruption-store.js';
@@ -761,6 +764,7 @@ import { createInputCaptureStore } from './core/plugins/input-capture/store.js';
 import { createInputCaptureRuntime, setInputCaptureRuntime, stopInputCaptureRuntimes } from './core/plugins/input-capture/runtime.js';
 import { deliverCapturedInput } from './core/plugins/input-capture/gateway.js';
 import { captureInboundText } from './im/lark/input-capture.js';
+import { isP2pForceTopicRoot } from './services/p2p-force-topic-store.js';
 import { readPluginRegistry } from './services/plugin-registry-store.js';
 import { setIssueActivate } from './im/lark/issue-command-deps.js';
 import { startIssueOutboxPump } from './services/issue-outbox-pump.js';
@@ -4355,8 +4359,9 @@ function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void
 /** `keepInactiveWorkflow`: also return a workflow handoff's delegation that no
  *  longer holds (the caller reports why). Every other caller — the inherited
  *  authority of a dispatch / `--mention` handoff, schedule creation — gets no
- *  delegation from it. */
-async function dispatchUserForTurn(ds: DaemonSession, turnId: string, opts: { keepInactiveWorkflow?: boolean } = {}) {
+ *  delegation from it. `waitMs`: how long to wait for an unbound handoff to
+ *  this bot to be bound (default: resolveDispatchUser's). */
+async function dispatchUserForTurn(ds: DaemonSession, turnId: string, opts: { keepInactiveWorkflow?: boolean; waitMs?: number } = {}) {
   const reply = pickTurnReplyTarget(ds.session, turnId);
   // The main bot's own workflow node turn has no inbound message (design
   // §6.5): its turn id is the handoff it posted, its topic the node card.
@@ -4376,6 +4381,7 @@ async function dispatchUserForTurn(ds: DaemonSession, turnId: string, opts: { ke
     secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
     appId: ds.larkAppId, chatId: ds.chatId, turnId,
     rootId: reply?.rootMessageId ?? (ds.scope !== 'chat' ? ds.session.rootMessageId ?? undefined : undefined),
+    waitMs: opts.waitMs,
   });
   // A workflow handoff's delegation (design 2026-11-03 §10) holds only while
   // its run attempt does; past that it is no delegation at all.
@@ -5323,7 +5329,7 @@ export async function enforceMessageQuotaForCliInput(
     ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId)
     : evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
   if (!ev.allowed) {
-    logger.debug(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
+    logger.info(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
     return false;
   }
   // Control/setup messages still need the authorization decision above, but
@@ -9162,7 +9168,10 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
     // lead that is handed a report by one bot can still hand the same person
     // on to the next. Re-checked against this chat and narrowed to this bot's
     // tools; a schedule or a plain bot-to-bot message still has no sender.
-    let inherited = await dispatchUserForTurn(ds, turnId);
+    // This turn's own handoff had its wait when the turn was delivered; an
+    // unbound one to this bot now is another handoff in flight, and waiting
+    // for it would only hold up this send.
+    let inherited = await dispatchUserForTurn(ds, turnId, { waitMs: 0 });
     let inheritedWorkflow: import('./core/dispatch-user-delegation.js').WorkflowDispatchUserRef | undefined;
     if (inherited && 'workflow' in inherited) {
       // Same rule as `botmux dispatch` from a workflow node (design §10).
@@ -10694,6 +10703,13 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     backendSurvivesRestart:
       !!askSession && getSessionPersistentBackendType(askSession) !== undefined,
   };
+  // chat-scope 的 ask 身份仍是 root=null（文字答复按 chatId 锚点命中），独立卡片只是跟着发起
+  // turn 冻结的话题落点。嵌进回复卡的 ask 由回复卡决定位置；异步提问的提示与答复 turn
+  // 都按 root=null 发，卡片不单独搬走。
+  const askTurnTarget = askSession?.session.scope === 'chat' && typeof body.originTurnId === 'string'
+    ? frozenReplyContextForTurn(askSession, body.originTurnId).target : undefined;
+  const cardRoot = asyncInput || askInput.replyCardTarget || askTurnTarget?.mode !== 'thread'
+    ? undefined : { cardRootMessageId: askTurnTarget.rootMessageId };
   const managedExplicit = askInput.originKind === 'explicit' && !!askInput.requestId && !!askSession;
   const explicitInput = { ...askInput, originKind: 'host_explicit', requestId: askInput.requestId! };
   if (body.acknowledge === true) {
@@ -10715,8 +10731,8 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
       ? { turnId: askOrigin.turnId,
           dispatchAttempt: askOrigin.dispatchAttempt,
           workerGeneration: askWorkerGeneration }
-      : undefined)
-    : await registerAskForResponse(askInput, res);
+      : undefined, cardRoot)
+    : await registerAskForResponse({ ...askInput, ...cardRoot }, res);
   if (res.destroyed) return;
 
   if (asyncInput && askSession && result.kind === 'answered') {
@@ -12107,284 +12123,339 @@ function restoreVcMeetingRuntimeSessionsForBot(larkAppId: string, cfg: VcMeeting
     logger.info(`[vc-agent] restore skipped for ${larkAppId}: global listener bot is ${listenerAppId}`);
     return;
   }
-  pruneExpiredVcMeetingRuntimeSessions(config.session.dataDir);
-  for (const record of listVcMeetingRuntimeSessions(config.session.dataDir, larkAppId)) {
+  // Startup must survive meeting state it cannot read: this runs inside the
+  // daemon's bot loop, so an exception here used to abort startDaemon for EVERY
+  // bot (a quarantined runtime store on 11-06 would have crash-looped each
+  // VC-enabled daemon). Failure paths never delete a durable record (a partly
+  // restored meeting may already have persisted some field updates), so the
+  // next start retries the meeting.
+  try {
+    pruneExpiredVcMeetingRuntimeSessions(config.session.dataDir);
+  } catch (err) {
+    logger.warn(`[vc-agent] restore: pruning expired meeting runtime records failed for ${larkAppId}: ${errorMessage(err)}`);
+  }
+  let records: VcMeetingRuntimeSessionRecord[];
+  try {
+    records = listVcMeetingRuntimeSessions(config.session.dataDir, larkAppId);
+  } catch (err) {
+    logger.error(
+      `[vc-agent] restore skipped for ${larkAppId}: meeting runtime state unreadable (${errorMessage(err)}); `
+      + 'in-progress meetings stay on disk and are restored on the next start',
+    );
+    return;
+  }
+  for (const record of records) {
     const key = vcMeetingSessionKey(larkAppId, record.meeting.id);
-    const hubClose = getVcMeetingHubCloseState(config.session.dataDir, {
-      listenerAppId: larkAppId,
-      meetingId: record.meeting.id,
-    });
-    const hasDurableClose = record.consumerClosePhase !== undefined
-      || hubClose?.phase === 'data_closing'
-      || hubClose?.phase === 'finalizing';
-    if (hubClose?.phase === 'closed') {
-      removeVcMeetingRuntimeSession(config.session.dataDir, larkAppId, record.meeting.id);
-      continue;
-    }
-    if (hasRecentVcMeetingEndedTombstone(key) && !hasDurableClose) {
-      removeVcMeetingRuntimeSession(config.session.dataDir, larkAppId, record.meeting.id);
-      continue;
-    }
-    const session = getOrCreateVcMeetingDaemonSession(
-      larkAppId,
-      {
-        id: record.meeting.id,
-        meetingNo: record.meeting.meetingNo,
-        topic: record.meeting.topic,
-      },
-      cfg,
-      { joined: record.listenerPresenceStale !== true, listenerChatId: record.listenerChatId },
-    );
-    if (!session) continue;
-    const preparation = record.preparationMeetingNo
-      ? getVcMeetingPreparation(config.session.dataDir, record.larkAppId, record.preparationMeetingNo)
-      : undefined;
-    // 2.105.x 的准备会议会把 Q&A Agent 同时写成普通 consumer。新模型将两者
-    // 分离；恢复旧记录时只迁移能与 preparation 精确对应的自动绑定，避免覆盖
-    // 用户后来显式选择的其它 consumer。
-    const migratePreparedConsumer = !record.qaAgentAppId
-      && !!preparation
-      && record.listenerChatId === preparation.prepChatId
-      && record.consumerMode === 'agent'
-      && record.selectedAgentAppId === preparation.agentAppId;
-    session.joined = record.listenerPresenceStale !== true;
-    session.monitoringStarted = true;
-    session.listenerPresenceStale = record.listenerPresenceStale === true;
-    session.listenerPresenceChangedAtMs = record.listenerPresenceChangedAtMs;
-    session.listenerPresenceGeneration = record.listenerPresenceGeneration;
-    session.listenerRejoinNonce = record.listenerRejoinNonce;
-    session.listenerRejoinCardMessageId = record.listenerRejoinCardMessageId;
-    session.inviterManagers = record.inviterManagers;
-    session.listenerChatCreatedForMeeting = record.listenerChatCreatedForMeeting;
-    session.listenerChatId = record.listenerChatId;
-    session.state.notificationChatId = record.listenerChatId;
-    if (record.attentionTargetOpenId) session.state.attentionTargetOpenId = record.attentionTargetOpenId;
-    session.consumerMode = migratePreparedConsumer ? 'listenOnly' : record.consumerMode;
-    session.selectedAgents = migratePreparedConsumer ? [] : (record.selectedAgents ?? []);
-    session.selectedAgentAppId = migratePreparedConsumer ? undefined : record.selectedAgentAppId;
-    session.selectedAgentLabel = migratePreparedConsumer ? undefined : record.selectedAgentLabel;
-    session.consumerPaused = migratePreparedConsumer ? false : record.consumerPaused;
-    if (session.consumerMode === 'agent') session.consumerLastInjectedAtMs = undefined;
-    session.textOutputPolicy = record.textOutputPolicy ?? defaultVcMeetingTextOutputPolicy(cfg);
-    session.voiceOutputPolicy = record.voiceOutputPolicy ?? defaultVcMeetingVoiceOutputPolicy(cfg);
-    session.syncIntervalMs = record.syncIntervalMs;
-    session.listenerPolicy = resolveVcMeetingListenerPolicy(record.listenerPolicy);
-    session.consumerSelectionExpiresAt = record.consumerSelectionExpiresAt;
-    session.consumerCardMessageId = record.consumerCardMessageId;
-    session.temporaryInstructionOpenIds = Object.fromEntries(
-      (record.temporaryInstructionOpenIds ?? []).map(openId => [openId, true] as const),
-    );
-    session.temporaryInstructionUnionIds = Object.fromEntries(
-      (record.temporaryInstructionUnionIds ?? []).map(unionId => [unionId, true] as const),
-    );
-    session.preparationMeetingNo = record.preparationMeetingNo;
-    session.qaMode = record.qaMode ?? preparation?.qaMode;
-    session.qaAgentAppId = record.qaAgentAppId ?? preparation?.agentAppId;
-    session.qaRecentOutputHashes = record.qaRecentOutputHashes ?? [];
-    void synchronizeVcMeetingInviters(session, cfg).catch(err => logger.warn(`[vc-agent] inviter recovery: ${String(err)}`));
-    const selectedAgentsBeforeReconcile = JSON.stringify(session.selectedAgents);
-    const restoredProfileMemberships = session.consumerMode === 'agent'
-      && session.selectedAgents.length > 0
-      ? reconcileVcMeetingRestoredProfileMemberships(session, cfg)
-      : { activations: [], pauses: [] };
-    const profileSelectionReconciled = selectedAgentsBeforeReconcile !== JSON.stringify(session.selectedAgents);
-    if (session.consumerMode === 'agent' && session.selectedAgents.length > 0) {
-      session.consumerProfileOwnerBootReady = refreshVcMeetingProfileOwnerBoot(session);
-    }
-    if (hasDurableClose) {
-      if (session.consumerMode !== 'agent' || !vcMeetingSessionHasConsumerMembers(session, cfg)) {
-        logger.error(
-          `[vc-agent] invalid durable close record removed meeting=${record.meeting.id}: no selected agent`,
-        );
+    // Only entries this restore creates are ours to tear down on failure.
+    const hadSession = vcMeetingSessions.has(key);
+    const hadClosing = vcMeetingClosingConsumerSessions.has(key);
+    try {
+      restoreVcMeetingRuntimeSessionRecord(larkAppId, cfg, record);
+    } catch (err) {
+      // Drop the half-restored in-memory session and stop the timers it had
+      // already armed, so nothing keeps running on partial state (or doubles
+      // the cadence of the session a later push creates for the same meeting).
+      if (!hadSession) {
+        const partial = vcMeetingSessions.get(key);
+        if (partial) cleanupVcMeetingDaemonSession(partial, 'meeting-restore-failed');
         vcMeetingSessions.delete(key);
-        removeVcMeetingRuntimeSession(config.session.dataDir, larkAppId, record.meeting.id);
-        continue;
       }
-      const deadlineAt = record.consumerFinalizationDeadlineAt
-        ?? hubClose?.finalizationDeadlineAt
-        ?? Date.now() + vcMeetingConsumerCloseHorizonMs();
-      session.ended = true;
-      session.consumerClosePhase = hubClose?.phase === 'finalizing'
-        ? 'finalizing'
-        : record.consumerClosePhase ?? 'data_closing';
-      session.consumerFinalizationDeadlineAt = deadlineAt;
-      session.consumerCloseResolutionDeadlineAt = record.consumerCloseResolutionDeadlineAt
-        ?? (Date.now() >= deadlineAt
-          ? deadlineAt + vcMeetingConsumerRecoveryResolutionGraceMs()
-          : undefined);
-      session.consumerRestoreCatchUpRequired = true;
+      if (!hadClosing) {
+        const closing = vcMeetingClosingConsumerSessions.get(key);
+        if (closing) {
+          if (closing.timer) clearTimeout(closing.timer);
+          cleanupVcMeetingDaemonSession(closing.session, 'meeting-restore-failed');
+        }
+        vcMeetingClosingConsumerSessions.delete(key);
+      }
+      logger.error(
+        `[vc-agent] restore failed meeting=${record.meeting.id} bot=${larkAppId}: ${errorMessage(err)}; `
+        + 'other meetings continue, this one is retried on the next start',
+      );
+    }
+  }
+}
+
+function restoreVcMeetingRuntimeSessionRecord(
+  larkAppId: string,
+  cfg: VcMeetingAgentConfig,
+  record: VcMeetingRuntimeSessionRecord,
+): void {
+  const key = vcMeetingSessionKey(larkAppId, record.meeting.id);
+  const hubClose = getVcMeetingHubCloseState(config.session.dataDir, {
+    listenerAppId: larkAppId,
+    meetingId: record.meeting.id,
+  });
+  const hasDurableClose = record.consumerClosePhase !== undefined
+    || hubClose?.phase === 'data_closing'
+    || hubClose?.phase === 'finalizing';
+  if (hubClose?.phase === 'closed') {
+    removeVcMeetingRuntimeSession(config.session.dataDir, larkAppId, record.meeting.id);
+    return;
+  }
+  if (hasRecentVcMeetingEndedTombstone(key) && !hasDurableClose) {
+    removeVcMeetingRuntimeSession(config.session.dataDir, larkAppId, record.meeting.id);
+    return;
+  }
+  const session = getOrCreateVcMeetingDaemonSession(
+    larkAppId,
+    {
+      id: record.meeting.id,
+      meetingNo: record.meeting.meetingNo,
+      topic: record.meeting.topic,
+    },
+    cfg,
+    { joined: record.listenerPresenceStale !== true, listenerChatId: record.listenerChatId },
+  );
+  if (!session) return;
+  const preparation = record.preparationMeetingNo
+    ? getVcMeetingPreparation(config.session.dataDir, record.larkAppId, record.preparationMeetingNo)
+    : undefined;
+  // 2.105.x 的准备会议会把 Q&A Agent 同时写成普通 consumer。新模型将两者
+  // 分离；恢复旧记录时只迁移能与 preparation 精确对应的自动绑定，避免覆盖
+  // 用户后来显式选择的其它 consumer。
+  const migratePreparedConsumer = !record.qaAgentAppId
+    && !!preparation
+    && record.listenerChatId === preparation.prepChatId
+    && record.consumerMode === 'agent'
+    && record.selectedAgentAppId === preparation.agentAppId;
+  session.joined = record.listenerPresenceStale !== true;
+  session.monitoringStarted = true;
+  session.listenerPresenceStale = record.listenerPresenceStale === true;
+  session.listenerPresenceChangedAtMs = record.listenerPresenceChangedAtMs;
+  session.listenerPresenceGeneration = record.listenerPresenceGeneration;
+  session.listenerRejoinNonce = record.listenerRejoinNonce;
+  session.listenerRejoinCardMessageId = record.listenerRejoinCardMessageId;
+  session.inviterManagers = record.inviterManagers;
+  session.listenerChatCreatedForMeeting = record.listenerChatCreatedForMeeting;
+  session.listenerChatId = record.listenerChatId;
+  session.state.notificationChatId = record.listenerChatId;
+  if (record.attentionTargetOpenId) session.state.attentionTargetOpenId = record.attentionTargetOpenId;
+  session.consumerMode = migratePreparedConsumer ? 'listenOnly' : record.consumerMode;
+  session.selectedAgents = migratePreparedConsumer ? [] : (record.selectedAgents ?? []);
+  session.selectedAgentAppId = migratePreparedConsumer ? undefined : record.selectedAgentAppId;
+  session.selectedAgentLabel = migratePreparedConsumer ? undefined : record.selectedAgentLabel;
+  session.consumerPaused = migratePreparedConsumer ? false : record.consumerPaused;
+  if (session.consumerMode === 'agent') session.consumerLastInjectedAtMs = undefined;
+  session.textOutputPolicy = record.textOutputPolicy ?? defaultVcMeetingTextOutputPolicy(cfg);
+  session.voiceOutputPolicy = record.voiceOutputPolicy ?? defaultVcMeetingVoiceOutputPolicy(cfg);
+  session.syncIntervalMs = record.syncIntervalMs;
+  session.listenerPolicy = resolveVcMeetingListenerPolicy(record.listenerPolicy);
+  session.consumerSelectionExpiresAt = record.consumerSelectionExpiresAt;
+  session.consumerCardMessageId = record.consumerCardMessageId;
+  session.temporaryInstructionOpenIds = Object.fromEntries(
+    (record.temporaryInstructionOpenIds ?? []).map(openId => [openId, true] as const),
+  );
+  session.temporaryInstructionUnionIds = Object.fromEntries(
+    (record.temporaryInstructionUnionIds ?? []).map(unionId => [unionId, true] as const),
+  );
+  session.preparationMeetingNo = record.preparationMeetingNo;
+  session.qaMode = record.qaMode ?? preparation?.qaMode;
+  session.qaAgentAppId = record.qaAgentAppId ?? preparation?.agentAppId;
+  session.qaRecentOutputHashes = record.qaRecentOutputHashes ?? [];
+  void synchronizeVcMeetingInviters(session, cfg).catch(err => logger.warn(`[vc-agent] inviter recovery: ${String(err)}`));
+  const selectedAgentsBeforeReconcile = JSON.stringify(session.selectedAgents);
+  const restoredProfileMemberships = session.consumerMode === 'agent'
+    && session.selectedAgents.length > 0
+    ? reconcileVcMeetingRestoredProfileMemberships(session, cfg)
+    : { activations: [], pauses: [] };
+  const profileSelectionReconciled = selectedAgentsBeforeReconcile !== JSON.stringify(session.selectedAgents);
+  if (session.consumerMode === 'agent' && session.selectedAgents.length > 0) {
+    session.consumerProfileOwnerBootReady = refreshVcMeetingProfileOwnerBoot(session);
+  }
+  if (hasDurableClose) {
+    if (session.consumerMode !== 'agent' || !vcMeetingSessionHasConsumerMembers(session, cfg)) {
+      logger.error(
+        `[vc-agent] invalid durable close record removed meeting=${record.meeting.id}: no selected agent`,
+      );
       vcMeetingSessions.delete(key);
-      vcMeetingClosingConsumerSessions.set(key, {
+      removeVcMeetingRuntimeSession(config.session.dataDir, larkAppId, record.meeting.id);
+      return;
+    }
+    const deadlineAt = record.consumerFinalizationDeadlineAt
+      ?? hubClose?.finalizationDeadlineAt
+      ?? Date.now() + vcMeetingConsumerCloseHorizonMs();
+    session.ended = true;
+    session.consumerClosePhase = hubClose?.phase === 'finalizing'
+      ? 'finalizing'
+      : record.consumerClosePhase ?? 'data_closing';
+    session.consumerFinalizationDeadlineAt = deadlineAt;
+    session.consumerCloseResolutionDeadlineAt = record.consumerCloseResolutionDeadlineAt
+      ?? (Date.now() >= deadlineAt
+        ? deadlineAt + vcMeetingConsumerRecoveryResolutionGraceMs()
+        : undefined);
+    session.consumerRestoreCatchUpRequired = true;
+    vcMeetingSessions.delete(key);
+    vcMeetingClosingConsumerSessions.set(key, {
+      session,
+      cfg,
+      deadlineAt,
+      ...(Date.now() >= deadlineAt ? { timedOut: true } : {}),
+      ...(session.consumerCloseResolutionDeadlineAt !== undefined
+        ? { resolutionDeadlineAt: session.consumerCloseResolutionDeadlineAt }
+        : {}),
+    });
+    session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(session, cfg);
+    if (session.consumerPaused) {
+      session.consumerOverflowNotified = true;
+      session.consumerRecoveryCardRequired = true;
+      if (!session.consumerRestoreCatchUpRequired) {
+        void ensureVcMeetingConsumerOverflowRecoveryCard(
+          session,
+          cfg,
+          VC_MEETING_PENDING_ITEM_LIMIT,
+        ).catch((err) => {
+          logger.warn(
+            `[vc-agent] restored closing recovery card failed meeting=${record.meeting.id}: `
+            + `${err instanceof Error ? err.message : String(err)}`,
+          );
+        });
+      }
+    }
+    if (session.selectedAgents.length > 0
+      && session.selectedAgents.some(selected => selected.status === 'paused')) {
+      void ensureVcMeetingProfileRecoveryCard(
         session,
         cfg,
-        deadlineAt,
-        ...(Date.now() >= deadlineAt ? { timedOut: true } : {}),
-        ...(session.consumerCloseResolutionDeadlineAt !== undefined
-          ? { resolutionDeadlineAt: session.consumerCloseResolutionDeadlineAt }
-          : {}),
-      });
-      session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(session, cfg);
-      if (session.consumerPaused) {
-        session.consumerOverflowNotified = true;
-        session.consumerRecoveryCardRequired = true;
-        if (!session.consumerRestoreCatchUpRequired) {
-          void ensureVcMeetingConsumerOverflowRecoveryCard(
-            session,
-            cfg,
-            VC_MEETING_PENDING_ITEM_LIMIT,
-          ).catch((err) => {
-            logger.warn(
-              `[vc-agent] restored closing recovery card failed meeting=${record.meeting.id}: `
-              + `${err instanceof Error ? err.message : String(err)}`,
-            );
-          });
-        }
-      }
-      if (session.selectedAgents.length > 0
-        && session.selectedAgents.some(selected => selected.status === 'paused')) {
-        void ensureVcMeetingProfileRecoveryCard(
-          session,
-          cfg,
-          '会议结束收口期间仍有暂停的 profile；确认后会按各自 cursor 继续并提交 final。',
-        ).catch((err) => {
-          logger.warn(
-            `[vc-agent] restored closing profile recovery card failed meeting=${record.meeting.id}: `
-            + `${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
-      }
-      persistVcMeetingRuntimeSession(session, cfg);
-      if (restoredProfileMemberships.pauses.length > 0) {
-        void resumeVcMeetingRestoredProfileMemberships(
-          key,
-          session,
-          cfg,
-          [],
-          restoredProfileMemberships.pauses,
-        ).catch((err) => {
-          logger.warn(
-            `[vc-agent] restored closing profile pause failed meeting=${record.meeting.id}: `
-            + `${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
-      }
-      scheduleVcMeetingConsumerClosePump(key);
-      logger.info(
-        `[vc-agent] restored durable consumer close meeting=${record.meeting.id} `
-        + `phase=${session.consumerClosePhase} catchUp=${session.consumerRestoreCatchUpRequired ? 'pending' : 'ready'}`,
-      );
-      continue;
-    }
-    if (profileSelectionReconciled) persistVcMeetingRuntimeSession(session, cfg);
-    if (session.consumerMode === 'agent'
-      && session.selectedAgents.length > 0
-      && session.selectedAgents.some(selected => selected.status === 'active'
-        || selected.status === 'paused'
-        || selected.status === 'activating')) {
-      session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(session, cfg);
-      if (session.consumerRestoreCatchUpRequired) {
+        '会议结束收口期间仍有暂停的 profile；确认后会按各自 cursor 继续并提交 final。',
+      ).catch((err) => {
         logger.warn(
-          `[vc-agent] restored profile fan-out is waiting for body catch-up meeting=${session.state.meeting.id}`,
+          `[vc-agent] restored closing profile recovery card failed meeting=${record.meeting.id}: `
+          + `${err instanceof Error ? err.message : String(err)}`,
         );
-      }
-      if (session.selectedAgents.some(selected => selected.status === 'paused')) {
-        void ensureVcMeetingProfileRecoveryCard(session, cfg).catch((err) => {
-          logger.warn(
-            `[vc-agent] restored profile recovery card failed meeting=${session.state.meeting.id}: `
-            + `${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
-      }
-    } else if (session.consumerMode === 'agent' && session.selectedAgentAppId) {
-      const restoredMember = vcMeetingLatestSingleConsumerMember(session);
-      // An active runtime with a removed latest epoch is the durable marker
-      // left after an operator authorized from-now but the new receiver
-      // registration had not completed before restart. Do not resurrect or
-      // rehydrate the abandoned prefix; the regular pump will create a fresh
-      // epoch at the current ingest high-water.
-      session.consumerRestoreCatchUpRequired = restoredMember?.status === 'removed'
-        ? false
-        : !catchUpVcMeetingConsumerForRestore(session, cfg);
-      if (session.consumerRestoreCatchUpRequired) {
-        session.consumerActiveRecoveryCardRequired = true;
-        void ensureVcMeetingConsumerActiveRecoveryCard(session).catch((err) => {
-          logger.warn(
-            `[vc-agent] restored active recovery card failed meeting=${session.state.meeting.id}: `
-            + `${err instanceof Error ? err.message : String(err)}`,
-          );
-        });
-      }
-      if (session.consumerPaused) {
-        session.consumerOverflowNotified = true;
-        session.consumerRecoveryCardRequired = true;
-        if (!session.consumerRestoreCatchUpRequired) {
-          void ensureVcMeetingConsumerOverflowRecoveryCard(
-            session,
-            cfg,
-            VC_MEETING_PENDING_ITEM_LIMIT,
-          ).catch((err) => {
-            logger.warn(
-              `[vc-agent] restored overflow recovery card failed meeting=${session.state.meeting.id}: `
-              + `${err instanceof Error ? err.message : String(err)}`,
-            );
-          });
-        }
-      }
-    } else if (session.consumerMode === 'pending') {
-      session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(session, cfg);
-      session.consumerSelectionNonce = undefined;
-      session.consumerSelectionExpiresAt = undefined;
-      session.consumerRestoreSelectionCardRequired = true;
+      });
     }
-    scheduleVcMeetingListenerFlush(key, cfg);
-    scheduleVcMeetingRestoreImmediateTick(key, cfg);
-    if (session.consumerMode === 'agent') {
-      scheduleVcMeetingConsumerInjection(key, cfg);
-    }
-    if (restoredProfileMemberships.activations.length > 0
-      || restoredProfileMemberships.pauses.length > 0) {
+    persistVcMeetingRuntimeSession(session, cfg);
+    if (restoredProfileMemberships.pauses.length > 0) {
       void resumeVcMeetingRestoredProfileMemberships(
         key,
         session,
         cfg,
-        restoredProfileMemberships.activations,
+        [],
         restoredProfileMemberships.pauses,
       ).catch((err) => {
         logger.warn(
-          `[vc-agent] restored profile membership reconciliation failed meeting=${record.meeting.id}: `
+          `[vc-agent] restored closing profile pause failed meeting=${record.meeting.id}: `
           + `${err instanceof Error ? err.message : String(err)}`,
         );
       });
     }
-    if (session.consumerMode === 'pending') {
-      // The old nonce intentionally was not durable. Replace the stale card
-      // with a freshly signed one after rehydrating the pre-selection backlog.
+    scheduleVcMeetingConsumerClosePump(key);
+    logger.info(
+      `[vc-agent] restored durable consumer close meeting=${record.meeting.id} `
+      + `phase=${session.consumerClosePhase} catchUp=${session.consumerRestoreCatchUpRequired ? 'pending' : 'ready'}`,
+    );
+    return;
+  }
+  if (profileSelectionReconciled) persistVcMeetingRuntimeSession(session, cfg);
+  if (session.consumerMode === 'agent'
+    && session.selectedAgents.length > 0
+    && session.selectedAgents.some(selected => selected.status === 'active'
+      || selected.status === 'paused'
+      || selected.status === 'activating')) {
+    session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(session, cfg);
+    if (session.consumerRestoreCatchUpRequired) {
+      logger.warn(
+        `[vc-agent] restored profile fan-out is waiting for body catch-up meeting=${session.state.meeting.id}`,
+      );
+    }
+    if (session.selectedAgents.some(selected => selected.status === 'paused')) {
+      void ensureVcMeetingProfileRecoveryCard(session, cfg).catch((err) => {
+        logger.warn(
+          `[vc-agent] restored profile recovery card failed meeting=${session.state.meeting.id}: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+  } else if (session.consumerMode === 'agent' && session.selectedAgentAppId) {
+    const restoredMember = vcMeetingLatestSingleConsumerMember(session);
+    // An active runtime with a removed latest epoch is the durable marker
+    // left after an operator authorized from-now but the new receiver
+    // registration had not completed before restart. Do not resurrect or
+    // rehydrate the abandoned prefix; the regular pump will create a fresh
+    // epoch at the current ingest high-water.
+    session.consumerRestoreCatchUpRequired = restoredMember?.status === 'removed'
+      ? false
+      : !catchUpVcMeetingConsumerForRestore(session, cfg);
+    if (session.consumerRestoreCatchUpRequired) {
+      session.consumerActiveRecoveryCardRequired = true;
+      void ensureVcMeetingConsumerActiveRecoveryCard(session).catch((err) => {
+        logger.warn(
+          `[vc-agent] restored active recovery card failed meeting=${session.state.meeting.id}: `
+          + `${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+    if (session.consumerPaused) {
+      session.consumerOverflowNotified = true;
+      session.consumerRecoveryCardRequired = true;
       if (!session.consumerRestoreCatchUpRequired) {
-        void ensureVcMeetingRestoredSelectionCard(key, session, cfg).catch((err) => {
+        void ensureVcMeetingConsumerOverflowRecoveryCard(
+          session,
+          cfg,
+          VC_MEETING_PENDING_ITEM_LIMIT,
+        ).catch((err) => {
           logger.warn(
-            `[vc-agent] restored consumer selection card failed meeting=${record.meeting.id}: `
+            `[vc-agent] restored overflow recovery card failed meeting=${session.state.meeting.id}: `
             + `${err instanceof Error ? err.message : String(err)}`,
           );
         });
       }
     }
-    if (session.listenerPresenceStale && !session.listenerRejoinCardMessageId) {
-      void sendVcMeetingListenerRejoinCard(session, cfg).catch((err) => {
+  } else if (session.consumerMode === 'pending') {
+    session.consumerRestoreCatchUpRequired = !catchUpVcMeetingConsumerForRestore(session, cfg);
+    session.consumerSelectionNonce = undefined;
+    session.consumerSelectionExpiresAt = undefined;
+    session.consumerRestoreSelectionCardRequired = true;
+  }
+  scheduleVcMeetingListenerFlush(key, cfg);
+  scheduleVcMeetingRestoreImmediateTick(key, cfg);
+  if (session.consumerMode === 'agent') {
+    scheduleVcMeetingConsumerInjection(key, cfg);
+  }
+  if (restoredProfileMemberships.activations.length > 0
+    || restoredProfileMemberships.pauses.length > 0) {
+    void resumeVcMeetingRestoredProfileMemberships(
+      key,
+      session,
+      cfg,
+      restoredProfileMemberships.activations,
+      restoredProfileMemberships.pauses,
+    ).catch((err) => {
+      logger.warn(
+        `[vc-agent] restored profile membership reconciliation failed meeting=${record.meeting.id}: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  }
+  if (session.consumerMode === 'pending') {
+    // The old nonce intentionally was not durable. Replace the stale card
+    // with a freshly signed one after rehydrating the pre-selection backlog.
+    if (!session.consumerRestoreCatchUpRequired) {
+      void ensureVcMeetingRestoredSelectionCard(key, session, cfg).catch((err) => {
         logger.warn(
-          `[vc-agent] restored listener rejoin card failed meeting=${record.meeting.id}: `
+          `[vc-agent] restored consumer selection card failed meeting=${record.meeting.id}: `
           + `${err instanceof Error ? err.message : String(err)}`,
         );
       });
     }
-    if (migratePreparedConsumer) {
-      persistVcMeetingRuntimeSession(session, cfg);
-      logger.info(
-        `[vc-agent] migrated prepared meeting runtime to dedicated Q&A ` +
-        `meeting=${record.meeting.id} agent=${session.qaAgentAppId ?? '-'} chat=${record.listenerChatId}`,
-      );
-    }
-    logger.info(`[vc-agent] restored runtime session meeting=${record.meeting.id} chat=${record.listenerChatId} bot=${larkAppId}`);
   }
+  if (session.listenerPresenceStale && !session.listenerRejoinCardMessageId) {
+    void sendVcMeetingListenerRejoinCard(session, cfg).catch((err) => {
+      logger.warn(
+        `[vc-agent] restored listener rejoin card failed meeting=${record.meeting.id}: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    });
+  }
+  if (migratePreparedConsumer) {
+    persistVcMeetingRuntimeSession(session, cfg);
+    logger.info(
+      `[vc-agent] migrated prepared meeting runtime to dedicated Q&A ` +
+      `meeting=${record.meeting.id} agent=${session.qaAgentAppId ?? '-'} chat=${record.listenerChatId}`,
+    );
+  }
+  logger.info(`[vc-agent] restored runtime session meeting=${record.meeting.id} chat=${record.listenerChatId} bot=${larkAppId}`);
 }
 
 async function maybeStartVcMeetingRealtimeVoice(
@@ -32467,7 +32538,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // readOnly, and the dashboard shows them until the owner fixes the config.
     const forbiddenRw = findForbiddenReadWritePaths(cfg.sandboxPaths?.readWrite);
     if (forbiddenRw.length) {
-      logger.warn(`[sandbox:${cfg.larkAppId}] ${forbiddenReadWriteMessage(forbiddenRw)}（沙盒会话忽略根目录与相对路径条目、主目录与 botmux 数据目录类条目按只读处理）`);
+      logger.warn(`[sandbox:${cfg.larkAppId}] ${forbiddenReadWriteMessage(forbiddenRw)}（沙盒会话忽略根目录、/run 与相对路径条目、主目录与 botmux 数据目录类条目按只读处理）`);
     }
     const readOnlyRoot = findReadOnlyLauncherMountCovers(cfg.sandboxPaths?.readOnly);
     if (readOnlyRoot.length) {
@@ -33042,14 +33113,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         activeCaller: context.activeCaller,
         activeController: context.activeController,
       });
-      if (!envelope || !proposer || !active
-        || sameTrustedPrincipal(active.caller, proposer)
-        || sameTrustedPrincipal(active.controller, proposer)) {
+      const gaps = crossPrincipalRerouteGaps({ envelope, proposer, active });
+      if (gaps.length > 0 || !envelope || !proposer || !active) {
+        // A retry hits the same worker gate while the active turn is still running.
         logger.error(
-          `[${tag(ds)}] deterministic principal rejection lacked a safe reroute envelope/owner `
-          + `turn=${context.turnId.slice(0, 12)}`,
+          `[${tag(ds)}] deterministic principal rejection lacked a safe reroute gaps=${gaps.join(',')}; `
+          + `failing delivery as not executed turn=${context.turnId.slice(0, 12)}`,
         );
-        return false;
+        return 'not_executed';
       }
       return stageCrossPrincipalInterruption({
         ds,
@@ -34110,7 +34181,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     inputCapture.start();
     const botEventHandlers: EventHandlers = {
       captureHumanInput: data => captureInboundText(data, inputCapture,
-        id => isKnownPeerBot(config.session.dataDir, cfg.larkAppId, id)),
+        id => isKnownPeerBot(config.session.dataDir, cfg.larkAppId, id),
+        // Same fold as decideRouting: p2p chat mode keeps DM replies in the chat session unless the root seeded a /t topic.
+        (chatId, rootId) => {
+          const p2pMode = getBot(cfg.larkAppId).config.p2pMode;
+          return p2pMode !== 'thread' && p2pMode !== 'group' && !isP2pForceTopicRoot(cfg.larkAppId, rootId, chatId);
+        }),
       handleCardAction: (data, appId) => withBotTurnAdmission(
         appId,
         () => cardActionPluginGateway.dispatch(data, appId),
@@ -34251,10 +34327,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               await primaryControlRuntime?.authorizeBeforeAck(data) === true,
             pendingPrimaryControlCard: data =>
               primaryControlRuntime?.pendingCardBeforeAck(data),
-            readPrimarySession: async stableKey => {
-              const current = await durableCoordinationRuntime.store.readSession(stableKey);
-              return current ? parseDurablePrimarySessionRecord(current).session : undefined;
-            },
+            readPrimarySession: async stableKey =>
+              canonicalPrimarySession(await durableCoordinationRuntime.store.readSession(stableKey)),
             takeOverPrimarySession,
           },
         );

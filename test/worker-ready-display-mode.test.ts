@@ -178,6 +178,8 @@ import { getBot } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { applyHandoffCardEvent } from '../src/core/handoff-card-lifecycle.js';
 import { resetTerminalProxy, setTerminalProxyPort } from '../src/core/terminal-url.js';
+import { beginReplyTargetTurn, REPLY_TARGETS_MAX } from '../src/core/reply-target.js';
+import { logger } from '../src/utils/logger.js';
 
 const getBotMock = getBot as ReturnType<typeof vi.fn>;
 
@@ -2254,6 +2256,51 @@ describe('independent acceptance currentTurnId compatibility', () => {
     await flush();
     expect(ds.currentImageKey).toBe('img_http_current');
     expect(updateMessageMock).toHaveBeenCalled();
+  });
+});
+
+describe('turn_input_committed without a dispatch receipt', () => {
+  const ingressBaseMs = Date.parse('2026-11-07T08:00:00.000Z');
+  const ingressAt = (offsetSec: number) => new Date(ingressBaseMs + offsetSec * 1000).toISOString();
+
+  function prepareChatSession() {
+    vi.clearAllMocks();
+    getBotMock.mockReturnValue({ config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' }, resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot' } as any);
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_unused'), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, workerGeneration: 1, scope: 'chat' });
+    ds.session.scope = 'chat'; ds.session.rootMessageId = 'oc_chat'; ds.session.workerGeneration = 1;
+    setupActiveWorkerHandlers(ds, worker);
+    return { ds, worker };
+  }
+
+  it('logs a rootless chat-scope Lark turn at debug instead of warn', async () => {
+    const { ds, worker } = prepareChatSession();
+    beginReplyTargetTurn(ds, undefined, 'om_flat_turn', ingressAt(0), { inThread: false });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_flat_turn' });
+    await flush();
+    expect(ds.session.dispatchInputReceipts).toBeUndefined();
+    expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('om_flat_turn'));
+    expect(logger.debug).toHaveBeenCalledWith(expect.stringContaining('om_flat_turn'));
+  });
+
+  it.each([
+    ['its topic binding was evicted before the commit', (ds: DaemonSession) => {
+      beginReplyTargetTurn(ds, 'om_seed', 'om_kickoff', ingressAt(0), { inThread: true });
+      for (let i = 1; i <= REPLY_TARGETS_MAX; i++) {
+        beginReplyTargetTurn(ds, undefined, `om_later_${i}`, ingressAt(i), { inThread: false });
+      }
+    }],
+    ['it was folded flat out of a topic', (ds: DaemonSession) => {
+      beginReplyTargetTurn(ds, undefined, 'om_kickoff', ingressAt(0), { inThread: true, foldedRootId: 'om_answered' });
+    }],
+  ])('still warns for a Lark turn that arrived inside a topic when %s', async (_label, ingress) => {
+    const { ds, worker } = prepareChatSession();
+    ingress(ds);
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_kickoff' });
+    await flush();
+    expect(ds.session.dispatchInputReceipts?.om_kickoff).toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('om_kickoff'));
   });
 });
 

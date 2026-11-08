@@ -16,7 +16,7 @@ Botmux uses Lark cards to show what the CLI is doing, and lets you control it ri
 A few notes:
 
 - Status marks and the status card are **either/or**: with the status card on, no reactions are added; with it off, the reaction is the only lightweight progress signal. Swap the two emoji with `receivedReactionEmoji` / `doneReactionEmoji` (see [bots.json](/en/bots-json)).
-- The thinking process needs Lark PC ≥ 7.70 or mobile ≥ 7.74, and only appears for CLIs that emit thinking (Claude Code, Codex, TraeX, Pi and others).
+- The thinking process needs Lark PC ≥ 7.70 or mobile ≥ 7.74, and only appears for CLIs that emit thinking (Claude Code, Codex, TraeX, Pi, Kimi and others).
 - To get "one card per turn" instead, see the "Dynamic single cards" section below.
 
 ## Terminal status card
@@ -130,7 +130,8 @@ Want only one card? Choose dynamic single card and turn off "**Show a separate s
 
 ### Which sessions are supported
 
-- Supported: ordinary Lark conversations with Claude Code, Codex, Grok, TraeX and Pi **without a file sandbox** (both regular groups and topics).
+- Supported: ordinary Lark conversations with Claude Code, Codex, Grok, TraeX, Pi and Kimi **without a file sandbox** (both regular groups and topics).
+- Kimi's process comes from its local session log, which Kimi writes once per completed model step: thinking and tools update step by step rather than token by token, and the closing answer is delivered by `botmux send` rather than repeated in the process.
 - Not supported, still using the default mode: file-sandbox sessions (including `readIsolation` and global `BOTMUX_SANDBOX=1`), API-only, non-Lark channels, remote Riff/Mojo, adopt, local terminal sync, doc comments, video meetings, scheduled tasks, and v3 workflows.
 - Sandbox state is fixed when the session starts; changing the bot's sandbox switch does not affect running sessions.
 

@@ -5298,13 +5298,15 @@ describe('Bridge final_output delivery (P2 retry)', () => {
 describe('Worker hidden schedule retirement', () => {
   const turnId = 'schedule:task-hidden:11111111-2222-3333-4444-555555555555';
 
-  function prepareHiddenRun(armedAt = Date.now(), hidden = true, humanFollowUp = false) {
+  function prepareHiddenRun(
+    armedAt = Date.now(), hidden = true, humanFollowUp = false,
+    routingAnchor = 'schedule-run:task-hidden:11111111-2222-3333-4444-555555555555',
+  ) {
     const ds = makeDs();
     ds.adoptedFrom = undefined;
     ds.session.cliId = 'traex';
     ds.session.deferredScheduleRun = {
-      taskId: 'task-hidden', turnId,
-      routingAnchor: 'schedule-run:task-hidden:11111111-2222-3333-4444-555555555555',
+      taskId: 'task-hidden', turnId, routingAnchor,
       createdAt: new Date().toISOString(),
     };
     ds.session.rootMessageId = ds.session.deferredScheduleRun.routingAnchor;
@@ -5377,6 +5379,56 @@ describe('Worker hidden schedule retirement', () => {
     await Promise.resolve();
     expect(onDeferredScheduleTurnSettled).toHaveBeenCalledTimes(2);
     expect(onDeferredScheduleTurnSettled).toHaveBeenLastCalledWith(ds, { turnId, source: 'idle' });
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('does not settle a re-fired task-position run on the previous turn\'s unattributed idle', async () => {
+    const { ds, sessionReply, onDeferredScheduleTurnSettled } = prepareHiddenRun(
+      Date.now(), true, false, 'schedule-task:task-hidden',
+    );
+    const rerunTurnId = 'schedule:task-hidden:66666666-7777-8888-9999-000000000000';
+    ds.session.deferredScheduleRun!.turnId = rerunTurnId;
+    ds.deferredScheduleUnconfirmedTurnId = rerunTurnId;
+    const idle: Extract<WorkerToDaemon, { type: 'screen_update' }> = {
+      type: 'screen_update', content: 'ready', status: 'idle',
+    };
+    (ds.worker as any).emit('message', idle);
+    await Promise.resolve();
+    expect(ds.lastScreenStatus).toBe('idle');
+    expect(onDeferredScheduleTurnSettled).not.toHaveBeenCalled();
+
+    (ds.worker as any).emit('message', { ...idle, status: 'working', turnId: rerunTurnId });
+    (ds.worker as any).emit('message', idle);
+    await Promise.resolve();
+    expect(onDeferredScheduleTurnSettled).toHaveBeenCalledExactlyOnceWith(ds, { turnId: rerunTurnId, source: 'idle' });
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('does not let an in-flight frame stamped with the previous turn disarm the marker', async () => {
+    // The scheduler rewrites run.turnId in the daemon while the worker's periodic
+    // sampler may already have queued a screen_update stamped with the OLD turn.
+    // That frame matches neither run nor marker: it must neither settle nor clear
+    // the marker, or the old turn's later unattributed tail would settle the new
+    // turn again.
+    const oldTurn = turnId;
+    const rerunTurnId = 'schedule:task-hidden:66666666-7777-8888-9999-000000000000';
+    const { ds, sessionReply, onDeferredScheduleTurnSettled } = prepareHiddenRun(
+      Date.now(), true, false, 'schedule-task:task-hidden',
+    );
+    ds.session.deferredScheduleRun!.turnId = rerunTurnId;
+    ds.deferredScheduleUnconfirmedTurnId = rerunTurnId;
+    ds.silentScheduledTurns = new Map([[oldTurn, Date.now()], [rerunTurnId, Date.now()]]);
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'wrapping up', status: 'idle', turnId: oldTurn,
+    });
+    await Promise.resolve();
+    expect(onDeferredScheduleTurnSettled).not.toHaveBeenCalled();
+
+    (ds.worker as any).emit('message', {
+      type: 'screen_update', content: 'ready', status: 'idle',
+    });
+    await Promise.resolve();
+    expect(onDeferredScheduleTurnSettled).not.toHaveBeenCalled();
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
