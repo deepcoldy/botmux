@@ -8661,9 +8661,9 @@ esac
         await page.goto(`http://127.0.0.1:${(server.address() as any).port}`);
         const picker = page.locator('[data-section="codex-profile"]');
         await picker.locator('[role="status"]').filter({ hasText: /扫描完成|Scan complete/ }).waitFor();
-        await page.locator('#bd-menu-codexProfile summary').click();
-        await page.locator('#bd-menu-codexProfile input[type="search"]').fill('with');
-        await page.locator('#bd-menu-codexProfile button').filter({ hasText: /^withhooks$/ }).click();
+        await page.locator('#bd-menu-codexProfile .sect-sort-trigger').click();
+        await page.locator('.sect-sort-pop:visible .sect-sort-search').fill('with');
+        await page.locator('.sect-sort-pop:visible [role="option"]').filter({ hasText: /^withhooks$/ }).click();
         await page.locator('[data-action="save-agent"]').click();
         await page.locator('[data-saved-launch]').filter({ hasText: '"codexProfile": "withhooks"' }).waitFor();
         expect(requests[0]).toMatchObject({ codexProfile: 'withhooks' });
@@ -8680,9 +8680,9 @@ esac
         if (process.env.BOTMUX_PROFILE_SCREENSHOT_DIR) {
           await page.screenshot({ path: join(process.env.BOTMUX_PROFILE_SCREENSHOT_DIR, 'profile-missing.png'), fullPage: true });
         }
-        await page.locator('#bd-menu-codexProfile summary').click();
-        await page.locator('#bd-menu-codexProfile input[type="search"]').fill('');
-        await page.locator('#bd-menu-codexProfile button').filter({ hasText: /不指定 profile|No profile/ }).click();
+        await page.locator('#bd-menu-codexProfile .sect-sort-trigger').click();
+        await page.locator('.sect-sort-pop:visible .sect-sort-search').fill('');
+        await page.locator('.sect-sort-pop:visible [role="option"]').filter({ hasText: /不指定 profile|No profile/ }).click();
         await page.locator('[data-action="save-agent"]').click();
         await page.locator('[data-saved-launch]').filter({ hasText: '"codexProfile": null' }).waitFor();
         expect(disk()).not.toHaveProperty('codexProfile');
@@ -9009,8 +9009,8 @@ esac
           mkdirSync(process.env.BOTMUX_WRAPPER_SCREENSHOT_DIR, { recursive: true });
           await page.screenshot({ path: join(process.env.BOTMUX_WRAPPER_SCREENSHOT_DIR, 'wrapper-preserved.png'), fullPage: true });
         }
-        await page.locator('#bd-menu-agentCliId summary').click();
-        await page.locator('#bd-menu-agentCliId button[aria-current="true"]').click();
+        await page.locator('#bd-menu-agentCliId .sect-sort-trigger').click();
+        await page.locator('.sect-sort-pop:visible [role="option"][data-selected]').click();
         await page.locator('[data-codex-runtime]').waitFor();
         await page.locator('[data-action="save-agent"]').click();
         await page.locator('[data-saved-launch]').filter({ hasText: '"wrapperCli": null' }).waitFor();
