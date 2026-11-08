@@ -17,10 +17,12 @@
  *    两套计数各自从 1 起算会把限流整个绕过去（实测 20 次崩溃停止 0 次）。因此
  *    两个计数（总次数 `count`、永久次数 `permanentCount`）都只增不减，永久通道
  *    用自己的累计值判闸，而不是本次退出码。
- *  - **恢复健康即清零**：计数只在「连续失败」里才有意义。CLI 一旦报告 ready
- *    （prompt_ready），说明它真的跑起来了；此前那次历史性 127 不该让这条会话
- *    此后任何一次 127 都立即不重启（实测隔 90 天仍如此）。清零由调用方在 ready
- *    时做（worker-pool 的 prompt_ready 分支 delete 掉该 session 的计数）。
+ *  - **恢复健康即清零**：计数只在「连续失败」里才有意义。CLI 真的跑起来之后，
+ *    此前那次历史性 127 不该让这条会话此后任何一次 127 都立即不重启（实测隔
+ *    90 天仍如此）。但「到了 prompt」不等于恢复健康：CLI 可能每收到一条输入就
+ *    退出，每次重启又都能到 prompt，ready 即清零会让熔断永远不触发（#2551）。
+ *    所以调用方只在 prompt_ready 时记下本轮崩溃后首次 ready 的时间（readyAt），
+ *    ready 后稳定存活满一个窗口再崩溃，才视为新的一轮。
  *    本模块因此不缓存任何跨会话状态，重置语义天然成立。
  */
 
@@ -40,13 +42,15 @@ export function isPermanentCliExitCode(code: number | null | undefined): boolean
 }
 
 export interface RestartCounter {
-  /** 连续失败总次数（跨性质累计；CLI ready 后由调用方清掉整条记录）。 */
+  /** 连续失败总次数（跨性质累计；ready 后存活满窗口由本判定作废，或 Node worker 换代时由调用方删除）。 */
   count: number;
   lastAt: number;
   /** 上一次崩溃的退出码，用于日志与性质判断。 */
   lastCode?: number | null;
   /** 本轮连续失败里命中永久退出码的次数（跨性质累计）。 */
   permanentCount?: number;
+  /** 上一次崩溃后 CLI 首次报告 ready 的时间；之后存活满一个窗口才算恢复健康。 */
+  readyAt?: number;
 }
 
 export interface RestartDecisionInput {
@@ -72,19 +76,23 @@ export function decideAutoRestart(input: RestartDecisionInput): RestartDecision 
   const defaultMax = input.defaultMax ?? DEFAULT_MAX_RESTARTS;
   const fatalMax = input.fatalMax ?? FATAL_MAX_RESTARTS;
   const permanent = isPermanentCliExitCode(input.code);
+  // ready 后稳定存活满一个窗口才作废上一轮连续失败；ready 后很快又退出的仍属同一轮。
+  const prev = input.prev?.readyAt !== undefined && input.now - input.prev.readyAt > windowMs
+    ? undefined
+    : input.prev;
 
-  const withinWindow = input.prev !== undefined && input.now - input.prev.lastAt <= windowMs;
-  const prevPermanent = input.prev !== undefined && isPermanentCliExitCode(input.prev.lastCode);
-  const prevCount = input.prev?.count ?? 0;
-  const prevPermanentCount = input.prev?.permanentCount
+  const withinWindow = prev !== undefined && input.now - prev.lastAt <= windowMs;
+  const prevPermanent = prev !== undefined && isPermanentCliExitCode(prev.lastCode);
+  const prevCount = prev?.count ?? 0;
+  const prevPermanentCount = prev?.permanentCount
     // 兼容老记录（引入 permanentCount 前写入的项）：按上一次退出码补算。
     ?? (prevPermanent ? prevCount : 0);
 
   // 计数只增不减 —— 性质切换（永久↔普通）**不**重置，否则来回横跳即可无限续命。
-  // 唯一的重置入口是「恢复健康」（调用方在 prompt_ready 时删除计数）。
+  // 唯一的重置入口是「恢复健康」（ready 后稳定存活满一个窗口，见上）。
   // 时间窗只用来判断「这次普通崩溃是否属于同一轮抖动」。
   let count: number;
-  if (input.prev === undefined) {
+  if (prev === undefined) {
     count = 1;
   } else if (permanent && prevPermanent) {
     // 同一类确定性失败反复发生：跨窗也累计（本 PR 主治的慢启动必崩场景）。

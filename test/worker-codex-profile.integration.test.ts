@@ -19,7 +19,9 @@ it.skipIf(backendType === 'tmux' && !probeTmuxFunctional().ok)(`validates real $
 const fs = require('node:fs');
 if (process.argv.includes('--version')) { console.log('codex-cli 0.134.0'); process.exit(0); }
 if (process.argv.includes('--help')) { console.log('--profile PROFILE'); process.exit(0); }
-fs.writeFileSync(${JSON.stringify(report)}, JSON.stringify({pid:process.pid, args:process.argv.slice(2), home:process.env.CODEX_HOME}));
+// tmp + rename: the test polls for existence, so publish only a complete report.
+fs.writeFileSync(${JSON.stringify(`${report}.tmp`)}, JSON.stringify({pid:process.pid, args:process.argv.slice(2), home:process.env.CODEX_HOME}));
+fs.renameSync(${JSON.stringify(`${report}.tmp`)}, ${JSON.stringify(report)});
 process.stdout.write('› Ask Codex to do anything\\n  explicit-model · /tmp\\n');
 setInterval(() => {}, 1000);
 `, { mode: 0o700 });

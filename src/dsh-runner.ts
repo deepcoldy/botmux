@@ -41,6 +41,7 @@ import { createRunnerTerminal } from './runner-common.js';
 import { parseArgs, MAX_TURN_TIMEOUT_MS, type Args } from './dsh-runner-args.js';
 import { appendPendingNotification } from './dsh-runner-pending.js';
 import { resolveDshModel } from './dsh-runner-config.js';
+import { cotEntriesFromAssistantMessage, cotEntryFromToolCall, cotEntryFromToolResult } from './services/dsh-cot.js';
 
 const DSH_MARKER = '::botmux-dsh:';
 const EMPTY_TURN_REPLY = 'DeepSeek Harness 已结束本轮处理，但没有生成最终回复；无法确认任务是否成功，请查看会话执行记录。';
@@ -59,6 +60,7 @@ const MAX_TURN_DURATION_MULTIPLIER = 4;
 /** Upper bound on notifications buffered while waiting for this turn's inbox
  *  spliced receipt — see dsh-runner-pending.ts. */
 const HANDSHAKE_TIMEOUT_MS = 30_000;
+const INITIALIZE_RETRY_INTERVAL_MS = 1_000;
 const PROMPT_ACK_TIMEOUT_MS = 30_000;
 const SHUTDOWN_GRACE_MS = 2_000;
 const DEFAULT_MAX_TOKENS = 49152;
@@ -145,7 +147,7 @@ function migrateGeneratedBotmuxProfile(name: string, pkgJson: string, cordisPatc
   const pkg = readJsonRecord(pkgJson);
   if (pkg) {
     const deps = isRecord(pkg.dependencies) ? { ...pkg.dependencies } : {};
-    if (deps[DSH_TOOL_ASK_USER_PACKAGE] !== DSH_TOOL_ASK_USER_DEP) {
+    if (deps[DSH_TOOL_ASK_USER_PACKAGE] === undefined) {
       deps[DSH_TOOL_ASK_USER_PACKAGE] = DSH_TOOL_ASK_USER_DEP;
       pkg.dependencies = deps;
       writeFileSync(pkgJson, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
@@ -526,6 +528,8 @@ function handleSessionEvent(turn: PendingTurn, event: unknown): void {
       if (callId) turn.toolNames.set(callId, name);
       const argsText = typeof ev.data?.arguments === 'string' ? ev.data.arguments : '';
       writeLine(`🔧 ${name} ${truncate(argsText, 200)}`);
+      const entry = cotEntryFromToolCall(ev.data);
+      if (entry) emitMarker('cot', { entries: [entry] });
       break;
     }
     case 'tool/result': {
@@ -534,6 +538,8 @@ function handleSessionEvent(turn: PendingTurn, event: unknown): void {
       const name = turn.toolNames.get(callId) ?? 'tool';
       const isError = Array.isArray(message?.content) && message.content.some(c => c?.isError === true);
       writeLine(`${isError ? '✗' : '✓'} ${name}`);
+      const entry = cotEntryFromToolResult(ev.data);
+      if (entry) emitMarker('cot', { entries: [entry] });
       break;
     }
     case 'turn/end': {
@@ -560,6 +566,9 @@ function handleSessionEvent(turn: PendingTurn, event: unknown): void {
       // usage is per model call; accumulate across steps for a turn total.
       const usage = normalizeUsage(ev.data?.usage);
       if (usage) turn.usage = turn.usage ? addUsage(turn.usage, usage) : usage;
+      for (const entry of cotEntriesFromAssistantMessage(ev.data?.message)) {
+        emitMarker('cot', { entries: [entry] });
+      }
       break;
     }
     default:
@@ -830,11 +839,25 @@ async function main(): Promise<void> {
   };
   client.start();
 
-  const initializeResult = await client.request<unknown>(
-    'initialize',
-    { cwd, provider: selection.provider, model: selection.model, maxTokens: DEFAULT_MAX_TOKENS },
-    HANDSHAKE_TIMEOUT_MS,
-  );
+  // A plugin provider registers its models asynchronously after the plugin
+  // loader settles, so an initialize sent right after spawn can be rejected
+  // with "has no configured model" until that finishes.
+  const handshakeDeadline = Date.now() + HANDSHAKE_TIMEOUT_MS;
+  let initializeResult: unknown;
+  for (;;) {
+    try {
+      initializeResult = await client.request<unknown>(
+        'initialize',
+        { cwd, provider: selection.provider, model: selection.model, maxTokens: DEFAULT_MAX_TOKENS },
+        Math.max(1, handshakeDeadline - Date.now()),
+      );
+      break;
+    } catch (err) {
+      if (!errorMessage(err).includes('has no configured model')
+        || Date.now() + INITIALIZE_RETRY_INTERVAL_MS >= handshakeDeadline) throw err;
+      await new Promise(resolve => setTimeout(resolve, INITIALIZE_RETRY_INTERVAL_MS));
+    }
+  }
   const { serverInfo } = parseInitializeResult(initializeResult);
   writeLine(`dsh connected (${serverInfo.name} ${serverInfo.version}).`);
 

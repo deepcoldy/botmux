@@ -6,6 +6,7 @@ import { config } from '../config.js';
 import { readGlobalConfig } from '../global-config.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
+import { withManagedDirectories } from './managed-directory-retention.js';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from '../core/daemon-ipc-auth.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { loadAllSessionsSnapshot } from './session-store.js';
@@ -117,7 +118,8 @@ function readIndex(): WhiteboardIndex {
 
 function writeIndex(index: WhiteboardIndex): void {
   ensureRoot();
-  atomicWriteFileSync(indexPath(), JSON.stringify(index, null, 2) + '\n');
+  withManagedDirectories(index, () =>
+    atomicWriteFileSync(indexPath(), JSON.stringify(index, null, 2) + '\n'));
 }
 
 // Locks reuse the cross-process file-lock primitive (utils/file-lock.ts): it
@@ -211,7 +213,8 @@ function defaultTitle(input: EnsureWhiteboardInput): string {
 
 function writeMeta(meta: WhiteboardMeta): void {
   mkdirSync(dirname(metaPath(meta.id)), { recursive: true });
-  atomicWriteFileSync(metaPath(meta.id), JSON.stringify(meta, null, 2) + '\n');
+  withManagedDirectories(meta, () =>
+    atomicWriteFileSync(metaPath(meta.id), JSON.stringify(meta, null, 2) + '\n'));
 }
 
 function syncMetaFromDisk(id: string, fallback?: WhiteboardMeta): WhiteboardMeta | undefined {

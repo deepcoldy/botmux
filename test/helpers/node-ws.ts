@@ -1,6 +1,7 @@
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import type WS from 'ws';
+import type { WebSocketServer as NodeWebSocketServer } from 'ws';
 
 /**
  * The Node `ws` implementation, loaded by filesystem path.
@@ -12,7 +13,7 @@ import type WS from 'ws';
 const require = createRequire(import.meta.url);
 const wsPkgDir = dirname(require.resolve('ws/package.json'));
 const ws = require(join(wsPkgDir, 'index.js')) as typeof WS & {
-  WebSocketServer: typeof WS.WebSocketServer;
+  WebSocketServer: typeof NodeWebSocketServer;
 };
 
 export const WebSocket = ws;

@@ -1,8 +1,8 @@
 import type { ChildProcess } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker } from '../src/types.js';
@@ -32,9 +32,16 @@ afterEach(async () => {
     if (child.connected) try { child.send({ type: 'close' }, () => {}); } catch { /* exiting */ }
     await until(() => child.exitCode !== null || child.signalCode !== null, [], 3000).catch(() => child.kill('SIGKILL'));
     await until(() => child.exitCode !== null || child.signalCode !== null, [], 3000);
-    if (existsSync(cliObservation)) {
-      const { pid } = JSON.parse(readFileSync(cliObservation, 'utf8'));
+    if (hasCompleteJson(cliObservation)) {
+      const { pid, TMPDIR } = JSON.parse(readFileSync(cliObservation, 'utf8'));
       try { process.kill(pid, 'SIGKILL'); } catch { /* already reaped */ }
+      // The short root lives outside this fixture. Remove only its own alias,
+      // after the worker has stopped, without touching other sessions' roots.
+      const alias = dirname(dirname(TMPDIR));
+      if (lstatSync(alias, { throwIfNoEntry: false })?.isSymbolicLink()
+        && realpathSync(alias) === realpathSync(join(root, '.cache', 'botmux', 'session-tmp'))) {
+        unlinkSync(alias);
+      }
     }
     rmSync(root, { recursive: true, force: true });
   }
@@ -80,8 +87,16 @@ setInterval(() => {}, 1000);
     const profile = createHash('sha256').update(resolve(dataDir)).digest('hex').slice(0, 8);
     const key = createHash('sha256').update('temp-env-probe').digest('hex').slice(0, 16);
     const expected = join(root, '.cache', 'botmux', 'session-tmp', profile, key);
+    const worker = JSON.parse(readFileSync(workerObservation, 'utf8'));
     for (const file of [workerObservation, cliObservation]) {
-      expect(JSON.parse(readFileSync(file, 'utf8'))).toMatchObject({ TMPDIR: expected, TMP: expected, TEMP: expected, tmpdir: expected });
+      const observation = JSON.parse(readFileSync(file, 'utf8'));
+      expect(observation).toMatchObject({ TMPDIR: worker.TMPDIR, TMP: worker.TMPDIR, TEMP: worker.TMPDIR, tmpdir: worker.TMPDIR });
+      // Both processes must use the same lexical path while retaining the
+      // profile/session-specific physical backing directory.
+      expect(realpathSync(observation.TMPDIR)).toBe(realpathSync(expected));
+      if (typeof process.getuid === 'function') {
+        expect(Buffer.byteLength(join(observation.TMPDIR, '.org.chromium.Chromium.XXXXXX', 'SingletonSocket'))).toBeLessThan(104);
+      }
     }
     expect(existsSync(expected)).toBe(true);
   }, 25000);

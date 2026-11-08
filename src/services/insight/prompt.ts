@@ -8,6 +8,7 @@ function extractBotmuxUserText(value: string): string {
   let text = match?.[1] ?? value;
   text = text
     .replace(/<botmux_reminder>[\s\S]*?<\/botmux_reminder>/g, '')
+    .replace(/<botmux_formatting>[\s\S]*?<\/botmux_formatting>/g, '')
     .replace(/<mentions>[\s\S]*?<\/mentions>/g, '')
     .replace(/<sender\b[\s\S]*?<\/sender>/g, '')
     .replace(/<sender\b[\s\S]*?\/>/g, '')

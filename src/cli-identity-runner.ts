@@ -23,8 +23,9 @@ async function main(): Promise<void> {
     tool: tool!,
   });
   // The daemon proved the caller's lineage and returns the identity env
-  // ASSIGNMENTS themselves. Print only the body for the wrapper to eval; the
-  // body never names a disk path, so nothing in the session can redirect it.
+  // ASSIGNMENTS themselves. Print only the body for the wrapper to eval. The
+  // body is chosen by the daemon alone; the only path it may carry is the
+  // per-person HOME the daemon derived (bytedcli), never one the session picks.
   process.stdout.write(execution.env);
 }
 

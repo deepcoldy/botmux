@@ -41,6 +41,25 @@ describe('resolveBotRefs', () => {
     expect(r.larkAppIds).toEqual(['cli_claude_1', 'cli_codex_1']);
   });
 
+  it.each([42, {}, true])('ignores a truthy non-string botName before a valid match: %j', botName => {
+    const r = resolveBotRefs(
+      ['Codex'],
+      [CFG_CODEX],
+      [{ larkAppId: 'cli_malformed', botName }, INFO_CODEX],
+    );
+    expect(r.larkAppIds).toEqual(['cli_codex_1']);
+    expect(r.invalid).toEqual([]);
+  });
+
+  it('ignores null and scalar registry rows before a valid match', () => {
+    const r = resolveBotRefs(
+      ['Codex'],
+      [CFG_CODEX],
+      [null, 42, 'x', INFO_CODEX],
+    );
+    expect(r.larkAppIds).toEqual(['cli_codex_1']);
+  });
+
   it('resolves multiple bots preserving input order', () => {
     const r = resolveBotRefs(['CoCo', 'Claude'], [CFG_COCO_1, CFG_CLAUDE], [INFO_COCO_1, INFO_CLAUDE]);
     expect(r.larkAppIds).toEqual(['cli_coco_1', 'cli_claude_1']);

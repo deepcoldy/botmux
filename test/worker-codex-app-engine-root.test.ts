@@ -60,6 +60,7 @@ async function harness() {
     rejectCodexAppControlMarker: vi.fn(),
   };
   scope.failCodexAppControlGeneration = vi.fn(() => { scope.codexAppControlFatal = true; });
+  scope.restoreCodexAppAttestedTurn = loadWorkerFunction('restoreCodexAppAttestedTurn', scope);
   scope.waitForCodexAppEngineRoot = loadWorkerFunction('waitForCodexAppEngineRoot', scope);
   scope.publishLocalProcessAttestation = loadWorkerFunction('publishLocalProcessAttestation', scope);
   const handle = loadWorkerFunction<(...args: any[]) => Promise<boolean>>('handleTrustedCodexAppMarker', scope);

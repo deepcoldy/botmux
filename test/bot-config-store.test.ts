@@ -50,7 +50,8 @@ async function freshModules() {
   const registry = await import('../src/bot-registry.js');
   const store = await import('../src/services/bot-config-store.js');
   const pinStreamingCardChange = await import('../src/services/pin-streaming-card-change.js');
-  return { registry, store, pinStreamingCardChange };
+  const sessionGroups = await import('../src/services/session-groups-store.js');
+  return { registry, store, pinStreamingCardChange, sessionGroups };
 }
 
 describe('bot-config store', () => {
@@ -81,10 +82,174 @@ describe('bot-config store', () => {
   }
   async function loaded(entry: Record<string, unknown> = {}) {
     writeConfig(entry);
-    const { registry, store, pinStreamingCardChange } = await freshModules();
+    const { registry, store, pinStreamingCardChange, sessionGroups } = await freshModules();
     registry.loadBotConfigs().forEach((c: any) => registry.registerBot(c));
-    return { registry, store, pinStreamingCardChange };
+    return { registry, store, pinStreamingCardChange, sessionGroups };
   }
+
+  it('checks a picker model snapshot inside the file lock before writing effort', async () => {
+    const { registry, store } = await loaded({ model: 'opus' });
+    const { withFileLock } = await import('../src/utils/file-lock.js');
+    let announce!: () => void;
+    let release!: () => void;
+    const held = new Promise<void>(r => { announce = r; });
+    const finished = new Promise<void>(r => { release = r; });
+    const holder = withFileLock(configPath, async () => {
+      announce();
+      await finished;
+      const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+      raw[0].model = 'sonnet';
+      writeFileSync(configPath, JSON.stringify(raw));
+    });
+    await held;
+    const pending = store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, 'high', { selectionKey: 'claude-code', model: 'opus' });
+    release();
+    await holder;
+    const result = await pending;
+    expect(result).toMatchObject({ ok: false, reason: 'config_selection_changed' });
+    expect(readConfig()).toMatchObject({ model: 'sonnet' });
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it('checks a picker CLI snapshot inside the file lock before writing a model', async () => {
+    const { store } = await loaded({ model: 'opus' });
+    const { withFileLock } = await import('../src/utils/file-lock.js');
+    let announce!: () => void;
+    let release!: () => void;
+    const held = new Promise<void>(r => { announce = r; });
+    const finished = new Promise<void>(r => { release = r; });
+    const holder = withFileLock(configPath, async () => {
+      announce(); await finished;
+      const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+      raw[0].cliId = 'codex'; writeFileSync(configPath, JSON.stringify(raw));
+    });
+    await held;
+    const pending = store.applyConfigField('app_default', store.findConfigField('model')!, 'sonnet', { selectionKey: 'claude-code' });
+    release(); await holder;
+    expect(await pending).toMatchObject({ ok: false, reason: 'config_selection_changed' });
+    expect(readConfig()).toMatchObject({ cliId: 'codex', model: 'opus' });
+  });
+
+  it('refuses a picker write when the backend loses launch-model support while waiting for the lock', async () => {
+    const { registry, store } = await loaded({ model: 'opus' });
+    const { withFileLock } = await import('../src/utils/file-lock.js');
+    let announce!: () => void;
+    let release!: () => void;
+    const held = new Promise<void>(r => { announce = r; });
+    const finished = new Promise<void>(r => { release = r; });
+    const holder = withFileLock(configPath, async () => {
+      announce(); await finished;
+      const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+      raw[0].backendType = 'riff'; writeFileSync(configPath, JSON.stringify(raw));
+    });
+    await held;
+    const pending = store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, 'high', { selectionKey: 'claude-code', model: 'opus', requireLaunchModelSupport: true });
+    release(); await holder;
+    expect(await pending).toMatchObject({ ok: false, reason: 'config_selection_changed' });
+    expect(readConfig()).toMatchObject({ backendType: 'riff', model: 'opus' });
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it.each([false, true])('rechecks picker admin authorization under the lock (registry updated: %s)', async updateRegistry => {
+    const { registry, store } = await loaded({ model: 'opus' });
+    const { withFileLock } = await import('../src/utils/file-lock.js');
+    let announce!: () => void;
+    let release!: () => void;
+    const held = new Promise<void>(r => { announce = r; });
+    const finished = new Promise<void>(r => { release = r; });
+    const holder = withFileLock(configPath, async () => {
+      announce(); await finished;
+      const raw = JSON.parse(readFileSync(configPath, 'utf8'));
+      raw[0].allowedUsers = []; writeFileSync(configPath, JSON.stringify(raw));
+      if (updateRegistry) {
+        registry.getBot('app_default').config.allowedUsers = [];
+        registry.getBot('app_default').resolvedAllowedUsers = [];
+      }
+    });
+    await held;
+    const pending = store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, 'high', { selectionKey: 'claude-code', model: 'opus', actorOpenId: 'ou_owner' });
+    release(); await holder;
+    expect(await pending).toMatchObject({ ok: false, reason: 'config_selection_changed' });
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it('accepts and clears effort for the CLI default model with an exact picker snapshot', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('reasoningEffort')!;
+    const precondition = { selectionKey: 'claude-code', model: null };
+    expect((await store.applyConfigField('app_default', spec, 'high', precondition)).ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBe('high');
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('high');
+    expect((await store.applyConfigField('app_default', spec, null, precondition)).ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBeUndefined();
+  });
+
+  it('saves MiniMax effort and requires clearing it before switching to a model without levels', async () => {
+    const { registry, store } = await loaded({ cliId: 'minimax', model: 'minimax/MiniMax-M3.1-Flash' });
+    const effort = store.findConfigField('reasoningEffort')!;
+    expect((await store.applyConfigField('app_default', effort, 'xhigh')).ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBe('xhigh');
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('xhigh');
+    expect(registry.loadBotConfigs()[0].reasoningEffort).toBe('xhigh');
+    expect(await store.applyConfigField('app_default', store.findConfigField('model')!, 'minimax/MiniMax-M3'))
+      .toMatchObject({ ok: false, reason: 'reasoning_effort_not_supported_by_model' });
+    expect(readConfig()).toMatchObject({ model: 'minimax/MiniMax-M3.1-Flash', reasoningEffort: 'xhigh' });
+    expect((await store.applyConfigField('app_default', effort, null)).ok).toBe(true);
+    expect((await store.applyConfigField('app_default', store.findConfigField('model')!, 'minimax/MiniMax-M3')).ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it.each([
+    { cliId: 'codex', model: undefined },
+    { cliId: 'codex', model: 'gpt-5.5' },
+    { cliId: 'claude-code', model: undefined },
+    { cliId: 'claude-code', model: 'opus' },
+  ])('requires explicit effort clearing before switching $cliId / $model to MiniMax', async entry => {
+    const { registry, store } = await loaded({ ...entry, reasoningEffort: 'high' });
+    const cli = store.findConfigField('cli')!;
+    const before = readFileSync(configPath, 'utf8');
+    expect(await store.applyConfigField('app_default', cli, 'minimax'))
+      .toMatchObject({ ok: false, reason: 'reasoning_effort_not_supported_by_model' });
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
+    expect(registry.getBot('app_default').config).toMatchObject({ cliId: entry.cliId, reasoningEffort: 'high' });
+    expect(registry.loadBotConfigs()[0]).toMatchObject({ cliId: entry.cliId, reasoningEffort: 'high' });
+
+    expect((await store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, null)).ok).toBe(true);
+    expect((await store.applyConfigField('app_default', cli, 'minimax')).ok).toBe(true);
+    expect(readConfig().cliId).toBe('minimax');
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.cliId).toBe('minimax');
+    expect(registry.loadBotConfigs()[0].reasoningEffort).toBeUndefined();
+  });
+
+  it('preserves a compatible effort when switching CLI to MiniMax', async () => {
+    const { registry, store } = await loaded({ model: 'minimax/MiniMax-M3.1-Flash', reasoningEffort: 'high' });
+    expect((await store.applyConfigField('app_default', store.findConfigField('cli')!, 'minimax')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'minimax', reasoningEffort: 'high' });
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('high');
+    expect(registry.loadBotConfigs()[0].reasoningEffort).toBe('high');
+  });
+
+  it('does not treat a compatible effort as validation of a retained model when leaving MiniMax', async () => {
+    const model = 'minimax/MiniMax-M3.1-Flash';
+    const { registry, store } = await loaded({ cliId: 'minimax', model, reasoningEffort: 'high' });
+    expect((await store.applyConfigField('app_default', store.findConfigField('cli')!, 'codex')).ok).toBe(true);
+    // CLI switching retains the old model. Codex's unknown-model effort
+    // fallback permits high; it does not establish that Codex can run this model.
+    expect(readConfig()).toMatchObject({ cliId: 'codex', model, reasoningEffort: 'high' });
+    expect(registry.loadBotConfigs()[0]).toMatchObject({ cliId: 'codex', model, reasoningEffort: 'high' });
+  });
+
+  it.each([undefined, 'minimax/MiniMax-M3', 'other/MiniMax-M3.1-Flash'])('rejects MiniMax effort for an unverified model %s without persisting it', async model => {
+    const { store } = await loaded({ cliId: 'minimax', model });
+    expect(await store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, 'xhigh'))
+      .toMatchObject({ ok: false, reason: 'reasoning_effort_not_supported_by_model' });
+    expect(readConfig().reasoningEffort).toBeUndefined();
+  });
 
   it('round-trips envPolicy through shared CLI coercion, file parsing, persistence and memory', async () => {
     const { registry, store } = await loaded({ envPolicy: { mode: 'strict', inherit: ['HTTPS_PROXY'] } });
@@ -120,7 +285,7 @@ describe('bot-config store', () => {
     registry.registerBot({ larkAppId: 'plain', larkAppSecret: 's', cliId: 'codex' });
     expect(effectiveReplyDelivery('plain', 'codex')).toBe('send');
     const cli = store.findConfigField('cli')!;
-    const changed = await store.applyConfigField('app_default', cli, 'gemini');
+    const changed = await store.applyConfigField('app_default', cli, 'opencode');
     expect(changed).toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
     expect(readConfig().cliId).toBe('codex');
     expect((await store.applyConfigField('app_default', spec, 'default')).ok).toBe(true);
@@ -257,7 +422,7 @@ describe('bot-config store', () => {
   });
 
   it('rejects zero injection without automatic reply support', async () => {
-    const { store } = await loaded({ cliId: 'gemini' });
+    const { store } = await loaded({ cliId: 'opencode' });
     expect(await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none'))
       .toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
     expect(readConfig().promptInjection).toBeUndefined();
@@ -283,6 +448,48 @@ describe('bot-config store', () => {
     expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
     expect(readConfig()).not.toHaveProperty('sandboxNetworkPolicy');
     expect(readConfig().sandboxNetwork).toBe(false);
+  });
+
+  it.runIf(process.platform === 'linux')('judges a network policy on the backend new sessions launch on (daemon default when not overridden)', async () => {
+    const policy = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' }, dnsServers: ['10.0.0.53'] };
+    // No override: new sessions run on the daemon default (tmux), where the
+    // worker refuses the policy. Saving must not report success.
+    {
+      const { store } = await loaded({ sandbox: true });
+      const result = await store.applyConfigField('app_default', store.findConfigField('sandboxNetworkPolicy')!, policy);
+      expect(result).toMatchObject({ ok: false, reason: expect.stringContaining('tmux 后端') });
+      expect(readConfig()).not.toHaveProperty('sandboxNetworkPolicy');
+    }
+    process.env.BACKEND_TYPE = 'pty';
+    try {
+      const { store } = await loaded({ sandbox: true });
+      expect((await store.applyConfigField('app_default', store.findConfigField('sandboxNetworkPolicy')!, policy)).ok).toBe(true);
+      expect(readConfig().sandboxNetworkPolicy).toEqual(policy);
+    } finally {
+      delete process.env.BACKEND_TYPE;
+    }
+  });
+
+  it.runIf(process.platform === 'linux')('reconciles CLI and daemon-default backend when judging a network policy', async () => {
+    const policy = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' }, dnsServers: ['10.0.0.53'] };
+    // A remote CLI dictates its own backend even without an override: the save
+    // is refused and the message names that backend.
+    {
+      const { store } = await loaded({ sandbox: true, cliId: 'riff' });
+      const result = await store.applyConfigField('app_default', store.findConfigField('sandboxNetworkPolicy')!, policy);
+      expect(result).toMatchObject({ ok: false, reason: expect.stringContaining('riff') });
+      expect(readConfig()).not.toHaveProperty('sandboxNetworkPolicy');
+    }
+    // A local CLI on a daemon whose default backend is remote is paired back
+    // onto pty, so the policy is valid and saving succeeds.
+    process.env.BACKEND_TYPE = 'riff';
+    try {
+      const { store } = await loaded({ sandbox: true, cliId: 'claude-code' });
+      expect((await store.applyConfigField('app_default', store.findConfigField('sandboxNetworkPolicy')!, policy)).ok).toBe(true);
+      expect(readConfig().sandboxNetworkPolicy).toEqual(policy);
+    } finally {
+      delete process.env.BACKEND_TYPE;
+    }
   });
 
   it('CONFIG_FIELDS have unique keys and include allowedUsers', async () => {
@@ -399,6 +606,34 @@ describe('bot-config store', () => {
       value: { enabled: true, audience: 'requester' },
     });
     expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
+  });
+
+  it('persists presentation rules through the config store and reloads the same policy', async () => {
+    const { registry, store } = await loaded({ feedback: { enabled: true } });
+    const spec = store.findConfigField('feedbackPresentation')!;
+    const input = { default: { enabled: false }, rules: [
+      { id: 'example', match: { chatId: 'chat-example' }, enabled: true, rounds: [1, 3], templateId: 'compact' },
+    ] };
+    const coerced = store.coerceConfigValue(spec, JSON.stringify(input));
+    if (!coerced.ok) throw new Error(coerced.reason);
+    expect((await store.applyConfigField('app_default', spec, coerced.value)).ok).toBe(true);
+    expect(readConfig().feedbackPresentation).toEqual(input);
+    expect(registry.getBot('app_default').config.feedbackPresentation).toEqual(input);
+    expect(registry.loadBotConfigs()[0].feedbackPresentation).toEqual(input);
+    expect(readConfig().feedback).toEqual({ enabled: true });
+    expect(store.coerceConfigValue(spec, '{"default":{"buttons":[]}}')).toMatchObject({ ok: false });
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(registry.loadBotConfigs()[0].feedbackPresentation).toBeUndefined();
+  });
+
+  it('rejects direct invalid presentation writes without corrupting the reloadable config', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('feedbackPresentation')!;
+    const before = readConfig();
+    const result = await store.applyConfigField('app_default', spec, { default: { rounds: [0] } });
+    expect(result.ok).toBe(false);
+    expect(readConfig()).toEqual(before);
+    expect(registry.loadBotConfigs()[0].feedbackPresentation).toBeUndefined();
   });
 
   it('hot-updates sender email hiding through botconfig and reloads it', async () => {
@@ -1009,6 +1244,30 @@ describe('bot-config store', () => {
     expect(readConfig().cotEnabled).toBeUndefined();
   });
 
+  it('defaultOn boolean (replyCardShowTools): inverted persistence — only explicit false is written', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('replyCardShowTools')!;
+    expect(spec.defaultOn).toBe(true);
+
+    const r1 = await store.applyConfigField('app_default', spec, false);
+    expect(r1.ok).toBe(true);
+    if (r1.ok) { expect(r1.oldText).toBe('on'); expect(r1.newText).toBe('off'); }
+    expect(readConfig().replyCardShowTools).toBe(false);
+    expect(registry.getBot('app_default').config.replyCardShowTools).toBe(false);
+
+    const r2 = await store.applyConfigField('app_default', spec, true);
+    expect(r2.ok).toBe(true);
+    if (r2.ok) { expect(r2.oldText).toBe('off'); expect(r2.newText).toBe('on'); }
+    expect(readConfig().replyCardShowTools).toBeUndefined();
+    expect(registry.getBot('app_default').config.replyCardShowTools).toBeUndefined();
+
+    await store.applyConfigField('app_default', spec, false);
+    const r3 = await store.applyConfigField('app_default', spec, null);
+    expect(r3.ok).toBe(true);
+    if (r3.ok) expect(r3.newText).toBe('on');
+    expect(readConfig().replyCardShowTools).toBeUndefined();
+  });
+
   it('usageDisplay is an immediate three-state enum persisted verbatim, cleared via unset', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('usageDisplay')!;
@@ -1360,7 +1619,7 @@ describe('bot-config store', () => {
   });
 
   it('rejects reasoningEffort writes for unsupported CLIs and model pairs', async () => {
-    const unsupportedCli = await loaded({ cliId: 'gemini' });
+    const unsupportedCli = await loaded({ cliId: 'opencode' });
     const spec = unsupportedCli.store.findConfigField('reasoningEffort')!;
     const r1 = await unsupportedCli.store.applyConfigField('app_default', spec, 'medium');
     expect(r1.ok).toBe(false);
@@ -1439,7 +1698,7 @@ describe('bot-config store', () => {
   });
 
   it('rejects serviceTier writes for unsupported CLIs and clears it when switching CLI', async () => {
-    const unsupported = await loaded({ cliId: 'gemini' });
+    const unsupported = await loaded({ cliId: 'opencode' });
     const spec = unsupported.store.findConfigField('serviceTier')!;
     const rejected = await unsupported.store.applyConfigField('app_default', spec, 'priority');
     expect(rejected.ok).toBe(false);
@@ -1603,6 +1862,154 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.sandbox).not.toBe('scratch');
   });
 
+  it('rejects replyDelivery=transcript for doubao under scratch sandbox (#2828: .sessions tree lands in the merged overlay the host bridge cannot read)', async () => {
+    const { store } = await loaded({ cliId: 'doubao', sandbox: 'scratch' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const r = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('reply_delivery_unsupported');
+    expect(readConfig().replyDelivery).toBeUndefined();
+  });
+
+  it('accepts replyDelivery=transcript for doubao under oncall (authPaths directory bind keeps the host path readable)', async () => {
+    const { store } = await loaded({ cliId: 'doubao', sandbox: 'oncall' });
+    const spec = store.findConfigField('replyDelivery')!;
+    const r = await store.applyConfigField('app_default', spec, 'transcript');
+    expect(r.ok).toBe(true);
+    expect(readConfig().replyDelivery).toBe('transcript');
+  });
+
+  it('#2828 P2: legacy entry with persisted transcript on a non-capture CLI (no scratch) is not locked — editing an unrelated field succeeds', async () => {
+    // 可达形状：claude-code+transcript 切 cliId 到 opencode（invariant master 历来放行，
+    // 运行时回落 send）。窄化前的判据会把该 bot 的任何字段编辑锁死在
+    // reply_delivery_unsupported；现在改 model/name 等无关字段必须成功。
+    const { store } = await loaded({ cliId: 'opencode', replyDelivery: 'transcript', model: 'old' });
+    const r = await store.applyConfigField('app_default', store.findConfigField('model')!, 'new-model');
+    expect(r.ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'opencode', replyDelivery: 'transcript', model: 'new-model' });
+
+    // 直接写 transcript 到不支持的 CLI 仍被写入门禁拒绝（master 既有行为，不在本次放宽面）。
+    const reject = await store.applyConfigField('app_default', store.findConfigField('replyDelivery')!, 'transcript');
+    expect(reject).toMatchObject({ ok: false, reason: 'reply_delivery_unsupported' });
+
+    // 该 entry 切 scratch 也不锁：opencode「从来没有」转写采集，scratch 下显式
+    // transcript 只是运行时回落 send（不静默）。锁它会误伤存量 bots.json。
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    const sr = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
+    expect(sr.ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'opencode', sandbox: 'scratch', replyDelivery: 'transcript' });
+  });
+
+  it('#2828 P3: codex+scratch+transcript switching cliId to a never-capture CLI stays allowed (master-reachable legacy shape), to doubao/cursor stays rejected', async () => {
+    const { store } = await loaded({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+    const cli = store.findConfigField('cli')!;
+    const toOpencode = await store.applyConfigField('app_default', cli, 'opencode');
+    expect(toOpencode.ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'opencode', sandbox: 'scratch', replyDelivery: 'transcript' });
+    // 该存量 entry 的无关编辑不再被锁
+    const modelEdit = await store.applyConfigField('app_default', store.findConfigField('model')!, 'm');
+    expect(modelEdit.ok).toBe(true);
+
+    // 回到 codex 后切 doubao（真静默边）仍被 rmw 拦
+    expect((await store.applyConfigField('app_default', cli, 'codex')).ok).toBe(true);
+    const blocked = await store.applyConfigField('app_default', cli, 'doubao');
+    expect(blocked).toMatchObject({ ok: false, reason: 'reply_delivery_unsupported' });
+    expect(readConfig().cliId).toBe('codex');
+  });
+
+  it('doubao default (no explicit replyDelivery) may switch to scratch — the default resolves at runtime, the rmw invariant only rejects persisted transcript', async () => {
+    await loaded({ cliId: 'doubao' });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    const r = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
+    expect(r.ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'doubao', sandbox: 'scratch' });
+    expect(readConfig().replyDelivery).toBeUndefined();
+  });
+
+  it('invariant backstop: switching cliId codex→doubao while scratch+transcript persist is rejected', async () => {
+    const { store } = await loaded({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+    const spec = store.findConfigField('cli')!;
+    const r = await store.applyConfigField('app_default', spec, 'doubao');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('reply_delivery_unsupported');
+    expect(readConfig()).toMatchObject({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
+  });
+
+  it('invariant backstop: updateBotSandboxMode rejects switching a doubao+transcript bot to scratch (rmwBotEntry path, no replyDelivery write)', async () => {
+    const { registry } = await loaded({ cliId: 'doubao', replyDelivery: 'transcript' });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    const r = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('reply_delivery_unsupported');
+    expect(registry.getBot('app_default').config.sandbox).not.toBe('scratch');
+  });
+
+  it('doubao enables zero injection oncall but rejects it under scratch (#2828 bypass: none forces transcript past the delivery gate)', async () => {
+    const oncall = await loaded({ cliId: 'doubao', sandbox: 'oncall' });
+    const noneSpec = oncall.store.findConfigField('promptInjection')!;
+    expect((await oncall.store.applyConfigField('app_default', noneSpec, 'none')).ok).toBe(true);
+
+    const scratch = await loaded({ cliId: 'doubao', sandbox: 'scratch' });
+    const r = await scratch.store.applyConfigField('app_default', scratch.store.findConfigField('promptInjection')!, 'none');
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe('zero_prompt_unsupported');
+    expect(readConfig().promptInjection).toBeUndefined();
+  });
+
+  it('updateBotSandboxPaths refuses `/` / HOME / botmux home / `/run` and relative entries as readWrite and leaves bots.json untouched', async () => {
+    const { registry } = await loaded({ sandbox: true, sandboxPaths: { readOnly: ['/opt/ref'] } });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    const { homedir } = await import('node:os');
+    for (const bad of ['/', '//', '~', `${homedir()}/`, '~/.botmux', '~/..', '..', '../..', './rel', '/run', '//run/']) {
+      const r = await sandboxStore.updateBotSandboxPaths('app_default', { readWrite: ['/opt/proj', bad] });
+      expect(r.ok, bad).toBe(false);
+      if (!r.ok) {
+        expect(r.reason).toBe('sandbox_paths_forbidden_read_write');
+        expect(r.message).toContain(`「${bad}」`);
+        expect(r.forbiddenReadWrite?.map(f => f.path)).toEqual([bad]);
+      }
+    }
+    expect(readConfig().sandboxPaths).toEqual({ readOnly: ['/opt/ref'] });
+    expect(registry.getBot('app_default').config.sandboxPaths?.readWrite).toEqual([]);
+    // Relative entries in the other tiers are refused by the shape check too.
+    for (const tiers of [{ readOnly: ['../x'] }, { deny: ['rel/y'] }]) {
+      const r = await sandboxStore.updateBotSandboxPaths('app_default', { readWrite: ['/opt/proj'], ...tiers });
+      expect(r.ok, JSON.stringify(tiers)).toBe(false);
+      if (!r.ok) {
+        expect(r.reason).toBe('sandbox_paths_relative_entry');
+        expect(r.message).toContain('绝对路径');
+      }
+    }
+    expect(readConfig().sandboxPaths).toEqual({ readOnly: ['/opt/ref'] });
+    // On Linux `/` is refused as readOnly too: a read-only root cannot start (#2588).
+    const onLinux = process.platform === 'linux';
+    for (const root of onLinux ? ['/', '//', ' /./ ', '/run', '/run/'] : []) {
+      const r = await sandboxStore.updateBotSandboxPaths('app_default', { readWrite: ['/opt/proj'], readOnly: [root] });
+      expect(r.ok, root).toBe(false);
+      if (!r.ok) {
+        expect(r.reason).toBe('sandbox_paths_readonly_launcher_mount');
+        expect(r.message).toContain('根目录或 /run');
+      }
+    }
+    expect(readConfig().sandboxPaths).toEqual({ readOnly: ['/opt/ref'] });
+    // macOS Seatbelt runs a readOnly `/` fine: saved there.
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+    try {
+      const mac = await sandboxStore.updateBotSandboxPaths('app_default', { readWrite: ['/opt/proj'], readOnly: ['/'] });
+      expect(mac.ok).toBe(true);
+      expect(readConfig().sandboxPaths).toEqual({ readWrite: ['/opt/proj'], readOnly: ['/'] });
+    } finally {
+      Object.defineProperty(process, 'platform', platform);
+    }
+    // HOME as readOnly, and deeper paths as readWrite, still save.
+    const ok = await sandboxStore.updateBotSandboxPaths('app_default', {
+      readWrite: ['~/projects/app'], readOnly: ['~', '/usr', '/run/lock'],
+    });
+    expect(ok.ok).toBe(true);
+    expect(readConfig().sandboxPaths).toEqual({ readWrite: ['~/projects/app'], readOnly: ['~', '/usr', '/run/lock'] });
+  });
+
   it('stringList (customPassthroughCommands) coerces, dedupes, drops daemon-shadowing + junk', async () => {
     const { store } = await freshModules();
     const spec = store.findConfigField('customPassthroughCommands')!;
@@ -1663,6 +2070,195 @@ describe('bot-config store', () => {
     expect(r2.ok).toBe(true);
     expect(readConfig().startupCommands).toBeUndefined();
     expect(registry.getBot('app_default').config.startupCommands).toBeUndefined();
+  });
+
+  it('getConfigCardData carries the shared-bot sandbox advice only for shared, unsandboxed bots', async () => {
+    const { store: solo } = await loaded();
+    expect(solo.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+    const { store: shared, registry, sessionGroups } = await loaded({ oncallChats: [{ chatId: 'oc_x', workingDir: '/tmp' }] });
+    expect(shared.getConfigCardData('app_default')?.sandboxAdvice).toMatchObject({
+      reasons: ['oncall'], cliSupport: 'verified', cliId: 'claude-code',
+    });
+    const { store: sandboxed } = await loaded({ oncallChats: [{ chatId: 'oc_x', workingDir: '/tmp' }], sandbox: 'oncall' });
+    expect(sandboxed.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+
+    // A p2pMode='group' session group's oncall binding only pins a workingDir:
+    // the talk gate treats it as owner-only, so it is not a sharing signal.
+    sessionGroups.initSessionGroups('app_default');
+    sessionGroups.registerSessionGroup('oc_x', { ownerOpenId: 'ou_owner', lastSessionId: 'sess-1' });
+    expect(shared.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+    // Sanity: the registry used by getConfigCardData sees the same store.
+    expect(sessionGroups.isSessionGroup('oc_x')).toBe(true);
+    expect(registry.getBot('app_default').config.oncallChats).toHaveLength(1);
+
+    // allowedChatGroups is talk-open for a whole group, unless the id is itself
+    // a session group.
+    const { store: groups, sessionGroups: gs2 } = await loaded({ allowedChatGroups: ['oc_g'] });
+    expect(groups.getConfigCardData('app_default')?.sandboxAdvice?.reasons).toEqual(['allowedChatGroups']);
+    gs2.initSessionGroups('app_default');
+    gs2.registerSessionGroup('oc_g', { ownerOpenId: 'ou_owner', lastSessionId: 'sess-2' });
+    expect(groups.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+
+    // The legacy readIsolation flag and the global env switch also engage the
+    // sandbox at spawn — an already-isolated bot must not be advised.
+    const { store: readIso } = await loaded({ readIsolation: true, oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }] });
+    expect(readIso.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+    const { store: envIso } = await loaded({ oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }] });
+    process.env.BOTMUX_SANDBOX = 'oncall';
+    try {
+      expect(envIso.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+    } finally {
+      delete process.env.BOTMUX_SANDBOX;
+    }
+
+    // A launcher wrapper is dropped under the sandbox → dedicated caveat.
+    const { store: wrapped } = await loaded({ wrapperCli: 'aiden --', oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }] });
+    expect(wrapped.getConfigCardData('app_default')?.sandboxAdvice?.cliSupport).toBe('wrapper');
+
+    // Counts use RESOLVED identities: a stale email entry (raw count 2, one
+    // effective) must not make the bot look multi-user.
+    const { store: stale } = await loaded();
+    const upd = await stale.setBotAllowedUsers('app_default', ['ou_owner', 'ghost@corp.com'], 'ou_owner');
+    expect(upd.ok).toBe(true);
+    expect(readConfig().allowedUsers).toHaveLength(2);
+    expect(stale.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+  });
+
+  it('config card advice never throws on a typo BOTMUX_SANDBOX (display-only path)', async () => {
+    // The worker's resolver fail-closes (throws) on a bad env value at SPAWN;
+    // /botconfig is display-only — before the fix the same throw killed the
+    // command (outer catch only logs) and card buttons re-rendered to nothing.
+    const { store } = await loaded({ oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }] });
+    process.env.BOTMUX_SANDBOX = 'oncll';
+    try {
+      let data;
+      expect(() => { data = store.getConfigCardData('app_default'); }).not.toThrow();
+      // Fallback = config-only mode (sandbox unset → off) → the shared bot still
+      // gets the advice, instead of the whole card disappearing.
+      expect(data?.sandboxAdvice?.reasons).toEqual(['oncall']);
+    } finally {
+      delete process.env.BOTMUX_SANDBOX;
+    }
+  });
+
+  it('config card advice is silent for remote backends where no local sandbox engages', async () => {
+    for (const backendType of ['riff', 'remote-runner']) {
+      const { store } = await loaded({
+        cliId: backendType,
+        backendType,
+        oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }],
+        allowedChatGroups: ['oc_g'],
+      });
+      expect(
+        store.getConfigCardData('app_default')?.sandboxAdvice,
+        `advice must be absent for ${backendType}`,
+      ).toBeUndefined();
+    }
+    // The remote exemption wraps the WHOLE resolution: a global env switch must
+    // not change the verdict for riff either.
+    const { store: riffEnv } = await loaded({ cliId: 'riff', backendType: 'riff', oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }] });
+    process.env.BOTMUX_SANDBOX = 'oncall';
+    try {
+      expect(riffEnv.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+    } finally {
+      delete process.env.BOTMUX_SANDBOX;
+    }
+    // Local backends keep the advice (pty default / explicit tmux).
+    const { store: tmux } = await loaded({ backendType: 'tmux', oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }] });
+    expect(tmux.getConfigCardData('app_default')?.sandboxAdvice?.reasons).toEqual(['oncall']);
+    // Opposite direction: a LOCAL cli resolved onto a remote backend reconciles
+    // to pty exactly like the worker pairing does, so the advice stays — not
+    // silenced by the unreachable remote backend name.
+    const { store: localOnRemote } = await loaded({
+      cliId: 'claude-code', backendType: 'riff',
+      oncallChats: [{ chatId: 'oc_w', workingDir: '/tmp' }],
+    });
+    expect(localOnRemote.getConfigCardData('app_default')?.sandboxAdvice?.reasons).toEqual(['oncall']);
+  });
+
+  it('pairs a remote CLI id with its backend even when backendType is not written', async () => {
+    // The natural config: cliId riff/mojo/remote-runner, no backendType line.
+    // The open-coded `cfg.backendType ?? default ?? pty` chain classified these
+    // as pty and still showed the advice; the worker resolves the paired backend.
+    for (const cliId of ['riff', 'remote-runner']) {
+      const { store } = await loaded({
+        cliId,
+        oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }],
+      });
+      expect(
+        store.getConfigCardData('app_default')?.sandboxAdvice,
+        `advice must be absent for cliId=${cliId} without backendType`,
+      ).toBeUndefined();
+    }
+  });
+
+  it('treats a provably-remote mojo session as non-local', async () => {
+    const { store: remote } = await loaded({
+      cliId: 'mojo', backendType: 'mojo',
+      mojo: { cloud: true, localDaemon: false },
+      oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }],
+    });
+    expect(remote.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+    // cloud without the remote proof stays local (mojo spawns a binary locally).
+    const { store: localish } = await loaded({
+      cliId: 'mojo', backendType: 'mojo',
+      oncallChats: [{ chatId: 'oc_z', workingDir: '/tmp' }],
+    });
+    expect(localish.getConfigCardData('app_default')?.sandboxAdvice?.reasons).toEqual(['oncall']);
+  });
+
+  it('reports a local backend that refuses a file sandbox via the worker gate', async () => {
+    // herdr / zellij / zmx / orca run locally but backendSandboxCompatibilityError
+    // refuses a sandbox: the advice must not say "verified / turn it on".
+    for (const backendType of ['herdr', 'zellij', 'zmx']) {
+      const { store } = await loaded({
+        backendType,
+        oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }],
+      });
+      expect(
+        store.getConfigCardData('app_default')?.sandboxAdvice?.cliSupport,
+        `${backendType} must not be presented as sandbox-capable`,
+      ).toBe('blocked');
+    }
+    // pty/tmux are capable → the ordinary matrix verdict.
+    const { store: pty } = await loaded({ oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }] });
+    expect(pty.getConfigCardData('app_default')?.sandboxAdvice?.cliSupport).toBe('verified');
+  });
+
+  it('a local mojo session (cloud off or unprovable env) is shown as blocked, cloud mojo is silent', async () => {
+    const { store: localMojo } = await loaded({
+      cliId: 'mojo', backendType: 'mojo',
+      oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }],
+    });
+    expect(localMojo.getConfigCardData('app_default')?.sandboxAdvice?.cliSupport).toBe('blocked');
+    // cloud + an unprovable PATH override voids the remote proof → local → blocked.
+    const { store: envMojo } = await loaded({
+      cliId: 'mojo', backendType: 'mojo',
+      mojo: { cloud: true, localDaemon: false, env: { PATH: '/opt/fake' } },
+      oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }],
+    });
+    expect(envMojo.getConfigCardData('app_default')?.sandboxAdvice?.cliSupport).toBe('blocked');
+    // Fully remote mojo is silent (localSandboxApplies=false short-circuit).
+    const { store: remoteMojo } = await loaded({
+      cliId: 'mojo', backendType: 'mojo',
+      mojo: { cloud: true, localDaemon: false },
+      oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }],
+    });
+    expect(remoteMojo.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+  });
+
+  it('typod BOTMUX_SANDBOX fallback still honours readIsolation=true', async () => {    const { store } = await loaded({
+      readIsolation: true,
+      oncallChats: [{ chatId: 'oc_y', workingDir: '/tmp' }],
+    });
+    process.env.BOTMUX_SANDBOX = 'oncll';
+    try {
+      // Already isolated via the legacy flag: the fallback must resolve oncall,
+      // not re-advise enabling isolation.
+      expect(store.getConfigCardData('app_default')?.sandboxAdvice).toBeUndefined();
+    } finally {
+      delete process.env.BOTMUX_SANDBOX;
+    }
   });
 
   it('getConfigCardData joins startupCommands with ", " (commands carry space args)', async () => {

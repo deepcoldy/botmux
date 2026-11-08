@@ -58,7 +58,7 @@ process.stdin.on('data', data => {
     fs.appendFileSync(${JSON.stringify(join(root, '.codex', 'history.jsonl'))}, JSON.stringify({session_id:${JSON.stringify(nativeId)}, text:match[1], ts:Date.now()/1000})+'\\n');
   }
 });
-const screen = '\\x1b[?2004h\\x1b[2J\\x1b[H│ model: custom-model /model to change │\\r\\n│ directory: /tmp │\\r\\n› Ask Codex to do anything\\r\\n  100% context left';
+const screen = '\\x1b[?2004h\\x1b[2J\\x1b[H│ model: custom-model /model to change │\\r\\n│ directory: /tmp │\\r\\n› Ask Codex to do anything\\r\\n  100% context left\\x1b[3;3H';
 if (${manual}) {
   let released = false;
   setInterval(() => { if (!released && fs.existsSync(${JSON.stringify(release)})) { released = true; process.stdout.write(screen); } }, 100);

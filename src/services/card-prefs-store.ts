@@ -53,6 +53,10 @@ import {
   type StreamingCardButtonId,
 } from '../im/lark/streaming-card-buttons.js';
 
+import { normalizeCodexBrowserConfig, type CodexBrowserConfig } from '../core/codex-browser-config.js';
+
+class BrowserBridgeDisabledError extends Error {}
+
 export interface BotCardPrefs extends ReplyFooterPreferences {
   showReplyTiming: boolean;
   /** Where to show native Context / Token usage:
@@ -71,6 +75,7 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   /** Codex App browser bridge. Default false; the dashboard toggle uses the
    * default Chrome family. Edge/pluginRoot remain JSON-only advanced options. */
   codexBrowser: boolean;
+  codexBrowserAutoApproveOrigins: boolean;
   writableTerminalLinkInCard: boolean;
   privateCard: boolean;
   /** Compact overflow menu (terminal/model/close) on ordinary reply cards.
@@ -81,6 +86,10 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
    *  opt-out lives in noCotChats (`/cot off`), not here. */
   cotEnabled: boolean;
   thinkingCardToolResult: boolean;
+  /** Unified reply cards show tool calls/commands/results/counts.
+   *  Default TRUE (absent = show; only explicit false persists). Only takes
+   *  effect with replyCardMode 'unified'; the value survives mode switches. */
+  replyCardShowTools: boolean;
   /** Whether each forwarded turn carries a `<sender …/>` tag naming the speaker.
    *  Default TRUE (absent = on; only an explicit false persists), same
    *  convention as cotEnabled. Off also drops the cursor anti-echo note (it is
@@ -142,7 +151,9 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       silentTurnReactions: c.silentTurnReactions === true,
       codexAppCleanInput: c.codexAppCleanInput === true,
       codexBrowser: c.codexBrowser?.enabled === true,
+      codexBrowserAutoApproveOrigins: c.codexBrowser?.autoApproveOrigins === true,
       thinkingCardToolResult: c.thinkingCardToolResult !== false,
+      replyCardShowTools: c.replyCardShowTools !== false,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       privateCard: c.privateCard === true,
       replyCardActions: c.replyCardActions === true,
@@ -179,7 +190,9 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       silentTurnReactions: false,
       codexAppCleanInput: false,
       codexBrowser: false,
+      codexBrowserAutoApproveOrigins: false,
       thinkingCardToolResult: true,
+      replyCardShowTools: true,
       writableTerminalLinkInCard: false,
       privateCard: false,
       replyCardActions: false,
@@ -231,6 +244,7 @@ async function updateBotCardPrefsInternal(
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
   const previousPinStreamingCard = bot.config.pinStreamingCard === true;
+  let savedBrowser: CodexBrowserConfig | undefined = bot.config.codexBrowser;
 
   const apply = (entry: any, key: keyof BotCardPrefs, val: boolean | undefined) => {
     if (val === undefined) return;
@@ -302,8 +316,19 @@ async function updateBotCardPrefsInternal(
     apply(entry, 'pinStreamingCard', patch.pinStreamingCard);
     apply(entry, 'silentTurnReactions', patch.silentTurnReactions);
     apply(entry, 'codexAppCleanInput', patch.codexAppCleanInput);
-    apply(entry, 'codexBrowser', patch.codexBrowser);
+    if (patch.codexBrowser === false) delete entry.codexBrowser;
+    else if (patch.codexBrowser === true && !entry.codexBrowser) entry.codexBrowser = true;
+    if (patch.codexBrowser !== undefined || patch.codexBrowserAutoApproveOrigins !== undefined) {
+      savedBrowser = normalizeCodexBrowserConfig(entry.codexBrowser);
+      if (patch.codexBrowserAutoApproveOrigins === true && !savedBrowser) throw new BrowserBridgeDisabledError();
+      if (savedBrowser && patch.codexBrowserAutoApproveOrigins !== undefined) {
+        const { autoApproveOrigins: _previous, ...browser } = savedBrowser;
+        savedBrowser = patch.codexBrowserAutoApproveOrigins ? { ...browser, autoApproveOrigins: true } : browser;
+        entry.codexBrowser = savedBrowser;
+      }
+    }
     applyDefaultTrue(entry, 'thinkingCardToolResult', patch.thinkingCardToolResult);
+    applyDefaultTrue(entry, 'replyCardShowTools', patch.replyCardShowTools);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
     apply(entry, 'replyCardActions', patch.replyCardActions);
@@ -345,7 +370,9 @@ async function updateBotCardPrefsInternal(
         codexAppCleanInput: entry.codexAppCleanInput === true,
         codexBrowser: entry.codexBrowser === true
           || (typeof entry.codexBrowser === 'object' && entry.codexBrowser?.enabled === true),
+        codexBrowserAutoApproveOrigins: entry.codexBrowser?.autoApproveOrigins === true,
         thinkingCardToolResult: entry.thinkingCardToolResult !== false,
+        replyCardShowTools: entry.replyCardShowTools !== false,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
         replyCardActions: entry.replyCardActions === true,
@@ -374,6 +401,9 @@ async function updateBotCardPrefsInternal(
         summaryMemoryPath: typeof entry.summaryMemoryPath === 'string' && entry.summaryMemoryPath.trim() ? entry.summaryMemoryPath.trim() : 'summary.md',
       },
     };
+  }).catch(error => {
+    if (error instanceof BrowserBridgeDisabledError) return { ok: false as const, reason: 'codex_browser_not_enabled' };
+    throw error;
   });
   if (!r.ok) return { ok: false, reason: r.reason };
 
@@ -406,10 +436,8 @@ async function updateBotCardPrefsInternal(
   if (patch.codexAppCleanInput !== undefined) {
     bot.config.codexAppCleanInput = patch.codexAppCleanInput || undefined;
   }
-  if (patch.codexBrowser !== undefined) {
-    bot.config.codexBrowser = patch.codexBrowser
-      ? { enabled: true, family: 'chrome' }
-      : undefined;
+  if (patch.codexBrowser !== undefined || patch.codexBrowserAutoApproveOrigins !== undefined) {
+    bot.config.codexBrowser = savedBrowser;
   }
   if (patch.writableTerminalLinkInCard !== undefined) {
     bot.config.writableTerminalLinkInCard = patch.writableTerminalLinkInCard || undefined;
@@ -422,6 +450,10 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.thinkingCardToolResult !== undefined) {
     bot.config.thinkingCardToolResult = patch.thinkingCardToolResult === false ? false : undefined;
+  }
+  if (patch.replyCardShowTools !== undefined) {
+    // Default true: store false explicitly, clear (→ default show) when true.
+    bot.config.replyCardShowTools = patch.replyCardShowTools === false ? false : undefined;
   }
   if (patch.cotEnabled !== undefined) {
     // Default true: store false explicitly, clear (→ default on) when true.

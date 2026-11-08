@@ -44,11 +44,11 @@ it('refreshes the effective reply delivery shown next to it when zero injection 
 });
 
 it('cannot be turned on for an unsupported CLI, but an enabled one can still be turned off', () => {
-  const off = render({ cliId: 'gemini', promptInjection: 'default' });
+  const off = render({ cliId: 'opencode', promptInjection: 'default' });
   expect(toggle(off).props.disabled).toBe(true);
   expect(JSON.stringify(off.toJSON())).toContain('不支持零注入');
   act(() => off.unmount());
-  const on = render({ cliId: 'gemini', promptInjection: 'none' });
+  const on = render({ cliId: 'opencode', promptInjection: 'none' });
   expect(toggle(on).props.disabled).toBe(false);
   act(() => on.unmount());
 });
@@ -66,6 +66,10 @@ it('follows the row’s current CLI / backend / sandbox instead of a load-time s
   expect(zeroPromptSupportedFor({ cliId: 'cursor', sandboxMode: 'scratch' })).toBe(false);
   expect(zeroPromptSupportedFor({ cliId: 'cursor', sandboxMode: 'off' })).toBe(true);
   expect(zeroPromptSupportedFor({ cliId: 'cursor', sandbox: true })).toBe(true);
+  // #2828：doubao 的 .sessions 在 scratch merged 树里，零注入与 transcript 同样被锁
+  expect(zeroPromptSupportedFor({ cliId: 'doubao', sandboxMode: 'scratch' })).toBe(false);
+  expect(zeroPromptSupportedFor({ cliId: 'doubao', sandboxMode: 'off' })).toBe(true);
+  expect(zeroPromptSupportedFor({ cliId: 'doubao', sandbox: true })).toBe(true);
   // A local CLI never spawns on a remote backend (paired back to a local one), so
   // a stale riff override does not block it; antigravity on zmx is unsupported.
   expect(zeroPromptSupportedFor({ cliId: 'claude-code', backendType: 'riff' })).toBe(true);

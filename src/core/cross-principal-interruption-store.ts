@@ -6,6 +6,7 @@ import type {
   Session,
   TrustedCaller,
 } from '../types.js';
+import { sameTrustedPrincipal } from './active-turn-authority.js';
 
 const MAX_XPI_CANCELLATION_AUDIT = 50;
 
@@ -14,6 +15,31 @@ const MAX_XPI_CANCELLATION_AUDIT = 50;
  * same turnId is retried after a crash or IPC race. */
 export function crossPrincipalInterruptionId(sourceSessionId: string, turnId: string): string {
   return `xpi_${createHash('sha256').update(`${sourceSessionId}\0${turnId}`).digest('hex').slice(0, 24)}`;
+}
+
+export type CrossPrincipalRerouteGap =
+  | 'envelope'
+  | 'proposer'
+  | 'active'
+  | 'active_caller_is_proposer'
+  | 'active_controller_is_proposer';
+
+/** worker 拒收的轮次要暂存为发起人确认还缺哪些前提；空数组表示可以暂存。 */
+export function crossPrincipalRerouteGaps(args: {
+  envelope?: CrossPrincipalInterruptionMessage;
+  proposer?: TrustedCaller;
+  active?: { caller: TrustedCaller; controller?: TrustedCaller };
+}): CrossPrincipalRerouteGap[] {
+  const gaps: CrossPrincipalRerouteGap[] = [];
+  if (!args.envelope) gaps.push('envelope');
+  if (!args.proposer) gaps.push('proposer');
+  if (!args.active) {
+    gaps.push('active');
+  } else {
+    if (sameTrustedPrincipal(args.active.caller, args.proposer)) gaps.push('active_caller_is_proposer');
+    if (sameTrustedPrincipal(args.active.controller, args.proposer)) gaps.push('active_controller_is_proposer');
+  }
+  return gaps;
 }
 
 export function stageCrossPrincipalInterruptionRecord(args: {

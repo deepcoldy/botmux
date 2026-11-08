@@ -14,6 +14,8 @@ import {
 } from './adapters/cli/codex-app-turn.js';
 import { RunnerControlWriter } from './adapters/cli/runner-control-channel.js';
 import { CODEX_APP_ACTIVE_WRITER_EXIT_CODE } from './services/codex-app-runner-protocol.js';
+import { codexAppTurnFailureCode } from './services/codex-app-failure.js';
+import { captureCodexAppProcessIdentity, type CodexAppProcessIdentity } from './services/codex-app-process-attestation.js';
 import {
   CODEX_APP_CONTROL_BOOTSTRAP_ENV,
   CODEX_APP_CONTROL_FINAL_CHUNK_BYTES,
@@ -69,6 +71,7 @@ interface Args {
   reasoningEffort?: string;
   serviceTier?: CodexServiceTier;
   browserFamily?: CodexBrowserFamily;
+  browserAutoApproveOrigins?: boolean;
   browserPluginRoot?: string;
 }
 
@@ -93,6 +96,7 @@ interface ActiveTurn {
   startedAtMs: number;
   lastActivityMarkerAtMs: number;
   finalText: string;
+  failureCode?: string;
   userInputFailure?: string;
   allAgentText: string;
   itemText: Map<string, string>;
@@ -282,6 +286,7 @@ function parseArgs(argv: string[]): Args {
     }
     else if (key === '--browser-family' && (val === 'chrome' || val === 'edge')) { out.browserFamily = val; i++; }
     else if (key === '--browser-plugin-root' && val !== undefined) { out.browserPluginRoot = val; i++; }
+    else if (key === '--browser-auto-approve-origins') { out.browserAutoApproveOrigins = true; }
   }
   if (!out.sessionId) throw new Error('--session-id is required');
   if (out.strictResume && !out.threadId) throw new Error('--strict-resume requires --thread-id');
@@ -332,6 +337,7 @@ function appDeveloperInstructions(args: Args): string {
 }
 
 class AppServerClient {
+  processIdentity?: CodexAppProcessIdentity;
   private child: ChildProcessWithoutNullStreams;
   /** NDJSON framing + pending table. 'microtask' dispatch keeps a response's
    *  awaiting continuation ahead of a notification coalesced behind it. */
@@ -349,6 +355,7 @@ class AppServerClient {
   private requestHandlers: Array<(msg: JsonObject) => boolean> = [];
   private lastStderr = '';
   private fatalError?: Error;
+  private initialized = false;
   readonly lifetime = new AbortController();
 
   get hasExited(): boolean {
@@ -357,9 +364,15 @@ class AppServerClient {
   }
 
   get executionIdentity(): { pid: number; procStart: string } | undefined {
-    if (process.platform !== 'linux' || this.hasExited || !this.child.pid) return undefined;
-    const procStart = readProcessStartIdentity(this.child.pid);
-    return procStart ? { pid: this.child.pid, procStart } : undefined;
+    if (process.platform !== 'linux' || !this.initialized || this.hasExited || !this.child.pid) return undefined;
+    // The npm entry point stays alive as a Node launcher. Its native Codex
+    // child owns the persistent tool host and must be the signed engine root;
+    // attesting Node instead makes the native child look like an old tool on
+    // the next turn. Reuse the kernel/stdio proof captured at initialization.
+    const pid = this.processIdentity?.enginePid ?? this.child.pid;
+    const procStart = readProcessStartIdentity(pid);
+    if (this.processIdentity && procStart !== this.processIdentity.engineProcStart) return undefined;
+    return procStart ? { pid, procStart } : undefined;
   }
 
   constructor(codexBin: string, cwd: string) {
@@ -404,6 +417,11 @@ class AppServerClient {
       capabilities: { experimentalApi: true },
     }, { timeoutMs });
     this.notify('initialized');
+    this.processIdentity = captureCodexAppProcessIdentity(this.child.pid ?? 0);
+    // Idle-state timers can run while a replacement client is initializing.
+    // Publish no root until capture finishes, so a live launcher can never be
+    // registered first and then mistaken for an unauthorized engine swap.
+    this.initialized = true;
   }
 
   request(
@@ -714,6 +732,7 @@ const browserBroker = args.browserFamily
   ? new CodexBrowserBroker({
       sessionId: args.sessionId,
       family: args.browserFamily,
+      autoApproveOrigins: args.browserAutoApproveOrigins === true,
       codexBin: args.codexBin,
       ...(args.browserPluginRoot ? { pluginRoot: args.browserPluginRoot } : {}),
       readConfig: params => client.request('config/read', params, { timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS }),
@@ -785,6 +804,7 @@ function emitRunnerState(
   busy = processing || queue.length > 0 || nativeActiveTurnId !== undefined,
   tracksTurn = activeTurn !== null,
 ): void {
+  const activeReplyTurnId = activeTurn?.accepted?.at(-1)?.replyTurnId;
   const appServerProcess = client?.executionIdentity;
   emitMarker('state', {
     busy,
@@ -793,6 +813,8 @@ function emitRunnerState(
     // signed state. The worker uses this field as a runtime type-ahead gate;
     // authentication alone never releases a prompt.
     acceptingInput: runnerReady,
+    ...(busy && tracksTurn && activeReplyTurnId ? { activeReplyTurnId } : {}),
+    ...(client?.processIdentity ? { processIdentity: client.processIdentity } : {}),
     // This process owns tool execution. The outer runner owns reply routing;
     // the signed state must attest both sides of that process boundary.
     ...(appServerProcess ? { appServerProcess } : {}),
@@ -973,9 +995,18 @@ function handleNativeUserInput(msg: JsonObject): void {
   }
   const controller = new AbortController();
   const signal = AbortSignal.any([controller.signal, current.lifetime.signal]);
-  const nativeTurnId = typeof params.turnId === 'string' ? params.turnId : undefined;
+  const rawNativeTurnId = params.turnId ?? params.turn?.id;
+  const nativeTurnId = typeof rawNativeTurnId === 'string' ? rawNativeTurnId : undefined;
   userInputRequests.set(msg.id, { turnId: nativeTurnId, controller });
   const turn = activeTurn;
+  // Waiting for the human answer is not stalled model work, and app-server is
+  // silent meanwhile: keep the worker's no-progress window fed until it settles.
+  const waitHeartbeat = turn ? setInterval(() => {
+    if (!signal.aborted && client === current && !generationFenced && activeTurn === turn) {
+      emitTurnActivity(turn, 'progress', true);
+    }
+  }, TURN_ACTIVITY_MARKER_MIN_INTERVAL_MS) : undefined;
+  waitHeartbeat?.unref();
   const onClientDead = () => {
     if (client === current && !generationFenced && userInputRequests.get(msg.id)?.controller === controller) {
       fenceUnknown('turn/start', 'transport', turn);
@@ -1012,6 +1043,7 @@ function handleNativeUserInput(msg: JsonObject): void {
       }
     },
   ).finally(() => {
+    clearInterval(waitHeartbeat);
     current.lifetime.signal.removeEventListener('abort', onClientDead);
     if (userInputRequests.get(msg.id)?.controller === controller) userInputRequests.delete(msg.id);
   }).catch(error => {
@@ -1098,6 +1130,7 @@ function rebuildReconciledFinal(turn: JsonObject, userItemIndex: number): string
 
 function completeActiveTurnFromNative(turn: ActiveTurn, nativeTurn: JsonObject, exactIndex?: number): void {
   if (activeTurn !== turn || turn.completed || !isTerminalNativeTurn(nativeTurn)) return;
+  turn.failureCode = codexAppTurnFailureCode(nativeTurn);
   if (exactIndex !== undefined) {
     turn.finalText = rebuildReconciledFinal(nativeTurn, exactIndex);
     turn.allAgentText = '';
@@ -1642,6 +1675,15 @@ async function ensureThread(startupDeadlineAtMs?: number): Promise<string> {
     strictThreadResume = true;
     startupDeadlineAtMs ??= Date.now() + DEFAULT_REQUEST_TIMEOUT_MS;
     await initializeAppServer(startupDeadlineAtMs);
+    // No native turn has been submitted to the replacement engine yet. Publish
+    // its proof before thread/resume or turn/start can emit activity/tools.
+    // The queued input is still work: never publish prompt-ready at this edge.
+    emitMarker('state', {
+      busy: true, tracksTurn: false, acceptingInput: runnerReady, atMs: Date.now(),
+      ...(client.processIdentity ? { processIdentity: client.processIdentity } : {}),
+      ...(client.executionIdentity ? { appServerProcess: client.executionIdentity } : {}),
+      processIdentityBoundary: 'idle_restart',
+    });
   }
   if (threadReady && threadId) return threadId;
 
@@ -1889,6 +1931,7 @@ function settleSteeredCompletion(turn: ActiveTurn, nativeTurn: JsonObject): void
     turn.knownAgentItemIds.clear();
   }
   turn.terminalCompletion = nativeTurn;
+  turn.failureCode = codexAppTurnFailureCode(nativeTurn);
   if (typeof nativeTurn?.id === 'string' && nativeActiveTurnId === nativeTurn.id) {
     nativeActiveTurnId = undefined;
   }
@@ -1952,6 +1995,7 @@ async function reconcileSteeredGroupFromHistory(
       turn.itemText.clear();
       turn.knownAgentItemIds.clear();
       turn.terminalCompletion = matched;
+      turn.failureCode = codexAppTurnFailureCode(matched);
       // R4-B3: the matched turn is now the authoritative native identity for this
       // group — the final marker, native id, and usage drain must all key off
       // matched.id, not the stale pre-history canonical. Compare-and-clear the OLD
@@ -2175,6 +2219,7 @@ function finalizeAcceptedGroup(turn: ActiveTurn): void {
       ...(replyTurnId ? { turnId: replyTurnId } : {}),
       ...(turn.nativeTurnId ? { nativeTurnId: turn.nativeTurnId } : {}),
       content: isReal ? finalText : '',
+      ...(isReal && turn.failureCode ? { errorCode: turn.failureCode } : {}),
       // The real answer's clock starts at the LAST accepted dispatch so a
       // botmux-send marker emitted before the follow-up landed cannot race
       // ahead and suppress it. A single-member group keeps the turn's own
@@ -2533,6 +2578,7 @@ async function drainQueue(): Promise<void> {
           ...(replyTurnId ? { turnId: replyTurnId } : {}),
           ...(nativeTurnId ? { nativeTurnId } : {}),
           content: message,
+          errorCode: codexAppTurnFailureCode({ status: 'failed', error: err }),
           startedAtMs: activeTurn?.startedAtMs ?? completedAtMs,
           completedAtMs,
         });

@@ -1,6 +1,6 @@
 export type ThemeMode = 'system' | 'light' | 'dark';
 export type ResolvedTheme = 'light' | 'dark';
-export type SessionsViewMode = 'kanban' | 'board' | 'topics' | 'table';
+export type SessionsViewMode = 'kanban' | 'table';
 
 export const THEME_STORAGE_KEY = 'botmux.dashboard.theme';
 export const SESSIONS_VIEW_STORAGE_KEY = 'botmux.dashboard.sessions.view';
@@ -43,8 +43,11 @@ export function normalizeThemeMode(value: unknown): ThemeMode | null {
   return value === 'system' || value === 'light' || value === 'dark' ? value : null;
 }
 
+/** 会话页只剩「看板」「列表」两个视图。旧版存过的 board（状态板）/ topics（话题）
+ *  已并入看板，读到时迁移成 kanban，而不是当脏值丢回默认。 */
 export function normalizeSessionsViewMode(value: unknown): SessionsViewMode | null {
-  return value === 'kanban' || value === 'board' || value === 'topics' || value === 'table' ? value : null;
+  if (value === 'table') return 'table';
+  return value === 'kanban' || value === 'board' || value === 'topics' ? 'kanban' : null;
 }
 
 export function resolveThemeMode(mode: ThemeMode, systemPrefersDark: boolean): ResolvedTheme {
@@ -59,7 +62,7 @@ export function readStoredThemeMode(storage: Storage | undefined): ThemeMode {
 }
 
 export function readStoredSessionsViewMode(storage: Storage | undefined): SessionsViewMode {
-  return normalizeSessionsViewMode(storage?.getItem(SESSIONS_VIEW_STORAGE_KEY)) ?? 'board';
+  return normalizeSessionsViewMode(storage?.getItem(SESSIONS_VIEW_STORAGE_KEY)) ?? 'kanban';
 }
 
 export function readStoredSessionsShowUnknownChats(storage: Storage | undefined): boolean {
@@ -68,42 +71,6 @@ export function readStoredSessionsShowUnknownChats(storage: Storage | undefined)
     return raw == null ? true : raw === '1';
   } catch {
     return true;
-  }
-}
-
-// ── 看板列顺序（用户可拖拽/按钮自定义，从左到右）─────────────────────────────
-export const SESSIONS_BOARD_ORDER_STORAGE_KEY = 'botmux.dashboard.sessions.boardOrder';
-export const DEFAULT_BOARD_ORDER = ['needs-you', 'working', 'todo', 'idle'] as const;
-
-/** 必须是默认四列的一个排列（防旧版本残留/手改 localStorage 的脏值）。
- *  兼容旧存值：老版本存过含 'starting' 的四列（needs-you/starting/working/idle）——
- *  'starting' 已并入 'working'，先剔除；缺失的新列 'todo' 补到末尾，避免整体被丢弃回默认。 */
-export function normalizeBoardOrder(value: unknown): string[] | null {
-  if (!Array.isArray(value)) return null;
-  const migrated = value.filter(id => id !== 'starting');
-  for (const id of DEFAULT_BOARD_ORDER) if (!migrated.includes(id)) migrated.push(id);
-  if (migrated.length !== DEFAULT_BOARD_ORDER.length) return null;
-  const seen = new Set(migrated);
-  if (seen.size !== migrated.length) return null;
-  for (const id of DEFAULT_BOARD_ORDER) if (!seen.has(id)) return null;
-  return migrated.slice();
-}
-
-export function readStoredBoardOrder(storage: Storage | undefined): string[] {
-  try {
-    const raw = storage?.getItem(SESSIONS_BOARD_ORDER_STORAGE_KEY);
-    if (!raw) return [...DEFAULT_BOARD_ORDER];
-    return normalizeBoardOrder(JSON.parse(raw)) ?? [...DEFAULT_BOARD_ORDER];
-  } catch {
-    return [...DEFAULT_BOARD_ORDER];
-  }
-}
-
-export function writeStoredBoardOrder(storage: Storage | undefined, order: string[]): void {
-  try {
-    storage?.setItem(SESSIONS_BOARD_ORDER_STORAGE_KEY, JSON.stringify(order));
-  } catch {
-    // localStorage 不可用时顺序只在当前页生效
   }
 }
 
@@ -137,28 +104,6 @@ export function readStoredCreateKeepOpen(storage: Storage | undefined): boolean 
 export function writeStoredCreateKeepOpen(storage: Storage | undefined, keepOpen: boolean): void {
   try {
     storage?.setItem(SESSIONS_CREATE_KEEP_OPEN_STORAGE_KEY, keepOpen ? '1' : '0');
-  } catch {
-    // localStorage 不可用时只在当前页生效
-  }
-}
-
-// ── 看板分组维度：工作流列 / 团队（筛选某团队的工作流）/ 机器人列 ─────────────
-export type KanbanGroupBy = 'flow' | 'team' | 'bot';
-
-export const KANBAN_GROUPBY_STORAGE_KEY = 'botmux.dashboard.sessions.kanbanGroupBy';
-export const KANBAN_TEAM_STORAGE_KEY = 'botmux.dashboard.sessions.kanbanTeam';
-
-export function normalizeKanbanGroupBy(value: unknown): KanbanGroupBy | null {
-  return value === 'flow' || value === 'team' || value === 'bot' ? value : null;
-}
-
-export function readStoredKanbanGroupBy(storage: Storage | undefined): KanbanGroupBy {
-  return normalizeKanbanGroupBy(storage?.getItem(KANBAN_GROUPBY_STORAGE_KEY)) ?? 'flow';
-}
-
-export function writeStoredKanbanGroupBy(storage: Storage | undefined, mode: KanbanGroupBy): void {
-  try {
-    storage?.setItem(KANBAN_GROUPBY_STORAGE_KEY, mode);
   } catch {
     // localStorage 不可用时只在当前页生效
   }

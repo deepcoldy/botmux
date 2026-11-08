@@ -45,6 +45,7 @@ import {
 import { RELAY_ORIGIN_CAPABILITY_BASENAME } from '../src/core/managed-origin-capability.js';
 import { recordedSandboxTreeFlavour } from '../src/adapters/backend/sandbox-tree-teardown.js';
 import { readJsonLines } from './helpers/read-json-lines.js';
+import { onTestProcessExit } from './helpers/exit-cleanup.js';
 
 type SandboxFlavour = 'off' | 'credential-only' | 'oncall' | 'scratch';
 type Backend = 'tmux' | 'pty';
@@ -360,15 +361,25 @@ exec '${realTmux}' -S '${socket}' "$@"
     },
     async dispose(): Promise<void> {
       for (const worker of [...workers]) await lab.stop(worker, 'close').catch(() => undefined);
-      try { execFileSync(realTmux!, ['-S', socket, 'kill-server'], { stdio: 'ignore' }); } catch { /* gone */ }
-      for (const pid of lab.cliHostPids()) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
-      // Never leave a host overlay / tmpfs slot behind a failed assertion.
-      if (everScratch) teardownScratchSession(sessionId, dataDir);
-      // teardownScratchSession keeps a tree it could not unmount; so does this
-      // (reported, never deleted through the full-root COW view).
-      rmSandboxScratch(dir);
+      takeDown();
+      forgetOnExit();
     },
   };
+  /** Everything this lab started, synchronously: its private tmux server (the
+   *  pane outlives a worker by design), the CLI, the scratch overlay, the dir. */
+  const takeDown = (): void => {
+    for (const worker of workers) { try { worker.kill('SIGKILL'); } catch { /* gone */ } }
+    try { execFileSync(realTmux!, ['-S', socket, 'kill-server'], { stdio: 'ignore' }); } catch { /* gone */ }
+    for (const pid of lab.cliHostPids()) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
+    // Never leave a host overlay / tmpfs slot behind a failed assertion.
+    if (everScratch) teardownScratchSession(sessionId, dataDir);
+    // teardownScratchSession keeps a tree it could not unmount; so does this
+    // (reported, never deleted through the full-root COW view).
+    rmSandboxScratch(dir);
+  };
+  // An interrupted run never reaches dispose(): a persistent pane (and the
+  // overlay under a scratch one) kept running for days in /tmp/sbx-life-*.
+  const forgetOnExit = onTestProcessExit(takeDown);
   return lab;
 }
 

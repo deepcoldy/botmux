@@ -1,5 +1,9 @@
-import { codexRpcEligible } from '../src/codex-rpc-lifecycle.js';
 // test/dashboard-ipc.test.ts
+// Must stay the first import: this file writes bot homes, queues and session
+// stores under SESSION_DATA_DIR and CLI state under homedir(), so refuse to run
+// outside the test fence instead of touching live botmux data (see the helper).
+import { isInsideDir } from './helpers/require-fenced-data-dir.js';
+import { codexRpcEligible } from '../src/codex-rpc-lifecycle.js';
 import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
 import { validateCodexServiceTier } from '../src/services/codex-service-tier-catalog.js';
 
@@ -10,7 +14,7 @@ import type { ChildProcess } from 'node:child_process';
 import { createHmac, randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { request as httpRequest } from 'node:http';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, setExactChatGrantHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionListHandler, setDurableSessionSendHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, __testOnly_resetManagedOriginRuntimeAuthState, __testOnly_setNativeSubagentRuntimeNonceStore, type IpcServerHandle,
   __testOnly_agentSwitchBeforePreCloseVerify,
@@ -21,6 +25,7 @@ import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import * as groupsStore from '../src/services/groups-store.js';
 import * as pinStreamingCardModeStore from '../src/services/pin-streaming-card-mode-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
+import { resolveScheduleModelOverride } from '../src/core/schedule-model-override.js';
 import {
   ensureSchedulePreconditionRoot,
   resolveSchedulePrecondition,
@@ -38,6 +43,7 @@ import {
 scheduleStore.setScheduleScope('cli_ipc_test_bot001');
 import * as larkClient from '../src/im/lark/client.js';
 import * as oncallStore from '../src/services/oncall-store.js';
+import { initSessionGroups, registerSessionGroup } from '../src/services/session-groups-store.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as asyncTriggerStore from '../src/services/async-trigger-store.js';
 import * as sandboxStore from '../src/services/sandbox-store.js';
@@ -87,6 +93,10 @@ import {
   REPLY_RECIPE_PROMPT_MAX_CODEPOINTS,
 } from '../src/im/lark/reply-card-style.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
+
+if (!isInsideDir(homedir(), process.env.__TEST_DATA_DIR_FENCE)) {
+  throw new Error(`refusing to run: HOME ${homedir()} is not inside the test fence`);
+}
 
 // Loopback-HMAC the write-link routes require. Inject a known secret per test
 // (setIpcAuthSecret) and sign with it, so the suite doesn't depend on a real
@@ -1647,6 +1657,28 @@ describe('POST /api/session-origin/attest', () => {
     } finally { fixture.cleanup(); }
   });
 
+  it('attests only the owning bot mention permission and reflects same-turn revocation', async () => {
+    const fixture = installManagedOriginFixture();
+    try {
+      registerBot({ larkAppId: 'app-managed-origin', larkAppSecret: 'test-secret', allowArbitraryMention: true });
+      const bot = getBot('app-managed-origin');
+      setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      for (const allowed of [true, false, undefined]) {
+        bot.config.allowArbitraryMention = allowed;
+        const nonce = randomBytes(32).toString('hex');
+        const response = await postAttestation(handle.port, {
+          sessionId: fixture.sessionId, channelId: CHANNEL, originCapability: CAPABILITY, nonce,
+          allowArbitraryMention: true, larkAppId: 'cli_other',
+        });
+        expect(response.status).toBe(200);
+        const proof = JSON.parse(readFileSync(fixture.proofPath(nonce), 'utf8'));
+        expect(proof.allowArbitraryMention).toBe(allowed === true);
+        expect(proof.larkAppId).toBe('app-managed-origin');
+      }
+    } finally { fixture.cleanup(); }
+  });
+
   it('separates same-app open-id operation from union-id creator ownership', async () => {
     const fixture = installManagedOriginFixture();
     try {
@@ -1943,8 +1975,10 @@ describe('GET /api/bot-default-oncall — oncall chat counts', () => {
     const configPath = join(dir, 'bots.json');
     const appId = 'test-oncall-counts-app';
     const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = process.env.SESSION_DATA_DIR;
     try {
       process.env.BOTS_CONFIG = configPath;
+      process.env.SESSION_DATA_DIR = dir;
       writeFileSync(configPath, JSON.stringify([{
         larkAppId: appId,
         larkAppSecret: 'secret',
@@ -1952,26 +1986,235 @@ describe('GET /api/bot-default-oncall — oncall chat counts', () => {
         // oc_live is still bound; the other two were unbound / released and only
         // remain in the "auto-bind already used" list.
         oncallChats: [{ chatId: 'oc_live', workingDir: dir }],
+        allowedChatGroups: ['oc_grp'],
         defaultOncallAutoboundChats: ['oc_live', 'oc_unbound', 'oc_released'],
       }], null, 2));
       loadBotConfigs().forEach((c: any) => registerBot(c));
       setLarkAppId(appId);
+      initSessionGroups(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
 
       const body = await (await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`)).json();
-      expect(body).toMatchObject({ autoboundChatCount: 3, oncallChatCount: 1 });
+      expect(body).toMatchObject({
+        autoboundChatCount: 3,
+        oncallChatCount: 1,
+        // Shared-bot advice inputs: oc_live / oc_grp are ordinary groups here.
+        oncallSharedChatCount: 1,
+        allowedChatGroupsCount: 1,
+        allowedUsersCount: 0,
+        effectiveSandboxMode: 'off',
+      });
+
+      // Once both ids are p2pMode='group' session groups, the counts feeding
+      // the advice drop to zero (their oncall binding only pins a workingDir).
+      registerSessionGroup('oc_live', { ownerOpenId: 'ou_owner', lastSessionId: 's1' });
+      registerSessionGroup('oc_grp', { ownerOpenId: 'ou_owner', lastSessionId: 's2' });
+      const body2 = await (await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`)).json();
+      expect(body2).toMatchObject({ oncallChatCount: 1, oncallSharedChatCount: 0, allowedChatGroupsCount: 0 });
     } finally {
       if (handle) await handle.close();
       handle = null;
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('marks the advice inputs localSandboxApplies=false for a riff backend even with BOTMUX_SANDBOX on', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-riff-advice-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-riff-advice-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevEnv = process.env.BOTMUX_SANDBOX;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      process.env.SESSION_DATA_DIR = dir;
+      // The remote exemption wraps the whole resolution, including the env leg.
+      process.env.BOTMUX_SANDBOX = 'oncall';
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'riff', backendType: 'riff',
+        oncallChats: [{ chatId: 'oc_live', workingDir: dir }],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const body = await (await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`)).json();
+      expect(body).toMatchObject({ localSandboxApplies: false, effectiveSandboxMode: 'off' });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      if (prevEnv === undefined) delete process.env.BOTMUX_SANDBOX;
+      else process.env.BOTMUX_SANDBOX = prevEnv;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('pairs a remote CLI id with its backend when backendType is absent', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-riff-paired-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-riff-paired-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      process.env.SESSION_DATA_DIR = dir;
+      // cliId riff with NO backendType line (the natural config).
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'riff',
+        oncallChats: [{ chatId: 'oc_live', workingDir: dir }],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const body = await (await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`)).json();
+      expect(body).toMatchObject({ localSandboxApplies: false, effectiveSandboxMode: 'off' });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('marks a herdr backend local but sandbox-incapable at the IPC route', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-herdr-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-herdr-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      process.env.SESSION_DATA_DIR = dir;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude-code', backendType: 'herdr',
+        oncallChats: [{ chatId: 'oc_live', workingDir: dir }],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const body = await (await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`)).json();
+      expect(body).toMatchObject({ localSandboxApplies: true, sandboxCapable: false });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('marks a provably-remote mojo session non-local at the IPC route', async () => {    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-mojo-remote-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-mojo-remote-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      process.env.SESSION_DATA_DIR = dir;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'mojo', backendType: 'mojo',
+        mojo: { cloud: true, localDaemon: false },
+        oncallChats: [{ chatId: 'oc_live', workingDir: dir }],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const body = await (await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`)).json();
+      expect(body).toMatchObject({ localSandboxApplies: false, effectiveSandboxMode: 'off' });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('still resolves readIsolation to oncall in the typo-env fallback', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-readiso-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-readiso-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevEnv = process.env.BOTMUX_SANDBOX;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      process.env.SESSION_DATA_DIR = dir;
+      process.env.BOTMUX_SANDBOX = 'oncll';
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex', readIsolation: true,
+        oncallChats: [{ chatId: 'oc_live', workingDir: dir }],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const body = await (await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`)).json();
+      expect(body).toMatchObject({ localSandboxApplies: true, effectiveSandboxMode: 'oncall' });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      if (prevEnv === undefined) delete process.env.BOTMUX_SANDBOX;
+      else process.env.BOTMUX_SANDBOX = prevEnv;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not die when BOTMUX_SANDBOX has a typo, falling back to the config-only mode', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-bad-env-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-bad-env-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const prevDataDir = process.env.SESSION_DATA_DIR;
+    const prevEnv = process.env.BOTMUX_SANDBOX;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      process.env.SESSION_DATA_DIR = dir;
+      process.env.BOTMUX_SANDBOX = 'oncll';
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex',
+        oncallChats: [{ chatId: 'oc_live', workingDir: dir }],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`);
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body).toMatchObject({ effectiveSandboxMode: 'off', localSandboxApplies: true });
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+      else process.env.SESSION_DATA_DIR = prevDataDir;
+      if (prevEnv === undefined) delete process.env.BOTMUX_SANDBOX;
+      else process.env.BOTMUX_SANDBOX = prevEnv;
       rmSync(dir, { recursive: true, force: true });
     }
   });
 });
 
 describe('GET /api/bot-default-oncall — schedule host paths', () => {
-  it('reports the execution cwd and trusted file root without persisting either as bot config', async () => {
+  it('reports the validated Bot default and trusted file root without persisting either as extra bot config', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-schedule-cwd-'));
     const configPath = join(dir, 'bots.json');
     const appId = 'test-schedule-cwd-app';
@@ -1980,6 +2223,7 @@ describe('GET /api/bot-default-oncall — schedule host paths', () => {
     try {
       process.env.BOTS_CONFIG = configPath;
       config.session.dataDir = join(dir, 'daemon-data');
+      mkdirSync(join(dir, 'session-default'));
       writeFileSync(configPath, JSON.stringify([{
         larkAppId: appId,
         larkAppSecret: 'secret',
@@ -1994,7 +2238,7 @@ describe('GET /api/bot-default-oncall — schedule host paths', () => {
       const response = await fetch(`${base}/api/bot-default-oncall`);
       expect(response.status).toBe(200);
       expect(await response.json()).toMatchObject({
-        scheduleWorkingDir: process.cwd(),
+        scheduleWorkingDir: join(dir, 'session-default'),
         schedulePreconditionFileRoot: join(
           config.session.dataDir,
           'schedule-preconditions',
@@ -2301,6 +2545,23 @@ describe('PUT /api/bot-card-prefs — Codex browser bridge', () => {
       expect(await on.json()).toMatchObject({ ok: true, codexBrowser: true });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].codexBrowser).toBe(true);
 
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json())
+        .toMatchObject({ codexBrowserAutoApproveOrigins: false });
+      const approvalOn = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ codexBrowserAutoApproveOrigins: true }),
+      });
+      expect(approvalOn.status).toBe(200);
+      expect(await approvalOn.json()).toMatchObject({ codexBrowserAutoApproveOrigins: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].codexBrowser)
+        .toMatchObject({ enabled: true, autoApproveOrigins: true });
+      expect(getBot(appId).config.codexBrowser?.autoApproveOrigins).toBe(true);
+      const malformed = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ codexBrowserAutoApproveOrigins: 'true' }),
+      });
+      expect(malformed.status).toBe(400);
+
       const off = await fetch(`${base}/api/bot-card-prefs`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
@@ -2308,6 +2569,13 @@ describe('PUT /api/bot-card-prefs — Codex browser bridge', () => {
       });
       expect(off.status).toBe(200);
       expect(await off.json()).toMatchObject({ ok: true, codexBrowser: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].codexBrowser).toBeUndefined();
+
+      const disabledBridge = await fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ codexBrowserAutoApproveOrigins: true }),
+      });
+      expect(disabledBridge.status).toBe(409);
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].codexBrowser).toBeUndefined();
 
       getBot(appId).config.sandbox = true;
@@ -2630,14 +2898,18 @@ describe('PUT /api/bot-card-prefs — streaming card buttons', () => {
 });
 
 describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
-  async function withBot(cliId: string, run: (base: string, configPath: string, appId: string) => Promise<void>): Promise<void> {
+  async function withBot(
+    cliId: string,
+    run: (base: string, configPath: string, appId: string) => Promise<void>,
+    extraConfig: Record<string, unknown> = {},
+  ): Promise<void> {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-reply-delivery-'));
     const configPath = join(dir, 'bots.json');
     const appId = `test-reply-delivery-${cliId}`;
     const prevBotsConfig = process.env.BOTS_CONFIG;
     try {
       process.env.BOTS_CONFIG = configPath;
-      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId }], null, 2));
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId, ...extraConfig }], null, 2));
       loadBotConfigs().forEach((c: any) => registerBot(c));
       setLarkAppId(appId);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
@@ -2732,6 +3004,42 @@ describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
       expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send' });
       expect(persisted(configPath).replyDelivery).toBe('send');
     });
+  });
+
+  it('doubao: GET 缺省 transcript/supported（共享常驻 service 进程下 send 归属不可靠），PUT send 显式落盘可退回', async () => {
+    await withBot('doubao', async (base, configPath, appId) => {
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial).toMatchObject({ replyDelivery: 'transcript', replyDeliveryDefault: 'transcript', replyDeliverySupported: true });
+      expect('replyDelivery' in persisted(configPath)).toBe(false);
+
+      const off = await put(base, 'send');
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'transcript' });
+      expect(persisted(configPath).replyDelivery).toBe('send');
+      expect(getBot(appId).config.replyDelivery).toBe('send');
+
+      // '' 清 key，回到 doubao 的缺省 transcript（而不是通用缺省 send）。
+      const cleared = await put(base, '');
+      expect(cleared.status).toBe(200);
+      expect(await cleared.json()).toMatchObject({ ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'transcript' });
+      expect('replyDelivery' in persisted(configPath)).toBe(false);
+    });
+  });
+
+  it('doubao + scratch: GET 生效值回落 send、缺省值仍 transcript、开关 unsupported，PUT transcript 4xx（#2828 静默边）', async () => {
+    await withBot('doubao', async (base) => {
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'transcript', replyDeliverySupported: false });
+
+      const rejected = await put(base, 'transcript');
+      expect(rejected.status).toBe(400);
+      expect(await rejected.json()).toMatchObject({ ok: false, error: 'reply_delivery_unsupported' });
+
+      // 显式 send 在 scratch 下仍可写（doubao scratch 回旧行为，不静默）。
+      const send = await put(base, 'send');
+      expect(send.status).toBe(200);
+      expect(await send.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'transcript' });
+    }, { sandbox: 'scratch' });
   });
 
   it('antigravity: 只有零注入转写，PUT transcript 4xx reply_delivery_unsupported 且不落盘，PUT send 落盘', async () => {
@@ -4347,7 +4655,7 @@ describe('POST /api/grants/chat', () => {
     expect(handler).not.toHaveBeenCalled();
   });
 
-  it('rejects stable subject app ids for revoke or readback before invoking the service', async () => {
+  it('rejects stable subject app ids for readback before invoking the service (grant and revoke resolve them)', async () => {
     const handler = vi.fn();
     setExactChatGrantHandler(handler as any);
     setLarkAppId('cli_receiver');
@@ -4358,7 +4666,7 @@ describe('POST /api/grants/chat', () => {
       method: 'POST',
       headers: { 'content-type': 'application/json', ...tokenAuthHeaders(TEST_IPC_SECRET, cliAuthBind('POST', '/api/grants/chat', handle.port)) },
       body: JSON.stringify({
-        operation: 'revoke',
+        operation: 'readback',
         receiverLarkAppId: 'cli_receiver',
         chatId: 'oc_chat',
         subjectLarkAppIds: ['cli_pm'],
@@ -5073,9 +5381,11 @@ describe('POST /api/sessions/:sessionId/restart', () => {
 
       expect(res.status).toBe(200);
       await vi.waitFor(() => expect(replySpy).toHaveBeenCalled());
-      const notice = JSON.parse(replySpy.mock.calls[0]![2]);
-      expect(notice.text).toContain('Frozen Vendor Codex');
-      expect(notice.text).not.toContain('New Live Name');
+      // The restart status card, posted into the thread.
+      expect(replySpy.mock.calls[0]![3]).toBe('interactive');
+      const title = JSON.parse(replySpy.mock.calls[0]![2] as string).header.title.content as string;
+      expect(title).toContain('Frozen Vendor Codex');
+      expect(title).not.toContain('New Live Name');
     } finally {
       replySpy.mockRestore();
       findSpy.mockRestore();
@@ -5161,25 +5471,30 @@ describe('POST /api/sessions/:sessionId/restart', () => {
     forkSpy.mockRestore();
   });
 
-  it('revives a worker-less but active session by re-forking (matches the Feishu card path)', async () => {
+  it('revives a worker-less but active session through the restart coordinator (matches the Feishu card path)', async () => {
     const forkSpy = vi.spyOn(workerPool, 'forkWorker').mockImplementation(() => {});
-    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue({
+    const restartSpy = vi.spyOn(workerPool, 'requestSessionRestart')
+      .mockReturnValue({ attemptId: 'attempt-revive', joined: false });
+    const ds = {
       session: { sessionId: 's-revive', cliId: 'codex' },
       worker: null,
       adoptedFrom: undefined,
       hasHistory: true,
-    } as any);
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
 
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s-revive/restart`, { method: 'POST' });
 
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ ok: true, sessionId: 's-revive', cliId: 'codex', revived: true });
-    expect(forkSpy).toHaveBeenCalledTimes(1);
-    // forkWorker(ds, prompt, resume) — resume must carry ds.hasHistory so the
-    // revived CLI resumes the conversation rather than starting blank.
-    expect(forkSpy.mock.calls[0][2]).toBe(true);
+    // A correlated attempt (pane teardown + fork with a restartAttemptId, resume
+    // from ds.hasHistory) — not a bare forkWorker whose result nobody hears.
+    expect(restartSpy).toHaveBeenCalledTimes(1);
+    expect(restartSpy).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'dashboard' }));
+    expect(forkSpy).not.toHaveBeenCalled();
     findSpy.mockRestore();
+    restartSpy.mockRestore();
     forkSpy.mockRestore();
   });
 
@@ -6532,6 +6847,7 @@ describe('POST /api/schedules — creator identity binding', () => {
       const bot = registerBot({
         larkAppId: appId, larkAppSecret: '', cliId: 'codex', apiOnly: true,
         allowedUsers: [ownerOpenId],
+        defaultWorkingDir: dir,
       });
       bot.resolvedAllowedUsers = [ownerOpenId];
       bot.rawAllowedUserResolution.set(ownerUnionId, ownerOpenId);
@@ -6572,6 +6888,7 @@ describe('POST /api/schedules — creator identity binding', () => {
       const bot = registerBot({
         larkAppId: appId, larkAppSecret: '', cliId: 'codex', apiOnly: true,
         allowedUsers: ['ou_owner'],
+        defaultWorkingDir: dir,
       });
       bot.resolvedAllowedUsers = ['ou_owner'];
       bot.rawAllowedUserResolution.set('on_owner', 'ou_someone_else');
@@ -6615,7 +6932,14 @@ describe('POST/PATCH /api/schedules — per-task model & effort', () => {
       config.session.dataDir = join(dir, 'data');
       scheduleStore.setScheduleScope(APP);
       setLarkAppId(APP);
-      registerBot({ larkAppId: APP, larkAppSecret: '', cliId: cliId as any, apiOnly: true, ...(model ? { model } : {}) });
+      registerBot({
+        larkAppId: APP,
+        larkAppSecret: '',
+        cliId: cliId as any,
+        apiOnly: true,
+        defaultWorkingDir: dir,
+        ...(model ? { model } : {}),
+      });
       local = await startIpcServer({ port: 0, host: '127.0.0.1' });
       return await run(`http://127.0.0.1:${local.port}`);
     } finally {
@@ -6673,10 +6997,50 @@ describe('POST/PATCH /api/schedules — per-task model & effort', () => {
   });
 
   it('400s any override on a CLI without the per-turn model contract', async () => {
-    await withServer('gemini', undefined, async base => {
+    await withServer('opencode', undefined, async base => {
       const res = await create(base, { model: 'gpt-5.6-sol' });
       expect(res.status).toBe(400);
       expect((await res.json()).field).toBe('model');
+    });
+  });
+
+  it.each([
+    { model: 'minimax/MiniMax-M3' },
+    { reasoningEffort: 'max' },
+    { model: 'minimax/MiniMax-M3.1-Flash', reasoningEffort: 'high' },
+  ])('rejects a MiniMax task override without creating a task: %j', async fields => {
+    await withServer('minimax', 'minimax/MiniMax-M3.1-Flash', async base => {
+      const before = scheduleStore.listTasks(APP);
+      expect((await create(base, fields)).status).toBe(400);
+      expect(scheduleStore.listTasks(APP)).toEqual(before);
+    });
+  });
+
+  it.each(['', null])('allows clearing legacy MiniMax task overrides with %j, but rejects new ones', async clear => {
+    await withServer('minimax', 'minimax/MiniMax-M3.1-Flash', async base => {
+      const created = await create(base, {});
+      expect(created.status).toBe(200);
+      const task = (await created.json()).task;
+      // CLI/schedule-store can contain older intent that fire time ignores.
+      scheduleStore.updateTask(task.id, { model: 'minimax/MiniMax-M3', reasoningEffort: 'high' }, APP);
+      const before = scheduleStore.getTask(task.id, APP)!;
+      const patch = (body: Record<string, unknown>) => fetch(`${base}/api/schedules/${task.id}`, {
+        method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+      expect((await patch({ model: 'minimax/MiniMax-M3.1-Flash', reasoningEffort: 'max' })).status).toBe(400);
+      expect(scheduleStore.getTask(task.id, APP)).toEqual(before);
+      const ignored = resolveScheduleModelOverride(before, getBot(APP).config);
+      expect(ignored.model).toBeUndefined();
+      expect(ignored.reasoningEffort).toBeUndefined();
+      expect(ignored.warnings).toHaveLength(1);
+
+      expect((await patch({ reasoningEffort: clear })).status).toBe(400);
+      expect(scheduleStore.getTask(task.id, APP)).toEqual(before);
+      expect((await patch({ model: clear, reasoningEffort: clear })).status).toBe(200);
+      const after = scheduleStore.getTask(task.id, APP)!;
+      expect(after.model).toBeUndefined();
+      expect(after.reasoningEffort).toBeUndefined();
+      expect(resolveScheduleModelOverride(after, getBot(APP).config)).toEqual({ warnings: [] });
     });
   });
 
@@ -6717,7 +7081,13 @@ describe('POST/PATCH /api/schedules — local work calendar', () => {
       process.env.BOTMUX_SCHEDULE_TIMEZONE = 'Asia/Shanghai';
       scheduleStore.setScheduleScope(app);
       setLarkAppId(app);
-      registerBot({ larkAppId: app, larkAppSecret: '', cliId: 'gemini', apiOnly: true });
+      registerBot({
+        larkAppId: app,
+        larkAppSecret: '',
+        cliId: 'opencode',
+        apiOnly: true,
+        defaultWorkingDir: dir,
+      });
       const { workCalendarPath } = await import('../src/services/work-calendar.js');
       const fixture = JSON.parse(readFileSync(new URL('./fixtures/work-calendar/demo.json', import.meta.url), 'utf8'));
       mkdirSync(join(dir, 'bots', app), { recursive: true });
@@ -7781,6 +8151,7 @@ describe('POST /api/schedules execution position', () => {
         name: '每日巡检',
         schedule: 'every 30m',
         prompt: '检查发布状态',
+        workingDir: process.cwd(),
         chatId: 'oc_target',
         executionPosition: 'new-topic',
         topicTitle: '每日发布巡检',
@@ -7820,6 +8191,7 @@ describe('POST /api/schedules execution position', () => {
         name: '多群巡检',
         schedule: 'every 30m',
         prompt: '检查发布状态',
+        workingDir: process.cwd(),
         chatId: 'oc_first',
         chatIds: ['oc_first', 'oc_second', 'oc_second'],
         executionPosition: 'top-level',
@@ -7881,6 +8253,7 @@ describe('POST /api/schedules execution position', () => {
         name: '静默巡检',
         schedule: 'every 30m',
         prompt: '检查发布状态',
+        workingDir: process.cwd(),
         chatId: 'oc_target',
         executionPosition: 'new-topic',
         silent: true,
@@ -8106,7 +8479,7 @@ describe('PUT /api/bot-no-progress-notify', () => {
 });
 
 describe('PUT /api/bot-substitute-mode', () => {
-  it('preserves quote reply mode in the response and bots.json', async () => {
+  it('preserves reply settings and keyword filters through HTTP, and can clear keywords', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-substitute-ipc-'));
     const configPath = join(dir, 'bots.json');
     const appId = 'test-substitute-app';
@@ -8131,18 +8504,28 @@ describe('PUT /api/bot-substitute-mode', () => {
           disclosure: 'prefix',
           replyMode: 'quote',
           excludedChats: ['oc_x', ' oc_y ', '', 'oc_x'],
+          keywords: [' incident ', 'Oncall', '', 'incident'],
         }),
       });
 
       expect(res.status).toBe(200);
       expect(await res.json()).toMatchObject({
         ok: true,
-        substituteMode: { replyMode: 'quote', excludedChats: ['oc_x', 'oc_y'] },
+        substituteMode: { replyMode: 'quote', excludedChats: ['oc_x', 'oc_y'], keywords: ['incident', 'Oncall'] },
       });
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].substituteMode).toMatchObject({
         replyMode: 'quote',
         excludedChats: ['oc_x', 'oc_y'],
+        keywords: ['incident', 'Oncall'],
       });
+      const cleared = await fetch(`http://127.0.0.1:${handle.port}/api/bot-substitute-mode`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: true, targets: [{ userId: 'u_alice' }], keywords: [] }),
+      });
+      expect(cleared.status).toBe(200);
+      expect((await cleared.json()).substituteMode).not.toHaveProperty('keywords');
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].substituteMode).not.toHaveProperty('keywords');
+      expect(getBot(appId).config.substituteMode).not.toHaveProperty('keywords');
     } finally {
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
@@ -8288,9 +8671,9 @@ esac
         await page.goto(`http://127.0.0.1:${(server.address() as any).port}`);
         const picker = page.locator('[data-section="codex-profile"]');
         await picker.locator('[role="status"]').filter({ hasText: /扫描完成|Scan complete/ }).waitFor();
-        await page.locator('#bd-menu-codexProfile summary').click();
-        await page.locator('#bd-menu-codexProfile input[type="search"]').fill('with');
-        await page.locator('#bd-menu-codexProfile button').filter({ hasText: /^withhooks$/ }).click();
+        await page.locator('#bd-menu-codexProfile .sect-sort-trigger').click();
+        await page.locator('.sect-sort-pop:visible .sect-sort-search').fill('with');
+        await page.locator('.sect-sort-pop:visible [role="option"]').filter({ hasText: /^withhooks$/ }).click();
         await page.locator('[data-action="save-agent"]').click();
         await page.locator('[data-saved-launch]').filter({ hasText: '"codexProfile": "withhooks"' }).waitFor();
         expect(requests[0]).toMatchObject({ codexProfile: 'withhooks' });
@@ -8307,9 +8690,9 @@ esac
         if (process.env.BOTMUX_PROFILE_SCREENSHOT_DIR) {
           await page.screenshot({ path: join(process.env.BOTMUX_PROFILE_SCREENSHOT_DIR, 'profile-missing.png'), fullPage: true });
         }
-        await page.locator('#bd-menu-codexProfile summary').click();
-        await page.locator('#bd-menu-codexProfile input[type="search"]').fill('');
-        await page.locator('#bd-menu-codexProfile button').filter({ hasText: /不指定 profile|No profile/ }).click();
+        await page.locator('#bd-menu-codexProfile .sect-sort-trigger').click();
+        await page.locator('.sect-sort-pop:visible .sect-sort-search').fill('');
+        await page.locator('.sect-sort-pop:visible [role="option"]').filter({ hasText: /不指定 profile|No profile/ }).click();
         await page.locator('[data-action="save-agent"]').click();
         await page.locator('[data-saved-launch]').filter({ hasText: '"codexProfile": null' }).waitFor();
         expect(disk()).not.toHaveProperty('codexProfile');
@@ -8558,7 +8941,6 @@ esac
     });
 
     it.each([
-      [{ sandbox: true }, 'wrapper_sandbox_conflict'],
       [{ readIsolation: true }, 'wrapper_read_isolation_conflict'],
       [{ codexAuthSync: 'isolated' }, 'wrapper_isolated_auth_conflict'],
       [{ serviceTier: 'priority' }, 'service_tier_catalog_unavailable'],
@@ -8571,6 +8953,13 @@ esac
       expect(await response.json()).toMatchObject({ error });
       expect(readFileSync(configPath, 'utf8')).toBe(before);
       expect(getBot(appId).config).toEqual(memory);
+    });
+
+    it('saves a wrapper on a sandboxed bot (the wrapper runs inside the sandbox)', async () => {
+      await setup({ cliId: 'codex', wrapperCli: 'codex --profile withhooks', sandbox: true });
+      const response = await save({ cliId: 'codex', model: 'changed' });
+      expect(response.status).toBe(200);
+      expect(getBot(appId).config).toMatchObject({ wrapperCli: 'codex --profile withhooks', sandbox: true, model: 'changed' });
     });
 
 
@@ -8630,8 +9019,8 @@ esac
           mkdirSync(process.env.BOTMUX_WRAPPER_SCREENSHOT_DIR, { recursive: true });
           await page.screenshot({ path: join(process.env.BOTMUX_WRAPPER_SCREENSHOT_DIR, 'wrapper-preserved.png'), fullPage: true });
         }
-        await page.locator('#bd-menu-agentCliId summary').click();
-        await page.locator('#bd-menu-agentCliId button[aria-current="true"]').click();
+        await page.locator('#bd-menu-agentCliId .sect-sort-trigger').click();
+        await page.locator('.sect-sort-pop:visible [role="option"][data-selected]').click();
         await page.locator('[data-codex-runtime]').waitFor();
         await page.locator('[data-action="save-agent"]').click();
         await page.locator('[data-saved-launch]').filter({ hasText: '"wrapperCli": null' }).waitFor();
@@ -11206,6 +11595,34 @@ describe('POST /api/groups/create', () => {
     linkSpy.mockRestore();
   });
 
+  it('optional topic-group mode and bot collaboration: passed through when sent, refused when malformed', async () => {
+    setLarkAppId('test-app');
+    const createSpy = vi.spyOn(groupsStore, 'createChat').mockResolvedValue({ chatId: 'oc_topic', invalidBotIds: [], invalidUserIds: [] });
+    const addSpy = vi.spyOn(groupsStore, 'addBotToChat').mockResolvedValue([{ id: 'cli_X', ok: true }]);
+    const linkSpy = vi.spyOn(groupsStore, 'getChatShareLink').mockResolvedValue({ ok: true, shareLink: 'https://example.test/chat' });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const post = (body: unknown) => fetch(`http://127.0.0.1:${handle!.port}/api/groups/create`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+    });
+
+    expect((await post({ larkAppIds: ['test-app'], chatMode: 'thread' })).status).toBe(400);
+    expect((await post({ larkAppIds: ['test-app'], botCollaboration: 'yes' })).status).toBe(400);
+    expect(createSpy).not.toHaveBeenCalled();
+
+    const plain = await (await post({ larkAppIds: ['test-app', 'cli_X'] })).json();
+    expect(createSpy).toHaveBeenLastCalledWith('test-app', { name: undefined, botIds: [], userIds: [], chatMode: undefined });
+    expect('collaborationError' in plain).toBe(false);
+
+    const topic = await (await post({ larkAppIds: ['test-app', 'cli_X'], chatMode: 'topic', botCollaboration: true })).json();
+    expect(createSpy).toHaveBeenLastCalledWith('test-app', expect.objectContaining({ chatMode: 'topic' }));
+    // The grant matrix ran for the joined bots (no host secret / daemon here,
+    // so it reports its error; without the flag the key is absent).
+    expect(typeof topic.collaborationError).toBe('string');
+    addSpy.mockRestore();
+    createSpy.mockRestore();
+    linkSpy.mockRestore();
+  });
+
   it('rejects missing bindWorkingDir before creating the group', async () => {
     setLarkAppId('test-app');
     const createSpy = vi.spyOn(groupsStore, 'createChat').mockResolvedValue({
@@ -12450,7 +12867,7 @@ describe('group default model configuration', () => {
       expect(chats.chats[0].agentCliId).toBe('codex');
       list.mockRestore();
       const before = readFileSync(configPath, 'utf8');
-      expect((await put({ gemini: 'flash' })).status).toBe(400);
+      expect((await put({ opencode: 'flash' })).status).toBe(400);
       expect((await put(null)).status).toBe(400);
       expect((await put({codex:{model:'gpt-5.5',reasoningEffort:'ultra'}})).status).toBe(400);
       expect(readFileSync(configPath, 'utf8')).toBe(before);
@@ -12594,6 +13011,59 @@ describe('PUT /api/bot-card-prefs — tool result preference', () => {
         }
       }
       expect(getBot(appId).config.thinkingCardToolResult).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT /api/bot-card-prefs — unified card tool visibility', () => {
+  it('persists replyCardShowTools false explicitly and deletes the key on true', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-show-tools-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-show-tools-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex', replyCardMode: 'unified',
+      }]));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const url = `http://127.0.0.1:${handle.port}/api/bot-card-prefs`;
+
+      const hidden = await fetch(url, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ replyCardShowTools: false }),
+      });
+      expect(hidden.status).toBe(200);
+      expect(await hidden.json()).toMatchObject({ ok: true, replyCardShowTools: false });
+      const storedHidden = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+      expect(storedHidden.replyCardShowTools).toBe(false);
+      expect(loadBotConfigs()[0].replyCardShowTools).toBe(false);
+      expect(getBot(appId).config.replyCardShowTools).toBe(false);
+
+      const shown = await fetch(url, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ replyCardShowTools: true }),
+      });
+      expect(shown.status).toBe(200);
+      expect(await shown.json()).toMatchObject({ ok: true, replyCardShowTools: true });
+      const storedShown = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+      expect(storedShown).not.toHaveProperty('replyCardShowTools');
+      expect(loadBotConfigs()[0].replyCardShowTools).toBeUndefined();
+      expect(getBot(appId).config.replyCardShowTools).toBeUndefined();
+
+      const badType = await fetch(url, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ replyCardShowTools: 'false' }),
+      });
+      expect(badType.status).toBe(400);
     } finally {
       if (handle) await handle.close();
       handle = null;

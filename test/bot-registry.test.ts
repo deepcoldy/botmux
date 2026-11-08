@@ -3,6 +3,9 @@
  *
  * Run:  pnpm vitest run test/bot-registry.test.ts
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
@@ -623,6 +626,22 @@ describe('parseBotConfigsFromText — brand', () => {
     const custom = cfg.groupMessageListenerOverrides?.oc_custom;
     if (custom?.mode === 'custom') expect(custom.listener.autoCloseAfterCompletion).toBeUndefined();
     expect(cfg.messageListeners?.oc_legacy.autoCloseAfterCompletion).toBeUndefined();
+  });
+
+  it('retains identity keyword semantics across global, custom and legacy config reloads', () => {
+    const listener = { enabled: true, prompt: 'triage', contentPolicy: { includeMentionedOpenIds: ['ou_member'], matchMode: 'all' } };
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({
+      globalMessageListener: listener,
+      groupMessageListenerOverrides: { oc_custom: { mode: 'custom', listener } },
+      messageListeners: { oc_legacy: listener },
+    })]));
+    expect(cfg.globalMessageListener?.contentPolicy).toEqual(listener.contentPolicy);
+    expect(cfg.groupMessageListenerOverrides?.oc_custom).toMatchObject({ mode: 'custom', listener: { contentPolicy: listener.contentPolicy } });
+    expect(cfg.messageListeners?.oc_legacy.contentPolicy).toEqual(listener.contentPolicy);
+    const [invalid] = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({
+      globalMessageListener: { ...listener, contentPolicy: { includeKeywords: ['ask'], includeMentionedOpenIds: ['bad'], matchMode: 'all' } },
+    })]));
+    expect(invalid.globalMessageListener?.contentPolicy).toEqual({ includeKeywords: ['ask'], includeMentionedOpenIds: [], matchMode: 'all' });
   });
 
   it('normalizes per-chat messageListeners without enabling them by default', () => {
@@ -1436,6 +1455,24 @@ describe('parseBotConfigsFromText — autoStartOnGroupJoinGateRequired', () => {
       { larkAppId: 'a', larkAppSecret: 's', autoStartOnGroupJoinGateRequired: false },
     ]));
     expect(disabled.autoStartOnGroupJoinGateRequired).toBeUndefined();
+  });
+});
+
+describe('parseBotConfigsFromText — autoStartOnGroupJoinAnchor', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('preserves only the non-default latest-message value', () => {
+    const parse = (value: unknown) => mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', autoStartOnGroupJoinAnchor: value },
+    ]))[0].autoStartOnGroupJoinAnchor;
+    expect(parse('latest-message')).toBe('latest-message');
+    expect(parse('reply-mode')).toBeUndefined();
+    expect(parse('latestMessage')).toBeUndefined();
+    expect(parse(true)).toBeUndefined();
   });
 });
 
@@ -2430,8 +2467,8 @@ describe('loadBotConfigs', () => {
       larkAppId: 'app_full',
       larkAppSecret: 'secret_full',
       name: 'codex-main',
-      cliId: 'gemini',
-      cliPathOverride: '/usr/local/bin/gemini',
+      cliId: 'opencode',
+      cliPathOverride: '/usr/local/bin/opencode',
       disableCliBypass: true,
       sandbox: true,
       sandboxHidePaths: ['~/.ssh', '', 42, '/etc/secret'],
@@ -2447,8 +2484,8 @@ describe('loadBotConfigs', () => {
     expect(configs).toHaveLength(1);
     const c = configs[0];
     expect(c.name).toBe('codex-main');
-    expect(c.cliId).toBe('gemini');
-    expect(c.cliPathOverride).toBe('/usr/local/bin/gemini');
+    expect(c.cliId).toBe('opencode');
+    expect(c.cliPathOverride).toBe('/usr/local/bin/opencode');
     expect(c.disableCliBypass).toBe(true);
     expect(c.sandbox).toBe(true);
     expect(c.sandboxHidePaths).toEqual(['~/.ssh', '/etc/secret']);

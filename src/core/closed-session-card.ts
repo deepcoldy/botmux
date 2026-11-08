@@ -111,7 +111,7 @@ export function buildClosedSessionCard(
     // No precise resume command AND the adapter can only resume a precise id:
     // resuming reactivates the route but starts a FRESH session — the card
     // must not imply history is restored.
-    !cliResumeCommand && resumeStartsFresh({ cliId: closedCliId, cliSessionId: session.cliSessionId }),
+    !cliResumeCommand && resumeStartsFresh({ cliId: closedCliId, cliSessionId: session.cliSessionId, sessionId: session.sessionId, workingDir: session.workingDir }),
     closedCardWorktreeSection(
       worktreeCleanupState,
       !worktreeCleanupState && sessionWorktreeOffer(session) !== undefined,

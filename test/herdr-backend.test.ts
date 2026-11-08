@@ -33,7 +33,9 @@ vi.mock('node-pty', () => ({
 
 import { execFileSync, spawn } from 'node:child_process';
 import * as pty from 'node-pty';
-import { HerdrBackend, __testOnly_resetHerdrAgentWaitProbe, chunkByUtf8Bytes } from '../src/adapters/backend/herdr-backend.js';
+import {
+  HerdrBackend, PANE_AGENT_START_TIMEOUT_MS, __testOnly_resetHerdrAgentWaitProbe, chunkByUtf8Bytes,
+} from '../src/adapters/backend/herdr-backend.js';
 
 const mockedExecFileSync = vi.mocked(execFileSync);
 const mockedSpawn = vi.mocked(spawn);
@@ -414,6 +416,47 @@ describe('HerdrBackend.spawn', () => {
     be.kill();
   });
 
+  it.skipIf(process.platform === 'win32')('Herdr 0.7.5: removes protected env after the interactive rcfile before exec', async () => {
+    setManagedLaunchResponses('claude');
+    const be = new HerdrBackend(SESSION);
+    be.spawn('/usr/bin/env', [], {
+      cwd: '/work',
+      cols: 120,
+      rows: 30,
+      env: {
+        PATH: '/usr/bin:/bin',
+        FIXTURE_SECRET: 'base-secret',
+        BOTMUX_PROTECTED_SECRET_FD: '3',
+      },
+      injectEnv: { FIXTURE_TOKEN: 'per-bot-token' },
+      protectedUnsetEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN', 'BOTMUX_PROTECTED_SECRET_FD'],
+      cliBin: '/home/test/.local/bin/claude',
+    });
+
+    const workspaceCall = herdrCall('workspace', 'create')!;
+    expect(workspaceCall).not.toContain('FIXTURE_SECRET=base-secret');
+    expect(workspaceCall).not.toContain('FIXTURE_TOKEN=per-bot-token');
+    expect(workspaceCall).not.toContain('BOTMUX_PROTECTED_SECRET_FD=3');
+
+    const launcherPath = paneLauncherPath();
+    const { execFileSync: realExecFileSync } = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const output = realExecFileSync('/bin/sh', [launcherPath], {
+      encoding: 'utf8',
+      env: {
+        PATH: '/usr/bin:/bin',
+        KEEP_AFTER_RC: 'visible',
+        FIXTURE_SECRET: 'restored-by-rcfile',
+        FIXTURE_TOKEN: 'restored-by-rcfile',
+        BOTMUX_PROTECTED_SECRET_FD: '9',
+      },
+    });
+    expect(output).toContain('KEEP_AFTER_RC=visible');
+    expect(output).not.toContain('FIXTURE_SECRET=');
+    expect(output).not.toContain('FIXTURE_TOKEN=');
+    expect(output).not.toContain('BOTMUX_PROTECTED_SECRET_FD=');
+    be.kill();
+  });
+
   it('Herdr 0.7.5: rejects unsupported launch wrappers before creating a workspace', () => {
     setManagedLaunchResponses('pi');
     const be = new HerdrBackend(SESSION);
@@ -545,7 +588,7 @@ describe('HerdrBackend.spawn', () => {
     setManagedLaunchResponses('pi', [{
       match: a => a.includes('agent') && a.includes('list'),
       reply: () => {
-        vi.setSystemTime(++polls === 1 ? 29_950 : 30_000);
+        vi.setSystemTime(++polls === 1 ? PANE_AGENT_START_TIMEOUT_MS - 50 : PANE_AGENT_START_TIMEOUT_MS);
         return JSON.stringify({ result: { agents: [
           { name: null, pane_id: MANAGED_PANE, agent: null },
         ] } });
@@ -554,7 +597,7 @@ describe('HerdrBackend.spawn', () => {
     const be = new HerdrBackend(SESSION);
 
     expect(() => be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} }))
-      .toThrow(/did not detect "pi" in pane w_launch-1 within 30000 ms/);
+      .toThrow(/did not detect "pi" in pane w_launch-1/);
     const listCalls = mockedExecFileSync.mock.calls.filter(call => {
       const args = call[1] as string[];
       return args.includes('agent') && args.includes('list');
@@ -565,6 +608,131 @@ describe('HerdrBackend.spawn', () => {
     expect(herdrCall('agent', 'rename')).toBeUndefined();
     expect(herdrCall('agent', 'start')).toBeUndefined();
     expect(existsSync(dirname(paneLauncherPath()))).toBe(false);
+    be.kill();
+  });
+
+  // How execFileSync fails when herdr does not answer. The real timeout shape
+  // carries an errno code (ret.error merged with the spawnSync result) and may
+  // have partial output; a process killed from outside has neither.
+  const unansweredAgentList = [
+    {
+      name: 'the exec timeout fired (ETIMEDOUT, partial stderr)',
+      reply: () => {
+        throw Object.assign(new Error('spawnSync herdr ETIMEDOUT'), {
+          code: 'ETIMEDOUT', errno: -110, syscall: 'spawnSync herdr', status: null, signal: 'SIGTERM',
+          stdout: '', stderr: 'some partial warning',
+        });
+      },
+    },
+    {
+      name: 'the host could not fork (EAGAIN)',
+      reply: () => {
+        throw Object.assign(new Error('spawnSync herdr EAGAIN'), { code: 'EAGAIN', errno: -11, stdout: '', stderr: '' });
+      },
+    },
+    {
+      name: 'herdr was killed without output',
+      reply: () => {
+        throw Object.assign(new Error('Command failed: herdr agent list'), {
+          status: null, signal: 'SIGTERM', stdout: '', stderr: '',
+        });
+      },
+    },
+    { name: 'an empty response', reply: () => '' },
+    { name: 'a non-JSON response', reply: () => 'not json' },
+  ];
+
+  it.each(unansweredAgentList)('Herdr 0.7.5: an agent list poll where $name keeps polling instead of failing the launch', ({ reply }) => {
+    // Loaded host (load ≈ 25): single `herdr agent list` calls hit their 5s
+    // exec timeout while the CLI is still coming up. Each one used to fail the
+    // whole launch as "herdr agent list … failed"; a message-started session
+    // has no daemon-side retry, so the user saw 会话启动失败.
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    let polls = 0;
+    setManagedLaunchResponses('pi', [{
+      match: a => a.includes('agent') && a.includes('list'),
+      reply: () => {
+        polls++;
+        vi.setSystemTime(polls * 5_000);
+        if (polls <= 2) return reply();
+        return JSON.stringify({ result: { agents: [
+          { name: null, pane_id: MANAGED_PANE, agent: 'pi', agent_status: 'idle' },
+        ] } });
+      },
+    }]);
+    const be = new HerdrBackend(SESSION);
+
+    be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    // MUTATION CHECK: treating this answer as permanent fails here with
+    // "herdr agent list … failed" on the first poll.
+    expect(polls).toBe(3);
+    expect(herdrCall('agent', 'rename')).toBeDefined();
+    expect(herdrCall('workspace', 'close')).toBeUndefined();
+    be.kill();
+    rmSync(dirname(paneLauncherPath()), { recursive: true, force: true });
+  });
+
+  it('Herdr 0.7.5: agent list failing until the deadline reports the timeout with the last poll error', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    let polls = 0;
+    setManagedLaunchResponses('pi', [{
+      match: a => a.includes('agent') && a.includes('list'),
+      reply: () => {
+        vi.setSystemTime(++polls * (PANE_AGENT_START_TIMEOUT_MS / 3));
+        throw Object.assign(new Error('Command failed: herdr agent list'), {
+          status: null, signal: 'SIGTERM', stdout: '', stderr: '',
+        });
+      },
+    }]);
+    const be = new HerdrBackend(SESSION);
+
+    expect(() => be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} }))
+      .toThrow(/did not detect "pi" in pane w_launch-1.*last agent list error: herdr agent list in .* failed/);
+    expect(polls).toBeGreaterThanOrEqual(2); // kept polling after the first failure
+    expect(herdrCall('workspace', 'close', MANAGED_WORKSPACE)).toBeDefined();
+    expect(herdrCall('agent', 'rename')).toBeUndefined();
+    expect(existsSync(dirname(paneLauncherPath()))).toBe(false);
+    be.kill();
+  });
+
+  it.each([
+    {
+      name: 'a JSON error on stderr with exit status 1',
+      reply: () => {
+        throw Object.assign(new Error('Command failed: herdr'), {
+          status: 1, stdout: '', stderr: JSON.stringify({ error: { code: 'agent_list_failed', message: 'x' } }),
+        });
+      },
+    },
+    {
+      name: 'a missing herdr binary (ENOENT)',
+      reply: () => { throw Object.assign(new Error('spawnSync herdr ENOENT'), { code: 'ENOENT' }); },
+    },
+  ])('Herdr 0.7.5: an agent list answer of $name fails the launch on the first poll', ({ reply }) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    setManagedLaunchResponses('pi', [{
+      match: a => a.includes('agent') && a.includes('list'),
+      // Each poll costs time, so a mutated (always-retry) loop reaches the
+      // deadline and ends in "did not detect" instead of spinning forever.
+      reply: () => { vi.setSystemTime(Date.now() + 5_000); return reply(); },
+    }]);
+    const be = new HerdrBackend(SESSION);
+
+    let error: unknown;
+    try { be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} }); } catch (err) { error = err; }
+    // MUTATION CHECK: retrying every poll failure keeps polling until the
+    // deadline and ends in "did not detect".
+    expect(String(error)).toMatch(/herdr agent list in .* failed/);
+    expect(String(error)).not.toMatch(/did not detect/);
+    const listCalls = mockedExecFileSync.mock.calls.filter(call => {
+      const args = call[1] as string[];
+      return args.includes('agent') && args.includes('list');
+    });
+    expect(listCalls).toHaveLength(1);
+    expect(herdrCall('workspace', 'close', MANAGED_WORKSPACE)).toBeDefined();
     be.kill();
   });
 
@@ -668,6 +836,41 @@ describe('HerdrBackend.spawn', () => {
     expect(startCall).toBeDefined();
     expect(startCall).toContain('--session');
     expect(startCall![startCall!.indexOf('--session') + 1]).toBe(SESSION);
+    be.kill();
+  });
+
+  it('legacy Herdr prefixes trusted protected removals after shell startup', () => {
+    setHerdrResponses([
+      { match: a => a.includes('--version'), reply: () => 'herdr 0.6.6\n' },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      {
+        match: a => a.includes('agent') && a.includes('start'),
+        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: '2-3' } } }),
+      },
+      { match: a => a.includes('read'), reply: () => PANE_READ_REPLY('hello') },
+    ]);
+    const be = new HerdrBackend(SESSION);
+    be.spawn('claude', [], {
+      cwd: '/work',
+      cols: 120,
+      rows: 30,
+      env: { FIXTURE_SECRET: 'base-secret', BOTMUX_PROTECTED_SECRET_FD: '3' },
+      injectEnv: { FIXTURE_TOKEN: 'per-bot-token' },
+      protectedUnsetEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN', 'BOTMUX_PROTECTED_SECRET_FD'],
+    });
+
+    const startCall = herdrCall('agent', 'start', 'botmux')!;
+    expect(startCall.slice(startCall.indexOf('--') + 1)).toEqual([
+      '/usr/bin/env',
+      '-u', 'FIXTURE_SECRET',
+      '-u', 'FIXTURE_TOKEN',
+      '-u', 'BOTMUX_PROTECTED_SECRET_FD',
+      'claude',
+    ]);
+    const startOpts = findCallOpts(a => a.includes('agent') && a.includes('start'));
+    expect(startOpts?.env?.FIXTURE_SECRET).toBeUndefined();
+    expect(startOpts?.env?.FIXTURE_TOKEN).toBeUndefined();
+    expect(startOpts?.env?.BOTMUX_PROTECTED_SECRET_FD).toBeUndefined();
     be.kill();
   });
 

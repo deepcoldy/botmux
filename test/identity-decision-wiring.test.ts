@@ -2,7 +2,7 @@
  * 源码结构护栏(K3)：F3 执行身份单一事实源的接线，纯行为测试够不到的部分。
  *
  * 行为测试已覆盖（见 identity-spawn-matrix / identity-decision-report /
- * worker-turn-idle）：五格矩阵的真 bwrap 探针、daemon 只读上报值、PTY
+ * worker-turn-idle）：七格矩阵的真 bwrap 探针、daemon 只读上报值、PTY
  * spawn 真发 session_identity_decision。剩下三处只能在接线层钉死：
  *
  *  1. worker 有且仅有两个决策上站点（PTY spawnCli 与 Codex RPC engage），
@@ -58,14 +58,16 @@ describe('F3 identity decision wiring (source structure guard)', () => {
   it('records the published model at every actual publication site (N1/N2 flip baseline)', () => {
     // The flip detector compares against the model REALLY published, not the
     // previous report: after a daemon restart an accept-time single publish
-    // exists while no report does. Three daemon sites publish turn identity;
-    // all must run through the recording helper, and the helper must record.
+    // exists while no report does. Four daemon sites publish turn identity
+    // (scheduled turn, delegated scheduled turn, per-turn refresh, and the
+    // withdrawal of a stopped workflow handoff); all must run through the
+    // recording helper, and the helper must record.
     const helper = daemonSource
       .slice(daemonSource.indexOf('function identityModelForPublication'))
       .split(/\n}\n/)[0];
     expect(helper).toContain('ds.lastPublishedIdentityModel = model');
     const publishSites = daemonSource.match(/storageModel: identityModelForPublication\(ds\)/g) ?? [];
-    expect(publishSites).toHaveLength(3);
+    expect(publishSites).toHaveLength(4);
     // And no site may still bypass the recorder with the bare accessor.
     expect(daemonSource).not.toContain(
       'storageModel: identityStorageModelForDaemonSession(ds)',

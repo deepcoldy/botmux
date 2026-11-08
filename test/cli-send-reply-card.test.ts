@@ -14,6 +14,7 @@ import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { bindGroupContextDelivery, confirmGroupContextDelivery, getDeliveredGroupContextSeqs, writePreparedGroupContext } from '../src/services/group-context-delivery-store.js';
 import { groupContextEpoch } from '../src/services/group-context-prompt.js';
 import { DEFAULT_BRAND_LABEL } from '../src/im/lark/md-card.js';
+import { REPLY_CARD_MENU_ACTION } from '../src/im/lark/reply-card-actions.js';
 import {
   shouldEmitEmptyCompletedBridgeFallback,
   type BridgeSendMarker,
@@ -230,6 +231,14 @@ describe('real CLI send into a running reply card', () => {
     { cliId: 'claude-code', args: ['--mention-back'], senderIsBot: false, merged: true },
     { cliId: 'codex', args: ['--mention-back'], senderIsBot: false, merged: true },
     { cliId: 'grok', args: ['--mention-back'], senderIsBot: false, merged: true },
+    { cliId: 'traex', args: ['--mention-back'], senderIsBot: false, merged: true },
+    { cliId: 'traex', args: ['--no-mention'], senderIsBot: false, merged: true, responseKind: 'progress' },
+    { cliId: 'traex', args: ['--no-mention'], senderIsBot: false, merged: false, sandbox: true },
+    { cliId: 'traex', args: ['--mention', 'ou_other'], senderIsBot: false, merged: false },
+    { cliId: 'pi', args: ['--mention-back'], senderIsBot: false, merged: true },
+    { cliId: 'pi', args: ['--no-mention'], senderIsBot: false, merged: true, responseKind: 'progress' },
+    { cliId: 'pi', args: ['--no-mention'], senderIsBot: false, merged: false, sandbox: true },
+    { cliId: 'pi', args: ['--mention', 'ou_other'], senderIsBot: false, merged: false },
     { cliId: 'grok', args: ['--no-mention'], senderIsBot: false, merged: true, responseKind: 'progress' },
     { cliId: 'grok', args: ['--no-mention'], senderIsBot: false, merged: false, sandbox: true },
     { cliId: 'claude-code', args: ['--mention', 'ou_requester'], senderIsBot: false, merged: true },
@@ -241,6 +250,8 @@ describe('real CLI send into a running reply card', () => {
     { cliId: 'codex', args: ['--no-mention'], senderIsBot: false, merged: false, sandbox: true },
     { cliId: 'claude-code', args: ['--no-mention'], senderIsBot: false, merged: false, sandboxEnv: { BOTMUX_READ_ISOLATION: '1' } },
     { cliId: 'codex', args: ['--no-mention'], senderIsBot: false, merged: false, sandboxEnv: { BOTMUX_SANDBOX: '1' } },
+    { cliId: 'codex', args: ['--no-mention'], senderIsBot: false, merged: false, sandboxEnv: { BOTMUX_SANDBOX: 'oncall' } },
+    { cliId: 'claude-code', args: ['--no-mention'], senderIsBot: false, merged: false, sandboxEnv: { BOTMUX_SANDBOX: 'scratch' } },
     { cliId: 'claude-code', args: ['--no-mention'], senderIsBot: false, merged: false, sandbox: true, reserveCard: false },
     { cliId: 'claude-code', args: ['--no-mention'], senderIsBot: false, merged: true, oncall: true },
     { cliId: 'codex', args: ['--no-mention'], senderIsBot: false, merged: true, oncall: true },
@@ -373,9 +384,52 @@ describe('real CLI send into a running reply card', () => {
     }
   }, 35_000);
 
+  // The daemon's menu callback does not re-check the sandbox, so this send-side
+  // exclusion is the only gate on the reply-card action menu.
+  it.each([
+    { sandboxEnv: {}, menu: true },
+    { sandboxEnv: { BOTMUX_SANDBOX: '1' }, menu: false },
+    { sandboxEnv: { BOTMUX_SANDBOX: 'oncall' }, menu: false },
+    { sandboxEnv: { BOTMUX_SANDBOX: 'scratch' }, menu: false },
+  ])('final send with replyCardActions env=$sandboxEnv carries the action menu: $menu', ({ sandboxEnv, menu }) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-send-reply-menu-'));
+    const dataDir = join(root, 'data');
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+        sessionId: key.sessionId, turnId: key.turnId,
+      }));
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: key.larkAppId, larkAppSecret: 'test-secret', cliId: 'claude-code',
+        replyCardMode: 'legacy', replyCardActions: true,
+      }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        sessionId: key.sessionId, status: 'active', cliId: 'claude-code', larkAppId: key.larkAppId,
+        chatId: 'oc_test', rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root,
+      } });
+      const result = spawnSyncTsScript(fixture, ['send', '--no-mention', '--response-kind', 'final', 'Hello! 这是完整答复。'], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: key.turnId, BOTMUX_LARK_APP_ID: key.larkAppId, ...sandboxEnv },
+        encoding: 'utf8', timeout: 30_000,
+      });
+      expect(result.status, String(result.stderr)).toBe(0);
+      const requests = String(result.stdout).split('\n').filter(line => line.startsWith('CAPTURE_REPLY='))
+        .map(line => JSON.parse(line.slice('CAPTURE_REPLY='.length)));
+      expect(requests).toHaveLength(1);
+      expect(requests[0].body.content).toContain('Hello! 这是完整答复。');
+      expect(requests[0].body.content.includes(`"action":"${REPLY_CARD_MENU_ACTION}"`)).toBe(menu);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 35_000);
+
   it.each([
     ['isolated (no host secret): hands the row to the daemon', false],
-    ['host (secret readable): reports the local failure, no relay', true],
+    // A CLI's own sandbox (e.g. a workspace-write policy) can deny the store
+    // write while the host secret stays readable: the row must still reach
+    // the daemon instead of being dropped.
+    ['host secret readable (CLI-own sandbox): still hands the row to the daemon', true],
   ])('when the feedback store cannot be opened — %s', (_label, hostSecret) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-send-index-'));
     const dataDir = join(root, 'data');
@@ -445,11 +499,7 @@ describe('real CLI send into a running reply card', () => {
         .map(line => JSON.parse(line.slice('CAPTURE_DURABLE='.length)));
       const posts = requests.filter(r => r.method === 'POST');
       expect(posts[0]).toMatchObject({ path: `/api/sessions/${key.sessionId}/durable-send` });
-      const relayed = posts.filter(r => r.path.endsWith('/turn-delivery'));
-      if (hostSecret) {
-        expect(relayed).toHaveLength(0);
-        expect(String(result.stderr)).toContain('turn delivery indexing failed after delivery');
-      } else {
+      {
         expect(posts).toHaveLength(2);
         expect(posts[1]).toMatchObject({
           method: 'POST',
@@ -457,6 +507,9 @@ describe('real CLI send into a running reply card', () => {
           body: { messageId: 'om_durable_message' },
         });
         expect(posts[1].body.content).toContain('Indexed final');
+        // The turn this CLI answered, so the daemon refuses rather than
+        // indexing under a turn it has since moved on to.
+        expect(posts[1].body.expectedTurnId).toBe(key.turnId);
         // Correlation fields are the daemon's to derive, never the CLI's.
         for (const field of ['turnId', 'sessionId', 'chatId', 'botAppId', 'policy']) {
           expect(posts[1].body).not.toHaveProperty(field);
@@ -574,6 +627,109 @@ describe('real CLI send into a running reply card', () => {
     }
   }, 35_000);
 
+  it.each([
+    { choice: 'independent', token: 'botmux-as:v1:independent' },
+    { choice: 'suggestion', token: 'botmux-as:v1:suggestion' },
+  ] as const)('sends a bare --as $choice with empty stdin: the body is synthesized downstream', ({ choice, token }) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-send-as-empty-'));
+    const dataDir = join(root, 'data');
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+        sessionId: key.sessionId,
+        turnId: key.turnId,
+      }));
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: key.larkAppId,
+        larkAppSecret: 'test-secret',
+        cliId: 'claude-code',
+        replyCardMode: 'legacy',
+      }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        sessionId: key.sessionId,
+        status: 'active',
+        cliId: 'claude-code',
+        larkAppId: key.larkAppId,
+        chatId: 'oc_test',
+        rootMessageId: 'om_root',
+        scope: 'thread',
+        chatType: 'group',
+        workingDir: root,
+      } });
+      const result = spawnSyncTsScript(
+        fixture,
+        ['send', '--as', choice, '--no-mention'],
+        {
+          cwd: fileURLToPath(new URL('..', import.meta.url)),
+          env: {
+            PATH: process.env.PATH,
+            HOME: root,
+            SESSION_DATA_DIR: dataDir,
+            BOTS_CONFIG: join(root, 'bots.json'),
+            BOTMUX_SESSION_ID: key.sessionId,
+            BOTMUX_TURN_ID: key.turnId,
+            BOTMUX_LARK_APP_ID: key.larkAppId,
+          },
+          input: '',
+          encoding: 'utf8',
+          timeout: 30_000,
+        },
+      );
+      expect(result.status, String(result.stderr)).toBe(0);
+      const requests = String(result.stdout).split('\n')
+        .filter(line => line.startsWith('CAPTURE_REPLY='))
+        .map(line => JSON.parse(line.slice('CAPTURE_REPLY='.length)));
+      expect(requests).toHaveLength(1);
+      expect(requests[0].body.content).toContain(token);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 35_000);
+
+  it('reports the --as usage error (not the empty-body error) for a bad --as with empty stdin', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-send-as-bad-'));
+    const dataDir = join(root, 'data');
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+        sessionId: key.sessionId,
+        turnId: key.turnId,
+      }));
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: key.larkAppId, larkAppSecret: 'test-secret', cliId: 'claude-code', replyCardMode: 'legacy',
+      }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        sessionId: key.sessionId, status: 'active', cliId: 'claude-code', larkAppId: key.larkAppId,
+        chatId: 'oc_test', rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root,
+      } });
+      const result = spawnSyncTsScript(
+        fixture,
+        ['send', '--as', 'bogus', '--no-mention'],
+        {
+          cwd: fileURLToPath(new URL('..', import.meta.url)),
+          env: {
+            PATH: process.env.PATH,
+            HOME: root,
+            SESSION_DATA_DIR: dataDir,
+            BOTS_CONFIG: join(root, 'bots.json'),
+            BOTMUX_SESSION_ID: key.sessionId,
+            BOTMUX_TURN_ID: key.turnId,
+            BOTMUX_LARK_APP_ID: key.larkAppId,
+          },
+          input: '',
+          encoding: 'utf8',
+          timeout: 30_000,
+        },
+      );
+      expect(result.status).toBe(2);
+      expect(result.stderr).toContain('--as 仅支持 independent|suggestion');
+      expect(result.stderr).not.toContain('正文为空');
+      expect(String(result.stdout).split('\n').filter(line => line.startsWith('CAPTURE_'))).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 35_000);
+
   it('top-level send includes brand footer as a standalone card', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-send-toplevel-'));
     const dataDir = join(root, 'data');
@@ -673,6 +829,7 @@ describe('normal CLI send reply rendering snapshot', () => {
           BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: key.turnId, BOTMUX_LARK_APP_ID: key.larkAppId,
           BOTMUX_DAEMON_IPC_PORT: '7951', BOTMUX_TEST_REPLY_RENDER_SNAPSHOT: JSON.stringify({
             usage: { context: null, tokens: null }, footerPreferences: { replyFooterEnabled: !hidden },
+            consoleUrl: 'https://m-example.botmux.example/',
             timing: { executionDurationMs: 5000, waitingDurationMs: 2000, executionInProgress: true },
           }) }, encoding: 'utf8', timeout: 30_000,
       });
@@ -687,6 +844,54 @@ describe('normal CLI send reply rendering snapshot', () => {
       expect(card.includes('等待 2.0')).toBe(!hidden);
       expect(card.includes('执行至回复')).toBe(!hidden);
       expect(card.includes('botmux_reply_footer')).toBe(!hidden);
+      expect(card.includes('](https://m-example.botmux.example/)')).toBe(!hidden);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
+});
+
+describe('CLI local fallback snapshot selects the host console entry', () => {
+  // No BOTMUX_DAEMON_IPC_PORT and an empty data dir means the daemon IPC route
+  // is unreachable, so the CLI builds the render snapshot itself — the second
+  // production generation point that must carry consoleUrl.
+  const consoleEntry = 'https://m-mtest.console.example.com/';
+  it.each([
+    { name: 'remote on + bound', remoteAccess: true, bound: true, linked: true },
+    { name: 'remote on + unbound', remoteAccess: true, bound: false, linked: false },
+    { name: 'remote off + bound', remoteAccess: false, bound: true, linked: false },
+  ])('$name', ({ remoteAccess, bound, linked }) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-local-console-'));
+    const dataDir = join(root, 'data');
+    try {
+      mkdirSync(join(root, '.botmux'), { recursive: true, mode: 0o700 });
+      writeFileSync(join(root, '.botmux', 'config.json'), JSON.stringify({ remoteAccess }), { mode: 0o600 });
+      if (bound) {
+        writeFileSync(join(root, '.botmux', 'platform.json'), JSON.stringify({
+          platformUrl: 'https://console.example.com', machineId: 'mtest', machineToken: 'tok',
+        }), { mode: 0o600 });
+      }
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: key.larkAppId, larkAppSecret: 'test-secret', cliId: 'codex', replyCardMode: 'legacy',
+      }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        sessionId: key.sessionId, status: 'active', cliId: 'codex', larkAppId: key.larkAppId,
+        chatId: 'oc_test', rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root,
+      } });
+      const result = spawnSyncTsScript(fixture, ['send', '--no-mention', '--response-kind', 'final', 'LOCAL FALLBACK BODY'], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: key.turnId, BOTMUX_LARK_APP_ID: key.larkAppId },
+        encoding: 'utf8', timeout: 30_000,
+      });
+      expect(result.status, String(result.stderr)).toBe(0);
+      // The daemon snapshot route was unreachable: nothing should have answered it.
+      expect(String(result.stdout)).not.toContain('CAPTURE_RENDER_QUERY=');
+      const captured = String(result.stdout).split('\n').filter(line => line.startsWith('CAPTURE_REPLY='))
+        .map(line => JSON.parse(line.slice('CAPTURE_REPLY='.length)));
+      expect(captured).toHaveLength(1);
+      const card = captured[0].body.content as string;
+      expect(card).toContain('LOCAL FALLBACK BODY');
+      expect(card).toContain(DEFAULT_BRAND_LABEL);
+      expect(card.includes(`](${consoleEntry})`)).toBe(linked);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 35_000);
 });

@@ -120,6 +120,19 @@ describe('adopt-picker candidates cache', () => {
     expect((discoverResumable.mock.calls[0] as unknown[])[4]).toEqual(new Set(['sid-tmux', 'sid-herdr', 'sid-zellij']));
   });
 
+  it('sorts Orca sessions by most recent output', async () => {
+    discovery.orca.mockReturnValueOnce([
+      { source: 'orca', orcaTerminalHandle: 'old', lastOutputAt: 100 },
+      { source: 'orca', orcaTerminalHandle: 'unknown' },
+      { source: 'orca', orcaTerminalHandle: 'recent', lastOutputAt: 300 },
+    ] as any);
+
+    const result = await collectAdoptCandidates('traex', undefined, new Map(), vi.fn(async () => []), 20);
+
+    expect(result.sessions.map((session: any) => session.orcaTerminalHandle))
+      .toEqual(['recent', 'old', 'unknown']);
+  });
+
   it('keeps the legacy one-argument live discovery calls when no runtime is configured', async () => {
     discovery.tmux.mockClear();
     discovery.zellij.mockClear();

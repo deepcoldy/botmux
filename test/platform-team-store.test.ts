@@ -16,8 +16,9 @@ import {
   isPlatformTeamMember,
   listPlatformTeams,
   PLATFORM_TEAM_PREFIX,
+  isLegacyTeamGroupChat,
 } from '../src/services/platform-team-store.js';
-import { recordTeamGroup, isTeamGroupChat, listTeamGroups } from '../src/services/team-groups-store.js';
+import { recordTeamGroup, listTeamGroups } from '../src/services/team-groups-store.js';
 
 let dataDir: string;
 beforeEach(() => { dataDir = mkdtempSync(join(tmpdir(), 'botmux-pfteam-')); });
@@ -46,7 +47,6 @@ describe('applyPlatformTeamSync', () => {
 
   it('mirrors group chats into team-groups under the platform prefix', () => {
     applyPlatformTeamSync(dataDir, payload('rev1', [team('t1', ['oc_hall'], [])]));
-    expect(isTeamGroupChat(dataDir, 'oc_hall')).toBe(true);
     const entry = listTeamGroups(dataDir).find(g => g.chatId === 'oc_hall');
     expect(entry?.teamId).toBe(`${PLATFORM_TEAM_PREFIX}t1`);
   });
@@ -60,9 +60,9 @@ describe('applyPlatformTeamSync', () => {
     applyPlatformTeamSync(dataDir, payload('rev2', [
       team('t1', ['oc_hall1b'], [{ appId: 'cli_a', unionId: 'on_a' }]),
     ]));
-    expect(isTeamGroupChat(dataDir, 'oc_hall1')).toBe(false);
-    expect(isTeamGroupChat(dataDir, 'oc_hall1b')).toBe(true);
-    expect(isTeamGroupChat(dataDir, 'oc_hall2')).toBe(false);
+    expect(listTeamGroups(dataDir).some(g => g.chatId === 'oc_hall1')).toBe(false);
+    expect(listTeamGroups(dataDir).some(g => g.chatId === 'oc_hall1b')).toBe(true);
+    expect(listTeamGroups(dataDir).some(g => g.chatId === 'oc_hall2')).toBe(false);
     expect(isPlatformTeamBot(dataDir, 'on_b')).toBe(false);
     expect(isPlatformTeamBot(dataDir, 'on_a')).toBe(true);
   });
@@ -70,9 +70,12 @@ describe('applyPlatformTeamSync', () => {
   it('never touches legacy federation team-groups entries', () => {
     recordTeamGroup(dataDir, 'legacyTeam', 'oc_legacy');
     applyPlatformTeamSync(dataDir, payload('rev1', [team('t1', ['oc_hall'], [])]));
+    // 平台镜像不算旧版联邦团队群（不进 team-bots 学习闸）
+    expect(isLegacyTeamGroupChat(dataDir, 'oc_hall')).toBe(false);
+    expect(isLegacyTeamGroupChat(dataDir, 'oc_legacy')).toBe(true);
     applyPlatformTeamSync(dataDir, payload('rev2', [])); // machine left all platform teams
-    expect(isTeamGroupChat(dataDir, 'oc_legacy')).toBe(true);
-    expect(isTeamGroupChat(dataDir, 'oc_hall')).toBe(false);
+    expect(listTeamGroups(dataDir).some(g => g.chatId === 'oc_legacy')).toBe(true);
+    expect(listTeamGroups(dataDir).some(g => g.chatId === 'oc_hall')).toBe(false);
   });
 
   it('isPlatformHallChat matches only the FIRST chatId per team (hall-first protocol)', () => {

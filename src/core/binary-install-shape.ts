@@ -25,7 +25,9 @@ import { isStandaloneBinary } from './self-spawn.js';
  *                     (`botmux-<plat>-<arch>[-musl]`). The manager owns the file;
  *                     update by re-running it.
  *  · `curl-binary`  — the standalone location install.sh writes. We own the file;
- *                     update by replacing it.
+ *                     update by replacing it. Botmux.app's runtime copy
+ *                     (`~/.botmux/app-runtime/botmux`, see appRuntimeBinaryPath)
+ *                     has the same ownership, so it shares this shape.
  *  · `unknown`      — anywhere else (a hand-copied binary, a distro package, a dev
  *                     build run straight out of dist-bin/), or not a compiled
  *                     binary at all. Fail closed.
@@ -35,6 +37,17 @@ export type BinaryInstallShape = 'npm-binary' | 'curl-binary' | 'unknown';
 /** Default standalone install dir, matching install.sh's own default. */
 function defaultInstallDir(home: string): string {
   return join(home, '.botmux', 'bin');
+}
+
+/**
+ * Where Botmux.app keeps the botmux binary it runs. The app seeds it from its
+ * bundle and then treats it exactly like an install.sh binary: replaced in place
+ * by `botmux update` / maintenance, never by rewriting files inside the signed
+ * .app. Living outside the bundle also keeps the fleet (and launchd/wrapper paths
+ * that point at it) intact when the app is moved or reinstalled.
+ */
+export function appRuntimeBinaryPath(home: string = homedir()): string {
+  return join(home, '.botmux', 'app-runtime', 'botmux');
 }
 
 /** Strip Windows separators and any trailing slashes so two paths naming the same
@@ -113,7 +126,7 @@ export function classifyBinaryInstall(
   // Compared BOTH raw and canonicalized (see {@link canonical}): a symlinked home
   // makes the raw strings differ for one and the same file.
   const pathResolved = resolve(path);
-  for (const raw of [env.BOTMUX_INSTALL_DIR, defaultInstallDir(home)]) {
+  for (const raw of [env.BOTMUX_INSTALL_DIR, defaultInstallDir(home), join(home, '.botmux', 'app-runtime')]) {
     if (!raw) continue;
     const dir = normalizeSlashes(raw);
     if (!dir) continue;

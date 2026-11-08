@@ -8,6 +8,8 @@ import * as pool from '../src/core/worker-pool.js';
 import * as permissions from '../src/im/lark/event-dispatcher.js';
 import * as manager from '../src/core/session-manager.js';
 import { startIpcServer, setIpcAuthSecret, setLarkAppId, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
+import { registerBot } from '../src/bot-registry.js';
+import { recordFailedTurnTerminal, recordLimitedFailedTurn } from '../src/core/failed-turn-recovery.js';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
 
 let directory: string;
@@ -56,6 +58,30 @@ async function post(mode: 'retry' | 'fresh') {
   expect(response.status).toBe(200); return response.json();
 }
 describe('HTTP recovery with real SQLite persistence', () => {
+  it('reloads one input owner and refuses late or uncorrelated failures', () => {
+    registerBot({ larkAppId: 'cli_fixture', larkAppSecret: 'fixture', cliId: 'codex', apiOnly: true });
+    vi.mocked(manager.rememberLastCliInput).mockRestore();
+    manager.rememberLastCliInput(ds, 'B', 'wrapped B', 'om_b');
+    manager.rememberLastCliInput(ds, 'C', 'wrapped C', 'om_c');
+    store.init('cli_fixture');
+    const row = store.getSessionFresh(ds.session.sessionId)!;
+    Object.assign(ds, { session: row, lastUserPrompt: row.lastUserPrompt,
+      lastCliInput: row.lastCliInput, lastCliInputTurnId: row.lastCliInputTurnId });
+    const previous = structuredClone(row.lastFailedTurn);
+    recordFailedTurnTerminal(ds, { turnId: 'om_b', status: 'failed' },
+      { workerGeneration: 1, caller, silent: false });
+    ds.usageLimit = { limited: true, kind: 'rate' };
+    recordLimitedFailedTurn(ds, 'om_b');
+    expect(store.getSessionFresh(row.sessionId)?.lastFailedTurn).toEqual(previous);
+    recordFailedTurnTerminal(ds, { turnId: 'om_c', status: 'failed' },
+      { workerGeneration: 1, caller, silent: false });
+    expect(store.getSessionFresh(row.sessionId)?.lastFailedTurn).toMatchObject({ turnId: 'om_c', cliInput: 'wrapped C' });
+    manager.rememberLastCliInput(ds, 'untracked', 'untracked input', undefined);
+    recordFailedTurnTerminal(ds, { turnId: 'om_c', status: 'failed' },
+      { workerGeneration: 1, caller, silent: false });
+    expect(store.getSessionFresh(row.sessionId)?.lastCliInputTurnId).toBeUndefined();
+    expect(store.getSessionFresh(row.sessionId)?.lastFailedTurn?.cliInput).toBe('wrapped C');
+  });
   it('persists the clean session app, routing and frozen sandbox/profile through reload', async () => {
     Object.assign(ds.session, { cliConfigDir: '/tmp/frozen-cli', modelBackendVariant: 'max',
       larkThreadId: 'omt_original', creatorOpenId: 'ou_creator', lastCallerOpenId: 'ou_last',
@@ -83,6 +109,11 @@ describe('HTTP recovery with real SQLite persistence', () => {
     expect(store.getSessionFresh(first.sessionId)?.failedTurnRecovery?.caller).toEqual(caller);
     if (mode === 'fresh') expect(store.getSessionFresh(first.sessionId)?.larkAppId).toBe('cli_fixture');
     store.init('cli_fixture');
+    const restored = store.getSessionFresh(first.sessionId)!;
+    expect(restored.currentReplyTarget).toBeUndefined();
+    expect(restored.replyTargets?.[first.turnId]).toMatchObject({
+      rootMessageId: 'om_root', senderOpenId: 'ou_user_a',
+    });
     expect(await post(mode)).toEqual(first);
     expect(mode === 'retry' ? pool.sendWorkerInput : pool.forkWorker).toHaveBeenCalledTimes(1);
     if (mode === 'fresh') expect(store.getSessionFresh(id)?.status).toBe('closed');

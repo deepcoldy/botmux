@@ -1,41 +1,60 @@
 # Lifecycle Hooks
 
-botmux can invoke external commands when key lifecycle events occur. By default they are **asynchronous**: if a command fails, times out, or doesn't exist, it only writes to the log and never blocks botmux's main flow.
+Hooks let botmux **run your own command** at key moments: a new topic arrives, a session starts or exits, something needs a human, a turn finishes… Use them to send notifications, keep audit logs, auto-update skills, or run a custom check before a message reaches the CLI.
 
-There are also **synchronous gates** (`mode: "sync"`): `prompt.submit` decides whether a message reaches the CLI, while `chat.bot_added` decides whether enabled join auto-start may continue. See [Synchronous gates](#synchronous-gates).
+There are two kinds of hooks:
 
-## Configuration Location
+| Kind | How to write it | Does botmux wait? | Good for |
+|------|-----------------|-------------------|----------|
+| Notification (default) | Omit `mode`, or `"mode": "async"` | No. Failures, timeouts, or a missing command only go to the log and never affect messaging | Push notifications, auditing, metrics, kicking off external flows |
+| Gate | `"mode": "sync"`, only on `prompt.submit` and `chat.bot_added` | Yes, it waits for "allow / deny" | Permission or content checks before a message reaches the CLI; deciding whether to auto-start after joining a group |
 
-In order of precedence (highest to lowest):
+## 5-minute start: log events to a local file
 
-1. The `BOTMUX_HOOKS_JSON` environment variable (pass a JSON array directly)
-2. The file path specified by `BOTMUX_HOOKS_FILE`
-3. The default `~/.botmux/data/hooks.json`
+1. Write a minimal hook script that appends the incoming JSON to a log:
 
-## Quick Check: Write to a Local Log
+   ```bash
+   mkdir -p ~/bin
+   cat > ~/bin/botmux-hook-log.sh <<'SH'
+   #!/bin/bash
+   { echo "== $BOTMUX_HOOK_EVENT $(date)"; cat; echo; } >> /tmp/botmux-hook.log
+   SH
+   chmod +x ~/bin/botmux-hook-log.sh
+   ```
 
-The repo ships an example script you can copy and use right away:
+2. Write the config file `~/.botmux/data/hooks.json` (prefer an absolute path for `command`: the hook gets the daemon's `PATH`, which may differ from your terminal's):
 
-```bash
-chmod +x examples/hooks/echo-to-log.sh
-HOOK_CMD="$(pwd)/examples/hooks/echo-to-log.sh"
-mkdir -p ~/.botmux/data
-cat > ~/.botmux/data/hooks.json <<JSON
-[
-  {
-    "event": "session.requires_attention",
-    "command": "$HOOK_CMD",
-    "timeoutMs": 5000
-  }
-]
-JSON
+   ```bash
+   mkdir -p ~/.botmux/data
+   cat > ~/.botmux/data/hooks.json <<JSON
+   [
+     { "event": "session.start", "command": "$HOME/bin/botmux-hook-log.sh" },
+     { "event": "turn.finished", "command": "$HOME/bin/botmux-hook-log.sh" }
+   ]
+   JSON
+   ```
 
-tail -f /tmp/botmux-hook.log
-```
+3. Send a message in Feishu, then watch the log:
 
-After any hook event fires, you'll see the JSON payload in the log. `examples/hooks/` also includes examples for macOS Notification Center (`osascript-notify.sh`) and HTTP webhooks (`http-webhook.sh`).
+   ```bash
+   tail -f /tmp/botmux-hook.log
+   ```
 
-## Configuration Fields
+Editing `hooks.json` **does not require a daemon restart**: botmux checks the file whenever an event fires and reloads it when it changes.
+
+> The source repo's `examples/hooks/` has ready-made examples: `echo-to-log.sh` (log), `osascript-notify.sh` (macOS Notification Center), `http-webhook.sh` (forward to an HTTP endpoint), `prompt-gate.sh` (sync gate). The npm package does not include this directory; copy them from the GitHub repo if you need them.
+
+## Where the config lives
+
+From highest to lowest precedence; only the first one found is used:
+
+1. Env var `BOTMUX_HOOKS_JSON`: a JSON array inline
+2. Env var `BOTMUX_HOOKS_FILE`: path to a JSON file
+3. Default file `~/.botmux/data/hooks.json` (or `hooks.json` under `SESSION_DATA_DIR` if that is set)
+
+The content is an array; each item is one hook. You can attach several hooks to the same event. If the JSON fails to parse, none of it takes effect and the log shows `[hooks] Failed to load hook config`.
+
+## Config fields
 
 ```json
 [
@@ -49,85 +68,97 @@ After any hook event fires, you'll see the JSON payload in the log. `examples/ho
 ]
 ```
 
-| Field | Type | Description |
-|------|------|------|
-| `event` | string | Required. The event name to subscribe to (see table below) |
-| `command` | string | Required. The external executable command; supports arguments, but is not run through a shell |
-| `timeoutMs` | number | Optional. Defaults to 5000; on timeout, sends `SIGTERM` first, then falls back to `SIGKILL` |
-| `mode` | `"sync"`｜`"async"` | Optional, defaults to `async` (notification, non-blocking). `sync` (awaited, can block) is supported **only on gate events** (currently `prompt.submit` and `chat.bot_added`); declaring it on any other event degrades to `async` with a warning in the log. **Gate events also support `async`** — one event can carry both observers and adjudicators |
-| `onError` | `"allow"`｜`"deny"` | Optional, meaningful only with `mode:"sync"`. Fallback direction when the hook itself fails (timeout / missing command / crash). Defaults to `allow` (fail-open) |
-| `filter.larkAppId` | string｜string[] | Optional. Only match the specified bot app. `lark_app_id` is accepted as a compatibility input and normalized to camelCase |
-| `filter.chatId` | string｜string[] | Optional. Only match the chat of the specified Lark group / topic |
-| `filter.senderOpenId` | string｜string[] | Optional. Only match the specified sender open_id; not applicable to `chat.bot_added`, which only supplies `operatorOpenId` |
-| `redact.fullContentEvents` | string[] | Optional. Long text is truncated by default; events in this allowlist pass through the full text |
+| Field | Required | Description |
+|-------|----------|-------------|
+| `event` | Yes | Event to subscribe to; see "Events" below. Entries with an unknown event are ignored |
+| `command` | Yes | Command to run, with arguments (quotes supported). **No shell**; see "Execution environment" below |
+| `timeoutMs` | No | Timeout in ms, default `5000`. On timeout botmux sends `SIGTERM`, then `SIGKILL`, to the whole process group |
+| `mode` | No | `async` (default, notification) or `sync` (gate). `sync` only works on `prompt.submit` and `chat.bot_added`; on other events it is treated as `async` with a warning in the log |
+| `onError` | No | Only for `sync`: what to do when the hook itself breaks (timeout, command not found, crash). Default `allow`; can be `deny` |
+| `filter.larkAppId` | No | Only for one (or several) Bot apps. String or array |
+| `filter.chatId` | No | Only for one (or several) chats. String or array |
+| `filter.senderOpenId` | No | Only for one (or several) senders. Events without a sender (such as `session.start`) never match |
+| `redact.fullContentEvents` | No | Long text is truncated by default; events listed here get full text for this hook |
 
-> **`outbound.send` / `outbound.reply` cannot intercept.** They fire *after* the Lark API call succeeds (the `messageId` is required to build the payload), by which point the message is already in the chat; `mode:"sync"` there could only retract after the fact, which is not interception. Declaring `sync` on them degrades to async with a warning.
+All conditions in `filter` must **match together**; an array inside one condition means "any of these". If the event lacks the field, that condition does not match.
 
-## Supported Events
+## Events
 
-| Event | Trigger |
-|------|----------|
-| `chat.bot_added` | The bot was added to a chat (requires subscribing `im.chat.member.bot.added_v1`). Async observers receive `larkAppId`, `chatId`, and `operatorOpenId`; a sync gate also receives host-read `chatName`, `chatDescription`, `chatMode`, and `chatFetchStatus`, and adjudicates before join auto-start creates a session or seed. For an independent per-bot join script you can still use `groupJoinCommand` in bots.json |
-| `topic.new` | A new topic / @mention is received |
-| `thread.reply` | A reply to an existing topic is received |
-| `prompt.submit` | A message passed the built-in permission checks and is **about to be submitted to the CLI**. Usable as a plain notification (default `async`) or a `mode:"sync"` pre-submit gate |
-| `outbound.send` | botmux successfully sends a regular message |
-| `outbound.reply` | botmux successfully replies to a topic message |
-| `schedule.fired` | A scheduled task finishes its precondition check and dispatch attempt (success, skip, or error) |
-| `session.start` | A worker / adopt worker starts successfully |
-| `session.exit` | A worker exits, crashes, or the session is closed (silenced by default on daemon shutdown) |
-| `session.idle` | A session enters or leaves idle, deduplicated per session + state over 10s |
-| `session.requires_attention` | A TUI prompt or a worker `user_notify` needs the user to act |
-| `turn.finished` | A worker `turn_terminal` was accepted by the durable callback. Notification only. Dedupe, VC sessions, and who receives the SSE frame are described below |
+| Event | When it fires | Extra fields |
+|-------|---------------|--------------|
+| `topic.new` | A new topic or new @mention arrives | `messageId`, `senderOpenId`, `senderType`, `msgType`, `content` |
+| `thread.reply` | A reply arrives in an existing topic | `messageId`, `rootId`, `parentId`, `senderOpenId`, `senderType`, `msgType`, `sessionId`, `content` |
+| `prompt.submit` | A message has passed the built-in permission checks and is **about to be handed to the CLI**. Works as a notification or a gate | `messageId`, `senderOpenId`, `senderUnionId`, `memberUnionId`, `botSender`, `talkReason`, `content`, `attachments` |
+| `outbound.send` | After botmux sends a regular message | `messageId`, `msgType`, `uuid`, `content` |
+| `outbound.reply` | After botmux replies in a topic | `messageId`, `replyId`, `msgType`, `replyInThread`, `uuid`, `content` |
+| `schedule.fired` | A scheduled-task check and submit has finished (ok, skipped, or error) | `id`, `name`, `schedule`, `status`, `error`, `rootMessageId`, `runAt`; multi-chat tasks also carry `chatIds` |
+| `session.start` | A session process started (including resume and adopt) | `reason`, `pid`; adopt also has `adoptedFrom` |
+| `session.exit` | A session process exited, crashed, or the session was closed | `reason`, `code` |
+| `session.idle` | A session enters or leaves idle | `prevState`, `newState`, `transition` (`enter` / `exit`), `source`, `content` (screen text at the time) |
+| `session.requires_attention` | Something needs a human (`reason` values below) | `reason`, plus `message`, `kind`, `errorCode`, `turnId` / `logicalTurnId`, etc. depending on the case |
+| `turn.finished` | A turn ended (success, failure, or cancel) | `turnId`, `status`, `terminalStatus`, `senderOpenId`, `dispatchAttempt` |
+| `chat.bot_added` | The Bot was added to a group (subscribe to `im.chat.member.bot.added_v1` in the Feishu console) | `operatorOpenId` (who added the Bot); the sync gate also gets `chatName`, `chatDescription`, `chatMode`, `chatFetchStatus` |
 
-## Payload Fields
+### Fields on every event
 
-Every payload is written to the hook command via stdin, and the environment variable `BOTMUX_HOOK_EVENT` is also set. Each payload includes `event` and `emittedAt`; the event context may include `sessionId`, `chatId`, `chatType`, `larkAppId`, `scope`, `anchor`, `title`, `cliId`, `workingDir`, `hasHistory`, `spawnedAt`, and `lastMessageAt`.
+- The payload is written as JSON to the command's **stdin**, and the env var `BOTMUX_HOOK_EVENT=<event name>` is set.
+- Every payload has `event` and `emittedAt` (ISO time).
+- Most events also carry `larkAppId` and `chatId`; session events (`session.*`) also carry `sessionId`, `chatType`, `scope`, `anchor`, `title`, `cliId`, `workingDir`, `hasHistory`, `spawnedAt`, `lastMessageAt`.
 
-Different events carry extra fields:
+### Long text is truncated
 
-| Event | Extra fields |
-|------|----------|
-| `chat.bot_added` | Observer: `larkAppId`, `chatId`, `operatorOpenId`; sync gate additionally receives `chatName`, `chatDescription`, `chatMode`, `chatFetchStatus` |
-| `topic.new` | `messageId`, `senderOpenId`, `senderType`, `msgType`, `content` |
-| `prompt.submit` | `messageId`, `chatId`, `chatType`, `anchor`, `senderOpenId`, `senderUnionId`, `memberUnionId`, `botSender`, `talkReason`, `content`, `attachments` (`[{type,name}]`, metadata only) |
-| `thread.reply` | `messageId`, `rootId`, `parentId`, `senderOpenId`, `senderType`, `msgType`, `content` |
-| `outbound.send` | `messageId`, `msgType`, `uuid`, `content` |
-| `outbound.reply` | `messageId`, `replyId`, `msgType`, `replyInThread`, `uuid`, `content` |
-| `schedule.fired` | `id`, `name`, `schedule`, `status`, `error`, `rootMessageId`, `runAt` |
-| `session.start` | `reason`, `pid`, `adoptedFrom` |
-| `session.exit` | `reason`, `code` (worker exit path; `null` for `dashboard_close`) |
-| `session.idle` | `prevState`, `newState`, `transition`, `source` |
-| `session.requires_attention` | `reason`, `description`, `optionsCount`, `optionsPreview`, `multiSelect`, `message` |
-| `turn.finished` | `turnId`, `status` (`success` or `error`), `terminalStatus` (`completed`, `failed`, `cancelled`, or `ambiguous`), `senderOpenId` (this turn's reply-target sender, or the Codex App ledger sender frozen at acceptance), `dispatchAttempt` when present |
+`content`, `message`, `description`, `finalOutput`, and `lastScreenContent` are truncated past **600 characters**. These fields always come with `xxxLength` (original length) and `xxxTruncated` (whether it was cut). For full text, list the event in this hook's `redact.fullContentEvents`. Sync gates are the exception and always get full text (see below).
 
-`schedule.fired.status` and the task's `lastStatus` use `ok`, `error`, or `skipped`: `ok` means the task was handed to the executor, not that model generation or message delivery has completed; `error` means the precondition check or dispatch failed; `skipped` means the precondition did not pass and no model was called. A skip does not consume the repeat count or delete the task, precondition configuration, or execution logs. Enabled one-shot tasks remain enabled and become eligible for another scheduler check after at least 30 seconds; if an early manual run is skipped, subsequent automatic checks do not precede the original scheduled time. Recurring tasks keep their existing cadence.
+### Event details
 
-`skipped` is a new status and requires no migration of existing tasks. Custom hooks that accept only `ok/error` must handle it separately instead of treating it as a successful execution.
+**`session.exit`**: `reason` is `graceful` (exit code 0), `exit_code_<N>`, or `dashboard_close` (the session was closed on purpose, e.g. from the Dashboard; there is no `code` field). Not emitted when the daemon itself shuts down.
 
-`turn.finished` is the hook and daemon-loopback notice that a `turn_terminal` was accepted by the durable callback. It is not `turn.completed`. That name belongs to the feedback webhook outbox: it is written when a delivered answer is later correlated with a terminal, and it carries duration, usage, and a delivery id. `turn.finished` does not wait for that correlation and does not include usage.
+**`session.idle`**: fires at most once per session per state within 10 seconds, so flapping doesn't flood you.
 
-`status` maps `completed` to `success`, and `failed`, `cancelled`, or `ambiguous` to `error`. `terminalStatus` keeps the worker enum, so a cancel is distinct from a failure. `senderOpenId` comes from that turn's reply target, or from the Codex App ledger entry frozen at acceptance when that path publishes the event. When neither has a sender the field is absent. The session owner, creator, and previous caller are not filled in.
+**`schedule.fired`**: `status` matches the task's "last status":
 
-The notice is emitted once per session, turn, and dispatch attempt inside one daemon process, remembered in a 4096-entry FIFO. A restart can emit the same terminal again. It is published only after the durable terminal callback returns. A thrown persist does not emit and does not consume that memory key. A worker that exits without `turn_terminal` does not synthesize one (`session.exit` still covers the process exit).
+| `status` | Meaning |
+|----------|---------|
+| `ok` | Handed to the executor. It does **not** mean the model finished or the message was delivered |
+| `error` | Pre-check or submit failed; the reason is in `error` |
+| `skipped` | Pre-conditions not met; the model was not called |
 
-A dedicated VC receiver session still publishes on the daemon loopback bus, which already carries that session's rows, and does not run the user hook. The public dashboard `GET /events` relay drops the frame for anonymous and workbench viewers. A signed-in host management session can still see it. The dashboard UI does not render the frame.
+A skip doesn't use up a repeat and doesn't delete the task. A skipped one-shot task stays enabled and is rechecked after at least 30 seconds; recurring tasks continue on their normal schedule. If your script only handles `ok` / `error`, add a `skipped` branch and don't treat it as success.
 
-By default, `content`, `message`, `description`, `finalOutput`, and `lastScreenContent` are truncated to **600 characters**, with `xxxLength` / `xxxTruncated` added; only events in `redact.fullContentEvents` pass through the full text.
+**`turn.finished`**:
 
-## Synchronous gates
+- `status` is the simplified result, `success` or `error`; `terminalStatus` is the raw result, `completed`, `failed`, `cancelled`, or `ambiguous` (use it to tell cancel from failure).
+- `senderOpenId` is who started this turn; if unknown, the field is omitted rather than filled with the session owner.
+- Each turn (per dispatch attempt) fires once per daemon process; after a daemon restart it may fire again, so dedupe on `sessionId` + `turnId` + `dispatchAttempt`. A retried turn has a different `dispatchAttempt`, and each attempt fires.
+- If the session process exits without finishing a turn, no `turn.finished` is sent for it (the exit goes through `session.exit`).
+- It only says "this turn ended" and carries no duration or usage. For those, use the `turn.completed` outbound event in the Bot's `feedbackWebhooks` config.
+- The same notification also appears on the daemon's local `GET /api/events` stream.
 
-Scope `chat.bot_added` with `filter.larkAppId` or `filter.chatId`; inspect `operatorOpenId` inside the gate command when checking the inviter. Do not use `filter.senderOpenId` for join events: it does not match the operator, so `autoStartOnGroupJoinGateRequired: true` would silently prevent auto-start.
+**Meeting (VC) receiver sessions** never trigger `session.*` or `turn.finished` hooks, because they process external meeting content.
 
-The `<botmux_group_join>` block, the inviter `<sender>` tag, and the opening trusted caller are injected **only when `autoStartOnGroupJoinGateRequired: true`**; with the toggle off the opening turn stays byte-identical to legacy behaviour (configured sync gates still allow/deny as before).
+### `reason` values for session.requires_attention
 
-The trusted `botmux_group_join` block proves the host-observed lifecycle event, opening context, and turn ownership, **not that the caller is an authenticated human**. Without platform bot evidence the opening caller has no `senderType`, so automatic continuation leases, user-level dispatch, failed-turn recovery, and direct `schedule:create` privileges that require a user caller are not granted. Downstream consumers must independently verify identity and authorization when needed; a contact lookup alone does not replace these turn-level checks. If the event omits `operatorOpenId`, auto-start may still proceed if the gate allows it, but the opening has no `<sender>`, no `operator_open_id`, and no trusted caller.
+| `reason` | Situation |
+|----------|-----------|
+| `user_notify` | The session process raised something you need to handle, e.g. input could not be submitted to the CLI |
+| `agent_request` | The agent raised its hand with `botmux send --attention`; `kind` is `authz` / `decision` / `blocked` / `help`, `message` is the reason |
+| `stuck_warning` | The session looks stuck on some screen; also has `elapsedMs`, `matchedPattern` |
+| `worker_start_failed`, `worker_fork_error` | The session process failed to start |
+| `ordinary_turn_recovery_exhausted` | A turn failed and automatic retries ran out |
+| `task_continuation_stopped` | Automatic continuation stopped |
+| `claude_terminal_failure_unrecovered` | A turn failed (CLI error or it exited mid-turn) and could not recover automatically. The "claude" in the name is historical; other CLIs send it too |
+| `card_content_rejected`, `content_audit_blocked` | Feishu rejected the final reply (card format or content audit) |
+| `topic_send_blocked` | The original topic is no longer available and sending stopped (see [Stop sending when the topic is unavailable](/en/topic-unavailable-policy)) |
 
-When the inviter is already known to be an app or bot (identity-cache `type` `app`/`bot`, or a same-host peer cross-ref), that operator is not stored as the session owner or `lastCallerOpenId`, and the opening reply target is not recorded as a human sender (`isBot: false`). `trustedSessionController` therefore does not mint a user-typed controller for the join, and later schedule / dispatch recovery cannot treat the operator as the human who opened the turn. This refusal does not depend on `autoStartOnGroupJoinGateRequired`: with the gate off the opening prompt stays byte-identical to older versions, but an app or bot operator still receives no human identity. An operator with no such evidence is still recorded as the human sender and owner. With the experimental `crossPrincipalInterruption` feature enabled (off by default), only an owner that was actually recorded as human gets a user-typed controller.
+New `reason` values may be added later; give unknown values a default branch in your script.
 
-A regular hook is a *notification* — nothing reads its result. A gate event with `mode: "sync"` is a *verdict*: the daemon waits for it, reads it, and allows or rejects the action. `prompt.submit` gates a message before it reaches the CLI. `chat.bot_added` gates only `autoStartOnGroupJoin`; it does not block async observers, `groupJoinCommand`, or owner auto-invite.
+### Outbound events can't block anything
 
-For join automation that must have zero visible effects outside its target chats, set `autoStartOnGroupJoinGateRequired: true` on the bot and `onError: "deny"` on the gate. Missing, unmatched, timed-out, or crashed gates then fail closed instead of starting in every new group. Explicit human `forcePrompt` paths bypass the join gate.
+`outbound.send` / `outbound.reply` fire **after** Feishu has accepted the message, so it's already in the chat. They don't support `sync` and are notifications only.
+
+## Sync gate: run your check before a message reaches the CLI
+
+Add a `"mode": "sync"` hook on `prompt.submit` and every message headed for the CLI asks it first: allow or deny.
 
 ```json
 [
@@ -141,25 +172,51 @@ For join automation that must have zero visible effects outside its target chats
 ]
 ```
 
-A ready-to-adapt example ships in the repo: `examples/hooks/prompt-gate.sh`.
+`examples/hooks/prompt-gate.sh` in the source repo is a good starting point.
 
-### When it fires
+### How to answer "allow / deny"
 
-**The gate runs *before* the prompt is handed to the CLI — not "typed into the box, before Enter".**
+Either way works; **JSON on stdout wins**:
 
-That second moment does not exist in botmux: writing the text and pressing Enter are a single atomic adapter call (`writeInput` types line by line and the trailing Enter *is* the submit), with no insertion point between them.
+| Method | How | Notes |
+|--------|-----|-------|
+| JSON (recommended) | Print `{"decision":"deny","reason":"why"}` to stdout | `decision` is `allow` or `deny`; `reason` is shown to the user (up to 300 chars) |
+| Exit code | Print no JSON, just `exit 0` or `exit 1` | 0 allows, non-zero denies; stderr becomes the reason |
+
+stdout must be **entirely** one JSON object to count. A few log lines on stdout fall back to the exit code.
+
+When denied, the user gets "🚫 This message was blocked by a pre-submit check and was not sent to the CLI" in the topic, followed by the reason.
+
+### When it runs
 
 ```
-Lark message → built-in permission checks → 🚦 prompt.submit gate → charge quota
-   → download attachments → createSession/forkWorker → IPC to worker
-   → writeInput (type + Enter, atomic) → CLI
+Feishu message → built-in permission check → 🚦 prompt.submit gate → charge quota → download attachments
+              → create/wake session → type text into CLI + Enter → CLI starts working
 ```
 
-The gate runs in the **daemon** process, before the CLI subprocess has this turn's input at all (for a new topic the CLI has not even been forked). A denied message never existed as far as the CLI is concerned.
+The gate runs in the daemon, before the CLI has seen this message (for a new topic the CLI hasn't even started). A denied message never reaches the CLI at all.
 
-### Using it as a plain notification (`async`)
+Note: there is no "text already typed in the CLI input box, before Enter" moment. botmux types the text and presses Enter in one step, with nowhere to insert a check.
 
-`mode:"sync"` is **not** required. With no `mode` (or an explicit `async`) this event behaves like any other notification hook: the daemon does not wait for it and its result cannot affect admission — good for audit trails, metrics and alerting.
+### Rules at a glance
+
+| You want to know | What happens |
+|------------------|--------------|
+| Can it loosen permissions? | No. Built-in checks (`allowedUsers`, grants, oncall, quota) run first; the hook is only asked if they all pass. An `allow` can't let in someone they rejected |
+| Does a deny cost quota? | No, the gate runs before quota is charged |
+| Several `sync` hooks | All must allow; hooks after the first `deny` don't run |
+| The hook itself breaks | `onError` applies, default `allow`. For "deny everything if the checker is down", set `"onError": "deny"`; the user then sees the reason `permission check failed` |
+| `timeoutMs: 0` | ⚠️ Not "no limit" but "time out instantly", which means the gate does nothing (default `allow`). A warning is logged on load. Use a real budget like `3000` |
+| Does it slow things down? | Yes, gate time is added directly to message intake. Aim for 1–3 s. A slow gate makes later messages in the same topic queue up and may make this Bot's Dashboard actions (closing sessions, editing config) time out. No `sync` hook means zero overhead |
+| How much text does it see? | **Full text**, never truncated (otherwise padding past 600 chars would bypass it). ⚠️ So configuring a gate hands the full message to that command |
+| Can it see attachments? | Only metadata, `attachments: [{type, name}]`, e.g. `[{"type":"file","name":"prod.env"}]`, enough for "no .env uploads" or "images only"; not the file contents (attachments aren't downloaded yet) |
+| Which messages go through it | New topics, topic replies, slash commands that start a session, the first message in a session group, external content matched by a message listener (denials there are only logged, no reply). Saved workflows also pass the gate, but without the text, so only sender-based rules apply |
+| Which don't | Prompts sent automatically by scheduled tasks (automation you configured yourself); control messages that never reach the CLI |
+| Will it run twice? | No. A config entry that runs as a gate isn't run again as a notification |
+
+### Notify and gate on the same event
+
+`prompt.submit` can also be a plain notification (no `mode`). Both can coexist:
 
 ```json
 [
@@ -168,58 +225,79 @@ The gate runs in the **daemon** process, before the CLI subprocess has this turn
 ]
 ```
 
-Both can coexist — the first only records, the second actually blocks. Three rules:
+- Notifications are sent **before** the verdict, so they see denied messages too, which is exactly what an audit of "whose message got blocked" needs.
+- Notification hooks get text truncated to 600 chars as usual; only the gate gets full text.
+- A notification hook's exit code and output never affect the verdict.
 
-- **Observers are dispatched before the verdict**, so **a notification hook still sees a message that ends up denied** — "whose message was blocked" is exactly what an audit trail wants.
-- **Observers receive the truncated body** (600 characters by default, same as every other event). Only adjudicating `sync` hooks are exempt from truncation; subscribing to this event does not by itself hand a hook the full message text.
-- An observer's exit code and stdout **never** participate in the verdict.
+### Try it
 
-### Expressing a verdict
+```bash
+cat > /tmp/gate.sh <<'SH'
+#!/bin/bash
+cat > /tmp/gate-payload.json
+echo '{"decision":"deny","reason":"gate test: not allowed yet"}'
+SH
+chmod +x /tmp/gate.sh
 
-Two ways; **JSON on stdout takes precedence over the exit code**:
+cat > ~/.botmux/data/hooks.json <<'JSON'
+[{ "event": "prompt.submit", "mode": "sync", "command": "/tmp/gate.sh", "timeoutMs": 3000 }]
+JSON
+```
 
-| Method | How | Notes |
-|------|------|------|
-| JSON (recommended) | print `{"decision":"deny","reason":"..."}` on stdout | `reason` is shown to the user; `decision` is `allow`｜`deny` |
-| Exit code | print no JSON, `exit 0` / non-zero | 0 allows, non-zero denies; stderr is used as the reason |
+Send the Bot a message in Feishu. You should get the "blocked by a pre-submit check" reply, and `/tmp/gate-payload.json` will hold the payload. Restore `hooks.json` when you're done.
 
-Stdout must be a **whole JSON object** to count as a verdict. Printing an ordinary log line will not be mistaken for one — that case falls back to the exit code.
+## Join gate: decide whether to auto-start after being added to a group
 
-### Boundaries and guarantees
-
-- **It can only tighten, never loosen.** The built-in permission model (`allowedUsers` / `grant` / oncall / quota) runs first; the hook is asked only after all of it passes. A hook returning `allow` cannot let in someone the built-in gate rejected.
-- **A rejection costs no quota.** The gate sits before the charge, so a denied message does not consume the user's message quota.
-- **A rejection tells the user** (with `reason`) instead of dropping silently — an authorized user whose messages vanish is the hardest failure to diagnose.
-- **Multiple sync hooks are ANDed.** Any `deny` rejects; hooks after the first `deny` do not run.
-- **A broken hook is not a rejection.** Timeout, missing command, and crashes all follow `onError`, which defaults to `allow` — a broken checker should not brick the whole bot. Set `onError: "deny"` explicitly for the opposite.
-- ⚠️ **`timeoutMs: 0` does not mean "no timeout" — it means *instant* timeout**: the gate falls straight through to `onError` (default `allow`), i.e. **the gate is effectively disabled**. A warning is logged at load time. There is no "unlimited" option (the gate sits on the inbound path); set a real budget such as `3000`.
-- **The latency lands directly on the inbound path.** Keep `timeoutMs` small (1–3s). Bot-level admission is concurrent so a slow gate will not stall the whole daemon, but it holds up two things: (1) replies **within one topic** hold an ordering lock, so later messages in that topic queue up; (2) the gate runs inside that bot's admission lease, so **that bot's Dashboard operations** (closing/pruning sessions, changing Agent config) may time out until the gate returns. Do not lean on a large timeout to paper over a slow service. With no sync hook configured there is zero overhead — no spawn is added per message.
-- **Message-listener traffic is adjudicated too.** That content comes from third parties (alert bots and the like) and still reaches a CLI, so it is exactly what a gate should inspect. That path never charges quota; a denial is logged only, with no reply (there is no human sender to answer).
-- **A gate receives the full content, exempt from the 600-character truncation.** That truncation exists for notification hooks; for a gate the content *is* the input to the decision, so truncating it makes the gate structurally blind past the limit (pad 600 characters and hide the payload behind them).
-  ⚠️ **Privacy implication**: configuring a sync gate hands that command the **full message text**. Async hooks are unaffected and still truncate.
-- **A gate sees attachment metadata, not attachment content.** The `attachments` field carries this turn's `[{type,name}]` (e.g. `[{"type":"file","name":"prod.env"}]`), enough for "no .env uploads" or "images only" policies. But the gate runs *before* the files are downloaded (downloading must stay behind authorization, or an unauthorized sender could make the bot fetch files), so it **cannot decide on file contents**.
-- **Coverage: the inbound-message entry only.** New topics, thread replies, slash-command cold starts, session-group birth turns, and message-listener matches all pass through the gate. **Scheduled tasks do not** — that is automation the operator pre-authorized, not external input. **v3 saved workflows do pass through the gate, but carry no prompt body** — sender-level rules such as `senderOpenId` still apply; content-level rules are blind to them. Do not read the gate as "everything reaching the CLI was checked".
-- A given hook entry **runs only once**: after running as the gate, it is not fired again as an async notification.
-
-## Practical: Auto-Update Skills with session.start
-
-botmux natively integrates agentbuddy as a skill source (`botmux skills install <agentbuddy-command>` to install, `botmux skills update <name>` to update). Combined with the `session.start` hook, you can automatically check for and update installed skills on every new session — equivalent to the SessionStart Hook in Relay / Claude Code's settings.json.
-
-### Update a Single Skill
+If the Bot has join auto-start on (`autoStartOnGroupJoin`, see [bots.json](/en/bots-json)), you can add a `sync` hook on `chat.bot_added` to decide per group. The hook sees the group name `chatName`, description `chatDescription`, group type `chatMode`, and who added the Bot, `operatorOpenId`.
 
 ```json
 [
   {
-    "event": "session.start",
-    "command": "botmux skills update my-skill-name",
-    "timeoutMs": 60000
+    "event": "chat.bot_added",
+    "mode": "sync",
+    "command": "/root/bin/join-gate.sh",
+    "timeoutMs": 3000,
+    "onError": "deny",
+    "filter": { "larkAppId": "cli_xxx" }
   }
 ]
 ```
 
-### Update All Installed Skills
+Key points:
 
-`botmux skills update` accepts only a single skill name — no `*` or regex. To update everything, loop in a script:
+- It decides **only** join auto-start. Async `chat.bot_added` notifications and `groupJoinCommand` (run a command on join) keep running regardless.
+- Scope it with `filter.larkAppId` / `filter.chatId`. **Don't** use `filter.senderOpenId`: join events have no sender, so it never matches. To decide by inviter, read `operatorOpenId` in your script.
+- For "do nothing at all unless it's a target group": set `autoStartOnGroupJoinGateRequired: true` on the Bot and give the gate `"onError": "deny"`. Then a missing, unmatched, timed-out, or crashed gate means no auto-start, instead of auto-starting in every new group.
+- With `autoStartOnGroupJoinGateRequired: true`, the first-turn prompt also includes a group-join block and the inviter; without it, the first-turn prompt is exactly as before.
+- This join info only shows "the Bot was added to this group". It does **not** prove the first-turn caller is an authenticated human, so the first turn doesn't get human-only privileges (such as auto-continuation or creating scheduled tasks directly). If the inviter is an app or bot, it isn't recorded as the session owner either.
+- Manual force-start entry points skip this gate.
+
+To give one Bot its own join script (runs directly, no model), `groupJoinCommand` in bots.json is simpler; edit it in the Dashboard under Bot Config → Proactive Start. Its timeout is 10 minutes.
+
+## Execution environment
+
+Before writing your own hook, know how it runs:
+
+- **Any executable works**: bash, Python, Node, a Go binary, an internal CLI, an HTTP forwarder.
+- **No shell**: `command` is just split on spaces and quotes into program + arguments. Pipes `|`, redirects `>`, `&&`, and `~` expansion don't work. Use a script, or `bash -c '…'`.
+- **Minimal env vars**: only basics such as `PATH`, `HOME`, `TMPDIR`, `SHELL`, `USER`, `LANG`, plus `BOTMUX_HOOK_EVENT`. App secrets and API keys are not passed. `export` anything else you need inside your script.
+- **Payload on stdin**: one JSON object. It's fine not to read it.
+- **Timeouts kill the whole process group**, including child processes your script started.
+- **Nobody reads notification output**: non-zero exit, timeout, or command not found only go to the botmux log and never affect messaging, scheduled tasks, or sessions.
+
+## Recipe: auto-update Skills when a session starts
+
+botmux has built-in skill management (`botmux skills install …` to install, `botmux skills update <name>` to update, `botmux skills list` to list installed ones). With `session.start` you can check for updates every time a new session starts, similar to Claude Code's SessionStart hook.
+
+**Update one skill:**
+
+```json
+[
+  { "event": "session.start", "command": "botmux skills update my-skill-name", "timeoutMs": 60000 }
+]
+```
+
+**Update all installed skills**: `botmux skills update` takes a single name (no `*`), so loop in a script:
 
 ```bash
 #!/bin/bash
@@ -231,17 +309,11 @@ done
 
 ```json
 [
-  {
-    "event": "session.start",
-    "command": "/root/bin/botmux-update-all-skills.sh",
-    "timeoutMs": 120000
-  }
+  { "event": "session.start", "command": "/root/bin/botmux-update-all-skills.sh", "timeoutMs": 120000 }
 ]
 ```
 
-### Call agentbuddy CLI Directly to Update Global Skills
-
-If you prefer running `npx agentbuddy update` directly (updating the user's global skills rather than botmux-managed skills), be aware of botmux's hook execution constraints: `shell: false` (no redirection or piping) and a scrubbed environment (only PATH/HOME/TMPDIR/SHELL/USER and a few other basics are preserved). Use a wrapper script:
+**Call agentbuddy directly to update user-global skills**: hooks run without a shell and with a trimmed environment, so use a wrapper script:
 
 ```bash
 #!/bin/bash
@@ -252,21 +324,13 @@ npx -y agentbuddy update -y 2>/dev/null
 
 ```json
 [
-  {
-    "event": "session.start",
-    "command": "/root/bin/agentbuddy-update.sh",
-    "timeoutMs": 120000
-  }
+  { "event": "session.start", "command": "/root/bin/agentbuddy-update.sh", "timeoutMs": 120000 }
 ]
 ```
 
-### Notes
+Notes:
 
-- **Timeout**: The default `timeoutMs` is 5000ms. agentbuddy update involves network requests and typically takes longer — set it explicitly (60s+ recommended). On timeout, botmux sends `SIGTERM` first, then `SIGKILL` to the entire process group.
-- **Fire-and-forget**: Hooks run asynchronously and never block session startup; updated skills take effect in the next session.
-- **Filter**: Use `filter` to limit updates to specific `chatId` or `senderOpenId`, avoiding unnecessary updates for every session.
-- **Recommended approach**: Prefer `botmux skills update` (first approach) — it goes through botmux's telemetry scrubbing (`clearAgentbuddyTelemetry`) and updates the skill versions botmux injects, staying consistent with botmux's skill lifecycle.
-
-## Writing Your Own Hook
-
-A hook command can be any executable: a bash / Python / Node / Go binary, an internal company CLI, or an HTTP forwarder. A command that does `exit 0` is treated as a success; non-zero exits / timeouts / missing commands only write to the botmux log and never affect message send/receive, scheduled tasks, or the session lifecycle.
+- **Raise `timeoutMs`**: the 5 s default is rarely enough for a network update; use 60 s or more.
+- **Doesn't block the session**: updates run in the background and the current session doesn't wait; results take effect in the next new session.
+- **Narrow the scope**: use `filter.chatId` / `filter.larkAppId` to run only for certain chats or Bots.
+- **Prefer `botmux skills update`**: it updates the botmux-managed skill version, stays in step with botmux's skill lifecycle, and for skills installed from agentbuddy it strips the embedded usage telemetry.

@@ -19,9 +19,18 @@
  * forkWorker / lark client are stubbed (same pattern as
  * dashboard-create-session.test.ts) so the routing logic runs in isolation.
  */
+// Must stay the first import: this file writes prompt contexts, deferred topic
+// bindings and schedules under SESSION_DATA_DIR, so refuse to run outside the
+// data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { Session, ScheduledTask } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
+import { setScheduleAuthorityStore } from '../src/core/scheduler.js';
 
 // ── in-memory session store ──────────────────────────────────────────────
 const store = new Map<string, Session>();
@@ -143,6 +152,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
     };
   })()),
   ensureOrdinaryTurnRecoveryAttached: vi.fn(),
+  resumeTurnNotices: vi.fn(),
   isRelayableRealSession: vi.fn((ds: DaemonSession) =>
     (!!ds.worker && !ds.worker.killed) || !!ds.session.cliId || !!ds.session.lastCliInput),
   isDisposableCommandScratch: vi.fn((ds: DaemonSession) =>
@@ -635,6 +645,8 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
     const turnId = sendWorkerInputMock.mock.calls[0][2];
     expect(session.deferredScheduleRun?.turnId).toBe(turnId);
     expect(session.deferredScheduleRun?.routingAnchor).toBe(taskAnchor);
+    // The old turn may still emit unattributed frames; they must not settle this one.
+    expect(existing.deferredScheduleUnconfirmedTurnId).toBe(turnId);
   });
 
   it('non-silent first fire seeds a real topic, writes the root back to the task, and forks a thread session', async () => {
@@ -657,6 +669,33 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
     expect(ds.session.rootMessageId).toBe('om_banner_123');
     expect(ds.session.deferredScheduleRun).toBeUndefined();
     expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('a root forged into schedules.json does not steer the first fire: the root comes from the host authority', async () => {
+    // Sandboxed agent writes `rootMessageId` into its BOT_HOME projection; the
+    // authority row (the only thing the daemon executes) has no root yet.
+    const task = baseTask({ executionPosition: 'task', chatType: 'group' });
+    const root = mkdtempSync(join(tmpdir(), 'botmux-sched-authority-'));
+    const authority = ScheduleAuthorityStore.open(root);
+    authority.initializeApp(APP, [task]);
+    setScheduleAuthorityStore(authority);
+    scheduleStoreGetTaskMock.mockImplementation((id: string) => (
+      id === task.id ? { ...task, rootMessageId: 'om_attacker_chosen' } : undefined
+    ));
+    try {
+      const active = new Map<string, DaemonSession>();
+      await executeScheduledTask(task, active, refreshCliVersion);
+
+      expect(sendMessageMock).toHaveBeenCalledTimes(1);
+      expect(active.has(sessionKey('om_attacker_chosen', APP))).toBe(false);
+      expect(active.get(sessionKey('om_banner_123', APP))?.session.rootMessageId).toBe('om_banner_123');
+      expect(authority.getRecord(APP, task.id)?.task.rootMessageId).toBe('om_banner_123');
+    } finally {
+      setScheduleAuthorityStore(null);
+      scheduleStoreGetTaskMock.mockReset();
+      authority.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('renders dynamic date and owner placeholders for the dedicated task root', async () => {
@@ -1533,7 +1572,7 @@ describe('silent scheduled turn lifecycle', () => {
     const turnId = forkedTurnId();
     expect(ds.silentScheduledTurns?.has(turnId)).toBe(true);
 
-    rememberLastCliInput(ds, '真实用户消息', '真实用户消息');
+    rememberLastCliInput(ds, '真实用户消息', '真实用户消息', 'om_user');
     expect(ds.silentScheduledTurns?.has(turnId)).toBe(true);
   });
 });
@@ -1617,7 +1656,7 @@ describe('executeScheduledTask — per-task model / reasoning effort', () => {
   });
 
   it('drops both when the bot now runs a CLI without the override contract', async () => {
-    cliOf('gemini');
+    cliOf('opencode');
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(
       baseTask({ rootMessageId: ROOT, scope: 'thread', model: 'gpt-5.6-sol', reasoningEffort: 'high' }),

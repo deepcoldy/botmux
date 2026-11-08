@@ -4,6 +4,7 @@ import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import {
   createAntigravityAdapter,
+  annotateAntigravityUsageLimit,
   isAntigravityIdleComposerScreen,
 } from '../src/adapters/cli/antigravity.js';
 
@@ -42,7 +43,62 @@ const PLAIN_IDLE_SCREEN = [
   '',
 ].join('\n');
 
+const NATIVE_ERROR_SCREEN = [
+  '⚠ Request failed. Please try again.',
+  'Error ID: native-error-fixture',
+  '────────────────────────',
+  '>',
+  '────────────────────────',
+  '',
+].join('\n');
+
+const QUOTA_ERROR_SCREEN = NATIVE_ERROR_SCREEN.replace(
+  'Request failed. Please try again.',
+  'Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 124h24m15s.',
+);
+
 describe('Antigravity idle-composer viewport classifier', () => {
+  it.each([
+    '> Auto mode: edits & safe commands auto-approved (shift+tab to cycle)',
+    '> Accept-edits mode: file edits auto-approved (shift+tab to cycle)',
+    '> Plan mode: research & plan only (shift+tab to cycle)',
+    '> Best-of-N mode: fork into parallel arms and pick a winner (shift+tab to cycle)',
+  ])('recognizes a native error at the %s composer', composer => {
+    const screen = NATIVE_ERROR_SCREEN.replace('\n>\n', `\n${composer}\n`);
+    expect(isAntigravityIdleComposerScreen(screen)).toBe(true);
+    expect(createAntigravityAdapter().readyPattern!.test(screen)).toBe(true);
+  });
+
+  it('accepts native error layouts in ANSI-colored CRLF captures', () => {
+    const screen = NATIVE_ERROR_SCREEN.split('\n').map(line => `\x1b[31m${line}\x1b[0m`).join('\r\n');
+    expect(isAntigravityIdleComposerScreen(screen)).toBe(true);
+  });
+
+  it('retains native quota provenance only for the latest actual quota error composer', () => {
+    const state = { limited: true as const, kind: 'usage' as const, retryAtMs: 1_000, retryLabel: '1m', retryReady: false };
+    expect(annotateAntigravityUsageLimit(QUOTA_ERROR_SCREEN, state).source).toBe('antigravity-error-composer');
+    expect(annotateAntigravityUsageLimit(QUOTA_ERROR_SCREEN + 'esc to cancel', state)).toBe(state);
+    expect(annotateAntigravityUsageLimit(QUOTA_ERROR_SCREEN + NATIVE_ERROR_SCREEN, state)).toBe(state);
+    expect(annotateAntigravityUsageLimit(QUOTA_ERROR_SCREEN.replace('⚠ Individual', '  ⚠ Individual'), state)).toBe(state);
+  });
+  it.each([NATIVE_ERROR_SCREEN, QUOTA_ERROR_SCREEN])('recognizes a native error parked at the footerless composer', screen => {
+    expect(isAntigravityIdleComposerScreen(screen)).toBe(true);
+    expect(createAntigravityAdapter().readyPattern!.test(screen)).toBe(true);
+  });
+
+  it.each([
+    NATIVE_ERROR_SCREEN.replace('\n>\n', '\n> drafted request\n'),
+    NATIVE_ERROR_SCREEN + 'esc to cancel · running task',
+    NATIVE_ERROR_SCREEN + '● Bash(next command)',
+    NATIVE_ERROR_SCREEN.replace('Error ID: native-error-fixture\n', ''),
+  ])('does not infer idle from an incomplete, drafted or still-running error screen (%#)', screen => {
+    expect(isAntigravityIdleComposerScreen(screen)).toBe(false);
+  });
+
+  it('keeps the live-command layout working while the empty input box is visible', () => {
+    const screen = '● Bash(sleep 30)\n⣻ Running command...\n────────\n>\n────────\n● command running\n────────\nesc to cancel · 1 task(s)';
+    expect(isAntigravityIdleComposerScreen(screen)).toBe(false);
+  });
   it('accepts a bare empty composer at the ready footer', () => {
     expect(isAntigravityIdleComposerScreen(PLAIN_IDLE_SCREEN)).toBe(true);
   });
@@ -111,6 +167,10 @@ describe('Antigravity adapter isSessionBusy screen reconciliation', () => {
   it('stays busy without an authoritative screen getter (conservative)', () => {
     const adapter = createAntigravityAdapter();
     expect(adapter.isSessionBusy!({ cliSessionId })).toBe(true);
+  });
+
+  it.each([NATIVE_ERROR_SCREEN, QUOTA_ERROR_SCREEN])('releases the stale transcript busy hold at a native error composer', screen => {
+    expect(createAntigravityAdapter().isSessionBusy!({ cliSessionId, getCurrentScreen: () => screen })).toBe(false);
   });
 
   it('releases when the live TUI shows an empty composer at the ready footer', () => {

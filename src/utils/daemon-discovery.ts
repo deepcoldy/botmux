@@ -15,8 +15,10 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveBotmuxDataDir } from '../core/data-dir.js';
 import { DAEMON_HEARTBEAT_STALE_MS } from './daemon-heartbeat.js';
+import { parseLarkConnectionHealth, type LarkConnectionHealth } from '../im/lark/transport/connection-health.js';
 
 export interface OnlineDaemonInfo {
+  larkConnection?: LarkConnectionHealth | null;
   larkAppId: string;
   ipcPort: number;
   /** Random per-process audience for authenticated Workflow v3 mutations. */
@@ -25,6 +27,13 @@ export interface OnlineDaemonInfo {
   workflowIpcProtocol?: string;
   /** Internal target-authoritative dispatch launch protocol. */
   dispatchLaunchIpcProtocol?: 'v1';
+  /** Applies a workflow run's Gate-2 working dir to its node sessions
+   *  (design 2026-11-03 §15.4). Absent = an older daemon that ignores it. */
+  workflowNodeWorkingDir?: 'v1';
+  /** Handles a workflow handoff in the run's main topic (design 2026-11-03
+   *  §5.5: queued as its own turn, attempt-scoped session marker). Absent =
+   *  an older daemon, which gets node-topic handoffs only. */
+  workflowMainPlacement?: 'v1';
   /** Presence-based session-store capability. Copy only; never a write permit. */
   sessionStoreProtocol?: string;
   /** Running binary version. Copy only; never compared by size. */
@@ -88,7 +97,9 @@ export function listOnlineDaemons(dataDir?: string, opts: { strict?: boolean } =
       const d = JSON.parse(raw) as Partial<OnlineDaemonInfo>;
       if (typeof d.ipcPort !== 'number' || typeof d.larkAppId !== 'string') continue;
       if (now - (d.lastHeartbeat ?? 0) > DAEMON_HEARTBEAT_STALE_MS) continue;
+      const larkConnection = parseLarkConnectionHealth(d.larkConnection);
       out.push({
+        ...(larkConnection !== undefined ? { larkConnection } : {}),
         larkAppId: d.larkAppId,
         ipcPort: d.ipcPort,
         ...(typeof d.bootInstanceId === 'string' && d.bootInstanceId
@@ -100,6 +111,8 @@ export function listOnlineDaemons(dataDir?: string, opts: { strict?: boolean } =
         ...(d.dispatchLaunchIpcProtocol === 'v1'
           ? { dispatchLaunchIpcProtocol: d.dispatchLaunchIpcProtocol }
           : {}),
+        ...(d.workflowNodeWorkingDir === 'v1' ? { workflowNodeWorkingDir: d.workflowNodeWorkingDir } : {}),
+        ...(d.workflowMainPlacement === 'v1' ? { workflowMainPlacement: d.workflowMainPlacement } : {}),
         ...(typeof d.sessionStoreProtocol === 'string' && d.sessionStoreProtocol
           ? { sessionStoreProtocol: d.sessionStoreProtocol }
           : {}),

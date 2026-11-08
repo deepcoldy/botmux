@@ -36,7 +36,9 @@ import {
 } from './contract.js';
 import { readJournal } from './journal.js';
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
-import { isWorkflowFeatureEnabled } from '../../global-config.js';
+import { isWorkflowFeatureEnabled, workflowConcurrencyConfig, WORKFLOW_CONCURRENCY_MAX } from '../../global-config.js';
+import { resolveV3Concurrency } from './concurrency-config.js';
+import { V3_DEFAULT_CONCURRENCY } from './shared-node-runtime.js';
 import {
   botToSnapshot,
   freezeDagBotSnapshots,
@@ -68,6 +70,8 @@ interface V3RunArgs {
   baseDir: string;
   autoApproveGates: boolean;
   maxParallel?: number;
+  maxPerBot?: number;
+  maxPerCli?: number;
 }
 
 /** Default run root: `~/.botmux/v3-runs/<runId>`. */
@@ -147,16 +151,31 @@ function firstRejectOption(wait: GateWait): string | undefined {
   return wait.options.find((opt) => !wait.approveOptions.includes(opt));
 }
 
-function parseArgs(rest: string[]): V3RunArgs {
-  const flagsWithValue = ['--bot', '--working-dir', '--base-dir', '--max-parallel'];
+function parsePositiveIntFlag(rest: string[], flag: string, max?: number): number | undefined {
+  const raw = argValue(rest, flag);
+  if (!raw) return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) throw new Error(`${flag} 必须是正整数，收到 "${raw}"`);
+  if (max !== undefined && n > max) throw new Error(`${flag} 不能超过 ${max}，收到 "${raw}"`);
+  return n;
+}
+
+/** One line naming every effective cap, so a run that stays narrower than
+ *  `--max-parallel` shows which layer is holding it. */
+export function formatV3Concurrency(c: ReturnType<typeof resolveV3Concurrency>): string {
+  const byId = Object.entries(c.perCliConcurrencyById ?? {}).map(([id, n]) => `${id}=${n}`);
+  return [
+    `全局 ${c.globalConcurrency ?? V3_DEFAULT_CONCURRENCY.global}`,
+    `每 bot ${c.perBotConcurrency ?? V3_DEFAULT_CONCURRENCY.perBot}`,
+    `每种 CLI ${c.perCliConcurrency ?? V3_DEFAULT_CONCURRENCY.perCli}${byId.length ? `（${byId.join(', ')}）` : ''}`,
+  ].join(' / ');
+}
+
+export function parseArgs(rest: string[]): V3RunArgs {
+  const flagsWithValue = ['--bot', '--working-dir', '--base-dir', '--max-parallel', '--max-per-bot', '--max-per-cli'];
   const dagPath = firstPositional(rest, flagsWithValue);
   if (!dagPath) {
-    throw new Error('用法: botmux v3 run <dag.json> [--bot <larkAppId|name>] [--working-dir <dir>] [--base-dir <dir>] [--max-parallel <n>] [--yes]');
-  }
-  const maxParallelRaw = argValue(rest, '--max-parallel');
-  const maxParallel = maxParallelRaw ? Number(maxParallelRaw) : undefined;
-  if (maxParallel !== undefined && (!Number.isInteger(maxParallel) || maxParallel < 1)) {
-    throw new Error(`--max-parallel 必须是正整数，收到 "${maxParallelRaw}"`);
+    throw new Error('用法: botmux v3 run <dag.json> [--bot <larkAppId|name>] [--working-dir <dir>] [--base-dir <dir>] [--max-parallel <n>] [--max-per-bot <n>] [--max-per-cli <n>] [--yes]');
   }
   return {
     dagPath: resolve(dagPath),
@@ -164,7 +183,9 @@ function parseArgs(rest: string[]): V3RunArgs {
     workingDir: argValue(rest, '--working-dir'),
     baseDir: argValue(rest, '--base-dir') ? resolve(argValue(rest, '--base-dir')!) : defaultBaseDir(),
     autoApproveGates: rest.includes('--yes') || rest.includes('-y'),
-    maxParallel,
+    maxParallel: parsePositiveIntFlag(rest, '--max-parallel'),
+    maxPerBot: parsePositiveIntFlag(rest, '--max-per-bot', WORKFLOW_CONCURRENCY_MAX),
+    maxPerCli: parsePositiveIntFlag(rest, '--max-per-cli', WORKFLOW_CONCURRENCY_MAX),
   };
 }
 
@@ -386,11 +407,16 @@ export async function cmdV3(sub: string, rest: string[]): Promise<void> {
     hostExecutors: createDefaultHostExecutorRegistry(),
     hostReconcilers: createDefaultProviderReconcilers(),
   };
+  const concurrency = resolveV3Concurrency(workflowConcurrencyConfig(), {
+    ...(args.maxParallel ? { global: args.maxParallel } : {}),
+    ...(args.maxPerBot ? { perBot: args.maxPerBot } : {}),
+    ...(args.maxPerCli ? { perCli: args.maxPerCli } : {}),
+  });
   const opts: V3RuntimeOptions = {
     baseDir: args.baseDir,
     authorizedArtifacts: true,
     frozenBotSnapshots,
-    ...(args.maxParallel ? { globalConcurrency: args.maxParallel } : {}),
+    ...concurrency,
   };
 
   const defaultBot = resolveBotConfig(args.botSelector, bots);
@@ -399,6 +425,7 @@ export async function cmdV3(sub: string, rest: string[]): Promise<void> {
   console.log(`   runDir:    ${join(args.baseDir, dag.runId)}`);
   console.log(`   默认 bot:  ${defaultBot.name ?? defaultBot.larkAppId} (${defaultBot.cliId})`);
   console.log(`   支持 CLI:  ${V3_SUPPORTED_CLIS.join(', ')}`);
+  console.log(`   并发上限:  ${formatV3Concurrency(concurrency)}`);
 
   let outcome;
   try {
@@ -425,6 +452,11 @@ export async function cmdV3(sub: string, rest: string[]): Promise<void> {
       `\n⏸️  run 正在等待 humanGate：${outcome.pendingWaits.map(w => `${w.nodeId}(${w.waitId})`).join(', ')}`,
     );
     console.error(`   CLI 默认应使用 blocking gate；若看到此消息，请改用 daemon 驱动或检查 gateMode。`);
+    process.exit(1);
+  }
+  if (outcome.reason === 'awaitingExternal') {
+    // The CLI never pins nodeExecutor "bot"; keep the union total.
+    console.error(`\n⏸️  run 正在等待外部 Bot 执行节点；CLI 不驱动这种执行方式，请改用 daemon 驱动。`);
     process.exit(1);
   }
   if (outcome.runStatus === 'succeeded') {

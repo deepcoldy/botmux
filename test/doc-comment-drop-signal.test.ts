@@ -307,6 +307,18 @@ describe('processCommentEvent：丢弃点的失败标记、auto-sub 回滚与投
     vi.useRealTimers();
   });
 
+  it('preserves the actual comment-read error in the watch diagnostic before any session exists', async () => {
+    mocks.getDocComment.mockImplementation(async (_app, _file, _comment, options) => {
+      options.onError('Access denied (code: 1069303)');
+      return null;
+    });
+    await dispatch();
+    expect(mocks.handleDocComment).not.toHaveBeenCalled();
+    expect(mocks.recordDocWatchActivity).toHaveBeenCalledWith(expect.any(String), APP, FILE.fileToken, {
+      outcome: 'no-comment', error: 'Access denied (code: 1069303)',
+    });
+  });
+
   it.each(Object.keys(DROPS) as (keyof typeof DROPS)[])(
     'mention-only 下确实 @ 了 bot 的 %s 丢弃：给触发回复打 ❌、不投递、记对应结局',
     async drop => {

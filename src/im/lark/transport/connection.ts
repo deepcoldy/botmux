@@ -2,12 +2,17 @@ import * as Lark from '@larksuiteoapi/node-sdk';
 import { describeLarkWsProxy, describeWsRuntime, larkWsAgentFor, resolveLarkWsProxy } from '../ws-proxy-agent.js';
 import { logger } from '../../../utils/logger.js';
 import { type Brand, sdkDomain } from '../lark-hosts.js';
+import { registerLarkConnectionHealth, type LarkConnectionHealth } from './connection-health.js';
+import { createResilientWsClient } from './resilient-ws-client.js';
 
-/**
- * Start the SDK connection and its failed-state recovery watchdog.
- * The caller owns event registration and business dispatch; this module only
- * passes the supplied dispatcher to the SDK. Returns the original SDK client.
- */
+export type LarkConnection = Pick<Lark.WSClient, 'close' | 'getConnectionStatus'>;
+
+function positiveInt(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/** Own all SDK generations for this subscription. Closing the handle also disarms recovery. */
 export function startLarkConnection(
   larkAppId: string,
   larkAppSecret: string,
@@ -19,74 +24,134 @@ export function startLarkConnection(
     onReconnected?: () => void;
     onRestarting?: () => void;
   } = {},
-): Lark.WSClient {
-  // Start WSClient
-  // Proxy for the long connection: resolved once, logged once, and echoed in
-  // every ws failure line so "did it go through the proxy?" is answerable from
-  // the log alone. See ws-proxy-agent.ts for why the agent shape matters on Bun.
-  const wsProxy = resolveLarkWsProxy(sdkDomain(brand));
-  const wsProxyDesc = describeLarkWsProxy(wsProxy);
-  logger.info(`[ws] ${larkAppId} connecting domain=${sdkDomain(brand)} proxy=${wsProxyDesc} runtime=${describeWsRuntime()}`);
-  const wsClient = new Lark.WSClient({
-    appId: larkAppId,
-    appSecret: larkAppSecret,
-    // brand → 长连接域名。国际版租户必须连 larksuite.com，否则收不到任何事件。
-    domain: sdkDomain(brand),
-    // Evaluated against the HTTPS form of the domain so HTTPS_PROXY / NO_PROXY
-    // apply exactly as they do to the SDK's preceding Axios bootstrap request.
-    agent: larkWsAgentFor(wsProxy),
-    // Default to warn — the SDK is chatty at info ("client ready", reconnect
-    // heartbeats, etc.) and floods pm2 error.log when stderr is the only sink.
-    // DEBUG=1 widens the level back to info for troubleshooting.
-    loggerLevel: process.env.DEBUG ? Lark.LoggerLevel.info : Lark.LoggerLevel.warn,
-    // 主机长断网（夜间合盖睡眠、Wi-Fi 切换、VPN 重连）后，SDK 重连要先用 HTTPS 去
-    // 飞书换 ws 接入点，这步会 ENOTFOUND / 15s 超时；重连次数由服务端下发且有限，
-    // 耗尽后 SDK 置 terminalError 永久放弃，但进程仍 online、PM2 不会兜底 —— 表现为
-    // 「必须手动 botmux restart 才能恢复收消息」。下面两道防线让长连接死后自愈。
-    //
-    // ① pingTimeout：发 ping 后 30s 内无任何 inbound 帧即掐断 socket，触发 close →
-    //    SDK 自身重连。专治 TCP 半开连接（没收到 FIN/RST、close 事件不触发）的静默卡死。
-    wsConfig: { pingTimeout: 30 },
-    // 重连握手卡死（DNS/代理/NAT）兜底，避免单次握手永久 pending。
-    handshakeTimeoutMs: 15_000,
-    // 重连过程打日志，便于事后从 `bun run daemon:logs` 复盘（warn 默认看不到这些）。
-    onReady: () => lifecycle.onReady?.(),
-    onReconnecting: () => {
-      logger.warn(`[ws] ${larkAppId} reconnecting…`);
-      lifecycle.onReconnecting?.();
+): LarkConnection {
+  const reconnectLimit = positiveInt(process.env.BOTMUX_LARK_WS_RECONNECT_STALE_MS, 5 * 60_000);
+  const inboundLimit = positiveInt(process.env.BOTMUX_LARK_WS_INBOUND_STALE_MS, 15 * 60_000);
+  const maxRebuilds = positiveInt(process.env.BOTMUX_LARK_WS_MAX_REBUILDS, 3);
+  const domain = sdkDomain(brand);
+  const wsProxy = resolveLarkWsProxy(domain);
+  const diagnostics = `proxy=${describeLarkWsProxy(wsProxy)} runtime=${describeWsRuntime()}`;
+  logger.info(`[ws] ${larkAppId} connecting domain=${domain} ${diagnostics}`);
+
+  let generation = 0;
+  let generationStarted = Date.now();
+  let cycleStarted = generationStarted;
+  let rebuilds = 0;
+  let everConnected = false;
+  let closed = false;
+  let active: Lark.WSClient;
+  const health: LarkConnectionHealth = {
+    state: 'connecting', since: generationStarted, attempts: 0, lastInboundAt: null,
+  };
+  const changeState = (state: LarkConnectionHealth['state']) => {
+    if (health.state !== state) {
+      health.state = state;
+      health.since = Date.now();
+    }
+  };
+  const unregister = registerLarkConnectionHealth(larkAppId, () => ({ ...health }));
+
+  const startGeneration = () => {
+    const current = generation;
+    const isCurrent = () => !closed && current === generation;
+    generationStarted = Date.now();
+    const connected = () => {
+      if (!isCurrent()) return;
+      changeState('connected');
+      logger.info(`[ws] ${larkAppId} ${everConnected ? 'reconnected' : 'connected'} attempt=${health.attempts} elapsed=${Date.now() - cycleStarted}ms`);
+      if (everConnected) lifecycle.onReconnected?.();
+      else {
+        everConnected = true;
+        lifecycle.onReady?.();
+      }
+    };
+    active = createResilientWsClient({
+      appId: larkAppId,
+      appSecret: larkAppSecret,
+      domain,
+      agent: larkWsAgentFor(wsProxy),
+      loggerLevel: process.env.DEBUG ? Lark.LoggerLevel.info : Lark.LoggerLevel.warn,
+      wsConfig: { pingTimeout: 30 },
+      handshakeTimeoutMs: 15_000,
+      onReady: connected,
+      onReconnected: connected,
+      onReconnecting: () => {
+        if (!isCurrent() || health.state === 'reconnecting') return;
+        cycleStarted = Date.now();
+        health.attempts = 0;
+        changeState('reconnecting');
+        logger.warn(`[ws] ${larkAppId} reconnecting…`);
+        lifecycle.onReconnecting?.();
+      },
+      onError: () => {
+        if (!isCurrent()) return;
+        changeState('failed');
+        logger.error(`[ws] ${larkAppId} terminal connection failure (${diagnostics})`);
+      },
+    }, {
+      onAttempt: () => {
+        if (!isCurrent()) return;
+        health.attempts++;
+        logger.info(`[ws] ${larkAppId} attempt=${health.attempts} starting`);
+      },
+      onAttemptFailed: (_attempt, reason) => {
+        if (!isCurrent()) return;
+        logger.warn(`[ws] ${larkAppId} attempt=${health.attempts} failed: ${reason} (${diagnostics})`);
+      },
+      onInbound: () => {
+        if (!isCurrent()) return;
+        health.lastInboundAt = Date.now();
+        rebuilds = 0;
+      },
+    });
+    void active.start({ eventDispatcher }).catch(() => {
+      if (!isCurrent()) return;
+      changeState('failed');
+      logger.error(`[ws] ${larkAppId} WSClient start rejected (${diagnostics})`);
+    });
+  };
+
+  startGeneration();
+  const watchdog = setInterval(() => {
+    if (closed) return;
+    const now = Date.now();
+    const state = active.getConnectionStatus().state;
+    // Each replacement gets a full observation window. A handshake without
+    // a subsequent inbound frame never resets the consecutive rebuild budget.
+    const silentFor = now - Math.max(generationStarted, health.lastInboundAt ?? 0);
+    const pendingFor = now - Math.max(generationStarted, health.since);
+    let reason: string;
+    if (state === 'failed' || health.state === 'failed') reason = 'terminal failure';
+    else if (state !== 'connected' && pendingFor >= reconnectLimit) reason = `${state} for ${pendingFor}ms`;
+    else if (silentFor >= inboundLimit) reason = `no inbound for ${silentFor}ms`;
+    else return;
+    if (rebuilds >= maxRebuilds) {
+      logger.error(`[ws] ${larkAppId} ${reason} after ${rebuilds} rebuilds; exiting for supervisor recovery (${diagnostics})`);
+      process.exit(1);
+    }
+    logger.warn(`[ws] ${larkAppId} ${reason}; rebuilding WSClient ${++rebuilds}/${maxRebuilds} (${diagnostics})`);
+    generation++;
+    active.close({ force: true });
+    if (health.state === 'connected') {
+      cycleStarted = now;
+      health.attempts = 0;
+    }
+    changeState(everConnected ? 'reconnecting' : 'connecting');
+    try { lifecycle.onRestarting?.(); }
+    catch { logger.error(`[ws] ${larkAppId} restart observer failed`); }
+    // A synchronous subscriber can revoke ownership during the notification.
+    if (!closed) startGeneration();
+  }, Math.min(60_000, reconnectLimit, inboundLimit));
+  watchdog.unref();
+
+  return {
+    getConnectionStatus: () => active.getConnectionStatus(),
+    close: options => {
+      if (closed) return;
+      closed = true;
+      clearInterval(watchdog);
+      unregister();
+      active.close(options);
     },
-    onReconnected: () => {
-      logger.info(`[ws] ${larkAppId} reconnected`);
-      lifecycle.onReconnected?.();
-    },
-    onError: (err) => logger.error(`[ws] ${larkAppId} terminal error: ${err.message} (proxy=${wsProxyDesc} runtime=${describeWsRuntime()})`),
-  });
-
-  void Promise.resolve(wsClient.start({ eventDispatcher })).catch(
-    error => logger.error(
-      `[ws] ${larkAppId} initial connection failed: `
-      + `${error instanceof Error ? error.message : String(error)} `
-      + `(proxy=${wsProxyDesc} runtime=${describeWsRuntime()})`,
-    ),
-  );
-  logger.info('Daemon WSClient started');
-
-  // ② SDK 重连耗尽后停在 terminalError（getConnectionStatus().state === 'failed'）并
-  //    永久放弃。每分钟探测一次，发现已放弃就 start() 重新发起一轮全新握手 —— start()
-  //    会清掉 terminalError 并重新 pullConnectConfig + connect，无需手动重启 daemon。
-  //    只在 'failed' 时介入，不打断 SDK 正在进行的 'reconnecting' / 'connecting'。
-  let reviving = false;
-  const reviveTimer = setInterval(() => {
-    if (reviving) return;
-    if (wsClient.getConnectionStatus().state !== 'failed') return;
-    reviving = true;
-    logger.warn(`[ws] ${larkAppId} connection failed (reconnect exhausted, proxy=${wsProxyDesc} runtime=${describeWsRuntime()}), restarting WSClient`);
-    lifecycle.onRestarting?.();
-    wsClient.start({ eventDispatcher })
-      .catch(err => logger.error(`[ws] ${larkAppId} WSClient restart failed: ${err?.message ?? err}`))
-      .finally(() => { reviving = false; });
-  }, 60_000);
-  reviveTimer.unref();
-
-  return wsClient;
+  };
 }

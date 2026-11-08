@@ -2,6 +2,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { readLarkToolBinding, parseLarkToolInvocation, larkToolChildEnv, larkToolPassthroughEnv, LARK_TOOL_ROUTE, larkToolPrompt } from './core/lark-tool-binding.js';
 import { larkToolExecutionArgs } from './core/lark-tool-command.js';
 import { loopbackFetch } from './core/loopback-fetch.js';
+import { findOnlineDaemon, parseDaemonIpcPort } from './utils/daemon-discovery.js';
 
 const isLarkAppId = (value: string): boolean => /^cli_[A-Za-z0-9]{4,64}$/.test(value);
 
@@ -19,7 +20,8 @@ async function main(): Promise<void> {
   const isPassthrough = Boolean(invocation.passthroughProfile);
   let identity: { mode: 'bot' | 'user'; credential: string; appId?: string } | undefined;
   if (!invocation.offline && !isPassthrough) {
-    const port = binding.ipcPort ?? Number(process.env.BOTMUX_DAEMON_IPC_PORT);
+    const port = parseDaemonIpcPort(findOnlineDaemon(binding.appId, binding.dataDir)?.ipcPort)
+      ?? binding.ipcPort ?? Number(process.env.BOTMUX_DAEMON_IPC_PORT);
     if (!Number.isSafeInteger(port) || port <= 0 || port > 65535) throw new Error('The bound bot daemon is unavailable');
     const payload = JSON.stringify({ mode: invocation.mode });
     const response = await loopbackFetch(`http://127.0.0.1:${port}/api/sessions/${encodeURIComponent(binding.sessionId)}/${LARK_TOOL_ROUTE}`, {
@@ -27,8 +29,8 @@ async function main(): Promise<void> {
       body: payload, signal: AbortSignal.timeout(15_000),
     });
     const raw = await response.text();
-    const result = JSON.parse(raw) as { ok?: boolean; appId?: string; mode?: string; credentialType?: string; credential?: string; error?: string; issuer?: string };
-    if (!response.ok || result.ok !== true) throw new Error(result.error ?? 'lark_tool_identity_unavailable');
+    const result = JSON.parse(raw) as { ok?: boolean; appId?: string; mode?: string; credentialType?: string; credential?: string; error?: string; code?: string; issuer?: string };
+    if (!response.ok || result.ok !== true) throw new Error(result.error ?? result.code ?? 'lark_tool_identity_unavailable');
     const credentialType = invocation.mode === 'bot' ? 'tenant_access_token' : 'user_access_token';
     // A user grant issued by the botmux platform belongs to the platform's own
     // application; the daemon says so explicitly. Bot calls and every other user

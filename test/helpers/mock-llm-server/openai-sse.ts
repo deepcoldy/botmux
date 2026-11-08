@@ -17,12 +17,14 @@ export function buildOpenAiToolCallEvents(opts: {
   model?: string;
   command: string;
   functionName?: string;
+  /** Full call arguments; defaults to `{ command }`. */
+  args?: Record<string, unknown>;
 }): SseEvent[] {
   const model = opts.model ?? 'gpt-4o';
   const id = createChatCompletionId();
   const callId = createCallId();
   const fnName = opts.functionName ?? 'bash';
-  const args = JSON.stringify({ command: opts.command });
+  const args = JSON.stringify(opts.args ?? { command: opts.command });
   const created = Math.floor(Date.now() / 1000);
 
   return [

@@ -68,6 +68,12 @@ describe('inspectRecordedSessionWorker', () => {
       readCommandLine: () => 'claude --resume x',
       readSystemdUnit: () => `botmux-session-${SID}.scope`,
     })).status).toBe('exact');
+    // A relaunch whose deterministic scope name was still held runs under a
+    // spawn-generation fallback of the same session.
+    expect(inspectRecordedSessionWorker(row, fakeRuntime({
+      readCommandLine: () => 'claude --resume x',
+      readSystemdUnit: () => `botmux-session-${SID}-p77g2.scope`,
+    })).status).toBe('exact');
   });
 
   it('rejects a reused pid, a legacy row and a process botmux cannot be shown to have launched', () => {

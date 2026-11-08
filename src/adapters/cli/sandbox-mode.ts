@@ -30,6 +30,63 @@ export function normalizeSandboxMode(raw: unknown): SandboxMode {
   throw new Error(`invalid sandbox mode: ${JSON.stringify(raw)} (expected true/false or "off"|"oncall"|"scratch")`);
 }
 
+/** Read a session's FROZEN sandbox decision (`Session.sandbox`: true / "oncall" /
+ *  "scratch" / false / "off" / undefined) for display. Never throws — a corrupt
+ *  persisted value displays as "off" instead of breaking the card / list. */
+export function frozenSessionSandboxMode(raw: unknown): SandboxMode {
+  try { return normalizeSandboxMode(raw); } catch { return 'off'; }
+}
+
+/**
+ * Sandbox mode the session card should show. The frozen session decision is
+ * not the whole truth: the worker also honours the machine-wide BOTMUX_SANDBOX
+ * force (never materialised into the session), so a session frozen "off" on a
+ * forced daemon still runs inside a sandbox and must not render as unsandboxed.
+ * The latest worker spawn report (`engaged`, e.g. a remote backend bypasses
+ * it) is treated as the strongest signal, but it describes the spawn that
+ * reported it, not the live pane at render time: between worker generations
+ * (before the new generation reports) the previous generation's value lingers,
+ * and a persistent pane that warm-reconnects may keep a different profile
+ * than a fresh spawn would resolve. Undefined until the first report of this
+ * daemon process — then the env/frozen inference stands. Display only — never
+ * feeds a spawn decision. A typo'd env value (which makes the worker refuse
+ * to start) falls back to the frozen mode.
+ */
+export function sessionCardSandboxMode(
+  frozen: unknown,
+  engaged?: boolean,
+  envValue: string | undefined = process.env.BOTMUX_SANDBOX,
+): SandboxMode {
+  if (engaged === false) return 'off';
+  const recorded = frozenSessionSandboxMode(frozen);
+  let forced: SandboxMode = 'off';
+  try { forced = envSandboxMode(envValue); } catch { /* worker refuses to start; show what was frozen */ }
+  if (forced !== 'off') return forced;
+  if (recorded !== 'off') return recorded;
+  // Engaged without a frozen or env mode: legacy readIsolation applied at spawn.
+  return engaged === true ? 'oncall' : 'off';
+}
+
+/** The mode a NEW session of this bot would freeze right now — the same rule
+ *  as `freezeSessionSandboxDecision` (legacy readIsolation implies oncall). */
+export function botConfigSandboxMode(botCfg: { sandbox?: unknown; readIsolation?: boolean }): SandboxMode {
+  return botCfg.readIsolation === true ? 'oncall' : normalizeSandboxMode(botCfg.sandbox);
+}
+
+/** Session vs. current bot sandbox mismatch for the dashboard badge. Undefined
+ *  when the session has not frozen a decision yet (pre-spawn / legacy row), the
+ *  two agree, or the bot config is unreadable. */
+export function sessionSandboxDrift(
+  frozen: unknown,
+  botCfg: { sandbox?: unknown; readIsolation?: boolean } | undefined,
+): { session: SandboxMode; current: SandboxMode } | undefined {
+  if (frozen === undefined || !botCfg) return undefined;
+  let current: SandboxMode;
+  try { current = botConfigSandboxMode(botCfg); } catch { return undefined; }
+  const session = frozenSessionSandboxMode(frozen);
+  return session === current ? undefined : { session, current };
+}
+
 /** Whether the mode wraps the CLI in ANY local file sandbox. */
 export function sandboxIsActive(mode: SandboxMode): boolean {
   return mode !== 'off';
@@ -43,25 +100,30 @@ export function sandboxBoolValue(raw: unknown): boolean {
 
 /**
  * Resolve the effective mode for a spawn from the bot config, the legacy
- * readIsolation flag and the BOTMUX_SANDBOX env override. Env wins when set to
- * an active mode (it is the operator's global test/force switch); the legacy
- * flag implies oncall like its auto-migration does.
+ * readIsolation flag and the BOTMUX_SANDBOX env override. Precedence:
+ *   1. BOTMUX_SANDBOX set to an active mode (1/oncall/scratch) — the operator's
+ *      global force switch, applied to every bot;
+ *   2. legacy readIsolation → oncall (like its auto-migration);
+ *   3. the bot's own `sandbox` config.
+ * An inactive env value (unset/''/'0'/'false') means "no force" and falls
+ * through: it never turns off a sandbox the bot itself enables. An invalid
+ * value still throws.
  */
 export function resolveSandboxMode(input: {
   configSandbox?: unknown;
   readIsolation?: boolean;
   envValue?: string | undefined;
 }): SandboxMode {
-  if (input.envValue !== undefined && input.envValue !== '') {
-    return envSandboxMode(input.envValue);
-  }
+  const forced = envSandboxMode(input.envValue);
+  if (forced !== 'off') return forced;
   if (input.readIsolation === true) return 'oncall';
   return normalizeSandboxMode(input.configSandbox);
 }
 
 /**
  * Resolve the BOTMUX_SANDBOX env override.
- *   unset/'0'/'false'/'' → off
+ *   unset/'0'/'false'/'' → off (= no force; resolveSandboxMode then follows
+ *                          the bot config)
  *   '1'/'oncall'         → oncall (BOTMUX_SANDBOX=1 stays backwards compatible)
  *   'scratch'            → scratch
  * Any other value fails CLOSED with a throw (never silently off).
