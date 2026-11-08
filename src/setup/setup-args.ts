@@ -22,6 +22,8 @@ export interface SetupBotFlags {
   name?: string;
   /** 仅 add --create-app：飞书开放平台应用名称；留空由执行层生成 botmux-N。 */
   appName?: string;
+  /** 仅 add --create-app：新建飞书应用的图标（本地 PNG 路径）；缺省用 botmux 默认图标。 */
+  appIcon?: string;
   appId?: string;
   appSecret?: string;
   /** CLI 选择键：cliId 或网关键（aiden-x-claude / ttadk-x-codex …），见 CLI_SELECT_OPTIONS。 */
@@ -72,6 +74,7 @@ export function isScriptedSetupInvocation(argv: string[]): boolean {
 const BOT_FIELD_FLAGS: Record<string, keyof SetupBotFlags> = {
   '--name': 'name',
   '--app-name': 'appName',
+  '--app-icon': 'appIcon',
   '--app-id': 'appId',
   '--app-secret': 'appSecret',
   '--cli': 'cli',
@@ -129,6 +132,7 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
 字段选项（add / edit 通用；edit 中未给出的字段保持不变）：
   --name <n>                 botmux status 显示名（进程名后缀）
   --app-name <n>             新建的飞书应用名称（仅 add --create-app）
+  --app-icon <png>           新建的飞书应用图标，本地 PNG 路径（仅 add --create-app）
   --app-id <cli_xxx>         飞书应用 App ID（edit 时改绑另一个应用）
   --app-secret <secret>      App Secret
   --cli <key>                CLI 适配器：cliId 或网关键（claude-code / codex /
@@ -261,6 +265,12 @@ export function parseSetupCommand(argv: string[]): SetupCommand {
     if (!createApp && flags.appName !== undefined) {
       throw new Error('--app-name 必须与 add --create-app 一起使用。');
     }
+    if (!createApp && flags.appIcon !== undefined) {
+      throw new Error('--app-icon 必须与 add --create-app 一起使用。');
+    }
+    if (compatibilityMode && flags.appIcon?.trim()) {
+      throw new Error('兼容模式不支持 --app-icon。');
+    }
     if (compatibilityMode && !createApp) {
       throw new Error('--compatibility-mode 必须与 add --create-app 一起使用。');
     }
@@ -384,6 +394,9 @@ export function buildBotFromAddFlags(flags: SetupBotFlags): Record<string, any> 
 export function editInputFromFlags(flags: SetupBotFlags): BotConfigEditInput {
   if (flags.appName !== undefined) {
     throw new Error('--app-name 仅与 add --create-app 一起使用。');
+  }
+  if (flags.appIcon !== undefined) {
+    throw new Error('--app-icon 仅与 add --create-app 一起使用。');
   }
   if (flags.brand !== undefined) {
     throw new Error('--brand 仅在 add 时可指定（brand 绑定租户域名，换租户请 remove 后重新 add）。');

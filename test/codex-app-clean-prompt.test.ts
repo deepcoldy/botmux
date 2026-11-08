@@ -192,6 +192,16 @@ describe('Codex App clean prompt sidecar', () => {
     expect(built.codexAppInput?.additionalContext?.botmux_attachments.value).toContain('/tmp/readme.md');
   });
 
+  it('omits the reply reminder for silent turns (group secretary) but keeps the rest', () => {
+    const built = buildFollowUpCliInput('<group_secretary>...</group_secretary>', 'sid-3', {
+      cliId: 'codex-app',
+      locale: 'zh',
+      omitReminder: true,
+    });
+    expect(built.content).not.toContain('<botmux_reminder>');
+    expect(built.content).toContain('group_secretary');
+  });
+
   it('injects conservative summary.md reuse rules when summary memory is enabled', () => {
     registerBot({
       larkAppId: 'summary-memory-prompt',

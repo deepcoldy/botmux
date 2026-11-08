@@ -101,6 +101,7 @@ PR 早就合了、依赖的事早就办完了，看板上却还挂着「进行�
 
 - **群聊**：这件事的全部群，主群在最前、标「主群」，每个群一个「进群」按钮；写入时没能核实的群标「未核实」。
 - **一句话**说明和**当前进展**。
+- **图文说明**（管家附了才有）：说明页直接嵌在页面里，可以「全屏查看」或「新标签页打开」；视频在页内播放，能拖进度条。说明页是管家生成的，按不可信内容显示：不跑脚本、不加载任何外链，只显示内嵌的图片和样式，读不到 Dashboard 的登录态和接口。汇总页和飞书卡片上会标出哪些事项附了图文说明。
 - **要你定**：问题、选项，管家推荐的那项会标出来，并写上推荐理由。
 - **你的决定**：选一个选项，写说明，可以粘贴或拖入图片（png / jpg / gif / webp，单张不超过 10MB，每项最多 8 张）。
 - **历史**时间线，以及关联的 PR / 会话 / 提交。
@@ -183,6 +184,7 @@ botmux board set <编号> --state decide --ask "要你定的问题" \
 botmux board set <编号> --unlink doc=https://旧链接 --link "doc=https://新链接|看板文档"   # 删掉 / 替换关联
 botmux board history <编号> "做了什么、结果" --handled   # --handled：这项最近一批决定已执行
 botmux board attach <编号> shot.png --note "复现截图"
+botmux board attach <编号> explainer.html demo.mp4 --note "改前改后对比"   # 图文说明
 botmux board set <编号> --close-when "item:66 done" --depends-on 66,70 --next-check +2d   # 什么时候能收
 botmux board set <编号> --dismiss-hint                   # 收起巡检提示
 ```
@@ -191,8 +193,9 @@ botmux board set <编号> --dismiss-hint                   # 收起巡检提示
 - `--link` 只追加；填错的用 `set <编号> --unlink kind=ref` 删掉。
 - 群查不到又确实要写，加 `--allow-unverified-chat`。
 - `--close-when`：`"pr:owner/repo#12 merged"`、`"item:66 done"`、`manual`（只由管家判断，挂了 PR 也不按默认规则提示）、`auto`（去掉，回到默认）。`--depends-on` 整组替换，`none` 清空。`--next-check` 写 `+2h` / `+3d` / `+1w` 或带时区的时间（`2026-11-10T09:30+08:00`），`none` 清空。
+- `attach` 附图文说明：`.html` 说明页是单个文件（图片内嵌成 data URL，UTF-8，不超过 10MB）；`.mp4` / `.webm` 视频不超过 50MB，mp4 用 H.264 并加 `-movflags +faststart`。一次最多 4 个，可以和截图一起附。管家规则里有说明页的写法和最小模板（`botmux board guide`）。
 - 完整参数见 `botmux board --help`。
 
 ## 数据存在哪
 
-看板存在 `<数据目录>/decision-board.sqlite`（整机一个文件，按管家 Bot 分开），截图存在 `<数据目录>/decision-board/<app_id>/files/`。第一次用看板时才创建。关闭管家不会删除看板数据。
+看板存在 `<数据目录>/decision-board.sqlite`（整机一个文件，按管家 Bot 分开），截图和图文说明存在 `<数据目录>/decision-board/<app_id>/files/`（上传后还没附上的说明页 / 视频在同级的 `staging/`，1 小时后清掉）。第一次用看板时才创建。关闭管家不会删除看板数据。

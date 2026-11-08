@@ -46,6 +46,10 @@ import {
   BOARD_ACTOR_LABEL_KEYS,
   BOARD_EMPTY_VIEW_KEYS,
   BOARD_EVENT_KIND_KEYS,
+  BOARD_EXPLAINER_SANDBOX,
+  boardExplainers,
+  eventFileKind,
+  formatBoardBytes,
   BOARD_FILES_PER_DRAFT,
   BOARD_HINT_LABEL_KEYS,
   BOARD_IMAGE_TYPES,
@@ -86,6 +90,8 @@ import {
   type BoardDetailResponse,
   type BoardDraft,
   type BoardEvent,
+  type BoardExplainer,
+  type BoardFile,
   type BoardHint,
   type BoardItem,
   type BoardListResponse,
@@ -626,6 +632,7 @@ function BoardRow(props: { appId: string; item: BoardListResponse['items'][numbe
           {item.repo ? <span className="dboard-row-repo">{item.repo}</span> : null}
           <span className="dboard-row-time">{boardRelativeTime(item.updatedAt, props.now, tr)}</span>
           {item.hasDraft ? <span className="dboard-row-draft">{tr('decisionBoard.draftMark')}</span> : null}
+          {item.explainers ? <span className="dboard-row-explainer">📎 {tr('decisionBoard.explainerTitle')}</span> : null}
         </span>
       </a>
       <span className="dboard-row-join">
@@ -990,9 +997,11 @@ function SaveStatus(props: { editor: DraftEditor }) {
 
 // ─── 详情页 ─────────────────────────────────────────────────────────────────
 
-function EventRow(props: { appId: string; event: BoardEvent }) {
+function EventRow(props: { appId: string; event: BoardEvent; files: ReadonlyMap<string, BoardFile> }) {
   const tr = useT();
   const { event } = props;
+  const images = event.fileIds.filter(id => eventFileKind(id, props.files) === 'image');
+  const explainers = event.fileIds.filter(id => eventFileKind(id, props.files) !== 'image');
   return (
     <li className={`dboard-event dboard-event-${event.actor}`}>
       <div className="dboard-event-head">
@@ -1004,16 +1013,98 @@ function EventRow(props: { appId: string; event: BoardEvent }) {
         </span>
       </div>
       {event.text ? <div className="dboard-event-text">{event.text}</div> : null}
-      {event.fileIds.length ? (
+      {images.length ? (
         <div className="dboard-thumbs">
-          {event.fileIds.map(id => (
+          {images.map(id => (
             <a key={id} className="dboard-thumb" href={boardFileUrl(props.appId, id)} target="_blank" rel="noopener noreferrer" title={tr('decisionBoard.openImage')}>
               <img src={boardFileUrl(props.appId, id)} alt="" loading="lazy" />
             </a>
           ))}
         </div>
       ) : null}
+      {explainers.length ? (
+        <div className="dboard-event-files">
+          {explainers.map(id => (
+            <a key={id} className="dboard-link" href={boardFileUrl(props.appId, id)} target="_blank" rel="noopener noreferrer">
+              {eventFileKind(id, props.files) === 'video' ? '🎬' : '📄'} {props.files.get(id)?.name}
+            </a>
+          ))}
+        </div>
+      ) : null}
     </li>
+  );
+}
+
+function ExplainerVideo(props: { url: string; name: string }) {
+  const tr = useT();
+  const [failed, setFailed] = useState(false);
+  return (
+    <>
+      <video className="dboard-explainer-video" src={props.url} controls preload="metadata" playsInline aria-label={props.name}
+        onError={() => setFailed(true)} />
+      {failed ? <p className="dboard-warn">{tr('decisionBoard.explainerVideoFailed')}</p> : null}
+    </>
+  );
+}
+
+function ExplainerDialog(props: { appId: string; explainer: BoardExplainer | null; onClose(): void }) {
+  const tr = useT();
+  const { explainer } = props;
+  return (
+    <ModalDialog open={!!explainer} className="dboard-explainer-dialog" aria-label={explainer?.name} onRequestClose={props.onClose}>
+      {explainer ? (
+        <>
+          <div className="dboard-explainer-bar">
+            <strong>{explainer.name}</strong>
+            <a href={boardFileUrl(props.appId, explainer.id)} target="_blank" rel="noopener noreferrer">{tr('decisionBoard.explainerNewTab')}</a>
+            <button type="button" onClick={props.onClose}>{tr('decisionBoard.close')}</button>
+          </div>
+          <iframe className="dboard-explainer-dialog-frame" src={boardFileUrl(props.appId, explainer.id)} sandbox={BOARD_EXPLAINER_SANDBOX}
+            referrerPolicy="no-referrer" title={explainer.name} />
+        </>
+      ) : null}
+    </ModalDialog>
+  );
+}
+
+/**
+ * 管家附的说明页和视频。说明页嵌在 sandbox iframe 里（完全限制，响应头另有 CSP sandbox），视频用页内播放器；
+ * 飞书侧栏里新标签页不一定带得上登录态，所以页内就能看完。
+ */
+function ExplainerPanel(props: { appId: string; files: readonly BoardFile[] }) {
+  const tr = useT();
+  const [fullscreen, setFullscreen] = useState<BoardExplainer | null>(null);
+  const explainers = boardExplainers(props.files);
+  if (!explainers.length) return null;
+  return (
+    <section className="dboard-block dboard-explainers">
+      <h2 className="dboard-block-title">
+        {tr('decisionBoard.explainerTitle')}
+        <small>{tr('decisionBoard.explainerHint')}</small>
+      </h2>
+      {explainers.map(x => {
+        const url = boardFileUrl(props.appId, x.id);
+        return (
+          <figure key={x.id} className={`dboard-explainer is-${x.kind}`} data-file-id={x.id}>
+            <figcaption className="dboard-explainer-head">
+              <span className="dboard-explainer-name">{x.kind === 'video' ? '🎬' : '📄'} {x.name}</span>
+              <span className="dboard-explainer-size">{formatBoardBytes(x.bytes)}</span>
+              <span className="dboard-explainer-actions">
+                {x.kind === 'html' ? (
+                  <button type="button" className="dboard-text-btn" onClick={() => setFullscreen(x)}>{tr('decisionBoard.explainerFullscreen')}</button>
+                ) : null}
+                <a href={url} target="_blank" rel="noopener noreferrer">{tr('decisionBoard.explainerNewTab')}</a>
+              </span>
+            </figcaption>
+            {x.kind === 'html' ? (
+              <iframe className="dboard-explainer-frame" src={url} sandbox={BOARD_EXPLAINER_SANDBOX} referrerPolicy="no-referrer"
+                loading="lazy" title={x.name} />
+            ) : <ExplainerVideo url={url} name={x.name} />}
+          </figure>
+        );
+      })}
+      <ExplainerDialog appId={props.appId} explainer={fullscreen} onClose={() => setFullscreen(null)} />
+    </section>
   );
 }
 
@@ -1263,6 +1354,7 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
       : tr('decisionBoard.recommendOnly', { key: item.recommend }))
     : '';
   const meta = [item.repo, item.kind, tr('decisionBoard.updated', { time: boardRelativeTime(item.updatedAt, now, tr) })].filter(Boolean).join(' · ');
+  const filesById = new Map(detail.files.map(f => [f.id, f] as const));
 
   return (
     <section className="page dboard-page dboard-detail" data-seq={seq}>
@@ -1281,6 +1373,7 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
       {item.summary?.trim() ? (
         <p className="dboard-summary"><span className="dboard-summary-label">{tr('decisionBoard.summaryLabel')}</span>{item.summary}</p>
       ) : null}
+      <ExplainerPanel appId={appId} files={detail.files} />
       {loadError ? <p className="hint-warn">{tr('decisionBoard.loadFailed', { error: loadError.text })}</p> : null}
 
       {item.progress?.trim() ? (
@@ -1412,7 +1505,7 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
         <h2 className="dboard-block-title">{tr('decisionBoard.historyTitle')}</h2>
         {detail.events.length ? (
           <ol className="dboard-events">
-            {detail.events.map(event => <EventRow key={event.id} appId={appId} event={event} />)}
+            {detail.events.map(event => <EventRow key={event.id} appId={appId} event={event} files={filesById} />)}
           </ol>
         ) : <p className="dboard-empty-line">{tr('decisionBoard.historyEmpty')}</p>}
       </section>

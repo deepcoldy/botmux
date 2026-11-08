@@ -2415,6 +2415,12 @@ export interface BotConfig {
    */
   chatManagerEnabled?: boolean;
   /**
+   * 群秘书（`/secretary on`）总开关。仅当显式为 true 时，群里才能用 `/secretary on|takeover`
+   * 把本 bot 设为群秘书，后台旁听与巡检才运行。默认（undefined/false）= 关闭，老用户行为不变；
+   * `/secretary off|status` 不被此开关阻断。
+   */
+  groupSecretaryEnabled?: boolean;
+  /**
    * 管家（决策看板）配置。仅 `enabled === true` 时本 bot 是管家：它的会话能用
    * `botmux board` 写看板，owner 在 Dashboard 提交的批次送进 `chatId` 群的 chat 级会话，
    * 该群里常驻一行 `<botmux_steward>` 提示。缺省 = 关，老用户行为不变。
@@ -4492,6 +4498,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
       chatManagerEnabled: entry.chatManagerEnabled === true || undefined,
+      groupSecretaryEnabled: entry.groupSecretaryEnabled === true || undefined,
       // 非法的 steward 配置按关处理（不阻断 bot 启动）；Dashboard / /config 写入时已校验。
       steward: (() => {
         const parsed = normalizeStewardConfig(entry.steward);

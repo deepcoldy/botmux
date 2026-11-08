@@ -129,6 +129,7 @@ describe('no-transport sessions on the daemon IPC surface', () => {
 
     for (const [label, chatId, appId] of [
       ['HTTP virtual chat on a normal bot', 'http_async_nt', 'app_normal'],
+      ['CLI headless chat on a normal bot', 'headless_hl_11111111-1111-4111-8111-111111111111', 'app_normal'],
       ['apiOnly bot in a real-looking chat', 'oc_real_nt', 'local_riff'],
     ] as const) {
       find.mockReturnValue(activeSession(chatId, appId));
@@ -138,6 +139,13 @@ describe('no-transport sessions on the daemon IPC surface', () => {
         body: JSON.stringify({ name: 'new', proactive: true, originCapability: CAP }),
       });
       expect(await rename.json(), label).toMatchObject({ ok: false, error: 'no_feishu_transport' });
+      const project = await fetch(`${base}/project`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'init', title: 'must not persist', goal: 'must not send', originCapability: CAP }),
+      });
+      expect(project.status, label).toBe(409);
+      expect(await project.json(), label).toMatchObject({ ok: false, error: 'no_feishu_transport' });
       const history = await fetch(`${base}/history`);
       expect(history.status, label).toBe(200);
       expect(await history.json(), label).toMatchObject({ ok: true, messages: [], hint: 'no_feishu_transport' });

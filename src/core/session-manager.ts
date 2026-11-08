@@ -26,7 +26,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
-import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks } from '../adapters/cli/shared-hints.js';
+import { buildBotmuxShellHints, buildManagedLarkToolPromptBlocks, feishuReplyPresentationGuidance } from '../adapters/cli/shared-hints.js';
 import { usesLarkToolBinding } from './lark-tool-binding.js';
 import { effectiveReplyDelivery, type ReplyDelivery } from './reply-delivery.js';
 import {
@@ -1265,6 +1265,7 @@ function managedLarkToolAppIdForPrompt(
       larkAppId,
       chatId,
       apiOnly: botConfig.apiOnly,
+      headless: session?.headless,
       resume,
       forkSession: session?.pendingForkSession,
       adoptMode: !!session?.adoptedFrom,
@@ -1291,6 +1292,7 @@ function credentialBoundaryForPrompt(
       policy,
       managedLarkToolAppIdForPrompt(larkAppId, sessionId, chatId, resume),
       locale,
+      sessionIsNoTransport(larkAppId, chatId),
     );
   } catch { return ''; }
 }
@@ -1796,7 +1798,7 @@ export function buildNewTopicCliInput(
  * Mirrors buildNewTopicPrompt structure but for subsequent messages.
  * Session ID is omitted for adopt mode and CLIs with injectsSessionContext.
  */
-type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'formatting' | 'reminder' | 'whiteboard' | 'groupHistory' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
+type FollowUpBlockKey = 'sessionId' | 'role' | 'credentials' | 'summaryMemory' | 'formatting' | 'reminder' | 'whiteboard' | 'groupHistory' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
 
 /**
  * 按既有顺序构造 follow-up 的各个块。inline 模式直接 join；hook 模式
@@ -1840,6 +1842,9 @@ type FollowUpOpts = {
   solo?: boolean;
   /** solo 裸文本时剥掉开头的自 @（同 buildBridgeInputContent）。 */
   selfMention?: { name?: string | null; openId?: string | null };
+  /** 不注入 <botmux_reminder>（「至少回应一次」）：群秘书这类默认静默的回合用，
+   *  否则提醒与「无事不发」直接矛盾。 */
+  omitReminder?: boolean;
 };
 
 function buildFollowUpBlocks(
@@ -1870,7 +1875,7 @@ function buildFollowUpBlocks(
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, opts?.locale);
   const formattingBlock = opts?.cliId !== 'mira' && !noTransport
-    ? `<botmux_formatting>${t('ai.followup.feishu_safe_emphasis', undefined, opts?.locale)}</botmux_formatting>`
+    ? `<botmux_formatting>${feishuReplyPresentationGuidance(opts?.locale)}</botmux_formatting>`
     : '';
   const skipSessionId = opts?.isAdoptMode || (opts?.cliId
     ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
@@ -1883,11 +1888,19 @@ function buildFollowUpBlocks(
   // user's text. Per-turn attribution (sender/attachments/mentions) stays after.
   if (!skipSessionId) blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
+  if (noTransport && !skipSessionId) {
+    const session = sessionStore.getSession(sessionId);
+    const resume = !!session?.cliId || !!session?.lastCliInput || !!session?.backendType;
+    if (managedLarkToolAppIdForPrompt(opts?.larkAppId, sessionId, opts?.chatId, resume)) {
+      const credentialBoundary = credentialBoundaryForPrompt(opts?.larkAppId, sessionId, opts?.chatId, resume, opts?.locale);
+      if (credentialBoundary) blocks.push({ key: 'credentials', text: credentialBoundary });
+    }
+  }
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
   if (formattingBlock && !bare) blocks.push({ key: 'formatting', text: formattingBlock });
   // transcript：不注入 reminder（判定同样落在 KEY 选择层，hook 模式的 sidecar 自然为空
   // → buildFollowUpCliInput 回退 inline 且不写 sidecar）。
-  if (opts?.cliId !== 'mira' && !transcript) {
+  if (opts?.cliId !== 'mira' && !transcript && !opts?.omitReminder) {
     // All non-Mira CLIs — including Hermes, which no longer gets reverse
     // send-first guidance (#653) and now shares this standard path — get the
     // anti-resend variant only when the experimental dashboard toggle is on
@@ -1974,7 +1987,7 @@ export function buildFollowUpContent(
   ) {
     const formattingGuidance = sessionIsNoTransport(opts.larkAppId, opts.chatId) || opts.cliId === 'mira'
       ? undefined
-      : t('ai.followup.feishu_safe_emphasis', undefined, opts.locale);
+      : feishuReplyPresentationGuidance(opts.locale);
     return buildServiceUserPrompt(
       [opts?.sharedGroupContext, content].filter(Boolean).join('\n\n'),
       formattingGuidance,
@@ -2180,7 +2193,7 @@ export function buildFollowUpCliInput(
   const roleBlock = renderApplicationRoleBlock(opts.larkAppId, opts.chatId, { followUp: true });
   const formattingBlock = sessionIsNoTransport(opts.larkAppId, opts.chatId)
     ? ''
-    : `<botmux_formatting>${t('ai.followup.feishu_safe_emphasis', undefined, opts.locale)}</botmux_formatting>`;
+    : `<botmux_formatting>${feishuReplyPresentationGuidance(opts.locale)}</botmux_formatting>`;
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts.whiteboardId,
     noTransport: sessionIsNoTransport(opts.larkAppId, opts.chatId),
@@ -5135,6 +5148,17 @@ export interface OwnerBatchTurnInput {
   ownerOpenId?: string;
   ownerName?: string;
   sessionTitle: string;
+  /**
+   * 静默回合（群秘书摘要用）：按定时任务 --silent 同一套 turn 级登记，worker→飞书的
+   * 自动输出（流式卡、兜底最终回复）全部压掉，只有模型主动 `botmux send` 的内容可见；
+   * 也不刷新人活动钟、不清会话举手（这不是真人刚发的消息）。缺省 = 看板批次原行为。
+   */
+  silent?: boolean;
+  /**
+   * 群秘书话题巡查：回合投进本 bot 在这个话题（thread_root）的 thread 级会话，没有就新建。
+   * 不发横幅、不看群回复模式，落点就是这个话题——会话里的 botmux send 默认回到这个话题。
+   */
+  threadRootId?: string;
 }
 
 /**
@@ -5155,9 +5179,11 @@ export async function deliverOwnerBatchTurn(
   runtime?: {
     prepareTurnIdentity?: (session: DaemonSession, turnId: string) => void | Promise<void>;
   },
-): Promise<{ sessionId: string }> {
+): Promise<{ sessionId: string; created: boolean }> {
   const bot = getAllBots().find(b => b.config.larkAppId === input.larkAppId);
   if (!bot) throw new Error(`steward bot ${input.larkAppId} is not loaded`);
+  const threadRootId = input.threadRootId?.trim() || undefined;
+  if (threadRootId && !/^om_[A-Za-z0-9_-]{1,128}$/.test(threadRootId)) throw new Error(`invalid thread root ${threadRootId}`);
   const { larkAppId, chatId, turnId } = input;
   const { getChatMode, sendMessage, replyMessage, uploadImage } = await import('../im/lark/client.js');
   const chatMode = await getChatMode(larkAppId, chatId, { forceRefresh: true });
@@ -5169,13 +5195,15 @@ export async function deliverOwnerBatchTurn(
   //  - shared / chat / p2p：锚点就是 chatId，横幅只是通知和 shared 模式的回复根。必须等锁内
   //    开场保留 / 恢复归属检查通过后再发——否则管家会话还在选仓库时投递被拒，页面每重投一次
   //    群里就多一条横幅。
-  const independentByMode = chatMode === 'topic' || regularGroupMode === 'new-topic';
+  const independentByMode = !threadRootId && (chatMode === 'topic' || regularGroupMode === 'new-topic');
   let bannerId: string | undefined;
   let bannerAttempted = false;
   const [firstText = '', ...moreTexts] = input.announcement.texts;
   const postBanner = async (): Promise<string | undefined> => {
     if (bannerAttempted) return bannerId;
     bannerAttempted = true;
+    // 没有横幅正文（群秘书静默回合）：不发任何东西，落点回落 chat 锚点。
+    if (!firstText) return undefined;
     try {
       bannerId = await sendMessage(larkAppId, chatId, firstText);
     } catch (err: any) {
@@ -5208,9 +5236,9 @@ export async function deliverOwnerBatchTurn(
   if (independentByMode) await postBanner();
   // 横幅发送失败时回落 chat 锚点（与定时任务 chat 级触发同形）。
   const opensIndependentTopic = independentByMode && !!bannerId;
-  const anchor = opensIndependentTopic ? bannerId! : chatId;
+  const anchor = threadRootId ?? (opensIndependentTopic ? bannerId! : chatId);
   const sharedRootFor = (id: string | undefined): string | undefined =>
-    !opensIndependentTopic && id && chatMode === 'group' && regularGroupMode === 'shared' ? id : undefined;
+    !threadRootId && !opensIndependentTopic && id && chatMode === 'group' && regularGroupMode === 'shared' ? id : undefined;
   const trustedCaller: CliTurnPayload['trustedCaller'] = input.ownerOpenId
     ? { requestUserOpenId: input.ownerOpenId, requestLarkAppId: larkAppId, senderType: 'user' }
     : undefined;
@@ -5248,8 +5276,10 @@ export async function deliverOwnerBatchTurn(
         const sharedTopicRootId = sharedRootFor(await postBanner());
         // 批次就是 owner 刚点的提交：按真人入站同口径刷新人活动钟，并清掉管家的决策举手
         // （否则 Dashboard「需要你」常亮，且空闲自动关闭会一直跳过这个会话）。
-        markSessionActivity(existing, Date.now(), { human: !!input.ownerOpenId });
-        clearAgentAttention(existing);
+        if (!input.silent) {
+          markSessionActivity(existing, Date.now(), { human: !!input.ownerOpenId });
+          clearAgentAttention(existing);
+        }
         ensureSessionWhiteboard(existing);
         if (sharedTopicRootId) {
           beginReplyTargetTurn(existing, sharedTopicRootId, turnId);
@@ -5269,24 +5299,32 @@ export async function deliverOwnerBatchTurn(
           sender,
           turnId,
           trustedCaller,
+          ...(input.silent ? { omitReminder: true } : {}),
         });
         rememberLastCliInput(existing, input.prompt, payload, turnId);
+        if (input.silent) armSilentScheduledTurn(existing, turnId);
         if (existing.worker && !existing.worker.killed) {
           try {
             if (sendWorkerInput(existing, payload, turnId, trustedCaller ? { trustedCaller } : {})) {
               logger.info(`[decision-board] Batch turn ${turnId} injected into steward session ${existing.session.sessionId}`);
-              return { sessionId: existing.session.sessionId };
+              return { sessionId: existing.session.sessionId, created: false };
             }
           } catch (err: any) {
             logger.warn(`[decision-board] Live injection threw (${err.message}); cold-resuming steward session`);
           }
         }
         if (activeSessions.get(key) !== existing || existing.session.status !== 'active') {
+          if (input.silent) disarmSilentScheduledTurn(existing, turnId);
           throw new Error(`steward session ${existing.session.sessionId} is no longer active`);
         }
-        forkWorker(existing, payload, { resume: existing.hasHistory, turnId });
+        try {
+          forkWorker(existing, payload, { resume: existing.hasHistory, turnId });
+        } catch (err) {
+          if (input.silent) disarmSilentScheduledTurn(existing, turnId);
+          throw err;
+        }
         logger.info(`[decision-board] Batch turn ${turnId} cold-resumed steward session ${existing.session.sessionId}`);
-        return { sessionId: existing.session.sessionId };
+        return { sessionId: existing.session.sessionId, created: false };
       }
       if (isDisposableCommandScratch(existing)) {
         await closeSession(existing.session.sessionId);
@@ -5304,7 +5342,8 @@ export async function deliverOwnerBatchTurn(
     if (input.ownerOpenId) {
       session.ownerOpenId = input.ownerOpenId;
       // 批次按 owner 本人的消息投递，新人活动钟与真人开话题同口径（follow-active 据此落点）。
-      stampHumanActivity(session, now);
+      // 静默回合不是真人消息，不刷人活动钟。
+      if (!input.silent) stampHumanActivity(session, now);
     }
     session.lastMessageAt = new Date(now).toISOString();
     sessionStore.updateSession(session);
@@ -5357,16 +5396,18 @@ export async function deliverOwnerBatchTurn(
         + (winner ? ` to ${winner.session.sessionId}` : ''));
     }
     rememberLastCliInput(ds, input.prompt, prompt, turnId);
+    if (input.silent) armSilentScheduledTurn(ds, turnId);
     try {
       forkWorker(ds, prompt, turnId);
     } catch (err) {
+      if (input.silent) disarmSilentScheduledTurn(ds, turnId);
       await releaseStartRefusedForMissingDir(ds, err);
       throw err;
     }
     ds.initialStartPending = false;
     ds.pendingPrompt = undefined;
     logger.info(`[decision-board] Batch turn ${turnId} spawned steward session ${session.sessionId} (anchor ${anchor})`);
-    return { sessionId: session.sessionId };
+    return { sessionId: session.sessionId, created: true };
   });
 }
 

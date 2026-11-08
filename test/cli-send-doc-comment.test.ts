@@ -25,6 +25,7 @@ function runSend(options: {
   sendHistory?: Record<string, unknown>[];
   env?: NodeJS.ProcessEnv;
   repeat?: boolean;
+  content?: string;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-send-doc-'));
   const dataDir = join(root, 'data');
@@ -55,7 +56,7 @@ function runSend(options: {
     const send = (responseKind: typeof options.responseKind, args: string[] = []) => spawnSyncTsScript(fixture, [
       'send', options.mentionBack === false ? '--no-mention' : '--mention-back',
       ...(responseKind ? ['--response-kind', responseKind] : []),
-      '缺少电子表格读取权限，请授权后继续。', ...args,
+      options.content ?? '缺少电子表格读取权限，请授权后继续。', ...args,
     ], {
       cwd: fileURLToPath(new URL('..', import.meta.url)),
       env: {
@@ -127,6 +128,16 @@ describe('real CLI document-comment reply routing', () => {
       messageId: 'doc:comment_test', turnId: 'reply_user', responseKind: 'final',
     })]);
     expect(result.stdout).toContain('"kind":"doc-comment"');
+  }, 35_000);
+
+  // The document reply API is a raw request outside the Lark message client,
+  // so the send command's own presentation pass is the only one on this path.
+  it('removes host paths from an explicit document reply before the provider request', () => {
+    const result = runSend({ content: '报告在 /home/alice/private/report.md，另见 [说明](/home/alice/notes.md)。' });
+    expect(result.status, result.stderr).toBe(0);
+    const text = JSON.stringify(result.requests[0]?.body);
+    expect(text).toContain('说明');
+    expect(text).not.toContain('/home/alice');
   }, 35_000);
 
   it('treats an omitted response kind as the one final document reply', () => {

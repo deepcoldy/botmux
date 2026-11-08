@@ -94,6 +94,7 @@ import { deliverOwnerBatchTurn } from '../src/core/session-manager.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as sessionActivity from '../src/core/session-activity.js';
 import { sessionKey } from '../src/core/types.js';
+import { isSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 
 const INPUT = {
   larkAppId: 'app_s',
@@ -264,5 +265,52 @@ describe('管家群里的回显', () => {
     expect(lark.sendMessage.mock.calls.filter(c => c[3] === 'image').map(c => c[2]))
       .toEqual([JSON.stringify({ image_key: 'img_001-2-b.png' })]);
     expect(wp.sendWorkerInput).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('静默回合（群秘书摘要）', () => {
+  const SILENT = { ...INPUT, turnId: 'secretary:app_s:oc_steward:1', announcement: { texts: [], images: [] }, attachments: [], silent: true };
+
+  it('会话在跑：不发横幅、不刷人活动钟、不清举手，回合按 turn 登记为静默', async () => {
+    const map = new Map<string, any>();
+    const ds = liveSession(map, { agentAttention: { kind: 'decision', reason: '等拍板', at: 1 } });
+    await deliverOwnerBatchTurn(SILENT, map, () => false);
+    expect(lark.sendMessage).not.toHaveBeenCalled();
+    expect(lark.replyMessage).not.toHaveBeenCalled();
+    expect(sessionActivity.markSessionActivity).not.toHaveBeenCalled();
+    expect(sessionActivity.clearAgentAttention).not.toHaveBeenCalled();
+    expect(wp.sendWorkerInput).toHaveBeenCalledTimes(1);
+    expect(isSilentScheduledTurn(ds as any, SILENT.turnId)).toBe(true);
+    // 静默只按 turn 生效，同会话的其它回合不受影响。
+    expect(isSilentScheduledTurn(ds as any, 'other-turn')).toBe(false);
+  });
+
+  it('silent turns carry no reply reminder; ordinary batch turns still do', async () => {
+    const map = new Map<string, any>();
+    liveSession(map);
+    await deliverOwnerBatchTurn(SILENT, map, () => false);
+    expect(JSON.stringify((wp.sendWorkerInput.mock.calls.at(-1) as any[])[1])).not.toContain('botmux_reminder');
+    await deliverOwnerBatchTurn({ ...INPUT, turnId: 'board:app_s:2' }, map, () => false);
+    expect(JSON.stringify((wp.sendWorkerInput.mock.calls.at(-1) as any[])[1])).toContain('botmux_reminder');
+  });
+
+  it('注入失败且冷启动也抛错：撤销静默登记', async () => {
+    const map = new Map<string, any>();
+    const ds = liveSession(map);
+    wp.sendWorkerInput.mockReturnValueOnce(false);
+    wp.forkWorker.mockImplementationOnce(() => { throw new Error('spawn failed'); });
+    await expect(deliverOwnerBatchTurn(SILENT, map, () => false)).rejects.toThrow(/spawn failed/);
+    expect(isSilentScheduledTurn(ds as any, SILENT.turnId)).toBe(false);
+  });
+
+  it('话题群没有会话：不发横幅，回落到 chat 锚点新建静默会话，不写人活动钟', async () => {
+    lark.chatMode = 'topic';
+    const map = new Map<string, any>();
+    await deliverOwnerBatchTurn(SILENT, map, () => false);
+    expect(lark.sendMessage).not.toHaveBeenCalled();
+    const ds = map.get(sessionKey('oc_steward', 'app_s'));
+    expect(ds?.scope).toBe('chat');
+    expect(isSilentScheduledTurn(ds, SILENT.turnId)).toBe(true);
+    expect(sessionActivity.stampHumanActivity).not.toHaveBeenCalled();
   });
 });

@@ -35114,6 +35114,33 @@ a.dboard-link:hover { border-color: var(--accent-border); color: var(--accent-st
 .dboard-link-plain { color: var(--muted); }
 .dboard-summary { margin: 0; font-size: var(--fs-14); line-height: var(--lh-body); overflow-wrap: anywhere; }
 .dboard-summary-label { margin-right: 8px; color: var(--muted); font-size: var(--fs-12); }
+/* 图文说明：说明页在 sandbox iframe 里不跑脚本，高度撑不开，给固定高度在框内滚动；视频用页内播放器。 */
+.dboard-explainers { gap: 12px; }
+.dboard-explainer { display: grid; gap: 6px; min-width: 0; margin: 0; }
+.dboard-explainer-head { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 10px; min-width: 0; font-size: var(--fs-13); }
+.dboard-explainer-name { min-width: 0; font-weight: var(--fw-m); overflow-wrap: anywhere; }
+.dboard-explainer-size { color: var(--muted); font-size: var(--fs-12); }
+.dboard-explainer-actions { display: inline-flex; align-items: baseline; gap: 12px; margin-left: auto; font-size: var(--fs-12); }
+.dboard-explainer-frame { display: block; width: 100%; height: min(70vh, 640px); border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: #fff; }
+.dboard-explainer-video { display: block; width: 100%; max-height: 70vh; border-radius: var(--radius-md); background: #000; }
+.dboard-row-explainer { color: var(--accent-strong); }
+.dboard-event-files { display: flex; flex-wrap: wrap; gap: 6px; }
+dialog.dboard-explainer-dialog {
+  width: 100vw;
+  max-width: none;
+  height: 100vh;
+  height: 100dvh;
+  max-height: none;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  overflow: hidden;
+}
+dialog.dboard-explainer-dialog[open] { display: flex; flex-direction: column; }
+.dboard-explainer-bar { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--border-soft); font-size: var(--fs-13); }
+.dboard-explainer-bar strong { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dboard-explainer-dialog-frame { flex: 1 1 auto; width: 100%; min-height: 0; border: 0; background: #fff; }
 .dboard-md { font-size: var(--fs-13); line-height: var(--lh-body); overflow-wrap: anywhere; }
 .dboard-md > :first-child { margin-top: 0; }
 .dboard-md > :last-child { margin-bottom: 0; }

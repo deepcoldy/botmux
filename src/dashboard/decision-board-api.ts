@@ -9,9 +9,12 @@
  * 实际点提交的人（'local' 或 'u:<union_id>'）单独记进批次。
  */
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import type { DashboardRequestIdentity } from './request-identity.js';
 import type { StewardConfig } from '../core/decision-board/model.js';
 import { immersiveWorkbenchHash } from '../core/workbench-shell.js';
+import { BOARD_HTML_CSP, boardFileKind, isSingleByteRange } from '../core/decision-board/files.js';
 
 export const DECISION_BOARD_IMAGE_BODY_MAX_BYTES = 16 * 1024 * 1024;
 const JSON_BODY_MAX_BYTES = 1024 * 1024;
@@ -75,6 +78,117 @@ async function relay(res: ServerResponse, upstream: Response): Promise<void> {
   const text = await upstream.text();
   res.writeHead(upstream.status, { 'content-type': 'application/json', 'cache-control': 'no-store' });
   res.end(text);
+}
+
+/** `Content-Range: bytes a-b/size` → 三个数；其它写法返回 null。 */
+function contentRange(value: string | null): { start: number; end: number; size: number } | null {
+  const m = /^bytes (\d{1,15})-(\d{1,15})\/(\d{1,15})$/.exec(value ?? '');
+  if (!m) return null;
+  const [start, end, size] = [Number(m[1]), Number(m[2]), Number(m[3])];
+  return start <= end && end < size ? { start, end, size } : null;
+}
+
+/** 写入后缓冲满了就等浏览器读走（或断开）。已经断开的不写也不等：那时 drain / close 都不会再来。 */
+async function writeDrained(res: ServerResponse, data: Buffer): Promise<void> {
+  if (res.destroyed) return;
+  if (res.write(data)) return;
+  await new Promise<void>(resolve => {
+    if (res.destroyed) return resolve();
+    const done = () => { res.off('drain', done); res.off('close', done); resolve(); };
+    res.on('drain', done);
+    res.on('close', done);
+  });
+}
+
+/**
+ * 浏览器没要 Range（下载、curl，或者多段 / 写错的 Range）时也回整份 200，但从 daemon 按块拿：
+ * loopbackFetch 收响应不做背压，整份要会把 50MB 全收进 Dashboard 内存。这里一次只拿一块（daemon 每次
+ * 最多回 BOARD_VIDEO_RANGE_CHUNK），等浏览器读走再拿下一块，浏览器断开就停。
+ */
+async function relayWholeVideo(
+  res: ServerResponse,
+  first: Response,
+  headers: Record<string, string>,
+  fetchRange: (range: string) => Promise<Response>,
+): Promise<void> {
+  const head = contentRange(first.headers.get('content-range'));
+  if (first.status !== 206 || !head || head.start !== 0) {
+    await first.body?.cancel().catch(() => undefined);
+    json(res, 502, { ok: false, error: 'bad_upstream_range' });
+    return;
+  }
+  res.writeHead(200, { ...headers, 'content-length': String(head.size) });
+  let closed = false;
+  res.once('close', () => { closed = true; });
+  try {
+    let upstream: Response | null = first;
+    let pos = 0;
+    while (pos < head.size && !closed) {
+      upstream ??= await fetchRange(`bytes=${pos}-`);
+      const span = contentRange(upstream.headers.get('content-range'));
+      const data = Buffer.from(await upstream.arrayBuffer());
+      upstream = null;
+      if (closed) return;
+      if (!span || span.start !== pos || span.size !== head.size || data.length !== span.end - span.start + 1) {
+        res.destroy();
+        return;
+      }
+      pos += data.length;
+      await writeDrained(res, data);
+    }
+    if (!closed) res.end();
+  } catch {
+    res.destroy();
+  }
+}
+
+/**
+ * 附件下载。截图和报错照旧走 relay；图文说明：
+ *   - HTML：响应头由这里自己写（不信上游），始终带 CSP sandbox——说明页与控制台同域名，就靠它不跑脚本、
+ *     拿不到控制台的源；
+ *   - 视频：浏览器要了 Range 就透传 206 / 416 和 Content-Range（daemon 每段最多回一块）；没要就由
+ *     relayWholeVideo 按块拼成 200。
+ * `fetchWhole` 只在浏览器没要 Range、转给 daemon 的是 `bytes=0-` 时传。
+ */
+async function relayFile(res: ServerResponse, upstream: Response, fetchWhole?: (range: string) => Promise<Response>): Promise<void> {
+  const type = (upstream.headers.get('content-type') ?? '').split(';')[0]!.trim().toLowerCase();
+  const kind = boardFileKind(type);
+  if (upstream.status === 416) {
+    await upstream.arrayBuffer().catch(() => undefined);
+    res.writeHead(416, { 'content-range': upstream.headers.get('content-range') ?? '', 'accept-ranges': 'bytes', 'cache-control': 'no-store' });
+    res.end();
+    return;
+  }
+  if (!upstream.ok || (kind !== 'html' && kind !== 'video')) return relay(res, upstream);
+  const cache = upstream.headers.get('cache-control') ?? 'private, max-age=3600';
+  if (kind === 'html') {
+    const data = Buffer.from(await upstream.arrayBuffer());
+    res.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'content-length': String(data.length),
+      'content-security-policy': BOARD_HTML_CSP,
+      'referrer-policy': 'no-referrer',
+      'x-content-type-options': 'nosniff',
+      'cache-control': cache,
+    });
+    res.end(data);
+    return;
+  }
+  const headers: Record<string, string> = {
+    'content-type': type,
+    'accept-ranges': 'bytes',
+    'x-content-type-options': 'nosniff',
+    'cache-control': cache,
+  };
+  if (fetchWhole) return relayWholeVideo(res, upstream, headers, fetchWhole);
+  const length = upstream.headers.get('content-length');
+  if (length) headers['content-length'] = length;
+  const range = upstream.headers.get('content-range');
+  if (upstream.status === 206 && range) headers['content-range'] = range;
+  res.writeHead(upstream.status === 206 ? 206 : 200, headers);
+  if (!upstream.body) { res.end(); return; }
+  // 浏览器拖进度条会中途断开上一个请求：pipeline 以 premature close 结束，不算错。
+  await pipeline(Readable.fromWeb(upstream.body as Parameters<typeof Readable.fromWeb>[0]), res).catch(() => { res.destroy(); });
 }
 
 function isJsonRequest(req: IncomingMessage): boolean {
@@ -183,7 +297,14 @@ export async function handleDecisionBoardApi(
   }
   mm = /^\/files\/([A-Za-z0-9]{8,40})$/.exec(rest);
   if (method === 'GET' && mm) {
-    await forward(`${PREFIX}/files/${mm[1]}`, { method: 'GET' });
+    // 只透传单段 Range（daemon 按块回 206）；别的都按整份处理，转给 daemon 的是 `bytes=0-`，
+    // daemon 对截图 / 说明页不看 Range，照旧回整份 200。
+    const path = `${PREFIX}/files/${mm[1]}`;
+    const asked = typeof req.headers.range === 'string' ? req.headers.range : '';
+    const single = asked.length <= 200 && isSingleByteRange(asked);
+    const fetchRange = (range: string) => deps.proxyToDaemon(appId, path, { method: 'GET', headers: { range } });
+    const upstream = await fetchRange(single ? asked : 'bytes=0-');
+    await relayFile(res, upstream, single ? undefined : fetchRange);
     return true;
   }
   if (method === 'POST' && rest === '/submit') {

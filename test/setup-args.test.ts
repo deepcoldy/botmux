@@ -332,6 +332,14 @@ describe('buildBotFromAddFlags', () => {
 });
 
 describe('editInputFromFlags', () => {
+  it('accepts --app-icon only with add --create-app (not compat mode, not edit)', () => {
+    expect(parseSetupCommand(['add', '--create-app', '--app-icon', '/tmp/a.png', '--allowed-users', 'o@example.com']))
+      .toMatchObject({ action: 'add', createApp: true, flags: { appIcon: '/tmp/a.png' } });
+    expect(() => parseSetupCommand(['add', '--app-icon', '/tmp/a.png'])).toThrow(/必须与 add --create-app/);
+    expect(() => parseSetupCommand(['add', '--create-app', '--compatibility-mode', '--app-icon', '/tmp/a.png'])).toThrow(/不支持 --app-icon/);
+    expect(() => editInputFromFlags({ appIcon: '/tmp/a.png' })).toThrow(/仅与 add --create-app/);
+  });
+
   it('rejects --app-name outside add --create-app', () => {
     expect(() => editInputFromFlags({ appName: 'Bot' })).toThrow(/仅与 add --create-app/);
   });
