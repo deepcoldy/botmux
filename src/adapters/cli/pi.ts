@@ -9,6 +9,7 @@ import { wrapBracketedPaste } from './tui-input.js';
 import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
 import { PI_TURN_BOUNDARY_EXTENSION_SOURCE } from './pi-turn-boundary-extension-data.js';
 import { resolvePiModel } from './pi-model.js';
+import { discoverPiLocalModels } from './pi-local-models.js';
 import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { clearBotmuxPromptEnv } from '../../skills/zero-injection.js';
@@ -335,6 +336,7 @@ export function createPiAdapter(
     // (piSandboxSessionDir).
     authPaths: ['~/.pi/agent'],
     resolvedBin: bin,
+    detectModels: discoverPiLocalModels,
 
     buildArgs({
       sessionId,

@@ -158,9 +158,12 @@ async function detectModelCatalogWith(
       && !adapter?.detectModels) return null;
 
     // TTL 内的成功缓存直接复用。
-    const envKey = opts?.probeEnv
+    // Pi reads local configuration in the effective environment, including
+    // ambient HOME/agent-dir when no Bot-specific probe env was supplied.
+    const probeEnv = opts?.probeEnv ?? (opt.cliId === 'pi' ? process.env : undefined);
+    const envKey = probeEnv
       ? createHash('sha256').update(JSON.stringify(
-        Object.keys(opts.probeEnv).sort().map(key => [key, opts.probeEnv![key]]),
+        Object.keys(probeEnv).sort().map(key => [key, probeEnv[key]]),
       )).digest('hex')
       : '';
     const runtimeIdentity = opt.key === 'aiden-x-codex'
@@ -188,7 +191,7 @@ async function detectModelCatalogWith(
           ? await (opts?.aidenCodexDetector ?? detectAidenCodexModels)()
           : adapter?.detectModelCapabilities
             ? capabilities?.map(model => model.slug) ?? null
-            : await adapter?.detectModels?.() ?? null;
+            : await adapter?.detectModels?.({ env: probeEnv }) ?? null;
         // 只缓存非空成功结果；失败（null/空数组/异常）不缓存，下次调用重试。
         if (models === null) return null;
         if (models.length === 0) return { models: [] };
