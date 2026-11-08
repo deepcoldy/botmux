@@ -21,7 +21,7 @@ import MarkdownIt from 'markdown-it';
 import * as cotMessage from '../src/im/lark/cot-message.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { outputSnapshot } from '../src/services/universal-output-handoff.js';
-import { OutputDeliveryJournal } from '../src/services/output-delivery-journal.js';
+import { OutputDeliveryJournal, outputDeliveryJournal } from '../src/services/output-delivery-journal.js';
 import { OutputDeliveryCoordinator } from '../src/services/output-delivery-coordinator.js';
 import { finalOutputSnapshot } from '../src/services/final-output-handoff.js';
 import { FinalOutputHandoffStore } from '../src/services/final-output-handoff-store.js';
@@ -164,6 +164,8 @@ import {
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
+import { markRetryAttempt } from '../src/services/failed-turn-retry.js';
+import { holdPurgeClickRollback, PURGE_CONTINUATION_WITHHELD, PURGE_IMAGES_NOT_APPLIED } from '../src/services/image-purge-recovery.js';
 import { emitSessionLifecycleHook } from '../src/services/session-lifecycle-hooks.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
@@ -2893,6 +2895,52 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       state: 'replied',
       sessionId: ds.session.sessionId,
       replyMessageId: 'om_explicit_reply',
+    });
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('settles a silent listener test run on its terminal without a source reply', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const run = createMessageListenerRunPreview('app_test', 'oc_chat', ['om_source']);
+    const triggerId = 'mlrp_turn_silent';
+    markMessageListenerRunPreviewTriggered(run.runId, 'om_source', { sessionId: 'sid-final-out', triggerId });
+    const ds = makeDs();
+    ds.session.messageListenerRun = { sourceMessageId: 'om_source', replyMode: 'none' };
+    ds.currentTurnId = triggerId;
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', { ...finalOutputMsg(), sessionId: ds.session.sessionId, turnId: triggerId });
+    (ds.worker as any).emit('message', { type: 'turn_terminal', sessionId: ds.session.sessionId, turnId: triggerId, status: 'completed' });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(getMessageListenerRunPreview(run.runId)?.results[0]).toMatchObject({ state: 'completed', ok: true });
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('marks the durable output journal of a silent listener turn as intentionally suppressed', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const triggerId = 'mlrp_turn_journal';
+    const ds = makeDs();
+    ds.session.messageListenerRun = { sourceMessageId: 'om_source', replyMode: 'none' };
+    ds.currentTurnId = triggerId;
+    ds.initConfig = { ...(ds.initConfig ?? {}), finalOutputHandoff: { version: 2 as const, token: 'tok-silent' } };
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const base = { ...finalOutputMsg(), sessionId: ds.session.sessionId, turnId: triggerId };
+    const snapshot = outputSnapshot(ds.larkAppId, base);
+    (ds.worker as any).emit('message', {
+      ...base,
+      handoff: { version: 2 as const, token: 'tok-silent', id: snapshot.id, fingerprint: snapshot.fingerprint },
+    });
+    // The handoff processor settles through async coordinator/DB steps; flush
+    // the microtask queue instead of asserting synchronously after emit.
+    for (let i = 0; i < 5; i += 1) {
+      await vi.advanceTimersByTimeAsync(1);
+      await Promise.resolve();
+    }
+    const stored = outputDeliveryJournal(config.session.dataDir, ds.larkAppId).read(snapshot.id);
+    expect(stored?.sink).toMatchObject({
+      kind: 'suppressed',
+      reason: 'silent_message_listener',
     });
     expect(sessionReply).not.toHaveBeenCalled();
   });
@@ -6092,4 +6140,82 @@ it('keeps V2 requester addressing frozen after the current sender changes', asyn
   await vi.advanceTimersByTimeAsync(100); await run;
   expect(sessionReply).toHaveBeenCalledOnce(); expect(sessionReply.mock.calls[0][1]).toContain('ou_original'); expect(sessionReply.mock.calls[0][1]).not.toContain('ou_newer');
   journal.close(); vi.useRealTimers();
+});
+
+describe('purge-and-continue on the daemon side', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+  });
+
+  function purgeClickedDs(): DaemonSession & { restoreTurnState: ReturnType<typeof vi.fn> } {
+    const ds = makeDs() as DaemonSession & { restoreTurnState: ReturnType<typeof vi.fn> };
+    ds.adoptedFrom = undefined;
+    ds.session.lastFailedTurn = {
+      turnId: 'om_failed', userPrompt: 'p', cliInput: 'i', failedAt: new Date().toISOString(),
+      status: 'failed', errorCode: 'provider_image_too_small', retryCount: 0,
+    };
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    ds.restoreTurnState = vi.fn(() => {
+      ds.lastCliInputTurnId = 'om_failed';
+      ds.lastScreenStatus = 'idle';
+      ds.streamCardPending = false;
+    });
+    holdPurgeClickRollback(ds, 'retry-purge', { receipt: markRetryAttempt(ds.session)!, restoreTurnState: ds.restoreTurnState });
+    ds.lastCliInputTurnId = 'retry-purge';
+    ds.lastScreenStatus = 'working';
+    ds.streamCardPending = true;
+    return ds;
+  }
+
+  it.each([PURGE_IMAGES_NOT_APPLIED, PURGE_CONTINUATION_WITHHELD])('refunds the retry cooldown when the worker rejects the purge continuation (%s)', async (reason) => {
+    const ds = purgeClickedDs();
+    (ds.worker as any).emit('message', { type: 'turn_input_rejected', turnId: 'retry-purge', reason });
+    await vi.waitFor(() => expect(ds.session.lastFailedTurn?.lastRetryAt).toBeUndefined());
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
+    expect(updateSessionMock).toHaveBeenCalledWith(ds.session);
+  });
+
+  it('puts back the pre-click turn state while the rejected continuation is still the latest input', async () => {
+    const ds = purgeClickedDs();
+    (ds.worker as any).emit('message', { type: 'turn_input_rejected', turnId: 'retry-purge', reason: PURGE_IMAGES_NOT_APPLIED });
+    await vi.waitFor(() => expect(ds.restoreTurnState).toHaveBeenCalledTimes(1));
+    expect(ds.lastCliInputTurnId).toBe('om_failed');
+    expect(ds.streamCardPending).toBe(false);
+    expect(ds.idleSinceAt).toEqual(expect.any(Number));
+  });
+
+  it('leaves newer input alone but still refunds when the rejection arrives late', async () => {
+    const ds = purgeClickedDs();
+    ds.lastCliInputTurnId = 'om_newer';
+    (ds.worker as any).emit('message', { type: 'turn_input_rejected', turnId: 'retry-purge', reason: PURGE_IMAGES_NOT_APPLIED });
+    await vi.waitFor(() => expect(ds.session.lastFailedTurn?.lastRetryAt).toBeUndefined());
+    expect(ds.restoreTurnState).not.toHaveBeenCalled();
+    expect(ds.lastCliInputTurnId).toBe('om_newer');
+    expect(ds.streamCardPending).toBe(true);
+  });
+
+  it('keeps the cooldown when some other turn is rejected', async () => {
+    const ds = purgeClickedDs();
+    const stamped = ds.session.lastFailedTurn?.lastRetryAt;
+    (ds.worker as any).emit('message', { type: 'turn_input_rejected', turnId: 'retry-other', reason: PURGE_IMAGES_NOT_APPLIED });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(ds.session.lastFailedTurn?.lastRetryAt).toBe(stamped);
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(1);
+    expect(ds.restoreTurnState).not.toHaveBeenCalled();
+  });
+
+  it('refuses a purge request behind a queued activation instead of staging a plain continuation', () => {
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.queuedActivationPending = true;
+    expect(sendWorkerInput(ds, { content: 'continue' }, 'retry-purge', { purgeUndersizedImages: true })).toBe(false);
+    expect(ds.session.queuedActivationTail ?? []).toHaveLength(0);
+    expect((ds.worker as any).send).not.toHaveBeenCalled();
+  });
 });

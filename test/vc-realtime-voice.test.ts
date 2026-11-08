@@ -1,5 +1,6 @@
+import { createHash } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import { createServer as createNetServer, type AddressInfo, type Socket } from 'node:net';
 import { describe, expect, it } from 'vitest';
 import { WebSocketServer, type RawData } from 'ws';
 import {
@@ -299,10 +300,35 @@ describe('VC realtime WebSocket transport', () => {
     try {
       const transport = await connectRealtimeVoiceTransport(server.url);
 
-      await expect(transport.receive()).resolves.toBeUndefined();
+      expect(await transport.receive()).toBeUndefined();
       await transport.close();
     } finally {
       await server.close();
+    }
+  });
+
+  it('close() gives up on a peer that never answers the Close frame', async () => {
+    // Completes the handshake, then ignores every frame, including our Close.
+    const sockets: Socket[] = [];
+    const peer = createNetServer((sock) => {
+      sockets.push(sock);
+      sock.on('error', () => { /* torn down by the client */ });
+      sock.once('data', (chunk) => {
+        const key = /Sec-WebSocket-Key: *(\S+)/i.exec(chunk.toString('latin1'))?.[1] ?? '';
+        const accept = createHash('sha1').update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64');
+        sock.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
+      });
+    });
+    await new Promise<void>((resolve) => peer.listen(0, '127.0.0.1', () => resolve()));
+    try {
+      const transport = await connectRealtimeVoiceTransport(`ws://127.0.0.1:${(peer.address() as AddressInfo).port}`);
+      const started = Date.now();
+      await transport.close();
+
+      expect(Date.now() - started).toBeLessThan(10_000);
+    } finally {
+      for (const sock of sockets) sock.destroy();
+      await new Promise<void>((resolve) => peer.close(() => resolve()));
     }
   });
 });

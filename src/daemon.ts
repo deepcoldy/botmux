@@ -8,6 +8,10 @@ import { handleSandboxSendRouteRequest, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } fro
 import { currentGatewayCallerOpenId } from './core/gateway-turn-caller.js';
 import { createBotAdminUnionsPublisher, readBotAdminUnions } from './services/bot-admin-unions-store.js';
 import { DecisionBoardService } from './core/decision-board/service.js';
+import { peerSessions, type ChatSessionRef, type ChatTaskReaderDeps } from './core/decision-board/chat-task-reader.js';
+import { stewardTaskHintsOn } from './core/decision-board/model.js';
+import { composeRowFromActive, composeRowFromPersistedActive } from './core/dashboard-rows.js';
+import { onSessionTaskEvent } from './core/session-task-events.js';
 import { setDecisionCardService } from './core/decision-board/card-action.js';
 import { createPrStateLookup } from './core/decision-board/github-pr-state.js';
 import { lookupChatAcrossBots } from './core/decision-board/chat-lookup.js';
@@ -105,6 +109,7 @@ import { botmuxVersion } from './utils/install-info.js';
 import { SESSION_STORE_PROTOCOL } from './utils/daemon-version-display.js';
 import { readSupervisorProcessStartIdentity } from './core/process-start-identity.js';
 import { statSync } from 'node:fs';
+import { deliverWelcomeMessageOnce, planStartupWelcomeMessages } from './services/welcome-message.js';
 import { addReaction, deleteMessage, getChatContext, getChatMode, getChatModeStrict, getChatNameAndMode, getMessageChatId, getMessageDetail, lookupMessageChatId, listChatMemberOpenIds, listChatMessages, listThreadMessages, MessageUpdateExpiredError, MessageWithdrawnError, patchCardStreamElement, replyMessage, resolveAllowedUsersWithMap, resolveCurrentChatBotOpenIdsByLarkAppIds, resolveTargetAppOpenId, sendMessage, sendUserMessage, updateCardStreamElementContent, updateMessage, type EntryResolveStatus } from './im/lark/client.js';
 import { GROUP_JOIN_ANCHOR_SCAN_LIMIT, pickGroupJoinAnchorMessageId, resolveGroupJoinPrompt, waitForAllowedUserInChat } from './core/auto-start.js';
 import {
@@ -152,7 +157,7 @@ import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
-import { coordinationModeIsPrimary, initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
+import { coordinationModeIsPrimary, initializeDurableCoordinationRuntime, type DurableCoordinationMode } from './services/durable-coordination-runtime.js';
 import { effortTaskFingerprint } from './services/codex-effort-task-state.js';
 import { closeLinkRefRuntime, initializeLinkRefRuntime } from './services/link-ref-runtime.js';
 import { startDurableInboxShadowConsumer } from './services/durable-inbox-shadow-consumer.js';
@@ -198,6 +203,7 @@ import {
 } from './services/durable-lark-session-control.js';
 import { failedTurnCaller, recordLimitedFailedTurn, clearLimitedFailedTurn, recordFailedTurnTerminal, noteFailedTurnRecoveryInput } from './core/failed-turn-recovery.js';
 import { isSilentScheduledTurn } from './core/silent-schedule-turns.js';
+import { isMessageListenerTaskAnchor, isSilentMessageListenerSession, messageListenerSendBlocked } from './core/message-listener-silence.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
@@ -607,6 +613,12 @@ import {
   closeCliMismatchedSessionsForBot,
   resolveScheduledTaskExecutionPosition,
 } from './core/session-manager.js';
+import { createGroupSecretaryRuntime, setGroupSecretaryRuntime } from './services/group-secretary-runtime.js';
+import { fetchObserveSnapshot } from './services/session-observe-command-fetch.js';
+import { fetchSessionRecentTranscript } from './services/group-secretary-transcript.js';
+import { readSecretaryMarker, writeSecretaryMarker } from './services/group-secretary-marker.js';
+import { fetchRemoteSecretarySessions, fetchRemoteSecretaryTranscript, listSecretaryPeers, type SecretaryPeer } from './services/group-secretary-federation.js';
+import { listSecretaryWatches } from './services/group-secretary-watch-store.js';
 import { publishTurnCliIdentity, trackTurnIdentityPublication, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
 import { clearSingleIdentityArtifacts, forgetProvenIdentityContent } from './core/cli-identity.js';
 import { BYTEDCLI_RENEWAL_SWEEP_MS, renewExpiringBytedcliIdentities } from './core/bytedcli-identity-renewal.js';
@@ -4234,6 +4246,7 @@ function startMemoryDiagnostics(): ReturnType<typeof setInterval> | undefined {
  * address spaces never collide; the lookup just tries both.
  */
 function streamingCardDisabledFor(ds: DaemonSession, turnId?: string): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return true;
   if (privateReplyEnabled(ds.session)) return true;
   if (ds.streamingCardForced) return false;
   try {
@@ -4249,6 +4262,7 @@ function streamingCardDisabledFor(ds: DaemonSession, turnId?: string): boolean {
 }
 
 function silentTurnReactionsFor(ds: DaemonSession): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return true;
   try {
     return getBot(ds.larkAppId).config.silentTurnReactions === true;
   } catch { return false; }
@@ -4949,6 +4963,10 @@ async function sessionReply(
   }
   const appId = larkAppId ?? ds?.larkAppId ?? getAllBots()[0]?.config.larkAppId;
   if (!appId) throw new Error('No bot configured');
+  if (isMessageListenerTaskAnchor(anchor) || (ds && isSilentMessageListenerSession(ds.session))) {
+    logger.debug(`[message-listener] suppressed automatic reply for ${anchor.substring(0, 24)}`);
+    return '';
+  }
   // Central Lark-transport gate (fail-closed): a core-only (apiOnly) bot or an
   // HTTP virtual session (http_async_* / http_wait_*) has no real Feishu chat.
   // Auxiliary worker UI is already suppressed at its source (worker-pool
@@ -5468,7 +5486,7 @@ async function forceTopicWorktreeTarget(baseDir: string, anchor: string): Promis
   branch: string;
   targetSubdir?: string;
 }> {
-  const { mainWorktreeFor, worktreeRootFor } = await import('./services/git-worktree.js');
+  const { mainWorktreeFor, worktreeRootFor, worktreeTargetPath } = await import('./services/git-worktree.js');
   const containingRoot = await worktreeRootFor(baseDir);
   const repoRoot = await mainWorktreeFor(baseDir);
   // `git rev-parse --show-toplevel` can canonicalize platform aliases (for
@@ -5481,7 +5499,7 @@ async function forceTopicWorktreeTarget(baseDir: string, anchor: string): Promis
   const branch = `wt/botmux-${short}`;
   return {
     branch,
-    worktreePath: join(dirname(repoRoot), `${basename(repoRoot)}-wt-botmux-${short}`),
+    worktreePath: worktreeTargetPath(repoRoot, `${basename(repoRoot)}-wt-botmux-${short}`),
     ...((subdir && !subdir.startsWith('..') && !isAbsolute(subdir)) ? { targetSubdir: subdir } : {}),
   };
 }
@@ -5498,10 +5516,11 @@ function resolveForceTopicCurrentWorkingDir(ctx: {
   anchor: string;
   chatId: string;
   larkAppId: string;
-  currentSession?: DaemonSession;
 }): string | undefined {
   const loc = localeForBot(ctx.larkAppId);
-  const current = validateExplicitForceTopicWorkingDir(ctx.currentSession?.workingDir, loc);
+  const currentSession = activeSessions.get(sessionKey(ctx.chatId, ctx.larkAppId))
+    ?? activeSessions.get(sessionKey(ctx.anchor, ctx.larkAppId));
+  const current = validateExplicitForceTopicWorkingDir(currentSession?.workingDir, loc);
   if (current) return current;
 
   const oncall = validateExplicitForceTopicWorkingDir(findOncallChat(ctx.larkAppId, ctx.chatId)?.workingDir, loc);
@@ -5518,6 +5537,29 @@ function resolveForceTopicCurrentWorkingDir(ctx: {
     const resolved = validateExplicitForceTopicWorkingDir(peer.workingDir, loc);
     if (resolved) return resolved;
   }
+  return undefined;
+}
+
+/**
+ * `/th` `/tw` 头后紧跟斜杠命令时用的目录。与常规建会话路径同序：先跑 resolvePinnedWorkingDir
+ * （第 2 层 defaultOncall 自动绑定会写状态，每条 spawn 路径都要照样发生，绑出的 oncall
+ * 目录也是当前目录的一个来源），再取当前目录。取不到时已回复用户，调用方不得再建会话。
+ */
+async function resolveForceTopicSlashWorkingDir(ctx: {
+  scope: 'thread' | 'chat';
+  anchor: string;
+  chatId: string;
+  chatType: 'group' | 'p2p';
+  larkAppId: string;
+  mode: 'here' | 'worktree';
+  reply: (text: string) => Promise<unknown>;
+}): Promise<string | undefined> {
+  const { scope, anchor, chatId, chatType, larkAppId } = ctx;
+  await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  const dir = resolveForceTopicCurrentWorkingDir({ scope, anchor, chatId, larkAppId });
+  if (dir) return dir;
+  await ctx.reply(tr('daemon.force_topic_current_dir_missing', undefined, localeForBot(larkAppId)));
+  logger.warn(`[/t:${ctx.mode}] no current workingDir available for chat ${chatId}`);
   return undefined;
 }
 
@@ -5755,6 +5797,38 @@ function notifyAllowedUsersResolveFailure(
       }
     }
   })();
+}
+
+/**
+ * bots.json `welcomeMessage`：机器人首次成功上线（事件分发已启动）后私聊 owner 一次。
+ * 与 notifyAllowedUsersResolveFailure 同款 fire-and-forget + 限时，绝不阻塞启动；
+ * 失败释放认领，下次启动重试。各状态的日志由 deliverWelcomeMessageOnce 打。
+ */
+function sendStartupWelcomeMessages(coordinationMode: DurableCoordinationMode): void {
+  const plans = planStartupWelcomeMessages(getAllBots().map(bot => bot.config), {
+    coordinationMode,
+    resolvedOwnerOpenId: getOwnerOpenId,
+    configuredOwnerOpenId: getConfiguredOwnerOpenId,
+  });
+  for (const plan of plans) {
+    const { larkAppId } = plan;
+    if (plan.action === 'skip') {
+      logger.info(`[${larkAppId}] welcome message not sent: ${plan.reason === 'api_only'
+        ? 'core-only bot has no Feishu identity'
+        : 'BOTMUX_COORDINATION_MODE=primary replicas do not share the delivery record'}`);
+      continue;
+    }
+    void deliverWelcomeMessageOnce({
+      dataDir: config.session.dataDir,
+      larkAppId,
+      message: plan.message,
+      recipient: plan.recipient,
+      send: (openId, text, { uuid, signal }) =>
+        sendUserMessage(larkAppId, openId, text, 'text', uuid, { timeoutMs: 10_000, signal }),
+    }).catch(err => {
+      logger.warn(`[${larkAppId}] welcome message skipped: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
 }
 
 function scheduleAllowedUsersResolveRetry(larkAppId: string, attempt = 1): void {
@@ -9409,6 +9483,17 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   if (!ds.managedTurnOrigin?.turnId || ds.workerGeneration === undefined) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_origin_unproven' });
   }
+  // Every fire of a task aimed at the source group posts there, so a silent
+  // listener task may only schedule into other groups.
+  if (isSilentMessageListenerSession(ds.session)) {
+    const rootChatId = typeof task.rootMessageId === 'string'
+      ? await getMessageChatId(ds.larkAppId, task.rootMessageId)
+      : task.chatId;
+    if (messageListenerSendBlocked(ds.session, task.chatId)
+      || messageListenerSendBlocked(ds.session, rootChatId ?? undefined)) {
+      return jsonRes(res, 403, { ok: false, error: 'silent_message_listener' });
+    }
+  }
   if (!trustedHost) {
     const pinned = capabilityScheduleWorkingDir(ds, task.workingDir);
     if (!pinned) return jsonRes(res, 403, { ok: false, error: 'schedule_working_dir_forbidden' });
@@ -10597,6 +10682,18 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
       ok: false,
       error: 'unsupported',
       detail: 'botmux ask requires a Feishu chat; this session has no Lark transport (apiOnly / HTTP virtual session)',
+    });
+  }
+
+  // Silent listener tasks must never surface an ask card in the source group.
+  // A non-retryable 403 makes the standalone CLI fail closed and lets hook
+  // adapters fall back to their native terminal prompt (Dashboard/terminal is
+  // the documented place to handle authorisation for these tasks).
+  if (askSession && isSilentMessageListenerSession(askSession.session)) {
+    return jsonRes(res, 403, {
+      ok: false,
+      error: 'silent_message_listener',
+      detail: '静默执行任务不能向来源群发送确认卡；请在 Dashboard/终端处理授权或异常',
     });
   }
 
@@ -25459,13 +25556,16 @@ async function startInitialPassthroughSession(args: {
   /** 本轮 inbound 进入 durable 队列（staging + append）后回调，供调用方翻转
    *  ingress 接纳标记——之后的 repo card / 状态回复失败不得再诱导重发。 */
   onDurablyAdmitted?: () => void;
+  /** `/th` `/tw` 生命周期头：目录取当前群会话目录而不是 bot 默认目录；`worktree` 再以它为基目录，
+   *  走与 `/tw <任务>` 同一条强制建 worktree 的路径。 */
+  lifecycle?: 'here' | 'worktree';
 }): Promise<void> {
   const {
     larkAppId, chatId, chatType, scope, anchor, messageId, replyRootId,
     parsed, promptResources, commandContent, senderOpenId, substitute, senderUnionId,
     memberUnionId, ownerOpenId, ownerUnionId, creatorOpenId, botSender,
     senderIsBot, cardlessForceTopicSeed, onDurablyAdmitted,
-    routeToCanonicalOwner,
+    routeToCanonicalOwner, lifecycle,
   } = args;
   if (!await enforceMessageQuotaForCliInput(larkAppId, chatId, senderOpenId, messageId, anchor, senderUnionId, memberUnionId, chatType, botSender, {
     promptContent: commandContent || parsed.content,
@@ -25473,6 +25573,18 @@ async function startInitialPassthroughSession(args: {
   })) {
     return;
   }
+  // 与常规建会话路径同序：过配额闸之后取目录；放在建会话之前，缺目录时不留会话行。
+  const lifecycleWorkingDir = lifecycle
+    ? await resolveForceTopicSlashWorkingDir({
+        scope, anchor, chatId, chatType, larkAppId, mode: lifecycle,
+        reply: text => sessionReply(anchor, text, 'text', larkAppId),
+      })
+    : undefined;
+  if (lifecycle && !lifecycleWorkingDir) return;
+  // 认领槽位与写 pending-repo journal 之间不能有 await：窗口内重启会按基目录恢复会话。
+  const lifecycleWorktree = lifecycle === 'worktree' && lifecycleWorkingDir
+    ? { force: true, ...await forceTopicWorktreeTarget(lifecycleWorkingDir, anchor), reuseExisting: true }
+    : undefined;
   // Reply attribution's is-bot. `resolvedSenderIsBot` is a BOOLEAN for the
   // legacy consumers that need one (pendingSender.type, quoteTargetSenderIsBot,
   // loser-handoff turn.senderIsBot). `resolvedSenderIsBotTriState` keeps
@@ -25513,10 +25625,12 @@ async function startInitialPassthroughSession(args: {
   fillNativeTopicId(session, scope, parsed.threadId);
   sessionStore.updateSession(session);
 
-  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+  const { pinnedWorkingDir, oncallEntry, inheritedFrom, pinnedFromBotDefault } = lifecycleWorkingDir
+    ? { pinnedWorkingDir: lifecycleWorkingDir, oncallEntry: undefined, inheritedFrom: null, pinnedFromBotDefault: false }
+    : await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
   // Auto-worktree: register PENDING (router buffers, no force-fork) and build the
   // worktree off the critical path (see willAutoWorktree / runAutoWorktreeCommit).
-  const autoWt = willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
+  const autoWt = lifecycle === 'worktree' || willAutoWorktree(larkAppId, pinnedWorkingDir, pinnedFromBotDefault);
   const ds: DaemonSession = {
     session,
     worker: null,
@@ -25565,6 +25679,7 @@ async function startInitialPassthroughSession(args: {
     stageClaimedPendingRepoSetup(activeSessions, ds, {
       mode: autoWt ? 'auto_worktree' : 'picker',
       ...(autoWt && pinnedWorkingDir ? { baseDir: pinnedWorkingDir } : {}),
+      ...lifecycleWorktree,
       turnId: messageId,
     });
   }
@@ -25581,7 +25696,7 @@ async function startInitialPassthroughSession(args: {
     ds.initialStartPending = false; // pendingRepo/worktree now owns buffering
     // 挂起态提交：worktree 建好后经 runAutoWorktreeCommit → commitRepoSelection 拉起
     // pendingRawInput 冷启动会话。detach → 立即返回，不阻塞本条消息处理。
-    startAutoWorktreePending(ds, { anchor, baseDir: pinnedWorkingDir, title: session.title, prompt: commandContent, operatorOpenId: ownerOpenId });
+    startAutoWorktreePending(ds, { anchor, baseDir: pinnedWorkingDir, title: session.title, prompt: commandContent, operatorOpenId: ownerOpenId, ...lifecycleWorktree });
     return;
   }
 
@@ -25597,7 +25712,9 @@ async function startInitialPassthroughSession(args: {
     forkReservedInitialRawSession(ds, availableBots);
     // fork 成功即开场已交给 CLI；fork 抛错则本轮只存在于内存，保持重发提示。
     onDurablyAdmitted?.();
-    const reason = oncallEntry
+    const reason = lifecycle
+      ? `/t ${lifecycle} current dir`
+      : oncallEntry
       ? `oncall-bound chat ${chatId}`
       : inheritedFrom
       ? `inherited from sibling session ${inheritedFrom.sessionId.substring(0, 8)} (app=${inheritedFrom.larkAppId ?? 'unknown'})`
@@ -25966,7 +26083,7 @@ async function prepareGroupBackground(data: any, ctx: RoutingContext): Promise<v
       configuredTrigger: !!ctx.commandTrigger,
       renderedPrompt: ctx.commandTrigger ? renderCommandTriggerPrompt(ctx.commandTrigger) : undefined,
     });
-    if (!query) return;
+    if (query === undefined) return;
     void ensureGroupContextRecallHealth(ctx.larkAppId, () => ensureMessageRecalledEventSubscribed(ctx.larkAppId));
     const ds = activeSessions.get(sessionKey(ctx.runtimeRoutingAnchor ?? ctx.anchor, ctx.larkAppId));
     if (ds && sessionPromptInjection(ds) === 'none') return;
@@ -26249,7 +26366,12 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       parsed.msgType,
       data.message?.content ?? '',
       parsed.content,
-      (text) => replyMessage(larkAppId, replyAnchorId, text, 'text'),
+      // A silent listener task keeps transcription progress and failures out of the source group.
+      (text) => {
+        if (!isMessageListenerTaskAnchor(anchor)) return replyMessage(larkAppId, replyAnchorId, text, 'text');
+        logger.debug(`[message-listener] silent task kept audio notice local: ${text}`);
+        return Promise.resolve('');
+      },
       parsed.senderId,
     );
     if (audioOutcome.kind === 'transcribed') {
@@ -26626,14 +26748,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // 直接在 `getSessionWorkingDir` 解析出的默认目录里起会话 —— 就是 command-handler 里
   // `!repoArg && ds.pendingRepo` 那条分支（选仓卡「直接开始」按钮的文本孪生）。
   const lifecycleWorkingDir = forceTopic && forceTopicMode !== 'default'
-    ? resolveForceTopicCurrentWorkingDir({
-        scope,
-        anchor,
-        chatId,
-        larkAppId,
-        currentSession: activeSessions.get(sessionKey(chatId, larkAppId))
-          ?? activeSessions.get(sessionKey(anchor, larkAppId)),
-      })
+    ? resolveForceTopicCurrentWorkingDir({ scope, anchor, chatId, larkAppId })
     : undefined;
   if (forceTopic && forceTopicMode !== 'default' && !lifecycleWorkingDir) {
     await sessionReply(
@@ -26736,7 +26851,11 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // audit trail points at a message that actually lives in the session's chat.
   const rootIdForStore = scope === 'thread' ? anchor : replyAnchorId;
   const initialTurnTitle = (messageListener?.replyCardTitle ?? (ctx.forwardSeedData ? followupContent : content)).substring(0, 50);
-  const session = sessionStore.createSession(chatId, rootIdForStore, initialTurnTitle, chatType, undefined, { source: 'ordinary-feishu' });
+  const session = sessionStore.createSession(chatId, rootIdForStore, initialTurnTitle, chatType, undefined, {
+    source: 'ordinary-feishu',
+    ...(messageListener?.replyMode === 'none'
+      ? { messageListenerRun: { sourceMessageId: messageId, replyMode: 'none' as const } } : {}),
+  });
   if (messageListener?.autoCloseAfterCompletion === true) session.messageListenerAutoClose = true;
   const now = Date.now();
   setDirectChatDisplayNameFromSender(session, chatType, newTopicSender);
@@ -27244,9 +27363,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       await handleTermLinkCommand(anchor, larkAppId, chatId, senderOpenId, commandContent, invocationDeps);
       return true;
     }
-    // `/tw /<passthrough>`：主干的 worktree 生命周期变体要先建 worktree 再起 CLI，所以不走
-    // 冷启动透传（那条路会直接在基目录 fork）；落到下面的常规建会话路径。
-    if (forceTopicMode !== 'worktree' && slashDecision.kind === 'passthrough') {
+    if (slashDecision.kind === 'passthrough') {
       if (slashDecision.delivery === 'cold_start') {
         await startInitialPassthroughSession({
           promptResources: resources,
@@ -27270,6 +27387,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
           // passthrough 也能让 bot→bot 的 --mention-back 直通不对称门禁。
           senderIsBot: isForeignBotSender,
           cardlessForceTopicSeed: forceTopic !== null,
+          lifecycle: forceTopicMode === 'default' ? undefined : forceTopicMode,
           // New-topic senders are humans here (mirrors the normal new-topic
           // spawn path, which assigns ownership unconditionally too).
           ownerOpenId: senderOpenId,
@@ -27327,6 +27445,22 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
         await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, invocationDeps, larkAppId);
         return true;
       }
+      // `/tw` + 预建型命令：worktree 在后台异步建，命令执行时会话还没有落地目录——
+      // /status 只能报基目录、/cd 会被随后建好的 worktree 盖掉、/close 之后 worktree
+      // 照建不误。没有说得通的组合语义，直接拒绝并告诉用户怎么做，不建任何会话。
+      if (forceTopicMode === 'worktree') {
+        await invocationDeps.sessionReply(anchor, tr('daemon.force_topic_worktree_command_unsupported', { cmd }, localeForBot(larkAppId)), 'text', larkAppId);
+        return true;
+      }
+      // `/th` + 预建型命令：与默认路径同一个命令会话（不建开场、不过配额闸），只是目录
+      // 钉在当前群会话目录上，话题里之后的真实任务从这里 fork。
+      const lifecycleWorkingDir = forceTopicMode === 'here'
+        ? await resolveForceTopicSlashWorkingDir({
+            scope, anchor, chatId, chatType, larkAppId, mode: forceTopicMode,
+            reply: text => invocationDeps.sessionReply(anchor, text, 'text', larkAppId),
+          })
+        : undefined;
+      if (forceTopicMode === 'here' && !lifecycleWorkingDir) return true;
       // Same rootMessageId reasoning as below in the main spawn path:
       // thread-scope MUST anchor on the thread root or sessionAnchorId() will
       // disagree with activeSessions's key and downstream card buttons silently
@@ -27362,7 +27496,9 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       // spawn path" (see resolvePinnedWorkingDir) — skipping it here also left
       // that write undone for the whole life of the chat, since later turns
       // reuse this session and never re-enter a spawn path.
-      const { pinnedWorkingDir, pinnedFromBotDefault } = await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+      const { pinnedWorkingDir, pinnedFromBotDefault } = lifecycleWorkingDir
+        ? { pinnedWorkingDir: lifecycleWorkingDir, pinnedFromBotDefault: false }
+        : await resolvePinnedWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
       // …EXCEPT when that dir would have triggered auto-worktree. There the bot
       // default is a worktree BASE, not a launch dir: the ordinary spawn paths
       // answer it with `pendingRepo` + a detached worktree build, which a daemon
@@ -32431,6 +32567,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   if (tmuxEnvScrub.removed.length > 0) {
     logger.info(`[tmux] scrubbed ${tmuxEnvScrub.removed.length} server-global env key(s): ${tmuxEnvScrub.removed.join(', ')}`);
   }
+  if (tmuxEnvScrub.updated.length > 0) {
+    logger.info(`[tmux] rewrote ${tmuxEnvScrub.updated.length} server-global env key(s): ${tmuxEnvScrub.updated.join(', ')}`);
+  }
   if (tmuxEnvScrub.failed.length > 0) {
     logger.warn(`[tmux] failed to scrub server-global env key(s): ${tmuxEnvScrub.failed.join(', ')}`);
   }
@@ -34642,6 +34781,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   for (const startDispatcher of startEventDispatchers) startDispatcher();
   if (!cfg.apiOnly) void closeSessionsInGoneChatsOnStartup({ larkAppId: cfg.larkAppId, activeSessions });
+  sendStartupWelcomeMessages(durableCoordinationRuntime?.mode ?? 'disabled');
   if (durableCoordinationRuntime?.mode === 'primary') {
     const deliverDurablePrimaryMessage = async (
       request: DurableSessionSendRequest,
@@ -35297,6 +35437,50 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     )(candidate),
     createClient: createDetachedLarkClient,
   });
+  // 决策看板上的群状态：本 bot 的会话读内存，其他 bot 的会话问所属 daemon（本机 HMAC）。
+  // 其他 bot 在哪些群里有会话从它们的会话库读（短缓存），状态本身只信所属 daemon 的回答。
+  let boardPeerSessions: { at: number; sessions: Session[] } | undefined;
+  const boardChatTasks: ChatTaskReaderDeps = {
+    ownAppId: () => cfg.larkAppId,
+    chatSessions: chatIds => {
+      const wanted = new Set(chatIds);
+      const out = new Map<string, ChatSessionRef[]>();
+      const add = (s: Session, appId: string): void => {
+        if (!s.chatId || !wanted.has(s.chatId)) return;
+        const list = out.get(s.chatId) ?? [];
+        out.set(s.chatId, list);
+        const closedAt = s.closedAt ? Date.parse(s.closedAt) : NaN;
+        list.push({ sessionId: s.sessionId, larkAppId: appId, status: s.status, ...(Number.isFinite(closedAt) ? { closedAt } : {}) });
+      };
+      for (const s of sessionStore.listSessionsStrict()) add(s, cfg.larkAppId);
+      const now = Date.now();
+      if (!boardPeerSessions || now - boardPeerSessions.at > 15_000) {
+        const snapshot = sessionStore.loadAllSessionsSnapshot({ dataDir: config.session.dataDir, fallbackAppId: cfg.larkAppId });
+        let configured: Set<string> | undefined;
+        try { configured = new Set(loadBotConfigsCached().map(bot => bot.larkAppId)); } catch { configured = undefined; }
+        boardPeerSessions = { at: now, sessions: peerSessions(snapshot.values(), cfg.larkAppId, configured) };
+      }
+      for (const s of boardPeerSessions.sessions) add(s, s.larkAppId!);
+      return out;
+    },
+    ownRow: sessionId => {
+      const ds = findActiveBySessionId(sessionId);
+      if (ds) return composeRowFromActive(ds, { includeTokenUsage: false });
+      const s = sessionStore.getSession(sessionId);
+      return s?.status === 'active' ? composeRowFromPersistedActive(s, { includeTokenUsage: false }) : undefined;
+    },
+    peerRow: async (appId, sessionId) => {
+      const peer = findOnlineDaemon(appId);
+      if (!peer) return undefined;
+      const res = await fetchDaemonIpc(peer.ipcPort, `/api/sessions/${encodeURIComponent(sessionId)}`, { signal: AbortSignal.timeout(2_000) });
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        return undefined;
+      }
+      const body = await res.json() as { session?: unknown };
+      return body.session && typeof body.session === 'object' ? body.session as Record<string, unknown> : undefined;
+    },
+  };
   const decisionBoard = new DecisionBoardService({
     dataDir: config.session.dataDir,
     larkAppId: () => cfg.larkAppId,
@@ -35336,9 +35520,111 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         || (error instanceof TopicSendError && error.code === 'TOPIC_SEND_BLOCKED'),
     },
     prState: createPrStateLookup({ log: message => logger.info(message) }),
+    chatTasks: boardChatTasks,
   });
   setDecisionBoardService(decisionBoard);
+  // 子任务提醒：本 daemon 记下本轮结果或举手时，按群转给本机开着「子任务提醒」的管家
+  // （本 bot 直接调用，其他 bot 走本机 IPC）。管家端防抖、重新核对、去重。
+  onSessionTaskEvent(({ chatId }) => {
+    let bots: readonly BotConfig[];
+    try { bots = loadBotConfigsCached(); } catch { return; }
+    for (const bot of bots) {
+      if (!stewardTaskHintsOn(bot.steward) || bot.steward.chatId === chatId) continue;
+      if (bot.larkAppId === cfg.larkAppId) {
+        decisionBoard.noteTaskEvent(chatId);
+        continue;
+      }
+      const peer = findOnlineDaemon(bot.larkAppId);
+      if (!peer) continue;
+      void fetchDaemonIpc(peer.ipcPort, '/api/steward/task-event', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chatId }),
+        signal: AbortSignal.timeout(3_000),
+      }).then(r => r.body?.cancel()).catch(err => logger.debug(`[decision-board] task event to ${bot.larkAppId} failed: ${err?.message ?? err}`));
+    }
+  });
   setDecisionCardService(decisionBoard);
+
+  // 群秘书（/secretary on）：旁听开启群的消息 + 每 10 秒拉一次本机会话快照，摘要以静默回合
+  // 送进本 bot 在该群的 chat 级会话。bot 级开关关着或没有开启的群时每拍只做一次查表。
+  let secretaryRemoteAppPeer = new Map<string, SecretaryPeer>();
+  setGroupSecretaryRuntime(createGroupSecretaryRuntime({
+    larkAppId: cfg.larkAppId,
+    enabled: () => getBot(cfg.larkAppId).config.groupSecretaryEnabled === true,
+    selfOpenId: () => getBot(cfg.larkAppId).botOpenId,
+    canTalk: (chatId, openId) => evaluateTalk(cfg.larkAppId, chatId, openId, undefined, undefined, 'group').allowed,
+    fetchSnapshot: () => fetchObserveSnapshot(),
+    fetchTranscript: async (appId, sessionId, chatId) => {
+      const local = await fetchSessionRecentTranscript(appId, sessionId);
+      if (local) return local;
+      const peer = appId ? secretaryRemoteAppPeer.get(appId) : undefined;
+      return peer && appId ? fetchRemoteSecretaryTranscript(peer, appId, sessionId, chatId) : undefined;
+    },
+    readMarker: chatId => readSecretaryMarker(cfg.larkAppId, chatId),
+    writeMarker: (chatId, appId, opts) => writeSecretaryMarker(cfg.larkAppId, chatId, appId, opts),
+    fetchRemoteViews: async chatIds => {
+      const peers = listSecretaryPeers(config.session.dataDir);
+      if (peers.length === 0 || chatIds.length === 0) return [];
+      const remote = await fetchRemoteSecretarySessions(peers, chatIds);
+      secretaryRemoteAppPeer = remote.appPeer;
+      return remote.views;
+    },
+    fetchRecentMessages: chatId => listChatMessages(cfg.larkAppId, chatId, 50),
+    groupContextEnabled: (chatId: string) => getGroupContextSettings(cfg.larkAppId, chatId).enabled,
+    manualWatches: () => listSecretaryWatches(cfg.larkAppId),
+    deliver: async input => {
+      // 秘书回合没有触发消息，Context Sharing 默认拿不到锚点（只会注入空壳）。这里替本轮按
+      // 「整群」范围准备一份增量：与 @ 秘书的普通回合共用同一条已投递记录，互不重复。
+      if (getGroupContextSettings(cfg.larkAppId, input.chatId).enabled) {
+        const ds = activeSessions.get(sessionKey(input.chatId, cfg.larkAppId));
+        const cliId = ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session.cliId ?? getBot(cfg.larkAppId).config.cliId;
+        try {
+          await prepareGroupContextForTurn({
+            appId: cfg.larkAppId, chatId: input.chatId, turnId: input.turnId,
+            query: '群秘书：通览全群最新动态', createTime: Date.now(), scope: 'all',
+            ...(ds ? {
+              sessionId: ds.session.sessionId,
+              epoch: groupContextEpoch(ds.session.sessionId, ds.session.cliSessionId, cliId, input.turnId),
+            } : {}),
+          });
+        } catch {
+          logger.warn('[group-secretary] group context preparation failed; delivering without it');
+        }
+      }
+      return withBotTurnAdmission(cfg.larkAppId, () => deliverOwnerBatchTurn({
+      larkAppId: cfg.larkAppId,
+      chatId: input.chatId,
+      turnId: input.turnId,
+      prompt: input.prompt,
+      announcement: { texts: [], images: [] },
+      attachments: [],
+      ownerOpenId: input.ownerOpenId,
+      sessionTitle: tr('cmd.secretary.session_title', undefined, localeForBot(cfg.larkAppId)),
+      silent: true,
+    }, activeSessions, refreshCliVersion, {
+      prepareTurnIdentity: (session, turnId) => prepareTurnCliIdentity(session, turnId),
+    }));
+    },
+    // 话题巡查：回合投进秘书在该话题的 thread 会话（落点天然是这个话题），巡查完关掉新建的会话。
+    deliverPatrol: input => withBotTurnAdmission(cfg.larkAppId, () => deliverOwnerBatchTurn({
+      larkAppId: cfg.larkAppId,
+      chatId: input.chatId,
+      turnId: input.turnId,
+      prompt: input.prompt,
+      announcement: { texts: [], images: [] },
+      attachments: [],
+      ownerOpenId: input.ownerOpenId,
+      sessionTitle: tr('cmd.secretary.patrol_session_title', undefined, localeForBot(cfg.larkAppId)),
+      silent: true,
+      threadRootId: input.threadRoot,
+    }, activeSessions, refreshCliVersion, {
+      prepareTurnIdentity: (session, turnId) => prepareTurnCliIdentity(session, turnId),
+    })),
+    closePatrolSession: sessionId => closeSessionForBackgroundCleanup(sessionId, 'group-secretary patrol finished'),
+    log: (level, message) => (level === 'warn' ? logger.warn(message) : logger.info(message)),
+  }));
+
   // 「自动发现可以关的项」：管家开了这个开关才真正干活（sweepHints 内部判断），没开的 bot 每轮只读一次配置。
   // 5 分钟一轮：PR 合入后十来分钟内出提示（开着的 PR 每 10 分钟最多查一次，见 github-pr-state.ts），
   // 复查时间到点后最多晚一轮；不需要更密。

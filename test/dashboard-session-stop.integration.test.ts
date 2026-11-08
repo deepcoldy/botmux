@@ -184,7 +184,8 @@ describe('Dashboard session stop HTTP integration', () => {
     // 跨站 Origin（含同站不同端口、Origin: null）带着合法 cookie 也到不了 owner daemon。
     await request(`${base}/api/settings`, { method: 'PUT', headers: auth, body: '{"publicReadOnly":false}' });
     for (const origin of ['https://evil.example', 'http://127.0.0.1:1', 'null']) {
-      for (const route of [suspendPath, interruptPath, '/api/sessions/cleanup-idle', '/api/sessions/create', '/api/trigger', '/api/asks/answer']) {
+      for (const route of [suspendPath, interruptPath, '/api/sessions/cleanup-idle', '/api/sessions/create', '/api/trigger', '/api/asks/answer',
+        '/api/schedules', '/api/trigger-logs/prune']) {
         const res = await request(base + route, { method: 'POST', headers: { ...auth, origin }, body: '{}' });
         expect(res.status).toBe(403);
         expect(res.body).toEqual({ ok: false, error: 'control_origin_forbidden' });

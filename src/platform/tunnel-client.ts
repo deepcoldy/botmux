@@ -473,7 +473,7 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
  * 把一条胜出的数据通道 WebSocket 裸桥接到本地 dashboard 的 TCP 端口。
  *
  * 手动事件桥接，不用 `ws` 的 `createWebSocketStream()`：那个 API 在 **Bun 里直接抛
- * `Error("Not supported yet in Bun")`**（实测 bun 1.4.0 抛、node v22.21.1 正常）。
+ * `Error("Not supported yet in Bun")`**（实测 bun 1.4.0–1.4.3 抛、1.4.4 起可用、node v22.21.1 正常）。
  * 而编译版单文件二进制跑的就是 Bun —— 于是控制通道连上了（`new WebSocket` 在 Bun 下
  * 正常，日志照打「隧道已连接平台」、平台侧显示机器在线），但每次真要转发请求都崩在桥接
  * 那一行，数据通道永远建不起来：平台侧 Dashboard 整站打不开，而本地直连不经隧道故一切
@@ -485,7 +485,8 @@ export function startPlatformTunnelClient(opts: TunnelClientOptions): TunnelClie
  * 照送、`send(data, cb)` 的回调在「交给内部队列」时就结算（对端应用层实收 0.0MB 时
  * 400 个回调已全部回来，所以自计数也恒为 0）、`ws` shim 无 `_socket` 可看
  * `writableLength`、Bun 原生 `globalThis.WebSocket` 的 `bufferedAmount` 同样恒 0。
- * ⟹ **ws 层没有任何可用的已缓冲量信号**。
+ * ⟹ **ws 层没有任何可用的已缓冲量信号**。bun 1.4.4 重写 ws 后 `bufferedAmount` 与发送回调
+ * 都反映真实写出量了；下面的协议层确认不挑运行时和版本，先保持不动。
  *
  * 所以改用**协议层确认**：超水位后 `ping()`，只有收到 `pong` 才继续读 TCP。pong 必须由
  * 对端真的读到我们的字节后才可能回来，因此它是「平台确实在消费」的证据，且在 Node 与
@@ -569,10 +570,11 @@ export function bridgeDataChannel(winner: WebSocket, dashboardPort: number): voi
 
   // ── 平台 → 本地 ──
   // TCP 侧写不动时暂停 WebSocket 读取，drain 后恢复。
-  // ⚠️ `winner.pause()` 在 Bun 下是 no-op（见函数注释），所以**这个方向在编译版里仍然没有
-  // 闸门**：平台灌得比本地 dashboard 收得快时，帧会堆在进程里。下面反向那条 ping 闸门只管
-  // 「本地 → 平台」，**不解决这一侧**，别把它读成这一侧的兜底。保留 pause/resume 是因为它
-  // 在 Node（源码/npm 形态）下真实有效且在 Bun 下无害。编译态这一侧待 follow-up。
+  // ⚠️ `winner.pause()` 在 bun 1.4.0 下是 no-op（见函数注释）；1.4.3 起会停发 message，但是否
+  // 把背压传到 TCP 没实测过，所以**编译版里别指望这个方向有闸门**：平台灌得比本地 dashboard
+  // 收得快时，帧可能堆在进程里。下面反向那条 ping 闸门只管「本地 → 平台」，**不解决这一侧**，
+  // 别把它读成这一侧的兜底。保留 pause/resume 是因为它在 Node（源码/npm 形态）下真实有效且在
+  // Bun 下无害。编译态这一侧待 follow-up。
   winner.on('message', (data: RawData) => {
     const buf = toBuffer(data);
     if (!buf.length) return;
