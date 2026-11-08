@@ -606,6 +606,7 @@ import {
 } from './session-preview.js';
 import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { ChatRenameCooldown, chatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
+import { isSilentMessageListenerSession } from './message-listener-silence.js';
 import { executeChatRename } from './chat-rename-operation.js';
 import { authorizeHumanManager } from './human-manager-authorization.js';
 import { changeChatManager, getChatManagerStatus } from '../services/chat-manager.js';
@@ -4038,6 +4039,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   if (sessionTransportDisabled(ds)) return jsonRes(res, 200, { ok: false, error: 'no_feishu_transport' });
   if (ds.chatType !== 'group') return jsonRes(res, 400, { ok: false, error: 'not_group_chat' });
+  // Renaming the session's own group is a visible source-group write; a silent
+  // listener task must not change its source group. Human dashboard management
+  // still uses the host-only PUT /api/groups/:chatId/name route.
+  if (isSilentMessageListenerSession(ds.session)) {
+    return jsonRes(res, 403, { ok: false, error: 'silent_message_listener' });
+  }
   const normalized = normalizeLarkChatName(body.name);
   if (!normalized.ok) return jsonRes(res, 400, normalized);
 

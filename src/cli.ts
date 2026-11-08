@@ -10670,6 +10670,13 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
     sessionId,
     chatId,
     rootMessageId,
+    // Riff/mojo sandboxes have no local session store, so the frozen listener
+    // identity must be rebuilt from the env anchor: without it `history` and
+    // the source-topic availability checks would hand the internal `ml:` id
+    // to Lark read APIs instead of the real source message id.
+    ...(isMessageListenerTaskAnchor(rootMessageId)
+      ? { messageListenerRun: { sourceMessageId: rootMessageId.slice(3), replyMode: 'none' as const } }
+      : {}),
     title: 'riff',
     status: 'active',
     createdAt: new Date().toISOString(),

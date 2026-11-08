@@ -160,3 +160,58 @@ describe('other source-group write paths from silent listener tasks', () => {
     }
   });
 });
+
+describe('riff/mojo env-mode silent tasks (no local session store)', () => {
+  // The sandbox rebuilds SessionData from env only; the frozen listener
+  // identity must be reconstructed from the ml: anchor, not silently dropped.
+  function spawnRiffEnv(args: string[]) {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-riff-listener-'));
+    try {
+      const dataDir = join(root, 'data');
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: 'riff-sid', turnId: 'om_turn' }));
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{ larkAppId: 'cli_riff', larkAppSecret: 'secret', cliId: 'riff', replyCardMode: 'legacy' }]));
+      // Deliberately NO seedPersistedSessionRows: riffModeSession must kick in.
+      const result = spawnSyncTsScript(fixture, args, {
+        cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+        env: { ...process.env, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_LARK_APP_ID: 'cli_riff', BOTMUX_LARK_APP_SECRET: 'secret',
+          BOTMUX_SESSION_ID: 'riff-sid', BOTMUX_CHAT_ID: 'oc_source',
+          BOTMUX_ROOT_MESSAGE_ID: 'ml:om_source', BOTMUX_SESSION_SCOPE: 'thread',
+          BOTMUX_TURN_ID: 'om_turn',
+          BOTMUX_TEST_CAPTURE_HTTP: '1', BOTMUX_TEST_LIST_MESSAGES: '1' },
+      });
+      return { root, result };
+    } catch (err) {
+      rmSync(root, { recursive: true, force: true });
+      throw err;
+    }
+  }
+
+  it.each([
+    ['thread scope', ['history', '--limit', '5']],
+    ['ambient scope', ['history', '--scope', 'ambient', '--limit', '5']],
+  ])('history in %s reads the real source message id, never the ml: anchor', (_label, args) => {
+    const { root, result } = spawnRiffEnv(args);
+    try {
+      expect(result.status, result.stderr).toBe(0);
+      const queriedPaths = result.stdout.split('\n')
+        .filter(line => line.startsWith('CAPTURE_HTTP='))
+        .map(line => JSON.parse(line.slice('CAPTURE_HTTP='.length)).path as string);
+      expect(queriedPaths.some(path => /ml(?::|%3a)/i.test(path))).toBe(false);
+      expect(queriedPaths.some(path => path.includes('/messages/om_source'))).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('still blocks a default send to the source group without a local session row', () => {
+    const { root, result } = spawnRiffEnv(['send', '--no-mention', '--response-kind', 'progress', 'result']);
+    try {
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('silent_message_listener');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
