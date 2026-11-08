@@ -231,6 +231,7 @@ export function recoveryCauseI18nKey(code: string | undefined): string {
     return 'card.recovery_failed.cause.provider_auth';
   }
   if (code === 'provider_invalid_request') return 'card.recovery_failed.cause.provider_rejected';
+  if (code === 'provider_image_too_small') return 'card.recovery_failed.cause.image_too_small';
   if (code.includes('capacity')) return 'card.recovery_failed.cause.capacity';
   if (code === 'recovery_outcome_unverified') return 'card.recovery_failed.cause.outcome_unverified';
   if (code === 'recovery_restart_unverified' || code === 'recovery_dispatch_interrupted') {

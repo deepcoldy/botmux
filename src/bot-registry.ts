@@ -1941,6 +1941,8 @@ export interface BotConfig {
    * identity, simply have none and fall back to the resolved allowlist.
    */
   ownerOpenId?: string;
+  /** 首次成功上线后私聊 owner 一次的欢迎语；已发送记录在 dataDir，见 services/welcome-message.ts。 */
+  welcomeMessage?: string;
   allowedChatGroups?: string[];
   /** Oncall bindings: chat_id → default workingDir. Any group member can talk; allowedUsers still gates card buttons / daemon commands. */
   oncallChats?: OncallChat[];
@@ -2412,6 +2414,12 @@ export interface BotConfig {
    * 不被此开关阻断（拆除与只读始终允许）。
    */
   chatManagerEnabled?: boolean;
+  /**
+   * 群秘书（`/secretary on`）总开关。仅当显式为 true 时，群里才能用 `/secretary on|takeover`
+   * 把本 bot 设为群秘书，后台旁听与巡检才运行。默认（undefined/false）= 关闭，老用户行为不变；
+   * `/secretary off|status` 不被此开关阻断。
+   */
+  groupSecretaryEnabled?: boolean;
   /**
    * 管家（决策看板）配置。仅 `enabled === true` 时本 bot 是管家：它的会话能用
    * `botmux board` 写看板，owner 在 Dashboard 提交的批次送进 `chatId` 群的 chat 级会话，
@@ -4358,6 +4366,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       ownerOpenId: typeof entry.ownerOpenId === 'string' && entry.ownerOpenId.startsWith('ou_')
         ? entry.ownerOpenId
         : undefined,
+      welcomeMessage: typeof entry.welcomeMessage === 'string' && entry.welcomeMessage.trim()
+        ? entry.welcomeMessage.trim()
+        : undefined,
       allowedChatGroups,
       oncallChats,
       defaultOncall,
@@ -4487,6 +4498,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
       chatManagerEnabled: entry.chatManagerEnabled === true || undefined,
+      groupSecretaryEnabled: entry.groupSecretaryEnabled === true || undefined,
       // 非法的 steward 配置按关处理（不阻断 bot 启动）；Dashboard / /config 写入时已校验。
       steward: (() => {
         const parsed = normalizeStewardConfig(entry.steward);

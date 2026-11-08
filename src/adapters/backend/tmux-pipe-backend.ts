@@ -58,6 +58,29 @@ function shellescape(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
+/** tmux argv for typing `text` literally into `target`.
+ *
+ *  tmux treats an argument whose LAST character is `;` as a command separator
+ *  and strips it, even under `send-keys -l --` and even when argv comes from
+ *  execFile (no shell involved): `send-keys -l -- 'X;'` types `X`, a lone `;`
+ *  types nothing. The `\;` escape cannot be used generically either: tmux
+ *  also unescapes backslashes before it (`'B\\;'` types `B;`). Callers chunk
+ *  long input (Claude Code: 96 UTF-8 bytes per send), so any chunk or line that
+ *  happens to end in `;` silently lost it; HTML-escaped group context (`&#10;`,
+ *  `&lt;`, `&gt;`) made that frequent. Send trailing semicolons as hex keys
+ *  (`send-keys -H 3b`, tmux >= 3.0) in the same tmux invocation instead. */
+export function literalSendKeysArgs(target: string, text: string, version = getTmuxVersionCached()): string[] {
+  const body = text.replace(/;+$/, '');
+  const semicolons = text.length - body.length;
+  // tmux < 3.0 has no `-H`: keep the old argv there (loses the `;` instead of
+  // failing the whole send). An unknown version is assumed current.
+  if (semicolons === 0 || (version !== null && !tmuxVersionAtLeast(version, 3, 0))) {
+    return ['send-keys', '-t', target, '-l', '--', text];
+  }
+  const hex = ['send-keys', '-t', target, '-H', ...Array.from({ length: semicolons }, () => '3b')];
+  return body ? ['send-keys', '-t', target, '-l', '--', body, ';', ...hex] : hex;
+}
+
 /** Quote one argument of a command string that tmux parses itself (an if-shell
  *  branch). tmux 2.x has no backslash escapes outside quotes, so the `'\''`
  *  form above splits there; every tmux unescapes `\\`, `\"`, `\$`, `\~` inside
@@ -896,7 +919,7 @@ export class TmuxPipeBackend implements SessionBackend {
     if (this.exited) return false;
     this.exitCopyModeIfNeeded();
     return this.guardedSend('send-keys (text)', () => {
-      execFileSync('tmux', [...this.tmuxArgs, 'send-keys', '-t', this.paneTarget, '-l', '--', text], {
+      execFileSync('tmux', [...this.tmuxArgs, ...literalSendKeysArgs(this.paneTarget, text)], {
         stdio: 'ignore',
         timeout: 5000,
         env: tmuxEnv(),
@@ -922,7 +945,7 @@ export class TmuxPipeBackend implements SessionBackend {
     const args: string[] = [];
     for (let i = 0; i < lines.length; i++) {
       if (i > 0) args.push(';');
-      args.push('send-keys', '-t', this.paneTarget, '-l', '--', lines[i]);
+      args.push(...literalSendKeysArgs(this.paneTarget, lines[i]));
       if (i < lines.length - 1) {
         args.push(';');
         args.push('send-keys', '-t', this.paneTarget, softNewlineKey);

@@ -75,6 +75,7 @@ Two bots, one on Claude Code and one on Codex:
 | The live card is too noisy | `disableStreamingCard`, `hiddenStreamingCardButtons` |
 | One card per turn for both progress and answer | `replyCardMode: "unified"` |
 | Start working without being @-mentioned | `autoStartOnNewTopic`, `autoStartOnGroupJoin` |
+| DM the owner a welcome message when the bot first comes online | `welcomeMessage` (see [Welcome message](#welcome-message)) |
 | Watch an alert group and handle every alert | Group message listener (see [Group message listener](#message-listener)) |
 | Hand off to another bot when quota runs out | `quotaFallbackBot` |
 | Stop botmux from adding anything to the prompt | `promptInjection: "none"` |
@@ -647,6 +648,14 @@ By default a bot only starts working when @-mentioned. These fields make it more
 - No shell; for pipes or redirects write `bash -c '…'`. Only a minimal set of environment variables is passed (no app secrets).
 - stdin receives JSON `{event:"chat.bot_added", larkAppId, chatId, operatorOpenId, emittedAt}`; the environment variables `BOTMUX_JOIN_CHAT_ID` / `BOTMUX_JOIN_LARK_APP_ID` / `BOTMUX_JOIN_OPERATOR_OPEN_ID` are also set.
 - It's killed if it hasn't finished after 10 minutes.
+
+### Welcome message (`welcomeMessage`) {#welcome-message}
+
+Set it to some text and the bot DMs its primary admin (see `ownerOpenId`) once after it first comes online. Set it with `--welcome-message "…"` or `--welcome-message-file <file>` on `botmux setup add` / `botmux setup edit`; `--welcome-message -` on edit clears it. It can't be edited in the Dashboard yet. The value of `--welcome-message` is always sent as written, so text starting with `@` is never treated as a file path.
+
+- Delivery is recorded in `welcome-sent/<AppID>.json` under the daemon data dir. Once sent, restarts don't resend it, and neither does changing the text. Deleting that file makes it send again, but Feishu dedupes a resend less than 1 hour after the previous one.
+- A failed send, or an admin who can't be resolved yet, doesn't block startup; the next start retries.
+- Core-only (`apiOnly`) bots and multi-replica deployments (`BOTMUX_COORDINATION_MODE=primary`, where replicas don't share the delivery record) don't send it; the daemon log says why.
 
 ## Group message listener {#message-listener}
 
