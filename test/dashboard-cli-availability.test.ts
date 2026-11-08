@@ -2,6 +2,7 @@ import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BotAgentSection } from '../src/dashboard/web/bot-defaults-page.js';
+import { BotOnboardingDialog } from '../src/dashboard/web/bot-onboarding.js';
 import { fetchCliAvailability } from '../src/dashboard/web/cli-availability.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -94,6 +95,29 @@ describe('selected Dashboard CLI availability', () => {
     }
     vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('offline'); }));
     expect(await fetchCliAvailability('traex')).toBeNull();
+  });
+});
+
+describe('Bot onboarding dialog probes', () => {
+  const cliProbeUrls = (spy: ReturnType<typeof vi.fn>) => spy.mock.calls
+    .map(([url]) => String(url))
+    .filter(url => url.startsWith('/api/cli-options/availability') || url.startsWith('/api/cli-options/models'));
+
+  it('does not probe CLI availability or models while the always-mounted dialog is closed', async () => {
+    const fetchSpy = vi.fn(async () => ({ ok: false, status: 401, json: async () => ({}) }));
+    vi.stubGlobal('fetch', fetchSpy);
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(BotOnboardingDialog, { open: false, onClose: vi.fn() }));
+    });
+    renderers.push(renderer);
+    expect(cliProbeUrls(fetchSpy)).toEqual([]);
+
+    await act(async () => {
+      renderer.update(React.createElement(BotOnboardingDialog, { open: true, onClose: vi.fn() }));
+    });
+    expect(cliProbeUrls(fetchSpy).some(url => url.startsWith('/api/cli-options/availability'))).toBe(true);
+    expect(cliProbeUrls(fetchSpy).some(url => url.startsWith('/api/cli-options/models'))).toBe(true);
   });
 });
 

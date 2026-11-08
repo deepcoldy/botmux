@@ -10,6 +10,9 @@ import type { WorkflowDraftView } from '../../workflows/v3/draft-service.js';
 import type { WorkflowDraftInitiator, WorkflowDraftPhase, WorkflowDraftQuestion, WorkflowDraftTurn } from '../../workflows/v3/draft-store.js';
 import type { WorkflowOrchestratorBotOption } from '../workflow-drafts-api.js';
 import type { V3Gate2BotPlanRow, V3RosterBot, V3RosterExclusion } from '../../workflows/v3/bot-assignment.js';
+import { extractFailureCode, maskFailureText, type WorkflowDraftFailureCategory, type WorkflowDraftFailureStep } from '../../workflows/v3/draft-failure.js';
+import type { WorkflowDraftFailureSummary, WorkflowDraftHandoffRecord } from '../../workflows/v3/draft-store.js';
+import { botDefaultsHref } from './bot-defaults.js';
 
 // ─── 路由（E13）──────────────────────────────────────────────────────────
 
@@ -109,6 +112,8 @@ export function draftErrorKey(code: string): string | undefined {
     // D5 模板
     'unknown_run', 'template_run', 'template_not_found', 'template_scope', 'template_not_published',
     'bad_params', 'template_invalid', 'not_owner', 'save_conflict', 'unsafe_literals', 'library_unavailable',
+    // 换编排 Bot
+    'handoff_pending',
   ]);
   return known.has(code) ? `workflow.draft.err.${code}` : undefined;
 }
@@ -118,6 +123,8 @@ export function draftErrorKey(code: string): string | undefined {
 export interface OrchestratorOptionState {
   larkAppId: string;
   label: string;
+  name: string;
+  cliId?: string;
   /** 不能选时的原因文案键或原文（已本地化由调用方处理）。 */
   disabledReason?: { key: string; fallback: string };
 }
@@ -133,14 +140,15 @@ export function orchestratorOptionStates(
 ): OrchestratorOptionState[] {
   return bots.map((bot) => {
     const label = bot.cliId ? `${bot.name} · ${bot.cliId}` : bot.name;
+    const base = { larkAppId: bot.larkAppId, label, name: bot.name, ...(bot.cliId ? { cliId: bot.cliId } : {}) };
     if (bot.unavailable) {
-      return { larkAppId: bot.larkAppId, label, disabledReason: { key: `workflow.draft.unavailable.${bot.unavailable.code}`, fallback: bot.unavailable.why } };
+      return { ...base, disabledReason: { key: `workflow.draft.unavailable.${bot.unavailable.code}`, fallback: bot.unavailable.why } };
     }
     const check = checks.get(bot.larkAppId);
     if (check?.state === 'failed' && !check.retryable) {
-      return { larkAppId: bot.larkAppId, label, disabledReason: { key: draftErrorKey(check.error) ?? check.error, fallback: check.error } };
+      return { ...base, disabledReason: { key: draftErrorKey(check.error) ?? check.error, fallback: check.error } };
     }
-    return { larkAppId: bot.larkAppId, label };
+    return base;
   });
 }
 
@@ -482,6 +490,10 @@ export function assignableRows(nodeId: string, rows: readonly V3Gate2BotPlanRow[
 export interface BotChoice {
   larkAppId: string;
   label: string;
+  /** 可搜索选择器用：显示名、CLI、主 Bot 标记分开给。 */
+  name: string;
+  cliId?: string;
+  suffix?: string;
   disabledWhy?: string;
 }
 
@@ -494,8 +506,11 @@ export function executorBotChoices(
     ...roster.bots.map((bot) => ({
       larkAppId: bot.larkAppId,
       label: `${bot.name} · ${bot.cli}${bot.main ? mainSuffix : ''}`,
+      name: bot.name,
+      cliId: bot.cli,
+      ...(bot.main && mainSuffix ? { suffix: mainSuffix } : {}),
     })),
-    ...roster.excluded.map((entry) => ({ larkAppId: entry.larkAppId, label: entry.name, disabledWhy: entry.why })),
+    ...roster.excluded.map((entry) => ({ larkAppId: entry.larkAppId, label: entry.name, name: entry.name, disabledWhy: entry.why })),
   ];
 }
 
@@ -588,4 +603,156 @@ export function formatDraftTime(iso: string): string {
   if (Number.isNaN(d.getTime())) return iso;
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// ─── 编排失败：哪个 Bot、什么原因、出路 ─────────────────────────────────
+
+/** 页面要说的那次失败：daemon 记下的结构化原因，或（旧草稿）从报错字符串里只取错误码。 */
+export interface DraftFailureDisplay {
+  category: WorkflowDraftFailureCategory;
+  code?: string;
+  step: WorkflowDraftFailureStep;
+  larkAppId: string;
+  cliId?: string;
+  /** Bot 配置（bots.json）里写了 model 才有；没配不推导、不显示。 */
+  model?: string;
+  at?: string;
+  /** 原始报错（daemon 已脱敏、截断；旧草稿取报错字符串，页面再脱敏一次）。 */
+  detail?: string;
+  /** 终端输出的最后一段（纯文本，已脱敏、截断）。 */
+  terminalTail?: string;
+  /** 出错的澄清会话：页面用现有的只读终端链接（view-link）打开它。 */
+  sessionId?: string;
+  /** 旧草稿：只有字符串 error，原因按「未知」。 */
+  legacy: boolean;
+}
+
+/** 页面上原始报错的长度上限（与 daemon 记录的上限一致）。 */
+const FAILURE_DETAIL_MAX = 2000;
+
+/** 旧草稿里的报错原文：页面自己脱敏、截断后再显示。 */
+function legacyDetail(text: string | undefined): string | undefined {
+  const masked = text ? maskFailureText(text).trim() : '';
+  if (!masked) return undefined;
+  return masked.length <= FAILURE_DETAIL_MAX ? masked : `${masked.slice(0, FAILURE_DETAIL_MAX - 1)}…`;
+}
+
+/** 不算失败、页面另有说法的澄清报错（会话断开有「继续」，发送超时有系统消息）。 */
+const ROUTINE_CLARIFY_ERRORS = new Set(['会话已断开', '发送超时']);
+
+/**
+ * 要展示的失败，只在还能补救的阶段（澄清 / 待确认需求 / 待编排）：
+ *   - daemon 记下的 `failure`；
+ *   - 旧草稿只有 `clarify.error`：原因「未知」，错误码取字符串里的码（不显示原文）；
+ *   - 旧草稿 Architect 失败：超时按「超时」，其余「未知」。换编排 Bot 之前那次
+ *     Architect 是原来那个 Bot 跑的，不算到新 Bot 头上（新 Bot 自己失败会另记 `failure`）。
+ */
+export function draftFailureOf(
+  view: Pick<WorkflowDraftView, 'phase' | 'orchestratorAppId' | 'clarify' | 'failure' | 'architect' | 'handoffs'>,
+): DraftFailureDisplay | undefined {
+  if (!['clarifying', 'spec_ready', 'awaiting_architect'].includes(view.phase)) return undefined;
+  if (view.failure) {
+    // 一次澄清失败只在澄清阶段说；编排失败只在待编排说。
+    const architectStep = view.failure.step === 'architect';
+    if (architectStep !== (view.phase === 'awaiting_architect')) return undefined;
+    return { ...view.failure, legacy: false };
+  }
+  if (view.phase === 'awaiting_architect') {
+    const state = view.architect?.state;
+    if (state !== 'failed' && state !== 'timed_out') return undefined;
+    const movedAt = view.handoffs?.at(-1)?.at;
+    if (movedAt && view.architect!.startedAt <= movedAt) return undefined;
+    const problems = view.architect?.problems ?? [];
+    const code = problems.map((problem) => extractFailureCode(problem)).find((found) => !!found);
+    const detail = legacyDetail(problems.join('\n'));
+    return {
+      category: state === 'timed_out' ? 'timeout' : 'unknown', ...(code ? { code } : {}), ...(detail ? { detail } : {}),
+      step: 'architect', larkAppId: view.orchestratorAppId, legacy: true,
+    };
+  }
+  const error = view.clarify.error;
+  if (!error || ROUTINE_CLARIFY_ERRORS.has(error) || view.clarify.pending) return undefined;
+  const code = extractFailureCode(error);
+  const detail = legacyDetail(error);
+  return {
+    category: 'unknown', ...(code ? { code } : {}), ...(detail ? { detail } : {}),
+    step: 'clarify_turn', larkAppId: view.orchestratorAppId, legacy: true,
+  };
+}
+
+/** 失败原因的文案键与参数（bot = 显示名，带 CLI）。模型不进这句话，另起一行且只在配置了时显示。 */
+export function draftFailureMessage(
+  failure: Pick<DraftFailureDisplay, 'category' | 'cliId'>,
+  botName: string,
+): { key: string; params: Record<string, string> } {
+  return { key: `workflow.draft.failure.cause.${failure.category}`, params: { bot: draftFailureBotLabel(failure, botName) } };
+}
+
+/** 「显示名（CLI）」，CLI 不知道就只有显示名。 */
+export function draftFailureBotLabel(failure: Pick<DraftFailureDisplay, 'cliId'>, botName: string): string {
+  return failure.cliId ? `${botName}（${failure.cliId}）` : botName;
+}
+
+/** 失败面板的事实行：哪个 Bot；Bot 配置里有 model 才有「模型」这一行。 */
+export function draftFailureFacts(
+  failure: Pick<DraftFailureDisplay, 'cliId' | 'model'>,
+  botName: string,
+): Array<{ key: 'bot' | 'model'; value: string }> {
+  return [
+    { key: 'bot', value: draftFailureBotLabel(failure, botName) },
+    ...(failure.model ? [{ key: 'model' as const, value: failure.model }] : []),
+  ];
+}
+
+/** 终端从哪儿看：有澄清会话就取它的只读终端链接（现有 view-link，按登录身份鉴权）；
+ *  另有 daemon 留下的终端输出片段就直接显示。 */
+export function draftFailureTerminal(
+  failure: Pick<DraftFailureDisplay, 'sessionId' | 'terminalTail'>,
+): { sessionId?: string; tail?: string } {
+  return {
+    ...(failure.sessionId ? { sessionId: failure.sessionId } : {}),
+    ...(failure.terminalTail ? { tail: failure.terminalTail } : {}),
+  };
+}
+
+/** 排查用的一行：错误码（已是码形，截到 64 字符）。 */
+export function draftFailureCodeLine(failure: Pick<DraftFailureDisplay, 'code'>): string | undefined {
+  return failure.code ? failure.code.slice(0, 64) : undefined;
+}
+
+/** 去改这个 Bot 的模型配置：Bot 配置页该 Bot 的模型设置处。 */
+export function botModelSettingsHref(larkAppId: string): string {
+  return botDefaultsHref({ bot: larkAppId, section: 'agent', field: 'botDefaults.agentModel' });
+}
+
+/** 这个阶段能不能换编排 Bot（还没拉群；澄清中、待确认需求、编排失败）。daemon 再校验。 */
+export function canSwitchOrchestrator(
+  view: Pick<WorkflowDraftView, 'phase' | 'architect' | 'template' | 'launch' | 'clarify' | 'handoff'>,
+): boolean {
+  // 平台登录和本机令牌登录都可以换（本机令牌登录：新发起人 = 新 Bot 的 owner）。
+  if (view.template || view.launch || view.clarify.pending) return false;
+  if (view.phase === 'clarifying' || view.phase === 'spec_ready') return true;
+  return view.phase === 'awaiting_architect'
+    && !!view.architect && ['failed', 'timed_out', 'interrupted', 'cancelled'].includes(view.architect.state);
+}
+
+/** 下拉项旁的预检提示：「最近一次调用模型失败：<原因>（时间）」的参数。 */
+export function recentFailureHint(failure: WorkflowDraftFailureSummary | undefined): { key: string; at: string } | undefined {
+  if (!failure) return undefined;
+  return { key: `workflow.draft.failure.short.${failure.category}`, at: formatDraftTime(failure.at) };
+}
+
+/** 交接记录一条：何时、从哪个 Bot 到哪个 Bot、谁（登录方式）、确认人是否改写。
+ *  页面不显示 open_id，确认人只说改写到了哪个 Bot 的应用下。 */
+export function handoffHistoryRows(
+  handoffs: ReadonlyArray<Omit<WorkflowDraftHandoffRecord, 'token'>> | undefined,
+  nameOf: (larkAppId: string) => string,
+): Array<{ at: string; from: string; to: string; source?: WorkflowDraftInitiator['source']; confirmerRewritten?: true }> {
+  return (handoffs ?? []).map((entry) => ({
+    at: formatDraftTime(entry.at),
+    from: nameOf(entry.fromAppId),
+    to: nameOf(entry.toAppId),
+    ...(entry.by ? { source: entry.by.source } : {}),
+    ...(entry.specConfirmation ? { confirmerRewritten: true as const } : {}),
+  }));
 }

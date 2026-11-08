@@ -84,9 +84,15 @@ export interface AsyncStateInputs {
     failedAt?: number;
     errorCode?: 'trigger_failed';
     terminalErrorCode?: string;
+    terminalErrorDetail?: string;
+    terminalScreenTail?: string;
     usage?: TurnUsageBuckets;
     interruptedAt?: number;
   };
+  /** Copy the in-memory failure's raw error text and screen tail onto a
+   *  worker-terminal failure. Off for the HTTP trigger-result route: its
+   *  callers never got terminal text, and must not start to. */
+  includeFailureDiagnostics?: boolean;
   /** triggerId the in-memory result is keyed under (latest or explicit). */
   memTriggerId?: string;
   /** Durable persisted result (survives restart), if any. */
@@ -179,11 +185,21 @@ export function resolveAsyncTriggerState(inp: AsyncStateInputs): TriggerResponse
     };
   }
 
-  const explicitFailure = inp.memResult?.status === 'failed' && inp.memTriggerId
+  const explicitFailure: {
+    triggerId: string;
+    failedAt?: number;
+    terminalErrorCode?: string;
+    terminalErrorDetail?: string;
+    terminalScreenTail?: string;
+  } | undefined = inp.memResult?.status === 'failed' && inp.memTriggerId
     ? {
         triggerId: inp.memTriggerId,
         failedAt: inp.memResult.failedAt,
         terminalErrorCode: inp.memResult.terminalErrorCode,
+        ...(inp.includeFailureDiagnostics && inp.memResult.terminalErrorDetail
+          ? { terminalErrorDetail: inp.memResult.terminalErrorDetail } : {}),
+        ...(inp.includeFailureDiagnostics && inp.memResult.terminalScreenTail
+          ? { terminalScreenTail: inp.memResult.terminalScreenTail } : {}),
       }
     : inp.persisted?.result.status === 'failed'
       && inp.persisted.result.reason === 'turn_terminal'
@@ -201,6 +217,8 @@ export function resolveAsyncTriggerState(inp: AsyncStateInputs): TriggerResponse
       target: { kind: 'turn', sessionId, chatId },
       errorCode: 'trigger_failed',
       terminalErrorCode: explicitFailure.terminalErrorCode,
+      ...(explicitFailure.terminalErrorDetail ? { terminalErrorDetail: explicitFailure.terminalErrorDetail } : {}),
+      ...(explicitFailure.terminalScreenTail ? { terminalScreenTail: explicitFailure.terminalScreenTail } : {}),
       error: `worker reported terminal failure: ${explicitFailure.terminalErrorCode ?? 'unknown'}`,
       finishedAt: explicitFailure.failedAt
         ? new Date(explicitFailure.failedAt).toISOString()

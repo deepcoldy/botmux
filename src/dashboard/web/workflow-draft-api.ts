@@ -121,7 +121,11 @@ type DraftAction =
   | { kind: 'launch-resend-summary' }
   /** D6：复制出来的草稿改目标、改节点文字。 */
   | { kind: 'copy-goal'; goal: string; mode: 'text_only' | 'rearchitect' | 'reclarify' }
-  | { kind: 'node-text'; nodeId: string; goal?: string; completion?: string };
+  | { kind: 'node-text'; nodeId: string; goal?: string; completion?: string }
+  /** 换编排 Bot（Dashboard 依次问新 Bot、让现编排 Bot 交出、新 Bot 接管）；中途断了再发一次接着做。 */
+  | { kind: 'orchestrator'; larkAppId: string }
+  /** 取消进行中的更换（草稿留在现编排 Bot）。 */
+  | { kind: 'handoff-cancel' };
 
 /** Path and body of one draft write. `baseVersion` pins the version the page showed. */
 export function draftActionRequest(runId: string, action: DraftAction, baseVersion?: number): { path: string; body: Record<string, unknown> } {
@@ -171,6 +175,8 @@ export function draftActionRequest(runId: string, action: DraftAction, baseVersi
         ...base,
       },
     };
+    case 'orchestrator': return { path: draftPath(runId, '/orchestrator'), body: { larkAppId: action.larkAppId, ...base } };
+    case 'handoff-cancel': return { path: draftPath(runId, '/handoff/cancel'), body: {} };
   }
 }
 
