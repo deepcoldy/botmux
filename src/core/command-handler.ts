@@ -2476,7 +2476,7 @@ export async function handleCommand(
         const chatId = message.chatId ?? ds?.chatId;
         if (!appId || !chatId || message.senderType !== 'user' || !message.senderId
           || !canOperate(appId, chatId, message.senderId, message.senderUnionId)) {
-          await sessionReply(rootId, t('cmd.dismiss.owner_only', undefined, loc));
+          await sessionReply(rootId, t(chatId && !isSessionGroup(chatId) ? 'cmd.dismiss.operator_only' : 'cmd.dismiss.owner_only', undefined, loc));
           break;
         }
         const parsed = /^\/dismiss(?:\s+--confirm=([a-f0-9]{64}))?\s*$/i.exec(message.content.trim());
@@ -2485,7 +2485,7 @@ export async function handleCommand(
           break;
         }
         const result = await dismissSessionGroup({
-          larkAppId: appId, chatId, rootId, senderId: message.senderId,
+          larkAppId: appId, chatId, rootId, chatType: message.chatType ?? ds?.chatType, senderId: message.senderId,
           confirmedState: parsed[1], activeSessions, botName: botDisplayName,
         });
         if (result.status === 'dismissed') {
@@ -2494,7 +2494,7 @@ export async function handleCommand(
           try {
             const offers = await offerWorktreeCleanup(appId, result.workingDirs);
             await sendUserMessage(appId, message.senderId,
-              buildDismissReceiptCard({ offers, invokerOpenId: message.senderId, loc }), 'interactive');
+              buildDismissReceiptCard({ offers, invokerOpenId: message.senderId, ordinaryGroup: result.ordinaryGroup, loc }), 'interactive');
           } catch (err) { logger.warn(`[dismiss] private receipt failed: ${err}`); }
         } else if (result.status === 'confirm') {
           await sessionReply(rootId, buildDismissConfirmCard({
@@ -2502,6 +2502,7 @@ export async function handleCommand(
             invokerOpenId: message.senderId,
             confirmationState: result.state,
             rows: result.sessions.map(s => closeWorktreeSessionRow({ ...s.session, larkAppId: s.larkAppId }, s.resident, loc)),
+            ordinaryGroup: result.ordinaryGroup,
             loc,
           }), 'interactive');
         } else if (result.status === 'peer_offline') {
