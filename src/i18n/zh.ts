@@ -2235,6 +2235,7 @@ export const messages: Record<string, string> = {
   'card.ask.field.answerable': '可答复',
   'card.ask.question_n': '问题 {n}',
   'card.ask.prompt_truncated': '（问题正文过长，卡片内已截断；完整内容见本话题中的附件文件）',
+  'card.ask.descriptions_truncated': '（选项说明过长，卡片内已截断；完整内容见本话题中的附件文件）',
   'card.ask.submit': '提交',
   'card.ask.submit_confirm_empty': '确认空提交',
   'card.ask.empty_warning': '⚠️ 你还没有勾选任何选项。多选允许「一个都不选」，如确实要以空作答，请再次点击「确认空提交」；否则先勾选再提交。',

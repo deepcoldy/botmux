@@ -8029,6 +8029,8 @@ ${SEND_HELP_BODY}
   input-capture register|inspect|revoke|revoke-set --bot <appId> --session <id> ...
   ask buttons --questions-file <file>   多题/文本/数值表单，支持预选；一次提交，返回 answers/inputs JSON
   ask buttons --answerer <ou_id>       仅指定答题人可提交（不授予业务批准权）
+  ask buttons --mention <ou_id>        在卡片里 @ 该成员。仅本应用通讯录查得到的真人有效，
+                                       否则只丢掉 @，卡片照发
   ask buttons [--multi] --options "a,b" "<问题>"
                                        把选择题做成按钮卡片抛给飞书；--multi 返回逗号分隔的多个 key
                                        （无 hook 的 CLI 用它把决策引到人；也可省略 buttons 走裸别名）
@@ -17715,7 +17717,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     process.exit(2);
   }
 
-  const { findMissingAskEnv, parseAskOptions, parseAskQuestionsFile, parseAskTimeoutSeconds, AskArgsError } =
+  const { findMissingAskEnv, parseAskOptions, parseAskQuestionsFile, parseAskTimeoutSeconds, parseAskMention, AskArgsError } =
     await import('./core/ask-args.js');
   type AskJsonOutput = import('./core/ask-types.js').AskJsonOutput;
   const { toLegacySelected, isCustomReply } = await import('./core/ask-types.js');
@@ -17734,6 +17736,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   const answererOpenId = argValue(rest, '--answerer');
   const optionsRaw = argValue(rest, '--options');
   const timeoutRaw = argValue(rest, '--timeout');
+  const mentionRaw = argValue(rest, '--mention');
   const useJson = rest.includes('--json') || questionsFile !== undefined;
   const multiSelect = rest.includes('--multi');
   const positionalArgs = positionals(rest, ['--json', '--multi']);
@@ -17741,6 +17744,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   let options;
   let questions;
   let timeoutMs;
+  let mentionedOpenId;
   try {
     if (rest.some(a => a === '--answerer' || a.startsWith('--answerer='))
       && (!answererOpenId || !/^ou_[A-Za-z0-9_-]{1,128}$/.test(answererOpenId))) {
@@ -17757,6 +17761,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       questions = parseAskQuestionsFile(raw);
     } else options = parseAskOptions(optionsRaw);
     timeoutMs = parseAskTimeoutSeconds(timeoutRaw);
+    mentionedOpenId = parseAskMention(mentionRaw);
   } catch (err) {
     if (err instanceof AskArgsError) {
       console.error(`botmux ask: ${err.message}`);
@@ -17803,6 +17808,9 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       ? { originDispatchAttempt: liveAskOrigin.dispatchAttempt }
       : {}),
     ...(askOriginCapability ? { originCapability: askOriginCapability } : {}),
+    // `botmux ask --mention <open_id>`：daemon 确认对方是本应用通讯录里的真人后，在卡片
+    // 问题前注入真实 <at> 让对方收到通知；确认不了就只丢掉 @（at 到 bot 会让整卡 100290）。
+    ...(mentionedOpenId ? { mentionedOpenId } : {}),
   };
 
   const protectAskWait = () => {

@@ -31,6 +31,9 @@ export interface AskApiBody {
   /** Caller kind ('hook' | 'explicit' | …) namespacing the identity so an
    *  explicit `botmux ask` can't re-claim a hook ask's card. Optional. */
   originKind?: string;
+  /** 显式 `botmux ask --mention <open_id>` 请求 @ 的人。只是请求：daemon 核实是本应用
+   *  通讯录里的真人后才画进卡片（见 verifiedAskMention）。 */
+  mentionedOpenId?: string;
   acknowledge?: boolean;
   asyncUserInput?: CodexAsyncUserInput;
   /** Optional narrowing only; never grants talk/approval authority. */
@@ -51,6 +54,7 @@ export type AskApiBodyError =
   | 'bad_option_shape'
   | 'bad_option_key'
   | 'bad_option_label'
+  | 'bad_option_description'
   | 'duplicate_option_key'
   | 'bad_questions'
   | 'bad_question_shape'
@@ -62,6 +66,7 @@ export type AskApiBodyError =
   | 'bad_defaultSelectedKeys'
   | 'bad_requestId'
   | 'bad_originKind'
+  | 'bad_mentionedOpenId'
   | 'bad_acknowledge'
   | 'bad_asyncUserInput';
 
@@ -113,6 +118,19 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     }
     originKind = r.originKind;
   }
+  let mentionedOpenId: string | undefined;
+  if (r.mentionedOpenId !== undefined) {
+    // 卡片 `<at id=…>` 只接受 open_id（`ou_` 前缀）。union_id/user_id 等其它
+    // ID 形态进了卡片会整条被飞书拒掉，这里 fail loud。
+    if (
+      originKind !== 'explicit'
+      || typeof r.mentionedOpenId !== 'string'
+      || !/^ou_[A-Za-z0-9_-]{1,128}$/.test(r.mentionedOpenId)
+    ) {
+      return { error: 'bad_mentionedOpenId' };
+    }
+    mentionedOpenId = r.mentionedOpenId;
+  }
 
   if (r.acknowledge !== undefined && typeof r.acknowledge !== 'boolean') return { error: 'bad_acknowledge' };
 
@@ -127,7 +145,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   if (Array.isArray(r.questions)) {
     // 新格式：questions[] 多问多选
     if (r.questions.length === 0) return { error: 'bad_questions' };
-    const parsed = parseAskQuestions(r.questions, { allowSingleOption: !!asyncUserInput });
+    const parsed = parseAskQuestions(r.questions, { allowSingleOption: !!asyncUserInput, clampDescription: originKind === 'hook' });
     if (typeof parsed === 'string') return { error: parsed };
     questions = parsed;
   } else if (Array.isArray(r.options) && typeof r.prompt === 'string' && r.prompt.trim()) {
@@ -136,7 +154,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     const opts: AskOption[] = [];
     const seen = new Set<string>();
     for (const o of r.options) {
-      const parsed = parseOption(o);
+      const parsed = parseOption(o, { clampDescription: originKind === 'hook' });
       if (typeof parsed === 'string') return { error: parsed };
       if (seen.has(parsed.key)) return { error: 'duplicate_option_key' };
       seen.add(parsed.key);
@@ -165,6 +183,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     timeoutMs: r.timeoutMs,
     ...(requestId !== undefined ? { requestId } : {}),
     ...(originKind !== undefined ? { originKind } : {}),
+    ...(mentionedOpenId !== undefined ? { mentionedOpenId } : {}),
     ...(r.acknowledge !== undefined ? { acknowledge: r.acknowledge as boolean } : {}),
     ...(asyncUserInput ? { asyncUserInput } : {}),
     ...(r.asyncFailure ? { asyncFailure: r.asyncFailure as 'limit' | 'invalid_questions' } : {}),
@@ -177,6 +196,23 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     return { error: 'unsupported_fields' };
   }
   return parsed;
+}
+
+/** The requested mention, or undefined when it may not be drawn. A card that mentions a bot is
+ *  rejected whole (100290) and bot open_ids share the `ou_` format, so only an id the contact
+ *  lookup confirms as a human of this app is kept. Any doubt drops just the mention: the card
+ *  itself must still go out. */
+export async function verifiedAskMention(openId: string | undefined, deps: {
+  isPeerBot(openId: string): boolean;
+  isHuman(openId: string): Promise<boolean>;
+}): Promise<string | undefined> {
+  if (!openId) return undefined;
+  try {
+    if (deps.isPeerBot(openId)) return undefined;
+    return await deps.isHuman(openId) ? openId : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Body of `POST /api/asks/cli-resolved`: which hook ask (by its per-invocation

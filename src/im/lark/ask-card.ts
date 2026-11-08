@@ -35,6 +35,7 @@ export const ASK_FORM_ACTION = 'ask_form_submit';
 
 import { supportsAskCustomInput } from '../../core/ask-custom-input.js';
 import { buildAskCustomForm } from './ask-custom-form.js';
+import { optionDescriptions } from './ask-option-descriptions.js';
 import { permissionAskSettleStatus } from './ask-permission-status.js';
 
 const MAX_BUTTONS_PER_ACTION_ROW = 4;
@@ -94,7 +95,7 @@ export function createLarkAskCardDispatcher(
           throw new AskDispatchError(detail, retryable);
         }
       }
-      const { json: cardJson, promptTruncated } = renderAskCard(ask);
+      const { json: cardJson, promptTruncated, descriptionsTruncated, fits } = renderAskCard(ask);
       // botmux 把 chat-scope session 的 routing anchor 也叫 rootMessageId,
       // 但在 chat-scope 下它实际是 chat_id (oc_...) 而非 message_id (om_...).
       // 飞书 /messages/{id}/reply 只接受 om_ — 用 oc_ 会 400 invalid message_id.
@@ -109,26 +110,30 @@ export function createLarkAskCardDispatcher(
       // re-send after a daemon restart (restart-resume) dedupes server-side and
       // returns the ORIGINAL message_id instead of posting a second card.
       const uuid = ask.dispatchUuid;
+      const truncated = promptTruncated || descriptionsTruncated;
+      const sendAttachment = () => sendPromptAttachment(ask, upload, (content, fileUuid) => canReplyToRoot
+        ? reply(ask.larkAppId, replyRoot!, content, 'file', true, fileUuid)
+        : sendToRecipient(content, 'file', fileUuid));
+      const attachmentFailed = (err: unknown) => logger.warn(`[ask:${ask.askId}] failed to send full-question attachment; sending truncated card only: ${
+        err instanceof Error ? err.message : String(err)}`);
       try {
-        // 问题正文超出整卡 30KB 预算时卡片内只展示截断版，全文先作为附件发出，
+        // 问题正文或选项说明超出整卡 30KB 预算时卡片内只展示截断版，全文先作为附件发出，
         // 让审批人始终能看到完整信息（对齐 turn reply card 的 sendOverflow）。
         // 附件先于卡片发送：瞬时失败整体按同一分类重试，附件 uuid 由 dispatchUuid
         // 派生，重试/重启重发都会被飞书去重；确定性失败（如缺上传权限）不阻断
         // 卡片——宁可只看到截断版，也不能让审批卡整张发不出、被误报「未获确认」。
-        if (promptTruncated) {
-          try {
-            await sendPromptAttachment(ask, upload, (content, fileUuid) => canReplyToRoot
-              ? reply(ask.larkAppId, replyRoot!, content, 'file', true, fileUuid)
-              : sendToRecipient(content, 'file', fileUuid));
-          } catch (err) {
+        if (truncated && fits) {
+          try { await sendAttachment(); } catch (err) {
             if (classifyAskDispatchError(err).retryable) throw err;
-            logger.warn(`[ask:${ask.askId}] failed to send full-question attachment; sending truncated card only: ${
-              err instanceof Error ? err.message : String(err)}`);
+            attachmentFailed(err);
           }
         }
         const messageId = canReplyToRoot
           ? await reply(ask.larkAppId, replyRoot!, cardJson, 'interactive', true, uuid)
           : await sendToRecipient(cardJson, 'interactive', uuid);
+        // 截到最小仍超预算的卡大概率被飞书拒收：附件改在卡片送达后发，避免话题里只留下一个孤立文件；
+        // 此时卡片已送达，附件失败只记日志。
+        if (truncated && !fits) await sendAttachment().catch(attachmentFailed);
         return { messageId };
       } catch (err) {
         // Re-throw as a typed AskDispatchError so the broker's bounded retry can
@@ -422,38 +427,48 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
 
 /**
  * 按飞书卡片请求体 30KB 上限（与 turn reply card 同一把尺子）渲染 ask 卡：
- * 问题正文默认完整渲染；整卡超预算时把过长的正文统一截到能放下的最大长度并附
- * 「完整内容见附件」，由发送方把全文作为文件发出。纯函数、只依赖 ask 本身，
- * 首发 / 勾选重绘 / settle PATCH 得到一致的截断结果。
+ * 问题正文与选项说明默认完整渲染；整卡超预算时先让选项说明让路（统一截到能放下的
+ * 最大长度），说明全省略仍放不下才截问题正文——批准的效力取决于正文。任一截断都由发送方
+ * 把全文作为文件发出。`fits` 为 false 表示截到最小仍超预算（如选项过多）。纯函数、只依赖
+ * ask 本身，首发 / 勾选重绘 / settle PATCH 得到一致的截断结果。
  */
 export function renderAskCard(
   ask: PendingAsk,
   result?: AskResult,
   opts?: { confirmEmptyArmed?: boolean },
-): { json: string; promptTruncated: boolean } {
+): { json: string; promptTruncated: boolean; descriptionsTruncated: boolean; fits: boolean } {
   const measureUuid = ask.dispatchUuid ?? ASK_DISPATCH_UUID_WORST_CASE;
   const receiveId = ask.deliveryTarget?.openId ?? ask.chatId;
-  const full = renderAskCardWithCap(ask, result, opts, Infinity);
-  if (turnReplyCardRequestBytes(full, receiveId, measureUuid) <= TURN_REPLY_CARD_MAX_BYTES) {
-    return { json: full, promptTruncated: false };
+  const fits = (json: string) => turnReplyCardRequestBytes(json, receiveId, measureUuid) <= TURN_REPLY_CARD_MAX_BYTES;
+  const render = (promptCap: number, descriptionCap: number) => renderAskCardWithCap(ask, result, opts, promptCap, descriptionCap);
+  const full = render(Infinity, Infinity);
+  if (fits(full)) return { json: full, promptTruncated: false, descriptionsTruncated: false, fits: true };
+  const longestDescription = Math.max(0, ...ask.questions.flatMap(q => q.options.map(o => o.description?.length ?? 0)));
+  if (longestDescription > 0) {
+    const withoutDescriptions = render(Infinity, 0);
+    if (fits(withoutDescriptions)) return { promptTruncated: false, descriptionsTruncated: true, fits: true,
+      json: largestFitting(1, longestDescription - 1, cap => render(Infinity, cap), fits) ?? withoutDescriptions };
   }
-  const longest = Math.max(0, ...ask.questions.map((_, i) => questionPrompt(ask, i).length));
-  // 二分出能放进预算的最大单题字符上限（只影响超过该上限的题）。
-  let lo = 0;
-  let hi = longest;
-  let best = renderAskCardWithCap(ask, result, opts, 0);
+  const longestPrompt = Math.max(0, ...ask.questions.map((_, i) => questionPrompt(ask, i).length));
+  const json = largestFitting(0, longestPrompt - 1, cap => render(cap, 0), fits);
+  return { json: json ?? render(0, 0), promptTruncated: true, descriptionsTruncated: longestDescription > 0, fits: json !== undefined };
+}
+
+/** 二分出 `renderAt(cap)` 仍放得进预算的最大 cap（渲染体积随 cap 单调不减）。 */
+function largestFitting(lo: number, hi: number, renderAt: (cap: number) => string, fits: (json: string) => boolean): string | undefined {
+  let best: string | undefined;
   while (lo <= hi) {
     const mid = Math.floor((lo + hi) / 2);
-    const json = renderAskCardWithCap(ask, result, opts, mid);
-    if (turnReplyCardRequestBytes(json, receiveId, measureUuid) <= TURN_REPLY_CARD_MAX_BYTES) {
-      best = json;
-      lo = mid + 1;
-    } else {
-      hi = mid - 1;
-    }
+    const json = renderAt(mid);
+    if (fits(json)) { best = json; lo = mid + 1; } else hi = mid - 1;
   }
-  // 若正文截到 0 仍超限（如超长选项标签），超限与正文无关，原样返回最小形态。
-  return { json: best, promptTruncated: true };
+  return best;
+}
+
+/** 显式 ask 的 `--mention`：只在待答的群内卡上点名；settle 后的卡和发给文档作者的私聊卡不带。 */
+function askMention(ask: PendingAsk, result: AskResult | undefined): string | undefined {
+  return !result && !ask.deliveryTarget && ask.mentionedOpenId && /^ou_[A-Za-z0-9_-]+$/.test(ask.mentionedOpenId)
+    ? `<at id=${ask.mentionedOpenId}></at>` : undefined;
 }
 
 /** 未 settle 的文本作答批次会把选项标签并进问题正文展示；settle 后只展示原问题。 */
@@ -472,12 +487,14 @@ function capPrompt(prompt: string, cap: number, locale?: Locale): string {
   return `${head}…\n\n${t('card.ask.prompt_truncated', undefined, locale)}`;
 }
 
-/** 完整问题正文（附件内容）。 */
+/** 完整问题正文与选项说明（附件内容）。 */
 export function askPromptAttachmentText(ask: PendingAsk): string {
   const locale = localeForBot(ask.larkAppId);
+  const separator = locale === 'en' ? ': ' : '：';
   return ask.questions.map((q, i) => {
     const lines = [`## ${t('card.ask.question_n', { n: i + 1 }, locale)}`, '', q.prompt];
-    if (q.options.length) lines.push('', ...q.options.map(o => `- ${o.label}`));
+    if (q.options.length) lines.push('', ...q.options.map(o => o.description
+      ? `- ${o.label}${separator}${o.description.replace(/\n/g, '\n  ')}` : `- ${o.label}`));
     return lines.join('\n');
   }).join('\n\n') + '\n';
 }
@@ -506,13 +523,15 @@ function renderAskCardWithCap(
   result: AskResult | undefined,
   opts: { confirmEmptyArmed?: boolean } | undefined,
   promptCap: number,
+  descriptionCap: number,
 ): string {
   const locale = localeForBot(ask.larkAppId);
+  const mention = askMention(ask, result);
   if (hasAskForm(ask.questions)) {
     const capped = { ...ask, questions: ask.questions.map(q => ({ ...q, prompt: capPrompt(q.prompt, promptCap, locale) })) };
     return JSON.stringify({ schema: '2.0', config: { wide_screen_mode: true },
       header: { title: { tag: 'plain_text', content: 'botmux ask' }, template: result ? 'grey' : 'blue' },
-      body: { elements: buildAskFormElements(capped, locale, result, Math.min(300, promptCap)) } });
+      body: { elements: buildAskFormElements(capped, locale, result, Math.min(300, promptCap), { mention, descriptionCap }) } });
   }
   const optionLayout = askOptionLayoutForBot(ask.larkAppId);
   const deadline = new Date(ask.deadlineAt).toLocaleString('zh-CN');
@@ -529,6 +548,14 @@ function renderAskCardWithCap(
   };
 
   const elements: Array<Record<string, unknown>> = [metaDiv];
+  const descriptionNotes = new Set<Record<string, unknown>>();
+  const pushDescriptions = (q: PendingAsk['questions'][number]) => {
+    const details = optionDescriptions(q, locale, descriptionCap);
+    if (!details) return;
+    const note = { tag: 'note', elements: [{ tag: 'lark_md', content: details.content }] };
+    descriptionNotes.add(note);
+    elements.push(note);
+  };
   if (ask.deliveryTarget) {
     elements.push({ tag: 'note', elements: [{ tag: 'plain_text',
       content: t('card.ask.document_origin', {
@@ -549,6 +576,7 @@ function renderAskCardWithCap(
           content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(capPrompt(questionPrompt(ask, i, true), promptCap, locale))}`,
         },
       });
+      pushDescriptions(ask.questions[i]!);
     }
     elements.push({ tag: 'hr' });
     elements.push({
@@ -564,7 +592,8 @@ function renderAskCardWithCap(
         ...(ask.deliveryTarget ? [{ tag: 'markdown', content: t('card.ask.document_origin', {
           document: ask.deliveryTarget.fileToken, comment: ask.deliveryTarget.commentId,
         }, locale) }] : []),
-        buildAskCustomForm(ask, locale, confirmEmptyArmed, text => escapeQuestion(capPrompt(text, promptCap, locale))),
+        buildAskCustomForm(ask, locale, confirmEmptyArmed, text => escapeQuestion(capPrompt(text, promptCap, locale)),
+          { mention, descriptionCap }),
         ...(ask.deliveryTarget || ask.originKind === 'native-user-input-async' ? [{ tag: 'markdown', text_size: 'notation', content:
           t(ask.deliveryTarget ? 'card.ask.document_reply_hint' : 'card.ask.async_reply_hint', undefined, locale) }] : []),
       ] },
@@ -588,11 +617,11 @@ function renderAskCardWithCap(
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(prompt)}`,
+          content: `${i === 0 && mention ? `${mention}\n` : ''}**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(prompt)}`,
         },
       });
 
-      if (textReplyRequired) continue; // A batch with text inputs is answered in conversation.
+      if (textReplyRequired) { pushDescriptions(q); continue; } // A batch with text inputs is answered in conversation.
       const selected = new Set(selections[i] ?? []);
       const optionButtons = q.options.map((opt) => ({
         tag: 'button',
@@ -617,6 +646,9 @@ function renderAskCardWithCap(
             },
       }));
       appendActionRows(elements, optionButtons, optionLayout);
+
+      // 选项说明不进按钮（飞书按钮无副标题），在按钮行下方以小字列出。
+      pushDescriptions(q);
     }
 
     if (requiresSubmit && !textReplyRequired) {
@@ -676,7 +708,8 @@ function renderAskCardWithCap(
     body: { elements: elements.map(element => {
       if (element.tag === 'hr') return element;
       const div = element as { text?: { content: string }; fields?: Array<{ text: { content: string } }>; elements?: Array<{ content: string }> };
-      return { tag: 'markdown', content: div.text?.content ?? div.fields?.map(f => f.text.content).join('\n')
+      return { tag: 'markdown', ...(descriptionNotes.has(element) ? { text_size: 'notation' } : {}),
+        content: div.text?.content ?? div.fields?.map(f => f.text.content).join('\n')
         ?? div.elements?.map(e => e.content).join('\n') ?? '' };
     }) },
   });
