@@ -25,6 +25,7 @@ import { SPEC_SCHEMA_VERSION } from '../src/workflows/v3/contract.js';
 import { frozenNodeWorkingDir, readRunEnvelope } from '../src/workflows/v3/run-envelope.js';
 import type { V3BotEligibilityProbe } from '../src/workflows/v3/node-executor-mode.js';
 import { checkV3BotExecutorEligibility } from '../src/workflows/v3/node-executor-mode.js';
+import { createWorkflowWorkingDirOperatorWiring, type WorkflowWorkingDirOperatorIo } from '../src/core/workflow-working-dir-operator.js';
 
 const bases: string[] = [];
 afterEach(() => {
@@ -424,6 +425,31 @@ describe('approve-dag --working-dir in bot mode (design §15.4)', () => {
       return 'no';
     } });
     expect((thrown.error as Error).message).toMatch(/verify → bot\(cli_test\)：暂时无法确认发起人能否操作它/);
+  });
+
+  it('the main bot\'s own node, its app definitively unable to see the initiator\'s union_id: the range refusal it gave before; a lookup that only failed is "could not confirm"', async () => {
+    const d = dirs();
+    // lab: outside the main bot's range; her union_id alone would let her through.
+    const viaMainApp = (union: WorkflowWorkingDirOperatorIo['resolveUnionIdFromOpenId']) => {
+      const wiring = createWorkflowWorkingDirOperatorWiring({
+        resolveTargetAppOpenId: async () => ({ status: 'definitive' }),
+        resolveUnionIdFromOpenId: union,
+        listChatMemberOpenIds: async () => ['ou_owner'],
+        canRunDaemonCommand: (_appId, _chatId, _openId, unionId) => unionId === 'on_owner',
+        selfLarkAppId: () => MAIN,
+      });
+      return async (target: { larkAppId: string }): Promise<Operate> => target.larkAppId === MAIN
+        ? wiring.initiatorOperates({ larkAppId: MAIN, chatId: GROUP_TOPIC.chatId, initiator: { sourceLarkAppId: MAIN, openId: 'ou_owner' } })
+        : 'yes';
+    };
+    const invisible = await approveWithDir(d.lab, d.bots, { answer: viaMainApp(async () => ({ status: 'unavailable' })) });
+    expect((invisible.error as Error).message).toContain('inspect → bot(cli_main)：指定的工作目录不在它配置的目录范围内（默认工作目录 / 仓库目录）');
+    expect((invisible.error as Error).message).not.toMatch(/暂时无法确认/);
+    expect(invisible.envelope.kind).toBe('missing');
+    const failing = await approveWithDir(d.lab, d.bots, { answer: viaMainApp(async () => ({ status: 'retryable', error: '503' })) });
+    expect((failing.error as Error).message).toMatch(/inspect → bot\(cli_main\)：暂时无法确认发起人能否操作它/);
+    const found = await approveWithDir(d.lab, d.bots, { answer: viaMainApp(async () => ({ status: 'resolved', unionId: 'on_owner' })) });
+    expect(found.error).toBeUndefined();
   });
 
   it('every bot that needs asking is asked at the same time, and the refusal keeps node order', async () => {

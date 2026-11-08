@@ -6994,6 +6994,7 @@ const workflowWorkingDirOperatorWiring = createWorkflowWorkingDirOperatorWiring(
   listChatMemberOpenIds: (appId, chatId) => listChatMemberOpenIds(appId, chatId),
   canRunDaemonCommand: (appId, chatId, openId, unionId, cmd, chatType) => humanCanRunDaemonCommand(appId, chatId, openId, unionId, cmd, chatType),
   selfLarkAppId: () => workflowSelfAppId(),
+  warn: (message) => logger.warn(message),
 });
 
 const workflowNodeDaemon = createWorkflowNodeDaemon({
