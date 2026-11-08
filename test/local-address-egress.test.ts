@@ -315,7 +315,9 @@ describe('host capability links in a default LAN deployment', () => {
   it('sends a host link no builder in this process produced, as a separate `botmux send` process would', async () => {
     const { app, writes } = capture();
     const links = [`${dashboardOrigin()}/#/v3/run-from-cli`, `${webOrigin(8800)}/s/sid-from-cli?viewToken=${viewToken}`];
-    await sendMessage(app, 'oc_chat', JSON.stringify({ body: { elements: links.map(url => ({ tag: 'button', url })) } }), 'interactive');
+    const card = { body: { elements: links.map(url => ({ tag: 'button', url })) } };
+    expect(sanitizeLocalAddressNode(card, localAddressContextForBot(app))).toEqual(card);
+    await sendMessage(app, 'oc_chat', JSON.stringify(card), 'interactive');
     expect(writes).toHaveLength(1);
   });
 

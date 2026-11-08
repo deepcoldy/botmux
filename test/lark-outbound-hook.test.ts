@@ -81,15 +81,14 @@ describe('Lark outbound hook provider replay suppression', () => {
     expect(mocks.observePublished).toHaveBeenLastCalledWith('app', expect.objectContaining({ message_id: 'om_reply', chat_id: 'oc_chat' }), undefined, {});
   });
 
-  it.each(['send', 'reply'] as const)('records only the sanitized content acknowledged by the provider for %s', async kind => {
+  it.each(['send', 'reply'] as const)('records the content acknowledged by the provider for %s, prose as written', async kind => {
     mocks.sharing = true;
     mocks.reply.mockResolvedValue({ code: 0, data: { message_id: 'om_reply', chat_id: 'oc_chat' } });
     const raw = '协作说明：[协作技能](/home/alice/.agents/skills/collaboration/SKILL.md)';
     const action = kind === 'send' ? sendMessage('app', 'oc_chat', raw) : replyMessage('app', 'om_parent', raw);
     await action;
     const wire = (kind === 'send' ? mocks.create : mocks.reply).mock.calls[0][0].data.content;
-    expect(wire).not.toContain('/home/');
-    expect(JSON.parse(wire).text).toContain('协作技能');
+    expect(JSON.parse(wire).text).toBe(raw);
     expect(mocks.observePublished.mock.calls[0][1].body.content).toBe(wire);
     expect(mocks.emitHookEvent.mock.calls[0][1].content).toBe(JSON.parse(wire).text);
   });

@@ -84,6 +84,22 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(record?.finalText).toBe(raw);
   });
 
+  it.each(['bridge', 'explicit'] as const)('removes local addresses from a %s reply that fits in the card', async source => {
+    const ds = session({ workingDir: '/custom/project' });
+    const send = vi.fn(async (_body: string) => 'om_inline');
+    const raw = '见 [协作技能](/home/alice/.agents/skills/a/SKILL.md)，改动在 /custom/project/src/main.ts:12';
+    const card = JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: raw }] } });
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: raw, source, card }, send);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase: 'completed' }, send);
+    const cards = [...send.mock.calls.map(call => call[0]), ...vi.mocked(updateMessage).mock.calls.map(call => call[2])];
+    expect(cards.some(body => body.includes('协作技能') && body.includes('src/main.ts:12'))).toBe(true);
+    for (const body of cards) {
+      expect(body).not.toContain('/home/alice/');
+      expect(body).not.toContain('/custom/project/');
+    }
+  });
+
   it.each(['oc_mode', 'om_root'])('recovers a failed overflow with stable delivery identity for root %s', async rootId => {
     const store = new TurnReplyCardStore(dir);
     const key = { larkAppId: 'app_mode', sessionId: 'sid_mode', turnId: 'om_mode' };
