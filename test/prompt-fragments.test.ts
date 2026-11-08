@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
+import { feishuReplyPresentationGuidance } from '../src/adapters/cli/shared-hints.js';
 import {
   PROMPT_FRAGMENTS,
   PROMPT_STAGES,
@@ -7,7 +8,7 @@ import {
   validateFragmentOverride,
   type PromptFragmentSpec,
 } from '../src/skills/prompt-fragments.js';
-import { shippedText } from '../src/i18n/index.js';
+import { setPromptOverrideResolver, shippedText } from '../src/i18n/index.js';
 import { SUPPORTED_LOCALES } from '../src/i18n/types.js';
 
 /**
@@ -112,6 +113,31 @@ describe('prompt fragment catalog', () => {
     ];
     for (const key of migratedKeys) {
       expect(PROMPT_FRAGMENTS.some((f: PromptFragmentSpec) => f.key === key), key).toBe(true);
+    }
+  });
+});
+
+describe('prompt fragment catalog matches what each stage reads', () => {
+  afterEach(() => setPromptOverrideResolver(undefined));
+
+  it('every line of the per-turn Lark guidance comes from a follow-up fragment', () => {
+    const followup = new Set(
+      PROMPT_FRAGMENTS.filter((f) => fragmentStages(f).includes('followup')).map((f) => f.key),
+    );
+    setPromptOverrideResolver((key) => (followup.has(key) ? `<<${key}>>` : undefined));
+    for (const loc of SUPPORTED_LOCALES) {
+      const lines = feishuReplyPresentationGuidance(loc).split('\n');
+      expect(lines.length).toBeGreaterThan(1);
+      for (const line of lines) expect(line, `[${loc}]`).toMatch(/^<<ai\.[\w.]+>>$/);
+    }
+  });
+
+  it('routing fragments stay on the opening turn', () => {
+    // Both routing blocks ride only the first message; a follow-up listing would
+    // show an editor entry whose copy never reaches a follow-up.
+    for (const f of PROMPT_FRAGMENTS) {
+      if (f.block !== 'routing_system' && f.block !== 'routing_shell') continue;
+      expect(fragmentStages(f), f.key).toEqual(['new']);
     }
   });
 });

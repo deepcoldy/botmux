@@ -147,8 +147,11 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
 
   // <botmux_routing> — system-prompt path (claude-family / genius / grok)
   { key: 'ai.routing.intro', block: 'routing_system', stage: 'new', label: '开场说明（标准 send 模式）', kind: 'editable' },
-  { key: 'ai.routing.no_local_addresses', block: 'routing_system', stage: 'new', stages: ['followup'],
-    label: '飞书回复：用户可访问的地址', kind: 'editable' },
+  {
+    key: 'ai.routing.no_local_addresses', block: 'routing_system', stage: 'new', kind: 'editable',
+    label: '飞书回复：用户可访问的地址',
+    gateLabel: '完整规则，每个会话一次：系统提示，或无系统提示 CLI 的首轮 Shell 提示',
+  },
   {
     key: 'ai.routing.intro_transcript', block: 'routing_system', stage: 'new', kind: 'editable',
     label: '开场说明（transcript 自动转发模式）',
@@ -376,6 +379,11 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
 
   { key: 'ai.followup.reminder', block: 'followup', stage: 'followup', label: '续轮提醒（默认）', kind: 'editable' },
   { key: 'ai.followup.feishu_safe_emphasis', block: 'followup', stage: 'followup', label: '飞书安全强调格式', kind: 'editable' },
+  {
+    key: 'ai.followup.no_local_addresses', block: 'followup', stage: 'followup', kind: 'editable',
+    label: '飞书回复：用户可访问的地址（每轮一句）',
+    gateLabel: '随每轮飞书格式提示；完整规则在会话开始阶段',
+  },
   {
     key: 'ai.followup.reminder_hook', block: 'followup', stage: 'followup', kind: 'editable',
     label: '续轮提醒（Claude Code hook 离带注入版）',
