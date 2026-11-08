@@ -35716,3 +35716,34 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .model-pin-summary p { margin: 0 0 .5rem; }
 
 .model-pin-chip > span { white-space: normal; min-width: 0; overflow-wrap: anywhere; }
+
+/* ── 会话任务状态：看板卡片状态行、状态点、表格徽标共用一套色 ────────────────── */
+.kanban-card[data-signal="done"]::before { background: var(--success); }
+.kanban-card[data-signal="closed"] { opacity: 0.6; }
+.kanban-card[data-signal="closed"]:hover,
+.kanban-card[data-signal="closed"].selected { opacity: 1; }
+
+.kanban-card-task {
+  font-size: var(--fs-12);
+  line-height: 1.45;
+}
+.kanban-card-task:not(.session-signal) { color: var(--muted); }
+.kanban-card-task-label { font-weight: 600; }
+.kanban-card-task-label + .kanban-card-task-detail::before { content: ' · '; }
+.kanban-card-task[data-tone="work"] .kanban-card-task-label { color: var(--st-work); }
+.kanban-card-task[data-tone="done"] .kanban-card-task-label { color: var(--success); }
+.kanban-card-task[data-tone="todo"] .kanban-card-task-label { color: var(--st-todo); }
+
+.kanban-card-dot[data-task="need"] { background: var(--st-need); }
+.kanban-card-dot[data-task="work"] { background: var(--st-work); }
+.kanban-card-dot[data-task="done"] { background: var(--success); }
+.kanban-card-dot[data-task="todo"] { background: var(--st-todo); }
+.kanban-card-dot[data-task="idle"] { background: var(--st-idle); }
+.kanban-card-dot[data-task="closed"] { background: var(--border); }
+
+.status-task-need { background: var(--warning-soft); color: var(--warning); }
+.status-task-work { background: color-mix(in srgb, var(--st-work) 14%, transparent); color: var(--st-work); }
+.status-task-done { background: var(--success-soft); color: var(--success); }
+.status-task-todo { background: color-mix(in srgb, var(--st-todo) 14%, transparent); color: var(--st-todo); }
+.status-task-idle { background: var(--surface-muted); color: var(--muted); }
+.status-task-closed { background: var(--surface-muted); color: var(--faint); }
