@@ -57,6 +57,26 @@ describe('steward events from raised hands', () => {
       off();
     }
   });
+
+  it('a later turn failing for the same reason reaches the steward; retries inside a turn do not', () => {
+    const events: string[] = [];
+    const off = onSessionTaskEvent(e => events.push(e.sessionId));
+    try {
+      // Bot-only group: nobody replies, so the first raise is never cleared.
+      const ds = makeDs();
+      const fail = (at: number) => { if (raiseDaemonAttention(ds, 'blocked', 'final delivery failed', at)) publishAttentionPatch(ds); };
+      noteTurnStarted(ds, 't1', T0);
+      fail(T0 + 30_000);
+      fail(T0 + 35_000);
+      expect(events).toHaveLength(1);
+      noteTurnStarted(ds, 't2', T0 + 600_000);
+      fail(T0 + 630_000);
+      fail(T0 + 635_000);
+      expect(events).toEqual(['s1', 's1']);
+    } finally {
+      off();
+    }
+  });
 });
 
 describe('raiseDaemonAttention', () => {
