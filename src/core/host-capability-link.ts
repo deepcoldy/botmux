@@ -20,7 +20,8 @@
 export interface HostLinkScope {
   /** Hosts the URL builders put in links (Web terminal and Dashboard external host). */
   hosts: readonly string[];
-  /** Ports the Dashboard answers on; a bare root is only a host page there. */
+  /** Ports the Dashboard answers on; a bare root is only a host page there.
+   *  The terminal root is refused only on listed ports: an empty list refuses none. */
   dashboardPorts: readonly string[];
 }
 
