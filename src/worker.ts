@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
+import { admitSessionCommand } from './services/session-command-gateway.js';
+import { contractTerminalStatus, type RuntimeIdentity } from './services/session-contract.js';
 import { applyWorkerLaunchModel } from './core/worker-launch-model.js';
 import { readTraexEffortComposer, validateTraexTopicEffortRestart, type TraexTopicEffortRestart } from './utils/traex-session-effort.js';
 import { deploymentContinuationTemplate } from './services/deployment-continuation.js';
@@ -1946,6 +1949,123 @@ function armRpcStartupDialogDismiss(): void {
 /** Monotonic identity for the owned/adopted CLI backend generation. Deferred
  * callbacks capture it and must re-check after every await before touching
  * transcript lifecycle or user-visible state. */
+let workerSessionEventScope: WorkerSessionEventScope | undefined;
+const pendingRuntimeReservations = new Map<string, (mayStart: boolean) => void>();
+const contractWriteBackends = new WeakSet<SessionBackend>();
+function hasCurrentSessionRuntime(): boolean { return !workerSessionEventScope || workerSessionEventScope.isCurrentContext(); }
+function fenceContractBackendWrites(): void {
+  const target = backend;
+  if (!workerSessionEventScope || !target || contractWriteBackends.has(target)) return;
+  contractWriteBackends.add(target);
+  const write = target.write.bind(target);
+  target.write = data => hasCurrentSessionRuntime() ? write(data) : false;
+  if (target.submitTurn) {
+    const submit = target.submitTurn.bind(target);
+    target.submitTurn = input => hasCurrentSessionRuntime() ? submit(input) : Promise.resolve({ submitted: false, submissionDisposition: 'untouched', failureReason: 'runtime_scope_superseded' });
+  }
+}
+function bindSessionRuntimeCallback<T extends (...args: any[]) => any>(callback: T, livePhysical = false): T {
+  fenceContractBackendWrites();
+  return workerSessionEventScope ? livePhysical ? workerSessionEventScope.bindLivePhysical(callback) : workerSessionEventScope.bind(callback) : callback;
+}
+function bindSessionInputCallback<T extends (...args: any[]) => any>(callback: T): T {
+  return ((...args: Parameters<T>) => {
+    const scope = workerSessionEventScope; const binding = scope?.currentBinding();
+    return scope && binding ? scope.run(binding, () => callback(...args)) : callback(...args);
+  }) as T;
+}
+function bindSessionExecutionEvent<T extends (...args: any[]) => any>(callback: T,
+  select?: (args: Parameters<T>) => { turnId?: string; dispatchAttempt?: number; origin?: CapturedSessionOrigin }): T {
+  return workerSessionEventScope ? workerSessionEventScope.bindExecutionEvent(callback, select) : callback;
+}
+function bindSessionBackendExit<T extends (...args: any[]) => any>(callback: T): T {
+  const observed = backend;
+  return bindSessionRuntimeCallback(((...args: Parameters<T>) => {
+    if (backend !== observed) {
+      if (intentionalRestartBackend === observed) intentionalRestartBackend = null;
+      // Only a scoped host can retain an old runtime's exit as history. Legacy
+      // consumers interpret claude_exit as the current CLI and must not receive
+      // a delayed exit from the planned replacement's predecessor.
+      if (workerSessionEventScope) send({ type: 'claude_exit', code: args[0], signal: args[1] });
+      return;
+    }
+    return callback(...args);
+  }) as T);
+}
+function bindSessionObservation<T extends (...args: any[]) => any>(callback: T): T {
+  return workerSessionEventScope ? workerSessionEventScope.bindObservation(callback) : callback;
+}
+function observeContractNativeSession(nativeSessionId: string): void {
+  const scope = workerSessionEventScope;
+  const active = scope?.currentBinding();
+  if (!scope || !active || scope.contextBinding() !== active || !nativeSessionId) return;
+  const previous = active.identity?.nativeSessionId;
+  if (previous && previous !== nativeSessionId) {
+    const binding = scope.beginRuntime(active.operationId, active.physicalId);
+    binding.identity = { ...runtimeIdentityForContract(active), nativeSessionId };
+    scope.enterRuntime(binding);
+    send({ type: 'runtime_binding_started', bindingId: binding.bindingId });
+    send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity });
+  } else if (!previous) {
+    active.identity = { ...runtimeIdentityForContract(active), nativeSessionId };
+    send({ type: 'runtime_binding', bindingId: active.bindingId, identity: active.identity });
+  }
+}
+function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): WorkerToDaemon {
+  if (!workerSessionEventScope) return msg;
+  const operationOrigin = msg.type === 'restart_result' ? workerSessionEventScope.operationOrigin(msg.attemptId) : undefined;
+  const captured = origin ?? workerSessionEventScope.origin('turnId' in msg ? msg.turnId : undefined, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined) ?? operationOrigin;
+  const context = workerSessionEventScope.envelope(captured);
+  if (!context.scope.execution && 'turnId' in msg) {
+    const execution = workerSessionEventScope.executionForTurn(msg.turnId, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined);
+    if (execution) context.scope.execution = execution;
+  }
+  // Physical process proof is available before an opening attempt is bound.
+  // Keep its frozen runtime, without claiming execution acceptance.
+  if (msg.type === 'claude_exit' || msg.type === 'local_process_attestation') delete context.scope.execution;
+  return { ...msg, sessionContract: context };
+}
+function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdentity {
+  const observedBackend = backend; const observedScope = workerSessionEventScope;
+  const observedBinding = observedScope?.currentBinding(); const backendType = effectiveBackendType;
+  const owned = () => backend === observedBackend && workerSessionEventScope === observedScope
+    && observedScope?.currentBinding() === observedBinding;
+  const opaque = (): RuntimeIdentity => ({ backend: backendType, physicalId: binding.physicalId, proof: 'opaque' });
+  const nativeIdentity = observedBackend?.getRuntimeIdentity?.();
+  if (nativeIdentity) return owned() ? nativeIdentity : opaque();
+  const remote = (observedBackend as { getBackendState?(): { provider?: string; generation?: number; remoteSessionId?: string; agentThreadId?: string } } | null)?.getBackendState?.();
+  if (remote?.generation !== undefined) return owned() ? { backend: backendType, physicalId: `${remote.provider ?? 'remote'}:${remote.remoteSessionId ?? binding.physicalId}`, nativeSessionId: remote.agentThreadId, nativeGeneration: String(remote.generation), proof: remote.remoteSessionId ? 'native_generation' : 'opaque' } : opaque();
+  const childPid = (observedBackend as { cliPid?: number } | null)?.cliPid ?? observedBackend?.getChildPid?.() ?? codexRpcEngine?.appServerPid;
+  const start = childPid ? readProcessStartIdentity(childPid) : undefined;
+  if (childPid && start) {
+    let nativeSessionId = binding.identity?.nativeSessionId;
+    if (lastInitConfig?.cliId === 'traex') {
+      // A restored busy CLI may emit no new cli_session_id. Only a fresh,
+      // unambiguous top-level rollout held by this PID supplies its identity;
+      // a configured resume target cannot prove the live conversation.
+      const owned = findTraexRolloutSetByPid(childPid);
+      const observed = owned?.size === 1 ? findTraexRolloutByPid(childPid) : undefined;
+      if (observed && owned!.has(observed.cliSessionId)) nativeSessionId = observed.cliSessionId;
+    }
+    if (owned() && readProcessStartIdentity(childPid) === start) return { backend: backendType, physicalId: `${childPid}:${start}`, proof: 'process_start', ...(nativeSessionId ? { nativeSessionId } : {}) };
+  }
+  return opaque();
+}
+async function publishRuntimeContract(binding: RuntimeEventBinding): Promise<void> {
+  if (!workerSessionEventScope || workerSessionEventScope.currentBinding() !== binding) return;
+  const identity = runtimeIdentityForContract(binding);
+  const previous = binding.identity;
+  if (previous && previous.proof !== 'opaque' && (previous.backend !== identity.backend || previous.physicalId !== identity.physicalId
+    || previous.proof !== identity.proof || (previous.nativeGeneration !== undefined && previous.nativeGeneration !== identity.nativeGeneration)
+    || (previous.nativeSessionId !== undefined && previous.nativeSessionId !== identity.nativeSessionId))) {
+    const scope = workerSessionEventScope;
+    binding = scope.beginRuntime(binding.operationId, binding.physicalId);
+    scope.enterRuntime(binding);
+    send({ type: 'runtime_binding_started', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
+  }
+  binding.identity = identity;
+  send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
+}
 let cliSpawnGeneration = 0;
 
 class CliSpawnSupersededError extends Error {
@@ -2146,6 +2266,7 @@ async function resolveMcpLinkRefsThroughHost(input: {
 
 const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = async (input) => {
   const { identity, delivery } = input;
+  const sessionOrigin = identity.sessionOrigin ?? workerSessionEventScope?.origin(identity.turnId, identity.dispatchAttempt);
   const cfg = lastInitConfig;
   if (!cfg || !identity.turnId || !identity.caller?.requestUserUnionId) {
     throw new Error('plugin_result_delivery_missing_identity');
@@ -2203,6 +2324,7 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
     fileCount: artifact.fileCount,
     responseKind: resolvedDelivery.responseKind ?? 'final',
   };
+  const scopedPayload = sessionEventMetadata(payload, sessionOrigin);
   try {
     await sendTrustedDeliveryIpcWithBackpressure({
       get connected() { return process.connected; },
@@ -2210,7 +2332,7 @@ const deliverPluginResultThroughHost: GatewayTrustedResultDeliveryHandler = asyn
         if (!process.send) throw new Error('plugin_result_delivery_ipc_unavailable');
         return process.send(message, callback);
       },
-    }, payload);
+    }, scopedPayload);
   } catch (error) {
     pendingPluginResultDeliveries.delete(requestId);
     artifactStore.revoke(artifact.artifactId);
@@ -6382,11 +6504,16 @@ function releaseActiveTurnAuthority(
 
 function currentGatewayTrustedTurnIdentity(): GatewayTrustedTurnIdentity {
   const identity = activeTurnAuthority.identity();
+  const binding = workerSessionEventScope?.currentBinding();
+  const sessionOrigin = workerSessionEventScope?.origin(identity.turnId, identity.dispatchAttempt)
+    ?? (binding && identity.turnId && identity.turnId === currentBotmuxTurnId
+      ? { bindingId: binding.bindingId, runtime: binding.runtime, execution: workerSessionEventScope?.executionForTurn(identity.turnId, identity.dispatchAttempt) } : undefined);
   return {
     ...identity,
     protectedMcpContainmentActiveCapabilityIds: [
       ...localProtectedMcpContainmentActiveCapabilityIds,
     ],
+    ...(sessionOrigin ? { sessionOrigin } : {}),
     ...(currentBotmuxLinkRefMode ? { linkRefMode: currentBotmuxLinkRefMode } : {}),
   };
 }
@@ -9273,6 +9400,7 @@ function initializeFinalOutputHandoff(cfg: Extract<DaemonToWorker, { type: 'init
       appId: cfg.larkAppId, sessionId: cfg.sessionId, token: cfg.finalOutputHandoff.token,
       persist: snapshot => journal.save(snapshot), remove: snapshot => journal.remove(snapshot),
       restore: () => journal.readPending(), send: output => { if (!closeRequested) process.send?.(output); },
+      context: origin => workerSessionEventScope?.replayEnvelope(origin) ?? origin,
       error: error => log(`Universal output recovery pending: ${String(error)}`),
     });
     if (cfg.finalOutputHandoff.admitNew && cfg.turnId) new TurnSendLedger(process.env.SESSION_DATA_DIR).enableHandoffFence({ larkAppId: cfg.larkAppId, sessionId: cfg.sessionId, turnId: cfg.turnId });
@@ -16058,7 +16186,11 @@ async function handleTermAction(requestedKey: TermActionKey): Promise<void> {
  *  active turn. This is deliberately separate from card `term_action`: a stale
  *  HTTP request must never interrupt a newer turn that reused this CLI process. */
 async function handleExactTurnInterrupt(requestId: string, turnId: string): Promise<void> {
-  if (turnId !== currentBotmuxTurnId) {
+  const expectedExecution = workerSessionEventScope?.capture()?.execution;
+  const isCurrentExact = () => turnId === currentBotmuxTurnId
+    && (!expectedExecution || expectedExecution.dispatchAttempt === currentBotmuxDispatchAttempt)
+    && (!workerSessionEventScope || hasCurrentSessionRuntime());
+  if (!isCurrentExact()) {
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
     return;
   }
@@ -16089,7 +16221,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
   const targetBackend = backend;
   const lifetime = cliLifetimeNonce;
   if (codexCliEffortOperation) await cancelCodexCliEffort();
-  if (backend !== targetBackend || cliLifetimeNonce !== lifetime || currentBotmuxTurnId !== turnId) {
+  if (backend !== targetBackend || cliLifetimeNonce !== lifetime || !isCurrentExact()) {
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
     return;
   }
@@ -16100,16 +16232,16 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
   let delivered = false;
   try {
     delivered = await runAfterAmbiguousSubmissionWrites(targetBackend, async () => {
-      if (backend !== targetBackend || currentBotmuxTurnId !== turnId) return false;
+      if (backend !== targetBackend || !isCurrentExact()) return false;
       return sendCriticalControlKey(interruptKey, () => {
-        if (backend !== targetBackend || currentBotmuxTurnId !== turnId) return true;
+        if (backend !== targetBackend || !isCurrentExact()) return true;
         return sendTermActionOnce(targetBackend, interruptKey);
       });
     });
   } catch (err) {
     log(`Exact interrupt ${turnId.substring(0, 8)} failed: ${err instanceof Error ? err.message : String(err)}`);
   }
-  if (backend !== targetBackend || currentBotmuxTurnId !== turnId) {
+  if (backend !== targetBackend || !isCurrentExact()) {
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
     return;
   }
@@ -18897,6 +19029,7 @@ function markPromptReadyFromPty(observedBackend: SessionBackend): void {
 
 /** Push a coarse screen status without waiting for the periodic sampler. */
 function publishScreenStatus(status: 'working' | 'idle', opts?: { force?: boolean; clearTurnId?: boolean }): void {
+  if (workerSessionEventScope && !hasCurrentSessionRuntime()) return;
   if (!renderer) return;
   const { content } = renderer.snapshot();
   const statusPayload = opts?.force ? { status } : classifyScreenUsageLimit(content, status);
@@ -19336,6 +19469,7 @@ function holdForNativeSessionFork(): boolean {
 }
 
 function markPromptReady(): void {
+  if (workerSessionEventScope && !hasCurrentSessionRuntime()) return;
   // Screen probes and timeout fallbacks must honor the same startup evidence
   // as quiescence; a skeleton composer is not a ready CLI.
   if (idleDetector?.isStartupPending()) return;
@@ -20914,6 +21048,11 @@ async function flushPending(): Promise<void> {
         && !(await admitTraexAutoModelPendingInput(pendingMessages[0]!))) break;
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
+      if (workerSessionEventScope && !workerSessionEventScope.canSubmit(item.turnId, item.dispatchAttempt)) {
+        if (item.turnId) send({ type: 'turn_input_rejected', turnId: item.turnId, ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}), reason: 'execution_reconciliation_required' });
+        continue;
+      }
+      workerSessionEventScope?.enterTurn(item.turnId, item.dispatchAttempt);
       attachDeferredPluginSkillCatalog(item);
       // Apply the credential snapshot that arrived WITH this turn, immediately
       // before the turn is written. Doing it at IPC-receive time collapsed two
@@ -21201,6 +21340,7 @@ async function flushPending(): Promise<void> {
           } else {
             prepareNormalWrite();
             result = await writeBackend.submitTurn({
+              sessionOrigin: workerSessionEventScope?.origin(item.turnId, item.dispatchAttempt),
               content: msg,
               turnId: item.turnId,
               ...(item.replyTurnId ? { replyTurnId: item.replyTurnId } : {}),
@@ -22266,7 +22406,7 @@ function setupAdoptInputAdapter(cfg: Extract<DaemonToWorker, { type: 'init' }>):
 }
 
 function wireIdleDetectorBusyTransition(detector: IdleDetector, label: string): void {
-  detector.onBusy(() => {
+  detector.onBusy(bindSessionObservation(() => {
     // The CLI went back to work while an idle edge was still settling.
     idleTranscriptSettle?.cancel();
     if (!isPromptReady) return;
@@ -22274,13 +22414,13 @@ function wireIdleDetectorBusyTransition(detector: IdleDetector, label: string): 
     log(`Explicit busy marker detected — ${label}`);
     noteClaudeBridgeTurnStarted();
     publishScreenStatus('working', { force: true });
-  });
+  }));
 }
 
 function setupAdoptIdleDetection(cfg: Extract<DaemonToWorker, { type: 'init' }>, label: string): void {
   idleDetector = new IdleDetector(adoptIdleAdapter(cfg));
   wireIdleDetectorBusyTransition(idleDetector, `${label} adopt mode`);
-  idleDetector.onIdle(async (evidenceSource) => {
+  idleDetector.onIdle(bindSessionObservation(async (evidenceSource) => {
     const idleBackend = backend;
     if ((evidenceSource === 'external' || currentPostTerminalInputFence())
       && cliAdapter?.postTerminalPromptFence === true
@@ -22313,7 +22453,7 @@ function setupAdoptIdleDetection(cfg: Extract<DaemonToWorker, { type: 'init' }>,
     if (idleBackend && deferPromptReadyWhileBusy(`${label} adopt-idle`, idleBackend)) return;
     drainBridges();
     markPromptReady();
-  });
+  }));
 }
 
 function seedBackendScreen(source: string, be: Pick<SessionBackend, 'captureCurrentScreen'>): void {
@@ -22741,6 +22881,46 @@ async function spawnCli(
     reuseExistingScratchTree?: boolean;
   } = {},
 ): Promise<void> {
+  if (!workerSessionEventScope) return spawnCliBody(cfg, opts);
+  const firstBinding = !workerSessionEventScope.currentBinding();
+  if (cfg.prompt && !workerSessionEventScope.canSubmit(cfg.turnId, cfg.dispatchAttempt, cfg.sessionCommand?.execution)) {
+    if (cfg.turnId) send({ type: 'turn_input_rejected', turnId: cfg.turnId, ...(cfg.dispatchAttempt !== undefined ? { dispatchAttempt: cfg.dispatchAttempt } : {}), reason: 'execution_reconciliation_required' });
+    cfg.prompt = ''; initialInputOwnershipPending = false;
+  }
+  const execution = firstBinding || cfg.prompt ? cfg.sessionCommand?.execution : undefined;
+  const previousBinding = workerSessionEventScope.currentBinding();
+  const binding = workerSessionEventScope.beginRuntime(activeRestartAttemptId);
+  if (execution) workerSessionEventScope.rememberExecution(execution, binding);
+  return workerSessionEventScope.run(binding, async () => {
+    const reserved = new Promise<boolean>((resolve) => {
+      const timer = setTimeout(() => { pendingRuntimeReservations.delete(binding.bindingId); resolve(false); }, 15_000);
+      timer.unref?.();
+      pendingRuntimeReservations.set(binding.bindingId, mayStart => { clearTimeout(timer); pendingRuntimeReservations.delete(binding.bindingId); resolve(mayStart); });
+    });
+    send({ type: 'runtime_binding_started', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
+    if (!await reserved || closeRequested || workerSessionEventScope?.currentBinding() !== binding) {
+      workerSessionEventScope?.restoreAfterAbortedStart(binding, previousBinding);
+      workerSessionEventScope?.reportAbortedStart(binding, () => send({ type: 'runtime_binding_aborted', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) }));
+      throw new CliSpawnSupersededError();
+    }
+    try { await spawnCliBody(cfg, opts); }
+    catch (error) {
+      // A replacement that never published an identity releases its
+      // reservation; otherwise it would mask the surviving runtime's exit.
+      if (!binding.identity) {
+        workerSessionEventScope?.restoreAfterAbortedStart(binding, previousBinding);
+        workerSessionEventScope?.reportAbortedStart(binding, () => send({ type: 'runtime_binding_aborted', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) }));
+      }
+      throw error;
+    }
+    await publishRuntimeContract(binding);
+  }, execution);
+}
+
+async function spawnCliBody(
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+  opts: Parameters<typeof spawnCli>[1] = {},
+): Promise<void> {
   followBotTraeHome(cfg);
   const protectedCliError = protectedHttpEgressCliSupportError(cfg.cliId, cfg.protectedHttpEgressPolicy);
   if (protectedCliError) throw new Error(protectedCliError + FROZEN_NETWORK_POLICY_HINT);
@@ -22953,14 +23133,14 @@ async function spawnCli(
     setupAdoptTranscriptBridges(cfg);
     setupAdoptInputAdapter(cfg);
     setupAdoptIdleDetection(cfg, 'orca');
-    backend.onData(onPtyData);
-    backend.onExit((code, signal) => {
+    backend.onData(bindSessionRuntimeCallback(onPtyData, true));
+    backend.onExit(bindSessionBackendExit((code, signal) => {
       log(`Adopted Orca terminal ended (code: ${code}, signal: ${signal})`);
       backend = null;
       isPromptReady = false;
       stopBridgeWatcher();
       send({ type: 'claude_exit', code, signal, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
-    });
+    }));
     awaitingFirstPrompt = false;
     renderer?.markNewTurn();
     publishLocalProcessAttestation(cfg.adoptCliPid);
@@ -23006,22 +23186,22 @@ async function spawnCli(
     setupAdoptInputAdapter(cfg);
     setupAdoptIdleDetection(cfg, 'herdr');
 
-    backend.onData(onPtyData);
-    backend.onAccessUrl?.((url) => {
+    backend.onData(bindSessionRuntimeCallback(onPtyData, true));
+    backend.onAccessUrl?.(bindSessionRuntimeCallback((url) => {
       send({
         type: 'riff_access_url',
         accessUrl: url,
         turnId: currentBotmuxTurnId,
         dispatchAttempt: currentBotmuxDispatchAttempt,
       });
-    });
-    backend.onExit((code, signal) => {
+    }));
+    backend.onExit(bindSessionBackendExit((code, signal) => {
       log(`Adopted herdr stream ended (code: ${code}, signal: ${signal})`);
       backend = null;
       isPromptReady = false;
       stopBridgeWatcher();
       send({ type: 'claude_exit', code, signal, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
-    });
+    }));
 
     awaitingFirstPrompt = false;
     renderer?.markNewTurn();
@@ -23070,22 +23250,22 @@ async function spawnCli(
     setupAdoptIdleDetection(cfg, 'pipe');
     setupAdoptInputAdapter(cfg);
 
-    backend.onData(onPtyData);
-    backend.onAccessUrl?.((url) => {
+    backend.onData(bindSessionRuntimeCallback(onPtyData, true));
+    backend.onAccessUrl?.(bindSessionRuntimeCallback((url) => {
       send({
         type: 'riff_access_url',
         accessUrl: url,
         turnId: currentBotmuxTurnId,
         dispatchAttempt: currentBotmuxDispatchAttempt,
       });
-    });
-    backend.onExit((code, signal) => {
+    }));
+    backend.onExit(bindSessionBackendExit((code, signal) => {
       log(`Adopted pipe-pane stream ended (code: ${code}, signal: ${signal})`);
       backend = null;
       isPromptReady = false;
       stopBridgeWatcher();
       send({ type: 'claude_exit', code, signal, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
-    });
+    }));
 
     awaitingFirstPrompt = false;
     renderer?.markNewTurn();
@@ -25460,6 +25640,9 @@ async function spawnCli(
   // Never let a stale daemon environment poison an unprotected CLI launch.
   delete childEnv.BOTMUX_PROTECTED_EGRESS_REQUIRED;
   if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(childEnv);
+  const runtimeBinding = workerSessionEventScope?.contextBinding();
+  if (runtimeBinding) childEnv.BOTMUX_RUNTIME_BINDING_ID = runtimeBinding.bindingId;
+  else delete childEnv.BOTMUX_RUNTIME_BINDING_ID;
   // buildSessionChildEnv preserves TMPDIR/TMP/TEMP in both inheritance modes.
   // The worker pin above is the single source for CLI and worker scratch.
   childEnv[PLUGIN_CARD_ACTION_CAPABILITIES_ENV] = cardActionCapabilities;
@@ -28420,7 +28603,7 @@ async function spawnCli(
     // A new CLI process starts with no closed turn of its own.
     claudeTranscriptTurnEnd.reset();
     wireIdleDetectorBusyTransition(idleDetector, `${cliName()} PTY`);
-    idleDetector.onIdle(async (evidenceSource) => {
+    idleDetector.onIdle(bindSessionObservation(async (evidenceSource) => {
       log('Prompt detected (idle)');
       // Snapshot-only backends (ZMX) must complete one authoritative refresh
       // before a turn is declared idle, or a final burst lands after finalize.
@@ -28476,20 +28659,20 @@ async function spawnCli(
         if (backend !== observedBackend) return;
         drainBridgesThenMarkReady(evidenceSource);
       });
-    });
+    }));
   }
 
-  observedBackend.onData((data) => {
+  observedBackend.onData(bindSessionRuntimeCallback((data) => {
     if (backend !== observedBackend) return;
     onPtyData(data);
-  });
+  }, true));
   if (observedBackend instanceof HerdrBackend) {
     const transcriptSettle = makeBridgeTranscriptSettle(
       () => bridgeHeadTurnAwaitingTerminal(),
       noteBridgeTurnCloseWaitExpired,
     );
     const promptReadyEdgesAtSpawn = promptReadyEdges;
-    observedBackend.onAgentStatus((status) => {
+    observedBackend.onAgentStatus(bindSessionRuntimeCallback((status) => {
       if (backend !== observedBackend) return;
       if (status === 'idle' || status === 'done') {
         // A just-launched CLI may be reported idle while booting (Kimi and
@@ -28511,9 +28694,9 @@ async function spawnCli(
         isPromptReady = false;
         idleDetector?.reset();
       }
-    });
+    }));
   }
-  backend.onScreenResync?.((snapshot) => {
+  backend.onScreenResync?.(bindSessionRuntimeCallback((snapshot) => {
     if (observedBackend !== backend) return;
     if (effectiveBackendType === 'remote-runner') {
       relayRemoteRunnerWebSnapshot(snapshot);
@@ -28521,20 +28704,20 @@ async function spawnCli(
       log(`${effectiveBackendType} observer recovered — rebasing screen state from history`);
     }
     scheduleBackendScreenResync(snapshot, `${effectiveBackendType} observer recovery`);
-  });
-  backend.onAccessUrl?.((url) => {
+  }, true));
+  backend.onAccessUrl?.(bindSessionRuntimeCallback((url) => {
     send({
       type: 'riff_access_url',
       accessUrl: url,
       turnId: currentBotmuxTurnId,
       dispatchAttempt: currentBotmuxDispatchAttempt,
     });
-  });
+  }));
   // Remote-task turn boundary (riff): flushPending() marks the session busy on
   // every write and riff has no PTY output, so the idle detector never re-arms
   // prompt-ready — without this hook a follow-up arriving mid-task would sit
   // in pendingMessages forever once the task finishes.
-  backend.onTaskDone?.(() => {
+  backend.onTaskDone?.(bindSessionExecutionEvent(() => {
     if (fatalWorkerErrorPending) return;
     // Generation fence (matches the onAgentStatus above and the onExit below):
     // a stale RiffBackend's `fetchAndEmitOutput(...).finally(taskDoneCb)` can
@@ -28547,12 +28730,12 @@ async function spawnCli(
     if (backend !== observedBackend) return;
     log(`${cliName()} task finished — re-arming prompt-ready for queued follow-ups`);
     markPromptReady();
-  });
+  }));
   // Headless final-answer bridge: deliver the turn's answer to the
   // thread when the agent produced one but never called `botmux send`. Same
   // generation fence as onTaskDone above — a late callback from a backend the
   // worker has already replaced must not post into the current turn.
-  backend.onTurnFinal?.((text, turnId, hostContext) => {
+  backend.onTurnFinal?.(bindSessionExecutionEvent((text, turnId, hostContext) => {
     if (fatalWorkerErrorPending) return;
     if (backend !== observedBackend) return;
     if (turnId && currentBotmuxTurnId && turnId !== currentBotmuxTurnId) {
@@ -28573,8 +28756,8 @@ async function spawnCli(
         currentBotmuxDispatchAttempt,
       );
     }
-  });
-  backend.onOutboundMessage?.(async (message, hostContext) => {
+  }, args => ({ turnId: args[1], origin: args[2]?.sessionOrigin })));
+  backend.onOutboundMessage?.(bindSessionExecutionEvent(async (message, hostContext) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) {
       return {
         outcome: 'rejected',
@@ -28583,8 +28766,8 @@ async function spawnCli(
       };
     }
     return deliverRemoteRunnerOutboundMessage(message, hostContext?.linkRefMode);
-  });
-  backend.onSessionTool?.(async (operation) => {
+  }, args => ({ turnId: args[0].turnId, origin: args[1]?.sessionOrigin })));
+  backend.onSessionTool?.(bindSessionExecutionEvent(async (operation, hostContext) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) {
       return {
         outcome: 'rejected',
@@ -28593,8 +28776,8 @@ async function spawnCli(
       };
     }
     return deliverRemoteRunnerSessionTool(operation);
-  });
-  backend.onTurnRecovered?.(async (turn) => {
+  }, args => ({ turnId: args[0].turnId, origin: args[1]?.sessionOrigin })));
+  backend.onTurnRecovered?.(bindSessionExecutionEvent(async (turn) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) return;
     try {
       if (currentBotmuxTurnId && currentBotmuxTurnId !== turn.turnId) {
@@ -28618,7 +28801,7 @@ async function spawnCli(
       if (fatalWorkerErrorPending || backend !== observedBackend) return;
       if (!observedBackend.setRecoveredTurnHostContext?.(
         turn.turnId,
-        restoredLinkRefMode ? { linkRefMode: restoredLinkRefMode } : {},
+        { ...(restoredLinkRefMode ? { linkRefMode: restoredLinkRefMode } : {}), sessionOrigin: workerSessionEventScope?.origin(turn.turnId, turn.dispatchAttempt) },
       )) {
         throw new Error('recovered turn host context is no longer installable');
       }
@@ -28660,8 +28843,8 @@ async function spawnCli(
       );
       observedBackend.kill();
     }
-  });
-  backend.onTurnFailure?.((failure) => {
+  }, args => ({ turnId: args[0].turnId, dispatchAttempt: args[0].dispatchAttempt })));
+  backend.onTurnFailure?.(bindSessionExecutionEvent((failure) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) return;
     if (currentBotmuxTurnId && failure.turnId !== currentBotmuxTurnId) {
       log(`Ignored stale remote failure for turn ${failure.turnId.substring(0, 12)}`);
@@ -28683,16 +28866,18 @@ async function spawnCli(
       undefined,
       failure.retryable,
     );
-  });
-  backend.onBackendState?.((state) => {
+  }, args => ({ turnId: args[0].turnId, origin: args[0].sessionOrigin })));
+  backend.onBackendState?.(bindSessionRuntimeCallback((state) => {
     if (backend !== observedBackend) return;
+    const binding = workerSessionEventScope?.currentBinding();
+    if (binding) void publishRuntimeContract(binding);
     send({ type: 'remote_backend_state', state });
-  });
-  backend.onUsageSnapshot?.((usage) => {
+  }));
+  backend.onUsageSnapshot?.(bindSessionRuntimeCallback((usage) => {
     if (backend !== observedBackend) return;
     send({ type: 'remote_usage', usage });
-  });
-  backend.onReady?.(() => {
+  }));
+  backend.onReady?.(bindSessionRuntimeCallback(() => {
     if (backend !== observedBackend || fatalWorkerErrorPending) return;
     if (effectiveBackendType === 'remote-runner') {
       if (remoteRunnerRecoveredTurnInFlight && currentBotmuxTurnId) {
@@ -28703,16 +28888,18 @@ async function spawnCli(
       return;
     }
     markPromptReady();
-  });
+  }));
   // riff：任务 id 变更同步给 daemon 持久化，daemon 重启后 follow-up 血缘不断。
-  backend.onTaskId?.((taskId) => {
+  backend.onTaskId?.(bindSessionRuntimeCallback((taskId) => {
+    const binding = workerSessionEventScope?.currentBinding();
+    if (binding && workerSessionEventScope?.contextBinding() === binding) void publishRuntimeContract(binding);
     send({ type: 'riff_task_id', taskId });
-  });
+  }));
   if (backend instanceof HerdrBackend) {
     wireHerdrWebTerminalRelays(backend);
     restoreHerdrWebBindings();
   }
-  backend.onExit((code, signal) => {
+  backend.onExit(bindSessionBackendExit((code, signal) => {
     const intentionalRestart = intentionalRestartBackend === observedBackend;
     if (intentionalRestart) intentionalRestartBackend = null;
     // destroySession()/kill() may report exit after the 500ms replacement spawn
@@ -28923,7 +29110,7 @@ async function spawnCli(
       const sandboxNamespace = code !== 0 ? sandboxNamespaceDiagnosis(logTail) : undefined;
       send({ type: 'claude_exit', code, signal, logTail, canParkDiagnostic, turnId: exitedTurnId, dispatchAttempt: exitedDispatchAttempt, ...(isCodexAppCliId(lastInitConfig?.cliId) && code === CODEX_APP_ACTIVE_WRITER_EXIT_CODE ? { codexAppActiveWriter: true } : {}), ...(sandboxNamespace ? { sandboxNamespace } : {}) });
     }
-  });
+  }));
 
   const isPersistentBackendReattach = actuallyReattachedPersistent;
   // Codex App warm observation is armed only after the old generation proves
@@ -29944,7 +30131,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         // attach at a reasonable default after a short delay.
         const spawnTimer = setTimeout(() => startAttach(150, 40), 500);
 
-        ws.on('message', async (raw) => {
+        ws.on('message', bindSessionInputCallback(async (raw) => {
           try {
             const msg = JSON.parse(String(raw));
             if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
@@ -29961,8 +30148,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               if (!authedClients.has(ws)) return;
               const inputBackend = backend;
               const inputLifetime = cliLifetimeNonce;
+              const inputRuntimeBinding = workerSessionEventScope?.currentBinding();
+              if (workerSessionEventScope && !inputRuntimeBinding?.runtime) return;
               if (!await cancelDeploymentForTerminalInput()) return;
-              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
+              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || workerSessionEventScope?.currentBinding() !== inputRuntimeBinding || !authedClients.has(ws) || nativeSessionForkPending()) return;
               if (codexCliEffortOperation) {
                 const target = backend;
                 const lifetime = cliLifetimeNonce;
@@ -29974,7 +30163,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               else pendingInput.push(msg.data);
             }
           } catch { /* ignore non-JSON or bad messages */ }
-        });
+        }));
 
         ws.on('close', () => {
           clearTimeout(spawnTimer);
@@ -30037,7 +30226,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
 
         const spawnTimer = setTimeout(() => startAttach(150, 40), 500);
 
-        ws.on('message', async (raw) => {
+        ws.on('message', bindSessionInputCallback(async (raw) => {
           try {
             const msg = JSON.parse(String(raw));
             if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
@@ -30047,8 +30236,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               if (!authedClients.has(ws)) return;
               const inputBackend = backend;
               const inputLifetime = cliLifetimeNonce;
+              const inputRuntimeBinding = workerSessionEventScope?.currentBinding();
+              if (workerSessionEventScope && !inputRuntimeBinding?.runtime) return;
               if (!await cancelDeploymentForTerminalInput()) return;
-              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
+              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || workerSessionEventScope?.currentBinding() !== inputRuntimeBinding || !authedClients.has(ws) || nativeSessionForkPending()) return;
               if (codexCliEffortOperation) {
                 const target = backend;
                 const lifetime = cliLifetimeNonce;
@@ -30060,7 +30251,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               else pendingInput.push(msg.data);
             }
           } catch { /* ignore non-JSON or bad messages */ }
-        });
+        }));
 
         ws.on('close', () => {
           clearTimeout(spawnTimer);
@@ -30143,7 +30334,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
           ws.send(seed + modeSeed + herdrWebCursorSequence());
         }
 
-        ws.on('message', async (raw) => {
+        ws.on('message', bindSessionInputCallback(async (raw) => {
           try {
             const msg = JSON.parse(String(raw));
             if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
@@ -30159,8 +30350,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               if (!authedClients.has(ws)) return;
               const inputBackend = backend;
               const inputLifetime = cliLifetimeNonce;
+              const inputRuntimeBinding = workerSessionEventScope?.currentBinding();
+              if (workerSessionEventScope && !inputRuntimeBinding?.runtime) return;
               if (!await cancelDeploymentForTerminalInput()) return;
-              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || !authedClients.has(ws) || nativeSessionForkPending()) return;
+              if (backend !== inputBackend || cliLifetimeNonce !== inputLifetime || workerSessionEventScope?.currentBinding() !== inputRuntimeBinding || !authedClients.has(ws) || nativeSessionForkPending()) return;
               if (codexCliEffortOperation) {
                 const target = backend;
                 const lifetime = cliLifetimeNonce;
@@ -30191,7 +30384,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               }
             }
           } catch { /* ignore non-JSON or bad messages */ }
-        });
+        }));
 
         ws.on('close', () => {
           wsClients.delete(ws);
@@ -31905,6 +32098,7 @@ const turnExecutionClock = new TurnExecutionClock();
  *  now. Called from every literal-write site (flush, adopt, passthrough, init)
  *  so `durationMs` measures the CLI, not the daemon's backlog. */
 function markTurnExecutionStart(turnId: string | undefined, dispatchAttempt?: number): void {
+  workerSessionEventScope?.recordSubmission(turnId, dispatchAttempt);
   const startedAtMs = Date.now();
   turnExecutionClock.start(turnId, dispatchAttempt, startedAtMs);
   inputDeliveryEvidence.start({
@@ -32057,6 +32251,7 @@ function emitTurnTerminal(
   errorDetail?: string,
 ): void {
   if (!sessionId || !turnId) return;
+  if (workerSessionEventScope && !workerSessionEventScope.ownsExecutionEvent(turnId, dispatchAttempt)) return;
   if (traexQuotaPending?.turnId === turnId) traexQuotaPending = undefined;
   if (traexModelAccessSwitchNotice?.action.turnId === turnId) traexModelAccessSwitchNotice = undefined;
   cancelSubmitFailureChainForTerminal(
@@ -32064,7 +32259,9 @@ function emitTurnTerminal(
     { turnId, dispatchAttempt },
     cliSpawnGeneration,
   );
-  if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt, status)) {
+  const outcome = contractTerminalStatus(status, errorCode);
+  const dedupStatus = outcome === 'reconciling' ? 'ambiguous' : outcome === 'succeeded' ? 'completed' : outcome;
+  if (!emittedTurnTerminals.claim(sessionId, turnId, dispatchAttempt, dedupStatus)) {
     // A duplicate terminal must not leave the start armed: the first emission
     // already published this turn's timing and consumed the entry, but a
     // *replay* whose first emission never ran through this path could.
@@ -32157,11 +32354,13 @@ function workerIpcPayload(msg: WorkerToDaemon): WorkerToDaemon {
 }
 
 function send(msg: WorkerToDaemon): void {
+  if (msg.type === 'final_output' && workerSessionEventScope && !workerSessionEventScope.ownsExecutionEvent(msg.turnId, msg.dispatchAttempt)) { log('Dropped final output with unproven execution origin'); return; }
   if (closeRequested && msg.type === 'final_output') {
     log('Dropped final_output after close fence');
     return;
   }
-  const payload = workerIpcPayload(msg);
+  if (msg.type === 'cli_session_id') observeContractNativeSession(msg.cliSessionId);
+  const payload = sessionEventMetadata(workerIpcPayload(msg));
   if (payload.type === 'final_output' && universalOutputHandoff && lastInitConfig?.finalOutputHandoff?.admitNew === true) universalOutputHandoff.publish(payload);
   else process.send?.(payload);
   if (isWorkflowWorker() && payload.type === 'final_output') workflowFinalOutputSent = true;
@@ -32368,7 +32567,7 @@ function publishLocalProcessAttestation(
  * the exact startup diagnostic the user needs and recreate the silent-bot bug.
  */
 function sendAndFlush(msg: WorkerToDaemon): Promise<void> {
-  const payload = workerIpcPayload(msg);
+  const payload = sessionEventMetadata(workerIpcPayload(msg));
   return new Promise((resolve) => {
     if (!process.send || !process.connected) {
       resolve();
@@ -32515,7 +32714,7 @@ function unattendedRawInputRefusal(
 
 // ─── IPC Message Handler ─────────────────────────────────────────────────────
 
-process.on('message', async (raw: unknown, handle: unknown) => {
+async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Promise<void> {
   const msg = raw as DaemonToWorker;
 
   switch (msg.type) {
@@ -32640,6 +32839,9 @@ process.on('message', async (raw: unknown, handle: unknown) => {
       initialInputOwnershipPending = !!msg.prompt;
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
+      workerSessionEventScope = msg.sessionContract ? new WorkerSessionEventScope(msg.sessionContract.session, msg.sessionContract.worker) : undefined;
+      for (const state of msg.sessionContract?.executions ?? []) workerSessionEventScope?.noteAdmission(state);
+      if (msg.sessionCommand?.execution) workerSessionEventScope?.rememberExecution(msg.sessionCommand.execution);
       initializeFinalOutputHandoff(msg);
       applyInitFinalOutputBackpressure(msg, ordinaryImTurnId);
       // Dashboard grants stay per-boot, while the Lark-card capability is
@@ -33121,6 +33323,33 @@ process.on('message', async (raw: unknown, handle: unknown) => {
       if (!msg.ok) {
         log(`Daemon rejected Codex App dispatch persistence: ${msg.error ?? 'unknown error'}`);
       }
+      break;
+    }
+
+    case 'runtime_binding_aborted_ack': {
+      workerSessionEventScope?.confirmAbortedStart(msg.bindingId);
+      break;
+    }
+    case 'runtime_binding_refused': {
+      workerSessionEventScope?.refuseBinding(msg.bindingId);
+      break;
+    }
+    case 'runtime_contract_reserved': {
+      const binding = workerSessionEventScope?.currentBinding();
+      if (binding?.bindingId === msg.bindingId) binding.proposedRuntime = msg.runtime;
+      pendingRuntimeReservations.get(msg.bindingId)?.(msg.mayStart);
+      break;
+    }
+    case 'execution_contract_assigned': {
+      const binding = workerSessionEventScope?.currentBinding();
+      if (binding?.bindingId === msg.bindingId) workerSessionEventScope?.rememberExecution(msg.execution, binding);
+      break;
+    }
+    case 'runtime_contract_assigned': {
+      workerSessionEventScope?.assign(msg.bindingId, msg.runtime);
+      for (const state of msg.admissionStates ?? []) workerSessionEventScope?.noteAdmission(state);
+      for (const execution of msg.executions ?? []) workerSessionEventScope?.rememberExecution(execution);
+      if (!msg.mayExecute) { closeRequested = true; stopBridgeWatcher(); stopScreenshotLoop(); killCli(); }
       break;
     }
 
@@ -34608,6 +34837,28 @@ process.on('message', async (raw: unknown, handle: unknown) => {
       process.exit(0);
     }
   }
+}
+process.on('message', (raw: unknown, handle: unknown) => {
+  const msg = raw as DaemonToWorker;
+  if (!msg || typeof msg !== 'object') return;
+  const binding = workerSessionEventScope?.currentBinding();
+  if (workerSessionEventScope && msg.type !== 'init') {
+    const admission = admitSessionCommand(msg.type, msg.sessionCommand, binding?.runtime ?? binding?.proposedRuntime, msg.type === 'restart' ? msg.attemptId : undefined);
+    if (!admission.allowed) {
+      log(`Rejected ${msg.type}: ${admission.reason}`);
+      const target = msg.sessionCommand?.runtime ? workerSessionEventScope.bindingForRuntime(msg.sessionCommand.runtime) : binding;
+      const reject = () => {
+        if (msg.type === 'interrupt_turn') send({ type: 'turn_interrupt_result', requestId: msg.requestId, turnId: msg.turnId, delivered: false, reason: 'stale_turn' });
+        if (msg.type === 'restart' && msg.attemptId) send({ type: 'restart_result', attemptId: msg.attemptId, status: 'failed', category: 'spawn_failed', untouched: true });
+      };
+      if (target) workerSessionEventScope.run(target, reject, msg.sessionCommand?.execution, msg.sessionCommand?.operationId);
+      return;
+    }
+  }
+  const execution = msg.sessionCommand?.execution;
+  if (execution) workerSessionEventScope?.rememberExecution(execution);
+  if (binding && workerSessionEventScope && msg.type !== 'init') return workerSessionEventScope.run(binding, () => handleContractDaemonMessage(msg, handle), execution, msg.sessionCommand?.operationId);
+  return handleContractDaemonMessage(msg, handle);
 });
 
 // 预加载层会在正式处理器注册前暂存冷启动消息；现在按到达顺序交还。

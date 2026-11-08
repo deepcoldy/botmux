@@ -14,6 +14,7 @@ import { currentGatewayCallerOpenId } from '../src/core/gateway-turn-caller.js';
 import { isUnsentInputReplayable } from '../src/services/unsent-input-journal.js';
 import { WrittenInputLedger } from '../src/services/prompt-submission-match.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { controllerForSession } from '../src/core/session-controller.js';
 import { loadWorkerPoolMessageHandlers } from './helpers/worker-pool-message-harness.js';
 import { cancelDeploymentContinuation, claimDeploymentContinuation, deploymentContinuationCandidate, recordDeploymentContinuation } from '../src/services/deployment-continuation.js';
 import { codexCapacityRecoveryCli } from '../src/services/codex-app-failure.js';
@@ -72,6 +73,7 @@ function manualInput(failPersistence: boolean) {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
   }).outputText;
   const scope = {
+    controllerForSession,
     cancelDeploymentContinuation, deploymentContinuationAuthority,
     sessionStore: failPersistence ? { updateDeploymentContinuation: () => { throw new Error('disk unavailable'); } } : store,
     getBot: () => ({ config: { cliId: 'codex' } }), sessionCliId: () => 'codex',

@@ -47,7 +47,7 @@ describe('POST /api/sessions/:sessionId/suspend — 延迟挂起', () => {
   it.each(['working', 'analyzing'])('queues instead of killing while %s', async (status) => {
     const ds = activeSession({ lastScreenStatus: status });
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker');
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync');
 
     const res = await postSuspend('s-susp');
 
@@ -63,7 +63,7 @@ describe('POST /api/sessions/:sessionId/suspend — 延迟挂起', () => {
   it.each(['idle', 'limited'])('suspends immediately when already settled (%s)', async (status) => {
     const ds = activeSession({ lastScreenStatus: status });
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync').mockResolvedValue(true);
 
     const res = await postSuspend('s-susp');
 
@@ -77,7 +77,7 @@ describe('POST /api/sessions/:sessionId/suspend — 延迟挂起', () => {
   it('does not queue when the screen status is unknown', async () => {
     const ds = activeSession({ lastScreenStatus: undefined });
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
-    const suspendSpy = vi.spyOn(workerPool, 'suspendWorker').mockReturnValue(true);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync').mockResolvedValue(true);
 
     const res = await postSuspend('s-susp');
 

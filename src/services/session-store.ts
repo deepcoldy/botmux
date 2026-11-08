@@ -1,5 +1,7 @@
 import { guardSessionDirectoryWrites, reserveManagedDirectories } from './managed-directory-retention.js';
 import { resolveCodexProfileHome } from './codex-profiles.js';
+import { sessionContractStore } from './session-contract-store.js';
+import { sessionContractsEnabled, type ControlKind } from './session-contract.js';
 import { readFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
 import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -2219,6 +2221,15 @@ function persistRow(session: Session, modelPinWrite = false): void {
         wrapperCli: durable.wrapperCli, cliLaunchMode: durable.cliLaunchMode, agentFrozen: durable.agentFrozen };
     }
   }
+  if (ownStore.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='contracts'").get()) {
+    const hit = ownStore.db.prepare('SELECT value,revision FROM contracts WHERE session_key=?').get(JSON.stringify([currentAppId, session.sessionId])) as { value: string; revision: number } | undefined;
+    if (hit) {
+      const canonical = JSON.parse(hit.value);
+      if ((canonical.lifecycle === 'closed' && session.status !== 'closed')
+        || (session.status === 'closed' && !['closing', 'closed'].includes(canonical.lifecycle))) throw new Error('session_lifecycle_requires_control_operation');
+      session = { ...session, sessionLifecycle: canonical.lifecycle, sessionContractRevision: hit.revision };
+    }
+  }
   const json = JSON.stringify(session);
   if (existing?.row === json) return;
   // Compare-and-set across the read/merge/write boundary. An offline writer
@@ -2768,6 +2779,21 @@ export function markMojoCloseUnresolved(
   });
 }
 
+function commitContractLifecycle(session: Session, kind: ControlKind, write: () => void): void {
+  const appId = currentAppId;
+  if (!sessionContractsEnabled() || !appId || !ownStore) { write(); return; }
+  const contract = sessionContractStore(config.session.dataDir, appId);
+  const ref = { appId, sessionId: session.sessionId };
+  runOwnedWriteTransaction(ownStore, false, () => contract.usingDatabase(ownStore!.db, () => {
+    contract.ensure(ref, { closed: session.status === 'closed', suspended: session.suspendedColdResume });
+    if (kind === 'close' && contract.read(ref)?.lifecycle === 'closed') { write(); return; }
+    const { operation } = contract.beginOperation(ref, kind);
+    contract.apply(ref, { type: 'control_started', operationId: operation.operationId });
+    write();
+    contract.apply(ref, { type: 'control_result', operationId: operation.operationId, phase: 'confirmed' });
+  }));
+}
+
 export function closeSession(
   sessionId: string,
   opts: {
@@ -2804,8 +2830,11 @@ export function closeSession(
     // only when the row carries no snapshot yet. An already-closed row does
     // not take a new snapshot — re-close must not pin a later `null` over a
     // live dashboard read, and must not spend the scan when apply will ignore it.
+    const durableHit = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
+    const durable = durableHit ? JSON.parse(durableHit.row) as Session : undefined;
+    const basis = durable?.status === 'closed' ? { ...session, ...durable, tokenUsage: durable.tokenUsage } : session;
     let tokenUsage: NonNullable<Session['tokenUsage']> | null | undefined;
-    if (session.status !== 'closed') {
+    if (basis.status !== 'closed') {
       tokenUsage = null;
       try {
         tokenUsage = getSessionTokenUsage({
@@ -2827,7 +2856,7 @@ export function closeSession(
     // store close, reached after its explicit prepare, so it alone names the
     // journal wipe. Persist only on `applied` — a no-op re-close must not
     // rewrite the row.
-    const next: Session = { ...session };
+    const next: Session = { ...basis };
     const applied = applySessionRowCommand(next, {
       type: 'close',
       ...(opts.backgroundExecutionCleanup ? { backgroundExecutionCleanup: true } : {}),
@@ -2839,7 +2868,15 @@ export function closeSession(
       ...(opts.clearRiffParentTaskId ? { clearRiffParentTaskId: true } : {}),
     }, { now: new Date() });
     if (applied.outcome === 'applied') {
-      persistRow(next);
+      commitContractLifecycle(basis, 'close', () => {
+        const latest = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
+        const closed = latest ? JSON.parse(latest.row) as Session : undefined;
+        if (closed?.status === 'closed') { next.closedAt = closed.closedAt; next.tokenUsage = closed.tokenUsage; }
+        persistRow(next);
+      });
+      const committed = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
+      Object.assign(session, next, committed ? JSON.parse(committed.row) : {});
+    } else if (durable?.status === 'closed') {
       Object.assign(session, next);
     }
     const released = applied.outcome === 'applied' ? applied.released.dashboardAttachments : undefined;
@@ -2925,8 +2962,9 @@ export function reactivateClosedSession(
   next.mojoCloseJournal = undefined;
   next.tokenUsage = undefined;
 
-  persistRow(next);
-  Object.assign(session, next);
+  commitContractLifecycle(session, 'resume', () => persistRow(next));
+  const committed = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
+  Object.assign(session, next, committed ? JSON.parse(committed.row) : {});
   return { ok: true, session };
 }
 
@@ -6206,9 +6244,10 @@ function runUnownedRowTxn<T>(
 
   const dbPath = storeDbPath(target.larkAppId, dataDir);
   let lease: OccupancyLease | undefined;
+  let hasContract = false;
   try {
     const readDb = openDbForRead(dbPath);
-    try { lease = readOccupancyInTxn(readDb); }
+    try { lease = readOccupancyInTxn(readDb); hasContract = !!readDb.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='contracts'").get(); }
     finally { readDb.close(); }
   } catch (err) {
     if (isTransientStoreContentionError(err)) return { outcome: 'contended' };
@@ -6220,6 +6259,7 @@ function runUnownedRowTxn<T>(
 
   let db: SqliteDatabaseLike | undefined;
   let inTxn = false;
+  const contract = hasContract ? sessionContractStore(dataDir, target.larkAppId) : undefined;
   try {
     db = openDbForOwnStore(dbPath);
     db.exec('BEGIN IMMEDIATE');
@@ -6231,10 +6271,22 @@ function runUnownedRowTxn<T>(
       .get(target.sessionId) as { row: string } | undefined;
     if (!hit) return { outcome: 'missing' };
     const current = JSON.parse(hit.row) as Session;
+    const previousStatus = current.status;
     const { publish, result } = step(current);
     if (!publish) return result;
-    db.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ?')
+    const write = () => db!.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ?')
       .run(sessionStatusText(current), JSON.stringify(current), target.sessionId);
+    if (contract && current.status !== previousStatus) contract.usingDatabase(db, () => {
+      const ref = { appId: target.larkAppId, sessionId: target.sessionId };
+      contract.ensure(ref, { closed: previousStatus === 'closed' });
+      const { operation } = contract.beginOperation(ref, current.status === 'closed' ? 'close' : 'resume');
+      contract.apply(ref, { type: 'control_started', operationId: operation.operationId });
+      write();
+      contract.apply(ref, { type: 'control_result', operationId: operation.operationId, phase: 'confirmed' });
+      const updated = db!.prepare('SELECT row FROM sessions WHERE session_id=?').get(target.sessionId) as { row: string };
+      Object.assign(current, JSON.parse(updated.row));
+    });
+    else write();
     db.exec('COMMIT');
     inTxn = false;
     return result;

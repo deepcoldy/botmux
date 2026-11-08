@@ -169,6 +169,16 @@ vi.mock('../src/services/session-store.js', () => ({
   updateSessionPid: vi.fn(),
 }));
 
+// These synthetic workers model unscoped legacy IPC. Keep contract storage out
+// of this unit fixture; v2 bootstrap/admission runs through real components in
+// session-contract-gateway and the real Worker integration tests. Only the
+// worker-start operation test installs a controller.
+const contractController = vi.hoisted(() => ({ value: undefined as unknown }));
+vi.mock('../src/core/session-controller.js', async importOriginal => ({
+  ...await importOriginal<typeof import('../src/core/session-controller.js')>(),
+  controllerForSession: () => contractController.value,
+}));
+
 vi.mock('../src/services/frozen-card-store.js', () => ({
   loadFrozenCards: vi.fn(() => new Map()),
   saveFrozenCards: vi.fn(),
@@ -287,6 +297,8 @@ import {
   readManagedOriginCapability,
 } from '../src/core/managed-origin-capability.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { SessionController } from '../src/core/session-controller.js';
+import { SessionContractStore } from '../src/services/session-contract-store.js';
 import type { TrustedCaller, WorkerToDaemon } from '../src/types.js';
 import { activeSessionKey } from '../src/core/types.js';
 import { resolveDaemonCurrentActor } from '../src/core/current-actor-attestation.js';
@@ -424,6 +436,34 @@ afterEach(() => {
   disposeReadonlyTaskContinuation({ sessionId: 'sid-start-test' });
   setActiveSessionsRegistry(undefined);
   setLinkRefRuntime(undefined);
+});
+
+describe('worker start operation', () => {
+  it.each(['normal', 'adopt'])('starts a %s worker under a restart that takes over an unverified Stop', mode => {
+    const data = mkdtempSync(join(tmpdir(), 'botmux-start-operation-'));
+    const store = new SessionContractStore(data, 'app_test');
+    try {
+      const ds = makeDs(mode === 'adopt' ? {
+        adoptedFrom: { tmuxTarget: 'bmx-start-operation:0.0', originalCliPid: 23456, sessionId: 'fixture-adopted', cliId: 'codex', cwd: REPO },
+      } : undefined);
+      const controller = new SessionController(ds, store); const worker = controller.bindWorker(1).worker;
+      controller.reserveBinding('binding-old', worker);
+      controller.bindRuntime('binding-old', worker, { backend: 'tmux', physicalId: '111:start', nativeSessionId: 'native-old', proof: 'process_start' });
+      const execution = controller.admitInput('om_stopped_turn');
+      const stop = controller.beginControl('cancel', undefined, execution).operation;
+      controller.controlStarted(stop.operationId); controller.controlResult(stop.operationId, 'uncertain');
+      contractController.value = controller;
+      const child = makeFakeWorker(); const send = child.send; forkMock.mockImplementationOnce(() => child);
+      if (mode === 'adopt') forkAdoptWorker(ds, { prompt: '' });
+      else forkWorker(ds, '');
+      const init = send.mock.calls[0][0];
+      expect(init.type).toBe('init');
+      expect(controller.operation()).toMatchObject({ kind: 'restart', operationId: init.restartAttemptId });
+      expect(controller.operation(stop.operationId)).toMatchObject({ phase: 'uncertain', error: 'superseded_by_restart' });
+    } finally {
+      contractController.value = undefined; store.close(); rmSync(data, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('protected MCP env stays out of ordinary worker IPC', () => {

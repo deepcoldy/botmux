@@ -18531,12 +18531,14 @@ async function cmdSessionReady(): Promise<void> {
     payloadText = Buffer.concat(chunks).toString('utf-8');
   } catch { /* stdin 读不到也无所谓 */ }
   let source: string | undefined;
+  let nativeSessionId: string | undefined;
   try {
     const p = JSON.parse(payloadText);
     if (p && typeof p.source === 'string') source = p.source;
+    if (p && typeof p.session_id === 'string') nativeSessionId = p.session_id;
   } catch { /* 非 JSON / 空 → 不带 source */ }
 
-  await postSessionScopedSignal('/api/session-ready', { source });
+  await postSessionScopedSignal('/api/session-ready', { source, nativeSessionId });
   process.exit(0);
 }
 
@@ -18620,6 +18622,7 @@ async function postSessionScopedSignal(
           : (liveOrigin?.dispatchAttempt
             ?? (Number.isSafeInteger(envAttempt) && envAttempt > 0 ? envAttempt : undefined)),
         ...payload,
+        runtimeBindingId: process.env.BOTMUX_RUNTIME_BINDING_ID,
       }),
     } satisfies RequestInit;
     let hostSecret: string | undefined;

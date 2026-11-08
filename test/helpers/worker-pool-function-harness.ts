@@ -2,6 +2,7 @@
  * worker-function harness while the pool still has no importable host seam. */
 import { readFileSync } from 'node:fs';
 import ts from 'typescript';
+import { controllerForSession } from '../../src/core/session-controller.js';
 
 export function loadWorkerPoolFunction<T extends (...args: any[]) => any>(
   name: string, scope: Record<string, any>,
@@ -15,7 +16,7 @@ export function loadWorkerPoolFunction<T extends (...args: any[]) => any>(
   }).outputText;
   const proxy = new Proxy(scope, {
     has: (_target, key) => key !== Symbol.unscopables,
-    get: (target, key) => key in target ? target[key as string] : (globalThis as any)[key],
+    get: (target, key) => key in target ? target[key as string] : key === 'controllerForSession' ? controllerForSession : (globalThis as any)[key],
     set: (target, key, value) => { target[key as string] = value; return true; },
   });
   return new Function('scope', `with (scope) { ${compiled}; return ${name}; }`)(proxy) as T;
@@ -35,7 +36,7 @@ export function loadWorkerPoolClosure<T extends (...args: any[]) => any>(name: s
   const compiled = ts.transpileModule(`const ${declaration.getText(source)};`, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None } }).outputText;
   const proxy = new Proxy(scope, {
     has: (_target, key) => key !== Symbol.unscopables,
-    get: (target, key) => key in target ? target[key as string] : (globalThis as any)[key],
+    get: (target, key) => key in target ? target[key as string] : key === 'controllerForSession' ? controllerForSession : (globalThis as any)[key],
     set: (target, key, value) => { target[key as string] = value; return true; },
   });
   return new Function('scope', `with (scope) { ${compiled}; return ${name}; }`)(proxy) as T;

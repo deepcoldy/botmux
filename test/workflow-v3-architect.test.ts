@@ -21,6 +21,7 @@ import { createEphemeralPool } from '../src/workflows/v3/ephemeral-pool.js';
 import { hostApproveSpec, hostArchitect, hostNew, hostSpecFinalize, type ArchitectDeps } from '../src/workflows/v3/host.js';
 import { DagValidationError } from '../src/workflows/v3/dag.js';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
+import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 import type { WorkerHandle, WorkerProcessFactory, WorkerSpawnOptions } from '../src/workflows/shared/worker-process.js';
 
 const BOT: BotSnapshot = {
@@ -327,28 +328,38 @@ class LingeringTmux {
 class TmuxWorker extends EventEmitter implements WorkerHandle {
   readonly pid = process.pid;
   private exited = false;
+  private contractScope?: WorkerSessionEventScope;
 
   constructor(private readonly tmux: LingeringTmux, private readonly opts: WorkerSpawnOptions) {
     super();
   }
 
   send(msg: unknown): void {
-    const m = msg as { type?: string; sessionId?: string };
+    const m = msg as { type?: string; sessionId?: string; sessionContract?: any; bindingId?: string; runtime?: any };
     if (m.type === 'init') {
       const name = TmuxBackend.sessionName(m.sessionId!);
       if (this.tmux.sessions.has(name)) {
         this.tmux.refused.push(name);
         setImmediate(() => {
-          this.emit('message', { type: 'error', message: `tmux 创建会话失败：duplicate session: ${name}` });
+          this.emitMessage({ type: 'error', message: `tmux 创建会话失败：duplicate session: ${name}` });
           this.exit(1);
         });
         return;
       }
       this.tmux.sessions.set(name, m.sessionId!);
+      if (m.sessionContract) {
+        this.contractScope = new WorkerSessionEventScope(m.sessionContract.session, m.sessionContract.worker);
+        const binding = this.contractScope.beginRuntime();
+        this.contractScope.enterRuntime(binding);
+        this.emitMessage({ type: 'runtime_binding_started', bindingId: binding.bindingId });
+        this.emitMessage({ type: 'runtime_binding', bindingId: binding.bindingId, identity: { backend: 'tmux', physicalId: name, proof: 'opaque' } });
+      }
       setImmediate(() => {
-        this.emit('message', { type: 'ready', port: 3001, token: 'tok' });
-        this.emit('message', { type: 'prompt_ready' });
+        this.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+        this.emitMessage({ type: 'prompt_ready' });
       });
+    } else if (m.type === 'runtime_contract_assigned') {
+      this.contractScope?.assign(m.bindingId!, m.runtime);
     } else if (m.type === 'raw_input') {
       this.writeProducts();
     } else if (m.type === 'close') {
@@ -367,6 +378,11 @@ class TmuxWorker extends EventEmitter implements WorkerHandle {
       writeProduct(outputDir, 'architect-notes.md', `# Notes ${this.opts.env[GOAL_ENV.ATTEMPT_DIR]}`),
     ];
     writeFileSync(this.opts.env[GOAL_ENV.MANIFEST_PATH]!, JSON.stringify({ schemaVersion: 1, status: 'ok', summary: 'ok', files }));
+  }
+
+  private emitMessage(msg: Record<string, unknown>): void {
+    const binding = this.contractScope?.currentBinding();
+    this.emit('message', binding && this.contractScope ? { ...msg, sessionContract: this.contractScope.envelope({ bindingId: binding.bindingId, runtime: binding.runtime }) } : msg);
   }
 
   private exit(code: number): void {

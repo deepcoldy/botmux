@@ -130,6 +130,7 @@ interface ResourceRoute {
 }
 
 export interface GatewayTrustedTurnIdentity {
+  sessionOrigin?: import('../../../services/session-event-scope.js').CapturedSessionOrigin;
   caller?: TrustedCaller;
   turnId?: string;
   identityTurnId?: string;
@@ -871,13 +872,19 @@ export class PluginMcpGateway {
   private registerHandlers(): void {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: await this.refreshTools() }));
     this.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+      const currentIdentity = this.trustedTurnIdentity?.();
+      const identity = currentIdentity ? structuredClone(currentIdentity) : undefined;
       if (this.toolRoutes.size === 0) await this.refreshTools();
       const route = this.toolRoutes.get(request.params.name);
       if (!route) throw methodUnsupported(`tools/call:${request.params.name}`);
-      const currentIdentity = this.trustedTurnIdentity?.();
-      const identity = currentIdentity
-        ? { ...currentIdentity, ...(currentIdentity.caller ? { caller: { ...currentIdentity.caller } } : {}) }
-        : undefined;
+      const original = identity?.sessionOrigin;
+      if (original) {
+        const latest = this.trustedTurnIdentity?.()?.sessionOrigin;
+        const same = original.runtime && latest?.runtime
+          ? original.runtime.runtimeId === latest.runtime.runtimeId && original.runtime.epoch === latest.runtime.epoch
+          : original.bindingId === latest?.bindingId;
+        if (!same) throw methodUnsupported('tools/call:runtime_superseded');
+      }
       const result = await this.toolCallIdentity.run({ identity }, () => route.connection.client.callTool(
         this.withTrustedTurnMeta(
           { ...request.params, name: route.originalName },

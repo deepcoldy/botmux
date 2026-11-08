@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -44,12 +45,17 @@ vi.mock('node:child_process', async (importOriginal) => {
 
 
 let dir: string;
+const originalDataDir = config.session.dataDir;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'wf-v3-pool-'));
+  config.session.dataDir = join(dir, 'data');
+  vi.stubEnv('SESSION_DATA_DIR', config.session.dataDir);
 });
 
 afterEach(async () => {
+  config.session.dataDir = originalDataDir;
+  vi.unstubAllEnvs();
   // The pool deliberately fire-and-forgets its diagnostic log writes
   // (`void appendLine(...)` in ephemeral-pool.ts — each one mkdir+append into
   // the attempt dir). A straggler landing after runNode resolves can RECREATE
@@ -1153,6 +1159,7 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   readonly rawInputs: string[] = [];
   readonly autoReadyAfterInit: boolean;
   init: any;
+  private contractScope?: WorkerSessionEventScope;
   readyEmitted = false;
   private initResolve?: () => void;
   private initPromise = new Promise<void>((resolve) => { this.initResolve = resolve; });
@@ -1165,6 +1172,14 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   send(msg: unknown): void {
     if ((msg as any)?.type === 'init' && !this.init) {
       this.init = msg;
+      const contract = (msg as any).sessionContract;
+      if (contract) {
+        this.contractScope = new WorkerSessionEventScope(contract.session, contract.worker);
+        const binding = this.contractScope.beginRuntime();
+        this.contractScope.enterRuntime(binding);
+        this.emitMessage({ type: 'runtime_binding_started', bindingId: binding.bindingId });
+        this.emitMessage({ type: 'runtime_binding', bindingId: binding.bindingId, identity: { backend: 'tmux', physicalId: 'fake-worker', proof: 'opaque' } });
+      }
       this.initResolve?.();
       if (this.autoReadyAfterInit) {
         setImmediate(() => {
@@ -1173,6 +1188,7 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
         });
       }
     }
+    if ((msg as any)?.type === 'runtime_contract_assigned') this.contractScope?.assign((msg as any).bindingId, (msg as any).runtime);
     if ((msg as any)?.type === 'raw_input') {
       this.rawInputs.push((msg as any).content);
     }
@@ -1187,7 +1203,8 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   }
 
   emitMessage(msg: unknown): void {
-    this.emit('message', msg);
+    const binding = this.contractScope?.currentBinding();
+    this.emit('message', binding && this.contractScope ? { ...(msg as any), sessionContract: this.contractScope.envelope({ bindingId: binding.bindingId, runtime: binding.runtime }) } : msg);
   }
 
   emitExit(code: number | null): void {
