@@ -1,5 +1,7 @@
 export type FeedbackSemantic = 'positive' | 'progress' | 'negative';
 export type FeedbackButtonStyle = 'primary' | 'default' | 'danger';
+/** Horizontal placement of the feedback button rows. Unset is the same as `left`. */
+export type FeedbackButtonAlign = 'left' | 'right';
 
 /**
  * Who may click the feedback buttons.
@@ -44,6 +46,12 @@ export interface FeedbackPolicy {
     comment: { enabled: boolean; required: boolean; placeholder: string; maxLength: number };
   };
   allowReselect: boolean;
+  /**
+   * Only present when non-left. Absent means left, so policies from before this
+   * field existed (including persisted delivery snapshots) normalize and
+   * serialize exactly as before.
+   */
+  buttonAlign?: 'right';
 }
 
 export interface FeedbackPolicyInput {
@@ -54,6 +62,7 @@ export interface FeedbackPolicyInput {
   buttons?: unknown;
   negativeFollowup?: unknown;
   allowReselect?: unknown;
+  buttonAlign?: unknown;
 }
 
 const SEMANTICS: FeedbackSemantic[] = ['positive', 'progress', 'negative'];
@@ -63,6 +72,12 @@ const DEFAULT_BUTTONS: FeedbackButton[] = [
   { key: 'incorrect', label: '结论有误', semantic: 'negative', style: 'danger' },
 ];
 const KEY = /^[a-z0-9_-]+$/;
+
+/** Shared by the full normalizer and the partial layer validator. */
+export function validateButtonAlign(value: unknown, path = 'feedback.buttonAlign'): FeedbackButtonAlign {
+  if (value !== 'left' && value !== 'right') throw new Error(`${path} must be left or right`);
+  return value;
+}
 
 function object(value: unknown, path: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${path} must be an object`);
@@ -156,6 +171,8 @@ export function normalizeFeedbackPolicy(raw: unknown): FeedbackPolicy {
     throw new Error('feedback.reviewers requires feedback.audience "reviewers"');
   }
 
+  const buttonAlign = input.buttonAlign === undefined ? 'left' : validateButtonAlign(input.buttonAlign);
+
   let visibleSemantics = [...SEMANTICS];
   if (input.visibleSemantics !== undefined) {
     if (!Array.isArray(input.visibleSemantics) || input.visibleSemantics.length < 1 || input.visibleSemantics.length > 3) {
@@ -205,6 +222,7 @@ export function normalizeFeedbackPolicy(raw: unknown): FeedbackPolicy {
     audience,
     reviewers,
     allowReselect: input.allowReselect === true,
+    ...(buttonAlign === 'left' ? {} : { buttonAlign }),
     visibleSemantics,
     buttons,
     negativeFollowup: {
