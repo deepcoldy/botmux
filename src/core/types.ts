@@ -983,7 +983,8 @@ export interface DaemonSession {
    *  agent-initiated, and carries no rendered options. `source: 'agent'` marks
    *  the agent's own raise; daemon-raised failure notices leave it unset. */
   agentAttention?: { kind: string; reason: string; at: number; source?: 'agent' };
-  /** Start of the current busy stretch (edge into starting/working/analyzing). */
+  /** Start of the current busy stretch (edge into starting/working/analyzing/
+   *  active). A prompt-cache keep-alive's own busy period is not stamped. */
   busySinceAt?: number;
   /** 文档评论入口（/watch-comment / /subscribe-lark-doc）：本会话「来自文档评论的轮」的回复落点
    *  映射。key = turnId（= 触发评论的 reply_id/comment_id，随消息传给 worker 再

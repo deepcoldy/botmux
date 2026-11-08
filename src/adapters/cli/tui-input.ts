@@ -18,6 +18,28 @@ export function wrapBracketedPaste(content: string): string {
 }
 
 /**
+ * 一段原样转发给 TUI 的终端输入会不会提交输入框：bracketed paste 之外出现 CR / LF。
+ * ESC、Ctrl-C、方向键、还留在输入框里的字符、粘贴内容本身都不算；ESC+CR、`\` 后回车
+ * 这类在部分 TUI 里只是换行的组合按提交算，宁可多算。
+ * 只看这一段：没收尾的粘贴到段尾为止，丢了结束标记也不会把后面的回车当成粘贴。
+ */
+export function terminalInputSubmits(data: string): boolean {
+  let inPaste = false;
+  for (let i = 0; i < data.length; i++) {
+    if (data.startsWith(BRACKETED_PASTE_START, i)) {
+      inPaste = true;
+      i += BRACKETED_PASTE_START.length - 1;
+    } else if (data.startsWith(BRACKETED_PASTE_END, i)) {
+      inPaste = false;
+      i += BRACKETED_PASTE_END.length - 1;
+    } else if (!inPaste && (data[i] === '\r' || data[i] === '\n')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * 「先写文本、等一拍、再回车」的最朴素提交序列。
  *
  * - 有 `sendText` + `sendSpecialKeys`（tmux / herdr 等持久化后端）：文本和 Enter 分两次 send-keys，

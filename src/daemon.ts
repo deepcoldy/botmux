@@ -1054,9 +1054,10 @@ import {
   publishSessionMessagePreviewPatch,
   publishClosedSessionPatch,
   clearAgentAttention,
+  markPassthroughActivity,
   stampHumanActivity,
 } from './core/session-activity.js';
-import { holdLastTurnThrough, isMaintenanceTurnId, noteTurnStarted } from './core/turn-outcome.js';
+import { noteTurnStarted } from './core/turn-outcome.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { botAutoWorktreeEnabled } from './services/default-worktree.js';
 import { createRepoWorktree, isGitWorkTree } from './services/git-worktree.js';
@@ -11073,12 +11074,13 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
 // 该会话的 worker；worker 放行被 ready-gate 门控的首条 prompt（绕开 cjadk 启动
 // 选择器吞首条消息）。找不到会话 / worker 仍返回 200（best-effort）：worker 侧
 // 有超时兜底，信号丢失不致命，没必要让 hook 客户端报错。
-ipcRoute('POST', '/api/session-ready', async (req, res) => {
+async function handleSessionLifecycleSignal(req: IncomingMessage, res: ServerResponse, compaction = false): Promise<void> {
   let raw: {
     runtimeBindingId?: unknown;
     nativeSessionId?: unknown;
     sessionId?: unknown;
     source?: unknown;
+    startedAtMs?: unknown;
     originCapability?: unknown;
     originTurnId?: unknown;
     originDispatchAttempt?: unknown;
@@ -11091,6 +11093,10 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
   const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId : '';
   if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_sessionId' });
   const source = typeof raw.source === 'string' ? raw.source : undefined;
+  if (compaction && (typeof raw.startedAtMs !== 'number' || !Number.isSafeInteger(raw.startedAtMs)
+    || raw.startedAtMs < 0 || raw.startedAtMs > Date.now())) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_startedAtMs' });
+  }
 
   let ds: DaemonSession | undefined;
   for (const s of activeSessions.values()) {
@@ -11123,25 +11129,33 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
     }
   }
   if (ds?.worker) {
-    const controller = controllerForSession(ds);
+    const signal = compaction ? 'claude-compaction-start' : 'session-ready';
+    const controller = compaction ? undefined : controllerForSession(ds);
     const sessionCommand = controller?.nativeSignal(raw.runtimeBindingId, raw.nativeSessionId);
     if (controller && !sessionCommand) return jsonRes(res, 200, { ok: true, ignored: 'runtime_scope_unproven' });
     const requestId = randomUUID();
     const ack = waitForSessionReadyAck(requestId, 2_000);
     try {
-      ds.worker.send({ type: 'session_ready', source, requestId, ...(sessionCommand ? { sessionCommand } : {}) } as DaemonToWorker);
-      logger.info(`[${sessionId.slice(0, 8)}] session-ready signal forwarded to worker (source=${source ?? '?'})`);
+      ds.worker.send(compaction
+        ? { type: 'claude_compaction_start', startedAtMs: raw.startedAtMs as number, requestId }
+        : { type: 'session_ready', source, requestId, ...(sessionCommand ? { sessionCommand } : {}) } as DaemonToWorker);
+      logger.info(compaction
+        ? `[${sessionId.slice(0, 8)}] ${signal} signal forwarded to worker (startedAtMs=${raw.startedAtMs})`
+        : `[${sessionId.slice(0, 8)}] ${signal} signal forwarded to worker (source=${source ?? '?'})`);
     } catch (err) {
       cancelSessionReadyAck(requestId);
-      logger.warn(`session-ready forward failed: ${err instanceof Error ? err.message : String(err)}`);
+      logger.warn(`${signal} forward failed: ${err instanceof Error ? err.message : String(err)}`);
     }
     const acknowledged = await ack;
     if (!acknowledged) {
-      logger.warn(`[${sessionId.slice(0, 8)}] session-ready worker ACK timed out; allowing hook to continue`);
+      logger.warn(`[${sessionId.slice(0, 8)}] ${signal} worker ACK timed out; allowing hook to continue`);
     }
   }
   return jsonRes(res, 200, { ok: true });
-});
+}
+
+ipcRoute('POST', '/api/session-ready', (req, res) => handleSessionLifecycleSignal(req, res));
+ipcRoute('POST', '/api/claude-compaction-start-v1', (req, res) => handleSessionLifecycleSignal(req, res, true));
 
 // ─── turn-idle IPC route (internal: 结构化回合空闲信号) ────────────────────────
 //
@@ -25545,9 +25559,7 @@ function deliverPassthroughToExistingSession(
     // release its claim and compact the same idle stretch again.
     turn.onDelivered?.();
     beginNewTurn(ds, commandContent, turnId);
-    const activityAt = Date.now();
-    if (isMaintenanceTurnId(turnId)) holdLastTurnThrough(ds, activityAt);
-    markSessionActivity(ds, activityAt);
+    markPassthroughActivity(ds, turnId);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
     return true;
   }
