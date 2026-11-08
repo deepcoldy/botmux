@@ -122,6 +122,18 @@ import {
 } from './core/xterm-vendor-assets.js';
 import { handleXtermVendorHttp } from './core/xterm-vendor-serve.js';
 import { WEB_TERMINAL_BOOT_ERROR_HANDLER_SOURCE } from './core/web-terminal-boot-error.js';
+import { terminalBufferTextSource } from './core/web-terminal-text.js';
+import {
+  decodeQuickCommandsReplySource,
+  defaultQuickCommandsSource,
+  formatQuickCommandsReply,
+  normalizeQuickCommandsSource,
+  parseQuickCommandsMessage,
+  quickCommandProfile,
+  quickCommandProfileSource,
+  quickCommandSequenceSource,
+  unsubmittedLineLengthSource,
+} from './core/web-terminal-quick-commands.js';
 import { rawCommandWriteOptionsFor } from './core/raw-command-write-options.js';
 import { classifyRawDispatchFailure, rewrapSubmissionFailure } from './core/raw-dispatch-failure.js';
 import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js';
@@ -201,8 +213,11 @@ import {
 import {
   formatMobileInputModeOsc,
   getWebTerminalInputMode,
+  getWebTerminalQuickCommands,
   MOBILE_INPUT_MODE_OSC_REGEX,
+  saveWebTerminalQuickCommands,
   setWebTerminalInputMode,
+  type QuickCommandScope,
   type WebTerminalInputMode,
 } from './services/web-terminal-settings-store.js';
 import { aidenCodexResumeNeedsRedraw, CodexUpdateDialogGuard, codexUpdateDialogSafeKeys } from './utils/codex-update-dialog.js';
@@ -30121,6 +30136,18 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         if (controlExpiryTimer) clearTimeout(controlExpiryTimer);
         authedClients.delete(ws);
       });
+      // 手机终端读取、保存快捷指令。挂在这里而不是各后端分支的 message 处理里，三种接入方式都生效；
+      // 只认可写连接，应答只回给发请求的这条连接。别的页面下次打开面板时会自己来取。
+      ws.on('message', (raw) => {
+        if (!authedClients.has(ws)) return;
+        const request = parseQuickCommandsMessage(String(raw));
+        if (!request) return;
+        const scope = quickCommandScope();
+        const result = request.op === 'get'
+          ? { status: 'ok' as const, commands: getWebTerminalQuickCommands(scope) }
+          : saveWebTerminalQuickCommands(scope, request.base, request.commands);
+        if (ws.readyState === WebSocket.OPEN) ws.send(formatQuickCommandsReply(request.nonce, result.status, result.commands));
+      });
 
       if (isTmuxMode && !isPipeMode && sessionId) {
         // ── Tmux-attach mode: per-client attach ──
@@ -30473,6 +30500,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
   });
 }
 
+function quickCommandScope(): QuickCommandScope {
+  return { botId: lastInitConfig?.larkAppId ?? '', profile: quickCommandProfile(lastInitConfig?.cliId) };
+}
+
 function getTerminalHtml(
   hasWrite: boolean,
   platformReadonly = false,
@@ -30483,6 +30514,8 @@ function getTerminalHtml(
   initialMobileInputMode: WebTerminalInputMode = getWebTerminalInputMode(sessionId),
 ): string {
   const label = sessionId.substring(0, 8);
+  // 只读页面没有快捷指令入口，也就不把用户的自定义列表下发给它。
+  const quickCommandsSaved = hasWrite ? getWebTerminalQuickCommands(quickCommandScope()) : null;
   return `<!DOCTYPE html>
 <html>
 <head>
@@ -30638,8 +30671,26 @@ body.touch.has-token #mobile-input-bar{
   transform:translateY(calc(0px - var(--keyboard-inset,0px)));transition:transform .12s ease}
 body.touch.has-token #terminal .xterm{
   padding-bottom:calc(var(--mobile-bar-h,0px) + var(--keyboard-inset,0px))}
-#mobile-bar-keys{display:flex;gap:6px;margin-bottom:5px;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch}
+#mobile-bar-top{display:flex;align-items:center;gap:6px;margin-bottom:5px;min-width:0}
+/* 右端淡出：告诉用户这一行还能往左滑，否则屏幕外的键没人知道。 */
+#mobile-bar-keys{flex:1;min-width:0;display:flex;gap:6px;overflow-x:auto;scrollbar-width:none;-webkit-overflow-scrolling:touch;
+  -webkit-mask-image:linear-gradient(to right,#000 calc(100% - 18px),transparent);mask-image:linear-gradient(to right,#000 calc(100% - 18px),transparent)}
 #mobile-bar-keys::-webkit-scrollbar{display:none}
+/* 固定在右侧、不随快捷键行滚动的两个入口：快捷指令菜单、键盘开关。 */
+#mobile-bar-pinned{flex:none;display:flex;gap:6px}
+#mobile-bar-pinned button{
+  flex:none;display:inline-flex;align-items:center;justify-content:center;gap:4px;min-width:44px;height:34px;padding:0 10px;
+  border:1px solid #2a2b3d;border-radius:8px;background:#1c1c24;color:#9d9fb0;
+  font:500 13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  touch-action:manipulation;-webkit-tap-highlight-color:transparent;
+  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;white-space:nowrap}
+#mobile-bar-pinned button:active{background:#3a3b4d;color:#e4e6f0}
+#mobile-bar-pinned svg{display:block;width:18px;height:18px;flex:none;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+#mobile-cmds{color:#c0caf5!important}
+#mobile-kbd{padding:0!important}
+#mobile-kbd .kbd-up,#mobile-kbd[aria-pressed="true"] .kbd-down{display:block}
+#mobile-kbd .kbd-down,#mobile-kbd[aria-pressed="true"] .kbd-up{display:none}
+#mobile-kbd[aria-pressed="true"]{color:#7aa2f7;border-color:#3b4d7a}
 /* A long press on a bar key must repeat that key (see the repeat handler below),
    never raise the iOS selection handles / callout menu. user-select alone is not
    enough in a WKWebView — the -webkit- pair is what suppresses both, same as the
@@ -30680,6 +30731,113 @@ body.touch.has-token #mobile-input-bar[data-mode="live"] #mobile-input{color:tra
 body.touch.has-token #mobile-input-bar[data-mode="live"] #mobile-live-hint{display:flex}
 /* live mode: the hint replaces the placeholder — hide both to avoid overlap */
 body.touch.has-token #mobile-input-bar[data-mode="live"] #mobile-input::placeholder{color:transparent}
+/* ── 底部面板（复制文本 / 快捷指令共用）──
+   从底部滑出；点遮罩、点关闭、拖住顶部往下滑都能收起。宽屏限宽居中。
+   外层只做裁切，底边对齐底部输入栏的上沿（输入栏又垫在软键盘上方）：面板从输入栏后面滑出来，滑动过程中
+   也盖不到「指令」「键盘」按钮。那里只有遮罩，再点一下就是收起，不会误点到面板里的指令。 */
+#wb-sheet-scrim{display:none;position:fixed;inset:0;z-index:200;background:rgba(5,6,12,.5);opacity:0;transition:opacity .22s ease}
+#wb-sheet-scrim.show{display:block}
+#wb-sheet-scrim.in{opacity:1}
+#wb-sheet-wrap{position:fixed;left:0;right:0;top:0;bottom:calc(var(--mobile-bar-h,0px) + var(--keyboard-inset,0px));z-index:201;
+  overflow:hidden;pointer-events:none}
+#wb-sheet{display:none;position:absolute;left:0;right:0;bottom:0;margin:0 auto;max-width:640px;max-height:calc(100% - min(40px,6vh));pointer-events:auto;
+  flex-direction:column;background:#1f2030;border-radius:16px 16px 0 0;color:#c0caf5;
+  box-shadow:0 -12px 40px rgba(0,0,0,.5),inset 0 1px 0 rgba(122,162,247,.16);
+  padding:0 max(14px,env(safe-area-inset-right)) max(12px,env(safe-area-inset-bottom)) max(14px,env(safe-area-inset-left));
+  font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  transform:translateY(105%);transition:transform .3s cubic-bezier(.2,.8,.2,1)}
+#wb-sheet.show{display:flex}
+/* 底部输入栏已经让开了安全区。 */
+body.touch.has-token #wb-sheet{padding-bottom:12px}
+#wb-sheet.in{transform:translateY(0)}
+#wb-sheet.dragging{transition:none}
+@media(prefers-reduced-motion:reduce){#wb-sheet{transition:none}#wb-sheet-scrim{transition:none}}
+#wb-sheet-grab{flex:none;height:22px;display:grid;place-items:center;touch-action:none;cursor:grab}
+#wb-sheet-grab::before{content:"";width:38px;height:5px;border-radius:3px;background:#3b3f5c}
+#wb-sheet-head{flex:none;display:flex;align-items:center;gap:8px;min-height:40px;padding-bottom:8px;touch-action:none}
+#wb-sheet-title{flex:1;min-width:0;font-weight:600;font-size:16px;color:#c0caf5;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#wb-sheet-actions{display:flex;gap:6px}
+#wb-sheet button{font:inherit;-webkit-tap-highlight-color:transparent;touch-action:manipulation;cursor:pointer}
+#wb-sheet-close,.wb-sheet-text-btn{flex:none;min-width:44px;height:36px;padding:0 12px;border:0;border-radius:10px;
+  background:#2a2c40;color:#a9b1d6;font-size:14px!important}
+.wb-sheet-text-btn{color:#7aa2f7}
+#wb-sheet-close:active,.wb-sheet-text-btn:active{background:#3a3d57}
+#wb-sheet-body{flex:1;min-height:0;display:flex;flex-direction:column;gap:10px;overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch}
+#wb-sheet-foot{flex:none;display:flex;gap:10px;padding-top:10px}
+#wb-sheet-foot:empty{display:none}
+/* 在面板里打字时底栏被遮罩盖着、用不上，面板只垫键盘，节省下来的高度留给表单；小屏和横屏上否则会被压没。 */
+body.wb-sheet-typing #wb-sheet-wrap{bottom:var(--keyboard-inset,0px)}
+body.wb-sheet-typing #wb-sheet-foot{display:none}
+.wb-btn{flex:1;min-height:46px;padding:0 14px;border:1px solid #33375a;border-radius:12px;background:#24283b;color:#c0caf5;font-weight:600}
+.wb-btn:active{background:#33375a}
+.wb-btn.primary{background:#7aa2f7;border-color:#7aa2f7;color:#1a1b26}
+.wb-btn.primary:active{background:#5d87e0}
+.wb-btn.danger{color:#f7768e}
+.wb-btn:disabled{opacity:.42;cursor:not-allowed}
+.wb-sheet-note{color:#737aa2;font-size:12px;line-height:1.5}
+.wb-seg{flex:none;display:flex;padding:3px;border-radius:10px;background:#16161e}
+.wb-seg button{flex:1;height:32px;border:0;border-radius:8px;background:transparent;color:#737aa2;font-size:13px!important;font-weight:600}
+.wb-seg button[aria-selected="true"]{background:#2f3350;color:#c0caf5;box-shadow:0 1px 3px rgba(0,0,0,.35)}
+/* 复制面板的文本区是普通的可选文字：跟系统一样长按选词、拖两端的手柄改范围、弹系统拷贝菜单。
+   显式写死可选，不让内嵌浏览器可能注入的全局 user-select:none 盖掉。 */
+#wb-copy-text{position:relative;flex:1;min-height:min(180px,30vh);margin:0;padding:10px 12px;overflow:auto;overscroll-behavior:contain;
+  -webkit-overflow-scrolling:touch;border-radius:12px;background:#16161e;box-shadow:inset 0 0 0 1px #262a3f;color:#c0caf5;
+  font:12.5px/1.5 "JetBrains Mono","Fira Code",Menlo,monospace;white-space:pre-wrap;word-break:break-all;tab-size:8;
+  -webkit-user-select:text!important;user-select:text!important;-webkit-touch-callout:default!important;touch-action:pan-x pan-y}
+#wb-copy-text span.anchor{background:rgba(122,162,247,.22);border-radius:3px;animation:wb-anchor 1.8s ease-out 1 forwards}
+@keyframes wb-anchor{0%{background:rgba(122,162,247,.45)}100%{background:rgba(122,162,247,.10)}}
+#wb-sheet[data-kind="copy"]{height:calc(100% - min(40px,6vh))}
+.wb-qc-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px}
+.wb-qc{position:relative;display:flex;flex-direction:column;align-items:flex-start;justify-content:center;gap:3px;min-height:58px;
+  padding:9px 12px;border:1px solid #2c3050;border-radius:12px;background:#24283b;color:#c0caf5;text-align:left;
+  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+.wb-qc:active{background:#313657;transform:scale(.98)}
+.wb-qc-label{max-width:100%;font:600 14px/1.25 "JetBrains Mono","Fira Code",Menlo,monospace;color:#c0caf5;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wb-qc-hint{max-width:100%;font-size:12px;color:#737aa2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wb-qc-send{max-width:100%;font:12px/1.3 "JetBrains Mono","Fira Code",Menlo,monospace;color:#e0af68;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wb-qc-badge{position:absolute;top:6px;right:8px;padding:1px 6px;border-radius:6px;background:rgba(224,175,104,.14);color:#e0af68;font-size:10px;line-height:16px}
+.wb-qc-empty{padding:18px 4px;text-align:center;color:#737aa2}
+.wb-qc-row{display:flex;align-items:center;gap:6px;padding:6px 0;border-bottom:1px solid #262a3f}
+.wb-qc-row-main{flex:1;min-width:0;display:flex;flex-direction:column;align-items:flex-start;gap:2px;min-height:44px;padding:4px 6px;
+  border:0;border-radius:8px;background:transparent;color:#c0caf5;text-align:left}
+.wb-qc-row-main:active,.wb-qc-row.editing .wb-qc-row-main{background:#24283b}
+.wb-qc-row-main code{max-width:100%;font:12px/1.4 "JetBrains Mono","Fira Code",Menlo,monospace;color:#737aa2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.wb-icon-btn{flex:none;width:40px;height:40px;border:0;border-radius:10px;background:#24283b;color:#a9b1d6;font-size:15px!important}
+.wb-icon-btn:active{background:#33375a}
+.wb-icon-btn:disabled{opacity:.3}
+.wb-icon-btn.danger{color:#f7768e}
+.wb-qc-form{display:flex;flex-direction:column;gap:8px;padding:12px;border-radius:12px;background:#24283b}
+.wb-qc-form-title{font-weight:600;color:#a9b1d6}
+/* 16px 是硬下限：更小的字号让 iOS 在输入框获焦时自动放大页面且不再缩回去（见 #mobile-input）。 */
+.wb-qc-form input[type="text"]{width:100%;min-height:42px;padding:9px 11px;border:1px solid #33375a;border-radius:10px;background:#1a1b26;color:#e4e6f0;
+  font:16px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;-webkit-text-size-adjust:100%;text-size-adjust:100%}
+.wb-qc-form input[type="text"].mono{font-family:"JetBrains Mono","Fira Code",Menlo,monospace}
+.wb-qc-form input::placeholder{color:#565f89}
+.wb-qc-check{display:flex;align-items:center;gap:8px;min-height:36px;color:#a9b1d6;font-size:14px}
+.wb-qc-check input{width:20px;height:20px;accent-color:#7aa2f7}
+.wb-qc-form-actions{display:flex;gap:8px}
+/* 轻提示：浮在底栏上方，带可选的操作按钮（例如终端请求复制但浏览器要求用户点一下）。 */
+#wb-toast{position:fixed;left:50%;bottom:calc(var(--mobile-bar-h,0px) + var(--keyboard-inset,0px) + 14px);z-index:999;
+  display:flex;align-items:center;gap:10px;max-width:min(92vw,520px);padding:9px 14px;border-radius:12px;
+  background:rgba(36,40,59,.96);box-shadow:0 8px 28px rgba(0,0,0,.45),inset 0 0 0 1px rgba(122,162,247,.22);color:#c0caf5;
+  font:13px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;pointer-events:none;opacity:0;
+  transform:translate(-50%,8px);transition:opacity .18s ease,transform .18s ease}
+#wb-toast.show{opacity:1;transform:translate(-50%,0)}
+#wb-toast.show.has-action{pointer-events:auto}
+#wb-toast.err{box-shadow:0 8px 28px rgba(0,0,0,.45),inset 0 0 0 1px rgba(247,118,142,.45)}
+#wb-toast button{flex:none;min-height:32px;padding:0 12px;border:0;border-radius:8px;background:#7aa2f7;color:#1a1b26;font:600 13px/1 -apple-system,sans-serif}
+/* 面板打开时底部被占了，提示改到顶部。 */
+body.wb-sheet-open #wb-toast{bottom:auto;top:calc(env(safe-area-inset-top,0px) + 14px)}
+/* 只读触屏没有底栏，给一个右下角的复制入口（长按终端也能打开同一个面板）。终端底部让出一条放它，
+   不然会一直盖住最后几行右侧（CLI 常把状态放在那里）。 */
+body.touch:not(.has-token) #terminal .xterm{padding-bottom:calc(56px + env(safe-area-inset-bottom,0px))}
+#copy-fab{display:none}
+body.touch:not(.has-token) #copy-fab{display:inline-flex;align-items:center;gap:6px;position:fixed;z-index:55;
+  right:max(14px,env(safe-area-inset-right));bottom:calc(8px + env(safe-area-inset-bottom,0px));height:40px;padding:0 14px;
+  border:1px solid #3b4d7a;border-radius:20px;background:rgba(36,40,59,.9);color:#c0caf5;
+  font:600 13px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.4);
+  backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+#copy-fab svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
 </style>
 </head>
 <body>
@@ -30709,8 +30867,10 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
   </div>
 </div>
 <form id="mobile-input-bar" autocomplete="off" data-mode="${initialMobileInputMode}" aria-label="手机输入">
+  <div id="mobile-bar-top">
   <div id="mobile-bar-keys">
-    <button type="button" data-sk="paste">Paste</button>
+    <button type="button" data-sk="copy" title="复制终端文本" aria-label="复制终端文本">复制</button>
+    <button type="button" data-sk="paste" title="粘贴到终端" aria-label="粘贴到终端">粘贴</button>
     <button type="button" data-sk="ctrlc">Ctrl+C</button>
     <button type="button" data-sk="esc">Esc</button>
     <button type="button" data-sk="tab">Tab</button>
@@ -30722,6 +30882,11 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
     <button type="button" data-sk="enter">Enter</button>
     <button type="button" data-sk="stab">Shift+Tab</button>
   </div>
+  <div id="mobile-bar-pinned">
+    <button id="mobile-cmds" type="button" aria-haspopup="dialog" title="快捷指令" aria-label="快捷指令"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M13 2.5 5.5 13.5H12l-1 8 7.5-11H12z"></path></svg>指令</button>
+    <button id="mobile-kbd" type="button" aria-pressed="false" title="弹出键盘" aria-label="弹出键盘"><svg class="kbd-up" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="2.5" y="8" width="19" height="11" rx="2"></rect><path d="M6 11.5h.5m3 0h.5m3 0h.5m3 0h.5M7.5 15.5h9M9 5l3-2.5L15 5"></path></svg><svg class="kbd-down" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="2.5" y="3" width="19" height="11" rx="2"></rect><path d="M6 6.5h.5m3 0h.5m3 0h.5m3 0h.5M7.5 10.5h9M9 19l3 2.5 3-2.5"></path></svg></button>
+  </div>
+  </div>
   <div id="mobile-bar-row">
     <button id="mobile-mode" type="button" title="切换输入模式" aria-label="切换输入模式">缓冲</button>
     <div id="mobile-input-wrap">
@@ -30731,6 +30896,7 @@ ${loginUrl ? `<a id="login-banner" href="${loginUrl}" target="_top" rel="noopene
     <button id="mobile-send" type="submit">上屏</button>
   </div>
 </form>
+<button id="copy-fab" type="button" aria-haspopup="dialog" aria-label="复制终端文本"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><rect x="8" y="8" width="12" height="12" rx="2"></rect><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h2"></path></svg>复制</button>
 <div id="status" class="err" role="status">加载中…</div>
 <div id="status-bytes" aria-hidden="true"></div>
 <div id="boot-error" aria-live="assertive"></div>
@@ -30763,6 +30929,17 @@ var wsHasWrite=null;
 // 规则：只在**本连接的第一帧**上尝试，且要求整帧精确匹配。PTY 里跑的进程打出一模
 // 一样的字节也翻不动权限——它永远不可能是第一帧。
 var _wbDecodeWriteFrame=${decodeTerminalWriteFrameSource};
+// 复制面板的取字、快捷指令的默认列表 / 校验 / 按键记法，同样是一份源码两处跑：
+// 见 core/web-terminal-text.ts 与 core/web-terminal-quick-commands.ts。
+var _wbBufferText=${terminalBufferTextSource};
+var _wbQuickProfile=${quickCommandProfileSource};
+var _wbDefaultQuick=${defaultQuickCommandsSource};
+var _wbNormalizeQuick=${normalizeQuickCommandsSource};
+var _wbQuickSeq=${quickCommandSequenceSource};
+var _wbQuickReplyDecode=${decodeQuickCommandsReplySource};
+var _wbLineAfter=${unsubmittedLineLengthSource};
+var _wbCliId=${JSON.stringify(lastInitConfig?.cliId ?? '').replace(/</g, '\\u003c')};
+var _wbQuickSaved=${JSON.stringify(quickCommandsSaved).replace(/</g, '\\u003c')};
 // 本连接还没消费过首帧。每次 connect() 重置：上一条连接的结论套不到新连接上。
 var _wbFirstFrame=true;
 var platformReadonly=${platformReadonly};
@@ -30827,6 +31004,11 @@ term.loadAddon(new WebLinksAddon.WebLinksAddon());
 term.loadAddon(new Unicode11Addon.Unicode11Addon());
 term.unicode.activeVersion='11';
 term.open(document.getElementById('terminal'));
+// 触屏：xterm 在 mousedown 时会把焦点给自己的隐藏输入框，手指点一下终端就弹出软键盘——读输出、
+// 点链接、点 TUI 里的选项都会被键盘顺手翻出来。触屏的文字输入本来就走底栏输入框（只读则
+// 根本不收字），所以这里只关掉它的软键盘；焦点、鼠标上报和外接硬件键盘的输入一切照旧。
+// 键盘的开关交给底栏的键盘按钮和输入框本身。
+if(isTouch&&term.textarea){try{term.textarea.setAttribute('inputmode','none')}catch(_e){}}
 // GPU/canvas renderer.  The default DOM renderer repaints every text span on
 // each scroll frame, which is exactly what makes scrolling over text-heavy
 // areas janky/stuck on mobile (blank areas are cheap, so they stayed smooth).
@@ -30958,6 +31140,8 @@ function _wbPostWrite(){
   try{window.parent.postMessage({type:'botmux:wb-terminal-write',write:wsHasWrite},_wbParentOrigin)}catch(_e){}
 }
 var _wbMobileWriteState=null;
+// 底栏对外暴露的两个口子（只在触屏且可写时装上）：快捷指令借它发字，底部面板借它收 / 还键盘。
+var _wbMobileSend=null,_wbMobileKeyboard=null;
 function _wbSetWsWrite(v){
   var changed=wsHasWrite!==v;
   wsHasWrite=v;
@@ -31059,21 +31243,73 @@ window.addEventListener('keydown',function(e){
   if(e.key==='PageUp'||e.key==='PageDown'||e.key==='Home'||e.key==='End')_cancelInitialFollow();
 },{capture:true});
 // ── OSC 52 clipboard ──
+// 剪贴板与轻提示（终端的 OSC 52 请求和触屏复制面板共用）。两条路都试：execCommand 在 http 页面和各家内嵌 WebView 里最通用，但 iOS 要求临时输入框只读（不弹
+// 键盘）、显式 setSelectionRange 才选得中；navigator.clipboard 只在安全上下文（https / localhost）
+// 存在。两者都要求「用户刚点了一下」，所以必须在点击处理函数里同步调用，失败了就如实告诉
+// 用户，绝不假装复制成功。
 var _clipBuf='';
-function _doCopy(text){
-  var ta=document.createElement('textarea');ta.value=text;
-  ta.style.cssText='position:fixed;left:-9999px';
-  document.body.appendChild(ta);ta.select();
-  try{document.execCommand('copy')}catch(e){}
+function _wbExecCopy(text){
+  var prev=document.activeElement;
+  var ta=document.createElement('textarea');
+  ta.value=text;ta.setAttribute('readonly','');ta.setAttribute('aria-hidden','true');
+  ta.style.cssText='position:fixed;top:0;left:0;width:1px;height:1px;padding:0;border:0;margin:0;opacity:0;font-size:16px';
+  document.body.appendChild(ta);
+  var ok=false;
+  try{
+    try{ta.focus({preventScroll:true})}catch(_f){ta.focus()}
+    ta.select();ta.setSelectionRange(0,text.length);
+    ok=document.execCommand('copy')===true;
+  }catch(_e){ok=false}
   document.body.removeChild(ta);
+  try{var _sel=window.getSelection&&window.getSelection();if(_sel)_sel.removeAllRanges()}catch(_e){}
+  // 临时输入框抢走了焦点：还给原来的元素，否则正在打字时来一条终端复制请求会把键盘收掉。
+  if(prev&&prev!==document.body&&prev!==document.activeElement&&typeof prev.focus==='function'){
+    try{prev.focus({preventScroll:true})}catch(_e){}
+  }
+  return ok;
 }
-function _showCopied(){
-  var d=document.createElement('div');
-  d.textContent='Copied!';
-  d.style.cssText='position:fixed;top:8px;left:50%;transform:translateX(-50%);z-index:999;background:#9ece6a;color:#1a1b26;padding:4px 16px;border-radius:4px;font:13px monospace;pointer-events:none;opacity:1;transition:opacity .4s';
-  document.body.appendChild(d);
-  setTimeout(function(){d.style.opacity='0'},800);
-  setTimeout(function(){document.body.removeChild(d)},1200);
+function _wbCopyText(text,done,skipExec){
+  done=done||function(){};
+  if(!text){done(false);return;}
+  if(!skipExec&&_wbExecCopy(text)){done(true);return;}
+  if(navigator.clipboard&&typeof navigator.clipboard.writeText==='function'){
+    try{navigator.clipboard.writeText(text).then(function(){done(true)},function(){done(false)});return;}catch(_e){}
+  }
+  done(false);
+}
+var _wbToastEl=null,_wbToastT=0;
+function _wbToast(msg,opts){
+  opts=opts||{};
+  if(!_wbToastEl){
+    _wbToastEl=document.createElement('div');_wbToastEl.id='wb-toast';
+    _wbToastEl.setAttribute('role','status');_wbToastEl.setAttribute('aria-live','polite');
+    document.body.appendChild(_wbToastEl);
+  }
+  var el=_wbToastEl;
+  el.textContent='';
+  var span=document.createElement('span');span.textContent=msg;el.appendChild(span);
+  el.className=(opts.kind==='err'?'err ':'')+(opts.action?'has-action ':'')+'show';
+  if(opts.action){
+    var b=document.createElement('button');b.type='button';b.textContent=opts.action.label;
+    b.addEventListener('click',function(){el.className='';clearTimeout(_wbToastT);opts.action.run();});
+    el.appendChild(b);
+  }
+  clearTimeout(_wbToastT);
+  _wbToastT=setTimeout(function(){el.className=el.className.replace(/\\bshow\\b/,'')},opts.duration||1800);
+  // 返回的函数只收起这一条；已经被后来的提示替换掉就什么都不做。
+  return function(){if(el.firstChild!==span)return;clearTimeout(_wbToastT);el.className='';};
+}
+// 终端里的程序用 OSC 52 请求写剪贴板（tmux set-clipboard、CLI 的复制命令）。这条请求从 WebSocket 来，
+// 不在用户手势里，手机和 http 页面上多半会被拦；拦下时给一个带按钮的提示，用户点一下就是手势。
+// 触屏上确定不在手势里时不走 execCommand：它必然失败，还要借焦点选字，会把正在打字的键盘收掉。
+function _wbCopyFromTerminal(text){
+  var ua=navigator.userActivation;
+  _wbCopyText(text,function(ok){
+    if(ok){_wbToast('已复制到剪贴板');return;}
+    _wbToast('终端请求复制 '+text.length+' 个字符',{duration:8000,action:{label:'复制',run:function(){
+      _wbCopyText(text,function(ok2){_wbToast(ok2?'已复制到剪贴板':'复制被浏览器拦截了，可以长按终端打开复制面板',ok2?{}:{kind:'err',duration:3200});});
+    }}});
+  },isTouch&&!!ua&&ua.isActive===false);
 }
 var _roToastT=0;
 function _showReadonlyToast(){
@@ -31219,7 +31455,10 @@ function _wbRecordOutput(data){
   _wbStatusUpdatePending=true;
   setTimeout(function(){_wbStatusUpdatePending=false;_wbConnectionStatus()},250);
 }
-function _sendInput(d){if(ws_&&ws_.readyState===1)ws_.send(JSON.stringify({type:'input',data:d}))}
+// 本页发给 CLI 的输入行里大概还有几个没提交的字（估计方法见 unsubmittedLineLength）。
+var _wbLineLen=0;
+function _wbNoteInput(d){_wbLineLen=_wbLineAfter(_wbLineLen,d);}
+function _sendInput(d){if(ws_&&ws_.readyState===1){ws_.send(JSON.stringify({type:'input',data:d}));_wbNoteInput(d);}}
 // Pure pointer-motion reports (SGR button code 35 + shift/alt/ctrl modifier
 // bits). Emitted by xterm once the seed re-asserts DECSET 1003 (grok build) —
 // one per cell crossed. Each forwarded report costs a synchronous tmux
@@ -31374,6 +31613,7 @@ if(typeof ResizeObserver!=='undefined'){
       var _ctl=_wbDecodeWriteFrame(e.data,true);
       if(_ctl!==null){_wbSetWsWrite(_ctl);return;}
     }
+    if(typeof e.data==='string'&&_wbQuickReply(e.data))return;
     _wbRecordOutput(e.data);
     var data=typeof e.data==='string'?e.data:new TextDecoder().decode(e.data);
     // Snapshot-aware Herdr history replaces the buffer instead of appending a
@@ -31430,7 +31670,7 @@ if(typeof ResizeObserver!=='undefined'){
     if(_mim){data=data.replace(_mim[0],'');if(_wbSetMobileInputMode){try{_wbSetMobileInputMode(_mim[1]);}catch(ex){}}if(!data)return;}
     // Intercept OSC 52 clipboard sequence from tmux (set-clipboard on)
     var m=data.match(/\\x1b\\]52;[^;]*;([A-Za-z0-9+/=]+)(?:\\x07|\\x1b\\\\)/);
-    if(m){try{_clipBuf=new TextDecoder().decode(Uint8Array.from(atob(m[1]),function(c){return c.charCodeAt(0)}));_doCopy(_clipBuf);_showCopied()}catch(ex){}}
+    if(m){try{_clipBuf=new TextDecoder().decode(Uint8Array.from(atob(m[1]),function(c){return c.charCodeAt(0)}));if(_clipBuf)_wbCopyFromTerminal(_clipBuf)}catch(ex){}}
     term.write(data,_settleInitialBottom);
   };
   ws.onclose=function(){
@@ -31440,6 +31680,7 @@ if(typeof ResizeObserver!=='undefined'){
     // 的门禁都以 wsHasWrite===true 为准）并向嵌入方上抛 write:null。不这样做的话，断线
     // 到 2 秒后重连的空窗里，页面仍以上一条连接的旧判定放行输入、父页也还显示旧的可写。
     _wbFirstFrame=true;_wbSetWsWrite(null);
+    _wbQuickAbort();
     setTimeout(connect,2000);
   };
   ws.onerror=function(){ws.close()};
@@ -31766,7 +32007,7 @@ if(isTouch&&hasToken){
       // （还没确认）与 false（只读）都不发，桌面也等首帧（第 17 点）。
       if(wsHasWrite!==true){if(wsHasWrite===false)_showReadonlyToast();return;}
       var k=km[btn.getAttribute('data-k')];
-      if(k)ws_.send(JSON.stringify({type:'input',data:k}));
+      if(k){ws_.send(JSON.stringify({type:'input',data:k}));_wbNoteInput(k);}
     }
     btn.addEventListener('pointerdown',function(e){
       if(e.button!==0)return;e.preventDefault();e.stopPropagation();_wakeToolbar();
@@ -31920,8 +32161,13 @@ if(isTouch&&hasToken){(function(){
 
   function setWriteState(v){
     var disabled=v!==true;
-    for(var ci=0;ci<controls.length;ci++)controls[ci].disabled=disabled;
+    for(var ci=0;ci<controls.length;ci++){
+      // 复制只读本地缓冲区，断线、只读时照样可用。
+      if(controls[ci].getAttribute('data-sk')==='copy')continue;
+      controls[ci].disabled=disabled;
+    }
     bar.setAttribute('aria-disabled',disabled?'true':'false');
+    if(disabled)syncKbdBtn();
   }
   _wbMobileWriteState=setWriteState;
 
@@ -31940,7 +32186,7 @@ if(isTouch&&hasToken){(function(){
     return CL.repeat(suf)+BS.repeat(rem)+ins+CR.repeat(suf);}
   var mirror={sent:'',held:'',composing:false};
   function sendInput(seq){if(!seq||wsHasWrite!==true||!ws_||ws_.readyState!==1)return false;
-    try{ws_.send(JSON.stringify({type:'input',data:seq}));return true;}catch(e){return false;}}
+    try{ws_.send(JSON.stringify({type:'input',data:seq}));_wbNoteInput(seq);return true;}catch(e){return false;}}
   function syncMirror(v){mirror.held=String(v||'');
     if(mirror.composing||mirror.held===mirror.sent)return true;
     var seq=editSeq(mirror.sent,mirror.held);
@@ -31975,7 +32221,44 @@ if(isTouch&&hasToken){(function(){
   function resizeTa(){ta.style.height='42px';
     if(ta.value)ta.style.height=Math.min(Math.max(ta.scrollHeight,42),120)+'px';
     measureBar();}
-  function showKeyboard(){try{ta.focus({preventScroll:true})}catch(e){ta.focus();}}
+  // ── 软键盘状态 ──
+  // 规则只有一条：只有输入框和键盘按钮能改变键盘的开关。底栏其余按钮（按键行、模式、上屏）
+  // 按下前键盘是什么样，点完还是什么样；点终端区域收起键盘，留出地方看输出。
+  // 「开着」= 输入框有焦点，且没有被系统单方面收掉——Android 的返回键 / 收键盘键只收键盘、
+  // 不失焦，只能从可视视口里键盘占的高度变没了看出来。只在本次聚焦里确实见过键盘高度后才
+  // 这样判，键盘不挤压可视视口的浏览器上就不会误报。
+  var kbdBtn=document.getElementById('mobile-kbd');
+  var cmdsBtn=document.getElementById('mobile-cmds');
+  var kbSeenInset=false,kbHiddenWhileFocused=false;
+  function keyboardOpen(){return document.activeElement===ta&&!kbHiddenWhileFocused;}
+  function syncKbdBtn(){
+    if(!kbdBtn)return;
+    var open=keyboardOpen();
+    kbdBtn.setAttribute('aria-pressed',open?'true':'false');
+    kbdBtn.setAttribute('aria-label',open?'收起键盘':'弹出键盘');
+    kbdBtn.title=open?'收起键盘':'弹出键盘';}
+  function focusTa(){try{ta.focus({preventScroll:true})}catch(e){ta.focus();}}
+  // 必须在用户手势里调用：iOS 只在点击处理里的 focus() 上弹键盘。已聚焦但键盘被系统收掉时，
+  // 再 focus 一次什么都不会发生，得先失焦再聚焦。
+  function showKeyboard(){
+    if(document.activeElement===ta&&kbHiddenWhileFocused){try{ta.blur()}catch(_e){}}
+    kbHiddenWhileFocused=false;
+    focusTa();syncKbdBtn();}
+  function hideKeyboard(){
+    if(document.activeElement===ta){try{ta.blur()}catch(_e){}}
+    kbHiddenWhileFocused=false;kbSeenInset=false;syncKbdBtn();}
+  // 按下那一刻的键盘状态。点击处理里不能现查：iOS 上按钮的 mousedown 仍可能已经把输入框弄失焦，
+  // 现查会把「刚才开着」误判成「关着」。一次按下只用一次；没有新鲜的按下（硬件键盘触发、
+  // 手指滑走后很久才来的点击）就退回现查。
+  var kbAtPress=null,kbPressAt=0;
+  function consumePress(){
+    var v=(kbAtPress!==null&&Date.now()-kbPressAt<3000)?kbAtPress:keyboardOpen();
+    kbAtPress=null;return v;}
+  // 按下前开着的，点完确保还开着（双保险：万一上面的 preventDefault 没拦住失焦，在同一个
+  // 手势里立刻重新聚焦，WebKit 不会真的把键盘收下去）；按下前关着的，绝不替用户打开。
+  function keepKeyboard(wasOpen){
+    if(wasOpen&&!keyboardOpen())showKeyboard();
+    else syncKbdBtn();}
 
   // 上屏 puts the text into the CLI's own input box and stops there — the user
   // eyeballs it and presses Enter themselves. It must append NOTHING: a newline
@@ -31988,9 +32271,9 @@ if(isTouch&&hasToken){(function(){
     if(!sendInput(text.replace(/\\x1b/g,'')))return;
     ta.value='';resizeTa();
     if(mode===LIVE){mirror.sent=mirror.held='';}
-    showKeyboard();}
+    keepKeyboard(consumePress());}
   function sendLiveCommit(appendEnter){
-    if(sendLiveKey(appendEnter?'\\r':''))showKeyboard();}
+    if(sendLiveKey(appendEnter?'\\r':''))keepKeyboard(consumePress());}
   // An EMPTY box in buffer mode still has to submit: after 上屏 the text is on the
   // terminal and the box was cleared, and pressing Enter is literally step 3 of
   // the 上屏 → 检查 → Enter flow this bar is built around. sendBuffered() bails on
@@ -32005,24 +32288,35 @@ if(isTouch&&hasToken){(function(){
   // Keys whose effect is safe to apply repeatedly while the finger stays down.
   var REPEATABLE={bs:1,left:1,right:1,up:1,down:1};
   var REPEAT_DELAY=450,REPEAT_EVERY=60;
+  // 读不到剪贴板（http 页面没有这个 API、用户拒了权限）时把键盘叫出来，让用户在输入框里长按粘贴。
+  function pasteFallback(){
+    showKeyboard();
+    if(typeof _wbToast==='function')_wbToast('浏览器不允许网页直接读剪贴板，请在输入框里长按粘贴',{duration:3200});}
   var keyBtns=document.querySelectorAll('#mobile-bar-keys button');
   for(var i=0;i<keyBtns.length;i++){(function(btn){
     // Set once a repeat tick has actually fired, so the click the browser sends
     // when the finger lifts can be swallowed instead of adding one more hit.
     var suppressTrailingClick=false;
     btn.addEventListener('click',function(){btn.blur();
-      if(suppressTrailingClick){suppressTrailingClick=false;return;}
+      var wasOpen=consumePress();
+      if(suppressTrailingClick){suppressTrailingClick=false;keepKeyboard(wasOpen);return;}
       var act=btn.getAttribute('data-sk');
+      if(act==='copy'){
+        // 复制面板会先把键盘收起来腾地方，关掉时按这里记下的状态还原。
+        if(typeof _wbOpenCopySheet==='function')_wbOpenCopySheet({restoreKeyboard:wasOpen});
+        return;}
       if(act==='paste'){
         // Commit pending live text before the async clipboard result lands.
-        if(mode===LIVE&&!sendLiveKey(''))return;
+        if(mode===LIVE&&!sendLiveKey('')){keepKeyboard(wasOpen);return;}
         // Read the clipboard and send as terminal input. Async API; fall back
         // to focusing the textarea so the user can long-press paste.
         if(navigator.clipboard&&navigator.clipboard.readText){
-          navigator.clipboard.readText().then(function(t){if(t)sendInput(t);}).catch(function(){showKeyboard();});
-        }else{showKeyboard();}
+          keepKeyboard(wasOpen);
+          navigator.clipboard.readText().then(function(t){if(t)sendInput(t);}).catch(pasteFallback);
+        }else{pasteFallback();}
         return;}
-      if(mode===LIVE)sendLiveKey(sk[act]);else sendInput(sk[act]);});
+      if(mode===LIVE)sendLiveKey(sk[act]);else sendInput(sk[act]);
+      keepKeyboard(wasOpen);});
     // Hold-to-repeat, but ONLY for keys that are safe to apply N times: cursor
     // moves and backspace. Enter/Ctrl-C/Esc/Tab/Shift-Tab/Paste are one-shot —
     // repeating Enter would fire the command several times, repeating Ctrl-C
@@ -32072,14 +32366,21 @@ if(isTouch&&hasToken){(function(){
   // Static NodeList, captured once: the bar's buttons must stay in the initial
   // markup. A button added later would miss this handler AND the disable pass
   // over 'controls' below, so both regress together rather than silently apart.
+  // The same press also records whether the keyboard was up (see consumePress).
+  // iOS sometimes moves focus on the compatibility mousedown even after the
+  // pointerdown was cancelled, so that one is cancelled as well.
   var barBtns=bar.querySelectorAll('button');
+  function notePress(e){e.preventDefault();kbAtPress=keyboardOpen();kbPressAt=Date.now();}
+  function noFocusSteal(e){e.preventDefault();}
   for(var bbi=0;bbi<barBtns.length;bbi++){
-    barBtns[bbi].addEventListener('pointerdown',function(e){e.preventDefault();});
+    barBtns[bbi].addEventListener('pointerdown',notePress);
+    barBtns[bbi].addEventListener('mousedown',noFocusSteal);
   }
 
   modeBtn.addEventListener('click',function(){modeBtn.blur();
+    var wasOpen=consumePress();
     // switching away from live flushes pending held text
-    if(mode===LIVE&&!sendLiveKey(''))return;
+    if(mode===LIVE&&!sendLiveKey('')){keepKeyboard(wasOpen);return;}
     // Entering live must flush the staged buffer text too, for the same reason:
     // live means "what the box holds is already in the terminal", and the mirror
     // is reset to empty just below. Leaving text in the textarea breaks that
@@ -32088,13 +32389,22 @@ if(isTouch&&hasToken){(function(){
     // terminal instead of editing it. Flush it the way 上屏 does — insert without
     // submitting — rather than silently discarding what the user typed.
     if(mode!==LIVE&&ta.value){
-      if(!sendInput(ta.value.replace(/\\x1b/g,'')))return;
+      if(!sendInput(ta.value.replace(/\\x1b/g,''))){keepKeyboard(wasOpen);return;}
       ta.value='';resizeTa();}
     var nextMode=mode===LIVE?BUFFER:LIVE;
     setMode(nextMode);
     if(nextMode===LIVE){mirror.sent=mirror.held='';hint.textContent='实时输入 · 点击显示键盘';}
-    showKeyboard();
+    keepKeyboard(wasOpen);
     _syncMode(nextMode);});
+
+  if(kbdBtn)kbdBtn.addEventListener('click',function(){
+    // 按按下时的状态切换，而不是现在的：见 consumePress。
+    if(consumePress())hideKeyboard();else showKeyboard();});
+  if(cmdsBtn)cmdsBtn.addEventListener('click',function(){
+    var wasOpen=consumePress();
+    if(typeof _wbOpenQuickSheet==='function')_wbOpenQuickSheet({restoreKeyboard:wasOpen});});
+  _wbMobileSend=function(seq){return mode===LIVE?sendLiveKey(seq):sendInput(seq);};
+  _wbMobileKeyboard={open:showKeyboard,close:hideKeyboard,isOpen:keyboardOpen};
 
   bar.addEventListener('submit',function(e){e.preventDefault();submit();});
 
@@ -32133,15 +32443,529 @@ if(isTouch&&hasToken){(function(){
   if(typeof ResizeObserver!=='undefined'){
     try{new ResizeObserver(measureBar).observe(bar)}catch(_e){}
   }
-  // tapping the terminal area surfaces the keyboard (mirrors woof's focus hint)
-  document.getElementById('terminal').addEventListener('click',function(){showKeyboard();},{passive:true});
+  ta.addEventListener('focus',function(){kbHiddenWhileFocused=false;syncKbdBtn();});
+  ta.addEventListener('blur',function(){kbHiddenWhileFocused=false;kbSeenInset=false;syncKbdBtn();});
+  // 再点一下已聚焦的输入框，Android 会把刚被返回键收掉的键盘重新弹出来。
+  ta.addEventListener('pointerdown',function(){if(kbHiddenWhileFocused){kbHiddenWhileFocused=false;syncKbdBtn();}},{passive:true});
+  function noteKeyboardInset(inset){
+    if(document.activeElement!==ta)return;
+    if(inset>80){kbSeenInset=true;kbHiddenWhileFocused=false;}
+    else if(inset<40&&kbSeenInset){kbHiddenWhileFocused=true;kbSeenInset=false;}
+    syncKbdBtn();}
+  syncKbdBtn();
+  // 点终端区域是想看输出：收起键盘，而不是把键盘弹出来挡住它。打字走底栏输入框或键盘按钮。
+  document.getElementById('terminal').addEventListener('click',function(){hideKeyboard();},{passive:true});
   // keep the bar above the software keyboard using visualViewport when available
   if(window.visualViewport){
     var vkT=0;
     window.visualViewport.addEventListener('resize',function(){clearTimeout(vkT);vkT=setTimeout(function(){
       var vv=window.visualViewport;var inset=Math.max(0,window.innerHeight-vv.height-vv.offsetTop);
-      document.documentElement.style.setProperty('--keyboard-inset',inset+'px');onViewportResize();},120);});
+      document.documentElement.style.setProperty('--keyboard-inset',inset+'px');
+      noteKeyboardInset(inset);
+      onViewportResize();_wbSheetTypingSync();},120);});
   }
+})();}
+
+// ── 底部面板：复制文本 / 快捷指令共用 ──
+// 打开时先收起键盘（面板占住键盘的位置），关掉时按打开前的状态还原：开着的再弹出来，关着的
+// 不替用户打开。点遮罩、点「关闭」、外接键盘 Esc、拖住顶部往下滑都能收起。
+// 注意：这一整段在 worker.ts 的模板字符串里，注释和代码都不能出现反引号，
+// 也不能出现「美元号 + 左花括号」的插值起始序列，否则会把模板字符串截断。
+var _wbSheet=null;
+function _wbSheetButton(label,cls){
+  var b=document.createElement('button');b.type='button';b.className=cls;b.textContent=label;
+  return b;
+}
+function _wbSheetEls(){
+  if(_wbSheet)return _wbSheet;
+  var s={open:false,kind:'',restoreKeyboard:false,onClose:null,closeT:0};
+  s.scrim=document.createElement('div');s.scrim.id='wb-sheet-scrim';
+  s.wrap=document.createElement('div');s.wrap.id='wb-sheet-wrap';
+  s.sheet=document.createElement('div');s.sheet.id='wb-sheet';
+  s.sheet.setAttribute('role','dialog');s.sheet.setAttribute('aria-modal','true');s.sheet.setAttribute('aria-labelledby','wb-sheet-title');
+  s.grab=document.createElement('div');s.grab.id='wb-sheet-grab';s.grab.setAttribute('aria-hidden','true');
+  s.head=document.createElement('div');s.head.id='wb-sheet-head';
+  s.title=document.createElement('div');s.title.id='wb-sheet-title';
+  s.actions=document.createElement('div');s.actions.id='wb-sheet-actions';
+  s.close=_wbSheetButton('关闭','');s.close.id='wb-sheet-close';
+  s.body=document.createElement('div');s.body.id='wb-sheet-body';
+  s.foot=document.createElement('div');s.foot.id='wb-sheet-foot';
+  s.head.appendChild(s.title);s.head.appendChild(s.actions);s.head.appendChild(s.close);
+  s.sheet.appendChild(s.grab);s.sheet.appendChild(s.head);s.sheet.appendChild(s.body);s.sheet.appendChild(s.foot);
+  s.wrap.appendChild(s.sheet);
+  document.body.appendChild(s.scrim);document.body.appendChild(s.wrap);
+  s.scrim.addEventListener('click',function(){_wbSheetClose();});
+  s.sheet.addEventListener('focusin',_wbSheetTypingSync);
+  s.sheet.addEventListener('focusout',function(){setTimeout(_wbSheetTypingSync,0);});
+  // 打字时点面板里的按钮不许抢走输入框的焦点：焦点一走就退出打字模式、面板换位置，按下和松手之间一跳，点击就落空了。
+  s.sheet.addEventListener('mousedown',function(e){
+    if(document.body.classList.contains('wb-sheet-typing')&&e.target.closest&&e.target.closest('button,label'))e.preventDefault();
+  },true);
+  // 重画时正在输入的框被移掉，浏览器不一定发 focusout。
+  new MutationObserver(_wbSheetTypingSync).observe(s.body,{childList:true,subtree:true});
+  s.close.addEventListener('click',function(){_wbSheetClose();});
+  // 外接键盘的 Esc 关面板，而不是漏给终端里的程序。
+  document.addEventListener('keydown',function(e){
+    if(s.open&&e.key==='Escape'){e.preventDefault();e.stopPropagation();_wbSheetClose();}
+  },true);
+  // 拖住顶部往下滑：跟手移动，松手时拖得够远或甩得够快就收起，否则弹回去；往上拖加阻尼。
+  var drag=null;
+  function dragStart(e){
+    if(!s.open||(e.button!==undefined&&e.button!==0))return;
+    if(e.target&&e.target.closest&&e.target.closest('button,input,textarea,label'))return;
+    var now=performance.now();
+    drag={id:e.pointerId,y:e.clientY,dy:0,lastY:e.clientY,lastT:now,v:0};
+    s.sheet.classList.add('dragging');
+    try{e.currentTarget.setPointerCapture(e.pointerId)}catch(_e){}
+  }
+  function dragMove(e){
+    if(!drag||e.pointerId!==drag.id)return;
+    var now=performance.now();
+    drag.v=(e.clientY-drag.lastY)/Math.max(1,now-drag.lastT);
+    drag.lastY=e.clientY;drag.lastT=now;
+    var dy=e.clientY-drag.y;
+    drag.dy=dy<0?dy/4:dy;
+    s.sheet.style.transform='translateY('+drag.dy+'px)';
+  }
+  function dragEnd(e,cancelled){
+    if(!drag||e.pointerId!==drag.id)return;
+    var d=drag;drag=null;
+    s.sheet.classList.remove('dragging');
+    if(!cancelled&&(d.dy>Math.min(120,s.sheet.offsetHeight*.3)||(d.dy>24&&d.v>.5)))_wbSheetClose();
+    else s.sheet.style.transform='';
+  }
+  [s.grab,s.head].forEach(function(el){
+    el.addEventListener('pointerdown',dragStart);
+    el.addEventListener('pointermove',dragMove);
+    el.addEventListener('pointerup',function(e){dragEnd(e,false)});
+    el.addEventListener('pointercancel',function(e){dragEnd(e,true)});
+  });
+  _wbSheet=s;
+  return s;
+}
+function _wbSheetOpen(kind,titleText,opts){
+  var s=_wbSheetEls();
+  opts=opts||{};
+  clearTimeout(s.closeT);
+  if(s.open&&s.onClose){var prev=s.onClose;s.onClose=null;try{prev()}catch(_e){}}
+  // 面板之间直接切换时，沿用最早那次打开前的键盘状态。
+  if(!s.open)s.restoreKeyboard=!!opts.restoreKeyboard;
+  s.kind=kind;s.onClose=opts.onClose||null;
+  s.sheet.setAttribute('data-kind',kind);
+  s.title.textContent=titleText;
+  s.actions.textContent='';s.body.textContent='';s.foot.textContent='';
+  s.sheet.classList.remove('dragging');s.sheet.style.transform='';
+  if(_wbMobileKeyboard)_wbMobileKeyboard.close();
+  s.scrim.classList.add('show');s.sheet.classList.add('show');
+  document.body.classList.add('wb-sheet-open');
+  s.open=true;
+  // 先让 display 生效再加 .in，滑入动画才有起点。
+  void s.sheet.offsetHeight;
+  s.scrim.classList.add('in');s.sheet.classList.add('in');
+  return s;
+}
+// 软键盘真占了地方才进打字模式：没有软键盘（外接键盘）时藏起底部按钮只会让面板白跳一下。
+function _wbSheetTypingSync(){
+  var s=_wbSheet,ae=document.activeElement;
+  var inset=parseFloat(document.documentElement.style.getPropertyValue('--keyboard-inset'))||0;
+  var typing=!!(s&&s.open&&inset>80&&ae&&s.sheet.contains(ae)&&ae.matches&&ae.matches('input[type=text],textarea')&&!ae.readOnly);
+  document.body.classList.toggle('wb-sheet-typing',typing);
+}
+// keyboard：省略 = 按打开前的状态还原；'open' = 无论之前如何都弹出（例如填入了还要补参数的指令）。
+function _wbSheetClose(keyboard){
+  var s=_wbSheet;
+  if(!s||!s.open)return;
+  s.open=false;
+  var cb=s.onClose;s.onClose=null;
+  if(cb){try{cb()}catch(_e){}}
+  var ae=document.activeElement;
+  if(ae&&ae!==document.body&&s.sheet.contains(ae)&&typeof ae.blur==='function')ae.blur();
+  s.sheet.classList.remove('dragging');s.sheet.style.transform='';
+  s.scrim.classList.remove('in');s.sheet.classList.remove('in');
+  document.body.classList.remove('wb-sheet-open');
+  _wbSheetTypingSync();
+  clearTimeout(s.closeT);
+  s.closeT=setTimeout(function(){
+    if(s.open)return;
+    s.scrim.classList.remove('show');s.sheet.classList.remove('show');
+    s.actions.textContent='';s.body.textContent='';s.foot.textContent='';
+  },320);
+  if(_wbMobileKeyboard&&(keyboard==='open'||s.restoreKeyboard))_wbMobileKeyboard.open();
+}
+
+// ── 复制面板 ──
+// 终端画布里没法用手指选字（见 core/web-terminal-text.ts），这里把缓冲区的文字摊进一个普通的
+// 可选文本区：系统原生的长按选词、拖手柄、拷贝菜单都能用；底部再给「复制选中」「复制全部」
+// 兜底——有的内嵌浏览器不弹系统拷贝菜单。
+var _WB_COPY_MAX_ROWS=5000;
+var _wbCopySel=null;
+document.addEventListener('selectionchange',function(){if(_wbCopySel)_wbCopySel();});
+function _wbOpenCopySheet(opts){
+  opts=opts||{};
+  var buf=term.buffer.active;
+  var hasAnchor=typeof opts.anchorRow==='number';
+  var pre=document.createElement('pre');pre.id='wb-copy-text';
+  var s=_wbSheetOpen('copy','复制文本',{restoreKeyboard:opts.restoreKeyboard,onClose:function(){
+    _wbCopySel=null;
+    try{var sel=window.getSelection();if(sel&&sel.rangeCount&&pre.contains(sel.getRangeAt(0).commonAncestorContainer))sel.removeAllRanges();}catch(_e){}
+  }});
+  var scope=opts.scope==='screen'?'screen':'all';
+  var seg=document.createElement('div');seg.className='wb-seg';seg.setAttribute('role','tablist');
+  var segAll=_wbSheetButton('全部记录','');segAll.setAttribute('role','tab');
+  var segScreen=_wbSheetButton('当前屏幕','');segScreen.setAttribute('role','tab');
+  seg.appendChild(segAll);seg.appendChild(segScreen);
+  var note=document.createElement('div');note.className='wb-sheet-note';
+  s.body.appendChild(seg);s.body.appendChild(pre);s.body.appendChild(note);
+  var copySel=_wbSheetButton('复制选中','wb-btn');
+  var copyAll=_wbSheetButton('复制全部','wb-btn primary');
+  s.foot.appendChild(copySel);s.foot.appendChild(copyAll);
+  var lines=[],lastSel='',pressing=false,pressSel='';
+  function selected(){
+    try{
+      var sel=window.getSelection();
+      if(!sel||sel.isCollapsed||!sel.rangeCount)return '';
+      if(!pre.contains(sel.getRangeAt(0).commonAncestorContainer))return '';
+      return sel.toString();
+    }catch(_e){return '';}
+  }
+  _wbCopySel=function(){
+    var t=selected();
+    // 点按钮那一下可能把选区收掉（iOS 点选区外会取消选择）：按住期间不清空，留给按钮用。
+    if(t)lastSel=t;else if(!pressing)lastSel='';
+    copySel.disabled=!lastSel;
+  };
+  function render(){
+    var start,end;
+    if(scope==='screen'){start=buf.viewportY;end=buf.viewportY+term.rows;}
+    else{end=buf.length;start=Math.max(0,end-_WB_COPY_MAX_ROWS);}
+    // 定位：长按打开的定到按住的那一行并高亮；按钮打开的定到终端当前看着的第一行。
+    var r=_wbBufferText(buf,{start:start,end:end,anchorRow:hasAnchor?opts.anchorRow:buf.viewportY});
+    lines=r.lines;
+    pre.textContent='';
+    var mark=null;
+    if(r.anchorLine>=0){
+      if(r.anchorLine>0)pre.appendChild(document.createTextNode(lines.slice(0,r.anchorLine).join('\\n')+'\\n'));
+      mark=document.createElement('span');
+      if(hasAnchor)mark.className='anchor';
+      mark.textContent=lines[r.anchorLine];
+      pre.appendChild(mark);
+      if(r.anchorLine<lines.length-1)pre.appendChild(document.createTextNode('\\n'+lines.slice(r.anchorLine+1).join('\\n')));
+    }else pre.textContent=lines.join('\\n');
+    segAll.setAttribute('aria-selected',scope==='all'?'true':'false');
+    segScreen.setAttribute('aria-selected',scope==='screen'?'true':'false');
+    copyAll.textContent=scope==='screen'?'复制本屏':'复制全部';
+    copyAll.disabled=!lines.length;
+    lastSel='';copySel.disabled=true;
+    var tips=[];
+    tips.push(lines.length?'长按文字选择，拖动两端调整范围，再点「复制选中」或系统菜单里的拷贝。':'终端里还没有文字。');
+    if(scope==='all'&&start>0)tips.push('只显示最近 '+_WB_COPY_MAX_ROWS+' 行。');
+    note.textContent=tips.join('');
+    requestAnimationFrame(function(){
+      if(mark)pre.scrollTop=Math.max(0,mark.offsetTop-(hasAnchor?(pre.clientHeight-mark.offsetHeight)/2:6));
+      else pre.scrollTop=pre.scrollHeight;
+    });
+  }
+  function finish(text,msg){
+    _wbCopyText(text,function(ok){
+      if(ok){_wbSheetClose();_wbToast(msg);}
+      else _wbToast('浏览器拦截了复制，请长按选中文字后用系统菜单里的拷贝',{kind:'err',duration:3600});
+    });
+  }
+  // 按钮不许抢焦点、不许清掉选区：选中的文字要留到点击处理里用。
+  [copySel,copyAll].forEach(function(btn){
+    btn.addEventListener('pointerdown',function(e){e.preventDefault();pressing=true;pressSel=selected()||lastSel;});
+    btn.addEventListener('mousedown',function(e){e.preventDefault();});
+    btn.addEventListener('pointercancel',function(){pressing=false;pressSel='';});
+  });
+  copySel.addEventListener('click',function(){
+    var t=pressSel||selected()||lastSel;pressing=false;pressSel='';
+    if(!t){copySel.disabled=true;return;}
+    finish(t,'已复制选中的文字');
+  });
+  copyAll.addEventListener('click',function(){
+    pressing=false;pressSel='';
+    if(lines.length)finish(lines.join('\\n'),scope==='screen'?'已复制本屏文字':'已复制 '+lines.length+' 行');
+  });
+  segAll.addEventListener('click',function(){if(scope!=='all'){scope='all';render();}});
+  segScreen.addEventListener('click',function(){if(scope!=='screen'){scope='screen';render();}});
+  render();
+}
+
+// ── 快捷指令 ──
+// 列表按 Bot 和 CLI 家族存在本机的终端设置里，页面加载时随 HTML 下发（只给可写页面）。读取和保存都走
+// WebSocket 请求/应答，worker 只认可写连接；它不走 PTY 字节流，见 core/web-terminal-quick-commands.ts。
+// 保存时带上改之前看到的列表：别的页面已经改过，服务端就拒绝并回最新列表，两边不会整表互相覆盖。
+// 只有收到确认才提示保存成功。没存过就用内置默认；用户删光了就是空列表，不会悄悄变回默认。
+var _wbQuickServer=_wbNormalizeQuick(_wbQuickSaved),_wbQuickReq=null,_wbQuickLate='',_wbQuickView=null;
+function _wbQuickCommands(){
+  return _wbQuickServer||_wbDefaultQuick(_wbQuickProfile(_wbCliId));
+}
+function _wbQuickNonce(){
+  var a=new Uint8Array(16),h='';
+  crypto.getRandomValues(a);
+  for(var i=0;i<a.length;i++)h+=(a[i]<16?'0':'')+a[i].toString(16);
+  return h;
+}
+// 同一时间只有一个请求在路上。done(status,changed)：status 是 ok / conflict / error，断线或超时是 null；
+// changed 表示服务端回的列表和本页之前知道的不一样。
+function _wbQuickRequest(msg,done){
+  if(_wbQuickReq||!ws_||ws_.readyState!==1||wsHasWrite!==true)return false;
+  var req={nonce:_wbQuickNonce(),done:done,t:0};
+  msg.type='quick_commands';msg.nonce=req.nonce;
+  try{ws_.send(JSON.stringify(msg));}catch(_e){return false;}
+  _wbQuickReq=req;
+  req.t=setTimeout(function(){
+    if(_wbQuickReq!==req)return;
+    // 应答可能只是来晚了：记下随机数，到了照样更新列表。
+    _wbQuickReq=null;_wbQuickLate=req.nonce;done(null,false);
+  },10000);
+  return true;
+}
+function _wbQuickAdopt(commands){
+  var list=commands===null?null:_wbNormalizeQuick(commands);
+  var changed=JSON.stringify(list)!==JSON.stringify(_wbQuickServer);
+  _wbQuickServer=list;
+  return changed;
+}
+// 应答混在终端输出里，靠只有本页知道的随机数认领：是在等的应答就吃掉（返回 true），否则原样交给终端。
+function _wbQuickReply(data){
+  var req=_wbQuickReq,r=req?_wbQuickReplyDecode(data,req.nonce):null;
+  if(r){
+    clearTimeout(req.t);_wbQuickReq=null;
+    req.done(r.status,_wbQuickAdopt(r.commands));
+    return true;
+  }
+  if(_wbQuickLate&&(r=_wbQuickReplyDecode(data,_wbQuickLate))){
+    _wbQuickLate='';
+    if(_wbQuickAdopt(r.commands)&&_wbQuickView)_wbQuickView(true);
+    return true;
+  }
+  return false;
+}
+function _wbQuickAbort(){
+  var req=_wbQuickReq;
+  _wbQuickLate='';
+  if(!req)return;
+  clearTimeout(req.t);_wbQuickReq=null;req.done(null,false);
+}
+// 保存新列表（null = 恢复默认）。base 是算出 next 时界面上那份列表，不是发送时的最新值，
+// 否则界面过期时服务端查不出冲突。onOk 在服务端确认后才调用；没成功时列表保持服务端的样子。
+function _wbSaveQuick(base,next,okMsg,onOk){
+  var msg=next?{op:'save',base:base,commands:next}:{op:'save',base:base,reset:true};
+  var sent=_wbQuickRequest(msg,function(status){
+    // 上一次保存其实写进去了、只是应答丢了，重试时会撞上冲突：服务端已经是想要的样子，就当成功。
+    if(status==='conflict'&&JSON.stringify(next?_wbNormalizeQuick(next):null)===JSON.stringify(_wbQuickServer))status='ok';
+    if(status==='ok'){if(onOk)onOk();if(okMsg)_wbToast(okMsg);}
+    else if(status==='conflict')_wbToast('列表在别的页面改过，已换成最新的，请重做这次修改',{kind:'err',duration:3600});
+    else if(status==='error')_wbToast('保存失败，列表没有改动',{kind:'err',duration:3200});
+    else _wbToast('没等到保存结果，这次修改可能没生效，重新打开面板会读取最新列表',{kind:'err',duration:3600});
+    if(_wbQuickView)_wbQuickView(status==='conflict');
+  });
+  if(!sent){
+    if(_wbQuickReq)_wbToast('正在同步，稍等一下再改',{duration:1600});
+    else _wbToast('连接断开了，修改没有保存',{kind:'err',duration:2600});
+  }
+  return sent;
+}
+function _wbRunQuick(cmd){
+  if(!_wbMobileSend)return false;
+  var seq=_wbQuickSeq(cmd.send);
+  if(!seq||!_wbMobileSend(seq))return false;
+  // 回车单独再发：和正文挤在同一帧里，有的 TUI 会当成粘贴，回车成了换行。
+  if(cmd.enter)setTimeout(function(){if(_wbMobileSend)_wbMobileSend('\\r');},120);
+  return true;
+}
+function _wbOpenQuickSheet(opts){
+  opts=opts||{};
+  var view=null,dismissGuard=null;
+  // 关掉面板就是不发了：确认条跟着收起，否则它会移到终端底部，之后一不小心就点到。
+  var s=_wbSheetOpen('quick','快捷指令',{restoreKeyboard:opts.restoreKeyboard,onClose:function(){if(_wbQuickView===view)_wbQuickView=null;if(dismissGuard)dismissGuard();}});
+  // draft：提交后还没收到确认的表单内容。保存没成功时重画的表单用它回填，用户不用重敲。
+  var editing=false,editIndex=-1,draft=null,resetArmedT=0;
+  var editBtn=_wbSheetButton('编辑','wb-sheet-text-btn');
+  s.actions.appendChild(editBtn);
+  editBtn.addEventListener('click',function(){editing=!editing;editIndex=-1;draft=null;render();});
+  function render(){
+    s.body.textContent='';s.foot.textContent='';
+    clearTimeout(resetArmedT);resetArmedT=0;
+    editBtn.textContent=editing?'完成':'编辑';
+    editBtn.setAttribute('aria-pressed',editing?'true':'false');
+    var base=_wbQuickServer,list=_wbQuickCommands();
+    if(editIndex>=list.length){editIndex=-1;draft=null;}
+    if(editing)renderEditor(list,base);else renderGrid(list);
+  }
+  function fire(cmd){
+    if(!_wbRunQuick(cmd)){_wbToast('终端还没连上或是只读，指令没有发出去',{kind:'err',duration:2600});return;}
+    // 「填入」的指令还等着补参数：直接把键盘叫出来；会自动回车的按打开前的键盘状态还原。
+    _wbSheetClose(cmd.enter?undefined:'open');
+  }
+  function renderGrid(list){
+    if(!list.length){
+      var empty=document.createElement('div');empty.className='wb-qc-empty';
+      empty.textContent='还没有快捷指令，点右上角「编辑」添加。';
+      s.body.appendChild(empty);return;
+    }
+    var grid=document.createElement('div');grid.className='wb-qc-grid';
+    list.forEach(function(cmd){
+      var b=_wbSheetButton('','wb-qc');
+      var l=document.createElement('span');l.className='wb-qc-label';l.textContent=cmd.label;b.appendChild(l);
+      // 名字和实际发送的不一样就把发送内容亮出来：别人改过的列表没法把一条命令伪装成「/status」。
+      if(cmd.send!==cmd.label){var sd=document.createElement('code');sd.className='wb-qc-send';sd.textContent=cmd.send;b.appendChild(sd);}
+      if(cmd.hint){var h=document.createElement('span');h.className='wb-qc-hint';h.textContent=cmd.hint;b.appendChild(h);}
+      if(!cmd.enter){var g=document.createElement('span');g.className='wb-qc-badge';g.textContent='填入';b.appendChild(g);}
+      b.setAttribute('aria-label',cmd.label+(cmd.enter?'，发送':'，填入输入框'));
+      b.addEventListener('click',function(){
+        // 输入行里还有没提交的字时，自动回车会把它和指令拼成一行交给 CLI：先问一句。
+        if(cmd.enter&&_wbLineLen>0){
+          dismissGuard=_wbToast('输入行里可能还有没提交的内容，直接发会和它拼成一行',{kind:'err',duration:6000,action:{label:'仍然发送',run:function(){fire(cmd);}}});
+          return;
+        }
+        fire(cmd);
+      });
+      grid.appendChild(b);
+    });
+    s.body.appendChild(grid);
+    var note=document.createElement('div');note.className='wb-sheet-note';
+    note.textContent='点一下就发给终端；标着「填入」的只放进输入框、不回车，方便接着补参数。';
+    s.body.appendChild(note);
+  }
+  function renderEditor(list,base){
+    function move(from,to){
+      if(to<0||to>=list.length)return;
+      var next=list.slice();var it=next.splice(from,1)[0];next.splice(to,0,it);
+      _wbSaveQuick(base,next,'',function(){if(editIndex===from)editIndex=to;else if(editIndex===to)editIndex=from;});
+    }
+    var rows=document.createElement('div');
+    list.forEach(function(cmd,i){
+      var row=document.createElement('div');row.className='wb-qc-row'+(i===editIndex?' editing':'');
+      var main=_wbSheetButton('','wb-qc-row-main');
+      var l=document.createElement('span');l.textContent=cmd.label+(cmd.enter?'':' · 填入');main.appendChild(l);
+      var c=document.createElement('code');c.textContent=cmd.send;main.appendChild(c);
+      main.setAttribute('aria-label','修改 '+cmd.label);
+      main.addEventListener('click',function(){editIndex=i;draft=null;render();});
+      var up=_wbSheetButton('↑','wb-icon-btn');up.disabled=i===0;up.setAttribute('aria-label','上移 '+cmd.label);
+      var down=_wbSheetButton('↓','wb-icon-btn');down.disabled=i===list.length-1;down.setAttribute('aria-label','下移 '+cmd.label);
+      var del=_wbSheetButton('✕','wb-icon-btn danger');del.setAttribute('aria-label','删除 '+cmd.label);
+      up.addEventListener('click',function(){move(i,i-1);});
+      down.addEventListener('click',function(){move(i,i+1);});
+      del.addEventListener('click',function(){
+        var next=list.slice();next.splice(i,1);
+        _wbSaveQuick(base,next,'',function(){if(editIndex===i){editIndex=-1;draft=null;}else if(editIndex>i)editIndex--;});
+      });
+      row.appendChild(main);row.appendChild(up);row.appendChild(down);row.appendChild(del);
+      rows.appendChild(row);
+    });
+    var cur=editIndex>=0?list[editIndex]:null,src=draft||cur;
+    var form=document.createElement('form');form.className='wb-qc-form';form.setAttribute('autocomplete','off');
+    var ft=document.createElement('div');ft.className='wb-qc-form-title';ft.textContent=cur?'修改「'+cur.label+'」':'添加指令';
+    function field(ph,val,mono){
+      var inp=document.createElement('input');inp.type='text';inp.placeholder=ph;inp.value=val||'';
+      if(mono)inp.className='mono';
+      inp.setAttribute('autocapitalize','off');inp.setAttribute('autocorrect','off');inp.setAttribute('spellcheck','false');
+      inp.setAttribute('enterkeyhint','done');
+      return inp;
+    }
+    var fSend=field('发送内容，例如 /compact',src?src.send:'',true);
+    var fLabel=field('名称（可选，默认同发送内容）',src?src.label:'',false);
+    var fHint=field('说明（可选）',src?src.hint:'',false);
+    var chk=document.createElement('label');chk.className='wb-qc-check';
+    var fEnter=document.createElement('input');fEnter.type='checkbox';fEnter.checked=src?src.enter:true;
+    chk.appendChild(fEnter);chk.appendChild(document.createTextNode('发送后自动回车（不勾选则只填入输入框）'));
+    var keysNote=document.createElement('div');keysNote.className='wb-sheet-note';
+    keysNote.textContent='发送内容里可以写按键：<Esc> <Enter> <Tab> <S-Tab> <Up> <Down> <C-c> 等。';
+    var acts=document.createElement('div');acts.className='wb-qc-form-actions';
+    var save=document.createElement('button');save.type='submit';save.className='wb-btn primary';save.textContent=cur?'保存':'添加';
+    acts.appendChild(save);
+    if(cur){var cancel=_wbSheetButton('取消','wb-btn');cancel.addEventListener('click',function(){editIndex=-1;draft=null;render();});acts.appendChild(cancel);}
+    form.appendChild(ft);form.appendChild(fSend);form.appendChild(fLabel);form.appendChild(fHint);
+    form.appendChild(chk);form.appendChild(keysNote);form.appendChild(acts);
+    form.addEventListener('submit',function(e){
+      e.preventDefault();
+      var d={label:fLabel.value,send:fSend.value,hint:fHint.value,enter:fEnter.checked};
+      var norm=_wbNormalizeQuick([d]);
+      if(!norm||!norm.length){_wbToast('发送内容不能为空，也不能超过 500 个字符',{kind:'err',duration:2600});return;}
+      var next=list.slice();
+      if(cur)next[editIndex]=norm[0];
+      else{if(next.length>=40){_wbToast('最多 40 条指令',{kind:'err',duration:2600});return;}next.push(norm[0]);}
+      draft=d;
+      if(!_wbSaveQuick(base,next,cur?'已保存':'已添加',function(){editIndex=-1;draft=null;}))return;
+      if(document.activeElement&&form.contains(document.activeElement))document.activeElement.blur();
+    });
+    s.body.appendChild(rows);s.body.appendChild(form);
+    if(cur||draft)requestAnimationFrame(function(){try{form.scrollIntoView({block:'nearest'})}catch(_e){}});
+    var reset=_wbSheetButton('恢复默认','wb-btn danger');
+    reset.addEventListener('click',function(){
+      // 两步确认：误触一下不会把自定义的指令全丢掉。
+      if(!resetArmedT){
+        reset.textContent='再点一次确认';
+        resetArmedT=setTimeout(function(){resetArmedT=0;reset.textContent='恢复默认';},3000);
+        return;
+      }
+      clearTimeout(resetArmedT);resetArmedT=0;reset.textContent='恢复默认';
+      _wbSaveQuick(base,null,'已恢复默认指令',function(){editIndex=-1;draft=null;});
+    });
+    var done=_wbSheetButton('完成','wb-btn primary');
+    done.addEventListener('click',function(){editing=false;editIndex=-1;draft=null;render();});
+    s.foot.appendChild(reset);s.foot.appendChild(done);
+  }
+  view=_wbQuickView=function(stale){if(stale){editIndex=-1;draft=null;}render();};
+  render();
+  // 别的页面可能刚改过：打开时向服务端要一次最新列表，有变化再重画。
+  _wbQuickRequest({op:'get'},function(_status,changed){if(changed&&_wbQuickView)_wbQuickView(true);});
+}
+
+// ── 触屏：长按终端打开复制面板；只读页右下角的复制按钮 ──
+if(isTouch){(function(){
+  var host=document.getElementById('terminal');
+  var fab=document.getElementById('copy-fab');
+  if(fab)fab.addEventListener('click',function(){_wbOpenCopySheet({});});
+  if(!host)return;
+  function rowAt(clientY){
+    var b=term.buffer.active;
+    try{
+      var sc=term.element&&term.element.querySelector('.xterm-screen');
+      var r=sc&&sc.getBoundingClientRect();
+      if(r&&r.height>0){
+        var row=Math.floor((clientY-r.top)/(r.height/term.rows));
+        if(row<0)row=0;else if(row>=term.rows)row=term.rows-1;
+        return b.viewportY+row;
+      }
+    }catch(_e){}
+    return b.viewportY;
+  }
+  // 挂在 window 的捕获阶段：终端自己的触摸滚动处理会在元素上 stopImmediatePropagation，挂在元素上
+  // 可能等不到 touchmove，手指正在滚动也会被当成长按。
+  var LONG_PRESS_MS=480,SLOP=10,lp=null;
+  function cancel(){if(lp){clearTimeout(lp.t);lp=null;}}
+  window.addEventListener('touchstart',function(e){
+    cancel();
+    if(e.touches.length!==1||!host.contains(e.target)||(_wbSheet&&_wbSheet.open))return;
+    var t0=e.touches[0];
+    var press={x:t0.clientX,y:t0.clientY,fired:false,t:0};
+    press.t=setTimeout(function(){
+      if(lp!==press)return;
+      press.fired=true;
+      try{if(navigator.vibrate)navigator.vibrate(10)}catch(_e){}
+      _wbOpenCopySheet({anchorRow:rowAt(press.y),restoreKeyboard:_wbMobileKeyboard?_wbMobileKeyboard.isOpen():false});
+    },LONG_PRESS_MS);
+    lp=press;
+  },{capture:true,passive:true});
+  window.addEventListener('touchmove',function(e){
+    if(!lp)return;
+    if(lp.fired){
+      // 面板已经打开、手指还按着：这次拖动别再去滚后面的终端。
+      if(e.cancelable)e.preventDefault();
+      e.stopPropagation();return;
+    }
+    var t=e.touches[0];
+    if(e.touches.length!==1||!t||Math.abs(t.clientX-lp.x)>SLOP||Math.abs(t.clientY-lp.y)>SLOP)cancel();
+  },{capture:true,passive:false});
+  window.addEventListener('touchend',function(e){
+    // 长按已经打开了面板：这次抬手不能再变成一次点击发给终端（TUI 可能把点击当操作）。
+    if(lp&&lp.fired&&e.cancelable)e.preventDefault();
+    cancel();
+  },{capture:true,passive:false});
+  window.addEventListener('touchcancel',cancel,{capture:true,passive:true});
 })();}
 </script>
 </body>
