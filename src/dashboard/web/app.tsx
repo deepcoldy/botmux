@@ -63,6 +63,7 @@ import { isMacLike, isPaletteHotkey, paletteShortcutLabel } from './command-pale
 import { NAV_GROUPS, NAV_ITEMS, NAV_SUBPAGES, type NavItem } from './nav-items.js';
 import { DECISION_BOARD_CHANGED_EVENT, boardsFromResponse } from './decision-board-model.js';
 import { parseWorkflowSidebarHash } from '../../core/workflow-sidebar-link.js';
+import { deriveSessionTaskStatus } from '../../core/session-task-status.js';
 import type { PalettePageEntry, PaletteShellContext } from './command-palette-sources.js';
 
 type OwnerAvatar = { avatarUrl: string; name?: string };
@@ -148,7 +149,6 @@ let appRoot: ReturnType<typeof createRoot> | null = null;
 
 const routeState = createDashboardRouteState();
 const OWNER_AVATAR_KEY = 'botmux.ownerAvatar.v1';
-const BUSY_STATUSES = new Set(['working', 'analyzing', 'active', 'starting']);
 const AUTH_EXPIRED_EVENT = 'botmux:auth-expired';
 let authLoginBaseUrl: string | undefined;
 
@@ -392,8 +392,7 @@ function dashboardStatusSummary(): TopbarStatusSummary {
     .map(s => ({ s, reason: attentionReason(s) }))
     .filter((x): x is { s: Record<string, any>; reason: string } => !!x.reason)
     .sort((a, b) => attentionWaitSince(a.s) - attentionWaitSince(b.s));
-  const attentionIds = new Set(attention.map(item => String(item.s.sessionId ?? '')));
-  const working = active.filter(s => BUSY_STATUSES.has(String(s.status)) && !attentionIds.has(String(s.sessionId ?? ''))).length;
+  const working = active.filter(s => deriveSessionTaskStatus(s).kind === 'working').length;
   const longest = attention[0] ?? null;
   const onlineBots = buildBotCards(sessions).filter(c => c.online || c.active.length > 0).length;
   const idle = Math.max(0, active.length - attention.length - working);

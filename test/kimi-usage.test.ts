@@ -115,8 +115,8 @@ describe('Kimi native usage snapshot', () => {
       records: [wire.prompt(0, prompt('old')), wire.llmRequest('kimi-code/k3.1-pro-highspeed'), wire.usage(50_000, 5_000, 0), wire.measured(550_000)],
     });
     const { getSessionUsageSnapshot } = await import('../src/core/cost-calculator.js');
-    const query = (fresh: boolean) => getSessionUsageSnapshot({ cliId: 'kimi', sessionId, cwd: home, fresh });
-    expect(query(true).turnTokens).toEqual({ in: 50_000, out: 5_000 });
+    const query = () => getSessionUsageSnapshot({ cliId: 'kimi', sessionId, cwd: home, fresh: true });
+    expect(query().turnTokens).toEqual({ in: 50_000, out: 5_000 });
     // Our `/new` session is indexed while still empty…
     const ours = makeKimiSession(home, { id: 'session_c_ours', workDir: home, records: [] });
     // …then a SIBLING conversation creates its session afterwards, becoming
@@ -125,16 +125,13 @@ describe('Kimi native usage snapshot', () => {
     sibling.append([wire.prompt(0, `<session_id>${other}</session_id>\nsibling`), wire.usage(1, 1, 0), wire.measured(2)]);
     setLastPrompt(sibling.dir, `<session_id>${other}</session_id>\nsibling`);
     // Our new generation is still empty: the lookup correctly keeps the old one.
-    expect(query(true).turnTokens).toEqual({ in: 50_000, out: 5_000 });
+    expect(query().turnTokens).toEqual({ in: 50_000, out: 5_000 });
     // Our first prompt lands in a session that is no longer the newest index
     // entry, so the stamp cannot see this write. A turn-boundary fresh read
     // must re-run the marker lookup instead of trusting the cached hit.
     ours.append([wire.prompt(0, prompt('new')), wire.llmRequest('kimi-code/k3.1-pro-highspeed'), wire.usage(700, 70, 0), wire.measured(770)]);
     setLastPrompt(ours.dir, prompt('new'));
-    expect(query(true).turnTokens).toEqual({ in: 700, out: 70 });
-    // Non-fresh streaming reads are allowed to ride the TTL cache; the next
-    // fresh turn boundary converges regardless.
-    expect(query(true).turnTokens).toEqual({ in: 700, out: 70 });
+    expect(query().turnTokens).toEqual({ in: 700, out: 70 });
   });
 
   it('reads the data dir a bot relocates with KIMI_CODE_HOME in its env', async () => {

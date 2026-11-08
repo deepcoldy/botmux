@@ -102,7 +102,9 @@ export interface DaemonSession {
   workerReady?: boolean;
   /** True while the CURRENT CLI generation's prompt is known idle/ready.
    *  Set by the worker's `prompt_ready` IPC; cleared on spawn / restart /
-   *  `claude_exit` / worker retirement. Deliberately NOT cleared by the
+   *  `claude_exit` / worker retirement, and when a MiniMax compact card request
+   *  is accepted for delivery. A false value can therefore also mean a pending
+   *  or in-flight compact on a live worker. Deliberately NOT cleared by the
    *  worker's `ready` IPC: `prompt_ready` frequently arrives BEFORE `ready`
    *  (riff / mojo synthesize the first one inside spawnCli, fast TUIs under
    *  Herdr do too), so clearing on `ready` would erase a just-set value.
@@ -978,8 +980,11 @@ export interface DaemonSession {
    *  Cleared when the user next replies to the session or when the session
    *  closes. Distinct from tuiPromptCardId (which is a
    *  rendered TUI menu detected by screen-analyzer) — this is deliberate,
-   *  agent-initiated, and carries no rendered options. */
-  agentAttention?: { kind: string; reason: string; at: number };
+   *  agent-initiated, and carries no rendered options. `source: 'agent'` marks
+   *  the agent's own raise; daemon-raised failure notices leave it unset. */
+  agentAttention?: { kind: string; reason: string; at: number; source?: 'agent' };
+  /** Start of the current busy stretch (edge into starting/working/analyzing). */
+  busySinceAt?: number;
   /** 文档评论入口（/watch-comment / /subscribe-lark-doc）：本会话「来自文档评论的轮」的回复落点
    *  映射。key = turnId（= 触发评论的 reply_id/comment_id，随消息传给 worker 再
    *  随 final_output 传回）；value = 该回哪个文档的哪条评论。deliverFinalOutput

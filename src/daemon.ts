@@ -8,6 +8,10 @@ import { handleSandboxSendRouteRequest, SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE } fro
 import { currentGatewayCallerOpenId } from './core/gateway-turn-caller.js';
 import { createBotAdminUnionsPublisher, readBotAdminUnions } from './services/bot-admin-unions-store.js';
 import { DecisionBoardService } from './core/decision-board/service.js';
+import { peerSessions, type ChatSessionRef, type ChatTaskReaderDeps } from './core/decision-board/chat-task-reader.js';
+import { stewardTaskHintsOn } from './core/decision-board/model.js';
+import { composeRowFromActive, composeRowFromPersistedActive } from './core/dashboard-rows.js';
+import { onSessionTaskEvent } from './core/session-task-events.js';
 import { setDecisionCardService } from './core/decision-board/card-action.js';
 import { createPrStateLookup } from './core/decision-board/github-pr-state.js';
 import { lookupChatAcrossBots } from './core/decision-board/chat-lookup.js';
@@ -1040,6 +1044,7 @@ import {
   clearAgentAttention,
   stampHumanActivity,
 } from './core/session-activity.js';
+import { holdLastTurnThrough, isMaintenanceTurnId, noteTurnStarted } from './core/turn-outcome.js';
 import { emitSessionLifecycleHook } from './services/session-lifecycle-hooks.js';
 import { botAutoWorktreeEnabled } from './services/default-worktree.js';
 import { createRepoWorktree, isGitWorkTree } from './services/git-worktree.js';
@@ -5467,7 +5472,7 @@ async function forceTopicWorktreeTarget(baseDir: string, anchor: string): Promis
   branch: string;
   targetSubdir?: string;
 }> {
-  const { mainWorktreeFor, worktreeRootFor } = await import('./services/git-worktree.js');
+  const { mainWorktreeFor, worktreeRootFor, worktreeTargetPath } = await import('./services/git-worktree.js');
   const containingRoot = await worktreeRootFor(baseDir);
   const repoRoot = await mainWorktreeFor(baseDir);
   // `git rev-parse --show-toplevel` can canonicalize platform aliases (for
@@ -5480,7 +5485,7 @@ async function forceTopicWorktreeTarget(baseDir: string, anchor: string): Promis
   const branch = `wt/botmux-${short}`;
   return {
     branch,
-    worktreePath: join(dirname(repoRoot), `${basename(repoRoot)}-wt-botmux-${short}`),
+    worktreePath: worktreeTargetPath(repoRoot, `${basename(repoRoot)}-wt-botmux-${short}`),
     ...((subdir && !subdir.startsWith('..') && !isAbsolute(subdir)) ? { targetSubdir: subdir } : {}),
   };
 }
@@ -6481,6 +6486,7 @@ function runIdleAutoCompact(): void {
  * sees no visible response.
  */
 function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
+  noteTurnStarted(ds, turnId);
   // A real turn ends the idle stretch a prompt-cache keep-alive was extending.
   resetPromptCacheKeepalive(ds);
   // Any turn other than an in-flight idle auto-compact opens a fresh stretch.
@@ -10924,7 +10930,7 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
   const rawKind = typeof raw.kind === 'string' ? raw.kind.trim().toLowerCase() : '';
   const kind = ['authz', 'decision', 'blocked', 'help'].includes(rawKind) ? rawKind : 'blocked';
 
-  ds.agentAttention = { kind, reason, at: Date.now() };
+  ds.agentAttention = { kind, reason, at: Date.now(), source: 'agent' };
   publishAttentionPatch(ds);
   emitSessionLifecycleHook(ds, 'session.requires_attention', { reason: 'agent_request', kind, message: reason });
   return jsonRes(res, 200, { ok: true });
@@ -23128,6 +23134,15 @@ function forkReservedInitialSession(
   const input = buildReservedInitialInput(ds, availableBots);
   if (trustedCaller) input.trustedCaller = trustedCaller;
   const turnId = ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId;
+  // 被 @ 回执的来源记录只能挂在这个 turnId 上（turn_terminal 带回的就是它）：会话群出生等
+  // 路径里它不是入站 messageId，在 seed 处按 messageId 记会留下永远消费不到的记录。
+  if (turnId) {
+    recordTurnExplicitMention(ds, turnId, messageMentionsBot(
+      { mentions: ds.pendingMentions },
+      ds.larkAppId,
+      getBot(ds.larkAppId).botOpenId,
+    ));
+  }
   let admission: XpiSharedCwdTurnAdmission = { kind: 'unmanaged' };
   let xpiAdmissionAcquired = false;
   if (ds.session.xpiSharedCwdAdmissionGroupId) {
@@ -25388,7 +25403,9 @@ function deliverPassthroughToExistingSession(
     // release its claim and compact the same idle stretch again.
     turn.onDelivered?.();
     beginNewTurn(ds, commandContent, turnId);
-    markSessionActivity(ds);
+    const activityAt = Date.now();
+    if (isMaintenanceTurnId(turnId)) holdLastTurnThrough(ds, activityAt);
+    markSessionActivity(ds, activityAt);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
     return true;
   }
@@ -32418,6 +32435,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   if (tmuxEnvScrub.removed.length > 0) {
     logger.info(`[tmux] scrubbed ${tmuxEnvScrub.removed.length} server-global env key(s): ${tmuxEnvScrub.removed.join(', ')}`);
   }
+  if (tmuxEnvScrub.updated.length > 0) {
+    logger.info(`[tmux] rewrote ${tmuxEnvScrub.updated.length} server-global env key(s): ${tmuxEnvScrub.updated.join(', ')}`);
+  }
   if (tmuxEnvScrub.failed.length > 0) {
     logger.warn(`[tmux] failed to scrub server-global env key(s): ${tmuxEnvScrub.failed.join(', ')}`);
   }
@@ -35284,6 +35304,50 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     )(candidate),
     createClient: createDetachedLarkClient,
   });
+  // 决策看板上的群状态：本 bot 的会话读内存，其他 bot 的会话问所属 daemon（本机 HMAC）。
+  // 其他 bot 在哪些群里有会话从它们的会话库读（短缓存），状态本身只信所属 daemon 的回答。
+  let boardPeerSessions: { at: number; sessions: Session[] } | undefined;
+  const boardChatTasks: ChatTaskReaderDeps = {
+    ownAppId: () => cfg.larkAppId,
+    chatSessions: chatIds => {
+      const wanted = new Set(chatIds);
+      const out = new Map<string, ChatSessionRef[]>();
+      const add = (s: Session, appId: string): void => {
+        if (!s.chatId || !wanted.has(s.chatId)) return;
+        const list = out.get(s.chatId) ?? [];
+        out.set(s.chatId, list);
+        const closedAt = s.closedAt ? Date.parse(s.closedAt) : NaN;
+        list.push({ sessionId: s.sessionId, larkAppId: appId, status: s.status, ...(Number.isFinite(closedAt) ? { closedAt } : {}) });
+      };
+      for (const s of sessionStore.listSessionsStrict()) add(s, cfg.larkAppId);
+      const now = Date.now();
+      if (!boardPeerSessions || now - boardPeerSessions.at > 15_000) {
+        const snapshot = sessionStore.loadAllSessionsSnapshot({ dataDir: config.session.dataDir, fallbackAppId: cfg.larkAppId });
+        let configured: Set<string> | undefined;
+        try { configured = new Set(loadBotConfigsCached().map(bot => bot.larkAppId)); } catch { configured = undefined; }
+        boardPeerSessions = { at: now, sessions: peerSessions(snapshot.values(), cfg.larkAppId, configured) };
+      }
+      for (const s of boardPeerSessions.sessions) add(s, s.larkAppId!);
+      return out;
+    },
+    ownRow: sessionId => {
+      const ds = findActiveBySessionId(sessionId);
+      if (ds) return composeRowFromActive(ds, { includeTokenUsage: false });
+      const s = sessionStore.getSession(sessionId);
+      return s?.status === 'active' ? composeRowFromPersistedActive(s, { includeTokenUsage: false }) : undefined;
+    },
+    peerRow: async (appId, sessionId) => {
+      const peer = findOnlineDaemon(appId);
+      if (!peer) return undefined;
+      const res = await fetchDaemonIpc(peer.ipcPort, `/api/sessions/${encodeURIComponent(sessionId)}`, { signal: AbortSignal.timeout(2_000) });
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {});
+        return undefined;
+      }
+      const body = await res.json() as { session?: unknown };
+      return body.session && typeof body.session === 'object' ? body.session as Record<string, unknown> : undefined;
+    },
+  };
   const decisionBoard = new DecisionBoardService({
     dataDir: config.session.dataDir,
     larkAppId: () => cfg.larkAppId,
@@ -35323,8 +35387,30 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         || (error instanceof TopicSendError && error.code === 'TOPIC_SEND_BLOCKED'),
     },
     prState: createPrStateLookup({ log: message => logger.info(message) }),
+    chatTasks: boardChatTasks,
   });
   setDecisionBoardService(decisionBoard);
+  // 子任务提醒：本 daemon 记下本轮结果或举手时，按群转给本机开着「子任务提醒」的管家
+  // （本 bot 直接调用，其他 bot 走本机 IPC）。管家端防抖、重新核对、去重。
+  onSessionTaskEvent(({ chatId }) => {
+    let bots: readonly BotConfig[];
+    try { bots = loadBotConfigsCached(); } catch { return; }
+    for (const bot of bots) {
+      if (!stewardTaskHintsOn(bot.steward) || bot.steward.chatId === chatId) continue;
+      if (bot.larkAppId === cfg.larkAppId) {
+        decisionBoard.noteTaskEvent(chatId);
+        continue;
+      }
+      const peer = findOnlineDaemon(bot.larkAppId);
+      if (!peer) continue;
+      void fetchDaemonIpc(peer.ipcPort, '/api/steward/task-event', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chatId }),
+        signal: AbortSignal.timeout(3_000),
+      }).then(r => r.body?.cancel()).catch(err => logger.debug(`[decision-board] task event to ${bot.larkAppId} failed: ${err?.message ?? err}`));
+    }
+  });
   setDecisionCardService(decisionBoard);
   // 「自动发现可以关的项」：管家开了这个开关才真正干活（sweepHints 内部判断），没开的 bot 每轮只读一次配置。
   // 5 分钟一轮：PR 合入后十来分钟内出提示（开着的 PR 每 10 分钟最多查一次，见 github-pr-state.ts），

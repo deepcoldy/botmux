@@ -2249,7 +2249,7 @@ function GroupsPage() {
           onChange={ev => updateFilters({ q: ev.currentTarget.value })}
         />
         <DropdownMenu
-          className="groups-bot-filter"
+          className="groups-bot-filter dashboard-toolbar-menu"
           ariaLabel={tr('groups.botFilterLabel')}
           label={botFilterLabel}
           value={filters.botId}
@@ -2261,7 +2261,7 @@ function GroupsPage() {
         />
         {view === 'session' ? (
           <DropdownMenu
-            className="groups-session-sort"
+            className="groups-session-sort dashboard-toolbar-menu"
             ariaLabel={tr('groups.sessionSortLabel')}
             label={sessionSortOptions.find(option => option.value === sessionSort)?.label ?? ''}
             value={sessionSort}

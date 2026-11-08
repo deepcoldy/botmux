@@ -42,6 +42,7 @@ import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill
 import { shouldInstallGlobalSkills } from '../skills/injection-mode.js';
 import { whiteboardEnabled } from '../services/whiteboard-store.js';
 import { cliSupportsNativeUsage, resolveSessionTranscriptPath } from '../services/transcript-resolver.js';
+import { confirmCodexModelLaunch, readCodexModelLaunchReceipt, readCodexModelSettingsCursor, refreshCodexModelSelection, recordCodexModelLaunch, resetCodexModelSelection, supportsCodexModelSelection } from '../services/codex-model-selection.js';
 import { readStatuslineSnapshot, toCardQuota } from '../services/statusline-snapshot.js';
 import { notePromptCacheKeepaliveResult, notePromptCacheKeepaliveScreenStatus, resolvedPromptCacheTtl } from './prompt-cache-keepalive.js';
 import { settleAutoCompactSafeComposerRefusal } from './auto-compact.js';
@@ -236,6 +237,8 @@ import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/o
 import { attachWorkflowSidebarEntry, workflowNodeSessionEntry } from '../im/lark/workflow-sidebar-entry.js';
 import { resolveWorkflowEntryLink } from './workflow-entry-link.js';
 import { beginFinalOutputDelivery, waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
+import { BUSY_RUNTIME_STATUSES } from './session-task-status.js';
+import { isMaintenanceTurnId, noteDiagnosticFinal, noteFinalReplyText, noteLateFinalReply, recordTurnOutcome } from './turn-outcome.js';
 import { validateFinalOutputSnapshot, type FinalOutputOffer } from '../services/final-output-handoff.js';
 import { FinalOutputHandoffStore, type StoredFinalOutput } from '../services/final-output-handoff-store.js';
 import { FinalOutputHandoffHost, FinalOutputRejectedError, type FinalOutputDeliveryControl } from '../services/final-output-handoff-host.js';
@@ -797,7 +800,7 @@ import {
   takeSessionPreviewTarget,
 } from './session-preview-registry.js';
 import { composeRowFromActive } from './dashboard-rows.js';
-import { publishAttentionPatch, publishClosedSessionPatch } from './session-activity.js';
+import { publishAttentionPatch, publishClosedSessionPatch, raiseDaemonAttention } from './session-activity.js';
 import { isOrdinaryImTurnId } from './ordinary-im-turn.js';
 import { isSerialGroupInput, trustedSessionController } from './trusted-session-controller.js';
 import {
@@ -1516,8 +1519,7 @@ function finalOutputHandoffHost(appId: string): FinalOutputHandoffHost {
       logger.warn(`[final-handoff] ${record.intentId} ${String(error)}`);
       if (['delivered', 'suppressed'].includes(store.read(record.intentId)?.state ?? '')) return;
       const ds = findActiveBySessionId(record.output.sessionId);
-      if (ds?.larkAppId === appId) {
-        ds.agentAttention = { kind: 'blocked', reason: FINAL_HANDOFF_DELIVERY_REASON, at: Date.now() };
+      if (ds?.larkAppId === appId && raiseDaemonAttention(ds, 'blocked', FINAL_HANDOFF_DELIVERY_REASON, record.output.turnId)) {
         publishAttentionPatch(ds);
       }
     },
@@ -3521,10 +3523,55 @@ function storedSessionCliDisplayName(ds: DaemonSession): string {
  * contract, and persisting it is exactly the mistake the frozen model was.
  */
 function recordLaunchModel(ds: DaemonSession, model: string | undefined): void {
-  if (ds.spawnModelOverride) return;
-  if (ds.session.model === model) return;
-  ds.session.model = model;   // undefined clears a stale record
+  const recordedNativeLaunch = !ds.adoptedFrom && !ds.initConfig?.adoptMode
+    && recordCodexModelLaunch(ds.session, model);
+  if (!recordedNativeLaunch && (ds.spawnModelOverride || ds.session.model === model)) return;
+  if (!ds.spawnModelOverride) ds.session.model = model;   // undefined clears a stale record
   sessionStore.updateSession(ds.session);
+}
+
+/** Resolve only this conversation's settings before a launcher can overwrite
+ * them. A bound instance never falls back to a different Codex home. */
+function refreshNativeCodexModel(ds: DaemonSession, botCfg: Parameters<typeof resolveSessionLaunchModel>[1], requireComplete = false): boolean {
+  if (!supportsCodexModelSelection(ds.session) || ds.adoptedFrom || ds.initConfig?.adoptMode
+    || !ds.session.cliSessionId) return false;
+  try {
+    const receipt = readCodexModelLaunchReceipt(config.session.dataDir, ds.session.sessionId);
+    if (receipt) confirmCodexModelLaunch(ds.session, receipt);
+    const binding = ds.session.cliInstanceBinding ?? ds.initConfig?.cliInstanceBinding;
+    const path = binding
+      ? findCodexRolloutBySessionId(ds.session.cliSessionId, {
+        codexHome: binding.codexHome, noFollow: binding.source !== 'legacy',
+      })
+      : resolveSessionTranscriptPath({
+        cliId: 'codex', sessionId: ds.session.sessionId,
+        cliSessionId: ds.session.cliSessionId,
+        cwd: ds.workingDir ?? ds.session.workingDir,
+        larkAppId: ds.larkAppId, fresh: true,
+      })?.path;
+    if (!path) return false;
+    if (requireComplete && !readCodexModelSettingsCursor(path)?.complete) return false;
+    const inherited = resolveSessionLaunchModel({
+      ...ds, spawnModelOverride: undefined,
+      session: { ...ds.session, codexModelSelection: undefined },
+    }, botCfg);
+    refreshCodexModelSelection(ds.session, path, inherited, ds.session.cliSessionId);
+    return true;
+  } catch (error) {
+    logger.warn(`[${tag(ds)}] Could not read native Codex model settings: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+}
+
+/** Checkpoint the current native model before clearing the saved preference.
+ * An unrelated /effort snapshot from the still-running CLI must not recreate it. */
+export function resetSessionCodexModelSelection(ds: DaemonSession): boolean {
+  if (!supportsCodexModelSelection(ds.session) || ds.adoptedFrom || ds.initConfig?.adoptMode
+    || isSessionRestartInFlight(ds)) return false;
+  if (ds.session.cliSessionId && !refreshNativeCodexModel(ds, getBot(ds.larkAppId).config, true)) return false;
+  resetCodexModelSelection(ds.session);
+  sessionStore.updateSession(ds.session);
+  return true;
 }
 
 function sessionServiceTier(ds: DaemonSession, cliId: CliId): CodexServiceTier | undefined {
@@ -3579,6 +3626,7 @@ function sessionAgentConfig(
     // is false → no bot model leaks to a different CLI; same-CLI keeps the bot's model
     // and stays consistent with in-place restarts (latestModelForRespawn), which never
     // pass through this snapshot branch. spawnModelOverride is honored automatically.
+    refreshNativeCodexModel(ds, botCfg);
     const modelChoice = resolveSessionLaunchModelChoice(ds, botCfg);
     const model = modelChoice.model;
     recordLaunchModel(ds, model);
@@ -3684,6 +3732,7 @@ function sessionAgentConfig(
     if (repaired) sessionStore.updateSession(ds.session);
   }
   // Resolved at EVERY spawn, resume included — see resolveSessionLaunchModel.
+  refreshNativeCodexModel(ds, botCfg);
   const modelChoice = resolveSessionLaunchModelChoice(ds, botCfg);
   const model = modelChoice.model;
   recordLaunchModel(ds, model);
@@ -7642,16 +7691,19 @@ function sessionMojoBlockEnv(ds: DaemonSession): Record<string, string> {
  * undefined = 取不到（bot 已注销等异常），让 worker 保持快照不动（=旧行为）。
  */
 export function latestModelForRespawn(ds: DaemonSession): string | null | undefined {
+  let botCfg: Parameters<typeof resolveSessionLaunchModel>[1];
   try {
-    const model = resolveSessionLaunchModel(ds, getBot(ds.larkAppId).config);
-    // An in-worker respawn IS a launch, so the rule-3 record must converge here
-    // too — otherwise `/restart` starts B while the record still says A, and a
-    // later CLI hot-switch pulls A back out of the record.
-    recordLaunchModel(ds, model);
-    return model ?? null;
+    botCfg = getBot(ds.larkAppId).config;
   } catch {
     return undefined;
   }
+  refreshNativeCodexModel(ds, botCfg);
+  const model = resolveSessionLaunchModel(ds, botCfg);
+  // An in-worker respawn IS a launch, so the rule-3 record must converge here
+  // too — otherwise `/restart` starts B while the record still says A, and a
+  // later CLI hot-switch pulls A back out of the record.
+  recordLaunchModel(ds, model);
+  return model ?? null;
 }
 
 export function latestPinEffortForRespawn(ds: DaemonSession): { reasoningEffort?: import('../services/codex-reasoning-effort.js').CodexReasoningEffort | null } {
@@ -7856,12 +7908,13 @@ export function requestSessionRestart(
     settingAttempt = attemptId;
     try {
       if (ds.worker && !ds.worker.killed) {
+        const model = opts.topicEffort?.model ?? latestModelForRespawn(ds);
         if (opts.topicEffort) topicEffortRestartReadiness.set(ds.session.sessionId, { attemptId, worker: ds.worker, workerGeneration: ds.workerGeneration, workerReady: !!ds.workerReady, cliReady: !!ds.cliReady, requested: opts.topicEffort });
         ds.workerReady = false;
         // In-worker respawn: the next prompt belongs to a NEW CLI generation.
         ds.cliReady = false;
         ds.worker.send({ type: 'restart', attemptId, ...restartIpcReason(observer.source), ...cwdMove,
-          ...(opts.topicEffort ? {} : { ...restartSessionEnvFields(ds), ...latestPinEffortForRespawn(ds) }), model: opts.topicEffort?.model ?? latestModelForRespawn(ds),
+          ...(opts.topicEffort ? {} : { ...restartSessionEnvFields(ds), ...latestPinEffortForRespawn(ds) }), model,
           ...(opts.topicEffort ? { topicEffort: opts.topicEffort } : {}),
           traexAutoModel: opts.topicEffort ? null : latestTraexAutoModelForRespawn(ds),
           ...(opts.topicEffort ? {} : { codexRpcInput: latestCodexRpcInputForRespawn(ds),
@@ -14816,6 +14869,9 @@ export function stampIdleSinceAt(
   } else if (ds.idleSinceAt !== undefined) {
     ds.idleSinceAt = undefined;
   }
+  const busy = BUSY_RUNTIME_STATUSES.has(ds.lastScreenStatus ?? '');
+  if (busy && !BUSY_RUNTIME_STATUSES.has(prev ?? '')) ds.busySinceAt = now;
+  else if (!busy) ds.busySinceAt = undefined;
   // A prompt-cache keep-alive's own busy period is not activity: restore the
   // idle stretch's original start so idleSuspendMinutes keeps counting.
   notePromptCacheKeepaliveScreenStatus(ds, prev, now);
@@ -16514,6 +16570,15 @@ function forkWorkerPrepared(
       cliRuntime: agentCfg.cliRuntime,
       cliPathOverride: agentCfg.cliPathOverride,
     })),
+    // 已探测到的 CLI 版本，供 adapter 给「新版本才有的 flag」做门控（例如
+    // opencode v1 的 --auto 到 1.17.12 才落地）。没探测过就是 'unknown'，
+    // adapter 必须按「不支持」处理 —— 传未知 flag 会让老版本打帮助退出 1，
+    // 再被 daemon 的自动重启放大成 crash-loop。
+    cliVersion: getCurrentCliVersion(runtimeInstallationKey({
+      cliId: agentCfg.cliId,
+      cliRuntime: agentCfg.cliRuntime,
+      cliPathOverride: agentCfg.cliPathOverride,
+    })),
     wrapperCli: agentCfg.wrapperCli,
     cliLaunchMode: agentCfg.cliLaunchMode,
     launchShell: agentCfg.launchShell,
@@ -17875,7 +17940,7 @@ function setupWorkerHandlers(
         }
       },
       error: (error, terminal) => {
-        ds.agentAttention = { kind: 'blocked', reason: FINAL_HANDOFF_DELIVERY_REASON, at: Date.now() };
+        if (raiseDaemonAttention(ds, 'blocked', FINAL_HANDOFF_DELIVERY_REASON, record.output.turnId)) publishAttentionPatch(ds);
         logger.warn(`[${t}] Universal output ${terminal ? 'terminally rejected' : 'remains durable'}: ${String(error)}`);
       },
     });
@@ -18936,6 +19001,12 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'codex_model_launch': {
+        if (!ownsLifecycleMutation()) break;
+        if (confirmCodexModelLaunch(ds.session, msg)) sessionStore.updateSession(ds.session);
+        break;
+      }
+
       case 'restart_result': {
         if (ds.worker !== worker) {
           logger.warn(`[${t}] Ignored restart_result from stale worker generation`);
@@ -19241,6 +19312,7 @@ function setupWorkerHandlers(
                 // 任务态随运行态边沿一起推：working→idle 时 todo 往往刚变化，
                 // 不带上会让看板「待办」列停在旧值。?? null 让清空也能同步（patch 合并）。
                 openTodos: dashboardRow.openTodos ?? null,
+                busySinceAt: ds.busySinceAt ?? null,
               },
             },
           });
@@ -20724,6 +20796,7 @@ function setupWorkerHandlers(
             kind: msg.terminalCarrier,
             ...(msg.responseKind ? { responseKind: msg.responseKind } : {}),
           });
+          if (msg.responseKind === 'final') noteLateFinalReply(ds, msg.turnId);
         }
         if (ds.session.principalLane && msg.messageId) {
           const binding = readPrincipalLaneTurnBinding(ds, msg.turnId);
@@ -21031,6 +21104,14 @@ function setupWorkerHandlers(
             executionTerminals.delete(oldestTerminalKey);
           }
         }
+        // Auto-compact and HTTP-caller turns never reach the group, so they
+        // must not replace the session's last user-visible turn result.
+        const outcomeExcluded = isMaintenanceTurnId(msg.turnId)
+          || ds.session.idleAutoCompact?.inFlight?.turnId === msg.turnId
+          || ds.idleAutoCompactDispatchedTurnId === msg.turnId
+          || !!ds.pendingWaitPromises?.has(msg.turnId)
+          || !!ds.asyncTriggerResults?.has(msg.turnId)
+          || !!ds.settledHttpTerminalTurns?.has(msg.turnId);
         observeTurnResultTerminal(ds, msg, workerGeneration);
         if (settleAutoCompactSafeComposerRefusal(ds, msg)) {
           if (noteIdleAutoCompactRefused(ds, msg.turnId)) {
@@ -21307,6 +21388,14 @@ function setupWorkerHandlers(
               + `${err instanceof Error ? err.message : String(err)}`,
             );
           }
+        }
+        if (!outcomeExcluded && !nonLarkFailureHandled && !ordinaryHttpTerminal) {
+          void recordTurnOutcome(ds, msg, {
+            recoveryHandled,
+            isFinalDelivered: () => isFinalTurnTerminalCarrier(ds.turnTerminalCarriers?.get(msg.turnId)),
+          }).catch((err: unknown) => {
+            logger.warn(`[${t}] turn outcome: ${err instanceof Error ? err.message : String(err)}`);
+          });
         }
         // Async-HTTP settle-on-terminal (core-only completion bug #70): a turn
         // the worker's bridge gate suppressed as GENUINE SILENCE (the model
@@ -23675,12 +23764,7 @@ function deliverFinalOutput(
           })
         : undefined;
       if (durableDelivery?.kind === 'ambiguous') {
-        ds.agentAttention = {
-          kind: 'blocked',
-          reason: `Durable final output is ambiguous: ${durableDelivery.error}`,
-          at: Date.now(),
-        };
-        publishAttentionPatch(ds);
+        if (raiseDaemonAttention(ds, 'blocked', `Durable final output is ambiguous: ${durableDelivery.error}`, msg.turnId)) publishAttentionPatch(ds);
         logger.error(`[${t}] Durable final_output ambiguous: ${durableDelivery.error}`);
         onComplete?.(false);
         return;
@@ -23738,6 +23822,14 @@ function deliverFinalOutput(
       }
       recordPrimaryOutput(messageId);
       const explicit = unifiedReply?.record.finalSource === 'explicit' ? unifiedReply.record : undefined;
+      if (messageId && !managedReceiver && !msg.turnFailed) {
+        if (msg.emptyCompletedNotice) {
+          noteDiagnosticFinal(ds, msg.turnId);
+        } else {
+          noteFinalReplyText(ds, msg.turnId, explicit?.finalText ?? safeAssistantText);
+          noteLateFinalReply(ds, msg.turnId);
+        }
+      }
       if (!managedReceiver) {
         recordOncallGroupDelivery(config.session.dataDir, {
           appId: ds.larkAppId, chatId: ds.chatId, messageId,
@@ -23877,11 +23969,10 @@ function deliverFinalOutput(
           resultReceipt(deliveredParts.length ? 'partial' : 'failed', deliveredParts, 'topic_send_blocked'));
         // The original topic cannot receive a notice. Surface the failure on the
         // existing Dashboard attention channel without changing the send route.
-        ds.agentAttention = { kind: 'blocked', reason: err.message, at: Date.now() };
         // Push the needs-you row immediately; the owner-reminder sweep would
         // surface it eventually, but the Dashboard must not wait for the next
         // row refresh to light up.
-        publishAttentionPatch(ds);
+        if (raiseDaemonAttention(ds, 'blocked', err.message, msg.turnId)) publishAttentionPatch(ds);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
           reason: 'topic_send_blocked', message: err.message, turnId: msg.turnId,
         });
@@ -24322,6 +24413,12 @@ export function forkAdoptWorker(
     // Same live-read pattern as the primary init: adopt re-forks gate on the
     // adopted CLI id.
     noProgressNotify: isCodexAppCliId(adoptedCliId) ? botCfg.noProgressNotify : undefined,
+    // 同主 init：adopt 重新 fork 时带上已探测版本（按 adopt 的 CLI id 取）。
+    cliVersion: getCurrentCliVersion(runtimeInstallationKey({
+      cliId: adoptedCliId,
+      cliRuntime: agentCfg.cliRuntime,
+      cliPathOverride: agentCfg.cliPathOverride,
+    })),
     codexRpcInput: resolveCodexRpcInput(adoptedCliId, botCfg.codexRpcInput, config.codexRpcInputDefault),
     // Adopt is normally observe-only (prompt=''), driven later by 'message'
     // IPCs. But a re-fork triggered by an incoming Lark turn (worker had exited

@@ -229,6 +229,7 @@ exec '${realTmux}' -S '${socket}' "$@"
     ...process.env,
     PATH: `${bin}:${process.env.PATH}`,
     HOME: dir,
+    TMUX_TMPDIR: dir,
     // Pane launch goes through the user's shell; pin a plain one so the test
     // does not depend on the runner's login shell (nologin for service
     // accounts) or its rcfiles.
@@ -238,6 +239,9 @@ exec '${realTmux}' -S '${socket}' "$@"
     BOTMUX_NO_CLAIM: '1',
   };
   for (const key of Object.keys(env)) if (key.startsWith('BOTMUX_') && key !== 'BOTMUX_NO_CLAIM') delete env[key];
+  // Strict spawn filters TMUX_TMPDIR again; give the host-side socket census
+  // a private label too. The shim still routes every tmux command to `socket`.
+  env.BOTMUX_TMUX_SOCKET = `sbx-life-${sessionId}`;
   delete env.TMUX;
   delete env.TMUX_PANE;
   const init = (bootId: string) => ({

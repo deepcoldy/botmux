@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 vi.mock('../src/dashboard/web/confirm-modal.js', () => ({ confirm: vi.fn(async () => true) }));
 
 import { ScheduleBotGrantsEditor, scheduleBotGrantDraftProblem } from '../src/dashboard/web/schedule-bot-grants-editor.js';
+import { DropdownMenu, type DropdownOption } from '../src/dashboard/web/dashboard-components.js';
 import { confirm } from '../src/dashboard/web/confirm-modal.js';
 import { applySettingsWrite, type SettingsWriteApplierDeps } from '../src/dashboard/settings-write-applier.js';
 import { scheduleBotGrantsPayload } from '../src/dashboard/web/settings-page.js';
@@ -34,9 +35,9 @@ const typeInto = (r: TestRenderer.ReactTestRenderer, input: string, value: strin
   act(() => { r.root.findByProps({ 'data-input': input }).props.onChange({ currentTarget: { value } }); });
 };
 const pickSource = (r: TestRenderer.ReactTestRenderer, name: string) => {
-  const summary = r.root.findAllByType('summary').find(node => node.props['aria-label'] === '来源 Bot')!;
-  const option = summary.parent!.findAllByType('button').find(b => JSON.stringify(b.props.children ?? '').includes(name))!;
-  act(() => { option.props.onClick?.({}); });
+  const menu = r.root.findAllByType(DropdownMenu).find(node => node.props.ariaLabel === '来源 Bot')!;
+  const option = (menu.props.options as DropdownOption<string>[]).find(o => JSON.stringify(o.label ?? '').includes(name))!;
+  act(() => { menu.props.onChange(option.value); });
 };
 const checkTarget = (r: TestRenderer.ReactTestRenderer, appId: string) => {
   const box = r.root.findAllByType('input').find(node => node.props.type === 'checkbox' && node.props.value === appId)!;

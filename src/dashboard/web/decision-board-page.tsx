@@ -61,12 +61,15 @@ import {
   boardItemHash,
   boardRelativeTime,
   boardSummaryHash,
+  chatTaskLine,
+  chatTaskSummaryText,
   checkBoardImages,
   draftFromServer,
   draftNeedsReview,
   isDraftEmpty,
   itemChatView,
   knownHint,
+  knownTaskHint,
   newSubmitNonce,
   nonChatLinks,
   orderSubmitCandidates,
@@ -79,6 +82,10 @@ import {
   submitPayloadItems,
   submitScope,
   textPreview,
+  TASK_HINT_LABEL_KEYS,
+  type ChatTaskState,
+  type ItemTaskFields,
+  type TaskHint,
   type BoardBatch,
   type BoardDetailResponse,
   type BoardDraft,
@@ -219,6 +226,66 @@ function HintBanner(props: { hint: BoardHint | undefined }) {
     <p className={`dboard-hint-banner is-${hint.kind}`} data-hint={hint.kind} role="note">
       💡 {tr('decisionBoard.hintDetail', { label: tr(BOARD_HINT_LABEL_KEYS[hint.kind]), reason: hint.reason })}
     </p>
+  );
+}
+
+/** 子任务提示：关联群里有管家还没处理的新结果（只是提示，状态没改）。 */
+function TaskHintChip(props: { hint: TaskHint | undefined; banner?: boolean }) {
+  const tr = useT();
+  const hint = knownTaskHint(props.hint);
+  if (!hint) return null;
+  const label = tr(TASK_HINT_LABEL_KEYS[hint.kind]);
+  if (props.banner) {
+    return <p className={`dboard-hint-banner is-${hint.kind}`} data-task-hint={hint.kind} role="note">🔔 {tr('decisionBoard.taskHintDetail', { label })}</p>;
+  }
+  return (
+    <span className="dboard-hint-row" data-task-hint={hint.kind}>
+      <span className={`dboard-hint-chip is-${hint.kind}`}>🔔 {label}</span>
+    </span>
+  );
+}
+
+/** 汇总行里的关联群状态：单群写状态、时间和一句话；多群写汇总。 */
+function RowTaskLine(props: { item: ItemTaskFields; now: number }) {
+  const tr = useT();
+  const chats = props.item.taskChats;
+  if (!chats?.length) return null;
+  if (chats.length > 1) {
+    return <span className="dboard-row-task" data-fresh={props.item.taskFresh ? 'true' : undefined}>{chatTaskSummaryText(chats, tr)}</span>;
+  }
+  const line = chatTaskLine(chats[0]!, props.now, tr);
+  if (!line) return null;
+  return (
+    <span className="dboard-row-task" data-task={chats[0]!.kind} data-fresh={props.item.taskFresh ? 'true' : undefined}>
+      <span className="dboard-task-label">{line.label}</span>
+      {line.time ? <span className="dboard-task-time">{line.time}</span> : null}
+      {line.text ? <span className="dboard-task-text">{line.text}</span> : null}
+    </span>
+  );
+}
+
+/** 详情页：每个关联群的子任务状态（状态、时间、一句话）；进群链接在上面的群列表里。 */
+function TaskChatsPanel(props: { chats: ChatTaskState[] | undefined; links: RenderedLink[]; now: number }) {
+  const tr = useT();
+  if (!props.chats?.length) return null;
+  return (
+    <section className="dboard-tasks" aria-label={tr('decisionBoard.taskTitle')}>
+      <span className="dboard-chats-label">{tr('decisionBoard.taskTitle')}</span>
+      <ul className="dboard-tasks-list">
+        {props.chats.map(state => {
+          const line = chatTaskLine(state, props.now, tr);
+          const link = props.links.find(l => l.kind === 'chat' && l.ref === state.chatId);
+          return (
+            <li key={state.chatId} className="dboard-task" data-task={state.kind}>
+              <span className="dboard-task-chat">{link?.text ?? state.chatId}</span>
+              {line ? <span className="dboard-task-label">{line.label}</span> : null}
+              {line?.time ? <span className="dboard-task-time">{line.time}</span> : null}
+              {line?.text ? <span className="dboard-task-text">{line.text}</span> : null}
+            </li>
+          );
+        })}
+      </ul>
+    </section>
   );
 }
 
@@ -556,7 +623,9 @@ function BoardRow(props: { appId: string; item: BoardListResponse['items'][numbe
           ) : null}
           {item.pendingDecisions > 0 ? <span className="dboard-row-pending">{tr('decisionBoard.pendingShort')}</span> : null}
           <HintChip hint={item.hint} />
+          <TaskHintChip hint={item.taskHint} />
           <RowChatLine view={chat} />
+          <RowTaskLine item={item} now={props.now} />
         </span>
         <span className="dboard-row-meta">
           <StateChip state={item.state} stage={item.stage} />
@@ -1297,7 +1366,9 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
       </header>
       <p className="dboard-detail-meta">{meta}</p>
       <HintBanner hint={item.hint} />
+      <TaskHintChip hint={detail.taskHint} banner />
       <ChatPanel seq={item.seq} view={itemChatView(item, detail.links)} />
+      <TaskChatsPanel chats={detail.taskChats} links={detail.links} now={now} />
       <LinkChips links={nonChatLinks(detail.links)} />
       {item.summary?.trim() ? (
         <p className="dboard-summary"><span className="dboard-summary-label">{tr('decisionBoard.summaryLabel')}</span>{item.summary}</p>
