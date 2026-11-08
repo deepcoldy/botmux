@@ -16,6 +16,10 @@
  *     anonymous read-only visitor): wake an ordinary worker-less session as
  *     before (e.g. one restored after a daemon restart), but never a session
  *     that was deliberately suspended — that gets the "session suspended" page;
+ *   • view-grant — a Dashboard view-link read grant the front proxy countersigned
+ *     (a WebSocket that carries no cookie): it is pinned to a worker boot that is
+ *     already gone, so no worker this wake could fork would accept it. Never
+ *     wake; a suspended session still gets the "session suspended" page;
  *   • none — no credential, or one that does not verify: never wake. The worker
  *     would have answered 403 after the wake anyway.
  *
@@ -23,8 +27,11 @@
  * never granted to a request the worker would then refuse outright.
  */
 import {
+  looksLikeTerminalControlGrant,
+  TERMINAL_VIEW_FORWARD_HEADER,
   TERMINAL_WAKE_HEADER,
   verifyTerminalControlGrant,
+  verifyTerminalViewForward,
   verifyTerminalWakeProof,
 } from './terminal-control-grant.js';
 import {
@@ -38,7 +45,7 @@ import {
  * worker reads the same literal). */
 const TERMINAL_CONTROL_GRANT_HEADER = 'x-botmux-terminal-control';
 
-export type TerminalWakeCredential = 'authenticated' | 'read-link' | 'none';
+export type TerminalWakeCredential = 'authenticated' | 'read-link' | 'view-grant' | 'none';
 export type TerminalWakeDecision = 'wake' | 'suspended' | 'deny';
 
 export interface TerminalWakeRequest {
@@ -95,6 +102,12 @@ export function classifyTerminalWakeCredential(input: TerminalWakeCredentialInpu
     // read-only visitor: it may watch, so it is a read-only capability here.
     if (grant.ok) return grant.claims.scope === 'write' ? 'authenticated' : 'read-link';
   }
+  const { viewToken } = capability;
+  if (looksLikeTerminalControlGrant(viewToken)
+    && verifyTerminalViewForward(secret, viewToken, headers[TERMINAL_VIEW_FORWARD_HEADER])) {
+    const grant = verifyTerminalControlGrant(secret, viewToken, sessionId, now);
+    if (grant.ok && grant.claims.scope === 'read' && grant.claims.audience === 'central') return 'view-grant';
+  }
   return authorizeTerminalStatusPage({
     secret,
     sessionId,
@@ -120,5 +133,6 @@ export function terminalSessionSuspended(ds: {
 export function decideTerminalWake(credential: TerminalWakeCredential, suspended: boolean): TerminalWakeDecision {
   if (credential === 'authenticated') return 'wake';
   if (credential === 'read-link') return suspended ? 'suspended' : 'wake';
+  if (credential === 'view-grant') return suspended ? 'suspended' : 'deny';
   return 'deny';
 }
