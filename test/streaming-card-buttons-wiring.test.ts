@@ -23,19 +23,30 @@ function buildStreamingCardCallSites(source: string): string[] {
   return sites;
 }
 
-/** Remove every comment while preserving all code, using the TypeScript parser's
- *  own comment ranges. A hand-rolled char scanner cannot tell a regex literal
- *  (e.g. xmlEscape's `/"/g`) from a division/string opener, so on files containing
- *  regexes its string-state inverts and real comments survive — which would let a
- *  comment naming the guarded argument satisfy the guard. The parser distinguishes
- *  regex / string / template / comment correctly, so its ranges are ground truth. */
+/** Remove every comment while preserving all code and line numbers, using the
+ *  TypeScript parser's own comment ranges.
+ *
+ *  Two earlier approaches were wrong:
+ *  - A hand-rolled char scanner cannot tell a regex literal (e.g. xmlEscape's
+ *    `/"/g`) from a division/string opener, so its string-state inverts on files
+ *    containing regexes and real comments survive.
+ *  - Walking only forEachChild nodes misses punctuation tokens (comma, ')', '}'):
+ *    comments sitting next to them are never visited, so an argument guard can be
+ *    satisfied by a comment placed right after the closing comma/paren.
+ *
+ *  getChildren returns the full token stream including punctuation, which covers
+ *  every comment position; JSDoc nodes are skipped because their pos falls inside
+ *  the comment span itself. Comment characters are blanked but their newlines are
+ *  kept, so line numbers in any later assertion stay aligned with the source. */
 function stripComments(source: string): string {
   const sf = ts.createSourceFile('guard.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const ranges: Array<[number, number]> = [];
   const collect = (node: ts.Node): void => {
     for (const r of ts.getLeadingCommentRanges(source, node.pos) ?? []) ranges.push([r.pos, r.end]);
     for (const r of ts.getTrailingCommentRanges(source, node.end) ?? []) ranges.push([r.pos, r.end]);
-    ts.forEachChild(node, collect);
+    for (const child of node.getChildren(sf)) {
+      if (!ts.isJSDoc(child)) collect(child);
+    }
   };
   collect(sf);
   ranges.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
@@ -44,6 +55,7 @@ function stripComments(source: string): string {
   for (const [start, end] of ranges) {
     if (start < cursor) continue; // drop overlapping ranges
     out += source.slice(cursor, start);
+    out += source.slice(start, end).replace(/[^\n]/g, ''); // keep '\n', drop comment chars
     cursor = end;
   }
   return out + source.slice(cursor);
@@ -127,5 +139,42 @@ describe('streaming-card keys-panel restore wiring', () => {
       }
     }
     expect(offenders).toEqual([]);
+  });
+});
+
+// stripComments 的自测夹具：锁住「注释必须剥干净、但字符串/模板/正则里的斜杠要保留」
+// 这几个坑——字符状态机和只走 forEachChild 的 AST 遍历都曾在这里漏剥注释。
+describe('stripComments comment handling', () => {
+  it('removes comments in every position while keeping code, strings and line count', () => {
+    const source = [
+      "const a = 1; // line comment after a comma",
+      "const b = 2; /* block comment after a comma */",
+      "function f() {",
+      "  g(",
+      "    'http://example.com/path', // line comment next to ')'",
+      "    `template // not a comment ${x}`,",
+      "  );",
+      "  try { h(); } catch { /* comment inside an empty catch block */ }",
+      "  return s.replace(/\"/g, '&quot;').replace(/'/g, '&apos;');",
+      "  // a comment on its own line right before the closing brace",
+      "}",
+    ].join('\n');
+    const stripped = stripComments(source);
+
+    // Every real comment is gone (its prose no longer appears)…
+    expect(stripped).not.toContain('line comment after a comma');
+    expect(stripped).not.toContain('block comment after a comma');
+    expect(stripped).not.toContain("line comment next to ')'");
+    expect(stripped).not.toContain('comment inside an empty catch block');
+    expect(stripped).not.toContain('a comment on its own line');
+    // …while code and slashes that live inside string/template/regex survive.
+    expect(stripped).toContain('http://example.com/path');
+    expect(stripped).toContain('template // not a comment');
+    expect(stripped).toContain('/"/g');
+    expect(stripped).toContain("/'/g");
+    expect(stripped).toContain('const a = 1;');
+    expect(stripped).toContain('function f() {');
+    // Newlines are retained so line numbers in diagnostics stay aligned.
+    expect(stripped.split('\n')).toHaveLength(source.split('\n').length);
   });
 });
