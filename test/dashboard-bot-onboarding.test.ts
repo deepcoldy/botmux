@@ -784,6 +784,31 @@ describe('BotOnboardingManager', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  it('表单选「跟随 CLI 默认」（请求不带 model）时新 Bot 不写 model 字段', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-'));
+    const manager = new BotOnboardingManager({
+      botsJsonPath: join(dir, 'bots.json'),
+      registerApp: async () => ({ ok: true, appId: 'cli_x', appSecret: 's', brand: 'feishu' }),
+      validateCredentials: async () => ({ ok: true }),
+      automateOpenPlatform: async () => autoOk(),
+      renderQrDataUrl: () => 'data:image/svg+xml;base64,qr',
+    });
+
+    const job = manager.start({ cliId: 'codex', workingDir: dir });
+    await job.done;
+    batchGetIdMock.mockResolvedValueOnce({
+      code: 0,
+      data: { user_list: [{ email: 'admin@corp.com', user_id: 'ou_admin' }] },
+    });
+    expect((await manager.submitOwner(job.id, ['admin@corp.com'])).ok).toBe(true);
+
+    const bots = JSON.parse(readFileSync(join(dir, 'bots.json'), 'utf-8'));
+    expect(bots[0]).toMatchObject({ larkAppId: 'cli_x', cliId: 'codex' });
+    expect(bots[0]).not.toHaveProperty('model');
+
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   it('dirMode=fixed persists defaultWorkingDir (direct start) instead of workingDir', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-onboard-'));
     const manager = new BotOnboardingManager({
