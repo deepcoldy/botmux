@@ -22,7 +22,12 @@ export function resolveLarkTestCli(env: NodeJS.ProcessEnv = process.env): string
   // ELF, PE, Mach-O (both endiannesses) and universal Mach-O. A shell/Node/Python entry is not the native CLI contract.
   if (!['7f454c46', 'feedface', 'cefaedfe', 'feedfacf', 'cffaedfe', 'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca'].includes(header.toString('hex'))
       && header.subarray(0, 2).toString() !== 'MZ') {
-    throw new Error('lark-cli contract needs a native executable; PATH selected a wrapper. Set BOTMUX_TEST_LARK_CLI explicitly.');
+    // The documented npm install puts a Node launcher on PATH; without an explicit
+    // or required contract that host simply has no native CLI to test.
+    if (explicit === undefined && env.BOTMUX_TEST_REQUIRE_LARK_CLI !== '1') return null;
+    throw new Error(explicit !== undefined
+      ? 'BOTMUX_TEST_LARK_CLI must name a native executable, not a wrapper'
+      : 'lark-cli contract needs a native executable; PATH selected a wrapper. Set BOTMUX_TEST_LARK_CLI explicitly.');
   }
   if (env.BOTMUX_TEST_LARK_CLI_SHA256
       && createHash('sha256').update(readFileSync(path)).digest('hex') !== env.BOTMUX_TEST_LARK_CLI_SHA256) {

@@ -19,7 +19,7 @@ describe('real CLI contract executable selection', () => {
     const dir = root(); const wrapper = join(dir, 'wrapper');
     writeFileSync(wrapper, '#!/bin/sh\nexit 77\n', { mode: 0o700 }); native(join(dir, 'lark-cli'));
     const resolve = resolveLarkTestCli;
-    expect(() => resolve({ PATH: dir, BOTMUX_TEST_LARK_CLI: wrapper })).toThrow(/native executable/);
+    expect(() => resolve({ PATH: dir, BOTMUX_TEST_LARK_CLI: wrapper })).toThrow(/BOTMUX_TEST_LARK_CLI must name a native executable/);
   });
   it('rejects missing and nonexecutable explicit paths', () => {
     const dir = root(); const resolve = resolveLarkTestCli;
@@ -27,11 +27,16 @@ describe('real CLI contract executable selection', () => {
     const binary = native(join(dir, 'native-cli')); chmodSync(binary, 0o600);
     expect(() => resolve({ BOTMUX_TEST_LARK_CLI: binary })).toThrow();
   });
-  it('rejects a PATH symlink pointing at an identity wrapper', () => {
+  it('skips when PATH discovery only finds a wrapper, unless the contract is required', () => {
     const dir = root(); const wrapper = join(dir, 'wrapper');
     writeFileSync(wrapper, '#!/bin/sh\nexit 77\n', { mode: 0o700 }); symlinkSync(wrapper, join(dir, 'lark-cli'));
+    const npmDir = root();
+    writeFileSync(join(npmDir, 'lark-cli'), '#!/usr/bin/env node\nrequire("./run.js")\n', { mode: 0o700 });
     const resolve = resolveLarkTestCli;
-    expect(() => resolve({ PATH: dir })).toThrow(/native executable/);
+    expect(resolve({ PATH: dir })).toBeNull();
+    expect(resolve({ PATH: npmDir })).toBeNull();
+    expect(() => resolve({ PATH: dir, BOTMUX_TEST_REQUIRE_LARK_CLI: '1' })).toThrow(/PATH selected a wrapper/);
+    expect(() => resolve({ PATH: npmDir, BOTMUX_TEST_REQUIRE_LARK_CLI: '1' })).toThrow(/PATH selected a wrapper/);
   });
   it('fails rather than skipping when the maintenance contract is required', () => {
     const resolve = resolveLarkTestCli;
