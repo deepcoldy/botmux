@@ -564,7 +564,6 @@
     "test/dashboard-feed-group-owner.integration.test.ts": 3.66,
     "test/dashboard-feed-groups-hook.test.ts": 0.07,
     "test/dashboard-feed-groups.test.ts": 0.02,
-    "test/dashboard-floating-scrollbars-inert.test.ts": 0.02,
     "test/dashboard-force-update.integration.test.ts": 2.39,
     "test/dashboard-force-update.test.ts": 0.05,
     "test/dashboard-grant-defaults.test.ts": 0.28,

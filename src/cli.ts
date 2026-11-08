@@ -15638,7 +15638,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     const appIds = parsedBotApps.map(item => item.appId);
     const resolved = await resolveCurrentChatBotOpenIdsByLarkAppIds(appId, targetChatId, appIds);
     if (!resolved.ok) {
-      console.error(`dispatch 协作身份解析失败: ${resolved.error}: ${resolved.message}`);
+      const timeoutHint = resolved.timeoutMs !== undefined
+        ? `\n群成员实时查询在 ${resolved.timeoutMs}ms 内未返回；网络较慢时可调大环境变量 BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS（毫秒）后重试。`
+        : '';
+      console.error(`dispatch 协作身份解析失败: ${resolved.error}: ${resolved.message}${timeoutHint}`);
       process.exit(1);
     }
     let botInfo: Array<{ larkAppId: string; botName: string | null }> = [];
