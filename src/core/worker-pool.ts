@@ -974,6 +974,7 @@ import {
 import { clearAllSessionIdentities, collectProvenIdentityContents } from './cli-identity.js';
 import {
   identityBindingAllowsProven,
+  larkToolBindingEffective,
   type IdentityStorageModel,
 } from './lark-tool-binding.js';
 import { larkToolDelegationTurnIds } from './lark-tool-delegation.js';
@@ -1635,6 +1636,7 @@ function provenStructurallyPossible(ds: DaemonSession): boolean {
     larkAppId: ds.larkAppId,
     chatId: ds.chatId,
     apiOnly: bot.apiOnly,
+    headless: ds.session.headless,
     adoptMode: !!ds.session.adoptedFrom,
     existingAppServerEndpoint: ds.session.existingAppServerEndpoint,
     backendType: ds.session.backendType ?? bot.backendType ?? config.daemon.backendType,
@@ -7565,8 +7567,14 @@ export function resolveSessionEnvForSession(
     skipBotSet: !!(ds.session?.cliLaunchSnapshot || ds.session?.cliInstanceBinding),
     // Same session facts the worker's usesLarkToolBinding sees.
     facts: {
-      larkBindingOff: !larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly })
-        || ds.session?.existingAppServerEndpoint !== undefined,
+      larkBindingOff: !larkToolBindingEffective({
+        chatId: ds.chatId,
+        apiOnly: botCfg.apiOnly,
+        headless: ds.session?.headless,
+        adoptMode: !!ds.session?.adoptedFrom,
+        existingAppServerEndpoint: ds.session?.existingAppServerEndpoint,
+        backendType,
+      }),
     },
   });
   const protectedKeys = new Set(protectedMcpCurrentRedactedEnvKeys(
@@ -16781,6 +16789,7 @@ function forkWorkerPrepared(
     // Feishu (uploader/cred-write are also skipped downstream on the same test).
     larkAppSecret: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     apiOnly: botCfg.apiOnly,
+    headless: ds.session.headless ? { id: ds.session.headless.id, source: ds.session.headless.source } : undefined,
     // replyDelivery=transcript 的冻结值（core/reply-delivery.ts）：worker 只用它给
     // injectsSessionContext 适配器选系统提示措辞；solo 由 daemon 在 fork 前按轮算好
     // 写在 ds 上（resolveSoloSessionForTurn），缺省非 solo。
@@ -24511,6 +24520,7 @@ export function forkAdoptWorker(
     // Feishu (uploader/cred-write are also skipped downstream on the same test).
     larkAppSecret: larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly }) ? botCfg.larkAppSecret : '',
     apiOnly: botCfg.apiOnly,
+    headless: ds.session.headless ? { id: ds.session.headless.id, source: ds.session.headless.source } : undefined,
     brand: normalizeBrand(botCfg.brand),
     botName: bot.botName,
     botOpenId: bot.botOpenId,
