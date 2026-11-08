@@ -1,3 +1,5 @@
+import { resolvePostBody } from '../im/lark/message-parser.js';
+
 /** Match only text authored in this message, never mention labels or quoted/history data. */
 export function matchesSubstituteKeywords(
   keywords: string[] | undefined,
@@ -14,8 +16,11 @@ export function matchesSubstituteKeywords(
       }
       text = text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, ' ');
     } else {
-      const post = content?.zh_cn ?? content?.en_us ?? content;
-      if (!Array.isArray(post?.content)) return false;
+      // Reuse the locale-agnostic post projection so ja_jp/de_de/… rich-text
+      // bodies match the same as zh_cn/en_us instead of being silently dropped.
+      // An unrecognized/empty post resolves to no paragraphs → no keyword can
+      // match, so this stays fail-closed.
+      const post = resolvePostBody(content);
       const paragraphs = post.content.map((paragraph: unknown) => {
         if (!Array.isArray(paragraph)) return '';
         return paragraph.map(node =>
@@ -23,7 +28,7 @@ export function matchesSubstituteKeywords(
             ? node.text : ' ',
         ).join('');
       });
-      text = [typeof post.title === 'string' ? post.title : '', ...paragraphs].join('\n');
+      text = [post.title, ...paragraphs].join('\n');
     }
     const lower = text.toLowerCase();
     return keywords.some(keyword => lower.includes(keyword.toLowerCase()));

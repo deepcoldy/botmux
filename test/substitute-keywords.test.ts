@@ -33,7 +33,7 @@ describe('substitute keyword matching', () => {
     })).toBe(false);
   });
 
-  it.each(['zh_cn', 'en_us', 'flat'])('matches visible rich text and links in %s posts', locale => {
+  it.each(['zh_cn', 'en_us', 'ja_jp', 'de_de', 'flat'])('matches visible rich text and links in %s posts', locale => {
     const post = { content: [[{ tag: 'at', user_id: 'ou_sub', user_name: 'Oncall' },
       { tag: 'text', text: '独' }, { tag: 'text', text: '立卡', style: ['bold'] },
       { tag: 'a', text: 'incident', href: 'https://example.com/hidden-keyword' }]] };
@@ -41,6 +41,14 @@ describe('substitute keyword matching', () => {
     expect(matchesSubstituteKeywords(['独立卡'], { content })).toBe(true);
     expect(matchesSubstituteKeywords(['INCIDENT'], { content })).toBe(true);
     expect(matchesSubstituteKeywords(['oncall', 'hidden-keyword'], { content })).toBe(false);
+  });
+
+  it('matches and rejects keywords inside a non-English-locale post', () => {
+    // Regression guard: a self-rolled zh_cn/en_us-only parser silently dropped
+    // ja_jp posts (and the dispatcher hard-silences a keyword miss).
+    const content = JSON.stringify({ ja_jp: { content: [[{ tag: 'text', text: 'oncall お願いします' }]] } });
+    expect(matchesSubstituteKeywords(['oncall'], { content })).toBe(true);
+    expect(matchesSubstituteKeywords(['incident'], { content })).toBe(false);
   });
 
   it('does not search quoted content or bridge paragraphs', () => {

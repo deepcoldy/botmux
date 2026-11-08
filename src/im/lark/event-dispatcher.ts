@@ -5781,17 +5781,27 @@ export function createLarkEventDispatcherRuntime(
         // old keywords with newly saved targets can bypass the hand-off gate.
         ? resolveSubstituteTrigger(larkAppId, message, substituteCfg)
         : undefined;
-      if (substituteMention && !explicitlyMentionedThisBot
+      // Slash-command exemption predates the keyword gate: the "@目标" inside
+      // `/solve @someone …` is a command argument rather than a substitute
+      // hand-off, so the message keeps its ordinary routing (see mention-mode
+      // docs). Resolve it before the keyword-miss hard stop, otherwise turning
+      // keywords on would make such command messages disappear instead of
+      // reaching the normal session. The parse only runs when a substitute
+      // mention is present, so the hot path is unchanged.
+      const substituteRawText = substituteMention ? extractMessageTextForRouting(message) : null;
+      const substituteStripped = substituteRawText
+        ? stripLeadingMentions(substituteRawText.trim(), message?.mentions ?? []).trim()
+        : '';
+      const mentionlessSlash = substituteStripped.startsWith('/');
+      if (substituteMention && !explicitlyMentionedThisBot && !mentionlessSlash
           && !matchesSubstituteKeywords(substituteCfg?.keywords, message)) {
         // A keyword miss is a hand-off to the person, including owned topics,
         // mentionMode=never and solo groups. Do not fall through to auto-reply.
         logger.debug(`[substitute:${larkAppId}] keyword miss — dropping @target message msg=${messageId.substring(0, 12)}`);
         return;
       }
-      if (substituteTrigger && !explicitlyMentionedThisBot) {
-        const rawText = extractMessageTextForRouting(message);
-        const stripped = rawText ? stripLeadingMentions(rawText.trim(), message?.mentions ?? []).trim() : '';
-        if (stripped.startsWith('/')) substituteTrigger = undefined;
+      if (substituteTrigger && !explicitlyMentionedThisBot && mentionlessSlash) {
+        substituteTrigger = undefined;
       }
       if (substituteTrigger && substituteChatMode === 'topic'
           && substituteCfg?.topicActiveSessionTrigger === false
