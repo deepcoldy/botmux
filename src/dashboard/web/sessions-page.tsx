@@ -82,7 +82,7 @@ import {
 } from './sessions.js';
 import { addMonitorRoomSessionIds, monitorRoomUrl } from './monitor-room-store.js';
 import { dashboardShellAllowsWebTerminal } from './client-shell.js';
-import { CreateActionButton, DropdownMenu, LoadingState } from './dashboard-components.js';
+import { CreateActionButton, DropdownMenu, IconTip, LoadingState } from './dashboard-components.js';
 import {
   filterMentionBots,
   findMentionTrigger,
@@ -347,20 +347,21 @@ function IconActionButton(props: {
 }): React.JSX.Element {
   const className = props.className ?? `card-act${props.kind ? ` ${props.kind}` : ''}`;
   return (
-    <button
-      type="button"
-      id={props.id}
-      className={className}
-      data-action={props.action}
-      data-tip={props.label}
-      aria-label={props.label}
-      disabled={props.disabled}
-      onClick={(event) => {
-        event.stopPropagation();
-        props.onClick(event.currentTarget);
-      }}
-      dangerouslySetInnerHTML={rawHtml(props.icon)}
-    />
+    <IconTip label={props.label}>
+      <button
+        type="button"
+        id={props.id}
+        className={className}
+        data-action={props.action}
+        aria-label={props.label}
+        disabled={props.disabled}
+        onClick={(event) => {
+          event.stopPropagation();
+          props.onClick(event.currentTarget);
+        }}
+        dangerouslySetInnerHTML={rawHtml(props.icon)}
+      />
+    </IconTip>
   );
 }
 
@@ -1387,15 +1388,16 @@ function Drawer(props: {
                   {t('sessions.history.title')}
                 </button>
                 {shouldOpenWritableTerminal() && !closed ? (
-                  <button
-                    id="copy-cmd-btn"
-                    type="button"
-                    role="menuitem"
-                    data-tip={t('sessions.copyCommandHint')}
-                    onClick={event => void copySpawnCommand(row, event.currentTarget)}
-                  >
-                    {t('sessions.copyCommand')}
-                  </button>
+                  <IconTip label={t('sessions.copyCommandHint')}>
+                    <button
+                      id="copy-cmd-btn"
+                      type="button"
+                      role="menuitem"
+                      onClick={event => void copySpawnCommand(row, event.currentTarget)}
+                    >
+                      {t('sessions.copyCommand')}
+                    </button>
+                  </IconTip>
                 ) : null}
                 <button
                   id="lock-btn"
