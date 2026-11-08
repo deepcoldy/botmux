@@ -93,6 +93,29 @@ export function loadOrCreateDispatchReportBindingSecret(
   }));
 }
 
+/**
+ * Read the dispatch-report secret WITHOUT creating one.
+ *
+ * A caller that only needs to VERIFY an already-issued binding (for example
+ * `botmux send` deciding whether this topic returns its results through
+ * `botmux report`) must never mint signing authority as a side effect: a fresh
+ * secret would silently invalidate every binding the daemon issued with the
+ * real one, and an agent-side process has no business creating host
+ * credentials. Returns undefined when absent or unreadable.
+ */
+export function readDispatchReportBindingSecret(dataDir: string): string | undefined {
+  const coreOnly = process.env.BOTMUX_CORE_ONLY === '1';
+  try {
+    const secret = readSecureHostFileSync(
+      dispatchReportBindingSecretPath(dataDir, { coreOnly }),
+      256,
+    )?.trim();
+    return secret || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function validDispatchRoot(value: string): boolean {
   return /^om_[A-Za-z0-9_-]{1,128}$/.test(value);
 }

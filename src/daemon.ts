@@ -172,6 +172,7 @@ import {
 } from './services/durable-lark-outbox.js';
 import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-output.js';
 import {
+  canonicalPrimarySession,
   claimDurableLarkActiveSession,
   listValidDurablePrimarySessions,
   parseDurablePrimarySessionRecord,
@@ -669,6 +670,7 @@ import {
   cancelCrossPrincipalInterruptionsForFeatureDisable,
   continueCrossPrincipalOwnerWait,
   crossPrincipalOwnerWaitDisposition,
+  crossPrincipalRerouteGaps,
   markCrossPrincipalSuggestionWaiting,
   stageCrossPrincipalInterruptionRecord,
 } from './core/cross-principal-interruption-store.js';
@@ -761,6 +763,7 @@ import { createInputCaptureStore } from './core/plugins/input-capture/store.js';
 import { createInputCaptureRuntime, setInputCaptureRuntime, stopInputCaptureRuntimes } from './core/plugins/input-capture/runtime.js';
 import { deliverCapturedInput } from './core/plugins/input-capture/gateway.js';
 import { captureInboundText } from './im/lark/input-capture.js';
+import { isP2pForceTopicRoot } from './services/p2p-force-topic-store.js';
 import { readPluginRegistry } from './services/plugin-registry-store.js';
 import { setIssueActivate } from './im/lark/issue-command-deps.js';
 import { startIssueOutboxPump } from './services/issue-outbox-pump.js';
@@ -4353,8 +4356,9 @@ function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void
 /** `keepInactiveWorkflow`: also return a workflow handoff's delegation that no
  *  longer holds (the caller reports why). Every other caller — the inherited
  *  authority of a dispatch / `--mention` handoff, schedule creation — gets no
- *  delegation from it. */
-async function dispatchUserForTurn(ds: DaemonSession, turnId: string, opts: { keepInactiveWorkflow?: boolean } = {}) {
+ *  delegation from it. `waitMs`: how long to wait for an unbound handoff to
+ *  this bot to be bound (default: resolveDispatchUser's). */
+async function dispatchUserForTurn(ds: DaemonSession, turnId: string, opts: { keepInactiveWorkflow?: boolean; waitMs?: number } = {}) {
   const reply = pickTurnReplyTarget(ds.session, turnId);
   // The main bot's own workflow node turn has no inbound message (design
   // §6.5): its turn id is the handoff it posted, its topic the node card.
@@ -4374,6 +4378,7 @@ async function dispatchUserForTurn(ds: DaemonSession, turnId: string, opts: { ke
     secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
     appId: ds.larkAppId, chatId: ds.chatId, turnId,
     rootId: reply?.rootMessageId ?? (ds.scope !== 'chat' ? ds.session.rootMessageId ?? undefined : undefined),
+    waitMs: opts.waitMs,
   });
   // A workflow handoff's delegation (design 2026-11-03 §10) holds only while
   // its run attempt does; past that it is no delegation at all.
@@ -5317,7 +5322,7 @@ export async function enforceMessageQuotaForCliInput(
     ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId)
     : evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
   if (!ev.allowed) {
-    logger.debug(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
+    logger.info(`[quota:${larkAppId}] dropping message ${messageId.substring(0, 12)} from non-allowed sender ${senderOpenId?.substring(0, 12) ?? '?'}`);
     return false;
   }
   // Control/setup messages still need the authorization decision above, but
@@ -9156,7 +9161,10 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
     // lead that is handed a report by one bot can still hand the same person
     // on to the next. Re-checked against this chat and narrowed to this bot's
     // tools; a schedule or a plain bot-to-bot message still has no sender.
-    let inherited = await dispatchUserForTurn(ds, turnId);
+    // This turn's own handoff had its wait when the turn was delivered; an
+    // unbound one to this bot now is another handoff in flight, and waiting
+    // for it would only hold up this send.
+    let inherited = await dispatchUserForTurn(ds, turnId, { waitMs: 0 });
     let inheritedWorkflow: import('./core/dispatch-user-delegation.js').WorkflowDispatchUserRef | undefined;
     if (inherited && 'workflow' in inherited) {
       // Same rule as `botmux dispatch` from a workflow node (design §10).
@@ -10676,6 +10684,13 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     backendSurvivesRestart:
       !!askSession && getSessionPersistentBackendType(askSession) !== undefined,
   };
+  // chat-scope 的 ask 身份仍是 root=null（文字答复按 chatId 锚点命中），独立卡片只是跟着发起
+  // turn 冻结的话题落点。嵌进回复卡的 ask 由回复卡决定位置；异步提问的提示与答复 turn
+  // 都按 root=null 发，卡片不单独搬走。
+  const askTurnTarget = askSession?.session.scope === 'chat' && typeof body.originTurnId === 'string'
+    ? frozenReplyContextForTurn(askSession, body.originTurnId).target : undefined;
+  const cardRoot = asyncInput || askInput.replyCardTarget || askTurnTarget?.mode !== 'thread'
+    ? undefined : { cardRootMessageId: askTurnTarget.rootMessageId };
   const managedExplicit = askInput.originKind === 'explicit' && !!askInput.requestId && !!askSession;
   const explicitInput = { ...askInput, originKind: 'host_explicit', requestId: askInput.requestId! };
   if (body.acknowledge === true) {
@@ -10697,8 +10712,8 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
       ? { turnId: askOrigin.turnId,
           dispatchAttempt: askOrigin.dispatchAttempt,
           workerGeneration: askWorkerGeneration }
-      : undefined)
-    : await registerAskForResponse(askInput, res);
+      : undefined, cardRoot)
+    : await registerAskForResponse({ ...askInput, ...cardRoot }, res);
   if (res.destroyed) return;
 
   if (asyncInput && askSession && result.kind === 'answered') {
@@ -32500,7 +32515,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // readOnly, and the dashboard shows them until the owner fixes the config.
     const forbiddenRw = findForbiddenReadWritePaths(cfg.sandboxPaths?.readWrite);
     if (forbiddenRw.length) {
-      logger.warn(`[sandbox:${cfg.larkAppId}] ${forbiddenReadWriteMessage(forbiddenRw)}（沙盒会话忽略根目录与相对路径条目、主目录与 botmux 数据目录类条目按只读处理）`);
+      logger.warn(`[sandbox:${cfg.larkAppId}] ${forbiddenReadWriteMessage(forbiddenRw)}（沙盒会话忽略根目录、/run 与相对路径条目、主目录与 botmux 数据目录类条目按只读处理）`);
     }
     const readOnlyRoot = findReadOnlyLauncherMountCovers(cfg.sandboxPaths?.readOnly);
     if (readOnlyRoot.length) {
@@ -33075,14 +33090,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         activeCaller: context.activeCaller,
         activeController: context.activeController,
       });
-      if (!envelope || !proposer || !active
-        || sameTrustedPrincipal(active.caller, proposer)
-        || sameTrustedPrincipal(active.controller, proposer)) {
+      const gaps = crossPrincipalRerouteGaps({ envelope, proposer, active });
+      if (gaps.length > 0 || !envelope || !proposer || !active) {
+        // A retry hits the same worker gate while the active turn is still running.
         logger.error(
-          `[${tag(ds)}] deterministic principal rejection lacked a safe reroute envelope/owner `
-          + `turn=${context.turnId.slice(0, 12)}`,
+          `[${tag(ds)}] deterministic principal rejection lacked a safe reroute gaps=${gaps.join(',')}; `
+          + `failing delivery as not executed turn=${context.turnId.slice(0, 12)}`,
         );
-        return false;
+        return 'not_executed';
       }
       return stageCrossPrincipalInterruption({
         ds,
@@ -34143,7 +34158,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     inputCapture.start();
     const botEventHandlers: EventHandlers = {
       captureHumanInput: data => captureInboundText(data, inputCapture,
-        id => isKnownPeerBot(config.session.dataDir, cfg.larkAppId, id)),
+        id => isKnownPeerBot(config.session.dataDir, cfg.larkAppId, id),
+        // Same fold as decideRouting: p2p chat mode keeps DM replies in the chat session unless the root seeded a /t topic.
+        (chatId, rootId) => {
+          const p2pMode = getBot(cfg.larkAppId).config.p2pMode;
+          return p2pMode !== 'thread' && p2pMode !== 'group' && !isP2pForceTopicRoot(cfg.larkAppId, rootId, chatId);
+        }),
       handleCardAction: (data, appId) => withBotTurnAdmission(
         appId,
         () => cardActionPluginGateway.dispatch(data, appId),
@@ -34284,10 +34304,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               await primaryControlRuntime?.authorizeBeforeAck(data) === true,
             pendingPrimaryControlCard: data =>
               primaryControlRuntime?.pendingCardBeforeAck(data),
-            readPrimarySession: async stableKey => {
-              const current = await durableCoordinationRuntime.store.readSession(stableKey);
-              return current ? parseDurablePrimarySessionRecord(current).session : undefined;
-            },
+            readPrimarySession: async stableKey =>
+              canonicalPrimarySession(await durableCoordinationRuntime.store.readSession(stableKey)),
             takeOverPrimarySession,
           },
         );

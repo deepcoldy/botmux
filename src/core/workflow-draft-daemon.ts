@@ -29,6 +29,9 @@
  *   POST /drafts/from-source                    {source, larkAppId?}    复制为新工作流（D6）
  *   POST /drafts/:runId/copy/goal               {goal, mode}            复制的草稿改目标（D6）
  *   POST /drafts/:runId/nodes/:nodeId/text      {goal?, completion?}    复制的草稿改节点文字（D6）
+ *   POST /drafts/:runId/handoff/prepare         {toLarkAppId}           换编排 Bot 第 1 步（现编排 Bot：记目标、关澄清会话）
+ *   POST /drafts/:runId/handoff/accept          {token}                 换编排 Bot 第 2 步（新编排 Bot：接管、起新会话）
+ *   POST /drafts/:runId/handoff/cancel                                  取消更换（现编排 Bot）
  *
  * Templates (D5, under {@link WORKFLOW_LIBRARY_PATH}; reads are the
  * Dashboard's own, from disk):
@@ -258,6 +261,15 @@ export function registerWorkflowDraftIpcRoutes(
     ({ draft: await service.abandonLaunch(runId, initiator) }));
   write(draftPath('launch/resend-root'), async ({ service, initiator, body, baseVersion, runId }) =>
     ({ draft: await service.resendRoot(runId, initiator, { confirmedAbsent: body.confirmedAbsent, baseVersion }) }));
+  // 换编排 Bot: prepare / cancel on the current orchestrator, accept on the
+  // target — the Dashboard routes accept to the bot the handoff names; the
+  // service checks that this daemon is that bot.
+  write(draftPath('handoff/prepare'), async ({ service, initiator, body, baseVersion, runId }) =>
+    service.prepareHandoff(runId, initiator, { toLarkAppId: body.toLarkAppId, baseVersion }));
+  write(draftPath('handoff/accept'), async ({ service, initiator, body, runId }) =>
+    ({ draft: await service.acceptHandoff(runId, initiator, { token: body.token }) }));
+  write(draftPath('handoff/cancel'), async ({ service, initiator, runId }) =>
+    ({ draft: await service.cancelHandoff(runId, initiator) }));
   write(draftPath('launch/resend-summary'), async ({ service, initiator, body, runId }) =>
     ({ draft: await service.resendSummary(runId, initiator, { confirmedAbsent: body.confirmedAbsent }) }));
 
@@ -499,7 +511,7 @@ export interface ProductionDraftClarifierDeps {
   activeSessions: () => Map<string, DaemonSession> | undefined;
   createHeadlessSession: (
     activeSessions: Map<string, DaemonSession>,
-    args: { larkAppId: string; title: string },
+    args: { larkAppId: string; title: string; failureDiagnostics: true },
   ) => Promise<{ ok: true; headlessId: string; sessionId: string } | { ok: false; error: string }>;
   triggerSessionTurn: (req: TriggerRequest, deps: { larkAppId: string; activeSessions: Map<string, DaemonSession> }) => Promise<TriggerResponse>;
   lookupTriggerResult: (sessionId: string, triggerId: string) => TriggerResponse;
@@ -530,7 +542,9 @@ export function createProductionDraftClarifier(deps: ProductionDraftClarifierDep
     async create({ larkAppId, title }) {
       const active = deps.activeSessions();
       if (!active) return { ok: false, error: 'registry_unavailable' };
-      return deps.createHeadlessSession(active, { larkAppId, title });
+      // The failure panel reads this session's failed turns (provider error,
+      // screen tail); no other session pays for capturing them.
+      return deps.createHeadlessSession(active, { larkAppId, title, failureDiagnostics: true });
     },
     async send({ larkAppId, sessionId, headlessId, prompt, requestId }) {
       const active = deps.activeSessions();
@@ -575,7 +589,15 @@ export function createProductionDraftClarifier(deps: ProductionDraftClarifierDep
         return { state: 'completed', content: response.output?.content ?? '', ...(response.finishedAt ? { finishedAt: response.finishedAt } : {}) };
       }
       if (response.state === 'running') return { state: 'running' };
-      if (response.state === 'failed') return { state: 'failed', ...(response.error ? { error: response.error } : {}) };
+      if (response.state === 'failed') {
+        return {
+          state: 'failed',
+          ...(response.error ? { error: response.error } : {}),
+          ...(response.terminalErrorCode ? { errorCode: response.terminalErrorCode } : {}),
+          ...(response.terminalErrorDetail ? { errorDetail: response.terminalErrorDetail } : {}),
+          ...(response.terminalScreenTail ? { terminalTail: response.terminalScreenTail } : {}),
+        };
+      }
       return { state: 'not_found' };
     },
     suspend(sessionId) {
