@@ -15,6 +15,12 @@ import {
 import { OutputDeliveryCoordinator } from '../src/services/output-delivery-coordinator.js';
 import { OutputDeliveryJournal } from '../src/services/output-delivery-journal.js';
 import { outputSnapshot } from '../src/services/universal-output-handoff.js';
+import { sanitizeLocalAddressNode } from '../src/im/lark/local-address-policy.js';
+import { buildTerminalUrl, resetTerminalProxy } from '../src/core/terminal-url.js';
+import { resolvePluginResultAccessUrl } from '../src/core/plugin-result-access-url.js';
+import { resetHostLinkOrigins } from '../src/core/host-link-origins.js';
+import { buildStreamingCard } from '../src/im/lark/card-builder.js';
+import { buildTrustedResultDeliveryCard } from '../src/im/lark/trusted-result-delivery-card.js';
 
 const skillText = '协作说明：通过 [MIX Bot 协作技能](/data00/home/alice/.agents/skills/mix-bot-collaboration/SKILL.md) 联系 CAT，返回授权提示。';
 const businessUrl = 'https://example.com/v2/activity?activityId=123&path=/home/business#detail';
@@ -162,5 +168,51 @@ describe('local addresses at the real Lark SDK write boundary', () => {
       expect(deps.settled).not.toHaveBeenCalled();
       expect(writes).toHaveLength(0);
     } finally { journal.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+});
+
+// No public external host configured: getLocalIp() is the advertised host, so
+// the host's own capability links point at this machine's interface.
+describe('host-issued capability links in a default LAN deployment', () => {
+  afterEach(() => { resetHostLinkOrigins(); resetTerminalProxy(); });
+  const terminal = () => buildTerminalUrl({
+    session: { sessionId: 'sid-lan' }, workerPort: 9999, workerToken: 'write-token', workerViewToken: 'view-token',
+  });
+
+  it('sends the Web terminal button the host built for a direct-port worker', async () => {
+    const { app, writes } = capture();
+    const terminalUrl = terminal();
+    expect(() => sanitizeLocalAddressNode({ url: terminalUrl })).toThrow();
+    const streaming = buildStreamingCard('sid-lan', 'om_root', terminalUrl, 'title', 'screen', 'working');
+    await sendMessage(app, 'oc_chat', streaming, 'interactive');
+    expect(writes).toHaveLength(1);
+    expect(writes[0].data.content).toContain(terminalUrl);
+  });
+
+  it('sends the trusted plugin result card on the dashboard origin', async () => {
+    const { app, writes } = capture();
+    const accessUrl = resolvePluginResultAccessUrl('view_token_abcdefghijklmnopqrstuvwxyz')!;
+    expect(() => sanitizeLocalAddressNode({ android_url: accessUrl })).toThrow();
+    const entry = buildTrustedResultDeliveryCard({
+      accessUrl, expiresAt: new Date(Date.now() + 3_600_000).toISOString(), brand: 'feishu',
+    });
+    await sendMessage(app, 'oc_chat', entry, 'interactive');
+    expect(writes).toHaveLength(1);
+    expect(writes[0].data.content).toContain(accessUrl);
+  });
+
+  it('still rejects other ports on the same host and keeps the text policy for prose', async () => {
+    const { app, writes } = capture();
+    const terminalUrl = terminal();
+    const { host, hostname } = new URL(terminalUrl);
+    const devServer = terminalUrl.replace(host, hostname.includes(':') ? `[${hostname}]:3000` : `${hostname}:3000`);
+    await expect(sendMessage(app, 'oc_chat', JSON.stringify({ body: { elements: [{ tag: 'button', url: devServer }] } }), 'interactive'))
+      .rejects.toMatchObject({ code: 'LOCAL_ADDRESS_OUTBOUND_REJECTED' });
+    await expect(sendMessage(app, 'oc_chat', JSON.stringify({ body: { elements: [
+      { tag: 'button', url: terminalUrl.replace('://', '://alice@') }] } }), 'interactive'))
+      .rejects.toMatchObject({ code: 'LOCAL_ADDRESS_OUTBOUND_REJECTED' });
+    expect(writes).toHaveLength(0);
+    await sendMessage(app, 'oc_chat', '终端在 ' + terminalUrl);
+    expect(JSON.parse(writes[0].data.content).text).not.toContain(terminalUrl);
   });
 });

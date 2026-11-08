@@ -12,6 +12,9 @@ export interface LocalAddressContext {
   localHosts?: readonly string[];
   internalFileLabel?: string;
   unavailableLinkLabel?: string;
+  /** Origins of the Web terminal / Dashboard links the host issued itself.
+   * Consulted only for card link fields; prose keeps the text policy. */
+  hostLinkOrigin?: (origin: string) => boolean;
 }
 
 interface Context {
@@ -21,6 +24,7 @@ interface Context {
   hostNames: RegExp;
   internalFile: string;
   unavailableLink: string;
+  hostLinkOrigin?: (origin: string) => boolean;
 }
 
 export class LocalAddressOutboundError extends OutputDeliveryTerminalError {
@@ -80,6 +84,7 @@ function contextFor(input: LocalAddressContext): Context {
     hostNames: new RegExp('(?<![\\w.-])(?:localhost|127(?:\\.\\d{1,3}){3}|' + hostNames.join('|') + ')(?::\\d+)?(?![\\w.:-])(?:/[^\\s<>"\\x27\\x60，。、；！？()[\\]]*)?', 'giu'),
     internalFile: input.internalFileLabel ?? '【内部文件】',
     unavailableLink: input.unavailableLinkLabel ?? '（未提供可访问链接）',
+    hostLinkOrigin: input.hostLinkOrigin,
   };
 }
 
@@ -258,11 +263,22 @@ export function sanitizeLocalAddressText(text: string, context: LocalAddressCont
   return scrubText(text, contextFor(context));
 }
 
+/** Without a public external host, Web terminal and Dashboard buttons point at
+ * this machine's own interface. Only an origin the host issued passes. */
+function hostIssuedLink(value: string, ctx: Context): boolean {
+  if (!ctx.hostLinkOrigin) return false;
+  try {
+    const url = new URL(value);
+    if (url.username || url.password) return false;
+    return ctx.hostLinkOrigin(url.origin);
+  } catch { return false; }
+}
+
 function scrubNode(node: unknown, key: string | undefined, ctx: Context): unknown {
   if (typeof node === 'string') {
     if (key && STRUCTURAL_KEYS.has(key)) return node;
     if (key && LINK_KEYS.has(key)) {
-      if (localDestination(node, ctx)) throw new LocalAddressOutboundError();
+      if (localDestination(node, ctx) && !hostIssuedLink(node, ctx)) throw new LocalAddressOutboundError();
       return node;
     }
     return scrubText(node, ctx);

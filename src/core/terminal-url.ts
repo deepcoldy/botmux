@@ -6,6 +6,7 @@ import { loadDashboardSecret } from '../dashboard/auth.js';
 import { platformTerminalBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
 import { isRemoteAccessEnabled } from '../global-config.js';
 import { devboxDashboardBaseUrl } from '../platform/devbox-dashboard-export.js';
+import { noteHostLinkOrigin } from './host-link-origins.js';
 
 /**
  * Builds the public URL for a session's web terminal. When the per-daemon
@@ -173,6 +174,7 @@ export function buildTerminalUrl(
   const base = proxyReady
     ? `http://${formatUrlHost(config.web.externalHost)}:${getTerminalAdvertisedPort()}/s/${ds.session.sessionId}`
     : `http://${formatUrlHost(config.web.externalHost)}:${ds.workerPort ?? ds.session.webPort}`;
+  noteHostLinkOrigin(base);
   return opts.write
     ? withCapability(base, 'token', ds.workerToken)
     : withCapability(base, 'viewToken', readToken);

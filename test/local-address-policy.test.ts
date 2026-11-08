@@ -85,6 +85,19 @@ describe('local address presentation policy', () => {
     expect(sanitizeLocalAddressText('http://10.20.30.41/api', context)).toBe('http://10.20.30.41/api');
   });
 
+  it('lets a card link through only for an origin the host issued itself', () => {
+    const hostLinkOrigin = (origin: string) => origin === 'http://10.20.30.40:7891';
+    const context = { localHosts: ['10.20.30.40'], hostLinkOrigin };
+    const issued = { behaviors: [{ type: 'open_url', android_url: 'http://10.20.30.40:7891/plugin-result-access/abc' }] };
+    expect(sanitizeLocalAddressNode(issued, context)).toEqual(issued);
+    for (const url of ['http://10.20.30.40:3000/report', 'http://alice@10.20.30.40:7891/', 'file:///tmp/report.md',
+      'http://127.0.0.1:7891/']) {
+      expect(() => sanitizeLocalAddressNode({ url }, context)).toThrowError(
+        expect.objectContaining({ code: 'LOCAL_ADDRESS_OUTBOUND_REJECTED' }));
+    }
+    expect(sanitizeLocalAddressText('[入口](http://10.20.30.40:7891/x)', context)).not.toContain('10.20.30.40');
+  });
+
   it.each(['https://127.example.com/home/page', 'https://127.0.0.1.example.com/tmp/report'])(
     'preserves a remote domain starting with 127: %s', url => {
       const link = '[业务](' + url + ')';

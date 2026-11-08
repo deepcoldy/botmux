@@ -7,6 +7,7 @@ import {
 import { isRemoteAccessEnabled } from '../global-config.js';
 import { devboxDashboardBaseUrl } from '../platform/devbox-dashboard-export.js';
 import { immersiveWorkbenchHash } from './workbench-shell.js';
+import { noteHostLinkOrigin } from './host-link-origins.js';
 
 export interface DashboardUrls {
   /**
@@ -77,6 +78,7 @@ export function formatUrlHost(host: string): string {
  */
 export function buildDashboardUrls(opts: { host: string; port: number | string; token?: string }): DashboardUrls {
   const localOrigin = `http://${formatUrlHost(String(opts.host))}:${opts.port}`;
+  noteHostLinkOrigin(localOrigin);
   // Ask for the platform leg separately from the whole precedence chain: the two
   // answers differ exactly in the reverse-proxy / Devbox cases, which is the
   // distinction every token-stripping caller needs (see DashboardUrls.platformHosted).
