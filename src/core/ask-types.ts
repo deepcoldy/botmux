@@ -11,10 +11,16 @@ import type { GroupContextDeliveryBinding } from '../services/group-context-deli
 /** A single selectable option on an ask card. `key` is the stable identifier
  *  returned via stdout; `label` is the human-facing button text. When the user
  *  writes `--options "yes,no"`, `key === label`. With `--options "yes=继续"`,
- *  `key="yes"` and `label="继续"`. */
+ *  `key="yes"` and `label="继续"`.
+ *
+ *  `description` is the optional longer explanation the upstream CLI attaches
+ *  to an option (Claude Code `AskUserQuestion.options[].description`,
+ *  OpenCode `question.options[].description`). It is shown beneath the option
+ *  label; older callers that omit it render exactly as before. */
 export interface AskOption {
   key: string;
   label: string;
+  description?: string;
 }
 
 /** Opt-in input schema for an atomic Card 2.0 form. */
@@ -185,6 +191,10 @@ export interface CreateAskInput {
   /** Optional exact responder lock for host-owned approval asks. Ordinary
    * agent asks omit it and retain the existing canTalk-any-member policy. */
   answererOpenId?: string;
+  /** 显式 `botmux ask --mention <open_id>` 要 @ 的人。daemon 只在通讯录确认是本应用的
+   *  真人后填入（at 到 bot 会让整卡 100290），卡片在第一问前注入真实 `<at>`。
+   *  带点名的 ask 走独立卡：嵌进回复卡是 PATCH，不会触发通知。 */
+  mentionedOpenId?: string;
 }
 
 /** Daemon-internal state for a pending ask. Not exported on the IPC boundary —
@@ -212,6 +222,8 @@ export interface PendingAsk {
   chatType?: 'group' | 'p2p';
   /** When present, only this app-scoped open_id may settle the ask. */
   answererOpenId?: string;
+  /** 显式 ask 要 @ 的人类 open_id（见 CreateAskInput.mentionedOpenId）。 */
+  mentionedOpenId?: string;
   /** 问题列表，替代旧的 `options` + `prompt`。 */
   questions: ReadonlyArray<AskQuestion>;
   /** 当前已勾选答案快照。仅 daemon/card 内部使用；CLI IPC 边界不暴露。 */

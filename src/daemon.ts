@@ -1083,7 +1083,7 @@ import {
 } from './core/completion-proposal.js';
 import { runCompletionProposalContinuation } from './core/completion-proposal-continuation.js';
 import { renderCompletionProposalCard } from './im/lark/completion-proposal-card.js';
-import { handleCliResolvedRequest, parseAskBody, registerAskForResponse } from './core/ask-api.js';
+import { handleCliResolvedRequest, parseAskBody, registerAskForResponse, verifiedAskMention } from './core/ask-api.js';
 import { CODEX_ASYNC_ASK_ORIGIN, deliverCodexAsyncAnswer, codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable } from './services/codex-async-user-input.js';
 import { resolveDocumentAskDelivery } from './core/doc-comment-ask.js';
 import { isHumanOpenId } from './im/lark/client.js';
@@ -10804,6 +10804,17 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
     ? frozenReplyContextForTurn(askSession, body.originTurnId).target : undefined;
   const cardRoot = asyncInput || askInput.replyCardTarget || askTurnTarget?.mode !== 'thread'
     ? undefined : { cardRootMessageId: askTurnTarget.rootMessageId };
+  // 点名核验查通讯录，结果随重连可能变化，所以和卡片落点一样只作展示、不进调用身份。
+  // 文档 ask 私聊发给作者，确认回执不发卡，都不点名。
+  const requestedMention = documentDelivery || body.acknowledge === true ? undefined : boundAsk.mentionedOpenId;
+  const mentionedOpenId = await verifiedAskMention(requestedMention, {
+    isPeerBot: openId => isKnownPeerBot(config.session.dataDir, boundAsk.larkAppId, openId),
+    isHuman: openId => isHumanOpenId(boundAsk.larkAppId, openId),
+  });
+  if (requestedMention && !mentionedOpenId) {
+    logger.warn(`[ask:${boundAsk.sessionId.slice(0, 8)}] --mention ${requestedMention.slice(0, 12)} is not a human of this app; card sent without the mention`);
+  }
+  const presentation = { ...cardRoot, ...(mentionedOpenId ? { mentionedOpenId } : {}) };
   const managedExplicit = askInput.originKind === 'explicit' && !!askInput.requestId && !!askSession;
   const explicitInput = { ...askInput, originKind: 'host_explicit', requestId: askInput.requestId! };
   if (body.acknowledge === true) {
@@ -10825,8 +10836,8 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
       ? { turnId: askOrigin.turnId,
           dispatchAttempt: askOrigin.dispatchAttempt,
           workerGeneration: askWorkerGeneration }
-      : undefined, cardRoot)
-    : await registerAskForResponse({ ...askInput, ...cardRoot }, res);
+      : undefined, presentation)
+    : await registerAskForResponse({ ...askInput, ...presentation }, res);
   if (res.destroyed) return;
 
   if (asyncInput && askSession && result.kind === 'answered') {

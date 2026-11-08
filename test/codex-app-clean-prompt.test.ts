@@ -381,6 +381,33 @@ describe('Codex App clean prompt sidecar', () => {
     expect(built.content).not.toContain('<observed_mention');
   });
 
+  it('renders an App ID target by its App ID and keeps the observed open_id out of the configured slot', () => {
+    const built = buildNewTopicCliInput(
+      '请代为处理',
+      'sid-substitute-app',
+      'codex-app',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'zh',
+      undefined,
+      { substituteTrigger: {
+        target: { appId: 'cli_target' },
+        observedMention: { name: 'Target Bot', appId: 'cli_target', openId: 'ou_receiver_scoped' },
+        disclosure: 'prefix',
+      } },
+    );
+
+    const target = built.codexAppInput?.additionalContext?.botmux_substitute_target?.value;
+    expect(target).toContain('<configured_target app_id="cli_target" />');
+    expect(target).toContain('<observed_mention name="Target Bot" app_id="cli_target" open_id="ou_receiver_scoped" />');
+    expect(built.content).toContain('<target name="Target Bot" app_id="cli_target" />');
+    expect(built.content).not.toContain('ou_receiver_scoped');
+  });
+
   it('preserves the trust split when a stopped Codex App session is reforked', () => {
     const built = buildReforkCliInput({
       larkAppId: 'refork-app',

@@ -51,9 +51,9 @@ export function createExplicitAskContinuation(deps: {
     mkdirSync(deps.dir, { recursive: true, mode: 0o700 });
     atomicWriteFileSync(pathFor(key), JSON.stringify(receipt), { mode: 0o600, durable: true });
   };
-  /** presentation 只影响发卡位置，不写进回执：回执 input 的全等比较就是调用身份。 */
+  /** presentation 只影响发卡位置和点名，不写进回执：回执 input 的全等比较就是调用身份。 */
   function wait(input: CreateAskInput & { requestId: string }, origin?: ExplicitAskReceipt['origin'],
-    presentation?: Pick<CreateAskInput, 'cardRootMessageId'>): Promise<AskResult> {
+    presentation?: Pick<CreateAskInput, 'cardRootMessageId' | 'mentionedOpenId'>): Promise<AskResult> {
     const key = keyFor(input);
     const original = read(key);
     if (original && JSON.stringify(original.input) !== JSON.stringify(input)) {
