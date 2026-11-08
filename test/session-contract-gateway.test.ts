@@ -194,7 +194,7 @@ describe('contract gateway and real worker boundaries', () => {
       invalidateStuckWarning: vi.fn(), invalidateTuiPrompt: vi.fn(), clearIdleAutoCompactStretch: vi.fn(),
       clearPendingSuspendClaim: vi.fn(),
       takeSessionPreviewTarget: () => undefined, sessionStore: { updateSessionPid: vi.fn(), updateSession: vi.fn() },
-      dashboardEventBus: { publish: vi.fn() }, logger: { warn: vi.fn(), info: vi.fn() }, tag: () => 'test' };
+      dashboardEventBus: { publish: vi.fn() }, restartCoordinator: { cancelSession: vi.fn() }, logger: { warn: vi.fn(), info: vi.fn() }, tag: () => 'test' };
     scope.suspendWorker = loadWorkerPoolFunction('suspendWorker', scope);
     const suspend = loadWorkerPoolFunction<(ds: DaemonSession) => Promise<boolean>>('suspendWorkerAsync', scope);
     expect(await suspend(s.ds)).toBe(false);

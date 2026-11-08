@@ -203,8 +203,13 @@ describe('dashboard sessions filters', () => {
   });
 
   it('surfaces stalled sessions as a filterable needs-you state', () => {
-    expect(SESSION_STATUS_OPTIONS).toContain('stalled');
+    expect(SESSION_STATUS_OPTIONS).toContain('needs_you');
     expect(deriveSessionBoardColumn({ status: 'stalled' })).toBe('needs-you');
+    const rows = [{ sessionId: 's-stalled', status: 'stalled' }, { sessionId: 's-idle', status: 'idle' }];
+    for (const status of ['needs_you', 'stalled']) {
+      const filters: SessionRowFilters = { q: '', status, adopt: '', bot: '', chat: '', cli: '', showUnknownChats: true };
+      expect(filterSessionRows(rows, filters, { keepClosed: false }).map(r => r.sessionId)).toEqual(['s-stalled']);
+    }
   });
 
   it('derives CLI filter options from the shared CLI registry', () => {
@@ -312,7 +317,7 @@ describe('dashboard sessions kanban react view', () => {
     expect(html).toContain('data-id="s-progress"');
     expect(html).toContain('role="button"');
     // 「需要你」原因单独一行，不再挤在卡片头里。
-    expect(html).toContain('class="session-signal kanban-card-reason"');
+    expect(html).toMatch(/class="session-signal kanban-card-reason[^"]*"/);
     expect(html).toContain('长时间无进展');
     // 重设计后：状态色条 + 「终端」文字按钮 + 「⋯」菜单（原 icon rail 已移除）
     expect(html).toContain('data-signal="needs-you"');

@@ -1,3 +1,4 @@
+import { GroupMessageRecall } from './group-message-recall.js';
 import { GroupIdleCloseRow } from './group-idle-close.js';
 import { GroupCardModeRow } from './group-card-mode.js';
 import { GroupReplyModeRow, useGroupTopology } from './group-reply-mode.js';
@@ -86,7 +87,7 @@ import { hashQueryParam, setHashQueryParam } from './dashboard-routes.js';
 
 type Translator = ReturnType<typeof useT>;
 
-type ManageTab = 'overview' | 'bots' | 'collab' | 'access' | 'danger';
+type ManageTab = 'overview' | 'bots' | 'collab' | 'access' | 'recall' | 'danger';
 
 type DialogState =
   | { type: 'create'; template?: GroupCloneTemplate }
@@ -1372,6 +1373,7 @@ const MANAGE_TABS: Array<{ id: ManageTab; labelKey: string }> = [
   { id: 'bots', labelKey: 'groups.tabBots' },
   { id: 'collab', labelKey: 'groups.tabCollab' },
   { id: 'access', labelKey: 'groups.tabAccess' },
+  { id: 'recall', labelKey: 'groups.recallTitle' },
   { id: 'danger', labelKey: 'groups.tabDanger' },
 ];
 
@@ -1795,6 +1797,10 @@ export function ManageDialog(props: {
 
         <section role="tabpanel" id="g-manage-panel-access" aria-labelledby="g-manage-tab-access" hidden={tab !== 'access'}>
           {accessVisited ? <MemberAccessSection chat={chat} members={inChat} disabled={!available} tr={tr} /> : null}
+        </section>
+
+        <section role="tabpanel" id="g-manage-panel-recall" aria-labelledby="g-manage-tab-recall" hidden={tab !== 'recall'}>
+          <GroupMessageRecall key={chat.chatId} chatId={chat.chatId} bots={inChat} active={tab === 'recall'} disabled={!available} />
         </section>
 
         <section role="tabpanel" id="g-manage-panel-danger" aria-labelledby="g-manage-tab-danger" hidden={tab !== 'danger'}>
@@ -2243,7 +2249,7 @@ function GroupsPage() {
           onChange={ev => updateFilters({ q: ev.currentTarget.value })}
         />
         <DropdownMenu
-          className="groups-bot-filter"
+          className="groups-bot-filter dashboard-toolbar-menu"
           ariaLabel={tr('groups.botFilterLabel')}
           label={botFilterLabel}
           value={filters.botId}
@@ -2255,7 +2261,7 @@ function GroupsPage() {
         />
         {view === 'session' ? (
           <DropdownMenu
-            className="groups-session-sort"
+            className="groups-session-sort dashboard-toolbar-menu"
             ariaLabel={tr('groups.sessionSortLabel')}
             label={sessionSortOptions.find(option => option.value === sessionSort)?.label ?? ''}
             value={sessionSort}

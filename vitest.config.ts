@@ -83,9 +83,12 @@ export default defineConfig({
           fileParallelism: false,
           testTimeout: 60_000,
           hookTimeout: 360_000,
-          globalSetup: ['./test/global-setup.ts', './test/tmux-fence-global-setup.ts'],
-          // No test may reach the host's tmux servers (test/helpers/tmux-fence.ts).
-          setupFiles: ['./test/tmux-fence-setup.ts'],
+          // unit-global-setup.ts provides the disposable root that e2e-setup.ts
+          // carves each file's SESSION_DATA_DIR from (same as the unit project).
+          globalSetup: ['./test/global-setup.ts', './test/unit-global-setup.ts', './test/tmux-fence-global-setup.ts'],
+          // No test may reach the host's tmux servers (test/helpers/tmux-fence.ts),
+          // nor the live botmux data directory (test/e2e-setup.ts).
+          setupFiles: ['./test/tmux-fence-setup.ts', './test/e2e-setup.ts'],
         },
       },
     ],

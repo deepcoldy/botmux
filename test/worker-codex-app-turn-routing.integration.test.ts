@@ -5,6 +5,7 @@ import {
   copyFileSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -12,18 +13,29 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { nodeTsRunnerPrefix, spawnNodeTsScript } from './helpers/ts-runner.js';
+import { privateTmuxEnv } from './helpers/private-tmux-env.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
-import { preferredManagedTmuxSocket, tmuxSocketArgs } from '../src/adapters/backend/tmux-socket.js';
+import { DEFAULT_MANAGED_TMUX_SOCKET } from '../src/adapters/backend/tmux-socket.js';
 import { codexAppControlStatePath } from '../src/utils/codex-app-control.js';
 import { readJsonLines } from './helpers/read-json-lines.js';
 import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import { buildCredentialOnlySandboxArgs } from '../src/adapters/backend/sandbox.js';
 import { backendSandboxCompatibilityUserMessage } from '../src/adapters/backend/session-backend-selector.js';
 
-// The worker inherits process.env, so its panes live on this server.
-const managedTmuxArgs = tmuxSocketArgs(preferredManagedTmuxSocket(process.env));
+// 自带私有 tmux 目录，不依赖全局 tmux 围栏。没有它时，TMUX_TMPDIR 为空的运行（例如绕过
+// setupFiles 的全量）会让 worker 的 `-L botmux` 落到宿主 /tmp/tmux-<uid>/botmux，和线上
+// fleet 共用同一个 server；2026-11-06 就有测试 worker 在宿主 socket 上起了 server，线上会话被
+// 迁到它上面，测试结束 server 退出，又断了一次。目录必须预先存在（tmux 对不存在的
+// TMUX_TMPDIR 会静默回落 /tmp），路径要短（unix socket 路径上限约 104 字节）。
+const tmuxRoot = mkdtempSync('/tmp/bmx-cr-');
+const tmuxEnv = privateTmuxEnv(tmuxRoot);
+// socket 名由 BOTMUX_TMUX_SOCKET 决定，测试围栏不清这个变量；固定成默认的 botmux。
+delete tmuxEnv.BOTMUX_TMUX_SOCKET;
+// 测试侧按绝对路径找 worker 的 server：worker 一旦没用上私有目录，下面的 tmux 断言会直接失败，
+// 不会因为全局围栏恰好也给了私有目录而继续变绿。
+const managedTmuxArgs = ['-S', join(tmuxRoot, `tmux-${process.getuid?.() ?? 0}`, DEFAULT_MANAGED_TMUX_SOCKET)];
 
 const children = new Set<ChildProcess>();
 const tempDirs = new Set<string>();
@@ -86,6 +98,17 @@ afterEach(async () => {
   tempDirs.clear();
 });
 
+afterAll(() => {
+  // 只关本文件私有目录里的 server，再删目录。
+  const uidDir = join(tmuxRoot, `tmux-${process.getuid?.() ?? 0}`);
+  let sockets: string[] = [];
+  try { sockets = readdirSync(uidDir); } catch { /* no server was ever started */ }
+  for (const socket of sockets) {
+    spawnSync('tmux', ['-S', join(uidDir, socket), 'kill-server'], { stdio: 'ignore', timeout: 3_000 });
+  }
+  rmSync(tmuxRoot, { recursive: true, force: true });
+});
+
 function replacementSessionId(label: string): string {
   return `${randomBytes(4).toString('hex')}-${label}-${process.pid}-${Date.now()}`;
 }
@@ -104,7 +127,7 @@ function spawnWorker(
   const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
     cwd: resolve('.'),
     env: {
-      ...process.env,
+      ...tmuxEnv,
       HOME: root,
       NODE_ENV: 'test',
       NODE_OPTIONS: [process.env.NODE_OPTIONS, '--import=tsx'].filter(Boolean).join(' '),
@@ -413,7 +436,7 @@ describe('Codex App worker queued-turn attribution', () => {
     const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
-        ...process.env,
+        ...tmuxEnv,
         HOME: root,
         NODE_ENV: 'test',
         NODE_OPTIONS: nodeOptions,
@@ -553,7 +576,7 @@ describe('Codex App worker queued-turn attribution', () => {
     const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
-        ...process.env,
+        ...tmuxEnv,
         HOME: root,
         NODE_ENV: 'test',
         NODE_OPTIONS: nodeOptions,
@@ -632,7 +655,7 @@ describe('Codex App worker queued-turn attribution', () => {
     const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
-        ...process.env,
+        ...tmuxEnv,
         HOME: root,
         NODE_ENV: 'test',
         NODE_OPTIONS: nodeOptions,
@@ -709,7 +732,7 @@ describe('Codex App worker queued-turn attribution', () => {
     const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
       cwd: resolve('.'),
       env: {
-        ...process.env,
+        ...tmuxEnv,
         HOME: root,
         NODE_ENV: 'test',
         NODE_OPTIONS: nodeOptions,

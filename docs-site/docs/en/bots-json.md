@@ -75,6 +75,7 @@ Two bots, one on Claude Code and one on Codex:
 | The live card is too noisy | `disableStreamingCard`, `hiddenStreamingCardButtons` |
 | One card per turn for both progress and answer | `replyCardMode: "unified"` |
 | Start working without being @-mentioned | `autoStartOnNewTopic`, `autoStartOnGroupJoin` |
+| DM the owner a welcome message when the bot first comes online | `welcomeMessage` (see [Welcome message](#welcome-message)) |
 | Watch an alert group and handle every alert | Group message listener (see [Group message listener](#message-listener)) |
 | Hand off to another bot when quota runs out | `quotaFallbackBot` |
 | Stop botmux from adding anything to the prompt | `promptInjection: "none"` |
@@ -319,6 +320,14 @@ Requirements and limits:
 
 ### Waiting and no-progress reminders {#reminders}
 
+**`longTaskReminder`** sends an independent status card to the original chat or topic while an executing task remains unfinished. Configure it in **Bot Defaults → Message cards → Long-running task cards**; saves apply immediately.
+
+```json
+{"longTaskReminder": {"enabled": true, "thresholdMinutes": 10, "intervalMinutes": 10}}
+```
+
+Disabled by default. Both windows default to 10 minutes and accept integers from 1 to 10080. Timing starts at the observed native execution write, excluding queued and idle time. Progress and follow-up messages do not reset the running turn. Scans run every 30 seconds; repeats start at the previous successful delivery and missed cycles are not replayed. Failed sends retry after one minute using the same delivery ID. Completion, cancellation, worker exit or session closure stops reminders. Chat, DM and topic sessions are supported; document comments and headless sessions are excluded. Silent, meeting-driven and suppressed replay turns keep their auxiliary-UI restrictions; reminder cards do not invoke `outbound.send` hooks. Preferences persist, but execution timing requires a current worker observation and is never inferred across daemon restarts.
+
 **`sessionOwnerReminder`**: when a session sits in a state that needs a person and nothing changes, it @-mentions the session owner in the original topic at a fixed interval.
 
 ```json
@@ -457,7 +466,6 @@ To migrate legacy environment secrets, provision the safe file and change the co
 
 A restarted stdio MCP process currently cannot receive the one-shot secret again and falls back to read-only; recreate the session to restore protected capabilities. User-visible errors from the different policy collection entry points remain a follow-up.
 
-||||||| 15acd8dde
 ### Run CLI calls as the message sender (`triggerUserAuth`) {#trigger-user-auth}
 
 **Off by default.** When on, `lark-cli` / `bytedcli` in this bot's sessions run with the authorization of whoever sent the current message, not whatever is logged in on the machine. Useful when several people share one bot: each message reads docs, checks calendars or calls internal platforms as its own sender.
@@ -491,7 +499,7 @@ What the cards look like and what each switch does: see [Live streaming cards](/
 
 | Field | Description |
 |------|------|
-| `replyCardMode` | `legacy` (default): progress and answer are sent separately; `unified`: a turn's progress, tool calls and final answer all update one card. Works for non-sandboxed Claude Code / Codex / Grok / TraeX / Pi sessions, from the next turn |
+| `replyCardMode` | `legacy` (default): progress and answer are sent separately; `unified`: a turn's progress, tool calls and final answer all update one card. Works for non-sandboxed Claude Code / Codex / Grok / TraeX / Pi / Kimi sessions, from the next turn |
 | `replyCardShowTools` | `unified` only: `false` hides tool calls on the card; thinking summaries and progress still show |
 | `disableStreamingCard` | `true` stops sending the live terminal status card. The web terminal still runs and final answers are still sent |
 | `hiddenStreamingCardButtons` | Hide buttons on the live card: `output`, `terminal`, `writeLink`, `compact`, `stop`, `close`. E.g. `["terminal", "writeLink", "close"]`. Also `/botconfig set hiddenStreamingCardButtons terminal,close` |
@@ -631,6 +639,7 @@ By default a bot only starts working when @-mentioned. These fields make it more
 | `autoStartOnGroupJoinPrompt` | First task when auto-starting on group join. If empty, the bot looks at the group's context first and reports that it's ready if nobody has assigned anything |
 | `autoStartOnGroupJoinSeed` | Text of the opening message posted on join; a built-in text is used if empty |
 | `autoStartOnGroupJoinGateRequired` | `true`: auto-start on join also needs a matching `chat.bot_added` sync [hook](/en/hooks) to explicitly allow it, otherwise nothing happens. Useful when only specific groups should auto-start |
+| `autoStartOnGroupJoinAnchor` | Where the join session lives in a regular group. Default `"reply-mode"` follows the group's reply mode; `"latest-message"` skips the opening message and starts the session in the thread of the newest existing message (system events, recalled messages and this bot's own messages are skipped). Useful when another platform posts a context message and then adds the bot. Falls back to the default when there is no usable message or the read fails. Topic groups and `new-topic` mode are unaffected. Anchoring on a message sent by another bot (e.g. a platform card) also requires the `im:message.group_msg.include_bot:read` scope; without it only user messages are listed |
 | `autoStartExcludedChats` | Groups where auto-start (join and new topic) never happens; @-mentions still work |
 | `groupJoinCommandEnabled` / `groupJoinCommand` | When the bot is added to any group, run a command on this machine directly: no session, no model. Independent of `autoStartOnGroupJoin`, and no admin needs to be in the group. Also needs the `im.chat.member.bot.added_v1` subscription |
 
@@ -639,6 +648,14 @@ By default a bot only starts working when @-mentioned. These fields make it more
 - No shell; for pipes or redirects write `bash -c '…'`. Only a minimal set of environment variables is passed (no app secrets).
 - stdin receives JSON `{event:"chat.bot_added", larkAppId, chatId, operatorOpenId, emittedAt}`; the environment variables `BOTMUX_JOIN_CHAT_ID` / `BOTMUX_JOIN_LARK_APP_ID` / `BOTMUX_JOIN_OPERATOR_OPEN_ID` are also set.
 - It's killed if it hasn't finished after 10 minutes.
+
+### Welcome message (`welcomeMessage`) {#welcome-message}
+
+Set it to some text and the bot DMs its primary admin (see `ownerOpenId`) once after it first comes online. Set it with `--welcome-message "…"` or `--welcome-message-file <file>` on `botmux setup add` / `botmux setup edit`; `--welcome-message -` on edit clears it. It can't be edited in the Dashboard yet. The value of `--welcome-message` is always sent as written, so text starting with `@` is never treated as a file path.
+
+- Delivery is recorded in `welcome-sent/<AppID>.json` under the daemon data dir. Once sent, restarts don't resend it, and neither does changing the text. Deleting that file makes it send again, but Feishu dedupes a resend less than 1 hour after the previous one.
+- A failed send, or an admin who can't be resolved yet, doesn't block startup; the next start retries.
+- Core-only (`apiOnly`) bots and multi-replica deployments (`BOTMUX_COORDINATION_MODE=primary`, where replicas don't share the delivery record) don't send it; the daemon log says why.
 
 ## Group message listener {#message-listener}
 

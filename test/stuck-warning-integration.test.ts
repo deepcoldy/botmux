@@ -18,7 +18,7 @@
  *
  * Run:  pnpm vitest run test/stuck-warning-integration.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import {
   initWorkerPool,
@@ -30,6 +30,7 @@ import { botLocale, localeForBot, t as tr } from '../src/i18n/index.js';
 import { stuckCardFallbackText, stuckKeyResultText } from '../src/core/stuck-warning-card.js';
 import { config } from '../src/config.js';
 import { getBot } from '../src/bot-registry.js';
+import { registerAsk, setCanTalkChecker, setCardDispatcher, _resetForTest as resetAsks } from '../src/core/ask-broker.js';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────
 
@@ -1071,5 +1072,69 @@ describe('stuck-page card content and result reporting (integration)', () => {
       ['not confirmed', 'text'],
       ['other notice', 'text'],
     ]);
+  });
+});
+
+describe('Claude permission dialog notice (integration)', () => {
+  let sessionReplyMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    sessionReplyMock = vi.fn(async () => 'om_notice');
+    initWorkerPool({
+      sessionReply: sessionReplyMock,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    setCanTalkChecker(() => true);
+    setCardDispatcher({ send: async () => ({ messageId: 'om_card' }) });
+  });
+  afterEach(() => { resetAsks(); vi.useRealTimers(); });
+
+  const ALLOW_DENY = [{ key: 'allow', label: '允许执行' }, { key: 'deny', label: '拒绝' }];
+  function setup() {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({ worker: fakeWorker });
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    const notice = () => fakeWorker.emit('message', {
+      type: 'user_notify', kind: 'claude_permission_prompt', message: 'Claude 正等待你确认', turnId: 'turn_1',
+    });
+    const hookAsk = (options = ALLOW_DENY, sessionId = ds.session.sessionId, kind: 'permission' | 'question' = 'permission') => void registerAsk({
+      larkAppId: ds.larkAppId, chatId: ds.chatId, rootMessageId: 'om_root', sessionId, originKind: 'hook', timeoutMs: 600_000,
+      questions: [{ prompt: 'Claude 请求执行一个需要人工确认的操作', multiSelect: false, options,
+        ...(kind === 'permission' ? { allowCustom: false } : {}) }],
+    });
+    return { notice, hookAsk };
+  }
+  const texts = () => sessionReplyMock.mock.calls.filter(c => c[2] === 'text').map(c => c[1]);
+
+  it('is dropped while the PermissionRequest card for the session is pending', async () => {
+    const { notice, hookAsk } = setup();
+    hookAsk(); notice();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(texts()).toEqual([]);
+  });
+
+  it('is dropped when the card registers shortly after the notice', async () => {
+    const { notice, hookAsk } = setup();
+    notice();
+    await vi.advanceTimersByTimeAsync(1_000);
+    hookAsk();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(texts()).toEqual([]);
+  });
+
+  it.each<[string, (hookAsk: ReturnType<typeof setup>['hookAsk']) => void]>([
+    ['no card arrives (hook missing, fork agent)', () => {}],
+    ['only another kind of ask is pending', hookAsk => hookAsk([{ key: 'staging', label: 'staging' }, { key: 'production', label: 'production' }])],
+    ['the pending card belongs to another session', hookAsk => hookAsk(ALLOW_DENY, 'sid-other')],
+    ['only an AskUserQuestion card whose options happen to be allow / deny is pending', hookAsk => hookAsk(ALLOW_DENY, undefined, 'question')],
+  ])('is sent when %s', async (_, pending) => {
+    const { notice, hookAsk } = setup();
+    pending(hookAsk);
+    notice();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(texts()).toEqual(['Claude 正等待你确认']);
   });
 });

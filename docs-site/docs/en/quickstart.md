@@ -81,6 +81,8 @@ Running `botmux setup` on a machine that's already configured shows a menu: Add 
 
 > Want to configure from a script or an AI agent instead of the interactive UI? Use the `botmux setup add` / `botmux setup list` subcommands; `botmux setup help` shows all options.
 
+> 👋 **Welcome message on first launch**: `botmux setup add ... --welcome-message "Reply /init to get started"` (or `--welcome-message-file welcome.txt` to read it from a file) makes the bot DM its owner once after it first comes online; for an existing bot use `botmux setup edit <process-name|AppID> --welcome-message ...`, and `-` clears it. Delivery is recorded under `welcome-sent/` in the daemon data dir so restarts never resend; a failed send does not block startup and is retried on the next start. See [bots.json · Welcome message](/en/bots-json#welcome-message).
+
 ## Step 3 · Start
 
 ```bash
@@ -142,14 +144,15 @@ Still stuck? Check by hand:
 
 Run `botmux restart` after fixing. See [FAQ / Troubleshooting](/en/faq) for more.
 
-### Optional events: @ by editing, recall sync
+### Optional events: @ by editing, recall sync, disbanded groups
 
-Missing either of these **does not affect ordinary messages**; only the related small feature. New bots subscribe to them automatically; for older bots, botmux tries to add them at startup using this machine's existing Open Platform login.
+Missing any of these **does not affect ordinary messages**; only the related small feature. New bots subscribe to them automatically; for older bots, botmux tries to add them at startup using this machine's existing Open Platform login.
 
 | Event | Used for |
 |---|---|
 | `im.message.updated_v1` | Editing a message that didn't @ the bot to add the @, which then triggers a task |
 | `im.message.recalled_v1` | In group context sharing (`/context-sharing`), marking recalled messages in the record. Only added when that feature is on |
+| `im.chat.disbanded_v1` | Ending the bot's sessions in a group once it is disbanded (like `/close`: they can be resumed and worktrees are kept). Without it, those sessions are only closed at the next daemon restart |
 
 Things to note:
 

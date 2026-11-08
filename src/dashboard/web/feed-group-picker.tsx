@@ -1,93 +1,48 @@
 import type React from 'react';
-import { useEffect, useRef } from 'react';
+import { lazyWithFallback } from './dashboard-components.js';
 
 export type FeedGroupPickerOption = { groupId: string; name: string };
 
-export function FeedGroupPicker(props: {
+export type FeedGroupPickerProps = {
   groups: FeedGroupPickerOption[];
   selectedId: string;
   newName: string;
   disabled?: boolean;
   onChange(selectedId: string, newName: string): void;
-}): React.JSX.Element {
-  const detailsRef = useRef<HTMLDetailsElement | null>(null);
-  const summaryRef = useRef<HTMLElement | null>(null);
+};
+
+/** What the closed picker shows, worked out once by the shell for both implementations. */
+export type FeedGroupPickerImplProps = FeedGroupPickerProps & { label: string };
+
+export function feedGroupPickerLabel(props: FeedGroupPickerProps): string {
   const selectedName = props.groups.find(group => group.groupId === props.selectedId)?.name;
-  const label = props.newName.trim()
+  return props.newName.trim()
     ? `新建标签：${props.newName.trim()}`
     : selectedName || '不选择标签';
+}
 
-  useEffect(() => {
-    const closeOnOutside = (event: PointerEvent) => {
-      const details = detailsRef.current;
-      if (!details?.open) return;
-      if (event.target instanceof Node && details.contains(event.target)) return;
-      details.open = false;
-    };
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && detailsRef.current?.open) detailsRef.current.open = false;
-    };
-    document.addEventListener('pointerdown', closeOnOutside, true);
-    document.addEventListener('keydown', closeOnEscape);
-    return () => {
-      document.removeEventListener('pointerdown', closeOnOutside, true);
-      document.removeEventListener('keydown', closeOnEscape);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (props.disabled && detailsRef.current?.open) detailsRef.current.open = false;
-  }, [props.disabled]);
-
-  const choose = (selectedId: string, newName: string) => {
-    props.onChange(selectedId, newName);
-    detailsRef.current?.removeAttribute('open');
-    queueMicrotask(() => summaryRef.current?.focus());
-  };
-
+function FeedGroupPickerFallback(props: FeedGroupPickerImplProps): React.JSX.Element {
   return (
-    <details ref={detailsRef} className={`feed-group-picker${props.disabled ? ' is-disabled' : ''}`}>
-      <summary
-        ref={summaryRef}
-        aria-label={`飞书标签，当前：${label}`}
+    <div className={`feed-group-picker${props.disabled ? ' is-disabled' : ''}`}>
+      <div
+        className="feed-group-picker-trigger"
+        role="button"
+        aria-label={`飞书标签，当前：${props.label}`}
         aria-disabled={props.disabled || undefined}
-        tabIndex={props.disabled ? -1 : undefined}
-        onClick={event => { if (props.disabled) event.preventDefault(); }}
       >
-        <span>{label}</span>
-      </summary>
-      <div className="feed-group-picker-pop">
-        <label className="feed-group-picker-new">
-          <span>新建标签</span>
-          <input
-            type="text"
-            maxLength={60}
-            value={props.newName}
-            placeholder="输入新标签名称"
-            onChange={event => props.onChange('', event.currentTarget.value.trimStart())}
-            onKeyDown={event => {
-              if (event.key === 'Enter') event.preventDefault();
-            }}
-          />
-        </label>
-        <button
-          type="button"
-          aria-current={!props.selectedId && !props.newName.trim() ? 'true' : undefined}
-          onClick={() => choose('', '')}
-        >
-          不选择标签
-        </button>
-        {props.groups.map(group => (
-          <button
-            key={group.groupId}
-            type="button"
-            aria-current={props.selectedId === group.groupId && !props.newName.trim() ? 'true' : undefined}
-            onClick={() => choose(group.groupId, '')}
-          >
-            {group.name}
-          </button>
-        ))}
+        <span>{props.label}</span>
       </div>
-    </details>
+    </div>
   );
+}
+
+const FeedGroupPickerPopover = lazyWithFallback(
+  () => import('./feed-group-picker-popover.js'),
+  FeedGroupPickerFallback,
+  'feed group picker',
+  { browserOnly: true },
+);
+
+export function FeedGroupPicker(props: FeedGroupPickerProps): React.JSX.Element {
+  return <FeedGroupPickerPopover {...props} label={feedGroupPickerLabel(props)} />;
 }

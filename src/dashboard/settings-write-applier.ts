@@ -15,8 +15,10 @@ import type {
   GlobalConfig,
   MaintenanceConfig,
 } from '../global-config.js';
+import { accessSync, constants as fsConstants, statSync } from 'node:fs';
 import {
   normalizeGroupNamePrefix,
+  normalizeWorktreeRoot,
   mergeDashboardConfig,
   mergeGlobalConfig,
   mergeMaintenanceConfig,
@@ -37,6 +39,7 @@ import {
   isCodexNotifierHookInstalled,
 } from '../features/codex-notifier/index.js';
 import { isLocale } from '../i18n/types.js';
+import { expandHomePath } from '../utils/working-dir.js';
 import { canonicalScheduleBotGrant, isScheduleBotGrant, overlappingScheduleBotGrants } from '../core/schedule-bot-grant.js';
 import { normalizePromptCacheConfig, type PromptCacheConfig } from '../services/prompt-cache-policy.js';
 import { isLocalDevInstall } from '../utils/install-info.js';
@@ -51,6 +54,7 @@ import { isValidTimeZone } from '../utils/timezone.js';
  */
 export interface ResolvedDashboardSettingsView {
   groupNamePrefix: string;
+  worktreeRoot: string;
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   enableLocalCliOpen: boolean;
@@ -60,6 +64,8 @@ export interface ResolvedDashboardSettingsView {
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
   reapOrphanTmuxServers: boolean;
+  tmuxOrphanSessionSweep: boolean;
+  tmuxOrphanSessionBareWrapperKill: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
   /** Machine-wide reply-card footer brand signature switch. Default ON. */
@@ -256,6 +262,7 @@ export type ApplySettingsWriteResult =
  */
 export type ApplySettingsWriteError =
   | 'invalid_groupNamePrefix'
+  | 'invalid_worktreeRoot'
   | 'invalid_publicReadOnly'
   | 'invalid_openTerminalInFeishu'
   | 'invalid_enableLocalCliOpen'
@@ -268,6 +275,8 @@ export type ApplySettingsWriteError =
   | 'invalid_codexRpcInput'
   | 'invalid_autoUpgradeCodexSessions'
   | 'invalid_reapOrphanTmuxServers'
+  | 'invalid_tmuxOrphanSessionSweep'
+  | 'invalid_tmuxOrphanSessionBareWrapperKill'
   | 'invalid_bypassCodexHookTrust'
   | 'invalid_hideCodexRateLimitModelNudge'
   | 'invalid_cardBrandLabel'
@@ -414,6 +423,16 @@ export function resolveCodexNotifierRecipientView(
  *   - Forbids enabling `autoRestart` unless `autoUpdate` is (or is being) enabled.
  *   - Returns `empty_patch` when no fields changed.
  */
+function isWritableDirectory(path: string): boolean {
+  try {
+    if (!statSync(path).isDirectory()) return false;
+    accessSync(path, fsConstants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function applySettingsWrite(
   body: unknown,
   deps: SettingsWriteApplierDeps,
@@ -443,6 +462,25 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_groupNamePrefix' };
     }
     groupNamePrefixPatch = groupNamePrefix ?? null;
+  }
+
+  // The directory must already exist: a typo would otherwise have the next
+  // `git worktree add` create it, on whatever disk holds its nearest parent.
+  // Unwritable would fail every later `git worktree add`.
+  let worktreeRootPatch: string | null | undefined;
+  if ('worktreeRoot' in obj) {
+    if (typeof obj.worktreeRoot !== 'string') {
+      return { ok: false, error: 'invalid_worktreeRoot' };
+    }
+    if (obj.worktreeRoot.trim() === '') {
+      worktreeRootPatch = null;
+    } else {
+      const worktreeRoot = normalizeWorktreeRoot(obj.worktreeRoot);
+      if (!worktreeRoot || !isWritableDirectory(expandHomePath(worktreeRoot))) {
+        return { ok: false, error: 'invalid_worktreeRoot' };
+      }
+      worktreeRootPatch = worktreeRoot;
+    }
   }
 
   const patch: DashboardGlobalConfig = {};
@@ -521,6 +559,18 @@ export async function applySettingsWrite(
       return { ok: false, error: 'invalid_reapOrphanTmuxServers' };
     }
     patch.reapOrphanTmuxServers = obj.reapOrphanTmuxServers;
+  }
+  if ('tmuxOrphanSessionSweep' in obj) {
+    if (typeof obj.tmuxOrphanSessionSweep !== 'boolean') {
+      return { ok: false, error: 'invalid_tmuxOrphanSessionSweep' };
+    }
+    patch.tmuxOrphanSessionSweep = obj.tmuxOrphanSessionSweep;
+  }
+  if ('tmuxOrphanSessionBareWrapperKill' in obj) {
+    if (typeof obj.tmuxOrphanSessionBareWrapperKill !== 'boolean') {
+      return { ok: false, error: 'invalid_tmuxOrphanSessionBareWrapperKill' };
+    }
+    patch.tmuxOrphanSessionBareWrapperKill = obj.tmuxOrphanSessionBareWrapperKill;
   }
   if ('bypassCodexHookTrust' in obj) {
     if (typeof obj.bypassCodexHookTrust !== 'boolean') {
@@ -982,6 +1032,11 @@ export async function applySettingsWrite(
   // 返回失败却已经改变了 `/group` 的建群命名。
   if (groupNamePrefixPatch !== undefined) {
     deps.mergeGlobalConfig({ groupNamePrefix: groupNamePrefixPatch });
+    touched = true;
+  }
+
+  if (worktreeRootPatch !== undefined) {
+    deps.mergeGlobalConfig({ worktreeRoot: worktreeRootPatch });
     touched = true;
   }
 

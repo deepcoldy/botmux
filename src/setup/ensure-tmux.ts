@@ -21,12 +21,15 @@
  * tmux command would fail. Functional probe + soft fallback fixes both.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
-import { unlinkSync } from 'node:fs';
+import { readFileSync, unlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { detectPlatform, type PackageManager, type PlatformInfo } from './detect-platform.js';
 import {
   isBotmuxManagedTmuxEnvKey,
   isBotmuxManagedTmuxServerGlobalEnvKey,
+  scrubTraeGitAttributionEnv,
+  TRAE_GIT_ATTRIBUTION_PATH_RE,
 } from '../utils/child-env.js';
 
 export interface TmuxResult {
@@ -216,6 +219,28 @@ export function resolveTmuxVersionAtSessionBoundary(): TmuxVersion | null {
 }
 
 /**
+ * Resolve the tmux CLIENT binary version under an explicit environment, WITHOUT
+ * the process-global cache. The anti-fork gate must decide whether the binary
+ * the pane launch actually spawns (its own PATH/TMUX_TMPDIR — a brew 3.6 vs
+ * /usr/bin 3.x skew is possible) supports the `-N` flag; using the daemon's
+ * ambient cached version could add -N to an older client or omit it for a new
+ * one. Never throws; null ⇒ caller must assume -N unsupported (fail closed).
+ */
+export function clientTmuxVersionForEnv(env: NodeJS.ProcessEnv): TmuxVersion | null {
+  try {
+    const out = execFileSync('tmux', ['-V'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: TMUX_VERSION_PROBE_TIMEOUT_MS,
+      env: tmuxEnv(env),
+    });
+    return parseTmuxVersion(out);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Version of the tmux SERVER currently answering `socketArgs` (`[]` = the
  * default server), as reported by `display-message -p '#{version}'`. Commands
  * and option values are parsed by that server, which can be older than the
@@ -362,8 +387,13 @@ function withTmuxSearchPath(pathValue: string | undefined): string {
 }
 
 export function tmuxEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const cleaned = { ...env };
+  // A tmux server snapshots its first client's environment globally. Keep a
+  // Trae-started Botmux from seeding the broken attribution hook into every
+  // later pane while preserving unrelated user Git config slots.
+  scrubTraeGitAttributionEnv(cleaned, () => {});
   const rest: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(env)) {
+  for (const [key, value] of Object.entries(cleaned)) {
     // TMUX/TMUX_PANE would re-target a dead parent server; botmux-managed keys
     // would seed the server's shared global env and leak to co-tenant sessions.
     if (key === 'TMUX' || key === 'TMUX_PANE') continue;
@@ -380,6 +410,8 @@ export interface TmuxGlobalEnvScrubResult {
   /** False means no tmux server answered (or tmux was temporarily unavailable). */
   serverFound: boolean;
   removed: string[];
+  /** Existing keys rewritten to preserve non-Trae config after filtering. */
+  updated: string[];
   failed: string[];
 }
 
@@ -404,35 +436,143 @@ export function scrubTmuxServerGlobalEnv(socketName?: string): TmuxGlobalEnvScru
       env: tmuxEnv(),
     });
   } catch {
-    return { serverFound: false, removed: [], failed: [] };
+    return { serverFound: false, removed: [], updated: [], failed: [] };
   }
   if (typeof output !== 'string') {
-    return { serverFound: false, removed: [], failed: [] };
+    return { serverFound: false, removed: [], updated: [], failed: [] };
   }
 
-  const names = output.split('\n')
+  const lines = output.split('\n');
+  const names = lines
     // `show-environment -g` prints `NAME=value`, or `-NAME` for an explicitly
     // removed entry. Take the name in both shapes.
     .map(line => (line.startsWith('-') ? line.slice(1) : line.split('=', 1)[0]).trim())
     .filter(name => name.length > 0 && isBotmuxManagedTmuxServerGlobalEnvKey(name));
 
-  const removed: string[] = [];
-  const failed: string[] = [];
-  for (const name of new Set(names)) {
+  // Dynamic Git config cannot be classified by key alone: GIT_CONFIG_COUNT
+  // and numbered slots are legitimate user channels. Reconstruct the server
+  // table, filter only Trae's commit-attribution entry, then apply the exact
+  // key-level delta (unset removed slots, rewrite retained/reindexed slots).
+  const serverEnv: NodeJS.ProcessEnv = {};
+  for (const line of lines) {
+    if (!line || line.startsWith('-')) continue;
+    const separator = line.indexOf('=');
+    if (separator <= 0) continue;
+    serverEnv[line.slice(0, separator)] = line.slice(separator + 1);
+  }
+  // `show-environment` is LOSSY: values render through the CLIENT locale
+  // (non-ASCII becomes '_' under C — which is what the fleet daemons actually
+  // run with, they carry no LANG/LC_*) and the loop above cuts a multi-line
+  // value at its first continuation line. Writing such a value back silently
+  // rewrites the user's own git config: a CJK user.name becomes '____', and a
+  // multi-line credential.helper is truncated into a script that no longer
+  // parses. So the values we are about to filter/reindex are re-read
+  // byte-exact out of the server's own environment.
+  //
+  // `tmux run-shell` executes in the server (synchronously) so the value never
+  // passes through the renderer. Variable names come from an arbitrary —
+  // possibly hostile — server table, so only strictly shell-safe names are
+  // interpolated, and the temp path is single-quoted after rejecting quotes.
+  const exactValue = (name: string): string | undefined => {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) return undefined;
+    const tmp = join(tmpdir(), `bmx-tmux-env-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    if (tmp.includes("'")) return undefined;
     try {
-      execFileSync('tmux', [...socketArgs, 'set-environment', '-g', '-u', name], {
+      execFileSync('tmux', [...socketArgs, 'run-shell',
+        `printf %s "$${name}" | base64 | tr -d '\\n' > '${tmp}'`,
+      ], { stdio: 'ignore', timeout: 2000, env: tmuxEnv() });
+      const encoded = readFileSync(tmp, 'utf-8').trim();
+      // An empty read cannot be told apart from an absent variable; report "no
+      // exact read" so the caller keeps the rendered value instead of blanking
+      // a real one.
+      return encoded ? Buffer.from(encoded, 'base64').toString('utf-8') : undefined;
+    } catch {
+      return undefined;
+    } finally {
+      try { unlinkSync(tmp); } catch { /* best effort */ }
+    }
+  };
+  // Only pay for the byte-exact reads when the rendered table actually names a
+  // Trae hook. Without one this function must stay a no-op: a plain `git
+  // config` in the user's own tmux server costs zero extra tmux round-trips.
+  // The hook path itself is always ASCII, so a rendered match cannot be a
+  // locale artifact.
+  const maybeTrae = Object.keys(serverEnv).some(key =>
+    /^(?:GIT_CONFIG_|TRAE_GIT_ATTRIBUTION_)/.test(key) && TRAE_GIT_ATTRIBUTION_PATH_RE.test(String(serverEnv[key])));
+  // Fail CLOSED. A value we could not read byte-exact (run-shell unavailable,
+  // base64/tr missing from the server's PATH, timeout) must never be written
+  // back from the rendered copy — that is exactly the corruption this block
+  // exists to prevent. If any Git-channel value is unreadable, leave the whole
+  // Git/attribution group untouched and report it: a stale Trae hook is loud
+  // (`fatal: ref updates aborted by hook`) and recoverable, while a silently
+  // rewritten credential helper or user.name is neither. The other boundaries
+  // (tmuxEnv for a new server, redactChildEnv for CLI children) still clean
+  // their own copies in that case.
+  let gitValuesUnreadable = false;
+  if (maybeTrae) {
+    for (const key of Object.keys(serverEnv)) {
+      // TRAE_GIT_ATTRIBUTION_* keys are only ever deleted, so they need no value.
+      if (!/^GIT_CONFIG_/.test(key)) continue;
+      const exact = exactValue(key);
+      if (exact === undefined) gitValuesUnreadable = true;
+      else serverEnv[key] = exact;
+    }
+  }
+  const unsafeGitKeys = gitValuesUnreadable
+    ? new Set(Object.keys(serverEnv).filter(key => /^(?:GIT_CONFIG_|TRAE_GIT_ATTRIBUTION_)/.test(key)))
+    : new Set<string>();
+  const cleanedServerEnv = { ...serverEnv };
+  const gitScrub = unsafeGitKeys.size > 0
+    ? { changedKeys: [] as string[], warnings: [] as string[] }
+    : scrubTraeGitAttributionEnv(cleanedServerEnv, () => {});
+  const gitChanges = new Map(gitScrub.changedKeys.map(key => [key, cleanedServerEnv[key]]));
+  if (gitScrub.changedKeys.length > 0) {
+    // GIT_CONFIG_{COUNT,KEY_n,VALUE_n} also belong to Botmux's per-turn
+    // identity channel, so the generic server scrub normally removes them all.
+    // Once the Trae filter has deliberately preserved/reindexed ordinary slots,
+    // promote the complete cleaned structure into the delta; otherwise an
+    // unchanged retained slot would be removed by the generic pass while its
+    // rewritten COUNT survived, leaving a discontinuous Git config contract.
+    for (const key of new Set([...Object.keys(serverEnv), ...Object.keys(cleanedServerEnv)])) {
+      if (/^GIT_CONFIG_(?:COUNT|PARAMETERS|KEY_\d+|VALUE_\d+)$/.test(key)
+        || key.startsWith('TRAE_GIT_ATTRIBUTION_')) {
+        // Re-publishing an unchanged key is NOT a no-op: its value may have
+        // been read through the lossy renderer, so only COUNT (whose set-vs-
+        // unset structure must be republished) and genuinely changed keys are
+        // written.
+        if (key !== 'GIT_CONFIG_COUNT' && serverEnv[key] === cleanedServerEnv[key]) continue;
+        gitChanges.set(key, cleanedServerEnv[key]);
+      }
+    }
+  }
+
+  const removed: string[] = [];
+  const updated: string[] = [];
+  // Keys deliberately left untouched because their exact value was unreadable.
+  // Reported through `failed` (the daemon already logs that) so the degraded
+  // condition is observable rather than silent.
+  const failed: string[] = [...unsafeGitKeys];
+  for (const name of new Set([...names, ...gitChanges.keys()])) {
+    if (unsafeGitKeys.has(name)) continue;
+    try {
+      const replacement = gitChanges.get(name);
+      const args = replacement === undefined
+        ? [...socketArgs, 'set-environment', '-g', '-u', name]
+        : [...socketArgs, 'set-environment', '-g', name, replacement];
+      execFileSync('tmux', args, {
         stdio: 'ignore',
         timeout: 2000,
         env: tmuxEnv(),
       });
-      removed.push(name);
+      if (replacement === undefined) removed.push(name);
+      else updated.push(name);
     } catch {
       // Keep the exact failed key observable to callers without exposing its
       // (potentially sensitive) old value in logs.
       failed.push(name);
     }
   }
-  return { serverFound: true, removed, failed };
+  return { serverFound: true, removed, updated, failed };
 }
 
 function cleanupTmuxProbeSocket(sockName: string, env: NodeJS.ProcessEnv = process.env): void {

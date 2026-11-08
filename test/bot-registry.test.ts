@@ -3,6 +3,9 @@
  *
  * Run:  pnpm vitest run test/bot-registry.test.ts
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
@@ -1452,6 +1455,24 @@ describe('parseBotConfigsFromText — autoStartOnGroupJoinGateRequired', () => {
       { larkAppId: 'a', larkAppSecret: 's', autoStartOnGroupJoinGateRequired: false },
     ]));
     expect(disabled.autoStartOnGroupJoinGateRequired).toBeUndefined();
+  });
+});
+
+describe('parseBotConfigsFromText — autoStartOnGroupJoinAnchor', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('preserves only the non-default latest-message value', () => {
+    const parse = (value: unknown) => mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', autoStartOnGroupJoinAnchor: value },
+    ]))[0].autoStartOnGroupJoinAnchor;
+    expect(parse('latest-message')).toBe('latest-message');
+    expect(parse('reply-mode')).toBeUndefined();
+    expect(parse('latestMessage')).toBeUndefined();
+    expect(parse(true)).toBeUndefined();
   });
 });
 
@@ -2938,5 +2959,34 @@ describe('network policy configuration loading', () => {
     const [config] = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ sandbox: true, sandboxNetwork: false, sandboxNetworkPolicy: { version: 1, public: { mode: 'allowlist', rules: [{ cidr: '8.8.8.8' }] }, private: { mode: 'block' } } })]));
     expect(config.sandboxNetwork).toBe(false);
     expect(config.sandboxNetworkPolicy!.public.rules![0]!.cidr).toBe('8.8.8.8/32');
+  });
+});
+
+describe('sandbox field types', () => {
+  it.each([
+    ['sandboxPaths.deny', { sandboxPaths: { deny: '~/.ssh' } }],
+    ['sandboxPaths.readOnly', { sandboxPaths: { readWrite: ['/srv'], readOnly: '/srv/ref' } }],
+    ['sandboxPaths.readWrite', { sandboxPaths: { readWrite: '/srv/work' } }],
+    ['sandboxPaths.deny', { sandboxPaths: { deny: ['~/.ssh', 7] } }],
+    ['sandboxPaths', { sandboxPaths: ['~/.ssh'] }],
+    ['scratchDenyPaths', { scratchDenyPaths: '~/.ssh' }],
+    ['sandboxNetwork', { sandboxNetwork: 'false' }],
+  ])('rejects a mistyped %s instead of reading it as unset', async (field, overrides) => {
+    const mod = await freshImport();
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ sandbox: true, ...overrides })])))
+      .toThrow(`Bot config [0]: ${field} must be`);
+  });
+
+  it('keeps well-typed lists and treats null as not set', async () => {
+    const mod = await freshImport();
+    const [config] = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({
+      sandbox: true,
+      sandboxPaths: { deny: [' ~/.ssh ', ''], readOnly: null },
+      scratchDenyPaths: null,
+      sandboxNetwork: null,
+    })]));
+    expect(config.sandboxPaths).toEqual({ readWrite: [], readOnly: [], deny: ['~/.ssh'] });
+    expect(config.scratchDenyPaths).toEqual([]);
+    expect(config.sandboxNetwork).toBeUndefined();
   });
 });

@@ -50,6 +50,24 @@ export interface AskQuestion {
   defaultSelectedKeys?: ReadonlyArray<string>;
 }
 
+/** How the asking CLI ended a hook permission confirmation on its own, without
+ *  the card: its built-in confirmation timeout, a terminal choice, or the hook
+ *  being terminated with nothing recorded. */
+export const CLI_PERMISSION_OUTCOMES = [
+  'cli_auto_denied',
+  'terminal_allowed',
+  'terminal_rejected',
+  'allowed_elsewhere',
+  'denied_elsewhere',
+  'resolved_elsewhere',
+  'cli_stopped_waiting',
+] as const;
+export type CliPermissionOutcome = typeof CLI_PERMISSION_OUTCOMES[number];
+
+export function isCliPermissionOutcome(value: unknown): value is CliPermissionOutcome {
+  return typeof value === 'string' && (CLI_PERMISSION_OUTCOMES as readonly string[]).includes(value);
+}
+
 /** Terminal result of an ask, returned to the CLI caller. Discriminated by
  *  `kind` so the CLI can map straight to stdout shape + exit code.
  *
@@ -89,8 +107,10 @@ export type AskResult =
       /** card_delivery_failed: delivery never completed; do not describe this as
        *  a missing answer. claimant_gone / answer_undelivered: the hook never
        *  re-attached, so the asking CLI is no longer waiting (the latter: an
-       *  answer had been given but could not reach it). */
-      failureCode?: 'card_delivery_failed' | 'claimant_gone' | 'answer_undelivered';
+       *  answer had been given but could not reach it). cli_resolved: the asking
+       *  CLI ended this permission confirmation itself; see `cliOutcome`. */
+      failureCode?: 'card_delivery_failed' | 'claimant_gone' | 'answer_undelivered' | 'cli_resolved';
+      cliOutcome?: CliPermissionOutcome;
       selected: null;
       by: null;
       comment: null;
@@ -132,6 +152,8 @@ export interface CreateAskInput {
   chatId: string;
   /** thread-scope ask → root message_id; chat-scope ask → null. */
   rootMessageId: string | null;
+  /** chat-scope 下发起 turn 冻结的话题根，只决定卡片发到哪；不属于 ask 身份，也不落盘。 */
+  cardRootMessageId?: string;
   /** Session that issued the ask — used for audit + future replay scoping. */
   sessionId: string;
   /** Per-invocation identity: the hook generates this once and reuses it across
@@ -184,6 +206,7 @@ export interface PendingAsk {
   larkAppId: string;
   chatId: string;
   rootMessageId: string | null;
+  cardRootMessageId?: string;
   sessionId: string;
   /** 发起 ask 的会话类型（见 CreateAskInput.chatType）。 */
   chatType?: 'group' | 'p2p';

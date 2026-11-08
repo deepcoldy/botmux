@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { handlePluginSettingsRequest } from '../src/core/plugins/dashboard-settings.js';
+import { withPluginServiceLock } from '../src/core/plugins/service-manager.js';
 
 const cleanups: Array<() => Promise<void> | void> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
@@ -15,7 +16,7 @@ async function fixture(source?: string, installed = true) {
   let state: Record<string, unknown> = {};
   const server = createServer((req, res) => {
     void handlePluginSettingsRequest(req, res, 'sample', {
-      isInstalled: () => installed,
+      installedState: () => installed ? 'fixture-state' : null,
       resolveEntry: () => entry,
       createConfig: () => ({ path: join(dir, 'config.json'), get: <T>() => state as T, set: (key, value) => { state[key] = value; }, replace: value => { state = value; } }),
       readBody: async req => {
@@ -35,6 +36,39 @@ async function fixture(source?: string, installed = true) {
 }
 const adapter = 'export function getSettings({config}) { return config.get(); } export function saveSettings({config}, value) { config.replace(value); return config.get(); }';
 describe('Dashboard plugin settings HTTP contract', () => {
+  it.each([null, 'replacement-state'])('rechecks identity after waiting for lifecycle writes (%s)', async nextState => {
+    let state: string | null = 'original-state';
+    let release!: () => void;
+    let entered!: () => void;
+    const locked = new Promise<void>(resolve => { entered = resolve; });
+    const hold = withPluginServiceLock(async () => {
+      entered();
+      await new Promise<void>(resolve => { release = resolve; });
+      state = nextState;
+    });
+    await locked;
+    let bodyRead!: () => void;
+    const reading = new Promise<void>(resolve => { bodyRead = resolve; });
+    let status: number | undefined;
+    let response: string | undefined;
+    const saving = handlePluginSettingsRequest({ method: 'PUT' } as any, {
+      writeHead: (value: number) => { status = value; }, end: (value: string) => { response = value; },
+    } as any, 'sample', {
+      installedState: () => state,
+      resolveEntry: () => { throw new Error('Must not load removed or replacement code'); },
+      createConfig: () => { throw new Error('Must not write removed or replacement settings'); },
+      readBody: async () => { bodyRead(); return { endpoint: 'new' }; },
+    });
+    try {
+      await reading;
+      await new Promise(resolve => setTimeout(resolve, 10));
+      expect(status).toBeUndefined();
+    } finally { release(); }
+    await hold;
+    await saving;
+    expect(status).toBe(nextState === null ? 404 : 409);
+    expect(JSON.parse(response!)).toEqual({ error: nextState === null ? 'plugin_not_found' : 'plugin_settings_stale' });
+  });
   it('returns 405 for unsupported methods', async () => {
     expect(await (await fixture(adapter))('POST')).toEqual({ status: 405, body: { error: 'method_not_allowed' } });
   });

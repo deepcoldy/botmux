@@ -161,7 +161,7 @@ Common actions:
 
 - **New Chat**: pick the bots to add, and optionally bind a working directory (new threads start right there instead of asking you to pick a repo). After creating the group botmux adds you and tries to transfer group ownership to you.
 - **Duplicate**: create another group with the same bots, bound directory, and chat roles in one click.
-- **Manage**: opens the group settings drawer with five tabs:
+- **Manage**: opens the group settings drawer with six tabs:
 
 | Tab | Contents |
 |---|---|
@@ -169,6 +169,7 @@ Common actions:
 | Bot settings | Per bot for this group: reply mode, Oncall, default model for new threads, serial handling of multi-person messages, idle auto-close, run cards, pinning the live card |
 | Collaboration | Standard group (bots respond independently) or Project group (one coordinator bot orchestrates, each subtask gets its own thread) |
 | Member access | Managed from one bot's point of view: multi-select members for a **batch grant** (up to 50 at a time, optional message quota and duration, membership re-checked before writing), a **whole-chat grant** (same as sending a bare `/grant` in the group), and **Block / Unblock** for a single member |
+| Recall messages | Pick one of the bots in the chat and page through the group's messages (or open a topic to read replies). You can only select messages sent by that bot **itself**, up to 50 per batch, with a success or failure result for each message. Lark's recall time limit applies |
 | Leave / Disband | Have selected bots leave, or disband the group (only works when a bot is the owner). Related sessions are cleaned up automatically |
 
 ### Serial input and idle close

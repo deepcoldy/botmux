@@ -16,7 +16,7 @@ import {
   DEFAULT_CONTEXT_COMPACT_THRESHOLD,
 } from '../src/im/lark/card-builder.js';
 import { ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
-import { cliHasNoRawPassthroughSurface } from '../src/core/passthrough-commands.js';
+import { cliHasNoRawPassthroughSurface, cliSupportsCompactAction } from '../src/core/passthrough-commands.js';
 import { setPromptOverrideResolver } from '../src/i18n/index.js';
 import {
   globalConfigPath,
@@ -138,6 +138,11 @@ describe('buildStreamingCard: stop button (stop_turn)', () => {
 });
 
 describe('buildStreamingCard: compact button (compact_session)', () => {
+  it.each(['idle', 'working'])('renders the MiniMax compact button while %s without requiring usage metrics', status => {
+    const button = findButton(headerActions(build({ cliId: 'minimax', status })), 'compact_session');
+    expect(button).toBeTruthy();
+    expect(button.value).toMatchObject({ session_id: SID, root_id: ROOT, cli_id: 'minimax' });
+  });
   // 判据是「这个 CLI 有没有能收 /compact 的输入通道」，**不是**「有没有上下文百分比」。
   // 旧实现拿 percentUsed 当闸门，而只有 codex（native model_context_window）和 pi
   // （读 ~/.pi/agent/models.json）算得出百分比；Claude Code 的 transcript 里没有任何
@@ -188,7 +193,7 @@ describe('buildStreamingCard: compact button (compact_session)', () => {
     const offenders: string[] = [];
     for (const cliId of ALL_CLI_IDS) {
       // dsh 是运行时相关的：不传 dshRuntime ⇒ 谓词按 headless runner 判（fail-closed）。
-      if (!cliHasNoRawPassthroughSurface(cliId)) continue;
+      if (cliSupportsCompactAction(cliId)) continue;
       const card = build({ status: 'working', cliId, usage: { context: { percentUsed: 45 } } });
       if (findButton(headerActions(card), 'compact_session')) offenders.push(cliId);
     }
@@ -198,10 +203,11 @@ describe('buildStreamingCard: compact button (compact_session)', () => {
   });
 
   it('is hidden for the runner CLIs specifically (mira/mir/dsh/ebsd — /compact would be dropped or sent as a user message)', () => {
-    for (const cliId of ['mira', 'mir', 'dsh', 'ebsd', 'minimax']) {
+    for (const cliId of ['mira', 'mir', 'dsh', 'ebsd']) {
       const card = build({ status: 'working', cliId, usage: { context: { percentUsed: 45 } } });
       expect(findButton(headerActions(card), 'compact_session'), `cliId=${cliId}`).toBeFalsy();
     }
+    expect(cliHasNoRawPassthroughSurface('minimax')).toBe(true);
   });
 
   // dsh-tui 是 PTY 驱动的交互式 TUI（与 claude-code 同款交互模型），raw /compact 有效。

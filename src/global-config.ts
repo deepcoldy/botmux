@@ -57,6 +57,13 @@ export function normalizeGroupNamePrefix(raw: unknown): string | undefined {
   return value;
 }
 
+/** A usable `worktreeRoot`: trimmed, absolute or `~`/`~/`-prefixed. */
+export function normalizeWorktreeRoot(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const value = raw.trim();
+  return value && (isAbsolute(value) || value === '~' || value.startsWith('~/')) ? value : undefined;
+}
+
 export interface WhiteboardConfig {
   /** Optional local project whiteboard. Off by default; enabling it must not create boards by itself. */
   enabled?: boolean;
@@ -293,6 +300,10 @@ export interface GlobalConfig {
    *  behavior (repos + linked worktrees). 'repos' lists only main worktrees in
    *  selection cards; explicit /repo /abs/path/to/worktree still works. */
   repoPickerMode?: RepoPickerMode;
+  /** Machine-wide directory botmux creates new worktrees under, e.g. a large
+   *  data disk. Absolute or `~/`-prefixed. Missing keeps worktrees next to the
+   *  main checkout (services/git-worktree.ts `worktreeTargetPath`). */
+  worktreeRoot?: string;
   /** Machine-wide dashboard settings. These are intentionally global rather
    *  than per-bot: they govern the dashboard security boundary and the default
    *  terminal-opening behavior of cards emitted by all daemons on this host. */
@@ -477,6 +488,12 @@ export interface DashboardGlobalConfig {
    *  daemon gate (config.ts `reapOrphanTmuxServers`). BOTMUX_DISABLE_ORPHAN_TMUX_REAP=1
    *  remains an independent emergency kill-switch. */
   reapOrphanTmuxServers?: boolean;
+  /** Periodic orphan-tmux SESSION sweep. Default ON but REPORT-ONLY (logs
+   *  displaced servers/panes, never signals). Read live by the daemon timer. */
+  tmuxOrphanSessionSweep?: boolean;
+  /** Destructive arm of the periodic session sweep: signal only a proven
+   *  taken-over bare-wrapper pane. Default OFF. */
+  tmuxOrphanSessionBareWrapperKill?: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate ("Press t
    *  to trust") for Codex-family plain-TUI launches (codex / traex). Codex 0.14x
    *  gates the botmux-installed ~/.codex/hooks.json behind a manual trust prompt,
@@ -670,6 +687,8 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   if (typeof d.codexRpcInput === 'boolean') out.codexRpcInput = d.codexRpcInput;
   if (typeof d.autoUpgradeCodexSessions === 'boolean') out.autoUpgradeCodexSessions = d.autoUpgradeCodexSessions;
   if (typeof d.reapOrphanTmuxServers === 'boolean') out.reapOrphanTmuxServers = d.reapOrphanTmuxServers;
+  if (typeof d.tmuxOrphanSessionSweep === 'boolean') out.tmuxOrphanSessionSweep = d.tmuxOrphanSessionSweep;
+  if (typeof d.tmuxOrphanSessionBareWrapperKill === 'boolean') out.tmuxOrphanSessionBareWrapperKill = d.tmuxOrphanSessionBareWrapperKill;
   // Round-trip an explicit boolean either way. Absent stays absent — the live
   // getter (config.ts `bypassCodexHookTrust`) treats absent as ON, so we must
   // preserve a stored `false` to let an operator disable it.
@@ -1032,6 +1051,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (groupNamePrefix) out.groupNamePrefix = groupNamePrefix;
   const repoPickerMode = readRepoPickerMode(raw.repoPickerMode);
   if (repoPickerMode) out.repoPickerMode = repoPickerMode;
+  const worktreeRoot = normalizeWorktreeRoot(raw.worktreeRoot);
+  if (worktreeRoot) out.worktreeRoot = worktreeRoot;
   const dashboard = readDashboard(raw.dashboard);
   if (dashboard) out.dashboard = dashboard;
   const voice = readVoice(raw.voice);

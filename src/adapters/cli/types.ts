@@ -20,6 +20,10 @@ export interface PtyHandle {
   /** Deliver one explicit bracketed-paste frame, preserving embedded newlines.
    * Unlike pasteText, this capability guarantees the boundary markers. */
   sendBracketedPaste?(text: string): void | boolean;
+  /** Deliver bracketed paste plus its submit Enter in ONE backend operation. No
+   * adapter delay or separate transport call may separate them. false/throw is
+   * ambiguous and must never cause an automatic replay. Used by Codex's terminal submit path. */
+  submitBracketedPaste?(text: string): void | boolean;
   /** Send multiple lines separated by a special soft-newline key in a single batch (tmux mode only). */
   sendLines?(lines: string[], softNewlineKey: string): void | boolean;
   /**
@@ -296,6 +300,13 @@ export interface CliAdapter {
     modelBackendVariant?: 'standard' | 'max';
     /** When true, do not add adapter-default flags that bypass CLI approvals or disable sandboxing. */
     disableCliBypass?: boolean;
+    /** Version of the CLI binary this spawn will run ("1.17.11", "2.1.4", …), as
+     *  last probed by the daemon (`getCurrentCliVersion`). Adapters use it to gate
+     *  flags that only newer releases accept — passing an unknown flag makes some
+     *  CLIs print help and exit 1, which the daemon amplifies into a crash loop.
+     *  Missing or "unknown" means "not probed": adapters must then behave as if the
+     *  flag is unsupported (keep the old argv) rather than guess. */
+    cliVersion?: string;
     /** Codex App only: restricted local browser extension bridge. */
     codexBrowser?: import('../../core/codex-browser-config.js').CodexBrowserConfig;
     /** Codex-family only: when true (default from the global `bypassCodexHookTrust`
@@ -524,6 +535,16 @@ export interface CliAdapter {
     recheck?: () => SubmitRecheckResult | Promise<SubmitRecheckResult>;
   }>;
 
+  /** Press the composer's SUBMIT key once for a draft already parked in the
+   *  input box (the cold-start late-SessionStart re-submit path). Must use the
+   *  same key resolution as {@link writeInput}: users can remap submit
+   *  (keybindings.json / CLAUDE_CODE_SUBMIT_KEY) and bind plain Enter to
+   *  chat:newline, in which case sending Enter would merely insert a newline.
+   *  Returns false when no terminal-sendable submit key is configured or the
+   *  backend could not confirm the send (ambiguous — callers must not retry on
+   *  a guess). Adapters without this method get a plain Enter. */
+  pressComposerSubmit?(pty: PtyHandle): boolean;
+
   /** Optional deterministic evidence that a slash-command LINE typed into the
    *  TUI (a bot startup command such as `/effort xhigh`) was executed, e.g.
    *  Claude Code's transcript `<command-name>/effort</command-name>` record.
@@ -532,6 +553,17 @@ export interface CliAdapter {
    *  Returns undefined when no such evidence is available — the worker then
    *  falls back to PTY evidence (output after the submit key, then the prompt). */
   commandExecutionProbe?(pty: PtyHandle, commandLine: string): (() => boolean) | undefined;
+
+  /** Optional: a confirmation dialog the CLI raised for a startup-command LINE
+   *  botmux typed itself (e.g. Claude Code's "Change effort level?" prompt-cache
+   *  warning after `/effort max` in a resumed conversation). The worker passes
+   *  its authoritative screen while that command is still unconfirmed.
+   *  `accept: true` — the line's own argument already answers the dialog and
+   *  Enter on the focused option accepts it (the worker presses Enter);
+   *  `accept: false` — such a dialog is up but must stay for a person (the
+   *  queue stays held behind the command). null when no dialog for this line
+   *  is on screen. Pure and cheap: called at most once a second. */
+  startupCommandConfirmation?(screen: string, commandLine: string): { accept: boolean; detail: string } | null;
 
   /** Optional structured input path for adapters whose protocol can keep
    * application context out of the visible user message. The worker calls this
@@ -834,6 +866,16 @@ export interface CliAdapter {
    *  and the screen decides, as it does without OSC 7501. */
   readonly programStatusSubmitAwaitsBusy?: boolean;
 
+  /** The CLI reports an OSC 7501 terminal state (idle) before its composer
+   *  accepts input: omp 18.10 reports `idle` from `InteractiveMode.init()`
+   *  before its `session_start` hooks run, and a paste + Enter in that window
+   *  is dropped while writeInput still reports success. When true, IdleDetector
+   *  ignores idle/done/error reports until this process has published a first
+   *  idle from other evidence (screen quiescence / transcript) or reported
+   *  `working`/`blocked`; startup readiness stays on the screen heuristics, as
+   *  with program status off. Later reports are authoritative as usual. */
+  readonly programStatusStartupIdleUntrusted?: boolean;
+
   /** A structured terminal closes the business turn but does not by itself
    *  prove the PTY composer is writable. On an authoritative local screen,
    *  require fresh composer evidence (`staticBusyClearPattern`, falling back
@@ -915,8 +957,8 @@ export interface CliAdapter {
    *  free-text option, so this list is curation, not a hard whitelist. */
   readonly modelChoices?: readonly string[];
 
-  /** Optional live model discovery: enumerate the models this CLI can actually
-   *  use right now (e.g. `traex debug models` prints its full catalogue as
+  /** Optional live model discovery: enumerate configured model candidates,
+   *  not a guarantee of successful API access (e.g. `traex debug models` prints its full catalogue as
    *  JSON). The dashboard model picker invokes it on demand for the SELECTED
    *  CLI only — never in a scan over all adapters — and merges the result with
    *  `modelChoices`. Contract:
@@ -927,7 +969,7 @@ export interface CliAdapter {
    *    JSON can be hundreds of KB;
    *  - absent = the CLI cannot enumerate its models; the picker shows
    *    `modelChoices` only. */
-  readonly detectModels?: () => Promise<readonly string[] | null>;
+  readonly detectModels?: (options?: { env?: NodeJS.ProcessEnv }) => Promise<readonly string[] | null>;
 
   /** Optional richer form of {@link detectModels}. Adapters that already parse
    *  a model catalogue should implement this and derive detectModels from it,

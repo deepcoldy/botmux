@@ -6,6 +6,9 @@
  *
  * Run:  pnpm vitest run test/session-store.test.ts
  */
+// Must stay the first import: this file fakes node:fs, so refuse to run outside
+// the data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import {
@@ -13,6 +16,8 @@ import {
 } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { tmpdir } from 'os';
+import { readCodexModelLaunchReceipt, recordCodexModelLaunch, refreshCodexModelSelection, spawnWithCodexModelLaunch } from '../src/services/codex-model-selection.js';
+import { resolveSessionLaunchModel } from '../src/core/session-model.js';
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
@@ -193,6 +198,49 @@ afterEach(() => {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
   try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
+});
+
+describe('native Codex model preference persistence', () => {
+  it('keeps a native choice through a real SQLite store reopen', () => {
+    const session = createSession('chat-model', 'root-model', 'native model');
+    Object.assign(session, { cliId: 'codex', cliSessionId: 'native-1', model: 'A', backendType: 'tmux' });
+    recordCodexModelLaunch(session, 'A', 1000);
+    updateSession(session);
+    const path = join(tempDir, 'rollout-model.jsonl');
+    writeFileSync(path, JSON.stringify({ timestamp: new Date(2000).toISOString(), type: 'event_msg',
+      payload: { type: 'thread_settings_applied', thread_settings: { model: 'B' } },
+    }) + '\n');
+    refreshCodexModelSelection(session, path, 'A');
+    recordCodexModelLaunch(session, 'B', 3000);
+    updateSession(session);
+    init('test-app');
+    const restored = getSession(session.sessionId)!;
+    expect(resolveSessionLaunchModel({ session: restored }, { cliId: 'codex', model: 'C' })).toBe('B');
+    expect(readPersistedRows(tempDir, 'test-app')[session.sessionId].codexModelSelection.override).toBe('B');
+  });
+
+  it('rolls back a failed row write and can recover the choice from native settings on retry', () => {
+    const session = createSession('chat-model-fail', 'root-model-fail', 'native model');
+    Object.assign(session, { cliId: 'codex', cliSessionId: 'native-1', model: 'A' });
+    recordCodexModelLaunch(session, 'A', 1000);
+    updateSession(session);
+    const path = join(tempDir, 'rollout-model-fail.jsonl');
+    writeFileSync(path, JSON.stringify({ timestamp: new Date(2000).toISOString(), type: 'event_msg',
+      payload: { type: 'thread_settings_applied', thread_settings: { model: 'B' } },
+    }) + '\n');
+    refreshCodexModelSelection(session, path, 'A');
+    recordCodexModelLaunch(session, 'B', 3000);
+    __testOnly_setBeforeRowPersist(() => { throw new Error('injected row failure'); });
+    expect(() => updateSession(session)).toThrow('injected row failure');
+    expect(session.codexModelSelection?.override).toBeUndefined();
+    expect(session.codexModelSelection?.launchStartedAtMs).toBe(1000);
+    __testOnly_setBeforeRowPersist(undefined);
+    refreshCodexModelSelection(session, path, 'A');
+    recordCodexModelLaunch(session, 'B', 4000);
+    updateSession(session);
+    init('test-app');
+    expect(getSession(session.sessionId)?.codexModelSelection?.override).toBe('B');
+  });
 });
 
 describe('principal lane durable store', () => {
@@ -2779,6 +2827,24 @@ describe('closeSession()', () => {
     expect(existsSync(unread.path)).toBe(false);
     expect(existsSync(paneLaunchDir(tempDir, closing.sessionId))).toBe(false);
     expect(existsSync(sibling.path)).toBe(true);
+  });
+
+  it('removes the Codex launch receipt of the closed session only', () => {
+    const closing = createSession('chat1', 'root-receipt-close', 'Close With Receipt');
+    const other = createSession('chat1', 'root-receipt-other', 'Stays Open');
+    const writeReceipt = (sessionId: string): void => spawnWithCodexModelLaunch({
+      dataDir: tempDir, sessionId,
+      launch: { model: 'gpt-test', startedAtMs: 1234 },
+      spawn: () => {}, reattached: () => false, publish: () => {},
+    });
+    writeReceipt(closing.sessionId);
+    writeReceipt(other.sessionId);
+    expect(readCodexModelLaunchReceipt(tempDir, closing.sessionId)).toBeDefined();
+
+    closeSession(closing.sessionId);
+
+    expect(readCodexModelLaunchReceipt(tempDir, closing.sessionId)).toBeUndefined();
+    expect(readCodexModelLaunchReceipt(tempDir, other.sessionId)).toBeDefined();
   });
 
   it('snapshots token usage in the same durable close write', () => {

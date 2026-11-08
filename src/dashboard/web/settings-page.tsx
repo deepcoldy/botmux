@@ -37,6 +37,7 @@ interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: Mainte
 
 interface DashboardSettings {
   groupNamePrefix: string;
+  worktreeRoot: string;
   publicReadOnly: boolean;
   openTerminalInFeishu: boolean;
   enableLocalCliOpen: boolean;
@@ -52,6 +53,8 @@ interface DashboardSettings {
   codexRpcInput: boolean;
   autoUpgradeCodexSessions: boolean;
   reapOrphanTmuxServers: boolean;
+  tmuxOrphanSessionSweep: boolean;
+  tmuxOrphanSessionBareWrapperKill: boolean;
   bypassCodexHookTrust: boolean;
   hideCodexRateLimitModelNudge: boolean;
   cardBrandLabel: boolean;
@@ -209,6 +212,7 @@ function traexInstallMessage(install: any, tr: (k: string) => string): StatusMes
 function parseSettings(s: any): DashboardSettings {
   return {
     groupNamePrefix: typeof s?.groupNamePrefix === 'string' ? s.groupNamePrefix : '',
+    worktreeRoot: typeof s?.worktreeRoot === 'string' ? s.worktreeRoot : '',
     publicReadOnly: s?.publicReadOnly === true,
     openTerminalInFeishu: s?.openTerminalInFeishu === true,
     enableLocalCliOpen: s?.enableLocalCliOpen === true,
@@ -224,6 +228,8 @@ function parseSettings(s: any): DashboardSettings {
     codexRpcInput: s?.codexRpcInput === true,
     autoUpgradeCodexSessions: s?.autoUpgradeCodexSessions === true,
     reapOrphanTmuxServers: s?.reapOrphanTmuxServers === true,
+    tmuxOrphanSessionSweep: s?.tmuxOrphanSessionSweep !== false,
+    tmuxOrphanSessionBareWrapperKill: s?.tmuxOrphanSessionBareWrapperKill === true,
     // default ON — only an explicit persisted false disables (matches server snapshot)
     bypassCodexHookTrust: s?.bypassCodexHookTrust !== false,
     hideCodexRateLimitModelNudge: s?.hideCodexRateLimitModelNudge !== false,
@@ -901,7 +907,7 @@ export function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'stuckCardInitiatorKeys' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'reapOrphanTmuxServers' | 'tmuxOrphanSessionSweep' | 'tmuxOrphanSessionBareWrapperKill' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'cardBrandLabel' | 'stuckCardInitiatorKeys' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -1080,6 +1086,20 @@ export function SettingsBody(props: {
             onChange={value => saveBoolean('reapOrphanTmuxServers', value)}
           />
           <ToggleRow
+            title={tr('settings.tmuxOrphanSessionSweep')}
+            help={tr('settings.tmuxOrphanSessionSweepHelp')}
+            checked={settings.tmuxOrphanSessionSweep}
+            disabled={dis || savingKey === 'tmuxOrphanSessionSweep'}
+            onChange={value => saveBoolean('tmuxOrphanSessionSweep', value)}
+          />
+          <ToggleRow
+            title={tr('settings.tmuxOrphanSessionBareWrapperKill')}
+            help={tr('settings.tmuxOrphanSessionBareWrapperKillHelp')}
+            checked={settings.tmuxOrphanSessionBareWrapperKill}
+            disabled={dis || savingKey === 'tmuxOrphanSessionBareWrapperKill'}
+            onChange={value => saveBoolean('tmuxOrphanSessionBareWrapperKill', value)}
+          />
+          <ToggleRow
             title={tr('settings.bypassCodexHookTrust')}
             help={tr('settings.bypassCodexHookTrustHelp')}
             checked={settings.bypassCodexHookTrust}
@@ -1222,6 +1242,17 @@ export function SettingsBody(props: {
               }}
             />
           </div>
+        </SettingsBlock>
+        <SettingsBlock id="settings-worktree" title={tr('settings.sectionWorktree')}>
+          <WorktreeRootRow
+            value={settings.worktreeRoot}
+            disabled={dis || savingKey === 'worktreeRoot'}
+            onSave={value => props.onSave(
+              'worktreeRoot',
+              { worktreeRoot: value },
+              s => ({ ...s, worktreeRoot: value }),
+            )}
+          />
         </SettingsBlock>
         <SettingsBlock id="settings-schedule" title={tr('settings.sectionSchedule')}>
           <TimeZoneRow
@@ -1930,6 +1961,54 @@ export function GroupNamePrefixRow(props: {
           onClick={submit}
         >
           {tr('settings.groupNamePrefixSave')}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+export function WorktreeRootRow(props: {
+  value: string;
+  disabled: boolean;
+  onSave(value: string): Promise<void> | void;
+}) {
+  const tr = useT();
+  const [draft, setDraft] = useState(props.value);
+  useEffect(() => setDraft(props.value), [props.value]);
+
+  const dirty = draft.trim() !== props.value;
+  const submit = () => {
+    if (props.disabled || !dirty) return;
+    void props.onSave(draft.trim());
+  };
+
+  return (
+    <div className="settings-subfield">
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.worktreeRootHelp')}>{tr('settings.worktreeRoot')}</FieldTitle>
+        <input
+          className="settings-text-input"
+          type="text"
+          value={draft}
+          placeholder={tr('settings.worktreeRootPlaceholder')}
+          disabled={props.disabled}
+          onChange={event => setDraft(event.currentTarget.value)}
+          onKeyDown={event => { if (event.key === 'Enter') { event.preventDefault(); submit(); } }}
+        />
+      </div>
+      <p className="settings-subfield-hint" data-worktree-root-hint>
+        {props.value
+          ? tr('settings.worktreeRootCurrent', { path: props.value })
+          : tr('settings.worktreeRootDefault')}
+      </p>
+      <div className="actions">
+        <button
+          type="button"
+          className="page-primary-action"
+          disabled={props.disabled || !dirty}
+          onClick={submit}
+        >
+          {tr('settings.worktreeRootSave')}
         </button>
       </div>
     </div>

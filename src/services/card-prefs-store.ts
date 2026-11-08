@@ -118,6 +118,8 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   autoStartOnNewTopic: boolean;
   /** 群负责人（默认接待者）开关，默认关。 */
   chatManagerEnabled: boolean;
+  /** 群秘书（/secretary）开关，默认关。 */
+  groupSecretaryEnabled: boolean;
   autoStartExcludedChats: string[];
   /** 主动开工 — 入群执行命令开关（不经 LLM，见 BotConfig.groupJoinCommandEnabled）。 */
   groupJoinCommandEnabled: boolean;
@@ -168,6 +170,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoinSeed: typeof c.autoStartOnGroupJoinSeed === 'string' ? c.autoStartOnGroupJoinSeed : '',
       autoStartOnNewTopic: c.autoStartOnNewTopic === true,
       chatManagerEnabled: c.chatManagerEnabled === true,
+      groupSecretaryEnabled: c.groupSecretaryEnabled === true,
       autoStartExcludedChats: c.autoStartExcludedChats ?? [],
       groupJoinCommandEnabled: c.groupJoinCommandEnabled === true,
       groupJoinCommand: typeof c.groupJoinCommand === 'string' ? c.groupJoinCommand : '',
@@ -207,6 +210,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoinSeed: '',
       autoStartOnNewTopic: false,
       chatManagerEnabled: false,
+      groupSecretaryEnabled: false,
       autoStartExcludedChats: [],
       groupJoinCommandEnabled: false,
       groupJoinCommand: '',
@@ -345,6 +349,7 @@ async function updateBotCardPrefsInternal(
     applyStr(entry, 'autoStartOnGroupJoinSeed', patch.autoStartOnGroupJoinSeed);
     apply(entry, 'autoStartOnNewTopic', patch.autoStartOnNewTopic);
     apply(entry, 'chatManagerEnabled', patch.chatManagerEnabled);
+    apply(entry, 'groupSecretaryEnabled', patch.groupSecretaryEnabled);
     if (patch.autoStartExcludedChats !== undefined) {
       if (patch.autoStartExcludedChats.length) entry.autoStartExcludedChats = patch.autoStartExcludedChats;
       else delete entry.autoStartExcludedChats;
@@ -387,6 +392,7 @@ async function updateBotCardPrefsInternal(
         autoStartOnGroupJoinSeed: typeof entry.autoStartOnGroupJoinSeed === 'string' ? entry.autoStartOnGroupJoinSeed : '',
         autoStartOnNewTopic: entry.autoStartOnNewTopic === true,
         chatManagerEnabled: entry.chatManagerEnabled === true,
+        groupSecretaryEnabled: entry.groupSecretaryEnabled === true,
         autoStartExcludedChats: entry.autoStartExcludedChats ?? [],
         groupJoinCommandEnabled: entry.groupJoinCommandEnabled === true,
         groupJoinCommand: typeof entry.groupJoinCommand === 'string' ? entry.groupJoinCommand : '',
@@ -492,6 +498,9 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.chatManagerEnabled !== undefined) {
     bot.config.chatManagerEnabled = patch.chatManagerEnabled || undefined;
+  }
+  if (patch.groupSecretaryEnabled !== undefined) {
+    bot.config.groupSecretaryEnabled = patch.groupSecretaryEnabled || undefined;
   }
   if (patch.groupJoinCommandEnabled !== undefined) {
     bot.config.groupJoinCommandEnabled = patch.groupJoinCommandEnabled || undefined;

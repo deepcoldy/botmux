@@ -381,6 +381,8 @@ export interface ClaudeStopFailureContext<TTimer = unknown> {
     errorCode: string,
     dispatchAttempt: number | undefined,
     retryable: boolean,
+    /** The hook's own error text (unmasked; the worker masks it). */
+    errorDetail?: string,
   ) => void;
   /** Plain chat notice; `replyTurnId` picks the reply target. */
   notify: (errorCode: string, replyTurnId: string | undefined) => void;
@@ -490,7 +492,10 @@ export function handleClaudeStopFailureReport<TTimer>(
       case 'emit':
         ctx.log(`Claude StopFailure fallback: the transcript never settled turn ${settleTurnId!.slice(0, 12)}; `
           + `emitting ${decision.status}/${decision.errorCode}`);
-        ctx.emit(settleTurnId!, decision.status, decision.errorCode, active.dispatchAttempt, decision.retryable);
+        ctx.emit(
+          settleTurnId!, decision.status, decision.errorCode, active.dispatchAttempt, decision.retryable,
+          report.lastAssistantMessage ?? report.errorDetails,
+        );
         return;
       case 'notify':
         // A closed turn gets one notice: whatever else fails after it stopped

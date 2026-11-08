@@ -37,6 +37,47 @@ const PERMISSION_DIALOG = [
   ' Esc to cancel · Tab to amend',
 ].join('\n');
 
+// A permission dialog whose wrapped question used to be invisible while the
+// empty composer box is still painted below it: the last readyPattern hit then
+// sits inside a framed composer, so without the wrap fix the gate ALLOWED the
+// keep-alive — an Enter landing on the dialog selects the highlighted choice
+// unattended.
+const WRAPPED_PERMISSION_DIALOG_OVER_COMPOSER = [
+  RULE,
+  ' Edit file',
+  ' │ const x = 1;',
+  '',
+  ' Do you want to make this edit to a-very-long-component-file-name-for-the-',
+  ' settings-panel-of-account.tsx?',
+  ' ❯ 1. Yes',
+  '   2. No',
+  '',
+  ' Esc to cancel',
+  RULE,
+  '❯ ',
+  RULE,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+].join('\n');
+
+// Same regression with the real Edit layout: the diff's last line sits
+// DIRECTLY above the wrapped question with no blank row.
+const WRAPPED_DIALOG_DIRECTLY_ABOVE_COMPOSER = [
+  RULE,
+  ' Edit file',
+  ' │ -  const x;',
+  ' │ +  const x = 1;',
+  ' Do you want to make this edit to a-very-long-component-file-name-for-the-',
+  ' settings-panel-of-account.tsx?',
+  ' ❯ 1. Yes',
+  '   2. No',
+  '',
+  ' Esc to cancel',
+  RULE,
+  '❯ ',
+  RULE,
+  '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+].join('\n');
+
 const ASK_USER_QUESTION = [
   RULE,
   ' ☐ Deploy',
@@ -71,6 +112,74 @@ describe('promptCacheKeepaliveRefusal', () => {
   it('refuses a permission dialog even though it matches the ready pattern', () => {
     expect(READY.test(PERMISSION_DIALOG)).toBe(true);
     expect(promptCacheKeepaliveRefusal({ ...ok, screen: PERMISSION_DIALOG })).toBe('action_prompt_open');
+  });
+
+  it('refuses a wrapped permission dialog even with the composer box still painted', () => {
+    expect(READY.test(WRAPPED_PERMISSION_DIALOG_OVER_COMPOSER)).toBe(true);
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: WRAPPED_PERMISSION_DIALOG_OVER_COMPOSER })).toBe('action_prompt_open');
+  });
+
+  it('refuses a wrapped dialog whose last diff row is directly above the question', () => {
+    expect(READY.test(WRAPPED_DIALOG_DIRECTLY_ABOVE_COMPOSER)).toBe(true);
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen: WRAPPED_DIALOG_DIRECTLY_ABOVE_COMPOSER })).toBe('action_prompt_open');
+  });
+
+  it('refuses a one-line permission question with the composer still painted below', () => {
+    const screen = [PERMISSION_DIALOG, RULE, '❯ ', RULE, '  ⏵⏵ bypass permissions on (shift+tab to cycle)'].join('\n');
+    expect(READY.test(screen)).toBe(true);
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen })).toBe('action_prompt_open');
+  });
+
+  it('refuses a dialog wrapped beyond the join window (the notification parser stays silent)', () => {
+    // Head + 4 continuations: claudeActionPrompt deliberately does not
+    // reconstruct it, but the hard choices+footer evidence is on screen.
+    // Failing closed here is what keeps the keep-alive Enter off the dialog.
+    const screen = [
+      RULE,
+      ' Edit file',
+      ` Do you want to make this edit to components-${'a'.repeat(40)}`,
+      ` panel-${'b'.repeat(40)}`,
+      ` section-${'c'.repeat(40)}`,
+      ` view-${'d'.repeat(40)}`,
+      ' final.tsx?',
+      ' ❯ 1. Yes',
+      '   2. No',
+      '',
+      ' Esc to cancel',
+      RULE,
+      '❯ ',
+      RULE,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n');
+    expect(READY.test(screen)).toBe(true);
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen })).toBe('action_prompt_open');
+  });
+
+  it('refuses the 80-col 4-choice variant with a 5-row wrapped question', () => {
+    // Head -> footer spans 11 rows (5 question rows, a wrapped option 3); the
+    // compact-block gate window must still cover it.
+    const question = `Do you want to make this edit to ${'a'.repeat(200)}/really-long-directory-path-to-a-component-file-in-a-monorepo/packages/editor/src/components/panel.tsx?`;
+    const qRows: string[] = [];
+    for (let i = 0; i < question.length; i += 78) qRows.push(` ${question.slice(i, i + 78)}`);
+    const screen = [
+      RULE,
+      ' Edit file',
+      ...qRows,
+      ' ❯ 1. Yes',
+      '   2. No, skip for now',
+      "   3. Yes, and don't ask again for Bash(rm -rf /home/tiger/work/monorepo/packages)",
+      '      editor/src/components',
+      '   4. No, and tell Claude what to do differently (esc)',
+      '',
+      ' Esc to cancel',
+      RULE,
+      '❯ ',
+      RULE,
+      '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+    ].join('\n');
+    expect(qRows.length).toBe(5);
+    expect(READY.test(screen)).toBe(true);
+    expect(promptCacheKeepaliveRefusal({ ...ok, screen })).toBe('action_prompt_open');
   });
 
   it('refuses an AskUserQuestion picker (prompt not inside an input box)', () => {

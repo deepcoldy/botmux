@@ -837,7 +837,7 @@ describe('Auto input and shared-setting continuity', () => {
       setCaptureIdentity: vi.fn(() => { expect(h.scope.traexAutoModelTurnReplayForbidden).toBe(true); }),
       markTurnRetired: vi.fn(), markTurnExecutionStart: vi.fn(), stampMojoTurnMark: vi.fn(),
       writeCliPidMarker: vi.fn(), publishSandboxRelayCapability: vi.fn(),
-      isEffortLevelCommand: () => false, claudeBtwQuestion: () => undefined,
+      claudeSwitchKindForCommand: () => null, claudeBtwQuestion: () => undefined,
       finalizeRawCommandDelivery: (input: any) => { if (input.accepted) input.onAccepted(); return input.accepted; },
       idleDetector: { reset: vi.fn() }, flushPending: vi.fn(async () => {}),
     });

@@ -12,11 +12,12 @@
  * 不清理附件、不限历史条数：看板是给人读的台账，规模由人维护的事项数决定（几十到几百项）。
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike, type StatementLike } from './sqlite-compat.js';
 import type { Locale } from '../i18n/types.js';
 import { decisionAskKey } from '../core/decision-board/ask-key.js';
+import { BOARD_EXPLAINER_EXT, boardFileKind } from '../core/decision-board/files.js';
 import {
   BOARD_LIMITS,
   BOARD_STATE_LABELS,
@@ -67,7 +68,7 @@ export const decisionBoardFilesDir = (dataDir: string, appId: string): string =>
 // 看板仍能打开。补列见 migrateChatColumns，回滚期间旧构建留下的不一致见 healChatFields。
 // 「自动发现可以关的项」的六列（board_items.close_when / depends_on / next_check_at / hint_json /
 // hint_notified / hint_dismissed）同理：都可空，存量行全是 NULL = 没写条件、没有提示，不升版本号。
-// 补列见 migrateHintColumns。
+// 补列见 migrateHintColumns。「子任务提醒」的 board_items.task_notified 同理。
 const SCHEMA_VERSION = 3;
 
 /** 管家写入的字段补丁。undefined = 不动；null = 清空（仅可选字段）。 */
@@ -108,6 +109,22 @@ export interface ItemSummary extends BoardItem {
   pendingDecisions: number;
   /** 管家在 owner 上次打开详情之后写过东西。 */
   unseen: boolean;
+  /** 这一项附了几个图文说明（HTML 说明页 + 视频）；没有就不带。 */
+  explainers?: number;
+}
+
+/** 已经写在暂存区里的图文说明（见 decision-board-staging.ts）：attach 时挪进 files/。 */
+export interface StagedFileInput {
+  path: string;
+  sha256: string;
+  bytes: number;
+  mime: string;
+  name: string;
+}
+
+interface StagedMoves {
+  moved: Array<{ from: string; to: string }>;
+  duplicates: string[];
 }
 
 export interface ItemDetail {
@@ -172,6 +189,7 @@ interface ItemRow {
   /** 同上：补列前的旧行没有这几列。 */
   close_when?: string | null; depends_on?: string | null; next_check_at?: number | null;
   hint_json?: string | null; hint_notified?: string | null; hint_dismissed?: string | null;
+  task_notified?: string | null;
 }
 
 function rowToItem(r: ItemRow): BoardItem {
@@ -221,6 +239,17 @@ function parseIds(json: string | null): string[] {
   } catch { return []; }
 }
 
+/** 没写 --note 时这次附件的默认历史文字。 */
+function attachSummary(files: BoardFile[]): string {
+  const count = (kind: string) => files.filter(f => boardFileKind(f.mime) === kind).length;
+  const parts = [
+    count('html') ? `说明页 ${count('html')} 个` : '',
+    count('video') ? `视频 ${count('video')} 个` : '',
+    count('image') ? `截图 ${count('image')} 张` : '',
+  ].filter(Boolean);
+  return `附了图文说明（${parts.join('、')}）`;
+}
+
 function checkLen(field: string, value: string | null | undefined, max: number): void {
   if (typeof value === 'string' && value.length > max) {
     throw new BoardError('field_too_long', `${field} 太长（上限 ${max} 字）`);
@@ -229,6 +258,7 @@ function checkLen(field: string, value: string | null | undefined, max: number):
 
 const FILE_EXT: Record<string, string> = {
   'image/png': '.png', 'image/jpeg': '.jpg', 'image/gif': '.gif', 'image/webp': '.webp',
+  ...BOARD_EXPLAINER_EXT,
 };
 
 /**
@@ -282,6 +312,7 @@ function migrateHintColumns(db: DatabaseSyncLike): void {
   const columns: Array<[string, string]> = [
     ['close_when', 'TEXT'], ['depends_on', 'TEXT'], ['next_check_at', 'INTEGER'],
     ['hint_json', 'TEXT'], ['hint_notified', 'TEXT'], ['hint_dismissed', 'TEXT'],
+    ['task_notified', 'TEXT'],
   ];
   for (const [column, type] of columns) {
     if (!have.has(column)) db.exec(`ALTER TABLE board_items ADD COLUMN ${column} ${type};`);
@@ -380,6 +411,8 @@ export class DecisionBoardStore {
           hint_notified TEXT,
           -- 管家收起过的提示 key（JSON 数组）：之后不再标出。
           hint_dismissed TEXT,
+          -- 已提醒过管家的子任务结果 key（JSON 数组）：同一次交付 / 举手 / 中断只提醒一次。
+          task_notified TEXT,
           PRIMARY KEY (app_id, seq)
         ) WITHOUT ROWID;
         CREATE UNIQUE INDEX IF NOT EXISTS board_items_key ON board_items(app_id, item_key) WHERE item_key IS NOT NULL;
@@ -985,6 +1018,51 @@ export class DecisionBoardStore {
     });
   }
 
+  // ─── 子任务提醒 ────────────────────────────────────────────────────────────────
+
+  /** 没结束、且关联了这些群之一的事项（含已提醒过的 key）。 */
+  itemsForChats(appId: string, chatIds: readonly string[]):
+    Array<{ item: BoardItem; links: BoardLink[]; taskNotified: string[] }> {
+    if (chatIds.length === 0) return [];
+    const wanted = new Set(chatIds);
+    const rows = this.stmt('SELECT * FROM board_items WHERE app_id = ? ORDER BY seq').all(appId) as ItemRow[];
+    const out: Array<{ item: BoardItem; links: BoardLink[]; taskNotified: string[] }> = [];
+    for (const row of rows) {
+      const item = rowToItem(row);
+      if (isEndedState(item.state)) continue;
+      const links = this.links(appId, item.seq);
+      const hit = (item.primaryChat && wanted.has(item.primaryChat)) || links.some(l => l.kind === 'chat' && wanted.has(l.ref));
+      if (hit) out.push({ item, links, taskNotified: keyListFromJson(row.task_notified) });
+    }
+    return out;
+  }
+
+  /** 提醒送进管家会话之前记下这些 key；送不出去再 {@link unmarkTaskNotified}。 */
+  markTaskNotified(appId: string, entries: ReadonlyArray<{ seq: number; key: string }>): void {
+    this.tx(() => {
+      for (const e of entries) {
+        const row = this.itemRow(appId, e.seq);
+        if (!row) continue;
+        this.stmt('UPDATE board_items SET task_notified = ? WHERE app_id = ? AND seq = ?')
+          .run(JSON.stringify(appendKey(keyListFromJson(row.task_notified), e.key)), appId, e.seq);
+      }
+    });
+  }
+
+  unmarkTaskNotified(appId: string, entries: ReadonlyArray<{ seq: number; key: string }>): void {
+    this.tx(() => {
+      for (const e of entries) {
+        const row = this.itemRow(appId, e.seq);
+        if (!row) continue;
+        const keys = keyListFromJson(row.task_notified);
+        if (!keys.includes(e.key)) continue;
+        const next = keys.filter(k => k !== e.key);
+        this.stmt('UPDATE board_items SET task_notified = ? WHERE app_id = ? AND seq = ?')
+          .run(next.length ? JSON.stringify(next) : null, appId, e.seq);
+      }
+    });
+  }
+
   links(appId: string, seq: number): BoardLink[] {
     // ord 是同一事项内严格单调的写入序号（见建表注释），单独按它排序即得稳定的作者顺序。
     return (this.stmt('SELECT kind, ref, label, chat_check, chat_name FROM board_links WHERE app_id = ? AND seq = ? ORDER BY ord')
@@ -1017,6 +1095,7 @@ export class DecisionBoardStore {
       : []);
     const pending = new Map((this.stmt('SELECT seq, COUNT(*) AS n FROM board_decisions WHERE app_id = ? AND handled_at IS NULL GROUP BY seq')
       .all(appId) as Array<{ seq: number; n: number }>).map(r => [r.seq, r.n]));
+    const explainers = this.explainerCounts(appId);
     const q = opts.query?.trim().toLowerCase();
     const out: ItemSummary[] = [];
     for (const row of rows) {
@@ -1034,6 +1113,7 @@ export class DecisionBoardStore {
         hasDraft: drafts.has(item.seq),
         pendingDecisions: pending.get(item.seq) ?? 0,
         unseen: !!item.stewardEventAt && (!item.ownerSeenAt || item.stewardEventAt > item.ownerSeenAt),
+        ...(explainers.get(item.seq) ? { explainers: explainers.get(item.seq) } : {}),
       });
     }
     // 待拍板按进入该状态的时间（先进先拍）；其它按最近更新。
@@ -1080,7 +1160,7 @@ export class DecisionBoardStore {
   addFile(appId: string, input: { seq?: number; bytes: Buffer; mime: string; name: string; by: 'owner' | 'steward' },
     now = Date.now()): BoardFile {
     const ext = FILE_EXT[input.mime];
-    if (!ext) throw new BoardError('unsupported_file', '只支持 png / jpg / gif / webp 图片');
+    if (!ext || boardFileKind(input.mime) !== 'image') throw new BoardError('unsupported_file', '只支持 png / jpg / gif / webp 图片');
     const sha256 = createHash('sha256').update(input.bytes).digest('hex');
     const dir = decisionBoardFilesDir(this.dataDir, appId);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -1113,6 +1193,40 @@ export class DecisionBoardStore {
     try { return { file: found.file, data: readFileSync(found.path) }; } catch { return undefined; }
   }
 
+  /** 每项的图文说明个数（只数已经挂到事项上的）。 */
+  explainerCounts(appId: string): Map<number, number> {
+    const mimes = Object.keys(BOARD_EXPLAINER_EXT);
+    const rows = this.stmt(`SELECT seq, COUNT(*) AS n FROM board_files WHERE app_id = ? AND seq IS NOT NULL
+      AND mime IN (${mimes.map(() => '?').join(', ')}) GROUP BY seq`).all(appId, ...mimes) as Array<{ seq: number; n: number }>;
+    return new Map(rows.map(r => [r.seq, r.n]));
+  }
+
+  /**
+   * 暂存区里的文件挪到按 sha256 命名的位置再写元数据。只在 attachExplainers 的事务里调用：同一份暂存
+   * 文件被并发 attach 两次时，后一个在写锁里发现它已不在，整个 attach 回滚。
+   * 挪动记进 moves，由调用方在回滚时挪回去、提交后删掉内容重复的暂存副本。
+   */
+  private addStagedFile(appId: string, seq: number, input: StagedFileInput, now: number, moves: StagedMoves): BoardFile {
+    const ext = FILE_EXT[input.mime];
+    if (!ext || boardFileKind(input.mime) === 'image') throw new BoardError('unsupported_file', '图文说明只支持 .html 说明页和 .mp4 / .webm 视频');
+    if (!existsSync(input.path)) throw new BoardError('unknown_file', '说明文件已经不在了，重新 attach');
+    const dir = decisionBoardFilesDir(this.dataDir, appId);
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const path = join(dir, `${input.sha256}${ext}`);
+    if (existsSync(path)) {
+      moves.duplicates.push(input.path);
+    } else {
+      renameSync(input.path, path);
+      moves.moved.push({ from: input.path, to: path });
+      try { chmodSync(path, 0o600); } catch { /* best effort */ }
+    }
+    const id = randomUUID().replace(/-/g, '').slice(0, 20);
+    this.stmt(`INSERT INTO board_files (app_id, id, seq, sha256, mime, bytes, name, uploader, created_at, ord)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'steward', ?, (SELECT COALESCE(MAX(ord), 0) + 1 FROM board_files WHERE app_id = ?))`)
+      .run(appId, id, seq, input.sha256, input.mime, input.bytes, input.name, now, appId);
+    return { id, seq, sha256: input.sha256, mime: input.mime, bytes: input.bytes, name: input.name, by: 'steward', createdAt: now };
+  }
+
   /** 管家附截图：文件 + 一条历史，同一事务。 */
   attachFiles(appId: string, seq: number, files: Array<{ bytes: Buffer; mime: string; name: string }>, note: string | undefined,
     actorRef?: string, now = Date.now()): BoardFile[] {
@@ -1124,6 +1238,35 @@ export class DecisionBoardStore {
         saved.map(f => f.id));
       return saved;
     });
+  }
+
+  /** 管家附图文说明（可同时带截图）：文件 + 一条历史，同一事务。 */
+  attachExplainers(appId: string, seq: number, input: { images: Array<{ bytes: Buffer; mime: string; name: string }>; staged: StagedFileInput[] },
+    note: string | undefined, actorRef?: string, now = Date.now()): BoardFile[] {
+    checkLen('说明', note, BOARD_LIMITS.note);
+    const moves: StagedMoves = { moved: [], duplicates: [] };
+    let saved: BoardFile[];
+    try {
+      saved = this.tx(() => {
+        if (!this.itemRow(appId, seq)) throw new BoardError('item_not_found', `没有 #${seq}`);
+        const files = [
+          ...input.staged.map(f => this.addStagedFile(appId, seq, f, now, moves)),
+          ...input.images.map(f => this.addFile(appId, { ...f, seq, by: 'steward' }, now)),
+        ];
+        this.insertEvent(appId, seq, now, 'steward', actorRef, 'attach', note?.trim() || attachSummary(files), files.map(f => f.id));
+        return files;
+      });
+    } catch (error) {
+      // 没提交：库里没有行指向这次挪进 files/ 的文件，挪回暂存区（挪不回就删），不留孤儿。
+      for (const m of moves.moved) {
+        try { renameSync(m.to, m.from); } catch { try { unlinkSync(m.to); } catch { /* 已经不在 */ } }
+      }
+      throw error;
+    }
+    for (const path of moves.duplicates) {
+      try { unlinkSync(path); } catch { /* 暂存区下次上传时按时间清 */ }
+    }
+    return saved;
   }
 
   // ─── 草稿 ───────────────────────────────────────────────────────────────

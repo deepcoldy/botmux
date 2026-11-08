@@ -23,7 +23,7 @@ import { sandboxNetworkLaunch } from '../../core/sandbox-network-launch.js';
 import type { ProtectedHttpEgressLoopbackPlan, ProtectedLocalServiceLoopbackPlan } from '../../core/protected-http-egress-loopback.js';
 import { networkProxyError, type SandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
 import { isMojoFullyRemote } from './mojo-types.js';
-import { resolveSandboxMode, type SandboxMode } from '../cli/sandbox-mode.js';
+import { envSandboxMode, resolveSandboxMode, type SandboxMode } from '../cli/sandbox-mode.js';
 import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, rmdirSync, unlinkSync, statSync, lstatSync, readlinkSync, realpathSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
@@ -605,10 +605,11 @@ export function botmuxCliInvocation(cliPathOverride?: string): { command: string
   return { command: process.execPath, args: [distCliJs()] };
 }
 
-/** Is the file sandbox globally forced for this daemon? The real per-bot
- *  BotConfig.sandbox flag is decided by the caller. */
+/** Is the file sandbox globally forced for this daemon (BOTMUX_SANDBOX=1/oncall/
+ *  scratch)? The real per-bot BotConfig.sandbox flag is decided by the caller.
+ *  An invalid value counts as forced: the worker refuses to spawn with it. */
 export function sandboxEnabled(): boolean {
-  return process.env.BOTMUX_SANDBOX === '1';
+  try { return envSandboxMode(process.env.BOTMUX_SANDBOX) !== 'off'; } catch { return true; }
 }
 
 /**

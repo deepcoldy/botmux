@@ -224,6 +224,15 @@ export function durablePrimarySessionProjection(
   return { sessionKey: identity.sessionKey, value: value as unknown as DurableJson };
 }
 
+/** The canonical Session behind a primary key, or undefined when there is none.
+ * A shadow row left at the same key from before a controlled switch to primary
+ * mode counts as none, exactly as admission treats it (see
+ * mergePrimaryProjection); a malformed primary envelope still throws. */
+export function canonicalPrimarySession(record: DurableSessionRecord | undefined): Session | undefined {
+  if (!record || object(record.value)?.type !== 'botmux.session.primary') return undefined;
+  return parseDurablePrimarySessionRecord(record).session;
+}
+
 /** Parse a full primary snapshot for failover restore and validate its routing key. */
 export function parseDurablePrimarySessionRecord(record: DurableSessionRecord): {
   session: Session;

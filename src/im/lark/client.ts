@@ -1,6 +1,7 @@
 import { assertMessageTopicAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../../cli/topic-send-guard.js';
 import { readFileSync, writeFileSync, createWriteStream, mkdirSync, existsSync } from 'node:fs';
 import { dirname, extname, basename, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { Client } from '@larksuiteoapi/node-sdk';
@@ -20,6 +21,8 @@ import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { canonicalMobileKey, isMobileEntry, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
 import { stampBotmuxCallbackMarkers } from './callback-button-marker.js';
+import { prepareLocalAddressContent, sanitizeLocalAddressNode } from './local-address-policy.js';
+import { linkFieldContext } from './local-address-context.js';
 import { executeWithLarkGate } from './api-gate.js';
 import {
   LARK_CODE_APP_SCOPE_MISSING,
@@ -235,8 +238,9 @@ const listBotsApiFailures = new Map<string, { reason: string; expiresAt: number 
  * chars, 1-hour TTL — see spike report §1.2).  When supplied, the Feishu
  * server returns the original message_id for repeat requests within TTL,
  * making the send idempotent.  Workflow runtime passes the attempt's
- * idempotencyKey here so retries don't re-send.  Existing callers omit
- * the param and get exactly the pre-Step-6 behavior.
+ * idempotencyKey here so retries don't re-send.  Callers that omit the param
+ * still get a per-call generated token (see {@link dedupeUuid}) so api-gate
+ * retries inside this call cannot post the message twice.
  */
 export interface OutboundMessageOptions {
   /** Revalidate the frozen source immediately before every provider attempt. */
@@ -339,6 +343,17 @@ async function recordPublishedGroupContext(larkAppId: string, data: any, body: s
   } catch { logger.warn('[group-context] outbound observation failed; publication remains successful'); }
 }
 
+/**
+ * Dedupe token for one logical send. The api-gate re-runs the whole closure on
+ * 429/5xx/network errors, and a request that landed server-side before the
+ * response was lost would be posted a second time. Generating the token OUTSIDE
+ * the closure keeps it stable across gate retries so Feishu returns the original
+ * message_id. Caller-supplied uuids win; the generated one is never exposed to hooks.
+ */
+function dedupeUuid(uuid?: string): string {
+  return uuid || randomUUID();
+}
+
 export async function sendMessage(
   larkAppId: string,
   chatId: string,
@@ -349,6 +364,8 @@ export async function sendMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendMessage');
+  content = prepareLocalAddressContent(content, msgType, linkFieldContext());
+  const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'sendMessage', async () => {
     // A retry gets a new cache after the gate wait, never a previous attempt's
     // available result. Destination and source checks may share this lookup.
@@ -367,7 +384,7 @@ export async function sendMessage(
           receive_id: chatId,
           msg_type: msgType as any,
           content: body,
-          ...(uuid ? { uuid } : {}),
+          uuid: wireUuid,
         },
       });
     } catch (err: any) {
@@ -417,6 +434,8 @@ export async function replyMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'replyMessage');
+  content = prepareLocalAddressContent(content, msgType, linkFieldContext());
+  const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'replyMessage', async () => {
     const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
     await assertMessageWriteAllowed(larkAppId, messageId, topicLookup.lookup);
@@ -435,7 +454,7 @@ export async function replyMessage(
           msg_type: msgType as any,
           content: body,
           ...(replyInThread ? { reply_in_thread: true } : {}),
-          ...(uuid ? { uuid } : {}),
+          uuid: wireUuid,
         },
       });
     } catch (err: any) {
@@ -528,6 +547,7 @@ export async function forwardMessage(
   uuid?: string,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'forwardMessage');
+  const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'forwardMessage', async () => {
     await assertMessageWriteAllowed(larkAppId, messageId);
     const c = getBotClient(larkAppId);
@@ -536,7 +556,7 @@ export async function forwardMessage(
       res = await (c as any).im.v1.message.forward({
         path: { message_id: messageId },
         // NOTE: forward takes `uuid` in params (not data) — unlike create/reply.
-        params: { receive_id_type: 'chat_id', ...(uuid ? { uuid } : {}) },
+        params: { receive_id_type: 'chat_id', uuid: wireUuid },
         data: { receive_id: chatId },
       });
     } catch (err: any) {
@@ -781,6 +801,8 @@ export async function sendUserMessage(
   requestOptions?: LarkRequestOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendUserMessage');
+  content = prepareLocalAddressContent(content, msgType, linkFieldContext());
+  const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(
     larkAppId,
     'sendUserMessage',
@@ -801,7 +823,7 @@ export async function sendUserMessage(
         receive_id: openId,
         msg_type: msgType as any,
         content: body,
-        ...(uuid ? { uuid } : {}),
+        uuid: wireUuid,
       };
 
       const res = requestOptions
@@ -1292,6 +1314,7 @@ export async function sendEphemeralCard(
   larkAppId: string, chatId: string, openId: string, cardJson: string,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendEphemeralCard');
+  cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext());
   return executeWithLarkGate(larkAppId, 'sendEphemeralCard', async () => {
     const c = getBotClient(larkAppId);
     let card: unknown;
@@ -1357,6 +1380,7 @@ export async function updateMessage(
   const beforeWrite = typeof optionsOrAck === 'object' ? optionsOrAck.beforeWrite : undefined;
   const returnAcknowledgement = optionsOrAck === true || (typeof optionsOrAck === 'object' && optionsOrAck.returnAcknowledgement === true);
   assertLarkTransport(larkAppId, 'updateMessage');
+  cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext());
   return executeWithLarkGate(larkAppId, 'updateMessage', async () => {
     const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
     await assertMessageWriteAllowed(larkAppId, messageId, topicLookup.lookup);
@@ -1434,6 +1458,7 @@ export async function updateCardStreamingSettings(
   settings: CardStreamingSettings,
 ): Promise<void> {
   assertLarkTransport(larkAppId, 'updateCardStreamingSettings');
+  settings = sanitizeLocalAddressNode(settings, linkFieldContext());
   return executeWithLarkGate(larkAppId, 'updateCardStreamingSettings', async () => {
     await assertMessageWriteAllowed(larkAppId, settings.messageId);
     const c = getBotClient(larkAppId);
@@ -1497,6 +1522,7 @@ export async function patchCardStreamElement(
   messageId?: string,
 ): Promise<void> {
   assertLarkTransport(larkAppId, 'patchCardStreamElement');
+  partialElement = sanitizeLocalAddressNode(partialElement, linkFieldContext());
   return executeWithLarkGate(larkAppId, 'patchCardStreamElement', async () => {
     await assertMessageWriteAllowed(larkAppId, messageId);
     const c = getBotClient(larkAppId);
@@ -2634,7 +2660,7 @@ export type ChatBotMember = {
 type ChatBotListApiItem = { botId: string; botName: string };
 type ChatBotListApiResult =
   | { ok: true; items: ChatBotListApiItem[] }
-  | { ok: false; reason: string; cacheable: boolean };
+  | { ok: false; reason: string; cacheable: boolean; timeoutMs?: number };
 
 /**
  * A bot row returned directly by Feishu's live `/members/bots` endpoint.
@@ -2668,13 +2694,22 @@ export type CurrentChatBotAppResolution =
         | 'subject_lark_app_ambiguous';
       message: string;
       invalidSubjectLarkAppIds?: string[];
+      /** 仅当实时成员查询按 listBotsApiTimeoutMs 本地超时时存在，值为当时生效的上限。 */
+      timeoutMs?: number;
     };
+
+class LarkCallTimeoutError extends Error {
+  constructor(label: string, readonly timeoutMs: number) {
+    super(`${label} timed out after ${timeoutMs}ms`);
+    this.name = 'LarkCallTimeoutError';
+  }
+}
 
 function promiseWithTimeout<T>(p: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return p;
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer = setTimeout(() => reject(new LarkCallTimeoutError(label, timeoutMs)), timeoutMs);
   });
   return Promise.race([p, timeout]).finally(() => {
     if (timer) clearTimeout(timer);
@@ -2704,7 +2739,12 @@ async function listChatBotsViaMembersBots(
       .filter((it: ChatBotListApiItem) => it.botId && it.botName);
     return { ok: true, items };
   } catch (err: any) {
-    return { ok: false, reason: err?.message ?? String(err), cacheable: true };
+    return {
+      ok: false,
+      reason: err?.message ?? String(err),
+      cacheable: true,
+      ...(err instanceof LarkCallTimeoutError ? { timeoutMs: err.timeoutMs } : {}),
+    };
   }
 }
 
@@ -2753,6 +2793,7 @@ export async function resolveCurrentChatBotOpenIdsByLarkAppIds(
       ok: false,
       error: 'live_membership_unavailable',
       message: `live_chat_bot_members_unavailable: ${live.reason}`,
+      ...(live.timeoutMs !== undefined ? { timeoutMs: live.timeoutMs } : {}),
     };
   }
 
@@ -2837,6 +2878,7 @@ export async function resolveCurrentChatBotOpenIdsByLarkAppIds(
         error: 'live_membership_unavailable',
         message: `is_in_chat failed for ${appId}: ${err?.message ?? String(err)}`,
         invalidSubjectLarkAppIds: subjectLarkAppIds.includes(appId) ? [appId] : undefined,
+        ...(err instanceof LarkCallTimeoutError ? { timeoutMs: err.timeoutMs } : {}),
       };
     }
   }

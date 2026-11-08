@@ -12,6 +12,7 @@ import { OutputDeliveryTerminalError } from '../src/services/output-delivery-coo
 import { loadWorkerPoolClosure, loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
 import { committedCodexAppSequence, hasUnsettledCodexAppDispatch } from '../src/utils/codex-app-dispatch-ledger.js';
 import { FINAL_HANDOFF_DELIVERY_REASON, FINAL_HANDOFF_WAIT_REASON } from '../src/core/worker-pool.js';
+import { raiseDaemonAttention } from '../src/core/session-activity.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import type { WorkerFinalOutput } from '../src/types.js';
 
@@ -82,7 +83,7 @@ describe('attention lifecycle', () => {
       evaluateTalk: () => { const a = talkAllowed(); return { allowed: a, reason: a ? 'allowedUser' : (options.talkReason ?? 'none') }; },
       FinalOutputHandoffStore: { exists: () => options.v1Exists ?? false },
       finalOutputHandoffHost: () => ({ store: { attentionPending: () => options.v1Attention ? {} : undefined } }),
-      readBridgeTurnJournal: () => options.bridgeEntries ?? [], publishAttentionPatch, join,
+      readBridgeTurnJournal: () => options.bridgeEntries ?? [], publishAttentionPatch, raiseDaemonAttention, join,
       FINAL_HANDOFF_WAIT_REASON, FINAL_HANDOFF_DELIVERY_REASON,
       privateReplyEnabled: () => options.privateReplyOn ?? false,
       asyncTriggerStore: { lookupStrict: () => undefined },

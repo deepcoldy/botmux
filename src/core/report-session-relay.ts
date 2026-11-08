@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import type { VcMeetingLiveManagedOrigin } from '../services/vc-meeting-send-policy.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
-import { resolveVerifiedDispatchReportTarget } from './dispatch-report-binding.js';
+import { resolveVerifiedDispatchReportTarget, type SignedDispatchReportBinding } from './dispatch-report-binding.js';
+import { REPORT_SOURCE_REPLY_ROUTE } from './report-source-reply.js';
 import type { ProjectWorkstreamStatus } from '../services/project-group-store.js';
 
 export const REPORT_SESSION_RELAY_ROUTE = '/api/report-relay';
@@ -66,6 +67,7 @@ export type ReportSessionRelayDecision =
       relayFallback?: true;
       publishTo?: 'thread' | 'chat';
       deliveryKey?: string;
+      replyBinding?: SignedDispatchReportBinding;
       projectUpdate: {
         status?: ProjectWorkstreamStatus;
         progress?: number;
@@ -264,6 +266,10 @@ export function authorizeReportSessionRelayRequest(
     };
   }
 
+  if (resolved.binding.reply && current.larkAppId !== resolved.binding.reply.reporterLarkAppId) {
+    return { ok: false, status: 403, error: 'report_reply_reporter_mismatch' };
+  }
+
   return {
     ok: true,
     source: { sessionId: current.sessionId, larkAppId: current.larkAppId, chatId: current.chatId },
@@ -277,6 +283,8 @@ export function authorizeReportSessionRelayRequest(
     sourceName: resolved.binding.sourceName,
     content,
     delivery,
+    ...(resolved.binding.reply && delivery === 'relay' && projectStatus === 'completed'
+      ? { replyBinding: (input.registry[dispatchRoot] as { reportBinding: SignedDispatchReportBinding }).reportBinding } : {}),
     ...(verified.relayFallback ? { relayFallback: true as const } : {}),
     ...(delivery !== 'relay' ? {
       publishTo,
@@ -572,6 +580,20 @@ export async function deliverReportSessionRelay(input: {
 }): Promise<{ status: number; body: Record<string, unknown> }> {
   const { decision } = input;
   if (input.beforeWrite) await input.beforeWrite();
+  if (decision.replyBinding) {
+    const direct = await input.fetchTarget(REPORT_SOURCE_REPLY_ROUTE, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ dispatchRoot: decision.dispatchRoot, binding: decision.replyBinding,
+        sourceLarkAppId: decision.source.larkAppId, content: decision.content }),
+    });
+    const body = await direct.json().catch(() => ({})) as Record<string, unknown>;
+    // 新输入或取消到达后，由原会话处理结果；未知的发布结果不切换出口。
+    if (direct.status !== 409 || body.error !== 'report_reply_source_changed') {
+      const project = direct.ok ? await input.postProjectUpdate(decision.target) : { projectSynced: false };
+      return { status: direct.status, body: { ...body, reportTarget: decision.target, ...project } };
+    }
+    if (input.beforeWrite) await input.beforeWrite();
+  }
   const response = await input.fetchTarget('/api/trigger', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },

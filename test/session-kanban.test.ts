@@ -65,9 +65,11 @@ describe('deriveKanbanColumn', () => {
     expect(deriveKanbanColumn({ status: 'closed', kanbanColumn: 'in_progress' })).toBe('done');
   });
 
-  it('manual placement wins over runtime derivation', () => {
-    expect(deriveKanbanColumn({ status: 'working', kanbanColumn: 'backlog' })).toBe('backlog');
+  it('manual placement wins until the task state changes', () => {
+    expect(deriveKanbanColumn({ status: 'idle', kanbanColumn: 'backlog' })).toBe('backlog');
     expect(deriveKanbanColumn({ status: 'idle', kanbanColumn: 'done' })).toBe('done');
+    expect(deriveKanbanColumn({ status: 'idle', kanbanColumn: 'done', kanbanColumnAt: 2_000, lastMessageAt: 1_000 })).toBe('done');
+    expect(deriveKanbanColumn({ status: 'idle', kanbanColumn: 'done', kanbanColumnAt: 1_000, lastMessageAt: 2_000 })).toBe('todo');
   });
 
   it('falls back to runtime derivation when manual value is invalid', () => {
@@ -93,7 +95,8 @@ describe('deriveKanbanColumn', () => {
 
 describe('effectiveKanbanPosition', () => {
   it('pinned positions sort before unpinned cards', () => {
-    const pinned = effectiveKanbanPosition({ kanbanPosition: 99999, lastMessageAt: Date.now() });
+    const now = Date.now();
+    const pinned = effectiveKanbanPosition({ kanbanColumn: 'todo', kanbanColumnAt: now, kanbanPosition: 99999, lastMessageAt: now });
     const unpinned = effectiveKanbanPosition({ lastMessageAt: Date.now() });
     expect(pinned).toBeLessThan(unpinned);
   });

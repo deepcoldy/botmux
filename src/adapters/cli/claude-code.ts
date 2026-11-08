@@ -33,6 +33,7 @@ import { wrapBracketedPaste } from './tui-input.js';
 import { delay, scaleMs } from '../../utils/timing.js';
 import { discoverClaudeFamilySessions } from '../../services/resumable-session-discovery.js';
 import { builtinPluginDirForSession } from '../../skills/workflow-node-plugin-dir.js';
+import { decideStartupSwitchConfirm } from '../../utils/claude-switch-confirm.js';
 
 /** Resolve cwd to its canonical (symlink-free) absolute path for project-hash
  *  computation. Claude Code itself runs `process.cwd()` which the kernel returns
@@ -815,7 +816,18 @@ export function findOpenClaudeSessionIds(pid: number, dataDir: string = DEFAULT_
 function findJsonlAcrossProjectsRoot(
   searchPath: string,
   fingerprint: string,
-  options: { minMtimeMs?: number; minEventTimestampMs?: number; includeQueueOperations?: boolean },
+  options: {
+    minMtimeMs?: number;
+    minEventTimestampMs?: number;
+    includeQueueOperations?: boolean;
+    /** Include Task/Agent subagent transcripts (<sid>/subagents/*.jsonl).
+     *  Only safe for boolean "did the prompt land" checks: the matched
+     *  subagent path must NOT be pinned as the watched session jsonl. */
+    includeSubagentTranscripts?: boolean;
+    /** Also match queued_command attachments. Same restriction: boolean
+     *  checks only, never pin the match. */
+    includeQueuedCommandAttachments?: boolean;
+  },
 ): string | null {
   if (fingerprint.length < CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN) return null;
   const primaryDir = dirname(searchPath);
@@ -1322,7 +1334,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // replyDelivery=transcript：系统提示改口为「最终回复由 botmux 自动转发」。v3 workflow
       // 子会话（GOAL_ENV.V3_MARKER）的收口靠 botmux send，强制保持 send 措辞。
       const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, larkToolAppId, replyDelivery: effectiveReplyDelivery, solo }));
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({ locale, botName, botOpenId, noTransport, triggerUserAuth, larkToolAppId, replyDelivery: effectiveReplyDelivery, solo, cliId: 'claude-code' }));
       return args;
     },
 
@@ -1349,6 +1361,11 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         return !!current && current !== path && !!readDeltaText(current, 0)?.includes(marker);
       };
     },
+
+    // `/effort <level>` / `/model <name>` replayed into a resumed conversation
+    // whose prompt cache may still be warm: Claude asks before re-reading the
+    // history, and records the command only once that is answered.
+    startupCommandConfirmation: decideStartupSwitchConfirm,
 
     async writeInput(pty, content) {
       // HERDR advertises an explicit bracketed-paste frame: send the complete
@@ -1453,12 +1470,19 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         // drift like worker thinking `-foo-bar/` while Claude actually appends
         // to `-foo-bar-baz/`). Same minMtime guard as the in-band fingerprint
         // fallback so a stale historical match can't suppress the warning.
+        // Subagent transcripts and queued_command attachments are included
+        // here only (boolean use — the matched path is never pinned): while
+        // the TUI views a subagent, a prompt is recorded solely in
+        // <sid>/subagents/*.jsonl, as a queued_command attachment written at
+        // the agent's next step when it is still running.
         const searchPath = currentPath ?? pty.claudeJsonlPath;
         if (!searchPath) return false;
         const matched = findJsonlAcrossProjectsRoot(searchPath, submitFingerprint, {
           minMtimeMs: submitSearchMinMtime,
           minEventTimestampMs: submitSearchMinMtime,
           includeQueueOperations: true,
+          includeSubagentTranscripts: true,
+          includeQueuedCommandAttachments: true,
         });
         return !!matched;
       };
@@ -1625,6 +1649,28 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // jsonl append by 5–15s. The worker calls recheck() after a delay, and
       // suppresses the user-facing warning when the line shows up by then.
       return { ...buildResult(false), recheck };
+    },
+
+    // One-shot re-submit for a draft parked in the composer (the cold-start
+    // late-SessionStart rescue in scheduleSubmitFailureNotify). Uses the SAME
+    // submit-key resolution as writeInput: with a remapped submit
+    // (keybindings.json / CLAUDE_CODE_SUBMIT_KEY, Enter possibly bound to
+    // chat:newline) plain Enter would only insert a newline and strand the
+    // draft again. False means no terminal-sendable submit key or an
+    // unconfirmed backend send — the caller must not guess with another key.
+    pressComposerSubmit(pty) {
+      const keybindings = resolveClaudeChatKeybindings(join(variant.dataDir, 'keybindings.json'));
+      try {
+        if (pty.sendSpecialKeys && keybindings.submitKeys) {
+          return pty.sendSpecialKeys(...keybindings.submitKeys) !== false;
+        }
+        if (!pty.sendSpecialKeys && keybindings.rawSubmitSequence) {
+          return pty.write(keybindings.rawSubmitSequence) !== false;
+        }
+      } catch {
+        return false;
+      }
+      return false;
     },
 
     completionPattern: COMPLETION_RE,

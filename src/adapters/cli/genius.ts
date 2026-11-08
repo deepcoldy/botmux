@@ -143,6 +143,7 @@ export function createGeniusAdapter(pathOverride?: string): CliAdapter {
           asksViaHook: false,
           whiteboardEnabled: whiteboardEnabled(),
         }),
+        cliId: 'genius',
       }));
       if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
       return args;

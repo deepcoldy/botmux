@@ -1,3 +1,8 @@
+// 第一个 import：测试围栏（unit-setup / bun-test-fence）没生效时整个文件直接拒跑。
+// 本文件的会话启动链路会经 ensureCliSkills 往 homedir() 推导的目录装 CLI 钩子和配置
+// （~/.config/opencode/plugin/botmux-ask.js、~/.trae/traecli.toml、~/.codex/config.toml）；
+// 2026-11-06 一次绕过 setupFiles 的全量运行里，真实的 opencode 插件就是这样被改写的。
+import { isInsideDir } from './helpers/require-fenced-data-dir.js';
 import { EventEmitter, once } from 'node:events';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { applyQueuedCodexAppLegacyFallback } from '../src/core/session-create.js';
@@ -312,6 +317,11 @@ import { retireCodexAppDispatchAfterBackingMissing } from '../src/utils/codex-ap
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
+
+// 上面那些钩子和配置都按 homedir() 落盘：HOME 不在本文件的测试围栏内就拒绝加载，一个文件都不写。
+if (!isInsideDir(homedir(), process.env.__TEST_DATA_DIR_FENCE)) {
+  throw new Error(`refusing to run: HOME ${homedir()} is not inside the test fence`);
+}
 
 // The session working directory these fixtures point at. It must exist:
 // forkWorker refuses to start a CLI whose directory is gone (it no longer falls
@@ -2558,10 +2568,10 @@ describe('ordinary IM worker receipt acknowledgement', () => {
   it('reports an unstageable pre-admission rejection as a known non-execution', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_reply');
-    // The daemon declines the handoff — this is the real fallback path: the XPI
-    // switch is off, or the rejection lacked a safe reroute envelope/owner. The
-    // delivery then falls back to retry/fail, and its terminal notice must still
-    // describe a KNOWN outcome: the turn never entered the worker queue.
+    // The daemon declines the handoff — the XPI switch TTL-skew path (the daemon
+    // already reads the switch off). The delivery falls back to retry/fail, and
+    // its terminal notice must still describe a KNOWN outcome: the turn never
+    // entered the worker queue.
     const onOrdinaryImInputRejected = vi.fn(async () => false);
     initWorkerPool({
       sessionReply,
@@ -2726,6 +2736,63 @@ describe('ordinary IM worker receipt acknowledgement', () => {
       .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
     expect(businessSends).toHaveLength(1);
     expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it('fails a deterministic rejection the daemon cannot reroute at once as not executed, without retrying', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const onOrdinaryImInputRejected = vi.fn(async () => 'not_executed' as const);
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => REPO,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onOrdinaryImInputRejected,
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+
+    // A peer bot's message arrives while a caller-less scheduled turn runs, so
+    // the daemon has no principal to ask for confirmation.
+    const peerBot = {
+      requestUserOpenId: 'ou_peer_bot',
+      requestUserUnionId: 'on_peer_bot',
+      requestLarkAppId: 'app_test',
+      senderType: 'bot' as const,
+    };
+    expect(sendWorkerInput(ds, 'business turn', 'om_business', { trustedCaller: peerBot })).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    const rejection = {
+      type: 'turn_input_rejected',
+      turnId: 'om_business',
+      reason: 'cross_principal_requires_owner_confirmation',
+      rejectedBeforeAdmission: true,
+      activeTurnId: 'schedule:abcd1234:00000000-0000-4000-8000-000000000000',
+    };
+    worker.emit('message', rejection);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
+    worker.emit('message', rejection);
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(onOrdinaryImInputRejected).toHaveBeenCalledTimes(1);
+    const businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(1);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    const terminal = String(sessionReply.mock.calls[0]?.[1]);
+    expect(terminal).toContain('没有被执行');
+    expect(terminal).toContain('om_business');
+    expect(terminal).toContain('cross_principal_requires_owner_confirmation');
+    expect(terminal).not.toContain('无法确认这条消息是否已进入 Worker 的执行队列');
   });
 
   it('retries the exact turn once and reports a visible failure when no receipt ACK arrives', async () => {
@@ -4887,7 +4954,7 @@ describe('ordinary Claude semantic recovery', () => {
       'interactive',
       'app_test',
       'om_adopted',
-      { sourceSessionId: 'sid-start-test' },
+      expect.objectContaining({ sourceSessionId: 'sid-start-test' }),
     ));
     expect(ds.session.ordinaryTurnRecovery).toBeUndefined();
     expect(ds.agentAttention).toEqual(expect.objectContaining({
@@ -9208,6 +9275,15 @@ describe('forkWorker session agent config freeze', () => {
 
   // ── An EXPLICIT per-trigger override (trigger API options.model) still wins
   //    over the bot config — that is the only thing that outranks it now. ──
+  it.each([false, true])('explicit pin reaches the actual worker init on fresh/restore spawn (resume=%s)', resume => {
+    const ds = makeDs();
+    ds.session.modelPin = { model: 'gpt-6.1-terra', effort: 'high', source: 'topic-header', setBy: 'owner', setAt: new Date().toISOString() };
+    forkWorker(ds, '', resume);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'init', model: 'gpt-6.1-terra', reasoningEffort: 'high', resume }));
+    expect(ds.session.model).toBe('gpt-6.1-terra');
+  });
+
   it('prefers an explicit per-trigger model override over the bot config', () => {
     const ds = makeDs();
     ds.session.cliId = 'codex' as any;
@@ -10179,5 +10255,38 @@ describe('worker pid record', () => {
 
       expect(sessionStore.updateSessionPid).toHaveBeenCalledWith('sid-start-test', pid, readWorkerProcessStart(pid));
     });
+  });
+});
+
+describe('turn failure diagnostics: only a workflow draft clarify session asks its worker for them', () => {
+  const headless = { id: 'hl_draft', createdAt: '2026-11-06T00:00:00.000Z', source: 'cli' as const };
+  const initOf = () => {
+    const worker = forkMock.mock.results.at(-1)!.value;
+    return vi.mocked(worker.send).mock.calls.map(call => call[0]).find(message => message.type === 'init');
+  };
+
+  it('a draft clarify session (marker persisted on session.headless): the init asks for them', () => {
+    const ds = makeDs({ hasHistory: true, chatId: 'headless_hl_draft' });
+    ds.session.chatId = 'headless_hl_draft';
+    ds.session.headless = { ...headless, failureDiagnostics: true };
+    expect(forkWorker(ds, '', true)).toBe(true);
+    expect(initOf()).toMatchObject({ type: 'init', captureTurnFailureDiagnostics: true });
+  });
+
+  it.each([
+    ['an ordinary topic session', undefined, 'oc_chat'],
+    ['a `botmux headless` session', headless, 'headless_hl_draft'],
+    // The transfer into the main topic forks the topic's worker before the
+    // binding is recorded (or the recording never lands): the chat decides.
+    ['a draft clarify session whose transfer into its topic forks the worker', { ...headless, failureDiagnostics: true as const }, 'oc_topic'],
+    ['a draft clarify session already bound into its topic', { ...headless, failureDiagnostics: true as const, boundChatId: 'oc_topic' }, 'oc_topic'],
+  ] as const)('%s: the init does not carry the field at all', (_name, headlessBlock, chatId) => {
+    const ds = makeDs({ hasHistory: true, chatId });
+    ds.session.chatId = chatId;
+    if (headlessBlock) ds.session.headless = { ...headlessBlock };
+    expect(forkWorker(ds, '', true)).toBe(true);
+    const init = initOf();
+    expect(init).toMatchObject({ type: 'init' });
+    expect(Object.keys(init)).not.toContain('captureTurnFailureDiagnostics');
   });
 });

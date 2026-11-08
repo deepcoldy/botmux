@@ -251,6 +251,17 @@ describe('report CLI recipient root and authenticated relay', () => {
     expect(result.outbound).toBeUndefined();
   });
 
+  it('reports the source-topic receipt after a direct reply without sending another copy', async () => {
+    const publicationTarget = { mode: 'thread', rootMessageId: 'om_source', chatId: 'oc_source' };
+    const result = await runReport({ args: ['--dispatch-root', THREAD], relayStatus: 200,
+      relayBody: { ok: true, delivery: 'reply', publishedMessageId: 'om_answer', publicationTarget,
+        reportTarget: { sessionId: 'orchestrator', larkAppId: 'cli_reviewer' } } });
+    expect(result.status).toBe(0);
+    expect(result.output).toMatchObject({ deliveryMode: 'reply', reportedTo: 'om_answer',
+      messageTarget: publicationTarget, relayDelivered: false });
+    expect(result.outbound).toBeUndefined();
+  });
+
   it('returns both destinations when publishing and relaying', async () => {
     const result = await runReport({
       args: ['--dispatch-root', THREAD, '--delivery', 'publish-and-relay'],

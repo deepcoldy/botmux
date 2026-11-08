@@ -262,6 +262,8 @@ export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta
   ['worktree_toggle_mode', NO_META],
   ['retry_last_task', NO_META],
   ['retry_turn', NO_META],
+  // 清理小图并续跑——会注入续跑输入并重载 CLI，等同 restart 级敏感动作。
+  ['purge_images_continue', NO_META],
   ['get_write_link', { denyToastKey: 'card.action.write_link_no_permission' }],
   ['open_local_terminal', { denyToastKey: 'card.action.local_terminal_no_permission' }],
   ['open_local_cli', { denyToastKey: 'card.action.local_cli_no_permission' }],
@@ -289,6 +291,7 @@ export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta
   // 普通回复卡右下角操作菜单（#1877）：展开菜单与模型选择注入都必须过 canOperate。
   ['reply_card_menu', NO_META],
   ['reply_model_pick', NO_META],
+  ['session_model_unpin', NO_META],
   ['session_model_pick', NO_META],
   ['session_effort_pick', NO_META],
   ['session_effort_apply', NO_META],

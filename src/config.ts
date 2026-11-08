@@ -427,6 +427,14 @@ export const config = {
   // without a rebuild. BOTMUX_DISABLE_ORPHAN_TMUX_REAP=1 remains an emergency
   // kill-switch checked inside the reaper itself.
   get reapOrphanTmuxServers(): boolean { return readGlobalConfig().dashboard?.reapOrphanTmuxServers === true; },
+  // Periodic orphan-tmux SESSION sweep. Default ON but REPORT-ONLY: on a timer
+  // it logs displaced botmux servers/panes and never signals anything. Read
+  // live so a Dashboard flip applies to the next tick without a restart.
+  get tmuxOrphanSessionSweep(): boolean { return readGlobalConfig().dashboard?.tmuxOrphanSessionSweep !== false; },
+  // Narrow destructive arm of the session sweep: signal only a proven
+  // taken-over bare-wrapper pane. Default OFF — even with the report sweep on,
+  // no process is killed without an explicit opt-in.
+  get tmuxOrphanSessionBareWrapperKill(): boolean { return readGlobalConfig().dashboard?.tmuxOrphanSessionBareWrapperKill === true; },
   // Live getter (like noVisibleOutputHint): the experimental cross-principal
   // interruption (XPI) switch. Default OFF (absent ⇒ disabled) — with it off the
   // daemon delivers another principal's message normally instead of diverting it

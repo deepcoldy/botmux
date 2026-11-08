@@ -1851,6 +1851,35 @@ describe('bot-config store', () => {
     expect(readConfig()).toMatchObject({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
   });
 
+  it.each(['cursor', 'doubao', 'antigravity'])('invariant backstop: updateBotSandboxMode rejects switching a zero-injection %s bot to scratch (rmwBotEntry path, no promptInjection write)', async cliId => {
+    const { registry } = await loaded({ cliId, promptInjection: 'none' });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    const r = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('zero_prompt_unsupported');
+    expect(readConfig().sandbox).toBeUndefined();
+    expect(registry.getBot('app_default').config.sandbox).not.toBe('scratch');
+    // oncall keeps zero injection working
+    expect((await sandboxStore.updateBotSandboxMode('app_default', 'oncall')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ promptInjection: 'none', sandbox: 'oncall' });
+  });
+
+  it('repair exit: a stored zero-injection cursor+scratch entry can leave scratch', async () => {
+    await loaded({ cliId: 'cursor', promptInjection: 'none', sandbox: 'scratch' });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    expect((await sandboxStore.updateBotSandboxMode('app_default', 'off')).ok).toBe(true);
+    expect(readConfig().sandbox).toBeUndefined();
+    expect(readConfig().promptInjection).toBe('none');
+  });
+
+  it('repair exit: a stored zero-injection cursor+scratch entry can turn zero injection off', async () => {
+    const { store } = await loaded({ cliId: 'cursor', promptInjection: 'none', sandbox: 'scratch' });
+    const r = await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'default');
+    expect(r.ok).toBe(true);
+    expect(readConfig().promptInjection).not.toBe('none');
+    expect(readConfig().sandbox).toBe('scratch');
+  });
+
   it('invariant backstop: updateBotSandboxMode rejects switching a cursor+transcript bot to scratch (rmwBotEntry path, no replyDelivery write)', async () => {
     const { registry } = await loaded({ cliId: 'cursor', replyDelivery: 'transcript' });
     const sandboxStore = await import('../src/services/sandbox-store.js');
@@ -1956,11 +1985,11 @@ describe('bot-config store', () => {
     expect(readConfig().promptInjection).toBeUndefined();
   });
 
-  it('updateBotSandboxPaths refuses `/` / HOME / botmux home and relative entries as readWrite and leaves bots.json untouched', async () => {
+  it('updateBotSandboxPaths refuses `/` / HOME / botmux home / `/run` and relative entries as readWrite and leaves bots.json untouched', async () => {
     const { registry } = await loaded({ sandbox: true, sandboxPaths: { readOnly: ['/opt/ref'] } });
     const sandboxStore = await import('../src/services/sandbox-store.js');
     const { homedir } = await import('node:os');
-    for (const bad of ['/', '//', '~', `${homedir()}/`, '~/.botmux', '~/..', '..', '../..', './rel']) {
+    for (const bad of ['/', '//', '~', `${homedir()}/`, '~/.botmux', '~/..', '..', '../..', './rel', '/run', '//run/']) {
       const r = await sandboxStore.updateBotSandboxPaths('app_default', { readWrite: ['/opt/proj', bad] });
       expect(r.ok, bad).toBe(false);
       if (!r.ok) {

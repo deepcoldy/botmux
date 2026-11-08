@@ -1,5 +1,5 @@
 import { isRemoteCliId } from '../../core/remote-cli-ids.js';
-import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
+import { cliSupportsCompactAction } from '../../core/passthrough-commands.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
 import type { SandboxMode } from '../../adapters/cli/sandbox-mode.js';
@@ -26,6 +26,7 @@ import {
   GRANT_DURATION_OPTIONS,
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
+import { modelPinText } from '../../core/model-pin.js';
 import { BACKGROUND_WAIT_TEMPLATE, STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 import type { StreamingCardButtonId } from './streaming-card-buttons.js';
 import type { SubstituteCardControl } from './substitute-card-control.js';
@@ -524,6 +525,7 @@ export function buildSessionCard(
   localCliReady = false,
   runtimeDisplayName?: string,
   sessionSandbox?: SandboxMode,
+  modelPin?: CardUsageSnapshot['modelPin'],
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const effectiveCliId = cliId ?? 'claude-code';
@@ -561,6 +563,9 @@ export function buildSessionCard(
   } else {
     actions.push(callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }));
   }
+  if (modelPin && !adoptMode) actions.push(callbackButton('解除话题固定', 'default', {
+    action: 'session_model_unpin', ...actionBase, expected_pin_set_at: modelPin.setAt,
+  }));
   const card = wideCard({
     header: cardHeader(`🖥️ ${cliName} · ${plainTitle(title)}`, 'blue'),
     elements: [
@@ -573,6 +578,7 @@ export function buildSessionCard(
             text_size: 'notation',
           }]
         : []),
+      ...(modelPin ? [{ tag: 'div', text: { tag: 'plain_text', content: modelPinText(modelPin) } }] : []),
       { tag: 'action', actions },
     ],
   });
@@ -877,9 +883,18 @@ export function buildRelayedFrozenCard(
 
 /**
  * Feishu card API rejects payloads exceeding ~109 KB (error 230025).
- * Cap markdown content byte size with headroom for card JSON overhead.
+ * Budget is measured in JSON-serialized (escaped: `"`, `\`, control chars)
+ * UTF-8 bytes with headroom for the surrounding card JSON overhead.
  */
 const MAX_CONTENT_BYTES = 100_000;
+
+/**
+ * Estimates the UTF-8 byte length of a string once serialized inside JSON (accounting for
+ * escaping of `"`, `\`, control characters, etc.).
+ */
+export function jsonEscapedByteLength(str: string): number {
+  return Buffer.byteLength(JSON.stringify(str), 'utf-8') - 2;
+}
 
 /**
  * Truncate content to fit within `maxBytes`, keeping the tail (most recent
@@ -888,7 +903,7 @@ const MAX_CONTENT_BYTES = 100_000;
  * tighter budget so the whole card stays under Feishu's ~109 KB hard limit.
  */
 export function truncateContent(content: string, locale?: Locale, maxBytes: number = MAX_CONTENT_BYTES): string {
-  if (Buffer.byteLength(content, 'utf-8') <= maxBytes) return content;
+  if (jsonEscapedByteLength(content) <= maxBytes) return content;
   // Binary search for the longest suffix that fits
   const lines = content.split('\n');
   let lo = 0;
@@ -896,7 +911,7 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
   while (lo < hi) {
     const mid = Math.floor((lo + hi) / 2);
     const candidate = lines.slice(mid).join('\n');
-    if (Buffer.byteLength(candidate, 'utf-8') <= maxBytes - 30) {
+    if (jsonEscapedByteLength(candidate) <= maxBytes - 30) {
       hi = mid;
     } else {
       lo = mid + 1;
@@ -912,11 +927,26 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
     for (let i = lines.length - 1; i >= 0; i--) {
       if (lines[i].trim() !== '') { last = lines[i]; break; }
     }
-    const buf = Buffer.from(last, 'utf-8');
-    let start = Math.min(buf.length, Math.max(0, buf.length - budget));
-    // Step forward past UTF-8 continuation bytes so we never cut a character.
-    while (start < buf.length && (buf[start] & 0xc0) === 0x80) start++;
-    tail = buf.subarray(start).toString('utf-8');
+    let loChar = 0;
+    let hiChar = last.length;
+    while (loChar < hiChar) {
+      const midChar = Math.floor((loChar + hiChar) / 2);
+      const sub = last.slice(midChar);
+      if (jsonEscapedByteLength(sub) <= budget) {
+        hiChar = midChar;
+      } else {
+        loChar = midChar + 1;
+      }
+    }
+    // Defensive: a paired surrogate costs 4 escaped bytes but a lone low
+    // surrogate costs 6, so on well-formed input the minimum always lands on a
+    // pair lead. Only input that already contains an unpaired surrogate can
+    // leave the cut on a trailing low one; skip it so the tail never opens with
+    // a lone low surrogate.
+    if (loChar < last.length && last.charCodeAt(loChar) >= 0xdc00 && last.charCodeAt(loChar) <= 0xdfff) {
+      loChar++;
+    }
+    tail = last.slice(loChar);
   }
   return `${t('card.status.truncated_prefix', undefined, locale)}\n${tail}`;
 }
@@ -1216,7 +1246,8 @@ export function buildStreamingCard(
   // 是最需要 /compact 的一家。百分比是「快满了吗」的提示，与「能不能压缩」无关，用它当
   // 闸门是拿错了判据。
   //
-  // 判据必须**调谓词**（cliHasNoRawPassthroughSurface），不能手写单个 cliId 字面量：
+  // Builder 与 handler 共用压缩能力判断。MiniMax 经帧协议把 /compact 直接交给 ACP，
+  // 不因此开放任意 TUI passthrough；其它无输入面的 runner 仍拒绝。
   //   ① remote CLI（riff/mojo）无本地终端可驱动；
   //   ② 无 raw passthrough 面的 CLI（codex-app/mira/mir/dsh/ebsd）——/compact 走 raw_input
   //      把字面量写进 PTY，绕过 runner 的 `::botmux-<id>:<base64>` 帧协议：dsh 打
@@ -1225,7 +1256,7 @@ export function buildStreamingCard(
   //      resolvePassthroughCommands 对这些 CLI 返回空集拦住，按钮不能把那条路重新打开。
   // dsh 是运行时相关的：dshRuntime='tui' 跑的是 PTY 驱动的 dsh-tui（真交互 TUI），照常显示。
   // handler 侧另有一道同谓词的拒绝兜底（compact_session），两层都不依赖百分比。
-  if (!hidden.has('compact') && !isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
+  if (!hidden.has('compact') && !isRemoteCliId(cliId) && cliSupportsCompactAction(effectiveCliId, { dshRuntime })) {
     headerActions.push(callbackButton(t('card.btn.compact', undefined, locale), 'default', { action: 'compact_session', ...actionBase }));
   }
   // 「⏲️ 闲置自动压缩：开/关」：本会话 opt-in 的闲置自动 /compact（core/idle-auto-compact.ts）。
@@ -1351,6 +1382,13 @@ export function buildStreamingCard(
   // Model auto-fallback notice — pinned as small yellow text at the very bottom of
   // the session card (never a separate message) for as long as the session
   // keeps running on the fallback model.
+  const pinNotice = modelPinText(usage?.modelPin);
+  if (pinNotice) {
+    elements.push({ tag: 'div', text: { tag: 'plain_text', content: pinNotice } });
+    if (!adoptMode) elements.push({ tag: 'action', actions: [callbackButton('解除话题固定', 'default', {
+      action: 'session_model_unpin', ...actionBase, expected_pin_set_at: usage!.modelPin!.setAt,
+    })] });
+  }
   const modelFallbackNotice = cardModelFallbackNotice(usage?.modelFallback, locale);
   if (modelFallbackNotice) {
     elements.push({
@@ -2153,13 +2191,17 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
 
   // 重试建议与按钮由同一个 retryOffer 决定，避免「卡上说能重试但按钮不给」。
   const canRetry = o.retryOffer !== 'none' && !!o.retryTurnId;
-  const adviceKey = o.retryOffer === 'none'
-    ? 'card.turn_failed.no_retry'
-    : !o.retryTurnId
-      ? 'card.turn_failed.no_input'
-      : o.retryOffer === 'safe'
-        ? 'card.turn_failed.retry_safe'
-        : 'card.turn_failed.retry_caveated';
+  // 图片尺寸 400 是会话历史被毒化：任何重试/续跑都会带着同一张图再 400，
+  // 必须优先于通用 no_retry 文案，给出 /clear 恢复指引。
+  const adviceKey = o.errorCode === 'provider_image_too_small'
+    ? 'card.turn_failed.image_too_small'
+    : o.retryOffer === 'none'
+      ? 'card.turn_failed.no_retry'
+      : !o.retryTurnId
+        ? 'card.turn_failed.no_input'
+        : o.retryOffer === 'safe'
+          ? 'card.turn_failed.retry_safe'
+          : 'card.turn_failed.retry_caveated';
   elements.push({ tag: 'markdown', content: t(adviceKey, undefined, locale) });
 
   const actions: any[] = [];
@@ -2184,6 +2226,21 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
         // handler 据此决定提交「原话」还是「续跑指令」。渲染与执行读同一个
         // retryOffer，卡上写的语义就是真正会发生的事。
         mode: o.retryOffer === 'safe' ? 'resend' : 'continue',
+        ...actionBase,
+      },
+    });
+  }
+  // 小图毒化：普通「继续」会把同一张图再发一遍、必然再 400。单独给一个
+  // primary 动作——worker 先清洗会话记录再 --resume 重启，随后自动续跑，
+  // 文本上下文保留（无需 /clear）。没有失败轮次凭据（retryTurnId）时不给。
+  if (o.errorCode === 'provider_image_too_small' && o.retryTurnId) {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.purge_images_continue', undefined, locale) },
+      type: 'primary',
+      value: {
+        action: 'purge_images_continue',
+        turn_id: o.retryTurnId,
         ...actionBase,
       },
     });
@@ -2226,6 +2283,9 @@ export interface RecoveryFailedCardOpts {
      *  very turn: keep the pre-existing admin「继续这一轮」button (retry_turn,
      *  continue mode) that recovery cards used to carry. */
     | { kind: 'continue_legacy'; turnId: string }
+    /** A poisoned-history image failure can be repaired in place even when the
+     *  ordinary recovery notice has no re-delivery envelope. */
+    | { kind: 'purge_images'; turnId: string }
     | { kind: 'none'; reason: 'no_input' | 'scheduled' | 'unsupported' };
   terminalUrl?: string;
   locale?: Locale;
@@ -2270,6 +2330,8 @@ export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
     ? t('card.recovery_failed.retry_hint', undefined, locale)
     : o.retry.kind === 'continue_legacy'
       ? t('card.turn_failed.retry_caveated', undefined, locale)
+    : o.retry.kind === 'purge_images'
+      ? t('card.turn_failed.image_too_small', undefined, locale)
     : o.retry.kind === 'retried'
       ? t('card.recovery_failed.retried', {
         who: `<at id=${o.retry.byOpenId}></at>`,
@@ -2304,6 +2366,20 @@ export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
         action: 'retry_turn',
         turn_id: o.retry.turnId,
         mode: 'continue',
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        cli_id: o.cliId ?? 'claude-code',
+      },
+    });
+  }
+  if (o.retry.kind === 'purge_images') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.purge_images_continue', undefined, locale) },
+      type: 'primary',
+      value: {
+        action: 'purge_images_continue',
+        turn_id: o.retry.turnId,
         root_id: o.rootId,
         session_id: o.sessionId,
         cli_id: o.cliId ?? 'claude-code',

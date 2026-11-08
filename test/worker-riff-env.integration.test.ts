@@ -173,7 +173,7 @@ describe('Riff worker session environment', () => {
     }
   }, 25_000);
 
-  it('forwards reply-card usage and the effective feedback policy into the remote sandbox', async () => {
+  it.each(['om_riff_env', 'ml:om_riff_env'])('forwards reply-card usage and frozen session policies into the remote sandbox (%s)', async rootMessageId => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-riff-env-'));
     const sockets = new Set<Socket>();
     let child: ChildProcess | undefined;
@@ -273,7 +273,7 @@ describe('Riff worker session environment', () => {
         type: 'init',
         sessionId: 'sid-riff-env',
         chatId: 'oc_riff_env',
-        rootMessageId: 'om_riff_env',
+        rootMessageId,
         workingDir: root,
         cliId: 'riff',
         backendType: 'riff',
@@ -290,6 +290,7 @@ describe('Riff worker session environment', () => {
             // pane's CLI-side gate from the daemon's authoritative decision.
             BOTMUX_WORKFLOW_ENABLED: 'false',
             BOTMUX_REPLY_STYLE: JSON.stringify({ layout: true, theme: 'vivid' }),
+            ...(rootMessageId.startsWith('ml:') ? { BOTMUX_ROOT_MESSAGE_ID: 'om_wrong', BOTMUX_CHAT_ID: 'oc_wrong', BOTMUX_SESSION_SCOPE: 'chat' } : {}),
           },
         },
         prompt: 'verify remote session environment',
@@ -327,6 +328,9 @@ describe('Riff worker session environment', () => {
         }),
       ]);
       expect(request.config?.env?.BOTMUX_USAGE_DISPLAY).toBe('footer');
+      expect(request.config?.env?.BOTMUX_ROOT_MESSAGE_ID).toBe(rootMessageId);
+      expect(request.config?.env?.BOTMUX_CHAT_ID).toBe('oc_riff_env');
+      expect(request.config?.env?.BOTMUX_SESSION_SCOPE).toBe('thread');
       expect(request.config?.userPrompt).not.toContain('<botmux_host_tools>');
       expect(request.config?.env?.BOTMUX_OWNER_OPEN_ID).toBe('ou_authenticated_owner');
       expect(request.config?.env?.__OWNER_OPEN_ID).toBe('ou_authenticated_owner');

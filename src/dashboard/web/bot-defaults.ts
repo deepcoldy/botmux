@@ -89,7 +89,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     titleKey: 'botDefaults.sectionSessionMode',
     fieldKeys: [
       'botDefaults.groupP2p', 'botDefaults.groupRegular', 'botDefaults.groupMention', 'botDefaults.sgTag',
-      'botDefaults.docSubscribeMode', 'botDefaults.chatManagerTitle', 'botDefaults.sgTagAuthPasteLabel',
+      'botDefaults.docSubscribeMode', 'botDefaults.chatManagerTitle', 'botDefaults.groupSecretaryTitle', 'botDefaults.sgTagAuthPasteLabel',
       'botDefaults.sgTagName', 'botDefaults.sgClosedTagName',
     ],
   },
@@ -98,7 +98,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     id: 'steward',
     tab: 'sessions',
     titleKey: 'botDefaults.sectionSteward',
-    fieldKeys: ['botDefaults.stewardEnabled', 'botDefaults.stewardChat', 'botDefaults.stewardDecisionCards', 'botDefaults.stewardAutoJoin', 'botDefaults.stewardAutoJoinSolo', 'botDefaults.stewardCloseHints', 'botDefaults.stewardGuide'],
+    fieldKeys: ['botDefaults.stewardEnabled', 'botDefaults.stewardChat', 'botDefaults.stewardDecisionCards', 'botDefaults.stewardAutoJoin', 'botDefaults.stewardAutoJoinSolo', 'botDefaults.stewardCloseHints', 'botDefaults.stewardTaskHints', 'botDefaults.stewardGuide'],
   },
   {
     id: 'substitute',
@@ -108,6 +108,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.substituteEnabled', 'botDefaults.substituteTargets', 'botDefaults.substituteChats',
       'botDefaults.substituteExcludedChats', 'botDefaults.substituteReplyMode', 'botDefaults.substituteDisclosure',
       'botDefaults.substituteControlCard', 'botDefaults.substituteTopicGroups', 'botDefaults.substituteTopicActive',
+      'botDefaults.substituteKeywords',
     ],
   },
   {
@@ -227,6 +228,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
     fieldKeys: ['botDefaults.sectionLaunchShell', 'sessionEnv.sectionTitle', 'sessionEnv.inheritLabel', 'sessionEnv.tmuxTitle'],
   },
   { id: 'owner-reminder', tab: 'advanced', titleKey: 'botDefaults.ownerReminderTitle', fieldKeys: ['botDefaults.ownerReminderEnabled', 'botDefaults.ownerReminderText', 'botDefaults.ownerReminderInterval'] },
+  { id: 'long-task-reminder', tab: 'cards', titleKey: 'botDefaults.longTaskReminderTitle', fieldKeys: ['botDefaults.longTaskReminderEnabled', 'botDefaults.longTaskReminderThreshold', 'botDefaults.longTaskReminderInterval'] },
 ];
 
 export function botDefaultsSectionDomId(id: string): string {
@@ -301,6 +303,7 @@ export type BotSubstituteTarget = {
 export type BotSubstituteMode = {
   enabled: boolean;
   targets: BotSubstituteTarget[];
+  keywords?: string[];
   disclosure: 'prefix' | 'none';
   chats?: string[];
   excludedChats?: string[];
@@ -367,6 +370,8 @@ export type BotDefaultsRow = {
   sandboxCapable?: boolean | null;
   /** Worker spawn 实际生效的沙盒模式（含全局 env / legacy readIsolation；null = daemon 太旧）。 */
   effectiveSandboxMode?: 'off' | 'oncall' | 'scratch' | null;
+  /** daemon 环境变量 BOTMUX_SANDBOX 对所有 bot 的强制模式（null = 未强制 / daemon 太旧）。 */
+  sandboxEnvForce?: 'oncall' | 'scratch' | null;
   brandLabel?: string | null;
   /** Sparse per-bot reply-card style override; null means all built-in defaults. */
   replyStyle?: ReplyStyleConfig | null;
@@ -509,6 +514,8 @@ export type BotDefaultsRow = {
   logicalSessionCount?: number;
   residentSessionCount?: number;
   dormantSessionCount?: number;
+  /** Per-bot native execution reminder preferences; absent means opt-in defaults. */
+  longTaskReminder?: import('../../services/long-task-reminder-policy.js').LongTaskReminderConfig | null;
   sessionOwnerReminder?: {
     enabled: boolean;
     intervalMinutes: number;
@@ -536,6 +543,7 @@ export type BotDefaultsRow = {
   groupJoinCommand?: string;
   autoStartOnNewTopic?: boolean;
   chatManagerEnabled?: boolean;
+  groupSecretaryEnabled?: boolean;
   autoStartExcludedChats?: string[];
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;

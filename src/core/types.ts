@@ -102,7 +102,9 @@ export interface DaemonSession {
   workerReady?: boolean;
   /** True while the CURRENT CLI generation's prompt is known idle/ready.
    *  Set by the worker's `prompt_ready` IPC; cleared on spawn / restart /
-   *  `claude_exit` / worker retirement. Deliberately NOT cleared by the
+   *  `claude_exit` / worker retirement, and when a MiniMax compact card request
+   *  is accepted for delivery. A false value can therefore also mean a pending
+   *  or in-flight compact on a live worker. Deliberately NOT cleared by the
    *  worker's `ready` IPC: `prompt_ready` frequently arrives BEFORE `ready`
    *  (riff / mojo synthesize the first one inside spawnCli, fast TUIs under
    *  Herdr do too), so clearing on `ready` would erase a just-set value.
@@ -249,6 +251,8 @@ export interface DaemonSession {
    *  Kept (not cleared after the first spawn) so a spawn retry or an in-boot
    *  re-fork of the same session launches identically. */
   spawnModelOverride?: string;
+  /** Formerly pinned workers must also clear their effort launch snapshot. */
+  modelPinCleared?: boolean;
   /** True while this session's worker sits in the crash-loop park state: its CLI
    *  is dead, a diagnostic shell is parked, and the NEXT message makes the worker
    *  respawn the CLI itself from its own `lastInitConfig` snapshot — a launch with
@@ -444,6 +448,11 @@ export interface DaemonSession {
    *  never recorded; its settlement reports the run instead of closing it
    *  quietly. In-memory: a restart closes unmaterialized hidden runs anyway. */
   deferredScheduleUndeliveredTurnId?: string;
+  /** The turn a task-position hidden run was re-fired to before it materialized,
+   *  until a worker frame carries that id. Until then an unattributed frame may
+   *  be the previous turn's tail and must not settle the new turn. In-memory,
+   *  like deferredScheduleUndeliveredTurnId. */
+  deferredScheduleUnconfirmedTurnId?: string;
   /** Turn-exact ids for loud external triggers whose connector opted into
    *  suppressFinalOutput. Only the daemon-rendered final_output reply is dropped
    *  (the streaming card / start notice still show); keyed on the trigger turn
@@ -473,9 +482,15 @@ export interface DaemonSession {
   /** Native write observations, scoped to the worker generation and exact attempt. */
   replyExecutionStarts?: Map<string, {
     startedAtMs: number; workerGeneration: number;
+    /** Exact terminal observed; retain timing for reply rendering, suppress reminders. */
+    completed?: boolean;
     stage?: 'model_output' | 'tool_started' | 'tool_returned';
     lastProgressAtMs?: number;
   }>;
+  /** Bounded terminal facts keyed by worker generation, turn and exact attempt.
+   * Values are receipt epoch milliseconds, also fencing older legacy starts
+   * when a compatibility terminal omitted its attempt before any start arrived. */
+  replyExecutionTerminals?: Map<string, number>;
   /** Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming
    *  card disabled). The bot reacts 冲! on each user message the moment it's accepted for the session
    *  (bound to the message, NOT a worker status edge — so type-ahead / busy-
@@ -762,6 +777,14 @@ export interface DaemonSession {
   lastCodexAppInput?: CodexAppTurnInput;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
+  /** Lark turns that a still-running Claude background task was launched
+   *  from, as last reported by THIS worker generation
+   *  (`background_task_pins_sync`). Their replyTargets records are exempt from
+   *  eviction like a live CronCreate task's (see replyTargetPinnedTurnIds), so
+   *  the task's wake answer still finds its topic after many newer turns.
+   *  In-memory only and cleared when the worker exits: the anchors live in
+   *  the worker's memory, so a new worker never forwards an older one's wake. */
+  backgroundTaskPinnedTurnIds?: readonly string[];
   /** One-shot runtime flag set by the daemon when creating a substitute
    *  (分身) session. The worker-pool consumes and clears it once the worker
    *  reports ready, triggering a one-time substitute control card post so the
@@ -795,6 +818,11 @@ export interface DaemonSession {
     content?: string;
     errorCode?: 'trigger_failed';
     terminalErrorCode?: string;
+    /** In memory only (never in the durable async store): the provider's raw
+     *  error text and the screen tail the worker's failed terminal carried,
+     *  masked and clipped (services/turn-failure-diagnostics). */
+    terminalErrorDetail?: string;
+    terminalScreenTail?: string;
     interruptedAt?: number;
     usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;
@@ -952,8 +980,11 @@ export interface DaemonSession {
    *  Cleared when the user next replies to the session or when the session
    *  closes. Distinct from tuiPromptCardId (which is a
    *  rendered TUI menu detected by screen-analyzer) — this is deliberate,
-   *  agent-initiated, and carries no rendered options. */
-  agentAttention?: { kind: string; reason: string; at: number };
+   *  agent-initiated, and carries no rendered options. `source: 'agent'` marks
+   *  the agent's own raise; daemon-raised failure notices leave it unset. */
+  agentAttention?: { kind: string; reason: string; at: number; source?: 'agent' };
+  /** Start of the current busy stretch (edge into starting/working/analyzing). */
+  busySinceAt?: number;
   /** 文档评论入口（/watch-comment / /subscribe-lark-doc）：本会话「来自文档评论的轮」的回复落点
    *  映射。key = turnId（= 触发评论的 reply_id/comment_id，随消息传给 worker 再
    *  随 final_output 传回）；value = 该回哪个文档的哪条评论。deliverFinalOutput
