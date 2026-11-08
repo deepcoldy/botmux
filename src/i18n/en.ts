@@ -2173,13 +2173,13 @@ export const messages: Record<string, string> = {
   // ─── i18n coverage v2: shared fragments + cards + chat messages ───────────
   'common.operator': 'By: {by}',
   'common.empty_paren': '(empty)',
-  'common.truncated_short': '…(truncated)',
 
   // Ask card
   'card.ask.field.deadline': 'Deadline',
   'card.ask.field.answerable': 'Can answer',
   'card.ask.question_n': 'Question {n}',
   'card.ask.prompt_truncated': '(The question is too long and was truncated in this card; see the attached file in this thread for the full text.)',
+  'card.ask.descriptions_truncated': '(Option details are too long and were truncated in this card; see the attached file in this thread for the full text.)',
   'card.ask.submit': 'Submit',
   'card.ask.submit_confirm_empty': 'Confirm empty submit',
   'card.ask.empty_warning': "⚠️ You haven't selected any option. Multi-select allows choosing none; if you really mean an empty answer, click \"Confirm empty submit\" again, otherwise select first and submit.",

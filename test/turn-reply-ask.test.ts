@@ -376,6 +376,7 @@ describe('Ask inside the running reply card', () => {
     expect(replyCardAskTarget(ds, input, { originTurnId: 'om_other' })).toBeUndefined();
     expect(replyCardAskTarget(ds, { ...input, chatId: 'oc_other' }, origin)).toBeUndefined();
     expect(replyCardAskTarget(ds, input, { ...origin, originDispatchAttempt: 2 })).toBeUndefined();
+    expect(replyCardAskTarget(ds, { ...input, mentionedOpenId: 'ou_human' }, origin)).toBeUndefined();
     expect(replyCardAskTarget(ds, { ...input, questions: [{ ...input.questions[0], prompt: '文'.repeat(2000) }] }, origin)).toBeUndefined();
     expect(replyCardAskTarget(ds, { ...input, questions: [{ prompt: 'Details', options: [], multiSelect: false, input: { type: 'text' } }] }, origin)).toBeUndefined();
     const group = { ...ds, scope: 'chat' as const };
@@ -422,11 +423,11 @@ describe('Ask inside the running reply card', () => {
   });
 });
 
-// ─── 内嵌 ask 的 askOptionLayout 受控（PR #1587 评审建议同批项） ─────────────
-// unified/final-only 模式下 ask 内嵌在实时回复卡（Card JSON 2.0，独立渲染路径），
-// 必须与独立卡读同一个 per-bot 布局配置。
 describe('buildTurnReplyAskElements — 选项说明', () => {
-  it('混合 choice/input 批次在文字作答视图保留 choice descriptions', () => {
+  const notes = (elements: Array<Record<string, any>>) => elements
+    .filter(element => element.tag === 'markdown' && element.text_size === 'notation').map(element => element.content).join('\n');
+
+  it('文字作答批次不画按钮，但选项说明照常展示', () => {
     const elements = buildTurnReplyAskElements(inlineAskWithQuestions([
       { prompt: '发布方式', multiSelect: false, options: [
         { key: 'gray', label: '灰度', description: '先放 5% 流量观察' },
@@ -434,27 +435,54 @@ describe('buildTurnReplyAskElements — 选项说明', () => {
       ] },
       { prompt: '补充说明', multiSelect: false, options: [], inputMode: 'text' },
     ]));
-    const blob = JSON.stringify(elements);
-    expect(blob).toContain('灰度：先放 5% 流量观察');
-    expect(blob).toContain('全量：立即放开所有流量');
-    expect(blob).not.toContain('ask_select');
+    expect(notes(elements)).toContain('先放 5% 流量观察');
+    expect(notes(elements)).toContain('立即放开所有流量');
+    expect(JSON.stringify(elements)).not.toMatch(/ask_select|ask_toggle/);
   });
 
-  it('把每条 inline description 截到展示上限，避免合法载荷挤爆卡片预算', () => {
-    const marker = 'TAIL-MARKER';
-    const description = `${'详'.repeat(900)}${marker}`;
+  it('选项里的 at 标签不会变成真实点名，实体解码后也不会', () => {
     const elements = buildTurnReplyAskElements(inlineAskWithQuestions([
-      { prompt: '选择', multiSelect: true, options: Array.from({ length: 10 }, (_, i) => (
-        { key: `k${i}`, label: `选项 ${i}`, description }
-      )) },
+      { prompt: '选择', multiSelect: false, options: [
+        { key: 'a', label: '<at id=ou_label></at>', description: '<at id=all></at> 和 <at id=ou_desc></at>' },
+        { key: 'b', label: 'B' },
+      ] },
     ]));
-    const blob = JSON.stringify(elements);
-    expect(blob).toContain(`${'详'.repeat(400)}…`);
-    expect(blob).not.toContain(marker);
-    expect(Buffer.byteLength(blob, 'utf8')).toBeLessThan(15_000);
+    expect(notes(elements).replace(/&lt;/g, '<').replace(/&gt;/g, '>')).not.toMatch(/<at\b/);
+  });
+
+  // replyCardAskTarget admits at most 3000 bytes of questions JSON. `<` grows fourfold once
+  // escaped, and a described label is drawn twice in a text batch: the two worst shapes.
+  const fillGate = (questions: (n: number) => PendingAsk['questions']) => {
+    let n = 0;
+    while (Buffer.byteLength(JSON.stringify(questions(n + 1)), 'utf8') <= 3000) n++;
+    return questions(n);
+  };
+  it.each([
+    ['长说明', fillGate(n => [{ prompt: '选择', allowCustom: false, multiSelect: false, options: [
+      { key: 'a', label: 'A', description: `${'<'.repeat(n)}TAIL-A` },
+      { key: 'b', label: 'B', description: `${'<'.repeat(n)}TAIL-B` },
+    ] }])],
+    ['文字批次里的长标签', fillGate(n => [
+      { prompt: '选择', allowCustom: false, multiSelect: false, options: [
+        { key: 'a', label: `${'<'.repeat(n)}A`, description: 'TAIL-A' },
+        { key: 'b', label: `${'<'.repeat(n)}B`, description: 'TAIL-B' },
+      ] },
+      { prompt: '补充', multiSelect: false, options: [], inputMode: 'text' },
+    ])],
+  ])('能进回复卡的最大选项说明完整展示，整卡仍在请求体上限内（%s）', async (_shape, questions) => {
+    const ds = { larkAppId: 'app', chatId: 'oc_chat', replyCardRunningTurnId: 'om_turn',
+      session: { sessionId: 'sid', rootMessageId: 'om_root' } } as DaemonSession;
+    expect(replyCardAskTarget(ds, { ...input, questions }, { originTurnId: 'om_turn' })).toBeDefined();
+    await ask({ questions });
+    expect(body).toContain('TAIL-A');
+    expect(body).toContain('TAIL-B');
+    expect(turnReplyCardRequestBytes(body, 'oc_chat')).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
   });
 });
 
+// ─── 内嵌 ask 的 askOptionLayout 受控（PR #1587 评审建议同批项） ─────────────
+// unified/final-only 模式下 ask 内嵌在实时回复卡（Card JSON 2.0，独立渲染路径），
+// 必须与独立卡读同一个 per-bot 布局配置。
 describe('buildTurnReplyAskElements — askOptionLayout 受控', () => {
   function makeInlineAsk(): any {
     return {

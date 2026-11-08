@@ -7,29 +7,35 @@ export type AskQuestionParseError =
   | 'duplicate_option_key' | 'bad_questions' | 'bad_question_shape'
   | 'bad_allowCustom' | 'bad_multiSelect' | 'bad_defaultSelectedKeys' | 'bad_inputMode' | 'bad_input';
 
-/** 选项说明长度上限（卡片渲染还会再截到 400 字，这里只给 IPC 兜底）。 */
+/** 选项说明长度上限（IPC 兜底；卡片放不下时由渲染层按字节预算截断并附全文）。 */
 const MAX_OPTION_DESCRIPTION = 1000;
 
-/** 校验单个 option 对象，返回解析后的 AskOption 或错误码。 */
-export function parseOption(o: unknown): AskOption | AskQuestionParseError {
+/** 校验单个 option 对象，返回解析后的 AskOption 或错误码。
+ *  `clampDescription`：超长说明截到上限而非拒收——hook 来的问题由上游 CLI 生成，
+ *  整张 ask 被拒会让模型的提问直接失败；显式 CLI 仍 fail loud。 */
+export function parseOption(o: unknown, opts?: { clampDescription?: boolean }): AskOption | AskQuestionParseError {
   if (!o || typeof o !== 'object') return 'bad_option_shape';
   const oo = o as Record<string, unknown>;
   if (typeof oo.key !== 'string' || !oo.key.trim()) return 'bad_option_key';
   if (typeof oo.label !== 'string') return 'bad_option_label';
   // 可选 description（AskUserQuestion options[].description）：空白归一化为
-  // undefined，非字符串/超长 fail loud，避免选项说明被静默丢弃。
+  // undefined，非字符串 fail loud，避免选项说明被静默丢弃。
   let description: string | undefined;
   if (oo.description !== undefined && oo.description !== null) {
     if (typeof oo.description !== 'string') return 'bad_option_description';
     const trimmed = oo.description.trim();
-    if (trimmed.length > MAX_OPTION_DESCRIPTION) return 'bad_option_description';
-    if (trimmed) description = trimmed;
+    if (trimmed.length > MAX_OPTION_DESCRIPTION) {
+      if (!opts?.clampDescription) return 'bad_option_description';
+      // 不切断 UTF-16 代理对。
+      const head = trimmed.slice(0, MAX_OPTION_DESCRIPTION - 1);
+      description = `${/[\uD800-\uDBFF]$/.test(head) ? head.slice(0, -1) : head}…`;
+    } else if (trimmed) description = trimmed;
   }
   return description ? { key: oo.key, label: oo.label, description } : { key: oo.key, label: oo.label };
 }
 
 /** 校验 questions[] 数组，返回解析后的 AskQuestion[] 或错误码。 */
-export function parseAskQuestions(arr: unknown, options?: { allowSingleOption?: boolean }): AskQuestion[] | AskQuestionParseError {
+export function parseAskQuestions(arr: unknown, options?: { allowSingleOption?: boolean; clampDescription?: boolean }): AskQuestion[] | AskQuestionParseError {
   if (!Array.isArray(arr) || arr.length === 0) return 'bad_questions';
   const result: AskQuestion[] = [];
   for (const q of arr) {
@@ -48,7 +54,7 @@ export function parseAskQuestions(arr: unknown, options?: { allowSingleOption?: 
     const opts: AskOption[] = [];
     const seen = new Set<string>();
     for (const o of qq.options) {
-      const parsed = parseOption(o);
+      const parsed = parseOption(o, { clampDescription: options?.clampDescription });
       if (typeof parsed === 'string') return parsed;
       if (seen.has(parsed.key)) return 'duplicate_option_key';
       seen.add(parsed.key);

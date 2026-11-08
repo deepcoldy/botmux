@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { createAskInput, parseAskBody } from '../src/core/ask-api.js';
+import { parseAskBody, verifiedAskMention } from '../src/core/ask-api.js';
 
 function validBody(over: Record<string, unknown> = {}) {
   return {
@@ -208,24 +208,21 @@ describe('parseAskBody — requestId / originKind (invocation identity)', () => 
 });
 
 describe('parseAskBody — mentionedOpenId (--mention)', () => {
-  it('接受合法人类 open_id 并透传', () => {
-    const out = parseAskBody(validBody({ mentionedOpenId: 'ou_humanTarget0001' }));
-    expect('error' in out).toBe(false);
-    if (!('error' in out)) {
-      expect(out.mentionedOpenId).toBe('ou_humanTarget0001');
-    }
+  const explicit = (over: Record<string, unknown> = {}) => validBody({ requestId: 'r1', originKind: 'explicit', ...over });
+
+  it.each(['ou_humanTarget0001', 'ou_proposer_bot', 'ou_a-b'])('显式 ask 接受与 --answerer 同形的 open_id：%s', (openId) => {
+    expect(parseAskBody(explicit({ mentionedOpenId: openId }))).toMatchObject({ mentionedOpenId: openId });
   });
 
-  it('daemon 注册输入保留 mentionedOpenId', () => {
-    const parsed = parseAskBody(validBody({ mentionedOpenId: 'ou_humanTarget0001' }));
-    expect('error' in parsed).toBe(false);
-    if (!('error' in parsed)) {
-      expect(createAskInput(parsed).mentionedOpenId).toBe('ou_humanTarget0001');
-    }
+  it('只有显式 ask 能点名：hook / 无 origin 的请求带 mentionedOpenId 被拒', () => {
+    expect(parseAskBody(validBody({ mentionedOpenId: 'ou_humanTarget0001' }))).toEqual({ error: 'bad_mentionedOpenId' });
+    expect(parseAskBody(validBody({ requestId: 'r1', originKind: 'hook', mentionedOpenId: 'ou_humanTarget0001' })))
+      .toEqual({ error: 'bad_mentionedOpenId' });
   });
 
   it('缺省时 mentionedOpenId 为 undefined（旧调用方兼容）', () => {
-    const out = parseAskBody(validBody());
+    const out = parseAskBody(explicit());
+    expect('error' in out).toBe(false);
     if (!('error' in out)) expect(out.mentionedOpenId).toBeUndefined();
   });
 
@@ -233,17 +230,36 @@ describe('parseAskBody — mentionedOpenId (--mention)', () => {
     ['union_id', 'on_6741d98b6423c1b46e1ef7a5e6dd'],
     ['裸字符串', 'some-user'],
     ['空串', ''],
+    ['带尖括号', 'ou_x><at id=all'],
     ['数字', 12345],
     ['对象', { id: 'ou_x' }],
-    ['null 视为缺省不报错', null],
+    ['null', null],
   ])('%s', (_label, value) => {
-    const out = parseAskBody(validBody({ mentionedOpenId: value }));
-    if (value === null) {
-      expect('error' in out).toBe(false);
-    } else {
-      expect('error' in out).toBe(true);
-      if ('error' in out) expect(out.error).toBe('bad_mentionedOpenId');
-    }
+    expect(parseAskBody(explicit({ mentionedOpenId: value }))).toEqual({ error: 'bad_mentionedOpenId' });
+  });
+});
+
+describe('verifiedAskMention', () => {
+  const human = async (openId: string) => openId === 'ou_human';
+
+  it('只保留通讯录确认的真人', async () => {
+    expect(await verifiedAskMention('ou_human', { isPeerBot: () => false, isHuman: human })).toBe('ou_human');
+    expect(await verifiedAskMention('ou_unknown', { isPeerBot: () => false, isHuman: human })).toBeUndefined();
+    expect(await verifiedAskMention(undefined, { isPeerBot: () => false, isHuman: human })).toBeUndefined();
+  });
+
+  it('已知的同伴 bot 不经通讯录就丢掉', async () => {
+    let looked = false;
+    const out = await verifiedAskMention('ou_human', { isPeerBot: () => true, isHuman: async (id) => { looked = true; return human(id); } });
+    expect(out).toBeUndefined();
+    expect(looked).toBe(false);
+  });
+
+  it('核实抛错时只丢掉点名，不让整张 ask 失败', async () => {
+    await expect(verifiedAskMention('ou_human', { isPeerBot: () => false, isHuman: async () => { throw new Error('contact api down'); } }))
+      .resolves.toBeUndefined();
+    await expect(verifiedAskMention('ou_human', { isPeerBot: () => { throw new Error('bad cross-ref file'); }, isHuman: human }))
+      .resolves.toBeUndefined();
   });
 });
 
@@ -302,5 +318,32 @@ describe('parseAskBody — options[].description 透传', () => {
         { key: 'no', label: '停止' },
       ],
     }))).toBe(true);
+  });
+});
+
+describe('parseAskBody — 超长选项说明', () => {
+  const longOptions = (description: string) => [{ key: 'yes', label: '继续', description }, { key: 'no', label: '停止' }];
+
+  it.each([
+    ['questions[]', (description: string) => ({ questions: [{ prompt: '继续吗？', multiSelect: false, options: longOptions(description) }] })],
+    ['旧 options', (description: string) => ({ options: longOptions(description) })],
+  ])('hook 提问截到上限而不是整张拒收（%s）', (_shape, body) => {
+    const out = parseAskBody(validBody({ requestId: 'tool-1', originKind: 'hook', ...body('x'.repeat(1500)) }));
+    if ('error' in out) throw new Error(out.error);
+    const description = out.questions[0].options[0].description!;
+    expect(description.length).toBeLessThanOrEqual(1000);
+    expect(description.endsWith('…')).toBe(true);
+    expect(description.startsWith('x'.repeat(900))).toBe(true);
+  });
+
+  it('显式 ask 仍然 fail loud', () => {
+    expect(parseAskBody(validBody({ requestId: 'r1', originKind: 'explicit', options: longOptions('x'.repeat(1001)) })))
+      .toEqual({ error: 'bad_option_description' });
+  });
+
+  it('截断不留下孤立的 UTF-16 代理', () => {
+    const out = parseAskBody(validBody({ requestId: 'tool-1', originKind: 'hook', options: longOptions(String.fromCodePoint(0x1f600).repeat(800)) }));
+    if ('error' in out) throw new Error(out.error);
+    expect(out.questions[0].options[0].description!.isWellFormed()).toBe(true);
   });
 });

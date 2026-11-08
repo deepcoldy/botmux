@@ -15,10 +15,11 @@ import type { GroupContextDeliveryBinding } from '../services/group-context-deli
 
 /** Only the authenticated, currently running turn can admit an inline Ask.
  * Input forms stay standalone: streaming progress patches would erase client drafts.
- * Large choice sets retain standalone presentation without truncation. */
+ * Large choice sets retain standalone presentation without truncation.
+ * A mention needs a new message: an inline Ask arrives by PATCH, which never notifies. */
 export function replyCardAskTarget(
   ds: DaemonSession | undefined,
-  input: Pick<CreateAskInput, 'sessionId' | 'larkAppId' | 'chatId' | 'rootMessageId' | 'questions'>,
+  input: Pick<CreateAskInput, 'sessionId' | 'larkAppId' | 'chatId' | 'rootMessageId' | 'questions' | 'mentionedOpenId'>,
   origin: { originTurnId?: unknown; originDispatchAttempt?: unknown },
 ): CreateAskInput['replyCardTarget'] {
   const sameAnchor = ds && ((ds.scope ?? ds.session.scope) === 'chat'
@@ -27,6 +28,7 @@ export function replyCardAskTarget(
   if (!ds || typeof origin.originTurnId !== 'string' || origin.originTurnId !== ds.replyCardRunningTurnId
     || input.sessionId !== ds.session.sessionId || input.larkAppId !== ds.larkAppId || input.chatId !== ds.chatId
     || !sameAnchor
+    || input.mentionedOpenId
     || input.questions.some(q => q.input)
     || input.questions.reduce((sum, q) => sum + q.options.length, 0) > 16
     || Buffer.byteLength(JSON.stringify(input.questions), 'utf8') > 3000) return undefined;

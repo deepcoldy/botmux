@@ -171,10 +171,9 @@ export interface CreateAskInput {
   /** Optional exact responder lock for host-owned approval asks. Ordinary
    * agent asks omit it and retain the existing canTalk-any-member policy. */
   answererOpenId?: string;
-  /** 显式 `botmux ask --mention <open_id>` 要 @ 的人（仅人类 open_id；bot 的
-   *  open_id 在卡片里会触发 100290，daemon 侧会识别并剔除）。daemon 在卡片
-   *  问题正文前注入真实 `<at>`，确保接收者能收到通知——卡片不像回复消息那样
-   *  天然带 @。 */
+  /** 显式 `botmux ask --mention <open_id>` 要 @ 的人。daemon 只在通讯录确认是本应用的
+   *  真人后填入（at 到 bot 会让整卡 100290），卡片在第一问前注入真实 `<at>`。
+   *  带点名的 ask 走独立卡：嵌进回复卡是 PATCH，不会触发通知。 */
   mentionedOpenId?: string;
 }
 

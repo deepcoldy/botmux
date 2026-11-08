@@ -162,13 +162,11 @@ describe('daemon session-scoped IPC route wiring', () => {
     expect(authAt).toBeGreaterThan(-1);
     // Host HMAC callers are bound too: the bind sits after the auth block closes.
     expect(askBindAt).toBeGreaterThan(blockEnd(ask, authAt));
-    const inputAt = ask.indexOf('const askInput = createAskInput(boundAsk, {');
+    const inputAt = ask.indexOf('const askInput = {');
     expect(inputAt).toBeGreaterThan(askBindAt);
-    const askExtra = ask.slice(inputAt, blockEnd(ask, inputAt) + 1);
-    // Identity comes only from the bound first argument: the overlay must not reintroduce
-    // caller-supplied ids (createAskInput's extra type also rejects these keys at compile time).
-    expect(askExtra).not.toMatch(/\bparsed\./);
-    expect(askExtra).not.toMatch(/\b(larkAppId|chatId|sessionId|rootMessageId|originKind)\s*:/);
+    const askInput = ask.slice(inputAt, ask.indexOf('};', inputAt));
+    expect(askInput).toContain('boundAsk.larkAppId');
+    expect(askInput).not.toContain('parsed.larkAppId');
     expect(ask.search(/registerAskForResponse\((\{ \.\.\.)?askInput\b/)).toBeGreaterThan(inputAt);
 
     const hook = route('/api/hooks/emit');

@@ -131,10 +131,10 @@ export function parseAskMention(raw: string | undefined): string | undefined {
   }
   // 第一个冒号前是 open_id（与 send 的 "open_id:Display Name" 约定一致）。
   const openId = (value.includes(':') ? value.slice(0, value.indexOf(':')) : value).trim();
-  if (!/^ou_[A-Za-z0-9]{6,64}$/.test(openId)) {
+  if (!/^ou_[A-Za-z0-9_-]{1,128}$/.test(openId)) {
     throw new AskArgsError(
       'mention_not_open_id',
-      `--mention 只接受人类成员的 open_id（ou_ 开头），收到 "${value}"`,
+      `--mention 只接受成员的 open_id（ou_ 开头），收到 "${value}"`,
     );
   }
   return openId;
