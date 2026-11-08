@@ -1970,9 +1970,8 @@ export function resolveSubstituteTrigger(
   larkAppId: string,
   message: any,
   cfg: SubstituteModeConfig | undefined = getBot(larkAppId).config.substituteMode,
-  botTargetsOnly = false,
 ): import('../../types.js').SubstituteTrigger | undefined {
-  const mention = resolveSubstituteMention(cfg, message, botTargetsOnly);
+  const mention = resolveSubstituteMention(cfg, message);
   return mention && matchesSubstituteKeywords(cfg?.keywords, message)
     ? mention : undefined;
 }
@@ -2027,43 +2026,72 @@ function isSubstituteAllowedChat(cfg: { chats?: string[]; excludedChats?: string
   return cfg.chats.includes(chatId);
 }
 
+/** App ID targets only match after REST maps the event's observer open_ids.
+ *  Look them up wherever an open_id target would reach a substitute gate:
+ *  the excluded / per-chat off / keyword-miss hard drops, or a trigger. */
+function needsSubstituteAppLookup(
+  larkAppId: string,
+  cfg: SubstituteModeConfig,
+  message: any,
+  explicitlyMentionedThisBot: boolean,
+  botSender: boolean,
+): boolean {
+  const chatId = message.chat_id;
+  if (isSubstituteExcludedChat(cfg, chatId)) return !explicitlyMentionedThisBot;
+  const keywordsHit = matchesSubstituteKeywords(cfg.keywords, message);
+  if (!isSubstituteAllowedChat(cfg, chatId)) return !explicitlyMentionedThisBot && !keywordsHit;
+  if (!explicitlyMentionedThisBot) return true;
+  // Bot senders that @ this bot keep the ordinary bot-to-bot path.
+  return !botSender && keywordsHit && isSubstituteEnabledForChat(larkAppId, chatId);
+}
+
 type SubstituteMessageRouteInput = {
   larkAppId: string;
   message: any;
   chatType: string;
-  explicitlyMentionedThisBot: boolean;
   ownsSession: () => boolean;
-  botTargetsOnly?: boolean;
 };
 
 type SubstituteMessageRoute =
-  | { kind: 'skip' | 'drop' }
+  | { kind: 'skip' }
+  | { kind: 'drop'; reason: string }
   | { kind: 'trigger'; trigger: import('../../types.js').SubstituteTrigger; chatMode: 'group' | 'topic' };
 
-async function resolveSubstituteMessageRoute(input: SubstituteMessageRouteInput): Promise<SubstituteMessageRoute> {
-  const { larkAppId, message, explicitlyMentionedThisBot } = input;
-  let cfg = getBot(larkAppId).config.substituteMode;
-  if (!cfg?.enabled || input.chatType !== 'group'
-      || !resolveSubstituteTrigger(larkAppId, message, cfg, input.botTargetsOnly)) return { kind: 'skip' };
-  if (!explicitlyMentionedThisBot && isSubstituteExcludedChat(cfg, message.chat_id)) return { kind: 'drop' };
-  if (!isSubstituteAllowedChat(cfg, message.chat_id)) return { kind: 'skip' };
-  const chatMode = await getChatMode(larkAppId, message.chat_id);
-  cfg = getBot(larkAppId).config.substituteMode;
-  const trigger = resolveSubstituteTrigger(larkAppId, message, cfg, input.botTargetsOnly);
-  if (!cfg?.enabled || !trigger) return { kind: 'skip' };
-  if (!explicitlyMentionedThisBot && isSubstituteExcludedChat(cfg, message.chat_id)) return { kind: 'drop' };
-  if (!isSubstituteAllowedChat(cfg, message.chat_id)) return { kind: 'skip' };
+/** Bot senders that did not @ this bot, App ID targets only. Gates and their
+ *  order mirror the human path: excluded, per-chat off and keyword-miss drops
+ *  come before the slash exemption, the allowlist and the chat mode. Only the
+ *  chat mode needs I/O, so the queue re-runs this before delivery. */
+function decideSubstituteMessageRoute(
+  input: SubstituteMessageRouteInput,
+  chatMode?: string,
+): SubstituteMessageRoute | { kind: 'needs-chat-mode' } {
+  const { larkAppId, message } = input;
+  const chatId = message.chat_id;
+  const cfg = getBot(larkAppId).config.substituteMode;
+  const mention = input.chatType === 'group' ? resolveSubstituteMention(cfg, message, true) : undefined;
+  if (!cfg || !mention) return { kind: 'skip' };
+  if (isSubstituteExcludedChat(cfg, chatId)) return { kind: 'drop', reason: 'excluded chat' };
+  const allowed = isSubstituteAllowedChat(cfg, chatId);
+  if (allowed && !isSubstituteEnabledForChat(larkAppId, chatId)) return { kind: 'drop', reason: 'per-chat off' };
+  const rawText = extractMessageTextForRouting(message);
+  const stripped = rawText ? stripLeadingMentions(rawText.trim(), message.mentions ?? []).trim() : '';
+  if (stripped.startsWith('/')) return { kind: 'skip' };
+  if (!matchesSubstituteKeywords(cfg.keywords, message)) return { kind: 'drop', reason: 'keyword miss' };
+  if (!allowed) return { kind: 'skip' };
+  if (chatMode === undefined) return { kind: 'needs-chat-mode' };
   if (chatMode !== 'group' && (chatMode !== 'topic' || cfg.topicGroups === false)) return { kind: 'skip' };
-  if (!isSubstituteEnabledForChat(larkAppId, message.chat_id)) return { kind: 'skip' };
-  if (!explicitlyMentionedThisBot) {
-    const rawText = extractMessageTextForRouting(message);
-    const stripped = rawText ? stripLeadingMentions(rawText.trim(), message.mentions ?? []).trim() : '';
-    if (stripped.startsWith('/')) return { kind: 'skip' };
-  }
   if (chatMode === 'topic' && cfg.topicActiveSessionTrigger === false && input.ownsSession()) {
-    return { kind: explicitlyMentionedThisBot ? 'skip' : 'drop' };
+    return { kind: 'drop', reason: 'active topic' };
   }
-  return { kind: 'trigger', trigger, chatMode };
+  return { kind: 'trigger', trigger: mention, chatMode };
+}
+
+async function resolveSubstituteMessageRoute(input: SubstituteMessageRouteInput): Promise<SubstituteMessageRoute> {
+  const route = decideSubstituteMessageRoute(input);
+  if (route.kind !== 'needs-chat-mode') return route;
+  // Re-run every gate on the config current after the live lookup.
+  const current = decideSubstituteMessageRoute(input, await getChatMode(input.larkAppId, input.message.chat_id));
+  return current.kind === 'needs-chat-mode' ? { kind: 'skip' } : current;
 }
 
 // ─── Permission gates ────────────────────────────────────────────────────
@@ -5347,20 +5375,22 @@ export function createLarkEventDispatcherRuntime(
       // chat-scope gate（isKnownPeerBot）和"Bot-to-bot @mention detected"
       // 日志。
       const senderType = sender?.sender_type;
+      const isBotSenderType = senderType === 'app' || senderType === 'bot';
       const appTargets = getBot(larkAppId).config.substituteMode;
+      const selfOpenId = getBot(larkAppId).botOpenId;
       if (appTargets?.enabled && appTargets.targets.some(target => target.appId)
           && chatType === 'group'
-          && isSubstituteAllowedChat(appTargets, chatId)
-          && sender?.sender_id?.open_id !== getBot(larkAppId).botOpenId
+          && sender?.sender_id?.open_id !== selfOpenId
           && sender?.sender_id?.app_id !== larkAppId
-          && !isBotMentioned(larkAppId, message, sender?.sender_id?.open_id)
           && SUBSTITUTE_TRIGGER_MESSAGE_TYPES.has(message.message_type ?? message.msg_type)
-          && extractMentionIdentities(message).some(mention => mention.openId && !mention.appId)
-          && isSubstituteEnabledForChat(larkAppId, chatId)) {
+          && extractMentionIdentities(message).some(mention =>
+            mention.openId && !mention.appId && mention.openId !== 'all' && mention.openId !== selfOpenId)
+          && needsSubstituteAppLookup(
+            larkAppId, appTargets, message,
+            isBotMentioned(larkAppId, message, sender?.sender_id?.open_id), isBotSenderType)) {
         message = await resolveSubstituteAppMentions(larkAppId, message);
         data = { ...data, message };
       }
-      const isBotSenderType = senderType === 'app' || senderType === 'bot';
       if (isBotSenderType) {
         const senderOpenId = sender.sender_id?.open_id ?? sender.sender_id?.app_id;
         // When Feishu gave us only an app_id (no open_id), this bot sender's
@@ -5449,16 +5479,23 @@ export function createLarkEventDispatcherRuntime(
           return;
         }
         const explicitlyMentionedThisBot = isBotMentioned(larkAppId, message, undefined);
-        const substituteDecision = !explicitlyMentionedThisBot && resolveSubstituteTrigger(larkAppId, message, undefined, true)
+        const substituteDecision = !explicitlyMentionedThisBot && chatType === 'group'
+            && resolveSubstituteMention(getBot(larkAppId).config.substituteMode, message, true)
           ? await decideRoutingWithSource(larkAppId, message)
           : undefined;
         const substituteRoute = substituteDecision
           ? await resolveSubstituteMessageRoute({
-              larkAppId, message, chatType, explicitlyMentionedThisBot, botTargetsOnly: true,
+              larkAppId, message, chatType,
               ownsSession: () => handlers.isSessionOwner?.(substituteDecision.anchor, larkAppId) ?? false,
             })
           : undefined;
-        if (substituteRoute?.kind === 'drop') return;
+        if (substituteRoute?.kind === 'drop') {
+          logger.info(
+            `[substitute:${larkAppId}] ${substituteRoute.reason} — dropping bot @App ID target message ` +
+            `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
+          );
+          return;
+        }
         const substituteTrigger = substituteRoute?.kind === 'trigger' ? substituteRoute.trigger : undefined;
         // Direct mentions and configured bot substitutes share sender authorization.
         // Other messages may still opt into new-topic auto-start below.
