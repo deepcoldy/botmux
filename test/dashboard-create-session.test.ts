@@ -85,6 +85,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getCurrentCliVersion: vi.fn(() => 'test-cli-v1'),
   restoreUsageLimitRuntimeState: vi.fn(),
   ensureOrdinaryTurnRecoveryAttached: vi.fn(),
+  resumeTurnNotices: vi.fn(),
   ensureReadonlyTaskContinuationAttached: vi.fn(),
   findQuarantinedRoutingConflict: (...a: [string, string]) => findQuarantinedRoutingConflictMock(...a),
   setActiveSessionIfActive: vi.fn((map: Map<string, any>, k: string, ds: any) => {

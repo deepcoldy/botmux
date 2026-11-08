@@ -720,6 +720,9 @@ export interface Session {
    * durable delivery state (retried until Feishu accepts it, never re-sent once
    * delivered) plus the material for the card's retry button. Bounded. */
   ordinaryRecoveryNotices?: import('./services/ordinary-recovery-notice.js').OrdinaryRecoveryNoticeRecord[];
+  /** Failure cards / worker notices whose send hit a Feishu transport failure,
+   * retried until delivered (bounded, pending ones only). */
+  turnNotices?: import('./services/ordinary-recovery-notice.js').TurnNoticeRecord[];
   /**
    * Bounded, crash-recoverable proof that a durable-primary Inbox message
    * crossed the Remote Runner provider submission boundary. The turn id is the
