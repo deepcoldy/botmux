@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
+import { isMessageListenerTaskAnchor, isSilentMessageListenerSession, messageListenerSendBlocked } from './core/message-listener-silence.js';
 import { buildReplyConsoleUrl } from './core/dashboard-url.js';
 /**
  * CLI entry point for botmux.
@@ -127,6 +128,7 @@ import {
   isScriptedSetupInvocation,
   maskAppSecret,
   parseSetupCommand,
+  resolveWelcomeMessageFile,
   SETUP_CLI_USAGE,
   type SetupCommand,
 } from './setup/setup-args.js';
@@ -371,6 +373,8 @@ import {
 } from './utils/bot-routing.js';
 import { botsInfoObjectEntries, isBotsInfoRouteEntry, normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
 import { getDefaultLocale, isLocale, localeForBot, setDefaultLocale, SUPPORTED_LOCALES, t, type Locale } from './i18n/index.js';
+import { sanitizeLocalAddressText, sanitizeLocalAddressNode } from './im/lark/local-address-policy.js';
+import { localAddressContextForBot } from './im/lark/local-address-context.js';
 import {
   crossPrincipalAsKeyword,
   crossPrincipalBotSendGate,
@@ -1824,6 +1828,22 @@ async function cmdSetupScripted(
     return;
   }
 
+  if (cmd.action === 'add' || cmd.action === 'edit') {
+    try {
+      cmd.flags = resolveWelcomeMessageFile(cmd.flags, path => {
+        const file = resolve(expandHomePath(path));
+        try {
+          return readFileSync(file, 'utf8');
+        } catch (err) {
+          throw new Error(`读取欢迎语文件 ${file} 失败: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      });
+    } catch (err) {
+      failSetupScripted(cmd.json, err instanceof Error ? err.message : String(err));
+      return;
+    }
+  }
+
   ensureConfigDir();
   const bots = loadBotsJson();
 
@@ -2028,6 +2048,7 @@ async function cmdSetupScripted(
             : { forceQrLogin: true as const };
           const created = await createFeishuOpenPlatformApp({
             name: appName,
+            ...(cmd.flags.appIcon?.trim() ? { iconFilePath: resolve(cmd.flags.appIcon.trim()) } : {}),
             ...sessionOptions,
             disableBytedcliFallback: true,
             onSessionReady: ({ identity, source }) => {
@@ -2392,12 +2413,20 @@ async function cmdSetupScripted(
 }
 
 async function cmdClone(argv: string[]): Promise<void> {
-  const [sourceSelector, nameFlag, requestedName] = argv;
-  if (
-    !sourceSelector
-    || (argv.length !== 1 && (argv.length !== 3 || nameFlag !== '--name' || !requestedName?.trim()))
-  ) {
-    console.error('用法: botmux clone <进程名|配置名|AppID> [--name <新名称>]');
+  const [sourceSelector, ...rest] = argv;
+  let requestedName: string | undefined;
+  let iconPath: string | undefined;
+  let badArgs = !sourceSelector || sourceSelector.startsWith('-');
+  for (let i = 0; i < rest.length && !badArgs; i += 2) {
+    const flag = rest[i];
+    const value = rest[i + 1];
+    if (!value?.trim()) badArgs = true;
+    else if (flag === '--name' && requestedName === undefined) requestedName = value;
+    else if (flag === '--icon' && iconPath === undefined) iconPath = value;
+    else badArgs = true;
+  }
+  if (badArgs) {
+    console.error('用法: botmux clone <进程名|配置名|AppID> [--name <新名称>] [--icon <PNG 路径>]');
     process.exitCode = 1;
     return;
   }
@@ -2421,8 +2450,8 @@ async function cmdClone(argv: string[]): Promise<void> {
   }
   const addArgs = ['add', '--create-app', '--allowed-users', owners.join(',')];
   if (botBrand(source) === 'lark') {
-    if (requestedName) {
-      console.error('Lark SDK 创建路径暂不支持自定义应用名称。');
+    if (requestedName || iconPath) {
+      console.error('Lark SDK 创建路径暂不支持自定义应用名称或图标。');
       process.exitCode = 1;
       return;
     }
@@ -2432,6 +2461,7 @@ async function cmdClone(argv: string[]): Promise<void> {
       ? source.displayName.trim()
       : botProcessName(source, sourceIndex);
     addArgs.push('--app-name', resolveCloneAppName(requestedName, sourceName));
+    if (iconPath) addArgs.push('--app-icon', iconPath);
   }
   await cmdSetupScripted(addArgs, source);
 }
@@ -4094,6 +4124,7 @@ interface AdoptedFromData {
 
 interface SessionData {
   sessionId: string;
+  messageListenerRun?: import('./core/message-listener-silence.js').SilentMessageListenerRun;
   chatId: string;
   chatType?: 'group' | 'p2p';
   rootMessageId: string;
@@ -9349,6 +9380,30 @@ async function resolveSessionAppId(sessionIdArg: string | undefined): Promise<{ 
   return { sid, larkAppId: s.larkAppId, session: s };
 }
 
+async function silentListenerSources(session: SessionData): Promise<SessionData[]> {
+  const context = resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID);
+  const origin = context?.sessionId && context.sessionId !== session.sessionId
+    ? await requireSessionById(context.sessionId) : session;
+  return [origin, session].filter(source => isSilentMessageListenerSession(source));
+}
+
+async function assertListenerChatWriteAllowed(session: SessionData, chatId: string, refusal: string): Promise<void> {
+  if ((await silentListenerSources(session)).some(source => messageListenerSendBlocked(source, chatId))) {
+    throw new Error(refusal);
+  }
+}
+
+async function assertListenerCardDestination(session: SessionData, appId: string, messageId?: string): Promise<void> {
+  const sources = await silentListenerSources(session);
+  if (!sources.length) return;
+  const destination = messageId
+    ? await (await import('./im/lark/client.js')).getMessageChatId(appId, messageId)
+    : session.chatId;
+  if (sources.some(source => messageListenerSendBlocked(source, destination ?? undefined))) {
+    throw new Error('silent_message_listener: 来源群已设置静默执行，不能发布或更新来源群卡片。');
+  }
+}
+
 async function cmdTabs(rest: string[]): Promise<void> {
   const {
     CHAT_TABS_CLI_USAGE,
@@ -9385,6 +9440,10 @@ async function cmdTabs(rest: string[]): Promise<void> {
     console.error('botmux tabs: 当前会话不是群聊；请在群会话中运行，或传 --chat-id <oc_xxx>');
     process.exitCode = 2;
     return;
+  }
+  if (parsed.action !== 'list') {
+    await assertListenerChatWriteAllowed(session, chatId,
+      'botmux tabs: silent_message_listener: 来源群已设置静默执行，不能修改来源群标签页。');
   }
   try {
     const result = await executeChatTabsCli({ ...parsed, larkAppId, resolvedChatId: chatId });
@@ -9432,6 +9491,8 @@ async function cmdTopNotice(rest: string[]): Promise<void> {
     process.exitCode = 2;
     return;
   }
+  await assertListenerChatWriteAllowed(session, chatId,
+    'botmux top-notice: silent_message_listener: 来源群已设置静默执行，不能在来源群置顶或取消置顶。');
   try {
     const result = await executeChatTopNoticeCli({
       ...parsed,
@@ -9515,10 +9576,14 @@ async function cmdHistory(rest: string[]): Promise<void> {
       process.exit(1);
     }
 
+    // Silent listener sessions anchor on an internal `ml:` route id that must
+    // never reach Lark read APIs; use the frozen real source message id.
+    const threadRootMessageId = s.messageListenerRun?.sourceMessageId ?? s.rootMessageId;
+
     let ambientBeforeCreateTime: string | undefined;
     if (effectiveScope === 'ambient') {
       try {
-        const detail = await getMessageDetail(appId, s.rootMessageId, { userCardContent: false });
+        const detail = await getMessageDetail(appId, threadRootMessageId, { userCardContent: false });
         ambientBeforeCreateTime = detail?.items?.[0]?.create_time;
       } catch {
         // Best-effort only: ambient history should still work if the root
@@ -9532,9 +9597,9 @@ async function cmdHistory(rest: string[]): Promise<void> {
       : effectiveScope === 'ambient'
         ? await listAmbientChatMessages(appId, s.chatId, limit, {
             beforeCreateTime: ambientBeforeCreateTime,
-            excludeRootMessageId: s.rootMessageId,
+            excludeRootMessageId: threadRootMessageId,
           })
-        : await listThreadMessages(appId, s.chatId, s.rootMessageId, limit);
+        : await listThreadMessages(appId, s.chatId, threadRootMessageId, limit);
     // Expand merge_forward to <forwarded_messages> XML, mirroring the live event
     // path in daemon.ts. Each message gets its own numberer with resources
     // assigned BEFORE text extraction, so in-body [图片 N] placeholders match
@@ -9931,6 +9996,11 @@ import {
   managedVcSendPayloadError,
   containsLarkAtTag,
   matchUniqueChatMemberOpenId,
+  validateSecretaryAction,
+  validateSecretaryRouting,
+  parseSecretaryPatrolRoot,
+  findSecretaryDuplicate,
+  SECRETARY_TURN_PREFIX,
 } from './services/send-policy.js';
 import { normalizePositionalSendContent } from './services/send-content.js';
 import { describeScheduleState } from './services/schedule-until-done.js';
@@ -10145,7 +10215,7 @@ async function relaySend(
   // and --session-id flags are dropped — content/attachments come from the
   // outbox and session-id is forced host-side.
   const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent', '--schedule-remove-self', '--top-level']);
-  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into']);
+  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into', '--secretary-action', '--secretary-reason']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
@@ -10600,7 +10670,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
   // Only trust a real message id as the thread anchor — chat-scope sessions
   // anchor on the chat id (oc_…), which must NOT be used as a reply target.
   const rootEnv = process.env.BOTMUX_ROOT_MESSAGE_ID;
-  const rootMessageId = rootEnv?.startsWith('om_') ? rootEnv : '';
+  const rootMessageId = rootEnv?.startsWith('om_') || isMessageListenerTaskAnchor(rootEnv) ? rootEnv! : '';
   const scopeEnv = process.env.BOTMUX_SESSION_SCOPE;
   const scope: 'thread' | 'chat' =
     scopeEnv === 'chat' || scopeEnv === 'thread' ? scopeEnv : (rootMessageId ? 'thread' : 'chat');
@@ -10641,6 +10711,13 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
     sessionId,
     chatId,
     rootMessageId,
+    // Riff/mojo sandboxes have no local session store, so the frozen listener
+    // identity must be rebuilt from the env anchor: without it `history` and
+    // the source-topic availability checks would hand the internal `ml:` id
+    // to Lark read APIs instead of the real source message id.
+    ...(isMessageListenerTaskAnchor(rootMessageId)
+      ? { messageListenerRun: { sourceMessageId: rootMessageId.slice(3), replyMode: 'none' as const } }
+      : {}),
     title: 'riff',
     status: 'active',
     createdAt: new Date().toISOString(),
@@ -11542,6 +11619,18 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     }
   }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+  const silentListenerSources = [originSession, s].filter(source => source && isSilentMessageListenerSession(source));
+  if (silentListenerSources.length > 0) {
+    // Check the actual reply destination; --quote/--into derive their chat
+    // from a message id and can otherwise bypass a --chat-id-only check.
+    const targetMessageId = sendInto ?? explicitQuote;
+    const destination = targetMessageId
+      ? await (await import('./im/lark/client.js')).getMessageChatId(s.larkAppId, targetMessageId)
+      : !sendTopLevel && s.scope !== 'chat' ? s.chatId : overrideChatId ?? s.chatId;
+    if (silentListenerSources.some(source => messageListenerSendBlocked(source!, destination ?? undefined))) {
+      throw new Error('silent_message_listener: 来源群已设置静默执行。请将结果保留在 assistant 输出中；任务需要发往其他群时显式指定目标群。');
+    }
+  }
   const replyStyle = resolveReplyStyle(resolveReplyStyleConfig(s.larkAppId));
   if (replyLayout && !replyStyle.layout) {
     console.error('botmux send: 当前 Bot 已关闭 layout，本次按普通回复卡发送');
@@ -12170,6 +12259,18 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     console.error(`botmux send refused: ${stable}`);
     process.exit(2);
   }
+  // Process the expanded presentation before validation, uploads or any send
+  // ledger/hash. The Lark client checks only card link fields, not prose.
+  try {
+    const localContext = localAddressContextForBot(s.larkAppId, s.workingDir);
+    content = sanitizeLocalAddressText(content, localContext);
+    if (preparedText !== undefined) preparedText = sanitizeLocalAddressText(preparedText, localContext);
+    if (customCard) customCard = sanitizeLocalAddressNode(customCard, localContext);
+    if (completionProposalVisible) completionProposalVisible = sanitizeLocalAddressNode(completionProposalVisible, localContext);
+  } catch (error) {
+    console.error('botmux send refused: ' + (error instanceof Error ? error.message : 'LOCAL_ADDRESS_OUTBOUND_REJECTED'));
+    process.exit(2);
+  }
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
     ?? frozenTurnDispatch?.replyTargetSenderOpenId
     ?? turnReplyTarget?.senderOpenId
@@ -12495,7 +12596,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   const topicSourceTurn = pickTurnReplyTarget(topicSourceSession, topicSourceTurnId);
   const sourceTopicTarget = exactOriginDispatch?.replyTarget ?? resolveSendTarget({
     topLevel: false, chatScope: topicSourceSession.scope === 'chat', chatId: topicSourceSession.chatId,
-    rootMessageId: topicSourceSession.rootMessageId, replyTargetRootId: topicSourceTurn?.rootMessageId,
+    rootMessageId: topicSourceSession.messageListenerRun?.sourceMessageId ?? topicSourceSession.rootMessageId, replyTargetRootId: topicSourceTurn?.rootMessageId,
     replyTargetTurnId: topicSourceTurn?.turnId,
     replyTargetQuoteOnly: topicSourceTurn?.quoteOnly, currentTurnId: topicSourceTurnId,
   });
@@ -12887,6 +12988,44 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     hasQuoteTargetSender: !!replyTargetSenderOpenId,
   });
   if (!mentionGate.ok) { console.error(mentionGate.error); process.exit(2); }
+  // 群秘书回合发送闸：秘书回合里每条消息都要声明动作，旁白式发送直接拒绝。
+  const secretaryGate = validateSecretaryAction({
+    turnId: currentTurnId,
+    action: argValue(rest, '--secretary-action'),
+    reason: argValue(rest, '--secretary-reason'),
+  });
+  if (!secretaryGate.ok) { console.error(secretaryGate.error); process.exit(2); }
+  if (secretaryGate.action && currentTurnId?.startsWith(SECRETARY_TURN_PREFIX) && s.chatId && s.larkAppId) {
+    // 复述拦截（deliver 例外：把别的 bot 的结果转交 leader 本来就要引用原文）：与群里最近的消息高度重复（把别人刚交付的结论再说一遍）→ 拒发。拉不到历史时放行。
+    try {
+      const { listChatMessages } = await import('./im/lark/client.js');
+      const { restMessageToEventData, larkEventToSecretaryMessage } = await import('./services/group-secretary-runtime.js');
+      const items = await listChatMessages(s.larkAppId, s.chatId, 30);
+      const recent = items
+        .map(item => larkEventToSecretaryMessage(restMessageToEventData(item, s.chatId!), undefined))
+        .filter((m): m is NonNullable<typeof m> => !!m && !!m.text && !m.text.startsWith('[卡片消息'))
+        .map(m => ({ id: m.messageId, text: m.text }));
+      const dup = secretaryGate.action === 'deliver' ? undefined : findSecretaryDuplicate(content, recent);
+      if (dup) {
+        console.error(`botmux send refused: 这条内容与群里最近的消息 ${dup} 高度重复——复述已有结论属于旁白，不要发。真有新信息就只写新增的部分。`);
+        process.exit(2);
+      }
+    } catch { /* 历史拉取失败：不拦 */ }
+    try {
+      const { appendFileSync, mkdirSync: mk } = await import('node:fs');
+      const dir = resolveDataDir();
+      mk(dir, { recursive: true });
+      const auditPath = join(dir, `group-secretary-actions-${s.larkAppId}.jsonl`);
+      // 审计日志只追加：超过 5 MiB 时滚成 .1（只留一份历史），不让它无限长大。
+      const { rotateLogIfNeeded } = await import('./utils/log-rotate.js');
+      rotateLogIfNeeded(auditPath, 5 * 1024 * 1024);
+      appendFileSync(auditPath, JSON.stringify({
+        at: new Date().toISOString(), chatId: s.chatId, turnId: currentTurnId,
+        action: secretaryGate.action, reason: argValue(rest, '--secretary-reason')?.slice(0, 300),
+        text: content.slice(0, 300),
+      }) + '\n');
+    } catch { /* 审计日志写失败不挡发送 */ }
+  }
 
   const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
 
@@ -12979,6 +13118,21 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     }
   }
   // ───────────────────────────────────────────────────────────────────────────
+  // 群秘书落点闸：巡查回合锁在被巡查的话题；总管回合不许在主群顶层 @ bot。
+  if (currentTurnId?.startsWith(SECRETARY_TURN_PREFIX) && s.larkAppId) {
+    const { botEntries: secBotEntries, crossRef: secCrossRef } = loadBotMentionIdentityMap(resolveDataDir(), s.larkAppId);
+    const routing = validateSecretaryRouting({
+      turnId: currentTurnId,
+      mentionOpenIds: mentions.map(m => m.open_id),
+      knownBotOpenIds: knownBotOpenIdsFromCrossRef(secCrossRef, secBotEntries, s.larkAppId),
+      ...(sendInto ? { sendInto } : {}),
+      ...(explicitQuote !== undefined ? { explicitQuote } : {}),
+      sendTopLevel,
+      ...(overrideChatId ? { overrideChatId } : {}),
+      ...(s.chatId ? { sessionChatId: s.chatId } : {}),
+    });
+    if (!routing.ok) { console.error(routing.error); process.exit(2); }
+  }
   let feedbackPolicy: ReturnType<typeof resolveFeedbackPolicyForDelivery>;
   let oncallGroupPolicy: import('./services/oncall-group-policy.js').OncallGroupPolicy | undefined;
   let oncallGroupCard: Record<string, any> | undefined;
@@ -14520,6 +14674,7 @@ async function cmdCard(rest: string[]): Promise<void> {
       try {
         const { sid, larkAppId, session } = await resolveSessionAppId(runtimeParsed.sessionId);
         assertSessionTransportOrExit({ chatId: session.chatId, larkAppId }, 'card stream runtime');
+        await assertListenerCardDestination(session, larkAppId);
         if (runtimeParsed.operation === 'bind-runtime' && runtimeParsed.labels) {
           const linkRefPayload = { card: runtimeParsed.labels as Record<string, unknown> };
           const linkRefMode = await attestCardLinkRefMode(sid, linkRefPayload);
@@ -14601,6 +14756,7 @@ async function cmdCard(rest: string[]): Promise<void> {
 
     const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
     assertSessionTransportOrExit({ chatId: session.chatId, larkAppId }, 'card stream');
+    if (parsed.operation !== 'snapshot') await assertListenerCardDestination(session, larkAppId);
     try {
       if (parsed.operation === 'write') {
         const linkRefPayload = { text: contentInput!.content };
@@ -14801,6 +14957,7 @@ async function cmdCard(rest: string[]): Promise<void> {
   // Target-aware door: a --session-id pointing at a virtual/apiOnly session is
   // refused even from a transport-capable turn.
   assertSessionTransportOrExit({ chatId: session.chatId, larkAppId }, 'card patch');
+  await assertListenerCardDestination(session, larkAppId, parsed.messageId);
   if (process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1') {
     try {
       const { getMessageChatId } = await import('./im/lark/client.js');
@@ -15175,6 +15332,9 @@ async function cmdDispatchTree(rest: string[]): Promise<void> {
   const originClaim = freezeDispatchOriginClaim(sid);
   const s = await requireSessionById(sid);
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+  if (isSilentMessageListenerSession(s)) {
+    throw new Error('silent_message_listener: 来源群已设置静默执行，不能在来源群更新任务树卡片。');
+  }
   const result = await trySyncDispatchTaskTree({
     originClaim,
     sessionId: sid,
@@ -15466,6 +15626,12 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const dispatchTurnId = dispatchContext?.sessionId === dispatchOrigin.sessionId
     ? dispatchContext.turnId : undefined;
   const dispatchTurn = pickTurnReplyTarget(dispatchOrigin, dispatchTurnId);
+  // 话题巡查回合只能往被巡查的那个话题里派 / 追加，不能另开话题或派到别的话题。
+  const patrolRoot = parseSecretaryPatrolRoot(dispatchTurnId);
+  if (patrolRoot && dispatchArgs.into !== patrolRoot) {
+    console.error(`botmux dispatch refused: 这是话题巡查回合，只能 --into ${patrolRoot}（被巡查的话题）。别的话题或主群的事用 botmux secretary report --escalate 交给总管。`);
+    process.exit(2);
+  }
   const dispatchSourceAppId = dispatchOrigin.larkAppId!;
   const dispatchSource = resolveSendTarget({
     topLevel: false, chatScope: (dispatchOrigin.scope ?? 'thread') === 'chat', chatId: dispatchOrigin.chatId,
@@ -15518,6 +15684,20 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   }
   const { resolveCurrentChatBotOpenIdsByLarkAppIds, replyMessage, lookupMessageChatId } = await import('./im/lark/client.js');
   const appId = s.larkAppId!;
+
+  // Silent listener tasks may only orchestrate inside other groups: their
+  // seed/prime messages and task-tree cards must never land in the source
+  // group. --into derives its chat from a real message id, so resolve the
+  // actual destination instead of trusting a --chat-id-only view.
+  const silentDispatchSources = [dispatchOrigin, s].filter(source => isSilentMessageListenerSession(source));
+  if (silentDispatchSources.length > 0) {
+    const dispatchDestination = intoRoot
+      ? await lookupMessageChatId(appId, intoRoot)
+      : targetChatId;
+    if (silentDispatchSources.some(source => messageListenerSendBlocked(source, dispatchDestination ?? undefined))) {
+      throw new Error('silent_message_listener: 来源群已设置静默执行，不能在来源群派发话题或更新任务树；请显式指定其他目标群。');
+    }
+  }
 
   const parsedBotApps: Array<{ appId: string; role?: string }> = [];
   for (const raw of botAppSpecs) {
@@ -16352,13 +16532,23 @@ async function cmdReport(rest: string[]): Promise<void> {
   // Destination overrides cannot erase the original session/turn source.
   const reportOrigin = reportContext?.sessionId && reportContext.sessionId !== sid
     ? await requireSessionById(reportContext.sessionId) : s;
+  const silentReportSources = [reportOrigin, s].filter(source => isSilentMessageListenerSession(source));
+  if (silentReportSources.length > 0) {
+    const targetMessageId = explicitInto ?? explicitDispatchRoot;
+    const destination = targetMessageId
+      ? await (await import('./im/lark/client.js')).getMessageChatId(s.larkAppId, targetMessageId)
+      : s.chatId;
+    if (silentReportSources.some(source => messageListenerSendBlocked(source, destination ?? undefined))) {
+      throw new Error('silent_message_listener: 来源群已设置静默执行。请将回报保留在 assistant 输出中。');
+    }
+  }
   const reportOriginTurnId = reportContext?.sessionId === reportOrigin.sessionId
     ? reportContext.turnId : undefined;
   const reportOriginTurn = pickTurnReplyTarget(reportOrigin, reportOriginTurnId);
   const reportSourceAppId = reportOrigin.larkAppId!;
   const reportSource = resolveSendTarget({
     topLevel: false, chatScope: (reportOrigin.scope ?? 'thread') === 'chat', chatId: reportOrigin.chatId,
-    rootMessageId: reportOrigin.rootMessageId, replyTargetRootId: reportOriginTurn?.rootMessageId,
+    rootMessageId: reportOrigin.messageListenerRun?.sourceMessageId ?? reportOrigin.rootMessageId, replyTargetRootId: reportOriginTurn?.rootMessageId,
     replyTargetTurnId: reportOriginTurn?.turnId,
     replyTargetQuoteOnly: reportOriginTurn?.quoteOnly, currentTurnId: reportOriginTurnId,
   });
@@ -19952,6 +20142,10 @@ function printPluginServiceDeleteError(err: unknown): boolean {
 
 async function cmdPlugin(args: string[]): Promise<void> {
   const sub = (args[0] ?? 'list').toLowerCase();
+  if (sub === 'install-verified' || sub === 'uninstall-verified') {
+    if (!findArgValue(args, '--guard-json')) throw new Error('plugin_mutation_guard_required');
+    return cmdPlugin([sub === 'install-verified' ? 'install' : 'uninstall', ...args.slice(1)]);
+  }
   if (sub === 'help' || sub === '--help' || sub === '-h') {
     printPluginUsage();
     return;
@@ -19962,10 +20156,11 @@ async function cmdPlugin(args: string[]): Promise<void> {
     if (!spec) { printPluginUsage(); process.exit(1); }
     const { installPlugin } = await import('./core/plugins/install.js');
     const { resolveOfficialPluginPackageSpec } = await import('./core/plugins/init.js');
+    const { parsePluginMutationGuard } = await import('./core/plugins/mutation-guard.js');
     const resolvedSpec = resolveOfficialPluginPackageSpec(spec);
     let result;
     try {
-      result = installPlugin(resolvedSpec, { link: args.includes('--link') });
+      result = installPlugin(resolvedSpec, { link: args.includes('--link'), guard: parsePluginMutationGuard(findArgValue(args, '--guard-json')) });
     } catch (err) {
       if (printPluginServiceRunningError(err)) {
         process.exitCode = 1;
@@ -20107,29 +20302,37 @@ async function cmdPlugin(args: string[]): Promise<void> {
       console.error('❌ --bot 后需要 bot 名称、序号或 all。');
       process.exit(1);
     }
-    const { materializePlugin, dematerializePlugin } = await import('./core/plugins/materializer.js');
-    if (enable) {
-      if (botSelector) {
-        updateBotPluginBinding(pluginId, botSelector, true, () => materializePlugin(pluginId));
+    const { withPluginServiceLock } = await import('./core/plugins/service-manager.js');
+    await withPluginServiceLock(async () => {
+      const { invalidateGlobalConfigCache } = await import('./global-config.js');
+      invalidateGlobalConfigCache();
+      const { readPluginRegistry } = await import('./services/plugin-registry-store.js');
+      pluginRegistryCache = readPluginRegistry();
+      if (!pluginRegistryCache.plugins[pluginId]) throw new Error(`plugin_not_installed:${pluginId}`);
+      const { materializePlugin, dematerializePlugin } = await import('./core/plugins/materializer.js');
+      if (enable) {
+        if (botSelector) {
+          updateBotPluginBinding(pluginId, botSelector, true, () => materializePlugin(pluginId));
+        } else {
+          const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+          assertPluginBindingTransitionForCli(pluginId, true, current);
+          materializePlugin(pluginId);
+          updateGlobalPluginBinding(pluginId, true);
+        }
       } else {
-        const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
-        assertPluginBindingTransitionForCli(pluginId, true, current);
-        materializePlugin(pluginId);
-        updateGlobalPluginBinding(pluginId, true);
+        if (botSelector) {
+          updateBotPluginBinding(pluginId, botSelector, false);
+        } else {
+          const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
+          assertPluginBindingTransitionForCli(pluginId, false, current);
+          updateGlobalPluginBinding(pluginId, false);
+        }
+        const stillReferenced = (normalizePluginIdList(readGlobalConfig().plugins) ?? []).includes(pluginId)
+          || loadBotsJson().some(bot => (normalizePluginIdList(bot.plugins) ?? []).includes(pluginId));
+        if (!stillReferenced) dematerializePlugin(pluginId);
       }
-    } else {
-      if (botSelector) {
-        updateBotPluginBinding(pluginId, botSelector, false);
-      } else {
-        const current = normalizePluginIdList(readGlobalConfig().plugins) ?? [];
-        assertPluginBindingTransitionForCli(pluginId, false, current);
-        updateGlobalPluginBinding(pluginId, false);
-      }
-      const stillReferenced = (normalizePluginIdList(readGlobalConfig().plugins) ?? []).includes(pluginId)
-        || loadBotsJson().some(bot => (normalizePluginIdList(bot.plugins) ?? []).includes(pluginId));
-      if (!stillReferenced) dematerializePlugin(pluginId);
-    }
-    console.log(`✅ 已${enable ? '启用' : '禁用'}${botSelector ? ` Bot(${botSelector})` : '机器默认'}插件: ${pluginId}`);
+      console.log(`✅ 已${enable ? '启用' : '禁用'}${botSelector ? ` Bot(${botSelector})` : '机器默认'}插件: ${pluginId}`);
+    });
     return;
   }
 
@@ -20144,8 +20347,22 @@ async function cmdPlugin(args: string[]): Promise<void> {
     const { dematerializePlugin } = await import('./core/plugins/materializer.js');
     const { readPluginRegistry, removeInstalledPlugin } = await import('./services/plugin-registry-store.js');
     const { pluginHome } = await import('./core/plugins/paths.js');
+    const { parsePluginMutationGuard, assertPluginMutationGuard } = await import('./core/plugins/mutation-guard.js');
+    const guard = parsePluginMutationGuard(findArgValue(args, '--guard-json'));
+    const { invalidateGlobalConfigCache } = await import('./global-config.js');
+    const { renameSync } = await import('node:fs');
+    const assertConfirmation = () => {
+      if (!guard) return;
+      invalidateGlobalConfigCache();
+      if (guard.id !== pluginId) throw new Error('plugin_confirmation_id_mismatch');
+      assertPluginMutationGuard(guard, readPluginRegistry().plugins[pluginId]);
+      if ((readGlobalConfig().plugins ?? []).includes(pluginId) || loadBotsJson().some(bot => (bot.plugins ?? []).includes(pluginId))) {
+        throw new Error('plugin_confirmation_enabled');
+      }
+    };
     try {
       await withPluginServiceLock(async () => {
+        assertConfirmation();
         const lockedRegistry = readPluginRegistry();
         const installed = lockedRegistry.plugins[pluginId];
         if (!installed) throw new Error(`plugin_not_installed:${pluginId}`);
@@ -20163,11 +20380,23 @@ async function cmdPlugin(args: string[]): Promise<void> {
         }
 
         await deletePluginServicesOrThrowUnlocked([pluginId]);
+        assertConfirmation();
         dematerializePlugin(pluginId);
         await removePluginSkillRegistryEntries(pluginId);
-        removeInstalledPlugin(pluginId);
+        assertConfirmation();
         removePluginBindingsEverywhere(pluginId);
-        rmSync(pluginHome(pluginId), { recursive: true, force: true });
+        // Keep the registry retryable until all preceding cleanup succeeds.
+        const path = pluginHome(pluginId);
+        const retired = `${path}.removed-${process.pid}-${Date.now()}`;
+        const hadHome = existsSync(path);
+        if (hadHome) renameSync(path, retired);
+        try { removeInstalledPlugin(pluginId); }
+        catch (error) {
+          if (hadHome) renameSync(retired, path);
+          throw error;
+        }
+        try { rmSync(retired, { recursive: true, force: true }); }
+        catch { console.error('插件已卸载；临时备份目录清理失败，保留待清理。'); }
       });
     } catch (err) {
       if (err instanceof Error && err.message.startsWith(`plugin_has_enabled_dependents:${pluginId}:`)) {
@@ -20398,6 +20627,11 @@ switch (command) {
     break;
   }
   case 'clone': await cmdClone(process.argv.slice(3)); break;
+  case 'secretary': {
+    const { runSecretaryCommand } = await import('./cli/secretary-command.js');
+    process.exitCode = await runSecretaryCommand(process.argv.slice(3));
+    break;
+  }
   case 'start':   await runFleetMutationCommand('start', cmdStart); break;
   case '__watchdog': await cmdWatchdog(); break;
   case 'serve':   await cmdServe(process.argv.slice(3)); break;

@@ -102,7 +102,9 @@ export interface DaemonSession {
   workerReady?: boolean;
   /** True while the CURRENT CLI generation's prompt is known idle/ready.
    *  Set by the worker's `prompt_ready` IPC; cleared on spawn / restart /
-   *  `claude_exit` / worker retirement. Deliberately NOT cleared by the
+   *  `claude_exit` / worker retirement, and when a MiniMax compact card request
+   *  is accepted for delivery. A false value can therefore also mean a pending
+   *  or in-flight compact on a live worker. Deliberately NOT cleared by the
    *  worker's `ready` IPC: `prompt_ready` frequently arrives BEFORE `ready`
    *  (riff / mojo synthesize the first one inside spawnCli, fast TUIs under
    *  Herdr do too), so clearing on `ready` would erase a just-set value.

@@ -1,6 +1,7 @@
 import { config } from '../config.js';
 import { outputDeliveryJournal } from '../services/output-delivery-journal.js';
 import { armTriggerStreamingCard } from './trigger-streaming-card.js';
+import { messageListenerTaskAnchor } from './message-listener-silence.js';
 import { rememberTriggerTurn } from './turn-origin.js';
 import { zeroPromptInjectionForBot, sessionPromptInjection } from './prompt-injection.js';
 import { withLarkTurnIdempotency } from './lark-turn-idempotency.js';
@@ -54,6 +55,9 @@ export interface TriggerSessionDeps {
  * identity that participates in durable delivery reconciliation. */
 export interface TriggerSessionInternalOptions {
   stableTurnId?: string;
+  /** Trusted dashboard listener execution; never accepted from the public trigger API. */
+  messageListenerRun?: import('./message-listener-silence.js').SilentMessageListenerRun;
+  messageListenerAutoClose?: boolean;
   /** A loud idempotent relay must not be replayed by worker crash recovery. */
   atMostOnce?: boolean;
   /** Synchronous write-ahead hook invoked immediately before worker IPC/fork.
@@ -1280,7 +1284,7 @@ async function triggerSessionTurnAdmitted(
       return { ok: false, errorCode: rootTarget.errorCode, error: rootTarget.error };
     }
     chatId = rootTarget.chatId;
-    ds = deps.activeSessions.get(sessionKey(rootMessageId, larkAppId));
+    if (!internal?.messageListenerRun) ds = deps.activeSessions.get(sessionKey(rootMessageId, larkAppId));
   }
 
   if (!chatId) {
@@ -1827,7 +1831,12 @@ async function triggerSessionTurnAdmitted(
     : await getChatMode(larkAppId, chatId, { forceRefresh: true }));
   let scope: 'thread' | 'chat' = rootMessageId ? 'thread' : 'chat';
   let anchor = rootMessageId || chatId;
+  if (internal?.messageListenerRun) {
+    anchor = messageListenerTaskAnchor(stableTurnId ?? internal.messageListenerRun.sourceMessageId);
+    scope = 'thread';
+  }
   const shouldOpenOwnTopic = !rootMessageId
+    && !internal?.messageListenerRun
     && !httpVirtual
     && (opensExplicitTopic || externalEventOpensOwnTopic(chatMode, regularGroupMode));
   if (shouldOpenOwnTopic && topicMessage !== null) {
@@ -1859,7 +1868,10 @@ async function triggerSessionTurnAdmitted(
     const current = deps.activeSessions.get(key);
     if (current) return { kind: 'existing' as const, ds: current };
 
-    const session = sessionStore.createSession(chatId, anchor, triggerTitle(req), 'group', undefined, { source: 'http' });
+    const session = sessionStore.createSession(chatId, anchor, triggerTitle(req), 'group', undefined, {
+      source: 'http', messageListenerRun: internal?.messageListenerRun,
+    });
+    if (internal?.messageListenerAutoClose) session.messageListenerAutoClose = true;
     const now = Date.now();
     const nowIso = new Date(now).toISOString();
     session.larkAppId = larkAppId;

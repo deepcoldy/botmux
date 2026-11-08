@@ -70,6 +70,42 @@ beforeEach(() => {
 });
 
 describe('handleCotThinkingUpdate', () => {
+  it('sanitizes native reasoning, tool titles and results while preserving execution args and event identities', async () => {
+    const ds = makeDs({ workingDir: '/custom/project' });
+    const args = JSON.stringify({ path: '/custom/project/src/index.ts', state: '/tmp/internal-state' });
+    const entries = [think('协作说明：[协作技能](/home/alice/.agents/skills/a/SKILL.md)\nhttp://localhost:3000/report'),
+      { kind: 'tool_call', id: 'call-identity', name: 'read', args },
+      { kind: 'tool_result', id: 'call-identity', result: '/etc/private.json\nhttps://example.com/home/page?file=/tmp/x' }];
+    handleCotThinkingUpdate(ds, upd(entries));
+    await flush();
+    const events = pushedEvents();
+    const reasoning = events.find(event => event.type === 'REASONING_MESSAGE_CONTENT')!.content;
+    expect(reasoning.delta).toContain('协作技能');
+    expect(reasoning.delta).not.toContain('/home/alice/');
+    expect(reasoning.delta).not.toContain('localhost');
+    const tool = events.find(event => event.type === 'TOOL_CALL_START')!.content;
+    expect(tool.title).toContain('src/index.ts');
+    expect(tool.title).not.toContain('/custom/project/');
+    expect(tool.toolCallId).toBe('call-identity');
+    expect(events.find(event => event.type === 'TOOL_CALL_ARGS')!.content.delta).toBe(args);
+    const result = JSON.parse(events.find(event => event.type === 'TOOL_CALL_RESULT')!.content.content);
+    expect(result.code).not.toContain('/etc/');
+    expect(result.code).toContain('https://example.com/home/page?file=/tmp/x');
+    expect(entries[0].text).toContain('/home/alice/');
+  });
+
+  it.each([false, true])('keeps restored silent listener thinking and late updates local with cotForced=%s', async cotForced => {
+    const ds = makeDs({ cotForced, session: JSON.parse(JSON.stringify({
+      rootMessageId: 'ml:om_source', messageListenerRun: { sourceMessageId: 'om_source', replyMode: 'none' },
+    })) });
+    expect(handleCotThinkingUpdate(ds, upd([think('private task')]))).toBe(false);
+    expect(finalizeCotMessage(ds, 'om_turn1', 'completed')).toBe(false);
+    expect(handleCotThinkingUpdate(ds, upd([say('late progress')]))).toBe(false);
+    await flush();
+    expect(request).not.toHaveBeenCalled();
+    expect(existsSync(orphanDir)).toBe(false);
+  });
+
   it.each([false, true])('keeps hidden recovery turns quiet after restore with cotForced=%s', async cotForced => {
     const ds = makeDs({ cotForced, session: JSON.parse(JSON.stringify({ hiddenThinkingTurns: ['trg_recovery'] })) });
     handleCotThinkingUpdate(ds, upd([say('User work')], 'om_user'));
@@ -341,7 +377,7 @@ describe('handleCotThinkingUpdate', () => {
    * a real shape harvested from on-disk transcripts, not an invented one.
    */
   it('carries the tool subject in the title across both CLIs\' arg shapes', async () => {
-    const ds = makeDs();
+    const ds = makeDs({ workingDir: '/root/iserver/botmux' });
     const titleOf = (id: string): string =>
       pushedEvents().find(e => e.type === 'TOOL_CALL_START' && e.content.toolCallId === id)!.content.title;
 
@@ -361,7 +397,8 @@ describe('handleCotThinkingUpdate', () => {
 
     expect(titleOf('t1')).toContain('git log --oneline -5');
     expect(titleOf('t1')).not.toContain('recent commits'); // description is not the subject
-    expect(titleOf('t2')).toContain('/root/iserver/botmux/src/daemon.ts');
+    expect(titleOf('t2')).toContain('src/daemon.ts');
+    expect(titleOf('t2')).not.toContain('/root/');
     expect(titleOf('t3')).toContain('pnpm run build');
     expect(titleOf('t3')).not.toContain('bash'); // argv boilerplate stripped
     expect(titleOf('t4')).toContain('free -h');
@@ -437,7 +474,7 @@ describe('handleCotThinkingUpdate', () => {
    * and silently fell back to plaintext.
    */
   it('detects the language from the untruncated path, not the shortened title', async () => {
-    const ds = makeDs();
+    const ds = makeDs({ workingDir: '/root/iserver/botmux' });
     const longPath = '/root/iserver/botmux/src/very/deeply/nested/directory/structure/that/goes/on/module.ts';
     expect(longPath.length).toBeGreaterThan(80); // the case only bites past the cap
     handleCotThinkingUpdate(ds, upd([
@@ -459,7 +496,7 @@ describe('handleCotThinkingUpdate', () => {
    * bare label.
    */
   it('recovers a subject by regex when oversized args arrive truncated', async () => {
-    const ds = makeDs();
+    const ds = makeDs({ workingDir: '/root/iserver/botmux' });
     const path = '/root/iserver/botmux/src/core/worker-pool.ts';
     const full = JSON.stringify({ file_path: path, content: 'x'.repeat(2000) });
     const truncated = full.slice(0, 600); // exactly what truncateForCot does
@@ -478,7 +515,8 @@ describe('handleCotThinkingUpdate', () => {
     const bodyOf = (id: string): any =>
       JSON.parse(pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT' && e.content.toolCallId === id)!.content.content);
 
-    expect(titleOf('W')).toContain(path);
+    expect(titleOf('W')).toContain('src/core/worker-pool.ts');
+    expect(titleOf('W')).not.toContain('/root/');
     expect(titleOf('W')).not.toContain('{');       // never the JSON fragment
     expect(bodyOf('W').language).toBe('typescript'); // recovery feeds detection too
     // Incomplete pair → no match → bare label, exactly as before.
@@ -569,7 +607,7 @@ describe('handleCotThinkingUpdate', () => {
   });
 
   it('bounds a long subject for the title but resolves the language from its full form', async () => {
-    const ds = makeDs();
+    const ds = makeDs({ workingDir: '/root/iserver/botmux' });
     const longPath = '/root/iserver/botmux/src/very/deeply/nested/directory/structure/that/goes/on/module.ts';
     expect(longPath.length).toBeGreaterThan(80);
     handleCotThinkingUpdate(ds, upd([

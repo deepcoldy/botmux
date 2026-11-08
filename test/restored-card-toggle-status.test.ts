@@ -412,6 +412,7 @@ describe('Web Terminal link on a restored session', () => {
   // A daemon shutdown leaves the last worker's port persisted (it is also the
   // next fork's preferred listen port), so a restored session still carries it.
   const PERSISTED_PORT = 31219;
+  const VIEW_TOKEN = 'view_cap'.padEnd(43, '0');
   const OPEN = label('card.btn.open_terminal');
   const terminalLinkOf = (card: any): string | undefined =>
     buttonsOf(card).find(b => b.text?.content === OPEN)?.multi_url?.url;
@@ -440,7 +441,8 @@ describe('Web Terminal link on a restored session', () => {
   });
 
   it('direct link with a running worker points at its port', async () => {
-    const ds = restored({ worker: makeFakeWorker(), workerReady: true, workerPort: 40_001, lastScreenStatus: 'idle' });
+    const ds = restored({ worker: makeFakeWorker(), workerReady: true, workerPort: 40_001,
+      workerViewToken: VIEW_TOKEN, lastScreenStatus: 'idle' });
     const card = await toggleCurrent(ds, activate(ds));
     expect(terminalLinkOf(card)).toContain(':40001');
   });
@@ -458,7 +460,7 @@ describe('Web Terminal link on a restored session', () => {
   ])('keeps the diagnostic terminal on the $name card after repeated display toggles', async ({ proxyPort }) => {
     if (proxyPort) setTerminalProxyPort(proxyPort);
     const ds = restored({ worker: makeFakeWorker(), workerReady: false, workerPort: 40_001,
-      crashDiagnosticParked: true, lastScreenStatus: 'idle' });
+      workerViewToken: VIEW_TOKEN, crashDiagnosticParked: true, lastScreenStatus: 'idle' });
     const deps = activate(ds);
     for (let i = 0; i < 2; i++) {
       const card = await toggleCurrent(ds, deps);

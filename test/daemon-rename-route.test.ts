@@ -103,6 +103,7 @@ const mocks = vi.hoisted(() => {
       deps.ds.worktreeCreating = true;
     }),
     persistStreamCardState: vi.fn((impl: (...args: any[]) => any, ...args: any[]) => impl(...args)),
+    consumeQuota: vi.fn(async () => ({ tracked: true, allow: true, exhausted: false, used: 1, limit: 100 })),
   };
 });
 
@@ -216,7 +217,13 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
   return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
 });
 
-import { registerBot } from '../src/bot-registry.js';
+vi.mock('../src/services/grant-store.js', async () => {
+  const actual = await vi.importActual<any>('../src/services/grant-store.js');
+  return { ...actual, consumeQuota: mocks.consumeQuota };
+});
+
+import { __testOnly_resetBotRegistry, loadBotConfigs, registerBot } from '../src/bot-registry.js';
+import { localeForBot, t } from '../src/i18n/index.js';
 import { sessionAnchorId, sessionKey } from '../src/core/types.js';
 import { __testOnly_setCascadeTiming } from '../src/core/cli-idle-wait.js';
 import { recordBotUnionId } from '../src/services/bot-union-ids-store.js';
@@ -321,6 +328,30 @@ describe('document Ask production routing', () => {
       } finally { await server.close(); }
     },
   );
+
+  it('refuses to surface an ask card from a silent listener session into the source group', async () => {
+    registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'codex', allowedUsers: [OWNER] });
+    const ds = seedThreadSession('ml:om_silent_source', 'silent listener task');
+    ds.session.messageListenerRun = { sourceMessageId: 'om_silent_source', replyMode: 'none' as const };
+    let card: PendingAsk | undefined;
+    setCardDispatcher({ async send(ask) { card = ask; return { messageId: 'om_should_not_send' }; } });
+    const secret = 'silent-ask-test-secret';
+    setIpcAuthSecret(secret);
+    const server = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    try {
+      const path = '/api/asks';
+      const response = await fetch(`http://127.0.0.1:${server.port}${path}`, {
+        method: 'POST', headers: daemonIpcAuthHeaders({ secret, port: server.port, method: 'POST', path,
+          headers: { 'content-type': 'application/json' } }),
+        body: JSON.stringify({ sessionId: ds.session.sessionId, larkAppId: APP, chatId: CHAT,
+          rootMessageId: 'ml:om_silent_source', questions, timeoutMs: 60_000,
+          originKind: 'native-user-input', originTurnId: 'turn-silent' }),
+      });
+      expect(response.status).toBe(403);
+      expect(await response.json()).toMatchObject({ ok: false, error: 'silent_message_listener' });
+      expect(card).toBeUndefined();
+    } finally { await server.close(); }
+  });
 
   it.each(['button', 'dm-text'] as const)('keeps async document questions private and preserves their reply route after completion: %s', async answerMode => {
     const ds = seedDocument();
@@ -599,6 +630,27 @@ function seedLiveChatSession(send = vi.fn()): DaemonSession {
   return ds;
 }
 
+/** `/th` `/tw` 的「当前目录」：群里已有一个 chat 会话钉在返回的目录上。 */
+function registerBotWithCurrentDir(options: { gitRepo?: boolean; bot?: Record<string, unknown> } = {}): string {
+  const currentDir = makeRepoFixtureDir();
+  if (options.gitRepo) execFileSync('git', ['init', '-q'], { cwd: currentDir });
+  const bot = registerBot({
+    larkAppId: APP,
+    larkAppSecret: 's',
+    cliId: 'codex',
+    allowedUsers: [OWNER],
+    workingDirs: ['/tmp'],
+    disableStreamingCard: true,
+    ...options.bot,
+  });
+  bot.resolvedAllowedUsers = [OWNER];
+  const existing = seedLiveChatSession();
+  existing.workingDir = currentDir;
+  existing.session.workingDir = currentDir;
+  mocks.sessions.set(existing.session.sessionId, existing.session);
+  return currentDir;
+}
+
 function seedPendingRawSession(anchor: string): DaemonSession {
   const ds = seedThreadSession(anchor, 'pending raw');
   ds.pendingRepo = true;
@@ -657,6 +709,11 @@ function repliedText(): string {
   return [...mocks.replyMessage.mock.calls, ...mocks.sendMessage.mock.calls]
     .map(call => String(call[2] ?? ''))
     .join('\n');
+}
+
+/** Whether a reply carried this i18n entry (compared against the dictionary, not pinned copy). */
+function repliedKey(key: string, params?: Record<string, string>): boolean {
+  return repliedText().includes(t(key, params, localeForBot(APP)));
 }
 
 function crossRefPath(): string {
@@ -2129,6 +2186,218 @@ describe('/rename production routing — must not pre-create a session (review P
   });
 
 
+
+  it.each([
+    ['skill', '/th /teach explain the implementation', '/teach explain the implementation', false],
+    ['cold-start passthrough', '/th\n/goal fix login', '/goal fix login', true],
+  ])('`/th` followed by a %s keeps the current working directory and forwards the slash text', async (_kind, text, forwarded, raw) => {
+    const currentDir = makeRepoFixtureDir();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      workingDirs: ['/tmp'],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const existing = seedLiveChatSession();
+    existing.workingDir = currentDir;
+    existing.session.workingDir = currentDir;
+    mocks.sessions.set(existing.session.sessionId, existing.session);
+
+    await handleNewTopic(
+      makeEventData('om_th_slash', text),
+      makeCtx('om_th_slash', 'om_th_slash'),
+    );
+
+    const ds = activeSessions.get(sessionKey('om_th_slash', APP));
+    expect(ds?.workingDir).toBe(currentDir);
+    expect(ds?.pendingRepo).toBe(false);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    if (raw) {
+      expect(mocks.forkWorker.mock.calls[0]?.[0]?.pendingRawInput).toBe(forwarded);
+      expect(mocks.forkWorker.mock.calls[0]?.[1]).toBe('');
+    } else {
+      expect(JSON.stringify(mocks.forkWorker.mock.calls[0])).toContain(forwarded);
+    }
+  });
+
+
+
+  it('`/th` + a precreate daemon command pins the command session to the current working directory', async () => {
+    const currentDir = makeRepoFixtureDir();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      workingDirs: ['/tmp'],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const existing = seedLiveChatSession();
+    existing.workingDir = currentDir;
+    existing.session.workingDir = currentDir;
+    mocks.sessions.set(existing.session.sessionId, existing.session);
+
+    await handleNewTopic(
+      makeEventData('om_th_status', '/th /status'),
+      makeCtx('om_th_status', 'om_th_status'),
+    );
+
+    const ds = activeSessions.get(sessionKey('om_th_status', APP));
+    expect(ds?.workingDir).toBe(currentDir);
+    expect(ds?.session.workingDir).toBe(currentDir);
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('`/th /status` leaves no pending opening behind: the next real task in the topic forks the CLI', async () => {
+    // 命令会话若留着 initialStartPending，话题里之后的每条消息都会排进 activation tail，
+    // 永远等不到一个不会发生的开场——整个话题被静默挂起。
+    const currentDir = registerBotWithCurrentDir();
+    await handleNewTopic(
+      makeEventData('om_th_status_next', '/th /status'),
+      makeCtx('om_th_status_next', 'om_th_status_next'),
+    );
+    const ds = activeSessions.get(sessionKey('om_th_status_next', APP))!;
+    expect(ds.initialStartPending).toBeFalsy();
+    expect(ds.pendingCodexAppText).toBeUndefined();
+
+    await handleThreadReply(
+      makeEventData('om_th_status_next_task', '修一下登录', 'om_th_status_next'),
+      makeCtx('om_th_status_next', 'om_th_status_next_task'),
+    );
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[0]).toBe(ds);
+    expect(ds.workingDir).toBe(currentDir);
+    expect(JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1])).toContain('修一下登录');
+  });
+
+  it('`/th /cd <dir>` switches the directory instead of hitting the unsettled-opening guard', async () => {
+    registerBotWithCurrentDir();
+    await handleNewTopic(makeEventData('om_th_cd', '/th /cd /tmp'), makeCtx('om_th_cd', 'om_th_cd'));
+
+    const ds = activeSessions.get(sessionKey('om_th_cd', APP));
+    expect(ds?.initialStartPending).toBeFalsy();
+    expect(ds?.workingDir).toBe('/tmp');
+  });
+
+  it('`/th /restart` publishes the restart card instead of hitting the unsettled-opening guard', async () => {
+    registerBotWithCurrentDir();
+    await handleNewTopic(makeEventData('om_th_restart', '/th /restart'), makeCtx('om_th_restart', 'om_th_restart'));
+
+    expect(activeSessions.get(sessionKey('om_th_restart', APP))?.initialStartPending).toBeFalsy();
+    expect(mocks.replyMessage.mock.calls.some(call => call[3] === 'interactive')).toBe(true);
+  });
+
+  it('`/th /status` charges no message quota, like plain `/status`; `/th <task>` still charges', async () => {
+    const GUEST = 'ou_th_quota_guest';
+    registerBotWithCurrentDir({ bot: { globalGrants: [GUEST], canTalkDaemonCommands: ['/status'] } });
+    const guestEvent = (messageId: string, text: string) => {
+      const data = makeEventData(messageId, text);
+      data.sender = { sender_id: { open_id: GUEST }, sender_type: 'user' };
+      return data;
+    };
+
+    await handleNewTopic(guestEvent('om_th_quota_status', '/th /status'), makeCtx('om_th_quota_status', 'om_th_quota_status'));
+    expect(activeSessions.get(sessionKey('om_th_quota_status', APP))).toBeDefined();
+    expect(mocks.consumeQuota).not.toHaveBeenCalled();
+
+    await handleNewTopic(guestEvent('om_th_quota_task', '/th 修登录'), makeCtx('om_th_quota_task', 'om_th_quota_task'));
+    expect(mocks.consumeQuota).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['/th /status', '/th /goal 修登录'])('`%s` runs the defaultOncall auto-bind before picking the current directory', async (text) => {
+    // 自动绑定会写 bots.json，必须有已加载的配置路径；用完重置，免得路径漏到后面的用例。
+    const oncallDir = makeRepoFixtureDir();
+    const entry = {
+      larkAppId: APP, larkAppSecret: 's', cliId: 'codex', allowedUsers: [OWNER], workingDirs: ['/tmp'],
+      disableStreamingCard: true, defaultOncall: { enabled: true, workingDir: oncallDir, since: 1 },
+    };
+    writeFileSync(botsConfigPath(), JSON.stringify([entry]));
+    try {
+      loadBotConfigs();
+      registerBot(entry).resolvedAllowedUsers = [OWNER];
+
+      await handleNewTopic(makeEventData('om_th_oncall', text), makeCtx('om_th_oncall', 'om_th_oncall'));
+
+      expect(activeSessions.get(sessionKey('om_th_oncall', APP))?.workingDir).toBe(oncallDir);
+    } finally {
+      __testOnly_resetBotRegistry();
+    }
+  });
+
+  it.each(['/th /status', '/th /goal 修登录', '/tw /goal 修登录'])('`%s` with no reusable directory only replies, without creating a session', async (text) => {
+    registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'codex', allowedUsers: [OWNER], workingDirs: ['/tmp'], disableStreamingCard: true })
+      .resolvedAllowedUsers = [OWNER];
+
+    await handleNewTopic(makeEventData('om_th_nodir', text), makeCtx('om_th_nodir', 'om_th_nodir'));
+
+    expect(repliedKey('daemon.force_topic_current_dir_missing')).toBe(true);
+    expect(activeSessions.get(sessionKey('om_th_nodir', APP))).toBeUndefined();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.runAutoWorktreeCommit).not.toHaveBeenCalled();
+  });
+
+  it.each(['/th /compact', '/tw /compact'])('`%s` replies like `/t /compact` (needs an existing session) instead of cold-starting', async (text) => {
+    registerBotWithCurrentDir({ gitRepo: true });
+    await handleNewTopic(makeEventData('om_th_compact', text), makeCtx('om_th_compact', 'om_th_compact'));
+
+    expect(repliedKey('daemon.cmd_requires_session', { cmd: '/compact' })).toBe(true);
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.runAutoWorktreeCommit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['/tw /status', '/status'],
+    ['/tw /close', '/close'],
+    ['/tw /cd /tmp', '/cd'],
+    ['/topic worktree /status', '/status'],
+  ])('`%s` is rejected up front: no session and no worktree build', async (text, cmd) => {
+    // worktree 在后台异步建，命令执行时还没有落地目录：/status 报基目录、/cd 被 worktree
+    // 盖掉、/close 之后 worktree 照建。这里必须在建会话之前就拒绝。
+    registerBotWithCurrentDir({ gitRepo: true });
+    await handleNewTopic(makeEventData('om_tw_cmd', text), makeCtx('om_tw_cmd', 'om_tw_cmd'));
+
+    expect(repliedKey('daemon.force_topic_worktree_command_unsupported', { cmd })).toBe(true);
+    expect(activeSessions.get(sessionKey('om_tw_cmd', APP))).toBeUndefined();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(mocks.runAutoWorktreeCommit).not.toHaveBeenCalled();
+  });
+
+  it('`/tw /goal …` cold-starts the raw command in the forced worktree without a trailing empty `<user_message>` turn', async () => {
+    const currentDir = registerBotWithCurrentDir({ gitRepo: true });
+    await handleNewTopic(makeEventData('om_tw_goal', '/tw /goal 修登录'), makeCtx('om_tw_goal', 'om_tw_goal'));
+
+    const ds = activeSessions.get(sessionKey('om_tw_goal', APP))!;
+    const setup = (ds.session as any).pendingRepoSetup;
+    expect(ds.pendingRepo).toBe(true);
+    expect(ds.pendingCodexAppText).toBeUndefined();
+    expect(setup).toMatchObject({ rawInput: '/goal 修登录', force: true, reuseExisting: true });
+    expect(setup.codexAppText).toBeUndefined();
+    expect(mocks.runAutoWorktreeCommit).toHaveBeenCalledWith(expect.objectContaining({
+      ds,
+      baseDir: currentDir,
+      force: true,
+      reuseExisting: true,
+      branch: expect.stringMatching(/^wt\/botmux-/),
+    }));
+
+    const { commitRepoSelection } = await import('../src/im/lark/card-handler.js');
+    await commitRepoSelection({
+      ds, rootId: 'om_tw_goal', larkAppId: APP, activeSessions, sessionReply: async () => 'om_x',
+    }, currentDir, 'wt', { suppressConfirmReply: true });
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[1]).toBe('');
+    expect(ds.pendingRawInput).toBe('/goal 修登录');
+    expect(ds.pendingFollowUpInput).toBeUndefined();
+  });
 
   it('`/tw <content>` creates a topic that starts from a worktree of the current chat working directory', async () => {
     const repoRoot = makeRepoFixtureDir();

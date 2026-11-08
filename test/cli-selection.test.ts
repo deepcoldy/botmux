@@ -17,6 +17,8 @@ import {
   decorateResumeForWrapper,
   isTtadkWrapper,
   ttadkAcceptsModel,
+  wrapperIdentityTokens,
+  wrapperLaunchEnv,
   ttadkConfigModelChoices,
   TTADK_DEFAULT_MODEL,
   TTADK_MODEL_SUGGESTIONS,
@@ -1081,5 +1083,70 @@ describe('Codex model-nudge override through wrappers', () => {
         expect(out.args).toContain('model.name=coco-model');
       }
     }
+  });
+});
+
+describe('wrapper launcher written as an absolute path', () => {
+  it('identifies the launcher by its file name only', () => {
+    expect(wrapperIdentityTokens('/opt/aiden/bin/aiden x claude')).toEqual(['aiden', 'x', 'claude']);
+    expect(wrapperIdentityTokens('  aiden   x codex ')).toEqual(['aiden', 'x', 'codex']);
+    expect(wrapperIdentityTokens('/home/aiden/bin/claude-w --fast')).toEqual(['claude-w', '--fast']);
+    expect(wrapperIdentityTokens(undefined)).toEqual([]);
+  });
+
+  it('strips --settings for an absolute-path aiden x claude and spawns that exact path', () => {
+    const out = buildWrappedLaunch('/opt/aiden/bin/aiden x claude', ['--session-id', 'sid', '--settings', '{}', '--plugin-dir', '/p'], (b) => `resolved:${b}`);
+    expect(out.bin).toBe('resolved:/opt/aiden/bin/aiden');
+    expect(out.args).toEqual(['x', 'claude', '--session-id', 'sid', '--plugin-dir', '/p']);
+  });
+
+  it('routes an absolute-path aiden x codex through the aiden codex rewrite', () => {
+    const out = buildWrappedLaunch('/opt/aiden/bin/aiden x codex', [
+      '-c', 'check_for_update_on_startup=false', '--no-alt-screen', '-C', '/repo',
+    ]);
+    expect(out.bin).toBe('/opt/aiden/bin/aiden');
+    expect(out.args).toEqual(['x', 'codex', '--no-alt-screen', '-C', '/repo']);
+
+    const withEffort = buildWrappedLaunch(
+      '/opt/aiden/bin/aiden x codex',
+      ['-c', 'model_reasoning_effort="high"', '--no-alt-screen'],
+      (bin) => bin,
+      { aidenCodexShimDir: '/botmux/shim', aidenCodexRealBin: '/resolved/codex' },
+    );
+    expect(withEffort.bin).toBe('/botmux/shim/launch');
+    expect(withEffort.args).toEqual(['/opt/aiden/bin/aiden', 'x', 'codex', '--no-alt-screen']);
+    expect(withEffort.env).toMatchObject({
+      BOTMUX_AIDEN_CODEX_REAL_BIN: '/resolved/codex',
+      BOTMUX_AIDEN_CODEX_REASONING_EFFORT: 'high',
+    });
+  });
+
+  it('rewrites -c to --config and disables the selector for an absolute-path cjadk codex', () => {
+    const out = buildWrappedLaunch('/usr/local/bin/cjadk codex', [
+      '-c', 'shell_environment_policy.set.BOTMUX_SESSION_ID="s"', '--no-alt-screen',
+    ]);
+    expect(out.bin).toBe('/usr/local/bin/cjadk');
+    expect(out.args).toEqual(['codex', '--config', 'shell_environment_policy.set.BOTMUX_SESSION_ID="s"', '--no-alt-screen']);
+    expect(wrapperLaunchEnv('/usr/local/bin/cjadk codex')).toEqual({ CJADK_INTERACTIVE: '0' });
+  });
+
+  it('injects the ttadk model flags and keeps the configured path for an absolute-path ttadk', () => {
+    expect(isTtadkWrapper('/opt/ttadk/bin/ttadk claude')).toBe(true);
+    expect(ttadkAcceptsModel('/opt/ttadk/bin/ttadk claude')).toBe(true);
+    const out = buildWrappedLaunch('/opt/ttadk/bin/ttadk claude', ['--resume', 'x'], (b) => b, { ttadkModel: 'glm-5.1' });
+    expect(out.bin).toBe('/opt/ttadk/bin/ttadk');
+    expect(out.args).toEqual(['claude', '-m', 'glm-5.1', '--skip-check', '--resume', 'x']);
+    expect(decorateResumeForWrapper('claude --resume ID', '/opt/ttadk/bin/ttadk claude', { ttadkModel: 'glm-5.1' }))
+      .toBe('/opt/ttadk/bin/ttadk claude -m glm-5.1 --skip-check --resume ID');
+  });
+
+  it('leaves launchers whose file name only resembles a known gateway untouched', () => {
+    const args = ['--settings', '{}', '-c', 'shell_environment_policy.set.BOTMUX_SESSION_ID="s"'];
+    for (const wrapper of ['/opt/aiden/bin/claude-w', '/opt/bin/aiden-beta x claude', '/opt/bin/cjadk2 codex']) {
+      const out = buildWrappedLaunch(wrapper, args);
+      expect(out.args.slice(-args.length)).toEqual(args);
+      expect(wrapperLaunchEnv(wrapper)).toBeUndefined();
+    }
+    expect(isTtadkWrapper('/opt/bin/ttadk-dev claude')).toBe(false);
   });
 });
