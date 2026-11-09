@@ -279,7 +279,7 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
 | 字段 | 说明 |
 |------|------|
 | `family` | `chrome` 或 `edge` |
-| `pluginRoot` | 自定义插件目录（绝对路径）。一般不用填，默认从 `CODEX_HOME`（或 `~/.codex`）的官方插件缓存里选最新版本 |
+| `pluginRoot` | 自定义插件目录（绝对路径），填了就只用这一份。一般不用填，默认在 `CODEX_HOME`（或 `~/.codex`）的官方插件缓存和 Codex / ChatGPT 桌面端自带的插件里，选版本最新且文件完整的一份 |
 | `autoApproveOrigins` | 访问 HTTP/HTTPS 站点时不再逐站弹授权卡。默认关闭；登录凭据、上传下载、浏览历史和完整开发者工具不在自动授权范围内，也不会写入「始终允许」 |
 
 使用前提和边界：
