@@ -401,6 +401,73 @@ describe('final delivery retry edge', () => {
 });
 
 describe('independent review regressions', () => {
+  it('settles an early native receipt together with its later explicit commit', async () => {
+    const ds = makeDs();
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    // TRAE supports RPC input. worker.ts emits native acceptance immediately
+    // after sendTurn(), before the deferred explicit-attempt commit below.
+    worker.emit('message', { type: 'native_input_consumed', turnId: 'om_native_first', proofKind: 'codex_rpc_turn_start' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_native_first', dispatchAttempt: 2 });
+    worker.emit('message', { type: 'turn_terminal', turnId: 'om_native_first', dispatchAttempt: 2, sessionId: ds.session.sessionId });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(true);
+  });
+
+  it('does not assume an un-attempted native receipt belongs to an older settled attempt', async () => {
+    const ds = makeDs();
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'turn_terminal', turnId: 'om_native_retry', dispatchAttempt: 1, sessionId: ds.session.sessionId });
+    // This can be the new attempt's submit proof before its commit ACK. An
+    // attempt-1 terminal alone cannot prove it is an attempt-1 duplicate.
+    worker.emit('message', { type: 'native_input_consumed', turnId: 'om_native_retry', proofKind: 'codex_rpc_turn_start' });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(false);
+  });
+
+  it('keeps automatic reclaim blocked after unresolved obligations exceed the actual cap', async () => {
+    const ds = makeDs();
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    for (let index = 0; index < 4097; index += 1) {
+      worker.emit('message', { type: 'turn_input_committed', turnId: `om_overflow_${index}` });
+    }
+    expect(ds.acceptedInputOverflow).toBe(true);
+    for (let index = 0; index < 4097; index += 1) {
+      worker.emit('message', { type: 'turn_terminal', turnId: `om_overflow_${index}`, sessionId: ds.session.sessionId });
+    }
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(false);
+  });
+
+  it('settles a native receipt carrying the same explicit attempt as commit/terminal', async () => {
+    const ds = makeDs();
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'native_input_consumed', turnId: 'om_native_exact', dispatchAttempt: 2, proofKind: 'codex_rpc_turn_start' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_native_exact', dispatchAttempt: 2 });
+    worker.emit('message', { type: 'turn_terminal', turnId: 'om_native_exact', dispatchAttempt: 2, sessionId: ds.session.sessionId });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(true);
+  });
+
+  it('does not let an older attempt native receipt or terminal release a newer attempt', async () => {
+    const ds = makeDs();
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_native_late', dispatchAttempt: 2 });
+    // A late attempt-1 native proof must not downgrade/duplicate the live
+    // attempt-2 obligation, and a late attempt-1 terminal must not settle it.
+    worker.emit('message', { type: 'native_input_consumed', turnId: 'om_native_late', dispatchAttempt: 1, proofKind: 'codex_rpc_turn_start' });
+    worker.emit('message', { type: 'turn_terminal', turnId: 'om_native_late', dispatchAttempt: 1, sessionId: ds.session.sessionId });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(false);
+    worker.emit('message', { type: 'turn_terminal', turnId: 'om_native_late', dispatchAttempt: 2, sessionId: ds.session.sessionId });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(true);
+  });
+
   it('does not revive completed work when a committed duplicate is re-ACKed', async () => {
     const ds = makeDs();
     const worker = ds.worker as any;

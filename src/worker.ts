@@ -1780,7 +1780,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       if (first.outcome === 'accepted') {
         // Acknowledged (or rollout-evidenced) first turn on the fresh thread.
         // 'ambiguous' stays on the terminal fallback: dispatched is not accepted.
-        acknowledgeNativeInputConsumed(cfg.turnId, 'codex_rpc_turn_start', engine.activeThreadId, first.nativeTurnId);
+        acknowledgeNativeInputConsumed(cfg.turnId, 'codex_rpc_turn_start', engine.activeThreadId, first.nativeTurnId, cfg.dispatchAttempt);
       }
       // Fresh RPC delivery bypasses flushPending(), which is the normal owner
       // of this durable head-of-line gate. Claim it here only after the frame is
@@ -13017,7 +13017,7 @@ function maybeBindUnprovenCodexSession(): boolean {
   persistCliSessionId(pending.sessionId);
   // Now the exact owned history match writeInput would have reported.
   if (codexHistoryMatchProvesConsumption()) {
-    acknowledgeNativeInputConsumed(pending.turnId, 'codex_history_match', pending.sessionId);
+    acknowledgeNativeInputConsumed(pending.turnId, 'codex_history_match', pending.sessionId, undefined, pending.dispatchAttempt);
   }
   void syncFreshCodexNativeSessionTitle(pending.sessionId, codexRpcEngine);
   codexBridgeAttach(path, codexBridgeUsesSplitLiveAttach() ? 'split-live' : 'fresh-empty');
@@ -20290,7 +20290,7 @@ function scheduleSubmitFailureNotify(
     switch (action.kind) {
       case 'suppress-confirmed':
         if (deferNativeCodexInputCommit(turnIdentity?.dispatchAttempt)) {
-          acknowledgeTurnInputCommitted(turnIdentity?.turnId);
+          acknowledgeTurnInputCommitted(turnIdentity?.turnId, turnIdentity?.dispatchAttempt);
         }
         queuePostSubmitNativeSessionTitle(turnIdentity?.nativeSessionTitle);
         if (cliSessionId) {
@@ -20308,7 +20308,7 @@ function scheduleSubmitFailureNotify(
         // immediate one; other CLIs' rechecks stay on the terminal fallback.
         if (settlement.ownershipProven === true && codexHistoryMatchProvesConsumption()) {
           acknowledgeNativeInputConsumed(turnIdentity?.turnId, 'codex_history_match',
-            cliSessionId ?? lastInitConfig?.cliSessionId);
+            cliSessionId ?? lastInitConfig?.cliSessionId, undefined, turnIdentity?.dispatchAttempt);
         }
         onConfirmed?.(cliSessionId);
         log(`Deferred recheck found submit in ${transcriptLabel} — suppressing warning. preview="${preview}"`);
@@ -21532,7 +21532,8 @@ async function flushPending(): Promise<void> {
           // The app-server acknowledged turn/start for this exact input on
           // the engine's active thread, fenced to the current generation.
           acknowledgeNativeInputConsumed(item.turnId, 'codex_rpc_turn_start',
-            writeRpcEngine.activeThreadId ?? lastInitConfig?.cliSessionId, rpcNativeTurnId);
+            writeRpcEngine.activeThreadId ?? lastInitConfig?.cliSessionId, rpcNativeTurnId,
+            item.dispatchAttempt);
           // Only the ACKed, still-current generation may create bridge state.
           // While turn/start was pending, codexBridgeIngest left its cursor
           // untouched; marking now therefore still precedes replay of any
@@ -21828,7 +21829,7 @@ async function flushPending(): Promise<void> {
       // POSITIVELY owned line proves this pane consumed the input.
       if (result?.submitted === true && result.ownershipProven === true && codexHistoryMatchProvesConsumption()) {
         acknowledgeNativeInputConsumed(item.turnId, 'codex_history_match',
-          result.cliSessionId ?? lastInitConfig?.cliSessionId);
+          result.cliSessionId ?? lastInitConfig?.cliSessionId, undefined, item.dispatchAttempt);
       }
       if (lastInitConfig?.cliId === 'codex' && result?.submitted !== false) {
         const threadId = result?.cliSessionId
@@ -33457,6 +33458,7 @@ function acknowledgeNativeInputConsumed(
   proofKind: Extract<WorkerToDaemon, { type: 'native_input_consumed' }>['proofKind'],
   nativeSessionId?: string,
   nativeTurnId?: string,
+  dispatchAttempt?: number,
 ): void {
   if (!turnId) return;
   // The CLI has the input in its own history: a crash no longer re-delivers
@@ -33464,6 +33466,7 @@ function acknowledgeNativeInputConsumed(
   inflightInputs.onTurnStarted(turnId);
   send({
     type: 'native_input_consumed', turnId, proofKind,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(lastWrittenCliInput?.turnId === turnId && isUnsentInputReplayable(lastWrittenCliInput)
       && lastWrittenCliInput.trustedCaller?.senderType === 'user'
       ? { ordinaryInteractive: true as const } : {}),

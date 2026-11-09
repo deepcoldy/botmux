@@ -9984,11 +9984,46 @@ function noteAcceptedInputTurn(
   // Overflow is a conservative block for the rest of the generation; tracking
   // more individually cannot make the reclaim decision any safer.
   if (ds.acceptedInputOverflow) return;
+  const turns = ds.acceptedInputTurns ?? (ds.acceptedInputTurns = new Map());
   const key = acceptedInputTurnKey(turnId, dispatchAttempt);
   // A duplicate ACK for an execution that already terminated is a transport
-  // retry, not new work. Do not resurrect an obligation nobody will settle.
+  // retry, not new work. Only an EXACT settled key proves that: an older
+  // attempt's terminal says nothing about this identity.
   if (ds.settledInputTurns?.has(key)) return;
-  const turns = ds.acceptedInputTurns ?? (ds.acceptedInputTurns = new Map());
+
+  if (dispatchAttempt !== undefined) {
+    // A receipt observed earlier without an attempt belongs to this same
+    // in-flight execution (a session runs one turn at a time). Adopt it under
+    // the provable identity so the exact terminal settles one obligation
+    // instead of leaving an un-attempted orphan behind.
+    const unprovenKey = acceptedInputTurnKey(turnId, undefined);
+    const unproven = turns.get(unprovenKey);
+    if (unproven && unproven.workerGeneration === workerGeneration && !turns.has(key)) {
+      turns.delete(unprovenKey);
+      turns.set(key, {
+        workerGeneration,
+        turnId,
+        dispatchAttempt,
+        phase: unproven.phase === 'native-submit' ? 'native-submit' : phase,
+        at: Date.now(),
+      });
+      return;
+    }
+  } else {
+    // Without a provable attempt, upgrade an existing live obligation for this
+    // turn in the same generation rather than creating a second one that no
+    // exact terminal can settle. When none exists this is a first observation:
+    // register it conservatively even if a DIFFERENT attempt settled earlier.
+    for (const [existingKey, entry] of turns) {
+      if (entry.turnId !== turnId || entry.workerGeneration !== workerGeneration) continue;
+      entry.phase = entry.phase === 'native-submit' ? 'native-submit' : phase;
+      entry.at = Date.now();
+      turns.delete(existingKey);
+      turns.set(existingKey, entry);
+      return;
+    }
+  }
+
   const previous = turns.get(key);
   // A later queue-commit observation must never downgrade proven native submit.
   const nextPhase = previous?.phase === 'native-submit' ? 'native-submit' : phase;
@@ -10007,39 +10042,17 @@ function noteAcceptedInputTurn(
   }
 }
 
-/** Native receipts carry no dispatchAttempt: upgrade every tracked obligation
- *  for the turn, or register one when the commit ACK was not observed. Phase
- *  is diagnostic; both phases already block an install-change reclaim. */
+/** Native acceptance proof. When the receipt names the exact dispatch attempt
+ *  it joins the queue-commit/terminal obligation; otherwise it upgrades an
+ *  existing live obligation or registers an un-attempted one conservatively.
+ *  Phase is diagnostic; both phases already block an install-change reclaim. */
 function noteNativeAcceptedInputTurn(
   ds: DaemonSession,
   turnId: string | undefined,
+  dispatchAttempt: number | undefined,
   workerGeneration: number,
 ): void {
-  if (!turnId || ds.acceptedInputOverflow) return;
-  let upgraded = false;
-  for (const entry of ds.acceptedInputTurns?.values() ?? []) {
-    if (entry.turnId !== turnId || entry.workerGeneration !== workerGeneration) continue;
-    entry.phase = 'native-submit';
-    upgraded = true;
-  }
-  if (upgraded) return;
-  // No commit obligation to upgrade. A receipt for an execution that already
-  // settled is a late duplicate, not a new obligation.
-  if (hasSettledInputTurn(ds, turnId)) return;
-  noteAcceptedInputTurn(ds, turnId, undefined, workerGeneration, 'native-submit');
-}
-
-/** Any settled execution (regardless of attempt) for this turnId. Native
- *  receipts carry no attempt, so this is the only conservative way to tell a
- *  late duplicate from a first observation. */
-function hasSettledInputTurn(ds: DaemonSession, turnId: string): boolean {
-  const settled = ds.settledInputTurns;
-  if (!settled) return false;
-  const prefix = `${turnId}\0`;
-  for (const key of settled.keys()) {
-    if (key.startsWith(prefix)) return true;
-  }
-  return false;
+  noteAcceptedInputTurn(ds, turnId, dispatchAttempt, workerGeneration, 'native-submit');
 }
 
 function settleAcceptedInputTurn(
@@ -18886,7 +18899,7 @@ function setupWorkerHandlers(
         }
         // Native proof upgrades the phase, but a submitted turn is still owned
         // work until its terminal: reclaim must wait for that boundary too.
-        noteNativeAcceptedInputTurn(ds, msg.turnId, workerGeneration);
+        noteNativeAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, workerGeneration);
         try {
           cb.onNativeInputConsumed?.(ds, msg, { workerGeneration });
         } catch (err) {
@@ -18905,7 +18918,7 @@ function setupWorkerHandlers(
         }
         // A native submit proof still leaves the turn running; keep it protected
         // until the terminal arrives.
-        noteNativeAcceptedInputTurn(ds, msg.turnId, workerGeneration);
+        noteNativeAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, workerGeneration);
         try {
           cb.onPromptSubmittedInput?.(ds, msg.turnId, { workerGeneration });
         } catch (err) {
