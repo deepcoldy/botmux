@@ -15,6 +15,7 @@ import { loadWorkerPoolClosure, loadWorkerPoolFunction } from './helpers/worker-
 import type { DaemonSession } from '../src/core/types.js';
 import { sameWorker, sameRuntime } from '../src/services/session-contract.js';
 import { RestartCoordinator } from '../src/core/restart-coordinator.js';
+import { RUNTIME_RESERVATION_DEADLINE_MS, RuntimeReservationExpiredError } from '../src/services/runtime-reservation.js';
 import { prepareCodexAppDispatch, hasUnsettledCodexAppDispatch } from '../src/utils/codex-app-dispatch-ledger.js';
 
 const fixtureConfig = vi.hoisted(() => ({ dataDir: '' }));
@@ -128,13 +129,13 @@ describe('contract gateway and real worker boundaries', () => {
     await handler({ ...message, sessionContract: { ...context, producer: { workerId: 'unproven-worker', generation: 1 } } });
     expect(s.store.deferredEvents(s.ref, 'legitimate-pending')).toEqual([message]);
   });
-  it.each(['refused', 'timeout'] as const)('settles a %s spawn reservation and restores the surviving binding before a genuine crash', async condition => {
+  it.each(['refused', 'unanswered'] as const)('settles a %s spawn reservation and restores the surviving binding before a genuine crash', async condition => {
     vi.useFakeTimers(); const s = fixture();
     const workerScope = new WorkerSessionEventScope(s.ref, s.worker); const previous = workerScope.beginRuntime(); workerScope.assign(previous.bindingId, s.runtime);
     const reservations = new Map(); const pending: Promise<void>[] = [];
     const env: any = { workerSessionEventScope: workerScope, pendingRuntimeReservations: reservations,
       activeRestartAttemptId: undefined, closeRequested: false, initialInputOwnershipPending: false,
-      spawnCliBody: vi.fn(), publishRuntimeContract: vi.fn(), CliSpawnSupersededError: class extends Error {} };
+      spawnCliBody: vi.fn(), publishRuntimeContract: vi.fn(), CliSpawnSupersededError: class extends Error {}, log: vi.fn() };
     const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', env);
     s.controller.ingest(workerScope.run(previous, () => metadata({ type: 'ready' })), s.worker);
     s.controller.ingest(workerScope.run(previous, () => metadata({ type: 'prompt_ready' })), s.worker);
@@ -147,10 +148,11 @@ describe('contract gateway and real worker boundaries', () => {
     const host = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', hostScope); hostScope.handleWorkerMessage = host;
     env.send = (message: any) => { pending.push(host(metadata(message))); };
     const spawn = loadWorkerFunction<(cfg: any) => Promise<void>>('spawnCli', env);
-    const started = spawn({ prompt: '' }); const rejected = expect(started).rejects.toBeInstanceOf(Error);
+    const started = spawn({ prompt: '' });
+    const rejected = expect(started).rejects.toBeInstanceOf(condition === 'refused' ? env.CliSpawnSupersededError : RuntimeReservationExpiredError);
     const abandoned = workerScope.currentBinding()!;
     if (condition === 'refused') { s.controller.beginControl('close', 'close-during-start'); release(); }
-    else { await vi.advanceTimersByTimeAsync(15_001); release(); }
+    else { await vi.advanceTimersByTimeAsync(RUNTIME_RESERVATION_DEADLINE_MS + 1); release(); }
     await rejected; await Promise.all(pending); await Promise.all(pending);
     if (condition === 'refused') s.controller.controlResult('close-during-start', 'rejected');
     expect(env.spawnCliBody).not.toHaveBeenCalled(); expect(workerScope.currentBinding()).toBe(previous);
@@ -524,6 +526,8 @@ describe('contract gateway and real worker boundaries', () => {
       const wire = scope.run(binding, () => metadata({ type, sessionId: s.ref.sessionId, turnId: 'never-admitted', capability: 'unknown-capability' }));
       expect(wire.sessionContract.scope.execution).toBeUndefined();
       await handler(wire);
+      expect(handlerScope.logger.warn).toHaveBeenLastCalledWith(
+        `[test] Dropped ${type} from current worker turn=never-admitted reason=execution_scope_missing`);
     }
     expect(legacy).not.toHaveBeenCalled();
     expect(s.ds.managedTurnOrigin).toBeUndefined();
