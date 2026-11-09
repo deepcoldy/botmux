@@ -2546,6 +2546,9 @@ export type WorkerToDaemonBase =
       /** The install entry this worker's adapter resolved at spawn. The daemon
        * re-resolves it to detect an install replacement under the process. */
       cliInstallEntry?: string;
+      /** `cliInstallEntry` statted right before the spawn that produced
+       * `cliSpawnGeneration`. Absent when it did not resolve. */
+      cliInstallAtSpawn?: import('./services/cli-install-identity.js').ExecutableIdentity;
       /** Monotonic per-worker CLI spawn counter. Late attestations from an
        * older spawn are rejected by the daemon handler. */
       cliSpawnGeneration?: number;

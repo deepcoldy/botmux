@@ -155,3 +155,22 @@ export function compareRunningToInstall(
   if (running.size !== install.size || running.mtimeNs !== install.mtimeNs) return 'stale';
   return 'current';
 }
+
+/**
+ * `compareRunningToInstall` for a process PROVEN to have been launched from the
+ * install entry: the entry, statted right before spawn, must have resolved to
+ * the very object the process runs. Otherwise the entry may be a wrapper script
+ * or launcher that execs a binary elsewhere; its identity never matches the
+ * running image, and that mismatch must not read as an upgrade.
+ *
+ * The sweep and the pre-suspend re-validation both decide through this, so a
+ * queued claim is never judged by a looser rule than the one that queued it.
+ */
+export function compareLaunchedInstall(
+  running: ExecutableIdentity | undefined,
+  installAtSpawn: ExecutableIdentity | undefined,
+  install: ExecutableIdentity | undefined,
+): ExecutableIdentityComparison {
+  if (!sameExecutableObject(running, installAtSpawn)) return 'unknown';
+  return compareRunningToInstall(running, install);
+}

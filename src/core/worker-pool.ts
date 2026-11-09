@@ -2,7 +2,7 @@ import { controllerForSession, type WorkerContractContext } from './session-cont
 import { sameWorker, sameRuntime } from '../services/session-contract.js';
 import { observeTraexInstall } from '../services/traex-install-watch.js';
 import {
-  compareRunningToInstall,
+  compareLaunchedInstall,
   readRunningExeIdentity,
   resolveInstallIdentity,
   sameExecutableObject,
@@ -10477,7 +10477,8 @@ type InstallClaimVerdict = 'stale' | 'replaced' | 'reverted' | 'unknown';
  * - a recorded pid/birth must still name the same process, and the kernel's
  *   current `/proc/<pid>/exe` must still be the very object we attested;
  * - the install entry is statted FRESH (bypassing the sweep cache), and must
- *   still resolve to a different physical object.
+ *   still resolve to a different physical object, judged by the same
+ *   launched-from-entry rule as the sweep (`compareLaunchedInstall`).
  *
  * `unknown` (no attestation, unreadable exe, unprovable mapping) never
  * authorizes the suspend; the claim is kept for a later checkpoint.
@@ -10503,7 +10504,7 @@ function revalidateInstallChangeClaim(
   }
   const install = resolveInstallIdentity(claim.entry);
   if (!install) return 'unknown';
-  const comparison = compareRunningToInstall(claim.running, install);
+  const comparison = compareLaunchedInstall(claim.running, claim.installAtSpawn, install);
   if (comparison === 'current') return 'reverted';
   if (comparison === 'unknown') return 'unknown';
   return 'stale';
@@ -10668,9 +10669,17 @@ export const __testOnly_canSafelyReclaimWorkerForInstallChange = canSafelyReclai
  */
 export function requestInstallChangeSuspend(
   ds: DaemonSession,
-  detail: { entry: string; running: ExecutableIdentity; install: ExecutableIdentity },
+  detail: {
+    entry: string;
+    running: ExecutableIdentity;
+    installAtSpawn: ExecutableIdentity;
+    install: ExecutableIdentity;
+  },
   opts: { tryNow?: boolean } = {},
 ): boolean {
+  // An unproven launch can never re-validate as stale; queuing it would only
+  // park the session behind a claim that never resolves.
+  if (!sameExecutableObject(detail.running, detail.installAtSpawn)) return false;
   if (ds.pendingSuspendReason && ds.pendingSuspendReason !== CLI_INSTALL_CHANGED_SUSPEND) return false;
   const firstRequest = ds.pendingSuspendReason !== CLI_INSTALL_CHANGED_SUSPEND;
   if (firstRequest) {
@@ -10682,6 +10691,7 @@ export function requestInstallChangeSuspend(
     ds.pendingSuspendInstallClaim = {
       entry: detail.entry,
       running: detail.running,
+      installAtSpawn: detail.installAtSpawn,
       workerGeneration: ds.workerGeneration ?? 0,
       ...(att?.cliSpawnGeneration !== undefined ? { cliSpawnGeneration: att.cliSpawnGeneration } : {}),
       ...(att?.cliPid !== undefined ? { cliPid: att.cliPid } : {}),
@@ -19082,6 +19092,7 @@ function setupWorkerHandlers(
           ...(msg.cliProcStart !== undefined ? { cliProcStart: msg.cliProcStart } : {}),
           ...(msg.cliExe !== undefined ? { cliExe: msg.cliExe } : {}),
           ...(msg.cliInstallEntry !== undefined ? { cliInstallEntry: msg.cliInstallEntry } : {}),
+          ...(msg.cliInstallAtSpawn !== undefined ? { cliInstallAtSpawn: msg.cliInstallAtSpawn } : {}),
           ...(msg.cliSpawnGeneration !== undefined ? { cliSpawnGeneration: msg.cliSpawnGeneration } : {}),
           ...(msg.enginePid !== undefined ? { enginePid: msg.enginePid } : {}),
           ...(msg.engineProcStart !== undefined

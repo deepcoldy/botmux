@@ -153,6 +153,9 @@ export interface DaemonSession {
     cliExe?: import('../services/cli-install-identity.js').ExecutableIdentity;
     /** Install entry the worker's adapter resolved at spawn. */
     cliInstallEntry?: string;
+    /** What `cliInstallEntry` resolved to right before this CLI spawn. Only a
+     *  process whose `cliExe` is this very object was launched from the entry. */
+    cliInstallAtSpawn?: import('../services/cli-install-identity.js').ExecutableIdentity;
     /** Worker-local CLI spawn counter that produced `cliExe`. */
     cliSpawnGeneration?: number;
     enginePid?: number;
@@ -741,6 +744,7 @@ export interface DaemonSession {
   pendingSuspendInstallClaim?: {
     entry: string;
     running: import('../services/cli-install-identity.js').ExecutableIdentity;
+    installAtSpawn: import('../services/cli-install-identity.js').ExecutableIdentity;
     workerGeneration: number;
     cliSpawnGeneration?: number;
     cliPid?: number;

@@ -65,16 +65,40 @@ describe('observeTraexInstall', () => {
     const running = resolveInstallIdentity(entry)!;
     rmSync(entry);
     expect(observeTraexInstall(
-      ds({ backendType: 'pty', credentialIsolated: false, cliExe: running, cliInstallEntry: entry }),
+      ds({ backendType: 'pty', credentialIsolated: false, cliExe: running, cliInstallEntry: entry, cliInstallAtSpawn: running }),
       'traex',
     )).toMatchObject({ state: 'unknown', reason: 'install-entry-missing' });
+  });
+
+  it('is unknown when the worker did not record what the entry named at spawn', () => {
+    const { entry } = tempEntry();
+    const running = resolveInstallIdentity(entry)!;
+    expect(observeTraexInstall(
+      ds({ backendType: 'pty', credentialIsolated: false, cliExe: running, cliInstallEntry: entry }),
+      'traex',
+    )).toMatchObject({ state: 'unknown', reason: 'install-at-spawn-unknown' });
+  });
+
+  it('is unknown when the entry did not name the running image at spawn (wrapper layout)', () => {
+    const { entry } = tempEntry('#!/bin/sh\nexec /opt/traex/bin/traex "$@"\n');
+    const { entry: real } = tempEntry('real-traex-binary');
+    const wrapper = resolveInstallIdentity(entry)!;
+    const running = { ...resolveInstallIdentity(real)!, source: 'linux-proc-exe' as const };
+    // Nothing was upgraded, yet the wrapper's identity never matches the running image.
+    expect(observeTraexInstall(
+      ds({
+        backendType: 'pty', credentialIsolated: false,
+        cliExe: running, cliInstallEntry: entry, cliInstallAtSpawn: wrapper,
+      }),
+      'traex',
+    )).toMatchObject({ state: 'unknown', reason: 'launch-unproven' });
   });
 
   it('is current when the process runs the installed inode', () => {
     const { entry } = tempEntry();
     const running = resolveInstallIdentity(entry)!;
     const result = observeTraexInstall(
-      ds({ backendType: 'pty', credentialIsolated: false, cliExe: running, cliInstallEntry: entry }),
+      ds({ backendType: 'pty', credentialIsolated: false, cliExe: running, cliInstallEntry: entry, cliInstallAtSpawn: running }),
       'traex',
     );
     expect(result.state).toBe('current');
@@ -86,12 +110,13 @@ describe('observeTraexInstall', () => {
     // Upgrade: a new file replaces the entry.
     writeFileSync(entry, 'release-0.214.1-longer');
     const result = observeTraexInstall(
-      ds({ backendType: 'pty', credentialIsolated: false, cliExe: running, cliInstallEntry: entry }),
+      ds({ backendType: 'pty', credentialIsolated: false, cliExe: running, cliInstallEntry: entry, cliInstallAtSpawn: running }),
       'traex',
     );
     expect(result.state).toBe('stale');
     if (result.state === 'stale') {
       expect(result.running.ino).toBe(running.ino);
+      expect(result.installAtSpawn.ino).toBe(running.ino);
       expect(result.install.ino).toBe(statSync(entry, { bigint: true }).ino.toString());
     }
   });
@@ -99,7 +124,7 @@ describe('observeTraexInstall', () => {
   it('caches the install stat per entry for the TTL so N workers cost one lookup', () => {
     const { entry } = tempEntry('old');
     const running = resolveInstallIdentity(entry)!;
-    const attestation = { backendType: 'pty', credentialIsolated: false, cliExe: running, cliInstallEntry: entry };
+    const attestation = { backendType: 'pty', credentialIsolated: false, cliExe: running, cliInstallEntry: entry, cliInstallAtSpawn: running };
     const now = 1_000_000;
 
     expect(observeTraexInstall(ds(attestation), 'traex', now).state).toBe('current');
@@ -115,7 +140,7 @@ describe('observeTraexInstall', () => {
   it('shares one cache across workers of the same entry', () => {
     const { entry } = tempEntry('release');
     const running = resolveInstallIdentity(entry)!;
-    const attestation = { backendType: 'pty', credentialIsolated: false, cliExe: running, cliInstallEntry: entry };
+    const attestation = { backendType: 'pty', credentialIsolated: false, cliExe: running, cliInstallEntry: entry, cliInstallAtSpawn: running };
     const now = 2_000_000;
     expect(observeTraexInstall(ds(attestation), 'traex', now).state).toBe('current');
 

@@ -1,7 +1,8 @@
 import type { DaemonSession } from '../core/types.js';
 import {
-  compareRunningToInstall,
+  compareLaunchedInstall,
   resolveInstallIdentity,
+  sameExecutableObject,
   type ExecutableIdentity,
 } from './cli-install-identity.js';
 
@@ -27,6 +28,11 @@ export type TraexInstallUnknownReason =
   | 'no-attestation'
   | 'running-identity-unknown'
   | 'install-entry-unknown'
+  /** The worker did not record what the entry resolved to at spawn. */
+  | 'install-at-spawn-unknown'
+  /** At spawn the entry did not resolve to the object the process runs (a
+   *  wrapper-script / launcher layout). This mitigation does not cover it. */
+  | 'launch-unproven'
   | 'install-entry-missing'
   /** The two stats are not provably the same physical object (different
    *  device / unproven bind or overlay mapping). Never auto-reclaim. */
@@ -39,6 +45,7 @@ export type TraexInstallObservation =
       state: 'current' | 'stale';
       entry: string;
       running: ExecutableIdentity;
+      installAtSpawn: ExecutableIdentity;
       install: ExecutableIdentity;
     };
 
@@ -56,8 +63,8 @@ function cachedInstallIdentity(entry: string, now: number): ExecutableIdentity |
  *
  * Only `stale` may drive an automatic reclaim. Every unavailable input is
  * `unknown`: macOS (no proven running-identity source), a worker that has not
- * attested yet, an adopted/launcher process, or an install entry that no
- * longer resolves.
+ * attested yet, an adopted/launcher process, an install entry that no longer
+ * resolves, or an entry that did not name the running image at spawn.
  */
 export function observeTraexInstall(
   ds: DaemonSession,
@@ -71,11 +78,14 @@ export function observeTraexInstall(
   if (!running) return { state: 'unknown', reason: 'running-identity-unknown' };
   const entry = attestation.cliInstallEntry;
   if (!entry) return { state: 'unknown', reason: 'install-entry-unknown' };
+  const installAtSpawn = attestation.cliInstallAtSpawn;
+  if (!installAtSpawn) return { state: 'unknown', reason: 'install-at-spawn-unknown', entry };
+  if (!sameExecutableObject(running, installAtSpawn)) return { state: 'unknown', reason: 'launch-unproven', entry };
   const install = cachedInstallIdentity(entry, now);
   if (!install) return { state: 'unknown', reason: 'install-entry-missing', entry };
-  const comparison = compareRunningToInstall(running, install);
+  const comparison = compareLaunchedInstall(running, installAtSpawn, install);
   if (comparison === 'unknown') return { state: 'unknown', reason: 'identity-unprovable', entry };
-  return { state: comparison, entry, running, install };
+  return { state: comparison, entry, running, installAtSpawn, install };
 }
 
 /** Unit-test seam: the cache is daemon-wide by design, so tests that change a

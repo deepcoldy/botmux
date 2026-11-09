@@ -14,6 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  compareLaunchedInstall,
   compareRunningToInstall,
   readRunningExeIdentity,
   resolveInstallIdentity,
@@ -190,5 +191,23 @@ describe('sameExecutableObject', () => {
     expect(sameExecutableObject(identity({ ino: '200' }), identity())).toBe(false);
     expect(sameExecutableObject(identity({ size: '999' }), identity())).toBe(false);
     expect(sameExecutableObject(undefined, identity())).toBe(false);
+  });
+});
+
+describe('compareLaunchedInstall', () => {
+  it('is unknown unless the entry named the running image at spawn', () => {
+    const running = identity({ source: 'linux-proc-exe' });
+    const upgraded = identity({ ino: '200' });
+    expect(compareLaunchedInstall(running, undefined, upgraded)).toBe('unknown');
+    // Wrapper layout: the entry was a different file all along, so a mismatch
+    // with the running image says nothing about an upgrade.
+    expect(compareLaunchedInstall(running, identity({ ino: '300' }), upgraded)).toBe('unknown');
+  });
+
+  it('compares a proven launch against the current install', () => {
+    const running = identity({ source: 'linux-proc-exe' });
+    expect(compareLaunchedInstall(running, identity(), identity())).toBe('current');
+    expect(compareLaunchedInstall(running, identity(), identity({ ino: '200' }))).toBe('stale');
+    expect(compareLaunchedInstall(running, identity(), identity({ dev: '2' }))).toBe('unknown');
   });
 });
