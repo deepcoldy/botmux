@@ -20,11 +20,15 @@
  * missing `uuid` / `firstAttemptAt`, or carrying a uuid that is not the one
  * derived for this app, is invalid and nothing is sent.
  *
- * The file is capped at {@link GROUP_SEND_RECORD_LIMIT}. Oldest `sent` records
- * may be dropped to admit a new attempt (that forgets the read-back binding).
- * `pending` records are never dropped — they are the proof an attempt may
- * already be visible — and a new requestId is refused with `store_full` once
- * they fill the cap.
+ * The live file is capped at {@link GROUP_SEND_RECORD_LIMIT}. Admitting a new
+ * requestId past that cap compacts the oldest `sent` records (by
+ * `firstAttemptAt`) into a sibling archive capped at
+ * {@link GROUP_SEND_ARCHIVE_LIMIT}. The archive is fsynced before those keys
+ * are removed from the live file, and it is not rewritten on replay or on the
+ * post-provider `sent` save. Pending records are never compacted — they are
+ * the proof an attempt may already be visible — and a new requestId is refused
+ * with `store_full` once they fill the cap. A requestId evicted from the
+ * archive (oldest `sentAt` past the archive cap) retries as a new send.
  *
  * `outbound.send` is at-most-once per message id, not exactly-once. The route
  * always passes `suppressHook` into `sendMessage`. This module fires
@@ -60,6 +64,20 @@ export const GROUP_SEND_BODY_MAX_BYTES = 64 * 1024;
 /** Stay well inside Lark's ~1h uuid dedupe window. */
 export const GROUP_SEND_UUID_REUSE_MS = 50 * 60 * 1000;
 export const GROUP_SEND_RECORD_LIMIT = 2000;
+/**
+ * Archive cap. 20_000 full records is about 6MB. That file is rewritten only
+ * when a new requestId is admitted while the live file is already full.
+ * Past this cap the oldest `sentAt` is dropped, and that requestId retries
+ * as a new send.
+ */
+export const GROUP_SEND_ARCHIVE_LIMIT = 20_000;
+
+/** Sibling of the live store: `group-sends-<appId>.json` → `group-sends-<appId>-archive.json`. */
+export function groupSendArchivePath(storePath: string): string {
+  return storePath.endsWith('.json')
+    ? `${storePath.slice(0, -'.json'.length)}-archive.json`
+    : `${storePath}-archive.json`;
+}
 
 export type GroupSendRecord = {
   chatId: string; requestId: string; contentDigest: string; uuid: string;
@@ -147,17 +165,42 @@ function load(path: string, larkAppId: string): StoreFile {
   return parsed;
 }
 
-function evictOldestSent(file: StoreFile): void {
-  let overflow = Object.keys(file.records).length - GROUP_SEND_RECORD_LIMIT;
+function byKey(a: string, b: string): number {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+/** Live slot order. Only `sent` records can leave the live file. */
+function oldestSent(file: StoreFile): [string, GroupSendRecord][] {
+  return Object.entries(file.records)
+    .filter(([, record]) => record.state === 'sent')
+    .sort((a, b) => a[1].firstAttemptAt - b[1].firstAttemptAt || byKey(a[0], b[0]));
+}
+
+/**
+ * Archive retention order is `sentAt`, not `firstAttemptAt`. A missing
+ * `sentAt` sorts oldest so an undated row cannot pin the cap forever.
+ */
+function evictArchiveOverflow(file: StoreFile): void {
+  const entries = Object.entries(file.records);
+  let overflow = entries.length - GROUP_SEND_ARCHIVE_LIMIT;
   if (overflow <= 0) return;
-  const sent = Object.entries(file.records)
-    .filter(([, r]) => r.state === 'sent')
-    .sort((a, b) => a[1].firstAttemptAt - b[1].firstAttemptAt);
-  for (const [storeKey] of sent) {
+  entries.sort((a, b) => (a[1].sentAt ?? Number.NEGATIVE_INFINITY) - (b[1].sentAt ?? Number.NEGATIVE_INFINITY) || byKey(a[0], b[0]));
+  for (const [storeKey] of entries) {
     if (overflow <= 0) break;
     delete file.records[storeKey];
     overflow--;
   }
+}
+
+/**
+ * Forward lookup is one value. Live wins when the same key is in both files,
+ * including when the message ids differ. Do not replace this with a merged
+ * map whose last write wins: equal message ids hide a reversed merge.
+ */
+function forwardRecord(active: StoreFile, archive: StoreFile, storeKey: string): GroupSendRecord | undefined {
+  const live = active.records[storeKey];
+  if (live) return live;
+  return archive.records[storeKey];
 }
 
 function save(path: string, file: StoreFile): void {
@@ -201,9 +244,13 @@ export async function sendRequestBoundGroupMessage(deps: GroupSendDeps, input: G
   }
   const now = deps.now ?? Date.now;
   return serial(deps.storePath, async () => {
-    const file = load(deps.storePath, deps.larkAppId);
+    const active = load(deps.storePath, deps.larkAppId);
+    const archivePath = groupSendArchivePath(deps.storePath);
+    // Missing archive is an empty store. A corrupt archive throws here (fail
+    // closed) before any provider call or write.
+    const archive = load(archivePath, deps.larkAppId);
     const k = key(input.chatId, input.requestId), contentDigest = digest(input.content);
-    let record = file.records[k];
+    let record = forwardRecord(active, archive, k);
     if (record && record.contentDigest !== contentDigest) return { ok: false, status: 409, error: 'request_conflict' };
     if (record?.state === 'sent' && record.messageId) {
       return { ok: true, status: 200, messageId: record.messageId, requestId: input.requestId, chatId: input.chatId, replayed: true };
@@ -215,17 +262,28 @@ export async function sendRequestBoundGroupMessage(deps: GroupSendDeps, input: G
     if (!record) {
       record = { chatId: input.chatId, requestId: input.requestId, contentDigest,
         uuid: groupSendUuid(deps.larkAppId, input.chatId, input.requestId), state: 'pending', firstAttemptAt: now() };
-      file.records[k] = record;
-      evictOldestSent(file);
-      if (Object.keys(file.records).length > GROUP_SEND_RECORD_LIMIT) {
-        return { ok: false, status: 503, error: 'store_full', retryable: false };
+      const overflow = Object.keys(active.records).length + 1 - GROUP_SEND_RECORD_LIMIT;
+      if (overflow > 0) {
+        const movable = oldestSent(active);
+        // Decide the whole move before touching either file. Compacting only
+        // part of the overflow would still be over the cap and would have
+        // written the archive on a store_full response.
+        if (movable.length < overflow) return { ok: false, status: 503, error: 'store_full', retryable: false };
+        const moving = movable.slice(0, overflow);
+        for (const [storeKey, compacted] of moving) archive.records[storeKey] = compacted;
+        evictArchiveOverflow(archive);
+        save(archivePath, archive);
+        for (const [storeKey] of moving) delete active.records[storeKey];
       }
-      save(deps.storePath, file);
+      active.records[k] = record;
+      save(deps.storePath, active);
     }
     let messageId: string;
     try { messageId = await deps.send(input.chatId, input.content, record.uuid); }
     catch (err) { return sendFailure(err); }
     if (typeof messageId !== 'string' || !messageId) return { ok: false, status: 502, error: 'send_failed', retryable: true };
+    // Post-provider save rewrites only the live file. The archive was already
+    // fsynced above when this send had to compact, and must not be rewritten here.
     const latest = load(deps.storePath, deps.larkAppId);
     latest.records[k] = { ...record, state: 'sent', messageId, sentAt: now() };
     save(deps.storePath, latest);
@@ -252,11 +310,25 @@ export type GroupReadResult = GroupMessageReadback | {
   ok: false; status: 400 | 404 | 409 | 502; error: 'invalid_request' | 'not_found' | 'chat_mismatch' | 'read_failed';
 };
 
+/**
+ * Reverse lookup scans every entry of both files. It must not use
+ * {@link forwardRecord}: that view keeps one message id per key, so a stale
+ * archived message id would lose its binding once the live row diverges.
+ */
+function requestIdForMessage(active: StoreFile, archive: StoreFile, chatId: string, messageId: string): string | null {
+  for (const source of [active.records, archive.records]) {
+    for (const record of Object.values(source)) {
+      if (record.chatId === chatId && record.messageId === messageId) return record.requestId;
+    }
+  }
+  return null;
+}
+
 function boundRequestId(deps: GroupReadDeps, chatId: string, messageId: string): string | null {
   try {
-    for (const r of Object.values(load(deps.storePath, deps.larkAppId).records)) {
-      if (r.chatId === chatId && r.messageId === messageId) return r.requestId;
-    }
+    const active = load(deps.storePath, deps.larkAppId);
+    const archive = load(groupSendArchivePath(deps.storePath), deps.larkAppId);
+    return requestIdForMessage(active, archive, chatId, messageId);
   } catch { /* unreadable store: no binding claim */ }
   return null;
 }
