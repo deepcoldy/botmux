@@ -121,6 +121,7 @@ import {
   readTrustedMessageProvenance,
 } from '../src/services/session-store.js';
 import { settlePrincipalLaneOutboundProvenance } from '../src/core/principal-lane-outbound-provenance.js';
+import { topicResumeBlockReason } from '../src/core/topic-session-continuity.js';
 import { seedPersistedSessionRows, readPersistedSessionRows, sessionStorePath } from './helpers/session-store-disk.js';
 import { paneLaunchDir, writePaneLaunchFile } from '../src/adapters/backend/pane-launch.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
@@ -4160,6 +4161,37 @@ describe('applySessionCommandUnowned() / readSessionRowUnowned()', () => {
     expect(onDisk.s1.status).toBe('closed');
     expect(onDisk.s1.closedAt).toBeTruthy();
     expect(onDisk.s1.workerGeneration).toBe(7);
+  });
+
+  it('a host close (offline `botmux delete`) stamps userClosedAt so the topic cannot auto-resume it', () => {
+    seedStore('appA', { s1: row('s1', { larkAppId: 'appA' }) });
+
+    const published = applySessionCommandUnowned(
+      { sessionId: 's1', larkAppId: 'appA' },
+      { type: 'close' },
+      { dataDir: tempDir },
+    );
+
+    expect(published).toMatchObject({ outcome: 'applied' });
+    const onDisk = readPersistedSessionRows(tempDir, 'appA');
+    expect(onDisk.s1.userClosedAt).toBeTruthy();
+    expect(topicResumeBlockReason(onDisk.s1 as any)).toBe('user_closed');
+  });
+
+  it('a host prune (ledger-empty cleanup, not a human close) does not stamp userClosedAt', () => {
+    seedStore('appA', { s1: row('s1', { larkAppId: 'appA' }) });
+
+    const published = applySessionCommandUnowned(
+      { sessionId: 's1', larkAppId: 'appA' },
+      { type: 'prune' },
+      { dataDir: tempDir },
+    );
+
+    expect(published).toMatchObject({ outcome: 'applied' });
+    const onDisk = readPersistedSessionRows(tempDir, 'appA');
+    expect(onDisk.s1.status).toBe('closed');
+    expect(onDisk.s1.userClosedAt).toBeUndefined();
+    expect(topicResumeBlockReason(onDisk.s1 as any)).toBeUndefined();
   });
 
   it('reads the fresh row without writing', () => {
