@@ -78,6 +78,7 @@ function daemon(self: string, dataDir: string, baseDir: string, run: BotRun, ove
     loadRun: () => ({ dag: run.dag, nodeExecutor: 'bot', chatId: CHAT, title: 't' }),
     botWorkingDirConfig: () => ({}),
     daemonAppliesNodeWorkingDir: () => true,
+    daemonReadsNodeProjectDir: () => true,
     drive: () => {},
     botName: (appId) => appId,
     warn: () => {},
@@ -728,6 +729,154 @@ describe('workflow node daemon wiring — the run\'s working dir (design §15.4)
   });
 });
 
+describe('workflow node daemon wiring — the launching draft\'s project (nodeProjectDir, design §15.4)', () => {
+  /** `repos/project` is the draft's project; `lab` is somewhere else. */
+  function dirs() {
+    const root = trackTempDir(mkdtempSync(join(tmpdir(), 'wdp-dir-')));
+    const repos = join(root, 'repos');
+    const project = join(repos, 'project');
+    const lab = join(root, 'lab');
+    mkdirSync(project, { recursive: true });
+    mkdirSync(lab, { recursive: true });
+    return { repos, project, lab };
+  }
+
+  /** A run as the Dashboard launch writes it (`nodeProjectDir` or, for a run
+   *  from before projects, none), handed off to cli_a. */
+  async function launched(runId: string, nodeProjectDir: string | undefined) {
+    const run = new BotRun(reportDag(runId));
+    authorizeRun(run, { identity: null, ...(nodeProjectDir ? { nodeProjectDir } : {}) });
+    const world = handoffWorld();
+    await run.drive(world.executor, { opts: { chatBinding: BINDING } });
+    const attempt = run.openAttempt('write');
+    const binding = { nonce: nonceOf(attempt), sourceLarkAppId: MAIN, workflow: { runId } } as never;
+    return { run, world, attempt, binding };
+  }
+
+  /** cli_a's inbound gate, its configuration alone deciding the range. */
+  async function admittedOn(config: Record<string, unknown>, handed: Awaited<ReturnType<typeof launched>>) {
+    const target = daemon('cli_a', handed.world.dataDir, handed.run.base, handed.run, { botWorkingDirConfig: () => config });
+    const gate = await target.wiring.admitInboundHandoff({
+      binding: handed.binding,
+      handoffMessageId: handed.attempt.handoffMessageId!,
+      executingLarkAppId: 'cli_a',
+      currentSession: () => ({}),
+      describeSession: () => ({}),
+    });
+    if (gate.kind !== 'admission') throw new Error(`expected an admission, got ${gate.kind}`);
+    return { admission: gate.admission, target };
+  }
+
+  it('a bot without a default working dir starts the node in the draft\'s project (in its range), not in ~ or its first repo dir', async () => {
+    const d = dirs();
+    const handed = await launched('wdp-no-default', d.project);
+    for (const config of [{ workingDirs: [d.repos] }, { workingDir: d.repos }, { workingDirs: [d.lab, d.repos] }]) {
+      expect((await admittedOn(config, handed)).admission).toEqual({ start: true, workingDir: realpathSync(d.project) });
+    }
+  });
+
+  it('a bot with a default working dir keeps it: the project is neither applied nor checked against its range', async () => {
+    const d = dirs();
+    const handed = await launched('wdp-has-default', d.project);
+    for (const config of [
+      { defaultWorkingDir: d.lab },
+      { defaultWorkingDir: d.lab, workingDirs: [d.repos] },
+      { defaultOncall: { enabled: true, workingDir: d.lab } },
+    ]) {
+      const { admission, target } = await admittedOn(config, handed);
+      expect(admission).toEqual({ start: true });
+      await settleBriefly();
+      expect(target.posted).toEqual([]);
+    }
+    // A disabled Oncall dir is no default: the project applies.
+    expect((await admittedOn({ defaultOncall: { enabled: false, workingDir: d.lab }, workingDirs: [d.repos] }, handed)).admission)
+      .toEqual({ start: true, workingDir: realpathSync(d.project) });
+  });
+
+  it('a run from before projects (no nodeProjectDir in run.json) keeps every bot\'s own default resolution, as before', async () => {
+    const d = dirs();
+    const handed = await launched('wdp-old-run', undefined);
+    expect(JSON.parse(readFileSync(join(handed.run.runDir, 'run.json'), 'utf-8'))).not.toHaveProperty('nodeProjectDir');
+    for (const config of [{}, { workingDirs: [d.repos] }, { defaultWorkingDir: d.lab }]) {
+      expect((await admittedOn(config, handed)).admission).toEqual({ start: true });
+    }
+  });
+
+  it('a project outside the bot\'s range (no operate right) is refused, naming the project, and the node blocks', async () => {
+    const d = dirs();
+    const handed = await launched('wdp-outside', d.project);
+    for (const [config, why] of [
+      [{ workingDirs: [d.lab] }, '不在这个 Bot 配置的目录范围内'],
+      [{}, '没有配置目录范围'],
+    ] as const) {
+      const { admission } = await admittedOn(config, handed);
+      expect(admission).toMatchObject({ start: false });
+      expect((admission as { reason: string }).reason).toContain(`工作流的项目目录 ${d.project}`);
+      expect((admission as { reason: string }).reason).toContain(why);
+    }
+    const gone = await launched('wdp-gone', join(d.repos, 'gone'));
+    const { admission, target } = await admittedOn({ workingDirs: [d.repos] }, gone);
+    expect((admission as { reason: string }).reason).toContain('目录不存在');
+    // The refusal reaches the main bot, which blocks the node with it.
+    await eventually(() => expect(target.posted).toHaveLength(1));
+    const main = daemon(MAIN, gone.world.dataDir, gone.run.base, gone.run);
+    await main.wiring.eventRoute(target.posted[0]!.body);
+    expect(gone.run.of('nodeBlocked')).toEqual([expect.objectContaining({ errorCode: 'WORKING_DIR_REFUSED', message: (admission as { reason: string }).reason })]);
+  });
+
+  it('the main bot\'s own node: without a default dir it starts in the project; with one it stays in its default', async () => {
+    const d = dirs();
+    for (const [config, expected] of [
+      [{ workingDirs: [d.repos] }, { workingDir: realpathSync(d.project) }],
+      [{ defaultWorkingDir: d.lab }, {}],
+    ] as const) {
+      const run = new BotRun(reportDag(`wdp-self-${'defaultWorkingDir' in config}`, { bot: undefined }));
+      authorizeRun(run, { identity: null, selectors: [''], nodeProjectDir: d.project });
+      const dataDir = trackTempDir(mkdtempSync(join(tmpdir(), 'wdp-self-data-')));
+      const delivered: Array<{ workingDir?: string }> = [];
+      const main = daemon(MAIN, dataDir, run.base, run, {
+        botWorkingDirConfig: () => config,
+        sendCard: async () => 'om_node_card',
+        replyCard: async () => 'om_handoff_card',
+        deliverSelfTurn: async (input) => { delivered.push({ ...(input.workingDir ? { workingDir: input.workingDir } : {}) }); return { sessionId: 'self-session' }; },
+      });
+      await run.drive(main.wiring.executor, { opts: { chatBinding: BINDING } });
+      await eventually(() => expect(delivered).toEqual([expected]));
+      expect(run.of('nodeBlocked')).toEqual([]);
+    }
+  });
+
+  it('a run carrying a project is not handed to a bot whose daemon cannot read it (reassigned to an older version); a run without one still is', async () => {
+    const d = dirs();
+    for (const [nodeProjectDir, reads, expectSent] of [
+      [d.project, false, false],
+      [d.project, true, true],
+      [undefined, false, true],
+    ] as const) {
+      const run = new BotRun(reportDag(`wdp-old-${String(nodeProjectDir !== undefined)}-${String(reads)}`));
+      authorizeRun(run, { identity: null, ...(nodeProjectDir ? { nodeProjectDir } : {}) });
+      const dataDir = trackTempDir(mkdtempSync(join(tmpdir(), 'wdp-old-data-')));
+      const posted: string[] = [];
+      const main = daemon(MAIN, dataDir, run.base, run, {
+        daemonPort: () => 4100,
+        daemonReadsNodeProjectDir: (appId) => (appId === 'cli_a' ? reads : true),
+        sendCard: async () => { posted.push('node card'); return 'om_node_card'; },
+        replyCard: async () => { posted.push('handoff card'); return 'om_handoff_card'; },
+      });
+      await run.drive(main.wiring.executor, { opts: { chatBinding: BINDING } });
+      if (expectSent) {
+        expect(posted).toEqual(['node card', 'handoff card']);
+        expect(run.of('nodeBlocked')).toEqual([]);
+      } else {
+        expect(posted).toEqual([]);
+        const [blocked] = run.of('nodeBlocked');
+        expect(blocked).toMatchObject({ errorCode: 'WORKING_DIR_REFUSED' });
+        expect(blocked!.message).toContain('版本过旧');
+      }
+    }
+  });
+});
+
 describe('workflow node daemon wiring — the initiator\'s operate right decides the range (design §15.4)', () => {
   /** `repos/project` is in cli_a's range; `lab` is not. */
   function dirs() {
@@ -1003,6 +1152,31 @@ describe('workflow node daemon wiring — the initiator\'s operate right decides
     delete raw.nodeWorkingDir;
     writeFileSync(plainEnvelope, JSON.stringify(raw));
     expect(await main.wiring.initiatorUnionRoute({ runId: plain.run.dag.runId, requesterLarkAppId: 'cli_a' })).toMatchObject({ status: 404 });
+  });
+
+  it('the launching draft\'s project follows the same rule on a bot without a default dir: outside its range only when she may operate it (union_id asked of the main bot)', async () => {
+    const d = dirs();
+    const run = new BotRun(reportDag('wdo-project'));
+    authorizeRun(run, { identity: null, nodeProjectDir: d.lab });
+    const world = handoffWorld();
+    await run.drive(world.executor, { opts: { chatBinding: BINDING } });
+    const attempt = run.openAttempt('write');
+    const binding = { nonce: nonceOf(attempt), sourceLarkAppId: MAIN, workflow: { runId: run.dag.runId } } as never;
+    const main = daemon(MAIN, world.dataDir, run.base, run, { lookupOwnUnionId: async () => ({ unionId: INITIATOR_UNION }) });
+    const onCliA = (cdUsers: string[]) => daemon('cli_a', world.dataDir, run.base, run, {
+      botWorkingDirConfig: () => ({ workingDirs: [d.repos] }),
+      initiatorOperates: operateDeps({ cli_a: cdUsers }).initiatorOperates,
+      postDaemon: async (_port, path, body) => (path === WORKFLOW_INITIATOR_UNION_ROUTE
+        ? main.wiring.initiatorUnionRoute(body)
+        : { status: 200, body: { ok: true } }),
+    });
+    expect(await admit(onCliA([INITIATOR_OU_IN.cli_a!]), binding, attempt.handoffMessageId!))
+      .toEqual({ start: true, workingDir: realpathSync(d.lab) });
+    const refused = await admit(onCliA(['ou_bob_in_a']), binding, attempt.handoffMessageId!);
+    expect(refused).toMatchObject({ start: false });
+    expect((refused as { reason: string }).reason).toContain(`工作流的项目目录 ${d.lab}`);
+    expect((refused as { reason: string }).reason).toContain('不在这个 Bot 配置的目录范围内');
+    expect((refused as { reason: string }).reason).not.toContain('暂时无法确认');
   });
 
   it('a directory gone since approval is refused even on her own bot', async () => {

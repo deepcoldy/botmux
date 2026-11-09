@@ -121,7 +121,7 @@ Architect（主 Bot 的 daemon 后台跑，按「计划中的群」给节点分�
   - 管家 Bot（decision-board 管家开关打开即算，不要求选了管家群，`isStewardBot`）：不能选；daemon 的建草稿接口在 `birthRun` 之前直接拒绝（`orchestrator_ineligible`），不建 run 目录、不起澄清会话；
   - daemon 不在线：不能选；
   - 发起人不能操作这个 Bot（第 11 节 I1）：不能选。
-- 项目：选完编排 Bot 后出现。Bot 有默认目录（`effectiveDefaultWorkingDir`）就直接显示「项目：<目录>」；没有就必须从下拉里选一个，候选和飞书仓库选择卡一样（扫 Bot 的工作目录，列不列 worktree 跟 `repoPickerMode`）。daemon 建草稿时按同样的范围再校验一次，不接受任意路径，存进 draft.json 的 `projectDir`。澄清会话、「继续」、换编排 Bot 后的新会话、运行模板时主 Bot 的会话都开在这个目录，不再退回 daemon 自己的进程目录。运行模板和复制为新工作流也一样选项目。
+- 项目：选完编排 Bot 后出现。Bot 有默认目录（`effectiveDefaultWorkingDir`）就直接显示「项目：<目录>」；没有就必须从下拉里选一个，候选和飞书仓库选择卡一样（扫 Bot 的工作目录，列不列 worktree 跟 `repoPickerMode`）。daemon 建草稿时按同样的范围再校验一次，不接受任意路径，存进 draft.json 的 `projectDir`。澄清会话、「继续」、换编排 Bot 后的新会话、运行模板时主 Bot 的会话都开在这个目录，不再退回 daemon 自己的进程目录。运行模板和复制为新工作流也一样选项目。拉群开始后，没有默认目录的节点 Bot 也在这个项目里起节点会话（7.3 的 `nodeProjectDir`）。
 - 目标：一个多行输入框。
 
 前提：工作流总开关和「节点交给群里的 Bot 执行」开关都要开。只开了总开关时，入口提示「Dashboard 编排需要打开『节点交给群里的 Bot 执行』」，不进入编排。
@@ -294,6 +294,8 @@ Architect（主 Bot 的 daemon 后台跑，按「计划中的群」给节点分�
 - 第二道确认的确认人、时间、确认时的流程摘要（现在的 `authorizedByOpenId` 记的是 grill 发起人，这里改为如实记录确认人；飞书入口仍由模型执行 approve-dag，确认人记为当前回合的人）。
 
 `run.json` 的结构是严格校验的，新字段会让旧版本 daemon 拒绝驱动这些 run，与群内 Bot 接力设计 §15.3 的口径一致。
+
+另在顶层记 `nodeProjectDir`：草稿的项目（4.1），普通拉群和运行模板都写。没有默认目录的节点 Bot 在它里面起会话，目录范围和发起人操作权按群内 Bot 接力设计 §15.4 同一条规则判定，不通过就受阻；有默认目录的照旧。只有除主 Bot 外的每个执行 Bot 的 daemon 都声明能读它（`workflowNodeProjectDir: "v1"`）时才写，否则不写、节点按原来的目录规则执行（§15.3）。编排 Bot 有默认目录时，项目就是这个目录。
 
 ### 7.4 平台部署
 

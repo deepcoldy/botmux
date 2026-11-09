@@ -158,7 +158,7 @@ async function world(initialStatus: string | undefined = 'working') {
     interruptTurn: (session: DaemonSession) => { interrupted.push(session.session.sessionId); return true; },
     proveBotSender: async () => true, deliverSelfTurn: async () => ({ sessionId: 'x' }), prepareTurnIdentity: async () => {},
     attachmentsDir: () => dataDir, loadRun: () => undefined, botWorkingDirConfig: () => ({}),
-    daemonAppliesNodeWorkingDir: () => true, drive: () => {}, botName: (id: string) => id, warn: () => {},
+    daemonAppliesNodeWorkingDir: () => true, daemonReadsNodeProjectDir: () => true, drive: () => {}, botName: (id: string) => id, warn: () => {},
     handoffIdentity: { botTools: () => [], checkSelf: async () => ({ status: 'not_required' }) },
   } as unknown as WorkflowNodeDaemonDeps;
   const nodeDaemon = createWorkflowNodeDaemon(deps);

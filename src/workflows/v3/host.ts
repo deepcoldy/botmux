@@ -596,6 +596,10 @@ export function authorizeAdHocRun(
      *  the main topic root, the session, the initiator) is produced by
      *  拉群开始 and given here. Refused when the grill has a binding of its own. */
     chatBinding?: RunChatBinding;
+    /** Bot runs only, without `workingDirOverride`: the launching draft's
+     *  project, recorded as `nodeProjectDir` (the caller has checked that
+     *  every executing bot's daemon reads it). Snapshots are not touched. */
+    nodeProjectDir?: string;
   } = {},
 ): AdHocRunAuthorizationResult {
   // A bot-executed run freezes the directory exactly as an ephemeral one does
@@ -603,6 +607,7 @@ export function authorizeAdHocRun(
   // executing bots' daemons read it as an explicit choice to check and apply
   // (design §15.4). Callers pass the absolute, already range-checked path.
   const nodeWorkingDir = opts.nodeExecutor === 'bot' ? opts.workingDirOverride : undefined;
+  const nodeProjectDir = opts.nodeExecutor === 'bot' && nodeWorkingDir === undefined ? opts.nodeProjectDir : undefined;
   // The outer host lock prevents Gate-2 from racing any grill RMW / architect
   // attempt. The inner envelope lock serializes this producer with all other
   // run.json publishers. Keep this exact order; see the lock-order invariant
@@ -686,6 +691,7 @@ export function authorizeAdHocRun(
       ...(chatBinding?.ownerOpenId ? { authorizedByOpenId: chatBinding.ownerOpenId } : {}),
       ...(opts.nodeExecutor ? { nodeExecutor: opts.nodeExecutor } : {}),
       ...(nodeWorkingDir !== undefined ? { nodeWorkingDir } : {}),
+      ...(nodeProjectDir !== undefined ? { nodeProjectDir } : {}),
       ...(opts.nodeExecutor && opts.handoffIdentity ? { handoffIdentity: opts.handoffIdentity } : {}),
       ...(opts.nodeExecutor && opts.initiator ? { initiator: opts.initiator } : {}),
       ...(opts.nodeExecutor && opts.flowConfirmation

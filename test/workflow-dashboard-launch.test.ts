@@ -22,7 +22,7 @@ import { readGrillState } from '../src/workflows/v3/grill-state.js';
 import { readJournal } from '../src/workflows/v3/journal.js';
 import { launchGroupName, launchMarker } from '../src/workflows/v3/draft-launch.js';
 import {
-  ALICE, BOTS, DOC, MAIN, OWNER, PI, SKETCHES, STEWARD,
+  ALICE, BOTS, DEFAULT_PROJECT, DOC, MAIN, OWNER, PI, SKETCHES, STEWARD,
   architectSettled, makeService, specMarkdown,
 } from './helpers/workflow-draft-fakes.js';
 import { fakeLaunch, seenBy } from './helpers/workflow-launch-fakes.js';
@@ -552,5 +552,69 @@ describe('concurrency: two tabs, a swap mid-launch, abandon', () => {
     const runId = await confirmed(h);
     expect(await code(h.service.launch(runId, OWNER, {}))).toBe('launch_unavailable');
     expect(readWorkflowDraft(join(base, runId))!.launch).toBeUndefined();
+  });
+});
+
+describe('第 7 步: the draft\'s project goes into run.json for the nodes (nodeProjectDir)', () => {
+  /** `reads`: whose daemons advertise reading it (absent = the dep is not wired). */
+  function launchWith(reads: ((appId: string) => boolean) | undefined, logs: string[] = []) {
+    const launch = fakeLaunch(base);
+    launch.setOnline(ONLINE);
+    const h = makeService(base, {
+      loadBots: () => FLEET,
+      launch: launch.deps,
+      ...(reads ? { daemonReadsNodeProjectDir: reads } : {}),
+      log: (message) => { logs.push(message); },
+    });
+    h.setOnline(ONLINE);
+    return h;
+  }
+
+  async function launchedRun(h: ReturnType<typeof makeService>, runId: string) {
+    await h.service.launch(runId, OWNER, {});
+    expect((await settled(h.service, runId)).phase).toBe('started');
+    const read = readRunEnvelope(join(base, runId), runId);
+    expect(read.kind).toBe('ok');
+    return (read as any).envelope;
+  }
+
+  it('every executing bot\'s daemon reads it: run.json carries the draft\'s project, and nothing else changes', async () => {
+    const asked: string[] = [];
+    const h = launchWith((appId) => { asked.push(appId); return true; });
+    const runId = await confirmed(h);
+    const projectDir = readWorkflowDraft(join(base, runId))!.projectDir;
+    expect(projectDir).toBe(DEFAULT_PROJECT);
+    const run = await launchedRun(h, runId);
+    expect(run.nodeProjectDir).toBe(DEFAULT_PROJECT);
+    expect(run.nodeWorkingDir).toBeUndefined();
+    // Only the other executing bots are asked: the main bot is this daemon.
+    expect([...new Set(asked)]).toEqual([DOC]);
+    // The frozen snapshots are as before (the project is not every node's directory).
+    expect(readFileSync(join(base, runId, 'bots.snapshot.json'), 'utf-8')).not.toContain(DEFAULT_PROJECT);
+  });
+
+  it('an executing bot\'s daemon is an older version, or the check is not wired: the project is left out and the run starts as before', async () => {
+    for (const reads of [(appId: string) => appId !== DOC, () => { throw new Error('registry unreadable'); }, undefined]) {
+      const logs: string[] = [];
+      const h = launchWith(reads, logs);
+      const runId = await confirmed(h);
+      const run = await launchedRun(h, runId);
+      // Exactly the keys an older daemon's strict reader accepts.
+      expect(run).not.toHaveProperty('nodeProjectDir');
+      expect(JSON.parse(readFileSync(join(base, runId, 'run.json'), 'utf-8'))).not.toHaveProperty('nodeProjectDir');
+      if (reads) expect(logs.join('\n')).toContain(`older daemon: ${DOC}`);
+      rmSync(join(base, runId), { recursive: true, force: true });
+    }
+  });
+
+  it('a draft from before projects (no project recorded) launches as before: no project in run.json', async () => {
+    const h = launchWith(() => true);
+    const runId = await confirmed(h);
+    const dir = join(base, runId);
+    const draft = readWorkflowDraft(dir)!;
+    delete draft.projectDir;
+    writeWorkflowDraft(dir, draft);
+    const run = await launchedRun(h, runId);
+    expect(run).not.toHaveProperty('nodeProjectDir');
   });
 });
