@@ -12,6 +12,7 @@ import { OutputDeliveryTerminalError } from '../src/services/output-delivery-coo
 import { loadWorkerPoolClosure, loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
 import { committedCodexAppSequence, hasUnsettledCodexAppDispatch } from '../src/utils/codex-app-dispatch-ledger.js';
 import { FINAL_HANDOFF_DELIVERY_REASON, FINAL_HANDOFF_WAIT_REASON } from '../src/core/worker-pool.js';
+import { raiseDaemonAttention } from '../src/core/session-activity.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import type { WorkerFinalOutput } from '../src/types.js';
 
@@ -76,13 +77,13 @@ describe('attention lifecycle', () => {
     const coordinator = new OutputDeliveryCoordinator(db);
     const scope: any = {
       ds, worker, t: 'probe', journal: db, coordinator, config: { session: { dataDir: dir } },
-      ownsLifecycleMutation: () => true,
+      ownsLifecycleMutation: () => true, ownsWorkerSession: () => true, isSessionTransferring: () => false, sessionController: undefined,
       processFinalOutput: options.processFinalOutput ?? vi.fn(async () => ({ status: 'suppressed' as const })),
       canTalk: typeof options.canTalk === 'function' ? options.canTalk : () => options.canTalk ?? true,
       evaluateTalk: () => { const a = talkAllowed(); return { allowed: a, reason: a ? 'allowedUser' : (options.talkReason ?? 'none') }; },
       FinalOutputHandoffStore: { exists: () => options.v1Exists ?? false },
       finalOutputHandoffHost: () => ({ store: { attentionPending: () => options.v1Attention ? {} : undefined } }),
-      readBridgeTurnJournal: () => options.bridgeEntries ?? [], publishAttentionPatch, join,
+      readBridgeTurnJournal: () => options.bridgeEntries ?? [], publishAttentionPatch, raiseDaemonAttention, join,
       FINAL_HANDOFF_WAIT_REASON, FINAL_HANDOFF_DELIVERY_REASON,
       privateReplyEnabled: () => options.privateReplyOn ?? false,
       asyncTriggerStore: { lookupStrict: () => undefined },
@@ -398,7 +399,7 @@ describe('universal output recovery', () => {
 describe('worker production IPC boundary', () => {
   it('routes every final producer through durable publication and keeps workflow completion behind the write', () => {
     const ipc = vi.fn(); const publish = vi.fn();
-    const scope: any = { closeRequested: false, log: vi.fn(), workerIpcPayload: (msg: WorkerFinalOutput) => msg,
+    const scope: any = { closeRequested: false, log: vi.fn(), workerIpcPayload: (msg: WorkerFinalOutput) => msg, sessionEventMetadata: (msg: WorkerFinalOutput) => msg,
       isWorkflowWorker: () => true, workflowFinalOutputSent: false, process: { send: ipc },
       universalOutputHandoff: { publish }, lastInitConfig: { finalOutputHandoff: { version: 2, admitNew: true } } };
     const send = loadWorkerFunction<(msg: unknown) => void>('send', scope);
@@ -423,7 +424,7 @@ describe('native and generic settlement contracts', () => {
     const record = db.accept(outputSnapshot(app, native), { kind: 'managed' });
     const ds: any = { worker, larkAppId: app, initConfig: { finalOutputHandoff: { token: 'token' } }, session: { sessionId: output.sessionId, status: 'active', codexAppDispatchLedger: [], codexAppGenerationCommits: failure === 'recovery receipt write' ? [{ generation: 'native-1', committedThrough: 1 }] : [] } };
     const scope: any = { ds, worker, t: 'probe', workerGeneration: 1, cb: {}, journal: db, coordinator: new OutputDeliveryCoordinator(db),
-      ownsLifecycleMutation: () => true, logger: { warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+      ownsLifecycleMutation: () => true, ownsWorkerSession: () => true, isSessionTransferring: () => false, sessionController: undefined, logger: { warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
       committedCodexAppSequence, hasUnsettledCodexAppDispatch,
       reconcileOrdinaryTurnRecoveryTerminalReceipt: () => { throw new Error('EIO'); },
       settleCodexAppDispatch: () => failure === 'unauthorized steer' ? { ok: true, ledger: [], settledEntry: { codexAppSteerable: false, deliverySink: 'suppressed' } } : { ok: false, error: 'signed_sequence_rejected' },
@@ -452,7 +453,7 @@ it('does not accept a generic suppression receipt as native FIFO settlement', as
   const native: WorkerFinalOutput = { ...output, codexAppSettlement: { requestId: 'current', generation: 'native-1', seq: 1, dispatchId: 'dispatch' } };
   const record = db.accept(outputSnapshot(app, native), { kind: 'managed' });
   const ds = { worker, larkAppId: app, session: { sessionId: output.sessionId, status: 'active' } };
-  const scope: any = { ds, worker, journal: db, coordinator: new OutputDeliveryCoordinator(db), ownsLifecycleMutation: () => true,
+  const scope: any = { ds, worker, journal: db, coordinator: new OutputDeliveryCoordinator(db), ownsLifecycleMutation: () => true, ownsWorkerSession: () => true, isSessionTransferring: () => false, sessionController: undefined,
     processFinalOutput: async () => ({ status: 'suppressed' }), logger: { warn: vi.fn() }, FINAL_HANDOFF_DELIVERY_REASON: 'pending', t: 'probe' };
   await loadWorkerPoolClosure<(record: OutputDeliveryRecord) => Promise<void>>('runOutput', scope)(record);
   expect(db.read(record.id)?.state).toBe('blocked'); expect(worker.send).not.toHaveBeenCalled();
@@ -475,7 +476,7 @@ describe('native suppressed replay', () => {
     expect(record.output.content).toBe('answer'); expect(record.output.codexAppSettlement?.requestId).toBe('replacement');
     if (state === 'pending') expect(workerJournal.readPending()[0].output.content).toBe('answer');
     const worker = { send: vi.fn() }; const ds: any = { worker, larkAppId: app, session: { sessionId: output.sessionId, status: 'active', codexAppGenerationCommits: [{ generation: 'native-1', committedThrough: 1 }], codexAppDispatchLedger: [] }, initConfig: { finalOutputHandoff: { token: 'token' } } };
-    const scope: any = { ds, worker, t: 'probe', workerGeneration: 1, cb: {}, journal: host, coordinator: new OutputDeliveryCoordinator(host), ownsLifecycleMutation: () => true, logger: { warn: vi.fn() }, committedCodexAppSequence, hasUnsettledCodexAppDispatch, reconcileOrdinaryTurnRecoveryTerminalReceipt: () => {}, FINAL_HANDOFF_DELIVERY_REASON: 'pending' };
+    const scope: any = { ds, worker, t: 'probe', workerGeneration: 1, cb: {}, journal: host, coordinator: new OutputDeliveryCoordinator(host), ownsLifecycleMutation: () => true, ownsWorkerSession: () => true, isSessionTransferring: () => false, sessionController: undefined, logger: { warn: vi.fn() }, committedCodexAppSequence, hasUnsettledCodexAppDispatch, reconcileOrdinaryTurnRecoveryTerminalReceipt: () => {}, FINAL_HANDOFF_DELIVERY_REASON: 'pending' };
     scope.processFinalOutput = loadWorkerPoolClosure('processFinalOutput', scope);
     await loadWorkerPoolClosure<(record: OutputDeliveryRecord) => Promise<void>>('runOutput', scope)(record);
     expect(worker.send).toHaveBeenCalledWith({ type: 'codex_app_dispatch_persisted', requestId: 'replacement', ok: true });

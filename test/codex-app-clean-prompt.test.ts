@@ -192,6 +192,16 @@ describe('Codex App clean prompt sidecar', () => {
     expect(built.codexAppInput?.additionalContext?.botmux_attachments.value).toContain('/tmp/readme.md');
   });
 
+  it('omits the reply reminder for silent turns (group secretary) but keeps the rest', () => {
+    const built = buildFollowUpCliInput('<group_secretary>...</group_secretary>', 'sid-3', {
+      cliId: 'codex-app',
+      locale: 'zh',
+      omitReminder: true,
+    });
+    expect(built.content).not.toContain('<botmux_reminder>');
+    expect(built.content).toContain('group_secretary');
+  });
+
   it('injects conservative summary.md reuse rules when summary memory is enabled', () => {
     registerBot({
       larkAppId: 'summary-memory-prompt',
@@ -371,6 +381,33 @@ describe('Codex App clean prompt sidecar', () => {
     expect(built.content).not.toContain('<observed_mention');
   });
 
+  it('renders an App ID target by its App ID and keeps the observed open_id out of the configured slot', () => {
+    const built = buildNewTopicCliInput(
+      '请代为处理',
+      'sid-substitute-app',
+      'codex-app',
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      'zh',
+      undefined,
+      { substituteTrigger: {
+        target: { appId: 'cli_target' },
+        observedMention: { name: 'Target Bot', appId: 'cli_target', openId: 'ou_receiver_scoped' },
+        disclosure: 'prefix',
+      } },
+    );
+
+    const target = built.codexAppInput?.additionalContext?.botmux_substitute_target?.value;
+    expect(target).toContain('<configured_target app_id="cli_target" />');
+    expect(target).toContain('<observed_mention name="Target Bot" app_id="cli_target" open_id="ou_receiver_scoped" />');
+    expect(built.content).toContain('<target name="Target Bot" app_id="cli_target" />');
+    expect(built.content).not.toContain('ou_receiver_scoped');
+  });
+
   it('preserves the trust split when a stopped Codex App session is reforked', () => {
     const built = buildReforkCliInput({
       larkAppId: 'refork-app',
@@ -464,7 +501,7 @@ describe('Codex App clean prompt sidecar', () => {
     };
     const payload = buildFollowUpCliInput('visible', 'sid-off', { cliId: 'codex-app' });
 
-    rememberLastCliInput(ds, 'visible', payload);
+    rememberLastCliInput(ds, 'visible', payload, 'om_visible');
 
     expect(ds.lastCliInput).toBe(payload.content);
     expect(ds.lastCodexAppInput).toBeUndefined();
@@ -484,10 +521,23 @@ describe('Codex App clean prompt sidecar', () => {
     };
     const payload = buildFollowUpCliInput('visible', 'sid-on', { cliId: 'codex-app' });
 
-    rememberLastCliInput(ds, 'visible', payload);
+    rememberLastCliInput(ds, 'visible', payload, 'om_visible');
 
     expect(ds.lastCodexAppInput?.text).toBe('visible');
     expect(ds.session.lastCodexAppInput?.text).toBe('visible');
+  });
+
+  it('persists input ownership with the payload and clears it for an uncorrelated input', () => {
+    registerBot({ larkAppId: 'input-owner', larkAppSecret: 's', cliId: 'codex' });
+    const ds: any = { larkAppId: 'input-owner', session: { sessionId: 'sid-owner', cliId: 'codex' } };
+    rememberLastCliInput(ds, 'first', 'wrapped first', 'om_first');
+    expect(ds.session).toMatchObject({ lastUserPrompt: 'first', lastCliInput: 'wrapped first', lastCliInputTurnId: 'om_first' });
+    rememberLastCliInput(ds, 'second', 'wrapped second', 'schedule:second');
+    expect(ds.session).toMatchObject({ lastUserPrompt: 'second', lastCliInput: 'wrapped second', lastCliInputTurnId: 'schedule:second' });
+    rememberLastCliInput(ds, 'untracked', 'wrapped untracked', undefined);
+    expect(ds.lastCliInputTurnId).toBeUndefined();
+    expect(ds.session.lastCliInputTurnId).toBeUndefined();
+    expect(ds.session.lastCliInput).toBe('wrapped untracked');
   });
 
   it('strips the one-shot async steer target when persisting the sidecar for replay', () => {
@@ -510,7 +560,7 @@ describe('Codex App clean prompt sidecar', () => {
       },
     };
 
-    rememberLastCliInput(ds, 'answer', payload);
+    rememberLastCliInput(ds, 'answer', payload, 'om_answer');
 
     // A retry / failed-turn replay must not carry a target pointing at the
     // dead native turn; ordinary sidecar fields still survive.

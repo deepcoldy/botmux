@@ -48,16 +48,23 @@ function replaceOnce(text: string, candidate: string, replacement: string): stri
 }
 
 /** Drop every rendering of a background attachment that no longer belongs to
- * the dispatched sources: `<image|file … path="…"/>` hint items, bridge
- * `- name (path)` lines, and empty hint blocks left behind. */
+ * the dispatched sources: `<image|file|video … path="…"/>` hint items, bridge
+ * `- name (path)` lines, a video hint left without a video item, and empty hint
+ * blocks left behind. */
 function stripAttachmentReferences(text: string, paths: readonly string[]): string {
   let out = text;
   for (const path of paths) {
-    out = out.replace(new RegExp(`^[ \\t]*<(?:image|file) n="\\d+" path="${escapeRegExp(xmlEscape(path))}"[^\\n]*\\/>\\n?`, 'gm'), '');
+    out = out.replace(new RegExp(`^[ \\t]*<(?:image|file|video) n="\\d+" path="${escapeRegExp(xmlEscape(path))}"[^\\n]*\\/>\\n?`, 'gm'), '');
     out = out.replace(new RegExp(`^- [^\\n]* \\(${escapeRegExp(path)}\\)\\n?`, 'gm'), '');
   }
+  // A video hint whose items were all stripped (other attachment types may
+  // remain in the block) must not survive on its own.
+  out = out.replace(/<attachments\b[^>]*>[\s\S]*?<\/attachments>/g, block =>
+    /<video\b/.test(block)
+      ? block
+      : block.replace(/^[ \t]*<video_hint>[\s\S]*?<\/video_hint>\n?/gm, ''));
   // An attachments hint block with no items left.
-  out = out.replace(/<attachments hint="[^"]*">\n*<\/attachments>\n?/g, '');
+  out = out.replace(/<attachments hint="[^"]*">\s*<\/attachments>\n?/g, '');
   // A bridge attachments label with no items left.
   out = out.replace(/\n?\[(?:附件|Attachments)\]\n(?=\n|$)/g, '');
   return out;

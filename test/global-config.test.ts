@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
   clearWorkerConfig,
+  configuredProtectedMcpEnvKeys,
   GROUP_NAME_PREFIX_MAX_LENGTH,
   globalVcMeetingAgentListenerBotAppId,
   globalConfigPath,
@@ -23,6 +24,7 @@ import {
   ignoredScheduleBotGrantCount,
 } from '../src/global-config.js';
 import { resolveCodexNotifierConfig } from '../src/features/codex-notifier/config.js';
+import { protectedMcpIsolationPolicy } from '../src/core/protected-mcp-capabilities.js';
 
 describe('global dashboard config', () => {
   let home: string;
@@ -121,6 +123,166 @@ describe('global dashboard config', () => {
   it('rejects a relative operator-provided global config path', () => {
     vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', 'control/config.json');
     expect(() => globalConfigPath()).toThrow(/must be absolute/);
+  });
+
+  it('reads protected MCP capabilities from machine-wide config with writes default-off', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      protectedMcpCapabilities: {
+        'fixture.secret.v1': {
+          allowedPluginIds: ['fixture-plugin', 'fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
+          principal: 'verified-human-email',
+          containmentProfile: 'local-stdio-secret-v1',
+          isolation: {
+            protectedHomePaths: ['.fixture-credential', '.fixture-credential'],
+            redactEnv: ['FIXTURE_TOKEN', 'FIXTURE_TOKEN'],
+          },
+        },
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().protectedMcpCapabilities).toEqual({
+      'fixture.secret.v1': {
+        enabled: false,
+        allowedPluginIds: ['fixture-plugin'],
+        secret: { source: 'file', path: '.secrets/mcp-secret' },
+        principal: 'verified-human-email',
+        containmentProfile: 'local-stdio-secret-v1',
+        isolation: {
+          protectedHomePaths: ['.fixture-credential'],
+          redactEnv: ['FIXTURE_TOKEN'],
+        },
+      },
+    });
+  });
+
+  it('accepts the fixed egress-guard containment profile in machine-wide config', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      protectedMcpCapabilities: {
+        'fixture.actor-write.v1': {
+          enabled: false,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
+          principal: 'verified-human-email',
+          containmentProfile: 'local-stdio-secret-egress-guard-v1',
+        },
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().protectedMcpCapabilities).toEqual({
+      'fixture.actor-write.v1': {
+        enabled: false,
+        allowedPluginIds: ['fixture-plugin'],
+        secret: { source: 'file', path: '.secrets/mcp-secret' },
+        principal: 'verified-human-email',
+        containmentProfile: 'local-stdio-secret-egress-guard-v1',
+      },
+    });
+  });
+
+  it('drops malformed protected MCP capability entries without widening access', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      protectedMcpCapabilities: {
+        '../escape': {
+          enabled: true,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
+          containmentProfile: 'local-stdio-secret-v1',
+        },
+        'fixture.absolute-path.v1': {
+          enabled: true,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
+          containmentProfile: 'local-stdio-secret-v1',
+          isolation: { protectedHomePaths: ['/tmp/credential'] },
+        },
+        'fixture.bad-env.v1': {
+          enabled: true,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'env', name: 'BAD-NAME' },
+          containmentProfile: 'local-stdio-secret-v1',
+        },
+        'fixture.unknown-profile.v1': {
+          enabled: true,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
+          containmentProfile: 'operator-composed-profile',
+        },
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().protectedMcpCapabilities).toBeUndefined();
+  });
+
+  it('drops protected MCP capability records whose enabled flag is not boolean', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      protectedMcpCapabilities: {
+        'fixture.string-enabled.v1': {
+          enabled: 'true',
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/string-secret' },
+          isolation: { redactEnv: ['FIXTURE_STRING_SECRET'] },
+          containmentProfile: 'local-stdio-secret-v1',
+        },
+        'fixture.numeric-enabled.v1': {
+          enabled: 1,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/numeric-secret' },
+          isolation: { redactEnv: ['FIXTURE_NUMERIC_SECRET'] },
+          containmentProfile: 'local-stdio-secret-v1',
+        },
+        'fixture.boolean-enabled.v1': {
+          enabled: false,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/boolean-secret' },
+          isolation: { redactEnv: ['FIXTURE_BOOLEAN_SECRET'] },
+          containmentProfile: 'local-stdio-secret-v1',
+        },
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().protectedMcpCapabilities).toEqual({
+      'fixture.boolean-enabled.v1': {
+        enabled: false,
+        allowedPluginIds: ['fixture-plugin'],
+        secret: { source: 'file', path: '.secrets/boolean-secret' },
+        isolation: { redactEnv: ['FIXTURE_BOOLEAN_SECRET'] },
+        containmentProfile: 'local-stdio-secret-v1',
+      },
+    });
+    expect(configuredProtectedMcpEnvKeys()).toEqual([
+      'FIXTURE_STRING_SECRET',
+      'FIXTURE_NUMERIC_SECRET',
+      'FIXTURE_BOOLEAN_SECRET',
+    ]);
+  });
+
+  it('keeps matching protected MCP isolation active while the capability is disabled', () => {
+    const config = {
+      'fixture.secret.v1': {
+        enabled: false,
+        allowedPluginIds: ['fixture-plugin'],
+        secret: { source: 'file' as const, path: '.secrets/mcp-secret' },
+        containmentProfile: 'local-stdio-secret-v1' as const,
+        isolation: {
+          protectedHomePaths: ['.fixture-credential'],
+          redactEnv: ['FIXTURE_TOKEN'],
+        },
+      },
+    };
+
+    expect(protectedMcpIsolationPolicy(['fixture-plugin'], config)).toEqual({
+      protectedHomePaths: ['.secrets/mcp-secret', '.fixture-credential'],
+      redactEnv: ['FIXTURE_TOKEN'],
+    });
+    expect(protectedMcpIsolationPolicy(['other-plugin'], config)).toEqual({
+      protectedHomePaths: ['.secrets/mcp-secret'],
+      redactEnv: [],
+    });
   });
 
   it('rejects an uncoordinated global config write in primary mode', () => {
@@ -222,6 +384,22 @@ describe('global dashboard config', () => {
     }));
 
     expect(readGlobalConfig().repoPickerMode).toBe('repos');
+  });
+
+  it('reads worktreeRoot as a trimmed absolute or ~/-prefixed path', () => {
+    for (const worktreeRoot of ['/data00/worktrees', '~/wts']) {
+      writeFileSync(globalConfigPath(), JSON.stringify({ worktreeRoot: ` ${worktreeRoot} ` }));
+      invalidateGlobalConfigCache();
+      expect(readGlobalConfig().worktreeRoot).toBe(worktreeRoot);
+    }
+  });
+
+  it('ignores relative or non-string worktreeRoot values', () => {
+    for (const worktreeRoot of ['wts', '~other/wts', '   ', 42]) {
+      writeFileSync(globalConfigPath(), JSON.stringify({ worktreeRoot }));
+      invalidateGlobalConfigCache();
+      expect(readGlobalConfig().worktreeRoot).toBeUndefined();
+    }
   });
 
   it('preserves separator whitespace in groupNamePrefix', () => {

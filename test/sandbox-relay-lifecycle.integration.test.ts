@@ -83,6 +83,10 @@ function createLab(opts: { flavour: SandboxFlavour; backend: Backend }) {
   const sessionId = randomUUID();
   // Short path: tmux socket paths are length-limited.
   const dir = mkdtempSync('/tmp/sbx-life-');
+  // Strict launch drops TMUX_TMPDIR. A unique simulated -L label prevents its
+  // census from borrowing the host's botmux listener; the shim still routes
+  // every real tmux operation to this lab's private -S socket.
+  const socketName = `sbx-life-${sessionId.slice(0, 8)}`;
   const socket = join(dir, 'socket');
   const botmuxHome = join(dir, '.botmux');
   const dataDir = join(botmuxHome, 'data');
@@ -229,6 +233,7 @@ exec '${realTmux}' -S '${socket}' "$@"
     ...process.env,
     PATH: `${bin}:${process.env.PATH}`,
     HOME: dir,
+    TMUX_TMPDIR: dir,
     // Pane launch goes through the user's shell; pin a plain one so the test
     // does not depend on the runner's login shell (nologin for service
     // accounts) or its rcfiles.
@@ -238,6 +243,9 @@ exec '${realTmux}' -S '${socket}' "$@"
     BOTMUX_NO_CLAIM: '1',
   };
   for (const key of Object.keys(env)) if (key.startsWith('BOTMUX_') && key !== 'BOTMUX_NO_CLAIM') delete env[key];
+  // Strict spawn filters TMUX_TMPDIR again; give the host-side socket census
+  // a private label too. The shim still routes every tmux command to `socket`.
+  env.BOTMUX_TMUX_SOCKET = `sbx-life-${sessionId}`;
   delete env.TMUX;
   delete env.TMUX_PANE;
   const init = (bootId: string) => ({

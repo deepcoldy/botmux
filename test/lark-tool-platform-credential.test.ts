@@ -114,6 +114,8 @@ describe('resolveBoundLarkUserCredential', () => {
     const out = await result;
     expect(out).toMatchObject({ ok: false, reason: 'platform', authorizeUrl: PAGE });
     expect(out.ok === false && out.reason === 'platform' && out.error).toContain(PAGE);
+     // The cause travels with the text the agent relays.
+    expect(out.ok === false && out.reason === 'platform' && out.error).toMatch(/\[reason=platform_[a-z_]+\]$/);
   });
 
   it('platform mode never consults the bot-app grant', async () => {
@@ -126,7 +128,9 @@ describe('resolveBoundLarkUserCredential', () => {
   it('platform mode on an unbound machine refuses instead of falling back', async () => {
     bound = false;
     const { result, tokenFn } = resolve(bot({ enabled: true, tools: ['lark-cli'], credentialSource: 'platform' }), 'bot-app-token');
-    expect(await result).toMatchObject({ ok: false, reason: 'platform' });
+    const out = await result;
+    expect(out).toMatchObject({ ok: false, reason: 'platform' });
+    expect(out.ok === false && out.reason === 'platform' && out.error).toContain('[reason=platform_unbound]');
     expect(tokenFn).not.toHaveBeenCalled();
   });
 

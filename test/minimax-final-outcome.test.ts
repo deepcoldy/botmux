@@ -5,17 +5,23 @@ import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import { normalizeFinalUsage } from '../src/services/codex-app-runner-protocol.js';
 import { bridgePostText } from '../src/services/bridge-fallback-gate.js';
 import { runnerFinalOutcome } from '../src/services/runner-final-outcome.js';
+import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
 
 function runner(cliId = 'minimax') {
   const send = vi.fn();
   const terminal = vi.fn();
+  // The real production function retires the finalized turn here; use the real
+  // tracker (not a stub) so a final actually moves replay state the tests can
+  // assert on.
+  const inflightInputs = new InflightInputTracker();
   const scope = {
     lastInitConfig: { cliId }, isCodexAppCliId, normalizeFinalUsage,
     resolveCodexAppFinalTurnIdentity, bridgePostText, runnerFinalOutcome,
     currentBotmuxTurnId: 'om_current', currentBotmuxDispatchAttempt: 2,
     send, emitTurnTerminal: terminal, log: vi.fn(), cliName: () => cliId,
+    inflightInputs,
   };
-  return { scope, send, terminal, final: loadWorkerFunction<(kind: string, payload: Record<string, unknown>) => Promise<boolean>>(
+  return { scope, send, terminal, inflightInputs, final: loadWorkerFunction<(kind: string, payload: Record<string, unknown>) => Promise<boolean>>(
     'handleTrustedCodexAppMarker', scope,
   ) };
 }
@@ -63,10 +69,17 @@ describe('MiniMax final marker downstream settlement', () => {
 
   it.each(['minimax', 'dsh', 'mira'])('preserves ordinary %s success', async cli => {
     const worker = runner(cli);
+    // A trusted final settles the turn: it must leave replay tracking (a later
+    // CLI exit must not carry this input into a fresh session). The filter is
+    // exact-turn, so a different in-flight input survives.
+    worker.inflightInputs.onWrite({ turnId: 'om_current' });
+    worker.inflightInputs.onWrite({ turnId: 'om_queued' });
     await worker.final('final', { content: 'answer', turnId: 'om_current' });
     expect(worker.send.mock.calls[0][0]).toMatchObject({ content: 'answer', turnId: 'om_current' });
     expect(worker.send.mock.calls[0][0].turnFailed).toBeUndefined();
     expect(worker.terminal.mock.calls[0].slice(0, 4)).toEqual(['om_current', 'completed', undefined, 2]);
+    expect(worker.inflightInputs.onCliExit()).toBe(1);
+    expect(worker.inflightInputs.takeCarryOver().map(item => item.turnId)).toEqual(['om_queued']);
   });
 
   it.each([{ turnId: 'om_old' }, { turnId: 'om_current', dispatchAttempt: 1 }])('rejects stale failure identity %j', async identity => {

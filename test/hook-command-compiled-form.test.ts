@@ -89,7 +89,10 @@ describe('hook-command — compiled binary form', () => {
     expect(userPromptHookCommand()).toBe(`'${process.execPath}' user-prompt-hook`);
     expect(claudeStopFailureHookCommand()).toBe(`'${process.execPath}' __claude-stop-failure-v1`);
     // statusLine.command 走进程级 --settings，同样由 Claude 经 shell 执行。
-    expect(statuslineHookCommand()).toBe(`'${process.execPath}' statusline`);
+    // 编译态由 standalone-entry 在加载 cli.js 前分流 statusline；Bun 下带 JSC 线程限制前缀。
+    expect(statuslineHookCommand(true, undefined, false)).toBe(`'${process.execPath}' statusline`);
+    expect(statuslineHookCommand(true, undefined, true, 'linux'))
+      .toBe(`BUN_JSC_numberOfGCMarkers=1 BUN_JSC_useConcurrentJIT=false '${process.execPath}' statusline`);
     expect(cursorUsageHookCommand()).toContain(`'${process.execPath}' __cursor-usage-v1`);
     expect(nativeSubagentRuntimeHookCommand()).toMatch(
       /^".+[/\\]\.botmux[/\\]bin[/\\]botmux-native-subagent-runtime-hook(?:\.cmd)?"$/,
@@ -182,7 +185,6 @@ describe('hook-command — non-standalone form', () => {
     expect(sessionReadyHookCommand()).toBe(`${prefix} session-ready`);
     expect(userPromptHookCommand()).toBe(`${prefix} user-prompt-hook`);
     expect(claudeStopFailureHookCommand()).toBe(`${prefix} __claude-stop-failure-v1`);
-    expect(statuslineHookCommand()).toBe(`${prefix} statusline`);
 
     expect(nativeSubagentRuntimeHookCommand()).toMatch(
       /^".+[/\\]\.botmux[/\\]bin[/\\]botmux-native-subagent-runtime-hook(?:\.cmd)?"$/,

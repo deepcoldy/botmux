@@ -16,6 +16,12 @@ concurrency:
   # the running one now completes and only the newest pending one waits.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+env:
+  # No job runs the Electron binary that electron's postinstall downloads (the
+  # desktop release lets electron-builder fetch its own copy), and that download
+  # has no retry: one 504 fails the whole bun install (#3193).
+  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+
 jobs:
   # Compile + workflow-core only. The unit suite used to live here and dominated
   # the wall (~10.5 min of a 12 min job on a 4-core runner). Tests now run as
@@ -35,14 +41,14 @@ jobs:
         with:
           node-version: 22
 
-      # Bun is the package manager (packageManager: bun@1.4.3). node-pty's install
+      # Bun is the package manager (packageManager: bun@1.4.4). node-pty's install
       # script runs only because it is in `trustedDependencies` — bun skips
       # dependency lifecycle scripts otherwise, and the sandbox/PTY tests below
       # need a loadable pty.node (here node-pty's own linux-x64 prebuild).
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
         with:
-          bun-version: 1.4.3
-      - run: bun install --frozen-lockfile
+          bun-version: 1.4.4
+      - run: node scripts/ci-net-retry.mjs bun install --frozen-lockfile
       - run: bun run build
       - run: bun run workflow-core:test
 
@@ -54,12 +60,22 @@ jobs:
   # Four shards, split by recorded per-file duration (vitest.config.ts →
   # scripts/duration-shards.mjs; table test/shard-timings.json) rather than
   # vitest's equal-file-count hash split, which left one shard at 19–20 of its
-  # 20 minutes while another finished in 9. Rebalance instead of raising the
-  # limit, so the timeout keeps catching a genuinely hung shard.
+  # limit while another finished in 9.
+  #
+  # The planner balances the SUM of recorded per-file wall times, so the four
+  # shard plans are near-identical (~2560s each), but real shard wall time also
+  # depends on in-shard fork parallelism, PTY integration-test contention and
+  # runner hot/cold state — none of which is in the table. Measured
+  # actual/plan ratios across fully-green runs span ~0.79–0.94 (≈±15%), i.e.
+  # ~±6 min between shards at this size. With a 20-min limit the longest shard
+  # observed 19.2/19.7/20.1 min on three runs and was step-cancelled at 20m06s
+  # (no failing test). 25 min covers that measured variance and still caps a
+  # genuinely hung shard; a stale table only makes shards less even, never
+  # drops a file (refresh with scripts/update-shard-timings.mjs). See #2986.
   test:
     name: test (${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -78,7 +94,7 @@ jobs:
       # Permission denied",exit 1)。这里放开限制并预装 bubblewrap,让沙盒
       # 用例在 CI 上真正执行。整步 best-effort:哪一步失败都不阻塞——测试侧
       # 有 bwrap 运行时探测 gate,跑不了会 loud skip。sudo/apt 卡住时 `|| true`
-      # 不会返回,所以整段准备限时 90s,避免吃掉 job 的 20 分钟超时。
+      # 不会返回,所以整段准备限时 90s,避免吃掉 job 的 25 分钟超时。
       # install 前必须先 apt-get update:runner 镜像自带的 apt 索引会滞后于镜像源,
       # 实测索引里的 bubblewrap 0.9.0-1ubuntu0.1 被 0.9.0-1ubuntu0.2 顶替后,
       # 不 update 直接 install 全部镜像源 404(2026-09-19 master 自身 CI 因此红)。
@@ -96,14 +112,14 @@ jobs:
             echo "bwrap still unavailable — sandbox integration tests will skip (see test-side gate)"
           fi
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
         with:
-          bun-version: 1.4.3
-      - run: bun install --frozen-lockfile
+          bun-version: 1.4.4
+      - run: node scripts/ci-net-retry.mjs bun install --frozen-lockfile
       - run: bun run build
-      # No rerun on failure: a shard spends 10–12 of its 20 minutes in vitest,
-      # so a second pass cannot finish anyway, and a flake must surface to be
-      # fixed rather than be retried away (#2464).
+      # No rerun on failure: a shard spends up to ~17 of its 25 minutes in
+      # vitest, so a second pass cannot finish anyway, and a flake must surface
+      # to be fixed rather than be retried away (#2464).
       - name: Unit tests (shard ${{ matrix.shard }}/4)
         run: bun run test -- --shard=${{ matrix.shard }}/4
 
@@ -205,10 +221,10 @@ jobs:
             echo "bwrap still unavailable — sandbox integration tests will skip (see test-side gate)"
           fi
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
         with:
-          bun-version: 1.4.3
-      - run: bun install --frozen-lockfile
+          bun-version: 1.4.4
+      - run: node scripts/ci-net-retry.mjs bun install --frozen-lockfile
       - run: bun run build
       # Exercise the runner itself before the 20-minute suite. `node --check` cannot
       # catch a missing binding (a ReferenceError is a RUNTIME error, verified), so a
@@ -297,20 +313,21 @@ jobs:
             -v "$PWD:/work" -w /work \
             -e CI_RUN_NUMBER="${{ github.run_number }}" \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -e ELECTRON_SKIP_BINARY_DOWNLOAD=1 \
             node:22-alpine sh -euc '
               # python3/make/g++ are node-gyp'"'"'s toolchain: node-pty must compile
               # here because its linux prebuilds are glibc-only. binutils supplies
               # readelf.
               apk add --no-cache python3 make g++ libstdc++ binutils >/dev/null
 
-              npm i -g bun@1.4.3 --loglevel=error
+              node scripts/ci-net-retry.mjs npm i -g bun@1.4.4 --loglevel=error
               echo "bun $(bun --version) on $(uname -m)"
 
               # Compiles node-pty against MUSL — the entire point of this job.
               # build_from_source makes node-pty'"'"'s install script delete its
               # (glibc) prebuilds and run node-gyp. It only takes effect when
               # node-pty is actually (re)installed — a clean checkout here.
-              npm_config_build_from_source=true bun install --frozen-lockfile
+              npm_config_build_from_source=true node scripts/ci-net-retry.mjs bun install --frozen-lockfile
 
               # Fail closed rather than compiling a musl binary around a glibc
               # native: that mistake survives the build and surfaces only when the
@@ -438,9 +455,9 @@ jobs:
         with:
           node-version: 22
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
 
       # node-pty SHIPS darwin prebuilds (prebuilds/darwin-{x64,arm64}/pty.node
       # plus the spawn-helper sidecar), which is why ONE macOS runner can emit
@@ -448,7 +465,7 @@ jobs:
       # arch only. This install is also the only place in CI where the darwin
       # branch of scripts/build-bun-binary.mjs (`resolveNodePtyNative` picking a
       # prebuild, and the spawn-helper embed) is exercised at all.
-      - run: bun install --frozen-lockfile
+      - run: node scripts/ci-net-retry.mjs bun install --frozen-lockfile
 
       # Same reason and same ORDER as the linux/musl legs: the compiled binary
       # has no package.json on disk, so the version is baked at compile time,

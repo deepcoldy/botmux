@@ -85,6 +85,13 @@ function optionButton(key: string) {
   ).find((element: any) => element.behaviors?.some((behavior: any) =>
     ['ask_select', 'ask_toggle'].includes(behavior.value?.action) && behavior.value?.key === key));
 }
+
+function inlineAskWithQuestions(questions: PendingAsk['questions']): Parameters<typeof buildTurnReplyAskElements>[0] {
+  return { ask: {
+    askId: 'ask-inline', nonce: 'nonce-inline', larkAppId: 'app', chatId: 'oc_chat', rootMessageId: 'om_root',
+    sessionId: 'sid', questions, createdAt: 1_000, deadlineAt: 61_000, settled: false,
+  } };
+}
 async function click(snapshot: PendingAsk, value: Record<string, string>, by = 'ou_owner', messageId = 'om_reply') {
   const response = await handleAskCardAction({
     operator: { open_id: by }, context: { open_message_id: messageId },
@@ -115,6 +122,28 @@ describe('Ask inside the running reply card', () => {
     await answer;
     await Promise.allSettled([...publishing]);
     expect(vi.mocked(observePublishedGroupMessage).mock.calls.at(-1)?.[2]).toBeUndefined();
+  });
+
+  it('masks a content-audit-rejected question patch instead of failing the question', async () => {
+    // The card already shows progress with an email; settling the question
+    // re-renders the whole card and Lark rejects that text.
+    const email = 'alice.liu@example.com';
+    const { snapshot, answer } = await ask();
+    await store.update(key, { kind: 'progress', text: `作者 <${email}>` }, io);
+    const bodies: string[] = [];
+    vi.mocked(updateMessage).mockImplementation(async (_app, _id, content) => {
+      bodies.push(content);
+      if (content.includes(email)) throw { isAxiosError: true, name: 'AxiosError', message: 'Request failed with status code 400',
+        response: { status: 400, data: { code: 230028, msg: 'contain sensitive data: EMAIL_ADDRESS' } } };
+      body = content;
+    });
+    await click(snapshot, { action: 'ask_select', key: 'yes' });
+    expect(await answer).toMatchObject({ kind: 'answered', answers: [['yes']] });
+    await vi.waitFor(() => expect(body).toContain('✓ 继续'));
+    expect(bodies[0]).toContain(email);
+    expect(body).not.toContain(email);
+    expect(body).toContain('example.com');
+    expect(body).toContain('部分内容已自动打码');
   });
 
   it('observes the acknowledged inline question patch for shared history', async () => {
@@ -347,6 +376,7 @@ describe('Ask inside the running reply card', () => {
     expect(replyCardAskTarget(ds, input, { originTurnId: 'om_other' })).toBeUndefined();
     expect(replyCardAskTarget(ds, { ...input, chatId: 'oc_other' }, origin)).toBeUndefined();
     expect(replyCardAskTarget(ds, input, { ...origin, originDispatchAttempt: 2 })).toBeUndefined();
+    expect(replyCardAskTarget(ds, { ...input, mentionedOpenId: 'ou_human' }, origin)).toBeUndefined();
     expect(replyCardAskTarget(ds, { ...input, questions: [{ ...input.questions[0], prompt: '文'.repeat(2000) }] }, origin)).toBeUndefined();
     expect(replyCardAskTarget(ds, { ...input, questions: [{ prompt: 'Details', options: [], multiSelect: false, input: { type: 'text' } }] }, origin)).toBeUndefined();
     const group = { ...ds, scope: 'chat' as const };
@@ -390,6 +420,63 @@ describe('Ask inside the running reply card', () => {
     expect(hidden).not.toContain('config.ts');
     expect(hidden).toContain('已找到配置');
     expect(hidden).toContain('继续执行吗');
+  });
+});
+
+describe('buildTurnReplyAskElements — 选项说明', () => {
+  const notes = (elements: Array<Record<string, any>>) => elements
+    .filter(element => element.tag === 'markdown' && element.text_size === 'notation').map(element => element.content).join('\n');
+
+  it('文字作答批次不画按钮，但选项说明照常展示', () => {
+    const elements = buildTurnReplyAskElements(inlineAskWithQuestions([
+      { prompt: '发布方式', multiSelect: false, options: [
+        { key: 'gray', label: '灰度', description: '先放 5% 流量观察' },
+        { key: 'full', label: '全量', description: '立即放开所有流量' },
+      ] },
+      { prompt: '补充说明', multiSelect: false, options: [], inputMode: 'text' },
+    ]));
+    expect(notes(elements)).toContain('先放 5% 流量观察');
+    expect(notes(elements)).toContain('立即放开所有流量');
+    expect(JSON.stringify(elements)).not.toMatch(/ask_select|ask_toggle/);
+  });
+
+  it('选项里的 at 标签不会变成真实点名，实体解码后也不会', () => {
+    const elements = buildTurnReplyAskElements(inlineAskWithQuestions([
+      { prompt: '选择', multiSelect: false, options: [
+        { key: 'a', label: '<at id=ou_label></at>', description: '<at id=all></at> 和 <at id=ou_desc></at>' },
+        { key: 'b', label: 'B' },
+      ] },
+    ]));
+    expect(notes(elements).replace(/&lt;/g, '<').replace(/&gt;/g, '>')).not.toMatch(/<at\b/);
+  });
+
+  // replyCardAskTarget admits at most 3000 bytes of questions JSON. `<` grows fourfold once
+  // escaped, and a described label is drawn twice in a text batch: the two worst shapes.
+  const fillGate = (questions: (n: number) => PendingAsk['questions']) => {
+    let n = 0;
+    while (Buffer.byteLength(JSON.stringify(questions(n + 1)), 'utf8') <= 3000) n++;
+    return questions(n);
+  };
+  it.each([
+    ['长说明', fillGate(n => [{ prompt: '选择', allowCustom: false, multiSelect: false, options: [
+      { key: 'a', label: 'A', description: `${'<'.repeat(n)}TAIL-A` },
+      { key: 'b', label: 'B', description: `${'<'.repeat(n)}TAIL-B` },
+    ] }])],
+    ['文字批次里的长标签', fillGate(n => [
+      { prompt: '选择', allowCustom: false, multiSelect: false, options: [
+        { key: 'a', label: `${'<'.repeat(n)}A`, description: 'TAIL-A' },
+        { key: 'b', label: `${'<'.repeat(n)}B`, description: 'TAIL-B' },
+      ] },
+      { prompt: '补充', multiSelect: false, options: [], inputMode: 'text' },
+    ])],
+  ])('能进回复卡的最大选项说明完整展示，整卡仍在请求体上限内（%s）', async (_shape, questions) => {
+    const ds = { larkAppId: 'app', chatId: 'oc_chat', replyCardRunningTurnId: 'om_turn',
+      session: { sessionId: 'sid', rootMessageId: 'om_root' } } as DaemonSession;
+    expect(replyCardAskTarget(ds, { ...input, questions }, { originTurnId: 'om_turn' })).toBeDefined();
+    await ask({ questions });
+    expect(body).toContain('TAIL-A');
+    expect(body).toContain('TAIL-B');
+    expect(turnReplyCardRequestBytes(body, 'oc_chat')).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
   });
 });
 

@@ -118,6 +118,41 @@ function allActions(card: any): any[] {
     .flatMap((e: any) => e.actions ?? []);
 }
 
+/** Recursively flatten every card node, including column_set grids, action
+ *  containers and collapsible panels (the streaming card nests controls in
+ *  all three after the keys-panel redesign). */
+function walkNodes(nodes: any[]): any[] {
+  const out: any[] = [];
+  for (const n of nodes ?? []) {
+    if (!n || typeof n !== 'object') continue;
+    out.push(n);
+    if (Array.isArray(n.actions)) out.push(...walkNodes(n.actions));
+    if (Array.isArray(n.columns)) out.push(...walkNodes(n.columns.flatMap((c: any) => c.elements ?? [])));
+    if (Array.isArray(n.elements)) out.push(...walkNodes(n.elements));
+    if (Array.isArray(n.options)) out.push(...n.options);
+  }
+  return out;
+}
+
+function allButtons(card: any): any[] {
+  return walkNodes(card.elements).filter((n: any) => n.tag === 'button');
+}
+
+/** The streaming card's single collapsible panel holds the low-frequency
+ *  controls behind a titled 「更多操作」 header. */
+function morePanel(card: any): any {
+  return walkNodes(card.elements).find((n: any) => n.tag === 'collapsible_panel');
+}
+
+function panelButtons(card: any): any[] {
+  const panel = morePanel(card);
+  return panel ? walkNodes(panel.elements).filter((n: any) => n.tag === 'button') : [];
+}
+
+function findPanelButton(card: any, action: string): any {
+  return panelButtons(card).find((b: any) => b.value?.action === action);
+}
+
 describe('buildAdoptSelectCard (V2 picker)', () => {
   // Helper: flatten the V2 card body to the markdown text of each session card.
   const cardTexts = (card: any): string[] =>
@@ -1726,11 +1761,11 @@ describe('buildStreamingCard', () => {
       expect(hrElements).toHaveLength(0);
     });
 
-    it('should show toggle button text as "显示输出"', () => {
+    it('should show a "显示输出" button inside the more-actions panel', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, 'hidden'));
-      const actions = findActions(card);
-      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_display');
-      expect(toggleBtn.text.content).toContain('显示输出');
+      const btn = findPanelButton(card, 'toggle_display');
+      expect(btn).toBeDefined();
+      expect(btn.text.content).toContain('显示输出');
     });
 
     it('should default to hidden when displayMode is undefined', () => {
@@ -1856,66 +1891,58 @@ describe('buildStreamingCard', () => {
       expect(card.elements[1].tag).toBe('hr');
     });
 
-    it('should show toggle button text as "隐藏输出"', () => {
+    it('should show a "隐藏输出" button inside the more-actions panel', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, 'screenshot'));
-      const actions = findActions(card);
-      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_display');
-      expect(toggleBtn.text.content).toContain('隐藏输出');
+      const btn = findPanelButton(card, 'toggle_display');
+      expect(btn).toBeDefined();
+      expect(btn.text.content).toContain('隐藏输出');
     });
 
-    it('should include export text and refresh buttons', () => {
+    it('should include export text and refresh buttons inside the more-actions panel', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, 'screenshot'));
-      const actions = findActions(card);
-      expect(actions.find((a: any) => a.value?.action === 'export_text')).toBeDefined();
-      expect(actions.find((a: any) => a.value?.action === 'refresh_screenshot')).toBeDefined();
+      expect(findPanelButton(card, 'export_text')).toBeDefined();
+      expect(findPanelButton(card, 'refresh_screenshot')).toBeDefined();
     });
   });
 
   // ── Nonce embedding ────────────────────────────────────────────────────
 
   describe('cardNonce embedding', () => {
-    it('should embed card_nonce in toggle button value when provided', () => {
+    it('should embed card_nonce on the more-panel display toggle when provided', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden', 'nonce_123'));
-      const actions = findActions(card);
-      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_display');
-      expect(toggleBtn.value.card_nonce).toBe('nonce_123');
+      expect(findPanelButton(card, 'toggle_display').value.card_nonce).toBe('nonce_123');
     });
 
     it('should NOT include card_nonce when not provided', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden'));
-      const actions = findActions(card);
-      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_display');
-      expect(toggleBtn.value).not.toHaveProperty('card_nonce');
+      expect(findPanelButton(card, 'toggle_display').value).not.toHaveProperty('card_nonce');
     });
 
     it('should NOT include card_nonce when undefined is passed explicitly', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden', undefined));
-      const actions = findActions(card);
-      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_display');
-      expect(toggleBtn.value).not.toHaveProperty('card_nonce');
+      expect(findPanelButton(card, 'toggle_display').value).not.toHaveProperty('card_nonce');
     });
   });
 
   // #2062: the idempotent display target exists only for the primary
-  // multi-replica control lane; single-replica cards keep the old payload
-  // (byte-for-byte, see card-builder-wire-golden).
+  // multi-replica control lane; single-replica cards keep the plain payload.
+  // The panel toggle button carries target_display_mode directly.
   describe('display toggle target mode', () => {
     afterEach(() => { vi.unstubAllEnvs(); });
-    const toggleValue = (mode: 'hidden' | 'screenshot') => findActions(
-      parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, mode)),
-    ).find((a: any) => a.value?.action === 'toggle_display').value;
+    const toggleButton = (mode: 'hidden' | 'screenshot') =>
+      findPanelButton(parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, mode)), 'toggle_display');
 
     it('carries the visible target in primary coordination mode', () => {
       vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
-      expect(toggleValue('hidden').target_display_mode).toBe('screenshot');
-      expect(toggleValue('screenshot').target_display_mode).toBe('hidden');
+      expect(toggleButton('hidden').value.target_display_mode).toBe('screenshot');
+      expect(toggleButton('screenshot').value.target_display_mode).toBe('hidden');
     });
 
     it('omits it outside primary mode', () => {
       vi.stubEnv('BOTMUX_COORDINATION_MODE', 'disabled');
-      expect(toggleValue('hidden')).not.toHaveProperty('target_display_mode');
+      expect(toggleButton('hidden').value).not.toHaveProperty('target_display_mode');
       vi.stubEnv('BOTMUX_COORDINATION_MODE', '');
-      expect(toggleValue('screenshot')).not.toHaveProperty('target_display_mode');
+      expect(toggleButton('screenshot').value).not.toHaveProperty('target_display_mode');
     });
   });
 
@@ -1934,13 +1961,12 @@ describe('buildStreamingCard', () => {
       expect(termBtn.type).toBe('primary');
     });
 
-    it('should include get_write_link button', () => {
+    it('should include get_write_link button inside the more-actions panel', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
-      const actions = findActions(card);
-      const linkBtn = actions.find((a: any) => a.value?.action === 'get_write_link');
-      expect(linkBtn).toBeDefined();
-      expect(linkBtn.value.root_id).toBe(ROOT);
-      expect(linkBtn.value.session_id).toBe(SID);
+      const btn = findPanelButton(card, 'get_write_link');
+      expect(btn).toBeDefined();
+      expect(btn.value.root_id).toBe(ROOT);
+      expect(btn.value.session_id).toBe(SID);
     });
 
     it('hides Web Terminal controls when the backend has no terminal URL', () => {
@@ -1949,14 +1975,15 @@ describe('buildStreamingCard', () => {
         SID, ROOT, '', TITLE, '', 'idle', 'codex', 'hidden',
         undefined, undefined, false, false, 'en', undefined, undefined, true,
       ));
-      const actions = findActions(card);
 
-      expect(actions.some((a: any) => a.multi_url)).toBe(false);
-      expect(actions.some((a: any) => a.value?.action === 'get_write_link')).toBe(false);
+      // No URL button on the primary row; the link/display/local controls all
+      // live (or are absent) inside the more-actions panel.
+      expect(allButtons(card).some((a: any) => a.multi_url)).toBe(false);
+      expect(findPanelButton(card, 'get_write_link')).toBeUndefined();
       // Native local opening (for example `zmx attach`) stays available.
-      expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(true);
-      expect(actions.some((a: any) => a.value?.action === 'toggle_display')).toBe(true);
-      expect(actions.some((a: any) => a.value?.action === 'close')).toBe(true);
+      expect(findPanelButton(card, 'open_local_cli')).toBeDefined();
+      expect(findPanelButton(card, 'toggle_display')).toBeDefined();
+      expect(allButtons(card).some((a: any) => a.value?.action === 'close')).toBe(true);
     });
 
     it('should include close button with danger type', () => {
@@ -1974,14 +2001,13 @@ describe('buildStreamingCard', () => {
         undefined, undefined, undefined, false, undefined,
         ['terminal', 'writeLink', 'close'],
       ));
-      const actions = findActions(card);
 
-      expect(actions.some((a: any) => a.multi_url)).toBe(false);
-      expect(actions.some((a: any) => a.value?.action === 'get_write_link')).toBe(false);
-      expect(actions.some((a: any) => a.value?.action === 'close')).toBe(false);
-      expect(actions.some((a: any) => a.value?.action === 'toggle_display')).toBe(true);
-      expect(actions.some((a: any) => a.value?.action === 'compact_session')).toBe(true);
-      expect(actions.some((a: any) => a.value?.action === 'stop_turn')).toBe(true);
+      expect(allButtons(card).some((a: any) => a.multi_url)).toBe(false);
+      expect(findPanelButton(card, 'get_write_link')).toBeUndefined();
+      expect(allButtons(card).some((a: any) => a.value?.action === 'close')).toBe(false);
+      expect(findPanelButton(card, 'toggle_display')).toBeDefined();
+      expect(allButtons(card).some((a: any) => a.value?.action === 'compact_session')).toBe(true);
+      expect(allButtons(card).some((a: any) => a.value?.action === 'stop_turn')).toBe(true);
     });
 
     it('treats output as one control group and omits empty action containers', () => {
@@ -1991,10 +2017,11 @@ describe('buildStreamingCard', () => {
         undefined, undefined, undefined, false, undefined,
         ['output'],
       ));
-      const screenshotActions = findActions(screenshot);
-      expect(screenshotActions.some((a: any) => a.value?.action === 'toggle_display')).toBe(false);
-      expect(screenshotActions.some((a: any) => a.value?.action === 'export_text')).toBe(false);
-      expect(screenshotActions.some((a: any) => a.value?.action === 'refresh_screenshot')).toBe(false);
+      expect(findPanelButton(screenshot, 'toggle_display')).toBeUndefined();
+      expect(findPanelButton(screenshot, 'export_text')).toBeUndefined();
+      expect(findPanelButton(screenshot, 'refresh_screenshot')).toBeUndefined();
+      // The keys toggle is independent of the output group and stays available.
+      expect(allActions(screenshot).some((a: any) => a.value?.action === 'toggle_keys_panel')).toBe(true);
 
       const allHidden = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, '', 'idle', 'claude-code', 'hidden',
@@ -2002,25 +2029,31 @@ describe('buildStreamingCard', () => {
         undefined, undefined, undefined, false, undefined,
         ['output', 'terminal', 'writeLink', 'compact', 'stop', 'close'],
       ));
+      // No primary action rows and no more-actions panel when every control is hidden.
       expect(allHidden.elements.some((e: any) => e.tag === 'action')).toBe(false);
+      expect(morePanel(allHidden)).toBeUndefined();
     });
 
-    it('should have exactly 5 buttons (toggle, terminal, get_write_link, compact, close)', () => {
+    it('splits idle controls into a primary row and a more-actions panel', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
-      const actions = findActions(card);
-      // 压缩按钮不依赖 usage/百分比，也不限 working 态——idle 恰是最适合压缩的时机
-      // （没有 turn 在跑），handler 侧只要求 worker 活着。
-      expect(actions.map((a: any) => a.value?.action ?? 'url'))
-        .toEqual(['toggle_display', 'url', 'get_write_link', 'compact_session', 'close']);
+      // Primary row: terminal URL, compact, close (idle has no turn to stop).
+      // allActions only walks action containers, so panel buttons are excluded.
+      expect(allActions(card).map((a: any) => a.value?.action ?? 'url'))
+        .toEqual(['url', 'compact_session', 'close']);
+      // Low-frequency controls move into the titled collapsible panel.
+      expect(panelButtons(card).map((b: any) => b.value.action))
+        .toEqual(['toggle_display', 'get_write_link']);
+      expect(morePanel(card).header.title.content).toContain('更多操作');
+      expect(morePanel(card).expanded).toBe(false);
     });
 
-    it('should include Open TRAE beside Web Terminal for traex streaming cards', () => {
+    it('should include Open TRAE as a more-actions panel button for traex cards', () => {
       enableLocalCliOpen();
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden', undefined, undefined, false, false, 'en', undefined, undefined, true));
-      const actions = findActions(card);
-      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['toggle_display', 'url', 'open_local_cli', 'get_write_link', 'compact_session', 'close']);
-      expect(actions[2].text.content).toBe('Open TRAE');
-      expect(actions[2].value.cli_id).toBe('traex');
+      const trae = findPanelButton(card, 'open_local_cli');
+      expect(trae).toBeDefined();
+      expect(trae.text.content).toBe('Open TRAE');
+      expect(trae.value.cli_id).toBe('traex');
     });
 
     it('shows streaming native CLI opening only when local CLI readiness is true', () => {
@@ -2028,8 +2061,8 @@ describe('buildStreamingCard', () => {
       const notReady = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'codex', 'hidden', undefined, undefined, false, false, 'en', undefined, undefined, false));
       const ready = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'codex', 'hidden', undefined, undefined, false, false, 'en', undefined, undefined, true));
 
-      expect(findActions(notReady).some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
-      expect(findActions(ready).some((a: any) => a.value?.action === 'open_local_cli')).toBe(true);
+      expect(findPanelButton(notReady, 'open_local_cli')).toBeUndefined();
+      expect(findPanelButton(ready, 'open_local_cli')).toBeDefined();
     });
   });
 
@@ -2103,7 +2136,7 @@ describe('buildStreamingCard', () => {
       }, undefined, true, undefined, 'Vendor [Codex] <at id=ou_fake></at>',
     ));
     expect(card.header.title.content).toContain('Vendor [Codex] <at id=ou_fake></at>');
-    expect(buttonTexts(findActions(card))).toContain('💻 Open Vendor [Codex] <at id=ou_fake></at>');
+    expect(panelButtons(card).map((b: any) => b.text.content)).toContain('💻 Open Vendor [Codex] <at id=ou_fake></at>');
     const markdown = card.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
     expect(markdown).toContain('Vendor \\[Codex\\] \\<at id=ou\\_fake\\>\\</at\\>');
     expect(markdown).not.toContain('<at id=ou_fake>');
@@ -2956,6 +2989,64 @@ describe('buildPrivateSnapshotCard', () => {
       .flatMap((e: any) => e.actions ?? []);
   }
 
+  it('keeps the card under the size budget when the screen holds a huge backtick run', () => {
+    for (const screen of ['`'.repeat(36_000), 'a\n' + '`'.repeat(200_000) + '\nb']) {
+      const json = buildPrivateSnapshotCard(
+        'https://t.example/ro', 'my session', 'idle', 'claude-code', undefined, screen,
+        'sess-9', 'om_anchor', 'zh',
+      );
+      expect(Buffer.byteLength(json, 'utf-8')).toBeLessThan(20_000);
+    }
+  });
+
+  it('still fences output containing a backtick run so it cannot break out of the code block', () => {
+    const card = build({ screen: 'x\n```\n# not a heading\n```\ny' });
+    const md = card.elements.find((e: any) => e.tag === 'markdown' && e.content.includes('not a heading')).content;
+    const fence = md.match(/^`+/)![0];
+    expect(fence.length).toBeGreaterThan(3);
+    expect(md.endsWith(fence)).toBe(true);
+  });
+
+  it('caps a run of exactly 9 backticks at 8 in the body, keeping a length-9 fence that closes', () => {
+    const card = build({ screen: 'a\n' + '`'.repeat(9) });
+    const md = card.elements.find((e: any) => e.tag === 'markdown' && e.content.startsWith('`')).content;
+    const fence = '`'.repeat(9);
+    expect(md.startsWith(fence)).toBe(true);
+    expect(md.endsWith(fence)).toBe(true);
+    // The capped content sits between the two fences; no run of 9+ survives there.
+    const body = md.slice(fence.length, md.length - fence.length);
+    const maxBodyRun = (body.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 0);
+    expect(maxBodyRun).toBe(8);
+  });
+
+  it('stays bounded when a huge backtick run is the final line and truncation keeps its tail', () => {
+    // The run is the LAST line: once truncateContent preserves an oversized
+    // line's tail, dropping the cap would keep ~50k ticks and the two
+    // maxRun+1 fences would push the card past Feishu's size limit.
+    const json = buildPrivateSnapshotCard(
+      'https://t.example/ro', 'my session', 'idle', 'claude-code', undefined,
+      'a\n' + '`'.repeat(200_000),
+      'sess-9', 'om_anchor', 'zh',
+    );
+    expect(Buffer.byteLength(json, 'utf-8')).toBeLessThan(20_000);
+  });
+
+  it('bounds whole card size under Feishu limit when content is densely packed with quotes or backslashes (#2929)', () => {
+    // 50,000 quotes or backslashes: before fix, raw byte length was ~50 KB but
+    // JSON escaping doubled it to ~100 KB, pushing the whole card to ~101 KB (near the ~109 KB limit).
+    // With JSON-escaped budgeting, whole card size stays safely bounded.
+    for (const denseChar of ['"', '\\']) {
+      const dense = denseChar.repeat(50_000);
+      const json = buildPrivateSnapshotCard(
+        'https://t.example/ro', 'my session', 'idle', 'claude-code', undefined,
+        dense,
+        'sess-9', 'om_anchor', 'zh',
+      );
+      const byteLen = Buffer.byteLength(json, 'utf-8');
+      expect(byteLen).toBeLessThanOrEqual(60_000);
+    }
+  });
+
   it('does not opt private one-shot snapshots into shared PATCH updates', () => {
     expect(build().config.update_multi).toBeUndefined();
   });
@@ -3077,32 +3168,150 @@ describe('buildPrivateSnapshotCard', () => {
   });
 });
 
-describe('remote backends get no PTY quick-action keys', () => {
+describe('terminal-key grid (collapsed by default, toggle-gated)', () => {
   /** The 11 quick-action buttons only make sense with a local terminal. */
-  const KEY_LABELS = ['Esc', '^C', 'Tab', '␣ Space', '↵ Enter', '←', '↑', '↓', '→'];
+  const KEY_LABELS = ['×', '^C', '⇥', '␣', '↵', '←', '↑', '↓', '→'];
+  const HALF_LABELS = ['▲', '▼'];
 
-  function keysIn(cliId: 'claude-code' | 'riff' | 'mojo'): string[] {
-    const card = buildStreamingCard(
+  function cardFor(cliId: 'claude-code' | 'riff' | 'mojo', keysPanelOpen = false): any {
+    return parse(buildStreamingCard(
       'sid-1', 'om-1', '', 'title', 'screen', 'idle' as never,
       cliId as never,
       'screenshot' as never,
-    );
-    return KEY_LABELS.filter(l => card.includes(`"content":"${l}"`));
+      undefined, undefined, false, false, undefined, undefined, undefined, false,
+      undefined, undefined, undefined, undefined, undefined, [], false, undefined, keysPanelOpen,
+    ));
   }
 
-  it('renders them for a local CLI', () => {
-    // Guards the negative assertions below: if the buttons stopped being rendered
-    // at all, those would pass for the wrong reason.
-    expect(keysIn('claude-code')).toEqual(KEY_LABELS);
+  function renderedKeyLabels(card: any): string[] {
+    return allButtons(card)
+      .filter((b: any) => b.value?.action === 'term_action')
+      .map((b: any) => b.text.content);
+  }
+
+  it('hides the grid behind the toggle while collapsed, even for a local CLI', () => {
+    const card = cardFor('claude-code');
+    expect(renderedKeyLabels(card)).toEqual([]);
+    const toggle = allButtons(card).find((b: any) => b.value?.action === 'toggle_keys_panel');
+    expect(toggle).toBeDefined();
+    expect(toggle.text.content).toContain('终端按键');
+  });
+
+  it('renders all 11 keys in three column_set rows sized so labels never ellipsize', () => {
+    const card = cardFor('claude-code', true);
+    const labels = renderedKeyLabels(card);
+    for (const l of [...KEY_LABELS, ...HALF_LABELS]) expect(labels).toContain(l);
+    expect(labels).toHaveLength(11);
+    // 5 + 4 + 2 weighted rows: no row exceeds five columns, and the long
+    // The half-page glyphs each get a half-width column instead of a 1/6 sliver.
+    const grids = card.elements.filter((e: any) => e.tag === 'column_set');
+    expect(grids).toHaveLength(3);
+    expect(grids.map((g: any) => g.columns.length)).toEqual([5, 4, 2]);
+    for (const col of grids.flatMap((g: any) => g.columns)) {
+      expect(col.width).toBe('weighted');
+      expect(col.elements[0].width).toBe('fill');
+    }
+  });
+
+  it('keeps terminal keys available without a local-state toggle in primary mode', () => {
+    vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+    try {
+      const card = cardFor('claude-code');
+      expect(renderedKeyLabels(card)).toHaveLength(11);
+      expect(allButtons(card).some((button: any) => button.value?.action === 'toggle_keys_panel')).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   for (const cliId of ['riff', 'mojo'] as const) {
-    it(`hides them for ${cliId}`, () => {
+    it(`renders neither toggle nor grid for the remote backend ${cliId}`, () => {
       // A remote backend has no terminal to drive, so these clicks are silently
-      // inert. The gate was hardcoded to `cliId !== 'riff'`, so adding mojo left
-      // it rendering all 11 buttons; it now consults the REMOTE_CLI_IDS leaf, so
-      // the next remote CLI cannot regress this the same way.
-      expect(keysIn(cliId)).toEqual([]);
+      // inert. The gate consults the REMOTE_CLI_IDS leaf, so the next remote
+      // CLI cannot regress this the same way.
+      const collapsed = cardFor(cliId);
+      const expanded = cardFor(cliId, true);
+      for (const card of [collapsed, expanded]) {
+        expect(renderedKeyLabels(card)).toEqual([]);
+        expect(allButtons(card).some((b: any) => b.value?.action === 'toggle_keys_panel')).toBe(false);
+      }
     });
   }
+});
+
+describe('truncateContent single oversized line', () => {
+  it('keeps the tail of a newline-free blob within budget', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('a'.repeat(300_000) + 'END', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.endsWith('a'.repeat(900) + 'END')).toBe(true);
+  });
+
+  it.each(['\n', '\r\n', '\n\n'])('still keeps content when the blob ends with %j', async (eol) => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('a'.repeat(300_000) + 'END' + eol, 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out).toContain('a'.repeat(900) + 'END');
+  });
+
+  it('keeps the oversized last line even when short lines precede it', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('head\nmid\n' + 'b'.repeat(5000) + 'END', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.endsWith('b'.repeat(900) + 'END')).toBe(true);
+    expect(out).not.toContain('head');
+  });
+
+  it('does not split multibyte characters when cutting a long line', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('中'.repeat(5000) + '尾', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out).not.toContain('\uFFFD');
+    expect(out.endsWith('尾')).toBe(true);
+  });
+
+  it('keeps the whole fitted last non-blank line pushed out by trailing newlines', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    // The 600-byte non-blank line fits within the 970-byte body budget, but the
+    // 401 trailing newlines push total size to 1001, so line bisection leaves
+    // only blank lines. The line must be kept in full: a negative byte offset
+    // (600 - 970) must clamp to 0, not slice off the line's head.
+    const out = truncateContent('x'.repeat(600) + '\n'.repeat(401), 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.split('\n')[1]).toBe('x'.repeat(600));
+  });
+
+  it('skips whitespace-only (not just empty) lines when picking the tail line', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    // After split('\n') the final element is spaces, not an empty string. The
+    // reverse scan must trim() candidates, otherwise the body is blank again.
+    const out = truncateContent('y'.repeat(3000) + '\n   ', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.split('\n')[1]).toBe('y'.repeat(970));
+  });
+
+  it('budget accounts for JSON escape expansion for quote- and backslash-dense input (#2929)', async () => {
+    const { truncateContent, jsonEscapedByteLength } = await import('../src/im/lark/card-builder.js');
+    const maxBytes = 1000;
+    for (const denseChar of ['"', '\\']) {
+      const out = truncateContent(denseChar.repeat(5000), 'zh', maxBytes);
+      expect(jsonEscapedByteLength(out)).toBeLessThanOrEqual(maxBytes);
+    }
+  });
+});
+
+describe('truncateContent JSON-escape byte budget across lines (#2929)', () => {
+  it.each(['"', '\\'])('accounts for escape expansion when line-bisecting %j-dense multi-line input', async (denseChar) => {
+    const { truncateContent, jsonEscapedByteLength } = await import('../src/im/lark/card-builder.js');
+    const maxBytes = 1000;
+    // 20 lines × 80 escape-doubled chars: 1600 raw bytes but ~3200 JSON-escaped.
+    // Newlines force the LINE bisection path; the single-line cases above only
+    // exercise the single-oversized-line char fallback, so reverting the line
+    // predicate to raw byte length survives those but must fail here.
+    const content = Array.from({ length: 20 }, () => denseChar.repeat(80)).join('\n');
+    const out = truncateContent(content, 'zh', maxBytes);
+    expect(jsonEscapedByteLength(out)).toBeLessThanOrEqual(maxBytes);
+    // Tail is retained rather than the output collapsing to just the prefix.
+    expect(out.endsWith(denseChar)).toBe(true);
+  });
 });

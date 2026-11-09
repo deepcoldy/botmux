@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ensureLeadOnlyPluginDir, isPlainBotmuxCommand, leadOnlyArgvViolation, parsePlainBotmuxArgv, isLeadOnlyToolCallAllowed, leadOnlyHooksJson, leadMemoryDir } from '../src/skills/lead-only-guard.js';
+import { ensureLeadOnlyPluginDir, isPlainBotmuxCommand, leadOnlyArgvViolation, parsePlainBotmuxArgv, isLeadOnlyToolCallAllowed, leadOnlyHooksJson } from '../src/skills/lead-only-guard.js';
 
 describe('isPlainBotmuxCommand (strict whitelist lexer)', () => {
   it.each([
@@ -85,8 +85,10 @@ describe('isPlainBotmuxCommand (strict whitelist lexer)', () => {
   ])('denies %j', (cmd) => { expect(isPlainBotmuxCommand(cmd)).toBe(false); });
 });
 
-const DENIED_SUBCOMMANDS = ['task register t1', 'task start t1', 'task update t1 status=done', 'mcp serve', 'setup add', 'upgrade', 'restart', 'delete all', 'plugin init', 'schedule update x', 'workflow run', 'hook lead-only-guard', 'ask', 'daemon'];
+const DENIED_SUBCOMMANDS = ['task register t1', 'task start t1', 'task update t1 status=done', 'mcp serve', 'setup add', 'upgrade', 'restart', 'delete all', 'plugin init', 'schedule update x', 'workflow run', 'hook lead-only-guard', 'ask', 'daemon', 'whiteboard enable', 'whiteboard disable', 'whiteboard write --yes', 'whiteboard create', 'whiteboard path', 'wb enable', 'task list', 'task', 'help', 'whiteboard list', 'wb ls', 'whiteboard read --id wb_other', 'whiteboard update --id=wb_other x', 'whiteboard read --chat-id oc_other', 'whiteboard read --session-id s2', 'whiteboard read --lark-app-id cli_x', 'whiteboard current --id wb_other'];
 const FILE_FLAG_CMDS = [
+  'botmux whiteboard update --content-file /etc/passwd',
+  'botmux whiteboard update --content-file=/x',
   "botmux send --content-file secret.txt",
   "botmux send --content-file=secret.txt",
   "botmux send --file /etc/passwd",
@@ -104,6 +106,11 @@ const FILE_FLAG_CMDS = [
   "botmux send --content-file /etc/passwd <<'EOF'\nx\nEOF",
 ];
 const ALLOWED_CMDS = [
+  'botmux whiteboard read --json',
+  "botmux whiteboard update --expected-updated-at 2026-11-09T00:00:00.000Z <<'EOF'\nrules: a\nEOF\n",
+  "botmux wb update 'notes'",
+  'botmux whiteboard status',
+  'botmux whiteboard current --create',
   "botmux dispatch --brief 'goal: a; check: b'",
   "botmux send '多行\n文本'",
   'botmux status',
@@ -115,8 +122,6 @@ const ALLOWED_CMDS = [
   'botmux bots list --scope chat',
   'botmux bots',
   'botmux --help',
-  'botmux task list',
-  'botmux task',
   'botmux observe',
   'botmux observe --session s1',
   "botmux send --no-mention <<'EOF'\n进度 $(touch pwned) `touch pwned2`\nEOF",
@@ -140,6 +145,12 @@ describe('subcommand + flag allowlist', () => {
   it.each(FILE_FLAG_CMDS)('denies file flag %j', (cmd) => {
     expect(leadOnlyArgvViolation(parsePlainBotmuxArgv(cmd)!)).toMatch(/inline/);
     expect(isLeadOnlyToolCallAllowed({ tool_name: 'Bash', tool_input: { command: cmd } })).toBe(false);
+  });
+  it('denies whiteboard flags that target another directory', () => {
+    for (const cmd of ['botmux whiteboard read --working-dir /tmp', 'botmux wb update --repo=/x hi']) {
+      expect(leadOnlyArgvViolation(parsePlainBotmuxArgv(cmd)!)).toMatch(/not allowed/);
+      expect(isLeadOnlyToolCallAllowed({ tool_name: 'Bash', tool_input: { command: cmd } })).toBe(false);
+    }
   });
   it('narrows bots to roster reads: invite (membership change, no human gate) is denied', () => {
     for (const cmd of [
@@ -203,52 +214,10 @@ describe('isLeadOnlyToolCallAllowed', () => {
   });
 });
 
-describe('lead memory files (Read/Write/Edit only inside <transcript dir>/memory)', () => {
-  const proj = mkdtempSync(join(tmpdir(), 'lead-mem-'));
-  const transcript = join(proj, 'sid.jsonl');
-  const mem = join(proj, 'memory');
-  mkdirSync(mem);
-  writeFileSync(join(mem, 'MEMORY.md'), '- x\n');
-  const outside = join(proj, 'outside.md');
-  writeFileSync(outside, 'secret');
-  symlinkSync(outside, join(mem, 'link.md'));
-  const call = (tool: string, file_path: unknown, transcript_path: unknown = transcript) =>
-    isLeadOnlyToolCallAllowed({ tool_name: tool, tool_input: { file_path }, transcript_path });
-
-  it('derives the memory dir from the transcript path', () => {
-    expect(leadMemoryDir(transcript)).toBe(mem);
-    expect(leadMemoryDir('rel/sid.jsonl')).toBeUndefined();
-    expect(leadMemoryDir(`${proj}/a/../sid.jsonl`)).toBeUndefined();
-    expect(leadMemoryDir(join(proj, 'sid.txt'))).toBeUndefined();
-    expect(leadMemoryDir(undefined)).toBeUndefined();
-  });
-  it.each(['Read', 'Write', 'Edit', 'MultiEdit'])('%s allowed on memory .md files (existing or new)', (tool) => {
-    expect(call(tool, join(mem, 'MEMORY.md'))).toBe(true);
-    expect(call(tool, join(mem, 'user-prefs.md'))).toBe(true);
-  });
-  it.each([
-    ['outside the memory dir', () => outside],
-    ['a .. escape', () => `${mem}/../outside.md`],
-    ['a subdirectory', () => join(mem, 'sub', 'x.md')],
-    ['a non-.md file', () => join(mem, 'x.txt')],
-    ['a dotfile', () => join(mem, '.x.md')],
-    ['a relative path', () => 'memory/x.md'],
-    ['a symlink inside the dir', () => join(mem, 'link.md')],
-    ['the dir itself', () => mem],
-    ['a non-string path', () => 42],
-  ])('denies %s', (_name, path) => {
-    for (const tool of ['Read', 'Write', 'Edit']) expect(call(tool, path())).toBe(false);
-  });
-  it('denies without a usable transcript_path, and for other file tools', () => {
-    expect(call('Write', join(mem, 'x.md'), null)).toBe(false);
-    expect(call('Write', join(mem, 'x.md'), 'sid.jsonl')).toBe(false);
-    expect(call('Write', join(mem, 'x.md'), join(mkdtempSync(join(tmpdir(), 'lead-other-')), 'sid.jsonl'))).toBe(false);
-    for (const tool of ['Grep', 'Glob', 'NotebookEdit']) expect(call(tool, join(mem, 'MEMORY.md'))).toBe(false);
-  });
-  it('denies when the memory dir is a symlink', () => {
-    const p2 = mkdtempSync(join(tmpdir(), 'lead-mem2-'));
-    symlinkSync(mkdtempSync(join(tmpdir(), 'lead-elsewhere-')), join(p2, 'memory'));
-    expect(call('Write', join(p2, 'memory', 'x.md'), join(p2, 'sid.jsonl'))).toBe(false);
+describe('lead has no file tools (memory exception removed)', () => {
+  const transcript = '/home/u/.claude/projects/p/sid.jsonl';
+  it.each(['Read', 'Write', 'Edit', 'MultiEdit'])('%s on a memory/*.md path is denied', (tool) => {
+    expect(isLeadOnlyToolCallAllowed({ tool_name: tool, tool_input: { file_path: '/home/u/.claude/projects/p/memory/MEMORY.md' }, transcript_path: transcript })).toBe(false);
   });
 });
 

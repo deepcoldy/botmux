@@ -16,10 +16,15 @@ function button(text: string, style: string, value: Record<string, unknown>, dis
   return { tag: 'button', text: { tag: 'plain_text', content: text }, type: style, disabled, behaviors: [{ type: 'callback', value }] };
 }
 
+/** `buttonAlign` is only set on the policy when non-left, so the unset case adds no keys at all. */
+function alignProps(policy: FeedbackPolicy, key: 'horizontal_align' | 'text_align'): Record<string, string> {
+  return policy.buttonAlign ? { [key]: policy.buttonAlign } : {};
+}
+
 export function buildFeedbackElement(policy: FeedbackPolicy, state: FeedbackCardState = {}): Record<string, unknown> {
   const locked = !!state.result && !policy.allowReselect;
   return {
-    tag: 'column_set', element_id: 'botmux_feedback', flex_mode: 'flow', horizontal_spacing: 'small',
+    tag: 'column_set', element_id: 'botmux_feedback', flex_mode: 'flow', horizontal_spacing: 'small', ...alignProps(policy, 'horizontal_align'),
     columns: policy.buttons.map(option => ({
       tag: 'column', width: 'auto', elements: [
         button(option.label, option.style, versionedValue(state, { action: 'feedback_submit', result: option.key }), locked),
@@ -32,13 +37,13 @@ function feedbackStateElements(policy: FeedbackPolicy, state: FeedbackCardState)
   if (!state.result) return [buildFeedbackElement(policy)];
   const selected = policy.buttons.find(option => option.key === state.result);
   const elements: Record<string, unknown>[] = [buildFeedbackElement(policy, state)];
-  elements.push({ tag: 'markdown', element_id: 'botmux_feedback_status', content: `已选择：**${selected?.label ?? state.result}**` });
+  elements.push({ tag: 'markdown', element_id: 'botmux_feedback_status', ...alignProps(policy, 'text_align'), content: `已选择：**${selected?.label ?? state.result}**` });
   if (!selected || selected.semantic !== 'negative') {
     return elements;
   }
   if (policy.negativeFollowup.reasons.length > 0) {
     elements.push({
-      tag: 'column_set', element_id: 'botmux_feedback_reasons', flex_mode: 'flow', horizontal_spacing: 'small',
+      tag: 'column_set', element_id: 'botmux_feedback_reasons', flex_mode: 'flow', horizontal_spacing: 'small', ...alignProps(policy, 'horizontal_align'),
       columns: policy.negativeFollowup.reasons.map(reason => ({ tag: 'column', width: 'auto', elements: [button(state.reasonKey === reason.key ? `✓ ${reason.label}` : reason.label, state.reasonKey === reason.key ? 'primary' : 'default', versionedValue(state, { action: 'feedback_reason', reason_key: reason.key }))] })),
     });
   }
@@ -267,6 +272,12 @@ export function renderFeedbackCard(baseCard: Record<string, any>, policy: Feedba
   let end = feedbackIndex + 1;
   while (end < elements.length && FEEDBACK_ELEMENT_IDS.has(String((elements[end] as any)?.element_id ?? ''))) end++;
   const updated = feedbackStateElements(policy, state);
+  const originalColumns = (elements[feedbackIndex] as { columns?: Array<{ width?: string; elements?: unknown[] }> }).columns;
+  if (originalColumns?.length === 1 && originalColumns[0].width === 'weighted') {
+    const columns = updated[0].columns as Array<{ elements: unknown[] }>;
+    updated[0].columns = [{ tag: 'column', width: 'weighted', weight: 1, ...alignProps(policy, 'horizontal_align'), elements: columns.flatMap(column => column.elements) }];
+    updated[0].flex_mode = 'none';
+  }
   const oncall = (elements[feedbackIndex] as any).columns?.find((column: any) => column.element_id === 'botmux_oncall_group_column');
   // Lark's message read API omits behaviors, so restore the callback definition.
   if (oncall) { (updated[0] as any).columns.push(buildOncallGroupColumn()); updated[0].flex_mode = 'flow'; }
@@ -280,6 +291,7 @@ function callbackKey(input: Record<string, unknown>): string { return createHash
 export async function handleSkillFeedbackCardAction(input: unknown, larkAppId: string, deps: {
   store: CompatibleFeedbackStore;
   loadBaseCard?: (platformMessageId: string) => Promise<Record<string, unknown> | undefined>;
+  renderCard?: (policy: FeedbackPolicy, state: FeedbackCardState) => Record<string, unknown>;
 }): Promise<any> {
   const data = normalizeCardActionData(input);
   const platformMessageId = data.context?.open_message_id;
@@ -324,7 +336,7 @@ export async function handleSkillFeedbackCardAction(input: unknown, larkAppId: s
 
   const previous = await deps.store.getLatestFeedback(delivery.deliveryId, operatorSubjectId);
   if (previous && !delivery.policy.allowReselect && action === 'feedback_submit') {
-    return { card: { type: 'raw', data: renderFeedbackCard(baseCard, delivery.policy, previous) } };
+    return { card: { type: 'raw', data: deps.renderCard?.(delivery.policy, previous) ?? renderFeedbackCard(baseCard, delivery.policy, previous) } };
   }
   let result: string;
   let reasonKey: string | undefined;
@@ -376,7 +388,7 @@ export async function handleSkillFeedbackCardAction(input: unknown, larkAppId: s
     }
     throw error;
   }
-  const renderedCard = renderFeedbackCard(baseCard, delivery.policy, recorded.feedback);
+  const renderedCard = deps.renderCard?.(delivery.policy, recorded.feedback) ?? renderFeedbackCard(baseCard, delivery.policy, recorded.feedback);
   const toast = recorded.status === 'stale'
     ? { type: 'warning', content: '反馈状态已更新，请基于最新卡片重试' }
     : undefined;

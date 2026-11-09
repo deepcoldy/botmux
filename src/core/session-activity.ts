@@ -7,8 +7,10 @@ import * as sessionStore from '../services/session-store.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive, composeRowFromClosed, composeRowFromPersistedActive } from './dashboard-rows.js';
 import { buildSessionMessagePreview } from './session-message-preview.js';
+import { holdLastTurnThrough, isMaintenanceTurnId, turnStartedAt } from './turn-outcome.js';
 import type { DaemonSession } from './types.js';
 import type { Session } from '../types.js';
+import { emitSessionTaskEvent } from './session-task-events.js';
 
 /**
  * Stamp `lastHumanMessageAt` on a session that is being created by a human
@@ -49,6 +51,17 @@ export function markSessionActivity(
       },
     },
   });
+}
+
+/**
+ * Bump session activity once a passthrough command reached the worker. A
+ * daemon-issued maintenance turn (auto-compact) is not a new task: extend the
+ * still-current turn result through this moment first, or the bump would make
+ * it stale.
+ */
+export function markPassthroughActivity(ds: DaemonSession, turnId: string, at: number = Date.now()): void {
+  if (isMaintenanceTurnId(turnId)) holdLastTurnThrough(ds, at);
+  markSessionActivity(ds, at);
 }
 
 /** Refresh the latest user/bot exchange after its append-only source file has
@@ -144,12 +157,31 @@ export function publishNativeTopicLinkPatchForSession(session: Session, activeLi
   return true;
 }
 
+const emittedAttention = new WeakMap<DaemonSession, number>();
+
+/** Tell the steward about a raise only when it is a new one, i.e. it has a new
+ *  `at`. Pushes that repeat the same raise (delivery retries keep the first
+ *  `at`, see raiseDaemonAttention) stay quiet. Don't dedupe on the reason: a
+ *  later turn can fail the same way with its own `at`, and the steward's alert
+ *  key is the raise time. */
+function noteAttentionEvent(ds: DaemonSession): void {
+  const raised = ds.agentAttention;
+  if (!raised) {
+    emittedAttention.delete(ds);
+    return;
+  }
+  if (emittedAttention.get(ds) === raised.at) return;
+  emittedAttention.set(ds, raised.at);
+  if (ds.session.chatId) emitSessionTaskEvent({ chatId: ds.session.chatId, sessionId: ds.session.sessionId });
+}
+
 /** Push the current attention signals (repo-selection pending / TUI prompt
  *  open) to the dashboard. Call after mutating `ds.pendingRepo` or
  *  `ds.tuiPromptCardId` so the board view's needs-you column tracks live
  *  state. Idempotent — patches are derived from the session, never toggled
  *  blindly. */
 export function publishAttentionPatch(ds: DaemonSession): void {
+  noteAttentionEvent(ds);
   dashboardEventBus.publish({
     type: 'session.update',
     body: {
@@ -160,11 +192,43 @@ export function publishAttentionPatch(ds: DaemonSession): void {
         // Object when raised, null to clear — SSE consumers merge the patch, so
         // null overwrites the prior value and drops the row out of needs-you.
         agentAttention: ds.agentAttention
-          ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
+          ? {
+              kind: ds.agentAttention.kind,
+              reason: ds.agentAttention.reason,
+              at: ds.agentAttention.at,
+              ...(ds.agentAttention.source ? { source: ds.agentAttention.source } : {}),
+            }
           : null,
       },
     },
   });
+}
+
+/** Raise the daemon's own hand for `turnId`'s delivery that keeps failing.
+ *  Pending deliveries of every unsettled turn are retried every few seconds,
+ *  long after newer turns started. While a daemon raise is up, keep its
+ *  original `at` so the board, owner reminders and steward alerts see one raise,
+ *  not a fresh one per retry. Only a failing turn that started after that raise
+ *  gets its own `at`: the board reads a raise older than a newer turn's start as
+ *  superseded (bot-only groups never clear it), so the newer failure must not
+ *  inherit it, and an older turn's retry must not push it past the newer turn.
+ *  Returns whether anything changed. */
+export function raiseDaemonAttention(
+  ds: DaemonSession,
+  kind: string,
+  reason: string,
+  turnId: string | undefined,
+  now: number = Date.now(),
+): boolean {
+  const current = ds.agentAttention;
+  const startedAt = turnId ? turnStartedAt(ds, turnId) : undefined;
+  if (current && current.source !== 'agent' && !(startedAt !== undefined && startedAt > current.at)) {
+    if (current.kind === kind && current.reason === reason) return false;
+    ds.agentAttention = { kind, reason, at: current.at };
+    return true;
+  }
+  ds.agentAttention = { kind, reason, at: now };
+  return true;
 }
 
 export function clearAgentAttention(ds: DaemonSession): boolean {

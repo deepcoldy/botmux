@@ -1,0 +1,50 @@
+
+  ▄▄▄▄▄▄▄
+  █ ◆ ◆ █  TRAE CLI (v0.213.1)
+   ▀▀▀▀▀▀
+  /tmp/repo
+  permissions: YOLO mode
+
+  Hello, user
+
+  Tip: You can run any shell command from TRAE CLI using ! (e.g. !ls)
+
+⚠ `--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Implement {feature}
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Seed-Evolving · /tmp/repo · Context 100% left
+  ☢ Full Access (shift+tab to cycle) · ? for shortcuts · ← for agents
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

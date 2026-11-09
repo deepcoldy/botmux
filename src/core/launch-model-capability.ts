@@ -2,10 +2,9 @@
  * 「这个 bot 的下一次 spawn 能不能带上一个指定模型」——话题指令头里 `/model` 的**能力门**。
  *
  * 与两个相邻但不同的判据分清楚：
- *   - `isConfigurableReasoningCliId`（services/codex-reasoning-effort.ts）是**策略**门：
- *     trigger API / 定时任务只让「有显式推理控制」的 CLI 接受每次触发的模型覆盖。
- *     它比这里窄得多（只有 codex / codex-app / grok / traex / claude-code），拿它当能力门
- *     会把 cursor、opencode 这些明明吃 `--model` 的 CLI 一并拒掉。
+ *   - `allowsTaskModelOverride` 是 trigger API / 定时任务的**策略**门，独立于 bot
+ *     思考强度配置能力。它比这里窄，拿它当能力门会把 cursor、opencode 这些明明吃
+ *     `--model` 的 CLI 一并拒掉。
  *   - `CliAdapter.modelChoices` 是 **UI 策展**：`botmux setup` / dashboard / 配置卡要不要
  *     渲染模型下拉。它两头都不准 —— `pi` / `oh-my-pi` 吃 `--model` 却没有候选列表，
  *     而 `dsh-tui` 列了候选却在注释里写明「模型由 TUI 自己的 profile 决定，不注入」。
@@ -22,6 +21,17 @@
  */
 import type { BackendType } from '../adapters/backend/types.js';
 import type { CliId } from '../adapters/cli/types.js';
+
+/** Task-supplied model/effort overrides are an explicit policy, not a consequence
+ * of gaining bot-level effort controls. Keep the established allowlist so enabling
+ * a CLI's effort setting cannot activate previously ignored stored task intent. */
+const TASK_MODEL_OVERRIDE_CLI_IDS: ReadonlySet<CliId> = new Set<CliId>([
+  'codex', 'codex-app', 'grok', 'traex', 'remote-runner', 'claude-code', 'kimi', 'zcode',
+]);
+
+export function allowsTaskModelOverride(cliId: CliId | undefined): boolean {
+  return cliId !== undefined && TASK_MODEL_OVERRIDE_CLI_IDS.has(cliId);
+}
 
 /** 启动参数（或远端后端配置）里真的会带上 model 的 CLI。 */
 export const LAUNCH_MODEL_CLI_IDS: ReadonlySet<CliId> = new Set<CliId>([

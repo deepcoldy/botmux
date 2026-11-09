@@ -2,27 +2,21 @@ import React from 'react';
 import TestRenderer, { act } from 'react-test-renderer';
 import { describe, expect, it, vi } from 'vitest';
 import { TimeZoneRow } from '../src/dashboard/web/settings-page.js';
-import { FieldTitle } from '../src/dashboard/web/dashboard-components.js';
+import { DropdownMenu, FieldTitle, type DropdownOption } from '../src/dashboard/web/dashboard-components.js';
+
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 function findMenu(r: TestRenderer.ReactTestRenderer) {
-  return r.root.findByType('details');
+  return r.root.findByType(DropdownMenu);
 }
 
-function findSummaryText(r: TestRenderer.ReactTestRenderer): string {
-  const value = r.root.findByProps({ className: 'sect-sort-value' });
-  return value.children.join('');
+function optionLabel(r: TestRenderer.ReactTestRenderer, value: string): string {
+  const options = findMenu(r).props.options as DropdownOption<string>[];
+  return String(options.find(option => option.value === value)?.label ?? '');
 }
 
-function findOptionButton(r: TestRenderer.ReactTestRenderer, label: string) {
-  return r.root.findAllByType('button').find(button => button.children.join('') === label);
-}
-
-function clickOption(button: TestRenderer.ReactTestInstance): void {
-  act(() => {
-    button.props.onClick({
-      currentTarget: { closest: () => ({ removeAttribute: vi.fn() }) },
-    });
-  });
+function pick(r: TestRenderer.ReactTestRenderer, value: string): void {
+  act(() => { findMenu(r).props.onChange(value); });
 }
 
 /**
@@ -47,10 +41,9 @@ function render(over: Partial<RowProps> = {}) {
 describe('TimeZoneRow (dashboard settings)', () => {
   it('renders the configured value + host placeholder + effective hint', () => {
     const { r } = render({ value: 'Asia/Shanghai', host: 'America/Los_Angeles', effective: 'Asia/Shanghai' });
-    expect(findSummaryText(r)).toBe('Asia/Shanghai');
-    const buttons = r.root.findAllByType('button');
-    expect(buttons.some(o => o.children.join('').includes('America/Los_Angeles'))).toBe(true);
-    expect(findOptionButton(r, 'Asia/Shanghai')?.props['aria-current']).toBe('true');
+    expect(findMenu(r).props.label).toBe('Asia/Shanghai');
+    expect(findMenu(r).props.value).toBe('Asia/Shanghai');
+    expect(optionLabel(r, '')).toContain('America/Los_Angeles');
     const hint = findHint(r);
     expect(hint).toContain('America/Los_Angeles'); // host
     expect(hint).toContain('Asia/Shanghai');        // effective
@@ -58,8 +51,8 @@ describe('TimeZoneRow (dashboard settings)', () => {
 
   it('empty value ⇒ placeholder = host; effective (=host) shown in hint', () => {
     const { r } = render({ value: '', host: 'America/Los_Angeles', effective: 'America/Los_Angeles' });
-    expect(findSummaryText(r)).toContain('America/Los_Angeles');
-    expect(r.root.findAllByType('button').find(button => button.props['aria-current'] === 'true')?.children.join('')).toContain('America/Los_Angeles');
+    expect(String(findMenu(r).props.label)).toContain('America/Los_Angeles');
+    expect(findMenu(r).props.value).toBe('');
     expect(findHint(r)).toContain('America/Los_Angeles');
   });
 
@@ -74,33 +67,27 @@ describe('TimeZoneRow (dashboard settings)', () => {
   it('commits a new zone when selecting a menu option', () => {
     const onSave = vi.fn();
     const { r } = render({ onSave });
-    const option = findOptionButton(r, 'Asia/Tokyo');
-    expect(option).toBeTruthy();
-    clickOption(option!);
+    expect(optionLabel(r, 'Asia/Tokyo')).toBe('Asia/Tokyo');
+    pick(r, 'Asia/Tokyo');
     expect(onSave).toHaveBeenCalledWith('Asia/Tokyo');
   });
 
   it('selecting the host option commits null (clear override → follow host)', () => {
     const onSave = vi.fn();
     const { r } = render({ value: 'Asia/Shanghai', onSave });
-    const hostOption = r.root.findAllByType('button').find(button => button.children.join('').includes('America/Los_Angeles'));
-    expect(hostOption).toBeTruthy();
-    clickOption(hostOption!);
+    pick(r, '');
     expect(onSave).toHaveBeenCalledWith(null);
   });
 
-  it('does NOT fire onSave when re-selecting the current value', () => {
-    const onSave = vi.fn();
-    const { r } = render({ value: 'Asia/Shanghai', onSave });
-    const option = findOptionButton(r, 'Asia/Shanghai');
-    expect(option).toBeTruthy();
-    clickOption(option!);
-    expect(onSave).not.toHaveBeenCalled();
+  it('leaves re-selecting the current value to the menu no-op guard', () => {
+    // DropdownMenu drops a same-value pick unless notifyOnReselect is set
+    // (covered in dashboard-dropdown-menu.test.ts); an auto-saving row must not opt in.
+    const { r } = render({ value: 'Asia/Shanghai' });
+    expect(findMenu(r).props.notifyOnReselect).toBeFalsy();
   });
 
   it('marks the dropdown disabled when requested', () => {
     const { r } = render({ disabled: true });
-    expect(findMenu(r).props.className).toContain('is-disabled');
-    expect(r.root.findByType('summary').props['aria-disabled']).toBe(true);
+    expect(findMenu(r).props.disabled).toBe(true);
   });
 });

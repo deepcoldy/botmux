@@ -27,6 +27,13 @@ import {
   normalizeIsolationPath,
   shouldRedirectCliData,
 } from '../src/adapters/cli/read-isolation.js';
+import { protectedMcpHomePaths, type ProtectedMcpWorkerPolicy } from '../src/core/protected-mcp-capabilities.js';
+
+const protectedPolicy: ProtectedMcpWorkerPolicy = {
+  capabilities: [],
+  protectedHomePaths: ['.fixture-credential'],
+  redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+};
 
 describe('CLI data redirect gate', () => {
   const base = { supportsReadIsolation: true, sessionDataDir: '/srv/botmux/data' };
@@ -160,10 +167,15 @@ describe('evaluateReadIsolationGate (fail-closed, single decision point)', () =>
 });
 
 describe('mandatory device credential isolation', () => {
-  it('activates once either the enrollment marker or a device credential exists', () => {
+  it('activates once an enrollment marker, device credential, or protected MCP Home path is configured', () => {
     expect(credentialIsolationRequired({ markerExists: false, deviceCredentialExists: false })).toBe(false);
     expect(credentialIsolationRequired({ markerExists: true, deviceCredentialExists: false })).toBe(true);
     expect(credentialIsolationRequired({ markerExists: false, deviceCredentialExists: true })).toBe(true);
+    expect(credentialIsolationRequired({
+      markerExists: false,
+      deviceCredentialExists: false,
+      protectedHomePaths: ['/home/agent/.fixture-credential'],
+    })).toBe(true);
     expect(deviceCredentialIsolationMarkerPath('/home/agent/'))
       .toBe('/home/agent/.botmux/.device-credential-isolation');
   });
@@ -188,14 +200,17 @@ describe('mandatory device credential isolation', () => {
   });
 
   it('denies dedicated, legacy, marker, backup, and atomic sidecar paths', () => {
+    const protectedPaths = protectedMcpHomePaths('/home/agent/', protectedPolicy);
     const rules = buildCredentialIsolationRules({
       homeDir: '/home/agent',
       botmuxHome: '/srv/botmux-runtime',
-    });
+    }, protectedPaths);
     expect(rules.roots).toEqual(['/home/agent/.botmux', '/srv/botmux-runtime']);
     expect(rules.denyPaths).toContain('/home/agent/.botmux/device-auth');
     expect(rules.denyPaths).toContain('/srv/botmux-runtime/platform.json');
     expect(rules.denyPaths).toContain('/home/agent/.botmux/.device-credential-isolation');
+    expect(rules.denyPaths).toContain('/home/agent/.fixture-credential');
+    expect(rules.denyRegexes.some(rx => new RegExp(rx).test('/home/agent/.fixture-credential.tmp'))).toBe(true);
     for (const name of [
       'device-auth',
       'device.json',
@@ -206,6 +221,15 @@ describe('mandatory device credential isolation', () => {
     ]) {
       expect(isCredentialIsolationReservedBasename(name), name).toBe(true);
     }
+  });
+
+  it('resolves only validated relative protected paths beneath daemon Home', () => {
+    const tampered = {
+      ...protectedPolicy,
+      protectedHomePaths: ['.fixture-credential', '../escape', '/absolute', 'nested/../escape'],
+    } as ProtectedMcpWorkerPolicy;
+    expect(protectedMcpHomePaths('/home/agent/', tampered))
+      .toEqual(['/home/agent/.fixture-credential']);
   });
 
   it('credential-only isolation leaves the session skill manifest, skill snapshot and store readable (`botmux skill show` works)', () => {
@@ -1116,9 +1140,9 @@ describe('CLI protected capability wiring', () => {
    * internal `__turn-idle-v2` subcommand, never named by a user or an adapter
    * command line) constructs a frozen origin, and only its `/api/turn-idle` call
    * passes one. Wire a caller-supplied origin into `send` / reply / relay (or into
-   * the session-ready or claude-stop-failure call, or into any new transport call) and one of these
-   * assertions goes red — the mention/ carrier sets are computed from the source,
-   * not from a substring's presence.
+   * the session-ready, claude-compaction-start or claude-stop-failure call, or into
+   * any new transport call) and one of these assertions goes red — the mention/
+   * carrier sets are computed from the source, not from a substring's presence.
    */
   // 源码结构护栏(K2)：调用方可供给的身份只能经内部 turn-idle 事件进入 reporter，其余入口必须自己解析
   // live origin；这是跨函数的可达性约束，只能对源码做函数归属扫描（8da52fe7ab）。
@@ -1136,13 +1160,14 @@ describe('CLI protected capability wiring', () => {
     expect(producers).toHaveLength(1);
     const versionCheckAt = code.lastIndexOf('TURN_IDLE_PROTOCOL_VERSION', producers[0].index!);
     expect(enclosingFunctionName(code, versionCheckAt)).toBe('cmdTurnIdle');
-    // …and exactly three carriers. session-ready and claude-stop-failure pass NO
-    // opts (so they must resolve the live origin themselves); turn-idle passes
-    // the frozen one.
+    // …and exactly four carriers. session-ready, claude-compaction-start and
+    // claude-stop-failure pass NO opts (so they must resolve the live origin
+    // themselves); turn-idle passes the frozen one.
     expect([...code.matchAll(/await postSessionScopedSignal\(/g)]
       .map(m => enclosingFunctionName(code, m.index!)).sort())
-      .toEqual(['cmdClaudeStopFailure', 'cmdSessionReady', 'cmdTurnIdle']);
+      .toEqual(['cmdClaudeCompactionStart', 'cmdClaudeStopFailure', 'cmdSessionReady', 'cmdTurnIdle']);
     expect(code).toMatch(/await postSessionScopedSignal\('\/api\/session-ready', \{[^}]*\}\);/);
+    expect(code).toMatch(/await postSessionScopedSignal\('\/api\/claude-compaction-start-v1', \{[^}]*\}\);/);
     expect(code).toMatch(/await postSessionScopedSignal\('\/api\/claude-stop-failure', \{[^}]*\}\);/);
     expect(code).toMatch(/await postSessionScopedSignal\('\/api\/turn-idle', \{[^}]*\}, \{\s*frozenOrigin\s*\}\);/);
   });

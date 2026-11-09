@@ -58,7 +58,8 @@ describe('cursor attach baseline is footer-aware', () => {
 // seam，只能在源码里钉住 spawn 绑定、deferral 释放后即时 drain、TRAE final 直接 emit 的存在与顺序。
 describe('fresh TRAE RPC bridge attachment', () => {
   it('binds the app-server thread when no persisted CLI session id exists yet', () => {
-    const spawn = topLevelFunction('spawnCli');
+    // Admission now wraps spawning; the actual bridge attachment lives in the body.
+    const spawn = topLevelFunction('spawnCliBody');
     expect(spawn).toContain('cliSessionId: effectiveCliSessionId ?? remoteThreadId');
   });
 

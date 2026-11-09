@@ -6,6 +6,7 @@ import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import { TraexAutoModelController } from '../src/services/traex-auto-model.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 
 // Execute the actual worker handler with a controlled backend. Importing the
 // whole worker would start its IPC/runtime; a copy of the handler would miss
@@ -27,10 +28,13 @@ function harness(delivered = true, interruptKey?: 'ctrlc' | 'esc', cliId = 'code
   const control = vi.fn(async () => delivered);
   const controlKey = vi.fn(async (_key: string, action: () => unknown) => action());
   const retireDoubaoBridgeTurnOnInterrupt = vi.fn(() => false);
+  const submitCursorParkedFollowUpAfterStop = vi.fn();
   const context = createContext({
+    workerSessionEventScope: undefined,
     currentBotmuxTurnId: 'stop', currentBotmuxDispatchAttempt: undefined, backend: {}, lastInitConfig: { cliId }, effectiveBackendType: 'pty', isCodexAppCliId,
     codexCliEffortOperation: undefined, cliLifetimeNonce: 1,
-    traexAutoModelController: null,
+    traexAutoModelController: null, traexQuotaPending: undefined, traexModelAccessSwitchNotice: undefined,
+    publishActiveRuntime: vi.fn(), emitReadyCodexTurns: vi.fn(),
     cliAdapter: interruptKey ? { id: cliId, interruptKey } : undefined,
     inflightInputs, pendingMessages, send, log: vi.fn(), tuiPromptBlocking: true,
     flushPending: vi.fn(), scheduleOneShotAfterAction: vi.fn(),
@@ -38,15 +42,26 @@ function harness(delivered = true, interruptKey?: 'ctrlc' | 'esc', cliId = 'code
     sendCriticalControlKey: controlKey,
     sendTermActionOnce: control,
     retireDoubaoBridgeTurnOnInterrupt,
+    submitCursorParkedFollowUpAfterStop,
   });
   context.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', context);
+  context.holdTraexRecoveryForStop = loadWorkerFunction('holdTraexRecoveryForStop', context);
+  context.settleStoppedTraexRecovery = loadWorkerFunction('settleStoppedTraexRecovery', context);
   runInContext(handler, context);
   const interrupt = () => runInContext("handleExactTurnInterrupt('request', 'stop')", context) as Promise<void>;
   const replay = () => { inflightInputs.onCliExit(); return inflightInputs.takeCarryOver().map(item => item.turnId); };
-  return { context, pendingMessages, send, control, controlKey, retireDoubaoBridgeTurnOnInterrupt, interrupt, replay, inflightInputs };
+  return { context, pendingMessages, send, control, controlKey, retireDoubaoBridgeTurnOnInterrupt, submitCursorParkedFollowUpAfterStop, interrupt, replay, inflightInputs };
 }
 
 describe('worker exact interrupt acknowledgement and crash replay', () => {
+  it('does not interrupt a later dispatch attempt that reused the same logical turn id', async () => {
+    const h = harness(); const scope = new WorkerSessionEventScope({ appId: 'cli_exact', sessionId: 'sid' }, { workerId: 'worker', generation: 1 });
+    const binding = scope.beginRuntime(); scope.assign(binding.bindingId, { runtimeId: 'runtime', epoch: 1 });
+    h.context.workerSessionEventScope = scope; h.context.currentBotmuxDispatchAttempt = 2;
+    h.context.hasCurrentSessionRuntime = () => scope.isCurrentContext();
+    await scope.run(binding, h.interrupt, { executionId: 'attempt1', turnId: 'stop', dispatchAttempt: 1 });
+    expect(h.control).not.toHaveBeenCalled(); expect(h.send).toHaveBeenCalledWith(expect.objectContaining({ delivered: false, reason: 'stale_turn' }));
+  });
   it.each([false, true])('retires only the cancelled turn before ACK (already exited=%s)', async exited => {
     const h = harness();
     if (exited) h.inflightInputs.onCliExit();
@@ -136,5 +151,28 @@ describe('worker exact interrupt acknowledgement and crash replay', () => {
     expect(h.retireDoubaoBridgeTurnOnInterrupt).toHaveBeenCalledWith('stop', h.context.currentBotmuxDispatchAttempt);
     // The shared helper itself gates on cliId; the handler still calls it once.
     expect(h.retireDoubaoBridgeTurnOnInterrupt.mock.results[0]!.value).toBe(false);
+  });
+});
+
+// Cursor leaves a follow-up typed ahead during the stopped turn parked at
+// `enter steer`; the exact-turn stop must hand off to the same submitter as
+// the card stop, and only once the interrupt was actually delivered.
+describe('worker exact interrupt for Cursor', () => {
+  it('hands the delivered stop to the parked follow-up submitter', async () => {
+    const h = harness(true, 'ctrlc', 'cursor');
+    await h.interrupt();
+    expect(h.submitCursorParkedFollowUpAfterStop).toHaveBeenCalledExactlyOnceWith(h.context.backend, 1);
+  });
+
+  it('does not when the interrupt was not delivered', async () => {
+    const h = harness(false, 'ctrlc', 'cursor');
+    await h.interrupt();
+    expect(h.submitCursorParkedFollowUpAfterStop).not.toHaveBeenCalled();
+  });
+
+  it('leaves other CLIs alone', async () => {
+    const h = harness(true, 'ctrlc', 'codex');
+    await h.interrupt();
+    expect(h.submitCursorParkedFollowUpAfterStop).not.toHaveBeenCalled();
   });
 });

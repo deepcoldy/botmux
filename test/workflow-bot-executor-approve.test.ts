@@ -25,6 +25,7 @@ import { SPEC_SCHEMA_VERSION } from '../src/workflows/v3/contract.js';
 import { frozenNodeWorkingDir, readRunEnvelope } from '../src/workflows/v3/run-envelope.js';
 import type { V3BotEligibilityProbe } from '../src/workflows/v3/node-executor-mode.js';
 import { checkV3BotExecutorEligibility } from '../src/workflows/v3/node-executor-mode.js';
+import { createWorkflowWorkingDirOperatorWiring, type WorkflowWorkingDirOperatorIo } from '../src/core/workflow-working-dir-operator.js';
 
 const bases: string[] = [];
 afterEach(() => {
@@ -263,9 +264,20 @@ describe('approve-dag --working-dir in bot mode (design §15.4)', () => {
     return { root, repos, project, lab, bots };
   }
 
-  async function approveWithDir(dir: string, bots: any[], opts: { switchMode?: 'bot' | 'ephemeral'; nodes?: unknown[] } = {}) {
+  /** `operates`: whether the initiator may operate each bot, as that bot's
+   *  daemon would answer (default: no one operates anything). */
+  type Operate = 'yes' | 'no' | { unknown: string };
+  async function approveWithDir(dir: string, bots: any[], opts: {
+    switchMode?: 'bot' | 'ephemeral';
+    nodes?: unknown[];
+    operates?: Record<string, Operate>;
+    /** Replaces the table: answers each question itself. */
+    answer?: (target: { nodeId: string; larkAppId: string }) => Promise<Operate>;
+  } = {}) {
     const { base, runDir } = await dagReadyRun(GROUP_TOPIC, opts.nodes);
     const probeFactory = vi.fn(() => tableProbe({}).probe);
+    const asked: string[] = [];
+    const operatorFor: Array<{ runId: string; binding: RunChatBinding }> = [];
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
     let error: unknown;
     try {
@@ -276,13 +288,20 @@ describe('approve-dag --working-dir in bot mode (design §15.4)', () => {
         multiTopicEnabled: () => true,
         botEligibilityProbe: probeFactory,
         botDisplayName: () => (appId) => `bot(${appId})`,
+        workingDirOperator: (run) => {
+          operatorFor.push(run);
+          return async (target) => {
+            asked.push(target.larkAppId);
+            return opts.answer ? opts.answer(target) : opts.operates?.[target.larkAppId] ?? 'no';
+          };
+        },
       });
     } catch (err) {
       error = err;
     }
     const output = log.mock.calls.flat().join('\n');
     log.mockRestore();
-    return { error, output, runDir, probeFactory, envelope: readRunEnvelope(runDir) };
+    return { error, output, runDir, probeFactory, asked, operatorFor, envelope: readRunEnvelope(runDir) };
   }
 
   const snapshotDirs = (runDir: string) => Object.values(
@@ -353,6 +372,110 @@ describe('approve-dag --working-dir in bot mode (design §15.4)', () => {
     expect((result.error as Error).message).toMatch(/--working-dir.*(目录不存在|does not exist)/);
     expect((result.error as Error).message).not.toMatch(/→/);
     expect(result.probeFactory).not.toHaveBeenCalled();
+    expect(result.envelope.kind).toBe('missing');
+  });
+
+  it('a bot the initiator may operate (their own) takes any existing directory, outside its range too', async () => {
+    const d = dirs();
+    // cli_test may only work under lab; the initiator operates it.
+    const result = await approveWithDir(d.project, d.bots, { operates: { cli_test: 'yes' } });
+    expect(result.error).toBeUndefined();
+    if (result.envelope.kind !== 'ok') throw new Error('no envelope');
+    const real = realpathSync(d.project);
+    expect(frozenNodeWorkingDir(result.envelope.envelope)).toBe(real);
+    expect(snapshotDirs(result.runDir)).toEqual([real, real, real]);
+    // Only the bot whose range refuses it is asked, about the run's own initiator.
+    expect(result.asked).toEqual(['cli_test']);
+    expect(result.operatorFor).toEqual([{ runId: 'r', binding: GROUP_TOPIC }]);
+  });
+
+  it('a colleague\'s bot (the initiator may not operate it) keeps the range: outside it the approval is refused as before', async () => {
+    const d = dirs();
+    const result = await approveWithDir(d.project, d.bots, { operates: { [MAIN]: 'yes', cli_doc: 'yes', cli_test: 'no' } });
+    expect((result.error as Error).message).toMatch(/verify → bot\(cli_test\)：指定的工作目录不在它配置的目录范围内/);
+    expect((result.error as Error).message).not.toMatch(/inspect →|write →/);
+    expect(result.probeFactory).not.toHaveBeenCalled();
+    expect(result.envelope.kind).toBe('missing');
+  });
+
+  it('a colleague\'s bot takes a directory inside its range without being asked; the main bot\'s own nodes follow the same rule', async () => {
+    const d = dirs();
+    // lab: in cli_test's range only; main and doc are operated by the initiator.
+    const result = await approveWithDir(d.lab, d.bots, { operates: { [MAIN]: 'yes', cli_doc: 'yes' } });
+    expect(result.error).toBeUndefined();
+    if (result.envelope.kind !== 'ok') throw new Error('no envelope');
+    expect(frozenNodeWorkingDir(result.envelope.envelope)).toBe(realpathSync(d.lab));
+    expect(result.asked.sort()).toEqual(['cli_doc', MAIN].sort());
+    // The main bot is not exempt: not operating it, its range decides.
+    const mainNot = await approveWithDir(d.lab, d.bots, { operates: { cli_doc: 'yes' } });
+    expect((mainNot.error as Error).message).toMatch(/inspect → bot\(cli_main\)：指定的工作目录不在/);
+    expect((mainNot.error as Error).message).not.toMatch(/write →|verify →/);
+  });
+
+  it('an answer that could not be confirmed refuses outside the range, saying so and why — not "add it to the range" alone', async () => {
+    const d = dirs();
+    const result = await approveWithDir(d.project, d.bots, { operates: { cli_test: { unknown: '暂时查不到发起人是否还在群里' } } });
+    const message = (result.error as Error).message;
+    expect(message).toMatch(/verify → bot\(cli_test\)：暂时无法确认发起人能否操作它.*（暂时查不到发起人是否还在群里）/);
+    expect(message).not.toMatch(/verify → bot\(cli_test\)：指定的工作目录不在它配置的目录范围内/);
+    expect(result.envelope.kind).toBe('missing');
+    // A thrown question is the same unknown.
+    const thrown = await approveWithDir(d.project, d.bots, { answer: async (target) => {
+      if (target.larkAppId === 'cli_test') throw new Error('ipc down');
+      return 'no';
+    } });
+    expect((thrown.error as Error).message).toMatch(/verify → bot\(cli_test\)：暂时无法确认发起人能否操作它/);
+  });
+
+  it('the main bot\'s own node, its app definitively unable to see the initiator\'s union_id: the range refusal it gave before; a lookup that only failed is "could not confirm"', async () => {
+    const d = dirs();
+    // lab: outside the main bot's range; her union_id alone would let her through.
+    const viaMainApp = (union: WorkflowWorkingDirOperatorIo['resolveUnionIdFromOpenId']) => {
+      const wiring = createWorkflowWorkingDirOperatorWiring({
+        resolveTargetAppOpenId: async () => ({ status: 'definitive' }),
+        resolveUnionIdFromOpenId: union,
+        listChatMemberOpenIds: async () => ['ou_owner'],
+        canRunDaemonCommand: (_appId, _chatId, _openId, unionId) => unionId === 'on_owner',
+        selfLarkAppId: () => MAIN,
+      });
+      return async (target: { larkAppId: string }): Promise<Operate> => target.larkAppId === MAIN
+        ? wiring.initiatorOperates({ larkAppId: MAIN, chatId: GROUP_TOPIC.chatId, initiator: { sourceLarkAppId: MAIN, openId: 'ou_owner' } })
+        : 'yes';
+    };
+    const invisible = await approveWithDir(d.lab, d.bots, { answer: viaMainApp(async () => ({ status: 'unavailable' })) });
+    expect((invisible.error as Error).message).toContain('inspect → bot(cli_main)：指定的工作目录不在它配置的目录范围内（默认工作目录 / 仓库目录）');
+    expect((invisible.error as Error).message).not.toMatch(/暂时无法确认/);
+    expect(invisible.envelope.kind).toBe('missing');
+    const failing = await approveWithDir(d.lab, d.bots, { answer: viaMainApp(async () => ({ status: 'retryable', error: '503' })) });
+    expect((failing.error as Error).message).toMatch(/inspect → bot\(cli_main\)：暂时无法确认发起人能否操作它/);
+    const found = await approveWithDir(d.lab, d.bots, { answer: viaMainApp(async () => ({ status: 'resolved', unionId: 'on_owner' })) });
+    expect(found.error).toBeUndefined();
+  });
+
+  it('every bot that needs asking is asked at the same time, and the refusal keeps node order', async () => {
+    const d = dirs();
+    // root: outside every bot's range, so all three are asked.
+    const pending = new Map<string, (answer: Operate) => void>();
+    let askedBeforeAnyAnswer = 0;
+    const answers: Record<string, Operate> = { [MAIN]: 'no', cli_doc: { unknown: 'timeout' }, cli_test: 'no' };
+    const result = await approveWithDir(d.root, d.bots, { answer: (target) => new Promise<Operate>((resolve) => {
+      pending.set(target.larkAppId, resolve);
+      if (pending.size === 3) {
+        askedBeforeAnyAnswer = pending.size;
+        // Answer in reverse order: the message must still list nodes in order.
+        for (const appId of ['cli_test', 'cli_doc', MAIN]) pending.get(appId)!(answers[appId]!);
+      }
+    }) });
+    expect(askedBeforeAnyAnswer).toBe(3);
+    const lines = (result.error as Error).message.split('\n').filter((line) => line.startsWith('- '));
+    expect(lines.map((line) => line.slice(2, line.indexOf(' →')))).toEqual(['inspect', 'write', 'verify']);
+  });
+
+  it('a directory that does not exist is refused even for bots the initiator operates, without asking', async () => {
+    const d = dirs();
+    const result = await approveWithDir(join(d.lab, 'missing'), d.bots, { operates: { [MAIN]: 'yes', cli_doc: 'yes', cli_test: 'yes' } });
+    expect((result.error as Error).message).toMatch(/--working-dir.*(目录不存在|does not exist)/);
+    expect(result.asked).toEqual([]);
     expect(result.envelope.kind).toBe('missing');
   });
 

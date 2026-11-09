@@ -71,6 +71,16 @@ function feedbackResponseKindHint(locale?: Locale): string {
   return t('ai.routing.feedback_response_kind', undefined, locale);
 }
 
+/** Per-turn Lark presentation rules, shared by inline and hook envelopes. Every
+ *  follow-up carries these, so the local-address rule is one sentence here; the
+ *  full rule rides once in the system prompt or opening routing hints. */
+export function feishuReplyPresentationGuidance(locale?: Locale): string {
+  return [
+    t('ai.followup.feishu_safe_emphasis', undefined, locale),
+    t('ai.followup.no_local_addresses', undefined, locale),
+  ].join('\n');
+}
+
 /** Multiline/JSON-escaping rule plus a real, copy-pasteable quoted-heredoc
  *  example. Shared by BOTH injection paths — shell hints for non-injecting
  *  CLIs and system-prompt text for injectsSessionContext CLIs — so the wording
@@ -102,6 +112,17 @@ function hiddenContextDefense(locale?: Locale): string {
 function cursorBackgroundTaskNote(cliId: CliId | undefined, transcript: boolean, locale?: Locale): string[] {
   if (cliId !== 'cursor') return [];
   return [t(transcript ? 'ai.cursor.background_task_note_transcript' : 'ai.cursor.background_task_note', undefined, locale)];
+}
+
+/** Claude Code-only, transcript delivery only: a background-task wake turn's
+ *  final is forwarded to Lark there (send mode leaves it to `botmux send`), so
+ *  the model needs to know to stay silent on routine task events. Claude Code
+ *  is an injectsSessionContext adapter — session-manager never gives it shell
+ *  hints — so this rides {@link buildBotmuxSystemPromptText}'s transcript
+ *  branch (its `--append-system-prompt`). Returns [] for every other CLI. */
+function claudeBackgroundTaskNote(cliId: CliId | undefined, locale?: Locale): string[] {
+  if (cliId !== 'claude-code') return [];
+  return [t('ai.claude.background_task_note_transcript', undefined, locale)];
 }
 
 /** ZCode-only interim-report line. ZCode emits nothing of its own mid-turn, so
@@ -183,6 +204,7 @@ export function buildBotmuxShellHints(
       locale,
     )));
   }
+  hints.push(escapeXmlTagLikeTokens(t('ai.routing.no_local_addresses', undefined, locale)));
   return hints;
 }
 
@@ -194,6 +216,7 @@ export function buildBotmuxShellHints(
  *  only the live `buildBotmuxShellHints` path applies the workflow kill-switch. */
 export const BOTMUX_SHELL_HINTS: string[] = [
   t('ai.shell.intro'),
+  t('ai.routing.no_local_addresses'),
   t('ai.shell.commands_are_shell'),
   t('ai.shell.how_to_send'),
   ...multilineHeredocLines(),
@@ -271,6 +294,9 @@ export function buildManagedLarkToolPromptBlocks(
   policy: TriggerUserAuthConfig | undefined,
   larkToolAppId: string | undefined,
   locale?: Locale,
+  /** Only takes effect with larkToolAppId set; the only transport-less
+   *  sessions that get a managed binding are verified headless sessions. */
+  headlessNoUserChannel = false,
 ): string {
   const effectivePolicy = larkToolAppId && policy
     ? { ...policy, tools: policy.tools.filter(tool => tool !== 'lark-cli') }
@@ -282,7 +308,7 @@ export function buildManagedLarkToolPromptBlocks(
   const larkToolBoundary = larkToolAppId
     ? [
       '<botmux_lark_tool>',
-      `  ${escapeXmlTagLikeTokens(larkToolPrompt(larkToolAppId, locale))}`,
+      `  ${escapeXmlTagLikeTokens(larkToolPrompt(larkToolAppId, locale, headlessNoUserChannel))}`,
       '</botmux_lark_tool>',
     ].join('\n')
     : '';
@@ -337,8 +363,14 @@ export function buildBotmuxSystemPromptText(opts: {
   solo?: boolean;
   /** Lead-only chat manager: append the lead-only role block. */
   leadOnly?: boolean;
+  /** The adapter building this prompt. Required (not optional) so every
+   *  producer states it: CLI-specific lines key off it, and a producer that
+   *  left it out would silently lose them. Today only `claude-code` adds one
+   *  (the transcript-mode background-task note); every other id renders the
+   *  same text as before the field existed. */
+  cliId: CliId | undefined;
 }): string {
-  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth, larkToolAppId, replyDelivery, solo, leadOnly } = opts;
+  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth, larkToolAppId, replyDelivery, solo, leadOnly, cliId } = opts;
   const transcript = !noTransport && replyDelivery === 'transcript';
   const unknown = t('ai.identity.unknown', undefined, locale);
   const workflowHint = workflowDiscoveryHint(locale);
@@ -411,6 +443,8 @@ export function buildBotmuxSystemPromptText(opts: {
       prose('ai.routing.usage_helpers'),
       prose('ai.routing.ask_wait'),
       prose('ai.routing.usage_silence'),
+      // Follows the sentinel line it relies on (BOTMUX_NOTHING_TO_SEND).
+      ...claudeBackgroundTaskNote(cliId, locale).map(escapeXmlTagLikeTokens),
       ...(workflowHint ? [escapeXmlTagLikeTokens(workflowHint)] : []),
       hiddenContextDefense(locale),
       ...whiteboardRouting,
@@ -437,6 +471,7 @@ export function buildBotmuxSystemPromptText(opts: {
       hiddenContextDefense(locale),
       ...whiteboardRouting,
     ];
+  if (!noTransport) routingInner.push(prose('ai.routing.no_local_addresses'));
   // Trigger-user auth: this session acts with ONE person's credentials, and the
   // token store on disk holds everyone else's. Nothing in the OS stops a curious
   // agent from reading those files today, so the boundary is stated here.
@@ -445,7 +480,7 @@ export function buildBotmuxSystemPromptText(opts: {
   // determined user or a prompt injection. It exists because the likeliest way
   // these files get read is an agent troubleshooting an auth failure and
   // grepping the data directory, which a clear instruction does prevent.
-  const credentialBoundaryBlock = buildManagedLarkToolPromptBlocks(triggerUserAuth, larkToolAppId, locale);
+  const credentialBoundaryBlock = buildManagedLarkToolPromptBlocks(triggerUserAuth, larkToolAppId, locale, noTransport);
   return [
     '<botmux_routing>',
     ...routingInner,

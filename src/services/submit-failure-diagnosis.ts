@@ -57,7 +57,9 @@ const LOGGED_OUT_RULES: readonly ScreenRule[] = [
 ];
 
 const INTERACTIVE_MENU_RULES: readonly ScreenRule[] = [
-  { id: 'interactive_menu:hooks_need_review', re: /hooks need review/i },
+  // 启动页 "Hooks need review"、浏览页 "2 hooks need review before they can run."、
+  // 详情页单数 "1 hook needs review before it can run."（Codex 0.162+ / traex）
+  { id: 'interactive_menu:hooks_need_review', re: /\bhooks?\s+needs?\s+review\b/i },
   // 真机迁移菜单 "Legacy TraeCode … migrate"
   { id: 'interactive_menu:legacy_trae_migrate', re: /legacy\s*trae(?:code)?[^\n]{0,40}migrat/i },
   { id: 'interactive_menu:migration_target', re: /\bmigrat(?:e|ion)[^\n]{0,30}(?:data|session|legacy)/i },
@@ -90,11 +92,10 @@ function matchScreenRule(rules: readonly ScreenRule[], screen: string): string |
 // on-screen evidence the payload is stuck unsubmitted.
 const CLAUDE_PASTED_TEXT_CHIP = /\[\s*pasted text\s+#\d+(?:\s*\+\d+\s+lines?)?\s*\]/i;
 
-function claudeComposerDraftMatch(screen: string): string | undefined {
+/** Bodies of the ❯ input boxes on screen, bottom-most first. */
+function* claudeComposerBodies(screen: string): Generator<string> {
   const rows = screen.split(/\r?\n/);
   const separator = (line: string) => /^\s*[─━═╌-]{10,}\s*$/.test(line);
-  // Only the last input box, bounded by two full-width rules, is evidence.
-  // Assistant transcript text or an idle suggestion outside it is not a draft.
   for (let bottom = rows.length - 1; bottom >= 0; bottom--) {
     if (!separator(rows[bottom])) continue;
     let top = bottom - 1;
@@ -102,11 +103,31 @@ function claudeComposerDraftMatch(screen: string): string | undefined {
     if (top < 0) continue;
     const body = rows.slice(top + 1, bottom);
     if (!/^\s*❯/.test(body[0] ?? '')) continue;
-    const bodyText = body.join('\n');
+    yield body.join('\n');
+  }
+}
+
+function claudeComposerDraftMatch(screen: string): string | undefined {
+  // Only the last input box, bounded by two full-width rules, is evidence.
+  // Assistant transcript text or an idle suggestion outside it is not a draft.
+  for (const bodyText of claudeComposerBodies(screen)) {
     if (bodyText.includes('<user_message>')) return 'draft_parked:claude_composer';
     if (CLAUDE_PASTED_TEXT_CHIP.test(bodyText)) return 'draft_parked:claude_pasted_chip';
   }
   return undefined;
+}
+
+/** Whether Claude's last input box still holds `input`: the chip of a multi-line
+ *  paste, or its opening text (compared without whitespace and the `\` of typed
+ *  soft newlines, so wrapped or multi-line drafts still match). */
+export function claudeComposerHoldsInput(screenText: string, input: string): boolean {
+  const compact = (text: string) => text.replace(/[\s\\]+/g, '');
+  const head = compact(input).slice(0, 40);
+  for (const bodyText of claudeComposerBodies(stripAnsiScreenText(screenText))) {
+    if (CLAUDE_PASTED_TEXT_CHIP.test(bodyText)) return true;
+    return head.length > 0 && compact(bodyText.replace(/^\s*❯/, '')).includes(head);
+  }
+  return false;
 }
 
 export function diagnoseSubmitFailure(input: SubmitFailureDiagnosisInput): SubmitFailureDiagnosis {

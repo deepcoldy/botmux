@@ -12,6 +12,12 @@ concurrency:
   group: minimax-long-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  # No job runs the Electron binary that electron's postinstall downloads (the
+  # desktop release lets electron-builder fetch its own copy), and that download
+  # has no retry: one 504 fails the whole bun install (#3193).
+  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+
 jobs:
   native-exec:
     # Forks may run manually, but do not inherit a daily background workload.
@@ -28,12 +34,12 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: 22
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
         with:
-          bun-version: 1.4.3
-      - run: bun install --frozen-lockfile
+          bun-version: 1.4.4
+      - run: node scripts/ci-net-retry.mjs bun install --frozen-lockfile
       - name: Install isolated, pinned native CLI
-        run: npm install --prefix "$RUNNER_TEMP/minimax-code" --no-package-lock --no-audit --no-fund '@minimax-ai/code@0.6.5'
+        run: node scripts/ci-net-retry.mjs npm install --prefix "$RUNNER_TEMP/minimax-code" --no-package-lock --no-audit --no-fund '@minimax-ai/code@0.6.5'
       - name: Cross the former ten-minute boundary (fresh and resumed)
         timeout-minutes: 15
         env:

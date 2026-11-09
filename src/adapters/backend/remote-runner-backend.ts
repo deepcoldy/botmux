@@ -19,6 +19,7 @@ import {
   normalizeRemoteRunnerBackendState,
   normalizeRemoteRunnerUsageReport,
   parseRemoteRunnerEventLine,
+  projectRemoteRunnerTrustedCaller,
   remoteRunnerCommand,
   type RemoteRunnerBackendState,
   type RemoteRunnerCapability,
@@ -157,7 +158,7 @@ export class RemoteRunnerBackend implements SessionBackend {
     message: RemoteRunnerOutboundMessage,
     hostContext: RemoteRunnerTurnHostContext,
   ) => Promise<RemoteRunnerOutboundMessageResult>) | null = null;
-  private sessionToolCb: ((operation: RemoteRunnerSessionToolOperation) => Promise<RemoteRunnerSessionToolResult>) | null = null;
+  private sessionToolCb: ((operation: RemoteRunnerSessionToolOperation, hostContext?: RemoteRunnerTurnHostContext) => Promise<RemoteRunnerSessionToolResult>) | null = null;
   private readyCb: (() => void) | null = null;
   private stateCb: ((state: RemoteRunnerBackendState) => void) | null = null;
   private usageCb: ((usage: RemoteRunnerUsageReport) => void) | null = null;
@@ -269,7 +270,8 @@ export class RemoteRunnerBackend implements SessionBackend {
       };
     }
     this.activeTurnId = input.turnId;
-    this.activeTurnHostContext = input.linkRefMode ? { linkRefMode: input.linkRefMode } : {};
+    this.activeTurnHostContext = { ...(input.linkRefMode ? { linkRefMode: input.linkRefMode } : {}),
+      ...(input.sessionOrigin ? { sessionOrigin: structuredClone(input.sessionOrigin) } : {}) };
     this.activeTurnAccepted = false;
     this.outboundOperations.clear();
     this.outboundOperationCount = 0;
@@ -286,7 +288,9 @@ export class RemoteRunnerBackend implements SessionBackend {
         turnId: input.turnId,
         content: input.content,
         ...(input.dispatchAttempt !== undefined ? { dispatchAttempt: input.dispatchAttempt } : {}),
-        ...(input.trustedCaller ? { trustedCaller: input.trustedCaller } : {}),
+        ...(input.trustedCaller
+          ? { trustedCaller: projectRemoteRunnerTrustedCaller(input.trustedCaller as typeof input.trustedCaller & Record<string, unknown>) }
+          : {}),
       }), event => event.type === 'status' && event.status === 'busy', this.operationTimeoutMs);
       if (acknowledgement.type === 'failure') {
         const failure: BackendTurnFailure = {
@@ -369,9 +373,7 @@ export class RemoteRunnerBackend implements SessionBackend {
     if (!this.recoveredTurnHostContextPending
       || this.recoveredTurn?.turnId !== turnId
       || this.activeTurnId !== turnId) return false;
-    this.activeTurnHostContext = context.linkRefMode
-      ? { linkRefMode: context.linkRefMode }
-      : {};
+    this.activeTurnHostContext = structuredClone(context);
     this.recoveredTurnHostContextPending = false;
     const deferred = this.deferredRecoveredEvents.splice(0);
     for (const event of deferred) {
@@ -387,7 +389,7 @@ export class RemoteRunnerBackend implements SessionBackend {
     ) => Promise<RemoteRunnerOutboundMessageResult>,
   ): void { this.outboundMessageCb = cb; }
   onSessionTool(
-    cb: (operation: RemoteRunnerSessionToolOperation) => Promise<RemoteRunnerSessionToolResult>,
+    cb: (operation: RemoteRunnerSessionToolOperation, hostContext?: RemoteRunnerTurnHostContext) => Promise<RemoteRunnerSessionToolResult>,
   ): void { this.sessionToolCb = cb; }
   onReady(cb: () => void): void {
     this.readyCb = cb;
@@ -992,8 +994,9 @@ export class RemoteRunnerBackend implements SessionBackend {
     } else {
       this.sessionToolOperationCount++;
       const callback = this.sessionToolCb;
+      const context = structuredClone(this.activeTurnHostContext);
       result = callback
-        ? Promise.resolve().then(() => callback(operation)).catch((error): RemoteRunnerSessionToolResult => ({
+        ? Promise.resolve().then(() => context.sessionOrigin ? callback(operation, context) : callback(operation)).catch((error): RemoteRunnerSessionToolResult => ({
             outcome: 'unknown',
             code: 'session_tool_execution_unknown',
             message: (error instanceof Error ? error.message : String(error)).slice(0, 4096)
@@ -1036,7 +1039,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   }
 
   private emitTurnFailure(failure: BackendTurnFailure): void {
-    this.turnFailureCb?.(failure);
+    this.turnFailureCb?.({ ...failure, ...(this.activeTurnHostContext.sessionOrigin ? { sessionOrigin: this.activeTurnHostContext.sessionOrigin } : {}) });
     this.finishActiveTurn();
     this.taskDoneCb?.();
   }

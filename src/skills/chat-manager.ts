@@ -20,8 +20,9 @@ botmux manager lead-only off
 
 可选的 lead-only（默认关闭）：本机器人是负责人时，可让它在本群的非执行者会话里只能执行 botmux 命令，
 读写文件、搜索、联网、子 agent、MCP 以及非 botmux 的 Bash 都会被拦截，具体工作须用 botmux dispatch 派给执行 bot。
-botmux 子命令也按名单放行（dispatch/send/status/manager/history/quoted/bots list/task list/observe/capabilities/skill/help），
-多行正文可放进单引号，或在命令末尾用带引号定界符的 heredoc（<<'EOF'）；文件工具（Read/Write/Edit）只能用于负责人自己记忆目录 memory/ 下的 .md 文件，
+botmux 子命令也按名单放行（dispatch/send/status/manager/history/quoted/bots list/observe/capabilities/skill/whiteboard status|current|read|update/--help），
+多行正文可放进单引号，或在命令末尾用带引号定界符的 heredoc（<<'EOF'）；
+负责人的长期笔记（用户定的规矩、各 bot 的专长）可在白板启用时先 botmux whiteboard current --create，再不带 --id 用 botmux whiteboard read/update 写进本群白板；白板由群内所有 bot 共享，不要写密钥。
 读本地文件的参数（--content-file/--file/--brief-file/--diff 等）、fleet 与配置类子命令（setup/upgrade/restart/delete/mcp 等）、
 以及 botmux bots invite 这类变更群成员的操作都会被拦——拉人进群请真人或在 dashboard 操作。
 由 botmux dispatch 派出的会话和 workflow 节点会话（执行者）不受限；私聊不生效；仅对 claude-code 生效，其他 CLI 忽略该开关。

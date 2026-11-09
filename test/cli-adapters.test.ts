@@ -3,11 +3,15 @@
  *
  * Run:  pnpm vitest run test/cli-adapters.test.ts
  */
+// 第一个 import：测试围栏（unit-setup / bun-test-fence）没生效时整个文件直接拒跑。
+// 本文件有用例会写 homedir() 推导的目录（PI_PLUGIN_DIR/extensions、~/.botmux/dsh-question-bridge 等）；
+// 2026-11-06 一次绕过 setupFiles 的全量运行里，这些写入落在了真实的 ~/.botmux 下。
+import { isInsideDir } from './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, appendFileSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, appendFileSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { codexHome } from '../src/services/codex-paths.js';
 
 // ---------------------------------------------------------------------------
@@ -38,6 +42,7 @@ import { createCursorAdapter, CURSOR_PLUGIN_DIR } from '../src/adapters/cli/curs
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter, isOpenCodeSessionId } from '../src/adapters/cli/opencode.js';
 import { createMiMoCodeAdapter } from '../src/adapters/cli/mimocode.js';
+import { statuslineHookCommand } from '../src/adapters/hook-command.js';
 import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
@@ -57,6 +62,7 @@ import { createReasonixAdapter } from '../src/adapters/cli/reasonix.js';
 import { createDshAdapter } from '../src/adapters/cli/dsh.js';
 import { createDshTuiAdapter } from '../src/adapters/cli/dsh-tui.js';
 import { buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
+import { stripAnsiScreenText } from '../src/utils/idle-detector.js';
 import { ALL_CLI_IDS as REGISTRY_ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
 import { isRemoteCliId } from '../src/core/remote-cli-ids.js';
 import type { CliAdapter, CliId, PtyHandle } from '../src/adapters/cli/types.js';
@@ -339,7 +345,7 @@ describe('claude-code buildArgs', () => {
     const parsed = JSON.parse(args[idx + 1]);
     expect(Object.keys(parsed)).toEqual(['statusLine']);
     expect(parsed.statusLine.type).toBe('command');
-    expect(parsed.statusLine.command.endsWith('statusline')).toBe(true);
+    expect(parsed.statusLine.command).toBe(statuslineHookCommand());
     expect(adapter.hookInstall?.sessionStartCommand).toContain('session-ready');
   });
 
@@ -1166,6 +1172,28 @@ describe('codex buildArgs', () => {
     expect(fullArgs).toContain('shell_environment_policy.set.BOTMUX_IDENTITY_BIN="/tmp/identity.bin"');
     expect(fullArgs).toContain('model_reasoning_effort="high"');
     expect(fullArgs.includes('tui.auto_recap=false')).toBe(!forkSession);
+  });
+
+  it.each([
+    { command: 'resume', forkSession: false },
+    { command: 'fork', forkSession: true },
+  ])('keeps the protected provider base URL override before $command', ({ command, forkSession }) => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-protected-provider',
+      resume: true,
+      resumeSessionId: 'codex-existing',
+      forkSession,
+      modelProviderBaseUrlOverride: {
+        providerId: 'mixoul',
+        baseUrl: 'http://127.0.0.1:0/dev_portal/relay/model',
+      },
+    });
+    const commandIdx = args.indexOf(command);
+    const override = 'model_providers.mixoul.base_url="http://127.0.0.1:0/dev_portal/relay/model"';
+    const overrideIdx = args.indexOf(override);
+    expect(overrideIdx).toBeGreaterThan(0);
+    expect(args[overrideIdx - 1]).toBe('-c');
+    expect(overrideIdx).toBeLessThan(commandIdx);
   });
 
   it('disables automatic recap for a quiet resume without adding a prompt', () => {
@@ -2093,6 +2121,41 @@ describe('opencode buildArgs', () => {
     expect(args).toEqual([]);
   });
 
+  it('passes --auto when the probed CLI version accepts it (>= 1.17.12)', () => {
+    // V1 的默认 ask（external_directory / .env）在托管态没人看得见，turn 会
+    // 静默卡在原生弹窗上；--auto 是 opencode 1.17.12 才加的。
+    for (const cliVersion of ['1.17.12', '1.17.13', '1.19.1', 'v1.18.32', '2.1.4']) {
+      const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion });
+      expect(args).toEqual(['--auto']);
+    }
+  });
+
+  it('omits --auto on versions that predate the flag (help-and-exit would crash-loop)', () => {
+    // adapter 注释里的实测基线就是 1.17.11 —— 传未知 flag 会打帮助退出 1，
+    // 再被 daemon 的自动重启放大成 crash-loop。
+    for (const cliVersion of ['1.17.11', '1.17.8', '1.16.0', '1.4.1', '1.0.0']) {
+      const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion });
+      expect(args).toEqual([]);
+    }
+  });
+
+  it('omits --auto when the version was never probed', () => {
+    for (const cliVersion of [undefined, '', 'unknown']) {
+      const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion });
+      expect(args).toEqual([]);
+    }
+  });
+
+  it('omits --auto when disableCliBypass is set even on a new version', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion: '1.19.1', disableCliBypass: true });
+    expect(args).toEqual([]);
+  });
+
+  it('mimo (same adapter family) never gets --auto: it has no such flag', () => {
+    const mimo = createMiMoCodeAdapter('/usr/bin/mimo');
+    expect(mimo.buildArgs({ sessionId: 'sess-6', resume: false, cliVersion: '2.1.4' })).toEqual(['--trust']);
+  });
+
   it('passes initialPrompt via --prompt flag', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-6', resume: false, initialPrompt: 'hello world' });
     expect(args).toContain('--prompt');
@@ -2213,6 +2276,8 @@ describe('pi buildArgs', () => {
   });
 
   it('materializes turn-boundary extension to ~/.botmux/pi-skills/extensions for compiled binaries', () => {
+    // 写入目标 PI_PLUGIN_DIR 在模块加载时由 homedir() 推导：只在它落在本文件的测试围栏里时才写。
+    expect(isInsideDir(PI_PLUGIN_DIR, process.env.__TEST_DATA_DIR_FENCE)).toBe(true);
     const extPath = materializePiTurnBoundaryExtension();
     expect(extPath).toBeTruthy();
     expect(existsSync(extPath!)).toBe(true);
@@ -3426,6 +3491,70 @@ describe('busyPattern', () => {
 });
 
 describe('idleToBusyPattern', () => {
+  it('oh-my-pi only revives idle from an active footer, not legacy Working prose', () => {
+    const adapter = createOhMyPiAdapter('/bin/omp');
+    const active = [
+      '⠇ 1h │ ⬢ model · xhigh │ 📁 …/repo ─────67%┃─272K─',
+      '  ⠋ 1.5s │ model │ 12%┃',
+      '● 🐴 ponytail: ⚡ FULL',
+    ];
+    for (const footer of active) {
+      expect(adapter.busyPattern!.test(footer)).toBe(true);
+      expect(adapter.idleToBusyPattern!.test(footer)).toBe(true);
+    }
+    for (const text of [
+      'Working... on the fix',
+      'The previous log contained Working… but the task is finished.',
+      'π │ model │ 📁 …/repo ─────67%┃─272K─',
+      '○ 🐴 ponytail: ⚡ FULL',
+      'The log said ● 🐴 ponytail: ⚡ FULL',
+      'Quoted footer: ⠇ 1h │ model │ 67%┃',
+      '⠇ 1h │ model\n67%┃',
+    ]) {
+      expect(adapter.idleToBusyPattern!.test(text)).toBe(false);
+    }
+    // Preserve the legacy viewport guard without using it as a new-turn edge.
+    expect(adapter.busyPattern!.test('Working…')).toBe(true);
+  });
+
+  it('oh-my-pi recognizes the real omp 18.10.1 default band footer, not its idle footer', () => {
+    const adapter = createOhMyPiAdapter('/bin/omp');
+    const fx = JSON.parse(readFileSync(new URL('./fixtures/omp-band-footer-v18.10.1.json', import.meta.url), 'utf8'));
+    for (const frame of [fx.workingFrame, fx.workingFrameWithStatusRow]) {
+      const stripped = stripAnsiScreenText(frame);
+      expect(adapter.idleToBusyPattern!.test(stripped)).toBe(true);
+      expect(adapter.busyPattern!.test(stripped)).toBe(true);
+    }
+    // Interrupted/finished turn: status glyph instead of a braille spinner.
+    expect(adapter.idleToBusyPattern!.test(stripAnsiScreenText(fx.idleFrame))).toBe(false);
+    // Plain-text equivalents of what the band footer renders.
+    expect(adapter.idleToBusyPattern!.test(' \ue0b6 ⠦ 1s \ue0b1 4o 1M \ue0b1 repo \ue0b0─0.9%────1M─')).toBe(true);
+    expect(adapter.idleToBusyPattern!.test(' ⠦ 1m30s  model   repo ─12%────')).toBe(true);
+    for (const text of [
+      // A spinner + elapsed line quoted in a reply, with no footer gauge.
+      '⠦ 1s waiting for the build',
+      'Quoted footer: ⠦ 1s  model   repo ─0.9%───',
+      // Footer split across lines must not combine.
+      '\ue0b6 ⠦ 1s \ue0b1 model\n─0.9%───',
+      // Idle band footer redrawn right after the previous row (no newline).
+      '  Working…\ue0b6 \u{f0d57} \ue0b1 4o 1M \ue0b0─0.9%───',
+      // Percentages not followed by the footer rule.
+      '⠦ 1s finished 100% of the tests.',
+    ]) {
+      expect(adapter.idleToBusyPattern!.test(text)).toBe(false);
+    }
+  });
+
+  it('oh-my-pi opts into OSC 7501 program status', () => {
+    expect(createOhMyPiAdapter('/bin/omp').supportsProgramStatus).toBe(true);
+  });
+
+  it('only oh-my-pi distrusts its startup OSC 7501 idle report (reported before session_start hooks)', () => {
+    expect(createOhMyPiAdapter('/bin/omp').programStatusStartupIdleUntrusted).toBe(true);
+    expect(createPiAdapter('/bin/pi').programStatusStartupIdleUntrusted).toBeUndefined();
+    expect(createClaudeCodeAdapter('/bin/claude').programStatusStartupIdleUntrusted).toBeUndefined();
+  });
+
   it('codex explicitly opts into idle→busy recovery with the strict active marker', () => {
     const adapter = createCodexAdapter('/bin/codex');
     const busy = adapter.idleToBusyPattern;

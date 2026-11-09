@@ -123,6 +123,47 @@ export function findDoubaoSessionForSubmit(
   return matches.size === 1 ? [...matches][0] : undefined;
 }
 
+/**
+ * How long writeInput keeps looking for the native session id after Enter.
+ *
+ * assignment.md is appended only once doubao has accepted the turn, and on a
+ * cold first turn that includes bringing up the account-wide `--type=service`
+ * process: observed 4 s with a warm service and 7–8 s right after it was
+ * (re)started. The previous 5 s budget missed the cold case, so the first
+ * turn's reply was never collected (the bridge has no transcript to bind to
+ * until the id is known) and the caller waited out its full timeout. The
+ * budget must stay below the structured queue's submit-verification grace
+ * (STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS): that grace covers this in-band
+ * poll, and the head is pruned as soon as it lapses. The poll returns as soon
+ * as it matches, so warm turns are not slowed down.
+ */
+export const DOUBAO_SUBMIT_CAPTURE_BUDGET_MS = 20_000;
+export const DOUBAO_SUBMIT_CAPTURE_INTERVAL_MS = 250;
+
+/** Poll `find` until it yields a session id or the budget runs out. Split out
+ *  of writeInput so the cold-start timing is testable without a real TUI. */
+export async function pollDoubaoSessionForSubmit(
+  find: () => string | undefined,
+  opts: {
+    budgetMs?: number;
+    intervalMs?: number;
+    now?: () => number;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+): Promise<string | undefined> {
+  const budgetMs = opts.budgetMs ?? DOUBAO_SUBMIT_CAPTURE_BUDGET_MS;
+  const intervalMs = opts.intervalMs ?? DOUBAO_SUBMIT_CAPTURE_INTERVAL_MS;
+  const now = opts.now ?? Date.now;
+  const sleep = opts.sleep ?? delay;
+  const deadline = now() + budgetMs;
+  for (;;) {
+    const sid = find();
+    if (sid) return sid;
+    if (now() >= deadline) return undefined;
+    await sleep(intervalMs);
+  }
+}
+
 /** True when the session directory exists locally; undefined when no session
  *  root is readable (cannot tell — let the worker's secondary guard decide). */
 export function doubaoSessionExists(sessionId: string, roots: readonly string[] = doubaoSessionRoots()): boolean | undefined {
@@ -145,8 +186,10 @@ export function parseDoubaoAvailableModels(output: string): string[] | null {
  *  shown in the TUI, so the first submit is matched against the native per-turn
  *  log to learn the id that `--resume` needs; without it a restart starts fresh
  *  instead of guessing (there is no "latest" resume that is safe to share). */
-/** Structured transcript bridge: doubao has no `botmux send` channel and no
- *  machine-readable stdout, so the final answer is harvested from its own
+/** Structured transcript bridge: doubao has no CLI-native machine-readable
+ *  reply channel (the generic `botmux send` stays executable, but under the
+ *  account-wide resident service it misattributes — see
+ *  defaultReplyDeliveryFor), so the final answer is harvested from its own
  *  trajectory.jsonl (and the user prompts from assignment.md). */
 export const doubaoBridgeSpec: StructuredBridgeSpec = {
   stateCommit: 'drain',
@@ -220,16 +263,16 @@ export function createDoubaoAdapter(pathOverride?: string): CliAdapter {
         if (pty.write('\r') === false) return { submitted: false };
       }
       if (!capturePending) return;
-      // assignment.md is appended at submit; poll briefly. A miss stays armed
+      // assignment.md is appended once doubao accepts the turn (later on a cold
+      // service start, see DOUBAO_SUBMIT_CAPTURE_BUDGET_MS). A miss stays armed
       // for the next input instead of costing the session its resume id, and is
       // reported as "unverified" (void) — never as a failed submit.
-      for (let i = 0; i < 20; i++) {
-        const sid = findDoubaoSessionForSubmit(content, startedAt - 2000);
-        if (sid) {
-          capturePending = false;
-          return { submitted: true, cliSessionId: sid };
-        }
-        await delay(250);
+      const sid = await pollDoubaoSessionForSubmit(
+        () => findDoubaoSessionForSubmit(content, startedAt - 2000),
+      );
+      if (sid) {
+        capturePending = false;
+        return { submitted: true, cliSessionId: sid };
       }
     },
 

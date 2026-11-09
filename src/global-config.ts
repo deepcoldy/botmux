@@ -29,6 +29,11 @@ import { applyEnvOps, envLayerWithinBudget, globalEnvLayer, isEmptyEnvLayer, typ
 import { readPromptCacheConfig, type PromptCacheConfig } from './services/prompt-cache-policy.js';
 import { normalizeMcpGatewayMaxToolTimeoutMs } from './core/plugins/mcp/runtime-options.js';
 import { canonicalScheduleBotGrant, isScheduleBotGrant } from './core/schedule-bot-grant.js';
+import {
+  normalizeProtectedMcpCapabilities,
+  protectedMcpConfiguredEnvKeys,
+  type ProtectedMcpCapabilityConfigMap,
+} from './core/protected-mcp-capabilities.js';
 
 export type RepoPickerMode = 'all' | 'repos';
 export type LocalCliOpenMode = 'attach' | 'resume';
@@ -50,6 +55,13 @@ export function normalizeGroupNamePrefix(raw: unknown): string | undefined {
   // 覆盖 C0(U+0000–001F) + DEL(U+007F) + C1(U+0080–009F) 全部控制字符。
   if (/\p{Cc}/u.test(value)) return undefined;
   return value;
+}
+
+/** A usable `worktreeRoot`: trimmed, absolute or `~`/`~/`-prefixed. */
+export function normalizeWorktreeRoot(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const value = raw.trim();
+  return value && (isAbsolute(value) || value === '~' || value.startsWith('~/')) ? value : undefined;
 }
 
 export interface WhiteboardConfig {
@@ -202,9 +214,12 @@ export interface WorkerConfig {
   sessionMemoryMaxBytes?: number;
 }
 
-/** Supported idle thresholds (hours) for both the manual「清理空闲」button and
- *  scheduled auto-cleanup. Kept in lockstep with session-cleanup's
- *  IDLE_CLEANUP_HOUR_OPTIONS so the two paths never diverge. */
+/** Supported idle thresholds (hours) for scheduled auto-cleanup ONLY.
+ *  Deliberately a strict subset of the manual button's options
+ *  (session-cleanup IDLE_CLEANUP_HOUR_OPTIONS additionally offers 1 and 0 =
+ *  "all"); never align the two — a 0 leaking into unattended sweeps means
+ *  "close every eligible session". The invariant is
+ *  AUTO_CLEANUP_HOUR_OPTIONS === SESSION_CLEANUP_HOUR_OPTIONS (unit-tested). */
 export const SESSION_CLEANUP_HOUR_OPTIONS = [24, 72, 168] as const;
 export type SessionCleanupHours = typeof SESSION_CLEANUP_HOUR_OPTIONS[number];
 /** Bounds for the check cadence. A 5-minute floor keeps a hand-edited config
@@ -218,7 +233,8 @@ export interface SessionCleanupGlobalConfig {
   archiveCodex?: boolean;
   /** 定时自动清理空闲会话开关。缺省关闭 —— 不开启则完全保持既有（纯手动）行为。 */
   enabled?: boolean;
-  /** 空闲阈值（小时）。仅接受 24 / 72 / 168，与手动清理按钮完全一致。缺省 168（7 天）。 */
+  /** 空闲阈值（小时）。定时自动清理仅接受 24 / 72 / 168；手动清理按钮另提供
+   *  1 与 0（全部）。缺省 168（7 天）。 */
   olderThanHours?: SessionCleanupHours;
   /** 检查频率（分钟）。缺省 60，最小 5（低于则回退到最小值）。 */
   intervalMinutes?: number;
@@ -284,6 +300,10 @@ export interface GlobalConfig {
    *  behavior (repos + linked worktrees). 'repos' lists only main worktrees in
    *  selection cards; explicit /repo /abs/path/to/worktree still works. */
   repoPickerMode?: RepoPickerMode;
+  /** Machine-wide directory botmux creates new worktrees under, e.g. a large
+   *  data disk. Absolute or `~/`-prefixed. Missing keeps worktrees next to the
+   *  main checkout (services/git-worktree.ts `worktreeTargetPath`). */
+  worktreeRoot?: string;
   /** Machine-wide dashboard settings. These are intentionally global rather
    *  than per-bot: they govern the dashboard security boundary and the default
    *  terminal-opening behavior of cards emitted by all daemons on this host. */
@@ -341,6 +361,8 @@ export interface GlobalConfig {
   skills?: GlobalSkillConfig;
   /** Plugin ids enabled for every bot. Per-bot plugin ids are additive. */
   plugins?: string[];
+  /** Operator-owned bindings for optional protected local MCP capabilities. */
+  protectedMcpCapabilities?: ProtectedMcpCapabilityConfigMap;
   /** Host-wide ceiling for per-plugin MCP tool calls. Missing defaults to 10 minutes. */
   mcpGatewayMaxToolTimeoutMs?: number;
   /** 远程访问. When true (and this machine is bound to the central platform),
@@ -466,6 +488,12 @@ export interface DashboardGlobalConfig {
    *  daemon gate (config.ts `reapOrphanTmuxServers`). BOTMUX_DISABLE_ORPHAN_TMUX_REAP=1
    *  remains an independent emergency kill-switch. */
   reapOrphanTmuxServers?: boolean;
+  /** Periodic orphan-tmux SESSION sweep. Default ON but REPORT-ONLY (logs
+   *  displaced servers/panes, never signals). Read live by the daemon timer. */
+  tmuxOrphanSessionSweep?: boolean;
+  /** Destructive arm of the periodic session sweep: signal only a proven
+   *  taken-over bare-wrapper pane. Default OFF. */
+  tmuxOrphanSessionBareWrapperKill?: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate ("Press t
    *  to trust") for Codex-family plain-TUI launches (codex / traex). Codex 0.14x
    *  gates the botmux-installed ~/.codex/hooks.json behind a manual trust prompt,
@@ -517,6 +545,11 @@ export interface DashboardGlobalConfig {
    *  编辑框随之置灰。只影响品牌签名这一段，页脚的用量/耗时/发送给等不受影响。
    *  Live 读取（见 bot-registry.ts `isCardBrandLabelEnabled`），Settings 翻转后无需重启。 */
   cardBrandLabel?: boolean;
+  /** 「CLI 卡住」卡片上，本轮发起人能否按只做拒绝/跳过的安全键（core/stuck-page-catalog.ts
+   *  里 audience='initiator' 的键，如 Esc 不信任继续 / 暂不迁移）。缺省 ON（absent ⇒ 允许）；
+   *  显式 `false` 时只有 Bot 管理员（canOperate）能按卡片上的任何键。与默认值相同的 `true`
+   *  不落盘（Dashboard 写入时删键）。点击时 live 读取（见 config.ts `stuckCardInitiatorKeys`）。 */
+  stuckCardInitiatorKeys?: boolean;
 }
 
 /** Loosely validate a `voice` block: keep it only if it's an object with a
@@ -654,6 +687,8 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   if (typeof d.codexRpcInput === 'boolean') out.codexRpcInput = d.codexRpcInput;
   if (typeof d.autoUpgradeCodexSessions === 'boolean') out.autoUpgradeCodexSessions = d.autoUpgradeCodexSessions;
   if (typeof d.reapOrphanTmuxServers === 'boolean') out.reapOrphanTmuxServers = d.reapOrphanTmuxServers;
+  if (typeof d.tmuxOrphanSessionSweep === 'boolean') out.tmuxOrphanSessionSweep = d.tmuxOrphanSessionSweep;
+  if (typeof d.tmuxOrphanSessionBareWrapperKill === 'boolean') out.tmuxOrphanSessionBareWrapperKill = d.tmuxOrphanSessionBareWrapperKill;
   // Round-trip an explicit boolean either way. Absent stays absent — the live
   // getter (config.ts `bypassCodexHookTrust`) treats absent as ON, so we must
   // preserve a stored `false` to let an operator disable it.
@@ -677,6 +712,8 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   // reader (bot-registry.ts `isCardBrandLabelEnabled`) treats absent as ON, so a stored
   // `false` must be preserved to let an operator suppress footer brands fleet-wide.
   if (typeof d.cardBrandLabel === 'boolean') out.cardBrandLabel = d.cardBrandLabel;
+  // Default ON: only an explicit stored false disables (config.ts getter).
+  if (typeof d.stuckCardInitiatorKeys === 'boolean') out.stuckCardInitiatorKeys = d.stuckCardInitiatorKeys;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -799,9 +836,11 @@ function readHostOverloadAlert(raw: unknown): HostOverloadAlertGlobalConfig | un
 
 /** Parse `sessionCleanup` from config. Whitelist known keys; drop invalid
  *  values so a hand-edited config degrades to defaults rather than crashing.
- *  `olderThanHours` accepts only the three supported thresholds (same set as the
- *  manual button); `intervalMinutes` is clamped to a 5-minute floor. The tick
- *  (dashboard/auto-cleanup.ts) layers defaults over whatever survives here. */
+ *  `olderThanHours` accepts only the three scheduled-sweep thresholds
+ *  24 / 72 / 168 — deliberately NOT the manual button's full set (which also
+ *  offers 1 and 0 = all); `intervalMinutes` is clamped to a 5-minute floor. The
+ *  tick (dashboard/auto-cleanup.ts) layers defaults over whatever survives
+ *  here. */
 function readSessionCleanup(raw: unknown): SessionCleanupGlobalConfig | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const value = raw as Record<string, unknown>;
@@ -989,6 +1028,11 @@ function readRawConfig(): Record<string, unknown> {
 const READ_CACHE_TTL_MS = 2_000;
 let readCache: { path: string; value: GlobalConfig; at: number } | null = null;
 let vcMeetingAgentLiveCache: { path: string; mtimeMs: number; config: VcMeetingAgentGlobalConfig } | null = null;
+let lastConfiguredProtectedMcpEnvKeys: string[] = [];
+
+export function configuredProtectedMcpEnvKeys(): string[] {
+  return [...lastConfiguredProtectedMcpEnvKeys];
+}
 
 /** Typed view of the global config. Validates `lang` so a malformed file
  *  can't propagate a bad value into the i18n module. */
@@ -998,6 +1042,7 @@ export function readGlobalConfig(): GlobalConfig {
     return readCache.value;
   }
   const raw = readRawConfig();
+  lastConfiguredProtectedMcpEnvKeys = protectedMcpConfiguredEnvKeys(raw.protectedMcpCapabilities);
   const out: GlobalConfig = {};
   if (isLocale(raw.lang)) out.lang = raw.lang;
   const linkRefs = normalizeLinkRefConfig(raw.linkRefs);
@@ -1006,6 +1051,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (groupNamePrefix) out.groupNamePrefix = groupNamePrefix;
   const repoPickerMode = readRepoPickerMode(raw.repoPickerMode);
   if (repoPickerMode) out.repoPickerMode = repoPickerMode;
+  const worktreeRoot = normalizeWorktreeRoot(raw.worktreeRoot);
+  if (worktreeRoot) out.worktreeRoot = worktreeRoot;
   const dashboard = readDashboard(raw.dashboard);
   if (dashboard) out.dashboard = dashboard;
   const voice = readVoice(raw.voice);
@@ -1039,6 +1086,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (skills) out.skills = skills;
   const plugins = normalizePluginIdList(raw.plugins);
   if (plugins) out.plugins = plugins;
+  const protectedMcpCapabilities = normalizeProtectedMcpCapabilities(raw.protectedMcpCapabilities);
+  if (protectedMcpCapabilities) out.protectedMcpCapabilities = protectedMcpCapabilities;
   const mcpGatewayMaxToolTimeoutMs = normalizeMcpGatewayMaxToolTimeoutMs(raw.mcpGatewayMaxToolTimeoutMs);
   if (mcpGatewayMaxToolTimeoutMs !== undefined) out.mcpGatewayMaxToolTimeoutMs = mcpGatewayMaxToolTimeoutMs;
   if (typeof raw.remoteAccess === 'boolean') out.remoteAccess = raw.remoteAccess;

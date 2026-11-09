@@ -24,11 +24,13 @@ import type {
   AskCardDispatcher,
   AskClickOutcome,
   AskResult,
+  CliPermissionOutcome,
   CreateAskInput,
   PendingAsk,
 } from './ask-types.js';
 import { AskDispatchError } from './ask-types.js';
 import { supportsAskCustomInput, parseAskCustomFields } from './ask-custom-input.js';
+import { isHookPermissionAsk } from './ask-hook/types.js';
 
 /** Origins for which restart-resume + durable handoff are enabled. Only a
  *  caller that has a reconnecting claimant after a daemon restart may persist:
@@ -332,9 +334,11 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       larkAppId: input.larkAppId,
       chatId: input.chatId,
       rootMessageId: input.rootMessageId,
+      cardRootMessageId: input.cardRootMessageId,
       sessionId: input.sessionId,
       chatType: input.chatType,
       answererOpenId: input.answererOpenId,
+      mentionedOpenId: input.mentionedOpenId,
       deliveryTarget: input.deliveryTarget ? { ...input.deliveryTarget } : undefined,
       questions: input.questions,
       replyCardTarget: input.replyCardTarget,
@@ -415,9 +419,10 @@ function sameIdentity(ask: InternalPending, input: CreateAskInput): boolean {
 }
 
 /** Stable shape string for question-set equality (prompt + multiSelect + each
- *  option's key AND label, order-sensitive). Two question sets that would render
- *  a DIFFERENT card to the user — including a relabelled option whose key is
- *  unchanged — must not re-attach/replay (codex P1-2). */
+ *  option's key, label AND description, order-sensitive). Two question sets that
+ *  would render a DIFFERENT card to the user — including a relabelled option or
+ *  one whose description changed while its key is unchanged — must not
+ *  re-attach/replay (codex P1-2). */
 function questionsShape(qs: PendingAsk['questions']): string {
   return JSON.stringify(
     qs.map((q) => ({
@@ -427,7 +432,7 @@ function questionsShape(qs: PendingAsk['questions']): string {
       input: q.inputMode,
       field: q.input,
       custom: q.allowCustom !== false,
-      o: q.options.map((o) => [o.key, o.label]),
+      o: q.options.map((o) => [o.key, o.label, o.description ?? null]),
     })),
   );
 }
@@ -593,6 +598,7 @@ function persistFromInternal(ask: InternalPending, strict = false): void {
     sessionId: ask.sessionId,
     chatType: ask.chatType,
     answererOpenId: ask.answererOpenId,
+    mentionedOpenId: ask.mentionedOpenId,
     deliveryTarget: ask.deliveryTarget,
     questions: ask.questions,
     customAnswers: ask.customAnswers,
@@ -1052,6 +1058,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       sessionId: p.sessionId,
       chatType: p.chatType,
       answererOpenId: p.answererOpenId,
+      mentionedOpenId: p.mentionedOpenId,
       deliveryTarget: p.deliveryTarget,
       questions: p.questions,
       customAnswers: p.customAnswers,
@@ -1172,6 +1179,45 @@ function abandonUnclaimedHookAsk(askId: string): void {
     ...ask, settled: true, settledAt: Date.now(), dormant: false,
     answeredResult: undefined, terminalResult: result,
   }, result);
+}
+
+/**
+ * The asking CLI ended a hook permission confirmation itself (its built-in
+ * timeout, a terminal choice, an interrupt), so nothing is waiting on this card
+ * any more: settle it with that outcome now instead of at its own deadline.
+ * Only a hook permission ask of this exact session/request matches. An answer
+ * stashed while dormant was never delivered, so it yields to the CLI outcome.
+ */
+export function resolveHookAskFromCli(args: {
+  larkAppId: string;
+  sessionId: string;
+  requestId: string;
+  outcome: CliPermissionOutcome;
+}): 'settled' | 'already_settled' | 'not_found' {
+  const ask = findByKey(askKeyFor(args.larkAppId, args.sessionId, 'hook', args.requestId));
+  if (!ask || !isHookPermissionAsk(ask)) return 'not_found';
+  const result: AskResult = {
+    kind: 'invalidated',
+    reason: `the asking CLI ended this permission confirmation itself (${args.outcome})`,
+    failureCode: 'cli_resolved',
+    cliOutcome: args.outcome,
+    selected: null, by: null, comment: null, timedOut: false,
+  };
+  if (ask.settled) {
+    if (!ask.dormant || ask.answeredResult === undefined || ask.waiters.length > 0) return 'already_settled';
+    clearTimeout(ask.timeoutHandle);
+    clearTimeout(ask.handoffExpiryHandle);
+    clearTimeout(ask.reclaimHandle);
+    pending.delete(ask.askId);
+    persistStore?.remove(ask.askKey);
+    notifyOnSettle({
+      ...ask, settledAt: Date.now(), dormant: false, answeredResult: undefined, terminalResult: result,
+    }, result);
+    return 'settled';
+  }
+  logger.info?.(`ask-broker: ${ask.askId} ended by the asking CLI (${args.outcome}) (key=${ask.askKey})`);
+  settle(ask.askId, result);
+  return 'settled';
 }
 
 /** Internal — settle an ask exactly once and notify the dispatcher's onSettle

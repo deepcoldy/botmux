@@ -31,6 +31,7 @@ import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
 import { buildPiArgs, createPiAdapter } from '../src/adapters/cli/pi.js';
 import { buildCredentialIsolationRules } from '../src/adapters/cli/read-isolation.js';
+import { protectedMcpHomePaths, type ProtectedMcpWorkerPolicy } from '../src/core/protected-mcp-capabilities.js';
 import { sessionSkillManifestPath } from '../src/core/skills/manifest-store.js';
 import { sessionSkillSnapshotRoot } from '../src/core/skills/snapshot.js';
 import { workflowNodePluginDir } from '../src/skills/workflow-node-plugin-dir.js';
@@ -2012,6 +2013,16 @@ describe('buildFsPolicy — trigger-user CLI identity', () => {
     expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin/.data/lark-cli.env`).access)
       .not.toBe('readOnly');
   });
+  it('grants a verified headless tool only its current session identity read-only', () => {
+    const p = buildFsPolicy(ctx({ sessionId: 'sess-mine', larkTransportEnabled: false, larkToolIdentityEnabled: true }));
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin/.data/lark-tool-binding.json`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin/.data/lark-cli.env`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin/.data/bytedcli.env`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-other.bin/.data/lark-tool-binding.json`).access).toBe('deny');
+    expect(accessForPath(p.rules, `${dataDir}/user-token-other.json`).access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.lark-cli-bots/cli_self/config.json').access).toBe('deny');
+    expect(p.rules.some(r => r.path === `${dataDir}/cli-identity`)).toBe(false);
+  });
 });
 
 // sandbox=true × `botmux skill list/show/read/resources`: the reader needs THIS
@@ -2094,9 +2105,19 @@ describe('buildFsPolicy — session skill manifest + skill snapshot', () => {
   });
 
   it('oncall + device-credential boundary: the credential masks hide neither the manifest nor the snapshot', () => {
+    const protectedPaths = protectedMcpHomePaths('/Users/u', {
+      capabilities: [],
+      protectedHomePaths: ['.fixture-credential'],
+      redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+    } satisfies ProtectedMcpWorkerPolicy);
     for (const platform of ['darwin', 'linux'] as const) {
-      const cred = buildCredentialIsolationRules({ homeDir: '/Users/u', botmuxHome: '/Users/u/.botmux' });
+      const cred = buildCredentialIsolationRules(
+        { homeDir: '/Users/u', botmuxHome: '/Users/u/.botmux' },
+        protectedPaths,
+      );
       const p = buildFsPolicy(skillCtx({ platform, mandatoryDenyPaths: cred.denyPaths, mandatoryDenyRegexes: cred.denyRegexes }));
+      expect(accessForPath(p.rules, '/Users/u/.fixture-credential').access).toBe('deny');
+      expect((p.denyRegexes ?? []).some(rx => new RegExp(rx).test('/Users/u/.fixture-credential.tmp'))).toBe(true);
       for (const path of [ownManifest, `${snapshot}/deploy/SKILL.md`]) {
         expect(accessForPath(p.rules, path).access).toBe('readOnly');
         expect((p.denyRegexes ?? []).some(rx => new RegExp(rx).test(path))).toBe(false);

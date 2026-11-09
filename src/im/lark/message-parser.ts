@@ -207,7 +207,8 @@ export function extractPostAtParticipants(message: { content?: string } | null |
  * "explicit @ hands off to normal routing, not the listener" rule can never
  * diverge between legs. Matches by open_id OR by app_id (via mentionAppId, which
  * covers every observed app_id shape), and also scans post-content inline `at`
- * tags (post messages may not populate `mentions`).
+ * tags (post messages may not populate `mentions`). Parsed `LarkMention`s
+ * (camelCase `openId` / `appId`) match too — turn-origin records only keep those.
  */
 export function messageMentionsBot(
   message: { mentions?: any[]; content?: string; body?: { content?: string } } | null | undefined,
@@ -217,7 +218,7 @@ export function messageMentionsBot(
   if (!botOpenId && !larkAppId) return false;
   const mentions: any[] = message?.mentions ?? [];
   for (const m of mentions) {
-    if (botOpenId && mentionOpenId(m) === botOpenId) return true;
+    if (botOpenId && (mentionOpenId(m) === botOpenId || m?.openId === botOpenId)) return true;
     if (larkAppId && mentionAppId(m) === larkAppId) return true;
   }
   // Post-content inline `at` tags (bot-sent post messages may omit `mentions`).
@@ -267,7 +268,8 @@ export function extractMentionIdentities(message: {
           // target and pollute the userId leg with an open_id value.
           out.push({
             name: node.user_name,
-            openId: node.user_id,
+            ...(typeof node.user_id === 'string' && node.user_id.startsWith('cli_')
+              ? { appId: node.user_id } : { openId: node.user_id }),
           });
         }
       }
@@ -1820,7 +1822,8 @@ const BOTMUX_INTERNAL_CARD_ACTIONS: ReadonlySet<string> = new Set([
   'close', 'disconnect', 'export_text', 'get_write_link', 'open_local_cli',
   'open_local_terminal', 'refresh_screenshot', 'restart', 'resume',
   'retry_last_task', 'takeover', 'term_action', 'toggle_display',
-  'toggle_stream', 'tui_keys', 'tui_text_input', 'voice_summary',
+  'toggle_stream', 'toggle_keys_panel',
+  'tui_keys', 'tui_text_input', 'voice_summary',
   'reply_card_menu', 'reply_model_pick', 'session_model_pick', 'session_effort_pick', 'session_effort_apply', 'models_default_pick', 'models_default_effort_pick', 'reply_menu_cancel',
   // pendingRepo gates
   'repo_manual_submit', 'repo_worktree_submit', 'skip_repo',

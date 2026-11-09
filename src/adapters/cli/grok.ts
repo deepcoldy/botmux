@@ -274,6 +274,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
             asksViaHook: false,
             whiteboardEnabled: whiteboardEnabled(),
           }),
+          cliId: 'grok',
         }),
       );
 

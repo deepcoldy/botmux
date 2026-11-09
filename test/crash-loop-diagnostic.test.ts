@@ -115,6 +115,8 @@ import type { DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
 import { createWorkerStderrRing, WORKER_ERROR_MARKER } from '../src/core/worker-stderr-ring.js';
 import { sandboxNamespaceNotice } from '../src/core/system-bwrap.js';
+import { buildStreamingCard } from '../src/im/lark/card-builder.js';
+import { RESTART_WINDOW_MS } from '../src/core/restart-policy.js';
 
 function makeFakeWorker() {
   const w = new EventEmitter() as any;
@@ -235,7 +237,7 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     expect(worker.send).toHaveBeenCalledWith({
       type: 'restart', attemptId: expect.any(String), reason: 'cli_crash',
       env: null, envUnset: null, envFingerprint: expect.any(String), model: null, larkToolBinding: true,
-      codexRpcInput: false, traexAutoModel: null,
+      codexRpcInput: false, traexAutoModel: null, startupCommands: null, launchShell: null,
     });
     expect(worker.send).toHaveBeenCalledWith({ type: 'park_diagnostic' });
     expect(worker.send).not.toHaveBeenCalledWith({ type: 'close' });
@@ -260,7 +262,7 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
 
     // The user changes the bot's model while the session sits parked.
     vi.mocked(getBot).mockReturnValue({
-      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', model: 'opus' },
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', model: 'opus', startupCommands: ['/effort xhigh'], launchShell: 'bash' },
       resolvedAllowedUsers: [],
       botOpenId: 'ou_bot',
       botName: 'TestBot',
@@ -271,6 +273,10 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
 
     const message = worker.send.mock.calls.map((c: any[]) => c[0]).find((m: any) => m.type === 'message');
     expect(message?.model).toBe('opus');
+    // Same for the startup commands / shell edited while parked (the recovery
+    // spawn replays them).
+    expect(message?.startupCommands).toEqual(['/effort xhigh']);
+    expect(message?.launchShell).toBe('bash');
 
     // Once a CLI is live again the refresh stops riding along on every turn.
     worker.emit('message', { type: 'ready', port: 1234, token: 't' });
@@ -302,6 +308,24 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
 
     expect(worker.send).toHaveBeenCalledWith({ type: 'close' });
     expect(ds.session.suspendedColdResume).toBeFalsy();
+  });
+
+  it('the crash freeze keeps the terminal keys grid the session had open', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-crash-keys', worker);
+    ds.streamCardId = 'om_stream_card';
+    ds.streamCardNonce = 'nonce_live';
+    ds.keysPanelOpen = true;
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    await crashTimes(worker, 3, undefined);
+    // Each auto-restart clears readiness; the card is frozen only when the CLI
+    // came back up before the crash that ends the loop.
+    ds.workerReady = true;
+    await crashTimes(worker, 1, undefined);
+
+    expect(buildStreamingCard).toHaveBeenCalled();
+    expect(vi.mocked(buildStreamingCard).mock.calls.at(-1)?.[24]).toBe(true);
   });
 
   it('crash card falls back to the per-worker stderr ring when logTail is missing', async () => {
@@ -419,28 +443,151 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
     expect(notice).toContain('1 分钟');
   });
 
-  // 恢复健康即清零：CLI 真的跑到可输入 prompt，说明此前那些崩溃不构成持续的
-  // 确定性故障。不清掉的话，一次历史 127 会让这条会话此后任何一次 127 都立即
-  // 放弃自动重启（评审实测隔 90 天仍如此）。
-  it('clears the crash-restart streak once the CLI reports ready again', async () => {
+  // 恢复健康即清零：CLI 跑到可输入 prompt 并稳定存活，说明此前那些崩溃不构成
+  // 持续的确定性故障。不清掉的话，一次历史 127 会让这条会话此后任何一次 127 都
+  // 立即放弃自动重启（评审实测隔 90 天仍如此）。不使用假时钟——bun:test 的假定时器
+  // 会接管 setTimeout 让 flush() 死锁；改为把 readyAt 直接拨老来模拟「已存活满窗」，
+  // 严格的窗口边界（恰好满窗 vs 超 1ms）由 restart-policy 的纯函数用例覆盖。
+  it('clears the crash-restart streak once the CLI stays up a full window after ready', async () => {
+    const sid = 'sid-ready-clears-streak';
     const worker = makeFakeWorker();
-    const ds = makeDs('sid-ready-clears-streak', worker);
+    const ds = makeDs(sid, worker);
     __testOnly_setupWorkerHandlers(ds, worker);
 
     worker.emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: true });
     await flush();
-    expect(restartCounts.get('sid-ready-clears-streak')?.permanentCount).toBe(1);
+    expect(restartCounts.get(sid)?.permanentCount).toBe(1);
 
-    // The CLI comes up for real.
+    // The CLI reaches a prompt: prompt_ready stamps readyAt once and keeps the streak.
     worker.emit('message', { type: 'prompt_ready' });
     await flush();
-    expect(restartCounts.has('sid-ready-clears-streak')).toBe(false);
+    const firstReadyAt = restartCounts.get(sid)?.readyAt;
+    expect(firstReadyAt).not.toBeUndefined();
+
+    // Simulate the CLI having stayed up a full window; a later ready must not re-anchor.
+    const agedReadyAt = Date.now() - RESTART_WINDOW_MS - 1;
+    restartCounts.get(sid)!.readyAt = agedReadyAt;
+    worker.emit('message', { type: 'prompt_ready' });
+    await flush();
+    expect(restartCounts.get(sid)?.readyAt).toBe(agedReadyAt);
 
     // So the NEXT permanent exit gets its own fresh single chance instead of
     // being killed on arrival by a stale streak.
     worker.emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: true });
     await flush();
-    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'restart', reason: 'cli_crash' }));
+    expect(restartCounts.get(sid)?.permanentCount).toBe(1);
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'park_diagnostic' });
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+
+  // #2551：到了 prompt 不等于恢复健康。CLI 每收到（被重投的）同一条输入就退出
+  // 时，每次重启都能到 prompt；若 ready 就清零，熔断永远不触发，会话在后台无限
+  // 「退出 → 重启 → 重投 → 退出」，用户收不到任何提示。
+  it('stops a crash-on-input loop even though every respawn reaches the prompt', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-crash-on-input', worker);
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    for (let i = 0; i < 4; i++) {
+      if (i > 0) {
+        worker.emit('message', { type: 'prompt_ready' });
+        await flush();
+      }
+      worker.emit('message', { type: 'claude_exit', code: 42, signal: null, canParkDiagnostic: true });
+      await flush();
+    }
+
+    expect(worker.send).toHaveBeenCalledWith({ type: 'park_diagnostic' });
+    const notice = sessionReplyMock.mock.calls.at(-1)?.[1] as string;
+    expect(notice).toContain('崩溃 4 次');
+  });
+
+  it('stops a permanent exit that recurs right after the respawn reached the prompt', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs('sid-permanent-after-ready', worker);
+    __testOnly_setupWorkerHandlers(ds, worker);
+
+    worker.emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: true });
+    await flush();
+    worker.emit('message', { type: 'prompt_ready' });
+    await flush();
+    worker.emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: true });
+    await flush();
+
+    expect(worker.send).toHaveBeenCalledWith({ type: 'park_diagnostic' });
+    const notice = sessionReplyMock.mock.calls.at(-1)?.[1] as string;
+    expect(notice).toContain('127');
+  });
+
+  // Node worker 进程换代（OOM / 管控杀死，没有 claude_exit）是比 in-worker CLI
+  // respawn 更强的边界：替代 worker 是全新一代，不能让上一代锚定的 readyAt 与
+  // 崩溃计数连坐它——否则新 CLI 在旧 readyAt 的窗口内第一次 127 就被直接熔断，
+  // 连自己唯一的一次重启机会都没有。
+  it('gives the replacement Node worker its own permanent budget after the old worker died', async () => {
+    const sid = 'sid-worker-generation-reset';
+    const w1 = makeFakeWorker();
+    const ds = makeDs(sid, w1);
+    __testOnly_setupWorkerHandlers(ds, w1);
+
+    w1.emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: true });
+    await flush();
+    expect(restartCounts.get(sid)?.permanentCount).toBe(1);
+    w1.emit('message', { type: 'prompt_ready' });
+    await flush();
+    expect(restartCounts.get(sid)?.readyAt).not.toBeUndefined();
+
+    // The Node worker itself is killed (no claude_exit); the stale streak is
+    // still parked on the session until a replacement worker is bound.
+    w1.emit('exit', 137, 'SIGKILL');
+    await flush();
+    expect(restartCounts.get(sid)?.readyAt).not.toBeUndefined();
+
+    // Daemon forks a replacement worker (next user message / continuation resume):
+    // binding the new generation voids the old streak and its readyAt.
+    const w2 = makeFakeWorker();
+    ds.worker = w2;
+    __testOnly_setupWorkerHandlers(ds, w2);
+    expect(restartCounts.has(sid)).toBe(false);
+    w2.emit('message', { type: 'prompt_ready' });
+    await flush();
+    w2.emit('message', { type: 'claude_exit', code: 127, signal: null, canParkDiagnostic: true });
+    await flush();
+
+    // First permanent exit OF THE NEW GENERATION gets its own single restart.
+    expect(restartCounts.get(sid)?.permanentCount).toBe(1);
+    const w2Messages = w2.send.mock.calls.map((c: any[]) => c[0]);
+    expect(w2Messages.some(m => m?.type === 'restart')).toBe(true);
+    expect(w2Messages.some(m => m?.type === 'park_diagnostic')).toBe(false);
+  });
+
+  // 非 tmux（PTY）后端熔断后走 killWorker（worker 同步解绑，进程随后退出）：
+  // 用户下一条消息 fork 出新 worker 代次时必须作废旧计数，与 tmux 的 park 路径
+  // 对称——否则新 CLI 第一次崩溃就带着旧计数被再次熔断，只能 /close。
+  it('gives the post-crash-loop replacement worker a fresh budget on non-tmux backends', async () => {
+    const sid = 'sid-pty-killworker-clears';
+    const w1 = makeFakeWorker();
+    const ds = makeDs(sid, w1);
+    __testOnly_setupWorkerHandlers(ds, w1);
+
+    await crashTimes(w1, 4, false, 1);
+    expect(w1.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'close' }));
+    // killWorker detached the worker synchronously; the process exit follows.
+    w1.emit('exit', 0, null);
+    await flush();
+    expect(restartCounts.get(sid)?.count).toBe(4);
+
+    // The next user message forks a replacement worker: binding it resets the streak.
+    const w2 = makeFakeWorker();
+    ds.worker = w2;
+    __testOnly_setupWorkerHandlers(ds, w2);
+    expect(restartCounts.has(sid)).toBe(false);
+
+    w2.emit('message', { type: 'prompt_ready' });
+    await flush();
+    w2.emit('message', { type: 'claude_exit', code: 1, signal: null, canParkDiagnostic: false });
+    await flush();
+    expect(restartCounts.get(sid)?.count).toBe(1);
+    expect(w2.send.mock.calls.map((c: any[]) => c[0]).some(m => m?.type === 'restart')).toBe(true);
   });
 
 });

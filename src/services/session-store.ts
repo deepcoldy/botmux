@@ -1,8 +1,11 @@
 import { guardSessionDirectoryWrites, reserveManagedDirectories } from './managed-directory-retention.js';
 import { resolveCodexProfileHome } from './codex-profiles.js';
+import { sessionContractStore } from './session-contract-store.js';
+import { sessionContractsEnabled, type ControlKind } from './session-contract.js';
 import { readFileSync, mkdirSync, existsSync, renameSync, readdirSync, unlinkSync, copyFileSync, realpathSync } from 'node:fs';
 import { join, dirname, basename, resolve, relative, isAbsolute } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { pidExistsEpermAlive } from '../utils/process-alive.js';
@@ -14,6 +17,7 @@ import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
 import { removeStatuslineDir } from './statusline-snapshot.js';
 import { removePaneLaunchDir } from '../adapters/backend/pane-launch.js';
+import { removeCodexModelLaunchReceipt } from './codex-model-selection.js';
 import { removeSessionSkillRuntime } from '../core/skills/snapshot.js';
 import {
   applySessionRowCommand,
@@ -2155,7 +2159,7 @@ export function persistActiveRemoteLineagesExactBatch(
  *  the serialized row identical skips the write — the daemon fires several
  *  updateSession() calls per inbound message (activity bump, pid, stream-card
  *  state, …) and many of them change nothing. */
-function persistRow(session: Session): void {
+function persistRow(session: Session, modelPinWrite = false): void {
   if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
   if (!ownStore) {
     throw new SessionStoreUnavailableError(
@@ -2168,6 +2172,9 @@ function persistRow(session: Session): void {
   const existing = ownStore.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (existing) {
     const durable = JSON.parse(existing.row) as Session;
+    // Only explicit pin writers may change intent. Late metadata copies cannot
+    // resurrect a cleared pin or erase a newer choice.
+    if (!modelPinWrite) session = { ...session, modelPin: durable.modelPin };
     if (durable.workspaceRetirement) {
       if (session.status !== 'closed') throw new Error('workspace_retired');
       // Late whole-row writers may hold a pre-close copy. Retirement cannot
@@ -2187,6 +2194,22 @@ function persistRow(session: Session): void {
     if (session.serviceTier === undefined && durable.serviceTier !== undefined) {
       session = { ...session, serviceTier: durable.serviceTier };
     }
+    if (durable.protectedHttpEgressPolicy !== undefined) {
+      if (session.protectedHttpEgressPolicy !== undefined
+        && !isDeepStrictEqual(
+          session.protectedHttpEgressPolicy,
+          durable.protectedHttpEgressPolicy,
+        )) {
+        throw new Error('Protected HTTP egress policy is immutable');
+      }
+      // The first successful freeze owns this field permanently. Whole-row
+      // metadata writers created before that freeze must carry it forward,
+      // while later writers may only replay the exact durable value.
+      session = {
+        ...session,
+        protectedHttpEgressPolicy: durable.protectedHttpEgressPolicy,
+      };
+    }
     if (durable.cliInstanceBinding) {
       if (session.cliInstanceBinding && JSON.stringify(session.cliInstanceBinding) !== JSON.stringify(durable.cliInstanceBinding)) {
         throw new Error('Codex instance binding is immutable');
@@ -2196,6 +2219,15 @@ function persistRow(session: Session): void {
       session = { ...session, cliInstanceBinding: durable.cliInstanceBinding, creationSource: durable.creationSource,
         cliId: durable.cliId, cliRuntime: durable.cliRuntime, cliPathOverride: durable.cliPathOverride,
         wrapperCli: durable.wrapperCli, cliLaunchMode: durable.cliLaunchMode, agentFrozen: durable.agentFrozen };
+    }
+  }
+  if (ownStore.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='contracts'").get()) {
+    const hit = ownStore.db.prepare('SELECT value,revision FROM contracts WHERE session_key=?').get(JSON.stringify([currentAppId, session.sessionId])) as { value: string; revision: number } | undefined;
+    if (hit) {
+      const canonical = JSON.parse(hit.value);
+      if ((canonical.lifecycle === 'closed' && session.status !== 'closed')
+        || (session.status === 'closed' && !['closing', 'closed'].includes(canonical.lifecycle))) throw new Error('session_lifecycle_requires_control_operation');
+      session = { ...session, sessionLifecycle: canonical.lifecycle, sessionContractRevision: hit.revision };
     }
   }
   const json = JSON.stringify(session);
@@ -2214,7 +2246,7 @@ function buildNewSession(
   title: string,
   chatType?: 'group' | 'p2p',
   scope?: 'thread' | 'chat',
-  intent: { source?: SessionCreationSource; inherit?: Session } = {},
+  intent: { source?: SessionCreationSource; inherit?: Session; messageListenerRun?: Session['messageListenerRun'] } = {},
 ): Session {
   const bot = configuredCodexInstanceBot(currentAppId);
   const source = intent.source ?? 'other';
@@ -2225,6 +2257,7 @@ function buildNewSession(
   } : bot ? newSessionCodexInstanceState(bot, source) : {};
   const session: Session = {
     sessionId: randomUUID(),
+    ...(intent.messageListenerRun ? { messageListenerRun: { ...intent.messageListenerRun } } : {}),
     chatId,
     chatType,
     rootMessageId,
@@ -2257,7 +2290,7 @@ export function createSession(
   title: string,
   chatType?: 'group' | 'p2p',
   scope?: 'thread' | 'chat',
-  intent: { source?: SessionCreationSource; inherit?: Session } = {},
+  intent: { source?: SessionCreationSource; inherit?: Session; messageListenerRun?: Session['messageListenerRun'] } = {},
 ): Session {
   loadForWrite();
   const session = buildNewSession(chatId, rootMessageId, title, chatType, scope, intent);
@@ -2746,6 +2779,21 @@ export function markMojoCloseUnresolved(
   });
 }
 
+function commitContractLifecycle(session: Session, kind: ControlKind, write: () => void): void {
+  const appId = currentAppId;
+  if (!sessionContractsEnabled() || !appId || !ownStore) { write(); return; }
+  const contract = sessionContractStore(config.session.dataDir, appId);
+  const ref = { appId, sessionId: session.sessionId };
+  runOwnedWriteTransaction(ownStore, false, () => contract.usingDatabase(ownStore!.db, () => {
+    contract.ensure(ref, { closed: session.status === 'closed', suspended: session.suspendedColdResume });
+    if (kind === 'close' && contract.read(ref)?.lifecycle === 'closed') { write(); return; }
+    const { operation } = contract.beginOperation(ref, kind);
+    contract.apply(ref, { type: 'control_started', operationId: operation.operationId });
+    write();
+    contract.apply(ref, { type: 'control_result', operationId: operation.operationId, phase: 'confirmed' });
+  }));
+}
+
 export function closeSession(
   sessionId: string,
   opts: {
@@ -2782,8 +2830,11 @@ export function closeSession(
     // only when the row carries no snapshot yet. An already-closed row does
     // not take a new snapshot — re-close must not pin a later `null` over a
     // live dashboard read, and must not spend the scan when apply will ignore it.
+    const durableHit = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
+    const durable = durableHit ? JSON.parse(durableHit.row) as Session : undefined;
+    const basis = durable?.status === 'closed' ? { ...session, ...durable, tokenUsage: durable.tokenUsage } : session;
     let tokenUsage: NonNullable<Session['tokenUsage']> | null | undefined;
-    if (session.status !== 'closed') {
+    if (basis.status !== 'closed') {
       tokenUsage = null;
       try {
         tokenUsage = getSessionTokenUsage({
@@ -2805,7 +2856,7 @@ export function closeSession(
     // store close, reached after its explicit prepare, so it alone names the
     // journal wipe. Persist only on `applied` — a no-op re-close must not
     // rewrite the row.
-    const next: Session = { ...session };
+    const next: Session = { ...basis };
     const applied = applySessionRowCommand(next, {
       type: 'close',
       ...(opts.backgroundExecutionCleanup ? { backgroundExecutionCleanup: true } : {}),
@@ -2817,7 +2868,15 @@ export function closeSession(
       ...(opts.clearRiffParentTaskId ? { clearRiffParentTaskId: true } : {}),
     }, { now: new Date() });
     if (applied.outcome === 'applied') {
-      persistRow(next);
+      commitContractLifecycle(basis, 'close', () => {
+        const latest = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
+        const closed = latest ? JSON.parse(latest.row) as Session : undefined;
+        if (closed?.status === 'closed') { next.closedAt = closed.closedAt; next.tokenUsage = closed.tokenUsage; }
+        persistRow(next);
+      });
+      const committed = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
+      Object.assign(session, next, committed ? JSON.parse(committed.row) : {});
+    } else if (durable?.status === 'closed') {
       Object.assign(session, next);
     }
     const released = applied.outcome === 'applied' ? applied.released.dashboardAttachments : undefined;
@@ -2841,6 +2900,9 @@ export function closeSession(
     // tmux 启动文件目录（pane-launch.ts）：正常情况下 pane 读完即删，这里兜住
     // 一个 shell 没来得及读的文件——它带着该 bot 注入的环境变量值。
     removePaneLaunchDir(config.session.dataDir, sessionId);
+    // Codex 启动回执（codex-model-selection.ts）：每会话一份，仅服务恢复时的
+    // 启动基线确认，关会话一并删除（best-effort，内部吞错）。
+    removeCodexModelLaunchReceipt(config.session.dataDir, sessionId);
     // 本会话的 skill manifest 与 runtime-skills/<sid>/（skill 快照 + 原生投递副本）
     // 同生命周期：快照只服务这个会话的 CLI 进程，关会话即清（best-effort）。
     removeSessionSkillRuntime(sessionId, config.session.dataDir);
@@ -2900,8 +2962,9 @@ export function reactivateClosedSession(
   next.mojoCloseJournal = undefined;
   next.tokenUsage = undefined;
 
-  persistRow(next);
-  Object.assign(session, next);
+  commitContractLifecycle(session, 'resume', () => persistRow(next));
+  const committed = ownStore?.selectRow.get(sessionId) as { row: string } | undefined;
+  Object.assign(session, next, committed ? JSON.parse(committed.row) : {});
   return { ok: true, session };
 }
 
@@ -2943,9 +3006,9 @@ export function clearSessionPidsIfUnchanged(
   return targets.length;
 }
 
-export function updateSession(session: Session): void {
+export function updateSession(session: Session, options: { modelPinWrite?: true } = {}): void {
   loadForWrite();
-  try { persistRow(session); }
+  try { persistRow(session, options.modelPinWrite); }
   catch (error) {
     const row = ownStore?.selectRow.get(session.sessionId) as { row: string } | undefined;
     if (row) {
@@ -2959,7 +3022,14 @@ export function updateSession(session: Session): void {
     throw error;
   }
   const durable = ownStore?.selectRow.get(session.sessionId) as { row: string } | undefined;
-  if (durable) Object.assign(session, JSON.parse(durable.row));
+  if (durable) {
+    const row = JSON.parse(durable.row) as Session;
+    Object.assign(session, row);
+    // Object.assign does not remove a key the durable row lacks; drop an
+    // in-memory pin explicitly instead of leaving a lingering own `undefined`.
+    if (row.modelPin === undefined) delete session.modelPin;
+    else session.modelPin = row.modelPin;
+  }
   sessions.set(session.sessionId, session);
 }
 
@@ -2999,6 +3069,8 @@ export function mutateOwnedSessionsAtomically<T>(
     /** Fail fast with SessionStoreBusyError instead of blocking the daemon's
      * event loop behind the connection's normal busy_timeout. */
     nonblocking?: boolean;
+    /** Explicit pin writer, never ordinary metadata. */
+    modelPinWrite?: true;
   } = {},
 ): { result: T; rows: Map<string, Session> } {
   loadForWrite();
@@ -3019,7 +3091,7 @@ export function mutateOwnedSessionsAtomically<T>(
       fresh.set(sessionId, structuredClone(JSON.parse(hit.row) as Session));
     }
     result = mutate(fresh);
-    for (const row of fresh.values()) persistRow(row);
+    for (const row of fresh.values()) persistRow(row, options.modelPinWrite);
   });
   for (const [sessionId, row] of fresh) {
     const cached = sessions.get(sessionId);
@@ -3929,10 +4001,11 @@ function shadowRoutingAnchor(sourceSessionId: string, laneId: string): string {
 
 const PRINCIPAL_LANE_RUNTIME_KEYS = [
   'cliId', 'promptInjection', 'cliLaunchSnapshot', 'cliInstanceBinding', 'cliRuntime', 'cliPathOverride',
-  'codexProfile', 'codexProfileHome', 'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'reasoningEffort', 'modelBackendVariant',
+  'codexProfile', 'codexProfileHome', 'cliConfigDir', 'wrapperCli', 'agentFrozen', 'model', 'modelPin', 'reasoningEffort', 'modelBackendVariant',
   'backendType', 'mojoIdentity', 'mojoIdentityHostDefault',
   'sandbox', 'sandboxPaths', 'sandboxHidePaths',
   'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy',
+  'protectedHttpEgressPolicy',
 ] as const satisfies readonly (keyof Session)[];
 
 function copyPrincipalLaneRuntimeConfig(source: Session, target: Session): void {
@@ -6171,9 +6244,10 @@ function runUnownedRowTxn<T>(
 
   const dbPath = storeDbPath(target.larkAppId, dataDir);
   let lease: OccupancyLease | undefined;
+  let hasContract = false;
   try {
     const readDb = openDbForRead(dbPath);
-    try { lease = readOccupancyInTxn(readDb); }
+    try { lease = readOccupancyInTxn(readDb); hasContract = !!readDb.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='contracts'").get(); }
     finally { readDb.close(); }
   } catch (err) {
     if (isTransientStoreContentionError(err)) return { outcome: 'contended' };
@@ -6185,6 +6259,7 @@ function runUnownedRowTxn<T>(
 
   let db: SqliteDatabaseLike | undefined;
   let inTxn = false;
+  const contract = hasContract ? sessionContractStore(dataDir, target.larkAppId) : undefined;
   try {
     db = openDbForOwnStore(dbPath);
     db.exec('BEGIN IMMEDIATE');
@@ -6196,10 +6271,22 @@ function runUnownedRowTxn<T>(
       .get(target.sessionId) as { row: string } | undefined;
     if (!hit) return { outcome: 'missing' };
     const current = JSON.parse(hit.row) as Session;
+    const previousStatus = current.status;
     const { publish, result } = step(current);
     if (!publish) return result;
-    db.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ?')
+    const write = () => db!.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ?')
       .run(sessionStatusText(current), JSON.stringify(current), target.sessionId);
+    if (contract && current.status !== previousStatus) contract.usingDatabase(db, () => {
+      const ref = { appId: target.larkAppId, sessionId: target.sessionId };
+      contract.ensure(ref, { closed: previousStatus === 'closed' });
+      const { operation } = contract.beginOperation(ref, current.status === 'closed' ? 'close' : 'resume');
+      contract.apply(ref, { type: 'control_started', operationId: operation.operationId });
+      write();
+      contract.apply(ref, { type: 'control_result', operationId: operation.operationId, phase: 'confirmed' });
+      const updated = db!.prepare('SELECT row FROM sessions WHERE session_id=?').get(target.sessionId) as { row: string };
+      Object.assign(current, JSON.parse(updated.row));
+    });
+    else write();
     db.exec('COMMIT');
     inTxn = false;
     return result;

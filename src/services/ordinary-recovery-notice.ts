@@ -25,6 +25,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import type { TrustedCaller } from '../types.js';
+import { extractLarkBusinessCode } from '../im/lark/lark-errors.js';
 import { stripBotmuxDisplayBlocks } from '../utils/prompt-display-strip.js';
 import {
   ordinaryTurnRecoveryCauseCode,
@@ -57,6 +58,21 @@ export function recoveryNoticeSendNeverLanded(error: unknown): boolean {
     error instanceof Error ? error.message : String(error),
   ];
   return /ENOTFOUND|EAI_AGAIN|ECONNREFUSED|getaddrinfo|circuit open|CircuitOpen/i.test(parts.join(' '));
+}
+
+/** Transport failures that leave the outcome unknown: the request may have
+ *  reached Feishu (timeout, connection reset mid-request). A reply from Feishu
+ *  itself (HTTP response or business code) is an answer, not one of these. */
+export function recoveryNoticeSendOutcomeUnknown(error: unknown): boolean {
+  if ((error as { response?: unknown })?.response !== undefined) return false;
+  if (extractLarkBusinessCode(error) !== undefined) return false;
+  const parts = [
+    (error as { code?: unknown })?.code,
+    (error as { name?: unknown })?.name,
+    error instanceof Error ? error.message : String(error),
+  ];
+  return /ETIMEDOUT|ECONNRESET|ECONNABORTED|EPIPE|ENETUNREACH|EHOSTUNREACH|ERR_NETWORK|socket hang up|timeout|timed out/i
+    .test(parts.join(' '));
 }
 
 /** Notice records kept per session (newest win; pending ones are never evicted
@@ -198,7 +214,7 @@ export function recoveryNoticeRetryDelayMs(attempts: number): number {
   return RECOVERY_NOTICE_RETRY_DELAYS_MS[index]!;
 }
 
-export function recoveryNoticeExpired(record: OrdinaryRecoveryNoticeRecord, now: number): boolean {
+export function recoveryNoticeExpired(record: Pick<OrdinaryRecoveryNoticeRecord, 'createdAt'>, now: number): boolean {
   return now - record.createdAt > RECOVERY_NOTICE_MAX_AGE_MS;
 }
 
@@ -215,6 +231,7 @@ export function recoveryCauseI18nKey(code: string | undefined): string {
     return 'card.recovery_failed.cause.provider_auth';
   }
   if (code === 'provider_invalid_request') return 'card.recovery_failed.cause.provider_rejected';
+  if (code === 'provider_image_too_small') return 'card.recovery_failed.cause.image_too_small';
   if (code.includes('capacity')) return 'card.recovery_failed.cause.capacity';
   if (code === 'recovery_outcome_unverified') return 'card.recovery_failed.cause.outcome_unverified';
   if (code === 'recovery_restart_unverified' || code === 'recovery_dispatch_interrupted') {
@@ -365,20 +382,60 @@ export function recoveryRetryPermitted(input: {
   return input.operatorOpenId === input.initiatorOpenId && input.operatorCanTalk;
 }
 
+/**
+ * A turn failure card or worker notice whose first send hit a Feishu transport
+ * failure (#2687), kept on the session (`Session.turnNotices`) so the outbox
+ * retries it with the same uuid instead of dropping it. Keyed by that uuid.
+ */
+export interface TurnNoticeRecord {
+  kind: 'turn_failure' | 'user_notify';
+  /** Reply-target turn, frozen at the first send. */
+  turnId?: string;
+  msgType: 'interactive' | 'text';
+  content: string;
+  createdAt: number;
+  delivery: OrdinaryRecoveryNoticeRecord['delivery'];
+}
+
+export const MAX_TURN_NOTICES = 10;
+
+/** Add a notice to the session's list, keeping only the newest pending ones. */
+export function addTurnNotice(
+  list: readonly TurnNoticeRecord[] | undefined,
+  record: TurnNoticeRecord,
+): TurnNoticeRecord[] {
+  const pending = (list ?? []).filter(entry => entry.delivery.state === 'pending');
+  pending.push(record);
+  return pending.slice(-MAX_TURN_NOTICES);
+}
+
 // ─── Outbox ──────────────────────────────────────────────────────────────────
+
+/** What the outbox reads from a record. */
+export interface OutboxNoticeRecord {
+  logicalTurnId?: string;
+  createdAt: number;
+  delivery: OrdinaryRecoveryNoticeRecord['delivery'];
+}
+
+/** A record's key within its session's list: the recovery card's logical turn,
+ *  otherwise the record's own delivery uuid. */
+function outboxNoticeKey(record: OutboxNoticeRecord): string {
+  return record.logicalTurnId ?? record.delivery.uuid;
+}
 
 /** One session's view of its notice records. `update` must re-read the record
  *  from the live session (the session store refreshes nested objects on every
  *  write), apply the mutation, persist, and return the fresh record. */
-export interface RecoveryNoticeHost {
+export interface RecoveryNoticeHost<TRecord extends OutboxNoticeRecord = OrdinaryRecoveryNoticeRecord> {
   readonly key: string;
-  list(): readonly OrdinaryRecoveryNoticeRecord[];
+  list(): readonly TRecord[];
   update(
-    logicalTurnId: string,
-    mutate: (record: OrdinaryRecoveryNoticeRecord) => void,
-  ): OrdinaryRecoveryNoticeRecord | undefined;
+    recordKey: string,
+    mutate: (record: TRecord) => void,
+  ): TRecord | undefined;
   /** Post the card; resolves with the Feishu message id, rejects on failure. */
-  send(record: OrdinaryRecoveryNoticeRecord): Promise<string | undefined>;
+  send(record: TRecord): Promise<string | undefined>;
   /** False while the session cannot post (closed / replaced); the record stays
    *  pending and the next attach resumes it. */
   canDeliver(): boolean;
@@ -389,6 +446,8 @@ export interface RecoveryNoticeOutboxDeps<TTimer = unknown> {
   cancel: (timer: TTimer) => void;
   now?: () => number;
   log?: (level: 'info' | 'warn' | 'error', message: string) => void;
+  /** Absent ⇒ every failed send is retried; false ⇒ the record is abandoned. */
+  retryable?: (error: unknown) => boolean;
 }
 
 function errorText(error: unknown): string {
@@ -396,7 +455,7 @@ function errorText(error: unknown): string {
   return text.length > 200 ? `${text.slice(0, 200)}…` : text;
 }
 
-export class RecoveryNoticeOutbox<TTimer = unknown> {
+export class RecoveryNoticeOutbox<TTimer = unknown, TRecord extends OutboxNoticeRecord = OrdinaryRecoveryNoticeRecord> {
   private readonly timers = new Map<string, TTimer>();
   private readonly inFlight = new Set<string>();
   private readonly now: () => number;
@@ -406,7 +465,7 @@ export class RecoveryNoticeOutbox<TTimer = unknown> {
   }
 
   /** Attempt delivery of one pending record now. */
-  deliver(host: RecoveryNoticeHost, logicalTurnId: string): Promise<void> {
+  deliver(host: RecoveryNoticeHost<TRecord>, logicalTurnId: string): Promise<void> {
     this.clearTimer(host.key, logicalTurnId);
     return this.attempt(host, logicalTurnId);
   }
@@ -416,14 +475,15 @@ export class RecoveryNoticeOutbox<TTimer = unknown> {
    *  existing timer is replaced so it always runs against the latest host (a
    *  timer armed for a replaced session object would otherwise find it unable
    *  to deliver and stop). */
-  resume(host: RecoveryNoticeHost): void {
+  resume(host: RecoveryNoticeHost<TRecord>): void {
     for (const record of host.list()) {
       if (record.delivery.state !== 'pending') continue;
-      const key = this.keyOf(host.key, record.logicalTurnId);
+      const recordKey = outboxNoticeKey(record);
+      const key = this.keyOf(host.key, recordKey);
       if (this.inFlight.has(key)) continue;
-      this.clearTimer(host.key, record.logicalTurnId);
+      this.clearTimer(host.key, recordKey);
       const delayMs = Math.max(0, (record.delivery.nextAttemptAt ?? this.now()) - this.now());
-      this.arm(host, record.logicalTurnId, delayMs);
+      this.arm(host, recordKey, delayMs);
     }
   }
 
@@ -447,7 +507,7 @@ export class RecoveryNoticeOutbox<TTimer = unknown> {
     this.timers.delete(key);
   }
 
-  private arm(host: RecoveryNoticeHost, logicalTurnId: string, delayMs: number): void {
+  private arm(host: RecoveryNoticeHost<TRecord>, logicalTurnId: string, delayMs: number): void {
     const key = this.keyOf(host.key, logicalTurnId);
     this.timers.set(key, this.deps.schedule(delayMs, () => {
       this.timers.delete(key);
@@ -456,10 +516,10 @@ export class RecoveryNoticeOutbox<TTimer = unknown> {
   }
 
   private safeUpdate(
-    host: RecoveryNoticeHost,
+    host: RecoveryNoticeHost<TRecord>,
     logicalTurnId: string,
-    mutate: (record: OrdinaryRecoveryNoticeRecord) => void,
-  ): OrdinaryRecoveryNoticeRecord | undefined {
+    mutate: (record: TRecord) => void,
+  ): TRecord | undefined {
     try {
       return host.update(logicalTurnId, mutate);
     } catch (error) {
@@ -468,10 +528,10 @@ export class RecoveryNoticeOutbox<TTimer = unknown> {
     }
   }
 
-  private async attempt(host: RecoveryNoticeHost, logicalTurnId: string): Promise<void> {
+  private async attempt(host: RecoveryNoticeHost<TRecord>, logicalTurnId: string): Promise<void> {
     const key = this.keyOf(host.key, logicalTurnId);
     if (this.inFlight.has(key)) return;
-    const record = host.list().find(entry => entry.logicalTurnId === logicalTurnId);
+    const record = host.list().find(entry => outboxNoticeKey(entry) === logicalTurnId);
     if (!record || record.delivery.state !== 'pending') return;
     const now = this.now();
     if (recoveryNoticeExpired(record, now)) {
@@ -500,6 +560,17 @@ export class RecoveryNoticeOutbox<TTimer = unknown> {
       try {
         messageId = await host.send(record);
       } catch (error) {
+        if (this.deps.retryable && !this.deps.retryable(error)) {
+          this.safeUpdate(host, logicalTurnId, entry => {
+            if (entry.delivery.state !== 'pending') return;
+            entry.delivery.state = 'abandoned';
+            entry.delivery.attempts += 1;
+            entry.delivery.lastError = errorText(error);
+          });
+          this.deps.log?.('warn', `recovery notice ${logicalTurnId.slice(0, 16)} abandoned: `
+            + `the failure is not retryable (${errorText(error)})`);
+          return;
+        }
         const failedAt = this.now();
         const uncertain = !recoveryNoticeSendNeverLanded(error);
         const planDelay = (attempts: number, since: number | undefined): number => {

@@ -38,10 +38,17 @@ function wrapperFilename(
  * process somehow lacks SESSION_DATA_DIR (defensive; the entrypoint always sets it).
  */
 export function resolveBotmuxWrapperBinDir(env: NodeJS.ProcessEnv = process.env): string {
+  let binDir: string;
   if (env.BOTMUX_CORE_ONLY === '1' && env.SESSION_DATA_DIR) {
-    return join(env.SESSION_DATA_DIR, 'bin');
+    binDir = join(env.SESSION_DATA_DIR, 'bin');
+  } else {
+    binDir = join(env.HOME ?? env.USERPROFILE ?? homedir(), '.botmux', 'bin');
   }
-  return join(env.HOME ?? env.USERPROFILE ?? homedir(), '.botmux', 'bin');
+  try {
+    return realpathSync(binDir);
+  } catch {
+    return binDir;
+  }
 }
 
 export function resolveNativeSubagentRuntimeHookWrapperPath(

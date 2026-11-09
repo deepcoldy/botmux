@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { basename } from 'node:path';
 import type { WorkerFinalOutput } from '../types.js';
+import type { SessionEventContext } from './session-contract.js';
 
 /** Filesystem key for per-app journals/stores. Containment, not an id-shape
  *  whitelist, is the security boundary here: the configured app id space is
@@ -35,6 +36,9 @@ export interface OutputSnapshot {
   fingerprint: string;
   output: WorkerFinalOutput;
   createdAt: number;
+  /** Execution provenance is a sidecar; changing IPC producers cannot change
+   * the native effect identity or the first frozen output bytes. */
+  origin?: SessionEventContext;
 }
 
 function boundedId(value: unknown): value is string {
@@ -48,7 +52,8 @@ export function outputSnapshot(appId: string, output: WorkerFinalOutput, now = D
     || typeof output.content !== 'string' || (output.dispatchAttempt !== undefined && !Number.isSafeInteger(output.dispatchAttempt))) {
     throw new Error('invalid_output_snapshot');
   }
-  const { handoff: _claim, ...frozen } = structuredClone(output);
+  const { handoff: _claim, sessionContract, sessionOutputOrigin, ...frozen } = structuredClone(output);
+  const origin = sessionOutputOrigin ?? sessionContract;
   const canonical = structuredClone(frozen);
   if (canonical.codexAppSettlement) {
     canonical.codexAppSettlement.requestId = '';
@@ -65,13 +70,13 @@ export function outputSnapshot(appId: string, output: WorkerFinalOutput, now = D
   return { version: 2,
     id: createHash('sha256').update(JSON.stringify(key)).digest('hex'),
     fingerprint: createHash('sha256').update(JSON.stringify(canonical, (_key, value) => value && typeof value === 'object' && !Array.isArray(value) ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b))) : value)).digest('hex'),
-    output: frozen, createdAt: now };
+    output: frozen, createdAt: now, ...(origin ? { origin } : {}) };
 }
 
 export function validateOutputSnapshot(appId: string, snapshot: OutputSnapshot): OutputSnapshot {
   const expected = outputSnapshot(appId, snapshot.output, snapshot.createdAt);
   if (snapshot.version !== 2 || snapshot.id !== expected.id || snapshot.fingerprint !== expected.fingerprint) throw new Error('output_snapshot_conflict');
-  return expected;
+  return { ...expected, ...(snapshot.origin ? { origin: structuredClone(snapshot.origin) } : {}) };
 }
 
 /** A native final may be re-emitted as empty after its explicit publication.
@@ -102,6 +107,7 @@ export class UniversalOutputHandoff {
     remove(snapshot: OutputSnapshot): void;
     restore(): OutputSnapshot[];
     send(output: WorkerFinalOutput): void;
+    context?(origin: SessionEventContext): SessionEventContext;
     error(error: unknown): void;
     retryMs?: number;
   }) {}
@@ -140,7 +146,9 @@ export class UniversalOutputHandoff {
   stop(): void { this.stopped = true; if (this.timer) clearTimeout(this.timer); this.timer = undefined; }
 
   private transmit(snapshot: OutputSnapshot): void {
-    try { this.deps.send({ ...snapshot.output, handoff: { version: 2, id: snapshot.id, fingerprint: snapshot.fingerprint, token: this.deps.token } }); }
+    try { this.deps.send({ ...snapshot.output,
+      ...(snapshot.origin ? { sessionOutputOrigin: snapshot.origin, sessionContract: this.deps.context?.(snapshot.origin) ?? snapshot.origin } : {}),
+      handoff: { version: 2, id: snapshot.id, fingerprint: snapshot.fingerprint, token: this.deps.token } }); }
     catch (error) { this.deps.error(error); }
   }
   private arm(): void {
