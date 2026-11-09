@@ -275,6 +275,11 @@ export type WorkflowDraftErrorCode =
   | 'not_a_copy'
   /** 换编排 Bot is under way: only it, 「放弃」 and 「删除」 go on meanwhile. */
   | 'handoff_pending'
+  /** The orchestrator has no default dir and no project was picked. */
+  | 'project_required'
+  /** Not this orchestrator's project: neither its default dir nor one of
+   *  its repo-picker candidates. */
+  | 'project_not_allowed'
   | 'bad_request';
 
 const STATUS: Record<WorkflowDraftErrorCode, number> = {
@@ -319,6 +324,8 @@ const STATUS: Record<WorkflowDraftErrorCode, number> = {
   unresolved_params: 409,
   not_a_copy: 409,
   handoff_pending: 409,
+  project_required: 422,
+  project_not_allowed: 422,
   bad_request: 400,
 };
 
@@ -357,7 +364,9 @@ export type DraftClarifyResult =
 
 /** The orchestrating bot's headless sessions (session-manager / trigger). */
 export interface DraftClarifier {
-  create(input: { larkAppId: string; title: string }): Promise<
+  /** `workingDir`: the draft's project — always given, so a session never
+   *  falls back to the daemon's own directory. */
+  create(input: { larkAppId: string; title: string; workingDir: string }): Promise<
     { ok: true; headlessId: string; sessionId: string } | { ok: false; error: string }
   >;
   /** Start one turn. `disconnected`: the session cannot take turns anymore. */
@@ -374,6 +383,30 @@ export interface DraftClarifier {
   close(input: { sessionId: string; headlessId?: string }): Promise<void>;
 }
 
+/** One project the orchestrator may clarify in: a repo-picker candidate. */
+export interface WorkflowDraftProjectCandidate {
+  path: string;
+  name: string;
+  type: 'repo' | 'worktree';
+  branch?: string;
+}
+
+/** Where a new draft of this bot is clarified: its default dir as is, or a
+ *  project to pick (required) from its repo-picker candidates. */
+export type WorkflowDraftProjectOptions =
+  | { kind: 'default'; dir: string }
+  | { kind: 'pick'; candidates: WorkflowDraftProjectCandidate[] };
+
+/** This bot's projects, by the Feishu repo picker's rules. */
+export interface WorkflowDraftProjects {
+  /** The bot's effective default working dir, absolute; undefined: none. */
+  defaultDir(): string | undefined;
+  /** The repo picker's candidates (scans the bot's working dirs). */
+  candidates(): WorkflowDraftProjectCandidate[];
+  /** Where a clarify session actually runs, if it is still on record. */
+  sessionDir?(sessionId: string): string | undefined;
+}
+
 export interface WorkflowDraftServiceDeps {
   /** This daemon's bot: the only orchestrator it serves. */
   appId: string;
@@ -387,6 +420,7 @@ export interface WorkflowDraftServiceDeps {
    *  either static (bots.json) or settled when the group is built (§4.4). */
   isDaemonOnline: (larkAppId: string) => boolean;
   clarifier: DraftClarifier;
+  projects: WorkflowDraftProjects;
   runArchitect: ArchitectDeps['runArchitect'];
   loadDag?: (path: string) => unknown;
   architectTimeoutMs?: number;
@@ -434,6 +468,12 @@ export interface WorkflowDraftView {
   updatedAt: string;
   stale: boolean;
   abandonedAt?: string;
+  /** Where the clarify session runs. `from`: `draft` — the draft's project;
+   *  a draft from before projects shows where its clarify session actually
+   *  runs (`session`) or, with none on record, the orchestrator's default dir
+   *  it reopens in (`default`). `required`: such a draft whose orchestrator
+   *  has no default dir — 「继续」 needs a project picked first. */
+  project?: { dir?: string; from?: 'draft' | 'session' | 'default'; required?: true };
   clarify: {
     state: WorkflowDraftRecord['clarify']['state'];
     pending: boolean;
@@ -1376,16 +1416,16 @@ export class WorkflowDraftService {
    * only while `reservation` (taken by the caller under the lock) is still
    * the draft's: otherwise, or when the draft was abandoned / deleted
    * meanwhile, the session just created is closed, never left running.
-   * Releases the reservation.
+   * Releases the reservation. `workingDir`: the draft's project.
    */
-  private async startSession(runId: string, prompt: string, title: string, reservation: string): Promise<void> {
+  private async startSession(runId: string, prompt: string, title: string, reservation: string, workingDir: string): Promise<void> {
     let created: Awaited<ReturnType<DraftClarifier['create']>> = { ok: false, error: 'not started' };
     let keep = false;
     try {
       try {
         // A create that answers after the timeout made a session nobody
         // records: close it when it lands.
-        const outcome = await this.bounded(this.deps.clarifier.create({ larkAppId: this.deps.appId, title }), (late) => {
+        const outcome = await this.bounded(this.deps.clarifier.create({ larkAppId: this.deps.appId, title, workingDir }), (late) => {
           if (late.ok) void this.closeOrRemember(undefined, { sessionId: late.sessionId, headlessId: late.headlessId });
         });
         created = outcome === TIMED_OUT ? { ok: false, error: '创建会话超时' } : outcome;
@@ -1490,10 +1530,60 @@ export class WorkflowDraftService {
     }
   }
 
+  // ── projects ──
+  //
+  // A draft is clarified in one project, fixed when it is created: the
+  // orchestrator's default dir, or — without one — a project the person picks
+  // from the bot's repo-picker candidates (the Feishu repo card's list, never
+  // a typed path). Every clarify session of the draft opens there.
+
+  /** What 新建 / 运行模板 / 复制 offer for this bot (scans for candidates). */
+  projectOptions(): WorkflowDraftProjectOptions {
+    const dir = this.deps.projects.defaultDir();
+    if (dir) return { kind: 'default', dir };
+    return { kind: 'pick', candidates: this.deps.projects.candidates() };
+  }
+
+  /** The project `requested` for a draft of this bot, or refused. A bot with
+   *  a default dir always clarifies there. */
+  private chooseProject(requested: unknown): string {
+    if (requested !== undefined && (typeof requested !== 'string' || !requested || requested.length > 4096)) {
+      throw err('bad_request', 'project 不合法');
+    }
+    const dir = this.deps.projects.defaultDir();
+    if (dir) {
+      if (requested === undefined || requested === dir) return dir;
+      throw err('project_not_allowed', `这个编排 Bot 有默认目录（${dir}），草稿就在那里澄清`);
+    }
+    if (requested === undefined) throw err('project_required', '这个编排 Bot 没设默认目录，请先选项目');
+    if (!this.deps.projects.candidates().some((candidate) => candidate.path === requested)) {
+      throw err('project_not_allowed', '所选项目不在这个编排 Bot 的仓库列表里（和飞书仓库选择卡同一份）');
+    }
+    return requested;
+  }
+
+  /** Where the draft's next clarify session opens, recorded on the draft (the
+   *  caller writes it): its project; a draft from before projects takes the
+   *  orchestrator's default dir, else `requested` as on creation. */
+  private reopenProject(draft: WorkflowDraftRecord, requested?: unknown): string {
+    if (draft.projectDir) {
+      if (requested !== undefined && requested !== draft.projectDir) {
+        throw err('project_not_allowed', `这个草稿的项目是 ${draft.projectDir}，不能再换`);
+      }
+      return draft.projectDir;
+    }
+    if (requested === undefined && !this.deps.projects.defaultDir()) {
+      throw err('project_required', '这个草稿还没有项目，编排 Bot 也没设默认目录：请先选项目再点「继续」');
+    }
+    draft.projectDir = this.chooseProject(requested);
+    return draft.projectDir;
+  }
+
   // ── public operations ──
 
-  /** 新建草稿 (§4.1): a grill run without a chat binding + its clarify session. */
-  async create(initiator: WorkflowDraftInitiator, input: { goal: unknown }): Promise<WorkflowDraftView> {
+  /** 新建草稿 (§4.1): a grill run without a chat binding + its clarify session,
+   *  in `project` (see {@link chooseProject}). */
+  async create(initiator: WorkflowDraftInitiator, input: { goal: unknown; project?: unknown }): Promise<WorkflowDraftView> {
     const goal = typeof input.goal === 'string' ? input.goal.trim() : '';
     if (!goal) throw err('bad_request', '目标不能为空');
     if (goal.length > MAX_GOAL_CHARS) throw err('bad_request', `目标最多 ${MAX_GOAL_CHARS} 个字符`);
@@ -1503,6 +1593,7 @@ export class WorkflowDraftService {
     if (why) throw err('orchestrator_ineligible', `这个 Bot 不能编排工作流：${why}`);
     // The same rule that keeps the steward off the Architect roster.
     if (isStewardBot(bot.steward)) throw err('orchestrator_ineligible', '管家 Bot 不能当编排 Bot');
+    const projectDir = this.chooseProject(input.project);
 
     const now = this.now();
     const { runId, runDir } = birthRun({
@@ -1522,6 +1613,7 @@ export class WorkflowDraftService {
       createdAt: at,
       updatedAt: at,
       version: 1,
+      projectDir,
       // The session slot is reserved from birth: a second tab's 「继续」 or
       // message waits for this create instead of starting a second session.
       clarify: { state: 'active', turns: [{ role: 'user', text: goal, at }], pending: this.reservationEntry(reservation) },
@@ -1532,8 +1624,8 @@ export class WorkflowDraftService {
       this.inflight.delete(reservation);
       throw error;
     }
-    this.log(`[workflow-draft] created ${runId} app=${this.deps.appId} initiator=${initiator.openId} source=${initiator.source}`);
-    await this.startSession(runId, buildDraftClarifyKickoff({ runId, goal }), clip(goal.replace(/\s+/g, ' '), 80), reservation);
+    this.log(`[workflow-draft] created ${runId} app=${this.deps.appId} initiator=${initiator.openId} source=${initiator.source} project=${projectDir}`);
+    await this.startSession(runId, buildDraftClarifyKickoff({ runId, goal }), clip(goal.replace(/\s+/g, ' '), 80), reservation, projectDir);
     return this.view(runId);
   }
 
@@ -1543,11 +1635,12 @@ export class WorkflowDraftService {
    * `/workflow run` rules — no clarify, no Architect: it stands at 待确认流程
    * (draft-born revision, I13) or 已确认流程 (from a finished run), and 拉群开始
    * runs as for any draft. `expectedRevisionId`: the revision the form was
-   * built from (a newer publish is refused, not run silently).
+   * built from (a newer publish is refused, not run silently). `project`: as
+   * on 新建 — where the main bot's session opens at 拉群开始.
    */
   async createFromTemplate(
     initiator: WorkflowDraftInitiator,
-    input: { workflowId: unknown; params?: unknown; expectedRevisionId?: unknown },
+    input: { workflowId: unknown; params?: unknown; expectedRevisionId?: unknown; project?: unknown },
   ): Promise<WorkflowDraftView> {
     const workflowId = typeof input.workflowId === 'string' ? input.workflowId : '';
     if (!/^wf_[0-9a-f]{32}$/.test(workflowId)) throw err('bad_request', 'workflowId 不合法');
@@ -1570,6 +1663,7 @@ export class WorkflowDraftService {
     const why = v3BotStaticExclusion(bot);
     if (why) throw err('orchestrator_ineligible', `这个 Bot 不能编排工作流：${why}`);
     if (isStewardBot(bot.steward)) throw err('orchestrator_ineligible', '管家 Bot 不能当编排 Bot');
+    const projectDir = this.chooseProject(input.project);
 
     const rawParams = Object.create(null) as Record<string, RawParamInput>;
     for (const [name, value] of Object.entries(params)) rawParams[name] = { kind: 'string', value };
@@ -1617,6 +1711,7 @@ export class WorkflowDraftService {
         createdAt: at,
         updatedAt: at,
         version: 1,
+        projectDir,
         clarify: { state: 'closed', turns: [] },
         flowRevision: 0,
         template: {
@@ -1655,10 +1750,11 @@ export class WorkflowDraftService {
    *
    * `larkAppId`: the orchestrating bot chosen on the page; absent, it is the
    * source's (the Dashboard routes there) and must be this daemon's.
+   * `project`: as on 新建 — where 「按新目标重新编排」 clarifies.
    */
   async createFromSource(
     initiator: WorkflowDraftInitiator,
-    input: { source: unknown; larkAppId?: unknown },
+    input: { source: unknown; larkAppId?: unknown; project?: unknown },
   ): Promise<WorkflowDraftView> {
     if (input.larkAppId !== undefined && input.larkAppId !== this.deps.appId) {
       throw err('bot_mismatch', '请求的编排 Bot 不是这个 daemon 的 Bot');
@@ -1684,6 +1780,7 @@ export class WorkflowDraftService {
     const why = v3BotStaticExclusion(bot);
     if (why) throw err('orchestrator_ineligible', `这个 Bot 不能编排工作流：${why}`);
     if (isStewardBot(bot.steward)) throw err('orchestrator_ineligible', '管家 Bot 不能当编排 Bot');
+    const projectDir = this.chooseProject(input.project);
     const roster = await this.plannedRoster(bots, this.deps.nameOf());
 
     const title = material.spec.title;
@@ -1759,6 +1856,7 @@ export class WorkflowDraftService {
         createdAt: at,
         updatedAt: at,
         version: 1,
+        projectDir,
         // No clarify session is copied; 「按新目标重新编排」 starts one.
         clarify: { state: 'disconnected', turns: [{ role: 'system', text: `复制自${what}`, at }] },
         flowRevision: 0,
@@ -1855,7 +1953,7 @@ export class WorkflowDraftService {
       throw err('bad_request', 'mode 只能是 text_only / rearchitect / reclarify');
     }
     const reservation = mode === 'reclarify' ? this.reserve() : undefined;
-    let kickoff: { prompt: string; title: string } | undefined;
+    let kickoff: { prompt: string; title: string; workingDir: string } | undefined;
     try {
       kickoff = this.mutate(runId, initiator, { baseVersion: input.baseVersion }, ({ draft, grill, runDir }) => {
         const copy = this.assertCopy(draft, '改目标');
@@ -1865,6 +1963,7 @@ export class WorkflowDraftService {
         const at = this.now().toISOString();
         if (mode === 'reclarify') {
           if (draft.clarify.pending) throw err('clarify_turn_running', '上一轮还没回复');
+          const workingDir = this.reopenProject(draft);
           const copiedSpecMarkdown = readTextOrUndefined(grill.specPath);
           // The grill moves first: a refusal there leaves the copy as it was.
           // The copied flow is dropped in the same write as the rest; a crash
@@ -1881,6 +1980,7 @@ export class WorkflowDraftService {
             result: {
               prompt: buildDraftCopyClarifyKickoff({ runId, goal, ...(copiedSpecMarkdown ? { copiedSpecMarkdown } : {}) }),
               title: clip(goal.replace(/\s+/g, ' '), 80),
+              workingDir,
             },
           };
         }
@@ -1929,7 +2029,7 @@ export class WorkflowDraftService {
       if (reservation) this.inflight.delete(reservation);
       throw error;
     }
-    if (kickoff && reservation) await this.startSession(runId, kickoff.prompt, kickoff.title, reservation);
+    if (kickoff && reservation) await this.startSession(runId, kickoff.prompt, kickoff.title, reservation, kickoff.workingDir);
     return this.view(runId);
   }
 
@@ -2275,10 +2375,12 @@ export class WorkflowDraftService {
   }
 
   /** 「继续」(§9): replace a session that cannot be resumed with a new one,
-   *  carrying the spec so far and the last turns. */
-  async continueClarify(runId: string, initiator: WorkflowDraftInitiator, input: { baseVersion?: number } = {}): Promise<WorkflowDraftView> {
+   *  carrying the spec so far and the last turns, in the draft's project.
+   *  `project`: a draft from before projects whose orchestrator has no
+   *  default dir picks one here (checked as on 新建). */
+  async continueClarify(runId: string, initiator: WorkflowDraftInitiator, input: { baseVersion?: number; project?: unknown } = {}): Promise<WorkflowDraftView> {
     const reservation = this.reserve();
-    let prior: { old: { sessionId?: string; headlessId?: string }; prompt: string; title: string };
+    let prior: { old: { sessionId?: string; headlessId?: string }; prompt: string; title: string; workingDir: string };
     try {
       prior = this.mutate(runId, initiator, { baseVersion: input.baseVersion }, ({ draft, grill }) => {
         this.assertNoLaunch(draft, '继续对话');
@@ -2286,6 +2388,7 @@ export class WorkflowDraftService {
         this.assertStatus(grill, ['grilling', 'spec_ready'], '继续对话');
         if (draft.clarify.pending) throw err('clarify_turn_running', '上一轮还没回复');
         if (draft.clarify.sessionId && this.suspending.has(draft.clarify.sessionId)) throw err('busy', '会话正在释放空闲进程，请稍后重试');
+        const workingDir = this.reopenProject(draft, input.project);
         const old = { sessionId: draft.clarify.sessionId, headlessId: draft.clarify.headlessId };
         const specMarkdown = readTextOrUndefined(grill.specPath) ?? draft.clarify.specCandidate?.markdown;
         const prompt = buildDraftClarifyResume({ runId, goal: draft.goal, specMarkdown, turns: draft.clarify.turns });
@@ -2294,14 +2397,14 @@ export class WorkflowDraftService {
         delete draft.clarify.sessionId;
         delete draft.clarify.headlessId;
         delete draft.failure;
-        return { changed: true, result: { old, prompt, title: clip(draft.goal.replace(/\s+/g, ' '), 80) } };
+        return { changed: true, result: { old, prompt, title: clip(draft.goal.replace(/\s+/g, ' '), 80), workingDir } };
       });
     } catch (error) {
       this.inflight.delete(reservation);
       throw error;
     }
     await this.closeOrRemember(runId, prior.old);
-    await this.startSession(runId, prior.prompt, prior.title, reservation);
+    await this.startSession(runId, prior.prompt, prior.title, reservation, prior.workingDir);
     return this.view(runId);
   }
 
@@ -2391,6 +2494,10 @@ export class WorkflowDraftService {
       const token = same?.token ?? randomUUID();
       const state = sessions.length === 0 ? 'ready' as const : 'closing' as const;
       if (state === 'ready' && draft.clarify.state !== 'closed') draft.clarify.state = 'disconnected';
+      // A draft from before projects goes to the new bot with the project it
+      // was clarified in here, this bot's default dir (when it has one).
+      const sourceDir = draft.projectDir ? undefined : this.deps.projects.defaultDir();
+      if (sourceDir) draft.projectDir = sourceDir;
       draft.handoff = { toAppId, token, state, at: same?.at ?? this.now().toISOString() };
       return { changed: true, result: { token, sessions } };
     });
@@ -2450,7 +2557,7 @@ export class WorkflowDraftService {
     if (!/^[0-9a-f-]{36}$/.test(token)) throw err('bad_request', 'token 不合法');
     const runDir = this.runDirOf(runId);
     const reservation = this.reserve();
-    let next: { prompt?: string; title: string; fromAppId: string } | undefined;
+    let next: { prompt?: string; workingDir?: string; title: string; fromAppId: string } | undefined;
     try {
       next = withWorkflowDraftLock(runDir, runId, () => {
         if (!isWorkflowDraftDir(runDir)) throw err('unknown_draft', `没有这个草稿：${runId}`);
@@ -2527,16 +2634,25 @@ export class WorkflowDraftService {
             + (confirmedBy ? '；「确认需求」的确认人已改为新编排 Bot 下的发起人身份' : ''),
           at,
         });
-        if (prompt) draft.clarify.pending = this.reservationEntry(reservation);
+        // The new bot clarifies in the draft's project. A draft from before
+        // projects takes this bot's default dir, or waits for 「继续」 with a
+        // project picked.
+        if (!draft.projectDir) {
+          const dir = this.deps.projects.defaultDir();
+          if (dir) draft.projectDir = dir;
+        }
+        const workingDir = draft.projectDir;
+        if (prompt && workingDir) draft.clarify.pending = this.reservationEntry(reservation);
+        else if (prompt) draft.clarify.error = '这个草稿还没有项目，新的编排 Bot 也没设默认目录：选好项目后点「继续」';
         this.persist(runDir, draft);
-        return { ...(prompt ? { prompt } : {}), title: clip(draft.goal.replace(/\s+/g, ' '), 80), fromAppId };
+        return { ...(prompt && workingDir ? { prompt, workingDir } : {}), title: clip(draft.goal.replace(/\s+/g, ' '), 80), fromAppId };
       });
     } catch (error) {
       this.inflight.delete(reservation);
       throw this.mapError(error);
     }
     if (next) this.log(`[workflow-draft] handoff of ${runId} accepted: ${next.fromAppId} → ${this.deps.appId}`);
-    if (next?.prompt) await this.startSession(runId, next.prompt, next.title, reservation);
+    if (next?.prompt && next.workingDir) await this.startSession(runId, next.prompt, next.title, reservation, next.workingDir);
     else this.inflight.delete(reservation);
     return this.view(runId);
   }
@@ -3215,6 +3331,14 @@ export class WorkflowDraftService {
             throw err('unresolved_params', '流程里还有参数没换成具体内容：先「存为模板」再带参数运行，或把这些参数改成具体文字', left);
           }
         }
+        // A template run opens the main bot's session in its project at the
+        // move into the main topic: one prepared before projects takes the
+        // bot's default dir — settled before any group exists.
+        if (draft.template && !draft.projectDir) {
+          const dir = this.deps.projects.defaultDir();
+          if (!dir) throw err('project_required', '这个草稿建于加项目之前，主 Bot 也没设默认目录：请回模板页重新运行（运行时选项目）');
+          draft.projectDir = dir;
+        }
         const marker = launchMarker(runId);
         if (!marker) throw err('state_conflict', `runId ${runId} 没有随机段，无法给群名加标记`);
         // I7: the platform login joins by union_id, a local login as the bot
@@ -3719,7 +3843,7 @@ export class WorkflowDraftService {
    */
   private async openTemplateRunSession(runId: string, token: string): Promise<boolean> {
     const reservation = this.reserve();
-    type Plan = { prompt: string; title: string } | 'ready' | 'busy';
+    type Plan = { prompt: string; title: string; workingDir: string } | 'ready' | 'busy' | 'no_project';
     let plan: Plan;
     let stale: { sessionId: string; headlessId?: string } | undefined;
     try {
@@ -3728,6 +3852,10 @@ export class WorkflowDraftService {
         if (!template || launch.migrate?.status === 'binding') return { changed: false, result: 'ready' as const };
         if (draft.clarify.sessionId && draft.clarify.state !== 'disconnected') return { changed: false, result: 'ready' as const };
         if (draft.clarify.pending) return { changed: false, result: 'busy' as const };
+        // Settled at 拉群开始; a launch begun before projects takes the default dir now.
+        const workingDir = draft.projectDir ?? this.deps.projects.defaultDir();
+        if (!workingDir) return { changed: false, result: 'no_project' as const };
+        draft.projectDir = workingDir;
         if (draft.clarify.sessionId) {
           // Created, but its first turn did not go in: not relayable as is.
           stale = { sessionId: draft.clarify.sessionId, ...(draft.clarify.headlessId ? { headlessId: draft.clarify.headlessId } : {}) };
@@ -3741,6 +3869,7 @@ export class WorkflowDraftService {
           result: {
             prompt: buildTemplateRunSessionPrompt({ runId, displayName: template.displayName, humanVersion: template.humanVersion, params: template.params }),
             title: clip(template.displayName.replace(/\s+/g, ' '), 80),
+            workingDir,
           },
         };
       });
@@ -3753,16 +3882,20 @@ export class WorkflowDraftService {
       this.inflight.delete(reservation);
       throw error;
     }
-    if (plan === 'ready' || plan === 'busy') {
+    if (plan === 'ready' || plan === 'busy' || plan === 'no_project') {
       this.inflight.delete(reservation);
       if (plan === 'busy') {
         this.stopLaunch(runId, token, { step: 'migrate', code: 'session_busy', retryable: true, message: '主 Bot 的会话正在处理上一步，请稍后点「继续」' });
         return false;
       }
+      if (plan === 'no_project') {
+        this.stopLaunch(runId, token, { step: 'migrate', code: 'project_required', retryable: true, message: '主 Bot 没设默认目录，这个草稿也没有项目：给主 Bot 设好默认目录后点「继续」' });
+        return false;
+      }
       return true;
     }
     if (stale) await this.closeOrRemember(runId, stale);
-    await this.startSession(runId, plan.prompt, plan.title, reservation);
+    await this.startSession(runId, plan.prompt, plan.title, reservation, plan.workingDir);
     const opened = this.launchTx(runId, token, ({ draft }) => ({
       changed: false,
       result: draft.clarify.sessionId && draft.clarify.state !== 'disconnected'
@@ -4714,6 +4847,7 @@ export class WorkflowDraftService {
       updatedAt,
       stale: now.getTime() - Date.parse(updatedAt) >= WORKFLOW_DRAFT_STALE_MS,
       ...(draft.abandonedAt ? { abandonedAt: draft.abandonedAt } : {}),
+      project: this.projectView(draft),
       clarify: {
         state: draft.clarify.state,
         pending: !!draft.clarify.pending,
@@ -4753,6 +4887,19 @@ export class WorkflowDraftService {
         ...(newerPublished ? { newerPublished } : {}),
       } } : {}),
       ...(copyView ? { copy: copyView } : {}),
+    };
+  }
+
+  private projectView(draft: WorkflowDraftRecord): NonNullable<WorkflowDraftView['project']> {
+    if (draft.projectDir) return { dir: draft.projectDir, from: 'draft' };
+    let sessionDir: string | undefined;
+    try {
+      sessionDir = draft.clarify.sessionId ? this.deps.projects.sessionDir?.(draft.clarify.sessionId) : undefined;
+    } catch { sessionDir = undefined; }
+    const defaultDir = this.deps.projects.defaultDir();
+    return {
+      ...(sessionDir ? { dir: sessionDir, from: 'session' as const } : defaultDir ? { dir: defaultDir, from: 'default' as const } : {}),
+      ...(defaultDir ? {} : { required: true as const }),
     };
   }
 

@@ -24,6 +24,8 @@ export const DOC = 'cli_doc';
 export const OFFLINE = 'cli_off';
 export const STEWARD = 'cli_steward';
 export const PI = 'cli_pi';
+/** The default dir every fake orchestrator has unless a test says otherwise. */
+export const DEFAULT_PROJECT = '/work/main-repo';
 
 export const BOTS = [
   { larkAppId: MAIN, larkAppSecret: 's-main', name: 'main', cliId: 'claude-code' },
@@ -126,9 +128,11 @@ export function fakeClarifier() {
   const suspended: string[] = [];
   const order: string[] = [];
   const controls = { createError: undefined as string | undefined, closeError: undefined as string | undefined, creates: 0, closes: [] as string[] };
+  const createInputs: Array<Parameters<DraftClarifier['create']>[0]> = [];
   const clarifier: DraftClarifier = {
-    async create() {
+    async create(input) {
       controls.creates += 1;
+      createInputs.push(input);
       if (controls.createError) return { ok: false, error: controls.createError };
       n += 1;
       const sessionId = `sess-${n}`;
@@ -189,6 +193,8 @@ export function fakeClarifier() {
     /** close() throws this (undefined: works again). */
     set closeError(value: string | undefined) { controls.closeError = value; },
     get creates() { return controls.creates; },
+    /** What each create() was asked for (bot, title, working dir), in order. */
+    get createInputs() { return createInputs; },
     get closes() { return controls.closes; },
   };
 }
@@ -225,6 +231,7 @@ export function makeService(baseDir: string, overrides: Partial<WorkflowDraftSer
     nameOf: () => (appId) => NAMES[appId] ?? appId,
     isDaemonOnline: (appId) => online.has(appId),
     clarifier: clarify.clarifier,
+    projects: { defaultDir: () => DEFAULT_PROJECT, candidates: () => [] },
     runArchitect: architect.run,
     randomSuffix: () => (suffix += 1).toString(16).padStart(8, '0'),
     ...overrides,
