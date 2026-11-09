@@ -34,6 +34,7 @@ export type FeedbackStore = AsyncMethods<Pick<SkillFeedbackStore,
   | 'findDeliveryByPlatformMessage' | 'findDeliveryById' | 'listSubjectDeliveries' | 'recordFeedback' | 'listFeedbackRevisions'
   | 'getLatestFeedback' | 'listTurnCompletionEvents' | 'listFeedbackEvents' | 'readFeedbackEventsAfter'
   | 'listFeedbackOutbox' | 'claimFeedbackOutbox' | 'tryClaimFeedbackOutbox'
+  | 'startFeedbackOutboxRequest' | 'tryStartFeedbackOutboxRequest'
   | 'settleFeedbackOutboxDelivered' | 'trySettleFeedbackOutboxDelivered'
   | 'rescheduleFeedbackOutbox' | 'tryRescheduleFeedbackOutbox'
   | 'resetExpiredFeedbackOutboxClaims' | 'tryResetExpiredFeedbackOutboxClaims'

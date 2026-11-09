@@ -103,6 +103,7 @@ describe('feedback webhook attempt contract', () => {
   it('releases a claim that completes after hard stop without dispatching or inventing an unknown outcome', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-late-claim-')); dirs.push(dir);
     const db = await SkillFeedbackStore.open(dir);
+    const blocker = await SkillFeedbackStore.open(dir);
     db.recordTurnTerminal({ botAppId: 'app', sessionId: 's', turnId: 't', status: 'completed' });
     db.recordTurnDelivery({
       botAppId: 'app', sessionId: 's', turnId: 't', platform: 'lark', platformAppId: 'app', platformMessageId: 'm',
@@ -113,6 +114,7 @@ describe('feedback webhook attempt contract', () => {
     const original = db.tryClaimFeedbackOutbox.bind(db);
     vi.spyOn(db, 'tryClaimFeedbackOutbox').mockImplementation(async input => {
       const result = original(input);
+      (blocker as any).db.exec('BEGIN IMMEDIATE');
       claimed.resolve();
       await release.promise;
       return result;
@@ -126,10 +128,16 @@ describe('feedback webhook attempt contract', () => {
       await dispatcher.stop(0);
       release.resolve();
       await dispatcher.ready;
+      (blocker as any).db.exec('COMMIT');
+      db.resetExpiredFeedbackOutboxClaims(Date.now() + 1000, 0);
       expect(db.listFeedbackOutbox()).toMatchObject([{ status: 'pending', lastError: 'webhook_stopped_before_request' }]);
       await beginFeedbackMaintenance(dir, 'late-claim');
       await expect(freezeFeedbackSource(dir, 'late-claim')).resolves.toBeUndefined();
-    } finally { release.resolve(); await dispatcher.stop(0); db.close(); }
+    } finally {
+      release.resolve(); await dispatcher.stop(0);
+      try { (blocker as any).db.exec('ROLLBACK'); } catch {}
+      blocker.close(); db.close();
+    }
   });
 
   it('retries a failed storage bootstrap and delivers pending events without restarting', async () => {

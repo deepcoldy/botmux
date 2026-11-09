@@ -176,6 +176,14 @@ export function startFeedbackWebhookDispatcher(options: {
         try {
           const secret = options.readSecret(row.destination.secretRef);
           if (!secret) { await store!.tryRescheduleFeedbackOutbox(row.outboxId, claimToken, { now, nextAttemptAt: now, error: 'webhook_secret_missing', permanent: true }); return; }
+          const started = await store!.tryStartFeedbackOutboxRequest(row.outboxId, claimToken);
+          if (!started.done || !started.changed) return;
+          if (controller.signal.aborted) {
+            await store!.tryRescheduleFeedbackOutbox(row.outboxId, claimToken, {
+              now, nextAttemptAt: now, error: 'webhook_stopped_before_request', permanent: false,
+            });
+            return;
+          }
           const result = await dispatch({ destination: row.destination, event: row.event, secret, allowPrivateNetworks: options.allowPrivateNetworks, signal: controller.signal });
           if (result.kind === 'delivered') { await store!.trySettleFeedbackOutboxDelivered(row.outboxId, claimToken, result.status ?? 200, new Date().toISOString()); return; }
           const delay = result.kind === 'retry' ? computeRetryDelay({ attempts: row.attempts, retryAfter: result.retryAfter }) : 0;

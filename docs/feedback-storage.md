@@ -104,6 +104,15 @@ For a verified empty installation, run `botmux feedback storage enable-empty --y
 
 ## Migrate existing feedback
 
+Webhook claims persist a request-stage marker in existing outbox error metadata.
+A claim abandoned before request admission can be recovered as known-unsent,
+including when SQLite contention prevents its immediate release. Admission
+updates that marker before starting transport; a crash afterward remains
+conservatively unknown. Previous unknown outcomes are preserved through claim,
+admission and successful delivery. No new tables or schema migration are needed,
+but all processes sharing the backend must use this version before relying on
+the request-stage distinction; old workers retain conservative unknown recovery.
+
 Upgrade every process sharing the data directory first. Schedule a maintenance window: new turns and sends are paused, existing work and persistence must finish, and unknown webhook/send outcomes prevent migration.
 
 ```bash
