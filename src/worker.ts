@@ -32916,7 +32916,9 @@ function _wbOpenQuickSheet(opts){
     var form=s.body.querySelector('.wb-qc-form');if(!form)return;
     var inputs=form.querySelectorAll('input[type="text"]');
     var send=inputs[0]?inputs[0].value:'';
-    if(!send)return;
+    // 发送内容被清空时连同草稿一起清掉：否则上一次重画存下的旧草稿会在本次重画里回填，
+    // 用户已经删掉的字又回到输入框。
+    if(!send){draft=null;return;}
     var enter=form.querySelector('input[type="checkbox"]');
     draft={send:send,label:inputs[1]?inputs[1].value:'',hint:inputs[2]?inputs[2].value:'',
       enter:enter?enter.checked:true};

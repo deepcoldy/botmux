@@ -868,4 +868,26 @@ setInterval(() => {}, 1_000);
     await closeSheet();
     rmSync(settingsPath(), { force: true });
   });
+
+  it('用户清空新增表单后再排序或删除，旧草稿不会被回填回来', async () => {
+    rmSync(settingsPath(), { force: true });
+    await openPage();
+    await page.tap('#mobile-cmds');
+    await expect.poll(sheetOpen).toBe(true);
+    await page.tap('#wb-sheet-actions .wb-sheet-text-btn');
+    const sendInput = page.locator('.wb-qc-form input[type="text"]').nth(0);
+    // 先填内容并下移一次：草稿被存下、重画后回填（默认列表首行 /rewind 下移后变成 /compact）。
+    await sendInput.fill('/x-draft');
+    await page.locator('.wb-qc-row').nth(0).locator('button[aria-label^="下移"]').tap();
+    await expect.poll(() => page.locator('.wb-qc-row-main').nth(0).textContent()).toContain('/compact');
+    expect(await sendInput.inputValue()).toBe('/x-draft');
+    // 用户主动清空输入框，再删除当前首行：行数 7→6，确认又一次重画已发生。
+    await sendInput.fill('');
+    await page.locator('.wb-qc-row').nth(0).locator('button[aria-label^="删除"]').tap();
+    await expect.poll(() => page.locator('.wb-qc-row').count()).toBe(6);
+    // 清空就是清空：旧草稿不能在这次重画里被填回来。
+    expect(await sendInput.inputValue()).toBe('');
+    await closeSheet();
+    rmSync(settingsPath(), { force: true });
+  });
 });
