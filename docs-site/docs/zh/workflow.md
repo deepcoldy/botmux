@@ -386,9 +386,14 @@ botmux goal run "整理 docs/ 下的过期链接，输出一份清单" --run-id 
 | `--bot <id\|name>` | 用哪个 Bot（填 App ID 或名字）；不填用 `bots.json` 里的第一个 |
 | `--working-dir <目录>` | 在哪个目录跑；不填用这个 Bot 的默认工作目录 |
 | `--timeout <秒>` | 总时限，最多 14370 秒；到点按取消处理。不填时按节点默认超时（30 分钟） |
-| `--json` | 结束时在 stdout 输出一行 JSON 结果（`schemaVersion` 为 `botmux.goal-run-result/v1`），含 `state`、`summary`、`artifacts`、`error` |
+| `--codex-home <绝对路径>` | 自己准备好的 Codex 配置目录（`CODEX_HOME`），这次 run 用它的凭据和配置；必须和 `--model`、`--reasoning-effort` 一起传 |
+| `--model <模型>` | 这次 run 用的 Codex 模型，覆盖 Bot 和目录里的默认值 |
+| `--reasoning-effort <档位>` | `low`、`medium`、`high`、`xhigh`、`max` 或 `ultra`，必须是该模型支持的档位 |
+| `--json` | 结束时在 stdout 输出一行 JSON 结果（`schemaVersion` 为 `botmux.goal-run-result/v1`），含 `state`、`summary`、`artifacts`、`error`，以及 `runtime`（CLI 实际上报的模型和档位，上报了才有） |
 
 它只有一个节点，没有审批卡，也不发飞书消息；执行方式和临时进程节点一样，所以只支持上面「限制」里列的 CLI。数据同样落在 `~/.botmux/v3-runs/<runId>`。
+
+**指定 Codex 配置目录、模型和档位**：三个参数要一起传，只支持没有 wrapper、没开沙箱的 Codex Bot。目录必须属于当前用户、权限 0700，写真实路径（路径上不能经过软链）；`config.toml` 是 0600 的普通文件；`auth.json` 可以是指向一份共享凭据的软链，但指向的文件必须是当前用户的 0600 普通文件，且里面有凭据。有一条不满足，或模型不支持这个档位，开跑前就以 `RUN_AUTHORIZATION_FAILED` 拒绝。结束时 botmux 会比对 Codex 实际用的模型和档位：对不上返回 `GOAL_RUNTIME_MISMATCH`，一直没上报返回 `GOAL_RUNTIME_UNVERIFIED`，两种都算失败（退出码 10）。
 
 **结果看退出码**：
 
@@ -401,7 +406,7 @@ botmux goal run "整理 docs/ 下的过期链接，输出一份清单" --run-id 
 | 13 | `conflict` | run-id 冲突，或这个 run 正由别的进程在跑 |
 | 14 | `error` | 参数错误、未开 Workflow、没配 Bot 等 |
 
-**同一个 `--run-id` 再跑一次**，参数要和第一次完全一样（目标、`--bot`、`--working-dir`、`--timeout`）：
+**同一个 `--run-id` 再跑一次**，参数要和第一次完全一样（目标、`--bot`、`--working-dir`、`--timeout`、`--codex-home`、`--model`、`--reasoning-effort`）：
 
 - 已经结束的 run：不会重跑，直接返回当时的结果和退出码。即使 `bots.json` 后来改了或删了也一样。
 - 没结束的 run（比如进程崩了、机器重启）：从断点接着跑，沿用第一次定下的 Bot、目录和设置，不会按当前配置重新挑；但仍需要 `bots.json` 里有这个 Bot 的凭据。

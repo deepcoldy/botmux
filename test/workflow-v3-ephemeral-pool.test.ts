@@ -417,6 +417,160 @@ describe('v3 ephemeral pool', () => {
     await promise;
   });
 
+  it('passes a goal-scoped Codex runtime to worker init and attests the observed runtime', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const req = request();
+    req.botSnapshot.cliId = 'codex';
+    req.botSnapshot.model = 'gpt-6.1-sol';
+    req.botSnapshot.reasoningEffort = 'xhigh';
+    req.botSnapshot.cliInstanceBinding = {
+      version: 1,
+      source: 'goal',
+      instanceId: null,
+      cliId: 'codex',
+      codexHome: '/private/codex-verifier',
+      authMode: 'shared',
+    };
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await worker.waitForInit();
+    expect(worker.init).toMatchObject({
+      cliId: 'codex',
+      model: 'gpt-6.1-sol',
+      reasoningEffort: 'xhigh',
+      cliInstanceBinding: { source: 'goal', codexHome: '/private/codex-verifier' },
+    });
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'active_runtime', model: 'gpt-6.1-sol', reasoningEffort: 'xhigh' });
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+
+    await expect(promise).resolves.toMatchObject({
+      status: 'ok',
+      runtime: {
+        cliId: 'codex',
+        source: 'worker-active-runtime',
+        model: 'gpt-6.1-sol',
+        reasoningEffort: 'xhigh',
+        codexHome: '/private/codex-verifier',
+      },
+    });
+  });
+
+  it('fails a goal-scoped Codex run when the worker reports a different runtime', async () => {
+    const worker = new ScriptedWorker();
+    const req = request();
+    req.botSnapshot.cliId = 'codex';
+    req.botSnapshot.model = 'gpt-6.1-sol';
+    req.botSnapshot.reasoningEffort = 'high';
+    req.botSnapshot.cliInstanceBinding = {
+      version: 1,
+      source: 'goal',
+      instanceId: null,
+      cliId: 'codex',
+      codexHome: '/private/codex-repairer',
+      authMode: 'shared',
+    };
+    const pool = createEphemeralPool({
+      factory: factoryFor(worker),
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'active_runtime', model: 'gpt-5.6-sol', reasoningEffort: 'high' });
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+
+    await expect(promise).resolves.toMatchObject({
+      status: 'fail',
+      error: { code: 'GOAL_RUNTIME_MISMATCH', message: expect.stringContaining('gpt-5.6-sol/high') },
+      runtime: { model: 'gpt-5.6-sol', reasoningEffort: 'high' },
+    });
+  });
+
+  function goalBoundRun(worker: ScriptedWorker) {
+    const req = request();
+    req.botSnapshot.cliId = 'codex';
+    req.botSnapshot.model = 'gpt-6.1-sol';
+    req.botSnapshot.reasoningEffort = 'xhigh';
+    req.botSnapshot.cliInstanceBinding = {
+      version: 1,
+      source: 'goal',
+      instanceId: null,
+      cliId: 'codex',
+      codexHome: '/private/codex-goal',
+      authMode: 'shared',
+    };
+    const pool = createEphemeralPool({
+      factory: factoryFor(worker),
+      workerPath: '/tmp/worker.js',
+      quiesceMs: 1,
+      resolveLarkAppSecret: () => 'secret',
+    });
+    return pool.runNode(req);
+  }
+
+  it('fails an otherwise successful goal-scoped Codex run that never attested its runtime', async () => {
+    const worker = new ScriptedWorker();
+    const promise = goalBoundRun(worker);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+
+    const result = await promise;
+    expect(result).toMatchObject({ status: 'fail', error: { code: 'GOAL_RUNTIME_UNVERIFIED' } });
+    expect(result.runtime).toBeUndefined();
+  });
+
+  it('fails a goal-scoped Codex run whose observed reasoning effort differs', async () => {
+    const worker = new ScriptedWorker();
+    const promise = goalBoundRun(worker);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'active_runtime', model: 'gpt-6.1-sol', reasoningEffort: 'medium' });
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+
+    await expect(promise).resolves.toMatchObject({
+      status: 'fail',
+      error: { code: 'GOAL_RUNTIME_MISMATCH', message: expect.stringContaining('gpt-6.1-sol/medium') },
+    });
+  });
+
+  it('keeps a goal-scoped worker failure instead of reporting it as an unverified runtime', async () => {
+    const worker = new ScriptedWorker();
+    const promise = goalBoundRun(worker);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'error', message: 'Codex instance routing does not support sandbox/readIsolation' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(1);
+
+    const result = await promise;
+    expect(result.status).toBe('fail');
+    expect(result.error).toBeUndefined();
+  });
+
   it('does not carry the PM2 graceful-exit sentinel into the ephemeral worker env', async () => {
     // The v3 ephemeral worker forks straight from the daemon (not via
     // workerForkEnv), so the daemon's PM2 graceful-exit sentinel would ride

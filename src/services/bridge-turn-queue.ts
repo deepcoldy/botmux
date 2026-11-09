@@ -178,6 +178,13 @@ export interface BridgePendingTurn {
    *  being observable. The record that binds the mark follows right behind, so
    *  the normal TTL runs again from here. */
   cliQueueReleasedAtMs?: number;
+  /** The worker is still typing / submitting this input. A mark is not
+   *  stranded while its own write is running: under tmux overload a long
+   *  chunked write can outlast the TTL, and expiring it then would leave the
+   *  reply that follows the eventual submit without a Lark turn. */
+  writeInFlight?: boolean;
+  /** When that write settled; the TTL runs from here like from a queue release. */
+  writeSettledAtMs?: number;
   /** Last prune at which an earlier turn was still running when this mark was
    *  pending. Claude Code persists the queue records of type-ahead input only
    *  when the running turn next writes to its transcript (observed: enqueue
@@ -575,6 +582,22 @@ export class BridgeTurnQueue {
     return dropped;
   }
 
+  /** Hold one exact unstarted mark while the worker writes its input. */
+  holdForWrite(turnId: string, dispatchAttempt?: number): void {
+    const turn = this.queue.find(t =>
+      t.turnId === turnId && t.dispatchAttempt === dispatchAttempt && !t.started);
+    if (turn) turn.writeInFlight = true;
+  }
+
+  /** The write of a held mark settled: its TTL starts now. */
+  releaseWriteHold(turnId: string, dispatchAttempt?: number, now: number = Date.now()): void {
+    const turn = this.queue.find(t =>
+      t.turnId === turnId && t.dispatchAttempt === dispatchAttempt && t.writeInFlight);
+    if (!turn) return;
+    turn.writeInFlight = undefined;
+    turn.writeSettledAtMs = now;
+  }
+
   /** Sweep pending (unstarted) turns whose mark is older than `maxAgeMs`.
    *  Returns the dropped turns for logging. Belt-and-braces backstop for
    *  any future code path that leaves an unstarted mark stranded — without
@@ -583,8 +606,9 @@ export class BridgeTurnQueue {
    *  never expired here: once Claude actually wrote the user line, the
    *  turn is collecting assistant text and we want to wait however long
    *  the model takes. The same goes for a mark whose input Claude holds in its
-   *  own queue, or that was written while an earlier turn is still running,
-   *  up to {@link CLI_QUEUE_HOLD_MAX_MS}. */
+   *  own queue, up to {@link CLI_QUEUE_HOLD_MAX_MS}, for one whose input
+   *  the worker is still writing ({@link holdForWrite}), or that was written
+   *  while an earlier turn is still running. */
   pruneExpired(maxAgeMs: number, now: number = Date.now()): BridgePendingTurn[] {
     const dropped: BridgePendingTurn[] = [];
     // An earlier turn is still running: type-ahead input waits behind it.
@@ -592,9 +616,16 @@ export class BridgeTurnQueue {
     this.queue = this.queue.filter(t => {
       if (t.started) return true;
       if (t.markTimeMs === undefined) return true;
+      if (t.writeInFlight) return true;
       if (isHeldInCliQueue(t) && now - t.cliQueuedAtMs! <= CLI_QUEUE_HOLD_MAX_MS) return true;
       if (busy && now - t.markTimeMs <= CLI_QUEUE_HOLD_MAX_MS) { t.heldWhileBusyAtMs = now; return true; }
-      if (now - Math.max(t.markTimeMs, t.cliQueueReleasedAtMs ?? 0, t.heldWhileBusyAtMs ?? 0) <= maxAgeMs) return true;
+      const ttlStartMs = Math.max(
+        t.markTimeMs,
+        t.cliQueueReleasedAtMs ?? 0,
+        t.writeSettledAtMs ?? 0,
+        t.heldWhileBusyAtMs ?? 0,
+      );
+      if (now - ttlStartMs <= maxAgeMs) return true;
       dropped.push(t);
       return false;
     });
