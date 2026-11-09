@@ -14,8 +14,9 @@ export interface CodexBrowserConfig {
   autoApproveOrigins?: true;
   /**
    * Trusted operator override for a Codex Chrome plugin checkout/cache root.
-   * The model never sees or controls this path. When omitted, Botmux discovers
-   * the standard plugin cache below CODEX_HOME (or ~/.codex).
+   * The model never sees or controls this path. When omitted, Botmux picks the
+   * newest complete plugin from the standard cache below CODEX_HOME (or
+   * ~/.codex) and the plugin bundled with the Codex/ChatGPT desktop app.
    */
   pluginRoot?: string;
 }
