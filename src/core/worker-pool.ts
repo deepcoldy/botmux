@@ -19995,6 +19995,10 @@ function setupWorkerHandlers(
         if (!ownsLifecycleMutation()) break;
         cliNotices.finish(msg.turnId, msg.dispatchAttempt);
         if (msg.sessionId !== ds.session.sessionId) break;
+        // A steered turn is merged into its successor and never gets a terminal
+        // of its own: this edge is its settlement. Tombstone it so a re-sent
+        // commit ACK for the same attempt cannot revive the obligation.
+        settleAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, true);
         handleCotThinkingSuperseded(ds, msg);
         if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
           void supersedeTurnReplyCard(ds, msg,

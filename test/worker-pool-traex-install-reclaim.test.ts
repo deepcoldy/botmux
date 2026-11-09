@@ -891,3 +891,36 @@ describe.skipIf(process.platform !== 'linux')('launch provenance with real proce
     expect(ds.pendingSuspendReason).toBeUndefined();
   });
 });
+
+describe('same-turn steer settlement', () => {
+  it('settles a steered turn on thinking_superseded so the merged terminal frees the reclaim', async () => {
+    const { entry, identity } = tempEntry('release-new');
+    const old = { ...identity, ino: `${Number(identity.ino) + 1}`, source: 'linux-proc-exe' as const };
+    const ds = makeDs({
+      localProcessAttestation: {
+        backendType: 'tmux', credentialIsolated: false, cliExe: old, cliInstallEntry: entry,
+        cliInstallAtSpawn: old, cliSpawnGeneration: 1,
+      },
+    });
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const flush = () => new Promise(resolve => setTimeout(resolve, 0));
+
+    // The bridge queue merged t1 into t2: t1 only gets thinking_superseded,
+    // and the merged answer is t2's terminal.
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_t1', dispatchAttempt: 1 });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_t2', dispatchAttempt: 1 });
+    worker.emit('message', { type: 'thinking_superseded', sessionId: ds.session.sessionId, turnId: 'om_t1', dispatchAttempt: 1 });
+    await flush();
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(false);
+
+    // A re-sent commit ACK for the steered attempt is a transport retry, not new work.
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_t1', dispatchAttempt: 1 });
+    worker.emit('message', { type: 'turn_terminal', turnId: 'om_t2', dispatchAttempt: 1, sessionId: ds.session.sessionId });
+    await flush();
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(true);
+
+    requestInstallChangeSuspend(ds, detail(entry, old, identity), { tryNow: true });
+    expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
+  });
+});
