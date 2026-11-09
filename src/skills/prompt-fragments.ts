@@ -248,6 +248,18 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     key: 'ai.credentials.never_forward', block: 'credentials', stage: 'new', kind: 'editable',
     label: '凭证：不得转发 / 落盘', gateLabel: '仅 trigger-user 鉴权会话',
   },
+  {
+    key: 'ai.credentials.on_auth_failure', block: 'credentials', stage: 'new', kind: 'editable',
+    label: '凭证：飞书鉴权失败处理流程', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内、且会话未启用飞书托管绑定时注入',
+  },
+  {
+    key: 'ai.credentials.on_auth_link', block: 'credentials', stage: 'new', kind: 'editable',
+    label: '凭证：stderr 已附授权链接时', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内、且会话未启用飞书托管绑定时注入',
+  },
+  {
+    key: 'ai.credentials.on_missing_scope', block: 'credentials', stage: 'new', kind: 'editable',
+    label: '凭证：missing_scope 补授权流程', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内、且会话未启用飞书托管绑定时注入',
+  },
 
   // ───────── cross-listed: 会话开始 + 每条新消息 (new + followup) ──────────
 

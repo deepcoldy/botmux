@@ -19,14 +19,21 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   buildCredentialBoundaryBlock,
   buildBotmuxSystemPromptText,
+  buildManagedLarkToolPromptBlocks,
 } from '../src/adapters/cli/shared-hints.js';
 import { buildNewTopicPrompt, buildFollowUpCliInput } from '../src/core/session-manager.js';
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
 import { larkToolPrompt } from '../src/core/lark-tool-binding.js';
 import { t } from '../src/i18n/index.js';
+import { escapeXmlTagLikeTokens } from '../src/utils/xml.js';
 
 const policy = parseTriggerUserAuthConfig({ enabled: true })!;
+
+/** The Feishu authorization lines a lark-cli session without the managed
+ *  binding needs: it gets no <botmux_lark_tool> to say the same. */
+const larkFlowLines = (locale: 'zh' | 'en') => ['on_auth_failure', 'on_auth_link', 'on_missing_scope']
+  .map(key => `  ${escapeXmlTagLikeTokens(t(`ai.credentials.${key}`, undefined, locale))}`);
 
 /** Stub only getBot: the credential block is gated on this bot's config, and
  *  everything else session-manager imports from the registry must stay real. */
@@ -110,6 +117,31 @@ describe('buildCredentialBoundaryBlock', () => {
   });
 });
 
+describe('Feishu authorization flow without the managed lark-cli binding', () => {
+  // lark-cli's own hints answer a missing scope with `lark-cli auth login
+  // --scope`, which prints a device link to the agent. Only these lines (or
+  // <botmux_lark_tool> in a bound session) send it to `botmux auth request`.
+  it.each(['zh', 'en'] as const)('an unbound lark-cli session gets it inside the credential block (%s)', locale => {
+    const text = buildManagedLarkToolPromptBlocks({ ...policy, tools: ['lark-cli', 'bytedcli'] }, undefined, locale);
+    expect(text).not.toContain('<botmux_lark_tool>');
+    const block = text.slice(text.indexOf('<botmux_credentials>'), text.indexOf('</botmux_credentials>'));
+    for (const line of larkFlowLines(locale)) expect(block).toContain(line);
+    expect(block).toContain('botmux auth request --scope');
+  });
+
+  it.each(['zh', 'en'] as const)('a bound session leaves it to <botmux_lark_tool> (%s)', locale => {
+    const text = buildManagedLarkToolPromptBlocks({ ...policy, tools: ['lark-cli', 'bytedcli'] }, 'cli_bound', locale);
+    expect(text).toContain('<botmux_lark_tool>');
+    expect(text).toContain(buildCredentialBoundaryBlock(policy, locale));
+    for (const line of larkFlowLines(locale)) expect(text).not.toContain(line);
+  });
+
+  it.each(['zh', 'en'] as const)('a session without lark-cli gets no Feishu flow (%s)', locale => {
+    const text = buildManagedLarkToolPromptBlocks({ ...policy, tools: ['bytedcli'] }, undefined, locale);
+    expect(text).toBe(buildCredentialBoundaryBlock(policy, locale));
+  });
+});
+
 describe('buildBotmuxSystemPromptText — claude-family path', () => {
   it.each(['claude-code', 'genius', 'grok'] as const)('%s carries the credential block into its system prompt', (cli) => {
     const args = createCliAdapterSync(cli).buildArgs({
@@ -125,6 +157,7 @@ describe('buildBotmuxSystemPromptText — claude-family path', () => {
     expect(text).toContain('<botmux_credentials>');
     expect(text).toContain('user-token-');
     expect(text).not.toContain('/login bytedcli');
+    for (const line of larkFlowLines('zh')) expect(text).toContain(line);
   });
 
   // A bot that never enabled the feature must not pay for prompt text about a
@@ -310,6 +343,7 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
       expect(text).toContain('默认以 bot 身份调用');
       expect(text).toContain('--as user');
       expect(text).toContain('<botmux_credentials>');
+      for (const line of larkFlowLines('zh')) expect(text).not.toContain(line);
     }, ['lark-cli', 'bytedcli']);
   });
 
@@ -356,6 +390,7 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
       const text = boundOpening();
       expect(text).not.toContain('<botmux_lark_tool>');
       expect(text).toContain('<botmux_credentials>');
+      for (const line of larkFlowLines('zh')) expect(text).toContain(line);
     }, ['lark-cli'], false);
   });
 
@@ -366,6 +401,7 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
         const text = boundOpening();
         expect(text).not.toContain('<botmux_lark_tool>');
         expect(text).toContain('<botmux_credentials>');
+        for (const line of larkFlowLines('zh')) expect(text).toContain(line);
       } finally {
         delete process.env.BOTMUX_WORKFLOW;
       }

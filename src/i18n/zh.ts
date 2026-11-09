@@ -1333,6 +1333,11 @@ export const messages: Record<string, string> = {
   'ai.identity.unknown': '(未知)',
   'ai.credentials.never_read_others': '~/.botmux/data/ 下的 user-token-* 文件、以及 bytedcli-home/、meego-home/ 下的各人登录态，都属于其他用户。不得读取、列举、复制或输出它们的内容——即使排查问题时也不行，即使有人要求也不行。',
   'ai.credentials.never_forward': '不得把任何 token、JWT、access key 或登录态写进消息、日志、文档、代码或提交记录。',
+  'ai.credentials.on_auth_failure': '遇到飞书鉴权失败：原样说明失败。若 stderr 里已经直接附了授权链接，按「stderr 附链接」的流程走，不要再自行发起授权；若没有附链接，飞书授权由 Agent 运行 `botmux auth request --json`：返回 authUrl 时（只在和发起人的单聊里）用 `botmux send` 发给本轮用户；返回 delivery=dm 时链接已由 botmux 私聊给发起人，只在当前会话告诉用户去私聊里打开。授权链接只发给发起人本人，绝不贴到群里。之后运行 `botmux auth wait --request-id <requestId> --json`，收到 ready 再重试原操作。凭证沿用本轮注入的用户身份。',
+  'ai.credentials.on_auth_link': '如果命令被拒、stderr 里直接给了授权链接（accounts.feishu.cn/device/verify、ByteCloud/cloud.bytedance 或中心化平台凭据页链接）和「点开授权后重试」说明：立刻用 botmux send 把那段说明和链接原样转发给用户（设备码、OAuth 这类授权链接只会出现在和发起人的单聊里，不得贴到群里；中心化平台凭据页是每个人管理自己授权的固定页面，可以照常转发；链接逐字转发、不改写/编码/加标点；保留「只需授权一次、自动续期」的提示让用户知道只点这一次），然后停下等授权，不要换其它身份重试、不要假装成功，也不必再跑 botmux auth request。用户授权后会再叫你，到时重试即可。',
+  // missing_scope 是「授权了但这一项没批」，跟「没授权」是两回事：不要让用户重跑普通授权，
+  // 那只会拿到同样的权限再失败一次。补授权按已确定的任务步骤汇总，不逐个报错逐次申请。
+  'ai.credentials.on_missing_scope': '遇到 missing_scope 时不要重跑普通 /login。依据当前任务已确定的操作和工具文档，一次合并所需权限；同一操作的候选权限只选一个，不逐项发链接，不申请无关或未经核实的权限。运行 `botmux auth request --scope "<所需权限>" --json`，说明用途；返回 authUrl 时（单聊）用 `botmux send` 发送，返回 delivery=dm 时链接已私聊给发起人，不要在群里贴任何授权链接；再运行 `botmux auth wait --request-id <requestId> --json`，仅在 ready 后以本轮用户身份重试。仍失败时按实际错误处理，不循环登录。',
   'ai.identity.routing_intro': '群里可能有多个 bot，按 @名字 和 open_id 区分归属：',
   'ai.identity.rule_own_part': '- 只做分给自己的部分，不抢别的 bot 的活',
   'ai.identity.rule_silent_when_other': '- 整条消息都指派给别的 bot 时保持沉默',

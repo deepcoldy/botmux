@@ -20,7 +20,7 @@ import { config } from '../../config.js';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
 import { resolveConditionalLine } from '../../skills/effective-builtins.js';
 import type { ReplyDelivery } from '../../core/reply-delivery.js';
-import type { TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
+import { triggerUserAuthApplies, type TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
 import { larkToolPrompt } from '../../core/lark-tool-binding.js';
 import type { CliId } from './types.js';
 
@@ -256,14 +256,29 @@ export const BOTMUX_SHELL_HINTS: string[] = [
  *
  * Authorization itself is not taught here: a refused command's own output
  * says what happened, and botmux sends any link to the person directly.
+ * `larkAuthFlow` is the exception, for a lark-cli session without the managed
+ * binding: it gets no `<botmux_lark_tool>`, so nothing else tells it to add
+ * Feishu scopes through `botmux auth request --scope` instead of the
+ * `lark-cli auth login --scope` that lark-cli's own hints suggest, which
+ * prints a device link to the agent.
  */
-export function buildCredentialBoundaryBlock(policy: TriggerUserAuthConfig | undefined, locale?: Locale): string {
+export function buildCredentialBoundaryBlock(
+  policy: TriggerUserAuthConfig | undefined,
+  locale?: Locale,
+  larkAuthFlow = false,
+): string {
   if (!policy?.enabled || policy.tools.length === 0) return '';
   const line = (key: string): string => `  ${escapeXmlTagLikeTokens(t(key, undefined, locale))}`;
+  const lark = larkAuthFlow && triggerUserAuthApplies(policy, 'lark-cli');
   return [
     '<botmux_credentials>',
     line('ai.credentials.never_read_others'),
     line('ai.credentials.never_forward'),
+    ...(lark ? [
+      line('ai.credentials.on_auth_failure'),
+      line('ai.credentials.on_auth_link'),
+      line('ai.credentials.on_missing_scope'),
+    ] : []),
     '</botmux_credentials>',
   ].join('\n');
 }
@@ -283,7 +298,7 @@ export function buildManagedLarkToolPromptBlocks(
    *  sessions that get a managed binding are verified headless sessions. */
   headlessNoUserChannel = false,
 ): string {
-  const credentialBoundary = buildCredentialBoundaryBlock(policy, locale);
+  const credentialBoundary = buildCredentialBoundaryBlock(policy, locale, !larkToolAppId);
   const larkToolBoundary = larkToolAppId
     ? [
       '<botmux_lark_tool>',

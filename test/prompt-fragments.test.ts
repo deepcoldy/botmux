@@ -77,10 +77,13 @@ describe('prompt fragment catalog', () => {
     expect(validateFragmentOverride(line.key, '群里有 {count} 个：{names}')).toBeUndefined();
   });
 
-  it('lists exactly the two credential rules the block renders', () => {
+  it('lists exactly the credential lines the block can render', () => {
     expect(PROMPT_FRAGMENTS.filter((f) => f.block === 'credentials').map((f) => f.key)).toEqual([
       'ai.credentials.never_read_others',
       'ai.credentials.never_forward',
+      'ai.credentials.on_auth_failure',
+      'ai.credentials.on_auth_link',
+      'ai.credentials.on_missing_scope',
     ]);
   });
 
