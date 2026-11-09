@@ -2,6 +2,12 @@
 import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
 import { admitSessionCommand } from './services/session-command-gateway.js';
 import { contractTerminalStatus, type RuntimeIdentity } from './services/session-contract.js';
+import {
+  awaitRuntimeReservation,
+  RUNTIME_RESERVATION_DEADLINE_MS,
+  RUNTIME_RESERVATION_SLOW_LOG_MS,
+  RuntimeReservationExpiredError,
+} from './services/runtime-reservation.js';
 import { applyWorkerLaunchModel } from './core/worker-launch-model.js';
 import { readTraexEffortComposer, validateTraexTopicEffortRestart, type TraexTopicEffortRestart } from './utils/traex-session-effort.js';
 import { deploymentContinuationTemplate } from './services/deployment-continuation.js';
@@ -167,7 +173,7 @@ import {
   type CliRestartCause,
   type InterruptedWork,
 } from './services/restart-interruption.js';
-import { isUnsentInputReplayable, saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs } from './services/unsent-input-journal.js';
+import { appendUnsentInputs, isUnsentInputReplayable, saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs } from './services/unsent-input-journal.js';
 import { UniversalOutputHandoff } from './services/universal-output-handoff.js';
 import { WorkerOutputJournal } from './services/worker-output-journal.js';
 import { WorkerFinalOutputHandoff, canHandoffFinalOutput, FINAL_OUTPUT_HANDOFF_MAX_PENDING } from './services/final-output-handoff.js';
@@ -9309,6 +9315,14 @@ function bridgeTurnJournalFilePath(): string | undefined {
  *  once empty, the taken journal is settled. */
 const restoredUnsentInputs = new Set<PendingCliInput>();
 
+/** Until init takes the previous worker's inputs back, the journal on disk is
+ *  still theirs: this worker may only add to it, not replace it. */
+let predecessorUnsentInputsTaken = false;
+
+/** Queued inputs this worker already appended there: a second save on the way
+ *  out (a fatal exit cut short by the parent's) adds only later arrivals. */
+const appendedUnsentInputs = new WeakSet<PendingCliInput>();
+
 /** Inputs accepted from the daemon but not yet written to the CLI when the
  *  daemon shut this worker down (services/unsent-input-journal). */
 function unsentInputJournalPath(): string | undefined {
@@ -9322,6 +9336,13 @@ function saveUnsentInputsForSuccessor(reason: string): void {
   const path = unsentInputJournalPath();
   if (!path || lastInitConfig?.adoptMode || isCodexAppCliId(lastInitConfig?.cliId)) return;
   try {
+    if (!predecessorUnsentInputsTaken) {
+      const unsaved = pendingMessages.filter(item => !appendedUnsentInputs.has(item));
+      const saved = appendUnsentInputs(path, unsaved);
+      for (const item of unsaved) appendedUnsentInputs.add(item);
+      if (saved > 0) log(`Saved ${saved} unwritten input(s) behind the previous worker's for this session's next worker (${reason})`);
+      return;
+    }
     const saved = saveUnsentInputs(path, pendingMessages);
     // Restored inputs not written yet are in that save; the rest are written.
     settleTakenUnsentInputs(path);
@@ -9350,6 +9371,7 @@ function takeUnsentInputsFromPredecessor(cfg: Extract<DaemonToWorker, { type: 'i
   if (!path || cfg.adoptMode || isCodexAppCliId(cfg.cliId)) return [];
   try {
     const { inputs, expired, unconfirmed } = takeUnsentInputs(path);
+    predecessorUnsentInputsTaken = true;
     for (const input of inputs) restoredUnsentInputs.add(input);
     if (inputs.length > 0) log(`Re-queued ${inputs.length} input(s) the previous worker never wrote to the CLI`);
     if (unconfirmed.length > 0) {
@@ -23155,15 +23177,20 @@ async function spawnCli(
   const binding = workerSessionEventScope.beginRuntime(activeRestartAttemptId);
   if (execution) workerSessionEventScope.rememberExecution(execution, binding);
   return workerSessionEventScope.run(binding, async () => {
-    const reserved = new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => { pendingRuntimeReservations.delete(binding.bindingId); resolve(false); }, 15_000);
-      timer.unref?.();
-      pendingRuntimeReservations.set(binding.bindingId, mayStart => { clearTimeout(timer); pendingRuntimeReservations.delete(binding.bindingId); resolve(mayStart); });
-    });
+    const reserved = awaitRuntimeReservation(pendingRuntimeReservations, binding.bindingId, () => log(
+      `Runtime reservation ${binding.bindingId} unanswered after ${RUNTIME_RESERVATION_SLOW_LOG_MS / 1000}s; `
+      + `waiting for the daemon up to ${RUNTIME_RESERVATION_DEADLINE_MS / 1000}s`,
+    ));
     send({ type: 'runtime_binding_started', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
-    if (!await reserved || closeRequested || workerSessionEventScope?.currentBinding() !== binding) {
+    const outcome = await reserved;
+    const superseded = closeRequested || workerSessionEventScope?.currentBinding() !== binding;
+    if (outcome !== 'granted' || superseded) {
       workerSessionEventScope?.restoreAfterAbortedStart(binding, previousBinding);
       workerSessionEventScope?.reportAbortedStart(binding, () => send({ type: 'runtime_binding_aborted', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) }));
+      // Superseded means another lifecycle operation owns the next start. An
+      // unanswered start has no such owner, so it must fail where it is seen.
+      if (outcome === 'expired' && !superseded) throw new RuntimeReservationExpiredError();
+      if (outcome === 'refused') log(`Daemon refused runtime reservation ${binding.bindingId}; the lifecycle operation that owns the session takes over`);
       throw new CliSpawnSupersededError();
     }
     try { await spawnCliBody(cfg, opts); }
@@ -33753,6 +33780,9 @@ async function sendFatalWorkerErrorAndExit(
 ): Promise<void> {
   if (fatalWorkerErrorPending) return;
   fatalWorkerErrorPending = true;
+  // No CLI of this start ever existed to take the queued inputs; the daemon's
+  // retry of a transient startup failure starts the worker that types them.
+  if (err instanceof RuntimeReservationExpiredError) saveUnsentInputsForSuccessor('runtime reservation unconfirmed');
   const pendingAttemptId = pendingLaunchConvergence?.attemptId;
   pendingLaunchConvergence = undefined;
   if (pendingAttemptId && pendingAttemptId !== activeRestartAttemptId) {
