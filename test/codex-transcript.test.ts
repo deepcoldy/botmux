@@ -463,6 +463,22 @@ describe('codexTaskFailureCode (shared Codex-family failure classifier)', () => 
     expect(codexTaskFailureCode('429 Too Many Requests')).toBe(CODEX_RATE_LIMIT_ERROR_CODE);
   });
 
+  it('classifies a 413 by its status alone when the body has no "too large" wording', () => {
+    // Anthropic's request_too_large body (as its SDK formats it) matches none
+    // of the text alternatives; only the status token identifies the cause.
+    expect(codexTaskFailureCode('413 {"type":"error","error":{"type":"request_too_large","message":"Request exceeds the maximum allowed number of bytes."}}'))
+      .toBe(CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE);
+    expect(codexTaskFailureCode({
+      message: 'unexpected status',
+      codex_error_info: { http_connection_failed: { http_status_code: 413 } },
+    })).toBe(CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE);
+  });
+
+  it('keeps a 413 relayed inside an invalid_request_error envelope on payload-too-large', () => {
+    expect(codexTaskFailureCode({ error: { type: 'invalid_request_error', message: '413 Request Entity Too Large' } }))
+      .toBe(CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE);
+  });
+
   it('falls back to codex_task_failed for unrecognized errors', () => {
     expect(codexTaskFailureCode('something exploded')).toBe(CODEX_TASK_FAILED_ERROR_CODE);
   });
