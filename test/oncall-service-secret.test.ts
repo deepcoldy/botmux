@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parse } from 'dotenv';
 import { readOncallDeploymentEnv } from '../src/services/oncall-deployment-config.js';
-import { DEFAULT_ONCALL_CONNECTION, loadOncallGroupTarget } from '../src/services/oncall-group-client.js';
+import { loadOncallGroupTarget } from '../src/services/oncall-group-client.js';
 import { handleOncallServiceSecret } from '../src/dashboard/oncall-service-secret.js';
 import { ControlCsrfTokens } from '../src/dashboard/control-csrf.js';
 import { decideDashboardAuth, decideWorkbenchH5Auth } from '../src/dashboard/auth.js';
@@ -65,13 +65,12 @@ const put = (body: unknown, headers: Record<string, string> = {}) => fetch(base 
   body: JSON.stringify(body),
 });
 
-it('provides a working connection default without creating deployment or bot files', async () => {
+it('shows an unconfigured connection as editable empty fields without creating deployment or bot files', async () => {
   const view = await (await fetch(base + '/api/oncall-connection')).json();
-  expect(view).toEqual({ ok: true, ...DEFAULT_ONCALL_CONNECTION, restartRequired: false });
+  expect(view).toEqual({ ok: true, endpoint: '', emailDomain: '', restartRequired: false });
   expect(existsSync(envFile)).toBe(false);
   writeFileSync(join(dir, 'oncall-group-targets.json'), JSON.stringify({ app: { tenantId: 12 } }));
-  expect(loadOncallGroupTarget(dir, 'app', readOncallDeploymentEnv(envFile)))
-    .toEqual({ tenantId: 12, ...DEFAULT_ONCALL_CONNECTION });
+  expect(() => loadOncallGroupTarget(dir, 'app', readOncallDeploymentEnv(envFile))).toThrow('平台连接尚未配置');
 });
 
 it('makes saved connection and credential values available to readers with stale startup environments', async () => {

@@ -2,8 +2,9 @@
 
 /**
  * Keep private deployment hostnames out of the public repository and package.
- * Documented integration gateways are allowed explicitly; private deployment
- * hostnames must still be supplied at runtime.
+ * Riff is a documented, intentional public integration; every other
+ * Other corporate deployment hostnames must be supplied at runtime instead
+ * of committed.
  */
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { extname, join, relative, resolve } from 'node:path';
@@ -17,8 +18,10 @@ const textExtensions = new Set([
   '.html', '.css', '.sh', '.kdl',
 ]);
 const allowedHosts = new Set([
-  // Official Oncall gateway, also used by oncall-cli's default CN site.
-  'cloud.bytedance.net',
+  // Empty by design: no corporate deployment host should appear in the public
+  // tree. Repo specs are host-agnostic and install sources live in internal
+  // docs — so any bytedance.net / byted.org hit here is a regression to fix,
+  // not to allowlist. Add an entry only for a deliberately public integration.
 ]);
 // Require at least one label so bare corporate TLD mentions in assertions/comments
 // do not trip the gate; catch accidental private subdomains under either suffix.

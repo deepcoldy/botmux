@@ -10,7 +10,7 @@ import type { DashboardRequestIdentity } from './request-identity.js';
 import { readJsonBodyWithLimit } from './trigger-api.js';
 import { jsonRes } from './http.js';
 import { resolveBotmuxDataDir } from '../core/data-dir.js';
-import { normalizeOncallConnection, readOncallDeploymentConnection } from '../services/oncall-group-client.js';
+import { normalizeOncallConnection, readOncallConnectionDraft } from '../services/oncall-group-client.js';
 import { readOncallDeploymentEnv } from '../services/oncall-deployment-config.js';
 
 const KEY = 'ONCALL_SERVICE_SECRET';
@@ -53,7 +53,7 @@ export async function handleOncallServiceSecret(
       if (isConnection) {
         const dataDir = deps.dataDir ?? resolveBotmuxDataDir();
         const appId = url.searchParams.get('appId') ?? '';
-        return reply(200, { ok: true, ...readOncallDeploymentConnection(dataDir, appId, active), restartRequired: false });
+        return reply(200, { ok: true, ...readOncallConnectionDraft(dataDir, appId, active), restartRequired: false });
       }
       const configured = Boolean(active[KEY]?.trim());
       return reply(200, { ok: true, configured, secret: active[KEY] ?? '', restartRequired: false });

@@ -2,14 +2,14 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_ONCALL_CONNECTION, loadOncallGroupTarget, oncallUsername, readOncallGroupSettings, saveOncallGroupTarget } from '../src/services/oncall-group-client.js';
+import { loadOncallGroupTarget, oncallUsername, readOncallGroupSettings, saveOncallGroupTarget } from '../src/services/oncall-group-client.js';
 
 let dir: string;
 const legacy = { endpoint: 'https://legacy.example.test/api/inf/v1/chat/', emailDomain: 'legacy.test', tenantId: 12, region: 'cn', typeId: 34 };
 const file = () => join(dir, 'oncall-group-targets.json');
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'oncall-target-settings-'));
-  vi.stubEnv('ONCALL_GROUP_ENDPOINT', ''); vi.stubEnv('ONCALL_EMAIL_DOMAIN', '');
+  vi.stubEnv('HOME', dir); vi.stubEnv('ONCALL_GROUP_ENDPOINT', ''); vi.stubEnv('ONCALL_EMAIL_DOMAIN', '');
 });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); vi.unstubAllEnvs(); });
 
@@ -36,11 +36,11 @@ describe('Oncall business settings and deployment connection', () => {
     }
   });
 
-  it('uses the built-in connection on a fresh deployment and keeps business routing separate', () => {
-    expect(readOncallGroupSettings(dir, 'app')).toMatchObject({ target: null, connectionReady: true });
+  it('waits for the deployment connection on a fresh deployment and keeps business routing separate', () => {
+    expect(readOncallGroupSettings(dir, 'app')).toMatchObject({ target: null, connectionReady: false });
     saveOncallGroupTarget(dir, 'app', { tenantId: 12 });
-    expect(readOncallGroupSettings(dir, 'app')).toMatchObject({ target: { tenantId: 12 }, connectionReady: true });
-    expect(loadOncallGroupTarget(dir, 'app')).toEqual({ tenantId: 12, ...DEFAULT_ONCALL_CONNECTION });
+    expect(readOncallGroupSettings(dir, 'app')).toMatchObject({ target: { tenantId: 12 }, connectionReady: false });
+    expect(() => loadOncallGroupTarget(dir, 'app')).toThrow('平台连接尚未配置');
     expect(JSON.parse(readFileSync(file(), 'utf8'))).toEqual({ app: { tenantId: 12 } });
     vi.stubEnv('ONCALL_GROUP_ENDPOINT', legacy.endpoint); vi.stubEnv('ONCALL_EMAIL_DOMAIN', legacy.emailDomain);
     expect(loadOncallGroupTarget(dir, 'app')).toEqual({ tenantId: 12, endpoint: legacy.endpoint, emailDomain: legacy.emailDomain });

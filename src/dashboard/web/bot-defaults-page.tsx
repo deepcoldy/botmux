@@ -1566,11 +1566,11 @@ export function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: Patc
     {visited && ui.authed ? <details className="bd-oncall-details bd-oncall-advanced"><summary>高级设置</summary>
       <fieldset className="bd-oncall-fields" disabled={busy || connection.saved === null}>
         <div className="bd-oncall-grid">
-          <label className="bd-oncall-field"><FieldTitle help="Oncall 建群接口的完整 HTTPS 地址。默认使用字节 Oncall 官方网关；可覆盖为其他 HTTPS 网关。同一部署的机器人共用，保存后自动生效。">网关地址</FieldTitle>
+          <label className="bd-oncall-field"><FieldTitle help="Oncall 建群接口的完整 HTTPS 地址，由部署方提供。同一部署的机器人共用，保存后自动生效。">网关地址</FieldTitle>
             <input type="text" name="oncallEndpoint" autoComplete="off" spellCheck={false} placeholder="输入完整的 HTTPS 接口地址" value={connection.endpoint}
               onChange={event => { const endpoint = event.currentTarget.value; setConnection(previous => ({ ...previous, endpoint })); setStatus(null); }} />
           </label>
-          <label className="bd-oncall-field"><FieldTitle help="用于识别提单人企业邮箱，默认 bytedance.com；不填写 @。可按企业邮箱修改，同一部署的机器人共用，保存后自动生效。">企业邮箱域</FieldTitle>
+          <label className="bd-oncall-field"><FieldTitle help="用于识别提单人企业邮箱，不填写 @。同一部署的机器人共用，保存后自动生效。">企业邮箱域</FieldTitle>
             <input type="text" name="oncallEmailDomain" autoComplete="off" spellCheck={false} placeholder="例如 example.com，不含 @" value={connection.emailDomain}
               onChange={event => { const emailDomain = event.currentTarget.value; setConnection(previous => ({ ...previous, emailDomain })); setStatus(null); }} />
           </label>

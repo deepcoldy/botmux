@@ -4,11 +4,6 @@ import { withFileLockSync } from '../utils/file-lock.js';
 import { join } from 'node:path';
 import { readOncallDeploymentEnv } from './oncall-deployment-config.js';
 
-export const DEFAULT_ONCALL_CONNECTION = {
-  endpoint: 'https://cloud.bytedance.net/api/v1/oncall_platform/api/inf/v1/chat/',
-  emailDomain: 'bytedance.com',
-};
-
 export interface OncallGroupBusinessTarget {
   tenantId: number;
   typeId?: number;
@@ -16,7 +11,7 @@ export interface OncallGroupBusinessTarget {
 }
 
 export interface OncallGroupTarget extends OncallGroupBusinessTarget {
-  /** BytedOncall OpenAPI endpoint, with a deployment override. */
+  /** BytedOncall OpenAPI endpoint, supplied by the deployment. */
   endpoint: string;
   emailDomain: string;
 }
@@ -43,9 +38,18 @@ export function normalizeOncallConnection({ endpoint, emailDomain }: Partial<Onc
   return { endpoint, emailDomain };
 }
 
+function connectionValues(target: StoredTarget | undefined, env: NodeJS.ProcessEnv): Pick<OncallGroupTarget, 'endpoint' | 'emailDomain'> {
+  return { endpoint: env.ONCALL_GROUP_ENDPOINT?.trim() || target?.endpoint || '',
+    emailDomain: env.ONCALL_EMAIL_DOMAIN?.trim() || target?.emailDomain || '' };
+}
+
 function connection(target: StoredTarget | undefined, env: NodeJS.ProcessEnv): Pick<OncallGroupTarget, 'endpoint' | 'emailDomain'> {
-  return normalizeOncallConnection({ endpoint: env.ONCALL_GROUP_ENDPOINT?.trim() || target?.endpoint || DEFAULT_ONCALL_CONNECTION.endpoint,
-    emailDomain: env.ONCALL_EMAIL_DOMAIN?.trim() || target?.emailDomain || DEFAULT_ONCALL_CONNECTION.emailDomain });
+  return normalizeOncallConnection(connectionValues(target, env));
+}
+
+/** The deployment supplies the platform connection; the editor shows it unvalidated, including empty. */
+export function readOncallConnectionDraft(dataDir: string, appId: string, env: NodeJS.ProcessEnv = readOncallDeploymentEnv()) {
+  return connectionValues(readTargets(dataDir)[appId], env);
 }
 
 export function readOncallDeploymentConnection(dataDir: string, appId: string, env: NodeJS.ProcessEnv = readOncallDeploymentEnv()) {
