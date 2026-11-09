@@ -13,6 +13,18 @@ const ref = (refId: string, originalUrl: string): RegisteredLinkRef => ({
 });
 
 describe('LinkRef presenter', () => {
+  it('bounds the displayed mappings while acknowledging links retained beyond the companion', () => {
+    const refs = Array.from({ length: 154 }, (_, index) => ref(
+      `lr_${index.toString(16).padStart(32, '0')}`, `https://example.test/problem?id=${index}`,
+    ));
+    const output = renderLinkRefCompanion(refs);
+
+    expect(output.match(/^lr_[0-9a-f]+ = /gm)).toHaveLength(128);
+    expect(output).toContain(refs[0]!.originalUrl);
+    expect(output).not.toContain(`${refs.at(-1)!.refId} = `);
+    expect(output).toMatch(/26.*已登记/);
+  });
+
   it('renders deterministic source order and exact original URL bytes', () => {
     const refs = [ref('lr_0123456789abcdef0123456789abcdef', 'https://example.test/p#Frag')];
     expect(renderLinkRefCompanion(refs)).toBe([

@@ -19,6 +19,7 @@ import {
   fetchDrafts,
   fetchInitiator,
   fetchOrchestratorBots,
+  fetchProjectOptions,
   fetchWorkflowSwitches,
   postDraftAction,
   type DraftAction,
@@ -59,6 +60,11 @@ import {
   launchStepRows,
   needsContinue,
   parseLaunchMembersInput,
+  projectChoicesStale,
+  projectForRequest,
+  projectOptionLabel,
+  readProjectOptions,
+  type ProjectOptionsCheck,
   startedRunHref,
   orchestratorOptionStates,
   sameDraftInitiator,
@@ -277,6 +283,83 @@ function InitiatorLine(props: { check: InitiatorCheck | undefined }): React.JSX.
   );
 }
 
+/** 某个编排 Bot（或复制某个运行时默认的编排 Bot）的项目选项；`null` = 还没选 Bot。 */
+export function useProjectOptions(target: { larkAppId: string } | { runId: string } | null): [ProjectOptionsCheck | undefined, () => void] {
+  const key = !target ? '' : 'larkAppId' in target ? `bot:${target.larkAppId}` : `run:${target.runId}`;
+  const [loaded, setLoaded] = useState<{ key: string; check: ProjectOptionsCheck } | null>(null);
+  const [attempt, setAttempt] = useState(0);
+  useEffect(() => {
+    if (!key) return;
+    let disposed = false;
+    setLoaded({ key, check: { state: 'checking' } });
+    const id = key.slice(4);
+    void fetchProjectOptions(key.startsWith('bot:') ? { larkAppId: id } : { runId: id }).then((result) => {
+      if (disposed) return;
+      const options = result.ok ? readProjectOptions(result.project) : null;
+      setLoaded({
+        key,
+        check: options
+          ? { state: 'ok', options }
+          : result.ok
+            ? { state: 'failed', error: 'bad_response', retryable: true }
+            : { state: 'failed', error: result.error, ...(result.message ? { message: result.message } : {}), retryable: result.retryable },
+      });
+    });
+    return () => { disposed = true; };
+  }, [key, attempt]);
+  const retry = useCallback(() => setAttempt((value) => value + 1), []);
+  return [loaded && loaded.key === key ? loaded.check : undefined, retry];
+}
+
+/**
+ * 「项目」一栏：编排 Bot 有默认目录就直接显示；没有就必须从和飞书仓库选择卡一样的
+ * 候选里选一个。
+ */
+export function ProjectField(props: {
+  id: string;
+  check: ProjectOptionsCheck | undefined;
+  picked: string;
+  onPick: (path: string) => void;
+  onRetry: () => void;
+}): React.JSX.Element | null {
+  const tr = useT();
+  const check = props.check;
+  if (!check) return null;
+  if (check.state === 'checking') return <p className="wfd-project muted" role="status">{tr('workflow.draft.project.loading')}</p>;
+  if (check.state === 'failed') {
+    return (
+      <p className="wfd-project wfd-error" role="alert">
+        {tr('workflow.draft.project.loadFailed', { reason: describeError(tr, check) })}
+        {check.retryable ? <> <button type="button" className="wfd-small" onClick={props.onRetry}>{tr('workflow.draft.retry')}</button></> : null}
+      </p>
+    );
+  }
+  if (check.options.kind === 'default') {
+    return (
+      <p className="wfd-project" id={props.id}>
+        <span className="wfd-label">{tr('workflow.draft.project')}</span>
+        <code>{check.options.dir}</code>
+        <span className="wfd-project-from">{tr('workflow.draft.project.botDefault')}</span>
+      </p>
+    );
+  }
+  const candidates = check.options.candidates;
+  return (
+    <div className="wfd-field">
+      <label className="wfd-label" htmlFor={props.id}>{tr('workflow.draft.project')}</label>
+      {candidates.length === 0 ? (
+        <p className="wfd-error" role="alert">{tr('workflow.draft.project.noCandidates')}</p>
+      ) : (
+        <select id={props.id} required value={props.picked} aria-describedby={`${props.id}-help`} onChange={(event) => props.onPick(event.target.value)}>
+          <option value="" disabled>{tr('workflow.draft.project.pick')}</option>
+          {candidates.map((candidate) => <option key={candidate.path} value={candidate.path}>{projectOptionLabel(candidate)}</option>)}
+        </select>
+      )}
+      <p id={`${props.id}-help`} className="wfd-help">{tr('workflow.draft.project.pickHelp')}</p>
+    </div>
+  );
+}
+
 export function WorkflowNewPage(): React.JSX.Element {
   const tr = useT();
   const switches = useWorkflowSwitches();
@@ -300,21 +383,27 @@ export function WorkflowNewPage(): React.JSX.Element {
   const options = useMemo(() => orchestratorOptionStates(bots ?? [], checks), [bots, checks]);
   const bot = bots?.find((candidate) => candidate.larkAppId === selected);
   const currentCheck = selected ? checks.get(selected) : undefined;
+  const projectTarget = useMemo(() => (selected ? { larkAppId: selected } : null), [selected]);
+  const [projectCheck, retryProjects] = useProjectOptions(projectTarget);
+  const [pickedProject, setPickedProject] = useState('');
+  const project = projectForRequest(projectCheck, pickedProject);
 
   const choose = (larkAppId: string) => {
     setSelected(larkAppId);
+    setPickedProject('');
     setError(null);
     if (larkAppId) check(larkAppId);
   };
 
   const start = async () => {
-    if (!bot || !canStartDraft({ goal, bot, check: currentCheck, busy })) return;
+    if (!bot || project === null || !canStartDraft({ goal, bot, check: currentCheck, project, busy })) return;
     setBusy(true);
     setError(null);
-    const result = await createDraft({ larkAppId: bot.larkAppId, goal: goal.trim() });
+    const result = await createDraft({ larkAppId: bot.larkAppId, goal: goal.trim(), project });
     setBusy(false);
     if (!result.ok) {
       setError(describeError(tr, result));
+      if (projectChoicesStale(result.error)) { setPickedProject(''); retryProjects(); }
       return;
     }
     window.location.hash = workflowDraftHref(result.draft.runId);
@@ -367,13 +456,14 @@ export function WorkflowNewPage(): React.JSX.Element {
           {currentCheck?.state === 'failed' && currentCheck.retryable ? (
             <button type="button" className="wfd-small" onClick={() => check(selected, true)}>{tr('workflow.draft.retry')}</button>
           ) : null}
+          <ProjectField id="wfd-project" check={projectCheck} picked={pickedProject} onPick={setPickedProject} onRetry={retryProjects} />
           <label className="wfd-field" htmlFor="wfd-goal">
             <span className="wfd-label">{tr('workflow.draft.goal')}</span>
             <textarea id="wfd-goal" rows={5} value={goal} placeholder={tr('workflow.draft.goalPlaceholder')} onChange={(event) => setGoal(event.target.value)} />
           </label>
           {error ? <p className="wfd-error" role="alert">{error}</p> : null}
           <div className="wfd-actions">
-            <button type="button" className="primary" disabled={!canStartDraft({ goal, bot, check: currentCheck, busy })} onClick={() => { void start(); }}>
+            <button type="button" className="primary" disabled={!canStartDraft({ goal, bot, check: currentCheck, project, busy })} onClick={() => { void start(); }}>
               {busy ? tr('workflow.draft.starting') : tr('workflow.draft.start')}
             </button>
           </div>
@@ -597,6 +687,15 @@ export function WorkflowDraftPage(props: { runId: string }): React.JSX.Element {
             ? <button type="button" className="btn-link wfd-small" disabled={!!busy} onClick={() => setSwitching(true)}>{tr('workflow.draft.switch.title')}</button>
             : null}
         </span>
+        {view.project ? (
+          <span>
+            <span className="wfd-label">{tr('workflow.draft.project')}</span>
+            {view.project.dir ? <code className="wfd-project-dir">{view.project.dir}</code> : <span className="wfd-warning">{tr('workflow.draft.project.unset')}</span>}
+            {view.project.from === 'session' || view.project.from === 'default'
+              ? <small className="wfd-project-from">{tr(view.project.from === 'session' ? 'workflow.draft.project.fromSession' : 'workflow.draft.project.fromDefault')}</small>
+              : null}
+          </span>
+        ) : null}
         <span><span className="wfd-label">{tr('workflow.draft.initiator')}</span>{tr(initiatorSourceKey(view.initiator))}{isInitiator ? <small className="wfd-me">{tr('workflow.draft.you')}</small> : null}</span>
         <span><span className="wfd-label">{tr('workflow.draft.colUpdated')}</span><time dateTime={view.updatedAt}>{formatDraftTime(view.updatedAt)}</time></span>
       </div>
@@ -856,11 +955,22 @@ function ChatPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: st
   const writable = canChat(view, props.canWrite) && !props.busy;
   const question = activeQuestion(view.clarify.turns);
   const turnCount = view.clarify.turns.length;
+  // A draft from before projects, whose bot has no default dir: 「继续」 needs one picked.
+  const needsProject = needsContinue(view) && !!view.project?.required;
+  const projectTarget = useMemo(() => (needsProject ? { larkAppId: view.orchestratorAppId } : null), [needsProject, view.orchestratorAppId]);
+  const [projectCheck, retryProjects] = useProjectOptions(projectTarget);
+  const [pickedProject, setPickedProject] = useState('');
+  const project = needsProject ? projectForRequest(projectCheck, pickedProject) : undefined;
 
   useEffect(() => {
     const list = listRef.current;
     if (list) list.scrollTop = list.scrollHeight;
   }, [turnCount, view.clarify.pending]);
+
+  const continueClarify = async () => {
+    const result = await props.act({ kind: 'continue', ...(project ? { project } : {}) }, 'continue') as { ok?: boolean; error?: string } | null;
+    if (result && !result.ok && result.error && projectChoicesStale(result.error)) { setPickedProject(''); retryProjects(); }
+  };
 
   const send = async (message: string) => {
     const trimmed = message.trim();
@@ -915,8 +1025,11 @@ function ChatPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: st
       {needsContinue(view) ? (
         <div className="wfd-disconnected" role="status">
           <span>{view.copy && !copyHasConversation(view.clarify) ? tr('workflow.copy.noSession') : tr('workflow.draft.disconnected')}</span>
-          <button type="button" className="primary" disabled={!props.canWrite || !!props.busy}
-            onClick={() => { void props.act({ kind: 'continue' }, 'continue'); }}>
+          {needsProject && props.canWrite ? (
+            <ProjectField id="wfd-continue-project" check={projectCheck} picked={pickedProject} onPick={setPickedProject} onRetry={retryProjects} />
+          ) : null}
+          <button type="button" className="primary" disabled={!props.canWrite || !!props.busy || project === null}
+            onClick={() => { void continueClarify(); }}>
             {tr('workflow.draft.continue')}
           </button>
         </div>

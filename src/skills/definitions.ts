@@ -714,6 +714,8 @@ botmux send --mention ou_xxx "帮忙看下这段代码"
 
 ### @ 决策硬门（必读）
 
+定时任务等没有本轮发送者的自动回合，有明确收件人时用 --mention，没有明确收件人时用 --no-mention；不要使用 --mention-back，也不要从会话 owner 或历史发送者推断收件人。
+
 每条回复**必须显式做出 @ 决策**，否则 \`botmux send\` 报错（exit 2）不发送。三选一：
 
 | flag | 何时用 |
@@ -795,6 +797,9 @@ botmux dispatch --chat-id oc_xxxxxxxxxxxx --bot-app cli_xxxxxxxxxxxx \\
 sandbox 内也可以用 \`--into <om_话题根消息id>\` 往已有话题追加：宿主侧会
 重新查询该根消息实际所在的群，必须与目标群（默认当前会话群，或
 \`--chat-id\` 指定的群）一致才会投递，否则返回 \`dispatch_chat_mismatch\`。
+
+往话题追加时，该话题里已关闭的会话默认会自动接上（上下文都在）；人手动关闭的（\`/close\`、卡片关闭、dashboard 关闭、\`botmux delete\`）除外，会另开新会话。
+想强制另开新会话（不相干的事、或不想继承之前思路的独立评审）加 \`--session-mode fresh\`，\`--session-mode resume\` 为默认行为。
 
 \`--top-level\` 模式下不会附加"发送给：@xxx / cc：xxx" 那行 footer（顶层广播没有特定收件人）。oncall 寻址也会跳过。
 

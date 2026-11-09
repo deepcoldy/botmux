@@ -76,6 +76,7 @@ import {
   type DispatchTransportState,
 } from './core/dispatch-lifecycle.js';
 import { withBotSteerDirective } from './core/bot-steer-directive.js';
+import { withBotSessionDirective } from './core/topic-session-continuity.js';
 import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
 import {
   consumeAutostartUnitMarker,
@@ -6704,8 +6705,10 @@ async function cmdChat(argv: string[]): Promise<void> {
 
 async function cmdChatManager(argv: string[]): Promise<void> {
   const action = argv[0];
-  if (argv.length !== 1 || !['set', 'clear', 'status'].includes(action)) {
-    console.error('用法: botmux manager set|clear|status');
+  const leadOnlyArg = action === 'lead-only' && argv.length === 2 && (argv[1] === 'on' || argv[1] === 'off')
+    ? argv[1] === 'on' : undefined;
+  if (leadOnlyArg === undefined && (argv.length !== 1 || !['set', 'clear', 'status'].includes(action))) {
+    console.error('用法: botmux manager set|clear|status|lead-only on|off');
     process.exitCode = 2;
     return;
   }
@@ -6717,7 +6720,8 @@ async function cmdChatManager(argv: string[]): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const response = await postSessionCliIpc(daemon.ipcPort, session.sessionId, 'chat-manager', { action });
+  const response = await postSessionCliIpc(daemon.ipcPort, session.sessionId, 'chat-manager',
+    leadOnlyArg === undefined ? { action } : { action, leadOnly: leadOnlyArg });
   const body: any = await response.json().catch(() => ({ ok: false, error: `HTTP ${response.status}` }));
   if (response.ok && body?.ok) console.log(JSON.stringify(body));
   else { console.error(JSON.stringify(body)); process.exitCode = 1; }
@@ -10473,7 +10477,7 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
     process.exit(2);
   }
   const allowedFlags = new Set([
-    '--title', '--bot-app', '--chat-id', '--into', '--steer',
+    '--title', '--bot-app', '--chat-id', '--into', '--steer', '--session-mode',
     '--brief', '--brief-file', '--session-id', '--delegate', '--no-delegate',
     // Task-tree card metadata, relayed verbatim; the host re-exec's cmdDispatch
     // validates --kind's enum and --task-url's https itself.
@@ -10530,6 +10534,8 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
   }
   if (intoRoot) flags.push('--into', intoRoot);
   if (rest.includes('--steer')) flags.push('--steer');
+  const relaySessionMode = parsedRelayArgs.ok ? parsedRelayArgs.value.sessionMode : undefined;
+  if (relaySessionMode !== undefined) flags.push('--session-mode', relaySessionMode);
   // Task-tree metadata is single-value (cmdDispatch keeps the first occurrence);
   // forward only that one so the host re-exec sees the same effective argv.
   for (const flag of ['--kind', '--task-id', '--task-url'] as const) {
@@ -15608,6 +15614,11 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --model / --reasoning-effort: 为唯一 --bot-app 的新话题冻结启动规格；与 --into 冲突。
   --standby: 配合 --repo——只把 bot 拉起来定好目录待命（不派简报），之后用 --into 派具体任务。
   --into:   不建种子，直接回到已有话题线程 @ bot 追加一条。
+  --session-mode resume|fresh（仅配合 --into）: 该话题里目标 bot 的会话已关闭时怎么接：
+            resume（默认，不写也一样）接着原会话，上下文都在；人手动 /close 过的不会自动接；
+            fresh  另开新会话（会话还在运行也会先关掉）。适合换一件不相干的事，或想要不受之前
+                   思路影响的独立评审。接收方会在话题里说明实际是续上了还是新开了，
+                   botmux observe 的 continuity / resumable 字段也能查到。
   --into + --repo + --standby: 往已有话题发「@bot /repo <目录>」（与新话题 --standby 同一条文本）。
             bot 一侧的 /repo 会关掉该话题正在跑的会话，并在同一话题、该目录里起一个全新会话；
             谁能发 /repo、目录校验沿用 bot 现有规则（需要 --bot <open_id>，--bot-app 不授权 /repo）。
@@ -15627,6 +15638,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --brief-file <path>   从文件读取简报
   --result-delivery <mode>  结果投递：relay（默认）|publish|publish-and-relay|reply（原话题直回）
   --steer               在简报前注入通用 @steer 指令；普通 dispatch 默认仍进入 Queue
+  --session-mode <m>    resume|fresh，仅配合 --into，见上方说明
   --delegate schedule:create
                         请求把当前真人回合的 schedule 创建权限委托给目标 Bot 当前派发 turn（需宿主策略开启）
   --no-delegate schedule:create
@@ -15794,6 +15806,22 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     process.exit(1);
   }
   if (steer) brief = withBotSteerDirective(brief);
+  const sessionMode = dispatchArgs.sessionMode?.trim().toLowerCase();
+  if (sessionMode !== undefined) {
+    if (sessionMode !== 'resume' && sessionMode !== 'fresh') {
+      console.error(JSON.stringify({ success: false, errorCode: 'INVALID_SESSION_MODE', detail: '--session-mode must be resume or fresh' }));
+      process.exit(2);
+    }
+    if (!intoRoot) {
+      console.error(JSON.stringify({ success: false, errorCode: 'SESSION_MODE_REQUIRES_INTO', detail: '--session-mode only applies to --into (a new topic always starts a new session)' }));
+      process.exit(2);
+    }
+    if (standby) {
+      console.error(JSON.stringify({ success: false, errorCode: 'SESSION_MODE_WITH_STANDBY', detail: '--session-mode cannot be combined with --standby (standby already starts a new session)' }));
+      process.exit(2);
+    }
+    brief = withBotSessionDirective(brief, sessionMode);
+  }
   if (!intoRoot && !title.trim()) {
     console.error('新开话题需要 --title。往已有话题追加请用 --into <root_id>。');
     process.exit(1);
@@ -21297,6 +21325,11 @@ switch (command) {
   case 'hook': {
     // `botmux hook <cliId>` — hook 客户端，stdin 读 payload，stdout 写 directive
     const cliId = process.argv[3] ?? '';
+    if (cliId === 'lead-only-guard') {
+      // Hidden: PreToolUse guard of the dedicated lead-only plugin dir (never listed in help).
+      const { runLeadOnlyGuardHook } = await import('./skills/lead-only-guard.js');
+      runLeadOnlyGuardHook();
+    }
     await cmdHook(cliId);
     break;
   }

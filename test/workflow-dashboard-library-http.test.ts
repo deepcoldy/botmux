@@ -32,6 +32,7 @@ import { createSavedWorkflow } from '../src/workflows/v3/library-store.js';
 import { computeSavedWorkflowGateDigest } from '../src/workflows/v3/library-schema.js';
 import { BOTS, DOC, MAIN, PI, SKETCHES, STEWARD, goalNode, makeService } from './helpers/workflow-draft-fakes.js';
 import { fakeLaunch } from './helpers/workflow-launch-fakes.js';
+import { readWorkflowDraft } from '../src/workflows/v3/draft-store.js';
 
 const SECRET = 'wf-library-host-key';
 const OWNER_OPEN = 'ou_owner';
@@ -198,6 +199,25 @@ describe('Dashboard → daemon workflow templates', () => {
     expect(await call('POST', `${LIB}/${saved.body.saved.workflowId}/run`, { params: {} }, alice))
       .toMatchObject({ status: 403, body: { error: 'cannot_operate' } });
     expect(readdirSync(runsDir)).toEqual([RUN_ID]);
+  });
+
+  it('running a template over HTTP carries the picked 项目 to the main bot\'s daemon', async () => {
+    const repo = join(dir, 'repo-a');
+    resetWorkflowDraftServiceForTests();
+    const launch = fakeLaunch(runsDir);
+    launch.setOnline([MAIN, DOC, STEWARD, PI]);
+    h = makeService(runsDir, {
+      launch: launch.deps, libraryDataDir: libraryDir, loadBots: () => BOTS,
+      projects: { defaultDir: () => undefined, candidates: () => [{ path: repo, name: 'repo-a', type: 'repo' }] },
+    });
+    installWorkflowDraftService(h.service, { sweep: false });
+    seedRun(RUN_ID);
+    const saved = await call('POST', `${LIB}/runs/${RUN_ID}/save`, { requestKey: 'req-http-0006' });
+    const path = `${LIB}/${saved.body.saved.workflowId}/run`;
+    expect(await call('POST', path, { params: {} })).toMatchObject({ status: 422, body: { error: 'project_required' } });
+    const run = await call('POST', path, { params: {}, project: repo });
+    expect(run).toMatchObject({ status: 200, body: { draft: { phase: 'flow_confirmed', project: { dir: repo, from: 'draft' } } } });
+    expect(readWorkflowDraft(join(runsDir, run.body.draft.runId))!.projectDir).toBe(repo);
   });
 
   it('a chat-scoped template: shown, not runnable here (no daemon asked); writes need a JSON body', async () => {

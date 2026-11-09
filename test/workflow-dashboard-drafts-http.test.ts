@@ -15,21 +15,22 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { registerPlatformTunnelBridge } from '../src/platform/tunnel-peers.js';
-import { handleWorkflowDraftsApi } from '../src/dashboard/workflow-drafts-api.js';
+import { handleWorkflowDraftsApi, handleWorkflowProjectsApi } from '../src/dashboard/workflow-drafts-api.js';
 import { handleV3RunsApi } from '../src/dashboard/v3-runs-api.js';
 import { workflowInitiatorPreGateDenial } from '../src/dashboard/workflow-initiator-api.js';
 import { startIpcServer, setIpcAuthSecret, setLarkAppId, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { daemonIpcAuthHeaders, fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
-import { installWorkflowDraftService, resetWorkflowDraftServiceForTests, WORKFLOW_DRAFTS_PATH } from '../src/core/workflow-draft-daemon.js';
+import { installWorkflowDraftService, resetWorkflowDraftServiceForTests, WORKFLOW_DRAFTS_PATH, WORKFLOW_PROJECTS_PATH } from '../src/core/workflow-draft-daemon.js';
 import { DASHBOARD_INITIATOR_SOURCE_HEADER } from '../src/core/workflow-initiator.js';
 import * as larkClient from '../src/im/lark/client.js';
 import { registerBot } from '../src/bot-registry.js';
 import { invalidateGlobalConfigCache } from '../src/global-config.js';
 import { config } from '../src/config.js';
 import type { DashboardRequestIdentity } from '../src/dashboard/request-identity.js';
-import { DOC, MAIN, SKETCHES, STEWARD, PI, makeService, specMarkdown } from './helpers/workflow-draft-fakes.js';
+import { DEFAULT_PROJECT, DOC, MAIN, SKETCHES, STEWARD, PI, makeService, specMarkdown } from './helpers/workflow-draft-fakes.js';
 import { fakeLaunch } from './helpers/workflow-launch-fakes.js';
 import { readRunEnvelope } from '../src/workflows/v3/run-envelope.js';
+import { readWorkflowDraft, writeWorkflowDraft } from '../src/workflows/v3/draft-store.js';
 
 const SECRET = 'wf-drafts-host-key';
 const OWNER_OPEN = 'ou_owner';
@@ -94,6 +95,12 @@ describe('Dashboard → daemon workflow drafts', () => {
         identity: deps.identity,
         canManageHost: deps.canManageHost,
         platformBound: true,
+        featureEnabled: () => deps.featureEnabled,
+        runsDir,
+        proxyToDaemon,
+      })) return;
+      if (await handleWorkflowProjectsApi(req, res, url, {
+        canManageHost: deps.canManageHost,
         featureEnabled: () => deps.featureEnabled,
         runsDir,
         proxyToDaemon,
@@ -371,5 +378,62 @@ describe('Dashboard → daemon workflow drafts', () => {
     expect(await create()).toMatchObject({ status: 403, body: { error: 'h5_login_unsupported' } });
     deps.identity = null;
     expect(await call('GET', WORKFLOW_DRAFTS_PATH)).toMatchObject({ status: 401 });
+  });
+
+  it('项目 over HTTP: the bot\'s daemon lists the choices and refuses a draft without one, or with a path off the list', async () => {
+    const repo = join(dir, 'repo-a');
+    const candidate = { path: repo, name: 'repo-a', type: 'repo' as const, branch: 'main' };
+    resetWorkflowDraftServiceForTests();
+    h = makeService(runsDir, { launch: launch.deps, projects: { defaultDir: () => undefined, candidates: () => [candidate] } });
+    installWorkflowDraftService(h.service, { sweep: false });
+
+    const options = await call('GET', `${WORKFLOW_PROJECTS_PATH}?larkAppId=${MAIN}`);
+    expect(options).toMatchObject({ status: 200, body: { ok: true, project: { kind: 'pick', candidates: [candidate] } } });
+    expect(proxied).toEqual([`GET ${WORKFLOW_PROJECTS_PATH}`]);
+
+    const goal = '帮我出一份代码风险报告';
+    expect(await call('POST', WORKFLOW_DRAFTS_PATH, { larkAppId: MAIN, goal })).toMatchObject({ status: 422, body: { error: 'project_required' } });
+    expect(await call('POST', WORKFLOW_DRAFTS_PATH, { larkAppId: MAIN, goal, project: '/etc' })).toMatchObject({ status: 422, body: { error: 'project_not_allowed' } });
+    expect(h.clarify.creates).toBe(0);
+    const created = await call('POST', WORKFLOW_DRAFTS_PATH, { larkAppId: MAIN, goal, project: repo });
+    expect(created).toMatchObject({ status: 200, body: { draft: { project: { dir: repo, from: 'draft' } } } });
+    expect(h.clarify.createInputs.map((input) => input.workingDir)).toEqual([repo]);
+  });
+
+  it('「继续」 over HTTP carries the picked 项目 to the daemon for a draft from before projects', async () => {
+    const repo = join(dir, 'repo-a');
+    let defaultDir: string | undefined = DEFAULT_PROJECT;
+    resetWorkflowDraftServiceForTests();
+    h = makeService(runsDir, {
+      launch: launch.deps,
+      projects: { defaultDir: () => defaultDir, candidates: () => [{ path: repo, name: 'repo-a', type: 'repo' }] },
+    });
+    installWorkflowDraftService(h.service, { sweep: false });
+    const runId = (await create()).body.draft.runId as string;
+    const { projectDir: _drop, ...legacy } = readWorkflowDraft(join(runsDir, runId))!;
+    writeWorkflowDraft(join(runsDir, runId), legacy);
+    defaultDir = undefined;
+    h.clarify.reply('先确认范围？');
+    await call('GET', `${WORKFLOW_DRAFTS_PATH}/${runId}`);
+    h.clarify.lose([...h.clarify.sessions.keys()].at(-1)!);
+    expect(await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/messages`, { text: '主仓' })).toMatchObject({ status: 409, body: { error: 'session_disconnected' } });
+
+    const path = `${WORKFLOW_DRAFTS_PATH}/${runId}/clarify/continue`;
+    expect(await call('POST', path, {})).toMatchObject({ status: 422, body: { error: 'project_required' } });
+    expect(await call('POST', path, { project: repo })).toMatchObject({ status: 200, body: { draft: { project: { dir: repo, from: 'draft' } } } });
+    expect(h.clarify.createInputs.at(-1)?.workingDir).toBe(repo);
+    expect(readWorkflowDraft(join(runsDir, runId))!.projectDir).toBe(repo);
+  });
+
+  it('项目 options need the management login, the feature, and a bot or a run to copy', async () => {
+    expect(await call('GET', `${WORKFLOW_PROJECTS_PATH}?larkAppId=${MAIN}`)).toMatchObject({ status: 200, body: { project: { kind: 'default', dir: DEFAULT_PROJECT } } });
+    expect(await call('GET', WORKFLOW_PROJECTS_PATH)).toMatchObject({ status: 400, body: { error: 'larkAppId_required' } });
+    expect(await call('GET', `${WORKFLOW_PROJECTS_PATH}?runId=src-261101-080000-000-ffff0001`)).toMatchObject({ status: 404, body: { error: 'unknown_run' } });
+    deps.featureEnabled = false;
+    expect(await call('GET', `${WORKFLOW_PROJECTS_PATH}?larkAppId=${MAIN}`)).toMatchObject({ status: 409, body: { error: 'feature_disabled' } });
+    deps.featureEnabled = true;
+    deps.canManageHost = false;
+    expect(await call('GET', `${WORKFLOW_PROJECTS_PATH}?larkAppId=${MAIN}`)).toMatchObject({ status: 401 });
+    expect(proxied).toEqual([`GET ${WORKFLOW_PROJECTS_PATH}`]);
   });
 });

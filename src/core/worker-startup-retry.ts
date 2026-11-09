@@ -22,6 +22,7 @@
  * Pure module: the classifier and delay schedule are unit-tested; the timer
  * wiring lives in worker-pool's setupWorkerHandlers.
  */
+import { RUNTIME_RESERVATION_UNCONFIRMED } from '../services/runtime-reservation.js';
 
 /** Maximum daemon-side auto-retries per failing streak. Reset when a worker
  *  generation reaches `ready`. */
@@ -41,12 +42,15 @@ const STARTUP_AUTO_RETRY_BASE_DELAYS_MS = [15_000, 60_000, 180_000];
  *   - connect-level failures against a stalled/restarting shared server
  *     (`ECONNREFUSED`, tmux's "error connecting to …" / "lost server" /
  *     "server exited unexpectedly");
- *   - fd/process pressure (`EAGAIN`, `EMFILE`, `ENFILE`).
+ *   - fd/process pressure (`EAGAIN`, `EMFILE`, `ENFILE`);
+ *   - a runtime reservation the daemon never answered — the overloaded
+ *     party was the daemon itself, and no CLI of that start exists.
  * Deliberately NOT matched: ENOENT/EACCES (binary genuinely missing/broken),
  * CLI-specific launch errors, config validation — retrying only delays the
  * same user-actionable failure.
  */
 export function isTransientStartupFailure(reason: string): boolean {
+  if (reason.includes(RUNTIME_RESERVATION_UNCONFIRMED)) return true;
   return /\bETIMEDOUT\b|\bECONNREFUSED\b|\bEAGAIN\b|\bEMFILE\b|\bENFILE\b|error connecting to|lost server|server exited unexpectedly/i.test(reason);
 }
 

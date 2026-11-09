@@ -277,6 +277,7 @@ describe('a worker asked to suspend', () => {
       log,
       pendingMessages,
       restoredUnsentInputs: new Set(),
+      predecessorUnsentInputsTaken: true,
       lastInitConfig: { cliId: 'claude-code' },
       unsentInputJournalPath: () => journal,
       isCodexAppCliId: () => false,

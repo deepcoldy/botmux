@@ -589,6 +589,24 @@ describe('stuck_key card action', () => {
     expect(canTalk).toHaveBeenCalledWith(APP_ID, 'oc_chat', 'ou_alice', undefined, 'on_ou_alice', 'group');
   });
 
+  it.each(['p2p', 'group'] as const)('%s: the initiator can retry a lock once without sending arbitrary callback keys', async chatType => {
+    const session = stuckDs({ stuckWarningPageType: 'session lock', chatType });
+    await click(session, { selected_index: '0', keys: '["C-c","Enter"]' });
+    await click(session, { selected_index: '0' });
+    expect(workerSend).toHaveBeenCalledTimes(1);
+    expect(workerSend.mock.calls[0][0]).toMatchObject({
+      type: 'tui_keys', keys: ['r'], stuckPageType: 'session lock',
+      stuckNonce: 7, stuckCliLifetime: 4, rearmStuckDetector: false,
+    });
+    expect(canTalk).toHaveBeenCalledWith(APP_ID, 'oc_chat', 'ou_alice', undefined, 'on_ou_alice', chatType);
+  });
+
+  it.each(['ou_other', 'ou_alice'])('refuses a lock retry for a different or revoked initiator: %s', async operator => {
+    if (operator === 'ou_alice') vi.mocked(canTalk).mockReturnValue(false);
+    await click(stuckDs({ stuckWarningPageType: 'session lock' }), { selected_index: '0' }, operator);
+    expect(workerSend).not.toHaveBeenCalled();
+  });
+
   it('global switch off: the initiator is refused on a decline key, an operator still presses it', async () => {
     (config as any).stuckCardInitiatorKeys = false;
     const ds = stuckDs();

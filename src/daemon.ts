@@ -52,6 +52,11 @@ import { normalizeBotsInfoRouteEntries } from './services/bots-info-shape.js';
 import { createBotProfileRefresher } from './services/bot-profile-refresh.js';
 import { lastKnownBotName } from './services/bot-display-name.js';
 import { parseBotSteerDirective } from './core/bot-steer-directive.js';
+import {
+  parseBotSessionDirective, findLatestClosedTopicSession, topicResumeBlockReason,
+  type TopicContinuityRecord,
+} from './core/topic-session-continuity.js';
+import { describeCloseResidual as describeTopicCloseResidual } from './core/close-residual.js';
 import { readAllowedUsersResolveCache, writeAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname, basename, isAbsolute, relative } from 'node:path';
 import { homedir, loadavg, cpus, totalmem, freemem } from 'node:os';
@@ -517,7 +522,7 @@ import {
   sweepTraexInstallChanges,
 } from './core/worker-pool.js';
 import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
-import { noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice } from './core/idle-auto-compact.js';
+import { isLocalCliCommand, noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice } from './core/idle-auto-compact.js';
 import { ensureServerThenReapOrphanTmuxServers, orphanTmuxReaperEnabled, reaperCandidateSocketNames } from './core/orphan-tmux-reaper.js';
 import { runPeriodicOrphanSessionSweep, loadRichProcsLinux, enumerateThreadLockHolders, enumerateOrphanPanes, readProcEnviron } from './core/orphan-session-reaper.js';
 import { listeningServersOnPath, probeTmuxOwner, tmuxSocketPath, procIsBotmuxListener } from './core/tmux-server-guard.js';
@@ -528,7 +533,7 @@ import {
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
 import { createProductionDraftLaunchDeps, createProductionWorkflowDraftService, installWorkflowDraftService } from './core/workflow-draft-daemon.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setCardClickTurnPoster, productionWorkflowDraftClarifier, productionWorkflowDraftSessionBinder, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setCardClickTurnPoster, productionWorkflowDraftClarifier, productionWorkflowDraftProjects, productionWorkflowDraftSessionBinder, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -25667,7 +25672,11 @@ function deliverPassthroughToExistingSession(
     // the input never landed — the idle auto-compact sweep would otherwise
     // release its claim and compact the same idle stretch again.
     turn.onDelivered?.();
+    // A locally answered CLI command (/model, /cost, …) sends no request, so it
+    // must not arm a warm idle-auto-compact stretch (core/idle-auto-compact.ts).
+    const idleCompactArm = ds.idleAutoCompactArm;
     beginNewTurn(ds, commandContent, turnId);
+    if (isLocalCliCommand(cmd)) ds.idleAutoCompactArm = idleCompactArm;
     markPassthroughActivity(ds, turnId);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
     return true;
@@ -28980,6 +28989,16 @@ async function handleThreadReplyAdmitted(
     ? parseBotSteerDirective(parsed.content)
     : { requested: false, content: parsed.content };
   if (botSteerDirective.requested) parsed.content = botSteerDirective.content;
+  // `@session resume|fresh` (botmux dispatch --into … --session-mode): a peer
+  // bot's explicit choice for a topic whose session may have been closed.
+  // Transport-only like @steer; a human's text is left as written.
+  // Unlike @steer (text only) it changes persistent state (closes a session), so
+  // besides the @steer sender rule (a bot sender) it needs this bot to accept bot
+  // slash commands; the quota/talk gate then runs before anything is consumed.
+  const botSessionDirective = isForeignBot && botAcceptsSlashFromBots(larkAppId)
+    ? parseBotSessionDirective(parsed.content)
+    : { content: parsed.content };
+  if (botSessionDirective.mode) parsed.content = botSessionDirective.content;
   // Workflow node handoff (design 2026-11-03 §5.4): only a bot message whose
   // exact id carries a host-signed binding for this bot, chat and topic. It
   // marks the session as a node session, stages the node's inputs and shows
@@ -29408,7 +29427,11 @@ async function handleThreadReplyAdmitted(
     markIngressAdmitted(ctx);
     return;
   }
-  let ds = workflowGate ? workflowGate.session.current : activeSessions.get(runtimeSessionKey);
+  // `dsPre` only until the continuity step below may resume a closed session;
+  // `ds` is then const so TypeScript keeps its narrowing in later closures.
+  let dsPre = workflowGate ? workflowGate.session.current : activeSessions.get(runtimeSessionKey);
+  let pendingTopicContinuity: Omit<TopicContinuityRecord, 'at'> | undefined;
+  let announceFreshTopicSession = false;
   if (!workflowGate && effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   const workflowAdmission = workflowGate?.admission;
   // A retry / later round handed off into a node topic this bot already has
@@ -29418,16 +29441,16 @@ async function handleThreadReplyAdmitted(
     markIngressAdmitted(ctx);
     return;
   }
-  if (ds && workflowHandoff) {
-    ds.session.workflowNode = workflowNodeMarkerFromBinding(workflowHandoff, parsed.messageId);
-    sessionStore.updateSession(ds.session);
-    workflowNodeDaemon.onRegistered(ds.session.sessionId, ds.session.workflowNode);
+  if (dsPre && workflowHandoff) {
+    dsPre.session.workflowNode = workflowNodeMarkerFromBinding(workflowHandoff, parsed.messageId);
+    sessionStore.updateSession(dsPre.session);
+    workflowNodeDaemon.onRegistered(dsPre.session.sessionId, dsPre.session.workflowNode);
   }
   // cmdContent (mention-stripped), matching the host-ask gate below: a raw
   // "@<bot> 另开任务" is not a choice, so the answer would fall through, the
   // record would time out, and the notice would ask for the answer just sent.
-  if (ds && threadTrustedCaller
-    && await trySettleCrossPrincipalProposerChoice(ds, threadTrustedCaller, cmdContent, parsed.mentions)) {
+  if (dsPre && threadTrustedCaller
+    && await trySettleCrossPrincipalProposerChoice(dsPre, threadTrustedCaller, cmdContent, parsed.mentions)) {
     markIngressAdmitted(ctx);
     return;
   }
@@ -29435,31 +29458,31 @@ async function handleThreadReplyAdmitted(
   // active. Do this before native-topic mutation, quota/resource awaits,
   // dashboard preview, reply-target mutation, reactions or worker IPC: a busy
   // retry must be a pure claim-state transition.
-  if (ds && ctx.durablePrimaryDispatch) {
+  if (dsPre && ctx.durablePrimaryDispatch) {
     const disposition = durablePrimaryExistingTurnDisposition({
-      session: ds.session,
-      worker: ds.worker,
-      cliReady: ds.cliReady,
-      activeInteractiveTurn: ds.activeInteractiveTurn,
+      session: dsPre.session,
+      worker: dsPre.worker,
+      cliReady: dsPre.cliReady,
+      activeInteractiveTurn: dsPre.activeInteractiveTurn,
       // Durable queued-activation state is recovery INPUT, not proof that a
       // live handler already owns this dead worker's generation. Let the cold
       // path below replay that exact journal. Only a pending repository choice
       // or another handler's live claim token blocks this refork boundary.
-      workerStartBlocker: ds.pendingRepo === true
+      workerStartBlocker: dsPre.pendingRepo === true
         ? 'pending-repo'
-        : ds.initialStartPending === true && ds.initialStartClaimToken !== undefined
+        : dsPre.initialStartPending === true && dsPre.initialStartClaimToken !== undefined
           ? 'in-flight-claim'
           : undefined,
     }, parsed.messageId);
     if (disposition === 'committed') {
       const callerOpenId = parsed.senderId || data?.sender?.sender_id?.open_id;
-      markSessionActivity(ds, Date.now(), {
+      markSessionActivity(dsPre, Date.now(), {
         human: parsed.senderType === 'user' && !isForeignBot,
       });
-      const nativeTopicChanged = fillNativeTopicId(ds.session, scope, parsed.threadId);
-      if (!ctx.completionProposalContinuation) ds.session.quoteTargetId = parsed.messageId;
-      ds.session.quoteTargetSenderOpenId = callerOpenId;
-      ds.session.quoteTargetSenderIsBot = isForeignBot;
+      const nativeTopicChanged = fillNativeTopicId(dsPre.session, scope, parsed.threadId);
+      if (!ctx.completionProposalContinuation) dsPre.session.quoteTargetId = parsed.messageId;
+      dsPre.session.quoteTargetSenderOpenId = callerOpenId;
+      dsPre.session.quoteTargetSenderIsBot = isForeignBot;
       const substituteReplyMode = substituteTrigger
         ? (getBot(larkAppId).config.substituteMode?.replyMode ?? 'thread')
         : 'thread';
@@ -29473,7 +29496,7 @@ async function handleThreadReplyAdmitted(
         undefined,
         postAt,
       );
-      beginReplyTargetTurn(ds, replyRootId, parsed.messageId, new Date().toISOString(), {
+      beginReplyTargetTurn(dsPre, replyRootId, parsed.messageId, new Date().toISOString(), {
         quoteOnly: substituteReplyMode === 'quote',
         substitute: !!substituteTrigger,
         senderOpenId: callerOpenId,
@@ -29483,19 +29506,19 @@ async function handleThreadReplyAdmitted(
         foldedRootId: ctx.foldedRootId,
         sourceMessageId: parsed.messageId,
       });
-      if (callerOpenId) ds.session.lastCallerOpenId = callerOpenId;
-      publishLastInputFromBotPatch(ds);
-      if (ds.session.vcMeetingReceiver) {
-        ds.vcMeetingImTurnOrigin = ctx.vcMeetingImTurnOrigin;
+      if (callerOpenId) dsPre.session.lastCallerOpenId = callerOpenId;
+      publishLastInputFromBotPatch(dsPre);
+      if (dsPre.session.vcMeetingReceiver) {
+        dsPre.vcMeetingImTurnOrigin = ctx.vcMeetingImTurnOrigin;
         if (ctx.vcMeetingImTurnOrigin) {
-          rememberVcMeetingImTurnOrigin(ds.session, ctx.vcMeetingImTurnOrigin);
+          rememberVcMeetingImTurnOrigin(dsPre.session, ctx.vcMeetingImTurnOrigin);
         }
       }
-      sessionStore.updateSession(ds.session);
-      if (nativeTopicChanged) publishNativeTopicLinkPatch(ds);
+      sessionStore.updateSession(dsPre.session);
+      if (nativeTopicChanged) publishNativeTopicLinkPatch(dsPre);
       markIngressAdmitted(ctx);
       logger.info(
-        `[${tag(ds)}] Reused durable-primary provider submit proof for `
+        `[${tag(dsPre)}] Reused durable-primary provider submit proof for `
         + `${parsed.messageId.slice(0, 12)}`,
       );
       return;
@@ -29503,22 +29526,22 @@ async function handleThreadReplyAdmitted(
     if (disposition === 'retry') {
       retryDurablePrimaryIngress(ctx, 'session has an unfinished turn');
       logger.info(
-        `[${tag(ds)}] Requeued durable-primary turn ${parsed.messageId.slice(0, 12)} `
+        `[${tag(dsPre)}] Requeued durable-primary turn ${parsed.messageId.slice(0, 12)} `
         + 'behind the active session turn',
       );
       return;
     }
   }
-  if (ds && fillNativeTopicId(ds.session, scope, parsed.threadId)) {
-    sessionStore.updateSession(ds.session);
-    publishNativeTopicLinkPatch(ds);
+  if (dsPre && fillNativeTopicId(dsPre.session, scope, parsed.threadId)) {
+    sessionStore.updateSession(dsPre.session);
+    publishNativeTopicLinkPatch(dsPre);
   }
 
   // If another bot already owns this anchor, ignore unmentioned replies here as a
   // second line of defense. Explicit @mentions are still allowed to spin up/take over.
   // For chat-scope: another bot's session in the same chat is keyed by its own chatId.
   // For thread-scope: same rootMessageId may have peer sessions across bots.
-  if (!ds) {
+  if (!dsPre) {
     const mentionedThisBot = isBotMentioned(larkAppId, data?.message ?? {}, data?.sender?.sender_id?.open_id);
     const hasOtherBot = [...activeSessions.values()].some(s => {
       if (s.larkAppId === larkAppId) return false;
@@ -29530,6 +29553,108 @@ async function handleThreadReplyAdmitted(
       return;
     }
   }
+
+  // Quota/talk gate runs before any side effect below (continuity resume/close,
+  // initial-start claim).
+  const quotaSenderOpenId = threadSenderOpenId;
+  if (!prepared?.quotaChecked && !await enforceMessageQuotaForCliInput(
+    larkAppId,
+    ctxChatId ?? data?.message?.chat_id,
+    quotaSenderOpenId,
+    parsed.messageId,
+    anchor,
+    threadTeamTrustUnionId,
+    threadSenderUnionId,
+    ctxChatType,
+    isBotSenderType || isForeignBot,
+    { promptContent: parsed.content, promptAttachments: resources.map(r => ({ type: r.type, name: r.name })) },
+  )) {
+    return;
+  }
+  if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
+  // Topic session continuity (core/topic-session-continuity.ts). A topic whose
+  // session was closed used to get a brand-new CLI session on the next message,
+  // so a lead's `dispatch --into` follow-up reached an executor with no memory
+  // of the earlier work. Resume the topic's last closed session instead, unless
+  // a human closed it or the sender asked for `@session fresh`; record what
+  // happened. Only a resume, a requested fresh session or a failed resume is
+  // announced: a fresh session for a human-closed / retired / adopted row is the
+  // plain @ behaviour and stays silent. Durable primary mode fences local
+  // close/resume, so it keeps the plain fresh-session behaviour.
+  const primaryCoordination = coordinationModeIsPrimary();
+  if (primaryCoordination && botSessionDirective.mode) {
+    logger.info(`[${larkAppId}] topic ${anchor.substring(0, 12)}: @session ${botSessionDirective.mode} ignored in durable primary mode`);
+  }
+  if (scope === 'thread' && ctxChatId && !workflowHandoff && !ctx.completionProposalContinuation && !primaryCoordination) {
+    const continuityLocale = localeForBot(larkAppId);
+    const announceContinuity = (text: string) => sessionReply(anchor, text, 'text', larkAppId).catch(err => {
+      logger.warn(`[${larkAppId}] topic continuity notice failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    const liveDs = activeSessions.get(runtimeSessionKey);
+    if (liveDs && botSessionDirective.mode === 'fresh') {
+      if (hasProtectedSessionMutationOwnership(liveDs) || liveDs.initialStartPending) {
+        await announceContinuity(tr('daemon.topic_continuity.fresh_refused_busy', undefined, continuityLocale));
+      } else {
+        const previousSessionId = liveDs.session.sessionId;
+        const closeResult = await closeSessionHelper(previousSessionId, { userClosed: true });
+        if (!closeResult.ok) {
+          // Not proven closed (e.g. remote cancellation unverified): keep it and
+          // let it handle this message rather than run two sessions in one topic.
+          await announceContinuity(tr('daemon.topic_continuity.fresh_close_refused', {
+            error: closeResult.error,
+            taskId: 'taskId' in closeResult && closeResult.taskId ? String(closeResult.taskId) : '-',
+          }, continuityLocale));
+        } else {
+          if (closeResult.outcome === 'closed_with_residual') {
+            await announceContinuity(tr('daemon.topic_continuity.fresh_close_residual', {
+              detail: describeTopicCloseResidual(closeResult.residual),
+            }, continuityLocale));
+          }
+          if (!activeSessions.has(runtimeSessionKey)) {
+            pendingTopicContinuity = { mode: 'fresh-requested', previousSessionId };
+            announceFreshTopicSession = true;
+          }
+        }
+      }
+    } else if (!liveDs) {
+      // Strict listing (as the other reactivate routes): an unreadable store means
+      // "no continuation", never a guess from a partial list.
+      let previous: Session | undefined;
+      try {
+        previous = findLatestClosedTopicSession(sessionStore.listSessionsStrict(), {
+          larkAppId, chatId: ctxChatId, anchor: ctx.runtimeRoutingAnchor ?? anchor,
+        });
+      } catch (err) {
+        logger.warn(`[${larkAppId}] topic continuity: session store unreadable, not continuing: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (previous) {
+        const blocked = botSessionDirective.mode === 'fresh' ? 'fresh_requested' : topicResumeBlockReason(previous);
+        if (blocked === 'fresh_requested') {
+          pendingTopicContinuity = { mode: 'fresh-requested', previousSessionId: previous.sessionId };
+          announceFreshTopicSession = true;
+        } else if (blocked) {
+          pendingTopicContinuity = { mode: 'fresh-after-close', previousSessionId: previous.sessionId, reason: blocked };
+        } else {
+          const resumed = await resumeSession(previous.sessionId, activeSessions);
+          if (resumed.ok) {
+            resumed.ds.session.continuity = { mode: 'resumed', previousSessionId: previous.sessionId, at: new Date().toISOString() };
+            sessionStore.updateSession(resumed.ds.session);
+            logger.info(`[${larkAppId}] topic ${anchor.substring(0, 12)}: resumed closed session ${previous.sessionId.substring(0, 8)} for incoming message`);
+            await announceContinuity(tr('daemon.topic_continuity.resumed', { id: previous.sessionId.substring(0, 8) }, continuityLocale));
+          } else {
+            pendingTopicContinuity = { mode: 'fresh-after-close', previousSessionId: previous.sessionId, reason: resumed.error };
+            announceFreshTopicSession = true;
+          }
+        }
+        if (pendingTopicContinuity) {
+          logger.info(`[${larkAppId}] topic ${anchor.substring(0, 12)}: not continuing closed session ${previous.sessionId.substring(0, 8)} (${pendingTopicContinuity.reason ?? pendingTopicContinuity.mode}); starting fresh`);
+        }
+      }
+    }
+    dsPre = activeSessions.get(runtimeSessionKey);
+  }
+
+  const ds = dsPre;
 
   // Reserve an existing worker:null owner before ANY post-routing await.
   // withBotTurnAdmission permits concurrent turns, so two
@@ -29563,21 +29688,6 @@ async function handleThreadReplyAdmitted(
   );
 
   try {
-  const quotaSenderOpenId = threadSenderOpenId;
-  if (!prepared?.quotaChecked && !await enforceMessageQuotaForCliInput(
-    larkAppId,
-    ctxChatId ?? data?.message?.chat_id,
-    quotaSenderOpenId,
-    parsed.messageId,
-    anchor,
-    threadTeamTrustUnionId,
-    threadSenderUnionId,
-    ctxChatType,
-    isBotSenderType || isForeignBot,
-    { promptContent: parsed.content, promptAttachments: resources.map(r => ({ type: r.type, name: r.name })) },
-  )) {
-    return;
-  }
   // 种子 = 闸刚校验的 parsed.content。prepared 重投时闸已在新话题入口跑过（那边已调度）；
   if (effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   // 免@ 命令模板与监听器包装的正文不是用户在说事。
@@ -30014,6 +30124,18 @@ async function handleThreadReplyAdmitted(
     //                   (used as audit trail; routing key is chatId).
     const rootIdForStore = scope === 'thread' ? anchor : parsed.messageId;
     const session = sessionStore.createSession(autoCreateChatId, rootIdForStore, parsed.content.substring(0, 50), autoCreateChatType, undefined, { source: 'ordinary-feishu' });
+    if (pendingTopicContinuity) {
+      session.continuity = { ...pendingTopicContinuity, at: new Date().toISOString() };
+      sessionStore.updateSession(session);
+      if (announceFreshTopicSession) {
+        const id = (pendingTopicContinuity.previousSessionId ?? '').substring(0, 8);
+        const continuityLocale = localeForBot(larkAppId);
+        const notice = pendingTopicContinuity.mode === 'fresh-requested'
+          ? tr('daemon.topic_continuity.fresh_requested', { id }, continuityLocale)
+          : tr('daemon.topic_continuity.fresh_after_close', { id }, continuityLocale);
+        void sessionReply(anchor, notice, 'text', larkAppId).catch(() => undefined);
+      }
+    }
     const now = Date.now();
     // Bot-started handoff sessions have no human owner; keeping the bot as
     // owner makes daemon-generated footers wake that bot again.
@@ -33923,6 +34045,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   installWorkflowDraftService(createProductionWorkflowDraftService(
     cfg.larkAppId,
     productionWorkflowDraftClarifier(),
+    productionWorkflowDraftProjects(cfg.larkAppId),
     createProductionDraftLaunchDeps({
       appId: cfg.larkAppId,
       startRun: async (runId) => {

@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { LinkRefLedger } from '../src/services/link-ref-ledger.js';
-import { LINK_REF_RETENTION_MS, LinkRefError, type LinkRefCandidate, type LinkRefTurnKey } from '../src/services/link-ref-types.js';
+import { resolveOutboundLinkRefs } from '../src/services/link-ref-resolver.js';
+import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
+import { LINK_REF_MAX_URLS_PER_TURN, LINK_REF_RETENTION_MS, LinkRefError, type LinkRefCandidate, type LinkRefTurnKey } from '../src/services/link-ref-types.js';
 
 const key: LinkRefTurnKey = { appId: 'app-a', sessionId: 'session-a', turnId: 'turn-a', dispatchAttempt: 1 };
 const candidate = (originalUrl: string): LinkRefCandidate => ({ originalUrl, sourceType: 'tool' });
@@ -20,13 +22,80 @@ describe('LinkRefLedger', () => {
     sequence = 0;
     ledger = new LinkRefLedger(dataDir, {
       now: () => now,
-      randomBytes: () => Buffer.alloc(16, ++sequence),
+      randomBytes: () => { const bytes = Buffer.alloc(16); bytes.writeUInt32BE(++sequence); return bytes; },
     });
   });
 
   afterEach(() => {
     ledger.close();
     rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it('preserves a registration-limit refusal across reopening, later successful writes, and settlement', () => {
+    ledger.openTurn(key);
+    const original = 'https://example.test/problem?id=1';
+    const omitted = `https://example.test/problem?id=2&padding=${'x'.repeat(8 * 1024)}`;
+    ledger.registerBatch(key, [candidate(original), candidate(omitted)]);
+    ledger.registerBatch(key, [candidate('https://example.test/problem?id=3')]);
+    ledger.close();
+    ledger = new LinkRefLedger(dataDir, { now: () => now });
+    ledger.settleTurn(key);
+
+    expect(() => resolveOutboundLinkRefs(ledger, key, { text: omitted }, 'final'))
+      .toThrowError(expect.objectContaining({ code: 'link_ref_limit_exceeded' }));
+    expect(resolveOutboundLinkRefs(ledger, key, { text: original }, 'final').text).toBe(original);
+    expect(ledger.readTurn(key)).toEqual(expect.objectContaining({ registrationLimited: true, state: 'settled' }));
+  });
+
+  it('refuses URL finals when every source exceeded registration capacity but permits a plain error report', () => {
+    ledger.openTurn(key);
+    const omitted = `https://example.test/problem?padding=${'x'.repeat(9_000)}`;
+    ledger.registerBatch(key, [candidate(omitted)]);
+
+    expect(() => resolveOutboundLinkRefs(ledger, key, { text: omitted }, 'final'))
+      .toThrowError(expect.objectContaining({ code: 'link_ref_limit_exceeded' }));
+    expect(resolveOutboundLinkRefs(ledger, key, { text: '查询结果超过链接校验容量' }, 'final').text)
+      .toBe('查询结果超过链接校验容量');
+  });
+
+  it('rejects unregistered endpoints after overflow while preserving exact registered finals', () => {
+    ledger.openTurn(key);
+    const original = 'https://ops.example.test/help?id=1';
+    const omitted = `https://detail.example.test/problem?id=2&padding=${'x'.repeat(9_000)}`;
+    ledger.registerBatch(key, [candidate(original), candidate(omitted)]);
+
+    for (const text of [omitted, 'https://detail.example.test/problem?id=999']) {
+      expect(() => resolveOutboundLinkRefs(ledger, key, { text }, 'final'))
+        .toThrowError(expect.objectContaining({ code: 'link_ref_limit_exceeded' }));
+    }
+    expect(resolveOutboundLinkRefs(ledger, key, { text: original }, 'final').text).toBe(original);
+  });
+
+  it('migrates a legacy ledger without resetting its existing turn or losing overflow evidence', () => {
+    const legacy = join(dataDir, 'legacy');
+    mkdirSync(join(legacy, 'link-refs'), { recursive: true });
+    const db = openDatabaseSyncOrThrow(join(legacy, 'link-refs', 'link-refs.sqlite'));
+    db.exec(`CREATE TABLE link_ref_turns (
+      app_id TEXT NOT NULL, session_id TEXT NOT NULL, turn_id TEXT NOT NULL,
+      dispatch_attempt INTEGER NOT NULL, mode TEXT NOT NULL, state TEXT NOT NULL,
+      created_at_ms INTEGER NOT NULL, last_activity_at_ms INTEGER NOT NULL,
+      settled_at_ms INTEGER, expires_at_ms INTEGER NOT NULL, total_url_bytes INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(app_id, session_id, turn_id, dispatch_attempt)
+    )`);
+    db.prepare(`INSERT INTO link_ref_turns VALUES (?, ?, ?, ?, 'enabled', 'open', 100, 100, NULL, ?, 0)`)
+      .run(key.appId, key.sessionId, key.turnId, key.dispatchAttempt!, now + LINK_REF_RETENTION_MS);
+    db.close();
+    ledger.close();
+    ledger = new LinkRefLedger(legacy, { now: () => now });
+    const original = 'https://example.test/legacy?id=1';
+    ledger.registerBatch(key, [candidate(original), candidate(`https://example.test/legacy?padding=${'x'.repeat(9_000)}`)]);
+
+    expect(ledger.readTurn(key)).toEqual(expect.objectContaining({ createdAtMs: 100, registrationLimited: true }));
+    expect(resolveOutboundLinkRefs(ledger, key, { text: original }, 'final').text).toBe(original);
+    ledger.close();
+    ledger = new LinkRefLedger(legacy, { now: () => now });
+    expect(ledger.listRegistered(key).map(entry => entry.originalUrl)).toEqual([original]);
+    expect(ledger.readTurn(key)).toEqual(expect.objectContaining({ registrationLimited: true }));
   });
 
   it('creates immutable random refs and reuses byte-identical mappings', () => {
@@ -130,11 +199,11 @@ describe('LinkRefLedger', () => {
 
   it('skips over-limit URLs while retaining earlier registrations and reusable mappings', () => {
     ledger.openTurn(key);
-    const urls = Array.from({ length: 128 }, (_, index) => `https://example.test/${index}`);
+    const urls = Array.from({ length: LINK_REF_MAX_URLS_PER_TURN }, (_, index) => `https://example.test/${index}`);
     const first = ledger.registerBatch(key, urls.map(candidate));
     const later = ledger.registerBatch(key, [candidate(urls[0]!), candidate('https://example.test/overflow')]);
 
-    expect(first.registered).toHaveLength(128);
+    expect(first.registered).toHaveLength(urls.length);
     expect(later.registered).toHaveLength(1);
     expect(later.registered[0]?.originalUrl).toBe(urls[0]);
     expect(later.deduplicated).toBe(1);

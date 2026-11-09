@@ -18,6 +18,8 @@ export interface LinkRefTurnRecord extends Required<LinkRefTurnKey> {
   lastActivityAtMs: number;
   settledAtMs?: number;
   expiresAtMs: number;
+  /** At least one source URL could not be retained within the turn's limits. */
+  registrationLimited?: boolean;
 }
 
 export type LinkRefSourceType =
@@ -117,7 +119,8 @@ export interface LinkRefTurnEnvelope {
   sources?: LinkRefSourceInput[];
 }
 
-export const LINK_REF_MAX_URLS_PER_TURN = 128;
+export const LINK_REF_MAX_URLS_PER_TURN = 2048;
+export const LINK_REF_MAX_COMPANION_URLS = 128;
 export const LINK_REF_MAX_URL_BYTES = 8 * 1024;
 export const LINK_REF_MAX_TOTAL_URL_BYTES = 512 * 1024;
 export const LINK_REF_RETENTION_MS = 7 * 24 * 60 * 60_000;

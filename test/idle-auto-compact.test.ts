@@ -30,6 +30,7 @@ import {
   IDLE_AUTO_COMPACT_TURN_PREFIX,
   applyIdleAutoCompactSetting,
   clearIdleAutoCompactStretch,
+  isLocalCliCommand,
   noteIdleAutoCompactRefused,
   noteIdleAutoCompactTurnEnded,
   noteIdleAutoCompactTurnStarted,
@@ -50,6 +51,9 @@ function makeDs(id: string, opts: { enabled?: boolean; minutes?: number } = {}):
     lastScreenStatus: 'working',
   } as unknown as DaemonSession;
   if (opts.enabled) applyIdleAutoCompactSetting(ds.session, { enabled: true, minutes: opts.minutes });
+  // Starts mid-turn: a botmux turn is running (seen busy), so its idle edge is warm.
+  noteIdleAutoCompactTurnStarted(ds, `om_${id}_first`, T0 - 2 * MIN);
+  ds.idleAutoCompactArm!.busy = true;
   return ds;
 }
 
@@ -138,11 +142,37 @@ describe('idle auto-compact sweep', () => {
     edge(ds, 'idle', T0);
     const h = harness();
     h.sweepAt([ds], T0 + 30 * MIN);
+    noteIdleAutoCompactTurnStarted(ds, 'om_second', T0 + 30 * MIN);
     edge(ds, 'working', T0 + 30 * MIN);
     edge(ds, 'idle', T0 + 40 * MIN);
     expect(h.sweepAt([ds], T0 + 55 * MIN)).toBe(0);
     expect(h.sweepAt([ds], T0 + 94 * MIN)).toBe(0);
     expect(h.sweepAt([ds], T0 + 95 * MIN)).toBe(1);
+  });
+
+  it('a busy flicker that is not a botmux turn does not restart the clock', () => {
+    // E.g. a CLI restarting inside the same worker shows working before idle.
+    const ds = makeDs('dddd9999', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    edge(ds, 'working', T0 + 20 * MIN);
+    edge(ds, 'idle', T0 + 21 * MIN);
+    expect(h.sweepAt([ds], T0 + 55 * MIN)).toBe(1);
+  });
+
+  it('a stretch that expired days ago stays expired through a CLI restart showing working first', () => {
+    const ds = makeDs('dddd8888', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    h.sweepAt([ds], T0 + 61 * MIN); // past the cache window: skipped
+    // Two days later the CLI is restarted in place (crash auto-restart,
+    // /restart, model change); --resume boots with a working spinner first.
+    const r = T0 + 2 * 24 * 60 * MIN;
+    edge(ds, 'working', r + 15_000);
+    edge(ds, 'idle', r + 27_000);
+    for (let m = 0; m <= 120; m += 1) h.sweepAt([ds], r + m * MIN);
+    expect(h.compact).not.toHaveBeenCalled();
+    expect(h.notify).not.toHaveBeenCalled();
   });
 
   it('does not fire while a turn is running, however long it runs', () => {
@@ -175,7 +205,7 @@ describe('idle auto-compact sweep', () => {
     for (let m = 56; m <= 240; m += 1) h.sweepAt([ds], T0 + m * MIN);
     expect(h.compact).toHaveBeenCalledTimes(1);
     // Real activity afterwards opens a new stretch that is eligible again.
-    noteIdleAutoCompactTurnStarted(ds, 'om_user_turn');
+    noteIdleAutoCompactTurnStarted(ds, 'om_user_turn', T0 + 241 * MIN);
     edge(ds, 'working', T0 + 241 * MIN);
     edge(ds, 'idle', T0 + 242 * MIN);
     expect(h.sweepAt([ds], T0 + 297 * MIN)).toBe(1);
@@ -203,11 +233,16 @@ describe('idle auto-compact sweep', () => {
     expect(h.compact).toHaveBeenCalledTimes(1);
     // The topic hears it was skipped, never that it compacted.
     expect(h.notify.mock.calls.map(c => c[1].kind)).toEqual(['refused']);
-    // Activity that starts no botmux turn (typing in the web terminal) must not
-    // be mistaken for the refused compact's own busy→idle edge.
+    // Activity that starts no botmux turn (typing in the web terminal) is not
+    // proof of a warm cache: the handled stretch stays current.
     edge(ds, 'working', T0 + 61 * MIN);
     edge(ds, 'idle', T0 + 62 * MIN);
-    expect(h.sweepAt([ds], T0 + 117 * MIN)).toBe(1);
+    expect(h.sweepAt([ds], T0 + 117 * MIN)).toBe(0);
+    // The next botmux turn opens a fresh stretch.
+    noteIdleAutoCompactTurnStarted(ds, 'om_after_refusal', T0 + 120 * MIN);
+    edge(ds, 'working', T0 + 120 * MIN);
+    edge(ds, 'idle', T0 + 121 * MIN);
+    expect(h.sweepAt([ds], T0 + 176 * MIN)).toBe(1);
   });
 
   it('an undelivered send releases the claim so the next tick retries', () => {
@@ -329,6 +364,19 @@ describe('idle auto-compact across a daemon restart', () => {
     expect(h.sweepAt([restored], T0 + 55 * MIN)).toBe(1);
   });
 
+  it('turned on mid-stretch: the sweep mirrors the stretch so a restart continues it', () => {
+    const before = makeDs('cccc1111');
+    edge(before, 'idle', T0);
+    applyIdleAutoCompactSetting(before.session, { enabled: true });
+    const h = harness();
+    h.sweepAt([before], T0 + 5 * MIN);
+    expect(before.session.idleAutoCompact?.idleSince).toBe(T0);
+    const restored = restartFrom(before);
+    edge(restored, 'idle', T0 + 30 * MIN);
+    expect(h.sweepAt([restored], T0 + 55 * MIN)).toBe(1);
+    expect(h.compact.mock.calls[0][0]).toBe(restored);
+  });
+
   it('a compacted stretch stays handled after restart', () => {
     const ds = makeDs('dddd0000', { enabled: true });
     edge(ds, 'idle', T0);
@@ -356,15 +404,109 @@ describe('idle auto-compact across a daemon restart', () => {
     expect(h.compact).toHaveBeenCalledTimes(1);
   });
 
-  it('a message newer than the persisted stretch starts a new one', () => {
+  it('a daemon restart mid-turn keeps the turn: its idle edge after reattach is warm', () => {
     const before = makeDs('eeee0000', { enabled: true });
     edge(before, 'idle', T0);
+    noteIdleAutoCompactTurnStarted(before, 'om_mid_restart', T0 + 10 * MIN);
+    edge(before, 'working', T0 + 10 * MIN);
+    expect(before.session.idleAutoCompact?.armed).toEqual({ at: T0 + 10 * MIN, busy: true });
+    // The daemon restarts; the turn ends while it is down.
     const restored = restartFrom(before);
-    restored.session.lastMessageAt = new Date(T0 + 20 * MIN).toISOString();
-    edge(restored, 'idle', T0 + 30 * MIN);
+    edge(restored, 'idle', T0 + 12 * MIN);
     const h = harness();
-    expect(h.sweepAt([restored], T0 + 55 * MIN)).toBe(0);
-    expect(h.sweepAt([restored], T0 + 85 * MIN)).toBe(1);
+    // Dated from the turn start: its request was no earlier than that.
+    expect(h.sweepAt([restored], T0 + 64 * MIN)).toBe(0);
+    expect(h.sweepAt([restored], T0 + 65 * MIN)).toBe(1);
+  });
+
+  it('a daemon down for days mid-turn: the reattach idle edge is not a warm stretch', () => {
+    const before = makeDs('eeee0001', { enabled: true });
+    edge(before, 'idle', T0);
+    noteIdleAutoCompactTurnStarted(before, 'om_before_outage', T0 + 10 * MIN);
+    edge(before, 'working', T0 + 10 * MIN);
+    const back = T0 + 2 * 24 * 60 * MIN;
+    const restored = restartFrom(before);
+    edge(restored, 'idle', back);
+    const h = harness();
+    for (let m = 0; m <= 120; m += 1) h.sweepAt([restored], back + m * MIN);
+    expect(h.compact).not.toHaveBeenCalled();
+    expect(h.notify).not.toHaveBeenCalled();
+  });
+
+  it('a turn that ends in a usage limit: leaving limited hours later is not a warm stretch', () => {
+    const ds = makeDs('eeee0002', { enabled: true });
+    edge(ds, 'idle', T0);
+    noteIdleAutoCompactTurnStarted(ds, 'om_limited', T0 + 10 * MIN);
+    edge(ds, 'working', T0 + 10 * MIN);
+    const prev = ds.lastScreenStatus;
+    ds.lastScreenStatus = 'limited';
+    stampIdleSinceAt(ds, prev, T0 + 11 * MIN);
+    edge(ds, 'idle', T0 + 5 * 60 * MIN);
+    const h = harness();
+    for (let m = 0; m <= 120; m += 1) h.sweepAt([ds], T0 + 5 * 60 * MIN + m * MIN);
+    expect(h.compact).not.toHaveBeenCalled();
+  });
+
+  it('a turn that never went busy (rejected) does not warm a much later busy flicker', () => {
+    const ds = makeDs('eeee0003', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    h.sweepAt([ds], T0 + 61 * MIN); // expired
+    noteIdleAutoCompactTurnStarted(ds, 'om_rejected', T0 + 70 * MIN);
+    const later = T0 + 2 * 24 * 60 * MIN;
+    edge(ds, 'working', later); // CLI crash-restart spinner two days later
+    edge(ds, 'idle', later + 20_000);
+    for (let m = 0; m <= 120; m += 1) h.sweepAt([ds], later + m * MIN);
+    expect(h.compact).not.toHaveBeenCalled();
+  });
+
+  it('an idle edge before the turn goes busy keeps the arm for the real busy period', () => {
+    const ds = makeDs('eeee0004', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    h.sweepAt([ds], T0 + 61 * MIN); // expired
+    noteIdleAutoCompactTurnStarted(ds, 'om_slow_start', T0 + 100 * MIN);
+    // A stray idle report before the turn's input reaches the CLI.
+    edge(ds, 'working', T0 + 100 * MIN + 1_000);
+    ds.idleAutoCompactArm!.busy = false; // that flicker preceded the turn's busy
+    edge(ds, 'idle', T0 + 100 * MIN + 2_000);
+    expect(ds.idleAutoCompactArm).toBeDefined();
+    // The turn's real busy period, then its idle edge: warm from there.
+    edge(ds, 'working', T0 + 101 * MIN);
+    edge(ds, 'idle', T0 + 170 * MIN);
+    expect(h.sweepAt([ds], T0 + 224 * MIN)).toBe(0);
+    expect(h.sweepAt([ds], T0 + 225 * MIN)).toBe(1);
+  });
+
+  it('re-affirming "on" mid-turn keeps the persisted arm', () => {
+    const before = makeDs('eeee0005', { enabled: true });
+    edge(before, 'idle', T0);
+    noteIdleAutoCompactTurnStarted(before, 'om_reaffirm', T0 + 10 * MIN);
+    edge(before, 'working', T0 + 10 * MIN);
+    applyIdleAutoCompactSetting(before.session, { enabled: true, minutes: 30 });
+    persisted.updates.push(structuredClone(before.session.idleAutoCompact));
+    expect(before.session.idleAutoCompact?.armed).toEqual({ at: T0 + 10 * MIN, busy: true });
+    const restored = restartFrom(before);
+    edge(restored, 'idle', T0 + 12 * MIN);
+    const h = harness();
+    expect(h.sweepAt([restored], T0 + 40 * MIN)).toBe(1);
+  });
+
+  it('a row with no persisted stretch: idle for days, reattach at restart is not timed as fresh idle', () => {
+    // Opted in on a build that never mirrored the stretch (or the mirror was
+    // lost): the row says enabled and nothing else.
+    const before = makeDs('eeee2222', { enabled: true });
+    edge(before, 'idle', T0);
+    before.session.idleAutoCompact = { enabled: true };
+    persisted.updates.push(structuredClone(before.session.idleAutoCompact));
+    // Two days later the daemon restarts and reattaches the live tmux CLI.
+    const reattachAt = T0 + 2 * 24 * 60 * MIN;
+    const restored = restartFrom(before);
+    edge(restored, 'idle', reattachAt);
+    const h = harness();
+    for (let m = 0; m <= 120; m += 1) h.sweepAt([restored], reattachAt + m * MIN);
+    expect(h.compact).not.toHaveBeenCalled();
+    expect(h.notify).not.toHaveBeenCalled();
   });
 
   it('a marker inherited across a restart folds silently on the FIRST idle edge', () => {
@@ -387,10 +529,15 @@ describe('idle auto-compact across a daemon restart', () => {
   it('the screen-edge bookkeeping is saved while opted in, never while off', () => {
     const on = makeDs('ffff0000', { enabled: true });
     edge(on, 'idle', T0);
-    edge(on, 'working', T0 + MIN);
+    edge(on, 'working', T0 + MIN); // not a turn: nothing to save
+    edge(on, 'idle', T0 + 2 * MIN);
+    noteIdleAutoCompactTurnStarted(on, 'om_ffff', T0 + 3 * MIN);
+    edge(on, 'working', T0 + 3 * MIN);
+    edge(on, 'idle', T0 + 4 * MIN);
     expect(persisted.updates).toEqual([
       { enabled: true, idleSince: T0 },
-      { enabled: true },
+      { enabled: true, idleSince: T0, armed: { at: T0 + 3 * MIN, busy: true } },
+      { enabled: true, idleSince: T0 + 4 * MIN },
     ]);
     persisted.updates = [];
     const off = makeDs('ffff1111');
@@ -464,6 +611,19 @@ describe('idle auto-compact interrupted turns', () => {
     expect(ds.idleAutoCompactPendingNotice).toBeUndefined();
   });
 
+  it('a compact cancelled before its idle edge is not compacted again 55 minutes later', () => {
+    const ds = makeDs('intr0009', { enabled: true });
+    edge(ds, 'idle', T0);
+    const h = harness();
+    h.sweepAt([ds], T0 + 55 * MIN);
+    const turnId = h.compact.mock.calls[0][1];
+    edge(ds, 'working', T0 + 55 * MIN + 1_000);
+    noteIdleAutoCompactTurnEnded(ds, turnId, 'cancelled'); // Ctrl-C
+    edge(ds, 'idle', T0 + 56 * MIN);
+    for (let m = 57; m <= 200; m += 1) h.sweepAt([ds], T0 + m * MIN);
+    expect(h.compact).toHaveBeenCalledTimes(1);
+  });
+
   it('a cancelled terminal inherited from a restart posts nothing (no local witness)', () => {
     const before = makeDs('intr0005', { enabled: true });
     edge(before, 'idle', T0);
@@ -478,24 +638,30 @@ describe('idle auto-compact interrupted turns', () => {
 });
 
 describe('idle auto-compact across a worker suspend', () => {
-  it('clearIdleAutoCompactStretch drops only the live-stretch mirror and marker', () => {
-    const session: { idleAutoCompact?: any } = {};
-    expect(clearIdleAutoCompactStretch(session)).toBe(false);
-    applyIdleAutoCompactSetting(session, { enabled: true, minutes: 20 });
-    expect(clearIdleAutoCompactStretch(session)).toBe(false);
-    session.idleAutoCompact.idleSince = T0;
-    session.idleAutoCompact.inFlight = { turnId: 'auto-compact:idle:x', since: T0, idleMinutes: 20 };
-    expect(clearIdleAutoCompactStretch(session)).toBe(true);
-    expect(session.idleAutoCompact).toEqual({ enabled: true, minutes: 20 });
+  it('clearIdleAutoCompactStretch drops the stretch, the arm and the marker', () => {
+    const ds = { session: {} } as unknown as DaemonSession;
+    expect(clearIdleAutoCompactStretch(ds)).toBe(false);
+    applyIdleAutoCompactSetting(ds.session, { enabled: true, minutes: 20 });
+    expect(clearIdleAutoCompactStretch(ds)).toBe(false);
+    ds.idleAutoCompactWarmSince = T0;
+    ds.idleAutoCompactArm = { at: T0, busy: true };
+    Object.assign(ds.session.idleAutoCompact!, {
+      idleSince: T0, armed: { at: T0, busy: true },
+      inFlight: { turnId: 'auto-compact:idle:x', since: T0, idleMinutes: 20 },
+    });
+    expect(clearIdleAutoCompactStretch(ds)).toBe(true);
+    expect(ds.session.idleAutoCompact).toEqual({ enabled: true, minutes: 20 });
+    expect(ds.idleAutoCompactWarmSince).toBeUndefined();
+    expect(ds.idleAutoCompactArm).toBeUndefined();
     // Idempotent.
-    expect(clearIdleAutoCompactStretch(session)).toBe(false);
+    expect(clearIdleAutoCompactStretch(ds)).toBe(false);
   });
 
-  it('a message-less cold resume starts a fresh stretch: no immediate /compact on the cold CLI', () => {
+  it('a message-less cold resume is never compacted: its cache was never warmed', () => {
     const ds = makeDs('susp001', { enabled: true, minutes: 55 });
     edge(ds, 'idle', T0);
     // suspendWorker(): live fields and the persisted mirror are all dropped.
-    expect(clearIdleAutoCompactStretch(ds.session)).toBe(true);
+    expect(clearIdleAutoCompactStretch(ds)).toBe(true);
     ds.idleSinceAt = undefined;
     ds.lastScreenStatus = undefined;
     ds.idleAutoCompactPendingNotice = undefined;
@@ -505,9 +671,33 @@ describe('idle auto-compact across a worker suspend', () => {
     const h = harness();
     edge(ds, 'idle', T0 + 56 * MIN);
     expect(h.sweepAt([ds], T0 + 56 * MIN)).toBe(0);
-    // The timer counts from the fresh edge, not from before the suspend.
-    expect(h.sweepAt([ds], T0 + 110 * MIN)).toBe(0);
-    expect(h.sweepAt([ds], T0 + 111 * MIN)).toBe(1);
+    // Nor 55 minutes after the cold start: compacting would read it all cold.
+    for (let m = 57; m <= 240; m += 1) h.sweepAt([ds], T0 + m * MIN);
+    expect(h.compact).not.toHaveBeenCalled();
+    expect(h.notify).not.toHaveBeenCalled();
+    // A cold resume can also show working before its first idle (a slow
+    // --resume boot): still no request, still cold.
+    edge(ds, 'working', T0 + 241 * MIN);
+    edge(ds, 'idle', T0 + 242 * MIN);
+    expect(h.sweepAt([ds], T0 + 297 * MIN)).toBe(0);
+    // The next botmux turn warms it.
+    noteIdleAutoCompactTurnStarted(ds, 'om_after_resume', T0 + 300 * MIN);
+    edge(ds, 'working', T0 + 300 * MIN);
+    edge(ds, 'idle', T0 + 301 * MIN);
+    expect(h.sweepAt([ds], T0 + 356 * MIN)).toBe(1);
+  });
+
+  it('turning the feature on after a cold start does not time the cold stretch', () => {
+    const ds = makeDs('susp002');
+    edge(ds, 'idle', T0);
+    clearIdleAutoCompactStretch(ds); // suspend
+    ds.idleSinceAt = undefined;
+    ds.lastScreenStatus = undefined;
+    edge(ds, 'idle', T0 + 10 * MIN); // cold resume while the feature is off
+    applyIdleAutoCompactSetting(ds.session, { enabled: true });
+    const h = harness();
+    for (let m = 10; m <= 120; m += 1) h.sweepAt([ds], T0 + m * MIN);
+    expect(h.compact).not.toHaveBeenCalled();
   });
 });
 
@@ -526,6 +716,14 @@ describe('idle auto-compact support and command parsing', () => {
     expect(supportsIdleAutoCompact({ ...base, headless: true })).toBe(false);
     expect(supportsIdleAutoCompact({ ...base, vcMeetingReceiver: true })).toBe(false);
     expect(supportsIdleAutoCompact({ ...base, backendType: 'remote-runner' })).toBe(false);
+  });
+
+  it('only locally answered CLI commands are exempt from arming a warm stretch', () => {
+    expect(isLocalCliCommand('/model opus')).toBe(true);
+    expect(isLocalCliCommand('/cost')).toBe(true);
+    expect(isLocalCliCommand('/review')).toBe(false);
+    expect(isLocalCliCommand('/compact')).toBe(false);
+    expect(isLocalCliCommand('/my-skill do it')).toBe(false);
   });
 
   it('parses on / off / minutes / status and rejects out-of-range minutes', () => {

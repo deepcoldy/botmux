@@ -1,7 +1,7 @@
 import { getBotClient } from '../bot-registry.js';
 import { larkGet } from '../im/lark/client.js';
 import { withFileLock } from '../utils/file-lock.js';
-import { managerLockPath, parseManagerDescription, readManagerClaim, writeManagerClaim } from './chat-manager-state.js';
+import { managerLockPath, parseManagerDescription, isLeadOnlyManagerClaim, readManagerClaim, writeManagerClaim } from './chat-manager-state.js';
 
 export async function readManagerChat(app: string, chat: string) {
   const res = await larkGet(getBotClient(app), `/open-apis/im/v1/chats/${encodeURIComponent(chat)}`, {}, { timeoutMs: 3_000 });
@@ -28,7 +28,7 @@ export async function isChatManager(app: string, chat: string): Promise<boolean>
 }
 
 export type ManagerResult =
-  | { ok: true; changed: boolean; managerAppId?: string; locallyEnabled: boolean }
+  | { ok: true; changed: boolean; managerAppId?: string; locallyEnabled: boolean; leadOnly?: boolean }
   | { ok: false; reason: string };
 
 const publicErrors = new Set([
@@ -52,7 +52,8 @@ export async function getChatManagerStatus(app: string, chat: string): Promise<M
     const remote = await readManagerChat(app, chat);
     const managerAppId = parseManagerDescription(remote.description).appId;
     return { ok: true, changed: false, managerAppId,
-      locallyEnabled: managerAppId === app && !!readManagerClaim(app, chat)?.enabled };
+      locallyEnabled: managerAppId === app && !!readManagerClaim(app, chat)?.enabled,
+      leadOnly: managerAppId === app && isLeadOnlyManagerClaim(app, chat) };
   } catch (error) { return failure(error); }
 }
 
@@ -92,7 +93,7 @@ export async function changeChatManager(
         return { ok: true, changed: false, managerAppId: app, locallyEnabled: true };
       }
       if (action === 'clear' && !parsed.appId) {
-        if (local?.enabled) writeManagerClaim({ ...local, enabled: false });
+        if (local?.enabled) writeManagerClaim({ ...local, enabled: false, leadOnly: undefined });
         return { ok: true, changed: false, locallyEnabled: false };
       }
 
@@ -116,9 +117,33 @@ export async function changeChatManager(
       if (confirmed.name !== name || confirmed.description !== description) {
         throw new Error('chat_update_unconfirmed');
       }
-      if (action === 'clear' && local) writeManagerClaim({ ...local, enabled: false });
+      if (action === 'clear' && local) writeManagerClaim({ ...local, enabled: false, leadOnly: undefined });
       return { ok: true, changed: true, managerAppId: action === 'set' ? app : undefined,
         locallyEnabled: action === 'set' };
+    });
+  } catch (error) { return failure(error); }
+}
+
+/**
+ * Toggle lead-only on this bot's own manager claim. Same gate as set/clear (the caller
+ * proves a real human turn); only the current manager may flip it. Takes effect on the
+ * next session (re)start — running sessions keep the value frozen at spawn.
+ */
+export async function setChatManagerLeadOnly(
+  app: string, chat: string, leadOnly: boolean,
+  stillCurrent: () => boolean = () => true,
+): Promise<ManagerResult> {
+  try {
+    if (!/^[A-Za-z0-9_-]+$/.test(app)) throw new Error('invalid_app_id');
+    return await withFileLock(managerLockPath(chat), async (): Promise<ManagerResult> => {
+      const remote = await readManagerChat(app, chat);
+      const parsed = parseManagerDescription(remote.description);
+      const local = readManagerClaim(app, chat);
+      if (!stillCurrent()) throw new Error('human_turn_changed');
+      if (parsed.appId !== app || !local?.enabled) throw new Error('not_current_manager');
+      const changed = (local.leadOnly === true) !== leadOnly;
+      if (changed) writeManagerClaim({ ...local, leadOnly });
+      return { ok: true, changed, managerAppId: app, locallyEnabled: true, leadOnly };
     });
   } catch (error) { return failure(error); }
 }

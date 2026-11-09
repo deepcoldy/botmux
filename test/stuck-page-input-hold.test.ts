@@ -40,6 +40,7 @@ const TRAEX_STARTUP = page('traex-0.213.1-hooks-startup-menu.txt');
 const TRAEX_L1 = page('traex-0.213.1-hooks-browser-l1.txt');
 const TRAEX_STARTUP_AFTER_ESC = page('traex-0.213.1-hooks-startup-menu-after-l1-esc.txt');
 const TRAEX_MIGRATION = page('traex-0.213.1-migration-menu.txt');
+const TRAEX_LOCK = page('traex-0.213.1-session-lock.txt');
 const TRAEX_COMPOSER = page('traex-0.213.1-composer-after-hooks-esc.txt');
 const CODEX_L2 = page('codex-0.164.0-sessionstart-detail-l2.txt');
 const CODEX_STARTUP = page('codex-0.164.0-sessionstart-startup-menu.txt');
@@ -179,7 +180,7 @@ function harness(cliId: CliId, opts: {
 
 describe('input hold scope follows the adapter declaration', () => {
   it.each(['codex', 'traex', 'coco'] as const)('%s holds on every recognised page, migration picker included', cliId => {
-    for (const screen of [TRAEX_STARTUP, TRAEX_L1, CODEX_L2, TRAEX_MIGRATION]) {
+    for (const screen of [TRAEX_STARTUP, TRAEX_L1, CODEX_L2, TRAEX_MIGRATION, TRAEX_LOCK]) {
       const h = harness(cliId);
       h.fn('refreshHookReviewInputHold')(screen);
       expect(h.scope.hookReviewInputHold).toBe(true);
@@ -190,8 +191,35 @@ describe('input hold scope follows the adapter declaration', () => {
     const h = harness('claude-code');
     h.fn('refreshHookReviewInputHold')(TRAEX_MIGRATION);
     expect(h.scope.hookReviewInputHold).toBe(false);
+    h.fn('refreshHookReviewInputHold')(TRAEX_LOCK);
+    expect(h.scope.hookReviewInputHold).toBe(false);
     h.fn('refreshHookReviewInputHold')(CODEX_L2);
     expect(h.scope.hookReviewInputHold).toBe(true);
+  });
+});
+
+describe('session lock input admission', () => {
+  it('holds the pending turn without consuming it, then delivers once after stable recovery', async () => {
+    const held = { turnId: 'turn_lock', dispatchAttempt: 2 };
+    const worker = harness('traex', { screen: TRAEX_LOCK, pending: [held], gateFlush: true });
+    await worker.scope.flushPending();
+    await worker.scope.flushPending();
+    expect(worker.delivered()).toBe(0);
+    expect(worker.scope.pendingMessages).toEqual([held]);
+    expect(worker.sent).toEqual([expect.objectContaining({
+      type: 'stuck_warning', reason: 'input_held', matchedPattern: 'session lock',
+      turnId: 'turn_lock', dispatchAttempt: 2, screenTail: pageTail(TRAEX_LOCK),
+    })]);
+    worker.scope.screen = TRAEX_COMPOSER;
+    worker.fn('refreshHookReviewInputHold')(TRAEX_COMPOSER);
+    expect(worker.scope.hookReviewInputHold).toBe(true);
+    worker.runTimers();
+    await Promise.resolve();
+    expect(worker.delivered()).toBe(1);
+    expect(worker.scope.pendingMessages).toEqual([]);
+    worker.runTimers();
+    await Promise.resolve();
+    expect(worker.delivered()).toBe(1);
   });
 });
 
@@ -402,6 +430,15 @@ describe('codex-family hold across transient frames', () => {
 });
 
 describe('first-prompt timeout on a recognised page', () => {
+  it('cannot force a pending prompt into a session lock', () => {
+    const worker = harness('traex', { screen: TRAEX_LOCK, pending: [{ turnId: 'turn_first' }] });
+    expect(worker.fn('holdFirstPromptForStuckPage')('First prompt timeout')).toBe(true);
+    expect(worker.scope.pendingMessages).toEqual([{ turnId: 'turn_first' }]);
+    expect(worker.sent[0]).toMatchObject({
+      type: 'stuck_warning', reason: 'input_held', matchedPattern: 'session lock', turnId: 'turn_first',
+    });
+  });
+
   it('keeps the queued prompt held and raises the card instead of letting the timeout write', () => {
     const h = harness('traex', { screen: TRAEX_MIGRATION, pending: [{ turnId: 'turn_first' }] });
     expect(h.fn('holdFirstPromptForStuckPage')('First prompt timeout')).toBe(true);
@@ -622,6 +659,46 @@ describe('tui_keys IPC from a stuck card (real handler)', () => {
     await k.click('hook review startup', ['Enter']);
     expect(k.written).toEqual([]);
     expect(k.sent).toEqual([{ type: 'stuck_warning_expired', nonce: 4, turnId: 'turn_current', dispatchAttempt: undefined }]);
+  });
+
+  it('R while another process still owns the session keeps input held and reports the lock', async () => {
+    const worker = keyHarness([TRAEX_LOCK, TRAEX_LOCK]);
+    worker.fn('refreshHookReviewInputHold')(TRAEX_LOCK);
+    worker.fn('notifyHookReviewInputHold')();
+    await worker.click('session lock', ['r']);
+    expect(worker.written).toEqual([['r']]);
+    expect(worker.scope.hookReviewInputHold).toBe(true);
+    expect(worker.scope.pendingMessages).toEqual([{ turnId: 'turn_held' }]);
+    expect(worker.sent).toContainEqual(expect.objectContaining({
+      type: 'tui_keys_delivered', key: 'r', afterObserved: true, afterPageType: 'session lock',
+    }));
+    expect(worker.flushes()).toBe(0);
+  });
+
+  it('R after the owner exits observes recovery and releases only after a stable capture', async () => {
+    const worker = keyHarness([TRAEX_LOCK, TRAEX_COMPOSER]);
+    worker.fn('refreshHookReviewInputHold')(TRAEX_LOCK);
+    await worker.click('session lock', ['r']);
+    expect(worker.written).toEqual([['r']]);
+    expect(worker.scope.hookReviewInputHold).toBe(true);
+    worker.scope.screen = TRAEX_COMPOSER;
+    worker.runTimers();
+    expect(worker.scope.hookReviewInputHold).toBe(false);
+    expect(worker.flushes()).toBe(1);
+  });
+
+  it('an old retry click cannot type r into an already recovered composer', async () => {
+    const worker = keyHarness([TRAEX_COMPOSER]);
+    await worker.click('session lock', ['r']);
+    expect(worker.written).toEqual([]);
+    expect(worker.sent[0]).toMatchObject({ type: 'stuck_warning_expired', nonce: 4 });
+  });
+
+  it.each([['Enter'], ['Escape'], ['q'], ['C-c'], ['r', 'Enter']].map(keys => ({ keys })))('rejects unlisted lock-page keys $keys', async ({ keys }) => {
+    const worker = keyHarness([TRAEX_LOCK]);
+    await worker.click('session lock', keys);
+    expect(worker.written).toEqual([]);
+    expect(worker.sent[0]).toMatchObject({ type: 'stuck_warning_expired' });
   });
 
   it('re-matches with the full classifier (startup menu and migration picker cards are clickable)', async () => {

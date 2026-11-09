@@ -38,7 +38,8 @@ import {
   type WorkflowInitiatorResolution,
 } from './workflow-initiator.js';
 import { createProductionDraftClarifier, registerWorkflowDraftIpcRoutes, workflowDraftService } from './workflow-draft-daemon.js';
-import type { DraftClarifier } from '../workflows/v3/draft-service.js';
+import type { DraftClarifier, WorkflowDraftProjects } from '../workflows/v3/draft-service.js';
+import { scanMultipleProjects } from '../services/project-scanner.js';
 import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
 import { updateHandoffLiveCard } from './worker-pool.js';
 import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator } from './schedule-creator-authorization.js';
@@ -49,7 +50,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createReadStream, existsSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { hostDnsServers, networkPolicyWarnings, proxyEnvKeys } from './sandbox-network-policy.js';
-import { join } from 'node:path';
+import { join, resolve as resolvePath } from 'node:path';
 import { updateDispatchRegistry } from './dispatch-registry.js';
 import { logger } from '../utils/logger.js';
 import type { DurableLarkOutboxTarget } from '../services/durable-lark-outbox.js';
@@ -74,7 +75,7 @@ import * as sessionStore from '../services/session-store.js';
 import { applySessionRowCommand } from '../services/session-commands.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
 import { allowsTaskModelOverride } from './launch-model-capability.js';
-import { parseHookCommand } from '../services/hook-runner.js';
+import { emitHookEventLocal, parseHookCommand } from '../services/hook-runner.js';
 import {
   cliModelSupportsReasoningEffort,
   isBackendVariantCliId,
@@ -119,6 +120,7 @@ import {
   SchedulePreconditionError,
 } from '../services/schedule-precondition-runner.js';
 import * as groupsStore from '../services/groups-store.js';
+import { GROUP_SEND_BODY_MAX_BYTES, parseGroupSendBody, readRequestBoundGroupMessage, sendRequestBoundGroupMessage } from '../services/request-bound-group-send.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
@@ -241,7 +243,7 @@ import {
 } from '../services/quota-fallback.js';
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
-import { readGlobalConfig, isDispatchTaskTreeCardEnabled, isWorkflowFeatureEnabled, workflowNodeExecutorMode } from '../global-config.js';
+import { readGlobalConfig, isDispatchTaskTreeCardEnabled, isWorkflowFeatureEnabled, workflowNodeExecutorMode, repoPickerScanOptions } from '../global-config.js';
 import { archiveCodexForCleanup } from '../services/codex-cleanup-archive.js';
 import {
   clearChatReplyMode,
@@ -291,7 +293,7 @@ import {
 } from '../services/group-collaboration-mode-store.js';
 import { publishNativeTopicLinkPatchForSession } from './session-activity.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
-import { createHeadlessSession, resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
+import { createHeadlessSession, resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, expandHome, getProjectScanDirsForBot } from './session-manager.js';
 import { reconcileResumedStreamingCard } from './resume-streaming-card.js';
 import { buildRestartStatusCard, restartStatusCardNotifier } from './restart-status-card.js';
 import type { RestartObserver } from './restart-coordinator.js';
@@ -621,7 +623,8 @@ import { ChatRenameCooldown, chatRenameSerialQueue, normalizeLarkChatName } from
 import { isSilentMessageListenerSession } from './message-listener-silence.js';
 import { executeChatRename } from './chat-rename-operation.js';
 import { authorizeHumanManager } from './human-manager-authorization.js';
-import { changeChatManager, getChatManagerStatus } from '../services/chat-manager.js';
+import { planChatManagerMutation } from './lead-only.js';
+import { changeChatManager, getChatManagerStatus, setChatManagerLeadOnly } from '../services/chat-manager.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, isHttpVirtualSession, isHeadlessSessionChatId, larkTransportEnabled, type DaemonSession } from './types.js';
 import { isRemoteBackendSession, persistentBackendTargetForSession, probePersistentBackendTarget } from './persistent-backend.js';
@@ -687,6 +690,8 @@ export function ipcRoute(method: string, path: string, handler: Handler): void {
   routes.push({ method: method.toUpperCase(), pattern, keys, handler });
 }
 
+const groupSendStorePath = (larkAppId: string): string => join(config.session.dataDir, `group-sends-${larkAppId}.json`);
+
 export function jsonRes(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));
@@ -714,12 +719,24 @@ function requireBoundBot(handler: Handler, notBound: object = NOT_BOUND_BODY.leg
 const BAD_JSON: unique symbol = Symbol('bad_json');
 
 /**
- * 读取并解析请求 JSON（无大小上限，同 `readJsonBody(req)`）。失败时已回写
- * 400 `{ ok: false, error: 'bad_json' }`，调用方写 `if (body === BAD_JSON) return;` 即可。
+ * 读取并解析请求 JSON。`maxBytes` 缺省时无大小上限（同 `readJsonBody(req)`）。
+ * 失败时已回写 400 `{ ok: false, error: 'bad_json' }`，超限回 413
+ * `{ ok: false, error: 'body_too_large' }`。调用方写 `if (body === BAD_JSON) return;` 即可。
  */
-async function readJsonBodyOrBadJson<T = unknown>(req: IncomingMessage, res: ServerResponse): Promise<T | typeof BAD_JSON> {
-  try { return await readJsonBody<T>(req); }
-  catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return BAD_JSON; }
+async function readJsonBodyOrBadJson<T = unknown>(
+  req: IncomingMessage,
+  res: ServerResponse,
+  maxBytes?: number,
+): Promise<T | typeof BAD_JSON> {
+  try { return await readJsonBody<T>(req, maxBytes); }
+  catch (error) {
+    if (error instanceof JsonBodyTooLargeError) {
+      jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+      return BAD_JSON;
+    }
+    jsonRes(res, 400, { ok: false, error: 'bad_json' });
+    return BAD_JSON;
+  }
 }
 
 /** `botConfigPutRoute` 的 normalize 结果：待写入的值，或 400 的 error。 */
@@ -2401,6 +2418,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
   const closeCurrentGeneration = () => closeSession(params.sessionId, {
     ...(isTrustedHostIpcRequest(req) && body.idleCleanup === true && body.idleCleanupSource === 'scheduled'
       ? { backgroundExecutionCleanup: true } : {}),
+    // Dashboard "close" and `botmux delete` are human closes (empty body); only
+    // idle/auto cleanup (idleCleanup: true) stays resumable.
+    ...(body.idleCleanup === true ? {} : { userClosed: true }),
     onCodexCleanupRelease: ticket => { codexArchiveReleaseTicket = ticket; },
   });
   const cleanupSource = body.idleCleanupSource === 'manual' ? 'manual'
@@ -2440,6 +2460,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
       if (current.backgroundExecutionCleanupClosedAt
         && !(isTrustedHostIpcRequest(req) && body.idleCleanup === true && body.idleCleanupSource === 'scheduled')) {
         await closeCurrentGeneration();
+      }
+      // A human re-close of a row that idle cleanup already closed is still the
+      // human's intent to end the conversation: stamp it so the topic does not
+      // auto-resume (closeSession's stamp only fires on an open -> closed edge).
+      if (body.idleCleanup !== true) {
+        const row = sessionStore.getOwnedSession(params.sessionId);
+        if (row && row.status === 'closed' && !row.userClosedAt) {
+          row.userClosedAt = new Date().toISOString();
+          sessionStore.updateSession(row);
+        }
       }
       // A closed row can still carry an UNCANCELLED remote session (a quarantined
       // lineage is parked, not cancelled). Short-circuiting to a bare success here
@@ -3700,10 +3730,14 @@ for (const action of ['auth-request', 'auth-status']) {
       return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
     }
     const origin = ds?.managedTurnOrigin;
+    const denyCurrentActor = (reason: string) => {
+      logger.warn(`[session-auth] session=${params.sessionId} action=${action} reason=${reason}`);
+      return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+    };
     if (!ds || ds.session.status !== 'active' || sessionTransportDisabled(ds)
       || ds.session.vcMeetingReceiver || !ds.worker || ds.worker.killed
       || !origin?.turnId || !origin.capability) {
-      return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+      return denyCurrentActor('origin_unavailable');
     }
     // Two proof modes for "this request belongs to the current turn":
     //  · Isolated pane (sandbox / read isolation): presents the rotating
@@ -3717,7 +3751,7 @@ for (const action of ['auth-request', 'auth-status']) {
     if (presentsOriginTuple) {
       if (body.originCapability !== origin.capability || body.originTurnId !== origin.turnId
         || body.originDispatchAttempt !== origin.dispatchAttempt) {
-        return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+        return denyCurrentActor('origin_tuple_mismatch');
       }
     } else if (!boundTool) {
       const peer = await resolveLoopbackPeerProcesses({
@@ -3728,7 +3762,7 @@ for (const action of ['auth-request', 'auth-status']) {
       if (!peer.ok || !attestCurrentExecutionLoopbackPeer({
         sessionId: params.sessionId, peer: peer.peer, findSession: findActiveBySessionId,
       })) {
-        return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+        return denyCurrentActor('execution_peer_unverified');
       }
     }
     const cfg = getBot(ds.larkAppId).config;
@@ -3746,7 +3780,7 @@ for (const action of ['auth-request', 'auth-status']) {
     const identityTurnId = origin.identityTurnId ?? origin.turnId;
     const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId);
     const callerOpenId = requestingUser();
-    if (!callerOpenId) return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+    if (!callerOpenId) return denyCurrentActor('caller_unavailable');
     const originCallerOpenId = origin.callerOpenId;
     const turnId = origin.turnId;
     const capability = origin.capability;
@@ -3876,7 +3910,7 @@ for (const action of ['auth-request', 'auth-status']) {
       ? cached
       : await resolveVerifiedUserIdentity(ds.larkAppId, callerOpenId);
     if (!identity || identity.type !== 'user' || identity.openId !== callerOpenId || !isCurrent()) {
-      return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+      return denyCurrentActor(!isCurrent() ? 'origin_changed_during_identity_lookup' : 'identity_unverified');
     }
     // A person with no grant to this bot's application usually cannot give one
     // (the app's availability range excludes them); their lark-cli identity
@@ -3892,7 +3926,7 @@ for (const action of ['auth-request', 'auth-status']) {
       });
     }
     // The check above awaited; the turn may have moved on meanwhile.
-    if (!isCurrent()) return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+    if (!isCurrent()) return denyCurrentActor('origin_changed_during_platform_lookup');
     // Issuance is turn-bound; an accepted grant belongs to this app/user and
     // session until its own deadline. A different speaker cannot claim it.
     const appId = cfg.larkAppId;
@@ -4041,25 +4075,26 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-manager', async (req, res, param
     return jsonRes(res, 400, { ok: false, error: 'regular_group_only' });
   }
   if (body.action === 'status') return jsonRes(res, 200, await getChatManagerStatus(ds.larkAppId, ds.chatId));
-  if (body.action !== 'set' && body.action !== 'clear') return jsonRes(res, 400, { ok: false, error: 'invalid_action' });
-  // `set` requires the per-bot manager switch. `clear` (teardown) and status are
+  // `set` and `lead-only on` require the per-bot manager switch. `clear`, `lead-only off` and status are
   // intentionally left ungated so an admin can always remove the manager / inspect
   // state even after turning the switch off — the switch gates activation, not removal.
-  if (body.action === 'set' && getBot(ds.larkAppId).config.chatManagerEnabled !== true) {
-    return jsonRes(res, 409, { ok: false, error: 'chat_manager_disabled' });
-  }
+  const plan = planChatManagerMutation(body, getBot(ds.larkAppId).config.chatManagerEnabled === true);
+  if (!plan.ok) return jsonRes(res, plan.status, { ok: false, error: plan.error });
   const { getMessageDetail } = await import('../im/lark/client.js');
   const { effectiveBotDisplayName } = await import('../bot-registry.js');
   const human = await authorizeHumanManager({
     sessionId: ds.session.sessionId, appId: ds.larkAppId, chatId: ds.chatId,
-    action: body.action, claim: body, targetOpenId: getBotOpenId(ds.larkAppId),
+    action: plan.authAction,
+    claim: body, targetOpenId: getBotOpenId(ds.larkAppId),
     liveOrigin: () => findActiveBySessionId(params.sessionId)?.managedTurnOrigin,
     readMessage: getMessageDetail,
     canOperate: (app, chat, sender) => getBot(app).resolvedAllowedUsers.includes(sender) && canOperate(app, chat, sender),
   });
   if (!human.ok) return jsonRes(res, 403, human);
-  const result = await changeChatManager(ds.larkAppId, ds.chatId, body.action,
-    effectiveBotDisplayName(getBot(ds.larkAppId)), human.stillCurrent);
+  const result = plan.action === 'lead-only'
+    ? await setChatManagerLeadOnly(ds.larkAppId, ds.chatId, plan.leadOnly as boolean, human.stillCurrent)
+    : await changeChatManager(ds.larkAppId, ds.chatId, plan.action,
+      effectiveBotDisplayName(getBot(ds.larkAppId)), human.stillCurrent);
   return jsonRes(res, result.ok ? 200 : 409, result);
 });
 /** Session-scoped external mutation used by the botmux-chat-rename Skill. */
@@ -7045,6 +7080,24 @@ export function productionWorkflowDraftClarifier(): DraftClarifier {
   });
 }
 
+/** The drafts' projects: this bot's effective default dir, else the same
+ *  candidates the Feishu repo picker card offers a new topic. */
+export function productionWorkflowDraftProjects(larkAppId: string): WorkflowDraftProjects {
+  return {
+    defaultDir: () => {
+      const dir = effectiveDefaultWorkingDir(getBot(larkAppId).config);
+      return dir ? resolvePath(expandHome(dir)) : undefined;
+    },
+    candidates: () => {
+      const scanDirs = getProjectScanDirsForBot(larkAppId).filter((dir) => existsSync(dir));
+      if (scanDirs.length === 0) return [];
+      return scanMultipleProjects(scanDirs, 3, repoPickerScanOptions())
+        .map(({ path, name, type, branch }) => ({ path, name, type, ...(branch ? { branch } : {}) }));
+    },
+    sessionDir: (sessionId) => findActiveBySessionId(sessionId)?.workingDir ?? sessionStore.getOwnedSession(sessionId)?.workingDir,
+  };
+}
+
 /**
  * 拉群开始 第 4 步 (design 2026-11-03 workflow-dashboard-orchestration §4.5,
  * E7): move a draft's clarify session into the main topic — the same
@@ -7871,6 +7924,49 @@ ipcRoute('GET', '/api/groups/:chatId/membership', requireBoundBot(async (_req, r
     jsonRes(res, 502, { error: String(e) });
   }
 }));
+
+/**
+ * Request-bound send (see services/request-bound-group-send.ts): body exactly
+ * `{requestId, content}` (plain text). Returns `{ok, messageId, replayed}`.
+ * The same requestId never produces a second visible message; an attempt whose
+ * outcome cannot be reconciled any more is `409 outcome_unknown`.
+ *
+ * `sendMessage` always suppresses its own outbound hook. The hook fires from
+ * `onCommitted` after the sent record is durable, at most once per message id.
+ * `larkAppId` and `chatId` are on that payload because hook filters gate on them.
+ */
+ipcRoute('POST', '/api/groups/:chatId/messages', requireBoundBot(async (req, res, p) => {
+  const body = await readJsonBodyOrBadJson<unknown>(req, res, GROUP_SEND_BODY_MAX_BYTES);
+  if (body === BAD_JSON) return;
+  const input = parseGroupSendBody(body);
+  if (!input) return jsonRes(res, 400, { ok: false, error: 'invalid_request' });
+  const larkAppId = cachedLarkAppId;
+  try {
+    const result = await sendRequestBoundGroupMessage({
+      larkAppId, storePath: groupSendStorePath(larkAppId),
+      send: (chatId, text, uuid) => sendMessage(larkAppId, chatId, text, 'text', uuid, undefined, { suppressHook: true }),
+      onCommitted: (payload) => emitHookEventLocal('outbound.send', { ...payload }),
+    }, { chatId: p.chatId, ...input });
+    const { status, ...rest } = result;
+    return jsonRes(res, status, rest);
+  } catch (e) {
+    // Fail closed. The provider may already have accepted (the post-send save
+    // failed). Retry this same requestId; a new one can post a second message.
+    logger.warn(`[group-send] store unavailable: ${e instanceof Error ? e.message : String(e)}`);
+    return jsonRes(res, 503, { ok: false, error: 'store_unavailable', retryable: true });
+  }
+}, NOT_BOUND_BODY.okFalse));
+
+/** Read-back of one message in this chat: sender, deleted flag, text and the bound requestId (if any). */
+ipcRoute('GET', '/api/groups/:chatId/messages/:messageId', requireBoundBot(async (_req, res, p) => {
+  const larkAppId = cachedLarkAppId;
+  const result = await readRequestBoundGroupMessage({
+    larkAppId, storePath: groupSendStorePath(larkAppId),
+    detail: id => getMessageDetail(larkAppId, id, { userCardContent: false, timeoutMs: 10000 }),
+  }, p.chatId, p.messageId);
+  if (!result.ok) return jsonRes(res, result.status, { ok: false, error: result.error });
+  return jsonRes(res, 200, result);
+}, NOT_BOUND_BODY.okFalse));
 
 /** Host-only rename through this daemon's exact bot identity. */
 ipcRoute('PUT', '/api/groups/:chatId/name', requireBoundBot(async (req, res, p) => {

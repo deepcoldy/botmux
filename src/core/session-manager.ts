@@ -1,4 +1,5 @@
 import { isWorkflowNodeSessionMarker, workflowHandoffInputOptions } from './workflow-node-session.js';
+import { isLeadOnlySession } from './lead-only.js';
 import { deploymentContinuationCandidate, claimDeploymentContinuation, deploymentContinuationClaimCurrent, setDeploymentContinuation } from '../services/deployment-continuation.js';
 import { canTalk } from '../im/lark/event-dispatcher.js';
 import { isSessionGroup, touchSessionGroup } from '../services/session-groups-store.js';
@@ -1101,12 +1102,15 @@ export function ensureSessionWhiteboard(ds: DaemonSession): void {
   }
 }
 
-function renderWhiteboardBlock(opts?: { whiteboardId?: string; noTransport?: boolean; replyDelivery?: ReplyDelivery; locale?: Locale }): string {
+function renderWhiteboardBlock(opts?: { whiteboardId?: string; noTransport?: boolean; replyDelivery?: ReplyDelivery; locale?: Locale; sessionId?: string; cliId?: string; larkAppId?: string }): string {
   if (!whiteboardEnabled() || !opts?.whiteboardId) return '';
   const meta = getWhiteboard(opts.whiteboardId);
   if (!meta || meta.archived) return '';
   const id = xmlEscape(meta.id);
   const locale = opts.locale;
+  // lead-only 负责人会话的守卫拒绝 `whiteboard --id`；不带 --id 时 CLI 按调用会话解析到
+  // 同一块已绑定的白板，所以只有这类会话改用不带 id 的读取/更新指令。
+  const leadOnly = !!opts.sessionId && isLeadOnlySessionRow(opts.sessionId, opts.cliId, opts.larkAppId);
   // Copy migrated to i18n keys ai.whiteboard.* (customizable via the
   // customization center, byte-identical when uncustomized). Only the update
   // line gets the tag-like-token escape — it alone contains the prose token
@@ -1123,8 +1127,8 @@ function renderWhiteboardBlock(opts?: { whiteboardId?: string; noTransport?: boo
       : 'ai.whiteboard.block_tail_send';
   return [
     `<whiteboard id="${id}">`,
-    t('ai.whiteboard.block_read', { id }, locale),
-    escapeXmlTagLikeTokens(t('ai.whiteboard.block_update', { id }, locale)),
+    t(leadOnly ? 'ai.whiteboard.block_read_lead_only' : 'ai.whiteboard.block_read', { id }, locale),
+    escapeXmlTagLikeTokens(t(leadOnly ? 'ai.whiteboard.block_update_lead_only' : 'ai.whiteboard.block_update', { id }, locale)),
     t('ai.whiteboard.block_rewrite', undefined, locale),
     t('ai.whiteboard.block_cas', undefined, locale),
     t(tailKey, undefined, locale),
@@ -1337,6 +1341,19 @@ function isWorkflowNodeSessionRow(sessionId: string): boolean {
   return isWorkflowNodeSessionMarker(sessionStore.getSession(sessionId)?.workflowNode);
 }
 
+/** Re-derived per turn from the manager claim: a lead-only toggle after spawn can disagree with the
+ *  worker's frozen value until the session restarts. */
+function isLeadOnlySessionRow(sessionId: string, cliId: string | undefined, larkAppId: string | undefined): boolean {
+  try {
+    const session = sessionStore.getSession(sessionId);
+    if (!session || (cliId ?? session.cliLaunchSnapshot?.cliId ?? session.cliId) !== 'claude-code') return false;
+    const app = session.larkAppId ?? larkAppId;
+    return !!app && isLeadOnlySession(app, session.chatId, session.chatType, session);
+  } catch {
+    return false;
+  }
+}
+
 function inputPromptInjection(sessionId: string, larkAppId?: string, cliId?: string): PromptInjection {
   const session = sessionStore.getSession(sessionId);
   if (session) return session.promptInjection ?? 'default';
@@ -1528,6 +1545,9 @@ function buildNewTopicBlocks(
     noTransport,
     replyDelivery,
     locale,
+    sessionId,
+    cliId,
+    larkAppId: opts?.larkAppId,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, locale);
   const groupJoinContextBlock = renderGroupJoinContextBlock(opts?.groupJoinContext);
@@ -1879,6 +1899,9 @@ function buildFollowUpBlocks(
     noTransport,
     replyDelivery: transcript ? 'transcript' : 'send',
     locale: opts?.locale,
+    sessionId,
+    cliId: opts?.cliId,
+    larkAppId: opts?.larkAppId,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, opts?.locale);
   const formattingBlock = opts?.cliId !== 'mira' && !noTransport
