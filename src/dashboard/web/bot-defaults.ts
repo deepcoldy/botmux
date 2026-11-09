@@ -29,6 +29,7 @@ export const BOT_DEFAULTS_TAB_LABEL_KEYS: Readonly<Record<BotDefaultsTab, string
 };
 
 export function parseBotDefaultsTab(value: string | null | undefined): BotDefaultsTab | null {
+  if (value === 'oncall') return 'cards';
   return value && (BOT_DEFAULTS_TABS as readonly string[]).includes(value) ? value as BotDefaultsTab : null;
 }
 
@@ -184,6 +185,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   },
   { id: 'ask-option-layout', tab: 'cards', titleKey: 'botDefaults.sectionAskOptionLayout' },
   { id: 'brand', tab: 'cards', titleKey: 'botDefaults.sectionBrand', fieldKeys: ['botDefaults.brandLabel'] },
+  { id: 'oncall', tab: 'cards', titleKey: 'botDefaults.sectionOncall' },
   { id: 'backend', tab: 'advanced', titleKey: 'botDefaults.sectionBackend', fieldKeys: ['botDefaults.backendLabel'] },
   {
     id: 'herdr',
@@ -461,6 +463,7 @@ export type BotDefaultsRow = {
   /** Show tool calls/commands/results in unified reply cards. Default ON;
    *  only meaningful for replyCardMode 'unified'. */
   replyCardShowTools?: boolean;
+  replyCardNativeCot?: boolean;
   /** Whether each turn carries the `<sender>` speaker tag. Default ON — only an
    *  explicit false means the tag is suppressed. */
   senderTag?: boolean;

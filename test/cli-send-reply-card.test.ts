@@ -27,6 +27,95 @@ const presentation = { showProcess: true, showToolResults: true, canStop: true }
 
 describe('real CLI send into a running reply card', () => {
   it.each([
+    { cliId: 'traex', timing: 'first', unified: true },
+    { cliId: 'traex', timing: 'final', unified: true },
+    { cliId: 'codex', timing: 'final', unified: true },
+    { cliId: 'claude-code', timing: 'final', unified: false },
+  ])('requires explicit response kind only for a managed card ($cliId/$timing/$unified)', async ({ cliId, timing, unified }) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-send-kind-'));
+    const dataDir = join(root, 'data');
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: key.sessionId, turnId: key.turnId }));
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: key.larkAppId, larkAppSecret: 'fixture', cliId,
+        replyCardMode: unified ? 'unified' : 'legacy', cotEnabled: false, replyCardNativeCot: true,
+        oncallGroup: { enabled: true, chatIds: ['oc_test'], button: { timing, minTurns: 1 } },
+      }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        ...key, status: 'active', cliId, chatId: 'oc_test', rootMessageId: 'om_root',
+        scope: 'thread', chatType: 'group', workingDir: root,
+      } });
+      const store = new TurnReplyCardStore(dataDir);
+      if (unified) await store.prepare(key, { mode: 'unified', nativeCot: true, chatId: 'oc_test', rootId: 'om_root' });
+      const before = store.read(key);
+      const send = (kind?: string) => spawnSyncTsScript(fixture, ['send', '--no-mention',
+        ...(kind ? ['--response-kind', kind] : []), 'A complete answer.'], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: key.turnId, BOTMUX_LARK_APP_ID: key.larkAppId,
+          BOTMUX_DAEMON_IPC_PORT: '49501', BOTMUX_TEST_NATIVE_COT_BARRIER: 'ready' },
+        encoding: 'utf8', timeout: 30_000,
+      });
+      const unclassified = send();
+      if (!unified) {
+        expect(unclassified.status, String(unclassified.stderr)).toBe(0);
+        expect(String(unclassified.stdout)).toContain('CAPTURE_REPLY=');
+        return;
+      }
+      expect(unclassified.status).toBe(2);
+      expect(String(unclassified.stderr)).toContain('--response-kind');
+      expect(String(unclassified.stdout)).not.toContain('CAPTURE_REPLY=');
+      expect(store.read(key)).toEqual(before);
+      const final = send('final');
+      expect(final.status, String(final.stderr)).toBe(0);
+      await store.update(key, { kind: 'terminal', phase: 'completed' }, {
+        beforeEffect: () => {}, isWithdrawn: () => false,
+        send: async () => { throw new Error('terminal must reuse the published answer'); }, patch: async () => {},
+        render: record => buildTurnReplyCard(record, { showProcess: false, showToolResults: false, canStop: false }),
+      });
+      const record = store.read(key)!;
+      expect(record.finalDelivered).toBe(true);
+      expect(record.finalSource).toBe('explicit');
+      expect(record.progress).toEqual([]);
+      const card = JSON.parse(record.lastCard!);
+      expect(card.body.elements.some((element: any) => ['botmux_turn_status', 'botmux_turn_process'].includes(element.element_id))).toBe(false);
+      expect(record.lastCard).toContain('oncall_group_create');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 35_000);
+
+  it.each(['ready', 'denied'])('waits for the native thinking barrier before its first answer (%s)', async barrier => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-native-order-cli-'));
+    const dataDir = join(root, 'data');
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: key.sessionId, turnId: key.turnId }));
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{ larkAppId: key.larkAppId, larkAppSecret: 'fixture', cliId: 'codex', replyCardMode: 'unified' }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        ...key, status: 'active', cliId: 'codex', larkAppId: key.larkAppId, chatId: 'oc_test', rootMessageId: 'om_root',
+        scope: 'thread', chatType: 'group', workingDir: root,
+      } });
+      await new TurnReplyCardStore(dataDir).prepare(key, { mode: 'unified', nativeCot: true, chatId: 'oc_test', rootId: 'om_root' });
+      const result = spawnSyncTsScript(fixture, ['send', '--no-mention', '--response-kind', 'final', 'Ordered answer'], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: key.turnId, BOTMUX_LARK_APP_ID: key.larkAppId,
+          BOTMUX_DAEMON_IPC_PORT: '49501', BOTMUX_TEST_NATIVE_COT_BARRIER: barrier },
+        encoding: 'utf8', timeout: 30_000,
+      });
+      const lines = String(result.stdout).split('\n');
+      expect(lines.indexOf('CAPTURE_NATIVE_READY')).toBeGreaterThanOrEqual(0);
+      if (barrier === 'ready') {
+        expect(result.status, String(result.stderr)).toBe(0);
+        expect(lines.findIndex(line => line.startsWith('CAPTURE_REPLY='))).toBeGreaterThan(lines.indexOf('CAPTURE_NATIVE_READY'));
+      } else {
+        expect(result.status).not.toBe(0);
+        expect(lines.some(line => line.startsWith('CAPTURE_REPLY='))).toBe(false);
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it.each([
     {
       name: 'Pi current-session --mention',
       cliId: 'pi',
@@ -892,6 +981,30 @@ describe('CLI local fallback snapshot selects the host console entry', () => {
       expect(card).toContain('LOCAL FALLBACK BODY');
       expect(card).toContain(DEFAULT_BRAND_LABEL);
       expect(card.includes(`](${consoleEntry})`)).toBe(linked);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 35_000);
+});
+
+
+describe('session Oncall after the CLI turn lease retires', () => {
+  it('retains the proven session turn and group on an independently sent final card', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-oncall-retired-turn-')); const dataDir = join(root, 'data');
+    try {
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{ larkAppId: key.larkAppId, larkAppSecret: 'test-secret', cliId: 'claude-code',
+        replyCardMode: 'legacy', oncallGroup: { enabled: true, chatIds: ['oc_test'], flowMode: 'classify', formDisplay: 'thread_card' } }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: { sessionId: key.sessionId, status: 'active', cliId: 'claude-code',
+        larkAppId: key.larkAppId, chatId: 'oc_test', rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root } });
+      const source = { appId: key.larkAppId, sessionId: key.sessionId, chatId: 'oc_test', messageId: 'om_progress', questionId: key.turnId, answer: '' };
+      const store = new OncallGroupStore(dataDir); store.registerTurn(key.larkAppId, key.sessionId, key.turnId); store.recordSource(source);
+      store.claim(source); store.finish(source, { status: 'succeeded', openChatId: 'oc_existing' }, store.getRequest(source)!.attemptId);
+      const result = spawnSyncTsScript(fixture, ['send', '--no-mention', '--response-kind', 'final', 'Delivered final'], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)), env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir,
+          BOTS_CONFIG: join(root, 'bots.json'), BOTMUX_SESSION_ID: key.sessionId, BOTMUX_LARK_APP_ID: key.larkAppId }, encoding: 'utf8', timeout: 30_000 });
+      expect(result.status, String(result.stderr)).toBe(0);
+      const delivered = String(result.stdout).split('\n').find(line => line.startsWith('CAPTURE_REPLY='));
+      expect(delivered).toContain('oc_existing');
+      expect(store.findSource(key.larkAppId, 'om_separate_message')?.questionId).toBe(key.turnId);
+      store.recordSource(source); expect(store.latest(key.larkAppId, key.sessionId)?.messageId).toBe('om_separate_message');
     } finally { rmSync(root, { recursive: true, force: true }); }
   }, 35_000);
 });

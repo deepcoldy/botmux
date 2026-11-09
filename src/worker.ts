@@ -12021,6 +12021,7 @@ function structuredBridgeIngestPath(
 
 function codexBridgeStartTimer(): void {
   if (codexBridgeTimer) return;
+  log(`Structured bridge poller armed (cliId=${lastInitConfig?.cliId ?? 'unknown'})`);
   // Single 1s ticker that handles three jobs: late-attach (poll for the
   // rollout file once we know cliSessionId), ingest (fs.watch backup),
   // and idle-window emit. The last is critical for the late-attach race:
@@ -12569,6 +12570,27 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
       codexBridgePendingTail = cursor.pendingTail;
       codexBridgeBaselineDone = true;
       log(`Codex bridge baselined: ${rolloutPath} (offset=${codexBridgeOffset})`);
+      // A resumed CLI may receive a new prompt before its first owned rollout
+      // is discovered. Preserve those live marks instead of baselining past it.
+      const pending = structuredBridgeIs('traex') ? codexBridgeQueue.peek().filter(turn =>
+        !turn.restoredFromJournal && !turn.started && turn.finalText === undefined && turn.markTimeMs !== undefined) : [];
+      if (pending.length) {
+        const entries = pending.map(turn => ({ turnId: turn.turnId, markTimeMs: turn.markTimeMs!, jsonlPath: rolloutPath,
+          offsetAtMark: turn.recoveryJsonlPathAtMark === rolloutPath ? turn.recoveryOffsetAtMark ?? 0 : 0 }));
+        const plan = planBridgeTurnRecovery(entries, cursor.newOffset);
+        if (plan.kind === 'recover') {
+          const replay = structuredBridgeIngestPath(rolloutPath, plan.fromOffset);
+          const cutoff = Math.min(...pending.map(turn => turn.markTimeMs!));
+          const { history, live } = splitCodexEventsByCutoff(replay.events, cutoff);
+          codexBridgeQueue.absorb(history);
+          codexBridgeQueue.ingest(live);
+          codexBridgeOffset = replay.newOffset;
+          codexBridgePendingTail = replay.pendingTail;
+          emitReadyCodexTurns();
+          if (live.some(event => event.kind === 'assistant_final')) idleDetector?.fireIdle();
+          log(`TRAE initial baseline retained ${pending.length} live pending turn(s)`);
+        }
+      }
     }
     }
   } else {
@@ -13412,24 +13434,28 @@ function maybeFollowGrokSessionRotationViaPid(): void {
   codexBridgeNotifyCliSessionId(observed.sessionId);
 }
 
-/** Follow a TRAE in-process session rotation for direct local input in an
- * adopted pane. `codexBridgeNotifyCliSessionId` performs the drain-before-
- * detach switch and persists the newly observed native session id. */
+/** Discover the rollout actually held by the live TRAE process, including its
+ * first lazily opened rollout when submit verification returned no session id.
+ * `codexBridgeNotifyCliSessionId` also owns rotation's drain-before-detach. */
 function maybeFollowTraexSessionRotationViaPid(): void {
-  if (lastInitConfig?.adoptMode !== true
-    || !structuredBridgeIs('traex') || !codexBridgeRolloutPath || !backend) return;
+  if (!structuredBridgeIs('traex') || !backend) return;
   const now = Date.now();
   if (now - traexBridgePidProbeLastMs < TRAEX_BRIDGE_PID_PROBE_INTERVAL_MS) return;
+  const firstProbe = traexBridgePidProbeLastMs === 0;
   traexBridgePidProbeLastMs = now;
-  const pid = (backend as { cliPid?: number }).cliPid
-    ?? backend.getChildPid?.()
-    ?? codexAdoptPendingPid;
+  const pid = currentTraexObservedPid();
+  if (firstProbe) log(`TRAE bridge first PID probe: wired=${(backend as { cliPid?: number }).cliPid ?? 'none'}, observed=${pid ?? 'none'}, bound=${!!codexBridgeRolloutPath}, resume=${lastSpawnEffectiveResume}`);
   if (!pid) return;
-  const currentSid = traexSessionIdFromRolloutPath(codexBridgeRolloutPath);
+  const currentSid = codexBridgeRolloutPath ? traexSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
   const observed = findTraexRolloutByPid(pid, currentSid);
   if (!observed) return;
   if (currentSid?.toLowerCase() === observed.cliSessionId.toLowerCase()) return;
   persistCliSessionId(observed.cliSessionId);
+  if (!codexBridgeRolloutPath && lastSpawnEffectiveResume && !lastInitConfig?.adoptMode) {
+    codexBridgePendingSessionId = undefined;
+    codexBridgeAttach(observed.path, 'baseline-existing');
+    return;
+  }
   codexBridgeNotifyCliSessionId(observed.cliSessionId);
 }
 
@@ -13777,11 +13803,11 @@ function structuredBridgeRecoveryCursorAtMark(): { jsonlPath: string; offsetAtMa
     ?? lastSpawnEffectiveCliSessionId
     ?? (spec?.spawn?.sessionId === 'cli-or-adapter' ? lastSpawnEffectiveAdapterSessionId : undefined)
     ?? lastInitConfig?.cliSessionId;
-  if (!sessionIdAtMark) return undefined;
-  const jsonlPath = resolveFileBridgePath(cliId, {
+  const jsonlPath = (sessionIdAtMark ? resolveFileBridgePath(cliId, {
     sessionId: sessionIdAtMark,
     cwd: lastInitConfig?.workingDir,
-  });
+  }) : undefined) ?? (cliId === 'traex' && currentTraexObservedPid()
+    ? findTraexRolloutByPid(currentTraexObservedPid()!)?.path : undefined);
   if (!jsonlPath) return undefined;
   const cursor = baselineJsonlCursor(jsonlPath);
   return { jsonlPath, offsetAtMark: cursor.newOffset };
@@ -14102,7 +14128,9 @@ function notifyUncollectedStructuredTurns(turns: readonly CodexPendingTurn[]): v
     send({
       type: 'user_notify',
       message: uncollectedStructuredTurnNotice(),
+      kind: 'structured_turn_not_collected',
       turnId: turn.turnId,
+      ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
     });
   }
 }
@@ -14160,6 +14188,7 @@ function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
   holdStructuredStartLeasesWhileCliStarting();
   let fenceCurrentRpcEngine = false;
   const settledByTerminal = new Set<CodexPendingTurn>();
+  const displayRetirements: CodexPendingTurn[] = [];
   const dropped = pruneExpiredPreStartHeadsAndEmit(
     codexBridgeQueue,
     emitReadyCodexTurns,
@@ -14206,6 +14235,10 @@ function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
             turn.dispatchAttempt,
           );
           settledByTerminal.add(turn);
+        } else if (!turn.isLocal && turn.turnId.startsWith('om_')) {
+          // A prior submit notice may suppress another notification, but must
+          // never suppress closure of an eagerly published thinking display.
+          displayRetirements.push(turn);
         }
         // Publish/retire N before a synchronous immediate restart can clear the
         // current exact identity in killCli(). The callback still installs the
@@ -14223,7 +14256,7 @@ function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
   );
   if (dropped.length === 0) return false;
   log(`${source}: expired ${dropped.length} structured head(s) without transcript start (${dropped.map(turn => turn.turnId).join(', ')})`);
-  notifyUncollectedStructuredTurns(uncollectedTurnsNeedingNotice(dropped, {
+  const turnsNeedingNotice = uncollectedTurnsNeedingNotice(dropped, {
     settledByTerminal,
     hasOwnNotice: turn => structuredTurnsWithSubmitNotice.delete(turn.turnId)
       || submitFailureChains.has({
@@ -14238,7 +14271,15 @@ function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
         dispatchAttempt: turn.dispatchAttempt,
         cliGeneration: cliSpawnGeneration,
       }) ?? Date.now(), turn) === 'botmux-send',
-  }));
+  });
+  notifyUncollectedStructuredTurns(turnsNeedingNotice);
+  // The notice handler already retires its reply card. Only emit a separate
+  // display edge for inputs whose own prior notice suppressed this one.
+  for (const turn of displayRetirements) {
+    if (!turnsNeedingNotice.includes(turn)) {
+      send({ type: 'turn_display_retired', turnId: turn.turnId, message: uncollectedStructuredTurnNotice() });
+    }
+  }
   if (fenceCurrentRpcEngine) log('Fenced ambiguous Codex RPC generation before structured successor replay');
   // A rejected prompt-ready signal may be waiting on this exact pre-start
   // lease. Re-evaluate it after both the queue mark and its separate RPC
@@ -25844,7 +25885,8 @@ async function spawnCliBody(
   // build can't read bots.json (Seatbelt-denied) → `botmux send` fails "Bot not registered".
   // (The tmux backend re-prepends this in its pane script after rcfile load; this covers the
   // pty/direct-spawn path, whose child inherits childEnv.PATH directly.)
-  childEnv.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), childEnv.PATH);
+  childEnv.BOTMUX_WRAPPER_BIN = resolveBotmuxWrapperBinDir(process.env);
+  childEnv.PATH = prependBotmuxBin(childEnv.BOTMUX_WRAPPER_BIN, childEnv.PATH);
   if (!boundLark) {
     delete childEnv.BOTMUX_LARK_TOOL_BINDING;
   }

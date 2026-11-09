@@ -57,7 +57,7 @@ import { logger } from '../utils/logger.js';
 import { isStoreFileUnavailableError } from '../utils/json-file.js';
 import { buildRestartStatusCard, restartStatusCardNotifier } from './restart-status-card.js';
 import { botsInfoObjectEntries, isBotsInfoNameEntry, normalizeBotsInfoRouteEntries } from '../services/bots-info-shape.js';
-import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
+import { updateReplyCardNativeThinking, replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { supportsUnifiedReplyCardCli } from '../services/turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
@@ -1666,9 +1666,14 @@ export async function handleCotCommand(
   }
 
   const sub = content.replace(/^\/cot\s*/i, '').trim().toLowerCase();
-  // Master switch defaults ON — only an explicit false means disabled.
+  // /cot controls all enabled process destinations for the effective reply mode.
   const masterOn = (() => {
-    try { return getBot(larkAppId).config.cotEnabled !== false; } catch { return false; }
+    try {
+      const cfg = getBot(larkAppId).config;
+      const ds = deps.activeSessions.get(sessionKey(rootId, larkAppId));
+      const unified = ds?.currentTurnId ? replyCardModeFor(ds) !== 'legacy' : cfg.replyCardMode === 'unified';
+      return cfg.cotEnabled !== false || (unified && cfg.replyCardNativeCot === true);
+    } catch { return false; }
   })();
 
   if (sub === 'off') {
@@ -1700,6 +1705,7 @@ export async function handleCotCommand(
           activity: publicReplyCardActivity(update.entries),
         }, (body, type, uuid, beforeWrite) => deps.sessionReply(rootId, body, type, larkAppId, update.turnId, { uuid, beforeWrite }),
         { dispatchAttempt: update.dispatchAttempt, forceVisible: true });
+        updateReplyCardNativeThinking(ds, update);
         return;
       }
       // Turn in flight with thinking already accumulated — render right away

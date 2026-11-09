@@ -214,6 +214,7 @@ import { isSilentScheduledTurn } from './core/silent-schedule-turns.js';
 import { isMessageListenerTaskAnchor, isSilentMessageListenerSession, messageListenerSendBlocked } from './core/message-listener-silence.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
+import { OncallGroupStore } from './services/oncall-group-store.js';
 import * as scheduleStore from './services/schedule-store.js';
 import { migrateSharedSchedulesAtStartup } from './services/schedule-split-migration.js';
 import { ensureSchedulePreconditionRoot } from './services/schedule-precondition-store.js';
@@ -4365,6 +4366,14 @@ function receivedReactionEmojiFor(ds: DaemonSession): string {
   } catch { return RECEIVED_REACTION_EMOJI_TYPE; }
 }
 
+function registerOncallTurn(ds: DaemonSession, turnId: string): void {
+  const bot = getBot(ds.larkAppId).config;
+  if (!bot.apiOnly && ds.chatType !== 'p2p' && bot.oncallGroup?.chatIds.includes(ds.chatId)) {
+    new OncallGroupStore(config.session.dataDir).registerTurn(ds.larkAppId, ds.session.sessionId,
+      turnId, { chatId: ds.chatId, rootId: sessionAnchorId(ds) });
+  }
+}
+
 export async function noteTurnReceived(
   ds: DaemonSession,
   triggerMessageId: string,
@@ -4373,7 +4382,9 @@ export async function noteTurnReceived(
   _turnId?: string,
   receivedReactionEmoji?: string,
 ): Promise<void> {
-  if (getBot(ds.larkAppId).config.showReplyTiming === true) {
+  const bot = getBot(ds.larkAppId).config;
+  registerOncallTurn(ds, _turnId ?? triggerMessageId);
+  if (bot.showReplyTiming === true) {
     const turnId = _turnId ?? triggerMessageId;
     const received = ds.turnReceivedAtMs ??= new Map();
     if (!received.has(turnId)) received.set(turnId, Date.now());
@@ -21868,6 +21879,10 @@ async function claimNewDaemonSession(
   return withActiveSessionKeyLock(map, key, async () => {
     const incumbent = map.get(key);
     if (!incumbent || incumbent === incoming) {
+      // Initial turns can wait for repo selection/worktree creation without
+      // reaching noteTurnReceived. Persist their boundary before that wait.
+      const turnId = incoming.pendingTurnId ?? incoming.session.currentReplyTarget?.turnId;
+      if (turnId) registerOncallTurn(incoming, turnId);
       map.set(key, incoming);
       recordSessionGroupResident(incoming, key);
       return { accepted: true as const, key, owner: incoming };
@@ -35317,6 +35332,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // bot 从不连飞书，且其合成身份不会有真实文档订阅——整块跳过，否则非 pristine
   // dataDir 上的遗留订阅会让「无飞书连接」的 bot 每 5 秒主动打飞书。
   let docCommentPollTimer: ReturnType<typeof setInterval> | undefined;
+  let oncallHandoffTimer: ReturnType<typeof setInterval> | undefined;
+  let oncallHandoffRunning = false;
+  let oncallHandoffStopped = false;
+  if (!cfg.apiOnly) {
+    const reconcileOncall = async () => {
+      if (oncallHandoffRunning || oncallHandoffStopped || !getBot(cfg.larkAppId).config.oncallGroup?.enabled) return;
+      oncallHandoffRunning = true;
+      try { await (await import('./im/lark/oncall-group.js')).retryPendingOncallHandoffs(cfg.larkAppId, () => !oncallHandoffStopped); }
+      catch { logger.warn('[oncall-group] Handoff recovery failed; retry remains scheduled'); }
+      finally { oncallHandoffRunning = false; }
+    };
+    oncallHandoffTimer = setInterval(() => { void reconcileOncall(); }, 5_000);
+    oncallHandoffTimer.unref?.();
+    void reconcileOncall();
+  }
   if (!cfg.apiOnly) {
     // 文档订阅恢复：重启后订阅可能已失效，给仍活跃的会话重订阅；会话没恢复
     // （已关/丢失）的订阅则退订 + 清表，避免「命中订阅但无会话」的孤儿。
@@ -36311,6 +36341,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     v3ProgressCardManager.close();
     clearInterval(maintenanceHeartbeat);
     clearInterval(docCommentPollTimer);
+    oncallHandoffStopped = true;
+    clearInterval(oncallHandoffTimer);
     for (const session of vcMeetingSessions.values()) cleanupVcMeetingDaemonSession(session, 'daemon-shutdown');
     vcMeetingSessions.clear();
     for (const closing of vcMeetingClosingConsumerSessions.values()) {
@@ -36599,6 +36631,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(grantExpirySweepTimer);
     clearInterval(bytedcliRenewalTimer);
     clearInterval(docCommentPollTimer);
+    oncallHandoffStopped = true;
+    clearInterval(oncallHandoffTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     setDurableBridgeFinalOutputHandler(undefined);
     setDurableSessionSendHandler(null);

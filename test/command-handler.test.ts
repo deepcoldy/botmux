@@ -715,6 +715,8 @@ vi.mock('../src/services/cot-mode-store.js', () => ({
 
 vi.mock('../src/im/lark/cot-message.js', () => ({
   handleCotThinkingUpdate: vi.fn(() => true),
+  prepareCotMessageBeforeReply: vi.fn(async () => {}),
+  hasCotMessageForTurn: vi.fn(() => true),
 }));
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
@@ -10992,6 +10994,16 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     expect(setCotMode).not.toHaveBeenCalled();
   });
 
+  it('/cot status sees enabled unified native CoT even with in-card activity off', async () => {
+    botWith({ cotEnabled: false, replyCardNativeCot: true, replyCardMode: 'unified' });
+    const deps = makeDeps();
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
+    const nativeStatus = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1)![1];
+    botWith({ cotEnabled: true, replyCardMode: 'unified' });
+    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
+    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1)![1]).toBe(nativeStatus);
+  });
+
   it('/cot show without a live session replies no_active_session', async () => {
     const deps = makeDeps();
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
@@ -11025,7 +11037,7 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('下个 turn');
   });
 
-  it('/cot show unified mid-turn does not restore hidden results to disk', async () => {
+  it.each([false, true])('/cot show unified with native=%s preserves hidden results on disk', async native => {
     const fs = await import('node:fs');
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
     const { tmpdir } = await vi.importActual<typeof import('node:os')>('node:os');
@@ -11043,7 +11055,7 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     const previousDir = config.session.dataDir;
     config.session.dataDir = dir;
     try {
-      botWith({ cotEnabled: true, thinkingCardToolResult: false, replyCardMode: 'unified', usageDisplay: 'off' });
+      botWith({ cotEnabled: true, replyCardNativeCot: native, thinkingCardToolResult: false, replyCardMode: 'unified', usageDisplay: 'off' });
       const ds = makeDaemonSession();
       ds.currentTurnId = 'om_cot_hidden';
       ds.lastThinkingUpdate = { turnId: ds.currentTurnId, entries: [
@@ -11060,6 +11072,8 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
       expect(disk()?.tools[0]).not.toHaveProperty('result');
       await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
       expect(ds.cotForced).toBe(true);
+      if (native) expect(handleCotThinkingUpdate).toHaveBeenCalledWith(ds, expect.objectContaining({ turnId: ds.currentTurnId }), 'unified', expect.any(Function));
+      else expect(handleCotThinkingUpdate).not.toHaveBeenCalled();
       expect(disk()?.tools).toHaveLength(1);
       expect(disk()?.tools[0]).not.toHaveProperty('result');
     } finally {

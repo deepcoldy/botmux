@@ -94,9 +94,13 @@ describe('worker: expired structured heads', () => {
     expect(prune('structured bridge tick')).toBe(true);
 
     const notices = scope.send.mock.calls.map(([msg]: [any]) => msg);
-    expect(notices).toEqual([{
+    expect(notices.filter(msg => msg.type === 'turn_display_retired').map(msg => msg.turnId)).toEqual([
+      'om_write_failed', 'om_rechecking', 'om_sent_during_receipt',
+    ]);
+    expect(notices.filter(msg => msg.type === 'user_notify')).toEqual([{
       type: 'user_notify',
       message: 'worker.structured_turn_not_collected|Pi',
+      kind: 'structured_turn_not_collected',
       turnId: 'om_ordinary',
     }]);
     // The durable attempt is settled by its own terminal instead.
@@ -119,7 +123,7 @@ describe('worker: expired structured heads', () => {
       startupBlocker: { generation: 3, blocker: { kind: 'folder_trust', rule: 'grok-folder-trust' }, visible: true },
     });
     blocked.prune('structured bridge tick');
-    expect(blocked.scope.send.mock.calls.map(([msg]: [any]) => msg.message)).toEqual([
+    expect(blocked.scope.send.mock.calls.filter(([msg]: [any]) => msg.type === 'user_notify').map(([msg]: [any]) => msg.message)).toEqual([
       'worker.structured_turn_not_started_blocked|Pi|worker.startup_blocker_label.folder_trust',
     ]);
     // The lease was held (bounded) before anything could expire.
@@ -135,7 +139,7 @@ describe('worker: expired structured heads', () => {
       lastInitConfig: { adoptMode: false, cliUpgrade: { from: '1.0.62', to: '1.0.67' } },
     });
     firstTurn.prune('structured bridge tick');
-    expect(firstTurn.scope.send.mock.calls.map(([msg]: [any]) => msg.message)).toEqual([
+    expect(firstTurn.scope.send.mock.calls.filter(([msg]: [any]) => msg.type === 'user_notify').map(([msg]: [any]) => msg.message)).toEqual([
       'worker.structured_turn_not_collected|Piworker.startup_upgrade_hint|Pi|1.0.62→1.0.67',
     ]);
     expect(firstTurn.scope.codexBridgeQueue.refreshUnstartedHeadAttributionLease).not.toHaveBeenCalled();
@@ -148,7 +152,7 @@ describe('worker: expired structured heads', () => {
       lastInitConfig: { adoptMode: false, cliUpgrade: { from: '1.0.62', to: '1.0.67' } },
     });
     later.prune('structured bridge tick');
-    expect(later.scope.send.mock.calls.map(([msg]: [any]) => msg.message)).toEqual(['worker.structured_turn_not_collected|Pi']);
+    expect(later.scope.send.mock.calls.filter(([msg]: [any]) => msg.type === 'user_notify').map(([msg]: [any]) => msg.message)).toEqual(['worker.structured_turn_not_collected|Pi']);
     expect(later.scope.codexBridgeQueue.refreshUnstartedHeadAttributionLease).not.toHaveBeenCalled();
   });
 

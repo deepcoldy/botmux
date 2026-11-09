@@ -2657,6 +2657,8 @@ export type WorkerToDaemonBase =
    * Claude (transcript attribution) and Codex (bridge-queue cot observer)
    * bridges. Cosmetic channel: it must never influence turn
    * settlement, final_output attribution, or durable receipts. */
+  /** Cosmetic closure when a structured attribution lease retires without a task terminal. */
+  | { type: 'turn_display_retired'; turnId: string; dispatchAttempt?: number; message: string }
   | { type: 'thinking_update'; sessionId?: string; entries: CotEntry[]; turnId: string; dispatchAttempt?: number }
   /** A confirmed steer retired this exact timeline. Cosmetic only: this is
    * not a turn_terminal or a successful durable-delivery receipt. */
@@ -2714,6 +2716,8 @@ export type WorkerToDaemonBase =
          *  working→idle edge PATCH may have been lost, and nothing else would
          *  ever correct a card still claiming the unsubmitted turn runs. */
         | 'input_not_submitted'
+        /** A structured input retired without a transcript start; only its UI ends. */
+        | 'structured_turn_not_collected'
         /** Claude's own permission dialog seen on screen (claudeActionPrompt). The
          *  daemon drops it while the PermissionRequest hook's card is pending. */
         | 'claude_permission_prompt';

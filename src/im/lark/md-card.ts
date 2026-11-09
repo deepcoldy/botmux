@@ -126,7 +126,7 @@ export interface ReplyCardV2 {
   schema: '2.0';
   config: { update_multi: true; width_mode: 'fill' };
   header?: ReplyCardHeader;
-  body: { direction: 'vertical'; elements: any[] };
+  body: { direction: 'vertical'; padding?: string; vertical_spacing?: string; elements: any[] };
 }
 
 /** Single envelope shared by direct sends and fallback reply-card builders. */

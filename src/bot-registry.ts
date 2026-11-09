@@ -2244,8 +2244,8 @@ export interface BotConfig {
    *  `/card pin off|on`. */
   noPinStreamingCardChats?: string[];
   /**
-   * Stream the model's thinking process (CoT) into a native Feishu CoT
-   * message per turn: a fixed-height scrolling bubble showing thinking
+   * Show activity inside unified reply cards, or stream the model's thinking
+   * process (CoT) into a native Feishu CoT message in legacy mode: a fixed-height scrolling bubble showing thinking
    * paragraphs and tool calls as nodes, auto-collapsing when the turn settles.
    * Default ON (absent/undefined = on); only an explicit false disables.
    * Requires a transcript-backed CLI (claude-code and codex today); other
@@ -2257,6 +2257,8 @@ export interface BotConfig {
   thinkingCardToolResult?: boolean;
   /** Show tool-call nodes in unified reply cards. Default on; false keeps thinking text. */
   replyCardShowTools?: boolean;
+  /** Native CoT alongside unified reply cards. Default off; independent of card activity. */
+  replyCardNativeCot?: boolean;
   /** chat_id list: chats where the CoT (thinking process) message is suppressed
    *  even when {@link cotEnabled} is on. Written by `/cot off|on`. */
   noCotChats?: string[];
@@ -4455,6 +4457,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       replyCardMode: entry.replyCardMode === 'unified' || entry.replyCardMode === 'final-only' ? 'unified' : undefined,
       thinkingCardToolResult: entry.thinkingCardToolResult === false ? false : undefined,
       replyCardShowTools: entry.replyCardShowTools === false ? false : undefined,
+      replyCardNativeCot: entry.replyCardNativeCot === true ? true : undefined,
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).

@@ -16,6 +16,7 @@ function harness(options: { ready?: boolean; adopt?: boolean } = {}) {
   const queue = new CodexBridgeQueue(() => now);
   const dropped: string[] = [];
   const emitted: string[] = [];
+  const logs: string[] = [];
   let pendingEvents: CodexBridgeEvent[] = [];
   const prune = () => {
     const removed = queue.pruneExpiredPreStartHeads();
@@ -45,9 +46,10 @@ function harness(options: { ready?: boolean; adopt?: boolean } = {}) {
     },
     pruneExpiredStructuredHeadsAndEmit: prune,
     emitReadyCodexTurns: () => emitted.push(...queue.drainEmittable().map(turn => turn.finalText ?? '')),
-    log: (message: string) => { throw new Error(`Unexpected worker error: ${message}`); },
+    log: (message: string) => { logs.push(message); },
   };
   loadWorkerFunction<() => void>('codexBridgeStartTimer', scope)();
+  logs.length = 0;
   return {
     queue, dropped, emitted, scope,
     tick(at: number, events: CodexBridgeEvent[] = []) {
@@ -55,6 +57,7 @@ function harness(options: { ready?: boolean; adopt?: boolean } = {}) {
       pendingEvents = events;
       if (!timer) throw new Error('Worker ticker was not registered');
       timer();
+      expect(logs).toEqual([]);
     },
   };
 }

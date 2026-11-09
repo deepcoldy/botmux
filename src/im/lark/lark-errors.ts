@@ -34,6 +34,8 @@ export const LARK_CODE_MESSAGE_INTERNAL_ERROR = 2200;
 export const LARK_CODE_MESSAGE_WITHDRAWN = 230011;
 /** 消息超出可编辑时限（仍存在，只是不能再 PATCH）。 */
 export const LARK_CODE_MESSAGE_UPDATE_EXPIRED = 230031;
+/** 消息或群开启了转发限制，原样重试无法解除。 */
+export const LARK_CODE_FORWARD_RESTRICTED = 230070;
 /** 消息正在发送中——官方口径「请重试」。 */
 export const LARK_CODE_MESSAGE_BEING_SENT = 230049;
 /** 消息 API 单会话频控。 */
