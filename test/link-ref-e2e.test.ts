@@ -172,7 +172,7 @@ afterEach(async () => {
 });
 
 describe('LinkRef end-to-end URL integrity', () => {
-  it('delivers all 76 detail URLs from a large MCP result through the real final-send boundary', async () => {
+  it('delivers all 76 bold problem links from a large MCP result through the real final-send boundary', async () => {
     const state = makeFixture();
     const key: LinkRefTurnKey = { appId: state.appId, sessionId: state.sessionId,
       turnId: state.turnId, dispatchAttempt: state.dispatchAttempt };
@@ -196,7 +196,7 @@ describe('LinkRef end-to-end URL integrity', () => {
     ));
     setIpcAuthSecret(hostSecret);
     ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
-    const body = detail.map((record, index) => `[问题 ${index + 1}](${record.problemDetailUrl})`).join('\n');
+    const body = detail.map((record, index) => `**[问题 ${index + 1}](${record.problemDetailUrl})**`).join('\n');
     const sent = await runCli(state, [
       'send', '--no-mention', '--response-kind', 'final', body,
       ...detail.flatMap(record => ['--expected-link', record.problemDetailUrl]),
