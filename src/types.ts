@@ -2526,7 +2526,7 @@ export type WorkerToDaemonBase =
   | { type: 'turn_input_received'; turnId: string }
   /** The worker received an ordinary turn but could not place it into its CLI
    * input queue. This is safe to retry within the same worker generation. */
-  | { type: 'turn_input_rejected'; turnId: string; reason: string; rejectedBeforeAdmission?: true; activeTurnId?: string; activeCaller?: TrustedCaller; activeController?: TrustedCaller }
+  | { type: 'turn_input_rejected'; turnId: string; dispatchAttempt?: number; reason: string; rejectedBeforeAdmission?: true; activeTurnId?: string; activeCaller?: TrustedCaller; activeController?: TrustedCaller }
   /** Transfer-only completion fence. Emitted after the old worker has detached
    * its backend observer and disarmed sandbox teardown, immediately before it
    * exits. The daemon also waits for that child exit before forking replacement. */

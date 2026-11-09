@@ -746,17 +746,31 @@ export interface DaemonSession {
     cliPid?: number;
     cliProcStart?: string;
   };
-  /** Turns a live worker has ACCEPTED but not yet finished, keyed by turnId.
-   *  `turn_input_committed` only proves the worker queue took ownership — the
-   *  native PTY flush is asynchronous and the turn has not run yet. Keeping
-   *  this responsibility until the exact turn reaches a terminal/rejection
-   *  stops an install-change reclaim from destroying accepted work while the
-   *  screen still shows a cached idle. Cleared when the worker generation ends. */
+  /** Turns a live worker has ACCEPTED but not yet finished, keyed by
+   *  `turnId + dispatchAttempt`. `turn_input_committed` only proves the worker
+   *  queue took ownership — the native PTY flush is asynchronous and the turn
+   *  has not run yet. Keeping this responsibility until the EXACT execution
+   *  reaches a terminal/rejection stops an install-change reclaim from
+   *  destroying accepted work while the screen still shows a cached idle.
+   *  Cleared when the worker generation ends. */
   acceptedInputTurns?: Map<string, {
     workerGeneration: number;
+    turnId: string;
+    dispatchAttempt?: number;
     phase: 'queue-commit' | 'native-submit';
     at: number;
   }>;
+  /** Executions that already reached a terminal/rejection in this generation,
+   *  keyed the same way. The worker deliberately re-ACKs a committed duplicate
+   *  (`worker.ts` re-sends `turn_input_committed` without re-queueing), so a
+   *  late duplicate ACK is a transport retry, not new work: it must not revive
+   *  an obligation that will never terminal again. Bounded LRU of settled
+   *  dedupe facts only — never an unresolved obligation. */
+  settledInputTurns?: Map<string, number>;
+  /** Conservative overflow latch. When more unresolved obligations exist than
+   *  the ledger tracks, an automatic reclaim stays blocked for the rest of the
+   *  generation instead of silently dropping an unresolved obligation. */
+  acceptedInputOverflow?: boolean;
   /** Executor-observed Codex settings for this worker/rollout generation. */
   codexServiceTier?: CodexServiceTierSnapshot;
   /** Tier change arrived while a card POST was in-flight. */

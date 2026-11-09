@@ -9939,51 +9939,141 @@ export function hasPendingOrdinaryImInput(ds: DaemonSession): boolean {
 }
 
 /**
- * Inputs a live worker has ACCEPTED but not finished, keyed by turnId.
+ * Inputs a live worker has ACCEPTED but not finished, keyed by
+ * `turnId + dispatchAttempt`.
  *
  * `turn_input_committed` is the worker QUEUE taking ownership; the native PTY
  * flush is asynchronous and the turn has not run yet. The transport record
  * (`pendingOrdinaryImDeliveries`) is settled on that same ACK, and the screen
  * may still hold a cached idle, so neither proves the turn is safe to destroy.
- * The responsibility lives here until the exact turn reaches a terminal or a
- * pre-admission rejection. Phase records how far the turn got; both phases
- * block an install-change reclaim.
+ * The responsibility lives here until the EXACT execution reaches a terminal
+ * or a pre-admission rejection.
+ *
+ * The worker re-ACKs a committed duplicate without re-queueing it, so a
+ * repeated ACK for an execution that already settled must not revive the
+ * obligation. A replay keeps the turnId but increments `dispatchAttempt`, so
+ * an older attempt's late terminal/rejection must only settle that attempt.
  */
-const ACCEPTED_INPUT_TURN_LIMIT = 512;
+const ACCEPTED_INPUT_UNSETTLED_LIMIT = 4096;
+const ACCEPTED_INPUT_SETTLED_LIMIT = 4096;
+
+function acceptedInputTurnKey(turnId: string, dispatchAttempt: number | undefined): string {
+  return `${turnId}\0${dispatchAttempt ?? ''}`;
+}
+
+function noteSettledInputTurn(ds: DaemonSession, key: string): void {
+  const settled = ds.settledInputTurns ?? (ds.settledInputTurns = new Map());
+  // Refresh insertion order so the cap evicts the oldest settled dedupe fact.
+  settled.delete(key);
+  settled.set(key, Date.now());
+  while (settled.size > ACCEPTED_INPUT_SETTLED_LIMIT) {
+    const oldest = settled.keys().next().value;
+    if (oldest === undefined) break;
+    settled.delete(oldest);
+  }
+}
 
 function noteAcceptedInputTurn(
   ds: DaemonSession,
   turnId: string | undefined,
+  dispatchAttempt: number | undefined,
   workerGeneration: number,
   phase: 'queue-commit' | 'native-submit',
 ): void {
   if (!turnId) return;
+  // Overflow is a conservative block for the rest of the generation; tracking
+  // more individually cannot make the reclaim decision any safer.
+  if (ds.acceptedInputOverflow) return;
+  const key = acceptedInputTurnKey(turnId, dispatchAttempt);
+  // A duplicate ACK for an execution that already terminated is a transport
+  // retry, not new work. Do not resurrect an obligation nobody will settle.
+  if (ds.settledInputTurns?.has(key)) return;
   const turns = ds.acceptedInputTurns ?? (ds.acceptedInputTurns = new Map());
-  const previous = turns.get(turnId);
+  const previous = turns.get(key);
   // A later queue-commit observation must never downgrade proven native submit.
   const nextPhase = previous?.phase === 'native-submit' ? 'native-submit' : phase;
-  turns.delete(turnId);
-  turns.set(turnId, { workerGeneration, phase: nextPhase, at: Date.now() });
-  while (turns.size > ACCEPTED_INPUT_TURN_LIMIT) {
-    const oldest = turns.keys().next().value;
-    if (oldest === undefined) break;
-    turns.delete(oldest);
+  turns.delete(key);
+  turns.set(key, {
+    workerGeneration,
+    turnId,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    phase: nextPhase,
+    at: Date.now(),
+  });
+  if (turns.size > ACCEPTED_INPUT_UNSETTLED_LIMIT) {
+    // Never evict an unresolved obligation: an automatic reclaim cannot prove
+    // it is safe any more, so latch a conservative block instead.
+    ds.acceptedInputOverflow = true;
   }
 }
 
-function settleAcceptedInputTurn(ds: DaemonSession, turnId: string | undefined): void {
-  if (!turnId || !ds.acceptedInputTurns) return;
-  ds.acceptedInputTurns.delete(turnId);
-  if (ds.acceptedInputTurns.size === 0) ds.acceptedInputTurns = undefined;
+/** Native receipts carry no dispatchAttempt: upgrade every tracked obligation
+ *  for the turn, or register one when the commit ACK was not observed. Phase
+ *  is diagnostic; both phases already block an install-change reclaim. */
+function noteNativeAcceptedInputTurn(
+  ds: DaemonSession,
+  turnId: string | undefined,
+  workerGeneration: number,
+): void {
+  if (!turnId || ds.acceptedInputOverflow) return;
+  let upgraded = false;
+  for (const entry of ds.acceptedInputTurns?.values() ?? []) {
+    if (entry.turnId !== turnId || entry.workerGeneration !== workerGeneration) continue;
+    entry.phase = 'native-submit';
+    upgraded = true;
+  }
+  if (upgraded) return;
+  // No commit obligation to upgrade. A receipt for an execution that already
+  // settled is a late duplicate, not a new obligation.
+  if (hasSettledInputTurn(ds, turnId)) return;
+  noteAcceptedInputTurn(ds, turnId, undefined, workerGeneration, 'native-submit');
+}
+
+/** Any settled execution (regardless of attempt) for this turnId. Native
+ *  receipts carry no attempt, so this is the only conservative way to tell a
+ *  late duplicate from a first observation. */
+function hasSettledInputTurn(ds: DaemonSession, turnId: string): boolean {
+  const settled = ds.settledInputTurns;
+  if (!settled) return false;
+  const prefix = `${turnId}\0`;
+  for (const key of settled.keys()) {
+    if (key.startsWith(prefix)) return true;
+  }
+  return false;
+}
+
+function settleAcceptedInputTurn(
+  ds: DaemonSession,
+  turnId: string | undefined,
+  dispatchAttempt: number | undefined,
+  rememberTerminal: boolean,
+): void {
+  if (!turnId) return;
+  const key = acceptedInputTurnKey(turnId, dispatchAttempt);
+  const turns = ds.acceptedInputTurns;
+  if (turns) {
+    // Exact key only: an un-attempted receipt must not clear an explicit
+    // attempt's obligation, and an older attempt's late terminal must not
+    // release a newer attempt that is still running.
+    turns.delete(key);
+    if (turns.size === 0) ds.acceptedInputTurns = undefined;
+  }
+  // Only a terminal proves the execution is over for good. A pre-admission
+  // rejection may be retried with the same turnId within this generation, so
+  // its key must stay registrable when that retry is accepted.
+  if (rememberTerminal) noteSettledInputTurn(ds, key);
 }
 
 /** The worker generation is ending; its accepted queue dies with it. */
 function clearAcceptedInputTurns(ds: DaemonSession): void {
   ds.acceptedInputTurns = undefined;
+  ds.settledInputTurns = undefined;
+  ds.acceptedInputOverflow = undefined;
 }
 
 /** Does the CURRENT generation still own an accepted input with no terminal? */
 function hasUnsettledAcceptedInput(ds: DaemonSession): boolean {
+  if (ds.acceptedInputOverflow) return true;
   const turns = ds.acceptedInputTurns;
   if (!turns) return false;
   for (const entry of turns.values()) {
@@ -18738,8 +18828,10 @@ function setupWorkerHandlers(
           break;
         }
         // A pre-admission rejection never ran: release the accepted-input guard
-        // for this turn. A same-turnId redelivery re-registers on its own commit.
-        settleAcceptedInputTurn(ds, msg.turnId);
+        // for the exact admission attempt it names. Without an attempt it can
+        // only prove the un-attempted execution; a later re-accepted attempt
+        // stays protected. A retry with the same identity may re-register.
+        settleAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, false);
         discardTriggerStreamingCard(ds, msg.turnId);
         const purgeClick = takePurgeClickRollback(ds, msg.turnId);
         if (purgeClick) {
@@ -18794,7 +18886,7 @@ function setupWorkerHandlers(
         }
         // Native proof upgrades the phase, but a submitted turn is still owned
         // work until its terminal: reclaim must wait for that boundary too.
-        noteAcceptedInputTurn(ds, msg.turnId, workerGeneration, 'native-submit');
+        noteNativeAcceptedInputTurn(ds, msg.turnId, workerGeneration);
         try {
           cb.onNativeInputConsumed?.(ds, msg, { workerGeneration });
         } catch (err) {
@@ -18813,7 +18905,7 @@ function setupWorkerHandlers(
         }
         // A native submit proof still leaves the turn running; keep it protected
         // until the terminal arrives.
-        noteAcceptedInputTurn(ds, msg.turnId, workerGeneration, 'native-submit');
+        noteNativeAcceptedInputTurn(ds, msg.turnId, workerGeneration);
         try {
           cb.onPromptSubmittedInput?.(ds, msg.turnId, { workerGeneration });
         } catch (err) {
@@ -18880,7 +18972,7 @@ function setupWorkerHandlers(
         // Queue ownership is not native submission and not completion. Keep the
         // turn protected until its terminal/rejection, even though the
         // transport delivery record settles right below.
-        noteAcceptedInputTurn(ds, msg.turnId, workerGeneration, 'queue-commit');
+        noteAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, workerGeneration, 'queue-commit');
         if (msg.durablePrimaryInbox) {
           try {
             cb.onTurnInputCommitted?.(ds, msg, { workerGeneration });
@@ -21738,8 +21830,9 @@ function setupWorkerHandlers(
           break;
         }
         // The exact turn is over. This is the only boundary that releases the
-        // accepted-input guard for it.
-        settleAcceptedInputTurn(ds, msg.turnId);
+        // accepted-input guard for it, and only for the exact attempt it names:
+        // a late terminal from an older attempt must not release a newer one.
+        settleAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, true);
         try {
           getLinkRefRuntime()?.settleTurn({
             appId: ds.larkAppId,

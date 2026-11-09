@@ -401,6 +401,71 @@ describe('final delivery retry edge', () => {
 });
 
 describe('independent review regressions', () => {
+  it('does not revive completed work when a committed duplicate is re-ACKed', async () => {
+    const ds = makeDs();
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_done' });
+    worker.emit('message', { type: 'turn_terminal', turnId: 'om_done', sessionId: ds.session.sessionId });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(true);
+    // worker.ts explicitly re-ACKs committed duplicates, including ones whose
+    // native turn has already terminated; a transport retry is not new work.
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_done' });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(true);
+  });
+
+  it('does not release a later attempt on an older attempt terminal', async () => {
+    const ds = makeDs();
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_retry', dispatchAttempt: 2 });
+    worker.emit('message', { type: 'turn_terminal', turnId: 'om_retry', dispatchAttempt: 1, sessionId: ds.session.sessionId });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(false);
+  });
+
+  it('keeps an explicit attempt protected when a terminal carries no attempt', async () => {
+    const ds = makeDs();
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_no_attempt', dispatchAttempt: 2 });
+    // An un-attempted receipt cannot prove it is the attempt-2 execution.
+    worker.emit('message', { type: 'turn_terminal', turnId: 'om_no_attempt', sessionId: ds.session.sessionId });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(false);
+  });
+
+  it('allows a rejected input to be re-accepted under the same identity', async () => {
+    const ds = makeDs();
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_retryable' });
+    worker.emit('message', { type: 'turn_input_rejected', turnId: 'om_retryable', reason: 'worker_busy', rejectedBeforeAdmission: true });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(true);
+    // The retry is accepted again: it is new work and must be protected.
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_retryable' });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(false);
+  });
+
+  it('never evicts an unresolved input obligation to bound observation memory', async () => {
+    const ds = makeDs();
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_unresolved' });
+    for (let index = 0; index < 512; index += 1) {
+      worker.emit('message', { type: 'turn_input_committed', turnId: `om_done_${index}` });
+    }
+    for (let index = 0; index < 512; index += 1) {
+      worker.emit('message', { type: 'turn_terminal', turnId: `om_done_${index}`, sessionId: ds.session.sessionId });
+    }
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(false);
+  });
+
   it('protects a TRAE turn the worker queue committed before the native PTY write', async () => {
     __testOnly_resetOrdinaryImDeliveries();
     const { entry, identity } = tempEntry('release-new');
