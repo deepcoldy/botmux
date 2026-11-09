@@ -488,8 +488,13 @@ describe('V3 setCaptureIdentity (single identity writer)', () => {
     const harness = new Function('send', 'isCodexAppCliId', `
       let currentBotmuxTurnId, currentBotmuxDispatchAttempt, currentVcMeetingImTurnOrigin;
       let captureRevision = 0, captureIdentityAnnounced = false, currentTurnSteerPromoted = false;
-      let queuedTypeAheadTurns = [], queuedTurnAdvanceConsumedForPrompt;
+      let queuedTypeAheadTurns = [], queuedTurnAdvanceConsumedForPrompt, cliSubmissionInFlight = null;
       const ptyOutputGeneration = { snapshot: () => 7 };
+      // The flush write-edge preferred-model hold references these traex
+      // symbols; this scenario is traex-agnostic, so stub them to make the
+      // hold a no-op (undefined controller short-circuits the optional chain).
+      const traexAutoModelController = undefined;
+      const traexAutoModelRuntimeEligible = () => false;
       const retiredTurnIds = new Set();
       const started = [];
       const syncQueuedTurnsFromMarkerDisk = () => false;

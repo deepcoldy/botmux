@@ -39,6 +39,7 @@ import {
   type RunNode,
   type RunNodeRequest,
   type RunNodeResult,
+  type RuntimeAttestation,
   type WorkerSessionInfo,
 } from './contract.js';
 import { workflowSandboxInitFields } from '../shared/sandbox-policy.js';
@@ -303,6 +304,7 @@ async function runNodeImpl(
     cliPathOverride: req.botSnapshot.cliPathOverride,
     wrapperCli: req.botSnapshot.wrapperCli,
     model: req.botSnapshot.model,
+    reasoningEffort: req.botSnapshot.reasoningEffort,
     envPolicy: req.botSnapshot.envPolicy,
     ...workerSessionEnv,
     // Workflow nodes receive no write capability or secret channel, but must
@@ -344,6 +346,9 @@ async function runNodeImpl(
   const bootstrap = controller?.bindWorker(generation);
   const execution = controller?.admitInput(req.attemptId, undefined, req.attemptId);
   const scopedInit = bootstrap ? { ...init, sessionContract: bootstrap, sessionCommand: { version: 2 as const, execution } } : init;
+  const goalBinding = req.botSnapshot.cliInstanceBinding?.source === 'goal'
+    ? req.botSnapshot.cliInstanceBinding
+    : undefined;
 
   return new Promise<RunNodeResult>((resolve) => {
     let settled = false;
@@ -361,6 +366,42 @@ async function runNodeImpl(
     let goalSent = false;
     let sessionReadyNotified = false;
     let cancelReason: unknown;
+    let observedRuntime: Extract<WorkerEvent, { type: 'active_runtime' }> | undefined;
+
+    function runtimeAttestation(): RuntimeAttestation | undefined {
+      if (!observedRuntime) return undefined;
+      return {
+        cliId: req.botSnapshot.cliId,
+        source: 'worker-active-runtime',
+        model: observedRuntime.model,
+        reasoningEffort: observedRuntime.reasoningEffort,
+        ...(goalBinding ? { codexHome: goalBinding.codexHome } : {}),
+      };
+    }
+
+    function goalRuntimeError(
+      runtime: RuntimeAttestation | undefined,
+      workerStatus: RunNodeResult['status'],
+    ): RunNodeResult['error'] | undefined {
+      if (!goalBinding) return undefined;
+      if (!runtime) {
+        // A worker that already failed (spawn gate, crash, timeout) keeps its
+        // own failure; missing evidence only overrides an otherwise-ok run.
+        if (workerStatus !== 'ok') return undefined;
+        return {
+          code: 'GOAL_RUNTIME_UNVERIFIED',
+          message: 'goal-scoped Codex worker produced no active-runtime attestation',
+        };
+      }
+      if (runtime.model !== req.botSnapshot.model
+        || runtime.reasoningEffort !== req.botSnapshot.reasoningEffort) {
+        return {
+          code: 'GOAL_RUNTIME_MISMATCH',
+          message: `goal-scoped Codex runtime mismatch: expected ${req.botSnapshot.model ?? 'null'}/${req.botSnapshot.reasoningEffort ?? 'null'}, observed ${runtime.model ?? 'null'}/${runtime.reasoningEffort ?? 'null'}`,
+        };
+      }
+      return undefined;
+    }
 
     const hardDeadline = setTimeout(() => {
       finish('fail', 'timeout');
@@ -547,6 +588,9 @@ async function runNodeImpl(
             finish('fail', 'goal-send-failed');
           }
           break;
+        case 'active_runtime':
+          observedRuntime = event;
+          break;
         case 'error':
           void appendLine(stderrPath(req), `[worker] ${event.message}`);
           finish('fail', 'worker-error');
@@ -591,14 +635,27 @@ async function runNodeImpl(
           manifestPath,
           cancelReason,
           sessionInfo: sessionInfo(),
+          ...(runtimeAttestation() ? { runtime: runtimeAttestation() } : {}),
         });
         return;
       }
       settled = true;
-      const status = pendingResult?.status ?? (code === 0 ? 'ok' : 'fail');
+      const runtime = runtimeAttestation();
+      const workerStatus = pendingResult?.status ?? (code === 0 ? 'ok' : 'fail');
+      const runtimeError = goalRuntimeError(runtime, workerStatus);
+      const status = runtimeError ? 'fail' : workerStatus;
       const reason = pendingResult?.reason ?? 'worker-exit';
+      if (runtimeError) {
+        void appendLine(stderrPath(req), `[v3] ${runtimeError.code}: ${runtimeError.message}`);
+      }
       void appendLine(stderrPath(req), `[v3] worker closed status=${status} reason=${reason} code=${code ?? 'null'}`);
-      resolve({ status, manifestPath, sessionInfo: sessionInfo() });
+      resolve({
+        status,
+        manifestPath,
+        sessionInfo: sessionInfo(),
+        ...(runtime ? { runtime } : {}),
+        ...(runtimeError ? { error: runtimeError } : {}),
+      });
     });
 
     try {

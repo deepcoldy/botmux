@@ -7,10 +7,17 @@
 
 import { randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 
+import { resolveSandboxMode } from '../../adapters/cli/sandbox-mode.js';
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
 import { isWorkflowFeatureEnabled } from '../../global-config.js';
+import { validateCodexGoalHome, type SessionCliInstanceBindingV1 } from '../../services/codex-instance-pool.js';
+import {
+  codexModelSupportsReasoningEffort,
+  isCodexReasoningEffort,
+  type CodexReasoningEffort,
+} from '../../services/codex-reasoning-effort.js';
 import { withFileLock } from '../../utils/file-lock.js';
 import { expandHomePath } from '../../utils/working-dir.js';
 import { validateDag, MAX_NODE_TIMEOUT_SEC, type V3Dag } from './dag.js';
@@ -29,6 +36,7 @@ import {
   defaultBaseDir,
 } from './cli-run.js';
 import { readRunEnvelope, RunEnvelopeConflictError } from './run-envelope.js';
+import type { V3RuntimeAttestation } from './event-contract.js';
 import type {
   BotSnapshot,
   Manifest,
@@ -63,6 +71,9 @@ interface GoalRunArgs {
   workingDir?: string;
   baseDir: string;
   timeoutMs?: number;
+  codexHome?: string;
+  model?: string;
+  reasoningEffort?: CodexReasoningEffort;
   json: boolean;
 }
 
@@ -75,6 +86,9 @@ interface GoalRunRequestV1 {
   botSelector: string | null;
   workingDir: string | null;
   timeoutMs: number | null;
+  codexHome?: string;
+  model?: string;
+  reasoningEffort?: CodexReasoningEffort;
 }
 
 export type GoalRunTerminalState = 'succeeded' | 'failed' | 'blocked' | 'cancelled';
@@ -87,6 +101,9 @@ export interface GoalRunResultV1 {
   summary?: string;
   error?: { code: string; message: string };
   artifacts?: ManifestFile[];
+  /** Worker-observed runtime for callers that must prove the selected
+   * model/effort instead of trusting only the requested launch config. */
+  runtime?: V3RuntimeAttestation;
   runDirectory?: {
     path: string;
     stability: 'informative-only';
@@ -167,9 +184,35 @@ function parsePositiveSeconds(raw: string | undefined): number | undefined {
   return Math.ceil(seconds * 1_000);
 }
 
+function parseModel(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  const model = raw.trim();
+  if (!model || model.length > 256 || /[\0\r\n]/.test(model)) {
+    throw new Error('--model must be a non-empty single-line value no longer than 256 characters');
+  }
+  return model;
+}
+
+function parseReasoningEffort(raw: string | undefined): CodexReasoningEffort | undefined {
+  if (raw === undefined) return undefined;
+  if (!isCodexReasoningEffort(raw)) {
+    throw new Error(`--reasoning-effort must be one of low, medium, high, xhigh, max, ultra (got ${JSON.stringify(raw)})`);
+  }
+  return raw;
+}
+
+function parseCodexHome(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  if (!raw || raw !== raw.trim() || !isAbsolute(raw) || /[\0\r\n]/.test(raw)) {
+    throw new Error('--codex-home must be an explicit absolute path');
+  }
+  return resolve(raw);
+}
+
 function parseArgs(rest: string[], deps: GoalCliDependencies): GoalRunArgs {
   const flagsWithValues = new Set([
     '--run-id', '--bot', '--working-dir', '--base-dir', '--goal-file', '--timeout',
+    '--codex-home', '--model', '--reasoning-effort',
   ]);
   const knownFlags = new Set([...flagsWithValues, '--stdin', '--json', '--help', '-h']);
   const positionals: string[] = [];
@@ -193,6 +236,7 @@ function parseArgs(rest: string[], deps: GoalCliDependencies): GoalRunArgs {
   if (rest.includes('--help') || rest.includes('-h')) {
     throw new Error(
       'usage: botmux goal run <goal> [--run-id <id>] [--bot <id|name>] [--working-dir <dir>] [--timeout <seconds>] [--json]\n' +
+      '       [--codex-home <absolute-dir> --model <id> --reasoning-effort <level>]\n' +
       '       botmux goal run --goal-file <path> | --stdin [...options]',
     );
   }
@@ -220,6 +264,9 @@ function parseArgs(rest: string[], deps: GoalCliDependencies): GoalRunArgs {
       : undefined,
     baseDir: valueFor(rest, '--base-dir') ? resolve(valueFor(rest, '--base-dir')!) : defaultBaseDir(),
     timeoutMs: parsePositiveSeconds(valueFor(rest, '--timeout')),
+    codexHome: parseCodexHome(valueFor(rest, '--codex-home')),
+    model: parseModel(valueFor(rest, '--model')),
+    reasoningEffort: parseReasoningEffort(valueFor(rest, '--reasoning-effort')),
     json: rest.includes('--json'),
   };
 }
@@ -294,6 +341,7 @@ export async function projectGoalRunTerminal(
     ...(manifest?.summary ? { summary: manifest.summary } : {}),
     ...(error ? { error } : {}),
     ...(manifest?.files.length ? { artifacts: manifest.files } : {}),
+    ...(settle?.runtime ? { runtime: settle.runtime } : {}),
     runDirectory: { path: runDir, stability: 'informative-only' },
   };
 }
@@ -349,6 +397,44 @@ function buildGoalDag(args: GoalRunArgs, resolvedBotId?: string): V3Dag {
   });
 }
 
+function applyGoalCodexRuntime(snapshot: BotSnapshot, args: GoalRunArgs): BotSnapshot {
+  const requested = args.codexHome !== undefined || args.model !== undefined
+    || args.reasoningEffort !== undefined;
+  if (!requested) return snapshot;
+  if (!args.codexHome || !args.model || !args.reasoningEffort) {
+    throw new Error('--codex-home, --model and --reasoning-effort must be supplied together');
+  }
+  if (snapshot.cliId !== 'codex' || snapshot.wrapperCli) {
+    throw new Error('explicit goal Codex runtime requires an unwrapped codex bot');
+  }
+  // Mirrors the worker's spawn gate for non-legacy Codex homes, so a sandboxed
+  // bot is refused before a run is authorized rather than after a worker spawn.
+  if (resolveSandboxMode({ configSandbox: snapshot.sandbox, envValue: process.env.BOTMUX_SANDBOX }) !== 'off') {
+    throw new Error('explicit goal Codex runtime does not support sandboxed bots (bot sandbox or BOTMUX_SANDBOX)');
+  }
+  const codexHome = validateCodexGoalHome(args.codexHome);
+  if (codexHome !== args.codexHome) {
+    throw new Error('--codex-home must be the canonical path of the prepared Codex home');
+  }
+  if (!codexModelSupportsReasoningEffort(args.model, args.reasoningEffort)) {
+    throw new Error(`model ${JSON.stringify(args.model)} does not support reasoning effort ${JSON.stringify(args.reasoningEffort)}`);
+  }
+  const binding: SessionCliInstanceBindingV1 = {
+    version: 1,
+    source: 'goal',
+    instanceId: null,
+    cliId: 'codex',
+    codexHome,
+    authMode: 'shared',
+  };
+  return {
+    ...snapshot,
+    cliInstanceBinding: binding,
+    model: args.model,
+    reasoningEffort: args.reasoningEffort,
+  };
+}
+
 async function executeGoalRun(args: GoalRunArgs, deps: GoalCliDependencies): Promise<GoalRunResultV1> {
   // Install cancellation delivery before publishing any run artifacts. A
   // signal/timeout that arrives during authorization is remembered and becomes
@@ -381,6 +467,9 @@ async function executeGoalRunCore(
     botSelector: args.botSelector ?? null,
     workingDir: args.workingDir ?? null,
     timeoutMs: args.timeoutMs ?? null,
+    ...(args.codexHome ? { codexHome: args.codexHome } : {}),
+    ...(args.model ? { model: args.model } : {}),
+    ...(args.reasoningEffort ? { reasoningEffort: args.reasoningEffort } : {}),
   };
 
   let dag: V3Dag;
@@ -434,7 +523,10 @@ async function executeGoalRunCore(
     }
     try {
       const bot = resolveBotConfig(args.botSelector, bots);
-      const unresolvedSnapshot = botToSnapshot(bot, args.workingDir);
+      const unresolvedSnapshot = applyGoalCodexRuntime(
+        botToSnapshot(bot, args.workingDir),
+        args,
+      );
       // `child_process.fork({cwd})` interprets a relative cwd against the
       // current driver process. Freeze an absolute path so a crash re-drive
       // launched from another shell cannot silently execute in another repo.
@@ -449,6 +541,7 @@ async function executeGoalRunCore(
         bots,
         defaultBotSelector: bot.larkAppId,
         workingDirOverride: snapshot.workingDir,
+        transformBotSnapshot: () => snapshot,
         now: deps.now(),
         goalRequestBytes: requestBytes(request),
       });

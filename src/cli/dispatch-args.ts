@@ -11,6 +11,8 @@ export interface DispatchArgs {
   model?: string;
   reasoningEffort?: string;
   into?: string;
+  /** `--into` only: continue the topic's (possibly closed) session or start fresh. */
+  sessionMode?: string;
   resultDelivery?: string;
   /** Requirement shown in the task-tree card header. */
   taskId?: string;
@@ -36,7 +38,7 @@ export type DispatchArgsResult =
   | { ok: false; errorCode: DispatchArgsErrorCode; error: string; option?: string };
 
 const VALUE_FLAGS = new Map<string, keyof Pick<DispatchArgs,
-  'sessionId' | 'title' | 'brief' | 'briefFile' | 'chatId' | 'repo' | 'into' | 'resultDelivery' | 'model' | 'reasoningEffort'
+  'sessionId' | 'title' | 'brief' | 'briefFile' | 'chatId' | 'repo' | 'into' | 'sessionMode' | 'resultDelivery' | 'model' | 'reasoningEffort'
   | 'taskId' | 'taskUrl' | 'kind'
 >>([
   ['--session-id', 'sessionId'],
@@ -46,6 +48,7 @@ const VALUE_FLAGS = new Map<string, keyof Pick<DispatchArgs,
   ['--chat-id', 'chatId'],
   ['--repo', 'repo'],
   ['--into', 'into'],
+  ['--session-mode', 'sessionMode'],
   ['--result-delivery', 'resultDelivery'],
   ['--model', 'model'],
   ['--reasoning-effort', 'reasoningEffort'],

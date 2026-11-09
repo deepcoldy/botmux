@@ -3,9 +3,12 @@ import { execFileSync, type ChildProcess } from 'node:child_process';
 import { EventEmitter, once } from 'node:events';
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -14,6 +17,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { BotConfig } from '../src/bot-registry.js';
+import { parseFrozenBotSnapshots } from '../src/workflows/v3/bot-resolve.js';
 import {
   cmdGoal,
   GOAL_RUN_EXIT,
@@ -141,6 +145,14 @@ describe('botmux goal run — machine terminal contract', () => {
     return value;
   }
 
+  function goalHome(base: string): string {
+    const home = join(base, 'codex-goal-home');
+    mkdirSync(home, { mode: 0o700 });
+    writeFileSync(join(home, 'config.toml'), 'model = "gpt-6.1-sol"\n', { mode: 0o600 });
+    writeFileSync(join(home, 'auth.json'), JSON.stringify({ tokens: { access_token: 'NOT-A-REAL-TOKEN' } }), { mode: 0o600 });
+    return realpathSync(home);
+  }
+
   it('writes exactly one versioned JSON document after durable success and exposes only validated artifacts', async () => {
     const base = root();
     const h = harness(base, successfulRunNode());
@@ -208,6 +220,188 @@ describe('botmux goal run — machine terminal contract', () => {
     >;
     expect(request.workingDir).toBe(process.cwd());
     expect(Object.values(snapshots)[0]?.workingDir).toBe(process.cwd());
+  });
+
+  it('freezes an explicit Codex home/model/effort and returns worker-observed runtime evidence', async () => {
+    const base = root();
+    const home = goalHome(base);
+    const runNode: RunNode = async (req) => {
+      expect(req.botSnapshot).toMatchObject({
+        cliId: 'codex',
+        model: 'gpt-6.1-sol',
+        reasoningEffort: 'xhigh',
+        cliInstanceBinding: { source: 'goal', codexHome: home, authMode: 'shared' },
+      });
+      const file = product(req.outputDir);
+      return {
+        status: 'ok',
+        manifestPath: writeManifest(req, { schemaVersion: 1, status: 'ok', summary: 'verified runtime', files: [file] }),
+        runtime: {
+          cliId: 'codex',
+          source: 'worker-active-runtime',
+          model: 'gpt-6.1-sol',
+          reasoningEffort: 'xhigh',
+          codexHome: home,
+        },
+      };
+    };
+    const h = harness(base, runNode);
+    const extra = ['--codex-home', home, '--model', 'gpt-6.1-sol', '--reasoning-effort', 'xhigh'];
+
+    expect(await cmdGoal('run', h.args('explicit-runtime', 'repair issue', extra), h.deps)).toBe(0);
+    expect(onlyJson(h.stdout)).toMatchObject({
+      state: 'succeeded',
+      runtime: { cliId: 'codex', model: 'gpt-6.1-sol', reasoningEffort: 'xhigh', codexHome: home },
+    });
+    expect(JSON.parse(readFileSync(join(base, 'explicit-runtime', 'goal.request.json'), 'utf8'))).toMatchObject({
+      codexHome: home,
+      model: 'gpt-6.1-sol',
+      reasoningEffort: 'xhigh',
+    });
+  });
+
+  it('rejects a partial explicit Codex runtime before worker spawn', async () => {
+    const base = root();
+    const home = goalHome(base);
+    const runNode = vi.fn(successfulRunNode());
+    const h = harness(base, runNode);
+
+    expect(await cmdGoal('run', h.args('partial-runtime', 'repair issue', [
+      '--codex-home', home,
+      '--model', 'gpt-6.1-sol',
+    ]), h.deps)).toBe(GOAL_RUN_EXIT.error);
+    expect(onlyJson(h.stdout)).toMatchObject({
+      state: 'error',
+      error: { code: 'RUN_AUTHORIZATION_FAILED', message: expect.stringContaining('must be supplied together') },
+    });
+    expect(runNode).not.toHaveBeenCalled();
+  });
+
+  it.each<{ name: string; model?: string; effort?: string; bot?: Partial<BotConfig>; env?: Record<string, string>; message: RegExp }>([
+    { name: 'an effort the model does not support', model: 'gpt-5.5', effort: 'ultra', message: /does not support reasoning effort/ },
+    { name: 'a wrapped Codex bot', bot: { wrapperCli: 'codex-wrapper' }, message: /requires an unwrapped codex bot/ },
+    { name: 'a non-Codex bot', bot: { cliId: 'claude-code' }, message: /requires an unwrapped codex bot/ },
+    { name: 'a sandboxed bot', bot: { sandbox: true }, message: /does not support sandboxed bots/ },
+    { name: 'a sandbox forced by BOTMUX_SANDBOX', env: { BOTMUX_SANDBOX: '1' }, message: /does not support sandboxed bots/ },
+  ])('rejects an explicit Codex runtime for $name before worker spawn', async ({ model = 'gpt-6.1-sol', effort = 'xhigh', bot = {}, env = {}, message }) => {
+    for (const [key, value] of Object.entries(env)) vi.stubEnv(key, value);
+    try {
+      const base = root();
+      const home = goalHome(base);
+      const runNode = vi.fn(successfulRunNode());
+      const h = harness(base, runNode);
+      h.deps.loadBots = () => [{ ...TEST_BOT, ...bot }];
+
+      expect(await cmdGoal('run', h.args('rejected-runtime', 'repair issue', [
+        '--codex-home', home,
+        '--model', model,
+        '--reasoning-effort', effort,
+      ]), h.deps)).toBe(GOAL_RUN_EXIT.error);
+      expect(onlyJson(h.stdout)).toMatchObject({
+        state: 'error',
+        error: { code: 'RUN_AUTHORIZATION_FAILED', message: expect.stringMatching(message) },
+      });
+      expect(runNode).not.toHaveBeenCalled();
+      expect(existsSync(join(base, 'rejected-runtime', 'run.json'))).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('rejects a Codex home reached through a symlinked parent before worker spawn', async () => {
+    const base = realpathSync(root());
+    mkdirSync(join(base, 'real'));
+    const canonical = goalHome(join(base, 'real'));
+    symlinkSync(join(base, 'real'), join(base, 'alias'));
+    const runNode = vi.fn(successfulRunNode());
+    const h = harness(base, runNode);
+
+    expect(await cmdGoal('run', h.args('alias-runtime', 'repair issue', [
+      '--codex-home', join(base, 'alias', 'codex-goal-home'),
+      '--model', 'gpt-6.1-sol',
+      '--reasoning-effort', 'xhigh',
+    ]), h.deps)).toBe(GOAL_RUN_EXIT.error);
+    expect(onlyJson(h.stdout)).toMatchObject({
+      state: 'error',
+      error: { code: 'RUN_AUTHORIZATION_FAILED', message: expect.stringContaining('canonical path') },
+    });
+    expect(canonical).toBe(join(base, 'real', 'codex-goal-home'));
+    expect(runNode).not.toHaveBeenCalled();
+  });
+
+  it('persists the goal binding for re-drive and refuses a tampered frozen snapshot', async () => {
+    const base = root();
+    const home = goalHome(base);
+    const h = harness(base, successfulRunNode());
+    expect(await cmdGoal('run', h.args('frozen-runtime', 'repair issue', [
+      '--codex-home', home,
+      '--model', 'gpt-6.1-sol',
+      '--reasoning-effort', 'xhigh',
+    ]), h.deps)).toBe(0);
+
+    const frozen = JSON.parse(readFileSync(join(base, 'frozen-runtime', 'bots.snapshot.json'), 'utf8')) as Record<string, Record<string, unknown>>;
+    const restored = [...parseFrozenBotSnapshots(frozen).values()];
+    expect(restored.length).toBeGreaterThan(0);
+    for (const snapshot of restored) {
+      expect(snapshot).toMatchObject({
+        model: 'gpt-6.1-sol',
+        reasoningEffort: 'xhigh',
+        cliInstanceBinding: { source: 'goal', instanceId: null, authMode: 'shared', codexHome: home },
+      });
+    }
+
+    const tampered = (edit: (snapshot: Record<string, unknown>) => void): Record<string, Record<string, unknown>> => {
+      const copy = structuredClone(frozen);
+      for (const snapshot of Object.values(copy)) edit(snapshot);
+      return copy;
+    };
+    const binding = (snapshot: Record<string, unknown>) => snapshot.cliInstanceBinding as Record<string, unknown>;
+    expect(() => parseFrozenBotSnapshots(tampered((s) => { binding(s).authMode = 'isolated'; })))
+      .toThrow('invalid frozen workflow Codex instance binding');
+    expect(() => parseFrozenBotSnapshots(tampered((s) => { binding(s).instanceId = 'a'; })))
+      .toThrow('invalid frozen workflow Codex instance binding');
+    expect(() => parseFrozenBotSnapshots(tampered((s) => { s.reasoningEffort = 'turbo'; })))
+      .toThrow('reasoningEffort is invalid');
+    for (const edit of [
+      (s: Record<string, unknown>) => { delete s.model; },
+      (s: Record<string, unknown>) => { delete s.reasoningEffort; },
+      (s: Record<string, unknown>) => { s.wrapperCli = 'codex-wrapper'; },
+    ]) {
+      expect(() => parseFrozenBotSnapshots(tampered(edit)))
+        .toThrow('goal-scoped Codex binding requires an unwrapped frozen model and reasoning effort');
+    }
+  });
+
+  it('reports a goal runtime failure with its precise code instead of a generic worker error', async () => {
+    const base = root();
+    const home = goalHome(base);
+    const runNode: RunNode = async (req) => {
+      const file = product(req.outputDir);
+      return {
+        status: 'fail',
+        manifestPath: writeManifest(req, { schemaVersion: 1, status: 'ok', summary: 'wrong runtime', files: [file] }),
+        runtime: {
+          cliId: 'codex',
+          source: 'worker-active-runtime',
+          model: 'gpt-5.6-sol',
+          reasoningEffort: 'xhigh',
+          codexHome: home,
+        },
+        error: { code: 'GOAL_RUNTIME_MISMATCH', message: 'goal-scoped Codex runtime mismatch' },
+      };
+    };
+    const h = harness(base, runNode);
+
+    expect(await cmdGoal('run', h.args('mismatched-runtime', 'repair issue', [
+      '--codex-home', home,
+      '--model', 'gpt-6.1-sol',
+      '--reasoning-effort', 'xhigh',
+    ]), h.deps)).toBe(GOAL_RUN_EXIT.failed);
+    expect(onlyJson(h.stdout)).toMatchObject({
+      state: 'failed',
+      error: { code: 'GOAL_RUNTIME_MISMATCH', message: 'goal-scoped Codex runtime mismatch' },
+      runtime: { model: 'gpt-5.6-sol', reasoningEffort: 'xhigh' },
+    });
   });
 
   it('replays a terminal run byte-for-byte with zero new spawn', async () => {

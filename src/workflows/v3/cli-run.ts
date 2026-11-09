@@ -212,6 +212,9 @@ export interface AuthorizeManualCliRunOptions {
   bots: BotConfig[];
   defaultBotSelector?: string;
   workingDirOverride?: string;
+  /** Creation-only, secret-free adjustment applied before snapshots are
+   * serialized and covered by run.json. Existing runs never call it. */
+  transformBotSnapshot?: (snapshot: BotSnapshot) => BotSnapshot;
   now?: Date;
   /**
    * Exact canonical request bytes for `botmux goal run`. They are pinned by
@@ -283,6 +286,7 @@ export function authorizeManualCliRun(opts: AuthorizeManualCliRunOptions): Autho
     const frozenBotSnapshots = freezeDagBotSnapshots(opts.dag, opts.bots, {
       defaultSelector: opts.defaultBotSelector,
       workingDirOverride: opts.workingDirOverride,
+      transformSnapshot: opts.transformBotSnapshot,
     });
     atomicWriteFileSync(join(opts.runDir, 'dag.json'), `${JSON.stringify(opts.dag, null, 2)}\n`, { mode: 0o600 });
     atomicWriteFileSync(

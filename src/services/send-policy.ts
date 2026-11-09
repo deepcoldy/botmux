@@ -461,6 +461,13 @@ export function validateMentionDecision(args: MentionDecisionArgs): MentionDecis
   const decided = args.hasMentionArgs || args.mentionBack || args.noMention;
   if (decided) return { ok: true };
 
+  if (!args.hasQuoteTargetSender) {
+    return {
+      ok: false,
+      error: '本轮没有可识别的触发消息发送者（例如定时任务）。有明确收件人时使用 --mention <ou:Name>，否则使用 --no-mention；不要从会话 owner 或历史消息推断收件人。',
+    };
+  }
+
   // No decision made — guide by message VALUE (not by human-vs-bot). Avoid
   // letting --no-mention become the lazy default, and avoid meaningless @.
   return {

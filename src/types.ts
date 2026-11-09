@@ -840,6 +840,21 @@ export interface Session {
    *  只供会话任务状态推导使用（core/session-task-status.ts）。 */
   lastTurn?: import('./core/session-task-status.js').SessionLastTurn;
   closedAt?: string;
+  /** Set when a HUMAN closed this session explicitly (`/close`, the card's close
+   *  button). Such a session is not resumed automatically when the topic gets a
+   *  new message (core/topic-session-continuity.ts); cleared on reactivation. */
+  userClosedAt?: string;
+  /** How this session relates to an earlier closed session of the same bot in
+   *  the same topic (core/topic-session-continuity.ts). Absent for a first
+   *  session. Shown in `botmux observe` so a lead can tell a continued
+   *  conversation from one that started over. */
+  continuity?: {
+    mode: 'resumed' | 'fresh-after-close' | 'fresh-requested';
+    previousSessionId?: string;
+    /** Why the previous session was not continued (fresh-* only). */
+    reason?: string;
+    at: string;
+  };
   /** Owning-daemon automatic scratch cleanup, tied to this exact close. It
    * preserves existing registered jobs, never permission to admit a new turn. */
   backgroundExecutionCleanupClosedAt?: string;
@@ -2481,6 +2496,14 @@ export type WorkerToDaemonBase =
    * CLI input queue. The daemon persists a root-bound receipt only after this
    * acknowledgement; IPC arrival alone is not acceptance. */
   | { type: 'turn_input_committed'; turnId: string; dispatchAttempt?: number; durablePrimaryInbox?: true }
+  /** Snapshot of input this worker holds that its CLI has not taken yet.
+   * `pending`: anything still queued, being written, or submitted with its
+   * receipt unresolved — destroying the CLI now would lose it. `writingTurnId`:
+   * the ordinary turn being written to the CLI right now; no exit path hands
+   * it to a successor worker. Sent before any other message whenever it
+   * changed, so it never trails the commit ACK or the screen status it
+   * qualifies. */
+  | { type: 'cli_input_backlog'; pending: boolean; writingTurnId?: string }
   /** Native write observation for display timing; never an admission or completion receipt. */
   | { type: 'turn_execution_started'; turnId: string; dispatchAttempt?: number; startedAtMs: number }
   /** The native CLI accepted this exact dispatched input into its own

@@ -2939,6 +2939,7 @@ export function reactivateClosedSession(
   const next: Session = { ...session };
   next.status = 'active';
   next.closedAt = undefined;
+  next.userClosedAt = undefined;
   next.backgroundExecutionCleanupClosedAt = undefined;
   next.lastMessageAt = new Date().toISOString();
   next.codexAppDispatchLedger = undefined;
@@ -6342,6 +6343,14 @@ export function applySessionCommandUnowned(
     }
     const applied = applySessionRowCommand(current, command, { now: new Date() });
     if (applied.outcome === 'applied') {
+      // A host-side close only ever comes from a human `botmux delete` while the
+      // owning daemon is unreachable (session-command-host boundary). Record that
+      // human intent exactly like the daemon IPC close route's userClosed stamp,
+      // so topic continuity starts a fresh session instead of auto-resuming this
+      // row. Host `prune` is ledger cleanup, not a human close, and stays out.
+      if (command.type === 'close' && !current.userClosedAt) {
+        current.userClosedAt = new Date().toISOString();
+      }
       return { publish: true, result: { outcome: 'applied', row: current, released: applied.released } };
     }
     return { publish: false, result: { ...applied, row: current } };

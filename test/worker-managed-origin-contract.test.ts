@@ -1,21 +1,21 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
 import { randomBytes } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as botRegistry from '../src/bot-registry.js';
+import { config } from '../src/config.js';
 import { ActiveTurnAuthority, sameTrustedPrincipal } from '../src/core/active-turn-authority.js';
+import { setIpcAuthSecret, startIpcServer } from '../src/core/dashboard-ipc-server.js';
+import { larkToolBindingPath } from '../src/core/lark-tool-binding.js';
 import { SessionController } from '../src/core/session-controller.js';
+import * as workerPool from '../src/core/worker-pool.js';
+import * as identities from '../src/im/lark/identity-cache.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
+import * as tokens from '../src/utils/user-token.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { loadWorkerPoolClosure, loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
-import { startIpcServer, setIpcAuthSecret } from '../src/core/dashboard-ipc-server.js';
-import * as workerPool from '../src/core/worker-pool.js';
-import * as botRegistry from '../src/bot-registry.js';
-import * as identities from '../src/im/lark/identity-cache.js';
-import * as tokens from '../src/utils/user-token.js';
-import { larkToolBindingPath } from '../src/core/lark-tool-binding.js';
-import { config } from '../src/config.js';
 
 const cleanups: Array<() => void | Promise<void>> = [];
 afterEach(async () => {

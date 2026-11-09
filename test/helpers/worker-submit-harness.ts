@@ -80,6 +80,8 @@ export function workerSubmitHarness() {
     deferNativeCodexInputCommit: () => false,
     queuePostSubmitNativeSessionTitle: vi.fn(), persistCliSessionId: vi.fn(),
     syncFreshCodexNativeSessionTitle: vi.fn(async () => {}),
+    projectedRuntimeScreenStatus: () => (scope.isPromptReady ? 'idle' : 'working'),
+    publishScreenStatus: vi.fn(),
     log: vi.fn(), send: vi.fn(), t: (key: string) => key,
     buildSubmitMessagePreview,
     cliName: () => 'TraeX',

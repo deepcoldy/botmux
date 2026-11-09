@@ -386,9 +386,14 @@ botmux goal run "Collect the stale links under docs/ into a list" --run-id docs-
 | `--bot <id\|name>` | Which bot (App ID or name); defaults to the first bot in `bots.json` |
 | `--working-dir <dir>` | Where to run; defaults to the bot's default working directory |
 | `--timeout <seconds>` | Overall time limit, at most 14370 seconds; hitting it counts as a cancel. Without it, the default node timeout (30 minutes) applies |
-| `--json` | On exit, print one line of JSON to stdout (`schemaVersion` is `botmux.goal-run-result/v1`) with `state`, `summary`, `artifacts`, `error` |
+| `--codex-home <absolute-dir>` | A Codex home (`CODEX_HOME`) you prepared yourself; this run uses its credentials and config. Must be passed together with `--model` and `--reasoning-effort` |
+| `--model <id>` | Codex model for this run, overriding the bot and the home's default |
+| `--reasoning-effort <level>` | `low`, `medium`, `high`, `xhigh`, `max` or `ultra`; must be a level the model supports |
+| `--json` | On exit, print one line of JSON to stdout (`schemaVersion` is `botmux.goal-run-result/v1`) with `state`, `summary`, `artifacts`, `error`, and `runtime` (the model and effort the CLI actually reported, when it reports them) |
 
 It is a single node with no approval card and no Feishu messages. It runs the same way as temporary-process nodes, so only the CLIs listed under "Limitations" above are supported. Data also lands in `~/.botmux/v3-runs/<runId>`.
+
+**Choosing the Codex home, model and effort**: the three options go together and only work with a Codex bot that has no wrapper and no sandbox. The home must be a directory you own with mode 0700, given by its real path (no symlinks along the way); `config.toml` must be a regular 0600 file; `auth.json` may be a symlink to a shared credential file, but the target must be a regular 0600 file you own that contains a credential. If any of this does not hold, or the model does not support the level, the run is refused before it starts with `RUN_AUTHORIZATION_FAILED`. When the run ends, botmux compares the model and effort Codex actually used with what you asked for: a difference gives `GOAL_RUNTIME_MISMATCH`, and a run that never reported them gives `GOAL_RUNTIME_UNVERIFIED`. Both count as failed (exit code 10).
 
 **Read the result from the exit code**:
 
@@ -401,7 +406,7 @@ It is a single node with no approval card and no Feishu messages. It runs the sa
 | 13 | `conflict` | Run ID conflict, or another process is driving this run |
 | 14 | `error` | Bad arguments, Workflow off, no bots configured, etc. |
 
-**Running again with the same `--run-id`** requires exactly the same arguments as the first time (goal, `--bot`, `--working-dir`, `--timeout`):
+**Running again with the same `--run-id`** requires exactly the same arguments as the first time (goal, `--bot`, `--working-dir`, `--timeout`, `--codex-home`, `--model`, `--reasoning-effort`):
 
 - Finished run: nothing reruns; you get the original result and exit code back, even if `bots.json` has since changed or been removed.
 - Unfinished run (the process crashed, the machine rebooted): it resumes where it stopped, keeping the bot, directory and settings fixed on the first run rather than re-picking from current config. It still needs that bot's credentials in `bots.json`.

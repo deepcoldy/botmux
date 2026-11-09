@@ -578,6 +578,25 @@ export class TraexAutoModelController {
     return this.queueSinceMs !== undefined || (this.exhausted && this.liveCapacityQueued);
   }
 
+  /**
+   * The pool is exhausted on a non-preferred model while per-turn reselection
+   * is on: an independent follow-up turn must wait for the preferred-model
+   * reset instead of being written into the current degraded model.
+   *
+   * Unlike {@link capacityCurrentlyBlocking} this deliberately ignores the
+   * pane observation (`liveCapacityQueued`): the degraded CLI returns to its
+   * composer and stops painting the capacity queue frame well before the
+   * preferred relaunch, so a screen-only latch lets the follow-up slip through
+   * as type-ahead onto the wrong model. The `exhausted` flag itself is cleared
+   * by the reselection switch, so this cannot hold past the reset. Off when
+   * reselection is disabled (the exhausted latch then correctly outlives the
+   * pane for the whole session). */
+  awaitingPreferredModelReset(): boolean {
+    return this.exhausted === true
+      && this.config.reselectPerTurn === true
+      && this.currentIndex > 0;
+  }
+
   /** A resumed continuation must show activity before queued corrections can
    * follow it; process startup alone does not finish a capacity transition. */
   awaitingModelActivity(): boolean {
