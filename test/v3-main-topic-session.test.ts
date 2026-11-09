@@ -141,6 +141,7 @@ function wiringDeps(
     loadRun: () => ({ dag: run.dag, nodeExecutor: 'bot', chatId: CHAT, title: 't' }),
     botWorkingDirConfig: () => ({}),
     daemonAppliesNodeWorkingDir: () => true,
+    daemonReadsNodeProjectDir: () => true,
     drive: () => {},
     botName: (appId) => appId,
     warn: () => {},

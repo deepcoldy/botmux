@@ -144,6 +144,17 @@ describe('daemon discovery', () => {
     expect(findOnlineDaemon('wd-odd')).not.toHaveProperty('workflowNodeWorkingDir');
   });
 
+  it('passes through the workflow node project-dir capability only in its known form; an older descriptor has none', () => {
+    for (const [appId, value] of [['pd', 'v1'], ['pd-odd', 'v2'], ['pd-old', undefined]] as const) {
+      writeFileSync(join(dir, 'dashboard-daemons', `${appId}.json`), JSON.stringify({
+        larkAppId: appId, ipcPort: 7970, workflowNodeWorkingDir: 'v1', ...(value ? { workflowNodeProjectDir: value } : {}), lastHeartbeat: Date.now(),
+      }));
+    }
+    expect(findOnlineDaemon('pd')).toMatchObject({ workflowNodeProjectDir: 'v1' });
+    expect(findOnlineDaemon('pd-odd')).not.toHaveProperty('workflowNodeProjectDir');
+    expect(findOnlineDaemon('pd-old')).not.toHaveProperty('workflowNodeProjectDir');
+  });
+
   it('passes through sessionStoreProtocol and botmuxVersion without inventing them', () => {
     writeFileSync(join(dir, 'dashboard-daemons', 'new.json'), JSON.stringify({
       larkAppId: 'new',
