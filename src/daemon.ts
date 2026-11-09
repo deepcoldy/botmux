@@ -35906,6 +35906,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             ? precondition.precondition
             : 'none',
           targets: parkedTargets,
+          ...(parked?.heldTargets ? { heldTargets: parked.heldTargets } : {}),
           targetTurnIds: persistedTurnIds,
         });
         return 'deferred';

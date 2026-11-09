@@ -623,8 +623,11 @@ export interface DeferredRunParkInput {
   additionalPrompt?: string;
   precondition?: 'none' | 'disabled' | 'passed';
   /** Target chat ids with their current ownership state. A target that was
-   *  already dispatched is kept as `dispatched` and must never be replayed. */
-  targets: Record<string, 'waiting' | 'dispatching' | 'dispatched' | 'ambiguous'>;
+   *  already dispatched is kept as `dispatched` and must never be replayed;
+   *  `held` means a worker owns it and is waiting in its start gate. */
+  targets: Record<string, ScheduleDeferredTargetState>;
+  /** Exact turns already owned by a worker at the start gate. */
+  heldTargets?: Record<string, string>;
   targetTurnIds?: Record<string, string>;
 }
 
@@ -704,6 +707,9 @@ export function parkDeferredRun(
           ? { precondition: input.precondition ?? existing?.precondition } : {}),
         retryAt: new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
         targets: input.targets,
+        ...(input.heldTargets && Object.keys(input.heldTargets).length > 0
+          ? { heldTargets: input.heldTargets }
+          : {}),
         ...(Object.keys(targetTurnIds).length > 0 ? { targetTurnIds } : {}),
         // Freeze once: an edit made while parked must not change the prompt or
         // routing the remaining targets were admitted for.
