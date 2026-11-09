@@ -32833,7 +32833,7 @@ function _wbOpenQuickSheet(opts){
     function move(from,to){
       if(to<0||to>=list.length)return;
       var next=list.slice();var it=next.splice(from,1)[0];next.splice(to,0,it);
-      _wbSaveQuick(base,next,'',function(){if(editIndex===from)editIndex=to;else if(editIndex===to)editIndex=from;});
+      _wbSaveQuick(base,next,'',function(){captureAddDraft();if(editIndex===from)editIndex=to;else if(editIndex===to)editIndex=from;});
     }
     var rows=document.createElement('div');
     list.forEach(function(cmd,i){
@@ -32850,7 +32850,7 @@ function _wbOpenQuickSheet(opts){
       down.addEventListener('click',function(){move(i,i+1);});
       del.addEventListener('click',function(){
         var next=list.slice();next.splice(i,1);
-        _wbSaveQuick(base,next,'',function(){if(editIndex===i){editIndex=-1;draft=null;}else if(editIndex>i)editIndex--;});
+        _wbSaveQuick(base,next,'',function(){captureAddDraft();if(editIndex===i){editIndex=-1;draft=null;}else if(editIndex>i)editIndex--;});
       });
       row.appendChild(main);row.appendChild(up);row.appendChild(down);row.appendChild(del);
       rows.appendChild(row);

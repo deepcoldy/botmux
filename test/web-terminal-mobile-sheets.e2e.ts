@@ -777,6 +777,10 @@ setInterval(() => {}, 1_000);
   it('读取应答晚到触发重画时，新增表单里还没保存的内容先存草稿并回填', async () => {
     rmSync(settingsPath(), { force: true });
     await openPage();
+    // 外部列表在打开面板之前就写好：页面内嵌列表在 openPage 时已定，仍先显示默认，
+    // 晚到的读取应答带着外部列表回来，照样触发一次过期重画。写文件不依赖填表耗时，
+    // 用例不会因为机器忙、填表超过读取延迟而偶发失败。
+    writeQuickCommands([{ label: 'from-elsewhere', send: '/elsewhere' }]);
     await page.evaluate(() => {
       const ws = (window as unknown as { ws_: WebSocket }).ws_;
       const send = ws.send.bind(ws);
@@ -792,8 +796,7 @@ setInterval(() => {}, 1_000);
     const labelInput = page.locator('.wb-qc-form input[type="text"]').nth(1);
     await sendInput.fill('/typed-not-saved');
     await labelInput.fill('未保存的名称');
-    // 外部在读取在途期间改了列表；4 秒后晚到的应答带着它触发一次过期重画。
-    writeQuickCommands([{ label: 'from-elsewhere', send: '/elsewhere' }]);
+    // 4 秒后晚到的应答带着外部列表触发过期重画。
     await expect.poll(
       () => page.locator('.wb-qc-row-main', { hasText: 'from-elsewhere' }).count(),
       { timeout: 9_000 },
@@ -804,6 +807,64 @@ setInterval(() => {}, 1_000);
     // 回填的草稿可以直接提交，和外部刚写入的条目并存。
     await page.locator('.wb-qc-form button[type="submit"]').tap();
     await expect.poll(savedLabels).toEqual(expect.arrayContaining(['from-elsewhere', '未保存的名称']));
+    await closeSheet();
+    rmSync(settingsPath(), { force: true });
+  });
+
+  it('编辑已有条目提交时撞冲突：退出编辑态，新增表单为空且不预填刚编辑的内容', async () => {
+    rmSync(settingsPath(), { force: true });
+    await openPage();
+    await page.tap('#mobile-cmds');
+    await expect.poll(sheetOpen).toBe(true);
+    await page.tap('#wb-sheet-actions .wb-sheet-text-btn');
+    // 等打开面板时的读取完成：此时没有保存过，页面的比对基准是内置默认（null）。
+    await page.waitForFunction(() => (window as unknown as { _wbQuickReq: unknown })._wbQuickReq === null);
+    // 对一条默认指令进入编辑态并改内容，提交前让服务端文件被别的页面换掉，保存必然撞冲突。
+    await page.locator('.wb-qc-row-main', { hasText: '/rewind' }).tap();
+    const sendInput = page.locator('.wb-qc-form input[type="text"]').nth(0);
+    await expect.poll(() => sendInput.inputValue()).toBe('/rewind');
+    await sendInput.fill('/edited-send');
+    writeQuickCommands([{ label: 'from-elsewhere', send: '/elsewhere' }]);
+    await page.locator('.wb-qc-form button[type="submit"]').tap();
+    await expect.poll(() => page.textContent('#wb-toast')).toContain('别的页面改过');
+    // 冲突重画发生在编辑态（editIndex>=0、草稿是刚编辑的内容）：清空草稿、退回新增态，
+    // 表单为空——被编辑的那一行可能已被别的页面移位或删除，不能预填成一条待添加的重复项。
+    expect(await sendInput.inputValue()).toBe('');
+    expect(await page.locator('.wb-qc-form-title').textContent()).toContain('添加');
+    await closeSheet();
+    rmSync(settingsPath(), { force: true });
+  });
+
+  it('下移保存成功后的普通重画，保留新增表单里没提交的内容', async () => {
+    rmSync(settingsPath(), { force: true });
+    await openPage();
+    await page.tap('#mobile-cmds');
+    await expect.poll(sheetOpen).toBe(true);
+    await page.tap('#wb-sheet-actions .wb-sheet-text-btn');
+    const sendInput = page.locator('.wb-qc-form input[type="text"]').nth(0);
+    await sendInput.fill('/typed-before-move');
+    // 以 DOM 行序变化确认「客户端」已完成重画（不能只轮询服务端文件，文件先于应答写入，
+    // 那时页面还没重画），重画不能清掉正在新增的内容。
+    await page.locator('.wb-qc-row').nth(0).locator('button[aria-label^="下移"]').tap();
+    await expect.poll(() => page.locator('.wb-qc-row-main').nth(0).textContent()).toContain('/compact');
+    expect(await sendInput.inputValue()).toBe('/typed-before-move');
+    await closeSheet();
+    rmSync(settingsPath(), { force: true });
+  });
+
+  it('删除保存成功后的普通重画，保留新增表单里没提交的内容', async () => {
+    rmSync(settingsPath(), { force: true });
+    await openPage();
+    await page.tap('#mobile-cmds');
+    await expect.poll(sheetOpen).toBe(true);
+    await page.tap('#wb-sheet-actions .wb-sheet-text-btn');
+    const sendInput = page.locator('.wb-qc-form input[type="text"]').nth(0);
+    await sendInput.fill('/typed-before-delete');
+    // 独立用例：此前没有任何保存，草稿仍是空的，只有删除回调自己的保留逻辑能救下输入。
+    // 以 DOM 行数减少确认客户端重画已发生。
+    await page.locator('.wb-qc-row').nth(0).locator('button[aria-label^="删除"]').tap();
+    await expect.poll(() => page.locator('.wb-qc-row').count()).toBe(6);
+    expect(await sendInput.inputValue()).toBe('/typed-before-delete');
     await closeSheet();
     rmSync(settingsPath(), { force: true });
   });
