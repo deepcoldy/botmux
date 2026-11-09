@@ -94,11 +94,15 @@ describe('Antigravity ACP transport', () => {
     const f = fixture('hang');
     const controller = new AbortController();
     const task = runAntigravityAcp(f.options, controller.signal);
-    const rejected = expect(task).rejects.toThrow('cancelled');
+    // Bun's rejection matcher waits immediately; observe the task without
+    // asserting until the test has delivered its cancellation signal.
+    const rejected = task.catch((error: unknown) => error);
     await until(() => f.calls().some(call => call.method === 'session/prompt'));
     const pid = f.calls()[0].pid as number;
     controller.abort();
-    await rejected;
+    const error = await rejected;
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toHaveProperty('message', 'Antigravity ACP cancelled');
     await until(() => {
       try { return /^[ZX]/.test(execFileSync('ps', ['-p', String(pid), '-o', 'stat='], {
         encoding: 'utf8', timeout: 1_000, stdio: ['ignore', 'pipe', 'ignore'],
