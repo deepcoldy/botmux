@@ -94,6 +94,15 @@ describe('session Oncall request ownership', () => {
     expect(store.getRequest(source)?.status).toBe(status === 'succeeded' ? 'succeeded' : 'unknown');
     if (status === 'succeeded') expect(store.getRequest(source)?.openChatId).toBe('oc_original');
   });
+  it('keeps the delivered answer and links when a later non-final update re-indexes the same card', () => {
+    const store = new OncallGroupStore(temp());
+    store.registerTurn('app', 'session', 'om_q1');
+    store.recordSource({ ...source, answer: '', turnNumber: 1 });
+    store.recordSource({ ...source, answer: 'final answer', turnNumber: 1, nativeLink: 'https://applink.example.test/native', dispatchAttempt: 2 });
+    store.recordSource({ ...source, answer: '', turnNumber: undefined, nativeLink: undefined, dispatchAttempt: undefined });
+    expect(store.findSource('app', source.messageId)).toMatchObject({ answer: 'final answer', turnNumber: 1, nativeLink: 'https://applink.example.test/native', dispatchAttempt: 2 });
+    expect(store.latest('app', 'session')?.answer).toBe('final answer');
+  });
   it('permits an explicit retry only for a confirmed rejection, with a new attempt owner', () => {
     const store = new OncallGroupStore(temp()); store.claim(source);
     const prior = store.getRequest(source)!.attemptId;

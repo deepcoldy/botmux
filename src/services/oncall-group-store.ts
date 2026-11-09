@@ -89,7 +89,9 @@ export class OncallGroupStore {
       const previous = read<OncallGroupSource>(file);
       if (previous?.sessionId && source.sessionId && previous.sessionId !== source.sessionId) throw new Error('Oncall source session changed');
       if (previous && (previous.chatId !== source.chatId || previous.questionId !== source.questionId)) throw new Error('Oncall source question changed');
-      const recorded = previous ? { ...previous, ...source } : source;
+      // Non-final card updates re-index the same message without answer text.
+      const recorded = previous ? { ...previous, ...Object.fromEntries(Object.entries(source).filter(([, value]) => value !== undefined)),
+        answer: source.answer || previous.answer } as OncallGroupSource : source;
       const questionFile = this.path('questions', [source.appId, source.chatId, source.questionId]);
       mkdirSync(join(this.dataDir, 'oncall-groups', 'questions'), { recursive: true, mode: 0o700 });
       withFileLockSync(questionFile, () => {
