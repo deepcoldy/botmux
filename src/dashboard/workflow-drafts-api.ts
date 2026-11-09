@@ -3,7 +3,7 @@
  * workflow-dashboard-orchestration §4.6, §7.2, D2).
  *
  *   GET  /api/v3/orchestration/drafts            草稿列表，Dashboard 直接读盘
- *   POST /api/v3/orchestration/drafts            {larkAppId, goal} → 该 Bot 的 daemon
+ *   POST /api/v3/orchestration/drafts            {larkAppId, goal, project?} → 该 Bot 的 daemon
  *   GET  /api/v3/orchestration/drafts/:runId     → 草稿属主 daemon
  *   POST /api/v3/orchestration/drafts/:runId/…   → 草稿属主 daemon（写）
  *   POST /api/v3/orchestration/drafts/from-source {source, larkAppId?} 复制为新工作流（D6）
@@ -12,6 +12,8 @@
  *        先问新 Bot 的 daemon「我是谁」（I1），再让现编排 Bot prepare（关澄清会话），
  *        最后让新 Bot accept（接管）；中途断了，页面再点一次从断处接着做
  *   GET  /api/v3/orchestration/bots              编排 Bot 下拉框（D3，只读；带「最近一次调用模型失败」）
+ *   GET  /api/v3/orchestration/projects?larkAppId=… | ?runId=…  「项目」（只读）→ 该 Bot 的 daemon；
+ *        runId = 复制这个运行且没另选 Bot（取它的编排 Bot，同 from-source）
  *
  * The Dashboard only classifies the login (D1 `classifyDashboardInitiator`)
  * and routes; the orchestrating bot's daemon resolves the person, applies the
@@ -467,5 +469,57 @@ export function handleWorkflowOrchestratorBotsApi(
     return true;
   }
   jsonRes(res, 200, { ok: true, bots });
+  return true;
+}
+
+// ─── 项目（新建 / 运行模板 / 复制）────────────────────────────────────────
+
+export const WORKFLOW_PROJECTS_API_PATH = '/api/v3/orchestration/projects';
+
+/**
+ * GET /api/v3/orchestration/projects — where a new draft of the bot is
+ * clarified (its default dir, or the repo picker's candidates), read on that
+ * bot's own daemon, which also checks the choice. Read only, management login.
+ */
+export async function handleWorkflowProjectsApi(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  deps: Pick<WorkflowDraftsApiDeps, 'canManageHost' | 'featureEnabled' | 'runsDir' | 'proxyToDaemon'>,
+): Promise<boolean> {
+  if (url.pathname !== WORKFLOW_PROJECTS_API_PATH) return false;
+  if (req.method !== 'GET') {
+    jsonRes(res, 405, { ok: false, error: 'method_not_allowed', retryable: false });
+    return true;
+  }
+  if (!deps.canManageHost) {
+    jsonRes(res, 401, { ok: false, error: 'auth_required', retryable: false });
+    return true;
+  }
+  if (!deps.featureEnabled()) {
+    jsonRes(res, 409, { ok: false, error: 'feature_disabled', retryable: false });
+    return true;
+  }
+  let larkAppId = url.searchParams.get('larkAppId')?.trim() || undefined;
+  const runId = url.searchParams.get('runId')?.trim() || undefined;
+  if (!larkAppId && runId) {
+    larkAppId = runCopyDefaultOrchestrator(deps.runsDir, runId);
+    if (!larkAppId) {
+      jsonRes(res, 404, { ok: false, error: 'unknown_run', retryable: false });
+      return true;
+    }
+  }
+  if (!larkAppId) {
+    jsonRes(res, 400, { ok: false, error: 'larkAppId_required', retryable: false });
+    return true;
+  }
+  let upstream: Response;
+  try {
+    upstream = await deps.proxyToDaemon(larkAppId, WORKFLOW_PROJECTS_API_PATH, { method: 'GET', headers: { 'content-type': 'application/json' } });
+  } catch {
+    jsonRes(res, 502, { ok: false, error: 'daemon_proxy_failed', retryable: true });
+    return true;
+  }
+  await relay(res, upstream);
   return true;
 }

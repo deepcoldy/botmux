@@ -63,10 +63,10 @@ async function code(promise: Promise<unknown>): Promise<string> {
   return 'ok';
 }
 
-function setup() {
+function setup(overrides: Parameters<typeof makeService>[1] = {}) {
   const launch = fakeLaunch(base);
   launch.setOnline(ONLINE);
-  const h = makeService(base, { loadBots: () => FLEET, launch: launch.deps, libraryDataDir: library });
+  const h = makeService(base, { loadBots: () => FLEET, launch: launch.deps, libraryDataDir: library, ...overrides });
   h.setOnline(ONLINE);
   return { h, launch };
 }
@@ -432,6 +432,20 @@ describe('运行模板（§5.3, I13）', () => {
     expect(prompts).toHaveLength(1);
     expect(prompts[0]).toContain(`v1`);
     expect(prompts[0]).not.toMatch(/botmux workflow (start|approve|new|edit)/);
+  });
+
+  it('a main bot without a default dir: running a template needs a picked project, and the main bot\'s session opens there', async () => {
+    const repo = '/work/projects/web-portal';
+    const { h } = setup({ projects: { defaultDir: () => undefined, candidates: () => [{ path: repo, name: 'web-portal', type: 'repo' }] } });
+    seedFinishedRun('src-261101-080000-000-aaaa0031');
+    const saved = await h.service.saveRunAsTemplate('src-261101-080000-000-aaaa0031', OWNER, { requestKey: 'req-run-0031' });
+    expect(await code(h.service.createFromTemplate(OWNER, { workflowId: saved.workflowId }))).toBe('project_required');
+    expect(await code(h.service.createFromTemplate(OWNER, { workflowId: saved.workflowId, project: '/etc' }))).toBe('project_not_allowed');
+    const draft = await h.service.createFromTemplate(OWNER, { workflowId: saved.workflowId, project: repo });
+    expect(draft.project).toEqual({ dir: repo, from: 'draft' });
+    await h.service.launch(draft.runId, OWNER, {});
+    expect((await settled(h.service, draft.runId)).phase).toBe('started');
+    expect(h.clarify.createInputs.map((input) => input.workingDir)).toEqual([repo]);
   });
 
   it('the main bot session of a template run: a failed open stops the launch; 「继续」 opens it again', async () => {

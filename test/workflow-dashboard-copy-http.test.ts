@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { registerPlatformTunnelBridge } from '../src/platform/tunnel-peers.js';
-import { handleWorkflowDraftsApi } from '../src/dashboard/workflow-drafts-api.js';
+import { handleWorkflowDraftsApi, handleWorkflowProjectsApi } from '../src/dashboard/workflow-drafts-api.js';
 import { workflowInitiatorPreGateDenial } from '../src/dashboard/workflow-initiator-api.js';
 import { startIpcServer, setIpcAuthSecret, setLarkAppId, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { fetchDaemonIpc } from '../src/core/daemon-ipc-auth.js';
@@ -92,6 +92,12 @@ describe('Dashboard → daemon: 复制为新工作流', () => {
         libraryDataDir: join(dir, 'library'),
         proxyToDaemon,
       })) return;
+      if (await handleWorkflowProjectsApi(req, res, url, {
+        canManageHost: deps.canManageHost,
+        featureEnabled: () => deps.featureEnabled,
+        runsDir,
+        proxyToDaemon,
+      })) return;
       res.writeHead(404); res.end();
     });
     await new Promise<void>(resolve => dashboard!.listen(0, '127.0.0.1', () => resolve()));
@@ -165,6 +171,27 @@ describe('Dashboard → daemon: 复制为新工作流', () => {
     const edited = await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/nodes/write/text`, { goal: '写安全报告' }, alice);
     expect(edited.body.draft.flow.dag.nodes.find((node: any) => node.id === 'write').goal).toBe('写安全报告');
     expect(treeDigest(runDir)).toEqual(before);
+  });
+
+  it('复制运行的项目：没另选 Bot 就问来源运行的编排 Bot；它没设默认目录时，复制必须带上选的项目', async () => {
+    seedRun(runsDir, RUN);
+    const repo = join(dir, 'repo-a');
+    resetWorkflowDraftServiceForTests();
+    h = makeService(runsDir, {
+      loadBots: () => FLEET,
+      libraryDataDir: join(dir, 'library'),
+      projects: { defaultDir: () => undefined, candidates: () => [{ path: repo, name: 'repo-a', type: 'repo' }] },
+    });
+    h.setOnline([MAIN, DOC, REVIEW, STEWARD, PI]);
+    installWorkflowDraftService(h.service, { sweep: false });
+
+    const options = await call('GET', `/api/v3/orchestration/projects?runId=${RUN}`);
+    expect(options).toMatchObject({ status: 200, body: { project: { kind: 'pick', candidates: [{ path: repo }] } } });
+    expect(proxied).toEqual([`GET ${MAIN} /api/v3/orchestration/projects`]);
+    expect(await call('POST', FROM_SOURCE, { source: { kind: 'run', runId: RUN } })).toMatchObject({ status: 422, body: { error: 'project_required' } });
+    expect(draftDirs()).toEqual([]);
+    const out = await call('POST', FROM_SOURCE, { source: { kind: 'run', runId: RUN }, project: repo });
+    expect(out).toMatchObject({ status: 200, body: { draft: { project: { dir: repo, from: 'draft' } } } });
   });
 
   it('I1: a person who cannot operate the target orchestrating bot is refused, and nothing is created', async () => {

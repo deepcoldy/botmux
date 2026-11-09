@@ -38,7 +38,8 @@ import {
   type WorkflowInitiatorResolution,
 } from './workflow-initiator.js';
 import { createProductionDraftClarifier, registerWorkflowDraftIpcRoutes, workflowDraftService } from './workflow-draft-daemon.js';
-import type { DraftClarifier } from '../workflows/v3/draft-service.js';
+import type { DraftClarifier, WorkflowDraftProjects } from '../workflows/v3/draft-service.js';
+import { scanMultipleProjects } from '../services/project-scanner.js';
 import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
 import { updateHandoffLiveCard } from './worker-pool.js';
 import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator } from './schedule-creator-authorization.js';
@@ -49,7 +50,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createReadStream, existsSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { hostDnsServers, networkPolicyWarnings, proxyEnvKeys } from './sandbox-network-policy.js';
-import { join } from 'node:path';
+import { join, resolve as resolvePath } from 'node:path';
 import { updateDispatchRegistry } from './dispatch-registry.js';
 import { logger } from '../utils/logger.js';
 import type { DurableLarkOutboxTarget } from '../services/durable-lark-outbox.js';
@@ -242,7 +243,7 @@ import {
 } from '../services/quota-fallback.js';
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
-import { readGlobalConfig, isDispatchTaskTreeCardEnabled, isWorkflowFeatureEnabled, workflowNodeExecutorMode } from '../global-config.js';
+import { readGlobalConfig, isDispatchTaskTreeCardEnabled, isWorkflowFeatureEnabled, workflowNodeExecutorMode, repoPickerScanOptions } from '../global-config.js';
 import { archiveCodexForCleanup } from '../services/codex-cleanup-archive.js';
 import {
   clearChatReplyMode,
@@ -292,7 +293,7 @@ import {
 } from '../services/group-collaboration-mode-store.js';
 import { publishNativeTopicLinkPatchForSession } from './session-activity.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
-import { createHeadlessSession, resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
+import { createHeadlessSession, resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, expandHome, getProjectScanDirsForBot } from './session-manager.js';
 import { reconcileResumedStreamingCard } from './resume-streaming-card.js';
 import { buildRestartStatusCard, restartStatusCardNotifier } from './restart-status-card.js';
 import type { RestartObserver } from './restart-coordinator.js';
@@ -7073,6 +7074,24 @@ export function productionWorkflowDraftClarifier(): DraftClarifier {
     closeSession: (sessionId) => closeSessionForBackgroundCleanup(sessionId, 'workflow draft clarify session'),
     deleteHeadlessRecord: (headlessId) => { deleteHeadlessSession(headlessId); },
   });
+}
+
+/** The drafts' projects: this bot's effective default dir, else the same
+ *  candidates the Feishu repo picker card offers a new topic. */
+export function productionWorkflowDraftProjects(larkAppId: string): WorkflowDraftProjects {
+  return {
+    defaultDir: () => {
+      const dir = effectiveDefaultWorkingDir(getBot(larkAppId).config);
+      return dir ? resolvePath(expandHome(dir)) : undefined;
+    },
+    candidates: () => {
+      const scanDirs = getProjectScanDirsForBot(larkAppId).filter((dir) => existsSync(dir));
+      if (scanDirs.length === 0) return [];
+      return scanMultipleProjects(scanDirs, 3, repoPickerScanOptions())
+        .map(({ path, name, type, branch }) => ({ path, name, type, ...(branch ? { branch } : {}) }));
+    },
+    sessionDir: (sessionId) => findActiveBySessionId(sessionId)?.workingDir ?? sessionStore.getOwnedSession(sessionId)?.workingDir,
+  };
 }
 
 /**
