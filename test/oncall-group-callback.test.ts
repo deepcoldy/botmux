@@ -47,6 +47,15 @@ describe('Oncall card callback', () => {
     expect((await handleOncallGroupAction(event(), 'app')).toast.type).toBe('error');
     expect(fetcher).not.toHaveBeenCalled();
   });
+  it('does not bypass the classified form when an administrator changes the policy during identity resolution', async () => {
+    mocks.sender.mockImplementationOnce(async () => {
+      (mocks.bot.config as any).oncallGroup = { enabled: true, chatIds: ['oc_source'], flowMode: 'classify', formDisplay: 'private_card' };
+      return { email: 'clicker@example.test' };
+    });
+    await handleOncallGroupAction(event(), 'app');
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+  });
   it('uses the verified clicker account and replies with a link without changing the original card', async () => {
     vi.stubEnv('ONCALL_SERVICE_SECRET', ' service-secret ');
     vi.stubEnv('BYTEDCLI_USER_CLOUD_JWT', 'another-user-jwt');
@@ -100,7 +109,7 @@ describe('Oncall card callback', () => {
     await handleOncallGroupAction(event(), 'app');
     expect(mocks.reply.mock.calls.at(-1)![2]).toContain(message);
     expect(mocks.reply.mock.calls.at(-1)![2]).not.toContain('service-secret');
-    expect(new OncallGroupStore(dir).getRequest(source)).toEqual({ status: 'failed' });
+    expect(new OncallGroupStore(dir).getRequest(source)).toMatchObject({ status: 'failed' });
     expect(fetcher).toHaveBeenCalledTimes(1);
     vi.stubEnv('ONCALL_SERVICE_SECRET', 'updated-secret');
     mocks.sender.mockResolvedValueOnce({ email: 'another@example.test' });

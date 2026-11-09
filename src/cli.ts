@@ -6256,7 +6256,7 @@ async function cmdMaintenance(args: string[]): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'reply-card-ready' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -10109,7 +10109,8 @@ import {
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from './services/feedback-policy-resolver.js';
 import { normalizeFeedbackPolicy } from './services/feedback-policy.js';
 import { materializeFeedbackPolicyForDelivery } from './services/feedback-reviewer-delivery.js';
-import { attachOncallGroupButton, recordOncallGroupDelivery } from './im/lark/oncall-group.js';
+import { attachOncallGroupButton, recordOncallGroupDelivery, prepareNativeOncallCard } from './im/lark/oncall-group.js';
+import { OncallGroupStore } from './services/oncall-group-store.js';
 import { attachWorkflowSidebarEntry, workflowNodeSessionEntry } from './im/lark/workflow-sidebar-entry.js';
 import { resolveWorkflowEntryLink } from './core/workflow-entry-link.js';
 import { applyInlineMentions, applyInlineMentionsToCard } from './im/lark/inline-mentions.js';
@@ -13382,9 +13383,14 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   feedbackPolicy = feedbackPolicyForScheduledSend({ policy: feedbackPolicy,
     requesterSubjectId: feedbackRequesterSubjectId,
     authenticatedTurnId: authoritativeOriginTurnCtx?.turnId, session: scheduledOrigin });
+  // Oncall is session-scoped even when the CLI's turn lease has retired.
+  // Reuse a proven existing turn for card indexing without changing send authority.
+  const oncallTurnId = currentTurnId ?? new OncallGroupStore(resolveDataDir()).latest(appId, sid)?.questionId;
+  const nativeOncallLink = effectiveResponseKind === 'final' && !asVoice && !sendTopLevel && !overrideChatId && !sendInto && !vcMeetingManagedSendOrigin
+    ? await prepareNativeOncallCard(appId, s.chatId, oncallTurnId ?? '', sid) : undefined;
   const withOncallGroup = (card: string): string => {
     if (effectiveResponseKind !== 'final' || asVoice || sendTopLevel || overrideChatId || sendInto || vcMeetingManagedSendOrigin) return card;
-    const attached = attachOncallGroupButton(card, oncallGroupPolicy, s.chatId, s.chatType);
+    const attached = attachOncallGroupButton(card, oncallGroupPolicy, s.chatId, s.chatType, oncallTurnId ? { appId, sessionId: sid, questionId: oncallTurnId, phase: 'final', nativeLink: nativeOncallLink } : undefined);
     if (attached !== card) oncallGroupCard = JSON.parse(attached);
     return attached;
   };
@@ -14471,6 +14477,15 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
                 ...(feedbackPolicy ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}) }
             : { kind: 'progress', text }, {
             beforeEffect: async () => { await revalidateIsolatedOriginBeforeEffect(); revalidateVcMeetingManagedSend(); },
+            beforeCreate: async () => {
+              const port = findDaemon(appId)?.ipcPort ?? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT);
+              if (!port) throw new Error('Native thinking publication requires the live daemon');
+              const ready = await postSessionCliIpc(port, sid, 'reply-card-ready', {
+                expectedTurnId: currentTurnId, dispatchAttempt: originDispatchAttempt,
+              });
+              if (!ready.ok) throw new Error('Native thinking publication is not ready; answer send deferred');
+              await revalidateIsolatedOriginBeforeEffect();
+            },
             send: (body, uuid) => dispatchPrimaryUnlocked(body, 'interactive', undefined, completionProposalRecord ? completionProposalCardDispatchUuid(completionProposalRecord) : (uuid ?? providerUuid)),
             patch: (id, body) => patchPublishedGroupCard(appId, targetChatId, id, body, replyRecord.rootId,
               effectiveResponseKind === 'final' ? groupContextAuthorOrigin : undefined,
@@ -14480,11 +14495,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
                 beginScheduledProviderEffect();
               }),
             isWithdrawn: error => error instanceof MessageWithdrawnError,
-            render: record => buildTurnReplyCard(record, {
+            render: record => attachOncallGroupButton(buildTurnReplyCard(record, {
               ...replyCardPresentation(getBot(appId).config, targetChatId), locale: localeForBot(appId), workingDir: s.workingDir,
               showLiveUsage: resolveUsageDisplay(appId) === 'streaming',
               canStop: replyCardPresentation(getBot(appId).config, targetChatId).canStop && getBot(appId).config.codexRpcInput !== true,
-            }),
+            }), oncallGroupPolicy, s.chatId, s.chatType, { appId, sessionId: sid, questionId: record.turnId,
+              phase: record.finalCard ? 'final' : 'first', nativeLink: nativeOncallLink }),
             sendOverflow: async (fullText, uuid) => {
               const path = join(replyStore.directory, `${replyStore.id(replyKey)}-reply.md`);
               writeFileSync(path, fullText, { mode: 0o600 });
@@ -14557,9 +14573,9 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     }
 
     if (oncallGroupCard && messageId) {
-      recordOncallGroupDelivery(resolveDataDir(), { appId, chatId: targetChatId, messageId,
-        questionId: currentTurnId ?? messageId,
-        answer: text, card: oncallGroupCard });
+      recordOncallGroupDelivery(resolveDataDir(), { appId, chatId: targetChatId, messageId, sessionId: sid, rootId: s.scope === 'chat' ? s.chatId : s.rootMessageId,
+        questionId: oncallTurnId ?? messageId,
+        answer: text, card: oncallGroupCard, nativeLink: nativeOncallLink, dispatchAttempt: originDispatchAttempt });
     }
 
     // Turn-completion bookkeeping is INDEPENDENT of the feedback card. A
@@ -19869,6 +19885,7 @@ if (__entrySubcommand) {
   // help dump instead of a session, and nothing reported an error.
   else if (__entrySubcommand === 'codex-app-runner') await import('./codex-app-runner.js');
   else if (__entrySubcommand === 'minimax-runner') await import('./minimax-runner.js');
+  else if (__entrySubcommand === 'antigravity-runner') await import('./antigravity-runner.js');
   else if (__entrySubcommand === 'dsh-runner') await import('./dsh-runner.js');
   else if (__entrySubcommand === 'mira-runner') await import('./mira-runner.js');
   else if (__entrySubcommand === 'mir-runner') await import('./mir-runner.js');

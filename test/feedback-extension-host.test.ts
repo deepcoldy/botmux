@@ -28,6 +28,7 @@ import { createHash } from 'node:crypto';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 import { buildFeedbackSurface, defaultFeedbackTemplate } from '../src/services/feedback-template.js';
 import { feedbackRefreshBudget, refreshFeedbackMessage } from '../src/services/feedback-refresh.js';
+import { closeFeedbackStorage, getFeedbackStorage } from '../src/services/feedback-storage.js';
 
 const dispose: Array<() => void> = [];
 afterEach(() => {
@@ -108,6 +109,69 @@ describe('feedback extension host callback', () => {
     await tickFeedbackExtensions(data.directory, 'app');
     expect(sent).toBe(1);
     expect(data.extensions.jobsForApp('app').find(job => job.payload.answerMessageId === 'second-answer')?.status).toBe('blocked');
+  });
+  it('does not query more old answers after a slow read exhausts the refresh budget', async () => {
+    const data = await fixture();
+    for (const messageId of ['old-first', 'old-second']) {
+      data.extensions.bindSurface('app', messageId, data.extensions.surface('app', 'surface')!);
+      data.extensions.dirtySurface('app', messageId, {});
+    }
+    const clock = vi.spyOn(Date, 'now');
+    let now = Date.now();
+    clock.mockImplementation(() => now);
+    const original = data.source.findDeliveryById.bind(data.source);
+    const reads = vi.spyOn(data.source, 'findDeliveryById').mockImplementation(deliveryId => {
+      now += 3000;
+      return original(deliveryId);
+    });
+    try {
+      await tickFeedbackExtensions(data.directory, 'app');
+      expect(reads).toHaveBeenCalledTimes(1);
+      expect(data.extensions.dirtySurfaces('app').some(item => item.messageId === 'old-second')).toBe(true);
+    } finally { clock.mockRestore(); }
+  });
+  it('sends through the production SQLite selector while an old card network patch is pending', async () => {
+    const data = await fixture();
+    const current = await readFeedbackExtensionConfig(data.directory);
+    await saveFeedbackExtensionConfig(data.directory, current.version, {
+      ...current, presentations: { app: { default: { enabled: true, rounds: [1], mode: 'separate' }, rules: [] } },
+    }, 'test-admin');
+    data.extensions.activate('app', '2020-01-01T00:00:00Z');
+    data.extensions.dirtySurface('app', 'surface', {});
+    let release!: () => void;
+    const { store } = await getFeedbackStorage(data.directory);
+    mock.source = store;
+    mock.update.mockImplementation(async () => {
+      await new Promise<void>(resolve => { release = resolve; });
+    });
+    const background = tickFeedbackExtensions(data.directory, 'app', 'background');
+    const deadline = Date.now() + 5000;
+    while (!release) {
+      if (Date.now() > deadline) throw new Error('background patch did not start');
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    const next = await store.recordTurnDelivery({ botAppId: 'app', sessionId: 'next-session', turnId: 'next-turn',
+      platform: 'lark', platformAppId: 'app', platformMessageId: 'new-answer', chatId: 'chat', topicRootId: 'new-question',
+      content: 'new answer', cardMode: 'feedback', status: 'delivered', policy: data.policy });
+    await store.recordTurnTerminal({ botAppId: 'app', sessionId: 'next-session', turnId: 'next-turn', status: 'completed' });
+    mock.threadId.mockResolvedValue('thread');
+    mock.detail.mockResolvedValue({ items: [{ chat_id: 'chat' }] });
+    mock.mode.mockResolvedValue('topic');
+    mock.reply.mockResolvedValue('new-surface');
+    try {
+      await tickFeedbackExtensions(data.directory, 'app', 'surface');
+      expect(data.extensions.surface('app', 'new-surface')?.deliveryId).toBe(next.deliveryId);
+    } finally { release(); await background; await closeFeedbackStorage(data.directory); }
+  });
+  it('leaves old-card refresh and inline cleanup to the background lane', async () => {
+    const data = await fixture();
+    data.extensions.dirtySurface('app', 'surface', { result: 'old' });
+    (data.extensions as any).database.prepare('INSERT OR IGNORE INTO inline_cleanup VALUES(?,?)').run('app', 'old-answer');
+    await tickFeedbackExtensions(data.directory, 'app', 'surface');
+    expect(mock.detail).not.toHaveBeenCalled();
+    expect(mock.update).not.toHaveBeenCalled();
+    expect(data.extensions.dirtySurfaces('app').map(item => item.messageId)).toContain('surface');
+    expect(data.extensions.inlineCleanups('app')).toContain('old-answer');
   });
   it('keeps a newer revision queued until a timed-out old patch actually finishes', async () => {
     const data = await fixture();

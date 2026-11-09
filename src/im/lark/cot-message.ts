@@ -3,7 +3,7 @@
  *
  * Feishu renders `message_cot` messages as the NATIVE thinking bubble
  * (fixed-height, scrolling, collapsible — the same UI Feishu's own AI uses),
- * driven by AG-UI protocol events. This is the ONLY thinking channel; if the
+ * driven by AG-UI protocol events. Unified replies may also show in-card activity. If the
  * API fails (client < PC 7.70 / mobile 7.74 renders a plain post fallback,
  * tenants where the API is unavailable get errors), thinking is simply not
  * displayed for that turn — logged, never retried mid-turn.
@@ -37,8 +37,9 @@
  * Strictly cosmetic: every network call catches its own errors and never
  * touches turn settlement.
  *
- * Per-bot master switch `cotEnabled` (default ON — only an explicit false
- * disables; per-chat opt-out via `/cot off`).
+ * Legacy native switch `cotEnabled` defaults ON; unified native switch
+ * `replyCardNativeCot` defaults OFF and is independent of in-card activity.
+ * Both honor the per-chat `/cot off` opt-out.
  */
 import { mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
@@ -55,6 +56,7 @@ import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { withFileLockSync } from '../../utils/file-lock.js';
 import { localeForBot, t } from '../../i18n/index.js';
+import type { TurnReplyCardMode } from '../../services/turn-reply-card.js';
 import { prepareLocalAddressContent, sanitizeLocalAddressText } from './local-address-policy.js';
 import { localAddressContextForBot } from './local-address-context.js';
 import type { CotEntry, WorkerToDaemon } from '../../types.js';
@@ -107,6 +109,12 @@ interface CotState {
    *  tool_result entry has no tool name) and consumed by its result. */
   resultLanguages?: Map<string, string>;
   pumping: boolean;
+  /** Unified replies publish this bubble before their answer card. */
+  beforeReply?: boolean;
+  /** Frozen publisher authority; a later runtime cannot inherit this stream. */
+  owns?: () => boolean;
+  publication?: Promise<void>;
+  releasePublication?: () => void;
   /** Set when turn_terminal arrives; consumed by the pump's final flush. */
   finishStatus?: 'done' | 'interrupted';
   /** Worker loss is not evidence that an external adopted CLI stopped. */
@@ -178,6 +186,7 @@ const states = new WeakMap<DaemonSession, CotState>();
  *  而不是因 turnId 不匹配被忽略、让旧气泡永远转圈。有界（RECENT_COT_STATES_MAX）。 */
 const recentStates = new WeakMap<DaemonSession, Map<string, CotState>>();
 const RECENT_COT_STATES_MAX = 8;
+const earlyTerminals = new WeakMap<DaemonSession, Map<string, 'done' | 'interrupted'>>();
 const retiredKeys = new WeakMap<DaemonSession, string[]>();
 
 function retireKey(ds: DaemonSession, key: string): void {
@@ -582,20 +591,21 @@ function turnKeyOf(msg: { turnId: string; dispatchAttempt?: number }): string {
   return `${msg.turnId}|${msg.dispatchAttempt ?? ''}`;
 }
 
-/** Effective per-session gate: bot-level master switch (`cotEnabled`,
- *  default ON — only explicit false disables) AND the chat not opted out via
+/** Effective per-session gate: the native switch for the accepted display mode
+ *  (legacy cotEnabled defaults ON; unified replyCardNativeCot defaults OFF),
+ *  AND the chat not opted out via
  *  `/cot off` (`noCotChats`). Read fresh from the in-memory registry so
  *  `/cot` toggles apply from the next update without a daemon restart.
  *  `/cot show` (`ds.cotForced`) overrides both switches for one turn —
  *  apiOnly and private replies stay hard blocks for this public channel. */
-export function cotEnabled(ds: DaemonSession): boolean {
+export function cotEnabled(ds: DaemonSession, mode: TurnReplyCardMode = 'legacy'): boolean {
   if (isSilentMessageListenerSession(ds.session)) return false;
   try {
     const cfg = getBot(ds.larkAppId).config;
     if (cfg.apiOnly === true) return false;
     if (privateReplyEnabled(ds.session)) return false;
     if (ds.cotForced) return true;
-    return cfg.cotEnabled !== false
+    return (mode === 'legacy' ? cfg.cotEnabled !== false : cfg.replyCardNativeCot === true)
       && !(ds.chatId && cfg.noCotChats?.includes(ds.chatId));
   } catch {
     return false;
@@ -734,6 +744,7 @@ async function apiCreate(ds: DaemonSession, state: CotState): Promise<void> {
     }
   }
   const c = getBotClient(ds.larkAppId);
+  if (state.owns?.() === false) { clearCreateIntent(ds, state); return; }
   const res = await c.request({
     method: 'POST',
     url: '/open-apis/im/v1/message_cot',
@@ -760,10 +771,11 @@ async function apiAppend(ds: DaemonSession, state: CotState, events: CotEvent[])
   const c = getBotClient(ds.larkAppId);
   // PUT body caps events at 50 per call.
   for (let i = 0; i < events.length; i += 50) {
+    if (state.owns?.() === false) return;
     if (getBot(ds.larkAppId)?.config?.topicUnavailablePolicy === 'stop') {
       await assertCotWriteAllowed(ds, state, state.messageId);
     }
-    if (state.pausedForRestore) return;
+    if (state.pausedForRestore || state.owns?.() === false) return;
     const response = await c.request({
       method: 'PUT',
       url: '/open-apis/im/v1/message_cot',
@@ -981,19 +993,31 @@ function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index:
   ];
 }
 
-/**
- * Single-in-flight pump: creates the CoT entity on first run, then drains
- * pendingEntries — each unseen entry becomes its own node; when finishStatus
- * is set and all entries are drained, closes through RUN_FINISHED on success
- * or explicit error completion for interrupted streams.
- */
+/** A retired publisher may close its own entity but never resume its stream. */
+function stopUnownedCot(ds: DaemonSession, state: CotState): Promise<true> | undefined {
+  if (state.owns?.() !== false) return undefined;
+  state.disabled = true;
+  state.pendingEntries = undefined;
+  state.finishStatus = 'interrupted';
+  if (state.cotId && !state.settled) {
+    state.settled = true;
+    return completeAndClear(ds, state, 'error').then(() => true);
+  }
+  return Promise.resolve(true);
+}
+
+/** Single publisher for creation, ordered process events and terminal cleanup. */
 async function pump(ds: DaemonSession, state: CotState): Promise<void> {
   if (state.pumping) return;
   state.pumping = true;
+  state.publication ??= new Promise<void>(resolve => { state.releasePublication = resolve; });
   try {
     while (!state.disabled && !state.pausedForRestore) {
+      const abandoned = stopUnownedCot(ds, state);
+      if (abandoned) { await abandoned; break; }
       if (!state.cotId) {
-        const startingCard = pendingStartingCardPublication(ds);
+        if (state.beforeReply && state.finishStatus === 'interrupted') { state.disabled = true; break; }
+        const startingCard = state.beforeReply ? undefined : pendingStartingCardPublication(ds);
         if (startingCard) {
           await startingCard;
           // A newer turn/stop can arrive during the POST. Never resurrect its
@@ -1013,6 +1037,8 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
         // recording it after the append would leave a markerless window where
         // a created-but-never-settled bubble spins forever.
         if (!recordCreatedCot(ds, state) && canResumeCotMessage(ds)) throw new Error('CoT recovery checkpoint unavailable');
+        const abandoned = stopUnownedCot(ds, state);
+        if (abandoned) { await abandoned; break; }
         if (state.createSuperseded && !state.settled) {
           state.settled = true;
           await completeAndClear(ds, state, state.finishStatus === 'done' ? 'done' : 'error');
@@ -1027,9 +1053,12 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
           ev('RUN_STARTED', { threadId: ds.session.sessionId, runId: state.turnId }),
           ev('REASONING_START', { messageId: reasoningId(state, 0) }),
         ]);
+        const abandoned = stopUnownedCot(ds, state);
+        if (abandoned) { await abandoned; break; }
         if (state.pausedForRestore) break;
         logger.info(`[cot] created cot=${state.cotId} msg=${state.messageId} turn=${state.turnId.substring(0, 24)}`);
       }
+      state.releasePublication?.();
       const pending = state.pendingEntries;
       state.pendingEntries = undefined;
       if (pending && pending.length > state.sentCount) {
@@ -1042,6 +1071,8 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
         state.reservedCount = pending.length;
         if (!recordCotOrphanMarker(ds, state) && canResumeCotMessage(ds)) throw new Error('CoT recovery checkpoint unavailable');
         await apiAppend(ds, state, batch);
+        const abandoned = stopUnownedCot(ds, state);
+        if (abandoned) { await abandoned; break; }
         if (state.pausedForRestore) break;
         state.sentCount = pending.length;
         continue; // re-check for newer entries queued during the push
@@ -1056,6 +1087,8 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
           terminalEvents.push(ev('RUN_FINISHED', { threadId: ds.session.sessionId, runId: state.turnId, status: 'done' }));
         }
         await apiAppend(ds, state, terminalEvents);
+        const abandoned = stopUnownedCot(ds, state);
+        if (abandoned) { await abandoned; break; }
         if (state.finishStatus === 'interrupted') await apiComplete(ds, state, 'error');
         state.settled = true;
         clearCotOrphanMarker(state);
@@ -1073,6 +1106,7 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
       void completeAndClear(ds, state, state.recovery && state.finishStatus === 'done' ? 'done' : 'error');
     }
   } finally {
+    state.releasePublication?.();
     state.pumping = false;
     if (state.resumeRequested && state.pausedForRestore && !state.finishStatus) {
       state.resumeRequested = false;
@@ -1086,19 +1120,22 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
 }
 
 /**
- * Entry point for the worker's `thinking_update` IPC. Returns true while the
+ * Entry point for the worker's `thinking_update` IPC. The caller supplies the
+ * accepted turn's effective reply mode, including legacy fallbacks. Returns true while the
  * native CoT message owns this turn's thinking channel; false when CoT is
  * off or disabled for the turn (thinking is then simply not displayed).
  */
 export function handleCotThinkingUpdate(
   ds: DaemonSession,
   msg: Extract<WorkerToDaemon, { type: 'thinking_update' }>,
+  mode: TurnReplyCardMode = 'legacy',
+  owns?: () => boolean,
 ): boolean {
   // Thinking bubbles are outbound messages too. Keep silent fires quiet even
   // when /cot show is armed, without suppressing another turn in this session.
   if (isSilentScheduledTurn(ds, msg.turnId) || ds.session.hiddenThinkingTurns?.includes(msg.turnId)) return false;
   retireSupersededCotMarkers(ds, msg);
-  if (!cotEnabled(ds)) return false;
+  if (!cotEnabled(ds, mode)) return false;
   const key = turnKeyOf(msg);
   let state = states.get(ds);
   if (state?.turnKey !== key && (retiredKeys.get(ds)?.includes(key) || recentStates.get(ds)?.has(key))) return true;
@@ -1126,6 +1163,8 @@ export function handleCotThinkingUpdate(
       settled: false,
       sentCount: 0,
       pumping: false,
+      beforeReply: mode !== 'legacy',
+      ...(mode !== 'legacy' && earlyTerminals.get(ds)?.has(key) ? { finishStatus: earlyTerminals.get(ds)!.get(key) } : {}),
       ...(canResumeCotMessage(ds) ? { recovery: {
         larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, chatId: ds.chatId,
         nativeSessionId: ds.session.cliSessionId!, targetKey: cotTargetKey(ds.session),
@@ -1135,8 +1174,30 @@ export function handleCotThinkingUpdate(
     rememberRecentState(ds, state);
   }
   state.pendingEntries = msg.entries;
+  state.owns ??= owns;
   void pump(ds, state);
   return true;
+}
+
+/** The initial answer waits for native create + prologue (or its bounded failure).
+ * Once started, keep waiting even when the operator turns the switch off. */
+export async function prepareCotMessageBeforeReply(
+  ds: DaemonSession, binding: { turnId: string; dispatchAttempt?: number },
+  owns?: () => boolean,
+): Promise<void> {
+  const key = turnKeyOf(binding);
+  let state = states.get(ds);
+  if (state?.turnKey !== key) state = recentStates.get(ds)?.get(key);
+  if (!state) {
+    handleCotThinkingUpdate(ds, { type: 'thinking_update', ...binding, entries: [] }, 'unified', owns);
+    state = states.get(ds);
+  }
+  if (state?.turnKey === key) await state.publication;
+}
+
+export function hasCotMessageForTurn(ds: DaemonSession, binding: { turnId: string; dispatchAttempt?: number }): boolean {
+  const key = turnKeyOf(binding);
+  return states.get(ds)?.turnKey === key || recentStates.get(ds)?.has(key) === true;
 }
 
 /** Retire only the timeline that a confirmed steer replaced. The worker sends
@@ -1254,6 +1315,10 @@ export function finalizeCotMessage(
   // 迟到的 terminal 仍要收尾它自己的气泡（通常 settleSupersededState 已先按 done
   // 收过，这里靠 finishStatus / settled 幂等）。
   const key = turnKeyOf({ turnId, dispatchAttempt });
+  const terminals = earlyTerminals.get(ds) ?? new Map<string, 'done' | 'interrupted'>();
+  if (!terminals.has(key)) terminals.set(key, status === 'completed' ? 'done' : 'interrupted');
+  while (terminals.size > RECENT_COT_STATES_MAX) terminals.delete(terminals.keys().next().value!);
+  earlyTerminals.set(ds, terminals);
   if (state?.turnKey !== key) state = recentStates.get(ds)?.get(key);
   if (!state && canResumeCotMessage(ds)) {
     const candidates = cotRecoveryMarkers(ds).filter(rec => rec.turnKey === key);

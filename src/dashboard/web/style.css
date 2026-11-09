@@ -12378,6 +12378,7 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
 
 /* toggle 开关行：checkbox 隐藏，switch 是视觉开关 */
 .toggle-row {
+  position: relative;
   display: flex;
   align-items: flex-start;
   gap: 12px;
@@ -12385,7 +12386,9 @@ button.contrast:hover { background: var(--danger-soft); border-color: var(--dang
   cursor: pointer;
   color: var(--fg);
 }
-.toggle-row input { position: absolute; opacity: 0; pointer-events: none; }
+/* Keep the focusable checkbox inside its visible label. An unanchored absolute
+   input can sit outside a scrolled card and scroll the entire shell on focus. */
+.toggle-row input { position: absolute; left: 0; top: 50%; width: 1px; height: 1px; margin: 0; opacity: 0; pointer-events: none; }
 .toggle-row .switch {
   width: 36px;
   height: 20px;
@@ -33250,19 +33253,50 @@ a.card-menu-item {
 .group-default-models-row .sect-sort-menu > .sect-sort-trigger { width: 100%; min-width: 0; }
 .group-default-models-row .sect-sort-value { max-width: none; }
 .group-default-models-field { min-width: 0; }
-.bd-feedback-controls { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; gap: 24px; }
-.bd-oncall-settings { min-width: 0; border: 0; padding: 0; margin: 0; }
-.bd-oncall-scope { display: flex; align-items: center; gap: 12px; margin-top: 12px; }
-.bd-oncall-scope > label { flex-shrink: 0; }
-.bd-oncall-scope .connector-group-picker { max-width: 360px; }
-.bd-oncall-secret { display: grid; gap: 8px; margin-top: 16px; max-width: 480px; }
-.bd-oncall-secret > label { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; font-size: 13px; }
-.bd-oncall-secret-input { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
-.bd-oncall-secret-input > input { min-width: 0; width: 100%; height: var(--button-height); box-sizing: border-box; padding: 0 var(--button-padding-x); border: 1px solid var(--border-soft); border-radius: var(--radius-sm); background: var(--surface); color: var(--fg); }
-.bd-oncall-secret-input > input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.bd-oncall-secret-input > button { min-width: 64px; }
-.bd-oncall-secret > small { font-size: 12px; }
-@media (max-width: 720px) { .bd-feedback-controls { grid-template-columns: minmax(0, 1fr); gap: 16px; } }
+.bd-oncall-settings,
+.bd-oncall-fields { min-width: 0; border: 0; padding: 0; margin: 0; }
+.bd-oncall-section { container-type: inline-size; container-name: bd-oncall; }
+.bd-oncall-required { display: inline-block; margin-left: 6px; color: var(--muted); font-size: 11px; font-weight: 400; }
+.bd-oncall-business-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 18px; }
+.bd-oncall-business-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
+.bd-oncall-business-meta > span:first-child { overflow-wrap: anywhere; }
+.bd-oncall-business-meta button { font-size: 12px; }
+.bd-oncall-basic-grid > .bd-oncall-field > label { display: block; }
+.bd-oncall-basic-grid > .bd-oncall-field > label > input { display: block; width: 100%; margin-top: 8px; }
+.bd-oncall-status { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.bd-oncall-status::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.bd-oncall-status[data-state=ok] { color: var(--success, #3fbd91); }
+.bd-oncall-status[data-state=error] { color: var(--danger, #ed7c7c); }
+.bd-oncall-actions { justify-content: flex-end; align-items: center; }
+.bd-oncall-actions .oncall-status { margin-right: auto; }
+.bd-oncall-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px 24px;
+  margin-top: 18px;
+}
+.bd-oncall-field { display: flex; flex-direction: column; align-items: stretch; gap: 8px; min-width: 0; color: var(--fg); font-size: 13px; }
+.bd-oncall-field-wide { grid-column: 1 / -1; }
+.bd-oncall-field .bd-section-note { margin: 0; }
+.bd-oncall-field .connector-group-picker,
+.bot-defaults-page .bd-oncall-field .bd-field-menu { width: 100%; max-width: none; min-width: 0; }
+.bot-defaults-page .bd-tile .bd-oncall-field input[type=password] {
+  width: 100%; min-width: 0; height: var(--button-height); min-height: var(--button-height); max-height: var(--button-height);
+  box-sizing: border-box; padding: 0 var(--button-padding-x);
+  border: 1px solid var(--border-soft); border-radius: var(--radius-md);
+  background: var(--surface); color: var(--fg); font-size: 12px; font-weight: 600; line-height: normal;
+}
+.bd-oncall-field input[type=password]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.bd-oncall-details { margin-top: 18px; border-top: 1px solid var(--border-soft); padding-top: 14px; }
+.bd-oncall-details > summary { cursor: pointer; color: var(--fg); font-size: 13px; font-weight: 600; line-height: 1.7; overflow-wrap: anywhere; }
+.bd-oncall-details > summary:hover { color: var(--accent); }
+.bd-oncall-summary-meta { display: inline-block; margin-left: 12px; color: var(--muted); font-size: 12px; font-weight: 400; }
+.bd-oncall-details .actions,
+.bd-oncall-actions { margin-top: 18px; }
+@container bd-oncall (max-width: 560px) {
+  .bd-oncall-grid { grid-template-columns: minmax(0, 1fr); gap: 16px; }
+  .bd-oncall-summary-meta { margin-left: 6px; }
+}
 
 .group-serial-input-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 0; }
 .group-serial-input-row > label { display: flex; align-items: center; gap: 6px; }
@@ -35786,3 +35820,8 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .dboard-task { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 8px; font-size: var(--fs-12); color: var(--fg-2); }
 .dboard-task-chat { flex: 0 0 auto; font-weight: 600; color: var(--fg-1, inherit); }
 .dboard-task .dboard-task-text { white-space: normal; overflow-wrap: anywhere; }
+
+.bd-oncall-preset { margin-top: 8px; padding: 14px; border: 1px solid var(--border-soft); border-radius: var(--radius-md); background: var(--surface); }
+.bd-oncall-preset > strong { font-size: 12px; font-weight: 600; }
+.bd-oncall-preset .bd-oncall-grid { margin-top: 12px; gap: 12px; }
+.bd-oncall-preset > .bd-section-note { display: block; margin-top: 12px; }

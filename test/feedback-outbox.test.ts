@@ -33,8 +33,25 @@ describe('feedback schema v5 durable event outbox', () => {
       db.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'turn', status: 'completed' });
       db.recordTurnDelivery(deliveryInput([destination('one')]));
       db.claimFeedbackOutbox({ now: Date.now(), limit: 1, claimToken: 'crashed-attempt' });
+      expect(db.startFeedbackOutboxRequest(db.listFeedbackOutbox()[0].outboxId, 'crashed-attempt')).toBe(true);
       db.resetExpiredFeedbackOutboxClaims(Date.now() + 1000, 0);
       expect(db.listFeedbackOutbox()[0]).toMatchObject({ status: 'pending', lastError: 'webhook_outcome_unknown:crashed-attempt' });
+    } finally { db.close(); }
+  });
+  it('keeps an earlier unknown outcome through re-claim, request admission and delivery', async () => {
+    const db = await store();
+    try {
+      db.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'turn', status: 'completed' });
+      db.recordTurnDelivery(deliveryInput([destination('one')]));
+      const [row] = db.claimFeedbackOutbox({ now: Date.now(), limit: 1, claimToken: 'crashed-attempt' });
+      expect(db.startFeedbackOutboxRequest(row.outboxId, 'crashed-attempt')).toBe(true);
+      db.resetExpiredFeedbackOutboxClaims(Date.now() + 1000, 0);
+      db.claimFeedbackOutbox({ now: Date.now() + 1000, limit: 1, claimToken: 'second' });
+      expect(db.listFeedbackOutbox()[0]).toMatchObject({ status: 'inflight', lastError: 'webhook_outcome_unknown:crashed-attempt' });
+      expect(db.startFeedbackOutboxRequest(row.outboxId, 'second')).toBe(true);
+      expect(db.listFeedbackOutbox()[0]).toMatchObject({ status: 'inflight', lastError: 'webhook_outcome_unknown:crashed-attempt' });
+      expect(db.settleFeedbackOutboxDelivered(row.outboxId, 'second', 200, new Date().toISOString())).toBe(true);
+      expect(db.listFeedbackOutbox()[0]).toMatchObject({ status: 'delivered', lastError: 'webhook_outcome_unknown:crashed-attempt' });
     } finally { db.close(); }
   });
   it('migrates to v5 and atomically fans out a deterministic turn.completed event', async () => {
@@ -92,6 +109,7 @@ describe('feedback schema v5 durable event outbox', () => {
     expect(persisted.destination).toEqual(original.destination);
     expect(reopened.claimFeedbackOutbox({ now: dueAt + 4999, limit: 1, claimToken: 'worker-c' })).toEqual([]);
     reopened.claimFeedbackOutbox({ now: dueAt + 5000, limit: 1, claimToken: 'worker-c' });
+    expect(reopened.startFeedbackOutboxRequest(claimed.outboxId, 'worker-c')).toBe(true);
     expect(reopened.resetExpiredFeedbackOutboxClaims(dueAt + 7000, 1000)).toBe(1);
     expect(reopened.listFeedbackOutbox()[0].status).toBe('pending');
     reopened.close();

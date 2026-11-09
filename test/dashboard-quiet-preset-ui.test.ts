@@ -18,6 +18,7 @@ async function settle(times = 3): Promise<void> {
 
 function renderSection(overrides?: Partial<{
   cotEnabled: boolean;
+  replyCardNativeCot: boolean;
   silentReactions: boolean;
   disableStreaming: boolean;
 }>) {
@@ -27,6 +28,7 @@ function renderSection(overrides?: Partial<{
   const props = {
     tr,
     cotEnabled: true,
+    replyCardNativeCot: false,
     silentReactions: false,
     disableStreaming: false,
     putCardPref,
@@ -48,7 +50,7 @@ afterEach(() => {
 });
 
 describe('QuietPresetSection', () => {
-  it('starts off when the derived three-way condition is not met and writes nothing', async () => {
+  it('starts off when the derived four-way condition is not met and writes nothing', async () => {
     const { putCardPref, renderer } = renderSection();
     expect(switchInput(renderer).props.checked).toBe(false);
     expect(renderer.root.findAllByProps({ 'data-quiet-preset-details': true })).toHaveLength(0);
@@ -56,7 +58,7 @@ describe('QuietPresetSection', () => {
     expect(putCardPref).not.toHaveBeenCalled();
   });
 
-  it('starts on (details visible) when all three current values already match', () => {
+  it('starts on (details visible) when all four current values already match', () => {
     const { renderer, putCardPref } = renderSection({
       cotEnabled: false,
       silentReactions: true,
@@ -67,7 +69,7 @@ describe('QuietPresetSection', () => {
     expect(putCardPref).not.toHaveBeenCalled();
   });
 
-  it('ON performs exactly one PUT with exactly the three required keys, syncs parent, toasts', async () => {
+  it('ON performs exactly one PUT with exactly the four required keys, syncs parent, toasts', async () => {
     const { renderer, putCardPref, onApplied, props } = renderSection();
 
     await act(async () => {
@@ -79,10 +81,11 @@ describe('QuietPresetSection', () => {
     const patch = putCardPref.mock.calls[0]![0];
     expect(patch).toEqual({
       cotEnabled: false,
+      replyCardNativeCot: false,
       silentTurnReactions: true,
       disableStreamingCard: true,
     });
-    expect(Object.keys(patch)).toHaveLength(3);
+    expect(Object.keys(patch)).toHaveLength(4);
     expect(onApplied).toHaveBeenCalledTimes(1);
     expect(toast).toHaveBeenCalledWith('quietPreset.onToast', expect.objectContaining({ kind: 'success' }));
 

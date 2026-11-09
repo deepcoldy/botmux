@@ -210,7 +210,7 @@ describe('correlated async answer adversarial production probes', () => {
     } });
     Object.assign(scope.askSession.session, { sessionId: 'session', rootMessageId: 'om_root',
       ownerOpenId: 'ou_other', lastCallerOpenId: 'ou_other' });
-    for (const name of ['dispatchUserForTurn', 'refreshTurnCliIdentity', 'noteTurnReceived']) {
+    for (const name of ['dispatchUserForTurn', 'refreshTurnCliIdentity', 'registerOncallTurn', 'noteTurnReceived']) {
       scope[name] = productionFunction('src/daemon.ts', name, scope);
     }
     scope.sendWorkerInput = vi.fn(() => {
