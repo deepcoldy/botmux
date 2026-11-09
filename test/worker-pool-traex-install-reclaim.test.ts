@@ -101,6 +101,7 @@ import {
   sweepTraexInstallChanges,
   sendWorkerInput,
   hasPendingOrdinaryImInput,
+  recordWorkerCliInputBacklog,
 } from '../src/core/worker-pool.js';
 import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -401,6 +402,47 @@ describe('final delivery retry edge', () => {
 });
 
 describe('independent review regressions', () => {
+  it('combines upstream backlog protection with the install-claim settle predicate', async () => {
+    const { entry, identity } = tempEntry('release-new');
+    const stale = { ...identity, ino: `${Number(identity.ino) + 1}`, source: 'linux-proc-exe' as const };
+    const ds = makeDs({
+      localProcessAttestation: {
+        backendType: 'tmux', credentialIsolated: false, cliExe: stale, cliInstallEntry: entry, cliSpawnGeneration: 1,
+      },
+    });
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const flush = () => new Promise(resolve => setTimeout(resolve, 0));
+
+    // #3136 guard: the CLI has not taken the input yet. Even with a real
+    // install claim pending, nothing may be retired in this window.
+    recordWorkerCliInputBacklog(worker, { pending: true, writingTurnId: 'om_combo' });
+    requestInstallChangeSuspend(ds, detail(entry, stale, identity), { tryNow: false });
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'suspend' });
+
+    // Backlog drained, but the worker queue has accepted the turn: the input
+    // exists only inside the CLI now, so it still blocks the reclaim.
+    recordWorkerCliInputBacklog(worker, { pending: false });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_combo' });
+    await flush();
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'suspend' });
+
+    // Turn settled, but its final answer is still being delivered.
+    const finish = beginFinalOutputDelivery(ds, 'turn-combo');
+    worker.emit('message', { type: 'turn_terminal', turnId: 'om_combo', sessionId: ds.session.sessionId });
+    await flush();
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'suspend' });
+
+    // Every obligation is settled: the queued reclaim finally runs.
+    finish();
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
+    expect(ds.worker).toBeNull();
+  });
+
   it('settles an early native receipt together with its later explicit commit', async () => {
     const ds = makeDs();
     const worker = ds.worker as any;
