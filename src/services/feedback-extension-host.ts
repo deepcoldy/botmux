@@ -86,12 +86,23 @@ export async function tickFeedbackExtensions(dataDir: string, appId: string, lan
       appId, source, extensions, config, now: Date.now, startedAt,
       refreshBudget: lane === 'surface' ? { deadline: 0, remaining: 0 } : refreshBudget,
       sourceKey: `${storageConfig.instanceId}:${storageConfig.generation}`,
-      send: async (subjectId, card, operationId, chatId, round) => {
+      send: async (subjectId, card, operationId, chatId, round, roundScope, topicId) => {
+        let beforeWriteAttempts = 0;
         const beforeWrite = async () => {
+          const attempt = beforeWriteAttempts++;
           const current = await readFeedbackExtensionConfig(dataDir);
           const bot = getBot(appId).config;
           const presentation = current.presentations[appId] ?? bot.feedbackPresentation;
-          if (!presentation || !resolveFeedbackPresentation(presentation, { botAppId: appId, chatId, sourceMessageId: subjectId, round }).matched
+          const effective = presentation && resolveFeedbackPresentation(presentation, { botAppId: appId, chatId, sourceMessageId: subjectId, round });
+          const currentScope = effective?.roundScope === 'topic' && topicId !== chatId ? 'topic' : 'subject';
+          if (currentScope !== roundScope) {
+            // 网关重试时重跑本回调：首发可能已在飞书落地只是响应丢失，此时落
+            // unknown 才能走 reconcileSurfaceReceipt 人工核对补绑；只有第一次
+            // 尝试（确认尚未发出过）才直接 blocked。
+            if (attempt === 0) throw new Error('feedback_presentation_scope_changed');
+            throw new Error('feedback_presentation_scope_changed_during_retry');
+          }
+          if (!presentation || !effective?.matched
             || !resolveFeedbackPolicyForDelivery({ dataDir, larkAppId: appId, chatId, bot })) throw new Error('feedback_presentation_disabled');
         };
         const release = acquireFeedbackSendLease(dataDir);

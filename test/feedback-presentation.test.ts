@@ -22,6 +22,16 @@ describe('feedback presentation rules', () => {
     expect(resolveFeedbackPresentation(config, scope).matched).toBe(false);
     expect(resolveFeedbackPresentation(config, { ...scope, round: 1 }).matched).toBe(true);
   });
+  it('inherits topic counting for the configured chat and permits a subject override', () => {
+    const config = normalizeFeedbackPresentation({
+      default: { enabled: true, rounds: [1] },
+      rules: [{ id: 'topic', match: { chatId: scope.chatId }, roundScope: 'topic' },
+        { id: 'subject', match: { chatId: scope.chatId, sourceMessageId: 'other-question' }, roundScope: 'subject' }],
+    });
+    expect(resolveFeedbackPresentation(config, scope).roundScope).toBe('topic');
+    expect(resolveFeedbackPresentation(config, { ...scope, sourceMessageId: 'other-question' }).roundScope).toBe('subject');
+    expect(resolveFeedbackPresentation(config, { ...scope, chatId: 'other-chat' }).roundScope).toBeUndefined();
+  });
   it('supports explicit disable and replaces action lists rather than appending', () => {
     const config = normalizeFeedbackPresentation({
       default: { enabled: true, rounds: [1], templateId: 'compact', actionIds: ['help'] },
@@ -36,6 +46,7 @@ describe('feedback presentation rules', () => {
     { default: { rounds: [] } },
     { default: { rounds: [1.2] } },
     { default: { enabled: 'false' } },
+    { default: { roundScope: 'chat' } },
     { default: { buttons: [] } },
     { default: { actionIds: ['review.v1'] } },
     { default: { actionIds: ['review\u0000admin'] } },

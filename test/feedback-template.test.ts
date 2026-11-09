@@ -4,6 +4,73 @@ import { buildFeedbackSurface, defaultFeedbackTemplate, validateFeedbackTemplate
 import { renderFeedbackSurfaceState } from '../src/services/feedback-surface-delivery.js';
 
 describe('feedback template', () => {
+  it('renders without a reference and preserves feedback controls after an update', () => {
+    const policy = normalizeFeedbackPolicy({ enabled: true, allowReselect: true })!;
+    const template = defaultFeedbackTemplate();
+    template.elements = template.elements.filter(element => element.slot !== 'answerReference');
+    const card = buildFeedbackSurface({ template, policy, round: 1, answerUrl: 'https://example.com/answer',
+      preview: false, actions: [{ id: 'help', label: 'Help' }] });
+    const updated = renderFeedbackSurfaceState({ template, answerUrl: 'https://example.com/answer',
+      round: 1, actions: [{ id: 'help', label: 'Help' }], card }, policy, { result: policy.buttons[2].key });
+    expect(JSON.stringify(updated)).not.toContain('https://example.com/answer');
+    expect(JSON.stringify(updated)).toContain('feedback_submit');
+    expect(JSON.stringify(updated)).toContain('feedback_custom_action');
+  });
+  it('uses custom reference text and fixed variables in previews and feedback updates', () => {
+    const policy = normalizeFeedbackPolicy({ enabled: true, allowReselect: true })!;
+    const template = defaultFeedbackTemplate();
+    template.elements = template.elements.map(element => element.slot === 'answerReference'
+      ? { ...element, content: 'Answer {round}: [Read]({answerUrl})' } : element);
+    const answerUrl = 'https://example.com/answer(3)';
+    for (const preview of [true, false]) {
+      const card = buildFeedbackSurface({ template, policy, round: 3, answerUrl, preview });
+      const updated = renderFeedbackSurfaceState({ template, answerUrl, round: 3, actions: [], card },
+        policy, { result: policy.buttons[2].key });
+      expect((card.body as any).elements[0].content).toBe('Answer 3: [Read](https://example.com/answer%283%29)');
+      expect((updated.body as any).elements[0].content).toBe('Answer 3: [Read](https://example.com/answer%283%29)');
+    }
+  });
+  it.each([
+    ['mention', '<at id=all>all</at>'], ['image', '![image](https://example.com/a)'],
+    ['variable', '{unknown}'], ['oversized', 'a'.repeat(4001)],
+  ])('rejects %s reference content', (_name, content) => {
+      const template = defaultFeedbackTemplate();
+      template.elements = template.elements.map(element => element.slot === 'answerReference' ? { ...element, content } : element);
+      expect(() => validateFeedbackTemplate(template)).toThrow();
+    });
+  it.each(['feedbackButtons', 'feedbackDetails', 'status', 'actionButtons'])(
+    'rejects content attached to the non-reference %s slot', slot => {
+      const template = defaultFeedbackTemplate();
+      template.elements = template.elements.map(element => element.slot === slot ? { ...element, content: 'not allowed' } : element);
+      expect(() => validateFeedbackTemplate(template)).toThrow('feedback_template_reference_invalid');
+    });
+  it.each([
+    ['number', 123], ['array', ['text']], ['object', { text: 'x' }], ['boolean', true], ['nullish', null],
+  ] as [string, unknown][])(
+    'rejects non-string reference content: %s', (_name, content) => {
+      const template = defaultFeedbackTemplate();
+      template.elements = template.elements.map(element => element.slot === 'answerReference'
+        ? { ...element, content: content as any } : element);
+      expect(() => validateFeedbackTemplate(template)).toThrow('feedback_template_reference_invalid');
+    });
+  it.each(['Review this answer', ''])('renders literal reference content without adding a default link: %s', content => {
+    const template = defaultFeedbackTemplate();
+    template.elements = template.elements.map(element => element.slot === 'answerReference' ? { ...element, content } : element);
+    const card = buildFeedbackSurface({ template, policy: normalizeFeedbackPolicy({ enabled: true }), round: 2,
+      answerUrl: 'https://example.com/answer', preview: false });
+    expect(JSON.stringify(card)).not.toContain('https://example.com/answer');
+    expect((card.body as any).elements.some((element: any) => element.content === 'Review this answer')).toBe(!!content);
+  });
+  it.each(['', '   ', '\n\t '])('omits the reference element when its content is blank: %s', content => {
+    const template = defaultFeedbackTemplate();
+    template.elements = template.elements.map(element => element.slot === 'answerReference' ? { ...element, content } : element);
+    const card = buildFeedbackSurface({ template, policy: normalizeFeedbackPolicy({ enabled: true }), round: 1,
+      answerUrl: 'https://example.com/answer', preview: false });
+    const markdown = (card.body as any).elements.filter((element: any) => element.tag === 'markdown');
+    expect(markdown).toHaveLength(1);
+    expect(markdown[0].content).toBe(' ');
+    expect((card.body as any).elements.some((element: any) => element.content === content)).toBe(false);
+  });
   it('allows a ratings-only template but requires an action slot when actions are rendered', () => {
     const template = defaultFeedbackTemplate();
     template.elements = template.elements.filter(element => element.slot !== 'actionButtons');
