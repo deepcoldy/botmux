@@ -131,7 +131,10 @@ export async function reconcileFeedbackSurfaces(input: {
             if (!template) throw new Error('feedback_template_not_found');
             const actions = input.config.actions.filter(action => rule.actionIds.includes(action.id));
             const urlKey = JSON.stringify([delivery.chatId, delivery.platformMessageId]);
-            if (!answerUrls.has(urlKey)) answerUrls.set(urlKey, Promise.resolve().then(() => input.answerUrl(delivery.platformMessageId, delivery.chatId!)));
+            if (!answerUrls.has(urlKey)) {
+              answerUrls.set(urlKey, Promise.resolve().then(() => input.answerUrl(delivery.platformMessageId, delivery.chatId!))
+                .catch(error => { answerUrls.delete(urlKey); throw error; }));
+            }
             const answerUrl = await answerUrls.get(urlKey)!;
             const card = buildFeedbackSurface({ template, policy: delivery.policy, round,
               answerUrl, preview: false, actions });

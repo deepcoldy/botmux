@@ -12,6 +12,37 @@ import { buildFeedbackElement } from '../src/im/lark/skill-feedback-card.js';
 import { recordRelayedTurnDelivery } from '../src/core/relayed-turn-delivery.js';
 
 describe('feedback surface event reconciliation', () => {
+  it('retries a transient failed URL preparation rather than retaining its rejected batch cache', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-url-retry-'));
+    const source = await SkillFeedbackStore.open(directory);
+    let extensions = await FeedbackExtensionStore.open(directory);
+    try {
+      for (const turnId of ['first', 'second']) {
+        extensions.bindSubject('app', 'session', turnId, { sourceMessageId: `question-${turnId}`, answerKind: 'substantive' });
+        source.recordTurnDelivery({ botAppId: 'app', sessionId: 'session', turnId, platform: 'lark',
+          platformAppId: 'app', platformMessageId: turnId, chatId: 'chat', topicRootId: 'topic',
+          content: 'answer', cardMode: 'feedback', status: 'delivered', policy: normalizeFeedbackPolicy({ enabled: true }) });
+        source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId, status: 'completed' });
+      }
+      let firstReads = 0, secondReads = 0, sends = 0;
+      const dependencies = { appId: 'app', sourceKey: 'source', source, now: Date.now,
+        send: async () => `surface-${++sends}`, answerUrl: (messageId: string) => {
+          if (messageId === 'first' && ++firstReads === 1) throw new Error('transient lookup failure');
+          if (messageId === 'second') secondReads++;
+          return 'https://example.com/answer';
+        }, removeInline: async () => {},
+        config: { version: 1, hostId: 'host', templates: [defaultFeedbackTemplate()], hooks: [], actions: [],
+          presentations: { app: normalizeFeedbackPresentation({ default: { enabled: true, rounds: [1] } }) } } };
+      await reconcileFeedbackSurfaces({ ...dependencies, extensions });
+      expect(firstReads).toBe(2);
+      expect(secondReads).toBe(1);
+      expect(extensions.jobsForApp('app').map(job => job.payload.answerMessageId).sort()).toEqual(['first', 'second']);
+      extensions.close();
+      extensions = await FeedbackExtensionStore.open(directory);
+      await reconcileFeedbackSurfaces({ ...dependencies, extensions });
+      expect(sends).toBe(2);
+    } finally { extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
   it.each([8, 16])('prepares each answer once in a backlog of %s independent subjects', async count => {
     const directory = mkdtempSync(join(tmpdir(), 'feedback-backlog-'));
     const source = await SkillFeedbackStore.open(directory);
@@ -28,6 +59,7 @@ describe('feedback surface event reconciliation', () => {
       }
       const bindings = vi.spyOn(extensions, 'subject');
       const reads = vi.spyOn(source, 'listSubjectDeliveries');
+      const ingests = vi.spyOn(extensions, 'ingest');
       let urlCalls = 0, sends = 0;
       const dependencies = { appId: 'app', sourceKey: 'source', source, extensions, now: Date.now,
         send: async () => `surface-${++sends}`, answerUrl: () => { urlCalls++; return 'https://example.com/answer'; },
@@ -39,6 +71,7 @@ describe('feedback surface event reconciliation', () => {
       expect(urlCalls).toBe(count);
       expect(bindings.mock.calls.length).toBeLessThanOrEqual(count * 2);
       expect(reads.mock.calls.length).toBe(1);
+      expect(ingests.mock.calls[0][2].flatMap(entry => entry.jobs)).toHaveLength(count);
       const next = `turn-${count}`;
       extensions.bindSubject('app', 'session', next, { sourceMessageId: `question-${count}`, answerKind: 'substantive' });
       source.recordTurnDelivery({ botAppId: 'app', sessionId: 'session', turnId: next, platform: 'lark',
