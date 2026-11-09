@@ -77,7 +77,12 @@ describe('independent PR2 r6 acceptance ordering', () => {
     // A retry must now settle the accepted occurrence, without either send.
     scheduler.setExecuteCallback(async () => 'executed');
     expect(scheduler.runNow(taskId)).toEqual({ ok: true });
-    await vi.advanceTimersByTimeAsync(0);
+    // The settle callback is async. Vitest's async-timer advance drains every
+    // pending microtask; Bun's shim drains one per call, so keep advancing
+    // until the run settles (bounded, so a real hang still fails the assert).
+    for (let i = 0; i < 20 && current().lastStatus !== 'ok'; i++) {
+      await vi.advanceTimersByTimeAsync(0);
+    }
     expect(current().lastStatus).toBe('ok');
     expect(current().repeat?.completed).toBe(1);
     expect(current().deferredRun).toBeUndefined();
