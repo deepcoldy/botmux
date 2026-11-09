@@ -12061,12 +12061,21 @@ function sendOrdinaryImDeliveryTracked(
   ensurePrincipalLaneInboundTurnBinding(ds, turnId, workerGeneration!);
   const key = ordinaryImDeliveryKey(ds, turnId, workerGeneration!);
   if (pendingOrdinaryImDeliveries.has(key)) return true;
+  // Tracked delivery bypasses sendWorkerSessionInput to retain its IPC
+  // callback. Admit the execution here too, before any worker event can
+  // publish turn authority or acknowledge this input. Retries keep this exact
+  // execution rather than acquiring a new one on every transport attempt.
+  const controller = controllerForSession(ds);
+  if (controller && !controller.acceptsUserInput()) return false;
+  const scoped = controller && message.type === 'message'
+    ? { ...message, sessionCommand: { version: 2 as const, execution: controller.admitInput(turnId, message.dispatchAttempt) } }
+    : message;
   const record: OrdinaryImDelivery = {
     key,
     ds,
     worker,
     workerGeneration: workerGeneration!,
-    message,
+    message: scoped,
     turnId,
     attempt: 0,
     received: false,
