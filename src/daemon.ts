@@ -516,7 +516,7 @@ import {
   collectSessionTurnGarbage,
 } from './core/worker-pool.js';
 import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
-import { noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice } from './core/idle-auto-compact.js';
+import { isLocalCliCommand, noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice } from './core/idle-auto-compact.js';
 import { ensureServerThenReapOrphanTmuxServers, orphanTmuxReaperEnabled, reaperCandidateSocketNames } from './core/orphan-tmux-reaper.js';
 import { runPeriodicOrphanSessionSweep, loadRichProcsLinux, enumerateThreadLockHolders, enumerateOrphanPanes, readProcEnviron } from './core/orphan-session-reaper.js';
 import { listeningServersOnPath, probeTmuxOwner, tmuxSocketPath, procIsBotmuxListener } from './core/tmux-server-guard.js';
@@ -25666,7 +25666,11 @@ function deliverPassthroughToExistingSession(
     // the input never landed — the idle auto-compact sweep would otherwise
     // release its claim and compact the same idle stretch again.
     turn.onDelivered?.();
+    // A locally answered CLI command (/model, /cost, …) sends no request, so it
+    // must not arm a warm idle-auto-compact stretch (core/idle-auto-compact.ts).
+    const idleCompactArm = ds.idleAutoCompactArm;
     beginNewTurn(ds, commandContent, turnId);
+    if (isLocalCliCommand(cmd)) ds.idleAutoCompactArm = idleCompactArm;
     markPassthroughActivity(ds, turnId);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
     return true;

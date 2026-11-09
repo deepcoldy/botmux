@@ -153,7 +153,7 @@ describe('idle auto-compact settles on the real turn_terminal handler', () => {
   });
 });
 
-// 源码结构护栏(K3)：suspendWorker 销毁 CLI 时必须连同持久化的闲置压缩镜像一起清，
+// 源码结构护栏(K3)：suspendWorker 销毁 CLI 时必须连同闲置压缩的热区间、arm 与持久化镜像一起清，
 // 否则无消息冷唤醒会立刻对冷启 CLI 发 /compact（消息不会重发，但会无缓存重读整个
 // 上下文）。该路径依赖完整 PTY/tmux 后端，没有可单测的 seam；纯函数行为见
 // clearIdleAutoCompactStretch 在 test/idle-auto-compact.test.ts 的用例。
@@ -164,7 +164,7 @@ describe('suspend wiring guard', () => {
     const at = source.indexOf(anchor);
     expect(at).toBeGreaterThan(0);
     const window = source.slice(at, at + 600);
-    expect(window).toContain('clearIdleAutoCompactStretch(ds.session)');
+    expect(window).toContain('clearIdleAutoCompactStretch(ds)');
     expect(window).toContain('ds.idleAutoCompactPendingNotice = undefined');
     expect(window).toContain('ds.idleAutoCompactDispatchedTurnId = undefined');
   });
