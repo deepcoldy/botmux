@@ -107,9 +107,10 @@ export function saveTemplate(source: TemplateSaveSource, input: TemplateSaveInpu
 }
 
 /** 「运行」：按模板建一个草稿（参数在 daemon 上按 /workflow run 的规则转换）。 */
-export function runTemplate(workflowId: string, input: { params: Record<string, string>; expectedRevisionId?: string }, fetcher: DraftFetch = fetch) {
+export function runTemplate(workflowId: string, input: { params: Record<string, string>; expectedRevisionId?: string; project?: string }, fetcher: DraftFetch = fetch) {
   return post<{ draft: WorkflowDraftView }>(fetcher, `${LIBRARY}/${encodeURIComponent(workflowId)}/run`, {
     params: input.params,
     ...(input.expectedRevisionId ? { expectedRevisionId: input.expectedRevisionId } : {}),
+    ...(input.project ? { project: input.project } : {}),
   });
 }

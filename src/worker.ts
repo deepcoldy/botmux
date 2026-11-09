@@ -2000,6 +2000,9 @@ function bindSessionExecutionEvent<T extends (...args: any[]) => any>(callback: 
   select?: (args: Parameters<T>) => { turnId?: string; dispatchAttempt?: number; origin?: CapturedSessionOrigin }): T {
   return workerSessionEventScope ? workerSessionEventScope.bindExecutionEvent(callback, select) : callback;
 }
+function bindSessionPhysicalObservation<T extends (...args: any[]) => any>(callback: T): T {
+  return workerSessionEventScope ? workerSessionEventScope.bindLivePhysical(callback) : callback;
+}
 function bindSessionBackendExit<T extends (...args: any[]) => any>(callback: T): T {
   const observed = backend;
   return bindSessionRuntimeCallback(((...args: Parameters<T>) => {
@@ -2021,17 +2024,9 @@ function observeContractNativeSession(nativeSessionId: string): void {
   const scope = workerSessionEventScope;
   const active = scope?.currentBinding();
   if (!scope || !active || scope.contextBinding() !== active || !nativeSessionId) return;
-  const previous = active.identity?.nativeSessionId;
-  if (previous && previous !== nativeSessionId) {
-    const binding = scope.beginRuntime(active.operationId, active.physicalId);
-    binding.identity = { ...runtimeIdentityForContract(active), nativeSessionId };
-    scope.enterRuntime(binding);
-    send({ type: 'runtime_binding_started', bindingId: binding.bindingId });
-    send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity });
-  } else if (!previous) {
-    active.identity = { ...runtimeIdentityForContract(active), nativeSessionId };
-    send({ type: 'runtime_binding', bindingId: active.bindingId, identity: active.identity });
-  }
+  // The PID may have resolved from the launcher to the real CLI since the
+  // first binding. Check the full identity before enriching the native ID.
+  void publishRuntimeContract(active, nativeSessionId);
 }
 function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): WorkerToDaemon {
   if (!workerSessionEventScope) return msg;
@@ -2073,10 +2068,14 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
   }
   return opaque();
 }
-async function publishRuntimeContract(binding: RuntimeEventBinding): Promise<void> {
+async function publishRuntimeContract(binding: RuntimeEventBinding, nativeSessionId?: string): Promise<void> {
   if (!workerSessionEventScope || workerSessionEventScope.currentBinding() !== binding) return;
-  const identity = runtimeIdentityForContract(binding);
+  const observed = runtimeIdentityForContract(binding);
+  const identity = nativeSessionId ? { ...observed, nativeSessionId } : observed;
   const previous = binding.identity;
+  // A buffered observation can arrive after the process disappears. Preserve
+  // its proven binding so the captured physical exit still stops the runtime.
+  if (previous && previous.proof !== 'opaque' && identity.proof === 'opaque') return;
   if (previous && previous.proof !== 'opaque' && (previous.backend !== identity.backend || previous.physicalId !== identity.physicalId
     || previous.proof !== identity.proof || (previous.nativeGeneration !== undefined && previous.nativeGeneration !== identity.nativeGeneration)
     || (previous.nativeSessionId !== undefined && previous.nativeSessionId !== identity.nativeSessionId))) {
@@ -7500,6 +7499,37 @@ function failCodexAppControlGeneration(reason: string): void {
   });
 }
 
+function restoreCodexAppContractNativeSession(): void {
+  const scope = workerSessionEventScope;
+  const previous = scope?.currentBinding();
+  if (!scope || !previous || previous.identity?.proof !== 'process_start'
+      || previous.identity.nativeSessionId || !codexAppControlProven
+      || !codexAppRecoveredDispatches.some(entry => entry.state === 'prepared')
+      || !lastInitConfig) return;
+  // The original thread marker may already be ACKed. A resume argument is not
+  // live ownership proof: use the authenticated runner's uniquely attested
+  // app-server and its sole open rollout instead.
+  const observedBackend = backend;
+  const backendPid = observedBackend?.getChildPid?.() ?? undefined;
+  const backendStart = backendPid ? readProcessStartIdentity(backendPid) : undefined;
+  if (!backendStart) return;
+  const processIdentity = captureAttachedCodexAppProcessIdentity(
+    backendPid, lastInitConfig.sessionId, process.execPath,
+  );
+  if (!processIdentity) return;
+  const rollouts = findCodexRolloutSetByPid(processIdentity.enginePid);
+  const observed = rollouts?.size === 1 ? findCodexRolloutByPid(processIdentity.enginePid) : undefined;
+  if (!observed || !rollouts!.has(observed.cliSessionId.toLowerCase())
+      || readProcessStartIdentity(processIdentity.enginePid) !== processIdentity.engineProcStart
+      || backend !== observedBackend || backend?.getChildPid?.() !== backendPid
+      || readProcessStartIdentity(backendPid!) !== backendStart
+      || scope.currentBinding() !== previous) return;
+  // Enrich the bare binding without moving attempts that may already belong
+  // to it. The host separately grants historical result observation for exact
+  // recovered executions of this proven surviving native session.
+  scope.run(previous, () => { void publishRuntimeContract(previous, observed.cliSessionId); });
+}
+
 function activateCodexAppControlConnection(
   connection: CodexAppControlConnection,
   identity: CodexAppControlIdentity,
@@ -7552,6 +7582,7 @@ function activateCodexAppControlConnection(
   const previous = codexAppControlActiveSocket;
   codexAppControlActiveSocket = connection.socket;
   if (previous && previous !== connection.socket) previous.destroy();
+  if (proofKind === 'warm reattach') restoreCodexAppContractNativeSession();
   cleanupCodexAppControlBootstrap();
   connection.socket.write(`${encodeCodexAppControlAccepted(
     cfg.sessionId,
@@ -7664,19 +7695,28 @@ async function handleCodexAppControlLine(
   // worker effects is single-flight by signed generation/sequence until the
   // replay window below is committed.
   if (finalResult.status === 'accepted') return;
-  const applyRecord = () => finalResult.status === 'not-final'
-      ? handleTrustedCodexAppMarker(
+  // The socket can outlive a semantic runtime rebind (launcher -> native CLI).
+  // Recover the submitted execution from the authenticated final's exact FIFO
+  // head, while retaining the socket callback's physical-backend boundary.
+  const applyRecord = bindSessionExecutionEvent(() => finalResult.status === 'not-final'
+      ? bindSessionPhysicalObservation(() => handleTrustedCodexAppMarker(
           record.kind,
           record.payload,
           { generation: identity.generation, seq: record.seq, socket: connection.socket,
             channelId: connection.channelId, epoch: connection.epoch },
-        )
+        ))()
       : handleTrustedCodexAppMarker(
           'final',
           finalResult.payload,
           { generation: identity.generation, seq: record.seq, socket: connection.socket,
             channelId: connection.channelId, epoch: connection.epoch },
-        );
+        ), () => {
+    if (finalResult.status === 'not-final' || !isCodexAppCliId(cfg.cliId)) return {};
+    const settlement = codexAppTurnDispatchQueue.settleFinal(finalResult.payload, false);
+    return settlement.ok
+      ? { turnId: settlement.turnId, dispatchAttempt: settlement.dispatchAttempt }
+      : {};
+  });
   let application = codexAppControlRecordApplicationGate.run(identity.generation, record.seq, applyRecord);
   let applied: boolean;
   for (;;) {
@@ -17914,6 +17954,9 @@ async function handleTrustedCodexAppMarker(
         codexAppUnprovenPromptDeferred = false;
         queueMicrotask(() => markPromptReady());
       }
+      // markPromptReady() returns early when the prompt was already ready
+      // before the reconnect, so re-drive input held by the signed barrier.
+      if (isPromptReady && hasPendingInputForFlush()) queueMicrotask(() => { void flushPending(); });
     }
     return true;
   }
@@ -17978,8 +18021,7 @@ async function handleTrustedCodexAppMarker(
     if (isSuperseded
         && (!isCodexAppCliId(lastInitConfig?.cliId)
           || finalContent !== ''
-          || payload.usage !== undefined
-          || !codexAppCompletionAwaitingFinal)) {
+          || payload.usage !== undefined)) {
       rejectCodexAppControlMarker('invalid steer_superseded final (content/usage/awaiting contract)');
       return false;
     }
@@ -18038,6 +18080,29 @@ async function handleTrustedCodexAppMarker(
           + `(steerable=${settlement.codexAppSteerable === true}, remaining=${settlement.remaining})`,
         );
         return false;
+      }
+      if (isSuperseded && !codexAppCompletionAwaitingFinal) {
+        // activity:completed can already be ACKed when a worker dies, leaving
+        // only its uncommitted final group to replay. Recover that boundary
+        // solely from the authenticated surviving generation and the exact
+        // daemon-frozen prepared prefix; locally queued work is insufficient.
+        const recovered = codexAppTurnDispatchQueue.recoveredPrefix();
+        const prepared = codexAppRecoveredDispatches.filter(entry => entry.state === 'prepared');
+        const recoverable = control && codexAppControlProven
+          && codexAppControlStateValue?.status === 'active'
+          && codexAppControlStateValue.identities.length === 1
+          && codexAppControlStateValue.identities[0].generation === control.generation
+          && recovered.length >= 2 && prepared.length >= 2
+          && recovered[0].handle === settlement.handle
+          && recovered.slice(0, 2).every((entry, index) =>
+            entry.dispatchId === prepared[index].dispatchId
+            && entry.turnId === prepared[index].turnId
+            && entry.dispatchAttempt === prepared[index].dispatchAttempt)
+          && prepared[0].codexAppSteerable === true;
+        if (!recoverable) {
+          rejectCodexAppControlMarker('steer_superseded final has no proven completion boundary');
+          return false;
+        }
       }
       // Liveness slot retirement + completion-awaiting clearing happen AFTER the
       // durable commit below (a persist/commit failure must not retire a slot or
@@ -18231,7 +18296,9 @@ async function handleTrustedCodexAppMarker(
         // and never publish ready — the group's real final is still to come. This
         // is "retire a logical slot", NOT "close the native completion gate".
         codexAppTurnLiveness.completeCurrent(completedAtMs);
-        // codexAppCompletionAwaitingFinal intentionally left true.
+        // Rehydrate only after the durable ACK, including warm replay where
+        // the old worker had already acknowledged activity:completed.
+        codexAppCompletionAwaitingFinal = true;
       } else {
         if (!codexAppCompletionAwaitingFinal) {
           // turn/start failures emit a final transaction without an app-server
@@ -20485,11 +20552,13 @@ function scheduleSubmitFailureNotify(
               ? 'worker.activation_submit_unconfirmed'
               : submitDiagnosis.reason === 'logged_out'
                 ? 'submitDiag.logged_out'
-                : submitDiagnosis.reason === 'interactive_menu'
-                  ? 'submitDiag.interactive_menu'
-                  : submitDiagnosis.reason === 'draft_parked'
-                    ? 'submitDiag.draft_parked'
-                    : 'worker.submit_unconfirmed',
+                : submitDiagnosis.reason === 'session_locked'
+                  ? 'submitDiag.session_locked'
+                  : submitDiagnosis.reason === 'interactive_menu'
+                    ? 'submitDiag.interactive_menu'
+                    : submitDiagnosis.reason === 'draft_parked'
+                      ? 'submitDiag.draft_parked'
+                      : 'worker.submit_unconfirmed',
           {
             cliName: cliName(),
             secs: Math.round(SUBMIT_DEFERRED_RECHECK_MS / 1000),
@@ -20830,6 +20899,10 @@ async function flushPending(): Promise<void> {
   if (cliRestartInProgress) return;
   if (initialInputOwnershipPending) return;
   if (shouldHoldCodexRunnerInput(codexRunnerFreshness)) return;
+  // Static type-ahead support and the terminal startup timeout cannot prove
+  // that a recovered runner has republished its signed engine identity. Keep
+  // input outside the runner until this connection's state is authenticated.
+  if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppRuntimeTypeAheadReady()) return;
   if (isFlushing) return;  // while loop in active flush will pick up new messages
   if (!backend || !cliAdapter) return;
   if (
@@ -21057,6 +21130,7 @@ async function flushPending(): Promise<void> {
       hasRunStartupCommands = true;
       await runInitialNativeRename();
     }
+    if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppRuntimeTypeAheadReady()) return;
     // Commands deferred behind a previous rename run before the latest pending
     // rename. Some passthroughs (/clear, /new) can rotate the native session;
     // applying the canonical title last keeps the resume-picker label aligned.
@@ -21142,6 +21216,8 @@ async function flushPending(): Promise<void> {
     }
     let holdDrainForPreferredReset = false;
     while (pendingMessages.length > 0 && backend && cliAdapter && !holdDrainForPreferredReset) {
+      // A prior awaited write may have crossed a control-socket reconnect.
+      if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppRuntimeTypeAheadReady()) break;
       // The first item passed the prompt/model gate before beginCliWriteCycle
       // deliberately cleared readiness. Rechecking that synthetic false here
       // would strand the very input admitted by this flush.
@@ -33421,7 +33497,12 @@ function publishCliInputBacklog(): void {
 }
 
 function send(msg: WorkerToDaemon): void {
-  if (msg.type === 'final_output' && workerSessionEventScope && !workerSessionEventScope.ownsExecutionEvent(msg.turnId, msg.dispatchAttempt)) { log('Dropped final output with unproven execution origin'); return; }
+  if (msg.type === 'final_output' && workerSessionEventScope && !workerSessionEventScope.ownsExecutionEvent(msg.turnId, msg.dispatchAttempt)) {
+    log(`Dropped final output with unproven execution origin ${JSON.stringify({ turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
+      origin: workerSessionEventScope.capture(), current: workerSessionEventScope.currentBinding(),
+      execution: workerSessionEventScope.executionForTurn(msg.turnId, msg.dispatchAttempt) })}`);
+    return;
+  }
   // Once init is done, every message goes out behind the backlog it was sent under.
   if (publishedCliInputBacklog !== undefined && msg.type !== 'cli_input_backlog') publishCliInputBacklog();
   if (closeRequested && msg.type === 'final_output') {
@@ -34421,6 +34502,9 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       workerSessionEventScope?.assign(msg.bindingId, msg.runtime);
       for (const state of msg.admissionStates ?? []) workerSessionEventScope?.noteAdmission(state);
       for (const execution of msg.executions ?? []) workerSessionEventScope?.rememberExecution(execution);
+      for (const observed of msg.observedExecutions ?? []) {
+        workerSessionEventScope?.rememberObservedExecution(msg.bindingId, observed.runtime, observed.execution);
+      }
       if (!msg.mayExecute) { closeRequested = true; stopBridgeWatcher(); stopScreenshotLoop(); killCli(); }
       break;
     }

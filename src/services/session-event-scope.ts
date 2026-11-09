@@ -190,6 +190,16 @@ export class WorkerSessionEventScope {
     if (!values.some(value => value.binding === binding && value.execution.executionId === execution.executionId)) values.push({ binding, execution });
     this.origins.set(key, values);
   }
+  rememberObservedExecution(bindingId: string, runtime: RuntimeRef, execution: ExecutionRef): void {
+    const source = this.bindings.get(bindingId);
+    if (!source) return;
+    let binding = [...this.bindings.values()].find(value => value.physicalId === source.physicalId && sameRuntime(value.runtime, runtime));
+    if (!binding) {
+      binding = { bindingId: randomUUID(), physicalId: source.physicalId, runtime: structuredClone(runtime) };
+      this.bindings.set(binding.bindingId, binding);
+    }
+    this.rememberExecution(execution, binding);
+  }
   origin(turnId?: string, dispatchAttempt?: number): CapturedSessionOrigin | undefined {
     const active = this.storage.getStore();
     if (active?.binding && active.execution && (!turnId || active.execution.turnId === turnId)) return this.snapshot(active.binding, active.execution);

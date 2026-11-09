@@ -11,8 +11,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { useT } from './react-hooks.js';
 import { DagGraph } from './v3-components.js';
 import { copyAsNewWorkflow, fetchOrchestratorBots, type CopySource, type DraftAction } from './workflow-draft-api.js';
-import { draftGraphView, workflowDraftHref } from './workflow-draft-model.js';
-import { describeError } from './workflow-draft-page.js';
+import { draftGraphView, projectChoicesStale, projectForRequest, workflowDraftHref } from './workflow-draft-model.js';
+import { ProjectField, describeError, useProjectOptions } from './workflow-draft-page.js';
 import { BotSearchPicker } from './bot-search-picker.js';
 import type { BotSearchOption } from './bot-search-model.js';
 import { recentFailureHint } from './workflow-draft-model.js';
@@ -67,11 +67,25 @@ export function CopyWorkflowDialog(props: {
   const sameAsSourceLabel = props.sourceOrchestratorAppId
     ? tr('workflow.copy.sameAsSource', { name: nameOf(props.sourceOrchestratorAppId) })
     : tr('workflow.copy.sameAsSourcePlain');
+  const projectBot = bot || props.sourceOrchestratorAppId || '';
+  const sourceRunId = props.source.kind === 'run' ? props.source.runId : '';
+  const projectTarget = useMemo(
+    () => (projectBot ? { larkAppId: projectBot } : sourceRunId ? { runId: sourceRunId } : null),
+    [projectBot, sourceRunId],
+  );
+  const [projectCheck, retryProjects] = useProjectOptions(projectTarget);
+  const [pickedProject, setPickedProject] = useState('');
+  const project = projectForRequest(projectCheck, pickedProject);
+  const chooseBot = (larkAppId: string) => {
+    setBot(larkAppId);
+    setPickedProject('');
+  };
 
   const copy = async () => {
+    if (project === null) return;
     setBusy(true);
     setError(null);
-    const result = await copyAsNewWorkflow(props.source, bot || undefined);
+    const result = await copyAsNewWorkflow(props.source, bot || undefined, project);
     setBusy(false);
     if (result.ok) {
       if (props.onCopied) props.onCopied(result.draft);
@@ -80,6 +94,7 @@ export function CopyWorkflowDialog(props: {
     }
     const problems = Array.isArray(result.body.problems) ? (result.body.problems as unknown[]).map(String) : [];
     setError({ text: describeError(tr, result), problems });
+    if (projectChoicesStale(result.error)) { setPickedProject(''); retryProjects(); }
   };
 
   return (
@@ -118,13 +133,14 @@ export function CopyWorkflowDialog(props: {
           placeholder={sameAsSourceLabel}
           searchPlaceholder={tr('workflow.draft.botSearch.placeholder')}
           emptyLabel={tr('workflow.draft.botSearch.empty')}
-          onChange={(larkAppId) => setBot(larkAppId === props.sourceOrchestratorAppId ? '' : larkAppId)}
+          onChange={(larkAppId) => chooseBot(larkAppId === props.sourceOrchestratorAppId ? '' : larkAppId)}
         />
         {/* 选过别的 Bot 后总能回到默认：来源的 Bot 不可选或不在列表里时，列表里点不回去。 */}
         {bot ? (
-          <button type="button" className="btn-link wfd-small" disabled={busy} onClick={() => setBot('')}>{sameAsSourceLabel}</button>
+          <button type="button" className="btn-link wfd-small" disabled={busy} onClick={() => chooseBot('')}>{sameAsSourceLabel}</button>
         ) : null}
       </div>
+      <ProjectField id="wfc-project" check={projectCheck} picked={pickedProject} onPick={setPickedProject} onRetry={retryProjects} />
       {error ? (
         <div className="wfd-problems" role="alert">
           <p>{error.problems.length ? tr('workflow.copy.problems') : error.text}</p>
@@ -132,7 +148,7 @@ export function CopyWorkflowDialog(props: {
         </div>
       ) : null}
       <div className="wfd-actions">
-        <button type="button" className="primary" disabled={busy} onClick={() => { void copy(); }}>
+        <button type="button" className="primary" disabled={busy || project === null} onClick={() => { void copy(); }}>
           {busy ? tr('workflow.copy.copying') : tr('workflow.copy.confirm')}
         </button>
       </div>

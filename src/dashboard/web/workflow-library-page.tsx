@@ -17,9 +17,11 @@ import {
   draftGraphView,
   formatDraftTime,
   parseLaunchMembersInput,
+  projectChoicesStale,
+  projectForRequest,
   workflowDraftHref,
 } from './workflow-draft-model.js';
-import { describeError, useInitiatorChecks } from './workflow-draft-page.js';
+import { ProjectField, describeError, useInitiatorChecks, useProjectOptions } from './workflow-draft-page.js';
 import {
   fetchTemplate,
   fetchTemplates,
@@ -368,6 +370,11 @@ function TemplateRunPanel(props: { detail: SavedWorkflowDetailView }): React.JSX
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<{ text: string; error: boolean } | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Set<string>>(() => new Set());
+  const runnable = templateRunState(entry) === 'runnable';
+  const projectTarget = useMemo(() => (runnable ? { larkAppId: entry.orchestratorAppId } : null), [runnable, entry.orchestratorAppId]);
+  const [projectCheck, retryProjects] = useProjectOptions(projectTarget);
+  const [pickedProject, setPickedProject] = useState('');
+  const project = projectForRequest(projectCheck, pickedProject);
   // Editing a field clears its own error (and the form-level notice).
   const setValue = (name: string, value: string) => {
     setValues((current) => ({ ...current, [name]: value }));
@@ -397,18 +404,19 @@ function TemplateRunPanel(props: { detail: SavedWorkflowDetailView }): React.JSX
     const collected = collectTemplateRunParams(fields, values);
     const bad = new Set([...collected.missing, ...collected.invalid]);
     setFieldErrors(bad);
-    if (bad.size || !membersOk || !nameOk) {
-      setNotice({ text: tr('workflow.library.fixParams'), error: true });
+    if (bad.size || !membersOk || !nameOk || project === null) {
+      setNotice({ text: tr(project === null ? 'workflow.draft.project.pickFirst' : 'workflow.library.fixParams'), error: true });
       return;
     }
     setBusy(true);
     setNotice(null);
-    const created = await runTemplate(entry.workflowId, { params: collected.params, expectedRevisionId: current.revisionId });
+    const created = await runTemplate(entry.workflowId, { params: collected.params, expectedRevisionId: current.revisionId, project });
     if (!created.ok) {
       setBusy(false);
       const issues = (created.body.issues as Array<{ name?: string }> | undefined) ?? [];
       setFieldErrors(new Set(issues.map((issue) => issue.name ?? '').filter(Boolean)));
       setNotice({ text: describeError(tr, created), error: true });
+      if (projectChoicesStale(created.error)) { setPickedProject(''); retryProjects(); }
       return;
     }
     const draft = created.draft;
@@ -435,6 +443,7 @@ function TemplateRunPanel(props: { detail: SavedWorkflowDetailView }): React.JSX
         <span className="sect-head-hint">{tr('workflow.library.runHint', { version: current.humanVersion })}</span>
       </div>
       <p className="muted">{entry.savedFromDraft ? tr('workflow.library.runFromDraftVersion') : tr('workflow.library.runNoConfirm')}</p>
+      <ProjectField id="wfl-project" check={projectCheck} picked={pickedProject} onPick={setPickedProject} onRetry={retryProjects} />
       <div className="wfd-form wfl-param-form">
         {fields.map((field) => {
           const id = `wfl-param-${field.name}`;
@@ -478,7 +487,7 @@ function TemplateRunPanel(props: { detail: SavedWorkflowDetailView }): React.JSX
       <p className="muted">{tr('workflow.library.runInitiatorNote')}</p>
       {notice ? <p className={`wfd-notice${notice.error ? ' wfd-error' : ''}`} role={notice.error ? 'alert' : 'status'}>{notice.text}</p> : null}
       <div className="wfd-actions">
-        <button type="button" className="primary" disabled={busy} onClick={() => { void start(); }}>
+        <button type="button" className="primary" disabled={busy || project === null} onClick={() => { void start(); }}>
           {tr('workflow.draft.startGroup')}
         </button>
       </div>

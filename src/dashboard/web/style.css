@@ -35502,6 +35502,9 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .wfd-void { font-weight: 600; margin: 0; }
 .wfd-confirmed { color: var(--success); margin: 0; font-size: 13px; }
 .wfd-initiator { margin: 0; font-size: 13px; }
+.wfd-project { margin: 0; font-size: 13px; }
+.wfd-project code, .wfd-meta .wfd-project-dir { font-size: 12px; overflow-wrap: anywhere; }
+.wfd-project-from { color: var(--muted); font-size: 12px; margin-left: 6px; }
 .wfd-me { margin-left: 4px; color: var(--accent); }
 .wfd-small { min-height: 26px !important; padding: 0 10px !important; font-size: 12px; }
 .wfd-meta { display: flex; flex-wrap: wrap; gap: 6px 20px; font-size: 13px; margin: -4px 0 6px; }

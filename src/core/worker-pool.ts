@@ -10198,7 +10198,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   // Drop the persisted idle auto-compact stretch too: a message-less cold
   // resume must not immediately /compact a freshly started CLI reading its
   // whole context without a warm prompt cache (core/idle-auto-compact.ts).
-  clearIdleAutoCompactStretch(ds.session);
+  clearIdleAutoCompactStretch(ds);
   ds.idleAutoCompactPendingNotice = undefined;
   ds.idleAutoCompactDispatchedTurnId = undefined;
   ds.session.webPort = undefined;
@@ -12128,12 +12128,21 @@ function sendOrdinaryImDeliveryTracked(
   ensurePrincipalLaneInboundTurnBinding(ds, turnId, workerGeneration!);
   const key = ordinaryImDeliveryKey(ds, turnId, workerGeneration!);
   if (pendingOrdinaryImDeliveries.has(key)) return true;
+  // Tracked delivery bypasses sendWorkerSessionInput to retain its IPC
+  // callback. Admit the execution here too, before any worker event can
+  // publish turn authority or acknowledge this input. Retries keep this exact
+  // execution rather than acquiring a new one on every transport attempt.
+  const controller = controllerForSession(ds);
+  if (controller && !controller.acceptsUserInput()) return false;
+  const scoped = controller && message.type === 'message'
+    ? { ...message, sessionCommand: { version: 2 as const, execution: controller.admitInput(turnId, message.dispatchAttempt) } }
+    : message;
   const record: OrdinaryImDelivery = {
     key,
     ds,
     worker,
     workerGeneration: workerGeneration!,
-    message,
+    message: scoped,
     turnId,
     attempt: 0,
     received: false,
@@ -18007,7 +18016,8 @@ function setupWorkerHandlers(
                       outputControl.record.sink.kind === 'im' ? outputControl.record.sink.context.target : preview.settledEntry.replyTarget)
                   : await new Promise<boolean>(resolve => {
                     deliverFinalOutput(ds, msg, t, 0, resolve,
-                      () => ownsLifecycleMutation() && ds.session.sessionId === msg.sessionId,
+                      () => ownsCodexAppFinalDelivery(ds, msg, sessionController, contractWorker,
+                        () => ownsWorkerSession() && !isSessionTransferring(ds), ownsLifecycleMutation),
                       preview.settledEntry.replyTarget);
                   });
               if (!owned) return false;
@@ -22566,9 +22576,24 @@ function setupWorkerHandlers(
         }
         else {
           const runtime = sessionController.bindRuntime(msg.bindingId, contractWorker, msg.identity, msg.operationId);
+          const observedExecutions: NonNullable<Extract<DaemonToWorker, { type: 'runtime_contract_assigned' }>['observedExecutions']> = [];
+          if (isCodexAppCliId(ds.initConfig?.cliId ?? ds.session.cliId)) {
+            for (const entry of ds.session.codexAppDispatchLedger ?? []) {
+              if (entry.state !== 'prepared') continue;
+              const candidates = sessionController.store.executions(sessionController.ref, entry.turnId, entry.dispatchAttempt)
+                .filter(value => value.ref.dispatchAttempt === entry.dispatchAttempt);
+              if (candidates.length !== 1) continue;
+              const execution = candidates[0];
+              if (execution.runtime && sessionController.store.authorizeExecutionObserver(sessionController.ref, contractWorker, execution.ref)) {
+                observedExecutions.push({ runtime: execution.runtime, execution: execution.ref });
+              }
+            }
+          }
+          sessionController.refresh();
           await sessionController.flushPrimary();
           if (ds.worker !== worker || !sameWorker(sessionController.store.read(sessionController.ref)!.worker, contractWorker)) return;
           worker.send({ type: 'runtime_contract_assigned', bindingId: msg.bindingId, runtime: runtime.ref, mayExecute: runtime.phase !== 'retiring',
+            ...(observedExecutions.length ? { observedExecutions } : {}),
             executions: sessionController.store.executions(sessionController.ref).filter(execution => execution.runtime?.runtimeId === runtime.ref.runtimeId).map(execution => execution.ref),
             admissionStates: sessionController.store.executions(sessionController.ref).map(({ ref, runtime, phase }) => ({ ref, runtime, phase })) } as DaemonToWorker);
           for (const pending of sessionController.store.deferredEvents<WorkerToDaemon>(sessionController.ref, msg.bindingId)) await handleWorkerMessage(pending);
@@ -23072,6 +23097,32 @@ function parkSteerFanoutMember(
       + `${err instanceof Error ? err.message : String(err)}`,
     );
   }
+}
+
+/** Historical observation permits only the exact frozen final's delivery.
+ * Session replacement, transfer or lifecycle intervention still revokes it. */
+export function ownsCodexAppFinalDelivery(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  controller: ReturnType<typeof controllerForSession> | undefined,
+  producer: import('../services/session-contract.js').WorkerRef | undefined,
+  ownsSession: () => boolean,
+  ownsCurrent: () => boolean,
+): boolean {
+  if (!ownsSession() || ds.session.sessionId !== msg.sessionId) return false;
+  const head = ds.session.codexAppDispatchLedger?.[0];
+  if (!msg.codexAppSettlement || !head || head.state !== 'prepared'
+      || head.dispatchId !== msg.codexAppSettlement.dispatchId
+      || head.turnId !== msg.turnId || head.dispatchAttempt !== msg.dispatchAttempt) return false;
+  if (ownsCurrent()) return true;
+  if (!controller || !producer || !msg.sessionOutputOrigin) return false;
+  const state = controller.store.read(controller.ref);
+  const origin = controller.outputOrigin(msg.sessionOutputOrigin);
+  return !!state && state.workerOnline && state.lifecycle === 'active' && !state.activeOperationId
+    && sameWorker(state.worker, producer) && !!origin && sameWorker(origin.producer, producer)
+    && origin.scope.execution?.turnId === msg.turnId
+    && origin.scope.execution.dispatchAttempt === msg.dispatchAttempt && !!origin.scope.runtime
+    && controller.store.authorizedExecutionObserver(controller.ref, origin.scope.runtime, producer, origin.scope.execution);
 }
 
 /** One sessions-file commit owns the signed high-water AND its recovery

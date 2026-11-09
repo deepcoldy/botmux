@@ -19,7 +19,7 @@ import { copyRequest, draftActionRequest } from '../src/dashboard/web/workflow-d
 import { loadSavedWorkflowDetailView } from '../src/workflows/v3/library-catalog.js';
 import { ui } from '../src/dashboard/web/ui.js';
 import { BotSearchPicker } from '../src/dashboard/web/bot-search-picker.js';
-import { BOTS, DOC, MAIN, OWNER, PI, SKETCHES, STEWARD, architectSettled, makeService, specMarkdown } from './helpers/workflow-draft-fakes.js';
+import { BOTS, DEFAULT_PROJECT, DOC, MAIN, OWNER, PI, SKETCHES, STEWARD, architectSettled, makeService, specMarkdown } from './helpers/workflow-draft-fakes.js';
 import { REVIEW, seedRun } from './helpers/workflow-copy-fakes.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -115,6 +115,9 @@ describe('页面渲染', () => {
       if (url === '/api/v3/orchestration/bots') {
         return { ok: true, status: 200, json: async () => ({ ok: true, bots: [{ larkAppId: MAIN, name: '主Bot', cliId: 'claude-code', online: true }, { larkAppId: DOC, name: '文档Bot', cliId: 'claude-code', online: true }] }) } as Response;
       }
+      if (url.startsWith('/api/v3/orchestration/projects?')) {
+        return { ok: true, status: 200, json: async () => ({ ok: true, project: { kind: 'default', dir: DEFAULT_PROJECT } }) } as Response;
+      }
       const body = routes(url, init) ?? { ok: false, error: 'not_found' };
       return { ok: (body as { ok?: boolean }).ok !== false, status: 200, json: async () => body } as Response;
     });
@@ -149,7 +152,7 @@ describe('页面渲染', () => {
     expect(text(dialog)).toContain('两道确认');
     await act(async () => { buttons(renderer, '复制')[0]!.props.onClick(); });
     await flush();
-    expect(sent.find((call) => call.url.endsWith('/drafts/from-source'))?.body).toEqual({ source: { kind: 'run', runId: RUN } });
+    expect(sent.find((call) => call.url.endsWith('/drafts/from-source'))?.body).toEqual({ source: { kind: 'run', runId: RUN }, project: DEFAULT_PROJECT });
     expect(location.hash).toBe('#/workflows/drafts/copy-1');
     act(() => { renderer.unmount(); });
   });
@@ -171,7 +174,7 @@ describe('页面渲染', () => {
     await act(async () => { buttons(renderer, '复制')[0]!.props.onClick(); });
     await flush();
     expect(sent.find((call) => call.url.endsWith('/drafts/from-source'))?.body)
-      .toEqual({ source: { kind: 'template', workflowId: detail.entry.workflowId, revisionId: older.revisionId }, larkAppId: DOC });
+      .toEqual({ source: { kind: 'template', workflowId: detail.entry.workflowId, revisionId: older.revisionId }, larkAppId: DOC, project: DEFAULT_PROJECT });
     act(() => { renderer.unmount(); });
   });
 
@@ -276,6 +279,7 @@ describe('复制对话框：选过别的 Bot 后回到「与来源相同」', ()
     vi.stubGlobal('fetch', async (url: string, init?: RequestInit) => {
       sent.push({ url, ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}) });
       if (url === '/api/v3/orchestration/bots') return { ok: true, status: 200, json: async () => ({ ok: true, bots }) } as Response;
+      if (url.startsWith('/api/v3/orchestration/projects?')) return { ok: true, status: 200, json: async () => ({ ok: true, project: { kind: 'default', dir: DEFAULT_PROJECT } }) } as Response;
       return { ok: true, status: 200, json: async () => ({ ok: true, draft: { runId: 'copy-9' } }) } as Response;
     });
     const { CopyWorkflowDialog } = await import('../src/dashboard/web/workflow-copy.js');
@@ -312,7 +316,7 @@ describe('复制对话框：选过别的 Bot 后回到「与来源相同」', ()
     expect(d.resets()).toHaveLength(1);
     await act(async () => { d.resets()[0]!.props.onClick(); });
     expect(text(d.picker())).toContain('与来源相同');
-    expect(await d.submit()).toEqual({ source: { kind: 'run', runId: RUN } });
+    expect(await d.submit()).toEqual({ source: { kind: 'run', runId: RUN }, project: DEFAULT_PROJECT });
     act(() => { d.renderer.unmount(); });
   });
 });

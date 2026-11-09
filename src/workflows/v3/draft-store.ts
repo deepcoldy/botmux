@@ -490,6 +490,10 @@ export const WorkflowDraftRecordSchema = z.object({
   createdAt: iso,
   updatedAt: iso,
   version: z.number().int().min(1),
+  /** The project its clarify session runs in: the orchestrator's default
+   *  dir, or one of its repo-picker candidates chosen at creation. Drafts
+   *  from before projects have none until a session reopens in one. */
+  projectDir: z.string().min(1).max(4096).optional(),
   clarify: clarifySchema,
   architect: architectSchema.optional(),
   /** Bumped by every write that changes the DAG or the spec; a second
