@@ -798,6 +798,48 @@ describe('HerdrBackend.spawn', () => {
     be.kill();
   });
 
+  it('Herdr 0.7.5: tab placement counts the closed tab as closed even though `pane close` then fails', () => {
+    // Real Herdr: once the tab is gone, closing its root pane exits 1.
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const tabs: string[] = [];
+    setManagedLaunchResponses('claude', [
+      { match: a => a.includes('workspace') && a.includes('list'), reply: () => JSON.stringify({ result: { workspaces: [{ workspace_id: 'ws-main', focused: true }] } }) },
+      {
+        match: a => a.includes('tab') && a.includes('create'),
+        reply: () => {
+          const n = tabs.push(`t-try${tabs.length + 1}`);
+          return JSON.stringify({ result: { tab: { tab_id: `t-try${n}` }, root_pane: { pane_id: `p-try${n}` } } });
+        },
+      },
+      {
+        match: a => a.includes('pane') && a.includes('close'),
+        reply: () => { throw Object.assign(new Error('pane not found'), { status: 1 }); },
+      },
+      { match: a => a.includes('pane') && a.includes('read'), reply: () => PANE_READ_REPLY('$ /tmp/botmux-launch/claude\n') },
+      {
+        match: a => a.includes('agent') && a.includes('list'),
+        reply: () => {
+          if (tabs.length === 1) {
+            vi.setSystemTime(Date.now() + PANE_AGENT_START_TIMEOUT_MS);
+            return JSON.stringify({ result: { agents: [{ name: null, pane_id: 'p-try1', agent: null }] } });
+          }
+          return JSON.stringify({ result: { agents: [{ name: null, pane_id: `p-try${tabs.length}`, agent: 'claude', agent_status: 'idle' }] } });
+        },
+      },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY(`p-try${tabs.length}`) },
+    ]);
+    const be = new HerdrBackend(SESSION, { herdrConfig: { placement: 'tab' } });
+
+    be.spawn('/usr/local/bin/claude', ['--session-id', 'sid-1'], FRESH_START);
+
+    expect(tabs).toEqual(['t-try1', 't-try2']);
+    expect(herdrCall('tab', 'close', 't-try1')).toBeDefined();
+    expect(herdrCall('tab', 'close', 't-try2')).toBeUndefined();
+    expect(herdrCall('agent', 'rename')).toEqual(['--session', SESSION, 'agent', 'rename', 'p-try2', 'botmux']);
+    be.kill();
+  });
+
   it('Herdr 0.7.5: without retryPaneAgentStart (an in-worker restart) a stalled launch is not retried', () => {
     vi.useFakeTimers();
     vi.setSystemTime(0);
