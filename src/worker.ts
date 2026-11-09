@@ -1994,6 +1994,9 @@ function bindSessionExecutionEvent<T extends (...args: any[]) => any>(callback: 
   select?: (args: Parameters<T>) => { turnId?: string; dispatchAttempt?: number; origin?: CapturedSessionOrigin }): T {
   return workerSessionEventScope ? workerSessionEventScope.bindExecutionEvent(callback, select) : callback;
 }
+function bindSessionPhysicalObservation<T extends (...args: any[]) => any>(callback: T): T {
+  return workerSessionEventScope ? workerSessionEventScope.bindLivePhysical(callback) : callback;
+}
 function bindSessionBackendExit<T extends (...args: any[]) => any>(callback: T): T {
   const observed = backend;
   return bindSessionRuntimeCallback(((...args: Parameters<T>) => {
@@ -7675,12 +7678,12 @@ async function handleCodexAppControlLine(
   // Recover the submitted execution from the authenticated final's exact FIFO
   // head, while retaining the socket callback's physical-backend boundary.
   const applyRecord = bindSessionExecutionEvent(() => finalResult.status === 'not-final'
-      ? handleTrustedCodexAppMarker(
+      ? bindSessionPhysicalObservation(() => handleTrustedCodexAppMarker(
           record.kind,
           record.payload,
           { generation: identity.generation, seq: record.seq, socket: connection.socket,
             channelId: connection.channelId, epoch: connection.epoch },
-        )
+        ))()
       : handleTrustedCodexAppMarker(
           'final',
           finalResult.payload,

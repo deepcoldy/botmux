@@ -10,7 +10,7 @@ import { WorkerSessionEventScope } from '../src/services/session-event-scope.js'
 import { TurnExecutionClock } from '../src/services/turn-execution-clock.js';
 import { TurnTerminalDeduper } from '../src/services/turn-terminal-deduper.js';
 import { CodexAppTurnDispatchQueue } from '../src/utils/codex-app-turn-dispatch.js';
-import { CodexAppTurnLiveness } from '../src/utils/codex-app-turn-liveness.js';
+import { CodexAppTurnLiveness, CodexAppReadyAuthority, applyTrustedCodexAppStateMarker } from '../src/utils/codex-app-turn-liveness.js';
 import { runnerFinalOutcome } from '../src/services/runner-final-outcome.js';
 import { normalizeFinalUsage } from '../src/services/codex-app-runner-protocol.js';
 import { bridgePostText } from '../src/services/bridge-fallback-gate.js';
@@ -18,7 +18,7 @@ import { committedCodexAppSequence } from '../src/utils/codex-app-dispatch-ledge
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import { CodexAppControlSequenceFence, CodexAppControlFinalAssembler, CodexAppControlReplayWindow,
   CodexAppControlRecordApplicationGate, parseCodexAppControlWireRecord, verifyCodexAppSignedControlMarker,
-  encodeCodexAppSignedControlMarker, encodeCodexAppControlAck } from '../src/utils/codex-app-control.js';
+  encodeCodexAppSignedControlMarker, encodeCodexAppControlAck, codexAppSignedStateReadiness } from '../src/utils/codex-app-control.js';
 import { sameWorker } from '../src/services/session-contract.js';
 import { loadWorkerPoolClosure } from './helpers/worker-pool-function-harness.js';
 import { loadWorkerFunction, loadWorkerMessageHandler } from './helpers/worker-function-harness.js';
@@ -142,7 +142,9 @@ function harness(reattached: boolean | 'native-recovery' = false) {
     scope.run(binding, () => { scope.enterTurn(turnId, attempt); loadWorkerFunction<any>('markTurnExecutionStart', env)(turnId, attempt); });
     return next;
   };
-  return { scope, startup, active, execution, store, ref, env, wire, admissions, queue, socket, final, line, connection, reconnect, add, bind, heldAcks, historicalRuntime, controller,
+  const marker = (kind: string, payload: Record<string, unknown>, seq = 1) => socketResource.runInAsyncScope(() => line(connection,
+    encodeCodexAppSignedControlMarker(pair.privateKey, ref.sessionId, generation, challenge, seq, kind, payload)));
+  return { scope, startup, active, execution, store, ref, env, wire, admissions, queue, socket, final, marker, line, connection, reconnect, add, bind, heldAcks, historicalRuntime, controller,
     restoreNative: () => scope.run(startup, () => loadWorkerFunction<any>('restoreCodexAppContractNativeSession', env)()),
     drainBindings: async () => { while (bindingTasks.length) await Promise.all(bindingTasks.splice(0)); } };
 }
@@ -362,5 +364,78 @@ describe('new input during bare runtime recovery', () => {
     expect(h.store.execution(h.ref, h.execution.executionId)).toMatchObject({ phase: 'reconciling', runtime: h.historicalRuntime });
     expect(h.store.execution(h.ref, middle.executionId)).toMatchObject({ phase: 'submitting', runtime: h.startup.runtime });
     expect(h.store.executions(h.ref)).toHaveLength(2);
+  });
+});
+
+
+function signedReadinessHarness() {
+  const h = harness(); const e = h.env;
+  h.queue.clear();
+  Object.assign(e, {
+    codexAppCompletionAwaitingFinal: false, codexAppControlProven: true,
+    codexAppRunnerProcessIdentity: { launcherPid: 111, launcherProcStart: 'start111', enginePid: 222, engineProcStart: 'engine222' },
+    codexAppReadyAuthority: new CodexAppReadyAuthority(), applyTrustedCodexAppStateMarker, codexAppSignedStateReadiness,
+    codexAppProofDeadline: { armed: false, clear: vi.fn() }, cleanupCodexAppControlBootstrap: vi.fn(),
+    failCodexAppControlGeneration: vi.fn(), awaitingFirstPrompt: false, isPromptReady: false,
+    isFlushing: false, durableTurnInFlight: true, preserveActiveTurnAuthorityForReady: false,
+    pendingMessages: [], pendingRawInputs: [], pendingAdoptMessages: [], pendingSessionRename: null, pendingInjections: [],
+    ptyOutputGeneration: { snapshot: () => 1 }, queuedTypeAheadTurns: [], promptReadyEdges: 0,
+    decideQueuedReadyTransition: () => ({ releaseActiveTurnAuthority: false, advanceQueuedTurn: false }),
+    inflightInputs: { onTurnComplete: vi.fn() }, backgroundTaskTracker: { pendingTurnAgents: () => 0 },
+    freshnessInputQueue: { onPromptReady: () => 'continue' }, bridgeQueue: { cliQueueDrained: vi.fn() },
+    readyGate: { shouldHold: () => false },
+  });
+  for (const name of ['traexFirstPromptViewportRejects', 'currentPostTerminalInputFence', 'currentInputDeliveryQuarantine',
+    'holdForNativeSessionFork', 'probeStartupBlocker', 'spawnArgvTurnStartGateHolds', 'hasStructuredLifecycleBlock',
+    'syncQueuedTurnsFromMarkerDisk', 'shouldFlushInjectionsFirst']) e[name] = () => false;
+  for (const name of ['stopStructuredStartGraceRecheck', 'stopBusyPatternIdleProbe',
+    'releaseInterruptedStructuredBridgeOnFirstPrompt', 'judgeClaudeBridgeTurn', 'settleSessionRenameOnPrompt',
+    'releaseRawInputRestartGate', 'maybeEmitWorkflowTranscriptOutput', 'refreshBackgroundWait', 'settleRestartAttemptOnReady',
+    'advanceQueuedTypeAheadTurn', 'flushPending']) e[name] = vi.fn();
+  e.hasCurrentSessionRuntime = loadWorkerFunction('hasCurrentSessionRuntime', e);
+  e.markPromptReady = loadWorkerFunction('markPromptReady', e);
+  h.scope.run(h.active, () => e.send({ type: 'ready' }));
+  return h;
+}
+
+describe('signed Codex App state follows the same physical runtime after launcher enrichment', () => {
+  it('publishes real prompt-ready metadata through the gateway and makes the current native runtime ready', async () => {
+    vi.useFakeTimers(); const h = signedReadinessHarness();
+    const before = h.store.read(h.ref)!;
+    expect(h.store.runtime(h.ref, h.active.runtime!.runtimeId)?.phase).toBe('starting');
+    await h.marker('state', { busy: false, acceptingInput: true });
+    await vi.advanceTimersByTimeAsync(0);
+    const ready = h.wire.filter(m => m.type === 'prompt_ready');
+    expect(ready).toHaveLength(1);
+    expect(ready[0].sessionContract.scope.runtime).toEqual(h.active.runtime);
+    expect(ready[0].sessionContract.scope.runtime).not.toEqual(h.startup.runtime);
+    expect(h.admissions.at(-1)?.kind).toBe('current');
+    const after = h.store.read(h.ref)!;
+    expect(h.store.runtime(h.ref, h.active.runtime!.runtimeId)?.promptReady).toBe(true);
+    expect(after.readinessSequence).toBe(before.readinessSequence + 1);
+    expect(h.controller.ds.cliReady).toBe(true);
+    expect(h.controller.ds.cliReadyGeneration).toBe(after.readinessSequence);
+    expect(h.store.runtime(h.ref, h.active.runtime!.runtimeId)?.phase).toBe('ready');
+    expect(h.env.isPromptReady).toBe(true);
+    expect(h.env.failCodexAppControlGeneration).not.toHaveBeenCalled();
+    expect(h.socket.destroy).not.toHaveBeenCalled();
+    expect(h.socket.write).toHaveBeenCalledOnce();
+  });
+  it('rejects an authenticated stale socket state after the physical backend has been replaced', async () => {
+    vi.useFakeTimers(); const h = signedReadinessHarness();
+    const replacement = h.scope.beginRuntime(); h.bind(replacement, 'replacement-native', '222:start222');
+    const before = h.store.read(h.ref)!;
+    await h.marker('state', { busy: false, acceptingInput: true });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.wire.filter(m => m.type === 'prompt_ready')).toHaveLength(0);
+    expect(h.store.read(h.ref)?.readinessSequence).toBe(before.readinessSequence);
+    expect(h.store.runtime(h.ref, replacement.runtime!.runtimeId)?.promptReady).toBe(false);
+    expect(h.controller.ds.cliReady).toBe(false);
+    expect(h.store.runtime(h.ref, replacement.runtime!.runtimeId)?.phase).toBe('starting');
+    expect(h.env.codexAppReadyAuthority.canPublishPromptReady()).toBe(false);
+    expect(h.env.codexAppSignedStateObserved).not.toBe(true);
+    expect(h.env.codexAppControlReplayWindow.hasSeen('g'.repeat(43), 1)).toBe(false);
+    expect(h.socket.write).not.toHaveBeenCalled();
+    expect(h.socket.destroy).toHaveBeenCalledOnce();
   });
 });
