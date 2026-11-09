@@ -99,6 +99,25 @@ describe('feedback surface event reconciliation', () => {
       } });
     } finally { extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
   });
+  it('treats a legacy queued surface without roundScope in its payload as subject scope', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-legacy-scope-'));
+    const source = await SkillFeedbackStore.open(directory);
+    const extensions = await FeedbackExtensionStore.open(directory);
+    try {
+      extensions.ingest('source:app', 0, [{ sequence: 1, eventId: 'old', jobs: [{ id: 'legacy-job', kind: 'surface',
+        payload: { appId: 'app', chatId: 'chat', topicId: 'topic', subjectId: 'question', round: 1, mode: 'separate',
+          answerMessageId: 'answer', card: {} } }] }]);
+      let sends = 0;
+      await reconcileFeedbackSurfaces({ appId: 'app', sourceKey: 'source', source, extensions, now: Date.now,
+        send: async () => { sends++; return 'legacy-surface'; }, answerUrl: () => 'https://example.com',
+        removeInline: async () => {},
+        config: { version: 1, hostId: 'host', templates: [defaultFeedbackTemplate()], hooks: [], actions: [],
+          presentations: { app: normalizeFeedbackPresentation({ default: { enabled: true, rounds: [1] } }) } } });
+      expect(sends).toBe(1);
+      expect(extensions.job('legacy-job')?.status).toBe('succeeded');
+      expect(extensions.surface('app', 'legacy-surface')?.answerMessageId).toBe('answer');
+    } finally { extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
   it.each([true, false])('keeps unfinished answers ahead of later answers in native topic scope (bound=%s)', async bound => {
     const directory = mkdtempSync(join(tmpdir(), 'feedback-topic-pending-'));
     const source = await SkillFeedbackStore.open(directory);

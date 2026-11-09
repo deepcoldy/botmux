@@ -38,6 +38,21 @@ describe('feedback template', () => {
       template.elements = template.elements.map(element => element.slot === 'answerReference' ? { ...element, content } : element);
       expect(() => validateFeedbackTemplate(template)).toThrow();
     });
+  it.each(['feedbackButtons', 'feedbackDetails', 'status', 'actionButtons'])(
+    'rejects content attached to the non-reference %s slot', slot => {
+      const template = defaultFeedbackTemplate();
+      template.elements = template.elements.map(element => element.slot === slot ? { ...element, content: 'not allowed' } : element);
+      expect(() => validateFeedbackTemplate(template)).toThrow('feedback_template_reference_invalid');
+    });
+  it.each([
+    ['number', 123], ['array', ['text']], ['object', { text: 'x' }], ['boolean', true], ['nullish', null],
+  ] as [string, unknown][])(
+    'rejects non-string reference content: %s', (_name, content) => {
+      const template = defaultFeedbackTemplate();
+      template.elements = template.elements.map(element => element.slot === 'answerReference'
+        ? { ...element, content: content as any } : element);
+      expect(() => validateFeedbackTemplate(template)).toThrow('feedback_template_reference_invalid');
+    });
   it.each(['Review this answer', ''])('renders literal reference content without adding a default link: %s', content => {
     const template = defaultFeedbackTemplate();
     template.elements = template.elements.map(element => element.slot === 'answerReference' ? { ...element, content } : element);
