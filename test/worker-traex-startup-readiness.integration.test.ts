@@ -26,16 +26,16 @@ function redraw(rows: string[]): string {
 
 // per-bot-home: TRAE_HOME comes only from the bot's env (the worker's own env
 // has none), so the submit receipt is only visible if the worker follows it.
-type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog' | 'per-bot-home' | 'repository-notice' | 'resumed-repository-notice' | 'resumed-repository-notice-held-idle' | 'native-viewport' | 'native-viewport-loading' | 'native-viewport-race' | 'native-viewport-retry';
+type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog' | 'per-bot-home' | 'repository-notice' | 'resumed-repository-notice' | 'resumed-repository-notice-held-idle' | 'native-viewport' | 'native-viewport-loading' | 'native-viewport-race' | 'native-viewport-retry' | 'session-lock';
 
 const tmuxAvailable = probeTmuxFunctional().ok;
 for (const backendType of process.env.BOTMUX_TEST_WORKER_BINARY ? ['tmux'] as const : ['pty', 'tmux'] as const) {
-  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice', 'resumed-repository-notice', 'resumed-repository-notice-held-idle', 'native-viewport', 'native-viewport-loading', 'native-viewport-race', 'native-viewport-retry'] as const) {
+  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice', 'resumed-repository-notice', 'resumed-repository-notice-held-idle', 'native-viewport', 'native-viewport-loading', 'native-viewport-race', 'native-viewport-retry', 'session-lock'] as const) {
     if (mode.startsWith('native-viewport') && backendType !== 'tmux') continue;
     it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
       `TraeX ${backendType} ${mode}: admits a quiet cursor-painted composer and submits the first input once`,
       () => runScenario(backendType, mode),
-      65_000,
+      mode === 'session-lock' ? 120_000 : 65_000,
     );
   }
 }
@@ -69,7 +69,9 @@ async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise
     renameSync(`${frameFile}.tmp`, frameFile);
     return id;
   }
-  const initial = nativeViewport
+  const initial = mode === 'session-lock'
+    ? readFileSync(resolve('test/fixtures/stuck-pages/traex-0.213.1-session-lock.txt'), 'utf8').trimEnd().split('\n')
+    : nativeViewport
     ? COMPOSER.map(row => mode === 'native-viewport-loading' ? row.replace('GPT-6-Astra xhigh', 'loading') : row)
     : mode.startsWith('resumed-repository-notice')
     ? ['■ Conversation interrupted - use /feedback if something went wrong', '',
@@ -234,13 +236,21 @@ await import(${JSON.stringify(resolve('src/worker.ts'))});
     child.send({
       type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_test',
       workingDir: dataDir, cliId: 'traex', cliPathOverride: fakeCli, backendType,
-      ...(mode === 'resume' || mode.startsWith('resumed-repository-notice') || nativeViewport ? { resume: true, cliSessionId: nativeId } : {}),
+      ...(mode === 'resume' || mode === 'session-lock' || mode.startsWith('resumed-repository-notice') || nativeViewport ? { resume: true, cliSessionId: nativeId } : {}),
       ...(mode === 'per-bot-home' ? { env: { TRAE_HOME: traeHome } } : {}),
       prompt: 'only-this-traex-startup-input', turnId: 'om_first',
       dispatchAttempt: 1, durablePrimaryInbox: true,
       larkAppId: 'app_test', larkAppSecret: 'test',
     } satisfies DaemonToWorker);
-    await waitFor(() => existsSync(seenFile), 'first frame');
+    await waitFor(() => existsSync(seenFile), 'first frame', mode === 'session-lock' ? 60_000 : 12_000);
+    if (mode === 'session-lock') {
+      await waitFor(() => messages.some(message => message.type === 'stuck_warning'
+        && message.reason === 'input_held' && message.matchedPattern === 'session lock'),
+      'session-lock hold card', 25_000);
+      expect(existsSync(inputFile), logs.join('')).toBe(false);
+      expect(messages.some(message => message.type === 'turn_input_committed')).toBe(false);
+      paint(['TraeCode CLI (v0.213.1)', '', ...COMPOSER]);
+    }
     if (heldIdle) await waitFor(() => existsSync(idleHeld), 'first idle edge held');
     if (nativeViewport) {
       const pane = execFileSync('tmux', [...tmuxSocketArgs(preferredManagedTmuxSocket(env)),

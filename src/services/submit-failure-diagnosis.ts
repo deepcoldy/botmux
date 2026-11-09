@@ -9,10 +9,12 @@
  * extra silences, never a conclusion about what happened to the message.
  */
 import { stripAnsiScreenText } from '../utils/idle-detector.js';
+import { classifyStuckPage } from '../utils/stuck-detector.js';
 
 export type SubmitFailureDiagnosisReason =
   | 'logged_out'        // 登录/鉴权门
   | 'interactive_menu'  // 菜单/迁移/hooks review/确认框等键盘选择界面
+  | 'session_locked'
   | 'draft_parked'      // 正文停在 composer，尚未提交
   | 'still_active'      // CLI 仍有持续活动证据（弱证据，只用于有限度静默，不用于下结论）
   | 'unknown';
@@ -136,6 +138,9 @@ export function diagnoseSubmitFailure(input: SubmitFailureDiagnosisInput): Submi
   const screen = stripAnsiScreenText(input.screenText ?? '');
   const loggedOut = matchScreenRule(LOGGED_OUT_RULES, screen);
   if (loggedOut) return { reason: 'logged_out', evidence: 'screen', matched: loggedOut };
+  if (classifyStuckPage(screen) === 'session lock') {
+    return { reason: 'session_locked', evidence: 'screen', matched: 'session_locked:writer_lock' };
+  }
   const interactiveMenu = matchScreenRule(INTERACTIVE_MENU_RULES, screen);
   if (interactiveMenu) return { reason: 'interactive_menu', evidence: 'screen', matched: interactiveMenu };
   const draftParked = matchScreenRule(DRAFT_PARKED_RULES, screen);
@@ -271,5 +276,6 @@ export function shouldWaitThroughBusyTurn(state: {
   // A gate screen means the CLI is parked on a question; it is not executing.
   if (state.diagnosisReason === 'logged_out') return false;
   if (state.diagnosisReason === 'interactive_menu') return false;
+  if (state.diagnosisReason === 'session_locked') return false;
   return state.waitsSoFar < (state.maxWaits ?? SUBMIT_BUSY_TURN_MAX_WAITS);
 }

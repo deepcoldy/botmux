@@ -10,7 +10,7 @@ import {
   buildStuckKeyResultCard,
   buildStuckPageCard,
 } from '../src/im/lark/card-builder.js';
-import { STUCK_PAGE_CATALOG } from '../src/core/stuck-page-catalog.js';
+import { isAllowedStuckKeySequence, STUCK_PAGE_CATALOG } from '../src/core/stuck-page-catalog.js';
 import {
   decideStuckKeyClick,
   stuckCardFallbackText,
@@ -55,6 +55,17 @@ function card(pageType: string | undefined, extra: Partial<Parameters<typeof bui
 }
 
 describe('buildStuckPageCard', () => {
+  it('the lock card offers only native retry, never exit, kill or free-form input', () => {
+    expect(STUCK_PAGE_CATALOG['session lock'].options).toEqual([
+      expect.objectContaining({ key: 'r', audience: 'initiator' }),
+    ]);
+    expect(buttonsOf(card('session lock'))).toHaveLength(1);
+    expect(isAllowedStuckKeySequence('session lock', ['r'])).toBe(true);
+    for (const keys of [['Enter'], ['Escape'], ['q'], ['C-c'], ['r', 'Enter']]) {
+      expect(isAllowedStuckKeySequence('session lock', keys)).toBe(false);
+    }
+  });
+
   it.each(PAGE_TYPES)('%s: one button per catalog option, carrying only index + nonce', (pageType) => {
     const options = STUCK_PAGE_CATALOG[pageType].options;
     const buttons = buttonsOf(card(pageType));

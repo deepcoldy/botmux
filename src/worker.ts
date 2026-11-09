@@ -20463,11 +20463,13 @@ function scheduleSubmitFailureNotify(
               ? 'worker.activation_submit_unconfirmed'
               : submitDiagnosis.reason === 'logged_out'
                 ? 'submitDiag.logged_out'
-                : submitDiagnosis.reason === 'interactive_menu'
-                  ? 'submitDiag.interactive_menu'
-                  : submitDiagnosis.reason === 'draft_parked'
-                    ? 'submitDiag.draft_parked'
-                    : 'worker.submit_unconfirmed',
+                : submitDiagnosis.reason === 'session_locked'
+                  ? 'submitDiag.session_locked'
+                  : submitDiagnosis.reason === 'interactive_menu'
+                    ? 'submitDiag.interactive_menu'
+                    : submitDiagnosis.reason === 'draft_parked'
+                      ? 'submitDiag.draft_parked'
+                      : 'worker.submit_unconfirmed',
           {
             cliName: cliName(),
             secs: Math.round(SUBMIT_DEFERRED_RECHECK_MS / 1000),

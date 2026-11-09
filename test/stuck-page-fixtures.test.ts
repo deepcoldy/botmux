@@ -56,6 +56,7 @@ const PAGES: Record<string, ReturnType<typeof classifyStuckPage>> = {
   'traex-0.213.1-sessionstart-detail-l2.txt': 'hook review level 2',
   'traex-0.213.1-migration-menu.txt': 'cli migration menu',
   'traex-0.213.1-migration-menu-after-paste-enter.txt': 'cli migration menu',
+  'traex-0.213.1-session-lock.txt': 'session lock',
 };
 
 /** Screens one key past a page, the composer, and other dialogs: no card,
@@ -102,6 +103,42 @@ describe('classifyStuckPage over real captures', () => {
     expect(classifyStuckPage(fixture(name))).toBe(classifyStuckPage(fixture(plain)));
     // The pair must be a real page or a real non-page, never an unlisted one.
     expect(plain in PAGES || NOT_PAGES.includes(plain)).toBe(true);
+  });
+});
+
+describe('session writer-lock page', () => {
+  const locked = () => fixture('traex-0.213.1-session-lock.txt');
+
+  it.each(['pty', 'tmux', 'tmux-pipe'])('reports the concrete gate before recent activity on %s', backendType => {
+    expect(diagnoseBackendSubmitFailure({
+      backendType,
+      capturedScreenText: locked(),
+      cliId: 'traex',
+      nowMs: 1000,
+      lastActivityAtMs: 999,
+    })).toEqual({ reason: 'session_locked', evidence: 'screen', matched: 'session_locked:writer_lock' });
+  });
+
+  it('does not use a ZMX history snapshot as lock evidence', () => {
+    expect(diagnoseBackendSubmitFailure({
+      backendType: 'zmx', capturedScreenText: locked(), cliId: 'traex', lastActivityAtMs: 0,
+    })).toEqual({ reason: 'unknown', evidence: 'none' });
+  });
+
+  it('recognises ANSI and trailing blank viewport rows', () => {
+    expect(classifyStuckPage(`\x1b[33m${locked()}\x1b[0m${'\n'.repeat(80)}`)).toBe('session lock');
+  });
+
+  it.each([
+    (screen: string) => `${screen}\n❯ Explain this codebase\nmodel · Context 100% left\n`,
+    (screen: string) => screen.split('\n').map(row => `> ${row}`).join('\n'),
+    (screen: string) => screen.replace('Owner: PID 91565', 'Owner: PID unknown'),
+    (screen: string) => screen.replace('Close it there and press R to continue here.', 'This example shows the session lock screen.'),
+    (screen: string) => screen.replace('r retry  |  esc/ctrl+c/q exit  |  ctrl+o transcript', 'Press enter to submit'),
+    (screen: string) => screen.replace('This conversation is open in another app', 'The guide says: This conversation is open in another app'),
+  ])('does not offer keys for quoted, stale or incomplete lock text %#', change => {
+    expect(classifyStuckPage(change(locked()))).toBeUndefined();
+    expect(shouldHoldInputForStuckPage(change(locked()))).toBe(false);
   });
 });
 
