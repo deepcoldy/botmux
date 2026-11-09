@@ -527,6 +527,7 @@ import {
 import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay, scaleMs } from './utils/timing.js';
 import { waitForProcessQuiescence } from './services/process-quiescence.js';
+import { reapStaleCodexThreadWriter } from './services/codex-stale-writer-reaper.js';
 import { pidNotProvablyGone } from './utils/process-alive.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
 import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
@@ -26060,6 +26061,42 @@ async function spawnCliBody(
       { botmuxSessionProfile: hermesUsesBotmuxSessionProfile },
     )
     : undefined;
+
+  // A cold `codex resume` cannot share its thread with a still-running Codex:
+  // the new TUI stops at "This conversation is open in another app" and never
+  // accepts input. A restart that left this session's previous Codex alive
+  // outside the pane we manage (replaced tmux server, unreattached pane) used
+  // to wedge the session exactly that way. Retire only a holder that carries
+  // THIS session's id; anything else is reported and left alone.
+  if (cfg.cliId === 'codex' && !willReattachPersistent && effectiveResume && effectiveCliSessionId
+      && !codexRpcEngine && !cfg.adoptMode && !cfg.existingAppServerEndpoint
+      && !isRemoteBackendType(effectiveBackendType)) {
+    const homes = [...new Set([perBotInjectEnv.CODEX_HOME, childEnv.CODEX_HOME, join(homedir(), '.codex')]
+      .filter((home): home is string => typeof home === 'string' && home.trim() !== '')
+      .map(home => home.trim()))];
+    for (const home of homes) {
+      try {
+        const outcome = await reapStaleCodexThreadWriter({
+          codexHome: home,
+          threadId: effectiveCliSessionId,
+          sessionId: cfg.sessionId,
+          excludePids: [process.pid],
+        });
+        if (outcome.kind === 'reaped') {
+          log(`[codex-writer-lock] retired stale Codex of this session holding thread ${effectiveCliSessionId}: pids ${outcome.pids.join(',')}${outcome.forced ? ' (SIGKILL)' : ''}`);
+        } else if (outcome.kind === 'foreign') {
+          log(`[codex-writer-lock] thread ${effectiveCliSessionId} is held by a process outside this session (pids ${outcome.pids.join(',')}); left alone${outcome.reaped.length ? `, retired own pids ${outcome.reaped.join(',')}` : ''}`);
+        } else if (outcome.kind === 'stuck') {
+          log(`[codex-writer-lock] stale Codex of this session survived SIGKILL (pids ${outcome.pids.join(',')}); resume may stop at the lock screen`);
+        } else if (outcome.kind === 'unavailable') {
+          log(`[codex-writer-lock] could not enumerate holders of thread ${effectiveCliSessionId} under ${home}`);
+        }
+      } catch (error) {
+        log(`[codex-writer-lock] check failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
+  }
 
   // ── File sandbox (oncall): wrap the CLI in bwrap so it can only touch a
   // per-session project copy + de-identified config. The agent's `botmux send`
