@@ -2084,16 +2084,19 @@ async function publishRuntimeContract(binding: RuntimeEventBinding, nativeSessio
   // A buffered observation can arrive after the process disappears. Preserve
   // its proven binding so the captured physical exit still stops the runtime.
   if (previous && previous.proof !== 'opaque' && identity.proof === 'opaque') return;
+  let continuesBindingId: string | undefined;
   if (previous && previous.proof !== 'opaque' && (previous.backend !== identity.backend || previous.physicalId !== identity.physicalId
     || previous.proof !== identity.proof || (previous.nativeGeneration !== undefined && previous.nativeGeneration !== identity.nativeGeneration)
     || (previous.nativeSessionId !== undefined && previous.nativeSessionId !== identity.nativeSessionId))) {
     const scope = workerSessionEventScope;
+    continuesBindingId = binding.bindingId;
     binding = scope.beginRuntime(binding.operationId, binding.physicalId);
     scope.enterRuntime(binding);
     send({ type: 'runtime_binding_started', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
   }
   binding.identity = identity;
-  send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
+  send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity,
+    ...(continuesBindingId ? { continuesBindingId } : {}), ...(binding.operationId ? { operationId: binding.operationId } : {}) });
 }
 let cliSpawnGeneration = 0;
 /** What the TRAE install entry resolved to right before the spawn of

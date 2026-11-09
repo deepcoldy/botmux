@@ -17944,6 +17944,23 @@ function setupWorkerHandlers(
     );
   const ownsLifecycleMutation = (): boolean =>
     ownsWorkerSession() && !isSessionTransferring(ds) && (!sessionController || sessionController.currentAuthority());
+  // The live worker produced an answer the contract will not post. Without the
+  // notice the card stays "working" and the user never learns the reply is gone.
+  const undeliveredFinalNotices = new Set<string>();
+  const reportUndeliveredFinal = (final: Extract<WorkerToDaemon, { type: 'final_output' }>, reason: string): void => {
+    if (ds.worker !== worker) return;
+    logger.warn(`[${t}] Final output from current worker not delivered turn=${final.turnId} reason=${reason}`);
+    // Restart, suspend and close retire in-flight replies on purpose.
+    if (!final.content.trim() || (sessionController && !sessionController.allowsInput())) return;
+    if (managedFinalOutputSuppressed(final.turnId, final.dispatchAttempt) || managedAuxUiSuppressed(final.turnId, final.dispatchAttempt)) return;
+    const key = `${final.turnId}:${final.dispatchAttempt ?? ''}`;
+    if (undeliveredFinalNotices.has(key)) return;
+    undeliveredFinalNotices.add(key);
+    void sendTurnNotice(ds, {
+      kind: 'user_notify', turnId: fallbackTurnId(ds, final.turnId), msgType: 'text',
+      content: tr('worker.final_output_undelivered', undefined, localeForBot(ds.larkAppId)),
+    }).catch(error => logger.error(`[${t}] Undelivered reply notice failed: ${error instanceof Error ? error.message : String(error)}`));
+  };
   // A new worker generation is starting. As a backstop, invalidate any
   // stuck-warning card posted by the previous generation — explicit kill/suspend/
   // exit paths should already have done this, but fork/refork/takeover paths
@@ -18561,7 +18578,13 @@ function setupWorkerHandlers(
         if (msg.turnId.startsWith('mlrp_turn_')) {
           markMessageListenerRunPreviewRunning(msg.turnId);
         }
-        if (!outputControl) { deliverFinalOutputWithShutdownDrain(ds, finalOutput, t, ownsLifecycleMutation); return undefined; }
+        if (!outputControl) {
+          if (sessionController && ownsWorkerSession() && !isSessionTransferring(ds) && !sessionController.currentAuthority()) {
+            reportUndeliveredFinal(msg, 'superseded_runtime');
+          }
+          deliverFinalOutputWithShutdownDrain(ds, finalOutput, t, ownsLifecycleMutation);
+          return undefined;
+        }
         return deliverFinalOutputWithOutputControl(ds, finalOutput, t, outputControl,
           outputControl.record.sink.kind === 'im' ? outputControl.record.sink.context.target : undefined);
 
@@ -23015,7 +23038,7 @@ function setupWorkerHandlers(
           worker.send({ type: 'runtime_binding_aborted_ack', bindingId: msg.bindingId });
         }
         else {
-          const runtime = sessionController.bindRuntime(msg.bindingId, contractWorker, msg.identity, msg.operationId);
+          const runtime = sessionController.bindRuntime(msg.bindingId, contractWorker, msg.identity, msg.operationId, msg.continuesBindingId);
           const observedExecutions: NonNullable<Extract<DaemonToWorker, { type: 'runtime_contract_assigned' }>['observedExecutions']> = [];
           if (isCodexAppCliId(ds.initConfig?.cliId ?? ds.session.cliId)) {
             for (const entry of ds.session.codexAppDispatchLedger ?? []) {
@@ -23081,6 +23104,8 @@ function setupWorkerHandlers(
     const logRejected = (reason: string) => {
       if ((msg.type === 'managed_turn_origin' || msg.type === 'managed_turn_origin_revoked') && ds.worker === worker) {
         logger.warn(`[${t}] Dropped ${msg.type} from current worker turn=${msg.turnId ?? '-'} reason=${reason}`);
+      } else if (msg.type === 'final_output' && ds.worker === worker) {
+        reportUndeliveredFinal(msg, reason);
       } else {
         logger.debug(`[${t}] Scoped event rejected: ${msg.type} ${reason}`);
       }

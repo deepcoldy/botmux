@@ -2423,6 +2423,7 @@ export const messages: Record<string, string> = {
   'worker.interrupt_recovery_zmx': '请在本机运行 botmux list，进入该 ZMX 会话检查并手动中断；如果状态仍不确定，请用 /restart 重启会话。',
   'worker.interrupt_recovery_web': '请重试，或打开 Web 终端后手动中断。',
   'worker.skill_delivery_failed': '⚠️ 当前 bot 的 Skill delivery 配置阻止了新会话启动：{reason}\n请把 skills.delivery 改为 auto/prompt，或改用支持 native skill delivery 的 CLI 后再重试。',
+  'worker.final_output_undelivered': '⚠️ 这一轮的回复没能发到群里：无法确认它属于当前会话运行时（运行时可能刚切换）。请在网页终端查看完整输出，或重新发送消息。',
   'worker.coco_session_dir_gone': '⚠️ 当前 CoCo 进程的会话目录已被删除（可能是 e2e 测试清理或手动 rm），写到 events.jsonl 的内容会落到一个失效 inode 上，桥接读不到。请重启 CoCo 后重新 /adopt。',
   'worker.cli_flag_needs_upgrade': '⚠️ 本机 {cliName} 是 {version}，低于 {minVersion}，不支持启动参数 {flag}，这次启动已经去掉了它（旧版本没有 hooks 信任确认这一步，启动不受影响）。建议升级到 {minVersion} 或更新的版本；PATH 上装了多份时，请确认 bot 实际用的是哪一份（`which -a traex traecli`）。',
   'worker.cli_rejected_argument': '⚠️ {cliName} 启动失败：它不认识启动参数 {flag}（unexpected argument），一般是 CLI 版本太旧。请把 {cliName} 升级到最新版；PATH 上装了多份时，请确认 bot 用的是新版（`which -a traex traecli`）。',

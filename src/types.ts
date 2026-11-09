@@ -2452,7 +2452,10 @@ export type WorkerToDaemonBase =
   | ({ type: 'codex_cli_effort_result'; requestId: string } & CodexAppEffortResult)
   | { type: 'runtime_binding_started'; bindingId: string; operationId?: string }
   | { type: 'runtime_binding_aborted'; bindingId: string; operationId?: string }
-  | { type: 'runtime_binding'; bindingId: string; identity: import('./services/session-contract.js').RuntimeIdentity; operationId?: string }
+  | { type: 'runtime_binding'; bindingId: string; identity: import('./services/session-contract.js').RuntimeIdentity; operationId?: string;
+      /** The same live CLI moved here from this binding (launcher PID
+       *  resolved, native session rotated); its in-flight turns continue. */
+      continuesBindingId?: string }
   | { type: 'worker_ipc_ready' }
   | ({ type: 'link_ref_register'; requestId: string } & import('./core/link-ref-ipc.js').McpLinkRefRegistrationRequest)
   | ({ type: 'link_ref_resolve'; requestId: string } & import('./core/link-ref-ipc.js').McpHostDeliveryLinkRefRequest)
