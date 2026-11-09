@@ -5,7 +5,7 @@ import { feedbackExtensionId } from './feedback-extension-id.js';
 type Slot = 'answerReference' | 'feedbackButtons' | 'feedbackDetails' | 'actionButtons' | 'status';
 export interface FeedbackTemplate {
   id: string; version: number; title: string; theme: string; density: 'compact' | 'comfortable';
-  elements: Array<{ slot: Slot; layout?: 'horizontal' | 'vertical' } | { tag: 'markdown'; content: string; slot?: never }>;
+  elements: Array<{ slot: Slot; layout?: 'horizontal' | 'vertical'; content?: string } | { tag: 'markdown'; content: string; slot?: never }>;
 }
 const slots: Slot[] = ['answerReference', 'feedbackButtons', 'feedbackDetails', 'actionButtons', 'status'];
 
@@ -25,14 +25,19 @@ export function validateFeedbackTemplate(input: unknown): FeedbackTemplate {
     if (!element || typeof element !== 'object') throw new Error('feedback_template_element_invalid');
     if (element.slot) {
       if (!slots.includes(element.slot) || seen.has(element.slot)
-        || Object.keys(element).some(key => !['slot', 'layout'].includes(key))
+        || Object.keys(element).some(key => !['slot', 'layout', 'content'].includes(key))
         || (element.layout !== undefined && !['horizontal', 'vertical'].includes(element.layout))) throw new Error('feedback_template_slot_invalid');
       seen.add(element.slot);
+      if (element.content !== undefined && (element.slot !== 'answerReference' || typeof element.content !== 'string'
+        || element.content.length > 4000 || /<at[\s>]|!\[/.test(element.content)
+        || /\{[^{}]*\}/.test(element.content.replace(/\{round\}|\{answerUrl\}/g, '')))) {
+        throw new Error('feedback_template_reference_invalid');
+      }
     } else if (!('tag' in element) || element.tag !== 'markdown' || typeof element.content !== 'string'
       || element.content.length > 4000 || /<at[\s>]|!\[/.test(element.content)
       || Object.keys(element).some(key => !['tag', 'content'].includes(key))) throw new Error('feedback_template_element_invalid');
   }
-  if (slots.filter(slot => slot !== 'actionButtons').some(slot => !seen.has(slot))) throw new Error('feedback_template_slot_missing');
+  if (slots.filter(slot => slot !== 'actionButtons' && slot !== 'answerReference').some(slot => !seen.has(slot))) throw new Error('feedback_template_slot_missing');
   if (Buffer.byteLength(JSON.stringify(raw)) > 20000) throw new Error('feedback_template_card_too_large');
   return structuredClone(raw);
 }
@@ -56,7 +61,12 @@ export function buildFeedbackSurface(input: {
   const elements: Record<string, unknown>[] = [];
   for (const element of template.elements) {
     if (!element.slot) { elements.push({ tag: 'markdown', content: element.content }); continue; }
-    if (element.slot === 'answerReference') elements.push({ tag: 'markdown', content: `第 ${input.round} 轮 · [答复](${url.href.replace(/[()]/g, value => encodeURIComponent(value))})` });
+    if (element.slot === 'answerReference') {
+      const content = element.content === undefined ? '第 {round} 轮 · [答复]({answerUrl})' : element.content;
+      const rendered = content.replace(/\{round\}|\{answerUrl\}/g, placeholder => placeholder === '{round}'
+        ? String(input.round) : url.href.replace(/\(/g, '%28').replace(/\)/g, '%29'));
+      if (rendered.trim()) elements.push({ tag: 'markdown', content: rendered });
+    }
     if (element.slot === 'feedbackButtons') {
       const buttons = structuredClone(details[0]);
       if (element.layout === 'vertical') {

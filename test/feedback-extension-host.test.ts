@@ -72,6 +72,43 @@ async function fixture() {
 }
 
 describe('feedback extension host callback', () => {
+  it('blocks a surface prepared before its counting scope changes at the transport boundary', async () => {
+    const data = await fixture();
+    const initial = await readFeedbackExtensionConfig(data.directory);
+    await saveFeedbackExtensionConfig(data.directory, initial.version, {
+      ...initial, presentations: { app: { default: { enabled: true, rounds: [1], roundScope: 'subject' }, rules: [] } },
+    }, 'admin');
+    data.extensions.activate('app', '2020-01-01T00:00:00Z');
+    data.source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'turn', status: 'completed' });
+    mock.threadId.mockResolvedValue('thread');
+    mock.detail.mockResolvedValue({ items: [{ chat_id: 'chat' }] });
+    mock.mode.mockResolvedValue('topic');
+    let sent = 0;
+    mock.reply.mockImplementation(async (...args: any[]) => {
+      await args[7].beforeWrite();
+      sent++;
+      return 'first-surface';
+    });
+    await tickFeedbackExtensions(data.directory, 'app');
+    expect(sent).toBe(1);
+    data.extensions.bindSubject('app', 'session', 'second', { sourceMessageId: 'followup-question', answerKind: 'substantive' });
+    data.source.recordTurnDelivery({ botAppId: 'app', sessionId: 'session', turnId: 'second', platform: 'lark',
+      platformAppId: 'app', platformMessageId: 'second-answer', chatId: 'chat', topicRootId: 'question',
+      content: 'second answer', status: 'delivered', cardMode: 'feedback', policy: data.policy });
+    data.source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'second', status: 'completed' });
+    mock.reply.mockImplementation(async (...args: any[]) => {
+      const current = await readFeedbackExtensionConfig(data.directory);
+      await saveFeedbackExtensionConfig(data.directory, current.version, {
+        ...current, presentations: { app: { default: { enabled: true, rounds: [1], roundScope: 'topic' }, rules: [] } },
+      }, 'admin');
+      await args[7].beforeWrite();
+      sent++;
+      return 'stale-surface';
+    });
+    await tickFeedbackExtensions(data.directory, 'app');
+    expect(sent).toBe(1);
+    expect(data.extensions.jobsForApp('app').find(job => job.payload.answerMessageId === 'second-answer')?.status).toBe('blocked');
+  });
   it('keeps a newer revision queued until a timed-out old patch actually finishes', async () => {
     const data = await fixture();
     vi.useFakeTimers();

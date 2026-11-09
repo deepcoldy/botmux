@@ -12,6 +12,56 @@ import { buildFeedbackElement } from '../src/im/lark/skill-feedback-card.js';
 import { recordRelayedTurnDelivery } from '../src/core/relayed-turn-delivery.js';
 
 describe('feedback surface event reconciliation', () => {
+  it.each([false, true])('does not block independent subjects behind an unfinished answer (ordinary=%s)', async ordinary => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-independent-subject-'));
+    const source = await SkillFeedbackStore.open(directory);
+    const extensions = await FeedbackExtensionStore.open(directory);
+    try {
+      for (const [turnId, sourceMessageId] of [['unfinished', 'question-a'], ['completed', 'question-b']]) {
+        extensions.bindSubject('app', 'session', turnId, { sourceMessageId, answerKind: 'substantive' });
+        source.recordTurnDelivery({ botAppId: 'app', sessionId: 'session', turnId, platform: 'lark',
+          platformAppId: 'app', platformMessageId: turnId, chatId: 'chat', topicRootId: ordinary ? 'chat' : 'topic',
+          content: 'answer', cardMode: 'feedback', status: 'delivered', policy: normalizeFeedbackPolicy({ enabled: true }) });
+      }
+      source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'completed', status: 'completed' });
+      const subjects: string[] = [];
+      await reconcileFeedbackSurfaces({ appId: 'app', sourceKey: 'source', source, extensions, now: Date.now,
+        send: async subject => { subjects.push(subject); return 'surface'; }, answerUrl: () => 'https://example.com',
+        removeInline: async () => {},
+        config: { version: 1, hostId: 'host', templates: [defaultFeedbackTemplate()], hooks: [], actions: [],
+          presentations: { app: normalizeFeedbackPresentation({ default: { enabled: true, rounds: [1],
+            ...(ordinary ? { roundScope: 'topic' } : {}) } }) } } });
+      expect(subjects).toEqual(['question-b']);
+    } finally { extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+  it('uses each answer rule counting scope when a question overrides its topic default', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-mixed-scope-'));
+    const source = await SkillFeedbackStore.open(directory);
+    const extensions = await FeedbackExtensionStore.open(directory);
+    const policy = normalizeFeedbackPolicy({ enabled: true });
+    try {
+      for (const [turnId, sourceMessageId] of [['first', 'question'], ['second', 'followup-question']]) {
+        extensions.bindSubject('app', 'session', turnId, { sourceMessageId, answerKind: 'substantive' });
+        source.recordTurnDelivery({ botAppId: 'app', sessionId: 'session', turnId, platform: 'lark',
+          platformAppId: 'app', platformMessageId: turnId, chatId: 'chat', topicRootId: 'question',
+          content: 'answer', cardMode: 'feedback', status: 'delivered', policy });
+        source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId, status: 'completed' });
+      }
+      let sends = 0;
+        const dependencies = { appId: 'app', sourceKey: 'source', source, extensions, now: Date.now,
+        send: async () => `surface-${++sends}`, answerUrl: () => 'https://example.com/answer', removeInline: async () => {},
+        config: { version: 1, hostId: 'host', templates: [defaultFeedbackTemplate()], hooks: [], actions: [],
+          presentations: { app: normalizeFeedbackPresentation({ default: { enabled: true, rounds: [1, 2], roundScope: 'topic' },
+            rules: [{ id: 'question', match: { chatId: 'chat', sourceMessageId: 'followup-question' }, roundScope: 'subject' }] }) } },
+      };
+      await reconcileFeedbackSurfaces(dependencies);
+      await reconcileFeedbackSurfaces(dependencies);
+      expect(sends).toBe(2);
+      expect(extensions.surface('app', 'surface-2')).toMatchObject({
+        answerMessageId: 'second', subjectId: 'followup-question', round: 1,
+      });
+    } finally { extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
   it('marks both presentation surfaces dirty when a feedback revision is persisted', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'feedback-both-'));
     const source = await SkillFeedbackStore.open(directory);
@@ -173,28 +223,44 @@ describe('feedback surface event reconciliation', () => {
       expect(extensions.cursor('source:app')).toBeGreaterThan(0);
     } finally { extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
   });
-  it('produces one separate feedback surface for the configured round and binds it to the answer', async () => {
+  it.each(['subject', 'topic'] as const)('counts %s scope across followup bindings and keeps topics and chats isolated', async roundScope => {
     const directory = mkdtempSync(join(tmpdir(), 'feedback-runtime-'));
     const source = await SkillFeedbackStore.open(directory);
-    const extensions = await FeedbackExtensionStore.open(directory);
+    let extensions = await FeedbackExtensionStore.open(directory);
     const policy = normalizeFeedbackPolicy({ enabled: true })!;
     const config = { version: 1, hostId: 'host', templates: [defaultFeedbackTemplate()], hooks: [], actions: [],
-      presentations: { app: normalizeFeedbackPresentation({ default: { enabled: true, rounds: [1], templateId: 'default', mode: 'separate' } }) } };
+      presentations: { app: normalizeFeedbackPresentation({ default: { enabled: false }, rules: [{
+        id: 'target', match: { chatId: 'chat' }, enabled: true, rounds: [1], roundScope, templateId: 'default', mode: 'separate',
+      }] }) } };
     let sends = 0;
     const dependencies = { appId: 'app', sourceKey: 'source', source, extensions, config,
-      send: async () => { sends++; return 'surface'; }, answerUrl: () => 'https://example.com/answer',
+      send: async () => `surface-${++sends}`, answerUrl: () => 'https://example.com/answer',
       removeInline: async () => {}, now: () => 1000 };
     try {
-      for (const turn of ['one', 'two']) {
+      for (const [turn, chatId, topicRootId] of [
+        ['clarify', 'chat', 'question'], ['one', 'chat', 'question'], ['two', 'chat', 'question'],
+        ['new-topic', 'chat', 'another-question'], ['other-chat', 'elsewhere', 'other-question'],
+      ]) {
+        extensions.bindSubject('app', 'session', turn, {
+          sourceMessageId: turn === 'two' ? 'followup-question' : topicRootId,
+          answerKind: turn === 'clarify' ? 'clarification' : 'substantive',
+        });
         source.recordTurnDelivery({ botAppId: 'app', sessionId: 'session', turnId: turn, platform: 'lark', platformAppId: 'app',
-          chatId: 'chat', topicRootId: 'question', platformMessageId: turn, content: 'answer', status: 'delivered', cardMode: 'feedback', policy,
+          chatId, topicRootId, platformMessageId: turn, content: 'answer', status: 'delivered', cardMode: 'feedback', policy,
           baseCard: { schema: '2.0', body: { elements: [buildFeedbackElement(policy)] } } });
         source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: turn, status: 'completed' });
       }
-      await reconcileFeedbackSurfaces(dependencies);
-      await reconcileFeedbackSurfaces(dependencies);
-      expect(sends).toBe(1);
-      expect(extensions.surface('app', 'surface')).toMatchObject({ answerMessageId: 'one', subjectId: 'question', round: 1 });
+      for (let iteration = 0; iteration < 4; iteration++) await reconcileFeedbackSurfaces(dependencies);
+      expect(sends).toBe(roundScope === 'topic' ? 2 : 3);
+      expect(extensions.surface('app', 'surface-1')).toMatchObject({ answerMessageId: 'one', subjectId: 'question', round: 1 });
+      expect(extensions.surface('app', roundScope === 'topic' ? 'surface-2' : 'surface-3')).toMatchObject({
+        answerMessageId: 'new-topic', subjectId: 'another-question', round: 1,
+      });
+      extensions.close();
+      extensions = await FeedbackExtensionStore.open(directory);
+      const reopened = { ...dependencies, extensions };
+      await Promise.all([reconcileFeedbackSurfaces(reopened), reconcileFeedbackSurfaces(reopened)]);
+      expect(sends).toBe(roundScope === 'topic' ? 2 : 3);
     } finally { extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
   });
 });

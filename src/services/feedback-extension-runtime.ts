@@ -14,7 +14,8 @@ export async function reconcileFeedbackSurfaces(input: {
   appId: string; sourceKey: string; source: CompatibleFeedbackStore; extensions: FeedbackExtensionStore;
   config: FeedbackExtensionConfig; now: () => number;
   startedAt?: string;
-  send: (subjectId: string, card: Record<string, unknown>, operationId: string, chatId: string, round: number) => Promise<string>;
+  send: (subjectId: string, card: Record<string, unknown>, operationId: string, chatId: string, round: number,
+    roundScope: 'subject' | 'topic', topicId: string) => Promise<string>;
   answerUrl: (messageId: string, chatId: string) => string | Promise<string>;
   removeInline: (messageId: string, signal?: AbortSignal) => Promise<void>;
   refreshBudget?: FeedbackRefreshBudget;
@@ -63,23 +64,38 @@ export async function reconcileFeedbackSurfaces(input: {
       const presentation = input.config.presentations[input.appId];
       if (eventDelivery?.chatId && eventDelivery.topicRootId && presentation) {
         const sourceDeliveries = await source.listSubjectDeliveries(input.appId, eventDelivery.chatId, eventDelivery.topicRootId);
-        const sourceBinding = extensions.subject(input.appId, eventDelivery.sessionId ?? '', eventDelivery.turnId ?? '');
-        const subjectId = sourceBinding?.sourceMessageId ?? eventDelivery.topicRootId;
-        if (subjectId === eventDelivery.chatId) {
-          entries.push({ sequence: entry.sequence, eventId: event.eventId, jobs });
-          continue;
-        }
-        const groups = feedbackAnswerGroups(sourceDeliveries.filter(delivery => {
+        const substantiveDeliveries = sourceDeliveries.filter(delivery => {
           const binding = extensions.subject(input.appId, delivery.sessionId ?? '', delivery.turnId ?? '');
-          return (binding?.sourceMessageId ?? delivery.topicRootId) === subjectId && (!binding || binding.answerKind === 'substantive');
-        }));
+          return !binding || binding.answerKind === 'substantive';
+        });
+        const topicGroups = feedbackAnswerGroups(substantiveDeliveries);
+        const subjectGroups = new Map<string, ReturnType<typeof feedbackAnswerGroups>>();
+        for (const delivery of substantiveDeliveries) {
+          const binding = extensions.subject(input.appId, delivery.sessionId ?? '', delivery.turnId ?? '');
+          const subject = binding?.sourceMessageId ?? delivery.topicRootId;
+          if (subject && !subjectGroups.has(subject)) {
+            subjectGroups.set(subject, feedbackAnswerGroups(substantiveDeliveries.filter(candidate => {
+              const candidateBinding = extensions.subject(input.appId, candidate.sessionId ?? '', candidate.turnId ?? '');
+              return (candidateBinding?.sourceMessageId ?? candidate.topicRootId) === subject;
+            })));
+          }
+        }
+        const groups = [...new Map([...topicGroups, ...[...subjectGroups.values()].flat()].map(group => [group.id, group])).values()];
         for (const group of groups) {
           try {
-          const { delivery, id: answerId, round } = group;
+          const { delivery, id: answerId } = group;
           if (!delivery.policy || !delivery.chatId || !delivery.topicRootId
             || (input.startedAt && delivery.createdAt < input.startedAt)) continue;
+          const deliveryBinding = extensions.subject(input.appId, delivery.sessionId ?? '', delivery.turnId ?? '');
+          const answerSubjectId = deliveryBinding?.sourceMessageId ?? delivery.topicRootId;
+          if (answerSubjectId === delivery.chatId) continue;
+          const topicRounds = resolveFeedbackPresentation(presentation, { botAppId: input.appId,
+            chatId: delivery.chatId, sourceMessageId: answerSubjectId, round: 1 }).roundScope === 'topic'
+            && delivery.topicRootId !== delivery.chatId;
+          const round = (topicRounds ? topicGroups : subjectGroups.get(answerSubjectId))?.find(candidate => candidate.id === answerId)?.round;
+          if (round === undefined) continue;
           const rule = resolveFeedbackPresentation(presentation, { botAppId: input.appId, chatId: delivery.chatId,
-            sourceMessageId: subjectId, round });
+            sourceMessageId: answerSubjectId, round });
           const layers = [['default', presentation.default] as const,
             ...presentation.rules.filter(item => rule.ruleIds.includes(item.id)).map(item => [item.id, item] as const)];
           const effectiveAt = layers.map(([key, value]) => input.config.ruleEffectiveAt?.[JSON.stringify([
@@ -95,8 +111,9 @@ export async function reconcileFeedbackSurfaces(input: {
             const card = buildFeedbackSurface({ template, policy: delivery.policy, round,
               answerUrl, preview: false, actions });
             jobs.push({ id: identity(['surface', answerId]), kind: 'surface', payload: {
-              appId: input.appId, subjectId, topicId: delivery.topicRootId, chatId: delivery.chatId, answerId,
+              appId: input.appId, subjectId: answerSubjectId, topicId: delivery.topicRootId, chatId: delivery.chatId, answerId,
               deliveryId: delivery.deliveryId, answerMessageId: delivery.platformMessageId, messageIds: group.messageIds, round, card, actions,
+              roundScope: topicRounds ? 'topic' : 'subject',
               mode: rule.mode, templateId: template.id, template, answerUrl,
             } });
           }
@@ -126,20 +143,26 @@ export async function reconcileFeedbackSurfaces(input: {
     return;
   }
   const current = input.config.presentations[input.appId];
-  if (!current || !resolveFeedbackPresentation(current, {
+  const effective = current && resolveFeedbackPresentation(current, {
     botAppId: input.appId, chatId: String(job.payload.chatId), sourceMessageId: payload.subjectId, round: Number(job.payload.round),
-  }).matched) {
+  });
+  const preparedScope = job.payload.roundScope === 'topic' ? 'topic' : 'subject';
+  const currentScope = effective?.roundScope === 'topic' && job.payload.topicId !== job.payload.chatId ? 'topic' : 'subject';
+  if (!effective?.matched || preparedScope !== currentScope) {
     extensions.settle(job.id, job.token!, 'blocked', { reason: 'presentation_disabled' }, input.now());
     return;
   }
   try {
-    const messageId = await input.send(payload.subjectId, payload.card, job.id.slice(0, 32), String(job.payload.chatId), Number(job.payload.round));
+    const messageId = await input.send(payload.subjectId, payload.card, job.id.slice(0, 32), String(job.payload.chatId),
+      Number(job.payload.round), preparedScope, String(job.payload.topicId ?? job.payload.chatId));
     if (!extensions.completeSurface(job.id, job.token!, messageId, input.now())) return;
     if (payload.mode === 'separate') {
       await refreshFeedbackMessage({ store: extensions, appId: input.appId, messageId: payload.answerMessageId,
         kind: 'cleanup', budget: refreshBudget, run: signal => input.removeInline(payload.answerMessageId, signal) });
     }
-  } catch {
-    extensions.settle(job.id, job.token!, 'unknown', { reason: 'surface_delivery_unknown' }, input.now());
+  } catch (error) {
+    const staleScope = error instanceof Error && error.message === 'feedback_presentation_scope_changed';
+    extensions.settle(job.id, job.token!, staleScope ? 'blocked' : 'unknown',
+      { reason: staleScope ? 'presentation_scope_changed' : 'surface_delivery_unknown' }, input.now());
   }
 }

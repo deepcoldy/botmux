@@ -13,6 +13,7 @@ import { authorizeFeedbackExtensionChange, handleFeedbackExtensionApi } from '..
 import { readFeedbackExtensionConfig, saveFeedbackExtensionConfig } from '../src/services/feedback-extension-config.js';
 import { FeedbackExtensionStore } from '../src/services/feedback-extension-store.js';
 import { stampBotmuxCallbackMarkers } from '../src/im/lark/callback-button-marker.js';
+import { defaultFeedbackTemplate } from '../src/services/feedback-template.js';
 
 async function call(dataDir: string, path: string, body: unknown, hostAdmin = false) {
   const request = Readable.from([JSON.stringify(body)]) as any;
@@ -26,6 +27,25 @@ async function call(dataDir: string, path: string, body: unknown, hostAdmin = fa
 }
 
 describe('feedback extension API permissions', () => {
+  it('saves custom reference text and topic scope and previews their persisted configuration', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'feedback-api-custom-'));
+    try {
+      const initial = await readFeedbackExtensionConfig(directory);
+      const template = defaultFeedbackTemplate();
+      template.elements = template.elements.map(element => element.slot === 'answerReference'
+        ? { ...element, content: 'Reply {round}: {answerUrl}' } : element);
+      const saved = await call(directory, 'presentation', { appId: 'app', expectedVersion: initial.version,
+        templates: [template], presentation: { default: { enabled: true, rounds: [1], roundScope: 'topic' }, rules: [] } });
+      expect(saved.status).toBe(200);
+      const loaded = await readFeedbackExtensionConfig(directory);
+      expect(loaded.presentations.app.default.roundScope).toBe('topic');
+      const preview = await call(directory, 'preview', { appId: 'app', chatId: 'chat', round: 1 });
+      expect(preview.status).toBe(200);
+      expect(preview.result.card.body.elements[0].content).toBe('Reply 1: https://example.com/answer');
+      expect(preview.result.presentation.roundScope).toBe('topic');
+      expect(loaded.hooks).toEqual(initial.hooks);
+    } finally { await rm(directory, { recursive: true, force: true }); }
+  });
   it('only reconciles a surface after verifying sender, scope and stamped card content', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'feedback-receipt-api-'));
     const store = await FeedbackExtensionStore.open(directory);

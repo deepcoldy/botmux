@@ -24,7 +24,7 @@ function identifier(value: unknown, path: string): string {
 
 function layer(value: unknown, path: string): FeedbackPresentationLayer {
   const raw = record(value, path);
-  fields(raw, ['enabled', 'rounds', 'mode', 'templateId', 'actionIds'], path);
+  fields(raw, ['enabled', 'rounds', 'roundScope', 'mode', 'templateId', 'actionIds'], path);
   const result: FeedbackPresentationLayer = {};
   if (raw.enabled !== undefined) {
     if (typeof raw.enabled !== 'boolean') throw new Error(`${path}.enabled: expected boolean`);
@@ -40,6 +40,10 @@ function layer(value: unknown, path: string): FeedbackPresentationLayer {
   if (raw.mode !== undefined) {
     if (raw.mode !== 'separate' && raw.mode !== 'inline' && raw.mode !== 'both') throw new Error(`${path}.mode: invalid mode`);
     result.mode = raw.mode;
+  }
+  if (raw.roundScope !== undefined) {
+    if (raw.roundScope !== 'subject' && raw.roundScope !== 'topic') throw new Error(`${path}.roundScope: invalid scope`);
+    result.roundScope = raw.roundScope;
   }
   if (raw.templateId !== undefined) result.templateId = identifier(raw.templateId, `${path}.templateId`);
   if (raw.actionIds !== undefined) {
@@ -88,6 +92,7 @@ export function resolveFeedbackPresentation(config: FeedbackPresentationConfig, 
   return {
     enabled: merged.enabled, rounds: [...merged.rounds], mode: merged.mode,
     templateId: merged.templateId, actionIds: [...merged.actionIds],
+    ...(merged.roundScope === undefined ? {} : { roundScope: merged.roundScope }),
     matched: merged.enabled && merged.rounds.includes(scope.round), ruleIds: matching.map(rule => rule.id),
   };
 }

@@ -73,11 +73,14 @@ export async function tickFeedbackExtensions(dataDir: string, appId: string): Pr
     await reconcileFeedbackSurfaces({
       appId, source, extensions, config, now: Date.now, startedAt, refreshBudget,
       sourceKey: `${storageConfig.instanceId}:${storageConfig.generation}`,
-      send: async (subjectId, card, operationId, chatId, round) => {
+      send: async (subjectId, card, operationId, chatId, round, roundScope, topicId) => {
         const beforeWrite = async () => {
           const current = await readFeedbackExtensionConfig(dataDir);
           const bot = getBot(appId).config;
           const presentation = current.presentations[appId] ?? bot.feedbackPresentation;
+          const effective = presentation && resolveFeedbackPresentation(presentation, { botAppId: appId, chatId, sourceMessageId: subjectId, round });
+          const currentScope = effective?.roundScope === 'topic' && topicId !== chatId ? 'topic' : 'subject';
+          if (currentScope !== roundScope) throw new Error('feedback_presentation_scope_changed');
           if (!presentation || !resolveFeedbackPresentation(presentation, { botAppId: appId, chatId, sourceMessageId: subjectId, round }).matched
             || !resolveFeedbackPolicyForDelivery({ dataDir, larkAppId: appId, chatId, bot })) throw new Error('feedback_presentation_disabled');
         };
