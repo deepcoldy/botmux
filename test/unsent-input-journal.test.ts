@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import {
   UNSENT_INPUT_MAX_AGE_MS,
+  appendUnsentInputs,
   isUnsentInputReplayable,
   saveUnsentInputs,
   settleTakenUnsentInputs,
@@ -48,6 +49,31 @@ describe('unsent input journal', () => {
     saveUnsentInputs(path, [{ content: 'old', turnId: 'om_old' }], 0);
     expect(takeUnsentInputs(path, { nowMs: UNSENT_INPUT_MAX_AGE_MS + 1 })).toEqual({
       inputs: [], expired: [{ content: 'old', turnId: 'om_old' }], unconfirmed: [],
+    });
+  });
+
+  it('appending keeps what an earlier worker saved, first', () => {
+    const path = join(dir, 'f.unsent.json');
+    expect(appendUnsentInputs(path, [{ content: 'durable', dispatchAttempt: 1 }], 0)).toBe(0);
+    expect(existsSync(path)).toBe(false);
+    saveUnsentInputs(path, [{ content: 'first', turnId: 'om_1' }], 1_000);
+    expect(appendUnsentInputs(path, [], 2_000)).toBe(0);
+    expect(appendUnsentInputs(path, [{ content: 'second', turnId: 'om_2' }], 3_000)).toBe(1);
+    expect(takeUnsentInputs(path, { nowMs: 4_000 })).toEqual({
+      inputs: [{ content: 'first', turnId: 'om_1' }, { content: 'second', turnId: 'om_2' }], expired: [], unconfirmed: [],
+    });
+  });
+
+  it('each input ages from its own save: one appended behind a day-old input is still delivered, and only it is held as taken', () => {
+    const path = join(dir, 'g.unsent.json');
+    saveUnsentInputs(path, [{ content: 'old', turnId: 'om_old' }], 0);
+    appendUnsentInputs(path, [{ content: 'recent', turnId: 'om_recent' }], UNSENT_INPUT_MAX_AGE_MS + 1_000);
+    expect(takeUnsentInputs(path, { nowMs: UNSENT_INPUT_MAX_AGE_MS + 2_000 })).toEqual({
+      inputs: [{ content: 'recent', turnId: 'om_recent' }], expired: [{ content: 'old', turnId: 'om_old' }], unconfirmed: [],
+    });
+    // (taker died before writing it)
+    expect(takeUnsentInputs(path, { nowMs: UNSENT_INPUT_MAX_AGE_MS + 3_000 })).toEqual({
+      inputs: [], expired: [], unconfirmed: [{ content: 'recent', turnId: 'om_recent' }],
     });
   });
 

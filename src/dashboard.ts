@@ -390,7 +390,7 @@ import { readPlatformBinding } from './platform/binding.js';
 import { startPlatformTunnelClient, type PlatformBotInfo, type PlatformTeamSyncMessage } from './platform/tunnel-client.js';
 import { dashboardScheduleWriteHeaders } from './core/dashboard-schedule-creator.js';
 import { handleWorkflowInitiatorApi, workflowInitiatorPreGateDenial } from './dashboard/workflow-initiator-api.js';
-import { handleWorkflowDraftsApi, handleWorkflowOrchestratorBotsApi, workflowOrchestratorBotOptions } from './dashboard/workflow-drafts-api.js';
+import { handleWorkflowDraftsApi, handleWorkflowOrchestratorBotsApi, handleWorkflowProjectsApi, workflowOrchestratorBotOptions } from './dashboard/workflow-drafts-api.js';
 import { recentModelFailures } from './workflows/v3/draft-store.js';
 import { handleWorkflowLibraryApi } from './dashboard/workflow-library-api.js';
 import { applyPlatformTeamSync, getPlatformTeamSyncRev } from './services/platform-team-store.js';
@@ -6968,6 +6968,15 @@ const server = createServer(async (req, res) => {
       featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
       runsDir: v3RunsDir(),
       libraryDataDir: dirname(v3RunsDir()),
+      proxyToDaemon,
+    })) {
+      return;
+    }
+    // 「项目」 of 新建 / 运行模板 / 复制: read on the chosen bot's daemon.
+    if (await handleWorkflowProjectsApi(req, res, url, {
+      canManageHost: authed,
+      featureEnabled: () => isWorkflowFeatureEnabled() && workflowNodeExecutorMode() === 'bot',
+      runsDir: v3RunsDir(),
       proxyToDaemon,
     })) {
       return;

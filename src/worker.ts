@@ -2,6 +2,12 @@
 import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
 import { admitSessionCommand } from './services/session-command-gateway.js';
 import { contractTerminalStatus, type RuntimeIdentity } from './services/session-contract.js';
+import {
+  awaitRuntimeReservation,
+  RUNTIME_RESERVATION_DEADLINE_MS,
+  RUNTIME_RESERVATION_SLOW_LOG_MS,
+  RuntimeReservationExpiredError,
+} from './services/runtime-reservation.js';
 import { applyWorkerLaunchModel } from './core/worker-launch-model.js';
 import { readTraexEffortComposer, validateTraexTopicEffortRestart, type TraexTopicEffortRestart } from './utils/traex-session-effort.js';
 import { deploymentContinuationTemplate } from './services/deployment-continuation.js';
@@ -167,7 +173,7 @@ import {
   type CliRestartCause,
   type InterruptedWork,
 } from './services/restart-interruption.js';
-import { isUnsentInputReplayable, saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs } from './services/unsent-input-journal.js';
+import { appendUnsentInputs, isUnsentInputReplayable, saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs } from './services/unsent-input-journal.js';
 import { UniversalOutputHandoff } from './services/universal-output-handoff.js';
 import { WorkerOutputJournal } from './services/worker-output-journal.js';
 import { WorkerFinalOutputHandoff, canHandoffFinalOutput, FINAL_OUTPUT_HANDOFF_MAX_PENDING } from './services/final-output-handoff.js';
@@ -406,7 +412,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexGenerationSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexGenerationSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { codexConsumedRolloutEvents, codexEventsWithStableIds } from './services/codex-rollout-replay.js';
 import { PI_CREDENTIAL_ERROR_CODE, adoptPiTranscriptIntoBotmuxDir, piSessionUsesBotmuxDir } from './services/pi-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
@@ -414,7 +420,12 @@ import { readCodexModelSettingsCursor, spawnWithCodexModelLaunch, type CodexMode
 import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
 import { traexRejectedArgument } from './adapters/cli/traex-version.js';
-import { resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from './core/traex-leaf-pid.js';
+import { isTraexProcess, resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from './core/traex-leaf-pid.js';
+import {
+  readRunningExeIdentity,
+  resolveInstallIdentity,
+  type ExecutableIdentity,
+} from './services/cli-install-identity.js';
 import { pinWorkerTraeHome } from './services/traex-paths.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput } from './services/codex-user-input.js';
@@ -1779,7 +1790,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       if (first.outcome === 'accepted') {
         // Acknowledged (or rollout-evidenced) first turn on the fresh thread.
         // 'ambiguous' stays on the terminal fallback: dispatched is not accepted.
-        acknowledgeNativeInputConsumed(cfg.turnId, 'codex_rpc_turn_start', engine.activeThreadId, first.nativeTurnId);
+        acknowledgeNativeInputConsumed(cfg.turnId, 'codex_rpc_turn_start', engine.activeThreadId, first.nativeTurnId, cfg.dispatchAttempt);
       }
       // Fresh RPC delivery bypasses flushPending(), which is the normal owner
       // of this durable head-of-line gate. Claim it here only after the frame is
@@ -1994,6 +2005,9 @@ function bindSessionExecutionEvent<T extends (...args: any[]) => any>(callback: 
   select?: (args: Parameters<T>) => { turnId?: string; dispatchAttempt?: number; origin?: CapturedSessionOrigin }): T {
   return workerSessionEventScope ? workerSessionEventScope.bindExecutionEvent(callback, select) : callback;
 }
+function bindSessionPhysicalObservation<T extends (...args: any[]) => any>(callback: T): T {
+  return workerSessionEventScope ? workerSessionEventScope.bindLivePhysical(callback) : callback;
+}
 function bindSessionBackendExit<T extends (...args: any[]) => any>(callback: T): T {
   const observed = backend;
   return bindSessionRuntimeCallback(((...args: Parameters<T>) => {
@@ -2015,17 +2029,9 @@ function observeContractNativeSession(nativeSessionId: string): void {
   const scope = workerSessionEventScope;
   const active = scope?.currentBinding();
   if (!scope || !active || scope.contextBinding() !== active || !nativeSessionId) return;
-  const previous = active.identity?.nativeSessionId;
-  if (previous && previous !== nativeSessionId) {
-    const binding = scope.beginRuntime(active.operationId, active.physicalId);
-    binding.identity = { ...runtimeIdentityForContract(active), nativeSessionId };
-    scope.enterRuntime(binding);
-    send({ type: 'runtime_binding_started', bindingId: binding.bindingId });
-    send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity });
-  } else if (!previous) {
-    active.identity = { ...runtimeIdentityForContract(active), nativeSessionId };
-    send({ type: 'runtime_binding', bindingId: active.bindingId, identity: active.identity });
-  }
+  // The PID may have resolved from the launcher to the real CLI since the
+  // first binding. Check the full identity before enriching the native ID.
+  void publishRuntimeContract(active, nativeSessionId);
 }
 function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): WorkerToDaemon {
   if (!workerSessionEventScope) return msg;
@@ -2039,6 +2045,9 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   // Physical process proof is available before an opening attempt is bound.
   // Keep its frozen runtime, without claiming execution acceptance.
   if (msg.type === 'claude_exit' || msg.type === 'local_process_attestation') delete context.scope.execution;
+  // Queue observations span turns, including admissions not yet bound to the
+  // runtime. An unaccepted input must not invalidate its own backlog report.
+  if (msg.type === 'cli_input_backlog') delete context.scope.execution;
   return { ...msg, sessionContract: context };
 }
 function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdentity {
@@ -2067,22 +2076,32 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
   }
   return opaque();
 }
-async function publishRuntimeContract(binding: RuntimeEventBinding): Promise<void> {
+async function publishRuntimeContract(binding: RuntimeEventBinding, nativeSessionId?: string): Promise<void> {
   if (!workerSessionEventScope || workerSessionEventScope.currentBinding() !== binding) return;
-  const identity = runtimeIdentityForContract(binding);
+  const observed = runtimeIdentityForContract(binding);
+  const identity = nativeSessionId ? { ...observed, nativeSessionId } : observed;
   const previous = binding.identity;
+  // A buffered observation can arrive after the process disappears. Preserve
+  // its proven binding so the captured physical exit still stops the runtime.
+  if (previous && previous.proof !== 'opaque' && identity.proof === 'opaque') return;
+  let continuesBindingId: string | undefined;
   if (previous && previous.proof !== 'opaque' && (previous.backend !== identity.backend || previous.physicalId !== identity.physicalId
     || previous.proof !== identity.proof || (previous.nativeGeneration !== undefined && previous.nativeGeneration !== identity.nativeGeneration)
     || (previous.nativeSessionId !== undefined && previous.nativeSessionId !== identity.nativeSessionId))) {
     const scope = workerSessionEventScope;
+    continuesBindingId = binding.bindingId;
     binding = scope.beginRuntime(binding.operationId, binding.physicalId);
     scope.enterRuntime(binding);
     send({ type: 'runtime_binding_started', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
   }
   binding.identity = identity;
-  send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
+  send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity,
+    ...(continuesBindingId ? { continuesBindingId } : {}), ...(binding.operationId ? { operationId: binding.operationId } : {}) });
 }
 let cliSpawnGeneration = 0;
+/** What the TRAE install entry resolved to right before the spawn of
+ *  `generation`. Published only while that spawn is still the current one. */
+let traexInstallAtSpawn: { generation: number; identity: ExecutableIdentity | undefined } | undefined;
 
 class CliSpawnSupersededError extends Error {
   constructor() {
@@ -7494,6 +7513,37 @@ function failCodexAppControlGeneration(reason: string): void {
   });
 }
 
+function restoreCodexAppContractNativeSession(): void {
+  const scope = workerSessionEventScope;
+  const previous = scope?.currentBinding();
+  if (!scope || !previous || previous.identity?.proof !== 'process_start'
+      || previous.identity.nativeSessionId || !codexAppControlProven
+      || !codexAppRecoveredDispatches.some(entry => entry.state === 'prepared')
+      || !lastInitConfig) return;
+  // The original thread marker may already be ACKed. A resume argument is not
+  // live ownership proof: use the authenticated runner's uniquely attested
+  // app-server and its sole open rollout instead.
+  const observedBackend = backend;
+  const backendPid = observedBackend?.getChildPid?.() ?? undefined;
+  const backendStart = backendPid ? readProcessStartIdentity(backendPid) : undefined;
+  if (!backendStart) return;
+  const processIdentity = captureAttachedCodexAppProcessIdentity(
+    backendPid, lastInitConfig.sessionId, process.execPath,
+  );
+  if (!processIdentity) return;
+  const rollouts = findCodexRolloutSetByPid(processIdentity.enginePid);
+  const observed = rollouts?.size === 1 ? findCodexRolloutByPid(processIdentity.enginePid) : undefined;
+  if (!observed || !rollouts!.has(observed.cliSessionId.toLowerCase())
+      || readProcessStartIdentity(processIdentity.enginePid) !== processIdentity.engineProcStart
+      || backend !== observedBackend || backend?.getChildPid?.() !== backendPid
+      || readProcessStartIdentity(backendPid!) !== backendStart
+      || scope.currentBinding() !== previous) return;
+  // Enrich the bare binding without moving attempts that may already belong
+  // to it. The host separately grants historical result observation for exact
+  // recovered executions of this proven surviving native session.
+  scope.run(previous, () => { void publishRuntimeContract(previous, observed.cliSessionId); });
+}
+
 function activateCodexAppControlConnection(
   connection: CodexAppControlConnection,
   identity: CodexAppControlIdentity,
@@ -7546,6 +7596,7 @@ function activateCodexAppControlConnection(
   const previous = codexAppControlActiveSocket;
   codexAppControlActiveSocket = connection.socket;
   if (previous && previous !== connection.socket) previous.destroy();
+  if (proofKind === 'warm reattach') restoreCodexAppContractNativeSession();
   cleanupCodexAppControlBootstrap();
   connection.socket.write(`${encodeCodexAppControlAccepted(
     cfg.sessionId,
@@ -7658,19 +7709,28 @@ async function handleCodexAppControlLine(
   // worker effects is single-flight by signed generation/sequence until the
   // replay window below is committed.
   if (finalResult.status === 'accepted') return;
-  const applyRecord = () => finalResult.status === 'not-final'
-      ? handleTrustedCodexAppMarker(
+  // The socket can outlive a semantic runtime rebind (launcher -> native CLI).
+  // Recover the submitted execution from the authenticated final's exact FIFO
+  // head, while retaining the socket callback's physical-backend boundary.
+  const applyRecord = bindSessionExecutionEvent(() => finalResult.status === 'not-final'
+      ? bindSessionPhysicalObservation(() => handleTrustedCodexAppMarker(
           record.kind,
           record.payload,
           { generation: identity.generation, seq: record.seq, socket: connection.socket,
             channelId: connection.channelId, epoch: connection.epoch },
-        )
+        ))()
       : handleTrustedCodexAppMarker(
           'final',
           finalResult.payload,
           { generation: identity.generation, seq: record.seq, socket: connection.socket,
             channelId: connection.channelId, epoch: connection.epoch },
-        );
+        ), () => {
+    if (finalResult.status === 'not-final' || !isCodexAppCliId(cfg.cliId)) return {};
+    const settlement = codexAppTurnDispatchQueue.settleFinal(finalResult.payload, false);
+    return settlement.ok
+      ? { turnId: settlement.turnId, dispatchAttempt: settlement.dispatchAttempt }
+      : {};
+  });
   let application = codexAppControlRecordApplicationGate.run(identity.generation, record.seq, applyRecord);
   let applied: boolean;
   for (;;) {
@@ -9221,13 +9281,15 @@ function failedBridgeFailureText(errorCode?: string, summary?: string): string {
     ? 'worker.empty_final_failed_invalid_request'
     : errorCode === CODEX_AUTH_ERROR_CODE
       ? 'worker.empty_final_failed_auth'
-      : errorCode === CODEX_CONNECTION_ERROR_CODE
-        ? 'worker.empty_final_failed_connection'
-        : errorCode === CODEX_UPSTREAM_ERROR_CODE || errorCode === CODEX_CAPACITY_ERROR_CODE
-          ? 'worker.empty_final_failed_upstream'
-          : errorCode === PI_CREDENTIAL_ERROR_CODE
-            ? 'worker.empty_final_failed_credential'
-            : 'worker.empty_final_failed';
+      : errorCode === CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE
+        ? 'worker.empty_final_failed_payload_too_large'
+        : errorCode === CODEX_CONNECTION_ERROR_CODE
+          ? 'worker.empty_final_failed_connection'
+          : errorCode === CODEX_UPSTREAM_ERROR_CODE || errorCode === CODEX_CAPACITY_ERROR_CODE
+            ? 'worker.empty_final_failed_upstream'
+            : errorCode === PI_CREDENTIAL_ERROR_CODE
+              ? 'worker.empty_final_failed_credential'
+              : 'worker.empty_final_failed';
   const failure = t(key, { cliName: cliName(), reason });
   return failure;
 }
@@ -9266,6 +9328,14 @@ function bridgeTurnJournalFilePath(): string | undefined {
  *  once empty, the taken journal is settled. */
 const restoredUnsentInputs = new Set<PendingCliInput>();
 
+/** Until init takes the previous worker's inputs back, the journal on disk is
+ *  still theirs: this worker may only add to it, not replace it. */
+let predecessorUnsentInputsTaken = false;
+
+/** Queued inputs this worker already appended there: a second save on the way
+ *  out (a fatal exit cut short by the parent's) adds only later arrivals. */
+const appendedUnsentInputs = new WeakSet<PendingCliInput>();
+
 /** Inputs accepted from the daemon but not yet written to the CLI when the
  *  daemon shut this worker down (services/unsent-input-journal). */
 function unsentInputJournalPath(): string | undefined {
@@ -9279,6 +9349,13 @@ function saveUnsentInputsForSuccessor(reason: string): void {
   const path = unsentInputJournalPath();
   if (!path || lastInitConfig?.adoptMode || isCodexAppCliId(lastInitConfig?.cliId)) return;
   try {
+    if (!predecessorUnsentInputsTaken) {
+      const unsaved = pendingMessages.filter(item => !appendedUnsentInputs.has(item));
+      const saved = appendUnsentInputs(path, unsaved);
+      for (const item of unsaved) appendedUnsentInputs.add(item);
+      if (saved > 0) log(`Saved ${saved} unwritten input(s) behind the previous worker's for this session's next worker (${reason})`);
+      return;
+    }
     const saved = saveUnsentInputs(path, pendingMessages);
     // Restored inputs not written yet are in that save; the rest are written.
     settleTakenUnsentInputs(path);
@@ -9307,6 +9384,7 @@ function takeUnsentInputsFromPredecessor(cfg: Extract<DaemonToWorker, { type: 'i
   if (!path || cfg.adoptMode || isCodexAppCliId(cfg.cliId)) return [];
   try {
     const { inputs, expired, unconfirmed } = takeUnsentInputs(path);
+    predecessorUnsentInputsTaken = true;
     for (const input of inputs) restoredUnsentInputs.add(input);
     if (inputs.length > 0) log(`Re-queued ${inputs.length} input(s) the previous worker never wrote to the CLI`);
     if (unconfirmed.length > 0) {
@@ -13038,7 +13116,7 @@ function maybeBindUnprovenCodexSession(): boolean {
   persistCliSessionId(pending.sessionId);
   // Now the exact owned history match writeInput would have reported.
   if (codexHistoryMatchProvesConsumption()) {
-    acknowledgeNativeInputConsumed(pending.turnId, 'codex_history_match', pending.sessionId);
+    acknowledgeNativeInputConsumed(pending.turnId, 'codex_history_match', pending.sessionId, undefined, pending.dispatchAttempt);
   }
   void syncFreshCodexNativeSessionTitle(pending.sessionId, codexRpcEngine);
   codexBridgeAttach(path, codexBridgeUsesSplitLiveAttach() ? 'split-live' : 'fresh-empty');
@@ -17933,6 +18011,9 @@ async function handleTrustedCodexAppMarker(
         codexAppUnprovenPromptDeferred = false;
         queueMicrotask(() => markPromptReady());
       }
+      // markPromptReady() returns early when the prompt was already ready
+      // before the reconnect, so re-drive input held by the signed barrier.
+      if (isPromptReady && hasPendingInputForFlush()) queueMicrotask(() => { void flushPending(); });
     }
     return true;
   }
@@ -17997,8 +18078,7 @@ async function handleTrustedCodexAppMarker(
     if (isSuperseded
         && (!isCodexAppCliId(lastInitConfig?.cliId)
           || finalContent !== ''
-          || payload.usage !== undefined
-          || !codexAppCompletionAwaitingFinal)) {
+          || payload.usage !== undefined)) {
       rejectCodexAppControlMarker('invalid steer_superseded final (content/usage/awaiting contract)');
       return false;
     }
@@ -18057,6 +18137,29 @@ async function handleTrustedCodexAppMarker(
           + `(steerable=${settlement.codexAppSteerable === true}, remaining=${settlement.remaining})`,
         );
         return false;
+      }
+      if (isSuperseded && !codexAppCompletionAwaitingFinal) {
+        // activity:completed can already be ACKed when a worker dies, leaving
+        // only its uncommitted final group to replay. Recover that boundary
+        // solely from the authenticated surviving generation and the exact
+        // daemon-frozen prepared prefix; locally queued work is insufficient.
+        const recovered = codexAppTurnDispatchQueue.recoveredPrefix();
+        const prepared = codexAppRecoveredDispatches.filter(entry => entry.state === 'prepared');
+        const recoverable = control && codexAppControlProven
+          && codexAppControlStateValue?.status === 'active'
+          && codexAppControlStateValue.identities.length === 1
+          && codexAppControlStateValue.identities[0].generation === control.generation
+          && recovered.length >= 2 && prepared.length >= 2
+          && recovered[0].handle === settlement.handle
+          && recovered.slice(0, 2).every((entry, index) =>
+            entry.dispatchId === prepared[index].dispatchId
+            && entry.turnId === prepared[index].turnId
+            && entry.dispatchAttempt === prepared[index].dispatchAttempt)
+          && prepared[0].codexAppSteerable === true;
+        if (!recoverable) {
+          rejectCodexAppControlMarker('steer_superseded final has no proven completion boundary');
+          return false;
+        }
       }
       // Liveness slot retirement + completion-awaiting clearing happen AFTER the
       // durable commit below (a persist/commit failure must not retire a slot or
@@ -18250,7 +18353,9 @@ async function handleTrustedCodexAppMarker(
         // and never publish ready — the group's real final is still to come. This
         // is "retire a logical slot", NOT "close the native completion gate".
         codexAppTurnLiveness.completeCurrent(completedAtMs);
-        // codexAppCompletionAwaitingFinal intentionally left true.
+        // Rehydrate only after the durable ACK, including warm replay where
+        // the old worker had already acknowledged activity:completed.
+        codexAppCompletionAwaitingFinal = true;
       } else {
         if (!codexAppCompletionAwaitingFinal) {
           // turn/start failures emit a final transaction without an app-server
@@ -20330,7 +20435,7 @@ function scheduleSubmitFailureNotify(
     switch (action.kind) {
       case 'suppress-confirmed':
         if (deferNativeCodexInputCommit(turnIdentity?.dispatchAttempt)) {
-          acknowledgeTurnInputCommitted(turnIdentity?.turnId);
+          acknowledgeTurnInputCommitted(turnIdentity?.turnId, turnIdentity?.dispatchAttempt);
         }
         queuePostSubmitNativeSessionTitle(turnIdentity?.nativeSessionTitle);
         if (cliSessionId) {
@@ -20348,7 +20453,7 @@ function scheduleSubmitFailureNotify(
         // immediate one; other CLIs' rechecks stay on the terminal fallback.
         if (settlement.ownershipProven === true && codexHistoryMatchProvesConsumption()) {
           acknowledgeNativeInputConsumed(turnIdentity?.turnId, 'codex_history_match',
-            cliSessionId ?? lastInitConfig?.cliSessionId);
+            cliSessionId ?? lastInitConfig?.cliSessionId, undefined, turnIdentity?.dispatchAttempt);
         }
         onConfirmed?.(cliSessionId);
         log(`Deferred recheck found submit in ${transcriptLabel} — suppressing warning. preview="${preview}"`);
@@ -20504,11 +20609,13 @@ function scheduleSubmitFailureNotify(
               ? 'worker.activation_submit_unconfirmed'
               : submitDiagnosis.reason === 'logged_out'
                 ? 'submitDiag.logged_out'
-                : submitDiagnosis.reason === 'interactive_menu'
-                  ? 'submitDiag.interactive_menu'
-                  : submitDiagnosis.reason === 'draft_parked'
-                    ? 'submitDiag.draft_parked'
-                    : 'worker.submit_unconfirmed',
+                : submitDiagnosis.reason === 'session_locked'
+                  ? 'submitDiag.session_locked'
+                  : submitDiagnosis.reason === 'interactive_menu'
+                    ? 'submitDiag.interactive_menu'
+                    : submitDiagnosis.reason === 'draft_parked'
+                      ? 'submitDiag.draft_parked'
+                      : 'worker.submit_unconfirmed',
           {
             cliName: cliName(),
             secs: Math.round(SUBMIT_DEFERRED_RECHECK_MS / 1000),
@@ -20849,6 +20956,10 @@ async function flushPending(): Promise<void> {
   if (cliRestartInProgress) return;
   if (initialInputOwnershipPending) return;
   if (shouldHoldCodexRunnerInput(codexRunnerFreshness)) return;
+  // Static type-ahead support and the terminal startup timeout cannot prove
+  // that a recovered runner has republished its signed engine identity. Keep
+  // input outside the runner until this connection's state is authenticated.
+  if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppRuntimeTypeAheadReady()) return;
   if (isFlushing) return;  // while loop in active flush will pick up new messages
   if (!backend || !cliAdapter) return;
   if (
@@ -21076,6 +21187,7 @@ async function flushPending(): Promise<void> {
       hasRunStartupCommands = true;
       await runInitialNativeRename();
     }
+    if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppRuntimeTypeAheadReady()) return;
     // Commands deferred behind a previous rename run before the latest pending
     // rename. Some passthroughs (/clear, /new) can rotate the native session;
     // applying the canonical title last keeps the resume-picker label aligned.
@@ -21161,6 +21273,8 @@ async function flushPending(): Promise<void> {
     }
     let holdDrainForPreferredReset = false;
     while (pendingMessages.length > 0 && backend && cliAdapter && !holdDrainForPreferredReset) {
+      // A prior awaited write may have crossed a control-socket reconnect.
+      if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppRuntimeTypeAheadReady()) break;
       // The first item passed the prompt/model gate before beginCliWriteCycle
       // deliberately cleared readiness. Rechecking that synthetic false here
       // would strand the very input admitted by this flush.
@@ -21572,7 +21686,8 @@ async function flushPending(): Promise<void> {
           // The app-server acknowledged turn/start for this exact input on
           // the engine's active thread, fenced to the current generation.
           acknowledgeNativeInputConsumed(item.turnId, 'codex_rpc_turn_start',
-            writeRpcEngine.activeThreadId ?? lastInitConfig?.cliSessionId, rpcNativeTurnId);
+            writeRpcEngine.activeThreadId ?? lastInitConfig?.cliSessionId, rpcNativeTurnId,
+            item.dispatchAttempt);
           // Only the ACKed, still-current generation may create bridge state.
           // While turn/start was pending, codexBridgeIngest left its cursor
           // untouched; marking now therefore still precedes replay of any
@@ -21868,7 +21983,7 @@ async function flushPending(): Promise<void> {
       // POSITIVELY owned line proves this pane consumed the input.
       if (result?.submitted === true && result.ownershipProven === true && codexHistoryMatchProvesConsumption()) {
         acknowledgeNativeInputConsumed(item.turnId, 'codex_history_match',
-          result.cliSessionId ?? lastInitConfig?.cliSessionId);
+          result.cliSessionId ?? lastInitConfig?.cliSessionId, undefined, item.dispatchAttempt);
       }
       if (lastInitConfig?.cliId === 'codex' && result?.submitted !== false) {
         const threadId = result?.cliSessionId
@@ -23099,6 +23214,8 @@ async function spawnCli(
     pluginGenerationPrepared?: boolean;
     exactResumeSessionId?: string;
     restartCause?: CliRestartCause;
+    /** First CLI start only; see SpawnOpts.retryPaneAgentStart. */
+    retryPaneAgentStart?: boolean;
     /** Linux scratch only: re-prepare around the existing COW view that killCli
      *  kept (preserveSandboxForRespawn) instead of retiring it. */
     reuseExistingScratchTree?: boolean;
@@ -23115,15 +23232,20 @@ async function spawnCli(
   const binding = workerSessionEventScope.beginRuntime(activeRestartAttemptId);
   if (execution) workerSessionEventScope.rememberExecution(execution, binding);
   return workerSessionEventScope.run(binding, async () => {
-    const reserved = new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => { pendingRuntimeReservations.delete(binding.bindingId); resolve(false); }, 15_000);
-      timer.unref?.();
-      pendingRuntimeReservations.set(binding.bindingId, mayStart => { clearTimeout(timer); pendingRuntimeReservations.delete(binding.bindingId); resolve(mayStart); });
-    });
+    const reserved = awaitRuntimeReservation(pendingRuntimeReservations, binding.bindingId, () => log(
+      `Runtime reservation ${binding.bindingId} unanswered after ${RUNTIME_RESERVATION_SLOW_LOG_MS / 1000}s; `
+      + `waiting for the daemon up to ${RUNTIME_RESERVATION_DEADLINE_MS / 1000}s`,
+    ));
     send({ type: 'runtime_binding_started', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
-    if (!await reserved || closeRequested || workerSessionEventScope?.currentBinding() !== binding) {
+    const outcome = await reserved;
+    const superseded = closeRequested || workerSessionEventScope?.currentBinding() !== binding;
+    if (outcome !== 'granted' || superseded) {
       workerSessionEventScope?.restoreAfterAbortedStart(binding, previousBinding);
       workerSessionEventScope?.reportAbortedStart(binding, () => send({ type: 'runtime_binding_aborted', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) }));
+      // Superseded means another lifecycle operation owns the next start. An
+      // unanswered start has no such owner, so it must fail where it is seen.
+      if (outcome === 'expired' && !superseded) throw new RuntimeReservationExpiredError();
+      if (outcome === 'refused') log(`Daemon refused runtime reservation ${binding.bindingId}; the lifecycle operation that owns the session takes over`);
       throw new CliSpawnSupersededError();
     }
     try { await spawnCliBody(cfg, opts); }
@@ -25724,6 +25846,7 @@ async function spawnCliBody(
     promptInjection: cfg.promptInjection,
     promptCacheTtl: cfg.promptCacheTtl,
     solo: cfg.solo,
+    leadOnly: cfg.leadOnly,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
     modelProviderBaseUrlOverride: codexProtectedProviderBridge
@@ -28032,6 +28155,9 @@ async function spawnCliBody(
       publish: send,
       spawn: () => {
         const backend = spawnBackend;
+        if (cfg.cliId === 'traex') {
+          traexInstallAtSpawn = { generation: cliSpawnGeneration, identity: resolveInstallIdentity(spawnCliBin) };
+        }
         backend.spawn(spawnBin, spawnArgs, {
           cwd: spawnCwd,
           cols: PTY_COLS,
@@ -28059,6 +28185,7 @@ async function spawnCliBody(
           model: cfg.model,
           modelBackendVariant: cfg.modelBackendVariant,
           reasoningEffort: cfg.reasoningEffort,
+          retryPaneAgentStart: opts.retryPaneAgentStart,
         });
       },
     });
@@ -28415,10 +28542,17 @@ async function spawnCliBody(
   lastSpawnCodexExecutable = codexFilterExecutable;
   const startTraexLauncherPidResolve = (launcherPid: number): void => {
     if (cfg.cliId !== 'traex' || !traexLauncherActive) return;
+    // Capture the spawn this resolve belongs to. A late timer from an older
+    // spawn must not rewire the replacement backend or attest its pid.
+    const generation = cliSpawnGeneration;
     scheduleTraexLeafPidResolve(launcherPid, {
       getBackend: () => backend,
       getChildPid: () => backend?.getChildPid?.(),
       applyRealPid: (realPid) => {
+        if (generation !== cliSpawnGeneration) {
+          log(`TRAE launcher: ignoring stale leaf pid ${realPid} from spawn ${generation} (current ${cliSpawnGeneration})`);
+          return;
+        }
         log(`TRAE launcher: resolved real traex leaf pid ${realPid} under launcher ${launcherPid}; rewiring ownership pid`);
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
@@ -33432,7 +33566,12 @@ function publishCliInputBacklog(): void {
 }
 
 function send(msg: WorkerToDaemon): void {
-  if (msg.type === 'final_output' && workerSessionEventScope && !workerSessionEventScope.ownsExecutionEvent(msg.turnId, msg.dispatchAttempt)) { log('Dropped final output with unproven execution origin'); return; }
+  if (msg.type === 'final_output' && workerSessionEventScope && !workerSessionEventScope.ownsExecutionEvent(msg.turnId, msg.dispatchAttempt)) {
+    log(`Dropped final output with unproven execution origin ${JSON.stringify({ turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
+      origin: workerSessionEventScope.capture(), current: workerSessionEventScope.currentBinding(),
+      execution: workerSessionEventScope.executionForTurn(msg.turnId, msg.dispatchAttempt) })}`);
+    return;
+  }
   // Once init is done, every message goes out behind the backlog it was sent under.
   if (publishedCliInputBacklog !== undefined && msg.type !== 'cli_input_backlog') publishCliInputBacklog();
   if (closeRequested && msg.type === 'final_output') {
@@ -33491,6 +33630,7 @@ function acknowledgeNativeInputConsumed(
   proofKind: Extract<WorkerToDaemon, { type: 'native_input_consumed' }>['proofKind'],
   nativeSessionId?: string,
   nativeTurnId?: string,
+  dispatchAttempt?: number,
 ): void {
   if (!turnId) return;
   // The CLI has the input in its own history: a crash no longer re-delivers
@@ -33498,6 +33638,7 @@ function acknowledgeNativeInputConsumed(
   inflightInputs.onTurnStarted(turnId);
   send({
     type: 'native_input_consumed', turnId, proofKind,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(lastWrittenCliInput?.turnId === turnId && isUnsentInputReplayable(lastWrittenCliInput)
       && lastWrittenCliInput.trustedCaller?.senderType === 'user'
       ? { ordinaryInteractive: true as const } : {}),
@@ -33626,12 +33767,34 @@ function publishLocalProcessAttestation(
     : codexAppRunnerProcessIdentity && enginePid === codexAppRunnerProcessIdentity.enginePid
       ? codexAppRunnerProcessIdentity.engineProcStart
       : enginePid ? readProcessStartIdentity(enginePid) : undefined;
+  // Actual running image of the TRAE leaf, read from the kernel. The initial
+  // attestation names the bwrap/forge launcher, which is not traex and must not
+  // be recorded; the leaf re-attestation (applyRealPid) fills this in.
+  // Bind the exe read to the birth token just read for this pid: a reused pid
+  // must not pair one process's birth with another process's image.
+  const cliExe = lastInitConfig?.cliId === 'traex' && cliPid && isTraexProcess(cliPid)
+    ? readRunningExeIdentity(cliPid, cliProcStart)
+    : undefined;
+  // The install entry this worker's adapter resolved at spawn. The daemon
+  // re-resolves it later to detect a replacement under the running process;
+  // this worker never re-runs a version probe for it.
+  const cliInstallEntry = lastInitConfig?.cliId === 'traex'
+    ? cliAdapter?.resolvedBin
+    : undefined;
+  // An earlier spawn's observation says nothing about the current process.
+  const cliInstallAtSpawn = cliInstallEntry && traexInstallAtSpawn?.generation === cliSpawnGeneration
+    ? traexInstallAtSpawn.identity
+    : undefined;
   send({
     type: 'local_process_attestation',
     backendType: effectiveBackendType,
     credentialIsolated: currentCliCredentialIsolated,
     ...(cliPid ? { cliPid } : {}),
     ...(cliProcStart ? { cliProcStart } : {}),
+    ...(cliExe ? { cliExe } : {}),
+    ...(cliInstallEntry ? { cliInstallEntry } : {}),
+    ...(cliInstallAtSpawn ? { cliInstallAtSpawn } : {}),
+    cliSpawnGeneration,
     ...(enginePid ? { enginePid } : {}),
     ...(engineProcStart ? { engineProcStart } : {}),
   });
@@ -33707,6 +33870,9 @@ async function sendFatalWorkerErrorAndExit(
 ): Promise<void> {
   if (fatalWorkerErrorPending) return;
   fatalWorkerErrorPending = true;
+  // No CLI of this start ever existed to take the queued inputs; the daemon's
+  // retry of a transient startup failure starts the worker that types them.
+  if (err instanceof RuntimeReservationExpiredError) saveUnsentInputsForSuccessor('runtime reservation unconfirmed');
   const pendingAttemptId = pendingLaunchConvergence?.attemptId;
   pendingLaunchConvergence = undefined;
   if (pendingAttemptId && pendingAttemptId !== activeRestartAttemptId) {
@@ -34101,7 +34267,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           // init so the daemon retries a clean incarnation instead of freezing.
           throw new Error('codex RPC resume: could not replace stale --remote pane; aborting init');
         }
-        await spawnCli(msg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });
+        await spawnCli(msg, { pluginGenerationPrepared: rpcPluginGenerationPrepared, retryPaneAgentStart: !msg.restartAttemptId });
         if (traexAutoModelRuntimeEligible()) publishActiveRuntime({ model: msg.model, reasoningEffort: msg.reasoningEffort });
         await prepareCodexNativeTitleGeneration(msg, codexRpcEngine);
         if (codexRpcEngine) armRpcStartupDialogDismiss(); // boundary #4: keep the --remote pane from freezing on a startup dialog
@@ -34429,6 +34595,9 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       workerSessionEventScope?.assign(msg.bindingId, msg.runtime);
       for (const state of msg.admissionStates ?? []) workerSessionEventScope?.noteAdmission(state);
       for (const execution of msg.executions ?? []) workerSessionEventScope?.rememberExecution(execution);
+      for (const observed of msg.observedExecutions ?? []) {
+        workerSessionEventScope?.rememberObservedExecution(msg.bindingId, observed.runtime, observed.execution);
+      }
       if (!msg.mayExecute) { closeRequested = true; stopBridgeWatcher(); stopScreenshotLoop(); killCli(); }
       break;
     }

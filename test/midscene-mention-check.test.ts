@@ -21,6 +21,7 @@ import {
   staleViewReason,
   topicOpenInMain,
   topicRootInMain,
+  turnOutputOn,
   waitForCardButtons,
   waitForTopicIcon,
   type ScreenBox,
@@ -758,5 +759,98 @@ describe('Feishu E2E session card wait', () => {
     await expect(waitForCardButtons(never.deps, 90_000)).resolves.toBe(false);
     // 45s to the reopen, 50s inside it, then nothing more beyond the budget.
     expect(never.deps.now()).toBeLessThanOrEqual(90_000 + 50_000);
+  });
+});
+
+describe('Feishu E2E card output toggle', () => {
+  // The streaming card as Feishu shows it: 「更多操作」 starts folded, every
+  // landed click flips the output when its card update arrives, and that
+  // update folds the panel again. `clipped`: folding clips the panel instead of
+  // removing it, so the label still reads but takes no click.
+  function card(opts: {
+    output?: 'hidden' | 'screenshot';
+    updateMs?: number;
+    missedClicks?: number;
+    clipped?: boolean;
+  }) {
+    let t = 0;
+    let folded = true;
+    let output = opts.output ?? 'hidden';
+    let missed = opts.missedClicks ?? 0;
+    const updates: number[] = [];
+    const calls = { attempts: 0, clicks: 0, unfolds: 0 };
+    const settle = () => {
+      while (updates.length > 0 && updates[0] <= t) {
+        updates.shift();
+        output = output === 'hidden' ? 'screenshot' : 'hidden';
+        folded = true;
+      }
+    };
+    return {
+      calls,
+      output: () => output,
+      deps: {
+        toggle: async () => {
+          settle();
+          if (folded && !opts.clipped) return undefined;
+          return output === 'hidden' ? ('show' as const) : ('hide' as const);
+        },
+        unfoldMore: async () => {
+          calls.unfolds += 1;
+          folded = !folded;
+        },
+        clickShow: async () => {
+          calls.attempts += 1;
+          if (folded || missed-- > 0) return false;
+          calls.clicks += 1;
+          updates.push(t + (opts.updateMs ?? 2_000));
+          return true;
+        },
+        now: () => t,
+        sleep: async (ms: number) => {
+          t += ms;
+        },
+      },
+    };
+  }
+
+  it('unfolds 更多操作, clicks 显示输出, and unfolds it again after the card update folds it', async () => {
+    const c = card({ updateMs: 3_000 });
+    await expect(turnOutputOn(c.deps, 45_000)).resolves.toEqual({ on: true, clicked: true, unfolds: 2 });
+    expect(c.calls.clicks).toBe(1);
+    expect(c.output()).toBe('screenshot');
+  });
+
+  it('clicks once however slow the update is: a second click turns the output off', async () => {
+    const slow = card({ updateMs: 20_000 });
+    await expect(turnOutputOn(slow.deps, 45_000)).resolves.toMatchObject({ on: true });
+    expect(slow.calls.clicks).toBe(1);
+    expect(slow.output()).toBe('screenshot');
+
+    const never = card({ updateMs: Infinity });
+    await expect(turnOutputOn(never.deps, 45_000)).resolves.toEqual({ on: false, clicked: true, unfolds: 1 });
+    expect(never.calls.clicks).toBe(1);
+    expect(never.deps.now()).toBeLessThanOrEqual(45_000 + 1_000);
+  });
+
+  it('leaves output that is already on alone', async () => {
+    const on = card({ output: 'screenshot' });
+    await expect(turnOutputOn(on.deps, 45_000)).resolves.toEqual({ on: true, clicked: false, unfolds: 1 });
+    expect(on.calls.attempts).toBe(0);
+  });
+
+  it('clicks again when a click did not go through', async () => {
+    const flaky = card({ missedClicks: 1 });
+    await expect(turnOutputOn(flaky.deps, 45_000)).resolves.toMatchObject({ on: true, clicked: true });
+    expect(flaky.calls.attempts).toBe(2);
+    expect(flaky.calls.clicks).toBe(1);
+  });
+
+  it('unfolds 更多操作 when the folded panel shows 显示输出 but will not take the click', async () => {
+    const c = card({ clipped: true });
+    await expect(turnOutputOn(c.deps, 45_000)).resolves.toEqual({ on: true, clicked: true, unfolds: 1 });
+    expect(c.calls.attempts).toBe(2);
+    expect(c.calls.clicks).toBe(1);
+    expect(c.output()).toBe('screenshot');
   });
 });

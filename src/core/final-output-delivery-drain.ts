@@ -3,6 +3,17 @@ import { waitAllWithin } from './producer-quiescence.js';
 
 const allFinalOutputDeliveries = new Set<Promise<void>>();
 
+type FinalOutputDeliverySettledListener = (ds: DaemonSession, turnId?: string) => void;
+const settledListeners = new Set<FinalOutputDeliverySettledListener>();
+
+/** Observe the end of a daemon-owned final delivery. Used by the install-change
+ *  reclaim, which must not retire a worker whose answer is still in flight.
+ *  Listeners must be synchronous and non-throwing; failures are isolated. */
+export function onFinalOutputDeliverySettled(listener: FinalOutputDeliverySettledListener): () => void {
+  settledListeners.add(listener);
+  return () => { settledListeners.delete(listener); };
+}
+
 /** Register one daemon-owned user-visible final delivery.
  *
  * The worker may already have emitted its provider terminal, but graceful
@@ -40,6 +51,15 @@ export function beginFinalOutputDelivery(ds: DaemonSession, turnId?: string): ()
     allFinalOutputDeliveries.delete(settled);
     if (pending.size === 0) delete ds.finalOutputDeliveriesInFlight;
     resolve();
+    // Lifecycle edge: an install-change reclaim may have been waiting for this
+    // very delivery. Listeners are synchronous and isolated from each other.
+    for (const listener of settledListeners) {
+      try {
+        listener(ds, turnId);
+      } catch {
+        /* a listener must never break delivery completion */
+      }
+    }
   };
 }
 

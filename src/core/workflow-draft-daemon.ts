@@ -6,10 +6,10 @@
  * Routes (all under {@link WORKFLOW_DRAFTS_PATH}, deliberately outside the
  * workflow daemon-mutation protocol):
  *
- *   POST /drafts                                {larkAppId, goal}       新建
+ *   POST /drafts                                {larkAppId, goal, project?}  新建
  *   GET  /drafts/:runId                                                 读（管理员）
  *   POST /drafts/:runId/messages                {text}                  对话一轮
- *   POST /drafts/:runId/clarify/continue                                「继续」
+ *   POST /drafts/:runId/clarify/continue        {project?}              「继续」
  *   POST /drafts/:runId/spec                    {specMarkdown?, relayProblems?}  定稿 / 改完重新校验
  *   POST /drafts/:runId/approve-spec                                    第一道确认
  *   POST /drafts/:runId/architect               {note?}                 编排 / 重新编排
@@ -26,7 +26,7 @@
  *   POST /drafts/:runId/launch/resend-summary   {confirmedAbsent: true} 人工确认群里没有摘要后重发
  *   POST /drafts/:runId/template/preview        {workflowId?, paramEdits?}   存为模板的确认框（D5）
  *   POST /drafts/:runId/template/save           {flowSummarySha256, …}       存为模板（D5）
- *   POST /drafts/from-source                    {source, larkAppId?}    复制为新工作流（D6）
+ *   POST /drafts/from-source                    {source, larkAppId?, project?}  复制为新工作流（D6）
  *   POST /drafts/:runId/copy/goal               {goal, mode}            复制的草稿改目标（D6）
  *   POST /drafts/:runId/nodes/:nodeId/text      {goal?, completion?}    复制的草稿改节点文字（D6）
  *   POST /drafts/:runId/handoff/prepare         {toLarkAppId}           换编排 Bot 第 1 步（现编排 Bot：记目标、关澄清会话）
@@ -38,7 +38,13 @@
  *
  *   POST /library/runs/:runId/save/preview      {workflowId?, paramEdits?, allowDraft?}  保存为模板的确认框
  *   POST /library/runs/:runId/save              {workflowId?, expectedLatestRevision?, displayName?, paramEdits?, requestKey?, …}
- *   POST /library/:workflowId/run               {params, expectedRevisionId?}  运行模板 → 草稿
+ *   POST /library/:workflowId/run               {params, expectedRevisionId?, project?}  运行模板 → 草稿
+ *
+ * Projects ({@link WORKFLOW_PROJECTS_PATH}): where this bot's drafts are
+ * clarified — its default dir, or the Feishu repo picker's candidates to
+ * pick from (`project` above must be one of them):
+ *
+ *   GET  /projects                                                      新建表单的「项目」
  *
  * The launch record is part of GET /drafts/:runId (`launch`).
  *
@@ -68,6 +74,7 @@ import {
   WorkflowDraftService,
   type DraftClarifier,
   type DraftClarifyResult,
+  type WorkflowDraftProjects,
 } from '../workflows/v3/draft-service.js';
 import type { WorkflowDraftInitiator } from '../workflows/v3/draft-store.js';
 import type { TriggerRequest, TriggerResponse } from '../services/trigger-types.js';
@@ -86,6 +93,7 @@ import { getBotBrand, getBotOpenId } from '../bot-registry.js';
 
 export const WORKFLOW_DRAFTS_PATH = '/api/v3/orchestration/drafts';
 export const WORKFLOW_LIBRARY_PATH = '/api/v3/orchestration/library';
+export const WORKFLOW_PROJECTS_PATH = '/api/v3/orchestration/projects';
 
 /** How far back (messages) / how many candidates are read in full when
  *  looking for a root card past Feishu's uuid window. */
@@ -200,12 +208,26 @@ export function registerWorkflowDraftIpcRoutes(
     if (body.larkAppId !== ctx.appId()) {
       throw new WorkflowDraftError('bot_mismatch', '请求的编排 Bot 不是这个 daemon 的 Bot');
     }
-    return { draft: await service.create(initiator, { goal: body.goal }) };
+    return { draft: await service.create(initiator, { goal: body.goal, project: body.project }) };
   });
 
   // 复制为新工作流（D6）: the copier is the new draft's initiator.
   write(`${WORKFLOW_DRAFTS_PATH}/from-source`, async ({ service, initiator, body }) =>
-    ({ draft: await service.createFromSource(initiator, { source: body.source, ...(body.larkAppId !== undefined ? { larkAppId: body.larkAppId } : {}) }) }));
+    ({ draft: await service.createFromSource(initiator, {
+      source: body.source,
+      ...(body.larkAppId !== undefined ? { larkAppId: body.larkAppId } : {}),
+      project: body.project,
+    }) }));
+
+  route('GET', WORKFLOW_PROJECTS_PATH, async (req, res) => {
+    const service = gate(req, res);
+    if (!service) return;
+    try {
+      ctx.jsonRes(res, 200, { ok: true, project: service.projectOptions() });
+    } catch (error) {
+      respondError(res, error, 'projects');
+    }
+  });
 
   route('GET', `${WORKFLOW_DRAFTS_PATH}/:runId`, async (req, res, params) => {
     const service = gate(req, res);
@@ -221,8 +243,8 @@ export function registerWorkflowDraftIpcRoutes(
   const draftPath = (tail: string) => `${WORKFLOW_DRAFTS_PATH}/:runId/${tail}`;
   write(draftPath('messages'), async ({ service, initiator, body, baseVersion, runId }) =>
     ({ draft: await service.sendMessage(runId, initiator, { text: body.text, baseVersion }) }));
-  write(draftPath('clarify/continue'), async ({ service, initiator, baseVersion, runId }) =>
-    ({ draft: await service.continueClarify(runId, initiator, { baseVersion }) }));
+  write(draftPath('clarify/continue'), async ({ service, initiator, body, baseVersion, runId }) =>
+    ({ draft: await service.continueClarify(runId, initiator, { baseVersion, project: body.project }) }));
   write(draftPath('spec'), async ({ service, initiator, body, baseVersion, runId }) =>
     service.finalizeSpec(runId, initiator, { specMarkdown: body.specMarkdown, relayProblems: body.relayProblems, baseVersion }));
   write(draftPath('approve-spec'), async ({ service, initiator, baseVersion, runId }) =>
@@ -303,6 +325,7 @@ export function registerWorkflowDraftIpcRoutes(
       workflowId: decodeParam(params.workflowId),
       params: body.params,
       expectedRevisionId: body.expectedRevisionId,
+      project: body.project,
     }) }));
 }
 
@@ -511,7 +534,7 @@ export interface ProductionDraftClarifierDeps {
   activeSessions: () => Map<string, DaemonSession> | undefined;
   createHeadlessSession: (
     activeSessions: Map<string, DaemonSession>,
-    args: { larkAppId: string; title: string; failureDiagnostics: true },
+    args: { larkAppId: string; title: string; workingDir: string; failureDiagnostics: true },
   ) => Promise<{ ok: true; headlessId: string; sessionId: string } | { ok: false; error: string }>;
   triggerSessionTurn: (req: TriggerRequest, deps: { larkAppId: string; activeSessions: Map<string, DaemonSession> }) => Promise<TriggerResponse>;
   lookupTriggerResult: (sessionId: string, triggerId: string) => TriggerResponse;
@@ -539,12 +562,12 @@ export function createProductionDraftClarifier(deps: ProductionDraftClarifierDep
     return undefined;
   };
   return {
-    async create({ larkAppId, title }) {
+    async create({ larkAppId, title, workingDir }) {
       const active = deps.activeSessions();
       if (!active) return { ok: false, error: 'registry_unavailable' };
       // The failure panel reads this session's failed turns (provider error,
       // screen tail); no other session pays for capturing them.
-      return deps.createHeadlessSession(active, { larkAppId, title, failureDiagnostics: true });
+      return deps.createHeadlessSession(active, { larkAppId, title, workingDir, failureDiagnostics: true });
     },
     async send({ larkAppId, sessionId, headlessId, prompt, requestId }) {
       const active = deps.activeSessions();
@@ -663,6 +686,7 @@ export function resetWorkflowDraftServiceForTests(): void {
 export function createProductionWorkflowDraftService(
   appId: string,
   clarifier: DraftClarifier,
+  projects: WorkflowDraftProjects,
   launch?: DraftLaunchDeps,
 ): WorkflowDraftService {
   return new WorkflowDraftService({
@@ -674,7 +698,11 @@ export function createProductionWorkflowDraftService(
     isDaemonOnline: (larkAppId) => {
       try { return findOnlineDaemon(larkAppId, config.session.dataDir) !== null; } catch { return false; }
     },
+    daemonReadsNodeProjectDir: (larkAppId) => {
+      try { return findOnlineDaemon(larkAppId, config.session.dataDir)?.workflowNodeProjectDir === 'v1'; } catch { return false; }
+    },
     clarifier,
+    projects,
     runArchitect,
     ...(launch ? { launch } : {}),
     log: (message) => logger.info(message),

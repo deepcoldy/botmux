@@ -3113,7 +3113,7 @@ export function listOncallChats(larkAppId: string): OncallChat[] {
  * or binds a chat to oncall, so the resolved session's permission model is
  * unchanged regardless of which source supplied the path.
  */
-export function effectiveDefaultWorkingDir(cfg: BotConfig): string | undefined {
+export function effectiveDefaultWorkingDir(cfg: Pick<BotConfig, 'defaultWorkingDir' | 'defaultOncall'>): string | undefined {
   return cfg.defaultWorkingDir
     || (cfg.defaultOncall?.enabled ? cfg.defaultOncall.workingDir : undefined)
     || undefined;

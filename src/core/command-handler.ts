@@ -2694,8 +2694,7 @@ export async function handleCommand(
                 residual: closeResult.residual,
               };
             }
-            return { status: 'closed' as const, current, card, privateCard,
-              closedCardPatchQueued: closeResult.closedCardPatchQueued === true };
+            return { status: 'closed' as const, current, card, privateCard };
           });
           if (!closed) {
             await replyNoSession(replyHere, loc);
@@ -2765,10 +2764,9 @@ export async function handleCommand(
                 await sendEphemeralCard(closed.current.larkAppId, closed.current.chatId, openId, closed.card)
                   .catch(err => logger.warn(`[${logTag}] private close card delivery failed: ${err}`));
               }
-            } else if (closed.current.scope === 'chat' || !closed.closedCardPatchQueued) {
-              // A thread's live card already has its closing PATCH queued. Keep
-              // the fallback when no PATCH was queued, and preserve the separate
-              // operator confirmation for chat-scoped sessions.
+            } else {
+              // The live card's closing PATCH may land far above the /close
+              // message, so the operator also gets a confirmation where they typed.
               await deliverEphemeralOrReply(
                 closed.current,
                 message.senderId,

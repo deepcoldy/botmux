@@ -148,6 +148,16 @@ export interface DaemonSession {
     credentialIsolated: boolean;
     cliPid?: number;
     cliProcStart?: string;
+    /** Actual running executable image (Linux `/proc/<pid>/exe`). Absent when
+     * unknown; an unknown identity never authorizes an automatic reclaim. */
+    cliExe?: import('../services/cli-install-identity.js').ExecutableIdentity;
+    /** Install entry the worker's adapter resolved at spawn. */
+    cliInstallEntry?: string;
+    /** What `cliInstallEntry` resolved to right before this CLI spawn. Only a
+     *  process whose `cliExe` is this very object was launched from the entry. */
+    cliInstallAtSpawn?: import('../services/cli-install-identity.js').ExecutableIdentity;
+    /** Worker-local CLI spawn counter that produced `cliExe`. */
+    cliSpawnGeneration?: number;
     enginePid?: number;
     engineProcStart?: string;
     workerGeneration?: number;
@@ -583,6 +593,14 @@ export interface DaemonSession {
    *  as handled must not be announced as a successful compact, because this
    *  process never saw it run. Cleared on the finishing edge / terminal. */
   idleAutoCompactDispatchedTurnId?: string;
+  /** Start of the current warm idle stretch for idle auto-compact: the idle
+   *  edge that followed the last botmux turn (core/idle-auto-compact.ts).
+   *  Undefined = no stretch is known to follow a model request (cold). Tracked
+   *  while the feature is off too. In-memory; mirrored to the row while on. */
+  idleAutoCompactWarmSince?: number;
+  /** A botmux turn started and its idle edge has not been seen yet
+   *  (core/idle-auto-compact.ts). In-memory; mirrored to the row while on. */
+  idleAutoCompactArm?: import('./idle-auto-compact.js').IdleAutoCompactArm;
   /** turnIds whose triggering Lark message explicitly @-mentioned this bot.
    *  Only positives are stored (absent === not mentioned), so the bounded FIFO
    *  (see recordTurnExplicitMention) is spent entirely on turns that can still
@@ -726,6 +744,45 @@ export interface DaemonSession {
    *  read-isolation switch suspended first) survives into the NEXT generation
    *  and suspends it on its first idle. See clearPendingSuspendClaim. */
   pendingSuspendGeneration?: number;
+  /** Exact running CLI an install-change reclaim was requested for. The claim
+   *  is re-validated immediately before the suspend: an in-worker CLI restart
+   *  (same worker generation, new spawn), a reverted install entry, or an
+   *  unprovable identity must not consume it against the replacement.
+   *  In-memory only, like the queued suspend it belongs to. */
+  pendingSuspendInstallClaim?: {
+    entry: string;
+    running: import('../services/cli-install-identity.js').ExecutableIdentity;
+    installAtSpawn: import('../services/cli-install-identity.js').ExecutableIdentity;
+    workerGeneration: number;
+    cliSpawnGeneration?: number;
+    cliPid?: number;
+    cliProcStart?: string;
+  };
+  /** Turns a live worker has ACCEPTED but not yet finished, keyed by
+   *  `turnId + dispatchAttempt`. `turn_input_committed` only proves the worker
+   *  queue took ownership — the native PTY flush is asynchronous and the turn
+   *  has not run yet. Keeping this responsibility until the EXACT execution
+   *  reaches a terminal/rejection stops an install-change reclaim from
+   *  destroying accepted work while the screen still shows a cached idle.
+   *  Cleared when the worker generation ends. */
+  acceptedInputTurns?: Map<string, {
+    workerGeneration: number;
+    turnId: string;
+    dispatchAttempt?: number;
+    phase: 'queue-commit' | 'native-submit';
+    at: number;
+  }>;
+  /** Executions that already reached a terminal/rejection in this generation,
+   *  keyed the same way. The worker deliberately re-ACKs a committed duplicate
+   *  (`worker.ts` re-sends `turn_input_committed` without re-queueing), so a
+   *  late duplicate ACK is a transport retry, not new work: it must not revive
+   *  an obligation that will never terminal again. Bounded LRU of settled
+   *  dedupe facts only — never an unresolved obligation. */
+  settledInputTurns?: Map<string, number>;
+  /** Conservative overflow latch. When more unresolved obligations exist than
+   *  the ledger tracks, an automatic reclaim stays blocked for the rest of the
+   *  generation instead of silently dropping an unresolved obligation. */
+  acceptedInputOverflow?: boolean;
   /** Executor-observed Codex settings for this worker/rollout generation. */
   codexServiceTier?: CodexServiceTierSnapshot;
   /** Tier change arrived while a card POST was in-flight. */

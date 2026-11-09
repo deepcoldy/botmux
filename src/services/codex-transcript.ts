@@ -413,6 +413,12 @@ export const CODEX_CONNECTION_ERROR_CODE = 'codex_connection_failed';
 export const CODEX_UPSTREAM_ERROR_CODE = 'codex_upstream_error';
 /** Explicit model capacity refusal; generic 5xx/stream errors stay upstream. */
 export const CODEX_CAPACITY_ERROR_CODE = 'codex_capacity_exceeded';
+/** Request BODY exceeded the model gateway's byte limit (HTTP 413). Distinct
+ *  from `codex_connection_failed`: the host was reachable and answered, so
+ *  telling the user to check the network sends them chasing the wrong thing.
+ *  The cause is almost always conversation bloat — many base64 images in tool
+ *  output plus a long transcript — because the limit is on BYTES, not tokens. */
+export const CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE = 'codex_payload_too_large';
 export const CODEX_OUTPUT_LIMIT_ERROR_CODE = 'codex_output_limit_exceeded';
 export const CODEX_TASK_FAILED_ERROR_CODE = 'codex_task_failed';
 export const CODEX_OUTPUT_LIMIT_ERROR_MESSAGE = 'model output limit exceeded: max_output_tokens';
@@ -604,6 +610,15 @@ export function codexTaskFailureCode(error: unknown): string {
   if (/\b429\b|too many requests|rate[_ -]?limit/.test(normalized)) return CODEX_RATE_LIMIT_ERROR_CODE;
   if (/\b401\b|\b403\b|unauthorized|forbidden|authentication|invalid[_ -]?(?:api[_ -]?)?key/.test(normalized)) {
     return CODEX_AUTH_ERROR_CODE;
+  }
+  // Request body over the gateway's byte cap. Checked before the generic
+  // invalid-request branch so a 413 is never reported as a malformed request,
+  // and before the connection branch (whose "please check the network" advice
+  // is actively misleading here — the service answered, it just refused the
+  // size). Matches both the status code and the openresty/nginx body text,
+  // because some gateways only put it in the HTML title.
+  if (/\b413\b|payload too large|request entity too large|body too large|entity too large/.test(normalized)) {
+    return CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE;
   }
   if (/invalid_request|invalid request|validation|empty_string|\b400\b|\b-4003\b/.test(normalized)) {
     return CODEX_INVALID_REQUEST_ERROR_CODE;

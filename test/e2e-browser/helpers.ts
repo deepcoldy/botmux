@@ -1329,7 +1329,8 @@ export async function waitForStreamingCard(
   // Step 5: Wait for streaming card.
   await agent.aiWaitFor(
     '主内容区正在显示的测试话题里出现当前会话的流式卡片；' +
-      '卡片必须带有"显示输出"、"打开 Web 终端"、"获取操作链接"或"关闭会话"这类会话操作按钮；' +
+      '卡片主行必须带有"打开 Web 终端"、"压缩"、"停止"或"关闭会话"这类会话操作按钮' +
+      '（"显示输出"等低频操作收在下方默认折叠的"更多操作"里，看不到是正常的）；' +
       '卡片标题包含"启动中"、"工作中"、"等待输入"或"正在分析"之一，或正文已经出现 Codex 的 usage/rate limit/model switch 提示；' +
       '"项目仓库管理"和"直接开启会话"的仓库选择卡不能算作流式卡片',
     { timeoutMs, checkIntervalMs: 5_000 },
@@ -1766,45 +1767,115 @@ export async function clickDirectStartIfPresent(
   }
 }
 
+/** The card's output toggle as shown; undefined while 「更多操作」 is folded. */
+export type OutputToggle = 'show' | 'hide' | undefined;
+
+/** What turnOutputOn needs from the page; injected so it can be tested. */
+export interface OutputToggleDeps {
+  toggle: () => Promise<OutputToggle>;
+  /** Click the card's 「更多操作」 header. */
+  unfoldMore: () => Promise<void>;
+  /** Click 「📖 显示输出」; false when the click did not go through. */
+  clickShow: () => Promise<boolean>;
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+}
+
 /**
- * Show the streaming card body in its current screenshot mode.
- * Current cards use "显示输出/隐藏输出".
+ * Turn the streaming card's output on. The toggle sits in the card's
+ * 「更多操作」 panel, folded by default, and a card update folds it again —
+ * the update this very click causes included. So unfold it whenever the toggle
+ * is out of sight or will not take a click (a panel folded by clipping keeps
+ * the label readable), and click 「显示输出」 once: a second click turns the
+ * output off again. Done when the toggle reads 「隐藏输出」.
  */
+export async function turnOutputOn(
+  deps: OutputToggleDeps,
+  timeoutMs: number,
+): Promise<{ on: boolean; clicked: boolean; unfolds: number }> {
+  const deadline = deps.now() + timeoutMs;
+  let clicked = false;
+  let unfolds = 0;
+  while (deps.now() < deadline) {
+    const toggle = await deps.toggle();
+    if (toggle === 'hide') return { on: true, clicked, unfolds };
+    let unfold = toggle === undefined;
+    if (!unfold && !clicked) {
+      clicked = await deps.clickShow();
+      unfold = !clicked;
+    }
+    if (unfold) {
+      await deps.unfoldMore();
+      unfolds += 1;
+    }
+    await deps.sleep(1_000);
+  }
+  return { on: false, clicked, unfolds };
+}
+
+const MORE_ACTIONS_LABEL = '更多操作';
+// Button labels only: a stale-card toast also mentions 「显示/隐藏输出」.
+const OUTPUT_TOGGLE_LABEL = /^\s*(📖|📕)?\s*(显示|隐藏)输出\s*$/;
+const SHOW_OUTPUT_LABEL = /^\s*(📖\s*)?显示输出\s*$/;
+const OUTPUT_ON_BUDGET_MS = 45_000;
+
+/** Show the streaming card body in screenshot mode (turnOutputOn). */
 export async function showStreamingOutput(
   agent: PlaywrightAgent,
   page: Page,
 ): Promise<void> {
+  const cardClause =
+    '主内容区正在显示的测试话题里，当前会话的流式卡片（主行带"打开 Web 终端"和"关闭会话"的那张，可能在 ACK 文本气泡上方）。' +
+    '不要把文本气泡右侧的点赞、复制、转发或更多选项当成卡片按钮。';
+  const moreHeader = () => lastVisible(page.getByText(MORE_ACTIONS_LABEL, { exact: true }));
   // The ACK text bubble is the last item after a successful reply, so "the
   // bottom of the thread" is that bubble (thumbs-up / copy / forward), not
-  // the streaming card. Bring the card's own button into view first.
-  const cardButton = page.getByRole('button', { name: /显示输出|隐藏输出/ }).last();
-  try {
-    await cardButton.scrollIntoViewIfNeeded({ timeout: 15_000 });
-  } catch {
-    // The vision checks below report a real miss.
-  }
-  const cardClause =
-    '主内容区正在显示的测试话题里，当前会话的流式卡片（带"打开 Web 终端"或"显示输出/隐藏输出"的那张，可能在 ACK 文本气泡上方）。' +
-    '不要把文本气泡右侧的点赞、复制、转发或更多选项当成卡片按钮。';
-  const needShow = await agent.aiBoolean(
-    `${cardClause}这张卡片的操作按钮中有"📖 显示输出"按钮`,
+  // the streaming card. Bring the card's own controls into view first.
+  const header = await moreHeader();
+  await header?.scrollIntoViewIfNeeded({ timeout: 15_000 }).catch(() => {});
+
+  const result = await turnOutputOn(
+    {
+      toggle: async () => {
+        const button = await lastVisible(page.getByText(OUTPUT_TOGGLE_LABEL));
+        if (!button) return undefined;
+        return (await button.innerText().catch(() => '')).includes('隐藏输出') ? 'hide' : 'show';
+      },
+      unfoldMore: async () => {
+        try {
+          const current = await moreHeader();
+          if (!current) throw new Error('no 「更多操作」 header on the page');
+          await current.click({ timeout: 5_000 });
+        } catch {
+          await agent
+            .aiAct(`点击${cardClause}按钮下方的"更多操作"（折叠面板的标题，右侧有向下的箭头），把它展开`)
+            .catch(() => {});
+        }
+      },
+      clickShow: async () => {
+        const button = await lastVisible(page.getByText(SHOW_OUTPUT_LABEL));
+        if (!button) return false;
+        return button
+          .click({ timeout: 5_000 })
+          .then(() => true)
+          .catch(() => false);
+      },
+      now: () => Date.now(),
+      sleep: (ms) => page.waitForTimeout(ms),
+    },
+    OUTPUT_ON_BUDGET_MS,
   );
-  if (needShow) {
-    try {
-      await page
-        .getByRole('button', { name: /显示输出/ })
-        .last()
-        .click({ timeout: 5_000 });
-    } catch {
-      await agent.aiAct(
-        `点击${cardClause}里的"📖 显示输出"按钮；不要点击"打开 Web 终端"，也不要点文本气泡上的按钮`,
-      );
-    }
-    await page.waitForTimeout(1000);
+  if (!result.on) {
+    const detail =
+      `the card's output toggle never read 「📕 隐藏输出」 within ${OUTPUT_ON_BUDGET_MS / 1000}s ` +
+      `(clicked 「显示输出」: ${result.clicked ? 'yes' : 'no'}; unfolded 「更多操作」 ${result.unfolds}×)`;
+    await recordFailureState(agent, page, MORE_ACTIONS_LABEL, detail);
+    throw new Error(`showStreamingOutput: ${detail}`);
   }
+
+  await (await moreHeader())?.scrollIntoViewIfNeeded({ timeout: 5_000 }).catch(() => {});
   await agent.aiWaitFor(
-    `${cardClause}这张卡片的操作按钮中有"📕 隐藏输出"，` +
-      '并且卡片正文显示终端截图、终端区域，或"等待第一张截图"占位',
+    `${cardClause}这张卡片正文显示终端截图、终端区域，或"等待第一张截图"占位`,
     { timeoutMs: 30_000, checkIntervalMs: 2_000 },
   );
 }
@@ -2237,6 +2308,17 @@ async function anyVisible(locator: ReturnType<Page['getByText']>): Promise<boole
     if (await locator.nth(i).isVisible().catch(() => false)) return true;
   }
   return false;
+}
+
+/** The last visible match: hidden cached copies of a chat share the same text. */
+async function lastVisible(
+  locator: ReturnType<Page['getByText']>,
+): Promise<ReturnType<Page['getByText']> | undefined> {
+  const count = await locator.count().catch(() => 0);
+  for (let i = count - 1; i >= 0; i--) {
+    if (await locator.nth(i).isVisible().catch(() => false)) return locator.nth(i);
+  }
+  return undefined;
 }
 
 /** What the page held when a reply never came: tells "no card" from "not clicked". */

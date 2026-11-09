@@ -11,7 +11,8 @@
  * only recognises screens captured from real CLI builds.
  *
  * Safety model:
- *  - `initiator` keys only ever DECLINE or SKIP: they leave the page without
+ *  - `initiator` keys only ever DECLINE, SKIP or RETRY lock acquisition:
+ *    retry never terminates the owner or removes a lock; the other keys leave the page without
  *    persisting a decision (Esc on the Codex-family hook review = "continue
  *    without trusting", hooks simply do not run this session; Esc on the TRAE
  *    migration picker = "Skip for now", asked again next start). They may be
@@ -29,7 +30,7 @@
 import type { StuckPageType } from '../utils/stuck-detector.js';
 
 export type StuckKeyAudience = 'initiator' | 'admin';
-export type StuckKey = 'Escape' | 'Enter' | 't';
+export type StuckKey = 'Escape' | 'Enter' | 't' | 'r';
 
 export interface StuckPageOption {
   key: StuckKey;
@@ -70,6 +71,12 @@ export const STUCK_PAGE_CATALOG: Readonly<Record<StuckPageType, StuckPageSpec>> 
     descriptionKey: 'card.stuck.page.migration_menu',
     options: [
       { key: 'Escape', labelKey: 'card.stuck.key.skip_migration', audience: 'initiator' },
+    ],
+  },
+  'session lock': {
+    descriptionKey: 'card.stuck.page.session_lock',
+    options: [
+      { key: 'r', labelKey: 'card.stuck.key.retry_session_lock', audience: 'initiator' },
     ],
   },
 };
@@ -219,7 +226,7 @@ export function redactStuckPageTail(tail: string): string {
  * secret / password shapes, URL userinfo) and the user name in home-directory
  * paths.
  */
-function maskCredentialShapes(text: string): string {
+export function maskCredentialShapes(text: string): string {
   let out = text.replace(/(\/(?:home|Users)\/)[^/\s]+/g, '$1~');
   for (const shape of SECRET_SHAPES) {
     out = out.replace(shape, (match, keep?: string) =>

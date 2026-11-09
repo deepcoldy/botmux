@@ -3,7 +3,7 @@
  * workflow-dashboard-orchestration D3）。写接口一律 POST 且带 JSON 对象请求体
  * （至少 `{}`）：平台会把没有请求体的请求走直连路径，那里认不出人（D1）。
  */
-import type { WorkflowDraftView } from '../../workflows/v3/draft-service.js';
+import type { WorkflowDraftProjectOptions, WorkflowDraftView } from '../../workflows/v3/draft-service.js';
 import type { WorkflowDraftInitiator, WorkflowDraftSummary } from '../../workflows/v3/draft-store.js';
 import type { WorkflowOrchestratorBotOption } from '../workflow-drafts-api.js';
 import { readWorkflowSwitches, type WorkflowSwitches } from './workflow-draft-model.js';
@@ -83,26 +83,40 @@ export function fetchDraft(runId: string, fetcher: DraftFetch = fetch) {
   return call<{ draft: WorkflowDraftView }>(fetcher, draftPath(runId));
 }
 
-export function createDraft(input: { larkAppId: string; goal: string }, fetcher: DraftFetch = fetch) {
+/** No `project` = the bot's default dir (the daemon refuses it when the bot has none). */
+export function createDraft(input: { larkAppId: string; goal: string; project?: string }, fetcher: DraftFetch = fetch) {
   return post<{ draft: WorkflowDraftView }>(fetcher, DRAFTS, input);
+}
+
+/**
+ * 「项目」 of a new draft of this bot: its default dir, or the repo picker's
+ * candidates to choose from. `{ runId }` = the bot that copying this run
+ * defaults to.
+ */
+export function fetchProjectOptions(target: { larkAppId: string } | { runId: string }, fetcher: DraftFetch = fetch) {
+  const query = 'larkAppId' in target
+    ? `larkAppId=${encodeURIComponent(target.larkAppId)}`
+    : `runId=${encodeURIComponent(target.runId)}`;
+  return call<{ project: WorkflowDraftProjectOptions }>(fetcher, `/api/v3/orchestration/projects?${query}`);
 }
 
 /** 复制为新工作流（D6）的来源：一个运行，或模板的某个版本。 */
 export type CopySource = { kind: 'run'; runId: string } | { kind: 'template'; workflowId: string; revisionId: string };
 
 /** Path and body of 「复制为新工作流」. No `larkAppId` = the source's orchestrating bot. */
-export function copyRequest(source: CopySource, larkAppId?: string): { path: string; body: Record<string, unknown> } {
-  return { path: `${DRAFTS}/from-source`, body: { source, ...(larkAppId ? { larkAppId } : {}) } };
+export function copyRequest(source: CopySource, larkAppId?: string, project?: string): { path: string; body: Record<string, unknown> } {
+  return { path: `${DRAFTS}/from-source`, body: { source, ...(larkAppId ? { larkAppId } : {}), ...(project ? { project } : {}) } };
 }
 
-export function copyAsNewWorkflow(source: CopySource, larkAppId?: string, fetcher: DraftFetch = fetch) {
-  const request = copyRequest(source, larkAppId);
+export function copyAsNewWorkflow(source: CopySource, larkAppId?: string, project?: string, fetcher: DraftFetch = fetch) {
+  const request = copyRequest(source, larkAppId, project);
   return post<{ draft: WorkflowDraftView }>(fetcher, request.path, request.body);
 }
 
 type DraftAction =
   | { kind: 'message'; text: string }
-  | { kind: 'continue' }
+  /** `project`: the one picked for a draft that has none (and a bot without a default dir). */
+  | { kind: 'continue'; project?: string }
   | { kind: 'spec'; specMarkdown?: string; relayProblems?: boolean }
   | { kind: 'approve-spec' }
   | { kind: 'architect'; note?: string }
@@ -132,7 +146,7 @@ export function draftActionRequest(runId: string, action: DraftAction, baseVersi
   const base = baseVersion !== undefined ? { baseVersion } : {};
   switch (action.kind) {
     case 'message': return { path: draftPath(runId, '/messages'), body: { text: action.text, ...base } };
-    case 'continue': return { path: draftPath(runId, '/clarify/continue'), body: { ...base } };
+    case 'continue': return { path: draftPath(runId, '/clarify/continue'), body: { ...(action.project ? { project: action.project } : {}), ...base } };
     case 'spec': return {
       path: draftPath(runId, '/spec'),
       body: {

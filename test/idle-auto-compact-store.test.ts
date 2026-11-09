@@ -40,7 +40,8 @@ describe('idle auto-compact persistence', () => {
     session.lastMessageAt = new Date(T0 - MIN).toISOString();
     applyIdleAutoCompactSetting(session, { enabled: true, minutes: 30 });
     updateSession(session);
-    const live = { session, lastScreenStatus: 'idle', idleSinceAt: T0 } as unknown as DaemonSession;
+    // A botmux turn just ended (armed by its start) and the screen went idle.
+    const live = { session, lastScreenStatus: 'idle', idleSinceAt: T0, idleAutoCompactArm: { at: T0 - MIN, busy: true } } as unknown as DaemonSession;
     expect(noteIdleAutoCompactScreenStatus(live, 'working', T0)).toBe(true);
     updateSession(session);
 
@@ -68,7 +69,8 @@ describe('idle auto-compact persistence', () => {
     session.lastMessageAt = new Date(T0 - MIN).toISOString();
     applyIdleAutoCompactSetting(session, { enabled: true });
     updateSession(session);
-    const ds = { session, lastScreenStatus: 'idle', idleSinceAt: T0 } as unknown as DaemonSession;
+    const ds = { session, lastScreenStatus: 'idle', idleSinceAt: T0, idleAutoCompactArm: { at: T0 - MIN, busy: true } } as unknown as DaemonSession;
+    noteIdleAutoCompactScreenStatus(ds, 'working', T0);
     let accept = false;
     const compact = vi.fn(() => accept);
     const sweep = (at: number) => runIdleAutoCompactSweep([ds], {

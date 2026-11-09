@@ -24,7 +24,7 @@ import { parseWorkflowsRoute } from '../src/dashboard/web/workflow-draft-model.j
 import { templateSaveRequest } from '../src/dashboard/web/workflow-library-api.js';
 import { loadSavedWorkflowDetailView, listSavedWorkflowCatalogView } from '../src/workflows/v3/library-catalog.js';
 import type { SavedWorkflowDetailView } from '../src/workflows/v3/library-catalog.js';
-import { BOTS, DOC, MAIN, OWNER, PI, SKETCHES, STEWARD, architectSettled, goalNode, makeService, specMarkdown } from './helpers/workflow-draft-fakes.js';
+import { BOTS, DEFAULT_PROJECT, DOC, MAIN, OWNER, PI, SKETCHES, STEWARD, architectSettled, goalNode, makeService, specMarkdown } from './helpers/workflow-draft-fakes.js';
 
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -151,6 +151,7 @@ describe('页面渲染', () => {
       if (url === '/api/settings') return { ok: true, status: 200, json: async () => ({ settings: { workflow: switches } }) } as Response;
       if (url === '/api/v3/orchestration/initiator') return { ok: true, status: 200, json: async () => ({ ok: true, initiator: me }) } as Response;
       if (url === '/api/v3/orchestration/bots') return { ok: true, status: 200, json: async () => ({ ok: true, bots: [] }) } as Response;
+      if (url.startsWith('/api/v3/orchestration/projects?')) return { ok: true, status: 200, json: async () => ({ ok: true, project: { kind: 'default', dir: DEFAULT_PROJECT } }) } as Response;
       const body = routes(url, init) ?? { ok: false, error: 'not_found' };
       return { ok: (body as { ok?: boolean }).ok !== false, status: 200, json: async () => body } as Response;
     });
@@ -204,6 +205,24 @@ describe('页面渲染', () => {
     act(() => { renderer.unmount(); });
   });
 
+  it('运行：daemon 不认页面送的项目（默认目录在表单打开后变了）→ 报错并重新拉项目', async () => {
+    const detail = await twoVersions();
+    const { renderer, sent } = await renderPage(`#/workflows/library/${detail.entry.workflowId}`, (url) => {
+      if (url.endsWith(`/library/${detail.entry.workflowId}`)) return { ok: true, template: detail };
+      if (url.endsWith(`/library/${detail.entry.workflowId}/run`)) return { ok: false, error: 'project_not_allowed' };
+      return undefined;
+    });
+    const projectFetches = () => sent.filter((call) => call.url.startsWith('/api/v3/orchestration/projects?')).length;
+    expect(projectFetches()).toBe(1);
+    await act(async () => { buttons(renderer, '拉群开始')[0]!.props.onClick(); });
+    await flush();
+    expect(sent.find((call) => call.url.endsWith('/run'))?.body).toMatchObject({ project: DEFAULT_PROJECT });
+    expect(text(renderer.root)).toContain('这个项目不在可选范围里');
+    expect(projectFetches()).toBe(2);
+    expect(sent.some((call) => call.url.endsWith('/launch'))).toBe(false);
+    act(() => { renderer.unmount(); });
+  });
+
   it('运行：来源是草稿的版本也直接拉群，不经过确认流程（I13，11-05）', async () => {
     const detail = await twoVersions();
     const created = { runId: 'tmpl-run-1', version: 1, phase: 'flow_confirmed', title: detail.entry.displayName };
@@ -218,7 +237,7 @@ describe('页面渲染', () => {
     expect(text(renderer.root)).not.toContain('确认流程」');
     await act(async () => { buttons(renderer, '拉群开始')[0]!.props.onClick(); });
     await flush();
-    expect(sent.find((call) => call.url.endsWith('/run'))?.body).toEqual({ params: {}, expectedRevisionId: detail.current.revisionId });
+    expect(sent.find((call) => call.url.endsWith('/run'))?.body).toEqual({ params: {}, expectedRevisionId: detail.current.revisionId, project: DEFAULT_PROJECT });
     expect(sent.find((call) => call.url.endsWith('/launch'))?.body).toEqual({ baseVersion: 1 });
     expect(location.hash).toBe('#/workflows/drafts/tmpl-run-1');
     act(() => { renderer.unmount(); });
@@ -248,7 +267,7 @@ describe('页面渲染', () => {
     await act(async () => { depth.props.onChange({ target: { value: '3' } }); });
     await act(async () => { buttons(renderer, '拉群开始')[0]!.props.onClick(); });
     await flush();
-    expect(sent.find((call) => call.url.endsWith('/run'))?.body).toEqual({ params: { focus: 'auth', depth: '3' }, expectedRevisionId: detail.current.revisionId });
+    expect(sent.find((call) => call.url.endsWith('/run'))?.body).toEqual({ params: { focus: 'auth', depth: '3' }, expectedRevisionId: detail.current.revisionId, project: DEFAULT_PROJECT });
     expect(sent.find((call) => call.url.endsWith('/launch'))?.body).toEqual({ baseVersion: 3 });
     act(() => { renderer.unmount(); });
   });

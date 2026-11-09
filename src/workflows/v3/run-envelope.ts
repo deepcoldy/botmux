@@ -115,6 +115,19 @@ const nodeExecutorSchema = z.literal('bot').optional();
 const nodeWorkingDirSchema = z.string().min(1).max(4096)
   .refine((path) => isAbsolute(path) && !path.includes('\0'), 'must be an absolute path');
 
+/**
+ * The project of the Dashboard draft a bot-executed run was launched from
+ * (拉群开始): the absolute directory its clarify session ran in. Unlike
+ * `nodeWorkingDir` it is not a choice for every node: only a node whose
+ * executing bot has no default working dir of its own starts there, checked
+ * by that bot's daemon against the same §15.4 rule (its configured range, or
+ * the initiator's operate right); a bot with a default dir keeps it. Never
+ * together with `nodeWorkingDir`. Only with `nodeExecutor: "bot"`, and only
+ * written when every executing bot's daemon advertises
+ * `workflowNodeProjectDir` — older readers reject the key (`.strict()`).
+ */
+const nodeProjectDirSchema = nodeWorkingDirSchema;
+
 /** Tools the initiator could run as themselves on the main bot (mirrors
  *  `TRIGGER_USER_AUTH_TOOLS`; kept literal so this module stays host-neutral). */
 export const V3_HANDOFF_IDENTITY_TOOLS = ['lark-cli', 'bytedcli'] as const;
@@ -220,6 +233,7 @@ const adHocEnvelopeSchema = z.object({
   ...baseShape,
   nodeExecutor: nodeExecutorSchema,
   nodeWorkingDir: nodeWorkingDirSchema.optional(),
+  nodeProjectDir: nodeProjectDirSchema.optional(),
   source: z.object({
     kind: z.literal('ad_hoc'),
     grillStatePath: z.literal('grill.state.json'),
@@ -244,6 +258,7 @@ const adHocEnvelopeSchema = z.object({
 const savedDefinitionEnvelopeSchema = z.object({
   ...baseShape,
   nodeExecutor: nodeExecutorSchema,
+  nodeProjectDir: nodeProjectDirSchema.optional(),
   source: z.object({
     kind: z.literal('saved_definition'),
     workflowId: runIdSchema,
@@ -430,6 +445,14 @@ export const V3RunEnvelopeSchema = z.union([
       message: 'requires nodeExecutor "bot"',
     });
   }
+  if ('nodeProjectDir' in envelope && envelope.nodeProjectDir !== undefined) {
+    if (envelope.nodeExecutor !== 'bot') {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['nodeProjectDir'], message: 'requires nodeExecutor "bot"' });
+    }
+    if ('nodeWorkingDir' in envelope && envelope.nodeWorkingDir !== undefined) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['nodeProjectDir'], message: 'must be absent when nodeWorkingDir is set' });
+    }
+  }
 
   if (envelope.authorization.kind === 'gate2') {
     const artifacts = envelope.artifacts as z.infer<typeof adHocEnvelopeSchema>['artifacts'];
@@ -543,6 +566,14 @@ export function frozenHandoffIdentity(envelope: V3RunEnvelope): V3FrozenHandoffI
 export function frozenNodeWorkingDir(envelope: V3RunEnvelope): string | undefined {
   if (!('nodeWorkingDir' in envelope) || envelope.nodeExecutor !== 'bot') return undefined;
   return envelope.nodeWorkingDir;
+}
+
+/** The project of the Dashboard draft a bot-executed run was launched from,
+ *  or undefined: then (and for every bot with a default working dir) a node
+ *  runs in its executing bot's own default. */
+export function frozenNodeProjectDir(envelope: V3RunEnvelope): string | undefined {
+  if (!('nodeProjectDir' in envelope) || envelope.nodeExecutor !== 'bot') return undefined;
+  return envelope.nodeProjectDir;
 }
 
 /** Who started a bot-executed run, as the §15.4 working-dir rule asks
@@ -1126,6 +1157,7 @@ export function makeAdHocRunEnvelope(input: CommonBuilderInput & {
   artifacts: V3AdHocRunEnvelope['artifacts'];
   nodeExecutor?: 'bot';
   nodeWorkingDir?: string;
+  nodeProjectDir?: string;
   handoffIdentity?: V3HandoffIdentityRecord;
   initiator?: V3RunInitiator;
   flowConfirmation?: V3FlowConfirmation;
@@ -1138,6 +1170,7 @@ export function makeAdHocRunEnvelope(input: CommonBuilderInput & {
     ...(input.chatBinding ? { chatBinding: input.chatBinding } : {}),
     ...(input.nodeExecutor ? { nodeExecutor: input.nodeExecutor } : {}),
     ...(input.nodeWorkingDir !== undefined ? { nodeWorkingDir: input.nodeWorkingDir } : {}),
+    ...(input.nodeProjectDir !== undefined ? { nodeProjectDir: input.nodeProjectDir } : {}),
     source: { kind: 'ad_hoc', grillStatePath: 'grill.state.json' },
     artifacts: input.artifacts,
     authorization: {
@@ -1160,6 +1193,7 @@ export function makeSavedDefinitionRunEnvelope(input: CommonBuilderInput & {
   authorizedAt: string;
   artifacts: V3SavedDefinitionRunEnvelope['artifacts'];
   nodeExecutor?: 'bot';
+  nodeProjectDir?: string;
   handoffIdentity?: V3HandoffIdentityRecord;
   initiator?: V3RunInitiator;
   flowConfirmation?: V3FlowConfirmation;
@@ -1171,6 +1205,7 @@ export function makeSavedDefinitionRunEnvelope(input: CommonBuilderInput & {
     createdAt: input.createdAt,
     ...(input.chatBinding ? { chatBinding: input.chatBinding } : {}),
     ...(input.nodeExecutor ? { nodeExecutor: input.nodeExecutor } : {}),
+    ...(input.nodeProjectDir !== undefined ? { nodeProjectDir: input.nodeProjectDir } : {}),
     source: {
       kind: 'saved_definition',
       workflowId: input.workflowId,

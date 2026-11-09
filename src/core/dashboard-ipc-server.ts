@@ -42,7 +42,8 @@ import {
   type WorkflowInitiatorResolution,
 } from './workflow-initiator.js';
 import { createProductionDraftClarifier, registerWorkflowDraftIpcRoutes, workflowDraftService } from './workflow-draft-daemon.js';
-import type { DraftClarifier } from '../workflows/v3/draft-service.js';
+import type { DraftClarifier, WorkflowDraftProjects } from '../workflows/v3/draft-service.js';
+import { scanMultipleProjects } from '../services/project-scanner.js';
 import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
 import { updateHandoffLiveCard } from './worker-pool.js';
 import { authorizeOwnerlessScheduleCreator, authorizeScheduleOperator } from './schedule-creator-authorization.js';
@@ -53,7 +54,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createReadStream, existsSync, readFileSync, statSync, unlinkSync } from 'node:fs';
 import { hostDnsServers, networkPolicyWarnings, proxyEnvKeys } from './sandbox-network-policy.js';
-import { join } from 'node:path';
+import { join, resolve as resolvePath } from 'node:path';
 import { updateDispatchRegistry } from './dispatch-registry.js';
 import { logger } from '../utils/logger.js';
 import type { DurableLarkOutboxTarget } from '../services/durable-lark-outbox.js';
@@ -247,7 +248,7 @@ import {
 } from '../services/quota-fallback.js';
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
-import { readGlobalConfig, isDispatchTaskTreeCardEnabled, isWorkflowFeatureEnabled, workflowNodeExecutorMode } from '../global-config.js';
+import { readGlobalConfig, isDispatchTaskTreeCardEnabled, isWorkflowFeatureEnabled, workflowNodeExecutorMode, repoPickerScanOptions } from '../global-config.js';
 import { archiveCodexForCleanup } from '../services/codex-cleanup-archive.js';
 import {
   clearChatReplyMode,
@@ -297,7 +298,7 @@ import {
 } from '../services/group-collaboration-mode-store.js';
 import { publishNativeTopicLinkPatchForSession } from './session-activity.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
-import { createHeadlessSession, resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
+import { createHeadlessSession, resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot, expandHome, getProjectScanDirsForBot } from './session-manager.js';
 import { reconcileResumedStreamingCard } from './resume-streaming-card.js';
 import { buildRestartStatusCard, restartStatusCardNotifier } from './restart-status-card.js';
 import type { RestartObserver } from './restart-coordinator.js';
@@ -627,7 +628,8 @@ import { ChatRenameCooldown, chatRenameSerialQueue, normalizeLarkChatName } from
 import { isSilentMessageListenerSession } from './message-listener-silence.js';
 import { executeChatRename } from './chat-rename-operation.js';
 import { authorizeHumanManager } from './human-manager-authorization.js';
-import { changeChatManager, getChatManagerStatus } from '../services/chat-manager.js';
+import { planChatManagerMutation } from './lead-only.js';
+import { changeChatManager, getChatManagerStatus, setChatManagerLeadOnly } from '../services/chat-manager.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, isHttpVirtualSession, isHeadlessSessionChatId, larkTransportEnabled, type DaemonSession } from './types.js';
 import { isRemoteBackendSession, persistentBackendTargetForSession, probePersistentBackendTarget } from './persistent-backend.js';
@@ -3762,10 +3764,14 @@ for (const action of ['auth-request', 'auth-status']) {
       return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
     }
     const origin = ds?.managedTurnOrigin;
+    const denyCurrentActor = (reason: string) => {
+      logger.warn(`[session-auth] session=${params.sessionId} action=${action} reason=${reason}`);
+      return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+    };
     if (!ds || ds.session.status !== 'active' || sessionTransportDisabled(ds)
       || ds.session.vcMeetingReceiver || !ds.worker || ds.worker.killed
       || !origin?.turnId || !origin.capability) {
-      return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+      return denyCurrentActor('origin_unavailable');
     }
     // Two proof modes for "this request belongs to the current turn":
     //  · Isolated pane (sandbox / read isolation): presents the rotating
@@ -3779,7 +3785,7 @@ for (const action of ['auth-request', 'auth-status']) {
     if (presentsOriginTuple) {
       if (body.originCapability !== origin.capability || body.originTurnId !== origin.turnId
         || body.originDispatchAttempt !== origin.dispatchAttempt) {
-        return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+        return denyCurrentActor('origin_tuple_mismatch');
       }
     } else if (!boundTool) {
       const peer = await resolveLoopbackPeerProcesses({
@@ -3790,7 +3796,7 @@ for (const action of ['auth-request', 'auth-status']) {
       if (!peer.ok || !attestCurrentExecutionLoopbackPeer({
         sessionId: params.sessionId, peer: peer.peer, findSession: findActiveBySessionId,
       })) {
-        return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+        return denyCurrentActor('execution_peer_unverified');
       }
     }
     const cfg = getBot(ds.larkAppId).config;
@@ -3808,7 +3814,7 @@ for (const action of ['auth-request', 'auth-status']) {
     const identityTurnId = origin.identityTurnId ?? origin.turnId;
     const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, identityTurnId);
     const callerOpenId = requestingUser();
-    if (!callerOpenId) return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+    if (!callerOpenId) return denyCurrentActor('caller_unavailable');
     const originCallerOpenId = origin.callerOpenId;
     const turnId = origin.turnId;
     const capability = origin.capability;
@@ -3938,7 +3944,7 @@ for (const action of ['auth-request', 'auth-status']) {
       ? cached
       : await resolveVerifiedUserIdentity(ds.larkAppId, callerOpenId);
     if (!identity || identity.type !== 'user' || identity.openId !== callerOpenId || !isCurrent()) {
-      return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+      return denyCurrentActor(!isCurrent() ? 'origin_changed_during_identity_lookup' : 'identity_unverified');
     }
     // A person with no grant to this bot's application usually cannot give one
     // (the app's availability range excludes them); their lark-cli identity
@@ -3954,7 +3960,7 @@ for (const action of ['auth-request', 'auth-status']) {
       });
     }
     // The check above awaited; the turn may have moved on meanwhile.
-    if (!isCurrent()) return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+    if (!isCurrent()) return denyCurrentActor('origin_changed_during_platform_lookup');
     // Issuance is turn-bound; an accepted grant belongs to this app/user and
     // session until its own deadline. A different speaker cannot claim it.
     const appId = cfg.larkAppId;
@@ -4103,25 +4109,26 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-manager', async (req, res, param
     return jsonRes(res, 400, { ok: false, error: 'regular_group_only' });
   }
   if (body.action === 'status') return jsonRes(res, 200, await getChatManagerStatus(ds.larkAppId, ds.chatId));
-  if (body.action !== 'set' && body.action !== 'clear') return jsonRes(res, 400, { ok: false, error: 'invalid_action' });
-  // `set` requires the per-bot manager switch. `clear` (teardown) and status are
+  // `set` and `lead-only on` require the per-bot manager switch. `clear`, `lead-only off` and status are
   // intentionally left ungated so an admin can always remove the manager / inspect
   // state even after turning the switch off — the switch gates activation, not removal.
-  if (body.action === 'set' && getBot(ds.larkAppId).config.chatManagerEnabled !== true) {
-    return jsonRes(res, 409, { ok: false, error: 'chat_manager_disabled' });
-  }
+  const plan = planChatManagerMutation(body, getBot(ds.larkAppId).config.chatManagerEnabled === true);
+  if (!plan.ok) return jsonRes(res, plan.status, { ok: false, error: plan.error });
   const { getMessageDetail } = await import('../im/lark/client.js');
   const { effectiveBotDisplayName } = await import('../bot-registry.js');
   const human = await authorizeHumanManager({
     sessionId: ds.session.sessionId, appId: ds.larkAppId, chatId: ds.chatId,
-    action: body.action, claim: body, targetOpenId: getBotOpenId(ds.larkAppId),
+    action: plan.authAction,
+    claim: body, targetOpenId: getBotOpenId(ds.larkAppId),
     liveOrigin: () => findActiveBySessionId(params.sessionId)?.managedTurnOrigin,
     readMessage: getMessageDetail,
     canOperate: (app, chat, sender) => getBot(app).resolvedAllowedUsers.includes(sender) && canOperate(app, chat, sender),
   });
   if (!human.ok) return jsonRes(res, 403, human);
-  const result = await changeChatManager(ds.larkAppId, ds.chatId, body.action,
-    effectiveBotDisplayName(getBot(ds.larkAppId)), human.stillCurrent);
+  const result = plan.action === 'lead-only'
+    ? await setChatManagerLeadOnly(ds.larkAppId, ds.chatId, plan.leadOnly as boolean, human.stillCurrent)
+    : await changeChatManager(ds.larkAppId, ds.chatId, plan.action,
+      effectiveBotDisplayName(getBot(ds.larkAppId)), human.stillCurrent);
   return jsonRes(res, result.ok ? 200 : 409, result);
 });
 /** Session-scoped external mutation used by the botmux-chat-rename Skill. */
@@ -7105,6 +7112,24 @@ export function productionWorkflowDraftClarifier(): DraftClarifier {
     closeSession: (sessionId) => closeSessionForBackgroundCleanup(sessionId, 'workflow draft clarify session'),
     deleteHeadlessRecord: (headlessId) => { deleteHeadlessSession(headlessId); },
   });
+}
+
+/** The drafts' projects: this bot's effective default dir, else the same
+ *  candidates the Feishu repo picker card offers a new topic. */
+export function productionWorkflowDraftProjects(larkAppId: string): WorkflowDraftProjects {
+  return {
+    defaultDir: () => {
+      const dir = effectiveDefaultWorkingDir(getBot(larkAppId).config);
+      return dir ? resolvePath(expandHome(dir)) : undefined;
+    },
+    candidates: () => {
+      const scanDirs = getProjectScanDirsForBot(larkAppId).filter((dir) => existsSync(dir));
+      if (scanDirs.length === 0) return [];
+      return scanMultipleProjects(scanDirs, 3, repoPickerScanOptions())
+        .map(({ path, name, type, branch }) => ({ path, name, type, ...(branch ? { branch } : {}) }));
+    },
+    sessionDir: (sessionId) => findActiveBySessionId(sessionId)?.workingDir ?? sessionStore.getOwnedSession(sessionId)?.workingDir,
+  };
 }
 
 /**

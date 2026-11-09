@@ -131,14 +131,16 @@ describe('入口（§4.1）', () => {
     expect(states.get(PI)?.disabledReason?.key).toBe('workflow.draft.unavailable.cli_unsupported');
   });
 
-  it('只有选了能用的 Bot、拿到发起人、写了目标才能开始', () => {
+  it('只有选了能用的 Bot、拿到发起人、有了项目、写了目标才能开始', () => {
     const bot = { larkAppId: MAIN, name: 'm', cliId: 'claude-code', online: true };
     const ok: InitiatorCheck = { state: 'ok', initiator: OWNER };
-    expect(canStartDraft({ goal: '目标', bot, check: ok, busy: false })).toBe(true);
-    expect(canStartDraft({ goal: '  ', bot, check: ok, busy: false })).toBe(false);
-    expect(canStartDraft({ goal: '目标', bot, check: { state: 'checking' }, busy: false })).toBe(false);
-    expect(canStartDraft({ goal: '目标', bot: { ...bot, unavailable: { code: 'daemon_offline', why: 'x' } }, check: ok, busy: false })).toBe(false);
-    expect(canStartDraft({ goal: '目标', bot, check: ok, busy: true })).toBe(false);
+    const project = '/work/repo';
+    expect(canStartDraft({ goal: '目标', bot, check: ok, project, busy: false })).toBe(true);
+    expect(canStartDraft({ goal: '  ', bot, check: ok, project, busy: false })).toBe(false);
+    expect(canStartDraft({ goal: '目标', bot, check: { state: 'checking' }, project, busy: false })).toBe(false);
+    expect(canStartDraft({ goal: '目标', bot: { ...bot, unavailable: { code: 'daemon_offline', why: 'x' } }, check: ok, project, busy: false })).toBe(false);
+    expect(canStartDraft({ goal: '目标', bot, check: ok, project, busy: true })).toBe(false);
+    expect(canStartDraft({ goal: '目标', bot, check: ok, project: null, busy: false })).toBe(false);
   });
 
   it('发起人只认 open_id 与登录方式都一致', () => {

@@ -63,6 +63,8 @@ export function authorizeRun(run: BotRun, opts: {
   chatBinding?: typeof BINDING;
   /** Gate-2 `--working-dir` (design §15.4). */
   nodeWorkingDir?: string;
+  /** The launching Dashboard draft's project (§15.4, bots without a default dir). */
+  nodeProjectDir?: string;
 }): Map<string, BotSnapshot> {
   const runDir = run.runDir;
   mkdirSync(runDir, { recursive: true });
@@ -86,6 +88,7 @@ export function authorizeRun(run: BotRun, opts: {
     authorizedByOpenId: binding.ownerOpenId,
     nodeExecutor: 'bot',
     ...(opts.nodeWorkingDir ? { nodeWorkingDir: opts.nodeWorkingDir } : {}),
+    ...(opts.nodeProjectDir ? { nodeProjectDir: opts.nodeProjectDir } : {}),
     ...(opts.identity ? { handoffIdentity: opts.identity } : {}),
     artifacts: {
       dag: artifactRef(runDir, 'dag.json'),
@@ -190,6 +193,7 @@ export function identityWorld(overrides: Partial<WorkflowNodeDaemonDeps> = {}, o
     loadRun: () => undefined,
     botWorkingDirConfig: () => ({}),
     daemonAppliesNodeWorkingDir: () => true,
+    daemonReadsNodeProjectDir: () => true,
     drive: () => {},
     botName: (appId) => `bot(${appId})`,
     warn: () => {},

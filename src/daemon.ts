@@ -520,9 +520,10 @@ import {
   identityDecisionConflict,
   identityDecisionTurnIsLive,
   collectSessionTurnGarbage,
+  sweepTraexInstallChanges,
 } from './core/worker-pool.js';
 import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
-import { noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice } from './core/idle-auto-compact.js';
+import { isLocalCliCommand, noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice } from './core/idle-auto-compact.js';
 import { ensureServerThenReapOrphanTmuxServers, orphanTmuxReaperEnabled, reaperCandidateSocketNames } from './core/orphan-tmux-reaper.js';
 import { runPeriodicOrphanSessionSweep, loadRichProcsLinux, enumerateThreadLockHolders, enumerateOrphanPanes, readProcEnviron } from './core/orphan-session-reaper.js';
 import { listeningServersOnPath, probeTmuxOwner, tmuxSocketPath, procIsBotmuxListener } from './core/tmux-server-guard.js';
@@ -533,7 +534,7 @@ import {
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
 import { createProductionDraftLaunchDeps, createProductionWorkflowDraftService, installWorkflowDraftService } from './core/workflow-draft-daemon.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setCardClickTurnPoster, productionWorkflowDraftClarifier, productionWorkflowDraftSessionBinder, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setCardClickTurnPoster, productionWorkflowDraftClarifier, productionWorkflowDraftProjects, productionWorkflowDraftSessionBinder, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -5802,6 +5803,8 @@ interface DaemonDescriptor {
   dispatchLaunchIpcProtocol?: 'v1';
   /** Applies a workflow run's Gate-2 working dir to node sessions (§15.4). */
   workflowNodeWorkingDir: 'v1';
+  /** Reads a run's `nodeProjectDir` (the launching draft's project, §15.4). */
+  workflowNodeProjectDir: 'v1';
   /** Handles main-topic workflow handoffs (§5.5). */
   workflowMainPlacement: 'v1';
   /** Presence-based session-store capability. Copy only; never a write permit. */
@@ -7254,6 +7257,7 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
     try { return getBot(appId).config; } catch { return undefined; }
   },
   daemonAppliesNodeWorkingDir: (appId) => findOnlineDaemon(appId)?.workflowNodeWorkingDir === 'v1',
+  daemonReadsNodeProjectDir: (appId) => findOnlineDaemon(appId)?.workflowNodeProjectDir === 'v1',
   // §15.4: the initiator operates this bot when they may use /cd in its
   // topics (the gate a typed /cd passes) and are in the run's chat now, with
   // their identity converted into this bot's own app first.
@@ -25686,7 +25690,11 @@ function deliverPassthroughToExistingSession(
     // the input never landed — the idle auto-compact sweep would otherwise
     // release its claim and compact the same idle stretch again.
     turn.onDelivered?.();
+    // A locally answered CLI command (/model, /cost, …) sends no request, so it
+    // must not arm a warm idle-auto-compact stretch (core/idle-auto-compact.ts).
+    const idleCompactArm = ds.idleAutoCompactArm;
     beginNewTurn(ds, commandContent, turnId);
+    if (isLocalCliCommand(cmd)) ds.idleAutoCompactArm = idleCompactArm;
     markPassthroughActivity(ds, turnId);
     logger.info(`[${anchor.substring(0, 12)}] Passthrough ${cmd} → worker`);
     return true;
@@ -33262,6 +33270,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     workflowIpcProtocol: 'v1',
     ...(cfg.dispatchLaunchPolicy?.enabled === true ? { dispatchLaunchIpcProtocol: 'v1' as const } : {}),
     workflowNodeWorkingDir: 'v1',
+    workflowNodeProjectDir: 'v1',
     workflowMainPlacement: 'v1',
     sessionStoreProtocol: SESSION_STORE_PROTOCOL,
     botmuxVersion: botmuxVersion(),
@@ -34055,6 +34064,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   installWorkflowDraftService(createProductionWorkflowDraftService(
     cfg.larkAppId,
     productionWorkflowDraftClarifier(),
+    productionWorkflowDraftProjects(cfg.larkAppId),
     createProductionDraftLaunchDeps({
       appId: cfg.larkAppId,
       startRun: async (runId) => {
@@ -35388,6 +35398,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Dashboard config edits need no restart; the timer also backstops any
     // missed lifecycle edge. Normal new/resumed sessions enforce immediately.
     enforceLiveSessionCap('periodic');
+    // A fully quiet idle TRAE worker produces no screen/PTY edge, so the
+    // install-replacement check must be driven by this timer. Detection is
+    // shared per install entry and never runs a CLI version probe.
+    try {
+      const queued = sweepTraexInstallChanges(activeSessions.values(), getBot(cfg.larkAppId).config);
+      if (queued > 0) logger.info(`[install-watch] queued ${queued} TRAE install-change reclaim(s)`);
+    } catch (error) {
+      logger.warn(`[install-watch] TRAE install sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
     void closeIdleGroupSessions().catch(error => logger.warn(`[group-idle-close] sweep failed: ${String(error)}`));
     // Claude Code prompt-cache keep-alive: off unless config.json / bots.json
     // `promptCache.keepalive.enabled`; read live so Dashboard edits apply here.

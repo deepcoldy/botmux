@@ -63,10 +63,10 @@ async function code(promise: Promise<unknown>): Promise<string> {
   return 'ok';
 }
 
-function setup() {
+function setup(overrides: Parameters<typeof makeService>[1] = {}) {
   const launch = fakeLaunch(base);
   launch.setOnline(ONLINE);
-  const h = makeService(base, { loadBots: () => FLEET, launch: launch.deps, libraryDataDir: library });
+  const h = makeService(base, { loadBots: () => FLEET, launch: launch.deps, libraryDataDir: library, ...overrides });
   h.setOnline(ONLINE);
   return { h, launch };
 }
@@ -432,6 +432,49 @@ describe('运行模板（§5.3, I13）', () => {
     expect(prompts).toHaveLength(1);
     expect(prompts[0]).toContain(`v1`);
     expect(prompts[0]).not.toMatch(/botmux workflow (start|approve|new|edit)/);
+  });
+
+  it('a main bot without a default dir: running a template needs a picked project, and the main bot\'s session opens there', async () => {
+    const repo = '/work/projects/web-portal';
+    const { h } = setup({ projects: { defaultDir: () => undefined, candidates: () => [{ path: repo, name: 'web-portal', type: 'repo' }] } });
+    seedFinishedRun('src-261101-080000-000-aaaa0031');
+    const saved = await h.service.saveRunAsTemplate('src-261101-080000-000-aaaa0031', OWNER, { requestKey: 'req-run-0031' });
+    expect(await code(h.service.createFromTemplate(OWNER, { workflowId: saved.workflowId }))).toBe('project_required');
+    expect(await code(h.service.createFromTemplate(OWNER, { workflowId: saved.workflowId, project: '/etc' }))).toBe('project_not_allowed');
+    const draft = await h.service.createFromTemplate(OWNER, { workflowId: saved.workflowId, project: repo });
+    expect(draft.project).toEqual({ dir: repo, from: 'draft' });
+    await h.service.launch(draft.runId, OWNER, {});
+    expect((await settled(h.service, draft.runId)).phase).toBe('started');
+    expect(h.clarify.createInputs.map((input) => input.workingDir)).toEqual([repo]);
+  });
+
+  /** A template run of a picked project, launched; its run.json. */
+  async function templateRunWithProject(reads: (appId: string) => boolean) {
+    const repo = '/work/projects/web-portal';
+    const { h } = setup({
+      projects: { defaultDir: () => undefined, candidates: () => [{ path: repo, name: 'web-portal', type: 'repo' }] },
+      daemonReadsNodeProjectDir: reads,
+    });
+    seedFinishedRun('src-261101-080000-000-aaaa0041');
+    const saved = await h.service.saveRunAsTemplate('src-261101-080000-000-aaaa0041', OWNER, { requestKey: 'req-run-0041' });
+    const draft = await h.service.createFromTemplate(OWNER, { workflowId: saved.workflowId, project: repo });
+    await h.service.launch(draft.runId, OWNER, {});
+    expect((await settled(h.service, draft.runId)).phase).toBe('started');
+    const read = readRunEnvelope(join(base, draft.runId), draft.runId);
+    expect(read.kind).toBe('ok');
+    return { repo, run: (read as any).envelope };
+  }
+
+  it('拉群开始 of a template: run.json carries the picked project for the nodes when every executing bot\'s daemon reads it', async () => {
+    const { repo, run } = await templateRunWithProject(() => true);
+    expect(run.source.kind).toBe('saved_definition');
+    expect(run.nodeProjectDir).toBe(repo);
+  });
+
+  it('拉群开始 of a template with an older executing daemon: the project is left out and the run starts as before', async () => {
+    const { run } = await templateRunWithProject((appId) => appId !== DOC);
+    expect(run.source.kind).toBe('saved_definition');
+    expect(run).not.toHaveProperty('nodeProjectDir');
   });
 
   it('the main bot session of a template run: a failed open stops the launch; 「继续」 opens it again', async () => {

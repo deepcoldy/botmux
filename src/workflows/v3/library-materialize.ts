@@ -474,6 +474,9 @@ export interface CommitSavedWorkflowRunInPlaceInput {
   expected: { dagSha256: string; specSha256: string };
   bots: BotConfig[];
   now?: Date;
+  /** The launching draft's project, recorded as `nodeProjectDir` (the caller
+   *  has checked that every executing bot's daemon reads it). */
+  nodeProjectDir?: string;
 }
 
 /**
@@ -635,6 +638,7 @@ export function commitSavedWorkflowRunInPlace(input: CommitSavedWorkflowRunInPla
     authorizedAt: now.toISOString(),
     chatBinding: input.chatBinding,
     nodeExecutor: 'bot',
+    ...(input.nodeProjectDir !== undefined ? { nodeProjectDir: input.nodeProjectDir } : {}),
     initiator: input.initiator,
     ...(flowConfirmation ? { flowConfirmation } : {}),
     artifacts: {

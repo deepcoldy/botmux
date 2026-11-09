@@ -436,6 +436,8 @@ export const messages: Record<string, string> = {
   'card.stuck.page.hook_review_level1': 'Hook 审核列表：列出的 hook 需要审核，审核前不会运行。',
   'card.stuck.page.hook_review_level2': '单个 hook 的审核页：决定是否信任这个 hook。',
   'card.stuck.page.migration_menu': 'CLI 迁移选择：询问是否从旧配置迁移。',
+  'card.stuck.page.session_lock': '会话被占用：另一进程持有写锁。请核对终端中的 Owner PID，正常退出持锁的那份会话后再按 R 重试；不要盲删锁文件或结束未知进程。',
+  'card.stuck.key.retry_session_lock': '占用解除后重试（R）',
   'card.stuck.page.unknown': '未识别的页面：卡片不提供按键，请打开 Web 终端查看并手动处理。',
   'card.stuck.screen_tail': '终端末尾：',
   'card.stuck.hint.initiator': '本轮发起人或管理员可以点下面的按键；标注「仅管理员」的按键只有管理员能点。也可以打开 Web 终端手动处理。',
@@ -1313,6 +1315,7 @@ export const messages: Record<string, string> = {
   'xpi.timeout.still_busy': '原任务仍在执行，且未选择后续处理；消息未执行。可重新发送，或 botmux send --as independent。',
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
+  'ai.lead_only.rules': '你是本群的负责人（chat manager），只转发不执行：不论任务大小一律用 botmux dispatch 派给执行 bot；需要看代码/资料也派单，让执行 bot 回报结论，不要自己读写文件或跑非 botmux 命令。长期笔记（用户定的规矩、各执行 bot 的专长）在群白板启用时先 botmux whiteboard current --create，再不带 --id 用 botmux whiteboard read/update 记到本群白板；白板由群内所有 bot 共享，不要写密钥。你只能使用 botmux 命令，且命令必须是单条普通 botmux 命令：不能用重定向（< >）、管道、; & 、$ 展开、反引号、括号或 # 注释；多行/含特殊字符的正文请整体放进单引号 \'...\'（正文里不要出现单引号），或在命令末尾用带引号定界符的 heredoc（<<\'EOF\'，结束行之后不能再有命令）。派出的会话是否起来用 botmux observe 确认。orchestrate 等技能里「简单紧耦合工作自己完成」一句在本会话不适用。',
   'ai.identity.unknown': '(未知)',
   'ai.credentials.acting_identity': '本会话已为 {tools} 启用按当前消息发起人身份注入授权。调用时沿用 botmux 注入的身份；授权可用性以工具返回结果为准。',
   'ai.credentials.git_identity': 'git 对 {host} 的鉴权已配置为使用本轮 bytedcli 身份。',
@@ -1387,6 +1390,9 @@ export const messages: Record<string, string> = {
   // <whiteboard> 结构化块（session-manager.renderWhiteboardBlock，{id} 必填）
   'ai.whiteboard.block_read': '本地项目上下文；读取：`botmux whiteboard read --id {id} --json`（拿到 content 与 updatedAt）。',
   'ai.whiteboard.block_update': '更新状态：`botmux whiteboard update --id {id} --expected-updated-at <上次 read 的 updatedAt> <内容>`。',
+  // lead-only 负责人会话的守卫拒绝 --id，这两条替换上面两条
+  'ai.whiteboard.block_read_lead_only': '本地项目上下文；读取：`botmux whiteboard read --json`（拿到 content 与 updatedAt；本会话只能读写本群白板，不要带 --id）。',
+  'ai.whiteboard.block_update_lead_only': '更新状态：`botmux whiteboard update --expected-updated-at <上次 read 的 updatedAt> <内容>`。',
   'ai.whiteboard.block_rewrite': '更新前先用 `read --json` 拿到当前内容与 updatedAt，融合新信息后整体重写为一份完整的当前状态（默认中文；代码标识/命令/错误信息可保留原文），并用 `--expected-updated-at` 回传 read 到的版本号做并发冲突检测。',
   'ai.whiteboard.block_cas': '若更新报 `whiteboard_cas_mismatch`，说明期间有其它 agent 改过白板——重新 `read --json` 拿最新内容与 updatedAt，再次融合重写。',
   'ai.whiteboard.block_tail_send': '不要直接读写本地文件；不要写密钥/隐私；用户可见结论仍必须 `botmux send`。',
@@ -1661,6 +1667,7 @@ export const messages: Record<string, string> = {
   'worker.empty_final_failed_invalid_request': '⚠️ {cliName} 请求被拒绝：{reason}\n请检查 CLI、模型网关和工具 schema 配置，修复后重发消息。',
   'worker.empty_final_failed_auth': '⚠️ {cliName} 认证失败：{reason}\n请检查 CLI 登录状态和模型服务凭证，修复后重发消息。',
   'worker.empty_final_failed_connection': '⚠️ {cliName} 连接模型服务失败：{reason}\n请检查网络与模型服务状态，恢复后重发消息。',
+  'worker.empty_final_failed_payload_too_large': '⚠️ {cliName} 请求体超过模型服务上限（413 Payload Too Large）：{reason}\n这不是网络问题，是单次请求的体积太大——多为会话里累积了太多图片（每张图会转成几 MB 的 base64 并随每一轮重发）或历史太长。\n处理：新开一个会话（或点「新话题」）重发任务；需要看图时先缩到 1280px 以内、一次只读 1~3 张；长任务分段做，不要在一个会话里堆几十张图。',
   'worker.empty_final_failed_upstream': '⚠️ {cliName} 遇到模型网关/上游服务故障：{reason}\n这是服务端暂态错误，与你的消息内容无关；请稍后重发消息重试。',
   'worker.empty_final_failed_credential': '⚠️ {cliName} 获取模型凭据失败，本轮已中止：{reason}\n请求没有发到模型，多为机器负载高时取 token 超时，属暂态错误；直接重发消息即可继续。反复出现请检查凭据命令或登录状态。',
   'worker.codex_capacity_recovery_stopped': '⚠️ {cliName} 模型容量不足，当前停止自动恢复。请稍后点击「继续」恢复原任务，或切换模型后继续。',
@@ -2416,6 +2423,7 @@ export const messages: Record<string, string> = {
   'worker.interrupt_recovery_zmx': '请在本机运行 botmux list，进入该 ZMX 会话检查并手动中断；如果状态仍不确定，请用 /restart 重启会话。',
   'worker.interrupt_recovery_web': '请重试，或打开 Web 终端后手动中断。',
   'worker.skill_delivery_failed': '⚠️ 当前 bot 的 Skill delivery 配置阻止了新会话启动：{reason}\n请把 skills.delivery 改为 auto/prompt，或改用支持 native skill delivery 的 CLI 后再重试。',
+  'worker.final_output_undelivered': '⚠️ 这一轮的回复没能发到群里：无法确认它属于当前会话运行时（运行时可能刚切换）。请在网页终端查看完整输出，或重新发送消息。',
   'worker.coco_session_dir_gone': '⚠️ 当前 CoCo 进程的会话目录已被删除（可能是 e2e 测试清理或手动 rm），写到 events.jsonl 的内容会落到一个失效 inode 上，桥接读不到。请重启 CoCo 后重新 /adopt。',
   'worker.cli_flag_needs_upgrade': '⚠️ 本机 {cliName} 是 {version}，低于 {minVersion}，不支持启动参数 {flag}，这次启动已经去掉了它（旧版本没有 hooks 信任确认这一步，启动不受影响）。建议升级到 {minVersion} 或更新的版本；PATH 上装了多份时，请确认 bot 实际用的是哪一份（`which -a traex traecli`）。',
   'worker.cli_rejected_argument': '⚠️ {cliName} 启动失败：它不认识启动参数 {flag}（unexpected argument），一般是 CLI 版本太旧。请把 {cliName} 升级到最新版；PATH 上装了多份时，请确认 bot 用的是新版（`which -a traex traecli`）。',
@@ -2516,6 +2524,7 @@ export const messages: Record<string, string> = {
   'submitDiag.logged_out': '⚠️ 消息没有进入模型：{cliName} 停在登录/鉴权页面\n阶段：输入提交\n错误码：submit_unconfirmed\n终端当前停在 {cliName} 的登录或鉴权页面（要求先登录，或登录态已失效），这条消息没有进入模型。CLI 自身登录与飞书授权是两层，互不代表。\n请打开 Web 终端完成登录后，再重发这条消息。\n原消息：{preview}',
   'submitDiag.interactive_menu': '⚠️ 消息没有进入模型：{cliName} 停在等待键盘选择的界面\n阶段：输入提交\n错误码：submit_unconfirmed\n终端当前停在需要键盘选择的界面（更新、数据迁移、hooks review 或确认框等），这条消息没有进入模型。\n请打开 Web 终端完成选择，或按 Esc 取消该界面后再重发；BotMux 不会替你做选择。\n原消息：{preview}',
   'submitDiag.draft_parked': '⚠️ 消息已粘贴但没有提交：正文停在 {cliName} 输入框\n阶段：输入提交\n错误码：submit_unconfirmed\n消息正文仍停在输入框，提交尚未成功。\n请打开 Web 终端按 Enter 提交；若确认不需要执行，再回到飞书重发。\n原消息：{preview}',
+  'submitDiag.session_locked': '⚠️ 会话被占用，消息提交未确认：{cliName}\n阶段：输入提交\n错误码：submit_unconfirmed\n当前会话的写锁被另一进程持有。请核对终端中的 Owner PID，正常退出持锁的那份会话后按 R 重试。\nBotMux 不会终止占用进程或自动重发这条未确认消息；请先核对会话记录，避免重复执行。\n原消息：{preview}',
   // ─── schedulePos: 定时任务「本任务专属话题」执行位置（opt-in 任务级隔离） ─────
   'schedulePos.positionNote': '执行位置：本任务专属话题（首次触发时自动创建；同一任务之后每次触发都在该话题内继续，不同任务各自独立、互不串扰；仅支持单个群聊）',
   'schedulePos.cardDeliveryTask': '专属话题（本任务独立）',
