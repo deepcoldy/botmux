@@ -12,7 +12,7 @@ import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { WorkflowDraftError, type WorkflowDraftProjectCandidate, type WorkflowDraftProjects } from '../src/workflows/v3/draft-service.js';
+import { DRAFT_PROJECT_OFFER_TTL_MS, WorkflowDraftError, type WorkflowDraftProjectCandidate, type WorkflowDraftProjects } from '../src/workflows/v3/draft-service.js';
 import { readWorkflowDraft, writeWorkflowDraft } from '../src/workflows/v3/draft-store.js';
 import { DEFAULT_PROJECT, DOC, OWNER, makeService } from './helpers/workflow-draft-fakes.js';
 
@@ -96,6 +96,29 @@ describe('编排 Bot 没设默认目录', () => {
     expect(await code(h.service.continueClarify(runId, OWNER, { project: WEB }))).toBe('project_not_allowed');
     await h.service.continueClarify(runId, OWNER);
     expect(h.clarify.createInputs.map((input) => input.workingDir)).toEqual([BILLING, BILLING]);
+  });
+
+  it('a candidate the page was offered is taken though a re-scan under load now stops before it', async () => {
+    let scanned = CANDIDATES;
+    const h = makeService(base, { projects: noDefault({ candidates: () => scanned }) });
+    h.service.projectOptions();
+    scanned = CANDIDATES.slice(0, 1);
+    const view = await h.service.create(OWNER, { goal: 'g', project: BILLING });
+    expect(h.clarify.createInputs.map((input) => input.workingDir)).toEqual([BILLING]);
+    expect(view.project).toEqual({ dir: BILLING, from: 'draft' });
+    expect(await code(h.service.create(OWNER, { goal: 'g', project: '/etc' }))).toBe('project_not_allowed');
+  });
+
+  it('an offer expires: past it, a fresh scan decides again', async () => {
+    let scanned = CANDIDATES;
+    const h = makeService(base, { projects: noDefault({ candidates: () => scanned }) });
+    h.service.projectOptions();
+    scanned = CANDIDATES.slice(0, 1);
+    h.advance(DRAFT_PROJECT_OFFER_TTL_MS - 1);
+    await h.service.create(OWNER, { goal: 'g', project: BILLING });
+    h.advance(1);
+    expect(await code(h.service.create(OWNER, { goal: 'g', project: BILLING }))).toBe('project_not_allowed');
+    expect(h.clarify.creates).toBe(1);
   });
 
   it('the options are the repo picker\'s candidates', () => {

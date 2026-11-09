@@ -205,6 +205,10 @@ const RESERVATION_PREFIX = 'reserve:';
 /** Feishu deduplicates a message uuid for about an hour; a resend later
  *  than this after the first try is not trusted to be deduplicated. */
 export const LAUNCH_UUID_DEDUP_SAFE_MS = 55 * 60_000;
+/** A project candidate the page was offered is taken without a new scan for
+ *  this long: the forms that offer one are filled in minutes; an older pick
+ *  is checked against a fresh scan (a refusal reloads the page's list). */
+export const DRAFT_PROJECT_OFFER_TTL_MS = 60 * 60_000;
 const MAX_GOAL_CHARS = 4_000;
 const MAX_MESSAGE_CHARS = 16_000;
 const MAX_NOTE_CHARS = 4_000;
@@ -892,6 +896,11 @@ export class WorkflowDraftService {
   private readonly orphans = new Map<string, { sessionId: string; headlessId?: string }>();
   /** Sessions this process closed successfully (most recent, bounded). */
   private readonly closedSessions = new Set<string>();
+  /** Candidates {@link projectOptions} handed out, path → when. The repo
+   *  picker's scan stops at a time budget, so a re-scan under load can end
+   *  before a project the page offered: a pick is checked against the offer,
+   *  as the Feishu repo card resolves a pick against its own scan. */
+  private readonly offeredProjects = new Map<string, number>();
   /** This service instance (one per daemon boot) as a reservation holder. */
   private readonly holder: WorkflowDraftReservationHolder;
   private readonly holderAlive: (holder: WorkflowDraftReservationHolder) => boolean;
@@ -1541,7 +1550,13 @@ export class WorkflowDraftService {
   projectOptions(): WorkflowDraftProjectOptions {
     const dir = this.deps.projects.defaultDir();
     if (dir) return { kind: 'default', dir };
-    return { kind: 'pick', candidates: this.deps.projects.candidates() };
+    const candidates = this.deps.projects.candidates();
+    const now = this.now().getTime();
+    for (const [path, at] of this.offeredProjects) {
+      if (now - at >= DRAFT_PROJECT_OFFER_TTL_MS) this.offeredProjects.delete(path);
+    }
+    for (const candidate of candidates) this.offeredProjects.set(candidate.path, now);
+    return { kind: 'pick', candidates };
   }
 
   /** The project `requested` for a draft of this bot, or refused. A bot with
@@ -1556,7 +1571,9 @@ export class WorkflowDraftService {
       throw err('project_not_allowed', `这个编排 Bot 有默认目录（${dir}），草稿就在那里澄清`);
     }
     if (requested === undefined) throw err('project_required', '这个编排 Bot 没设默认目录，请先选项目');
-    if (!this.deps.projects.candidates().some((candidate) => candidate.path === requested)) {
+    const offeredAt = this.offeredProjects.get(requested);
+    const offered = offeredAt !== undefined && this.now().getTime() - offeredAt < DRAFT_PROJECT_OFFER_TTL_MS;
+    if (!offered && !this.deps.projects.candidates().some((candidate) => candidate.path === requested)) {
       throw err('project_not_allowed', '所选项目不在这个编排 Bot 的仓库列表里（和飞书仓库选择卡同一份）');
     }
     return requested;
