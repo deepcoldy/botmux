@@ -3,8 +3,10 @@ import { execFileSync, type ChildProcess } from 'node:child_process';
 import { EventEmitter, once } from 'node:events';
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -141,6 +143,14 @@ describe('botmux goal run — machine terminal contract', () => {
     return value;
   }
 
+  function goalHome(base: string): string {
+    const home = join(base, 'codex-goal-home');
+    mkdirSync(home, { mode: 0o700 });
+    writeFileSync(join(home, 'config.toml'), 'model = "gpt-6.1-sol"\n', { mode: 0o600 });
+    writeFileSync(join(home, 'auth.json'), JSON.stringify({ tokens: { access_token: 'NOT-A-REAL-TOKEN' } }), { mode: 0o600 });
+    return realpathSync(home);
+  }
+
   it('writes exactly one versioned JSON document after durable success and exposes only validated artifacts', async () => {
     const base = root();
     const h = harness(base, successfulRunNode());
@@ -208,6 +218,61 @@ describe('botmux goal run — machine terminal contract', () => {
     >;
     expect(request.workingDir).toBe(process.cwd());
     expect(Object.values(snapshots)[0]?.workingDir).toBe(process.cwd());
+  });
+
+  it('freezes an explicit Codex home/model/effort and returns worker-observed runtime evidence', async () => {
+    const base = root();
+    const home = goalHome(base);
+    const runNode: RunNode = async (req) => {
+      expect(req.botSnapshot).toMatchObject({
+        cliId: 'codex',
+        model: 'gpt-6.1-sol',
+        reasoningEffort: 'xhigh',
+        cliInstanceBinding: { source: 'goal', codexHome: home, authMode: 'shared' },
+      });
+      const file = product(req.outputDir);
+      return {
+        status: 'ok',
+        manifestPath: writeManifest(req, { schemaVersion: 1, status: 'ok', summary: 'verified runtime', files: [file] }),
+        runtime: {
+          cliId: 'codex',
+          source: 'worker-active-runtime',
+          model: 'gpt-6.1-sol',
+          reasoningEffort: 'xhigh',
+          codexHome: home,
+        },
+      };
+    };
+    const h = harness(base, runNode);
+    const extra = ['--codex-home', home, '--model', 'gpt-6.1-sol', '--reasoning-effort', 'xhigh'];
+
+    expect(await cmdGoal('run', h.args('explicit-runtime', 'repair issue', extra), h.deps)).toBe(0);
+    expect(onlyJson(h.stdout)).toMatchObject({
+      state: 'succeeded',
+      runtime: { cliId: 'codex', model: 'gpt-6.1-sol', reasoningEffort: 'xhigh', codexHome: home },
+    });
+    expect(JSON.parse(readFileSync(join(base, 'explicit-runtime', 'goal.request.json'), 'utf8'))).toMatchObject({
+      codexHome: home,
+      model: 'gpt-6.1-sol',
+      reasoningEffort: 'xhigh',
+    });
+  });
+
+  it('rejects a partial explicit Codex runtime before worker spawn', async () => {
+    const base = root();
+    const home = goalHome(base);
+    const runNode = vi.fn(successfulRunNode());
+    const h = harness(base, runNode);
+
+    expect(await cmdGoal('run', h.args('partial-runtime', 'repair issue', [
+      '--codex-home', home,
+      '--model', 'gpt-6.1-sol',
+    ]), h.deps)).toBe(GOAL_RUN_EXIT.error);
+    expect(onlyJson(h.stdout)).toMatchObject({
+      state: 'error',
+      error: { code: 'RUN_AUTHORIZATION_FAILED', message: expect.stringContaining('must be supplied together') },
+    });
+    expect(runNode).not.toHaveBeenCalled();
   });
 
   it('replays a terminal run byte-for-byte with zero new spawn', async () => {
