@@ -41,9 +41,9 @@ import {
   reportFiles,
 } from './helpers/v3-external-harness.js';
 
-afterEach(() => {
+afterEach(async () => {
   crash.nextSucceeded = false;
-  cleanupBotRuns();
+  await cleanupBotRuns();
 });
 
 async function crashAfterInstall(run: BotRun, attemptId: string): Promise<void> {

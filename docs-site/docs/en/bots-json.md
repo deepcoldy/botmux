@@ -279,7 +279,7 @@ Full form:
 | Field | Description |
 |------|------|
 | `family` | `chrome` or `edge` |
-| `pluginRoot` | Custom plugin directory (absolute path). Usually not needed; by default the newest complete version is picked from the official plugin cache under `CODEX_HOME` (or `~/.codex`) |
+| `pluginRoot` | Custom plugin directory (absolute path); when set, only this one is used. Usually not needed; by default the newest complete version is picked from the official plugin cache under `CODEX_HOME` (or `~/.codex`) and the plugin bundled with the Codex / ChatGPT desktop app |
 | `autoApproveOrigins` | Stop asking for approval site by site when visiting HTTP/HTTPS sites. Off by default; login credentials, uploads/downloads, browsing history and full devtools access are not covered, and nothing is saved as "always allow" |
 
 Requirements and limits:

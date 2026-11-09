@@ -53,12 +53,17 @@ function build(opts: {
   return JSON.parse(json);
 }
 
-function headerActions(card: any): any[] {
-  return card.elements.find((e: any) => e.tag === 'action')?.actions ?? [];
+function cardButtons(node: any): any[] {
+  if (!node || typeof node !== 'object') return [];
+  if (Array.isArray(node)) return node.flatMap(cardButtons);
+  return [
+    ...(node.tag === 'button' ? [node] : []),
+    ...Object.values(node).flatMap(cardButtons),
+  ];
 }
 
 function substituteButton(card: any): any {
-  return headerActions(card).find((a: any) => a.tag === 'button' && a.value?.action === 'toggle_substitute');
+  return cardButtons(card).find((button: any) => button.value?.action === 'toggle_substitute');
 }
 
 describe('buildStreamingCard: per-group substitute toggle', () => {
@@ -87,9 +92,9 @@ describe('buildStreamingCard: per-group substitute toggle', () => {
     expect(substituteButton(build({ control: { enabled: true }, hidden: ['substitute'] }))).toBeFalsy();
   });
 
-  it('keeps the other control-row buttons untouched', () => {
+  it('keeps display and session controls reachable', () => {
     const card = build({ control: { enabled: true } });
-    const actions = headerActions(card).map((a: any) => a.value?.action ?? 'url');
+    const actions = cardButtons(card).map((button: any) => button.value?.action ?? 'url');
     expect(actions).toContain('toggle_display');
     expect(actions).toContain('toggle_substitute');
     expect(actions).toContain('close');

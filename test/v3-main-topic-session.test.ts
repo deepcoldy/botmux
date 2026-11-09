@@ -77,7 +77,7 @@ afterEach(async () => {
   } finally {
     refusalsStarted = 0;
     refusalsDelivered = 0;
-    cleanupBotRuns();
+    await cleanupBotRuns();
   }
 });
 
