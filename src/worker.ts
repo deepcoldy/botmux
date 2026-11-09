@@ -453,6 +453,7 @@ import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './service
 import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot, type AntigravityCotEntry } from './services/antigravity-cot.js';
 import { KimiActivityObserver } from './services/kimi-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
+import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
 import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen } from './adapters/cli/antigravity.js';
 import {
   mapAntigravityCompactOffsetToFull,
@@ -538,6 +539,7 @@ import {
 import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay, scaleMs } from './utils/timing.js';
 import { waitForProcessQuiescence } from './services/process-quiescence.js';
+import { reapStaleCodexThreadWriter, shouldReapStaleCodexWriterBeforeSpawn } from './services/codex-stale-writer-reaper.js';
 import { pidNotProvablyGone } from './utils/process-alive.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
 import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
@@ -11975,6 +11977,7 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
 // shared with the Claude path.
 
 function codexBridgeFallbackActive(): boolean {
+  if (lastInitConfig?.cliId === 'antigravity' && cliAdapter?.runnerFramedInput) return false;
   // scratch full-root COW: cursor's transcript mirror lands in the overlay
   // and the host-side reader (~/.cursor/projects) cannot resolve it, so the
   // send-less harvest would silently vanish. `botmux send` still works, so
@@ -12757,6 +12760,7 @@ function armCursorCotForTurn(): void {
 let antigravityCotReaderSessionId: string | undefined;
 
 function ensureAntigravityCotReader(cliSessionId: string): void {
+  if (cliAdapter?.runnerFramedInput) return;
   if (!cliSessionId || antigravityCotReaderSessionId === cliSessionId) return;
   const previousId = antigravityCotReaderSessionId;
   antigravityCotReaderSessionId = cliSessionId;
@@ -12786,6 +12790,7 @@ function ensureAntigravityCotReader(cliSessionId: string): void {
 }
 
 function armAntigravityCotForTurn(): void {
+  if (cliAdapter?.runnerFramedInput) return;
   if (lastInitConfig?.cliId !== 'antigravity') return;
   if (nativeSessionForkPending()) return;
   let cid = cliAdapter?.resolveActiveSessionId?.({ cliPid: backend?.getChildPid?.() ?? undefined, cliCwd: lastInitConfig.workingDir })
@@ -18395,7 +18400,8 @@ function maybeCaptureKiroSessionId(data: string): void {
 function splitCodexAppControl(data: string): string {
   return appRunnerControlDecoder.push(
     data,
-    APP_RUNNER_OSC_CLI_IDS.has(lastInitConfig?.cliId ?? ''),
+    APP_RUNNER_OSC_CLI_IDS.has(lastInitConfig?.cliId ?? '')
+      || (lastInitConfig?.cliId === 'antigravity' && cliAdapter?.runnerFramedInput === true),
     handleAppRunnerOscMarker,
   );
 }
@@ -20120,6 +20126,7 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
 }
 
 function observeAntigravityCliSessionId(pid: number, label = 'spawn'): void {
+  if (cliAdapter?.runnerFramedInput) return;
   if (!Number.isInteger(pid) || pid <= 0) return;
   if (lastInitConfig?.cliId !== 'antigravity') return;
 
@@ -23609,7 +23616,16 @@ async function spawnCliBody(
     wrapperCli: cfg.wrapperCli,
     cliLaunchMode: cfg.cliLaunchMode,
   };
-  const createAdapter = () => createCliAdapterSync(effectiveCliId, cfg.cliPathOverride, { configDir: cfg.cliConfigDir });
+  const agyTransport = effectiveCliId === 'antigravity' ? antigravityTransport(cfg.env) : undefined;
+  if (agyTransport === 'acp' && (cfg.wrapperCli || cfg.promptInjection === 'none' || cfg.startupCommands?.length)) {
+    throw new Error('Antigravity ACP does not support wrapperCli, startupCommands or zero-injection terminal sessions.');
+  }
+  if (agyTransport === 'acp' && ['riff', 'mojo', 'remote-runner', 'orca'].includes(cfg.backendType)) {
+    throw new Error('Antigravity ACP requires a local process backend.');
+  }
+  const createAdapter = () => createCliAdapterSync(effectiveCliId, cfg.cliPathOverride, {
+    configDir: cfg.cliConfigDir, antigravityTransport: agyTransport,
+  });
   cliAdapter = createAdapter();
   let waitedForMissingCli = false;
   if (!cfg.adoptMode && cfg.backendType !== 'riff') {
@@ -25855,6 +25871,10 @@ async function spawnCliBody(
       ? nativeSubagentRuntimeHookCommand()
       : undefined,
   });
+  if (agyTransport) verifyAntigravityTransport({
+    dataDir: config.session.dataDir, sessionId: cfg.sessionId,
+    transport: agyTransport, reattach: willReattachPersistent,
+  });
   // Pi's deferred long-first-prompt command is implemented by a session-scoped
   // extension. Keep its launch args across owned process restarts while the
   // queued/in-flight command may still need replay.
@@ -26285,6 +26305,50 @@ async function spawnCliBody(
       { botmuxSessionProfile: hermesUsesBotmuxSessionProfile },
     )
     : undefined;
+
+  // A cold `codex resume` cannot share its thread with a still-running Codex:
+  // the new TUI stops at "This conversation is open in another app" and never
+  // accepts input. A restart that left this session's previous Codex alive
+  // outside the pane we manage (replaced tmux server, unreattached pane) used
+  // to wedge the session exactly that way. Retire only a holder that carries
+  // THIS session's id; anything else is reported and left alone.
+  if (effectiveCliSessionId && shouldReapStaleCodexWriterBeforeSpawn({
+    cliId: cfg.cliId,
+    willReattachPersistent,
+    resume: effectiveResume,
+    cliSessionId: effectiveCliSessionId,
+    rpcEngine: !!codexRpcEngine,
+    adoptMode: !!cfg.adoptMode,
+    existingAppServerEndpoint: !!cfg.existingAppServerEndpoint,
+    remoteBackend: isRemoteBackendType(effectiveBackendType),
+  })) {
+    const homes = [...new Set([perBotInjectEnv.CODEX_HOME, childEnv.CODEX_HOME, join(homedir(), '.codex')]
+      .filter((home): home is string => typeof home === 'string' && home.trim() !== '')
+      .map(home => { try { return realpathSync(home.trim()); } catch { return home.trim(); } }))];
+    for (const home of homes) {
+      if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
+      try {
+        const outcome = await reapStaleCodexThreadWriter({
+          codexHome: home,
+          threadId: effectiveCliSessionId,
+          sessionId: cfg.sessionId,
+          excludePids: [process.pid],
+        });
+        if (outcome.kind === 'reaped') {
+          log(`[codex-writer-lock] retired stale Codex of this session holding thread ${effectiveCliSessionId}: pids ${outcome.pids.join(',')}${outcome.forced ? ' (SIGKILL)' : ''}`);
+        } else if (outcome.kind === 'foreign') {
+          log(`[codex-writer-lock] thread ${effectiveCliSessionId} is held by a process outside this session (pids ${outcome.pids.join(',')}); left alone${outcome.reaped.length ? `, retired own pids ${outcome.reaped.join(',')}` : ''}`);
+        } else if (outcome.kind === 'stuck') {
+          log(`[codex-writer-lock] stale Codex of this session survived SIGKILL (pids ${outcome.pids.join(',')}); resume may stop at the lock screen`);
+        } else if (outcome.kind === 'unavailable') {
+          log(`[codex-writer-lock] could not enumerate holders of thread ${effectiveCliSessionId} under ${home}`);
+        }
+      } catch (error) {
+        log(`[codex-writer-lock] check failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
+  }
 
   // ── File sandbox (oncall): wrap the CLI in bwrap so it can only touch a
   // per-session project copy + de-identified config. The agent's `botmux send`
@@ -29442,6 +29506,10 @@ async function spawnCliBody(
     reattachOpenTurnGate = true;
     reattachOpenTurnLogged = false;
     scheduleReattachIdleProbe(`${effectiveBackendType} reattach`, backend);
+  } else if (isPipeMode && backend && cfg.cliId === 'antigravity' && cliAdapter.runnerFramedInput) {
+    // A small headless runner can print ready before pipe-pane subscribes.
+    // Recover its actual viewport once the detector and all listeners exist.
+    seedBackendScreen('Antigravity ACP startup', backend);
   }
 
   // Fallback: if the CLI takes too long to show its prompt (e.g. slow plugin
