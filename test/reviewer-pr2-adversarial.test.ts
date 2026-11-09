@@ -346,7 +346,7 @@ describe('independent PR2 r4 late worker defer', () => {
     const corrected = scheduler.noteWorkerRuntimeDeferred(t.id, runId, 'oc_A', turnId, APP);
     const current = scheduler.getRuntimeTask(t.id, APP)!;
     expect({corrected, status:current.lastStatus, completed:current.repeat?.completed, enabled:current.enabled, waiting:current.deferredRun?.targets.oc_A})
-      .toEqual({corrected:true, status:'deferred', completed:0, enabled:true, waiting:'waiting'});
+      .toEqual({corrected:true, status:'deferred', completed:0, enabled:true, waiting:'held'});
   });
 
   it('does not redispatch a target whose first worker still holds the exact turn', async () => {
@@ -376,5 +376,47 @@ describe('independent PR2 r4 late worker defer', () => {
     scheduler.runNow(t.id);
     await flush();
     expect(sendsToA).toBe(1);
+  });
+});
+
+describe('independent PR2 r5 admission facts', () => {
+  it('never publishes successful completion while the forked worker has not crossed its gate', async () => {
+    task();
+    const t = scheduler.addTask({id:'rvpr2002',name:'finite',schedule:'every 30m',prompt:'original prompt',workingDir:root,chatId:'oc_A',chatIds:['oc_A'],larkAppId:APP,repeat:{times:1,completed:0}});
+    let runId = '';
+    const turnId = `schedule:${t.id}:late`;
+    scheduler.setExecuteCallback(async (current, context) => {
+      runId = context.runId;
+      scheduler.markDeferredTargetDispatching(current.id,runId,'oc_A',turnId,APP);
+      scheduler.markDeferredTargetDispatched(current.id,runId,'oc_A',APP);
+      return 'executed'; // daemon currently returns immediately after fork
+    });
+    scheduler.runNow(t.id);
+    await flush();
+    const visibleBeforeLateMessage = scheduler.getRuntimeTask(t.id,APP)!;
+    expect(visibleBeforeLateMessage.lastStatus).not.toBe('ok');
+    expect(visibleBeforeLateMessage.repeat?.completed).toBe(0);
+    expect(visibleBeforeLateMessage.enabled).toBe(true);
+  });
+
+  it('recovers every worker-held representation as ambiguous after restart', async () => {
+    const t = task();
+    let runId = '';
+    const turnId = `schedule:${t.id}:late`;
+    scheduler.setExecuteCallback(async (current,context) => {
+      runId = context.runId;
+      for(const chatId of ['oc_A','oc_B']){
+        scheduler.markDeferredTargetDispatching(current.id,runId,chatId,chatId==='oc_A'?turnId:`schedule:${t.id}:other`,APP);
+        scheduler.markDeferredTargetDispatched(current.id,runId,chatId,APP);
+      }
+      return 'executed';
+    });
+    scheduler.runNow(t.id);
+    await flush();
+    expect(scheduler.noteWorkerRuntimeDeferred(t.id,runId,'oc_A',turnId,APP)).toBe(true);
+    // This is the settled-run path's waiting + heldTargets representation.
+    expect(scheduler.getRuntimeTask(t.id,APP)!.deferredRun?.heldTargets?.oc_A).toBe(turnId);
+    scheduler.recoverDeferredRunOnStartup(t.id,APP);
+    expect(scheduler.getRuntimeTask(t.id,APP)!.deferredRun?.targets.oc_A).toBe('ambiguous');
   });
 });

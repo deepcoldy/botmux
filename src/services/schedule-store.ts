@@ -337,19 +337,52 @@ export function normalizeDeferredRun(raw: unknown): ScheduledTaskDeferredRun | u
   if (r.targets && typeof r.targets === 'object' && !Array.isArray(r.targets)) {
     for (const [chatId, state] of Object.entries(r.targets as Record<string, unknown>)) {
       if (!chatId) continue;
-      targets[chatId] = state === 'dispatched' || state === 'dispatching' || state === 'ambiguous'
-        ? state
-        : 'waiting';
+      if (state === 'dispatched' || state === 'dispatching' || state === 'ambiguous'
+        || state === 'held' || state === 'waiting') {
+        targets[chatId] = state;
+      } else {
+        // A corrupt state must never degrade to a re-dispatchable `waiting`:
+        // we cannot prove the target has no worker owner, so fail closed.
+        targets[chatId] = 'ambiguous';
+      }
     }
   }
   const targetTurnIds: Record<string, string> = {};
+  const validTurn = (chatId: string, turnId: unknown): turnId is string =>
+    !!targets[chatId] && typeof turnId === 'string' && turnId.startsWith('schedule:');
   if (r.targetTurnIds && typeof r.targetTurnIds === 'object' && !Array.isArray(r.targetTurnIds)) {
     for (const [chatId, turnId] of Object.entries(r.targetTurnIds as Record<string, unknown>)) {
       // Only keep turn ids for targets we also track, and only the exact
       // `schedule:<taskId>:<uuid>` shape the provenance layer accepts.
-      if (targets[chatId] && typeof turnId === 'string' && turnId.startsWith('schedule:')) {
+      if (validTurn(chatId, turnId)) targetTurnIds[chatId] = turnId;
+    }
+  }
+  const heldTargets: Record<string, string> = {};
+  if (r.heldTargets && typeof r.heldTargets === 'object' && !Array.isArray(r.heldTargets)) {
+    for (const [chatId, turnId] of Object.entries(r.heldTargets as Record<string, unknown>)) {
+      if (validTurn(chatId, turnId)) {
+        heldTargets[chatId] = turnId;
+        // The held turn is authoritative: a retry must reuse it.
         targetTurnIds[chatId] = turnId;
       }
+    }
+  }
+  const acceptedTargets: Record<string, string> = {};
+  if (r.acceptedTargets && typeof r.acceptedTargets === 'object' && !Array.isArray(r.acceptedTargets)) {
+    for (const [chatId, turnId] of Object.entries(r.acceptedTargets as Record<string, unknown>)) {
+      if (validTurn(chatId, turnId)) {
+        acceptedTargets[chatId] = turnId;
+        targetTurnIds[chatId] = turnId;
+      }
+    }
+  }
+  // Legacy rows predate `acceptedTargets`: a PERSISTED `dispatched` target was
+  // accepted under the old contract. Fresh in-memory fork-accounting never goes
+  // through normalize, so it still requires the worker's acceptance receipt.
+  for (const [chatId, state] of Object.entries(targets)) {
+    if (state === 'dispatched' && !acceptedTargets[chatId]
+      && !heldTargets[chatId] && targetTurnIds[chatId]) {
+      acceptedTargets[chatId] = targetTurnIds[chatId];
     }
   }
   const context = normalizeDeferredContext(r.context);
@@ -371,6 +404,8 @@ export function normalizeDeferredRun(raw: unknown): ScheduledTaskDeferredRun | u
       : {}),
     targets,
     ...(Object.keys(targetTurnIds).length > 0 ? { targetTurnIds } : {}),
+    ...(Object.keys(heldTargets).length > 0 ? { heldTargets } : {}),
+    ...(Object.keys(acceptedTargets).length > 0 ? { acceptedTargets } : {}),
     ...(context ? { context } : {}),
   };
 }

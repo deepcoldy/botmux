@@ -90,6 +90,8 @@ function makeDaemonCallback(options: {
       const turnId = parked?.targetTurnIds?.[chatId] ?? `schedule:${task.id}:${randomUUID()}`;
       usedTurnIds.set(chatId, turnId);
       if (state === 'dispatched') {
+        // Production's non-TRAE daemon marks fork acceptance immediately.
+        scheduler.markDeferredTargetAccepted(task.id, context.runId, chatId, turnId, APP);
         outcomes.push({ chatId, outcome: 'dispatched' });
         continue;
       }
@@ -100,7 +102,7 @@ function makeDaemonCallback(options: {
         continue;
       }
       calls.push({ runId: context.runId, chatId, turnId });
-      scheduler.markDeferredTargetDispatched(task.id, context.runId, chatId, APP);
+      scheduler.markDeferredTargetAccepted(task.id, context.runId, chatId, turnId, APP);
       outcomes.push({ chatId, outcome: 'dispatched' });
     }
     if (!outcomes.some(entry => entry.outcome === 'deferred')) return 'executed';

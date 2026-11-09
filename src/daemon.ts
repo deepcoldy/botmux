@@ -35866,8 +35866,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   },
                 ).then(dispatched => {
                   if (dispatched !== 'deferred') {
-                    scheduler.markDeferredTargetDispatched(
-                      task.id, executionContext.runId, targetTask.chatId!, effectiveAppId,
+                    const targetTurnId = turnIds.get(targetTask.chatId!)!;
+                    // Fork return is NOT an acceptance fact. For managed TRAE
+                    // the input is only queued in the worker, which may still be
+                    // waiting in its start gate: keep the target held and the
+                    // run parked until the worker reports the exact turn
+                    // accepted. Other CLIs keep the historical fork acceptance.
+                    if (cfg.cliId === 'traex') {
+                      scheduler.markDeferredTargetHeld(
+                        task.id, executionContext.runId, targetTask.chatId!, targetTurnId, effectiveAppId,
+                      );
+                      return 'deferred' as const;
+                    }
+                    scheduler.markDeferredTargetAccepted(
+                      task.id, executionContext.runId, targetTask.chatId!, targetTurnId, effectiveAppId,
                     );
                   }
                   return dispatched;

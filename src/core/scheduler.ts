@@ -557,10 +557,6 @@ function recordDispatchOutcome(
   // the run and will re-claim it once the runtime handoff clears. Never record
   // success, a run-log terminal state, or repeat/once completion here.
   if (outcome === 'deferred') return;
-  // A success callback can race a worker that reported its start-gate wait just
-  // before this outcome is recorded. The target is still owed; keep the run
-  // parked instead of consuming once/repeat and announcing success.
-  if (current?.deferredRun && deferredRunHasUnsettledTargets(current.deferredRun)) return;
   if (current?.lastRunId === context.runId && current.deliveryFailureRunId === context.runId) {
     // A very short model turn can fail its send before dispatch returns.
     // Keep that failure; only account for the dispatch that just completed.
@@ -587,6 +583,14 @@ function recordDispatchOutcome(
       id: task.id, runAt: Date.now(), status: 'error', error: current.lastDeliveryError } });
     return;
   }
+  // A success callback is not an acceptance fact: fork return only means the
+  // worker process was started. Settle only once every target's exact turn has
+  // been proven accepted by the worker; otherwise keep the run parked so no
+  // success log/notification/once-repeat accounting happens early. Skips are
+  // terminal and do not dispatch, so they are not gated here.
+  if (outcome !== 'skipped'
+    && current?.deferredRun
+    && !deferredRunFullyAccepted(current.deferredRun)) return;
   const status = outcome === 'skipped' ? 'skipped' : 'ok';
   if (status === 'skipped') {
     let nextRunAt: string | undefined;
@@ -628,6 +632,8 @@ export interface DeferredRunParkInput {
   targets: Record<string, ScheduleDeferredTargetState>;
   /** Exact turns already owned by a worker at the start gate. */
   heldTargets?: Record<string, string>;
+  /** Exact turns already accepted by their worker. */
+  acceptedTargets?: Record<string, string>;
   targetTurnIds?: Record<string, string>;
 }
 
@@ -670,6 +676,21 @@ function deferredRunHasUnsettledTargets(deferred: NonNullable<ScheduledTask['def
   return Object.values(deferred.targets).some(state => state !== 'dispatched');
 }
 
+/** Every target must be dispatched AND carry the worker's acceptance fact for
+ *  its exact turn. A missing acceptance (fork return only) is never success. */
+function deferredRunFullyAccepted(deferred: NonNullable<ScheduledTask['deferredRun']>): boolean {
+  const entries = Object.entries(deferred.targets);
+  if (entries.length === 0) return false;
+  return entries.every(([chatId, state]) => {
+    if (state !== 'dispatched') return false;
+    if (deferred.heldTargets?.[chatId]) return false;
+    const accepted = deferred.acceptedTargets?.[chatId];
+    if (!accepted) return false;
+    const turn = deferred.targetTurnIds?.[chatId];
+    return turn === undefined || turn === accepted;
+  });
+}
+
 /** Park the claimed run behind a runtime handoff. Reuses `since` when the same
  *  run defers again. Never touches nextRunAt: the occurrence was consumed by
  *  the original claim. */
@@ -693,6 +714,18 @@ export function parkDeferredRun(
     for (const chatId of Object.keys(targetTurnIds)) {
       if (!(chatId in input.targets)) delete targetTurnIds[chatId];
     }
+    // Ownership bookkeeping survives a re-park: a target already accepted by
+    // its worker must not lose that fact just because another target deferred.
+    const heldTargets: Record<string, string> = { ...(existing?.heldTargets ?? {}) };
+    const acceptedTargets: Record<string, string> = { ...(existing?.acceptedTargets ?? {}) };
+    for (const [chatId, turnId] of Object.entries(input.heldTargets ?? {})) heldTargets[chatId] = turnId;
+    for (const [chatId, turnId] of Object.entries(input.acceptedTargets ?? {})) acceptedTargets[chatId] = turnId;
+    for (const chatId of Object.keys(heldTargets)) {
+      if (!(chatId in input.targets)) delete heldTargets[chatId];
+    }
+    for (const chatId of Object.keys(acceptedTargets)) {
+      if (!(chatId in input.targets)) delete acceptedTargets[chatId];
+    }
     return {
       ...task,
       lastStatus: 'deferred',
@@ -707,9 +740,8 @@ export function parkDeferredRun(
           ? { precondition: input.precondition ?? existing?.precondition } : {}),
         retryAt: new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
         targets: input.targets,
-        ...(input.heldTargets && Object.keys(input.heldTargets).length > 0
-          ? { heldTargets: input.heldTargets }
-          : {}),
+        ...(Object.keys(heldTargets).length > 0 ? { heldTargets } : {}),
+        ...(Object.keys(acceptedTargets).length > 0 ? { acceptedTargets } : {}),
         ...(Object.keys(targetTurnIds).length > 0 ? { targetTurnIds } : {}),
         // Freeze once: an edit made while parked must not change the prompt or
         // routing the remaining targets were admitted for.
@@ -766,6 +798,12 @@ export function markDeferredTargetDispatching(
           ...(existing?.precondition ? { precondition: existing.precondition } : {}),
           retryAt: existing?.retryAt ?? new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
           targets,
+          ...(existing?.heldTargets && Object.keys(existing.heldTargets).length > 0
+            ? { heldTargets: existing.heldTargets }
+            : {}),
+          ...(existing?.acceptedTargets && Object.keys(existing.acceptedTargets).length > 0
+            ? { acceptedTargets: existing.acceptedTargets }
+            : {}),
           targetTurnIds: { ...(existing?.targetTurnIds ?? {}), [chatId]: turnId },
           context: existing?.context ?? freezeDeferredContext(task),
         },
@@ -813,67 +851,73 @@ export function noteWorkerRuntimeDeferred(
 ): boolean {
   let changed = false;
   mutateRuntimeTask(id, task => {
-    if (task.lastRunId !== runId) return;
-    const existing = task.deferredRun?.runId === runId ? task.deferredRun : undefined;
-    if (existing) {
-      if (existing.targetTurnIds?.[chatId] !== turnId) return;
-      const state = existing.targets[chatId];
-      if (state !== 'dispatching' && state !== 'dispatched') return;
-      changed = true;
-      return {
-        ...task,
-        lastStatus: 'deferred' as const,
-        deferredRun: {
-          ...existing,
-          retryAt: new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
-          targets: { ...existing.targets, [chatId]: 'held' as const },
-          heldTargets: { ...(existing.heldTargets ?? {}), [chatId]: turnId },
-        },
-      };
-    }
-    // No parked run: the settlement already consumed this dispatch.
-    if (task.lastStatus !== 'ok') return;
+    const deferred = task.deferredRun;
+    if (!deferred || deferred.runId !== runId) return;
+    if (deferred.targetTurnIds?.[chatId] !== turnId) return;
+    const state = deferred.targets[chatId];
+    if (state !== 'dispatching' && state !== 'dispatched'
+      && state !== 'waiting' && state !== 'held') return;
     changed = true;
-    const repeat = task.repeat
-      ? { ...task.repeat, completed: Math.max(0, (task.repeat.completed ?? 0) - 1) }
-      : undefined;
-    const runStats = task.runStats
-      ? { ...task.runStats, dispatched: Math.max(0, (task.runStats.dispatched ?? 0) - 1) }
-      : undefined;
-    const autoCompleted = task.enabled === false && task.disabledReason === 'once_completed';
-    // Every other target of this settled run already succeeded; keep it
-    // `dispatched` so reopening the run cannot re-dispatch it. Only the
-    // worker-held target becomes owed again.
-    const targets: Record<string, ScheduleDeferredTargetState> = {};
-    for (const cid of scheduleStore.effectiveScheduleChatIds(task)) targets[cid] = 'dispatched';
-    targets[chatId] = 'waiting';
+    const { [chatId]: _accepted, ...restAccepted } = deferred.acceptedTargets ?? {};
+    void _accepted;
     return {
       ...task,
       lastStatus: 'deferred' as const,
-      lastError: undefined,
-      ...(autoCompleted
-        ? {
-            enabled: true,
-            disabledReason: undefined,
-            nextRunAt: new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
-          }
-        : {}),
-      ...(repeat ? { repeat } : {}),
-      ...(runStats ? { runStats } : {}),
       deferredRun: {
-        runId,
-        since: new Date().toISOString(),
-        reason: 'traex_runtime' as const,
-        detail: 'worker holds the admitted input at the start gate',
+        ...deferred,
         retryAt: new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
-        targets,
-        targetTurnIds: { [chatId]: turnId },
-        heldTargets: { [chatId]: turnId },
-        context: freezeDeferredContext(task),
+        targets: { ...deferred.targets, [chatId]: 'held' as const },
+        heldTargets: { ...(deferred.heldTargets ?? {}), [chatId]: turnId },
+        ...(Object.keys(restAccepted).length > 0
+          ? { acceptedTargets: restAccepted }
+          : { acceptedTargets: undefined }),
       },
     };
   }, appId);
   return changed;
+}
+
+/** Record that a target's input was handed to a worker (fork/queue ownership)
+ *  but not yet accepted. It must not settle or be re-dispatched. */
+export function markDeferredTargetHeld(
+  id: string,
+  runId: string,
+  chatId: string,
+  turnId: string,
+  appId?: string,
+): boolean {
+  return mutateDeferredTarget(id, runId, appId, deferred => {
+    if (deferred.targetTurnIds?.[chatId] !== turnId) return undefined;
+    const state = deferred.targets[chatId];
+    if (state !== 'dispatching' && state !== 'dispatched') return undefined;
+    return {
+      ...deferred,
+      targets: { ...deferred.targets, [chatId]: 'held' as const },
+      heldTargets: { ...(deferred.heldTargets ?? {}), [chatId]: turnId },
+    };
+  });
+}
+
+/** Record the worker's acceptance fact for the exact turn. This is the only
+ *  transition that may later settle a target as success. */
+export function markDeferredTargetAccepted(
+  id: string,
+  runId: string,
+  chatId: string,
+  turnId: string,
+  appId?: string,
+): boolean {
+  return mutateDeferredTarget(id, runId, appId, deferred => {
+    if (deferred.targetTurnIds?.[chatId] !== turnId) return undefined;
+    const { [chatId]: _held, ...restHeld } = deferred.heldTargets ?? {};
+    void _held;
+    return {
+      ...deferred,
+      targets: { ...deferred.targets, [chatId]: 'dispatched' as const },
+      acceptedTargets: { ...(deferred.acceptedTargets ?? {}), [chatId]: turnId },
+      ...(Object.keys(restHeld).length > 0 ? { heldTargets: restHeld } : { heldTargets: undefined }),
+    };
+  });
 }
 
 /**
@@ -888,17 +932,7 @@ export function noteWorkerRuntimeAccepted(
   turnId: string,
   appId?: string,
 ): boolean {
-  return mutateDeferredTarget(id, runId, appId, deferred => {
-    if (deferred.targetTurnIds?.[chatId] !== turnId) return undefined;
-    if (deferred.heldTargets?.[chatId] !== turnId) return undefined;
-    const { [chatId]: _accepted, ...restHeld } = deferred.heldTargets;
-    void _accepted;
-    return {
-      ...deferred,
-      heldTargets: restHeld,
-      targets: { ...deferred.targets, [chatId]: 'dispatched' as const },
-    };
-  });
+  return markDeferredTargetAccepted(id, runId, chatId, turnId, appId);
 }
 
 /** A target that was not actually sent (precheck refused again) goes back to
@@ -925,13 +959,16 @@ export function recoverDeferredRunOnStartup(
     let changed = false;
     const targets = { ...deferred.targets };
     const heldTargets = deferred.heldTargets ? { ...deferred.heldTargets } : undefined;
+    const acceptedTargets = deferred.acceptedTargets ? { ...deferred.acceptedTargets } : undefined;
     for (const [chatId, state] of Object.entries(targets)) {
       // `dispatching` may or may not have reached the worker. `held` DID reach
       // it, but a daemon restart cannot prove the worker still survives, so
-      // neither may be auto-replayed or settled as success.
-      if (state === 'dispatching' || state === 'held') {
+      // neither may be auto-replayed or settled as success. Any target named in
+      // `heldTargets` is held regardless of its visible state.
+      if (state === 'dispatching' || state === 'held' || heldTargets?.[chatId] !== undefined) {
         targets[chatId] = 'ambiguous';
         if (heldTargets) delete heldTargets[chatId];
+        if (acceptedTargets) delete acceptedTargets[chatId];
         changed = true;
       }
     }
@@ -942,6 +979,9 @@ export function recoverDeferredRunOnStartup(
       ...(heldTargets && Object.keys(heldTargets).length > 0
         ? { heldTargets }
         : { heldTargets: undefined }),
+      ...(acceptedTargets && Object.keys(acceptedTargets).length > 0
+        ? { acceptedTargets }
+        : { acceptedTargets: undefined }),
       retryAt: new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
     };
   });

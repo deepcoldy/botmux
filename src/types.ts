@@ -1816,6 +1816,10 @@ export interface ScheduledTaskDeferredRun {
    *  its start gate. Unlike `waiting`, these must not be re-dispatched; they
    *  settle only after the worker reports the turn accepted. */
   heldTargets?: Record<string, string>;
+  /** Exact turns the worker has proven accepted (queued/native submission).
+   *  A run settles only when every target is both `dispatched` and accepted;
+   *  fork return alone is never a success fact. */
+  acceptedTargets?: Record<string, string>;
   /** Stable per-target scheduled turn ids. Persisted before dispatch so a
    *  retry (or a daemon restart) cannot mint a second turn for the same
    *  target; the worker's turn-id dedupe then rejects a duplicate input. */
