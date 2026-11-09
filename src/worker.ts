@@ -20843,6 +20843,10 @@ async function flushPending(): Promise<void> {
   if (cliRestartInProgress) return;
   if (initialInputOwnershipPending) return;
   if (shouldHoldCodexRunnerInput(codexRunnerFreshness)) return;
+  // Static type-ahead support and the terminal startup timeout cannot prove
+  // that a recovered runner has republished its signed engine identity. Keep
+  // input outside the runner until this connection's state is authenticated.
+  if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppRuntimeTypeAheadReady()) return;
   if (isFlushing) return;  // while loop in active flush will pick up new messages
   if (!backend || !cliAdapter) return;
   if (
@@ -21038,6 +21042,7 @@ async function flushPending(): Promise<void> {
       hasRunStartupCommands = true;
       await runInitialNativeRename();
     }
+    if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppRuntimeTypeAheadReady()) return;
     // Commands deferred behind a previous rename run before the latest pending
     // rename. Some passthroughs (/clear, /new) can rotate the native session;
     // applying the canonical title last keeps the resume-picker label aligned.
@@ -21122,6 +21127,8 @@ async function flushPending(): Promise<void> {
       return;
     }
     while (pendingMessages.length > 0 && backend && cliAdapter) {
+      // A prior awaited write may have crossed a control-socket reconnect.
+      if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppRuntimeTypeAheadReady()) break;
       // The first item passed the prompt/model gate before beginCliWriteCycle
       // deliberately cleared readiness. Rechecking that synthetic false here
       // would strand the very input admitted by this flush.
