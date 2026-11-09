@@ -63,7 +63,7 @@ let server: Server | null = null;
 afterEach(async () => {
   if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
   server = null;
-  cleanupBotRuns();
+  await cleanupBotRuns();
 });
 
 /** code → identity the fake Feishu exchanger returns. */

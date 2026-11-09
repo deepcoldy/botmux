@@ -160,7 +160,8 @@ function imageFileDataUrl(file: File): Promise<string> {
 
 function StateChip(props: { state: BoardState; stage?: string }) {
   const tr = useT();
-  return <span className={`dboard-state dboard-state-${props.state}`}>{stateChipText(props.state, props.stage, tr)}</span>;
+  const text = stateChipText(props.state, props.stage, tr);
+  return <span className={`dboard-state dboard-state-${props.state}`} title={text}>{text}</span>;
 }
 
 function Markdown(props: { text: string; className?: string }) {

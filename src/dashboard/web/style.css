@@ -34883,9 +34883,10 @@ dialog.command-palette-dialog::backdrop {
 }
 .dboard-list.is-loading { opacity: .6; }
 .dboard-list > li + li { border-top: 1px solid var(--border-soft); }
+/* 右列封顶 40%：auto 列会按整段不换行的阶段文字撑开，把标题列挤到 0、标题一字一行。 */
 .dboard-row {
   display: grid;
-  grid-template-columns: 14px minmax(0, 1fr) auto;
+  grid-template-columns: 14px minmax(0, 1fr) fit-content(40%);
   align-items: start;
   gap: 4px 10px;
   padding: 10px 14px 10px 8px;
@@ -34917,6 +34918,7 @@ dialog.command-palette-dialog::backdrop {
   justify-content: flex-end;
   flex-wrap: wrap;
   gap: 4px 10px;
+  min-width: 0;
   color: var(--muted);
   font-size: var(--fs-12);
   white-space: nowrap;
@@ -34948,15 +34950,17 @@ a.dboard-join-btn:hover { border-color: var(--accent); background: var(--accent)
 .dboard-chat-tag { flex: none; padding: 0 6px; border-radius: var(--radius-sm); background: var(--accent-soft); color: var(--accent-strong); font-size: var(--fs-11); font-weight: var(--fw-m); line-height: 18px; white-space: nowrap; }
 .dboard-chat-tag.is-warn { background: var(--warning-soft); color: var(--warning); }
 
+/* 阶段是管家写的自由文本，可能很长：放不下就省略，全文在 title 里。 */
 .dboard-state {
-  display: inline-flex;
-  align-items: center;
+  display: inline-block;
   padding: 1px 8px;
   border-radius: var(--radius-full);
   font-size: var(--fs-12);
   font-weight: var(--fw-m);
   line-height: 20px;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .dboard-state-decide { background: var(--st-need-soft); color: var(--st-need); }
 .dboard-state-accept { background: var(--st-todo-soft); color: var(--st-todo); }
@@ -35037,8 +35041,10 @@ button.dboard-text-btn:disabled { color: var(--faint); cursor: default; text-dec
 .dboard-item-nav-pos { flex: 1; min-width: 0; text-align: center; color: var(--muted); font-size: var(--fs-13); }
 .dboard-item-nav button { white-space: nowrap; }
 .dboard-detail-head { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 6px 12px; }
-.dboard-detail-head h1 { flex: 1 1 240px; min-width: 0; margin: 0; font-size: var(--fs-20); line-height: var(--lh-title); overflow-wrap: anywhere; }
+.dboard-detail-head h1 { flex: 1 1 max(240px, 60%); min-width: 0; margin: 0; font-size: var(--fs-20); line-height: var(--lh-title); overflow-wrap: anywhere; }
 .dboard-detail-head h1 .dboard-seq { font-size: var(--fs-17); }
+/* 详情页不省略：长阶段换到标题下一行、放不下就折行；单行时圆角被压到半高，和胶囊一样。 */
+.dboard-detail-head .dboard-state { white-space: normal; overflow-wrap: anywhere; border-radius: var(--radius-lg); }
 .dboard-detail-meta { margin: -8px 0 0; color: var(--muted); font-size: var(--fs-12); }
 .dboard-chats {
   display: grid;
