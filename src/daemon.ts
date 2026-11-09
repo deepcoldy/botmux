@@ -33038,17 +33038,24 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
   );
   process.once('exit', stopFeedbackMaintenanceParticipant);
-  let feedbackExtensionBusy = false;
-  const feedbackExtensionTimer = setInterval(() => {
-    if (feedbackExtensionBusy) return;
-    feedbackExtensionBusy = true;
-    void import('./services/feedback-extension-host.js')
-      .then(module => module.tickFeedbackExtensions(config.session.dataDir, cfg.larkAppId))
-      .catch(error => logger.warn(`[feedback-extension] ${error instanceof Error ? error.message : String(error)}`))
-      .finally(() => { feedbackExtensionBusy = false; });
-  }, 2000);
-  feedbackExtensionTimer.unref();
-  process.once('exit', () => clearInterval(feedbackExtensionTimer));
+  for (const lane of ['surface', 'background'] as const) {
+    let feedbackExtensionBusy = false;
+    const feedbackExtensionTimer = setInterval(() => {
+      if (feedbackExtensionBusy) return;
+      feedbackExtensionBusy = true;
+      const startedAt = Date.now();
+      void import('./services/feedback-extension-host.js')
+        .then(module => module.tickFeedbackExtensions(config.session.dataDir, cfg.larkAppId, lane))
+        .catch(error => logger.warn(`[feedback-extension] ${error instanceof Error ? error.message : String(error)}`))
+        .finally(() => {
+          feedbackExtensionBusy = false;
+          const elapsedMs = Date.now() - startedAt;
+          if (elapsedMs > 5000) logger.warn(`[feedback-extension] slow lane=${lane} elapsed_ms=${elapsedMs}`);
+        });
+    }, 2000);
+    feedbackExtensionTimer.unref();
+    process.once('exit', () => clearInterval(feedbackExtensionTimer));
+  }
   // Establish the target-scoped daemon control credential before publishing
   // the daemon descriptor or accepting IPC traffic. Corruption fails startup
   // closed; silently rotating here could strand peers on mismatched tokens.

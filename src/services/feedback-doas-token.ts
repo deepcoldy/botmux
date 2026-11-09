@@ -44,6 +44,7 @@ async function readCachedCredential(path: string, generation: number, tokenHash?
     if (!info.isFile() || info.nlink !== 1 || info.size > 131072 || (info.mode & 0o077) !== 0
       || (process.getuid && info.uid !== process.getuid())) throw new Error('feedback_doas_cache_unsafe');
     const value = JSON.parse(await handle.readFile('utf8'));
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('feedback_doas_state_invalid');
     if (value.generation !== generation || value.tokenHash !== tokenHash) return undefined;
     if (typeof value.token !== 'string' || !value.token || value.token.length > 65536 || /[\s\0]/.test(value.token)
       || !Number.isFinite(value.validUntil) || value.validUntil > Date.now() + 60000
@@ -127,6 +128,7 @@ export function createDoasTokenSource(dataDir: string, config: DoasTokenConfig, 
         tokenHash = value.tokenHash;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw new Error('feedback_doas_state_invalid');
+        if (cached) throw new Error('feedback_doas_state_invalid');
       }
       if (rejected !== undefined && generation <= rejected && !unusable) {
         rejectedHash = tokenHash ?? (cached ? createHash('sha256').update(cached.value).digest('hex') : rejectedHash);

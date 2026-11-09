@@ -48,7 +48,18 @@ export function feedbackPostgresPool(target: PostgresTarget, password: PostgresC
       const connect = this.connect.bind(this);
       this.connect = ((callback?: (error: Error) => void) => {
         const operation = async () => {
-          current = typeof password === 'string' ? credential : await password.get();
+          if (typeof password === 'string') current = credential;
+          else {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              current = await Promise.race([
+                password.get(),
+                new Promise<never>((_, reject) => {
+                  timer = setTimeout(() => reject(new Error('feedback_bytepg_credentials_timeout')), target.connectTimeoutMs);
+                }),
+              ]);
+            } finally { if (timer) clearTimeout(timer); }
+          }
           wireOptions = `bytepg_compute_id=${tokenMode!.computeId} bytepg_auth_token=${validateToken(current.value)} ${options}`;
           await connect();
         };

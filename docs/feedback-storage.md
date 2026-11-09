@@ -175,3 +175,22 @@ bun run build:bun
 ```
 
 Integration tests require `BOTMUX_TEST_POSTGRES_URL` for an isolated PostgreSQL database and `BOTMUX_TEST_POSTGRES_CA` for its test TLS CA. Only unique test schemas are created/deleted. Use an isolated HOME for migration tests so unrelated fleet state is not interpreted as participants.
+
+## Dynamic Credential Reuse
+
+BytePG dynamic credentials are shared through an owned private cache directory.
+The credential file is a single regular file with mode `0600`; generation metadata
+contains only the credential hash. Cached values are reused for at most one minute
+and, when the returned token carries an expiry, no later than thirty seconds before
+that expiry. These local cache limits do not extend the token's authority.
+
+An explicit authentication rejection invalidates the rejected generation before
+cleanup and replacement. Concurrent callers reuse the replacement instead of
+running another refresh. Established PostgreSQL connections do not fetch another
+credential for every query; new connections obtain credentials before the startup
+handshake. Query failures are not replayed.
+
+Feedback surface sending and background card refresh use independent worker
+lanes. Background queries run inside the existing refresh deadline and per-message
+coordination. A slow or abandoned old-card refresh cannot hold the new-card lane.
+Slow lane durations are logged without credentials or card content.

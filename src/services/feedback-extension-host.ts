@@ -21,6 +21,18 @@ import { feedbackRefreshBudget, refreshFeedbackMessage } from './feedback-refres
 import type { FeedbackHookRegistration } from './feedback-extension-types.js';
 
 function configured(dataDir: string): boolean { return existsSync(join(dataDir, 'feedback-extensions.json')); }
+async function removeInlineFeedback(dataDir: string, appId: string, messageId: string, signal?: AbortSignal): Promise<void> {
+  const detail = await getMessageDetail(appId, messageId, { signal });
+  const content = detail?.items?.[0]?.body?.content ?? detail?.body?.content;
+  if (typeof content !== 'string') throw new Error('feedback_refresh_target_missing');
+  const card = JSON.parse(content);
+  if (!Array.isArray(card.body?.elements)) throw new Error('feedback_answer_card_invalid');
+  card.body.elements = card.body.elements.filter((element: { element_id?: string }) => !element.element_id?.startsWith('botmux_feedback'));
+  await updateMessage(appId, messageId, JSON.stringify(card), { beforeWrite: async () => {
+    signal?.throwIfAborted();
+    if (!configured(dataDir) && !getBot(appId).config.feedbackPresentation) throw new Error('feedback_presentation_disabled');
+  } });
+}
 function hookDefinition(hook: FeedbackHookRegistration): Record<string, unknown> {
   const { enabled, version, ...definition } = hook;
   return definition;
@@ -51,7 +63,7 @@ export async function sendFeedbackSurface(appId: string, input: {
   return replyMessage(appId, input.subjectId, JSON.stringify(input.card), 'interactive', mode === 'topic', input.operationId,
     undefined, { beforeWrite: input.beforeWrite });
 }
-export async function tickFeedbackExtensions(dataDir: string, appId: string): Promise<void> {
+export async function tickFeedbackExtensions(dataDir: string, appId: string, lane: 'all' | 'surface' | 'background' = 'all'): Promise<void> {
   const botPresentation = getBot(appId).config.feedbackPresentation;
   if (!configured(dataDir) && !botPresentation) {
     if (existsSync(join(dataDir, 'feedback-extensions.sqlite')) && !feedbackMaintenanceActive(dataDir)) {
@@ -70,8 +82,9 @@ export async function tickFeedbackExtensions(dataDir: string, appId: string): Pr
     const startedAt = extensions.activate(appId, new Date().toISOString());
     const storageConfig = await readFeedbackStorageConfig(dataDir);
     const source = await getSkillFeedbackStore(dataDir);
-    await reconcileFeedbackSurfaces({
-      appId, source, extensions, config, now: Date.now, startedAt, refreshBudget,
+    if (lane !== 'background') await reconcileFeedbackSurfaces({
+      appId, source, extensions, config, now: Date.now, startedAt,
+      refreshBudget: lane === 'surface' ? { deadline: 0, remaining: 0 } : refreshBudget,
       sourceKey: `${storageConfig.instanceId}:${storageConfig.generation}`,
       send: async (subjectId, card, operationId, chatId, round) => {
         const beforeWrite = async () => {
@@ -89,25 +102,24 @@ export async function tickFeedbackExtensions(dataDir: string, appId: string): Pr
         const threadId = await getMessageThreadId(appId, messageId);
         return threadId ? threadAppLink(chatId, threadId, getBotBrand(appId)) : chatAppLink(chatId, getBotBrand(appId));
       },
-      removeInline: async (messageId, signal) => {
-        const detail = await getMessageDetail(appId, messageId, { signal });
-        const content = detail?.items?.[0]?.body?.content ?? detail?.body?.content;
-        if (typeof content !== 'string') throw new Error('feedback_refresh_target_missing');
-        const card = JSON.parse(content);
-        if (!Array.isArray(card.body?.elements)) throw new Error('feedback_answer_card_invalid');
-        card.body.elements = card.body.elements.filter((element: { element_id?: string }) => !element.element_id?.startsWith('botmux_feedback'));
-        await updateMessage(appId, messageId, JSON.stringify(card), { beforeWrite: async () => {
-          signal?.throwIfAborted();
-          if (!configured(dataDir) && !getBot(appId).config.feedbackPresentation) throw new Error('feedback_presentation_disabled');
-        } });
-      },
+      removeInline: (messageId, signal) => removeInlineFeedback(dataDir, appId, messageId, signal),
     });
+    if (lane === 'surface') return;
+    if (lane === 'background') {
+      for (const messageId of extensions.inlineCleanups(appId)) {
+        await refreshFeedbackMessage({ store: extensions, appId, messageId, kind: 'cleanup', budget: refreshBudget,
+          run: signal => removeInlineFeedback(dataDir, appId, messageId, signal) });
+      }
+    }
     for (const dirty of extensions.dirtySurfaces(appId)) {
+      if (refreshBudget.remaining <= 0 || Date.now() >= refreshBudget.deadline) break;
+      if (!extensions.refreshDue(appId, dirty.messageId, 'dirty', Date.now())) continue;
       const binding = extensions.surface(appId, dirty.messageId);
       if (!binding) {
-        const original = await source.findDeliveryByPlatformMessage('lark', appId, dirty.messageId);
         await refreshFeedbackMessage({ store: extensions, appId, messageId: dirty.messageId, kind: 'dirty',
           revision: dirty.revision, budget: refreshBudget, run: async signal => {
+          const original = await source.findDeliveryByPlatformMessage('lark', appId, dirty.messageId);
+          signal.throwIfAborted();
           if (!original?.policy) throw new Error('feedback_refresh_target_missing');
           const detail = await getMessageDetail(appId, dirty.messageId, { signal });
           const content = detail?.items?.[0]?.body?.content ?? detail?.body?.content;
@@ -120,9 +132,10 @@ export async function tickFeedbackExtensions(dataDir: string, appId: string): Pr
         } });
         continue;
       }
-      const delivery = await source.findDeliveryById(String(binding.deliveryId));
       await refreshFeedbackMessage({ store: extensions, appId, messageId: dirty.messageId, kind: 'dirty',
         revision: dirty.revision, budget: refreshBudget, run: async signal => {
+          const delivery = await source.findDeliveryById(String(binding.deliveryId));
+          signal.throwIfAborted();
           if (!delivery?.policy) throw new Error('feedback_refresh_target_missing');
           await updateMessage(appId, dirty.messageId, JSON.stringify(renderFeedbackSurfaceState(binding, delivery.policy, dirty.state)), {
             beforeWrite: async () => {

@@ -72,6 +72,59 @@ async function fixture() {
 }
 
 describe('feedback extension host callback', () => {
+  it('does not query more old answers after a slow read exhausts the refresh budget', async () => {
+    const data = await fixture();
+    for (const messageId of ['old-first', 'old-second']) {
+      data.extensions.bindSurface('app', messageId, data.extensions.surface('app', 'surface')!);
+      data.extensions.dirtySurface('app', messageId, {});
+    }
+    const clock = vi.spyOn(Date, 'now');
+    let now = Date.now();
+    clock.mockImplementation(() => now);
+    const original = data.source.findDeliveryById.bind(data.source);
+    const reads = vi.spyOn(data.source, 'findDeliveryById').mockImplementation(deliveryId => {
+      now += 3000;
+      return original(deliveryId);
+    });
+    try {
+      await tickFeedbackExtensions(data.directory, 'app');
+      expect(reads).toHaveBeenCalledTimes(1);
+      expect(data.extensions.dirtySurfaces('app').some(item => item.messageId === 'old-second')).toBe(true);
+    } finally { clock.mockRestore(); }
+  });
+  it('allows the surface lane to send while the background lane is still refreshing an old answer', async () => {
+    const data = await fixture();
+    const current = await readFeedbackExtensionConfig(data.directory);
+    await saveFeedbackExtensionConfig(data.directory, current.version, {
+      ...current, presentations: { app: { default: { enabled: true, rounds: [1], mode: 'separate' }, rules: [] } },
+    }, 'test-admin');
+    data.extensions.activate('app', '2020-01-01T00:00:00Z');
+    data.extensions.dirtySurface('app', 'surface', {});
+    let release!: () => void;
+    const original = data.source.findDeliveryById.bind(data.source);
+    vi.spyOn(data.source, 'findDeliveryById').mockImplementation(async deliveryId => {
+      await new Promise<void>(resolve => { release = resolve; });
+      return original(deliveryId);
+    });
+    const background = tickFeedbackExtensions(data.directory, 'app', 'background');
+    const deadline = Date.now() + 5000;
+    while (!release) {
+      if (Date.now() > deadline) throw new Error('background read did not start');
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    const next = data.source.recordTurnDelivery({ botAppId: 'app', sessionId: 'next-session', turnId: 'next-turn',
+      platform: 'lark', platformAppId: 'app', platformMessageId: 'new-answer', chatId: 'chat', topicRootId: 'new-question',
+      content: 'new answer', cardMode: 'feedback', status: 'delivered', policy: data.policy });
+    data.source.recordTurnTerminal({ botAppId: 'app', sessionId: 'next-session', turnId: 'next-turn', status: 'completed' });
+    mock.threadId.mockResolvedValue('thread');
+    mock.detail.mockResolvedValue({ items: [{ chat_id: 'chat' }] });
+    mock.mode.mockResolvedValue('topic');
+    mock.reply.mockResolvedValue('new-surface');
+    try {
+      await tickFeedbackExtensions(data.directory, 'app', 'surface');
+      expect(data.extensions.surface('app', 'new-surface')?.deliveryId).toBe(next.deliveryId);
+    } finally { release(); await background; }
+  });
   it('keeps a newer revision queued until a timed-out old patch actually finishes', async () => {
     const data = await fixture();
     vi.useFakeTimers();
