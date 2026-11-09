@@ -74,6 +74,21 @@ const target = (port: number): PostgresTarget => ({
   tls: { mode: 'disable' }, connectTimeoutMs: 1000,
 });
 describe('BytePG feedback authentication', () => {
+  it('does not fetch credentials again when querying over an established connection', async () => {
+    const server = await gateway();
+    let reads = 0;
+    const pool = feedbackPostgresPool(target(server.port), {
+      get: async () => { reads++; return { value: 'new-token', generation: 0 }; },
+      refresh: async () => { throw new Error('unexpected refresh'); },
+    });
+    try {
+      await pool.query('SELECT 1');
+      await pool.query('SELECT 2');
+      expect(server.startups).toHaveLength(1);
+      expect(server.queries).toEqual(['SELECT 1', 'SELECT 2']);
+      expect(reads).toBe(1);
+    } finally { await pool.end(); await server.close(); }
+  });
   it('refreshes once after authentication rejection and sends the SQL only on the successful connection', async () => {
     const server = await gateway('expired');
     let refreshes = 0;

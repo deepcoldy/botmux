@@ -33,8 +33,8 @@ export function feedbackPostgresPool(target: PostgresTarget, password: PostgresC
   class BytePgClient extends Client {
     constructor(config?: ClientConfig) {
       super(config);
-      const current = credential;
-      const wireOptions = `bytepg_compute_id=${tokenMode!.computeId} bytepg_auth_token=${validateToken(current.value)} ${options}`;
+      let current = credential;
+      let wireOptions = '';
       const sanitize = (value: unknown): Error => {
         const error = new Error('feedback_bytepg_connection_or_query_failed');
         const code = (value as { code?: unknown } | undefined)?.code;
@@ -45,6 +45,17 @@ export function feedbackPostgresPool(target: PostgresTarget, password: PostgresC
       };
       const parameters = (this as unknown as { connectionParameters: Record<string, unknown> }).connectionParameters;
       Object.defineProperty(parameters, 'options', { configurable: true, enumerable: false, get: () => wireOptions });
+      const connect = this.connect.bind(this);
+      this.connect = ((callback?: (error: Error) => void) => {
+        const operation = async () => {
+          current = typeof password === 'string' ? credential : await password.get();
+          wireOptions = `bytepg_compute_id=${tokenMode!.computeId} bytepg_auth_token=${validateToken(current.value)} ${options}`;
+          await connect();
+        };
+        const pending = operation();
+        if (!callback) return pending;
+        void pending.then(() => callback(undefined as unknown as Error), error => callback(error));
+      }) as Client['connect'];
       const connection = (this as unknown as { connection: { on: (...args: any[]) => unknown; emit: (...args: any[]) => boolean } }).connection;
       const emit = connection.emit.bind(connection);
       connection.emit = (event: string, ...args: unknown[]) => {
@@ -70,8 +81,6 @@ export function feedbackPostgresPool(target: PostgresTarget, password: PostgresC
   if (tokenMode && typeof password !== 'string') {
     const originalConnect = pool.connect.bind(pool);
     const connect = async (): Promise<PoolClient> => {
-      credential = await password.get();
-      validateToken(credential.value);
       try { return await originalConnect(); }
       catch (error) {
         const generation = (error as { [rejectedGeneration]?: number })[rejectedGeneration];
