@@ -10,7 +10,7 @@ import { loadWorkerPoolClosure, loadWorkerPoolFunction } from './helpers/worker-
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 import { randomBytes } from 'node:crypto';
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
 
 it('publishes identity for a follow-up on a completed ordinary IM runtime', async () => {
   const data = mkdtempSync(join(tmpdir(), 'followup-authority-'));
@@ -89,5 +89,93 @@ it('publishes identity for a follow-up on a completed ordinary IM runtime', asyn
       }, received.sessionCommand.execution);
     }
     expect(host.logger.debug.mock.calls.filter(([text]: string[]) => text.includes('managed_turn_origin'))).toEqual([]);
+  } finally { store.close(); rmSync(data, { recursive: true, force: true }); }
+});
+
+it('keeps a queued follow-up protected from deferred suspend after its commit ACK', async () => {
+  vi.useFakeTimers();
+  const data = mkdtempSync(join(tmpdir(), 'followup-backlog-'));
+  const store = new SessionContractStore(data, 'cli_followup');
+  try {
+    const ds: any = {
+      larkAppId: 'cli_followup', chatId: 'oc_test',
+      session: { sessionId: 'backlog', status: 'active', workerGeneration: 1 },
+      workerGeneration: 1, cliReadyGeneration: 0, lastScreenStatus: 'idle',
+      pendingSuspendReason: 'cli_install_changed', pendingSuspendGeneration: 1,
+    };
+    const controller = new SessionController(ds, store);
+    const producer = controller.bindWorker(1).worker;
+    const events = new WorkerSessionEventScope(controller.ref, producer);
+    const binding = events.beginRuntime();
+    const runtime = controller.reserveBinding(binding.bindingId, producer);
+    controller.bindRuntime(binding.bindingId, producer, { backend: 'tmux', physicalId: '111:start1', proof: 'process_start' });
+    events.assign(binding.bindingId, runtime);
+    const worker = { send: vi.fn() };
+    ds.worker = worker;
+    const deliveries = new Map();
+    const pool: any = {
+      controllerForSession: () => controller,
+      ensurePrincipalLaneInboundTurnBinding: vi.fn(),
+      pendingOrdinaryImDeliveries: deliveries, workerCliInputBacklogs: new WeakMap(),
+      ordinaryImDeliveryKey: (_ds: unknown, turnId: string) => turnId,
+      sendOrdinaryImDeliveryAttempt: (record: any) => { worker.send(record.message); return true; },
+      suspendWorker: vi.fn(() => true), logger: { info: vi.fn() }, tag: () => 'test',
+    };
+    for (const name of ['sendOrdinaryImDeliveryTracked', 'clearOrdinaryImDelivery', 'completeOrdinaryImDelivery',
+      'hasPendingOrdinaryImDelivery', 'hasUnacceptedCliInput', 'recordWorkerCliInputBacklog', 'runPendingSuspendIfSettled']) {
+      pool[name] = loadWorkerPoolFunction(name, pool);
+    }
+    pool.sendOrdinaryImDeliveryTracked(ds, { type: 'message', turnId: 'om_queued', content: 'waiting' });
+    const execution = worker.send.mock.calls[0][0].sessionCommand.execution;
+    events.rememberExecution(execution, binding);
+    const observations: any[] = [];
+    const ws: any = {
+      workerSessionEventScope: events,
+      pendingMessages: [{ turnId: execution.turnId, content: 'waiting' }],
+      pendingRawInputs: [], pendingAdoptMessages: [], cliSubmissionInFlight: null,
+      submitFailureChains: { size: () => 0 }, publishedCliInputBacklog: 'false:',
+      universalOutputHandoff: null, closeRequested: false,
+      isWorkflowWorker: () => false, ordinaryImTurnDedupe: { commit: vi.fn() },
+      process: { send: (payload: any) => {
+        const admission = controller.ingest(payload, producer);
+        observations.push({ payload, admission });
+        if (admission.kind !== 'current' && admission.kind !== 'worker') return;
+        if (payload.type === 'cli_input_backlog') pool.recordWorkerCliInputBacklog(worker, payload);
+        if (payload.type === 'turn_input_committed') pool.completeOrdinaryImDelivery(ds, payload.turnId, 1);
+      } },
+    };
+    for (const name of ['sessionEventMetadata', 'workerIpcPayload', 'cliInputBacklogKey', 'cliInputBacklog',
+      'publishCliInputBacklog', 'send', 'acknowledgeTurnInputCommitted']) {
+      ws[name] = loadWorkerFunction(name, ws);
+    }
+
+    // The real send path publishes backlog before the ACK removes delivery protection.
+    events.run(binding, () => ws.acknowledgeTurnInputCommitted(execution.turnId), execution);
+    expect(deliveries.size).toBe(0);
+    const periodicReport = setInterval(() => ws.publishCliInputBacklog(), 1_000);
+    setTimeout(() => pool.runPendingSuspendIfSettled(ds, () => true), 2_000);
+    await vi.advanceTimersByTimeAsync(2_000);
+    clearInterval(periodicReport);
+    expect(ws.pendingMessages).toHaveLength(1);
+    expect(pool.suspendWorker).not.toHaveBeenCalled();
+    expect(pool.hasUnacceptedCliInput(ds)).toBe(true);
+    expect(observations.map(({ payload, admission }) => [payload.type, admission.kind])).toEqual([
+      ['cli_input_backlog', 'current'], ['turn_input_committed', 'current'],
+    ]);
+    expect(store.execution(controller.ref, execution.executionId)?.phase).toBe('queued');
+
+    // Queue drain releases the protection; the pending suspend can then proceed.
+    ws.pendingMessages.length = 0;
+    events.run(binding, () => ws.publishCliInputBacklog(), execution);
+    pool.runPendingSuspendIfSettled(ds, () => true);
+    expect(pool.hasUnacceptedCliInput(ds)).toBe(false);
+    expect(pool.suspendWorker).toHaveBeenCalledTimes(1);
+
+    // Removing execution scope must not let a retired worker change the backlog.
+    controller.bindWorker(2);
+    ws.pendingMessages.push({ turnId: execution.turnId, content: 'late report' });
+    events.run(binding, () => ws.publishCliInputBacklog(), execution);
+    expect(observations.at(-1).admission.kind).toBe('reject');
+    expect(pool.hasUnacceptedCliInput(ds)).toBe(false);
   } finally { store.close(); rmSync(data, { recursive: true, force: true }); }
 });
