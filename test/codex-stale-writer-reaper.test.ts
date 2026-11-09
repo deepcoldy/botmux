@@ -1,12 +1,18 @@
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import {
   botmuxSessionArgvMarker,
+  codexThreadWriterLockPath,
+  listLockHoldersOnHost,
   shouldReapStaleCodexWriterBeforeSpawn,
   parsePidLines,
   reapStaleCodexThreadWriter,
   type StaleWriterReaperDeps,
 } from '../src/services/codex-stale-writer-reaper.js';
+import { spawnTsEval } from './helpers/ts-runner.js';
 
 const THREAD = '01a1bf6c-17cd-7862-b1ab-7e64eab530ce';
 const SESSION = '7dde7682-61df-44fb-931f-cdffb7823881';
@@ -187,4 +193,32 @@ describe('parsePidLines', () => {
     expect(parsePidLines('123\n456\n\n')).toEqual([123, 456]);
     expect(parsePidLines('')).toEqual([]);
   });
+});
+
+describe.skipIf(process.platform !== 'linux')('listLockHoldersOnHost on a real /proc', () => {
+  it('finds a Codex process holding the lock, also when CODEX_HOME is reached through a symlink', async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'codex-lock-holders-')));
+    const realHome = join(root, 'real', '.codex');
+    mkdirSync(join(realHome, 'thread-writer-locks'), { recursive: true });
+    symlinkSync(join(root, 'real'), join(root, 'linked'));
+    const lock = codexThreadWriterLockPath(realHome, THREAD);
+    writeFileSync(lock, '');
+    // The lock path (".codex/…") is part of the holder's argv, so it passes the
+    // Codex cmdline prefilter the way a real Codex holder does.
+    const holder = spawnTsEval(
+      `import { openSync } from 'node:fs'; openSync(${JSON.stringify(lock)}, 'r+'); process.stdout.write('ready\\n'); setInterval(() => {}, 1 << 30);`,
+      { stdio: ['ignore', 'pipe', 'inherit'] },
+    );
+    try {
+      await new Promise<void>((resolve, reject) => {
+        holder.stdout!.on('data', chunk => { if (String(chunk).includes('ready')) resolve(); });
+        holder.once('exit', code => reject(new Error(`lock holder exited early (${code})`)));
+      });
+      expect(listLockHoldersOnHost(lock)).toContain(holder.pid);
+      expect(listLockHoldersOnHost(codexThreadWriterLockPath(join(root, 'linked', '.codex'), THREAD))).toContain(holder.pid);
+    } finally {
+      holder.kill('SIGKILL');
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 20_000);
 });
