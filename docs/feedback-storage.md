@@ -82,11 +82,13 @@ The host must have `doas`, Perl with the standard Fcntl/POSIX modules, and nonin
 
 Both acquisition and `doas clean` use the same 0700 cache root under `<dataDir>/feedback-doas/<source-hash>`, with `TMPDIR`, `TMP`, `TEMP` and `DOAS_IDENTITY_DIR` explicitly scoped. The cross-process refresh lock lives outside the cache entries removed by clean. Shared user doas caches are not copied or cleaned; a fresh private cache may require an administrator to establish noninteractive authentication.
 
-No TTL is assumed and there is no periodic clean. Only a new-connection authentication rejection (`28000` or `28P01`) triggers one serialized clean/refetch and one reconnect. Other callers that rejected the same generation reuse the replacement rather than cleaning again. Network/TLS errors and SQL/transaction errors never trigger this recovery, and SQL is never replayed. The cleanup attempt is recorded before execution, so failed or interrupted cleanup is not blindly repeated. Later connection attempts may retry acquisition; a hash of the rejected credential prevents returning that same token. If doas continues returning it, an administrator must restore authentication in the private cache.
+No server TTL is assumed for opaque tokens and there is no periodic clean. Local reuse is bounded as described below. Only a new-connection authentication rejection (`28000` or `28P01`) triggers one serialized clean/refetch and one reconnect. Other callers that rejected the same generation reuse the replacement rather than cleaning again. Network/TLS errors and SQL/transaction errors never trigger this recovery, and SQL is never replayed. The cleanup attempt is recorded before execution, so failed or interrupted cleanup is not blindly repeated. Later connection attempts may retry acquisition; a hash of the rejected credential prevents returning that same token. If doas continues returning it, an administrator must restore authentication in the private cache.
 
 An exclusive `flock` on the command file serializes private-cache operations, and the credential command runs in its own process group with an independent timeout. A later operation therefore never runs concurrently with an in-flight acquisition or clean, including after the calling BotMux process dies mid-command: it proceeds only once the in-flight command finishes or its timeout fires. This command lock is separate from the parent-process metadata lock.
 
-Dashboard provides **Token source → Dynamic doas**, PSM and environment. Token values remain in process memory; BotMux persists only generation metadata and credential hashes (doas itself manages its private credential cache). Acquisition/cleanup commands have time and output bounds. No arbitrary command string can be supplied through this configuration.
+Dashboard provides **Token source → Dynamic doas**, PSM and environment. BotMux persists tokens in the owned `0600` file `<dataDir>/feedback-doas/<source-hash>/credential.json` for cross-process reuse; generation metadata contains only credential hashes. This file is not encrypted. Protect the private directory and any backups as credential material. Doas separately manages its private identity cache. Acquisition/cleanup commands have time and output bounds. No arbitrary command string can be supplied through this configuration.
+
+`connectTimeoutMs` bounds waiting for a pool connection, including cold doas acquisition for a new client, as well as the connection handshake. The independent credential-command timeout still bounds shared-cache work after a caller times out; a late credential result never starts that caller's handshake. A daemon storage-bootstrap failure is reported without disabling the recurring webhook worker: it retries storage opening on its normal five-second poll, with one opening attempt in flight. Maintenance quiescence and shutdown prevent a late open from starting dispatch; explicit maintenance resume creates a new worker. This recovery neither bypasses maintenance nor replays SQL or completed webhooks.
 
 Local tests exercise startup-packet encoding (including IPv6), escaping, error/notice redaction and existing PostgreSQL 17 storage/migration behavior. They do not certify authorization against a production BytePG gateway; use **Test saved connection** in an authorized environment before migration, without sharing tokens in chat or logs.
 
@@ -183,6 +185,8 @@ The credential file is a single regular file with mode `0600`; generation metada
 contains only the credential hash. Cached values are reused for at most one minute
 and, when the returned token carries an expiry, no later than thirty seconds before
 that expiry. These local cache limits do not extend the token's authority.
+An unexpired token already within the safety margin may be used for the current
+handshake, but is not reusable by later calls. Only actual expiry is rejected.
 
 An explicit authentication rejection invalidates the rejected generation before
 cleanup and replacement. Concurrent callers reuse the replacement instead of
@@ -192,5 +196,9 @@ handshake. Query failures are not replayed.
 
 Feedback surface sending and background card refresh use independent worker
 lanes. Background queries run inside the existing refresh deadline and per-message
-coordination. A slow or abandoned old-card refresh cannot hold the new-card lane.
-Slow lane durations are logged without credentials or card content.
+coordination. A slow network patch of an old card cannot hold the new-card lane,
+including with the production SQLite selector. Database-operation concurrency
+is backend-dependent: PostgreSQL uses separate pooled connections, while SQLite
+retains its single shared serialized operation queue. Separate lanes do not
+bypass a stalled SQLite database operation. Slow lane durations are logged
+without credentials or card content.

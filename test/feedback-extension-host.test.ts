@@ -28,6 +28,7 @@ import { createHash } from 'node:crypto';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 import { buildFeedbackSurface, defaultFeedbackTemplate } from '../src/services/feedback-template.js';
 import { feedbackRefreshBudget, refreshFeedbackMessage } from '../src/services/feedback-refresh.js';
+import { closeFeedbackStorage, getFeedbackStorage } from '../src/services/feedback-storage.js';
 
 const dispose: Array<() => void> = [];
 afterEach(() => {
@@ -92,7 +93,7 @@ describe('feedback extension host callback', () => {
       expect(data.extensions.dirtySurfaces('app').some(item => item.messageId === 'old-second')).toBe(true);
     } finally { clock.mockRestore(); }
   });
-  it('allows the surface lane to send while the background lane is still refreshing an old answer', async () => {
+  it('sends through the production SQLite selector while an old card network patch is pending', async () => {
     const data = await fixture();
     const current = await readFeedbackExtensionConfig(data.directory);
     await saveFeedbackExtensionConfig(data.directory, current.version, {
@@ -101,21 +102,21 @@ describe('feedback extension host callback', () => {
     data.extensions.activate('app', '2020-01-01T00:00:00Z');
     data.extensions.dirtySurface('app', 'surface', {});
     let release!: () => void;
-    const original = data.source.findDeliveryById.bind(data.source);
-    vi.spyOn(data.source, 'findDeliveryById').mockImplementation(async deliveryId => {
+    const { store } = await getFeedbackStorage(data.directory);
+    mock.source = store;
+    mock.update.mockImplementation(async () => {
       await new Promise<void>(resolve => { release = resolve; });
-      return original(deliveryId);
     });
     const background = tickFeedbackExtensions(data.directory, 'app', 'background');
     const deadline = Date.now() + 5000;
     while (!release) {
-      if (Date.now() > deadline) throw new Error('background read did not start');
+      if (Date.now() > deadline) throw new Error('background patch did not start');
       await new Promise(resolve => setTimeout(resolve, 5));
     }
-    const next = data.source.recordTurnDelivery({ botAppId: 'app', sessionId: 'next-session', turnId: 'next-turn',
+    const next = await store.recordTurnDelivery({ botAppId: 'app', sessionId: 'next-session', turnId: 'next-turn',
       platform: 'lark', platformAppId: 'app', platformMessageId: 'new-answer', chatId: 'chat', topicRootId: 'new-question',
       content: 'new answer', cardMode: 'feedback', status: 'delivered', policy: data.policy });
-    data.source.recordTurnTerminal({ botAppId: 'app', sessionId: 'next-session', turnId: 'next-turn', status: 'completed' });
+    await store.recordTurnTerminal({ botAppId: 'app', sessionId: 'next-session', turnId: 'next-turn', status: 'completed' });
     mock.threadId.mockResolvedValue('thread');
     mock.detail.mockResolvedValue({ items: [{ chat_id: 'chat' }] });
     mock.mode.mockResolvedValue('topic');
@@ -123,7 +124,7 @@ describe('feedback extension host callback', () => {
     try {
       await tickFeedbackExtensions(data.directory, 'app', 'surface');
       expect(data.extensions.surface('app', 'new-surface')?.deliveryId).toBe(next.deliveryId);
-    } finally { release(); await background; }
+    } finally { release(); await background; await closeFeedbackStorage(data.directory); }
   });
   it('keeps a newer revision queued until a timed-out old patch actually finishes', async () => {
     const data = await fixture();

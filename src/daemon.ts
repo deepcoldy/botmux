@@ -33008,10 +33008,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // log and continue; delivery-time paths degrade to best-effort on their own.
   let feedbackWebhookDispatcher: ReturnType<typeof startFeedbackWebhookDispatcher> | undefined;
   try {
-    const feedbackWebhookStore = await getSkillFeedbackStore(config.session.dataDir);
     const feedbackWebhookSecrets = new FeedbackWebhookSecretStore(config.session.dataDir);
     feedbackWebhookDispatcher = startFeedbackWebhookDispatcher({
-      store: feedbackWebhookStore,
+      store: () => getSkillFeedbackStore(config.session.dataDir),
       readSecret: ref => feedbackWebhookSecrets.get(ref),
       onError: error => logger.warn(`[feedback-webhook] ${error instanceof Error ? error.message : String(error)}`),
     });
@@ -33031,9 +33030,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }),
     async () => { await feedbackWebhookDispatcher?.quiesce(); },
     async () => {
-      const store = await getSkillFeedbackStore(config.session.dataDir);
       const secrets = new FeedbackWebhookSecretStore(config.session.dataDir);
-      feedbackWebhookDispatcher = startFeedbackWebhookDispatcher({ store, readSecret: ref => secrets.get(ref), onError: error => logger.warn(String(error)) });
+      feedbackWebhookDispatcher = startFeedbackWebhookDispatcher({
+        store: () => getSkillFeedbackStore(config.session.dataDir),
+        readSecret: ref => secrets.get(ref), onError: error => logger.warn(String(error)),
+      });
       await feedbackWebhookDispatcher.ready;
     },
   );

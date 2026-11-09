@@ -1,8 +1,8 @@
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHmac } from 'node:crypto';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   FeedbackWebhookSecretStore,
   startFeedbackWebhookDispatcher,
@@ -14,6 +14,8 @@ import {
 import { parseBotConfigsFromText } from '../src/bot-registry.js';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import { beginFeedbackMaintenance, freezeFeedbackSource } from '../src/services/feedback-maintenance.js';
+import { closeFeedbackStorage, getFeedbackStorage } from '../src/services/feedback-storage.js';
+import { readFeedbackStorageConfig } from '../src/services/feedback-storage-config.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -61,6 +63,67 @@ describe('feedback webhook destination and secret safety', () => {
 });
 
 describe('feedback webhook attempt contract', () => {
+  it('retries a failed storage bootstrap and delivers pending events without restarting', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-bootstrap-')); dirs.push(dir);
+    const config = await readFeedbackStorageConfig(dir);
+    const path = join(dir, 'feedback-storage.json');
+    writeFileSync(path, '{');
+    const errors: unknown[] = [];
+    const dispatcher = startFeedbackWebhookDispatcher({
+      store: async () => (await getFeedbackStorage(dir)).store,
+      readSecret: () => 'secret', intervalMs: 50, onError: error => errors.push(error),
+      dispatch: async () => ({ kind: 'delivered' as const, status: 204 }),
+    });
+    try {
+      await dispatcher.ready;
+      expect(errors).toHaveLength(1);
+      writeFileSync(path, JSON.stringify(config));
+      const { store } = await getFeedbackStorage(dir);
+      await store.recordTurnTerminal({ botAppId: 'app', sessionId: 's', turnId: 't', status: 'completed' });
+      await store.recordTurnDelivery({
+        botAppId: 'app', sessionId: 's', turnId: 't', platform: 'lark', platformAppId: 'app', platformMessageId: 'm',
+        content: 'answer', cardMode: 'card', status: 'delivered',
+        webhookDestinations: [{ id: 'd', enabled: true, url: 'https://hook.example/x', eventTypes: ['turn.completed'], secretRef: 'secret' }],
+      });
+      await vi.waitFor(async () => {
+        expect(await store.listFeedbackOutbox()).toMatchObject([{ status: 'delivered', attempts: 1 }]);
+      });
+    } finally {
+      await dispatcher.stop(0);
+      await closeFeedbackStorage(dir);
+    }
+  });
+
+  it.each(['quiesce', 'stop'] as const)('does not start dispatching when storage opens after %s', async method => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-late-bootstrap-')); dirs.push(dir);
+    const db = await SkillFeedbackStore.open(dir);
+    db.recordTurnTerminal({ botAppId: 'app', sessionId: 's', turnId: 't', status: 'completed' });
+    db.recordTurnDelivery({
+      botAppId: 'app', sessionId: 's', turnId: 't', platform: 'lark', platformAppId: 'app', platformMessageId: 'm',
+      content: 'answer', cardMode: 'card', status: 'delivered',
+      webhookDestinations: [{ id: 'd', enabled: true, url: 'https://hook.example/x', eventTypes: ['turn.completed'], secretRef: 'secret' }],
+    });
+    const opening = deferred<SkillFeedbackStore>();
+    const dispatcher = startFeedbackWebhookDispatcher({
+      store: () => opening.promise, readSecret: () => 'secret',
+      dispatch: async () => ({ kind: 'delivered' as const, status: 204 }),
+    });
+    const stopped = method === 'stop' ? dispatcher.stop(0) : dispatcher.quiesce();
+    opening.resolve(db);
+    try {
+      await stopped;
+      await dispatcher.ready;
+      expect(db.listFeedbackOutbox()).toMatchObject([{ status: 'pending', attempts: 0 }]);
+      const resumed = startFeedbackWebhookDispatcher({
+        store: db, readSecret: () => 'secret',
+        dispatch: async () => ({ kind: 'delivered' as const, status: 204 }),
+      });
+      await resumed.ready;
+      await resumed.stop(0);
+      expect(db.listFeedbackOutbox()).toMatchObject([{ status: 'delivered', attempts: 1 }]);
+    } finally { await dispatcher.stop(0); db.close(); }
+  });
+
   it('retains unknown request outcome and blocks migration after a transport reset', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-unknown-')); dirs.push(dir);
     const db = await SkillFeedbackStore.open(dir);

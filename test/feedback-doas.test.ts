@@ -23,6 +23,23 @@ process.stdout.write(fs.existsSync(marker) ? 'new-token\\n' : 'old-token\\n');
   return { root, executable, config: { psm: 'data.example.service', environment: 'boe' } };
 }
 describe('isolated doas token source', () => {
+  it('uses an unexpired short-lived credential without caching it beyond its safety margin', async () => {
+    const { root, executable, config } = await fixture();
+    const now = Date.now();
+    const token = `header.${Buffer.from(JSON.stringify({ expireTime: Math.floor(now / 1000) + 20 })).toString('base64url')}.signature`;
+    await writeFile(executable, `#!/bin/sh\nprintf '%s' '${token}'\n`, { mode: 0o700 });
+    const source = createDoasTokenSource(root, config, executable);
+    expect((await source.get()).value).toBe(token);
+    await writeFile(executable, "#!/bin/sh\nprintf '%s' 'replacement-token'\n", { mode: 0o700 });
+    expect((await source.get()).value).toBe('replacement-token');
+  });
+  it('fails closed when generation metadata disappears after an existing credential was cached', async () => {
+    const { root, executable, config } = await fixture();
+    const source = createDoasTokenSource(root, config, executable);
+    await source.get();
+    await unlink(join(source.directory, 'generation.json'));
+    await expect(source.get()).rejects.toThrow('feedback_doas_state_invalid');
+  });
   it('renews a shared credential after its bounded cache lifetime', async () => {
     const { root, executable, config } = await fixture();
     const source = createDoasTokenSource(root, config, executable);

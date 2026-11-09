@@ -22,17 +22,21 @@ export type PostgresCredential = string | TokenSource;
 
 function credentialCacheDeadline(token: string, now: number): number {
   let deadline = now + 60000;
+  let expiresAt: number | undefined;
   const segments = token.split('.');
   if (segments.length === 3) {
     try {
       const payload = JSON.parse(Buffer.from(segments[1], 'base64url').toString('utf8'));
       const expiry = payload.expireTime ?? payload.exp;
       if (typeof expiry === 'number' && Number.isFinite(expiry) && expiry > 0) {
-        deadline = Math.min(deadline, expiry * 1000 - 30000);
+        expiresAt = expiry * 1000;
       }
     } catch {}
   }
-  if (deadline <= now) throw new Error('feedback_doas_token_expired');
+  if (expiresAt !== undefined) {
+    if (expiresAt <= now) throw new Error('feedback_doas_token_expired');
+    deadline = Math.min(deadline, expiresAt - 30000);
+  }
   return deadline;
 }
 
@@ -52,7 +56,7 @@ async function readCachedCredential(path: string, generation: number, tokenHash?
       throw new Error('feedback_doas_state_invalid');
     }
     if (value.validUntil <= Date.now()) return undefined;
-    credentialCacheDeadline(value.token, Date.now());
+    if (credentialCacheDeadline(value.token, Date.now()) <= Date.now()) return undefined;
     return { value: value.token, generation };
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;

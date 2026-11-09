@@ -18,7 +18,7 @@ export function feedbackPostgresPool(target: PostgresTarget, password: PostgresC
     return value.replace(/\\/g, '\\\\').replace(/\s/g, character => `\\${character}`);
   };
   const options = `-c search_path=${target.schema},pg_catalog`;
-  let credential: DynamicToken = { value: typeof password === 'string' ? password : '', generation: 0 };
+  const credential: DynamicToken = { value: typeof password === 'string' ? password : '', generation: 0 };
   if (tokenMode && typeof password === 'string') validateToken(password);
   const rejectedGeneration = Symbol('bytepgRejectedGeneration');
   let effectiveUser = target.user;
@@ -96,8 +96,7 @@ export function feedbackPostgresPool(target: PostgresTarget, password: PostgresC
       catch (error) {
         const generation = (error as { [rejectedGeneration]?: number })[rejectedGeneration];
         if (generation === undefined) throw error;
-        credential = await password.refresh(generation);
-        validateToken(credential.value);
+        await password.refresh(generation);
         return originalConnect();
       }
     };
