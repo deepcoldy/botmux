@@ -176,3 +176,77 @@ describe('草稿页头部：项目', () => {
     act(() => { renderer.unmount(); });
   });
 });
+
+describe('daemon 不认页面送的项目（候选在表单打开后变了）：重新拉候选、清掉已选', () => {
+  const REFUSED = { ok: false, error: 'project_not_allowed' };
+  const projectFetches = (sent: Array<{ url: string }>) =>
+    sent.filter((call) => call.url === `/api/v3/orchestration/projects?larkAppId=${DOC}`).length;
+  const selectById = (renderer: TestRenderer.ReactTestRenderer, id: string) =>
+    renderer.root.find((node) => node.type === 'select' && node.props.id === id);
+
+  it('新建工作流', async () => {
+    const { renderer, sent } = await renderAt('#/workflows/new', (url) => (url === '/api/v3/orchestration/drafts' ? REFUSED : undefined));
+    const picker = renderer.root.find((node) => node.type === BotSearchPicker && node.props.id === 'wfd-bot');
+    await act(async () => { picker.props.onChange(DOC); });
+    await flush();
+    const goal = renderer.root.find((node) => node.type === 'textarea' && node.props.id === 'wfd-goal');
+    await act(async () => { goal.props.onChange({ target: { value: '帮我出一份代码风险报告' } }); });
+    await act(async () => { selectById(renderer, 'wfd-project').props.onChange({ target: { value: BILLING } }); });
+    expect(projectFetches(sent)).toBe(1);
+
+    await act(async () => { renderer.root.find((node) => node.type === 'button' && text(node) === '开始').props.onClick(); });
+    await flush();
+    expect(text(renderer.root)).toContain('这个项目不在可选范围里');
+    expect(projectFetches(sent)).toBe(2);
+    expect(selectById(renderer, 'wfd-project').props.value).toBe('');
+    expect(renderer.root.find((node) => node.type === 'button' && text(node) === '开始').props.disabled).toBe(true);
+    act(() => { renderer.unmount(); });
+  });
+
+  it('老草稿点「继续」', async () => {
+    let defaultDir: string | undefined = DEFAULT_PROJECT;
+    const h = makeService(base, { appId: DOC, projects: { defaultDir: () => defaultDir, candidates: () => CANDIDATES } });
+    const { runId } = await h.service.create(OWNER, { goal: 'g' });
+    const { projectDir: _drop, ...legacy } = readWorkflowDraft(join(base, runId))!;
+    writeWorkflowDraft(join(base, runId), legacy);
+    defaultDir = undefined;
+    h.clarify.reply('先确认范围？');
+    await h.service.view(runId);
+    h.clarify.lose('sess-1');
+    await h.service.sendMessage(runId, OWNER, { text: '主仓' }).catch(() => {});
+    const view = await h.service.view(runId);
+
+    const { renderer, sent } = await renderAt(`#/workflows/drafts/${runId}`, (url) =>
+      (url === `/api/v3/orchestration/drafts/${encodeURIComponent(runId)}` ? { ok: true, draft: view }
+        : url.endsWith('/clarify/continue') ? REFUSED : undefined));
+    await act(async () => { selectById(renderer, 'wfd-continue-project').props.onChange({ target: { value: WEB } }); });
+    expect(projectFetches(sent)).toBe(1);
+    await act(async () => { renderer.root.find((node) => node.type === 'button' && text(node) === '继续').props.onClick(); });
+    await flush();
+    expect(sent.find((call) => call.url.endsWith('/clarify/continue'))?.body).toMatchObject({ project: WEB });
+    expect(projectFetches(sent)).toBe(2);
+    expect(selectById(renderer, 'wfd-continue-project').props.value).toBe('');
+    act(() => { renderer.unmount(); });
+  });
+
+  it('复制为新工作流', async () => {
+    const sent = stubBrowser('', (url) => (url.endsWith('/drafts/from-source') ? REFUSED : undefined));
+    const { CopyWorkflowDialog } = await import('../src/dashboard/web/workflow-copy.js');
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(CopyWorkflowDialog, {
+        source: { kind: 'run', runId: 'run-src' }, sourceOrchestratorAppId: DOC, onClose: () => {}, onCopied: () => {},
+      }));
+    });
+    await flush();
+    await act(async () => { selectById(renderer, 'wfc-project').props.onChange({ target: { value: BILLING } }); });
+    expect(projectFetches(sent)).toBe(1);
+    await act(async () => { renderer.root.findAll((node) => node.type === 'button' && text(node) === '复制')[0]!.props.onClick(); });
+    await flush();
+    expect(sent.find((call) => call.url.endsWith('/drafts/from-source'))?.body).toMatchObject({ project: BILLING });
+    expect(text(renderer.root)).toContain('这个项目不在可选范围里');
+    expect(projectFetches(sent)).toBe(2);
+    expect(selectById(renderer, 'wfc-project').props.value).toBe('');
+    act(() => { renderer.unmount(); });
+  });
+});

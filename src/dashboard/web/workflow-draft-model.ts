@@ -188,6 +188,12 @@ export function projectForRequest(check: ProjectOptionsCheck | undefined, picked
   return check.options.candidates.some((candidate) => candidate.path === picked) ? picked : null;
 }
 
+/** The daemon refused the project the page sent (its default dir or its
+ *  candidates changed since the form loaded them): load the choices again. */
+export function projectChoicesStale(error: string): boolean {
+  return error === 'project_required' || error === 'project_not_allowed';
+}
+
 /** 下拉里的一项：和飞书仓库选择卡一样的名字、分支、worktree 标记，再带上路径。 */
 export function projectOptionLabel(candidate: WorkflowDraftProjectCandidate): string {
   const branch = candidate.branch ? ` (${candidate.branch})` : '';

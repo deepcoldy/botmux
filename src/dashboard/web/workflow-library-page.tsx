@@ -17,6 +17,7 @@ import {
   draftGraphView,
   formatDraftTime,
   parseLaunchMembersInput,
+  projectChoicesStale,
   projectForRequest,
   workflowDraftHref,
 } from './workflow-draft-model.js';
@@ -415,6 +416,7 @@ function TemplateRunPanel(props: { detail: SavedWorkflowDetailView }): React.JSX
       const issues = (created.body.issues as Array<{ name?: string }> | undefined) ?? [];
       setFieldErrors(new Set(issues.map((issue) => issue.name ?? '').filter(Boolean)));
       setNotice({ text: describeError(tr, created), error: true });
+      if (projectChoicesStale(created.error)) { setPickedProject(''); retryProjects(); }
       return;
     }
     const draft = created.draft;

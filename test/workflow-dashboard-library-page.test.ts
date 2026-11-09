@@ -205,6 +205,24 @@ describe('页面渲染', () => {
     act(() => { renderer.unmount(); });
   });
 
+  it('运行：daemon 不认页面送的项目（默认目录在表单打开后变了）→ 报错并重新拉项目', async () => {
+    const detail = await twoVersions();
+    const { renderer, sent } = await renderPage(`#/workflows/library/${detail.entry.workflowId}`, (url) => {
+      if (url.endsWith(`/library/${detail.entry.workflowId}`)) return { ok: true, template: detail };
+      if (url.endsWith(`/library/${detail.entry.workflowId}/run`)) return { ok: false, error: 'project_not_allowed' };
+      return undefined;
+    });
+    const projectFetches = () => sent.filter((call) => call.url.startsWith('/api/v3/orchestration/projects?')).length;
+    expect(projectFetches()).toBe(1);
+    await act(async () => { buttons(renderer, '拉群开始')[0]!.props.onClick(); });
+    await flush();
+    expect(sent.find((call) => call.url.endsWith('/run'))?.body).toMatchObject({ project: DEFAULT_PROJECT });
+    expect(text(renderer.root)).toContain('这个项目不在可选范围里');
+    expect(projectFetches()).toBe(2);
+    expect(sent.some((call) => call.url.endsWith('/launch'))).toBe(false);
+    act(() => { renderer.unmount(); });
+  });
+
   it('运行：来源是草稿的版本也直接拉群，不经过确认流程（I13，11-05）', async () => {
     const detail = await twoVersions();
     const created = { runId: 'tmpl-run-1', version: 1, phase: 'flow_confirmed', title: detail.entry.displayName };

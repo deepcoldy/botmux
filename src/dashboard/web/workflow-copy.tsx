@@ -11,7 +11,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { useT } from './react-hooks.js';
 import { DagGraph } from './v3-components.js';
 import { copyAsNewWorkflow, fetchOrchestratorBots, type CopySource, type DraftAction } from './workflow-draft-api.js';
-import { draftGraphView, projectForRequest, workflowDraftHref } from './workflow-draft-model.js';
+import { draftGraphView, projectChoicesStale, projectForRequest, workflowDraftHref } from './workflow-draft-model.js';
 import { ProjectField, describeError, useProjectOptions } from './workflow-draft-page.js';
 import { BotSearchPicker } from './bot-search-picker.js';
 import type { BotSearchOption } from './bot-search-model.js';
@@ -94,6 +94,7 @@ export function CopyWorkflowDialog(props: {
     }
     const problems = Array.isArray(result.body.problems) ? (result.body.problems as unknown[]).map(String) : [];
     setError({ text: describeError(tr, result), problems });
+    if (projectChoicesStale(result.error)) { setPickedProject(''); retryProjects(); }
   };
 
   return (

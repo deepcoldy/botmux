@@ -60,6 +60,7 @@ import {
   launchStepRows,
   needsContinue,
   parseLaunchMembersInput,
+  projectChoicesStale,
   projectForRequest,
   projectOptionLabel,
   readProjectOptions,
@@ -402,6 +403,7 @@ export function WorkflowNewPage(): React.JSX.Element {
     setBusy(false);
     if (!result.ok) {
       setError(describeError(tr, result));
+      if (projectChoicesStale(result.error)) { setPickedProject(''); retryProjects(); }
       return;
     }
     window.location.hash = workflowDraftHref(result.draft.runId);
@@ -965,6 +967,11 @@ function ChatPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: st
     if (list) list.scrollTop = list.scrollHeight;
   }, [turnCount, view.clarify.pending]);
 
+  const continueClarify = async () => {
+    const result = await props.act({ kind: 'continue', ...(project ? { project } : {}) }, 'continue') as { ok?: boolean; error?: string } | null;
+    if (result && !result.ok && result.error && projectChoicesStale(result.error)) { setPickedProject(''); retryProjects(); }
+  };
+
   const send = async (message: string) => {
     const trimmed = message.trim();
     if (!trimmed || !writable) return;
@@ -1022,7 +1029,7 @@ function ChatPanel(props: { view: WorkflowDraftView; canWrite: boolean; busy: st
             <ProjectField id="wfd-continue-project" check={projectCheck} picked={pickedProject} onPick={setPickedProject} onRetry={retryProjects} />
           ) : null}
           <button type="button" className="primary" disabled={!props.canWrite || !!props.busy || project === null}
-            onClick={() => { void props.act({ kind: 'continue', ...(project ? { project } : {}) }, 'continue'); }}>
+            onClick={() => { void continueClarify(); }}>
             {tr('workflow.draft.continue')}
           </button>
         </div>

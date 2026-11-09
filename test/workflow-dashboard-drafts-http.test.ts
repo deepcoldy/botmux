@@ -30,6 +30,7 @@ import type { DashboardRequestIdentity } from '../src/dashboard/request-identity
 import { DEFAULT_PROJECT, DOC, MAIN, SKETCHES, STEWARD, PI, makeService, specMarkdown } from './helpers/workflow-draft-fakes.js';
 import { fakeLaunch } from './helpers/workflow-launch-fakes.js';
 import { readRunEnvelope } from '../src/workflows/v3/run-envelope.js';
+import { readWorkflowDraft, writeWorkflowDraft } from '../src/workflows/v3/draft-store.js';
 
 const SECRET = 'wf-drafts-host-key';
 const OWNER_OPEN = 'ou_owner';
@@ -397,6 +398,31 @@ describe('Dashboard → daemon workflow drafts', () => {
     const created = await call('POST', WORKFLOW_DRAFTS_PATH, { larkAppId: MAIN, goal, project: repo });
     expect(created).toMatchObject({ status: 200, body: { draft: { project: { dir: repo, from: 'draft' } } } });
     expect(h.clarify.createInputs.map((input) => input.workingDir)).toEqual([repo]);
+  });
+
+  it('「继续」 over HTTP carries the picked 项目 to the daemon for a draft from before projects', async () => {
+    const repo = join(dir, 'repo-a');
+    let defaultDir: string | undefined = DEFAULT_PROJECT;
+    resetWorkflowDraftServiceForTests();
+    h = makeService(runsDir, {
+      launch: launch.deps,
+      projects: { defaultDir: () => defaultDir, candidates: () => [{ path: repo, name: 'repo-a', type: 'repo' }] },
+    });
+    installWorkflowDraftService(h.service, { sweep: false });
+    const runId = (await create()).body.draft.runId as string;
+    const { projectDir: _drop, ...legacy } = readWorkflowDraft(join(runsDir, runId))!;
+    writeWorkflowDraft(join(runsDir, runId), legacy);
+    defaultDir = undefined;
+    h.clarify.reply('先确认范围？');
+    await call('GET', `${WORKFLOW_DRAFTS_PATH}/${runId}`);
+    h.clarify.lose([...h.clarify.sessions.keys()].at(-1)!);
+    expect(await call('POST', `${WORKFLOW_DRAFTS_PATH}/${runId}/messages`, { text: '主仓' })).toMatchObject({ status: 409, body: { error: 'session_disconnected' } });
+
+    const path = `${WORKFLOW_DRAFTS_PATH}/${runId}/clarify/continue`;
+    expect(await call('POST', path, {})).toMatchObject({ status: 422, body: { error: 'project_required' } });
+    expect(await call('POST', path, { project: repo })).toMatchObject({ status: 200, body: { draft: { project: { dir: repo, from: 'draft' } } } });
+    expect(h.clarify.createInputs.at(-1)?.workingDir).toBe(repo);
+    expect(readWorkflowDraft(join(runsDir, runId))!.projectDir).toBe(repo);
   });
 
   it('项目 options need the management login, the feature, and a bot or a run to copy', async () => {
