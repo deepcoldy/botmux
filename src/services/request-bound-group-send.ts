@@ -22,13 +22,15 @@
  *
  * The live file is capped at {@link GROUP_SEND_RECORD_LIMIT}. Admitting a new
  * requestId past that cap compacts the oldest `sent` records (by
- * `firstAttemptAt`) into a sibling archive capped at
- * {@link GROUP_SEND_ARCHIVE_LIMIT}. The archive is fsynced before those keys
- * are removed from the live file, and it is not rewritten on replay or on the
- * post-provider `sent` save. Pending records are never compacted — they are
- * the proof an attempt may already be visible — and a new requestId is refused
- * with `store_full` once they fill the cap. A requestId evicted from the
- * archive (oldest `sentAt` past the archive cap) retries as a new send.
+ * `firstAttemptAt`, at least {@link GROUP_SEND_COMPACT_BATCH} at a time) into
+ * a sibling archive capped at {@link GROUP_SEND_ARCHIVE_LIMIT}. The archive is
+ * fsynced before those keys are removed from the live file, and it is not
+ * rewritten on replay, on the post-provider `sent` save, or on the new
+ * requestIds admitted into the room a compaction made. Pending records are
+ * never compacted — they are the proof an attempt may already be visible — and
+ * a new requestId is refused with `store_full` once they fill the cap. A
+ * requestId evicted from the archive (oldest `sentAt` past the archive cap)
+ * retries as a new send.
  *
  * `outbound.send` is at-most-once per message id, not exactly-once. The route
  * always passes `suppressHook` into `sendMessage`. This module fires
@@ -66,11 +68,19 @@ export const GROUP_SEND_UUID_REUSE_MS = 50 * 60 * 1000;
 export const GROUP_SEND_RECORD_LIMIT = 2000;
 /**
  * Archive cap. 20_000 full records is about 6MB. That file is rewritten only
- * when a new requestId is admitted while the live file is already full.
+ * by a compaction (see {@link GROUP_SEND_COMPACT_BATCH}).
  * Past this cap the oldest `sentAt` is dropped, and that requestId retries
  * as a new send.
  */
 export const GROUP_SEND_ARCHIVE_LIMIT = 20_000;
+/**
+ * Minimum `sent` records moved per compaction. Once the live file is full,
+ * every new requestId needs a slot; moving one record at a time rewrites and
+ * fsyncs the whole archive (up to ~6MB) on every new send. A tenth of the live
+ * cap is one archive rewrite per 200 new requestIds (~30KB per send at the
+ * archive cap), well under the live-file rewrite each send already does.
+ */
+export const GROUP_SEND_COMPACT_BATCH = GROUP_SEND_RECORD_LIMIT / 10;
 
 /** Sibling of the live store: `group-sends-<appId>.json` → `group-sends-<appId>-archive.json`. */
 export function groupSendArchivePath(storePath: string): string {
@@ -269,7 +279,7 @@ export async function sendRequestBoundGroupMessage(deps: GroupSendDeps, input: G
         // part of the overflow would still be over the cap and would have
         // written the archive on a store_full response.
         if (movable.length < overflow) return { ok: false, status: 503, error: 'store_full', retryable: false };
-        const moving = movable.slice(0, overflow);
+        const moving = movable.slice(0, Math.max(overflow, GROUP_SEND_COMPACT_BATCH));
         for (const [storeKey, compacted] of moving) archive.records[storeKey] = compacted;
         evictArchiveOverflow(archive);
         save(archivePath, archive);

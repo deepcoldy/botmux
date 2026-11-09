@@ -33,9 +33,11 @@ dedupe window is ~1 hour). A record that is missing `uuid` / `firstAttemptAt`,
 or whose `uuid` is not that derived value, fails closed and nothing is sent.
 The live file holds at most 2000 records and is the only file rewritten on
 replay or on the post-provider `sent` save. Admitting a new `requestId` past
-that cap compacts the oldest sent records (`firstAttemptAt`) into
-`<dataDir>/group-sends-<appId>-archive.json`: upsert by key, fsync the archive,
-and only then remove those keys from the live file. The archive stores the
+that cap compacts the oldest sent records (`firstAttemptAt`), at least 200 at
+a time, into `<dataDir>/group-sends-<appId>-archive.json`: upsert by key,
+fsync the archive, and only then remove those keys from the live file. So the
+archive is rewritten once per 200 new `requestId`s, not on every send once the
+live file is full. The archive stores the
 full record (so both `requestId` → `messageId` and `messageId` → `requestId`
 still resolve) and keeps at most 20,000 records, dropping the oldest `sentAt`.
 The same key in both files is a single forward answer, and the live record

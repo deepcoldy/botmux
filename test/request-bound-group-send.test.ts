@@ -13,6 +13,7 @@ import {
   GROUP_CHAT_ID,
   GROUP_SEND_ARCHIVE_LIMIT,
   GROUP_SEND_BODY_MAX_BYTES,
+  GROUP_SEND_COMPACT_BATCH,
   GROUP_SEND_RECORD_LIMIT,
   GROUP_SEND_UUID_REUSE_MS,
   groupSendArchivePath,
@@ -294,6 +295,32 @@ describe('sent archive', () => {
     expect(readFileSync(archiveFile()).equals(archiveBefore)).toBe(true);
   });
 
+  it('keeps every live claim when the archive write fails during compaction', async () => {
+    writeStore(fillSent(GROUP_SEND_RECORD_LIMIT, 'c', clock, 'x'));
+    const activeBefore = readFileSync(storePath);
+    const send = vi.fn(async () => 'om_new');
+    // `now` runs after both files are loaded and before the archive is written.
+    // A directory at the archive path fails that write without failing the load.
+    let blockArchive = true;
+    const now = () => {
+      if (blockArchive) {
+        blockArchive = false;
+        mkdirSync(join(archiveFile(), 'blocker'), { recursive: true });
+      }
+      return clock;
+    };
+    await expect(sendRequestBoundGroupMessage({ ...deps(send), now }, input('req_trigger', 'x'))).rejects.toMatchObject({ syscall: 'rename' });
+    expect(send).not.toHaveBeenCalled();
+    expect(readFileSync(storePath).equals(activeBefore)).toBe(true);
+
+    rmSync(archiveFile(), { recursive: true, force: true });
+    const oldest = 'c0000000';
+    expect(await sendRequestBoundGroupMessage(deps(send), { chatId: CHAT, requestId: oldest, content: 'x' })).toMatchObject({
+      ok: true, replayed: true, messageId: `om_${oldest}`,
+    });
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it('replays a stored requestId inside and outside the uuid window when the live file is full', async () => {
     const requestId = 'c0000000';
     writeStore(fillSent(GROUP_SEND_RECORD_LIMIT, 'c', clock, 'x'));
@@ -342,6 +369,10 @@ describe('sent archive', () => {
     expect(result).toMatchObject({ ok: true, replayed: true, messageId: record.messageId });
     expect(send).not.toHaveBeenCalled();
     expect(committed).toEqual([]);
+    expect(await sendRequestBoundGroupMessage(deps(send), input(requestId, 'other text'))).toEqual({
+      ok: false, status: 409, error: 'request_conflict',
+    });
+    expect(send).not.toHaveBeenCalled();
     expect(existsSync(storePath)).toBe(false);
     expect(readFileSync(archiveFile()).equals(archiveBefore)).toBe(true);
     const read = await readRequestBoundGroupMessage({
@@ -364,24 +395,34 @@ describe('sent archive', () => {
       return `om_${String(n).padStart(8, '0')}`;
     });
     const sizes: number[] = [];
+    let archiveIno: number | undefined;
+    let archiveRewrites = 0;
     for (let i = 0; i < 2100; i++) {
       const requestId = `req_${String(i).padStart(8, '0')}`;
       expect(await sendRequestBoundGroupMessage(deps(send), input(requestId, 'plateau'))).toMatchObject({ ok: true, replayed: false });
-      if (i + 1 === 2050) expect(readFileSync(archiveFile()).equals(archiveDuringSend!)).toBe(true);
-      if (i + 1 === 2000 || i + 1 === 2050 || i + 1 === 2100) sizes.push(statSync(storePath).size);
+      if (i + 1 === GROUP_SEND_RECORD_LIMIT + 1) expect(readFileSync(archiveFile()).equals(archiveDuringSend!)).toBe(true);
+      // Every atomic rewrite renames a new inode over the archive.
+      if (existsSync(archiveFile()) && statSync(archiveFile()).ino !== archiveIno) {
+        archiveIno = statSync(archiveFile()).ino;
+        archiveRewrites++;
+      }
+      if (i + 1 === 2000 || i + 1 === 2100) sizes.push(statSync(storePath).size);
     }
-    const [at2000, at2050, at2100] = sizes;
+    expect(archiveRewrites).toBe(1);
+    const [at2000, at2100] = sizes;
     expect(at2100).toBeLessThan(at2000 * 1.04);
-    expect(Math.abs(at2100 - at2050)).toBeLessThan(at2050 * 0.02);
-    expect(Object.keys(readRecords(storePath))).toHaveLength(GROUP_SEND_RECORD_LIMIT);
-    expect(Object.keys(readRecords(archiveFile()))).toHaveLength(2100 - GROUP_SEND_RECORD_LIMIT);
-    expect(Object.keys(readRecords(archiveFile())).length).toBeLessThanOrEqual(GROUP_SEND_ARCHIVE_LIMIT);
+    const live = Object.keys(readRecords(storePath)).length;
+    const archived = Object.keys(readRecords(archiveFile())).length;
+    expect(live).toBeLessThanOrEqual(GROUP_SEND_RECORD_LIMIT);
+    expect(archived).toBe(GROUP_SEND_COMPACT_BATCH);
+    expect(live + archived).toBe(2100);
 
     const beforeReplay = readFileSync(archiveFile());
     await sendRequestBoundGroupMessage(deps(send), input('req_00002099', 'plateau'));
     expect(readFileSync(archiveFile()).equals(beforeReplay)).toBe(true);
 
     writeArchive(fillSent(GROUP_SEND_ARCHIVE_LIMIT, 'a', 1, 'old'));
+    writeStore(fillSent(GROUP_SEND_RECORD_LIMIT, 'b', clock, 'plateau'));
     expect(await sendRequestBoundGroupMessage(deps(send), input('req_pastcap', 'plateau'))).toMatchObject({ ok: true, replayed: false });
     expect(Object.keys(readRecords(archiveFile()))).toHaveLength(GROUP_SEND_ARCHIVE_LIMIT);
     // 2100 次 durable 写 + 一次 20k 条归档种子，bun:test 默认 5s 超时下跑不完，显式放宽。
@@ -389,10 +430,15 @@ describe('sent archive', () => {
 
   it('retries a requestId evicted from the archive as a new send', async () => {
     const victim = 'req_victim1';
-    const archived = fillSent(GROUP_SEND_ARCHIVE_LIMIT - 1, 'a', 2, 'x');
+    const archived = fillSent(GROUP_SEND_ARCHIVE_LIMIT - 2, 'a', 2, 'x');
     const victimRecord = pendingRecord(victim, CHAT, 'x', 'sent', 1);
     victimRecord.sentAt = 1;
     archived[`${CHAT}\0${victim}`] = victimRecord;
+    // The oldest attempt, but sent late: retention follows sentAt, so it stays.
+    const keeper = 'req_keeper1';
+    const keeperRecord = pendingRecord(keeper, CHAT, 'x', 'sent', 0);
+    keeperRecord.sentAt = GROUP_SEND_ARCHIVE_LIMIT + 5;
+    archived[`${CHAT}\0${keeper}`] = keeperRecord;
     writeArchive(archived);
     writeStore(fillSent(GROUP_SEND_RECORD_LIMIT, 'b', GROUP_SEND_ARCHIVE_LIMIT + 10, 'x'));
     const send = vi.fn(async () => 'om_newsend');
@@ -400,6 +446,7 @@ describe('sent archive', () => {
       ok: true, replayed: false, messageId: 'om_newsend',
     });
     expect(readRecords(archiveFile())[`${CHAT}\0${victim}`]).toBeUndefined();
+    expect(readRecords(archiveFile())[`${CHAT}\0${keeper}`]).toMatchObject({ messageId: `om_${keeper}` });
     const retry = await sendRequestBoundGroupMessage(deps(send), { chatId: CHAT, requestId: victim, content: 'x' });
     expect(retry).toMatchObject({ ok: true, replayed: false, messageId: 'om_newsend' });
     expect(send).toHaveBeenCalledTimes(2);
