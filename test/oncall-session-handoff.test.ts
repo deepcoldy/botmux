@@ -103,6 +103,21 @@ describe('session Oncall request ownership', () => {
     expect(store.findSource('app', source.messageId)).toMatchObject({ answer: 'final answer', turnNumber: 1, nativeLink: 'https://applink.example.test/native', dispatchAttempt: 2 });
     expect(store.latest('app', 'session')?.answer).toBe('final answer');
   });
+  it('scans pending handoffs without expanding sessions that have no request', () => {
+    const store = new OncallGroupStore(temp());
+    const sessions = ['s1', 's2', 's3', 's4', 'tracked', 'adopted'].map((sessionId, index) => ({ ...source, sessionId, questionId: `om_q${index}`, messageId: `om_a${index}` }));
+    for (const item of sessions) store.recordSource(item);
+    const tracked = sessions[4]!;
+    store.claim(tracked, 'ou_owner', { messageIds: [tracked.questionId], cutoffMs: Date.now() });
+    store.finish(tracked, { status: 'succeeded', openChatId: 'oc_tracked' }, store.getRequest(tracked)!.attemptId);
+    const old = { ...sessions[5]!, sessionId: undefined };
+    store.claim(old, 'ou_owner');
+    store.finish(old, { status: 'succeeded', openChatId: 'oc_adopted', attemptId: 'old', submittedAtMs: Date.now(), forwardMode: 'individual', messageIdsSnapshot: [old.questionId], forwarded: [] });
+    const expand = vi.spyOn(OncallGroupStore.prototype, 'sessionSources');
+    expect(store.pendingHandoffs('app').map(item => item.sessionId).sort()).toEqual(['adopted', 'tracked']);
+    expect(expand).toHaveBeenCalledTimes(1);
+    expand.mockRestore();
+  });
   it('permits an explicit retry only for a confirmed rejection, with a new attempt owner', () => {
     const store = new OncallGroupStore(temp()); store.claim(source);
     const prior = store.getRequest(source)!.attemptId;

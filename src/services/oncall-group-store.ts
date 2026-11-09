@@ -144,6 +144,7 @@ export class OncallGroupStore {
 
   pendingHandoffs(appId: string): OncallGroupSource[] {
     const sources = new Map<string, OncallGroupSource>();
+    const legacyFiles = new Map<string, Set<string>>();
     for (const kind of ['questions', 'messages', 'sessions']) {
       let files: string[];
       try { files = readdirSync(join(this.dataDir, 'oncall-groups', kind)); }
@@ -151,17 +152,26 @@ export class OncallGroupStore {
       for (const file of files.filter(file => file.endsWith('.json'))) {
         const entry = read<OncallGroupSource & SessionEntry & QuestionEntry>(join(this.dataDir, 'oncall-groups', kind, file));
         const candidates = kind === 'questions' ? entry?.sources ?? [] : kind === 'sessions' ? entry?.latest ? [entry.latest] : [] : entry ? [entry] : [];
-        for (const source of candidates) if (source.appId === appId && source.questionId && source.chatId) sources.set(this.requestStatePath(source), source);
+        for (const source of candidates) if (source.appId === appId && source.questionId && source.chatId) {
+          const key = this.requestStatePath(source);
+          sources.set(key, source);
+          if (source.sessionId) legacyFiles.set(key, (legacyFiles.get(key) ?? new Set()).add(this.path('requests', [appId, source.chatId, source.questionId])));
+        }
       }
     }
-    return [...sources.values()].filter(source => {
-      const request = this.getRequest(source);
+    let requests: Set<string>;
+    try { requests = new Set(readdirSync(join(this.dataDir, 'oncall-groups', 'requests')).map(name => join(this.dataDir, 'oncall-groups', 'requests', name))); }
+    catch (error: any) { if (error.code !== 'ENOENT') throw error; requests = new Set(); }
+    // Expanding a whole session is only needed when one of its questions has an old request to adopt.
+    return [...sources].filter(([key, source]) => {
+      const request = read<OncallGroupRequest>(key)
+        ?? ([...legacyFiles.get(key) ?? []].some(file => requests.has(file)) ? this.legacyRequest(source) : undefined);
       return request?.status === 'succeeded'
         && Date.now() - (request.submittedAtMs ?? 0) < 24 * 60 * 60_000
         && (request.cardRefreshPending || (request.handoffError !== 'restricted_merge'
           && (request.conversationScopePending || (request.forwardMode !== 'none' && !request.forwardingBlocked
             && pendingOncallMessageIds(request).length > 0))));
-    });
+    }).map(([, source]) => source);
   }
 
   isLatest(source: OncallGroupSource): boolean {
