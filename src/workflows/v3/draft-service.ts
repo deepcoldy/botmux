@@ -24,7 +24,7 @@
  */
 
 import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, rmSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
 import type { BotConfig } from '../../bot-registry.js';
@@ -423,6 +423,10 @@ export interface WorkflowDraftServiceDeps {
   /** Live daemon registry. The other roster facts of a planned group are
    *  either static (bots.json) or settled when the group is built (§4.4). */
   isDaemonOnline: (larkAppId: string) => boolean;
+  /** Whether that bot's running daemon reads a run.json carrying the
+   *  draft's project (`workflowNodeProjectDir` in its descriptor). Absent:
+   *  none does, and run.json never carries the project. */
+  daemonReadsNodeProjectDir?: (larkAppId: string) => boolean;
   clarifier: DraftClarifier;
   projects: WorkflowDraftProjects;
   runArchitect: ArchitectDeps['runArchitect'];
@@ -4361,6 +4365,24 @@ export class WorkflowDraftService {
     });
   }
 
+  /** The draft's project as run.json's `nodeProjectDir` (§15.4: a node whose
+   *  bot has no default working dir starts there). Left out unless every
+   *  other executing bot's daemon reads it — an older one rejects the whole
+   *  run.json and could not start its node — and then every node runs where
+   *  it did before projects. */
+  private nodeProjectDirFor(runId: string, draft: WorkflowDraftRecord, targets: readonly V3NodeExecutorTarget[]): string | undefined {
+    const dir = draft.projectDir;
+    const reads = this.deps.daemonReadsNodeProjectDir;
+    if (!reads || !dir || !isAbsolute(dir) || dir.includes('\0')) return undefined;
+    const older = [...new Set(targets.map((target) => target.larkAppId))].filter((appId) => {
+      if (appId === this.deps.appId) return false;
+      try { return !reads(appId); } catch { return true; }
+    });
+    if (older.length === 0) return dir;
+    this.log(`[workflow-draft] launch ${runId}: project ${dir} not recorded for the nodes, older daemon: ${older.join(', ')}`);
+    return undefined;
+  }
+
   private async launchCommitStep(runId: string, token: string): Promise<boolean> {
     // 运行模板 as is (§5.3): run.json is the template's (saved_definition).
     // A swapped bot made it 复制后启动: the ad-hoc commit below.
@@ -4387,6 +4409,7 @@ export class WorkflowDraftService {
         source: draft.initiator.source,
       };
       let placementRefusal: string | undefined;
+      let nodeProjectDir: string | undefined;
       if (!existsSync(envelopePath)) {
         let flow: ReturnType<WorkflowDraftService['currentFlow']>;
         try {
@@ -4408,6 +4431,7 @@ export class WorkflowDraftService {
         // that entry). A replay below already passed this gate.
         const problems = this.commitPlacementProblems(flow.targets, binding);
         if (problems.length > 0) placementRefusal = formatV3PlacementRefusal(problems);
+        else nodeProjectDir = this.nodeProjectDirFor(runId, draft, flow.targets);
       }
       if (draft.template && Object.keys(draft.nodeBots ?? {}).length === 0) return { changed: false, result: 'again' as const };
       if (placementRefusal) return { changed: true, result: { placement: placementRefusal } as const };
@@ -4428,6 +4452,7 @@ export class WorkflowDraftService {
         nodeExecutor: 'bot',
         chatBinding: binding,
         initiator,
+        ...(nodeProjectDir !== undefined ? { nodeProjectDir } : {}),
         flowConfirmation: ({ dag, targets }) => {
           // Exactly what is being frozen must be what was confirmed.
           const flowSummary = adHocFlowSummary({ runDir, dag, targets, orchestratorAppId: this.deps.appId, bots, nameOf });
@@ -4570,9 +4595,11 @@ export class WorkflowDraftService {
         ...(draft.initiator.source === 'dashboard-platform' && draft.initiator.unionId ? { unionId: draft.initiator.unionId } : {}),
         source: draft.initiator.source,
       };
+      let nodeProjectDir: string | undefined;
       if (pendingTargets) {
         const problems = this.commitPlacementProblems(pendingTargets, binding);
         if (problems.length > 0) return { changed: true, result: { placement: formatV3PlacementRefusal(problems) } };
+        nodeProjectDir = this.nodeProjectDirFor(runId, draft, pendingTargets);
       }
       const rawParams = Object.create(null) as Record<string, RawParamInput>;
       for (const [name, value] of Object.entries(template.params)) rawParams[name] = { kind: 'string', value };
@@ -4604,6 +4631,7 @@ export class WorkflowDraftService {
               expected: { dagSha256: template.dagSha256, specSha256: template.specSha256 },
               bots,
               now: this.now(),
+              ...(nodeProjectDir !== undefined ? { nodeProjectDir } : {}),
             });
         // The grill is this draft's bookkeeping only: past run.json it reads
         // as approved, like an ad-hoc launch's.

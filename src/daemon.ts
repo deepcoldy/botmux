@@ -5791,6 +5791,8 @@ interface DaemonDescriptor {
   dispatchLaunchIpcProtocol?: 'v1';
   /** Applies a workflow run's Gate-2 working dir to node sessions (§15.4). */
   workflowNodeWorkingDir: 'v1';
+  /** Reads a run's `nodeProjectDir` (the launching draft's project, §15.4). */
+  workflowNodeProjectDir: 'v1';
   /** Handles main-topic workflow handoffs (§5.5). */
   workflowMainPlacement: 'v1';
   /** Presence-based session-store capability. Copy only; never a write permit. */
@@ -7243,6 +7245,7 @@ const workflowNodeDaemon = createWorkflowNodeDaemon({
     try { return getBot(appId).config; } catch { return undefined; }
   },
   daemonAppliesNodeWorkingDir: (appId) => findOnlineDaemon(appId)?.workflowNodeWorkingDir === 'v1',
+  daemonReadsNodeProjectDir: (appId) => findOnlineDaemon(appId)?.workflowNodeProjectDir === 'v1',
   // §15.4: the initiator operates this bot when they may use /cd in its
   // topics (the gate a typed /cd passes) and are in the run's chat now, with
   // their identity converted into this bot's own app first.
@@ -33251,6 +33254,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     workflowIpcProtocol: 'v1',
     ...(cfg.dispatchLaunchPolicy?.enabled === true ? { dispatchLaunchIpcProtocol: 'v1' as const } : {}),
     workflowNodeWorkingDir: 'v1',
+    workflowNodeProjectDir: 'v1',
     workflowMainPlacement: 'v1',
     sessionStoreProtocol: SESSION_STORE_PROTOCOL,
     botmuxVersion: botmuxVersion(),

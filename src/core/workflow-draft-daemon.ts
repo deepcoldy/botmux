@@ -698,6 +698,9 @@ export function createProductionWorkflowDraftService(
     isDaemonOnline: (larkAppId) => {
       try { return findOnlineDaemon(larkAppId, config.session.dataDir) !== null; } catch { return false; }
     },
+    daemonReadsNodeProjectDir: (larkAppId) => {
+      try { return findOnlineDaemon(larkAppId, config.session.dataDir)?.workflowNodeProjectDir === 'v1'; } catch { return false; }
+    },
     clarifier,
     projects,
     runArchitect,
