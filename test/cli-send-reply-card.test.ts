@@ -31,7 +31,7 @@ describe('real CLI send into a running reply card', () => {
     { cliId: 'traex', timing: 'final', unified: true },
     { cliId: 'codex', timing: 'final', unified: true },
     { cliId: 'claude-code', timing: 'final', unified: false },
-  ])('requires explicit response kind only for a managed card ($cliId/$timing/$unified)', async ({ cliId, timing, unified }) => {
+  ])('keeps a bare send as progress and attaches Oncall to the final answer ($cliId/$timing/$unified)', async ({ cliId, timing, unified }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-send-kind-'));
     const dataDir = join(root, 'data');
     try {
@@ -48,7 +48,6 @@ describe('real CLI send into a running reply card', () => {
       } });
       const store = new TurnReplyCardStore(dataDir);
       if (unified) await store.prepare(key, { mode: 'unified', nativeCot: true, chatId: 'oc_test', rootId: 'om_root' });
-      const before = store.read(key);
       const send = (kind?: string) => spawnSyncTsScript(fixture, ['send', '--no-mention',
         ...(kind ? ['--response-kind', kind] : []), 'A complete answer.'], {
         cwd: fileURLToPath(new URL('..', import.meta.url)),
@@ -58,15 +57,11 @@ describe('real CLI send into a running reply card', () => {
         encoding: 'utf8', timeout: 30_000,
       });
       const unclassified = send();
-      if (!unified) {
-        expect(unclassified.status, String(unclassified.stderr)).toBe(0);
-        expect(String(unclassified.stdout)).toContain('CAPTURE_REPLY=');
-        return;
-      }
-      expect(unclassified.status).toBe(2);
-      expect(String(unclassified.stderr)).toContain('--response-kind');
-      expect(String(unclassified.stdout)).not.toContain('CAPTURE_REPLY=');
-      expect(store.read(key)).toEqual(before);
+      expect(unclassified.status, String(unclassified.stderr)).toBe(0);
+      expect(String(unclassified.stdout)).toContain('CAPTURE_REPLY=');
+      if (!unified) return;
+      expect(store.read(key)).toMatchObject({ progress: ['A complete answer.'] });
+      expect(store.read(key)?.finalCard).toBeUndefined();
       const final = send('final');
       expect(final.status, String(final.stderr)).toBe(0);
       await store.update(key, { kind: 'terminal', phase: 'completed' }, {
@@ -77,9 +72,9 @@ describe('real CLI send into a running reply card', () => {
       const record = store.read(key)!;
       expect(record.finalDelivered).toBe(true);
       expect(record.finalSource).toBe('explicit');
-      expect(record.progress).toEqual([]);
       const card = JSON.parse(record.lastCard!);
-      expect(card.body.elements.some((element: any) => ['botmux_turn_status', 'botmux_turn_process'].includes(element.element_id))).toBe(false);
+      expect(card.body.elements.some((element: any) => element.element_id === 'botmux_turn_status')).toBe(false);
+      expect(record.lastCard).toContain('A complete answer.');
       expect(record.lastCard).toContain('oncall_group_create');
     } finally { rmSync(root, { recursive: true, force: true }); }
   }, 35_000);

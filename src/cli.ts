@@ -14469,14 +14469,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
         && (effectiveResponseKind === 'final' || (imageKeys.length === 0 && files.length === 0 && videoAttachments.length === 0));
       const replyRecord = canUseReplyCard ? replyStore.read(replyKey) : undefined;
       if (replyRecord && replyKey) {
-        // A bare legacy send is ambiguous here: silently storing it as progress
-        // leaves no final card when the CLI then emits its no-reply sentinel.
-        if (responseKind === undefined) {
-          console.error('botmux send: 单卡模式需要 --response-kind final（最终答复）或 --response-kind progress（过程消息）；本次未发送，请补全参数后重试。');
-          process.exit(2);
-        }
         if (replyRecord.chatId !== targetChatId) throw new Error('Reply-card destination changed; send refused');
-
         let delivered: Awaited<ReturnType<typeof replyStore.update>> | undefined;
         const replyDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
           delivered = await replyStore.update(replyKey, effectiveResponseKind === 'final'
