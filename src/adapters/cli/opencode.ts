@@ -25,9 +25,11 @@ import { delay, scaleMs } from '../../utils/timing.js';
 const OPENCODE_SESSION_ID_RE = /^ses_[0-9A-Za-z-]+$/;
 const OPENCODE_PASTE_THRESHOLD = 150;
 
-/** OpenCode 1.x 输入框的下边沿 `╹▀▀▀…`：首页和会话页、空闲和忙碌时都画着。
- *  画出来之前屏幕是空的，这时打进去的字会被整段丢掉，不落库、也不发请求。 */
-const OPENCODE_COMPOSER_EDGE_RE = /^[ \t]*╹▀{8,}/m;
+/** OpenCode 1.x 输入框：左边框是一列 `┃`，下边沿是 `╹▀▀▀…`，首页和会话页、空闲和
+ *  忙碌时都画着。下边沿只在主题的 backgroundElement 不透明时画，透明主题（如
+ *  lucent-orng）那一行是空格；左边框所有主题都画。画出来之前屏幕是空的，这时打
+ *  进去的字会被整段丢掉，不落库、也不发请求。 */
+const OPENCODE_COMPOSER_RE = /^[ \t]*(?:┃|╹▀{8,})/m;
 /** 启动可能比 worker 的静默窗口长（每次启动都要装插件依赖）。给足但有界：
  *  输入框长相变了也只是首条消息晚这么久，不会卡住。 */
 const OPENCODE_COMPOSER_WAIT_MS = 45_000;
@@ -40,7 +42,7 @@ async function waitForOpenCodeComposer(pty: PtyHandle): Promise<void> {
   const deadline = Date.now() + scaleMs(OPENCODE_COMPOSER_WAIT_MS);
   while (Date.now() < deadline) {
     const screen = await pty.captureViewportAsync().catch(() => '');
-    if (OPENCODE_COMPOSER_EDGE_RE.test(screen)) return;
+    if (OPENCODE_COMPOSER_RE.test(screen)) return;
     await delay(OPENCODE_COMPOSER_POLL_MS);
   }
 }

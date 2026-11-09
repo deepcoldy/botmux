@@ -21,9 +21,13 @@ const HOME_SCREEN = [
   '                                         tab agents  ctrl+p commands',
 ].join('\n');
 
+// The same screen under a theme whose backgroundElement is transparent
+// (built-in lucent-orng): OpenCode draws the bottom edge as spaces.
+const TRANSPARENT_HOME_SCREEN = HOME_SCREEN.replace(/╹▀+/, '');
+
 /** OpenCode as the adapter sees it through tmux: a blank screen until the input
  *  box is drawn, keystrokes before that are lost, Enter submits the box. */
-function fakeOpenCode() {
+function fakeOpenCode(screen = HOME_SCREEN) {
   let composerDrawn = false;
   let box = '';
   const received: string[] = [];
@@ -41,7 +45,7 @@ function fakeOpenCode() {
       received.push(box);
       box = '';
     },
-    captureViewportAsync: vi.fn(async () => (composerDrawn ? HOME_SCREEN : '')),
+    captureViewportAsync: vi.fn(async () => (composerDrawn ? screen : '')),
   };
   return {
     pty,
@@ -89,6 +93,20 @@ describe('OpenCode first input during startup', () => {
 
     expect(opencode.lost).toEqual([]);
     expect(opencode.received).toEqual([prompt]);
+  });
+
+  it.each([
+    ['default theme', HOME_SCREEN],
+    ['transparent theme, no bottom edge', TRANSPARENT_HOME_SCREEN],
+  ])('types at once when the input box is already on screen (%s)', async (_theme, screen) => {
+    const adapter = createOpenCodeAdapter('/bin/opencode');
+    const opencode = fakeOpenCode(screen);
+    opencode.drawComposer();
+
+    await adapter.writeInput(opencode.pty, 'hello');
+
+    expect(opencode.pty.captureViewportAsync).toHaveBeenCalledTimes(1);
+    expect(opencode.received).toEqual(['hello']);
   });
 
   it('only waits on the first input: a later message is typed even while the input box is hidden', async () => {

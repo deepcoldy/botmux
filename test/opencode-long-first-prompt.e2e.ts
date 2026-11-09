@@ -1,11 +1,12 @@
 /** Opt-in native OpenCode acceptance: a first message over the launch-argument
- * budget is typed while OpenCode is still starting, and must reach the model.
+ * budget is typed while OpenCode is still starting, and must reach the model as
+ * soon as the input box is drawn, also under a theme that draws no bottom edge.
  * Empty HOME and a loopback model; never reads host credentials or config.
  * BOTMUX_OPENCODE_E2E_BIN=$(command -v opencode) bun x vitest run --project e2e test/opencode-long-first-prompt.e2e.ts */
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { createServer, type Server } from 'node:http';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -27,21 +28,29 @@ afterEach(async () => {
   root = undefined;
 });
 
-it.skipIf(!process.env.BOTMUX_OPENCODE_E2E_BIN)('real OpenCode: a first message over the launch-argument budget, typed during startup, reaches the model', async () => {
+describe.skipIf(!process.env.BOTMUX_OPENCODE_E2E_BIN)('real OpenCode', () => it.each([
+  ['default theme', undefined],
+  ['transparent theme lucent-orng', 'lucent-orng'],
+])('a first message over the launch-argument budget, typed during startup, reaches the model once the input box is drawn (%s)', async (_label, theme) => {
   root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-opencode-first-prompt-')));
   const home = join(root, 'home');
   const cwd = join(root, 'work');
   mkdirSync(home);
   mkdirSync(cwd);
+  if (theme) {
+    // OpenCode reads the theme from its TUI config file, not OPENCODE_CONFIG_CONTENT.
+    mkdirSync(join(home, '.config', 'opencode'), { recursive: true });
+    writeFileSync(join(home, '.config', 'opencode', 'tui.json'), JSON.stringify({ $schema: 'https://opencode.ai/tui.json', theme }));
+  }
   // The adapter checks the submit in the same DB the child writes.
   vi.stubEnv('XDG_DATA_HOME', join(home, '.local', 'share'));
-  const requests: string[] = [];
+  const requests: Array<{ at: number; body: string }> = [];
   server = createServer((req, res) => {
     let body = '';
     req.on('data', chunk => { body += chunk; });
     req.on('end', () => {
       if (req.method !== 'POST' || !req.url?.endsWith('/chat/completions')) { res.writeHead(404); res.end(); return; }
-      requests.push(body);
+      requests.push({ at: Date.now(), body });
       void streamOpenAiEvents(res, buildOpenAiTextEvents({ model: 'mock-model', text: 'fixture done' }));
     });
   });
@@ -82,11 +91,26 @@ it.skipIf(!process.env.BOTMUX_OPENCODE_E2E_BIN)('real OpenCode: a first message 
   lines.push('</botmux_routing>', `Reply with ${marker}.`);
   const prompt = lines.join('\n');
 
+  // The model line inside the input box marks when the box is drawn.
+  let boxDrawnAt: number | undefined;
+  const watchDeadline = Date.now() + 90_000;
+  const watching = (async () => {
+    while (boxDrawnAt === undefined && Date.now() < watchDeadline) {
+      if ((await backend.captureViewportAsync().catch(() => '')).includes('Mock Model Mock LLM')) boxDrawnAt = Date.now();
+      else await delay(100);
+    }
+  })();
+
   // Typed right after spawn, before OpenCode has drawn anything.
   const result = await createOpenCodeAdapter(process.env.BOTMUX_OPENCODE_E2E_BIN).writeInput(backend, prompt);
 
   const deadline = Date.now() + 60_000;
-  while (!requests.some(body => body.includes(marker)) && Date.now() < deadline) await delay(250);
-  expect(requests.some(body => body.includes(marker)), `requests=${requests.length}\n${await backend.captureViewportAsync()}`).toBe(true);
+  while (!requests.some(r => r.body.includes(marker)) && Date.now() < deadline) await delay(250);
+  await watching;
+  const request = requests.find(r => r.body.includes(marker));
+  expect(request, `requests=${requests.length}\n${await backend.captureViewportAsync()}`).toBeDefined();
   expect(result).toMatchObject({ submitted: true });
-}, 120_000);
+  expect(boxDrawnAt).toBeDefined();
+  // Far below the 45s input-box wait: the adapter recognised the box.
+  expect(request!.at - boxDrawnAt!).toBeLessThan(15_000);
+}, 120_000));
