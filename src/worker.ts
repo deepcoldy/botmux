@@ -7475,6 +7475,37 @@ function failCodexAppControlGeneration(reason: string): void {
   });
 }
 
+function restoreCodexAppContractNativeSession(): void {
+  const scope = workerSessionEventScope;
+  const previous = scope?.currentBinding();
+  if (!scope || !previous || previous.identity?.proof !== 'process_start'
+      || previous.identity.nativeSessionId || !codexAppControlProven
+      || !codexAppRecoveredDispatches.some(entry => entry.state === 'prepared')
+      || !lastInitConfig) return;
+  // The original thread marker may already be ACKed. A resume argument is not
+  // live ownership proof: use the authenticated runner's uniquely attested
+  // app-server and its sole open rollout instead.
+  const observedBackend = backend;
+  const backendPid = observedBackend?.getChildPid?.() ?? undefined;
+  const backendStart = backendPid ? readProcessStartIdentity(backendPid) : undefined;
+  if (!backendStart) return;
+  const processIdentity = captureAttachedCodexAppProcessIdentity(
+    backendPid, lastInitConfig.sessionId, process.execPath,
+  );
+  if (!processIdentity) return;
+  const rollouts = findCodexRolloutSetByPid(processIdentity.enginePid);
+  const observed = rollouts?.size === 1 ? findCodexRolloutByPid(processIdentity.enginePid) : undefined;
+  if (!observed || !rollouts!.has(observed.cliSessionId.toLowerCase())
+      || readProcessStartIdentity(processIdentity.enginePid) !== processIdentity.engineProcStart
+      || backend !== observedBackend || backend?.getChildPid?.() !== backendPid
+      || readProcessStartIdentity(backendPid!) !== backendStart
+      || scope.currentBinding() !== previous) return;
+  // Enrich the bare binding without moving attempts that may already belong
+  // to it. The host separately grants historical result observation for exact
+  // recovered executions of this proven surviving native session.
+  scope.run(previous, () => { void publishRuntimeContract(previous, observed.cliSessionId); });
+}
+
 function activateCodexAppControlConnection(
   connection: CodexAppControlConnection,
   identity: CodexAppControlIdentity,
@@ -7527,6 +7558,7 @@ function activateCodexAppControlConnection(
   const previous = codexAppControlActiveSocket;
   codexAppControlActiveSocket = connection.socket;
   if (previous && previous !== connection.socket) previous.destroy();
+  if (proofKind === 'warm reattach') restoreCodexAppContractNativeSession();
   cleanupCodexAppControlBootstrap();
   connection.socket.write(`${encodeCodexAppControlAccepted(
     cfg.sessionId,
@@ -7639,7 +7671,10 @@ async function handleCodexAppControlLine(
   // worker effects is single-flight by signed generation/sequence until the
   // replay window below is committed.
   if (finalResult.status === 'accepted') return;
-  const applyRecord = () => finalResult.status === 'not-final'
+  // The socket can outlive a semantic runtime rebind (launcher -> native CLI).
+  // Recover the submitted execution from the authenticated final's exact FIFO
+  // head, while retaining the socket callback's physical-backend boundary.
+  const applyRecord = bindSessionExecutionEvent(() => finalResult.status === 'not-final'
       ? handleTrustedCodexAppMarker(
           record.kind,
           record.payload,
@@ -7651,7 +7686,13 @@ async function handleCodexAppControlLine(
           finalResult.payload,
           { generation: identity.generation, seq: record.seq, socket: connection.socket,
             channelId: connection.channelId, epoch: connection.epoch },
-        );
+        ), () => {
+    if (finalResult.status === 'not-final' || !isCodexAppCliId(cfg.cliId)) return {};
+    const settlement = codexAppTurnDispatchQueue.settleFinal(finalResult.payload, false);
+    return settlement.ok
+      ? { turnId: settlement.turnId, dispatchAttempt: settlement.dispatchAttempt }
+      : {};
+  });
   let application = codexAppControlRecordApplicationGate.run(identity.generation, record.seq, applyRecord);
   let applied: boolean;
   for (;;) {
@@ -17937,8 +17978,7 @@ async function handleTrustedCodexAppMarker(
     if (isSuperseded
         && (!isCodexAppCliId(lastInitConfig?.cliId)
           || finalContent !== ''
-          || payload.usage !== undefined
-          || !codexAppCompletionAwaitingFinal)) {
+          || payload.usage !== undefined)) {
       rejectCodexAppControlMarker('invalid steer_superseded final (content/usage/awaiting contract)');
       return false;
     }
@@ -17997,6 +18037,29 @@ async function handleTrustedCodexAppMarker(
           + `(steerable=${settlement.codexAppSteerable === true}, remaining=${settlement.remaining})`,
         );
         return false;
+      }
+      if (isSuperseded && !codexAppCompletionAwaitingFinal) {
+        // activity:completed can already be ACKed when a worker dies, leaving
+        // only its uncommitted final group to replay. Recover that boundary
+        // solely from the authenticated surviving generation and the exact
+        // daemon-frozen prepared prefix; locally queued work is insufficient.
+        const recovered = codexAppTurnDispatchQueue.recoveredPrefix();
+        const prepared = codexAppRecoveredDispatches.filter(entry => entry.state === 'prepared');
+        const recoverable = control && codexAppControlProven
+          && codexAppControlStateValue?.status === 'active'
+          && codexAppControlStateValue.identities.length === 1
+          && codexAppControlStateValue.identities[0].generation === control.generation
+          && recovered.length >= 2 && prepared.length >= 2
+          && recovered[0].handle === settlement.handle
+          && recovered.slice(0, 2).every((entry, index) =>
+            entry.dispatchId === prepared[index].dispatchId
+            && entry.turnId === prepared[index].turnId
+            && entry.dispatchAttempt === prepared[index].dispatchAttempt)
+          && prepared[0].codexAppSteerable === true;
+        if (!recoverable) {
+          rejectCodexAppControlMarker('steer_superseded final has no proven completion boundary');
+          return false;
+        }
       }
       // Liveness slot retirement + completion-awaiting clearing happen AFTER the
       // durable commit below (a persist/commit failure must not retire a slot or
@@ -18190,7 +18253,9 @@ async function handleTrustedCodexAppMarker(
         // and never publish ready — the group's real final is still to come. This
         // is "retire a logical slot", NOT "close the native completion gate".
         codexAppTurnLiveness.completeCurrent(completedAtMs);
-        // codexAppCompletionAwaitingFinal intentionally left true.
+        // Rehydrate only after the durable ACK, including warm replay where
+        // the old worker had already acknowledged activity:completed.
+        codexAppCompletionAwaitingFinal = true;
       } else {
         if (!codexAppCompletionAwaitingFinal) {
           // turn/start failures emit a final transaction without an app-server
@@ -34252,6 +34317,9 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       workerSessionEventScope?.assign(msg.bindingId, msg.runtime);
       for (const state of msg.admissionStates ?? []) workerSessionEventScope?.noteAdmission(state);
       for (const execution of msg.executions ?? []) workerSessionEventScope?.rememberExecution(execution);
+      for (const observed of msg.observedExecutions ?? []) {
+        workerSessionEventScope?.rememberObservedExecution(msg.bindingId, observed.runtime, observed.execution);
+      }
       if (!msg.mayExecute) { closeRequested = true; stopBridgeWatcher(); stopScreenshotLoop(); killCli(); }
       break;
     }

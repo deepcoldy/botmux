@@ -31,9 +31,12 @@ export class SessionEventGateway {
       && sameRuntime(recoveredOrigin.scope.runtime, runtime)
       && recoveredOrigin.scope.execution?.executionId === context.scope.execution?.executionId
       && (this.store.authorizedProducer(this.session, runtime, recoveredOrigin.producer)
+        || this.store.authorizedExecutionObserver(this.session, runtime, recoveredOrigin.producer, recoveredOrigin.scope.execution)
         || (recoveredOrigin.bindingId && this.store.bindingProducer(this.session, recoveredOrigin.bindingId, recoveredOrigin.producer)
           && sameRuntime(this.store.binding(this.session, recoveredOrigin.bindingId)?.ref, runtime)));
-    if (!this.store.authorizedProducer(this.session, runtime, channel) && !recovery) return { kind: 'reject', reason: 'runtime_producer_unproven' };
+    const observation = sameWorker(state.worker, channel) && ['final_output', 'turn_terminal'].includes(type)
+      && this.store.authorizedExecutionObserver(this.session, runtime, channel, context.scope.execution);
+    if (!this.store.authorizedProducer(this.session, runtime, channel) && !recovery && !observation) return { kind: 'reject', reason: 'runtime_producer_unproven' };
     if (context.scope.execution) {
       const execution = this.store.execution(this.session, context.scope.execution.executionId);
       if (!execution || execution.ref.turnId !== context.scope.execution.turnId || execution.ref.dispatchAttempt !== context.scope.execution.dispatchAttempt
@@ -49,7 +52,7 @@ export class SessionEventGateway {
         return { kind: 'reject', reason: 'execution_scope_unproven' };
       }
     }
-    if (!recovery && sameWorker(state.worker, channel) && sameRuntime(state.activeRuntime, runtime) && state.lifecycle !== 'closed' && state.lifecycle !== 'closing') {
+    if (!recovery && !observation && sameWorker(state.worker, channel) && sameRuntime(state.activeRuntime, runtime) && state.lifecycle !== 'closed' && state.lifecycle !== 'closing') {
       if (type === 'claude_exit' && this.store.hasPendingRuntimeReplacement(this.session, runtime)) return { kind: 'historical', context };
       return { kind: 'current', context };
     }
