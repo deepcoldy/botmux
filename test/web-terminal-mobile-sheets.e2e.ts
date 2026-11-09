@@ -745,4 +745,66 @@ setInterval(() => {}, 1_000);
     expect(geometry.overlap).toBeLessThanOrEqual(0.5);
     expect(geometry.pinnedRight).toBeLessThanOrEqual(geometry.width);
   });
+
+  it('读取请求先超时、应答后到：迟到应答仍被认领，最新列表照样刷到面板上', async () => {
+    rmSync(settingsPath(), { force: true });
+    await openPage();
+    writeQuickCommands([{ label: 'late-after-timeout', send: '/late' }]);
+    // 把打开面板时的读取压到 11 秒后：页面 10 秒先超时，应答到达时请求已经不在途。
+    await page.evaluate(() => {
+      const ws = (window as unknown as { ws_: WebSocket }).ws_;
+      const send = ws.send.bind(ws);
+      ws.send = (data: string) => {
+        if (String(data).includes('"op":"get"')) setTimeout(() => send(data), 11_000);
+        else send(data);
+      };
+    });
+    await page.tap('#mobile-cmds');
+    await expect.poll(sheetOpen).toBe(true);
+    // 应答到达前只有内置默认，外部写入的指令看不到。
+    expect(await page.locator('.wb-qc', { hasText: 'late-after-timeout' }).count()).toBe(0);
+    expect(await page.locator('.wb-qc', { hasText: '/rewind' }).count()).toBeGreaterThan(0);
+    // 迟到应答靠超时前记下的 nonce 仍被认领：外部列表出现，默认列表被替换。
+    await expect.poll(
+      () => page.locator('.wb-qc', { hasText: 'late-after-timeout' }).count(),
+      { timeout: 18_000 },
+    ).toBe(1);
+    expect(await page.locator('.wb-qc', { hasText: '/rewind' }).count()).toBe(0);
+    await closeSheet();
+    rmSync(settingsPath(), { force: true });
+  });
+
+  it('读取应答晚到触发重画时，新增表单里还没保存的内容先存草稿并回填', async () => {
+    rmSync(settingsPath(), { force: true });
+    await openPage();
+    await page.evaluate(() => {
+      const ws = (window as unknown as { ws_: WebSocket }).ws_;
+      const send = ws.send.bind(ws);
+      ws.send = (data: string) => {
+        if (String(data).includes('"op":"get"')) setTimeout(() => send(data), 4_000);
+        else send(data);
+      };
+    });
+    await page.tap('#mobile-cmds');
+    await expect.poll(sheetOpen).toBe(true);
+    await page.tap('#wb-sheet-actions .wb-sheet-text-btn');
+    const sendInput = page.locator('.wb-qc-form input[type="text"]').nth(0);
+    const labelInput = page.locator('.wb-qc-form input[type="text"]').nth(1);
+    await sendInput.fill('/typed-not-saved');
+    await labelInput.fill('未保存的名称');
+    // 外部在读取在途期间改了列表；4 秒后晚到的应答带着它触发一次过期重画。
+    writeQuickCommands([{ label: 'from-elsewhere', send: '/elsewhere' }]);
+    await expect.poll(
+      () => page.locator('.wb-qc-row-main', { hasText: 'from-elsewhere' }).count(),
+      { timeout: 9_000 },
+    ).toBe(1);
+    // 重画没清掉表单：草稿回填，用户敲了一半的内容还在。
+    expect(await sendInput.inputValue()).toBe('/typed-not-saved');
+    expect(await labelInput.inputValue()).toBe('未保存的名称');
+    // 回填的草稿可以直接提交，和外部刚写入的条目并存。
+    await page.locator('.wb-qc-form button[type="submit"]').tap();
+    await expect.poll(savedLabels).toEqual(expect.arrayContaining(['from-elsewhere', '未保存的名称']));
+    await closeSheet();
+    rmSync(settingsPath(), { force: true });
+  });
 });

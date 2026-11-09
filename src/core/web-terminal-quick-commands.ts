@@ -27,7 +27,13 @@ export type QuickCommandProfile = 'codex' | 'default';
 
 /** 自定义列表按哪一套存：Codex 家族的斜杠命令和其它 CLI 不一样，其余共用一套。 */
 export function quickCommandProfile(cliId: unknown): QuickCommandProfile {
-  return cliId === 'codex' || cliId === 'codex-app' ? 'codex' : 'default';
+  // coco / traex 与 codex 跑同一套 traecli/codex-rs TUI：适配器都标 stuckPageFamily:'codex-family'，
+  // 实测命令面同时有 /status /compact /model /review /diff，而没有 Claude 系的 /rewind /effort /usage。
+  // 这里只决定快捷指令的默认档，与 adapters/cli/types.ts 的 isCodexFamilyCliId（管 bridge/升级行为，
+  // 刻意不含 coco/traex）是两件事，不要合并判定。
+  return cliId === 'codex' || cliId === 'codex-app' || cliId === 'coco' || cliId === 'traex'
+    ? 'codex'
+    : 'default';
 }
 
 export function defaultQuickCommands(profile: unknown): QuickCommand[] {
