@@ -420,7 +420,12 @@ import { readCodexModelSettingsCursor, spawnWithCodexModelLaunch, type CodexMode
 import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
 import { traexRejectedArgument } from './adapters/cli/traex-version.js';
-import { resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from './core/traex-leaf-pid.js';
+import { isTraexProcess, resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from './core/traex-leaf-pid.js';
+import {
+  readRunningExeIdentity,
+  resolveInstallIdentity,
+  type ExecutableIdentity,
+} from './services/cli-install-identity.js';
 import { pinWorkerTraeHome } from './services/traex-paths.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput } from './services/codex-user-input.js';
@@ -1785,7 +1790,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       if (first.outcome === 'accepted') {
         // Acknowledged (or rollout-evidenced) first turn on the fresh thread.
         // 'ambiguous' stays on the terminal fallback: dispatched is not accepted.
-        acknowledgeNativeInputConsumed(cfg.turnId, 'codex_rpc_turn_start', engine.activeThreadId, first.nativeTurnId);
+        acknowledgeNativeInputConsumed(cfg.turnId, 'codex_rpc_turn_start', engine.activeThreadId, first.nativeTurnId, cfg.dispatchAttempt);
       }
       // Fresh RPC delivery bypasses flushPending(), which is the normal owner
       // of this durable head-of-line gate. Claim it here only after the frame is
@@ -2091,6 +2096,9 @@ async function publishRuntimeContract(binding: RuntimeEventBinding, nativeSessio
   send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
 }
 let cliSpawnGeneration = 0;
+/** What the TRAE install entry resolved to right before the spawn of
+ *  `generation`. Published only while that spawn is still the current one. */
+let traexInstallAtSpawn: { generation: number; identity: ExecutableIdentity | undefined } | undefined;
 
 class CliSpawnSupersededError extends Error {
   constructor() {
@@ -13081,7 +13089,7 @@ function maybeBindUnprovenCodexSession(): boolean {
   persistCliSessionId(pending.sessionId);
   // Now the exact owned history match writeInput would have reported.
   if (codexHistoryMatchProvesConsumption()) {
-    acknowledgeNativeInputConsumed(pending.turnId, 'codex_history_match', pending.sessionId);
+    acknowledgeNativeInputConsumed(pending.turnId, 'codex_history_match', pending.sessionId, undefined, pending.dispatchAttempt);
   }
   void syncFreshCodexNativeSessionTitle(pending.sessionId, codexRpcEngine);
   codexBridgeAttach(path, codexBridgeUsesSplitLiveAttach() ? 'split-live' : 'fresh-empty');
@@ -20381,7 +20389,7 @@ function scheduleSubmitFailureNotify(
     switch (action.kind) {
       case 'suppress-confirmed':
         if (deferNativeCodexInputCommit(turnIdentity?.dispatchAttempt)) {
-          acknowledgeTurnInputCommitted(turnIdentity?.turnId);
+          acknowledgeTurnInputCommitted(turnIdentity?.turnId, turnIdentity?.dispatchAttempt);
         }
         queuePostSubmitNativeSessionTitle(turnIdentity?.nativeSessionTitle);
         if (cliSessionId) {
@@ -20399,7 +20407,7 @@ function scheduleSubmitFailureNotify(
         // immediate one; other CLIs' rechecks stay on the terminal fallback.
         if (settlement.ownershipProven === true && codexHistoryMatchProvesConsumption()) {
           acknowledgeNativeInputConsumed(turnIdentity?.turnId, 'codex_history_match',
-            cliSessionId ?? lastInitConfig?.cliSessionId);
+            cliSessionId ?? lastInitConfig?.cliSessionId, undefined, turnIdentity?.dispatchAttempt);
         }
         onConfirmed?.(cliSessionId);
         log(`Deferred recheck found submit in ${transcriptLabel} — suppressing warning. preview="${preview}"`);
@@ -21632,7 +21640,8 @@ async function flushPending(): Promise<void> {
           // The app-server acknowledged turn/start for this exact input on
           // the engine's active thread, fenced to the current generation.
           acknowledgeNativeInputConsumed(item.turnId, 'codex_rpc_turn_start',
-            writeRpcEngine.activeThreadId ?? lastInitConfig?.cliSessionId, rpcNativeTurnId);
+            writeRpcEngine.activeThreadId ?? lastInitConfig?.cliSessionId, rpcNativeTurnId,
+            item.dispatchAttempt);
           // Only the ACKed, still-current generation may create bridge state.
           // While turn/start was pending, codexBridgeIngest left its cursor
           // untouched; marking now therefore still precedes replay of any
@@ -21928,7 +21937,7 @@ async function flushPending(): Promise<void> {
       // POSITIVELY owned line proves this pane consumed the input.
       if (result?.submitted === true && result.ownershipProven === true && codexHistoryMatchProvesConsumption()) {
         acknowledgeNativeInputConsumed(item.turnId, 'codex_history_match',
-          result.cliSessionId ?? lastInitConfig?.cliSessionId);
+          result.cliSessionId ?? lastInitConfig?.cliSessionId, undefined, item.dispatchAttempt);
       }
       if (lastInitConfig?.cliId === 'codex' && result?.submitted !== false) {
         const threadId = result?.cliSessionId
@@ -28099,6 +28108,9 @@ async function spawnCliBody(
       publish: send,
       spawn: () => {
         const backend = spawnBackend;
+        if (cfg.cliId === 'traex') {
+          traexInstallAtSpawn = { generation: cliSpawnGeneration, identity: resolveInstallIdentity(spawnCliBin) };
+        }
         backend.spawn(spawnBin, spawnArgs, {
           cwd: spawnCwd,
           cols: PTY_COLS,
@@ -28483,10 +28495,17 @@ async function spawnCliBody(
   lastSpawnCodexExecutable = codexFilterExecutable;
   const startTraexLauncherPidResolve = (launcherPid: number): void => {
     if (cfg.cliId !== 'traex' || !traexLauncherActive) return;
+    // Capture the spawn this resolve belongs to. A late timer from an older
+    // spawn must not rewire the replacement backend or attest its pid.
+    const generation = cliSpawnGeneration;
     scheduleTraexLeafPidResolve(launcherPid, {
       getBackend: () => backend,
       getChildPid: () => backend?.getChildPid?.(),
       applyRealPid: (realPid) => {
+        if (generation !== cliSpawnGeneration) {
+          log(`TRAE launcher: ignoring stale leaf pid ${realPid} from spawn ${generation} (current ${cliSpawnGeneration})`);
+          return;
+        }
         log(`TRAE launcher: resolved real traex leaf pid ${realPid} under launcher ${launcherPid}; rewiring ownership pid`);
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
@@ -33564,6 +33583,7 @@ function acknowledgeNativeInputConsumed(
   proofKind: Extract<WorkerToDaemon, { type: 'native_input_consumed' }>['proofKind'],
   nativeSessionId?: string,
   nativeTurnId?: string,
+  dispatchAttempt?: number,
 ): void {
   if (!turnId) return;
   // The CLI has the input in its own history: a crash no longer re-delivers
@@ -33571,6 +33591,7 @@ function acknowledgeNativeInputConsumed(
   inflightInputs.onTurnStarted(turnId);
   send({
     type: 'native_input_consumed', turnId, proofKind,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(lastWrittenCliInput?.turnId === turnId && isUnsentInputReplayable(lastWrittenCliInput)
       && lastWrittenCliInput.trustedCaller?.senderType === 'user'
       ? { ordinaryInteractive: true as const } : {}),
@@ -33699,12 +33720,34 @@ function publishLocalProcessAttestation(
     : codexAppRunnerProcessIdentity && enginePid === codexAppRunnerProcessIdentity.enginePid
       ? codexAppRunnerProcessIdentity.engineProcStart
       : enginePid ? readProcessStartIdentity(enginePid) : undefined;
+  // Actual running image of the TRAE leaf, read from the kernel. The initial
+  // attestation names the bwrap/forge launcher, which is not traex and must not
+  // be recorded; the leaf re-attestation (applyRealPid) fills this in.
+  // Bind the exe read to the birth token just read for this pid: a reused pid
+  // must not pair one process's birth with another process's image.
+  const cliExe = lastInitConfig?.cliId === 'traex' && cliPid && isTraexProcess(cliPid)
+    ? readRunningExeIdentity(cliPid, cliProcStart)
+    : undefined;
+  // The install entry this worker's adapter resolved at spawn. The daemon
+  // re-resolves it later to detect a replacement under the running process;
+  // this worker never re-runs a version probe for it.
+  const cliInstallEntry = lastInitConfig?.cliId === 'traex'
+    ? cliAdapter?.resolvedBin
+    : undefined;
+  // An earlier spawn's observation says nothing about the current process.
+  const cliInstallAtSpawn = cliInstallEntry && traexInstallAtSpawn?.generation === cliSpawnGeneration
+    ? traexInstallAtSpawn.identity
+    : undefined;
   send({
     type: 'local_process_attestation',
     backendType: effectiveBackendType,
     credentialIsolated: currentCliCredentialIsolated,
     ...(cliPid ? { cliPid } : {}),
     ...(cliProcStart ? { cliProcStart } : {}),
+    ...(cliExe ? { cliExe } : {}),
+    ...(cliInstallEntry ? { cliInstallEntry } : {}),
+    ...(cliInstallAtSpawn ? { cliInstallAtSpawn } : {}),
+    cliSpawnGeneration,
     ...(enginePid ? { enginePid } : {}),
     ...(engineProcStart ? { engineProcStart } : {}),
   });

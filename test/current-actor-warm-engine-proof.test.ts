@@ -45,6 +45,10 @@ function fixture() {
   const startup = bind(); const current = bind(startup.physicalId);
   const worker: any = { pid: 90, killed: false, connected: true }; ds.worker = worker;
   const hostEnv: any = { sessionController: controller, contractWorker: workerRef, ds, worker,
+    // The sliced worker-pool closure reads workerGeneration as a free variable;
+    // without it the attestation worker-generation guard compares 7 !== undefined
+    // and drops a legitimate engine attestation. It matches ds.workerGeneration.
+    workerGeneration: 7,
     sessionCliId: () => 'codex-app', botCfg: {}, logger: { warn: vi.fn(), debug: vi.fn() }, t: 'actor-proof' };
   hostEnv.handleLegacyWorkerMessage = loadWorkerPoolClosure('handleLegacyWorkerMessage', hostEnv);
   const host = loadWorkerPoolClosure<any>('handleWorkerMessage', hostEnv); hostEnv.handleWorkerMessage = host;

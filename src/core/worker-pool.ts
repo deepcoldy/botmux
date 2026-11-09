@@ -1,6 +1,14 @@
 import { isLeadOnlySession } from './lead-only.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
 import { sameWorker, sameRuntime } from '../services/session-contract.js';
+import { observeTraexInstall } from '../services/traex-install-watch.js';
+import {
+  compareLaunchedInstall,
+  readRunningExeIdentity,
+  resolveInstallIdentity,
+  sameExecutableObject,
+  type ExecutableIdentity,
+} from '../services/cli-install-identity.js';
 import { sessionContractPrimary } from './session-contract-primary.js';
 import { resolveSessionModelPinView } from './session-model.js';
 import { isWorkflowNodeSessionMarker } from './workflow-node-session.js';
@@ -246,7 +254,7 @@ import { materializeFeedbackPolicyForDelivery } from '../services/feedback-revie
 import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
 import { attachWorkflowSidebarEntry, workflowNodeSessionEntry } from '../im/lark/workflow-sidebar-entry.js';
 import { resolveWorkflowEntryLink } from './workflow-entry-link.js';
-import { beginFinalOutputDelivery, waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
+import { beginFinalOutputDelivery, onFinalOutputDeliverySettled, waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
 import { BUSY_RUNTIME_STATUSES } from './session-task-status.js';
 import { isTurnOutcomeExcluded, noteFinalOutputReceipt, noteLateFinalReply, recordTurnOutcome } from './turn-outcome.js';
 import { validateFinalOutputSnapshot, type FinalOutputOffer } from '../services/final-output-handoff.js';
@@ -7250,6 +7258,8 @@ export function killWorker(
   ds.cliReady = false;
   clearUsageRefreshTimer(ds);
   ds.localProcessAttestation = undefined;
+  // The accepted-input queue belongs to the CLI generation being retired.
+  clearAcceptedInputTurns(ds);
   ds.protectedLoopbackProxyAttestation = undefined;
   // A managed-turn capability belongs to one concrete worker generation.
   // Retiring (or observing the absence of) that generation must revoke the
@@ -7335,6 +7345,8 @@ export function retireWorkerProcessOnly(ds: DaemonSession, reason: string): void
   ds.cliReady = false;
   clearUsageRefreshTimer(ds);
   ds.localProcessAttestation = undefined;
+  // The accepted-input queue belongs to the CLI generation being retired.
+  clearAcceptedInputTurns(ds);
   ds.protectedLoopbackProxyAttestation = undefined;
   ds.managedTurnOrigin = undefined;
   invalidateStuckWarning(ds, reason);
@@ -7364,6 +7376,8 @@ function clearTransferWorkerState(
   // readiness with its own prompt_ready.
   ds.cliReady = false;
   ds.localProcessAttestation = undefined;
+  // The accepted-input queue belongs to the CLI generation being retired.
+  clearAcceptedInputTurns(ds);
   ds.protectedLoopbackProxyAttestation = undefined;
   ds.managedTurnOrigin = undefined;
   invalidateStuckWarning(ds, reason);
@@ -9807,6 +9821,7 @@ function clearPendingSuspendClaim(ds: DaemonSession, why: string): void {
   const reason = ds.pendingSuspendReason;
   ds.pendingSuspendReason = undefined;
   ds.pendingSuspendGeneration = undefined;
+  ds.pendingSuspendInstallClaim = undefined;
   logger.debug(`[${tag(ds)}] Cleared queued suspend claim (${reason ?? 'none'}): ${why}`);
 }
 
@@ -9922,6 +9937,163 @@ export function setTopicReasoningEffort(ds: DaemonSession, effort: unknown, acto
 /** Whether accepted ordinary IM input still awaits worker admission. */
 export function hasPendingOrdinaryImInput(ds: DaemonSession): boolean {
   return [...pendingOrdinaryImDeliveries.values()].some(delivery => delivery.ds === ds);
+}
+
+/**
+ * Inputs a live worker has ACCEPTED but not finished, keyed by
+ * `turnId + dispatchAttempt`.
+ *
+ * `turn_input_committed` is the worker QUEUE taking ownership; the native PTY
+ * flush is asynchronous and the turn has not run yet. The transport record
+ * (`pendingOrdinaryImDeliveries`) is settled on that same ACK, and the screen
+ * may still hold a cached idle, so neither proves the turn is safe to destroy.
+ * The responsibility lives here until the EXACT execution reaches a terminal
+ * or a pre-admission rejection.
+ *
+ * The worker re-ACKs a committed duplicate without re-queueing it, so a
+ * repeated ACK for an execution that already settled must not revive the
+ * obligation. A replay keeps the turnId but increments `dispatchAttempt`, so
+ * an older attempt's late terminal/rejection must only settle that attempt.
+ */
+const ACCEPTED_INPUT_UNSETTLED_LIMIT = 4096;
+const ACCEPTED_INPUT_SETTLED_LIMIT = 4096;
+
+function acceptedInputTurnKey(turnId: string, dispatchAttempt: number | undefined): string {
+  return `${turnId}\0${dispatchAttempt ?? ''}`;
+}
+
+function noteSettledInputTurn(ds: DaemonSession, key: string): void {
+  const settled = ds.settledInputTurns ?? (ds.settledInputTurns = new Map());
+  // Refresh insertion order so the cap evicts the oldest settled dedupe fact.
+  settled.delete(key);
+  settled.set(key, Date.now());
+  while (settled.size > ACCEPTED_INPUT_SETTLED_LIMIT) {
+    const oldest = settled.keys().next().value;
+    if (oldest === undefined) break;
+    settled.delete(oldest);
+  }
+}
+
+function noteAcceptedInputTurn(
+  ds: DaemonSession,
+  turnId: string | undefined,
+  dispatchAttempt: number | undefined,
+  workerGeneration: number,
+  phase: 'queue-commit' | 'native-submit',
+): void {
+  if (!turnId) return;
+  // Overflow is a conservative block for the rest of the generation; tracking
+  // more individually cannot make the reclaim decision any safer.
+  if (ds.acceptedInputOverflow) return;
+  const turns = ds.acceptedInputTurns ?? (ds.acceptedInputTurns = new Map());
+  const key = acceptedInputTurnKey(turnId, dispatchAttempt);
+  // A duplicate ACK for an execution that already terminated is a transport
+  // retry, not new work. Only an EXACT settled key proves that: an older
+  // attempt's terminal says nothing about this identity.
+  if (ds.settledInputTurns?.has(key)) return;
+
+  if (dispatchAttempt !== undefined) {
+    // A receipt observed earlier without an attempt belongs to this same
+    // in-flight execution (a session runs one turn at a time). Adopt it under
+    // the provable identity so the exact terminal settles one obligation
+    // instead of leaving an un-attempted orphan behind.
+    const unprovenKey = acceptedInputTurnKey(turnId, undefined);
+    const unproven = turns.get(unprovenKey);
+    if (unproven && unproven.workerGeneration === workerGeneration && !turns.has(key)) {
+      turns.delete(unprovenKey);
+      turns.set(key, {
+        workerGeneration,
+        turnId,
+        dispatchAttempt,
+        phase: unproven.phase === 'native-submit' ? 'native-submit' : phase,
+        at: Date.now(),
+      });
+      return;
+    }
+  } else {
+    // Without a provable attempt, upgrade an existing live obligation for this
+    // turn in the same generation rather than creating a second one that no
+    // exact terminal can settle. When none exists this is a first observation:
+    // register it conservatively even if a DIFFERENT attempt settled earlier.
+    for (const [existingKey, entry] of turns) {
+      if (entry.turnId !== turnId || entry.workerGeneration !== workerGeneration) continue;
+      entry.phase = entry.phase === 'native-submit' ? 'native-submit' : phase;
+      entry.at = Date.now();
+      turns.delete(existingKey);
+      turns.set(existingKey, entry);
+      return;
+    }
+  }
+
+  const previous = turns.get(key);
+  // A later queue-commit observation must never downgrade proven native submit.
+  const nextPhase = previous?.phase === 'native-submit' ? 'native-submit' : phase;
+  turns.delete(key);
+  turns.set(key, {
+    workerGeneration,
+    turnId,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+    phase: nextPhase,
+    at: Date.now(),
+  });
+  if (turns.size > ACCEPTED_INPUT_UNSETTLED_LIMIT) {
+    // Never evict an unresolved obligation: an automatic reclaim cannot prove
+    // it is safe any more, so latch a conservative block instead.
+    ds.acceptedInputOverflow = true;
+  }
+}
+
+/** Native acceptance proof. When the receipt names the exact dispatch attempt
+ *  it joins the queue-commit/terminal obligation; otherwise it upgrades an
+ *  existing live obligation or registers an un-attempted one conservatively.
+ *  Phase is diagnostic; both phases already block an install-change reclaim. */
+function noteNativeAcceptedInputTurn(
+  ds: DaemonSession,
+  turnId: string | undefined,
+  dispatchAttempt: number | undefined,
+  workerGeneration: number,
+): void {
+  noteAcceptedInputTurn(ds, turnId, dispatchAttempt, workerGeneration, 'native-submit');
+}
+
+function settleAcceptedInputTurn(
+  ds: DaemonSession,
+  turnId: string | undefined,
+  dispatchAttempt: number | undefined,
+  rememberTerminal: boolean,
+): void {
+  if (!turnId) return;
+  const key = acceptedInputTurnKey(turnId, dispatchAttempt);
+  const turns = ds.acceptedInputTurns;
+  if (turns) {
+    // Exact key only: an un-attempted receipt must not clear an explicit
+    // attempt's obligation, and an older attempt's late terminal must not
+    // release a newer attempt that is still running.
+    turns.delete(key);
+    if (turns.size === 0) ds.acceptedInputTurns = undefined;
+  }
+  // Only a terminal proves the execution is over for good. A pre-admission
+  // rejection may be retried with the same turnId within this generation, so
+  // its key must stay registrable when that retry is accepted.
+  if (rememberTerminal) noteSettledInputTurn(ds, key);
+}
+
+/** The worker generation is ending; its accepted queue dies with it. */
+function clearAcceptedInputTurns(ds: DaemonSession): void {
+  ds.acceptedInputTurns = undefined;
+  ds.settledInputTurns = undefined;
+  ds.acceptedInputOverflow = undefined;
+}
+
+/** Does the CURRENT generation still own an accepted input with no terminal? */
+function hasUnsettledAcceptedInput(ds: DaemonSession): boolean {
+  if (ds.acceptedInputOverflow) return true;
+  const turns = ds.acceptedInputTurns;
+  if (!turns) return false;
+  for (const entry of turns.values()) {
+    if (entry.workerGeneration === ds.workerGeneration) return true;
+  }
+  return false;
 }
 
 /** Whether a direct keystroke command (e.g. `/model <value>`) may be injected
@@ -10176,6 +10348,8 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   // The CLI is destroyed by the suspend; the cold resume brings a new one.
   ds.cliReady = false;
   ds.localProcessAttestation = undefined;
+  // The accepted-input queue belongs to the CLI generation being retired.
+  clearAcceptedInputTurns(ds);
   ds.protectedLoopbackProxyAttestation = undefined;
   ds.workerPort = null;
   ds.workerToken = null;
@@ -10291,6 +10465,64 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
 /** Queued-suspend reason for a CLI whose install changed under it. */
 const CLI_INSTALL_CHANGED_SUSPEND = 'cli_install_changed';
 
+type InstallClaimVerdict = 'stale' | 'replaced' | 'reverted' | 'unknown';
+
+/**
+ * Is the exact running CLI an install-change claim named still the stale one?
+ *
+ * A claim is a destructive action on a live worker, so it is re-proven at the
+ * last moment rather than trusted from the observation that queued it:
+ *
+ * - the worker generation and its CLI spawn counter must be unchanged (an
+ *   in-worker `restartCliProcess` keeps the generation but swaps the CLI);
+ * - a recorded pid/birth must still name the same process, and the kernel's
+ *   current `/proc/<pid>/exe` must still be the very object we attested;
+ * - the install entry is statted FRESH (bypassing the sweep cache), and must
+ *   still resolve to a different physical object, judged by the same
+ *   launched-from-entry rule as the sweep (`compareLaunchedInstall`).
+ *
+ * `unknown` (no attestation, unreadable exe, unprovable mapping) never
+ * authorizes the suspend; the claim is kept for a later checkpoint.
+ */
+function revalidateInstallChangeClaim(
+  ds: DaemonSession,
+  claim: NonNullable<DaemonSession['pendingSuspendInstallClaim']>,
+): InstallClaimVerdict {
+  if (claim.workerGeneration !== ds.workerGeneration) return 'replaced';
+  const att = ds.localProcessAttestation;
+  if (!att) return 'unknown';
+  if (att.workerGeneration !== undefined && att.workerGeneration !== claim.workerGeneration) return 'replaced';
+  if (claim.cliSpawnGeneration !== undefined) {
+    if (att.cliSpawnGeneration === undefined) return 'unknown';
+    if (att.cliSpawnGeneration !== claim.cliSpawnGeneration) return 'replaced';
+  }
+  if (claim.cliPid !== undefined) {
+    if (att.cliPid !== claim.cliPid) return 'replaced';
+    if (claim.cliProcStart !== undefined && att.cliProcStart !== claim.cliProcStart) return 'replaced';
+    const actual = readRunningExeIdentity(claim.cliPid, claim.cliProcStart);
+    if (!actual) return 'unknown';
+    if (!sameExecutableObject(actual, claim.running)) return 'replaced';
+  }
+  const install = resolveInstallIdentity(claim.entry);
+  if (!install) return 'unknown';
+  const comparison = compareLaunchedInstall(claim.running, claim.installAtSpawn, install);
+  if (comparison === 'current') return 'reverted';
+  if (comparison === 'unknown') return 'unknown';
+  return 'stale';
+}
+
+/** Re-validate a queued install claim and consume it when the running object
+ *  or the selected install no longer matches what the claim was about. */
+function reconcileInstallChangeClaim(ds: DaemonSession): InstallClaimVerdict | undefined {
+  const claim = ds.pendingSuspendInstallClaim;
+  if (!claim) return undefined;
+  const verdict = revalidateInstallChangeClaim(ds, claim);
+  if (verdict === 'replaced' || verdict === 'reverted') {
+    clearPendingSuspendClaim(ds, `install claim ${verdict}`);
+  }
+  return verdict;
+}
+
 function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => boolean): void {
   const reason = ds.pendingSuspendReason;
   if (!reason) return;
@@ -10322,6 +10554,28 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
   // its way into the CLI; retiring the CLI now destroys it. The claim stays and
   // is cashed in once the worker reports that input taken.
   if (hasUnacceptedCliInput(ds)) return;
+  if (reason === CLI_INSTALL_CHANGED_SUSPEND) {
+    // A TRAE reclaim carries an exact running-object claim; re-prove it right
+    // before acting. A Pi `cli_install_changed` report has no claim and keeps
+    // its historical immediate-suspend behavior (the worker already decided).
+    if (ds.pendingSuspendInstallClaim) {
+      const verdict = reconcileInstallChangeClaim(ds);
+      if (verdict === 'replaced' || verdict === 'reverted') return;
+      // Unprovable identity: keep the claim pending; never suspend on a guess.
+      if (verdict === 'unknown') return;
+    }
+    // An install-change reclaim is only safe when nothing of the current
+    // generation is still owned: no background task, no undelivered final
+    // answer, no transfer, no accepted-but-unsettled input. Keep the claim
+    // pending instead of consuming it; screen/final-delivery/transfer edges and
+    // the periodic sweep re-run this checkpoint.
+    if (ds.pendingSuspendInstallClaim && !canSafelyReclaimWorkerForInstallChange(ds)) {
+      if (isSessionTransferring(ds)) {
+        deferUntilSessionTransferSettled(ds, () => runPendingSuspendIfSettled(ds, ownsGeneration));
+      }
+      return;
+    }
+  }
   // Clear only on success. suspendWorker refuses mid-routing-transfer (and for a
   // backend that stopped being suspendable), and that refusal is temporary —
   // eating the flag would silently drop the request until the next `suspend all`.
@@ -10353,6 +10607,147 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
 }
 
 export const __testOnly_runPendingSuspendIfSettled = runPendingSuspendIfSettled;
+
+/**
+ * May this generation be retired because the CLI install changed under it?
+ *
+ * This is deliberately NOT the idle-sweeper predicate: that one treats
+ * `pendingSuspendReason` / `pendingSuspendGeneration` as "busy", but here those
+ * fields ARE the request being fulfilled — copying them would deadlock every
+ * reclaim. Everything else that still owns user-visible work or input must
+ * keep the worker alive until it settles:
+ *
+ * - background tasks die with the CLI;
+ * - an undelivered final answer would be lost;
+ * - a routing transfer / protected mutation owns the lifecycle;
+ * - accepted-but-unsettled IM input, activation tail, buffered follow-ups and
+ *   a pending repo/raw input all carry a turn that has not been submitted;
+ * - adopted workers are not ours to reclaim, and a locked session is an
+ *   explicit operator hold.
+ *
+ * `pendingSuspend*` is intentionally absent; see above.
+ */
+export function canSafelyReclaimWorkerForInstallChange(ds: DaemonSession): boolean {
+  if (!ds.worker || ds.worker.killed) return false;
+  if (ds.session.status !== 'active') return false;
+  if (ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) return false;
+  if (ds.session.locked === true) return false;
+  if (ds.workerReady !== true) return false;
+  if (hasProtectedSessionMutationOwnership(ds) || isSessionTransferring(ds)) return false;
+  if (ds.pendingRepo || ds.pendingRepoCommitInFlight || ds.worktreeCreating) return false;
+  if (ds.initialStartPending) return false;
+  if (ds.session.queuedActivationPending || (ds.session.queuedActivationTail?.length ?? 0) > 0) return false;
+  if (ds.pendingPrompt !== undefined || ds.pendingTurnId !== undefined) return false;
+  if (ds.pendingRawInput !== undefined || ds.pendingFollowUpInput !== undefined) return false;
+  if ((ds.pendingFollowUps?.length ?? 0) > 0) return false;
+  if (ds.cascadeInFlight || (ds.cascadeDeferred?.length ?? 0) > 0) return false;
+  if (ds.tuiPromptCardId || (ds.tuiPromptOptions?.length ?? 0) > 0 || ds.tuiPromptProcessing) return false;
+  if (ds.agentAttention || ds.usageLimit) return false;
+  if ((ds.backgroundTaskCount ?? 0) > 0) return false;
+  if ((ds.finalOutputDeliveriesInFlight?.size ?? 0) > 0) return false;
+  if (ds.remoteCloseState !== undefined || ds.remoteShutdownState !== undefined) return false;
+  if (hasPendingOrdinaryImInput(ds)) return false;
+  // The transport record above settles on the worker queue COMMIT, which is
+  // earlier than native submit and far earlier than the turn terminal. Keep
+  // protecting accepted work until its exact turn ends.
+  if (hasUnsettledAcceptedInput(ds)) return false;
+  if (isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds)) return false;
+  return true;
+}
+
+export const __testOnly_canSafelyReclaimWorkerForInstallChange = canSafelyReclaimWorkerForInstallChange;
+
+/**
+ * Queue (or refresh) the install-change reclaim for this generation.
+ *
+ * A manual suspend request already queued wins: the operator asked for a
+ * different reason and we must not overwrite it. Re-detecting the same reason
+ * keeps the existing claim (and its generation) so a worker that is busy for
+ * a while does not accumulate requests.
+ *
+ * `tryNow` immediately runs the settlement checkpoint; the periodic sweep and
+ * lifecycle edges call this too.
+ */
+export function requestInstallChangeSuspend(
+  ds: DaemonSession,
+  detail: {
+    entry: string;
+    running: ExecutableIdentity;
+    installAtSpawn: ExecutableIdentity;
+    install: ExecutableIdentity;
+  },
+  opts: { tryNow?: boolean } = {},
+): boolean {
+  // An unproven launch can never re-validate as stale; queuing it would only
+  // park the session behind a claim that never resolves.
+  if (!sameExecutableObject(detail.running, detail.installAtSpawn)) return false;
+  if (ds.pendingSuspendReason && ds.pendingSuspendReason !== CLI_INSTALL_CHANGED_SUSPEND) return false;
+  const firstRequest = ds.pendingSuspendReason !== CLI_INSTALL_CHANGED_SUSPEND;
+  if (firstRequest) {
+    ds.pendingSuspendReason = CLI_INSTALL_CHANGED_SUSPEND;
+    ds.pendingSuspendGeneration = ds.workerGeneration;
+    // Freeze the exact running object this request is about. The worker
+    // generation alone is not enough: an in-worker CLI restart keeps it.
+    const att = ds.localProcessAttestation;
+    ds.pendingSuspendInstallClaim = {
+      entry: detail.entry,
+      running: detail.running,
+      installAtSpawn: detail.installAtSpawn,
+      workerGeneration: ds.workerGeneration ?? 0,
+      ...(att?.cliSpawnGeneration !== undefined ? { cliSpawnGeneration: att.cliSpawnGeneration } : {}),
+      ...(att?.cliPid !== undefined ? { cliPid: att.cliPid } : {}),
+      ...(att?.cliProcStart !== undefined ? { cliProcStart: att.cliProcStart } : {}),
+    };
+    logger.warn(
+      `[${tag(ds)}] TRAE install changed under the running process `
+      + `(running ino=${detail.running.ino} mtime=${detail.running.mtimeNs}, `
+      + `installed ino=${detail.install.ino} mtime=${detail.install.mtimeNs}, entry=${detail.entry}) — `
+      + 'queued a safe reclaim once this generation owns no more work',
+    );
+  }
+  if (opts.tryNow) runPendingSuspendIfSettled(ds);
+  return firstRequest;
+}
+
+/**
+ * Periodic per-daemon sweep: compare each live worker's actual executable with
+ * the install entry it was launched from. This is what catches a fully quiet
+ * idle worker — there is no PTY/screen edge to piggyback on.
+ *
+ * Detection is shared per install entry (see traex-install-watch), so N workers
+ * cost at most one stat per TTL, never a `--version` probe. Unknown identities
+ * (macOS, not-yet-attested, adopted) never trigger a reclaim.
+ */
+export function sweepTraexInstallChanges(
+  sessions: Iterable<DaemonSession>,
+  botCfg: { cliId: CliId },
+  now = Date.now(),
+): number {
+  let queued = 0;
+  for (const ds of sessions) {
+    if (!ds.worker || ds.worker.killed) continue;
+    // Adopted processes are not ours to retire, and an adopt-mode worker has no
+    // managed lifecycle to hand over. Do not even queue a claim for them.
+    if (ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) continue;
+    const observation = observeTraexInstall(ds, sessionCliId(ds, botCfg), now);
+    if (observation.state !== 'stale') {
+      // The install entry may have reverted to the running image (or the CLI
+      // may have been replaced) since the claim was queued. Re-check freshly so
+      // a stale claim does not linger until the next idle edge.
+      if (observation.state === 'current') reconcileInstallChangeClaim(ds);
+      continue;
+    }
+    if (requestInstallChangeSuspend(ds, observation, { tryNow: true })) queued += 1;
+  }
+  return queued;
+}
+
+// An install-change reclaim must not retire a worker whose final answer is
+// still being delivered. The drain module notifies after each delivery settles;
+// re-run the settlement checkpoint only when such a claim is queued.
+onFinalOutputDeliverySettled(ds => {
+  if (ds.pendingSuspendReason === CLI_INSTALL_CHANGED_SUSPEND) runPendingSuspendIfSettled(ds);
+});
 
 function armWorkerKillBackstop(w: ChildProcess, label: string, sigtermMs: number = WORKER_SIGTERM_BACKSTOP_MS): void {
   const sigterm = setTimeout(() => {
@@ -16315,6 +16710,8 @@ function forkWorkerPrepared(
   let agentCfg!: ReturnType<typeof sessionAgentConfig>;
   const t = tag(ds);
   ds.localProcessAttestation = undefined;
+  // The accepted-input queue belongs to the CLI generation being retired.
+  clearAcceptedInputTurns(ds);
   ds.protectedLoopbackProxyAttestation = undefined;
   try {
   // Per-turn authority is never inferred from mutable session state. Human
@@ -18472,6 +18869,11 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored turn_input_rejected from stale worker generation`);
           break;
         }
+        // A pre-admission rejection never ran: release the accepted-input guard
+        // for the exact admission attempt it names. Without an attempt it can
+        // only prove the un-attempted execution; a later re-accepted attempt
+        // stays protected. A retry with the same identity may re-register.
+        settleAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, false);
         discardTriggerStreamingCard(ds, msg.turnId);
         const purgeClick = takePurgeClickRollback(ds, msg.turnId);
         if (purgeClick) {
@@ -18524,6 +18926,9 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored native_input_consumed from stale worker generation`);
           break;
         }
+        // Native proof upgrades the phase, but a submitted turn is still owned
+        // work until its terminal: reclaim must wait for that boundary too.
+        noteNativeAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, workerGeneration);
         try {
           cb.onNativeInputConsumed?.(ds, msg, { workerGeneration });
         } catch (err) {
@@ -18540,6 +18945,9 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored prompt_submitted_input from stale worker generation`);
           break;
         }
+        // A native submit proof still leaves the turn running; keep it protected
+        // until the terminal arrives.
+        noteNativeAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, workerGeneration);
         try {
           cb.onPromptSubmittedInput?.(ds, msg.turnId, { workerGeneration });
         } catch (err) {
@@ -18603,6 +19011,10 @@ function setupWorkerHandlers(
           break;
         }
         recordWorkerCommittedTurn(worker, msg.turnId);
+        // Queue ownership is not native submission and not completion. Keep the
+        // turn protected until its terminal/rejection, even though the
+        // transport delivery record settles right below.
+        noteAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, workerGeneration, 'queue-commit');
         if (msg.durablePrimaryInbox) {
           try {
             cb.onTurnInputCommitted?.(ds, msg, { workerGeneration });
@@ -18676,11 +19088,31 @@ function setupWorkerHandlers(
         // unlike .botmux-cli-pids it cannot be forged or deleted by the CLI.
         // Bind it to the daemon's current worker generation so a late message
         // from a replaced worker never attests the replacement process.
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) {
+          logger.warn(`[${t}] Ignored local_process_attestation from stale worker generation`);
+          break;
+        }
+        // A late attestation from an older CLI spawn of THIS worker must not
+        // overwrite the identity of the process that replaced it.
+        const previousSpawnGeneration = ds.localProcessAttestation?.cliSpawnGeneration;
+        if (msg.cliSpawnGeneration !== undefined
+          && previousSpawnGeneration !== undefined
+          && msg.cliSpawnGeneration < previousSpawnGeneration) {
+          logger.warn(
+            `[${t}] Ignored stale local_process_attestation spawn=${msg.cliSpawnGeneration} `
+            + `(current ${previousSpawnGeneration})`,
+          );
+          break;
+        }
         ds.localProcessAttestation = {
           backendType: msg.backendType,
           credentialIsolated: msg.credentialIsolated,
           ...(msg.cliPid !== undefined ? { cliPid: msg.cliPid } : {}),
           ...(msg.cliProcStart !== undefined ? { cliProcStart: msg.cliProcStart } : {}),
+          ...(msg.cliExe !== undefined ? { cliExe: msg.cliExe } : {}),
+          ...(msg.cliInstallEntry !== undefined ? { cliInstallEntry: msg.cliInstallEntry } : {}),
+          ...(msg.cliInstallAtSpawn !== undefined ? { cliInstallAtSpawn: msg.cliInstallAtSpawn } : {}),
+          ...(msg.cliSpawnGeneration !== undefined ? { cliSpawnGeneration: msg.cliSpawnGeneration } : {}),
           ...(msg.enginePid !== undefined ? { enginePid: msg.enginePid } : {}),
           ...(msg.engineProcStart !== undefined
             ? { engineProcStart: msg.engineProcStart }
@@ -19582,6 +20014,10 @@ function setupWorkerHandlers(
         if (!ownsLifecycleMutation()) break;
         cliNotices.finish(msg.turnId, msg.dispatchAttempt);
         if (msg.sessionId !== ds.session.sessionId) break;
+        // A steered turn is merged into its successor and never gets a terminal
+        // of its own: this edge is its settlement. Tombstone it so a re-sent
+        // commit ACK for the same attempt cannot revive the obligation.
+        settleAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, true);
         handleCotThinkingSuperseded(ds, msg);
         if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
           void supersedeTurnReplyCard(ds, msg,
@@ -21440,6 +21876,10 @@ function setupWorkerHandlers(
           );
           break;
         }
+        // The exact turn is over. This is the only boundary that releases the
+        // accepted-input guard for it, and only for the exact attempt it names:
+        // a late terminal from an older attempt must not release a newer one.
+        settleAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, true);
         try {
           getLinkRefRuntime()?.settleTurn({
             appId: ds.larkAppId,
@@ -22770,6 +23210,9 @@ function setupWorkerHandlers(
       // Its background-task anchors died with it: nothing can forward a wake
       // to those turns any more, so they stop holding their records.
       ds.backgroundTaskPinnedTurnIds = undefined;
+      // A crashed/closed worker cannot terminal its accepted turns; the queue
+      // and the responsibility for it are gone together.
+      clearAcceptedInputTurns(ds);
       ds.workerPort = null;
       // A dead worker can no longer refresh its card/usage view.
       clearUsageRefreshTimer(ds);

@@ -2511,11 +2511,11 @@ export type WorkerToDaemonBase =
    * turn acknowledgement. Neither IPC arrival, queue ownership nor a generic
    * adapter `submitted` flag qualifies. The daemon covers shared group
    * background at this boundary; terminal completion stays the fallback. */
-  | { type: 'native_input_consumed'; ordinaryInteractive?: true; turnId: string; proofKind: 'codex_history_match' | 'codex_rpc_turn_start' | 'claude_transcript_user_record'; nativeSessionId?: string; nativeTurnId?: string }
+  | { type: 'native_input_consumed'; ordinaryInteractive?: true; turnId: string; dispatchAttempt?: number; proofKind: 'codex_history_match' | 'codex_rpc_turn_start' | 'claude_transcript_user_record'; nativeSessionId?: string; nativeTurnId?: string }
   /** The CLI's UserPromptSubmit hook submitted a prompt that is, or starts
    * with, the text this worker wrote for this turn. Read before the model
    * starts on it; no stand-in for `native_input_consumed`. */
-  | { type: 'prompt_submitted_input'; turnId: string }
+  | { type: 'prompt_submitted_input'; turnId: string; dispatchAttempt?: number }
   /** A live native terminal turn in a zero-injection session. Freeze its
    * reply destination before newer IM inputs can replace the sender. */
   | { type: 'terminal_turn_started'; turnId: string; startedAtMs: number; replyContextTurnId?: string }
@@ -2541,7 +2541,7 @@ export type WorkerToDaemonBase =
   | { type: 'turn_input_received'; turnId: string }
   /** The worker received an ordinary turn but could not place it into its CLI
    * input queue. This is safe to retry within the same worker generation. */
-  | { type: 'turn_input_rejected'; turnId: string; reason: string; rejectedBeforeAdmission?: true; activeTurnId?: string; activeCaller?: TrustedCaller; activeController?: TrustedCaller }
+  | { type: 'turn_input_rejected'; turnId: string; dispatchAttempt?: number; reason: string; rejectedBeforeAdmission?: true; activeTurnId?: string; activeCaller?: TrustedCaller; activeController?: TrustedCaller }
   /** Transfer-only completion fence. Emitted after the old worker has detached
    * its backend observer and disarmed sandbox teardown, immediately before it
    * exits. The daemon also waits for that child exit before forking replacement. */
@@ -2554,6 +2554,19 @@ export type WorkerToDaemonBase =
       credentialIsolated: boolean;
       cliPid?: number;
       cliProcStart?: string;
+      /** Actual executable image the CLI process is running, read from
+       * `/proc/<pid>/exe` at publish time. Absent when the platform has no
+       * proven source (macOS) or the pid is not the TRAE leaf yet. */
+      cliExe?: import('./services/cli-install-identity.js').ExecutableIdentity;
+      /** The install entry this worker's adapter resolved at spawn. The daemon
+       * re-resolves it to detect an install replacement under the process. */
+      cliInstallEntry?: string;
+      /** `cliInstallEntry` statted right before the spawn that produced
+       * `cliSpawnGeneration`. Absent when it did not resolve. */
+      cliInstallAtSpawn?: import('./services/cli-install-identity.js').ExecutableIdentity;
+      /** Monotonic per-worker CLI spawn counter. Late attestations from an
+       * older spawn are rejected by the daemon handler. */
+      cliSpawnGeneration?: number;
       /** RPC app-server root. Tool subprocesses are descendants of this
        * sibling rather than of the viewer CLI. */
       enginePid?: number;

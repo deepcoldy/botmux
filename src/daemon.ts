@@ -519,6 +519,7 @@ import {
   identityDecisionConflict,
   identityDecisionTurnIsLive,
   collectSessionTurnGarbage,
+  sweepTraexInstallChanges,
 } from './core/worker-pool.js';
 import { resetPromptCacheKeepalive, runPromptCacheKeepaliveSweep, statuslineContextTokens } from './core/prompt-cache-keepalive.js';
 import { isLocalCliCommand, noteIdleAutoCompactTurnStarted, runIdleAutoCompactSweep, type IdleAutoCompactNotice } from './core/idle-auto-compact.js';
@@ -35363,6 +35364,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Dashboard config edits need no restart; the timer also backstops any
     // missed lifecycle edge. Normal new/resumed sessions enforce immediately.
     enforceLiveSessionCap('periodic');
+    // A fully quiet idle TRAE worker produces no screen/PTY edge, so the
+    // install-replacement check must be driven by this timer. Detection is
+    // shared per install entry and never runs a CLI version probe.
+    try {
+      const queued = sweepTraexInstallChanges(activeSessions.values(), getBot(cfg.larkAppId).config);
+      if (queued > 0) logger.info(`[install-watch] queued ${queued} TRAE install-change reclaim(s)`);
+    } catch (error) {
+      logger.warn(`[install-watch] TRAE install sweep failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
     void closeIdleGroupSessions().catch(error => logger.warn(`[group-idle-close] sweep failed: ${String(error)}`));
     // Claude Code prompt-cache keep-alive: off unless config.json / bots.json
     // `promptCache.keepalive.enabled`; read live so Dashboard edits apply here.
