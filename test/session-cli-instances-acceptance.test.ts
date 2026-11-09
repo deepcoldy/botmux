@@ -192,6 +192,26 @@ describe('goal-scoped Codex home admission', () => {
     expect(() => validateCodexGoalHome(canonical)).toThrow(/auth\.json target/);
     expect(() => codexInstanceEnv(process.env, binding)).toThrow(/auth\.json target/);
   });
+
+  it('rejects a shared home directory, a shared config, and an auth file without credentials', () => {
+    const goalHome = join(root, 'goal-home-private');
+    mkdirSync(goalHome, { mode: 0o700 });
+    writeFileSync(join(goalHome, 'config.toml'), 'model = "gpt-6.1-sol"\n', { mode: 0o600 });
+    writeFileSync(join(goalHome, 'auth.json'), JSON.stringify({ tokens: { access_token: 'NOT-A-REAL-TOKEN' } }), { mode: 0o600 });
+    const canonical = realpathSync(goalHome);
+    expect(validateCodexGoalHome(canonical)).toBe(canonical);
+
+    chmodSync(canonical, 0o755);
+    expect(() => validateCodexGoalHome(canonical)).toThrow(/goal home must be an owned private directory/);
+    chmodSync(canonical, 0o700);
+
+    chmodSync(join(canonical, 'config.toml'), 0o644);
+    expect(() => validateCodexGoalHome(canonical)).toThrow(/goal config\.toml must be an owned private regular file/);
+    chmodSync(join(canonical, 'config.toml'), 0o600);
+
+    writeFileSync(join(canonical, 'auth.json'), JSON.stringify({ tokens: { access_token: '  ' } }), { mode: 0o600 });
+    expect(() => validateCodexGoalHome(canonical)).toThrow(/goal auth\.json has no credential structure/);
+  });
 });
 
 describe('A6: isolated process and transcript roots', () => {
