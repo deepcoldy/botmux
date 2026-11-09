@@ -2015,17 +2015,9 @@ function observeContractNativeSession(nativeSessionId: string): void {
   const scope = workerSessionEventScope;
   const active = scope?.currentBinding();
   if (!scope || !active || scope.contextBinding() !== active || !nativeSessionId) return;
-  const previous = active.identity?.nativeSessionId;
-  if (previous && previous !== nativeSessionId) {
-    const binding = scope.beginRuntime(active.operationId, active.physicalId);
-    binding.identity = { ...runtimeIdentityForContract(active), nativeSessionId };
-    scope.enterRuntime(binding);
-    send({ type: 'runtime_binding_started', bindingId: binding.bindingId });
-    send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity });
-  } else if (!previous) {
-    active.identity = { ...runtimeIdentityForContract(active), nativeSessionId };
-    send({ type: 'runtime_binding', bindingId: active.bindingId, identity: active.identity });
-  }
+  // The PID may have resolved from the launcher to the real CLI since the
+  // first binding. Check the full identity before enriching the native ID.
+  void publishRuntimeContract(active, nativeSessionId);
 }
 function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigin): WorkerToDaemon {
   if (!workerSessionEventScope) return msg;
@@ -2067,10 +2059,14 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
   }
   return opaque();
 }
-async function publishRuntimeContract(binding: RuntimeEventBinding): Promise<void> {
+async function publishRuntimeContract(binding: RuntimeEventBinding, nativeSessionId?: string): Promise<void> {
   if (!workerSessionEventScope || workerSessionEventScope.currentBinding() !== binding) return;
-  const identity = runtimeIdentityForContract(binding);
+  const observed = runtimeIdentityForContract(binding);
+  const identity = nativeSessionId ? { ...observed, nativeSessionId } : observed;
   const previous = binding.identity;
+  // A buffered observation can arrive after the process disappears. Preserve
+  // its proven binding so the captured physical exit still stops the runtime.
+  if (previous && previous.proof !== 'opaque' && identity.proof === 'opaque') return;
   if (previous && previous.proof !== 'opaque' && (previous.backend !== identity.backend || previous.physicalId !== identity.physicalId
     || previous.proof !== identity.proof || (previous.nativeGeneration !== undefined && previous.nativeGeneration !== identity.nativeGeneration)
     || (previous.nativeSessionId !== undefined && previous.nativeSessionId !== identity.nativeSessionId))) {
