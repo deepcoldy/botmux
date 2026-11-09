@@ -33325,7 +33325,12 @@ function workerIpcPayload(msg: WorkerToDaemon): WorkerToDaemon {
 }
 
 function send(msg: WorkerToDaemon): void {
-  if (msg.type === 'final_output' && workerSessionEventScope && !workerSessionEventScope.ownsExecutionEvent(msg.turnId, msg.dispatchAttempt)) { log('Dropped final output with unproven execution origin'); return; }
+  if (msg.type === 'final_output' && workerSessionEventScope && !workerSessionEventScope.ownsExecutionEvent(msg.turnId, msg.dispatchAttempt)) {
+    log(`Dropped final output with unproven execution origin ${JSON.stringify({ turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt,
+      origin: workerSessionEventScope.capture(), current: workerSessionEventScope.currentBinding(),
+      execution: workerSessionEventScope.executionForTurn(msg.turnId, msg.dispatchAttempt) })}`);
+    return;
+  }
   if (closeRequested && msg.type === 'final_output') {
     log('Dropped final_output after close fence');
     return;

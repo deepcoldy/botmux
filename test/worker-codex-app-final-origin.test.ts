@@ -26,7 +26,8 @@ const config = vi.hoisted(() => ({ dir: '' }));
 vi.mock('../src/config.js', () => ({ config: { session: { get dataDir() { return config.dir; } } } }));
 const resources: Array<() => void> = [];
 afterEach(() => { vi.useRealTimers(); for (const f of resources.splice(0).reverse()) f(); });
-function harness(reattached: boolean | 'native-recovery' = false) {
+function harness(reattached: boolean | 'native-recovery' = false, ordinary = false) {
+  const executionAttempt = ordinary ? undefined : 1;
   const dir = mkdtempSync(join(tmpdir(), 'final-origin-probe-')); config.dir = dir;
   resources.push(() => rmSync(dir, { recursive: true, force: true }));
   const ref = { appId: 'cli_origin_probe', sessionId: 'session-origin-probe' };
@@ -37,7 +38,7 @@ function harness(reattached: boolean | 'native-recovery' = false) {
   if (reattached === 'native-recovery') {
     historicalRuntime = controller.reserveBinding('previous-worker-proven', worker);
     controller.bindRuntime('previous-worker-proven', worker, { backend: 'tmux', physicalId: '111:start111', proof: 'process_start', nativeSessionId: 'native-conversation' });
-    historicalExecution = controller.admitInput('turnA', 1); store.bindQueuedExecution(ref, historicalExecution, historicalRuntime);
+    historicalExecution = controller.admitInput('turnA', executionAttempt); store.bindQueuedExecution(ref, historicalExecution, historicalRuntime);
     store.apply(ref, { type: 'execution_phase', runtime: historicalRuntime, execution: historicalExecution, phase: 'submitting' });
     controller.workerLost(worker); worker = controller.bindWorker(2).worker;
   }
@@ -53,8 +54,8 @@ function harness(reattached: boolean | 'native-recovery' = false) {
   resources.push(() => socketResource.emitDestroy());
   const active = reattached === 'native-recovery' ? startup : scope.beginRuntime(undefined, startup.physicalId);
   if (active !== startup) bind(active, 'native-conversation');
-  const execution = historicalExecution ?? controller.admitInput('turnA', 1); scope.noteAdmission({ ref: execution, phase: 'queued' });
-  const queue = new CodexAppTurnDispatchQueue(); queue.reserve('turnA', 1, 'dispatchA');
+  const execution = historicalExecution ?? controller.admitInput('turnA', executionAttempt); scope.noteAdmission({ ref: execution, phase: 'queued' });
+  const queue = new CodexAppTurnDispatchQueue(); queue.reserve('turnA', executionAttempt, 'dispatchA');
   const pair = generateKeyPairSync('ed25519'); const generation = 'g'.repeat(43), challenge = 'c'.repeat(43);
   const socket: any = { destroyed: false, write: vi.fn(), destroy: vi.fn(() => { socket.destroyed = true; }) };
   const env: any = { workerSessionEventScope: scope, sessionId: ref.sessionId, lastInitConfig: { cliId: 'codex-app', sessionId: ref.sessionId },
@@ -95,7 +96,7 @@ function harness(reattached: boolean | 'native-recovery' = false) {
   for (const name of ['bindSessionExecutionEvent', 'workerIpcPayload', 'send', 'waitForCodexAppDaemonPersistence', 'emitTurnTerminal', 'handleTrustedCodexAppMarker']) env[name] = loadWorkerFunction(name, env);
   if (reattached === 'native-recovery') {
     scope.noteAdmission({ ref: execution, runtime: historicalRuntime, phase: 'reconciling' });
-    env.codexAppRecoveredDispatches = [{ state: 'prepared', dispatchId: 'dispatchA', turnId: 'turnA', dispatchAttempt: 1 }];
+    env.codexAppRecoveredDispatches = [{ state: 'prepared', dispatchId: 'dispatchA', turnId: 'turnA', dispatchAttempt: executionAttempt }];
     queue.clear(); queue.restore(env.codexAppRecoveredDispatches);
     ds.session.codexAppDispatchLedger = env.codexAppRecoveredDispatches.map((entry: any) => ({ ...entry, content: 'prompt' }));
     env.codexAppControlProven = true; env.effectiveBackendType = 'tmux';
@@ -111,7 +112,7 @@ function harness(reattached: boolean | 'native-recovery' = false) {
     store.apply(ref, { type: 'execution_phase', runtime: active.runtime!, execution, phase: 'submitting' });
     scope.noteAdmission({ ref: execution, runtime: active.runtime!, phase: 'submitting' });
     scope.rememberExecution(execution, active);
-  } else scope.run(active, () => { scope.enterTurn('turnA', 1); loadWorkerFunction<any>('markTurnExecutionStart', env)('turnA', 1); });
+  } else scope.run(active, () => { scope.enterTurn('turnA', executionAttempt); loadWorkerFunction<any>('markTurnExecutionStart', env)('turnA', executionAttempt); });
   const line = loadWorkerFunction<any>('handleCodexAppControlLine', env);
   const connection: any = { socket, channelId: 1, epoch: 'epoch', authenticated: true, challenge,
     identity: { generation, publicKey: pair.publicKey.export({ format: 'der', type: 'spki' }).toString('base64url') },
@@ -437,5 +438,28 @@ describe('signed Codex App state follows the same physical runtime after launche
     expect(h.env.codexAppControlReplayWindow.hasSeen('g'.repeat(43), 1)).toBe(false);
     expect(h.socket.write).not.toHaveBeenCalled();
     expect(h.socket.destroy).toHaveBeenCalledOnce();
+  });
+});
+
+describe('ordinary Codex App finals retain absent dispatch attempt identity', () => {
+  it('settles an ordinary local turn with undefined attempt across a semantic rebind of the same physical runtime', async () => {
+    vi.useFakeTimers(); const h = harness(false, true);
+    expect(h.execution.dispatchAttempt).toBeUndefined();
+    expect(h.queue.findByTurnId('turnA')?.dispatchAttempt).toBeUndefined();
+    await h.final();
+    expect(h.wire.filter(m => m.type === 'final_output')).toHaveLength(1);
+    expect(h.wire.find(m => m.type === 'final_output')?.sessionContract.scope.execution).toEqual(h.execution);
+    expect(h.store.execution(h.ref, h.execution.executionId)?.phase).toBe('succeeded');
+  });
+  it('settles an ordinary historical turn with undefined attempt through the actual recovered observer assignment', async () => {
+    vi.useFakeTimers(); const h = harness('native-recovery', true);
+    expect(h.execution.dispatchAttempt).toBeUndefined();
+    await h.restoreNative(); await h.drainBindings();
+    expect(h.store.authorizedExecutionObserver(h.ref, h.historicalRuntime, h.scope.worker, h.execution)).toBe(true);
+    await h.final();
+    expect(h.wire.filter(m => m.type === 'final_output')).toHaveLength(1);
+    expect(h.wire.find(m => m.type === 'final_output')?.sessionContract.scope.execution).toEqual(h.execution);
+    expect(h.wire.find(m => m.type === 'final_output')?.sessionContract.scope.runtime).toEqual(h.historicalRuntime);
+    expect(h.store.execution(h.ref, h.execution.executionId)?.phase).toBe('succeeded');
   });
 });
