@@ -20985,6 +20985,20 @@ switch (command) {
     }
     break;
   }
+  case '__screenshot-smoke': {
+    try {
+      const output = process.argv[3];
+      if (!output) throw new Error('an output PNG path is required');
+      const { runScreenshotSmoke } = await import('./cli/screenshot-smoke.js');
+      const png = await runScreenshotSmoke();
+      writeFileSync(output, png);
+      process.stdout.write(`${JSON.stringify({ ok: true, bytes: png.length })}\n`);
+    } catch (error) {
+      console.error(`__screenshot-smoke: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+    break;
+  }
   case 'capabilities': {
     const { botmuxCapabilities, parseCapabilitiesArgs } = await import('./cli/capabilities.js');
     const parsed = parseCapabilitiesArgs(process.argv.slice(3));
