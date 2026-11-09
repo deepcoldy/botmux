@@ -103,7 +103,7 @@ describe('managed origin publication through the session contract', () => {
     h.scope.run(h.startup, () => h.env.publishSandboxRelayCapability()); await h.drain();
     expect(h.env.writeCliPidMarker).toHaveBeenCalled(); expect(h.authority.identity().caller).toEqual(h.caller);
     expect(h.ds.managedTurnOrigin).toBeUndefined();
-    expect(h.hostEnv.logger.debug).toHaveBeenCalledWith(expect.stringMatching(/Scoped event rejected: managed_turn_origin (stale_runtime_scope|execution_scope_unproven)/));
+    expect(h.hostEnv.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/Dropped managed_turn_origin from current worker turn=\S+ reason=(stale_runtime_scope|execution_scope_unproven)$/));
   });
 });
 

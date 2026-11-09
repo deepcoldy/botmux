@@ -2034,6 +2034,9 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   // Physical process proof is available before an opening attempt is bound.
   // Keep its frozen runtime, without claiming execution acceptance.
   if (msg.type === 'claude_exit' || msg.type === 'local_process_attestation') delete context.scope.execution;
+  // Queue observations span turns, including admissions not yet bound to the
+  // runtime. An unaccepted input must not invalidate its own backlog report.
+  if (msg.type === 'cli_input_backlog') delete context.scope.execution;
   return { ...msg, sessionContract: context };
 }
 function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdentity {

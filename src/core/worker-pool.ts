@@ -22636,16 +22636,26 @@ function setupWorkerHandlers(
         }
       } catch (error) { logger.warn(`[${t}] Recovered output origin unproven: ${String(error)}`); return; }
     }
+    // Losing the current worker's turn origin leaves --as user and actor
+    // current without a requesting user, so it must be visible in production.
+    const logRejected = (reason: string) => {
+      if ((msg.type === 'managed_turn_origin' || msg.type === 'managed_turn_origin_revoked') && ds.worker === worker) {
+        logger.warn(`[${t}] Dropped ${msg.type} from current worker turn=${msg.turnId ?? '-'} reason=${reason}`);
+      } else {
+        logger.debug(`[${t}] Scoped event rejected: ${msg.type} ${reason}`);
+      }
+    };
     let admission = sessionController.ingest(msg as unknown as import('./session-controller.js').ControlledWorkerMessage, contractWorker, recoveredOrigin);
     if (admission.kind === 'reject') {
-      logger.debug(`[${t}] Scoped event rejected: ${msg.type} ${admission.reason}`);
+      logRejected(admission.reason);
       if (metadata) sessionController.store.acknowledgeDeferred(sessionController.ref, metadata.eventId, msg);
       return;
     }
     if (admission.kind === 'defer') return;
     await sessionController.flushPrimary();
     admission = sessionController.gateway.admit(msg.type, admission.context, contractWorker, recoveredOrigin);
-    if (admission.kind === 'reject' || admission.kind === 'defer') return;
+    if (admission.kind === 'reject') { logRejected(admission.reason); return; }
+    if (admission.kind === 'defer') return;
     if (msg.type === 'final_output') {
       if (msg.sessionOutputOrigin?.scope.execution && msg.sessionOutputOrigin.scope.execution.executionId !== admission.context.scope.execution?.executionId) return;
       if (!recoveredOrigin) msg = { ...msg, sessionOutputOrigin: admission.context };

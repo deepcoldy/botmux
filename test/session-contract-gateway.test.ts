@@ -517,13 +517,15 @@ describe('contract gateway and real worker boundaries', () => {
     const worker: any = { send: vi.fn() }; s.ds.worker = worker;
     const legacy = vi.fn();
     const handlerScope: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker,
-      logger: { debug: vi.fn() }, t: 'test', handleLegacyWorkerMessage: legacy };
+      logger: { debug: vi.fn(), warn: vi.fn() }, t: 'test', handleLegacyWorkerMessage: legacy };
     const handler = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', handlerScope);
     const revision = s.store.read(s.ref)?.revision;
     for (const type of ['managed_turn_origin', 'managed_turn_origin_revoked']) {
       const wire = scope.run(binding, () => metadata({ type, sessionId: s.ref.sessionId, turnId: 'never-admitted', capability: 'unknown-capability' }));
       expect(wire.sessionContract.scope.execution).toBeUndefined();
       await handler(wire);
+      expect(handlerScope.logger.warn).toHaveBeenLastCalledWith(
+        `[test] Dropped ${type} from current worker turn=never-admitted reason=execution_scope_missing`);
     }
     expect(legacy).not.toHaveBeenCalled();
     expect(s.ds.managedTurnOrigin).toBeUndefined();
