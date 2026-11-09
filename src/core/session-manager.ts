@@ -4706,12 +4706,39 @@ export async function executeScheduledTask(
         }
         try {
           if (!(await persistDispatch())) return 'deferred';
-          const stagedPrompt = staged.lastCliInput ?? staged.session.lastCliInput;
-          if (!stagedPrompt) {
-            throw new Error(
-              `staged scheduled session ${staged.session.sessionId} lost its prepared prompt`,
+          // Re-send the ORIGINAL structured payload. A restart loses the
+          // in-memory copy, so rebuild it from the frozen task identity instead
+          // of degrading to the stored text (which drops trustedCaller).
+          const rebuildStagedInput = () => {
+            const trusted = trustedCallerForScheduledTask(task, larkAppId);
+            const effective = additionalPrompt === undefined
+              ? task.prompt
+              : `${task.prompt}\n\n${additionalPrompt}`;
+            const fire = silent
+              ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${effective}`
+              : effective;
+            return buildNewTopicCliInput(
+              fire,
+              staged.session.sessionId,
+              staged.session.cliLaunchSnapshot?.cliId ?? staged.session.cliId ?? bot.config.cliId,
+              staged.session.cliLaunchSnapshot?.cliPathOverride
+                ?? staged.session.cliPathOverride
+                ?? bot.config.cliPathOverride,
+              undefined, undefined, undefined, undefined,
+              { name: bot.botName, openId: bot.botOpenId },
+              localeForBot(larkAppId),
+              undefined,
+              {
+                larkAppId,
+                chatId: task.chatId,
+                whiteboardId: staged.session.whiteboardId,
+                trustedCaller: trusted,
+                promptInjection: sessionPromptInjection(staged),
+                larkToolResume: false,
+              },
             );
-          }
+          };
+          const stagedPrompt = staged.scheduledStagedInput ?? rebuildStagedInput();
           refreshCliVersion(bot.config);
           forkWorker(staged, stagedPrompt, scheduledTurnId);
         } catch (err) {
@@ -5264,6 +5291,10 @@ export async function executeScheduledTask(
       // below receives no resume flag.
       larkToolResume: false,
     });
+    // Keep the EXACT structured payload (content + trustedCaller/linkRefs) so a
+    // refused durable admission can resume the same run/turn without losing the
+    // admitted requester provenance.
+    ds.scheduledStagedInput = prompt;
     // Keep the candidate out of the live registry until authorization succeeds.
     // On rejection there is no worker or activation journal to recover: close
     // its durable row so the next fire can create a fresh candidate.

@@ -342,6 +342,11 @@ export interface DaemonSession {
   };
   worktreeCreating?: boolean;    // a worktree-open is in flight — dedups repeated card clicks / `/repo wt`
   pendingPrompt?: string;        // original user message to send after repo is selected
+  /** Exact structured scheduled input (content + trustedCaller/linkRefs) built
+   *  for a fresh scheduled fire. A refused durable admission keeps it here so
+   *  the same run/turn retry re-sends the ORIGINAL payload instead of only its
+   *  text. In-memory only; a restart rebuilds it from the frozen task identity. */
+  scheduledStagedInput?: import('../types.js').CliTurnPayload;
   /** Exact Lark message id whose user input is waiting for the first worker
    *  spawn. This is intentionally in-memory and must come from the accepted
    *  inbound event: restoring a session must never recover per-turn authority

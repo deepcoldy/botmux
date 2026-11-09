@@ -35800,6 +35800,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         const runPrompt = [additionalPrompt, untilDonePrompt].filter(Boolean).join('\n\n') || undefined;
         const turnIds = new Map<string, string>();
         const pending: string[] = [];
+        const heldTarget = (chatId: string, turnId: string | undefined): boolean =>
+          parked?.targets[chatId] === 'held'
+          || (turnId !== undefined && parked?.heldTargets?.[chatId] === turnId);
         for (const chatId of targetChatIds) {
           const state = parked?.targets[chatId];
           if (state === 'ambiguous') {
@@ -35808,12 +35811,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               + 'refusing to replay it automatically',
             );
           }
-          turnIds.set(chatId, parked?.targetTurnIds?.[chatId] ?? `schedule:${task.id}:${randomUUID()}`);
-          if (state !== 'dispatched') pending.push(chatId);
+          const turnId = parked?.targetTurnIds?.[chatId] ?? `schedule:${task.id}:${randomUUID()}`;
+          turnIds.set(chatId, turnId);
+          if (state === 'dispatched') continue;
+          // A worker already owns this exact turn and is waiting in its start
+          // gate. Do NOT re-dispatch it; keep the run parked until acceptance.
+          if (heldTarget(chatId, turnId)) continue;
+          pending.push(chatId);
         }
         let results: ScheduleRunTargetResult[] = targetChatIds
           .filter(chatId => !pending.includes(chatId))
-          .map(chatId => ({ chatId, outcome: 'model_dispatched' as const }));
+          .map(chatId => ({
+            chatId,
+            outcome: heldTarget(chatId, turnIds.get(chatId)) ? 'deferred' as const : 'model_dispatched' as const,
+          }));
         if (pending.length > 0) {
           try {
             results = results.concat(await executeScheduledTaskForTargets(
@@ -35875,12 +35886,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         if (deferredResults.length === 0) return 'dispatched';
         // Keep the claimed run parked. Targets already dispatched stay recorded
         // so the retry can only deliver the ones still waiting.
-        const parkedTargets: Record<string, 'waiting' | 'dispatched'> = {};
+        const parkedTargets: Record<string, 'waiting' | 'dispatched' | 'held'> = {};
         const persistedTurnIds: Record<string, string> = {};
         for (const chatId of targetChatIds) {
           const result = results.find(entry => entry.chatId === chatId);
-          parkedTargets[chatId] = result?.outcome === 'deferred' ? 'waiting' : 'dispatched';
           const turnId = turnIds.get(chatId);
+          if (result?.outcome === 'deferred') {
+            parkedTargets[chatId] = heldTarget(chatId, turnId) ? 'held' : 'waiting';
+          } else {
+            parkedTargets[chatId] = 'dispatched';
+          }
           if (turnId) persistedTurnIds[chatId] = turnId;
         }
         scheduler.parkDeferredRun(task.id, executionContext, {

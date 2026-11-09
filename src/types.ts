@@ -1751,7 +1751,15 @@ export type ScheduleNotifyEvent = 'failing' | 'expired';
  *  session (accepted ≠ finished — this only prevents re-dispatch).
  *  `ambiguous` must never be replayed automatically: doing so could execute the
  *  same input twice. */
-export type ScheduleDeferredTargetState = 'waiting' | 'dispatching' | 'dispatched' | 'ambiguous';
+export type ScheduleDeferredTargetState =
+  | 'waiting'
+  | 'dispatching'
+  | 'dispatched'
+  | 'ambiguous'
+  /** A worker owns this target's exact turn and is still waiting in its start
+   *  gate (input accepted by the queue, not yet submitted to the CLI). The run
+   *  must not settle success and a retry must NOT re-dispatch this target. */
+  | 'held';
 
 /** A scheduled run parked behind a managed-runtime handoff. */
 /** Execution-relevant task fields frozen when a run is first admitted.
@@ -1804,6 +1812,10 @@ export interface ScheduledTaskDeferredRun {
   /** Earliest time the next retry may claim this parked run. */
   retryAt?: string;
   targets: Record<string, ScheduleDeferredTargetState>;
+  /** Targets whose exact turn is already owned by a worker that is waiting in
+   *  its start gate. Unlike `waiting`, these must not be re-dispatched; they
+   *  settle only after the worker reports the turn accepted. */
+  heldTargets?: Record<string, string>;
   /** Stable per-target scheduled turn ids. Persisted before dispatch so a
    *  retry (or a daemon restart) cannot mint a second turn for the same
    *  target; the worker's turn-id dedupe then rejects a duplicate input. */

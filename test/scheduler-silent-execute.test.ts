@@ -2104,3 +2104,14 @@ describe('independent PR2 r3 per-bot schedule domain', () => {
     }
   });
 });
+
+describe('independent PR2 r4 staged payload', () => {
+  it('keeps the admitted requester provenance when a staged scheduled fire retries', async () => {
+    const active = new Map<string,DaemonSession>();
+    const current = baseTask({rootMessageId:ROOT,scope:'thread',silent:true,ownerOpenId:'ou_creator',ownerUnionId:'on_creator',creatorLarkAppId:APP});
+    const runtime = {runId:'run-provenance',turnId:'schedule:task0001:provenance',onBeforeDispatch:vi.fn().mockReturnValueOnce(false).mockReturnValue(true)};
+    expect(await executeScheduledTask(current,active,refreshCliVersion,undefined,runtime)).toBe('deferred');
+    expect(await executeScheduledTask(current,active,refreshCliVersion,undefined,runtime)).toBe('dispatched');
+    expect(forkedPayload().trustedCaller).toEqual({requestUserOpenId:'ou_creator',requestUserUnionId:'on_creator',requestLarkAppId:APP,senderType:'user',source:'schedule_creator',taskId:current.id});
+  });
+});

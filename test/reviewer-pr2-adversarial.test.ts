@@ -170,7 +170,8 @@ describe('PR2 independent scheduler adversarial review', () => {
     await flush();
     const runId = scheduler.getRuntimeTask(t.id, APP)!.deferredRun!.runId;
     expect(scheduler.noteWorkerRuntimeDeferred(t.id, runId, 'oc_A', `schedule:${t.id}:a`, APP)).toBe(true);
-    expect(scheduler.getRuntimeTask(t.id, APP)?.deferredRun?.targets.oc_A).toBe('waiting');
+    // A worker-held target is `held`, not `waiting`: a retry must not re-dispatch it.
+    expect(scheduler.getRuntimeTask(t.id, APP)?.deferredRun?.targets.oc_A).toBe('held');
     // A different turn id must not move the target.
     expect(scheduler.noteWorkerRuntimeDeferred(t.id, runId, 'oc_A', 'schedule:other', APP)).toBe(false);
   });
@@ -323,5 +324,57 @@ describe('independent PR2 r3 admission-to-exec identity', () => {
     }} as any;
     // Running A must never be relabelled as the now-current B install.
     expect(observeTraexInstall(ds, 'traex').state).toBe('stale');
+  });
+});
+
+describe('independent PR2 r4 late worker defer', () => {
+  it('does not settle a finite run before the worker can report its start gate wait', async () => {
+    task(); // real authority/store initialization
+    const t = scheduler.addTask({id:'rvpr2002',name:'finite handoff',schedule:'every 30m',prompt:'exact prompt',workingDir:root,chatId:'oc_A',chatIds:['oc_A'],larkAppId:APP,repeat:{times:1,completed:0}});
+    let runId = '';
+    const turnId = `schedule:${t.id}:late`;
+    scheduler.setExecuteCallback(async (current, context) => {
+      runId = context.runId;
+      expect(scheduler.markDeferredTargetDispatching(current.id, runId, 'oc_A', turnId, APP)).toBe(true);
+      scheduler.markDeferredTargetDispatched(current.id, runId, 'oc_A', APP);
+      // Mirrors daemon: executeScheduledTask returned after fork, worker has
+      // not yet finished spawnCli / consulted the physical-cache gate.
+      return 'executed';
+    });
+    expect(scheduler.runNow(t.id).ok).toBe(true);
+    await flush();
+    const corrected = scheduler.noteWorkerRuntimeDeferred(t.id, runId, 'oc_A', turnId, APP);
+    const current = scheduler.getRuntimeTask(t.id, APP)!;
+    expect({corrected, status:current.lastStatus, completed:current.repeat?.completed, enabled:current.enabled, waiting:current.deferredRun?.targets.oc_A})
+      .toEqual({corrected:true, status:'deferred', completed:0, enabled:true, waiting:'waiting'});
+  });
+
+  it('does not redispatch a target whose first worker still holds the exact turn', async () => {
+    const t = task();
+    const turnA = `schedule:${t.id}:held-a`;
+    const turnB = `schedule:${t.id}:held-b`;
+    let attempts = 0;
+    let sendsToA = 0;
+    let runId = '';
+    scheduler.setExecuteCallback(async (current, context) => {
+      runId = context.runId;
+      if (++attempts === 1) {
+        sendsToA++;
+        // A worker exists and owns A's input while awaiting its start gate.
+        // B never got a worker. This is the daemon's persisted partial result.
+        scheduler.parkDeferredRun(current.id, context, {runId, detail:'B blocked', targets:{oc_A:'dispatched',oc_B:'waiting'}, targetTurnIds:{oc_A:turnA,oc_B:turnB}});
+      } else {
+        const parked = scheduler.getRuntimeTask(current.id, APP)!.deferredRun!;
+        if (parked.targets.oc_A === 'waiting') sendsToA++;
+        scheduler.parkDeferredRun(current.id, context, {runId, detail:'still waiting', targets:parked.targets,targetTurnIds:parked.targetTurnIds});
+      }
+      return 'deferred';
+    });
+    scheduler.runNow(t.id);
+    await flush();
+    expect(scheduler.noteWorkerRuntimeDeferred(t.id,runId,'oc_A',turnA,APP)).toBe(true);
+    scheduler.runNow(t.id);
+    await flush();
+    expect(sendsToA).toBe(1);
   });
 });

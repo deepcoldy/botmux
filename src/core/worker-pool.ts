@@ -19098,6 +19098,21 @@ function setupWorkerHandlers(
         // turn protected until its terminal/rejection, even though the
         // transport delivery record settles right below.
         noteAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, workerGeneration, 'queue-commit');
+        // A scheduled target previously marked `held` (worker waiting in the
+        // start gate) has now been accepted by that worker. Clear the held
+        // marker so the next retry can settle the run exactly once.
+        if (msg.turnId) {
+          const taskId = parseScheduledTurnId(msg.turnId);
+          const run = scheduledSessionRun(ds.session, msg.turnId);
+          if (taskId && run) {
+            const turnId = msg.turnId;
+            void import('./scheduler.js')
+              .then(scheduler => scheduler.noteWorkerRuntimeAccepted(
+                taskId, run.runId, ds.chatId, turnId, ds.larkAppId,
+              ))
+              .catch(() => { /* correction is best-effort */ });
+          }
+        }
         if (msg.durablePrimaryInbox) {
           try {
             cb.onTurnInputCommitted?.(ds, msg, { workerGeneration });

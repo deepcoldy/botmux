@@ -557,6 +557,10 @@ function recordDispatchOutcome(
   // the run and will re-claim it once the runtime handoff clears. Never record
   // success, a run-log terminal state, or repeat/once completion here.
   if (outcome === 'deferred') return;
+  // A success callback can race a worker that reported its start-gate wait just
+  // before this outcome is recorded. The target is still owed; keep the run
+  // parked instead of consuming once/repeat and announcing success.
+  if (current?.deferredRun && deferredRunHasUnsettledTargets(current.deferredRun)) return;
   if (current?.lastRunId === context.runId && current.deliveryFailureRunId === context.runId) {
     // A very short model turn can fail its send before dispatch returns.
     // Keep that failure; only account for the dispatch that just completed.
@@ -782,11 +786,17 @@ export function markDeferredTargetDispatched(
 }
 
 /**
- * A worker start gate refused/waiting for a scheduled turn AFTER the daemon had
- * already accounted its dispatch. Correct a run that is still parked: the
- * target never reached the CLI, so it must stay `waiting` rather than settle as
- * dispatched. A run that already settled is left untouched — the worker still
- * holds the input, and re-dispatching could duplicate it.
+ * A worker start gate is waiting for a scheduled turn.
+ *
+ * This is NOT "not yet dispatched": the worker already owns the exact turn and
+ * is waiting inside its gate. It must therefore neither settle success nor be
+ * re-dispatched by a retry.
+ *
+ * - Still-parked run: mark the target `held` (excluded from re-dispatch).
+ * - Already-settled run: the fork was accounted as success before the worker
+ *   reported the wait. Reverse that settlement (repeat/once accounting and the
+ *   auto-completed flag) and reopen the run as deferred, with the target
+ *   `waiting` + `heldTargets` so the retry reuses the same turn.
  */
 export function noteWorkerRuntimeDeferred(
   id: string,
@@ -795,11 +805,93 @@ export function noteWorkerRuntimeDeferred(
   turnId: string,
   appId?: string,
 ): boolean {
+  let changed = false;
+  mutateRuntimeTask(id, task => {
+    if (task.lastRunId !== runId) return;
+    const existing = task.deferredRun?.runId === runId ? task.deferredRun : undefined;
+    if (existing) {
+      if (existing.targetTurnIds?.[chatId] !== turnId) return;
+      const state = existing.targets[chatId];
+      if (state !== 'dispatching' && state !== 'dispatched') return;
+      changed = true;
+      return {
+        ...task,
+        lastStatus: 'deferred' as const,
+        deferredRun: {
+          ...existing,
+          retryAt: new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
+          targets: { ...existing.targets, [chatId]: 'held' as const },
+          heldTargets: { ...(existing.heldTargets ?? {}), [chatId]: turnId },
+        },
+      };
+    }
+    // No parked run: the settlement already consumed this dispatch.
+    if (task.lastStatus !== 'ok') return;
+    changed = true;
+    const repeat = task.repeat
+      ? { ...task.repeat, completed: Math.max(0, (task.repeat.completed ?? 0) - 1) }
+      : undefined;
+    const runStats = task.runStats
+      ? { ...task.runStats, dispatched: Math.max(0, (task.runStats.dispatched ?? 0) - 1) }
+      : undefined;
+    const autoCompleted = task.enabled === false && task.disabledReason === 'once_completed';
+    // Every other target of this settled run already succeeded; keep it
+    // `dispatched` so reopening the run cannot re-dispatch it. Only the
+    // worker-held target becomes owed again.
+    const targets: Record<string, ScheduleDeferredTargetState> = {};
+    for (const cid of scheduleStore.effectiveScheduleChatIds(task)) targets[cid] = 'dispatched';
+    targets[chatId] = 'waiting';
+    return {
+      ...task,
+      lastStatus: 'deferred' as const,
+      lastError: undefined,
+      ...(autoCompleted
+        ? {
+            enabled: true,
+            disabledReason: undefined,
+            nextRunAt: new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
+          }
+        : {}),
+      ...(repeat ? { repeat } : {}),
+      ...(runStats ? { runStats } : {}),
+      deferredRun: {
+        runId,
+        since: new Date().toISOString(),
+        reason: 'traex_runtime' as const,
+        detail: 'worker holds the admitted input at the start gate',
+        retryAt: new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
+        targets,
+        targetTurnIds: { [chatId]: turnId },
+        heldTargets: { [chatId]: turnId },
+        context: freezeDeferredContext(task),
+      },
+    };
+  }, appId);
+  return changed;
+}
+
+/**
+ * The worker accepted the exact turn it was holding at the gate. Clear the
+ * held marker and record the target as dispatched; the next retry then settles
+ * the run exactly once (no second send).
+ */
+export function noteWorkerRuntimeAccepted(
+  id: string,
+  runId: string,
+  chatId: string,
+  turnId: string,
+  appId?: string,
+): boolean {
   return mutateDeferredTarget(id, runId, appId, deferred => {
     if (deferred.targetTurnIds?.[chatId] !== turnId) return undefined;
-    const state = deferred.targets[chatId];
-    if (state !== 'dispatching' && state !== 'dispatched') return undefined;
-    return { ...deferred, targets: { ...deferred.targets, [chatId]: 'waiting' } };
+    if (deferred.heldTargets?.[chatId] !== turnId) return undefined;
+    const { [chatId]: _accepted, ...restHeld } = deferred.heldTargets;
+    void _accepted;
+    return {
+      ...deferred,
+      heldTargets: restHeld,
+      targets: { ...deferred.targets, [chatId]: 'dispatched' as const },
+    };
   });
 }
 
@@ -826,9 +918,14 @@ export function recoverDeferredRunOnStartup(
   return mutateDeferredTarget(id, undefined, appId, deferred => {
     let changed = false;
     const targets = { ...deferred.targets };
+    const heldTargets = deferred.heldTargets ? { ...deferred.heldTargets } : undefined;
     for (const [chatId, state] of Object.entries(targets)) {
-      if (state === 'dispatching') {
+      // `dispatching` may or may not have reached the worker. `held` DID reach
+      // it, but a daemon restart cannot prove the worker still survives, so
+      // neither may be auto-replayed or settled as success.
+      if (state === 'dispatching' || state === 'held') {
         targets[chatId] = 'ambiguous';
+        if (heldTargets) delete heldTargets[chatId];
         changed = true;
       }
     }
@@ -836,6 +933,9 @@ export function recoverDeferredRunOnStartup(
     return {
       ...deferred,
       targets,
+      ...(heldTargets && Object.keys(heldTargets).length > 0
+        ? { heldTargets }
+        : { heldTargets: undefined }),
       retryAt: new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
     };
   });
