@@ -9,6 +9,7 @@ import { logger } from '../../utils/logger.js';
 import { sessionChildEnvWithInject, trustedSessionEnvUnsetFlags } from '../../core/session-env.js';
 import { herdrExecutable } from '../../utils/herdr-executable.js';
 import { herdrPaneTerminalDevice, readTerminalDeviceGrid } from '../../utils/herdr-pane-grid.js';
+import { maskCredentialShapes } from '../../core/stuck-page-catalog.js';
 
 const { Terminal } = xtermHeadless;
 
@@ -74,6 +75,28 @@ const STATUS_WAIT_TIMEOUT_MS = 30_000;
 // a session started by an inbound message (no daemon-side startup auto-retry).
 export const PANE_AGENT_START_TIMEOUT_MS = 60_000;
 const PANE_AGENT_DETECTION_POLL_MS = 100;
+// A launch that Herdr never recognises is usually a one-off stall (observed
+// on a loaded macOS host: the same command re-run seconds later starts in
+// ~3s, while sibling sessions start normally). The failure is terminal for a
+// turn-carrying session — the daemon only auto-retries turn-less startups —
+// so a fresh CLI start (SpawnOpts.retryPaneAgentStart) is retried once in a
+// FRESH pane before it is reported. Restarts do not opt in: the restart
+// coordinator's 40s deadline would expire first and a late success would
+// leave the session fenced (see restart-paths-worker-ready.test.ts).
+export const PANE_AGENT_START_ATTEMPTS = 2;
+// Rows of the stalled pane logged before it is closed, for diagnosis.
+const PANE_AGENT_STALL_SNAPSHOT_LINES = 15;
+
+/** Herdr never recognised the launched CLI within the deadline (the only
+ *  launch failure worth a fresh-pane retry; wrong kind / herdr errors are not). */
+class PaneAgentNotDetectedError extends Error {
+  /** Whether the attempt's pane (or the tab/workspace holding it) was closed. */
+  closed = false;
+  constructor(message: string, readonly paneId: string, readonly snapshot?: string) {
+    super(message);
+    this.name = 'PaneAgentNotDetectedError';
+  }
+}
 // A started launcher deletes itself. This fallback only reaps one Herdr never
 // ran, and is long enough for a macOS Gatekeeper assessment of the exec to end.
 const PANE_AGENT_LAUNCHER_FALLBACK_CLEANUP_MS = 60_000;
@@ -1111,8 +1134,57 @@ export class HerdrBackend implements SessionBackend {
    * rc files can reorder PATH and bypass our launcher, losing wrappers and
    * argv. Execute the launcher explicitly with `pane run`, wait for Herdr to
    * detect the expected kind, then name and verify that exact pane's agent.
+   *
+   * Not detected within PANE_AGENT_START_TIMEOUT_MS: the attempt's pane is
+   * closed (with a snapshot of its screen logged) and the launch is retried
+   * once in a fresh pane; only the last attempt's failure is reported.
    */
   private startPaneAgent(bin: string, args: string[], opts: SpawnOpts): string {
+    const attempts = opts.retryPaneAgentStart ? PANE_AGENT_START_ATTEMPTS : 1;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return this.startPaneAgentOnce(bin, args, opts);
+      } catch (err) {
+        if (!(err instanceof PaneAgentNotDetectedError)) throw err;
+        // The screen is the only evidence of why the CLI never showed up. Keep
+        // it off stderr: the daemon may post a dying worker's last stderr rows
+        // to the chat.
+        if (err.snapshot) {
+          logger.info(`[herdr-backend] last rows of stalled pane ${err.paneId} (attempt ${attempt}/${attempts}):\n${err.snapshot}`);
+        }
+        if (attempt >= attempts || !err.closed) {
+          if (attempts > 1) {
+            err.message += err.closed
+              ? ` (attempt ${attempt}/${attempts})`
+              : ` (attempt ${attempt}/${attempts}; the stalled pane could not be closed, so it was not retried)`;
+          }
+          throw err;
+        }
+        logger.warn(
+          `[herdr-backend] ${err.message}; closed it and retrying in a fresh pane `
+          + `(attempt ${attempt + 1}/${attempts})`,
+        );
+        // The failed attempt already closed what it created; never let the
+        // retry (or a later kill) target those stale ids.
+        this.createdWorkspaceId = undefined;
+        this.createdTabId = undefined;
+        this.paneId = undefined;
+      }
+    }
+  }
+
+  /** Rows at the bottom of a stalled pane, best effort (never throws). */
+  private stalledPaneSnapshot(paneId: string): string | undefined {
+    const text = readHerdrTextCommand(herdrSessionArgs(this.sessionName, [
+      'pane', 'read', paneId, '--source', 'recent', '--lines', String(PANE_AGENT_STALL_SNAPSHOT_LINES), '--format', 'text',
+    ]));
+    const rows = text.split('\n').map(r => r.trimEnd()).filter(Boolean);
+    return rows.length
+      ? maskCredentialShapes(rows.slice(-PANE_AGENT_STALL_SNAPSHOT_LINES).join('\n')).slice(0, 2000)
+      : undefined;
+  }
+
+  private startPaneAgentOnce(bin: string, args: string[], opts: SpawnOpts): string {
     // Launch wrappers can replace bin with env, systemd-run, or a sandbox.
     // Identify the managed kind by the original CLI; the launcher still
     // executes the complete wrapped command.
@@ -1251,9 +1323,11 @@ export class HerdrBackend implements SessionBackend {
         sleepSync(Math.min(PANE_AGENT_DETECTION_POLL_MS, detectionDeadline - Date.now()));
       }
       if (!detected) {
-        throw new Error(
+        throw new PaneAgentNotDetectedError(
           `Herdr did not detect "${kind}" in pane ${paneId} within ${PANE_AGENT_START_TIMEOUT_MS} ms`
           + (lastListError ? ` (last agent list error: ${lastListError.message})` : ''),
+          paneId,
+          this.stalledPaneSnapshot(paneId),
         );
       }
 
@@ -1275,24 +1349,28 @@ export class HerdrBackend implements SessionBackend {
       launched = true;
       return paneId;
     } catch (err) {
+      // Any successful close removes the pane (closing its workspace or tab
+      // closes it too, after which `pane close` itself reports failure).
+      let closed = false;
       if (typeof this.createdWorkspaceId === 'string' && this.createdWorkspaceId) {
-        runHerdr(
+        closed = runHerdr(
           herdrSessionArgs(this.sessionName, ['workspace', 'close', this.createdWorkspaceId]),
           { timeout: 5000 },
-        );
+        ) || closed;
       }
       if (typeof this.createdTabId === 'string' && this.createdTabId) {
-        runHerdr(
+        closed = runHerdr(
           herdrSessionArgs(this.sessionName, ['tab', 'close', this.createdTabId]),
           { timeout: 5000 },
-        );
+        ) || closed;
       }
       if (typeof paneId === 'string' && paneId) {
-        runHerdr(
+        closed = runHerdr(
           herdrSessionArgs(this.sessionName, ['pane', 'close', paneId]),
           { timeout: 5000 },
-        );
+        ) || closed;
       }
+      if (err instanceof PaneAgentNotDetectedError) err.closed = closed;
       throw err;
     } finally {
       if (launcher && launched) {
