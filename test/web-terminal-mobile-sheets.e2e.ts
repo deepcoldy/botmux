@@ -745,4 +745,149 @@ setInterval(() => {}, 1_000);
     expect(geometry.overlap).toBeLessThanOrEqual(0.5);
     expect(geometry.pinnedRight).toBeLessThanOrEqual(geometry.width);
   });
+
+  it('读取请求先超时、应答后到：迟到应答仍被认领，最新列表照样刷到面板上', async () => {
+    rmSync(settingsPath(), { force: true });
+    await openPage();
+    writeQuickCommands([{ label: 'late-after-timeout', send: '/late' }]);
+    // 把打开面板时的读取压到 11 秒后：页面 10 秒先超时，应答到达时请求已经不在途。
+    await page.evaluate(() => {
+      const ws = (window as unknown as { ws_: WebSocket }).ws_;
+      const send = ws.send.bind(ws);
+      ws.send = (data: string) => {
+        if (String(data).includes('"op":"get"')) setTimeout(() => send(data), 11_000);
+        else send(data);
+      };
+    });
+    await page.tap('#mobile-cmds');
+    await expect.poll(sheetOpen).toBe(true);
+    // 应答到达前只有内置默认，外部写入的指令看不到。
+    expect(await page.locator('.wb-qc', { hasText: 'late-after-timeout' }).count()).toBe(0);
+    expect(await page.locator('.wb-qc', { hasText: '/rewind' }).count()).toBeGreaterThan(0);
+    // 迟到应答靠超时前记下的 nonce 仍被认领：外部列表出现，默认列表被替换。
+    await expect.poll(
+      () => page.locator('.wb-qc', { hasText: 'late-after-timeout' }).count(),
+      { timeout: 18_000 },
+    ).toBe(1);
+    expect(await page.locator('.wb-qc', { hasText: '/rewind' }).count()).toBe(0);
+    await closeSheet();
+    rmSync(settingsPath(), { force: true });
+  });
+
+  it('读取应答晚到触发重画时，新增表单里还没保存的内容先存草稿并回填', async () => {
+    rmSync(settingsPath(), { force: true });
+    await openPage();
+    // 外部列表在打开面板之前就写好：页面内嵌列表在 openPage 时已定，仍先显示默认，
+    // 晚到的读取应答带着外部列表回来，照样触发一次过期重画。写文件不依赖填表耗时，
+    // 用例不会因为机器忙、填表超过读取延迟而偶发失败。
+    writeQuickCommands([{ label: 'from-elsewhere', send: '/elsewhere' }]);
+    await page.evaluate(() => {
+      const ws = (window as unknown as { ws_: WebSocket }).ws_;
+      const send = ws.send.bind(ws);
+      ws.send = (data: string) => {
+        if (String(data).includes('"op":"get"')) setTimeout(() => send(data), 4_000);
+        else send(data);
+      };
+    });
+    await page.tap('#mobile-cmds');
+    await expect.poll(sheetOpen).toBe(true);
+    await page.tap('#wb-sheet-actions .wb-sheet-text-btn');
+    const sendInput = page.locator('.wb-qc-form input[type="text"]').nth(0);
+    const labelInput = page.locator('.wb-qc-form input[type="text"]').nth(1);
+    await sendInput.fill('/typed-not-saved');
+    await labelInput.fill('未保存的名称');
+    // 4 秒后晚到的应答带着外部列表触发过期重画。
+    await expect.poll(
+      () => page.locator('.wb-qc-row-main', { hasText: 'from-elsewhere' }).count(),
+      { timeout: 9_000 },
+    ).toBe(1);
+    // 重画没清掉表单：草稿回填，用户敲了一半的内容还在。
+    expect(await sendInput.inputValue()).toBe('/typed-not-saved');
+    expect(await labelInput.inputValue()).toBe('未保存的名称');
+    // 回填的草稿可以直接提交，和外部刚写入的条目并存。
+    await page.locator('.wb-qc-form button[type="submit"]').tap();
+    await expect.poll(savedLabels).toEqual(expect.arrayContaining(['from-elsewhere', '未保存的名称']));
+    await closeSheet();
+    rmSync(settingsPath(), { force: true });
+  });
+
+  it('编辑已有条目提交时撞冲突：退出编辑态，新增表单为空且不预填刚编辑的内容', async () => {
+    rmSync(settingsPath(), { force: true });
+    await openPage();
+    await page.tap('#mobile-cmds');
+    await expect.poll(sheetOpen).toBe(true);
+    await page.tap('#wb-sheet-actions .wb-sheet-text-btn');
+    // 等打开面板时的读取完成：此时没有保存过，页面的比对基准是内置默认（null）。
+    await page.waitForFunction(() => (window as unknown as { _wbQuickReq: unknown })._wbQuickReq === null);
+    // 对一条默认指令进入编辑态并改内容，提交前让服务端文件被别的页面换掉，保存必然撞冲突。
+    await page.locator('.wb-qc-row-main', { hasText: '/rewind' }).tap();
+    const sendInput = page.locator('.wb-qc-form input[type="text"]').nth(0);
+    await expect.poll(() => sendInput.inputValue()).toBe('/rewind');
+    await sendInput.fill('/edited-send');
+    writeQuickCommands([{ label: 'from-elsewhere', send: '/elsewhere' }]);
+    await page.locator('.wb-qc-form button[type="submit"]').tap();
+    await expect.poll(() => page.textContent('#wb-toast')).toContain('别的页面改过');
+    // 冲突重画发生在编辑态（editIndex>=0、草稿是刚编辑的内容）：清空草稿、退回新增态，
+    // 表单为空——被编辑的那一行可能已被别的页面移位或删除，不能预填成一条待添加的重复项。
+    expect(await sendInput.inputValue()).toBe('');
+    expect(await page.locator('.wb-qc-form-title').textContent()).toContain('添加');
+    await closeSheet();
+    rmSync(settingsPath(), { force: true });
+  });
+
+  it('下移保存成功后的普通重画，保留新增表单里没提交的内容', async () => {
+    rmSync(settingsPath(), { force: true });
+    await openPage();
+    await page.tap('#mobile-cmds');
+    await expect.poll(sheetOpen).toBe(true);
+    await page.tap('#wb-sheet-actions .wb-sheet-text-btn');
+    const sendInput = page.locator('.wb-qc-form input[type="text"]').nth(0);
+    await sendInput.fill('/typed-before-move');
+    // 以 DOM 行序变化确认「客户端」已完成重画（不能只轮询服务端文件，文件先于应答写入，
+    // 那时页面还没重画），重画不能清掉正在新增的内容。
+    await page.locator('.wb-qc-row').nth(0).locator('button[aria-label^="下移"]').tap();
+    await expect.poll(() => page.locator('.wb-qc-row-main').nth(0).textContent()).toContain('/compact');
+    expect(await sendInput.inputValue()).toBe('/typed-before-move');
+    await closeSheet();
+    rmSync(settingsPath(), { force: true });
+  });
+
+  it('删除保存成功后的普通重画，保留新增表单里没提交的内容', async () => {
+    rmSync(settingsPath(), { force: true });
+    await openPage();
+    await page.tap('#mobile-cmds');
+    await expect.poll(sheetOpen).toBe(true);
+    await page.tap('#wb-sheet-actions .wb-sheet-text-btn');
+    const sendInput = page.locator('.wb-qc-form input[type="text"]').nth(0);
+    await sendInput.fill('/typed-before-delete');
+    // 独立用例：此前没有任何保存，草稿仍是空的，只有删除回调自己的保留逻辑能救下输入。
+    // 以 DOM 行数减少确认客户端重画已发生。
+    await page.locator('.wb-qc-row').nth(0).locator('button[aria-label^="删除"]').tap();
+    await expect.poll(() => page.locator('.wb-qc-row').count()).toBe(6);
+    expect(await sendInput.inputValue()).toBe('/typed-before-delete');
+    await closeSheet();
+    rmSync(settingsPath(), { force: true });
+  });
+
+  it('用户清空新增表单后再排序或删除，旧草稿不会被回填回来', async () => {
+    rmSync(settingsPath(), { force: true });
+    await openPage();
+    await page.tap('#mobile-cmds');
+    await expect.poll(sheetOpen).toBe(true);
+    await page.tap('#wb-sheet-actions .wb-sheet-text-btn');
+    const sendInput = page.locator('.wb-qc-form input[type="text"]').nth(0);
+    // 先填内容并下移一次：草稿被存下、重画后回填（默认列表首行 /rewind 下移后变成 /compact）。
+    await sendInput.fill('/x-draft');
+    await page.locator('.wb-qc-row').nth(0).locator('button[aria-label^="下移"]').tap();
+    await expect.poll(() => page.locator('.wb-qc-row-main').nth(0).textContent()).toContain('/compact');
+    expect(await sendInput.inputValue()).toBe('/x-draft');
+    // 用户主动清空输入框，再删除当前首行：行数 7→6，确认又一次重画已发生。
+    await sendInput.fill('');
+    await page.locator('.wb-qc-row').nth(0).locator('button[aria-label^="删除"]').tap();
+    await expect.poll(() => page.locator('.wb-qc-row').count()).toBe(6);
+    // 清空就是清空：旧草稿不能在这次重画里被填回来。
+    expect(await sendInput.inputValue()).toBe('');
+    await closeSheet();
+    rmSync(settingsPath(), { force: true });
+  });
 });

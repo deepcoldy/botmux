@@ -28,6 +28,9 @@ describe('快捷指令默认列表', () => {
   it('Codex 家族单独一套，不带它没有的命令', () => {
     expect(quickCommandProfile('codex')).toBe('codex');
     expect(quickCommandProfile('codex-app')).toBe('codex');
+    // coco / traex 跑同一套 traecli/codex-rs TUI，命令面与 codex 一致。
+    expect(quickCommandProfile('coco')).toBe('codex');
+    expect(quickCommandProfile('traex')).toBe('codex');
     expect(quickCommandProfile('claude-code')).toBe('default');
     expect(quickCommandProfile(undefined)).toBe('default');
     const sends = defaultQuickCommands('codex').map(cmd => cmd.send);

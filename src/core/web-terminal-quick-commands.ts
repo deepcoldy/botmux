@@ -27,7 +27,15 @@ export type QuickCommandProfile = 'codex' | 'default';
 
 /** 自定义列表按哪一套存：Codex 家族的斜杠命令和其它 CLI 不一样，其余共用一套。 */
 export function quickCommandProfile(cliId: unknown): QuickCommandProfile {
-  return cliId === 'codex' || cliId === 'codex-app' ? 'codex' : 'default';
+  // coco / traex 与 codex 跑同一套 traecli/codex-rs TUI：适配器都标 stuckPageFamily:'codex-family'，
+  // 配置格式都是 codex-toml。以本机 traecli 0.214.1 实测：codex 档的 /status /compact /model /review
+  // /diff 都是它的 TUI 斜杠命令；default 档里的 /effort、/usage 在它里面没有对应斜杠命令（它也有
+  // /rewind、/context，所以真正的区分点是 /effort、/usage，不是 /rewind）。
+  // 这里只决定快捷指令的默认档，与 adapters/cli/types.ts 的 isCodexFamilyCliId（管 bridge/升级行为，
+  // 刻意不含 coco/traex）是两件事，不要合并判定。
+  return cliId === 'codex' || cliId === 'codex-app' || cliId === 'coco' || cliId === 'traex'
+    ? 'codex'
+    : 'default';
 }
 
 export function defaultQuickCommands(profile: unknown): QuickCommand[] {

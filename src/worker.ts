@@ -32833,7 +32833,7 @@ function _wbOpenQuickSheet(opts){
     function move(from,to){
       if(to<0||to>=list.length)return;
       var next=list.slice();var it=next.splice(from,1)[0];next.splice(to,0,it);
-      _wbSaveQuick(base,next,'',function(){if(editIndex===from)editIndex=to;else if(editIndex===to)editIndex=from;});
+      _wbSaveQuick(base,next,'',function(){captureAddDraft();if(editIndex===from)editIndex=to;else if(editIndex===to)editIndex=from;});
     }
     var rows=document.createElement('div');
     list.forEach(function(cmd,i){
@@ -32850,7 +32850,7 @@ function _wbOpenQuickSheet(opts){
       down.addEventListener('click',function(){move(i,i+1);});
       del.addEventListener('click',function(){
         var next=list.slice();next.splice(i,1);
-        _wbSaveQuick(base,next,'',function(){if(editIndex===i){editIndex=-1;draft=null;}else if(editIndex>i)editIndex--;});
+        _wbSaveQuick(base,next,'',function(){captureAddDraft();if(editIndex===i){editIndex=-1;draft=null;}else if(editIndex>i)editIndex--;});
       });
       row.appendChild(main);row.appendChild(up);row.appendChild(down);row.appendChild(del);
       rows.appendChild(row);
@@ -32908,7 +32908,25 @@ function _wbOpenQuickSheet(opts){
     done.addEventListener('click',function(){editing=false;editIndex=-1;draft=null;render();});
     s.foot.appendChild(reset);s.foot.appendChild(done);
   }
-  view=_wbQuickView=function(stale){if(stale){editIndex=-1;draft=null;}render();};
+  // 过期重画（晚到的读取应答、保存冲突、打开面板时的读取）会重建整个面板。正在新增、还没保存的
+  // 表单内容先抓进 draft 回填，否则用户敲了一半的指令会被一次后台刷新清掉。只救「新增」：
+  // 编辑已有条目时该行可能已被别的页面移位或删掉，重置 editIndex 是合理的。
+  function captureAddDraft(){
+    if(editIndex!==-1)return;
+    var form=s.body.querySelector('.wb-qc-form');if(!form)return;
+    var inputs=form.querySelectorAll('input[type="text"]');
+    var send=inputs[0]?inputs[0].value:'';
+    // 发送内容被清空时连同草稿一起清掉：否则上一次重画存下的旧草稿会在本次重画里回填，
+    // 用户已经删掉的字又回到输入框。
+    if(!send){draft=null;return;}
+    var enter=form.querySelector('input[type="checkbox"]');
+    draft={send:send,label:inputs[1]?inputs[1].value:'',hint:inputs[2]?inputs[2].value:'',
+      enter:enter?enter.checked:true};
+  }
+  view=_wbQuickView=function(stale){
+    if(stale){if(editIndex===-1)captureAddDraft();else draft=null;editIndex=-1;}
+    render();
+  };
   render();
   // 别的页面可能刚改过：打开时向服务端要一次最新列表，有变化再重画。
   _wbQuickRequest({op:'get'},function(_status,changed){if(changed&&_wbQuickView)_wbQuickView(true);});
