@@ -192,7 +192,7 @@ describe('contract gateway and real worker boundaries', () => {
       isSuspendableBackendType: () => true, suspendBackingVerifier: verifier,
       trackLifecycleRetirement: vi.fn(), clearLifecycleRetirement: vi.fn(), armWorkerKillBackstop: vi.fn(),
       invalidateStuckWarning: vi.fn(), invalidateTuiPrompt: vi.fn(), clearIdleAutoCompactStretch: vi.fn(),
-      clearPendingSuspendClaim: vi.fn(),
+      clearPendingSuspendClaim: vi.fn(), clearAcceptedInputTurns: vi.fn(),
       takeSessionPreviewTarget: () => undefined, sessionStore: { updateSessionPid: vi.fn(), updateSession: vi.fn() },
       dashboardEventBus: { publish: vi.fn() }, restartCoordinator: { cancelSession: vi.fn() }, logger: { warn: vi.fn(), info: vi.fn() }, tag: () => 'test' };
     scope.suspendWorker = loadWorkerPoolFunction('suspendWorker', scope);
@@ -516,7 +516,7 @@ describe('contract gateway and real worker boundaries', () => {
     const worker: any = { send: vi.fn() }; s.ds.worker = worker;
     const legacy = vi.fn();
     const handlerScope: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker,
-      logger: { debug: vi.fn() }, t: 'test', handleLegacyWorkerMessage: legacy };
+      logger: { debug: vi.fn(), warn: vi.fn() }, t: 'test', handleLegacyWorkerMessage: legacy };
     const handler = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', handlerScope);
     const revision = s.store.read(s.ref)?.revision;
     for (const type of ['managed_turn_origin', 'managed_turn_origin_revoked']) {
@@ -539,7 +539,8 @@ describe('contract gateway and real worker boundaries', () => {
       credentialIsolated: false, cliPid: 111, cliProcStart: 'start1' }), execution);
     const worker: any = { send: vi.fn() }; s.ds.worker = worker; s.ds.workerGeneration = 1;
     const handlerScope: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker,
-      logger: { debug: vi.fn() }, t: 'test', botCfg: {}, sessionCliId: () => 'claude-code' };
+      workerGeneration: 1,
+      logger: { debug: vi.fn(), warn: vi.fn() }, t: 'test', botCfg: {}, sessionCliId: () => 'claude-code' };
     handlerScope.handleLegacyWorkerMessage = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleLegacyWorkerMessage', handlerScope);
     const handler = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', handlerScope);
     await handler(wire);
