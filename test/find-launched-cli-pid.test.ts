@@ -144,6 +144,10 @@ function runWorkerWiring(late: boolean, options: {
     },
     claudeDataDir: options.claudeDataDir, sandboxRequested: options.sandboxRequested ?? false,
     credentialOnlyBwrap: false, backend, cliPid: late ? null : 100, bridgeCliPid: undefined,
+    // Module-level spawn counter read by the TRAE leaf-resolve guard; the sliced
+    // wiring runs in this VM without worker.ts's declaration, so supply its
+    // initial value. It is only read inside the slice, never assigned.
+    cliSpawnGeneration: 0,
     scopePayloadLauncherActive: options.scopeLaunched ?? options.scopePayloadPid !== undefined,
     lastSpawnOuterBwrapActive: false, lastSpawnTraexLauncherActive: false, lastSpawnCodexLauncherActive: false,
     lastSpawnCodexExecutable: undefined,

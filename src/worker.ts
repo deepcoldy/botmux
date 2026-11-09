@@ -415,7 +415,11 @@ import { validateCodexServiceTier } from './services/codex-service-tier-catalog.
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
 import { traexRejectedArgument } from './adapters/cli/traex-version.js';
 import { isTraexProcess, resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from './core/traex-leaf-pid.js';
-import { readRunningExeIdentity } from './services/cli-install-identity.js';
+import {
+  readRunningExeIdentity,
+  resolveInstallIdentity,
+  type ExecutableIdentity,
+} from './services/cli-install-identity.js';
 import { pinWorkerTraeHome } from './services/traex-paths.js';
 import { acquireTraexRuntimeLease, daemonBirthIdentity, type TraexRuntimeLease } from './services/traex-runtime-gate.js';
 import { releaseDirForExecutable } from './services/traex-runtime-snapshot.js';
@@ -2085,6 +2089,9 @@ async function publishRuntimeContract(binding: RuntimeEventBinding, nativeSessio
   send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
 }
 let cliSpawnGeneration = 0;
+/** What the TRAE install entry resolved to right before the spawn of
+ *  `generation`. Published only while that spawn is still the current one. */
+let traexInstallAtSpawn: { generation: number; identity: ExecutableIdentity | undefined } | undefined;
 
 class CliSpawnSupersededError extends Error {
   constructor() {
@@ -28214,6 +28221,9 @@ async function spawnCliBody(
       publish: send,
       spawn: () => {
         const backend = spawnBackend;
+        if (cfg.cliId === 'traex') {
+          traexInstallAtSpawn = { generation: cliSpawnGeneration, identity: resolveInstallIdentity(spawnCliBin) };
+        }
         backend.spawn(spawnBin, spawnArgs, {
           cwd: spawnCwd,
           cols: PTY_COLS,
@@ -33873,6 +33883,10 @@ function publishLocalProcessAttestation(
   const cliInstallEntry = lastInitConfig?.cliId === 'traex'
     ? cliAdapter?.resolvedBin
     : undefined;
+  // An earlier spawn's observation says nothing about the current process.
+  const cliInstallAtSpawn = cliInstallEntry && traexInstallAtSpawn?.generation === cliSpawnGeneration
+    ? traexInstallAtSpawn.identity
+    : undefined;
   send({
     type: 'local_process_attestation',
     backendType: effectiveBackendType,
@@ -33881,6 +33895,7 @@ function publishLocalProcessAttestation(
     ...(cliProcStart ? { cliProcStart } : {}),
     ...(cliExe ? { cliExe } : {}),
     ...(cliInstallEntry ? { cliInstallEntry } : {}),
+    ...(cliInstallAtSpawn ? { cliInstallAtSpawn } : {}),
     cliSpawnGeneration,
     ...(enginePid ? { enginePid } : {}),
     ...(engineProcStart ? { engineProcStart } : {}),
