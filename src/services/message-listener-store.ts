@@ -235,6 +235,15 @@ async function writeCustomGroupMessageListener(
   if (normalized) bot.config.groupMessageListenerOverrides[chatId] = { mode: 'custom', listener: normalized };
   else delete bot.config.groupMessageListenerOverrides[chatId];
   if (Object.keys(bot.config.groupMessageListenerOverrides).length === 0) bot.config.groupMessageListenerOverrides = undefined;
+  // The poller and the no-override fallback read the shadow in memory, so it
+  // must change with the rule rather than at the next restart.
+  if (normalized) {
+    if (!bot.config.messageListeners) bot.config.messageListeners = {};
+    bot.config.messageListeners[chatId] = normalized;
+  } else if (bot.config.messageListeners) {
+    delete bot.config.messageListeners[chatId];
+    if (Object.keys(bot.config.messageListeners).length === 0) bot.config.messageListeners = undefined;
+  }
 
   return { ok: true, listener: result.result };
 }

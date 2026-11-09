@@ -501,7 +501,7 @@ describe('a custom rule saved switched off with no prompt', () => {
 
   // With no global rule set up, a fresh custom draft starts switched off and empty.
   const noGlobalRule = () => savedGlobal({ enabled: false, prompt: '' });
-  const status = (root: Instance) => text(byClass(groupItem(root, 'Inherit group'), 'message-listener-group-status')[0]!);
+  const status = (root: Instance, name = 'Inherit group') => text(byClass(groupItem(root, name), 'message-listener-group-status')[0]!);
 
   it('stays custom and paused after the re-read and a reload', async () => {
     const requests = mockApi({ global: noGlobalRule() });
@@ -533,6 +533,18 @@ describe('a custom rule saved switched off with no prompt', () => {
     expect(hasEditor(root, 'group')).toBe(true);
     expect(editorOf(root, 'group').props.flash).toBeNull();
     expect(byClass(groupItem(root, 'Inherit group'), 'message-listener-unsaved-tag')).toHaveLength(1);
+    await act(async () => { renderer.unmount(); });
+  });
+
+  it('re-reads a group whose existing custom rule the daemon dropped, so it no longer shows as custom', async () => {
+    mockApi({ global: noGlobalRule(), dropsBlankPausedRule: true });
+    const renderer = await renderPage();
+    const root = renderer.root;
+    await click(groupItem(root, 'Custom group'));
+    act(() => editorOf(root, 'group').props.onPatch({ enabled: false, prompt: '' }));
+    await click(groupSave(root));
+    expect(toastMock).toHaveBeenCalledWith(expect.stringContaining('「Custom group」'), { kind: 'error' });
+    expect(status(root, 'Custom group')).toBe('使用全局');
     await act(async () => { renderer.unmount(); });
   });
 });

@@ -462,7 +462,7 @@ export function MessageListenersPage() {
       // The daemon's answer is what the group now runs; a rule it did not keep
       // must not read as saved. The editor may be gone after the re-read, so toast.
       if (saved?.mode !== 'custom' || !saved.listener) {
-        toast(tr('listeners.customNotKept'), { kind: 'error' });
+        toast(tr('listeners.customNotKept', { name: groupName(requestChatId) }), { kind: 'error' });
         void refresh(requestBotId, { groupsOnly: true });
         return;
       }

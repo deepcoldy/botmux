@@ -3932,10 +3932,25 @@ describe('PUT /api/group-message-listeners/:chatId — the answer is what the gr
     });
   });
 
-  it('leaves the legacy DELETE route clearing the rule', async () => {
-    await withDaemon({ groupMessageListenerOverrides: { [chatId]: ownRule } }, async base => {
+  // What a group-page save leaves in bots.json: the rule plus its legacy shadow,
+  // which a restart loads into memory for the poller and the no-override fallback.
+  const savedFromGroupPage = { groupMessageListenerOverrides: { [chatId]: ownRule }, messageListeners: { [chatId]: ownRule.listener } };
+
+  it('leaves the legacy DELETE route clearing the rule, for the running daemon too', async () => {
+    await withDaemon(savedFromGroupPage, async base => {
       expect((await fetch(`${base}/api/message-listeners/${chatId}`, { method: 'DELETE' })).status).toBe(200);
       expect(await (await fetch(`${base}/api/group-message-listeners/${chatId}`)).json()).toMatchObject({ mode: 'inherit', listener: null });
+      expect(findMessageListenerForChat(getBot(appId), chatId)).toBeUndefined();
+    });
+  });
+
+  it('pauses the rule for the running daemon too, so a later legacy clear cannot bring it back', async () => {
+    await withDaemon(savedFromGroupPage, async base => {
+      expect((await put(base, { mode: 'custom', listener: { enabled: false, prompt: '' } })).status).toBe(200);
+      // The poller reads this row; a stale enabled copy keeps the paused group polled.
+      expect(getBot(appId).config.messageListeners?.[chatId]).toMatchObject({ enabled: false, prompt: '' });
+      expect((await fetch(`${base}/api/message-listeners/${chatId}`, { method: 'DELETE' })).status).toBe(200);
+      expect(findMessageListenerForChat(getBot(appId), chatId)).toBeUndefined();
     });
   });
 });
