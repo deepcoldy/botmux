@@ -1090,6 +1090,11 @@ describe('/cli session selection', () => {
           expect(lines.some(line => line.includes(alias) && line.includes(id)), `${alias} listed with ${id}`).toBe(true);
         }
       }
+      // Names that pick nothing on their own are not offered: `codex` is Codex's
+      // own id rather than Codex App's alias, and `trae` is shared by coco and traex.
+      const words = reply.split(/[^a-z0-9-]+/i);
+      expect(words).not.toContain('trae');
+      expect(words.filter(word => word === 'codex-app')).toHaveLength(1);
     }
   });
 
