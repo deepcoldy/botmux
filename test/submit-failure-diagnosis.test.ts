@@ -248,6 +248,7 @@ const DIAG_KEYS = [
   'submitDiag.logged_out',
   'submitDiag.interactive_menu',
   'submitDiag.draft_parked',
+  'submitDiag.session_locked',
 ] as const;
 
 describe('submitDiag i18n 文案接缝', () => {
@@ -452,6 +453,12 @@ describe('shouldWaitThroughBusyTurn', () => {
   it('never extends over a login gate or an interactive menu', () => {
     expect(shouldWaitThroughBusyTurn({ ...base, diagnosisReason: 'logged_out' })).toBe(false);
     expect(shouldWaitThroughBusyTurn({ ...base, diagnosisReason: 'interactive_menu' })).toBe(false);
+  });
+
+  it('never extends over a recognised session writer lock', () => {
+    expect(shouldWaitThroughBusyTurn({
+      busy: true, diagnosisReason: 'session_locked', waitsSoFar: 0,
+    })).toBe(false);
   });
 
   it('still extends when a draft is parked, because that alone proves nothing either way', () => {

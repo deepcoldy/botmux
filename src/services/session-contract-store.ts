@@ -5,7 +5,7 @@ import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.
 import { isOutputJournalAppId } from './universal-output-handoff.js';
 import type { TurnResultBinding, TurnResult, TurnDeliveryReceipt } from './turn-result.js';
 import {
-  reduceSessionContract, reusableRuntimeIdentity, sameRuntime, samePhysicalRuntimeIdentity, canSupersedeControlOperation,
+  reduceSessionContract, reusableRuntimeIdentity, sameRuntime, sameWorker, sameExecution, samePhysicalRuntimeIdentity, canSupersedeControlOperation,
   type ContractSessionRef, type SessionContract, type RuntimeContract, type RuntimeIdentity, type RuntimeRef,
   type ExecutionContract, type ExecutionRef, type ControlOperation, type ControlKind, type ContractEvent,
   type ContractTransition, type ContractTransitionInput, type WorkerRef,
@@ -247,6 +247,17 @@ export class SessionContractStore {
   private saveEntity(ref: ContractSessionRef, kind: string, id: string, phase: string, value: unknown): void {
     this.db.prepare('INSERT INTO entities(session_key,kind,id,phase,value) VALUES(?,?,?,?,?) ON CONFLICT(session_key,kind,id) DO UPDATE SET phase=excluded.phase,value=excluded.value').run(sessionKey(ref), kind, id, phase, JSON.stringify(value));
   }
+  private projectSession(ref: ContractSessionRef, state: SessionContract): void {
+    if (!this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'").get()) return;
+    const hit = this.db.prepare('SELECT row FROM sessions WHERE session_id=?').get(ref.sessionId) as { row: string } | undefined;
+    if (!hit) return;
+    const row = JSON.parse(hit.row);
+    row.sessionContractRevision = state.revision;
+    row.sessionLifecycle = state.lifecycle;
+    row.status = state.lifecycle === 'closed' ? 'closed' : 'active';
+    if (row.status === 'closed') row.closedAt ??= new Date().toISOString();
+    this.db.prepare('UPDATE sessions SET status=?,row=? WHERE session_id=?').run(row.status, JSON.stringify(row), ref.sessionId);
+  }
   apply(ref: ContractSessionRef, event: ContractEvent, eventId: string = randomUUID(), expectedRevision?: number): ContractTransition {
     return this.transaction(() => this.applyInside(ref, event, eventId, expectedRevision));
   }
@@ -277,19 +288,7 @@ export class SessionContractStore {
       if (result.operation) this.saveEntity(ref, 'operation', result.operation.operationId, result.operation.phase, result.operation);
       // Session is the compatible projection of this contract. Metadata writers
       // use the same database and preserve the terminal lifecycle/revision.
-      if (this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'").get()) {
-        const hit = this.db.prepare('SELECT row FROM sessions WHERE session_id=?').get(ref.sessionId) as { row: string } | undefined;
-        if (hit) {
-          const row = JSON.parse(hit.row);
-          // The opened app-scoped database is the owner. Legacy annotation
-          // fields on the Session row are not an authorization boundary.
-          row.sessionContractRevision = result.session.revision;
-          row.sessionLifecycle = result.session.lifecycle;
-          row.status = result.session.lifecycle === 'closed' ? 'closed' : 'active';
-          if (row.status === 'closed') row.closedAt ??= new Date().toISOString();
-          this.db.prepare('UPDATE sessions SET status=?,row=? WHERE session_id=?').run(row.status, JSON.stringify(row), ref.sessionId);
-        }
-      }
+      this.projectSession(ref, result.session);
     }
     // Observation sequences are already watermarked; an unchanged readiness
     // sample needs no dedup record.
@@ -312,6 +311,9 @@ export class SessionContractStore {
         .run(key, kind, ...phases, key, kind, keep);
       older('execution', retention.executions, ['succeeded', 'failed', 'cancelled']);
       older('operation', retention.operations, ['confirmed', 'failed_before_effect', 'rejected']);
+      this.db.prepare(`DELETE FROM entities WHERE session_key=? AND kind='execution_observer'
+        AND NOT EXISTS (SELECT 1 FROM entities x WHERE x.session_key=entities.session_key AND x.kind='execution'
+          AND x.id=json_extract(entities.value,'$.execution.executionId'))`).run(key);
       // A turn whose attempt is still unsettled may yet deliver its result.
       for (const kind of ['result_binding', 'result_delivery', 'result_revision']) {
         this.db.prepare(`DELETE FROM entities WHERE session_key=? AND kind=? AND rowid NOT IN (SELECT rowid FROM entities WHERE session_key=? AND kind=? ORDER BY rowid DESC LIMIT ?)
@@ -433,6 +435,34 @@ export class SessionContractStore {
   authorizedProducer(ref: ContractSessionRef, runtime: RuntimeRef, worker: WorkerRef): boolean {
     const known = this.runtime(ref, runtime.runtimeId);
     return sameRuntime(known?.ref, runtime) && !!this.db.prepare('SELECT worker_id FROM runtime_producers WHERE session_key=? AND runtime_id=? AND worker_id=? AND generation=?').get(sessionKey(ref), runtime.runtimeId, worker.workerId, worker.generation);
+  }
+  authorizeExecutionObserver(ref: ContractSessionRef, worker: WorkerRef, execution: ExecutionRef): boolean {
+    return this.transaction(() => {
+      const state = this.read(ref); const current = this.runtime(ref);
+      const attempt = this.execution(ref, execution.executionId);
+      const source = attempt?.runtime && this.runtime(ref, attempt.runtime.runtimeId);
+      if (!state || state.lifecycle !== 'active' || state.activeOperationId || !sameWorker(state.worker, worker)
+          || !current || !sameWorker(current.worker, worker) || !['starting', 'ready'].includes(current.phase)
+          || !sameExecution(attempt?.ref, execution) || attempt?.phase !== 'reconciling'
+          || !source || !sameRuntime(attempt.runtime, source.ref) || source.phase !== 'unresolved' || sameRuntime(source.ref, current.ref)
+          || !current.identity?.nativeSessionId || !reusableRuntimeIdentity(source.identity, current.identity)) return false;
+      if (this.authorizedExecutionObserver(ref, source.ref, worker, execution)) return true;
+      this.saveEntity(ref, 'execution_observer', JSON.stringify([worker.workerId, worker.generation, execution.executionId]),
+        'authorized', { worker, execution, runtime: source.ref });
+      // Observer grants are part of the revision-gated primary snapshot.
+      const updated = { ...state, revision: state.revision + 1 };
+      this.db.prepare('UPDATE contracts SET revision=?,value=? WHERE session_key=? AND revision=?')
+        .run(updated.revision, JSON.stringify(updated), sessionKey(ref), state.revision);
+      this.projectSession(ref, updated);
+      return true;
+    });
+  }
+  authorizedExecutionObserver(ref: ContractSessionRef, runtime: RuntimeRef, worker: WorkerRef, execution?: ExecutionRef): boolean {
+    if (!execution) return false;
+    const value = this.entity<{ worker: WorkerRef; execution: ExecutionRef; runtime: RuntimeRef }>(ref,
+      'execution_observer', JSON.stringify([worker.workerId, worker.generation, execution.executionId]));
+    return !!value && sameWorker(value.worker, worker) && sameExecution(value.execution, execution)
+      && sameRuntime(value.runtime, runtime) && sameRuntime(this.execution(ref, execution.executionId)?.runtime, runtime);
   }
   admitExecution(ref: ContractSessionRef, turnId: string, dispatchAttempt?: number, admissionId?: string): ExecutionContract {
     return this.transaction(() => {

@@ -6,7 +6,7 @@
  */
 import type { RunNodeView, RunView } from '../../workflows/v3/ops-projection.js';
 import type { V3Dag, V3Node } from '../../workflows/v3/dag.js';
-import type { WorkflowDraftView } from '../../workflows/v3/draft-service.js';
+import type { WorkflowDraftProjectCandidate, WorkflowDraftProjectOptions, WorkflowDraftView } from '../../workflows/v3/draft-service.js';
 import type { WorkflowDraftInitiator, WorkflowDraftPhase, WorkflowDraftQuestion, WorkflowDraftTurn } from '../../workflows/v3/draft-store.js';
 import type { WorkflowOrchestratorBotOption } from '../workflow-drafts-api.js';
 import type { V3Gate2BotPlanRow, V3RosterBot, V3RosterExclusion } from '../../workflows/v3/bot-assignment.js';
@@ -114,6 +114,8 @@ export function draftErrorKey(code: string): string | undefined {
     'bad_params', 'template_invalid', 'not_owner', 'save_conflict', 'unsafe_literals', 'library_unavailable',
     // 换编排 Bot
     'handoff_pending',
+    // 项目
+    'project_required', 'project_not_allowed',
   ]);
   return known.has(code) ? `workflow.draft.err.${code}` : undefined;
 }
@@ -152,8 +154,51 @@ export function orchestratorOptionStates(
   });
 }
 
-export function canStartDraft(input: { goal: string; bot?: WorkflowOrchestratorBotOption; check?: InitiatorCheck; busy: boolean }): boolean {
-  return !input.busy && !!input.bot && !input.bot.unavailable && input.check?.state === 'ok' && input.goal.trim().length > 0;
+/** `project`: what {@link projectForRequest} gave; `null` = not chosen yet. */
+export function canStartDraft(input: { goal: string; bot?: WorkflowOrchestratorBotOption; check?: InitiatorCheck; project: string | null; busy: boolean }): boolean {
+  return !input.busy && !!input.bot && !input.bot.unavailable && input.check?.state === 'ok' && input.project !== null && input.goal.trim().length > 0;
+}
+
+// ─── 项目（新建 / 运行模板 / 复制）─────────────────────────────────────────
+
+/** 编排 Bot 的项目选项：默认目录，或要选的候选。 */
+export type ProjectOptionsCheck =
+  | { state: 'checking' }
+  | { state: 'ok'; options: WorkflowDraftProjectOptions }
+  | { state: 'failed'; error: string; message?: string; retryable: boolean };
+
+/** The projects answer, or `null` when it is not one (the form then cannot be sent). */
+export function readProjectOptions(value: unknown): WorkflowDraftProjectOptions | null {
+  const options = value as { kind?: unknown; dir?: unknown; candidates?: unknown } | null | undefined;
+  if (options?.kind === 'default' && typeof options.dir === 'string' && options.dir) return { kind: 'default', dir: options.dir };
+  if (options?.kind !== 'pick' || !Array.isArray(options.candidates)) return null;
+  const candidates = (options.candidates as Array<Partial<WorkflowDraftProjectCandidate> | null>)
+    .filter((candidate): candidate is WorkflowDraftProjectCandidate => typeof candidate?.path === 'string' && !!candidate.path && typeof candidate.name === 'string');
+  return { kind: 'pick', candidates };
+}
+
+/**
+ * The `project` sent with a new draft: the default dir the page shows (if it
+ * changed meanwhile the daemon refuses rather than clarifying somewhere else),
+ * or the picked candidate. `null` = nothing to send yet.
+ */
+export function projectForRequest(check: ProjectOptionsCheck | undefined, picked: string): string | null {
+  if (check?.state !== 'ok') return null;
+  if (check.options.kind === 'default') return check.options.dir;
+  return check.options.candidates.some((candidate) => candidate.path === picked) ? picked : null;
+}
+
+/** The daemon refused the project the page sent (its default dir or its
+ *  candidates changed since the form loaded them): load the choices again. */
+export function projectChoicesStale(error: string): boolean {
+  return error === 'project_required' || error === 'project_not_allowed';
+}
+
+/** 下拉里的一项：和飞书仓库选择卡一样的名字、分支、worktree 标记，再带上路径。 */
+export function projectOptionLabel(candidate: WorkflowDraftProjectCandidate): string {
+  const branch = candidate.branch ? ` (${candidate.branch})` : '';
+  const worktree = candidate.type === 'worktree' ? ' [worktree]' : '';
+  return `${candidate.name}${branch}${worktree} · ${candidate.path}`;
 }
 
 // ─── 状态（§4.6）─────────────────────────────────────────────────────────

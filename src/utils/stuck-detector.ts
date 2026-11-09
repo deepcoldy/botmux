@@ -5,7 +5,8 @@
  * Scope (intentionally narrow): only the blocking pages listed in
  * classifyStuckPage — the Codex-family hook-review flow (startup menu, hooks
  * browser, per-event detail, for any hook event) and the TRAE CLI legacy-data
- * migration picker — each matched against text captured from a real build.
+ * migration picker and session writer-lock page — each matched against text
+ * captured from a real build.
  * Generic [Y/n]/permission/Press-to-continue prompts are NOT handled here —
  * they require semantic parsing that cannot be safely inferred from a regex.
  * Which keys a card may send for each page lives in core/stuck-page-catalog.ts.
@@ -113,13 +114,17 @@ const STARTUP_FOOTERS = [
   ['enter confirm', 'esc go back'], // 0.147, traex 0.213
   ['enter confirm', 'esc skip'],    // codex 0.162+
 ] as const;
+const SESSION_LOCK_FOOTERS = [
+  ['r retry', 'esc/ctrl+c/q exit', 'ctrl+o transcript'],                // traex 0.213
+  ['r retry', '←/esc dashboard', 'ctrl+c/q exit', 'ctrl+o transcript'], // traex 0.214
+] as const;
 
 /** "1 hook needs review before it can run." / "2 hooks need review before they can run." */
 const PENDING_REVIEW_STATE = /\b\d+\s+hooks?\s+needs?\s+review before (?:it|they) can run\b/i;
 const L2_TITLE = /^[A-Z][A-Za-z]*\s+hooks$/;
 
 export type HookReviewPageType = 'hook review startup' | 'hook review level 1' | 'hook review level 2';
-export type StuckPageType = HookReviewPageType | 'cli migration menu';
+export type StuckPageType = HookReviewPageType | 'cli migration menu' | 'session lock';
 
 /** Hooks browser (level 1) or per-event detail (level 2). The startup menu is
  *  recognised separately — see classifyStuckPage. */
@@ -196,6 +201,16 @@ function isCliMigrationMenu(snapshot: string): boolean {
     && /^\s*[›>»❯]?\s*2\.\s+Skip for now$/m.test(region);
 }
 
+function isSessionLockScreen(snapshot: string): boolean {
+  const rows = activeViewport(snapshot).map(row => row.trim()).filter(Boolean);
+  const tail = rows.slice(-4);
+  return tail.length === 4
+    && /^(?:🔒\uFE0F?\s+)?This conversation is open in another app(?:\s+R to Retry)?$/.test(tail[0]!)
+    && /^Owner:\s+PID\s+[1-9]\d*$/.test(tail[1]!)
+    && tail[2] === 'Close it there and press R to continue here.'
+    && footerIs(tail[3]!, SESSION_LOCK_FOOTERS);
+}
+
 /** Which known blocking page (if any) the active screen shows. Pure; the
  *  worker uses it to hold queued input, to raise the stuck card, and to
  *  re-verify the page right before a card click writes a key. */
@@ -205,6 +220,7 @@ export function classifyStuckPage(snapshot: string): StuckPageType | undefined {
   if (hookPage) return hookPage;
   if (isStartupHookReviewScreen(snapshot)) return 'hook review startup';
   if (isCliMigrationMenu(snapshot)) return 'cli migration menu';
+  if (isSessionLockScreen(snapshot)) return 'session lock';
   return undefined;
 }
 
@@ -217,7 +233,7 @@ export function shouldHoldInputForHookReview(snapshot: string): boolean {
     || isStartupHookReviewScreen(snapshot);
 }
 
-/** Any known blocking page (hook review or migration picker) — queued input
+/** Any known blocking page (hook review, migration or session lock) — queued input
  *  must not be typed into it. */
 export function shouldHoldInputForStuckPage(snapshot: string): boolean {
   return classifyStuckPage(snapshot) !== undefined;

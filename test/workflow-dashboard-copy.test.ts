@@ -12,9 +12,9 @@ import { join } from 'node:path';
 import { WorkflowDraftError, WorkflowDraftService } from '../src/workflows/v3/draft-service.js';
 import { readRunEnvelope } from '../src/workflows/v3/run-envelope.js';
 import { listSavedWorkflowRevisions, loadCurrentSavedWorkflow } from '../src/workflows/v3/library-store.js';
-import { listWorkflowDrafts } from '../src/workflows/v3/draft-store.js';
+import { listWorkflowDrafts, readWorkflowDraft, writeWorkflowDraft } from '../src/workflows/v3/draft-store.js';
 import {
-  ALICE, BOTS, DOC, MAIN, OWNER, PI, SKETCHES, STEWARD,
+  ALICE, BOTS, DEFAULT_PROJECT, DOC, MAIN, OWNER, PI, SKETCHES, STEWARD,
   architectSettled, goalNode, makeService, specMarkdown,
 } from './helpers/workflow-draft-fakes.js';
 import { fakeLaunch } from './helpers/workflow-launch-fakes.js';
@@ -375,6 +375,33 @@ describe('复制后改什么（§6）', () => {
     h.clarify.reply(`好的。\n<botmux-spec>\n${specMarkdown(SKETCHES)}\n</botmux-spec>`);
     expect((await h.service.finalizeSpec(other.runId, OWNER, {})).ok).toBe(true);
     expect((await h.service.approveSpec(other.runId, OWNER)).phase).toBe('awaiting_architect');
+  });
+
+  it('改目标「重新澄清」 on a copy made before projects: the bot\'s default dir, or refused (nothing changed, no session) when it has none', async () => {
+    let defaultDir: string | undefined = DEFAULT_PROJECT;
+    const launch = fakeLaunch(base);
+    launch.setOnline(ONLINE);
+    const h = makeService(base, {
+      loadBots: () => FLEET, launch: launch.deps, libraryDataDir: library,
+      projects: { defaultDir: () => defaultDir, candidates: () => [] },
+    });
+    h.setOnline(ONLINE);
+    const draft = await copied(h);
+    const { projectDir: _drop, ...legacy } = readWorkflowDraft(join(base, draft.runId))!;
+    writeWorkflowDraft(join(base, draft.runId), legacy);
+
+    defaultDir = undefined;
+    expect(await code(h.service.editCopyGoal(draft.runId, OWNER, { goal: '改成发周报', mode: 'reclarify' }))).toBe('project_required');
+    expect(h.clarify.createInputs).toHaveLength(0);
+    const unchanged = await h.service.view(draft.runId);
+    expect(unchanged).toMatchObject({ phase: 'spec_ready', copy: { prefilled: true } });
+    expect(unchanged.goal).not.toBe('改成发周报');
+
+    defaultDir = DEFAULT_PROJECT;
+    const clarifying = await h.service.editCopyGoal(draft.runId, OWNER, { goal: '改成发周报', mode: 'reclarify' });
+    expect(clarifying.phase).toBe('clarifying');
+    expect(h.clarify.createInputs.map((input) => input.workingDir)).toEqual([DEFAULT_PROJECT]);
+    expect(readWorkflowDraft(join(base, draft.runId))!.projectDir).toBe(DEFAULT_PROJECT);
   });
 
   it('退回改需求 drops the copied flow: the next 确认需求 orchestrates anew', async () => {
