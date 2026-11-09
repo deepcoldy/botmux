@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { shouldSuppressStructuredFallback, structuredFallbackKind, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
-import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, CODEX_TASK_FAILED_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, codexTaskFailureCode, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, isExactCodexOutputLimitError, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, codexCotEntriesFromResponseItem, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, CODEX_TASK_FAILED_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, codexTaskFailureCode, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, isExactCodexOutputLimitError, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, codexCotEntriesFromResponseItem, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
 let path: string;
@@ -440,6 +440,43 @@ describe('codexTaskFailureCode (shared Codex-family failure classifier)', () => 
   it('keeps plain connectivity failures on codex_connection_failed', () => {
     expect(codexTaskFailureCode('ECONNRESET: connection reset by peer')).toBe(CODEX_CONNECTION_ERROR_CODE);
     expect(codexTaskFailureCode('getaddrinfo ENOTFOUND api.example.com')).toBe(CODEX_CONNECTION_ERROR_CODE);
+  });
+
+  it('classifies 413 as payload-too-large instead of a connection failure', () => {
+    // Live incident shape (DeepSeek / openresty gateway, 2026-11): the whole
+    // HTML body arrives wrapped in Codex's http_connection_failed error info.
+    // Reporting it as codex_connection_failed told the user to check the
+    // network, which can never fix a request-body size limit.
+    const live = {
+      message: 'unexpected status 413 Payload Too Large: <html>\r\n<head><title>413 Request Entity Too Large</title></head>\r\n<body>\r\n<center><h1>413 Request Entity Too Large</h1></center>\r\n<hr><center>openresty</center>\r\n</body>\r\n</html>',
+      codex_error_info: { http_connection_failed: { http_status_code: 413 } },
+    };
+    expect(codexTaskFailureCode(live)).toBe(CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE);
+    expect(codexTaskFailureCode('413 Request Entity Too Large')).toBe(CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE);
+    expect(codexTaskFailureCode('unexpected status 413 Payload Too Large')).toBe(CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE);
+    expect(codexTaskFailureCode({ error: { message: 'Request body too large' } }))
+      .toBe(CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE);
+  });
+
+  it('does not let the payload-too-large branch swallow unrelated statuses', () => {
+    expect(codexTaskFailureCode('400 Bad Request: invalid body')).toBe(CODEX_INVALID_REQUEST_ERROR_CODE);
+    expect(codexTaskFailureCode('429 Too Many Requests')).toBe(CODEX_RATE_LIMIT_ERROR_CODE);
+  });
+
+  it('classifies a 413 by its status alone when the body has no "too large" wording', () => {
+    // Anthropic's request_too_large body (as its SDK formats it) matches none
+    // of the text alternatives; only the status token identifies the cause.
+    expect(codexTaskFailureCode('413 {"type":"error","error":{"type":"request_too_large","message":"Request exceeds the maximum allowed number of bytes."}}'))
+      .toBe(CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE);
+    expect(codexTaskFailureCode({
+      message: 'unexpected status',
+      codex_error_info: { http_connection_failed: { http_status_code: 413 } },
+    })).toBe(CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE);
+  });
+
+  it('keeps a 413 relayed inside an invalid_request_error envelope on payload-too-large', () => {
+    expect(codexTaskFailureCode({ error: { type: 'invalid_request_error', message: '413 Request Entity Too Large' } }))
+      .toBe(CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE);
   });
 
   it('falls back to codex_task_failed for unrecognized errors', () => {

@@ -412,7 +412,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexGenerationSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_CAPACITY_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexGenerationSessionIdFromRolloutPath, isCodexRateLimitEvent, codexSessionsRootFromRolloutPath, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
 import { codexConsumedRolloutEvents, codexEventsWithStableIds } from './services/codex-rollout-replay.js';
 import { PI_CREDENTIAL_ERROR_CODE, adoptPiTranscriptIntoBotmuxDir, piSessionUsesBotmuxDir } from './services/pi-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
@@ -9278,13 +9278,15 @@ function failedBridgeFailureText(errorCode?: string, summary?: string): string {
     ? 'worker.empty_final_failed_invalid_request'
     : errorCode === CODEX_AUTH_ERROR_CODE
       ? 'worker.empty_final_failed_auth'
-      : errorCode === CODEX_CONNECTION_ERROR_CODE
-        ? 'worker.empty_final_failed_connection'
-        : errorCode === CODEX_UPSTREAM_ERROR_CODE || errorCode === CODEX_CAPACITY_ERROR_CODE
-          ? 'worker.empty_final_failed_upstream'
-          : errorCode === PI_CREDENTIAL_ERROR_CODE
-            ? 'worker.empty_final_failed_credential'
-            : 'worker.empty_final_failed';
+      : errorCode === CODEX_PAYLOAD_TOO_LARGE_ERROR_CODE
+        ? 'worker.empty_final_failed_payload_too_large'
+        : errorCode === CODEX_CONNECTION_ERROR_CODE
+          ? 'worker.empty_final_failed_connection'
+          : errorCode === CODEX_UPSTREAM_ERROR_CODE || errorCode === CODEX_CAPACITY_ERROR_CODE
+            ? 'worker.empty_final_failed_upstream'
+            : errorCode === PI_CREDENTIAL_ERROR_CODE
+              ? 'worker.empty_final_failed_credential'
+              : 'worker.empty_final_failed';
   const failure = t(key, { cliName: cliName(), reason });
   return failure;
 }
