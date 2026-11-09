@@ -1,7 +1,7 @@
 /**
  * Card lifecycle test (consolidated single test):
  *  1. Card status: 启动中… / 工作中 → 等待输入
- *  2. Toggle button exists
+ *  2. Card controls: the main row, with the low-frequency ones folded under 「更多操作」
  *  3. Screenshot output mode can be shown
  *
  * All assertions reference the specific test message to avoid
@@ -45,12 +45,13 @@ export function registerMidsceneSuites(): void {
       // Wait for bot to respond, open thread panel, handle repo selection
       await waitForStreamingCard(agent, { timeoutMs: 90_000, msgHint: msg, page });
 
-      // --- Step 1: Verify current display toggle exists ---
+      // --- Step 1: Verify the card's main row; the output toggle is folded under 更多操作 ---
       await agent.aiAssert(
-        '右侧话题详情面板最底部当前会话的流式卡片里有"📖 显示输出"或"📕 隐藏输出"按钮',
+        '主内容区正在显示的测试话题里，当前会话的流式卡片主行有"打开 Web 终端"和"关闭会话"按钮，' +
+          '按钮下方有可以展开的"更多操作"',
       );
 
-      // --- Step 2: Ensure output is visible in the current screenshot mode ---
+      // --- Step 2: Turn the output on from 更多操作 ---
       await showStreamingOutput(agent, page);
 
       // Check for ANSI escape codes specifically. CLI output may contain JSON
