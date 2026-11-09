@@ -224,6 +224,61 @@ describe('requestCredentialGrant transport failures', () => {
     }
   });
 
+  /** A platform that answers request i after `delays[i]` ms (`null`: never)
+   *  and drops a request once the client aborts it, like `postJson`. */
+  function slowPlatform(delays: Array<number | null>) {
+    const calls: Array<{ timeoutMs: number }> = [];
+    let firstCall!: () => void;
+    // Bun's fake clock can fire a due timer before microtasks already queued
+    // run, so advancing it before the request reached the transport would
+    // start the request after its own timeout.
+    const reached = new Promise<void>(resolve => { firstCall = resolve; });
+    const http: NonNullable<CredentialGrantClientOptions['http']> = {
+      post: (_url, _body, opts: any) => new Promise((resolve, reject) => {
+        const delay = delays[calls.length] ?? null;
+        calls.push({ timeoutMs: opts.timeoutMs });
+        firstCall();
+        const timer = delay === null ? undefined : setTimeout(() => resolve(GRANT_200), delay);
+        opts.signal?.addEventListener('abort', () => { clearTimeout(timer); reject(new Error('aborted')); }, { once: true });
+      }),
+    };
+    return { calls, http, reached };
+  }
+
+  // On a platform cache miss the grant is minted on the spot, and once started
+  // the platform finishes it even if the client gave up. Observed mints: ~3.7s
+  // typical, ~4s at p99, a few up to ~6s.
+  it('waits out a slow on-the-spot mint (6s) on the first attempt instead of abandoning it', async () => {
+    vi.useFakeTimers();
+    try {
+      const { calls, http, reached } = slowPlatform([6_000, 6_000]);
+      const pending = requestCredentialGrant(REQ, { binding: BINDING, http });
+      await reached;
+      await vi.advanceTimersByTimeAsync(60_000);
+      const r = await pending;
+      expect(r.ok).toBe(true);
+      expect(calls).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('leaves the retry after a silent first attempt at least 4.5s, enough for a typical mint', async () => {
+    vi.useFakeTimers();
+    try {
+      const { calls, http, reached } = slowPlatform([null, 4_500]);
+      const pending = requestCredentialGrant(REQ, { binding: BINDING, http });
+      await reached;
+      await vi.advanceTimersByTimeAsync(60_000);
+      const r = await pending;
+      expect(r.ok).toBe(true);
+      expect(calls).toHaveLength(2);
+      expect(calls[1]!.timeoutMs).toBeGreaterThanOrEqual(4_500);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // A transport may throw BEFORE returning its promise: `postJson` parses the
   // URL and serializes the body ahead of its own `new Promise`, so a malformed
   // binding (`platform.json` hand-edited or from an older build) throws

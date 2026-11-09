@@ -80,7 +80,12 @@ export const GRANT_VARIABLE_KEYS: Record<TriggerUserAuthTool, { required: readon
 
 /**
  * Budgets. A grant sits on the turn's critical path, so the whole call —
- * including its one retry — is capped near the old single-attempt 6s budget.
+ * including its one retry — has a hard cap. On a platform cache miss the grant
+ * is minted on the spot, which takes seconds: the first attempt is long enough
+ * to wait out a slow mint, and the cap still leaves the retry at least 5s,
+ * enough to finish a typical one. The retry needs that much because it rarely
+ * benefits from the first attempt's mint: the platform completes a mint it
+ * started, but the retry can land on another instance and mint again.
  *
  * Why a retry at all: a request that got NO answer (silent socket, reset,
  * timeout) never reached the platform's verdict; one new connection fixes the
@@ -88,8 +93,8 @@ export const GRANT_VARIABLE_KEYS: Record<TriggerUserAuthTool, { required: readon
  * without making the person resend their message. An HTTP status is the
  * platform's answer and is never retried here.
  */
-export const FIRST_ATTEMPT_TIMEOUT_MS = 5_000;
-export const TOTAL_BUDGET_MS = 8_000;
+export const FIRST_ATTEMPT_TIMEOUT_MS = 7_000;
+export const TOTAL_BUDGET_MS = 12_000;
 /** A retry with less time than this left is not worth starting. */
 export const MIN_RETRY_BUDGET_MS = 1_000;
 /** Defense in depth: a grant is a per-turn token. Whatever the platform says,
