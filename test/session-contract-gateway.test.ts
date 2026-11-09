@@ -195,7 +195,8 @@ describe('contract gateway and real worker boundaries', () => {
       invalidateStuckWarning: vi.fn(), invalidateTuiPrompt: vi.fn(), clearIdleAutoCompactStretch: vi.fn(),
       clearPendingSuspendClaim: vi.fn(),
       takeSessionPreviewTarget: () => undefined, sessionStore: { updateSessionPid: vi.fn(), updateSession: vi.fn() },
-      dashboardEventBus: { publish: vi.fn() }, restartCoordinator: { cancelSession: vi.fn() }, logger: { warn: vi.fn(), info: vi.fn() }, tag: () => 'test' };
+      dashboardEventBus: { publish: vi.fn() }, restartCoordinator: { cancelSession: vi.fn() }, logger: { warn: vi.fn(), info: vi.fn() }, tag: () => 'test',
+      clearAcceptedInputTurns: vi.fn() };
     scope.suspendWorker = loadWorkerPoolFunction('suspendWorker', scope);
     const suspend = loadWorkerPoolFunction<(ds: DaemonSession) => Promise<boolean>>('suspendWorkerAsync', scope);
     expect(await suspend(s.ds)).toBe(false);
@@ -540,7 +541,8 @@ describe('contract gateway and real worker boundaries', () => {
       credentialIsolated: false, cliPid: 111, cliProcStart: 'start1' }), execution);
     const worker: any = { send: vi.fn() }; s.ds.worker = worker; s.ds.workerGeneration = 1;
     const handlerScope: any = { sessionController: s.controller, contractWorker: s.worker, ds: s.ds, worker,
-      logger: { debug: vi.fn() }, t: 'test', botCfg: {}, sessionCliId: () => 'claude-code' };
+      workerGeneration: s.ds.workerGeneration,
+      logger: { debug: vi.fn(), warn: vi.fn() }, t: 'test', botCfg: {}, sessionCliId: () => 'claude-code' };
     handlerScope.handleLegacyWorkerMessage = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleLegacyWorkerMessage', handlerScope);
     const handler = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', handlerScope);
     await handler(wire);
