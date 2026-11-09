@@ -71,7 +71,7 @@ async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = 
   delayedHistoryReceipt?: { submission: number; ms: number },
   preflight?: { enabled: boolean; initialPrompt?: string; dispatchAttempt?: number;
     probe?: 'success' | 'timeout' | 'failure'; timeoutMs?: number },
-  restoreInterruptedStructuredTurn = false) {
+  restoreInterruptedStructuredTurn = false, restoreExhaustedOnLast = false) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-auto-model-'));
   roots.push(root);
   const dataDir = join(root, 'session');
@@ -351,6 +351,11 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
       policyKey: traexAutoModelPolicyKey({ enabled: true, trigger: 'quota', models: ['core', 'backup', 'last'],
         queueTimeoutMs: 5000, switchCooldownMs: 5000 }),
       quotaBlocks: ['core', 'backup', 'last'].map(model => ({ model })),
+    } } : {}),
+    ...(restoreExhaustedOnLast ? { traexAutoModelRuntime: {
+      model: 'last', nativeSessionId: nativeId, waitingOnFinalModel: true,
+      policyKey: traexAutoModelPolicyKey({ enabled: true, models: ['core', 'backup', 'last'],
+        queueTimeoutMs: 5000, switchCooldownMs: 5000, reselectPerTurn }),
     } } : {}),
     ...(rpcPolicy ? { codexRpcInput: resolveCodexRpcInput('traex', rpcPolicy.override, rpcPolicy.global) } : {}),
     ...(enabled ? { traexAutoModel: { enabled: true, models: ['core', 'backup', 'last'], queueTimeoutMs: 5_000, switchCooldownMs: 5_000,
@@ -837,6 +842,39 @@ describe('TraeX auto-model real Worker and PTY', () => {
     expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last', 'core']);
     expect(rows(f.submissions).filter(row => row.text.startsWith('next ask'))).toEqual([expect.objectContaining({ model: 'core' })]);
   }, 100_000);
+
+  it('holds a follow-up stamped before the capacity latch until the preferred reset', async () => {
+    // The follow-up arrives right after the submit, before any screen tick
+    // has seen the queue, so nothing tags it to wait behind the active turn.
+    const f = await fixture(true, false, true, undefined, false, undefined, false, undefined, 5_500);
+    f.child.send({ type: 'message', content: 'original ask', turnId: 'om_first' } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).length === 1, 'original submit');
+    f.child.send({ type: 'message', content: 'next ask', turnId: 'om_next' } satisfies DaemonToWorker);
+    await f.wait(() => f.messages.some(message => message.type === 'user_notify' && message.message.includes('均持续排队')), 'exhaustion', 55_000);
+    expect(rows(f.submissions).filter(row => row.text.startsWith('next ask'))).toHaveLength(0);
+    writeFileSync(f.release, 'go');
+    await f.wait(() => {
+      const nextSubmissions = rows(f.submissions).filter(row => row.text.startsWith('next ask'));
+      return rows(f.launches).length === 4
+        && nextSubmissions.length === 1
+        && nextSubmissions[0]!.model === 'core';
+    }, 'next ask relaunched on the preferred model, never typed into the fallback pane');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last', 'core']);
+  }, 100_000);
+
+  it('writes a redelivered turn on an exhausted fallback model restored at idle', async () => {
+    // The entry check keeps a redelivered turn on the current model. The
+    // preferred-reset hold must not re-queue it: the idle composer that
+    // admitted it never draws another ready edge.
+    const f = await fixture(true, false, true, undefined, false, undefined, false, undefined, 0, 0, false, false,
+      undefined, undefined, undefined, false, true);
+    writeFileSync(f.release, 'go');
+    f.child.send({ type: 'message', content: 'redelivered ask', turnId: 'om_redo', dispatchAttempt: 1 } satisfies DaemonToWorker);
+    await f.wait(() => rows(f.submissions).some(row => row.text.startsWith('redelivered ask')), 'redelivered turn written');
+    expect(rows(f.launches).map(row => row.model)).toEqual(['last']);
+    expect(rows(f.submissions).filter(row => row.text.startsWith('redelivered ask')))
+      .toEqual([expect.objectContaining({ model: 'last' })]);
+  }, 60_000);
 
   it('when all loads are high, holds the lowest allowlisted model and publishes its card identity', async () => {
     const f = await fixture(true, 'busy', false, { global: true, override: false });

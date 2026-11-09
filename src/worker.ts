@@ -21132,8 +21132,13 @@ async function flushPending(): Promise<void> {
       // dequeued item back and stop. The preferred relaunch's prompt-ready edge
       // re-drives the flush; the retry timer also re-arms in case that edge is
       // missed. The accessor flips false once the reset commits, releasing it.
+      // Not the first input of a flush that began at a ready prompt: the entry
+      // check already chose its model with real readiness, and one it kept on
+      // the current model (a redelivered or recovery turn, a refused switch)
+      // would wait for a ready edge that an unchanged screen never repeats.
       if (item.turnId
         && item.turnId !== currentBotmuxTurnId
+        && !(promptReadyAtFlushStart && itemsWrittenInThisFlush === 0)
         && traexAutoModelRuntimeEligible()
         && traexAutoModelController?.awaitingPreferredModelReset()) {
         pendingMessages.unshift(item);
