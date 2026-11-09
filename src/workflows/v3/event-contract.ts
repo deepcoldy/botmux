@@ -39,6 +39,14 @@ export type V3ErrorClass =
 export type V3RunFailureReason = 'allSinksSkipped';
 export type V3BlockedRecovery = 'retry' | 'reviseWorkflow';
 
+export interface V3RuntimeAttestation {
+  cliId: string;
+  source: 'worker-active-runtime';
+  model: string | null;
+  reasoningEffort: string | null;
+  codexHome?: string;
+}
+
 export interface V3UncertainHostEffect {
   nodeId: string;
   instanceId: string;
@@ -358,6 +366,7 @@ export type V3Event =
       instanceId?: string;
       attemptId: string;
       manifestPath: string;
+      runtime?: V3RuntimeAttestation;
     }
   | {
       type: 'nodeFailed';
@@ -367,6 +376,7 @@ export type V3Event =
       errorClass: V3ErrorClass;
       errorCode?: string;
       message?: string;
+      runtime?: V3RuntimeAttestation;
     }
   | {
       type: 'nodeBlocked';
@@ -376,6 +386,7 @@ export type V3Event =
       errorClass: V3ErrorClass;
       errorCode?: string;
       message?: string;
+      runtime?: V3RuntimeAttestation;
       recovery?: V3BlockedRecovery;
       ask?: GoalAsk;
       revisitTo?: string;

@@ -3551,6 +3551,7 @@ export async function runWorkflow(
           }
           appendWorkerOutcome({
             type: 'nodeSucceeded', nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, manifestPath: result.manifestPath,
+            ...(result.runtime ? { runtime: result.runtime } : {}),
           });
           return;
         }
@@ -3560,7 +3561,11 @@ export async function runWorkflow(
         let errorCode: string | undefined;
         let selfReportedFail = false;
         let retryable: boolean | undefined;
-        if (!verdict.ok) {
+        if (result.status === 'fail' && result.error) {
+          errorClass = 'workerError';
+          errorCode = result.error.code;
+          message = result.error.message;
+        } else if (!verdict.ok) {
           // Manifest missing / malformed.  If the process itself also failed,
           // the worker crash is the root cause; otherwise it's a bad manifest.
           errorClass = result.status === 'ok' ? 'manifestInvalid' : 'workerError';
@@ -3600,11 +3605,13 @@ export async function runWorkflow(
             type: 'nodeBlocked',
             nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, errorClass, errorCode, message,
             ...(ask ? { ask } : {}),
+            ...(result.runtime ? { runtime: result.runtime } : {}),
           });
         } else {
           appendWorkerOutcome({
             type: 'nodeFailed',
             nodeId: node.id, ...(instanceId ? { instanceId } : {}), attemptId, errorClass, errorCode, message,
+            ...(result.runtime ? { runtime: result.runtime } : {}),
           });
         }
       })

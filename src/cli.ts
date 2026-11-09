@@ -8130,8 +8130,10 @@ ${SEND_HELP_BODY}
 编排 / workflow（v3）:
   goal run <goal> [--run-id <id>] [--bot <id|name>] [--working-dir <dir>]
                   [--timeout <seconds>] [--json]
+                  [--codex-home <absolute-dir> --model <id> --reasoning-effort <level>]
                                        在现有 v3 沙箱/worker 路径运行一个 headless goal；
-                                       同一 run-id 可安全重放终态或接续崩溃运行
+                                       同一 run-id 可安全重放终态或接续崩溃运行；三项 Codex 参数必须成组传入，
+                                       且仅支持无 wrapper、未开沙箱的 Codex bot
   workflow save [last|runId] [名称]
                                        把成功 run 固化为 chat scope Saved Workflow；
                                        发布当前 Bot 全局版本 / 确认 unsafe lint 请由用户在飞书显式发送 /workflow save ...
