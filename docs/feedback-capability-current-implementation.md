@@ -35,7 +35,7 @@
 | 只评价 canonical final output | 已实现 | daemon `final_output` 正常 Lark 交付路径挂反馈；主动发送只有显式 `--response-kind final` 才挂反馈，未声明和显式 progress 都按非 final 发送 |
 | 排除特殊 sink | 已实现 | doc-comment、VC receiver、HTTP wait/async、managed receiver、自定义卡、语音/视频等路径不创建普通 Lark 反馈 delivery |
 | 三态统一语义 | 已实现 | 固定 `positive / progress / negative`；默认 key/文案为 `conclusive_usable/结论可用`、`effective_progress/有效推进`、`incorrect/结论有误` |
-| 呈现层可配置 | 已实现 | 可配按钮 key、文案、style、顺序、可见语义、负向原因、说明框、是否必填、长度及 `allowReselect` |
+| 呈现层可配置 | 已实现 | 可配按钮 key、文案、style、顺序、可见语义、负向原因、说明框、是否必填、长度、`allowReselect` 及 `buttonAlign` |
 | 团队 / bot / 群配置 | Core/API 已实现，Dashboard 基础 UI | local hosted team、bot、bot-scoped chat 三层；显式 `enabled:false` 可关闭继承；Dashboard 以 JSON textarea 编辑 team/bot policy，群下拉可保存覆盖并预览有效策略；尚不支持加载/删除既有 chat layer 的完整 CRUD |
 | 策略快照 | 已实现 | 每条 delivery 保存发送时 effective policy；配置热更新在 daemon worker 路径于下一次 session fork/restart 生效，主动 send 按发送时当前配置生成快照 |
 | 强回答↔执行↔消息关联 | 已实现 | schema v7 保存 bot/session/turn/native session/platform message/chat/topic/attempt/hash/ref/CLI/model/Skill/workflow/task/status/usage 等；delivery ID 包含 native session，terminal reconcile 使用 bot/session/turn/attempt |
@@ -80,6 +80,7 @@ Core 只接受三种语义：
 - `audience: "reviewers"` 用于 bot 触发的自动分析场景（如 Oncall/告警监听，本次 turn 的发送者是另一个 bot、没有单一真人 owner）：改由发送时冻结的 `reviewers` 名单鉴权，名单里任一可信真人身份点击即放行，与是否存在真人 requester 无关。名单可填写 `ou_`、`on_` 或完整邮箱；邮箱会在发卡时解析为当前应用的 `open_id`，回调仍保持零网络鉴权。名单为空时仍展示反馈按钮，但所有点击都会被拒绝。
 - `audience: "everyone"` 允许任意具有平台核验 operator 身份的点击者反馈，不要求 requester，也不需要 `reviewers` 名单。该模式会扩大反馈写入范围，应只用于群成员都可信的场景。
 - `allowReselect` 默认 `false`；只有显式设置 `true` 才允许改选。
+- `buttonAlign` 可选，取值 `left` / `right`，控制按钮行的水平位置；不设置等同于 `left`，此时卡片 JSON 与未引入该字段时完全一致。非 `left` 时，评价按钮行和负向原因按钮行带 `horizontal_align`，「已选择」状态行带 `text_align`，说明表单不变。team / bot / chat 三层均可设置，后面的层覆盖前面的（chat 设为 `left` 可覆盖 bot 的 `right`）；归一化后的 policy 仅在非 `left` 时才带该键，发送时的快照随之保存，旧快照没有该键，按 `left` 渲染。bot 层经 Dashboard 或 `/botconfig` 保存时，显式写的 `left` 会保留在 bots.json 里，用来覆盖 team 层的 `right`。非法取值会报错。
 - 说明框默认开启、非必填，默认最大 1000 字。
 - 负向原因默认可为空，由业务配置。
 - 新配置立即影响后续新卡，旧卡继续使用发送时快照（`reviewers` 名单同样随 delivery 快照冻结）。

@@ -47,6 +47,7 @@ import { getBot, getBotClient } from '../../bot-registry.js';
 import { boundSubjectForTitle, subjectFromArgsString, type ToolSubject } from '../../services/cot-subject.js';
 import { fallbackTurnId, frozenReplyContextForTurn } from '../../core/reply-target.js';
 import { isSilentScheduledTurn } from '../../core/silent-schedule-turns.js';
+import { isSilentMessageListenerSession } from '../../core/message-listener-silence.js';
 import { pendingStartingCardPublication } from '../../core/starting-card-publication.js';
 import { TopicSendError } from '../../cli/topic-send-guard.js';
 import { privateReplyEnabled } from '../../core/private-reply.js';
@@ -54,6 +55,8 @@ import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { withFileLockSync } from '../../utils/file-lock.js';
 import { localeForBot, t } from '../../i18n/index.js';
+import { prepareLocalAddressContent, sanitizeLocalAddressText } from './local-address-policy.js';
+import { localAddressContextForBot } from './local-address-context.js';
 import type { CotEntry, WorkerToDaemon } from '../../types.js';
 import type { DaemonSession } from '../../core/types.js';
 
@@ -64,6 +67,24 @@ interface CotEvent {
   event_type: string;
   content: string;
   timestamp: number;
+}
+
+/** CoT is a separate provider surface. Its entries are complete text nodes;
+ * only displayed fields are prose, while TOOL_CALL_ARGS and IDs are opaque. */
+function prepareCotEvents(events: CotEvent[], appId: string, workingDir?: string): CotEvent[] {
+  const context = localAddressContextForBot(appId, workingDir);
+  return events.map(event => {
+    const field = event.event_type === 'REASONING_MESSAGE_CONTENT' ? 'delta'
+      : event.event_type === 'TOOL_CALL_START' ? 'title'
+        : event.event_type === 'TOOL_CALL_RESULT' ? 'content' : undefined;
+    if (!field) return event;
+    const content = JSON.parse(event.content);
+    if (typeof content[field] !== 'string') return event;
+    const clean = field === 'content' ? prepareLocalAddressContent(content[field], 'post', context)
+      : sanitizeLocalAddressText(content[field], context);
+    return clean === content[field] ? event
+      : { ...event, content: JSON.stringify({ ...content, [field]: clean }) };
+  });
 }
 
 interface CotState {
@@ -114,6 +135,7 @@ interface CotRecoveryBinding extends CotRecoveryIdentity { turnId: string }
 /** Only the persistent, non-isolated agy case can safely continue its native
  * task across worker replacement. Other CLI/backend lifecycles stay unchanged. */
 export function canResumeCotMessage(ds: Pick<DaemonSession, 'session' | 'larkAppId'> & Partial<Pick<DaemonSession, 'initConfig'>>): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return false;
   try {
     const cfg = getBot(ds.larkAppId).config;
     const sandbox = ds.session.sandbox ?? ds.initConfig?.sandbox ?? cfg.sandbox;
@@ -427,6 +449,7 @@ function recoveredCotState(rec: any): CotState {
  * reader starts at EOF; its fresh segment reserves new reasoning node IDs.
  * An unacknowledged old batch may leave a display gap, but must not be replayed. */
 export function resumeCotMessage(ds: DaemonSession, binding?: { turnId: string; dispatchAttempt?: number }): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return false;
   const current = states.get(ds);
   if (current && !current.pausedForRestore && (current.cotId || !current.disabled)) return !current.settled;
   if (!canResumeCotMessage(ds)) return false;
@@ -510,7 +533,7 @@ export async function sweepOrphanCotMessages(
               data: {
                 cot_id: rec.cotId,
                 message_id: rec.messageId,
-                events: interruptedNoticeEvents(rec.larkAppId),
+                events: prepareCotEvents(interruptedNoticeEvents(rec.larkAppId), rec.larkAppId),
               },
               timeout: COT_REQUEST_TIMEOUT_MS,
             } as any);
@@ -566,6 +589,7 @@ function turnKeyOf(msg: { turnId: string; dispatchAttempt?: number }): string {
  *  `/cot show` (`ds.cotForced`) overrides both switches for one turn —
  *  apiOnly and private replies stay hard blocks for this public channel. */
 export function cotEnabled(ds: DaemonSession): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return false;
   try {
     const cfg = getBot(ds.larkAppId).config;
     if (cfg.apiOnly === true) return false;
@@ -732,6 +756,7 @@ async function apiCreate(ds: DaemonSession, state: CotState): Promise<void> {
 
 async function apiAppend(ds: DaemonSession, state: CotState, events: CotEvent[]): Promise<void> {
   if (events.length === 0) return;
+  events = prepareCotEvents(events, ds.larkAppId, ds.workingDir ?? ds.session.workingDir);
   const c = getBotClient(ds.larkAppId);
   // PUT body caps events at 50 per call.
   for (let i = 0; i < events.length; i += 50) {
@@ -1220,6 +1245,7 @@ export function finalizeCotMessage(
   status: 'completed' | 'failed' | 'cancelled' | 'ambiguous',
   dispatchAttempt?: number,
 ): boolean {
+  if (isSilentMessageListenerSession(ds.session)) return false;
   if (!isSilentScheduledTurn(ds, turnId) && !ds.session.hiddenThinkingTurns?.includes(turnId)) {
     retireSupersededCotMarkers(ds, { turnId, dispatchAttempt });
   }

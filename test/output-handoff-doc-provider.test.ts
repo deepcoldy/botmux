@@ -23,6 +23,8 @@ import { replyToDocComment } from '../src/im/lark/doc-comment.js';
 import { OutputDeliveryJournal } from '../src/services/output-delivery-journal.js';
 import { OutputDeliveryCoordinator } from '../src/services/output-delivery-coordinator.js';
 import { outputSnapshot } from '../src/services/universal-output-handoff.js';
+import { LocalAddressOutboundError, prepareLocalAddressContent, sanitizeLocalAddressText } from '../src/im/lark/local-address-policy.js';
+import { localAddressContextForBot } from '../src/im/lark/local-address-context.js';
 
 const appId = 'cli_doc_effect_test';
 const directories: string[] = [];
@@ -61,6 +63,7 @@ function pipeline() {
     requireCallbacks: () => ({ sessionReply: vi.fn() }), sessionCliId: () => 'claude-code',
     getBot: () => ({ config: {} }), readGroupContextAuthorOrigin: () => undefined, turnResultBinding: () => undefined,
     resolveDocCommentTarget: () => target, chunkCommentText: (content: string) => [content], replyToDocComment,
+    sanitizeLocalAddressText, prepareLocalAddressContent, LocalAddressOutboundError, localAddressContextForBot,
     consumeDocCommentTurn: vi.fn(), finalOutputDedupeKey: () => 'doc-dedupe',
     logger: { info: vi.fn(), debug: vi.fn(), error: vi.fn() }, FINAL_OUTPUT_RETRY_BACKOFF_MS: [0, 800, 2000],
   });

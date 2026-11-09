@@ -2362,7 +2362,15 @@ export function buildZmxLaunchFiles(
 ): { bootstrap: string; payload: string } {
   const shellSpec = opts.strictEnv ? { shell: '/bin/sh', flags: [] } : resolveUserShell(process.env, opts.launchShell);
   const shellKind = shellKindForPath(shellSpec.shell);
-  const envAssignments = (opts.strictEnv ? strictPaneEnvArgs(opts) : buildBotmuxEnvAssignments(opts.env, opts.injectEnv, opts.unsetEnv, opts.gitConfigPairs))
+  const envAssignments = (opts.strictEnv
+    ? strictPaneEnvArgs(opts)
+    : buildBotmuxEnvAssignments(
+        opts.env,
+        opts.injectEnv,
+        opts.unsetEnv,
+        opts.gitConfigPairs,
+        opts.protectedUnsetEnv,
+      ))
     .filter(assignment => !/^ZMX_(?:SESSION|SESSION_PREFIX)=/.test(assignment));
   const debugKeepShell = !opts.strictEnv && process.env.BOTMUX_DEBUG_KEEP_SHELL === '1';
   const wrapperBinDir = resolveBotmuxWrapperBinDir(opts.env ?? process.env);
@@ -2544,7 +2552,8 @@ export function zmxFreshSessionEnv(opts: SpawnOpts, socketDir?: string): NodeJS.
 
 /** Strip every payload-delivered key from ZMX control subprocesses. */
 export function zmxControlEnv(opts: SpawnOpts, socketDir?: string): NodeJS.ProcessEnv {
-  const env = zmxEnv(opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env);
+  const env = opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : { ...opts.env };
+  const payloadKeys = new Set(Object.keys(opts.injectEnv ?? {}));
   for (const assignment of buildBotmuxEnvAssignments(opts.env, opts.injectEnv, undefined, opts.gitConfigPairs)) {
     const equals = assignment.indexOf('=');
     if (equals <= 0) continue;
@@ -2553,15 +2562,15 @@ export function zmxControlEnv(opts: SpawnOpts, socketDir?: string): NodeJS.Proce
     // injected payload. ZMX control clients also need the caller's TMPDIR when
     // resolving a socket without an explicit ZMX_DIR.
     if (SESSION_TEMP_ENV_KEYS.some(tempKey => tempKey === key) && opts.injectEnv?.[key] === undefined) continue;
-    delete env[key];
+    payloadKeys.add(key);
   }
-  if (opts.injectEnv) {
-    for (const key of Object.keys(opts.injectEnv)) delete env[key];
-  }
-  // Apply the recorded address AFTER stripping payload keys: per-bot env
-  // must not redirect a control command or remove its frozen namespace.
-  if (socketDir !== undefined) env.ZMX_DIR = socketDir;
-  return env;
+  for (const key of payloadKeys) delete env[key];
+  // A payload PATH (e.g. the Lark identity shim dir) is for the CLI only.
+  // Control clients must still find zmx the way the availability probe did,
+  // through the worker's own PATH. Search paths and the recorded socket
+  // address are applied after stripping so payload keys cannot override them.
+  if (payloadKeys.has('PATH')) env.PATH = process.env.PATH;
+  return zmxEnv(env, socketDir);
 }
 
 export function parseZmxList(output: string): {

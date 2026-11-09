@@ -141,6 +141,22 @@ describe('botConfigInvariantError — sandbox tri-state', () => {
     })).toBeUndefined();
   });
 
+  it('flags zero injection under scratch for CLIs that lose it there (cursor/doubao/antigravity); repair exits stay writable', () => {
+    for (const cliId of ['cursor', 'doubao', 'antigravity']) {
+      expect(botConfigInvariantError({ cliId, promptInjection: 'none', sandbox: 'scratch' })).toBe('zero_prompt_unsupported');
+      // repair exits: leave scratch, or turn zero injection off
+      expect(botConfigInvariantError({ cliId, promptInjection: 'none', sandbox: 'oncall' })).toBeUndefined();
+      expect(botConfigInvariantError({ cliId, promptInjection: 'none' })).toBeUndefined();
+      expect(botConfigInvariantError({ cliId, promptInjection: 'default', sandbox: 'scratch' })).toBeUndefined();
+      expect(botConfigInvariantError({ cliId, sandbox: 'scratch' })).toBeUndefined();
+    }
+    // scratch does not take zero injection away from these
+    expect(botConfigInvariantError({ cliId: 'codex', promptInjection: 'none', sandbox: 'scratch' })).toBeUndefined();
+    expect(botConfigInvariantError({ cliId: 'claude-code', promptInjection: 'none', sandbox: 'scratch' })).toBeUndefined();
+    // a CLI with no zero injection at all is not made worse by scratch; its edits are not locked here
+    expect(botConfigInvariantError({ cliId: 'opencode', promptInjection: 'none', sandbox: 'scratch' })).toBeUndefined();
+  });
+
   // 源码结构护栏(K1)：invariants 处在 config-store→invariants→…→bot-registry 环的一边，
   // 从 core/reply-delivery 导入能力判据会把环闭成 bun 模块链接期错误（CI bun-test
   // summary-command-window 实测），vitest 对环宽容、行为测试测不出来，只能钉 import 边。

@@ -15,12 +15,14 @@ import {
 } from './ui.js';
 import { buildBotCards, loadGroupsSnapshot, type BotCard } from './overview.js';
 import { requestOpenCreateSession } from './create-session-entry.js';
+import { deriveSessionTaskStatus } from '../../core/session-task-status.js';
 import { DocCommentFailures } from './doc-comment-failures.js';
 import {
   CreateActionButton,
   HeaderAction,
   HeaderControls,
   Html,
+  IconTip,
   OverviewList,
   OverviewListItem,
   OverviewListMain,
@@ -33,8 +35,6 @@ type SessionRow = Record<string, any> & { sessionId: string };
 type ScheduleRow = Record<string, any> & { id: string };
 type ActiveSortMode = 'time' | 'attention';
 
-/** 「进行中」口径：working / analyzing / active（starting 是过渡态，不计入）。 */
-const WORKING_STATUSES = new Set(['working', 'analyzing', 'active']);
 const TEAM_EXPAND_KEY = 'botmux.overview.teamExpanded';
 const ACTIVE_SORT_KEY = 'botmux.overview.activeSort';
 const TEAM_DESKTOP_COLUMNS = 5;
@@ -243,18 +243,19 @@ function MateCard({ card }: { card: BotCard }) {
   return (
     <article className={`mate${needsYou ? ' mate-attn' : ''}${offline ? ' mate-off' : ''}`}>
       {consoleUrl ? (
-        <a
-          className="mate-console"
-          href={consoleUrl}
-          target="_blank"
-          rel="noopener noreferrer"
-          data-tip={tr('overview.botConsole')}
-          aria-label={tr('overview.botConsole')}
-        >
-          <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <path d="M7 17 17 7M9 7h8v8" />
-          </svg>
-        </a>
+        <IconTip label={tr('overview.botConsole')}>
+          <a
+            className="mate-console"
+            href={consoleUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            aria-label={tr('overview.botConsole')}
+          >
+            <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M7 17 17 7M9 7h8v8" />
+            </svg>
+          </a>
+        </IconTip>
       ) : null}
       <div className="mate-top">
         <Html html={botAvatarHtml({ name: card.botName, larkAppId: card.larkAppId, avatarUrl: card.botAvatarUrl, dot: dotClass })} />
@@ -401,10 +402,10 @@ function OverviewPage() {
     () => sortActiveSessions(attentionAll, activeSortMode).slice(0, ATTENTION_LIST_CAP),
     [attentionAll, activeSortMode],
   );
-  // 「进行中」：只保留 working/analyzing/active，按最近消息排序。
+  // 「进行中」：会话任务状态为进行中的，按最近消息排序。
   const workingAll = useMemo(
     () => active
-      .filter(s => WORKING_STATUSES.has(String(s.status)))
+      .filter(s => deriveSessionTaskStatus(s).kind === 'working')
       .sort((a, b) => Number(b.lastMessageAt ?? 0) - Number(a.lastMessageAt ?? 0)),
     [active],
   );

@@ -46,6 +46,7 @@ import { isUsableOpenId } from '../utils/user-token.js';
 import { logger } from '../utils/logger.js';
 import { ensureSessionTempLayout, sessionTempDir, sessionTempDirWithoutAlias } from './session-temp.js';
 import { ensureBackgroundJobHome } from '../services/bytedcli-home.js';
+import { resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 
 export type { IdentityStorageModel };
 
@@ -624,14 +625,33 @@ const BYTEDCLI_REGIONAL_JWT_VARS: Record<BytedcliRegion, string> = {
 const BYTEDCLI_SITE_REGIONS: Record<BytedcliRegion, readonly string[]> = {
   // The site `i18n` belongs to i18nbd; the i18n region uses i18n-tt.
   i18n: ['i18n-tt', 'eu-ttp', 'eu-ttp-limited', 'eu-ttp-full'],
-  i18nbd: ['i18n', 'i18n-bd'],
-  tx: ['us-ttp', 'us-ttp-bdee', 'us-ttp-usts', 'us-ttpbd'],
+  // us-ttpbd cannot be minted (auth commands reject it): it is scoped to
+  // bmq / apm argos log / cloud-ticket, which all request an i18n-bd JWT.
+  i18nbd: ['i18n', 'i18n-bd', 'us-ttpbd'],
+  tx: ['us-ttp', 'us-ttp-bdee', 'us-ttp-usts'],
 };
+/** bytedcli's CLOUD_SITE_ALIAS_MAP (identical in 0.173–0.187). Aliases of a
+ *  site without a regional token need no entry in the case below. */
+const BYTEDCLI_SITE_ALIASES: Readonly<Record<string, string>> = {
+  prod: 'cn', online: 'cn', 'sinf-cn': 'cn', boei18n: 'boe', 'boe-i18n': 'boe',
+  row: 'i18n-tt', i18ntt: 'i18n-tt', 'tiktok-row': 'i18n-tt',
+  usttp: 'us-ttp', 'tx-ttp': 'us-ttp', 'ttp-us': 'us-ttp', 'ttp-us-limited': 'us-ttp',
+  usttpbdee: 'us-ttp-bdee', usttpusts: 'us-ttp-usts',
+  euttp: 'eu-ttp', 'ttp-eu': 'eu-ttp',
+};
+
+/** Case pattern matching `site` in any letter case. */
+function anyCaseGlob(site: string): string {
+  return site.replace(/[a-z]/g, c => `[${c}${c.toUpperCase()}]`);
+}
 
 /** Shell lines selecting the regional ByteCloud JWT for this call's site. */
 function bytedcliRegionalSelection(): string[] {
-  const cases = (Object.keys(BYTEDCLI_SITE_REGIONS) as BytedcliRegion[]).map(region =>
-    `    ${BYTEDCLI_SITE_REGIONS[region].join('|')}) __botmux_regional=$${BYTEDCLI_REGIONAL_JWT_VARS[region]} ;;`);
+  const cases = (Object.keys(BYTEDCLI_SITE_REGIONS) as BytedcliRegion[]).map(region => {
+    const sites = BYTEDCLI_SITE_REGIONS[region];
+    const aliases = Object.keys(BYTEDCLI_SITE_ALIASES).filter(alias => sites.includes(BYTEDCLI_SITE_ALIASES[alias]));
+    return `    ${[...sites, ...aliases].map(anyCaseGlob).join('|')}) __botmux_regional=$${BYTEDCLI_REGIONAL_JWT_VARS[region]} ;;`;
+  });
   return [
     '  __botmux_site=${BYTEDCLI_CLOUD_SITE:-}',
     '  __botmux_next=',
@@ -645,6 +665,9 @@ function bytedcliRegionalSelection(): string[] {
     '      --site=*) __botmux_site=${__botmux_arg#--site=} ;;',
     '    esac',
     '  done',
+    // bytedcli trims and lowercases the site before resolving it.
+    '  __botmux_site=${__botmux_site#"${__botmux_site%%[![:space:]]*}"}',
+    '  __botmux_site=${__botmux_site%"${__botmux_site##*[![:space:]]}"}',
     '  __botmux_regional=',
     '  case "$__botmux_site" in',
     ...cases,
@@ -1433,8 +1456,14 @@ export function installLoginShellPathShim(binDir: string): { zdotdir: string; ba
   const reprepend = [
     '# botmux trigger-user identity — generated, do not edit.',
     '# Re-prepend the wrapper dir AFTER path_helper has rebuilt PATH.',
+    'if [ -n "${BOTMUX_WRAPPER_BIN:-}" ]; then',
+    '  case "$PATH:" in',
+    '    "$BOTMUX_WRAPPER_BIN":*) ;;',
+    '    *) PATH="$BOTMUX_WRAPPER_BIN${PATH:+:$PATH}"; export PATH ;;',
+    '  esac',
+    'fi',
     'if [ -n "$BOTMUX_IDENTITY_BIN" ]; then',
-    '  case ":$PATH:" in',
+    '  case "$PATH:" in',
     '    "$BOTMUX_IDENTITY_BIN":*) ;;',
     '    *) PATH="$BOTMUX_IDENTITY_BIN${PATH:+:$PATH}"; export PATH ;;',
     '  esac',
@@ -1846,6 +1875,7 @@ export function prepareTriggerUserCliEnv(
     try {
       const { zdotdir, bashEnv } = installLoginShellPathShim(wrapperDir);
       childEnv.BOTMUX_IDENTITY_BIN = wrapperDir;
+      childEnv.BOTMUX_WRAPPER_BIN = resolveBotmuxWrapperBinDir(childEnv);
       childEnv.ZDOTDIR = zdotdir;
       childEnv.BASH_ENV = bashEnv;
     } catch (e) {

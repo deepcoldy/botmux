@@ -81,6 +81,7 @@ export const COMMANDS: readonly CommandSpec[] = [
   { name: '/restart', sessionPolicy: 'default', help: ['help.restart'] },
   { name: '/status', sessionPolicy: 'default', help: ['help.status'] },
   { name: '/models', sessionPolicy: 'sessionless', help: ['help.models'] },
+  { name: '/modelpin', sessionPolicy: 'existingOnly', help: ['help.modelpin'] },
   { name: '/retry', sessionPolicy: 'default', help: ['help.retry'] },
   {
     name: '/rewind', sessionPolicy: 'existingOnly', help: ['help.rewind'],
@@ -235,7 +236,7 @@ export function commandSpec(cmd: string): CommandSpec | undefined {
  * declaring one would never receive it.
  */
 const PRE_ROUTING_COMMANDS: ReadonlySet<string> = new Set([
-  '/grant', '/revoke', '/introduce', '/summary', '/tabs', '/tab', '/mention-mode',
+  '/grant', '/revoke', '/introduce', '/summary', '/tabs', '/tab', '/mention-mode', '/secretary',
   '/substitute', '/reply-mode', '/workflow', '/template', '/invite',
 ]);
 

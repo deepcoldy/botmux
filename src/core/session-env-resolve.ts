@@ -37,15 +37,17 @@ export interface SessionEnvLaunchFacts {
    *  one-shot CLI process, a v3 workflow worker. */
   unwrapped?: boolean;
   /** The lark tool binding is off for this session although the bot enables
-   *  it: no IM transport (HTTP virtual chat) or an external Codex App Server
-   *  (worker.ts usesLarkToolBinding). */
+   *  it. Daemon callers derive it from larkToolBindingEffective, the same
+   *  predicate the worker's usesLarkToolBinding applies (HTTP virtual chat,
+   *  adopt, external Codex App Server, remote backend; a verified headless
+   *  session keeps the binding). */
   larkBindingOff?: boolean;
 }
 
 /**
  * Identity wrappers a launch runs (sessionEnvLock). Mirrors the worker's
- * gates: the lark tool binding is on unless disabled, transport-less, remote
- * or off for the session (usesLarkToolBinding); trigger-user auth is opt-in.
+ * gates: the lark tool binding is on unless disabled, apiOnly, remote or off
+ * for the session (larkBindingOff, see usesLarkToolBinding); trigger-user auth is opt-in.
  * Without launch facts this is the bot-level view the Dashboard edits against.
  */
 export function sessionEnvLockContextForBot(bot: SessionEnvBotInput, facts: SessionEnvLaunchFacts = {}): SessionEnvLockContext {
@@ -101,7 +103,9 @@ export function resolveSessionEnv(input: {
     const bot = botEnvLayer(input.bot);
     composed = composeSessionEnv(
       [input.global ?? readGlobalSessionEnvLayer(), input.skipBotSet ? { set: {}, unset: bot.unset } : bot],
-      sessionEnvLockContextForBot(input.bot, input.facts),
+      // The wrapper follows the backend this launch runs on, which a session can
+      // pin away from the bot's default (worker.ts usesLarkToolBinding).
+      sessionEnvLockContextForBot({ ...input.bot, backendType: input.backendType }, input.facts),
     );
   }
   return {

@@ -2,7 +2,8 @@
 // 管家配置的保存载荷。不碰 DOM、不发请求，页面和测试都直接 import。
 //
 // 类型只从 core 模型 type-import：那个模块会连带拉进 lark-hosts 等服务端代码，
-// 值导入会把它们打进浏览器 bundle。
+// 值导入会把它们打进浏览器 bundle。files.js 不依赖任何模块，可以值导入。
+import { boardFileKind, type BoardFileKind } from '../../core/decision-board/files.js';
 import type {
   BoardBatch,
   BoardChatCheck,
@@ -10,6 +11,8 @@ import type {
   BoardDraft,
   BoardEvent,
   BoardFile,
+  BoardHint,
+  BoardHintKind,
   BoardItem,
   BoardLinkKind,
   BoardState,
@@ -17,9 +20,15 @@ import type {
   StewardConfig,
   StewardGuideMode,
 } from '../../core/decision-board/model.js';
+import type { ChatTaskKind, ChatTaskState, TaskHint, TaskHintKind } from '../../core/decision-board/chat-task.js';
+import type { NeedsYouReason } from '../../core/session-task-status.js';
+
+export type { ChatTaskKind, ChatTaskState, TaskHint, TaskHintKind };
 
 export type {
   BoardBatch,
+  BoardHint,
+  BoardHintKind,
   BoardDecision,
   BoardDraft,
   BoardEvent,
@@ -66,13 +75,22 @@ export interface DraftStamp {
   updatedAt: number;
 }
 
-export interface BoardItemSummary extends BoardItem {
+/** 关联群里的子任务：各群状态、是否有管家还没处理的新结果、子任务提示（旧 daemon 不带）。 */
+export interface ItemTaskFields {
+  taskChats?: ChatTaskState[];
+  taskFresh?: boolean;
+  taskHint?: TaskHint;
+}
+
+export interface BoardItemSummary extends BoardItem, ItemTaskFields {
   links: RenderedLink[];
   hasDraft: boolean;
   pendingDecisions: number;
   unseen: boolean;
   url?: string;
   appLink?: string;
+  /** 图文说明（说明页 + 视频）个数；没有或旧 daemon 不带。 */
+  explainers?: number;
 }
 
 // ─── 事项关联的群 ─────────────────────────────────────────────────────────────
@@ -114,7 +132,7 @@ export interface BoardListResponse {
   batches: BoardBatch[];
 }
 
-export interface BoardDetailResponse {
+export interface BoardDetailResponse extends ItemTaskFields {
   item: BoardItem;
   links: RenderedLink[];
   events: BoardEvent[];
@@ -291,6 +309,76 @@ export const BOARD_ACTOR_LABEL_KEYS: Readonly<Record<BoardEvent['actor'], string
   system: 'decisionBoard.actorSystem',
 };
 
+/** 巡检提示的标签：建议关闭 / 建议推进 / 该看一眼。 */
+export const BOARD_HINT_LABEL_KEYS: Readonly<Record<BoardHintKind, string>> = {
+  close: 'decisionBoard.hintClose',
+  advance: 'decisionBoard.hintAdvance',
+  stale: 'decisionBoard.hintStale',
+};
+
+/** 认得的提示才显示（新 daemon 加了别的类型、旧页面不认时不显示半截标签）。 */
+export function knownHint(hint: BoardHint | undefined): BoardHint | undefined {
+  return hint && Object.prototype.hasOwnProperty.call(BOARD_HINT_LABEL_KEYS, hint.kind) ? hint : undefined;
+}
+
+/** 关联群状态的标签。 */
+export const CHAT_TASK_LABEL_KEYS: Readonly<Record<ChatTaskKind, string>> = {
+  needs_you: 'decisionBoard.taskNeedsYou',
+  interrupted: 'decisionBoard.taskInterrupted',
+  working: 'decisionBoard.taskWorking',
+  unreadable: 'decisionBoard.taskUnreadable',
+  delivered: 'decisionBoard.taskDelivered',
+  idle: 'decisionBoard.taskIdle',
+  closed: 'decisionBoard.taskClosed',
+  no_session: 'decisionBoard.taskNoSession',
+};
+
+const CHAT_TASK_ORDER: readonly ChatTaskKind[] = ['needs_you', 'interrupted', 'working', 'unreadable', 'delivered', 'idle', 'closed', 'no_session'];
+
+const NEEDS_YOU_REASON_KEYS: Readonly<Record<NeedsYouReason, string>> = {
+  attention: 'sessions.task.reasonAttention',
+  tui_prompt: 'sessions.task.reasonPrompt',
+  pending_repo: 'sessions.board.signalRepo',
+  limited: 'sessions.board.signalLimited',
+  stalled: 'sessions.board.signalStalled',
+  interrupted: 'sessions.task.reasonInterrupted',
+};
+
+export const TASK_HINT_LABEL_KEYS: Readonly<Record<TaskHintKind, string>> = {
+  task_delivered: 'decisionBoard.taskHintDelivered',
+  task_needs_you: 'decisionBoard.taskHintNeedsYou',
+  task_interrupted: 'decisionBoard.taskHintInterrupted',
+};
+
+export function knownTaskHint(hint: TaskHint | undefined): TaskHint | undefined {
+  return hint && Object.prototype.hasOwnProperty.call(TASK_HINT_LABEL_KEYS, hint.kind) ? hint : undefined;
+}
+
+function knownChatTask(state: ChatTaskState): boolean {
+  return Object.prototype.hasOwnProperty.call(CHAT_TASK_LABEL_KEYS, state.kind);
+}
+
+/** 一个群的状态一行：标签（需要你带原因）、时间、一句话（最终回复第一行 / 举手原因 / 错误码）。 */
+export function chatTaskLine(state: ChatTaskState, now: number, tr: Translate): { label: string; time?: string; text?: string } | null {
+  if (!knownChatTask(state)) return null;
+  const kind = tr(CHAT_TASK_LABEL_KEYS[state.kind]);
+  const label = state.kind === 'needs_you' && state.reason && state.reason !== 'attention'
+    ? `${kind} · ${tr(NEEDS_YOU_REASON_KEYS[state.reason])}`
+    : kind;
+  const showTime = state.at !== undefined && state.kind !== 'closed';
+  const text = state.summary ?? state.detail;
+  return { label, ...(showTime ? { time: boardRelativeTime(state.at, now, tr) } : {}), ...(text ? { text } : {}) };
+}
+
+/** 多群汇总：「3 个群：1 进行中 · 2 已交付」。按「需要你→…→没有会话」的顺序。 */
+export function chatTaskSummaryText(states: readonly ChatTaskState[], tr: Translate): string {
+  const known = states.filter(knownChatTask);
+  const counts = new Map<ChatTaskKind, number>();
+  for (const s of known) counts.set(s.kind, (counts.get(s.kind) ?? 0) + 1);
+  const parts = CHAT_TASK_ORDER.filter(k => counts.has(k)).map(k => `${counts.get(k)} ${tr(CHAT_TASK_LABEL_KEYS[k])}`);
+  return tr('decisionBoard.taskSummary', { n: known.length, parts: parts.join(' · ') });
+}
+
 export const BOARD_EVENT_KIND_KEYS: Readonly<Record<BoardEvent['kind'], string>> = {
   create: 'decisionBoard.eventCreate',
   note: 'decisionBoard.eventNote',
@@ -300,6 +388,7 @@ export const BOARD_EVENT_KIND_KEYS: Readonly<Record<BoardEvent['kind'], string>>
   reply: 'decisionBoard.eventReply',
   attach: 'decisionBoard.eventAttach',
   link: 'decisionBoard.eventLink',
+  hint: 'decisionBoard.eventHint',
 };
 
 /** 「待拍板·在审」：状态 + 自由文本阶段。 */
@@ -388,6 +477,45 @@ export function checkBoardImages(files: ReadonlyArray<{ type: string; size: numb
   if (files.some(f => f.size > BOARD_IMAGE_MAX_BYTES)) return { ok: false, reason: 'size' };
   if (existing + files.length > BOARD_FILES_PER_DRAFT) return { ok: false, reason: 'count' };
   return { ok: true };
+}
+
+// ─── 图文说明 ─────────────────────────────────────────────────────────────────────
+
+export type { BoardFileKind };
+
+export interface BoardExplainer {
+  id: string;
+  kind: 'html' | 'video';
+  name: string;
+  bytes: number;
+  createdAt: number;
+}
+
+/**
+ * 说明页嵌在页内时 iframe 的 sandbox：空串 = 全部限制（不跑脚本、不透明源、不能弹窗 / 提交表单 / 导航顶层）。
+ * 和响应头里的 CSP sandbox 是两道闸，哪一道单独都够。
+ */
+export const BOARD_EXPLAINER_SANDBOX = '';
+
+/** 事项的图文说明（说明页和视频），新附的在前；截图不算。 */
+export function boardExplainers(files: readonly BoardFile[]): BoardExplainer[] {
+  const out: BoardExplainer[] = [];
+  for (const f of files) {
+    const kind = boardFileKind(f.mime);
+    if (kind === 'html' || kind === 'video') out.push({ id: f.id, kind, name: f.name, bytes: f.bytes, createdAt: f.createdAt });
+  }
+  return out.sort((a, b) => b.createdAt - a.createdAt);
+}
+
+/** 历史里一个附件怎么显示：不在文件列表里的按截图处理（和以前一样）。 */
+export function eventFileKind(id: string, files: ReadonlyMap<string, BoardFile>): BoardFileKind {
+  const file = files.get(id);
+  return (file && boardFileKind(file.mime)) || 'image';
+}
+
+export function formatBoardBytes(bytes: number): string {
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
 // ─── 提交 ───────────────────────────────────────────────────────────────────
@@ -540,6 +668,12 @@ export interface StewardForm {
   autoJoinNewGroups: boolean;
   /** 只有一个人和一个 bot 的新群也带上管家；默认关。 */
   autoJoinSoloGroups: boolean;
+  /** 待拍板时往管家群发能直接点选项的卡片；默认开。 */
+  decisionCards: boolean;
+  /** 后台巡检找出可以关 / 可以推进 / 该看一眼的事项；默认关。 */
+  closeHints: boolean;
+  /** 关联群里一轮交付 / 举手 / 中断时提醒管家；默认关。 */
+  taskHints: boolean;
 }
 
 export function stewardFormFrom(cfg: StewardConfig | null | undefined): StewardForm {
@@ -550,6 +684,9 @@ export function stewardFormFrom(cfg: StewardConfig | null | undefined): StewardF
     guideText: cfg?.guideText ?? '',
     autoJoinNewGroups: cfg?.autoJoinNewGroups !== false,
     autoJoinSoloGroups: cfg?.autoJoinSoloGroups === true,
+    decisionCards: cfg?.decisionCards !== false,
+    closeHints: cfg?.closeHints === true,
+    taskHints: cfg?.taskHints === true,
   };
 }
 
@@ -568,9 +705,13 @@ export function stewardPayload(form: StewardForm): StewardConfig | null {
     ...(guideText ? { guideText } : {}),
     ...(form.autoJoinNewGroups ? {} : { autoJoinNewGroups: false }),
     ...(form.autoJoinSoloGroups ? { autoJoinSoloGroups: true } : {}),
+    ...(form.decisionCards ? {} : { decisionCards: false }),
+    ...(form.closeHints ? { closeHints: true } : {}),
+    ...(form.taskHints ? { taskHints: true } : {}),
   };
   if (!value.enabled && !value.chatId && !value.guideMode && !value.guideText
-    && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true) return null;
+    && value.autoJoinNewGroups !== false && value.autoJoinSoloGroups !== true && value.closeHints !== true
+    && value.decisionCards !== false && value.taskHints !== true) return null;
   return value;
 }
 

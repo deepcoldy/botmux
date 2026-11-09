@@ -77,7 +77,9 @@ const closeSessionMock = vi.fn(async () => ({ ok: true, outcome: 'closed', alrea
 const deliverWriteLinkCardMock = vi.fn();
 const deliverEphemeralOrReplyMock = vi.fn(async (_ds: any, _who: string, card: string) => card);
 
+const writeSessionModelPinMock = vi.fn((ds: any, pin: any) => { ds.session.modelPin = pin; return true; });
 vi.mock('../src/core/worker-pool.js', () => ({
+  writeSessionModelPin: (ds: any, pin: any) => writeSessionModelPinMock(ds, pin),
   topicReasoningControl: (...a: any[]) => topicReasoningControlMock(...a),
   setTopicReasoningEffort: (...a: any[]) => setTopicReasoningEffortMock(...a),
   isSessionRestartInFlight: (...a: any[]) => isSessionRestartInFlightMock(...a),
@@ -107,6 +109,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getDaemonStreamingCardUsageSnapshot: vi.fn(() => undefined),
   withActiveSessionKeyLock: vi.fn(async (_m: any, _k: string, action: () => any) => action()),
   buildStreamingCardJson: vi.fn(() => '{"elements":[]}'),
+  substituteCardControlFor: vi.fn(() => undefined),
   idleCardLabel: vi.fn(() => undefined),
   dshRuntimeForSession: vi.fn(() => undefined),
 }));
@@ -267,6 +270,7 @@ function enableMenu(cliId = 'claude-code') {
 }
 
 beforeEach(() => {
+  writeSessionModelPinMock.mockReset().mockImplementation((ds: any, pin: any) => { ds.session.modelPin = pin; return true; });
   topicReasoningControlMock.mockReset().mockReturnValue(undefined);
   setTopicReasoningEffortMock.mockReset().mockReturnValue('saved');
   isSessionRestartInFlightMock.mockReset().mockReturnValue(false);
@@ -441,7 +445,8 @@ describe('reply_model_pick action', () => {
     expect(deliver.mock.calls[0][1]).toBe('/model sonnet');
     expect(deliver.mock.calls[0][2].anchor).toBeTruthy();
     expect(result.toast.type).toBe('success');
-    expect(result.toast.content).toContain('/model sonnet');
+    expect(ds.session.modelPin).toMatchObject({ model: 'sonnet', source: 'card', setBy: OWNER });
+    expect(requestSessionRestartMock).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'card' }));
   });
 
   it('refuses a slug missing from the catalogue even if character-legal', async () => {
@@ -458,6 +463,17 @@ describe('reply_model_pick action', () => {
     const ds = makeDs();
     const deliver = vi.fn();
     const result = await handleCardAction(pickData('sonnet\nrm -rf /'), depsWith(ds, deliver), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(deliver).not.toHaveBeenCalled();
+  });
+
+  it('keeps refusing #variant slugs on the PTY-injected session picker', async () => {
+    enableMenu();
+    const ds = makeDs();
+    const deliver = vi.fn();
+    // Even when the catalogue advertises it, the injected command stays strict.
+    detectModelsMock.mockResolvedValue(['sonnet', 'sonnet#thinking']);
+    const result = await handleCardAction(pickData('sonnet#thinking'), depsWith(ds, deliver), LARK_APP_ID);
     expect(result.toast.type).toBe('warning');
     expect(deliver).not.toHaveBeenCalled();
   });
@@ -966,6 +982,30 @@ describe('/models bot defaults at top level', () => {
     expect(select.options.map((o: any) => o.value)).toContain('model-74');
   });
 
+  it('shows a stored #variant default as selected and lets it be re-submitted', async () => {
+    const stored = 'minimax/MiniMax-M3.1-Flash#thinking';
+    const card = JSON.parse(buildDefaultModelPickerCard(LARK_APP_ID, ['minimax/MiniMax-M3'], stored, 'zh', 'minimax', { cliId: 'minimax', effort: 'xhigh' }));
+    const [modelSelect, effortSelect] = card.elements.filter((e: any) => e.tag === 'action').map((e: any) => e.actions[0]);
+    expect(modelSelect.initial_option).toBe(stored);
+    expect(modelSelect.options.map((o: any) => o.value)).toContain(stored);
+    expect(effortSelect.initial_option).toBe('xhigh');
+
+    adminBot();
+    vi.mocked(findConfigField).mockReturnValue(modelSpec);
+    vi.mocked(coerceConfigValue).mockReturnValue({ ok: true, value: stored } as any);
+    vi.mocked(applyConfigField).mockResolvedValue({ ok: true, newText: stored, effect: 'next-session' } as any);
+    await handleCardAction(defaultPick(stored), depsWith(undefined), LARK_APP_ID);
+    expect(applyConfigField).toHaveBeenCalledWith(LARK_APP_ID, modelSpec, stored, expect.objectContaining({ requireLaunchModelSupport: true }));
+  });
+
+  it.each(['opus#', 'opus#a b', 'opus#x\n/clear', 'opus#a#b'])('still rejects a malformed default model value: %j', async model => {
+    adminBot();
+    vi.mocked(findConfigField).mockReturnValue(modelSpec);
+    const result = await handleCardAction(defaultPick(model), depsWith(undefined), LARK_APP_ID);
+    expect(applyConfigField).not.toHaveBeenCalled();
+    expect(result.toast.type).not.toBe('success');
+  });
+
   it('clears the default through the same model field', async () => {
     const bot = adminBot();
     vi.mocked(findConfigField).mockReturnValue(modelSpec);
@@ -1015,7 +1055,7 @@ describe('/models topic reasoning effort', () => {
     expect(effort.value).toMatchObject({ action: 'session_effort_pick', session_id: SID, expected_model: 'sonnet' });
     expect(effort.options.map((o: any) => o.value)).toEqual(['low', 'medium', 'high']);
     const result = await handleCardAction(action(effort.value, 'low'), depsWith(ds), LARK_APP_ID);
-    expect(setTopicReasoningEffortMock).toHaveBeenCalledWith(ds, 'low');
+    expect(setTopicReasoningEffortMock).toHaveBeenCalledWith(ds, 'low', { source: 'card', setBy: OWNER });
     expect(requestSessionRestartMock).not.toHaveBeenCalled();
     expect(applyConfigField).not.toHaveBeenCalled();
     expect(result.card.data.elements.some((e: any) => e.tag === 'action' && e.actions.some((a: any) => a.value?.action === 'session_effort_apply'))).toBe(true);
@@ -1229,4 +1269,90 @@ describe('reply_card_menu terminal option under a bound platform', () => {
     expect(deliverWriteLinkCardMock).toHaveBeenCalledTimes(1);
     expect(result.toast.type).toBe('success');
   });
+});
+
+describe('explicit model pin owner surfaces', () => {
+  it('sets command provenance and clears via --follow-bot without forwarding a native /model command', async () => {
+    const ds = makeDs(); const deps = depsWith(ds);
+    await handleCommand('/modelpin', ROOT, { messageId: 'om_pin', senderId: OWNER, content: '/modelpin sonnet high' } as any, deps, LARK_APP_ID);
+    expect(ds.session.modelPin).toMatchObject({ model: 'sonnet', effort: 'high', source: 'command', setBy: OWNER });
+    await handleCommand('/modelpin', ROOT, { messageId: 'om_unpin', senderId: OWNER, content: '/modelpin --follow-bot' } as any, deps, LARK_APP_ID);
+    expect(ds.session.modelPin).toBeUndefined();
+  });
+  it.each(['command', 'card'])('a non-operator cannot clear a pin via %s', async kind => {
+    const ds = makeDs(); ds.session.modelPin = { model: 'sonnet', source: 'command', setBy: OWNER, setAt: 'now' };
+    vi.mocked(canOperate).mockReturnValue(false);
+    if (kind === 'command') await handleCommand('/modelpin', ROOT, { senderId: 'other', content: '/modelpin --follow-bot' } as any, depsWith(ds), LARK_APP_ID);
+    else { const data = pickData('sonnet'); data.action.value.action = 'session_model_unpin'; await handleCardAction(data, depsWith(ds), LARK_APP_ID); }
+    expect(ds.session.modelPin.model).toBe('sonnet');
+  });
+});
+
+describe('pin clear card freshness', () => {
+  it('an old pin card cannot clear a newer explicit selection', async () => {
+    const ds = makeDs(); ds.session.modelPin = { model: 'sonnet', source: 'command', setBy: OWNER, setAt: 'new' };
+    const data = pickData('sonnet'); data.action.value.action = 'session_model_unpin'; data.action.value.expected_pin_set_at = 'old';
+    expect((await handleCardAction(data, depsWith(ds), LARK_APP_ID)).toast.type).toBe('warning');
+    expect(ds.session.modelPin.setAt).toBe('new');
+  });
+  it('the current owner-bound pin card clears the matching selection', async () => {
+    const ds = makeDs(); ds.session.modelPin = { model: 'sonnet', source: 'command', setBy: OWNER, setAt: 'current' };
+    const data = pickData('sonnet'); data.action.value.action = 'session_model_unpin'; data.action.value.expected_pin_set_at = 'current';
+    expect((await handleCardAction(data, depsWith(ds), LARK_APP_ID)).toast.type).toBe('success');
+    expect(ds.session.modelPin).toBeUndefined();
+  });
+});
+
+describe('model pin explicit entry semantics', () => {
+  async function useRealWriter() {
+    const actual = await vi.importActual<typeof import('../src/core/worker-pool.js')>('../src/core/worker-pool.js');
+    actual.__testOnly_resetRestartCoordinator();
+    writeSessionModelPinMock.mockImplementation(actual.writeSessionModelPin);
+    return actual;
+  }
+  it('unpinning an unpinned topic through the command is a side-effect-free no-op', async () => {
+    const pool = await useRealWriter(); const ds = makeDs();
+    const storage = await import('../src/services/session-store.js'); vi.mocked(storage.updateSession).mockClear();
+    const { dashboardEventBus } = await import('../src/core/dashboard-events.js'); const publish = vi.spyOn(dashboardEventBus, 'publish');
+    const before = pool.latestPinEffortForRespawn(ds);
+    await handleCommand('/modelpin', ROOT, { senderId: OWNER, content: '/modelpin --follow-bot' } as any, depsWith(ds), LARK_APP_ID);
+    expect(storage.updateSession).not.toHaveBeenCalled(); expect(publish).not.toHaveBeenCalled(); publish.mockRestore();
+    expect(requestSessionRestartMock).not.toHaveBeenCalled(); expect(ds.modelPinCleared).toBeUndefined();
+    expect(pool.latestPinEffortForRespawn(ds)).toEqual(before);
+  });
+  it.each(['command', 'card'])('%s shows a saved but shadowed pin without restarting or clearing the override', async kind => {
+    await useRealWriter(); enableMenu('claude-code'); const ds = makeDs({ spawnModelOverride: 'opus' });
+    const deliver = vi.fn(); const deps = depsWith(ds, deliver);
+    if (kind === 'command') await handleCommand('/modelpin', ROOT, { senderId: OWNER, content: '/modelpin sonnet high' } as any, deps, LARK_APP_ID);
+    else {
+      const data = pickData('sonnet'); const result = await handleCardAction(data, deps, LARK_APP_ID);
+      expect(result.toast.content).toContain('spawn-override'); expect(deliver).not.toHaveBeenCalled();
+    }
+    expect(ds.session.modelPin?.model).toBe('sonnet'); expect(ds.spawnModelOverride).toBe('opus');
+    expect(requestSessionRestartMock).not.toHaveBeenCalled();
+    if (kind === 'command') expect(JSON.stringify(vi.mocked(deps.sessionReply).mock.calls)).toContain('spawn-override');
+  });
+  it.each(['command', 'card'])('%s retains omitted effort only for the same pinned model', async kind => {
+    await useRealWriter(); enableMenu('claude-code'); detectModelsMock.mockResolvedValue(['sonnet', 'opus']); const ds = makeDs();
+    ds.session.modelPin = { model: 'sonnet', effort: 'high', source: 'topic-header', setBy: OWNER, setAt: 'old' };
+    const deps = depsWith(ds, vi.fn(() => true));
+    if (kind === 'command') await handleCommand('/modelpin', ROOT, { senderId: OWNER, content: '/modelpin sonnet' } as any, deps, LARK_APP_ID);
+    else await handleCardAction(pickData('sonnet'), deps, LARK_APP_ID);
+    expect(ds.session.modelPin.effort).toBe('high');
+    if (kind === 'command') await handleCommand('/modelpin', ROOT, { senderId: OWNER, content: '/modelpin opus' } as any, deps, LARK_APP_ID);
+    else { const res = await handleCardAction(pickData('opus'), deps, LARK_APP_ID); expect(res.toast.type, res.toast.content).toBe('success'); }
+    expect(ds.session.modelPin.model).toBe('opus'); expect(ds.session.modelPin.effort).toBeUndefined();
+  });
+  it('sends the supported Codex reasoning flag with the retained pin effort before requesting restart', async () => {
+    await useRealWriter(); enableMenu('codex'); detectModelsMock.mockResolvedValue(['gpt-6.1-terra']);
+    const ds = makeDs({ activeModel: 'gpt-6.1-terra', activeReasoningEffort: 'high',
+      sessionOverrides: { cliId: 'codex', backendType: 'pty' } });
+    ds.session.modelPin = { model: 'gpt-6.1-terra', effort: 'low', source: 'topic-header', setBy: OWNER, setAt: 'old' };
+    const deliver = vi.fn(() => true);
+    await handleCardAction(pickData('gpt-6.1-terra'), depsWith(ds, deliver), LARK_APP_ID);
+    expect(deliver).toHaveBeenCalledWith(ds, '/model gpt-6.1-terra --reasoning=low', expect.anything());
+    expect(ds.session.modelPin.effort).toBe('low');
+    expect(requestSessionRestartMock).toHaveBeenCalledWith(ds, expect.objectContaining({ source: 'card' }));
+  });
+
 });

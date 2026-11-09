@@ -4,15 +4,34 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import { larkTransportEnabled } from './types.js';
+import { isHeadlessSessionChatId, larkTransportEnabled } from './types.js';
 import { isRemoteBackendId } from './remote-cli-ids.js';
 import { normalizeBrand, type Brand } from '../im/lark/lark-hosts.js';
 import { findRealToolBinary, installLoginShellPathShim, sessionIdentityDataDir, sessionIdentityBinDir, sessionVisiblePath } from './cli-identity.js';
 import { resolveEntrySpawn } from './self-spawn.js';
+import { headlessChatId, isHeadlessId } from '../services/headless-session-store.js';
+import { resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
+import type { ProtectedLoopbackService } from './protected-http-egress-host.js';
 
 export const LARK_TOOL_BINDING_FILE = 'lark-tool-binding.json';
 export const LARK_TOOL_ROUTE = 'lark-tool-identity';
+
+export function larkToolLoopbackService(sessionId: string, ipcPort: number): ProtectedLoopbackService {
+  if (!/^[A-Za-z0-9._-]{1,200}$/.test(sessionId) || /^\.+$/.test(sessionId)
+    || !Number.isSafeInteger(ipcPort) || ipcPort < 1 || ipcPort > 65535) {
+    throw new Error('invalid_lark_tool_loopback_service');
+  }
+  return {
+    id: LARK_TOOL_ROUTE,
+    listenPort: ipcPort,
+    upstreamPort: ipcPort,
+    method: 'POST',
+    path: `/api/sessions/${sessionId}/${LARK_TOOL_ROUTE}`,
+    forwardHeaders: ['content-type', 'x-botmux-lark-session'],
+    attestProcessPeer: true,
+  };
+}
 export interface LarkToolBinding {
   version: 2;
   sessionId: string;
@@ -53,18 +72,44 @@ export function readLarkToolBinding(path: string): LarkToolBinding {
   return value;
 }
 
-/** Sessions adopt the lark-cli binding unless explicitly disabled (larkToolBinding === false).
- * Old/adopt/remote/workflow sessions do not use it.
- * Note: _dataDir, resume, forkSession are preserved for caller signature compatibility. */
-export function usesLarkToolBinding(config: {
-  sessionId: string; larkAppId: string; chatId: string; apiOnly?: boolean;
-  resume?: boolean; forkSession?: boolean; adoptMode?: boolean; existingAppServerEndpoint?: string;
+/** Tool identity is independent of chat delivery. A local headless runner on
+ * a Lark bot can use that bot's tools without acquiring a chat transport. */
+export function larkToolIdentityEnabled(config: { chatId: string; apiOnly?: boolean; headless?: { id: string; source: string } }): boolean {
+  return config.apiOnly !== true
+    && (larkTransportEnabled(config) || !!config.headless
+      && config.headless.source === 'cli' && isHeadlessId(config.headless.id)
+      && headlessChatId(config.headless.id) === config.chatId);
+}
+
+/** Session facts that decide whether the managed lark-cli wrapper applies. */
+export interface LarkToolBindingFacts {
+  chatId: string;
+  apiOnly?: boolean;
+  headless?: { id: string; source: string };
+  adoptMode?: boolean;
+  existingAppServerEndpoint?: string;
+  /** The backend the session actually runs on, not the bot's default. */
   backendType: import('../adapters/backend/types.js').BackendType;
+}
+
+/** Whether this session shape runs the managed lark-cli wrapper, before the
+ * bot's own larkToolBinding switch. The worker decides its spawn from this and
+ * daemon-side mirrors (session env lock, identity model check) must too, or the
+ * two sides disagree about whether ZDOTDIR/BASH_ENV belong to botmux.
+ * Old/adopt/remote/workflow sessions and external app-servers do not use it. */
+export function larkToolBindingEffective(config: LarkToolBindingFacts, workflow = false): boolean {
+  return !(workflow || config.adoptMode || config.existingAppServerEndpoint
+    || isRemoteBackendId(config.backendType) || !larkToolIdentityEnabled(config));
+}
+
+/** Ordinary local and headless sessions adopt the lark-cli binding unless explicitly disabled (larkToolBinding === false).
+ * Note: _dataDir, resume, forkSession are preserved for caller signature compatibility. */
+export function usesLarkToolBinding(config: LarkToolBindingFacts & {
+  sessionId: string; larkAppId: string;
+  resume?: boolean; forkSession?: boolean;
   larkToolBinding?: boolean;
 }, _dataDir?: string, workflow = false): boolean {
-  if (workflow || config.adoptMode || config.existingAppServerEndpoint
-    || isRemoteBackendId(config.backendType) || !larkTransportEnabled(config)) return false;
-  return config.larkToolBinding !== false;
+  return larkToolBindingEffective(config, workflow) && config.larkToolBinding !== false;
 }
 
 /**
@@ -113,16 +158,8 @@ export function resolveIdentityStorageModel(input: {
  *  uses this solely to fail closed when a worker reports `proven` for a
  *  session whose structure cannot run proven (e.g. binding disabled after a
  *  daemon restart with newer config). */
-export function identityBindingAllowsProven(input: {
+export function identityBindingAllowsProven(input: Parameters<typeof usesLarkToolBinding>[0] & {
   platform: NodeJS.Platform;
-  sessionId: string;
-  larkAppId: string;
-  chatId: string;
-  apiOnly?: boolean;
-  adoptMode?: boolean;
-  existingAppServerEndpoint?: string;
-  backendType: import('../adapters/backend/types.js').BackendType;
-  larkToolBinding?: boolean;
 }): boolean {
   return input.platform === 'linux' && usesLarkToolBinding(input);
 }
@@ -234,14 +271,19 @@ export function prepareLarkToolEnv(input: {
   const runner = input.runner ?? (moduleDir.endsWith('/src/core')
     ? { command: process.execPath, args: [...sourceExecArgs, resolve(moduleDir, '../lark-tool-runner.ts')] }
     : resolveEntrySpawn('lark-tool-runner', resolve(moduleDir, '..')));
+  const sourceTsconfigPath = moduleDir.endsWith('/src/core')
+    ? sessionVisiblePath(join(process.cwd(), 'tsconfig.json'), input.canonicalPaths) : undefined;
+  if (sourceTsconfigPath) input.env.TSX_TSCONFIG_PATH = sourceTsconfigPath;
   const quote = (v: string) => `'${v.replaceAll("'", "'\\''")}'`;
   atomicWriteFileSync(join(binDir, 'lark-cli'), [
     '#!/bin/sh', '# botmux managed lark-cli — application and caller are host-bound.',
+    ...(sourceTsconfigPath ? [`TSX_TSCONFIG_PATH=${quote(sourceTsconfigPath)}`, 'export TSX_TSCONFIG_PATH'] : []),
     `exec ${[...[runner.command, ...runner.args].map(p => sessionVisiblePath(p, input.canonicalPaths)), '--binding', bindingPath, '--'].map(quote).join(' ')} "$@"`, '',
   ].join('\n'), { mode: 0o755 });
   const { zdotdir, bashEnv } = installLoginShellPathShim(binDir);
   input.env.PATH = [binDir, ...(input.env.PATH ?? '').split(':').filter(p => p !== binDir)].join(':');
   input.env.BOTMUX_IDENTITY_BIN = binDir;
+  input.env.BOTMUX_WRAPPER_BIN = resolveBotmuxWrapperBinDir(input.env);
   input.env.ZDOTDIR = zdotdir;
   input.env.BASH_ENV = bashEnv;
   input.env.SESSION_DATA_DIR = rootDir;
@@ -255,7 +297,10 @@ export function hasLarkToolBinding(dataDir: string, sessionId: string): boolean 
   catch { return false; }
 }
 
-export function larkToolPrompt(appId: string, locale?: string): string {
+export function larkToolPrompt(appId: string, locale?: string, headlessNoUserChannel = false): string {
+  if (headlessNoUserChannel) return locale === 'en'
+    ? `lark-cli uses application ${appId}. Calls default to this bot. This headless session has no human authorization channel; --as user is unavailable. If the bot lacks access, report the blocked resource through the session result channel so the caller can resolve it. Do not change profiles or repeat writes whose result is uncertain.`
+    : `lark-cli 固定使用当前机器人的应用 ${appId}，默认以 bot 身份调用。本后台会话没有真人授权通道，--as user 不可用。bot 无权时，通过会话结果通道报告受阻资源，由调用方处理权限。不要切换 profile，也不要重复执行结果尚不确定的写操作。`;
   return locale === 'en'
     ? `lark-cli uses application ${appId} by default and calls default to this bot. For personal resources or a bot permission denial, use --as user to act as the current user; botmux picks that person's authorization (their grant to this application, or their botmux platform authorization). To use a different application or profile, specify --profile <profile>. When a read with --as user lacks a permission but the data is in a chat or document this bot can access (for example messages of a group the bot is in), retry that read with --as bot; never switch a write to --as bot. If the read also fails as bot, or the action must be done as the user, run botmux auth request --scope "<required scopes>" --json for the user's authorization and pass the link or platform page it returns to the user (in a group botmux sends authorization links privately to the requester itself; never post one in the group). Do not repeat writes whose result is uncertain.`
     : `lark-cli 固定使用当前机器人的应用 ${appId} 作为默认，默认以 bot 身份调用。需要个人资源或 bot 无权时，可用 --as user 以当前用户身份调用，用谁的哪份授权由 botmux 决定（该用户对本应用的授权，或其在 botmux 中心化平台的授权）；若需使用其他应用或 profile，可显式指定 --profile <profile>。以 --as user 读取时缺权限、但数据在本机器人能访问的群或文档里（例如本机器人所在群的消息），改用 --as bot 重试这次读取；写操作不得改用 --as bot。bot 身份也读不到、或这件事必须以用户身份完成时，再运行 botmux auth request --scope "<所需权限>" --json 申请用户授权，把返回的链接或平台页面发给用户（群聊里 botmux 会自己私聊发起人发授权链接，不要在群里贴授权链接）。不要重复执行结果尚不确定的写操作。`;
@@ -267,7 +312,7 @@ export function larkToolPromptFromEnv(
 ): string {
   const path = env.BOTMUX_LARK_TOOL_BINDING;
   if (!path) return '';
-  try { return larkToolPrompt(readLarkToolBinding(path).appId, locale); }
+  try { return larkToolPrompt(readLarkToolBinding(path).appId, locale, isHeadlessSessionChatId(env.BOTMUX_CHAT_ID ?? '')); }
   catch { return ''; }
 }
 

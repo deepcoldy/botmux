@@ -13,6 +13,9 @@ import {
   BOARD_VIEW_LABEL_KEYS,
   batchView,
   boardErrorText,
+  chatTaskLine,
+  chatTaskSummaryText,
+  knownTaskHint,
   boardItemHash,
   boardRelativeTime,
   boardSummaryHash,
@@ -223,14 +226,15 @@ describe('batches', () => {
 
 describe('steward config payload', () => {
   const forms: StewardForm[] = [
-    { enabled: false, chatId: '', guideMode: 'append', guideText: '', autoJoinNewGroups: true, autoJoinSoloGroups: false },
-    { enabled: true, chatId: '', guideMode: 'append', guideText: '', autoJoinNewGroups: true, autoJoinSoloGroups: false },
-    { enabled: true, chatId: 'oc_abc', guideMode: 'append', guideText: '  推进标准：合码按 STANDARD.md 执行\r\n', autoJoinNewGroups: true, autoJoinSoloGroups: false },
-    { enabled: true, chatId: 'oc_abc', guideMode: 'replace', guideText: '只汇报', autoJoinNewGroups: true, autoJoinSoloGroups: false },
-    { enabled: false, chatId: 'oc_abc', guideMode: 'append', guideText: '', autoJoinNewGroups: true, autoJoinSoloGroups: false },
-    { enabled: true, chatId: 'oc_abc', guideMode: 'append', guideText: '', autoJoinNewGroups: false, autoJoinSoloGroups: false },
-    { enabled: false, chatId: '', guideMode: 'append', guideText: '', autoJoinNewGroups: false, autoJoinSoloGroups: false },
-    { enabled: true, chatId: '', guideMode: 'append', guideText: '', autoJoinNewGroups: true, autoJoinSoloGroups: true },
+    { enabled: false, chatId: '', guideMode: 'append', guideText: '', autoJoinNewGroups: true, autoJoinSoloGroups: false, decisionCards: true },
+    { enabled: true, chatId: '', guideMode: 'append', guideText: '', autoJoinNewGroups: true, autoJoinSoloGroups: false, decisionCards: true },
+    { enabled: true, chatId: 'oc_abc', guideMode: 'append', guideText: '  推进标准：合码按 STANDARD.md 执行\r\n', autoJoinNewGroups: true, autoJoinSoloGroups: false, decisionCards: true },
+    { enabled: true, chatId: 'oc_abc', guideMode: 'replace', guideText: '只汇报', autoJoinNewGroups: true, autoJoinSoloGroups: false, decisionCards: true },
+    { enabled: false, chatId: 'oc_abc', guideMode: 'append', guideText: '', autoJoinNewGroups: true, autoJoinSoloGroups: false, decisionCards: true },
+    { enabled: true, chatId: 'oc_abc', guideMode: 'append', guideText: '', autoJoinNewGroups: false, autoJoinSoloGroups: false, decisionCards: true },
+    { enabled: false, chatId: '', guideMode: 'append', guideText: '', autoJoinNewGroups: false, autoJoinSoloGroups: false, decisionCards: true },
+    { enabled: true, chatId: '', guideMode: 'append', guideText: '', autoJoinNewGroups: true, autoJoinSoloGroups: true, decisionCards: true },
+    { enabled: true, chatId: 'oc_abc', guideMode: 'append', guideText: '', autoJoinNewGroups: true, autoJoinSoloGroups: false, decisionCards: false },
   ];
 
   it('sends null for the default and omits the default append mode and the default auto-join', () => {
@@ -243,6 +247,23 @@ describe('steward config payload', () => {
     expect(stewardPayload(forms[7]!)).toEqual({ enabled: true, autoJoinSoloGroups: true });
     expect(stewardFormFrom(null).autoJoinNewGroups).toBe(true);
     expect(stewardFormFrom(null).autoJoinSoloGroups).toBe(false);
+    expect(stewardPayload(forms[8]!)).toEqual({ enabled: true, chatId: 'oc_abc', decisionCards: false });
+    expect(stewardFormFrom(null).decisionCards).toBe(true);
+  });
+
+  it('subtask alerts default off and are written only when turned on', () => {
+    const base = stewardFormFrom({ enabled: true, chatId: 'oc_abc' });
+    expect(base.taskHints).toBe(false);
+    expect(stewardFormFrom(null).taskHints).toBe(false);
+    expect(stewardFormFrom({ enabled: true, chatId: 'oc_abc', taskHints: false }).taskHints).toBe(false);
+    expect(stewardPayload(base)).toEqual({ enabled: true, chatId: 'oc_abc' });
+    const on = stewardPayload({ ...base, taskHints: true });
+    expect(on).toEqual({ enabled: true, chatId: 'oc_abc', taskHints: true });
+    expect(stewardFormFrom(on).taskHints).toBe(true);
+    expect(normalizeStewardConfig(on)).toEqual({ ok: true, value: on });
+    // 只开了子任务提醒也要存下来，不能当成「全是默认」写 null。
+    expect(stewardPayload({ ...stewardFormFrom(null), taskHints: true })).toEqual({ enabled: false, taskHints: true });
+    expect(stewardPayload({ ...base, taskHints: true, closeHints: true })).toEqual({ enabled: true, chatId: 'oc_abc', closeHints: true, taskHints: true });
   });
 
   it('produces exactly what the server validator accepts and stores', () => {
@@ -255,7 +276,7 @@ describe('steward config payload', () => {
   });
 
   it('catches "replace" without text before the server does', () => {
-    const form: StewardForm = { enabled: true, chatId: 'oc_abc', guideMode: 'replace', guideText: ' ', autoJoinNewGroups: true, autoJoinSoloGroups: false };
+    const form: StewardForm = { enabled: true, chatId: 'oc_abc', guideMode: 'replace', guideText: ' ', autoJoinNewGroups: true, autoJoinSoloGroups: false, decisionCards: true };
     expect(stewardGuideProblem(form)).toBe('replace_empty');
     expect(normalizeStewardConfig({ enabled: true, chatId: 'oc_abc', guideMode: 'replace' }).ok).toBe(false);
     expect(stewardGuideProblem({ ...form, guideText: '只汇报' })).toBeNull();
@@ -330,5 +351,44 @@ describe('itemChatView', () => {
 
   it('其它关联里去掉群', () => {
     expect(nonChatLinks([pr, chat('oc_a')])).toEqual([pr]);
+  });
+});
+
+describe('关联群的子任务', () => {
+  const NOW = 1_700_000_000_000;
+  const MIN = 60_000;
+
+  it('单个群：状态、时间、第一行；需要你带原因（举手的原因就是那句话）；已关闭不写时间', () => {
+    expect(chatTaskLine({ chatId: 'oc_a', kind: 'delivered', at: NOW - 12 * MIN, summary: '修好了' }, NOW, zh)).toEqual({
+      label: zh('decisionBoard.taskDelivered'), time: boardRelativeTime(NOW - 12 * MIN, NOW, zh), text: '修好了',
+    });
+    expect(chatTaskLine({ chatId: 'oc_a', kind: 'needs_you', reason: 'limited' }, NOW, zh)).toEqual({
+      label: `${zh('decisionBoard.taskNeedsYou')} · ${zh('sessions.board.signalLimited')}`,
+    });
+    expect(chatTaskLine({ chatId: 'oc_a', kind: 'needs_you', reason: 'attention', at: NOW, detail: '要不要合？' }, NOW, zh))
+      .toMatchObject({ label: zh('decisionBoard.taskNeedsYou'), text: '要不要合？' });
+    expect(chatTaskLine({ chatId: 'oc_a', kind: 'interrupted', at: NOW, detail: 'api_error' }, NOW, en))
+      .toMatchObject({ label: en('decisionBoard.taskInterrupted'), text: 'api_error' });
+    expect(chatTaskLine({ chatId: 'oc_a', kind: 'closed', at: NOW }, NOW, zh)).toEqual({ label: zh('decisionBoard.taskClosed') });
+    expect(chatTaskLine({ chatId: 'oc_a', kind: 'unreadable' }, NOW, zh)).toEqual({ label: zh('decisionBoard.taskUnreadable') });
+    // 新 daemon 多出来的状态：不显示，不报错。
+    expect(chatTaskLine({ chatId: 'oc_a', kind: 'mystery' } as never, NOW, zh)).toBeNull();
+  });
+
+  it('多个群：「3 个群：1 进行中 · 2 本轮已交付」，按需要你到没有会话的顺序', () => {
+    expect(chatTaskSummaryText([
+      { chatId: 'a', kind: 'delivered' }, { chatId: 'b', kind: 'working' }, { chatId: 'c', kind: 'delivered' },
+    ], zh)).toBe('3 个群：1 进行中 · 2 本轮已交付');
+    expect(chatTaskSummaryText([
+      { chatId: 'a', kind: 'no_session' }, { chatId: 'b', kind: 'unreadable' }, { chatId: 'c', kind: 'needs_you' }, { chatId: 'd', kind: 'mystery' } as never,
+    ], zh)).toBe('3 个群：1 需要你 · 1 读不到 · 1 没有会话');
+    expect(chatTaskSummaryText([{ chatId: 'a', kind: 'idle' }, { chatId: 'b', kind: 'closed' }], en)).toBe('2 chats: 1 idle · 1 closed');
+  });
+
+  it('子任务提示：只认识的三种', () => {
+    const hint = { kind: 'task_delivered' as const, chatId: 'oc_a', at: NOW, key: 'task:delivered:s:t' };
+    expect(knownTaskHint(hint)).toBe(hint);
+    expect(knownTaskHint({ ...hint, kind: 'task_other' } as never)).toBeUndefined();
+    expect(knownTaskHint(undefined)).toBeUndefined();
   });
 });

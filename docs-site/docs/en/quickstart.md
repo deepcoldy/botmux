@@ -1,7 +1,6 @@
 # 5-minute quick setup
 
-<video src="../img/video-v1-quickstart.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
-<p style="font-size:13px;opacity:.7;margin-top:-8px">Video narration is in Chinese.</p>
+<video src="../img/video-v1-quickstart-en.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
 
 Four steps and you're chatting with an AI coding CLI from Lark:
 
@@ -82,6 +81,10 @@ Running `botmux setup` on a machine that's already configured shows a menu: Add 
 
 > Want to configure from a script or an AI agent instead of the interactive UI? Use the `botmux setup add` / `botmux setup list` subcommands; `botmux setup help` shows all options.
 
+> ➕ **Need permissions beyond the built-in list?** Pass `--extra-scopes-file <json>` in scripted setup (Feishu tenants only; on Lark, add them manually in the developer console), e.g. `botmux setup add --create-app --allowed-users <email> --extra-scopes-file ./scopes.json`; for an existing bot run `botmux setup configure <process-name|AppID> --extra-scopes-file ./scopes.json`. The file uses the `lark-scopes.json` shape (`{"scopes":{"tenant":[],"user":[]}}`). `{"scopes":[{"scope":"x:y"}]}` is also accepted, but every entry in that form is requested as a user scope; use `{"scopes":{"tenant":["x:y"]}}` for tenant scopes. Scopes missing from the tenant catalog (including scopes that only exist for the other identity type) are skipped and listed in the result instead of failing the run. The file path is saved on the bot so later `configure` runs reuse it; if the saved file can't be read, setup warns and continues with the built-in list. Run `botmux setup configure <process-name|AppID> --extra-scopes-file -` to clear it.
+
+> 👋 **Welcome message on first launch**: `botmux setup add ... --welcome-message "Reply /init to get started"` (or `--welcome-message-file welcome.txt` to read it from a file) makes the bot DM its owner once after it first comes online; for an existing bot use `botmux setup edit <process-name|AppID> --welcome-message ...`, and `-` clears it. Delivery is recorded under `welcome-sent/` in the daemon data dir so restarts never resend; a failed send does not block startup and is retried on the next start. See [bots.json · Welcome message](/en/bots-json#welcome-message).
+
 ## Step 3 · Start
 
 ```bash
@@ -143,14 +146,15 @@ Still stuck? Check by hand:
 
 Run `botmux restart` after fixing. See [FAQ / Troubleshooting](/en/faq) for more.
 
-### Optional events: @ by editing, recall sync
+### Optional events: @ by editing, recall sync, disbanded groups
 
-Missing either of these **does not affect ordinary messages**; only the related small feature. New bots subscribe to them automatically; for older bots, botmux tries to add them at startup using this machine's existing Open Platform login.
+Missing any of these **does not affect ordinary messages**; only the related small feature. New bots subscribe to them automatically; for older bots, botmux tries to add them at startup using this machine's existing Open Platform login.
 
 | Event | Used for |
 |---|---|
 | `im.message.updated_v1` | Editing a message that didn't @ the bot to add the @, which then triggers a task |
 | `im.message.recalled_v1` | In group context sharing (`/context-sharing`), marking recalled messages in the record. Only added when that feature is on |
+| `im.chat.disbanded_v1` | Ending the bot's sessions in a group once it is disbanded (like `/close`: they can be resumed and worktrees are kept). Without it, those sessions are only closed at the next daemon restart |
 
 Things to note:
 

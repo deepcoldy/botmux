@@ -43,7 +43,7 @@ function fixture(rows: () => Array<Record<string, unknown>>, trust: {
     bridgeKnownSessionIds: new Set(trust.known ?? [OWN]),
     bridgeCliProvenSessionIds: new Set(trust.proven ?? [OWN]),
     // Present on the queued-input branch; kept here so both changes can land in either order.
-    isHeldInCliQueue: () => false,
+    isHeldPendingMark: () => false,
     BRIDGE_HELD_FINGERPRINT_SCAN_MIN_INTERVAL_MS: 60_000,
     lastInitConfig: { sessionId: OWN, larkAppId: 'cli_app' },
     sessionStore: { loadAllSessionsSnapshot: () => new Map(rows().map(r => [r.sessionId as string, r])) },

@@ -1,4 +1,6 @@
 import { normalizeCodexProfile, assertCodexProfileConfig } from './services/codex-profiles.js';
+import { normalizeMessageListenerReplyMode } from './services/message-listener-reply-policy.js';
+import { normalizeLongTaskReminderConfig, type LongTaskReminderConfig } from './services/long-task-reminder-policy.js';
 import { normalizeVcMeetingListenerPolicy, type VcMeetingListenerPolicy } from './services/vc-meeting-listener-policy.js';
 import { normalizeReplyFooter, parseReplyFooterEnv, type ReplyFooterPreferences } from './services/reply-footer.js';
 import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
@@ -43,6 +45,7 @@ import { parseVolcengineConfig } from './services/voice/volcengine-config.js';
 import { normalizeGroupIdleClose, type GroupIdleCloseSettings } from './core/group-idle-close.js';
 import { normalizeGroupSerialInput } from './core/group-serial-input.js';
 import { normalizeGroupDefaultModels, type GroupDefaultModels } from './core/group-default-models.js';
+import type { GroupJoinAnchorMode } from './core/auto-start.js';
 import type { PricingOverrides } from './services/model-pricing.js';
 import type { BudgetConfig } from './services/budget-tracker.js';
 import { normalizePricingOverrides } from './services/model-pricing.js';
@@ -86,6 +89,8 @@ import { normalizePromptCacheConfig, type PromptCacheConfig } from './services/p
 import { normalizeLinkRefConfig } from './services/link-ref-config.js';
 import type { LinkRefConfig } from './services/link-ref-types.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
+import { normalizeFeedbackPresentation } from './services/feedback-presentation.js';
+import type { FeedbackPresentationConfig } from './services/feedback-extension-types.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
 import {
   normalizeReplyStyleConfig,
@@ -307,7 +312,7 @@ export interface MessageListenerConfig {
   contentPolicy?: ListenerContentPolicy;
   replyPolicy?: {
     /** `thread` replies under the triggering message; `chat` posts at group top level. */
-    mode?: 'thread' | 'chat';
+    mode?: import('./services/message-listener-reply-policy.js').MessageListenerReplyMode;
     /** V1 starts one session per matched message. */
     sessionMode?: 'per_message';
   };
@@ -998,6 +1003,16 @@ function normalizeStringList(raw: unknown): string[] {
     .map((p) => p.trim());
 }
 
+/** Sandbox path lists can narrow access (deny, readOnly under readWrite), so a
+ *  mistyped value must fail the load like a mistyped `sandbox` mode: read as
+ *  an empty list it would silently widen the sandbox. null stays "not set". */
+function sandboxPathList(raw: unknown, field: string, i: number): string[] {
+  if (raw != null && (!Array.isArray(raw) || raw.some(p => typeof p !== 'string'))) {
+    throw new Error(`Bot config [${i}]: ${field} must be an array of path strings, got ${JSON.stringify(raw)}`);
+  }
+  return normalizeStringList(raw);
+}
+
 function normalizeSummaryRange(raw: unknown): SummaryRangeConfig | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const entry = raw as Record<string, unknown>;
@@ -1209,9 +1224,8 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
     ...(Object.keys(messagePolicy).length > 0 ? { messagePolicy } : {}),
     ...(contentPolicy ? { contentPolicy } : {}),
     replyPolicy: {
-      mode: entry.replyPolicy && typeof entry.replyPolicy === 'object' && (entry.replyPolicy as Record<string, unknown>).mode === 'chat'
-        ? 'chat'
-        : 'thread',
+      mode: normalizeMessageListenerReplyMode(entry.replyPolicy && typeof entry.replyPolicy === 'object'
+        ? (entry.replyPolicy as Record<string, unknown>).mode : undefined),
       sessionMode: 'per_message',
     },
   };
@@ -1279,6 +1293,7 @@ export interface BotDefaultOncall {
 }
 
 export interface SubstituteTarget {
+  appId?: string;
   /** App-scoped open_id. Directly comparable with Lark mention payloads. */
   openId?: string;
   /** Tenant user_id. Preferred for hand-authored config when available. */
@@ -1296,6 +1311,9 @@ export interface SubstituteTarget {
 export interface SubstituteModeConfig {
   enabled: boolean;
   targets: SubstituteTarget[];
+  /** Optional case-insensitive body substrings; any match qualifies an @target.
+   *  Missing/empty keeps mention-only triggering. */
+  keywords?: string[];
   /** prefix = disclose "I will answer on behalf of X"; none = no extra disclosure instruction. */
   disclosure?: 'prefix' | 'none';
   /** Optional allow-list of chat IDs. When provided, substitute trigger only fires in these chats. */
@@ -1468,6 +1486,7 @@ export interface BotConfig {
   dispatchLaunchPolicy?: import('./core/dispatch-launch-contract.js').DispatchLaunchPolicyV1;
   /** Final-answer feedback policy. Missing/disabled is intentionally inert. */
   feedback?: FeedbackPolicyInput | FeedbackPolicy;
+  feedbackPresentation?: FeedbackPresentationConfig;
   oncallGroup?: OncallGroupPolicy;
   /** Opt-in defaults for explicit /g group creation. */
   groupCreation?: GroupCreationDefaults;
@@ -1483,6 +1502,12 @@ export interface BotConfig {
    * 具体 app/租户，不在运行时切换（要换平台 = 重新配/加一个 bot）。
    */
   brand?: Brand;
+  /**
+   * `botmux setup add|configure --extra-scopes-file` 记下的追加权限清单绝对路径，之后不带参的
+   * `setup configure` 沿用它。只有 setup 脚本化命令直接读写 bots.json 里的这个字段；
+   * {@link parseBotConfigsFromText} 不携带它，daemon 运行时也不用。
+   */
+  extraScopesFile?: string;
   /**
    * Bot-level synchronous card-action ACK cutoff in milliseconds. When a card
    * handler is still running at this point, Botmux ACKs with a background-work
@@ -1869,6 +1894,8 @@ export interface BotConfig {
   /** Periodically @ the persisted Session owner while selected actionable
    * runtime states remain unchanged. Missing means disabled. */
   sessionOwnerReminder?: SessionOwnerReminderConfig;
+  /** Opt-in cards for still-running native turns, with separate first/repeat windows. */
+  longTaskReminder?: LongTaskReminderConfig;
   /**
    * Optional daemon-side handoff when this bot's CLI enters a trusted usage or
    * rate-limit state. The stable target App ID is resolved to a live,
@@ -1921,6 +1948,8 @@ export interface BotConfig {
    * identity, simply have none and fall back to the resolved allowlist.
    */
   ownerOpenId?: string;
+  /** 首次成功上线后私聊 owner 一次的欢迎语；已发送记录在 dataDir，见 services/welcome-message.ts。 */
+  welcomeMessage?: string;
   allowedChatGroups?: string[];
   /** Oncall bindings: chat_id → default workingDir. Any group member can talk; allowedUsers still gates card buttons / daemon commands. */
   oncallChats?: OncallChat[];
@@ -2329,6 +2358,17 @@ export interface BotConfig {
    */
   autoStartOnGroupJoinGateRequired?: boolean;
   /**
+   * 主动开工 — 场景① 普通群会话锚点。只作用于 reply mode 本会让入群会话留在
+   * chat-scope 的普通群（chat / shared / chat-topic）；话题群与 new-topic 不变。
+   *   - 'reply-mode'（缺省）：跟随群的 reply mode，即现有行为。
+   *   - 'latest-message'：以群里最新一条已有消息（跳过系统消息、已撤回消息和本
+   *     bot 自己的消息）为根开 thread-scope 会话，回复落在该消息的话题里，而不是
+   *     群顶层。没有可用消息或拉取失败时回退 'reply-mode'。典型场景：外部平台建群、
+   *     先发一张上下文卡片再拉 bot，bot 在那张卡片的话题里干活。
+   * 仅 bots.json 配置；forcePrompt（Issue Board 领取 / 会议预热）路径不读它。
+   */
+  autoStartOnGroupJoinAnchor?: GroupJoinAnchorMode;
+  /**
    * 主动开工 — 场景① optional pre-configured first-turn prompt. When set, it
    * becomes the user_message of the auto-started session; when unset/blank the
    * session uses a built-in task to inspect the group context and report
@@ -2381,6 +2421,12 @@ export interface BotConfig {
    * 不被此开关阻断（拆除与只读始终允许）。
    */
   chatManagerEnabled?: boolean;
+  /**
+   * 群秘书（`/secretary on`）总开关。仅当显式为 true 时，群里才能用 `/secretary on|takeover`
+   * 把本 bot 设为群秘书，后台旁听与巡检才运行。默认（undefined/false）= 关闭，老用户行为不变；
+   * `/secretary off|status` 不被此开关阻断。
+   */
+  groupSecretaryEnabled?: boolean;
   /**
    * 管家（决策看板）配置。仅 `enabled === true` 时本 bot 是管家：它的会话能用
    * `botmux board` 写看板，owner 在 Dashboard 提交的批次送进 `chatId` 群的 chat 级会话，
@@ -3612,6 +3658,10 @@ export function loadBotConfigsCached(): readonly BotConfig[] {
 }
 
 /** Pure parser: bots.json text → BotConfig[]. Exported for testing & reuse. */
+// Uncached config loads re-parse bots.json several times per turn; warn once
+// per bot and value for the life of the process.
+const warnedInvalidSubstituteAppIds = new Set<string>();
+
 export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
   let parsed: unknown;
   try {
@@ -3750,7 +3800,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       && entry.scratchTmpfsSizeMb > 0
       ? Math.floor(entry.scratchTmpfsSizeMb)
       : undefined;
-    const scratchDenyPaths = normalizeStringList(entry.scratchDenyPaths);
+    const scratchDenyPaths = sandboxPathList(entry.scratchDenyPaths, 'scratchDenyPaths', i);
+    if (entry.sandboxPaths != null && (typeof entry.sandboxPaths !== 'object' || Array.isArray(entry.sandboxPaths))) {
+      throw new Error(`Bot config [${i}]: sandboxPaths must be an object of readWrite / readOnly / deny path arrays, got ${JSON.stringify(entry.sandboxPaths)}`);
+    }
+    if (entry.sandboxNetwork != null && typeof entry.sandboxNetwork !== 'boolean') {
+      throw new Error(`Bot config [${i}]: sandboxNetwork must be true or false, got ${JSON.stringify(entry.sandboxNetwork)}`);
+    }
     validateCliLaunchModeConfig({
       cliId: entryCliId,
       cliLaunchMode,
@@ -3850,7 +3906,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // Shared normalizer (with substitute-mode-store): keeps a disabled config's
     // target list so the dashboard toggle can flip without re-entering everyone;
     // only an enabled-but-unmatchable config collapses to undefined.
-    const substituteMode: SubstituteModeConfig | undefined = normalizeSubstituteMode(entry.substituteMode);
+    const substituteMode: SubstituteModeConfig | undefined = normalizeSubstituteMode(entry.substituteMode, value => {
+      const shown = JSON.stringify(value)?.slice(0, 80);
+      const key = `${entry.larkAppId}\0${shown}`;
+      if (warnedInvalidSubstituteAppIds.has(key)) return;
+      warnedInvalidSubstituteAppIds.add(key);
+      logger.warn(`[substitute:${entry.larkAppId}] ignoring substitute target with invalid appId ${shown}`);
+    });
 
     // chatReplyModes：只保留每群显式设置，非法值丢弃。四态 chat｜chat-topic｜
     // new-topic｜shared 都保留解析。显式设置即使与当前 per-bot 默认相同也保留为覆盖；
@@ -4003,6 +4065,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         .map(([pluginId, value]) => {
           const record = value as Record<string, unknown>;
           const runtimeEnv = sanitizePerBotEnv(record.env);
+          const droppedRuntimeEnv = droppedReservedPerBotEnvKeys(record.env);
+          if (droppedRuntimeEnv.length > 0
+            && shouldWarnDroppedReservedEnv(`${entry.larkAppId}:pluginRuntime.${pluginId}`, droppedRuntimeEnv)) {
+            logger.warn(
+              `[bot-registry:${entry.larkAppId}] pluginRuntime.${pluginId}.env 中的保留变量由 botmux 托管，已忽略且不会生效: ${droppedRuntimeEnv.join(' ')}`,
+            );
+          }
           const toolTimeoutMs = typeof record.toolTimeoutMs === 'number'
             && Number.isInteger(record.toolTimeoutMs)
             && record.toolTimeoutMs > 0
@@ -4185,6 +4254,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       feedback: entry.feedback === undefined
         ? undefined
         : normalizeFeedbackPolicyLayer(entry.feedback),
+      feedbackPresentation: entry.feedbackPresentation === undefined
+        ? undefined
+        : normalizeFeedbackPresentation(entry.feedbackPresentation),
       chatFeedbackPolicies: entry.chatFeedbackPolicies && typeof entry.chatFeedbackPolicies === 'object' && !Array.isArray(entry.chatFeedbackPolicies)
         ? Object.fromEntries(Object.entries(entry.chatFeedbackPolicies).map(([chatId, layer]) => [chatId, normalizeFeedbackPolicyLayer(layer)]))
         : undefined,
@@ -4265,9 +4337,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       scratchDenyPaths,
       sandboxPaths: entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
         ? {
-            readWrite: normalizeStringList(entry.sandboxPaths.readWrite),
-            readOnly: normalizeStringList(entry.sandboxPaths.readOnly),
-            deny: normalizeStringList(entry.sandboxPaths.deny),
+            readWrite: sandboxPathList(entry.sandboxPaths.readWrite, 'sandboxPaths.readWrite', i),
+            readOnly: sandboxPathList(entry.sandboxPaths.readOnly, 'sandboxPaths.readOnly', i),
+            deny: sandboxPathList(entry.sandboxPaths.deny, 'sandboxPaths.deny', i),
           }
         : undefined,
       sandboxHidePaths: normalizeStringList(entry.sandboxHidePaths),
@@ -4292,6 +4364,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.idleSuspendMinutes
         : undefined,
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
+      longTaskReminder: normalizeLongTaskReminderConfig(entry.longTaskReminder),
       quotaFallbackBot: normalizedQuotaFallback.config,
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
       overloadAlert: entry.overloadAlert === true || undefined,
@@ -4309,6 +4382,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // value that itself needs resolving.
       ownerOpenId: typeof entry.ownerOpenId === 'string' && entry.ownerOpenId.startsWith('ou_')
         ? entry.ownerOpenId
+        : undefined,
+      welcomeMessage: typeof entry.welcomeMessage === 'string' && entry.welcomeMessage.trim()
+        ? entry.welcomeMessage.trim()
         : undefined,
       allowedChatGroups,
       oncallChats,
@@ -4423,6 +4499,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       showInTeam: entry.showInTeam === false ? false : undefined,
       autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true || undefined,
       autoStartOnGroupJoinGateRequired: entry.autoStartOnGroupJoinGateRequired === true || undefined,
+      // Only the non-default value is meaningful/persisted (undefined = 'reply-mode').
+      autoStartOnGroupJoinAnchor: entry.autoStartOnGroupJoinAnchor === 'latest-message' ? 'latest-message' : undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
       autoInviteOwnerOnGroupAdd: entry.autoInviteOwnerOnGroupAdd === false ? false : undefined,
       // Preserve the configured prompt verbatim; trim-to-undefined when blank
@@ -4437,6 +4515,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
       chatManagerEnabled: entry.chatManagerEnabled === true || undefined,
+      groupSecretaryEnabled: entry.groupSecretaryEnabled === true || undefined,
       // 非法的 steward 配置按关处理（不阻断 bot 启动）；Dashboard / /config 写入时已校验。
       steward: (() => {
         const parsed = normalizeStewardConfig(entry.steward);

@@ -19,6 +19,10 @@
  * forkWorker / lark client are stubbed (same pattern as
  * dashboard-create-session.test.ts) so the routing logic runs in isolation.
  */
+// Must stay the first import: this file writes prompt contexts, deferred topic
+// bindings and schedules under SESSION_DATA_DIR, so refuse to run outside the
+// data-dir fence instead of touching live botmux data (see the helper).
+import './helpers/require-fenced-data-dir.js';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { Session, ScheduledTask } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -148,6 +152,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
     };
   })()),
   ensureOrdinaryTurnRecoveryAttached: vi.fn(),
+  resumeTurnNotices: vi.fn(),
   isRelayableRealSession: vi.fn((ds: DaemonSession) =>
     (!!ds.worker && !ds.worker.killed) || !!ds.session.cliId || !!ds.session.lastCliInput),
   isDisposableCommandScratch: vi.fn((ds: DaemonSession) =>
@@ -301,6 +306,22 @@ describe('retained-topic scheduled send policy', () => {
 });
 
 describe('executeScheduledTask — silent thread fire', () => {
+  it('freezes the fire requester separately from a reused session owner', async () => {
+    const active = new Map<string, DaemonSession>();
+    const owned = baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true,
+      ownerOpenId: 'ou_creator', ownerUnionId: 'on_creator', creatorLarkAppId: APP });
+    await executeScheduledTask(owned, active, refreshCliVersion, undefined, { runId: 'run-owned' });
+    const ds = active.get(sessionKey(ROOT, APP))!;
+    const first = ds.session.scheduledRun!;
+    expect(first).toMatchObject({ runId: 'run-owned', requesterSubjectId: 'ou_creator' });
+    await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active, refreshCliVersion, undefined, { runId: 'run-anonymous' });
+    expect(ds.session.ownerOpenId).toBe('ou_creator');
+    expect(ds.session.scheduledRun).toMatchObject({ runId: 'run-anonymous' });
+    expect(ds.session.scheduledRun?.requesterSubjectId).toBeUndefined();
+    expect(ds.session.scheduledRuns?.[first.turnId]).toEqual(first);
+  });
+
   it('prepares an exact scheduled-turn identity before the worker is forked', async () => {
     const active = new Map<string, DaemonSession>();
     let prepared = false;
@@ -640,6 +661,8 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
     const turnId = sendWorkerInputMock.mock.calls[0][2];
     expect(session.deferredScheduleRun?.turnId).toBe(turnId);
     expect(session.deferredScheduleRun?.routingAnchor).toBe(taskAnchor);
+    // The old turn may still emit unattributed frames; they must not settle this one.
+    expect(existing.deferredScheduleUnconfirmedTurnId).toBe(turnId);
   });
 
   it('non-silent first fire seeds a real topic, writes the root back to the task, and forks a thread session', async () => {

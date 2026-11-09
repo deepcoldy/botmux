@@ -31,6 +31,7 @@ import {
 import type { ScheduleAuthorityStore } from '../services/schedule-authority-store.js';
 import type { CommitDelegatedScheduleResult, DelegatedScheduleControl } from '../services/schedule-authority-store.js';
 import { assertScheduleTopicTitleTemplateValid } from './schedule-topic-title.js';
+import { isManualScheduleRun, parseScheduledTurnId } from './scheduled-turn-provenance.js';
 
 export interface ScheduleExecutionContext {
   runId: string;
@@ -120,6 +121,19 @@ function runtimeTasks(): ScheduledTask[] {
  *  land here first, so read-after-write within one fire is consistent. */
 export function getRuntimeTask(id: string, appId?: string): ScheduledTask | undefined {
   return runtimeTask(id, appId);
+}
+
+/** Register only a turn minted by this claimed host execution. */
+export function admitManualRunTurn(id: string, runId: string, turnId: string, appId: string): boolean {
+  if (parseScheduledTurnId(turnId) !== id) return false;
+  let admitted = false;
+  mutateRuntimeTask(id, task => {
+    if (!isManualScheduleRun(task, runId)) return;
+    admitted = true;
+    return { ...task, manualRunAuthorization: { runId,
+      turnIds: [...new Set([...task.manualRunAuthorization!.turnIds, turnId])] } };
+  }, appId);
+  return admitted;
 }
 
 function runtimeTask(id: string, appId?: string): ScheduledTask | undefined {
@@ -453,7 +467,11 @@ function markRuntimeRun(
     const repeat = task.repeat ? { ...task.repeat, completed: (task.repeat.completed ?? 0) + 1 } : undefined;
     const finiteComplete = !!repeat && repeat.times !== null && repeat.times !== undefined
       && repeat.times > 0 && repeat.completed >= repeat.times;
-    const tracking = scheduleStore.nextFailureTracking(task.runStats, success);
+    const deliveryState = task.deliveryFailureState;
+    const deliveryAlreadyCounted = !!deliveryState && deliveryState.runId === runId && deliveryState.counted;
+    const tracking = !success && deliveryAlreadyCounted
+      ? { runStats: task.runStats!, consecutiveFailures: task.runStats?.consecutiveFailures ?? 0, crossedFailureThreshold: false }
+      : scheduleStore.nextFailureTracking(task.runStats, success);
     result = {
       crossedFailureThreshold: tracking.crossedFailureThreshold,
       consecutiveFailures: tracking.consecutiveFailures,
@@ -461,14 +479,17 @@ function markRuntimeRun(
     // A person paused this task while the run was in flight. The run must not
     // consume it as a completed one-shot: the manual marker has to survive into
     // settleUntilDoneRun, which keeps the task paused instead of resurrecting it.
-    const manualPauseInFlight = !!task.untilDone && task.enabled === false && task.disabledReason === 'manual';
+    const manualPauseInFlight = task.enabled === false && task.disabledReason === 'manual';
     const consumedByRun = (finiteComplete || task.parsed.kind === 'once') && !manualPauseInFlight;
     const settled: ScheduledTask = {
       ...task,
       lastRunAt: new Date().toISOString(),
       lastStatus: success ? 'ok' : 'error',
       lastError: success ? undefined : error,
-      lastDeliveryError: deliveryError,
+      lastDeliveryError: deliveryError ?? (deliveryAlreadyCounted ? task.lastDeliveryError : undefined),
+      deliveryFailureState: !success && deliveryState && deliveryState.runId === runId
+        ? { ...deliveryState, counted: false, previousStatus: 'error', previousError: error }
+        : deliveryState,
       // 管理员 DM 水印（#2334 语义保留）：落盘即记账，投递为 fire-and-forget；
       // owner 侧的 failingNotifiedAt 在 runStats 内、投递成功才写，两者不合并。
       failureAlertSent: success
@@ -491,6 +512,31 @@ function recordDispatchOutcome(
   context: ScheduleExecutionContext,
   outcome: ScheduledTaskPreconditionOutcome | void,
 ): void {
+  const current = runtimeTask(task.id);
+  if (current?.lastRunId === context.runId && current.deliveryFailureRunId === context.runId) {
+    // A very short model turn can fail its send before dispatch returns.
+    // Keep that failure; only account for the dispatch that just completed.
+    mutateRuntimeTask(task.id, value => {
+      if (value.lastRunId !== context.runId) return;
+      const repeat = value.repeat ? { ...value.repeat, completed: (value.repeat.completed ?? 0) + 1 } : undefined;
+      const finiteComplete = !!repeat && repeat.times != null && repeat.times > 0 && repeat.completed >= repeat.times;
+      const paused = value.enabled === false && value.disabledReason === 'manual';
+      const dispatched = { ...value, repeat,
+        lastStatus: 'error' as const,
+        deliveryFailureState: value.deliveryFailureState
+          ? { ...value.deliveryFailureState, previousStatus: 'ok' as const, previousConsecutiveFailures: 0 }
+          : undefined,
+        runStats: { ...value.runStats!, dispatched: (value.runStats?.dispatched ?? 0) + 1 },
+        ...((value.parsed.kind === 'once' || finiteComplete) && !paused
+          ? { enabled: false, disabledReason: 'once_completed' as const, nextRunAt: undefined } : {}) };
+      // Dispatch succeeded; delivery observation must not start another closing
+      // run or change the planned retry/cadence.
+      return settleUntilDoneRun(dispatched, { success: true, runId: context.runId, nowMs: Date.now() });
+    });
+    dashboardEventBus.publish({ type: 'schedule.fired', body: {
+      id: task.id, runAt: Date.now(), status: 'error', error: current.lastDeliveryError } });
+    return;
+  }
   const status = outcome === 'skipped' ? 'skipped' : 'ok';
   if (status === 'skipped') {
     let nextRunAt: string | undefined;
@@ -511,6 +557,74 @@ function recordDispatchOutcome(
     body: { id: task.id, runAt: Date.now(), status },
   });
   emitScheduleFiredHook(task, status);
+}
+
+/** Correct a dispatched execution, without consuming repeats or scheduling a retry.
+ * Returns false once a newer run owns the task: a superseded run is not accounted. */
+export function recordDeliveryFailure(id: string, runId: string, error: string, appId: string,
+  errorCode = 'schedule_send_rejected', chatId = '__single'): boolean {
+  const before = runtimeTask(id, appId);
+  if (!before || before.lastRunId !== runId) return false;
+  let result: { crossedFailureThreshold?: boolean; consecutiveFailures?: number } = {};
+  let current = false;
+  let changed = false;
+  mutateRuntimeTask(id, task => {
+    if (task.lastRunId !== runId) return;
+    current = true;
+    const prior = task.deliveryFailureState?.runId === runId ? task.deliveryFailureState : undefined;
+    if (prior?.targets[chatId] === error && task.lastDeliveryErrorCode === errorCode) return;
+    const state = prior ?? { runId, targets: {}, counted: task.lastStatus !== 'error',
+      previousStatus: task.lastStatus, previousError: task.lastError,
+      previousConsecutiveFailures: task.runStats?.consecutiveFailures ?? 0 };
+    const tracking = !prior && state.counted ? scheduleStore.nextFailureTracking(task.runStats, false) : undefined;
+    if (tracking) result = tracking;
+    changed = true;
+    return { ...task, lastStatus: task.lastStatus === 'running' ? 'running' : 'error',
+      lastError: state.previousStatus === 'error' ? state.previousError : error, lastDeliveryError: error,
+      lastDeliveryErrorCode: errorCode,
+      deliveryFailureRunId: runId, runStats: tracking?.runStats ?? task.runStats,
+      deliveryFailureState: { ...state, targets: { ...state.targets, [chatId]: error } },
+      failureAlertSent: task.failureAlertSent === true || tracking?.crossedFailureThreshold ? true : undefined };
+  }, appId);
+  if (!changed) return current;
+  emitFailureAlertIfNeeded(runtimeTask(id, appId) ?? before, result);
+  dashboardEventBus.publish({ type: 'schedule.updated', body: { id,
+    patch: { lastStatus: runtimeTask(id, appId)?.lastStatus, lastError: error, lastDeliveryError: error } } });
+  notifyAfterSettle(before, id);
+  return true;
+}
+
+/** A late receipt corrects only this run and destination; never causes a resend.
+ * Returns false once a newer run owns the task, like recordDeliveryFailure. */
+export function recordDeliverySuccess(id: string, runId: string, appId: string, chatId = '__single'): boolean {
+  let current = false;
+  let changed = false;
+  mutateRuntimeTask(id, task => {
+    if (task.lastRunId !== runId) return;
+    current = true;
+    const state = task.deliveryFailureState;
+    if (state?.runId !== runId || !state.targets[chatId]) return;
+    changed = true;
+    const targets = { ...state.targets };
+    delete targets[chatId];
+    if (Object.keys(targets).length) return { ...task, deliveryFailureState: { ...state, targets },
+      lastDeliveryError: Object.values(targets)[0],
+      lastError: state.previousStatus === 'error' ? state.previousError : Object.values(targets)[0] };
+    const status = task.lastStatus === 'running' ? 'running' : state.previousStatus === 'error' ? 'error' : 'ok';
+    return { ...task, lastStatus: status, lastError: state.previousError,
+      lastDeliveryError: undefined, lastDeliveryErrorCode: undefined,
+      deliveryFailureRunId: undefined, deliveryFailureState: undefined,
+      runStats: task.runStats ? { ...task.runStats,
+        failed: Math.max(0, task.runStats.failed - (state.counted ? 1 : 0)),
+        consecutiveFailures: state.counted ? state.previousConsecutiveFailures : task.runStats.consecutiveFailures } : undefined,
+      failureAlertSent: state.previousStatus === 'error' ? task.failureAlertSent : undefined };
+  }, appId);
+  if (changed) {
+    const task = runtimeTask(id, appId);
+    dashboardEventBus.publish({ type: 'schedule.updated', body: { id,
+      patch: { lastStatus: task?.lastStatus, lastError: task?.lastError, lastDeliveryError: task?.lastDeliveryError } } });
+  }
+  return current;
 }
 
 /**
@@ -897,7 +1011,7 @@ async function tick(): Promise<void> {
   lastTickTz = tz;
 
   for (const task of tasks) {
-    if (!task.enabled) continue;
+    if (!task.enabled && !task.manualRunRequested) continue;
     if (!taskBelongsToThisDaemon(task)) continue;
 
     // An until-done task past its deadline gets its closing run now, whatever
@@ -968,10 +1082,12 @@ async function tick(): Promise<void> {
     const claimedTask = legacyClaim
       ? (legacyClaim.ok ? legacyClaim.task : undefined)
       : mutateRuntimeTask(task.id, current => {
-          if (current.lastStatus === 'running' || !current.enabled) return;
+          if (current.lastStatus === 'running' || (!current.enabled && !current.manualRunRequested)) return;
           const claimed: ScheduledTask = { ...current, lastRunAt: executionContext.startedAt,
             nextRunAt: newNext ?? undefined, lastRunId: executionContext.runId,
             lastStatus: 'running', lastError: undefined, lastDeliveryError: undefined,
+            manualRunAuthorization: !current.enabled && current.manualRunRequested
+              ? { runId: executionContext.runId, turnIds: [] } : undefined,
             // Re-arm for the next cycle: a pending manual flag belongs only to
             // the run that is being claimed now (mirrors legacy claimRun, which
             // deletes the field from storage and returns it on the snapshot).
@@ -1305,11 +1421,23 @@ export function addTask(params: {
     model: params.model?.trim() || undefined,
     reasoningEffort: params.reasoningEffort,
     ...untilDoneConfig,
-  }, params.larkAppId && authorityStore?.isInitialized(params.larkAppId)
-    ? candidate => project(authorityStore!.createDirect(candidate, audit?.directTurn))
-    : undefined);
+  }, authoritativeCreateFor(params.larkAppId, audit?.directTurn));
   logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${task.parsed.display}, next: ${task.nextRunAt ?? 'N/A'}`);
   return task;
+}
+
+/** The `authoritativeCreate` argument of scheduleStore.createTask: commits the
+ * candidate to the host authority and projects the committed row. Undefined
+ * when `appId` is not enrolled here, where createTask keeps the projection-only
+ * path. */
+export function authoritativeCreateFor(
+  appId: string | undefined,
+  directTurn?: { turnId: string; maxTasksPerTurn: number },
+): ((task: ScheduledTask) => ScheduledTask) | undefined {
+  assertScheduleAuthorityAvailable();
+  return appId && authorityStore?.isInitialized(appId)
+    ? candidate => project(authorityStore!.createDirect(candidate, directTurn))
+    : undefined;
 }
 
 /** Host-daemon only creation path for a one-shot delegated grant. It validates
@@ -1469,7 +1597,7 @@ export function disableTask(id: string): boolean {
     return true;
   }
   mutateRuntimeTask(id, current => ({ ...current,
-    enabled: false, disabledReason: 'manual', manualRunRequested: undefined }));
+    enabled: false, disabledReason: 'manual', manualRunRequested: undefined, manualRunAuthorization: undefined }));
   return true;
 }
 
@@ -1488,7 +1616,7 @@ export function runTaskNow(id: string): boolean {
     const requested = scheduleStore.requestRunNow(id);
     if (!requested.ok) return false;
   } else if (!mutateRuntimeTask(id, current => current.lastStatus === 'running'
-    ? undefined : { ...current, nextRunAt: new Date().toISOString() })) return false;
+    ? undefined : { ...current, nextRunAt: new Date().toISOString(), manualRunRequested: true })) return false;
   logger.info(`[scheduler] Marked "${task.name}" (${task.id}) for immediate run`);
   return true;
 }
@@ -1639,6 +1767,8 @@ export function runNow(id: string): { ok: boolean; error?: string } {
       ? undefined : { ...current, lastRunAt: executionContext.startedAt,
         nextRunAt: next ?? undefined, lastRunId: executionContext.runId,
         lastStatus: 'running', lastError: undefined, lastDeliveryError: undefined,
+        manualRunAuthorization: !current.enabled
+          ? { runId: executionContext.runId, turnIds: [] } : undefined,
         manualRunRequested: undefined });
   if (!claimedTask || claimedTask.lastRunId !== executionContext.runId) {
     return { ok: false, error: 'already_running' };
@@ -1674,7 +1804,8 @@ export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?:
   const task = runtimeTask(id);
   if (!task) return { ok: false, error: 'not_found' };
   if (task.enabled === enabled
-    && (enabled || (task.disabledReason === 'manual' && !task.manualRunRequested))) return { ok: true };
+    && (enabled || (task.disabledReason === 'manual' && !task.manualRunRequested
+      && !task.manualRunAuthorization))) return { ok: true };
   if (enabled && isUntilDoneClosed(task)) return { ok: false, error: 'schedule_until_done_closed' };
   if (enabled) {
     const next = untilDoneResumeNextRunAt(task, Date.now()) ?? computeNextRun(task.parsed);
@@ -1692,7 +1823,7 @@ export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?:
       scheduleStore.updateTask(id, { enabled: false, disabledReason: 'manual', manualRunRequested: undefined });
     } else {
       mutateRuntimeTask(id, current => ({ ...current,
-        enabled: false, disabledReason: 'manual', manualRunRequested: undefined }));
+        enabled: false, disabledReason: 'manual', manualRunRequested: undefined, manualRunAuthorization: undefined }));
     }
   }
   dashboardEventBus.publish({
@@ -2005,6 +2136,24 @@ export function updateTask(
       parsed = parseSchedule(updates.schedule);
     } catch (err) {
       return { ok: false, error: `invalid_schedule: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    // A claimed run settles against the task as it is when it finishes: a
+    // one-shot rule written mid-run would be consumed by the old recurring
+    // run, and an until-done settle would overwrite the new nextRunAt. Ask
+    // the caller to wait for the run to finish instead.
+    if (task.lastStatus === 'running') return { ok: false, error: 'schedule_run_in_flight' };
+    // A one-shot time already past would leave an enabled task that never fires.
+    if (parsed.kind === 'once' && computeNextRun(parsed) === null) {
+      return { ok: false, error: 'schedule_in_past' };
+    }
+    // Keep the until-done invariants `add` enforces: a retry interval only
+    // exists for a one-shot, and a one-shot may not start after the deadline.
+    if (task.untilDone?.retryMinutes !== undefined && parsed.kind !== 'once') {
+      return { ok: false, error: 'until_done_retry_requires_once' };
+    }
+    if (task.untilDone?.deadline && parsed.kind === 'once' && parsed.runAt
+      && Date.parse(parsed.runAt) > Date.parse(task.untilDone.deadline)) {
+      return { ok: false, error: 'until_done_deadline_before_first_run' };
     }
     patch.schedule = updates.schedule;
     patch.parsed = parsed;

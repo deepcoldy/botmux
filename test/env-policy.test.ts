@@ -5,6 +5,7 @@ import { envPolicyId, envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPo
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { ProtectedMcpWorkerPolicy } from '../src/core/protected-mcp-capabilities.js';
 
 const strict = { mode: 'strict' as const, inherit: ['HTTPS_PROXY', 'NODE_EXTRA_CA_CERTS', 'TOOLCHAIN_ROOT'] };
 const host = { HOME: '/test/home', PATH: '/usr/bin', LANG: 'C.UTF-8',
@@ -13,8 +14,30 @@ const host = { HOME: '/test/home', PATH: '/usr/bin', LANG: 'C.UTF-8',
   TOOLCHAIN_ROOT: 'tool-sentinel', GITHUB_TOKEN: 'daemon-sentinel', LARK_APP_SECRET: 'im-sentinel',
   BASH_ENV: '/test/poison', BOTMUX_DASHBOARD_FEISHU_H5_FUTURE: 'h5-sentinel',
 };
+const protectedPolicy: ProtectedMcpWorkerPolicy = {
+  capabilities: [],
+  protectedHomePaths: ['.fixture-credential'],
+  redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+};
 
 describe('per-bot environment policy', () => {
+  it('removes protected MCP credentials from worker, child, and configured injection environments', () => {
+    const worker = buildBotWorkerEnv({
+      FIXTURE_SECRET: 'host-secret',
+      FIXTURE_TOKEN: 'host-token',
+      BOTMUX_PROTECTED_SECRET_FD: '3',
+      KEEP: 'visible',
+    }, undefined, protectedPolicy);
+    const child = buildSessionChildEnv({ ...worker, FIXTURE_SECRET: 'rcfile-secret' }, undefined, undefined, protectedPolicy);
+    const injected = botInjectedEnv({ FIXTURE_TOKEN: 'configured-token', KEEP_INJECTED: 'yes' }, undefined, protectedPolicy);
+    for (const key of ['FIXTURE_SECRET', 'FIXTURE_TOKEN', 'BOTMUX_PROTECTED_SECRET_FD']) {
+      expect(worker[key], `worker ${key}`).toBeUndefined();
+      expect(child[key], `child ${key}`).toBeUndefined();
+      expect(injected[key], `injected ${key}`).toBeUndefined();
+    }
+    expect(worker.KEEP).toBe('visible');
+    expect(injected.KEEP_INJECTED).toBe('yes');
+  });
   it('defaults to historical inheritance plus mandatory redaction', () => {
     const env = buildSessionChildEnv(host);
     expect(env.UNLISTED_CLOUD_CREDENTIAL === host.UNLISTED_CLOUD_CREDENTIAL).toBe(true);
@@ -55,6 +78,13 @@ describe('per-bot environment policy', () => {
     for (const key of Object.keys(base).filter(key => key !== 'UNKNOWN_CREDENTIAL')) expect(worker[key]).toBe(base[key as keyof typeof base]);
     const child = buildSessionChildEnv(worker, { mode: 'strict' });
     for (const key of Object.keys(base)) expect(key in child, key).toBe(false);
+  });
+  it('keeps the fenced-run marker through strict worker, CLI and backend boundaries', () => {
+    const worker = buildBotWorkerEnv({ ...host, BOTMUX_FENCED_RUN: '1' }, strict);
+    const child = buildSessionChildEnv(worker, strict);
+    const pane = inheritBotEnv(child, { mode: 'strict' });
+    for (const [name, env] of Object.entries({ worker, child, pane })) expect(env.BOTMUX_FENCED_RUN, name).toBe('1');
+    expect('BOTMUX_FENCED_RUN' in buildSessionChildEnv(buildBotWorkerEnv(host, strict), strict)).toBe(false);
   });
   it('preserves per-session homes and workflows after trusted injection', () => {
     const env = buildSessionChildEnv({ ...host, CODEX_HOME: '/test/bot/codex', BOTMUX_WORKFLOW: '1', BOTMUX_GOAL_PATH: '/test/goal', SESSION_DATA_DIR: '/test/data' }, strict);

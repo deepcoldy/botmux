@@ -51,6 +51,13 @@ export interface ScheduleRunLogEntry {
   error?: string;
   /** Per-chat dispatch results for multi-chat tasks. Absent on legacy records. */
   targetResults?: ScheduleRunTargetResult[];
+  /** Preserve dispatch facts while late delivery observations correct the row. */
+  deliveryFailureBaseline?: {
+    outcome: ScheduleRunOutcome;
+    errorCode?: string;
+    error?: string;
+    targetResults?: ScheduleRunTargetResult[];
+  };
 }
 
 export interface ScheduleRunLogQueryOptions {
@@ -209,6 +216,8 @@ function projectEntry(value: unknown, expectedTaskId?: string): ScheduleRunLogEn
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const raw = value as Record<string, unknown>;
   const targetResults = projectTargetResults(raw.targetResults);
+  const baseline = raw.deliveryFailureBaseline as ScheduleRunLogEntry['deliveryFailureBaseline'];
+  const baselineTargets = baseline ? projectTargetResults(baseline.targetResults) : undefined;
   if (
     typeof raw.id !== 'string' || raw.id.length === 0 ||
     typeof raw.taskId !== 'string' || raw.taskId.length === 0 ||
@@ -222,7 +231,9 @@ function projectEntry(value: unknown, expectedTaskId?: string): ScheduleRunLogEn
     typeof raw.additionalPrompt !== 'boolean' ||
     (raw.errorCode !== undefined && typeof raw.errorCode !== 'string') ||
     (raw.error !== undefined && typeof raw.error !== 'string') ||
-    targetResults === null
+    targetResults === null || (baseline && (!OUTCOMES.has(baseline.outcome)
+      || (baseline.errorCode !== undefined && typeof baseline.errorCode !== 'string')
+      || (baseline.error !== undefined && typeof baseline.error !== 'string') || baselineTargets === null))
   ) {
     return undefined;
   }
@@ -243,6 +254,10 @@ function projectEntry(value: unknown, expectedTaskId?: string): ScheduleRunLogEn
       ? { error: truncateUtf8(raw.error, MAX_SCHEDULE_RUN_LOG_ERROR_BYTES) }
       : {}),
     ...(targetResults !== undefined ? { targetResults } : {}),
+    ...(baseline ? { deliveryFailureBaseline: { outcome: baseline.outcome,
+      ...(baseline.errorCode !== undefined ? { errorCode: baseline.errorCode } : {}),
+      ...(baseline.error !== undefined ? { error: truncateUtf8(baseline.error, MAX_SCHEDULE_RUN_LOG_ERROR_BYTES) } : {}),
+      ...(baselineTargets != null ? { targetResults: baselineTargets } : {}) } } : {}),
   };
 }
 
@@ -324,6 +339,9 @@ export function markScheduleRunLogFailed(
       : entry.targetResults;
     entries[index] = normalizeEntry({
       ...entry,
+      ...(failure.errorCode.startsWith('schedule_send_') ? { deliveryFailureBaseline:
+        entry.deliveryFailureBaseline ?? { outcome: entry.outcome, errorCode: entry.errorCode,
+          error: entry.error, targetResults: entry.targetResults } } : {}),
       outcome: 'error',
       errorCode: failure.errorCode,
       error: failure.error,
@@ -333,6 +351,35 @@ export function markScheduleRunLogFailed(
       mode: 0o600,
       followTargetSymlink: false,
     });
+    return true;
+  });
+}
+
+/** Reconcile a real receipt without erasing another target's delivery failure. */
+export function markScheduleRunLogDelivered(
+  taskId: string, runId: string, chatId: string, appId: string,
+  dataDir: string = config.session.dataDir,
+): boolean {
+  const path = scheduleRunLogPath(taskId, appId, dataDir);
+  if (!existsSync(dirname(path))) return false;
+  return withFileLockSync(path, () => {
+    const entries = readEntries(path, taskId);
+    const index = entries.findIndex(entry => entry.id === runId);
+    if (index < 0) return false;
+    const entry = entries[index]!;
+    const baseline = entry.deliveryFailureBaseline;
+    if (!baseline) return true;
+    const targets = entry.targetResults?.map(target => target.chatId === chatId
+      ? baseline.targetResults?.find(original => original.chatId === chatId) ?? target : target);
+    const remaining = targets?.find(target => {
+      const original = baseline.targetResults?.find(candidate => candidate.chatId === target.chatId);
+      return target.outcome === 'error' && (original?.outcome !== 'error' || original.error !== target.error);
+    });
+    entries[index] = normalizeEntry(remaining
+      ? { ...entry, targetResults: targets, error: remaining.error }
+      : { ...entry, ...baseline, targetResults: targets,
+          error: baseline.error, errorCode: baseline.errorCode, deliveryFailureBaseline: undefined });
+    atomicWriteFileSync(path, serialize(entries), { mode: 0o600, followTargetSymlink: false });
     return true;
   });
 }

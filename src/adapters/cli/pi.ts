@@ -9,6 +9,7 @@ import { wrapBracketedPaste } from './tui-input.js';
 import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
 import { PI_TURN_BOUNDARY_EXTENSION_SOURCE } from './pi-turn-boundary-extension-data.js';
 import { resolvePiModel } from './pi-model.js';
+import { discoverPiLocalModels } from './pi-local-models.js';
 import type { CliAdapter, PtyHandle, StructuredBridgeSpec } from './types.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { clearBotmuxPromptEnv } from '../../skills/zero-injection.js';
@@ -335,6 +336,7 @@ export function createPiAdapter(
     // (piSandboxSessionDir).
     authPaths: ['~/.pi/agent'],
     resolvedBin: bin,
+    detectModels: discoverPiLocalModels,
 
     buildArgs({
       sessionId,
@@ -369,6 +371,7 @@ export function createPiAdapter(
         larkToolAppId,
         replyDelivery: effectiveReplyDelivery,
         solo,
+        cliId: 'pi',
       });
 
       // Inject the Botmux routing prompt into the process environment so that
@@ -444,12 +447,17 @@ export function createPiAdapter(
     passesInitialPromptViaArgs: true,
 
     async writeInput(pty: PtyHandle, content: string) {
+      // Pi interprets Enter immediately after a backslash as a soft newline,
+      // even when that backslash arrived in a paste. End the paste on an empty
+      // line instead so the single Enter submits; Pi trims trailing whitespace
+      // in submitValue(), preserving the original trailing backslash.
+      const pastedContent = content.endsWith('\\') ? `${content}\n` : content;
       if (pty.pasteText && pty.sendSpecialKeys) {
-        pty.pasteText(content);
+        pty.pasteText(pastedContent);
         await delay(200);
         pty.sendSpecialKeys('Enter');
       } else {
-        pty.write(wrapBracketedPaste(content));
+        pty.write(wrapBracketedPaste(pastedContent));
         await delay(1000);
         pty.write('\r');
       }

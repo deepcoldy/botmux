@@ -43,12 +43,14 @@ export function parseBotmuxManifest(raw: unknown): BotmuxPluginManifest {
   const record = asRecord(raw, 'botmux_manifest');
   const id = assertValidPluginId(record.id, 'botmux_plugin_id');
   const displayName = optionalString(record.displayName);
+  const audience = optionalString(record.audience);
   const dependencies = readDependencies(record.dependencies);
   const service = readService(record.service);
   return {
     schemaVersion: 1,
     id,
     ...(displayName ? { displayName } : {}),
+    ...(audience ? { audience } : {}),
     ...(dependencies ? { dependencies } : {}),
     ...(service ? { service } : {}),
   };
@@ -58,6 +60,7 @@ export function parsePluginPackageManifest(raw: unknown): PluginPackageManifest 
   const record = asRecord(raw, 'package_json');
   const name = optionalString(record.name);
   const version = optionalString(record.version);
+  const description = optionalString(record.description);
   if (!name) throw new Error('plugin_package_missing_name');
   if (!version) throw new Error('plugin_package_missing_version');
   if (!PACKAGE_VERSION_RE.test(version)) throw new Error('invalid_plugin_package_version');
@@ -69,6 +72,7 @@ export function parsePluginPackageManifest(raw: unknown): PluginPackageManifest 
   return {
     name,
     version,
+    ...(description ? { description } : {}),
     ...(typeof record.type === 'string' ? { type: record.type } : {}),
     keywords,
     botmux,

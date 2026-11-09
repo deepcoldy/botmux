@@ -113,6 +113,13 @@ function cloneSession(session: Session): DurableJson {
   if (encoded === undefined) throw new Error('durable primary Session is not JSON-serializable');
   return JSON.parse(encoded) as DurableJson;
 }
+function preserveContractCheckpoint(current: Session, next: Session): Session {
+  if (current.sessionId !== next.sessionId || !current.sessionRuntimeContract) return next;
+  const saved = current.sessionRuntimeContract;
+  if ((next.sessionRuntimeContract?.session.revision ?? -1) >= saved.session.revision) return next;
+  return { ...next, sessionRuntimeContract: saved, sessionContractRevision: saved.session.revision,
+    sessionLifecycle: saved.session.lifecycle, status: saved.session.lifecycle === 'closed' ? 'closed' : 'active' };
+}
 
 function sameAdmission(
   left: DurablePrimarySessionAdmission,
@@ -215,6 +222,15 @@ export function durablePrimarySessionProjection(
     admissions: [admission],
   };
   return { sessionKey: identity.sessionKey, value: value as unknown as DurableJson };
+}
+
+/** The canonical Session behind a primary key, or undefined when there is none.
+ * A shadow row left at the same key from before a controlled switch to primary
+ * mode counts as none, exactly as admission treats it (see
+ * mergePrimaryProjection); a malformed primary envelope still throws. */
+export function canonicalPrimarySession(record: DurableSessionRecord | undefined): Session | undefined {
+  if (!record || object(record.value)?.type !== 'botmux.session.primary') return undefined;
+  return parseDurablePrimarySessionRecord(record).session;
 }
 
 /** Parse a full primary snapshot for failover restore and validate its routing key. */
@@ -327,6 +343,7 @@ function mergePrimaryProjection(
         throw new Error(`durable primary Session ${current.sessionKey} has an invalid next snapshot`);
       }
       if (parsed.session.sessionId === nextSession.sessionId) {
+        next = { ...next, session: cloneSession(preserveContractCheckpoint(parsed.session, nextSession)) };
         previousAdmissions = parsed.admissions;
         previousControls = parsed.controls;
       } else if (parsed.session.status === 'active') {
@@ -391,7 +408,7 @@ export async function commitDurableLarkSessionControl(input: {
     const next: DurablePrimarySessionProjection = {
       version: DURABLE_PRIMARY_SESSION_VERSION,
       type: 'botmux.session.primary',
-      session: sessionValue,
+      session: cloneSession(preserveContractCheckpoint(parsed.session, sessionValue as unknown as Session)),
       admission: parsed.admission,
       admissions: parsed.admissions,
       control,
@@ -455,7 +472,7 @@ export async function checkpointDurableLarkSession(input: {
     const terminal = confirmations.filter(item => !pending.includes(item));
     const retained = [...(pending.length < 64 ? terminal.slice(-(64 - pending.length)) : []), ...pending];
     const value = retained.length ? { ...nextSession, codexEffortTaskConfirmations: retained } : nextSession;
-    return { ...object(current.value)!, session: cloneSession(value) } as DurableJson;
+    return { ...object(current.value)!, session: cloneSession(preserveContractCheckpoint(parsed.session, value)) } as DurableJson;
   });
   input.assertCurrent?.();
   if (written.kind !== 'written' && written.kind !== 'unchanged') return written;

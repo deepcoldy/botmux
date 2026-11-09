@@ -68,6 +68,7 @@ vi.mock('../src/services/session-store.js', () => ({
 
 const sendWorkerSessionInputMock = vi.fn();
 const isSessionTransferringMock = vi.fn(() => false);
+const sessionAcceptsDirectCommandMock = vi.fn(() => true);
 
 vi.mock('../src/core/worker-pool.js', async () => {
   const { supportsIdleAutoCompact } = await vi.importActual<typeof import('../src/core/idle-auto-compact.js')>('../src/core/idle-auto-compact.js');
@@ -94,6 +95,9 @@ vi.mock('../src/core/worker-pool.js', async () => {
   parkStreamCard: vi.fn(),
   clearUsageLimitState: vi.fn(),
   cardUsageLimit: vi.fn(() => undefined),
+  cachedStreamingCardStatus: vi.fn(() => 'idle'),
+  cachedStreamCardLabel: vi.fn(() => undefined),
+  streamingCardPresentationImageKey: vi.fn(() => undefined),
   writableTerminalLinkFor: vi.fn(() => undefined),
   workerHasInitialized: vi.fn(() => true),
   sessionSupportsWebTerminal: vi.fn(() => true),
@@ -105,9 +109,11 @@ vi.mock('../src/core/worker-pool.js', async () => {
   CARD_POSTING_SENTINEL: '__posting__',
   requestSessionRestart: vi.fn(),
   isSessionTransferring: (...args: any[]) => isSessionTransferringMock(...args),
+  sessionAcceptsDirectCommand: (...args: any[]) => sessionAcceptsDirectCommandMock(...args),
   getDaemonStreamingCardUsageSnapshot: vi.fn(() => undefined),
   withActiveSessionKeyLock: vi.fn(async (_map: any, _key: string, action: () => any) => action()),
   buildStreamingCardJson: vi.fn(() => '{"elements":[]}'),
+  substituteCardControlFor: vi.fn(() => undefined),
   silentIdleCardFlag: vi.fn(() => false),
   idleCardLabel: vi.fn(() => undefined),
   streamCardLabel: vi.fn(() => undefined),
@@ -160,9 +166,11 @@ vi.mock('../src/global-config.js', () => ({
 import { handleCardAction } from '../src/im/lark/card-handler.js';
 import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { getBot } from '../src/bot-registry.js';
+import { persistStreamCardState } from '../src/core/session-manager.js';
 import { sessionKey, sessionAnchorId, type DaemonSession } from '../src/core/types.js';
 import type { Session } from '../src/types.js';
 import { sensitiveCardActionMeta } from '../src/im/lark/card-action-routes.js';
+import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 
 const LARK_APP_ID = 'cli_app_1';
 const OWNER = 'ou_owner_user';
@@ -229,6 +237,7 @@ beforeEach(() => {
   sendWorkerSessionInputMock.mockReset();
   isSessionTransferringMock.mockReset();
   isSessionTransferringMock.mockReturnValue(false);
+  sessionAcceptsDirectCommandMock.mockReset().mockReturnValue(true);
   vi.mocked(canOperate).mockReset();
   vi.mocked(canOperate).mockReturnValue(true);
 });
@@ -341,6 +350,55 @@ describe('stop_turn card action', () => {
 // ─── compact_session ──────────────────────────────────────────────────────
 
 describe('compact_session card action', () => {
+  it('keeps the MiniMax click fence when bookkeeping throws after the delivery receipt', async () => {
+    const ds = makeDs({ cliReady: true, sessionOverrides: { cliId: 'minimax' } });
+    const deliver = vi.fn((_ds: DaemonSession, _cmd: string, opts: { onDelivered(): void }) => {
+      opts.onDelivered(); throw new Error('post-enqueue save failed');
+    });
+    const deps = depsWith(ds, deliver);
+    expect((await handleCardAction(actionData('compact_session'), deps, LARK_APP_ID)).toast.type).toBe('success');
+    expect(ds.cliReady).toBe(false);
+    expect((await handleCardAction(actionData('compact_session'), deps, LARK_APP_ID)).toast.type).toBe('warning');
+    expect(deliver).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves MiniMax ready when delivery throws before acceptance', async () => {
+    const ds = makeDs({ cliReady: true, sessionOverrides: { cliId: 'minimax' } });
+    const deliver = vi.fn(() => { throw new Error('not enqueued'); });
+    expect((await handleCardAction(actionData('compact_session'), depsWith(ds, deliver), LARK_APP_ID)).toast.type).toBe('warning');
+    expect(ds.cliReady).toBe(true);
+  });
+  it('delivers MiniMax compact as a distinct turn and holds repeat clicks until the next prompt', async () => {
+    const ds = makeDs({ cliReady: true, sessionOverrides: { cliId: 'minimax' } });
+    const deliver = vi.fn((_ds: DaemonSession, _command: string, _turn: { turnId: string }) => true);
+    const deps = depsWith(ds, deliver);
+    expect((await handleCardAction(actionData('compact_session'), deps, LARK_APP_ID)).toast.type).toBe('success');
+    expect(deliver).toHaveBeenCalledWith(ds, '/compact', expect.objectContaining({ messageId: 'om_clicked', turnId: expect.any(String) }));
+    const firstTurn = deliver.mock.calls[0][2].turnId;
+    expect(ds.cliReady).toBe(false);
+    expect((await handleCardAction(actionData('compact_session'), deps, LARK_APP_ID)).toast.type).toBe('warning');
+    expect(deliver).toHaveBeenCalledTimes(1);
+    ds.cliReady = true;
+    expect((await handleCardAction(actionData('compact_session'), deps, LARK_APP_ID)).toast.type).toBe('success');
+    expect(deliver.mock.calls[1][2].turnId).not.toBe(firstTurn);
+  });
+
+  it('refuses MiniMax compact while the ordinary input boundary is busy', async () => {
+    const ds = makeDs({ cliReady: true, sessionOverrides: { cliId: 'minimax' } });
+    const deliver = vi.fn(() => true);
+    sessionAcceptsDirectCommandMock.mockReturnValue(false);
+    expect((await handleCardAction(actionData('compact_session'), depsWith(ds, deliver), LARK_APP_ID)).toast.type).toBe('warning');
+    expect(deliver).not.toHaveBeenCalled();
+    expect(ds.cliReady).toBe(true);
+  });
+
+  it('keeps MiniMax ready and reports failure when compact was not accepted', async () => {
+    const ds = makeDs({ cliReady: true, sessionOverrides: { cliId: 'minimax' } });
+    const deliver = vi.fn(() => false);
+    expect((await handleCardAction(actionData('compact_session'), depsWith(ds, deliver), LARK_APP_ID)).toast.type).toBe('warning');
+    expect(deliver).toHaveBeenCalledTimes(1);
+    expect(ds.cliReady).toBe(true);
+  });
   it('delivers /compact via the wired passthrough dep with the session anchor', async () => {
     const ds = makeDs();
     const deliver = vi.fn();
@@ -412,7 +470,7 @@ describe('compact_session card action', () => {
   // mira/mir 把它当**普通用户消息**发给模型白烧一个 turn。router
   // （resolvePassthroughCommands）对这些 CLI 返回空集，handler 也必须拒——否则
   // 卡片侧闸门一旦再漏，这条路又会被打开（本次缺陷正是这么发生的）。
-  it.each(['mira', 'mir', 'dsh', 'ebsd', 'codex-app', 'minimax'])(
+  it.each(['mira', 'mir', 'dsh', 'ebsd', 'codex-app'])(
     'refuses for %s (no raw passthrough surface) instead of writing a literal /compact',
     async (cliId) => {
       const ds = makeDs({ sessionOverrides: { cliId } as any });
@@ -488,7 +546,7 @@ describe('reasoning selector card callback', () => {
     ds.worker = null;
     ds.session.suspendedColdResume = true;
     const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
-    expect(setSessionReasoningEffort).toHaveBeenCalledWith(ds, 'high');
+    expect(setSessionReasoningEffort).toHaveBeenCalledWith(ds, 'high', expect.objectContaining({ source: 'card' }));
     expect(result).toMatchObject({ toast: { type: 'success' }, card: { type: 'raw' } });
     expect(sendWorkerSessionInputMock).not.toHaveBeenCalled();
   });
@@ -501,7 +559,7 @@ describe('reasoning selector card callback', () => {
     const { ds, data } = setup();
     const result = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
     expect(result.toast.type).toBe('info');
-    expect(pool.updateCodexCliEffort).toHaveBeenCalledWith(ds, 'high');
+    expect(pool.updateCodexCliEffort).toHaveBeenCalledWith(ds, 'high', undefined, expect.any(Function), expect.objectContaining({ source: 'card' }));
     expect(pool.setSessionReasoningEffort).not.toHaveBeenCalled();
     expect(pool.deliverEphemeralOrReply).not.toHaveBeenCalled();
     expect(ds.session.reasoningEffort).toBe('ultra');
@@ -623,5 +681,138 @@ describe('toggle_idle_compact card action', () => {
     expect(result.toast.type).toBe('warning');
     expect(ds.session.idleAutoCompact).toBeUndefined();
     expect(sensitiveCardActionMeta('toggle_idle_compact')).toBeDefined();
+  });
+});
+
+// ─── toggle_keys_panel ───────────────────────────────────────────────────
+
+describe('toggle_keys_panel card action', () => {
+  beforeEach(() => {
+    vi.mocked(persistStreamCardState).mockClear();
+  });
+
+  function toggleAction(messageId = 'om_stream_card', nonce = 'nonce_live') {
+    const data = actionData('toggle_keys_panel');
+    data.context.open_message_id = messageId;
+    data.action.value.card_nonce = nonce;
+    return data;
+  }
+
+  /** The toggle button exactly as the real builder draws it, clicked on the live card. */
+  function clickRenderedToggle(drawnOpen: boolean) {
+    const card = JSON.parse(buildStreamingCard(
+      SID, ROOT, '', 'title', '', 'idle' as never, 'claude-code', 'screenshot', 'nonce_live',
+      undefined, false, false, undefined, undefined, undefined, false,
+      undefined, undefined, undefined, undefined, undefined, [], false, undefined, drawnOpen,
+    ));
+    const toggle = card.elements
+      .flatMap((element: any) => element.actions ?? [])
+      .find((button: any) => button.value?.action === 'toggle_keys_panel');
+    return {
+      operator: { open_id: OWNER },
+      action: { value: { ...toggle.value } },
+      context: { open_message_id: 'om_stream_card' },
+    };
+  }
+
+  function termKeysIn(node: any): string[] {
+    if (!node || typeof node !== 'object') return [];
+    const own = node.tag === 'button' && node.value?.action === 'term_action' ? [node.value.key] : [];
+    return [...own, ...Object.values(node).flatMap(termKeysIn)];
+  }
+
+  it('flips the session flag, persists it, and rebuilds the card', async () => {
+    const ds = makeDs({ streamCardNonce: 'nonce_live' });
+    expect(ds.keysPanelOpen).toBeFalsy();
+    const result = await handleCardAction(toggleAction(), depsWith(ds), LARK_APP_ID);
+    expect(ds.keysPanelOpen).toBe(true);
+    expect(persistStreamCardState).toHaveBeenCalledWith(ds);
+    // scheduleCardPatch mock returns falsy → the rebuilt card rides the callback.
+    expect(result).toBeDefined();
+  });
+
+  it('a double tap on the collapsed card leaves the grid open', async () => {
+    const ds = makeDs({ streamCardNonce: 'nonce_live' });
+    await handleCardAction(clickRenderedToggle(false), depsWith(ds), LARK_APP_ID);
+    await handleCardAction(clickRenderedToggle(false), depsWith(ds), LARK_APP_ID);
+    expect(ds.keysPanelOpen).toBe(true);
+  });
+
+  it('opens on the first click when the card was drawn collapsed while the session was open', async () => {
+    const ds = makeDs({ keysPanelOpen: true, streamCardNonce: 'nonce_live' });
+    await handleCardAction(clickRenderedToggle(false), depsWith(ds), LARK_APP_ID);
+    expect(ds.keysPanelOpen).toBe(true);
+    expect(persistStreamCardState).toHaveBeenCalledWith(ds);
+  });
+
+  it('collapses from the expanded card', async () => {
+    const ds = makeDs({ keysPanelOpen: true, streamCardNonce: 'nonce_live' });
+    await handleCardAction(clickRenderedToggle(true), depsWith(ds), LARK_APP_ID);
+    expect(ds.keysPanelOpen).toBe(false);
+  });
+
+  it('keeps an open grid on the card re-rendered after a key press', async () => {
+    const ds = makeDs({ keysPanelOpen: true, displayMode: 'screenshot', streamCardNonce: 'nonce_live' });
+    const data = actionData('term_action');
+    data.action.value.key = 'down';
+    const card = await handleCardAction(data, depsWith(ds), LARK_APP_ID);
+    expect(sendWorkerSessionInputMock).toHaveBeenCalledWith(ds, { type: 'term_action', key: 'down' });
+    expect(termKeysIn(card)).toHaveLength(11);
+  });
+
+  it('flips back on a second click', async () => {
+    const ds = makeDs({ keysPanelOpen: true, streamCardNonce: 'nonce_live' });
+    await handleCardAction(toggleAction(), depsWith(ds), LARK_APP_ID);
+    expect(ds.keysPanelOpen).toBe(false);
+  });
+
+  it('refuses on a closed session without mutating state', async () => {
+    const ds = makeDs({ sessionOverrides: { status: 'closed' } });
+    const result = await handleCardAction(actionData('toggle_keys_panel'), depsWith(ds), LARK_APP_ID);
+    expect(result.toast.type).toBe('warning');
+    expect(ds.keysPanelOpen).toBeFalsy();
+  });
+
+  it('rejects panel toggles in primary mode without changing local state', async () => {
+    vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+    try {
+      const ds = makeDs({ streamCardNonce: 'nonce_live' });
+      const result = await handleCardAction(toggleAction(), depsWith(ds), LARK_APP_ID);
+      expect(result?.toast?.type).toBe('warning');
+      expect(ds.keysPanelOpen).toBeFalsy();
+      expect(persistStreamCardState).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('rejects panel toggles from a non-operator', async () => {
+    vi.mocked(canOperate).mockReturnValue(false);
+    const ds = makeDs({ streamCardNonce: 'nonce_live' });
+    await handleCardAction(toggleAction(), depsWith(ds), LARK_APP_ID);
+    expect(ds.keysPanelOpen).toBeFalsy();
+    expect(persistStreamCardState).not.toHaveBeenCalled();
+  });
+
+  it('is registered behind the canOperate gate', () => {
+    expect(sensitiveCardActionMeta('toggle_keys_panel')).toBeDefined();
+  });
+
+  it('reports a session that is no longer active', async () => {
+    const result = await handleCardAction(toggleAction(), depsWith(undefined), LARK_APP_ID);
+    expect(result?.toast.type).toBe('warning');
+    expect(persistStreamCardState).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['om_old_card', 'nonce_live'],
+    ['om_stream_card', 'nonce_old'],
+  ])('keeps live state unchanged for stale card identity %s / %s', async (messageId, nonce) => {
+    const ds = makeDs({ streamCardNonce: 'nonce_live' });
+    const result = await handleCardAction(toggleAction(messageId, nonce), depsWith(ds), LARK_APP_ID);
+    // Nothing will happen on this card, so the toast must not claim the click is being processed.
+    expect(result?.toast?.type).toBe('warning');
+    expect(ds.keysPanelOpen).toBeFalsy();
+    expect(persistStreamCardState).not.toHaveBeenCalled();
   });
 });

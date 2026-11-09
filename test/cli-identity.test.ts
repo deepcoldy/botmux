@@ -235,7 +235,7 @@ describe('clearSessionIdentity', () => {
 describe('tmux env passthrough covers the identity vars', () => {
   it('forwards the shim and git-attribution vars into a pane', async () => {
     const { BOTMUX_INJECTED_ENV_KEYS } = await import('../src/utils/child-env.js');
-    for (const key of ['BOTMUX_IDENTITY_BIN', 'ZDOTDIR', 'BASH_ENV', 'GIT_ASKPASS', 'GIT_CONFIG_COUNT']) {
+    for (const key of ['BOTMUX_IDENTITY_BIN', 'BOTMUX_WRAPPER_BIN', 'ZDOTDIR', 'BASH_ENV', 'GIT_ASKPASS', 'GIT_CONFIG_COUNT']) {
       expect(BOTMUX_INJECTED_ENV_KEYS).toContain(key);
     }
   });
@@ -512,6 +512,32 @@ describe('installLoginShellPathShim', () => {
     expect(resolved).toBe(join(wrapperDir, 'faketool'));
   });
 
+  it.each(SHELLS)('keeps the botmux wrapper directory after a %s login shell rebuilds PATH', shell => {
+    const wrapperDir = fakeWrapperDir();
+    const botmuxBinDir = join(dir, 'botmux-bin');
+    mkdirSync(botmuxBinDir, { recursive: true });
+    const botmuxProbe = join(botmuxBinDir, 'botmux-probe');
+    writeFileSync(botmuxProbe, '#!/bin/sh\nprintf botmux\n');
+    chmodSync(botmuxProbe, 0o755);
+    writeFileSync(join(dir, '.zprofile'), 'export PATH=/usr/bin:/bin\n');
+    writeFileSync(join(dir, '.bash_profile'), 'export PATH=/usr/bin:/bin\n');
+    const { zdotdir, bashEnv } = installLoginShellPathShim(wrapperDir);
+
+    const resolved = execFileSync(shell, ['-lc', 'command -v botmux-probe'], {
+      encoding: 'utf8',
+      env: {
+        PATH: loginShellPath(wrapperDir, botmuxBinDir),
+        HOME: dir,
+        BOTMUX_IDENTITY_BIN: wrapperDir,
+        BOTMUX_WRAPPER_BIN: botmuxBinDir,
+        ZDOTDIR: zdotdir,
+        BASH_ENV: bashEnv,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    expect(resolved).toBe(botmuxProbe);
+  });
+
   // Proves the test above is actually testing something: without the shim the
   // wrapper does NOT win.
   //
@@ -747,6 +773,9 @@ describe('renderIdentityWrapper', () => {
     [['--site', 'cn'], { BYTEDCLI_CLOUD_SITE: 'i18n' }, 'cn-tok'],
     [['--site', 'boe'], {}, 'cn-tok'],
     [['--', '--site', 'i18n'], {}, 'cn-tok'],
+    [['--site', 'ROW', 'auth'], { BYTEDCLI_CLOUD_SITE: 'us-ttp' }, 'i18n-tok'],
+    [['--site', 'prod'], { BYTEDCLI_CLOUD_SITE: 'I18N-TT' }, 'cn-tok'],
+    [['--', '--site', 'row'], { BYTEDCLI_CLOUD_SITE: ' usttp ' }, 'tx-tok'],
   ] as const)('selects the ByteCloud JWT for the call site: %j %j', (args, env, expected) => {
     const tool = join(dir, 'real-bytedcli.sh');
     writeFileSync(tool, '#!/bin/sh\nprintf "%s|%s|%s" "$BYTEDCLI_USER_CLOUD_JWT" "$BOTMUX_IDENTITY_CLOUD_JWT_I18N" "$*"\n');
@@ -790,12 +819,28 @@ describe('renderIdentityWrapper', () => {
     expect(bytedcliSiteToken([], { BYTEDCLI_CLOUD_SITE: site })).toBe(token);
   });
 
-  // Known-gap layer: alias/case normalization is deliberately deferred to
-  // #2506. That change must flip these assertions to the normalized token.
-  // Ordinary behavior assertions work under both Vitest and Bun 1.4.3;
-  // Bun does not implement it.fails.
-  it.each(['row', 'usttp', 'I18N-TT'])('known gap: alias/case %s selects the default JWT (#2506)', site => {
-    expect(bytedcliSiteToken(['--site', site])).toBe('cn-tok');
+  // bytedcli normalizeCloudSiteSelection: trim, lowercase, then resolve
+  // CLOUD_SITE_ALIAS_MAP (identical in 0.173–0.187).
+  const aliasSiteClaims = [
+    ['row', 'i18n-tok'], ['i18ntt', 'i18n-tok'], ['tiktok-row', 'i18n-tok'],
+    ['euttp', 'i18n-tok'], ['ttp-eu', 'i18n-tok'],
+    ['usttp', 'tx-tok'], ['tx-ttp', 'tx-tok'], ['ttp-us', 'tx-tok'], ['ttp-us-limited', 'tx-tok'],
+    ['usttpbdee', 'tx-tok'], ['usttpusts', 'tx-tok'],
+    ['prod', 'cn-tok'], ['online', 'cn-tok'], ['sinf-cn', 'cn-tok'], ['boei18n', 'cn-tok'], ['boe-i18n', 'cn-tok'],
+    ['I18N-TT', 'i18n-tok'], ['US-TTP', 'tx-tok'], ['I18N', 'bd-tok'], ['Row', 'i18n-tok'],
+    [' i18n-tt ', 'i18n-tok'], ['\tUSTTP\n', 'tx-tok'], ['  ', 'cn-tok'],
+  ] as const;
+  it.each(aliasSiteClaims)('normalizes the site like bytedcli before choosing the partition: %j', (site, token) => {
+    expect(bytedcliSiteToken(['--site', site])).toBe(token);
+    expect(bytedcliSiteToken([`--site=${site}`])).toBe(token);
+    expect(bytedcliSiteToken([], { BYTEDCLI_CLOUD_SITE: site })).toBe(token);
+  });
+
+  // us-ttpbd is scoped to bmq / apm argos log / cloud-ticket; bytedcli sends
+  // an i18n-bd JWT for all three (jwt_site / authSite "i18n-bd").
+  it('uses the i18n-bd partition for the scoped us-ttpbd site', () => {
+    expect(bytedcliSiteToken(['--site', 'us-ttpbd', 'bmq'])).toBe('bd-tok');
+    expect(bytedcliSiteToken(['bmq'], { BYTEDCLI_CLOUD_SITE: 'US-TTPBD' })).toBe('bd-tok');
   });
 
   it('keeps the default ByteCloud JWT for a site whose region has no token', () => {

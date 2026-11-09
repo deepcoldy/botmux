@@ -11,6 +11,7 @@ import {
   type BotDefaultsTab,
 } from '../src/dashboard/web/bot-defaults-page.js';
 import { isOnboardingSubmitDisabled } from '../src/dashboard/web/bot-onboarding.js';
+import { DropdownMenu } from '../src/dashboard/web/dashboard-components.js';
 
 // Profile scanning has its own component/browser tests. Keep these agent-save
 // contract tests independent of that additional GET request.
@@ -22,13 +23,21 @@ vi.mock('../src/dashboard/web/codex-profile-picker.js', () => ({
 const originalFetch = globalThis.fetch;
 afterEach(() => { vi.unstubAllGlobals(); globalThis.fetch = originalFetch; });
 
-// Readiness timing/responses have dedicated coverage. Keep this fixture's
-// request recorders scoped to the save/model APIs they assert.
-function stubReadinessProbe(): void {
+// Readiness and pin summaries have dedicated coverage. Keep this fixture's
+// request recorders scoped to the save/model APIs they assert, without hiding writes.
+function stubAgentAuxiliaryReads(): void {
   const configuredFetch = globalThis.fetch;
-  vi.stubGlobal('fetch', ((url: any, init?: any) => String(url).includes('/api/cli-options/availability?')
-    ? Promise.resolve({ ok: true, json: async () => ({ status: 'unknown' }) } as Response)
-    : configuredFetch(url, init)) as typeof fetch);
+  vi.stubGlobal('fetch', ((url: any, init?: any) => {
+    if (!init?.method || init.method === 'GET') {
+      if (String(url).includes('/api/cli-options/availability?')) {
+        return Promise.resolve({ ok: true, json: async () => ({ status: 'unknown' }) } as Response);
+      }
+      if (/^\/api\/bots\/[^/]+\/model-pins$/.test(String(url))) {
+        return Promise.resolve({ ok: true, json: async () => ({ ok: true, total: 0, protected: 0 }) } as Response);
+      }
+    }
+    return configuredFetch(url, init);
+  }) as typeof fetch);
 }
 
 describe('bot defaults task tabs', () => {
@@ -143,7 +152,7 @@ describe('Codex-compatible runtime editor', () => {
   };
 
   function renderAgent(bot: Record<string, any>, patchBot = vi.fn()) {
-    stubReadinessProbe();
+    stubAgentAuxiliaryReads();
     let renderer!: TestRenderer.ReactTestRenderer;
     act(() => {
       renderer = TestRenderer.create(React.createElement(BotAgentSection, {
@@ -279,8 +288,9 @@ describe('Codex-compatible runtime editor', () => {
       expect(requests[1]).not.toHaveProperty('replaceCliSelection');
       // The picker can deliberately choose the same key. This is distinguishable
       // from an untouched fallback key even for an unregistered Codex wrapper.
-      act(() => root.findByProps({ id: 'bd-menu-agentCliId' }).findAllByType('button')
-        .find(button => button.props['aria-current'] === 'true')!.props.onClick());
+      const cliMenu = root.find(node => node.type === DropdownMenu && node.props.id === 'bd-menu-agentCliId');
+      expect(cliMenu.props.notifyOnReselect).toBe(true);
+      act(() => cliMenu.props.onChange(cliMenu.props.value));
       await save();
       expect(requests[2]).toMatchObject({ cliId: key, replaceCliSelection: true });
       expect(patchBot).toHaveBeenLastCalledWith('cli_runtime', expect.objectContaining({ wrapperCli: null }));
@@ -620,7 +630,7 @@ describe('Codex-compatible runtime editor', () => {
       } as any;
     });
     try {
-      stubReadinessProbe();
+      stubAgentAuxiliaryReads();
       const grokCliState = {
         options: [
           { id: 'grok', label: 'Grok' },
@@ -672,7 +682,7 @@ describe('Codex-compatible runtime editor', () => {
       } as any;
     });
     try {
-      stubReadinessProbe();
+      stubAgentAuxiliaryReads();
       const traexCliState = {
         options: [
           { id: 'traex', label: 'TraeX' },
@@ -1187,7 +1197,7 @@ describe('Codex-compatible runtime editor', () => {
   };
 
   function renderBudget(bot: Record<string, any>, patchBot = vi.fn()) {
-    stubReadinessProbe();
+    stubAgentAuxiliaryReads();
     let renderer!: TestRenderer.ReactTestRenderer;
     act(() => {
       renderer = TestRenderer.create(React.createElement(BotAgentSection, {
@@ -2452,7 +2462,8 @@ describe('card behavior defaults', () => {
 
     const grid = renderer.root.findByProps({ 'data-card-button-grid': true });
     const toggles = grid.findAllByProps({ className: 'toggle-row bd-card-button-toggle' });
-    expect(toggles).toHaveLength(6);
+    // 紧凑网格逐一枚举 STREAMING_CARD_BUTTON_IDS（output/terminal/writeLink/compact/stop/close/substitute）。
+    expect(toggles).toHaveLength(7);
     expect(toggles.every(toggle => toggle.findAllByType('small').length === 0)).toBe(true);
   });
 

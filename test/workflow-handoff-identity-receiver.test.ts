@@ -58,6 +58,8 @@ const { CHAT, INITIATOR_MAIN_OU, INITIATOR_OU_IN, INITIATOR_UNION, MAIN, SECRET,
 const { nonceOf } = await import('./helpers/workflow-handoff-harness.js');
 const { validateDag } = await import('../src/workflows/v3/dag.js');
 const { getLarkToolDelegation, currentLarkToolDelegation, clearLarkToolDelegations } = await import('../src/core/lark-tool-delegation.js');
+const { parseScheduledTurnId } = await import('../src/core/scheduled-turn-provenance.js');
+const { prepareScheduledRecoveryRun } = await import('../src/core/scheduled-send.js');
 
 const SESSION = 'sess-node';
 const MAIN_BOT_IN_A = 'ou_main_bot_in_a';
@@ -139,6 +141,9 @@ async function receiver(opts: { self?: boolean; alsoApproved?: string[]; main?: 
     checkWorkflowHandoffIdentityTarget, workflowSelfAppId: () => appId,
     identityDecisionTurnIsLive: vi.fn(() => true),
     getLarkToolDelegation,
+    // prepareTurnCliIdentity took a scheduled-turn guard; the handoff id is a
+    // plain message id so recovery stays inert, but the free identifiers must resolve.
+    parseScheduledTurnId, prepareScheduledRecoveryRun,
   };
   const fns = daemonFunctions(scope);
   const identity = (turnId = handoff) => recallProvenIdentityContent(world.dataDir, SESSION, turnId, 'bytedcli') ?? '';

@@ -101,6 +101,13 @@ const desktopShellInjectedCss = `
   .attention-strip {
     margin-top: 0 !important;
   }
+
+  .chrome-body {
+    /* The browser layout gets its left gutter from .workspace's margin-left
+       (sidebar + gap), which is zeroed above; give the content the same gutter
+       the right edge already has so pages do not sit flush on the rail. */
+    padding-left: var(--chrome-x) !important;
+  }
 `;
 const messages: Record<DesktopLocale, Record<string, string>> = {
   zh: {
@@ -121,6 +128,8 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'nav.botDefaults': 'Bot 配置',
     'nav.agents': 'Agent',
     'nav.skills': 'Skills',
+    'nav.customization': '自定义',
+    'nav.feedback': '反馈分析',
     'nav.connectors': 'Webhook',
     'nav.settings': '设置',
     'summary.onlineDaemons': '在线 Daemon',
@@ -207,6 +216,8 @@ const messages: Record<DesktopLocale, Record<string, string>> = {
     'nav.botDefaults': 'Bot Profiles',
     'nav.agents': 'Agents',
     'nav.skills': 'Skills',
+    'nav.customization': 'Customization',
+    'nav.feedback': 'Feedback',
     'nav.connectors': 'Webhook',
     'nav.settings': 'Settings',
     'summary.onlineDaemons': 'Online daemons',

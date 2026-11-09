@@ -10,6 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { validateCodexServiceTier } from '../src/services/codex-service-tier-catalog.js';
+import { resolveEffectiveFeedbackPolicy, type FeedbackPolicyLayer } from '../src/services/feedback-policy-resolver.js';
 
 vi.mock('../src/services/codex-service-tier-catalog.js', () => ({
   validateCodexServiceTier: vi.fn(async () => ({ ok: true })),
@@ -184,6 +185,70 @@ describe('bot-config store', () => {
     expect(readConfig().reasoningEffort).toBe('high');
     expect(registry.getBot('app_default').config.reasoningEffort).toBe('high');
     expect((await store.applyConfigField('app_default', spec, null, precondition)).ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBeUndefined();
+  });
+
+  it('saves MiniMax effort and requires clearing it before switching to a model without levels', async () => {
+    const { registry, store } = await loaded({ cliId: 'minimax', model: 'minimax/MiniMax-M3.1-Flash' });
+    const effort = store.findConfigField('reasoningEffort')!;
+    expect((await store.applyConfigField('app_default', effort, 'xhigh')).ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBe('xhigh');
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('xhigh');
+    expect(registry.loadBotConfigs()[0].reasoningEffort).toBe('xhigh');
+    expect(await store.applyConfigField('app_default', store.findConfigField('model')!, 'minimax/MiniMax-M3'))
+      .toMatchObject({ ok: false, reason: 'reasoning_effort_not_supported_by_model' });
+    expect(readConfig()).toMatchObject({ model: 'minimax/MiniMax-M3.1-Flash', reasoningEffort: 'xhigh' });
+    expect((await store.applyConfigField('app_default', effort, null)).ok).toBe(true);
+    expect((await store.applyConfigField('app_default', store.findConfigField('model')!, 'minimax/MiniMax-M3')).ok).toBe(true);
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.reasoningEffort).toBeUndefined();
+  });
+
+  it.each([
+    { cliId: 'codex', model: undefined },
+    { cliId: 'codex', model: 'gpt-5.5' },
+    { cliId: 'claude-code', model: undefined },
+    { cliId: 'claude-code', model: 'opus' },
+  ])('requires explicit effort clearing before switching $cliId / $model to MiniMax', async entry => {
+    const { registry, store } = await loaded({ ...entry, reasoningEffort: 'high' });
+    const cli = store.findConfigField('cli')!;
+    const before = readFileSync(configPath, 'utf8');
+    expect(await store.applyConfigField('app_default', cli, 'minimax'))
+      .toMatchObject({ ok: false, reason: 'reasoning_effort_not_supported_by_model' });
+    expect(readFileSync(configPath, 'utf8')).toBe(before);
+    expect(registry.getBot('app_default').config).toMatchObject({ cliId: entry.cliId, reasoningEffort: 'high' });
+    expect(registry.loadBotConfigs()[0]).toMatchObject({ cliId: entry.cliId, reasoningEffort: 'high' });
+
+    expect((await store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, null)).ok).toBe(true);
+    expect((await store.applyConfigField('app_default', cli, 'minimax')).ok).toBe(true);
+    expect(readConfig().cliId).toBe('minimax');
+    expect(readConfig().reasoningEffort).toBeUndefined();
+    expect(registry.getBot('app_default').config.cliId).toBe('minimax');
+    expect(registry.loadBotConfigs()[0].reasoningEffort).toBeUndefined();
+  });
+
+  it('preserves a compatible effort when switching CLI to MiniMax', async () => {
+    const { registry, store } = await loaded({ model: 'minimax/MiniMax-M3.1-Flash', reasoningEffort: 'high' });
+    expect((await store.applyConfigField('app_default', store.findConfigField('cli')!, 'minimax')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ cliId: 'minimax', reasoningEffort: 'high' });
+    expect(registry.getBot('app_default').config.reasoningEffort).toBe('high');
+    expect(registry.loadBotConfigs()[0].reasoningEffort).toBe('high');
+  });
+
+  it('does not treat a compatible effort as validation of a retained model when leaving MiniMax', async () => {
+    const model = 'minimax/MiniMax-M3.1-Flash';
+    const { registry, store } = await loaded({ cliId: 'minimax', model, reasoningEffort: 'high' });
+    expect((await store.applyConfigField('app_default', store.findConfigField('cli')!, 'codex')).ok).toBe(true);
+    // CLI switching retains the old model. Codex's unknown-model effort
+    // fallback permits high; it does not establish that Codex can run this model.
+    expect(readConfig()).toMatchObject({ cliId: 'codex', model, reasoningEffort: 'high' });
+    expect(registry.loadBotConfigs()[0]).toMatchObject({ cliId: 'codex', model, reasoningEffort: 'high' });
+  });
+
+  it.each([undefined, 'minimax/MiniMax-M3', 'other/MiniMax-M3.1-Flash'])('rejects MiniMax effort for an unverified model %s without persisting it', async model => {
+    const { store } = await loaded({ cliId: 'minimax', model });
+    expect(await store.applyConfigField('app_default', store.findConfigField('reasoningEffort')!, 'xhigh'))
+      .toMatchObject({ ok: false, reason: 'reasoning_effort_not_supported_by_model' });
     expect(readConfig().reasoningEffort).toBeUndefined();
   });
 
@@ -542,6 +607,59 @@ describe('bot-config store', () => {
       value: { enabled: true, audience: 'requester' },
     });
     expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
+  });
+
+  it('keeps an explicit buttonAlign left on the bot layer so it can override a team right', async () => {
+    const { store } = await loaded();
+    const spec = store.findConfigField('feedback')!;
+    const team = { enabled: true, buttonAlign: 'right' } as const;
+    const stored = (raw: string) => {
+      const result = store.coerceConfigValue(spec, raw);
+      expect(result.ok).toBe(true);
+      return (result as { ok: true; value: unknown }).value as FeedbackPolicyLayer;
+    };
+
+    const explicitLeft = stored('{"enabled":true,"buttonAlign":"left"}');
+    expect(explicitLeft.buttonAlign).toBe('left');
+    const effective = resolveEffectiveFeedbackPolicy({ team, bot: explicitLeft })!;
+    expect(effective.enabled).toBe(true);
+    expect('buttonAlign' in effective).toBe(false);
+
+    // No buttonAlign on the bot layer: the team value is inherited.
+    const unset = stored('{"enabled":true}');
+    expect('buttonAlign' in unset).toBe(false);
+    expect(resolveEffectiveFeedbackPolicy({ team, bot: unset })?.buttonAlign).toBe('right');
+
+    expect(stored('{"enabled":true,"buttonAlign":"right"}').buttonAlign).toBe('right');
+    expect(store.coerceConfigValue(spec, '{"enabled":true,"buttonAlign":"center"}')).toEqual({ ok: false, reason: 'invalid_json' });
+  });
+
+  it('persists presentation rules through the config store and reloads the same policy', async () => {
+    const { registry, store } = await loaded({ feedback: { enabled: true } });
+    const spec = store.findConfigField('feedbackPresentation')!;
+    const input = { default: { enabled: false }, rules: [
+      { id: 'example', match: { chatId: 'chat-example' }, enabled: true, rounds: [1, 3], templateId: 'compact' },
+    ] };
+    const coerced = store.coerceConfigValue(spec, JSON.stringify(input));
+    if (!coerced.ok) throw new Error(coerced.reason);
+    expect((await store.applyConfigField('app_default', spec, coerced.value)).ok).toBe(true);
+    expect(readConfig().feedbackPresentation).toEqual(input);
+    expect(registry.getBot('app_default').config.feedbackPresentation).toEqual(input);
+    expect(registry.loadBotConfigs()[0].feedbackPresentation).toEqual(input);
+    expect(readConfig().feedback).toEqual({ enabled: true });
+    expect(store.coerceConfigValue(spec, '{"default":{"buttons":[]}}')).toMatchObject({ ok: false });
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(registry.loadBotConfigs()[0].feedbackPresentation).toBeUndefined();
+  });
+
+  it('rejects direct invalid presentation writes without corrupting the reloadable config', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('feedbackPresentation')!;
+    const before = readConfig();
+    const result = await store.applyConfigField('app_default', spec, { default: { rounds: [0] } });
+    expect(result.ok).toBe(false);
+    expect(readConfig()).toEqual(before);
+    expect(registry.loadBotConfigs()[0].feedbackPresentation).toBeUndefined();
   });
 
   it('hot-updates sender email hiding through botconfig and reloads it', async () => {
@@ -1759,6 +1877,35 @@ describe('bot-config store', () => {
     expect(readConfig()).toMatchObject({ cliId: 'codex', sandbox: 'scratch', replyDelivery: 'transcript' });
   });
 
+  it.each(['cursor', 'doubao', 'antigravity'])('invariant backstop: updateBotSandboxMode rejects switching a zero-injection %s bot to scratch (rmwBotEntry path, no promptInjection write)', async cliId => {
+    const { registry } = await loaded({ cliId, promptInjection: 'none' });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    const r = await sandboxStore.updateBotSandboxMode('app_default', 'scratch');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('zero_prompt_unsupported');
+    expect(readConfig().sandbox).toBeUndefined();
+    expect(registry.getBot('app_default').config.sandbox).not.toBe('scratch');
+    // oncall keeps zero injection working
+    expect((await sandboxStore.updateBotSandboxMode('app_default', 'oncall')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ promptInjection: 'none', sandbox: 'oncall' });
+  });
+
+  it('repair exit: a stored zero-injection cursor+scratch entry can leave scratch', async () => {
+    await loaded({ cliId: 'cursor', promptInjection: 'none', sandbox: 'scratch' });
+    const sandboxStore = await import('../src/services/sandbox-store.js');
+    expect((await sandboxStore.updateBotSandboxMode('app_default', 'off')).ok).toBe(true);
+    expect(readConfig().sandbox).toBeUndefined();
+    expect(readConfig().promptInjection).toBe('none');
+  });
+
+  it('repair exit: a stored zero-injection cursor+scratch entry can turn zero injection off', async () => {
+    const { store } = await loaded({ cliId: 'cursor', promptInjection: 'none', sandbox: 'scratch' });
+    const r = await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'default');
+    expect(r.ok).toBe(true);
+    expect(readConfig().promptInjection).not.toBe('none');
+    expect(readConfig().sandbox).toBe('scratch');
+  });
+
   it('invariant backstop: updateBotSandboxMode rejects switching a cursor+transcript bot to scratch (rmwBotEntry path, no replyDelivery write)', async () => {
     const { registry } = await loaded({ cliId: 'cursor', replyDelivery: 'transcript' });
     const sandboxStore = await import('../src/services/sandbox-store.js');
@@ -1864,11 +2011,11 @@ describe('bot-config store', () => {
     expect(readConfig().promptInjection).toBeUndefined();
   });
 
-  it('updateBotSandboxPaths refuses `/` / HOME / botmux home and relative entries as readWrite and leaves bots.json untouched', async () => {
+  it('updateBotSandboxPaths refuses `/` / HOME / botmux home / `/run` and relative entries as readWrite and leaves bots.json untouched', async () => {
     const { registry } = await loaded({ sandbox: true, sandboxPaths: { readOnly: ['/opt/ref'] } });
     const sandboxStore = await import('../src/services/sandbox-store.js');
     const { homedir } = await import('node:os');
-    for (const bad of ['/', '//', '~', `${homedir()}/`, '~/.botmux', '~/..', '..', '../..', './rel']) {
+    for (const bad of ['/', '//', '~', `${homedir()}/`, '~/.botmux', '~/..', '..', '../..', './rel', '/run', '//run/']) {
       const r = await sandboxStore.updateBotSandboxPaths('app_default', { readWrite: ['/opt/proj', bad] });
       expect(r.ok, bad).toBe(false);
       if (!r.ok) {

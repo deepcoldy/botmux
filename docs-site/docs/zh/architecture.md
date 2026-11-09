@@ -1,33 +1,12 @@
 # 架构总览
 
+<video src="img/video-v9-architecture.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
+
 botmux 做的事情一句话就能说清：**把飞书里的消息，变成 AI 编程 CLI 的输入；再把 CLI 的输出，变回飞书里的卡片。** 这一页讲它由哪些进程组成、一条消息怎么走、重启时会发生什么。日常使用不需要读懂这些，排查问题或参与开发时再来看就行。
 
 ## 一张图看懂
 
-```
-                    botmux start
-                         │
-                         ▼
-               ┌───────────────────┐
-               │    supervisor     │  常驻的「管家」进程：拉起并看护下面所有成员
-               └─────────┬─────────┘
-       ┌─────────────────┼─────────────────┬──────────────┐
-       ▼                 ▼                 ▼              ▼
-  ┌──────────┐     ┌──────────┐      ┌───────────┐   ┌──────────┐
-  │ daemon 0 │     │ daemon 1 │ ...  │ dashboard │   │ 插件服务 │（可选）
-  │ (bot A)  │     │ (bot B)  │      │ 管理后台  │   └──────────┘
-  └────┬─────┘     └──────────┘      └───────────┘
-       │ 每个话题一个 worker
-       ▼
-  ┌──────────┐   读终端输出 → 更新飞书卡片
-  │  worker  │   收到飞书消息 → 输入给 CLI
-  └────┬─────┘   顺带提供这个会话的 Web 终端
-       │ 通过「会话后端」连接（默认 tmux）
-       ▼
-  ┌──────────┐
-  │ CLI 进程 │   Claude Code / Codex / Cursor / ... 完整原生运行
-  └──────────┘
-```
+![botmux 进程结构：supervisor 拉起每个 bot 的 daemon、Dashboard 和插件服务；daemon 为每个话题起一个 worker，worker 通过 tmux 等会话后端连接 CLI 进程](/img/arch-overview-zh.png)
 
 ## 各进程分别做什么
 
@@ -47,6 +26,8 @@ botmux 做的事情一句话就能说清：**把飞书里的消息，变成 AI �
 
 ## 一条消息是怎么走的
 
+![一条消息的流程：飞书推送、daemon 过滤、命令分类、找到或创建会话、输出变成卡片](/img/arch-message-flow-zh.png)
+
 以「在话题里 @bot 说一句话」为例：
 
 1. **飞书推送消息给 daemon。** daemon 先判断这条消息要不要处理：是不是 @ 了自己、在不在自己负责的话题里、发消息的人有没有权限。
@@ -56,6 +37,8 @@ botmux 做的事情一句话就能说清：**把飞书里的消息，变成 AI �
 5. **CLI 也能主动发消息。** botmux 会给 CLI 注入一组内置 Skill（如 `botmux-send`、`botmux-schedule`、`botmux-history`），CLI 用它们往话题里发消息、建定时任务、读群聊记录等。详见 [Skill 与 CLI 命令](/skill-cli)。
 
 ## 重启时会发生什么
+
+![重启时各会话后端的表现：tmux 等常驻后端保留 CLI，pty 后端会重新拉起](/img/arch-restart-zh.png)
 
 `botmux restart` 会重启 daemon 和 worker，CLI 进程是否跟着重启，取决于会话后端：
 

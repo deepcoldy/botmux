@@ -173,6 +173,21 @@ describe('isForkCapableSession', () => {
     expect(isForkCapableSession(makeSourceDs({ cliId: 'antigravity', backendType: 'remote-runner' }))).toBe(false);
   });
 
+  it('refuses Antigravity in the scratch sandbox, whose fork receipt the worker cannot read', () => {
+    expect(isForkCapableSession(makeSourceDs({ cliId: 'antigravity', sandbox: 'scratch' }))).toBe(false);
+    vi.stubEnv('BOTMUX_SANDBOX', 'scratch');
+    try {
+      expect(isForkCapableSession(makeSourceDs({ cliId: 'antigravity', sandbox: false }))).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('keeps Antigravity forkable under the oncall sandbox and other CLIs under scratch', () => {
+    expect(isForkCapableSession(makeSourceDs({ cliId: 'antigravity', sandbox: true }))).toBe(true);
+    expect(isForkCapableSession(makeSourceDs({ cliId: 'claude-code', sandbox: 'scratch' }))).toBe(true);
+  });
+
   it('refuses aiden because its adapter has no native fork contract', () => {
     const ds = makeSourceDs({ cliId: 'aiden' });
     expect(isForkCapableSession(ds)).toBe(false);
@@ -438,6 +453,14 @@ describe('forkSession — frozen launch posture inheritance', () => {
   // ── An EXPLICIT per-trigger override, however, must reach the clone: it lives
   //    on the runtime session (in-memory, never persisted), so forkSession has
   //    to hand it to the child ds or the fork silently drops to the bot default. ──
+  it('inherits only an explicit topic pin, preserving provenance without aliasing', async () => {
+    const pin = { model: 'sonnet', effort: 'high' as const, source: 'topic-header' as const, setBy: 'owner', setAt: '2026-11-06T00:00:00Z' };
+    const src = makeSourceDs({ modelPin: pin }); registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+    expect((await callFork(src)).ok).toBe(true);
+    const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
+    expect(child.modelPin).toEqual(pin); expect(child.modelPin).not.toBe(src.session.modelPin);
+  });
+
   it('carries an explicit per-trigger model override onto the child runtime session', async () => {
     const src = makeSourceDs({}, { spawnModelOverride: 'gpt-5.6-terra' });
     registry.set(sessionKey('om_source_root', 'cli_app_test'), src);

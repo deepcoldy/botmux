@@ -23,6 +23,7 @@ You can also edit `~/.botmux/config.json` directly. Every item below lists its J
 | Run scheduled tasks in a specific timezone | General → Scheduled tasks → Timezone | `scheduleTimeZone` | Follow host |
 | Prefix group names created by `/g` | General → Group Creation | `groupNamePrefix` | None |
 | Hide worktrees in the repo picker | General → Repo Picker | `repoPickerMode` | Repos + worktrees |
+| Put new worktrees on a larger disk | General → Worktrees | `worktreeRoot` | Next to the main repo |
 | Download new versions through a proxy | System & Maintenance → Auto Maintenance → GitHub download proxy | `httpProxy` | Not set |
 | Skip pasting the callback URL after `/login` | General → Access → OAuth callback base URL | `oauthRedirectBase` | Not set |
 
@@ -136,6 +137,7 @@ An invalid timezone name is skipped and the next level is used. The auto-update 
 
 - **`/g` group name prefix** (General → Group Creation, `groupNamePrefix`): groups created with `/group` or `/g` get this text in front of their name, e.g. `AI-chat·`. Other ways of creating groups don't. Clear it and save to turn it off; takes effect within about 2 seconds. See [Create a session group](/en/group).
 - **Repo picker card mode** (General → Repo Picker, `repoPickerMode`): `all` (default, repos plus their worktrees) or `repos` (main repos only). With `repos`, `/repo <worktree path>` still takes you into a worktree.
+- **Worktree directory** (General → Worktrees, `worktreeRoot`): botmux creates new worktrees under this directory, e.g. `/data00/worktrees`. Useful when the system disk is small and a larger data disk is mounted. Worktrees are laid out under it by the main repo's own path: a worktree of `/root/iserver/botmux` becomes `/data00/worktrees/root/iserver/botmux-wt-…`, so repos with the same name in different places don't collide. Use an absolute path (may start with `~/`) to an existing, writable directory. Only affects worktrees created from then on; existing ones stay where they are and keep working, also if you change the directory again later. If the directory later goes missing or stops being writable (e.g. the data disk isn't mounted, or was remounted read-only), new worktrees are created next to the main repo instead and a warning is logged. Clear it and save to go back to creating them next to the main repo; takes effect within about 2 seconds.
 
 ## Network and access
 
@@ -158,6 +160,21 @@ botmux's built-in skills (sending messages, creating schedules, and so on) need 
 | `off` | Adds neither; only a pointer to `botmux --help` |
 
 This is the machine-wide default. Change it with `botmux skills injection [global|prompt|off|unset]`; no argument shows the current value. If a bot sets `skillInjection` in bots.json, the bot's own value wins. See [Skill](/en/skill-cli).
+
+## Separate sessions for each person in a group (XPI, experimental) {#xpi}
+
+**Off by default.** While it's off, everyone in a group shares one session: a message someone sends while the bot is busy is queued as usual and handled after the current task.
+
+When on, **each human in the same group gets their own CLI context and git worktree**, so people can work in parallel without interrupting each other:
+
+- Messages are still public in the group; each person's just go to their own "lane".
+- Quoting a task someone else is running goes through a suggestion / confirmation flow instead of jumping into their task; other messages continue in the sender's own lane.
+- Send `/lane status` in a topic to see your lane's branch, worktree, uncommitted changes and unpushed commits; `/lane close` closes your lane safely (it refuses while a task is running or files are uncommitted, pushes unpublished commits before reclaiming, and never merges or deletes branches on its own).
+- When an agent messages another bot, it has to say whether that's a separate task or input for the current one with `botmux send --as independent|suggestion`.
+
+To turn it on: Dashboard **Global Settings → General → Experimental → Cross-principal interruption isolation (XPI)**, which is `dashboard.crossPrincipalInterruption: true` in `config.json`. It applies to every bot on this machine and **takes effect from the next message, no restart needed**. To force it on or off for a single daemon process, set `BOTMUX_XPI_ENABLED=true` / `false` in its environment; that wins over the Dashboard switch.
+
+Keep it off when people need to share one context and set of files; turn it on when their tasks are fully independent.
 
 ## FAQ
 

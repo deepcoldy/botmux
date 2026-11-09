@@ -107,6 +107,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getDaemonStreamingCardUsageSnapshot: vi.fn(() => undefined),
   withActiveSessionKeyLock: vi.fn(async (_m: any, _k: string, action: () => any) => action()),
   buildStreamingCardJson: vi.fn(),
+  substituteCardControlFor: vi.fn(() => undefined),
   silentIdleCardFlag: vi.fn(() => false),
   idleCardLabel: vi.fn(() => undefined),
   streamCardLabel: vi.fn(() => undefined),
@@ -172,6 +173,7 @@ import { canOperate } from '../src/im/lark/event-dispatcher.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import type { Session, FailedTurnRecord } from '../src/types.js';
 import { sensitiveCardActionMeta } from '../src/im/lark/card-action-routes.js';
+import { takePurgeClickRollback } from '../src/services/image-purge-recovery.js';
 
 const LARK_APP_ID = 'cli_app_1';
 const OWNER = 'ou_owner_user';
@@ -231,12 +233,16 @@ function makeDs(over: Partial<DaemonSession> & { sessionOverrides?: Partial<Sess
 }
 
 /** `turnId === null` omits turn_id entirely (an old card built before the pin). */
-function actionData(turnId: string | null = TURN, mode: string | null = 'resend'): any {
+function actionData(
+  turnId: string | null = TURN,
+  mode: string | null = 'resend',
+  action = 'retry_turn',
+): any {
   return {
     operator: { open_id: OWNER },
     action: {
       value: {
-        action: 'retry_turn',
+        action,
         root_id: ROOT,
         session_id: SID,
         ...(turnId === null ? {} : { turn_id: turnId }),
@@ -294,7 +300,6 @@ describe('retry_turn — happy path', () => {
     expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
     const sent = sendWorkerInputMock.mock.calls[0][1].content as string;
     expect(sent).toContain('[BOTMUX_CONTINUE]');
-    expect(sent).toContain('不要重复已完成的操作');
     // The fork resumes the transcript, so the task text is already available to
     // the model. Re-sending it here would just burn tokens.
     expect(sent).not.toContain('do the thing');
@@ -449,6 +454,100 @@ describe('retry_turn — refusal branches', () => {
   });
 });
 
+describe('purge_images_continue — behavioral dispatch', () => {
+  it('submits a continuation carrying the purge flag under a fresh retry turn', async () => {
+    const ds = makeDs();
+    const res = await handleCardAction(
+      actionData(TURN, null, 'purge_images_continue'),
+      depsWith(ds),
+      LARK_APP_ID,
+    );
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    const [, input, retryTurnId, opts] = sendWorkerInputMock.mock.calls[0];
+    expect(input.content).toContain('[BOTMUX_CONTINUE]');
+    expect(retryTurnId).toMatch(/^retry-/);
+    expect(opts).toMatchObject({ purgeUndersizedImages: true });
+    expect(rememberLastCliInputMock).toHaveBeenCalledWith(ds, 'do the thing', input, retryTurnId);
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(1);
+    expect(res?.toast?.type).toBe('success');
+  });
+
+  it('holds a rollback that refunds the cooldown and puts back the turn state the click replaced', async () => {
+    rememberLastCliInputMock.mockImplementation((target: DaemonSession, prompt: string, input: { content: string }, turnId: string) => {
+      target.suppressRecoveryCard = undefined;
+      target.lastUserPrompt = target.session.lastUserPrompt = prompt;
+      target.lastCliInput = target.session.lastCliInput = input.content;
+      target.lastCliInputTurnId = target.session.lastCliInputTurnId = turnId;
+    });
+    const earlier = { lastUserPrompt: 'earlier', lastCliInput: 'earlier input', lastCliInputTurnId: 'om_earlier' };
+    const ds = makeDs({
+      ...earlier,
+      lastScreenStatus: 'idle',
+      streamCardPending: false,
+      currentTurnTitle: 'earlier title',
+      currentImageKey: 'img_earlier',
+      suppressRecoveryCard: true,
+      sessionOverrides: earlier,
+    });
+    await handleCardAction(actionData(TURN, null, 'purge_images_continue'), depsWith(ds), LARK_APP_ID);
+    const retryTurnId = sendWorkerInputMock.mock.calls[0][2];
+    expect(ds).toMatchObject({ lastScreenStatus: 'working', streamCardPending: true, lastCliInputTurnId: retryTurnId });
+    const rollback = takePurgeClickRollback(ds, retryTurnId)!;
+    expect(rollback.receipt).toMatchObject({
+      turnId: TURN,
+      previousRetryCount: 0,
+      stampedAt: ds.session.lastFailedTurn?.lastRetryAt,
+    });
+    rollback.restoreTurnState();
+    expect(ds).toMatchObject({
+      ...earlier,
+      lastScreenStatus: 'idle',
+      streamCardPending: false,
+      currentTurnTitle: 'earlier title',
+      currentImageKey: 'img_earlier',
+      suppressRecoveryCard: true,
+    });
+    expect(ds.session).toMatchObject(earlier);
+  });
+
+  it('keeps screen state a worker update replaced after the click', async () => {
+    const ds = makeDs({ lastScreenStatus: 'limited', streamCardPending: true });
+    await handleCardAction(actionData(TURN, null, 'purge_images_continue'), depsWith(ds), LARK_APP_ID);
+    const retryTurnId = sendWorkerInputMock.mock.calls[0][2];
+    ds.lastScreenStatus = 'idle';
+    ds.streamCardPending = false;
+    takePurgeClickRollback(ds, retryTurnId)!.restoreTurnState();
+    expect(ds.lastScreenStatus).toBe('idle');
+    expect(ds.streamCardPending).toBe(false);
+  });
+
+  it('fails closed without a live worker and does not consume the retry lease', async () => {
+    const ds = makeDs({ worker: undefined });
+    const res = await handleCardAction(
+      actionData(TURN, null, 'purge_images_continue'),
+      depsWith(ds),
+      LARK_APP_ID,
+    );
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(ds.session.lastFailedTurn?.retryCount).toBe(0);
+    expect(res?.toast?.type).toBe('warning');
+  });
+
+  it('rejects stale cards without dispatching', async () => {
+    const ds = makeDs({
+      sessionOverrides: { lastFailedTurn: makeFailedTurn({ turnId: 'newer-turn' }) },
+    });
+    const res = await handleCardAction(
+      actionData(TURN, null, 'purge_images_continue'),
+      depsWith(ds),
+      LARK_APP_ID,
+    );
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    expect(res?.toast?.content).toMatch(/过期/);
+  });
+});
+
 describe('retry_turn — permission gate', () => {
   it('is registered as a sensitive action in the permission gate table', () => {
     // The sensitive-action allowlist has no type-level enforcement, so an action
@@ -505,7 +604,7 @@ describe('retry_recovery_turn — routing', () => {
 
 
 describe('manual card retries rejected admission routing transaction', () => {
-  it.each(['retry_turn', 'retry_last_task'] as const)('%s preserves full routing and retry eligibility', async action => {
+  it.each(['retry_turn', 'retry_last_task', 'purge_images_continue'] as const)('%s preserves full routing and retry eligibility', async action => {
     const { fillRetryRouting, routingSnapshot } = await import('./helpers/retry-routing.js');
     for (const mode of ['ipc', 'false', 'handled-rejected', 'partial-write-throw']) {
       const ds = makeDs({ worker: mode === 'ipc' ? { killed: false } as any : null,

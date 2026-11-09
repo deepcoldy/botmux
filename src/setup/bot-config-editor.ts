@@ -222,6 +222,11 @@ export interface BotConfigEditInput {
    *   - null      → 清空（删字段，回到 CLI 默认）
    */
   model?: string | null;
+  /**
+   * 机器人首次上线后私聊 owner 的欢迎语（只发一次）。undefined 不动；
+   * '-' 或空串清空。
+   */
+  welcomeMessage?: string;
   backendType?: string;
   workingDir?: string;
   /**
@@ -433,6 +438,8 @@ export function parseBotSelection(
  *    talk + 自动开工，`defaultOncallAutoboundChats` 则相反，会让该群的自动
  *    绑定被误判成「已花掉」而不触发。`quotaFallbackBot` 也是源 Bot 的交接
  *    拓扑；复制到目标 Bot 可能变成自指或错误链路，必须由目标单独配置。
+ *    `extraScopesFile` 是源应用开放平台自动配置用过的清单；clone 建新应用时只申请
+ *    内置清单，继承路径会让新 Bot 的配置与它实际申请过的权限对不上。
  *
  * 单一真源：回归测试直接 import 本常量，避免测试再抄一份清单后与实现漂移
  * （新增实例态字段时两边都不报警）。新增此类字段请加在这里。
@@ -461,6 +468,7 @@ export const CLONE_EXCLUDED_KEYS = [
   'activationDeactivating',
   'activationStarting',
   'activationCommitted',
+  'extraScopesFile',
 ] as const;
 
 /**
@@ -652,6 +660,12 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
     if (v === '-') delete out.model;
     else if (v) out.model = v;
     else delete out.model;
+  }
+
+  if (input.welcomeMessage !== undefined) {
+    const v = input.welcomeMessage.trim();
+    if (!v || v === '-') delete out.welcomeMessage;
+    else out.welcomeMessage = v;
   }
 
   if (input.backendType !== undefined) {

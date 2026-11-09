@@ -1,7 +1,6 @@
 # botmux
 
-<video src="../img/video-v0-overview.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
-<p style="font-size:13px;opacity:.7;margin-top:-8px">Video narration is in Chinese.</p>
+<video src="../img/video-v0-overview-en.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
 
 <p class="lead">Remote-control your AI coding CLI from Lark. One message starts a session, and every session gets its own CLI process.</p>
 

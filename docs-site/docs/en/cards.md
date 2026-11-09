@@ -1,7 +1,6 @@
 # Streaming Cards
 
-<video src="../img/video-v2-daily.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
-<p style="font-size:13px;opacity:.7;margin-top:-8px">Video narration is in Chinese.</p>
+<video src="../img/video-v2-daily-en.mp4" controls preload="metadata" style="width:100%;border-radius:8px"></video>
 
 Botmux uses Lark cards to show what the CLI is doing, and lets you control it right from your phone. This page goes from most common to advanced: first what shows up during a turn, then the status card, dynamic single cards and the switches, and finally the features for scripts and integrators.
 
@@ -17,7 +16,7 @@ Botmux uses Lark cards to show what the CLI is doing, and lets you control it ri
 A few notes:
 
 - Status marks and the status card are **either/or**: with the status card on, no reactions are added; with it off, the reaction is the only lightweight progress signal. Swap the two emoji with `receivedReactionEmoji` / `doneReactionEmoji` (see [bots.json](/en/bots-json)).
-- The thinking process needs Lark PC ≥ 7.70 or mobile ≥ 7.74, and only appears for CLIs that emit thinking (Claude Code, Codex, TraeX, Pi and others).
+- The thinking process needs Lark PC ≥ 7.70 or mobile ≥ 7.74, and only appears for CLIs that emit thinking (Claude Code, Codex, TraeX, Pi, Kimi and others).
 - To get "one card per turn" instead, see the "Dynamic single cards" section below.
 
 ## Terminal status card
@@ -34,20 +33,29 @@ The card body is a **live screenshot** of the terminal: xterm renders the CLI's 
 | Working | Blue | The turn is in progress |
 | Analyzing… | Purple | Analysis in progress |
 | Awaiting input / ✓ Turn ended · Awaiting input | Green | The turn is done; send the next message |
+| ✓ Turn ended (AI determined no reply was needed) · Awaiting input | Green | The AI decided this turn needs no answer; see below |
 | ⏳ Main turn ended · background tasks running (N) | Light blue | The main agent has answered, but background work it started (background agents, `run_in_background` Bash, Monitor, Grok background tasks) is still running; N matches the web terminal, and the turn only counts as done once all of it finishes |
 | No recent progress | Red | No progress seen for a long time |
 | Limit reached | Red | The model quota is used up; turns green "Ready to retry" once a retry is possible |
 | Interrupted | Orange | The turn was interrupted |
 
+### "No reply needed" and timing {#no-reply-needed}
+
+- **No reply needed**: when the AI decides a message needs no answer (say, a status line someone posted in the group), no reply card is sent and the status card header reads "✓ Turn ended (AI determined no reply was needed) · Awaiting input", so you can tell it apart from a stuck turn. Automatic, nothing to configure. If the message explicitly @mentioned the bot, an automatic receipt is posted too; to force an answer, @mention it again and ask for a reply explicitly.
+- **Waiting / execution time**: off by default; see [Showing timing](#showing-timing) below to turn it on.
+
 ### Card buttons
+
+Frequently used buttons sit on the card's main row. The low-frequency buttons marked "More Actions" below live in the "More Actions" collapsible panel under the main row; tap the panel title to open it.
 
 | Button | What it does |
 |--------|--------------|
-| 📖 Show Output / 📕 Hide Output | Expand or collapse the terminal screenshot; when expanded you also get 📝 Export Text and 🔃 Refresh |
+| 📖 Show Output / 📕 Hide Output | More Actions. Expand or collapse the terminal screenshot; when expanded the panel also has 📝 Export Text and 🔃 Refresh |
+| ⌨️ Terminal Keys ▾ / ▴ | Appears when output is shown; shows or hides the terminal keys at the bottom of the card (see [Interrupting or correcting a turn](#interrupting-or-correcting-a-turn) below) |
 | 🖥️ Open Web Terminal | **Read-only** terminal view |
-| 🔑 Get Write Link | Get a **writable** terminal link. Flat groups first try a "visible only to you" card; topics, private chats, or a failed send fall back to a DM |
+| 🔑 Get Write Link | More Actions. Get a **writable** terminal link. Flat groups first try a "visible only to you" card; topics, private chats, or a failed send fall back to a DM |
 | 🗜️ Compact | Send `/compact` to the CLI to compress context (shown only when the CLI supports it) |
-| ⏲️ Idle auto-compact: on/off | Compact automatically after the session sits idle, same as [`/idlecompact`](/en/slash-commands) |
+| ⏲️ Idle auto-compact: on/off | More Actions. Compact automatically after the session sits idle, same as [`/idlecompact`](/en/slash-commands) |
 | ⏹ Stop | Interrupt the current turn (same as ^C); the session stays. Only shown while the turn is still running |
 | ❌ Close Session | Close the session; adopted sessions show "⏏ Disconnect" here |
 | 🔁 Retry Last Task | Appears when the quota recovers and the status becomes "Ready to retry" |
@@ -57,10 +65,10 @@ You can hide buttons you don't need in the Dashboard (see "Hiding card buttons" 
 
 ### Interrupting or correcting a turn
 
-**You don't have to wait for it to finish.** With output shown, the bottom of the card has quick keys: Esc, ^C, Tab, Space, Enter, arrow keys, ⇞ Page ½ Up, ⇟ Page ½ Down. Tapping Esc presses Esc in the terminal; after interrupting, just send a new instruction.
+**You don't have to wait for it to finish.** With output shown, tap "⌨️ Terminal Keys ▾" and a set of terminal keys appears at the bottom of the card: × (Esc), ^C, ⇥ (Tab), ␣ (Space), ↵ (Enter), arrow keys, ▲ half page up, ▼ half page down. Tapping × presses Esc in the terminal; after interrupting, just send a new instruction.
 
-- The quick keys only appear when **output is shown**, and remote backends (Riff / Mojo) don't have them.
-- By default, messages you send while a turn is running are queued and fed in after it ends. To correct course immediately, tap Esc or ⏹ Stop first.
+- The terminal keys are only available when **output is shown**, and remote backends (Riff / Mojo) don't have them. They start hidden; once you show them, later cards of the same session keep them shown until you hide them again.
+- By default, messages you send while a turn is running are queued and fed in after it ends. To correct course immediately, tap × (Esc) or ⏹ Stop first.
 
 ### Card lifecycle
 
@@ -125,7 +133,8 @@ Want only one card? Choose dynamic single card and turn off "**Show a separate s
 
 ### Which sessions are supported
 
-- Supported: ordinary Lark conversations with Claude Code, Codex, Grok, TraeX and Pi **without a file sandbox** (both regular groups and topics).
+- Supported: ordinary Lark conversations with Claude Code, Codex, Grok, TraeX, Pi and Kimi **without a file sandbox** (both regular groups and topics).
+- Kimi's process comes from its local session log, which Kimi writes once per completed model step: thinking and tools update step by step rather than token by token, and the closing answer is delivered by `botmux send` rather than repeated in the process.
 - Not supported, still using the default mode: file-sandbox sessions (including `readIsolation` and global `BOTMUX_SANDBOX=1`), API-only, non-Lark channels, remote Riff/Mojo, adopt, local terminal sync, doc comments, video meetings, scheduled tasks, and v3 workflows.
 - Sandbox state is fixed when the session starts; changing the bot's sandbox switch does not affect running sessions.
 
@@ -238,7 +247,7 @@ This only affects display, not usage accounting.
 
 ### Showing timing
 
-After `/botconfig set showReplyTiming on`, the final reply footer shows "waited 3.2s · ran 23.4s", starting with newly received messages.
+Off by default. Turn it on in the Dashboard under **Bot Config → Message cards → Task Cards → Waiting and execution time**, or send `/botconfig set showReplyTiming on` (`showReplyTiming` in `bots.json`). Once on, the final reply footer shows "waited 3.2s · ran 23.4s", starting with newly received messages.
 
 - **Waiting**: from Botmux accepting the message to actually handing it to the CLI, including queueing and cold start.
 - **Execution**: from handing it to the CLI to seeing the final output. Codex App uses its own completion time.
@@ -283,6 +292,12 @@ When an ordinary Claude message hits a transient model failure (API unreachable,
 - If the Lark API is also down when the card is due, it keeps retrying (up to 24 hours) and lands exactly once; a daemon restart won't send it twice.
 - Failed scheduled tasks get the card too, without a Retry button; run the task again manually if needed.
 
+## Stop, retry and spend {#stop-retry-cost}
+
+- **⏹ Stop**: there by default, shown on the status card only while the turn is still running. It is the same as pressing ^C and keeps the session; `/stop` in the topic does the same. Codex App sessions and sessions with `codexRpcInput` on can't be stopped this way; pressing it only suggests `/close`. To hide the button: `/botconfig set hiddenStreamingCardButtons stop`, or switch it off under the Dashboard's live card buttons (see [Hiding card buttons](#hiding-card-buttons) above).
+- **🔁 Retry**: available on failure cards by default; the original sender or a bot admin can press it (see [Automatic-recovery failure card](#automatic-recovery-failure-card) above). For other failed or interrupted turns, send `/retry` in the topic.
+- **Spend**: botmux only converts token usage into CNY after you set `pricing` for the bot in `bots.json` (the simplest is `"pricing": { "usdCny": 7.2 }`, which uses the built-in price table); without it the amount stays 0. In the current version the amount feeds monthly budget alerts (`budget`) and is not shown on cards; see [Spend and budget](/en/bots-json#budget). What the cards do show is the token usage line, see [Where usage is shown](#where-usage-is-shown) above.
+
 ## Richer messages with `botmux send`
 
 Messages the agent sends with `botmux send` are separate messages that can carry images, files, videos and @ mentions. See [CLI commands](/en/cli-commands) for all flags. These are the ones most related to cards.
@@ -292,6 +307,20 @@ Messages the agent sends with `botmux send` are separate messages that can carry
 `--card-file` / `--card-json` send raw Lark interactive card JSON.
 
 > ⚠️ Custom cards allow **display-only content and open_url buttons only**. Any callback control (buttons with a `value`, dropdowns, person pickers, date pickers, inputs, form submits) is rejected, so custom cards can't forge interactive callbacks.
+
+### Videos, @mentions, urgent pings and dry runs {#send-rich}
+
+These are all `botmux send` flags. The agent in the session calls them as needed; there is nothing to switch on:
+
+| Want to | Flags |
+|---|---|
+| Send a video with a preview | `--videos <mp4>` plus `--video-covers <image>`, paired in order, both repeatable |
+| Send a custom card | `--card-json '<json>'` or `--card-file <path>` (display-only content and open_url buttons, see above) |
+| @mention someone | `--mention <open_id>` (repeatable; with `allowArbitraryMention` on for the bot, a full email / phone / union_id also works, as long as the person is in the group); `--mention-back` @mentions this turn's sender. Every reply must pick one of `--mention`, `--mention-back` or `--no-mention` |
+| Send an urgent ping | `--urgent` (in-app, default), `--urgent=sms` or `--urgent=phone`, targeting this turn's sender; **must be used with `--mention-back`**. The app needs the matching `im:message.urgent*` permission; SMS / phone consume tenant quota |
+| Check before sending | `--dry-run` renders the body as a card and prints JSON plus warnings without sending (no image / file uploads, no @ resolution) |
+
+See `botmux send --help` for the full list.
 
 ### Semantic reply headers (`--layout`)
 

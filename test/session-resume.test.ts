@@ -61,6 +61,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
   ensureOrdinaryTurnRecoveryAttached: vi.fn(),
+  resumeTurnNotices: vi.fn(),
   ensureReadonlyTaskContinuationAttached: vi.fn(),
   // Default: promotion succeeds. A specific test overrides this to false to
   // exercise the restore-time transient-failure quarantine path.
@@ -193,6 +194,7 @@ vi.mock('../src/core/session-activity.js', () => ({
 }));
 
 import {
+  persistStreamCardState,
   restoreActiveSessions,
   resumeSession,
   takeOverDurableActiveRemoteSession,
@@ -1570,6 +1572,47 @@ describe('resumeSession', () => {
 // `quarantinedActivationTailPromotion` flag the guard keys on (see the
 // 'registers a visible quarantined owner …' test above).
 
+
+describe('terminal keys panel state', () => {
+  it('keeps an open grid across a daemon restart and writes the next collapse to disk', async () => {
+    const s = sessionStore.createSession('oc_keys', 'om_keys', 'keys topic', 'group');
+    s.larkAppId = 'app_test';
+    s.scope = 'thread';
+    s.cliId = 'claude-code';
+    s.workingDir = '/tmp/proj';
+    s.streamKeysPanelOpen = true;
+    sessionStore.updateSession(s);
+    const map = new Map<string, DaemonSession>();
+
+    await restoreActiveSessions(map);
+
+    const restored = map.get(sessionKey('om_keys', 'app_test'))!;
+    expect(restored.keysPanelOpen).toBe(true);
+    restored.keysPanelOpen = false;
+    persistStreamCardState(restored);
+    expect(sessionStore.getSessionFresh(s.sessionId)?.streamKeysPanelOpen).toBe(false);
+    restored.keysPanelOpen = true;
+    persistStreamCardState(restored);
+    expect(sessionStore.getSessionFresh(s.sessionId)?.streamKeysPanelOpen).toBe(true);
+  });
+
+  it('reopens a closed session with the grid state it was closed with', async () => {
+    const closed = makeClosedSession({ rootMessageId: 'om_keys_closed' });
+    const row = sessionStore.getSession(closed.sessionId)!;
+    row.streamKeysPanelOpen = true;
+    sessionStore.updateSession(row);
+    vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, _resume: any, opts: any) => {
+      ds.worker = { killed: false };
+      opts?.onAdmission?.('accepted');
+      return true;
+    });
+
+    const result = await resumeSession(closed.sessionId, new Map());
+
+    expect(result.ok).toBe(true);
+    if (result.ok) expect(result.ds.keysPanelOpen).toBe(true);
+  });
+});
 
 describe('resuming cleanup-archived Codex rows', () => {
   function archivedRow() {

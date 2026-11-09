@@ -6,8 +6,14 @@
 
 <p align="center">
   <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/npm/v/botmux.svg" alt="npm"></a>
+  <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fdeepcoldy%2Fbotmux%2Fbadges%2Fnpm-downloads.json" alt="npm downloads (all botmux packages)"></a>
+  <a href="https://github.com/deepcoldy/botmux/actions/workflows/ci.yml?query=branch%3Amaster"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fdeepcoldy%2Fbotmux%2Fbadges%2Fci.json" alt="CI"></a>
+  <a href="https://github.com/deepcoldy/botmux/actions/workflows/midscene-e2e.yml?query=branch%3Amaster"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Fdeepcoldy%2Fbotmux%2Fbadges%2Fmidscene.json" alt="Midscene E2E"></a>
   <img src="https://img.shields.io/badge/binary-no%20Node%20required-brightgreen.svg" alt="self-contained binary, no Node required">
+  <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS-blue.svg" alt="platform: Linux | macOS">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
+  <a href="#contributors"><img src="https://img.shields.io/github/contributors/deepcoldy/botmux.svg" alt="contributors"></a>
+  <a href="https://github.com/deepcoldy/botmux/commits/master"><img src="https://img.shields.io/github/commit-activity/m/deepcoldy/botmux.svg" alt="commit activity"></a>
   <a href="https://github.com/deepcoldy/botmux"><img src="https://img.shields.io/github/stars/deepcoldy/botmux.svg?style=social" alt="Stars"></a>
 </p>
 
@@ -21,12 +27,16 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/botmux-product-panorama.png" width="1000" alt="botmux product panorama: Lark topics, live cards, web terminal, multi-agent orchestration, and 20+ CLI / agent adapters">
+  <a href="https://deepcoldy.github.io/botmux/img/video-promo-en.mp4"><img src="docs/assets/botmux-promo-cover-en.gif" width="900" alt="botmux video intro: click to play"></a>
+</p>
+
+<p align="center">
+  <img src="docs/assets/botmux-product-panorama.png" width="1000" alt="botmux product panorama: Lark topics, live cards, web terminal, multi-agent orchestration, and 30+ CLI / agent adapters">
 </p>
 
 ---
 
-A daemon watches Lark messages and spawns an isolated session process for each new session, streaming the AI coding CLI / agent's output back as live Lark cards and offering an interactive web terminal. It **doesn't reimplement agent capabilities** — it bridges the tools you already use directly (**20+ CLI / agent adapters**, see [Supported CLIs & Agents](#supported-clis--agents)).
+A daemon watches Lark messages and spawns an isolated session process for each new session, streaming the AI coding CLI / agent's output back as live Lark cards and offering an interactive web terminal. It **doesn't reimplement agent capabilities** — it bridges the tools you already use directly (**30+ CLI / agent adapters**, see [Supported CLIs & Agents](#supported-clis--agents)).
 
 ## What it solves
 
@@ -100,22 +110,6 @@ Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (proce
 
 Authoritative `cliId` list and wrapper setups are documented in [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
 
-### Doubao CLI quickstart
-
-Use a Botmux build containing the `doubao` adapter. Install Doubao and finish native login as the same OS user that will run Botmux, then configure the Bot:
-
-```bash
-npm install -g '@bytedance/doubao-cli' --registry=https://registry.npmjs.org
-doubao --version
-doubao                      # finish login, verify the composer, then /exit
-botmux setup                # select Doubao and the actual project directory
-botmux start
-```
-
-For an existing Bot, select Doubao in Dashboard or merge `"cliId": "doubao"` and the actual `workingDir` into its existing `bots.json` entry, preserving credentials and other settings. Restart after saving and create a new session. Omit `model` for the default, or use a display name available to the account in native `/model`.
-
-Multiline tasks are submitted once; **Esc** interrupts through the Web terminal. Final answers are collected automatically from native logs, and restart resumes by the exact native decimal ID, never the “latest” conversation. Default permissions pass `--permission-mode always_allow`; restrict access to trusted users/projects. **The Botmux binary needs no Node; Doubao's npm installation and launcher still need Node/npm.** See the [Doubao guide](docs/doubao.en.md) for enterprise installation, local HTTP trials, permissions, and limits. Native Linux execution/sandbox and the existing-terminal `/adopt` bridge are not acceptance-tested; ordinary chat support does not imply every capability is supported.
-
 ## Design Philosophy: Bridge the CLI Directly, No SDK Wrapper
 
 botmux doesn't reimplement memory, context management, tool calls, or permission systems — **most native CLI capabilities don't need reimplementing, and CLI upgrades usually benefit botmux directly** (when interfaces / params / output formats / resume semantics change, an adapter may still need to catch up). You keep talking in plain language; the daemon wraps context into structured prompts behind the scenes before feeding the CLI. An Agent-SDK-based approach is the inverse: capabilities depend on what the SDK exposes and on your own integration.
@@ -145,5 +139,15 @@ The table below compares only **verifiable integration boundaries** — it does 
 botmux may well be the most-contributed-to open-source project built specifically for Feishu/Lark — and that is entirely thanks to everyone who has taken part. Thanks to all who have contributed code, documentation, and issues:
 
 <a href="https://github.com/deepcoldy/botmux/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=deepcoldy/botmux" alt="contributors" />
+  <img src="https://contrib.rocks/image?repo=deepcoldy/botmux&amp;max=500&amp;columns=16" alt="contributors" />
+</a>
+
+## Star History
+
+<a href="https://star-history.com/#deepcoldy/botmux&amp;Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=deepcoldy/botmux&amp;type=Date&amp;theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=deepcoldy/botmux&amp;type=Date" />
+    <img src="https://api.star-history.com/svg?repos=deepcoldy/botmux&amp;type=Date" alt="botmux star history" width="720" />
+  </picture>
 </a>

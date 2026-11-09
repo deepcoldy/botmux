@@ -75,6 +75,7 @@
 | 嫌实时卡片吵 | `disableStreamingCard`、`hiddenStreamingCardButtons` |
 | 一轮只用一张卡显示进度和答复 | `replyCardMode: "unified"` |
 | 不 @ 也自动开工 | `autoStartOnNewTopic`、`autoStartOnGroupJoin` |
+| 机器人首次上线后私聊主人一句欢迎语 | `welcomeMessage`（见[上线欢迎语](#welcome-message)） |
 | 盯住告警群，有告警就自动处理 | 群消息监听（见[群消息监听](#message-listener)） |
 | 额度用完自动交给另一个 bot | `quotaFallbackBot` |
 | 不让 botmux 往 prompt 里塞任何东西 | `promptInjection: "none"` |
@@ -319,6 +320,25 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
 
 ### 等待提醒与无进展提醒 {#reminders}
 
+**`longTaskReminder`**：任务实际执行超过指定时长仍未结束时，在原群聊或话题发送独立提醒卡片。Dashboard「Bot 配置 → 消息卡片 → 长任务卡片提醒」提供开关和保存按钮，保存后立即生效。
+
+```json
+{
+  "longTaskReminder": {
+    "enabled": true,
+    "thresholdMinutes": 10,
+    "intervalMinutes": 10
+  }
+}
+```
+
+- 默认关闭；首次提醒阈值和后续间隔分别默认 10 分钟，均支持 1–10080 的整数分钟。
+- 从 CLI 实际接收任务并开始执行的时间计时，排队和空闲时间不计入；后续消息和正常进度不会重置已运行任务的计时。
+- 每 30 秒检查一次；首次达到阈值后提醒，之后从上次成功投递起按间隔提醒，不补发错过的周期。发送失败一分钟后重试，同一未确认通知复用投递 ID。
+- 任务完成、取消、worker 停止或会话关闭后停止提醒。每轮任务独立计时；支持普通群、私聊和话题，文档评论和无 IM 会话不发送。
+- 保持静默任务、会议驱动任务和已抑制执行轮次的辅助卡片限制；提醒不会触发普通回答的 `outbound.send` hook。
+- 偏好会持久保存，执行计时只使用当前存活 worker 的真实观测，不从旧会话或历史日志猜测。daemon 重启后，没有重新观测到执行开始的旧任务不会提醒。
+
 **`sessionOwnerReminder`**：会话停在某个需要人处理的状态、而且一直没变化时，每隔一段时间在原话题里 @ 一次会话 owner。
 
 ```json
@@ -400,13 +420,97 @@ botmux 用 app-server 协议运行 Codex 时，拿不到 Codex App 内置的 Chr
 
 > ZMX 后端没法执行文件沙盒，开着沙盒的配置组合会直接拒绝启动，见 [ZMX 后端](/zmx)。
 
+### 受保护的本地 MCP 能力
+
+本地 stdio MCP 服务可以在插件私有的 `mcp/index.json` 中申请一个可选受保护能力。能力 ID 对 Botmux 是不透明数据；通用说明使用非业务 fixture：
+
+```json
+{
+  "transport": "stdio",
+  "command": ["node", "./mcp/server.js"],
+  "protectedCapability": "fixture.secret.v1"
+}
+```
+
+Streamable HTTP MCP 服务不能申请 `protectedCapability`，同时声明两者的插件描述会被拒绝。插件描述不提供密钥来源、主体策略或隔离规则；这些绑定只来自机器级配置。
+
+在 `bots.json` 中，`plugins` 数组只负责为当前 Bot 启用已安装插件：
+
+```json
+{
+  "plugins": ["fixture-plugin"]
+}
+```
+
+不要在 `bots.json` 中保存受保护能力绑定、密钥来源、密钥值或灰度状态。运维人员在机器级 `~/.botmux/config.json` 中绑定不透明能力 ID：
+
+```json
+{
+  "protectedMcpCapabilities": {
+    "fixture.secret.v1": {
+      "enabled": false,
+      "allowedPluginIds": ["fixture-plugin"],
+      "secret": {
+        "source": "file",
+        "path": ".botmux/secrets/fixture-protected-secret"
+      },
+      "principal": "verified-human-email",
+      "containmentProfile": "local-stdio-secret-v1",
+      "isolation": {
+        "protectedHomePaths": [".fixture-credential"],
+        "redactEnv": ["FIXTURE_AUTH_TOKEN"]
+      }
+    }
+  }
+}
+```
+
+省略 `enabled` 时默认关闭，JSON 布尔值 `true` 启用绑定，布尔值 `false` 关闭绑定。字符串 `"true"`、数字 `1` 等非布尔值会使整条能力记录被拒绝。secret 只支持 `{ "source": "file", "path": "<Home 相对路径>" }`；路径以 daemon 账户的可信 Home 为根，不接受绝对路径、`.`、`..` 或软链。运维人员预先创建当前用户拥有、精确权限为 `0600` 的非空普通文件，文件大小最多 64 KiB。Botmux 不会修复不安全文件，也不会在 daemon 启动时捕获或缓存密钥；每次新 worker fork 前现读文件，并逐级固定目录 fd 后以 no-follow 打开，拒绝中间路径或叶子的软链及替换竞态重定向。
+
+密钥只经一次性 fd 通道提供给获准 MCP，不进入 argv、通用环境或日志。文件轮换对下一次 worker fork 生效，已运行 MCP 保留本次启动获得的密钥，需重建该会话才能更新。每个有效配置的 secret 文件自动加入所有相关会话的沙箱 deny，即使 Bot 未启用匹配插件或能力关闭；额外 `protectedHomePaths` 仍按匹配插件生效。`redactEnv` 以及无效旧 `source: "env"` 记录中可辨识的合法变量名会按当前配置从 worker、模型和插件通用环境清除；旧环境来源不会授权写能力。修改机器配置沿用全局配置的短缓存刷新规则。
+
+MCP 进程启动时，如果能力已关闭或未 provision、插件不在 `allowedPluginIds` 中、配置的隔离前提不满足，或 daemon 无法提供一次性通道，Botmux 会改用不带受保护密钥文件描述符的普通 stdio transport 启动服务。服务仍可启动并提供只读工具；该连接上的 `tools/call` 不会收到 `botmuxTrustedPrincipal` 或 `botmuxGrantedCapabilities`，插件必须对受保护写入失败关闭。
+
+`principal` 是每次 `tools/call` 的授权条件，不是 MCP 进程启动条件。如果全局绑定、插件 allowlist、隔离前提和 daemon 通道在启动时均已成功，长驻 MCP 进程可能已持有一次性密钥，即使后续某次调用缺少所需的已验证真人主体或其它调用级授权条件。Botmux 会在该次调用中省略 `botmuxTrustedPrincipal` 和 `botmuxGrantedCapabilities`，插件必须拒绝受保护写入。插件必须在**每一次**受保护写操作中重新校验 `botmuxTrustedPrincipal` 以及 `botmuxGrantedCapabilities` 是否包含当前能力 ID，不得把上一轮主体、能力或授权结果缓存到进程级状态后复用；任一字段缺失、不匹配或过期都必须失败关闭。只要匹配的插件已启用，即使能力本身关闭，配置的隔离路径和环境变量清理仍然生效。
+
+迁移旧环境密钥时，先把密钥写入上述安全文件并将配置改为 `source: "file"`，再从 daemon 启动源移除旧变量并重启 daemon；仅 `delete process.env` 不能擦除旧进程的 `/proc/<pid>/environ`。新增或改变密钥文件路径前，须先结束并重建旧 CLI 会话，使新的文件 deny 生效；不要仅靠热更新撤回旧进程访问。建议固定路径后以安全文件原子替换轮换。存在受保护文件或其它需隔离的身份配置时，裸宿主 one-shot 自动标题生成会跳过并保留占位标题，不影响会话正文的读取能力。
+
+同一个 stdio MCP 子进程重启后，一次性密钥通道目前不会再次交付，受保护工具会退回只读；需重建会话恢复。不同出站策略收集入口的用户错误提示尚待统一。
+
+### 按触发人身份调用 CLI（`triggerUserAuth`） {#trigger-user-auth}
+
+**默认关闭。** 打开后，这个 Bot 会话里的 `lark-cli` / `bytedcli` 用「发这条消息的人」自己的授权调用，而不是本机的登录态。适合多人共用一个 Bot：谁发的消息，就以谁的身份读文档、查日程、调内部平台。
+
+三种开法任选一种，**新会话生效**（已有会话 `/restart` 后生效）：
+
+- **Dashboard**：「Bot 配置 → 权限与安全 → 按触发人鉴权」，打开「按触发人身份调用 CLI」，勾选要覆盖的工具。
+- **飞书里**（管理员）：`/botconfig set triggerUserAuth {"enabled":true,"tools":["lark-cli","bytedcli"]}`；关闭用 `/botconfig unset triggerUserAuth`。
+- **bots.json**：
+
+```json
+"triggerUserAuth": { "enabled": true, "tools": ["lark-cli", "bytedcli"] }
+```
+
+规则：
+
+- 只有 `enabled` 写成 `true` 才算开。`tools` 不写表示覆盖全部工具；写了不认识的工具名会直接报错，不会悄悄降级。
+- 没授权过的人调用时，命令会被拒绝，拒绝信息里附带授权链接。AI 也会自己用 `botmux auth request` 把链接发给这个人（见 [Agent 自助发起授权](/cli-commands#agent-auth-request)），或者让他在话题里发 `/login`。授权完成后重试即可。
+- 绝不会退回到 Bot 或其他人的身份代跑。`bytedcli` 没有 Bot 身份，没授权就是失败。
+- 可选字段：`credentialSource`（`auto` 默认 / `platform` 只用中心化平台 / `local` 只用本机扫码）、`delegateOnMention`（默认 `true`，见 [@ 交接带上发起人身份](/permissions#delegate-on-mention)）、`gitHost`（让该代码平台的 git 推送也按当轮身份鉴权）。
+
+#### 升级注意：旧格式授权要重新 `/login` {#legacy-user-token}
+
+v3.20 起，botmux 自己保存的飞书用户授权按「应用 + 授权人」分文件存（`~/.botmux/data/user-token-<appId>-<openId>.json`）。之前的旧文件（`user-token-<appId>.json`、`user-token.json`）看不出是谁授权的，凡是需要「以某个具体的人」调用飞书接口的地方都不再使用它。
+
+只剩旧格式授权的 Bot，这些用户身份能力会失效。**由本人在话题里重新发一次 `/login`** 即可恢复。注意 `/login` 只是补上授权文件，按触发人身份调用 CLI 仍要按上面的方法单独打开。
+
 ## 卡片与终端
 
 卡片长什么样、每个开关的效果见[实时流式卡片](/cards)。
 
 | 字段 | 说明 |
 |------|------|
-| `replyCardMode` | `legacy`（默认）：进度和答复分开发；`unified`：同一轮的进度、工具调用和最终答复都更新在一张卡里。支持未开沙盒的 Claude Code / Codex / Grok / TraeX / Pi 普通会话，从下一轮生效 |
+| `replyCardMode` | `legacy`（默认）：进度和答复分开发；`unified`：同一轮的进度、工具调用和最终答复都更新在一张卡里。支持未开沙盒的 Claude Code / Codex / Grok / TraeX / Pi / Kimi 普通会话，从下一轮生效 |
 | `replyCardShowTools` | 仅 `unified`：设 `false` 隐藏卡里的工具调用，思考摘要和进度照常显示 |
 | `disableStreamingCard` | `true` 时不发实时终端状态卡。Web 终端照常运行，最终答复照常发送 |
 | `hiddenStreamingCardButtons` | 隐藏实时卡上的按钮，可选 `output`、`terminal`、`writeLink`、`compact`、`stop`、`close`。例如 `["terminal", "writeLink", "close"]`。也可用 `/botconfig set hiddenStreamingCardButtons terminal,close` |
@@ -546,6 +650,7 @@ Doubao 默认就是 `transcript`（它的工具命令跑在账号级常驻进程
 | `autoStartOnGroupJoinPrompt` | 入群自动开工时的第一轮任务。不填时，bot 会先看看群里的上下文；没人派活就报告自己已就绪 |
 | `autoStartOnGroupJoinSeed` | 入群时先发的那条开场消息的文字，不填用内置文案 |
 | `autoStartOnGroupJoinGateRequired` | `true` 时，入群自动开工还必须有一条匹配的 `chat.bot_added` 同步 [Hook](/hooks) 明确放行，否则静默不开工。适合只让特定的群自动开工 |
+| `autoStartOnGroupJoinAnchor` | 普通群里入群会话挂在哪。默认 `"reply-mode"`，跟随群的回复模式；`"latest-message"` 时不发开场消息，直接在群里最新一条已有消息（跳过系统消息、已撤回消息和本 bot 自己的消息）的话题里开会话，适合外部平台先发一条上下文消息再拉 bot 的群。没有可用消息或读取失败时按默认处理。话题群和 `new-topic` 模式不受影响。若要锚定其他机器人发的消息（如平台卡片），还需授权 `im:message.group_msg.include_bot:read`，否则列表里只有用户消息 |
 | `autoStartExcludedChats` | 这些群里不自动开工（入群和新话题都算），被 @ 时照常响应 |
 | `groupJoinCommandEnabled` / `groupJoinCommand` | 被拉进任意群时，直接在本机执行一条命令，不起会话、不经过模型。和 `autoStartOnGroupJoin` 互不影响，也不要求群里有管理员。同样需要订阅 `im.chat.member.bot.added_v1` |
 
@@ -554,6 +659,14 @@ Doubao 默认就是 `transcript`（它的工具命令跑在账号级常驻进程
 - 不经过 shell，要用管道、重定向就写成 `bash -c '…'`；只带最少的环境变量（不含应用密钥）。
 - stdin 收到 JSON：`{event:"chat.bot_added", larkAppId, chatId, operatorOpenId, emittedAt}`；也可以读环境变量 `BOTMUX_JOIN_CHAT_ID` / `BOTMUX_JOIN_LARK_APP_ID` / `BOTMUX_JOIN_OPERATOR_OPEN_ID`。
 - 10 分钟没结束会被强制结束。
+
+### 上线欢迎语（`welcomeMessage`） {#welcome-message}
+
+填一段文字，机器人首次成功上线后会私聊主管理员（见 `ownerOpenId`）一次。用 `botmux setup add` / `botmux setup edit` 的 `--welcome-message "…"` 或 `--welcome-message-file <文件>` 设置，edit 传 `--welcome-message -` 清空；Dashboard 里暂时不能改。`--welcome-message` 的值始终按原文发送，以 `@` 开头也不会当成文件路径。
+
+- 发送记录在 daemon 数据目录的 `welcome-sent/<AppID>.json`，发过之后重启不再发，改欢迎语内容也不会重发。删掉这个文件可以让它重发，但距上次发送不到 1 小时的会被飞书去重。
+- 发送失败、还解析不到主管理员时不影响启动，下次启动重试。
+- core-only（`apiOnly`）bot 和多副本部署（`BOTMUX_COORDINATION_MODE=primary`，各副本不共享发送记录）不发送，daemon 日志里会写明原因。
 
 ## 群消息监听 {#message-listener}
 
@@ -687,6 +800,31 @@ botmux 可以按 token 用量估算每个 bot 的花费（人民币），并在�
 |------|------|
 | `voice` | 这个 bot 的语音引擎配置，会按字段覆盖 `~/.botmux/config.json` 里的全局 `voice`。有可用的语音凭据时，答复卡上会出现「🔊 语音总结」按钮。见[语音总结](/voice) |
 
+## 飞书会议智能体 {#vc-meeting-agent}
+
+连着飞书的 Bot **默认就能被拉进视频会议**（core-only 的 `apiOnly` Bot 除外），旁听会议、同步转写，按会议角色在会中发文字或说话。
+
+**准备**：应用要开通 `vc:meeting.bot.join:write`（入会 / 离会）、`vc:meeting.meetingevent:read`（读会中事件）、`vc:meeting.message:write`（会中发文字），实时语音另需 `vc:meeting.bot.realtime:write`；事件订阅里要有 `vc.bot.meeting_invited_v1`、`vc.bot.meeting_activity_v1`、`vc.bot.meeting_ended_v1`、`vc.meeting.participant_meeting_joined_v1`。权限缺了，daemon 启动时会在日志里报错并私聊通知管理员；事件订阅飞书没有接口可查，daemon 只会提醒你核对，缺事件时只是收不到会议推送、不会报错。
+
+**怎么用**：
+
+1. 在飞书视频会议里邀请这个 Bot 入会。
+2. Bot 私聊给 owner（配了 `vcMeetingAgent.attentionTargetOpenId` 时发给这个人）发一张确认卡，默认 30 分钟内有效（`inviteTtlMs` 可调）。
+3. 确认后 Bot 入会，自动建一个会议监听群同步转写；想用现有群就配 `vcMeetingAgent.listenerChatId`。
+4. 会中做什么由会议角色决定，见下一节。会议监听期间要临时让某人能给 Bot 下指令，用 `/vc-auth @成员`（`/vc-auth revoke @成员` 撤销，`/vc-auth list` 查看）。
+5. 想提前准备：在普通群发 `/vc prepare <会议链接或会议号>`，把这个群设成会议准备群，可以先补背景、预读文档，开会后复用同一个 Agent 会话（见[斜杠命令](/slash-commands)）。
+
+**会中发言**：
+
+- 文字和语音默认**直接发出，不逐条审批**。想逐条审批，在 `vcMeetingAgent.meetingConsumer` 里把 `textOutputPolicy` / `voiceOutputPolicy` 设成 `approval`；设成 `deny` 则禁止。
+- 实时语音默认开着，但只在 Bot 真要说话时才建连；关掉用 `vcMeetingAgent.realtimeVoice.enabled: false`。说话还需要上面的实时权限和会中的 AI 发言权限，缺了会明确报错、不会发出声音。
+- 语音用[语音总结](/voice)里配置的引擎合成（MiniMax、火山引擎 / 豆包等）。
+
+**关闭**：
+
+- 单个 Bot：`bots.json` 里写 `"vcMeetingAgent": { "enabled": false }`，或在「全局设置 → 会议 Agent → 会议监听 → 会议角色预设 → 按 Bot 的会议开关」里关掉这个 Bot 的「接收会议事件」。
+- 整台机器：Dashboard「全局设置 → 会议 Agent → 会议监听」关掉「允许本机使用会议监听能力」（`config.json` 的 `vcMeetingAgent.enabled: false`）。已经在开的会通常会自然结束。
+
 ## 会议角色
 
 bot 被拉进飞书视频会议后，可以按「会议角色」去做事，比如同步重要信息、记纪要、主持。推荐在 Dashboard「全局设置 → 会议角色预设」里管理：
@@ -797,6 +935,10 @@ bot 被拉进飞书视频会议后，可以按「会议角色」去做事，比�
 | `proxyMode` 不填，且任一区域是 `block` / `allowlist` / `denylist` | 有非空代理值就拒绝启动 |
 | `proxyMode: "reject"` | 有非空代理值就拒绝启动 |
 | `proxyMode: "trusted-egress"` | 可以保留显式放行的代理；网络规则要允许连到代理的 IP 和端口，最终访问哪些目标由代理自己的 ACL 控制 |
+
+上表的通用代理委托只适用于普通会话。插件已冻结受保护 HTTP 出站策略时，`trusted-egress` 与任务代理变量均会明确拒绝，不能反复添加该配置消除报错；模型连接使用受保护模型桥，目前仅支持 Codex。详见[网络沙盒文档](sandbox.md)。
+
+`trusted-egress` 不创建代理、不自动授权环境变量、不保证 CLI 会使用代理；允许代理出口不等于限制代理后的业务目标。若模型依赖代理，不能只删掉 `inherit` 中的代理名称来让配置通过：应显式选择可信出口并配置出口规则与部署层 ACL，或先准备可直连的模型认证、获准目标 CIDR / 端口和 DNS，再移除代理授权。tmux 等持久后端、adopt 和外部 App Server 的拒绝门禁不会因 `trusted-egress` 或 `envPolicy` 放开。
 
 网络策略本身要求 Linux、本地 PTY 后端和 `sandbox: "oncall"`，详见[文件与网络沙盒](/sandbox)。
 

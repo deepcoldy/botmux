@@ -34,6 +34,7 @@ import { dirname, join } from 'node:path';
 import { shellQuote } from '../core/cli-launch-mode.js';
 import { isStandaloneBinary } from '../core/self-spawn.js';
 import { resolveNativeSubagentRuntimeHookWrapperPath } from '../core/botmux-wrapper.js';
+import { STATUSLINE_BUN_THREAD_ENV } from '../services/statusline-command.js';
 
 const require = createRequire(import.meta.url);
 
@@ -121,6 +122,11 @@ export function sessionReadyHookCommand(): string {
   return renderShellCommand(undefined, 'session-ready');
 }
 
+/** 版本化维护入口：旧 CLI 不认识该命令时不发任何 ready 信号。 */
+export function claudeCompactionHookCommand(): string {
+  return renderShellCommand(undefined, '__claude-compaction-v1');
+}
+
 /**
  * 构造 `botmux zcode-session-hook` 的 **argv 形式** `{ cmd, args }`。
  *
@@ -189,14 +195,39 @@ export function claudeStopFailureHookCommand(): string {
 }
 
 /**
- * 构造 Claude Code `statusLine.command` 的 shell 命令字符串 → `botmux statusline`。
- * 与 sessionReadyHookCommand 同策略，但写进**进程级** `--settings`（不写全局：全局只能
- * 有一个 statusLine，写进去会覆盖用户自己的；被 wrapperCli 剥掉时卡片省略即可）。
- * 子进程靠继承的 BOTMUX_SESSION_ID 定位落盘目录、靠 BOTMUX_STATUSLINE_CHAIN 转发
- * 用户原有的 statusline 命令；缺 env 时静默 exit 0。
+ * 构造 Claude Code `statusLine.command` 的 shell 命令字符串。
+ * 写进**进程级** `--settings`（不写全局：全局只能有一个 statusLine，写进去会覆盖用户自己的；
+ * 被 wrapperCli 剥掉时卡片省略即可）。子进程靠继承的 BOTMUX_SESSION_ID 定位落盘目录、靠
+ * BOTMUX_STATUSLINE_CHAIN 转发用户原有的 statusline 命令；缺 env 时静默 exit 0。
+ *
+ * 与其它 hook 不同，这条命令每条 assistant 消息都会被调一次，所以走轻量形态：
+ *   - Node/Bun 态指向 `statusline-entry.{js,ts}`（只加载叶子模块），不经 cli.js；
+ *     编译态仍是 `<binary> statusline`，由 standalone-entry 在加载 cli.js 前分流。
+ *   - Bun 运行时（非 Windows）在命令前加 JSC 线程限制（STATUSLINE_BUN_THREAD_ENV）：
+ *     Bun 默认按核数开 GC marker 与并发 JIT 线程，64 核机器上一个短命进程就是几十个线程。
+ *     Node 不认这两个变量，所以只在 Bun 下加；Windows 的 shell 不支持 `A=b cmd` 前缀。
  */
-export function statuslineHookCommand(): string {
-  return renderShellCommand(undefined, 'statusline');
+export function statuslineHookCommand(
+  standalone: boolean = isStandaloneBinary(),
+  moduleUrl: string = import.meta.url,
+  bunRuntime: boolean = 'Bun' in globalThis,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  let parts: string[];
+  if (standalone) {
+    parts = [shellQuote(process.execPath), 'statusline'];
+  } else {
+    const entryUrl = new URL(moduleUrl.endsWith('.ts') ? '../statusline-entry.ts' : '../statusline-entry.js', moduleUrl);
+    const entry = fileURLToPath(entryUrl);
+    const runtime = moduleUrl.endsWith('.ts') && !bunRuntime
+      ? [process.execPath, '--import', require.resolve('tsx'), entry]
+      : [process.execPath, entry];
+    parts = runtime.map(shellQuote);
+  }
+  const envPrefix = bunRuntime && platform !== 'win32'
+    ? Object.entries(STATUSLINE_BUN_THREAD_ENV).map(([k, v]) => `${k}=${v}`)
+    : [];
+  return [...envPrefix, ...parts].join(' ');
 }
 
 /**

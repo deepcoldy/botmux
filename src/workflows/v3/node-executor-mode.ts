@@ -15,7 +15,15 @@
 import type { BotSnapshot } from './contract.js';
 import { isGoalNode, isLoopNode, type V3Dag } from './dag.js';
 import type { RunChatBinding } from './grill-state.js';
-import { v3OrderedAncestorSets, v3OrderingBreak, v3ReachableAncestorSets, v3PlacementProblems, type V3MainTopicAvailability } from './placement.js';
+import {
+  v3CheckpointProblems,
+  v3CheckpointsWithoutDependants,
+  v3OrderedAncestorSets,
+  v3OrderingBreak,
+  v3ReachableAncestorSets,
+  v3PlacementProblems,
+  type V3MainTopicAvailability,
+} from './placement.js';
 import type { V3HandoffIdentityRecord, V3HandoffIdentityTool, V3HandoffIdentityUnavailableReason } from './run-envelope.js';
 
 export type V3NodeExecutorSwitch = 'ephemeral' | 'bot';
@@ -109,6 +117,9 @@ export interface V3NodeExecutorTarget {
   /** With `placement`: the node's transitive `depends` ancestors (top-level
    *  ids), so the §5.2 hard rules can be checked from the targets alone. */
   ancestors?: string[];
+  /** A top-level checkpoint nothing depends on (refused at approval, see
+   *  placement.ts {@link v3CheckpointsWithoutDependants}). */
+  checkpointWithoutDependants?: true;
 }
 
 function directoryOutputsOf(outputs: Record<string, { kind: string }> | undefined): string[] | undefined {
@@ -143,9 +154,14 @@ export function v3BotExecutorTargets(
   // linked by `depends` yet unordered); computed once per DAG, not per pair.
   const executorOfMain = new Map(main.map((node) => [node.id, isGoalNode(node) ? targetOf(node.bot, node.id) : undefined]));
   let reach: Map<string, Set<string>> | undefined;
+  const checkpointSinks = new Set(v3CheckpointsWithoutDependants(dag));
   for (const node of dag.nodes) {
     if (isGoalNode(node)) {
-      const target = withOutputs({ nodeId: node.id, larkAppId: targetOf(node.bot, node.id) }, node.outputs);
+      const target: V3NodeExecutorTarget = withOutputs({
+        nodeId: node.id,
+        larkAppId: targetOf(node.bot, node.id),
+        ...(checkpointSinks.has(node.id) ? { checkpointWithoutDependants: true as const } : {}),
+      }, node.outputs);
       if (node.placement !== 'main') {
         out.push(target);
         continue;
@@ -189,10 +205,13 @@ export function v3TargetPlacementProblems(input: {
   mainTopic: V3MainTopicAvailability;
   nameOf?: (larkAppId: string) => string;
 }): string[] {
+  const checkpoints = v3CheckpointProblems(input.targets
+    .filter((target) => target.checkpointWithoutDependants && !target.loop)
+    .map((target) => target.nodeId));
   const main = input.targets.filter((target) => target.placement === 'main' && !target.loop);
-  if (main.length === 0) return [];
+  if (main.length === 0) return checkpoints;
   const executor = new Map(main.map((target) => [target.nodeId, target.larkAppId]));
-  return v3PlacementProblems({
+  return [...checkpoints, ...v3PlacementProblems({
     dag: {
       runId: 'placement-check',
       nodes: main.map((target) => ({
@@ -217,15 +236,21 @@ export function v3TargetPlacementProblems(input: {
     },
     mainTopic: input.mainTopic,
     ...(input.nameOf ? { nameOf: input.nameOf } : {}),
-  }).map((problem) => problem.message);
+  }).map((problem) => problem.message)];
+}
+
+/** Whether {@link v3TargetPlacementProblems} has anything to check (callers
+ *  skip resolving the main topic otherwise). */
+export function v3TargetsHaveFlowRules(targets: readonly V3NodeExecutorTarget[]): boolean {
+  return targets.some((target) => !target.loop && (target.placement === 'main' || target.checkpointWithoutDependants));
 }
 
 /** The refusal text when placements break the §5.2 hard rules. */
 export function formatV3PlacementRefusal(problems: readonly string[]): string {
   return [
-    '节点落点不满足硬规则，已拒绝批准：',
+    '流程不满足硬规则，已拒绝批准：',
     ...problems.map((problem) => `- ${problem}`),
-    '把相关节点改成节点话题或调整依赖后重试（即兴 run 可用 revise-dag 让 Architect 重排）。',
+    '按上面的说明改节点落点、依赖或检查点后重试（即兴 run 可用 revise-dag 让 Architect 重排）。',
   ].join('\n');
 }
 
@@ -245,7 +270,10 @@ export type V3BotEligibilityCode =
    *  directory range (design §15.4). */
   | 'WORKING_DIR_OUT_OF_RANGE'
   /** `approve-dag --working-dir`, but this bot configures no directory. */
-  | 'WORKING_DIR_NO_RANGE';
+  | 'WORKING_DIR_NO_RANGE'
+  /** The directory is outside this bot's range (or it has none) and whether
+   *  the initiator may operate it could not be confirmed (`detail`: why). */
+  | 'WORKING_DIR_OPERATOR_UNKNOWN';
 
 export interface V3BotEligibilityProblem {
   nodeId: string;
@@ -352,9 +380,10 @@ const PROBLEM_TEXT: Record<V3BotEligibilityCode, string> = {
   DIRECTORY_OUTPUT: '节点声明了目录型产出，交给 Bot 执行时无法提交目录；请改成文件产出，或在 Dashboard 关闭该开关改用临时进程执行',
   WORKING_DIR_OUT_OF_RANGE: '指定的工作目录不在它配置的目录范围内（默认工作目录 / 仓库目录）',
   WORKING_DIR_NO_RANGE: '它没有配置目录范围（默认工作目录 / 仓库目录），不能给它指定工作目录',
+  WORKING_DIR_OPERATOR_UNKNOWN: '暂时无法确认发起人能否操作它，而指定的工作目录不在它配置的目录范围内；稍后重试，或把目录加进它的默认工作目录或仓库目录，或改派',
 };
 
-const WORKING_DIR_CODES: ReadonlySet<V3BotEligibilityCode> = new Set(['WORKING_DIR_OUT_OF_RANGE', 'WORKING_DIR_NO_RANGE']);
+const WORKING_DIR_CODES: ReadonlySet<V3BotEligibilityCode> = new Set(['WORKING_DIR_OUT_OF_RANGE', 'WORKING_DIR_NO_RANGE', 'WORKING_DIR_OPERATOR_UNKNOWN']);
 
 /** One user-facing reason for an eligibility code. */
 export function describeV3BotEligibilityCode(code: V3BotEligibilityCode): string {
@@ -378,7 +407,8 @@ export function formatV3BotEligibilityRefusal(
     ...(dirRefused ? [`指定的工作目录：${opts.workingDir}`] : []),
     ...lines,
     ...(dirRefused
-      ? ['节点在执行 Bot 自己的会话里跑，指定的目录必须落在每个执行 Bot 配置的默认工作目录或仓库目录之内；'
+      ? ['节点在执行 Bot 自己的会话里跑：发起人能操作（能在它的话题里用 /cd）的 Bot，目录存在即可；'
+        + '其余执行 Bot，指定的目录必须落在它配置的默认工作目录或仓库目录之内。'
         + '可换一个目录、给这些 Bot 的默认工作目录或仓库目录补上它，或去掉 --working-dir 让各 Bot 用自己的默认目录。']
       : []),
     '处理后重新批准；或用 revise-dag 改派节点，或在 Dashboard 关闭该开关改用临时进程执行。',
@@ -387,8 +417,8 @@ export function formatV3BotEligibilityRefusal(
 
 /** The Gate-2 summary line for a bot run approved with `--working-dir`. */
 export function describeV3NodeWorkingDir(workingDir: string): string {
-  return `工作目录：${workingDir}（每个执行 Bot 起节点会话时会按它当时的配置再核对一次；`
-    + '到时不在它的目录范围内，该节点会受阻并写明原因，不会改用它的默认目录）';
+  return `工作目录：${workingDir}（每个执行 Bot 起节点会话时会按它当时的配置和发起人当时的操作权再核对一次；`
+    + '到时不满足，该节点会受阻并写明原因，不会改用它的默认目录）';
 }
 
 /** The summary heading of a bot run: unchanged while every node gets its own
@@ -553,8 +583,9 @@ export async function resolveV3NodeExecutor(input: {
   }
   const binding = input.binding!;
   const targets = input.targetsFor(binding);
-  // §5.2 hard rules first: pure, and a refusal needs no live probe.
-  if (targets.some((target) => target.placement === 'main')) {
+  // §5.2 hard rules (and checkpoints without dependants) first: pure, and a
+  // refusal needs no live probe.
+  if (v3TargetsHaveFlowRules(targets)) {
     const placement = v3TargetPlacementProblems({
       targets,
       orchestratorAppId: binding.larkAppId,

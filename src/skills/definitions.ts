@@ -67,16 +67,18 @@ prompt 是到点时会被执行的内容，就像用户新开一个话题向你�
 botmux schedule list
 \`\`\`
 
-### 修改提示词
+### 修改任务（频率 / 提示词 / 日历）
 
-修改已有任务的 prompt 必须原地更新，不要先删除再创建：
+修改已有任务必须原地更新，不要先删除再创建（删了重建会丢掉任务 ID、执行记录和前置条件）：
 
 \`\`\`
+botmux schedule update <id> --schedule "every 4h"          # 改执行频率，写法同 schedule add
 botmux schedule update <id> --prompt-file <UTF-8 文件路径>
 botmux schedule update <id> --prompt "新的完整提示词"
+botmux schedule update <id> --schedule "0 9 * * 1-5" --prompt-file <文件>   # 可组合
 \`\`\`
 
-两种输入方式只能选一种。更新成功保留任务 ID、执行时间、启停状态、每次新话题设置和运行记录；已开始的执行沿用原 prompt，后续执行使用新版，不会自动补跑。文件读取、身份验证或写入失败时保留旧任务，先排查错误，不要通过删除任务重试。旧版本没有 update 时先升级，不要把修改降级为先删后建。若提示任务绑定了守护前置条件（precondition），说明该任务只能在 Dashboard 修改，不要删除重建，告知用户去 Dashboard 的定时任务页编辑。
+\`--schedule\` 的写法与 \`schedule add\` 完全相同（上面的表格）；改频率后按新频率从现在起重新计算下次执行时间，不补跑、不立即触发，输出里会显示新规则和下次执行时间；任务正在执行时改频率会被拒绝（schedule_run_in_flight），等这次执行结束再改即可，不要删除重建。\`--prompt\` 与 \`--prompt-file\` 只能选一种。更新成功保留任务 ID、静默设置、执行位置、前置条件（precondition）、日历规则、创建人身份、启停状态和运行记录；已开始的执行沿用原配置，后续执行使用新版。频率解析失败、文件读取、身份验证或写入失败时保留旧任务，先排查错误，不要通过删除任务重试。旧版本没有 update 或不认 \`--schedule\` 时先升级，不要把修改降级为先删后建。完整字段见 \`botmux schedule update --help\`。
 
 ### 管理
 
@@ -850,6 +852,7 @@ botmux bots list
 
 每个机器人一行，关键字段：
 - \`name\` / \`openId\` / \`isSelf\`
+  - \`name\` 只用于展示：以飞书开放平台当前应用名为准，Bot 在开放平台改名后，它的 daemon 在线时 10–12 分钟内跟着更新，**不要把它存下来当身份**；要引用某个 bot 时用 \`openId\` / \`larkAppId\`。
 - \`larkAppId\`：本机托管的机器人才有（可用作 workflow 的 bot id）
 - \`capability\`：团队能力标签（它擅长什么）——挑选交棒/协作对象的依据
 - \`hasTeamRole\`：是否配置了团队级角色
@@ -1495,6 +1498,18 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 - 推荐 \`key=label\`，key 用稳定英文短词，label 给用户看
 - \`--multi\` 开启多选；\`--json\` 的 \`answers[0]\` 保留完整 key 数组，且 \`selected\` 恒为 \`null\`（多选不要读 \`selected\`）
 - 默认超时 300 秒，可用 \`--timeout <seconds>\` 调整
+
+## @ 点名（--mention）
+
+ask 卡片是**独立卡片，不像 \`botmux send\` 的回复那样天然 @ 触发者**——不加 \`--mention\` 时卡片不会通知任何人，只能靠对方主动看群。需要指定某人收到通知时显式点名：
+
+\`\`\`bash
+botmux ask buttons --mention ou_xxx --options "yes=继续,no=回滚" "继续发版吗？"
+\`\`\`
+
+- 只接受 open_id（\`ou_\` 前缀，也兼容 \`ou_xxx:显示名\` 形态）；只有本应用通讯录查得到的真人会被 @，否则（如机器人）只丢掉 @，卡片照发
+- 需要点选者作答后再 @ 他：先用 \`--json\` 拿到 \`by\`，再 \`botmux send --mention <by>\`（ask 本身不回发结论）
+- prompt 位置参数就是卡片上「问题 N」下展示的**完整问题正文**，必须自成上下文（背景 + 在问什么），不要写「（选项确认）」这类占位文案——选项 label 不能替代问题本身
 `;
 
 const GOAL_ASK_SKILL = `---
@@ -1801,7 +1816,7 @@ run 开跑后要调整流程（加/删/改节点、改依赖、改派、重做�
 1. \`botmux workflow status <runId> --json\` 读当前版本（\`revision\`）、各节点状态、尝试次数和待确认的修改。
 2. 写 patch 文件（一组操作，整体生效或整体拒绝）：\`{"ops":[...],"note":"为什么改"}\`。操作：
    - \`{"op":"addNode","node":{...完整节点，同 dag.json}}\` · \`{"op":"removeNode","nodeId":"x"}\`
-   - \`{"op":"updateNode","nodeId":"x","set":{"goal":"…","timeoutSec":600,"humanGate":null}}\`（\`null\` 删除字段；depends/bot 不在这里改；\`"checkpoint":true\` 标检查点：节点完成后依赖它的节点先暂停、唤醒你看结果；不作废正在跑的执行）
+   - \`{"op":"updateNode","nodeId":"x","set":{"goal":"…","timeoutSec":600,"humanGate":null}}\`（\`null\` 删除字段；depends/bot 不在这里改；\`"checkpoint":true\` 标检查点：节点完成后依赖它的节点先暂停、唤醒你看结果；不作废正在跑的执行；检查点必须有节点依赖它，没有下游的检查点会被拒绝）
    - \`{"op":"setDepends","nodeId":"x","depends":[...],"inputs":[...]}\` · \`{"op":"reassign","nodeId":"x","bot":"<larkAppId>"}\` · \`{"op":"rerunNode","nodeId":"x"}\`
 3. \`botmux workflow edit <runId> --patch-file <文件> --base <revision> [--reason "<为什么改>"]\`。版本冲突就重新 status 再改，不要硬重试。
 

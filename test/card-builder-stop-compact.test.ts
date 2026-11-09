@@ -16,7 +16,7 @@ import {
   DEFAULT_CONTEXT_COMPACT_THRESHOLD,
 } from '../src/im/lark/card-builder.js';
 import { ALL_CLI_IDS } from '../src/adapters/cli/registry.js';
-import { cliHasNoRawPassthroughSurface } from '../src/core/passthrough-commands.js';
+import { cliHasNoRawPassthroughSurface, cliSupportsCompactAction } from '../src/core/passthrough-commands.js';
 import { setPromptOverrideResolver } from '../src/i18n/index.js';
 import {
   globalConfigPath,
@@ -56,6 +56,20 @@ function headerActions(card: any): any[] {
 
 function findButton(actions: any[], action: string): any {
   return actions.find((a: any) => a.tag === 'button' && a.value?.action === action);
+}
+
+/** The idle auto-compact toggle lives in the titled more-actions panel;
+ *  the button value carries the desired target state. */
+function idleCompactButton(card: any, desired: 'on' | 'off'): any {
+  const panel = card.elements.find((e: any) => e.tag === 'collapsible_panel');
+  const walk = (nodes: any[]): any[] => nodes.flatMap((n: any) => [
+    n,
+    ...(Array.isArray(n.columns) ? walk(n.columns.flatMap((c: any) => c.elements ?? [])) : []),
+    ...(Array.isArray(n.elements) ? walk(n.elements) : []),
+  ]);
+  return walk(panel?.elements ?? [])
+    .filter((n: any) => n?.tag === 'button')
+    .find((b: any) => b.value?.action === 'toggle_idle_compact' && b.value.desired === desired);
 }
 
 function build(opts: {
@@ -138,6 +152,11 @@ describe('buildStreamingCard: stop button (stop_turn)', () => {
 });
 
 describe('buildStreamingCard: compact button (compact_session)', () => {
+  it.each(['idle', 'working'])('renders the MiniMax compact button while %s without requiring usage metrics', status => {
+    const button = findButton(headerActions(build({ cliId: 'minimax', status })), 'compact_session');
+    expect(button).toBeTruthy();
+    expect(button.value).toMatchObject({ session_id: SID, root_id: ROOT, cli_id: 'minimax' });
+  });
   // 判据是「这个 CLI 有没有能收 /compact 的输入通道」，**不是**「有没有上下文百分比」。
   // 旧实现拿 percentUsed 当闸门，而只有 codex（native model_context_window）和 pi
   // （读 ~/.pi/agent/models.json）算得出百分比；Claude Code 的 transcript 里没有任何
@@ -188,7 +207,7 @@ describe('buildStreamingCard: compact button (compact_session)', () => {
     const offenders: string[] = [];
     for (const cliId of ALL_CLI_IDS) {
       // dsh 是运行时相关的：不传 dshRuntime ⇒ 谓词按 headless runner 判（fail-closed）。
-      if (!cliHasNoRawPassthroughSurface(cliId)) continue;
+      if (cliSupportsCompactAction(cliId)) continue;
       const card = build({ status: 'working', cliId, usage: { context: { percentUsed: 45 } } });
       if (findButton(headerActions(card), 'compact_session')) offenders.push(cliId);
     }
@@ -198,10 +217,11 @@ describe('buildStreamingCard: compact button (compact_session)', () => {
   });
 
   it('is hidden for the runner CLIs specifically (mira/mir/dsh/ebsd — /compact would be dropped or sent as a user message)', () => {
-    for (const cliId of ['mira', 'mir', 'dsh', 'ebsd', 'minimax']) {
+    for (const cliId of ['mira', 'mir', 'dsh', 'ebsd']) {
       const card = build({ status: 'working', cliId, usage: { context: { percentUsed: 45 } } });
       expect(findButton(headerActions(card), 'compact_session'), `cliId=${cliId}`).toBeFalsy();
     }
+    expect(cliHasNoRawPassthroughSurface('minimax')).toBe(true);
   });
 
   // dsh-tui 是 PTY 驱动的交互式 TUI（与 claude-code 同款交互模型），raw /compact 有效。
@@ -433,26 +453,27 @@ describe('session reasoning selector', () => {
 describe('buildStreamingCard: idle auto-compact toggle (toggle_idle_compact)', () => {
   const usageWith = (enabled: boolean) => ({ context: null, tokens: null, idleAutoCompact: { enabled, minutes: 55 } });
 
-  it('renders in the main control row next to compact, showing the current state', () => {
-    const off = findButton(headerActions(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(false) })), 'toggle_idle_compact');
+  it('renders in the more-actions panel, showing the current state and the target state', () => {
+    const off = idleCompactButton(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(false) }), 'on');
+    expect(off).toBeDefined();
     expect(off.text.content).toContain('关');
-    expect(off.value.desired).toBe('on');
-    expect(off.value.session_id).toBe(SID);
-    const on = findButton(headerActions(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(true) })), 'toggle_idle_compact');
+    const on = idleCompactButton(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(true) }), 'off');
+    expect(on).toBeDefined();
     expect(on.text.content).toContain('开');
-    expect(on.value.desired).toBe('off');
-    const actions = headerActions(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(false) })).map((a: any) => a.value?.action);
-    expect(actions.indexOf('toggle_idle_compact')).toBe(actions.indexOf('compact_session') + 1);
+    // The button carries the session binding the handler needs.
+    const card = build({ status: 'idle', cliId: 'claude-code', usage: usageWith(false) });
+    expect(off.value.session_id).toBe(SID);
   });
 
   it('localises the label', () => {
-    const btn = findButton(headerActions(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(true), locale: 'en' })), 'toggle_idle_compact');
-    expect(btn.text.content).toMatch(/idle/i);
+    const button = idleCompactButton(build({ status: 'idle', cliId: 'claude-code', usage: usageWith(true), locale: 'en' }), 'off');
+    expect(button.text.content).toMatch(/idle/i);
   });
 
   it('is not rendered when the snapshot carries no toggle state (unsupported CLI/backend)', () => {
     const card = build({ status: 'idle', cliId: 'gemini', usage: { context: null, tokens: null } });
-    expect(findButton(headerActions(card), 'toggle_idle_compact')).toBeFalsy();
+    expect(idleCompactButton(card, 'on')).toBeFalsy();
+    expect(idleCompactButton(card, 'off')).toBeFalsy();
   });
 
   it('follows the compact button\'s hidden-button setting', () => {
@@ -461,6 +482,7 @@ describe('buildStreamingCard: idle auto-compact toggle (toggle_idle_compact)', (
       undefined, undefined, false, false, undefined, undefined, undefined, false,
       usageWith(true) as any, undefined, undefined, undefined, undefined, ['compact'],
     ));
-    expect(findButton(headerActions(card), 'toggle_idle_compact')).toBeFalsy();
+    expect(idleCompactButton(card, 'on')).toBeFalsy();
+    expect(idleCompactButton(card, 'off')).toBeFalsy();
   });
 });

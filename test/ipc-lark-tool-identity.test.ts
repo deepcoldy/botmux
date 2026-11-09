@@ -18,10 +18,21 @@ import { buildDocCommentTurnInput } from '../src/core/doc-comment-prompt.js';
 import { clearLarkToolDelegations } from '../src/core/lark-tool-delegation.js';
 import { Client } from '@larksuiteoapi/node-sdk';
 import { createServer, type Server } from 'node:http';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { __setPlatformCredentialDepsForTest } from '../src/core/platform-credential-source.js';
+import {
+  createProtectedLoopbackProxyAttestation,
+  PROTECTED_LOOPBACK_ATTESTATION_HEADER,
+} from '../src/core/protected-loopback-attestation.js';
 
 let dir: string, previousDataDir: string, ipc: IpcServerHandle | undefined, session: any, binding: LarkToolBinding;
 const botToken = vi.fn<() => Promise<unknown>>();
+const headlessId = 'hl_11111111-1111-4111-8111-111111111111';
+function markHeadless() {
+  session.chatId = `headless_${headlessId}`;
+  session.session.chatId = session.chatId;
+  session.session.headless = { id: headlessId, source: 'cli' };
+}
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), 'ipc-lark-tool-')); previousDataDir = config.session.dataDir; config.session.dataDir = dir;
   binding = prepareLarkToolEnv({ env: { PATH: '/usr/bin:/bin' }, dataDir: dir, sessionId: 'tool-session', appId: 'cli_bound' });
@@ -54,6 +65,58 @@ async function request(mode: string, accessKey = binding.accessKey) {
   });
 }
 describe('session application identity route', () => {
+  it.skipIf(process.platform !== 'linux')('accepts a signed original peer through the trusted loopback proxy and binds it to the live turn', async () => {
+    const cliRoot: ChildProcess = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+      stdio: 'ignore',
+    });
+    try {
+      if (!cliRoot.pid) throw new Error('fixture cli root did not start');
+      const cliProcStart = readProcessStartIdentity(cliRoot.pid);
+      session.localProcessAttestation = {
+        backendType: 'pty', workerGeneration: 1, cliPid: cliRoot.pid, cliProcStart,
+      };
+      session.managedTurnOrigin.preexistingProcessIdentities = [`${cliRoot.pid}:${cliProcStart}`];
+      session.protectedLoopbackProxyAttestation = {
+        secret: 'ab'.repeat(32), workerGeneration: 1,
+      };
+      const path = '/api/sessions/tool-session/lark-tool-identity';
+      const body = Buffer.from(JSON.stringify({ mode: 'user' }));
+      const headers = {
+        'content-type': 'application/json',
+        'x-botmux-lark-session': binding.accessKey,
+      };
+      const attestation = createProtectedLoopbackProxyAttestation(
+        session.protectedLoopbackProxyAttestation.secret,
+        {
+          sessionId: 'tool-session', serviceId: 'lark-tool-identity', workerGeneration: 1,
+          turnId: 'om_turn', peer: { pid: cliRoot.pid, procStart: cliProcStart },
+          method: 'POST', path, headers, body,
+        },
+      );
+
+      const direct = await request('user');
+      expect(direct.status).toBe(403);
+      const proxied = await fetch(`http://127.0.0.1:${ipc!.port}${path}`, {
+        method: 'POST',
+        headers: { ...headers, [PROTECTED_LOOPBACK_ATTESTATION_HEADER]: attestation },
+        body,
+      });
+      expect(proxied.status).toBe(200);
+      expect(await proxied.json()).toMatchObject({ mode: 'user', credential: 'bound-user-token' });
+
+      session.managedTurnOrigin.turnId = 'om_later';
+      const stale = await fetch(`http://127.0.0.1:${ipc!.port}${path}`, {
+        method: 'POST',
+        headers: { ...headers, [PROTECTED_LOOPBACK_ATTESTATION_HEADER]: attestation },
+        body,
+      });
+      expect(stale.status).toBe(403);
+      expect(await stale.json()).toMatchObject({ error: 'current_execution_unverified' });
+    } finally {
+      cliRoot.kill('SIGKILL');
+    }
+  });
+
   async function delegate(options: { tools?: ('lark-cli' | 'bytedcli')[]; denialReason?: 'target_access_denied' | 'target_validation_unavailable'; targetOpenId?: string; turnId?: string; recheck?: () => string | undefined } = {}) {
     session.managedTurnOrigin.callerOpenId = 'ou_dispatch_bot';
     const botConfig = { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',
@@ -258,6 +321,57 @@ describe('session application identity route', () => {
     expect((await request('bot')).status).toBe(403);
     expect(botToken).not.toHaveBeenCalled();
   });
+  it('gives a bound headless runner only its own bot token', async () => {
+    markHeadless();
+    session.managedTurnOrigin = undefined;
+    const response = await request('bot');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ appId: 'cli_bound', mode: 'bot',
+      credentialType: 'tenant_access_token', credential: 'bound-bot-token' });
+    expect((await request('user')).status).toBe(403);
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+    // Even a stale human origin cannot turn a headless runner into a user session.
+    session.managedTurnOrigin = { turnId: 'om_turn', capability: 'cap', callerOpenId: 'ou_sender' };
+    expect((await request('user')).status).toBe(403);
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+  });
+  it.each(['http_async_runner', 'http_wait_runner'])('keeps other virtual chats without tool credentials (%s)', async chatId => {
+    session.chatId = chatId;
+    expect((await request('bot')).status).toBe(403);
+    expect(botToken).not.toHaveBeenCalled();
+  });
+  it('keeps API-only bots without Lark credentials even in a headless chat', async () => {
+    markHeadless();
+    vi.mocked(bots.getBot).mockReturnValue({ config: { larkAppId: 'cli_bound', apiOnly: true } } as any);
+    expect((await request('bot')).status).toBe(403);
+    expect(botToken).not.toHaveBeenCalled();
+  });
+  it.each(['headless_forged-http-chat', `headless_${headlessId}`])('refuses forged webhook headless addresses without durable provenance (%s)', async chatId => {
+    session.chatId = chatId;
+    expect((await request('bot')).status).toBe(403);
+    expect(botToken).not.toHaveBeenCalled();
+  });
+  it('refuses mismatched headless provenance', async () => {
+    markHeadless();
+    session.session.headless.id = 'hl_22222222-2222-4222-8222-222222222222';
+    expect((await request('bot')).status).toBe(403);
+    expect(botToken).not.toHaveBeenCalled();
+  });
+  it('refuses a headless token if the bot configuration cannot be verified', async () => {
+    markHeadless();
+    vi.mocked(bots.getBot).mockImplementation(() => { throw new Error('unknown bot'); });
+    expect((await request('bot')).status).toBe(403);
+    expect(botToken).not.toHaveBeenCalled();
+  });
+  it('rejects unbound headless callers and rechecks the app during token resolution', async () => {
+    markHeadless();
+    expect((await request('bot', '00'.repeat(32))).status).toBe(403);
+    expect(botToken).not.toHaveBeenCalled();
+    botToken.mockImplementation(async () => { session.chatId = 'http_async_runner'; return 'late-token'; });
+    const response = await request('bot');
+    expect(response.status).toBe(403);
+    expect(await response.text()).not.toContain('late-token');
+  });
   it.each(['reject', 'empty'] as const)('refuses unavailable bot tokens without returning the app secret (%s)', async failure => {
     if (failure === 'reject') botToken.mockRejectedValue(new Error('private provider details'));
     else botToken.mockResolvedValue('');
@@ -334,6 +448,15 @@ describe('session application identity route', () => {
     const response = await request('user');
     expect(response.status).toBe(409); expect(await response.text()).not.toContain('wrong-turn-token');
   });
+  it('does not return a user credential when the session loses chat transport during resolution', async () => {
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+      markHeadless();
+      return 'late-user-token';
+    });
+    const response = await request('user');
+    expect(response.status).toBe(409);
+    expect(await response.text()).not.toContain('late-user-token');
+  });
   it.skipIf(process.platform !== 'linux')('allows a callerless scheduled execution with a scoped delegated user', async () => {
     await delegate();
     delete session.managedTurnOrigin.callerOpenId;
@@ -385,7 +508,11 @@ describe('session application identity route', () => {
       expect(tokens.resolveUserToken).not.toHaveBeenCalled();
     } finally { shell.kill(); }
   });
-  it('runs the real tool process with only the selected application credentials', async () => {
+  it.each([false, true])('runs the real tool process with only the selected application credentials (headless=%s)', async headless => {
+    if (headless) {
+      markHeadless();
+      session.managedTurnOrigin = undefined;
+    }
     const real = join(dir, 'real-lark');
     writeFileSync(real, '#!/usr/bin/env node\n' + fakeLarkHelpScript() + 'process.stdout.write([process.env.LARKSUITE_CLI_APP_ID,process.env.LARKSUITE_CLI_APP_SECRET,process.env.LARKSUITE_CLI_TENANT_ACCESS_TOKEN,process.env.LARKSUITE_CLI_USER_ACCESS_TOKEN,process.argv.slice(2).join(" ")].map(x=>x||"").join("|"));\n'); chmodSync(real, 0o755);
     binding.realBinary = real; writeFileSync(larkToolBindingPath(dir, 'tool-session'), JSON.stringify(binding), { mode: 0o600 });
@@ -399,8 +526,16 @@ describe('session application identity route', () => {
     });
     const bot = await run(['docs', '+fetch']); expect(bot.code, bot.err).toBe(0);
     expect(bot.out).toBe('cli_bound||bound-bot-token||docs +fetch --as bot');
-    const user = await run(['docs', '+fetch', '--as=user']); expect(user.code, user.err).toBe(0);
-    expect(user.out).toBe('cli_bound|||bound-user-token|docs +fetch --as user');
+    const user = await run(['docs', '+fetch', '--as=user']);
+    if (headless) {
+      expect(user.code).toBe(77);
+      expect(user.out).toBe('');
+      expect(user.err).toContain('lark_tool_user_transport_required');
+      expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+    } else {
+      expect(user.code, user.err).toBe(0);
+      expect(user.out).toBe('cli_bound|||bound-user-token|docs +fetch --as user');
+    }
     const passthrough = await run(['docs', '+fetch', '--profile=cli_other']); expect(passthrough.code, passthrough.err).toBe(0);
     expect(passthrough.out).toBe('cli_wrong|||wrong-user|docs +fetch --profile=cli_other');
   });

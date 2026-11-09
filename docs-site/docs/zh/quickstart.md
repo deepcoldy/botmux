@@ -81,6 +81,10 @@ botmux setup
 
 > 想用脚本或 AI agent 配置，不走交互界面？用 `botmux setup add` / `botmux setup list` 等子命令，`botmux setup help` 查看全部参数。
 
+> ➕ **需要内置清单之外的权限？** 脚本化添加时传 `--extra-scopes-file <json>`（仅飞书租户；Lark 需在开放平台手动添加），例如 `botmux setup add --create-app --allowed-users <邮箱> --extra-scopes-file ./scopes.json`；已有机器人用 `botmux setup configure <进程名|AppID> --extra-scopes-file ./scopes.json` 补上。文件格式同 `lark-scopes.json`（`{"scopes":{"tenant":[],"user":[]}}`）；也接受 `{"scopes":[{"scope":"x:y"}]}`，但这种写法一律按 user 权限申请，要申请 tenant 权限请用 `{"scopes":{"tenant":["x:y"]}}`。当前租户目录里没有的权限（包括只有另一种身份才有的权限）会跳过并列在结果里，不会中断流程。文件路径会记到该机器人配置，之后重跑 `configure` 自动沿用；记下的文件读不到时只提示并按内置清单继续，不再需要就跑 `botmux setup configure <进程名|AppID> --extra-scopes-file -` 清除。
+
+> 👋 **上线欢迎语**：`botmux setup add ... --welcome-message "回复 /init 开始配置"`（或 `--welcome-message-file welcome.txt` 从文件读取）会让机器人首次成功上线后主动私聊主人一次；已有机器人用 `botmux setup edit <进程名|AppID> --welcome-message ...` 设置，传 `-` 清空。发送记录在 daemon 数据目录 `welcome-sent/` 下，之后重启不会重发；发送失败不影响启动，下次启动重试。详见 [bots.json 配置 · 上线欢迎语](/bots-json#welcome-message)。
+
 ## 第 3 步 · 启动
 
 ```bash
@@ -142,14 +146,15 @@ cursor-agent -p "$DIAG"                    # Cursor
 
 改完执行 `botmux restart`。更多见 [FAQ / 排错](/faq)。
 
-### 可选事件：编辑补 @、撤回同步
+### 可选事件：编辑补 @、撤回同步、群解散
 
-下面两个事件缺了**不影响普通消息**，只影响对应的小功能。新建的机器人会自动订阅；老机器人在启动时，botmux 会借本机已有的开放平台登录状态尝试补上。
+下面几个事件缺了**不影响普通消息**，只影响对应的小功能。新建的机器人会自动订阅；老机器人在启动时，botmux 会借本机已有的开放平台登录状态尝试补上。
 
 | 事件 | 用途 |
 |---|---|
 | `im.message.updated_v1` | 编辑一条之前没 @ 机器人的消息、补上 @ 后触发任务 |
 | `im.message.recalled_v1` | 群聊上下文共享（`/context-sharing`）里，撤回的消息同步从记录中标记掉。只在开了这个功能时才会去补 |
+| `im.chat.disbanded_v1` | 群被解散后，结束机器人在这个群里的会话（和 `/close` 一样，之后还能恢复，不删 worktree）。缺了的话，要等 daemon 下次重启时才会把这些会话关掉 |
 
 注意几点：
 

@@ -51,14 +51,50 @@ export function retryCooldownRemaining(
   return Math.max(0, cooldownMs - (now.getTime() - last));
 }
 
+/** What one accepted attempt changed, so an attempt that provably never ran
+ *  can give its cooldown back (see refundRetryAttempt). */
+export interface RetryAttemptReceipt {
+  turnId: string;
+  previousRetryCount: number;
+  previousRetryAt?: string;
+  stampedAt: string;
+}
+
 /** Stamp one accepted `/retry` attempt onto the session's record. No-op when
  *  the session has no failed turn recorded. */
 export function markRetryAttempt(
   session: { lastFailedTurn?: FailedTurnRecord },
   now: Date = new Date(),
-): void {
+): RetryAttemptReceipt | undefined {
   const record = session.lastFailedTurn;
-  if (!record) return;
+  if (!record) return undefined;
+  const receipt: RetryAttemptReceipt = {
+    turnId: record.turnId,
+    previousRetryCount: record.retryCount,
+    ...(record.lastRetryAt ? { previousRetryAt: record.lastRetryAt } : {}),
+    stampedAt: now.toISOString(),
+  };
   record.retryCount += 1;
-  record.lastRetryAt = now.toISOString();
+  record.lastRetryAt = receipt.stampedAt;
+  return receipt;
+}
+
+/** Undo the attempt behind `receipt`. Only while the record is still that
+ *  failed turn with that stamp on top: a newer failure or a later attempt
+ *  keeps its own cooldown. Returns whether anything changed. */
+export function refundRetryAttempt(
+  session: { lastFailedTurn?: FailedTurnRecord },
+  receipt: RetryAttemptReceipt,
+): boolean {
+  const record = session.lastFailedTurn;
+  if (
+    !record
+    || record.turnId !== receipt.turnId
+    || record.retryCount !== receipt.previousRetryCount + 1
+    || record.lastRetryAt !== receipt.stampedAt
+  ) return false;
+  record.retryCount = receipt.previousRetryCount;
+  if (receipt.previousRetryAt) record.lastRetryAt = receipt.previousRetryAt;
+  else delete record.lastRetryAt;
+  return true;
 }

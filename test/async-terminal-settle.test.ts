@@ -160,7 +160,7 @@ describe('interruptExactWorkerTurn', () => {
     (ds.worker as any).emit('message', {
       type: 'turn_interrupt_result', requestId: sent.requestId, turnId: 'turn-exact', delivered: true,
     });
-    await expect(pending).resolves.toEqual({ ok: true });
+    await expect(pending).resolves.toEqual({ ok: true, confirmation: 'interrupt_delivered' });
   });
 });
 
@@ -475,5 +475,82 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     await new Promise(r => setTimeout(r, 20));
     expect(ds.asyncTriggerResults!.has('turn-feishu')).toBe(false);
     expect(recordCompletedMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('a failed terminal\'s raw error and screen tail (daemon turn_terminal handler)', () => {
+  beforeEach(() => {
+    recordTerminalFailureStrictMock.mockClear();
+    recordTerminalFailureStrictMock.mockReturnValue('written_failed');
+    initWorkerPool({
+      sessionReply: sessionReplyMock,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    } as any);
+  });
+  afterEach(() => { vi.clearAllMocks(); });
+
+  /** The session of the last settle(), for terminals that follow it. */
+  let settled: DaemonSession | undefined;
+
+  async function settle(extra: Partial<Extract<WorkerToDaemon, { type: 'turn_terminal' }>>, cliId = 'claude-code') {
+    const ds = makeDs(); ds.session.cliId = cliId;
+    settled = ds;
+    ds.asyncTriggerResults = new Map([['t-diag', { status: 'pending' } as any]]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', terminalMsg('t-diag', { status: 'failed', errorCode: 'provider_permission_denied', ...extra }));
+    await vi.waitFor(() => expect(ds.asyncTriggerResults!.get('t-diag')?.status).toBe('failed'));
+    return ds.asyncTriggerResults!.get('t-diag')!;
+  }
+
+  it('keeps both on the in-memory result, masked again (an older worker may not have), never in the durable record', async () => {
+    const result = await settle({
+      errorDetail: 'Access denied for model x; Authorization: Bearer abcdefghij0123456789',
+      screenTail: '$ claude\n  ⎿  API Error: 403 api_key=zyxwvut98765 Access denied for model x\n❯',
+    });
+    expect(result.terminalErrorDetail).toContain('Access denied for model x');
+    expect(result.terminalScreenTail).toContain('Access denied for model x');
+    expect(JSON.stringify(result)).not.toMatch(/abcdefghij0123456789|zyxwvut98765/);
+    expect(recordTerminalFailureStrictMock).toHaveBeenCalledWith(
+      'sid-async-settle', 't-diag', expect.any(Number), 'app_test', 'provider_permission_denied');
+  });
+
+  it('a CLI with no error text leaves only the screen tail', async () => {
+    const result = await settle({ errorCode: 'grok_turn_error', screenTail: 'grok> request failed: upstream 502' }, 'grok');
+    expect(result.terminalErrorDetail).toBeUndefined();
+    expect(result.terminalScreenTail).toBe('grok> request failed: upstream 502');
+  });
+
+  it('an older worker\'s terminal (neither field) settles exactly as before', async () => {
+    const result = await settle({});
+    expect(result).toMatchObject({ status: 'failed', errorCode: 'trigger_failed', terminalErrorCode: 'provider_permission_denied' });
+    expect('terminalErrorDetail' in result).toBe(false);
+    expect('terminalScreenTail' in result).toBe(false);
+  });
+
+  it('a later terminal of the turn (another attempt) brings its own text, or none — never its code under the earlier one\'s', async () => {
+    const result = await settle({
+      status: 'ambiguous', errorCode: 'write_input_threw', dispatchAttempt: 1,
+      errorDetail: 'ATTEMPT-1 DETAIL', screenTail: 'ATTEMPT-1 SCREEN',
+    });
+    expect(result).toMatchObject({ terminalErrorDetail: 'ATTEMPT-1 DETAIL', terminalScreenTail: 'ATTEMPT-1 SCREEN' });
+    const ds = settled!;
+
+    // The next attempt fails with no provider text and no screen.
+    (ds.worker as any).emit('message', terminalMsg('t-diag', { status: 'failed', errorCode: 'provider_server_error', dispatchAttempt: 2 }));
+    await vi.waitFor(() => expect(ds.asyncTriggerResults!.get('t-diag')?.terminalErrorCode).toBe('provider_server_error'));
+    const second = ds.asyncTriggerResults!.get('t-diag')!;
+    expect('terminalErrorDetail' in second).toBe(false);
+    expect('terminalScreenTail' in second).toBe(false);
+
+    // One that has only a screen brings the screen, and still no stale text.
+    (ds.worker as any).emit('message', terminalMsg('t-diag', {
+      status: 'failed', errorCode: 'provider_rate_limited', dispatchAttempt: 3, screenTail: 'ATTEMPT-3 SCREEN',
+    }));
+    await vi.waitFor(() => expect(ds.asyncTriggerResults!.get('t-diag')?.terminalErrorCode).toBe('provider_rate_limited'));
+    const third = ds.asyncTriggerResults!.get('t-diag')!;
+    expect(third.terminalScreenTail).toBe('ATTEMPT-3 SCREEN');
+    expect('terminalErrorDetail' in third).toBe(false);
   });
 });

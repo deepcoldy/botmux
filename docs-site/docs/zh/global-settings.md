@@ -23,6 +23,7 @@
 | 定时任务按某个时区算 | 通用设置 → 定时任务 → 时区 | `scheduleTimeZone` | 跟随主机 |
 | `/g` 建的群自动加前缀 | 通用设置 → 群聊创建 | `groupNamePrefix` | 不加 |
 | 选仓卡里不显示 worktree | 通用设置 → 仓库选择 | `repoPickerMode` | 仓库 + worktree |
+| 新建的 worktree 放到大数据盘 | 通用设置 → Worktree | `worktreeRoot` | 建在主仓库旁边 |
 | 下载新版走代理 | 系统与维护 → 自动维护 → GitHub 下载代理 | `httpProxy` | 不设 |
 | `/login` 授权后不用手动粘贴链接 | 通用设置 → 访问权限 → OAuth 回调基址 | `oauthRedirectBase` | 不设 |
 
@@ -136,6 +137,7 @@ botmux worker-budget unset                           # 清掉自定义，回到�
 
 - **`/g` 群名前缀**（通用设置 → 群聊创建，`groupNamePrefix`）：用 `/group` 或 `/g` 建群时，群名前面自动加上这段文字，例如 `AI讨论·`。别的建群方式不加。清空保存就关掉，最多约 2 秒生效。详见[一键新建会话群](/group)。
 - **仓库选择卡模式**（通用设置 → 仓库选择，`repoPickerMode`）：`all`（默认，仓库和它的 worktree 都列出来）或 `repos`（只列主仓库）。选了 `repos` 后，直接写 `/repo <worktree 路径>` 仍然能进 worktree。
+- **worktree 存放目录**（通用设置 → Worktree，`worktreeRoot`）：botmux 新建的 worktree 放到这个目录下，例如 `/data00/worktrees`，适合系统盘小、另有大数据盘的机器。目录下按主仓库所在路径分层：`/root/iserver/botmux` 的 worktree 会建成 `/data00/worktrees/root/iserver/botmux-wt-…`，所以不同位置的同名仓库不会冲突。填一个已存在、可写的目录的绝对路径（可以 `~/` 开头）。只影响之后新建的 worktree，已有的留在原处照常使用，之后再换目录也不影响。这个目录之后若不存在或不可写（比如数据盘没挂上、被重新挂成只读），新 worktree 会临时建回主仓库旁边，并在日志里告警。清空保存就恢复为建在主仓库旁边，最多约 2 秒生效。
 
 ## 网络与访问
 
@@ -158,6 +160,21 @@ botmux 自带的 skill（发消息、建定时任务等）要交给 CLI 用。�
 | `off` | 都不放，只留一句「用法见 `botmux --help`」 |
 
 这是整台机器的默认值，用命令改：`botmux skills injection [global|prompt|off|unset]`，不带参数是查看。单个机器人在 bots.json 里设了 `skillInjection` 时，以机器人自己的为准。详见 [Skill](/skill-cli)。
+
+## 同群多人独立会话（XPI，实验性） {#xpi}
+
+**默认关闭。** 关着时，群里所有人共用同一个会话：别人在 Bot 干活时发的消息按普通方式排队，等当前任务做完再处理。
+
+打开后，同一个群里**每个真人各用一套独立的 CLI 上下文和 git worktree**，可以并行干活、互不打断：
+
+- 消息仍然在群里公开可见，只是各自进各自的「lane」。
+- 引用别人正在执行的任务时，会走建议 / 确认流程，不会直接插进别人的任务；其它消息直接在发送者自己的 lane 里继续。
+- 在话题里发 `/lane status` 查看自己 lane 的分支、worktree、未提交改动和未推送提交数；`/lane close` 安全关闭自己的 lane（有任务在跑或有未提交文件时会拒绝，回收前先推送未发布的提交，不会自动合并或删分支）。
+- Agent 给别的 Bot 发消息时，要用 `botmux send --as independent|suggestion` 说明是「另开任务」还是「留给当前任务」。
+
+怎么开：Dashboard「全局设置 → 通用设置 → 实验性配置 → 跨身份打断隔离（XPI）」，对应 `config.json` 的 `dashboard.crossPrincipalInterruption: true`。开关对这台机器上所有 Bot 生效，**下一轮消息就生效，不用重启**。只想让某个 daemon 进程开或关，可以给它设环境变量 `BOTMUX_XPI_ENABLED=true` / `false`，它优先于 Dashboard 开关。
+
+大家需要共用同一份上下文和文件时保持关闭；任务彼此完全独立时再开。
 
 ## 常见问题
 

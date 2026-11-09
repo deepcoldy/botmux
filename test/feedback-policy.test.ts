@@ -271,4 +271,27 @@ describe('feedback policy', () => {
       expect((await materializeFeedbackReviewers(requester, resolve)).policy).toBe(requester);
     });
   });
+
+  describe('buttonAlign', () => {
+    it('keeps right alignment on the normalized policy', () => {
+      expect(normalizeFeedbackPolicy({ enabled: true, buttonAlign: 'right' }).buttonAlign).toBe('right');
+    });
+
+    it('treats left and unset the same and adds no key for either', () => {
+      const unset = normalizeFeedbackPolicy({ enabled: true });
+      const left = normalizeFeedbackPolicy({ enabled: true, buttonAlign: 'left' });
+      expect('buttonAlign' in unset).toBe(false);
+      expect('buttonAlign' in left).toBe(false);
+      expect(JSON.stringify(left)).toBe(JSON.stringify(unset));
+    });
+
+    it.each(['center', 'middle', 'RIGHT', '', 1, null, true, {}])('rejects invalid value %j', value => {
+      expect(() => normalizeFeedbackPolicy({ enabled: true, buttonAlign: value })).toThrow('feedback.buttonAlign must be left or right');
+    });
+
+    it('survives a persisted snapshot round trip', () => {
+      const policy = normalizeFeedbackPolicy({ enabled: true, buttonAlign: 'right' });
+      expect(normalizeFeedbackPolicy(JSON.parse(JSON.stringify(policy)))).toEqual(policy);
+    });
+  });
 });

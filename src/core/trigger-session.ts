@@ -1,6 +1,7 @@
 import { config } from '../config.js';
 import { outputDeliveryJournal } from '../services/output-delivery-journal.js';
 import { armTriggerStreamingCard } from './trigger-streaming-card.js';
+import { messageListenerTaskAnchor } from './message-listener-silence.js';
 import { rememberTriggerTurn } from './turn-origin.js';
 import { zeroPromptInjectionForBot, sessionPromptInjection } from './prompt-injection.js';
 import { withLarkTurnIdempotency } from './lark-turn-idempotency.js';
@@ -40,7 +41,8 @@ import type { CliTurnPayload } from '../types.js';
 import { withBotTurnAdmission } from './bot-turn-mutation-gate.js';
 import { stagePendingRepoSetup } from './pending-repo-journal.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
-import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort } from '../services/codex-reasoning-effort.js';
+import { allowsTaskModelOverride } from './launch-model-capability.js';
 import { headlessChatId, isHeadlessId, newHeadlessId, saveHeadlessSession, updateHeadlessSession } from '../services/headless-session-store.js';
 
 export interface TriggerSessionDeps {
@@ -53,6 +55,9 @@ export interface TriggerSessionDeps {
  * identity that participates in durable delivery reconciliation. */
 export interface TriggerSessionInternalOptions {
   stableTurnId?: string;
+  /** Trusted dashboard listener execution; never accepted from the public trigger API. */
+  messageListenerRun?: import('./message-listener-silence.js').SilentMessageListenerRun;
+  messageListenerAutoClose?: boolean;
   /** A loud idempotent relay must not be replayed by worker crash recovery. */
   atMostOnce?: boolean;
   /** Synchronous write-ahead hook invoked immediately before worker IPC/fork.
@@ -1279,7 +1284,7 @@ async function triggerSessionTurnAdmitted(
       return { ok: false, errorCode: rootTarget.errorCode, error: rootTarget.error };
     }
     chatId = rootTarget.chatId;
-    ds = deps.activeSessions.get(sessionKey(rootMessageId, larkAppId));
+    if (!internal?.messageListenerRun) ds = deps.activeSessions.get(sessionKey(rootMessageId, larkAppId));
   }
 
   if (!chatId) {
@@ -1807,12 +1812,12 @@ async function triggerSessionTurnAdmitted(
   }
 
   const bot = getBot(larkAppId);
-  const hasReasoningControl = isConfigurableReasoningCliId(bot.config.cliId);
+  const acceptsTaskOverride = allowsTaskModelOverride(bot.config.cliId);
   const effectiveModel = typeof req.options?.model === 'string' && req.options.model.trim()
     ? req.options.model.trim()
     : bot.config.model;
   const effectiveReasoningEffort = req.options?.reasoningEffort ?? bot.config.reasoningEffort;
-  if (hasReasoningControl && effectiveReasoningEffort
+  if (acceptsTaskOverride && effectiveReasoningEffort
       && bot.config.cliId !== 'traex'
       && !cliModelSupportsReasoningEffort(bot.config.cliId, effectiveModel, effectiveReasoningEffort)) {
     return {
@@ -1826,7 +1831,12 @@ async function triggerSessionTurnAdmitted(
     : await getChatMode(larkAppId, chatId, { forceRefresh: true }));
   let scope: 'thread' | 'chat' = rootMessageId ? 'thread' : 'chat';
   let anchor = rootMessageId || chatId;
+  if (internal?.messageListenerRun) {
+    anchor = messageListenerTaskAnchor(stableTurnId ?? internal.messageListenerRun.sourceMessageId);
+    scope = 'thread';
+  }
   const shouldOpenOwnTopic = !rootMessageId
+    && !internal?.messageListenerRun
     && !httpVirtual
     && (opensExplicitTopic || externalEventOpensOwnTopic(chatMode, regularGroupMode));
   if (shouldOpenOwnTopic && topicMessage !== null) {
@@ -1858,7 +1868,10 @@ async function triggerSessionTurnAdmitted(
     const current = deps.activeSessions.get(key);
     if (current) return { kind: 'existing' as const, ds: current };
 
-    const session = sessionStore.createSession(chatId, anchor, triggerTitle(req), 'group', undefined, { source: 'http' });
+    const session = sessionStore.createSession(chatId, anchor, triggerTitle(req), 'group', undefined, {
+      source: 'http', messageListenerRun: internal?.messageListenerRun,
+    });
+    if (internal?.messageListenerAutoClose) session.messageListenerAutoClose = true;
     const now = Date.now();
     const nowIso = new Date(now).toISOString();
     session.larkAppId = larkAppId;
@@ -1876,24 +1889,21 @@ async function triggerSessionTurnAdmitted(
     session.lastMessageAt = nowIso;
     session.workingDir = wd.workingDir;
     session.cliId = bot.config.cliId;
-    // Per-turn model / reasoning-effort override — scoped to CLIs with an
-    // explicit reasoning control and to a freshly-created trigger session.
-    // Gating on cliId keeps the contract honest and bounded: it never silently
-    // changes the model of a Claude/Kimi/CoCo bot, and a fold-in to an existing
-    // worker never reaches here. Model is gated here so it cannot leak to
-    // other CLIs whose adapters do not implement this contract.
+    // Per-turn model / reasoning-effort overrides follow the same explicit CLI
+    // policy as schedules, independently of bot-level effort configuration.
+    // A fold-in to an existing worker never reaches here.
     //
     // The model override lands on the in-memory DaemonSession below, NOT on the
     // persisted session record: the documented semantics are per-trigger, and a
     // persisted copy used to survive every later resume and outrank the bot's
     // configured model forever (see sessionAgentConfig). reasoningEffort stays
     // persisted with the session (unchanged by that PR).
-    const triggerModelOverride = hasReasoningControl
+    const triggerModelOverride = acceptsTaskOverride
       && typeof req.options?.model === 'string'
       && req.options.model.trim()
       ? req.options.model.trim()
       : undefined;
-    if (hasReasoningControl && req.options?.reasoningEffort) {
+    if (acceptsTaskOverride && req.options?.reasoningEffort) {
       session.reasoningEffort = req.options.reasoningEffort;
     }
     sessionStore.updateSession(session);
