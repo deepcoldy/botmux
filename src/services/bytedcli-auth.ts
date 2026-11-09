@@ -41,7 +41,7 @@ import { scrubSessionTurnMarkerEnv } from '../utils/child-env.js';
 import { cliAuthEpochAllows, readCliAuthEpoch, stampCliAuthEpoch } from './cli-auth-epoch.js';
 
 /** Root under which each authorized person gets their own bytedcli HOME. */
-import { BYTEDCLI_HOME_ROOT } from './bytedcli-home.js';
+import { BYTEDCLI_HOME_ROOT, MEEGO_ENV_CREDENTIALS } from './bytedcli-home.js';
 
 /** How long to wait on a `bytedcli` invocation. The device-code calls talk to
  *  ByteCloud, so they are network-bound; the JWT reads are usually local but
@@ -239,7 +239,15 @@ export interface BytedcliResult {
  * The provider must read only this person's isolated HOME.
  */
 async function runAsUser(openId: string, args: string[]): Promise<BytedcliResult> {
-  const home = bytedcliHomeFor(openId);
+  return await runBytedcliInHome(bytedcliHomeFor(openId), args);
+}
+
+/** {@link runAsUser} for any per-person HOME (the Meego store uses its own). */
+export async function runBytedcliInHome(
+  home: string,
+  args: string[],
+  extraEnv: Record<string, string> = {},
+): Promise<BytedcliResult> {
   mkdirSync(home, { recursive: true, mode: 0o700 });
   const env = { ...process.env };
   scrubSessionTurnMarkerEnv(env);
@@ -247,8 +255,10 @@ async function runAsUser(openId: string, args: string[]): Promise<BytedcliResult
     'BYTEDCLI_PROFILE', 'BYTEDCLI_CODEBASE_APP_ID', 'BYTEDCLI_CODEBASE_APP_SECRET',
     'AIME_WORKSPACE_PATH', 'AIME_CURRENT_USER',
     'BYTECLOUD_AUTH_ACCESS_KEY_ID', 'BYTECLOUD_AUTH_SECRET_ACCESS_KEY',
+    // An injected Meego credential wins over the HOME's login in bytedcli.
+    ...MEEGO_ENV_CREDENTIALS,
   ]) delete env[key];
-  Object.assign(env, { HOME: home, BYTECLOUD_AUTH_AS: 'user', BYTEDCLI_NO_AUTO_UPGRADE: '1' });
+  Object.assign(env, { HOME: home, BYTECLOUD_AUTH_AS: 'user', BYTEDCLI_NO_AUTO_UPGRADE: '1' }, extraEnv);
   return await new Promise<BytedcliResult>(resolve => {
     const child = spawn('bytedcli', args, {
       env,
@@ -282,7 +292,7 @@ async function runAsUser(openId: string, args: string[]): Promise<BytedcliResult
 }
 
 /** Parse bytedcli's `--json` envelope, which wraps everything in {status,data}. */
-function parseEnvelope(stdout: string): Record<string, unknown> | null {
+export function parseEnvelope(stdout: string): Record<string, unknown> | null {
   // `--begin` emits progress events (`qr_image_ready`) before the envelope, one
   // JSON object per line, so take the last parseable line rather than the first.
   try {

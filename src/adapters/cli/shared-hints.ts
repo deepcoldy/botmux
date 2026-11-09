@@ -20,7 +20,7 @@ import { config } from '../../config.js';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
 import { resolveConditionalLine } from '../../skills/effective-builtins.js';
 import type { ReplyDelivery } from '../../core/reply-delivery.js';
-import { triggerUserAuthApplies, type TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
+import type { TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
 import { larkToolPrompt } from '../../core/lark-tool-binding.js';
 import type { CliId } from './types.js';
 
@@ -253,27 +253,12 @@ export const BOTMUX_SHELL_HINTS: string[] = [
  * because the likeliest path to that happening is an agent grepping the data
  * directory to debug an auth failure — which a clear instruction does prevent —
  * and it does NOT survive a determined user or a prompt injection.
+ *
+ * Authorization itself is not taught here: a refused command's own output
+ * says what happened, and botmux sends any link to the person directly.
  */
 export function buildCredentialBoundaryBlock(policy: TriggerUserAuthConfig | undefined, locale?: Locale): string {
   if (!policy?.enabled || policy.tools.length === 0) return '';
-  const lark = triggerUserAuthApplies(policy, 'lark-cli');
-  const bytedcli = triggerUserAuthApplies(policy, 'bytedcli');
-  const line = (key: string, params?: Record<string, string>): string => `  ${escapeXmlTagLikeTokens(t(key, params, locale))}`;
-  return [
-    '<botmux_credentials>',
-    line('ai.credentials.acting_identity', { tools: policy.tools.join(' / ') }),
-    ...(bytedcli && policy.gitHost ? [line('ai.credentials.git_identity', { host: policy.gitHost })] : []),
-    line('ai.credentials.never_read_others'),
-    line('ai.credentials.never_forward'),
-    ...(lark ? [line('ai.credentials.on_auth_failure')] : []),
-    ...(bytedcli ? [line('ai.credentials.on_bytedcli_auth_failure')] : []),
-    line('ai.credentials.on_auth_link'),
-    ...(lark ? [line('ai.credentials.on_missing_scope')] : []),
-    '</botmux_credentials>',
-  ].join('\n');
-}
-
-function buildCredentialSafetyBlock(locale?: Locale): string {
   const line = (key: string): string => `  ${escapeXmlTagLikeTokens(t(key, undefined, locale))}`;
   return [
     '<botmux_credentials>',
@@ -289,7 +274,7 @@ function buildCredentialSafetyBlock(locale?: Locale): string {
  * trigger-user wrapper: it defaults to the receiving bot and switches to the
  * current user only with an explicit `--as user`. Keep that statement beside
  * the credential block so both system-prompt and inline-prompt paths use the
- * same wording and the same filtered legacy policy. */
+ * same wording. */
 export function buildManagedLarkToolPromptBlocks(
   policy: TriggerUserAuthConfig | undefined,
   larkToolAppId: string | undefined,
@@ -298,13 +283,7 @@ export function buildManagedLarkToolPromptBlocks(
    *  sessions that get a managed binding are verified headless sessions. */
   headlessNoUserChannel = false,
 ): string {
-  const effectivePolicy = larkToolAppId && policy
-    ? { ...policy, tools: policy.tools.filter(tool => tool !== 'lark-cli') }
-    : policy;
-  const credentialBoundary = buildCredentialBoundaryBlock(effectivePolicy, locale)
-    || (larkToolAppId && policy?.enabled && policy.tools.includes('lark-cli')
-      ? buildCredentialSafetyBlock(locale)
-      : '');
+  const credentialBoundary = buildCredentialBoundaryBlock(policy, locale);
   const larkToolBoundary = larkToolAppId
     ? [
       '<botmux_lark_tool>',

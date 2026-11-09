@@ -8,9 +8,10 @@
  *   1. It reaches BOTH prompt paths. Claude-family adapters build their own
  *      system prompt; codex/opencode get an inline one. A block present in only
  *      one is a silent hole in whichever CLI the operator happens to run.
- *   2. It says what not to do AND what to do instead. "Don't read those files"
- *      alone leaves an agent debugging an auth failure with no alternative —
- *      which is exactly the situation that makes it go looking.
+ *   2. It holds the two rules and nothing else. Authorization is botmux's job:
+ *      a refused command's own output says what happened and botmux sends any
+ *      link to the person privately, so the prompt teaches no flow to follow,
+ *      relay or route around.
  *
  * Run:  npx vitest run --project unit test/credential-boundary-prompt.test.ts
  */
@@ -23,6 +24,7 @@ import { buildNewTopicPrompt, buildFollowUpCliInput } from '../src/core/session-
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
 import { larkToolPrompt } from '../src/core/lark-tool-binding.js';
+import { t } from '../src/i18n/index.js';
 
 const policy = parseTriggerUserAuthConfig({ enabled: true })!;
 
@@ -45,29 +47,24 @@ vi.mock('../src/services/session-store.js', async (importOriginal) => ({
 afterEach(() => stubbedSessions.clear());
 
 describe('buildCredentialBoundaryBlock', () => {
-  it.each(['zh', 'en'] as const)('names the governed tools and configured git host in %s', (locale) => {
-    const lark = buildCredentialBoundaryBlock({ ...policy, tools: ['lark-cli'], gitHost: 'code.example.com' }, locale);
-    expect(lark).toContain(locale === 'zh' ? '已为 lark-cli 启用' : 'credentials for lark-cli.');
-    expect(lark).not.toContain('code.example.com');
-    expect(lark).not.toContain('/login bytedcli');
+  it.each(['zh', 'en'] as const)('holds only the two safety rules, whatever the tools, in %s', (locale) => {
+    const block = buildCredentialBoundaryBlock({ ...policy, tools: ['lark-cli', 'bytedcli'], gitHost: 'code.example.com' }, locale);
+    expect(block.split('\n')).toEqual([
+      '<botmux_credentials>',
+      `  ${t('ai.credentials.never_read_others', undefined, locale)}`,
+      `  ${t('ai.credentials.never_forward', undefined, locale)}`,
+      '</botmux_credentials>',
+    ]);
+    for (const tools of [['lark-cli'], ['bytedcli']] as const) {
+      expect(buildCredentialBoundaryBlock({ ...policy, tools: [...tools] }, locale)).toBe(block);
+    }
+  });
 
-    const byted = buildCredentialBoundaryBlock({ ...policy, tools: ['bytedcli'] }, locale);
-    expect(byted).toContain(locale === 'zh' ? '已为 bytedcli 启用' : 'credentials for bytedcli.');
-    expect(byted).not.toContain('git');
-    expect(byted).not.toContain('missing_scope');
-    expect(byted).toContain(locale === 'zh' ? 'stderr 已附授权链接' : 'If stderr carries an authorization link');
-    expect(byted).toContain(locale === 'zh' ? '只需授权一次、自动续期' : 'authorize just once, it renews automatically');
-    // The Feishu-specific failure flow must follow the same gate as lark-cli.
-    // Discriminate on that line itself: on_auth_link is emitted for every tool
-    // and also mentions `botmux auth request`, so the shared phrase cannot tell
-    // the two branches apart.
-    const feishuFailureLine = locale === 'zh' ? '遇到飞书鉴权失败' : 'On a Feishu auth failure';
-    expect(byted).not.toContain(feishuFailureLine);
-    expect(lark).toContain(feishuFailureLine);
-
-    const git = buildCredentialBoundaryBlock({ ...policy, gitHost: 'code.example.com' }, locale);
-    expect(git).toContain('git');
-    expect(git).toContain('code.example.com');
+  it.each(['zh', 'en'] as const)('teaches no authorization flow in %s', (locale) => {
+    const block = buildCredentialBoundaryBlock({ ...policy, tools: ['lark-cli', 'bytedcli'], gitHost: 'code.example.com' }, locale);
+    for (const phrase of ['/login', 'botmux send', 'botmux auth', 'missing_scope', 'stderr', 'code.example.com']) {
+      expect(block, phrase).not.toContain(phrase);
+    }
   });
 
   it('omits the block for disabled or empty policies', () => {
@@ -84,21 +81,12 @@ describe('buildCredentialBoundaryBlock', () => {
     expect(zh).toContain('~/.botmux/data/');
   });
 
-  it('tells the agent what to do instead of hunting for credentials', () => {
-    const zh = buildCredentialBoundaryBlock(policy, 'zh');
-    expect(zh).toContain('/login');
-  });
-
-  it.each(['zh', 'en'] as const)('bundles only the planned task permissions after missing_scope in %s', locale => {
-    const prompt = buildCredentialBoundaryBlock({ ...policy, tools: ['lark-cli'] }, locale);
-    expect(prompt).not.toContain('base:field:read base:record:read');
-    // The contributor guide does not ship in the npm package, so the injected
-    // prompt must not point users at a path they cannot open.
-    expect(prompt).not.toContain('docs/guide/lark-device-authorization.md');
-    expect(prompt).toContain(locale === 'zh' ? '不要重跑普通 /login' : 'do not repeat ordinary /login');
-    expect(prompt).toContain(locale === 'zh' ? '一次合并所需权限' : 'request them together');
-    expect(prompt).toContain(locale === 'zh' ? '不申请无关或未经核实的权限' : 'never request unrelated or unverified scopes');
-    expect(prompt).toContain('botmux auth wait --request-id &lt;requestId&gt; --json');
+  it('names every per-person login store, the shared Meego one included', () => {
+    for (const locale of ['zh', 'en'] as const) {
+      const block = buildCredentialBoundaryBlock(policy, locale);
+      expect(block).toContain('bytedcli-home/');
+      expect(block).toContain('meego-home/');
+    }
   });
 
   it('covers forwarding, not just reading', () => {
@@ -123,15 +111,13 @@ describe('buildCredentialBoundaryBlock', () => {
 });
 
 describe('buildBotmuxSystemPromptText — claude-family path', () => {
-  it.each(['claude-code', 'genius', 'grok'] as const)('%s forwards the selected tools into its system prompt', (cli) => {
+  it.each(['claude-code', 'genius', 'grok'] as const)('%s carries the credential block into its system prompt', (cli) => {
     const args = createCliAdapterSync(cli).buildArgs({
       sessionId: 'sess-cred', resume: false, locale: 'en',
       triggerUserAuth: { ...policy, tools: ['bytedcli'], gitHost: 'code.example.com' },
     });
     const text = args.find(arg => arg.includes('<botmux_credentials>'))!;
-    expect(text).toContain('credentials for bytedcli.');
-    expect(text).toContain('code.example.com');
-    expect(text).not.toContain('missing_scope');
+    expect(text).toContain(buildCredentialBoundaryBlock(policy, 'en'));
   });
 
   it('adds the block when trigger-user auth is on', () => {
@@ -181,9 +167,7 @@ describe('buildBotmuxSystemPromptText — claude-family path', () => {
       expect(text).toContain('lark-cli 固定使用当前机器人的应用 cli_current');
       expect(text).toContain('默认以 bot 身份调用');
       expect(text).toContain('--as user');
-      expect(text).toContain('已为 bytedcli 启用按当前消息发起人身份注入授权');
-      expect(text).not.toContain('已为 lark-cli / bytedcli 启用');
-      expect(text).not.toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+      expect(text).toContain('<botmux_credentials>');
     },
   );
 
@@ -325,9 +309,7 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
       expect(text).toContain('lark-cli 固定使用当前机器人的应用 cli_credboundary');
       expect(text).toContain('默认以 bot 身份调用');
       expect(text).toContain('--as user');
-      expect(text).toContain('已为 bytedcli 启用按当前消息发起人身份注入授权');
-      expect(text).not.toContain('已为 lark-cli / bytedcli 启用');
-      expect(text).not.toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+      expect(text).toContain('<botmux_credentials>');
     }, ['lark-cli', 'bytedcli']);
   });
 
@@ -336,7 +318,6 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
       const text = boundOpening();
       expect(text).toContain('不得读取、列举、复制或输出');
       expect(text).toContain('不得把任何 token、JWT、access key');
-      expect(text).not.toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
     });
   });
 
@@ -358,7 +339,7 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
       stubbedSessions.set('sess-bound', session);
       const text = boundOpening();
       expect(text).not.toContain('<botmux_lark_tool>');
-      expect(text).toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+      expect(text).toContain('<botmux_credentials>');
     });
   });
 
@@ -367,7 +348,6 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
       stubbedSessions.set('sess-bound', { lastCliInput: 'pre-persisted before failed first spawn' });
       const text = boundOpening();
       expect(text).toContain('<botmux_lark_tool>');
-      expect(text).not.toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
     });
   });
 
@@ -375,7 +355,7 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
     withTriggerUserAuth(true, () => {
       const text = boundOpening();
       expect(text).not.toContain('<botmux_lark_tool>');
-      expect(text).toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+      expect(text).toContain('<botmux_credentials>');
     }, ['lark-cli'], false);
   });
 
@@ -385,7 +365,7 @@ describe('buildNewTopicPrompt — inline prompt path', () => {
       try {
         const text = boundOpening();
         expect(text).not.toContain('<botmux_lark_tool>');
-        expect(text).toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+        expect(text).toContain('<botmux_credentials>');
       } finally {
         delete process.env.BOTMUX_WORKFLOW;
       }

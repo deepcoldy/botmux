@@ -11,6 +11,8 @@ import * as cliIdentity from '../src/core/cli-identity.js';
 import * as larkClient from '../src/im/lark/client.js';
 import { config } from '../src/config.js';
 import { rememberLarkToolDelegation, clearLarkToolDelegations } from '../src/core/lark-tool-delegation.js';
+import * as meegoAuth from '../src/services/meego-auth.js';
+import { __resetProviderAuthForTest } from '../src/core/provider-auth-request.js';
 
 const CAP = 'ab'.repeat(32);
 const SECRET = 'auth-request-test-secret';
@@ -613,5 +615,143 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
     },
     process.platform === 'linux' ? 'proven' : 'single',
   );
+  });
+});
+
+describe('provider authorization asked for by the bytedcli wrapper', () => {
+  const MEEGO_URL = 'https://meego.example/device?code=M1';
+  let replies: string[];
+
+  beforeEach(() => {
+    __resetProviderAuthForTest();
+    session.chatType = 'group';
+    session.session.rootMessageId = 'om_root';
+    vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
+      larkAppId: 'cli_test', larkAppSecret: 'test-secret',
+      triggerUserAuth: { enabled: true, tools: ['bytedcli'], fallback: 'none' },
+    } } as any);
+    vi.spyOn(meegoAuth, 'requestMeegoLogin').mockResolvedValue({ state: 'link', authUrl: MEEGO_URL });
+    replies = [];
+    vi.spyOn(larkClient, 'replyMessage').mockImplementation(async (_app, _root, text) => { replies.push(String(text)); return 'om_reply'; });
+  });
+
+  const ask = (overrides: Record<string, unknown> = {}) => post('auth-request', { scopes: undefined, provider: 'meego', ...overrides });
+
+  it('group: DMs the link to this turn\'s sender; the agent and the group never see it', async () => {
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    const response = await ask();
+    expect(response.status).toBe(200);
+    const body = await response.json() as Record<string, unknown>;
+    expect(body).toMatchObject({ ok: true, provider: 'meego', status: 'delivered', delivery: 'dm' });
+    expect(JSON.stringify(body)).not.toContain(MEEGO_URL);
+    expect(meegoAuth.requestMeegoLogin).toHaveBeenCalledExactlyOnceWith('ou_sender', undefined);
+    expect(dm).toHaveBeenCalledTimes(1);
+    expect(dm.mock.calls[0].slice(0, 2)).toEqual(['cli_test', 'ou_sender']);
+    expect(dm.mock.calls[0][2]).toContain(MEEGO_URL);
+    expect(replies).toHaveLength(1);
+    expect(replies.join('')).not.toContain(MEEGO_URL);
+  });
+
+  it('DM fails: a card only the sender can see, in this chat; the link is never a group message', async () => {
+    vi.spyOn(larkClient, 'sendUserMessage').mockRejectedValue(new Error('230013 user not in scope'));
+    const card = vi.spyOn(larkClient, 'sendEphemeralCard').mockResolvedValue('om_card' as any);
+    const body = await (await ask()).json() as Record<string, unknown>;
+    expect(body).toMatchObject({ ok: true, status: 'delivered', delivery: 'ephemeral' });
+    expect(card).toHaveBeenCalledTimes(1);
+    expect(card.mock.calls[0].slice(0, 3)).toEqual(['cli_test', 'oc_test', 'ou_sender']);
+    expect(String(card.mock.calls[0][3])).toContain(MEEGO_URL);
+    expect(replies.join('')).not.toContain(MEEGO_URL);
+  });
+
+  it('DM and private card both fail: undeliverable, the group hears where to get it, never the link', async () => {
+    vi.spyOn(larkClient, 'sendUserMessage').mockRejectedValue(new Error('230013 user not in scope'));
+    vi.spyOn(larkClient, 'sendEphemeralCard').mockRejectedValue(new Error('18053 topic group'));
+    const body = await (await ask()).json() as Record<string, unknown>;
+    expect(body).toMatchObject({ ok: true, status: 'undeliverable', delivery: 'dm_failed' });
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toContain('/login meego');
+    expect(replies[0]).not.toContain(MEEGO_URL);
+    // Retries in the same burst do not repeat the notice.
+    await ask();
+    expect(replies).toHaveLength(1);
+  });
+
+  it('even the notice failing is an answer the wrapper can act on, not an error', async () => {
+    vi.spyOn(larkClient, 'sendUserMessage').mockRejectedValue(new Error('230013'));
+    vi.spyOn(larkClient, 'sendEphemeralCard').mockRejectedValue(new Error('18053'));
+    vi.mocked(larkClient.replyMessage).mockRejectedValue(new Error('network'));
+    const response = await ask();
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ status: 'undeliverable' });
+  });
+
+  it('1:1 chat: the link is posted right there, to the person', async () => {
+    session.chatType = 'p2p';
+    const dm = vi.spyOn(larkClient, 'sendUserMessage');
+    const body = await (await ask()).json() as Record<string, unknown>;
+    expect(body).toMatchObject({ status: 'delivered', delivery: 'inline' });
+    expect(replies[0]).toContain(MEEGO_URL);
+    expect(dm).not.toHaveBeenCalled();
+    expect(JSON.stringify(body)).not.toContain(MEEGO_URL);
+  });
+
+  it('already logged in: ready, nothing sent', async () => {
+    vi.mocked(meegoAuth.requestMeegoLogin).mockResolvedValue({ state: 'ready' });
+    const dm = vi.spyOn(larkClient, 'sendUserMessage');
+    expect(await (await ask()).json()).toMatchObject({ ok: true, status: 'ready' });
+    expect(dm).not.toHaveBeenCalled();
+    expect(replies).toEqual([]);
+  });
+
+  it('refuses a delegated turn: that person is not here to approve anything', async () => {
+    rememberLarkToolDelegation(config.session.dataDir, 'auth-session', 'om_turn', {
+      credentialOpenId: 'ou_source_human', targetOpenId: 'ou_target_human',
+      tools: ['bytedcli'], dispatchRoot: 'om_dispatch_root',
+    });
+    const response = await ask();
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ ok: false, status: 'refused', error: 'delegated_turn' });
+    expect(meegoAuth.requestMeegoLogin).not.toHaveBeenCalled();
+  });
+
+  it('refuses when the bot does not run bytedcli as the person', async () => {
+    vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
+      larkAppId: 'cli_test', larkAppSecret: 'test-secret',
+      triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' },
+    } } as any);
+    const response = await ask();
+    expect(response.status).toBe(409);
+    expect(meegoAuth.requestMeegoLogin).not.toHaveBeenCalled();
+  });
+
+  it('platform-supplied ByteCloud identity: no ByteCloud login is started here', async () => {
+    vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
+      larkAppId: 'cli_test', larkAppSecret: 'test-secret',
+      triggerUserAuth: { enabled: true, tools: ['bytedcli'], fallback: 'none', credentialSource: 'platform' },
+    } } as any);
+    const dm = vi.spyOn(larkClient, 'sendUserMessage');
+    const response = await ask({ provider: 'bytedcli' });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ ok: false, status: 'refused', error: 'platform_credentials' });
+    expect(dm).not.toHaveBeenCalled();
+    expect(replies).toEqual([]);
+  });
+
+  it('passes the Meego tenant through, and only a tenant bytedcli knows', async () => {
+    vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    expect((await ask({ tenant: 'dcar' })).status).toBe(200);
+    expect(meegoAuth.requestMeegoLogin).toHaveBeenCalledExactlyOnceWith('ou_sender', 'dcar');
+    expect((await ask({ tenant: 'other' })).status).toBe(400);
+    expect((await ask({ provider: 'bytedcli', tenant: 'dcar' })).status).toBe(400);
+    expect(meegoAuth.requestMeegoLogin).toHaveBeenCalledTimes(1);
+  });
+
+  it('needs a verified current actor and a valid provider', async () => {
+    delete session.managedTurnOrigin.callerOpenId;
+    expect((await ask()).status).toBe(403);
+    session.managedTurnOrigin.callerOpenId = 'ou_sender';
+    expect((await ask({ provider: 'lark' })).status).toBe(400);
+    expect((await ask({ originCapability: 'cd'.repeat(32) })).status).toBe(403);
+    expect(meegoAuth.requestMeegoLogin).not.toHaveBeenCalled();
   });
 });

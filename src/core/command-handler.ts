@@ -18,6 +18,7 @@ import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effec
 import { triggerUserAuthApplies, credentialSourceOf } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
+import { requestMeegoLogin } from '../services/meego-auth.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
 import { sessionLarkToolBound } from './lark-tool-binding.js';
 import { deliverAuthLink } from './auth-link-delivery.js';
@@ -47,7 +48,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { resolveCliRuntime, runtimeInstallationKey, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
-import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, getMessageDetail, uploadImage, UserTokenMissingError } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, sendEphemeralCard, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, getMessageDetail, uploadImage, UserTokenMissingError } from '../im/lark/client.js';
 import type { OutboundMessageOptions } from '../im/lark/client.js';
 import { assertSendTopicsAvailable, TopicSendError } from '../cli/topic-send-guard.js';
 import { prepareForkTopic } from '../im/lark/fork-topic.js';
@@ -4479,12 +4480,14 @@ export async function handleCommand(
         const loginOpenId = message.senderId;
         // Any reply carrying an authorization link reaches only the sender: a
         // group member opening someone else's link would authorize as THEMSELVES.
+        const loginChatId = ds?.chatId ?? message.chatId;
         const authLinkReply = (text: string, privateCommand = '/login') => deliverAuthLink({
           privateChat: (ds?.chatType ?? message.chatType) === 'p2p',
           openId: isUsableOpenId(loginOpenId) ? loginOpenId : undefined,
           text,
           replyInPlace: content => sessionReply(rootId, content),
           sendDirect: (openId, content) => sendUserMessage(botCfg2.larkAppId, openId, content),
+          ...(loginChatId ? { sendEphemeral: (openId: string, card: string) => sendEphemeralCard(botCfg2.larkAppId, loginChatId, openId, card) } : {}),
           locale: loc,
           privateCommand,
         });
@@ -4524,6 +4527,30 @@ export async function handleCommand(
         const platformCredsUrl = credSource !== 'local' && (larkGoverned || bytedcliGoverned)
           ? platformCredentialsUrl() : null;
         const explicitGoverned = (subCmd === 'lark' && larkGoverned) || (subCmd === 'bytedcli' && bytedcliGoverned);
+        // `/login meego` — the person's Meego login, kept once per person for
+        // every session of this bot. Independent of where ByteCloud credentials
+        // come from: the platform does not issue Meego logins.
+        if (subCmd === 'meego') {
+          if (!bytedcliGoverned) {
+            await sessionReply(rootId, t('cmd.login.bytedcli_configure', undefined, loc));
+            break;
+          }
+          if (!isUsableOpenId(loginOpenId)) {
+            await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc));
+            break;
+          }
+          const login = await requestMeegoLogin(loginOpenId);
+          if (login.state === 'link') {
+            await authLinkReply([
+              t('auth_link.meego_title', undefined, loc), login.authUrl, '', t('auth_link.meego_footer', undefined, loc),
+            ].join('\n'), '/login meego');
+          } else {
+            await sessionReply(rootId, login.state === 'ready'
+              ? t('cmd.login.meego_ready', undefined, loc)
+              : t('provider_auth.unavailable', { provider: 'Meego', detail: login.detail }, loc));
+          }
+          break;
+        }
         // platform 模式 + 本机未绑定：按矩阵一律拒绝，绝不落到本机扫码——否则扫完也不会被采信。
         if (credSource === 'platform' && !platformCredsUrl && (larkGoverned || bytedcliGoverned)
           && (subCmd === '' || explicitGoverned)) {

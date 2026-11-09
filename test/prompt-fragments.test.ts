@@ -77,22 +77,11 @@ describe('prompt fragment catalog', () => {
     expect(validateFragmentOverride(line.key, '群里有 {count} 个：{names}')).toBeUndefined();
   });
 
-  it('protects {tools}/{host} on the credential-identity fragments', () => {
-    // The governed-tool list and git host are runtime values: an override that
-    // drops either token would silently render a credential block that names no
-    // tool (or no host), recreating the over-broad promise this catalog tracks.
-    expect(
-      validateFragmentOverride('ai.credentials.acting_identity', '本会话已启用按发起人身份注入。'),
-    ).toMatch(/tools/);
-    expect(
-      validateFragmentOverride('ai.credentials.acting_identity', '已为 {tools} 启用。'),
-    ).toBeUndefined();
-    expect(
-      validateFragmentOverride('ai.credentials.git_identity', 'git 鉴权使用本轮身份。'),
-    ).toMatch(/host/);
-    expect(
-      validateFragmentOverride('ai.credentials.git_identity', 'git 对 {host} 使用本轮身份。'),
-    ).toBeUndefined();
+  it('lists exactly the two credential rules the block renders', () => {
+    expect(PROMPT_FRAGMENTS.filter((f) => f.block === 'credentials').map((f) => f.key)).toEqual([
+      'ai.credentials.never_read_others',
+      'ai.credentials.never_forward',
+    ]);
   });
 
   it('fragmentStages lists primary + extra stages without duplicates', () => {

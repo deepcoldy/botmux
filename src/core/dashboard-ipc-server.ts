@@ -275,7 +275,12 @@ import { loadDaemonIpcSecret } from './daemon-ipc-auth.js';
 import type { DraftLaunchDeps } from '../workflows/v3/draft-launch.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { updateMessage, sendUserMessage } from '../im/lark/client.js';
+import { updateMessage, sendUserMessage, sendEphemeralCard } from '../im/lark/client.js';
+import { deliverAuthLink } from './auth-link-delivery.js';
+import { AUTH_PROVIDERS, requestProviderAuth, type AuthProvider } from './provider-auth-request.js';
+import { requestMeegoLogin } from '../services/meego-auth.js';
+import { MEEGO_TENANTS, type MeegoTenant } from '../services/bytedcli-home.js';
+import { beginBytedcliLogin, completeBytedcliLogin, describeBytedcliAuth, pendingBytedcliChallenge } from '../services/bytedcli-auth.js';
 import { safeRequirementUrl } from './dispatch-task-tree.js';
 import { createDispatchTaskTreeCards, isTaskTreeCardGone, type TaskTreeOrchestrator } from '../services/dispatch-task-tree-card.js';
 import { listDispatchTreeSessionRows } from '../services/dispatch-task-tree-sessions.js';
@@ -3712,6 +3717,83 @@ function trackSessionAuthorization(
   timer = setTimeout(tick, 2_000).unref();
 }
 
+/**
+ * `botmux auth request --provider`, sent by the bytedcli wrapper when a
+ * command needs the requester's own Meego or ByteCloud login. The caller has
+ * already proven it belongs to this session's live turn; the person is that
+ * turn's requester, never one the CLI names. botmux sends the link to them
+ * privately and answers with a message that does not carry it.
+ */
+async function handleProviderAuthRequest(
+  res: ServerResponse, ds: DaemonSession, sessionId: string, provider: unknown, tenant: unknown,
+): Promise<void> {
+  if (!AUTH_PROVIDERS.includes(provider as AuthProvider)
+    || tenant !== undefined && (provider !== 'meego' || !MEEGO_TENANTS.includes(tenant as MeegoTenant))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
+  }
+  const cfg = getBot(ds.larkAppId).config;
+  const loc = localeForBot(ds.larkAppId);
+  const refuse = (error: string, reason: string) => jsonRes(res, 409, {
+    ok: false, status: 'refused', error,
+    message: t('provider_auth.refused', { provider: provider === 'meego' ? 'Meego' : 'ByteCloud', reason }, loc),
+  });
+  const origin = ds.managedTurnOrigin;
+  const openId = origin?.callerOpenId;
+  if (!origin?.turnId || !openId || !isUsableOpenId(openId)) {
+    return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+  }
+  if (!triggerUserAuthApplies(cfg.triggerUserAuth, 'bytedcli')) {
+    return refuse('bytedcli_user_auth_disabled', 'bytedcli user identity is not enabled for this bot');
+  }
+  // A delegated turn acts for someone who is not here to approve anything.
+  if (getLarkToolDelegation(config.session.dataDir, sessionId, origin.identityTurnId ?? origin.turnId)) {
+    return refuse('delegated_turn', 'delegated turn');
+  }
+  if (provider === 'bytedcli' && credentialSourceOf(cfg.triggerUserAuth) === 'platform') {
+    return refuse('platform_credentials', 'ByteCloud identity comes from the platform');
+  }
+  const privateChat = ds.chatType === 'p2p';
+  const result = await requestProviderAuth({
+    provider: provider as AuthProvider, openId, locale: loc, chatId: ds.chatId,
+    ...(tenant ? { tenant: tenant as MeegoTenant } : {}),
+  }, {
+    requestMeegoLogin,
+    bytedcliAuthorized: async person => {
+      const pending = pendingBytedcliChallenge(person);
+      if (pending && (await completeBytedcliLogin(person, pending)).state === 'authorized') return true;
+      const { state } = await describeBytedcliAuth(person);
+      return state === 'unknown' ? 'unknown' : state === 'authorized';
+    },
+    beginBytedcliLogin,
+    deliver: (text, privateCommand) => deliverAuthLink({
+      privateChat,
+      openId,
+      text,
+      locale: loc,
+      privateCommand,
+      replyInPlace: content => replyInSession(ds, content),
+      sendDirect: (to, content) => sendUserMessage(ds.larkAppId, to, content),
+      ...(privateChat ? {} : { sendEphemeral: (to: string, card: string) => sendEphemeralCard(ds.larkAppId, ds.chatId, to, card) }),
+    }).catch(err => {
+      logger.warn(`[session-auth] session=${sessionId} provider=${String(provider)} link not delivered: ${err instanceof Error ? err.message : String(err)}`);
+      return 'dm_failed' as const;
+    }),
+  });
+  return jsonRes(res, 200, { ok: true, provider, ...result });
+}
+
+/** A plain text line where this session's replies go. */
+async function replyInSession(ds: DaemonSession, text: string): Promise<unknown> {
+  if (ds.scope === 'chat' && ds.chatId) {
+    const mode = await getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true });
+    return mode === 'topic' && ds.session.rootMessageId
+      ? replyMessage(ds.larkAppId, ds.session.rootMessageId, text, 'text', true)
+      : sendMessage(ds.larkAppId, ds.chatId, text, 'text');
+  }
+  if (!ds.session.rootMessageId) throw new Error('session has no reply anchor');
+  return replyMessage(ds.larkAppId, ds.session.rootMessageId, text, 'text', true);
+}
+
 for (const action of ['auth-request', 'auth-status']) {
   ipcRoute('POST', `/api/sessions/:sessionId/${action}`, async (req, res, params) => {
     let body: Record<string, unknown>;
@@ -3766,6 +3848,9 @@ for (const action of ['auth-request', 'auth-status']) {
       }
     }
     const cfg = getBot(ds.larkAppId).config;
+    if (action === 'auth-request' && 'provider' in body) {
+      return await handleProviderAuthRequest(res, ds, params.sessionId, body.provider, body.tenant);
+    }
     // Only the daemon's verified, turn-bound dispatch can supply a delegated
     // human. The CLI still cannot choose a user or an application.
     const requestingUser = (): string | undefined => {

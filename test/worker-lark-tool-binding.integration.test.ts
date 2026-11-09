@@ -162,9 +162,8 @@ setInterval(()=>{},1000);
       expect(prompt).toContain(`<botmux_lark_tool>\n  ${expectedPolicy}\n</botmux_lark_tool>`);
       expect(prompt).not.toContain(interactivePolicy);
     }
-    expect(prompt).toContain('已为 bytedcli 启用按当前消息发起人身份注入授权');
-    expect(prompt).not.toContain('已为 lark-cli / bytedcli 启用');
-    expect(prompt).not.toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+    expect(prompt).toContain('<botmux_credentials>');
+    expect(prompt).not.toContain('启用按当前消息发起人身份注入授权');
   } finally {
     if (child.connected) child.send!({ type: 'close' });
     const timer = setTimeout(() => child.kill('SIGKILL'), 5000);
