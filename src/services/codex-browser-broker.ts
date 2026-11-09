@@ -546,32 +546,52 @@ function defaultBundledPluginRoots(): string[] {
 }
 
 function discoverPluginRoot(pluginCache: string, bundledRoots: readonly string[]): string {
-  let entries: string[] = [];
-  try {
-    entries = readdirSync(pluginCache, { withFileTypes: true })
-      .filter(entry => entry.isDirectory() || entry.isSymbolicLink())
-      .map(entry => entry.name);
-  } catch { /* A desktop installation can exist without a user plugin cache. */ }
   // Desktop updates do not necessarily refresh the CLI cache (or its latest
   // symlink). Loading that older service against an updated extension can
-  // break debugger attachment, including its network-policy contract. Select
-  // a complete client/service pair by plugin version across both locations.
-  const candidates = [...bundledRoots, ...entries.map(name => join(pluginCache, name))]
-    .filter(isCompletePluginRoot)
-    .map(root => ({ root, version: pluginVersion(root) }))
-    .sort((left, right) => compareVersionNames(right.version, left.version));
-  if (!candidates[0]) throw new Error(`Codex browser plugin is not installed under ${pluginCache}`);
-  return candidates[0].root;
+  // break debugger attachment, including its network-policy contract. Start
+  // from the cache's own preference and replace it only with a complete
+  // client/service pair whose plugin version is known to be newer.
+  const candidates = [...cachedPluginRoots(pluginCache), ...bundledRoots.filter(isCompletePluginRoot)];
+  if (!candidates[0]) {
+    const desktop = bundledRoots.length ? ` or in a Codex/ChatGPT desktop app (${bundledRoots.join(', ')})` : '';
+    throw new Error(`Codex browser plugin is not installed under ${pluginCache}${desktop}`);
+  }
+  let selected = { root: candidates[0], version: pluginVersion(candidates[0]) };
+  for (const root of candidates.slice(1)) {
+    const version = pluginVersion(root);
+    if (version && selected.version && compareVersionNames(version, selected.version) > 0) {
+      selected = { root, version };
+    }
+  }
+  return selected.root;
 }
 
-function pluginVersion(root: string): string {
+/** Complete cache roots in the cache's own preference order: `latest`, then
+ * version directories from the highest name down. */
+function cachedPluginRoots(pluginCache: string): string[] {
+  let names: string[] = [];
+  try {
+    names = readdirSync(pluginCache, { withFileTypes: true })
+      .filter(entry => entry.name !== 'latest' && (entry.isDirectory() || entry.isSymbolicLink()))
+      .map(entry => entry.name)
+      .sort((left, right) => compareVersionNames(right, left) || right.localeCompare(left));
+  } catch { /* A desktop installation can exist without a user plugin cache. */ }
+  return ['latest', ...names].map(name => join(pluginCache, name)).filter(isCompletePluginRoot);
+}
+
+const PLUGIN_VERSION = /^\d+(?:\.\d+)*$/;
+
+/** Version from the plugin manifest, else from the version-named directory the
+ * root resolves to; undefined when neither identifies one. */
+function pluginVersion(root: string): string | undefined {
   try {
     const manifest = JSON.parse(readFileSync(join(root, '.codex-plugin', 'plugin.json'), 'utf8')) as Json;
-    if (typeof manifest.version === 'string' && /^\d+(?:\.\d+)*$/.test(manifest.version)) {
+    if (typeof manifest.version === 'string' && PLUGIN_VERSION.test(manifest.version)) {
       return manifest.version;
     }
   } catch { /* Older caches may only identify their version in the directory. */ }
-  return basename(realpathSync(root));
+  const name = basename(realpathSync(root));
+  return PLUGIN_VERSION.test(name) ? name : undefined;
 }
 
 function isCompletePluginRoot(root: string): boolean {

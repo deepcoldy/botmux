@@ -632,6 +632,79 @@ describe('resolveCodexBrowserPluginRoot', () => {
     });
   });
 
+  it('replaces a stale latest symlink with a newer complete cache version', () => {
+    withPlugins(({ cache, plugin }) => {
+      const stale = plugin(join(cache, '26.1007.21434'));
+      symlinkSync(stale, join(cache, 'latest'), 'junction');
+      const newest = plugin(join(cache, '26.1105.1'));
+      expect(resolveCodexBrowserPluginRoot(undefined, [])).toBe(realpathSync(newest));
+    });
+  });
+
+  it('prefers a newer desktop plugin over the newest cache directory', () => {
+    withPlugins(({ cache, bundled, plugin }) => {
+      plugin(join(cache, '26.1007.21434'));
+      plugin(bundled, '26.1029.61003');
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(bundled));
+    });
+  });
+
+  it('keeps the cache choice when no candidate has a strictly newer version', () => {
+    withPlugins(({ cache, bundled, plugin }) => {
+      const current = plugin(join(cache, '26.1105.1'));
+      symlinkSync(current, join(cache, 'latest'), 'junction');
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(current));
+      plugin(join(cache, '26.1007.21434'));
+      plugin(bundled, '26.1105.1');
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(current));
+    });
+  });
+
+  it('keeps a latest directory whose version cannot be determined', () => {
+    withPlugins(({ cache, bundled, plugin }) => {
+      const latest = plugin(join(cache, 'latest'));
+      expect(resolveCodexBrowserPluginRoot(undefined, [])).toBe(realpathSync(latest));
+      plugin(join(cache, '26.1105.1'));
+      plugin(bundled, '26.1201.1');
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(latest));
+    });
+  });
+
+  it('does not let a non-version cache directory shadow version directories', () => {
+    withPlugins(({ cache, bundled, plugin }) => {
+      plugin(join(cache, 'local'));
+      plugin(join(cache, '26.1007.21434'));
+      plugin(bundled, '26.1029.61003');
+      expect(resolveCodexBrowserPluginRoot(undefined, [bundled])).toBe(realpathSync(bundled));
+    });
+  });
+
+  it('honors an explicit plugin root over newer discovered plugins', () => {
+    withPlugins(({ cache, bundled, plugin }) => {
+      const pinned = plugin(join(cache, '26.1007.21434'));
+      symlinkSync(plugin(join(cache, '26.1105.1')), join(cache, 'latest'), 'junction');
+      plugin(bundled, '26.1201.1');
+      expect(resolveCodexBrowserPluginRoot(pinned, [bundled])).toBe(realpathSync(pinned));
+    });
+  });
+
+  it('lists the desktop locations it checked when no complete plugin is found', () => {
+    withPlugins(({ cache, bundled }) => {
+      const otherApp = join(cache, '..', 'other-app', 'chrome');
+      mkdirSync(join(bundled, 'scripts'), { recursive: true });
+      writeFileSync(join(bundled, 'scripts', 'browser-client.mjs'), 'export {}');
+      let message = '';
+      try {
+        resolveCodexBrowserPluginRoot(undefined, [bundled, otherApp]);
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toContain(cache);
+      expect(message).toContain(bundled);
+      expect(message).toContain(otherApp);
+    });
+  });
+
   function withPlugins(run: (fixture: {
     cache: string; bundled: string; plugin: (root: string, version?: string) => string;
   }) => void): void {
