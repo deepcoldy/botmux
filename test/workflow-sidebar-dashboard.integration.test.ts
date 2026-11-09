@@ -77,7 +77,7 @@ describe('workflow sidebar inside the real dashboard', () => {
     fakeDaemon = undefined;
     if (rootDir) rmSync(rootDir, { recursive: true, force: true });
     rootDir = '';
-    cleanupBotRuns();
+    await cleanupBotRuns();
   });
 
   /** Isolated HOME, one bot-executed run, a fake main-bot daemon, the real dashboard. */

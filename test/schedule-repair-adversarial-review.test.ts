@@ -469,10 +469,22 @@ describe('scheduled send settlement for in-flight sends, restarts and superseded
     // `finish` undefined under shard microtask starvation. The dispatch now
     // simply awaits a promise whose resolver exists from the first tick.
     let finish!: (messageId: string) => void;
+    let markEntered!: () => void;
     const delivery = new Promise<string>(resolve => { finish = resolve; });
+    // entered 在 dispatch 真正被调用（ledger 拿到文件锁、这次 send 已登记为 in-flight）
+    // 时 resolve。高负载下拿锁要花真实时间，测试必须先 await 它再推假时钟、再结算，
+    // 否则结算跑在 in-flight 登记之前，之后永远走不到 unknown（#3232 的 150ms 快速失败）。
+    const entered = new Promise<void>(resolve => { markEntered = resolve; });
     const receipt = new TurnSendLedger(isolated.dataDir).execute(sendKey(s, run), 'final', 'slow final',
-      () => delivery, { fenced: true });
-    return { receipt, finish: (messageId: string) => finish(messageId) };
+      async () => { markEntered(); return delivery; }, { fenced: true });
+    // 登记进 pending：哪条用例中途失败、没走到自己的 finish，afterEach 也能释放这次
+    // 悬着的 fenced send，不会把后面用例拖到 120s 超时（#3232 的 636 挂死就是被 536 连累）。
+    pending.push(() => finish('om_after_test_release'));
+    return {
+      receipt,
+      entered,
+      finish: (messageId: string) => finish(messageId),
+    };
   }
 
   it('keeps a fenced final still inside its provider call pending, then accounts its receipt', async () => {
@@ -480,6 +492,8 @@ describe('scheduled send settlement for in-flight sends, restarts and superseded
     const run = await dispatched(s);
     const markDelivered = vi.spyOn(runLogs, 'markScheduleRunLogDelivered');
     const send = slowFinal(s, run);
+    // 等这次 send 真正进 dispatch（已拿锁、登记为 in-flight）再动假时钟。
+    await send.entered;
     await vi.advanceTimersByTimeAsync(0);
     settleLater(daemonSession(s), { turnId: run.turnId, source: 'terminal' });
     await vi.advanceTimersByTimeAsync(30_000);
@@ -526,6 +540,9 @@ describe('scheduled send settlement for in-flight sends, restarts and superseded
     const run = await dispatched(s);
     const ds = daemonSession(s);
     const send = slowFinal(s, run);
+    // 等这次 send 真正进 dispatch（已拿锁、登记为 in-flight）再动假时钟，
+    // 否则结算会跑在登记之前，unknown 永远等不到（#3232）。
+    await send.entered;
     await vi.advanceTimersByTimeAsync(0);
     settleLater(ds, { turnId: run.turnId, source: 'terminal' });
     await vi.advanceTimersByTimeAsync(SCHEDULED_SEND_IN_FLIGHT_LIMIT_MS / 2);
