@@ -368,6 +368,8 @@ export function scrubSessionCliHomeEnv(env: NodeJS.ProcessEnv): void {
 export const BOTMUX_INJECTED_ENV_KEYS = [
   '__OWNER_OPEN_ID',
   'BOTMUX',
+  // Trusted runtime wrapper root, refreshed by the worker after env scrubbing.
+  'BOTMUX_WRAPPER_BIN',
   // Per-launch Aiden Codex shim configuration. Forward only into the owning
   // pane, and scrub stale values from shared terminal servers and login shells.
   'BOTMUX_AIDEN_CODEX_PARENT_PATH',

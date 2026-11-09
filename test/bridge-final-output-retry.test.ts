@@ -1099,15 +1099,20 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       status: 'completed', durationMs: 2300, completedAtMs: Date.now() });
     const expectedAnswer = source === 'explicit' ? '显式完整答复' : '同卡完整答复';
     const { OncallGroupStore } = await import('../src/services/oncall-group-store.js');
+    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+    const replyStore = new TurnReplyCardStore(config.session.dataDir);
+    const replyKey = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId };
     await vi.waitFor(() => {
+      expect(replyStore.read(replyKey)).toMatchObject({ phase: 'completed', finalDelivered: true });
       expect(updateMessageMock.mock.calls.some(call => call[2]?.includes(expectedAnswer) && call[2]?.includes('已完成') && call[2]?.includes('oncall_group_create'))).toBe(true);
       expect(new OncallGroupStore(config.session.dataDir).findSource('app_test', 'om_managed_reply'))
         .toMatchObject({ chatId: 'oc_chat', questionId: ds.currentTurnId, answer: expectedAnswer });
+      // The bridge final settles after an explicit answer already completed the card; the next case reuses this turn key.
+      expect(ds.lastBridgeEmittedUuid).toBe(`${ds.session.sessionId}:managed-final`);
     }, { timeout: 5000 });
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(updateMessageMock.mock.calls.every(call => call[1] === 'om_managed_reply')).toBe(true);
-    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
-    const record = new TurnReplyCardStore(config.session.dataDir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId });
+    const record = replyStore.read(replyKey);
     if (source === 'bridge') expect(record?.tools[0]?.subject).toBe('README.md');
     expect(record?.finalDelivered).toBe(true);
     expect(record?.finalSource).toBe(source);

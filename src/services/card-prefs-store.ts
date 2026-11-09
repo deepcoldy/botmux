@@ -81,7 +81,7 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
   /** Compact overflow menu (terminal/model/close) on ordinary reply cards.
    *  Default false; only an explicit true enables it. */
   replyCardActions: boolean;
-  /** Bot-level master switch for the native CoT (thinking process) message.
+  /** In-card activity in unified replies, native CoT in legacy replies.
    *  Default TRUE (absent = on; only explicit false persists). Per-chat
    *  opt-out lives in noCotChats (`/cot off`), not here. */
   cotEnabled: boolean;
@@ -90,6 +90,8 @@ export interface BotCardPrefs extends ReplyFooterPreferences {
    *  Default TRUE (absent = show; only explicit false persists). Only takes
    *  effect with replyCardMode 'unified'; the value survives mode switches. */
   replyCardShowTools: boolean;
+  /** Native CoT alongside unified replies; default false, independent of cotEnabled. */
+  replyCardNativeCot: boolean;
   /** Whether each forwarded turn carries a `<sender …/>` tag naming the speaker.
    *  Default TRUE (absent = on; only an explicit false persists), same
    *  convention as cotEnabled. Off also drops the cursor anti-echo note (it is
@@ -156,6 +158,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       codexBrowserAutoApproveOrigins: c.codexBrowser?.autoApproveOrigins === true,
       thinkingCardToolResult: c.thinkingCardToolResult !== false,
       replyCardShowTools: c.replyCardShowTools !== false,
+      replyCardNativeCot: c.replyCardNativeCot === true,
       writableTerminalLinkInCard: c.writableTerminalLinkInCard === true,
       privateCard: c.privateCard === true,
       replyCardActions: c.replyCardActions === true,
@@ -196,6 +199,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       codexBrowserAutoApproveOrigins: false,
       thinkingCardToolResult: true,
       replyCardShowTools: true,
+      replyCardNativeCot: false,
       writableTerminalLinkInCard: false,
       privateCard: false,
       replyCardActions: false,
@@ -333,6 +337,7 @@ async function updateBotCardPrefsInternal(
     }
     applyDefaultTrue(entry, 'thinkingCardToolResult', patch.thinkingCardToolResult);
     applyDefaultTrue(entry, 'replyCardShowTools', patch.replyCardShowTools);
+    apply(entry, 'replyCardNativeCot', patch.replyCardNativeCot);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
     apply(entry, 'replyCardActions', patch.replyCardActions);
@@ -378,6 +383,7 @@ async function updateBotCardPrefsInternal(
         codexBrowserAutoApproveOrigins: entry.codexBrowser?.autoApproveOrigins === true,
         thinkingCardToolResult: entry.thinkingCardToolResult !== false,
         replyCardShowTools: entry.replyCardShowTools !== false,
+        replyCardNativeCot: entry.replyCardNativeCot === true,
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
         replyCardActions: entry.replyCardActions === true,
@@ -456,6 +462,9 @@ async function updateBotCardPrefsInternal(
   }
   if (patch.thinkingCardToolResult !== undefined) {
     bot.config.thinkingCardToolResult = patch.thinkingCardToolResult === false ? false : undefined;
+  }
+  if (patch.replyCardNativeCot !== undefined) {
+    bot.config.replyCardNativeCot = patch.replyCardNativeCot || undefined;
   }
   if (patch.replyCardShowTools !== undefined) {
     // Default true: store false explicitly, clear (→ default show) when true.

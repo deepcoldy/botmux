@@ -1,3 +1,7 @@
+import { readOncallDeploymentEnv } from '../services/oncall-deployment-config.js';
+import { loadOncallPresetOptions } from '../services/oncall-preset-options.js';
+import { loadOncallGroupTarget, readOncallGroupSettings, saveOncallGroupTarget } from '../services/oncall-group-client.js';
+import { readOncallBusinessName, readOncallChoices } from '../services/oncall-platform.js';
 import { ModelPinBusyError, modelPinClearError } from './model-pin.js';
 import { isSessionEffortChangeInFlight } from './worker-pool.js';
 import { scheduleActiveRuntimePatch } from './worker-pool.js';
@@ -212,6 +216,7 @@ import type {
 import { findConfigField, applyConfigField, applyPerBotEnvChange, applyBotSessionEnvRequest, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers, removeBlockedUsers, type SetBlockedUsersResult, type ConfigFieldSpec } from '../services/bot-config-store.js';
 import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptReplyDeliveryForBot } from './reply-delivery.js';
 import { resolveFeedbackTeamId, traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
+import { prepareReplyCardNativeThinking, replyCardDispatchAttempt } from './turn-reply-card.js';
 import { recordRelayedTurnDelivery, RELAYED_TURN_DELIVERY_MAX_BYTES, RELAYED_TURN_DELIVERY_ROUTE } from './relayed-turn-delivery.js';
 import {
   emptyLinkRefExtractionStats,
@@ -1255,7 +1260,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|dispatch-tree|decision-board|decision-board\/upload|project-dispatch-policy|continuation|durable-send|turn-delivery|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|dispatch-tree|decision-board|decision-board\/upload|project-dispatch-policy|continuation|durable-send|turn-delivery|reply-card-ready|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -2109,6 +2114,35 @@ ipcRoute('GET', '/api/sessions/:sessionId/reply-render-snapshot', (req, res, par
     return jsonRes(res, 400, { error: 'invalid_dispatch_attempt' });
   }
   jsonRes(res, 200, { snapshot: getDaemonReplyCardRenderSnapshot(ds, { turnId, dispatchAttempt }) });
+});
+
+/** Cross-process ordering barrier. It creates only this accepted turn's native
+ * thinking display; the CLI keeps the existing answer publication lock/UUID. */
+ipcRoute('POST', '/api/sessions/:sessionId/reply-card-ready', async (req, res, params) => {
+  const body = await readJsonBody<Record<string, unknown>>(req).catch(() => undefined);
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds || ds.session.status === 'closed' || ds.larkAppId !== cachedLarkAppId) {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  }
+  const turnId = body?.expectedTurnId;
+  const attempt = body?.dispatchAttempt;
+  const boundAttempt = typeof turnId === 'string' ? replyCardDispatchAttempt(ds, turnId) : undefined;
+  if (attempt !== boundAttempt) return jsonRes(res, 409, { ok: false, error: 'reply_attempt_changed' });
+  if (typeof turnId !== 'string' || turnId !== ds.currentTurnId
+    || (attempt !== undefined && (!Number.isSafeInteger(attempt) || Number(attempt) < 1))) {
+    return jsonRes(res, 409, { ok: false, error: 'reply_turn_changed' });
+  }
+  await prepareReplyCardNativeThinking(ds, turnId, attempt as number | undefined);
+  const current = findActiveBySessionId(params.sessionId);
+  if (!sessionCliIpcAuth(req, current, params.sessionId, body).ok || (current && replyCardDispatchAttempt(current, turnId) !== attempt)) {
+    return jsonRes(res, 409, { ok: false, error: 'reply_attempt_changed' });
+  }
+  if (current !== ds || current?.currentTurnId !== turnId || current?.session.status === 'closed') {
+    return jsonRes(res, 409, { ok: false, error: 'reply_turn_changed' });
+  }
+  return jsonRes(res, 200, { ok: true });
 });
 
 /** Session-bound single-message delivery through the primary durable outbox.
@@ -9332,6 +9366,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     replyCardActions: cardPrefs.replyCardActions,
     cotEnabled: cardPrefs.cotEnabled,
     replyCardShowTools: cardPrefs.replyCardShowTools,
+    replyCardNativeCot: cardPrefs.replyCardNativeCot,
     senderTag: cardPrefs.senderTag,
     senderTagHideEmail: cardPrefs.senderTagHideEmail,
     overloadAlert: cardPrefs.overloadAlert,
@@ -9485,6 +9520,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     showReplyTiming?: unknown;
     thinkingCardToolResult?: unknown;
     replyCardShowTools?: unknown;
+    replyCardNativeCot?: unknown;
     usageDisplay?: unknown;
     replyCardMode?: unknown;
     disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; codexBrowserAutoApproveOrigins?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; replyCardActions?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
@@ -9504,6 +9540,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     showReplyTiming?: boolean;
     thinkingCardToolResult?: boolean;
     replyCardShowTools?: boolean;
+    replyCardNativeCot?: boolean;
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
     disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; codexBrowserAutoApproveOrigins?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; replyCardActions?: boolean; cotEnabled?: boolean;
@@ -9563,6 +9600,10 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     patch.codexBrowserAutoApproveOrigins = body.codexBrowserAutoApproveOrigins;
   }
   if (typeof body.thinkingCardToolResult === 'boolean') patch.thinkingCardToolResult = body.thinkingCardToolResult;
+  if (body.replyCardNativeCot !== undefined) {
+    if (typeof body.replyCardNativeCot !== 'boolean') return jsonRes(res, 400, { ok: false, error: 'replyCardNativeCot must be boolean' });
+    patch.replyCardNativeCot = body.replyCardNativeCot;
+  }
   if (typeof body.replyCardShowTools === 'boolean') patch.replyCardShowTools = body.replyCardShowTools;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
@@ -10925,6 +10966,51 @@ botConfigPutRoute<{ steward?: unknown }>('/api/bot-steward', 'steward', {
   },
   respond: value => ({ ok: true, steward: value ?? null }),
 });
+
+async function oncallTargetPresentation() {
+  const deployment = readOncallDeploymentEnv();
+  const settings = readOncallGroupSettings(config.session.dataDir, cachedLarkAppId);
+  const secret = deployment.ONCALL_SERVICE_SECRET?.trim() ?? '';
+  const state = { ...settings, credentialActive: Boolean(secret) };
+  if (!settings.target || !settings.connectionReady || !secret) return state;
+  try {
+    const tenantName = await readOncallBusinessName(loadOncallGroupTarget(config.session.dataDir, cachedLarkAppId, deployment), secret);
+    return { ...state, tenantName, connectionOk: true };
+  } catch (error) {
+    return { ...state, connectionOk: false, connectionError: error instanceof Error ? error.message : '连接校验失败' };
+  }
+}
+
+ipcRoute('GET', '/api/bot-oncall-target', requireBoundBot(async (_req, res) => {
+  try { jsonRes(res, 200, { ok: true, ...await oncallTargetPresentation() }); }
+  catch (error) { jsonRes(res, 400, { ok: false, error: error instanceof Error ? error.message : 'Oncall 目标配置无效' }); }
+}));
+ipcRoute('PUT', '/api/bot-oncall-target', requireBoundBot(async (req, res) => {
+  const body = await readJsonBodyOrBadJson<{ target?: unknown }>(req, res);
+  if (body === BAD_JSON) return;
+  try {
+    saveOncallGroupTarget(config.session.dataDir, cachedLarkAppId, body?.target);
+    jsonRes(res, 200, { ok: true, ...await oncallTargetPresentation() });
+  }
+  catch (error) { jsonRes(res, 400, { ok: false, error: error instanceof Error ? error.message : 'Oncall 目标配置无效' }); }
+}));
+ipcRoute('POST', '/api/bot-oncall-target/choices', requireBoundBot(async (req, res) => {
+  const body = await readJsonBodyOrBadJson<{ tenantId?: unknown }>(req, res);
+  if (body === BAD_JSON) return;
+  if (!Number.isSafeInteger(body?.tenantId) || Number(body.tenantId) <= 0) return jsonRes(res, 400, { ok: false, error: '请选择有效业务线' });
+  try {
+    const options = await loadOncallPresetOptions(config.session.dataDir, cachedLarkAppId, Number(body.tenantId));
+    jsonRes(res, 200, { ok: true, ...options });
+  } catch (error) { jsonRes(res, 400, { ok: false, error: error instanceof Error ? error.message : '区域和分类读取失败' }); }
+}));
+
+ipcRoute('POST', '/api/bot-oncall-target/check', requireBoundBot(async (_req, res) => {
+  try {
+    const deployment = readOncallDeploymentEnv();
+    const choices = await readOncallChoices(loadOncallGroupTarget(config.session.dataDir, cachedLarkAppId, deployment), deployment.ONCALL_SERVICE_SECRET?.trim() ?? '', '');
+    jsonRes(res, 200, { ok: true, regions: Object.keys(choices.regions), checkedAtMs: Date.now(), createPermissionVerified: false });
+  } catch (error) { jsonRes(res, 400, { ok: false, error: error instanceof Error ? error.message : '连接校验失败' }); }
+}));
 
 botConfigPutRoute<{ oncallGroup?: unknown }>('/api/bot-oncall-group', 'oncallGroup', {
   normalize: (body, spec) => {

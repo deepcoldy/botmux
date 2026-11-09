@@ -540,6 +540,24 @@ export async function urgentMessage(
  * Emits no outbound hook (same as {@link sendUserMessage}): the hook event
  * union is closed and a forward is not one of its members.
  */
+/** Merge up to 100 original messages using Lark's native forwarding API. */
+export async function mergeForwardMessages(larkAppId: string, messageIds: string[], chatId: string, uuid?: string): Promise<{ messageId: string; invalidMessageIds: string[] }> {
+  assertLarkTransport(larkAppId, 'mergeForwardMessages');
+  if (!messageIds.length || messageIds.length > 100) throw new Error('Merge forwarding requires 1–100 messages');
+  const wireUuid = dedupeUuid(uuid);
+  return executeWithLarkGate(larkAppId, 'mergeForwardMessages', async () => {
+    for (const id of messageIds) await assertMessageWriteAllowed(larkAppId, id);
+    const response = await getBotClient(larkAppId).im.v1.message.mergeForward({
+      params: { receive_id_type: 'chat_id', uuid: wireUuid },
+      data: { receive_id: chatId, message_id_list: messageIds },
+    });
+    if (response.code !== 0) throw larkApiError('merge forward messages', response);
+    const messageId = response.data?.message?.message_id;
+    if (!messageId) throw new Error('No message_id in merge forward response');
+    return { messageId, invalidMessageIds: response.data?.invalid_message_id_list ?? [] };
+  });
+}
+
 export async function forwardMessage(
   larkAppId: string,
   messageId: string,
@@ -921,6 +939,15 @@ export async function listChatUserMembers(larkAppId: string, chatId: string): Pr
     );
   }
   return members;
+}
+
+export async function isBotInChat(larkAppId: string, chatId: string): Promise<boolean> {
+  assertLarkTransport(larkAppId, 'isBotInChat');
+  return executeWithLarkGate(larkAppId, 'isBotInChat', async () => {
+    const response = await larkGet(getBotClient(larkAppId), `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/members/is_in_chat`);
+    if (response.code !== 0 || typeof response.data?.is_in_chat !== 'boolean') throw larkApiError('check bot membership', response);
+    return response.data.is_in_chat;
+  });
 }
 
 export async function listChatMemberOpenIds(larkAppId: string, chatId: string): Promise<string[]> {

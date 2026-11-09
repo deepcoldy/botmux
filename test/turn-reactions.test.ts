@@ -49,7 +49,8 @@ vi.mock('../src/core/turn-cli-identity.js', async () => {
 });
 
 import { getBot, registerBot } from '../src/bot-registry.js';
-import { noteTurnReceived } from '../src/daemon.js';
+import { noteTurnReceived, __testOnly_claimNewDaemonSession as claimNewDaemonSession } from '../src/daemon.js';
+import { OncallGroupStore } from '../src/services/oncall-group-store.js';
 import * as sessionStore from '../src/services/session-store.js';
 import {
   initWorkerPool,
@@ -93,6 +94,36 @@ describe('two-phase turn reactions', () => {
     sessionStore.init(APP);
     mocks.addReaction.mockImplementation(async (_app: string, msgId: string) => `rid_${msgId}`);
     mocks.removeReaction.mockResolvedValue(undefined);
+  });
+
+  it.each(['legacy', 'unified'] as const)('persists %s session boundaries before any first card is published', async replyCardMode => {
+    registerWith(false, { replyCardMode });
+    getBot(APP).config.oncallGroup = { enabled: true, chatIds: ['oc_x'] };
+    const ds = makeDs({ chatType: 'group', scope: 'thread' });
+    await noteTurnReceived(ds, 'om_newquestion');
+    // Reopen the store: boundary survives even without a published source/card.
+    const store = new OncallGroupStore(process.env.SESSION_DATA_DIR!);
+    expect(store.latest(APP, ds.session.sessionId)).toBeUndefined();
+    const boundary = store.otherSessionScope({ appId: APP, sessionId: 'old-session', chatId: 'oc_x',
+      rootId: 'om_root', questionId: 'om_oldquestion', messageId: 'om_oldreply', answer: '' });
+    expect([...boundary.starts]).toEqual(['om_newquestion']);
+    expect([...boundary.messages]).toEqual(['om_newquestion']);
+    expect(mocks.addReaction).not.toHaveBeenCalled();
+  });
+
+  it.each(['legacy', 'unified'] as const)('isolates %s initial turns while waiting for repo selection or worktree creation', async replyCardMode => {
+    registerWith(false, { replyCardMode });
+    getBot(APP).config.oncallGroup = { enabled: true, chatIds: ['oc_x'] };
+    const registry = new Map<string, DaemonSession>();
+    const ds = makeDs({ chatType: 'group', scope: 'thread', pendingRepo: true, pendingTurnId: 'om_newquestion' });
+    expect((await claimNewDaemonSession(registry, ds)).accepted).toBe(true);
+    const store = new OncallGroupStore(process.env.SESSION_DATA_DIR!);
+    expect([...store.otherSessionScope({ appId: APP, sessionId: 'old-session', chatId: 'oc_x',
+      rootId: 'om_root', questionId: 'om_oldquestion', messageId: 'om_oldreply', answer: '' }).starts]).toEqual(['om_newquestion']);
+    // Later acceptance must retain the same turn number, not count it twice.
+    await noteTurnReceived(ds, 'om_newquestion');
+    expect(store.registerTurn(APP, ds.session.sessionId, 'om_newquestion')).toBe(1);
+    expect(store.registerTurn(APP, ds.session.sessionId, 'om_secondquestion')).toBe(2);
   });
 
   it('用户身份刷新期间展示收到表情，身份就绪后完成接收登记', async () => {
