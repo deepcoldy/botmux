@@ -284,7 +284,9 @@ export class OncallGroupStore {
     if (uncertain.length > 1) return { status: 'unknown' };
     const chosen = uncertain[0] ?? [...records].sort((a, b) => (b.submittedAtMs ?? 0) - (a.submittedAtMs ?? 0))[0]!;
     if (chosen.status !== 'succeeded' && !chosen.attemptId) return { status: 'unknown' };
-    return { ...chosen,
+    // Records written before conversation forwarding existed never forwarded anything.
+    const forwardMode = chosen.forwardMode ?? 'none';
+    return { ...chosen, forwardMode,
       ...(records.length > 1 ? {
         submittedAtMs: Math.max(...records.map(item => item.submittedAtMs ?? 0)) || chosen.submittedAtMs,
         messageIdsSnapshot: [...new Set(records.flatMap(item => item.messageIdsSnapshot ?? []))],
@@ -293,7 +295,7 @@ export class OncallGroupStore {
         forwardedMessageIds: Object.assign({}, ...records.map(item => item.forwardedMessageIds)),
       } : {}),
       cardRefreshPending: chosen.status === 'succeeded' || chosen.cardRefreshPending,
-      conversationScopePending: chosen.status === 'succeeded' && chosen.forwardMode !== 'none' };
+      conversationScopePending: chosen.status === 'succeeded' && forwardMode !== 'none' };
   }
 
   claim(source: OncallGroupSource, operatorOpenId?: string, snapshot?: { messageIds: string[]; cutoffMs: number; forwardMode?: OncallForwardMode }): boolean {

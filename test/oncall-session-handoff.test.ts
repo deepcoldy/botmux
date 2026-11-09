@@ -92,7 +92,7 @@ describe('session Oncall request ownership', () => {
     store.recordSource(source);
     expect(store.claim(source)).toBe(false);
     expect(store.getRequest(source)?.status).toBe(status === 'succeeded' ? 'succeeded' : 'unknown');
-    if (status === 'succeeded') expect(store.getRequest(source)?.openChatId).toBe('oc_original');
+    if (status === 'succeeded') expect(store.getRequest(source)).toMatchObject({ openChatId: 'oc_original', forwardMode: 'none', conversationScopePending: false });
   });
   it('keeps the delivered answer and links when a later non-final update re-indexes the same card', () => {
     const store = new OncallGroupStore(temp());
