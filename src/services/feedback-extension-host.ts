@@ -81,7 +81,7 @@ export async function tickFeedbackExtensions(dataDir: string, appId: string): Pr
           const effective = presentation && resolveFeedbackPresentation(presentation, { botAppId: appId, chatId, sourceMessageId: subjectId, round });
           const currentScope = effective?.roundScope === 'topic' && topicId !== chatId ? 'topic' : 'subject';
           if (currentScope !== roundScope) throw new Error('feedback_presentation_scope_changed');
-          if (!presentation || !resolveFeedbackPresentation(presentation, { botAppId: appId, chatId, sourceMessageId: subjectId, round }).matched
+          if (!presentation || !effective?.matched
             || !resolveFeedbackPolicyForDelivery({ dataDir, larkAppId: appId, chatId, bot })) throw new Error('feedback_presentation_disabled');
         };
         const release = acquireFeedbackSendLease(dataDir);

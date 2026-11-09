@@ -27,6 +27,14 @@ export async function reconcileFeedbackSurfaces(input: {
   const cursor = extensions.cursor(cursorKey);
   const events = await source.readFeedbackEventsAfter({ after: cursor, limit: 100 });
   const entries: Array<{ sequence: number; eventId: string; jobs: ExtensionJobInput[] }> = [];
+  type Delivery = NonNullable<Awaited<ReturnType<CompatibleFeedbackStore['findDeliveryById']>>>;
+  type AnswerGroups = ReturnType<typeof feedbackAnswerGroups>;
+  const topics = new Map<string, Promise<{
+    groups: AnswerGroups; subjects: Map<string, string>;
+    topicRounds: Map<string, number>; subjectRounds: Map<string, number>;
+  }>>();
+  const answerUrls = new Map<string, Promise<string>>();
+  const preparedJobs = new Set<string>();
   for (const entry of events) {
     const event = entry.event;
     const data = event.data;
@@ -63,36 +71,51 @@ export async function reconcileFeedbackSurfaces(input: {
       const eventDelivery = await source.findDeliveryByPlatformMessage('lark', input.appId, data.platformMessageId);
       const presentation = input.config.presentations[input.appId];
       if (eventDelivery?.chatId && eventDelivery.topicRootId && presentation) {
-        const sourceDeliveries = await source.listSubjectDeliveries(input.appId, eventDelivery.chatId, eventDelivery.topicRootId);
-        const substantiveDeliveries = sourceDeliveries.filter(delivery => {
-          const binding = extensions.subject(input.appId, delivery.sessionId ?? '', delivery.turnId ?? '');
-          return !binding || binding.answerKind === 'substantive';
-        });
-        const topicGroups = feedbackAnswerGroups(substantiveDeliveries);
-        const subjectGroups = new Map<string, ReturnType<typeof feedbackAnswerGroups>>();
-        for (const delivery of substantiveDeliveries) {
-          const binding = extensions.subject(input.appId, delivery.sessionId ?? '', delivery.turnId ?? '');
-          const subject = binding?.sourceMessageId ?? delivery.topicRootId;
-          if (subject && !subjectGroups.has(subject)) {
-            subjectGroups.set(subject, feedbackAnswerGroups(substantiveDeliveries.filter(candidate => {
-              const candidateBinding = extensions.subject(input.appId, candidate.sessionId ?? '', candidate.turnId ?? '');
-              return (candidateBinding?.sourceMessageId ?? candidate.topicRootId) === subject;
-            })));
-          }
+        const topicKey = JSON.stringify([eventDelivery.chatId, eventDelivery.topicRootId]);
+        if (!topics.has(topicKey)) {
+          topics.set(topicKey, (async () => {
+            const sourceDeliveries = await source.listSubjectDeliveries(input.appId, eventDelivery.chatId!, eventDelivery.topicRootId!);
+            const substantive: Delivery[] = [];
+            const bySubject = new Map<string, Delivery[]>();
+            const subjects = new Map<string, string>();
+            for (const delivery of sourceDeliveries) {
+              const binding = extensions.subject(input.appId, delivery.sessionId ?? '', delivery.turnId ?? '');
+              if (binding && binding.answerKind !== 'substantive') continue;
+              const subject = binding?.sourceMessageId ?? delivery.topicRootId;
+              if (!subject) continue;
+              substantive.push(delivery);
+              subjects.set(delivery.deliveryId, subject);
+              const subjectDeliveries = bySubject.get(subject) ?? [];
+              subjectDeliveries.push(delivery);
+              bySubject.set(subject, subjectDeliveries);
+            }
+            const topicGroups = feedbackAnswerGroups(substantive);
+            const groups = new Map(topicGroups.map(group => [group.id, group]));
+            const subjectRounds = new Map<string, number>();
+            for (const deliveries of bySubject.values()) {
+              for (const group of feedbackAnswerGroups(deliveries)) {
+                groups.set(group.id, group);
+                subjectRounds.set(group.id, group.round);
+              }
+            }
+            return { groups: [...groups.values()], subjects,
+              topicRounds: new Map(topicGroups.map(group => [group.id, group.round])), subjectRounds };
+          })());
         }
-        const groups = [...new Map([...topicGroups, ...[...subjectGroups.values()].flat()].map(group => [group.id, group])).values()];
-        for (const group of groups) {
+        const candidates = await topics.get(topicKey)!;
+        for (const group of candidates.groups) {
           try {
           const { delivery, id: answerId } = group;
+          const jobId = identity(['surface', answerId]);
+          if (preparedJobs.has(jobId) || extensions.job(jobId)) continue;
           if (!delivery.policy || !delivery.chatId || !delivery.topicRootId
             || (input.startedAt && delivery.createdAt < input.startedAt)) continue;
-          const deliveryBinding = extensions.subject(input.appId, delivery.sessionId ?? '', delivery.turnId ?? '');
-          const answerSubjectId = deliveryBinding?.sourceMessageId ?? delivery.topicRootId;
+          const answerSubjectId = candidates.subjects.get(delivery.deliveryId)!;
           if (answerSubjectId === delivery.chatId) continue;
           const topicRounds = resolveFeedbackPresentation(presentation, { botAppId: input.appId,
             chatId: delivery.chatId, sourceMessageId: answerSubjectId, round: 1 }).roundScope === 'topic'
             && delivery.topicRootId !== delivery.chatId;
-          const round = (topicRounds ? topicGroups : subjectGroups.get(answerSubjectId))?.find(candidate => candidate.id === answerId)?.round;
+          const round = (topicRounds ? candidates.topicRounds : candidates.subjectRounds).get(answerId);
           if (round === undefined) continue;
           const rule = resolveFeedbackPresentation(presentation, { botAppId: input.appId, chatId: delivery.chatId,
             sourceMessageId: answerSubjectId, round });
@@ -107,15 +130,18 @@ export async function reconcileFeedbackSurfaces(input: {
             const template = input.config.templates.find(item => item.id === rule.templateId);
             if (!template) throw new Error('feedback_template_not_found');
             const actions = input.config.actions.filter(action => rule.actionIds.includes(action.id));
-            const answerUrl = await input.answerUrl(delivery.platformMessageId, delivery.chatId);
+            const urlKey = JSON.stringify([delivery.chatId, delivery.platformMessageId]);
+            if (!answerUrls.has(urlKey)) answerUrls.set(urlKey, Promise.resolve().then(() => input.answerUrl(delivery.platformMessageId, delivery.chatId!)));
+            const answerUrl = await answerUrls.get(urlKey)!;
             const card = buildFeedbackSurface({ template, policy: delivery.policy, round,
               answerUrl, preview: false, actions });
-            jobs.push({ id: identity(['surface', answerId]), kind: 'surface', payload: {
+            jobs.push({ id: jobId, kind: 'surface', payload: {
               appId: input.appId, subjectId: answerSubjectId, topicId: delivery.topicRootId, chatId: delivery.chatId, answerId,
               deliveryId: delivery.deliveryId, answerMessageId: delivery.platformMessageId, messageIds: group.messageIds, round, card, actions,
               roundScope: topicRounds ? 'topic' : 'subject',
               mode: rule.mode, templateId: template.id, template, answerUrl,
             } });
+            preparedJobs.add(jobId);
           }
           } catch (error) {
             const reason = error instanceof Error && /^feedback_[a-z_]+$/.test(error.message) ? error.message : 'feedback_surface_prepare_failed';
@@ -149,7 +175,9 @@ export async function reconcileFeedbackSurfaces(input: {
   const preparedScope = job.payload.roundScope === 'topic' ? 'topic' : 'subject';
   const currentScope = effective?.roundScope === 'topic' && job.payload.topicId !== job.payload.chatId ? 'topic' : 'subject';
   if (!effective?.matched || preparedScope !== currentScope) {
-    extensions.settle(job.id, job.token!, 'blocked', { reason: 'presentation_disabled' }, input.now());
+    extensions.settle(job.id, job.token!, 'blocked', {
+      reason: effective?.matched ? 'presentation_scope_changed' : 'presentation_disabled',
+    }, input.now());
     return;
   }
   try {

@@ -12,6 +12,85 @@ import { buildFeedbackElement } from '../src/im/lark/skill-feedback-card.js';
 import { recordRelayedTurnDelivery } from '../src/core/relayed-turn-delivery.js';
 
 describe('feedback surface event reconciliation', () => {
+  it.each([8, 16])('prepares each answer once in a backlog of %s independent subjects', async count => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-backlog-'));
+    const source = await SkillFeedbackStore.open(directory);
+    const extensions = await FeedbackExtensionStore.open(directory);
+    try {
+      const policy = normalizeFeedbackPolicy({ enabled: true });
+      for (let index = 0; index < count; index++) {
+        const turnId = `turn-${index}`;
+        extensions.bindSubject('app', 'session', turnId, { sourceMessageId: `question-${index}`, answerKind: 'substantive' });
+        source.recordTurnDelivery({ botAppId: 'app', sessionId: 'session', turnId, platform: 'lark',
+          platformAppId: 'app', platformMessageId: `answer-${index}`, chatId: 'chat', topicRootId: 'topic',
+          content: 'answer', cardMode: 'feedback', status: 'delivered', policy });
+        source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId, status: 'completed' });
+      }
+      const bindings = vi.spyOn(extensions, 'subject');
+      const reads = vi.spyOn(source, 'listSubjectDeliveries');
+      let urlCalls = 0, sends = 0;
+      const dependencies = { appId: 'app', sourceKey: 'source', source, extensions, now: Date.now,
+        send: async () => `surface-${++sends}`, answerUrl: () => { urlCalls++; return 'https://example.com/answer'; },
+        removeInline: async () => {},
+        config: { version: 1, hostId: 'host', templates: [defaultFeedbackTemplate()], hooks: [], actions: [],
+          presentations: { app: normalizeFeedbackPresentation({ default: { enabled: true, rounds: [1] } }) } },
+      };
+      await reconcileFeedbackSurfaces(dependencies);
+      expect(urlCalls).toBe(count);
+      expect(bindings.mock.calls.length).toBeLessThanOrEqual(count * 2);
+      expect(reads.mock.calls.length).toBe(1);
+      const next = `turn-${count}`;
+      extensions.bindSubject('app', 'session', next, { sourceMessageId: `question-${count}`, answerKind: 'substantive' });
+      source.recordTurnDelivery({ botAppId: 'app', sessionId: 'session', turnId: next, platform: 'lark',
+        platformAppId: 'app', platformMessageId: 'next-answer', chatId: 'chat', topicRootId: 'topic',
+        content: 'next', cardMode: 'feedback', status: 'delivered', policy });
+      source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: next, status: 'completed' });
+      await reconcileFeedbackSurfaces(dependencies);
+      expect(urlCalls).toBe(count + 1);
+    } finally { extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+  it.each([true, false])('records the actual block reason for a queued scope change (enabled=%s)', async enabled => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-claim-scope-'));
+    const source = await SkillFeedbackStore.open(directory);
+    const extensions = await FeedbackExtensionStore.open(directory);
+    try {
+      extensions.ingest('source:app', 0, [{ sequence: 1, eventId: 'old', jobs: [{ id: 'job', kind: 'surface',
+        payload: { appId: 'app', chatId: 'chat', topicId: 'topic', subjectId: 'question', round: 1, roundScope: 'subject' } }] }]);
+      await reconcileFeedbackSurfaces({ appId: 'app', sourceKey: 'source', source, extensions, now: Date.now,
+        send: async () => { throw new Error('must not send stale job'); }, answerUrl: () => 'https://example.com',
+        removeInline: async () => {},
+        config: { version: 1, hostId: 'host', templates: [defaultFeedbackTemplate()], hooks: [], actions: [],
+          presentations: { app: normalizeFeedbackPresentation({ default: { enabled, rounds: [1], roundScope: 'topic' } }) } } });
+      expect(extensions.job('job')).toMatchObject({ status: 'blocked', result: {
+        reason: enabled ? 'presentation_scope_changed' : 'presentation_disabled',
+      } });
+    } finally { extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+  it.each([true, false])('keeps unfinished answers ahead of later answers in native topic scope (bound=%s)', async bound => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-topic-pending-'));
+    const source = await SkillFeedbackStore.open(directory);
+    const extensions = await FeedbackExtensionStore.open(directory);
+    try {
+      for (const turnId of ['unfinished', 'completed']) {
+        if (bound) extensions.bindSubject('app', 'session', turnId, { sourceMessageId: `question-${turnId}`, answerKind: 'substantive' });
+        source.recordTurnDelivery({ botAppId: 'app', sessionId: 'session', turnId, platform: 'lark',
+          platformAppId: 'app', platformMessageId: turnId, chatId: 'chat', topicRootId: 'topic',
+          content: 'answer', cardMode: 'feedback', status: 'delivered', policy: normalizeFeedbackPolicy({ enabled: true }) });
+      }
+      source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'completed', status: 'completed' });
+      let sends = 0;
+      const dependencies = { appId: 'app', sourceKey: 'source', source, extensions, now: Date.now,
+        send: async () => `surface-${++sends}`, answerUrl: () => 'https://example.com', removeInline: async () => {},
+        config: { version: 1, hostId: 'host', templates: [defaultFeedbackTemplate()], hooks: [], actions: [],
+          presentations: { app: normalizeFeedbackPresentation({ default: { enabled: true, rounds: [1], roundScope: 'topic' } }) } } };
+      await reconcileFeedbackSurfaces(dependencies);
+      expect(sends).toBe(0);
+      source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'unfinished', status: 'completed' });
+      await reconcileFeedbackSurfaces(dependencies);
+      expect(sends).toBe(1);
+      expect(extensions.surface('app', 'surface-1')).toMatchObject({ answerMessageId: 'unfinished', round: 1 });
+    } finally { extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
   it.each([false, true])('does not block independent subjects behind an unfinished answer (ordinary=%s)', async ordinary => {
     const directory = mkdtempSync(join(tmpdir(), 'feedback-independent-subject-'));
     const source = await SkillFeedbackStore.open(directory);
