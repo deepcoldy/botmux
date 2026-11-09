@@ -379,9 +379,15 @@ async function runNodeImpl(
       };
     }
 
-    function goalRuntimeError(runtime: RuntimeAttestation | undefined): RunNodeResult['error'] | undefined {
+    function goalRuntimeError(
+      runtime: RuntimeAttestation | undefined,
+      workerStatus: RunNodeResult['status'],
+    ): RunNodeResult['error'] | undefined {
       if (!goalBinding) return undefined;
       if (!runtime) {
+        // A worker that already failed (spawn gate, crash, timeout) keeps its
+        // own failure; missing evidence only overrides an otherwise-ok run.
+        if (workerStatus !== 'ok') return undefined;
         return {
           code: 'GOAL_RUNTIME_UNVERIFIED',
           message: 'goal-scoped Codex worker produced no active-runtime attestation',
@@ -635,8 +641,9 @@ async function runNodeImpl(
       }
       settled = true;
       const runtime = runtimeAttestation();
-      const runtimeError = goalRuntimeError(runtime);
-      const status = runtimeError ? 'fail' : pendingResult?.status ?? (code === 0 ? 'ok' : 'fail');
+      const workerStatus = pendingResult?.status ?? (code === 0 ? 'ok' : 'fail');
+      const runtimeError = goalRuntimeError(runtime, workerStatus);
+      const status = runtimeError ? 'fail' : workerStatus;
       const reason = pendingResult?.reason ?? 'worker-exit';
       if (runtimeError) {
         void appendLine(stderrPath(req), `[v3] ${runtimeError.code}: ${runtimeError.message}`);

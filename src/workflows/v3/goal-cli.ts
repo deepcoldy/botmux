@@ -9,6 +9,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 
+import { resolveSandboxMode } from '../../adapters/cli/sandbox-mode.js';
 import { loadBotConfigs, type BotConfig } from '../../bot-registry.js';
 import { isWorkflowFeatureEnabled } from '../../global-config.js';
 import { validateCodexGoalHome, type SessionCliInstanceBindingV1 } from '../../services/codex-instance-pool.js';
@@ -405,6 +406,11 @@ function applyGoalCodexRuntime(snapshot: BotSnapshot, args: GoalRunArgs): BotSna
   }
   if (snapshot.cliId !== 'codex' || snapshot.wrapperCli) {
     throw new Error('explicit goal Codex runtime requires an unwrapped codex bot');
+  }
+  // Mirrors the worker's spawn gate for non-legacy Codex homes, so a sandboxed
+  // bot is refused before a run is authorized rather than after a worker spawn.
+  if (resolveSandboxMode({ configSandbox: snapshot.sandbox, envValue: process.env.BOTMUX_SANDBOX }) !== 'off') {
+    throw new Error('explicit goal Codex runtime does not support sandboxed bots (bot sandbox or BOTMUX_SANDBOX)');
   }
   const codexHome = validateCodexGoalHome(args.codexHome);
   if (codexHome !== args.codexHome) {
