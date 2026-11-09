@@ -120,9 +120,35 @@ describe('reapStaleCodexThreadWriter SIGKILL ownership recheck', () => {
   it('does not SIGKILL a pid whose argv no longer carries the marker (pid reused)', async () => {
     const host = fakeHost({ 4242: { argv: codexArgv(SESSION), dies: 'never' } });
     let reads = 0;
-    const deps = { ...host.deps, readArgv: (pid: number) => (reads++ === 0 ? codexArgv(SESSION) : 'some-other-program') };
+    // 1st read: classification, 2nd: right before SIGTERM, 3rd: right before SIGKILL.
+    const deps = { ...host.deps, readArgv: (_pid: number) => (reads++ < 2 ? codexArgv(SESSION) : 'some-other-program') };
     const outcome = await reapStaleCodexThreadWriter({ ...base, termGraceMs: 200, deps });
     expect(outcome).toEqual({ kind: 'stuck', pids: [4242] });
+    expect(host.signals).toEqual([[4242, 'SIGTERM']]);
+  });
+});
+
+describe('reapStaleCodexThreadWriter SIGTERM ownership recheck', () => {
+  it('does not SIGTERM a pid whose argv changed after classification (pid reused)', async () => {
+    const host = fakeHost({ 4242: { argv: codexArgv(SESSION) } });
+    let reads = 0;
+    const deps = { ...host.deps, readArgv: (_pid: number) => (reads++ === 0 ? codexArgv(SESSION) : 'some-other-program') };
+    const outcome = await reapStaleCodexThreadWriter({ ...base, deps });
+    expect(outcome).toEqual({ kind: 'stuck', pids: [4242] });
+    expect(host.signals).toEqual([]);
+  });
+
+  it('skips a holder that exited before it could be signalled', async () => {
+    const host = fakeHost({ 4242: { argv: codexArgv(SESSION) }, 4343: { argv: codexArgv(SESSION) } });
+    const deps = {
+      ...host.deps,
+      readArgv: (pid: number) => {
+        if (pid === 4343 && host.signals.length > 0) { host.alive.delete(4343); return undefined; }
+        return codexArgv(SESSION);
+      },
+    };
+    const outcome = await reapStaleCodexThreadWriter({ ...base, deps });
+    expect(outcome).toEqual({ kind: 'reaped', pids: [4242], forced: false });
     expect(host.signals).toEqual([[4242, 'SIGTERM']]);
   });
 });

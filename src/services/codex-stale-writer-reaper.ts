@@ -135,8 +135,23 @@ export async function reapStaleCodexThreadWriter(opts: {
     }
   };
 
-  send(ours, 'SIGTERM');
-  let remaining = await waitGone(ours, opts.termGraceMs ?? 3_000);
+  // Ownership was read for the whole holder list first; re-prove it per pid
+  // immediately before signalling, so a pid that exited and was reused while
+  // the other holders were being classified is never sent SIGTERM. A pid that
+  // no longer proves ownership is not signalled at all (reported as stuck if
+  // it is still alive, since the lock may still be held).
+  const signalled: number[] = [];
+  const unproven: number[] = [];
+  for (const pid of ours) {
+    if (deps.readArgv(pid)?.includes(marker) === true) {
+      send([pid], 'SIGTERM');
+      signalled.push(pid);
+    } else if (!deps.provablyGone(pid)) {
+      unproven.push(pid);
+    }
+  }
+  if (unproven.length > 0) return { kind: 'stuck', pids: unproven };
+  let remaining = await waitGone(signalled, opts.termGraceMs ?? 3_000);
   let forced = false;
   if (remaining.length > 0) {
     forced = true;
@@ -151,8 +166,8 @@ export async function reapStaleCodexThreadWriter(opts: {
     remaining = await waitGone(remaining, opts.killGraceMs ?? 2_000);
   }
   if (remaining.length > 0) return { kind: 'stuck', pids: remaining };
-  if (foreign.length > 0) return { kind: 'foreign', pids: foreign, reaped: ours };
-  return { kind: 'reaped', pids: ours, forced };
+  if (foreign.length > 0) return { kind: 'foreign', pids: foreign, reaped: signalled };
+  return { kind: 'reaped', pids: signalled, forced };
 }
 
 // ─── Host probes ────────────────────────────────────────────────────────────
