@@ -1107,6 +1107,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(updateMessageMock.mock.calls.some(call => call[2]?.includes(expectedAnswer) && call[2]?.includes('已完成') && call[2]?.includes('oncall_group_create'))).toBe(true);
       expect(new OncallGroupStore(config.session.dataDir).findSource('app_test', 'om_managed_reply'))
         .toMatchObject({ chatId: 'oc_chat', questionId: ds.currentTurnId, answer: expectedAnswer });
+      // The bridge final settles after an explicit answer already completed the card; the next case reuses this turn key.
+      expect(ds.lastBridgeEmittedUuid).toBe(`${ds.session.sessionId}:managed-final`);
     }, { timeout: 5000 });
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(updateMessageMock.mock.calls.every(call => call[1] === 'om_managed_reply')).toBe(true);
