@@ -21103,7 +21103,8 @@ async function flushPending(): Promise<void> {
       });
       return;
     }
-    while (pendingMessages.length > 0 && backend && cliAdapter) {
+    let holdDrainForPreferredReset = false;
+    while (pendingMessages.length > 0 && backend && cliAdapter && !holdDrainForPreferredReset) {
       // The first item passed the prompt/model gate before beginCliWriteCycle
       // deliberately cleared readiness. Rechecking that synthetic false here
       // would strand the very input admitted by this flush.
@@ -21180,6 +21181,24 @@ async function flushPending(): Promise<void> {
           && !!item.turnId
           && item.turnId !== currentBotmuxTurnId
           && (!promptReadyAtFlushStart || itemsWrittenInThisFlush > 0 || queuedTypeAheadTurns.length > 0);
+        // A type-ahead follow-up must not be written onto a degraded model while
+        // the pool is exhausted and a preferred-model reset is still pending.
+        // The enqueue-time latch only sees the pane frame, which the degraded
+        // CLI drops on returning to its composer, so re-check the pool state at
+        // the write edge (the controller is on the non-preferred model by now).
+        // Put the dequeued item back and stop this drain; the prompt-ready edge
+        // after the preferred relaunch re-drives the flush and writes it to core.
+        if (isTypeAhead
+          && traexAutoModelRuntimeEligible()
+          && traexAutoModelController?.awaitingPreferredModelReset()) {
+          pendingMessages.unshift(item);
+          holdDrainForPreferredReset = true;
+          log('Holding type-ahead input until the preferred-model reset; re-queuing');
+          // Re-drive after the preferred relaunch even if its prompt-ready edge
+          // is missed; the accessor flips false once the reset commits, releasing
+          // the held input. The retry no-ops while a timer is already armed.
+          retryTraexAutoModelAdmission();
+        }
         if (cliSubmissionInFlight?.item === item) {
           cliSubmissionInFlight.composerOwned = typedIntoComposer && promptReadyAtFlushStart
             && itemsWrittenInThisFlush === 0 && !isTypeAhead;
@@ -22024,12 +22043,8 @@ function sendToPty(
     // exhausted latch that outlives the queued pane (reselectPerTurn off)
     // must NOT tag later independent turns here — that would suppress message
     // merging and markNewTurn for the rest of the session.
-    // awaitingPreferredModelReset additionally holds a follow-up when the pool
-    // is exhausted on a degraded model even if the pane no longer paints the
-    // queue frame, so it cannot be type-ahead written onto the wrong model.
     ...((opts.queueAfterActiveTurn || (traexAutoModelRuntimeEligible()
-      && (traexAutoModelController?.capacityCurrentlyBlocking()
-        || traexAutoModelController?.awaitingPreferredModelReset())))
+      && traexAutoModelController?.capacityCurrentlyBlocking()))
       ? { queueAfterActiveTurn: true } : {}),
     ...(opts.replyTurnId ? { replyTurnId: opts.replyTurnId } : {}),
     ...(opts.codexAppDispatchId ? { codexAppDispatchId: opts.codexAppDispatchId } : {}),
