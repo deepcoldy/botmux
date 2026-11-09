@@ -189,11 +189,11 @@ describe('/close card delivery through the real session lifecycle', () => {
     await workerPool.closeSession(f.ds.session.sessionId);
     expect(setCodexAppThreadArchived).not.toHaveBeenCalled();
   });
-  it('patches a thread live card once without posting a second closed card', async () => {
+  it('patches a thread live card and also confirms below the /close message', async () => {
     const f = fixture({ streamCardId: 'om_live' });
     await f.close();
     expect(f.patch).toHaveBeenCalledExactlyOnceWith('app-close-command', 'om_live', expect.stringContaining('会话已关闭'), { beforeWrite: expect.any(Function) });
-    expect(f.reply).not.toHaveBeenCalled();
+    expect(f.reply).toHaveBeenCalledExactlyOnceWith('om_root', expect.stringContaining('会话已关闭'), 'interactive', 'app-close-command', 'om_command');
     expect(f.ephemeral).not.toHaveBeenCalled();
     expect(sessionStore.getSession(f.ds.session.sessionId)?.status).toBe('closed');
   });
@@ -229,7 +229,7 @@ describe('/close card delivery through the real session lifecycle', () => {
     expect(f.reply).not.toHaveBeenCalled();
   });
 
-  it('does not post a duplicate while the closing patch waits behind an in-flight update', async () => {
+  it('confirms once while the closing patch waits behind an in-flight update', async () => {
     const f = fixture({ streamCardId: 'om_live' });
     let release!: () => void;
     f.patch.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }) as any);
@@ -237,7 +237,7 @@ describe('/close card delivery through the real session lifecycle', () => {
       workerPool.scheduleCardPatch(f.ds, 'working');
       await f.close();
       expect(f.patch).toHaveBeenCalledTimes(1);
-      expect(f.reply).not.toHaveBeenCalled();
+      expect(f.reply).toHaveBeenCalledTimes(1);
       release();
       await vi.waitFor(() => expect(f.patch).toHaveBeenCalledTimes(2));
       expect(f.patch).toHaveBeenLastCalledWith('app-close-command', 'om_live', expect.stringContaining('会话已关闭'), { beforeWrite: expect.any(Function) });
