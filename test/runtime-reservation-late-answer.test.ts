@@ -22,7 +22,7 @@ import { sameWorker } from '../src/services/session-contract.js';
 import { isTransientStartupFailure } from '../src/core/worker-startup-retry.js';
 import { chatSafeFatalErrorMessage } from '../src/core/startup-failure-reason.js';
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
-import { saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs } from '../src/services/unsent-input-journal.js';
+import { appendUnsentInputs, saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs } from '../src/services/unsent-input-journal.js';
 import {
   RUNTIME_RESERVATION_DEADLINE_MS,
   RUNTIME_RESERVATION_UNCONFIRMED,
@@ -96,6 +96,24 @@ function reattachingWorker(store: SessionContractStore, index: number, daemon: (
   };
 }
 
+/** One worker of session-1 with `pendingMessages` queued: its real fatal exit
+ *  and unsent-input journal hand-off. `tookPredecessorInputs` is a worker whose
+ *  init got as far as taking its predecessor's inputs back. */
+function exitingWorker(data: string, pendingMessages: unknown[], tookPredecessorInputs = false) {
+  const env: any = { process: { env: { SESSION_DATA_DIR: data }, exit: vi.fn(), pid: process.pid, kill: vi.fn() },
+    sessionId: 'session-1', join, lastInitConfig: { cliId: 'claude-code' }, isCodexAppCliId,
+    appendUnsentInputs, saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs, pendingMessages, restoredUnsentInputs: new Set(),
+    predecessorUnsentInputsTaken: tookPredecessorInputs, appendedUnsentInputs: new WeakSet(),
+    log: vi.fn(), send: vi.fn(), t: (key: string) => key, fatalWorkerErrorPending: false,
+    pendingLaunchConvergence: undefined, activeRestartAttemptId: undefined,
+    currentBotmuxTurnId: undefined, currentBotmuxDispatchAttempt: undefined,
+    sendAndFlush: vi.fn(async () => {}), chatSafeFatalErrorMessage, sandboxNamespaceDiagnosis: () => undefined };
+  env.unsentInputJournalPath = loadWorkerFunction('unsentInputJournalPath', env);
+  env.saveUnsentInputsForSuccessor = loadWorkerFunction('saveUnsentInputsForSuccessor', env);
+  env.takeUnsentInputsFromPredecessor = loadWorkerFunction('takeUnsentInputsFromPredecessor', env);
+  return { env, fatal: loadWorkerFunction<(error: unknown) => Promise<void>>('sendFatalWorkerErrorAndExit', env) };
+}
+
 describe('a CLI start waiting on the daemon to confirm its runtime reservation', () => {
   it('the re-attach that lands at the live-worker cap, answered last by a busy daemon, still starts its CLI', async () => {
     vi.useFakeTimers();
@@ -137,32 +155,80 @@ describe('a CLI start waiting on the daemon to confirm its runtime reservation',
 
   it('the inputs queued behind a start that expired unanswered are typed by the next worker', async () => {
     const data = scratch();
-    const fatalScope = (pendingMessages: unknown[]) => {
-      const env: any = { process: { env: { SESSION_DATA_DIR: data }, exit: vi.fn(), pid: process.pid, kill: vi.fn() },
-        sessionId: 'session-1', join, lastInitConfig: { cliId: 'claude-code' }, isCodexAppCliId,
-        saveUnsentInputs, settleTakenUnsentInputs, takeUnsentInputs, pendingMessages, restoredUnsentInputs: new Set(),
-        log: vi.fn(), send: vi.fn(), t: (key: string) => key, fatalWorkerErrorPending: false,
-        pendingLaunchConvergence: undefined, activeRestartAttemptId: undefined,
-        currentBotmuxTurnId: undefined, currentBotmuxDispatchAttempt: undefined,
-        sendAndFlush: vi.fn(async () => {}), chatSafeFatalErrorMessage, sandboxNamespaceDiagnosis: () => undefined };
-      env.unsentInputJournalPath = loadWorkerFunction('unsentInputJournalPath', env);
-      env.saveUnsentInputsForSuccessor = loadWorkerFunction('saveUnsentInputsForSuccessor', env);
-      env.takeUnsentInputsFromPredecessor = loadWorkerFunction('takeUnsentInputsFromPredecessor', env);
-      return { env, fatal: loadWorkerFunction<(error: unknown) => Promise<void>>('sendFatalWorkerErrorAndExit', env) };
-    };
-
-    const otherFailure = fatalScope([{ content: 'queued behind a broken launch', turnId: 'om_broken' }]);
+    const otherFailure = exitingWorker(data, [{ content: 'queued behind a broken launch', turnId: 'om_broken' }]);
     await otherFailure.fatal(new Error('claude: command not found'));
-    expect(fatalScope([]).env.takeUnsentInputsFromPredecessor({ cliId: 'claude-code' })).toEqual([]);
+    expect(exitingWorker(data, []).env.takeUnsentInputsFromPredecessor({ cliId: 'claude-code' })).toEqual([]);
 
-    const expired = fatalScope([{ content: 'asked while the start waited', turnId: 'om_waiting' }]);
+    const expired = exitingWorker(data, [{ content: 'asked while the start waited', turnId: 'om_waiting' }]);
     await expired.fatal(new RuntimeReservationExpiredError());
     expect(expired.env.process.exit).toHaveBeenCalledWith(1);
     expect(expired.env.sendAndFlush).toHaveBeenCalledWith(expect.objectContaining({
       type: 'error', message: expect.stringContaining(RUNTIME_RESERVATION_UNCONFIRMED),
     }));
-    const successor = fatalScope([]);
+    const successor = exitingWorker(data, []);
     expect(successor.env.takeUnsentInputsFromPredecessor({ cliId: 'claude-code' }).map((input: any) => input.content))
       .toEqual(['asked while the start waited']);
+  });
+
+  it('what the restart saved survives starts that expire before taking it back, one after another, ahead of what they queued', async () => {
+    const data = scratch();
+    exitingWorker(data, [{ content: 'queued when the daemon restarted', turnId: 'om_restart' }], true)
+      .env.saveUnsentInputsForSuccessor('parent exit');
+    await exitingWorker(data, [{ content: 'asked while the first retry waited', turnId: 'om_first' }])
+      .fatal(new RuntimeReservationExpiredError());
+    await exitingWorker(data, []).fatal(new RuntimeReservationExpiredError());
+
+    const started = exitingWorker(data, []);
+    expect(started.env.takeUnsentInputsFromPredecessor({ cliId: 'claude-code' }).map((input: any) => input.content))
+      .toEqual(['queued when the daemon restarted', 'asked while the first retry waited']);
+    expect(started.env.send).not.toHaveBeenCalled();
+  });
+
+  it('a worker that took the inputs back hands the ones it never typed in on once, not as unconfirmed', async () => {
+    const data = scratch();
+    exitingWorker(data, [{ content: 'queued when the daemon restarted', turnId: 'om_restart' }], true)
+      .env.saveUnsentInputsForSuccessor('parent exit');
+    const restored = exitingWorker(data, []);
+    restored.env.pendingMessages.push(...restored.env.takeUnsentInputsFromPredecessor({ cliId: 'claude-code' }));
+    await restored.fatal(new RuntimeReservationExpiredError());
+
+    const next = exitingWorker(data, []);
+    expect(next.env.takeUnsentInputsFromPredecessor({ cliId: 'claude-code' }).map((input: any) => input.content))
+      .toEqual(['queued when the daemon restarted']);
+    expect(next.env.send).not.toHaveBeenCalled();
+  });
+
+  it('a fatal exit cut short by the parent exit hands each queued input on once, including one that arrived in between', async () => {
+    const data = scratch();
+    exitingWorker(data, [{ content: 'queued when the daemon restarted', turnId: 'om_restart' }], true)
+      .env.saveUnsentInputsForSuccessor('parent exit');
+    const expiring = exitingWorker(data, [{ content: 'asked while the start waited', turnId: 'om_waiting' }]);
+    let delivered!: () => void;
+    expiring.env.sendAndFlush = vi.fn(() => new Promise<void>(resolve => { delivered = resolve; }));
+    const fatal = expiring.fatal(new RuntimeReservationExpiredError());
+    expiring.env.pendingMessages.push({ content: 'asked while the error was on its way', turnId: 'om_between' });
+    expiring.env.saveUnsentInputsForSuccessor('IPC disconnect');
+    delivered(); await fatal;
+
+    expect(exitingWorker(data, []).env.takeUnsentInputsFromPredecessor({ cliId: 'claude-code' }).map((input: any) => input.content))
+      .toEqual(['queued when the daemon restarted', 'asked while the start waited', 'asked while the error was on its way']);
+  });
+
+  it('an input queued behind a start that expired a day after the last save is delivered; only the day-old one is reported', async () => {
+    vi.useFakeTimers();
+    const data = scratch();
+    vi.setSystemTime(0);
+    exitingWorker(data, [{ content: 'queued at suspend', turnId: 'om_old' }], true).env.saveUnsentInputsForSuccessor('suspend');
+    vi.setSystemTime(30 * 60 * 60 * 1000);
+    await exitingWorker(data, [{ content: 'asked while the resume waited', turnId: 'om_fresh' }]).fatal(new RuntimeReservationExpiredError());
+    vi.setSystemTime(30 * 60 * 60 * 1000 + 5 * 60 * 1000);
+
+    const next = exitingWorker(data, []);
+    next.env.t = (key: string, params: unknown) => `${key} ${JSON.stringify(params)}`;
+    expect(next.env.takeUnsentInputsFromPredecessor({ cliId: 'claude-code' }).map((input: any) => input.content))
+      .toEqual(['asked while the resume waited']);
+    expect(next.env.send).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      type: 'user_notify', message: 'worker.unsent_inputs_expired {"count":1}', turnId: 'om_old',
+    }));
   });
 });
