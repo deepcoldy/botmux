@@ -54,7 +54,10 @@ describe('canvas native resolution for the release matrix', () => {
     const expected = realpathSync(installedNative(suffix!));
     const fetch = vi.fn();
     vi.stubGlobal('fetch', fetch);
-    await expect(resolveCanvasSkiaNative(platform, arch, libc, { repoRoot: root, tempRoot: root })).resolves.toBe(expected);
+    // Bun 的 require.resolve 返回未展开的软链路径，而 expected 取了 realpath；
+    // TMPDIR 本身可能是软链（botmux 会话、macOS 默认临时目录），两边都 realpath 再比。
+    const resolved = await resolveCanvasSkiaNative(platform, arch, libc, { repoRoot: root, tempRoot: root });
+    expect(realpathSync(resolved)).toBe(expected);
     expect(fetch).not.toHaveBeenCalled();
   });
 

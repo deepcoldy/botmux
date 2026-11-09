@@ -44,6 +44,10 @@ export async function resolveCanvasSkiaNative(platform, arch, libc, { repoRoot =
     execFileSync('tar', ['-xzf', archive, '-C', directory], { stdio: 'pipe' });
     const native = join(directory, 'package', skiaName);
     if (!existsSync(native)) throw new Error(`${pkg}@${version} has no ${skiaName} in its tarball`);
+    // 成功路径刻意不回收 directory：返回的 .node 路径交给 makeNativeEmbedPlugin，
+    // 后者在 Bun.build 期间读取它，编译完成前删除会导致嵌入失败。失败路径才
+    // 立即清理。要回收得由拥有整个构建生命周期的 buildOne 在 Bun.build resolve
+    // 之后统一做——现状未做，本地 --all 每个目标会留下约 30MB（CI runner 即用即弃）。
     return native;
   } catch (error) {
     rmSync(directory, { recursive: true, force: true });
