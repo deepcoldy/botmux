@@ -96,8 +96,11 @@ import {
   __testOnly_setSuspendBackingVerifier,
   __testOnly_canSafelyReclaimWorkerForInstallChange,
   __testOnly_runPendingSuspendIfSettled,
+  __testOnly_resetOrdinaryImDeliveries,
   requestInstallChangeSuspend,
   sweepTraexInstallChanges,
+  sendWorkerInput,
+  hasPendingOrdinaryImInput,
 } from '../src/core/worker-pool.js';
 import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
 import type { DaemonSession } from '../src/core/types.js';
@@ -257,11 +260,19 @@ describe('requestInstallChangeSuspend', () => {
   });
 
   it('does not suspend while the generation still owns a background task, then does after it ends', () => {
-    const { entry, identity } = tempEntry();
-    const ds = makeDs();
+    const { entry, identity } = tempEntry('release-new');
+    // The worker runs the OLD image; the install entry already names the new
+    // one. A claim must carry that exact stale object or the fresh
+    // re-validation would (correctly) treat it as reverted.
+    const stale = { ...identity, ino: `${Number(identity.ino) + 1}`, source: 'linux-proc-exe' as const };
+    const ds = makeDs({
+      localProcessAttestation: {
+        backendType: 'tmux', credentialIsolated: false, cliExe: stale, cliInstallEntry: entry, cliSpawnGeneration: 1,
+      },
+    });
     const worker = ds.worker as any;
     ds.backgroundTaskCount = 1;
-    requestInstallChangeSuspend(ds, detail(entry, identity, identity), { tryNow: true });
+    requestInstallChangeSuspend(ds, detail(entry, stale, identity), { tryNow: true });
     expect(worker.send).not.toHaveBeenCalledWith({ type: 'suspend' });
     expect(ds.pendingSuspendReason).toBe('cli_install_changed');
 
@@ -366,10 +377,18 @@ describe('attestation fences', () => {
 
 describe('final delivery retry edge', () => {
   it('waits for an in-flight final answer, then reclaims when the delivery settles', () => {
-    const ds = makeDs();
+    const { entry, identity } = tempEntry('release-new');
+    const stale = { ...identity, ino: `${Number(identity.ino) + 1}`, source: 'linux-proc-exe' as const };
+    const ds = makeDs({
+      localProcessAttestation: {
+        backendType: 'tmux', credentialIsolated: false, cliExe: stale, cliInstallEntry: entry, cliSpawnGeneration: 1,
+      },
+    });
     const worker = ds.worker as any;
-    ds.pendingSuspendReason = 'cli_install_changed';
-    ds.pendingSuspendGeneration = ds.workerGeneration;
+    // A real claim (not just the reason string): the strict safe-reclaim
+    // predicate only applies to install claims, so the final-delivery guard
+    // has to be exercised through the same path production uses.
+    requestInstallChangeSuspend(ds, detail(entry, stale, identity), { tryNow: false });
     const finish = beginFinalOutputDelivery(ds, 'turn-1');
 
     __testOnly_runPendingSuspendIfSettled(ds);
@@ -378,5 +397,94 @@ describe('final delivery retry edge', () => {
     finish();
     expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
     expect(ds.worker).toBeNull();
+  });
+});
+
+describe('independent review regressions', () => {
+  it('protects a TRAE turn the worker queue committed before the native PTY write', async () => {
+    __testOnly_resetOrdinaryImDeliveries();
+    const { entry, identity } = tempEntry('release-new');
+    const old = { ...identity, ino: `${Number(identity.ino) + 1}`, source: 'linux-proc-exe' as const };
+    const ds = makeDs({
+      localProcessAttestation: {
+        backendType: 'tmux', credentialIsolated: false, cliExe: old, cliInstallEntry: entry, cliSpawnGeneration: 1,
+      },
+    });
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    expect(sendWorkerInput(ds, 'queued native work', 'om_review_queued')).toBe(true);
+    expect(hasPendingOrdinaryImInput(ds)).toBe(true);
+    // TRAE's commit ACK means the worker QUEUE owns the turn; the asynchronous
+    // PTY flush has not run and the screen may still show a cached idle.
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_review_queued' });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(hasPendingOrdinaryImInput(ds)).toBe(false);
+    expect(ds.lastScreenStatus).toBe('idle');
+
+    requestInstallChangeSuspend(ds, detail(entry, old, identity), { tryNow: true });
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'suspend' });
+  });
+
+  it('releases the accepted-input guard only on the exact turn terminal', async () => {
+    __testOnly_resetOrdinaryImDeliveries();
+    const { entry, identity } = tempEntry('release-new');
+    const old = { ...identity, ino: `${Number(identity.ino) + 1}`, source: 'linux-proc-exe' as const };
+    const ds = makeDs({
+      localProcessAttestation: {
+        backendType: 'tmux', credentialIsolated: false, cliExe: old, cliInstallEntry: entry, cliSpawnGeneration: 1,
+      },
+    });
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker);
+    expect(sendWorkerInput(ds, 'queued native work', 'om_review_queued')).toBe(true);
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_review_queued' });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    requestInstallChangeSuspend(ds, detail(entry, old, identity), { tryNow: false });
+
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'suspend' });
+
+    // The turn finishes: the guard releases and the queued reclaim proceeds.
+    worker.emit('message', { type: 'turn_terminal', turnId: 'om_review_queued', sessionId: ds.session.sessionId });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
+  });
+
+  it('must not suspend a replacement CLI for the old spawn install-change claim', () => {
+    const { entry, identity } = tempEntry('release-new');
+    const old = { ...identity, ino: `${Number(identity.ino) + 1}`, source: 'linux-proc-exe' as const };
+    const ds = makeDs({
+      lastScreenStatus: 'working',
+      localProcessAttestation: {
+        backendType: 'tmux', credentialIsolated: false, cliExe: old, cliInstallEntry: entry, cliSpawnGeneration: 1,
+      },
+    });
+    const worker = ds.worker as any;
+    requestInstallChangeSuspend(ds, detail(entry, old, identity), { tryNow: true });
+    // In-worker restart: the worker generation is unchanged, its CLI becomes current.
+    ds.localProcessAttestation = {
+      backendType: 'tmux', credentialIsolated: false, cliExe: identity, cliInstallEntry: entry, cliSpawnGeneration: 2,
+    };
+    ds.lastScreenStatus = 'idle';
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'suspend' });
+  });
+
+  it('must cancel an install-change claim if the selected install reverts before idle', () => {
+    const { entry, identity } = tempEntry('selected-old-release');
+    const changed = { ...identity, ino: `${Number(identity.ino) + 1}`, source: 'install-stat' as const };
+    const ds = makeDs({
+      lastScreenStatus: 'working',
+      localProcessAttestation: {
+        backendType: 'tmux', credentialIsolated: false, cliExe: identity, cliInstallEntry: entry, cliSpawnGeneration: 1,
+      },
+    });
+    const worker = ds.worker as any;
+    requestInstallChangeSuspend(ds, detail(entry, identity, changed), { tryNow: true });
+    // The selected entry names the old image again before the turn completes.
+    ds.lastScreenStatus = 'idle';
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'suspend' });
   });
 });

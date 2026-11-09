@@ -27,7 +27,10 @@ export type TraexInstallUnknownReason =
   | 'no-attestation'
   | 'running-identity-unknown'
   | 'install-entry-unknown'
-  | 'install-entry-missing';
+  | 'install-entry-missing'
+  /** The two stats are not provably the same physical object (different
+   *  device / unproven bind or overlay mapping). Never auto-reclaim. */
+  | 'identity-unprovable';
 
 export type TraexInstallObservation =
   | { state: 'not-traex' }
@@ -70,12 +73,9 @@ export function observeTraexInstall(
   if (!entry) return { state: 'unknown', reason: 'install-entry-unknown' };
   const install = cachedInstallIdentity(entry, now);
   if (!install) return { state: 'unknown', reason: 'install-entry-missing', entry };
-  return {
-    state: compareRunningToInstall(running, install) === 'stale' ? 'stale' : 'current',
-    entry,
-    running,
-    install,
-  };
+  const comparison = compareRunningToInstall(running, install);
+  if (comparison === 'unknown') return { state: 'unknown', reason: 'identity-unprovable', entry };
+  return { state: comparison, entry, running, install };
 }
 
 /** Unit-test seam: the cache is daemon-wide by design, so tests that change a

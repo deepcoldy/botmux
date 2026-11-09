@@ -17,8 +17,10 @@ import {
   compareRunningToInstall,
   readRunningExeIdentity,
   resolveInstallIdentity,
+  sameExecutableObject,
   type ExecutableIdentity,
 } from '../src/services/cli-install-identity.js';
+import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 
 const children: ChildProcess[] = [];
 const dirs: string[] = [];
@@ -55,8 +57,11 @@ describe('compareRunningToInstall', () => {
     expect(compareRunningToInstall(identity(), identity({ source: 'linux-proc-exe' }))).toBe('current');
   });
 
-  it('ignores dev so bind/overlay aliases do not look stale', () => {
-    expect(compareRunningToInstall(identity({ dev: '2' }), identity({ dev: '7' }))).toBe('current');
+  it('is unknown when the device differs: an alias must be proven, not guessed', () => {
+    // Inode numbers are only unique per filesystem. A bind/overlay/scratch view
+    // may name the same backing file, but that mapping is unproven here, so it
+    // must never be reported as `current` (nor as `stale`, which would churn).
+    expect(compareRunningToInstall(identity({ dev: '2' }), identity({ dev: '7' }))).toBe('unknown');
   });
 
   it('is stale when the inode changed (path re-pointed by an upgrade)', () => {
@@ -155,5 +160,35 @@ describe('readRunningExeIdentity', () => {
     expect(readRunningExeIdentity(0)).toBeUndefined();
     expect(readRunningExeIdentity(-1)).toBeUndefined();
     expect(readRunningExeIdentity(Number.NaN)).toBeUndefined();
+  });
+
+  it('refuses to pair the exe with a different process birth', async () => {
+    const dir = tempDir();
+    const cli = join(dir, 'traex');
+    copyFileSync('/bin/sleep', cli);
+    const child = spawn(cli, ['30'], { stdio: 'ignore' });
+    children.push(child);
+    await new Promise<void>((resolve, reject) => {
+      child.once('spawn', () => resolve());
+      child.once('error', reject);
+    });
+
+    // The pid is alive, but the caller's attested birth token names some other
+    // process: a reused pid must not authorize a reclaim of this one.
+    expect(readRunningExeIdentity(child.pid!, 'birth-of-another-process')).toBeUndefined();
+    // The real birth token still binds the exe read to this one process.
+    const birth = readProcessStartIdentity(child.pid!);
+    expect(birth).toBeDefined();
+    expect(readRunningExeIdentity(child.pid!, birth)).toBeDefined();
+  });
+});
+
+describe('sameExecutableObject', () => {
+  it('requires the same dev:ino and unchanged metadata', () => {
+    expect(sameExecutableObject(identity(), identity({ source: 'linux-proc-exe' }))).toBe(true);
+    expect(sameExecutableObject(identity({ dev: '2' }), identity())).toBe(false);
+    expect(sameExecutableObject(identity({ ino: '200' }), identity())).toBe(false);
+    expect(sameExecutableObject(identity({ size: '999' }), identity())).toBe(false);
+    expect(sameExecutableObject(undefined, identity())).toBe(false);
   });
 });

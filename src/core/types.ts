@@ -733,6 +733,30 @@ export interface DaemonSession {
    *  read-isolation switch suspended first) survives into the NEXT generation
    *  and suspends it on its first idle. See clearPendingSuspendClaim. */
   pendingSuspendGeneration?: number;
+  /** Exact running CLI an install-change reclaim was requested for. The claim
+   *  is re-validated immediately before the suspend: an in-worker CLI restart
+   *  (same worker generation, new spawn), a reverted install entry, or an
+   *  unprovable identity must not consume it against the replacement.
+   *  In-memory only, like the queued suspend it belongs to. */
+  pendingSuspendInstallClaim?: {
+    entry: string;
+    running: import('../services/cli-install-identity.js').ExecutableIdentity;
+    workerGeneration: number;
+    cliSpawnGeneration?: number;
+    cliPid?: number;
+    cliProcStart?: string;
+  };
+  /** Turns a live worker has ACCEPTED but not yet finished, keyed by turnId.
+   *  `turn_input_committed` only proves the worker queue took ownership — the
+   *  native PTY flush is asynchronous and the turn has not run yet. Keeping
+   *  this responsibility until the exact turn reaches a terminal/rejection
+   *  stops an install-change reclaim from destroying accepted work while the
+   *  screen still shows a cached idle. Cleared when the worker generation ends. */
+  acceptedInputTurns?: Map<string, {
+    workerGeneration: number;
+    phase: 'queue-commit' | 'native-submit';
+    at: number;
+  }>;
   /** Executor-observed Codex settings for this worker/rollout generation. */
   codexServiceTier?: CodexServiceTierSnapshot;
   /** Tier change arrived while a card POST was in-flight. */

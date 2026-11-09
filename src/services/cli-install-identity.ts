@@ -1,13 +1,18 @@
 import { readlinkSync, realpathSync, statSync } from 'node:fs';
 
+import { readProcessStartIdentity } from '../utils/process-identity.js';
+
 /**
  * Identity of one executable file, precise enough to tell "the process is
  * still running the binary that was on disk when it started" apart from "the
  * install was replaced under it".
  *
- * `dev` is deliberately NOT part of the comparison: a bind mount / overlay
- * view can present the same file under a different device id, while inode,
- * size and mtime describe the same content. See `compareRunningToInstall`.
+ * `dev` IS part of the comparison. Inode numbers are only unique within one
+ * filesystem, so dropping the device id would let an unrelated filesystem's
+ * inode look like the same object. A different device is `unknown` rather than
+ * `current`: a bind/overlay view may still name the same backing file, but
+ * that mapping must be proven, not assumed, and an unprovable identity must
+ * never authorize an automatic reclaim.
  *
  * `path` is diagnostic only (it is what `readlink`/`realpath` reported); it
  * must never be compared, because an upgrade rewrites the symlink target.
@@ -61,23 +66,53 @@ function statIdentity(
  *
  * Other platforms return `undefined` (unknown). macOS has no equivalent proven
  * source here, and the caller must not auto-reclaim on an unknown identity.
+ *
+ * `expectedProcStart` is the birth token already attested for this pid. The pid
+ * can be reused between a previous read and this stat, so the identity is only
+ * returned when the process birth is the same before and after the exe read —
+ * and matches the caller's expectation when one is supplied. Sending this over
+ * private IPC is not proof on its own; the read has to be bound to one process.
  */
-export function readRunningExeIdentity(pid: number): ExecutableIdentity | undefined {
+export function readRunningExeIdentity(
+  pid: number,
+  expectedProcStart?: string,
+): ExecutableIdentity | undefined {
   if (process.platform !== 'linux') return undefined;
   if (!Number.isSafeInteger(pid) || pid <= 1) return undefined;
   const procLink = `/proc/${pid}/exe`;
+  const before = readProcessStartIdentity(pid);
+  if (!before) return undefined;
+  if (expectedProcStart !== undefined && before !== expectedProcStart) return undefined;
   try {
     // Diagnostic text only. Once the old install is unlinked the link reads
     // `/path/to/old (deleted)`; the file itself is still reachable through the
     // magic link, so we stat the link (not the stripped text path).
     const link = readlinkSync(procLink);
     const path = link.endsWith(DELETED_SUFFIX) ? link.slice(0, -DELETED_SUFFIX.length) : link;
-    return statIdentity(procLink, 'linux-proc-exe', path);
+    const identity = statIdentity(procLink, 'linux-proc-exe', path);
+    if (!identity) return undefined;
+    // A pid reused between the two reads would otherwise pair one process's
+    // birth token with another process's executable.
+    return readProcessStartIdentity(pid) === before ? identity : undefined;
   } catch {
     // The process is gone, or /proc is not readable for it. Unknown, never
     // "stale": an unreadable running identity must not trigger a reclaim.
     return undefined;
   }
+}
+
+/** Same physical object, with no "unknown" escape hatch: the device AND inode
+ *  must match and the metadata must be unchanged. Used to re-validate that a
+ *  previously attested running CLI is still the very object a claim named. */
+export function sameExecutableObject(
+  a: ExecutableIdentity | undefined,
+  b: ExecutableIdentity | undefined,
+): boolean {
+  if (!a || !b) return false;
+  return a.dev === b.dev
+    && a.ino === b.ino
+    && a.size === b.size
+    && a.mtimeNs === b.mtimeNs;
 }
 
 /**
@@ -98,23 +133,24 @@ export function resolveInstallIdentity(entryPath: string): ExecutableIdentity | 
  * Does the live process still run the executable that the install entry
  * currently names?
  *
+ * - device differs → the two stats are not provably the same physical object
+ *   (bind/overlay/scratch alias) → `unknown`, never `current`
  * - inode changed  → the process holds a different image → `stale`
  * - size/mtime changed on the same inode → the file was rewritten in place
  *   after the process mapped it → `stale`
  * - otherwise → `current`
  *
- * `dev` is intentionally ignored: bind mounts and overlayfs can expose the
- * same physical file with a different device number. Comparing it would turn
- * every aliased view into a false "stale" and cause exactly the churn this
- * mitigation exists to stop. A truly different filesystem with a colliding
- * inode AND identical size/mtime is not reachable through the same entry path
- * within one detection cycle.
+ * The device check is what makes `current` a physical claim instead of a
+ * same-numbers guess: inode numbers are only unique per filesystem. A proven
+ * launcher/sandbox source mapping can opt in later; until then an unprovable
+ * view stays `unknown` and is skipped by the automatic reclaim.
  */
 export function compareRunningToInstall(
   running: ExecutableIdentity | undefined,
   install: ExecutableIdentity | undefined,
 ): ExecutableIdentityComparison {
   if (!running || !install) return 'unknown';
+  if (running.dev !== install.dev) return 'unknown';
   if (running.ino !== install.ino) return 'stale';
   if (running.size !== install.size || running.mtimeNs !== install.mtimeNs) return 'stale';
   return 'current';

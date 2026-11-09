@@ -33595,8 +33595,10 @@ function publishLocalProcessAttestation(
   // Actual running image of the TRAE leaf, read from the kernel. The initial
   // attestation names the bwrap/forge launcher, which is not traex and must not
   // be recorded; the leaf re-attestation (applyRealPid) fills this in.
+  // Bind the exe read to the birth token just read for this pid: a reused pid
+  // must not pair one process's birth with another process's image.
   const cliExe = lastInitConfig?.cliId === 'traex' && cliPid && isTraexProcess(cliPid)
-    ? readRunningExeIdentity(cliPid)
+    ? readRunningExeIdentity(cliPid, cliProcStart)
     : undefined;
   // The install entry this worker's adapter resolved at spawn. The daemon
   // re-resolves it later to detect a replacement under the running process;
