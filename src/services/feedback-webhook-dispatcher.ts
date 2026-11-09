@@ -166,6 +166,12 @@ export function startFeedbackWebhookDispatcher(options: {
       const claim = await store.tryClaimFeedbackOutbox({ now, limit: options.batchSize ?? 10, claimToken });
       if (!claim.done) return;
       const rows = claim.rows;
+      if (controller.signal.aborted) {
+        await Promise.all(rows.map(row => store!.tryRescheduleFeedbackOutbox(row.outboxId, claimToken, {
+          now, nextAttemptAt: now, error: 'webhook_stopped_before_request', permanent: false,
+        })));
+        return;
+      }
       await Promise.all(rows.map(async row => {
         try {
           const secret = options.readSecret(row.destination.secretRef);
@@ -216,6 +222,14 @@ export function startFeedbackWebhookDispatcher(options: {
     // deadline. Falls back to shutdownMs/5s only when called without a budget.
     const budget = timeoutMs ?? options.shutdownMs ?? 5_000;
     const pending = running;
-    if (pending && budget > 0) await Promise.race([pending, new Promise<void>(resolve => { setTimeout(resolve, budget); })]);
+    if (pending && budget > 0) {
+      let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          pending.catch(() => {}),
+          new Promise<void>(resolve => { deadlineTimer = setTimeout(resolve, budget); }),
+        ]);
+      } finally { if (deadlineTimer) clearTimeout(deadlineTimer); }
+    }
   } };
 }

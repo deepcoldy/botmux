@@ -74,6 +74,30 @@ const target = (port: number): PostgresTarget => ({
   tls: { mode: 'disable' }, connectTimeoutMs: 1000,
 });
 describe('BytePG feedback authentication', () => {
+  it('bounds authentication refresh and never reconnects or runs SQL after the caller times out', async () => {
+    const server = await gateway('expired');
+    let release!: (value: { value: string; generation: number }) => void;
+    let current = { value: 'old-token', generation: 0 };
+    const pool = feedbackPostgresPool({ ...target(server.port), connectTimeoutMs: 100 }, {
+      get: async () => current,
+      refresh: () => new Promise(resolve => { release = value => { current = value; resolve(value); }; }),
+    });
+    try {
+      const result = await Promise.race([
+        pool.query('SELECT 1').then(() => 'resolved', () => 'rejected'),
+        new Promise<string>(resolve => setTimeout(() => resolve('still-pending'), 500)),
+      ]);
+      expect(result).toBe('rejected');
+      release({ value: 'new-token', generation: 1 });
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(server.startups).toHaveLength(1);
+      expect(server.queries).toEqual([]);
+      await pool.query('SELECT 2');
+      expect(server.startups).toHaveLength(2);
+      expect(server.queries).toEqual(['SELECT 2']);
+    } finally { release?.({ value: 'new-token', generation: 1 }); await server.close(); await pool.end(); }
+  });
+
   it('bounds a stalled credential acquisition and never starts a handshake after timeout', async () => {
     const server = await gateway();
     let release!: (value: { value: string; generation: number }) => void;

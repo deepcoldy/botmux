@@ -18,6 +18,17 @@ export function feedbackPostgresPool(target: PostgresTarget, password: PostgresC
     return value.replace(/\\/g, '\\\\').replace(/\s/g, character => `\\${character}`);
   };
   const options = `-c search_path=${target.schema},pg_catalog`;
+  const waitForCredential = async <Result>(operation: Promise<Result>, timeoutMs: number): Promise<Result> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        operation,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('feedback_bytepg_credentials_timeout')), Math.max(1, timeoutMs));
+        }),
+      ]);
+    } finally { if (timer) clearTimeout(timer); }
+  };
   const credential: DynamicToken = { value: typeof password === 'string' ? password : '', generation: 0 };
   if (tokenMode && typeof password === 'string') validateToken(password);
   const rejectedGeneration = Symbol('bytepgRejectedGeneration');
@@ -49,17 +60,7 @@ export function feedbackPostgresPool(target: PostgresTarget, password: PostgresC
       this.connect = ((callback?: (error: Error) => void) => {
         const operation = async () => {
           if (typeof password === 'string') current = credential;
-          else {
-            let timer: ReturnType<typeof setTimeout> | undefined;
-            try {
-              current = await Promise.race([
-                password.get(),
-                new Promise<never>((_, reject) => {
-                  timer = setTimeout(() => reject(new Error('feedback_bytepg_credentials_timeout')), target.connectTimeoutMs);
-                }),
-              ]);
-            } finally { if (timer) clearTimeout(timer); }
-          }
+          else current = await waitForCredential(password.get(), target.connectTimeoutMs);
           wireOptions = `bytepg_compute_id=${tokenMode!.computeId} bytepg_auth_token=${validateToken(current.value)} ${options}`;
           await connect();
         };
@@ -92,11 +93,14 @@ export function feedbackPostgresPool(target: PostgresTarget, password: PostgresC
   if (tokenMode && typeof password !== 'string') {
     const originalConnect = pool.connect.bind(pool);
     const connect = async (): Promise<PoolClient> => {
+      const deadline = Date.now() + target.connectTimeoutMs;
       try { return await originalConnect(); }
       catch (error) {
         const generation = (error as { [rejectedGeneration]?: number })[rejectedGeneration];
         if (generation === undefined) throw error;
-        await password.refresh(generation);
+        if (Date.now() >= deadline) throw new Error('feedback_bytepg_credentials_timeout');
+        await waitForCredential(password.refresh(generation), deadline - Date.now());
+        if (Date.now() >= deadline) throw new Error('feedback_bytepg_credentials_timeout');
         return originalConnect();
       }
     };

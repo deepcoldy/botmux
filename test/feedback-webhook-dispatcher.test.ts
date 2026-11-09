@@ -63,6 +63,75 @@ describe('feedback webhook destination and secret safety', () => {
 });
 
 describe('feedback webhook attempt contract', () => {
+  it('keeps a recurring lazy opening single-flight and isolates its failure during bounded stop', async () => {
+    vi.useFakeTimers();
+    let rejectOpening!: (error: Error) => void;
+    const opening = new Promise<SkillFeedbackStore>((_, reject) => { rejectOpening = reject; });
+    let calls = 0;
+    const dispatcher = startFeedbackWebhookDispatcher({
+      store: () => ++calls === 1 ? Promise.reject(new Error('bootstrap-failed')) : opening,
+      readSecret: () => 'secret', intervalMs: 50,
+    });
+    try {
+      await dispatcher.ready;
+      await vi.advanceTimersByTimeAsync(1050);
+      expect(calls).toBe(2);
+      const stopping = dispatcher.stop(100);
+      rejectOpening(new Error('recurring-open-failed'));
+      await expect(stopping).resolves.toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { rejectOpening(new Error('test-finished')); vi.useRealTimers(); }
+  });
+
+  it('returns immediately from stop(0) while a recurring storage opening remains pending', async () => {
+    vi.useFakeTimers();
+    const opening = deferred<SkillFeedbackStore>();
+    let calls = 0;
+    const dispatcher = startFeedbackWebhookDispatcher({
+      store: () => ++calls === 1 ? Promise.reject(new Error('bootstrap-failed')) : opening.promise,
+      readSecret: () => 'secret', intervalMs: 50,
+    });
+    try {
+      await dispatcher.ready;
+      await vi.advanceTimersByTimeAsync(50);
+      expect(calls).toBe(2);
+      await dispatcher.stop(0);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { opening.resolve(undefined as unknown as SkillFeedbackStore); vi.useRealTimers(); }
+  });
+
+  it('releases a claim that completes after hard stop without dispatching or inventing an unknown outcome', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-late-claim-')); dirs.push(dir);
+    const db = await SkillFeedbackStore.open(dir);
+    db.recordTurnTerminal({ botAppId: 'app', sessionId: 's', turnId: 't', status: 'completed' });
+    db.recordTurnDelivery({
+      botAppId: 'app', sessionId: 's', turnId: 't', platform: 'lark', platformAppId: 'app', platformMessageId: 'm',
+      content: 'answer', cardMode: 'card', status: 'delivered',
+      webhookDestinations: [{ id: 'd', enabled: true, url: 'https://hook.example/x', eventTypes: ['turn.completed'], secretRef: 'secret' }],
+    });
+    const claimed = deferred<void>(), release = deferred<void>();
+    const original = db.tryClaimFeedbackOutbox.bind(db);
+    vi.spyOn(db, 'tryClaimFeedbackOutbox').mockImplementation(async input => {
+      const result = original(input);
+      claimed.resolve();
+      await release.promise;
+      return result;
+    });
+    const dispatcher = startFeedbackWebhookDispatcher({
+      store: db, readSecret: () => 'secret',
+      dispatch: async () => ({ kind: 'retry' as const, error: 'webhook_outcome_unknown' }),
+    });
+    try {
+      await claimed.promise;
+      await dispatcher.stop(0);
+      release.resolve();
+      await dispatcher.ready;
+      expect(db.listFeedbackOutbox()).toMatchObject([{ status: 'pending', lastError: 'webhook_stopped_before_request' }]);
+      await beginFeedbackMaintenance(dir, 'late-claim');
+      await expect(freezeFeedbackSource(dir, 'late-claim')).resolves.toBeUndefined();
+    } finally { release.resolve(); await dispatcher.stop(0); db.close(); }
+  });
+
   it('retries a failed storage bootstrap and delivers pending events without restarting', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-bootstrap-')); dirs.push(dir);
     const config = await readFeedbackStorageConfig(dir);
