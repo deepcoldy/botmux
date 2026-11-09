@@ -27,6 +27,7 @@ interface TurnRow {
   settled_at_ms: number | null;
   expires_at_ms: number;
   total_url_bytes: number;
+  registration_limited: number;
 }
 
 interface LinkRow {
@@ -60,6 +61,7 @@ function toRecord(row: TurnRow): LinkRefTurnRecord {
     lastActivityAtMs: row.last_activity_at_ms,
     ...(row.settled_at_ms === null ? {} : { settledAtMs: row.settled_at_ms }),
     expiresAtMs: row.expires_at_ms,
+    ...(row.registration_limited === 1 ? { registrationLimited: true } : {}),
   };
 }
 
@@ -115,6 +117,7 @@ export class LinkRefLedger {
         created_at_ms INTEGER NOT NULL, last_activity_at_ms INTEGER NOT NULL,
         settled_at_ms INTEGER, expires_at_ms INTEGER NOT NULL,
         total_url_bytes INTEGER NOT NULL DEFAULT 0,
+        registration_limited INTEGER NOT NULL DEFAULT 0 CHECK(registration_limited IN (0, 1)),
         PRIMARY KEY(app_id, session_id, turn_id, dispatch_attempt)
       );
       CREATE TABLE IF NOT EXISTS link_refs (
@@ -135,6 +138,14 @@ export class LinkRefLedger {
           REFERENCES link_ref_turns(app_id, session_id, turn_id, dispatch_attempt) ON DELETE CASCADE
       );
     `);
+    // Serialize the check and migration across daemon/worker connections.
+    // Old ledgers retain their turn identity, counters and URL mappings.
+    this.transaction(() => {
+      const columns = this.db.prepare('PRAGMA table_info(link_ref_turns)').all() as { name: string }[];
+      if (!columns.some(column => column.name === 'registration_limited')) {
+        this.db.exec('ALTER TABLE link_ref_turns ADD COLUMN registration_limited INTEGER NOT NULL DEFAULT 0 CHECK(registration_limited IN (0, 1))');
+      }
+    });
     chmodSync(path, 0o600);
   }
 
@@ -269,9 +280,10 @@ export class LinkRefLedger {
         totalBytes += bytes;
       }
       this.db.prepare(`
-        UPDATE link_ref_turns SET total_url_bytes = ?, last_activity_at_ms = ?, expires_at_ms = ?
+        UPDATE link_ref_turns SET total_url_bytes = ?, last_activity_at_ms = ?, expires_at_ms = ?,
+          registration_limited = CASE WHEN ? > 0 THEN 1 ELSE registration_limited END
         WHERE app_id = ? AND session_id = ? AND turn_id = ? AND dispatch_attempt = ?
-      `).run(totalBytes, this.now(), this.now() + LINK_REF_RETENTION_MS, ...keyParams(key));
+      `).run(totalBytes, this.now(), this.now() + LINK_REF_RETENTION_MS, filteredByLimit, ...keyParams(key));
       return {
         registered,
         deduplicated,

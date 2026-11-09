@@ -159,7 +159,7 @@ export function createLinkRefRuntime(
           limited: registration.filteredByLimit,
           ...(registration.failure ? { errorCode: registration.failure } : {}),
         });
-        const companion = renderLinkRefCompanion(registration.registered);
+        const companion = renderLinkRefCompanion(registration.registered, { limited: registration.filteredByLimit });
         return { ...(companion ? { companion } : {}), stats: extraction.stats };
       } catch (error) {
         recordDiagnostic({

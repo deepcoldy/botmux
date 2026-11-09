@@ -172,6 +172,42 @@ afterEach(async () => {
 });
 
 describe('LinkRef end-to-end URL integrity', () => {
+  it('delivers all 76 bold problem links from a large MCP result through the real final-send boundary', async () => {
+    const state = makeFixture();
+    const key: LinkRefTurnKey = { appId: state.appId, sessionId: state.sessionId,
+      turnId: state.turnId, dispatchAttempt: state.dispatchAttempt };
+    const detail = Array.from({ length: 76 }, (_, index) => ({
+      problemUrl: `${dacuBaseUrl}?region=0&previewId=218&problemId=${index + 1}`,
+      problemDetailUrl: `${dacuBaseUrl}?problemId=${index + 1}&previewId=218`,
+    }));
+    const diagnostics: LinkRefDiagnostic[] = [];
+    runtime = createLinkRefRuntime(state.dataDir, { onDiagnostic: event => diagnostics.push(event) });
+    setLinkRefRuntime(runtime);
+    runtime.registerSources({ key, mode: 'enabled', sources: [{
+      sourceType: 'mcp', kind: 'structured',
+      value: { data: { detail }, helpUrls: ['https://ops.example.test/a', 'https://ops.example.test/b'] },
+    }] });
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(sessionId => (
+      sessionId === state.sessionId ? {
+        session: { sessionId, status: 'active' }, larkAppId: state.appId,
+        managedTurnOrigin: { capability: 'ab'.repeat(32), turnId: state.turnId,
+          dispatchAttempt: state.dispatchAttempt, linkRefMode: 'enabled' },
+      } as never : undefined
+    ));
+    setIpcAuthSecret(hostSecret);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const body = detail.map((record, index) => `**[问题 ${index + 1}](${record.problemDetailUrl})**`).join('\n');
+    const sent = await runCli(state, [
+      'send', '--no-mention', '--response-kind', 'final', body,
+      ...detail.flatMap(record => ['--expected-link', record.problemDetailUrl]),
+    ], ipc.port);
+
+    expect(sent.code, sent.stderr).toBe(0);
+    expect(sent.providerRequests).toHaveLength(1);
+    for (const record of detail) expect(sent.providerRequests[0]).toContain(record.problemDetailUrl);
+    expect(diagnostics).toContainEqual(expect.objectContaining({ registered: 154, limited: 0 }));
+  });
+
   it('preserves registered URLs through authenticated final delivery without changing ordinary URLs', async () => {
     const state = makeFixture();
     const key: LinkRefTurnKey = {
