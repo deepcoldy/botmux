@@ -218,7 +218,16 @@ describe('PostgreSQL feedback integration', () => {
     expect(await store.listTurnCompletionEvents()).toHaveLength(1);
     const rows = await store.claimFeedbackOutbox({ now: Date.now() + 1000, limit: 10, claimToken: 'first' });
     expect(rows).toHaveLength(1);
+    await store.resetExpiredFeedbackOutboxClaims(Date.now() + 2000, 0);
+    expect(await store.listFeedbackOutbox()).toMatchObject([{ status: 'pending', lastError: 'webhook_stopped_before_request' }]);
+    await store.claimFeedbackOutbox({ now: Date.now() + 3000, limit: 10, claimToken: 'second' });
+    expect(await store.startFeedbackOutboxRequest(rows[0].outboxId, 'wrong')).toBe(false);
+    expect(await store.startFeedbackOutboxRequest(rows[0].outboxId, 'second')).toBe(true);
+    await store.resetExpiredFeedbackOutboxClaims(Date.now() + 4000, 0);
+    expect(await store.listFeedbackOutbox()).toMatchObject([{ status: 'pending', lastError: 'webhook_outcome_unknown:second' }]);
+    await store.claimFeedbackOutbox({ now: Date.now() + 5000, limit: 10, claimToken: 'first' });
     expect(await store.settleFeedbackOutboxDelivered(rows[0].outboxId, 'wrong', 200, new Date().toISOString())).toBe(false);
     expect(await store.settleFeedbackOutboxDelivered(rows[0].outboxId, 'first', 200, new Date().toISOString())).toBe(true);
+    expect(await store.listFeedbackOutbox()).toMatchObject([{ status: 'delivered', lastError: 'webhook_outcome_unknown:second' }]);
   });
 });

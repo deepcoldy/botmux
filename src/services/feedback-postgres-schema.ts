@@ -18,7 +18,18 @@ export function feedbackPostgresPool(target: PostgresTarget, password: PostgresC
     return value.replace(/\\/g, '\\\\').replace(/\s/g, character => `\\${character}`);
   };
   const options = `-c search_path=${target.schema},pg_catalog`;
-  let credential: DynamicToken = { value: typeof password === 'string' ? password : '', generation: 0 };
+  const waitForCredential = async <Result>(operation: Promise<Result>, timeoutMs: number): Promise<Result> => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([
+        operation,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('feedback_bytepg_credentials_timeout')), Math.max(1, timeoutMs));
+        }),
+      ]);
+    } finally { if (timer) clearTimeout(timer); }
+  };
+  const credential: DynamicToken = { value: typeof password === 'string' ? password : '', generation: 0 };
   if (tokenMode && typeof password === 'string') validateToken(password);
   const rejectedGeneration = Symbol('bytepgRejectedGeneration');
   let effectiveUser = target.user;
@@ -33,8 +44,8 @@ export function feedbackPostgresPool(target: PostgresTarget, password: PostgresC
   class BytePgClient extends Client {
     constructor(config?: ClientConfig) {
       super(config);
-      const current = credential;
-      const wireOptions = `bytepg_compute_id=${tokenMode!.computeId} bytepg_auth_token=${validateToken(current.value)} ${options}`;
+      let current = credential;
+      let wireOptions = '';
       const sanitize = (value: unknown): Error => {
         const error = new Error('feedback_bytepg_connection_or_query_failed');
         const code = (value as { code?: unknown } | undefined)?.code;
@@ -45,6 +56,18 @@ export function feedbackPostgresPool(target: PostgresTarget, password: PostgresC
       };
       const parameters = (this as unknown as { connectionParameters: Record<string, unknown> }).connectionParameters;
       Object.defineProperty(parameters, 'options', { configurable: true, enumerable: false, get: () => wireOptions });
+      const connect = this.connect.bind(this);
+      this.connect = ((callback?: (error: Error) => void) => {
+        const operation = async () => {
+          if (typeof password === 'string') current = credential;
+          else current = await waitForCredential(password.get(), target.connectTimeoutMs);
+          wireOptions = `bytepg_compute_id=${tokenMode!.computeId} bytepg_auth_token=${validateToken(current.value)} ${options}`;
+          await connect();
+        };
+        const pending = operation();
+        if (!callback) return pending;
+        void pending.then(() => callback(undefined as unknown as Error), error => callback(error));
+      }) as Client['connect'];
       const connection = (this as unknown as { connection: { on: (...args: any[]) => unknown; emit: (...args: any[]) => boolean } }).connection;
       const emit = connection.emit.bind(connection);
       connection.emit = (event: string, ...args: unknown[]) => {
@@ -70,14 +93,14 @@ export function feedbackPostgresPool(target: PostgresTarget, password: PostgresC
   if (tokenMode && typeof password !== 'string') {
     const originalConnect = pool.connect.bind(pool);
     const connect = async (): Promise<PoolClient> => {
-      credential = await password.get();
-      validateToken(credential.value);
+      const deadline = Date.now() + target.connectTimeoutMs;
       try { return await originalConnect(); }
       catch (error) {
         const generation = (error as { [rejectedGeneration]?: number })[rejectedGeneration];
         if (generation === undefined) throw error;
-        credential = await password.refresh(generation);
-        validateToken(credential.value);
+        if (Date.now() >= deadline) throw new Error('feedback_bytepg_credentials_timeout');
+        await waitForCredential(password.refresh(generation), deadline - Date.now());
+        if (Date.now() >= deadline) throw new Error('feedback_bytepg_credentials_timeout');
         return originalConnect();
       }
     };
