@@ -12128,12 +12128,19 @@ function sendOrdinaryImDeliveryTracked(
   ensurePrincipalLaneInboundTurnBinding(ds, turnId, workerGeneration!);
   const key = ordinaryImDeliveryKey(ds, turnId, workerGeneration!);
   if (pendingOrdinaryImDeliveries.has(key)) return true;
+  // This tracked route sends directly to the worker, bypassing
+  // sendWorkerSessionInput. Admit before freezing the retry payload so the
+  // worker can publish this turn's identity before native execution begins.
+  const controller = controllerForSession(ds);
+  const admitted = controller && message.type === 'message'
+    ? { ...message, sessionCommand: { version: 2 as const, execution: controller.admitInput(turnId, message.dispatchAttempt) } }
+    : message;
   const record: OrdinaryImDelivery = {
     key,
     ds,
     worker,
     workerGeneration: workerGeneration!,
-    message,
+    message: admitted,
     turnId,
     attempt: 0,
     received: false,
