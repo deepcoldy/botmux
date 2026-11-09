@@ -796,6 +796,9 @@ sandbox 内也可以用 \`--into <om_话题根消息id>\` 往已有话题追加�
 重新查询该根消息实际所在的群，必须与目标群（默认当前会话群，或
 \`--chat-id\` 指定的群）一致才会投递，否则返回 \`dispatch_chat_mismatch\`。
 
+往话题追加时，该话题里已关闭的会话默认会自动接上（上下文都在）；人手动关闭的（\`/close\`、卡片关闭、dashboard 关闭、\`botmux delete\`）除外，会另开新会话。
+想强制另开新会话（不相干的事、或不想继承之前思路的独立评审）加 \`--session-mode fresh\`，\`--session-mode resume\` 为默认行为。
+
 \`--top-level\` 模式下不会附加"发送给：@xxx / cc：xxx" 那行 footer（顶层广播没有特定收件人）。oncall 寻址也会跳过。
 
 ## 参数

@@ -2939,6 +2939,7 @@ export function reactivateClosedSession(
   const next: Session = { ...session };
   next.status = 'active';
   next.closedAt = undefined;
+  next.userClosedAt = undefined;
   next.backgroundExecutionCleanupClosedAt = undefined;
   next.lastMessageAt = new Date().toISOString();
   next.codexAppDispatchLedger = undefined;
