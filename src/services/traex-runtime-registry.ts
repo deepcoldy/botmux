@@ -61,6 +61,10 @@ export interface TraexRuntimeOccupant {
   /** The operator pinned this runtime to an explicit old executable. It still
    *  occupies the domain and passes the gate; it is never auto-switched. */
   fixedPath?: boolean;
+  /** Registered from an already-alive runtime this worker did not exec
+   *  (adopt/reattach/endpoint). It is never superseded by a later new exec from
+   *  the same worker pid: it describes a different process. */
+  occupancyOnly?: boolean;
   createdAt: number;
   heartbeatAt: number;
   leaseUntil: number;
@@ -84,11 +88,13 @@ export interface TraexStartRequest {
   daemonPid: number;
   daemonStart?: string;
   fixedPath?: boolean;
-  /** Register occupancy without demanding compatibility. Used for runtimes that
-   *  are not started by this worker (adopt/reattach/wrapper/forge) but can
-   *  still write the shared cache: they occupy as unknown and never authorize
-   *  an incompatible start. */
+  /** Register occupancy without demanding compatibility. Used ONLY for runtimes
+   *  that are already alive and were not started by this worker
+   *  (adopt/reattach/existing endpoint). New execs — including wrapper/forge —
+   *  must NOT set this. */
   force?: boolean;
+  /** Marks the record as an already-alive runtime (see TraexRuntimeOccupant). */
+  occupancyOnly?: boolean;
   now?: number;
 }
 
@@ -169,6 +175,7 @@ function normalizeOccupant(value: unknown): TraexRuntimeOccupant | undefined {
     ...(typeof v.cliStart === 'string' ? { cliStart: v.cliStart } : {}),
     ...(typeof v.bootId === 'string' ? { bootId: v.bootId } : {}),
     ...(v.fixedPath === true ? { fixedPath: true } : {}),
+    ...(v.occupancyOnly === true ? { occupancyOnly: true } : {}),
     createdAt: typeof v.createdAt === 'number' ? v.createdAt : 0,
     heartbeatAt: typeof v.heartbeatAt === 'number' ? v.heartbeatAt : 0,
     leaseUntil: typeof v.leaseUntil === 'number' ? v.leaseUntil : 0,
@@ -286,6 +293,7 @@ function supersedableSameOwner(
   occupant: TraexRuntimeOccupant,
   request: TraexStartRequest,
 ): boolean {
+  if (occupant.occupancyOnly === true) return false;
   if (occupant.workerPid !== request.workerPid) return false;
   if ((occupant.workerStart ?? undefined) !== (request.workerStart ?? undefined)) return false;
   if (occupant.phase !== 'starting') return false;
@@ -385,6 +393,7 @@ export async function acquireTraexRuntimeStart(
       ...(request.daemonStart ? { daemonStart: request.daemonStart } : {}),
       ...(bootId ? { bootId } : {}),
       ...(request.fixedPath ? { fixedPath: true } : {}),
+      ...(request.occupancyOnly ? { occupancyOnly: true } : {}),
       createdAt: now,
       heartbeatAt: now,
       leaseUntil: now + TRAEX_RUNTIME_LEASE_MS,

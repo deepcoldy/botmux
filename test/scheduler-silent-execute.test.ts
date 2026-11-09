@@ -1992,3 +1992,66 @@ describe('task-position restart recovery', () => {
     expect(daemonActiveSessions.size).toBe(0);
   });
 });
+
+import * as realScheduler from '../src/core/scheduler.js';
+describe('independent PR2 round2 schedule admission', () => {
+  it('does not fork when the production dispatch marker returns false', async () => {
+    const active = new Map<string, DaemonSession>();
+    let persisted: boolean | undefined;
+    const outcome = await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active, refreshCliVersion, undefined,
+      {
+        runId: 'run-not-owned', turnId: 'schedule:task0001:stable',
+        // Exact daemon callback shape: the durable result is returned, and a
+        // failed/no-longer-owned write must abort the external send.
+        onBeforeDispatch: turnId => {
+          persisted = realScheduler.markDeferredTargetDispatching(
+            'task0001', 'run-not-owned', CHAT, turnId, APP,
+          );
+          return persisted;
+        },
+      },
+    );
+    expect(persisted).toBe(false);
+    expect(outcome).toBe('deferred');
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(sendWorkerInputMock).not.toHaveBeenCalled();
+  });
+});
+
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { precheckTraexRuntime as realRuntimePrecheck } from '../src/services/traex-runtime-gate.js';
+describe('independent PR2 round2 unknown schedule gate', () => {
+  it('keeps a run waiting when the actual registry cannot be read', async () => {
+    const isolated = mkdtempSync(join(tmpdir(), 'pr2-schedule-unknown-'));
+    const home = join(isolated, 'home');
+    const release = join(isolated, 'release');
+    mkdirSync(join(home, 'skills'), { recursive: true });
+    mkdirSync(release);
+    writeFileSync(join(home, 'skills', '.botmux-traex-runtime.json'), '{broken');
+    writeFileSync(join(release, 'traex'), 'fake-executable');
+    const priorHome = process.env.TRAE_HOME;
+    const priorId = BOT.config.cliId;
+    const priorPath = BOT.config.cliPathOverride;
+    try {
+      process.env.TRAE_HOME = home;
+      BOT.config.cliId = 'traex';
+      (BOT.config as any).cliPathOverride = join(release, 'traex');
+      expect(realRuntimePrecheck({ traeHome: home, releaseDir: release }).state).toBe('unknown');
+      const outcome = await executeScheduledTask(
+        baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+        new Map(), refreshCliVersion, undefined,
+        { runId: 'run-unknown', turnId: 'schedule:task0001:unknown' },
+      );
+      expect(outcome).toBe('deferred');
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+    } finally {
+      if (priorHome === undefined) delete process.env.TRAE_HOME;
+      else process.env.TRAE_HOME = priorHome;
+      BOT.config.cliId = priorId;
+      BOT.config.cliPathOverride = priorPath;
+      rmSync(isolated, { recursive: true, force: true });
+    }
+  });
+});

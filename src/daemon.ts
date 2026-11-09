@@ -35846,7 +35846,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                     onBeforeDispatch: turnId => {
                       // Persist `dispatching` before the input can reach a
                       // worker: a crash after this point is never auto-replayed.
-                      scheduler.markDeferredTargetDispatching(
+                      // Return the durable result — `executeScheduledTask` must
+                      // stop before any fork/send when the write did not land.
+                      return scheduler.markDeferredTargetDispatching(
                         task.id, executionContext.runId, targetTask.chatId!, turnId, effectiveAppId,
                       );
                     },

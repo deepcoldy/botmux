@@ -4571,8 +4571,10 @@ export async function executeScheduledTask(
      *  retry is the same logical turn and cannot double-deliver a target. */
     turnId?: string;
     /** Called immediately before the input is handed to a worker, after the
-     *  caller persisted the target's `dispatching` state. */
-    onBeforeDispatch?: (turnId: string) => void | Promise<void>;
+     *  caller persisted the target's `dispatching` state. Returning `false`
+     *  means that durable admission did not land; the fire must stop before any
+     *  fork/send and report `deferred` instead of a false success. */
+    onBeforeDispatch?: (turnId: string) => boolean | void | Promise<boolean | void>;
   },
 ): Promise<'dispatched' | 'deferred'> {
   // Resolve which bot to use — prefer the task's original bot so replies come from
@@ -4648,13 +4650,26 @@ export async function executeScheduledTask(
   // target when a chat-scope session already has another turn queued.
   const scheduledTurnId = runtime?.turnId ?? `schedule:${task.id}:${randomUUID()}`;
   let dispatchPersisted = false;
+  /** A refused durable admission (the scheduler could not persist `dispatching`)
+   *  must stop this fire before any fork/send. */
+  let dispatchRefused = false;
   /** Persist the target's `dispatching` state once, immediately before the
    *  first real dispatch attempt. A later fallback within the same turn reuses
-   *  the same turn id and needs no second write. */
-  const persistDispatch = async (): Promise<void> => {
-    if (dispatchPersisted) return;
+   *  the same turn id and needs no second write. Returns false when the write
+   *  did not land; every fork/send path must then abort. */
+  const persistDispatch = async (): Promise<boolean> => {
+    if (dispatchPersisted) return true;
+    const admitted = await runtime?.onBeforeDispatch?.(scheduledTurnId);
+    if (admitted === false) {
+      logger.warn(
+        `[scheduler] Task "${task.name}" (${task.id}) dispatch refused: `
+        + 'durable admission did not persist',
+      );
+      dispatchRefused = true;
+      return false;
+    }
     dispatchPersisted = true;
-    await runtime?.onBeforeDispatch?.(scheduledTurnId);
+    return true;
   };
   const scheduledTrustedCaller = trustedCallerForScheduledTask(task, larkAppId);
   const rawTopicTitle = task.topicTitle?.trim();
@@ -5071,7 +5086,8 @@ export async function executeScheduledTask(
             // this is the steady-state path for a recurring task (first fire
             // creates the session, every later fire injects into it), so the
             // failure shape would be "worked once, silently identity-less after".
-            await persistDispatch();
+            // A refused durable admission must stop before the IPC send.
+            if (!(await persistDispatch())) return;
             if (sendWorkerInput(
               existing,
               input,
@@ -5090,7 +5106,7 @@ export async function executeScheduledTask(
           throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
         }
         try {
-          await persistDispatch();
+          if (!(await persistDispatch())) return;
           forkWorker(existing, input, { resume: existing.hasHistory, turnId: scheduledTurnId });
         } catch (err) {
           if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
@@ -5215,7 +5231,7 @@ export async function executeScheduledTask(
     rememberLastCliInput(ds, task.prompt, prompt, scheduledTurnId);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
     try {
-      await persistDispatch();
+      if (!(await persistDispatch())) return;
       forkWorker(ds, prompt, scheduledTurnId);
     } catch (err) {
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
@@ -5227,7 +5243,9 @@ export async function executeScheduledTask(
 
     logger.info(`[scheduler] Task "${task.name}" (${task.id}) spawned (session: ${session.sessionId}, scope: ${runtimeScope}, anchor: ${anchor}, continuation: ${isContinuation}${silent ? ', silent' : ''})`);
   });
-  return 'dispatched';
+  // A refused durable admission means nothing was sent; keep the run parked
+  // (with its original run/turn/prompt) instead of settling it as dispatched.
+  return dispatchRefused ? 'deferred' : 'dispatched';
 }
 
 /**
@@ -5235,8 +5253,9 @@ export async function executeScheduledTask(
  *
  * The worker gate immediately before exec remains the authority; this only
  * avoids creating a session/anchor/banner for a run that is certain to wait.
- * `unknown` deliberately proceeds: the worker holds the input itself, which is
- * better than refusing a start the gate might grant.
+ * `unknown` (registry unreadable/corrupt) ALSO defers: a run whose admission
+ * cannot be proven must not be settled as dispatched. The caller keeps the
+ * original run/turn/prompt and retries once the domain is readable.
  */
 function scheduledTraexRuntimeBlocker(
   bot: { config: Pick<BotConfig, 'cliId' | 'cliPathOverride'> },
@@ -5248,7 +5267,9 @@ function scheduledTraexRuntimeBlocker(
       releaseDir: releaseDirForExecutable(executablePath),
       executablePath,
     });
-    return check.state === 'blocked' ? check.detail : undefined;
+    if (check.state === 'blocked') return check.detail;
+    if (check.state === 'unknown') return `runtime registry unavailable: ${check.detail}`;
+    return undefined;
   } catch {
     // A missing/unresolvable binary is the worker's error to report; it must
     // not turn into an endless deferral here.

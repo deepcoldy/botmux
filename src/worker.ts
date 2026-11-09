@@ -508,7 +508,7 @@ import {
   clamp,
   resolveRenderDimensions,
 } from './utils/render-dimensions.js';
-import { bridgeSpecFor, createCliAdapterSync, locateOnPath, resolveCommandReal } from './adapters/cli/registry.js';
+import { bridgeSpecFor, createCliAdapterSync, locateOnPath, resolveCommandEntry, resolveCommandReal } from './adapters/cli/registry.js';
 import { parsePiInstallUpdatedNotice, readPiInstallVersion } from './adapters/cli/pi.js';
 import { cursorStopLeftParkedFollowUp } from './adapters/cli/cursor.js';
 import { cliAdapterBindsOwnershipPid } from './adapters/cli/ownership-pid.js';
@@ -25231,31 +25231,57 @@ async function spawnCliBody(
   };
   const traexRuntimeRelevant = effectiveCliId === 'traex' && !isRemoteBackendType(effectiveBackendType);
   // Runtimes this worker does not exec itself: an adopted pane, a persistent
-  // reattach, a wrapper/forge launcher, or an already-running app-server. They
-  // still write the shared cache, so they occupy the domain as unknown and
-  // must be waited out — never killed or retargeted.
-  const traexOccupancyOnly = traexRuntimeRelevant && (
+  // reattach, or an already-running app-server. They are ALREADY alive, so they
+  // may be registered beside an occupant as unknown — but never authorize a
+  // parallel start, and are never killed or retargeted.
+  const traexExistingRuntime = traexRuntimeRelevant && (
     cfg.adoptMode === true
     || willReattachPersistent
     || cfg.existingAppServerEndpoint !== undefined
-    || !!cfg.wrapperCli
+  );
+  // Wrapper/forge launchers are a NEW exec whose content identity this worker
+  // cannot hash. They must NOT borrow the existing-runtime registration bypass:
+  // an opaque new start has to pass the same compatibility gate (wait for every
+  // incompatible occupant to be proven gone) as a proven-content start.
+  const traexOpaqueNewExec = traexRuntimeRelevant && (
+    !!cfg.wrapperCli
     || cfg.cliLaunchMode === 'forge-traex'
   );
+  const traexOccupancyOnly = traexExistingRuntime || traexOpaqueNewExec;
   if (traexRuntimeRelevant) {
     const fixedPath = typeof cfg.cliPathOverride === 'string' && cfg.cliPathOverride.trim().length > 0;
+    // Two different facts:
+    //   - configuredEntry: the UPDATABLE operator/PATH entry. It must keep its
+    //     last alias so the install watcher can observe `current -> B` later.
+    //   - resolvedEntry: the physical leaf now, used for the release layout,
+    //     snapshot materialisation and exec.
     const configuredEntry = fixedPath
-      ? resolveCommandReal(cfg.cliPathOverride!.trim())
-      : resolveCommandReal('traex');
-    if (!isAbsolute(configuredEntry) || !existsSync(configuredEntry)) {
+      ? resolveCommandEntry(cfg.cliPathOverride!.trim())
+      : resolveCommandEntry('traex');
+    const resolvedEntry = resolveCommandReal(configuredEntry);
+    if (!isAbsolute(resolvedEntry) || !existsSync(resolvedEntry)) {
       // Nothing can exec; let the existing launch preflight report the missing
       // CLI instead of reserving a slot for a binary that does not exist.
-      log(`[traex-runtime] skipping gate: unresolved install entry ${configuredEntry}`);
+      log(`[traex-runtime] skipping gate: unresolved install entry ${resolvedEntry}`);
     } else {
       const workerStart = readProcessStartIdentity(process.pid);
       const daemon = daemonBirthIdentity();
+      // The shared cache is decided by the FINAL child env, not the worker's
+      // ambient TRAE_HOME. `envUnset` can remove TRAE_HOME (the CLI then falls
+      // back to $HOME/.trae) and a per-bot `env.TRAE_HOME` reaches only the
+      // child. The gate must reserve exactly the domain the CLI will write.
+      const gateTraeHome = resolveTraexChildHome({
+        baseEnv: process.env,
+        envPolicy: cfg.envPolicy,
+        envUnset: cfg.envUnset,
+        perBotEnv: botInjectedEnv(cfg.env, cfg.envPolicy, cfg.protectedMcpPolicy),
+        mojoEnv: effectiveBackendType === 'mojo'
+          ? (riffBackendConfig as EffectiveMojoConfig | undefined)?.env
+          : undefined,
+      });
       const common = {
-        traeHome: process.env.TRAE_HOME,
-        releaseDir: releaseDirForExecutable(configuredEntry),
+        traeHome: gateTraeHome,
+        releaseDir: releaseDirForExecutable(resolvedEntry),
         workerPid: process.pid,
         ...(workerStart ? { workerStart } : {}),
         daemonPid: daemon.daemonPid,
@@ -25275,32 +25301,51 @@ async function spawnCliBody(
           detail,
         });
       };
-      const gate = traexOccupancyOnly
+      const gateAbort = (): string | undefined => {
+        if (closeRequested) return 'worker-closing';
+        if (spawnGeneration !== cliSpawnGeneration) return 'spawn-superseded';
+        return undefined;
+      };
+      const gate = traexExistingRuntime
+        // Already alive: register as unknown beside an occupant, never authorize
+        // a parallel start.
         ? await acquireTraexRuntimeOccupancy({
             ...common,
             fixedPath,
+            existingRuntime: true,
           })
-        : await acquireTraexRuntimeLease({
-            ...common,
-            executablePath: configuredEntry,
-            fixedPath,
-            ...(fixedPath ? { fixedExecutablePath: configuredEntry } : {}),
-            // Always exec a frozen copy — including pinned and sandboxed
-            // launches. A pinned config stays untouched; only the runtime
-            // object is frozen so a switch between materialisation and exec
-            // cannot make this process load content it never registered.
-            materialize: true,
-            // Scratch is a session-private COW home: no cross-process domain.
-            coordinate: !scratchRequested,
-            waitMs: Number.POSITIVE_INFINITY,
-            pollMs: 500,
-            abort: () => {
-              if (closeRequested) return 'worker-closing';
-              if (spawnGeneration !== cliSpawnGeneration) return 'spawn-superseded';
-              return undefined;
-            },
-            onBlocked,
-          });
+        : traexOpaqueNewExec
+          // New opaque exec: same compatibility gate as a proven start. It may
+          // wait; it may not borrow the existing-runtime bypass.
+          ? await acquireTraexRuntimeOccupancy({
+              ...common,
+              fixedPath,
+              existingRuntime: false,
+              coordinate: !scratchRequested,
+              waitMs: Number.POSITIVE_INFINITY,
+              pollMs: 500,
+              abort: gateAbort,
+              onBlocked,
+            })
+          : await acquireTraexRuntimeLease({
+              ...common,
+              // Re-resolved on every wait iteration so A→B→C is observed rather
+              // than frozen to the release that was current when we arrived.
+              entryPath: configuredEntry,
+              fixedPath,
+              ...(fixedPath ? { fixedExecutablePath: resolvedEntry } : {}),
+              // Always exec a frozen copy — including pinned and sandboxed
+              // launches. A pinned config stays untouched; only the runtime
+              // object is frozen so a switch between materialisation and exec
+              // cannot make this process load content it never registered.
+              materialize: true,
+              // Scratch is a session-private COW home: no cross-process domain.
+              coordinate: !scratchRequested,
+              waitMs: Number.POSITIVE_INFINITY,
+              pollMs: 500,
+              abort: gateAbort,
+              onBlocked,
+            });
       if (gate.kind === 'aborted') throw new CliSpawnSupersededError();
       if (gate.kind === 'blocked') {
         throw new Error(`TRAE runtime gate stayed blocked: ${gate.detail}`);

@@ -17,7 +17,7 @@
  *   3. reserve `starting` in the registry (lock failure -> refuse)
  * Only after all three succeed may the caller exec the CLI.
  */
-import { statSync } from 'node:fs';
+import { realpathSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { readProcessStartIdentity } from '../utils/process-identity.js';
@@ -53,6 +53,12 @@ export interface TraexRuntimeGateInput {
   traeHome?: string;
   /** Directory holding `traex`, `traex-code-mode-host`, `trae-installation.json`. */
   releaseDir: string;
+  /** Updatable install entry (the operator-selected / PATH-resolved alias, NOT
+   *  realpath'd). When present the gate re-resolves it on every wait iteration,
+   *  so a symlink switched A→B while this start waits is materialised as B
+   *  instead of the release that happened to be current when the call began.
+   *  `releaseDir` is then ignored. */
+  entryPath?: string;
   /** Resolved leaf executable. When present it is the object whose content is
    *  hashed; `releaseDir` must be its directory. Keeping it explicit stops the
    *  gate from re-resolving a path that may have switched after the caller's
@@ -163,6 +169,17 @@ function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** Resolve the physical leaf, keeping the lexical path when the entry is gone.
+ *  The caller still materialises/hashes it, so a vanished entry fails closed
+ *  there instead of silently retargeting. */
+function realpathOrSelf(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+}
+
 function leaseFor(
   domain: TraexRuntimeDomain,
   snapshot: TraexRuntimeContent,
@@ -245,10 +262,31 @@ export async function acquireTraexRuntimeLease(
   const fixedExecutable = input.fixedPath === true
     ? (input.fixedExecutablePath ?? input.executablePath)
     : undefined;
-  const executablePath = fixedExecutable ?? input.executablePath;
-  const releaseDir = executablePath ? releaseDirForExecutable(executablePath) : input.releaseDir;
   const shouldMaterialize = input.materialize ?? true;
-  if (!shouldMaterialize && !executablePath) {
+  /**
+   * Resolve the object this attempt would exec. Called once per wait iteration
+   * when `entryPath` is given so a symlink switch (A→B→C) is observed instead
+   * of being frozen at the start of the wait. A pinned fixed path is never
+   * re-resolved: the operator chose that exact file.
+   */
+  const resolveLaunchTarget = (): { executablePath?: string; releaseDir: string } => {
+    if (fixedExecutable) {
+      return { executablePath: fixedExecutable, releaseDir: releaseDirForExecutable(fixedExecutable) };
+    }
+    if (input.entryPath) {
+      const resolved = realpathOrSelf(input.entryPath);
+      return { executablePath: resolved, releaseDir: releaseDirForExecutable(resolved) };
+    }
+    if (input.executablePath) {
+      return {
+        executablePath: input.executablePath,
+        releaseDir: releaseDirForExecutable(input.executablePath),
+      };
+    }
+    return { releaseDir: input.releaseDir };
+  };
+  const initialTarget = resolveLaunchTarget();
+  if (!shouldMaterialize && !initialTarget.executablePath) {
     return {
       kind: 'error',
       reason: 'snapshot-failed',
@@ -264,11 +302,11 @@ export async function acquireTraexRuntimeLease(
     try {
       const snapshot = shouldMaterialize
         ? await materializeTraexSnapshot({
-            releaseDir,
-            ...(executablePath ? { executablePath } : {}),
+            releaseDir: initialTarget.releaseDir,
+            ...(initialTarget.executablePath ? { executablePath: initialTarget.executablePath } : {}),
             snapshotsRoot: input.snapshotsRoot ?? defaultTraexSnapshotRoot(),
           })
-        : await captureTraexExecutableIdentity(executablePath!);
+        : await captureTraexExecutableIdentity(initialTarget.executablePath!);
       return {
         kind: 'granted',
         lease: {
@@ -317,16 +355,17 @@ export async function acquireTraexRuntimeLease(
     // where an upgrade lands) and re-materialise whenever it moved. The
     // registered `comboKey` therefore always names the bytes we are about to
     // exec, never the content that happened to be on disk earlier.
-    const currentSignature = computeTraexInstallSignature(releaseDir);
+    const target = resolveLaunchTarget();
+    const currentSignature = computeTraexInstallSignature(target.releaseDir);
     if (!snapshot || currentSignature !== snapshotSignature) {
       try {
         snapshot = shouldMaterialize
           ? await materializeTraexSnapshot({
-              releaseDir,
-              ...(executablePath ? { executablePath } : {}),
+              releaseDir: target.releaseDir,
+              ...(target.executablePath ? { executablePath: target.executablePath } : {}),
               snapshotsRoot: input.snapshotsRoot ?? defaultTraexSnapshotRoot(),
             })
-          : await captureTraexExecutableIdentity(executablePath!);
+          : await captureTraexExecutableIdentity(target.executablePath!);
         snapshotSignature = currentSignature;
         installSignature = currentSignature;
       } catch (err) {
@@ -381,23 +420,69 @@ export interface TraexRuntimeOccupancyInput {
   daemonPid: number;
   daemonStart?: string;
   fixedPath?: boolean;
+  /**
+   * `true` registers a runtime this worker did NOT exec: an adopted pane, a
+   * persistent reattach, or an already-running app-server endpoint. It may be
+   * registered beside an occupant because it is already alive; it is recorded
+   * as unknown so it blocks every later start.
+   *
+   * `false`/undefined authorizes a NEW exec whose content cannot be proven
+   * (wrapper/forge launchers). It is NOT exempt from the compatibility gate: an
+   * unknown new start must wait for every incompatible occupant to be proven
+   * gone, exactly like a proven-content start.
+   */
+  existingRuntime?: boolean;
+  /** `false` for a session-private cache (scratch COW): freeze nothing and take
+   *  no cross-process domain lease. */
+  coordinate?: boolean;
+  /** How long a new exec may wait for incompatible occupants to exit. 0 means a
+   *  single attempt; the caller then keeps its input and retries later. */
+  waitMs?: number;
+  pollMs?: number;
   now?: () => number;
+  onBlocked?: (blockers: TraexRuntimeBlocker[], detail: string) => void;
+  abort?: () => string | undefined;
+}
+
+function privateOccupancyLease(releaseDir: string): TraexRuntimeLease {
+  return {
+    occupantId: '',
+    domain: { domainKey: 'private', skillsDir: '', registryPath: '', lockPath: '' },
+    snapshot: { comboKey: '', dir: '', traexPath: releaseDir, reused: false, snapshot: false },
+    occupancyOnly: true,
+    async markRunning() { /* private cache: nothing to record */ },
+    async markUnknown() { /* private cache: nothing to record */ },
+    async heartbeat() { /* private cache: nothing to record */ },
+    async release() { /* private cache: nothing to record */ },
+    async abandon() { /* private cache: nothing to record */ },
+  };
 }
 
 /**
  * Reserve the domain for a runtime this worker did NOT exec.
  *
- * Adopted panes, persistent reattaches, wrapper/forge launchers and existing
- * app-server endpoints all end up writing the same physical skills cache, but
- * this worker cannot hash or replace what they run. They therefore occupy the
- * domain as UNKNOWN (`comboKey: ''`): they never authorize a parallel start,
- * and a newer content waits for them to be proven gone. They are never killed
- * or retargeted.
+ * Adopted panes, persistent reattaches and existing app-server endpoints are
+ * already running: they are registered as UNKNOWN (`comboKey: ''`) without
+ * demanding compatibility (`existingRuntime: true`). They never authorize a
+ * parallel start, and a newer content waits for them to be proven gone. They
+ * are never killed or retargeted.
+ *
+ * Wrapper/forge launchers are a NEW exec whose content cannot be hashed. They
+ * MUST NOT use the existing-runtime bypass: they pass through the same
+ * compatibility gate as a proven-content start, waiting for incompatible
+ * occupants. Otherwise a fresh opaque launcher could start beside a live old
+ * runtime and recreate the mixed-version cache this gate exists to prevent.
  */
 export async function acquireTraexRuntimeOccupancy(
   input: TraexRuntimeOccupancyInput,
 ): Promise<TraexGateAcquireResult> {
   const now = input.now ?? Date.now;
+  const coordinate = input.coordinate !== false;
+  if (!coordinate) {
+    const aborted = input.abort?.();
+    if (aborted) return { kind: 'aborted', reason: aborted };
+    return { kind: 'granted', lease: privateOccupancyLease(input.releaseDir) };
+  }
   const traeHome = input.traeHome ?? traexHomeForDomain();
   const resolution: TraexDomainResolution = resolveTraexRuntimeDomain(traeHome);
   if (resolution.kind !== 'ready') {
@@ -414,35 +499,55 @@ export async function acquireTraexRuntimeOccupancy(
     now(),
     Math.random().toString(36).slice(2, 10),
   ].join('-');
-  const decision = await acquireTraexRuntimeStart(domain, {
-    occupantId,
-    comboKey: '',
-    force: true,
-    workerPid: input.workerPid,
-    ...(input.workerStart ? { workerStart: input.workerStart } : {}),
-    daemonPid: input.daemonPid,
-    ...(input.daemonStart ? { daemonStart: input.daemonStart } : {}),
-    ...(input.fixedPath ? { fixedPath: true } : {}),
-    now: now(),
-  });
-  if (decision.decision === 'start') {
-    const snapshot: TraexRuntimeContent = {
+  const deadline = now() + Math.max(0, input.waitMs ?? 0);
+  const pollMs = Math.max(50, input.pollMs ?? 500);
+  let reportedSignature: string | undefined;
+  for (;;) {
+    const aborted = input.abort?.();
+    if (aborted) return { kind: 'aborted', reason: aborted };
+    const decision = await acquireTraexRuntimeStart(domain, {
+      occupantId,
       comboKey: '',
-      dir: '',
-      traexPath: input.releaseDir,
-      reused: false,
-      snapshot: false,
-    };
-    return { kind: 'granted', lease: leaseFor(domain, snapshot, occupantId, true) };
+      force: input.existingRuntime === true,
+      occupancyOnly: input.existingRuntime === true,
+      workerPid: input.workerPid,
+      ...(input.workerStart ? { workerStart: input.workerStart } : {}),
+      daemonPid: input.daemonPid,
+      ...(input.daemonStart ? { daemonStart: input.daemonStart } : {}),
+      ...(input.fixedPath ? { fixedPath: true } : {}),
+      now: now(),
+    });
+    if (decision.decision === 'start') {
+      const snapshot: TraexRuntimeContent = {
+        comboKey: '',
+        dir: '',
+        traexPath: input.releaseDir,
+        reused: false,
+        snapshot: false,
+      };
+      return { kind: 'granted', lease: leaseFor(domain, snapshot, occupantId, true) };
+    }
+    if (decision.decision === 'blocked') {
+      const signature = decision.blockers
+        .map((blocker) => `${blocker.occupantId}:${blocker.comboKey}:${blocker.phase}`)
+        .sort()
+        .join('|');
+      if (signature !== reportedSignature) {
+        reportedSignature = signature;
+        input.onBlocked?.(decision.blockers, describeTraexRuntimeBlockers(decision.blockers));
+      }
+      if (now() >= deadline) {
+        return {
+          kind: 'blocked',
+          blockers: decision.blockers,
+          detail: describeTraexRuntimeBlockers(decision.blockers),
+        };
+      }
+      await sleep(Math.min(pollMs, Math.max(0, deadline - now())));
+      continue;
+    }
+    return { kind: 'error', reason: decision.reason, detail: decision.detail };
   }
-  if (decision.decision === 'blocked') {
-    return {
-      kind: 'blocked',
-      blockers: decision.blockers,
-      detail: describeTraexRuntimeBlockers(decision.blockers),
-    };
-  }
-  return { kind: 'error', reason: decision.reason, detail: decision.detail };
 }
 
 export type TraexRuntimePrecheck =
