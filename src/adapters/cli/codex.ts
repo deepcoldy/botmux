@@ -18,10 +18,10 @@ import {
   findCodexSessionIdByBotmuxSessionId,
   type CodexDrainState,
 } from '../../services/codex-transcript.js';
-import { bindCodexSessionFromCorrelatedInput, codexFooterSessionId, codexNativeFooterRows, refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
+import { bindCodexSessionFromCorrelatedInput, codexFooterSessionId, codexNativeComposerState, codexNativeFooterRows, refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
-import { prepareCodexTranscriptInput } from '../../services/codex-transcript-input.js';
+import { codexTranscriptCloseable, prepareCodexTranscriptInput, settleCodexInputBox } from '../../services/codex-transcript-input.js';
 
 const CODEX_ACTIVE_BUSY_PATTERN = /Working[^\r\n]{0,160}esc to interrupt/i;
 const CODEX_STARTUP_READY_PATTERN = /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/;
@@ -592,6 +592,12 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     startupPendingPattern: /│[ \t]+(?:model|directory):[ \t]+loading\b/,
     startupReadyPattern: CODEX_STARTUP_READY_PATTERN,
     startupReadyFromHistory: restoredCodexHistoryReady,
+    // 0.166+ first paints a provisional `›` with no footer and only later the
+    // initialized composer; writeInput refuses anything but the latter, or a
+    // transcript pager it closes first.
+    inputBoxReady: state => codexNativeComposerState(state) === 'empty'
+      || codexTranscriptCloseable(state.viewport),
+    settleInputBox: settleCodexInputBox,
     startupResume: {
       historyPattern: /Earlier messages are available\s*—\s*press ctrl \+ t to view the full transcript/,
       isReady: resumedCodexPromptReady,

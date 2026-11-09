@@ -2412,6 +2412,8 @@ export const messages: Record<string, string> = {
   'worker.orca_composer_check_failed': 'Botmux 无法确认已 adopt 的 Orca 终端输入框是否为空，因此没有写入这条飞书消息。请确认 Orca 连接正常后重试。',
   'worker.transcriptLabel': '会话存储',
   'worker.submit_impossible': '⚠️ 刚才那条消息没有安全写入 {cliName}。\n原因：{reason}\n请处理上述原因并确认终端状态后再试。\n开头：{preview}',
+  'worker.first_write_input_box_held': '⚠️ {cliName} 启动超过 {seconds} 秒，输入框仍未就绪；排队的消息还没写入，输入框就绪后会自动发送。请在终端里检查是否有待处理的对话框或未发送的草稿。',
+  'worker.opening_input_held': '⏳ 消息暂未写入 {cliName}。\n原因：{reason}\n消息保留在队列中，输入框空出来后会自动发送，无需重发。',
   'worker.activation_submit_unconfirmed': '⚠️ 首条消息的提交尚未确认\n阶段：输入提交\n错误码：submit_unconfirmed\nBotMux 尚未在{transcriptLabel}确认 {cliName} 收到首条消息；它可能仍在执行或已经执行。后续消息会等待这条确认。\n请打开 Web 终端核对原输入与执行状态；若原输入仍未提交，请在终端完成提交。BotMux 会继续观察原提交回执，确认到达后自动释放队列。\n此时在飞书重发只会继续排队。若终端无法恢复，请关闭该会话后重新开始。\n原消息：{preview}',
   'worker.startup_command_dialog_pending': '⚠️ 启动命令 {command} 正在等待确认\n{cliName} 执行它时弹出了确认框，BotMux 不会替你选择；首条消息已暂存在队列中，尚未提交。\n请打开 Web 终端，在确认框里选择是否切换。选择之后，BotMux 会自动投递暂存的消息。',
   'worker.startup_command_unconfirmed': '⚠️ 启动命令 {command} 尚未确认执行\n{cliName} 在 {secs} 秒内没有留下执行记录，首条消息已暂存在队列中，尚未提交，避免和命令拼在一起。\n请打开 Web 终端查看：命令若仍停在输入框里，按回车执行即可。确认执行后，BotMux 会自动投递暂存的消息。',

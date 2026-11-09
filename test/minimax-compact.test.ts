@@ -268,7 +268,7 @@ it('queues a compact IPC while the ordinary input flush owns submission', async 
     isFlushing: true, currentBotmuxTurnId: 'business-turn',
     unattendedRawInputRefusal: () => undefined, discardDeploymentContinuation() {},
     refreshHookReviewInputHold() {}, hookReviewAdmissionScreen: () => '', nativeSessionForkPending: () => false,
-    firstWriteLivenessConfirmed: true, startupCommandAckHold: null,
+    firstWriteLivenessConfirmed: true, openingInputBoxSettled: true, startupCommandAckHold: null,
     sessionRenameInFlight: () => false, shouldHoldCodexRunnerInput: () => false,
     shouldDeferUserFlush: () => false, codexModelMigrationHoldsRawInput: () => false,
     freshnessInputQueue: { enqueueRaw: (msg: unknown) => worker.scope.pendingRawInputs.push(msg) },

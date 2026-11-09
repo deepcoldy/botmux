@@ -290,9 +290,14 @@ export function shouldReleaseFirstPromptTimeout(state: {
   elapsedMs: number;
   /** Absolute hard cap for keeping the first prompt queued. */
   hardTimeoutMs: number;
+  /** The adapter verified its empty input box on the backend's own screen.
+   *  The output pipe can attach after that box was drawn, so the readyPattern
+   *  the deferral waits for may never reach the stream. */
+  inputBoxReady?: boolean;
 }): boolean {
   if (!state.deferFirstPromptTimeoutUntilReady) return true;
   if (!state.hasReadyPattern) return true;
+  if (state.inputBoxReady === true) return true;
   return state.elapsedMs >= state.hardTimeoutMs;
 }
 
@@ -405,6 +410,11 @@ export function decideHardTimeoutAction(supportsTypeAhead: boolean): 'flush' | '
  * check (unchanged behavior). The first-prompt hard cap stays a real deadline:
  * past it the write goes through as before, so a stale readyPattern can delay
  * the first prompt but never trap it.
+ *
+ * An adapter that judges its own input box (inputBoxReady) outranks all of
+ * that: its writeInput refuses a box that is not empty, so a prompt marker, a
+ * ready signal or the hard cap would only turn a held first message into a
+ * rejected one. It stays queued until the box is ready.
  */
 export function decideFirstWriteLiveness(state: {
   readyPattern: RegExp | undefined;
@@ -414,7 +424,15 @@ export function decideFirstWriteLiveness(state: {
   readySignal: boolean;
   /** The spawn's first-prompt hard cap has elapsed. */
   hardCapReached: boolean;
-}): { write: boolean; reason: 'no-ready-pattern' | 'no-viewport' | 'ready-signal' | 'prompt-visible' | 'hard-cap' | 'prompt-not-visible' } {
+  /** The adapter's verdict on the backend's own input state; undefined when
+   *  the adapter or backend cannot judge it. */
+  inputBoxReady?: boolean;
+}): { write: boolean; reason: 'input-box-ready' | 'input-box-not-ready' | 'no-ready-pattern' | 'no-viewport' | 'ready-signal' | 'prompt-visible' | 'hard-cap' | 'prompt-not-visible' } {
+  if (state.inputBoxReady !== undefined) {
+    return state.inputBoxReady
+      ? { write: true, reason: 'input-box-ready' }
+      : { write: false, reason: 'input-box-not-ready' };
+  }
   if (!state.readyPattern) return { write: true, reason: 'no-ready-pattern' };
   if (state.readySignal) return { write: true, reason: 'ready-signal' };
   if (state.viewport === undefined) return { write: true, reason: 'no-viewport' };

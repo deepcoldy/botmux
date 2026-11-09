@@ -31,11 +31,12 @@ afterEach(() => {
 function terminal(initial = OVERLAY, options: {
   closeDelay?: number; receiptDelay?: number; hiddenDraft?: string; close?: boolean;
   closeResult?: 'false' | 'throw'; enterResult?: 'false' | 'throw';
-  redrawFrames?: number;
+  redrawFrames?: number; startupFrames?: number;
 } = {}) {
   let overlay: string | undefined = initial || undefined;
   let draft = options.hiddenDraft ?? '';
   let redrawLeft = options.redrawFrames ?? 0;
+  let startupLeft = options.startupFrames ?? 0;
   const executed: string[] = [];
   let rewinds = 0;
   const receipt = (text: string) => appendFileSync(join(home, 'history.jsonl'), `${JSON.stringify({ session_id: SID, text })}\n`);
@@ -70,6 +71,11 @@ function terminal(initial = OVERLAY, options: {
     sendSpecialKeys: vi.fn(() => enter()),
     captureInputState: vi.fn(() => {
       if (overlay) return { viewport: overlay, cursor: { x: 0, y: 0 } };
+      if (startupLeft > 0) {
+        startupLeft--;
+        // Codex 0.166 startup: the composer is painted before its footer.
+        return { viewport: '  >_ OpenAI Codex (v0.166.0)\n     /tmp/work\n\n\n› Ask Codex to do anything\n', cursor: { x: 2, y: 4 } };
+      }
       if (redrawLeft > 0) {
         redrawLeft--;
         return { viewport: 'Previous conversation\n› mid-redraw residual glyphs\n\n  model · /tmp · Ready\n', cursor: { x: 27, y: 1 } };
@@ -80,6 +86,7 @@ function terminal(initial = OVERLAY, options: {
   };
   return { target, executed, rewinds: () => rewinds, receipt,
     draft: () => draft, setDraft: (text: string) => { draft = text; },
+    redraw: (frames: number) => { redrawLeft = frames; },
     setOverlay: (text: string) => { overlay = text; } };
 }
 async function submit(target: PtyHandle) {
@@ -173,6 +180,109 @@ describe('Codex transcript submission boundary', () => {
     expect(t.target.write).not.toHaveBeenCalled();
     expect(t.target.submitBracketedPaste).not.toHaveBeenCalled();
     expect(t.executed).toEqual([]);
+  });
+
+  it('waits while startup paints the composer without its footer, then submits once', async () => {
+    const t = terminal('', { startupFrames: 20 });
+    expect(await submit(t.target)).toMatchObject({ submitted: true, ownershipProven: true });
+    expect(t.executed).toEqual([MESSAGE]);
+    expect(t.target.write).not.toHaveBeenCalled();
+    expect(t.target.submitBracketedPaste).toHaveBeenCalledExactlyOnceWith(MESSAGE);
+  });
+
+  it('does not take a draft-looking frame inside a redraw for a draft', async () => {
+    const t = terminal('', { startupFrames: 5, redrawFrames: 3 });
+    expect(await submit(t.target)).toMatchObject({ submitted: true });
+    expect(t.executed).toEqual([MESSAGE]);
+    expect(t.target.submitBracketedPaste).toHaveBeenCalledExactlyOnceWith(MESSAGE);
+  });
+
+  it('refuses a draft that persists after a redraw and leaves it intact', async () => {
+    const t = terminal('', { startupFrames: 3, hiddenDraft: 'human draft' });
+    let result: unknown;
+    const pending = createCodexAdapter().writeInput(t.target, MESSAGE).then(value => { result = value; });
+    await flushFakeTimers(400);
+    expect(result).toBeUndefined();
+    await flushFakeTimers(1000);
+    expect(result).toMatchObject({ submitted: false, failureReason: expect.stringContaining('existing draft') });
+    await pending;
+    expect(t.draft()).toBe('human draft');
+    expect(t.target.write).not.toHaveBeenCalled();
+    expect(t.target.submitBracketedPaste).not.toHaveBeenCalled();
+    expect(t.executed).toEqual([]);
+  });
+
+  it('refuses an input box that never settles only after a bounded wait', async () => {
+    const t = terminal('', { startupFrames: Number.POSITIVE_INFINITY });
+    let result: unknown;
+    const pending = createCodexAdapter().writeInput(t.target, MESSAGE).then(value => { result = value; });
+    await flushFakeTimers(1000);
+    expect(result).toBeUndefined();
+    await flushFakeTimers(6000);
+    expect(result).toMatchObject({ submitted: false, failureReason: expect.stringContaining('not at an empty input box') });
+    await pending;
+    expect(t.target.write).not.toHaveBeenCalled();
+    expect(t.target.submitBracketedPaste).not.toHaveBeenCalled();
+    expect(t.executed).toEqual([]);
+  });
+
+  it('aborts if the process is replaced while the input box settles', async () => {
+    const t = terminal('', { startupFrames: Number.POSITIVE_INFINITY });
+    setTimeout(() => { t.target.cliPid = 67890; }, 100);
+    let result: unknown;
+    const pending = createCodexAdapter().writeInput(t.target, MESSAGE).then(value => { result = value; });
+    await flushFakeTimers(300);
+    expect(result).toMatchObject({ submitted: false, failureReason: expect.stringContaining('process changed') });
+    await pending;
+    expect(t.target.submitBracketedPaste).not.toHaveBeenCalled();
+    expect(t.executed).toEqual([]);
+  });
+
+  it('lets the write after the opening check wait out a draft-looking redraw frame', async () => {
+    const t = terminal('');
+    const adapter = createCodexAdapter();
+    expect(await adapter.settleInputBox!(t.target)).toBeUndefined();
+    t.redraw(3);
+    expect(await submit(t.target)).toMatchObject({ submitted: true });
+    expect(t.executed).toEqual([MESSAGE]);
+    expect(t.target.submitBracketedPaste).toHaveBeenCalledExactlyOnceWith(MESSAGE);
+  });
+
+  it('still takes a draft-looking first frame as final without a fresh opening check', async () => {
+    const t = terminal('');
+    const adapter = createCodexAdapter();
+    expect(await adapter.settleInputBox!(t.target)).toBeUndefined();
+    await flushFakeTimers(1500);
+    t.redraw(3);
+    expect(await submit(t.target)).toMatchObject({ submitted: false, failureReason: expect.stringContaining('existing draft') });
+    expect(t.target.submitBracketedPaste).not.toHaveBeenCalled();
+    expect(t.executed).toEqual([]);
+  });
+
+  it('refuses a draft typed right after the opening check and leaves it intact', async () => {
+    const t = terminal('');
+    const adapter = createCodexAdapter();
+    expect(await adapter.settleInputBox!(t.target)).toBeUndefined();
+    t.setDraft('human draft');
+    let result: unknown;
+    const pending = adapter.writeInput(t.target, MESSAGE).then(value => { result = value; });
+    await flushFakeTimers(1000);
+    expect(result).toMatchObject({ submitted: false, failureReason: expect.stringContaining('existing draft') });
+    await pending;
+    expect(t.draft()).toBe('human draft');
+    expect(t.target.submitBracketedPaste).not.toHaveBeenCalled();
+    expect(t.executed).toEqual([]);
+  });
+
+  it('judges the box ready only at an initialized empty composer or a viewer it can close', () => {
+    const ready = createCodexAdapter().inputBoxReady!;
+    const composer = (text: string, x: number) => ({ viewport: `Previous conversation\n› ${text}\n  model · /tmp · Ready\n  ? for shortcuts\n`, cursor: { x, y: 1 } });
+    expect(ready(composer('Ask Codex to do anything', 2))).toBe(true);
+    expect(ready(composer('human draft', 13))).toBe(false);
+    expect(ready({ viewport: '  >_ OpenAI Codex (v0.166.0)\n     /tmp/work\n\n\n› Ask Codex to do anything\n', cursor: { x: 2, y: 4 } })).toBe(false);
+    expect(ready({ viewport: OVERLAY, cursor: { x: 0, y: 0 } })).toBe(true);
+    expect(ready({ viewport: OVERLAY_MODERN, cursor: { x: 0, y: 0 } })).toBe(true);
+    expect(ready({ viewport: OVERLAY.replace('q to quit', 'x to quit'), cursor: { x: 0, y: 0 } })).toBe(false);
   });
 
   it('does not guess a remapped close key', async () => {

@@ -3775,6 +3775,9 @@ let startupCommandAckHold: {
 let firstWriteLivenessConfirmed = true;
 /** The first write is currently held waiting for the prompt (release logging). */
 let firstWriteLivenessHeld = false;
+/** Per-spawn: the opening input passed the adapter's settleInputBox and left
+ *  the queue. Pre-set like firstWriteLivenessConfirmed. */
+let openingInputBoxSettled = true;
 let firstWriteSpawnedAtMs = 0;
 /** Any PTY output since this spawn started (ptyOutputGeneration is reset
  *  mid-spawn, so it cannot carry this). */
@@ -3830,6 +3833,8 @@ const FIRST_PROMPT_HARD_TIMEOUT_MS = CODEX_APP_CONTROL_STARTUP_TIMEOUT_MS;
  *  by FIRST_PROMPT_HARD_TIMEOUT_MS, so the hold stays observable but can never
  *  outlive the first-prompt budget. */
 const FIRST_PROMPT_STARTUP_RECHECK_MS = 5_000;
+/** Re-check cadence of the backend input box after a deferred soft timeout. */
+const FIRST_PROMPT_INPUT_BOX_RECHECK_MS = 1_000;
 
 // ─── Startup blockers (folder trust / sign-in / update dialogs) ─────────────
 /** How long a visibly blocked startup keeps re-probing its screen and keeps
@@ -5115,10 +5120,14 @@ function resetFirstWriteLiveness(skip: boolean): void {
   stopFirstWriteLivenessRecheck();
   firstWriteLivenessConfirmed = skip;
   firstWriteLivenessHeld = false;
+  openingInputBoxSettled = skip || !cliAdapter?.settleInputBox;
   firstWriteSpawnedAtMs = Date.now();
   ptyOutputSeenThisSpawn = false;
   firstWriteCaptureAtMs = 0;
   firstWriteCapturedViewport = undefined;
+  inputBoxStateAtMs = 0;
+  inputBoxReadyVerdict = undefined;
+  firstWriteHeldNoticeSent = false;
 }
 
 /** Minimum spacing of authoritative backend captures while the first write
@@ -5126,6 +5135,74 @@ function resetFirstWriteLiveness(skip: boolean): void {
 const FIRST_WRITE_CAPTURE_INTERVAL_MS = 1_000;
 let firstWriteCaptureAtMs = 0;
 let firstWriteCapturedViewport: string | undefined;
+
+/** Minimum spacing of input-state reads (cursor query + capture-pane) while
+ *  the screen sends no new bytes. */
+const INPUT_BOX_STATE_INTERVAL_MS = 1_000;
+/** Re-check cadence for a first write still held after the hard cap: by then
+ *  a dialog or a human draft owns the box, not a startup redraw. */
+const FIRST_WRITE_HELD_POLL_MS = 5_000;
+let inputBoxStateAtMs = 0;
+let inputBoxReadyVerdict: boolean | undefined;
+let firstWriteHeldNoticeSent = false;
+
+/** RPC input never touches the input box, so it keeps the readyPattern gate. */
+function inputBoxJudgeable(): boolean {
+  return !!cliAdapter?.inputBoxReady && !!backend?.captureInputState && !codexRpcEngine
+    && backendScreenEvidenceIsAuthoritativeForMutation();
+}
+
+/** The adapter's own verdict on its input box, read from the backend's cells
+ *  and cursor (re-read after new output, else rate-limited). undefined when
+ *  the adapter or the backend cannot judge it, which leaves the readyPattern
+ *  evidence in charge. */
+function adapterInputBoxReady(): boolean | undefined {
+  if (!inputBoxJudgeable()) return undefined;
+  const now = Date.now();
+  if (lastPtyOutputAtMs >= inputBoxStateAtMs || now - inputBoxStateAtMs >= INPUT_BOX_STATE_INTERVAL_MS) {
+    inputBoxStateAtMs = now;
+    let state: ReturnType<NonNullable<SessionBackend['captureInputState']>> = null;
+    try { state = backend!.captureInputState!(); } catch { state = null; }
+    inputBoxReadyVerdict = !!state && cliAdapter!.inputBoxReady!(state);
+  }
+  return inputBoxReadyVerdict;
+}
+
+/** settleInputBox refused the opening input before it left the queue. Nothing
+ *  was dequeued or written, so it stays at the head; the first-write gate
+ *  closes again and re-drives the flush once the input box is ready. */
+function holdOpeningInput(reason: string): void {
+  log(`Holding opening input — ${reason} ${pendingMessages.length} input(s) stay queued`);
+  firstWriteLivenessConfirmed = false;
+  firstWriteLivenessHeld = true;
+  inputBoxStateAtMs = 0;
+  if (!firstWriteHeldNoticeSent) {
+    firstWriteHeldNoticeSent = true;
+    notifyHeldInput(t('worker.opening_input_held', { cliName: cliName(), reason }));
+  }
+  armFirstWriteLivenessRecheck();
+}
+
+function notifyHeldInput(message: string): void {
+  const head = pendingMessages[0];
+  send({
+    type: 'user_notify',
+    turnId: head?.turnId ?? currentBotmuxTurnId,
+    dispatchAttempt: head?.dispatchAttempt ?? currentBotmuxDispatchAttempt,
+    message,
+  });
+}
+
+function notifyFirstWriteHeldPastHardCap(): void {
+  // A startup still loading past the cap already told the thread.
+  if (firstWriteHeldNoticeSent || idleDetector?.isStartupPending()) return;
+  firstWriteHeldNoticeSent = true;
+  log(`WARN First write still held after ${FIRST_PROMPT_HARD_TIMEOUT_MS}ms — ${cliName()} input box is not ready; ${pendingMessages.length} input(s) stay queued`);
+  notifyHeldInput(t('worker.first_write_input_box_held', {
+    cliName: cliName(),
+    seconds: Math.round(FIRST_PROMPT_HARD_TIMEOUT_MS / 1000),
+  }));
+}
 
 /** The screen the first-write gate judges. The renderer only sees bytes that
  *  arrived after the output pipe attached; a CLI that drew its composer before
@@ -5168,8 +5245,20 @@ function armFirstWriteLivenessRecheck(): void {
   const tick = (): void => {
     firstWriteLivenessTimer = null;
     if (firstWriteLivenessConfirmed || backend !== be || cliSpawnGeneration !== generation) return;
+    // Nothing left to write (a stop drained it); the next input re-arms the gate.
+    if (!hasPendingInputForFlush() && hasRunStartupCommands) return;
     const now = Date.now();
     const pastHardCap = now - firstWriteSpawnedAtMs >= FIRST_PROMPT_HARD_TIMEOUT_MS;
+    const inputBoxReady = adapterInputBoxReady();
+    if (inputBoxReady !== undefined) {
+      // Judged on the backend's own cells and re-checked by the adapter right
+      // before it writes, so no render settle on top. A tick only re-reads the
+      // screen after new output or once a second.
+      if (inputBoxReady) void flushPending();
+      else if (pastHardCap) notifyFirstWriteHeldPastHardCap();
+      schedule(pastHardCap && !inputBoxReady ? FIRST_WRITE_HELD_POLL_MS : FIRST_WRITE_LIVENESS_POLL_MS);
+      return;
+    }
     if (!firstWriteScreen().promptVisible) {
       promptSeenAtMs = 0;
       if (pastHardCap) void flushPending();
@@ -5192,14 +5281,15 @@ function armFirstWriteLivenessRecheck(): void {
 function firstWriteMayProceed(): boolean {
   if (firstWriteLivenessConfirmed) return true;
   const elapsedMs = Date.now() - firstWriteSpawnedAtMs;
-  const screen = firstWriteScreen();
+  const inputBoxReady = adapterInputBoxReady();
   const verdict = decideFirstWriteLiveness({
     readyPattern: cliAdapter?.readyPattern,
-    viewport: screen.viewport,
+    viewport: inputBoxReady === undefined ? firstWriteScreen().viewport : undefined,
     // A direct ready command (dsh-tui) proves the input box; Claude-family
     // SessionStart only proves the startup selector is behind us.
     readySignal: sessionStartSignalAtMs !== undefined && !cliAdapter?.claudeDataDir,
     hardCapReached: elapsedMs >= FIRST_PROMPT_HARD_TIMEOUT_MS,
+    inputBoxReady,
   });
   if (verdict.write) {
     if (firstWriteLivenessHeld) log(`First write released after ${elapsedMs}ms (${verdict.reason})`);
@@ -5209,7 +5299,9 @@ function firstWriteMayProceed(): boolean {
     return true;
   }
   if (!firstWriteLivenessHeld) {
-    log(`Holding first write — ${cliName()} input prompt is not on screen yet (${ptyOutputSeenThisSpawn ? 'nothing matches its prompt' : 'no output yet'}); ${pendingMessages.length} input(s) stay queued`);
+    log(verdict.reason === 'input-box-not-ready'
+      ? `Holding first write — ${cliName()} input box is not ready yet; ${pendingMessages.length} input(s) stay queued`
+      : `Holding first write — ${cliName()} input prompt is not on screen yet (${ptyOutputSeenThisSpawn ? 'nothing matches its prompt' : 'no output yet'}); ${pendingMessages.length} input(s) stay queued`);
   }
   firstWriteLivenessHeld = true;
   armFirstWriteLivenessRecheck();
@@ -21068,6 +21160,12 @@ async function flushPending(): Promise<void> {
   isFlushing = true;
   const promptReadyAtFlushStart = isPromptReady;
   let itemsWrittenInThisFlush = 0;
+  // An input-box hold wrote nothing, so the CLI is as idle as this flush found
+  // it. Inputs that cannot type ahead (durable attempts) need that readiness
+  // back for the hold's re-check to reach them on a screen that stays silent.
+  const keepPromptReadyAfterHold = (): void => {
+    if (promptReadyAtFlushStart && itemsWrittenInThisFlush === 0) isPromptReady = true;
+  };
   let promptReadyDeferred = false;
   // The write of `item` settled: prompts on screen belong to the CLI again
   // and its bridge mark's TTL starts now.
@@ -21136,7 +21234,10 @@ async function flushPending(): Promise<void> {
     // First write of a fresh spawn: the CLI's input prompt must be on screen
     // before anything is typed (see decideFirstWriteLiveness). The queue stays
     // untouched; a poll re-drives this flush once the prompt has rendered.
-    if (!firstWriteMayProceed()) return;
+    if (!firstWriteMayProceed()) {
+      if (inputBoxJudgeable()) keepPromptReadyAfterHold();
+      return;
+    }
     // Type-ahead and first-prompt timeout paths can bypass markPromptReady.
     // Refresh here too, before dequeuing or publishing the input's authority.
     if (lastInitConfig?.cliId === 'codex') currentCodexObservedPid();
@@ -21258,6 +21359,23 @@ async function flushPending(): Promise<void> {
       if (activeTurnBlocks(pendingMessages[0]!)) break;
       if (traexAutoModelRuntimeEligible()
         && !(await admitTraexAutoModelPendingInput(pendingMessages[0]!))) break;
+      if (!openingInputBoxSettled) {
+        // writeInput would run the same check after this input is dequeued and
+        // its turn opened; a refusal there fails the input instead of keeping it.
+        if (cliAdapter.settleInputBox && inputBoxJudgeable() && !backend.submitTurn
+          && !(pendingMessages[0]!.codexAppInput && cliAdapter.writeStructuredInput)) {
+          const target: SessionBackend = backend;
+          const generation = cliSpawnGeneration;
+          const refused = await cliAdapter.settleInputBox(adapterInputHandle(target));
+          if (backend !== target || generation !== cliSpawnGeneration || cliRestartInProgress) break;
+          if (refused) {
+            keepPromptReadyAfterHold();
+            holdOpeningInput(refused);
+            break;
+          }
+        }
+        openingInputBoxSettled = true;
+      }
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
       // A follow-up turn must never be written onto a degraded model while the
@@ -22055,6 +22173,11 @@ async function flushPending(): Promise<void> {
           );
           if (!result.failureReason && result.recheck) {
             observeQueuedActivationReceipt(item, result.recheck);
+          } else if (result.failureReason && item.queuedActivationToken && !codexAppSafeNonSubmission) {
+            // The thread was just told this input was not written; follow-ups
+            // the daemon holds behind the activation would otherwise wait forever.
+            log(`Settled refused queued activation ${item.queuedActivationToken.substring(0, 8)}`);
+            acknowledgeQueuedActivation(item);
           }
         }
         // A missing history receipt is ambiguous, not proof that the input was
@@ -29540,6 +29663,29 @@ async function spawnCliBody(
     }
     return true;
   };
+  // The output pipe can attach after the CLI drew its input box; with no new
+  // bytes the readyPattern the deferral waits for never reaches the stream.
+  // Keep reading the backend's own cells and re-run the timeout as soon as the
+  // adapter sees its input box there. One watch chain at a time.
+  let firstPromptInputBoxWatch: ReturnType<typeof setTimeout> | null = null;
+  const watchFirstPromptInputBox = (elapsedMs: number): void => {
+    if (firstPromptInputBoxWatch) return;
+    const startedAt = Date.now();
+    const tick = (): void => {
+      firstPromptInputBoxWatch = null;
+      if (!awaitingFirstPrompt || backend !== firstPromptBackend) return;
+      const nextElapsedMs = elapsedMs + (Date.now() - startedAt);
+      if (nextElapsedMs >= FIRST_PROMPT_HARD_TIMEOUT_MS) return;
+      if (adapterInputBoxReady()) {
+        releaseFirstPromptTimeout(nextElapsedMs, false);
+        return;
+      }
+      firstPromptInputBoxWatch = setTimeout(tick, FIRST_PROMPT_INPUT_BOX_RECHECK_MS);
+      firstPromptInputBoxWatch.unref?.();
+    };
+    firstPromptInputBoxWatch = setTimeout(tick, FIRST_PROMPT_INPUT_BOX_RECHECK_MS);
+    firstPromptInputBoxWatch.unref?.();
+  };
   const releaseFirstPromptTimeout = (elapsedMs: number, forced: boolean, pickerAdmitted = false): void => {
     if (!awaitingFirstPrompt || backend !== firstPromptBackend) return;
     if (holdFirstPromptForStartupBlocker(elapsedMs, forced)) return;
@@ -29590,16 +29736,19 @@ async function spawnCliBody(
       }
       return;
     }
+    const inputBoxReady = adapterInputBoxReady();
     if (!shouldReleaseFirstPromptTimeout({
       deferFirstPromptTimeoutUntilReady: cliAdapter?.deferFirstPromptTimeoutUntilReady === true,
       hasReadyPattern: !!cliAdapter?.readyPattern,
       elapsedMs,
       hardTimeoutMs: FIRST_PROMPT_HARD_TIMEOUT_MS,
+      inputBoxReady,
     })) {
       const hardWaitMs = Math.max(0, FIRST_PROMPT_HARD_TIMEOUT_MS - elapsedMs);
       log(`First prompt timeout — ${cliName()} still waiting for readyPattern before flushing queued messages`);
       const hardTimer = setTimeout(() => releaseFirstPromptTimeout(FIRST_PROMPT_HARD_TIMEOUT_MS, true), hardWaitMs);
       hardTimer.unref?.();
+      if (inputBoxReady === false) watchFirstPromptInputBox(elapsedMs);
       return;
     }
 
@@ -29624,7 +29773,9 @@ async function spawnCliBody(
     renderer?.markNewTurn();
     log(forced
       ? `WARN First prompt hard timeout — ${cliName()} readyPattern did not arrive; forcing queued message flush`
-      : 'First prompt timeout — enabling screen updates and flushing queued messages');
+      : inputBoxReady
+        ? `First prompt timeout — ${cliName()} input box is ready on the backend screen; flushing queued messages`
+        : 'First prompt timeout — enabling screen updates and flushing queued messages');
     if (backend && cliAdapter?.busyPattern) {
       if (deferPromptReadyWhileBusy(`${cliName()} first-prompt-timeout`, backend)
         || probeBusyPatternIdle(`${cliName()} first-prompt-timeout`, backend, { requireReadyPattern: true })) return;
@@ -35027,6 +35178,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // start it can arrive while the CLI is still booting — before any flush
       // has proven the input box.
       const startupInputGateHolds = !firstWriteLivenessConfirmed
+        || (!openingInputBoxSettled && pendingMessages.length > 0)
         || startupCommandsInProgress || startupCommandAckHold !== null || nativeSessionForkPending();
       if (cliRestartInProgress || rawInputRestartGate || sessionRenameInFlight()
         || shouldHoldCodexRunnerInput(codexRunnerFreshness)
