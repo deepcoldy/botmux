@@ -142,24 +142,14 @@ export function getGroupMessageListenerMode(larkAppId: string, chatId: string): 
 }
 
 /**
- * Build the persisted config for a listener update, or `null` when the update
- * carries nothing worth keeping (→ delete the entry).
+ * Build the persisted config for a listener update.
  *
- * A DISABLED listener with a non-empty prompt is a valid *draft*: it is
- * persisted with `enabled:false` so the operator can turn it on later without
- * retyping. Previously any disabled update was collapsed to `null` (deleted
- * outright), so a draft saved while the toggle was off vanished on the next
- * reload — the exact bug this fixes. Only a disabled update with a BLANK prompt
- * is a true clear (this is also what the DELETE route sends: `{enabled:false,
- * prompt:''}`). Enabled updates always carry a prompt
- * (validateMessageListenerUpdate guarantees it), so they always build a config.
- *
- * Runtime is unaffected by a persisted draft: findMessageListenerForChat and
- * enabledMessageListenerChatIds both require `enabled===true`, so an off draft
- * never matches messages — it only survives for the dashboard editor.
+ * A DISABLED listener is a valid *draft*: it is persisted with `enabled:false`
+ * so the operator can turn it on later without retyping. Runtime is unaffected:
+ * findMessageListenerForChat and enabledMessageListenerChatIds both require
+ * `enabled===true` and a prompt, so an off draft never matches messages.
  */
-export function messageListenerConfigFromUpdate(patch: MessageListenerUpdate): MessageListenerConfig | null {
-  if (!patch.prompt.trim()) return null;
+export function buildMessageListenerConfig(patch: MessageListenerUpdate): MessageListenerConfig {
   return {
     enabled: patch.enabled,
     ...(patch.autoCloseAfterCompletion === true ? { autoCloseAfterCompletion: true } : {}),
@@ -174,21 +164,52 @@ export function messageListenerConfigFromUpdate(patch: MessageListenerUpdate): M
   };
 }
 
+/**
+ * Like buildMessageListenerConfig, but `null` (→ delete the entry) for a
+ * disabled update with a BLANK prompt. The legacy per-chat endpoints
+ * (`PUT`/`DELETE /api/message-listeners/:chatId`) carry no mode, so that update
+ * is how they clear a group's rule; DELETE sends exactly `{enabled:false,
+ * prompt:''}`. Enabled updates always carry a prompt
+ * (validateMessageListenerUpdate guarantees it), so they always build a config.
+ */
+export function messageListenerConfigFromUpdate(patch: MessageListenerUpdate): MessageListenerConfig | null {
+  return patch.prompt.trim() ? buildMessageListenerConfig(patch) : null;
+}
+
+/** Legacy per-chat save: a disabled update with a blank prompt clears the rule. */
 export async function updateMessageListenerConfig(
   larkAppId: string,
   chatId: string,
   patch: MessageListenerUpdate,
 ): Promise<{ ok: true; listener: MessageListenerConfig | null } | { ok: false; reason: string }> {
-  let bot;
-  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
-
   const validation = validateMessageListenerUpdate(patch);
   if (!validation.ok) return { ok: false, reason: validation.reason };
+  return writeCustomGroupMessageListener(larkAppId, chatId, messageListenerConfigFromUpdate(patch));
+}
 
-  // A disabled update with a non-empty prompt persists as an off DRAFT (kept for
-  // the editor, never matched at runtime); only a blank-prompt disabled update
-  // clears the entry. See messageListenerConfigFromUpdate.
-  const normalized = messageListenerConfigFromUpdate(patch);
+/**
+ * Save a group's custom rule from the group page, where the mode is explicit
+ * (`mode:'inherit'` is the clear). The rule is always kept, even switched off
+ * with no prompt yet: that is how a group stops following the global rule.
+ */
+export async function saveCustomGroupMessageListener(
+  larkAppId: string,
+  chatId: string,
+  patch: MessageListenerUpdate,
+): Promise<{ ok: true; listener: MessageListenerConfig | null } | { ok: false; reason: string }> {
+  const validation = validateMessageListenerUpdate(patch);
+  if (!validation.ok) return { ok: false, reason: validation.reason };
+  return writeCustomGroupMessageListener(larkAppId, chatId, buildMessageListenerConfig(patch));
+}
+
+/** Persist `normalized` as the group's custom rule, or delete the group's entry when `null`. */
+async function writeCustomGroupMessageListener(
+  larkAppId: string,
+  chatId: string,
+  normalized: MessageListenerConfig | null,
+): Promise<{ ok: true; listener: MessageListenerConfig | null } | { ok: false; reason: string }> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
 
   const result = await rmwBotEntry<MessageListenerConfig | null>(larkAppId, (entry) => {
     if (!entry.groupMessageListenerOverrides || typeof entry.groupMessageListenerOverrides !== 'object' || Array.isArray(entry.groupMessageListenerOverrides)) {

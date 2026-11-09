@@ -457,8 +457,15 @@ export function MessageListenersPage() {
     const payload = payloadFor('group', snapshot);
     setGroupSaving(true);
     try {
-      await api(`/api/group-message-listeners/${encodeURIComponent(requestBotId)}/${encodeURIComponent(requestChatId)}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'custom', listener: payload }) });
+      const saved = await api(`/api/group-message-listeners/${encodeURIComponent(requestBotId)}/${encodeURIComponent(requestChatId)}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ mode: 'custom', listener: payload }) });
       if (generation !== contextGeneration.current) return;
+      // The daemon's answer is what the group now runs; a rule it did not keep
+      // must not read as saved. The editor may be gone after the re-read, so toast.
+      if (saved?.mode !== 'custom' || !saved.listener) {
+        toast(tr('listeners.customNotKept'), { kind: 'error' });
+        void refresh(requestBotId, { groupsOnly: true });
+        return;
+      }
       setCustomEdit(current => current && current.botId === requestBotId && current.chatId === requestChatId ? { ...current, persisted: true, base: snapshot } : current);
       setListenerGroups(current => current.map(item => item.chatId === requestChatId ? { ...item, mode: 'custom', listener: payload } : item));
       setFlash({ text: tr('roles.saved'), id: Date.now(), scope: 'group' });
