@@ -188,6 +188,7 @@ export class SessionController {
     if (value.bindingId && this.store.bindingProducer(this.ref, value.bindingId, value.producer)) value.scope.runtime = this.store.binding(this.ref, value.bindingId)?.ref;
     const runtime = value.scope.runtime;
     if (!runtime || (!this.store.authorizedProducer(this.ref, runtime, value.producer)
+      && !this.store.authorizedExecutionObserver(this.ref, runtime, value.producer, value.scope.execution)
       && !(value.bindingId && this.store.bindingProducer(this.ref, value.bindingId, value.producer)))) return undefined;
     if (value.scope.execution) {
       const execution = this.store.execution(this.ref, value.scope.execution.executionId);
