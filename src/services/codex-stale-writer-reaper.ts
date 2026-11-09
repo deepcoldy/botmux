@@ -20,7 +20,7 @@
  * `foreign`, and the launch proceeds exactly as before this guard existed).
  */
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, readlinkSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { LSOF_EXEC_OPTIONS } from '../utils/process-open-files.js';
 import { pidNotProvablyGone } from '../utils/process-alive.js';
@@ -63,6 +63,30 @@ export function botmuxSessionArgvMarker(sessionId: string): string {
 }
 
 const UUID_RE = /^[0-9a-f-]{36}$/i;
+
+/** The worker-side gate: only a COLD resume of a known Codex thread in a pane
+ *  botmux launches itself may retire a holder. A reattach targets the live
+ *  pane that legitimately holds the lock; RPC / adopt / external app-server /
+ *  remote backends do not launch a local TUI resume. */
+export function shouldReapStaleCodexWriterBeforeSpawn(input: {
+  cliId: string;
+  willReattachPersistent: boolean;
+  resume: boolean;
+  cliSessionId?: string;
+  rpcEngine: boolean;
+  adoptMode: boolean;
+  existingAppServerEndpoint: boolean;
+  remoteBackend: boolean;
+}): boolean {
+  return input.cliId === 'codex'
+    && !input.willReattachPersistent
+    && input.resume
+    && !!input.cliSessionId
+    && !input.rpcEngine
+    && !input.adoptMode
+    && !input.existingAppServerEndpoint
+    && !input.remoteBackend;
+}
 
 export async function reapStaleCodexThreadWriter(opts: {
   codexHome: string;
@@ -116,6 +140,13 @@ export async function reapStaleCodexThreadWriter(opts: {
   let forced = false;
   if (remaining.length > 0) {
     forced = true;
+    // Re-prove ownership right before the uncatchable signal: never SIGKILL a
+    // pid whose argv no longer carries this session's marker (pid reuse).
+    const stillOurs = remaining.filter(pid => deps.readArgv(pid)?.includes(marker) === true);
+    const gone = remaining.filter(pid => !stillOurs.includes(pid) && deps.provablyGone(pid));
+    const lost = remaining.filter(pid => !stillOurs.includes(pid) && !gone.includes(pid));
+    if (lost.length > 0) return { kind: 'stuck', pids: lost };
+    remaining = stillOurs;
     send(remaining, 'SIGKILL');
     remaining = await waitGone(remaining, opts.killGraceMs ?? 2_000);
   }
@@ -131,16 +162,27 @@ const IS_LINUX = process.platform === 'linux';
 /** Linux: scan /proc/<pid>/fd for the lock path. Elsewhere: `lsof -t`. */
 export function listLockHoldersOnHost(lockPath: string): number[] | undefined {
   if (IS_LINUX && existsSync('/proc/self/fd')) {
+    // /proc/<pid>/fd links always name the RESOLVED path; a CODEX_HOME reached
+    // through a symlink (symlinked $HOME, bind mounts) must be compared resolved.
+    const wanted = new Set([lockPath]);
+    try { wanted.add(realpathSync(lockPath)); } catch { /* compare lexically */ }
+    for (const path of [...wanted]) wanted.add(`${path} (deleted)`);
     let pids: string[];
     try { pids = readdirSync('/proc').filter(name => /^\d+$/.test(name)); } catch { return undefined; }
     const found: number[] = [];
     for (const pid of pids) {
+      // Cheap prefilter: only a Codex process can hold a Codex thread lock.
+      // Keeps the per-spawn cost to one small read per process instead of a
+      // readlink of every fd on a busy host.
+      let cmdline: string;
+      try { cmdline = readFileSync(`/proc/${pid}/cmdline`, 'utf8'); } catch { continue; }
+      if (!/codex/i.test(cmdline)) continue;
       let fds: string[];
       try { fds = readdirSync(`/proc/${pid}/fd`); } catch { continue; } // not ours / exited
       for (const fd of fds) {
         let target: string;
         try { target = readlinkSync(`/proc/${pid}/fd/${fd}`); } catch { continue; }
-        if (target === lockPath || target === `${lockPath} (deleted)`) { found.push(Number(pid)); break; }
+        if (wanted.has(target)) { found.push(Number(pid)); break; }
       }
     }
     return found;

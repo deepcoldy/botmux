@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import {
   botmuxSessionArgvMarker,
+  shouldReapStaleCodexWriterBeforeSpawn,
   parsePidLines,
   reapStaleCodexThreadWriter,
   type StaleWriterReaperDeps,
@@ -111,6 +113,46 @@ describe('reapStaleCodexThreadWriter', () => {
     const outcome = await reapStaleCodexThreadWriter({ ...base, threadId: '../.coordination', deps: host.deps });
     expect(outcome).toEqual({ kind: 'no-lock' });
     expect(host.signals).toEqual([]);
+  });
+});
+
+describe('reapStaleCodexThreadWriter SIGKILL ownership recheck', () => {
+  it('does not SIGKILL a pid whose argv no longer carries the marker (pid reused)', async () => {
+    const host = fakeHost({ 4242: { argv: codexArgv(SESSION), dies: 'never' } });
+    let reads = 0;
+    const deps = { ...host.deps, readArgv: (pid: number) => (reads++ === 0 ? codexArgv(SESSION) : 'some-other-program') };
+    const outcome = await reapStaleCodexThreadWriter({ ...base, termGraceMs: 200, deps });
+    expect(outcome).toEqual({ kind: 'stuck', pids: [4242] });
+    expect(host.signals).toEqual([[4242, 'SIGTERM']]);
+  });
+});
+
+describe('shouldReapStaleCodexWriterBeforeSpawn', () => {
+  const cold = {
+    cliId: 'codex', willReattachPersistent: false, resume: true, cliSessionId: THREAD,
+    rpcEngine: false, adoptMode: false, existingAppServerEndpoint: false, remoteBackend: false,
+  };
+  it('runs only for a cold local Codex resume of a known thread', () => {
+    expect(shouldReapStaleCodexWriterBeforeSpawn(cold)).toBe(true);
+  });
+  it.each([
+    ['reattaching the live pane', { willReattachPersistent: true }],
+    ['a fresh launch', { resume: false }],
+    ['no thread id', { cliSessionId: undefined }],
+    ['the RPC engine', { rpcEngine: true }],
+    ['adopt mode', { adoptMode: true }],
+    ['an external app-server', { existingAppServerEndpoint: true }],
+    ['a remote backend', { remoteBackend: true }],
+    ['another CLI', { cliId: 'claude-code' }],
+  ])('never runs for %s', (_label, patch) => {
+    expect(shouldReapStaleCodexWriterBeforeSpawn({ ...cold, ...patch })).toBe(false);
+  });
+});
+
+describe('ownership marker matches the real Codex launch argv', () => {
+  it('the codex adapter puts exactly the marker the reaper looks for into its args', () => {
+    const args = createCliAdapterSync('codex').buildArgs({ sessionId: SESSION, resume: true, cliSessionId: THREAD });
+    expect(args.join(' ')).toContain(botmuxSessionArgvMarker(SESSION));
   });
 });
 

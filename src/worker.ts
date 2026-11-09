@@ -527,7 +527,7 @@ import {
 import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay, scaleMs } from './utils/timing.js';
 import { waitForProcessQuiescence } from './services/process-quiescence.js';
-import { reapStaleCodexThreadWriter } from './services/codex-stale-writer-reaper.js';
+import { reapStaleCodexThreadWriter, shouldReapStaleCodexWriterBeforeSpawn } from './services/codex-stale-writer-reaper.js';
 import { pidNotProvablyGone } from './utils/process-alive.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
 import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
@@ -26068,13 +26068,21 @@ async function spawnCliBody(
   // outside the pane we manage (replaced tmux server, unreattached pane) used
   // to wedge the session exactly that way. Retire only a holder that carries
   // THIS session's id; anything else is reported and left alone.
-  if (cfg.cliId === 'codex' && !willReattachPersistent && effectiveResume && effectiveCliSessionId
-      && !codexRpcEngine && !cfg.adoptMode && !cfg.existingAppServerEndpoint
-      && !isRemoteBackendType(effectiveBackendType)) {
+  if (effectiveCliSessionId && shouldReapStaleCodexWriterBeforeSpawn({
+    cliId: cfg.cliId,
+    willReattachPersistent,
+    resume: effectiveResume,
+    cliSessionId: effectiveCliSessionId,
+    rpcEngine: !!codexRpcEngine,
+    adoptMode: !!cfg.adoptMode,
+    existingAppServerEndpoint: !!cfg.existingAppServerEndpoint,
+    remoteBackend: isRemoteBackendType(effectiveBackendType),
+  })) {
     const homes = [...new Set([perBotInjectEnv.CODEX_HOME, childEnv.CODEX_HOME, join(homedir(), '.codex')]
       .filter((home): home is string => typeof home === 'string' && home.trim() !== '')
-      .map(home => home.trim()))];
+      .map(home => { try { return realpathSync(home.trim()); } catch { return home.trim(); } }))];
     for (const home of homes) {
+      if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
       try {
         const outcome = await reapStaleCodexThreadWriter({
           codexHome: home,
