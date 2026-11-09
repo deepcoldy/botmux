@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { parseAuthRequestArgs } from '../src/cli/auth-request.js';
+import { parseAuthRequestArgs, providerAuthExitCode } from '../src/cli/auth-request.js';
 import {
   managedOriginCapabilityPath,
   RELAY_ORIGIN_CAPABILITY_BASENAME,
@@ -38,6 +38,37 @@ describe('auth request arguments', () => {
     ['wait', '--request-id', 'request-1', '--scope', 'im:chat:read'],
   ])('rejects invalid arguments %j', (...args: string[]) => {
     expect(() => parseAuthRequestArgs(args)).toThrow();
+  });
+
+  it('accepts a provider request from the bytedcli wrapper', () => {
+    expect(parseAuthRequestArgs(['request', '--provider', 'meego']))
+      .toEqual({ help: false, command: 'request', scopes: [], allowUnknown: false, provider: 'meego', json: false });
+    expect(parseAuthRequestArgs(['request', '--json', '--provider', 'bytedcli']))
+      .toEqual({ help: false, command: 'request', scopes: [], allowUnknown: false, provider: 'bytedcli', json: true });
+    expect(parseAuthRequestArgs(['request', '--provider', 'meego', '--tenant', 'dcar']))
+      .toEqual({ help: false, command: 'request', scopes: [], allowUnknown: false, provider: 'meego', tenant: 'dcar', json: false });
+  });
+
+  it.each([
+    [['request', '--provider']], [['request', '--provider', 'lark']], [['request', '--provider', '--json']],
+    [['request', '--provider', 'meego', '--provider', 'meego']],
+    [['request', '--provider', 'meego', '--scope', 'im:chat:read']],
+    [['request', '--provider', 'meego', '--allow-unknown']],
+    [['request', '--provider', 'meego', '--tenant']], [['request', '--provider', 'meego', '--tenant', 'other']],
+    [['request', '--provider', 'bytedcli', '--tenant', 'dcar']], [['request', '--tenant', 'dcar']],
+    [['request', '--provider', 'meego', '--tenant', 'dcar', '--tenant', 'dcar']],
+    [['wait', '--request-id', 'r', '--provider', 'meego']],
+  ])('rejects provider arguments %j', args => {
+    expect(() => parseAuthRequestArgs(args)).toThrow();
+  });
+
+  it('maps provider outcomes to the exit codes the wrapper reads', () => {
+    expect(providerAuthExitCode(true, 'ready')).toBe(0);
+    for (const status of ['delivered', 'pending', 'undeliverable']) expect(providerAuthExitCode(true, status)).toBe(3);
+    expect(providerAuthExitCode(true, 'unavailable')).toBe(4);
+    expect(providerAuthExitCode(false, 'refused')).toBe(3);
+    expect(providerAuthExitCode(false, undefined)).toBe(1);
+    expect(providerAuthExitCode(true, 'something-new')).toBe(1);
   });
 
   it('rejects an empty argument list', () => {
@@ -183,6 +214,32 @@ describe('auth request CLI', () => {
     expect(requests[0].body).not.toHaveProperty('originTurnId');
     expect(requests[0].body).not.toHaveProperty('originDispatchAttempt');
     expect(Boolean(requests[0].headers['x-botmux-cli-auth'])).toBe(true);
+  });
+
+  it('a provider request prints only the daemon\'s message and exits with its status', async () => {
+    const binding = prepareLarkToolEnv({ env, dataDir, sessionId: 'session', appId: 'cli_auth' });
+    responseBody = { ok: true, provider: 'meego', status: 'delivered', delivery: 'dm', message: 'botmux: 链接已私聊发给发起人' };
+    const result = await run(['request', '--provider', 'meego']);
+    expect(result.code).toBe(3);
+    expect(result.stdout.trim()).toBe('botmux: 链接已私聊发给发起人');
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      url: '/api/sessions/session/auth-request', body: { provider: 'meego' },
+      headers: { 'x-botmux-lark-session': binding.accessKey },
+    });
+    expect(requests[0].body).not.toHaveProperty('scopes');
+
+    responseBody = { ok: true, provider: 'meego', status: 'ready', message: 'botmux: Meego 已登录' };
+    expect((await run(['request', '--provider', 'meego'])).code).toBe(0);
+    status = 409;
+    responseBody = { ok: false, status: 'refused', error: 'delegated', message: 'botmux: 本轮不能为发起人发起 Meego 授权' };
+    const refused = await run(['request', '--provider', 'meego']);
+    expect(refused.code).toBe(3);
+    expect(refused.stdout).toContain('本轮不能');
+
+    status = 200;
+    await run(['request', '--provider', 'meego', '--tenant', 'dcar']);
+    expect(requests.at(-1)?.body).toMatchObject({ provider: 'meego', tenant: 'dcar' });
   });
 
   it('forwards allowUnknown flag to the daemon auth-request endpoint', async () => {

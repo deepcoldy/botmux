@@ -361,7 +361,8 @@ describe('empty-started session — first real business turn must use the new-to
 
     const opening = liveInputs()[0]!.content;
     expect(opening).not.toContain('<botmux_lark_tool>');
-    expect(opening).toContain('已为 lark-cli 启用按当前消息发起人身份注入授权');
+    expect(opening).toContain('<botmux_credentials>');
+    expect(opening).not.toContain('启用按当前消息发起人身份注入授权');
   });
 
   it('live resumed worker receives current Feishu emphasis guidance on its next turn', async () => {

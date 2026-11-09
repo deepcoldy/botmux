@@ -15242,7 +15242,7 @@ async function cmdCard(rest: string[]): Promise<void> {
 }
 
 async function cmdAuth(rest: string[]): Promise<void> {
-  const { AUTH_REQUEST_USAGE, parseAuthRequestArgs } = await import('./cli/auth-request.js');
+  const { AUTH_REQUEST_USAGE, parseAuthRequestArgs, providerAuthExitCode } = await import('./cli/auth-request.js');
   let parsed;
   try {
     parsed = parseAuthRequestArgs(rest);
@@ -15288,21 +15288,26 @@ async function cmdAuth(rest: string[]): Promise<void> {
         if (!read?.turnId) throw new Error('当前会话的本轮身份凭据不可用');
         claim = read;
       }
-      const authBody = parsed.command === 'request'
-        ? { scopes: parsed.scopes, ...(parsed.allowUnknown ? { allowUnknown: true } : {}) }
-        : { requestId: parsed.requestId };
+      const provider = parsed.command === 'request' ? parsed.provider : undefined;
+      const tenant = parsed.command === 'request' ? parsed.tenant : undefined;
+      const authBody = provider ? { provider, ...(tenant ? { tenant } : {}) }
+        : parsed.command === 'request'
+          ? { scopes: parsed.scopes, ...(parsed.allowUnknown ? { allowUnknown: true } : {}) }
+          : { requestId: parsed.requestId };
+      // A provider request may start a device login and send a DM before it answers.
+      const requestTimeout = Math.min(provider ? 60_000 : 10_000, Math.max(1, remaining));
       const authPath = `/api/sessions/${encodeURIComponent(sid)}/auth-${parsed.command === 'wait' ? 'status' : 'request'}`;
       const response = toolBinding
         ? await loopbackFetch(`http://127.0.0.1:${toolBinding.ipcPort}${authPath}`, {
           method: 'POST', headers: { 'content-type': 'application/json', 'x-botmux-lark-session': toolBinding.accessKey },
-          body: JSON.stringify(authBody), signal: AbortSignal.timeout(Math.min(10_000, Math.max(1, remaining))),
+          body: JSON.stringify(authBody), signal: AbortSignal.timeout(requestTimeout),
         })
         : await postCurrentSessionDaemonRoute({
           path: `/api/sessions/${encodeURIComponent(sid)}/auth-${parsed.command === 'wait' ? 'status' : 'request'}`,
           sessionId: sid,
           larkAppId,
           ...(claim ? { originClaim: claim } : {}),
-          signal: AbortSignal.timeout(Math.min(10_000, Math.max(1, remaining))),
+          signal: AbortSignal.timeout(requestTimeout),
           body: {
             ...authBody,
             ...(claim ? {
@@ -15312,7 +15317,14 @@ async function cmdAuth(rest: string[]): Promise<void> {
             } : {}),
           },
         });
-      const body = await response.json() as { ok?: boolean; status?: string };
+      const body = await response.json() as { ok?: boolean; status?: string; message?: string; error?: string };
+      if (provider) {
+        if (parsed.command === 'request' && parsed.json) console.log(JSON.stringify(body));
+        else if (body.message) console.log(body.message);
+        else console.error(`botmux auth: ${body.error ?? `HTTP ${response.status}`}`);
+        process.exitCode = providerAuthExitCode(response.ok && body.ok === true, body.status);
+        return;
+      }
       if (parsed.command === 'wait' && response.ok && body.ok === true && body.status === 'pending') {
         await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.min(2_000, deadline - Date.now()))));
         continue;
