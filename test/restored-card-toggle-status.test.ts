@@ -412,6 +412,7 @@ describe('Web Terminal link on a restored session', () => {
   // A daemon shutdown leaves the last worker's port persisted (it is also the
   // next fork's preferred listen port), so a restored session still carries it.
   const PERSISTED_PORT = 31219;
+  const VIEW_TOKEN = 'view_cap'.padEnd(43, '0');
   const OPEN = label('card.btn.open_terminal');
   const terminalLinkOf = (card: any): string | undefined =>
     buttonsOf(card).find(b => b.text?.content === OPEN)?.multi_url?.url;
@@ -431,22 +432,41 @@ describe('Web Terminal link on a restored session', () => {
     expect(ds.session.webPort).toBe(PERSISTED_PORT);
   });
 
-  it('through the terminal proxy: keeps the session link, which wakes a worker', async () => {
+  it('through the terminal proxy: hides the session recovery link until a live worker owns a terminal', async () => {
     setTerminalProxyPort(17_700);
     const ds = restored();
     const card = await toggleCurrent(ds, activate(ds));
-    expect(terminalLinkOf(card)).toContain(`:17700/s/${ds.session.sessionId}`);
+    expect(terminalLinkOf(card)).toBeUndefined();
+    expect(JSON.stringify(card)).not.toContain(`/s/${ds.session.sessionId}`);
   });
 
   it('direct link with a running worker points at its port', async () => {
-    const ds = restored({ worker: makeFakeWorker(), workerReady: true, workerPort: 40_001, lastScreenStatus: 'idle' });
+    const ds = restored({ worker: makeFakeWorker(), workerReady: true, workerPort: 40_001,
+      workerViewToken: VIEW_TOKEN, lastScreenStatus: 'idle' });
     const card = await toggleCurrent(ds, activate(ds));
     expect(terminalLinkOf(card)).toContain(':40001');
   });
 
-  it('direct link for a worker that has not reported its port yet uses the preferred one', async () => {
+  it('direct link for a worker that has not reported its port yet stays hidden', async () => {
     const ds = restored({ worker: makeFakeWorker() });
     const card = await toggleCurrent(ds, activate(ds));
-    expect(terminalLinkOf(card)).toContain(`:${PERSISTED_PORT}`);
+    expect(terminalLinkOf(card)).toBeUndefined();
+    expect(JSON.stringify(card)).not.toContain(`:${PERSISTED_PORT}`);
+  });
+
+  it.each([
+    { name: 'direct', proxyPort: 0 },
+    { name: 'proxy', proxyPort: 17_700 },
+  ])('keeps the diagnostic terminal on the $name card after repeated display toggles', async ({ proxyPort }) => {
+    if (proxyPort) setTerminalProxyPort(proxyPort);
+    const ds = restored({ worker: makeFakeWorker(), workerReady: false, workerPort: 40_001,
+      workerViewToken: VIEW_TOKEN, crashDiagnosticParked: true, lastScreenStatus: 'idle' });
+    const deps = activate(ds);
+    for (let i = 0; i < 2; i++) {
+      const card = await toggleCurrent(ds, deps);
+      expect(terminalLinkOf(card)).toContain(proxyPort ? `/s/${ds.session.sessionId}` : ':40001');
+    }
+    expect(ds.workerReady).toBe(false);
+    expect(ds.crashDiagnosticParked).toBe(true);
   });
 });

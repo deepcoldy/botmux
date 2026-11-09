@@ -1,4 +1,17 @@
+// 第一个 import：测试围栏（unit-setup / bun-test-fence）没生效时整个文件直接拒跑。
+import './helpers/require-fenced-data-dir.js';
 import { describe, expect, it, vi } from 'vitest';
+import { accessSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+// Tests run as root here, where a real permission check always passes.
+// `require` inside the factory, not the vitest-only `importOriginal` argument:
+// bun passes none, so taking it would drop this whole file from the bun leg.
+vi.mock('node:fs', () => {
+  const actual = require('node:fs') as typeof import('node:fs');
+  return { ...actual, accessSync: vi.fn(actual.accessSync) };
+});
 
 import type {
   DashboardGlobalConfig,
@@ -20,6 +33,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
   const storedGlobal: GlobalConfig = {};
   const settingsView: ResolvedDashboardSettingsView = {
     groupNamePrefix: '',
+    worktreeRoot: '',
     publicReadOnly: false,
     openTerminalInFeishu: false,
     enableLocalCliOpen: false,
@@ -148,6 +162,25 @@ describe('applySettingsWrite happy paths', () => {
     const r = await applySettingsWrite({ groupNamePrefix: '' }, deps);
     expect(r.ok).toBe(true);
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ groupNamePrefix: null });
+  });
+
+  it('writes a trimmed worktreeRoot that names an existing directory', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-worktree-root-'));
+    try {
+      const deps = makeDeps();
+      const r = await applySettingsWrite({ worktreeRoot: ` ${dir} ` }, deps);
+      expect(r.ok).toBe(true);
+      expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ worktreeRoot: dir });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('clears worktreeRoot when the dashboard saves an empty value', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ worktreeRoot: '  ' }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ worktreeRoot: null });
   });
 
   it('writes publicReadOnly toggle and echoes the resolved snapshot', async () => {
@@ -360,6 +393,25 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({ multiTopic: { enabled: false, futureFlag: 1 } });
   });
 
+  it('writes the nested taskTreeCard switch while preserving enabled and other siblings', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({ multiTopic: { enabled: true, futureFlag: 1 } as any })),
+    });
+    const r = await applySettingsWrite({ multiTopic: { enabled: true, taskTreeCard: true } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith(
+      { multiTopic: { enabled: true, futureFlag: 1, taskTreeCard: true } },
+    );
+  });
+
+  it('rejects a non-boolean nested taskTreeCard', async () => {
+    const deps = makeDeps({
+      readGlobalConfig: vi.fn(() => ({ multiTopic: { enabled: true } })),
+    });
+    expect(await applySettingsWrite({ multiTopic: { enabled: true, taskTreeCard: 'yes' } }, deps))
+      .toEqual({ ok: false, error: 'invalid_multiTopic_taskTreeCard' });
+  });
+
   it('rejects invalid multiTopic patches', async () => {
     const deps = makeDeps();
     expect(await applySettingsWrite({ multiTopic: 'off' }, deps))
@@ -521,6 +573,41 @@ describe('applySettingsWrite — validation errors', () => {
       if (r.ok) throw new Error('expected failure');
       expect(r.error).toBe('invalid_groupNamePrefix');
       expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+    }
+  });
+
+  it('rejects a worktreeRoot that is not an existing absolute directory without writing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-worktree-root-'));
+    const file = join(dir, 'not-a-dir');
+    writeFileSync(file, '');
+    try {
+      for (const worktreeRoot of [42, null, 'relative/dir', '~other/wts', join(dir, 'missing'), file]) {
+        const deps = makeDeps();
+        const r = await applySettingsWrite({ worktreeRoot }, deps);
+        expect(r.ok).toBe(false);
+        if (r.ok) throw new Error('expected failure');
+        expect(r.error).toBe('invalid_worktreeRoot');
+        expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a worktreeRoot directory that is not writable', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-worktree-root-'));
+    vi.mocked(accessSync).mockImplementationOnce(() => {
+      throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+    });
+    try {
+      const deps = makeDeps();
+      const r = await applySettingsWrite({ worktreeRoot: dir }, deps);
+      expect(r.ok).toBe(false);
+      if (r.ok) throw new Error('expected failure');
+      expect(r.error).toBe('invalid_worktreeRoot');
+      expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

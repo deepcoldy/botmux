@@ -60,6 +60,7 @@ const MAX_TURN_DURATION_MULTIPLIER = 4;
 /** Upper bound on notifications buffered while waiting for this turn's inbox
  *  spliced receipt — see dsh-runner-pending.ts. */
 const HANDSHAKE_TIMEOUT_MS = 30_000;
+const INITIALIZE_RETRY_INTERVAL_MS = 1_000;
 const PROMPT_ACK_TIMEOUT_MS = 30_000;
 const SHUTDOWN_GRACE_MS = 2_000;
 const DEFAULT_MAX_TOKENS = 49152;
@@ -146,7 +147,7 @@ function migrateGeneratedBotmuxProfile(name: string, pkgJson: string, cordisPatc
   const pkg = readJsonRecord(pkgJson);
   if (pkg) {
     const deps = isRecord(pkg.dependencies) ? { ...pkg.dependencies } : {};
-    if (deps[DSH_TOOL_ASK_USER_PACKAGE] !== DSH_TOOL_ASK_USER_DEP) {
+    if (deps[DSH_TOOL_ASK_USER_PACKAGE] === undefined) {
       deps[DSH_TOOL_ASK_USER_PACKAGE] = DSH_TOOL_ASK_USER_DEP;
       pkg.dependencies = deps;
       writeFileSync(pkgJson, JSON.stringify(pkg, null, 2) + '\n', 'utf8');
@@ -838,11 +839,25 @@ async function main(): Promise<void> {
   };
   client.start();
 
-  const initializeResult = await client.request<unknown>(
-    'initialize',
-    { cwd, provider: selection.provider, model: selection.model, maxTokens: DEFAULT_MAX_TOKENS },
-    HANDSHAKE_TIMEOUT_MS,
-  );
+  // A plugin provider registers its models asynchronously after the plugin
+  // loader settles, so an initialize sent right after spawn can be rejected
+  // with "has no configured model" until that finishes.
+  const handshakeDeadline = Date.now() + HANDSHAKE_TIMEOUT_MS;
+  let initializeResult: unknown;
+  for (;;) {
+    try {
+      initializeResult = await client.request<unknown>(
+        'initialize',
+        { cwd, provider: selection.provider, model: selection.model, maxTokens: DEFAULT_MAX_TOKENS },
+        Math.max(1, handshakeDeadline - Date.now()),
+      );
+      break;
+    } catch (err) {
+      if (!errorMessage(err).includes('has no configured model')
+        || Date.now() + INITIALIZE_RETRY_INTERVAL_MS >= handshakeDeadline) throw err;
+      await new Promise(resolve => setTimeout(resolve, INITIALIZE_RETRY_INTERVAL_MS));
+    }
+  }
   const { serverInfo } = parseInitializeResult(initializeResult);
   writeLine(`dsh connected (${serverInfo.name} ${serverInfo.version}).`);
 

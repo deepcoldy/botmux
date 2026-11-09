@@ -6,7 +6,9 @@
  *
  * These cases pin the split the old dual-predicate design got wrong:
  *  - frozen `sandbox:true, sandboxNetwork:false` with the worker reporting
- *    `proven` (BOTMUX_SANDBOX=0 forced the spawn off) → daemon follows proven;
+ *    `proven` (a worker whose actual spawn ran without a sandbox — e.g. it
+ *    started with a different config than the frozen one) → daemon follows
+ *    proven;
  *  - frozen `sandbox:off` with the worker reporting `single` (env=1 engaged a
  *    net-isolated sandbox) → daemon follows single;
  *  - no report yet → fail-closed 'single' and the proven content route stays
@@ -22,6 +24,7 @@ import {
   identityStorageModelForDaemonSession,
   recordWorkerIdentityDecision,
 } from '../src/core/worker-pool.js';
+import { headlessChatId } from '../src/services/headless-session-store.js';
 function sessionFixture(extra: Record<string, unknown> = {}): any {
   return {
     session: {
@@ -59,9 +62,10 @@ describe('identityStorageModelForDaemonSession follows the worker report', () =>
   });
 
   it('follows a proven report even when the frozen config says net-isolated sandbox', () => {
-    // Cell 1 of the matrix: BOTMUX_SANDBOX=0 disengaged the worker's sandbox,
-    // so the spawn reached loopback and rendered proven. The frozen config
-    // (sandbox:true, sandboxNetwork:false) used to make the daemon publish
+    // The worker's spawn ran without a sandbox (e.g. a worker started with a
+    // different config than the frozen one), so it reached loopback and
+    // rendered proven. The frozen config (sandbox:true, sandboxNetwork:false)
+    // used to make the daemon publish
     // single files — the fail-open split. It must now follow the report.
     const ds = sessionFixture();
     recordWorkerIdentityDecision(ds, worker, 9, {
@@ -136,6 +140,30 @@ describe('fail-closed on impossible or malformed reports', () => {
       model: 'proven', sandboxEngaged: false, loopbackShared: true,
     });
     expect(identityDecisionConflict(ds)).toBeTruthy();
+    expect(identityStorageModelForDaemonSession(ds)).toBe('single');
+  });
+
+  it('honors a proven report from a verified headless session, whose worker runs the binding without chat transport', () => {
+    const ds = sessionFixture({
+      chatId: headlessChatId('hl_decision01'),
+      sessionExtra: { headless: { id: 'hl_decision01', source: 'cli', createdAt: '2026-11-08T00:00:00.000Z' } },
+    });
+    recordWorkerIdentityDecision(ds, worker, 9, {
+      model: 'proven', sandboxEngaged: false, loopbackShared: true,
+    });
+    expect(identityDecisionConflict(ds)).toBeUndefined();
+    expect(identityStorageModelForDaemonSession(ds)).toBe('proven');
+  });
+
+  it('refuses a proven report when the headless record does not own the session chat', () => {
+    const ds = sessionFixture({
+      chatId: headlessChatId('hl_someoneelse01'),
+      sessionExtra: { headless: { id: 'hl_decision01', source: 'cli', createdAt: '2026-11-08T00:00:00.000Z' } },
+    });
+    recordWorkerIdentityDecision(ds, worker, 9, {
+      model: 'proven', sandboxEngaged: false, loopbackShared: true,
+    });
+    expect(identityDecisionConflict(ds)).toMatch(/structurally cannot run proven/);
     expect(identityStorageModelForDaemonSession(ds)).toBe('single');
   });
 

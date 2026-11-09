@@ -466,12 +466,19 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // Unguessable pane/profile authority channel. It selects an exact read carve
   // but is not sufficient without the daemon-rotated capability inside it.
   'BOTMUX_ORIGIN_CHANNEL_ID',
+  // Workflow node session marker: `botmux skill show` inside a tmux / zellij
+  // pane must see it like a PTY child does; being listed also means a stale
+  // value in a shared server's global env is unset for ordinary panes.
+  'BOTMUX_WORKFLOW_NODE_SESSION',
   // Keep `botmux bots list` and ready-gated CLIs aligned with daemon config.
   'BOTMUX_LARK_LIST_BOTS_API_ENABLED',
   'BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS',
   // Host-resolved multi-topic orchestration switch. Managed panes must not
   // inherit a stale value from a co-tenant tmux server.
   'BOTMUX_MULTI_TOPIC_ENABLED',
+  // Same for the dispatch task-tree card switch: a file-sandboxed CLI cannot
+  // read ~/.botmux/config.json, so the daemon must project the resolved value.
+  'BOTMUX_DISPATCH_TASK_TREE_CARD_ENABLED',
   'BOTMUX_READY_COMMAND',
   // Structured end-of-turn idle report command, injected per session for
   // adapters that opt in (dsh-tui). Not a credential and not fatal when absent.
@@ -485,12 +492,14 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
   // Trigger-user CLI identity. The pane inherits PATH from the user's rcfile,
   // NOT from childEnv, so the worker's PATH prepend never reaches it — these
-  // three are how the wrapper dir gets back in front, via the login-shell shim
-  // (ZDOTDIR/BASH_ENV) that re-prepends BOTMUX_IDENTITY_BIN after path_helper.
+  // these are how the wrapper dirs get back in front, via the login-shell shim
+  // (ZDOTDIR/BASH_ENV) that re-prepends BOTMUX_IDENTITY_BIN and
+  // BOTMUX_WRAPPER_BIN after path_helper.
   // Without them on this allowlist the whole feature is inert in a tmux pane:
   // every governed call silently resolves the real tool and runs as the machine
   // account.
   'BOTMUX_IDENTITY_BIN',
+  'BOTMUX_WRAPPER_BIN',
   'BOTMUX_LARK_TOOL_BINDING',
   'ZDOTDIR',
   'BASH_ENV',
@@ -519,6 +528,9 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'EBSD_BOTMUX_SUBJECT',
   'EBSD_BOTMUX_REPOSITORY_ROOT',
   'EBSD_NO_UPDATE_CHECK',
+  // Kimi Code: emit OSC 7501 turn state inside a tmux pane (it skips the
+  // support probe there). Set by the kimi adapter's spawnEnv.
+  'PI_PROGRAM_STATUS',
 ] as const;
 
 /**
@@ -604,10 +616,226 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   'BOTMUX_LARK_APP_ID',
   // cjadk wrapper-branch knob, set/deleted per spawn by the worker.
   'CJADK_INTERACTIVE',
+  // Workflow node session marker (workflows/session-kind.ts), set per
+  // session by the worker. An inherited copy (e.g. `botmux restart` issued
+  // from a node session) would silently strip the workflow hint and skills
+  // from every ordinary session the daemon then starts.
+  'BOTMUX_WORKFLOW_NODE_SESSION',
 ] as const;
+
+/**
+ * Matches a git config value that points at Trae CLI's managed
+ * commit-attribution hook directory. Exported so the tmux server-global repair
+ * can tell, from the rendered table alone, whether a byte-exact re-read is
+ * worth its extra round-trips.
+ */
+export const TRAE_GIT_ATTRIBUTION_PATH_RE = /(?:^|[\\/])\.trae[\\/]cli[\\/]hooks[\\/]commit-attribution(?:[\\/]|$)/i;
+const TRAE_GIT_ATTRIBUTION_ENV_PREFIX = 'TRAE_GIT_ATTRIBUTION_';
+
+export interface TraeGitAttributionScrubResult {
+  changedKeys: string[];
+  warnings: string[];
+}
+
+interface ShellToken {
+  raw: string;
+  decoded: string;
+}
+
+/**
+ * Split Git's legacy GIT_CONFIG_PARAMETERS shell-quoted token stream while
+ * retaining each token's original spelling. Git accepts both
+ * `'core.hooksPath=/path'` and `'core.hookspath'='/path'`; decoding adjacent
+ * quoted fragments lets the matcher handle both without rewriting unrelated
+ * entries. A malformed stream returns null so callers can preserve it intact.
+ */
+function splitShellTokens(raw: string): ShellToken[] | null {
+  const tokens: ShellToken[] = [];
+  let i = 0;
+  while (i < raw.length) {
+    while (i < raw.length && /\s/.test(raw[i]!)) i++;
+    if (i >= raw.length) break;
+    const start = i;
+    let decoded = '';
+    while (i < raw.length && !/\s/.test(raw[i]!)) {
+      const ch = raw[i]!;
+      if (ch === "'") {
+        const end = raw.indexOf("'", i + 1);
+        if (end < 0) return null;
+        decoded += raw.slice(i + 1, end);
+        i = end + 1;
+        continue;
+      }
+      if (ch === '"') {
+        i++;
+        let closed = false;
+        while (i < raw.length) {
+          const inner = raw[i]!;
+          if (inner === '"') {
+            i++;
+            closed = true;
+            break;
+          }
+          if (inner === '\\') {
+            i++;
+            if (i >= raw.length) return null;
+            decoded += raw[i]!;
+            i++;
+            continue;
+          }
+          decoded += inner;
+          i++;
+        }
+        if (!closed) return null;
+        continue;
+      }
+      if (ch === '\\') {
+        i++;
+        if (i >= raw.length) return null;
+        decoded += raw[i]!;
+        i++;
+        continue;
+      }
+      decoded += ch;
+      i++;
+    }
+    tokens.push({ raw: raw.slice(start, i), decoded });
+  }
+  return tokens;
+}
+
+function isTraeGitAttributionConfig(key: string | undefined, value: string | undefined): boolean {
+  return key?.toLowerCase() === 'core.hookspath'
+    && typeof value === 'string'
+    && TRAE_GIT_ATTRIBUTION_PATH_RE.test(value);
+}
+
+function stillReferencesTraeGitAttribution(env: NodeJS.ProcessEnv): boolean {
+  for (const key of Object.keys(env)) {
+    const match = /^GIT_CONFIG_KEY_(\d+)$/.exec(key);
+    if (!match) continue;
+    if (isTraeGitAttributionConfig(env[key], env[`GIT_CONFIG_VALUE_${match[1]}`])) return true;
+  }
+  const parameters = env.GIT_CONFIG_PARAMETERS;
+  if (parameters === undefined) return false;
+  const tokens = splitShellTokens(parameters);
+  if (!tokens) {
+    // Malformed input is preserved. Be conservative and keep its matching
+    // helper contract whole when the raw text still names this hook family.
+    return /core\.hookspath/i.test(parameters) && TRAE_GIT_ATTRIBUTION_PATH_RE.test(parameters);
+  }
+  return tokens.some(token => {
+    const separator = token.decoded.indexOf('=');
+    return separator >= 0 && isTraeGitAttributionConfig(
+      token.decoded.slice(0, separator),
+      token.decoded.slice(separator + 1),
+    );
+  });
+}
+
+/**
+ * Remove only Trae CLI's process-scoped git-attribution injection.
+ *
+ * Starting/restarting Botmux from inside Trae can otherwise bake a managed
+ * `core.hooksPath` into the supervisor, every daemon and every CLI child. The
+ * spawned CLI does not inherit the matching helper contract, so Git's
+ * reference-transaction hook exits 127 and ordinary branch/worktree updates
+ * fail with `fatal: ref updates aborted by hook`.
+ *
+ * User-owned Git config is preserved: numbered slots are filtered and
+ * reindexed only when their shape is complete, and GIT_CONFIG_PARAMETERS keeps
+ * every unmatched raw token. Malformed numbered input is left untouched and
+ * reported instead of being guessed at.
+ */
+export function scrubTraeGitAttributionEnv(
+  env: NodeJS.ProcessEnv,
+  warn: (message: string) => void = message => console.warn(message),
+): TraeGitAttributionScrubResult {
+  const before = { ...env };
+  const warnings: string[] = [];
+  const report = (message: string) => {
+    warnings.push(message);
+    warn(message);
+  };
+
+  const countRaw = env.GIT_CONFIG_COUNT;
+  if (countRaw !== undefined) {
+    if (!/^\d+$/.test(countRaw)) {
+      report(`[git-env] preserving malformed GIT_CONFIG_COUNT=${JSON.stringify(countRaw)}`);
+    } else {
+      const count = Number(countRaw);
+      if (!Number.isSafeInteger(count) || count > 10_000) {
+        report(`[git-env] preserving out-of-range GIT_CONFIG_COUNT=${JSON.stringify(countRaw)}`);
+      } else {
+        const slots: Array<{ key: string; value: string }> = [];
+        let complete = true;
+        for (let index = 0; index < count; index++) {
+          const key = env[`GIT_CONFIG_KEY_${index}`];
+          const value = env[`GIT_CONFIG_VALUE_${index}`];
+          if (key === undefined || value === undefined) {
+            complete = false;
+            break;
+          }
+          slots.push({ key, value });
+        }
+        if (!complete) {
+          report(`[git-env] preserving discontinuous GIT_CONFIG_* slots for count=${count}`);
+        } else if (slots.some(slot => isTraeGitAttributionConfig(slot.key, slot.value))) {
+          const retained = slots.filter(slot => !isTraeGitAttributionConfig(slot.key, slot.value));
+          for (const key of Object.keys(env)) {
+            if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(key)) delete env[key];
+          }
+          env.GIT_CONFIG_COUNT = String(retained.length);
+          retained.forEach((slot, index) => {
+            env[`GIT_CONFIG_KEY_${index}`] = slot.key;
+            env[`GIT_CONFIG_VALUE_${index}`] = slot.value;
+          });
+        }
+      }
+    }
+  }
+
+  const parameters = env.GIT_CONFIG_PARAMETERS;
+  if (parameters !== undefined) {
+    const tokens = splitShellTokens(parameters);
+    if (!tokens) {
+      report('[git-env] preserving malformed GIT_CONFIG_PARAMETERS');
+    } else {
+      const retained = tokens.filter(token => {
+        const separator = token.decoded.indexOf('=');
+        if (separator < 0) return true;
+        return !isTraeGitAttributionConfig(
+          token.decoded.slice(0, separator),
+          token.decoded.slice(separator + 1),
+        );
+      });
+      if (retained.length !== tokens.length) {
+        if (retained.length > 0) env.GIT_CONFIG_PARAMETERS = retained.map(token => token.raw).join(' ');
+        else delete env.GIT_CONFIG_PARAMETERS;
+      }
+    }
+  }
+
+  // Do not leave a half-contract behind. If malformed/discontinuous Git input
+  // forced us to preserve a Trae hooksPath, preserve its helper variables too;
+  // otherwise the reference-transaction wrapper would remain selected but lose
+  // the helper it needs and deterministically abort every ref update. Clean the
+  // helper family only after all recognizable Trae hook references are gone.
+  if (!stillReferencesTraeGitAttribution(env)) {
+    for (const key of Object.keys(env)) {
+      if (key.startsWith(TRAE_GIT_ATTRIBUTION_ENV_PREFIX)) delete env[key];
+    }
+  }
+
+  const changedKeys = [...new Set([...Object.keys(before), ...Object.keys(env)])]
+    .filter(key => before[key] !== env[key])
+    .sort();
+  return { changedKeys, warnings };
+}
 
 /** Delete inherited session-only identity/capabilities from `env` in place. */
 export function scrubSessionTurnMarkerEnv(env: NodeJS.ProcessEnv): void {
+  scrubTraeGitAttributionEnv(env);
   scrubCliIdentityEnv(env);
   for (const key of SESSION_TURN_MARKER_ENV_KEYS) delete env[key];
 }
@@ -761,9 +989,17 @@ export function isBotmuxManagedTmuxServerGlobalEnvKey(key: string): boolean {
  *
  * Returns a fresh object; the input env is not mutated.
  */
-export function redactChildEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+export function redactChildEnv(
+  base: NodeJS.ProcessEnv,
+  additionalKeys: readonly string[] = [],
+): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
   for (const key of REDACTED_CHILD_ENV_KEYS) delete env[key];
+  for (const key of additionalKeys) delete env[key];
+  // Defense in depth for direct/PTY children and one-shot helpers. Long-lived
+  // Botmux boundaries scrub this earlier, but old or externally launched
+  // workers must not be able to pass the broken Trae hook contract onward.
+  scrubTraeGitAttributionEnv(env, () => {});
   // Minimum-exposure sweep for the Dashboard-only H5 login family: the named
   // keys above are already gone, this also catches any BOTMUX_DASHBOARD_FEISHU_H5_*
   // knob added later. No CLI child ever consumes one, so a prefix-wide strip

@@ -7,7 +7,8 @@ const workerSource = (): string => readFileSync(join(process.cwd(), 'src/worker.
 function extractMobileInputScript(source = workerSource()): string {
   const start = source.indexOf("if(isTouch&&hasToken){(function(){\n  document.body.classList.add('has-token');");
   expect(start, 'worker.ts 里找不到手机输入栏脚本').toBeGreaterThan(-1);
-  const endMarker = '\n})();}\n</script>';
+  // 输入栏脚本是顶格闭合的 IIFE；它后面还跟着底部面板等脚本，取第一个顶格闭合处。
+  const endMarker = '\n})();}\n';
   const end = source.indexOf(endMarker, start);
   expect(end, '手机输入栏脚本没有正常闭合').toBeGreaterThan(-1);
   // Execute the browser script after the outer TypeScript template literal has
@@ -73,13 +74,30 @@ class FakeElement {
 interface MobileHarness {
   bar: FakeElement;
   textarea: FakeElement;
+  terminal: FakeElement;
+  kbd: FakeElement;
+  cmds: FakeElement;
   controls: FakeElement[];
   shortcut(action: string): FakeElement | undefined;
   sentInputs(): string[];
   rootProperty(name: string): string | undefined;
   viewportResizeCount(): number;
+  keyboardUp(): boolean;
+  focusCount(): number;
+  setViewportHeight(height: number): void;
+  copySheetOpens: Array<Record<string, unknown>>;
+  quickSheetOpens: Array<Record<string, unknown>>;
+  notedInputs: string[];
   setWriteState: ((value: boolean | null) => void) | null;
   setInputMode?: ((mode: string) => void) | null;
+  mobileSend: ((seq: string) => boolean) | null;
+  mobileKeyboard: { open(): void; close(): void; isOpen(): boolean } | null;
+}
+
+// 一次真实的点按：先 pointerdown（底栏在这里记下按下时的键盘状态），再 click。
+function tap(el: FakeElement | undefined): void {
+  el?.dispatch('pointerdown');
+  el?.dispatch('click');
 }
 
 function bootMobileInput(options: {
@@ -90,6 +108,7 @@ function bootMobileInput(options: {
   textareaScrollHeight?: number;
   initialMode?: 'buffer' | 'live';
   onSyncMode?: (mode: string) => void;
+  visualViewport?: boolean;
 }): MobileHarness {
   const source = workerSource();
   const formStart = source.indexOf('<form id="mobile-input-bar"');
@@ -109,7 +128,9 @@ function bootMobileInput(options: {
   const send = new FakeElement('mobile-send');
   const hint = new FakeElement('mobile-live-hint');
   const terminal = new FakeElement('terminal');
-  const controls = [mode, textarea, send, ...shortcutButtons];
+  const kbd = new FakeElement('mobile-kbd');
+  const cmds = new FakeElement('mobile-cmds');
+  const controls = [mode, textarea, send, ...shortcutButtons, cmds, kbd];
   bar.descendants = controls;
 
   const byId = new Map<string, FakeElement>([
@@ -119,12 +140,15 @@ function bootMobileInput(options: {
     [send.id, send],
     [hint.id, hint],
     [terminal.id, terminal],
+    [kbd.id, kbd],
+    [cmds.id, cmds],
     ...shortcutButtons.map(button => [button.id, button] as const),
   ]);
   const rootProperties = new Map<string, string>();
   const body = new FakeElement('body');
   const documentStub = {
     body,
+    activeElement: body,
     documentElement: {
       style: {
         setProperty: (name: string, value: string) => rootProperties.set(name, value),
@@ -133,9 +157,35 @@ function bootMobileInput(options: {
     getElementById: (id: string) => byId.get(id) ?? null,
     querySelectorAll: (selector: string) => selector === '#mobile-bar-keys button' ? shortcutButtons : [],
   };
+  // 输入框有焦点 = 软键盘开着（浏览器里就是这样联动的）。
+  let focusCount = 0;
+  textarea.focus = () => {
+    if (documentStub.activeElement === textarea) return;
+    focusCount += 1;
+    documentStub.activeElement = textarea;
+    textarea.dispatch('focus');
+  };
+  textarea.blur = () => {
+    if (documentStub.activeElement !== textarea) return;
+    documentStub.activeElement = body;
+    textarea.dispatch('blur');
+  };
+  const copySheetOpens: Array<Record<string, unknown>> = [];
+  const quickSheetOpens: Array<Record<string, unknown>> = [];
+  const notedInputs: string[] = [];
+  let viewportResize: (() => void) | null = null;
+  const visualViewport = options.visualViewport
+    ? {
+        height: 844,
+        offsetTop: 0,
+        addEventListener: (type: string, callback: () => void) => {
+          if (type === 'resize') viewportResize = callback;
+        },
+      }
+    : undefined;
   const windowStub = {
     innerHeight: 844,
-    visualViewport: undefined,
+    visualViewport,
   };
   const sent: string[] = [];
   const ws = {
@@ -162,7 +212,14 @@ function bootMobileInput(options: {
     '_wbMobileWriteState',
     '_wbInitialMobileInputMode',
     '_wbSyncMobileInputMode',
-    `${extractMobileInputScript(source)}\nreturn {setWriteState:_wbMobileWriteState,setInputMode:_wbSetMobileInputMode};`,
+    '_wbMobileSend',
+    '_wbMobileKeyboard',
+    '_wbOpenCopySheet',
+    '_wbOpenQuickSheet',
+    '_wbToast',
+    '_wbNoteInput',
+    '_wbSheetTypingSync',
+    `${extractMobileInputScript(source)}\nreturn {setWriteState:_wbMobileWriteState,setInputMode:_wbSetMobileInputMode,send:_wbMobileSend,keyboard:_wbMobileKeyboard};`,
   )(
     true,
     true,
@@ -176,22 +233,46 @@ function bootMobileInput(options: {
     null,
     options.initialMode,
     options.onSyncMode,
+    null,
+    null,
+    (opts: Record<string, unknown>) => copySheetOpens.push(opts),
+    (opts: Record<string, unknown>) => quickSheetOpens.push(opts),
+    () => {},
+    (data: string) => notedInputs.push(data),
+    () => {},
   ) as {
     setWriteState: ((value: boolean | null) => void) | null;
     setInputMode: ((mode: string) => void) | null;
+    send: ((seq: string) => boolean) | null;
+    keyboard: MobileHarness['mobileKeyboard'];
   };
 
   for (const callback of resizeObservers) callback();
   return {
     bar,
     textarea,
+    terminal,
+    kbd,
+    cmds,
     controls,
     shortcut: action => shortcutButtons.find(button => button.getAttribute('data-sk') === action),
     sentInputs: () => sent.map(payload => JSON.parse(payload).data as string),
     rootProperty: name => rootProperties.get(name),
     viewportResizeCount: () => resizeCount,
+    keyboardUp: () => documentStub.activeElement === textarea,
+    focusCount: () => focusCount,
+    setViewportHeight: (height: number) => {
+      if (!visualViewport) throw new Error('boot with visualViewport: true');
+      visualViewport.height = height;
+      viewportResize?.();
+    },
+    copySheetOpens,
+    quickSheetOpens,
+    notedInputs,
     setWriteState: result.setWriteState,
     setInputMode: result.setInputMode,
+    mobileSend: result.send,
+    mobileKeyboard: result.keyboard,
   };
 }
 
@@ -219,7 +300,10 @@ describe('手机 Web 终端输入栏', () => {
     disconnected.bar.dispatch('submit');
     expect(disconnected.sentInputs()).toEqual([]);
     expect(disconnected.textarea.value).toBe('keep this draft');
-    expect(disconnected.controls.every(control => control.disabled)).toBe(true);
+    const copyKey = disconnected.shortcut('copy');
+    expect(disconnected.controls.filter(control => control !== copyKey).every(control => control.disabled)).toBe(true);
+    // 复制只读本地缓冲区，断线时照样能用。
+    expect(copyKey?.disabled).toBe(false);
 
     const connected = bootMobileInput({ wsHasWrite: true });
     connected.textarea.value = 'ship it';
@@ -235,10 +319,112 @@ describe('手机 Web 终端输入栏', () => {
     expect(page.setWriteState).toBeTypeOf('function');
     page.textarea.value = 'draft across reconnect';
     page.setWriteState?.(null);
-    expect(page.controls.every(control => control.disabled)).toBe(true);
+    const copyKey = page.shortcut('copy');
+    expect(page.controls.filter(control => control !== copyKey).every(control => control.disabled)).toBe(true);
+    expect(copyKey?.disabled).toBe(false);
     expect(page.textarea.value).toBe('draft across reconnect');
     page.setWriteState?.(true);
     expect(page.controls.every(control => !control.disabled)).toBe(true);
+  });
+
+  it('点终端区域收起键盘，不再把键盘弹出来', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    page.terminal.dispatch('click');
+    expect(page.keyboardUp()).toBe(false);
+
+    page.textarea.focus();
+    expect(page.keyboardUp()).toBe(true);
+    page.terminal.dispatch('click');
+    expect(page.keyboardUp()).toBe(false);
+  });
+
+  it('底栏按键不改变键盘开关：关着的不打开，开着的点完还开着', () => {
+    const closed = bootMobileInput({ wsHasWrite: true });
+    tap(closed.shortcut('esc'));
+    tap(closed.shortcut('ctrlc'));
+    tap(closed.controls.find(control => control.id === 'mobile-mode'));
+    expect(closed.sentInputs()).toEqual(['\x1b', '\x03']);
+    expect(closed.keyboardUp()).toBe(false);
+
+    const open = bootMobileInput({ wsHasWrite: true });
+    open.textarea.focus();
+    const esc = open.shortcut('esc');
+    esc?.dispatch('pointerdown');
+    // iOS 偶尔仍在按钮的 mousedown 上让输入框失焦：点击处理要按按下时的状态把键盘留住。
+    open.textarea.blur();
+    esc?.dispatch('click');
+    expect(open.sentInputs()).toEqual(['\x1b']);
+    expect(open.keyboardUp()).toBe(true);
+  });
+
+  it('键盘按钮在弹出和收起之间切换，aria-pressed 反映当前状态', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    expect(page.kbd.getAttribute('aria-pressed')).toBe('false');
+    tap(page.kbd);
+    expect(page.keyboardUp()).toBe(true);
+    expect(page.kbd.getAttribute('aria-pressed')).toBe('true');
+    tap(page.kbd);
+    expect(page.keyboardUp()).toBe(false);
+    expect(page.kbd.getAttribute('aria-pressed')).toBe('false');
+  });
+
+  it('系统只收键盘不失焦（Android 返回键）时，键盘按钮显示已收起，再点会重新弹出', () => {
+    vi.useFakeTimers();
+    try {
+      const page = bootMobileInput({ wsHasWrite: true, visualViewport: true });
+      tap(page.kbd);
+      page.setViewportHeight(844 - 320);
+      vi.advanceTimersByTime(200);
+      expect(page.kbd.getAttribute('aria-pressed')).toBe('true');
+
+      page.setViewportHeight(844);
+      vi.advanceTimersByTime(200);
+      expect(page.keyboardUp()).toBe(true);
+      expect(page.kbd.getAttribute('aria-pressed')).toBe('false');
+
+      // 已聚焦的输入框再 focus 一次不会弹键盘，必须真的重新聚焦。
+      const focusesBefore = page.focusCount();
+      tap(page.kbd);
+      expect(page.focusCount()).toBe(focusesBefore + 1);
+      expect(page.kbd.getAttribute('aria-pressed')).toBe('true');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('复制键断线时也能打开复制面板，并带上按下时的键盘状态', () => {
+    const offline = bootMobileInput({ wsHasWrite: null, readyState: 3 });
+    tap(offline.shortcut('copy'));
+    expect(offline.copySheetOpens).toEqual([{ restoreKeyboard: false }]);
+    expect(offline.sentInputs()).toEqual([]);
+
+    const typing = bootMobileInput({ wsHasWrite: true });
+    typing.textarea.focus();
+    tap(typing.shortcut('copy'));
+    expect(typing.copySheetOpens).toEqual([{ restoreKeyboard: true }]);
+  });
+
+  it('指令按钮打开快捷指令面板，面板走底栏同一条输入通道发送', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    page.textarea.focus();
+    tap(page.cmds);
+    expect(page.quickSheetOpens).toEqual([{ restoreKeyboard: true }]);
+    expect(page.mobileSend?.('/compact')).toBe(true);
+    expect(page.sentInputs()).toEqual(['/compact']);
+    // 发出去的字节都报给输入行估计，快捷指令靠它判断自动回车会不会拼上残留的字。
+    expect(page.notedInputs).toEqual(['/compact']);
+
+    // 实时模式下先把输入框里还没同步的字发出去，再发指令，顺序不乱。
+    const live = bootMobileInput({ wsHasWrite: true, initialMode: 'live' });
+    live.textarea.value = 'ab';
+    expect(live.mobileSend?.('\x1b')).toBe(true);
+    expect(live.sentInputs()).toEqual(['ab\x1b']);
+    expect(live.notedInputs).toEqual(['ab\x1b']);
+
+    const offline = bootMobileInput({ wsHasWrite: null, readyState: 3 });
+    expect(offline.mobileSend?.('/compact')).toBe(false);
+    expect(offline.notedInputs).toEqual([]);
+    expect(offline.cmds.disabled).toBe(true);
   });
 
   it('快捷键行提供 ←/→，发送标准 ANSI 左右方向序列', () => {

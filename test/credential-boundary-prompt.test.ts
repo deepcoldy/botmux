@@ -6,7 +6,7 @@
  * file. That makes two properties worth pinning:
  *
  *   1. It reaches BOTH prompt paths. Claude-family adapters build their own
- *      system prompt; codex/gemini get an inline one. A block present in only
+ *      system prompt; codex/opencode get an inline one. A block present in only
  *      one is a silent hole in whichever CLI the operator happens to run.
  *   2. It says what not to do AND what to do instead. "Don't read those files"
  *      alone leaves an agent debugging an auth failure with no alternative —
@@ -19,9 +19,10 @@ import {
   buildCredentialBoundaryBlock,
   buildBotmuxSystemPromptText,
 } from '../src/adapters/cli/shared-hints.js';
-import { buildNewTopicPrompt } from '../src/core/session-manager.js';
+import { buildNewTopicPrompt, buildFollowUpCliInput } from '../src/core/session-manager.js';
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
+import { larkToolPrompt } from '../src/core/lark-tool-binding.js';
 
 const policy = parseTriggerUserAuthConfig({ enabled: true })!;
 
@@ -195,6 +196,31 @@ describe('buildBotmuxSystemPromptText — claude-family path', () => {
     expect(text).not.toContain('<botmux_credentials>');
   });
 
+  it.each(['zh', 'en'] as const)('describes headless bot-only access in system and inline prompts (%s)', locale => {
+    const appId = 'cli_headless';
+    stubbedBots.set(appId, { config: { larkAppId: appId, backendType: 'pty' } });
+    const headlessId = 'hl_11111111-1111-4111-8111-111111111111';
+    stubbedSessions.set('headless-session', { headless: { id: headlessId, source: 'cli' } });
+    try {
+      const system = buildBotmuxSystemPromptText({ locale, larkToolAppId: appId, noTransport: true });
+      const inline = buildNewTopicPrompt(
+        'read the linked doc', 'headless-session', 'codex', undefined, undefined, undefined,
+        undefined, undefined, undefined, locale, undefined,
+        { larkAppId: appId, chatId: `headless_${headlessId}`, larkToolResume: false },
+      );
+      const firstRun = buildFollowUpCliInput('read the linked doc', 'headless-session', {
+        larkAppId: appId, chatId: `headless_${headlessId}`, cliId: 'codex', locale,
+      }).content;
+      const expectedPolicy = larkToolPrompt(appId, locale, true);
+      const interactivePolicy = larkToolPrompt(appId, locale, false);
+      expect(expectedPolicy).not.toBe(interactivePolicy);
+      for (const prompt of [system, inline, firstRun]) {
+        expect(prompt).toContain(`<botmux_lark_tool>\n  ${expectedPolicy}\n</botmux_lark_tool>`);
+        expect(prompt).not.toContain(interactivePolicy);
+      }
+    } finally { stubbedBots.delete(appId); }
+  });
+
   it.each(['codex-app', 'dsh', 'mir'] as const)(
     '%s does not duplicate the managed lark app on argv',
     (cli) => {
@@ -233,7 +259,7 @@ describe('buildBotmuxSystemPromptText — claude-family path', () => {
  * covered.
  *
  * The claude-family assertions above go through buildBotmuxSystemPromptText.
- * codex/gemini/… never call it: they get the block inline, from
+ * codex/opencode/… never call it: they get the block inline, from
  * buildNewTopicPrompt. Until this suite existed, deleting the inline push left
  * every test green — and the inline CLIs then ran with no credential constraint
  * at all, which in a release with no kernel-level isolation is the whole

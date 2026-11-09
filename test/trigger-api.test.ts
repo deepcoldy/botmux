@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 vi.mock('../src/services/trigger-log-store.js', () => ({ appendTriggerLog: vi.fn() }));
 
 import { buildUntrustedEventPrompt } from '../src/core/trigger-session.js';
-import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
+import { validateTriggerRequest, TRIGGER_SOURCE_TYPES, type TriggerRequest } from '../src/services/trigger-types.js';
 import { dispatchTriggerRequest, queryTriggerResult } from '../src/dashboard/trigger-api.js';
 
 function request(): TriggerRequest {
@@ -34,6 +34,45 @@ describe('trigger request contract', () => {
     const v = validateTriggerRequest(bad);
     expect(v.ok).toBe(false);
     if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+  });
+
+  it('accepts payloadTrusted only as literal true on a webhook turn', () => {
+    const ok = request();
+    ok.payloadTrusted = true;
+    expect(validateTriggerRequest(ok).ok).toBe(true);
+    for (const mutate of [
+      (r: any) => { r.payloadTrusted = 'true'; },
+      (r: any) => { r.payloadTrusted = false; },
+      (r: any) => { r.payloadTrusted = 1; },
+      (r: any) => { r.payloadTrusted = true; r.source.type = 'headless'; },
+      (r: any) => { r.payloadTrusted = true; r.source.type = 'vc_meeting'; },
+      (r: any) => { r.payloadTrusted = true; r.source.type = 'ui'; },
+      (r: any) => { r.payloadTrusted = true; r.target = { kind: 'workflow', botId: 'app1', chatId: 'oc_1', workflowId: 'w' }; },
+    ]) {
+      const bad = request() as any;
+      mutate(bad);
+      const v = validateTriggerRequest(bad);
+      expect(v.ok).toBe(false);
+      if (!v.ok) expect(v.status).toBe(400);
+    }
+  });
+
+  it('accepts every known connector source type and rejects unknown ones', () => {
+    for (const type of TRIGGER_SOURCE_TYPES) {
+      const req = request();
+      req.source = { ...req.source, type };
+      expect(validateTriggerRequest(req).ok, type).toBe(true);
+    }
+    for (const badType of ['email', 'EMAIL', '', 'webhoox', 42, undefined]) {
+      const bad = request() as any;
+      bad.source = { ...bad.source, type: badType };
+      const v = validateTriggerRequest(bad);
+      expect(v.ok, String(badType)).toBe(false);
+      if (!v.ok) {
+        expect(v.status).toBe(400);
+        expect(v.body.errorCode).toBe('bad_request');
+      }
+    }
   });
 
   it('accepts a custom or suppressed topic message and rejects malformed presentation', () => {

@@ -10,10 +10,17 @@
 import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync, chmodSync, utimesSync } from 'node:fs';
-import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
+import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync, lstatSync, chmodSync, utimesSync } from 'node:fs';
+import { createServer, type Server } from 'node:net';
+import { once } from 'node:events';
+import { buildCredentialOnlySandboxArgs, buildRelayHostArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, sandboxTarOptions, attachSandboxOutbox, sandboxTreeSurvivesWorkerExit, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, coreOnlyPidNamespaceDegradeDecision, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
+import { buildCredentialIsolationRules } from '../src/adapters/cli/read-isolation.js';
+import { protectedMcpHomeDenyPaths, protectedMcpHomePaths, type ProtectedMcpWorkerPolicy } from '../src/core/protected-mcp-capabilities.js';
+import { PROTECTED_HTTP_EGRESS_SOCKET_ENV, protectedHttpEgressAuthTokenPath } from '../src/core/protected-http-egress-host.js';
+import { materializeProtectedHttpLoopbackArgs } from '../src/core/protected-http-egress-loopback.js';
+import type { NetworkLaunchPlan } from '../src/core/sandbox-network-launch.js';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
 
@@ -40,6 +47,189 @@ describe('prepareDirectSandbox platform gate', () => {
     });
     expect(r).toBeNull();
   });
+});
+
+describe('prepareDirectSandbox protected egress socket mount', () => {
+  async function listen(path: string): Promise<Server> {
+    const server = createServer();
+    server.listen(path);
+    await once(server, 'listening');
+    return server;
+  }
+
+  it('carries the actual Codex argument boundary through the shell and bwrap launch plan', async () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-provider-argv-'));
+    const socketDir = join(root, 'sockets');
+    const dataDir = join(root, 'data');
+    mkdirSync(socketDir, { mode: 0o700 });
+    mkdirSync(dataDir);
+    const gatewayPath = join(socketDir, 'g.sock');
+    const egressPath = join(socketDir, 'e.sock');
+    const gateway = await listen(gatewayPath);
+    const egress = await listen(egressPath);
+    const prompt = 'Keep http://127.0.0.1:0 in this prompt unchanged';
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({
+        sessionId: 'provider-argv', dataDir,
+        policy: { rules: [], net: true, writeRegexes: [] },
+        networkPolicy: { version: 1, public: { mode: 'allow' }, private: { mode: 'allow' } },
+        chdir: root, home: root, cliBin: '/bin/true',
+        cliArgs: ['-c', 'model_providers.fixture.base_url="http://127.0.0.1:0/relay"', '--', prompt],
+        mcpGatewaySocketPath: gatewayPath,
+        protectedEgressSocketPath: egressPath,
+        protectedHttpBridge: {
+          socketPath: egressPath, policyId: 'fixture.write.v1', targetIndex: 0,
+          placeholderOrigin: 'http://127.0.0.1:0',
+        },
+      });
+      expect(plan).not.toBeNull();
+      const launch = JSON.parse(Buffer.from(plan!.args.at(-1)!, 'base64').toString('utf8')) as NetworkLaunchPlan;
+      const result = materializeProtectedHttpLoopbackArgs(
+        launch.args, 'http://127.0.0.1:0', 'http://127.0.0.1:43123', launch.protectedHttpBridgeArgsOffset,
+      );
+      const offset = launch.protectedHttpBridgeArgsOffset!;
+      expect(result.slice(offset)).toEqual([
+        '-c', 'model_providers.fixture.base_url="http://127.0.0.1:43123/relay"', '--', prompt,
+      ]);
+      expect(result[offset - 1]).toBe(realpathSync('/bin/true'));
+      expect(result.slice(0, offset)).toEqual(launch.args.slice(0, offset));
+    } finally {
+      plan?.cleanup();
+      await Promise.all([new Promise<void>(resolve => gateway.close(() => resolve())), new Promise<void>(resolve => egress.close(() => resolve()))]);
+      rmSandboxScratch(root);
+    }
+  });
+
+  it('mounts the shared private socket directory once and exposes only sandbox socket paths', async () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-protected-egress-'));
+    const socketDir = join(root, 'sockets');
+    const dataDir = join(root, 'data');
+    mkdirSync(socketDir, { mode: 0o700 });
+    mkdirSync(dataDir);
+    const gatewayPath = join(socketDir, 'g.sock');
+    const egressPath = join(socketDir, 'e.sock');
+    const gateway = await listen(gatewayPath);
+    const egress = await listen(egressPath);
+    mkdirSync(dirname(protectedHttpEgressAuthTokenPath(egressPath)), { mode: 0o700 });
+    writeFileSync(protectedHttpEgressAuthTokenPath(egressPath), 'host-auth-token-fixture\n', { mode: 0o600 });
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({
+        sessionId: 'protected-egress',
+        dataDir,
+        policy: { rules: [], net: true, writeRegexes: [] },
+        chdir: root,
+        home: root,
+        cliBin: '/bin/true',
+        cliArgs: [],
+        mcpGatewaySocketPath: gatewayPath,
+        protectedEgressSocketPath: egressPath,
+      });
+      expect(plan).not.toBeNull();
+      const args = plan!.args;
+      const mounts = args.filter((value, index) => value === '--ro-bind'
+        && args[index + 1] === realpathSync(socketDir)
+        && args[index + 2] === '/run/botmux-mcp');
+      expect(mounts).toHaveLength(1);
+      expect(plan!.env.BOTMUX_MCP_GATEWAY_SOCKET).toBe('/run/botmux-mcp/g.sock');
+      expect(plan!.env[PROTECTED_HTTP_EGRESS_SOCKET_ENV]).toBe('/run/botmux-mcp/e.sock');
+      expect(plan!.env.BOTMUX_PROTECTED_EGRESS_PROTOCOL).toBe('shared-read-v1');
+      const childArgv = args.slice(args.lastIndexOf('--') + 1);
+      expect(JSON.stringify({ childArgv, env: plan!.env })).not.toContain(socketDir);
+      expect(JSON.stringify({ args, env: plan!.env })).not.toContain('host-auth-token-fixture');
+    } finally {
+      plan?.cleanup();
+      await Promise.all([new Promise<void>(resolve => gateway.close(() => resolve())), new Promise<void>(resolve => egress.close(() => resolve()))]);
+      rmSandboxScratch(root);
+    }
+  });
+
+  it('carries a route-scoped local-service bridge in the network runner without mounting an MCP socket', async () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-local-service-bridge-'));
+    const socketDir = join(root, 'sockets');
+    const dataDir = join(root, 'data');
+    mkdirSync(socketDir, { mode: 0o700 });
+    mkdirSync(dataDir);
+    const egressPath = join(socketDir, 'e.sock');
+    const egress = await listen(egressPath);
+    mkdirSync(dirname(protectedHttpEgressAuthTokenPath(egressPath)), { mode: 0o700 });
+    writeFileSync(protectedHttpEgressAuthTokenPath(egressPath), 'host-auth-token-fixture\n', { mode: 0o600 });
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({
+        sessionId: 'local-service-bridge',
+        dataDir,
+        policy: { rules: [], net: true, writeRegexes: [] },
+        networkPolicy: { version: 1, public: { mode: 'allow' }, private: { mode: 'allow' } },
+        chdir: root,
+        home: root,
+        cliBin: '/bin/true',
+        cliArgs: [],
+        localServiceBridges: [{
+          socketPath: egressPath,
+          serviceId: 'lark-tool-identity',
+          listenPort: 7950,
+          method: 'POST',
+          path: '/api/sessions/session-a/lark-tool-identity',
+          forwardHeaders: ['content-type', 'x-botmux-lark-session'],
+          attestProcessPeer: true,
+        }],
+      });
+      expect(plan).not.toBeNull();
+      const encoded = plan!.args.at(-1)!;
+      const launch = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
+      expect(launch.localServiceBridges).toEqual([{
+        socketPath: egressPath,
+        serviceId: 'lark-tool-identity',
+        listenPort: 7950,
+        method: 'POST',
+        path: '/api/sessions/session-a/lark-tool-identity',
+        forwardHeaders: ['content-type', 'x-botmux-lark-session'],
+        attestProcessPeer: true,
+      }]);
+      expect(plan!.env.BOTMUX_MCP_GATEWAY_SOCKET).toBeUndefined();
+      expect(plan!.env[PROTECTED_HTTP_EGRESS_SOCKET_ENV]).toBeUndefined();
+    } finally {
+      plan?.cleanup();
+      await new Promise<void>(resolve => egress.close(() => resolve()));
+      rmSandboxScratch(root);
+    }
+  });
+
+  it('rejects an egress socket outside the MCP directory or a non-socket leaf', async () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-protected-egress-invalid-'));
+    const socketDir = join(root, 'sockets');
+    const otherDir = join(root, 'other');
+    const dataDir = join(root, 'data');
+    mkdirSync(socketDir, { mode: 0o700 });
+    mkdirSync(otherDir, { mode: 0o700 });
+    mkdirSync(dataDir);
+    const gatewayPath = join(socketDir, 'g.sock');
+    const outsidePath = join(otherDir, 'e.sock');
+    const gateway = await listen(gatewayPath);
+    const outside = await listen(outsidePath);
+    const nonSocket = join(socketDir, 'not-a-socket');
+    writeFileSync(nonSocket, 'x');
+    const common = {
+      sessionId: 'protected-egress-invalid', dataDir,
+      policy: { rules: [], net: true, writeRegexes: [] },
+      chdir: root, home: root, cliBin: '/bin/true', cliArgs: [],
+      mcpGatewaySocketPath: gatewayPath,
+    };
+    try {
+      expect(prepareDirectSandbox({ ...common, protectedEgressSocketPath: outsidePath })).toBeNull();
+      expect(prepareDirectSandbox({ ...common, protectedEgressSocketPath: nonSocket })).toBeNull();
+    } finally {
+      await Promise.all([new Promise<void>(resolve => gateway.close(() => resolve())), new Promise<void>(resolve => outside.close(() => resolve()))]);
+      rmSandboxScratch(root);
+    }
+  });
+
 });
 
 describe('credential-only managed-origin carve-out', () => {
@@ -109,6 +299,77 @@ describe('credential-only managed-origin carve-out', () => {
   });
 });
 
+describe('configured protected MCP credential masks', () => {
+  const policy: ProtectedMcpWorkerPolicy = {
+    capabilities: [],
+    protectedHomePaths: ['.fixture-credential', '.missing-fixture-credential'],
+    redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+  };
+
+  it('keeps missing declared Home paths in credential-only deny masks', () => {
+    const home = '/home/fixture';
+    const protectedPaths = protectedMcpHomePaths(home, policy);
+    const rules = buildCredentialIsolationRules({ homeDir: home, botmuxHome: `${home}/.botmux` }, protectedPaths);
+    const missing = `${home}/.missing-fixture-credential`;
+    expect(rules.denyPaths).toContain(missing);
+    const args = buildCredentialOnlySandboxArgs({
+      hideDirectories: [missing],
+      hideFiles: [],
+      workingDir: '/workspace',
+      cliBin: '/usr/bin/true',
+      cliArgs: [],
+    });
+    expect(args.slice(args.indexOf('--tmpfs', args.indexOf('--dev')))).toContain(missing);
+  });
+
+  it('keeps a protected symlink path lexical instead of resolving to its target', () => {
+    const home = mkdtempSync(join(tmpdir(), 'protected-home-'));
+    const target = join(home, 'credential-target');
+    const link = join(home, '.fixture-credential');
+    writeFileSync(target, 'secret');
+    symlinkSync(target, link);
+    try {
+      const [protectedPath] = protectedMcpHomePaths(home, policy);
+      expect(protectedPath).toBe(link);
+      expect(lstatSync(protectedPath).isSymbolicLink()).toBe(true);
+      const args = buildCredentialOnlySandboxArgs({
+        hideDirectories: [],
+        hideFiles: [protectedPath],
+        workingDir: home,
+        cliBin: '/usr/bin/true',
+        cliArgs: [],
+      });
+      expect(args).toContain(link);
+      expect(args).not.toContain(realpathSync(link));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed before a protected Home deny can follow an intermediate symlink', () => {
+    const home = mkdtempSync(join(tmpdir(), 'protected-parent-home-'));
+    const outside = mkdtempSync(join(tmpdir(), 'protected-parent-outside-'));
+    symlinkSync(outside, join(home, 'nested'));
+    const nestedPolicy: ProtectedMcpWorkerPolicy = {
+      capabilities: [],
+      protectedHomePaths: ['nested/credential.json'],
+      redactEnv: ['FIXTURE_SECRET'],
+    };
+    try {
+      expect(() => {
+        const protectedPaths = protectedMcpHomeDenyPaths(home, nestedPolicy);
+        buildCredentialIsolationRules(
+          { homeDir: home, botmuxHome: join(home, '.botmux') },
+          protectedPaths,
+        );
+      }).toThrow(/protected MCP Home path.*symbolic link/i);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+});
+
 // The pid-namespace degrade (drop --unshare-pid for a nested sandbox that can't
 // mount /proc in a new pid ns) MUST be gated to core-only. On a normal/mixed
 // fleet a sibling transport bot's worker carries LARK_APP_SECRET in its env, so
@@ -140,6 +401,24 @@ describe('coreOnlyPidNamespaceDegrade gate (credential-safety)', () => {
       // the result must be the negation of the raw probe.
       const canUnshare = bwrapCanUnsharePid();
       expect(coreOnlyPidNamespaceDegrade()).toBe(!canUnshare);
+    } finally {
+      if (prev === undefined) delete process.env.BOTMUX_CORE_ONLY;
+      else process.env.BOTMUX_CORE_ONLY = prev;
+      __testOnly_resetPidNamespaceProbe();
+    }
+  });
+
+  it('never drops the PID namespace when any credential-bearing host channel is exposed', () => {
+    expect(coreOnlyPidNamespaceDegradeDecision({
+      coreOnly: true,
+      canUnsharePid: false,
+      credentialBearingHostChannel: true,
+    })).toBe(false);
+    const prev = process.env.BOTMUX_CORE_ONLY;
+    process.env.BOTMUX_CORE_ONLY = '1';
+    __testOnly_resetPidNamespaceProbe();
+    try {
+      expect(coreOnlyPidNamespaceDegrade({ credentialBearingHostChannel: true })).toBe(false);
     } finally {
       if (prev === undefined) delete process.env.BOTMUX_CORE_ONLY;
       else process.env.BOTMUX_CORE_ONLY = prev;
@@ -215,6 +494,47 @@ describe('prepareDirectSandbox canonicalizes the exec bin (symlinked-$HOME)', ()
       expect(r.args[index + 1]).toBe(join(dir, 'session-temp'));
     }
     r.cleanup();
+  });
+});
+
+// Root daemon + --unshare-user maps only uid 0, so GNU tar's default
+// --same-owner chown of a foreign-owned archive fails inside the sandbox.
+describe('sandbox TAR_OPTIONS', () => {
+  it('adds --no-same-owner for a root worker and keeps an operator value', () => {
+    expect(sandboxTarOptions(undefined, 0)).toBe('--no-same-owner');
+    expect(sandboxTarOptions('  ', 0)).toBe('--no-same-owner');
+    expect(sandboxTarOptions('--warning=no-timestamp', 0)).toBe('--warning=no-timestamp --no-same-owner');
+  });
+
+  it('leaves an explicit owner choice and non-root workers alone', () => {
+    expect(sandboxTarOptions('--same-owner', 0)).toBeUndefined();
+    expect(sandboxTarOptions('-v --no-same-owner', 0)).toBeUndefined();
+    expect(sandboxTarOptions(undefined, 1000)).toBeUndefined();
+    expect(sandboxTarOptions(undefined, undefined)).toBeUndefined();
+  });
+
+  it('reaches the bwrap child of a root worker', () => {
+    if (process.platform !== 'linux' || process.getuid?.() !== 0) return;
+    const dir = mkdtempSync(join(tmpdir(), 'sbx-tar-'));
+    const r = prepareDirectSandbox({
+      sessionId: 'taropts', dataDir: tmp(),
+      policy: { rules: [], net: true, writeRegexes: [] },
+      chdir: dir, home: dir, cliBin: '/bin/true', cliArgs: [],
+    });
+    if (!r) return; // bwrap unavailable on this host
+    const index = r.args.indexOf('TAR_OPTIONS');
+    expect(r.args[index - 1]).toBe('--setenv');
+    expect(r.args[index + 1]).toContain('--no-same-owner');
+    r.cleanup();
+    // The bot's own value is the base, not the daemon's.
+    const own = prepareDirectSandbox({
+      sessionId: 'taropts2', dataDir: tmp(),
+      policy: { rules: [], net: true, writeRegexes: [] },
+      chdir: dir, home: dir, cliBin: '/bin/true', cliArgs: [],
+      childTarOptions: '--warning=no-timestamp',
+    })!;
+    expect(own.args[own.args.indexOf('TAR_OPTIONS') + 1]).toBe('--warning=no-timestamp --no-same-owner');
+    own.cleanup();
   });
 });
 
@@ -472,6 +792,25 @@ describe('sandbox tree cleanup', () => {
 // blocker: only plain outbox basenames + allowlisted flags pass; raw argv /
 // path flags / sandbox-chosen session-id are rejected.
 describe('validateRelayRequest', () => {
+  it('rebuilds relayed images and files with their original media flags', () => {
+    expect(buildRelayHostArgs({
+      command: 'send',
+      flags: ['--no-mention'],
+      contentPath: '/stage/content',
+      imagePaths: ['/stage/preview.png'],
+      attachmentPaths: ['/stage/report.pdf'],
+      videoPaths: [],
+      videoCoverPaths: [],
+      sessionId: 'session-1',
+    })).toEqual([
+      '--no-mention',
+      '--content-file', '/stage/content',
+      '--images', '/stage/preview.png',
+      '--files', '/stage/report.pdf',
+      '--session-id', 'session-1',
+    ]);
+  });
+
   it('forces host-relayed cards to use probe-free lexical link repair', () => {
     expect(buildRelayHostEnv({
       BOTMUX_SEND_RELAY: '/sandbox/outbox',
@@ -495,7 +834,8 @@ describe('validateRelayRequest', () => {
       contentFile: 'c.content',
       preparedContentFile: 'c.card-content',
       completionProposalFile: 'c.completion-proposal.json',
-      attachments: ['a.png'],
+      images: ['preview.png'],
+      attachments: ['report.pdf'],
       videos: ['replay.mp4'],
       videoCovers: ['cover.png'],
       flags: ['--mention-back', '--mention', 'ou:X', '--voice'],
@@ -505,7 +845,8 @@ describe('validateRelayRequest', () => {
     expect(r.value.contentName).toBe('c.content');
     expect(r.value.preparedContentName).toBe('c.card-content');
     expect(r.value.completionProposalName).toBe('c.completion-proposal.json');
-    expect(r.value.attachmentNames).toEqual(['a.png']);
+    expect(r.value.imageNames).toEqual(['preview.png']);
+    expect(r.value.attachmentNames).toEqual(['report.pdf']);
     expect(r.value.videoNames).toEqual(['replay.mp4']);
     expect(r.value.videoCoverNames).toEqual(['cover.png']);
     expect(r.value.flags).toEqual(['--mention-back', '--mention', 'ou:X', '--voice']);
@@ -698,6 +1039,7 @@ describe('validateRelayRequest', () => {
   it('rejects non-basename content / attachment names (../ traversal)', () => {
     expect(validateRelayRequest({ contentFile: '../../etc/passwd' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', preparedContentFile: '../prepared' }).ok).toBe(false);
+    expect(validateRelayRequest({ contentFile: 'c.content', images: ['../preview.png'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', attachments: ['../secret'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', cardFile: '../card.json' }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'c.content', completionProposalFile: '../proposal.json' }).ok).toBe(false);
@@ -705,6 +1047,17 @@ describe('validateRelayRequest', () => {
     expect(validateRelayRequest({ contentFile: 'c.content', videoCovers: ['../cover.png'] }).ok).toBe(false);
     expect(validateRelayRequest({ contentFile: 'a/b' }).ok).toBe(false);
     expect(validateRelayRequest({ /* missing contentFile */ flags: [] }).ok).toBe(false);
+  });
+
+  it('rejects cards and every media field on a dispatch relay (send-only payloads)', () => {
+    const dispatchBase = { command: 'dispatch' as const, contentFile: 'c.brief', flags: [] };
+    expect(validateRelayRequest({ ...dispatchBase, images: ['preview.png'] }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, attachments: ['report.pdf'] }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, videos: ['replay.mp4'] }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, videoCovers: ['cover.png'] }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, preparedContentFile: 'c.card-content' }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, cardFile: 'c.card.json' }).ok).toBe(false);
+    expect(validateRelayRequest({ ...dispatchBase, completionProposalFile: 'c.proposal.json' }).ok).toBe(false);
   });
 });
 

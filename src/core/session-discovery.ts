@@ -2,7 +2,7 @@
  * Session Discovery — scans tmux panes for running CLI processes that can be adopted.
  *
  * Discovers non-botmux tmux sessions running known CLI binaries (Claude Code,
- * Codex, Aiden, CoCo, Cursor, Gemini, OpenCode, MTR, Hermes, TRAE, Pi) and collects metadata needed to adopt them.
+ * Codex, Aiden, CoCo, Cursor, OpenCode, MTR, Hermes, TRAE, Pi) and collects metadata needed to adopt them.
  */
 import { execFileSync, execSync } from 'node:child_process';
 import { readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
@@ -13,6 +13,7 @@ import { CLI_DISPLAY_NAMES } from '../adapters/cli/display-names.js';
 import { executableBasename } from '../adapters/cli/runtime.js';
 import { readClaudeSessionMeta } from '../services/claude-transcript.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
+import { isZombieProcess } from './session-scope.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
 import { findTraexRolloutByPid, readTraexThreadTitle } from '../services/traex-transcript.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
@@ -96,7 +97,6 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   // TRAE（traex）是另一套 Codex 系 CLI，可执行就叫 `traex`，与上面 CoCo 的
   // traecli 别名是两个不同的二进制（traecli 是 coco 的软链）。
   traex: 'traex',
-  gemini: 'gemini',
   opencode: 'opencode',
   opencode2: 'opencode2',
   mimo: 'mimocode',
@@ -289,10 +289,14 @@ export function cliIdForComm(
 }
 
 /** /proc/<pid>/cmdline → argv (Linux fast path; ps fallback for macOS). */
-export function readCmdline(pid: number): string[] {
+export function readCmdline(pid: number, options: { exact?: boolean } = {}): string[] {
   try {
     return readFileSync(`/proc/${pid}/cmdline`, 'utf-8').split('\0').filter(Boolean);
   } catch {
+    // `ps args` loses argv boundaries. It remains useful for executable
+    // discovery, but cannot distinguish a command from words inside a prompt
+    // or an option value (macOS and procfs-denied Linux).
+    if (options.exact) return [];
     try {
       const out = execFileSync('ps', ['-o', 'args=', '-p', String(pid)], {
         encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'],
@@ -301,6 +305,37 @@ export function readCmdline(pid: number): string[] {
       return out.trim().split(/\s+/).filter(Boolean);
     } catch { return []; }
   }
+}
+
+const CODEX_VALUE_OPTIONS = new Set([
+  '-c', '--config', '-m', '--model', '-p', '--profile', '-s', '--sandbox',
+  '-a', '--ask-for-approval', '-C', '--cd', '-i', '--image', '--add-dir',
+  '--enable', '--disable', '--local-provider', '--remote', '--remote-auth-token-env',
+]);
+const CODEX_NONINTERACTIVE_COMMANDS = new Set([
+  'debug', 'completion', 'exec', 'e', 'review', 'login', 'logout', 'mcp',
+  'mcp-server', 'app-server', 'exec-server', 'app', 'sandbox', 'apply', 'a',
+  'cloud', 'features', 'help', 'update', 'doctor', 'plugin', 'remote-control',
+  'queue', 'archive', 'unarchive', 'delete', 'migrate-rollouts', 'migrate-nfs-db',
+]);
+
+/** A wrapper may run a Codex metadata command before starting the actual TUI.
+ *  Inspect only the root command, skipping known option values: a model/profile
+ *  called "debug", or a prompt after `--`, must not look like a probe. Missing
+ *  argv retains the comm-based contract used when process inspection is denied. */
+export function isNonInteractiveCodexArgv(argv: string[]): boolean {
+  let interactiveSubcommand = false;
+  for (let index = 1; index < argv.length; index++) {
+    const arg = argv[index]!;
+    if (arg === '--') return false;
+    if (CODEX_VALUE_OPTIONS.has(arg)) { index++; continue; }
+    if (arg === '--help' || arg === '-h' || arg === '--version' || arg === '-V') return true;
+    if (arg.startsWith('-')) continue;
+    if (interactiveSubcommand) continue;
+    if (arg === 'resume' || arg === 'fork') { interactiveSubcommand = true; continue; }
+    return CODEX_NONINTERACTIVE_COMMANDS.has(arg);
+  }
+  return false;
 }
 
 /**
@@ -439,7 +474,7 @@ function clockTicksPerSecond(): number {
 /**
  * 进程启动时间（epoch ms），best-effort。让 /adopt 选择卡片能为**任意** CLI 显示
  * 真实运行时长，而不是只有 Claude（Claude 另有 ~/.claude/sessions/<pid>.json 带
- * startedAt）。其它 CLI（cursor/codex/coco/gemini…）之前一律落 "未知" 就是因为
+ * startedAt）。其它 CLI（cursor/codex/coco…）之前一律落 "未知" 就是因为
  * 这里没有兜底。
  *
  * Linux 走 /proc/<pid>/stat（字段 22 = starttime，单位时钟滴答，自开机起算）+
@@ -488,13 +523,24 @@ export function readProcessStartTime(pid: number): number | undefined {
  * 低频操作（只在用户 /adopt 时跑一遍）。
  */
 export function getChildPids(pid: number): number[] {
+  return snapshotChildPids()(pid);
+}
+
+/**
+ * Read the process table ONCE and answer "children of pid" from that copy.
+ * A BFS over a deep launch chain (sandbox launchers stack 7+ levels) calling
+ * {@link getChildPids} per node would fork `ps` once per visited process on
+ * every retry tick; a snapshot keeps it at one fork per walk. An unreadable
+ * table yields no children (same as getChildPids' failure mode).
+ */
+export function snapshotChildPids(): (pid: number) => number[] {
+  const byParent = new Map<number, number[]>();
   try {
     const out = execSync('ps -A -o pid= -o ppid=', {
       encoding: 'utf-8',
       maxBuffer: PROCESS_TABLE_MAX_BUFFER,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    const children: number[] = [];
     for (const line of out.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed) continue;
@@ -502,14 +548,15 @@ export function getChildPids(pid: number): number[] {
       if (parts.length < 2) continue;
       const childPid = Number(parts[0]);
       const parentPid = Number(parts[1]);
-      if (!isNaN(childPid) && !isNaN(parentPid) && parentPid === pid) {
-        children.push(childPid);
-      }
+      if (isNaN(childPid) || isNaN(parentPid)) continue;
+      const siblings = byParent.get(parentPid);
+      if (siblings) siblings.push(childPid);
+      else byParent.set(parentPid, [childPid]);
     }
-    return children;
   } catch {
-    return [];
+    // ps unavailable: every lookup answers "no children".
   }
+  return pid => [...(byParent.get(pid) ?? [])];
 }
 
 /**
@@ -575,6 +622,14 @@ function hasCliProcess(
 }
 
 /**
+ * How deep the Codex ownership search descends below its launch root. Under the
+ * network-policy sandbox the CLI sits 7 levels below the session-scope sh (8
+ * below an OSC relay); see the measured chain in traex-leaf-pid.ts. An npm
+ * install adds its Node launcher on top of that.
+ */
+export const CODEX_LEAF_SEARCH_DEPTH = 16;
+
+/**
  * Resolve the REAL CLI pid spawned underneath a wrapperCli launcher
  * (e.g. `aiden x claude`, where the launcher forks real Claude Code as a child).
  *
@@ -584,11 +639,12 @@ function hasCliProcess(
  * session-id discovery and leaves the JSONL bridge watching a path the real CLI
  * never writes. This walks the launcher's DESCENDANTS to find the actual CLI.
  *
- * Matching is by process `comm` ONLY — deliberately NOT argv. The launcher's own
+ * Executable matching is by process `comm`, not by searching argv. The launcher's own
  * argv carries the target name as a literal token (`aiden x claude` → "claude"
  * is in argv), so argv-scanning (cliIdFromCommArgv) would misidentify the
  * launcher itself as the CLI. The real CLI process has the binary as its comm
- * (`claude`, `codex`, …); the launcher's comm is its own (`node`/`aiden`).
+ * (`claude`, `codex`, …); the launcher's comm is its own (`node`/`aiden`). Codex
+ * additionally excludes noninteractive commands such as `debug models`.
  *
  * BFS starts at the launcher's children (never the launcher node) and returns
  * the shallowest descendant recognized as `targetCliId`, or null if none exists
@@ -599,11 +655,18 @@ export function findLaunchedCliPid(
   targetCliId: CliId,
   maxDepth = 6,
   // Injectable process probes (defaults hit the real OS); tests pass fakes.
-  probes: { childrenOf?: (pid: number) => number[]; commOf?: (pid: number) => string | undefined } = {},
+  probes: {
+    childrenOf?: (pid: number) => number[];
+    commOf?: (pid: number) => string | undefined;
+    cmdlineOf?: (pid: number) => string[];
+    isZombie?: (pid: number) => boolean;
+  } = {},
   filterExecutable?: string,
 ): number | null {
   const childrenOf = probes.childrenOf ?? getChildPids;
   const commOf = probes.commOf ?? readComm;
+  const cmdlineOf = probes.cmdlineOf ?? (pid => readCmdline(pid, { exact: true }));
+  const isZombie = probes.isZombie ?? isZombieProcess;
   let frontier = childrenOf(launcherPid);
   const seen = new Set<number>([launcherPid]);
   for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
@@ -612,7 +675,11 @@ export function findLaunchedCliPid(
       if (seen.has(pid)) continue;
       seen.add(pid);
       const comm = commOf(pid);
-      if (comm && cliIdForComm(comm, targetCliId, filterExecutable) === targetCliId) return pid;
+      if (comm && cliIdForComm(comm, targetCliId, filterExecutable) === targetCliId) {
+        if (targetCliId === 'codex'
+          && (isZombie(pid) || isNonInteractiveCodexArgv(cmdlineOf(pid)))) continue;
+        return pid;
+      }
       next.push(...childrenOf(pid));
     }
     frontier = next;
@@ -1144,7 +1211,7 @@ function resolveAdoptableSessionForPane(
 
   // 5b. Fall back to the CLI process's own start time for uptime. Without
   // this only Claude (which has a session JSON with startedAt) shows a real
-  // uptime; every other CLI — cursor/codex/coco/gemini… — rendered "未知".
+  // uptime; every other CLI — cursor/codex/coco… — rendered "未知".
   if (startedAt === undefined) {
     startedAt = readProcessStartTime(cliPid);
   }

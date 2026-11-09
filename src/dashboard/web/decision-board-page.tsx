@@ -46,7 +46,12 @@ import {
   BOARD_ACTOR_LABEL_KEYS,
   BOARD_EMPTY_VIEW_KEYS,
   BOARD_EVENT_KIND_KEYS,
+  BOARD_EXPLAINER_SANDBOX,
+  boardExplainers,
+  eventFileKind,
+  formatBoardBytes,
   BOARD_FILES_PER_DRAFT,
+  BOARD_HINT_LABEL_KEYS,
   BOARD_IMAGE_TYPES,
   BOARD_VIEW_LABEL_KEYS,
   BOARD_VIEW_ORDER,
@@ -56,11 +61,15 @@ import {
   boardItemHash,
   boardRelativeTime,
   boardSummaryHash,
+  chatTaskLine,
+  chatTaskSummaryText,
   checkBoardImages,
   draftFromServer,
   draftNeedsReview,
   isDraftEmpty,
   itemChatView,
+  knownHint,
+  knownTaskHint,
   newSubmitNonce,
   nonChatLinks,
   orderSubmitCandidates,
@@ -73,10 +82,17 @@ import {
   submitPayloadItems,
   submitScope,
   textPreview,
+  TASK_HINT_LABEL_KEYS,
+  type ChatTaskState,
+  type ItemTaskFields,
+  type TaskHint,
   type BoardBatch,
   type BoardDetailResponse,
   type BoardDraft,
   type BoardEvent,
+  type BoardExplainer,
+  type BoardFile,
+  type BoardHint,
   type BoardItem,
   type BoardListResponse,
   type BoardRoute,
@@ -186,6 +202,91 @@ function JoinChatLink(props: { link: RenderedLink; className: string; children: 
 function UnverifiedTag() {
   const tr = useT();
   return <span className="dboard-chat-tag is-warn" title={tr('decisionBoard.chatUnverifiedTitle')}>{tr('decisionBoard.chatUnverified')}</span>;
+}
+
+/** 汇总行里的巡检提示：标签 + 原因（触屏上没有悬停，原因直接写出来）。 */
+function HintChip(props: { hint: BoardHint | undefined }) {
+  const tr = useT();
+  const hint = knownHint(props.hint);
+  if (!hint) return null;
+  return (
+    <span className="dboard-hint-row" data-hint={hint.kind}>
+      <span className={`dboard-hint-chip is-${hint.kind}`}>💡 {tr(BOARD_HINT_LABEL_KEYS[hint.kind])}</span>
+      <span className="dboard-hint-reason">{hint.reason}</span>
+    </span>
+  );
+}
+
+/** 详情页标题下的一行：「建议关闭：PR … 已合入（巡检发现，状态没改…）」。 */
+function HintBanner(props: { hint: BoardHint | undefined }) {
+  const tr = useT();
+  const hint = knownHint(props.hint);
+  if (!hint) return null;
+  return (
+    <p className={`dboard-hint-banner is-${hint.kind}`} data-hint={hint.kind} role="note">
+      💡 {tr('decisionBoard.hintDetail', { label: tr(BOARD_HINT_LABEL_KEYS[hint.kind]), reason: hint.reason })}
+    </p>
+  );
+}
+
+/** 子任务提示：关联群里有管家还没处理的新结果（只是提示，状态没改）。 */
+function TaskHintChip(props: { hint: TaskHint | undefined; banner?: boolean }) {
+  const tr = useT();
+  const hint = knownTaskHint(props.hint);
+  if (!hint) return null;
+  const label = tr(TASK_HINT_LABEL_KEYS[hint.kind]);
+  if (props.banner) {
+    return <p className={`dboard-hint-banner is-${hint.kind}`} data-task-hint={hint.kind} role="note">🔔 {tr('decisionBoard.taskHintDetail', { label })}</p>;
+  }
+  return (
+    <span className="dboard-hint-row" data-task-hint={hint.kind}>
+      <span className={`dboard-hint-chip is-${hint.kind}`}>🔔 {label}</span>
+    </span>
+  );
+}
+
+/** 汇总行里的关联群状态：单群写状态、时间和一句话；多群写汇总。 */
+function RowTaskLine(props: { item: ItemTaskFields; now: number }) {
+  const tr = useT();
+  const chats = props.item.taskChats;
+  if (!chats?.length) return null;
+  if (chats.length > 1) {
+    return <span className="dboard-row-task" data-fresh={props.item.taskFresh ? 'true' : undefined}>{chatTaskSummaryText(chats, tr)}</span>;
+  }
+  const line = chatTaskLine(chats[0]!, props.now, tr);
+  if (!line) return null;
+  return (
+    <span className="dboard-row-task" data-task={chats[0]!.kind} data-fresh={props.item.taskFresh ? 'true' : undefined}>
+      <span className="dboard-task-label">{line.label}</span>
+      {line.time ? <span className="dboard-task-time">{line.time}</span> : null}
+      {line.text ? <span className="dboard-task-text">{line.text}</span> : null}
+    </span>
+  );
+}
+
+/** 详情页：每个关联群的子任务状态（状态、时间、一句话）；进群链接在上面的群列表里。 */
+function TaskChatsPanel(props: { chats: ChatTaskState[] | undefined; links: RenderedLink[]; now: number }) {
+  const tr = useT();
+  if (!props.chats?.length) return null;
+  return (
+    <section className="dboard-tasks" aria-label={tr('decisionBoard.taskTitle')}>
+      <span className="dboard-chats-label">{tr('decisionBoard.taskTitle')}</span>
+      <ul className="dboard-tasks-list">
+        {props.chats.map(state => {
+          const line = chatTaskLine(state, props.now, tr);
+          const link = props.links.find(l => l.kind === 'chat' && l.ref === state.chatId);
+          return (
+            <li key={state.chatId} className="dboard-task" data-task={state.kind}>
+              <span className="dboard-task-chat">{link?.text ?? state.chatId}</span>
+              {line ? <span className="dboard-task-label">{line.label}</span> : null}
+              {line?.time ? <span className="dboard-task-time">{line.time}</span> : null}
+              {line?.text ? <span className="dboard-task-text">{line.text}</span> : null}
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
 }
 
 /** 汇总行标题下的一行：主群名（+N 个群）/ 无群：原因 / ⚠ 缺群。 */
@@ -521,13 +622,17 @@ function BoardRow(props: { appId: string; item: BoardListResponse['items'][numbe
             </span>
           ) : null}
           {item.pendingDecisions > 0 ? <span className="dboard-row-pending">{tr('decisionBoard.pendingShort')}</span> : null}
+          <HintChip hint={item.hint} />
+          <TaskHintChip hint={item.taskHint} />
           <RowChatLine view={chat} />
+          <RowTaskLine item={item} now={props.now} />
         </span>
         <span className="dboard-row-meta">
           <StateChip state={item.state} stage={item.stage} />
           {item.repo ? <span className="dboard-row-repo">{item.repo}</span> : null}
           <span className="dboard-row-time">{boardRelativeTime(item.updatedAt, props.now, tr)}</span>
           {item.hasDraft ? <span className="dboard-row-draft">{tr('decisionBoard.draftMark')}</span> : null}
+          {item.explainers ? <span className="dboard-row-explainer">📎 {tr('decisionBoard.explainerTitle')}</span> : null}
         </span>
       </a>
       <span className="dboard-row-join">
@@ -892,9 +997,11 @@ function SaveStatus(props: { editor: DraftEditor }) {
 
 // ─── 详情页 ─────────────────────────────────────────────────────────────────
 
-function EventRow(props: { appId: string; event: BoardEvent }) {
+function EventRow(props: { appId: string; event: BoardEvent; files: ReadonlyMap<string, BoardFile> }) {
   const tr = useT();
   const { event } = props;
+  const images = event.fileIds.filter(id => eventFileKind(id, props.files) === 'image');
+  const explainers = event.fileIds.filter(id => eventFileKind(id, props.files) !== 'image');
   return (
     <li className={`dboard-event dboard-event-${event.actor}`}>
       <div className="dboard-event-head">
@@ -906,16 +1013,98 @@ function EventRow(props: { appId: string; event: BoardEvent }) {
         </span>
       </div>
       {event.text ? <div className="dboard-event-text">{event.text}</div> : null}
-      {event.fileIds.length ? (
+      {images.length ? (
         <div className="dboard-thumbs">
-          {event.fileIds.map(id => (
+          {images.map(id => (
             <a key={id} className="dboard-thumb" href={boardFileUrl(props.appId, id)} target="_blank" rel="noopener noreferrer" title={tr('decisionBoard.openImage')}>
               <img src={boardFileUrl(props.appId, id)} alt="" loading="lazy" />
             </a>
           ))}
         </div>
       ) : null}
+      {explainers.length ? (
+        <div className="dboard-event-files">
+          {explainers.map(id => (
+            <a key={id} className="dboard-link" href={boardFileUrl(props.appId, id)} target="_blank" rel="noopener noreferrer">
+              {eventFileKind(id, props.files) === 'video' ? '🎬' : '📄'} {props.files.get(id)?.name}
+            </a>
+          ))}
+        </div>
+      ) : null}
     </li>
+  );
+}
+
+function ExplainerVideo(props: { url: string; name: string }) {
+  const tr = useT();
+  const [failed, setFailed] = useState(false);
+  return (
+    <>
+      <video className="dboard-explainer-video" src={props.url} controls preload="metadata" playsInline aria-label={props.name}
+        onError={() => setFailed(true)} />
+      {failed ? <p className="dboard-warn">{tr('decisionBoard.explainerVideoFailed')}</p> : null}
+    </>
+  );
+}
+
+function ExplainerDialog(props: { appId: string; explainer: BoardExplainer | null; onClose(): void }) {
+  const tr = useT();
+  const { explainer } = props;
+  return (
+    <ModalDialog open={!!explainer} className="dboard-explainer-dialog" aria-label={explainer?.name} onRequestClose={props.onClose}>
+      {explainer ? (
+        <>
+          <div className="dboard-explainer-bar">
+            <strong>{explainer.name}</strong>
+            <a href={boardFileUrl(props.appId, explainer.id)} target="_blank" rel="noopener noreferrer">{tr('decisionBoard.explainerNewTab')}</a>
+            <button type="button" onClick={props.onClose}>{tr('decisionBoard.close')}</button>
+          </div>
+          <iframe className="dboard-explainer-dialog-frame" src={boardFileUrl(props.appId, explainer.id)} sandbox={BOARD_EXPLAINER_SANDBOX}
+            referrerPolicy="no-referrer" title={explainer.name} />
+        </>
+      ) : null}
+    </ModalDialog>
+  );
+}
+
+/**
+ * 管家附的说明页和视频。说明页嵌在 sandbox iframe 里（完全限制，响应头另有 CSP sandbox），视频用页内播放器；
+ * 飞书侧栏里新标签页不一定带得上登录态，所以页内就能看完。
+ */
+function ExplainerPanel(props: { appId: string; files: readonly BoardFile[] }) {
+  const tr = useT();
+  const [fullscreen, setFullscreen] = useState<BoardExplainer | null>(null);
+  const explainers = boardExplainers(props.files);
+  if (!explainers.length) return null;
+  return (
+    <section className="dboard-block dboard-explainers">
+      <h2 className="dboard-block-title">
+        {tr('decisionBoard.explainerTitle')}
+        <small>{tr('decisionBoard.explainerHint')}</small>
+      </h2>
+      {explainers.map(x => {
+        const url = boardFileUrl(props.appId, x.id);
+        return (
+          <figure key={x.id} className={`dboard-explainer is-${x.kind}`} data-file-id={x.id}>
+            <figcaption className="dboard-explainer-head">
+              <span className="dboard-explainer-name">{x.kind === 'video' ? '🎬' : '📄'} {x.name}</span>
+              <span className="dboard-explainer-size">{formatBoardBytes(x.bytes)}</span>
+              <span className="dboard-explainer-actions">
+                {x.kind === 'html' ? (
+                  <button type="button" className="dboard-text-btn" onClick={() => setFullscreen(x)}>{tr('decisionBoard.explainerFullscreen')}</button>
+                ) : null}
+                <a href={url} target="_blank" rel="noopener noreferrer">{tr('decisionBoard.explainerNewTab')}</a>
+              </span>
+            </figcaption>
+            {x.kind === 'html' ? (
+              <iframe className="dboard-explainer-frame" src={url} sandbox={BOARD_EXPLAINER_SANDBOX} referrerPolicy="no-referrer"
+                loading="lazy" title={x.name} />
+            ) : <ExplainerVideo url={url} name={x.name} />}
+          </figure>
+        );
+      })}
+      <ExplainerDialog appId={props.appId} explainer={fullscreen} onClose={() => setFullscreen(null)} />
+    </section>
   );
 }
 
@@ -1165,6 +1354,7 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
       : tr('decisionBoard.recommendOnly', { key: item.recommend }))
     : '';
   const meta = [item.repo, item.kind, tr('decisionBoard.updated', { time: boardRelativeTime(item.updatedAt, now, tr) })].filter(Boolean).join(' · ');
+  const filesById = new Map(detail.files.map(f => [f.id, f] as const));
 
   return (
     <section className="page dboard-page dboard-detail" data-seq={seq}>
@@ -1175,11 +1365,15 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
         <StateChip state={item.state} stage={item.stage} />
       </header>
       <p className="dboard-detail-meta">{meta}</p>
+      <HintBanner hint={item.hint} />
+      <TaskHintChip hint={detail.taskHint} banner />
       <ChatPanel seq={item.seq} view={itemChatView(item, detail.links)} />
+      <TaskChatsPanel chats={detail.taskChats} links={detail.links} now={now} />
       <LinkChips links={nonChatLinks(detail.links)} />
       {item.summary?.trim() ? (
         <p className="dboard-summary"><span className="dboard-summary-label">{tr('decisionBoard.summaryLabel')}</span>{item.summary}</p>
       ) : null}
+      <ExplainerPanel appId={appId} files={detail.files} />
       {loadError ? <p className="hint-warn">{tr('decisionBoard.loadFailed', { error: loadError.text })}</p> : null}
 
       {item.progress?.trim() ? (
@@ -1311,7 +1505,7 @@ export function ItemDetailView(props: { appId: string; seq: number }) {
         <h2 className="dboard-block-title">{tr('decisionBoard.historyTitle')}</h2>
         {detail.events.length ? (
           <ol className="dboard-events">
-            {detail.events.map(event => <EventRow key={event.id} appId={appId} event={event} />)}
+            {detail.events.map(event => <EventRow key={event.id} appId={appId} event={event} files={filesById} />)}
           </ol>
         ) : <p className="dboard-empty-line">{tr('decisionBoard.historyEmpty')}</p>}
       </section>

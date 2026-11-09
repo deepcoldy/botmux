@@ -5,6 +5,8 @@ import { isAbsolute, join, relative, sep } from 'node:path';
 import { resolveCommand } from '../adapters/cli/registry.js';
 import { JsonRpcStdioCore } from '../utils/jsonrpc-stdio.js';
 import { MIN_POLL_REQUEST_BUDGET_MS } from '../core/codex-poll-budget.js';
+import { provisionIsolatedTitleConfig, resolveSourceCodexHome, type TitleConfigFailure } from './codex-title-config.js';
+import { logger } from '../utils/logger.js';
 
 type JsonObject = Record<string, any>;
 
@@ -126,8 +128,15 @@ export interface SetCodexAppThreadNameOptions {
   codexBin?: string;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
+  /** Timeout of each app-server request: thread/name/set and the read that
+   *  verifies it. Default 7000ms. Also the default of the two below. */
   timeoutMs?: number;
   initializeTimeoutMs?: number;
+  /** Total time to wait for the existing preview / an updatedAt past
+   *  `waitForUpdatedAfter` before writing the title anyway. Defaults to
+   *  `timeoutMs`. Separate because running out of it is an expected outcome,
+   *  while each request after it still needs a real request timeout (#2454). */
+  waitBudgetMs?: number;
   signal?: AbortSignal;
   detached?: boolean;
   waitForExistingPreview?: boolean;
@@ -149,6 +158,8 @@ export interface ReadCodexAppThreadMetadataOptions {
 export interface GenerateCodexAppThreadTitleOptions {
   sourceText: string;
   codexBin?: string;
+  /** Trusted wrapper prefix arguments, before the app-server subcommand. */
+  codexArgs?: readonly string[];
   env?: NodeJS.ProcessEnv;
   model?: string;
   timeoutMs?: number;
@@ -185,9 +196,10 @@ class CodexAppServerProbe {
     signal?: AbortSignal,
     detached = false,
     registerForceClose?: (forceClose: () => void) => (() => void),
+    prefixArgs: readonly string[] = [],
   ) {
     this.useProcessGroup = detached && process.platform !== 'win32';
-    this.child = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
+    this.child = spawn(codexBin, [...prefixArgs, 'app-server', '--listen', 'stdio://'], {
       cwd,
       env,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -580,13 +592,21 @@ function withAbort<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
   });
 }
 
-/** 标题线程只继承登录凭证，不加载用户的 MCP、插件、hooks 或全局 Skill 配置。 */
+/**
+ * 标题线程只继承登录凭证与 provider 接线（`model` / `model_provider` /
+ * `model_providers`），不加载用户的 MCP、插件、hooks、projects 或全局 Skill 配置。
+ *
+ * provider 必须在场：只带 auth.json 会让自定义网关 Bot 掉回 codex 内置 `openai`
+ * provider —— 要么直接失败（永远占位名），要么用宿主 ChatGPT 账号在默认端点偷偷
+ * 计费。源 config.toml 存在却读不安全/解析失败时 fail closed（返回失败原因，调用方
+ * 放弃本次标题），宁可不改名也不走错 provider。
+ */
 function isolatedCodexTitleEnv(
   sourceEnv: NodeJS.ProcessEnv | undefined,
   scratchDir: string,
-): NodeJS.ProcessEnv {
+): { env: NodeJS.ProcessEnv } | { failed: TitleConfigFailure } {
   const env: NodeJS.ProcessEnv = { ...(sourceEnv ?? process.env) };
-  const sourceCodexHome = env.CODEX_HOME?.trim() || join(homedir(), '.codex');
+  const sourceCodexHome = resolveSourceCodexHome(env, homedir());
   const isolatedCodexHome = join(scratchDir, 'codex-home');
   mkdirSync(isolatedCodexHome, { recursive: true, mode: 0o700 });
   try {
@@ -599,10 +619,12 @@ function isolatedCodexTitleEnv(
   } catch {
     // API key / 自定义 provider 可完全依赖环境变量；凭证复制失败时交给 app-server 回退。
   }
+  const config = provisionIsolatedTitleConfig(sourceCodexHome, isolatedCodexHome);
+  if (!config.ok) return { failed: config.reason };
   env.CODEX_HOME = isolatedCodexHome;
   delete env.BOTMUX_MCP_GATEWAY_REQUIRED;
   delete env.BOTMUX_MCP_GATEWAY_SOCKET;
-  return env;
+  return { env };
 }
 
 /**
@@ -624,13 +646,19 @@ export async function generateCodexAppThreadTitle(
   try {
     scratchDir = mkdtempSync(join(tmpdir(), 'botmux-codex-title-'));
     const codexBin = resolveCommand(opts.codexBin ?? 'codex');
+    const isolated = isolatedCodexTitleEnv(opts.env, scratchDir);
+    if ('failed' in isolated) {
+      logger.warn(`[codex-title] isolated home refused (${isolated.failed}); skipping title generation`);
+      return undefined;
+    }
     client = new CodexAppServerProbe(
       codexBin,
       scratchDir,
-      isolatedCodexTitleEnv(opts.env, scratchDir),
+      isolated.env,
       undefined,
       opts.detached,
       opts.registerForceClose,
+      opts.codexArgs,
     );
     const wait = <T>(promise: Promise<T>, label: string): Promise<T> => (
       client!.withTimeout(withAbort(promise, opts.signal), remaining(), label)
@@ -707,6 +735,7 @@ export async function listCodexAppThreads(opts: ListCodexAppThreadsOptions = {})
 /** 等待首条消息预览落盘后设置最终标题；预览缺失时超时兜底写入。 */
 export async function setCodexAppThreadName(opts: SetCodexAppThreadNameOptions): Promise<void> {
   const timeoutMs = opts.timeoutMs ?? 7000;
+  const waitBudgetMs = opts.waitBudgetMs ?? timeoutMs;
   const codexBin = resolveCommand(opts.codexBin ?? 'codex');
   const cwd = opts.cwd ?? process.cwd();
   const client = new CodexAppServerProbe(
@@ -720,10 +749,10 @@ export async function setCodexAppThreadName(opts: SetCodexAppThreadNameOptions):
   try {
     await client.initialize(opts.initializeTimeoutMs ?? timeoutMs);
     if (opts.waitForExistingPreview) {
-      await client.waitForThreadPreview(opts.threadId, timeoutMs);
+      await client.waitForThreadPreview(opts.threadId, waitBudgetMs);
     }
     if (opts.waitForUpdatedAfter !== undefined) {
-      await client.waitForThreadUpdatedAfter(opts.threadId, opts.waitForUpdatedAfter, timeoutMs);
+      await client.waitForThreadUpdatedAfter(opts.threadId, opts.waitForUpdatedAfter, waitBudgetMs);
     }
     for (let attempt = 0; attempt < 3; attempt += 1) {
       await client.withTimeout(client.request('thread/name/set', {

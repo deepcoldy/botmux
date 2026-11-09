@@ -118,6 +118,41 @@ function allActions(card: any): any[] {
     .flatMap((e: any) => e.actions ?? []);
 }
 
+/** Recursively flatten every card node, including column_set grids, action
+ *  containers and collapsible panels (the streaming card nests controls in
+ *  all three after the keys-panel redesign). */
+function walkNodes(nodes: any[]): any[] {
+  const out: any[] = [];
+  for (const n of nodes ?? []) {
+    if (!n || typeof n !== 'object') continue;
+    out.push(n);
+    if (Array.isArray(n.actions)) out.push(...walkNodes(n.actions));
+    if (Array.isArray(n.columns)) out.push(...walkNodes(n.columns.flatMap((c: any) => c.elements ?? [])));
+    if (Array.isArray(n.elements)) out.push(...walkNodes(n.elements));
+    if (Array.isArray(n.options)) out.push(...n.options);
+  }
+  return out;
+}
+
+function allButtons(card: any): any[] {
+  return walkNodes(card.elements).filter((n: any) => n.tag === 'button');
+}
+
+/** The streaming card's single collapsible panel holds the low-frequency
+ *  controls behind a titled 「更多操作」 header. */
+function morePanel(card: any): any {
+  return walkNodes(card.elements).find((n: any) => n.tag === 'collapsible_panel');
+}
+
+function panelButtons(card: any): any[] {
+  const panel = morePanel(card);
+  return panel ? walkNodes(panel.elements).filter((n: any) => n.tag === 'button') : [];
+}
+
+function findPanelButton(card: any, action: string): any {
+  return panelButtons(card).find((b: any) => b.value?.action === action);
+}
+
 describe('buildAdoptSelectCard (V2 picker)', () => {
   // Helper: flatten the V2 card body to the markdown text of each session card.
   const cardTexts = (card: any): string[] =>
@@ -345,6 +380,15 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     // Escaped form is "!\[x\](…)"; the unescaped "![x](" must NOT survive.
     expect(md).toContain('\\[x\\]');
     expect(md).not.toContain('![x](');
+  });
+
+  it('offers a clear-search button on no match that re-fires adopt_search', () => {
+    const resumable = [{ cliSessionId: 'aaa', cwd: '/home/proj', title: 'unrelated', lastActivityAt: 1 }];
+    const card = parse(buildAdoptSelectCard([], 'om_root', 'en', resumable, { searchQuery: 'ja' }));
+    const buttons = (card.body.elements ?? []).filter((e: any) => e.tag === 'button');
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0].behaviors[0].value.action).toBe('adopt_search');
+    expect(buttons[0].behaviors[0].value.selected).toBe('');
   });
 
   const herdrLive = (extra: Partial<AdoptableSession> = {}): AdoptableSession => ({
@@ -699,10 +743,6 @@ describe('getCliDisplayName', () => {
     expect(getCliDisplayName('codex')).toBe('Codex');
   });
 
-  it('should return "Gemini" for gemini', () => {
-    expect(getCliDisplayName('gemini')).toBe('Gemini');
-  });
-
   it('should return "OpenCode" for opencode', () => {
     expect(getCliDisplayName('opencode')).toBe('OpenCode');
   });
@@ -817,6 +857,57 @@ describe('buildConfigCard', () => {
     // Sentinel first = "clear and follow the CLI/model default".
     expect(select.options.map((o: any) => o.value)).toEqual(['__unset__', 'low', 'high', 'max']);
     expect(select.initial_option).toBe('max');
+  });
+
+  it('shows the shared-bot sandbox advice only when the data carries it, as short lines plus a folded CLI list', () => {
+    const texts = (card: any) => JSON.stringify(card.elements ?? card.body?.elements ?? card);
+    const plain = parse(buildConfigCard(configData(null), 'zh'));
+    // CLI display names legitimately appear in the CLI dropdown; the advice
+    // block has its own markers that must be absent without sandboxAdvice.
+    expect(texts(plain)).not.toContain('建议开启白名单隔离');
+    expect(texts(plain)).not.toContain('已验证可用的 CLI');
+
+    const card = (cliSupport: 'verified' | 'unverified' | 'unsupported' | 'wrapper' | 'blocked', cliId: string, reasons: string[] = ['oncall']) =>
+      parse(buildConfigCard({ ...configData(null), sandboxAdvice: { reasons, cliSupport, cliId } }, 'zh'));
+    const elementsOf = (c: any): any[] => c.elements ?? c.body?.elements ?? [];
+    const adviceBlock = (c: any) => elementsOf(c).find((e: any) => e.tag === 'markdown' && String(e.content).includes('建议开启白名单隔离'));
+    const fold = (c: any) => elementsOf(c).find((e: any) => e.tag === 'collapsible_panel');
+
+    const verified = card('verified', 'codex', ['oncall', 'allowedUsers']);
+    // One fact per line: headline, why, the reasons, where to turn it on, the current CLI.
+    expect(String(adviceBlock(verified).content).split('\n')).toEqual([
+      '**⚠️ 建议开启白名单隔离**',
+      '这个 bot 被多人使用，群成员可以通过 agent 读到本机凭证。',
+      '原因：开了 Oncall 值班模式、allowedUsers 有多人',
+      '开启：Dashboard → Bot 配置 → 文件沙盒，新会话生效',
+      '当前 CLI：Codex，已验证可用',
+    ]);
+    // The verified list sits in a folded panel, not in the advice text.
+    // Literal list, not derived from the table: it must be the matrix result in table order.
+    expect(fold(verified).expanded).toBe(false);
+    expect(fold(verified).header.title.content).toBe('已验证可用的 CLI（Linux 实测）');
+    expect(fold(verified).elements[0].content).toBe('Claude、Codex、Antigravity、OpenCode、Pi、Oh My Pi、Grok Build、Kimi');
+    expect(String(adviceBlock(verified).content)).not.toContain('Grok Build');
+
+    // Each support state gets its own CLI line; the dynamic keys resolve to text.
+    const cliLine = (c: any) => String(adviceBlock(c).content).split('\n').at(-1);
+    expect(cliLine(card('unsupported', 'codex-app'))).toBe('当前 CLI：Codex App，暂不支持白名单隔离，请改用 Codex');
+    expect(cliLine(card('unverified', 'relay'))).toBe('当前 CLI：Relay，还没验证过，开启前先在测试会话里试一下');
+    expect(cliLine(card('wrapper', 'claude-code'))).toBe('当前 CLI：Claude，通过 wrapper 启动。开启白名单隔离后 wrapper 仍在沙盒内运行；若 wrapper 依赖的路径不在白名单内会明确报错拒绝启动，把这些路径加进沙盒白名单（只读/读写）即可');
+    expect(String(adviceBlock(card('verified', 'codex', ['allowedChatGroups'])).content)).toContain('原因：allowedChatGroups 授权了整群发言');
+    expect(texts(card('wrapper', 'claude-code'))).not.toContain('card.config.sandbox_advice');
+
+    // A local-but-sandbox-refusing backend (herdr/zellij/zmx/orca): no "turn it
+    // on" action line and no verified-list fold — they would brick sessions.
+    const backendBlocked = card('blocked', 'claude-code');
+    expect(String(adviceBlock(backendBlocked).content).split('\n')).toEqual([
+      '**⚠️ 建议开启白名单隔离**',
+      '这个 bot 被多人使用，群成员可以通过 agent 读到本机凭证。',
+      '原因：开了 Oncall 值班模式',
+      '当前会话后端不支持文件沙盒（开启后新会话会起不来）；请先把后端切换为 tmux 或 pty，再回来开启',
+    ]);
+    expect(fold(backendBlocked)).toBeUndefined();
+    expect(String(adviceBlock(backendBlocked).content)).not.toContain('开启：Dashboard');
   });
 
   it('renders card-behaviour toggles', () => {
@@ -1136,16 +1227,16 @@ describe('buildSessionCard', () => {
 
     it('can include local attach buttons for non-resume CLIs when mode-aware readiness is true', () => {
       enableLocalCliOpen();
-      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'gemini', false, false, 'en', true));
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'mimocode', false, false, 'en', true));
       const actions = findActions(card);
       const btn = actions.find((a: any) => a.value?.action === 'open_local_cli');
-      expect(btn?.value.cli_id).toBe('gemini');
-      expect(btn?.text.content).toBe('💻 Open Gemini');
+      expect(btn?.value.cli_id).toBe('mimocode');
+      expect(btn?.text.content).toBe('💻 Open MiMoCode');
     });
 
     it('does not include local-CLI open buttons when precise local resume is unavailable', () => {
       enableLocalCliOpen();
-      for (const cli of ['codex-app', 'gemini', 'mira', 'mir', undefined] as const) {
+      for (const cli of ['codex-app', 'mimocode', 'mira', 'mir', undefined] as const) {
         const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, cli));
         const actions = findActions(card);
         expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
@@ -1195,11 +1286,11 @@ describe('buildSessionCard', () => {
     });
 
     it('should include restart button with CLI display name', () => {
-      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'gemini', true));
+      const card = parse(buildSessionCard(SID, ROOT, URL, TITLE, 'opencode', true));
       const actions = findActions(card);
       const restartBtn = actions.find((a: any) => a.value?.action === 'restart');
       expect(restartBtn).toBeDefined();
-      expect(restartBtn.text.content).toContain('Gemini');
+      expect(restartBtn.text.content).toContain('OpenCode');
       expect(restartBtn.value.root_id).toBe(ROOT);
       expect(restartBtn.value.session_id).toBe(SID);
     });
@@ -1670,11 +1761,11 @@ describe('buildStreamingCard', () => {
       expect(hrElements).toHaveLength(0);
     });
 
-    it('should show toggle button text as "显示输出"', () => {
+    it('should show a "显示输出" button inside the more-actions panel', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, 'hidden'));
-      const actions = findActions(card);
-      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_display');
-      expect(toggleBtn.text.content).toContain('显示输出');
+      const btn = findPanelButton(card, 'toggle_display');
+      expect(btn).toBeDefined();
+      expect(btn.text.content).toContain('显示输出');
     });
 
     it('should default to hidden when displayMode is undefined', () => {
@@ -1733,7 +1824,7 @@ describe('buildStreamingCard', () => {
 
     it('renders nothing for a fully-empty snapshot (unsupported CLI)', () => {
       const card = parse(buildStreamingCard(
-        SID, ROOT, URL, TITLE, CONTENT, 'working', 'gemini', 'hidden',
+        SID, ROOT, URL, TITLE, CONTENT, 'working', 'opencode', 'hidden',
         undefined, undefined, false, false, 'en', undefined, undefined, false,
         { context: null, tokens: null },
       ));
@@ -1800,43 +1891,58 @@ describe('buildStreamingCard', () => {
       expect(card.elements[1].tag).toBe('hr');
     });
 
-    it('should show toggle button text as "隐藏输出"', () => {
+    it('should show a "隐藏输出" button inside the more-actions panel', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working', undefined, 'screenshot'));
-      const actions = findActions(card);
-      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_display');
-      expect(toggleBtn.text.content).toContain('隐藏输出');
+      const btn = findPanelButton(card, 'toggle_display');
+      expect(btn).toBeDefined();
+      expect(btn.text.content).toContain('隐藏输出');
     });
 
-    it('should include export text and refresh buttons', () => {
+    it('should include export text and refresh buttons inside the more-actions panel', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, 'screenshot'));
-      const actions = findActions(card);
-      expect(actions.find((a: any) => a.value?.action === 'export_text')).toBeDefined();
-      expect(actions.find((a: any) => a.value?.action === 'refresh_screenshot')).toBeDefined();
+      expect(findPanelButton(card, 'export_text')).toBeDefined();
+      expect(findPanelButton(card, 'refresh_screenshot')).toBeDefined();
     });
   });
 
   // ── Nonce embedding ────────────────────────────────────────────────────
 
   describe('cardNonce embedding', () => {
-    it('should embed card_nonce in toggle button value when provided', () => {
+    it('should embed card_nonce on the more-panel display toggle when provided', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden', 'nonce_123'));
-      const actions = findActions(card);
-      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_display');
-      expect(toggleBtn.value.card_nonce).toBe('nonce_123');
+      expect(findPanelButton(card, 'toggle_display').value.card_nonce).toBe('nonce_123');
     });
 
     it('should NOT include card_nonce when not provided', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden'));
-      const actions = findActions(card);
-      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_display');
-      expect(toggleBtn.value).not.toHaveProperty('card_nonce');
+      expect(findPanelButton(card, 'toggle_display').value).not.toHaveProperty('card_nonce');
     });
 
     it('should NOT include card_nonce when undefined is passed explicitly', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, 'hidden', undefined));
-      const actions = findActions(card);
-      const toggleBtn = actions.find((a: any) => a.value?.action === 'toggle_display');
-      expect(toggleBtn.value).not.toHaveProperty('card_nonce');
+      expect(findPanelButton(card, 'toggle_display').value).not.toHaveProperty('card_nonce');
+    });
+  });
+
+  // #2062: the idempotent display target exists only for the primary
+  // multi-replica control lane; single-replica cards keep the plain payload.
+  // The panel toggle button carries target_display_mode directly.
+  describe('display toggle target mode', () => {
+    afterEach(() => { vi.unstubAllEnvs(); });
+    const toggleButton = (mode: 'hidden' | 'screenshot') =>
+      findPanelButton(parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'working', undefined, mode)), 'toggle_display');
+
+    it('carries the visible target in primary coordination mode', () => {
+      vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+      expect(toggleButton('hidden').value.target_display_mode).toBe('screenshot');
+      expect(toggleButton('screenshot').value.target_display_mode).toBe('hidden');
+    });
+
+    it('omits it outside primary mode', () => {
+      vi.stubEnv('BOTMUX_COORDINATION_MODE', 'disabled');
+      expect(toggleButton('hidden').value).not.toHaveProperty('target_display_mode');
+      vi.stubEnv('BOTMUX_COORDINATION_MODE', '');
+      expect(toggleButton('screenshot').value).not.toHaveProperty('target_display_mode');
     });
   });
 
@@ -1855,13 +1961,12 @@ describe('buildStreamingCard', () => {
       expect(termBtn.type).toBe('primary');
     });
 
-    it('should include get_write_link button', () => {
+    it('should include get_write_link button inside the more-actions panel', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
-      const actions = findActions(card);
-      const linkBtn = actions.find((a: any) => a.value?.action === 'get_write_link');
-      expect(linkBtn).toBeDefined();
-      expect(linkBtn.value.root_id).toBe(ROOT);
-      expect(linkBtn.value.session_id).toBe(SID);
+      const btn = findPanelButton(card, 'get_write_link');
+      expect(btn).toBeDefined();
+      expect(btn.value.root_id).toBe(ROOT);
+      expect(btn.value.session_id).toBe(SID);
     });
 
     it('hides Web Terminal controls when the backend has no terminal URL', () => {
@@ -1870,14 +1975,15 @@ describe('buildStreamingCard', () => {
         SID, ROOT, '', TITLE, '', 'idle', 'codex', 'hidden',
         undefined, undefined, false, false, 'en', undefined, undefined, true,
       ));
-      const actions = findActions(card);
 
-      expect(actions.some((a: any) => a.multi_url)).toBe(false);
-      expect(actions.some((a: any) => a.value?.action === 'get_write_link')).toBe(false);
+      // No URL button on the primary row; the link/display/local controls all
+      // live (or are absent) inside the more-actions panel.
+      expect(allButtons(card).some((a: any) => a.multi_url)).toBe(false);
+      expect(findPanelButton(card, 'get_write_link')).toBeUndefined();
       // Native local opening (for example `zmx attach`) stays available.
-      expect(actions.some((a: any) => a.value?.action === 'open_local_cli')).toBe(true);
-      expect(actions.some((a: any) => a.value?.action === 'toggle_display')).toBe(true);
-      expect(actions.some((a: any) => a.value?.action === 'close')).toBe(true);
+      expect(findPanelButton(card, 'open_local_cli')).toBeDefined();
+      expect(findPanelButton(card, 'toggle_display')).toBeDefined();
+      expect(allButtons(card).some((a: any) => a.value?.action === 'close')).toBe(true);
     });
 
     it('should include close button with danger type', () => {
@@ -1895,14 +2001,13 @@ describe('buildStreamingCard', () => {
         undefined, undefined, undefined, false, undefined,
         ['terminal', 'writeLink', 'close'],
       ));
-      const actions = findActions(card);
 
-      expect(actions.some((a: any) => a.multi_url)).toBe(false);
-      expect(actions.some((a: any) => a.value?.action === 'get_write_link')).toBe(false);
-      expect(actions.some((a: any) => a.value?.action === 'close')).toBe(false);
-      expect(actions.some((a: any) => a.value?.action === 'toggle_display')).toBe(true);
-      expect(actions.some((a: any) => a.value?.action === 'compact_session')).toBe(true);
-      expect(actions.some((a: any) => a.value?.action === 'stop_turn')).toBe(true);
+      expect(allButtons(card).some((a: any) => a.multi_url)).toBe(false);
+      expect(findPanelButton(card, 'get_write_link')).toBeUndefined();
+      expect(allButtons(card).some((a: any) => a.value?.action === 'close')).toBe(false);
+      expect(findPanelButton(card, 'toggle_display')).toBeDefined();
+      expect(allButtons(card).some((a: any) => a.value?.action === 'compact_session')).toBe(true);
+      expect(allButtons(card).some((a: any) => a.value?.action === 'stop_turn')).toBe(true);
     });
 
     it('treats output as one control group and omits empty action containers', () => {
@@ -1912,10 +2017,11 @@ describe('buildStreamingCard', () => {
         undefined, undefined, undefined, false, undefined,
         ['output'],
       ));
-      const screenshotActions = findActions(screenshot);
-      expect(screenshotActions.some((a: any) => a.value?.action === 'toggle_display')).toBe(false);
-      expect(screenshotActions.some((a: any) => a.value?.action === 'export_text')).toBe(false);
-      expect(screenshotActions.some((a: any) => a.value?.action === 'refresh_screenshot')).toBe(false);
+      expect(findPanelButton(screenshot, 'toggle_display')).toBeUndefined();
+      expect(findPanelButton(screenshot, 'export_text')).toBeUndefined();
+      expect(findPanelButton(screenshot, 'refresh_screenshot')).toBeUndefined();
+      // The keys toggle is independent of the output group and stays available.
+      expect(allActions(screenshot).some((a: any) => a.value?.action === 'toggle_keys_panel')).toBe(true);
 
       const allHidden = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, '', 'idle', 'claude-code', 'hidden',
@@ -1923,25 +2029,31 @@ describe('buildStreamingCard', () => {
         undefined, undefined, undefined, false, undefined,
         ['output', 'terminal', 'writeLink', 'compact', 'stop', 'close'],
       ));
+      // No primary action rows and no more-actions panel when every control is hidden.
       expect(allHidden.elements.some((e: any) => e.tag === 'action')).toBe(false);
+      expect(morePanel(allHidden)).toBeUndefined();
     });
 
-    it('should have exactly 5 buttons (toggle, terminal, get_write_link, compact, close)', () => {
+    it('splits idle controls into a primary row and a more-actions panel', () => {
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle'));
-      const actions = findActions(card);
-      // 压缩按钮不依赖 usage/百分比，也不限 working 态——idle 恰是最适合压缩的时机
-      // （没有 turn 在跑），handler 侧只要求 worker 活着。
-      expect(actions.map((a: any) => a.value?.action ?? 'url'))
-        .toEqual(['toggle_display', 'url', 'get_write_link', 'compact_session', 'close']);
+      // Primary row: terminal URL, compact, close (idle has no turn to stop).
+      // allActions only walks action containers, so panel buttons are excluded.
+      expect(allActions(card).map((a: any) => a.value?.action ?? 'url'))
+        .toEqual(['url', 'compact_session', 'close']);
+      // Low-frequency controls move into the titled collapsible panel.
+      expect(panelButtons(card).map((b: any) => b.value.action))
+        .toEqual(['toggle_display', 'get_write_link']);
+      expect(morePanel(card).header.title.content).toContain('更多操作');
+      expect(morePanel(card).expanded).toBe(false);
     });
 
-    it('should include Open TRAE beside Web Terminal for traex streaming cards', () => {
+    it('should include Open TRAE as a more-actions panel button for traex cards', () => {
       enableLocalCliOpen();
       const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'traex', 'hidden', undefined, undefined, false, false, 'en', undefined, undefined, true));
-      const actions = findActions(card);
-      expect(actions.map((a: any) => a.value?.action ?? 'url')).toEqual(['toggle_display', 'url', 'open_local_cli', 'get_write_link', 'compact_session', 'close']);
-      expect(actions[2].text.content).toBe('Open TRAE');
-      expect(actions[2].value.cli_id).toBe('traex');
+      const trae = findPanelButton(card, 'open_local_cli');
+      expect(trae).toBeDefined();
+      expect(trae.text.content).toBe('Open TRAE');
+      expect(trae.value.cli_id).toBe('traex');
     });
 
     it('shows streaming native CLI opening only when local CLI readiness is true', () => {
@@ -1949,8 +2061,8 @@ describe('buildStreamingCard', () => {
       const notReady = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'codex', 'hidden', undefined, undefined, false, false, 'en', undefined, undefined, false));
       const ready = parse(buildStreamingCard(SID, ROOT, URL, TITLE, '', 'idle', 'codex', 'hidden', undefined, undefined, false, false, 'en', undefined, undefined, true));
 
-      expect(findActions(notReady).some((a: any) => a.value?.action === 'open_local_cli')).toBe(false);
-      expect(findActions(ready).some((a: any) => a.value?.action === 'open_local_cli')).toBe(true);
+      expect(findPanelButton(notReady, 'open_local_cli')).toBeUndefined();
+      expect(findPanelButton(ready, 'open_local_cli')).toBeDefined();
     });
   });
 
@@ -2024,7 +2136,7 @@ describe('buildStreamingCard', () => {
       }, undefined, true, undefined, 'Vendor [Codex] <at id=ou_fake></at>',
     ));
     expect(card.header.title.content).toContain('Vendor [Codex] <at id=ou_fake></at>');
-    expect(buttonTexts(findActions(card))).toContain('💻 Open Vendor [Codex] <at id=ou_fake></at>');
+    expect(panelButtons(card).map((b: any) => b.text.content)).toContain('💻 Open Vendor [Codex] <at id=ou_fake></at>');
     const markdown = card.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
     expect(markdown).toContain('Vendor \\[Codex\\] \\<at id=ou\\_fake\\>\\</at\\>');
     expect(markdown).not.toContain('<at id=ou_fake>');
@@ -2465,7 +2577,7 @@ describe('buildSessionClosedCard', () => {
     expect(findMarkdownContent(card)).toContain('/proj/x');
   });
 
-  it('shows a fallback note when the CLI cannot resume from CLI args (gemini/opencode)', () => {
+  it('shows a fallback note when the CLI cannot resume from CLI args (e.g. opencode)', () => {
     const card = parse(buildSessionClosedCard(
       'sess-3', 'om_root', 'topic', 'opencode', undefined, null,
     ));
@@ -2692,6 +2804,32 @@ describe('buildRelayPickerCard', () => {
     expect(allMd).toMatch(/没有匹配|No sessions match/);
   });
 
+  // Regression: the no-match card used to dead-end — the only way back was to
+  // clear the input and submit '', which Lark doesn't fire. A clear-search
+  // button re-fires relay_search without input_value, so the handler resolves
+  // the query to '' and re-renders the full list.
+  it('offers a clear-search button on no match that re-fires relay_search', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: 'ja' }));
+    const buttons = card.body.elements.filter((e: any) => e.tag === 'button');
+    expect(buttons).toHaveLength(1);
+    const v = buttons[0].behaviors[0].value;
+    expect(v.action).toBe('relay_search');
+    expect(v.target_chat_id).toBe('oc_t');
+    expect(v.root_id).toBe('om_r');
+    expect(v.invoker_open_id).toBe('ou_invoker_test');
+    expect(v.selected).toBe('');
+    // Not shown when the search has hits.
+    const hit = parse(buildRelayPickerCard(fixtureEntries(3), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: 'session 1' }));
+    expect(hit.body.elements.filter((e: any) => e.tag === 'button')).toHaveLength(0);
+  });
+
+  it('escapes the echoed search query in the no-match message', () => {
+    const card = parse(buildRelayPickerCard(fixtureEntries(1), 'oc_t', 'om_r', 'ou_invoker_test', undefined, { searchQuery: '![x](http://evil/b)' }));
+    const allMd = card.body.elements.filter((e: any) => e.tag === 'markdown').map((e: any) => e.content).join('\n');
+    expect(allMd).toContain('\\[x\\]');
+    expect(allMd).not.toContain('![x](');
+  });
+
   // Regression (申晗现场): a p2p entry's chatLabel is the raw DM chatId while
   // the card RENDERS the「单聊」literal — searching by the label the user sees
   // must find the entry, not return「没有匹配」. The DM was also buried on
@@ -2851,6 +2989,64 @@ describe('buildPrivateSnapshotCard', () => {
       .flatMap((e: any) => e.actions ?? []);
   }
 
+  it('keeps the card under the size budget when the screen holds a huge backtick run', () => {
+    for (const screen of ['`'.repeat(36_000), 'a\n' + '`'.repeat(200_000) + '\nb']) {
+      const json = buildPrivateSnapshotCard(
+        'https://t.example/ro', 'my session', 'idle', 'claude-code', undefined, screen,
+        'sess-9', 'om_anchor', 'zh',
+      );
+      expect(Buffer.byteLength(json, 'utf-8')).toBeLessThan(20_000);
+    }
+  });
+
+  it('still fences output containing a backtick run so it cannot break out of the code block', () => {
+    const card = build({ screen: 'x\n```\n# not a heading\n```\ny' });
+    const md = card.elements.find((e: any) => e.tag === 'markdown' && e.content.includes('not a heading')).content;
+    const fence = md.match(/^`+/)![0];
+    expect(fence.length).toBeGreaterThan(3);
+    expect(md.endsWith(fence)).toBe(true);
+  });
+
+  it('caps a run of exactly 9 backticks at 8 in the body, keeping a length-9 fence that closes', () => {
+    const card = build({ screen: 'a\n' + '`'.repeat(9) });
+    const md = card.elements.find((e: any) => e.tag === 'markdown' && e.content.startsWith('`')).content;
+    const fence = '`'.repeat(9);
+    expect(md.startsWith(fence)).toBe(true);
+    expect(md.endsWith(fence)).toBe(true);
+    // The capped content sits between the two fences; no run of 9+ survives there.
+    const body = md.slice(fence.length, md.length - fence.length);
+    const maxBodyRun = (body.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 0);
+    expect(maxBodyRun).toBe(8);
+  });
+
+  it('stays bounded when a huge backtick run is the final line and truncation keeps its tail', () => {
+    // The run is the LAST line: once truncateContent preserves an oversized
+    // line's tail, dropping the cap would keep ~50k ticks and the two
+    // maxRun+1 fences would push the card past Feishu's size limit.
+    const json = buildPrivateSnapshotCard(
+      'https://t.example/ro', 'my session', 'idle', 'claude-code', undefined,
+      'a\n' + '`'.repeat(200_000),
+      'sess-9', 'om_anchor', 'zh',
+    );
+    expect(Buffer.byteLength(json, 'utf-8')).toBeLessThan(20_000);
+  });
+
+  it('bounds whole card size under Feishu limit when content is densely packed with quotes or backslashes (#2929)', () => {
+    // 50,000 quotes or backslashes: before fix, raw byte length was ~50 KB but
+    // JSON escaping doubled it to ~100 KB, pushing the whole card to ~101 KB (near the ~109 KB limit).
+    // With JSON-escaped budgeting, whole card size stays safely bounded.
+    for (const denseChar of ['"', '\\']) {
+      const dense = denseChar.repeat(50_000);
+      const json = buildPrivateSnapshotCard(
+        'https://t.example/ro', 'my session', 'idle', 'claude-code', undefined,
+        dense,
+        'sess-9', 'om_anchor', 'zh',
+      );
+      const byteLen = Buffer.byteLength(json, 'utf-8');
+      expect(byteLen).toBeLessThanOrEqual(60_000);
+    }
+  });
+
   it('does not opt private one-shot snapshots into shared PATCH updates', () => {
     expect(build().config.update_multi).toBeUndefined();
   });
@@ -2972,32 +3168,150 @@ describe('buildPrivateSnapshotCard', () => {
   });
 });
 
-describe('remote backends get no PTY quick-action keys', () => {
+describe('terminal-key grid (collapsed by default, toggle-gated)', () => {
   /** The 11 quick-action buttons only make sense with a local terminal. */
-  const KEY_LABELS = ['Esc', '^C', 'Tab', '␣ Space', '↵ Enter', '←', '↑', '↓', '→'];
+  const KEY_LABELS = ['×', '^C', '⇥', '␣', '↵', '←', '↑', '↓', '→'];
+  const HALF_LABELS = ['▲', '▼'];
 
-  function keysIn(cliId: 'claude-code' | 'riff' | 'mojo'): string[] {
-    const card = buildStreamingCard(
+  function cardFor(cliId: 'claude-code' | 'riff' | 'mojo', keysPanelOpen = false): any {
+    return parse(buildStreamingCard(
       'sid-1', 'om-1', '', 'title', 'screen', 'idle' as never,
       cliId as never,
       'screenshot' as never,
-    );
-    return KEY_LABELS.filter(l => card.includes(`"content":"${l}"`));
+      undefined, undefined, false, false, undefined, undefined, undefined, false,
+      undefined, undefined, undefined, undefined, undefined, [], false, undefined, keysPanelOpen,
+    ));
   }
 
-  it('renders them for a local CLI', () => {
-    // Guards the negative assertions below: if the buttons stopped being rendered
-    // at all, those would pass for the wrong reason.
-    expect(keysIn('claude-code')).toEqual(KEY_LABELS);
+  function renderedKeyLabels(card: any): string[] {
+    return allButtons(card)
+      .filter((b: any) => b.value?.action === 'term_action')
+      .map((b: any) => b.text.content);
+  }
+
+  it('hides the grid behind the toggle while collapsed, even for a local CLI', () => {
+    const card = cardFor('claude-code');
+    expect(renderedKeyLabels(card)).toEqual([]);
+    const toggle = allButtons(card).find((b: any) => b.value?.action === 'toggle_keys_panel');
+    expect(toggle).toBeDefined();
+    expect(toggle.text.content).toContain('终端按键');
+  });
+
+  it('renders all 11 keys in three column_set rows sized so labels never ellipsize', () => {
+    const card = cardFor('claude-code', true);
+    const labels = renderedKeyLabels(card);
+    for (const l of [...KEY_LABELS, ...HALF_LABELS]) expect(labels).toContain(l);
+    expect(labels).toHaveLength(11);
+    // 5 + 4 + 2 weighted rows: no row exceeds five columns, and the long
+    // The half-page glyphs each get a half-width column instead of a 1/6 sliver.
+    const grids = card.elements.filter((e: any) => e.tag === 'column_set');
+    expect(grids).toHaveLength(3);
+    expect(grids.map((g: any) => g.columns.length)).toEqual([5, 4, 2]);
+    for (const col of grids.flatMap((g: any) => g.columns)) {
+      expect(col.width).toBe('weighted');
+      expect(col.elements[0].width).toBe('fill');
+    }
+  });
+
+  it('keeps terminal keys available without a local-state toggle in primary mode', () => {
+    vi.stubEnv('BOTMUX_COORDINATION_MODE', 'primary');
+    try {
+      const card = cardFor('claude-code');
+      expect(renderedKeyLabels(card)).toHaveLength(11);
+      expect(allButtons(card).some((button: any) => button.value?.action === 'toggle_keys_panel')).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   for (const cliId of ['riff', 'mojo'] as const) {
-    it(`hides them for ${cliId}`, () => {
+    it(`renders neither toggle nor grid for the remote backend ${cliId}`, () => {
       // A remote backend has no terminal to drive, so these clicks are silently
-      // inert. The gate was hardcoded to `cliId !== 'riff'`, so adding mojo left
-      // it rendering all 11 buttons; it now consults the REMOTE_CLI_IDS leaf, so
-      // the next remote CLI cannot regress this the same way.
-      expect(keysIn(cliId)).toEqual([]);
+      // inert. The gate consults the REMOTE_CLI_IDS leaf, so the next remote
+      // CLI cannot regress this the same way.
+      const collapsed = cardFor(cliId);
+      const expanded = cardFor(cliId, true);
+      for (const card of [collapsed, expanded]) {
+        expect(renderedKeyLabels(card)).toEqual([]);
+        expect(allButtons(card).some((b: any) => b.value?.action === 'toggle_keys_panel')).toBe(false);
+      }
     });
   }
+});
+
+describe('truncateContent single oversized line', () => {
+  it('keeps the tail of a newline-free blob within budget', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('a'.repeat(300_000) + 'END', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.endsWith('a'.repeat(900) + 'END')).toBe(true);
+  });
+
+  it.each(['\n', '\r\n', '\n\n'])('still keeps content when the blob ends with %j', async (eol) => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('a'.repeat(300_000) + 'END' + eol, 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out).toContain('a'.repeat(900) + 'END');
+  });
+
+  it('keeps the oversized last line even when short lines precede it', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('head\nmid\n' + 'b'.repeat(5000) + 'END', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.endsWith('b'.repeat(900) + 'END')).toBe(true);
+    expect(out).not.toContain('head');
+  });
+
+  it('does not split multibyte characters when cutting a long line', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    const out = truncateContent('中'.repeat(5000) + '尾', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out).not.toContain('\uFFFD');
+    expect(out.endsWith('尾')).toBe(true);
+  });
+
+  it('keeps the whole fitted last non-blank line pushed out by trailing newlines', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    // The 600-byte non-blank line fits within the 970-byte body budget, but the
+    // 401 trailing newlines push total size to 1001, so line bisection leaves
+    // only blank lines. The line must be kept in full: a negative byte offset
+    // (600 - 970) must clamp to 0, not slice off the line's head.
+    const out = truncateContent('x'.repeat(600) + '\n'.repeat(401), 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.split('\n')[1]).toBe('x'.repeat(600));
+  });
+
+  it('skips whitespace-only (not just empty) lines when picking the tail line', async () => {
+    const { truncateContent } = await import('../src/im/lark/card-builder.js');
+    // After split('\n') the final element is spaces, not an empty string. The
+    // reverse scan must trim() candidates, otherwise the body is blank again.
+    const out = truncateContent('y'.repeat(3000) + '\n   ', 'zh', 1000);
+    expect(Buffer.byteLength(out, 'utf-8')).toBeLessThanOrEqual(1000);
+    expect(out.split('\n')[1]).toBe('y'.repeat(970));
+  });
+
+  it('budget accounts for JSON escape expansion for quote- and backslash-dense input (#2929)', async () => {
+    const { truncateContent, jsonEscapedByteLength } = await import('../src/im/lark/card-builder.js');
+    const maxBytes = 1000;
+    for (const denseChar of ['"', '\\']) {
+      const out = truncateContent(denseChar.repeat(5000), 'zh', maxBytes);
+      expect(jsonEscapedByteLength(out)).toBeLessThanOrEqual(maxBytes);
+    }
+  });
+});
+
+describe('truncateContent JSON-escape byte budget across lines (#2929)', () => {
+  it.each(['"', '\\'])('accounts for escape expansion when line-bisecting %j-dense multi-line input', async (denseChar) => {
+    const { truncateContent, jsonEscapedByteLength } = await import('../src/im/lark/card-builder.js');
+    const maxBytes = 1000;
+    // 20 lines × 80 escape-doubled chars: 1600 raw bytes but ~3200 JSON-escaped.
+    // Newlines force the LINE bisection path; the single-line cases above only
+    // exercise the single-oversized-line char fallback, so reverting the line
+    // predicate to raw byte length survives those but must fail here.
+    const content = Array.from({ length: 20 }, () => denseChar.repeat(80)).join('\n');
+    const out = truncateContent(content, 'zh', maxBytes);
+    expect(jsonEscapedByteLength(out)).toBeLessThanOrEqual(maxBytes);
+    // Tail is retained rather than the output collapsing to just the prefix.
+    expect(out.endsWith(denseChar)).toBe(true);
+  });
 });

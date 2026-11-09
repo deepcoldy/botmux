@@ -111,6 +111,12 @@ export interface FsPolicyContext {
    *  exec `node <checkout>/dist/cli.js …`) can load — without this a sandboxed
    *  `botmux send` / SessionStart+AskUserQuestion hooks EPERM on cli.js. */
   botmuxInstallRoot?: string;
+  /** Paths under botmuxInstallRoot that are not part of the code (untracked /
+   *  ignored entries of a git checkout: `.env`, bots configs, login state,
+   *  `.git`, …; see install-root-masks.ts). Denied as MANDATORY rules unless
+   *  the caller itself grants that part of the checkout (a workingDir or user
+   *  path at/inside the install root — a bot working ON the checkout). */
+  botmuxInstallRootMaskPaths?: readonly string[];
   /** Daemon-mediated relay outbox (Linux) — readWrite. */
   outbox?: string;
   /** Extra writable roots (resolved TMPDIR, admin extras). */
@@ -146,7 +152,11 @@ export interface FsPolicyContext {
    *  authPaths (`~/.codex` etc.) are NOT Feishu creds and stay granted readWrite.
    *  Absent/true = normal behavior. */
   larkTransportEnabled?: boolean;
-  /** No-transport ONLY: the SECOND botmux authority root to freeze, when the
+  /** Worker-verified managed tool binding. Grants only this session's read-only
+   * wrapper/binding subtree; never the bot keystore or chat transport. */
+  larkToolIdentityEnabled?: boolean;
+  /** The SECOND botmux root to deny (transport sessions: as the botmux-root
+   *  ceiling; no-transport: as an authority root), when the
    *  daemon runs with a custom SESSION_DATA_DIR so `configuredBotmuxHome`
    *  (= dirname(dataDir), passed as `botmuxHome`) differs from the default
    *  `~/.botmux`. BOTH must be denied wholesale — the default root still holds
@@ -155,8 +165,15 @@ export interface FsPolicyContext {
    *  when equal to `botmuxHome`. MUST be canonical + host-frozen (never derived
    *  from agent-controllable env). */
   defaultBotmuxHome?: string;
-  /** No-transport ONLY: the ACTUAL loaded bots-config path, frozen by the daemon
+  /** Whether `botmuxHome` (dirname of the data dir) is a real botmux home —
+   *  false for a degenerate parent such as $HOME or / (SESSION_DATA_DIR=$HOME/data
+   *  or /data), decided by the worker with plausibleConfiguredBotmuxHome. Transport
+   *  sessions then deny only `<botmuxHome>/bots` + the data dir instead of the
+   *  whole parent. Absent = true. */
+  botmuxHomePlausible?: boolean;
+  /** The ACTUAL loaded bots-config path, frozen by the daemon
    *  (`getLoadedConfigPath()`), NOT guessed from BOTS_CONFIG env by the worker.
+   *  Transport sessions deny it by exact path. For no-transport turns:
    *  When it lives INSIDE a frozen authority root the parent mask already covers
    *  it (no extra rule needed). When it lives OUTSIDE every authority root,
    *  buildFsPolicy THROWS {@link FsPolicyConfigError} — a no-transport turn must
@@ -368,6 +385,8 @@ function commonHomeBaseline(h: string): FsRule[] {
     rw(`${h}/.cache`), rw(`${h}/.npm`), rw(`${h}/.local/state`),
     // The daemon-written botmux wrapper (head of PATH) + skill plugin dir.
     ro(`${h}/.botmux/bin`), ro(`${h}/.botmux/claude-plugin`), ro(`${h}/.botmux/cursor-plugin`),
+    // Their workflow-node-session copies (skills/workflow-node-plugin-dir.ts).
+    ro(`${h}/.botmux/claude-plugin-workflow-node`), ro(`${h}/.botmux/cursor-plugin-workflow-node`),
     // Installed-plugin registry. Secret-free BY CONTRACT: `assertPublicPluginRegistry`
     // refuses to persist a record carrying `command`/`env`/`url`/`headers`, and a
     // plugin's real MCP descriptor lives in its own `private/mcp.json` — which stays
@@ -460,6 +479,7 @@ export class FsPolicyConfigError extends Error {
   readonly kind:
     | 'external-bots-config'
     | 'working-dir-is-authority'
+    | 'working-dir-in-botmux-home'
     | 'working-dir-is-host-only'
     | 'bots-config-in-carveout';
   constructor(kind: FsPolicyConfigError['kind'], message: string) {
@@ -741,6 +761,59 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     }
   }
 
+  // Transport-enabled sessions: the botmux roots are a CEILING, not merely
+  // "uncovered". With a project workingDir they are unreachable anyway
+  // (deny-by-default), but a workingDir (or another broad grant) that is an
+  // ANCESTOR of a root — workingDir=~, the default when none is configured —
+  // used to re-open the whole tree readWrite: bots.json, .dashboard-secret,
+  // sibling BOT_HOMEs and their send-cred.json. The roots are denied as
+  // MANDATORY rules below and every legitimate surface (own BOT_HOME, bin,
+  // plugin dirs, own session files, …) is re-allowed at a deeper path exactly
+  // as in the uncovered case, so the agent sees the same ~/.botmux either way.
+  // A workingDir AT or INSIDE a denied region (other than inside its own
+  // BOT_HOME) would sit beside or below the deny with nothing left to protect
+  // it — refuse that layout instead of half-confining it.
+  //
+  // `botmuxHome` is dirname(SESSION_DATA_DIR), which is a real botmux home only
+  // in the standard / custom-instance layouts. With SESSION_DATA_DIR=$HOME/data
+  // or /data it is $HOME or /, and with <checkout>/data it is the install root
+  // itself (whose read-only grant a same-path deny would override). For such a
+  // degenerate parent the ceiling narrows to the two botmux-owned entries in
+  // it: `<parent>/bots` (BOT_HOMEs) and the session data dir. The default
+  // `~/.botmux` is a botmux home by definition and always gets the full ceiling.
+  const installRootPath = ctx.botmuxInstallRoot ? normalizeFsPath(ctx.botmuxInstallRoot) : null;
+  const configuredHome = normalizeFsPath(ctx.botmuxHome);
+  const defaultHome = ctx.defaultBotmuxHome ? normalizeFsPath(ctx.defaultBotmuxHome) : null;
+  const configuredIsHome = configuredHome !== null
+    && (configuredHome === defaultHome
+      || (ctx.botmuxHomePlausible !== false && configuredHome !== installRootPath));
+  const botmuxRoots = larkTransport
+    ? [...new Set([configuredIsHome ? configuredHome : null, defaultHome].filter((p): p is string => p !== null))]
+    : [];
+  // A narrowed entry that contains the default botmux home (a data dir AT
+  // $HOME, as some test harnesses set) is not botmux-owned either: denying it
+  // would hide the whole home, CLI binaries and auth dirs included. The
+  // default home under it keeps its own full ceiling.
+  const narrowedBotmuxDenies = larkTransport && configuredHome !== null && !configuredIsHome
+    ? [`${configuredHome === '/' ? '' : configuredHome}/bots`, normalizeFsPath(ctx.sessionDataDir)]
+      .filter((p): p is string => p !== null
+        && !botmuxRoots.some(root => coversPath(root, p))
+        && !(defaultHome !== null && coversPath(p, defaultHome)))
+    : [];
+  if (larkTransport) {
+    const wd = normalizeFsPath(ctx.workingDir);
+    const ownHome = normalizeFsPath(ctx.botHome);
+    const denied = [...botmuxRoots, ...narrowedBotmuxDenies];
+    if (wd !== null && denied.some(root => coversPath(root, wd)) && !(ownHome && coversPath(ownHome, wd))) {
+      throw new FsPolicyConfigError(
+        'working-dir-in-botmux-home',
+        `sandbox refuses workingDir ${wd}: it lives inside the botmux data directory `
+        + `(${denied.join(', ')}), which holds every bot's credentials; choose a project `
+        + `directory outside it (or the bot's own BOT_HOME).`,
+      );
+    }
+  }
+
   // Hoisted into a named const (vs the upstream inline `candidates.push(...)`)
   // because roleLibAccess() below inspects baseline's DENY entries.
   const baseline = ctx.platform === 'darwin' ? darwinBaseline(ctx.homeDir) : linuxBaseline(ctx.homeDir);
@@ -749,7 +822,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // Adapter-declared surfaces.
   push(ctx.execPaths, 'readOnly', 'adapter');
   // authPaths = the model CLI's OWN login/state surface (~/.codex, ~/.claude
-  // credentials, Seed/bytedcli SSO, Gemini OAuth, OpenCode DB, …) — NOT Feishu.
+  // credentials, Seed/bytedcli SSO, Antigravity OAuth, OpenCode DB, …) — NOT Feishu.
   // These MUST stay granted even for a no-transport turn, else the CLI can't
   // authenticate and the core functionality breaks. The no-Lark-transport gate
   // only denies Feishu-authority paths (below), never the CLI's own auth.
@@ -884,6 +957,12 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // able to. Writable would let an agent publish its own identity.
   if (ctx.sessionId && larkTransport) {
     push([`${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`], 'readOnly', 'internal');
+  } else if (ctx.sessionId && ctx.larkToolIdentityEnabled === true) {
+    const identity = `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`;
+    // The no-transport exception carries only the managed bot tool. Do not
+    // expose legacy user env/delegation files that may share this identity dir.
+    push([`${identity}/lark-cli`, `${identity}/shell`,
+      `${identity}/.data/lark-tool-binding.json`, `${identity}/.data/lark-config`], 'readOnly', 'internal');
   }
   // Own per-bot lark-cli config (agent-facing lark-cli identity). Withheld from
   // a no-transport turn — it IS this bot's Feishu credential surface.
@@ -911,6 +990,12 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     `${bh}/cursor-plugin`,      // skill/plugin dir (cursor --plugin-dir); no secrets
     `${bh}/omp-plugin`,         // skill/plugin dir (omp --plugin-dir); no secrets
     `${bh}/pi-skills`,          // skill dir (pi --skill); no secrets
+    // Workflow-node-session copies of the four dirs above (same skills minus
+    // the withheld ones; skills/workflow-node-plugin-dir.ts); no secrets.
+    `${bh}/claude-plugin-workflow-node`,
+    `${bh}/cursor-plugin-workflow-node`,
+    `${bh}/omp-plugin-workflow-node`,
+    `${bh}/pi-skills-workflow-node`,
     `${bh}/lark-scopes.json`,   // static scope catalog
     // dashboard-daemons (sibling IPC port table) is the discovery half of the
     // trusted-host escalation — a no-transport turn must NOT get it (paired with
@@ -1017,6 +1102,28 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   push(dropAuthority(ctx.userPaths?.readOnly), 'readOnly', 'user');
   push(ctx.userPaths?.deny, 'deny', 'user');
   push(ctx.mandatoryDenyPaths, 'deny', 'mandatory');
+  // Botmux-root ceiling for transport sessions (see botmuxRoots above). The
+  // loaded bots config is denied by exact path too: BOTS_CONFIG may point
+  // outside the roots (e.g. into the botmux checkout or a project dir).
+  push(botmuxRoots, 'deny', 'mandatory');
+  push(narrowedBotmuxDenies, 'deny', 'mandatory');
+  if (larkTransport && ctx.loadedBotsConfigPath) push([ctx.loadedBotsConfigPath], 'deny', 'mandatory');
+  // Non-code entries of the install root. The read-only install-root grant
+  // exists only so the CLI can load dist/ + node_modules/; it must not expose
+  // what a developer keeps beside the code. Only a workingDir AT or INSIDE the
+  // install root lifts the masks under it (that bot is working on the checkout
+  // itself); a sandboxPaths grant of the checkout, or any ancestor grant, does
+  // not — it means "let the agent read this tree", not "develop botmux".
+  const installRoot = installRootPath;
+  if (installRoot && ctx.botmuxInstallRootMaskPaths?.length) {
+    const wd = normalizeFsPath(ctx.workingDir);
+    const checkoutWorkingDir = wd !== null && coversPath(installRoot, wd) ? wd : null;
+    push(ctx.botmuxInstallRootMaskPaths.filter(p => {
+      const n = normalizeFsPath(p);
+      return n !== null && n !== installRoot && coversPath(installRoot, n)
+        && !(checkoutWorkingDir && coversPath(checkoutWorkingDir, n));
+    }), 'deny', 'mandatory');
+  }
   push(serviceCredentialReadOnlyPaths, 'readOnly', 'mandatory');
   push(hostOnlyRoots, 'deny', 'mandatory');
   push(ctx.mandatoryReadOnlyPaths, 'readOnly', 'mandatory');
@@ -1228,6 +1335,65 @@ export function compileToSeatbelt(policy: FsPolicy): string {
 
 // ───────────────────────────── bwrap compiler ────────────────────────────────
 
+export interface SymlinkProbe {
+  /** lstat(path).isSymbolicLink(); false when absent. */
+  isSymlink(path: string): boolean;
+  /** realpath(path); undefined when it cannot be resolved (dangling). */
+  realpath(path: string): string | undefined;
+}
+
+/**
+ * Baseline directories are candidates written lexically (`/opt`, `/usr`,
+ * `/etc`, `~/.cache` …). On hosts where one of them is a symlink (`/opt ->
+ * /data00/opt` on some devboxes) bwrap resolves the bind source to the real
+ * directory but the mount target `/opt` is then a mountpoint for a different
+ * path — MEASURED in a user report: `bwrap: Can't bind mount /oldroot/data00
+ * on /newroot/opt`. Handle it the way usrmerge `/bin` is handled: recreate the
+ * link inside the fresh root (`--symlink <real> <path>`, via
+ * CompileBwrapOpts.symlinks) and bind the REAL path instead.
+ *
+ * Rules (any source) below the lexical link are moved under the real path too,
+ * so longest-prefix still decides. A rule already naming the real path wins
+ * over the relocated baseline (an explicit grant/deny is never widened or
+ * narrowed by a baseline candidate). A dangling baseline link is dropped —
+ * nothing to expose. Only a link whose PARENT is already canonical is
+ * rebuilt; deeper aliasing is left untouched (as before). Pure given `io`.
+ */
+export function relocateSymlinkedBaselineRules(
+  rules: readonly FsRule[],
+  io: SymlinkProbe,
+): { rules: FsRule[]; symlinks: { path: string; target: string }[] } {
+  const symlinks: { path: string; target: string }[] = [];
+  const moves: { from: string; to: string }[] = [];
+  const dropped = new Set<string>();
+  for (const r of rules) {
+    if (r.source !== 'baseline' || r.access === 'deny' || r.path === '/') continue;
+    if (!io.isSymlink(r.path)) continue;
+    const parent = r.path.slice(0, r.path.lastIndexOf('/')) || '/';
+    if (io.realpath(parent) !== parent) continue;
+    const target = io.realpath(r.path);
+    if (!target) { dropped.add(r.path); continue; }
+    if (target === r.path || coversPath(r.path, target) || coversPath(target, r.path)) continue;
+    if (symlinks.some(l => l.path === r.path)) continue;
+    symlinks.push({ path: r.path, target });
+    moves.push({ from: r.path, to: target });
+  }
+  if (!moves.length && !dropped.size) return { rules: [...rules], symlinks };
+  const byPath = new Map<string, FsRule>();
+  for (const r of rules) {
+    if (dropped.has(r.path)) continue;
+    const move = moves.find(m => coversPath(m.from, r.path));
+    if (!move) { byPath.set(r.path, r); continue; }
+    const path = move.to + r.path.slice(move.from.length);
+    // A rule already naming the real path wins whichever order it comes in: an
+    // earlier one is kept here, a later one overwrites below via set().
+    if (!byPath.has(path)) byPath.set(path, { ...r, path });
+  }
+  const out = [...byPath.values()].sort((a, b) =>
+    pathDepth(a.path) - pathDepth(b.path) || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0));
+  return { rules: out, symlinks };
+}
+
 export interface CompileBwrapOpts {
   /** Top-level symlinks to replicate inside the tmpfs root (usrmerge /bin →
    *  usr/bin etc.). Resolved by the worker (impure readlink). */
@@ -1397,6 +1563,39 @@ export function compileToBwrap(policy: FsPolicy, opts: CompileBwrapOpts): BwrapC
 
 // ───────────────────────────── legacy config migration ───────────────────────
 
+/**
+ * Legacy path arrays were historically tolerated in any shape: the parser ran
+ * them through normalizeStringList, which silently dropped non-arrays and
+ * non-string elements. Migration copies their content into the new sandboxPaths
+ * field, whose strict loader rejects those shapes, so the same normalization
+ * must run HERE — the migration output must always be loadable instead of
+ * bricking the next daemon start.
+ */
+function sanitizeLegacyPathList(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((p: unknown): p is string => typeof p === 'string' && !!p.trim())
+    .map(p => p.trim());
+}
+
+/**
+ * Whether an on-disk `sandboxPaths` value has a shape the strict loader accepts
+ * (mirrors parseBotConfigsFromText: null/absent means "not set"; a tier may be
+ * absent/null or a string array). A malformed value must not make migration a
+ * no-op — the legacy fields stay on disk by design, so re-running the migration
+ * can repair it once.
+ */
+export function isLoadableSandboxPaths(raw: unknown): boolean {
+  if (raw === undefined || raw === null) return true;
+  if (typeof raw !== 'object' || Array.isArray(raw)) return false;
+  return (['readWrite', 'readOnly', 'deny'] as const).every((tier) => {
+    const value = (raw as Record<string, unknown>)[tier];
+    return value === undefined
+      || value === null
+      || (Array.isArray(value) && value.every(p => typeof p === 'string'));
+  });
+}
+
 export interface LegacySandboxFields {
   sandbox?: boolean | 'off' | 'oncall' | 'scratch';
   readIsolation?: boolean;
@@ -1420,11 +1619,20 @@ export interface MigratedSandboxFields {
  * reverse script (design doc §6.2). Returns null when nothing to migrate.
  */
 export function migrateLegacySandboxFields(entry: LegacySandboxFields & { sandboxPaths?: unknown }): MigratedSandboxFields | null {
-  if (entry.sandboxPaths !== undefined) return null; // already on the new model
+  // Already on the new model in a loadable shape → nothing to do. A malformed
+  // value falls through so this pass repairs it in place.
+  if (entry.sandboxPaths !== undefined && isLoadableSandboxPaths(entry.sandboxPaths)) return null;
   const hasLegacy = entry.readIsolation === true
     || (entry.sandboxReadonlyPaths?.length ?? 0) > 0
     || (entry.sandboxHidePaths?.length ?? 0) > 0
     || (entry.readDenyExtraPaths?.length ?? 0) > 0;
+  const onDisk = entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
+    ? (entry.sandboxPaths as Record<string, unknown>)
+    : undefined;
+  // No legacy fields to map and no malformed object worth repairing → no-op.
+  // A non-object malformed value with no legacy source stays fail-closed: there
+  // is nothing valid to preserve and nothing to rebuild it from.
+  if (!hasLegacy && !onDisk) return null;
   // Preserve the tri-state: only oncall representations collapse to boolean
   // true; 'scratch' passes through unchanged (the old path lists are irrelevant
   // to scratch's full-root COW, but the mode itself must not be downgraded).
@@ -1433,14 +1641,48 @@ export function migrateLegacySandboxFields(entry: LegacySandboxFields & { sandbo
     : (entry.sandbox === true
       || entry.sandbox === 'oncall'
       || entry.readIsolation === true);
-  if (!hasLegacy) return null; // plain `sandbox: true` needs no path migration
-  const readOnly = [...(entry.sandboxReadonlyPaths ?? [])];
-  const deny = [...(entry.sandboxHidePaths ?? []), ...(entry.readDenyExtraPaths ?? [])];
-  const sandboxPaths: MigratedSandboxFields['sandboxPaths'] = {};
-  if (readOnly.length) sandboxPaths.readOnly = readOnly;
-  if (deny.length) sandboxPaths.deny = [...new Set(deny)];
+  // Legacy-derived tiers; the raw legacy fields stay on disk for downgrade.
+  const legacyReadOnly = sanitizeLegacyPathList(entry.sandboxReadonlyPaths);
+  const legacyDeny = [
+    ...sanitizeLegacyPathList(entry.sandboxHidePaths),
+    ...sanitizeLegacyPathList(entry.readDenyExtraPaths),
+  ];
+  // A non-array tier (the #2530 scalar typo: deny:"~/.ssh", or a number/object)
+  // carries no extractable path. With no legacy tier to rebuild it from,
+  // "repairing" would delete the field and silently widen the sandbox BEFORE the
+  // parser runs, so its accurate field error would never surface — the exact
+  // defect #2530 set out to remove. Bail out and let the strict loader reject.
+  // An all-invalid ARRAY is different: it holds zero valid strings, so dropping
+  // it loses nothing. readWrite has no legacy source at all.
+  const scalarTierWithoutSource = (raw: unknown, legacyList: string[]): boolean =>
+    raw !== undefined && raw !== null && !Array.isArray(raw) && legacyList.length === 0;
+  if (
+    scalarTierWithoutSource(onDisk?.readWrite, [])
+    || scalarTierWithoutSource(onDisk?.readOnly, legacyReadOnly)
+    || scalarTierWithoutSource(onDisk?.deny, legacyDeny)
+  ) {
+    return null;
+  }
+  // The on-disk tiers are the dashboard/CLI-written source of truth: sanitize
+  // them in place (dropping only unloadable elements). Legacy fills a tier only
+  // when the on-disk tier is absent or empties out — never overwrite a surviving
+  // valid on-disk entry, which would silently widen the sandbox.
+  const mergeTier = (onDiskRaw: unknown, legacyList: string[]): string[] | undefined => {
+    const fromDisk = sanitizeLegacyPathList(onDiskRaw);
+    if (fromDisk.length) return fromDisk;
+    return legacyList.length ? legacyList : undefined;
+  };
+  // readWrite has no legacy source (the old field set never expressed it).
+  const readWrite = sanitizeLegacyPathList(onDisk?.readWrite);
+  const readOnly = mergeTier(onDisk?.readOnly, legacyReadOnly);
+  const deny = mergeTier(onDisk?.deny, legacyDeny);
+  const sandboxPaths: NonNullable<MigratedSandboxFields['sandboxPaths']> = {};
+  if (readWrite.length) sandboxPaths.readWrite = readWrite;
+  if (readOnly?.length) sandboxPaths.readOnly = readOnly;
+  if (deny?.length) sandboxPaths.deny = [...new Set(deny)];
+  const hasAnyTier = readWrite.length > 0 || (readOnly?.length ?? 0) > 0 || (deny?.length ?? 0) > 0;
   return {
     sandbox,
-    ...(readOnly.length || deny.length ? { sandboxPaths } : {}),
+    ...(hasAnyTier ? { sandboxPaths } : {}),
   };
 }

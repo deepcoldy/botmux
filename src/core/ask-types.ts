@@ -11,10 +11,16 @@ import type { GroupContextDeliveryBinding } from '../services/group-context-deli
 /** A single selectable option on an ask card. `key` is the stable identifier
  *  returned via stdout; `label` is the human-facing button text. When the user
  *  writes `--options "yes,no"`, `key === label`. With `--options "yes=继续"`,
- *  `key="yes"` and `label="继续"`. */
+ *  `key="yes"` and `label="继续"`.
+ *
+ *  `description` is the optional longer explanation the upstream CLI attaches
+ *  to an option (Claude Code `AskUserQuestion.options[].description`,
+ *  OpenCode `question.options[].description`). It is shown beneath the option
+ *  label; older callers that omit it render exactly as before. */
 export interface AskOption {
   key: string;
   label: string;
+  description?: string;
 }
 
 /** Opt-in input schema for an atomic Card 2.0 form. */
@@ -34,6 +40,8 @@ export interface AskInputField {
 export interface AskQuestion {
   /** Opt-in Card 2.0 form input; legacy inputMode=text remains a chat reply. */
   input?: AskInputField;
+  /** Disable free-form answers for constrained/native permission choices. */
+  allowCustom?: boolean;
   /** Native text-only questions use the existing conversation text-reply path.
    * They have no options and cannot be settled by an empty button submit. */
   inputMode?: 'text';
@@ -46,6 +54,24 @@ export interface AskQuestion {
   /** Optional draft selection. Presence (even []) requires a Submit button;
    * never an answer until an authorized user explicitly submits. */
   defaultSelectedKeys?: ReadonlyArray<string>;
+}
+
+/** How the asking CLI ended a hook permission confirmation on its own, without
+ *  the card: its built-in confirmation timeout, a terminal choice, or the hook
+ *  being terminated with nothing recorded. */
+export const CLI_PERMISSION_OUTCOMES = [
+  'cli_auto_denied',
+  'terminal_allowed',
+  'terminal_rejected',
+  'allowed_elsewhere',
+  'denied_elsewhere',
+  'resolved_elsewhere',
+  'cli_stopped_waiting',
+] as const;
+export type CliPermissionOutcome = typeof CLI_PERMISSION_OUTCOMES[number];
+
+export function isCliPermissionOutcome(value: unknown): value is CliPermissionOutcome {
+  return typeof value === 'string' && (CLI_PERMISSION_OUTCOMES as readonly string[]).includes(value);
 }
 
 /** Terminal result of an ask, returned to the CLI caller. Discriminated by
@@ -67,6 +93,8 @@ export type AskResult =
       answers: ReadonlyArray<ReadonlyArray<string>>;
       /** Form-only values, aligned with questions; choice/empty input slots are null. */
       inputs?: ReadonlyArray<string | null>;
+      /** Per-question free text; replaces only that question's selected keys. */
+      customAnswers?: ReadonlyArray<string | null>;
       by: string;
       /** 自定义回复原文（用户在话题里直接打字作答）；按钮选择时为 null。 */
       comment: string | null;
@@ -85,8 +113,10 @@ export type AskResult =
       /** card_delivery_failed: delivery never completed; do not describe this as
        *  a missing answer. claimant_gone / answer_undelivered: the hook never
        *  re-attached, so the asking CLI is no longer waiting (the latter: an
-       *  answer had been given but could not reach it). */
-      failureCode?: 'card_delivery_failed' | 'claimant_gone' | 'answer_undelivered';
+       *  answer had been given but could not reach it). cli_resolved: the asking
+       *  CLI ended this permission confirmation itself; see `cliOutcome`. */
+      failureCode?: 'card_delivery_failed' | 'claimant_gone' | 'answer_undelivered' | 'cli_resolved';
+      cliOutcome?: CliPermissionOutcome;
       selected: null;
       by: null;
       comment: null;
@@ -104,6 +134,7 @@ export interface AskJsonOutput {
   /** v0.1.8 新增：按问题分组的完整答案，answered 时非 null。 */
   answers: string[][] | null;
   inputs?: Array<string | null> | null;
+  customAnswers?: ReadonlyArray<string | null>;
   by: string | null;
   /** 自定义回复原文；按钮选择 / 超时 / 失效时为 null。 */
   comment: string | null;
@@ -127,6 +158,8 @@ export interface CreateAskInput {
   chatId: string;
   /** thread-scope ask → root message_id; chat-scope ask → null. */
   rootMessageId: string | null;
+  /** chat-scope 下发起 turn 冻结的话题根，只决定卡片发到哪；不属于 ask 身份，也不落盘。 */
+  cardRootMessageId?: string;
   /** Session that issued the ask — used for audit + future replay scoping. */
   sessionId: string;
   /** Per-invocation identity: the hook generates this once and reuses it across
@@ -158,6 +191,10 @@ export interface CreateAskInput {
   /** Optional exact responder lock for host-owned approval asks. Ordinary
    * agent asks omit it and retain the existing canTalk-any-member policy. */
   answererOpenId?: string;
+  /** 显式 `botmux ask --mention <open_id>` 要 @ 的人。daemon 只在通讯录确认是本应用的
+   *  真人后填入（at 到 bot 会让整卡 100290），卡片在第一问前注入真实 `<at>`。
+   *  带点名的 ask 走独立卡：嵌进回复卡是 PATCH，不会触发通知。 */
+  mentionedOpenId?: string;
 }
 
 /** Daemon-internal state for a pending ask. Not exported on the IPC boundary —
@@ -179,15 +216,21 @@ export interface PendingAsk {
   larkAppId: string;
   chatId: string;
   rootMessageId: string | null;
+  cardRootMessageId?: string;
   sessionId: string;
   /** 发起 ask 的会话类型（见 CreateAskInput.chatType）。 */
   chatType?: 'group' | 'p2p';
   /** When present, only this app-scoped open_id may settle the ask. */
   answererOpenId?: string;
+  /** 显式 ask 要 @ 的人类 open_id（见 CreateAskInput.mentionedOpenId）。 */
+  mentionedOpenId?: string;
   /** 问题列表，替代旧的 `options` + `prompt`。 */
   questions: ReadonlyArray<AskQuestion>;
   /** 当前已勾选答案快照。仅 daemon/card 内部使用；CLI IPC 边界不暴露。 */
   selections?: ReadonlyArray<ReadonlyArray<string>>;
+  /** Form drafts and optimistic version survive resumable Ask restarts. */
+  customAnswers?: ReadonlyArray<string | null>;
+  customRevision?: number;
   createdAt: number;
   deadlineAt: number;
   /** Set after the card dispatch succeeds. Until then, the ask is "registered
@@ -226,6 +269,8 @@ export type AskClickOutcome =
   | 'already_settled'
   /** 多选累积：用户勾选/取消某项，尚未 submit——不触发 settle。 */
   | 'toggled'
+  | 'draft_conflict'
+  | 'invalid_custom'
   /** 空提交二次确认：鉴权 + nonce 校验都通过，但当前一个选项都没勾、且每个问题
    *  都允许空集（全多选），提交极可能是手滑——先不 settle，要求带 confirmEmpty 再点
    *  一次。仅当所有问题都可空时才可能返回；任一单选未选走 `stale`（空非有效答案）。 */

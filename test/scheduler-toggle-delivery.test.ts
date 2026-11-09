@@ -7,6 +7,7 @@ const publish = vi.fn();
 
 vi.mock('../src/services/schedule-store.js', () => ({
   canonicalScheduleInput: (task: ScheduledTask) => task,
+  effectiveScheduleChatIds: (task: ScheduledTask) => task.chatIds ?? [task.chatId],
   getTask: (id: string) => store.get(id),
   normalizeScheduleChatTargets: ({ chatId, chatIds }: { chatId: string; chatIds?: readonly string[] | null }) => {
     if (chatIds === undefined || chatIds === null) return { chatId };

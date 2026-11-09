@@ -100,7 +100,9 @@ describe('adopted Codex turn recovery', () => {
     const result = restoreCodexAdoptTurns(path, rollout, queue, events, 20_000, 20_000);
     expect(result.restored).toBe(1);
     expect(queue.peek().map(t => t.turnId)).toEqual(['om_original', 'om_new']);
+    expect(queue.peek()[0]).toMatchObject({ turnId: 'om_original', restoredFromJournal: true });
     expect(queue.peek()[1]).toBe(current);
+    expect(current.restoredFromJournal).toBeUndefined();
     queue.absorb(result.history);
     queue.ingest(result.live);
     expect(queue.drainEmittable()).toMatchObject([{ turnId: 'om_original', finalText: 'Finished' }]);

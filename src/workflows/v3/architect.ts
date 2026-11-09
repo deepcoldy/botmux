@@ -7,7 +7,7 @@
  * place so host commands do not hand-roll goal-mode env/layout details.
  */
 
-import { mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { createEphemeralPool, type EphemeralPoolDeps } from './ephemeral-pool.js';
@@ -22,13 +22,27 @@ import {
   type ValidateManifest,
   type WorkerSessionInfo,
 } from './contract.js';
+import type { V3ArchitectBotAssignment, V3RosterBot, V3SketchAssignee } from './bot-assignment.js';
 
 const ARCHITECT_NODE_ID = 'architect';
-const ARCHITECT_ATTEMPT_ID = 'architect/attempts/001';
+const MAX_UNAVAILABLE_CHARS = 200;
+const ATTEMPT_NUMBER_RE = /^\d{3,}$/;
+/** Bounds on the previous attempt's problems quoted back to the Architect. */
+const MAX_PREVIOUS_PROBLEMS = 20;
+const MAX_PREVIOUS_PROBLEM_CHARS = 500;
+
+export interface ArchitectAttempt {
+  /** e.g. `architect/attempts/002`; the pool derives the worker's sessionId
+   *  (and so its tmux session name) from it. */
+  attemptId: string;
+  attemptDir: string;
+}
 
 export interface RunArchitectInput {
   runId: string;
   runDir: string;
+  /** From {@link allocateArchitectAttempt}: a fresh, empty directory. */
+  attempt: ArchitectAttempt;
   specPath: string;
   specJsonPath: string;
   botSnapshot: BotSnapshot;
@@ -41,6 +55,13 @@ export interface RunArchitectInput {
   runNode?: RunNode;
   resolveLarkAppSecret?: EphemeralPoolDeps['resolveLarkAppSecret'];
   validateManifest?: ValidateManifest;
+  /** Present only when the run's goal nodes will be handed to bots in the
+   *  group chat (design 2026-11-03 §6): the roster to assign from. Absent =
+   *  today's prompt, unchanged. */
+  botAssignment?: V3ArchitectBotAssignment;
+  /** Why the host turned down the previous attempt of this run (the problems
+   *  it left in grill.state.json), so this attempt can fix them. */
+  previousProblems?: readonly string[];
 }
 
 export interface RunArchitectResult {
@@ -52,7 +73,12 @@ export interface RunArchitectResult {
   sessionInfo?: WorkerSessionInfo;
 }
 
-export function buildArchitectGoal(specPath: string, specJsonPath: string): string {
+export function buildArchitectGoal(
+  specPath: string,
+  specJsonPath: string,
+  botAssignment?: V3ArchitectBotAssignment,
+  previousProblems?: readonly string[],
+): string {
   const sketchFields = [
     'sketchId',
     'goal',
@@ -61,6 +87,7 @@ export function buildArchitectGoal(specPath: string, specJsonPath: string): stri
     'acceptance',
     'risk_gate',
     'unknowns',
+    ...(botAssignment ? ['assignee'] : []),
   ].join(', ');
   return [
     'You are the botmux v3 workflow architect.',
@@ -137,24 +164,143 @@ export function buildArchitectGoal(specPath: string, specJsonPath: string): stri
     '- For each conditional branch: the decision field + its enum, which path each value takes, and confirmation that every value reaches some sink (no allSinksSkipped hole).',
     '- Include an artifact contract table listing producer node, output key, path, kind, and every consumer.',
     '- List any assumptions or unresolved risks for human review.',
+    ...(botAssignment ? architectBotAssignmentLines(botAssignment) : []),
+    ...previousProblemLines(previousProblems),
   ].join('\n');
 }
 
+/** The host's refusal of the previous attempt, one quoted line each. */
+function previousProblemLines(problems: readonly string[] | undefined): string[] {
+  const lines = (problems ?? [])
+    .map((problem) => problem.replace(/\s+/g, ' ').trim())
+    .filter((problem) => problem.length > 0)
+    .slice(0, MAX_PREVIOUS_PROBLEMS)
+    .map((problem) => `  - ${JSON.stringify(problem.slice(0, MAX_PREVIOUS_PROBLEM_CHARS))}`);
+  if (lines.length === 0) return [];
+  return [
+    '',
+    'Previous attempt:',
+    '- The host rejected the previous attempt of this run for these reasons. Produce a DAG that fixes every one of them (if a reason is about the spec rather than the DAG, mention it in architect-notes.md):',
+    ...lines,
+  ];
+}
+
+function rosterEntry(bot: V3RosterBot): Record<string, unknown> {
+  return {
+    larkAppId: bot.larkAppId,
+    name: bot.name,
+    cli: bot.cli,
+    ...(bot.model ? { model: bot.model } : {}),
+    ...(bot.role ? { role: bot.role } : {}),
+    ...(bot.main ? { main: true } : {}),
+  };
+}
+
+function assigneeLine(entry: V3SketchAssignee): string {
+  const sketch = `sketch ${JSON.stringify(entry.sketchId)}`;
+  const named = `the user named ${JSON.stringify(entry.assignee)}`;
+  const fallback = 'assign that node like any other and say so in its reason';
+  if (entry.target.kind === 'bot' && !entry.unavailable) return `  - ${sketch} → ${entry.target.larkAppId} (${named})`;
+  if (entry.target.kind === 'bot') {
+    // The reason may carry probe / Lark error text: keep it one quoted value.
+    const why = JSON.stringify((entry.unavailable ?? '').replace(/\s+/g, ' ').trim().slice(0, MAX_UNAVAILABLE_CHARS));
+    return `  - ${sketch}: ${named} (${entry.target.larkAppId}), which cannot execute nodes here (${why}); ${fallback}.`;
+  }
+  if (entry.target.kind === 'ambiguous') {
+    return `  - ${sketch}: ${named}, which matches several bots (${entry.target.larkAppIds.join(', ')}); ${fallback}.`;
+  }
+  return `  - ${sketch}: ${named}, which matches no bot on this host; ${fallback}.`;
+}
+
+/** The bot-run-only part of the prompt (design 2026-11-03 §6.1/§6.2). */
+function architectBotAssignmentLines(assignment: V3ArchitectBotAssignment): string[] {
+  const main = assignment.roster.mainLarkAppId;
+  return [
+    '',
+    'Bot assignment (each goal node of this run is executed by one bot in the group chat, in its own session):',
+    '- Roster — the ONLY bots that may execute a node (one JSON object per line; "main": true is the bot running this workflow):',
+    ...assignment.roster.bots.map((bot) => `  ${JSON.stringify(rosterEntry(bot))}`),
+    '- Set `"bot": "<larkAppId>"` on every goal node (loop body nodes included), using only roster larkAppIds; the host rejects any other value.',
+    '- Keep each sketch\'s sketchId as the id of the goal node that implements it.',
+    ...(assignment.assignees.length > 0
+      ? ['- The user named bots for these sketches (`assignee`, already resolved by the host); a resolved assignment is binding:',
+        ...assignment.assignees.map(assigneeLine)]
+      : []),
+    `- Otherwise pick the roster bot whose CLI, model and role best fit the node; when unsure, use the main bot (${main}).`,
+    '- architect-notes.md MUST contain a `## Bot assignments` section with exactly one line per goal node: `- <nodeId> → <larkAppId>: <one-line reason>` (a loop body node as `<loopId>.<bodyNodeId>`).',
+    '- Optionally mark a goal node `"checkpoint": true` where, once it is done, its result should be looked at before deciding how the rest goes (e.g. an investigation whose findings decide the next steps). When it completes, the nodes that depend on it wait while the main bot reviews the result (it may change the rest of the flow), then the flow goes on. At least one node must depend on a checkpoint — the main bot is only woken while the run goes on, so the host rejects a checkpoint nothing depends on (add a downstream summary node, or drop the mark). Do not mark routine nodes; loop body nodes cannot be checkpoints.',
+    ...architectPlacementLines(assignment),
+  ];
+}
+
+/** The bot-run-only placement part of the prompt (design 2026-11-03 §5.2). */
+function architectPlacementLines(assignment: V3ArchitectBotAssignment): string[] {
+  const mainTopic = assignment.mainTopic;
+  if (!mainTopic?.available) {
+    const why = JSON.stringify((mainTopic?.why ?? 'unknown').replace(/\s+/g, ' ').trim().slice(0, MAX_UNAVAILABLE_CHARS));
+    return [
+      `- Placement: this run has no usable main topic (${why}), so every node is handed off in a node topic of its own. Do not set \`placement\`.`,
+    ];
+  }
+  return [
+    '',
+    'Placement (where each top-level goal node is handed off):',
+    '- `"placement": "topic"` (the default; omit the field) opens a node topic: the node\'s handoff, the bot\'s progress messages, questions and report all live there. `"placement": "main"` hands the node off right in the main topic (no node topic) — for small steps whose result the people in the main topic want to see directly.',
+    '- Use a node topic when ANY of these holds: likely over ~10 minutes or several rounds of back-and-forth; may need to ask a person or discuss; many progress messages (editing code, running tests, fetching data); may be reworked by a revisit; runs in parallel with other nodes.',
+    '- Use the main topic only when ALL of these hold: a one-step small job (summarize, rewrite, format, look up one number); strictly serial with the other main-topic nodes; its result is what the main topic wants to read.',
+    '- Hard rules (the host rejects the DAG otherwise): (1) two main-topic nodes executed by the same bot must be ordered — one a transitive `depends` ancestor of the other — because a bot has only one session in the main topic; (2) the main bot\'s own main-topic nodes run in the main session itself, so rule 1 applies to them as well. Loop body nodes, loop and host nodes never take `placement`.',
+    '- architect-notes.md MUST contain a `## Placements` section with exactly one line per top-level goal node: `- <nodeId> → main|topic: <one-line reason>`.',
+  ];
+}
+
+/**
+ * Reserve the run's next Architect attempt, one past the highest number on
+ * disk (a run that only has `001` gets `002`). Every attempt needs its own id:
+ * a reused one gives the worker the same sessionId — and tmux session name —
+ * as an earlier attempt whose session may still be alive. The exclusive mkdir
+ * hands out an empty directory that is never another attempt's, so no stale
+ * manifest can finish the new worker early; earlier attempts stay as they are.
+ * Names whose number is outside the safe-integer range are ignored: past
+ * MAX_SAFE_INTEGER `n + 1` can equal `n`, which would make the EEXIST retry
+ * loop spin forever while holding the run's host mutation lock.
+ * Callers hold the run's host mutation lock.
+ */
+export function allocateArchitectAttempt(runDir: string): ArchitectAttempt {
+  const attemptsDir = join(runDir, ARCHITECT_NODE_ID, 'attempts');
+  mkdirSync(attemptsDir, { recursive: true });
+  let n = readdirSync(attemptsDir)
+    .filter((name) => ATTEMPT_NUMBER_RE.test(name))
+    .reduce((max, name) => {
+      const parsed = parseInt(name, 10);
+      return Number.isSafeInteger(parsed) ? Math.max(max, parsed) : max;
+    }, 0) + 1;
+  for (;;) {
+    // Defense in depth: with unsafe names filtered above, n starts safe and
+    // only advances by one, so this throws instead of looping on a stuck n.
+    if (!Number.isSafeInteger(n)) {
+      throw new Error(`architect attempt 编号超出安全整数范围：${attemptsDir}`);
+    }
+    const number = String(n).padStart(3, '0');
+    const attemptDir = join(attemptsDir, number);
+    try {
+      mkdirSync(attemptDir);
+      return { attemptId: `${ARCHITECT_NODE_ID}/attempts/${number}`, attemptDir };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+      n += 1;
+    }
+  }
+}
+
 export async function runArchitect(input: RunArchitectInput): Promise<RunArchitectResult> {
-  const attemptDir = join(input.runDir, 'architect', 'attempts', '001');
+  const { attemptId, attemptDir } = input.attempt;
   const outputDir = join(attemptDir, 'work');
   const inputsPath = join(attemptDir, 'inputs.json');
   const manifestPath = join(attemptDir, 'manifest.json');
   const goalPath = join(attemptDir, 'goal.txt');
-  // Architect always reuses attempt 001 (no nextAttemptId increment). Wipe any
-  // prior attempt first: otherwise a `revise-dag` re-architect leaves the old
-  // manifest.json + work/dag.json in place, the pool's manifest watcher sees a
-  // stable manifest and immediately finishes 'ok' WITHOUT running the new
-  // worker, so the revision silently validates the previous dag and never takes.
-  rmSync(attemptDir, { recursive: true, force: true });
   mkdirSync(outputDir, { recursive: true });
 
-  const goal = buildArchitectGoal(input.specPath, input.specJsonPath);
+  const goal = buildArchitectGoal(input.specPath, input.specJsonPath, input.botAssignment, input.previousProblems);
   const inputs = {
     inputs: [
       { from: 'grill', name: 'spec.json', path: input.specJsonPath, kind: 'json' },
@@ -164,7 +310,7 @@ export async function runArchitect(input: RunArchitectInput): Promise<RunArchite
 
   const req: RunNodeRequest = {
     runId: input.runId,
-    attemptId: ARCHITECT_ATTEMPT_ID,
+    attemptId,
     node: {
       id: ARCHITECT_NODE_ID,
       type: 'goal',

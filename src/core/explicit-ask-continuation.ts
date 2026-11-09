@@ -1,6 +1,6 @@
 import type { TriggerRequest } from '../services/trigger-types.js';
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { askKeyFor } from './ask-persist-store.js';
@@ -13,7 +13,12 @@ export interface ExplicitAskReceipt {
   settledAt?: number;
   acknowledged?: boolean;
   delivered?: boolean;
+  /** Daemon-observed origin, never supplied as authority by the caller. */
+  origin?: { turnId: string; dispatchAttempt?: number; workerGeneration?: number };
 }
+
+/** Consumed receipts only answer late reconnects of the same invocation. */
+const CONSUMED_RECEIPT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** Explicit asks have a daemon-owned claimant, independent of the waiting CLI.
  * Keep terminal receipts until acknowledged or durably dispatched to the SAME
@@ -46,7 +51,9 @@ export function createExplicitAskContinuation(deps: {
     mkdirSync(deps.dir, { recursive: true, mode: 0o700 });
     atomicWriteFileSync(pathFor(key), JSON.stringify(receipt), { mode: 0o600, durable: true });
   };
-  function wait(input: CreateAskInput & { requestId: string }): Promise<AskResult> {
+  /** presentation 只影响发卡位置和点名，不写进回执：回执 input 的全等比较就是调用身份。 */
+  function wait(input: CreateAskInput & { requestId: string }, origin?: ExplicitAskReceipt['origin'],
+    presentation?: Pick<CreateAskInput, 'cardRootMessageId' | 'mentionedOpenId'>): Promise<AskResult> {
     const key = keyFor(input);
     const original = read(key);
     if (original && JSON.stringify(original.input) !== JSON.stringify(input)) {
@@ -60,8 +67,8 @@ export function createExplicitAskContinuation(deps: {
       write(key, { ...original, result, settledAt: now() });
       return Promise.resolve(result);
     }
-    if (!original) write(key, { version: 1, input });
-    const promise = deps.register(input).then(result => {
+    if (!original) write(key, { version: 1, input, ...(origin ? { origin } : {}) });
+    const promise = deps.register({ ...input, ...presentation }).then(result => {
       const receipt = read(key)!;
       write(key, { ...receipt, result, settledAt: now() });
       deps.releaseHandoff?.(input);
@@ -70,11 +77,13 @@ export function createExplicitAskContinuation(deps: {
     running.set(key, promise);
     return promise;
   }
-  function acknowledge(input: CreateAskInput & { requestId: string }): AskResult | undefined {
+  function acknowledge(input: CreateAskInput & { requestId: string }, canAcknowledge?: (receipt: ExplicitAskReceipt) => boolean): AskResult | undefined {
     const key = keyFor(input);
     const receipt = read(key);
     if (!receipt?.result || JSON.stringify(receipt.input) !== JSON.stringify(input)) return undefined;
-    write(key, { ...receipt, acknowledged: true });
+    // A stdout flush can succeed even after its tool caller ended. A stale
+    // origin is not consumption; leave the receipt for same-session recovery.
+    if (!canAcknowledge || canAcknowledge(receipt)) write(key, { ...receipt, acknowledged: true });
     return receipt.result;
   }
   async function sweep() {
@@ -90,7 +99,11 @@ export function createExplicitAskContinuation(deps: {
           const key = file.slice(0, -5);
           const receipt = read(key)!;
           if (receipt.version !== 1 || receipt.input.larkAppId !== deps.appId
-            || keyFor(receipt.input) !== key || receipt.acknowledged || receipt.delivered) continue;
+            || keyFor(receipt.input) !== key) continue;
+          if (receipt.acknowledged || receipt.delivered) {
+            if (now() - receipt.settledAt! >= CONSUMED_RECEIPT_RETENTION_MS) rmSync(pathFor(key), { force: true });
+            continue;
+          }
           if (!receipt.result) {
             // Restore only existing, still-bound sessions. Never create a session
             // or revive a closed business task to recover an interaction.
@@ -115,6 +128,23 @@ export function createExplicitAskContinuation(deps: {
     finally { sweeping = false; }
   }
   return { wait, acknowledge, sweep };
+}
+
+/** The daemon must compare against its live worker authority, not CLI stdout. */
+export function explicitAskOriginIsLive(receipt: ExplicitAskReceipt, session: {
+  workerAlive: boolean;
+  workerGeneration?: number;
+  turnId?: string;
+  dispatchAttempt?: number;
+  terminal?: boolean;
+} | undefined): boolean {
+  // Preserve the behaviour of receipts written before origin tracking existed.
+  if (!receipt.origin) return true;
+  return !!session && session.workerAlive
+    && session.workerGeneration === receipt.origin.workerGeneration
+    && session.turnId === receipt.origin.turnId
+    && session.dispatchAttempt === receipt.origin.dispatchAttempt
+    && !session.terminal;
 }
 
 /** Shared production builder: group-only chat permission must never leak into

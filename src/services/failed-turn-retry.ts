@@ -3,9 +3,8 @@
  *
  * A turn that ends `failed` or `ambiguous` records its exact CLI input here
  * (persisted on the Session as `lastFailedTurn`) so the user can re-inject it
- * with `/retry` instead of copy-pasting. Recording is guarded by the session's
- * current reply target: a type-ahead successor already owns the prompt, so the
- * failed predecessor must not capture it.
+ * with `/retry` instead of copy-pasting. The daemon verifies the input's exact
+ * dispatch turn before invoking this builder; reply routing is not input ownership.
  *
  * Pure functions only — persistence and IPC stay with the daemon/command-handler
  * callers, mirroring the ordinary-turn-recovery split.
@@ -14,21 +13,6 @@ import type { CodexAppTurnInput, FailedTurnRecord, TrustedCaller } from '../type
 
 /** Cooldown between two `/retry` attempts on the same session. */
 export const RETRY_COOLDOWN_MS = 10_000;
-
-/** Whether a turn_terminal event should be recorded as the session's last
- *  failed turn. `completed`/`cancelled` never qualify. When the session's
- *  current reply target already points at a NEWER turn (type-ahead), the
- *  failed turn's prompt has been superseded and must not be captured. */
-export function shouldRecordFailedTurn(
-  terminal: { turnId: string; status: string },
-  currentReplyTargetTurnId: string | undefined,
-): boolean {
-  if (terminal.status !== 'failed' && terminal.status !== 'ambiguous') return false;
-  if (currentReplyTargetTurnId !== undefined && currentReplyTargetTurnId !== terminal.turnId) {
-    return false;
-  }
-  return true;
-}
 
 /** Build the persisted record for a failed/interrupted turn. Returns undefined
  *  when there is no CLI input to re-inject (e.g. a turn that died before its
@@ -67,14 +51,50 @@ export function retryCooldownRemaining(
   return Math.max(0, cooldownMs - (now.getTime() - last));
 }
 
+/** What one accepted attempt changed, so an attempt that provably never ran
+ *  can give its cooldown back (see refundRetryAttempt). */
+export interface RetryAttemptReceipt {
+  turnId: string;
+  previousRetryCount: number;
+  previousRetryAt?: string;
+  stampedAt: string;
+}
+
 /** Stamp one accepted `/retry` attempt onto the session's record. No-op when
  *  the session has no failed turn recorded. */
 export function markRetryAttempt(
   session: { lastFailedTurn?: FailedTurnRecord },
   now: Date = new Date(),
-): void {
+): RetryAttemptReceipt | undefined {
   const record = session.lastFailedTurn;
-  if (!record) return;
+  if (!record) return undefined;
+  const receipt: RetryAttemptReceipt = {
+    turnId: record.turnId,
+    previousRetryCount: record.retryCount,
+    ...(record.lastRetryAt ? { previousRetryAt: record.lastRetryAt } : {}),
+    stampedAt: now.toISOString(),
+  };
   record.retryCount += 1;
-  record.lastRetryAt = now.toISOString();
+  record.lastRetryAt = receipt.stampedAt;
+  return receipt;
+}
+
+/** Undo the attempt behind `receipt`. Only while the record is still that
+ *  failed turn with that stamp on top: a newer failure or a later attempt
+ *  keeps its own cooldown. Returns whether anything changed. */
+export function refundRetryAttempt(
+  session: { lastFailedTurn?: FailedTurnRecord },
+  receipt: RetryAttemptReceipt,
+): boolean {
+  const record = session.lastFailedTurn;
+  if (
+    !record
+    || record.turnId !== receipt.turnId
+    || record.retryCount !== receipt.previousRetryCount + 1
+    || record.lastRetryAt !== receipt.stampedAt
+  ) return false;
+  record.retryCount = receipt.previousRetryCount;
+  if (receipt.previousRetryAt) record.lastRetryAt = receipt.previousRetryAt;
+  else delete record.lastRetryAt;
+  return true;
 }

@@ -29,8 +29,9 @@ export function codexTerminalSessionIsBound(terminal: PtyHandle, sessionId: stri
     && binding.sessionId === sessionId.toLowerCase();
 }
 
-function emptyComposerFooter(terminal: PtyHandle): string | undefined {
-  const state = terminal.captureInputState?.();
+export function codexEmptyComposerFooter(
+  state: ReturnType<NonNullable<PtyHandle['captureInputState']>> | undefined,
+): string | undefined {
   if (!state) return undefined;
   const lines = stripAnsiScreenText(state.viewport).split(/\r?\n/);
   if (detectCodexComposerState({ ...state, viewport: lines.join('\n') }) !== 'empty') return undefined;
@@ -46,9 +47,35 @@ function emptyComposerFooter(terminal: PtyHandle): string | undefined {
   // Both layouts are native: an inline status/hints row, or a separate status
   // row followed by hints. Stay in the adjacent footer band, never scrollback.
   const footer = below.slice(0, 4).filter(row => row.trim());
+  // Busy/loading evidence is meaningful only next to the live composer. The
+  // same words can remain in scrollback after capacity recovers (or appear in
+  // ordinary transcript prose); scanning the whole viewport would then make a
+  // healthy empty composer fail closed forever.
+  const composerNeighborhood = lines.slice(
+    Math.max(0, state.cursor.y - 3),
+    Math.min(lines.length, state.cursor.y + 5),
+  ).join('\n');
   if (footer.length < 1 || footer.length > 2 || below.slice(4).some(row => row.trim())
-    || /^\s*(?:(?:[^\w\s]\s+)?(?:Queued for capacity|Resuming session)\b|│\s*(?:model|directory):\s*loading\b)/im.test(lines.join('\n'))) return undefined;
+    || /^\s*(?:(?:[^\w\s]\s+)?(?:Queued for capacity|Resuming session)\b|│\s*(?:model|directory):\s*loading\b)/im.test(composerNeighborhood)) return undefined;
   return codexNativeFooterRows(footer);
+}
+
+/** Positive, fail-closed evidence for unattended writes into Codex.
+ *
+ * Cursor position catches the common draft case while the exact native
+ * placeholder + bounded footer check catches a draft whose cursor was moved
+ * back to Home, stale scrollback prompts, pickers, and startup/loading screens.
+ */
+export function codexNativeComposerState(
+  state: ReturnType<NonNullable<PtyHandle['captureInputState']>> | undefined,
+): 'empty' | 'draft' | 'unknown' {
+  const coarse = detectCodexComposerState(state);
+  if (coarse !== 'empty') return coarse;
+  return codexEmptyComposerFooter(state) !== undefined ? 'empty' : 'unknown';
+}
+
+function emptyComposerFooter(terminal: PtyHandle): string | undefined {
+  return codexEmptyComposerFooter(terminal.captureInputState?.());
 }
 
 /** Validate the native one/two-row footer after the caller bounds its location. */

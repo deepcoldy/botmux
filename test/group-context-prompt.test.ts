@@ -40,7 +40,7 @@ describe('group background input lookup', () => {
   it('fresh native context does not inherit another native conversation’s coverage', () => {
     expect(groupContextEpoch('session', 'native_a', 'claude-code', 'turn_a'))
       .not.toBe(groupContextEpoch('session', 'native_b', 'claude-code', 'turn_a'));
-    expect(groupContextEpoch('session', undefined, 'gemini', 'turn_a'))
-      .not.toBe(groupContextEpoch('session', undefined, 'gemini', 'turn_b'));
+    expect(groupContextEpoch('session', undefined, 'opencode', 'turn_a'))
+      .not.toBe(groupContextEpoch('session', undefined, 'opencode', 'turn_b'));
   });
 });

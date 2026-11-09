@@ -102,7 +102,9 @@ export interface DaemonSession {
   workerReady?: boolean;
   /** True while the CURRENT CLI generation's prompt is known idle/ready.
    *  Set by the worker's `prompt_ready` IPC; cleared on spawn / restart /
-   *  `claude_exit` / worker retirement. Deliberately NOT cleared by the
+   *  `claude_exit` / worker retirement, and when a MiniMax compact card request
+   *  is accepted for delivery. A false value can therefore also mean a pending
+   *  or in-flight compact on a live worker. Deliberately NOT cleared by the
    *  worker's `ready` IPC: `prompt_ready` frequently arrives BEFORE `ready`
    *  (riff / mojo synthesize the first one inside spawnCli, fast TUIs under
    *  Herdr do too), so clearing on `ready` would erase a just-set value.
@@ -149,6 +151,12 @@ export interface DaemonSession {
     enginePid?: number;
     engineProcStart?: string;
     workerGeneration?: number;
+  };
+  /** Per-worker-generation HMAC key for the protected local-service proxy.
+   * It exists only in daemon/worker memory and crosses only their private IPC. */
+  protectedLoopbackProxyAttestation?: {
+    secret: string;
+    workerGeneration: number;
   };
   /** Monotonic within one daemon boot. Captured by durable delivery receipts
    *  so a terminal/exit from a replaced worker cannot settle a newer attempt. */
@@ -243,6 +251,8 @@ export interface DaemonSession {
    *  Kept (not cleared after the first spawn) so a spawn retry or an in-boot
    *  re-fork of the same session launches identically. */
   spawnModelOverride?: string;
+  /** Formerly pinned workers must also clear their effort launch snapshot. */
+  modelPinCleared?: boolean;
   /** True while this session's worker sits in the crash-loop park state: its CLI
    *  is dead, a diagnostic shell is parked, and the NEXT message makes the worker
    *  respawn the CLI itself from its own `lastInitConfig` snapshot — a launch with
@@ -389,6 +399,9 @@ export interface DaemonSession {
   ownerOpenId?: string;          // receives owner-only links and controls write-enabled access
   streamCardId?: string;         // message_id of the streaming card in group (PATCHed with live output)
   streamCardNonce?: string;       // unique nonce for the current streaming card — embedded in button values to distinguish old vs current card
+  /** Whether the streaming card's terminal-key grid is expanded. Daemon-owned
+   *  and carried through every card PATCH so streaming refreshes keep it open. */
+  keysPanelOpen?: boolean;
   /** Visible Lark destination of the live streaming card. Unlike
    * currentReplyTarget this remains bound to the card after a newer turn is
    * accepted, so parking cannot attribute the predecessor to the new topic. */
@@ -438,6 +451,11 @@ export interface DaemonSession {
    *  never recorded; its settlement reports the run instead of closing it
    *  quietly. In-memory: a restart closes unmaterialized hidden runs anyway. */
   deferredScheduleUndeliveredTurnId?: string;
+  /** The turn a task-position hidden run was re-fired to before it materialized,
+   *  until a worker frame carries that id. Until then an unattributed frame may
+   *  be the previous turn's tail and must not settle the new turn. In-memory,
+   *  like deferredScheduleUndeliveredTurnId. */
+  deferredScheduleUnconfirmedTurnId?: string;
   /** Turn-exact ids for loud external triggers whose connector opted into
    *  suppressFinalOutput. Only the daemon-rendered final_output reply is dropped
    *  (the streaming card / start notice still show); keyed on the trigger turn
@@ -465,7 +483,17 @@ export interface DaemonSession {
   /** Bounded per-turn admission times for optional reply timing; not restored or guessed. */
   turnReceivedAtMs?: Map<string, number>;
   /** Native write observations, scoped to the worker generation and exact attempt. */
-  replyExecutionStarts?: Map<string, { startedAtMs: number; workerGeneration: number }>;
+  replyExecutionStarts?: Map<string, {
+    startedAtMs: number; workerGeneration: number;
+    /** Exact terminal observed; retain timing for reply rendering, suppress reminders. */
+    completed?: boolean;
+    stage?: 'model_output' | 'tool_started' | 'tool_returned';
+    lastProgressAtMs?: number;
+  }>;
+  /** Bounded terminal facts keyed by worker generation, turn and exact attempt.
+   * Values are receipt epoch milliseconds, also fencing older legacy starts
+   * when a compatibility terminal omitted its attempt before any start arrived. */
+  replyExecutionTerminals?: Map<string, number>;
   /** Two-phase turn reactions (auto-on for card-off sessions, i.e. streaming
    *  card disabled). The bot reacts 冲! on each user message the moment it's accepted for the session
    *  (bound to the message, NOT a worker status edge — so type-ahead / busy-
@@ -545,6 +573,16 @@ export interface DaemonSession {
    *  (core/prompt-cache-keepalive.ts). In-memory only; cleared by any real
    *  turn or busy edge that is not a keep-alive. */
   promptCacheKeepalive?: import('../services/prompt-cache-policy.js').PromptCacheKeepaliveState;
+  /** Idle auto-compact topic notice waiting for the next sweep tick: posted
+   *  only once the compact's own busy→idle edge (or the worker's refusal) is
+   *  seen, so the topic never claims a compact that did not run
+   *  (core/idle-auto-compact.ts). In-memory only. */
+  idleAutoCompactPendingNotice?: import('./idle-auto-compact.js').IdleAutoCompactPendingNotice;
+  /** TurnId of the idle auto-compact this process itself dispatched. In-memory
+   *  ONLY (never persisted): a marker inherited from a restarted daemon folded
+   *  as handled must not be announced as a successful compact, because this
+   *  process never saw it run. Cleared on the finishing edge / terminal. */
+  idleAutoCompactDispatchedTurnId?: string;
   /** turnIds whose triggering Lark message explicitly @-mentioned this bot.
    *  Only positives are stored (absent === not mentioned), so the bounded FIFO
    *  (see recordTurnExplicitMention) is spent entirely on turns that can still
@@ -718,6 +756,8 @@ export interface DaemonSession {
     taskId?: string | null;
   };
   usageLimit?: CliUsageLimitState;
+  /** A failed persistence must be retried even if the next frame is identical. */
+  usageLimitPersistPending?: boolean;
   usageLimitRetryTimer?: NodeJS.Timeout;
   /** Latch for the proactive rate/usage-limit owner notification: the
    *  usageLimitStateKey of the limit episode we already posted about. Exactly
@@ -735,9 +775,19 @@ export interface DaemonSession {
   usageRefreshTimer?: NodeJS.Timeout;
   lastUserPrompt?: string;
   lastCliInput?: string;
+  /** Exact dispatch turn that owns lastCliInput; absent inputs cannot be replayed automatically. */
+  lastCliInputTurnId?: string;
   lastCodexAppInput?: CodexAppTurnInput;
   replyThreadAliases?: { [rootMessageId: string]: { createdAt: string; lastUsedAt: string } };
   currentReplyTarget?: { rootMessageId: string; turnId: string; updatedAt: string; quoteOnly?: boolean; substitute?: boolean };
+  /** Lark turns that a still-running Claude background task was launched
+   *  from, as last reported by THIS worker generation
+   *  (`background_task_pins_sync`). Their replyTargets records are exempt from
+   *  eviction like a live CronCreate task's (see replyTargetPinnedTurnIds), so
+   *  the task's wake answer still finds its topic after many newer turns.
+   *  In-memory only and cleared when the worker exits: the anchors live in
+   *  the worker's memory, so a new worker never forwards an older one's wake. */
+  backgroundTaskPinnedTurnIds?: readonly string[];
   /** One-shot runtime flag set by the daemon when creating a substitute
    *  (分身) session. The worker-pool consumes and clears it once the worker
    *  reports ready, triggering a one-time substitute control card post so the
@@ -771,6 +821,11 @@ export interface DaemonSession {
     content?: string;
     errorCode?: 'trigger_failed';
     terminalErrorCode?: string;
+    /** In memory only (never in the durable async store): the provider's raw
+     *  error text and the screen tail the worker's failed terminal carried,
+     *  masked and clipped (services/turn-failure-diagnostics). */
+    terminalErrorDetail?: string;
+    terminalScreenTail?: string;
     interruptedAt?: number;
     usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;
@@ -912,6 +967,11 @@ export interface DaemonSession {
    *  Forwarded back to the worker in tui_keys so it can verify the backend
    *  hasn't been replaced within the same worker process. */
   stuckWarningCliLifetime?: number;
+  /** Turn initiator frozen when the active stuck-warning card was posted
+   *  (same rule as the recovery-retry card: daemon-authenticated caller or a
+   *  reply-registry entry proving a human sender). They may press the card's
+   *  `initiator` keys; undefined = operators only. */
+  stuckWarningInitiatorOpenId?: string;
   /** Cached TUI prompt options — for dedup and for resolving after click */
   tuiPromptOptions?: Array<{ label?: string; text: string; selected: boolean; type?: string; keys?: string[] }>;
   tuiPromptMultiSelect?: boolean;
@@ -923,8 +983,12 @@ export interface DaemonSession {
    *  Cleared when the user next replies to the session or when the session
    *  closes. Distinct from tuiPromptCardId (which is a
    *  rendered TUI menu detected by screen-analyzer) — this is deliberate,
-   *  agent-initiated, and carries no rendered options. */
-  agentAttention?: { kind: string; reason: string; at: number };
+   *  agent-initiated, and carries no rendered options. `source: 'agent'` marks
+   *  the agent's own raise; daemon-raised failure notices leave it unset. */
+  agentAttention?: { kind: string; reason: string; at: number; source?: 'agent' };
+  /** Start of the current busy stretch (edge into starting/working/analyzing/
+   *  active). A prompt-cache keep-alive's own busy period is not stamped. */
+  busySinceAt?: number;
   /** 文档评论入口（/watch-comment / /subscribe-lark-doc）：本会话「来自文档评论的轮」的回复落点
    *  映射。key = turnId（= 触发评论的 reply_id/comment_id，随消息传给 worker 再
    *  随 final_output 传回）；value = 该回哪个文档的哪条评论。deliverFinalOutput

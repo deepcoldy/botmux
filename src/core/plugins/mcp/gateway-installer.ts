@@ -1,6 +1,8 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
+import { parse as parseToml } from 'smol-toml';
 import type { CliAdapter, McpGatewayInstallSpec } from '../../../adapters/cli/types.js';
 import { atomicWriteFileSync } from '../../../utils/atomic-write.js';
 import { expandHomePath } from '../../../utils/working-dir.js';
@@ -33,7 +35,7 @@ export function defaultGatewayEntry(): GatewayEntry {
   // Canonicalize $HOME: on a symlinked-home host (/home/u → /data00/home/u) the
   // lexical path is written into the CLI's MCP config, but the file sandbox binds
   // only CANONICAL exec dirs — the lexical /home/u prefix doesn't exist in the
-  // bwrap root, so codex/gemini's `botmux mcp serve` launch fails with
+  // bwrap root, so codex/opencode's `botmux mcp serve` launch fails with
   // "No such file or directory" and MCP startup aborts. realpath the home root
   // so the command path lands on a bound dir. Same file off-sandbox, so it's a
   // safe no-op on non-symlinked hosts.
@@ -170,6 +172,23 @@ function isBotmuxMcpSection(header: string): boolean {
   return codexMcpServerName(header) === 'botmux';
 }
 
+function hasCodexBotmuxTable(text: string): boolean {
+  return text.split(/\r?\n/).some(line => {
+    const header = parseTomlTableHeader(line);
+    return header !== null && isBotmuxMcpSection(header) && parseTomlDottedKey(header)!.length === 2;
+  });
+}
+
+// TraeX/CoCo rewrite their shared config wholesale: key order, number literals
+// (600 -> 600.0) and our marker comments change while the tables survive.
+function sameCodexToml(a: string, b: string): boolean {
+  try {
+    return isDeepStrictEqual(parseToml(a), parseToml(b));
+  } catch {
+    return false;
+  }
+}
+
 // Removes every table whose header matches `isOwned`. Blank lines and comments
 // trailing a removed table are buffered and kept: they introduce the NEXT table
 // (or the document), not the table we own. Attributing them to the removed
@@ -244,7 +263,7 @@ function ensureCodexEntry(path: string, entry: GatewayEntry): boolean {
   const withoutLegacy = stripCodexNamedMcpSections(withoutOwned, legacyMaterializedCodexNames());
   const cleaned = stripCodexBotmuxSections(withoutLegacy);
   const next = `${[cleaned, renderCodexEntry(entry)].filter(Boolean).join('\n\n')}\n`;
-  if (next === current) return false;
+  if (next === current || sameCodexToml(next, current)) return false;
   mkdirSync(dirname(path), { recursive: true });
   atomicWriteFileSync(path, next, { mode: 0o600 });
   return true;
@@ -327,10 +346,7 @@ export function inspectGatewayEntry(
   try {
     if (!existsSync(path)) return { cliId: adapter.id, state: 'absent', configPath: path };
     const configured = spec.format === 'codex-toml'
-      ? (() => {
-          const text = readFileSync(path, 'utf-8');
-          return text.includes(GATEWAY_START) && /\[mcp_servers\.(?:botmux|"botmux")\]/.test(text);
-        })()
+      ? hasCodexBotmuxTable(readFileSync(path, 'utf-8'))
       : (() => {
           const data = parseJsonConfig(path);
           const servers = data.mcpServers;

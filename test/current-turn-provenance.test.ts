@@ -350,6 +350,8 @@ describe('resolveCurrentTurnProvenance', () => {
         larkAppId: 'cli_real',
         chatId: 'oc_real',
         chatType: 'group',
+        // The registry records them as a non-bot participant.
+        callerProvenHuman: true,
       });
     });
 
@@ -465,6 +467,8 @@ describe('resolveCurrentTurnProvenance', () => {
         larkAppId: 'cli_real',
         chatId: 'oc_real',
         chatType: 'group',
+        // The registry records them as a non-bot participant.
+        callerProvenHuman: true,
       });
     });
 

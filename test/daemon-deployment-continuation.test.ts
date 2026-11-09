@@ -12,9 +12,12 @@ import { deploymentContinuationAuthority } from '../src/core/deployment-continua
 import { ActiveTurnAuthority, sameTrustedPrincipal } from '../src/core/active-turn-authority.js';
 import { currentGatewayCallerOpenId } from '../src/core/gateway-turn-caller.js';
 import { isUnsentInputReplayable } from '../src/services/unsent-input-journal.js';
+import { WrittenInputLedger } from '../src/services/prompt-submission-match.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { controllerForSession } from '../src/core/session-controller.js';
 import { loadWorkerPoolMessageHandlers } from './helpers/worker-pool-message-harness.js';
 import { cancelDeploymentContinuation, claimDeploymentContinuation, deploymentContinuationCandidate, recordDeploymentContinuation } from '../src/services/deployment-continuation.js';
+import { codexCapacityRecoveryCli } from '../src/services/codex-app-failure.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 // Execute the daemon's real receipt callback: importing daemon.ts would start
@@ -43,7 +46,7 @@ const nativeId = 'native-original';
 const receive = callback({ recordDeploymentContinuation, failedTurnCaller, deploymentContinuationAuthority, sessionStore: store,
   logger: { warn: vi.fn(), error: (message: string) => { throw new Error(message); } },
   trustedSessionController: () => undefined, ensureAutomaticTaskContinuationLease: () => {},
-  confirmNativeGroupContextInput: () => {},
+  confirmNativeGroupContextInput: () => {}, workflowMainWake: { onInputAccepted: () => {} },
 });
 function receipt(turnId: string) {
   receive(ds, { type: 'native_input_consumed', ordinaryInteractive: true, turnId,
@@ -70,9 +73,11 @@ function manualInput(failPersistence: boolean) {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
   }).outputText;
   const scope = {
+    controllerForSession,
     cancelDeploymentContinuation, deploymentContinuationAuthority,
     sessionStore: failPersistence ? { updateDeploymentContinuation: () => { throw new Error('disk unavailable'); } } : store,
     getBot: () => ({ config: { cliId: 'codex' } }), sessionCliId: () => 'codex',
+    codexCapacityRecoveryCli,
     cancelOrdinaryRecoveryForUserInput: () => {},
     withTurnCaller: (_session: unknown, message: unknown) => message, bufferTransferInput: () => false,
     afterWorkerIpcBootstrap: (_worker: unknown, effect: () => void) => { effect(); return true; },
@@ -98,7 +103,7 @@ function freshNativeTurn(turnId = 'om_first') {
     readIsolationOriginChannelId: undefined, sandboxRelayOutbox: undefined, currentVcMeetingImTurnOrigin: undefined,
     currentBotmuxTurnId: turnId, currentBotmuxDispatchAttempt: undefined, currentBotmuxLinkRefMode: undefined,
     randomBytes, parseDaemonIpcPort: () => undefined, writeCliPidMarker: () => {}, log: () => {}, flushPending: () => {},
-    inflightInputs: { onTurnStarted: () => {} }, isUnsentInputReplayable, restoredUnsentInputs: new Set(),
+    inflightInputs: { onTurnStarted: () => {} }, isUnsentInputReplayable, restoredUnsentInputs: new Set(), writtenInputs: new WrittenInputLedger(),
     send: (message: any) => {
       if (message.type.startsWith('managed_turn_origin')) handlePoolMessage(message);
       if (message.type === 'native_input_consumed') receive(ds, message, { workerGeneration: 1 });

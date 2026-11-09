@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 import { existsSync, mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -12,6 +13,7 @@ import { syntheticSessionUuid, type WorkerHandle, type WorkerProcessFactory, typ
 import { readV3AttemptWorkerFence } from '../src/workflows/v3/worker-fence.js';
 import { botToSnapshot, parseFrozenBotSnapshots } from '../src/workflows/v3/bot-resolve.js';
 import type { BotConfig } from '../src/bot-registry.js';
+import { invalidateGlobalConfigCache } from '../src/global-config.js';
 
 // The default factory delegates to self-spawn's spawnWorker, which is the only
 // path that gets the compiled-binary case right. Mock node:child_process so we
@@ -43,12 +45,17 @@ vi.mock('node:child_process', async (importOriginal) => {
 
 
 let dir: string;
+const originalDataDir = config.session.dataDir;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'wf-v3-pool-'));
+  config.session.dataDir = join(dir, 'data');
+  vi.stubEnv('SESSION_DATA_DIR', config.session.dataDir);
 });
 
 afterEach(async () => {
+  config.session.dataDir = originalDataDir;
+  vi.unstubAllEnvs();
   // The pool deliberately fire-and-forgets its diagnostic log writes
   // (`void appendLine(...)` in ephemeral-pool.ts — each one mkdir+append into
   // the attempt dir). A straggler landing after runNode resolves can RECREATE
@@ -183,6 +190,67 @@ describe('v3WorkerBackendType', () => {
 });
 
 describe('v3 ephemeral pool', () => {
+  it('does not inherit machine protected env names even when the workflow bot enables no matching plugin', async () => {
+    vi.stubEnv('FIXTURE_SECRET', 'machine-secret');
+    vi.stubEnv('FIXTURE_TOKEN', 'machine-token');
+    vi.stubEnv('INVALID_RECORD_SECRET', 'invalid-record-machine-secret');
+    vi.stubEnv('BOTMUX_GLOBAL_CONFIG_FILE', join(dir, 'current-global.json'));
+    vi.stubEnv('BOTMUX_PROTECTED_SECRET_FD', '3');
+    try {
+      writeFileSync(join(dir, 'current-global.json'), JSON.stringify({ protectedMcpCapabilities: {
+        'fixture.secret.v1': {
+          enabled: true,
+          allowedPluginIds: ['fixture-plugin'],
+          secret: { source: 'file', path: '.secrets/mcp-secret' },
+          containmentProfile: 'local-stdio-secret-v1',
+          isolation: {
+            protectedHomePaths: ['.fixture-credential'],
+            redactEnv: ['FIXTURE_SECRET', 'FIXTURE_TOKEN'],
+          },
+        },
+        legacy: { secret: { source: 'env', name: 'INVALID_RECORD_SECRET' } },
+      } }));
+      invalidateGlobalConfigCache();
+      const worker = new ScriptedWorker();
+      const factory = factoryFor(worker);
+      const pool = createEphemeralPool({
+        factory,
+        workerPath: '/tmp/worker.js',
+        quiesceMs: 1,
+        resolveLarkAppSecret: () => 'secret',
+        resolveBot: () => ({
+          env: {
+            FIXTURE_SECRET: 'bot-reintroduced-secret',
+            FIXTURE_TOKEN: 'bot-reintroduced-token',
+            INVALID_RECORD_SECRET: 'bot-reintroduced-invalid-record-secret',
+          },
+        }),
+      });
+      const running = pool.runNode(request());
+      await worker.waitForInit();
+      try {
+        expect(factory.lastOpts!.env.FIXTURE_SECRET).toBeUndefined();
+        expect(factory.lastOpts!.env.FIXTURE_TOKEN).toBeUndefined();
+        expect(factory.lastOpts!.env.INVALID_RECORD_SECRET).toBeUndefined();
+        expect(factory.lastOpts!.env.BOTMUX_PROTECTED_SECRET_FD).toBeUndefined();
+        expect(worker.init.env.FIXTURE_SECRET).toBeUndefined();
+        expect(worker.init.env.FIXTURE_TOKEN).toBeUndefined();
+        expect(worker.init.env.INVALID_RECORD_SECRET).toBeUndefined();
+        expect(worker.init.protectedMcpPolicy).toEqual({
+          capabilities: [],
+          protectedHomePaths: ['.secrets/mcp-secret'],
+          redactEnv: ['BOTMUX_PROTECTED_SECRET_FD', 'FIXTURE_SECRET', 'FIXTURE_TOKEN', 'INVALID_RECORD_SECRET'],
+        });
+      } finally {
+        worker.emitExit(0);
+        await running;
+      }
+    } finally {
+      vi.unstubAllEnvs();
+      invalidateGlobalConfigCache();
+    }
+  });
+
   it('freezes only strict names, filters worker inheritance and resolves this bot env without persisting credentials', async () => {
     vi.stubEnv('UNLISTED_CLOUD_CREDENTIAL', 'host-sentinel');
     vi.stubEnv('HTTPS_PROXY', 'proxy-sentinel');
@@ -1091,6 +1159,7 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   readonly rawInputs: string[] = [];
   readonly autoReadyAfterInit: boolean;
   init: any;
+  private contractScope?: WorkerSessionEventScope;
   readyEmitted = false;
   private initResolve?: () => void;
   private initPromise = new Promise<void>((resolve) => { this.initResolve = resolve; });
@@ -1103,6 +1172,14 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   send(msg: unknown): void {
     if ((msg as any)?.type === 'init' && !this.init) {
       this.init = msg;
+      const contract = (msg as any).sessionContract;
+      if (contract) {
+        this.contractScope = new WorkerSessionEventScope(contract.session, contract.worker);
+        const binding = this.contractScope.beginRuntime();
+        this.contractScope.enterRuntime(binding);
+        this.emitMessage({ type: 'runtime_binding_started', bindingId: binding.bindingId });
+        this.emitMessage({ type: 'runtime_binding', bindingId: binding.bindingId, identity: { backend: 'tmux', physicalId: 'fake-worker', proof: 'opaque' } });
+      }
       this.initResolve?.();
       if (this.autoReadyAfterInit) {
         setImmediate(() => {
@@ -1111,6 +1188,7 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
         });
       }
     }
+    if ((msg as any)?.type === 'runtime_contract_assigned') this.contractScope?.assign((msg as any).bindingId, (msg as any).runtime);
     if ((msg as any)?.type === 'raw_input') {
       this.rawInputs.push((msg as any).content);
     }
@@ -1125,7 +1203,8 @@ class ScriptedWorker extends EventEmitter implements WorkerHandle {
   }
 
   emitMessage(msg: unknown): void {
-    this.emit('message', msg);
+    const binding = this.contractScope?.currentBinding();
+    this.emit('message', binding && this.contractScope ? { ...(msg as any), sessionContract: this.contractScope.envelope({ bindingId: binding.bindingId, runtime: binding.runtime }) } : msg);
   }
 
   emitExit(code: number | null): void {

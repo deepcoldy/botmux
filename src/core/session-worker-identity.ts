@@ -3,7 +3,7 @@ import { pidNotProvablyGone } from '../utils/process-alive.js';
 import { readDurableProcessIdentity } from '../utils/process-identity.js';
 import { readProcessSystemdUnit } from '../utils/systemd-unit.js';
 import { builtinFleetEntryMatches, readFleetProcessCommandLine } from './fleet-process-identity.js';
-import { sessionScopeUnitName } from './session-scope.js';
+import { isSessionScopeUnitFor } from './session-scope.js';
 
 /**
  * Bind a persisted `Session.pid` to the exact worker process it was recorded
@@ -81,7 +81,7 @@ export function inspectRecordedSessionWorker(
   const commandLine = runtime.readCommandLine(pid);
   const unit = runtime.readSystemdUnit(pid);
   const launchedByBotmux = (commandLine !== undefined && builtinFleetEntryMatches('worker', commandLine))
-    || (unit !== undefined && unit === sessionScopeUnitName(session.sessionId));
+    || (unit !== undefined && isSessionScopeUnitFor(session.sessionId, unit));
   if (!launchedByBotmux) {
     return commandLine === undefined && unit === undefined ? { status: 'unverifiable' } : { status: 'unproven' };
   }

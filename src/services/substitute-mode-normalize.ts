@@ -22,7 +22,10 @@ import type { SubstituteModeConfig, SubstituteTarget } from '../bot-registry.js'
  *    de-duplicated, and dropped when empty. They persist on a disabled config
  *    the same way targets do.
  */
-export function normalizeSubstituteMode(raw: unknown): SubstituteModeConfig | undefined {
+export function normalizeSubstituteMode(
+  raw: unknown,
+  onInvalidAppId?: (value: unknown) => void,
+): SubstituteModeConfig | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const rec = raw as Record<string, unknown>;
   const targets = Array.isArray(rec.targets)
@@ -30,6 +33,18 @@ export function normalizeSubstituteMode(raw: unknown): SubstituteModeConfig | un
         if (!item || typeof item !== 'object' || Array.isArray(item)) return [];
         const src = item as Record<string, unknown>;
         const target: SubstituteTarget = {};
+        if (src.appId !== undefined) {
+          // Feishu reports App IDs in lowercase only.
+          const appId = typeof src.appId === 'string' ? src.appId.trim().toLowerCase() : '';
+          if (!/^cli_[a-z0-9]+$/.test(appId)) {
+            onInvalidAppId?.(src.appId);
+            return [];
+          }
+          // App ID is the sole matching identity; never retain a stale resolved person/bot id.
+          target.appId = appId;
+          if (typeof src.name === 'string' && src.name.trim()) target.name = src.name.trim();
+          return [target];
+        }
         if (typeof src.openId === 'string' && src.openId.trim()) target.openId = src.openId.trim();
         if (typeof src.userId === 'string' && src.userId.trim()) target.userId = src.userId.trim();
         if (typeof src.unionId === 'string' && src.unionId.trim()) target.unionId = src.unionId.trim();
@@ -41,7 +56,7 @@ export function normalizeSubstituteMode(raw: unknown): SubstituteModeConfig | un
     : [];
   if (targets.length === 0) return undefined;
   const enabled = rec.enabled === true;
-  const hasMatchableTarget = targets.some(t => t.openId || t.userId || t.unionId);
+  const hasMatchableTarget = targets.some(t => t.appId || t.openId || t.userId || t.unionId);
   // Enabling with no matchable id is a dead ON state — reject (undefined).
   if (enabled && !hasMatchableTarget) return undefined;
   const chats = Array.isArray(rec.chats)
@@ -60,6 +75,13 @@ export function normalizeSubstituteMode(raw: unknown): SubstituteModeConfig | un
   };
   if (chats.length) out.chats = chats;
   if (excludedChats.length) out.excludedChats = excludedChats;
+  const keywords = Array.isArray(rec.keywords)
+    ? [...new Map(rec.keywords
+        .filter((value): value is string => typeof value === 'string')
+        .map(value => value.trim()).filter(Boolean)
+        .map(value => [value.toLowerCase(), value])).values()]
+    : [];
+  if (keywords.length) out.keywords = keywords;
   const replyMode = rec.replyMode === 'quote' ? 'quote' : 'thread';
   if (replyMode === 'quote') out.replyMode = 'quote';
   if (rec.disableControlCard === true) out.disableControlCard = true;

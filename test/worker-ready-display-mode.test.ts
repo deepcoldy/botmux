@@ -158,6 +158,8 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 
 import {
   CARD_POSTING_SENTINEL,
+  readableTerminalUrlFor,
+  liveReadableTerminalUrlFor,
   initWorkerPool,
   postTurnStartingCard,
   postFreshStreamingCard,
@@ -168,12 +170,17 @@ import {
   commitCaptureIdentity,
   displayableStreamingCardImageKey,
   canExpectFreshStreamingScreenshot,
+  buildStreamingCardJson,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
+import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import { activeSessionKey, sessionAnchorId, sessionKey, type DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { applyHandoffCardEvent } from '../src/core/handoff-card-lifecycle.js';
+import { resetTerminalProxy, setTerminalProxyPort } from '../src/core/terminal-url.js';
+import { beginReplyTargetTurn, REPLY_TARGETS_MAX } from '../src/core/reply-target.js';
+import { logger } from '../src/utils/logger.js';
 
 const getBotMock = getBot as ReturnType<typeof vi.fn>;
 
@@ -273,6 +280,132 @@ describe('Worker ready: set_display_mode re-sync', () => {
       closeSession: closeSessionMock,
     });
     setActiveSessionsRegistry(new Map());
+  });
+
+  it('keeps session-level proxy recovery links out of live streaming cards without a live worker', () => {
+    setTerminalProxyPort(8800);
+    try {
+      const ds = makeDs({
+        worker: null as any,
+        workerReady: undefined,
+        workerPort: null,
+        streamCardId: 'om_live_card',
+        session: {
+          ...makeDs().session,
+          backendType: 'tmux',
+          webPort: 52842,
+        },
+      });
+
+      expect(readableTerminalUrlFor(ds)).toContain('/s/sid-ready-test');
+      expect(liveReadableTerminalUrlFor(ds)).toBe('');
+      expect(JSON.parse(buildStreamingCardJson(ds, 'working')).readUrl).toBe('');
+    } finally {
+      resetTerminalProxy();
+    }
+  });
+
+  it('renders the terminal keys through live card rebuilds after opening the panel', async () => {
+    const actual = await vi.importActual<typeof import('../src/im/lark/card-builder.js')>('../src/im/lark/card-builder.js');
+    await vi.mocked(buildStreamingCard).withImplementation(actual.buildStreamingCard, async () => {
+      const ds = makeDs({ displayMode: 'screenshot', keysPanelOpen: true });
+      const keysIn = (card: any) => card.elements
+        .filter((element: any) => element.tag === 'column_set')
+        .flatMap((row: any) => row.columns.flatMap((column: any) => column.elements))
+        .filter((button: any) => button.value?.action === 'term_action')
+        .map((button: any) => button.value.key);
+
+      expect(keysIn(JSON.parse(buildStreamingCardJson(ds, 'working')))).toEqual([
+        'esc', 'ctrlc', 'tab', 'space', 'enter', 'left', 'up', 'down', 'right',
+        'half_page_up', 'half_page_down',
+      ]);
+      ds.keysPanelOpen = false;
+      expect(keysIn(JSON.parse(buildStreamingCardJson(ds, 'working')))).toEqual([]);
+    });
+  });
+
+  it('keeps the Web Terminal button on live streaming cards when the current worker owns a terminal', () => {
+    setTerminalProxyPort(8800);
+    try {
+      const ds = makeDs({
+        worker: makeFakeWorker(),
+        workerReady: true,
+        workerPort: 9999,
+        workerViewToken: 'view_live'.padEnd(43, '0'),
+        workerCardViewToken: 'card_live'.padEnd(43, '0'),
+        streamCardId: 'om_live_card',
+        session: {
+          ...makeDs().session,
+          backendType: 'tmux',
+          webPort: 9999,
+        },
+      });
+
+      const liveUrl = liveReadableTerminalUrlFor(ds);
+      expect(liveUrl).toContain('/s/sid-ready-test');
+      expect(liveUrl).toContain('viewToken=card_live');
+      expect(JSON.parse(buildStreamingCardJson(ds, 'working')).readUrl).toBe(liveUrl);
+    } finally {
+      resetTerminalProxy();
+    }
+  });
+
+  it.each([
+    ['keeps', 'view_cap'.padEnd(43, '0')],
+    ['omits', null],
+  ] as const)('%s the direct-port terminal button by whether the worker reported a read capability', (verdict, token) => {
+    const ds = makeDs({
+      worker: makeFakeWorker(), workerReady: true, workerPort: 9999, workerViewToken: token,
+      session: { ...makeDs().session, backendType: 'tmux', webPort: 9999 },
+    });
+    for (const url of [readableTerminalUrlFor(ds), liveReadableTerminalUrlFor(ds)]) {
+      expect(url).toBe(verdict === 'keeps' ? `http://localhost:9999?viewToken=${token}` : '');
+    }
+  });
+
+  it.each([
+    { name: 'diagnostic parking', crashDiagnosticParked: true },
+    { name: 'CLI restart', crashDiagnosticParked: false },
+  ])('keeps the terminal server available during $name without a ready CLI', ({ crashDiagnosticParked }) => {
+    setTerminalProxyPort(8800);
+    try {
+      const ds = makeDs({ worker: makeFakeWorker(), workerReady: false, workerPort: 9999, crashDiagnosticParked });
+      expect(liveReadableTerminalUrlFor(ds)).toContain('/s/sid-ready-test');
+      expect(JSON.parse(buildStreamingCardJson(ds, 'idle')).readUrl).toContain('/s/sid-ready-test');
+    } finally {
+      resetTerminalProxy();
+    }
+  });
+
+  it.each([
+    { name: 'missing worker', workerState: 'missing', backendType: 'tmux' },
+    { name: 'killed worker', workerState: 'killed', backendType: 'tmux' },
+    { name: 'backend without Web Terminal', workerState: 'alive', backendType: 'zmx' },
+  ] as const)('hides stale ports from live cards with a $name', ({ workerState, backendType }) => {
+    setTerminalProxyPort(8800);
+    try {
+      const worker = workerState === 'missing' ? null : makeFakeWorker();
+      if (workerState === 'killed') worker.killed = true;
+      const ds = makeDs({ worker, workerReady: true, workerPort: 9999,
+        session: { ...makeDs().session, backendType, webPort: 9999 } });
+      expect(liveReadableTerminalUrlFor(ds)).toBe('');
+      expect(JSON.parse(buildStreamingCardJson(ds, 'working')).readUrl).toBe('');
+    } finally {
+      resetTerminalProxy();
+    }
+  });
+
+  it('removes the terminal from an adopted session freeze when its worker exits', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, workerPort: 9999, streamCardId: 'om_adopt_card',
+      adoptedFrom: { source: 'tmux', tmuxTarget: 'dev:1.2', cliId: 'traex', cwd: '/tmp' } });
+    activate(ds);
+    setupActiveWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'claude_exit', code: 0, signal: null });
+    await flush();
+    const card = JSON.parse(updateMessageMock.mock.calls.at(-1)![2]);
+    expect(card).toMatchObject({ status: 'idle', readUrl: '' });
+    expect(worker.send).toHaveBeenCalledWith({ type: 'close' });
   });
 
   it.each(['ready', 'screen_update', 'fallback'].flatMap(source => ['publish', 'stop', 'replace'].map(outcome => ({ source, outcome }))))(
@@ -616,21 +749,22 @@ describe('Worker ready: set_display_mode re-sync', () => {
   it('POST path forwards ready.turnId to sessionReply for initial alias cards', async () => {
     const fakeWorker = makeFakeWorker();
     const ds = makeDs({ streamCardPending: true, streamCardId: undefined, worker: fakeWorker });
+    const viewToken = 'view_cap'.padEnd(43, '0');
 
     setupActiveWorkerHandlers(ds, fakeWorker);
     fakeWorker.emit('message', {
       type: 'ready',
       port: 9999,
       token: 'tok_abc',
-      viewToken: 'view_cap',
+      viewToken,
       turnId: 'om_turn_ready',
     });
     await flush();
 
     expect(sessionReplyMock).toHaveBeenCalledTimes(1);
     expect(sessionReplyMock.mock.calls[0][4]).toBe('om_turn_ready');
-    expect(ds.workerViewToken).toBe('view_cap');
-    expect(JSON.stringify(sessionReplyMock.mock.calls[0][1])).toContain('viewToken=view_cap');
+    expect(ds.workerViewToken).toBe(viewToken);
+    expect(JSON.stringify(sessionReplyMock.mock.calls[0][1])).toContain(`viewToken=${viewToken}`);
     const logs = loggerInfoMock.mock.calls.flat().join('\n');
     expect(logs).toContain('viewToken=[redacted]');
     expect(logs).not.toContain('view_cap');
@@ -1168,6 +1302,25 @@ describe('Worker ready: set_display_mode re-sync', () => {
     );
   });
 
+  it('keeps silent listener startup, notifications and failure local while running the worker', async () => {
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, displayMode: 'screenshot', streamingCardForced: true });
+    ds.session.rootMessageId = 'ml:om_source';
+    ds.session.messageListenerRun = { sourceMessageId: 'om_source', replyMode: 'none' };
+    setupActiveWorkerHandlers(ds, worker);
+    worker.emit('message', { type: 'ready', port: 9999, token: 'tok' });
+    await flush();
+    expect(ds.workerReady).toBe(true);
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'set_display_mode', mode: 'screenshot' }));
+    worker.emit('message', { type: 'user_notify', message: 'requires attention' });
+    worker.emit('message', { type: 'steer_accepted', turnId: 'om_turn', appTurnId: 'app_turn' });
+    worker.emit('message', { type: 'error', message: 'invalid launch configuration' });
+    await flush();
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect(updateMessageMock).not.toHaveBeenCalled();
+    expect(pinMessageMock).not.toHaveBeenCalled();
+  });
+
   it('managed/silent-suppressed ready (apiOnly transport) still sends set_display_mode', async () => {
     // apiOnly makes auxUiSuppressedFor() return true — the "worker exists, no
     // card will ever be posted" shape. The mode re-sync must not be tied to
@@ -1310,7 +1463,7 @@ describe('Worker ready: set_display_mode re-sync', () => {
       streamCardId: 'om_existing_card',
       workingDir: '/tmp',
     });
-    ds.session.cliId = 'gemini' as any;
+    ds.session.cliId = 'opencode';
     ds.session.backendType = 'tmux';
     ds.session.cliSessionId = undefined;
     ds.session.workingDir = '/tmp';
@@ -2137,6 +2290,51 @@ describe('independent acceptance currentTurnId compatibility', () => {
     await flush();
     expect(ds.currentImageKey).toBe('img_http_current');
     expect(updateMessageMock).toHaveBeenCalled();
+  });
+});
+
+describe('turn_input_committed without a dispatch receipt', () => {
+  const ingressBaseMs = Date.parse('2026-11-07T08:00:00.000Z');
+  const ingressAt = (offsetSec: number) => new Date(ingressBaseMs + offsetSec * 1000).toISOString();
+
+  function prepareChatSession() {
+    vi.clearAllMocks();
+    getBotMock.mockReturnValue({ config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' }, resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot' } as any);
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_unused'), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker, workerReady: true, workerGeneration: 1, scope: 'chat' });
+    ds.session.scope = 'chat'; ds.session.rootMessageId = 'oc_chat'; ds.session.workerGeneration = 1;
+    setupActiveWorkerHandlers(ds, worker);
+    return { ds, worker };
+  }
+
+  it('logs a rootless chat-scope Lark turn at debug instead of warn', async () => {
+    const { ds, worker } = prepareChatSession();
+    beginReplyTargetTurn(ds, undefined, 'om_flat_turn', ingressAt(0), { inThread: false });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_flat_turn' });
+    await flush();
+    expect(ds.session.dispatchInputReceipts).toBeUndefined();
+    expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('om_flat_turn'));
+    expect(logger.debug).toHaveBeenCalledWith(expect.stringContaining('om_flat_turn'));
+  });
+
+  it.each([
+    ['its topic binding was evicted before the commit', (ds: DaemonSession) => {
+      beginReplyTargetTurn(ds, 'om_seed', 'om_kickoff', ingressAt(0), { inThread: true });
+      for (let i = 1; i <= REPLY_TARGETS_MAX; i++) {
+        beginReplyTargetTurn(ds, undefined, `om_later_${i}`, ingressAt(i), { inThread: false });
+      }
+    }],
+    ['it was folded flat out of a topic', (ds: DaemonSession) => {
+      beginReplyTargetTurn(ds, undefined, 'om_kickoff', ingressAt(0), { inThread: true, foldedRootId: 'om_answered' });
+    }],
+  ])('still warns for a Lark turn that arrived inside a topic when %s', async (_label, ingress) => {
+    const { ds, worker } = prepareChatSession();
+    ingress(ds);
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_kickoff' });
+    await flush();
+    expect(ds.session.dispatchInputReceipts?.om_kickoff).toBeUndefined();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('om_kickoff'));
   });
 });
 

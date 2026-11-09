@@ -1,8 +1,10 @@
 import { isRemoteCliId } from '../../core/remote-cli-ids.js';
-import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
+import { cliSupportsCompactAction } from '../../core/passthrough-commands.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
-import { CLI_DISPLAY_NAMES } from '../../adapters/cli/display-names.js';
+import type { SandboxMode } from '../../adapters/cli/sandbox-mode.js';
+import { CLI_DISPLAY_NAMES, lookupCliDisplayName } from '../../adapters/cli/display-names.js';
+import { allowlistSandboxVerifiedClis } from '../../core/shared-bot-sandbox-advice.js';
 import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
 import type { ZellijAdoptableSession } from '../../core/zellij-adopt-discovery.js';
 import type { OrcaAdoptableSession } from '../../core/orca-adopt-discovery.js';
@@ -16,6 +18,7 @@ import { cardModelFallbackNotice, cardUsageFooterSegment, cardUsageRuntimeSegmen
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
+import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import {
   clampGrantQuotaForCard,
   DEFAULT_GRANT_DURATION_MS,
@@ -23,12 +26,15 @@ import {
   GRANT_DURATION_OPTIONS,
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
+import { modelPinText } from '../../core/model-pin.js';
 import { BACKGROUND_WAIT_TEMPLATE, STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 import type { StreamingCardButtonId } from './streaming-card-buttons.js';
+import type { SubstituteCardControl } from './substitute-card-control.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 import { REPLY_CARD_FOOTER_ELEMENT_ID } from './reply-card-footer-signature.js';
 import { callbackButton, cardHeader, cardHeaderTemplateFirst, larkMdDiv, simpleCard, urlButton, wideCard } from './card-primitives.js';
 import { CLEANUP_SESSION_WORKTREE_ACTION } from './session-worktree-cleanup-card.js';
+import { stuckPageSpec } from '../../core/stuck-page-catalog.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -176,6 +182,37 @@ export function buildConfigCard(data: ConfigCardData, locale?: Locale): string {
       }, locale),
     },
   });
+
+  if (data.sandboxAdvice) {
+    // Short lines, one fact each: why, how to turn it on, the current CLI; the
+    // verified list folds away.
+    const advice = data.sandboxAdvice;
+    const sep = t('card.config.sandbox_advice.sep', undefined, locale);
+    const name = (id: string) => lookupCliDisplayName(id) ?? id;
+    // A sandbox-refusing backend (herdr/zellij/zmx/orca/…): skip the "turn it
+    // on" line and the matrix list — the backend-blocked line is the action.
+    const backendBlocked = advice.cliSupport === 'blocked';
+    const lines = [
+      t('card.config.sandbox_advice', undefined, locale),
+      t('card.config.sandbox_advice.reasons', {
+        reasons: advice.reasons.map(r => t(`card.config.sandbox_advice.${r}`, undefined, locale)).join(sep),
+      }, locale),
+    ];
+    if (!backendBlocked) lines.push(t('card.config.sandbox_advice.action', undefined, locale));
+    lines.push(t(`card.config.sandbox_advice.${advice.cliSupport}`, { cli: name(advice.cliId) }, locale));
+    elements.push({ tag: 'markdown', content: lines.join('\n') });
+    if (!backendBlocked) {
+      elements.push({
+        tag: 'collapsible_panel', expanded: false,
+        header: {
+          title: { tag: 'plain_text', content: t('card.config.sandbox_advice.list_title', undefined, locale) },
+          icon: { tag: 'standard_icon', token: 'down_outlined', color: 'grey' },
+          icon_position: 'right', icon_expanded_angle: -180,
+        },
+        elements: [{ tag: 'markdown', content: allowlistSandboxVerifiedClis().map(name).join(sep) }],
+      });
+    }
+  }
 
   // ── 🧠 运行: cli / model / lang ─────────────────────────────────────────
   elements.push({ tag: 'hr' });
@@ -487,6 +524,8 @@ export function buildSessionCard(
   locale?: Locale,
   localCliReady = false,
   runtimeDisplayName?: string,
+  sessionSandbox?: SandboxMode,
+  modelPin?: CardUsageSnapshot['modelPin'],
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const effectiveCliId = cliId ?? 'claude-code';
@@ -524,9 +563,22 @@ export function buildSessionCard(
   } else {
     actions.push(callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }));
   }
+  if (modelPin && !adoptMode) actions.push(callbackButton('解除话题固定', 'default', {
+    action: 'session_model_unpin', ...actionBase, expected_pin_set_at: modelPin.setAt,
+  }));
   const card = wideCard({
     header: cardHeader(`🖥️ ${cliName} · ${plainTitle(title)}`, 'blue'),
     elements: [
+      // Frozen session sandbox (oncall / scratch) gets one notation line; an
+      // unsandboxed session keeps the legacy card byte-for-byte.
+      ...(sessionSandbox === 'oncall' || sessionSandbox === 'scratch'
+        ? [{
+            tag: 'markdown',
+            content: t(sessionSandbox === 'scratch' ? 'card.body.session_sandbox_scratch' : 'card.body.session_sandbox_oncall', undefined, locale),
+            text_size: 'notation',
+          }]
+        : []),
+      ...(modelPin ? [{ tag: 'div', text: { tag: 'plain_text', content: modelPinText(modelPin) } }] : []),
       { tag: 'action', actions },
     ],
   });
@@ -542,7 +594,7 @@ export function buildSessionCard(
  * `claude --resume <id>`), built by the per-CLI adapter's
  * `buildResumeCommand`. That keeps the conversation portable: users can
  * pick it up locally without going through botmux. CLIs that can't resume
- * a specific session from CLI args (gemini's "latest only") surface a
+ * a specific session from CLI args (a "latest only" mode) surface a
  * fallback note instead of a fake command.
  *
  * The "▶️ 恢复会话" button still goes through botmux — it re-enables the
@@ -831,9 +883,18 @@ export function buildRelayedFrozenCard(
 
 /**
  * Feishu card API rejects payloads exceeding ~109 KB (error 230025).
- * Cap markdown content byte size with headroom for card JSON overhead.
+ * Budget is measured in JSON-serialized (escaped: `"`, `\`, control chars)
+ * UTF-8 bytes with headroom for the surrounding card JSON overhead.
  */
 const MAX_CONTENT_BYTES = 100_000;
+
+/**
+ * Estimates the UTF-8 byte length of a string once serialized inside JSON (accounting for
+ * escaping of `"`, `\`, control characters, etc.).
+ */
+export function jsonEscapedByteLength(str: string): number {
+  return Buffer.byteLength(JSON.stringify(str), 'utf-8') - 2;
+}
 
 /**
  * Truncate content to fit within `maxBytes`, keeping the tail (most recent
@@ -842,7 +903,7 @@ const MAX_CONTENT_BYTES = 100_000;
  * tighter budget so the whole card stays under Feishu's ~109 KB hard limit.
  */
 export function truncateContent(content: string, locale?: Locale, maxBytes: number = MAX_CONTENT_BYTES): string {
-  if (Buffer.byteLength(content, 'utf-8') <= maxBytes) return content;
+  if (jsonEscapedByteLength(content) <= maxBytes) return content;
   // Binary search for the longest suffix that fits
   const lines = content.split('\n');
   let lo = 0;
@@ -850,13 +911,44 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
   while (lo < hi) {
     const mid = Math.floor((lo + hi) / 2);
     const candidate = lines.slice(mid).join('\n');
-    if (Buffer.byteLength(candidate, 'utf-8') <= maxBytes - 30) {
+    if (jsonEscapedByteLength(candidate) <= maxBytes - 30) {
       hi = mid;
     } else {
       lo = mid + 1;
     }
   }
-  return `${t('card.status.truncated_prefix', undefined, locale)}\n${lines.slice(lo).join('\n')}`;
+  let tail = lines.slice(lo).join('\n');
+  if (!tail.trim() && content.trim()) {
+    // Only blank trailing lines fit: the last non-blank line alone exceeds the
+    // budget (e.g. a minified blob with no newline, optionally ending in \n).
+    // Keep that line's byte tail instead of returning an empty body.
+    const budget = Math.max(0, maxBytes - 30);
+    let last = '';
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (lines[i].trim() !== '') { last = lines[i]; break; }
+    }
+    let loChar = 0;
+    let hiChar = last.length;
+    while (loChar < hiChar) {
+      const midChar = Math.floor((loChar + hiChar) / 2);
+      const sub = last.slice(midChar);
+      if (jsonEscapedByteLength(sub) <= budget) {
+        hiChar = midChar;
+      } else {
+        loChar = midChar + 1;
+      }
+    }
+    // Defensive: a paired surrogate costs 4 escaped bytes but a lone low
+    // surrogate costs 6, so on well-formed input the minimum always lands on a
+    // pair lead. Only input that already contains an unpaired surrogate can
+    // leave the cut on a trailing low one; skip it so the tail never opens with
+    // a lone low surrogate.
+    if (loChar < last.length && last.charCodeAt(loChar) >= 0xdc00 && last.charCodeAt(loChar) <= 0xdfff) {
+      loChar++;
+    }
+    tail = last.slice(loChar);
+  }
+  return `${t('card.status.truncated_prefix', undefined, locale)}\n${tail}`;
 }
 
 /** Byte budget for the private snapshot's text fallback. Well under the ~109 KB
@@ -876,8 +968,14 @@ export interface BackgroundWaitCardLabel {
   backgroundTasks: number;
 }
 
+export interface ActivityCardLabel {
+  activity: 'working' | 'tool' | 'model_queue';
+  elapsedSeconds: number;
+  progressAgeSeconds?: number;
+}
+
 /** 卡头的替代标签：idle 专用的 {@link IdleCardLabel}，或 {@link BackgroundWaitCardLabel}。 */
-export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel;
+export type StreamCardLabel = IdleCardLabel | BackgroundWaitCardLabel | ActivityCardLabel;
 
 /** 兼容旧调用：布尔 `true` 等价于 'silent'。 */
 function normalizeIdleLabel(v: boolean | StreamCardLabel | undefined): IdleCardLabel | undefined {
@@ -889,7 +987,7 @@ function normalizeIdleLabel(v: boolean | StreamCardLabel | undefined): IdleCardL
 /** 后台子任务数；仅当标签是 {@link BackgroundWaitCardLabel} 且状态为 working/idle 时有值。 */
 function backgroundWaitCount(status: StreamStatus, label: boolean | StreamCardLabel | undefined): number | undefined {
   if (status !== 'working' && status !== 'idle') return undefined;
-  if (!label || typeof label !== 'object' || !(label.backgroundTasks > 0)) return undefined;
+  if (!label || typeof label !== 'object' || !('backgroundTasks' in label) || !(label.backgroundTasks > 0)) return undefined;
   return label.backgroundTasks;
 }
 
@@ -904,6 +1002,10 @@ export function frozenIdleLabel(fc: { idleLabel?: IdleCardLabel; silentIdle?: bo
 function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, idleLabel?: boolean | StreamCardLabel): string {
   const backgroundTasks = backgroundWaitCount(status, idleLabel);
   if (backgroundTasks !== undefined) return t('card.status.background_wait', { count: backgroundTasks }, locale);
+  if (status === 'working' && idleLabel && typeof idleLabel === 'object' && 'activity' in idleLabel) {
+    if (idleLabel.activity === 'model_queue') return t('card.status.model_queue', undefined, locale);
+    if (idleLabel.activity === 'tool') return t('card.status.tool_running', undefined, locale);
+  }
   switch (status) {
     case 'starting': return t('card.status.starting', undefined, locale);
     case 'working': return t('card.status.working', undefined, locale);
@@ -939,9 +1041,17 @@ const MODEL_FALLBACK_NOTICE_TEXT_SIZE = 'x-small';
 
 function pushStreamBody(
   elements: any[],
-  opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale; usage?: CardUsageSnapshot; screenshotUnavailable?: boolean },
+  opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale; usage?: CardUsageSnapshot; screenshotUnavailable?: boolean; activity?: boolean | StreamCardLabel },
 ): void {
   const { status, usageLimit, displayMode, imageKey, cliName, locale, usage, screenshotUnavailable } = opts;
+  const activity = opts.activity;
+  if (status === 'working' && activity && typeof activity === 'object' && 'activity' in activity) {
+    const elapsed = t('card.status.activity_elapsed', { seconds: activity.elapsedSeconds }, locale);
+    const progress = activity.progressAgeSeconds === undefined ? ''
+      : ` · ${t('card.status.activity_progress_age', { seconds: activity.progressAgeSeconds }, locale)}`;
+    elements.push({ tag: 'markdown', element_id: 'botmux_stream_activity', text_size: 'notation_small_v2',
+      content: `<font color='grey'>${elapsed}${progress}</font>` });
+  }
   if (status === 'limited' && usageLimit) {
     elements.push({
       tag: 'markdown',
@@ -1047,6 +1157,11 @@ export function buildStreamingCard(
   /** Screenshot mode with no image: render "no screenshot available" instead
    *  of "waiting for first screenshot". Ignored when `imageKey` is present. */
   screenshotUnavailable = false,
+  /** Per-chat substitute toggle. Omitted ⇒ no button (fail-closed). */
+  substituteControl?: SubstituteCardControl,
+  /** Terminal-key grid expanded state, owned by the daemon session and carried
+   *  through every PATCH so streaming refreshes don't snap the grid shut. */
+  keysPanelOpen = false,
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -1063,7 +1178,7 @@ export function buildStreamingCard(
   const elements: any[] = [];
 
   // ── Output body (shared with the private snapshot card) ──────────────────
-  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage, screenshotUnavailable });
+  pushStreamBody(elements, { status, usageLimit, displayMode, imageKey, cliName, locale, usage, screenshotUnavailable, activity: silentIdle });
 
   // ── 上下文余量：**不再单独渲染一行** ────────────────────────────────────
   // 曾经这里 push 过一行 `📊 上下文 N%`，但卡片下方本来就有 usage footer
@@ -1073,90 +1188,164 @@ export function buildStreamingCard(
   // 比 footer 少了绝对值。唯一不冗余的是「超阈值提醒」，已折进 footer 那一行
   // （见 cardUsageFooterSegment 的 compactHintThreshold）。
 
-  // ── Main control row: display toggle, mode toggle, terminal, manage ─────
-  const headerActions: any[] = [];
+  // ── Primary control row: high-frequency / dangerous actions only. The rest
+  //    move into the 「更多操作」 collapsible panel below, so narrow cards (e.g.
+  //    meeting chats) no longer render a dozen full-width buttons stacked into
+  //    one long vertical strip.
+  const primaryActions: any[] = [];
   const hidden = new Set(hiddenButtons);
 
+  if (terminalUrl && !hidden.has('terminal')) {
+    primaryActions.push(urlButton(t('card.btn.open_terminal', undefined, locale), 'primary', terminalMultiUrl(terminalUrl)));
+  }
+  if (status === 'limited' && usageLimit?.retryReady) {
+    primaryActions.push(callbackButton(
+      t('card.btn.retry_last_task', undefined, locale),
+      'primary',
+      { action: 'retry_last_task', ...actionBase },
+    ));
+  }
+  // 「压缩」显示判据必须调谓词，不能手写 cliId 字面量：Builder 与 handler 共用
+  // cliSupportsCompactAction——remote CLI（riff/mojo）无本地终端；无 raw passthrough 面
+  // 的 CLI（codex-app/mira/mir/dsh/ebsd）发 /compact 会被帧协议丢弃或当成普通消息白烧
+  // 一个 turn；MiniMax 经帧协议把 /compact 交给 ACP，同样由该谓词放行，但不开放任意 TUI
+  // passthrough。dshRuntime='tui' 的真交互 TUI 照常显示。handler 侧另有同谓词拒绝兜底。
+  if (!hidden.has('compact') && !isRemoteCliId(cliId) && cliSupportsCompactAction(effectiveCliId, { dshRuntime })) {
+    primaryActions.push(callbackButton(t('card.btn.compact', undefined, locale), 'default', { action: 'compact_session', ...actionBase }));
+  }
+  // 「停止」仅在有 turn 可停时显示（working/analyzing/stalled）：idle 无 turn 可停，
+  // starting CLI 未起，limited turn 已失败，只剩后台子任务时 ^C 也停不了后台任务。
+  // remote CLI 无终端可驱动、codex-app 无 PTY 输入通道，均隐藏。
+  if (!hidden.has('stop') && !isRemoteCliId(cliId) && effectiveCliId !== 'codex-app' && !backgroundWait
+    && (status === 'working' || status === 'analyzing' || status === 'stalled')) {
+    primaryActions.push(callbackButton(t('card.btn.stop', undefined, locale), 'default', { action: 'stop_turn', ...actionBase }));
+  }
+  if (adoptMode) {
+    if (showTakeover) {
+      primaryActions.push(callbackButton(t('card.btn.takeover', undefined, locale), 'default', { action: 'takeover', ...actionBase }));
+    }
+    if (!hidden.has('close')) {
+      primaryActions.push(callbackButton(t('card.btn.disconnect', undefined, locale), 'danger', { action: 'disconnect', ...actionBase }));
+    }
+  } else if (!hidden.has('close')) {
+    primaryActions.push(callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }));
+  }
+  if (primaryActions.length > 0) elements.push({ tag: 'action', actions: primaryActions });
+
+  // ── Secondary row + collapsible panels ──────────────────────────────────
+  // The terminal-key grid is a daemon-controlled toggle (state must survive
+  // card PATCHes). The low-frequency controls live in a native Feishu
+  // collapsible_panel with a titled header — an unlabelled overflow "⋯" icon
+  // was not discoverable on mobile. The panel expands locally in the client
+  // (no callback/state needed); its items are one-shot actions, so collapsing
+  // back on the next streaming PATCH is harmless.
+  const keysAvailable = displayMode === 'screenshot' && !isRemoteCliId(cliId);
+  const primaryMode = coordinationModeIsPrimary();
+  if (keysAvailable && !primaryMode) {
+    elements.push({
+      tag: 'action',
+      actions: [
+        // 按钮值带目标状态 desired（而非「翻转」）：连点两下、或卡面与会话状态不一致时，
+        // 点击结果都等于用户看到的那个箭头。
+        callbackButton(
+          `${t('card.btn.keys_panel', undefined, locale)} ${keysPanelOpen ? '▴' : '▾'}`,
+          'default',
+          { action: 'toggle_keys_panel', desired: keysPanelOpen ? 'closed' : 'open', ...actionBase },
+        ),
+      ],
+    });
+  }
+  const morePanelButtons: any[] = [];
   if (!hidden.has('output')) {
-    headerActions.push(callbackButton(
+    morePanelButtons.push(callbackButton(
       t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale),
       'default',
-      { action: 'toggle_display', ...actionBase },
+      coordinationModeIsPrimary()
+        ? {
+            action: 'toggle_display',
+            // #2062: carry the visible intent so a durable-lane retry applies
+            // the same mode instead of toggling back.
+            target_display_mode: displayMode === 'hidden' ? 'screenshot' : 'hidden',
+            ...actionBase,
+          }
+        : { action: 'toggle_display', ...actionBase },
     ));
     if (displayMode !== 'hidden') {
-      headerActions.push(callbackButton(
+      morePanelButtons.push(callbackButton(
         t('card.btn.export_text', undefined, locale),
         'default',
         { action: 'export_text', ...actionBase },
       ));
     }
     if (displayMode === 'screenshot') {
-      headerActions.push(callbackButton(
+      morePanelButtons.push(callbackButton(
         t('card.btn.refresh', undefined, locale),
         'default',
         { action: 'refresh_screenshot', ...actionBase },
       ));
     }
   }
-  if (terminalUrl && !hidden.has('terminal')) {
-    headerActions.push(urlButton(t('card.btn.open_terminal', undefined, locale), 'primary', terminalMultiUrl(terminalUrl)));
-  }
   const localBtn = cliId ? localCliButton(effectiveCliId, actionBase, locale, localCliReady, runtimeDisplayName) : undefined;
-  if (localBtn) headerActions.push(localBtn);
-  if (status === 'limited' && usageLimit?.retryReady) {
-    headerActions.push(callbackButton(
-      t('card.btn.retry_last_task', undefined, locale),
-      'primary',
-      { action: 'retry_last_task', ...actionBase },
-    ));
-  }
+  if (localBtn) morePanelButtons.push(localBtn);
   if (terminalUrl && !hidden.has('writeLink')) {
-    headerActions.push(callbackButton(
+    morePanelButtons.push(callbackButton(
       t('card.btn.get_write_link', undefined, locale),
       'default',
       { action: 'get_write_link', ...actionBase },
     ));
   }
-  // 「🗜️ 压缩」：只要该 CLI 有能接收 /compact 的输入通道就显示——**不再要求有上下文
-  // 百分比**。此前条件是 hasContextPct，但只有 codex（native model_context_window）和
-  // pi（读 ~/.pi/agent/models.json）算得出百分比；Claude Code 的 transcript 里根本没有
-  // 上下文窗口字段（只有 model），于是 Claude 会话永远看不到压缩按钮——而 Claude 恰好
-  // 是最需要 /compact 的一家。百分比是「快满了吗」的提示，与「能不能压缩」无关，用它当
-  // 闸门是拿错了判据。
-  //
-  // 判据必须**调谓词**（cliHasNoRawPassthroughSurface），不能手写单个 cliId 字面量：
-  //   ① remote CLI（riff/mojo）无本地终端可驱动；
-  //   ② 无 raw passthrough 面的 CLI（codex-app/mira/mir/dsh/ebsd）——/compact 走 raw_input
-  //      把字面量写进 PTY，绕过 runner 的 `::botmux-<id>:<base64>` 帧协议：dsh 打
-  //      `ignoring non-frame input` 静默丢弃，mira/mir 把 `/compact` 当**普通用户消息**
-  //      发给模型白烧一个 turn。打字发 /compact 本就被 router 的
-  //      resolvePassthroughCommands 对这些 CLI 返回空集拦住，按钮不能把那条路重新打开。
-  // dsh 是运行时相关的：dshRuntime='tui' 跑的是 PTY 驱动的 dsh-tui（真交互 TUI），照常显示。
-  // handler 侧另有一道同谓词的拒绝兜底（compact_session），两层都不依赖百分比。
-  if (!hidden.has('compact') && !isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
-    headerActions.push(callbackButton(t('card.btn.compact', undefined, locale), 'default', { action: 'compact_session', ...actionBase }));
+  // 闲置自动压缩：状态随 usage 快照到卡，快照里没有 ⇒ 该 CLI/后端不支持，不渲染。
+  // 跟随「压缩」的隐藏配置；按钮值带目标状态 desired，重复点击幂等。
+  const idleCompact = !adoptMode && !hidden.has('compact') ? usage?.idleAutoCompact : undefined;
+  if (idleCompact) {
+    morePanelButtons.push(callbackButton(
+      t(idleCompact.enabled ? 'card.btn.idle_compact_on' : 'card.btn.idle_compact_off', { minutes: idleCompact.minutes }, locale),
+      'default',
+      { action: 'toggle_idle_compact', desired: idleCompact.enabled ? 'off' : 'on', ...actionBase },
+    ));
   }
-  // 「⏹ 停止」：常驻主控制行（不再受 displayMode==='hidden' 折叠态限制——折叠态是 turn
-  // 跑飞时用户唯一可见的一行，此前只能 /close 杀整个会话丢上下文）。点击走已有的
-  // term_action ctrlc IPC 链路（与展开态 ^C 快捷键完全同款），中断当前 turn 但保留会话。
-  // 仅在有 turn 可停的状态显示：idle 无 turn 可停；starting CLI 未起；limited turn 已失败；
-  // 主回合已结束、只剩后台子任务在跑时也无 turn 可停（^C 停不了后台任务）。
-  // remote CLI（riff/mojo）无终端可驱动、codex-app 无 PTY 输入通道，均隐藏。
-  if (!hidden.has('stop') && !isRemoteCliId(cliId) && effectiveCliId !== 'codex-app' && !backgroundWait
-    && (status === 'working' || status === 'analyzing' || status === 'stalled')) {
-    headerActions.push(callbackButton(t('card.btn.stop', undefined, locale), 'default', { action: 'stop_turn', ...actionBase }));
+  // 「在本群关闭/开启替身模式」：per-bot + per-chat 运行态开关（不是会话设置）。
+  // 按钮值携带明确的目标 desired，处理侧按目标写入而不是翻转，旧卡重复点击幂等。
+  if (!hidden.has('substitute') && substituteControl) {
+    morePanelButtons.push(callbackButton(
+      t(substituteControl.enabled ? 'card.btn.substitute_off' : 'card.btn.substitute_on', undefined, locale),
+      'default',
+      { action: 'toggle_substitute', desired: substituteControl.enabled ? 'off' : 'on', ...actionBase },
+    ));
   }
-  if (adoptMode) {
-    if (showTakeover) {
-      headerActions.push(callbackButton(t('card.btn.takeover', undefined, locale), 'default', { action: 'takeover', ...actionBase }));
+  if (morePanelButtons.length > 0) {
+    // Two weighted columns keep labels on one line even on a phone-sized card;
+    // an odd last button simply occupies the first column of the final row.
+    const panelRows: any[] = [];
+    for (let i = 0; i < morePanelButtons.length; i += 2) {
+      const pair = morePanelButtons.slice(i, i + 2);
+      panelRows.push({
+        tag: 'column_set',
+        flex_mode: 'none',
+        horizontal_spacing: 'small',
+        ...(i > 0 ? { margin: '6px 0px 0px 0px' } : {}),
+        columns: pair.map((btn: any) => ({
+          tag: 'column',
+          width: 'weighted',
+          weight: 1,
+          vertical_align: 'top',
+          elements: [{ ...btn, width: 'fill' }],
+        })),
+      });
     }
-    if (!hidden.has('close')) {
-      headerActions.push(callbackButton(t('card.btn.disconnect', undefined, locale), 'danger', { action: 'disconnect', ...actionBase }));
-    }
-  } else if (!hidden.has('close')) {
-    headerActions.push(callbackButton(t('card.btn.close_session', undefined, locale), 'danger', { action: 'close', ...actionBase }));
+    elements.push({
+      tag: 'collapsible_panel',
+      expanded: false,
+      margin: '6px 0px 0px 0px',
+      header: {
+        title: { tag: 'plain_text', content: t('card.btn.more_actions', undefined, locale) },
+        icon: { tag: 'standard_icon', token: 'down_outlined', color: 'grey' },
+        icon_position: 'right',
+        icon_expanded_angle: -180,
+      },
+      elements: panelRows,
+    });
   }
-  if (headerActions.length > 0) elements.push({ tag: 'action', actions: headerActions });
   const effortControl = !adoptMode && usage?.reasoningControl;
   if (effortControl && effortControl.choices.length > 0) {
     // Display executor truth; keep CAS bound to the saved session setting.
@@ -1203,41 +1392,64 @@ export function buildStreamingCard(
     });
   }
 
-  // ── Quick-action keys (only when the screenshot is visible — in text mode
-  //    there's no visible cursor/input, so these keys would fire blindly) ──
-  // 远端任务后端（riff / mojo）没有可驱动的终端，PTY 快捷键只会变成内容为控制
-  // 字符的 follow-up 任务（worker 侧也有同款拒绝守卫），整排隐藏。
-  // 用 isRemoteCliId 而非硬编码单个 id：这一处原本只排除了 riff，于是新增 mojo
-  // 后卡片照旧渲染 11 个按钮、点击全部静默无效；改走 REMOTE_CLI_IDS 单一事实源，
-  // 以后再加远端 CLI 不会重复漏改。
-  if (displayMode === 'screenshot' && !isRemoteCliId(cliId)) {
-    const mkKey = (label: string, key: string) => (callbackButton(label, 'default', { action: 'term_action', ...actionBase, key }));
-    elements.push({
-      tag: 'action',
-      actions: [
-        mkKey('Esc', 'esc'),
-        mkKey('^C', 'ctrlc'),
-        mkKey('Tab', 'tab'),
-        mkKey('␣ Space', 'space'),
-        mkKey('↵ Enter', 'enter'),
-      ],
+  // ── Terminal-key grid (behind the 「⌨️ 终端按键」 toggle above). Only rendered
+  //    with a visible screenshot — in text mode the keys would fire blindly.
+  //    远端任务后端（riff / mojo）没有可驱动的终端，整组隐藏（isRemoteCliId 单一
+  //    事实源，新增远端 CLI 自动跟随）。weighted columns pin the keys into a
+  //    fixed grid: the old `action` rows stacked every key full-width on narrow
+  //    cards, which is what made the card a long vertical strip.
+  if (keysAvailable && (primaryMode || keysPanelOpen)) {
+    const mkKey = (label: string, key: string) => ({
+      ...callbackButton(label, 'default', { action: 'term_action', ...actionBase, key }),
+      width: 'fill' as const,
     });
-    elements.push({
-      tag: 'action',
-      actions: [
-        mkKey('←', 'left'),
-        mkKey('↑', 'up'),
-        mkKey('↓', 'down'),
-        mkKey('→', 'right'),
-        mkKey(t('card.btn.half_page_up', undefined, locale), 'half_page_up'),
-        mkKey(t('card.btn.half_page_down', undefined, locale), 'half_page_down'),
-      ],
+    // Row widths are deliberately unequal: Feishu truncates button text with an
+    // ellipsis when a weighted column gets narrower than the label. Labels are
+    // therefore single symbols wherever possible (×/⇥/␣/↵/▲/▼) — even a
+    // half-width column can't ellipsize one glyph. Esc renders as × (its
+    // common "exit/cancel" glyph); ^C stays textual, already two characters.
+    const keyRow = (keys: Array<{ label: string; key: string }>, topMargin = false) => ({
+      tag: 'column_set',
+      flex_mode: 'none',
+      horizontal_spacing: 'small',
+      ...(topMargin ? { margin: '6px 0px 0px 0px' } : {}),
+      columns: keys.map(({ label, key }) => ({
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        vertical_align: 'top',
+        elements: [mkKey(label, key)],
+      })),
     });
+    elements.push(keyRow([
+      { label: '×', key: 'esc' },
+      { label: '^C', key: 'ctrlc' },
+      { label: '⇥', key: 'tab' },
+      { label: '␣', key: 'space' },
+      { label: '↵', key: 'enter' },
+    ]));
+    elements.push(keyRow([
+      { label: '←', key: 'left' },
+      { label: '↑', key: 'up' },
+      { label: '↓', key: 'down' },
+      { label: '→', key: 'right' },
+    ], true));
+    elements.push(keyRow([
+      { label: t('card.btn.half_page_up', undefined, locale), key: 'half_page_up' },
+      { label: t('card.btn.half_page_down', undefined, locale), key: 'half_page_down' },
+    ], true));
   }
 
   // Model auto-fallback notice — pinned as small yellow text at the very bottom of
   // the session card (never a separate message) for as long as the session
   // keeps running on the fallback model.
+  const pinNotice = modelPinText(usage?.modelPin);
+  if (pinNotice) {
+    elements.push({ tag: 'div', text: { tag: 'plain_text', content: pinNotice } });
+    if (!adoptMode) elements.push({ tag: 'action', actions: [callbackButton('解除话题固定', 'default', {
+      action: 'session_model_unpin', ...actionBase, expected_pin_set_at: usage!.modelPin!.setAt,
+    })] });
+  }
   const modelFallbackNotice = cardModelFallbackNotice(usage?.modelFallback, locale);
   if (modelFallbackNotice) {
     elements.push({
@@ -1313,7 +1525,11 @@ export function buildPrivateSnapshotCard(
   if (!imageKey) {
     const text = (screenContent ?? '').replace(/[ \t\r\n]+$/, '');
     if (text) {
-      const body = truncateContent(text, locale, PRIVATE_SNAPSHOT_TEXT_MAX);
+      // Cap backtick runs first: the fence grows with the longest run and is
+      // emitted twice, so a huge run (e.g. 36k backticks) would push the card
+      // past Feishu's size limit even though the body fits its own budget.
+      const capped = text.replace(/`{9,}/g, '`'.repeat(8));
+      const body = truncateContent(capped, locale, PRIVATE_SNAPSHOT_TEXT_MAX);
       // Fence must be longer than the longest backtick run in the body, else
       // terminal output containing ``` would break out of the code block.
       const maxRun = (body.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 0);
@@ -2036,13 +2252,17 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
 
   // 重试建议与按钮由同一个 retryOffer 决定，避免「卡上说能重试但按钮不给」。
   const canRetry = o.retryOffer !== 'none' && !!o.retryTurnId;
-  const adviceKey = o.retryOffer === 'none'
-    ? 'card.turn_failed.no_retry'
-    : !o.retryTurnId
-      ? 'card.turn_failed.no_input'
-      : o.retryOffer === 'safe'
-        ? 'card.turn_failed.retry_safe'
-        : 'card.turn_failed.retry_caveated';
+  // 图片尺寸 400 是会话历史被毒化：任何重试/续跑都会带着同一张图再 400，
+  // 必须优先于通用 no_retry 文案，给出 /clear 恢复指引。
+  const adviceKey = o.errorCode === 'provider_image_too_small'
+    ? 'card.turn_failed.image_too_small'
+    : o.retryOffer === 'none'
+      ? 'card.turn_failed.no_retry'
+      : !o.retryTurnId
+        ? 'card.turn_failed.no_input'
+        : o.retryOffer === 'safe'
+          ? 'card.turn_failed.retry_safe'
+          : 'card.turn_failed.retry_caveated';
   elements.push({ tag: 'markdown', content: t(adviceKey, undefined, locale) });
 
   const actions: any[] = [];
@@ -2071,6 +2291,21 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
       },
     });
   }
+  // 小图毒化：普通「继续」会把同一张图再发一遍、必然再 400。单独给一个
+  // primary 动作——worker 先清洗会话记录再 --resume 重启，随后自动续跑，
+  // 文本上下文保留（无需 /clear）。没有失败轮次凭据（retryTurnId）时不给。
+  if (o.errorCode === 'provider_image_too_small' && o.retryTurnId) {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.purge_images_continue', undefined, locale) },
+      type: 'primary',
+      value: {
+        action: 'purge_images_continue',
+        turn_id: o.retryTurnId,
+        ...actionBase,
+      },
+    });
+  }
   if (o.terminalUrl) {
     actions.push(urlButton(t('card.btn.open_terminal', undefined, locale), 'default', terminalMultiUrl(o.terminalUrl)));
   }
@@ -2078,6 +2313,147 @@ export function buildTurnFailedCard(o: TurnFailedCardOpts): string {
 
   return JSON.stringify(wideCard({
     header: cardHeader(t(titleKey, { cliName: plainTitle(o.cliName) }, locale), 'red'),
+    elements,
+  }));
+}
+
+export interface RecoveryFailedCardOpts {
+  rootId: string;
+  sessionId: string;
+  cliId: CliId | undefined;
+  cliName: string;
+  /** Logical turn the notice is about; pins the retry button to it. */
+  logicalTurnId: string;
+  /** Original sender, @-mentioned first (never a bot). */
+  mentionOpenId?: string;
+  /** i18n key of the human-readable cause (see recoveryCauseI18nKey). */
+  causeKey: string;
+  /** i18n key of how far automatic recovery got (see recoveryOutcomeI18nKey). */
+  outcomeKey: string;
+  continuations: number;
+  /** Closed-set error codes, shown de-emphasised for whoever debugs it. */
+  errorCodes: string[];
+  task?: string;
+  failedAt?: Date;
+  /** `available` renders the retry button; `retried` replaces it with who
+   *  retried and when; `none` explains why there is nothing to re-deliver. */
+  retry:
+    | { kind: 'available' }
+    | { kind: 'retried'; byOpenId: string; at: Date }
+    /** No re-delivery material, but the session's `lastFailedTurn` is this
+     *  very turn: keep the pre-existing admin「继续这一轮」button (retry_turn,
+     *  continue mode) that recovery cards used to carry. */
+    | { kind: 'continue_legacy'; turnId: string }
+    /** A poisoned-history image failure can be repaired in place even when the
+     *  ordinary recovery notice has no re-delivery envelope. */
+    | { kind: 'purge_images'; turnId: string }
+    | { kind: 'none'; reason: 'no_input' | 'scheduled' | 'unsupported' };
+  terminalUrl?: string;
+  locale?: Locale;
+}
+
+/** 自动恢复失败卡：一轮普通消息的自动续跑最终失败（重试用尽 / 续跑结果无法确认 /
+ *  交接被打断……）时发到原群（原话题）的唯一一张卡。
+ *
+ *  与 {@link buildTurnFailedCard} 的区别：
+ *  1. 原因按错误码归类成一句人话（`causeKey`），错误码只作为次要信息附在后面——
+ *     从不出现 provider 原文、堆栈或内部地址；
+ *  2. 「重试」按钮重新投递**这条消息本身**（logical turn 的原始输入，按原发起人身份），
+ *     按钮钉在 logical turn 上，而不是会被后续失败覆盖的 `lastFailedTurn`；
+ *  3. 发起人与管理员都能点（handler 校验），点过后卡片原地换成「已由谁重试」。 */
+export function buildRecoveryFailedCard(o: RecoveryFailedCardOpts): string {
+  const { locale } = o;
+  const lines: string[] = [];
+  if (o.mentionOpenId) lines.push(`<at id=${o.mentionOpenId}></at>`);
+  lines.push(t('card.recovery_failed.field_cause', { cause: t(o.causeKey, undefined, locale) }, locale));
+  if (o.task) {
+    lines.push(t('card.recovery_failed.field_task', { task: escapeMd(o.task) }, locale));
+  }
+  if (o.failedAt) {
+    lines.push(t('card.recovery_failed.field_when', {
+      when: o.failedAt.toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN', { hour12: false }),
+    }, locale));
+  }
+  lines.push(t('card.recovery_failed.field_recovery', {
+    outcome: t(o.outcomeKey, { count: String(o.continuations) }, locale),
+  }, locale));
+  const codes = [...new Set(o.errorCodes.filter(Boolean))]
+    .map(code => `\`${code.replace(/[`<>]/g, '')}\``);
+  if (codes.length > 0) {
+    lines.push(t('card.recovery_failed.field_codes', { codes: codes.join(' · ') }, locale));
+  }
+
+  const elements: any[] = [
+    { tag: 'markdown', content: lines.join('\n') },
+    { tag: 'hr' },
+  ];
+  const advice = o.retry.kind === 'available'
+    ? t('card.recovery_failed.retry_hint', undefined, locale)
+    : o.retry.kind === 'continue_legacy'
+      ? t('card.turn_failed.retry_caveated', undefined, locale)
+    : o.retry.kind === 'purge_images'
+      ? t('card.turn_failed.image_too_small', undefined, locale)
+    : o.retry.kind === 'retried'
+      ? t('card.recovery_failed.retried', {
+        who: `<at id=${o.retry.byOpenId}></at>`,
+        when: o.retry.at.toLocaleTimeString(locale === 'en' ? 'en-US' : 'zh-CN', {
+          hour12: false, hour: '2-digit', minute: '2-digit',
+        }),
+      }, locale)
+      : t(`card.recovery_failed.no_retry_${o.retry.reason}`, undefined, locale);
+  elements.push({ tag: 'markdown', content: advice });
+
+  const actions: any[] = [];
+  if (o.retry.kind === 'available') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.retry_recovery_turn', undefined, locale) },
+      type: 'primary',
+      value: {
+        action: 'retry_recovery_turn',
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        cli_id: o.cliId ?? 'claude-code',
+        logical_turn_id: o.logicalTurnId,
+      },
+    });
+  }
+  if (o.retry.kind === 'continue_legacy') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.continue_turn', undefined, locale) },
+      type: 'default',
+      value: {
+        action: 'retry_turn',
+        turn_id: o.retry.turnId,
+        mode: 'continue',
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        cli_id: o.cliId ?? 'claude-code',
+      },
+    });
+  }
+  if (o.retry.kind === 'purge_images') {
+    actions.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: t('card.btn.purge_images_continue', undefined, locale) },
+      type: 'primary',
+      value: {
+        action: 'purge_images_continue',
+        turn_id: o.retry.turnId,
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        cli_id: o.cliId ?? 'claude-code',
+      },
+    });
+  }
+  if (o.terminalUrl) {
+    actions.push(urlButton(t('card.btn.open_terminal', undefined, locale), 'default', terminalMultiUrl(o.terminalUrl)));
+  }
+  if (actions.length > 0) elements.push({ tag: 'action', actions });
+
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.recovery_failed.title', { cliName: plainTitle(o.cliName) }, locale), 'red'),
     elements,
   }));
 }
@@ -2279,6 +2655,108 @@ export function buildTuiPromptFailedCard(message: string, locale?: Locale): stri
   return JSON.stringify(card);
 }
 
+// ─── Stuck-page cards ────────────────────────────────────────────────────────
+
+/** Code block for terminal text: the fence is longer than any backtick run in
+ *  the body, so screen content cannot close it early. */
+function fencedTerminalText(body: string): string {
+  const maxRun = (body.match(/`+/g) ?? []).reduce((m, r) => Math.max(m, r.length), 0);
+  const fence = '`'.repeat(Math.max(3, maxRun + 1));
+  return `${fence}\n${body}\n${fence}`;
+}
+
+function pushScreenTail(elements: unknown[], screenTail: string | undefined, locale?: Locale): void {
+  if (!screenTail) return;
+  elements.push(larkMdDiv(t('card.stuck.screen_tail', undefined, locale)));
+  elements.push({ tag: 'markdown', content: fencedTerminalText(screenTail) });
+}
+
+/**
+ * The "CLI is stuck on a blocking page" card. Buttons come from
+ * STUCK_PAGE_CATALOG for `pageType`, one per option, and carry only the
+ * button index and the warning nonce — the daemon maps (page, index) back to
+ * a key on click. An unknown page gets the same card without buttons. There
+ * is no input box: nobody can type through this card.
+ */
+export function buildStuckPageCard(o: {
+  rootId: string;
+  sessionId: string;
+  nonce: number;
+  pageType: string | undefined;
+  cliName: string;
+  /** Already-localised context line (e.g. the notice this card replaces). */
+  noticeText?: string;
+  /** Set for the StuckDetector path: how long the written turn has stalled. */
+  stalledSecs?: number;
+  screenTail?: string;
+  /** Whether a turn initiator was identified (changes who-may-press hint). */
+  hasInitiator: boolean;
+  /** Global switch `stuckCardInitiatorKeys` at build time; false = the hint
+   *  says operators only, whoever started the turn. Absent = on. */
+  initiatorKeysEnabled?: boolean;
+  locale?: Locale;
+}): string {
+  const locale = o.locale;
+  const spec = stuckPageSpec(o.pageType);
+  const lines: string[] = [];
+  if (o.noticeText) lines.push(escapeMd(o.noticeText));
+  if (o.stalledSecs !== undefined) lines.push(escapeMd(t('card.stuck.stalled', { secs: String(o.stalledSecs) }, locale)));
+  lines.push(escapeMd(t(spec ? spec.descriptionKey : 'card.stuck.page.unknown', undefined, locale)));
+  const elements: unknown[] = [larkMdDiv(lines.join('\n\n'))];
+  pushScreenTail(elements, o.screenTail, locale);
+  if (spec && spec.options.length > 0) {
+    elements.push({ tag: 'hr' });
+    const hintKey = o.initiatorKeysEnabled === false
+      ? 'card.stuck.hint.operators_only'
+      : o.hasInitiator ? 'card.stuck.hint.initiator' : 'card.stuck.hint.admin_only';
+    elements.push(larkMdDiv(escapeMd(t(hintKey, undefined, locale))));
+    const buttons = spec.options.map((option, index) => callbackButton(
+      t(option.labelKey, undefined, locale)
+        + (option.audience === 'admin' ? t('card.stuck.admin_suffix', undefined, locale) : ''),
+      option.audience === 'initiator' ? 'primary' : 'default',
+      {
+        action: 'stuck_key',
+        root_id: o.rootId,
+        session_id: o.sessionId,
+        selected_index: String(index),
+        nonce: String(o.nonce),
+      },
+    ));
+    elements.push({ tag: 'action', actions: buttons });
+  }
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.stuck.title', { cliName: o.cliName }, locale), 'orange'),
+    elements,
+  }));
+}
+
+/** Result of a stuck-card key press: what was sent and what the screen showed
+ *  afterwards (bounded plain-text tail when the worker could read it). */
+export function buildStuckKeyResultCard(
+  resultText: string,
+  afterScreenTail: string | undefined,
+  stillBlocked: boolean,
+  locale?: Locale,
+): string {
+  const elements: unknown[] = [larkMdDiv(`**${escapeMd(resultText)}**`)];
+  pushScreenTail(elements, afterScreenTail, locale);
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.stuck.result_title', undefined, locale), stillBlocked ? 'orange' : 'green'),
+    elements,
+  }));
+}
+
+/** An `input_not_submitted` notice together with the bottom of the terminal,
+ *  so the reader sees why the message did not go in without opening it. */
+export function buildInputNotSubmittedCard(message: string, screenTail: string, locale?: Locale): string {
+  const elements: unknown[] = [larkMdDiv(escapeMd(message))];
+  pushScreenTail(elements, screenTail, locale);
+  return JSON.stringify(wideCard({
+    header: cardHeader(t('card.stuck.notice_title', undefined, locale), 'orange'),
+    elements,
+  }));
+}
+
 // ─── Adopt cards ─────────────────────────────────────────────────────────────
 
 function formatDuration(ms: number): string {
@@ -2361,6 +2839,22 @@ function relayPickerFilter(entries: RelayPickerEntry[], query: string | undefine
       .toLowerCase();
     return haystack.includes(q);
   });
+}
+
+/**
+ * "Show all" button for the no-match state of the search pickers (relay /
+ * quote / adopt). Re-fires the picker's own `*_search` action; a button click
+ * has no `input_value`, so the handler reads the query as '' and re-renders
+ * the full list.
+ */
+function buildClearSearchButton(value: Record<string, unknown>, locale?: Locale): any {
+  return {
+    tag: 'button',
+    text: { tag: 'plain_text', content: t('card.picker.btn_clear_search', undefined, locale) },
+    type: 'default',
+    width: 'fill',
+    behaviors: [{ type: 'callback', value }],
+  };
 }
 
 /**
@@ -2486,8 +2980,13 @@ export function buildRelayPickerCard(
   if (filtered.length === 0) {
     elements.push({
       tag: 'markdown',
-      content: t('card.relay.empty_filtered', { query: searchQuery }, locale),
+      content: t('card.relay.empty_filtered', { query: escapeMd(searchQuery) }, locale),
     });
+    // Without this the only way back to the full list is to clear the input
+    // and submit an empty string, which Lark won't fire — the card dead-ends.
+    // A button click carries no input_value, so the relay_search handler
+    // resolves it to '' and re-renders the unfiltered list.
+    elements.push(buildClearSearchButton({ action: 'relay_search', ...stateValue, selected: '' }, locale));
     return JSON.stringify(wrapCard(elements, locale, targetChatType));
   }
 
@@ -2780,7 +3279,8 @@ export function buildQuotePickerCard(
     return JSON.stringify(wrapQuoteCard(elements, locale));
   }
   if (filtered.length === 0) {
-    elements.push({ tag: 'markdown', content: t('card.quote.empty_filtered', { query: searchQuery }, locale) });
+    elements.push({ tag: 'markdown', content: t('card.quote.empty_filtered', { query: escapeMd(searchQuery) }, locale) });
+    elements.push(buildClearSearchButton({ action: 'quote_search', ...stateValue, selected: '' }, locale));
     return JSON.stringify(wrapQuoteCard(elements, locale));
   }
 
@@ -3170,8 +3670,9 @@ export function buildAdoptSelectCard(
     // markdown element, so an unescaped `![](http://x)` would render as an
     // image (external fetch = tracking beacon / SSRF surface). Neutralising
     // [ ] ` etc. defuses that. (buildRelayPickerCard echoes its query the
-    // same way and shares the same latent risk — tracked separately.)
+    // same way and now escapes it too.)
     elements.push({ tag: 'markdown', content: t('card.adopt.empty_filtered', { query: escapeMd(searchQuery) }, locale) });
+    elements.push(buildClearSearchButton({ action: 'adopt_search', ...stateValue, selected: '' }, locale));
     return JSON.stringify(wrapAdoptCard(elements, locale));
   }
 

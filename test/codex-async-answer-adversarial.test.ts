@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { codexAsyncAnswerSteerTarget, codexAsyncSteerTargetMatches } from '../src/services/codex-async-user-input.js';
+import { codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable, codexAsyncSteerTargetMatches } from '../src/services/codex-async-user-input.js';
 import { buildCodexAppTurnStartParams, supportsClientUserMessageId } from '../src/adapters/cli/codex-app-turn.js';
 import { productionFunction, productionClass, delivery, deliveryIsCurrent } from './helpers/codex-async-answer-function-harness.js';
 import { beginReplyTargetTurn, pickTurnReplyTarget } from '../src/core/reply-target.js';
@@ -52,7 +52,7 @@ function daemonScope(): Record<string, any> {
     resolveSender: async () => ({ name: 'User' }),
     isCurrent: () => scope.current, current: true, asyncCaller: 'ou_owner',
     randomUUID: () => 'probe', getBot: () => ({ config: {}, botName: 'Bot', botOpenId: 'ou_bot' }),
-    asyncOriginMessageId: 'om_original', asyncOriginTurn: 'om_original',
+    asyncOriginMessageId: 'om_original', asyncOriginTurn: 'om_original', audience: { kind: 'human', answererOpenId: 'ou_owner' },
     boundAsk: { sessionId: 'session', larkAppId: 'app', chatId: 'oc_chat', rootMessageId: 'om_root' },
     beginReplyTargetTurn: vi.fn(), sessionPromptInjection: () => undefined,
     buildFollowUpCliInput: (_text: string, _session: string, opts: any) => ({ content: _text, codexAppInput: { text: opts.codexAppText } }),
@@ -60,11 +60,12 @@ function daemonScope(): Record<string, any> {
     noteTurnReceived: vi.fn(async () => undefined),
     trustedCallerForInboundTurn: vi.fn(async () => ({ senderType: 'user', requestLarkAppId: 'app', requestUserOpenId: 'ou_owner' })),
     asyncInput: { threadId: 'thread', itemId: 'call', nativeTurnId: 'native-original' },
-    codexAsyncAnswerSteerTarget, larkTransportEnabled: () => true,
+    codexAsyncAnswerSteerTarget, codexAsyncAnswerSteerable, larkTransportEnabled: () => true,
     codexAppCleanInputAcceptedForSession: () => scope.clean, clean: true,
     sendWorkerInput: vi.fn(() => true), beginNewTurn: vi.fn(), rememberLastCliInput: vi.fn(),
     markSessionActivity: vi.fn(), sessionStore: { updateSession: vi.fn() }, logger: { info: vi.fn() },
   };
+  scope.codexAsyncAnswerSteerable = productionFunction('src/services/codex-async-user-input.ts', 'codexAsyncAnswerSteerable', scope);
   scope.codexAsyncAnswerSteerTarget = productionFunction('src/services/codex-async-user-input.ts', 'codexAsyncAnswerSteerTarget', scope);
   return scope;
 }
@@ -123,7 +124,7 @@ describe('correlated async answer adversarial production probes', () => {
       expect(await delivery(scope)('answer', mode === 'wrong-answerer' ? 'ou_other' : 'ou_owner')).toBe(false);
       expect(scope.sendWorkerInput).not.toHaveBeenCalled();
     });
-  it.each(['document', 'adopted', 'vc', 'api-only', 'no-proof', 'wrong-app', 'wrong-principal', 'bot', 'clean-flip', 'legacy-card'])(
+  it.each(['document', 'adopted', 'vc', 'api-only', 'no-proof', 'wrong-app', 'wrong-principal', 'bot', 'clean-flip', 'shared-audience', 'unknown-synthetic-origin'])(
     'keeps %s delivery serial at the real daemon grant boundary', async mode => {
       const scope = daemonScope();
       if (mode === 'document') scope.documentDelivery = { openId: 'ou_owner' };
@@ -135,12 +136,34 @@ describe('correlated async answer adversarial production probes', () => {
       if (mode === 'wrong-principal') scope.trustedCallerForInboundTurn = async () => ({ senderType: 'user', requestLarkAppId: 'app', requestUserOpenId: 'ou_other' });
       if (mode === 'bot') scope.actor = { senderType: 'bot', botSender: true };
       if (mode === 'clean-flip') scope.noteTurnReceived = async () => { scope.clean = false; };
-      if (mode === 'legacy-card') delete scope.asyncInput.nativeTurnId;
+      if (mode === 'shared-audience') scope.audience = { kind: 'shared' };
+      if (mode === 'unknown-synthetic-origin') scope.asyncOriginTurn = 'http-answer-previous';
       expect(await delivery(scope)('answer', 'ou_owner')).toBe(true);
       const [, payload, id, opts] = scope.sendWorkerInput.mock.calls[0];
       expect(id).toBe('codex-async-answer-probe');
       expect(opts.atMostOnce).toBe(true); expect(opts.codexAppSteerable).toBeUndefined();
       expect(payload.codexAppInput.steerTargetTurnId).toBeUndefined();
+    });
+  it.each(['legacy-card', 'chained-answer', 'chained-legacy-card'])(
+    'accepts a human follow-up after the %s answer starts its own native turn', async mode => {
+      const scope = daemonScope();
+      if (mode !== 'chained-answer') delete scope.asyncInput.nativeTurnId;
+      if (mode !== 'legacy-card') scope.asyncOriginTurn = 'codex-async-answer-previous';
+      expect(await delivery(scope)('answer', 'ou_owner')).toBe(true);
+      const [, payload, id, opts] = scope.sendWorkerInput.mock.calls[0];
+      expect(opts.codexAppSteerable).toBe(true);
+      const runner = runnerScope();
+      // A missing target still cannot insert the answer into an active task.
+      if (mode !== 'chained-answer') {
+        expect(runner.canSteer(root(), { ...payload, replyTurnId: id, ...opts })).toBe(false);
+      }
+      // Once this answer has started, ordinary human supplements may steer it.
+      const turn = root();
+      turn.accepted[0].input = { codexAppSteerable: opts.codexAppSteerable };
+      turn.accepted[0].clientUserMessageId = id;
+      expect(runner.canSteer(turn, { content: 'supplement', replyTurnId: 'om_supplement', codexAppSteerable: true })).toBe(true);
+      // Explicit /queue and ordinary bot traffic remain serial.
+      expect(runner.canSteer(turn, { content: 'queued', replyTurnId: 'om_queued' })).toBe(false);
     });
   it('sends once while an accepted native steer is pending, then removes exactly its queued answer', async () => {
     vi.useFakeTimers(); const scope = steerScope();
@@ -300,5 +323,91 @@ describe('correlated async answer adversarial production probes', () => {
     const [, payload, , opts] = scope.sendWorkerInput.mock.calls[0];
     expect(payload.codexAppInput.steerTargetTurnId).toBe('native-original');
     expect(opts.codexAppSteerable).toBe(true);
+  });
+});
+
+describe('independent async-answer overlap review probes', () => {
+  it.each(['adopted', 'vc', 'api-only', 'clean-off', 'cancelled'])(
+    'rechecks manual %s intervention during legacy-answer identity wait', async mode => {
+      vi.useFakeTimers();
+      const scope = daemonScope(); delete scope.asyncInput.nativeTurnId;
+      const bot = { config: { apiOnly: false }, botName: 'Bot', botOpenId: 'ou_bot' };
+      scope.getBot = () => bot;
+      scope.larkTransportEnabled = ({ apiOnly }: { apiOnly?: boolean }) => apiOnly !== true;
+      scope.noteTurnReceived = async () => new Promise<void>(resolve => setTimeout(() => {
+        if (mode === 'adopted') scope.askSession.adoptedFrom = 'manual-native';
+        if (mode === 'vc') scope.askSession.session.vcMeetingReceiver = 'manual-vc';
+        if (mode === 'api-only') bot.config.apiOnly = true;
+        if (mode === 'clean-off') scope.clean = false;
+        if (mode === 'cancelled') scope.current = false;
+        resolve();
+      }, 60_000));
+      const pending = delivery(scope)('answer', 'ou_owner');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(scope.sendWorkerInput).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(await pending).toBe(mode !== 'cancelled');
+      if (mode === 'cancelled') expect(scope.sendWorkerInput).not.toHaveBeenCalled();
+      else expect(scope.sendWorkerInput.mock.calls[0][3].codexAppSteerable).toBeUndefined();
+    });
+  it('does not submit if identity preparation partially writes then fails', async () => {
+    vi.useFakeTimers(); const scope = daemonScope(); delete scope.asyncInput.nativeTurnId;
+    scope.noteTurnReceived = async () => {
+      scope.identityPrepared = true;
+      await new Promise(resolve => setTimeout(resolve, 30_000));
+      throw new Error('identity-write-failed');
+    };
+    const pending = delivery(scope)('answer', 'ou_owner');
+    // Attach a plain handler before the rejecting fake timer fires: bun:test's
+    // expect().rejects matcher subscribed pre-rejection never settles, while a
+    // late handler trips vitest's unhandled-rejection reporting.
+    const captured: unknown[] = [];
+    const settled = pending.catch(error => { captured.push(error); });
+    await vi.advanceTimersByTimeAsync(0); await vi.advanceTimersByTimeAsync(30_000);
+    await settled;
+    expect((captured[0] as Error).message).toBe('identity-write-failed');
+    expect(scope.identityPrepared).toBe(true);
+    expect(scope.sendWorkerInput).not.toHaveBeenCalled();
+    expect(scope.beginNewTurn).not.toHaveBeenCalled();
+  });
+  it('retains the submitted answer grant and target guard when later session persistence fails', async () => {
+    vi.useFakeTimers(); const scope = daemonScope(); delete scope.asyncInput.nativeTurnId;
+    scope.noteTurnReceived = async () => new Promise(resolve => setTimeout(resolve, 20));
+    scope.sessionStore.updateSession = () => { throw new Error('disk-write-failed'); };
+    const pending = delivery(scope)('answer', 'ou_owner');
+    // Attach a plain handler before the rejecting fake timer fires: bun:test's
+    // expect().rejects matcher subscribed pre-rejection never settles, while a
+    // late handler trips vitest's unhandled-rejection reporting.
+    const captured: unknown[] = [];
+    const settled = pending.catch(error => { captured.push(error); });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(scope.sendWorkerInput).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(20);
+    await settled;
+    expect((captured[0] as Error).message).toBe('disk-write-failed');
+    expect(scope.sendWorkerInput).toHaveBeenCalledTimes(1);
+    const [, payload, turnId, opts] = scope.sendWorkerInput.mock.calls[0];
+    expect(opts.codexAppSteerable).toBe(true);
+    expect(runnerScope().canSteer(root(), { ...payload, replyTurnId: turnId, ...opts })).toBe(false);
+  });
+  it.each([false, true])('keeps delayed chained answer out of a next native turn (legacy=%s)', async legacy => {
+    vi.useFakeTimers(); const scope = daemonScope(); scope.asyncOriginTurn = 'codex-async-answer-previous';
+    if (legacy) delete scope.asyncInput.nativeTurnId;
+    scope.noteTurnReceived = async () => new Promise(resolve => setTimeout(resolve, 600_000));
+    const pending = delivery(scope)('answer', 'ou_owner'); await vi.advanceTimersByTimeAsync(0);
+    const runner = runnerScope();
+    Object.assign(runner, { nativeActiveTurnId: 'native-next', queue: [], ensureThread: async () => 'thread',
+      makeTurn: vi.fn(() => { throw new Error('must remain queued'); }) });
+    await vi.advanceTimersByTimeAsync(600_000); expect(await pending).toBe(true);
+    const [, payload, turnId, opts] = scope.sendWorkerInput.mock.calls[0];
+    const message = { ...payload, replyTurnId: turnId, ...opts };
+    const next = root(); next.canonicalNativeTurnId = 'native-next';
+    expect(runner.canSteer(next, message)).toBe(false);
+    await productionFunction('src/codex-app-runner.ts', 'runTurn', runner)(message);
+    expect(runner.queue).toEqual([message]); expect(runner.makeTurn).not.toHaveBeenCalled();
+    const own = root(); own.canonicalNativeTurnId = 'native-answer';
+    own.accepted[0].input = { codexAppSteerable: opts.codexAppSteerable };
+    own.accepted[0].clientUserMessageId = turnId;
+    expect(runner.canSteer(own, { content: 'supplement', replyTurnId: 'om_supplement', codexAppSteerable: true })).toBe(true);
   });
 });

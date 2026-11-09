@@ -12,7 +12,9 @@
  *
  * What this module authenticates:
  *   1. The turn id is a well-formed scheduled turn.
- *   2. The task still exists and carries a creator (ownerOpenId). An enabled
+ *   2. The task still exists and carries a creator (ownerOpenId). The daemon
+ *      reads it from the host authority store; the CLI-side resolver can only
+ *      read the schedules.json projection and is a preflight, not a boundary. An enabled
  *      task is accepted directly. A one-shot that the scheduler auto-disabled
  *      after dispatch is accepted only while the daemon independently proves
  *      this exact turn is still live. Manual/legacy disables stay denied.
@@ -38,6 +40,8 @@ import { effectiveScheduleChatIds } from '../services/schedule-store.js';
 import { isAutoCompletedSchedule } from '../services/schedule-until-done.js';
 import type { ScheduledTask, TrustedCaller } from '../types.js';
 import { parseScheduleRunAsClaim, scheduledTaskRunAs } from './schedule-run-as.js';
+import { backgroundAuthorityKey } from './background-execution-policy.js';
+import type { ScheduleAuthorityRecord } from '../services/schedule-authority-store.js';
 
 /** Scheduled turn ids: `schedule:<taskId>:<uuid>`. Task ids come from two
  *  producers (see schedule-store.createTask): legacy `randomUUID().substring(0,
@@ -53,6 +57,43 @@ const SCHEDULED_TURN_RE = /^schedule:([0-9a-z_]{1,50}):[0-9a-f]{8}-[0-9a-f]{4}-[
 export function parseScheduledTurnId(turnId: string): string | null {
   const match = SCHEDULED_TURN_RE.exec(turnId);
   return match ? match[1]! : null;
+}
+
+export function isManualScheduleRun(task: ScheduledTask, runId: string | undefined): boolean {
+  return !!runId && task.lastRunId === runId && task.manualRunAuthorization?.runId === runId;
+}
+
+export function isManualScheduledTurn(task: ScheduledTask, turnId: string): boolean {
+  return parseScheduledTurnId(turnId) === task.id
+    && isManualScheduleRun(task, task.manualRunAuthorization?.runId)
+    && Array.isArray(task.manualRunAuthorization?.turnIds)
+    && task.manualRunAuthorization.turnIds.includes(turnId);
+}
+
+/** A lookup or credential publication may await while the user edits/revokes
+ * authority. Runtime accounting and topic materialization do not change this
+ * definition fence. Call again after each asynchronous admission boundary. */
+export function assertScheduledAuthorityCurrent(
+  original: ScheduleAuthorityRecord,
+  current: ScheduleAuthorityRecord | undefined,
+  context: { runId?: string; turnId?: string; allowCompleted?: boolean },
+): void {
+  const permitted = current && (current.state === 'active'
+    || (context.allowCompleted && current.state === 'completed' && isAutoCompletedSchedule(current.task))
+    || (current.state === 'paused' && (context.turnId
+      ? isManualScheduledTurn(current.task, context.turnId)
+      : isManualScheduleRun(current.task, context.runId))));
+  const controlKey = (record: ScheduleAuthorityRecord) => JSON.stringify({
+    kind: record.kind, controlOpenId: record.controlOpenId, controlUnionId: record.controlUnionId,
+    credentialOpenId: record.credentialOpenId, runScopes: record.runScopes,
+    grantId: record.grantId, selfManage: record.selfManage,
+  });
+  if (!permitted || !current
+    || (context.runId && current.task.lastRunId !== context.runId)
+    || backgroundAuthorityKey(current.task) !== backgroundAuthorityKey(original.task)
+    || controlKey(current) !== controlKey(original)) {
+    throw new Error('schedule authority changed during turn admission');
+  }
 }
 
 /** Mint the turn id for a semantic-recovery continuation of a scheduled turn.
@@ -110,9 +151,12 @@ export function trustedCallerForScheduledTask(
 /**
  * Read a task straight from the per-bot schedules.json
  * (`<botmuxHome>/bots/<appId>/schedules.json`). Read-only, no global store
- * state — safe inside the sandboxed CLI (the file lives under the bot's own
- * home dir, same as `botmux schedule list`) and in tests (takes the dataDir
- * explicitly instead of the global config).
+ * state — usable inside the sandboxed CLI (the file lives under the bot's own
+ * home dir, same as `botmux schedule list`).
+ *
+ * That same property is why the daemon must not use it: the file is a
+ * projection of the host authority store, and a sandboxed CLI can rewrite it.
+ * Daemon-side identity decisions read readScheduledTaskFromAuthority instead.
  */
 export function readScheduledTaskForProvenance(
   dataDir: string,
@@ -129,6 +173,36 @@ export function readScheduledTaskForProvenance(
   } catch {
     // Corrupt/unreadable schedules.json must not grant an exemption — the
     // caller falls back to the ordinary (failing) human-turn checks.
+    return undefined;
+  }
+}
+
+/** Minimal read view of the host-only schedule authority store. */
+export interface ScheduleAuthorityReader {
+  getRecord(appId: string, taskId: string): { state: string; task: ScheduledTask } | undefined;
+}
+
+/**
+ * Read a task from the host-only authority store for an identity decision
+ * (who a scheduled turn runs as, which chat it is bound to).
+ *
+ * Deliberately has NO schedules.json fallback: that file is a projection the
+ * daemon rewrites from the authority store, and it lives in BOT_HOME, which a
+ * sandboxed CLI can write. A missing store, an unreadable row or a revoked
+ * task yields undefined — the same fail-closed outcome as a deleted task.
+ * Paused/completed rows are returned as-is; callers judge `enabled` exactly
+ * like they judged the projection row.
+ */
+export function readScheduledTaskFromAuthority(
+  store: ScheduleAuthorityReader | null | undefined,
+  larkAppId: string,
+  taskId: string,
+): ScheduledTask | undefined {
+  if (!store) return undefined;
+  try {
+    const record = store.getRecord(larkAppId, taskId);
+    return record && record.state !== 'revoked' ? record.task : undefined;
+  } catch {
     return undefined;
   }
 }
@@ -154,25 +228,35 @@ export interface ScheduledTurnAuth {
  */
 export function authorizeScheduledTurn(input: {
   turnId: string;
-  dataDir: string;
   sessionLarkAppId: string;
   sessionChatId: string;
   isOwnerAllowed: (larkAppId: string, ownerOpenId: string) => boolean;
   /** Daemon-owned exact-turn liveness. Omit on paths that cannot prove it. */
   isScheduledTurnLive?: (turnId: string) => boolean;
-}): ScheduledTurnAuth | { error: ScheduledTurnAuthError } {
+} & (
+  /** Daemon callers: read the task from the host authority store. */
+  | { loadTask: (larkAppId: string, taskId: string) => ScheduledTask | undefined; dataDir?: never }
+  /** CLI-side preflight only: the per-bot schedules.json projection. Inside a
+   *  sandbox that file is agent-writable, so a result read this way must never
+   *  be the last check before a daemon-side effect. */
+  | { dataDir: string; loadTask?: never }
+)): ScheduledTurnAuth | { error: ScheduledTurnAuthError } {
   const taskId = parseScheduledTurnId(input.turnId);
   if (!taskId) return { error: 'task_not_found' };
   if (!input.sessionLarkAppId || !input.sessionChatId) return { error: 'binding_mismatch' };
 
-  const task = readScheduledTaskForProvenance(input.dataDir, input.sessionLarkAppId, taskId);
+  const task = input.loadTask
+    ? input.loadTask(input.sessionLarkAppId, taskId)
+    : readScheduledTaskForProvenance(input.dataDir, input.sessionLarkAppId, taskId);
   if (!task) return { error: 'task_not_found' };
   if (task.enabled === false) {
     // A one-shot that ran, or an until-done task closed by its own run, keeps
     // authority for that exact still-live turn.
     const autoCompletedStillLive = isAutoCompletedSchedule(task)
       && input.isScheduledTurnLive?.(input.turnId) === true;
-    if (!autoCompletedStillLive) return { error: 'task_disabled' };
+    const manualStillLive = isManualScheduledTurn(task, input.turnId)
+      && input.isScheduledTurnLive?.(input.turnId) === true;
+    if (!autoCompletedStillLive && !manualStillLive) return { error: 'task_disabled' };
   }
 
   // A claim from the claim card replaces the creator as the acting identity.

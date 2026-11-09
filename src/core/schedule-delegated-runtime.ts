@@ -1,8 +1,12 @@
 import type { ScheduledTask } from '../types.js';
 import type { ScheduleAuthorityRecord } from '../services/schedule-authority-store.js';
+import { isManualScheduleRun, isManualScheduledTurn } from './scheduled-turn-provenance.js';
 import { TRIGGER_USER_AUTH_TOOLS, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 
 export interface DelegatedScheduleRuntimeDependencies {
+  manualRunId?: string;
+  manualTurnId?: string;
+  assertAuthorityCurrent?: () => void;
   runEnabled: boolean;
   validateBotGrant?: (record: ScheduleAuthorityRecord) => void;
   hostRunScopes: readonly TriggerUserAuthTool[];
@@ -60,9 +64,13 @@ export async function authorizeDelegatedScheduleRun(
   authority: ScheduleAuthorityRecord,
   deps: DelegatedScheduleRuntimeDependencies,
 ): Promise<AuthorizedDelegatedScheduleRun> {
+  deps.assertAuthorityCurrent?.();
   assertBotGrantStillActive(authority, deps.validateBotGrant);
   if (authority.kind !== 'delegated') throw new Error('schedule authority is not delegated');
-  if (authority.state !== 'active') throw new Error(`schedule authority state is ${authority.state}`);
+  const manual = authority.state === 'paused' && (deps.manualTurnId
+    ? isManualScheduledTurn(authority.task, deps.manualTurnId)
+    : isManualScheduleRun(authority.task, deps.manualRunId));
+  if (authority.state !== 'active' && !manual) throw new Error(`schedule authority state is ${authority.state}`);
   if (!deps.runEnabled) throw new Error('delegated schedule execution is revoked by host policy');
   if (!TRIGGER_USER_AUTH_TOOLS.every(tool => deps.triggerUserAuthTools.includes(tool))) {
     throw new Error('delegated schedule requires triggerUserAuth isolation for every identity tool');
@@ -75,6 +83,7 @@ export async function authorizeDelegatedScheduleRun(
     throw new Error('delegated schedule credential identity is missing');
   }
   const targetOpenId = await revalidateController(task, authority, deps);
+  deps.assertAuthorityCurrent?.();
   assertBotGrantStillActive(authority, deps.validateBotGrant);
   return { task: { ...task, ownerOpenId: undefined, ownerUnionId: undefined }, targetOpenId };
 }
@@ -98,6 +107,12 @@ export async function authorizeScheduleSelfManage(
     throw new Error(`schedule authority state is ${authority.state}`);
   }
   if (authority.kind === 'direct') {
+    // A task added from the host terminal carries no controller at all: its
+    // creator is the host administrator, so there is no person whose access
+    // could have lapsed. It may still only stop itself (the route limits the
+    // action and the exact task). A task with any controller field recorded,
+    // even an empty one, keeps the live re-check and fails closed inside it.
+    if (authority.controlOpenId === undefined && authority.controlUnionId === undefined) return;
     await revalidateController(authority.task, authority, deps, deps.targetChatId);
     return;
   }

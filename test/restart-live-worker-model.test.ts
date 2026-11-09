@@ -20,6 +20,15 @@
  * Run:  pnpm vitest run test/restart-live-worker-model.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+const transcriptPathMock = vi.fn();
+vi.mock('../src/services/transcript-resolver.js', async (original) => ({
+  ...await original<typeof import('../src/services/transcript-resolver.js')>(),
+  resolveSessionTranscriptPath: (...args: unknown[]) => transcriptPathMock(...args),
+}));
 
 vi.mock('../src/utils/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -39,10 +48,15 @@ vi.mock('../src/services/session-store.js', async (importOriginal) => ({
 
 import {
   latestModelForRespawn,
+  latestPinEffortForRespawn,
+  __testOnly_sessionAgentConfig,
+  writeSessionModelPin,
   requestSessionRestart,
   __testOnly_resetRestartCoordinator,
 } from '../src/core/worker-pool.js';
 import { resolveSessionLaunchModel } from '../src/core/session-model.js';
+import { recordCodexModelLaunch } from '../src/services/codex-model-selection.js';
+import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 
 let sessionCounter = 0;
 
@@ -70,7 +84,69 @@ function observer() {
 beforeEach(() => {
   getBotMock.mockReset();
   updateSessionMock.mockReset();
+  transcriptPathMock.mockReset();
   __testOnly_resetRestartCoordinator();
+});
+
+describe('native Codex settings enter both real launch paths', () => {
+  let dir: string;
+  const start = Date.parse('2026-11-04T00:00:00.000Z');
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(start);
+    dir = mkdtempSync(join(tmpdir(), 'botmux-native-resume-'));
+    const path = join(dir, 'rollout.jsonl');
+    writeFileSync(path, JSON.stringify({ timestamp: new Date(start + 100).toISOString(), type: 'event_msg',
+      payload: { type: 'thread_settings_applied', thread_settings: { model: 'native-B' } },
+    }) + '\n');
+    transcriptPathMock.mockReturnValue({ path, kind: 'codex' });
+    getBotMock.mockReturnValue({ config: { cliId: 'codex', model: 'default-A' } });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('sends the confirmed native choice in a live-worker restart', () => {
+    const { ds, send } = makeDs({ cliSessionId: 'native-1', model: 'default-A' });
+    recordCodexModelLaunch(ds.session, 'default-A');
+    vi.setSystemTime(start + 1000);
+    requestSessionRestart(ds, observer());
+    expect(send.mock.calls[0][0]).toMatchObject({ type: 'restart', model: 'native-B' });
+    expect(ds.session.codexModelSelection).toMatchObject({ nativeSessionId: 'native-1', override: 'native-B' });
+  });
+
+  it('recovers a native choice on cold launch without a worker runtime update', () => {
+    const { ds } = makeDs({ cliSessionId: 'native-1', model: 'default-A', agentFrozen: true });
+    recordCodexModelLaunch(ds.session, 'default-A');
+    vi.setSystemTime(start + 1000);
+    const restored = { ...ds, session: JSON.parse(JSON.stringify(ds.session)), worker: null };
+    const result = __testOnly_sessionAgentConfig(restored, { cliId: 'codex', model: 'default-A' });
+    expect(result.model).toBe('native-B');
+    const args = createCodexAdapter('/test/codex').buildArgs({
+      sessionId: restored.session.sessionId, workingDir: dir,
+      resume: true, resumeSessionId: 'native-1', model: result.model,
+    });
+    expect(args[args.indexOf('--model') + 1]).toBe('native-B');
+    expect(restored.session.model).toBe('native-B');
+    expect(updateSessionMock).toHaveBeenCalledWith(restored.session);
+  });
+
+  it('keeps a saved preference when the native file is unavailable', () => {
+    const { ds } = makeDs({ cliSessionId: 'native-1', model: 'native-B', codexModelSelection: {
+      nativeSessionId: 'native-1', launchModel: 'native-B', launchStartedAtMs: start, override: 'native-B',
+    } });
+    transcriptPathMock.mockReturnValue({ path: join(dir, 'missing.jsonl'), kind: 'codex' });
+    expect(latestModelForRespawn(ds)).toBe('native-B');
+  });
+
+  it('does not consult native settings or change model policy for another CLI', () => {
+    const { ds } = makeDs({ cliId: 'claude-code', model: 'sonnet', cliSessionId: 'native-1' });
+    getBotMock.mockReturnValue({ config: { cliId: 'claude-code', model: 'opus' } });
+    expect(latestModelForRespawn(ds)).toBe('opus');
+    expect(transcriptPathMock).not.toHaveBeenCalled();
+    expect(ds.session.codexModelSelection).toBeUndefined();
+  });
 });
 
 afterEach(() => {
@@ -162,7 +238,9 @@ describe('an in-worker respawn converges the rule-3 record too', () => {
 
     expect(latestModelForRespawn(ds)).toBe('gpt-5.6-terra');
     expect(ds.session.model).toBe('gpt-5.5');
-    expect(updateSessionMock).not.toHaveBeenCalled();
+    // Record the one-shot launch BASELINE, without turning it into a preference.
+    expect(ds.session.codexModelSelection).toMatchObject({ launchModel: 'gpt-5.6-terra' });
+    expect(ds.session.codexModelSelection.override).toBeUndefined();
   });
 
   // THE state sequence the record exists for: launch on A → live `/restart`
@@ -182,5 +260,52 @@ describe('an in-worker respawn converges the rule-3 record too', () => {
     // bot hot-switches CLI (`/botconfig set cli` — no mismatch sweep)
     const switched = { cliId: 'claude-code' as const, model: 'opus' };
     expect(resolveSessionLaunchModel(ds, switched)).toBe('B');
+  });
+});
+
+
+describe('topic pin across launch channels', () => {
+  const pin = { model: 'gpt-6.1-terra', effort: 'high' as const, source: 'topic-header' as const, setBy: 'owner', setAt: '2026-11-06T00:00:00.000Z' };
+  it.each(['slash', 'dashboard', 'cwd_move', 'cli_crash'] as const)('%s respawn carries pinned launch model AND effort', source => {
+    getBotMock.mockReturnValue({ config: { cliId: 'codex', model: 'gpt-6.1-sol', reasoningEffort: 'low' } });
+    const { ds, send } = makeDs({ modelPin: pin, reasoningEffort: 'low' });
+    const result = requestSessionRestart(ds, { source, notify: async () => {} });
+    expect(result?.joined).toBe(false);
+    expect(send.mock.calls[0][0]).toMatchObject({ model: pin.model, reasoningEffort: pin.effort });
+    expect(ds.session.model).toBe(pin.model); expect(ds.session.modelPin).toEqual(pin);
+  });
+  it('cold restore/refork and message wake after crash park resolve the same choice', () => {
+    const cfg = { cliId: 'codex' as const, model: 'gpt-6.1-sol', reasoningEffort: 'low' as const };
+    getBotMock.mockReturnValue({ config: cfg });
+    const { ds } = makeDs({ modelPin: pin, reasoningEffort: 'low' });
+    const cold = __testOnly_sessionAgentConfig(ds, cfg);
+    expect(cold).toMatchObject({ model: pin.model, reasoningEffort: pin.effort });
+    expect({ model: latestModelForRespawn(ds), ...latestPinEffortForRespawn(ds) }).toMatchObject({ model: cold.model, reasoningEffort: cold.reasoningEffort });
+  });
+  it('clear refreshes the worker effort snapshot too; never-pinned sessions keep their wire payload', () => {
+    const cfg = { cliId: 'codex' as const, model: 'gpt-6.1-sol', reasoningEffort: 'low' as const };
+    getBotMock.mockReturnValue({ config: cfg });
+    const { ds } = makeDs({ modelPin: pin, reasoningEffort: 'low' });
+    writeSessionModelPin(ds, undefined);
+    expect(latestModelForRespawn(ds)).toBe(cfg.model);
+    expect(latestPinEffortForRespawn(ds)).toEqual({ reasoningEffort: 'low' });
+    const { ds: old } = makeDs({ reasoningEffort: 'high' }); expect(latestPinEffortForRespawn(old)).toEqual({});
+  });
+  it('rejects mismatched CLI, unsupported effort and in-flight restart before changing durable intent', () => {
+    getBotMock.mockReturnValue({ config: { cliId: 'claude-code', model: 'opus' } });
+    const { ds } = makeDs({ modelPin: pin });
+    expect(() => writeSessionModelPin(ds, { ...pin, source: 'command' })).toThrow();
+    expect(ds.session.modelPin).toEqual(pin); expect(updateSessionMock).not.toHaveBeenCalled();
+    getBotMock.mockReturnValue({ config: { cliId: 'codex' } });
+    expect(() => writeSessionModelPin(ds, { ...pin, model: 'gpt-5.2', effort: 'ultra' })).toThrow();
+    requestSessionRestart(ds, observer()); updateSessionMock.mockClear();
+    expect(() => writeSessionModelPin(ds, undefined)).toThrow(); expect(updateSessionMock).not.toHaveBeenCalled();
+  });
+  it('does not publish a successful mutation if persistence fails', () => {
+    getBotMock.mockReturnValue({ config: { cliId: 'codex' } });
+    const { ds } = makeDs({ modelPin: pin });
+    updateSessionMock.mockImplementationOnce(() => { throw new Error('disk'); });
+    expect(() => writeSessionModelPin(ds, undefined)).toThrow('disk'); expect(ds.session.modelPin).toEqual(pin);
+    expect(ds.modelPinCleared).toBeUndefined();
   });
 });

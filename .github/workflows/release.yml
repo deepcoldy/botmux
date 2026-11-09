@@ -11,13 +11,19 @@ on:
         required: true
         type: string
 
+env:
+  # No job runs the Electron binary that electron's postinstall downloads (the
+  # desktop release lets electron-builder fetch its own copy), and that download
+  # has no retry: one 504 fails the whole bun install (#3193).
+  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+
 jobs:
   desktop:
     if: >-
       github.actor == 'deepcoldy' &&
       github.triggering_actor == 'deepcoldy' &&
       (github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-'))
-    runs-on: macos-14
+    runs-on: macos-15
     environment: macos-signing
     permissions:
       contents: read
@@ -63,10 +69,10 @@ jobs:
         with:
           node-version: 22
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
         with:
-          bun-version: 1.4.3
-      - run: bun install --frozen-lockfile
+          bun-version: 1.4.4
+      - run: node scripts/ci-net-retry.mjs bun install --frozen-lockfile
 
       - name: Sync version from git tag to package.json
         run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
@@ -77,7 +83,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
 
+      # macos-15 runners have 7 GB RAM, so Node's default old-space cap is
+      # smaller than on the 16 GB linux runners, and the whole-repo `tsc` in
+      # `bun run build` (~2.4 GB used locally, `tsc --extendedDiagnostics`)
+      # now sits right at it: a PR adding ~30 MB of types aborted with
+      # "Reached heap limit … JavaScript heap out of memory" (exit 134) while
+      # its base passed. Give it explicit headroom instead of riding the edge.
       - run: bun run build
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
       - run: bun run desktop:bundle
       - run: bun run desktop:runtime
 
@@ -319,17 +333,17 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
         with:
-          bun-version: 1.4.3
-      - run: bun install --frozen-lockfile
+          bun-version: 1.4.4
+      - run: node scripts/ci-net-retry.mjs bun install --frozen-lockfile
 
       - name: Upgrade npm for Trusted Publishing
         # npm Trusted Publishing (OIDC) 要求 npm CLI >= 11.5.1（需 Node >= 22.14.0）。
         # Node 22 自带的 npm 可能不够新，这里升级到固定的 11.19.0（2026-07-28 的最新
         # 11.x）。不用 npm@latest —— floating latest 可能跳到 npm 12 并在 tag-push 发版
         # 时引入破坏性改动；固定版本确保发版流程可预测。
-        run: npm install -g npm@11.19.0
+        run: node scripts/ci-net-retry.mjs npm install -g npm@11.19.0
 
       - name: Sync version from git tag to package.json
         run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
@@ -664,7 +678,8 @@ jobs:
     # cross-compile the JS + runtime, but the embedded `.node` has to be the one
     # `bun install` compiled ON that OS. So we build each OS's binaries on its
     # own native architecture. Linux compiles inside manylinux_2_28 so the embedded
-    # native stays compatible with Node 22's glibc floor; darwin uses macos-14.
+    # native stays compatible with Node 22's glibc floor; darwin uses macos-15
+    # (arm64; macos-14 images were retired on 2026-11-02).
     needs: [preflight]
     # WHY a per-OS **and per-arch** matrix: node-pty's native `pty.node` (and
     # macOS `spawn-helper`) must match the target. Bun can cross-compile the JS +
@@ -696,7 +711,7 @@ jobs:
             targets: bun-linux-arm64
             artifact: linux-arm64
             glibc_baseline: '2.28'
-          - os: macos-14
+          - os: macos-15
             targets: bun-darwin-x64 bun-darwin-arm64
             artifact: darwin
             glibc_baseline: ''
@@ -712,21 +727,29 @@ jobs:
         if: matrix.glibc_baseline == ''
         with:
           node-version: 22
-      - uses: oven-sh/setup-bun@v2
+      - uses: ./.github/actions/setup-bun
         if: matrix.glibc_baseline == ''
         with:
-          bun-version: 1.4.3
+          bun-version: 1.4.4
       # Only the darwin leg installs here (linux installs inside the glibc-baseline
       # container); node-pty's darwin prebuilds are what the embed plugin bundles.
       - if: matrix.glibc_baseline == ''
-        run: bun install --frozen-lockfile
+        run: node scripts/ci-net-retry.mjs bun install --frozen-lockfile
 
       - name: Sync version from git tag to package.json
         if: matrix.glibc_baseline == ''
         run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
 
+      # On the macos-15 leg: macos-15 runners have 7 GB RAM, so Node's default old-space cap is
+      # smaller than on the 16 GB linux runners, and the whole-repo `tsc` in
+      # `bun run build` (~2.4 GB used locally, `tsc --extendedDiagnostics`)
+      # now sits right at it: a PR adding ~30 MB of types aborted with
+      # "Reached heap limit … JavaScript heap out of memory" (exit 134) while
+      # its base passed. Give it explicit headroom instead of riding the edge.
       - if: matrix.glibc_baseline == ''
         run: bun run build
+        env:
+          NODE_OPTIONS: --max-old-space-size=6144
 
       - name: Build Linux binary on the glibc 2.28 floor
         if: matrix.glibc_baseline != ''
@@ -917,19 +940,20 @@ jobs:
             -e RELEASE_TAG \
             -e MATRIX_TARGETS="${{ matrix.targets }}" \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            -e ELECTRON_SKIP_BINARY_DOWNLOAD=1 \
             node:22-alpine sh -euc '
               apk add --no-cache python3 make g++ libstdc++ binutils >/dev/null
 
               # setup-bun does not support musl, and npm ships musl builds of bun
               # (@oven/bun-linux-{x64,aarch64}-musl), so npm is the way in.
-              npm i -g bun@1.4.3 --loglevel=error
+              node scripts/ci-net-retry.mjs npm i -g bun@1.4.4 --loglevel=error
               echo "bun $(bun --version) on $(uname -m)"
 
               # Compiles node-pty against MUSL — the whole point of this job.
               # build_from_source makes node-pty'"'"'s install script delete its
               # (glibc) prebuilds and run node-gyp. It only takes effect when
               # node-pty is actually (re)installed — a clean checkout here.
-              npm_config_build_from_source=true bun install --frozen-lockfile
+              npm_config_build_from_source=true node scripts/ci-net-retry.mjs bun install --frozen-lockfile
 
               # Fail closed rather than shipping a glibc native inside a musl
               # binary: that mistake survives the build and only surfaces when the
@@ -1013,7 +1037,7 @@ jobs:
     # canary/beta/rc builds without access to the repository owner's certificate.
     if: github.event_name == 'push' && needs.preflight.outputs.tag == 'latest'
     needs: [preflight, bun-binaries]
-    runs-on: macos-14
+    runs-on: macos-15
     environment: macos-signing
     permissions:
       contents: read
@@ -1097,7 +1121,7 @@ jobs:
       - name: Upgrade npm for Trusted Publishing
         # Same pin and reason as the main publish job: OIDC needs npm >= 11.5.1,
         # and a floating `latest` could jump to npm 12 mid-release.
-        run: npm install -g npm@11.19.0
+        run: node scripts/ci-net-retry.mjs npm install -g npm@11.19.0
 
       - name: Download compiled binaries
         uses: actions/download-artifact@v4

@@ -15,7 +15,7 @@ export function checkpointCodexAdoptTurns(
     ? offsetAtMark
     : 0;
   const entries = queue.peek().flatMap(turn => {
-    if (turn.isLocal || turn.dispatchAttempt !== undefined || turn.finalText !== undefined
+    if (turn.isLocal || turn.dispatchAttempt !== undefined
       || turn.markTimeMs === undefined || !turn.contentFingerprint) return [];
     // Capture the cursor on the FIRST checkpoint for this pending turn. Later
     // checkpoints can run after its user/progress records were ingested, so
@@ -28,9 +28,17 @@ export function checkpointCodexAdoptTurns(
       && turn.recoveryOffsetAtMark! >= 0
       ? turn.recoveryOffsetAtMark
       : undefined;
+    const supersededTurnIds = turn.supersededTurns
+      ?.filter(identity => identity.dispatchAttempt === undefined)
+      .map(identity => identity.turnId);
     return [{ turnId: turn.turnId, markTimeMs: turn.markTimeMs,
       fingerprint: turn.contentFingerprint, jsonlPath: rolloutPath,
       ...(turn.linkRefMode ? { linkRefMode: turn.linkRefMode } : {}),
+      ...(turn.sourceTurnId && supersededTurnIds?.length ? { mergedExecution: {
+        sourceTurnId: turn.sourceTurnId,
+        ...(turn.sourceSessionId ? { sourceSessionId: turn.sourceSessionId } : {}),
+        supersededTurnIds,
+      } } : {}),
       offsetAtMark: prior?.offsetAtMark ?? capturedOffset ?? safeOffsetAtMark }];
   });
   if (JSON.stringify(previous) === JSON.stringify(entries)) return;

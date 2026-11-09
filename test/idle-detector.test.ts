@@ -7,6 +7,7 @@
  * Run:  pnpm vitest run test/idle-detector.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'node:fs';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import type { CliAdapter } from '../src/adapters/cli/types.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
@@ -15,6 +16,7 @@ import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createMinimaxAdapter } from '../src/adapters/cli/minimax.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
+import { createOhMyPiAdapter } from '../src/adapters/cli/oh-my-pi.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -82,6 +84,52 @@ describe('IdleDetector: isReadyEvidenceWeak()', () => {
     readyPattern: withRuleArm,
     readyPatternStrong: withoutRuleArm,
   }));
+
+  it('republishes viewport-verified readiness after an earlier idle edge was not admitted', () => {
+    vi.useFakeTimers();
+    const detector = makeTraexish();
+    const idle = vi.fn();
+    try {
+      detector.onIdle(idle);
+      detector.feed('──────\x1b[2;1H❯ Ask TRAE CLI to do anything');
+      vi.advanceTimersByTime(4_000);
+      expect(detector.isIdleNow()).toBe(true);
+      expect(detector.isReadyEvidenceWeak()).toBe(true);
+      expect(idle).toHaveBeenCalledTimes(1);
+      expect(detector.seedReadyEvidence()).toBe(false);
+      expect(idle).toHaveBeenCalledTimes(1);
+      expect(detector.seedReadyEvidence(true)).toBe(true);
+      expect(detector.isReadyEvidenceWeak()).toBe(false);
+      expect(idle).toHaveBeenCalledTimes(2);
+    } finally {
+      detector.dispose();
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps static capacity-queue evidence gated when rechecking an old idle edge', () => {
+    vi.useFakeTimers();
+    const detector = new IdleDetector(makeCli({
+      readyPattern: /❯/,
+      staticBusyPattern: /Queued for capacity/,
+      staticBusyClearPattern: /❯/,
+    }));
+    const idle = vi.fn();
+    try {
+      detector.onIdle(idle);
+      detector.feed('❯');
+      vi.advanceTimersByTime(4_000);
+      expect(idle).toHaveBeenCalledTimes(1);
+      detector.feed('Queued for capacity');
+      detector.seedReadyEvidence(true);
+      vi.advanceTimersByTime(4_000);
+      expect(idle).toHaveBeenCalledTimes(1);
+      expect(detector.isIdleNow()).toBe(false);
+    } finally {
+      detector.dispose();
+      vi.useRealTimers();
+    }
+  });
 
   it('tags a prompt joined to a horizontal rule (cursor-addressed redraw) as weak', () => {
     const detector = makeTraexish();
@@ -174,6 +222,62 @@ describe('IdleDetector: onIdle()', () => {
 
 describe('IdleDetector: onBusy()', () => {
   const idleToBusyPattern = /Working[^\r\n]{0,160}esc to interrupt/i;
+
+  it('recovers OMP local input from a split ANSI footer once per idle cycle', () => {
+    const detector = new IdleDetector(createOhMyPiAdapter('/bin/omp'));
+    const cb = vi.fn();
+    detector.onBusy(cb);
+    try {
+      detector.fireIdle();
+      detector.feed('Working... was printed in the previous reply.\n○ 🐴 ponytail: ⚡ FULL\n');
+      expect(cb).not.toHaveBeenCalled();
+      detector.feed('\x1b[2K\x1b[32m⠇ 1h │ model │ ');
+      expect(cb).not.toHaveBeenCalled();
+      detector.feed('67%┃─272K─\x1b[0m');
+      detector.feed('\r● 🐴 ponytail: ⚡ FULL');
+      expect(cb).toHaveBeenCalledTimes(1);
+      detector.fireIdle();
+      detector.feed('\x1b[2K○ 🐴 ponytail: ⚡ FULL');
+      expect(cb).toHaveBeenCalledTimes(1);
+      detector.feed('\r\x1b[32m● 🐴 ponytail: ⚡ FULL\x1b[0m');
+      expect(cb).toHaveBeenCalledTimes(2);
+    } finally {
+      detector.dispose();
+    }
+  });
+
+  it('recovers OMP local input from the real omp 18.10.1 band footer', () => {
+    const fx = JSON.parse(readFileSync(new URL('./fixtures/omp-band-footer-v18.10.1.json', import.meta.url), 'utf8'));
+    // Whole synchronized frames, and the same frames split at every escape
+    // sequence (omp moves the cursor with CSI H, so no newline precedes the
+    // footer once ANSI is stripped).
+    const splits: Array<(s: string) => string[]> = [(s) => [s], (s) => s.split(/(?=\x1b)/)];
+    for (const split of splits) {
+      for (const working of [fx.workingFrame, fx.workingFrameWithStatusRow]) {
+        const detector = new IdleDetector(createOhMyPiAdapter('/bin/omp'));
+        const cb = vi.fn();
+        detector.onBusy(cb);
+        try {
+          detector.fireIdle();
+          for (const chunk of split(fx.idleFrame)) detector.feed(chunk);
+          expect(cb).not.toHaveBeenCalled();
+          for (const chunk of split(working)) detector.feed(chunk);
+          expect(cb).toHaveBeenCalledTimes(1);
+          // Further spinner ticks in the same cycle do not re-fire.
+          for (const chunk of split(fx.workingFrame)) detector.feed(chunk);
+          expect(cb).toHaveBeenCalledTimes(1);
+          // After the turn ends, the next active footer revives busy again.
+          detector.fireIdle();
+          for (const chunk of split(fx.idleFrame)) detector.feed(chunk);
+          expect(cb).toHaveBeenCalledTimes(1);
+          for (const chunk of split(working)) detector.feed(chunk);
+          expect(cb).toHaveBeenCalledTimes(2);
+        } finally {
+          detector.dispose();
+        }
+      }
+    }
+  });
 
   it('fires once when an explicit busy marker follows idle, but ignores an ordinary redraw', () => {
     const detector = new IdleDetector(makeCli({ idleToBusyPattern }));

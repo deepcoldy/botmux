@@ -82,7 +82,7 @@ export const BLOCK_META: Record<string, { label: string; hint?: string }> = {
   },
   routing_shell: {
     label: 'Shell 提示路径 · 同批规则散文版',
-    hint: 'codex / gemini / opencode 等无系统提示参数的 CLI，随首轮 prompt 注入',
+    hint: 'codex / opencode 等无系统提示参数的 CLI，随首轮 prompt 注入',
   },
   identity: {
     label: '<identity> 身份与多 bot 归属',
@@ -148,6 +148,11 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   // <botmux_routing> — system-prompt path (claude-family / genius / grok)
   { key: 'ai.routing.intro', block: 'routing_system', stage: 'new', label: '开场说明（标准 send 模式）', kind: 'editable' },
   {
+    key: 'ai.routing.no_local_addresses', block: 'routing_system', stage: 'new', kind: 'editable',
+    label: '飞书回复：用户可访问的地址',
+    gateLabel: '完整规则，每个会话一次：系统提示，或无系统提示 CLI 的首轮 Shell 提示',
+  },
+  {
     key: 'ai.routing.intro_transcript', block: 'routing_system', stage: 'new', kind: 'editable',
     label: '开场说明（transcript 自动转发模式）',
     gateLabel: '仅 replyDelivery=transcript（daemon 自动转发最终回复）时替代上面的标准版',
@@ -176,7 +181,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     gateLabel: '实验开关：跨主体插队 XPI（默认关）；强制开/关同时作用于 Shell 路径',
   },
 
-  // shell-hints path (codex / gemini / opencode / …) — the same guidance, prose form
+  // shell-hints path (codex / opencode / …) — the same guidance, prose form
   { key: 'ai.shell.intro', block: 'routing_shell', stage: 'new', label: 'Shell：开场说明（标准模式）', kind: 'editable' },
   {
     key: 'ai.shell.intro_transcript', block: 'routing_shell', stage: 'new', kind: 'editable',
@@ -373,6 +378,12 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   // ───────────────────── stage: 每条新消息 (followup) ──────────────────────
 
   { key: 'ai.followup.reminder', block: 'followup', stage: 'followup', label: '续轮提醒（默认）', kind: 'editable' },
+  { key: 'ai.followup.feishu_safe_emphasis', block: 'followup', stage: 'followup', label: '飞书安全强调格式', kind: 'editable' },
+  {
+    key: 'ai.followup.no_local_addresses', block: 'followup', stage: 'followup', kind: 'editable',
+    label: '飞书回复：用户可访问的地址（每轮一句）',
+    gateLabel: '随每轮飞书格式提示；完整规则在会话开始阶段',
+  },
   {
     key: 'ai.followup.reminder_hook', block: 'followup', stage: 'followup', kind: 'editable',
     label: '续轮提醒（Claude Code hook 离带注入版）',

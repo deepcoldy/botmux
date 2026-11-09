@@ -33,6 +33,13 @@ export interface GroupChat {
   avatar?: string;
   chatMode?: string;
   sessionGroup?: boolean;
+  /** 会话群摘要（daemon `sessionGroupBoardMeta`）：排序、状态与当前会话入口。 */
+  sessionGroupMeta?: {
+    createdAt: number;
+    lastActiveAt: number;
+    sessionId?: string;
+    sessionStatus?: 'active' | 'closed';
+  };
   collaborationMode?: 'standard' | 'project';
   projectCoordinatorAppId?: string;
   projectWorkerAppIds?: string[];
@@ -97,7 +104,8 @@ export interface GroupsSnapshot {
 
 export interface GroupFilters {
   q: string;
-  missingOnly: boolean;
+  /** 只看有这个 bot 在群里的群；空串 = 不限。 */
+  botId: string;
 }
 
 export interface FetchGroupsSnapshotOptions {

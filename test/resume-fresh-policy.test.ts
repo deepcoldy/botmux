@@ -2,9 +2,11 @@
  * Resume-without-cliSessionId → fresh-session policy.
  *
  * Adapters whose buildArgs can only resume a PRECISE cliSessionId (cursor /
- * copilot / kimi — no --continue/latest fallback, which would risk loading a
- * SIBLING session's conversation) declare `resumeRequiresCliSessionId`. This
- * file covers:
+ * copilot — no --continue/latest fallback, which would risk loading a
+ * SIBLING session's conversation) declare `resumeRequiresCliSessionId`.
+ * Kimi finds its own session from the botmux id instead
+ * (`resumeFindsOwnSession`); for it the receipt follows the same
+ * `checkResumeTargetExists` probe the worker runs. This file covers:
  *
  *   1. `resumeStartsFresh` — the shared predicate upper layers (closed card,
  *      resume receipt) use to distinguish "route reactivated" from "CLI
@@ -17,7 +19,12 @@
  * Run: pnpm vitest run test/resume-fresh-policy.test.ts
  */
 import { describe, it, expect, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { resumeStartsFresh } from '../src/services/resume-fresh-policy.js';
+import { opencodeDbPath } from '../src/services/opencode-paths.js';
 import { buildClosedSessionCard } from '../src/core/closed-session-card.js';
 import { getCliDisplayName } from '../src/im/lark/card-builder.js';
 import { t } from '../src/i18n/index.js';
@@ -28,15 +35,80 @@ vi.mock('../src/bot-registry.js', () => ({
 }));
 
 describe('resumeStartsFresh', () => {
-  it('copilot / kimi / cursor without a persisted cliSessionId start fresh', () => {
+  it('copilot / cursor without a persisted cliSessionId start fresh', () => {
     expect(resumeStartsFresh({ cliId: 'copilot' })).toBe(true);
-    expect(resumeStartsFresh({ cliId: 'kimi' })).toBe(true);
     expect(resumeStartsFresh({ cliId: 'cursor' })).toBe(true);
+  });
+
+  it('kimi finds its own session: fresh exactly when the same probe the worker runs finds none', () => {
+    const root = mkdtempSync(join(tmpdir(), 'resume-fresh-'));
+    const prev = { KIMI_CODE_HOME: process.env.KIMI_CODE_HOME };
+    try {
+      process.env.KIMI_CODE_HOME = join(root, 'kimi');
+      const work = join(root, 'work');
+      mkdirSync(work, { recursive: true });
+      const sid = '4c0a8f9e-1b2d-4e3f-8a5b-6c7d8e9f0a1b';
+      // Nothing on disk yet: the receipt must say "starts fresh".
+      expect(resumeStartsFresh({ cliId: 'kimi', sessionId: sid, workingDir: work })).toBe(true);
+      // Kimi has the session (its prompt carries the botmux id): history is back.
+      const kdir = join(root, 'kimi', 'sessions', 'wd_work_0', 'session_aaaa');
+      mkdirSync(join(kdir, 'agents', 'main'), { recursive: true });
+      writeFileSync(join(kdir, 'agents', 'main', 'wire.jsonl'), `{"type":"metadata","protocol_version":"1.4"}\n{"content":"<session_id>${sid}</session_id>"}\n`);
+      writeFileSync(join(root, 'kimi', 'session_index.jsonl'), JSON.stringify({ sessionId: 'session_aaaa', sessionDir: kdir, workDir: work }) + '\n');
+      expect(resumeStartsFresh({ cliId: 'kimi', sessionId: sid, workingDir: work })).toBe(false);
+    } finally {
+      for (const [key, value] of Object.entries(prev)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { cliId: 'opencode', table: 'part' },
+    { cliId: 'opencode2', table: 'session_message' },
+  ])('$cliId finds its own session: fresh exactly when the same probe the worker runs finds none', ({ cliId, table }) => {
+    const root = mkdtempSync(join(tmpdir(), 'resume-fresh-'));
+    const prev = { XDG_DATA_HOME: process.env.XDG_DATA_HOME };
+    try {
+      process.env.XDG_DATA_HOME = root;
+      const sid = '4c0a8f9e-1b2d-4e3f-8a5b-6c7d8e9f0a1b';
+      // No OpenCode DB at all: the probe cannot tell, keep the restored copy.
+      expect(resumeStartsFresh({ cliId, sessionId: sid })).toBe(false);
+      // OpenCode has a DB but no session carrying this botmux id: the worker starts fresh.
+      mkdirSync(join(root, 'opencode'), { recursive: true });
+      const db = new DatabaseSync(opencodeDbPath());
+      db.exec(`
+        CREATE TABLE session (id TEXT PRIMARY KEY);
+        CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+        CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+        CREATE TABLE session_v2 (id TEXT PRIMARY KEY);
+        CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, time_created INTEGER, data TEXT);
+      `);
+      expect(resumeStartsFresh({ cliId, sessionId: sid })).toBe(true);
+      // OpenCode has the session (its prompt carries the botmux id): history is back.
+      const text = `<session_id>${sid}</session_id>`;
+      if (table === 'part') {
+        db.prepare('INSERT INTO session (id) VALUES (?)').run('ses_v1');
+        db.prepare('INSERT INTO message VALUES (?,?,?,?)').run('msg_1', 'ses_v1', 1000, JSON.stringify({ role: 'user' }));
+        db.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run('prt_1', 'msg_1', 'ses_v1', 1000, JSON.stringify({ type: 'text', text }));
+      } else {
+        db.prepare('INSERT INTO session_v2 (id) VALUES (?)').run('ses_v2');
+        db.prepare('INSERT INTO session_message VALUES (?,?,?,?,?)').run('msg_1', 'ses_v2', 'user', 1000, JSON.stringify({ text }));
+      }
+      db.close();
+      expect(resumeStartsFresh({ cliId, sessionId: sid })).toBe(false);
+    } finally {
+      for (const [key, value] of Object.entries(prev)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('copilot / kimi / cursor WITH a cliSessionId resume precisely (not fresh)', () => {
     expect(resumeStartsFresh({ cliId: 'copilot', cliSessionId: 'sess-1' })).toBe(false);
-    expect(resumeStartsFresh({ cliId: 'kimi', cliSessionId: 'sess-1' })).toBe(false);
+    expect(resumeStartsFresh({ cliId: 'kimi', cliSessionId: 'session_1' })).toBe(false);
     expect(resumeStartsFresh({ cliId: 'cursor', cliSessionId: 'chat-1' })).toBe(false);
   });
 
@@ -46,8 +118,8 @@ describe('resumeStartsFresh', () => {
     expect(resumeStartsFresh({ cliId: 'hermes' })).toBe(false);
   });
 
-  it('adapters that ignore resume entirely (gemini) are not flagged', () => {
-    expect(resumeStartsFresh({ cliId: 'gemini' })).toBe(false);
+  it('adapters that ignore resume entirely (mimocode) are not flagged', () => {
+    expect(resumeStartsFresh({ cliId: 'mimocode' })).toBe(false);
   });
 
   it('missing cliId / unknown cliId → false (fail safe, no false "history lost" claim)', () => {

@@ -1,4 +1,5 @@
 import type { DurableCoordinationStore, OutboxAttempt } from './durable-coordination.js';
+import { durableSessionControlMaxAttempts } from './durable-lark-session-control.js';
 import {
   createDurableLarkCanonicalDispatch,
   type DurableLarkCanonicalDispatchOptions,
@@ -179,6 +180,7 @@ export function startDurableLarkPrimaryRuntime(
           sessionOwnerId: session.ownerId,
           resolve: options.control.resolve,
         }),
+        maxAttemptsFor: durableSessionControlMaxAttempts,
         ...(options.control.workerId ? { workerId: options.control.workerId } : {}),
         ...(options.control.intervalMs === undefined
           ? {}

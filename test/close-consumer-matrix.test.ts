@@ -137,6 +137,11 @@ const CONSUMERS: Record<string, Rule> = {
   },
 
   // ── background: no UI, so refusal/residual must be logged ────────────────
+  'core/dismiss-command.ts::closeSessionsInGoneChat::closeSession': {
+    category: 'background',
+    why: 'The chat was disbanded or the bot was removed, so there is no surface left to report to; '
+      + 'a refusal or residual is logged per session and never counted as closed.',
+  },
   'core/session-manager.ts::closeActiveSessionIfCliMismatch::closeSession': {
     category: 'background',
     why: 'Returns close_failed / closed_with_residual to the sweep; a refusal is '
@@ -178,6 +183,21 @@ const CONSUMERS: Record<string, Rule> = {
       + 'surface: a refusal leaves the row active and is logged by closeSession itself.',
     count: 2,
   },
+  'core/session-manager.ts::deliverWorkflowNodeTurn::closeSession': {
+    category: 'background',
+    why: 'A workflow node turn the main bot starts for itself reclaims either a '
+      + 'disposable scratch at the node topic or its own candidate that lost the '
+      + 'active-session CAS (same shape as the decision-board batch). No user surface: '
+      + 'a refusal leaves the row active and is logged by closeSession itself; the '
+      + 'handoff is re-sent with the same keys or blocks for a human.',
+    count: 2,
+  },
+  'core/dashboard-ipc-server.ts::closeSession::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'A Dashboard workflow draft that is abandoned or deleted closes its clarify '
+      + 'headless session; nobody is waiting on that session, the wrapper logs refusal '
+      + 'and residual, and the draft is already marked so no turn can reach it again.',
+  },
   'core/failed-turn-recovery.ts::recoverFailedTurn::closeSessionForBackgroundCleanup': {
     category: 'background',
     why: 'Host recovery uses the native background wrapper to log refusal and '
@@ -197,6 +217,13 @@ const CONSUMERS: Record<string, Rule> = {
     category: 'background',
     why: 'Admission failure cleanup; wrapper logs both.',
     count: 4,
+  },
+  'daemon.ts::closePatrolSession::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Group-secretary patrol cleanup: only a session the patrol itself created, '
+      + 'with no human activity during the round, is closed after its ledger is written; '
+      + 'nobody is waiting on it, the wrapper logs refusal and residual, and the next '
+      + 'patrol re-opens a fresh session from the ledger.',
   },
   'daemon.ts::closeSession::closeSessionForBackgroundCleanup': {
     category: 'background',

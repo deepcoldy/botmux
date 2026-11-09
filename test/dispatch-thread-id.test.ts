@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import ts from 'typescript';
 import { describe, expect, it, vi } from 'vitest';
 import { pickTurnReplyTarget } from '../src/core/reply-target.js';
+import { isSilentMessageListenerSession, messageListenerSendBlocked } from '../src/core/message-listener-silence.js';
 import { parseDispatchArgs } from '../src/cli/dispatch-args.js';
 import { buildDispatchCompletionBrief, buildDispatchMessages, buildProjectDispatchSyncAction,
   buildRepoPrimeText, parseDispatchBotSpec, resolveSendTarget } from '../src/core/dispatch.js';
@@ -11,7 +12,8 @@ import { buildDispatchCompletionBrief, buildDispatchMessages, buildProjectDispat
 function extract(path: string, names: string[]): string {
   const source = ts.createSourceFile(path, readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true);
   return names.map(name => {
-    const declaration = source.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
+    const declaration = source.statements.find(node =>
+      (ts.isFunctionDeclaration(node) || ts.isClassDeclaration(node)) && node.name?.text === name);
     if (!declaration) throw new Error('Missing function: ' + name);
     return ts.transpileModule(declaration.getText(source).replace(/^export /, ''), {
       compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
@@ -19,7 +21,10 @@ function extract(path: string, names: string[]): string {
   }).join('\n');
 }
 
-const cliCode = extract('src/cli.ts', ['resolveDispatchThreadId', 'freezeDispatchOriginClaim', 'cmdDispatch']);
+const cliCode = extract('src/cli.ts', ['resolveDispatchThreadId', 'freezeDispatchOriginClaim', 'cmdDispatch',
+  // Real (not stubbed) task-tree sync so the default-off gate and its IPC
+  // behaviour are exercised; only the HTTP layer (postCurrentSessionDaemonRoute) is a mock.
+  'syncDispatchTaskTreeAfterDispatch', 'trySyncDispatchTaskTree']);
 // larkGet / larkRequestDeadline live in lark-get.ts (re-exported by client.ts).
 const clientCode = extract('src/im/lark/lark-get.ts', ['larkRequestDeadline', 'larkGet'])
   + '\n' + extract('src/im/lark/client.ts', ['getMessageDetail', 'getMessageThreadId']);
@@ -31,6 +36,8 @@ function harness(mode: Mode, options: {
   threadId?: unknown;
   failure?: 'permission' | 'network' | 'timeout' | 'send';
   acceptance?: 'accepted' | 'timed_out';
+  taskTreeCardEnabled?: boolean;
+  resolveBotApps?: (receiver: string, chatId: string, appIds: string[]) => Promise<unknown>;
 } = {}) {
   const root = mode === 'into' ? 'om_existing' : 'om_seed';
   const stdout: string[] = [];
@@ -87,6 +94,7 @@ function harness(mode: Mode, options: {
   const state = {
     parseDispatchArgs, buildDispatchCompletionBrief, buildDispatchMessages, buildProjectDispatchSyncAction,
     buildRepoPrimeText, parseDispatchBotSpec, resolveSendTarget, pickTurnReplyTarget,
+    isSilentMessageListenerSession, messageListenerSendBlocked,
     resolveSessionContext: () => undefined,
     process: { env: { SESSION_DATA_DIR: '/isolated/data' }, exitCode: 0,
       exit: (code: number) => { throw new Error('exit:' + code + '\n' + stderr.join('\n')); } },
@@ -97,6 +105,14 @@ function harness(mode: Mode, options: {
     // own refusal path is covered by multi-topic-feature-gate.test.ts, so this
     // receipt/thread-id harness keeps the default-enabled behavior.
     isMultiTopicOrchestrationEnabled: () => true,
+    // Extracted cmdDispatch calls the machine-wide task-tree card gate;
+    // default-OFF in this harness so the receipt/thread-id tests keep the
+    // pre-card shape (no attemptAt, no /dispatch-tree IPC). An explicit
+    // taskTreeCardEnabled:true exercises the on path.
+    isDispatchTaskTreeCardEnabled: () => options.taskTreeCardEnabled === true,
+    // Extracted cmdDispatch checks for a group-secretary patrol turn; these
+    // harness turns are ordinary bot turns, so no patrol root applies.
+    parseSecretaryPatrolRoot: () => undefined,
     loadSessions: () => new Map([['source', { sessionId: 'source', chatId: 'oc_chat', larkAppId: 'cli_source' }]]),
     requireSessionById: async (sid: string) => ({
       sessionId: sid, chatId: 'oc_chat', larkAppId: 'cli_source',
@@ -123,16 +139,17 @@ function harness(mode: Mode, options: {
       };
       if (path === './im/lark/client.js') return {
         getMessageThreadId, replyMessage,
-        resolveCurrentChatBotOpenIdsByLarkAppIds: async () => ({
+        resolveCurrentChatBotOpenIdsByLarkAppIds: options.resolveBotApps ?? (async () => ({
           ok: true, mappings: [{ larkAppId: 'cli_target', subjectOpenId: 'ou_target' }],
-        }),
+        })),
       };
       if (path === './core/role-resolver.js') return { readRoleDispatchCompletionEnabled: () => false };
       throw new Error('Unexpected import: ' + path);
     },
   };
   const command = new Function('state', 'with (state) { ' + cliCode + '; return cmdDispatch; }')(state);
-  const args = ['--session-id', 'source', ...(options.acceptance ? ['--bot-app', 'cli_target'] : ['--bot', 'ou_target'])];
+  const args = ['--session-id', 'source',
+    ...(options.acceptance || options.resolveBotApps ? ['--bot-app', 'cli_target'] : ['--bot', 'ou_target'])];
   if (mode === 'into') args.push('--into', root, '--brief', '完成任务');
   else if (mode === 'standby') args.push('--title', '任务', '--repo', '/repo', '--standby');
   else args.push('--title', '任务', '--brief', '完成任务');
@@ -166,6 +183,12 @@ for (const chatMode of ['normal', 'topic'] as const) {
         expect(oldFields).toEqual(oldReceipt(mode));
         expect(h.steps).toEqual(mode === 'into' ? ['reply', 'lookup'] : ['seed', 'reply', 'lookup']);
         expect(h.postCurrentSessionDaemonRoute).toHaveBeenCalledTimes(mode === 'dispatch' ? 2 : 1);
+        // Card OFF (harness default): no /dispatch-tree call and the dispatch
+        // entry gains no attemptAt — exactly the pre-card dispatch shape.
+        expect(h.postCurrentSessionDaemonRoute.mock.calls.map(c => c[0]!.path))
+          .not.toContain(expect.stringContaining('dispatch-tree'));
+        expect((h.persistDispatchLifecycle.mock.calls[0]![0] as Record<string, unknown>).attemptStartedAt)
+          .toBeUndefined();
         expect(h.request).toHaveBeenCalledExactlyOnceWith({
           method: 'GET', url: '/open-apis/im/v1/messages/' + h.root,
           params: { with_sender_name: 'true' }, timeout: 2_000, signal: h.timeoutSignals[0].signal,
@@ -173,6 +196,31 @@ for (const chatMode of ['normal', 'topic'] as const) {
         expect(h.state.process.exitCode).toBe(0);
       });
     }
+  });
+}
+
+for (const mode of ['dispatch', 'standby', 'into'] as const) {
+  describe(mode + ' task-tree card gate', () => {
+    it('OFF: persists no attemptStartedAt and makes no /dispatch-tree IPC (pre-card shape)', async () => {
+      const h = harness(mode, { taskTreeCardEnabled: false });
+      await h.run();
+      expect(h.persistDispatchLifecycle).toHaveBeenCalledTimes(1);
+      for (const call of h.persistDispatchLifecycle.mock.calls) {
+        expect((call[0] as Record<string, unknown>).attemptStartedAt).toBeUndefined();
+      }
+      expect(h.postCurrentSessionDaemonRoute.mock.calls.map(c => c[0]!.path))
+        .not.toContain(expect.stringContaining('dispatch-tree'));
+    });
+
+    it('ON: persists attemptStartedAt and calls the dispatch-tree IPC once', async () => {
+      const h = harness(mode, { taskTreeCardEnabled: true });
+      await h.run();
+      expect((h.persistDispatchLifecycle.mock.calls[0]![0] as Record<string, unknown>).attemptStartedAt)
+        .toEqual(expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/));
+      const treeCalls = h.postCurrentSessionDaemonRoute.mock.calls
+        .filter(c => c[0]!.path.includes('dispatch-tree'));
+      expect(treeCalls).toHaveLength(1);
+    });
   });
 }
 
@@ -219,4 +267,46 @@ it.each(['dispatch', 'into'] as const)('%s keeps acceptance timeout independent 
     accepted: false, acceptedBotAppIds: [], missingBotAppIds: ['cli_target'],
   });
   expect(h.state.process.exitCode).toBe(1);
+});
+
+describe('dispatch --bot-app live membership failures', () => {
+  // 真实的严格解析器，只替换 larkGet 与本机 Bot 配置。
+  function liveResolver(larkGet: (client: { appId: string }, url: string) => Promise<unknown>) {
+    const code = extract('src/im/lark/client.ts',
+      ['LarkCallTimeoutError', 'promiseWithTimeout', 'listChatBotsViaMembersBots', 'resolveCurrentChatBotOpenIdsByLarkAppIds']);
+    const client = (appId: string) => ({ appId });
+    const scope = {
+      config: { chatBotDiscovery: { listBotsApiTimeoutMs: 20 }, session: { dataDir: '/isolated/data' } },
+      getBotClient: client,
+      getAllBotClients: () => ['cli_source', 'cli_target'].map(appId => ({ appId, client: client(appId) })),
+      readFileSync: () => JSON.stringify([{ larkAppId: 'cli_target', botName: 'Target' }]),
+      join: (...parts: string[]) => parts.join('/'),
+      larkGet,
+    };
+    return new Function('scope', 'with (scope) { ' + code + '; return resolveCurrentChatBotOpenIdsByLarkAppIds; }')(scope);
+  }
+  const hang = () => new Promise<never>(() => {});
+  const liveRows = async () => ({ code: 0, data: { items: [{ bot_id: 'ou_target', bot_name: 'Target' }] } });
+
+  it.each([
+    ['/members/bots', (_c: { appId: string }, url: string) => (url.endsWith('/members/bots') ? hang() : liveRows())],
+    ['is_in_chat', (_c: { appId: string }, url: string) => (url.endsWith('/members/bots') ? liveRows() : hang())],
+  ])('names the timeout env var when %s is slower than the deadline', async (_label, larkGet) => {
+    const h = harness('dispatch', { resolveBotApps: liveResolver(larkGet) });
+    await expect(h.run()).rejects.toThrow('exit:1');
+    expect(h.stderr.join('\n')).toContain('BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS');
+    expect(h.replyMessage).not.toHaveBeenCalled();
+    expect(h.postCurrentSessionDaemonRoute).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { code: 99991672, msg: 'permission denied' },
+    { code: 232011, msg: 'upstream timed out after 20ms' },
+  ])('does not suggest the timeout env var for Feishu business error $code', async body => {
+    const h = harness('dispatch', { resolveBotApps: liveResolver(async () => body) });
+    await expect(h.run()).rejects.toThrow('exit:1');
+    const stderr = h.stderr.join('\n');
+    expect(stderr).toContain(String(body.code));
+    expect(stderr).not.toContain('BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS');
+  });
 });

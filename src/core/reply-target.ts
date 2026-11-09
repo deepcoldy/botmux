@@ -140,7 +140,8 @@ export const REPLY_TARGETS_MAX = 32;
  *  watermark against the turn window to decide incompleteness.
  *
  *  `pinnedTurnIds` lists turns whose routing record a LIVE built-in CronCreate
- *  task still reports into (see {@link cronPinnedTurnIds}): those entries are
+ *  task (or a running background task) still reports into (see
+ *  {@link replyTargetPinnedTurnIds}): those entries are
  *  exempt from eviction even past REPLY_TARGETS_MAX, otherwise a task created
  *  in topic A loses its replyTargets record after 32 newer turns and its next
  *  scheduled fire falls back to the group top level — no restart required. */
@@ -198,6 +199,32 @@ export function cronPinnedTurnIds(
   return pinned;
 }
 
+/** Bound on {@link DaemonSession.backgroundTaskPinnedTurnIds}, newest kept: the
+ *  worker reports only running tasks, so this caps a misbehaving snapshot,
+ *  not a real session. Same order of magnitude as CRON_TASK_ANCHORS_MAX. */
+export const BACKGROUND_TASK_PINS_MAX = 64;
+
+/** Validate and bound a worker `background_task_pins_sync` snapshot. Returns
+ *  undefined when nothing is pinned (the field is then cleared). */
+export function normalizeBackgroundTaskPins(turnIds: unknown): string[] | undefined {
+  if (!Array.isArray(turnIds)) return undefined;
+  const ids = [...new Set(turnIds.filter((id): id is string => typeof id === 'string' && id.length > 0))];
+  const bounded = ids.length > BACKGROUND_TASK_PINS_MAX ? ids.slice(ids.length - BACKGROUND_TASK_PINS_MAX) : ids;
+  return bounded.length > 0 ? bounded : undefined;
+}
+
+/** Every replyTargets turnId that eviction must keep: the create-time topic
+ *  of each live CronCreate task, plus the launching turn of each background
+ *  task the current worker still reports as running. All three replyTargets
+ *  writers prune through this set. */
+export function replyTargetPinnedTurnIds(
+  ds: Pick<DaemonSession, 'session' | 'backgroundTaskPinnedTurnIds'>,
+): Set<string> {
+  const pinned = cronPinnedTurnIds(ds.session.cronTaskReplyAnchors);
+  for (const turnId of ds.backgroundTaskPinnedTurnIds ?? []) pinned.add(turnId);
+  return pinned;
+}
+
 /** Apply a worker full-snapshot sync of its task→turnId map. The worker is the
  *  authority: tasks absent from its snapshot have been shed there too. A
  *  task already known keeps its original createdAtMs so FIFO eviction order is
@@ -252,6 +279,13 @@ export interface TurnReplyTarget extends Omit<ReplyTargetEntry, 'updatedAt'> {
  *   keeps logicalTurnId === currentTurnId on the live turn;
  * - every other synthetic mint (trg_, bmx-*, …) is refused here regardless of
  *   what its registry entry carries. */
+/** Whether `turnId` names a turn a human message opened (`om_…` inbound
+ *  message, `join_…` auto-start join). Every synthetic turn — `schedule:…`,
+ *  `trg_…`, `board:…`, `workflow-event:…` — has no human behind it. */
+export function isHumanInboundTurnId(turnId: string | undefined): boolean {
+  return typeof turnId === 'string' && (turnId.startsWith('om_') || turnId.startsWith('join_'));
+}
+
 export function registryTurnMayAuthenticateHuman(
   s: {
     ordinaryTurnRecovery?: { logicalTurnId: string; currentTurnId: string };
@@ -260,7 +294,7 @@ export function registryTurnMayAuthenticateHuman(
   },
   turnId: string,
 ): boolean {
-  if (!turnId.startsWith('om_') && !turnId.startsWith('join_')) return false;
+  if (!isHumanInboundTurnId(turnId)) return false;
   const ordinary = s.ordinaryTurnRecovery;
   if (ordinary && ordinary.currentTurnId === turnId && turnId !== ordinary.logicalTurnId) return false;
   if (s.failedTurnRecovery?.turnId === turnId) return false;
@@ -384,6 +418,45 @@ export function resolveSendTarget(opts: {
   return { mode: 'thread', rootMessageId: opts.rootMessageId };
 }
 
+let finalOutputOriginRecorder: ((ds: DaemonSession, turnId: string, context: FrozenSessionReplyContext) => void) | undefined;
+const TURN_REPLY_CONTEXTS_MAX = 256;
+
+export function setFinalOutputOriginRecorder(recorder: typeof finalOutputOriginRecorder): void {
+  finalOutputOriginRecorder = recorder;
+}
+
+/** Copy only the exact prior turn's destination, never its execution identity.
+ * The returned rollback must run synchronously on dispatch refusal, before any
+ * await. Restore evicted entries too; deleting only the new turn loses history.
+ * The caller must persist the restored row because fork may have written it. */
+export function inheritTurnReplyRouting(ds: DaemonSession, sourceTurnId: string | undefined, turnId: string): () => void {
+  if (!sourceTurnId) return () => {};
+  const previous = structuredClone({
+    turnReplyContexts: ds.session.turnReplyContexts,
+    replyTargets: ds.session.replyTargets,
+    replyTargetsPrunedThrough: ds.session.replyTargetsPrunedThrough,
+  });
+  const prior = pickTurnReplyTarget(ds.session, sourceTurnId);
+  const context = frozenReplyContextForTurn(ds, sourceTurnId);
+  ds.session.turnReplyContexts = { ...ds.session.turnReplyContexts,
+    [turnId]: { target: structuredClone(context.target),
+      ...(context.quoteTargetId ? { quoteTargetId: context.quoteTargetId } : {}) } };
+  for (const stale of Object.keys(ds.session.turnReplyContexts).slice(0,
+    Math.max(0, Object.keys(ds.session.turnReplyContexts).length - TURN_REPLY_CONTEXTS_MAX))) {
+    delete ds.session.turnReplyContexts[stale];
+  }
+  const targets = { ...ds.session.replyTargets, [turnId]: {
+    ...(context.target.mode !== 'plain' ? { rootMessageId: context.target.rootMessageId } : {}),
+    ...(context.target.mode === 'quote' ? { quoteOnly: true } : {}),
+    ...(prior?.substitute ? { substitute: true } : {}),
+    updatedAt: new Date().toISOString(),
+  } };
+  ds.session.replyTargetsPrunedThrough = pruneReplyTargets(targets,
+    ds.session.replyTargetsPrunedThrough, replyTargetPinnedTurnIds(ds));
+  ds.session.replyTargets = targets;
+  return () => { Object.assign(ds.session, previous); };
+}
+
 export function beginReplyTargetTurn(
   ds: DaemonSession,
   replyRootId: string | undefined,
@@ -407,6 +480,12 @@ export function beginReplyTargetTurn(
   delete exactContexts[turnId];
   exactContexts[turnId] = {
     target: exactTarget,
+    ...(opts?.senderOpenId && (process.env.BOTMUX_FINAL_OUTPUT_HANDOFF === '1' || ds.initConfig?.finalOutputHandoff?.admitNew)
+      ? { requesterOpenId: opts.senderOpenId,
+          ...(opts.participants?.some(p => p.openId === opts.senderOpenId)
+            ? { requesterIsBot: opts.participants.find(p => p.openId === opts.senderOpenId)!.isBot }
+            : ds.session.quoteTargetSenderOpenId === opts.senderOpenId && ds.session.quoteTargetSenderIsBot !== undefined
+              ? { requesterIsBot: ds.session.quoteTargetSenderIsBot } : {}) } : {}),
     ...(opts?.sourceMessageId && /^om_[a-zA-Z0-9_-]+$/.test(opts.sourceMessageId)
       ? { sourceMessageId: opts.sourceMessageId } : {}),
     ...(ds.session.quoteTargetId ? { quoteTargetId: ds.session.quoteTargetId } : {}),
@@ -424,7 +503,10 @@ export function beginReplyTargetTurn(
       ? { inThread: opts.inThread }
       : {}),
   };
-  const overflow = Object.keys(exactContexts).length - 256;
+  // The output owner records the authenticated origin before bounded UI
+  // projections can prune it. Failure prevents admission, not a forged ACK.
+  finalOutputOriginRecorder?.(ds, turnId, exactContexts[turnId]);
+  const overflow = Object.keys(exactContexts).length - TURN_REPLY_CONTEXTS_MAX;
   if (overflow > 0) {
     for (const staleTurnId of Object.keys(exactContexts).slice(0, overflow)) {
       delete exactContexts[staleTurnId];
@@ -456,7 +538,7 @@ export function beginReplyTargetTurn(
   ds.session.replyTargetsPrunedThrough = pruneReplyTargets(
     targets,
     ds.session.replyTargetsPrunedThrough,
-    cronPinnedTurnIds(ds.session.cronTaskReplyAnchors),
+    replyTargetPinnedTurnIds(ds),
   );
   ds.session.replyTargets = targets;
 

@@ -685,6 +685,7 @@ function OnboardingForm(props: {
             ariaLabel={t('botOnboarding.modelLabel')}
             defaultLabel={t('botDefaults.modelPickerDefault')}
             customLabel={t('botDefaults.modelPickerCustom')}
+            includeDefault
             menuClassName="onboarding-menu"
             detectedCount={detectedLiveCount || undefined}
             detectedLabel={detectedLiveCount > 0
@@ -900,6 +901,10 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
   }, [applyJob]);
 
   const body = useMemo(() => {
+    // The dialog stays mounted in the shell from the first paint, before the
+    // visitor's auth state is known. The form's CLI probes are management reads,
+    // so they must not run while the dialog is closed.
+    if (!props.open) return null;
     if (view.kind === 'form') {
       return (
         <OnboardingForm
@@ -927,7 +932,7 @@ export function BotOnboardingDialog(props: { open: boolean; onClose(): void }): 
         onClose={close}
       />
     );
-  }, [cliState, close, form, ownerIdInput, ownerInput, retry, sessionMode, submitForm, submitOwner, submitting, view]);
+  }, [cliState, close, form, ownerIdInput, ownerInput, props.open, retry, sessionMode, submitForm, submitOwner, submitting, view]);
 
   const canClose = view.kind === 'form' || (view.kind === 'job' && (view.job.status === 'completed' || view.job.status === 'failed'));
 

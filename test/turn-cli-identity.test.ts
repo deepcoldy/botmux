@@ -35,6 +35,7 @@ vi.mock('../src/utils/user-token.js', () => ({
 // bytedcli shells out to the real CLI; here we control who is authorized.
 const bytedcliJwts = new Map<string, { cloudJwt: string; codeJwt?: string }>();
 vi.mock('../src/services/bytedcli-auth.js', () => ({
+  renewBytedcliJwts: vi.fn(async () => null),
   mintBytedcliJwts: vi.fn(async (openId: string) => bytedcliJwts.get(openId) ?? null),
   beginBytedcliLogin: vi.fn(async () => ({
     authUrl: 'https://cloud.example.com/auth?state=auto',
@@ -53,10 +54,13 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
   beginLarkCliLogin: vi.fn(async () => ({ authUrl: 'https://example.com/lark-device' })),
 }));
 
-const { publishTurnCliIdentity } = await import('../src/core/turn-cli-identity.js');
+const { publishTurnCliIdentity, trackTurnIdentityPublication } = await import('../src/core/turn-cli-identity.js');
 const { writeSessionIdentity, recallProvenIdentityContent, renderIdentityWrapper } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { noteSenderUnionId } = await import('../src/core/platform-credential-source.js');
+const { beginLarkCliLogin } = await import('../src/services/lark-cli-auth.js');
+const { prepareScheduledRecoveryRun } = await import('../src/core/scheduled-send.js');
+const { assertScheduledAuthorityCurrent, isManualScheduleRun, isManualScheduledTurn } = await import('../src/core/scheduled-turn-provenance.js');
 
 const APP = 'cli_bot';
 const ALICE = 'ou_alice';
@@ -83,7 +87,8 @@ function botConfig(triggerUserAuth: unknown = { enabled: true, tools: ['lark-cli
   } as any;
 }
 
-function publish(config: any, senderOpenId: string | undefined, turnId = 'turn-default') {
+// Default: a 1:1 chat, the only place a refusal may carry an auth link.
+function publish(config: any, senderOpenId: string | undefined, turnId = 'turn-default', privateChat = true) {
   return publishTurnCliIdentity({
     botConfig: config,
     turnId,
@@ -91,6 +96,7 @@ function publish(config: any, senderOpenId: string | undefined, turnId = 'turn-d
     sessionDataDir: dir,
     sessionId: SESSION,
     senderOpenId,
+    privateChat,
   });
 }
 
@@ -181,6 +187,37 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     expect(body).not.toContain('tok-alice');
     expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
     expect(body).toContain('https://example.com/lark-device');
+    expect(body).toContain('[reason=not_authorized]');
+  });
+
+  // A group member opening someone else's device link authorizes as
+  // THEMSELVES; the agent relays whatever the refusal carries into the chat.
+  it('in a group: denies without any link and never starts a device login', async () => {
+    const begins = vi.mocked(beginLarkCliLogin).mock.calls.length;
+    const outcomes = await publish(botConfig(), BOB, 'turn-group', false);
+    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
+    const body = identityBody('lark-cli', 'turn-group');
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(body).not.toContain('https://example.com/lark-device');
+    expect(body).not.toMatch(/https?:\/\//);
+    expect(body).toContain('/login');
+    // The cause is still named in a group, just without a link.
+    expect(body).toContain('[reason=not_authorized]');
+    expect(vi.mocked(beginLarkCliLogin).mock.calls.length).toBe(begins);
+  });
+
+  // A group turn with no human sender takes the same linkless group branch and
+  // must still name no_sender; the p2p no-sender case cannot see this branch.
+  it('in a group with no sender: denies linkless with [reason=no_sender]', async () => {
+    const begins = vi.mocked(beginLarkCliLogin).mock.calls.length;
+    const outcomes = await publish(botConfig(), undefined, 'turn-group-no-sender', false);
+    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
+    const body = identityBody('lark-cli', 'turn-group-no-sender');
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='denied'");
+    expect(body).not.toMatch(/https?:\/\//);
+    expect(body).toContain('[reason=no_sender]');
+    expect(body).not.toContain('[reason=not_authorized]');
+    expect(vi.mocked(beginLarkCliLogin).mock.calls.length).toBe(begins);
   });
 
   // Scheduled runs, hooks, meeting events and bot-to-bot handoffs have no
@@ -192,6 +229,7 @@ describe('publishTurnCliIdentity — withholding removes, never inherits', () =>
     const outcomes = await publish(botConfig(), undefined);
     expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
     expect(identityBody('lark-cli')).not.toContain('tok-alice');
+    expect(identityBody('lark-cli')).toContain('[reason=no_sender]');
   });
 
   it('reports needs-authorization instead of degrading under fallback: none', async () => {
@@ -540,7 +578,7 @@ describe('target daemon consumes signed message authority', () => {
         if (options.memberError) throw new Error('member list exceeds 2000 members');
         return options.member === false ? [] : ['ou_alice_target'];
       },
-      publishTurnCliIdentity, noteSenderUnionId, localeForBot: () => 'en', logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
+      publishTurnCliIdentity, trackTurnIdentityPublication, noteSenderUnionId, localeForBot: () => 'en', logger: { warn: vi.fn(), error: vi.fn(), info: vi.fn() },
       // A session whose worker has not reported yet publishes under the
       // fail-closed single default; tests set ds.reportedModel to stage that.
       identityStorageModelForDaemonSession: (session: any) => session.reportedModel ?? 'proven',
@@ -554,6 +592,11 @@ describe('target daemon consumes signed message authority', () => {
         const match = /^schedule:([0-9a-z_]{1,50}):[0-9a-f-]{36}$/.exec(turnId);
         return match?.[1] ?? null;
       },
+      // prepareTurnCliIdentity / the extracted scheduler callback took new
+      // schedule-authority dependencies; bind the real ones (recovery is inert
+      // here because these sessions carry no ordinaryTurnRecovery).
+      prepareScheduledRecoveryRun,
+      assertScheduledAuthorityCurrent, isManualScheduleRun, isManualScheduledTurn,
       resolveScheduledRunIdentity,
       noteScheduledIdentityGap: vi.fn(),
       noteScheduledIdentityRestored: vi.fn(),
@@ -694,6 +737,9 @@ describe('target daemon consumes signed message authority', () => {
   it('the production scheduler prepares ordinary tasks before dispatch', async () => {
     const h = await targetHarness();
     const { task } = directSchedule(h);
+    // The real scheduler claims the run (writing lastRunId) before the
+    // callback; the post-admission authority fence compares against it.
+    task.lastRunId = 'test-run';
     bytedcliJwts.set(ALICE, { cloudJwt: 'scheduled-alice' });
     let execute: (task: any, context: any) => Promise<void>;
     let dispatches = 0;
@@ -998,5 +1044,59 @@ it('does not begin another login when the bytedcli provider fails', async () => 
   expect(provider.beginBytedcliLogin).not.toHaveBeenCalled();
   const written = identityBody('bytedcli', 'turn-unavailable');
   expect(written).toContain('停止自动重试');
+  expect(written).toContain('[reason=provider_unavailable]');
   expect(written).not.toContain('old-sender-credential');
+});
+
+// The governed tools are prepared side by side: a slow tool (a bytedcli mint
+// is several CLI runs) must not hold back the other one, and the turn is still
+// released only once BOTH have published or refused.
+describe('publishTurnCliIdentity — tools are prepared concurrently', () => {
+  const both = () => botConfig({ enabled: true, tools: ['lark-cli', 'bytedcli'] });
+  function deferred<T>() {
+    let resolve!: (v: T) => void;
+    const promise = new Promise<T>(r => { resolve = r; });
+    return { promise, resolve };
+  }
+
+  it('starts the second tool while the first is still resolving, and keeps the outcome order', async () => {
+    const lark = deferred<string | null>();
+    resolveLarkCliHomeForTurn.mockImplementationOnce(() => lark.promise);
+    const provider = await import('../src/services/bytedcli-auth.js');
+    const minted = vi.mocked(provider.mintBytedcliJwts);
+    const before = minted.mock.calls.length;
+    bytedcliJwts.set(ALICE, { cloudJwt: 'alice-cloud' });
+    const run = publish(both(), ALICE, 'turn-par');
+    await vi.waitFor(() => expect(minted.mock.calls.length).toBe(before + 1));
+    lark.resolve('/isolated/alice');
+    expect(await run).toEqual([{ tool: 'lark-cli', state: 'user' }, { tool: 'bytedcli', state: 'user' }]);
+    expect(identityBody('lark-cli', 'turn-par')).toContain('/isolated/alice');
+    expect(identityBody('bytedcli', 'turn-par')).toContain('alice-cloud');
+  });
+
+  it('settles the publication only after the slower tool has landed', async () => {
+    const provider = await import('../src/services/bytedcli-auth.js');
+    const slow = deferred<{ cloudJwt: string } | null>();
+    vi.mocked(provider.mintBytedcliJwts).mockImplementationOnce(() => slow.promise);
+    larkHomes.set(ALICE, '/isolated/alice');
+    let settled = false;
+    const run = publish(both(), ALICE, 'turn-slow').then(v => { settled = true; return v; });
+    await vi.waitFor(() => expect(published('lark-cli', 'turn-slow')).toBe(true));
+    await new Promise(r => setTimeout(r, 20));
+    expect(settled).toBe(false);
+    slow.resolve({ cloudJwt: 'late-cloud' });
+    await run;
+    expect(identityBody('bytedcli', 'turn-slow')).toContain('late-cloud');
+  });
+
+  it('one tool failing does not change what the other publishes', async () => {
+    const provider = await import('../src/services/bytedcli-auth.js');
+    vi.mocked(provider.mintBytedcliJwts).mockRejectedValueOnce(new Error('provider unavailable'));
+    larkHomes.set(ALICE, '/isolated/alice');
+    expect(await publish(both(), ALICE, 'turn-iso')).toEqual([
+      { tool: 'lark-cli', state: 'user' }, { tool: 'bytedcli', state: 'unavailable' },
+    ]);
+    expect(identityBody('lark-cli', 'turn-iso')).toContain('/isolated/alice');
+    expect(identityBody('bytedcli', 'turn-iso')).toContain('[reason=provider_unavailable]');
+  });
 });

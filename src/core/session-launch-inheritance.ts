@@ -4,6 +4,7 @@ import type { Session } from '../types.js';
  * Native conversation/pane IDs, routing and caller authority are not launch
  * configuration; each lifecycle entry sets those explicitly. */
 export function inheritSessionLaunchConfiguration(source: Session, target: Session): void {
+  if (source.modelPin) target.modelPin = structuredClone(source.modelPin);
   const fields = [
     'cliId', 'cliInstanceBinding', 'cliRuntime', 'cliPathOverride', 'cliConfigDir',
     'wrapperCli', 'cliLaunchMode', 'agentFrozen', 'cliLaunchSnapshot', 'backendType',

@@ -312,6 +312,32 @@ describe('Bot config steward section', () => {
     expect(p2p().props.disabled).toBe(true);
   });
 
+  it('"decision cards in Feishu" is on by default; turning it off saves false, turning it back on drops the field', async () => {
+    serve();
+    await render({ enabled: true, chatId: 'oc_1' });
+    const cards = () => renderer!.root.find(n => n.type === 'input' && n.props['data-action'] === 'toggle-steward-decision-cards');
+    expect(cards().props.checked).toBe(true);
+    expect(text()).toContain(zh('botDefaults.stewardDecisionCards'));
+    await act(async () => { cards().props.onChange({ currentTarget: { checked: false } }); });
+    expect(calls('PUT', '/api/bots/cli_s/steward').at(-1)!.body).toEqual({ steward: { enabled: true, chatId: 'oc_1', decisionCards: false } });
+    expect(cards().props.checked).toBe(false);
+    await act(async () => { cards().props.onChange({ currentTarget: { checked: true } }); });
+    expect(calls('PUT', '/api/bots/cli_s/steward').at(-1)!.body).toEqual({ steward: { enabled: true, chatId: 'oc_1' } });
+  });
+
+  it('"subtask alerts" is off by default; turning it on saves true, turning it back off drops the field', async () => {
+    serve();
+    await render({ enabled: true, chatId: 'oc_1', closeHints: true });
+    const alerts = () => renderer!.root.find(n => n.type === 'input' && n.props['data-action'] === 'toggle-steward-task-hints');
+    expect(alerts().props.checked).toBe(false);
+    expect(text()).toContain(zh('botDefaults.stewardTaskHints'));
+    await act(async () => { alerts().props.onChange({ currentTarget: { checked: true } }); });
+    expect(calls('PUT', '/api/bots/cli_s/steward').at(-1)!.body).toEqual({ steward: { enabled: true, chatId: 'oc_1', closeHints: true, taskHints: true } });
+    expect(alerts().props.checked).toBe(true);
+    await act(async () => { alerts().props.onChange({ currentTarget: { checked: false } }); });
+    expect(calls('PUT', '/api/bots/cli_s/steward').at(-1)!.body).toEqual({ steward: { enabled: true, chatId: 'oc_1', closeHints: true } });
+  });
+
   it('the auto-join switch only shows while the bot is a steward, and a saved "off" survives turning the steward off and on', async () => {
     serve();
     await render({ enabled: false, autoJoinNewGroups: false });
@@ -550,5 +576,53 @@ describe('linked chats', () => {
     await openDetail(32);
     expect(text()).toContain(zh('decisionBoard.noChat', { reason: '管家自己处理' }));
     expect(text()).not.toContain('--link chat=oc_');
+  });
+
+  it('rows show the linked chat state: one chat as state + first line, several as a count summary; fresh results get the subtask hint', async () => {
+    const at = Date.now() - 12 * 60_000;
+    const hint = { kind: 'task_delivered', chatId: 'oc_a', at, key: 'task:delivered:s:t', summary: '登录超时修好了' };
+    serve([
+      { seq: 1, links: [chat('oc_a', '修登录群')], taskChats: [{ chatId: 'oc_a', kind: 'delivered', at, summary: '登录超时修好了' }], taskFresh: true, taskHint: hint },
+      { seq: 2, links: [chat('oc_b', 'B'), chat('oc_c', 'C'), chat('oc_d', 'D')], taskChats: [
+        { chatId: 'oc_b', kind: 'working', at }, { chatId: 'oc_c', kind: 'delivered', at }, { chatId: 'oc_d', kind: 'delivered', at },
+      ] },
+      { seq: 3, links: [chat('oc_e', 'E')] },
+    ] as never);
+    await openSummary();
+    const rows = renderer!.root.findAll(n => n.props.className === 'dboard-row-task');
+    expect(rows.map(r => [r.props['data-task'], r.props['data-fresh']])).toEqual([['delivered', 'true'], [undefined, undefined]]);
+    expect(textOf(rows[0]!)).toContain(zh('decisionBoard.taskDelivered'));
+    expect(textOf(rows[0]!)).toContain('登录超时修好了');
+    expect(textOf(rows[1]!)).toBe(`3 个群：1 ${zh('decisionBoard.taskWorking')} · 2 ${zh('decisionBoard.taskDelivered')}`);
+    expect(renderer!.root.findAll(n => n.props['data-task-hint']).map(n => n.props['data-task-hint'])).toEqual(['task_delivered']);
+    expect(text()).toContain(zh('decisionBoard.taskHintDelivered'));
+  });
+
+  it('the detail page shows each linked chat state and the subtask hint banner; nothing extra when the daemon sends none', async () => {
+    const at = Date.now() - 60_000;
+    serve([], {
+      31: {
+        links: [chat('oc_a', '修登录群', { primary: true }), chat('oc_b', '文档群')],
+        taskChats: [
+          { chatId: 'oc_a', kind: 'needs_you', reason: 'attention', at, detail: '要不要合？' },
+          { chatId: 'oc_b', kind: 'unreadable' },
+        ],
+        taskHint: { kind: 'task_needs_you', chatId: 'oc_a', at, key: 'task:needs_you:s:1', detail: '要不要合？' },
+      } as never,
+      32: { links: [chat('oc_a', '修登录群')] },
+    });
+    await openDetail(31);
+    const items = renderer!.root.findAll(n => n.type === 'li' && n.props.className === 'dboard-task');
+    expect(items.map(i => i.props['data-task'])).toEqual(['needs_you', 'unreadable']);
+    expect(textOf(items[0]!)).toContain('修登录群');
+    expect(textOf(items[0]!)).toContain('要不要合？');
+    expect(textOf(items[1]!)).toContain(zh('decisionBoard.taskUnreadable'));
+    expect(text()).toContain(zh('decisionBoard.taskHintDetail', { label: zh('decisionBoard.taskHintNeedsYou') }));
+    // 进群链接只在上面的群列表里出现一次。
+    expect(chatAnchors().map(a => a.props['data-chat'])).toEqual(['oc_a', 'oc_b']);
+    act(() => renderer!.unmount());
+    await openDetail(32);
+    expect(renderer!.root.findAll(n => n.props.className === 'dboard-tasks')).toEqual([]);
+    expect(renderer!.root.findAll(n => n.props['data-task-hint'])).toEqual([]);
   });
 });

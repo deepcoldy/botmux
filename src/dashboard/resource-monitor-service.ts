@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { DaemonInfo } from './registry.js';
 import { join } from 'node:path';
 import { config } from '../config.js';
 import {
@@ -132,6 +133,8 @@ function nonEmptyString(value: unknown): string | undefined {
 export function buildResourceMonitorDaemonSeeds(
   configs: ResourceMonitorBotConfigRow[],
   onlineRows: ResourceMonitorDashboardDaemonRow[],
+  /** Unified appId → display name (services/bot-display-name.ts); wins when it has a name. */
+  nameOf?: (larkAppId: string) => string | undefined,
 ): ResourceDaemonSeed[] {
   const onlineByAppId = new Map<string, ResourceMonitorDashboardDaemonRow>();
   for (const row of onlineRows) {
@@ -145,7 +148,8 @@ export function buildResourceMonitorDaemonSeeds(
     const online = onlineByAppId.get(larkAppId);
     return [toResourceMonitorDaemonSeed({
       larkAppId,
-      botName: nonEmptyString(online?.botName)
+      botName: nonEmptyString(nameOf?.(larkAppId))
+        ?? nonEmptyString(online?.botName)
         ?? nonEmptyString(cfg.displayName)
         ?? nonEmptyString(cfg.name)
         ?? larkAppId,
@@ -168,9 +172,15 @@ export async function handleResourceMonitorApi(
   res: ServerResponse,
   url: URL,
   service: ResourceMonitorService,
+  listOnline: () => Pick<DaemonInfo, 'larkAppId' | 'botName' | 'larkConnection'>[] = () => [],
 ): Promise<boolean> {
   if (req.method === 'GET' && url.pathname === '/api/resources/current') {
-    json(res, 200, service.current());
+    // Transport health comes from daemon heartbeats, even on hosts without a
+    // process sampler. Project only operator-visible fields from the descriptor.
+    const larkConnections = listOnline().map(({ larkAppId, botName, larkConnection }) => ({
+      larkAppId, botName, larkConnection,
+    }));
+    json(res, 200, { ...service.current(), larkConnections });
     return true;
   }
   if (req.method === 'GET' && url.pathname === '/api/resources/history') {

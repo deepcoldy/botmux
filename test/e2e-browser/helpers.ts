@@ -26,8 +26,13 @@ export const BROWSER_CONFIG = {
   locale: 'zh-CN',
 };
 
-/** All bot display names available for testing (except Gemini). */
-export const BOT_NAMES = ['Claude', 'CoCo', 'Codex', 'OpenCode', 'Aiden'] as const;
+/**
+ * The test bots, named after their CLI. Claude, Codex and the public CLIs of
+ * the core-clis lane run on CI against the mock LLM; ClaudeSandbox is Claude
+ * Code with `sandbox: true` (core-sandbox lane); Aiden and CoCo are internal
+ * CLIs that only run where they are installed.
+ */
+export const BOT_NAMES = ['Claude', 'CoCo', 'Codex', 'OpenCode', 'Aiden', 'Pi', 'OhMyPi', 'Kimi', 'Antigravity', 'Grok', 'ClaudeSandbox'] as const;
 export type BotName = (typeof BOT_NAMES)[number];
 
 // ---------------------------------------------------------------------------
@@ -163,15 +168,15 @@ export function createAgent(page: Page): PlaywrightAgent {
 // CI), so pages load one at a time; a loaded page then works normally.
 let messengerLoadQueue: Promise<void> = Promise.resolve();
 
-function messengerShellReady(requireChatList: boolean): boolean {
+function messengerShellReady({ requireChatList, names }: { requireChatList: boolean; names: string[] }): boolean {
   const title = document.title;
   const titleReady = /messenger|飞书|lark/i.test(title);
   const body = document.body?.innerText ?? '';
   const searchReady = /search|搜索/i.test(body);
   const messengerReady = /messenger|消息/i.test(body);
   // The shell renders before the chat list; skeleton rows carry no text, so
-  // require a real chat entry (every test account has [Botmux] bot DMs).
-  const chatListReady = !requireChatList || body.includes('[Botmux]');
+  // require a real chat entry (every test account has the bot DMs).
+  const chatListReady = !requireChatList || names.some((name) => body.includes(name));
   return titleReady && searchReady && messengerReady && chatListReady;
 }
 
@@ -199,7 +204,11 @@ async function loadMessenger(page: Page, url: string): Promise<void> {
     });
     try {
       // A deep link (the test group) may open a view without the chat list.
-      await page.waitForFunction(messengerShellReady, url === getMessengerUrl(), { timeout: MESSENGER_LOAD_WAIT_MS });
+      await page.waitForFunction(
+        messengerShellReady,
+        { requireChatList: url === getMessengerUrl(), names: BOT_NAMES.flatMap(botDisplayNames) },
+        { timeout: MESSENGER_LOAD_WAIT_MS },
+      );
       return;
     } catch {
       console.warn(`[e2e] Feishu Messenger chat list not loaded (attempt ${attempt}/${MESSENGER_LOAD_ATTEMPTS}); reopening`);
@@ -217,17 +226,24 @@ async function loadMessenger(page: Page, url: string): Promise<void> {
  * Falls back to Feishu search (Ctrl+K) if not visible in sidebar.
  */
 /**
- * Display name of the Botmux bot conversation in Feishu.
+ * Display names the bot's Feishu app may have, preferred first.
  *
- * The test account also has same-named *native* Feishu AI agents (labelled
- * 智能体, e.g. a DM literally named "codex"/"claude") that never reply to
- * botmux traffic. The Botmux-backed bots are the conversations explicitly
- * named `[Botmux]<Name>` with a 机器人/Bot badge. Opening the bare name makes
- * the visual agent click the native agent, so always resolve and match the
- * prefixed bot conversation.
+ * The test bots are named after their CLI (`Claude`, `Codex`, …). They used to
+ * be `[Botmux]<Name>`, and either may be live while the apps are renamed, so
+ * both are accepted. Names compare exactly and case-sensitively: the test
+ * tenant also holds unrelated apps such as `codex` and `Nash_Claude` that
+ * never answer botmux traffic. The badge does not tell them apart: apps that
+ * `botmux setup` creates from the agent template show 智能体, older ones 机器人.
  */
-export function botChatName(botName: string): string {
-  return botName.startsWith('[Botmux]') ? botName : `[Botmux]${botName}`;
+export function botDisplayNames(botName: string): string[] {
+  const bare = botName.replace(/^\[Botmux\]/, '');
+  return [bare, `[Botmux]${bare}`];
+}
+
+/** How the bot is described to the vision agent: either name counts. */
+function botNameForVision(botName: string): string {
+  const [bare, legacy] = botDisplayNames(botName);
+  return `"${bare}" 或 "${legacy}"（两个名字任意一个都算，飞书上可能还是旧名）`;
 }
 
 /** A text box of TITLE_BOXES: `onTop` when hit-testing its middle lands on it. */
@@ -236,7 +252,7 @@ export interface TitleBox extends ScreenBox {
 }
 
 /**
- * The chat list's entry titled exactly `[Botmux]<Name>`: on top, left of 30%
+ * The chat list's entry titled exactly with the bot's name: on top, left of 30%
  * of the width (the main area shows the name too, as its title and as the
  * bot's sender line). Text scrolled out of the list is not on top. A pinned
  * shortcut ahead of the list, if it holds the full name, opens the same chat.
@@ -284,22 +300,23 @@ export async function openChat(
   // Concurrent lanes share this bot's DM; a case that switches its DM mode
   // holds the lease exclusively (see chat-lease.ts).
   await holdLeaseForPage(page, dmLeaseKey(botName.replace(/^\[Botmux\]/, '')), 'shared');
-  // Match the Botmux-backed bot conversation, never the same-named native AI
-  // agent. The display name is `[Botmux]<Name>` and it carries a Bot badge
-  // (机器人), whereas the native agent is labelled 智能体 and has no prefix.
-  const chatName = botChatName(botName);
-  if (await openChatFromList(page, chatName)) return;
+  // Match the bot conversation by its exact name, never a similarly named
+  // native AI agent (智能体 badge) or another app (see botDisplayNames).
+  const names = botDisplayNames(botName);
+  for (const chatName of names) {
+    if (await openChatFromList(page, chatName)) return;
+  }
+  const described = botNameForVision(botName);
   let opened = false;
   // The entry is not listed (or did not open): ask the vision agent.
   try {
     await agent.aiAct(
-      `在左侧"消息"列表或其置顶会话中，点击 Botmux 机器人的私聊会话 ` +
-        `"${chatName}"（名称以 [Botmux] 开头、带"机器人/Bot"徽标）。` +
-        `不要点同名的原生智能体（名称只有"${botName}"、带"智能体"徽标、没有 [Botmux] 前缀），` +
-        '也不要点话题里的消息或群聊。',
+      `在左侧"消息"列表或其置顶会话中，点击私聊会话 ${described}` +
+        '（名称大小写完全一致；徽标可能是"机器人"也可能是"智能体"，两者都可以）。' +
+        '不要点名称相近的其它会话（例如大小写不同、多了前后缀），也不要点话题里的消息或群聊。',
     );
     await agent.aiWaitFor(
-      `右侧聊天区域顶部标题栏显示 Botmux 机器人会话名"${chatName}"，而不是名称仅为"${botName}"的原生智能体`,
+      `右侧聊天区域顶部标题栏的会话名是 ${described}，大小写完全一致`,
       { timeoutMs: 8_000, checkIntervalMs: 2_000 },
     );
     opened = true;
@@ -311,18 +328,18 @@ export async function openChat(
     // Chat not visible or direct click failed — use search to find it
     await page.keyboard.press('Control+k');
     await page.waitForTimeout(1000);
-    await page.keyboard.type(chatName);
+    await page.keyboard.type(names[0]);
     await page.waitForTimeout(2000);
     await agent.aiAct(
-      `在搜索结果中点击 Botmux 机器人会话 "${chatName}"（[Botmux] 前缀、机器人徽标），` +
-        `不要点名称仅为"${botName}"的原生智能体。`,
+      `在搜索结果中点击会话 ${described}（名称大小写完全一致，徽标是"机器人"或"智能体"都可以），` +
+        '不要点名称相近（大小写不同、多了前后缀）的其它会话。',
     );
     // Close search overlay if still open
     await page.keyboard.press('Escape');
     await page.waitForTimeout(500);
     // Wait for chat to load
     await agent.aiWaitFor(
-      `右侧聊天区域顶部标题栏显示 Botmux 机器人会话名"${chatName}"，而不是名称仅为"${botName}"的原生智能体`,
+      `右侧聊天区域顶部标题栏的会话名是 ${described}，大小写完全一致`,
       { timeoutMs: 15_000, checkIntervalMs: 3_000 },
     );
   }
@@ -475,7 +492,7 @@ export interface MentionListSnapshot {
  * apart from the chat's sender labels: its rows are the fresh ones. A string
  * for the same reason as FIND_EDITOR.
  */
-const MENTION_LIST = `(({ name, bare, mark, before }) => {
+const MENTION_LIST = `(({ names, mark, before }) => {
   const editor = ${FIND_EDITOR};
   if (!editor) return null;
   const clean = (text) => (text || '').replace(/[\\u200b-\\u200d\\u2060\\ufeff]/g, '').replace(/\\s+/g, ' ').trim();
@@ -506,10 +523,11 @@ const MENTION_LIST = `(({ name, bare, mark, before }) => {
     }
     return found;
   };
-  // A row may hold the badge too (「[Botmux]Claude 机器人 | Claude」), or split
-  // the name around the highlighted query; the name must still lead it.
-  const isName = (text) => text === name || (text.startsWith(name) && !/^[\w-]/.test(text.slice(name.length)));
-  const options = find(isName, ['Botmux', bare]);
+  // A row may hold the badge too (「Claude 机器人 | Claude」), or split the
+  // name around the highlighted query; the name must still lead it.
+  const leads = (text, name) => text === name || (text.startsWith(name) && !/^[\w-]/.test(text.slice(name.length)));
+  const isName = (text) => names.some((name) => leads(text, name));
+  const options = find(isName, names);
   if (before) {
     // Per attempt: a node the list reuses across attempts must count as new.
     for (const el of document.querySelectorAll('[' + mark + ']')) el.removeAttribute(mark);
@@ -528,7 +546,7 @@ const MENTION_LIST = `(({ name, bare, mark, before }) => {
 const MENTION_MARK = 'data-e2e-before-mention';
 
 async function mentionList(page: Page, name: string, before = false): Promise<MentionListSnapshot | null> {
-  const args = { name: botChatName(name), bare: name, mark: MENTION_MARK, before };
+  const args = { names: botDisplayNames(name), mark: MENTION_MARK, before };
   return page.evaluate(`(${MENTION_LIST})(${JSON.stringify(args)})`);
 }
 
@@ -752,15 +770,36 @@ async function describeMentionList(page: Page, name: string): Promise<string> {
   );
 }
 /**
- * The input holds exactly one mention and it is `botName`. A selected mention
- * renders the member's display name (`[Botmux]<Name>`); the filter query typed
- * after `@` is the bare name, so an unselected query never passes. `@@` means
- * a stray literal `@` stayed in front of the chip, which breaks command parsing.
+ * The input holds exactly one mention and it is `botName`. `chips` are the
+ * texts of the editor's mention chips (MENTION_CHIPS): a selected member
+ * becomes a non-editable chip reading `@<display name>`, while the filter
+ * query typed after `@` stays plain text, so an unselected query never passes
+ * even though it reads the same. `@@` in the input means a stray literal `@`
+ * stayed in front of the chip, which breaks command parsing.
  */
-export function holdsOnlyMention(text: string, botName: string): boolean {
-  // `[Botmux]Claude` in the editor; `BotmuxClaude` where brackets are dropped.
-  const mentioned = [...text.matchAll(/\[?Botmux\]?\s*([A-Za-z][\w-]*)/g)].map((match) => match[1]);
-  return mentioned.length === 1 && mentioned[0] === botName && !text.includes('@@');
+export function holdsOnlyMention(chips: readonly string[], text: string, botName: string): boolean {
+  const names = botDisplayNames(botName).map((name) => `@${name}`);
+  return chips.length === 1 && names.includes(chips[0].trim()) && !text.includes('@@');
+}
+
+/**
+ * In-page: texts of the mention chips in the message editor. Feishu renders a
+ * picked member as `<span contenteditable="false">…<bdi>@Name</bdi>…</span>`;
+ * the placeholder is non-editable too but does not start with `@`. A string
+ * for the same reason as FIND_EDITOR.
+ */
+const MENTION_CHIPS = `(() => {
+  const editor = ${FIND_EDITOR};
+  if (!editor) return [];
+  return [...editor.querySelectorAll('[contenteditable="false"]')]
+    .filter((el) => !el.parentElement?.closest('[contenteditable="false"]'))
+    .map((el) => (el.textContent || '').replace(/[\u200b-\u200d\u2060\ufeff]/g, '').trim())
+    .filter((text) => text.startsWith('@'));
+})()`;
+
+async function inputHoldsOnlyMention(page: Page, botName: string): Promise<boolean> {
+  const chips = ((await page.evaluate(MENTION_CHIPS).catch(() => [])) ?? []) as string[];
+  return holdsOnlyMention(chips, await focusedInputText(page), botName);
 }
 
 /**
@@ -1112,9 +1151,9 @@ async function typeMention(
       await page.waitForTimeout(600);
       text = await focusedInputText(page);
       if (
-        holdsOnlyMention(text, name) &&
+        (await inputHoldsOnlyMention(page, name)) &&
         (await typeVerified(page, ` ${message}${message.startsWith('/') ? ' ' : ''}`, 20, text)) &&
-        holdsOnlyMention(await focusedInputText(page), name)
+        (await inputHoldsOnlyMention(page, name))
       ) {
         await page.keyboard.press('Enter');
         await page.waitForTimeout(1_000);
@@ -1122,14 +1161,14 @@ async function typeMention(
       }
     } else {
       console.warn(
-        `[e2e] @${name}: the member list never offered ${botChatName(name)} (attempt ${attempt}): ` +
+        `[e2e] @${name}: the member list never offered ${botDisplayNames(name).join(' / ')} (attempt ${attempt}): ` +
           (await describeMentionList(page, name)),
       );
     }
     text = await focusedInputText(page);
     console.warn(`[e2e] @${name} selection attempt ${attempt} left the input as ${JSON.stringify(text)}; retrying`);
   }
-  throw new Error(`Could not mention ${botChatName(name)}: the input still read ${JSON.stringify(text)}`);
+  throw new Error(`Could not mention ${name}: the input still read ${JSON.stringify(text)}`);
 }
 
 /** @mention `botName` from the reply input of the topic open in the main area. */
@@ -1909,6 +1948,35 @@ export async function revealNewMessages(page: Page): Promise<boolean> {
 }
 
 /** Occurrences of `text` in the rendered page text, including off-screen parts. */
+/**
+ * Text nodes on the page that hold `marker` outside the prompt asking for it.
+ * The prompt quotes the same ACK inside its instruction (「请立刻调用 botmux
+ * send …」), and the chat list previews it; the reply bubble only carries the
+ * marker, possibly after an @mention in its own element.
+ */
+export async function replyMarkerCount(page: Page, marker: string): Promise<number> {
+  return page.evaluate((wanted) => {
+    let count = 0;
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) {
+      const text = (walker.currentNode as Text).data;
+      if (text.includes(wanted) && !text.includes('请立刻调用') && !text.includes('请在最终回复中')) count += 1;
+    }
+    return count;
+  }, marker);
+}
+
+/** Wait until the bot's reply carrying `marker` is on the page (replyMarkerCount). */
+export async function waitForReplyMarker(page: Page, marker: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if ((await replyMarkerCount(page, marker).catch(() => 0)) > 0) return;
+    await scrollConversation(page);
+    await page.waitForTimeout(3_000);
+  }
+  throw new Error(`No reply carrying "${marker}" outside the prompt appeared within ${timeoutMs}ms`);
+}
+
 export async function pageTextCount(page: Page, text: string): Promise<number> {
   return (await page.locator('body').innerText()).split(text).length - 1;
 }

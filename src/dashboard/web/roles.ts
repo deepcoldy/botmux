@@ -4,6 +4,7 @@ import type {
 } from './role-profile-match.js';
 import { effectiveRoleKey, loadEffectiveRoleMap } from './role-batch.js';
 import { readJson } from './dashboard-api.js';
+import type { ListenerContentPolicy } from '../../services/message-listener-content-policy.js';
 
 export interface BotInfo {
   larkAppId: string;
@@ -69,12 +70,8 @@ export interface MessageListenerData {
    * V1 is keyword-only: regexes are not evaluated on the daemon main loop
    * (catastrophic-backtracking DoS risk).
    */
-  contentPolicy?: {
-    includeKeywords?: string[];
-    matchMode?: 'any' | 'all';
-    resolveDocumentTitles?: boolean;
-  };
-  replyPolicy?: { mode?: 'thread' | 'chat'; sessionMode?: 'per_message' };
+  contentPolicy?: ListenerContentPolicy;
+  replyPolicy?: { mode?: import('../../services/message-listener-reply-policy.js').MessageListenerReplyMode; sessionMode?: 'per_message' };
 }
 
 export function mergeListenerContentPolicy(
@@ -95,7 +92,7 @@ export interface MessageListenerPreviewItem {
   senderType: 'user' | 'bot';
 }
 
-export type MessageListenerRunPreviewState = 'triggered' | 'running' | 'replied' | 'failed';
+export type MessageListenerRunPreviewState = import('../../services/message-listener-run-preview-store.js').MessageListenerRunPreviewState;
 
 export interface MessageListenerRunPreviewResult {
   runId?: string;

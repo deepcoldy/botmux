@@ -1,6 +1,10 @@
 import { sanitizePerBotEnv, isReservedPerBotEnvKey } from './per-bot-env.js';
 import { BOTMUX_INJECTED_ENV_KEYS, WORKFLOW_WORKER_ENV_KEYS, redactChildEnv } from '../utils/child-env.js';
 import { applySessionEnvUnset } from './session-env.js';
+import {
+  protectedMcpRedactedEnvKeys,
+  type ProtectedMcpWorkerPolicy,
+} from './protected-mcp-capabilities.js';
 
 /** Secret-free per-bot inheritance policy. Missing means historical inheritance. */
 export interface EnvPolicy {
@@ -17,6 +21,10 @@ export const STRICT_ENV_BASELINE = [
   'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR',
   'SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT', 'USERPROFILE',
 ] as const;
+// scripts/fenced-run.ts marks its whole process tree; a strict boundary that
+// dropped the mark would let scope code derive the real user bus again
+// (session-scope.ts userSystemdBusEnv). BOTMUX* names cannot be granted via inherit.
+const FENCE_MARKER_KEYS = ['BOTMUX_FENCED_RUN'] as const;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const PROCESS_HOME_KEYS = new Set(['GROK_HOME', 'DSH_HOME', 'LARKSUITE_CLI_DATA_DIR']);
 
@@ -43,7 +51,7 @@ export function inheritBotEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): Node
   if (normalized?.mode !== 'strict') return { ...base };
   const out: NodeJS.ProcessEnv = {};
   // Revalidate at IPC boundaries: malformed strict config must never widen it.
-  for (const key of [...STRICT_ENV_BASELINE, ...(normalized.inherit ?? [])]) {
+  for (const key of [...STRICT_ENV_BASELINE, ...FENCE_MARKER_KEYS, ...(normalized.inherit ?? [])]) {
     if (base[key] !== undefined) out[key] = base[key];
   }
   return out;
@@ -59,6 +67,7 @@ export function buildSessionChildEnv(
   base: NodeJS.ProcessEnv,
   policy?: EnvPolicy,
   unset?: readonly string[],
+  protectedMcpPolicy?: ProtectedMcpWorkerPolicy,
 ): NodeJS.ProcessEnv {
   const inherited = inheritBotEnv(base, policy);
   if (policy?.mode === 'strict') {
@@ -69,13 +78,17 @@ export function buildSessionChildEnv(
       if (base[key] !== undefined) inherited[key] = base[key];
     }
   }
-  const env = redactChildEnv(inherited);
+  const env = redactChildEnv(inherited, protectedMcpRedactedEnvKeys(protectedMcpPolicy));
   applySessionEnvUnset(env, unset);
   return env;
 }
 
 /** Worker control process retains Botmux control knobs, never business env. */
-export function buildBotWorkerEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): NodeJS.ProcessEnv {
+export function buildBotWorkerEnv(
+  base: NodeJS.ProcessEnv,
+  policy?: EnvPolicy,
+  protectedMcpPolicy?: ProtectedMcpWorkerPolicy,
+): NodeJS.ProcessEnv {
   const env = inheritBotEnv(base, policy);
   if (policy?.mode === 'strict') {
     for (const key of [...BOTMUX_INJECTED_ENV_KEYS, ...WORKFLOW_WORKER_ENV_KEYS,
@@ -98,6 +111,10 @@ export function buildBotWorkerEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): 
       if (base[key] !== undefined) env[key] = base[key];
     }
   }
+  // Apply dynamic capability redaction last: a protected source may share a
+  // name with a normally retained worker control key (for example under a
+  // strict policy), and the protected boundary must win that collision.
+  for (const key of protectedMcpRedactedEnvKeys(protectedMcpPolicy)) delete env[key];
   return env;
 }
 
@@ -112,7 +129,12 @@ export function buildBotWorkerEnv(base: NodeJS.ProcessEnv, policy?: EnvPolicy): 
  * env to a direct git-running process without that step are known uncovered
  * one-shot/probe paths (follow-up after #2203).
  */
-export function botInjectedEnv(raw: unknown, policy?: EnvPolicy): Record<string, string> {
-  const env = sanitizePerBotEnv(raw);
+export function botInjectedEnv(
+  raw: unknown,
+  policy?: EnvPolicy,
+  protectedMcpPolicy?: ProtectedMcpWorkerPolicy,
+): Record<string, string> {
+  const protectedKeys = protectedMcpRedactedEnvKeys(protectedMcpPolicy);
+  const env = sanitizePerBotEnv(raw, protectedKeys);
   return (policy?.mode === 'strict' ? redactChildEnv(env) : env) as Record<string, string>;
 }

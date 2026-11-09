@@ -9,6 +9,7 @@
 import { describe, it, expect } from 'vitest';
 import { parseApiMessage, extractCardContent, extractResources, parseEventMessage, stripLeadingMentions, stripBotMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER, isPlaceholderOnlyText, extractAuthoredMessageText, rawPlaceholderText, resolveMentions } from '../src/im/lark/message-parser.js';
 import { buildMarkdownCard, buildReplyCardFooter, REPLY_CARD_FOOTER_MARKER } from '../src/im/lark/md-card.js';
+import { buildStreamingCard } from '../src/im/lark/card-builder.js';
 import { stampBotmuxCallbackMarkers, hasBotmuxCallbackMarker, BOTMUX_CALLBACK_MARKER_KEY } from '../src/im/lark/callback-button-marker.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -1325,6 +1326,27 @@ describe('botmux internal callback buttons (🔊 语音总结 …) dropped from 
     };
     const result = parseApiMessage(makeMsg('interactive', card));
     expect(result.content).not.toContain('未来按钮');
+  });
+
+  it('real streaming card with the key grid open: the keys toggle, key grid and 更多操作 panel do not leak unstamped', () => {
+    const card = buildStreamingCard(
+      'sid-1', 'om-1', 'https://term.example/t', 'title', 'screen text', 'working',
+      'claude-code', 'screenshot', 'nonce-1', undefined, false, false, 'zh', undefined,
+      undefined, true, undefined, undefined, undefined, undefined, undefined,
+      [], false, undefined, true,
+    );
+    expect(card).toContain('"toggle_keys_panel"');
+    expect(card).toContain('"term_action"');
+    expect(card).toContain('"collapsible_panel"');
+    const result = parseApiMessage(makeMsg('interactive', card));
+    expect(result.content).toContain('[🖥️ 打开 Web 终端](https://term.example/t)');
+    expect(result.content).not.toContain('终端按键');
+    for (const key of ['×', '^C', '⇥', '␣', '↵', '←', '↑', '↓', '→', '▲', '▼']) {
+      expect(result.content).not.toContain(`[${key}]`);
+    }
+    expect(card).toContain('隐藏输出');
+    expect(result.content).not.toContain('隐藏输出');
+    expect(result.content).not.toContain('导出文字');
   });
 
   it('roundtrip: every callback button in a real egress-stamped card vanishes, jump URL stays', () => {

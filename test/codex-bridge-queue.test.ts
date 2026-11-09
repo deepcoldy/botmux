@@ -5,6 +5,7 @@ import {
   STRUCTURED_TASK_START_CORROBORATION_GRACE_MS,
   STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS,
   STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS,
+  selectStaleRestoredJournalTurns,
 } from '../src/services/codex-bridge-queue.js';
 import { buildBridgeSendMarkerContent, shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import type { CodexBridgeEvent } from '../src/services/codex-transcript.js';
@@ -1223,6 +1224,20 @@ describe('CodexBridgeQueue', () => {
     ]);
   });
 
+  it('a replayed attempt terminal never satisfies an exact-attempt lookup for the retired attempt', () => {
+    // #2648 follow-up: a stale deferred submit timer keeps the OLD
+    // dispatchAttempt. Once a replay with the same turnId has run and closed,
+    // hasTerminalTurn must answer only for the new attempt — otherwise the
+    // stale timer would settle against the replacement delivery.
+    const q = new CodexBridgeQueue();
+    q.mark('delivery', 'same durable body', 100, 1);
+    expect(q.dropPendingTurn('delivery', 1, true)?.turnId).toBe('delivery');
+    q.mark('delivery', 'same durable body', 200, 2);
+    q.ingest([userEv('same durable body', 'u2', 300), asstEv('done', 'a2', 400)]);
+    expect(q.hasTerminalTurn('delivery', 2)).toBe(true);
+    expect(q.hasTerminalTurn('delivery', 1)).toBe(false);
+  });
+
   it('does not let stale submit lifecycle callbacks mutate a replay attempt with the same turnId', () => {
     const q = new CodexBridgeQueue();
     q.mark('same-turn', 'durable prompt', 100, 1);
@@ -2055,5 +2070,31 @@ describe('input the CLI holds in its own queue', () => {
     expect(q.peek().map(turn => turn.cliQueuedAtMs !== undefined)).toEqual([true, false]);
     q.ingest([queuedEv('queued-2', now + 400)]);
     expect(q.peek().map(turn => turn.cliQueuedAtMs !== undefined)).toEqual([true, true]);
+  });
+});
+
+describe('selectStaleRestoredJournalTurns — cold-resume stale-turn retirement', () => {
+  const turn = (overrides: Partial<import('../src/services/codex-bridge-queue.js').CodexPendingTurn>)
+    : import('../src/services/codex-bridge-queue.js').CodexPendingTurn => ({
+      turnId: 'om_x',
+      started: false,
+      restoredFromJournal: true,
+      ...overrides,
+    });
+  it.each([
+    ['started', { started: true }],
+    ['rpcActive', { started: false, rpcActive: true }],
+    ['cliQueuedAtMs', { cliQueuedAtMs: 1 }],
+    ['submitConfirmedAtMs', { submitConfirmedAtMs: 1 }],
+    ['submitVerificationStartedAtMs', { submitVerificationStartedAtMs: 1 }],
+  ] as const)('retires a journal mark the dead process had already accepted via %s', (_label, overrides) => {
+    expect(selectStaleRestoredJournalTurns([turn(overrides)]).map(t => t.turnId)).toEqual(['om_x']);
+  });
+  it.each([
+    ['bare mark never reached the transcript', {}, 'retained'],
+    ['started turn already has a final', { started: true, finalText: 'done' }, 'retained'],
+    ['new-generation mark without journal provenance', { started: true, restoredFromJournal: undefined }, 'retained'],
+  ] as const)('keeps a %s', (_label, overrides) => {
+    expect(selectStaleRestoredJournalTurns([turn(overrides)])).toEqual([]);
   });
 });

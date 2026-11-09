@@ -17,6 +17,8 @@ import {
   decorateResumeForWrapper,
   isTtadkWrapper,
   ttadkAcceptsModel,
+  wrapperIdentityTokens,
+  wrapperLaunchEnv,
   ttadkConfigModelChoices,
   TTADK_DEFAULT_MODEL,
   TTADK_MODEL_SUGGESTIONS,
@@ -53,9 +55,9 @@ describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
     const aiden = CLI_SELECT_TREE.find((g) => g.key === 'aiden');
     expect(aiden?.children?.map((c) => c.key)).toEqual(['aiden', 'aiden-x-claude', 'aiden-x-codex']);
     // an ungrouped top entry is a directly-selectable leaf
-    const gemini = CLI_SELECT_TREE.find((g) => g.key === 'gemini');
-    expect(gemini?.option?.cliId).toBe('gemini');
-    expect(gemini?.children).toBeUndefined();
+    const kimi = CLI_SELECT_TREE.find((g) => g.key === 'kimi');
+    expect(kimi?.option?.cliId).toBe('kimi');
+    expect(kimi?.children).toBeUndefined();
   });
 
   it('cascades Codex into one submenu of Codex + Codex App (no top-level codex-app)', () => {
@@ -159,21 +161,21 @@ describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
     expect(cjadk?.option).toBeUndefined();
   });
 
-  it('appends the six ttadk gateway options after cjadk', () => {
+  it('appends the five ttadk gateway options after cjadk', () => {
     const keys = CLI_SELECT_OPTIONS.map((o) => o.key);
     expect(keys).toContain('ttadk-x-claude');
     const i = keys.indexOf('ttadk-x-claude');
-    expect(keys.slice(i, i + 6)).toEqual([
-      'ttadk-x-claude', 'ttadk-x-codex', 'ttadk-x-opencode', 'ttadk-x-coco', 'ttadk-x-cursor', 'ttadk-x-gemini',
+    expect(keys.slice(i, i + 5)).toEqual([
+      'ttadk-x-claude', 'ttadk-x-codex', 'ttadk-x-opencode', 'ttadk-x-coco', 'ttadk-x-cursor',
     ]);
     // ttadk comes after the cjadk block
     expect(keys.indexOf('ttadk-x-claude')).toBeGreaterThan(keys.indexOf('cjadk-x-codex'));
   });
 
-  it('cascades TTADK into a submenu of its six × variants', () => {
+  it('cascades TTADK into a submenu of its five × variants', () => {
     const ttadk = CLI_SELECT_TREE.find((g) => g.key === 'ttadk');
     expect(ttadk?.children?.map((c) => c.key)).toEqual([
-      'ttadk-x-claude', 'ttadk-x-codex', 'ttadk-x-opencode', 'ttadk-x-coco', 'ttadk-x-cursor', 'ttadk-x-gemini',
+      'ttadk-x-claude', 'ttadk-x-codex', 'ttadk-x-opencode', 'ttadk-x-coco', 'ttadk-x-cursor',
     ]);
     expect(ttadk?.option).toBeUndefined();
   });
@@ -182,7 +184,7 @@ describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
 describe('resolveCliSelection', () => {
   it('maps a plain cli key to just its cliId', () => {
     expect(resolveCliSelection('claude-code')).toEqual({ cliId: 'claude-code' });
-    expect(resolveCliSelection('gemini')).toEqual({ cliId: 'gemini' });
+    expect(resolveCliSelection('kimi')).toEqual({ cliId: 'kimi' });
   });
 
   it('maps aiden×claude to claude-code + wrapperCli "aiden x claude"', () => {
@@ -212,7 +214,6 @@ describe('resolveCliSelection', () => {
     expect(resolveCliSelection('ttadk-x-coco')).toEqual({ cliId: 'coco', wrapperCli: 'ttadk coco' });
     // Cursor uses ttadk's `cursor-cli` subcommand but the botmux adapter is still `cursor`.
     expect(resolveCliSelection('ttadk-x-cursor')).toEqual({ cliId: 'cursor', wrapperCli: 'ttadk cursor-cli' });
-    expect(resolveCliSelection('ttadk-x-gemini')).toEqual({ cliId: 'gemini', wrapperCli: 'ttadk gemini' });
   });
 
   it('throws on an unknown key', () => {
@@ -980,7 +981,7 @@ describe('isTtadkWrapper / ttadkAcceptsModel', () => {
   it('reports which ttadk subcommands accept -m', () => {
     expect(ttadkAcceptsModel('ttadk claude')).toBe(true);
     expect(ttadkAcceptsModel('ttadk cursor-cli')).toBe(true);
-    expect(ttadkAcceptsModel('ttadk gemini')).toBe(true);
+    expect(ttadkAcceptsModel('ttadk opencode')).toBe(true);
     expect(ttadkAcceptsModel('ttadk coco')).toBe(false);
     expect(ttadkAcceptsModel('cjadk claude')).toBe(false);
     expect(ttadkAcceptsModel(undefined)).toBe(false);
@@ -1082,5 +1083,70 @@ describe('Codex model-nudge override through wrappers', () => {
         expect(out.args).toContain('model.name=coco-model');
       }
     }
+  });
+});
+
+describe('wrapper launcher written as an absolute path', () => {
+  it('identifies the launcher by its file name only', () => {
+    expect(wrapperIdentityTokens('/opt/aiden/bin/aiden x claude')).toEqual(['aiden', 'x', 'claude']);
+    expect(wrapperIdentityTokens('  aiden   x codex ')).toEqual(['aiden', 'x', 'codex']);
+    expect(wrapperIdentityTokens('/home/aiden/bin/claude-w --fast')).toEqual(['claude-w', '--fast']);
+    expect(wrapperIdentityTokens(undefined)).toEqual([]);
+  });
+
+  it('strips --settings for an absolute-path aiden x claude and spawns that exact path', () => {
+    const out = buildWrappedLaunch('/opt/aiden/bin/aiden x claude', ['--session-id', 'sid', '--settings', '{}', '--plugin-dir', '/p'], (b) => `resolved:${b}`);
+    expect(out.bin).toBe('resolved:/opt/aiden/bin/aiden');
+    expect(out.args).toEqual(['x', 'claude', '--session-id', 'sid', '--plugin-dir', '/p']);
+  });
+
+  it('routes an absolute-path aiden x codex through the aiden codex rewrite', () => {
+    const out = buildWrappedLaunch('/opt/aiden/bin/aiden x codex', [
+      '-c', 'check_for_update_on_startup=false', '--no-alt-screen', '-C', '/repo',
+    ]);
+    expect(out.bin).toBe('/opt/aiden/bin/aiden');
+    expect(out.args).toEqual(['x', 'codex', '--no-alt-screen', '-C', '/repo']);
+
+    const withEffort = buildWrappedLaunch(
+      '/opt/aiden/bin/aiden x codex',
+      ['-c', 'model_reasoning_effort="high"', '--no-alt-screen'],
+      (bin) => bin,
+      { aidenCodexShimDir: '/botmux/shim', aidenCodexRealBin: '/resolved/codex' },
+    );
+    expect(withEffort.bin).toBe('/botmux/shim/launch');
+    expect(withEffort.args).toEqual(['/opt/aiden/bin/aiden', 'x', 'codex', '--no-alt-screen']);
+    expect(withEffort.env).toMatchObject({
+      BOTMUX_AIDEN_CODEX_REAL_BIN: '/resolved/codex',
+      BOTMUX_AIDEN_CODEX_REASONING_EFFORT: 'high',
+    });
+  });
+
+  it('rewrites -c to --config and disables the selector for an absolute-path cjadk codex', () => {
+    const out = buildWrappedLaunch('/usr/local/bin/cjadk codex', [
+      '-c', 'shell_environment_policy.set.BOTMUX_SESSION_ID="s"', '--no-alt-screen',
+    ]);
+    expect(out.bin).toBe('/usr/local/bin/cjadk');
+    expect(out.args).toEqual(['codex', '--config', 'shell_environment_policy.set.BOTMUX_SESSION_ID="s"', '--no-alt-screen']);
+    expect(wrapperLaunchEnv('/usr/local/bin/cjadk codex')).toEqual({ CJADK_INTERACTIVE: '0' });
+  });
+
+  it('injects the ttadk model flags and keeps the configured path for an absolute-path ttadk', () => {
+    expect(isTtadkWrapper('/opt/ttadk/bin/ttadk claude')).toBe(true);
+    expect(ttadkAcceptsModel('/opt/ttadk/bin/ttadk claude')).toBe(true);
+    const out = buildWrappedLaunch('/opt/ttadk/bin/ttadk claude', ['--resume', 'x'], (b) => b, { ttadkModel: 'glm-5.1' });
+    expect(out.bin).toBe('/opt/ttadk/bin/ttadk');
+    expect(out.args).toEqual(['claude', '-m', 'glm-5.1', '--skip-check', '--resume', 'x']);
+    expect(decorateResumeForWrapper('claude --resume ID', '/opt/ttadk/bin/ttadk claude', { ttadkModel: 'glm-5.1' }))
+      .toBe('/opt/ttadk/bin/ttadk claude -m glm-5.1 --skip-check --resume ID');
+  });
+
+  it('leaves launchers whose file name only resembles a known gateway untouched', () => {
+    const args = ['--settings', '{}', '-c', 'shell_environment_policy.set.BOTMUX_SESSION_ID="s"'];
+    for (const wrapper of ['/opt/aiden/bin/claude-w', '/opt/bin/aiden-beta x claude', '/opt/bin/cjadk2 codex']) {
+      const out = buildWrappedLaunch(wrapper, args);
+      expect(out.args.slice(-args.length)).toEqual(args);
+      expect(wrapperLaunchEnv(wrapper)).toBeUndefined();
+    }
+    expect(isTtadkWrapper('/opt/bin/ttadk-dev claude')).toBe(false);
   });
 });

@@ -1,5 +1,6 @@
 import type { CliId } from '../adapters/cli/types.js';
 import { CLI_DISPLAY_NAMES } from '../adapters/cli/display-names.js';
+import { RETIRED_CLIS, retiredCliNotice } from '../adapters/cli/retired-cli.js';
 import {
   dropConfiguredCliRuntime,
   normalizeCliRuntimeConfig,
@@ -19,7 +20,8 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '3': 'coco',
   '4': 'codex',
   '5': 'cursor',
-  '6': 'gemini',
+  // '6' 是已移除的 gemini（见 adapters/cli/retired-cli.ts），留空不复用：
+  // 老脚本喂 6 应当报错，而不是静默选中别的 CLI。
   '7': 'opencode',
   '8': 'antigravity',
   '9': 'mtr',
@@ -58,6 +60,7 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   '32': 'remote-runner',
   '33': 'codem',
   '34': 'zcode',
+  '35': 'doubao',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -84,8 +87,10 @@ export function resolveCliId(input: string | undefined): CliId | undefined {
   const mapped = CLI_ID_CHOICES[raw];
   if (mapped) return mapped;
   if (VALID_CLI_IDS.has(raw)) return raw as CliId;
+  const retiredId = Object.keys(RETIRED_CLIS).find(id => id === raw || RETIRED_CLIS[id]!.setupChoice === raw);
+  if (retiredId) throw new Error(retiredCliNotice(retiredId));
   // 序号上界从 CLI_ID_CHOICES 派生, 新增 CLI 时自动跟随, 不再手写硬编码区间.
-  const maxChoice = Object.keys(CLI_ID_CHOICES).length;
+  const maxChoice = Math.max(...Object.keys(CLI_ID_CHOICES).map(Number));
   throw new Error(
     `Unknown CLI 适配器 "${raw}"。请输入序号 1-${maxChoice} 或合法 ID 之一: ${[...VALID_CLI_IDS].join(', ')}`,
   );
@@ -217,6 +222,11 @@ export interface BotConfigEditInput {
    *   - null      → 清空（删字段，回到 CLI 默认）
    */
   model?: string | null;
+  /**
+   * 机器人首次上线后私聊 owner 的欢迎语（只发一次）。undefined 不动；
+   * '-' 或空串清空。
+   */
+  welcomeMessage?: string;
   backendType?: string;
   workingDir?: string;
   /**
@@ -428,6 +438,8 @@ export function parseBotSelection(
  *    talk + 自动开工，`defaultOncallAutoboundChats` 则相反，会让该群的自动
  *    绑定被误判成「已花掉」而不触发。`quotaFallbackBot` 也是源 Bot 的交接
  *    拓扑；复制到目标 Bot 可能变成自指或错误链路，必须由目标单独配置。
+ *    `extraScopesFile` 是源应用开放平台自动配置用过的清单；clone 建新应用时只申请
+ *    内置清单，继承路径会让新 Bot 的配置与它实际申请过的权限对不上。
  *
  * 单一真源：回归测试直接 import 本常量，避免测试再抄一份清单后与实现漂移
  * （新增实例态字段时两边都不报警）。新增此类字段请加在这里。
@@ -456,6 +468,7 @@ export const CLONE_EXCLUDED_KEYS = [
   'activationDeactivating',
   'activationStarting',
   'activationCommitted',
+  'extraScopesFile',
 ] as const;
 
 /**
@@ -647,6 +660,12 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
     if (v === '-') delete out.model;
     else if (v) out.model = v;
     else delete out.model;
+  }
+
+  if (input.welcomeMessage !== undefined) {
+    const v = input.welcomeMessage.trim();
+    if (!v || v === '-') delete out.welcomeMessage;
+    else out.welcomeMessage = v;
   }
 
   if (input.backendType !== undefined) {
