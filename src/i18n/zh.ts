@@ -1388,6 +1388,9 @@ export const messages: Record<string, string> = {
   // <whiteboard> 结构化块（session-manager.renderWhiteboardBlock，{id} 必填）
   'ai.whiteboard.block_read': '本地项目上下文；读取：`botmux whiteboard read --id {id} --json`（拿到 content 与 updatedAt）。',
   'ai.whiteboard.block_update': '更新状态：`botmux whiteboard update --id {id} --expected-updated-at <上次 read 的 updatedAt> <内容>`。',
+  // lead-only 负责人会话的守卫拒绝 --id，这两条替换上面两条
+  'ai.whiteboard.block_read_lead_only': '本地项目上下文；读取：`botmux whiteboard read --json`（拿到 content 与 updatedAt；本会话只能读写本群白板，不要带 --id）。',
+  'ai.whiteboard.block_update_lead_only': '更新状态：`botmux whiteboard update --expected-updated-at <上次 read 的 updatedAt> <内容>`。',
   'ai.whiteboard.block_rewrite': '更新前先用 `read --json` 拿到当前内容与 updatedAt，融合新信息后整体重写为一份完整的当前状态（默认中文；代码标识/命令/错误信息可保留原文），并用 `--expected-updated-at` 回传 read 到的版本号做并发冲突检测。',
   'ai.whiteboard.block_cas': '若更新报 `whiteboard_cas_mismatch`，说明期间有其它 agent 改过白板——重新 `read --json` 拿最新内容与 updatedAt，再次融合重写。',
   'ai.whiteboard.block_tail_send': '不要直接读写本地文件；不要写密钥/隐私；用户可见结论仍必须 `botmux send`。',

@@ -85,7 +85,7 @@ describe('isPlainBotmuxCommand (strict whitelist lexer)', () => {
   ])('denies %j', (cmd) => { expect(isPlainBotmuxCommand(cmd)).toBe(false); });
 });
 
-const DENIED_SUBCOMMANDS = ['task register t1', 'task start t1', 'task update t1 status=done', 'mcp serve', 'setup add', 'upgrade', 'restart', 'delete all', 'plugin init', 'schedule update x', 'workflow run', 'hook lead-only-guard', 'ask', 'daemon', 'whiteboard enable', 'whiteboard disable', 'whiteboard write --yes', 'whiteboard create', 'whiteboard path', 'wb enable', 'task list', 'task', 'help', 'whiteboard list', 'wb ls', 'whiteboard read --id wb_other', 'whiteboard update --id=wb_other x', 'whiteboard read --chat-id oc_other', 'whiteboard read --session-id s2', 'whiteboard read --lark-app-id cli_x', 'whiteboard current --id wb_other'];
+const DENIED_SUBCOMMANDS = ['task register t1', 'task start t1', 'task update t1 status=done', 'mcp serve', 'setup add', 'upgrade', 'restart', 'delete all', 'plugin init', 'schedule update x', 'workflow run', 'hook lead-only-guard', 'ask', 'daemon', 'whiteboard enable', 'whiteboard disable', 'whiteboard write --yes', 'whiteboard create', 'whiteboard path', 'wb enable', 'task list', 'task', 'help', 'whiteboard list', 'wb ls', 'whiteboard read --id wb_other', 'whiteboard update --id=wb_other x', 'whiteboard read --chat-id oc_other', 'whiteboard read --session-id s2', 'whiteboard read --lark-app-id cli_x', 'whiteboard read --app-id cli_x','whiteboard current --id wb_other'];
 const FILE_FLAG_CMDS = [
   'botmux whiteboard update --content-file /etc/passwd',
   'botmux whiteboard update --content-file=/x',
