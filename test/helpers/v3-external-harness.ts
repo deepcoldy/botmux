@@ -82,16 +82,41 @@ export class FakeExecutor implements V3ExternalNodeExecutor {
 }
 
 const bases: string[] = [];
+/** Teardown 总预算：只在真的撞 ENOTEMPTY/EBUSY 时才进入等待循环，正常路径零延迟。 */
+const CLEANUP_RETRY_BUDGET_MS = 30_000;
+const CLEANUP_RETRY_DELAY_MS = 250;
+const RETRYABLE_RMDIR_CODES = new Set(['ENOTEMPTY', 'EBUSY', 'EPERM']);
+
 /** Call from afterEach: removes every run dir created since the last call.
  *  A refusal the node daemon records fire-and-forget (a registry write behind
  *  `withFileLock` + an atomic rename) can still be landing when the test body
  *  returns. The write itself is quick, but acquiring its file lock on a
- *  loaded CI runner can take seconds; retry the removal generously instead
- *  of failing teardown with ENOTEMPTY (the first 10 × 50 ms budget still lost
- *  that race in CI twice). This is teardown only, so the wait is harmless. */
-export function cleanupBotRuns(): void {
-  for (const base of bases.splice(0)) {
-    rmSync(base, { recursive: true, force: true, maxRetries: 60, retryDelay: 100 });
+ *  loaded CI runner can take seconds.
+ *
+ *  Why a manual async loop instead of rmSync's built-in retries (#3235):
+ *  Node 22's rmSync only deletes children on the FIRST pass; later retries
+ *  re-attempt the rmdir alone and sleep synchronously for i*retryDelay before
+ *  attempt i (so the old 60×100ms actually blocked ~183s, not 6s). A file that
+ *  lands after the first pass is never re-deleted, and the blocking sleeps keep
+ *  the same-process fire-and-forget write from ever finishing — so a bigger
+ *  rmSync budget cannot win. Here every round re-runs the whole removal (picking
+ *  up late files) and `await`s between rounds, which yields the main thread so
+ *  the pending write can land. Bounded by a wall-clock cap; teardown-only. */
+export async function cleanupBotRuns(): Promise<void> {
+  const dirs = bases.splice(0);
+  const deadline = Date.now() + CLEANUP_RETRY_BUDGET_MS;
+  for (const base of dirs) {
+    for (;;) {
+      try {
+        // maxRetries:0 — one full pass per round; the outer async loop owns retries.
+        rmSync(base, { recursive: true, force: true, maxRetries: 0 });
+        break;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code ?? '';
+        if (!RETRYABLE_RMDIR_CODES.has(code) || Date.now() >= deadline) throw error;
+        await new Promise<void>(resolve => setTimeout(resolve, CLEANUP_RETRY_DELAY_MS));
+      }
+    }
   }
 }
 
