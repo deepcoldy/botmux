@@ -19869,6 +19869,7 @@ if (__entrySubcommand) {
   // help dump instead of a session, and nothing reported an error.
   else if (__entrySubcommand === 'codex-app-runner') await import('./codex-app-runner.js');
   else if (__entrySubcommand === 'minimax-runner') await import('./minimax-runner.js');
+  else if (__entrySubcommand === 'antigravity-runner') await import('./antigravity-runner.js');
   else if (__entrySubcommand === 'dsh-runner') await import('./dsh-runner.js');
   else if (__entrySubcommand === 'mira-runner') await import('./mira-runner.js');
   else if (__entrySubcommand === 'mir-runner') await import('./mir-runner.js');

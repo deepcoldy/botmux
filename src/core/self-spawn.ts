@@ -37,7 +37,7 @@ export type BotmuxEntry =
   // process.execPath and the runner is argv[0]). They need the same treatment for
   // the same reason — see RUNNER_ENTRIES below.
   | 'codex-app-runner' | 'dsh-runner' | 'mira-runner' | 'mir-runner'
-  | 'minimax-runner' | 'lark-tool-runner' | 'cli-identity-runner';
+  | 'minimax-runner' | 'antigravity-runner' | 'lark-tool-runner' | 'cli-identity-runner';
 
 /** Hidden CLI subcommand that runs a given entry inline (see cli.ts dispatch). */
 const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
@@ -56,6 +56,7 @@ const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
   'mira-runner': '__mira-runner',
   'mir-runner': '__mir-runner',
   'minimax-runner': '__minimax-runner',
+  'antigravity-runner': '__antigravity-runner',
   'lark-tool-runner': '__lark-tool-runner',
   'cli-identity-runner': '__cli-identity-runner',
 };
@@ -77,6 +78,7 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
   'mira-runner': 'mira-runner.js',
   'mir-runner': 'mir-runner.js',
   'minimax-runner': 'minimax-runner.js',
+  'antigravity-runner': 'antigravity-runner.js',
   'lark-tool-runner': 'lark-tool-runner.js',
   'cli-identity-runner': 'cli-identity-runner.js',
 };
@@ -100,7 +102,7 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
  */
 export const RUNNER_ENTRIES: readonly BotmuxEntry[] = [
   'codex-app-runner', 'dsh-runner', 'mira-runner', 'mir-runner', 'minimax-runner',
-  'lark-tool-runner', 'cli-identity-runner',
+  'antigravity-runner', 'lark-tool-runner', 'cli-identity-runner',
 ] as const;
 
 /**

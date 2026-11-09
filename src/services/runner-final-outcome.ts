@@ -9,7 +9,7 @@ export function runnerFinalOutcome(cliId: string | undefined, errorCode: unknown
     return { status: 'failed', errorCode: errorCode === CODEX_CAPACITY_ERROR_CODE
       ? CODEX_CAPACITY_ERROR_CODE : 'codex_app_turn_failed' };
   }
-  if (cliId !== 'minimax' || errorCode === undefined) return { status: 'completed' };
+  if (!['minimax', 'antigravity'].includes(cliId ?? '') || errorCode === undefined) return { status: 'completed' };
   if (errorCode === 'cancelled') return { status: 'cancelled', errorCode };
   return {
     status: 'failed',
