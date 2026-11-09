@@ -1,5 +1,7 @@
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
 import { sameWorker, sameRuntime } from '../services/session-contract.js';
+import { observeTraexInstall } from '../services/traex-install-watch.js';
+import type { ExecutableIdentity } from '../services/cli-install-identity.js';
 import { sessionContractPrimary } from './session-contract-primary.js';
 import { resolveSessionModelPinView } from './session-model.js';
 import { isWorkflowNodeSessionMarker } from './workflow-node-session.js';
@@ -245,7 +247,7 @@ import { materializeFeedbackPolicyForDelivery } from '../services/feedback-revie
 import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
 import { attachWorkflowSidebarEntry, workflowNodeSessionEntry } from '../im/lark/workflow-sidebar-entry.js';
 import { resolveWorkflowEntryLink } from './workflow-entry-link.js';
-import { beginFinalOutputDelivery, waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
+import { beginFinalOutputDelivery, onFinalOutputDeliverySettled, waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
 import { BUSY_RUNTIME_STATUSES } from './session-task-status.js';
 import { isTurnOutcomeExcluded, noteFinalOutputReceipt, noteLateFinalReply, recordTurnOutcome } from './turn-outcome.js';
 import { validateFinalOutputSnapshot, type FinalOutputOffer } from '../services/final-output-handoff.js';
@@ -10321,6 +10323,17 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
   // its way into the CLI; retiring the CLI now destroys it. The claim stays and
   // is cashed in once the worker reports that input taken.
   if (hasUnacceptedCliInput(ds)) return;
+  // An install-change reclaim is only safe when nothing of the current
+  // generation is still owned: no background task, no undelivered final
+  // answer, no transfer, no accepted-but-unsettled input. Keep the claim
+  // pending instead of consuming it; screen/final-delivery/transfer edges and
+  // the periodic sweep re-run this checkpoint.
+  if (reason === CLI_INSTALL_CHANGED_SUSPEND && !canSafelyReclaimWorkerForInstallChange(ds)) {
+    if (isSessionTransferring(ds)) {
+      deferUntilSessionTransferSettled(ds, () => runPendingSuspendIfSettled(ds, ownsGeneration));
+    }
+    return;
+  }
   // Clear only on success. suspendWorker refuses mid-routing-transfer (and for a
   // backend that stopped being suspendable), and that refusal is temporary —
   // eating the flag would silently drop the request until the next `suspend all`.
@@ -10352,6 +10365,117 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
 }
 
 export const __testOnly_runPendingSuspendIfSettled = runPendingSuspendIfSettled;
+
+/**
+ * May this generation be retired because the CLI install changed under it?
+ *
+ * This is deliberately NOT the idle-sweeper predicate: that one treats
+ * `pendingSuspendReason` / `pendingSuspendGeneration` as "busy", but here those
+ * fields ARE the request being fulfilled — copying them would deadlock every
+ * reclaim. Everything else that still owns user-visible work or input must
+ * keep the worker alive until it settles:
+ *
+ * - background tasks die with the CLI;
+ * - an undelivered final answer would be lost;
+ * - a routing transfer / protected mutation owns the lifecycle;
+ * - accepted-but-unsettled IM input, activation tail, buffered follow-ups and
+ *   a pending repo/raw input all carry a turn that has not been submitted;
+ * - adopted workers are not ours to reclaim, and a locked session is an
+ *   explicit operator hold.
+ *
+ * `pendingSuspend*` is intentionally absent; see above.
+ */
+export function canSafelyReclaimWorkerForInstallChange(ds: DaemonSession): boolean {
+  if (!ds.worker || ds.worker.killed) return false;
+  if (ds.session.status !== 'active') return false;
+  if (ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) return false;
+  if (ds.session.locked === true) return false;
+  if (ds.workerReady !== true) return false;
+  if (hasProtectedSessionMutationOwnership(ds) || isSessionTransferring(ds)) return false;
+  if (ds.pendingRepo || ds.pendingRepoCommitInFlight || ds.worktreeCreating) return false;
+  if (ds.initialStartPending) return false;
+  if (ds.session.queuedActivationPending || (ds.session.queuedActivationTail?.length ?? 0) > 0) return false;
+  if (ds.pendingPrompt !== undefined || ds.pendingTurnId !== undefined) return false;
+  if (ds.pendingRawInput !== undefined || ds.pendingFollowUpInput !== undefined) return false;
+  if ((ds.pendingFollowUps?.length ?? 0) > 0) return false;
+  if (ds.cascadeInFlight || (ds.cascadeDeferred?.length ?? 0) > 0) return false;
+  if (ds.tuiPromptCardId || (ds.tuiPromptOptions?.length ?? 0) > 0 || ds.tuiPromptProcessing) return false;
+  if (ds.agentAttention || ds.usageLimit) return false;
+  if ((ds.backgroundTaskCount ?? 0) > 0) return false;
+  if ((ds.finalOutputDeliveriesInFlight?.size ?? 0) > 0) return false;
+  if (ds.remoteCloseState !== undefined || ds.remoteShutdownState !== undefined) return false;
+  if (hasPendingOrdinaryImInput(ds)) return false;
+  if (isSessionRestartInFlight(ds) || isSessionEffortChangeInFlight(ds)) return false;
+  return true;
+}
+
+export const __testOnly_canSafelyReclaimWorkerForInstallChange = canSafelyReclaimWorkerForInstallChange;
+
+/**
+ * Queue (or refresh) the install-change reclaim for this generation.
+ *
+ * A manual suspend request already queued wins: the operator asked for a
+ * different reason and we must not overwrite it. Re-detecting the same reason
+ * keeps the existing claim (and its generation) so a worker that is busy for
+ * a while does not accumulate requests.
+ *
+ * `tryNow` immediately runs the settlement checkpoint; the periodic sweep and
+ * lifecycle edges call this too.
+ */
+export function requestInstallChangeSuspend(
+  ds: DaemonSession,
+  detail: { entry: string; running: ExecutableIdentity; install: ExecutableIdentity },
+  opts: { tryNow?: boolean } = {},
+): boolean {
+  if (ds.pendingSuspendReason && ds.pendingSuspendReason !== CLI_INSTALL_CHANGED_SUSPEND) return false;
+  const firstRequest = ds.pendingSuspendReason !== CLI_INSTALL_CHANGED_SUSPEND;
+  if (firstRequest) {
+    ds.pendingSuspendReason = CLI_INSTALL_CHANGED_SUSPEND;
+    ds.pendingSuspendGeneration = ds.workerGeneration;
+    logger.warn(
+      `[${tag(ds)}] TRAE install changed under the running process `
+      + `(running ino=${detail.running.ino} mtime=${detail.running.mtimeNs}, `
+      + `installed ino=${detail.install.ino} mtime=${detail.install.mtimeNs}, entry=${detail.entry}) — `
+      + 'queued a safe reclaim once this generation owns no more work',
+    );
+  }
+  if (opts.tryNow) runPendingSuspendIfSettled(ds);
+  return firstRequest;
+}
+
+/**
+ * Periodic per-daemon sweep: compare each live worker's actual executable with
+ * the install entry it was launched from. This is what catches a fully quiet
+ * idle worker — there is no PTY/screen edge to piggyback on.
+ *
+ * Detection is shared per install entry (see traex-install-watch), so N workers
+ * cost at most one stat per TTL, never a `--version` probe. Unknown identities
+ * (macOS, not-yet-attested, adopted) never trigger a reclaim.
+ */
+export function sweepTraexInstallChanges(
+  sessions: Iterable<DaemonSession>,
+  botCfg: { cliId: CliId },
+  now = Date.now(),
+): number {
+  let queued = 0;
+  for (const ds of sessions) {
+    if (!ds.worker || ds.worker.killed) continue;
+    // Adopted processes are not ours to retire, and an adopt-mode worker has no
+    // managed lifecycle to hand over. Do not even queue a claim for them.
+    if (ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) continue;
+    const observation = observeTraexInstall(ds, sessionCliId(ds, botCfg), now);
+    if (observation.state !== 'stale') continue;
+    if (requestInstallChangeSuspend(ds, observation, { tryNow: true })) queued += 1;
+  }
+  return queued;
+}
+
+// An install-change reclaim must not retire a worker whose final answer is
+// still being delivered. The drain module notifies after each delivery settles;
+// re-run the settlement checkpoint only when such a claim is queued.
+onFinalOutputDeliverySettled(ds => {
+  if (ds.pendingSuspendReason === CLI_INSTALL_CHANGED_SUSPEND) runPendingSuspendIfSettled(ds);
+});
 
 function armWorkerKillBackstop(w: ChildProcess, label: string, sigtermMs: number = WORKER_SIGTERM_BACKSTOP_MS): void {
   const sigterm = setTimeout(() => {
@@ -18657,11 +18781,30 @@ function setupWorkerHandlers(
         // unlike .botmux-cli-pids it cannot be forged or deleted by the CLI.
         // Bind it to the daemon's current worker generation so a late message
         // from a replaced worker never attests the replacement process.
+        if (ds.worker !== worker || ds.workerGeneration !== workerGeneration) {
+          logger.warn(`[${t}] Ignored local_process_attestation from stale worker generation`);
+          break;
+        }
+        // A late attestation from an older CLI spawn of THIS worker must not
+        // overwrite the identity of the process that replaced it.
+        const previousSpawnGeneration = ds.localProcessAttestation?.cliSpawnGeneration;
+        if (msg.cliSpawnGeneration !== undefined
+          && previousSpawnGeneration !== undefined
+          && msg.cliSpawnGeneration < previousSpawnGeneration) {
+          logger.warn(
+            `[${t}] Ignored stale local_process_attestation spawn=${msg.cliSpawnGeneration} `
+            + `(current ${previousSpawnGeneration})`,
+          );
+          break;
+        }
         ds.localProcessAttestation = {
           backendType: msg.backendType,
           credentialIsolated: msg.credentialIsolated,
           ...(msg.cliPid !== undefined ? { cliPid: msg.cliPid } : {}),
           ...(msg.cliProcStart !== undefined ? { cliProcStart: msg.cliProcStart } : {}),
+          ...(msg.cliExe !== undefined ? { cliExe: msg.cliExe } : {}),
+          ...(msg.cliInstallEntry !== undefined ? { cliInstallEntry: msg.cliInstallEntry } : {}),
+          ...(msg.cliSpawnGeneration !== undefined ? { cliSpawnGeneration: msg.cliSpawnGeneration } : {}),
           ...(msg.enginePid !== undefined ? { enginePid: msg.enginePid } : {}),
           ...(msg.engineProcStart !== undefined
             ? { engineProcStart: msg.engineProcStart }

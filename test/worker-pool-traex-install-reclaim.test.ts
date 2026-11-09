@@ -1,0 +1,382 @@
+/**
+ * PR1 mitigation: reclaim a managed TRAE worker whose executable was replaced
+ * on disk, without ever killing work that still belongs to the old generation.
+ *
+ * Covers the safety predicate matrix, request idempotency, shared-entry
+ * detection, late attestation fences, and the final-delivery retry edge.
+ *
+ * Run: bun x vitest run --project unit test/worker-pool-traex-install-reclaim.test.ts
+ */
+import { EventEmitter } from 'node:events';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { emitHookEventMock } = vi.hoisted(() => ({ emitHookEventMock: vi.fn() }));
+
+vi.mock('../src/services/hook-runner.js', () => ({
+  emitHookEvent: (...args: unknown[]) => emitHookEventMock(...args),
+}));
+
+vi.mock('../src/im/lark/client.js', () => {
+  class MessageWithdrawnError extends Error {
+    constructor(id: string) { super(`withdrawn: ${id}`); this.name = 'MessageWithdrawnError'; }
+  }
+  return { updateMessage: vi.fn(async () => {}), deleteMessage: vi.fn(async () => {}), MessageWithdrawnError };
+});
+
+vi.mock('../src/im/lark/card-builder.js', () => ({
+  buildStreamingCard: vi.fn(() => '{"type":"streaming"}'),
+  buildSessionCard: vi.fn(() => '{"type":"session"}'),
+  buildTuiPromptCard: vi.fn(() => '{"type":"tui"}'),
+  buildTuiPromptResolvedCard: vi.fn(() => '{"type":"tui-resolved"}'),
+  getCliDisplayName: vi.fn(() => 'TRAE'),
+}));
+
+vi.mock('../src/bot-registry.js', () => ({
+  getBot: vi.fn(() => ({
+    config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'traex' },
+    resolvedAllowedUsers: [], botOpenId: 'ou_bot', botName: 'TestBot',
+  })),
+  getAllBots: vi.fn(() => []),
+}));
+
+vi.mock('../src/config.js', () => ({
+  config: {
+    web: { externalHost: 'localhost' },
+    session: { dataDir: '/tmp/test-sessions' },
+    daemon: { backendType: 'tmux', cliId: 'traex' },
+  },
+}));
+
+vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
+  closeSession: vi.fn(), updateSession: vi.fn(), updateSessionPid: vi.fn(),
+}));
+
+vi.mock('../src/services/frozen-card-store.js', () => ({
+  loadFrozenCards: vi.fn(() => new Map()), saveFrozenCards: vi.fn(),
+}));
+
+vi.mock('../src/core/session-manager.js', () => ({
+  ensureSessionWhiteboard: vi.fn(), persistStreamCardState: vi.fn(),
+}));
+
+vi.mock('../src/core/dashboard-events.js', () => ({
+  dashboardEventBus: { publish: vi.fn() },
+}));
+
+vi.mock('../src/core/dashboard-rows.js', () => ({
+  composeRowFromActive: vi.fn(() => ({ tokenUsage: null })),
+}));
+
+vi.mock('../src/skills/installer.js', () => ({ ensureSkills: vi.fn() }));
+vi.mock('../src/adapters/cli/registry.js', () => ({ createCliAdapterSync: vi.fn() }));
+vi.mock('../src/adapters/cli/claude-code.js', () => ({ claudeJsonlPathForSession: vi.fn() }));
+vi.mock('../src/adapters/backend/tmux-backend.js', () => ({ TmuxBackend: class {} }));
+// This host's shared node_modules is intentionally not fully installed; the
+// worker-pool import graph only needs the TOML parser symbol.
+vi.mock('smol-toml', () => ({ parse: vi.fn(() => ({})) }));
+vi.mock('../src/utils/logger.js', () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
+}));
+vi.mock('@larksuiteoapi/node-sdk', () => ({
+  Client: class { constructor() {} },
+  WSClient: class { start() {} },
+  EventDispatcher: class { register() {} },
+  LoggerLevel: { info: 2 },
+}));
+
+import {
+  initWorkerPool,
+  __testOnly_setupWorkerHandlers,
+  __testOnly_setSuspendBackingVerifier,
+  __testOnly_canSafelyReclaimWorkerForInstallChange,
+  __testOnly_runPendingSuspendIfSettled,
+  requestInstallChangeSuspend,
+  sweepTraexInstallChanges,
+} from '../src/core/worker-pool.js';
+import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
+import type { DaemonSession } from '../src/core/types.js';
+import type { ExecutableIdentity } from '../src/services/cli-install-identity.js';
+import { resolveInstallIdentity } from '../src/services/cli-install-identity.js';
+import { __testOnly_resetTraexInstallWatch } from '../src/services/traex-install-watch.js';
+
+const dirs: string[] = [];
+
+function tempEntry(content = 'traex-release'): { entry: string; identity: ExecutableIdentity } {
+  const dir = mkdtempSync(join(tmpdir(), 'botmux-traex-reclaim-'));
+  dirs.push(dir);
+  const entry = join(dir, 'traex');
+  writeFileSync(entry, content);
+  return { entry, identity: resolveInstallIdentity(entry)! };
+}
+
+function makeFakeWorker() {
+  const worker = new EventEmitter() as any;
+  worker.killed = false;
+  worker.send = vi.fn();
+  worker.kill = vi.fn();
+  worker.once = vi.fn();
+  worker.pid = 4242;
+  worker.stdout = new EventEmitter();
+  worker.stderr = new EventEmitter();
+  return worker;
+}
+
+function makeDs(overrides: Partial<DaemonSession> = {}): DaemonSession {
+  return {
+    session: {
+      sessionId: 'sid-traex', rootMessageId: 'om_root', chatId: 'oc_chat', title: 'TRAE',
+      status: 'active', createdAt: new Date('2026-11-09T00:00:00.000Z').toISOString(), chatType: 'group',
+      cliId: 'traex', workingDir: '/repo', cliSessionId: 'native-known',
+    },
+    worker: makeFakeWorker(),
+    workerReady: true,
+    lastScreenStatus: 'idle',
+    workerGeneration: 7,
+    larkAppId: 'app_test',
+    chatId: 'oc_chat',
+    chatType: 'group',
+    scope: 'thread',
+    spawnedAt: 1,
+    lastMessageAt: 2,
+    hasHistory: true,
+    workingDir: '/repo',
+    displayMode: 'hidden',
+    lastScreenContent: '',
+    initConfig: { backendType: 'tmux', cliId: 'traex' },
+    ...overrides,
+  } as unknown as DaemonSession;
+}
+
+function detail(entry: string, running: ExecutableIdentity, installed: ExecutableIdentity) {
+  return { entry, running, install: installed };
+}
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  __testOnly_resetTraexInstallWatch();
+  __testOnly_setSuspendBackingVerifier(() => true);
+  initWorkerPool({
+    sessionReply: vi.fn(async () => 'om_notice'),
+    getSessionWorkingDir: () => '/repo',
+    getActiveCount: () => 1,
+    closeSession: vi.fn(),
+  } as any);
+});
+
+afterEach(() => {
+  __testOnly_setSuspendBackingVerifier();
+  for (const dir of dirs.splice(0)) {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
+});
+
+describe('canSafelyReclaimWorkerForInstallChange', () => {
+  it('accepts a quiet, fully owned worker even though the reclaim request is queued', () => {
+    const ds = makeDs();
+    ds.pendingSuspendReason = 'cli_install_changed';
+    ds.pendingSuspendGeneration = ds.workerGeneration;
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(true);
+  });
+
+  it('is backend-neutral: a quiet PTY worker is eligible too (retirement path)', () => {
+    const ds = makeDs();
+    ds.initConfig = { backendType: 'pty', cliId: 'traex' } as any;
+    ds.session.backendType = 'pty';
+    ds.pendingSuspendReason = 'cli_install_changed';
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(true);
+  });
+
+  it.each([
+    ['no worker', (ds: DaemonSession) => { ds.worker = null; }],
+    ['dead worker', (ds: DaemonSession) => { (ds.worker as any).killed = true; }],
+    ['inactive session', (ds: DaemonSession) => { ds.session.status = 'suspended'; }],
+    ['adopted worker', (ds: DaemonSession) => { ds.adoptedFrom = 'legacy'; }],
+    ['adopt mode', (ds: DaemonSession) => { ds.initConfig = { ...ds.initConfig!, adoptMode: true } as any; }],
+    ['locked by operator', (ds: DaemonSession) => { ds.session.locked = true; }],
+    ['worker not ready', (ds: DaemonSession) => { ds.workerReady = false; }],
+    ['protected mutation', (ds: DaemonSession) => { ds.session.queued = true; }],
+    ['activation pending', (ds: DaemonSession) => { ds.session.queuedActivationPending = true; }],
+    ['activation tail', (ds: DaemonSession) => { ds.session.queuedActivationTail = [{ id: 't' } as any]; }],
+    ['pending prompt', (ds: DaemonSession) => { ds.pendingPrompt = 'hi'; }],
+    ['pending turn id', (ds: DaemonSession) => { ds.pendingTurnId = 'turn'; }],
+    ['pending raw input', (ds: DaemonSession) => { ds.pendingRawInput = 'raw'; }],
+    ['pending follow-up', (ds: DaemonSession) => { ds.pendingFollowUpInput = 'f'; }],
+    ['follow-up queue', (ds: DaemonSession) => { ds.pendingFollowUps = ['a']; }],
+    ['cascade in flight', (ds: DaemonSession) => { ds.cascadeInFlight = true; }],
+    ['cascade deferred', (ds: DaemonSession) => { ds.cascadeDeferred = ['x']; }],
+    ['tui prompt', (ds: DaemonSession) => { ds.tuiPromptCardId = 'card'; }],
+    ['agent attention', (ds: DaemonSession) => { ds.agentAttention = true; }],
+    ['usage limit', (ds: DaemonSession) => { ds.usageLimit = true; }],
+    ['background task', (ds: DaemonSession) => { ds.backgroundTaskCount = 1; }],
+    ['final delivery in flight', (ds: DaemonSession) => {
+      ds.finalOutputDeliveriesInFlight = new Set([Promise.resolve()]);
+    }],
+    ['remote close', (ds: DaemonSession) => { ds.remoteCloseState = { state: 'closing' } as any; }],
+    ['repo setup', (ds: DaemonSession) => { ds.pendingRepo = { repo: 'r' } as any; }],
+    ['initial start', (ds: DaemonSession) => { ds.initialStartPending = true; }],
+  ])('rejects when busy: %s', (_label, mutate) => {
+    const ds = makeDs();
+    ds.pendingSuspendReason = 'cli_install_changed';
+    mutate(ds);
+    expect(__testOnly_canSafelyReclaimWorkerForInstallChange(ds)).toBe(false);
+  });
+});
+
+describe('requestInstallChangeSuspend', () => {
+  it('queues one request bound to the current generation', () => {
+    const { entry, identity } = tempEntry();
+    const ds = makeDs();
+    const queued = requestInstallChangeSuspend(ds, detail(entry, identity, identity), { tryNow: false });
+    expect(queued).toBe(true);
+    expect(ds.pendingSuspendReason).toBe('cli_install_changed');
+    expect(ds.pendingSuspendGeneration).toBe(ds.workerGeneration);
+  });
+
+  it('keeps the existing request and generation when detection repeats', () => {
+    const { entry, identity } = tempEntry();
+    const ds = makeDs();
+    requestInstallChangeSuspend(ds, detail(entry, identity, identity), { tryNow: false });
+    const generation = ds.pendingSuspendGeneration;
+    expect(requestInstallChangeSuspend(ds, detail(entry, identity, identity), { tryNow: false })).toBe(false);
+    expect(ds.pendingSuspendGeneration).toBe(generation);
+  });
+
+  it('never overwrites a manual suspend already queued', () => {
+    const { entry, identity } = tempEntry();
+    const ds = makeDs();
+    ds.pendingSuspendReason = 'manual_suspend';
+    ds.pendingSuspendGeneration = ds.workerGeneration;
+    expect(requestInstallChangeSuspend(ds, detail(entry, identity, identity), { tryNow: false })).toBe(false);
+    expect(ds.pendingSuspendReason).toBe('manual_suspend');
+  });
+
+  it('does not suspend while the generation still owns a background task, then does after it ends', () => {
+    const { entry, identity } = tempEntry();
+    const ds = makeDs();
+    const worker = ds.worker as any;
+    ds.backgroundTaskCount = 1;
+    requestInstallChangeSuspend(ds, detail(entry, identity, identity), { tryNow: true });
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'suspend' });
+    expect(ds.pendingSuspendReason).toBe('cli_install_changed');
+
+    ds.backgroundTaskCount = 0;
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
+  });
+});
+
+describe('sweepTraexInstallChanges', () => {
+  it('queues every stale worker sharing one install entry and leaves current workers alone', () => {
+    const { entry, identity } = tempEntry('release-0.213.1');
+    const stale = { ...identity, ino: `${Number(identity.ino) + 1}`, source: 'linux-proc-exe' as const };
+    const attestation = (exe: ExecutableIdentity) => ({
+      backendType: 'tmux' as const, credentialIsolated: false, cliExe: exe, cliInstallEntry: entry,
+    });
+
+    const a = makeDs({ lastScreenStatus: 'working', localProcessAttestation: attestation(stale) });
+    const b = makeDs({ lastScreenStatus: 'working', localProcessAttestation: attestation(stale) });
+    const c = makeDs({ lastScreenStatus: 'working', localProcessAttestation: attestation(identity) });
+
+    expect(sweepTraexInstallChanges([a, b, c], { cliId: 'traex' }, 1_000)).toBe(2);
+    expect(a.pendingSuspendReason).toBe('cli_install_changed');
+    expect(b.pendingSuspendReason).toBe('cli_install_changed');
+    expect(c.pendingSuspendReason).toBeUndefined();
+  });
+
+  it('leaves a worker running a user-pinned old executable alone', () => {
+    // A pinned config points the install entry at the very binary the worker
+    // launched, so the running inode still matches — no reclaim, no config edit.
+    const { entry, identity } = tempEntry('pinned-0.213.1');
+    const pinned = makeDs({
+      lastScreenStatus: 'idle',
+      localProcessAttestation: {
+        backendType: 'tmux', credentialIsolated: false, cliExe: identity, cliInstallEntry: entry,
+      },
+    });
+    expect(sweepTraexInstallChanges([pinned], { cliId: 'traex' }, 3_000)).toBe(0);
+    expect(pinned.pendingSuspendReason).toBeUndefined();
+  });
+
+  it('does not touch non-TRAE, unknown, or adopted workers', () => {
+    const { entry, identity } = tempEntry();
+    const stale = { ...identity, ino: `${Number(identity.ino) + 1}`, source: 'linux-proc-exe' as const };
+    const unknown = makeDs({ localProcessAttestation: undefined });
+    const adopted = makeDs({
+      adoptedFrom: 'legacy',
+      localProcessAttestation: { backendType: 'tmux', credentialIsolated: false, cliExe: stale, cliInstallEntry: entry },
+    });
+    const otherCli = makeDs({
+      session: { ...makeDs().session, cliId: 'claude-code' },
+      localProcessAttestation: { backendType: 'tmux', credentialIsolated: false, cliExe: stale, cliInstallEntry: entry },
+    });
+
+    expect(sweepTraexInstallChanges([unknown, adopted, otherCli], { cliId: 'traex' }, 2_000)).toBe(0);
+  });
+});
+
+describe('attestation fences', () => {
+  it('ignores an attestation from a replaced worker generation', async () => {
+    const { entry, identity } = tempEntry();
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const reserved = ds.workerGeneration!;
+    ds.workerGeneration = reserved + 1;
+
+    worker.emit('message', {
+      type: 'local_process_attestation', backendType: 'tmux', credentialIsolated: false,
+      cliExe: identity, cliInstallEntry: entry, cliSpawnGeneration: 1,
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(ds.localProcessAttestation).toBeUndefined();
+  });
+
+  it('ignores a late attestation from an older CLI spawn of the same worker', async () => {
+    const { entry, identity } = tempEntry();
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    __testOnly_setupWorkerHandlers(ds, worker);
+    ds.localProcessAttestation = {
+      backendType: 'tmux', credentialIsolated: false, cliExe: identity, cliInstallEntry: entry, cliSpawnGeneration: 3,
+    };
+    const newer = { ...identity, ino: '999', source: 'linux-proc-exe' as const };
+
+    worker.emit('message', {
+      type: 'local_process_attestation', backendType: 'tmux', credentialIsolated: false,
+      cliExe: newer, cliInstallEntry: entry, cliSpawnGeneration: 2,
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(ds.localProcessAttestation!.cliExe!.ino).toBe(identity.ino);
+
+    worker.emit('message', {
+      type: 'local_process_attestation', backendType: 'tmux', credentialIsolated: false,
+      cliExe: newer, cliInstallEntry: entry, cliSpawnGeneration: 4,
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(ds.localProcessAttestation!.cliExe!.ino).toBe('999');
+  });
+});
+
+describe('final delivery retry edge', () => {
+  it('waits for an in-flight final answer, then reclaims when the delivery settles', () => {
+    const ds = makeDs();
+    const worker = ds.worker as any;
+    ds.pendingSuspendReason = 'cli_install_changed';
+    ds.pendingSuspendGeneration = ds.workerGeneration;
+    const finish = beginFinalOutputDelivery(ds, 'turn-1');
+
+    __testOnly_runPendingSuspendIfSettled(ds);
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'suspend' });
+
+    finish();
+    expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
+    expect(ds.worker).toBeNull();
+  });
+});

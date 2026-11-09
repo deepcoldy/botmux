@@ -2539,6 +2539,16 @@ export type WorkerToDaemonBase =
       credentialIsolated: boolean;
       cliPid?: number;
       cliProcStart?: string;
+      /** Actual executable image the CLI process is running, read from
+       * `/proc/<pid>/exe` at publish time. Absent when the platform has no
+       * proven source (macOS) or the pid is not the TRAE leaf yet. */
+      cliExe?: import('./services/cli-install-identity.js').ExecutableIdentity;
+      /** The install entry this worker's adapter resolved at spawn. The daemon
+       * re-resolves it to detect an install replacement under the process. */
+      cliInstallEntry?: string;
+      /** Monotonic per-worker CLI spawn counter. Late attestations from an
+       * older spawn are rejected by the daemon handler. */
+      cliSpawnGeneration?: number;
       /** RPC app-server root. Tool subprocesses are descendants of this
        * sibling rather than of the viewer CLI. */
       enginePid?: number;

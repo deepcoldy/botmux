@@ -414,7 +414,8 @@ import { readCodexModelSettingsCursor, spawnWithCodexModelLaunch, type CodexMode
 import { validateCodexServiceTier } from './services/codex-service-tier-catalog.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
 import { traexRejectedArgument } from './adapters/cli/traex-version.js';
-import { resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from './core/traex-leaf-pid.js';
+import { isTraexProcess, resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from './core/traex-leaf-pid.js';
+import { readRunningExeIdentity } from './services/cli-install-identity.js';
 import { pinWorkerTraeHome } from './services/traex-paths.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput } from './services/codex-user-input.js';
@@ -28373,10 +28374,17 @@ async function spawnCliBody(
   lastSpawnCodexExecutable = codexFilterExecutable;
   const startTraexLauncherPidResolve = (launcherPid: number): void => {
     if (cfg.cliId !== 'traex' || !traexLauncherActive) return;
+    // Capture the spawn this resolve belongs to. A late timer from an older
+    // spawn must not rewire the replacement backend or attest its pid.
+    const generation = cliSpawnGeneration;
     scheduleTraexLeafPidResolve(launcherPid, {
       getBackend: () => backend,
       getChildPid: () => backend?.getChildPid?.(),
       applyRealPid: (realPid) => {
+        if (generation !== cliSpawnGeneration) {
+          log(`TRAE launcher: ignoring stale leaf pid ${realPid} from spawn ${generation} (current ${cliSpawnGeneration})`);
+          return;
+        }
         log(`TRAE launcher: resolved real traex leaf pid ${realPid} under launcher ${launcherPid}; rewiring ownership pid`);
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = realPid;
         (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
@@ -33584,12 +33592,27 @@ function publishLocalProcessAttestation(
     : codexAppRunnerProcessIdentity && enginePid === codexAppRunnerProcessIdentity.enginePid
       ? codexAppRunnerProcessIdentity.engineProcStart
       : enginePid ? readProcessStartIdentity(enginePid) : undefined;
+  // Actual running image of the TRAE leaf, read from the kernel. The initial
+  // attestation names the bwrap/forge launcher, which is not traex and must not
+  // be recorded; the leaf re-attestation (applyRealPid) fills this in.
+  const cliExe = lastInitConfig?.cliId === 'traex' && cliPid && isTraexProcess(cliPid)
+    ? readRunningExeIdentity(cliPid)
+    : undefined;
+  // The install entry this worker's adapter resolved at spawn. The daemon
+  // re-resolves it later to detect a replacement under the running process;
+  // this worker never re-runs a version probe for it.
+  const cliInstallEntry = lastInitConfig?.cliId === 'traex'
+    ? cliAdapter?.resolvedBin
+    : undefined;
   send({
     type: 'local_process_attestation',
     backendType: effectiveBackendType,
     credentialIsolated: currentCliCredentialIsolated,
     ...(cliPid ? { cliPid } : {}),
     ...(cliProcStart ? { cliProcStart } : {}),
+    ...(cliExe ? { cliExe } : {}),
+    ...(cliInstallEntry ? { cliInstallEntry } : {}),
+    cliSpawnGeneration,
     ...(enginePid ? { enginePid } : {}),
     ...(engineProcStart ? { engineProcStart } : {}),
   });

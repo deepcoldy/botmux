@@ -148,6 +148,13 @@ export interface DaemonSession {
     credentialIsolated: boolean;
     cliPid?: number;
     cliProcStart?: string;
+    /** Actual running executable image (Linux `/proc/<pid>/exe`). Absent when
+     * unknown; an unknown identity never authorizes an automatic reclaim. */
+    cliExe?: import('../services/cli-install-identity.js').ExecutableIdentity;
+    /** Install entry the worker's adapter resolved at spawn. */
+    cliInstallEntry?: string;
+    /** Worker-local CLI spawn counter that produced `cliExe`. */
+    cliSpawnGeneration?: number;
     enginePid?: number;
     engineProcStart?: string;
     workerGeneration?: number;
