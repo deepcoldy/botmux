@@ -98,7 +98,7 @@ function screenReady(queue: CodexBridgeQueue, cliId = 'traex', quotaPending: unk
     traexQuotaPending: quotaPending,
     bareShellLaunchBlocked: false, currentInputDeliveryQuarantine: () => false,
     currentPostTerminalInputFence: () => false, isPromptReady: false,
-    stopStructuredStartGraceRecheck: vi.fn(), cliRestartInProgress: false,
+    stopStructuredStartGraceRecheck: vi.fn(), cliRestartInProgress: false, cliSubmissionInFlight: null,
     // This fixture exercises lifecycle/delegation, not a live process tree.
     // Root refresh and publication are covered by worker-codex-execution-root.
     currentCodexObservedPid: vi.fn(),

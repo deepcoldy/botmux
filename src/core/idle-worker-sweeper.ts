@@ -1,5 +1,5 @@
 import type { DaemonSession } from './types.js';
-import { isSessionTransferring, suspendWorker } from './worker-pool.js';
+import { hasUnacceptedCliInput, isSessionTransferring, suspendWorker } from './worker-pool.js';
 import {
   getSessionPersistentBackendType,
   isSuspendableBackendType,
@@ -144,6 +144,7 @@ function hasUnsettledIdleSuspendState(ds: DaemonSession): boolean {
     // cap / TTL / admission candidates in suspendableIdleCandidates).
     || (ds.backgroundTaskCount ?? 0) > 0
     || (ds.finalOutputDeliveriesInFlight?.size ?? 0) > 0
+    || hasUnacceptedCliInput(ds)
     || !!ds.pendingSuspendReason
     || ds.pendingSuspendGeneration !== undefined
     || ds.remoteCloseState !== undefined
@@ -323,7 +324,8 @@ export function sweepIdleWorkersByAgeAfterTurnDrain(
  *  - its backend survives a kill + cold resume (tmux/herdr/zellij/zmx only;
  *    pty/riff/mojo are skipped), and
  *  - it is currently idle (never cut off an in-flight reply), and
- *  - no background task it launched is still running.
+ *  - no background task it launched is still running, and
+ *  - no input delivered to it is still waiting for its CLI to take it.
  * Ordered least-recently-messaged first so all policies evict LRU.
  */
 function suspendableIdleCandidates(activeSessions: Map<string, DaemonSession>): DaemonSession[] {
@@ -346,6 +348,10 @@ function suspendableIdleCandidates(activeSessions: Map<string, DaemonSession>): 
     // a cold resume cannot bring it back, so the session would never hear its
     // result. Such a session counts as busy until the task stops.
     .filter(ds => !(ds.backgroundTaskCount && ds.backgroundTaskCount > 0))
+    // An idle screen does not mean the input has landed: a freshly woken
+    // session shows its prompt while the message that woke it is still queued
+    // or being typed, and suspending then destroys it with the CLI.
+    .filter(ds => !hasUnacceptedCliInput(ds))
     .sort((a, b) => (a.lastMessageAt || 0) - (b.lastMessageAt || 0));
 }
 

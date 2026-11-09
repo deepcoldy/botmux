@@ -2481,6 +2481,14 @@ export type WorkerToDaemonBase =
    * CLI input queue. The daemon persists a root-bound receipt only after this
    * acknowledgement; IPC arrival alone is not acceptance. */
   | { type: 'turn_input_committed'; turnId: string; dispatchAttempt?: number; durablePrimaryInbox?: true }
+  /** Snapshot of input this worker holds that its CLI has not taken yet.
+   * `pending`: anything still queued, being written, or submitted with its
+   * receipt unresolved — destroying the CLI now would lose it. `writingTurnId`:
+   * the ordinary turn being written to the CLI right now; no exit path hands
+   * it to a successor worker. Sent before any other message whenever it
+   * changed, so it never trails the commit ACK or the screen status it
+   * qualifies. */
+  | { type: 'cli_input_backlog'; pending: boolean; writingTurnId?: string }
   /** Native write observation for display timing; never an admission or completion receipt. */
   | { type: 'turn_execution_started'; turnId: string; dispatchAttempt?: number; startedAtMs: number }
   /** The native CLI accepted this exact dispatched input into its own

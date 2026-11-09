@@ -717,4 +717,44 @@ describe('capacityCurrentlyBlocking contract (pane ownership across a terminal)'
     controller.beginTurn('turn-2');
     expect(controller.capacityCurrentlyBlocking()).toBe(false);
   });
+
+  it('awaitingPreferredModelReset holds a follow-up even when the pane stops painting the queue', () => {
+    const controller = new TraexAutoModelController({ ...base, reselectPerTurn: true });
+    exhaustOnLastModel(controller);
+    expect(controller.currentModelIndex()).toBeGreaterThan(0);
+    // The degraded CLI returns to its composer: the pane no longer shows a
+    // capacity queue, so the screen-only latch releases — the exact gap that
+    // let a follow-up type-ahead onto the degraded model.
+    controller.observeCapacityQueue({ turnId: 'turn-1', queued: false, nowMs: now + 500 });
+    expect(controller.capacityCurrentlyBlocking()).toBe(false);
+    // But the pool is still exhausted on a non-preferred model with
+    // reselection on: a follow-up must keep waiting for the preferred reset.
+    expect(controller.awaitingPreferredModelReset()).toBe(true);
+  });
+
+  it('awaitingPreferredModelReset is off without per-turn reselection', () => {
+    const controller = new TraexAutoModelController(base); // reselectPerTurn defaults off
+    exhaustOnLastModel(controller);
+    controller.observeCapacityQueue({ turnId: 'turn-1', queued: false, nowMs: now + 500 });
+    expect(controller.awaitingPreferredModelReset()).toBe(false);
+  });
+
+  it('awaitingPreferredModelReset is false on the preferred model and clears after the reset', () => {
+    // A fresh controller sits on the preferred (index 0): nothing to reset to.
+    const fresh = new TraexAutoModelController({ ...base, reselectPerTurn: true });
+    fresh.beginTurn('turn-0');
+    expect(fresh.awaitingPreferredModelReset()).toBe(false);
+
+    const controller = new TraexAutoModelController({ ...base, reselectPerTurn: true });
+    exhaustOnLastModel(controller);
+    expect(controller.awaitingPreferredModelReset()).toBe(true);
+    controller.endTurn('turn-1');
+    const reset = controller.beginTurn('turn-2');
+    expect(reset).toMatchObject({ kind: 'switch', toModel: 'core' });
+    if (reset.kind === 'switch') expect(controller.commitSwitch(reset, now + 1_000)).toBe(true);
+    // The reselection switch clears exhaustion and returns to index 0, so the
+    // hold cannot outlive the preferred reset (no permanent suppression).
+    expect(controller.currentModelIndex()).toBe(0);
+    expect(controller.awaitingPreferredModelReset()).toBe(false);
+  });
 });

@@ -86,6 +86,21 @@ describe('POST /api/sessions/:sessionId/suspend — 延迟挂起', () => {
     expect(ds.pendingSuspendReason).toBeUndefined();
   });
 
+  it('queues while the CLI of an idle session has not taken the message that woke it', async () => {
+    const ds = activeSession({ lastScreenStatus: 'idle' });
+    workerPool.recordWorkerCliInputBacklog(ds.worker, { pending: true, writingTurnId: 'om_wake' });
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync');
+
+    const res = await postSuspend('s-susp');
+
+    expect(await res.json()).toEqual({
+      ok: true, sessionId: 's-susp', suspended: false, reason: 'deferred',
+    });
+    expect(suspendSpy).not.toHaveBeenCalled();
+    expect(ds.pendingSuspendReason).toBe('manual_suspend');
+  });
+
   // 幂等分支必须排在排队检查之前：worker 早就没了要如实回 no_live_worker，
   // 不能被误报成 deferred（否则 CLI 的排队计数——决策 2 的安全阀——会虚高）。
   it('reports no_live_worker instead of deferred when the worker is already gone', async () => {
@@ -125,6 +140,34 @@ describe('POST /api/sessions/:sessionId/suspend — 延迟挂起', () => {
     expect(res.status).toBe(409);
     expect((await res.json()).error).toBe('adopt_suspend_unsupported');
     expect(ds.pendingSuspendReason).toBeUndefined();
+  });
+});
+
+describe('POST /api/host-overload/sweep suspend_idle', () => {
+  it('skips an idle session whose CLI has not taken the input delivered to it yet', async () => {
+    const waiting = activeSession({
+      lastScreenStatus: 'idle',
+      worker: { killed: false },
+      session: { sessionId: 's-waiting', status: 'active' },
+    });
+    const settled = activeSession({
+      lastScreenStatus: 'idle',
+      worker: { killed: false },
+      session: { sessionId: 's-settled', status: 'active' },
+    });
+    workerPool.recordWorkerCliInputBacklog(waiting.worker, { pending: true, writingTurnId: 'om_wake' });
+    workerPool.setActiveSessionsRegistry(new Map([['waiting', waiting], ['settled', settled]]));
+    const suspendSpy = vi.spyOn(workerPool, 'suspendWorkerAsync').mockResolvedValue(true);
+    handle ??= await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/host-overload/sweep`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode: 'suspend_idle' }),
+    });
+
+    expect(await res.json()).toEqual({ ok: true, mode: 'suspend_idle', affected: 1 });
+    expect(suspendSpy.mock.calls.map(([ds]) => ds.session.sessionId)).toEqual(['s-settled']);
   });
 });
 
