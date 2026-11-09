@@ -9,7 +9,7 @@
  * Run: bun x vitest run --project unit test/cli-install-identity.test.ts
  */
 import { spawn, type ChildProcess } from 'node:child_process';
-import { copyFileSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, readlinkSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -30,6 +30,36 @@ function tempDir(): string {
   const dir = mkdtempSync(join(tmpdir(), 'botmux-cli-identity-'));
   dirs.push(dir);
   return dir;
+}
+
+const EXEC_SETTLE_MS = 2_000;
+
+/**
+ * Bun spawns through vfork, so its `spawn` event can arrive while the child is
+ * still inside execve and `/proc/<pid>/exe` still names the Bun runtime. Wait,
+ * bounded, until the kernel reports the copied CLI before asserting anything.
+ */
+async function spawnCopiedCli(dir: string): Promise<{ cli: string; child: ChildProcess }> {
+  const cli = join(dir, 'traex');
+  copyFileSync('/bin/sleep', cli);
+  const child = spawn(cli, ['30'], { stdio: 'ignore' });
+  children.push(child);
+  await new Promise<void>((resolve, reject) => {
+    child.once('spawn', () => resolve());
+    child.once('error', reject);
+  });
+
+  const image = realpathSync(cli);
+  const deadline = Date.now() + EXEC_SETTLE_MS;
+  for (;;) {
+    let seen = '<unreadable>';
+    try { seen = readlinkSync(`/proc/${child.pid}/exe`); } catch { /* not readable yet */ }
+    if (seen === image) return { cli, child };
+    if (Date.now() >= deadline) {
+      throw new Error(`pid ${child.pid} still runs ${seen} after ${EXEC_SETTLE_MS}ms, expected ${image}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
 }
 
 function identity(overrides: Partial<ExecutableIdentity> = {}): ExecutableIdentity {
@@ -104,14 +134,7 @@ describe('resolveInstallIdentity', () => {
 describe('readRunningExeIdentity', () => {
   it('reads the image the process actually runs, not the current path', async () => {
     const dir = tempDir();
-    const cli = join(dir, 'traex');
-    copyFileSync('/bin/sleep', cli);
-    const child = spawn(cli, ['30'], { stdio: 'ignore' });
-    children.push(child);
-    await new Promise<void>((resolve, reject) => {
-      child.once('spawn', () => resolve());
-      child.once('error', reject);
-    });
+    const { cli, child } = await spawnCopiedCli(dir);
 
     const before = readRunningExeIdentity(child.pid!);
     expect(before).toBeDefined();
@@ -134,15 +157,7 @@ describe('readRunningExeIdentity', () => {
   });
 
   it('keeps reporting the old identity after the running file is unlinked', async () => {
-    const dir = tempDir();
-    const cli = join(dir, 'traex');
-    copyFileSync('/bin/sleep', cli);
-    const child = spawn(cli, ['30'], { stdio: 'ignore' });
-    children.push(child);
-    await new Promise<void>((resolve, reject) => {
-      child.once('spawn', () => resolve());
-      child.once('error', reject);
-    });
+    const { cli, child } = await spawnCopiedCli(tempDir());
 
     const before = readRunningExeIdentity(child.pid!);
     expect(before).toBeDefined();
@@ -164,15 +179,7 @@ describe('readRunningExeIdentity', () => {
   });
 
   it('refuses to pair the exe with a different process birth', async () => {
-    const dir = tempDir();
-    const cli = join(dir, 'traex');
-    copyFileSync('/bin/sleep', cli);
-    const child = spawn(cli, ['30'], { stdio: 'ignore' });
-    children.push(child);
-    await new Promise<void>((resolve, reject) => {
-      child.once('spawn', () => resolve());
-      child.once('error', reject);
-    });
+    const { child } = await spawnCopiedCli(tempDir());
 
     // The pid is alive, but the caller's attested birth token names some other
     // process: a reused pid must not authorize a reclaim of this one.
