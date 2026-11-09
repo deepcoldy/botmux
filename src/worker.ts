@@ -22956,6 +22956,8 @@ async function spawnCli(
     pluginGenerationPrepared?: boolean;
     exactResumeSessionId?: string;
     restartCause?: CliRestartCause;
+    /** First CLI start only; see SpawnOpts.retryPaneAgentStart. */
+    retryPaneAgentStart?: boolean;
     /** Linux scratch only: re-prepare around the existing COW view that killCli
      *  kept (preserveSandboxForRespawn) instead of retiring it. */
     reuseExistingScratchTree?: boolean;
@@ -27915,6 +27917,7 @@ async function spawnCliBody(
           model: cfg.model,
           modelBackendVariant: cfg.modelBackendVariant,
           reasoningEffort: cfg.reasoningEffort,
+          retryPaneAgentStart: opts.retryPaneAgentStart,
         });
       },
     });
@@ -33928,7 +33931,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
           // init so the daemon retries a clean incarnation instead of freezing.
           throw new Error('codex RPC resume: could not replace stale --remote pane; aborting init');
         }
-        await spawnCli(msg, { pluginGenerationPrepared: rpcPluginGenerationPrepared });
+        await spawnCli(msg, { pluginGenerationPrepared: rpcPluginGenerationPrepared, retryPaneAgentStart: !msg.restartAttemptId });
         if (traexAutoModelRuntimeEligible()) publishActiveRuntime({ model: msg.model, reasoningEffort: msg.reasoningEffort });
         await prepareCodexNativeTitleGeneration(msg, codexRpcEngine);
         if (codexRpcEngine) armRpcStartupDialogDismiss(); // boundary #4: keep the --remote pane from freezing on a startup dialog

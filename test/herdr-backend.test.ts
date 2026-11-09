@@ -18,7 +18,7 @@
 import { EventEmitter } from 'node:events';
 import { existsSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { basename, dirname } from 'node:path';
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from 'vitest';
 
 // Command assertions use the bare name whether or not this host has herdr on PATH.
 vi.mock('../src/utils/herdr-executable.js', () => ({ herdrExecutable: () => 'herdr' }));
@@ -34,8 +34,9 @@ vi.mock('node-pty', () => ({
 import { execFileSync, spawn } from 'node:child_process';
 import * as pty from 'node-pty';
 import {
-  HerdrBackend, PANE_AGENT_START_TIMEOUT_MS, __testOnly_resetHerdrAgentWaitProbe, chunkByUtf8Bytes,
+  HerdrBackend, PANE_AGENT_START_TIMEOUT_MS, PANE_AGENT_START_ATTEMPTS, __testOnly_resetHerdrAgentWaitProbe, chunkByUtf8Bytes,
 } from '../src/adapters/backend/herdr-backend.js';
+import { logger } from '../src/utils/logger.js';
 
 const mockedExecFileSync = vi.mocked(execFileSync);
 const mockedSpawn = vi.mocked(spawn);
@@ -596,8 +597,9 @@ describe('HerdrBackend.spawn', () => {
     }]);
     const be = new HerdrBackend(SESSION);
 
+    // No retryPaneAgentStart (an in-worker restart): one attempt only.
     expect(() => be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} }))
-      .toThrow(/did not detect "pi" in pane w_launch-1/);
+      .toThrow(/did not detect "pi" in pane w_launch-1 within \d+ ms$/);
     const listCalls = mockedExecFileSync.mock.calls.filter(call => {
       const args = call[1] as string[];
       return args.includes('agent') && args.includes('list');
@@ -608,6 +610,225 @@ describe('HerdrBackend.spawn', () => {
     expect(herdrCall('agent', 'rename')).toBeUndefined();
     expect(herdrCall('agent', 'start')).toBeUndefined();
     expect(existsSync(dirname(paneLauncherPath()))).toBe(false);
+    be.kill();
+  });
+
+  /** Herdr replies for a fresh start whose first `n` launches are never
+   *  recognised; later launches come up as claude. */
+  function stallFirstLaunches(n: number, extra: HerdrResponseHandler[] = []): { workspaces: () => number } {
+    let workspaces = 0;
+    setManagedLaunchResponses('claude', [
+      ...extra,
+      {
+        match: a => a.includes('workspace') && a.includes('create'),
+        reply: () => { workspaces++; return WORKSPACE_CREATED_REPLY(`w_try${workspaces}`, `w_try${workspaces}-1`); },
+      },
+      {
+        match: a => a.includes('pane') && a.includes('read'),
+        reply: () => PANE_READ_REPLY('$ /tmp/botmux-launch/claude\nexport ANTHROPIC_AUTH_TOKEN=sk-abcdefghijklmnop\n'),
+      },
+      {
+        match: a => a.includes('agent') && a.includes('list'),
+        reply: () => {
+          if (workspaces <= n) {
+            vi.setSystemTime(Date.now() + PANE_AGENT_START_TIMEOUT_MS);
+            return JSON.stringify({ result: { agents: [{ name: null, pane_id: `w_try${workspaces}-1`, agent: null }] } });
+          }
+          return JSON.stringify({ result: { agents: [
+            { name: null, pane_id: `w_try${workspaces}-1`, agent: 'claude', agent_status: 'idle' },
+          ] } });
+        },
+      },
+      {
+        match: a => a.includes('agent') && a.includes('get'),
+        reply: () => JSON.stringify({ result: { agent: { name: 'botmux', pane_id: `w_try${workspaces}-1`, agent: 'claude' } } }),
+      },
+    ]);
+    return { workspaces: () => workspaces };
+  }
+
+  const FRESH_START = { cwd: '/work', cols: 80, rows: 24, env: {}, retryPaneAgentStart: true };
+
+  it('Herdr 0.7.5: a fresh start Herdr never recognises is retried once in a fresh pane', () => {
+    // 11/2026: on a loaded macOS host a fresh session's launch occasionally
+    // stalled past the deadline while siblings started normally, and re-sending
+    // the same message started it in ~3s. A turn-carrying startup failure gets
+    // no daemon-side retry, so the worker retries once before reporting it.
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined as any);
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined as any);
+    onTestFinished(() => { warn.mockRestore(); info.mockRestore(); });
+    const herdr = stallFirstLaunches(1);
+    const be = new HerdrBackend(SESSION);
+
+    be.spawn('/usr/local/bin/claude', ['--session-id', 'sid-1'], FRESH_START);
+
+    expect(herdr.workspaces()).toBe(2);
+    expect(herdrCall('workspace', 'close', 'w_try1')).toBeDefined();   // the stalled attempt is closed
+    expect(herdrCall('workspace', 'close', 'w_try2')).toBeUndefined(); // the retry is kept
+    expect(herdrCall('pane', 'read', 'w_try1-1')).toBeDefined();       // snapshot taken before closing
+    expect(herdrCall('agent', 'rename')).toEqual(['--session', SESSION, 'agent', 'rename', 'w_try2-1', 'botmux']);
+    const runs = mockedExecFileSync.mock.calls
+      .map(call => call[1] as string[])
+      .filter(args => args.includes('pane') && args.includes('run'));
+    expect(runs.map(args => args[4])).toEqual(['w_try1-1', 'w_try2-1']);
+    // stderr (warn) gets one summary line; the screen goes to the log only, masked.
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]![0]).toMatch(/did not detect "claude" in pane w_try1-1.*retrying in a fresh pane \(attempt 2\/2\)$/);
+    expect(warn.mock.calls[0]![0]).not.toContain('\n');
+    const shot = info.mock.calls.map(c => String(c[0])).find(m => m.includes('last rows of stalled pane w_try1-1'));
+    expect(shot).toContain('/tmp/botmux-launch/claude');
+    expect(shot).not.toContain('sk-abcdefghijklmnop');
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: a fresh start failing twice reports the last attempt and logs both screens', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined as any);
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined as any);
+    onTestFinished(() => { warn.mockRestore(); info.mockRestore(); });
+    const herdr = stallFirstLaunches(2);
+    const be = new HerdrBackend(SESSION);
+
+    expect(() => be.spawn('/usr/local/bin/claude', ['--session-id', 'sid-1'], FRESH_START))
+      .toThrow(/did not detect "claude" in pane w_try2-1 within \d+ ms \(attempt 2\/2\)$/);
+    expect(herdr.workspaces()).toBe(2);
+    expect(herdrCall('workspace', 'close', 'w_try1')).toBeDefined();
+    expect(herdrCall('workspace', 'close', 'w_try2')).toBeDefined();
+    expect(herdrCall('agent', 'rename')).toBeUndefined();
+    const shots = info.mock.calls.map(c => String(c[0])).filter(m => m.includes('last rows of stalled pane'));
+    expect(shots).toHaveLength(2);
+    expect(warn).toHaveBeenCalledTimes(1);
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: a stalled pane that could not be closed is not retried beside it', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const herdr = stallFirstLaunches(1, [{
+      // Neither the workspace nor the pane itself could be closed.
+      match: a => a.includes('close'),
+      reply: () => { throw Object.assign(new Error('spawnSync herdr ETIMEDOUT'), { code: 'ETIMEDOUT' }); },
+    }]);
+    const be = new HerdrBackend(SESSION);
+
+    expect(() => be.spawn('/usr/local/bin/claude', ['--session-id', 'sid-1'], FRESH_START))
+      .toThrow(/did not detect "claude" in pane w_try1-1.*\(attempt 1\/2; the stalled pane could not be closed, so it was not retried\)$/);
+    expect(herdr.workspaces()).toBe(1);
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: closing the stalled workspace counts as closed even though `pane close` then fails', () => {
+    // Real Herdr: once the workspace is gone, closing its pane reports an error.
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const herdr = stallFirstLaunches(1, [{
+      match: a => a.includes('pane') && a.includes('close'),
+      reply: () => { throw Object.assign(new Error('pane not found'), { status: 1 }); },
+    }]);
+    const be = new HerdrBackend(SESSION);
+
+    be.spawn('/usr/local/bin/claude', ['--session-id', 'sid-1'], FRESH_START);
+
+    expect(herdr.workspaces()).toBe(2);
+    expect(herdrCall('workspace', 'close', 'w_try1')).toBeDefined();
+    expect(herdrCall('agent', 'rename')).toEqual(['--session', SESSION, 'agent', 'rename', 'w_try2-1', 'botmux']);
+    be.kill();
+  });
+
+  /** Split placement (the shape a shared host uses): the stalled split is
+   *  closed and the retry splits from the same target pane again. */
+  function stallFirstSplit(paneCloseFails: boolean): { splits: string[][] } {
+    const splits: string[][] = [];
+    setManagedLaunchResponses('claude', [
+      { match: a => a.includes('workspace') && a.includes('list'), reply: () => JSON.stringify({ result: { workspaces: [{ workspace_id: 'ws-main', focused: true }] } }) },
+      { match: a => a.includes('tab') && a.includes('list'), reply: () => JSON.stringify({ result: { tabs: [{ tab_id: 't-bm', workspace_id: 'ws-main', label: '5 Botmux', focused: false }] } }) },
+      { match: a => a.includes('pane') && a.includes('list'), reply: () => JSON.stringify({ result: { panes: [{ pane_id: 'p-host', tab_id: 't-bm', focused: true }] } }) },
+      {
+        match: a => a.includes('pane') && a.includes('split'),
+        reply: a => { splits.push(a); return JSON.stringify({ result: { pane: { pane_id: `p-try${splits.length}`, tab_id: 't-bm' } } }); },
+      },
+      {
+        match: a => a.includes('pane') && a.includes('close'),
+        reply: () => { if (paneCloseFails) throw Object.assign(new Error('spawnSync herdr ETIMEDOUT'), { code: 'ETIMEDOUT' }); return ''; },
+      },
+      { match: a => a.includes('pane') && a.includes('read'), reply: () => PANE_READ_REPLY('$ /tmp/botmux-launch/claude\n') },
+      {
+        match: a => a.includes('agent') && a.includes('list'),
+        reply: () => {
+          if (splits.length === 1) {
+            vi.setSystemTime(Date.now() + PANE_AGENT_START_TIMEOUT_MS);
+            return JSON.stringify({ result: { agents: [{ name: null, pane_id: 'p-try1', agent: null }] } });
+          }
+          return JSON.stringify({ result: { agents: [{ name: null, pane_id: `p-try${splits.length}`, agent: 'claude', agent_status: 'idle' }] } });
+        },
+      },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY(`p-try${splits.length}`) },
+    ]);
+    return { splits };
+  }
+
+  it('Herdr 0.7.5: split placement closes only the stalled split and retries from the same target pane', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const herdr = stallFirstSplit(false);
+    const be = new HerdrBackend(SESSION, { herdrConfig: { placement: 'split', tab: '5 Botmux' } });
+
+    be.spawn('/usr/local/bin/claude', ['--session-id', 'sid-1'], FRESH_START);
+
+    expect(herdr.splits).toHaveLength(2);
+    for (const split of herdr.splits) expect(split).toContain('p-host');
+    const closes = mockedExecFileSync.mock.calls.map(c => c[1] as string[]).filter(a => a.includes('close'));
+    expect(closes).toEqual([['--session', SESSION, 'pane', 'close', 'p-try1']]);
+    expect(herdrCall('agent', 'rename')).toEqual(['--session', SESSION, 'agent', 'rename', 'p-try2', 'botmux']);
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: split placement does not split again beside a stalled pane it could not close', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const herdr = stallFirstSplit(true);
+    const be = new HerdrBackend(SESSION, { herdrConfig: { placement: 'split', tab: '5 Botmux' } });
+
+    expect(() => be.spawn('/usr/local/bin/claude', ['--session-id', 'sid-1'], FRESH_START))
+      .toThrow(/in pane p-try1 .*could not be closed, so it was not retried\)$/);
+    expect(herdr.splits).toHaveLength(1);
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: without retryPaneAgentStart (an in-worker restart) a stalled launch is not retried', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const herdr = stallFirstLaunches(1);
+    const be = new HerdrBackend(SESSION);
+
+    expect(() => be.spawn('/usr/local/bin/claude', ['--resume', 'sid-1'], { cwd: '/work', cols: 80, rows: 24, env: {} }))
+      .toThrow(/did not detect "claude" in pane w_try1-1 within \d+ ms$/);
+    expect(herdr.workspaces()).toBe(1);
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: only a not-detected launch is retried; a wrong detected kind fails at once', () => {
+    let workspaces = 0;
+    setManagedLaunchResponses('pi', [
+      {
+        match: a => a.includes('workspace') && a.includes('create'),
+        reply: () => { workspaces++; return WORKSPACE_CREATED_REPLY(MANAGED_WORKSPACE, MANAGED_PANE); },
+      },
+      {
+        match: a => a.includes('agent') && a.includes('list'),
+        reply: () => JSON.stringify({ result: { agents: [
+          { name: null, pane_id: MANAGED_PANE, agent: 'codex', agent_status: 'idle' },
+        ] } }),
+      },
+    ]);
+    const be = new HerdrBackend(SESSION);
+
+    expect(() => be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {}, retryPaneAgentStart: true }))
+      .toThrow(/detected "codex" instead of "pi"/);
+    expect(workspaces).toBe(1);
     be.kill();
   });
 

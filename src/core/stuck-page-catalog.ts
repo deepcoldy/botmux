@@ -219,7 +219,7 @@ export function redactStuckPageTail(tail: string): string {
  * secret / password shapes, URL userinfo) and the user name in home-directory
  * paths.
  */
-function maskCredentialShapes(text: string): string {
+export function maskCredentialShapes(text: string): string {
   let out = text.replace(/(\/(?:home|Users)\/)[^/\s]+/g, '$1~');
   for (const shape of SECRET_SHAPES) {
     out = out.replace(shape, (match, keep?: string) =>
