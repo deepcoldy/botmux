@@ -10198,7 +10198,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
   // Drop the persisted idle auto-compact stretch too: a message-less cold
   // resume must not immediately /compact a freshly started CLI reading its
   // whole context without a warm prompt cache (core/idle-auto-compact.ts).
-  clearIdleAutoCompactStretch(ds.session);
+  clearIdleAutoCompactStretch(ds);
   ds.idleAutoCompactPendingNotice = undefined;
   ds.idleAutoCompactDispatchedTurnId = undefined;
   ds.session.webPort = undefined;

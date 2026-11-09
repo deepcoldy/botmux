@@ -583,6 +583,14 @@ export interface DaemonSession {
    *  as handled must not be announced as a successful compact, because this
    *  process never saw it run. Cleared on the finishing edge / terminal. */
   idleAutoCompactDispatchedTurnId?: string;
+  /** Start of the current warm idle stretch for idle auto-compact: the idle
+   *  edge that followed the last botmux turn (core/idle-auto-compact.ts).
+   *  Undefined = no stretch is known to follow a model request (cold). Tracked
+   *  while the feature is off too. In-memory; mirrored to the row while on. */
+  idleAutoCompactWarmSince?: number;
+  /** A botmux turn started and its idle edge has not been seen yet
+   *  (core/idle-auto-compact.ts). In-memory; mirrored to the row while on. */
+  idleAutoCompactArm?: import('./idle-auto-compact.js').IdleAutoCompactArm;
   /** turnIds whose triggering Lark message explicitly @-mentioned this bot.
    *  Only positives are stored (absent === not mentioned), so the bounded FIFO
    *  (see recordTurnExplicitMention) is spent entirely on turns that can still
