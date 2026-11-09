@@ -548,7 +548,7 @@ describe('executeScheduledTask — fresh-topic execution', () => {
       executionPosition: 'top-level',
       topicTitle: '{{owner}}',
       ownerOpenId: undefined,
-    }), active, refreshCliVersion)).resolves.toBeUndefined();
+    }), active, refreshCliVersion)).resolves.toBe('dispatched');
   });
 
   it('thread task without a real root safely degrades to silent chat scope', async () => {

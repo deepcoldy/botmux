@@ -22,7 +22,7 @@ import { computeInputHash } from '../utils/canonical-input-hash.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { fsyncDirectorySyncPortable } from '../utils/fs-durability.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
-import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, ScheduleNotifyEvent, ScheduleRunStats, ScheduleUntilDone } from '../types.js';
+import type { ScheduledTask, ParsedSchedule, ScheduleDeferredTargetState, ScheduleExecutionPosition, ScheduleNotifyEvent, ScheduleRunStats, ScheduledTaskDeferredRun, ScheduleUntilDone } from '../types.js';
 import { parseScheduleRunAsClaim } from '../core/schedule-run-as.js';
 import {
   absorbLegacyFailureStats,
@@ -321,6 +321,58 @@ function fileVersion(fp: string): string {
  * Migrate legacy schedule task (pre-parsed field) to current shape.
  * Legacy tasks had { type, schedule } only — promote schedule+type into parsed.
  */
+/**
+ * Normalize a persisted deferred-run marker. A malformed value is dropped
+ * rather than carried into fire time: it only ever means "waiting for a
+ * managed-runtime handoff", so losing it degrades to a normal retry, while
+ * keeping a half-parsed identity could make a retry look already dispatched.
+ */
+export function normalizeDeferredRun(raw: unknown): ScheduledTaskDeferredRun | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.runId !== 'string' || !r.runId) return undefined;
+  if (typeof r.since !== 'string' || !r.since) return undefined;
+  if (r.reason !== 'traex_runtime') return undefined;
+  const targets: Record<string, ScheduleDeferredTargetState> = {};
+  if (r.targets && typeof r.targets === 'object' && !Array.isArray(r.targets)) {
+    for (const [chatId, state] of Object.entries(r.targets as Record<string, unknown>)) {
+      if (!chatId) continue;
+      targets[chatId] = state === 'dispatched' || state === 'dispatching' || state === 'ambiguous'
+        ? state
+        : 'waiting';
+    }
+  }
+  const targetTurnIds: Record<string, string> = {};
+  if (r.targetTurnIds && typeof r.targetTurnIds === 'object' && !Array.isArray(r.targetTurnIds)) {
+    for (const [chatId, turnId] of Object.entries(r.targetTurnIds as Record<string, unknown>)) {
+      // Only keep turn ids for targets we also track, and only the exact
+      // `schedule:<taskId>:<uuid>` shape the provenance layer accepts.
+      if (targets[chatId] && typeof turnId === 'string' && turnId.startsWith('schedule:')) {
+        targetTurnIds[chatId] = turnId;
+      }
+    }
+  }
+  return {
+    runId: r.runId,
+    since: r.since,
+    reason: 'traex_runtime',
+    ...(typeof r.detail === 'string' && r.detail.trim()
+      ? { detail: Array.from(r.detail.trim()).slice(0, 500).join('') }
+      : {}),
+    ...(typeof r.additionalPrompt === 'string' && r.additionalPrompt
+      ? { additionalPrompt: r.additionalPrompt.slice(0, 32_000) }
+      : {}),
+    ...(r.precondition === 'none' || r.precondition === 'disabled' || r.precondition === 'passed'
+      ? { precondition: r.precondition }
+      : {}),
+    ...(typeof r.retryAt === 'string' && Number.isFinite(Date.parse(r.retryAt))
+      ? { retryAt: new Date(Date.parse(r.retryAt)).toISOString() }
+      : {}),
+    targets,
+    ...(Object.keys(targetTurnIds).length > 0 ? { targetTurnIds } : {}),
+  };
+}
+
 function migrate(raw: any): ScheduledTask | null {
   if (!raw || typeof raw !== 'object') return null;
 
@@ -432,6 +484,10 @@ function migrate(raw: any): ScheduledTask | null {
     runStats: absorbLegacyFailureStats(raw.runStats, raw.consecutiveFailures),
     untilDone: normalizeUntilDone(raw.untilDone),
     notify: normalizeScheduleNotify(raw.notify),
+    // A deferred run survives daemon restarts and external reloads: dropping it
+    // would mint a fresh run id and re-dispatch a target that already accepted
+    // its turn. normalizeDeferredRun drops malformed rows to a plain retry.
+    deferredRun: normalizeDeferredRun(raw.deferredRun),
   };
 }
 
@@ -830,7 +886,7 @@ export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
     'calendar' | 'calendarDayType' | 'lastCalendarCheck' | 'manualRunRequested' | 'enabled' | 'disabledReason' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastRunId' | 'lastError' | 'lastDeliveryError' | 'failureAlertSent' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
-    | 'runStats' | 'untilDone' | 'notify'
+    | 'runStats' | 'untilDone' | 'notify' | 'deferredRun'
   >> & { chatIds?: readonly string[] | null },
   appId?: string,
 ): boolean {
@@ -897,6 +953,43 @@ export function claimRun(
   }, appId);
 }
 
+export type ScheduleDeferredClaimResult =
+  | { ok: true; task: ScheduledTask }
+  | { ok: false; error: 'not_found' | 'already_running' | 'not_deferred' | 'run_mismatch' };
+
+/** Atomically re-claim the SAME parked run for a retry. Unlike claimRun this
+ *  never advances nextRunAt: the occurrence was already consumed when the run
+ *  was first admitted, and re-arming it would create a second fire. The
+ *  persisted runId must match, so a stale retry cannot hijack a newer run. */
+export function claimDeferredRun(
+  id: string,
+  runId: string,
+  appId?: string,
+): ScheduleDeferredClaimResult {
+  return mutateTasks<ScheduleDeferredClaimResult>(working => {
+    const task = working.get(id);
+    if (!task) return { result: { ok: false, error: 'not_found' } as const, changed: false };
+    if (task.lastStatus === 'running') {
+      return { result: { ok: false, error: 'already_running' } as const, changed: false };
+    }
+    if (!task.deferredRun) {
+      return { result: { ok: false, error: 'not_deferred' } as const, changed: false };
+    }
+    if (task.deferredRun.runId !== runId) {
+      return { result: { ok: false, error: 'run_mismatch' } as const, changed: false };
+    }
+    const manualRunRequested = task.manualRunRequested;
+    delete task.manualRunRequested;
+    Object.assign(task, {
+      lastStatus: 'running' as const,
+      lastRunId: runId,
+      lastError: undefined,
+      lastDeliveryError: undefined,
+    });
+    return { result: { ok: true, task: { ...task, manualRunRequested } } as const, changed: true };
+  }, appId);
+}
+
 /** Atomically make a task due without re-arming one that is already running. */
 export function requestRunNow(
   id: string,
@@ -931,6 +1024,8 @@ export function markSkipped(id: string, nextRunAt?: string, runId?: string): voi
     task.lastStatus = 'skipped';
     task.lastError = undefined;
     task.lastDeliveryError = undefined;
+    // Terminal settlement: the parked run is over, so no retry may revive it.
+    delete task.deferredRun;
     task.runStats = recordRunOutcome(task.runStats, 'skipped');
     if (task.parsed.kind === 'once') task.nextRunAt = nextRunAt;
     working.set(id, settleUntilDoneSkip(task, runId, Date.now()));
@@ -963,6 +1058,8 @@ export function markRun(
     task.lastStatus = success ? 'ok' : 'error';
     task.lastError = success ? undefined : error;
     task.lastDeliveryError = deliveryError;
+    // Terminal settlement: a parked run never survives an ok/error outcome.
+    delete task.deferredRun;
 
     // Shared failure counter lives in the ledger (before any early return, so
     // until-done settlements advance it too). Admin watermark: recorded when
@@ -1183,6 +1280,8 @@ export function markCalendarBlocked(
     task.lastCalendarCheck = check;
     task.lastError = check.status === 'error' ? check.reason : undefined;
     task.lastDeliveryError = undefined;
+    // Terminal settlement: the parked run is over.
+    delete task.deferredRun;
     if (check.status === 'error') {
       const tracking = nextFailureTracking(task.runStats, false);
       task.runStats = tracking.runStats;

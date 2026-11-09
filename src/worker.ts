@@ -55,7 +55,7 @@ import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { accessSync, chmodSync, mkdirSync, writeFileSync, unlinkSync, rmdirSync, existsSync, statSync, lstatSync, readdirSync, readlinkSync, readFileSync, realpathSync, watch as fsWatch, createWriteStream, constants as fsConstants, type FSWatcher, type WriteStream } from 'node:fs';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
-import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
+import { join, basename, dirname, delimiter, relative, extname, isAbsolute } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, publishActiveTurn, canonicalPathNearest, GIT_ASKPASS_BASENAME, prepareTurnGitConfigEnv } from './core/cli-identity.js';
 import { prepareLarkToolEnv, usesLarkToolBinding, cleanupLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir, resolveIdentityStorageModel, larkToolLoopbackService } from './core/lark-tool-binding.js';
@@ -417,6 +417,8 @@ import { traexRejectedArgument } from './adapters/cli/traex-version.js';
 import { isTraexProcess, resolveTraexOwnershipPid, scheduleTraexLeafPidResolve } from './core/traex-leaf-pid.js';
 import { readRunningExeIdentity } from './services/cli-install-identity.js';
 import { pinWorkerTraeHome } from './services/traex-paths.js';
+import { acquireTraexRuntimeLease, daemonBirthIdentity, type TraexRuntimeLease } from './services/traex-runtime-gate.js';
+import { releaseDirForExecutable } from './services/traex-runtime-snapshot.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput } from './services/codex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
@@ -3122,6 +3124,13 @@ let lastCliExitSignal: string | null = null;
  *  of per-WS attach-session PTYs. Set in spawnCli's adopt branch. */
 let isPipeMode = false;
 let effectiveBackendType: BackendType = 'pty';
+
+/** Abandons a `starting` TRAE runtime reservation when this spawn dies before
+ *  the CLI is proven running (superseded generation, spawn failure, worker
+ *  shutdown). Cleared as soon as the CLI pid is recorded, so a normal exit
+ *  releases instead of abandoning. Without this a pre-exec death would leave a
+ *  permanent `starting` occupancy that no liveness proof can clear. */
+let pendingTraexSpawnAbandon: (() => void) | undefined;
 
 /**
  * Whether a screen snapshot can safely drive state changes or synthetic input.
@@ -23502,15 +23511,18 @@ async function spawnCliBody(
     cliAdapter = launchAdapter.adapter;
     waitedForMissingCli = launchAdapter.waited;
   }
-  if (effectiveCliId === 'traex' && cfg.resume === true && cfg.cliSessionId && cfg.adoptMode !== true) {
-    // The native resume target is host-owned. A resumed transcript can occupy
-    // the entire viewport while a nonblocking repository notice hides both
-    // footer rows, so cold-start banner cells need not remain visible.
-    cliAdapter = {
-      ...cliAdapter,
-      startupReadyFromHistory: (screen: string) => traexRestoredComposerReady(screen, { resumedSession: true }),
-    };
-  }
+  // A resumed native transcript can occupy the entire viewport while a
+  // nonblocking repository notice hides both footer rows, so cold-start banner
+  // cells need not remain visible. Re-applied whenever the adapter is rebuilt
+  // around a verified snapshot path (see the runtime gate below).
+  const withTraexResumeAdapter = (adapter: CliAdapter): CliAdapter =>
+    effectiveCliId === 'traex' && cfg.resume === true && cfg.cliSessionId && cfg.adoptMode !== true
+      ? {
+          ...adapter,
+          startupReadyFromHistory: (screen: string) => traexRestoredComposerReady(screen, { resumedSession: true }),
+        }
+      : adapter;
+  cliAdapter = withTraexResumeAdapter(cliAdapter);
   // Re-verify capability once effectiveCliId (e.g. dsh-tui) and cliPathOverride are resolved into cliAdapter.
   if (cliAdapter.supportsProgramStatus && !programStatusStream) {
     programStatusStream = new ProgramStatusFramingStream();
@@ -25046,6 +25058,131 @@ async function spawnCliBody(
   // keeps the existing record (it was verified equal).
   if (!willReattachPersistent) {
     writeCredentialSourceStamp(config.session.dataDir, cfg.sessionId, credentialSourceDir);
+  }
+
+  // ── TRAE shared-cache runtime gate ────────────────────────────────────────
+  // Every managed TRAE spawn that can write <TRAE_HOME>/skills/.system must be
+  // admitted by the cross-process registry keyed on the PHYSICAL skills dir.
+  // This is the single exec choke point, so it covers a daemon fork and an
+  // in-worker `restartCliProcess` alike. An incompatible old runtime keeps the
+  // domain until its CLI is proven gone; this worker keeps its input and waits
+  // instead of retargeting it. A non-fixed launch execs a verified private
+  // snapshot, so a later install switch cannot make this runtime load content
+  // it never registered.
+  let traexRuntimeLease: TraexRuntimeLease | undefined;
+  let traexLeaseRunning = false;
+  let traexLeaseHeartbeat: ReturnType<typeof setInterval> | undefined;
+  const stopTraexLeaseHeartbeat = (): void => {
+    if (traexLeaseHeartbeat !== undefined) {
+      clearInterval(traexLeaseHeartbeat);
+      traexLeaseHeartbeat = undefined;
+    }
+  };
+  // Record the actual exec'd CLI against the reservation. Called with the
+  // backend child pid right after spawn and again whenever a launcher/sandbox
+  // leaf resolves, so the registry names the process that really writes the
+  // shared cache rather than a wrapper that may exit earlier.
+  const attachTraexLeaseCli = (pid: number): void => {
+    const lease = traexRuntimeLease;
+    if (!lease) return;
+    const cliStart = readProcessStartIdentity(pid);
+    void lease.markRunning(pid, cliStart ?? undefined).catch((err) => {
+      log(`[traex-runtime] failed to record CLI identity ${pid}: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    if (traexLeaseRunning) return;
+    traexLeaseRunning = true;
+    // From here the worker is not a "pre-exec" owner: an exit must release
+    // (verified) rather than abandon the reservation.
+    pendingTraexSpawnAbandon = undefined;
+    traexLeaseHeartbeat = setInterval(() => {
+      const current = traexRuntimeLease;
+      if (!current) return;
+      void current.heartbeat().catch((err) => {
+        log(`[traex-runtime] heartbeat failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }, 20_000);
+    traexLeaseHeartbeat.unref?.();
+  };
+  const traexGateApplies = effectiveCliId === 'traex'
+    && cfg.adoptMode !== true
+    && !willReattachPersistent
+    && cfg.existingAppServerEndpoint === undefined
+    && !cfg.wrapperCli
+    && cfg.cliLaunchMode !== 'forge-traex'
+    && !isRemoteBackendType(effectiveBackendType);
+  if (traexGateApplies) {
+    const fixedPath = typeof cfg.cliPathOverride === 'string' && cfg.cliPathOverride.trim().length > 0;
+    const executablePath = fixedPath
+      ? resolveCommandReal(cfg.cliPathOverride!.trim())
+      : resolveCommandReal('traex');
+    if (!isAbsolute(executablePath) || !existsSync(executablePath)) {
+      // Nothing can exec; let the existing launch preflight report the missing
+      // CLI instead of reserving a slot for a binary that does not exist.
+      log(`[traex-runtime] skipping gate: unresolved install entry ${executablePath}`);
+    } else {
+      const workerStart = readProcessStartIdentity(process.pid);
+      const daemon = daemonBirthIdentity();
+      const gate = await acquireTraexRuntimeLease({
+        traeHome: process.env.TRAE_HOME,
+        releaseDir: releaseDirForExecutable(executablePath),
+        executablePath,
+        workerPid: process.pid,
+        ...(workerStart ? { workerStart } : {}),
+        daemonPid: daemon.daemonPid,
+        ...(daemon.daemonStart ? { daemonStart: daemon.daemonStart } : {}),
+        fixedPath,
+        ...(fixedPath ? { fixedExecutablePath: executablePath } : {}),
+        // Sandboxed launches bind the install path the operator resolved; the
+        // snapshot is only used for direct spawns, so keep them hash-only.
+        materialize: !fixedPath && !sandboxRequested,
+        waitMs: Number.POSITIVE_INFINITY,
+        pollMs: 500,
+        abort: () => {
+          if (closeRequested) return 'worker-closing';
+          if (spawnGeneration !== cliSpawnGeneration) return 'spawn-superseded';
+          return undefined;
+        },
+        onBlocked: (blockers, detail) => {
+          log(`[traex-runtime] waiting for an incompatible TRAE runtime: ${detail}`);
+          send({
+            type: 'traex_runtime_deferred',
+            blockers: blockers.map((blocker) => ({
+              occupantId: blocker.occupantId,
+              comboKey: blocker.comboKey,
+              phase: blocker.phase,
+              ...(blocker.fixedPath ? { fixedPath: true } : {}),
+              ...(blocker.pid !== undefined ? { pid: blocker.pid } : {}),
+            })),
+            detail,
+          });
+        },
+      });
+      if (gate.kind === 'aborted') throw new CliSpawnSupersededError();
+      if (gate.kind === 'blocked') {
+        throw new Error(`TRAE runtime gate stayed blocked: ${gate.detail}`);
+      }
+      if (gate.kind === 'error') {
+        throw new Error(`TRAE runtime gate refused the start (${gate.reason})${gate.detail ? `: ${gate.detail}` : ''}`);
+      }
+      traexRuntimeLease = gate.lease;
+      const abandonLease = (): void => {
+        const lease = traexRuntimeLease;
+        if (!lease || traexLeaseRunning) return;
+        traexRuntimeLease = undefined;
+        pendingTraexSpawnAbandon = undefined;
+        void lease.abandon();
+      };
+      pendingTraexSpawnAbandon = abandonLease;
+      if (gate.lease.snapshot.snapshot && !fixedPath) {
+        // Exec the verified private copy instead of the mutable install entry.
+        cfg = { ...cfg, cliPathOverride: gate.lease.snapshot.traexPath };
+        cliAdapter = withTraexResumeAdapter(createAdapter());
+      }
+      log(
+        `[traex-runtime] admitted content ${gate.lease.snapshot.comboKey.slice(0, 12)} `
+        + `(${fixedPath ? 'pinned' : gate.lease.snapshot.snapshot ? 'snapshot' : 'direct'})`,
+      );
+    }
   }
 
   // The worker establishes trust before any runner output can be parsed. A
@@ -27989,6 +28126,12 @@ async function spawnCliBody(
     }
     const spawnBackend = backend;
     const spawnCliBin = cliAdapter.resolvedBin;
+    if (spawnGeneration !== cliSpawnGeneration) {
+      // The reservation belongs to a superseded generation; drop it before it
+      // can exec anything, then let the caller treat this as a normal abort.
+      pendingTraexSpawnAbandon?.();
+      throw new CliSpawnSupersededError();
+    }
     spawnWithCodexModelLaunch({
       dataDir: config.session.dataDir, sessionId: cfg.sessionId, launch: nativeModelLaunch,
       reattached: () => 'isReattach' in spawnBackend && spawnBackend.isReattach === true,
@@ -28037,6 +28180,12 @@ async function spawnCliBody(
       }
     }
   } catch (err) {
+    // A failed launch either never exec'd (drop the reservation) or already
+    // produced a backend child (keep it, and let the verified exit path release
+    // it). Never abandon a pid that may be writing the shared cache.
+    const spawnedPid = backend?.getChildPid?.();
+    if (spawnedPid) attachTraexLeaseCli(spawnedPid);
+    else pendingTraexSpawnAbandon?.();
     cleanupCodexAppControlBootstrap();
     programStatusRelayPlanCleanup?.();
     if (!willReattachPersistent && sandboxTreeOutlivesPane) {
@@ -28234,6 +28383,10 @@ async function spawnCliBody(
   // can verify they were spawned inside a botmux session by walking the
   // process tree and looking for a matching pid file in this directory.
   const cliPid = backend.getChildPid?.();
+  // The gate reservation became a real runtime the moment the backend child
+  // exists; attach it before any other post-spawn bookkeeping so a crash in
+  // between still leaves a `running` record (never a silent `starting` leak).
+  if (cliPid) attachTraexLeaseCli(cliPid);
   if (cfg.existingAppServerEndpoint !== undefined) {
     // The local `codex --remote` client does not own the selected rollout fd;
     // writeInput must accept only the explicitly bound remote thread in the
@@ -28279,6 +28432,9 @@ async function spawnCliBody(
     // module-level bridgeCliPid and re-points to the real CLI's jsonl.
     bridgeCliPid = realPid;
     publishLocalProcessAttestation(realPid);
+    // Keep the shared-cache reservation pointing at the process that actually
+    // runs TRAE, not a launcher layer that may exit before the CLI does.
+    if (cfg.cliId === 'traex') attachTraexLeaseCli(realPid);
   };
   // wrapperCli launcher → real CLI by comm. `panePid` is what the backend
   // reports while this spawn is current (equal to launcherPid unless a relay
@@ -28397,6 +28553,7 @@ async function spawnCliBody(
         // may already have pointed the bridge pid at a layer above this leaf.
         bridgeCliPid = realPid;
         publishLocalProcessAttestation(realPid);
+        attachTraexLeaseCli(realPid);
       },
       schedule: (fn, ms) => { setTimeout(fn, ms); },
     });
@@ -28489,6 +28646,9 @@ async function spawnCliBody(
       const pid = backend.getChildPid?.();
       if (pid) {
         publishLocalProcessAttestation(pid);
+        // Backends that fork their pane asynchronously only expose the CLI pid
+        // here; the gate reservation must not stay `starting` once it exists.
+        if (cfg.cliId === 'traex') attachTraexLeaseCli(pid);
         if (process.env.SESSION_DATA_DIR && !cliPidMarker) {
           try {
             const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
@@ -29095,6 +29255,22 @@ async function spawnCliBody(
     restoreHerdrWebBindings();
   }
   backend.onExit(bindSessionBackendExit((code, signal) => {
+    // Settle this spawn's TRAE domain reservation before any other exit logic:
+    // a running CLI is released only once its pid is proven gone; a lease that
+    // never reached markRunning is abandoned (no CLI was ever exec'd).
+    {
+      const lease = traexRuntimeLease;
+      const wasRunning = traexLeaseRunning;
+      stopTraexLeaseHeartbeat();
+      traexRuntimeLease = undefined;
+      traexLeaseRunning = false;
+      pendingTraexSpawnAbandon = undefined;
+      if (lease) {
+        void (wasRunning ? lease.release() : lease.abandon()).catch((err) => {
+          log(`[traex-runtime] lease settlement failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
+      }
+    }
     const intentionalRestart = intentionalRestartBackend === observedBackend;
     if (intentionalRestart) intentionalRestartBackend = null;
     // destroySession()/kill() may report exit after the 500ms replacement spawn
@@ -29591,6 +29767,9 @@ function killCli(opts: {
   // remaining cleanup is synchronous today, but generation ownership must not
   // depend on that implementation detail.
   cliSpawnGeneration++;
+  // A TRAE start that reserved the shared-cache domain but has not exec'd yet
+  // must not leave a permanent `starting` occupancy behind.
+  pendingTraexSpawnAbandon?.();
   lastSpawnCodexLauncherPid = undefined;
   codexOwnershipAttestationPending = false;
   if (backend) previousCliEndedAtMs = Date.now();

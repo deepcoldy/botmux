@@ -10,7 +10,12 @@ import {
   SchedulePreconditionError,
 } from './schedule-precondition-runner.js';
 
-export type ScheduledTaskPreconditionOutcome = 'executed' | 'skipped';
+export type ScheduledTaskPreconditionOutcome = 'executed' | 'skipped' | 'deferred';
+
+/** What the model dispatch actually did. `deferred` means the run never
+ *  reached a session because a managed runtime handoff is still in progress;
+ *  the caller must keep the run parked instead of recording an execution. */
+export type ScheduledTaskDispatchResult = 'dispatched' | 'deferred' | void;
 
 export type ScheduledTaskPreconditionStatus =
   | 'none'
@@ -87,7 +92,7 @@ function observePreconditionSafely(
 export async function executeScheduledTaskWithPrecondition(
   task: ScheduledTask,
   effectiveAppId: string,
-  execute: (additionalPrompt?: string) => Promise<void>,
+  execute: (additionalPrompt?: string) => Promise<ScheduledTaskDispatchResult>,
   dependencies: SchedulePreconditionGateDependencies = defaultDependencies,
   observer?: ScheduledTaskPreconditionObserver,
 ): Promise<ScheduledTaskPreconditionOutcome> {
@@ -117,16 +122,14 @@ export async function executeScheduledTaskWithPrecondition(
       precondition: 'none',
       additionalPrompt: false,
     });
-    await execute();
-    return 'executed';
+    return (await execute()) === 'deferred' ? 'deferred' : 'executed';
   }
   if (!condition.enabled) {
     observePreconditionSafely(task, observer, {
       precondition: 'disabled',
       additionalPrompt: false,
     });
-    await execute();
-    return 'executed';
+    return (await execute()) === 'deferred' ? 'deferred' : 'executed';
   }
 
   let result: Awaited<ReturnType<typeof runSchedulePrecondition>>;
@@ -158,10 +161,8 @@ export async function executeScheduledTaskWithPrecondition(
     precondition: 'passed',
     additionalPrompt: result.additionalPrompt !== undefined,
   });
-  if (result.additionalPrompt === undefined) {
-    await execute();
-  } else {
-    await execute(result.additionalPrompt);
-  }
-  return 'executed';
+  const dispatched = result.additionalPrompt === undefined
+    ? await execute()
+    : await execute(result.additionalPrompt);
+  return dispatched === 'deferred' ? 'deferred' : 'executed';
 }

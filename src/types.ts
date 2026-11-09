@@ -1741,6 +1741,42 @@ export interface ScheduleUntilDone {
  *  streak). `expired`: an until-done task reached its deadline. */
 export type ScheduleNotifyEvent = 'failing' | 'expired';
 
+/** Per-target progress of a deferred run.
+ *
+ *  `waiting` has not been handed to any session yet and is safe to dispatch.
+ *  `dispatching` was persisted immediately before the IPC send; a crash in this
+ *  state becomes `ambiguous` on restart because we cannot prove whether the
+ *  worker accepted the turn.
+ *  `dispatched` means the target's turn input was accepted by a worker/CLI
+ *  session (accepted ≠ finished — this only prevents re-dispatch).
+ *  `ambiguous` must never be replayed automatically: doing so could execute the
+ *  same input twice. */
+export type ScheduleDeferredTargetState = 'waiting' | 'dispatching' | 'dispatched' | 'ambiguous';
+
+/** A scheduled run parked behind a managed-runtime handoff. */
+export interface ScheduledTaskDeferredRun {
+  /** Stable logical run identity reused by every retry until it settles. */
+  runId: string;
+  /** When the run first deferred (ISO). Never updated by later retries. */
+  since: string;
+  reason: 'traex_runtime';
+  /** Human-readable blocker summary for the dashboard / owner notice. */
+  detail?: string;
+  /** Effective extra prompt from the Bash precondition, preserved so a retry
+   *  runs the exact same prompt instead of silently dropping it. */
+  additionalPrompt?: string;
+  /** Precondition observation that admitted the original attempt, preserved so
+   *  the eventual run log reports what actually happened. */
+  precondition?: 'none' | 'disabled' | 'passed';
+  /** Earliest time the next retry may claim this parked run. */
+  retryAt?: string;
+  targets: Record<string, ScheduleDeferredTargetState>;
+  /** Stable per-target scheduled turn ids. Persisted before dispatch so a
+   *  retry (or a daemon restart) cannot mint a second turn for the same
+   *  target; the worker's turn-id dedupe then rejects a duplicate input. */
+  targetTurnIds?: Record<string, string>;
+}
+
 export interface ScheduledTask {
   id: string;
   /** Optional per-bot work-calendar name; filters automatic recurring dispatch only. */
@@ -1844,10 +1880,20 @@ export interface ScheduledTask {
   lastRunAt?: string;
   nextRunAt?: string;
   /** Durable state of the most recently claimed run. `running` is written
-   *  before asynchronous dispatch and settled only by the matching run id. */
-  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
+   *  before asynchronous dispatch and settled only by the matching run id.
+   *  `deferred` means the run could not start because an incompatible managed
+   *  runtime still occupies the shared cache; it is waiting, not finished. */
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped' | 'deferred';
   /** Scheduler-generated identity for the run represented by lastStatus. */
   lastRunId?: string;
+  /** Waiting state for a run held behind a managed-runtime handoff.
+   *
+   *  This is deliberately NOT a run-log outcome: it has no finishedAt and must
+   *  not consume a repeat/one-shot. It keeps the exact run identity (runId,
+   *  per-target turn ids, effective extra prompt) so a retry after the gate
+   *  opens re-enters the same logical run instead of minting a second turn.
+   *  Cleared by every terminal settlement (ok/error/skipped/calendar). */
+  deferredRun?: ScheduledTaskDeferredRun;
   lastError?: string;
   lastDeliveryError?: string;
   /** 管理员告警水印（#2334）：这串连续失败的管理员 DM 已在结算时记账（落盘
@@ -2085,6 +2131,11 @@ export interface QueuedActivationTailEntry {
   cliInput: CliTurnPayload;
   turnId: string;
   dispatchAttempt?: number;
+  /** Which runtime may execute this queued turn. `'new'` is stamped when the
+   *  entry was admitted while an install-change reclaim was pending: it must
+   *  never be injected into the old worker being retired, and it must not keep
+   *  that worker alive. Absent/`'old'` entries belong to the current runtime. */
+  ownerRuntime?: 'old' | 'new';
 }
 
 /** Durable opening/setup state while a repository picker or detached default
@@ -2639,6 +2690,15 @@ export type WorkerToDaemonBase =
    *  The daemon retires the worker once the current turn settles, so the next
    *  turn cold-starts on the new install. */
   | { type: 'cli_install_changed'; runningVersion: string; installedVersion: string }
+  /** A managed TRAE spawn is holding its input because another runtime with
+   *  incompatible content still occupies the shared physical skills cache.
+   *  The worker keeps waiting inside the gate; this is a status edge (the
+   *  daemon may surface it), never an input receipt. */
+  | {
+      type: 'traex_runtime_deferred';
+      blockers: Array<{ occupantId: string; comboKey: string; phase: 'starting' | 'running' | 'draining'; fixedPath?: boolean; pid?: number }>;
+      detail: string;
+    }
   | { type: 'runner_build_ready'; runnerBuildId: string }
   | {
       type: 'restart_result';

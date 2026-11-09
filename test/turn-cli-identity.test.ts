@@ -15,7 +15,7 @@
  * Run:  npx vitest run --project unit test/turn-cli-identity.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -602,6 +602,7 @@ describe('target daemon consumes signed message authority', () => {
       noteScheduledIdentityRestored: vi.fn(),
       isAutoCompletedSchedule, buildUntilDoneRunPrompt, scheduleTimeZone,
       scheduleStore: { effectiveScheduleChatIds: (task: any) => task.chatIds ?? [task.chatId] },
+      randomUUID,
       getDashboardAdminOpenIds: () => [ALICE],
       canOperate: vi.fn((_appId: string, _chatId: string, openId?: string) => openId === ALICE),
       scheduleAuthorityStore: undefined as any,
@@ -744,7 +745,15 @@ describe('target daemon consumes signed message authority', () => {
     let execute: (task: any, context: any) => Promise<void>;
     let dispatches = 0;
     h.installSchedulerCallback({
-      cfg: { larkAppId: APP }, scheduler: { setExecuteCallback: (fn: typeof execute) => { execute = fn; } },
+      cfg: { larkAppId: APP }, scheduler: {
+        setExecuteCallback: (fn: typeof execute) => { execute = fn; },
+        // The production callback reads the parked-run state and persists the
+        // per-target dispatch states. These tests run fresh (no parked run).
+        getRuntimeTask: () => undefined,
+        markDeferredTargetDispatching: () => false,
+        markDeferredTargetDispatched: () => false,
+        parkDeferredRun: () => false,
+      },
       executeScheduledTaskWithPrecondition: async (_task: any, _app: any, run: () => Promise<void>) => {
         await run(); return 'executed';
       },
