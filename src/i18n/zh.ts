@@ -1404,6 +1404,7 @@ export const messages: Record<string, string> = {
   'worker.empty_final_failed_invalid_request': '⚠️ {cliName} 请求被拒绝：{reason}\n请检查 CLI、模型网关和工具 schema 配置，修复后重发消息。',
   'worker.empty_final_failed_auth': '⚠️ {cliName} 认证失败：{reason}\n请检查 CLI 登录状态和模型服务凭证，修复后重发消息。',
   'worker.empty_final_failed_connection': '⚠️ {cliName} 连接模型服务失败：{reason}\n请检查网络与模型服务状态，恢复后重发消息。',
+  'worker.empty_final_failed_payload_too_large': '⚠️ {cliName} 请求体超过模型服务上限（413 Payload Too Large）：{reason}\n这不是网络问题，是单次请求的**体积**太大——多为会话里累积了太多图片（每张图会转成几 MB 的 base64 并随每一轮重发）或历史太长。\n处理：新开一个会话（或点「新话题」）重发任务；需要看图时先缩到 1280px 以内、一次只读 1~3 张；长任务分段做，不要在一个会话里堆几十张图。',
   'worker.empty_final_failed_upstream': '⚠️ {cliName} 遇到模型网关/上游服务故障：{reason}\n这是服务端暂态错误，与你的消息内容无关；请稍后重发消息重试。',
   'worker.empty_final_failed_credential': '⚠️ {cliName} 获取模型凭据失败，本轮已中止：{reason}\n请求没有发到模型，多为机器负载高时取 token 超时，属暂态错误；直接重发消息即可继续。反复出现请检查凭据命令或登录状态。',
   'worker.codex_capacity_recovery_stopped': '⚠️ {cliName} 模型容量不足，当前停止自动恢复。请稍后点击「继续」恢复原任务，或切换模型后继续。',
