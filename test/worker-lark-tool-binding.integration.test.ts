@@ -55,6 +55,10 @@ it('a real direct Trae worker pins managed tool PATH after the CLI launcher rese
   }
 },35000);
 
+// Each case boots a real worker and CLI. A CI runner (4 cores, several such files in parallel) has taken over 25s
+// here; under 4-core load on max one case took 14.7s against 1.4-2.3s alone. Allow 60s so load does not read as failure.
+const WORKER_RESULT_WAIT_MS = 60_000;
+
 it.each([
   { resume: false, daemonTool: true, headless: false, larkToolBinding: undefined },
   { resume: false, daemonTool: true, headless: false, larkToolBinding: true },
@@ -98,7 +102,7 @@ setInterval(()=>{},1000);
       workingDir: dataDir, cliId: 'pi', cliPathOverride: fakeCli, backendType: 'pty', prompt: '',
       larkAppId: 'cli_current_app', larkAppSecret: headless ? '' : 'test-only-secret', larkToolBinding,
       env: { PATH: `${botBin}:${process.env.PATH}`, LARKSUITE_CLI_APP_ID: 'cli_wrong' } });
-    const deadline = Date.now() + 25_000;
+    const deadline = Date.now() + WORKER_RESULT_WAIT_MS;
     while (!existsSync(output) && child.exitCode === null && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
     expect(existsSync(output), logs).toBe(true);
     const result = JSON.parse(readFileSync(output, 'utf8'));
@@ -115,7 +119,7 @@ setInterval(()=>{},1000);
     const timer = setTimeout(() => child.kill('SIGKILL'), 5000);
     await exit; clearTimeout(timer); rmSync(root, { recursive: true, force: true });
   }
-}, 35_000);
+}, WORKER_RESULT_WAIT_MS + 15_000);
 
 it.each([false, true])('aligns a real worker system prompt with the managed bot-default lark identity (headless=%s)', async headless => {
   const root = mkdtempSync(join(tmpdir(), 'worker-lark-prompt-'));
@@ -144,7 +148,7 @@ setInterval(()=>{},1000);
       larkAppId: 'cli_current_app', larkAppSecret: headless ? '' : 'test-only-secret', locale: 'zh', larkToolBinding: true,
       triggerUserAuth: { enabled: true, tools: ['lark-cli', 'bytedcli'], fallback: 'bot-identity' },
       env: { PATH: `${botBin}:${process.env.PATH}` } });
-    const deadline = Date.now() + 25_000;
+    const deadline = Date.now() + WORKER_RESULT_WAIT_MS;
     while (!existsSync(output) && child.exitCode === null && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
     expect(existsSync(output), logs).toBe(true);
     const { prompt } = JSON.parse(readFileSync(output, 'utf8'));
@@ -166,7 +170,7 @@ setInterval(()=>{},1000);
     const timer = setTimeout(() => child.kill('SIGKILL'), 5000);
     await exit; clearTimeout(timer); rmSync(root, { recursive: true, force: true });
   }
-}, 35_000);
+}, WORKER_RESULT_WAIT_MS + 15_000);
 
 const canSandbox = process.platform === 'linux' && spawnSync('bwrap', [
   '--ro-bind', '/', '/', '--unshare-user', '--unshare-pid', '--proc', '/proc', '--', '/bin/true',
@@ -218,7 +222,7 @@ process.stdout.write('Ready\\n'); setInterval(()=>{},1000);
       larkAppId: 'cli_current_app', larkAppSecret: headless ? '' : 'test-only-secret', sandbox: true, larkToolBinding: true,
       sandboxPaths: { readOnly: [join(root, 'bot-bin')] },
       env: { PATH: `${join(root, 'bot-bin')}:${process.env.PATH}`, LARKSUITE_CLI_APP_ID: 'cli_wrong' } });
-    const deadline = Date.now() + 25_000;
+    const deadline = Date.now() + WORKER_RESULT_WAIT_MS;
     while (!existsSync(output) && child.exitCode === null && Date.now() < deadline) await new Promise(r => setTimeout(r, 50));
     expect(existsSync(output), logs).toBe(true);
     const result = JSON.parse(readFileSync(output, 'utf8'));
@@ -232,4 +236,4 @@ process.stdout.write('Ready\\n'); setInterval(()=>{},1000);
     const timer = setTimeout(() => child.kill('SIGKILL'), 5000);
     await exit; clearTimeout(timer); rmSync(root, { recursive: true, force: true });
   }
-}, 35_000);
+}, WORKER_RESULT_WAIT_MS + 15_000);

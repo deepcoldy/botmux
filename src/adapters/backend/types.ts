@@ -276,6 +276,11 @@ export interface SpawnOpts {
   modelBackendVariant?: 'standard' | 'max';
   /** Provider-neutral reasoning effort for structured remote runners. */
   reasoningEffort?: string;
+  /** Herdr facade only: retry a launch Herdr never recognises once in a fresh
+   *  pane. Set for a worker's first CLI start unless its init carries a
+   *  restartAttemptId: restarts must finish inside the restart coordinator's
+   *  deadline, and a wake-up from suspend (resume attempt id) is left off too. */
+  retryPaneAgentStart?: boolean;
 }
 
 export type AmbiguousSubmissionRecoveryFailure =

@@ -74,7 +74,7 @@ import * as sessionStore from '../services/session-store.js';
 import { applySessionRowCommand } from '../services/session-commands.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
 import { allowsTaskModelOverride } from './launch-model-capability.js';
-import { parseHookCommand } from '../services/hook-runner.js';
+import { emitHookEventLocal, parseHookCommand } from '../services/hook-runner.js';
 import {
   cliModelSupportsReasoningEffort,
   isBackendVariantCliId,
@@ -119,6 +119,7 @@ import {
   SchedulePreconditionError,
 } from '../services/schedule-precondition-runner.js';
 import * as groupsStore from '../services/groups-store.js';
+import { GROUP_SEND_BODY_MAX_BYTES, parseGroupSendBody, readRequestBoundGroupMessage, sendRequestBoundGroupMessage } from '../services/request-bound-group-send.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
@@ -621,7 +622,8 @@ import { ChatRenameCooldown, chatRenameSerialQueue, normalizeLarkChatName } from
 import { isSilentMessageListenerSession } from './message-listener-silence.js';
 import { executeChatRename } from './chat-rename-operation.js';
 import { authorizeHumanManager } from './human-manager-authorization.js';
-import { changeChatManager, getChatManagerStatus } from '../services/chat-manager.js';
+import { planChatManagerMutation } from './lead-only.js';
+import { changeChatManager, getChatManagerStatus, setChatManagerLeadOnly } from '../services/chat-manager.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, isHttpVirtualSession, isHeadlessSessionChatId, larkTransportEnabled, type DaemonSession } from './types.js';
 import { isRemoteBackendSession, persistentBackendTargetForSession, probePersistentBackendTarget } from './persistent-backend.js';
@@ -687,6 +689,8 @@ export function ipcRoute(method: string, path: string, handler: Handler): void {
   routes.push({ method: method.toUpperCase(), pattern, keys, handler });
 }
 
+const groupSendStorePath = (larkAppId: string): string => join(config.session.dataDir, `group-sends-${larkAppId}.json`);
+
 export function jsonRes(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));
@@ -714,12 +718,24 @@ function requireBoundBot(handler: Handler, notBound: object = NOT_BOUND_BODY.leg
 const BAD_JSON: unique symbol = Symbol('bad_json');
 
 /**
- * 读取并解析请求 JSON（无大小上限，同 `readJsonBody(req)`）。失败时已回写
- * 400 `{ ok: false, error: 'bad_json' }`，调用方写 `if (body === BAD_JSON) return;` 即可。
+ * 读取并解析请求 JSON。`maxBytes` 缺省时无大小上限（同 `readJsonBody(req)`）。
+ * 失败时已回写 400 `{ ok: false, error: 'bad_json' }`，超限回 413
+ * `{ ok: false, error: 'body_too_large' }`。调用方写 `if (body === BAD_JSON) return;` 即可。
  */
-async function readJsonBodyOrBadJson<T = unknown>(req: IncomingMessage, res: ServerResponse): Promise<T | typeof BAD_JSON> {
-  try { return await readJsonBody<T>(req); }
-  catch { jsonRes(res, 400, { ok: false, error: 'bad_json' }); return BAD_JSON; }
+async function readJsonBodyOrBadJson<T = unknown>(
+  req: IncomingMessage,
+  res: ServerResponse,
+  maxBytes?: number,
+): Promise<T | typeof BAD_JSON> {
+  try { return await readJsonBody<T>(req, maxBytes); }
+  catch (error) {
+    if (error instanceof JsonBodyTooLargeError) {
+      jsonRes(res, 413, { ok: false, error: 'body_too_large' });
+      return BAD_JSON;
+    }
+    jsonRes(res, 400, { ok: false, error: 'bad_json' });
+    return BAD_JSON;
+  }
 }
 
 /** `botConfigPutRoute` 的 normalize 结果：待写入的值，或 400 的 error。 */
@@ -2401,6 +2417,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
   const closeCurrentGeneration = () => closeSession(params.sessionId, {
     ...(isTrustedHostIpcRequest(req) && body.idleCleanup === true && body.idleCleanupSource === 'scheduled'
       ? { backgroundExecutionCleanup: true } : {}),
+    // Dashboard "close" and `botmux delete` are human closes (empty body); only
+    // idle/auto cleanup (idleCleanup: true) stays resumable.
+    ...(body.idleCleanup === true ? {} : { userClosed: true }),
     onCodexCleanupRelease: ticket => { codexArchiveReleaseTicket = ticket; },
   });
   const cleanupSource = body.idleCleanupSource === 'manual' ? 'manual'
@@ -2440,6 +2459,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
       if (current.backgroundExecutionCleanupClosedAt
         && !(isTrustedHostIpcRequest(req) && body.idleCleanup === true && body.idleCleanupSource === 'scheduled')) {
         await closeCurrentGeneration();
+      }
+      // A human re-close of a row that idle cleanup already closed is still the
+      // human's intent to end the conversation: stamp it so the topic does not
+      // auto-resume (closeSession's stamp only fires on an open -> closed edge).
+      if (body.idleCleanup !== true) {
+        const row = sessionStore.getOwnedSession(params.sessionId);
+        if (row && row.status === 'closed' && !row.userClosedAt) {
+          row.userClosedAt = new Date().toISOString();
+          sessionStore.updateSession(row);
+        }
       }
       // A closed row can still carry an UNCANCELLED remote session (a quarantined
       // lineage is parked, not cancelled). Short-circuiting to a bare success here
@@ -4041,25 +4070,26 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-manager', async (req, res, param
     return jsonRes(res, 400, { ok: false, error: 'regular_group_only' });
   }
   if (body.action === 'status') return jsonRes(res, 200, await getChatManagerStatus(ds.larkAppId, ds.chatId));
-  if (body.action !== 'set' && body.action !== 'clear') return jsonRes(res, 400, { ok: false, error: 'invalid_action' });
-  // `set` requires the per-bot manager switch. `clear` (teardown) and status are
+  // `set` and `lead-only on` require the per-bot manager switch. `clear`, `lead-only off` and status are
   // intentionally left ungated so an admin can always remove the manager / inspect
   // state even after turning the switch off — the switch gates activation, not removal.
-  if (body.action === 'set' && getBot(ds.larkAppId).config.chatManagerEnabled !== true) {
-    return jsonRes(res, 409, { ok: false, error: 'chat_manager_disabled' });
-  }
+  const plan = planChatManagerMutation(body, getBot(ds.larkAppId).config.chatManagerEnabled === true);
+  if (!plan.ok) return jsonRes(res, plan.status, { ok: false, error: plan.error });
   const { getMessageDetail } = await import('../im/lark/client.js');
   const { effectiveBotDisplayName } = await import('../bot-registry.js');
   const human = await authorizeHumanManager({
     sessionId: ds.session.sessionId, appId: ds.larkAppId, chatId: ds.chatId,
-    action: body.action, claim: body, targetOpenId: getBotOpenId(ds.larkAppId),
+    action: plan.authAction,
+    claim: body, targetOpenId: getBotOpenId(ds.larkAppId),
     liveOrigin: () => findActiveBySessionId(params.sessionId)?.managedTurnOrigin,
     readMessage: getMessageDetail,
     canOperate: (app, chat, sender) => getBot(app).resolvedAllowedUsers.includes(sender) && canOperate(app, chat, sender),
   });
   if (!human.ok) return jsonRes(res, 403, human);
-  const result = await changeChatManager(ds.larkAppId, ds.chatId, body.action,
-    effectiveBotDisplayName(getBot(ds.larkAppId)), human.stillCurrent);
+  const result = plan.action === 'lead-only'
+    ? await setChatManagerLeadOnly(ds.larkAppId, ds.chatId, plan.leadOnly as boolean, human.stillCurrent)
+    : await changeChatManager(ds.larkAppId, ds.chatId, plan.action,
+      effectiveBotDisplayName(getBot(ds.larkAppId)), human.stillCurrent);
   return jsonRes(res, result.ok ? 200 : 409, result);
 });
 /** Session-scoped external mutation used by the botmux-chat-rename Skill. */
@@ -7871,6 +7901,49 @@ ipcRoute('GET', '/api/groups/:chatId/membership', requireBoundBot(async (_req, r
     jsonRes(res, 502, { error: String(e) });
   }
 }));
+
+/**
+ * Request-bound send (see services/request-bound-group-send.ts): body exactly
+ * `{requestId, content}` (plain text). Returns `{ok, messageId, replayed}`.
+ * The same requestId never produces a second visible message; an attempt whose
+ * outcome cannot be reconciled any more is `409 outcome_unknown`.
+ *
+ * `sendMessage` always suppresses its own outbound hook. The hook fires from
+ * `onCommitted` after the sent record is durable, at most once per message id.
+ * `larkAppId` and `chatId` are on that payload because hook filters gate on them.
+ */
+ipcRoute('POST', '/api/groups/:chatId/messages', requireBoundBot(async (req, res, p) => {
+  const body = await readJsonBodyOrBadJson<unknown>(req, res, GROUP_SEND_BODY_MAX_BYTES);
+  if (body === BAD_JSON) return;
+  const input = parseGroupSendBody(body);
+  if (!input) return jsonRes(res, 400, { ok: false, error: 'invalid_request' });
+  const larkAppId = cachedLarkAppId;
+  try {
+    const result = await sendRequestBoundGroupMessage({
+      larkAppId, storePath: groupSendStorePath(larkAppId),
+      send: (chatId, text, uuid) => sendMessage(larkAppId, chatId, text, 'text', uuid, undefined, { suppressHook: true }),
+      onCommitted: (payload) => emitHookEventLocal('outbound.send', { ...payload }),
+    }, { chatId: p.chatId, ...input });
+    const { status, ...rest } = result;
+    return jsonRes(res, status, rest);
+  } catch (e) {
+    // Fail closed. The provider may already have accepted (the post-send save
+    // failed). Retry this same requestId; a new one can post a second message.
+    logger.warn(`[group-send] store unavailable: ${e instanceof Error ? e.message : String(e)}`);
+    return jsonRes(res, 503, { ok: false, error: 'store_unavailable', retryable: true });
+  }
+}, NOT_BOUND_BODY.okFalse));
+
+/** Read-back of one message in this chat: sender, deleted flag, text and the bound requestId (if any). */
+ipcRoute('GET', '/api/groups/:chatId/messages/:messageId', requireBoundBot(async (_req, res, p) => {
+  const larkAppId = cachedLarkAppId;
+  const result = await readRequestBoundGroupMessage({
+    larkAppId, storePath: groupSendStorePath(larkAppId),
+    detail: id => getMessageDetail(larkAppId, id, { userCardContent: false, timeoutMs: 10000 }),
+  }, p.chatId, p.messageId);
+  if (!result.ok) return jsonRes(res, result.status, { ok: false, error: result.error });
+  return jsonRes(res, 200, result);
+}, NOT_BOUND_BODY.okFalse));
 
 /** Host-only rename through this daemon's exact bot identity. */
 ipcRoute('PUT', '/api/groups/:chatId/name', requireBoundBot(async (req, res, p) => {

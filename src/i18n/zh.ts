@@ -1266,7 +1266,7 @@ export const messages: Record<string, string> = {
   'card.local_address.unavailable_link': '（未提供可访问链接）',
   'worker.final_output_local_address_rejected': '结果卡包含无法供用户访问的本机跳转地址，完整结果未发送。已停止原样重试。',
   'ai.routing.usage_send': '- 发送：`botmux send "消息"`',
-  'ai.routing.usage_mention_gate': '- 每条 send 必须三选一：`--mention <open_id>` / `--mention-back` / `--no-mention`——按内容价值选：有实质结论要对方看/确认/决策 → @；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发',
+  'ai.routing.usage_mention_gate': '- 每条 send 必须三选一：`--mention <open_id>` / `--mention-back` / `--no-mention`——按内容价值选：有实质结论要对方看/确认/决策 → @；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发。定时任务等没有本轮发送者的自动回合，有明确收件人时用 --mention，没有明确收件人时用 --no-mention；不要使用 --mention-back，也不要从会话 owner 或历史发送者推断收件人。',
   'ai.routing.usage_attachments': '- 附件：`--images`、`--files`、`--videos`；尺寸/排版选择先 `botmux skill show botmux-send`',
   'ai.routing.ask_wait': '等待 botmux ask 真人回答时，无输出属正常等待；不得发送 Ctrl-C、kill 或取消等待工具来提前结束。复用原等待进程直到回答或正常超时；传输错误、超时和机器人回复不代表真人授权。收到 Ask 接续事件时回读原任务、问题与方案版本，只消费对应决定，不重跑已完成工作。',
   'ai.routing.usage_helpers': '- 上下文：`botmux history`；协作 bot：`botmux bots list`',
@@ -1313,6 +1313,7 @@ export const messages: Record<string, string> = {
   'xpi.timeout.still_busy': '原任务仍在执行，且未选择后续处理；消息未执行。可重新发送，或 botmux send --as independent。',
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
+  'ai.lead_only.rules': '你是本群的负责人（chat manager），只转发不执行：不论任务大小一律用 botmux dispatch 派给执行 bot；需要看代码/资料也派单，让执行 bot 回报结论，不要自己读写文件或跑非 botmux 命令。长期笔记（用户定的规矩、各执行 bot 的专长）在群白板启用时先 botmux whiteboard current --create，再不带 --id 用 botmux whiteboard read/update 记到本群白板；白板由群内所有 bot 共享，不要写密钥。你只能使用 botmux 命令，且命令必须是单条普通 botmux 命令：不能用重定向（< >）、管道、; & 、$ 展开、反引号、括号或 # 注释；多行/含特殊字符的正文请整体放进单引号 \'...\'（正文里不要出现单引号），或在命令末尾用带引号定界符的 heredoc（<<\'EOF\'，结束行之后不能再有命令）。派出的会话是否起来用 botmux observe 确认。orchestrate 等技能里「简单紧耦合工作自己完成」一句在本会话不适用。',
   'ai.identity.unknown': '(未知)',
   'ai.credentials.acting_identity': '本会话已为 {tools} 启用按当前消息发起人身份注入授权。调用时沿用 botmux 注入的身份；授权可用性以工具返回结果为准。',
   'ai.credentials.git_identity': 'git 对 {host} 的鉴权已配置为使用本轮 bytedcli 身份。',
@@ -1345,7 +1346,7 @@ export const messages: Record<string, string> = {
   // mention_gate 都不注入，见 shared-hints.ts）。
   'ai.shell.intro_transcript': '你运行在飞书（Lark）会话中。用户在飞书阅读回复，看不到你的终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书。',
   'ai.shell.when_to_send_transcript': '发给你的消息直接在最终 assistant message 里作答即可,别沉默。只有根本不是发给你的消息才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
-  'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名指定人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回本轮触发者本人）/ `--no-mention`（不@）。先按内容价值决定要不要 @：有实质结论要对方看/确认/决策→需要 @；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。再按收件人选方式：就是回触发这轮的人/bot→--mention-back；要 @ 别人（多人会话回复对象不一定是触发者）→--mention 显式点名。别把 --no-mention 当默认，也别无意义 @ 打扰。',
+  'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名指定人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回本轮触发者本人）/ `--no-mention`（不@）。先按内容价值决定要不要 @：有实质结论要对方看/确认/决策→需要 @；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。再按收件人选方式：就是回触发这轮的人/bot→--mention-back；要 @ 别人（多人会话回复对象不一定是触发者）→--mention 显式点名。别把 --no-mention 当默认，也别无意义 @ 打扰。定时任务等没有本轮发送者的自动回合，有明确收件人时用 --mention，没有明确收件人时用 --no-mention；不要使用 --mention-back，也不要从会话 owner 或历史发送者推断收件人。',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
   'ai.attach.hint': '使用 Read 工具查看，序号与正文中的 [图片 N] / [文件 N] / [视频 N] 占位符对应',
@@ -1387,6 +1388,9 @@ export const messages: Record<string, string> = {
   // <whiteboard> 结构化块（session-manager.renderWhiteboardBlock，{id} 必填）
   'ai.whiteboard.block_read': '本地项目上下文；读取：`botmux whiteboard read --id {id} --json`（拿到 content 与 updatedAt）。',
   'ai.whiteboard.block_update': '更新状态：`botmux whiteboard update --id {id} --expected-updated-at <上次 read 的 updatedAt> <内容>`。',
+  // lead-only 负责人会话的守卫拒绝 --id，这两条替换上面两条
+  'ai.whiteboard.block_read_lead_only': '本地项目上下文；读取：`botmux whiteboard read --json`（拿到 content 与 updatedAt；本会话只能读写本群白板，不要带 --id）。',
+  'ai.whiteboard.block_update_lead_only': '更新状态：`botmux whiteboard update --expected-updated-at <上次 read 的 updatedAt> <内容>`。',
   'ai.whiteboard.block_rewrite': '更新前先用 `read --json` 拿到当前内容与 updatedAt，融合新信息后整体重写为一份完整的当前状态（默认中文；代码标识/命令/错误信息可保留原文），并用 `--expected-updated-at` 回传 read 到的版本号做并发冲突检测。',
   'ai.whiteboard.block_cas': '若更新报 `whiteboard_cas_mismatch`，说明期间有其它 agent 改过白板——重新 `read --json` 拿最新内容与 updatedAt，再次融合重写。',
   'ai.whiteboard.block_tail_send': '不要直接读写本地文件；不要写密钥/隐私；用户可见结论仍必须 `botmux send`。',
@@ -1916,6 +1920,12 @@ export const messages: Record<string, string> = {
   'daemon.topic_header_effort_unsupported_model': '模型 {model} 不支持推理档位 {effort}',
   'daemon.fast_unsupported_backend': '⚠️ 这个会话的后端下 /fast 切不了 Codex 档位（RPC 输入模式 / Riff 的对话不走终端，按键到不了执行端）。卡片徽标仍会如实反映 Codex 实际运行的档位。',
   'daemon.enriched_mentions_label': '消息中的 @mention：',
+  'daemon.topic_continuity.resumed': '↩️ 本话题之前的会话（{id}）已关闭，这条消息接着它继续处理，之前的上下文都在。',
+  'daemon.topic_continuity.fresh_after_close': '⚠️ 本话题之前的会话（{id}）已关闭且无法恢复，这条消息由新开的会话处理，之前的上下文不在了。',
+  'daemon.topic_continuity.fresh_requested': '🆕 按派单要求（@session fresh）新开了会话，本话题之前的会话（{id}）不再续用。',
+  'daemon.topic_continuity.fresh_close_refused': '⚠️ 按 @session fresh 要关掉当前会话，但关闭被拒绝（{error}，远端任务 {taskId}），当前会话保留并处理这条消息。',
+  'daemon.topic_continuity.fresh_close_residual': '⚠️ 按 @session fresh 关掉了当前会话，但有残留需要人工核查：{detail}。',
+  'daemon.topic_continuity.fresh_refused_busy': '⚠️ 当前会话正在启动或交接，没有按 @session fresh 新开，这条消息交给当前会话处理。',
   'daemon.choose_repo_first': '请先在上方卡片中选择仓库，您的消息已暂存，选择后会自动发送。',
   'daemon.worktree_building_wait': '正在创建 worktree（含 git fetch，可能需要几秒），您的消息已暂存，创建完成后会自动一并发送。',
 

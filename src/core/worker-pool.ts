@@ -1,3 +1,4 @@
+import { isLeadOnlySession } from './lead-only.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
 import { sameWorker, sameRuntime } from '../services/session-contract.js';
 import { observeTraexInstall } from '../services/traex-install-watch.js';
@@ -11117,8 +11118,6 @@ export type CloseSessionResult =
       outcome: 'closed';
       alreadyClosed: boolean;
       known: boolean;
-      /** The closing card entered the serialized PATCH queue; delivery is best-effort. */
-      closedCardPatchQueued?: true;
     }
   | {
       ok: true;
@@ -11190,7 +11189,7 @@ export function closeSession(sessionId: string, opts?: Parameters<typeof closeSe
 
 async function closeSessionBody(
   sessionId: string,
-  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public'; explicitClose?: boolean; backgroundExecutionCleanup?: boolean; onArchiveError?: (error: string) => Promise<unknown>; onCodexCleanupRelease?: (ticket: CodexCleanupReleaseTicket) => void },
+  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public'; explicitClose?: boolean; userClosed?: boolean; backgroundExecutionCleanup?: boolean; onArchiveError?: (error: string) => Promise<unknown>; onCodexCleanupRelease?: (ticket: CodexCleanupReleaseTicket) => void },
 ): Promise<CloseSessionResult> {
   // `awaitWorkerExit` (default true): whether to block on the worker process
   // actually exiting before returning. A busy CLI wedges in node-pty teardown
@@ -11510,7 +11509,6 @@ async function closeSessionBody(
   // Shared-adopt closes only detach BotMux. Private close cards contain local
   // paths and resume commands, so neither bot policy nor clicked-card privacy
   // may be bypassed by this background PATCH path.
-  let closedCardPatchQueued = false;
   if (ds && !prepared.residual && !isSharedAdoptSession(ds)
       && opts?.cardVisibility !== 'private'
       && ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL) {
@@ -11522,7 +11520,6 @@ async function closeSessionBody(
         ds.pendingCardId = ds.streamCardId;
         ds.pendingCardJson = buildClosedSessionCard(ds, localeForBot(ds.larkAppId));
         if (!ds.cardPatchInFlight) flushCardPatch(ds);
-        closedCardPatchQueued = true;
       }
     } catch (error) {
       logger.warn(`[${sessionId.slice(0, 8)}] Could not freeze closed session card: ${error}`);
@@ -11673,6 +11670,17 @@ async function closeSessionBody(
 
   // Only explicit user close opts in. Background cleanup/replacement/restart
   // callers keep the existing native lifecycle. Never backfill old closed rows.
+  // A human chose to end this conversation: a later message in the topic must
+  // start fresh, not silently bring it back (topic-session-continuity.ts).
+  // `userClosed` is the same human intent for callers (dashboard / `botmux
+  // delete` close route) that do not take the explicitClose archive lifecycle.
+  if (opts?.explicitClose || opts?.userClosed) {
+    const row = sessionStore.getOwnedSession(sessionId);
+    if (row && wasOpen && row.status === 'closed' && !row.userClosedAt) {
+      row.userClosedAt = new Date().toISOString();
+      sessionStore.updateSession(row);
+    }
+  }
   if (opts?.explicitClose) {
     const row = sessionStore.getOwnedSession(sessionId);
     if (row && (wasOpen || row.codexCleanupArchive)) {
@@ -11717,10 +11725,7 @@ async function closeSessionBody(
       known,
     };
   }
-  return {
-    ok: true, outcome: 'closed', alreadyClosed, known,
-    ...(closedCardPatchQueued ? { closedCardPatchQueued: true as const } : {}),
-  };
+  return { ok: true, outcome: 'closed', alreadyClosed, known };
 }
 
 /**
@@ -17437,6 +17442,10 @@ function forkWorkerPrepared(
       return ttl ? { promptCacheTtl: ttl } : {};
     })(),
     solo: ds.soloSession === true,
+    // Lead-only chat manager: evaluated whenever a worker process is forked (new/reopened topic, or a
+    // dead worker process re-forked). /restart, dashboard restart and in-worker CLI respawn reuse
+    // lastInitConfig in place and do NOT re-read it (documented in the chat-manager skill).
+    ...(isLeadOnlySession(ds.larkAppId, ds.chatId, ds.chatType, ds.session) ? { leadOnly: true as const } : {}),
     // Workflow node session (design 2026-11-03 §4.2): the worker exports the
     // marker so its CLI system prompt and `botmux skill show` skip workflow.
     // A main-topic handoff's marker (§5.5) leaves the ordinary session as is.

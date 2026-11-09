@@ -260,6 +260,16 @@ describe('managedVcSendPayloadError', () => {
 });
 
 describe('validateMentionDecision', () => {
+  it('does not recommend mention-back when an automatic turn has no trigger sender', () => {
+    const result = validateMentionDecision({ enabled: true, sendTopLevel: false,
+      hasMentionArgs: false, mentionBack: false, noMention: false, hasQuoteTargetSender: false });
+
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('--mention <');
+    expect(result.error).toContain('--no-mention');
+    expect(result.error).not.toContain('--mention-back');
+  });
+
   const base = {
     enabled: true,
     sendTopLevel: false,
