@@ -1916,6 +1916,12 @@ export const messages: Record<string, string> = {
   'daemon.topic_header_effort_unsupported_model': '模型 {model} 不支持推理档位 {effort}',
   'daemon.fast_unsupported_backend': '⚠️ 这个会话的后端下 /fast 切不了 Codex 档位（RPC 输入模式 / Riff 的对话不走终端，按键到不了执行端）。卡片徽标仍会如实反映 Codex 实际运行的档位。',
   'daemon.enriched_mentions_label': '消息中的 @mention：',
+  'daemon.topic_continuity.resumed': '↩️ 本话题之前的会话（{id}）已关闭，这条消息接着它继续处理，之前的上下文都在。',
+  'daemon.topic_continuity.fresh_after_close': '⚠️ 本话题之前的会话（{id}）已关闭且无法恢复，这条消息由新开的会话处理，之前的上下文不在了。',
+  'daemon.topic_continuity.fresh_requested': '🆕 按派单要求（@session fresh）新开了会话，本话题之前的会话（{id}）不再续用。',
+  'daemon.topic_continuity.fresh_close_refused': '⚠️ 按 @session fresh 要关掉当前会话，但关闭被拒绝（{error}，远端任务 {taskId}），当前会话保留并处理这条消息。',
+  'daemon.topic_continuity.fresh_close_residual': '⚠️ 按 @session fresh 关掉了当前会话，但有残留需要人工核查：{detail}。',
+  'daemon.topic_continuity.fresh_refused_busy': '⚠️ 当前会话正在启动或交接，没有按 @session fresh 新开，这条消息交给当前会话处理。',
   'daemon.choose_repo_first': '请先在上方卡片中选择仓库，您的消息已暂存，选择后会自动发送。',
   'daemon.worktree_building_wait': '正在创建 worktree（含 git fetch，可能需要几秒），您的消息已暂存，创建完成后会自动一并发送。',
 

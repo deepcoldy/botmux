@@ -2416,6 +2416,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
   const closeCurrentGeneration = () => closeSession(params.sessionId, {
     ...(isTrustedHostIpcRequest(req) && body.idleCleanup === true && body.idleCleanupSource === 'scheduled'
       ? { backgroundExecutionCleanup: true } : {}),
+    // Dashboard "close" and `botmux delete` are human closes (empty body); only
+    // idle/auto cleanup (idleCleanup: true) stays resumable.
+    ...(body.idleCleanup === true ? {} : { userClosed: true }),
     onCodexCleanupRelease: ticket => { codexArchiveReleaseTicket = ticket; },
   });
   const cleanupSource = body.idleCleanupSource === 'manual' ? 'manual'
@@ -2455,6 +2458,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
       if (current.backgroundExecutionCleanupClosedAt
         && !(isTrustedHostIpcRequest(req) && body.idleCleanup === true && body.idleCleanupSource === 'scheduled')) {
         await closeCurrentGeneration();
+      }
+      // A human re-close of a row that idle cleanup already closed is still the
+      // human's intent to end the conversation: stamp it so the topic does not
+      // auto-resume (closeSession's stamp only fires on an open -> closed edge).
+      if (body.idleCleanup !== true) {
+        const row = sessionStore.getOwnedSession(params.sessionId);
+        if (row && row.status === 'closed' && !row.userClosedAt) {
+          row.userClosedAt = new Date().toISOString();
+          sessionStore.updateSession(row);
+        }
       }
       // A closed row can still carry an UNCANCELLED remote session (a quarantined
       // lineage is parked, not cancelled). Short-circuiting to a bare success here

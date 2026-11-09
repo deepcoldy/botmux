@@ -10805,7 +10805,7 @@ export function closeSession(sessionId: string, opts?: Parameters<typeof closeSe
 
 async function closeSessionBody(
   sessionId: string,
-  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public'; explicitClose?: boolean; backgroundExecutionCleanup?: boolean; onArchiveError?: (error: string) => Promise<unknown>; onCodexCleanupRelease?: (ticket: CodexCleanupReleaseTicket) => void },
+  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public'; explicitClose?: boolean; userClosed?: boolean; backgroundExecutionCleanup?: boolean; onArchiveError?: (error: string) => Promise<unknown>; onCodexCleanupRelease?: (ticket: CodexCleanupReleaseTicket) => void },
 ): Promise<CloseSessionResult> {
   // `awaitWorkerExit` (default true): whether to block on the worker process
   // actually exiting before returning. A busy CLI wedges in node-pty teardown
@@ -11288,6 +11288,17 @@ async function closeSessionBody(
 
   // Only explicit user close opts in. Background cleanup/replacement/restart
   // callers keep the existing native lifecycle. Never backfill old closed rows.
+  // A human chose to end this conversation: a later message in the topic must
+  // start fresh, not silently bring it back (topic-session-continuity.ts).
+  // `userClosed` is the same human intent for callers (dashboard / `botmux
+  // delete` close route) that do not take the explicitClose archive lifecycle.
+  if (opts?.explicitClose || opts?.userClosed) {
+    const row = sessionStore.getOwnedSession(sessionId);
+    if (row && wasOpen && row.status === 'closed' && !row.userClosedAt) {
+      row.userClosedAt = new Date().toISOString();
+      sessionStore.updateSession(row);
+    }
+  }
   if (opts?.explicitClose) {
     const row = sessionStore.getOwnedSession(sessionId);
     if (row && (wasOpen || row.codexCleanupArchive)) {

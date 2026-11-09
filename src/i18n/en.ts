@@ -1911,6 +1911,12 @@ export const messages: Record<string, string> = {
   'daemon.topic_header_effort_unsupported_model': 'Model {model} does not support reasoning effort {effort}',
   'daemon.fast_unsupported_backend': "⚠️ /fast can't toggle Codex's tier on this session's backend (RPC input mode / Riff runs turns off the terminal, so the keystroke never reaches the executor). The card badge still reflects the tier Codex is actually running.",
   'daemon.enriched_mentions_label': '@mentions in this message:',
+  'daemon.topic_continuity.resumed': '↩️ The previous session in this topic ({id}) was closed; this message continues it, with its earlier context.',
+  'daemon.topic_continuity.fresh_after_close': '⚠️ The previous session in this topic ({id}) is closed and could not be resumed; a new session handles this message without the earlier context.',
+  'daemon.topic_continuity.fresh_requested': '🆕 Started a new session as the dispatch asked (@session fresh); the previous session in this topic ({id}) is not continued.',
+  'daemon.topic_continuity.fresh_close_refused': '⚠️ @session fresh asked to close the current session, but the close was refused ({error}, remote task {taskId}); the current session stays and handles this message.',
+  'daemon.topic_continuity.fresh_close_residual': '⚠️ @session fresh closed the current session, but something was left behind and needs a manual check: {detail}.',
+  'daemon.topic_continuity.fresh_refused_busy': '⚠️ The current session is starting or being handed over, so @session fresh was not applied; it handles this message.',
   'daemon.choose_repo_first': 'Pick a repo from the card above first — your message is queued and will be sent once a repo is chosen.',
   'daemon.worktree_building_wait': 'Creating a worktree (includes a git fetch, may take a few seconds) — your message is queued and will be sent together once it is ready.',
 
