@@ -446,7 +446,7 @@ describe('ordinary Codex App finals retain absent dispatch attempt identity', ()
     vi.useFakeTimers(); const h = harness(false, true);
     expect(h.execution.dispatchAttempt).toBeUndefined();
     expect(h.queue.findByTurnId('turnA')?.dispatchAttempt).toBeUndefined();
-    await h.final();
+    const final = h.final(); await vi.advanceTimersByTimeAsync(30_001); await final;
     expect(h.wire.filter(m => m.type === 'final_output')).toHaveLength(1);
     expect(h.wire.find(m => m.type === 'final_output')?.sessionContract.scope.execution).toEqual(h.execution);
     expect(h.store.execution(h.ref, h.execution.executionId)?.phase).toBe('succeeded');
@@ -456,7 +456,7 @@ describe('ordinary Codex App finals retain absent dispatch attempt identity', ()
     expect(h.execution.dispatchAttempt).toBeUndefined();
     await h.restoreNative(); await h.drainBindings();
     expect(h.store.authorizedExecutionObserver(h.ref, h.historicalRuntime, h.scope.worker, h.execution)).toBe(true);
-    await h.final();
+    const final = h.final(); await vi.advanceTimersByTimeAsync(30_001); await final;
     expect(h.wire.filter(m => m.type === 'final_output')).toHaveLength(1);
     expect(h.wire.find(m => m.type === 'final_output')?.sessionContract.scope.execution).toEqual(h.execution);
     expect(h.wire.find(m => m.type === 'final_output')?.sessionContract.scope.runtime).toEqual(h.historicalRuntime);
