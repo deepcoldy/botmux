@@ -20657,14 +20657,10 @@ let traexAutoModelAdmissionRetry: ReturnType<typeof setTimeout> | undefined;
  * flush guards again; it never replays a dequeued or ambiguous submission. */
 function retryTraexAutoModelAdmission(): void {
   if (traexAutoModelAdmissionRetry) return;
-  // Scale with BOTMUX_TIME_SCALE like the rest of the worker's test timers: a
-  // raw 200ms wait is an eternity on the compressed (0.01) test timeline and,
-  // under Bun's event loop, can miss the preferred-relaunch ready edge that is
-  // measured in scaled time. Production (scale 1) keeps the original 200ms.
   traexAutoModelAdmissionRetry = setTimeout(() => {
     traexAutoModelAdmissionRetry = undefined;
     if (traexAutoModelRuntimeEligible() && backend && pendingMessages.length > 0) void flushPending();
-  }, scaleMs(200));
+  }, 200);
   traexAutoModelAdmissionRetry.unref();
 }
 
@@ -21128,6 +21124,24 @@ async function flushPending(): Promise<void> {
         && !(await admitTraexAutoModelPendingInput(pendingMessages[0]!))) break;
       const item = freshnessInputQueue.takeNormal();
       if (!item) break;
+      // A follow-up turn must never be written onto a degraded model while the
+      // pool is exhausted and the preferred-model reset is still pending. This
+      // is checked on EVERY drain (not only the type-ahead branch, whose
+      // prompt-ready predicate can differ between the initial flush and the
+      // admission-retry re-drive): the controller is authoritative, so put the
+      // dequeued item back and stop. The preferred relaunch's prompt-ready edge
+      // re-drives the flush; the retry timer also re-arms in case that edge is
+      // missed. The accessor flips false once the reset commits, releasing it.
+      if (item.turnId
+        && item.turnId !== currentBotmuxTurnId
+        && traexAutoModelRuntimeEligible()
+        && traexAutoModelController?.awaitingPreferredModelReset()) {
+        pendingMessages.unshift(item);
+        holdDrainForPreferredReset = true;
+        log('Holding input until the preferred-model reset; re-queuing');
+        retryTraexAutoModelAdmission();
+        break;
+      }
       if (workerSessionEventScope && !workerSessionEventScope.canSubmit(item.turnId, item.dispatchAttempt)) {
         if (item.turnId) send({ type: 'turn_input_rejected', turnId: item.turnId, ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}), reason: 'execution_reconciliation_required' });
         continue;
@@ -21185,24 +21199,6 @@ async function flushPending(): Promise<void> {
           && !!item.turnId
           && item.turnId !== currentBotmuxTurnId
           && (!promptReadyAtFlushStart || itemsWrittenInThisFlush > 0 || queuedTypeAheadTurns.length > 0);
-        // A type-ahead follow-up must not be written onto a degraded model while
-        // the pool is exhausted and a preferred-model reset is still pending.
-        // The enqueue-time latch only sees the pane frame, which the degraded
-        // CLI drops on returning to its composer, so re-check the pool state at
-        // the write edge (the controller is on the non-preferred model by now).
-        // Put the dequeued item back and stop this drain; the prompt-ready edge
-        // after the preferred relaunch re-drives the flush and writes it to core.
-        if (isTypeAhead
-          && traexAutoModelRuntimeEligible()
-          && traexAutoModelController?.awaitingPreferredModelReset()) {
-          pendingMessages.unshift(item);
-          holdDrainForPreferredReset = true;
-          log('Holding type-ahead input until the preferred-model reset; re-queuing');
-          // Re-drive after the preferred relaunch even if its prompt-ready edge
-          // is missed; the accessor flips false once the reset commits, releasing
-          // the held input. The retry no-ops while a timer is already armed.
-          retryTraexAutoModelAdmission();
-        }
         if (cliSubmissionInFlight?.item === item) {
           cliSubmissionInFlight.composerOwned = typedIntoComposer && promptReadyAtFlushStart
             && itemsWrittenInThisFlush === 0 && !isTypeAhead;
