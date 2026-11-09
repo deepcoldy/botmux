@@ -427,7 +427,7 @@ import {
   sameExecutableObject,
   type ExecutableIdentity,
 } from './services/cli-install-identity.js';
-import { pinWorkerTraeHome } from './services/traex-paths.js';
+import { pinWorkerTraeHome, resolveTraexChildHome } from './services/traex-paths.js';
 import {
   acquireTraexRuntimeLease,
   acquireTraexRuntimeOccupancy,
@@ -25279,7 +25279,6 @@ async function spawnCliBody(
     !!cfg.wrapperCli
     || cfg.cliLaunchMode === 'forge-traex'
   );
-  const traexOccupancyOnly = traexExistingRuntime || traexOpaqueNewExec;
   if (traexRuntimeRelevant) {
     const fixedPath = typeof cfg.cliPathOverride === 'string' && cfg.cliPathOverride.trim().length > 0;
     // Two different facts:
@@ -28396,9 +28395,6 @@ async function spawnCliBody(
       publish: send,
       spawn: () => {
         const backend = spawnBackend;
-        if (cfg.cliId === 'traex') {
-          traexInstallAtSpawn = { generation: cliSpawnGeneration, identity: resolveInstallIdentity(spawnCliBin) };
-        }
         backend.spawn(spawnBin, spawnArgs, {
           cwd: spawnCwd,
           cols: PTY_COLS,
