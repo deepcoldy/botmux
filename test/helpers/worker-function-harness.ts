@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import ts from 'typescript';
 import { contractTerminalStatus } from '../../src/services/session-contract.js';
+import * as runtimeReservation from '../../src/services/runtime-reservation.js';
 
 let parsed: ts.SourceFile | undefined;
 
@@ -70,6 +71,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
   const resolve = (key: string | symbol): unknown => {
     if (key in scope) return scope[key as string];
     if (key === 'contractTerminalStatus') return contractTerminalStatus;
+    if (typeof key === 'string' && Object.hasOwn(runtimeReservation, key)) return (runtimeReservation as Record<string, unknown>)[key];
     if (typeof key === 'string' && ['sessionEventMetadata', 'bindSessionObservation', 'spawnCliBody'].includes(key)) {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));
       return dependencies.get(key);

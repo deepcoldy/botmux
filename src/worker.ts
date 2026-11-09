@@ -2,6 +2,12 @@
 import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
 import { admitSessionCommand } from './services/session-command-gateway.js';
 import { contractTerminalStatus, type RuntimeIdentity } from './services/session-contract.js';
+import {
+  awaitRuntimeReservation,
+  RUNTIME_RESERVATION_DEADLINE_MS,
+  RUNTIME_RESERVATION_SLOW_LOG_MS,
+  RuntimeReservationExpiredError,
+} from './services/runtime-reservation.js';
 import { applyWorkerLaunchModel } from './core/worker-launch-model.js';
 import { readTraexEffortComposer, validateTraexTopicEffortRestart, type TraexTopicEffortRestart } from './utils/traex-session-effort.js';
 import { deploymentContinuationTemplate } from './services/deployment-continuation.js';
@@ -23076,15 +23082,20 @@ async function spawnCli(
   const binding = workerSessionEventScope.beginRuntime(activeRestartAttemptId);
   if (execution) workerSessionEventScope.rememberExecution(execution, binding);
   return workerSessionEventScope.run(binding, async () => {
-    const reserved = new Promise<boolean>((resolve) => {
-      const timer = setTimeout(() => { pendingRuntimeReservations.delete(binding.bindingId); resolve(false); }, 15_000);
-      timer.unref?.();
-      pendingRuntimeReservations.set(binding.bindingId, mayStart => { clearTimeout(timer); pendingRuntimeReservations.delete(binding.bindingId); resolve(mayStart); });
-    });
+    const reserved = awaitRuntimeReservation(pendingRuntimeReservations, binding.bindingId, () => log(
+      `Runtime reservation ${binding.bindingId} unanswered after ${RUNTIME_RESERVATION_SLOW_LOG_MS / 1000}s; `
+      + `waiting for the daemon up to ${RUNTIME_RESERVATION_DEADLINE_MS / 1000}s`,
+    ));
     send({ type: 'runtime_binding_started', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
-    if (!await reserved || closeRequested || workerSessionEventScope?.currentBinding() !== binding) {
+    const outcome = await reserved;
+    const superseded = closeRequested || workerSessionEventScope?.currentBinding() !== binding;
+    if (outcome !== 'granted' || superseded) {
       workerSessionEventScope?.restoreAfterAbortedStart(binding, previousBinding);
       workerSessionEventScope?.reportAbortedStart(binding, () => send({ type: 'runtime_binding_aborted', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) }));
+      // Superseded means another lifecycle operation owns the next start. An
+      // unanswered start has no such owner, so it must fail where it is seen.
+      if (outcome === 'expired' && !superseded) throw new RuntimeReservationExpiredError();
+      if (outcome === 'refused') log(`Daemon refused runtime reservation ${binding.bindingId}; the lifecycle operation that owns the session takes over`);
       throw new CliSpawnSupersededError();
     }
     try { await spawnCliBody(cfg, opts); }
@@ -33669,6 +33680,9 @@ async function sendFatalWorkerErrorAndExit(
 ): Promise<void> {
   if (fatalWorkerErrorPending) return;
   fatalWorkerErrorPending = true;
+  // No CLI of this start ever existed to take the queued inputs; the daemon's
+  // retry of a transient startup failure starts the worker that types them.
+  if (err instanceof RuntimeReservationExpiredError) saveUnsentInputsForSuccessor('runtime reservation unconfirmed');
   const pendingAttemptId = pendingLaunchConvergence?.attemptId;
   pendingLaunchConvergence = undefined;
   if (pendingAttemptId && pendingAttemptId !== activeRestartAttemptId) {
