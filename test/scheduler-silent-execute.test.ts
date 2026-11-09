@@ -2055,3 +2055,52 @@ describe('independent PR2 round2 unknown schedule gate', () => {
     }
   });
 });
+
+describe('independent PR2 r3 deferred retry', () => {
+  it('recovers the same scheduled turn after durable admission is refused once', async () => {
+    const active = new Map<string, DaemonSession>();
+    const t = baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true });
+    const onBeforeDispatch = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
+    const runtime = {runId:'run-retry', turnId:'schedule:task0001:retry', onBeforeDispatch};
+    expect(await executeScheduledTask(t, active, refreshCliVersion, undefined, runtime)).toBe('deferred');
+    expect(forkWorkerMock).not.toHaveBeenCalled();
+    expect(await executeScheduledTask(t, active, refreshCliVersion, undefined, runtime)).toBe('dispatched');
+    expect(active.size).toBe(1);
+    expect(forkWorkerMock).toHaveBeenCalledOnce();
+    expect(forkedTurnId()).toBe(runtime.turnId);
+  });
+});
+
+describe('independent PR2 r3 per-bot schedule domain', () => {
+  it('does not report dispatched when the target bot cache is unreadable but ambient cache is free', async () => {
+    const isolated = mkdtempSync(join(tmpdir(), 'pr2-schedule-bot-domain-'));
+    const targetHome = join(isolated, 'target-home');
+    const ambientHome = join(isolated, 'ambient-home');
+    const release = join(isolated, 'release');
+    mkdirSync(join(targetHome, 'skills'), { recursive: true });
+    mkdirSync(release);
+    writeFileSync(join(targetHome, 'skills', '.botmux-traex-runtime.json'), '{broken');
+    writeFileSync(join(release, 'traex'), 'fake-executable');
+    const priorHome = process.env.TRAE_HOME;
+    const prior = { cliId:BOT.config.cliId, cliPathOverride:BOT.config.cliPathOverride, env:(BOT.config as any).env };
+    try {
+      process.env.TRAE_HOME = ambientHome;
+      BOT.config.cliId = 'traex';
+      (BOT.config as any).cliPathOverride = join(release, 'traex');
+      (BOT.config as any).env = {TRAE_HOME:targetHome};
+      expect(realRuntimePrecheck({ traeHome: targetHome, releaseDir: release }).state).toBe('unknown');
+      expect(realRuntimePrecheck({ traeHome: ambientHome, releaseDir: release }).state).toBe('free');
+      const result = await executeScheduledTask(
+        baseTask({rootMessageId:ROOT, scope:'thread', silent:true}),
+        new Map(), refreshCliVersion, undefined,
+        {runId:'run-bot-cache', turnId:'schedule:task0001:bot-cache'},
+      );
+      expect(result).toBe('deferred');
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+    } finally {
+      if (priorHome === undefined) delete process.env.TRAE_HOME; else process.env.TRAE_HOME = priorHome;
+      Object.assign(BOT.config, prior);
+      rmSync(isolated, {recursive:true, force:true});
+    }
+  });
+});

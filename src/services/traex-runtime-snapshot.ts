@@ -34,6 +34,7 @@ import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 
 import { withExclusiveFileLockAsync } from '../utils/file-flock.js';
+import { resolveInstallIdentity, type ExecutableIdentity } from './cli-install-identity.js';
 
 export const TRAEX_SNAPSHOT_MANIFEST = 'manifest.json';
 export const TRAEX_SNAPSHOT_COMPLETE = '.complete';
@@ -50,6 +51,10 @@ export interface TraexReleaseIdentity {
   comboKey: string;
   /** Stat signature of the source files at capture time. */
   sourceSignature?: string;
+  /** Identity of the SOURCE install entry captured together with the content
+   *  hashes above. It is the "install at spawn" fact: the worker must attest
+   *  this value, never a later fresh stat of the mutable entry. */
+  sourceInstallIdentity?: ExecutableIdentity;
 }
 
 export interface TraexSnapshotManifest {
@@ -91,6 +96,11 @@ export interface TraexRuntimeContent {
   manifest?: TraexSnapshotManifest;
   reused: boolean;
   snapshot: boolean;
+  /** Identity of the configured install entry observed in the SAME capture
+   *  that produced `comboKey`. Source observation and exec content are then
+   *  atomically consistent: an entry switch after the lease cannot relabel
+   *  which install this runtime was admitted from. */
+  sourceInstallIdentity?: ExecutableIdentity;
 }
 
 export interface TraexSnapshot extends TraexRuntimeContent {
@@ -224,6 +234,9 @@ export async function captureTraexReleaseIdentity(
   const installation = existsSync(installationCandidate) ? installationCandidate : undefined;
 
   const signature = statSignature([traex, helper, installation]);
+  // Captured in the SAME pass as the content hashes. The worker must attest
+  // this value instead of statting the mutable entry again after the lease.
+  const sourceInstallIdentity = resolveInstallIdentity(traex);
   const cacheKey = releaseIdentityCacheKey(releaseDir, executablePath);
   if (signature) {
     const cached = releaseIdentityCache.get(cacheKey);
@@ -255,6 +268,7 @@ export async function captureTraexReleaseIdentity(
     hashes,
     comboKey: comboKeyFromHashes(hashes),
     ...(signature ? { sourceSignature: signature } : {}),
+    ...(sourceInstallIdentity ? { sourceInstallIdentity } : {}),
   };
   if (signature) releaseIdentityCache.set(cacheKey, { signature, identity });
   return identity;
@@ -285,10 +299,12 @@ export async function captureTraexExecutableIdentity(executablePath: string): Pr
     ...(helper ? { helper: await sha256File(helper) } : {}),
     ...(installation ? { installation: await sha256File(installation) } : {}),
   };
+  const sourceInstallIdentity = resolveInstallIdentity(executablePath);
   return {
     comboKey: comboKeyFromHashes(hashes),
     dir,
     traexPath: executablePath,
+    ...(sourceInstallIdentity ? { sourceInstallIdentity } : {}),
     ...(helper ? { helperPath: helper } : {}),
     ...(installation ? { installationPath: installation } : {}),
     reused: false,
@@ -325,7 +341,12 @@ function manifestMatches(manifest: TraexSnapshotManifest, identity: TraexRelease
   return true;
 }
 
-function snapshotFromDir(dir: string, manifest: TraexSnapshotManifest, reused: boolean): TraexSnapshot {
+function snapshotFromDir(
+  dir: string,
+  manifest: TraexSnapshotManifest,
+  reused: boolean,
+  sourceInstallIdentity?: ExecutableIdentity,
+): TraexSnapshot {
   const paths = snapshotPaths(dir);
   return {
     comboKey: manifest.comboKey,
@@ -336,6 +357,7 @@ function snapshotFromDir(dir: string, manifest: TraexSnapshotManifest, reused: b
     manifest,
     reused,
     snapshot: true,
+    ...(sourceInstallIdentity ? { sourceInstallIdentity } : {}),
   };
 }
 
@@ -355,7 +377,7 @@ function reusableSnapshot(dir: string, identity: TraexReleaseIdentity): TraexSna
   } catch {
     return undefined;
   }
-  return snapshotFromDir(dir, manifest, true);
+  return snapshotFromDir(dir, manifest, true, identity.sourceInstallIdentity);
 }
 
 function fileStat(path: string): ReleaseFileStat {
@@ -487,7 +509,7 @@ export async function materializeTraexSnapshot(input: {
             }
             throw err;
           }
-          return { kind: 'snapshot', snapshot: snapshotFromDir(finalDir, manifest, false) };
+          return { kind: 'snapshot', snapshot: snapshotFromDir(finalDir, manifest, false, identity.sourceInstallIdentity) };
         } catch (err) {
           try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* best effort */ }
           throw err;

@@ -19883,6 +19883,22 @@ function setupWorkerHandlers(
 
       case 'traex_runtime_deferred': {
         if (!ownsLifecycleMutation()) break;
+        // The daemon may already have accounted this scheduled dispatch. The
+        // worker never reached the CLI, so keep a still-parked target waiting
+        // instead of letting it settle as dispatched. Best-effort: a settled
+        // run is intentionally left alone (the worker still holds the input).
+        if (msg.turnId) {
+          const taskId = parseScheduledTurnId(msg.turnId);
+          const run = scheduledSessionRun(ds.session, msg.turnId);
+          if (taskId && run) {
+            const turnId = msg.turnId;
+            void import('./scheduler.js')
+              .then(scheduler => scheduler.noteWorkerRuntimeDeferred(
+                taskId, run.runId, ds.chatId, turnId, ds.larkAppId,
+              ))
+              .catch(() => { /* correction is best-effort */ });
+          }
+        }
         const noticeKey = `${ds.workerGeneration}:${msg.detail}`;
         if (traexRuntimeDeferredNotice.get(ds.session.sessionId) === noticeKey) break;
         traexRuntimeDeferredNotice.set(ds.session.sessionId, noticeKey);

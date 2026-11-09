@@ -158,6 +158,23 @@ describe('PR2 independent scheduler adversarial review', () => {
     expect(persistedBeforeSend).toBe(true);
   });
 
+  it('keeps a parked target waiting when the worker gate defers after dispatch accounting', async () => {
+    const t = task();
+    scheduler.setExecuteCallback(async (current, context) => {
+      scheduler.parkDeferredRun(current.id, context, { runId: context.runId, detail: 'handoff',
+        targets: { oc_A: 'dispatched', oc_B: 'waiting' },
+        targetTurnIds: { oc_A: `schedule:${t.id}:a`, oc_B: `schedule:${t.id}:b` } });
+      return 'deferred';
+    });
+    scheduler.runNow(t.id);
+    await flush();
+    const runId = scheduler.getRuntimeTask(t.id, APP)!.deferredRun!.runId;
+    expect(scheduler.noteWorkerRuntimeDeferred(t.id, runId, 'oc_A', `schedule:${t.id}:a`, APP)).toBe(true);
+    expect(scheduler.getRuntimeTask(t.id, APP)?.deferredRun?.targets.oc_A).toBe('waiting');
+    // A different turn id must not move the target.
+    expect(scheduler.noteWorkerRuntimeDeferred(t.id, runId, 'oc_A', 'schedule:other', APP)).toBe(false);
+  });
+
   it('keeps the exact accepted prompt when a partially dispatched run retries after edits', async () => {
     const t = task();
     let count = 0;
@@ -270,5 +287,41 @@ describe('PR2 round2 protocol wiring', () => {
       daemonPid: process.pid,
     });
     expect(next.kind).toBe('blocked');
+  });
+});
+
+describe('independent PR2 r3 admission-to-exec identity', () => {
+  it('does not label an A snapshot as current when the configured entry changes before attestation', async () => {
+    const a = release('A');
+    const b = release('B');
+    const selected = join(root, 'selected');
+    symlinkSync(join(a, 'traex'), selected);
+    const entry = resolveCommandEntry(selected);
+    const result = await acquireTraexRuntimeLease({
+      traeHome: join(root, 'home'), entryPath: entry,
+      releaseDir: a, snapshotsRoot: join(root, 'snapshots'),
+      workerPid: process.pid, daemonPid: process.pid,
+    });
+    if (result.kind !== 'granted') throw new Error('expected A lease');
+    expect(result.lease.snapshot.comboKey).toBe(actualKey(a));
+    // The source observation is captured in the SAME materialisation pass as
+    // the frozen content; production attests this value, not a later stat of
+    // the mutable entry.
+    const sourceAtSpawn = result.lease.snapshot.sourceInstallIdentity;
+    expect(sourceAtSpawn).toBeTruthy();
+    // Upgrade lands after the lease freezes A, before attestation.
+    unlinkSync(selected);
+    symlinkSync(join(b, 'traex'), selected);
+    const frozen = resolveInstallIdentity(result.lease.snapshot.traexPath)!;
+    const ds = { localProcessAttestation: {
+      cliInstallEntry: entry,
+      cliInstallAtSpawn: sourceAtSpawn,
+      cliLaunchTarget: result.lease.snapshot.traexPath,
+      cliLaunchTargetIdentity: frozen,
+      cliLaunchComboKey: result.lease.snapshot.comboKey,
+      cliExe: frozen,
+    }} as any;
+    // Running A must never be relabelled as the now-current B install.
+    expect(observeTraexInstall(ds, 'traex').state).toBe('stale');
   });
 });

@@ -2747,6 +2747,10 @@ export type WorkerToDaemonBase =
       type: 'traex_runtime_deferred';
       blockers: Array<{ occupantId: string; comboKey: string; phase: 'starting' | 'running' | 'draining'; fixedPath?: boolean; pid?: number }>;
       detail: string;
+      /** Turn this spawn is holding. Lets the daemon correct a scheduled run
+       *  that was already accounted as dispatched but whose worker is waiting
+       *  in the start gate (no input was accepted yet). */
+      turnId?: string;
     }
   | { type: 'runner_build_ready'; runnerBuildId: string }
   | {

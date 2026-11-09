@@ -25330,6 +25330,7 @@ async function spawnCliBody(
             ...(blocker.pid !== undefined ? { pid: blocker.pid } : {}),
           })),
           detail,
+          ...(currentBotmuxTurnId ? { turnId: currentBotmuxTurnId } : {}),
         });
       };
       const gateAbort = (): string | undefined => {
@@ -25401,7 +25402,10 @@ async function spawnCliBody(
         traexConfiguredEntryAtSpawn = {
           generation: cliSpawnGeneration,
           entry: configuredEntry,
-          identity: resolveInstallIdentity(configuredEntry),
+          // The source observation captured together with the frozen content.
+          // Re-statting the mutable entry here would let an A→B switch between
+          // the lease and attestation label the running A snapshot as "B".
+          identity: gate.lease.snapshot.sourceInstallIdentity ?? resolveInstallIdentity(configuredEntry),
         };
         traexLaunchTargetAtSpawn = {
           generation: cliSpawnGeneration,

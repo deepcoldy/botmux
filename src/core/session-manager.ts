@@ -27,6 +27,8 @@ import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWork
 import { createCliAdapterSync, resolveCommandReal } from '../adapters/cli/registry.js';
 import { precheckTraexRuntime } from '../services/traex-runtime-gate.js';
 import { releaseDirForExecutable } from '../services/traex-runtime-snapshot.js';
+import { resolveTraexChildHome } from '../services/traex-paths.js';
+import { botInjectedEnv } from './env-policy.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { resolveSandboxMode } from '../adapters/cli/sandbox-mode.js';
@@ -4671,6 +4673,61 @@ export async function executeScheduledTask(
     dispatchPersisted = true;
     return true;
   };
+  // ── Idempotent continuation of a staged fresh run ─────────────────────────
+  // A previous attempt created and registered this run's fresh session (and,
+  // for a loud new-topic fire, its banner/anchor) but was refused before any
+  // fork/send. Reuse that exact session instead of posting a second banner or
+  // creating a second session. Only the SAME run/turn may bypass the staged
+  // placeholder; every other `initialStartPending` owner keeps its protection.
+  if (runtime?.runId) {
+    const stagedEntry = [...activeSessions.entries()].find(([, candidate]) =>
+      candidate.initialStartPending === true
+      && candidate.session.scheduledRun?.runId === runtime.runId
+      && candidate.session.scheduledRun?.turnId === scheduledTurnId,
+    );
+    if (stagedEntry) {
+      const [stagedKey, staged] = stagedEntry;
+      // Serialize with any concurrent creator/restore of the same anchor.
+      return withActiveSessionKeyLock(activeSessions, stagedKey, async () => {
+        if (activeSessions.get(stagedKey) !== staged) {
+          throw new Error(
+            `scheduled staged session ${staged.session.sessionId} lost its active registration`,
+          );
+        }
+        try {
+          await runtime.prepareTurnIdentity?.(staged, scheduledTurnId);
+        } catch (err) {
+          // The authority was revoked between attempts; this staged session
+          // never accepted input, so retire it rather than leaving a stuck
+          // placeholder.
+          if (activeSessions.get(stagedKey) === staged) activeSessions.delete(stagedKey);
+          sessionStore.closeSession(staged.session.sessionId);
+          throw err;
+        }
+        try {
+          if (!(await persistDispatch())) return 'deferred';
+          const stagedPrompt = staged.lastCliInput ?? staged.session.lastCliInput;
+          if (!stagedPrompt) {
+            throw new Error(
+              `staged scheduled session ${staged.session.sessionId} lost its prepared prompt`,
+            );
+          }
+          refreshCliVersion(bot.config);
+          forkWorker(staged, stagedPrompt, scheduledTurnId);
+        } catch (err) {
+          if (silent) disarmSilentScheduledTurn(staged, scheduledTurnId);
+          throw err;
+        }
+        staged.initialStartPending = false;
+        staged.pendingPrompt = undefined;
+        logger.info(
+          `[scheduler] Task "${task.name}" (${task.id}) resumed staged session `
+          + `${staged.session.sessionId} after refused admission`,
+        );
+        return 'dispatched';
+      });
+    }
+  }
   const scheduledTrustedCaller = trustedCallerForScheduledTask(task, larkAppId);
   const rawTopicTitle = task.topicTitle?.trim();
   const createsOwnTopic = executionPosition === 'new-topic' || executionPosition === 'task';
@@ -5258,12 +5315,28 @@ export async function executeScheduledTask(
  * original run/turn/prompt and retries once the domain is readable.
  */
 function scheduledTraexRuntimeBlocker(
-  bot: { config: Pick<BotConfig, 'cliId' | 'cliPathOverride'> },
+  bot: {
+    config: Pick<
+      BotConfig,
+      'cliId' | 'cliPathOverride' | 'env' | 'envUnset' | 'envPolicy'
+    >;
+  },
 ): string | undefined {
   if (bot.config.cliId !== 'traex') return undefined;
   try {
     const executablePath = resolveCommandReal(bot.config.cliPathOverride?.trim() || 'traex');
+    // Pre-check the SAME cache domain the CLI child will write. Using the
+    // daemon's ambient TRAE_HOME here would read a different domain whenever
+    // the bot has its own env.TRAE_HOME / envUnset, and could report
+    // `dispatched` while the worker actually waits in the target domain.
+    const traeHome = resolveTraexChildHome({
+      baseEnv: process.env,
+      envPolicy: bot.config.envPolicy,
+      envUnset: bot.config.envUnset,
+      perBotEnv: botInjectedEnv(bot.config.env, bot.config.envPolicy),
+    });
     const check = precheckTraexRuntime({
+      traeHome,
       releaseDir: releaseDirForExecutable(executablePath),
       executablePath,
     });

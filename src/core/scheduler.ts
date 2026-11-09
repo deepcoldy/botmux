@@ -781,6 +781,28 @@ export function markDeferredTargetDispatched(
   });
 }
 
+/**
+ * A worker start gate refused/waiting for a scheduled turn AFTER the daemon had
+ * already accounted its dispatch. Correct a run that is still parked: the
+ * target never reached the CLI, so it must stay `waiting` rather than settle as
+ * dispatched. A run that already settled is left untouched — the worker still
+ * holds the input, and re-dispatching could duplicate it.
+ */
+export function noteWorkerRuntimeDeferred(
+  id: string,
+  runId: string,
+  chatId: string,
+  turnId: string,
+  appId?: string,
+): boolean {
+  return mutateDeferredTarget(id, runId, appId, deferred => {
+    if (deferred.targetTurnIds?.[chatId] !== turnId) return undefined;
+    const state = deferred.targets[chatId];
+    if (state !== 'dispatching' && state !== 'dispatched') return undefined;
+    return { ...deferred, targets: { ...deferred.targets, [chatId]: 'waiting' } };
+  });
+}
+
 /** A target that was not actually sent (precheck refused again) goes back to
  *  `waiting` so the next retry can still deliver it exactly once. */
 export function markDeferredTargetWaiting(
