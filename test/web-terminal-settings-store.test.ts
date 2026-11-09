@@ -1,16 +1,21 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   formatMobileInputModeOsc,
   getWebTerminalInputMode,
+  getWebTerminalQuickCommands,
   MOBILE_INPUT_MODE_OSC_REGEX,
   parseMobileInputModeOsc,
   resolveSettingsOptions,
+  saveWebTerminalQuickCommands,
   setWebTerminalInputMode,
+  setWebTerminalQuickCommands,
   type WebTerminalSettings,
 } from '../src/services/web-terminal-settings-store.js';
+import { spawnTsScript } from './helpers/ts-runner.js';
 
 describe('web-terminal-settings-store', () => {
   let tempDir: string;
@@ -140,5 +145,169 @@ describe('web-terminal-settings-store', () => {
     expect(parsedBuffer?.cleaned).toBe('');
 
     expect(parseMobileInputModeOsc('normal terminal output')).toBeNull();
+  });
+
+  describe('快捷指令', () => {
+    const status = { label: '状态', send: '/status', enter: true, hint: '' };
+    const effort = { label: '/effort', send: '/effort ', enter: false, hint: '补一个级别' };
+    const botA = { botId: 'cli_bot_a', profile: 'default' } as const;
+    const botACodex = { botId: 'cli_bot_a', profile: 'codex' } as const;
+    const botB = { botId: 'cli_bot_b', profile: 'default' } as const;
+    const opts = () => ({ dataDir: tempDir });
+
+    it('没存过时返回 null，由页面用内置默认', () => {
+      expect(getWebTerminalQuickCommands(botA, opts())).toBeNull();
+    });
+
+    it('同一个 Bot 按 CLI 家族分开保存，互不覆盖', () => {
+      setWebTerminalQuickCommands(botA, [status, effort], opts());
+      setWebTerminalQuickCommands(botACodex, [status], opts());
+      expect(getWebTerminalQuickCommands(botA, opts())).toEqual([status, effort]);
+      expect(getWebTerminalQuickCommands(botACodex, opts())).toEqual([status]);
+    });
+
+    it('不同 Bot 互不可见：一个 Bot 保存、删光或恢复默认都不动另一个', () => {
+      setWebTerminalQuickCommands(botB, [effort], opts());
+      setWebTerminalQuickCommands(botA, [status], opts());
+      expect(getWebTerminalQuickCommands(botB, opts())).toEqual([effort]);
+      setWebTerminalQuickCommands(botA, [], opts());
+      expect(getWebTerminalQuickCommands(botB, opts())).toEqual([effort]);
+      setWebTerminalQuickCommands(botA, null, opts());
+      expect(getWebTerminalQuickCommands(botA, opts())).toBeNull();
+      expect(getWebTerminalQuickCommands(botB, opts())).toEqual([effort]);
+    });
+
+    it('没有 Bot 标识时不读也不写', () => {
+      expect(setWebTerminalQuickCommands(botA, [status], opts())).toBe(true);
+      expect(setWebTerminalQuickCommands({ botId: '', profile: 'default' }, [effort], opts())).toBe(false);
+      expect(getWebTerminalQuickCommands({ botId: '', profile: 'default' }, opts())).toBeNull();
+      expect(getWebTerminalQuickCommands(botA, opts())).toEqual([status]);
+      const saved = JSON.parse(readFileSync(join(tempDir, 'web-terminal-settings.json'), 'utf-8')) as {
+        quickCommands?: Record<string, unknown>;
+      };
+      expect(Object.keys(saved.quickCommands ?? {})).toEqual(['cli_bot_a']);
+    });
+
+    it('空列表原样保存；传 null 删掉这一套、回到默认', () => {
+      setWebTerminalQuickCommands(botA, [], opts());
+      expect(getWebTerminalQuickCommands(botA, opts())).toEqual([]);
+      setWebTerminalQuickCommands(botA, null, opts());
+      expect(getWebTerminalQuickCommands(botA, opts())).toBeNull();
+      const saved = JSON.parse(readFileSync(join(tempDir, 'web-terminal-settings.json'), 'utf-8')) as Record<string, unknown>;
+      expect(saved.quickCommands).toBeUndefined();
+    });
+
+    it('和输入模式共用一个文件，写一边不冲掉另一边', () => {
+      setWebTerminalInputMode('live', { sessionId: 'sess-q', dataDir: tempDir });
+      setWebTerminalQuickCommands(botA, [status], opts());
+      setWebTerminalInputMode('buffer', { sessionId: 'sess-r', dataDir: tempDir });
+      expect(getWebTerminalInputMode({ sessionId: 'sess-q', dataDir: tempDir })).toBe('live');
+      expect(getWebTerminalQuickCommands(botA, opts())).toEqual([status]);
+    });
+
+    it('保存时比对改之前看到的列表：一致才写，不一致回冲突和当前列表、不动文件', () => {
+      expect(saveWebTerminalQuickCommands(botA, null, [status], opts())).toEqual({ status: 'ok', commands: [status] });
+      // 另一个页面还以为是默认列表。
+      expect(saveWebTerminalQuickCommands(botA, null, [effort], opts())).toEqual({ status: 'conflict', commands: [status] });
+      expect(getWebTerminalQuickCommands(botA, opts())).toEqual([status]);
+      // 拿最新列表重做就能存上。
+      expect(saveWebTerminalQuickCommands(botA, [status], [status, effort], opts())).toEqual({ status: 'ok', commands: [status, effort] });
+      // 删光（空列表）和默认列表不是一回事。
+      expect(saveWebTerminalQuickCommands(botA, [], null, opts()).status).toBe('conflict');
+      expect(saveWebTerminalQuickCommands(botA, [status, effort], null, opts())).toEqual({ status: 'ok', commands: null });
+      expect(saveWebTerminalQuickCommands(botA, [status, effort], [], opts()).status).toBe('conflict');
+      expect(getWebTerminalQuickCommands(botA, opts())).toBeNull();
+      // 别的 Bot 的列表不参与比对。
+      setWebTerminalQuickCommands(botB, [effort], opts());
+      expect(saveWebTerminalQuickCommands(botA, null, [], opts())).toEqual({ status: 'ok', commands: [] });
+    });
+
+    it('比对按规整后的内容，不受字段顺序和省略的默认字段影响', () => {
+      setWebTerminalQuickCommands(botA, [{ label: '/compact', send: '/compact', enter: true, hint: '' }], opts());
+      const base = [{ send: '/compact' }] as unknown as Parameters<typeof saveWebTerminalQuickCommands>[1];
+      expect(saveWebTerminalQuickCommands(botA, base, [status], opts()).status).toBe('ok');
+    });
+
+    it('写不进去时回 error 和原来的列表，不假装成功', () => {
+      expect(saveWebTerminalQuickCommands({ botId: '', profile: 'default' }, null, [status], opts())).toEqual({ status: 'error', commands: null });
+      // 设置文件的位置被一个目录占了：读当作没存过，写会失败。
+      mkdirSync(join(tempDir, 'web-terminal-settings.json'));
+      expect(setWebTerminalQuickCommands(botA, [status], opts())).toBe(false);
+      expect(saveWebTerminalQuickCommands(botA, null, [status], opts())).toEqual({ status: 'error', commands: null });
+    });
+
+    it('文件被手工改坏时不抛错：整体形状不对当作没存过，单条不合法只丢那一条', () => {
+      const filePath = join(tempDir, 'web-terminal-settings.json');
+      writeFileSync(filePath, '{ corrupt json');
+      expect(getWebTerminalQuickCommands(botA, opts())).toBeNull();
+      writeFileSync(filePath, JSON.stringify({ quickCommands: { cli_bot_a: 'nope' } }));
+      expect(getWebTerminalQuickCommands(botA, opts())).toBeNull();
+      writeFileSync(filePath, JSON.stringify({ quickCommands: { cli_bot_a: { default: 'nope' } } }));
+      expect(getWebTerminalQuickCommands(botA, opts())).toBeNull();
+      writeFileSync(filePath, JSON.stringify({ quickCommands: { cli_bot_a: { default: [{ send: '' }, status] } } }));
+      expect(getWebTerminalQuickCommands(botA, opts())).toEqual([status]);
+      // 损坏的文件上也能重新写入。
+      writeFileSync(filePath, '[1,2,3]');
+      setWebTerminalQuickCommands(botA, [effort], opts());
+      expect(getWebTerminalQuickCommands(botA, opts())).toEqual([effort]);
+      writeFileSync(filePath, JSON.stringify({ quickCommands: { cli_bot_a: [1], cli_bot_b: { default: [status] } } }));
+      setWebTerminalQuickCommands(botA, [effort], opts());
+      expect(getWebTerminalQuickCommands(botA, opts())).toEqual([effort]);
+      expect(getWebTerminalQuickCommands(botB, opts())).toEqual([status]);
+    });
+
+    it('文件读不出来时先留一份原文件副本再覆盖；只是冲突、没写盘时不留也不动', () => {
+      const filePath = join(tempDir, 'web-terminal-settings.json');
+      const backups = () => readdirSync(tempDir).filter(name => name.startsWith('web-terminal-settings.json.corrupt-')).sort();
+      writeFileSync(filePath, '{ corrupt json');
+      expect(saveWebTerminalQuickCommands(botA, [status], [effort], opts())).toEqual({ status: 'conflict', commands: null });
+      expect(backups()).toEqual([]);
+      expect(readFileSync(filePath, 'utf8')).toBe('{ corrupt json');
+
+      expect(saveWebTerminalQuickCommands(botA, null, [effort], opts()).status).toBe('ok');
+      expect(backups()).toHaveLength(1);
+      expect(readFileSync(join(tempDir, backups()[0]), 'utf8')).toBe('{ corrupt json');
+      expect(getWebTerminalQuickCommands(botA, opts())).toEqual([effort]);
+
+      writeFileSync(filePath, '[1,2,3]');
+      setWebTerminalInputMode('live', { sessionId: 'sess-1', dataDir: tempDir });
+      expect(backups()).toHaveLength(2);
+      expect(backups().map(name => readFileSync(join(tempDir, name), 'utf8'))).toContain('[1,2,3]');
+      expect(getWebTerminalInputMode({ sessionId: 'sess-1', dataDir: tempDir })).toBe('live');
+    });
+
+    it('几个进程同时保存时互不覆盖：每次确认成功的修改都留在文件里', async () => {
+      // 每个子进程把列表里的计数加一并报告成功了几次；丢了哪次写入，最后的计数就对不上。
+      const script = join(tempDir, 'save-race.mts');
+      const storeUrl = pathToFileURL(resolve('src/services/web-terminal-settings-store.ts')).href;
+      writeFileSync(script, [
+        "import { readdirSync, writeFileSync } from 'node:fs';",
+        "import { join } from 'node:path';",
+        `import { getWebTerminalQuickCommands, saveWebTerminalQuickCommands } from ${JSON.stringify(storeUrl)};`,
+        "const [dataDir, total] = process.argv.slice(2);",
+        "const scope = { botId: 'cli_bot_a', profile: 'default' as const };",
+        "writeFileSync(join(dataDir, 'ready-' + process.pid), '');",
+        "while (readdirSync(dataDir).filter(name => name.startsWith('ready-')).length < Number(total)) await new Promise(r => setTimeout(r, 5));",
+        "let ok = 0;",
+        "for (let i = 0; i < 200; i++) {",
+        "  const current = getWebTerminalQuickCommands(scope, { dataDir });",
+        "  const next = [{ label: 'count', send: String(current ? Number(current[0].send) + 1 : 1) }];",
+        "  if (saveWebTerminalQuickCommands(scope, current, next, { dataDir }).status === 'ok') ok++;",
+        "}",
+        "process.stdout.write(String(ok));",
+      ].join('\n'));
+      const run = () => new Promise<number>((done, fail) => {
+        const child = spawnTsScript(script, [tempDir, '2'], { stdio: ['ignore', 'pipe', 'pipe'] });
+        let out = '';
+        let err = '';
+        child.stdout!.on('data', chunk => { out += chunk; });
+        child.stderr!.on('data', chunk => { err += chunk; });
+        child.on('error', fail);
+        child.on('exit', code => (code === 0 ? done(Number(out)) : fail(new Error(`child exited ${code}: ${err}`))));
+      });
+      const counts = await Promise.all([run(), run()]);
+      expect(counts.every(count => count > 0)).toBe(true);
+      expect(getWebTerminalQuickCommands(botA, opts())?.[0].send).toBe(String(counts[0] + counts[1]));
+    }, 60_000);
   });
 });
