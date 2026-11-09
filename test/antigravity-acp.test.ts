@@ -128,12 +128,17 @@ describe('Antigravity ACP opt-in', () => {
     expect(createCliAdapterSync('codex', '/bin/true', { antigravityTransport: 'acp' }).runnerFramedInput).not.toBe(true);
   });
 
-  it('rejects unsupported permissions, forks, unknown resume identities and uncorrelated input', async () => {
+  it('rejects unsupported permissions and forks, and resumes only when the exact native id exists', async () => {
     const adapter = createAntigravityAcpAdapter('/bin/true');
     const base = { sessionId: 'test', resume: false };
     expect(() => adapter.buildArgs({ ...base, disableCliBypass: true })).toThrow('interactive permissions');
     expect(() => adapter.buildArgs({ ...base, forkSession: true })).toThrow('fork');
-    expect(() => adapter.buildArgs({ ...base, resume: true })).toThrow('exact native session');
+    // A resume without a native id (warm reattach before the first session/new)
+    // must not throw: the runner starts fresh instead of killing the reattach.
+    const freshArgs = adapter.buildArgs({ ...base, resume: true });
+    expect(freshArgs).not.toContain('--native-session-id');
+    const resumeArgs = adapter.buildArgs({ ...base, resume: true, resumeSessionId: 'native-123' });
+    expect(resumeArgs.slice(resumeArgs.indexOf('--native-session-id'))).toEqual(['--native-session-id', 'native-123']);
     const writes: string[] = [];
     expect(await adapter.writeInput({ write: text => { writes.push(text); } }, 'message')).toMatchObject({ submitted: false });
     expect(writes).toEqual([]);

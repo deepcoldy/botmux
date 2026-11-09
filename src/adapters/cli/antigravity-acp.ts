@@ -21,7 +21,11 @@ export function createAntigravityAcpAdapter(pathOverride?: string): CliAdapter {
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, disableCliBypass, forkSession }) {
       if (disableCliBypass) throw new Error('Antigravity ACP currently requires auto-approved tools; use terminal transport for interactive permissions.');
       if (forkSession) throw new Error('Antigravity ACP does not support forks; use terminal transport or a new session.');
-      if (resume && !resumeSessionId) throw new Error('Antigravity ACP requires the exact native session ID to resume.');
+      // A warm reattach can predate the first native session id (empty-start
+      // topic, or a first turn that failed before session/new returned). The
+      // worker demotes cold resumes to fresh via missingExactResumeId; here we
+      // only omit the flag so the surviving runner starts session/new on its
+      // next turn instead of killing the reattach — same shape as minimax.
       const args = [runnerArgv0('antigravity-runner', resolveRunnerPath('antigravity-runner.js', {
         testOverrideEnv: 'BOTMUX_TEST_ANTIGRAVITY_RUNNER_PATH', fallback: 'dist',
       })), '--agy-bin', executable(), '--log-file', new AntigravitySessionLog(sessionId).path];
