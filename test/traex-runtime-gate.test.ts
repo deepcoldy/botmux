@@ -139,13 +139,13 @@ describe('traex runtime registry', () => {
       occupantId: 'a', comboKey: 'content-a', workerPid: process.pid, daemonPid: process.pid,
     });
     const sameB = await acquireTraexRuntimeStart(domain, {
-      occupantId: 'b', comboKey: 'content-a', workerPid: process.pid, daemonPid: process.pid,
+      occupantId: 'b', comboKey: 'content-a', workerPid: process.ppid, daemonPid: process.ppid,
     });
     expect(sameA.decision).toBe('start');
     expect(sameB.decision).toBe('start');
 
     const other = await acquireTraexRuntimeStart(domain, {
-      occupantId: 'c', comboKey: 'content-b', workerPid: process.pid, daemonPid: process.pid,
+      occupantId: 'c', comboKey: 'content-b', workerPid: 999_999, daemonPid: 999_999,
     });
     expect(other.decision).toBe('blocked');
     if (other.decision === 'blocked') {
@@ -157,8 +157,10 @@ describe('traex runtime registry', () => {
 
   it('blocks a proven content request while an unknown occupant holds the domain', async () => {
     const domain = domainFor(traeHome());
+    // A distinct owner: the same worker superseding its own pre-exec record is
+    // a legitimate restart, so the fixture must not reuse this process's pid.
     await acquireTraexRuntimeStart(domain, {
-      occupantId: 'unknown', comboKey: '', workerPid: process.pid, daemonPid: process.pid,
+      occupantId: 'unknown', comboKey: '', workerPid: process.ppid, daemonPid: process.ppid,
     });
     const decision = await acquireTraexRuntimeStart(domain, {
       occupantId: 'new', comboKey: 'content-a', workerPid: process.pid, daemonPid: process.pid,
@@ -369,22 +371,31 @@ describe('acquireTraexRuntimeLease', () => {
     expect(readTraexRuntimeOccupants(domain.domain)).toEqual([]);
   });
 
-  it('hashes an operator-pinned executable without copying it', async () => {
+  it('freezes an operator-pinned executable while leaving the pinned path untouched', async () => {
     const home = traeHome();
     const pinned = release('pinned');
+    const pinnedExe = join(pinned, 'traex');
+    const before = readFileSync(pinnedExe, 'utf8');
+    const expected = await captureTraexReleaseIdentity(pinned, pinnedExe);
     const result = await acquireTraexRuntimeLease({
       traeHome: home,
       releaseDir: pinned,
       fixedPath: true,
-      fixedExecutablePath: join(pinned, 'traex'),
+      fixedExecutablePath: pinnedExe,
       workerPid: process.pid,
       daemonPid: process.pid,
       snapshotsRoot: tempDir('botmux-traex-snapshots-'),
     });
     expect(result.kind).toBe('granted');
     if (result.kind !== 'granted') return;
-    expect(result.lease.snapshot.snapshot).toBe(false);
-    expect(result.lease.snapshot.traexPath).toBe(join(pinned, 'traex'));
+    // A pinned runtime is still frozen: the gate never lets a later source
+    // switch change what this process loads. The operator's config path is not
+    // rewritten; only the launch object is a private copy.
+    expect(result.lease.snapshot.snapshot).toBe(true);
+    expect(result.lease.snapshot.traexPath).not.toBe(pinnedExe);
+    expect(result.lease.snapshot.comboKey).toBe(expected.comboKey);
+    expect(readFileSync(result.lease.snapshot.traexPath, 'utf8')).toBe(before);
+    expect(readFileSync(pinnedExe, 'utf8')).toBe(before);
     await result.lease.abandon();
   });
 
@@ -399,6 +410,10 @@ describe('acquireTraexRuntimeLease', () => {
       snapshotsRoot,
     });
     expect(first.kind).toBe('granted');
+    if (first.kind !== 'granted') return;
+    // The first runtime really started: attach a live CLI so the second start
+    // cannot treat it as this worker's own superseded pre-exec reservation.
+    await first.lease.markRunning(process.pid);
     const second = await acquireTraexRuntimeLease({
       traeHome: home,
       releaseDir: release('new'),
@@ -408,7 +423,7 @@ describe('acquireTraexRuntimeLease', () => {
     });
     expect(second.kind).toBe('blocked');
     if (second.kind === 'blocked') expect(second.blockers).toHaveLength(1);
-    if (first.kind === 'granted') await first.lease.release();
+    await first.lease.abandon();
   });
 
   it('fails closed when the shared cache cannot be coordinated', async () => {

@@ -226,12 +226,22 @@ describe('deferred scheduled run lifecycle', () => {
     expect(recovered.deferredRun!.targets.oc_b).toBe('waiting');
 
     // A retry refuses to replay the ambiguous target and surfaces an error.
+    // It must NOT settle the run: oc_b is still owed, so the parked identity,
+    // its turn ids and the waiting target survive. Only a human can resolve the
+    // ambiguous target.
     expect(scheduler.runNow(task.id)).toEqual({ ok: true });
     await flush();
     const failed = scheduler.getRuntimeTask(task.id, APP)!;
-    expect(failed.lastStatus).toBe('error');
+    expect(failed.lastStatus).toBe('deferred');
     expect(failed.lastError).toContain('ambiguous');
-    expect(failed.deferredRun).toBeUndefined();
+    expect(failed.deferredRun).toMatchObject({
+      runId,
+      targets: { oc_a: 'ambiguous', oc_b: 'waiting' },
+    });
+    // Refusing the replay is not a run outcome: no repeat/once consumption and
+    // no dispatched ledger entry for the still-waiting target.
+    expect(failed.repeat?.completed).toBe(0);
+    expect(failed.runStats?.dispatched ?? 0).toBe(0);
   });
 
   it('survives a real authority-store close/reopen and keeps waiting targets retryable', async () => {

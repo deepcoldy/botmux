@@ -1754,6 +1754,39 @@ export type ScheduleNotifyEvent = 'failing' | 'expired';
 export type ScheduleDeferredTargetState = 'waiting' | 'dispatching' | 'dispatched' | 'ambiguous';
 
 /** A scheduled run parked behind a managed-runtime handoff. */
+/** Execution-relevant task fields frozen when a run is first admitted.
+ *
+ *  A deferred retry must re-enter the SAME logical run: the prompt a person
+ *  accepted, the identity it runs as, and the routing it was created for are
+ *  not re-read from the live task row. Otherwise an edit made while one target
+ *  is still waiting would silently change what the remaining targets receive,
+ *  and a pause/revoke would either resurrect or half-deliver the run. Only
+ *  execution inputs live here — never mutable run state (lastStatus, nextRunAt,
+ *  runStats, repeat, deferredRun itself). */
+export interface ScheduledTaskDeferredContext {
+  prompt: string;
+  workingDir: string;
+  chatId: string;
+  chatIds?: string[];
+  rootMessageId?: string;
+  chatType?: ScheduledTask['chatType'];
+  scope?: ScheduledTask['scope'];
+  executionPosition?: ScheduledTask['executionPosition'];
+  topicTitle?: string;
+  larkAppId?: string;
+  creatorChatId?: string;
+  creatorRootMessageId?: string;
+  creatorLarkAppId?: string;
+  ownerOpenId?: string;
+  ownerUnionId?: string;
+  runAsClaim?: ScheduledTask['runAsClaim'];
+  model?: string;
+  reasoningEffort?: ScheduledTask['reasoningEffort'];
+  silent?: boolean;
+  deliver?: ScheduledTask['deliver'];
+  followActive?: boolean;
+}
+
 export interface ScheduledTaskDeferredRun {
   /** Stable logical run identity reused by every retry until it settles. */
   runId: string;
@@ -1775,6 +1808,10 @@ export interface ScheduledTaskDeferredRun {
    *  retry (or a daemon restart) cannot mint a second turn for the same
    *  target; the worker's turn-id dedupe then rejects a duplicate input. */
   targetTurnIds?: Record<string, string>;
+  /** Frozen execution inputs captured when this run was first admitted. A
+   *  retry overlays these onto the live task row so human edits after the
+   *  first partial dispatch cannot change what still-waiting targets receive. */
+  context?: ScheduledTaskDeferredContext;
 }
 
 export interface ScheduledTask {
@@ -2609,12 +2646,21 @@ export type WorkerToDaemonBase =
        * `/proc/<pid>/exe` at publish time. Absent when the platform has no
        * proven source (macOS) or the pid is not the TRAE leaf yet. */
       cliExe?: import('./services/cli-install-identity.js').ExecutableIdentity;
-      /** The install entry this worker's adapter resolved at spawn. The daemon
-       * re-resolves it to detect an install replacement under the process. */
+      /** The configured install entry this worker's adapter resolved. The
+       *  daemon re-resolves it to detect an install replacement. It stays the
+       *  mutable configured path even when the exec target is a frozen copy. */
       cliInstallEntry?: string;
       /** `cliInstallEntry` statted right before the spawn that produced
        * `cliSpawnGeneration`. Absent when it did not resolve. */
       cliInstallAtSpawn?: import('./services/cli-install-identity.js').ExecutableIdentity;
+      /** Exact object this generation exec'd (snapshot copy or pinned path). */
+      cliLaunchTarget?: string;
+      /** Identity of `cliLaunchTarget` captured before exec. */
+      cliLaunchTargetIdentity?: import('./services/cli-install-identity.js').ExecutableIdentity;
+      /** Content combination key of the exec'd object. */
+      cliLaunchComboKey?: string;
+      /** Private snapshot directory backing `cliLaunchTarget`, if any. */
+      cliSnapshotDir?: string;
       /** Monotonic per-worker CLI spawn counter. Late attestations from an
        * older spawn are rejected by the daemon handler. */
       cliSpawnGeneration?: number;

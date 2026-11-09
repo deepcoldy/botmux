@@ -418,10 +418,17 @@ import { isTraexProcess, resolveTraexOwnershipPid, scheduleTraexLeafPidResolve }
 import {
   readRunningExeIdentity,
   resolveInstallIdentity,
+  sameExecutableObject,
   type ExecutableIdentity,
 } from './services/cli-install-identity.js';
 import { pinWorkerTraeHome } from './services/traex-paths.js';
-import { acquireTraexRuntimeLease, daemonBirthIdentity, type TraexRuntimeLease } from './services/traex-runtime-gate.js';
+import {
+  acquireTraexRuntimeLease,
+  acquireTraexRuntimeOccupancy,
+  daemonBirthIdentity,
+  type TraexRuntimeBlocker,
+  type TraexRuntimeLease,
+} from './services/traex-runtime-gate.js';
 import { releaseDirForExecutable } from './services/traex-runtime-snapshot.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput } from './services/codex-user-input.js';
@@ -2089,9 +2096,21 @@ async function publishRuntimeContract(binding: RuntimeEventBinding, nativeSessio
   send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
 }
 let cliSpawnGeneration = 0;
-/** What the TRAE install entry resolved to right before the spawn of
- *  `generation`. Published only while that spawn is still the current one. */
-let traexInstallAtSpawn: { generation: number; identity: ExecutableIdentity | undefined } | undefined;
+/** The operator-configured TRAE entry (never the snapshot) of the current
+ *  spawn. Kept apart from the actual exec target so the install watcher can
+ *  tell "the configured install changed" from "we exec a frozen copy". */
+let traexConfiguredEntryAtSpawn: { generation: number; entry: string; identity: ExecutableIdentity | undefined } | undefined;
+/** The frozen object the current spawn actually execs. `identity` is captured
+ *  right after materialisation, before exec, so a later source change cannot
+ *  silently relabel it. */
+let traexLaunchTargetAtSpawn: {
+  generation: number;
+  path: string;
+  identity: ExecutableIdentity | undefined;
+  comboKey: string;
+  snapshotDir?: string;
+  helperPath?: string;
+} | undefined;
 
 class CliSpawnSupersededError extends Error {
   constructor() {
@@ -25155,6 +25174,9 @@ async function spawnCliBody(
   let traexRuntimeLease: TraexRuntimeLease | undefined;
   let traexLeaseRunning = false;
   let traexLeaseHeartbeat: ReturnType<typeof setInterval> | undefined;
+  /** Helper paired with the frozen snapshot, exported to the CLI child so it
+   *  loads the SAME release as the main binary it was admitted with. */
+  let traexLaunchHelperPath: string | undefined;
   const stopTraexLeaseHeartbeat = (): void => {
     if (traexLeaseHeartbeat !== undefined) {
       clearInterval(traexLeaseHeartbeat);
@@ -25169,7 +25191,28 @@ async function spawnCliBody(
     const lease = traexRuntimeLease;
     if (!lease) return;
     const cliStart = readProcessStartIdentity(pid);
-    void lease.markRunning(pid, cliStart ?? undefined).catch((err) => {
+    // Prove the leaf really runs the frozen object this lease registered. A
+    // path that was swapped after materialisation would otherwise be recorded
+    // under the old content identity. `isTraexProcess` keeps a launcher pid
+    // (bwrap/forge/relay) from being judged as the CLI; the leaf re-attach
+    // below verifies the real one. When the identity cannot be read at all we
+    // fail closed and downgrade the occupant to unknown instead of trusting
+    // the reservation.
+    let proven = true;
+    if (!lease.occupancyOnly && lease.snapshot.snapshot && isTraexProcess(pid)) {
+      const running = readRunningExeIdentity(pid, cliStart ?? undefined);
+      const expected = resolveInstallIdentity(lease.snapshot.traexPath);
+      proven = sameExecutableObject(running, expected);
+      if (!proven) {
+        log(
+          `[traex-runtime] pid ${pid} is not running the registered snapshot `
+          + `${lease.snapshot.traexPath}; marking the occupant unknown`,
+        );
+      }
+    }
+    void (proven
+      ? lease.markRunning(pid, cliStart ?? undefined)
+      : lease.markUnknown(pid, cliStart ?? undefined)).catch((err) => {
       log(`[traex-runtime] failed to record CLI identity ${pid}: ${err instanceof Error ? err.message : String(err)}`);
     });
     if (traexLeaseRunning) return;
@@ -25186,60 +25229,78 @@ async function spawnCliBody(
     }, 20_000);
     traexLeaseHeartbeat.unref?.();
   };
-  const traexGateApplies = effectiveCliId === 'traex'
-    && cfg.adoptMode !== true
-    && !willReattachPersistent
-    && cfg.existingAppServerEndpoint === undefined
-    && !cfg.wrapperCli
-    && cfg.cliLaunchMode !== 'forge-traex'
-    && !isRemoteBackendType(effectiveBackendType);
-  if (traexGateApplies) {
+  const traexRuntimeRelevant = effectiveCliId === 'traex' && !isRemoteBackendType(effectiveBackendType);
+  // Runtimes this worker does not exec itself: an adopted pane, a persistent
+  // reattach, a wrapper/forge launcher, or an already-running app-server. They
+  // still write the shared cache, so they occupy the domain as unknown and
+  // must be waited out — never killed or retargeted.
+  const traexOccupancyOnly = traexRuntimeRelevant && (
+    cfg.adoptMode === true
+    || willReattachPersistent
+    || cfg.existingAppServerEndpoint !== undefined
+    || !!cfg.wrapperCli
+    || cfg.cliLaunchMode === 'forge-traex'
+  );
+  if (traexRuntimeRelevant) {
     const fixedPath = typeof cfg.cliPathOverride === 'string' && cfg.cliPathOverride.trim().length > 0;
-    const executablePath = fixedPath
+    const configuredEntry = fixedPath
       ? resolveCommandReal(cfg.cliPathOverride!.trim())
       : resolveCommandReal('traex');
-    if (!isAbsolute(executablePath) || !existsSync(executablePath)) {
+    if (!isAbsolute(configuredEntry) || !existsSync(configuredEntry)) {
       // Nothing can exec; let the existing launch preflight report the missing
       // CLI instead of reserving a slot for a binary that does not exist.
-      log(`[traex-runtime] skipping gate: unresolved install entry ${executablePath}`);
+      log(`[traex-runtime] skipping gate: unresolved install entry ${configuredEntry}`);
     } else {
       const workerStart = readProcessStartIdentity(process.pid);
       const daemon = daemonBirthIdentity();
-      const gate = await acquireTraexRuntimeLease({
+      const common = {
         traeHome: process.env.TRAE_HOME,
-        releaseDir: releaseDirForExecutable(executablePath),
-        executablePath,
+        releaseDir: releaseDirForExecutable(configuredEntry),
         workerPid: process.pid,
         ...(workerStart ? { workerStart } : {}),
         daemonPid: daemon.daemonPid,
         ...(daemon.daemonStart ? { daemonStart: daemon.daemonStart } : {}),
-        fixedPath,
-        ...(fixedPath ? { fixedExecutablePath: executablePath } : {}),
-        // Sandboxed launches bind the install path the operator resolved; the
-        // snapshot is only used for direct spawns, so keep them hash-only.
-        materialize: !fixedPath && !sandboxRequested,
-        waitMs: Number.POSITIVE_INFINITY,
-        pollMs: 500,
-        abort: () => {
-          if (closeRequested) return 'worker-closing';
-          if (spawnGeneration !== cliSpawnGeneration) return 'spawn-superseded';
-          return undefined;
-        },
-        onBlocked: (blockers, detail) => {
-          log(`[traex-runtime] waiting for an incompatible TRAE runtime: ${detail}`);
-          send({
-            type: 'traex_runtime_deferred',
-            blockers: blockers.map((blocker) => ({
-              occupantId: blocker.occupantId,
-              comboKey: blocker.comboKey,
-              phase: blocker.phase,
-              ...(blocker.fixedPath ? { fixedPath: true } : {}),
-              ...(blocker.pid !== undefined ? { pid: blocker.pid } : {}),
-            })),
-            detail,
+      };
+      const onBlocked = (blockers: TraexRuntimeBlocker[], detail: string): void => {
+        log(`[traex-runtime] waiting for an incompatible TRAE runtime: ${detail}`);
+        send({
+          type: 'traex_runtime_deferred',
+          blockers: blockers.map((blocker) => ({
+            occupantId: blocker.occupantId,
+            comboKey: blocker.comboKey,
+            phase: blocker.phase,
+            ...(blocker.fixedPath ? { fixedPath: true } : {}),
+            ...(blocker.pid !== undefined ? { pid: blocker.pid } : {}),
+          })),
+          detail,
+        });
+      };
+      const gate = traexOccupancyOnly
+        ? await acquireTraexRuntimeOccupancy({
+            ...common,
+            fixedPath,
+          })
+        : await acquireTraexRuntimeLease({
+            ...common,
+            executablePath: configuredEntry,
+            fixedPath,
+            ...(fixedPath ? { fixedExecutablePath: configuredEntry } : {}),
+            // Always exec a frozen copy — including pinned and sandboxed
+            // launches. A pinned config stays untouched; only the runtime
+            // object is frozen so a switch between materialisation and exec
+            // cannot make this process load content it never registered.
+            materialize: true,
+            // Scratch is a session-private COW home: no cross-process domain.
+            coordinate: !scratchRequested,
+            waitMs: Number.POSITIVE_INFINITY,
+            pollMs: 500,
+            abort: () => {
+              if (closeRequested) return 'worker-closing';
+              if (spawnGeneration !== cliSpawnGeneration) return 'spawn-superseded';
+              return undefined;
+            },
+            onBlocked,
           });
-        },
-      });
       if (gate.kind === 'aborted') throw new CliSpawnSupersededError();
       if (gate.kind === 'blocked') {
         throw new Error(`TRAE runtime gate stayed blocked: ${gate.detail}`);
@@ -25256,14 +25317,47 @@ async function spawnCliBody(
         void lease.abandon();
       };
       pendingTraexSpawnAbandon = abandonLease;
-      if (gate.lease.snapshot.snapshot && !fixedPath) {
+      if (!gate.lease.occupancyOnly) {
+        // Configured entry (the mutable path the operator/bot selected) and
+        // the frozen object this generation will exec are DIFFERENT facts:
+        // the install watcher compares the former across time, while the
+        // attestation proves the latter is what the process runs.
+        traexConfiguredEntryAtSpawn = {
+          generation: cliSpawnGeneration,
+          entry: configuredEntry,
+          identity: resolveInstallIdentity(configuredEntry),
+        };
+        traexLaunchTargetAtSpawn = {
+          generation: cliSpawnGeneration,
+          path: gate.lease.snapshot.traexPath,
+          identity: resolveInstallIdentity(gate.lease.snapshot.traexPath),
+          comboKey: gate.lease.snapshot.comboKey,
+          ...(gate.lease.snapshot.snapshot ? { snapshotDir: gate.lease.snapshot.dir } : {}),
+          ...(gate.lease.snapshot.helperPath ? { helperPath: gate.lease.snapshot.helperPath } : {}),
+        };
+        traexLaunchHelperPath = gate.lease.snapshot.helperPath;
+      } else {
+        // Adopt/reattach/wrapper/forge: the configured entry is still the
+        // thing the install watcher should follow, but there is no frozen
+        // launch target to prove.
+        traexConfiguredEntryAtSpawn = {
+          generation: cliSpawnGeneration,
+          entry: configuredEntry,
+          identity: resolveInstallIdentity(configuredEntry),
+        };
+        traexLaunchTargetAtSpawn = undefined;
+        traexLaunchHelperPath = undefined;
+      }
+      if (gate.lease.snapshot.snapshot) {
         // Exec the verified private copy instead of the mutable install entry.
+        // For a pinned runtime the operator's config is not rewritten; only
+        // this process's launch object is overridden.
         cfg = { ...cfg, cliPathOverride: gate.lease.snapshot.traexPath };
         cliAdapter = withTraexResumeAdapter(createAdapter());
       }
       log(
-        `[traex-runtime] admitted content ${gate.lease.snapshot.comboKey.slice(0, 12)} `
-        + `(${fixedPath ? 'pinned' : gate.lease.snapshot.snapshot ? 'snapshot' : 'direct'})`,
+        `[traex-runtime] admitted content ${gate.lease.snapshot.comboKey.slice(0, 12) || 'unknown'} `
+        + `(${gate.lease.occupancyOnly ? 'occupancy-only' : gate.lease.snapshot.snapshot ? (fixedPath ? 'pinned-snapshot' : 'snapshot') : 'direct'})`,
       );
     }
   }
@@ -26041,6 +26135,10 @@ async function spawnCliBody(
   // namespaced BOTMUX_LARK_APP_ID injected below; the worker keeps its own
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
   const childEnv = buildSessionChildEnv(process.env, cfg.envPolicy, cfg.envUnset, cfg.protectedMcpPolicy);
+  // Pair the CLI with the helper from the SAME frozen release. Without this
+  // the CLI may lazily locate a helper next to the mutable install entry,
+  // which can already be the next version.
+  if (traexLaunchHelperPath) childEnv.TRAEX_CODE_MODE_HOST_PATH = traexLaunchHelperPath;
   delete childEnv[PROTECTED_HTTP_EGRESS_SOCKET_ENV];
   delete childEnv[PROTECTED_HTTP_EGRESS_PROTOCOL_ENV];
   // Older callers interpret this retired flag as a required socket contract.
@@ -28221,9 +28319,6 @@ async function spawnCliBody(
       publish: send,
       spawn: () => {
         const backend = spawnBackend;
-        if (cfg.cliId === 'traex') {
-          traexInstallAtSpawn = { generation: cliSpawnGeneration, identity: resolveInstallIdentity(spawnCliBin) };
-        }
         backend.spawn(spawnBin, spawnArgs, {
           cwd: spawnCwd,
           cols: PTY_COLS,
@@ -33877,15 +33972,25 @@ function publishLocalProcessAttestation(
   const cliExe = lastInitConfig?.cliId === 'traex' && cliPid && isTraexProcess(cliPid)
     ? readRunningExeIdentity(cliPid, cliProcStart)
     : undefined;
-  // The install entry this worker's adapter resolved at spawn. The daemon
-  // re-resolves it later to detect a replacement under the running process;
-  // this worker never re-runs a version probe for it.
+  // The configured install entry this worker was launched from. After the
+  // runtime gate rewrites `cliPathOverride` to a frozen snapshot, the adapter's
+  // `resolvedBin` names that snapshot — which is NOT the mutable install the
+  // daemon must watch. Prefer the gate-recorded configured entry for the
+  // current spawn; fall back to the adapter only when no gate ran (unresolved
+  // entry, where the launch fails and no reclaim can be authorized anyway).
+  const configuredAtSpawn = traexConfiguredEntryAtSpawn?.generation === cliSpawnGeneration
+    ? traexConfiguredEntryAtSpawn
+    : undefined;
   const cliInstallEntry = lastInitConfig?.cliId === 'traex'
-    ? cliAdapter?.resolvedBin
+    ? (configuredAtSpawn?.entry ?? cliAdapter?.resolvedBin)
     : undefined;
   // An earlier spawn's observation says nothing about the current process.
-  const cliInstallAtSpawn = cliInstallEntry && traexInstallAtSpawn?.generation === cliSpawnGeneration
-    ? traexInstallAtSpawn.identity
+  const cliInstallAtSpawn = cliInstallEntry ? configuredAtSpawn?.identity : undefined;
+  // The exact object this generation exec'd (frozen copy / pinned path). The
+  // daemon compares the leaf's kernel-reported image against this, so a source
+  // switch after materialisation can never be relabelled as "the same version".
+  const launchTarget = traexLaunchTargetAtSpawn?.generation === cliSpawnGeneration
+    ? traexLaunchTargetAtSpawn
     : undefined;
   send({
     type: 'local_process_attestation',
@@ -33896,6 +34001,12 @@ function publishLocalProcessAttestation(
     ...(cliExe ? { cliExe } : {}),
     ...(cliInstallEntry ? { cliInstallEntry } : {}),
     ...(cliInstallAtSpawn ? { cliInstallAtSpawn } : {}),
+    ...(launchTarget ? {
+      cliLaunchTarget: launchTarget.path,
+      ...(launchTarget.identity ? { cliLaunchTargetIdentity: launchTarget.identity } : {}),
+      cliLaunchComboKey: launchTarget.comboKey,
+      ...(launchTarget.snapshotDir ? { cliSnapshotDir: launchTarget.snapshotDir } : {}),
+    } : {}),
     cliSpawnGeneration,
     ...(enginePid ? { enginePid } : {}),
     ...(engineProcStart ? { engineProcStart } : {}),

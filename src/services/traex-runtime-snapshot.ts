@@ -48,17 +48,30 @@ export interface TraexReleaseIdentity {
   installation?: string;
   hashes: { traex: string; helper?: string; installation?: string };
   comboKey: string;
+  /** Stat signature of the source files at capture time. */
+  sourceSignature?: string;
 }
 
 export interface TraexSnapshotManifest {
   version: number;
   comboKey: string;
   sourceReleaseDir: string;
+  /** Stat signature of the three source files at capture time. Lets a reader
+   *  prove whether the mutable install entry still names the content this
+   *  snapshot was built from without re-hashing the large binaries. */
+  sourceSignature?: string;
   traex: { sha256: string; size: number; devIno: string };
   helper?: { sha256: string; size: number; devIno: string };
   installation?: { sha256: string; size: number; devIno: string };
   createdAt: string;
   verified: true;
+}
+
+export interface TraexSnapshotProvenance {
+  snapshotDir: string;
+  manifest: TraexSnapshotManifest;
+  sourceReleaseDir: string;
+  sourceSignature?: string;
 }
 
 /**
@@ -120,6 +133,13 @@ interface CachedReleaseIdentity {
 
 const releaseIdentityCache = new Map<string, CachedReleaseIdentity>();
 
+/** One release directory can be read through different leaves (the configured
+ *  `traex` entry or an operator-pinned executable with another name), so the
+ *  cache key must include the exact main-executable path. */
+function releaseIdentityCacheKey(releaseDir: string, executablePath?: string): string {
+  return `${releaseDir}\0${executablePath ?? 'traex'}`;
+}
+
 function statSignature(files: Array<string | undefined>): string | undefined {
   const parts: string[] = [];
   for (const file of files) {
@@ -132,6 +152,46 @@ function statSignature(files: Array<string | undefined>): string | undefined {
     }
   }
   return parts.join('|');
+}
+
+/**
+ * Stat-only signature of the three files in a release directory. Missing
+ * optional siblings are represented as `-`, so the value can be recomputed
+ * after an upgrade and compared with a snapshot's recorded source signature.
+ */
+export function traexReleaseSignature(releaseDir: string): string | undefined {
+  const traex = join(releaseDir, 'traex');
+  if (!existsSync(traex)) return undefined;
+  const helperCandidate = join(releaseDir, 'traex-code-mode-host');
+  const installationCandidate = join(releaseDir, 'trae-installation.json');
+  return statSignature([
+    traex,
+    existsSync(helperCandidate) ? helperCandidate : undefined,
+    existsSync(installationCandidate) ? installationCandidate : undefined,
+  ]);
+}
+
+/**
+ * Read the provenance a published snapshot records about its source install.
+ *
+ * `executablePath` may be the snapshot's `traex` leaf (what an attestation
+ * reports) or its directory. Returns `undefined` when the path is not inside a
+ * verified snapshot.
+ */
+export function readTraexSnapshotProvenance(executablePath: string): TraexSnapshotProvenance | undefined {
+  const snapshotDir = existsSync(join(executablePath, TRAEX_SNAPSHOT_MANIFEST))
+    ? executablePath
+    : releaseDirForExecutable(executablePath);
+  if (!existsSync(join(snapshotDir, TRAEX_SNAPSHOT_COMPLETE))) return undefined;
+  const manifest = readManifest(snapshotDir);
+  if (!manifest) return undefined;
+  if (typeof manifest.sourceReleaseDir !== 'string' || manifest.sourceReleaseDir.length === 0) return undefined;
+  return {
+    snapshotDir,
+    manifest,
+    sourceReleaseDir: manifest.sourceReleaseDir,
+    ...(typeof manifest.sourceSignature === 'string' ? { sourceSignature: manifest.sourceSignature } : {}),
+  };
 }
 
 async function sha256File(file: string): Promise<string> {
@@ -149,8 +209,14 @@ async function sha256File(file: string): Promise<string> {
  * Capture one release identity. The returned hashes are the expectation the
  * copies are later verified against; they are never re-read from the source.
  */
-export async function captureTraexReleaseIdentity(releaseDir: string): Promise<TraexReleaseIdentity> {
-  const traex = join(releaseDir, 'traex');
+export async function captureTraexReleaseIdentity(
+  releaseDir: string,
+  executablePath?: string,
+): Promise<TraexReleaseIdentity> {
+  // An operator-pinned executable may not be called `traex` (renamed or
+  // installed under a custom name). It is still the main executable of the
+  // snapshot; only the source leaf changes.
+  const traex = executablePath ?? join(releaseDir, 'traex');
   if (!existsSync(traex)) throw new Error(`TRAE release is missing its main executable: ${traex}`);
   const helperCandidate = join(releaseDir, 'traex-code-mode-host');
   const installationCandidate = join(releaseDir, 'trae-installation.json');
@@ -158,8 +224,9 @@ export async function captureTraexReleaseIdentity(releaseDir: string): Promise<T
   const installation = existsSync(installationCandidate) ? installationCandidate : undefined;
 
   const signature = statSignature([traex, helper, installation]);
+  const cacheKey = releaseIdentityCacheKey(releaseDir, executablePath);
   if (signature) {
-    const cached = releaseIdentityCache.get(releaseDir);
+    const cached = releaseIdentityCache.get(cacheKey);
     if (cached && cached.signature === signature) {
       // A stat signature can collide when two rewrites land in the same
       // timestamp tick (small files such as installation.json are the likely
@@ -171,7 +238,7 @@ export async function captureTraexReleaseIdentity(releaseDir: string): Promise<T
         return cached.identity;
       }
       if ((await sha256File(installation)) === cachedInstallation) return cached.identity;
-      releaseIdentityCache.delete(releaseDir);
+      releaseIdentityCache.delete(cacheKey);
     }
   }
 
@@ -187,8 +254,9 @@ export async function captureTraexReleaseIdentity(releaseDir: string): Promise<T
     ...(installation ? { installation } : {}),
     hashes,
     comboKey: comboKeyFromHashes(hashes),
+    ...(signature ? { sourceSignature: signature } : {}),
   };
-  if (signature) releaseIdentityCache.set(releaseDir, { signature, identity });
+  if (signature) releaseIdentityCache.set(cacheKey, { signature, identity });
   return identity;
 }
 
@@ -341,6 +409,7 @@ function buildManifest(
     version: SNAPSHOT_VERSION,
     comboKey: identity.comboKey,
     sourceReleaseDir: identity.releaseDir,
+    ...(identity.sourceSignature ? { sourceSignature: identity.sourceSignature } : {}),
     traex: { sha256: identity.hashes.traex, ...fileStat(paths.traex) },
     ...(identity.helper && identity.hashes.helper
       ? { helper: { sha256: identity.hashes.helper, ...fileStat(paths.helper) } }
@@ -361,6 +430,9 @@ function buildManifest(
  */
 export async function materializeTraexSnapshot(input: {
   releaseDir: string;
+  /** Exact main executable to snapshot. Defaults to `<releaseDir>/traex`; an
+   *  operator-pinned binary may live under another name. */
+  executablePath?: string;
   snapshotsRoot?: string;
   /** Test seam: runs after the expected hashes are captured and before the
    *  copy starts, which is exactly the window an install switch can hit. */
@@ -370,7 +442,7 @@ export async function materializeTraexSnapshot(input: {
   await fsp.mkdir(root, { recursive: true });
 
   for (let attempt = 1; attempt <= MAX_MATERIALIZE_ATTEMPTS; attempt += 1) {
-    const identity = await captureTraexReleaseIdentity(input.releaseDir);
+    const identity = await captureTraexReleaseIdentity(input.releaseDir, input.executablePath);
     await input.__testOnly_onCaptured?.(identity, attempt);
     const finalDir = join(root, identity.comboKey);
     const existing = reusableSnapshot(finalDir, identity);
@@ -432,7 +504,7 @@ export async function materializeTraexSnapshot(input: {
     // The copies disagreed with the captured identity. Drop the stat-keyed
     // cache so the next attempt hashes the source again instead of repeating
     // the same stale expectation, then capture again.
-    releaseIdentityCache.delete(input.releaseDir);
+    releaseIdentityCache.delete(releaseIdentityCacheKey(input.releaseDir, input.executablePath));
   }
   throw new Error(
     `TRAE install content kept changing while snapshotting ${input.releaseDir}; refusing to start`,

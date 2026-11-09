@@ -22,7 +22,7 @@ import { computeInputHash } from '../utils/canonical-input-hash.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import { fsyncDirectorySyncPortable } from '../utils/fs-durability.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
-import type { ScheduledTask, ParsedSchedule, ScheduleDeferredTargetState, ScheduleExecutionPosition, ScheduleNotifyEvent, ScheduleRunStats, ScheduledTaskDeferredRun, ScheduleUntilDone } from '../types.js';
+import type { ScheduledTask, ParsedSchedule, ScheduleDeferredTargetState, ScheduleExecutionPosition, ScheduleNotifyEvent, ScheduleRunStats, ScheduledTaskDeferredContext, ScheduledTaskDeferredRun, ScheduleUntilDone } from '../types.js';
 import { parseScheduleRunAsClaim } from '../core/schedule-run-as.js';
 import {
   absorbLegacyFailureStats,
@@ -352,6 +352,7 @@ export function normalizeDeferredRun(raw: unknown): ScheduledTaskDeferredRun | u
       }
     }
   }
+  const context = normalizeDeferredContext(r.context);
   return {
     runId: r.runId,
     since: r.since,
@@ -370,8 +371,91 @@ export function normalizeDeferredRun(raw: unknown): ScheduledTaskDeferredRun | u
       : {}),
     targets,
     ...(Object.keys(targetTurnIds).length > 0 ? { targetTurnIds } : {}),
+    ...(context ? { context } : {}),
   };
 }
+
+/** Whitelist the frozen execution inputs. A malformed context is dropped whole
+ *  rather than partially applied: a half-restored prompt/identity pair would
+ *  make a retry run something nobody accepted. */
+export function normalizeDeferredContext(raw: unknown): ScheduledTaskDeferredContext | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.prompt !== 'string') return undefined;
+  if (typeof r.workingDir !== 'string' || !r.workingDir) return undefined;
+  if (typeof r.chatId !== 'string' || !r.chatId) return undefined;
+  const context: ScheduledTaskDeferredContext = {
+    prompt: r.prompt,
+    workingDir: r.workingDir,
+    chatId: r.chatId,
+  };
+  if (Array.isArray(r.chatIds)) {
+    const chatIds = r.chatIds.filter((value): value is string => typeof value === 'string' && !!value);
+    if (chatIds.length > 0) context.chatIds = chatIds;
+  }
+  const str = (value: unknown): value is string => typeof value === 'string' && value.length > 0;
+  if (str(r.rootMessageId)) context.rootMessageId = r.rootMessageId;
+  if (r.chatType === 'group' || r.chatType === 'p2p' || r.chatType === 'topic_group') context.chatType = r.chatType;
+  if (r.scope === 'thread' || r.scope === 'chat') context.scope = r.scope;
+  if (r.executionPosition === 'top-level' || r.executionPosition === 'topic'
+    || r.executionPosition === 'new-topic' || r.executionPosition === 'task') {
+    context.executionPosition = r.executionPosition;
+  }
+  if (str(r.topicTitle)) context.topicTitle = r.topicTitle;
+  if (str(r.larkAppId)) context.larkAppId = r.larkAppId;
+  if (str(r.creatorChatId)) context.creatorChatId = r.creatorChatId;
+  if (str(r.creatorRootMessageId)) context.creatorRootMessageId = r.creatorRootMessageId;
+  if (str(r.creatorLarkAppId)) context.creatorLarkAppId = r.creatorLarkAppId;
+  if (str(r.ownerOpenId)) context.ownerOpenId = r.ownerOpenId;
+  if (str(r.ownerUnionId)) context.ownerUnionId = r.ownerUnionId;
+  const claim = r.runAsClaim as Record<string, unknown> | undefined;
+  if (claim && typeof claim === 'object' && !Array.isArray(claim)
+    && str(claim.openId) && str(claim.unionId) && str(claim.larkAppId) && str(claim.claimedAt)) {
+    context.runAsClaim = {
+      openId: claim.openId, unionId: claim.unionId,
+      larkAppId: claim.larkAppId, claimedAt: claim.claimedAt,
+    };
+  }
+  if (str(r.model)) context.model = r.model;
+  if (r.reasoningEffort === 'low' || r.reasoningEffort === 'medium' || r.reasoningEffort === 'high'
+    || r.reasoningEffort === 'xhigh' || r.reasoningEffort === 'max' || r.reasoningEffort === 'ultra') {
+    context.reasoningEffort = r.reasoningEffort;
+  }
+  if (typeof r.silent === 'boolean') context.silent = r.silent;
+  if (r.deliver === 'origin' || r.deliver === 'local' || r.deliver === 'new-topic') context.deliver = r.deliver;
+  if (typeof r.followActive === 'boolean') context.followActive = r.followActive;
+  return context;
+}
+
+/** Re-enter the exact accepted run: overlay the frozen inputs onto the claimed
+ *  task so human edits made while the run was parked cannot change its prompt,
+ *  identity or routing. */
+export function applyDeferredRunContext(task: ScheduledTask): ScheduledTask {
+  const context = task.deferredRun?.context;
+  if (!context) return task;
+  const next: ScheduledTask = { ...task };
+  const keys: ReadonlyArray<keyof ScheduledTaskDeferredContext> = [
+    'prompt', 'workingDir', 'chatId', 'chatIds', 'rootMessageId', 'chatType',
+    'scope', 'executionPosition', 'topicTitle', 'larkAppId', 'creatorChatId',
+    'creatorRootMessageId', 'creatorLarkAppId', 'ownerOpenId', 'ownerUnionId',
+    'runAsClaim', 'model', 'reasoningEffort', 'silent', 'deliver', 'followActive',
+  ];
+  for (const key of keys) {
+    const value = (context as any)[key];
+    if (value === undefined) delete (next as any)[key];
+    else (next as any)[key] = Array.isArray(value) ? [...value] : value;
+  }
+  return next;
+}
+
+/** A parked run may only be settled once every target was dispatched. */
+function deferredRunStillOwesTargets(task: ScheduledTask, runId: string | undefined): boolean {
+  const deferred = task.deferredRun;
+  if (!deferred || runId === undefined || deferred.runId !== runId) return false;
+  return Object.values(deferred.targets).some(state => state !== 'dispatched');
+}
+
+const DEFERRED_RETRY_MS = 30_000;
 
 function migrate(raw: any): ScheduledTask | null {
   if (!raw || typeof raw !== 'object') return null;
@@ -986,7 +1070,10 @@ export function claimDeferredRun(
       lastError: undefined,
       lastDeliveryError: undefined,
     });
-    return { result: { ok: true, task: { ...task, manualRunRequested } } as const, changed: true };
+    // Re-enter the exact accepted run: frozen inputs win over edits made while
+    // the run was parked.
+    const claimed = applyDeferredRunContext(task);
+    return { result: { ok: true, task: { ...claimed, manualRunRequested } } as const, changed: true };
   }, appId);
 }
 
@@ -1019,7 +1106,6 @@ export function markSkipped(id: string, nextRunAt?: string, runId?: string): voi
     if (runId !== undefined && task.lastRunId !== runId) {
       return { result: undefined, changed: false };
     }
-
     task.lastRunAt = new Date().toISOString();
     task.lastStatus = 'skipped';
     task.lastError = undefined;
@@ -1051,6 +1137,16 @@ export function markRun(
     if (!task) return { result: undefined, changed: false };
     if (runId !== undefined && task.lastRunId !== runId) {
       return { result: undefined, changed: false };
+    }
+    if (!success && deferredRunStillOwesTargets(task, runId)) {
+      // A failed retry attempt must not settle a run that still owes targets
+      // (waiting / dispatching / ambiguous): keep the parked identity, record
+      // no outcome and consume no repeat/once.
+      task.lastStatus = 'deferred';
+      task.lastError = error;
+      if (task.deferredRun) task.deferredRun.retryAt = new Date(Date.now() + DEFERRED_RETRY_MS).toISOString();
+      working.set(id, task);
+      return { result: undefined, changed: true };
     }
 
     const now = new Date().toISOString();

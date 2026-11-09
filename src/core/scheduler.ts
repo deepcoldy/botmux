@@ -11,7 +11,15 @@ import { scheduleTimeZone, zonedTomorrowAt } from '../utils/timezone.js';
 import { emitHookEvent } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from './dashboard-events.js';
-import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, ScheduleNotifyEvent, ScheduleRunAsClaim } from '../types.js';
+import type {
+  ScheduledTask,
+  ParsedSchedule,
+  ScheduleDeferredTargetState,
+  ScheduleExecutionPosition,
+  ScheduleNotifyEvent,
+  ScheduleRunAsClaim,
+  ScheduledTaskDeferredContext,
+} from '../types.js';
 import { parseScheduleRunAsClaim } from './schedule-run-as.js';
 import {
   completeUntilDone,
@@ -470,6 +478,23 @@ function markRuntimeRun(
   let result: { crossedFailureThreshold?: boolean; consecutiveFailures?: number } = {};
   mutateRuntimeTask(id, task => {
     if (runId !== undefined && task.lastRunId !== runId) return;
+    const deferred = task.deferredRun;
+    if (!success && runId !== undefined && deferred?.runId === runId && deferredRunHasUnsettledTargets(deferred)) {
+      // The run is still owed targets (waiting / dispatching / ambiguous). A
+      // failed retry attempt must not settle it: keep the parked identity and
+      // retry clock, record no run outcome and consume no repeat/once. An
+      // ambiguous target in particular must never take the still-waiting
+      // targets' ownership down with it.
+      return {
+        ...task,
+        lastStatus: 'deferred',
+        lastError: error,
+        deferredRun: {
+          ...deferred,
+          retryAt: new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
+        },
+      };
+    }
     const repeat = task.repeat ? { ...task.repeat, completed: (task.repeat.completed ?? 0) + 1 } : undefined;
     const finiteComplete = !!repeat && repeat.times !== null && repeat.times !== undefined
       && repeat.times > 0 && repeat.completed >= repeat.times;
@@ -599,6 +624,45 @@ export interface DeferredRunParkInput {
   targetTurnIds?: Record<string, string>;
 }
 
+/** Execution inputs a deferred run freezes at admission time. */
+const DEFERRED_CONTEXT_KEYS: ReadonlyArray<keyof ScheduledTaskDeferredContext> = [
+  'prompt', 'workingDir', 'chatId', 'chatIds', 'rootMessageId', 'chatType',
+  'scope', 'executionPosition', 'topicTitle', 'larkAppId', 'creatorChatId',
+  'creatorRootMessageId', 'creatorLarkAppId', 'ownerOpenId', 'ownerUnionId',
+  'runAsClaim', 'model', 'reasoningEffort', 'silent', 'deliver', 'followActive',
+];
+
+/** Snapshot the execution-relevant fields of the task row. */
+export function freezeDeferredContext(task: ScheduledTask): ScheduledTaskDeferredContext {
+  const context = {} as ScheduledTaskDeferredContext;
+  for (const key of DEFERRED_CONTEXT_KEYS) {
+    const value = (task as any)[key];
+    if (value === undefined) continue;
+    (context as any)[key] = Array.isArray(value) ? [...value] : value;
+  }
+  return context;
+}
+
+/** Overlay the frozen inputs onto a claimed task so a retry runs exactly what
+ *  the original attempt accepted, regardless of edits made while parked. */
+function overlayDeferredContext(task: ScheduledTask, context: ScheduledTaskDeferredContext): ScheduledTask {
+  const next = { ...task };
+  for (const key of DEFERRED_CONTEXT_KEYS) {
+    const value = (context as any)[key];
+    if (value === undefined) delete (next as any)[key];
+    else (next as any)[key] = Array.isArray(value) ? [...value] : value;
+  }
+  return next;
+}
+
+/** A parked run may only be settled once every target has actually been
+ *  dispatched. Waiting/dispatching targets are still owed; an ambiguous target
+ *  needs a human decision and must never be silently dropped with the run. */
+function deferredRunHasUnsettledTargets(deferred: NonNullable<ScheduledTask['deferredRun']> | undefined): boolean {
+  if (!deferred) return false;
+  return Object.values(deferred.targets).some(state => state !== 'dispatched');
+}
+
 /** Park the claimed run behind a runtime handoff. Reuses `since` when the same
  *  run defers again. Never touches nextRunAt: the occurrence was consumed by
  *  the original claim. */
@@ -612,6 +676,16 @@ export function parkDeferredRun(
     if (task.lastRunId !== context.runId) return;
     const existing = task.deferredRun?.runId === context.runId ? task.deferredRun : undefined;
     parked = true;
+    // A retry reports the current state of every target, but a turn id is a
+    // durable identity: keep the one already persisted for a target the retry
+    // did not mention instead of minting a replacement.
+    const targetTurnIds: Record<string, string> = {
+      ...(existing?.targetTurnIds ?? {}),
+      ...(input.targetTurnIds ?? {}),
+    };
+    for (const chatId of Object.keys(targetTurnIds)) {
+      if (!(chatId in input.targets)) delete targetTurnIds[chatId];
+    }
     return {
       ...task,
       lastStatus: 'deferred',
@@ -619,14 +693,17 @@ export function parkDeferredRun(
         runId: context.runId,
         since: existing?.since ?? new Date().toISOString(),
         reason: 'traex_runtime',
-        detail: input.detail,
-        ...(input.additionalPrompt ? { additionalPrompt: input.additionalPrompt } : {}),
-        ...(input.precondition ? { precondition: input.precondition } : {}),
+        detail: input.detail || existing?.detail || 'managed TRAE runtime handoff',
+        ...(input.additionalPrompt ?? existing?.additionalPrompt
+          ? { additionalPrompt: input.additionalPrompt ?? existing?.additionalPrompt } : {}),
+        ...(input.precondition ?? existing?.precondition
+          ? { precondition: input.precondition ?? existing?.precondition } : {}),
         retryAt: new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
         targets: input.targets,
-        ...(input.targetTurnIds && Object.keys(input.targetTurnIds).length > 0
-          ? { targetTurnIds: input.targetTurnIds }
-          : {}),
+        ...(Object.keys(targetTurnIds).length > 0 ? { targetTurnIds } : {}),
+        // Freeze once: an edit made while parked must not change the prompt or
+        // routing the remaining targets were admitted for.
+        context: existing?.context ?? freezeDeferredContext(task),
       },
     };
   });
@@ -641,7 +718,12 @@ export function parkDeferredRun(
 }
 
 /** Persist `dispatching` immediately before the target's IPC send. A crash in
- *  this state becomes `ambiguous` on restart (never auto-replayed). */
+ *  this state becomes `ambiguous` on restart (never auto-replayed).
+ *
+ *  This is also the first external effect of a fresh run: there is no parked
+ *  record yet, so the marker must create the full deferred run (targets, frozen
+ *  execution context, retry clock) in the same write. Returning false means the
+ *  write did not land and the caller MUST NOT send. */
 export function markDeferredTargetDispatching(
   id: string,
   runId: string,
@@ -649,14 +731,41 @@ export function markDeferredTargetDispatching(
   turnId: string,
   appId?: string,
 ): boolean {
-  return mutateDeferredTarget(id, runId, appId, deferred => {
-    if (deferred.targets[chatId] !== 'waiting' && deferred.targets[chatId] !== 'dispatching') return undefined;
-    return {
-      ...deferred,
-      targets: { ...deferred.targets, [chatId]: 'dispatching' },
-      targetTurnIds: { ...(deferred.targetTurnIds ?? {}), [chatId]: turnId },
-    };
-  });
+  let changed = false;
+  try {
+    mutateRuntimeTask(id, task => {
+      if (task.lastRunId !== runId) return;
+      const existing = task.deferredRun?.runId === runId ? task.deferredRun : undefined;
+      const targets: Record<string, ScheduleDeferredTargetState> = existing
+        ? { ...existing.targets }
+        : Object.fromEntries(
+            scheduleStore.effectiveScheduleChatIds(task).map(cid => [cid, 'waiting' as const]),
+          );
+      if (!(chatId in targets)) return;
+      if (targets[chatId] === 'dispatched' || targets[chatId] === 'ambiguous') return;
+      targets[chatId] = 'dispatching';
+      changed = true;
+      return {
+        ...task,
+        deferredRun: {
+          runId,
+          since: existing?.since ?? new Date().toISOString(),
+          reason: 'traex_runtime',
+          detail: existing?.detail ?? 'managed TRAE runtime handoff',
+          ...(existing?.additionalPrompt ? { additionalPrompt: existing.additionalPrompt } : {}),
+          ...(existing?.precondition ? { precondition: existing.precondition } : {}),
+          retryAt: existing?.retryAt ?? new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
+          targets,
+          targetTurnIds: { ...(existing?.targetTurnIds ?? {}), [chatId]: turnId },
+          context: existing?.context ?? freezeDeferredContext(task),
+        },
+      };
+    }, appId);
+  } catch (error) {
+    logger.warn(`[scheduler] failed to persist deferred dispatching for ${id}/${chatId}: ${error}`);
+    return false;
+  }
+  return changed;
 }
 
 /** Record that a target's input was accepted by a session. */
@@ -770,8 +879,13 @@ export function claimDeferredRunForDispatch(
     const claimed: ScheduledTask = { ...task, lastStatus: 'running', lastRunId: runId,
       lastError: undefined, lastDeliveryError: undefined };
     delete claimed.manualRunRequested;
-    result = { ok: true, task: { ...claimed, manualRunRequested } };
-    return claimed;
+    // Re-enter the exact accepted run: overlay the frozen inputs so edits made
+    // while parked cannot change this retry's prompt, identity or routing.
+    const restored = task.deferredRun.context
+      ? overlayDeferredContext(claimed, task.deferredRun.context)
+      : claimed;
+    result = { ok: true, task: { ...restored, manualRunRequested } };
+    return restored;
   }, appId);
   return result;
 }

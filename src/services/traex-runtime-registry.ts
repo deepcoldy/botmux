@@ -23,6 +23,7 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withExclusiveFileLock } from '../utils/file-flock.js';
 import { pidNotProvablyGone } from '../utils/process-alive.js';
 import {
+  findProcessesRunningUnder,
   isLinuxZombie,
   readLinuxBootIdentity,
   readProcessStartIdentity,
@@ -74,11 +75,20 @@ export interface TraexStartRequest {
   occupantId: string;
   comboKey: string;
   installSignature?: string;
+  /** Private snapshot directory this runtime execs from, when one is used.
+   *  Recorded at `starting` so a daemon crash before `markRunning` can still be
+   *  reconciled by scanning for a live process under it. */
+  snapshotDir?: string;
   workerPid: number;
   workerStart?: string;
   daemonPid: number;
   daemonStart?: string;
   fixedPath?: boolean;
+  /** Register occupancy without demanding compatibility. Used for runtimes that
+   *  are not started by this worker (adopt/reattach/wrapper/forge) but can
+   *  still write the shared cache: they occupy as unknown and never authorize
+   *  an incompatible start. */
+  force?: boolean;
   now?: number;
 }
 
@@ -119,9 +129,16 @@ function readRegistry(domain: TraexRuntimeDomain): ReadResult {
     const occupants = (parsed as { occupants?: unknown }).occupants;
     if (!Array.isArray(occupants)) return { kind: 'corrupt', detail: 'occupants is not an array' };
     const cleaned: TraexRuntimeOccupant[] = [];
-    for (const candidate of occupants) {
-      const occupant = normalizeOccupant(candidate);
-      if (occupant) cleaned.push(occupant);
+    for (let index = 0; index < occupants.length; index += 1) {
+      const occupant = normalizeOccupant(occupants[index]);
+      // A row we cannot parse may still describe a live writer. Dropping it
+      // would make the domain look empty and let an incompatible runtime
+      // start, so the whole registry is treated as corrupt and the gate fails
+      // closed until the row is repaired or its owner releases it.
+      if (!occupant) {
+        return { kind: 'corrupt', detail: `occupant ${index} cannot be normalized` };
+      }
+      cleaned.push(occupant);
     }
     return { kind: 'ok', registry: { version: TRAEX_RUNTIME_REGISTRY_VERSION, occupants: cleaned } };
   } catch (err) {
@@ -191,20 +208,89 @@ function pidLiveness(pid: number | undefined, expectedStart: string | undefined)
 }
 
 /**
- * `alive` if ANY recorded process (CLI, worker, daemon) may still run.
- * The CLI is checked first because a worker that lost its daemon may already
- * be gone while its CLI child is still writing the shared cache.
+ * `alive` if ANY recorded process (CLI, worker/launcher) may still run.
+ *
+ * The CLI is the only process that writes the shared cache, so once its birth
+ * identity is recorded it alone decides liveness: a bot daemon that outlived
+ * its worker/CLI must not keep the domain occupied forever. Before the CLI is
+ * attached the worker is still a possible future writer, so a live worker keeps
+ * the slot; a dead worker does NOT prove the CLI is gone (the exec can happen
+ * before the record is updated), hence `unknown` rather than `dead`.
+ *
+ * A record created in a previous boot names pids that may now belong to
+ * unrelated processes; it can never describe a live runtime.
  */
 export function occupantLiveness(occupant: TraexRuntimeOccupant, now = Date.now()): OccupantLiveness {
   void now; // liveness is pid/birth based; the lease is only a status hint
-  const cli = pidLiveness(occupant.cliPid, occupant.cliStart);
-  if (cli === 'alive') return 'alive';
+  const boot = readLinuxBootIdentity();
+  if (occupant.bootId !== undefined && boot !== undefined && occupant.bootId !== boot) return 'dead';
+  if (occupant.cliPid !== undefined) {
+    const cli = traexCliLiveness(occupant);
+    if (cli !== 'dead') return cli;
+    // The leaf is gone, but a launcher/helper from the same snapshot can still
+    // be alive and writing the shared cache. `undefined` means the platform
+    // cannot answer (macOS); fall back to the CLI verdict rather than blocking
+    // the domain forever.
+    if (occupant.snapshotDir) {
+      const writers = findProcessesRunningUnder(occupant.snapshotDir);
+      if (writers !== undefined && writers.length > 0) return 'alive';
+    }
+    return 'dead';
+  }
   const worker = pidLiveness(occupant.workerPid, occupant.workerStart);
-  if (worker === 'alive') return 'alive';
-  const daemon = pidLiveness(occupant.daemonPid, occupant.daemonStart);
-  if (daemon === 'alive') return 'alive';
-  if (cli === 'unknown' || worker === 'unknown' || daemon === 'unknown') return 'unknown';
-  return 'dead';
+  return worker === 'alive' ? 'alive' : 'unknown';
+}
+
+/**
+ * Recover `starting` records whose worker died before attaching the CLI.
+ *
+ * A daemon crash in the spawn window leaves a reservation with no `cliPid`. If
+ * a process is provably running the recorded snapshot, that process IS the
+ * runtime this record reserved — adopt its birth identity so the normal
+ * liveness path can release it once it exits. When nothing is found the record
+ * stays: a forked launcher may not have exec'd yet, and "not visible now" is
+ * not proof that no writer will appear.
+ */
+function reconcileStartingOrphans(occupants: TraexRuntimeOccupant[], now: number): {
+  occupants: TraexRuntimeOccupant[];
+  changed: boolean;
+} {
+  let changed = false;
+  const next = occupants.map((occupant) => {
+    if (occupant.phase !== 'starting' || occupant.cliPid !== undefined || !occupant.snapshotDir) return occupant;
+    if (pidLiveness(occupant.workerPid, occupant.workerStart) !== 'dead') return occupant;
+    const writers = findProcessesRunningUnder(occupant.snapshotDir);
+    if (!writers || writers.length === 0) return occupant;
+    const cliPid = writers[0];
+    const cliStart = readProcessStartIdentity(cliPid);
+    changed = true;
+    return {
+      ...occupant,
+      phase: 'running' as const,
+      cliPid,
+      ...(cliStart ? { cliStart } : {}),
+      heartbeatAt: now,
+    };
+  });
+  return { occupants: next, changed };
+}
+
+/**
+ * A previous start attempt by the very same worker (same pid and birth token)
+ * that never attached a CLI cannot be a concurrent runtime: that worker only
+ * execs one CLI per spawn generation, and the new reservation supersedes the
+ * old one. A record with a recorded CLI is never superseded here — the normal
+ * liveness/prune path decides, so a live old CLI still blocks.
+ */
+function supersedableSameOwner(
+  occupant: TraexRuntimeOccupant,
+  request: TraexStartRequest,
+): boolean {
+  if (occupant.workerPid !== request.workerPid) return false;
+  if ((occupant.workerStart ?? undefined) !== (request.workerStart ?? undefined)) return false;
+  if (occupant.phase !== 'starting') return false;
+  if (occupant.cliPid !== undefined) return traexCliLiveness(occupant) === 'dead';
+  return true;
 }
 
 function pruneDead(registry: TraexRuntimeRegistryFile, now: number): { occupants: TraexRuntimeOccupant[]; pruned: string[] } {
@@ -261,19 +347,37 @@ export async function acquireTraexRuntimeStart(
   const locked = await withExclusiveFileLock(domain.lockPath, TRAEX_RUNTIME_LOCK_TIMEOUT_MS, () => {
     const read = readRegistry(domain);
     if (read.kind !== 'ok') return { kind: 'read-failed', read } as const;
-    const pruned = pruneDead(read.registry, now);
-    const blockers = blockersFor(pruned.occupants, request.comboKey);
+    const reconciled = reconcileStartingOrphans(read.registry.occupants, now);
+    const base = reconciled.changed
+      ? { version: TRAEX_RUNTIME_REGISTRY_VERSION, occupants: reconciled.occupants }
+      : read.registry;
+    const pruned = pruneDead(base, now);
+    // The same worker retrying a start supersedes its own unfinished
+    // reservation. Without this a worker that rewrote the install between
+    // capture and exec would be blocked by its own `starting` record.
+    const superseded: string[] = [];
+    const remaining = pruned.occupants.filter((occupant) => {
+      if (occupant.occupantId === request.occupantId) return false;
+      if (!supersedableSameOwner(occupant, request)) return true;
+      superseded.push(occupant.occupantId);
+      return false;
+    });
+    // `force` registers occupancy without asserting content compatibility.
+    // Used only for runtimes this worker did not start (adopt/reattach/...),
+    // which must still make an incompatible start wait.
+    const blockers = request.force === true ? [] : blockersFor(remaining, request.comboKey);
     if (blockers.length > 0) {
-      if (pruned.pruned.length > 0) {
-        writeRegistry(domain, { version: TRAEX_RUNTIME_REGISTRY_VERSION, occupants: pruned.occupants });
+      if (pruned.pruned.length > 0 || superseded.length > 0 || reconciled.changed) {
+        writeRegistry(domain, { version: TRAEX_RUNTIME_REGISTRY_VERSION, occupants: remaining });
       }
-      return { kind: 'blocked', blockers, pruned: pruned.pruned } as const;
+      return { kind: 'blocked', blockers, pruned: [...pruned.pruned, ...superseded] } as const;
     }
     const bootId = readLinuxBootIdentity();
     const occupant: TraexRuntimeOccupant = {
       occupantId: request.occupantId,
       comboKey: request.comboKey,
       ...(request.installSignature ? { installSignature: request.installSignature } : {}),
+      ...(request.snapshotDir ? { snapshotDir: request.snapshotDir } : {}),
       phase: 'starting',
       workerPid: request.workerPid,
       ...(request.workerStart ? { workerStart: request.workerStart } : {}),
@@ -287,9 +391,9 @@ export async function acquireTraexRuntimeStart(
     };
     writeRegistry(domain, {
       version: TRAEX_RUNTIME_REGISTRY_VERSION,
-      occupants: [...pruned.occupants.filter((existing) => existing.occupantId !== occupant.occupantId), occupant],
+      occupants: [...remaining.filter((existing) => existing.occupantId !== occupant.occupantId), occupant],
     });
-    return { kind: 'started', pruned: pruned.pruned } as const;
+    return { kind: 'started', pruned: [...pruned.pruned, ...superseded] } as const;
   });
   if (!locked.acquired) {
     return locked.reason === 'timeout'
@@ -300,10 +404,10 @@ export async function acquireTraexRuntimeStart(
   }
   const outcome = locked.value;
   if (outcome.kind === 'blocked') {
-    return { decision: 'blocked', blockers: outcome.blockers, pruned: outcome.pruned };
+    return { decision: 'blocked', blockers: outcome.blockers, pruned: [...outcome.pruned] };
   }
   if (outcome.kind === 'started') {
-    return { decision: 'start', occupantId: request.occupantId, pruned: outcome.pruned };
+    return { decision: 'start', occupantId: request.occupantId, pruned: [...outcome.pruned] };
   }
   return outcome.read.kind === 'corrupt'
     ? { decision: 'error', reason: 'registry-corrupt', detail: outcome.read.detail }
@@ -331,6 +435,36 @@ export async function markTraexRuntimeRunning(
   }));
 }
 
+/**
+ * Downgrade an occupant whose exec target could not be proven to be the
+ * snapshot this worker registered.
+ *
+ * Keeping the previously computed `comboKey` would let another runtime treat
+ * it as compatible and start in parallel with unknown bytes. Clearing the key
+ * makes it block every start until its process tree is proven gone. The
+ * `installSignature` is dropped too: an equal stat signature must never
+ * re-upgrade an unproven occupant.
+ */
+export async function markTraexRuntimeUnknown(
+  domain: TraexRuntimeDomain,
+  occupantId: string,
+  detail: { cliPid?: number; cliStart?: string; snapshotDir?: string; now?: number } = {},
+): Promise<boolean> {
+  return mutateOccupant(domain, occupantId, (occupant, now) => {
+    const { installSignature: _dropped, ...rest } = occupant;
+    void _dropped;
+    return {
+      ...rest,
+      comboKey: '',
+      ...(detail.cliPid !== undefined ? { cliPid: detail.cliPid } : {}),
+      ...(detail.cliStart ? { cliStart: detail.cliStart } : {}),
+      ...(detail.snapshotDir ? { snapshotDir: detail.snapshotDir } : {}),
+      heartbeatAt: now,
+      leaseUntil: now + TRAEX_RUNTIME_LEASE_MS,
+    };
+  }, detail.now ?? Date.now());
+}
+
 export async function heartbeatTraexRuntime(
   domain: TraexRuntimeDomain,
   occupantId: string,
@@ -351,6 +485,8 @@ export async function heartbeatTraexRuntime(
  * means the record is still `starting` and no CLI has been proven yet.
  */
 export function traexCliLiveness(occupant: TraexRuntimeOccupant): OccupantLiveness {
+  const boot = readLinuxBootIdentity();
+  if (occupant.bootId !== undefined && boot !== undefined && occupant.bootId !== boot) return 'dead';
   return pidLiveness(occupant.cliPid, occupant.cliStart);
 }
 
@@ -374,8 +510,18 @@ export async function releaseTraexRuntime(
       // `starting` without a CLI pid is NOT releasable this way: the worker
       // may have exec'd before recording it, so only the explicit
       // `abandonTraexRuntime` (spawn failure) may drop it.
+      //
+      // The CLI leaf alone is not the whole writer tree: a launcher/helper of
+      // the same private snapshot can outlive it. On Linux, scan `/proc/*/exe`
+      // for any process still running from the recorded snapshot. `undefined`
+      // means the platform cannot answer (macOS); fall back to the CLI verdict
+      // rather than blocking forever, matching `occupantLiveness`.
       const cli = traexCliLiveness(target);
-      if (cli !== 'dead') {
+      const writers = target.snapshotDir
+        ? findProcessesRunningUnder(target.snapshotDir)
+        : undefined;
+      const writersGone = writers === undefined || writers.length === 0;
+      if (cli !== 'dead' || !writersGone) {
         if (target.phase !== 'draining') {
           const now = options.now ?? Date.now();
           writeRegistry(domain, {

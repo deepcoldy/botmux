@@ -33,11 +33,13 @@ import {
   describeTraexRuntimeBlockers,
   heartbeatTraexRuntime,
   markTraexRuntimeRunning,
+  markTraexRuntimeUnknown,
   occupantLiveness,
   readTraexRuntimeOccupants,
   releaseTraexRuntime,
   type TraexRuntimeBlocker,
 } from './traex-runtime-registry.js';
+export type { TraexRuntimeBlocker } from './traex-runtime-registry.js';
 import {
   captureTraexExecutableIdentity,
   defaultTraexSnapshotRoot,
@@ -68,6 +70,10 @@ export interface TraexRuntimeGateInput {
   fixedExecutablePath?: string;
   /** Override the default: snapshots are materialised unless fixedPath is set. */
   materialize?: boolean;
+  /** `false` materialises a frozen copy WITHOUT taking the cross-process
+   *  domain lease. Used only for session-private caches (scratch COW), where
+   *  this runtime cannot contend with another bot's process. */
+  coordinate?: boolean;
   snapshotsRoot?: string;
   /** How long a start may wait for an incompatible runtime to exit. 0 means a
    *  single attempt; the caller then holds the input and retries later.
@@ -87,8 +93,16 @@ export interface TraexRuntimeLease {
   occupantId: string;
   domain: TraexRuntimeDomain;
   snapshot: TraexRuntimeContent;
+  /** This lease only reserves the domain for a runtime this worker did not
+   *  exec (adopt/reattach/wrapper/forge). Its content identity is unknown, so
+   *  it blocks incompatible starts and must never authorize one. */
+  occupancyOnly?: boolean;
   /** Attach the real CLI birth identity after exec. Never releases the slot. */
   markRunning(cliPid: number, cliStart?: string): Promise<void>;
+  /** The process behind this lease does not run the object we registered.
+   *  Downgrade the occupant to unknown so it blocks instead of authorizing a
+   *  parallel start with an unproven identity. */
+  markUnknown(cliPid?: number, cliStart?: string): Promise<void>;
   heartbeat(): Promise<void>;
   /** Only call once the CLI this lease started is provably gone. A CLI that
    *  cannot be proven gone is marked `draining` and keeps occupying. */
@@ -153,6 +167,7 @@ function leaseFor(
   domain: TraexRuntimeDomain,
   snapshot: TraexRuntimeContent,
   occupantId: string,
+  occupancyOnly = false,
 ): TraexRuntimeLease {
   let releaseCalled = false;
   let abandonCalled = false;
@@ -160,11 +175,19 @@ function leaseFor(
     occupantId,
     domain,
     snapshot,
+    ...(occupancyOnly ? { occupancyOnly: true } : {}),
     async markRunning(cliPid: number, cliStart?: string): Promise<void> {
       await markTraexRuntimeRunning(domain, occupantId, {
         cliPid,
         ...(cliStart ? { cliStart } : {}),
-        snapshotDir: snapshot.dir,
+        ...(snapshot.dir ? { snapshotDir: snapshot.dir } : {}),
+      });
+    },
+    async markUnknown(cliPid?: number, cliStart?: string): Promise<void> {
+      await markTraexRuntimeUnknown(domain, occupantId, {
+        ...(cliPid !== undefined ? { cliPid } : {}),
+        ...(cliStart ? { cliStart } : {}),
+        ...(snapshot.dir ? { snapshotDir: snapshot.dir } : {}),
       });
     },
     async heartbeat(): Promise<void> {
@@ -172,8 +195,17 @@ function leaseFor(
     },
     async release(): Promise<void> {
       if (releaseCalled) return;
-      releaseCalled = true;
-      await releaseTraexRuntime(domain, occupantId, { requireCliGone: true });
+      // A release may run before the kernel has reaped the CLI (exit handlers
+      // fire in the same tick). Retry a bounded number of times; only a
+      // proven release stops the lease. Otherwise the record stays and keeps
+      // the domain, which is the fail-closed outcome.
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        if (await releaseTraexRuntime(domain, occupantId, { requireCliGone: true })) {
+          releaseCalled = true;
+          return;
+        }
+        await sleep(100 * (attempt + 1));
+      }
     },
     async abandon(): Promise<void> {
       if (abandonCalled) return;
@@ -195,45 +227,76 @@ export async function acquireTraexRuntimeLease(
   input: TraexRuntimeGateInput,
 ): Promise<TraexGateAcquireResult> {
   const now = input.now ?? Date.now;
-  const traeHome = input.traeHome ?? traexHomeForDomain();
-  const resolution: TraexDomainResolution = resolveTraexRuntimeDomain(traeHome);
-  if (resolution.kind !== 'ready') {
-    return {
-      kind: 'error',
-      reason: 'uncoordinated',
-      detail: `${resolution.reason}${resolution.detail ? `: ${resolution.detail}` : ''}`,
-    };
+  const coordinate = input.coordinate !== false;
+  let domain: TraexRuntimeDomain | undefined;
+  if (coordinate) {
+    const traeHome = input.traeHome ?? traexHomeForDomain();
+    const resolution: TraexDomainResolution = resolveTraexRuntimeDomain(traeHome);
+    if (resolution.kind !== 'ready') {
+      return {
+        kind: 'error',
+        reason: 'uncoordinated',
+        detail: `${resolution.reason}${resolution.detail ? `: ${resolution.detail}` : ''}`,
+      };
+    }
+    domain = resolution.domain;
   }
-  const domain = resolution.domain;
 
-  let snapshot: TraexRuntimeContent;
   const fixedExecutable = input.fixedPath === true
-    ? (input.fixedExecutablePath ?? input.releaseDir)
+    ? (input.fixedExecutablePath ?? input.executablePath)
     : undefined;
   const executablePath = fixedExecutable ?? input.executablePath;
   const releaseDir = executablePath ? releaseDirForExecutable(executablePath) : input.releaseDir;
-  try {
-    const shouldMaterialize = input.materialize ?? fixedExecutable === undefined;
-    if (shouldMaterialize) {
-      snapshot = await materializeTraexSnapshot({
-        releaseDir,
-        snapshotsRoot: input.snapshotsRoot ?? defaultTraexSnapshotRoot(),
-      });
-    } else {
-      if (!executablePath) {
-        return {
-          kind: 'error',
-          reason: 'snapshot-failed',
-          detail: 'an executable path is required to hash a non-materialised runtime',
-        };
-      }
-      snapshot = await captureTraexExecutableIdentity(executablePath);
-    }
-  } catch (err) {
-    return { kind: 'error', reason: 'snapshot-failed', detail: errorText(err) };
+  const shouldMaterialize = input.materialize ?? true;
+  if (!shouldMaterialize && !executablePath) {
+    return {
+      kind: 'error',
+      reason: 'snapshot-failed',
+      detail: 'an executable path is required to hash a non-materialised runtime',
+    };
   }
 
-  const installSignature = computeTraexInstallSignature(releaseDir);
+  if (!coordinate) {
+    // Session-private cache: freeze the object so a later install switch cannot
+    // change what this runtime loads, but do not take a shared-domain lease.
+    const aborted = input.abort?.();
+    if (aborted) return { kind: 'aborted', reason: aborted };
+    try {
+      const snapshot = shouldMaterialize
+        ? await materializeTraexSnapshot({
+            releaseDir,
+            ...(executablePath ? { executablePath } : {}),
+            snapshotsRoot: input.snapshotsRoot ?? defaultTraexSnapshotRoot(),
+          })
+        : await captureTraexExecutableIdentity(executablePath!);
+      return {
+        kind: 'granted',
+        lease: {
+          occupantId: '',
+          domain: {
+            domainKey: 'private',
+            skillsDir: '',
+            registryPath: '',
+            lockPath: '',
+          },
+          snapshot,
+          occupancyOnly: false,
+          async markRunning() { /* private cache: nothing to record */ },
+          async markUnknown() { /* private cache: nothing to record */ },
+          async heartbeat() { /* private cache: nothing to record */ },
+          async release() { /* private cache: nothing to record */ },
+          async abandon() { /* private cache: nothing to record */ },
+        },
+      };
+    } catch (err) {
+      return { kind: 'error', reason: 'snapshot-failed', detail: errorText(err) };
+    }
+  }
+
+  if (!domain) {
+    return { kind: 'error', reason: 'uncoordinated', detail: 'domain was not resolved' };
+  }
+
   const occupantId = [
     input.workerPid,
     input.workerStart ?? 'nostart',
@@ -243,14 +306,38 @@ export async function acquireTraexRuntimeLease(
   const deadline = now() + Math.max(0, input.waitMs ?? 0);
   const pollMs = Math.max(50, input.pollMs ?? 500);
   let reportedSignature: string | undefined;
+  let snapshot: TraexRuntimeContent | undefined;
+  let snapshotSignature: string | undefined;
+  let installSignature: string | undefined;
 
   for (;;) {
     const aborted = input.abort?.();
     if (aborted) return { kind: 'aborted', reason: aborted };
+    // Re-read the mutable entry AFTER `abort` (which may itself be the point
+    // where an upgrade lands) and re-materialise whenever it moved. The
+    // registered `comboKey` therefore always names the bytes we are about to
+    // exec, never the content that happened to be on disk earlier.
+    const currentSignature = computeTraexInstallSignature(releaseDir);
+    if (!snapshot || currentSignature !== snapshotSignature) {
+      try {
+        snapshot = shouldMaterialize
+          ? await materializeTraexSnapshot({
+              releaseDir,
+              ...(executablePath ? { executablePath } : {}),
+              snapshotsRoot: input.snapshotsRoot ?? defaultTraexSnapshotRoot(),
+            })
+          : await captureTraexExecutableIdentity(executablePath!);
+        snapshotSignature = currentSignature;
+        installSignature = currentSignature;
+      } catch (err) {
+        return { kind: 'error', reason: 'snapshot-failed', detail: errorText(err) };
+      }
+    }
     const decision = await acquireTraexRuntimeStart(domain, {
       occupantId,
       comboKey: snapshot.comboKey,
       ...(installSignature ? { installSignature } : {}),
+      ...(snapshot.snapshot ? { snapshotDir: snapshot.dir } : {}),
       workerPid: input.workerPid,
       ...(input.workerStart ? { workerStart: input.workerStart } : {}),
       daemonPid: input.daemonPid,
@@ -282,6 +369,80 @@ export async function acquireTraexRuntimeLease(
     }
     return { kind: 'error', reason: decision.reason, detail: decision.detail };
   }
+}
+
+export interface TraexRuntimeOccupancyInput {
+  /** Defaults to the worker's own TRAE_HOME. */
+  traeHome?: string;
+  /** Configured release entry; used for status only, never as content proof. */
+  releaseDir: string;
+  workerPid: number;
+  workerStart?: string;
+  daemonPid: number;
+  daemonStart?: string;
+  fixedPath?: boolean;
+  now?: () => number;
+}
+
+/**
+ * Reserve the domain for a runtime this worker did NOT exec.
+ *
+ * Adopted panes, persistent reattaches, wrapper/forge launchers and existing
+ * app-server endpoints all end up writing the same physical skills cache, but
+ * this worker cannot hash or replace what they run. They therefore occupy the
+ * domain as UNKNOWN (`comboKey: ''`): they never authorize a parallel start,
+ * and a newer content waits for them to be proven gone. They are never killed
+ * or retargeted.
+ */
+export async function acquireTraexRuntimeOccupancy(
+  input: TraexRuntimeOccupancyInput,
+): Promise<TraexGateAcquireResult> {
+  const now = input.now ?? Date.now;
+  const traeHome = input.traeHome ?? traexHomeForDomain();
+  const resolution: TraexDomainResolution = resolveTraexRuntimeDomain(traeHome);
+  if (resolution.kind !== 'ready') {
+    return {
+      kind: 'error',
+      reason: 'uncoordinated',
+      detail: `${resolution.reason}${resolution.detail ? `: ${resolution.detail}` : ''}`,
+    };
+  }
+  const domain = resolution.domain;
+  const occupantId = [
+    input.workerPid,
+    input.workerStart ?? 'nostart',
+    now(),
+    Math.random().toString(36).slice(2, 10),
+  ].join('-');
+  const decision = await acquireTraexRuntimeStart(domain, {
+    occupantId,
+    comboKey: '',
+    force: true,
+    workerPid: input.workerPid,
+    ...(input.workerStart ? { workerStart: input.workerStart } : {}),
+    daemonPid: input.daemonPid,
+    ...(input.daemonStart ? { daemonStart: input.daemonStart } : {}),
+    ...(input.fixedPath ? { fixedPath: true } : {}),
+    now: now(),
+  });
+  if (decision.decision === 'start') {
+    const snapshot: TraexRuntimeContent = {
+      comboKey: '',
+      dir: '',
+      traexPath: input.releaseDir,
+      reused: false,
+      snapshot: false,
+    };
+    return { kind: 'granted', lease: leaseFor(domain, snapshot, occupantId, true) };
+  }
+  if (decision.decision === 'blocked') {
+    return {
+      kind: 'blocked',
+      blockers: decision.blockers,
+      detail: describeTraexRuntimeBlockers(decision.blockers),
+    };
+  }
+  return { kind: 'error', reason: decision.reason, detail: decision.detail };
 }
 
 export type TraexRuntimePrecheck =
@@ -325,6 +486,18 @@ export function precheckTraexRuntime(input: {
   const signature = computeTraexInstallSignature(releaseDir);
   const blockers: TraexRuntimeBlocker[] = [];
   for (const occupant of alive) {
+    // An occupant whose content was never proven can never be "the same
+    // version": an equal stat signature says nothing about what it runs.
+    if (occupant.comboKey.length === 0) {
+      blockers.push({
+        occupantId: occupant.occupantId,
+        comboKey: occupant.comboKey,
+        phase: occupant.phase,
+        fixedPath: occupant.fixedPath === true,
+        ...(occupant.cliPid !== undefined ? { pid: occupant.cliPid } : {}),
+      });
+      continue;
+    }
     const sameSignature = signature !== undefined
       && occupant.installSignature !== undefined
       && occupant.installSignature === signature;

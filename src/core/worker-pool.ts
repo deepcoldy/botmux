@@ -15519,6 +15519,10 @@ export function hasQueuedActivationAdmissionGate(ds: DaemonSession): boolean {
   return ds.session.queuedActivationPending === true
     || (ds.session.queuedActivationTail?.length ?? 0) > 0
     || hasPendingSessionTurns(ds.session.sessionId)
+    // An install-change reclaim for the current generation means the live
+    // worker is being retired: every new input belongs to the replacement
+    // runtime and must be held in the tail, never sent over the old CLI's IPC.
+    || installReclaimPendingForCurrentGeneration(ds)
     || (ds.initialStartPending === true
       && ds.session.queuedActivationInput !== undefined);
 }
@@ -19191,6 +19195,12 @@ function setupWorkerHandlers(
           ...(msg.cliExe !== undefined ? { cliExe: msg.cliExe } : {}),
           ...(msg.cliInstallEntry !== undefined ? { cliInstallEntry: msg.cliInstallEntry } : {}),
           ...(msg.cliInstallAtSpawn !== undefined ? { cliInstallAtSpawn: msg.cliInstallAtSpawn } : {}),
+          ...(msg.cliLaunchTarget !== undefined ? { cliLaunchTarget: msg.cliLaunchTarget } : {}),
+          ...(msg.cliLaunchTargetIdentity !== undefined
+            ? { cliLaunchTargetIdentity: msg.cliLaunchTargetIdentity }
+            : {}),
+          ...(msg.cliLaunchComboKey !== undefined ? { cliLaunchComboKey: msg.cliLaunchComboKey } : {}),
+          ...(msg.cliSnapshotDir !== undefined ? { cliSnapshotDir: msg.cliSnapshotDir } : {}),
           ...(msg.cliSpawnGeneration !== undefined ? { cliSpawnGeneration: msg.cliSpawnGeneration } : {}),
           ...(msg.enginePid !== undefined ? { enginePid: msg.enginePid } : {}),
           ...(msg.engineProcStart !== undefined
