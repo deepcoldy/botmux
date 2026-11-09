@@ -714,17 +714,34 @@ export function parkDeferredRun(
     for (const chatId of Object.keys(targetTurnIds)) {
       if (!(chatId in input.targets)) delete targetTurnIds[chatId];
     }
-    // Ownership bookkeeping survives a re-park: a target already accepted by
-    // its worker must not lose that fact just because another target deferred.
+    // Ownership bookkeeping survives a re-park, and an ACCEPTED exact turn is
+    // monotonic: a caller that captured `parked` before an await cannot restore
+    // `held`/`waiting` over an acceptance that landed while it awaited. Input
+    // ownership claims are advisory and only count when their turn matches the
+    // durable turn id for that chat.
     const heldTargets: Record<string, string> = { ...(existing?.heldTargets ?? {}) };
     const acceptedTargets: Record<string, string> = { ...(existing?.acceptedTargets ?? {}) };
-    for (const [chatId, turnId] of Object.entries(input.heldTargets ?? {})) heldTargets[chatId] = turnId;
-    for (const [chatId, turnId] of Object.entries(input.acceptedTargets ?? {})) acceptedTargets[chatId] = turnId;
+    for (const [chatId, turnId] of Object.entries(input.heldTargets ?? {})) {
+      if (targetTurnIds[chatId] === turnId) heldTargets[chatId] = turnId;
+    }
+    for (const [chatId, turnId] of Object.entries(input.acceptedTargets ?? {})) {
+      if (targetTurnIds[chatId] === turnId) acceptedTargets[chatId] = turnId;
+    }
     for (const chatId of Object.keys(heldTargets)) {
       if (!(chatId in input.targets)) delete heldTargets[chatId];
     }
     for (const chatId of Object.keys(acceptedTargets)) {
       if (!(chatId in input.targets)) delete acceptedTargets[chatId];
+    }
+    const targets: Record<string, ScheduleDeferredTargetState> = { ...input.targets };
+    for (const [chatId, turnId] of Object.entries(acceptedTargets)) {
+      if (targetTurnIds[chatId] === turnId) {
+        targets[chatId] = 'dispatched';
+        delete heldTargets[chatId];
+      } else {
+        // An acceptance for a different turn says nothing about this one.
+        delete acceptedTargets[chatId];
+      }
     }
     return {
       ...task,
@@ -739,7 +756,7 @@ export function parkDeferredRun(
         ...(input.precondition ?? existing?.precondition
           ? { precondition: input.precondition ?? existing?.precondition } : {}),
         retryAt: new Date(Date.now() + TICK_INTERVAL_MS).toISOString(),
-        targets: input.targets,
+        targets,
         ...(Object.keys(heldTargets).length > 0 ? { heldTargets } : {}),
         ...(Object.keys(acceptedTargets).length > 0 ? { acceptedTargets } : {}),
         ...(Object.keys(targetTurnIds).length > 0 ? { targetTurnIds } : {}),
@@ -785,6 +802,7 @@ export function markDeferredTargetDispatching(
           );
       if (!(chatId in targets)) return;
       if (targets[chatId] === 'dispatched' || targets[chatId] === 'ambiguous') return;
+      if (existing?.acceptedTargets?.[chatId] === turnId) return;
       targets[chatId] = 'dispatching';
       changed = true;
       return {
@@ -854,6 +872,9 @@ export function noteWorkerRuntimeDeferred(
     const deferred = task.deferredRun;
     if (!deferred || deferred.runId !== runId) return;
     if (deferred.targetTurnIds?.[chatId] !== turnId) return;
+    // A late gate-wait notification cannot revoke an acceptance that already
+    // landed for the same exact turn.
+    if (deferred.acceptedTargets?.[chatId] === turnId) return;
     const state = deferred.targets[chatId];
     if (state !== 'dispatching' && state !== 'dispatched'
       && state !== 'waiting' && state !== 'held') return;
@@ -888,6 +909,9 @@ export function markDeferredTargetHeld(
 ): boolean {
   return mutateDeferredTarget(id, runId, appId, deferred => {
     if (deferred.targetTurnIds?.[chatId] !== turnId) return undefined;
+    // An exact acceptance is monotonic: a slower fork-accounting callback must
+    // not downgrade it back to held.
+    if (deferred.acceptedTargets?.[chatId] === turnId) return undefined;
     const state = deferred.targets[chatId];
     if (state !== 'dispatching' && state !== 'dispatched') return undefined;
     return {
@@ -961,6 +985,16 @@ export function recoverDeferredRunOnStartup(
     const heldTargets = deferred.heldTargets ? { ...deferred.heldTargets } : undefined;
     const acceptedTargets = deferred.acceptedTargets ? { ...deferred.acceptedTargets } : undefined;
     for (const [chatId, state] of Object.entries(targets)) {
+      // An exact acceptance is the strongest fact and survives restart.
+      const acceptedTurn = acceptedTargets?.[chatId];
+      if (acceptedTurn && deferred.targetTurnIds?.[chatId] === acceptedTurn) {
+        if (state !== 'dispatched' || heldTargets?.[chatId] !== undefined) {
+          targets[chatId] = 'dispatched';
+          if (heldTargets) delete heldTargets[chatId];
+          changed = true;
+        }
+        continue;
+      }
       // `dispatching` may or may not have reached the worker. `held` DID reach
       // it, but a daemon restart cannot prove the worker still survives, so
       // neither may be auto-replayed or settled as success. Any target named in

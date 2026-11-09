@@ -35894,6 +35894,21 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             throw error;
           }
         }
+        // The `parked` snapshot above was captured before the awaits. Re-read
+        // CURRENT ownership so an acceptance that landed while awaiting cannot
+        // be overwritten by the stale snapshot (and accepted turns are never
+        // re-sent on the retry).
+        const currentDeferred = scheduler.getRuntimeTask(task.id, effectiveAppId)?.deferredRun;
+        const acceptedNow = (chatId: string): boolean => {
+          const accepted = currentDeferred?.acceptedTargets?.[chatId];
+          return accepted !== undefined && accepted === turnIds.get(chatId);
+        };
+        const heldNow = (chatId: string): boolean =>
+          currentDeferred?.heldTargets?.[chatId] === turnIds.get(chatId)
+          || currentDeferred?.targets[chatId] === 'held';
+        results = results.map(result => acceptedNow(result.chatId)
+          ? { ...result, outcome: 'model_dispatched' as const }
+          : result);
         const deferredResults = results.filter(result => result.outcome === 'deferred');
         if (deferredResults.length === 0) return 'dispatched';
         // Keep the claimed run parked. Targets already dispatched stay recorded
@@ -35903,8 +35918,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         for (const chatId of targetChatIds) {
           const result = results.find(entry => entry.chatId === chatId);
           const turnId = turnIds.get(chatId);
-          if (result?.outcome === 'deferred') {
-            parkedTargets[chatId] = heldTarget(chatId, turnId) ? 'held' : 'waiting';
+          if (acceptedNow(chatId)) {
+            parkedTargets[chatId] = 'dispatched';
+          } else if (result?.outcome === 'deferred') {
+            parkedTargets[chatId] = heldNow(chatId) ? 'held' : 'waiting';
           } else {
             parkedTargets[chatId] = 'dispatched';
           }
