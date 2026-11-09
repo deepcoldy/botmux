@@ -324,7 +324,8 @@ describe('sent archive', () => {
     const next = `req_${String(GROUP_SEND_RECORD_LIMIT + 1).padStart(8, '0')}`;
     expect(await sendRequestBoundGroupMessage(deps(send), input(next, 'fresh'))).toMatchObject({ ok: true, replayed: false });
     expect(send).toHaveBeenCalledTimes(GROUP_SEND_RECORD_LIMIT + 2);
-  });
+    // 2002 次 fsync 级 durable 写在 bun:test 默认 5s 超时下跑不完，显式放宽（vitest/bun 均认第三参）。
+  }, 120_000);
 
   it('replays an archived requestId with no provider call and reads that binding back', async () => {
     const requestId = 'req_archived';
@@ -383,7 +384,8 @@ describe('sent archive', () => {
     writeArchive(fillSent(GROUP_SEND_ARCHIVE_LIMIT, 'a', 1, 'old'));
     expect(await sendRequestBoundGroupMessage(deps(send), input('req_pastcap', 'plateau'))).toMatchObject({ ok: true, replayed: false });
     expect(Object.keys(readRecords(archiveFile()))).toHaveLength(GROUP_SEND_ARCHIVE_LIMIT);
-  });
+    // 2100 次 durable 写 + 一次 20k 条归档种子，bun:test 默认 5s 超时下跑不完，显式放宽。
+  }, 120_000);
 
   it('retries a requestId evicted from the archive as a new send', async () => {
     const victim = 'req_victim1';
