@@ -9,6 +9,8 @@ import { attachOncallGroupButton, buildOncallGroupColumn } from '../src/im/lark/
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 import { buildFeedbackElement, renderFeedbackCard } from '../src/im/lark/skill-feedback-card.js';
 import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
+import { createNativeOncallLink } from '../src/services/oncall-platform.js';
+import { CARD_LATE_CHROME_RESERVE_BYTES } from '../src/im/lark/md-card.js';
 
 const dirs: string[] = [];
 const temporary = () => { const dir = mkdtempSync(join(tmpdir(), 'oncall-group-')); dirs.push(dir); return dir; };
@@ -129,6 +131,16 @@ describe('Oncall and feedback card composition', () => {
     expect(column.elements[0]).toMatchObject({ tag: 'button', type: 'default', size: 'small',
       behaviors: [{ type: 'open_url', default_url: 'https://applink.feishu.cn/client/chat/open?chatId=oc_fixture' }] });
     expect(column.elements[1]).toMatchObject({ tag: 'markdown', text_size: 'notation' });
+  });
+  it('keeps a native form link for a long question within the late card chrome reserve', async () => {
+    const page = new URL('https://oncall.example.test/chat?tenant=12');
+    const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: 0, data: {
+      lark_dialog_url: 'https://applink.feishu.cn/client/web_url/open?url=' + encodeURIComponent(page.href) } })));
+    const question = '系统报错日志'.repeat(500);
+    const href = await createNativeOncallLink(target, 'secret', '', question, 'feishu', fetcher);
+    const prefill = JSON.parse(new URL(new URL(href).searchParams.get('url')!).searchParams.get('context')!).trigger_message;
+    expect(prefill.endsWith('…') && question.startsWith(prefill.slice(0, -1))).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(buildOncallGroupColumn({ href })))).toBeLessThan(CARD_LATE_CHROME_RESERVE_BYTES);
   });
 
   it('preserves the static button through feedback and secondary selections', () => {

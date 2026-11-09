@@ -95,7 +95,10 @@ export async function createNativeOncallLink(target: OncallGroupTarget, secret: 
   page.searchParams.delete('type'); // classify: never force the legacy fixed category.
   page.searchParams.delete('region');
   page.searchParams.set('step', 'launch-oncall');
-  page.searchParams.set('context', JSON.stringify({ trigger_message: description }));
+  // The link rides in late card chrome (2000-byte reserve); a CJK character costs ~15 bytes after two URL encodings.
+  const chars = [...description];
+  const trigger = chars.length > 80 ? `${chars.slice(0, 79).join('')}…` : description;
+  page.searchParams.set('context', JSON.stringify({ trigger_message: trigger }));
   link.searchParams.set('mode', 'sidebar-semi');
   link.searchParams.set('width', '430');
   link.searchParams.set('url', page.href);

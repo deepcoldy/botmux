@@ -26,7 +26,7 @@ export function buildOncallGroupColumn(options: { href?: string; status?: string
       ...(options.href && options.status ? { icon: { tag: 'standard_icon', token: 'chat_outlined', color: 'grey' } } : {}),
       ...(options.disabled ? { disabled: true } : {}),
       ...(options.confirmText ? { confirm: { title: { tag: 'plain_text', content: '确认发起人工 Oncall？' }, text: { tag: 'plain_text', content: options.confirmText } } } : {}),
-      behaviors: options.href ? [{ type: 'open_url', default_url: options.href, pc_url: options.href, android_url: options.href, ios_url: options.href }]
+      behaviors: options.href ? [{ type: 'open_url', default_url: options.href }]
         : [{ type: 'callback', value: { action: 'oncall_group_create' } }],
     }, ...(options.handoffStatus ? [{ tag: 'markdown', text_size: 'notation', content: `<font color='grey'>${options.handoffStatus}</font>` }] : []),
     ...(options.retryForward ? [{ tag: 'button', type: 'default', size: 'small', text: { tag: 'plain_text', content: '重试转交' },
