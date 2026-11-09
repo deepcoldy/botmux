@@ -25,6 +25,7 @@ function resolve(
   const ledger = {
     resolveBatch: () => new Map(),
     listRegistered: () => registered,
+    readTurn: () => undefined,
   } as unknown as LinkRefLedger;
   return resolveOutboundLinkRefs(ledger, key, { text }, responseKind);
 }
@@ -136,6 +137,7 @@ describe('registered-source final link integrity', () => {
     const ledger = {
       resolveBatch: () => new Map(),
       listRegistered: () => registered,
+      readTurn: () => undefined,
     } as unknown as LinkRefLedger;
     expect(() => resolveOutboundLinkRefs(ledger, key, {
       text: `隐藏回退：${fullUrl}`,

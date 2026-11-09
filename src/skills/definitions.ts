@@ -714,6 +714,8 @@ botmux send --mention ou_xxx "帮忙看下这段代码"
 
 ### @ 决策硬门（必读）
 
+定时任务等没有本轮发送者的自动回合，有明确收件人时用 --mention，没有明确收件人时用 --no-mention；不要使用 --mention-back，也不要从会话 owner 或历史发送者推断收件人。
+
 每条回复**必须显式做出 @ 决策**，否则 \`botmux send\` 报错（exit 2）不发送。三选一：
 
 | flag | 何时用 |

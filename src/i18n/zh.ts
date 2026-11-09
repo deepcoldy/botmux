@@ -1266,7 +1266,7 @@ export const messages: Record<string, string> = {
   'card.local_address.unavailable_link': '（未提供可访问链接）',
   'worker.final_output_local_address_rejected': '结果卡包含无法供用户访问的本机跳转地址，完整结果未发送。已停止原样重试。',
   'ai.routing.usage_send': '- 发送：`botmux send "消息"`',
-  'ai.routing.usage_mention_gate': '- 每条 send 必须三选一：`--mention <open_id>` / `--mention-back` / `--no-mention`——按内容价值选：有实质结论要对方看/确认/决策 → @；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发',
+  'ai.routing.usage_mention_gate': '- 每条 send 必须三选一：`--mention <open_id>` / `--mention-back` / `--no-mention`——按内容价值选：有实质结论要对方看/确认/决策 → @；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发。定时任务等没有本轮发送者的自动回合，有明确收件人时用 --mention，没有明确收件人时用 --no-mention；不要使用 --mention-back，也不要从会话 owner 或历史发送者推断收件人。',
   'ai.routing.usage_attachments': '- 附件：`--images`、`--files`、`--videos`；尺寸/排版选择先 `botmux skill show botmux-send`',
   'ai.routing.ask_wait': '等待 botmux ask 真人回答时，无输出属正常等待；不得发送 Ctrl-C、kill 或取消等待工具来提前结束。复用原等待进程直到回答或正常超时；传输错误、超时和机器人回复不代表真人授权。收到 Ask 接续事件时回读原任务、问题与方案版本，只消费对应决定，不重跑已完成工作。',
   'ai.routing.usage_helpers': '- 上下文：`botmux history`；协作 bot：`botmux bots list`',
@@ -1345,7 +1345,7 @@ export const messages: Record<string, string> = {
   // mention_gate 都不注入，见 shared-hints.ts）。
   'ai.shell.intro_transcript': '你运行在飞书（Lark）会话中。用户在飞书阅读回复，看不到你的终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书。',
   'ai.shell.when_to_send_transcript': '发给你的消息直接在最终 assistant message 里作答即可,别沉默。只有根本不是发给你的消息才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
-  'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名指定人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回本轮触发者本人）/ `--no-mention`（不@）。先按内容价值决定要不要 @：有实质结论要对方看/确认/决策→需要 @；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。再按收件人选方式：就是回触发这轮的人/bot→--mention-back；要 @ 别人（多人会话回复对象不一定是触发者）→--mention 显式点名。别把 --no-mention 当默认，也别无意义 @ 打扰。',
+  'ai.shell.mention_gate': '@ 决策（硬性）：每条 `botmux send` 必须显式三选一否则报错——`--mention <open_id:名字>`（点名指定人/bot，跟别的 bot 沟通/协作必须用它）/ `--mention-back`（@回本轮触发者本人）/ `--no-mention`（不@）。先按内容价值决定要不要 @：有实质结论要对方看/确认/决策→需要 @；纯记录/低优先级/简短确认→--no-mention；没信息量的"收到"不如不发。再按收件人选方式：就是回触发这轮的人/bot→--mention-back；要 @ 别人（多人会话回复对象不一定是触发者）→--mention 显式点名。别把 --no-mention 当默认，也别无意义 @ 打扰。定时任务等没有本轮发送者的自动回合，有明确收件人时用 --mention，没有明确收件人时用 --no-mention；不要使用 --mention-back，也不要从会话 owner 或历史发送者推断收件人。',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
   'ai.attach.hint': '使用 Read 工具查看，序号与正文中的 [图片 N] / [文件 N] / [视频 N] 占位符对应',
