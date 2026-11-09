@@ -126,6 +126,16 @@ describe('feedback extension host callback', () => {
       expect(data.extensions.surface('app', 'new-surface')?.deliveryId).toBe(next.deliveryId);
     } finally { release(); await background; await closeFeedbackStorage(data.directory); }
   });
+  it('leaves old-card refresh and inline cleanup to the background lane', async () => {
+    const data = await fixture();
+    data.extensions.dirtySurface('app', 'surface', { result: 'old' });
+    (data.extensions as any).database.prepare('INSERT OR IGNORE INTO inline_cleanup VALUES(?,?)').run('app', 'old-answer');
+    await tickFeedbackExtensions(data.directory, 'app', 'surface');
+    expect(mock.detail).not.toHaveBeenCalled();
+    expect(mock.update).not.toHaveBeenCalled();
+    expect(data.extensions.dirtySurfaces('app').map(item => item.messageId)).toContain('surface');
+    expect(data.extensions.inlineCleanups('app')).toContain('old-answer');
+  });
   it('keeps a newer revision queued until a timed-out old patch actually finishes', async () => {
     const data = await fixture();
     vi.useFakeTimers();
