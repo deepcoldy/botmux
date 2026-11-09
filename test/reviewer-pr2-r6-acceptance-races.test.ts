@@ -167,4 +167,41 @@ describe('independent PR2 r6 acceptance ordering', () => {
     expect(current().deferredRun!.acceptedTargets).toBeUndefined();
     expect(current().deferredRun!.targets).toEqual({ oc_A: 'held', oc_B: 'held' });
   });
+
+  it.each([false, true])('classifies the newly selected topic session rather than an unrelated retained chat session (silent=%s)', async silent => {
+    const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
+    const begin = daemon.indexOf('      const runTargets = async (additionalPrompt?: string)');
+    const end = daemon.indexOf('      let outcome: ScheduledTaskPreconditionOutcome;', begin);
+    const js = ts.transpileModule(daemon.slice(begin, end), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+    const factory = new Function('scope', `with (scope) { ${js}; return runTargets; }`);
+    const sessions = new Map<string, any>(['oc_A', 'oc_B'].map(chatId => [ `${chatId}::${APP}`, {
+      larkAppId: APP, chatId, session: { cliId: 'claude-code', status: 'active', scope: 'chat' },
+    }]));
+    const opened: string[] = [];
+    const run = factory({ task: { ...current(), executionPosition: 'new-topic', silent },
+      executionContext: context, parked: current().deferredRun, scheduler, scheduleStore,
+      effectiveAppId: APP, cfg: { cliId: 'traex' }, randomUUID: () => 'unused',
+      buildUntilDoneRunPrompt: () => undefined, scheduleTimeZone: () => 'Asia/Shanghai',
+      executeScheduledTaskForTargets, ScheduleTargetExecutionError, activeSessions: sessions,
+      refreshCliVersion: async () => {}, precondition: { precondition: 'passed' }, targetResults: undefined,
+      withBotTurnAdmission: (_app: string, action: () => unknown) => action(),
+      executeScheduledTask: async (target: any, active: typeof sessions, _refresh: any, _prompt: any, runtime: any) => {
+        if (!runtime.onBeforeDispatch(runtime.turnId)) return 'deferred';
+        // New-topic routing creates its own fresh session; the old chat-scope
+        // session is NOT the owner of this scheduled turn.
+        const anchor = silent ? `schedule-run:${taskId}:${runtime.turnId.split(':').at(-1)}` : `om_new_${target.chatId}`;
+        active.set(`${anchor}::${APP}`, { larkAppId: APP, chatId: target.chatId,
+          session: { cliId: 'traex', rootMessageId: anchor,
+            scheduledRun: { runId: context.runId, turnId: runtime.turnId } } });
+        opened.push(anchor);
+        // The newly spawned TRAE worker owns the input but awaits the gate.
+        // No acceptance receipt has been received.
+        return 'dispatched';
+      },
+    }) as () => Promise<'dispatched' | 'deferred'>;
+    const outcome = await run();
+    expect(opened).toHaveLength(2);
+    expect(outcome).toBe('deferred');
+    expect(current().deferredRun!.acceptedTargets).toBeUndefined();
+  });
 });

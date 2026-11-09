@@ -4576,7 +4576,12 @@ export async function executeScheduledTask(
      *  caller persisted the target's `dispatching` state. Returning `false`
      *  means that durable admission did not land; the fire must stop before any
      *  fork/send and report `deferred` instead of a false success. */
-    onBeforeDispatch?: (turnId: string) => boolean | void | Promise<boolean | void>;
+    onBeforeDispatch?: (
+      turnId: string,
+      /** The EXACT session this target's input is being handed to. The daemon
+       *  must classify/accept by this identity, never by a guessed anchor. */
+      selectedSession?: DaemonSession,
+    ) => boolean | void | Promise<boolean | void>;
   },
 ): Promise<'dispatched' | 'deferred'> {
   // Resolve which bot to use — prefer the task's original bot so replies come from
@@ -4608,17 +4613,6 @@ export async function executeScheduledTask(
     throw new Error(workingDirSwap);
   }
 
-  // Managed TRAE runtime handoff: do not create an anchor, banner or session
-  // for a run that cannot start yet. The worker gate stays the authority
-  // immediately before exec; this read-only pre-check only parks the run early
-  // with its exact turn identity intact so the retry can deliver it exactly
-  // once. `unknown` proceeds — the worker holds the input itself.
-  const runtimeBlocker = scheduledTraexRuntimeBlocker(bot, task, larkAppId, activeSessions);
-  if (runtimeBlocker) {
-    logger.info(`[scheduler] Task "${task.name}" (${task.id}) deferred: ${runtimeBlocker}`);
-    return 'deferred';
-  }
-
   // --follow-active: keep the last landing point while a human holds it open;
   // otherwise re-target to where a human spoke most recently (persisting the
   // new landing point); with no human-active topic, stay in the landing point
@@ -4634,6 +4628,18 @@ export async function executeScheduledTask(
   };
   task = applyFollowActive(task, { persist: persistLanding });
   const followActiveFreshTopic = followActiveOpenedFreshTopic(taskBeforeFollowActive, task);
+
+  // Managed TRAE runtime handoff: do not create an anchor, banner or session
+  // for a run that cannot start yet. The worker gate stays the authority
+  // immediately before exec; this read-only pre-check only parks the run early
+  // with its exact turn identity intact so the retry can deliver it exactly
+  // once. `unknown` proceeds — the worker holds the input itself. Runs on the
+  // FINAL landing point so it inspects the same session the dispatch selects.
+  const runtimeBlocker = scheduledTraexRuntimeBlocker(bot, task, larkAppId, activeSessions);
+  if (runtimeBlocker) {
+    logger.info(`[scheduler] Task "${task.name}" (${task.id}) deferred: ${runtimeBlocker}`);
+    return 'deferred';
+  }
 
   const { getChatMode, sendMessage, replyMessage } = await import('../im/lark/client.js');
 
@@ -4659,9 +4665,9 @@ export async function executeScheduledTask(
    *  first real dispatch attempt. A later fallback within the same turn reuses
    *  the same turn id and needs no second write. Returns false when the write
    *  did not land; every fork/send path must then abort. */
-  const persistDispatch = async (): Promise<boolean> => {
+  const persistDispatch = async (selectedSession?: DaemonSession): Promise<boolean> => {
     if (dispatchPersisted) return true;
-    const admitted = await runtime?.onBeforeDispatch?.(scheduledTurnId);
+    const admitted = await runtime?.onBeforeDispatch?.(scheduledTurnId, selectedSession);
     if (admitted === false) {
       logger.warn(
         `[scheduler] Task "${task.name}" (${task.id}) dispatch refused: `
@@ -4705,7 +4711,7 @@ export async function executeScheduledTask(
           throw err;
         }
         try {
-          if (!(await persistDispatch())) return 'deferred';
+          if (!(await persistDispatch(staged))) return 'deferred';
           // Re-send the ORIGINAL structured payload. A restart loses the
           // in-memory copy, so rebuild it from the frozen task identity instead
           // of degrading to the stored text (which drops trustedCaller).
@@ -5171,7 +5177,7 @@ export async function executeScheduledTask(
             // creates the session, every later fire injects into it), so the
             // failure shape would be "worked once, silently identity-less after".
             // A refused durable admission must stop before the IPC send.
-            if (!(await persistDispatch())) return;
+            if (!(await persistDispatch(existing))) return;
             if (sendWorkerInput(
               existing,
               input,
@@ -5190,7 +5196,7 @@ export async function executeScheduledTask(
           throw new Error(`scheduled continuation lost active session ${existing.session.sessionId}`);
         }
         try {
-          if (!(await persistDispatch())) return;
+          if (!(await persistDispatch(existing))) return;
           forkWorker(existing, input, { resume: existing.hasHistory, turnId: scheduledTurnId });
         } catch (err) {
           if (silent) disarmSilentScheduledTurn(existing, scheduledTurnId);
@@ -5319,7 +5325,7 @@ export async function executeScheduledTask(
     rememberLastCliInput(ds, task.prompt, prompt, scheduledTurnId);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
     try {
-      if (!(await persistDispatch())) return;
+      if (!(await persistDispatch(ds))) return;
       forkWorker(ds, prompt, scheduledTurnId);
     } catch (err) {
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);
@@ -5334,27 +5340,6 @@ export async function executeScheduledTask(
   // A refused durable admission means nothing was sent; keep the run parked
   // (with its original run/turn/prompt) instead of settling it as dispatched.
   return dispatchRefused ? 'deferred' : 'dispatched';
-}
-
-/**
- * The CLI the target session will actually run with. A retained session can
- * freeze a CLI different from the bot's current default (`/cli` selection or a
- * bot config change), and the scheduled continuation honors the session.
- */
-function scheduledTargetCliId(
-  task: ScheduledTask,
-  larkAppId: string,
-  botCliId: string,
-  activeSessions: Map<string, DaemonSession>,
-): string {
-  const anchors = [task.rootMessageId, `schedule-task:${task.id}`, task.chatId]
-    .filter((value): value is string => !!value);
-  for (const anchor of anchors) {
-    const ds = activeSessions.get(sessionKey(anchor, larkAppId)) ?? activeSessions.get(anchor);
-    const cliId = ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session?.cliId;
-    if (cliId) return cliId;
-  }
-  return botCliId;
 }
 
 /**
@@ -5377,13 +5362,18 @@ function scheduledTraexRuntimeBlocker(
   larkAppId: string,
   activeSessions: Map<string, DaemonSession>,
 ): string | undefined {
-  // Classify by the ACTUAL target session runtime, not the bot default: a
-  // retained TRAE session under a Claude-default bot still has a TRAE gate,
-  // and a non-TRAE session under a TRAE-default bot must not be blocked by an
-  // unrelated shared cache domain.
-  if (scheduledTargetCliId(task, larkAppId, bot.config.cliId, activeSessions) !== 'traex') {
+  // Only a RETAINED topic has a provable target before routing: its exact
+  // anchor is task.rootMessageId. New-topic / rootless task / chat top-level
+  // choose their session later; their target proof comes from the actual
+  // dispatch (onBeforeDispatch selectedSession), never from a guessed anchor.
+  if (resolveScheduledTaskExecutionPosition(task) !== 'topic' || !task.rootMessageId) {
     return undefined;
   }
+  const selected = activeSessions.get(sessionKey(task.rootMessageId, larkAppId));
+  const targetCliId = selected?.session.cliLaunchSnapshot?.cliId
+    ?? selected?.session.cliId
+    ?? bot.config.cliId;
+  if (targetCliId !== 'traex') return undefined;
   try {
     const executablePath = resolveCommandReal(bot.config.cliPathOverride?.trim() || 'traex');
     // Pre-check the SAME cache domain the CLI child will write. Using the

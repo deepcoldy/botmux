@@ -35836,72 +35836,94 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               pending,
               targetTask => withBotTurnAdmission(
                 effectiveAppId,
-                () => executeScheduledTask(
-                  targetTask,
-                  activeSessions,
-                  refreshCliVersion,
-                  runPrompt,
-                  {
-                    prepareTurnIdentity: async (session, turnId) => {
-                      // Re-read after preconditions/admission waits. A human can
-                      // pause, revoke or edit while those awaits are outstanding.
-                      const current = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
-                      if (!current || (current.state !== 'active'
-                        && !(current.state === 'paused'
-                          && scheduler.admitManualRunTurn(task.id, executionContext.runId, turnId, effectiveAppId)))) {
-                        throw new Error('schedule authority changed before turn admission');
-                      }
-                      assertScheduledAuthorityCurrent(authority, current, { runId: executionContext.runId });
-                      await prepareTurnCliIdentity(session, turnId);
-                      const prepared = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
-                      assertScheduledAuthorityCurrent(current, prepared, { runId: executionContext.runId, turnId });
+                () => {
+                  // The EXACT session the dispatch path hands this target's
+                  // input to, captured synchronously at the admission seam.
+                  // Classification must use this identity: the target may be a
+                  // freshly created new-topic session that no anchor scan can
+                  // see yet, and an unrelated older session under the same chat
+                  // must never decide the outcome.
+                  let dispatchedSession: DaemonSession | undefined;
+                  // Whether the admission seam ran at all. No admission means
+                  // nothing was handed to any worker (e.g. no bot configured
+                  // yet), so the run must stay re-dispatchable rather than be
+                  // recorded as a held turn that no worker will ever accept.
+                  let admissionSeen = false;
+                  return executeScheduledTask(
+                    targetTask,
+                    activeSessions,
+                    refreshCliVersion,
+                    runPrompt,
+                    {
+                      prepareTurnIdentity: async (session, turnId) => {
+                        // Re-read after preconditions/admission waits. A human can
+                        // pause, revoke or edit while those awaits are outstanding.
+                        const current = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
+                        if (!current || (current.state !== 'active'
+                          && !(current.state === 'paused'
+                            && scheduler.admitManualRunTurn(task.id, executionContext.runId, turnId, effectiveAppId)))) {
+                          throw new Error('schedule authority changed before turn admission');
+                        }
+                        assertScheduledAuthorityCurrent(authority, current, { runId: executionContext.runId });
+                        await prepareTurnCliIdentity(session, turnId);
+                        const prepared = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
+                        assertScheduledAuthorityCurrent(current, prepared, { runId: executionContext.runId, turnId });
+                      },
+                      runId: executionContext.runId,
+                      turnId: turnIds.get(targetTask.chatId!)!,
+                      onBeforeDispatch: (turnId, selectedSession) => {
+                        admissionSeen = true;
+                        dispatchedSession = selectedSession;
+                        // Persist `dispatching` before the input can reach a
+                        // worker: a crash after this point is never auto-replayed.
+                        // Return the durable result — `executeScheduledTask` must
+                        // stop before any fork/send when the write did not land.
+                        return scheduler.markDeferredTargetDispatching(
+                          task.id, executionContext.runId, targetTask.chatId!, turnId, effectiveAppId,
+                        );
+                      },
                     },
-                    runId: executionContext.runId,
-                    turnId: turnIds.get(targetTask.chatId!)!,
-                    onBeforeDispatch: turnId => {
-                      // Persist `dispatching` before the input can reach a
-                      // worker: a crash after this point is never auto-replayed.
-                      // Return the durable result — `executeScheduledTask` must
-                      // stop before any fork/send when the write did not land.
-                      return scheduler.markDeferredTargetDispatching(
-                        task.id, executionContext.runId, targetTask.chatId!, turnId, effectiveAppId,
-                      );
-                    },
-                  },
-                ).then(dispatched => {
-                  if (dispatched !== 'deferred') {
-                    const targetTurnId = turnIds.get(targetTask.chatId!)!;
-                    // Fork return is NOT an acceptance fact. Classify by the
-                    // ACTUAL target session runtime, not the bot default: a
-                    // retained session can freeze TRAE while the bot defaults to
-                    // another CLI. For managed TRAE the input is only queued in
-                    // the worker, which may still be waiting in its start gate:
-                    // keep the target held and the run parked until the worker
-                    // reports the exact turn accepted. Other CLIs keep the
-                    // historical fork acceptance.
-                    const targetCliId = (() => {
-                      const anchors = [targetTask.rootMessageId, `schedule-task:${task.id}`, targetTask.chatId]
-                        .filter((value): value is string => !!value);
-                      for (const anchor of anchors) {
-                        const ds = activeSessions.get(`${anchor}::${effectiveAppId}`)
-                          ?? activeSessions.get(anchor);
-                        const cliId = ds?.session?.cliLaunchSnapshot?.cliId ?? ds?.session?.cliId;
-                        if (cliId) return cliId;
+                  ).then(dispatched => {
+                    if (dispatched !== 'deferred') {
+                      const targetTurnId = turnIds.get(targetTask.chatId!)!;
+                      // No admission seam ran, so no worker owns this turn:
+                      // leave it waiting for the next tick instead of holding
+                      // a nonexistent owner forever.
+                      if (!admissionSeen) return 'deferred' as const;
+                      // Fork return is NOT an acceptance fact. Classify by the
+                      // ACTUAL dispatched session runtime, not the bot default
+                      // and not a guessed anchor: a retained session can freeze
+                      // TRAE while the bot defaults to another CLI, and a fresh
+                      // new-topic session may not be discoverable yet. Managed
+                      // TRAE queues the input in a worker that may still wait in
+                      // its start gate, so the target stays held until the
+                      // worker reports the exact turn accepted. Without proof of
+                      // a non-TRAE target we fail closed (deferred).
+                      // A fresh session has no frozen CLI until its first
+                      // spawn; it launches with the owning bot's configured
+                      // default. Resolve that same default for the selected
+                      // session's app, never the daemon's own config.
+                      const selectedBotCliId = dispatchedSession
+                        ? getAllBots().find(b => b.config.larkAppId === dispatchedSession!.larkAppId)?.config.cliId
+                        : undefined;
+                      const targetCliId = dispatchedSession
+                        ? (dispatchedSession.session.cliLaunchSnapshot?.cliId
+                          ?? dispatchedSession.session.cliId
+                          ?? selectedBotCliId)
+                        : undefined;
+                      if (targetCliId === undefined || targetCliId === 'traex') {
+                        scheduler.markDeferredTargetHeld(
+                          task.id, executionContext.runId, targetTask.chatId!, targetTurnId, effectiveAppId,
+                        );
+                        return 'deferred' as const;
                       }
-                      return cfg.cliId;
-                    })();
-                    if (targetCliId === 'traex') {
-                      scheduler.markDeferredTargetHeld(
+                      scheduler.markDeferredTargetAccepted(
                         task.id, executionContext.runId, targetTask.chatId!, targetTurnId, effectiveAppId,
                       );
-                      return 'deferred' as const;
                     }
-                    scheduler.markDeferredTargetAccepted(
-                      task.id, executionContext.runId, targetTask.chatId!, targetTurnId, effectiveAppId,
-                    );
-                  }
-                  return dispatched;
-                }),
+                    return dispatched;
+                  });
+                },
               ),
             ));
             if (targetChatIds.length > 1) targetResults = results;
