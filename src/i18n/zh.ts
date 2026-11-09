@@ -1917,7 +1917,6 @@ export const messages: Record<string, string> = {
   'daemon.enriched_mentions_label': '消息中的 @mention：',
   'daemon.topic_continuity.resumed': '↩️ 本话题之前的会话（{id}）已关闭，这条消息接着它继续处理，之前的上下文都在。',
   'daemon.topic_continuity.fresh_after_close': '⚠️ 本话题之前的会话（{id}）已关闭且无法恢复，这条消息由新开的会话处理，之前的上下文不在了。',
-  'daemon.topic_continuity.fresh_after_user_close': '🆕 本话题之前的会话（{id}）是手动关闭的，按关闭时的意图新开会话处理这条消息；要接着原会话请先发 /resume。',
   'daemon.topic_continuity.fresh_requested': '🆕 按派单要求（@session fresh）新开了会话，本话题之前的会话（{id}）不再续用。',
   'daemon.topic_continuity.fresh_close_refused': '⚠️ 按 @session fresh 要关掉当前会话，但关闭被拒绝（{error}，远端任务 {taskId}），当前会话保留并处理这条消息。',
   'daemon.topic_continuity.fresh_close_residual': '⚠️ 按 @session fresh 关掉了当前会话，但有残留需要人工核查：{detail}。',

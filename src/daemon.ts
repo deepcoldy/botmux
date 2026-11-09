@@ -29426,6 +29426,7 @@ async function handleThreadReplyAdmitted(
   // `ds` is then const so TypeScript keeps its narrowing in later closures.
   let dsPre = workflowGate ? workflowGate.session.current : activeSessions.get(runtimeSessionKey);
   let pendingTopicContinuity: Omit<TopicContinuityRecord, 'at'> | undefined;
+  let announceFreshTopicSession = false;
   if (!workflowGate && effortSessionIsCurrent && !effortSessionIsCurrent()) return;
   const workflowAdmission = workflowGate?.admission;
   // A retry / later round handed off into a node topic this bot already has
@@ -29570,31 +29571,44 @@ async function handleThreadReplyAdmitted(
   // session was closed used to get a brand-new CLI session on the next message,
   // so a lead's `dispatch --into` follow-up reached an executor with no memory
   // of the earlier work. Resume the topic's last closed session instead, unless
-  // a human closed it or the sender asked for `@session fresh`; record and
-  // announce whichever happened.
-  if (scope === 'thread' && ctxChatId && !workflowHandoff && !ctx.completionProposalContinuation) {
+  // a human closed it or the sender asked for `@session fresh`; record what
+  // happened. Only a resume, a requested fresh session or a failed resume is
+  // announced: a fresh session for a human-closed / retired / adopted row is the
+  // plain @ behaviour and stays silent. Durable primary mode fences local
+  // close/resume, so it keeps the plain fresh-session behaviour.
+  const primaryCoordination = coordinationModeIsPrimary();
+  if (primaryCoordination && botSessionDirective.mode) {
+    logger.info(`[${larkAppId}] topic ${anchor.substring(0, 12)}: @session ${botSessionDirective.mode} ignored in durable primary mode`);
+  }
+  if (scope === 'thread' && ctxChatId && !workflowHandoff && !ctx.completionProposalContinuation && !primaryCoordination) {
     const continuityLocale = localeForBot(larkAppId);
+    const announceContinuity = (text: string) => sessionReply(anchor, text, 'text', larkAppId).catch(err => {
+      logger.warn(`[${larkAppId}] topic continuity notice failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
     const liveDs = activeSessions.get(runtimeSessionKey);
     if (liveDs && botSessionDirective.mode === 'fresh') {
       if (hasProtectedSessionMutationOwnership(liveDs) || liveDs.initialStartPending) {
-        await sessionReply(anchor, tr('daemon.topic_continuity.fresh_refused_busy', undefined, continuityLocale), 'text', larkAppId);
+        await announceContinuity(tr('daemon.topic_continuity.fresh_refused_busy', undefined, continuityLocale));
       } else {
         const previousSessionId = liveDs.session.sessionId;
         const closeResult = await closeSessionHelper(previousSessionId, { userClosed: true });
         if (!closeResult.ok) {
           // Not proven closed (e.g. remote cancellation unverified): keep it and
           // let it handle this message rather than run two sessions in one topic.
-          await sessionReply(anchor, tr('daemon.topic_continuity.fresh_close_refused', {
+          await announceContinuity(tr('daemon.topic_continuity.fresh_close_refused', {
             error: closeResult.error,
             taskId: 'taskId' in closeResult && closeResult.taskId ? String(closeResult.taskId) : '-',
-          }, continuityLocale), 'text', larkAppId);
+          }, continuityLocale));
         } else {
           if (closeResult.outcome === 'closed_with_residual') {
-            await sessionReply(anchor, tr('daemon.topic_continuity.fresh_close_residual', {
+            await announceContinuity(tr('daemon.topic_continuity.fresh_close_residual', {
               detail: describeTopicCloseResidual(closeResult.residual),
-            }, continuityLocale), 'text', larkAppId);
+            }, continuityLocale));
           }
-          if (!activeSessions.has(runtimeSessionKey)) pendingTopicContinuity = { mode: 'fresh-requested', previousSessionId };
+          if (!activeSessions.has(runtimeSessionKey)) {
+            pendingTopicContinuity = { mode: 'fresh-requested', previousSessionId };
+            announceFreshTopicSession = true;
+          }
         }
       }
     } else if (!liveDs) {
@@ -29612,6 +29626,7 @@ async function handleThreadReplyAdmitted(
         const blocked = botSessionDirective.mode === 'fresh' ? 'fresh_requested' : topicResumeBlockReason(previous);
         if (blocked === 'fresh_requested') {
           pendingTopicContinuity = { mode: 'fresh-requested', previousSessionId: previous.sessionId };
+          announceFreshTopicSession = true;
         } else if (blocked) {
           pendingTopicContinuity = { mode: 'fresh-after-close', previousSessionId: previous.sessionId, reason: blocked };
         } else {
@@ -29620,9 +29635,10 @@ async function handleThreadReplyAdmitted(
             resumed.ds.session.continuity = { mode: 'resumed', previousSessionId: previous.sessionId, at: new Date().toISOString() };
             sessionStore.updateSession(resumed.ds.session);
             logger.info(`[${larkAppId}] topic ${anchor.substring(0, 12)}: resumed closed session ${previous.sessionId.substring(0, 8)} for incoming message`);
-            await sessionReply(anchor, tr('daemon.topic_continuity.resumed', { id: previous.sessionId.substring(0, 8) }, continuityLocale), 'text', larkAppId);
+            await announceContinuity(tr('daemon.topic_continuity.resumed', { id: previous.sessionId.substring(0, 8) }, continuityLocale));
           } else {
             pendingTopicContinuity = { mode: 'fresh-after-close', previousSessionId: previous.sessionId, reason: resumed.error };
+            announceFreshTopicSession = true;
           }
         }
         if (pendingTopicContinuity) {
@@ -30106,16 +30122,14 @@ async function handleThreadReplyAdmitted(
     if (pendingTopicContinuity) {
       session.continuity = { ...pendingTopicContinuity, at: new Date().toISOString() };
       sessionStore.updateSession(session);
-      const id = (pendingTopicContinuity.previousSessionId ?? '').substring(0, 8);
-      const continuityLocale = localeForBot(larkAppId);
-      const notice = pendingTopicContinuity.mode === 'fresh-requested'
-        ? tr('daemon.topic_continuity.fresh_requested', { id }, continuityLocale)
-        : tr(pendingTopicContinuity.reason === 'user_closed'
-          ? 'daemon.topic_continuity.fresh_after_user_close'
-          : 'daemon.topic_continuity.fresh_after_close', {
-          id, reason: pendingTopicContinuity.reason ?? 'unknown',
-        }, continuityLocale);
-      void sessionReply(anchor, notice, 'text', larkAppId).catch(() => undefined);
+      if (announceFreshTopicSession) {
+        const id = (pendingTopicContinuity.previousSessionId ?? '').substring(0, 8);
+        const continuityLocale = localeForBot(larkAppId);
+        const notice = pendingTopicContinuity.mode === 'fresh-requested'
+          ? tr('daemon.topic_continuity.fresh_requested', { id }, continuityLocale)
+          : tr('daemon.topic_continuity.fresh_after_close', { id }, continuityLocale);
+        void sessionReply(anchor, notice, 'text', larkAppId).catch(() => undefined);
+      }
     }
     const now = Date.now();
     // Bot-started handoff sessions have no human owner; keeping the bot as

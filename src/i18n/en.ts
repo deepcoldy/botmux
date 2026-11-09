@@ -1912,7 +1912,6 @@ export const messages: Record<string, string> = {
   'daemon.enriched_mentions_label': '@mentions in this message:',
   'daemon.topic_continuity.resumed': '↩️ The previous session in this topic ({id}) was closed; this message continues it, with its earlier context.',
   'daemon.topic_continuity.fresh_after_close': '⚠️ The previous session in this topic ({id}) is closed and could not be resumed; a new session handles this message without the earlier context.',
-  'daemon.topic_continuity.fresh_after_user_close': '🆕 The previous session in this topic ({id}) was closed by hand, so a new session handles this message; send /resume first to continue the old one.',
   'daemon.topic_continuity.fresh_requested': '🆕 Started a new session as the dispatch asked (@session fresh); the previous session in this topic ({id}) is not continued.',
   'daemon.topic_continuity.fresh_close_refused': '⚠️ @session fresh asked to close the current session, but the close was refused ({error}, remote task {taskId}); the current session stays and handles this message.',
   'daemon.topic_continuity.fresh_close_residual': '⚠️ @session fresh closed the current session, but something was left behind and needs a manual check: {detail}.',

@@ -136,7 +136,7 @@ function closedRow(extra: Record<string, unknown> = {}): any {
   return {
     sessionId: 'sess-old-1', chatId: CHAT, rootMessageId: ROOT, title: 'old work', status: 'closed',
     createdAt: '2026-11-04T07:08:02.000Z', closedAt: '2026-11-04T18:20:27.000Z', chatType: 'group',
-    larkAppId: APP, ownerOpenId: OWNER, scope: 'thread', cliId: 'claude-code', ...extra,
+    larkAppId: APP, ownerOpenId: OWNER, scope: 'thread', cliId: 'claude-code', cliSessionId: 'cli-old-1', ...extra,
   };
 }
 
@@ -238,6 +238,31 @@ describe('a message in a topic whose session was closed (real route)', () => {
     expect(mocks.resumeSession).not.toHaveBeenCalled();
     expect(mocks.createSession).toHaveBeenCalledTimes(1);
     expect(mocks.createdSessions[0].continuity).toMatchObject({ mode: 'fresh-after-close', previousSessionId: 'sess-old-1', reason: 'user_closed' });
+    // A plain new session, as any @ in the topic gets: no extra message.
+    expect(replies().some(text => text.includes('sess-old'))).toBe(false);
+  });
+
+  it('a closed command shell newer than the real conversation is skipped', async () => {
+    mocks.closedRows.push(
+      closedRow({ sessionId: 'sess-real', closedAt: '2026-11-04T10:00:00.000Z' }),
+      closedRow({ sessionId: 'sess-help-shell', cliSessionId: undefined, closedAt: '2026-11-05T09:00:00.000Z' }),
+    );
+    resumeRegisters();
+    const { data, ctx } = event('继续上次的活', 'human');
+    await handleThreadReply(data, ctx);
+    expect(mocks.resumeSession).toHaveBeenCalledTimes(1);
+    expect(mocks.resumeSession.mock.calls[0]![0]).toBe('sess-real');
+  });
+
+  it('a failed continuity notice does not drop the message: the resumed session still gets it', async () => {
+    mocks.closedRows.push(closedRow());
+    resumeRegisters();
+    mocks.replyMessage.mockRejectedValueOnce(new Error('lark 502'));
+    const { data, ctx } = event('请补跑 ROW-015', 'bot');
+    await expect(handleThreadReply(data, ctx)).resolves.toBeUndefined();
+    expect(mocks.resumeSession).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(replies().some(text => text.includes('没有送达'))).toBe(false);
   });
 
   it('@session fresh from a peer bot starts fresh and never reaches the model', async () => {
@@ -294,6 +319,33 @@ describe('a message in a topic whose session was closed (real route)', () => {
     await handleThreadReply(data, ctx);
     expect(mocks.createSession).not.toHaveBeenCalled();
     expect(replies().some(text => text.includes('remote_cancel_unproven') && text.includes('task-9'))).toBe(true);
+  });
+
+  it('durable primary mode keeps the plain behaviour: no local resume, no local close', async () => {
+    mocks.closedRows.push(closedRow());
+    resumeRegisters();
+    process.env.BOTMUX_COORDINATION_MODE = 'primary';
+    try {
+      const closedTopic = event('请补跑', 'bot');
+      await handleThreadReply(closedTopic.data, closedTopic.ctx);
+      expect(mocks.resumeSession).not.toHaveBeenCalled();
+      expect(mocks.createSession).toHaveBeenCalledTimes(1);
+      expect(mocks.createdSessions[0].continuity).toBeUndefined();
+      expect(replies().some(text => text.includes('sess-old'))).toBe(false);
+
+      vi.clearAllMocks();
+      activeSessions.clear();
+      resumeRegisters();
+      await mocks.resumeSession('sess-live');
+      mocks.resumeSession.mockClear();
+      const liveTopic = event('@session fresh\n换一件事', 'bot');
+      await handleThreadReply(liveTopic.data, liveTopic.ctx);
+      expect(mocks.closeSession).not.toHaveBeenCalled();
+      expect(mocks.createSession).not.toHaveBeenCalled();
+      expect(activeSessions.get(sessionKey(ROOT, APP))?.session.sessionId).toBe('sess-live');
+    } finally {
+      delete process.env.BOTMUX_COORDINATION_MODE;
+    }
   });
 
   it('a topic with no earlier session is untouched: plain new session, no continuity', async () => {

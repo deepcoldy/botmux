@@ -75,7 +75,12 @@ export function topicResumeBlockReason(session: Session): string | undefined {
   return undefined;
 }
 
-/** The most recently closed thread-scope session of `larkAppId` in this chat + topic. */
+/**
+ * The most recently closed thread-scope session of `larkAppId` in this chat +
+ * topic that has conversation history. A shell a command pre-created (`/help`
+ * and the like) is a closed row too; like `/resume` it must not shadow the real
+ * conversation.
+ */
 export function findLatestClosedTopicSession(
   sessions: readonly Session[],
   target: { larkAppId: string; chatId: string; anchor: string },
@@ -86,6 +91,7 @@ export function findLatestClosedTopicSession(
     if (s.status !== 'closed' || s.scope === 'chat') continue;
     if ((s.larkAppId ?? '') !== target.larkAppId || s.chatId !== target.chatId) continue;
     if (storedSessionAnchorId(s) !== target.anchor) continue;
+    if (!(s.cliSessionId || s.lastCliInput || s.lastUserPrompt)) continue;
     const at = s.closedAt ? Date.parse(s.closedAt) : NaN;
     const rank = Number.isFinite(at) ? at : 0;
     if (!best || rank > bestAt) { best = s; bestAt = rank; }

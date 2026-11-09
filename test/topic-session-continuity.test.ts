@@ -10,7 +10,7 @@ import { normalizeSessionRow } from '../src/services/session-observe.js';
 
 const row = (extra: Record<string, unknown> = {}): any => ({
   sessionId: 's1', chatId: 'oc_c', rootMessageId: 'om_r', status: 'closed', scope: 'thread',
-  larkAppId: 'app', closedAt: '2026-11-04T18:20:27.000Z', createdAt: '2026-11-04T07:00:00.000Z', ...extra,
+  larkAppId: 'app', cliSessionId: 'cli-s1', closedAt: '2026-11-04T18:20:27.000Z', createdAt: '2026-11-04T07:00:00.000Z', ...extra,
 });
 
 describe('parseBotSessionDirective', () => {
@@ -70,6 +70,15 @@ describe('findLatestClosedTopicSession', () => {
   });
   it('none → undefined', () => {
     expect(findLatestClosedTopicSession([], target)).toBeUndefined();
+  });
+  it('a closed shell with no conversation history (e.g. a `/help` row) does not shadow the real conversation', () => {
+    const found = findLatestClosedTopicSession([
+      row({ sessionId: 'real', closedAt: '2026-11-04T10:00:00.000Z' }),
+      row({ sessionId: 'shell', cliSessionId: undefined, closedAt: '2026-11-05T09:00:00.000Z' }),
+    ], target);
+    expect(found?.sessionId).toBe('real');
+    expect(findLatestClosedTopicSession([row({ cliSessionId: undefined })], target)).toBeUndefined();
+    expect(findLatestClosedTopicSession([row({ cliSessionId: undefined, lastUserPrompt: 'x' })], target)?.sessionId).toBe('s1');
   });
 });
 

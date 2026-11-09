@@ -39,7 +39,7 @@ afterAll(() => rmSync(env.root, { recursive: true, force: true }));
 async function closeViaRoute(body: Record<string, unknown>): Promise<{ root: string; sessionId: string }> {
   const root = `om_close_route_root_${++n}`;
   const session = sessionStore.createSession(CHAT, root, 'work', 'group');
-  Object.assign(session, { larkAppId: APP, scope: 'thread', cliId: 'claude-code' });
+  Object.assign(session, { larkAppId: APP, scope: 'thread', cliId: 'claude-code', cliSessionId: 'cli-work' });
   sessionStore.updateSession(session);
   handle ??= await startIpcServer({ port: 0, host: '127.0.0.1' });
   const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/close`, {
