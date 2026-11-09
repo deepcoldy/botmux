@@ -303,13 +303,14 @@ describe('contentful historical Codex App settlement delivery', () => {
     expect(h.ds.session.codexAppDispatchLedger).toHaveLength(1);
     expect(h.sent).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex_app_dispatch_persisted', ok: true }));
   });
-  it.each(['suspend', 'worker-replacement'])('does not retry or settle after %s while transport is pending and then fails', async intervention => {
+  it.each(['suspend', 'restart', 'worker-replacement'])('does not retry or settle after %s while transport is pending and then fails', async intervention => {
     const network = deferred<string>(); const h = await fixture(() => network.promise);
     const pending = h.run(); await vi.waitFor(() => expect(h.sessionReply).toHaveBeenCalledTimes(1));
     if (intervention === 'suspend') h.controller.beginControl('suspend', 'operator-suspend');
+    else if (intervention === 'restart') h.controller.beginControl('restart', 'operator-restart');
     else { h.controller.bindWorker(3); h.ds.worker = { send: vi.fn() } as any; }
-    network.reject(new Error('network-failed-after-intervention')); await pending;
-    await vi.advanceTimersByTimeAsync(60_000);
+    network.reject(new Error('network-failed-after-intervention'));
+    await vi.advanceTimersByTimeAsync(60_000); await pending;
     expect(h.sessionReply).toHaveBeenCalledTimes(1); expect(h.ds.session.codexAppDispatchLedger).toHaveLength(2);
     expect(h.sent).toHaveBeenCalledWith(expect.objectContaining({ type: 'codex_app_dispatch_persisted', ok: false }));
   });

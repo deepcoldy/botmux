@@ -17932,6 +17932,9 @@ async function handleTrustedCodexAppMarker(
         codexAppUnprovenPromptDeferred = false;
         queueMicrotask(() => markPromptReady());
       }
+      // markPromptReady() returns early when the prompt was already ready
+      // before the reconnect, so re-drive input held by the signed barrier.
+      if (isPromptReady && hasPendingInputForFlush()) queueMicrotask(() => { void flushPending(); });
     }
     return true;
   }

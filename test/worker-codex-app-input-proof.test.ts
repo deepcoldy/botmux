@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 import { resolvePtyInputPolicy } from '../src/utils/pty-input-policy.js';
+import { codexAppSignedStateReadiness } from '../src/utils/codex-app-control.js';
+import { CodexAppReadyAuthority, CodexAppTurnLiveness, applyTrustedCodexAppStateMarker } from '../src/utils/codex-app-turn-liveness.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { workerSubmitHarness } from './helpers/worker-submit-harness.js';
 
@@ -111,4 +113,28 @@ describe('Codex App input waits for signed connection readiness', () => {
     expect(h.scope.pendingMessages).toEqual([next]);
   });
 
+  it('re-drives input held across a control reconnect once the new connection publishes signed idle', async () => {
+    const h = harness();
+    const flushPending = vi.fn(() => h.flush());
+    Object.assign(h.scope, {
+      flushPending, codexAppControlProven: true, codexAppRunnerProcessIdentity: { launcherPid: 100 },
+      codexAppTurnLiveness: new CodexAppTurnLiveness(), codexAppReadyAuthority: new CodexAppReadyAuthority(),
+      codexAppSignedStateReadiness, applyTrustedCodexAppStateMarker, codexAppCompletionAwaitingFinal: false,
+      codexAppTurnDispatchQueue: { recoveredPrefix: () => [] }, codexAppProofDeadline: { clear: vi.fn() },
+      cleanupCodexAppControlBootstrap: vi.fn(), rejectCodexAppControlMarker: vi.fn(), failCodexAppControlGeneration: vi.fn(),
+      codexAppUnprovenPromptDeferred: false, awaitingFirstPrompt: false, traexFirstPromptViewportRejects: () => false,
+      currentPostTerminalInputFence: () => null, stopStructuredStartGraceRecheck: vi.fn(),
+    });
+    h.scope.markPromptReady = loadWorkerFunction('markPromptReady', h.scope);
+    const marker = loadWorkerFunction('handleTrustedCodexAppMarker', h.scope);
+    // The authenticated socket of an idle session closed; its prompt stays ready.
+    h.scope.codexAppReadyAuthority.beginWork(); h.scope.codexAppTurnLiveness.beginReattachObservation();
+    expect(h.scope.isPromptReady).toBe(true);
+    await h.flush();
+    expect(h.takeNormal).not.toHaveBeenCalled();
+    expect(await marker('state', { busy: false, acceptingInput: true }, { generation: 'generation', seq: 2 })).toBe(true);
+    for (let i = 0; i < 5; i++) await new Promise(resolve => setImmediate(resolve));
+    expect(flushPending).toHaveBeenCalled();
+    expect(h.takeNormal).toHaveBeenCalledOnce();
+  });
 });

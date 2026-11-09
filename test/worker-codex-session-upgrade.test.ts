@@ -7,6 +7,7 @@ import ts from 'typescript';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CodexExecutable, CodexProcess } from '../src/services/codex-session-upgrade.js';
 import { classifyMergedRestart, decideRestartReceipt, decideUpgradeLaunchConvergence, restartLaunchSettings } from '../src/core/restart-followup-policy.js';
+import { isCodexAppCliId } from '../src/adapters/cli/types.js';
 
 const source = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
 const parsed = ts.createSourceFile('worker.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -45,6 +46,7 @@ function harness() {
   const delivered: unknown[] = [];
   const state: Record<string, any> = {
     config: { autoUpgradeCodexSessions: true },
+    isCodexAppCliId,
     lastInitConfig: {
       cliId: 'codex', cliSessionId: threadId, sessionId: 'botmux-session',
       workingDir: '/project', prompt: 'previous already executed prompt',

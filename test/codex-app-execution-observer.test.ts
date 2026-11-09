@@ -80,7 +80,8 @@ describe('historical execution observation across occupied bare runtime', () => 
     expect(h.store.execution(h.ref, h.middle.executionId)).toMatchObject({ phase: 'submitting', runtime: h.current });
     expect(h.controller.currentRuntime()).toEqual(h.current); expect(h.scope.currentBinding()).toBe(h.binding);
   });
-  it.each(['prompt_ready', 'screen_update', 'managed_turn_origin', 'managed_turn_origin_revoked', 'codex_app_dispatch_transition'])(
+  it.each(['prompt_ready', 'screen_update', 'managed_turn_origin', 'managed_turn_origin_revoked', 'codex_app_dispatch_transition',
+    'final_output_offer', 'turn_interrupt_result', 'codex_app_dispatch_persisted', 'restart_result'])(
     'does not turn observer authority into %s authority', async type => {
       const h = fixture(); await h.enrich(); const before = h.store.read(h.ref)!.revision;
       expect(h.controller.ingest(h.message(type), h.worker).kind).toBe('reject');
