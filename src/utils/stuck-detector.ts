@@ -114,6 +114,10 @@ const STARTUP_FOOTERS = [
   ['enter confirm', 'esc go back'], // 0.147, traex 0.213
   ['enter confirm', 'esc skip'],    // codex 0.162+
 ] as const;
+const SESSION_LOCK_FOOTERS = [
+  ['r retry', 'esc/ctrl+c/q exit', 'ctrl+o transcript'],                // traex 0.213
+  ['r retry', '←/esc dashboard', 'ctrl+c/q exit', 'ctrl+o transcript'], // traex 0.214
+] as const;
 
 /** "1 hook needs review before it can run." / "2 hooks need review before they can run." */
 const PENDING_REVIEW_STATE = /\b\d+\s+hooks?\s+needs?\s+review before (?:it|they) can run\b/i;
@@ -204,7 +208,7 @@ function isSessionLockScreen(snapshot: string): boolean {
     && /^(?:🔒\uFE0F?\s+)?This conversation is open in another app(?:\s+R to Retry)?$/.test(tail[0]!)
     && /^Owner:\s+PID\s+[1-9]\d*$/.test(tail[1]!)
     && tail[2] === 'Close it there and press R to continue here.'
-    && /^r retry\s*\|\s*esc\/ctrl\+c\/q exit\s*\|\s*ctrl\+o transcript$/.test(tail[3]!);
+    && footerIs(tail[3]!, SESSION_LOCK_FOOTERS);
 }
 
 /** Which known blocking page (if any) the active screen shows. Pure; the

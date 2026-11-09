@@ -10,6 +10,8 @@
  *  - traecli 0.213.1 (traex / CoCo): the same flow in TRAE's wording, the
  *    legacy-data migration picker, the 0.213.1 sign-in page, folder trust and
  *    the plain composer.
+ *  - traecli 0.213.1 / 0.214.1: the session writer-lock page (0.214.1 added a
+ *    "←/esc dashboard" hint to its footer) and the composer after R.
  *
  * Every positive screen here was missed by the base classifier (footers,
  * "<Event> hooks" titles and the singular state line of these builds), so a
@@ -57,6 +59,7 @@ const PAGES: Record<string, ReturnType<typeof classifyStuckPage>> = {
   'traex-0.213.1-migration-menu.txt': 'cli migration menu',
   'traex-0.213.1-migration-menu-after-paste-enter.txt': 'cli migration menu',
   'traex-0.213.1-session-lock.txt': 'session lock',
+  'traex-0.214.1-session-lock.txt': 'session lock',
 };
 
 /** Screens one key past a page, the composer, and other dialogs: no card,
@@ -75,6 +78,7 @@ const NOT_PAGES = [
   'traex-0.213.1-detail-l2-after-t.txt',
   'traex-0.213.1-folder-trust.txt',
   'traex-0.213.1-sign-in.txt',
+  'traex-0.214.1-composer-after-lock-retry.txt',
   ...CREDENTIAL_PAGES(),
 ];
 
@@ -139,6 +143,15 @@ describe('session writer-lock page', () => {
   ])('does not offer keys for quoted, stale or incomplete lock text %#', change => {
     expect(classifyStuckPage(change(locked()))).toBeUndefined();
     expect(shouldHoldInputForStuckPage(change(locked()))).toBe(false);
+  });
+
+  it.each(['traex-0.213.1-session-lock.txt', 'traex-0.214.1-session-lock.txt'])('%s: a footer with a hint added or dropped is not the lock page', name => {
+    const screen = fixture(name);
+    const footer = screen.trimEnd().split('\n').at(-1)!;
+    for (const changed of [`${footer}  |  enter submit`, footer.replace(/\s*\|\s*ctrl\+o transcript$/, '')]) {
+      expect(changed).not.toBe(footer);
+      expect(classifyStuckPage(screen.replace(footer, changed))).toBeUndefined();
+    }
   });
 });
 
