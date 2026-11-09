@@ -171,9 +171,9 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   const en = presentation.locale === 'en';
   const terminal = replyCardIsTerminal(record);
   const pendingAsks = (record.asks ?? []).filter(entry => !entry.result && !entry.ask.settled);
-  const simpleFinal = !!record.finalCard && record.phase === 'completed' && !pendingAsks.length;
-  const compactRuntime = !terminal && !record.finalCard && !pendingAsks.length
-    && (record.nativeCot === true || (!record.progress.length && !record.tools.length && !record.activity?.length));
+  // Native thinking carries the runtime status, so only its opt-in turns drop the in-card chrome.
+  const simpleFinal = record.nativeCot === true && !!record.finalCard && record.phase === 'completed' && !pendingAsks.length;
+  const compactRuntime = record.nativeCot === true && !terminal && !record.finalCard && !pendingAsks.length;
   const phaseLabels = en
     ? { queued: 'Queued', working: 'Working', waiting: 'Waiting for a response', stopping: 'Stopping', completed: 'Completed', failed: 'Failed', cancelled: 'Stopped', ambiguous: 'Interrupted', superseded: 'Continued in a later message' }
       : { queued: '等待执行', working: '处理中', waiting: '等待响应', stopping: '正在停止', completed: '已完成', failed: '执行失败', cancelled: '已停止', ambiguous: '执行状态待确认', superseded: '已由后续消息接续' };

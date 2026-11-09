@@ -1104,7 +1104,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const replyKey = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId };
     await vi.waitFor(() => {
       expect(replyStore.read(replyKey)).toMatchObject({ phase: 'completed', finalDelivered: true });
-      expect(updateMessageMock.mock.calls.some(call => call[2]?.includes(expectedAnswer) && call[2]?.includes('oncall_group_create'))).toBe(true);
+      expect(updateMessageMock.mock.calls.some(call => call[2]?.includes(expectedAnswer) && call[2]?.includes('已完成') && call[2]?.includes('oncall_group_create'))).toBe(true);
       expect(new OncallGroupStore(config.session.dataDir).findSource('app_test', 'om_managed_reply'))
         .toMatchObject({ chatId: 'oc_chat', questionId: ds.currentTurnId, answer: expectedAnswer });
     }, { timeout: 5000 });

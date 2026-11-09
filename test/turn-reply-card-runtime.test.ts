@@ -597,13 +597,13 @@ describe('reply-card runtime eligibility and recovery', () => {
     expect(updateMessage).not.toHaveBeenCalled();
   });
 
-  it('shows the selected runtime on substantive unified progress even with usage off', async () => {
+  it('shows the selected runtime on unified cards even with usage off', async () => {
     const ds = session();
     ds.session.cliId = 'codex';
     ds.session.model = 'gpt-5.6-sol';
     ds.activeReasoningEffort = 'high';
     const send = vi.fn(async (_content: string) => 'om_reply');
-    await updateTurnReplyCard(ds, 'om_mode', { kind: 'progress', text: 'Visible progress' }, send);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
     const card = JSON.parse(send.mock.calls[0]![0]);
     const line = card.body.elements.find((e: any) => e.element_id === 'botmux_turn_usage');
     expect(line?.content).toBe('**gpt-5.6-sol** high');

@@ -123,7 +123,7 @@ describe('one reply card per turn', () => {
     if (lost) await expect(final).rejects.toThrow('ACK lost'); else await final;
     await store.update(key, { kind: 'display_retired', notice: 'Capture unavailable' }, io);
     expect(store.read(key)).toMatchObject({ phase: 'completed', finalDelivered: true });
-    expect(JSON.parse([...cards.values()][0]).body.elements.some((e: any) => e.element_id === 'botmux_turn_status')).toBe(false);
+    expect(JSON.parse([...cards.values()][0]).body.elements.find((e: any) => e.element_id === 'botmux_turn_status')?.content).toContain('已完成');
     expect(io.send).toHaveBeenCalledTimes(1);
   });
 
@@ -632,7 +632,7 @@ describe('one reply card per turn', () => {
     await expect(store.update(key, { kind: 'terminal', phase: 'completed', durationMs: 1400 }, io))
       .rejects.toThrow('temporary terminal error');
     expect(store.read(key)?.phase).toBe('completed');
-    expect(cards.get(started.messageId!)!).toBe(started.card);
+    expect(cards.get(started.messageId!)!).toContain('处理中');
 
     const restarted = new TurnReplyCardStore(dir);
     await restarted.update(key, { kind: 'terminal', phase: 'failed', durationMs: 9000 }, io);
@@ -683,8 +683,7 @@ describe('one reply card per turn', () => {
     await store.update(key, finalEvent(), io);
     expect(io.send).toHaveBeenCalledTimes(1);
     expect([...cards.values()][0]).toContain('完整答复');
-    expect(store.read(key)?.durationMs).toBe(2000);
-    expect(JSON.parse([...cards.values()][0]).body.elements.some((e: any) => e.element_id === 'botmux_turn_status')).toBe(false);
+    expect([...cards.values()][0]).toContain('2.0s');
   });
 
   it.each([false, true])('replaces a progress attachment with the actual late final (long=%s)', async long => {
@@ -1096,7 +1095,7 @@ describe('public process and fallback compatibility', () => {
     // The shared-context purpose extends the invisible footer signature only.
     const visibleElements = JSON.parse(JSON.stringify(card.body.elements).replace(/\u2063/g, ''));
     for (const element of canonical.body.elements) expect(visibleElements).toContainEqual(element);
-    expect(card.body.elements.some((element: any) => element.element_id === 'botmux_turn_status')).toBe(false);
+    expect(card.body.elements[0].content).toBe('✅ **已完成 · 1.2s**');
     const panel = card.body.elements.find((element: any) => element.tag === 'collapsible_panel');
     expect(panel.header.title.content).toBe('📋 本轮记录');
     expect(panel.elements[0].content).toBe('💬 检查完成');
