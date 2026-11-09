@@ -10686,12 +10686,6 @@ export async function closeSession(
   // callers keep the existing native lifecycle. Never backfill old closed rows.
   if (opts?.explicitClose) {
     const row = sessionStore.getOwnedSession(sessionId);
-    // A human chose to end this conversation: a later message in the topic must
-    // start fresh, not silently bring it back (topic-session-continuity.ts).
-    if (row && wasOpen && row.status === 'closed' && !row.userClosedAt) {
-      row.userClosedAt = new Date().toISOString();
-      sessionStore.updateSession(row);
-    }
     if (row && (wasOpen || row.codexCleanupArchive)) {
       const archive = async () => {
         const error = await archiveCodexForCleanup(row,

@@ -24,7 +24,6 @@ botmux 子命令也按名单放行（dispatch/send/status/manager/history/quoted
 多行正文可放进单引号，或在命令末尾用带引号定界符的 heredoc（<<'EOF'）；文件工具（Read/Write/Edit）只能用于负责人自己记忆目录 memory/ 下的 .md 文件，
 读本地文件的参数（--content-file/--file/--brief-file/--diff 等）、fleet 与配置类子命令（setup/upgrade/restart/delete/mcp 等）、
 以及 botmux bots invite 这类变更群成员的操作都会被拦——拉人进群请真人或在 dashboard 操作。
-后续活用 botmux dispatch --into 派回原话题：话题会话已关闭也会自动接上原会话（人手动 /close 的除外）；要另开新会话加 --session-mode fresh。
 由 botmux dispatch 派出的会话和 workflow 节点会话（执行者）不受限；私聊不生效；仅对 claude-code 生效，其他 CLI 忽略该开关。
 守卫在文件沙箱/读隔离下也生效（守卫插件目录在沙箱内只读可见）；源码（非编译）运行时，若安装目录被删/移动，
 钩子命令路径失效，工具调用会被持续拦截（fail-closed），重开话题即可恢复。
