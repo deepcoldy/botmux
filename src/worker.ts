@@ -20657,10 +20657,14 @@ let traexAutoModelAdmissionRetry: ReturnType<typeof setTimeout> | undefined;
  * flush guards again; it never replays a dequeued or ambiguous submission. */
 function retryTraexAutoModelAdmission(): void {
   if (traexAutoModelAdmissionRetry) return;
+  // Scale with BOTMUX_TIME_SCALE like the rest of the worker's test timers: a
+  // raw 200ms wait is an eternity on the compressed (0.01) test timeline and,
+  // under Bun's event loop, can miss the preferred-relaunch ready edge that is
+  // measured in scaled time. Production (scale 1) keeps the original 200ms.
   traexAutoModelAdmissionRetry = setTimeout(() => {
     traexAutoModelAdmissionRetry = undefined;
     if (traexAutoModelRuntimeEligible() && backend && pendingMessages.length > 0) void flushPending();
-  }, 200);
+  }, scaleMs(200));
   traexAutoModelAdmissionRetry.unref();
 }
 
