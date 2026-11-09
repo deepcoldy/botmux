@@ -751,7 +751,7 @@ describe('target daemon consumes signed message authority', () => {
         // per-target dispatch states. These tests run fresh (no parked run).
         getRuntimeTask: () => undefined,
         markDeferredTargetDispatching: () => false,
-        markDeferredTargetDispatched: () => false,
+        markDeferredTargetAccepted: () => false,
         parkDeferredRun: () => false,
       },
       executeScheduledTaskWithPrecondition: async (_task: any, _app: any, run: () => Promise<void>) => {

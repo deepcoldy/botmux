@@ -131,4 +131,40 @@ describe('independent PR2 r6 acceptance ordering', () => {
     // Real runTargets must skip A's already accepted exact turn on this retry.
     expect(sent.filter(chat => chat === 'oc_A')).toHaveLength(1);
   });
+
+  it('waits for actual TRAE session acceptance when the bot default is another CLI', async () => {
+    const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
+    const begin = daemon.indexOf('      const runTargets = async (additionalPrompt?: string)');
+    const end = daemon.indexOf('      let outcome: ScheduledTaskPreconditionOutcome;', begin);
+    const js = ts.transpileModule(daemon.slice(begin, end), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+    const factory = new Function('scope', `with (scope) { ${js}; return runTargets; }`);
+    // A retained session can freeze /cli traex while its bot defaults to
+    // claude-code. executeScheduledTask's continuation path honors that
+    // session runtime (cliLaunchSnapshot -> session.cliId -> bot config).
+    const sessions = new Map(['oc_A', 'oc_B'].map(chatId => [chatId, {
+      chatId, session: { cliId: 'traex', cliLaunchSnapshot: { cliId: 'traex' } },
+    }]));
+    const sent: string[] = [];
+    const run = factory({ task: current(), executionContext: context, parked: current().deferredRun,
+      scheduler, scheduleStore, effectiveAppId: APP, cfg: { cliId: 'claude-code' },
+      randomUUID: () => 'unused', buildUntilDoneRunPrompt: () => undefined,
+      scheduleTimeZone: () => 'Asia/Shanghai', executeScheduledTaskForTargets,
+      ScheduleTargetExecutionError, activeSessions: sessions, refreshCliVersion: async () => {},
+      precondition: { precondition: 'passed' }, targetResults: undefined,
+      withBotTurnAdmission: (_app: string, action: () => unknown) => action(),
+      executeScheduledTask: async (target: any, active: typeof sessions, _refresh: any, _prompt: any, runtime: any) => {
+        expect(active.get(target.chatId)!.session.cliId).toBe('traex');
+        if (!runtime.onBeforeDispatch(runtime.turnId)) return 'deferred';
+        sent.push(target.chatId);
+        // IPC/fork ownership only; actual session worker still waits in its
+        // TRAE start gate. No queue/native acceptance has been reported.
+        return 'dispatched';
+      },
+    }) as () => Promise<'dispatched' | 'deferred'>;
+    const outcome = await run();
+    expect(sent).toHaveLength(2);
+    expect(outcome).toBe('deferred');
+    expect(current().deferredRun!.acceptedTargets).toBeUndefined();
+    expect(current().deferredRun!.targets).toEqual({ oc_A: 'held', oc_B: 'held' });
+  });
 });

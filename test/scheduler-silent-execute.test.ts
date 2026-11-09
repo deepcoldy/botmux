@@ -2115,3 +2115,44 @@ describe('independent PR2 r4 staged payload', () => {
     expect(forkedPayload().trustedCaller).toEqual({requestUserOpenId:'ou_creator',requestUserUnionId:'on_creator',requestLarkAppId:APP,senderType:'user',source:'schedule_creator',taskId:current.id});
   });
 });
+
+describe('independent PR2 r7 actual session runtime classification', () => {
+  it('does not block a non-TRAE retained session under a TRAE-default bot', async () => {
+    const isolated = mkdtempSync(join(tmpdir(), 'pr2-reverse-domain-'));
+    const targetHome = join(isolated, 'target-home');
+    const release = join(isolated, 'release');
+    mkdirSync(join(targetHome, 'skills'), { recursive: true });
+    mkdirSync(release);
+    writeFileSync(join(targetHome, 'skills', '.botmux-traex-runtime.json'), '{broken');
+    writeFileSync(join(release, 'traex'), 'fake-executable');
+    const prior = { cliId:BOT.config.cliId, cliPathOverride:BOT.config.cliPathOverride, env:(BOT.config as any).env };
+    try {
+      BOT.config.cliId = 'traex';
+      (BOT.config as any).cliPathOverride = join(release, 'traex');
+      (BOT.config as any).env = {TRAE_HOME:targetHome};
+      // The retained session froze a non-TRAE CLI; the bot default must not
+      // pull it into the TRAE shared-cache precheck.
+      const session: Session = {
+        sessionId: 'sess-nontraex', chatId: CHAT, rootMessageId: ROOT, title: 'x',
+        status: 'active', createdAt: '2026-01-01T00:00:00.000Z', cliId: 'claude-code',
+      };
+      store.set(session.sessionId, session);
+      const existing: DaemonSession = {
+        session, worker: null, workerPort: null, workerToken: null,
+        larkAppId: APP, chatId: CHAT, chatType: 'group', scope: 'thread',
+        spawnedAt: 0, cliVersion: 'test-cli-v1', lastMessageAt: 0,
+        hasHistory: true, workingDir: '/tmp',
+      };
+      const active = new Map<string, DaemonSession>([[sessionKey(ROOT, APP), existing]]);
+      const outcome = await executeScheduledTask(
+        baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+        active, refreshCliVersion,
+      );
+      expect(outcome).toBe('dispatched');
+      expect(forkWorkerMock).toHaveBeenCalledOnce();
+    } finally {
+      Object.assign(BOT.config, prior);
+      rmSync(isolated, { recursive: true, force: true });
+    }
+  });
+});

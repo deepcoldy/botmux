@@ -4613,7 +4613,7 @@ export async function executeScheduledTask(
   // immediately before exec; this read-only pre-check only parks the run early
   // with its exact turn identity intact so the retry can deliver it exactly
   // once. `unknown` proceeds — the worker holds the input itself.
-  const runtimeBlocker = scheduledTraexRuntimeBlocker(bot);
+  const runtimeBlocker = scheduledTraexRuntimeBlocker(bot, task, larkAppId, activeSessions);
   if (runtimeBlocker) {
     logger.info(`[scheduler] Task "${task.name}" (${task.id}) deferred: ${runtimeBlocker}`);
     return 'deferred';
@@ -5337,6 +5337,27 @@ export async function executeScheduledTask(
 }
 
 /**
+ * The CLI the target session will actually run with. A retained session can
+ * freeze a CLI different from the bot's current default (`/cli` selection or a
+ * bot config change), and the scheduled continuation honors the session.
+ */
+function scheduledTargetCliId(
+  task: ScheduledTask,
+  larkAppId: string,
+  botCliId: string,
+  activeSessions: Map<string, DaemonSession>,
+): string {
+  const anchors = [task.rootMessageId, `schedule-task:${task.id}`, task.chatId]
+    .filter((value): value is string => !!value);
+  for (const anchor of anchors) {
+    const ds = activeSessions.get(sessionKey(anchor, larkAppId)) ?? activeSessions.get(anchor);
+    const cliId = ds?.session.cliLaunchSnapshot?.cliId ?? ds?.session?.cliId;
+    if (cliId) return cliId;
+  }
+  return botCliId;
+}
+
+/**
  * Daemon-side cheap pre-check for the managed TRAE runtime handoff.
  *
  * The worker gate immediately before exec remains the authority; this only
@@ -5352,8 +5373,17 @@ function scheduledTraexRuntimeBlocker(
       'cliId' | 'cliPathOverride' | 'env' | 'envUnset' | 'envPolicy'
     >;
   },
+  task: ScheduledTask,
+  larkAppId: string,
+  activeSessions: Map<string, DaemonSession>,
 ): string | undefined {
-  if (bot.config.cliId !== 'traex') return undefined;
+  // Classify by the ACTUAL target session runtime, not the bot default: a
+  // retained TRAE session under a Claude-default bot still has a TRAE gate,
+  // and a non-TRAE session under a TRAE-default bot must not be blocked by an
+  // unrelated shared cache domain.
+  if (scheduledTargetCliId(task, larkAppId, bot.config.cliId, activeSessions) !== 'traex') {
+    return undefined;
+  }
   try {
     const executablePath = resolveCommandReal(bot.config.cliPathOverride?.trim() || 'traex');
     // Pre-check the SAME cache domain the CLI child will write. Using the

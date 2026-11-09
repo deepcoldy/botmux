@@ -35871,12 +35871,26 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                 ).then(dispatched => {
                   if (dispatched !== 'deferred') {
                     const targetTurnId = turnIds.get(targetTask.chatId!)!;
-                    // Fork return is NOT an acceptance fact. For managed TRAE
-                    // the input is only queued in the worker, which may still be
-                    // waiting in its start gate: keep the target held and the
-                    // run parked until the worker reports the exact turn
-                    // accepted. Other CLIs keep the historical fork acceptance.
-                    if (cfg.cliId === 'traex') {
+                    // Fork return is NOT an acceptance fact. Classify by the
+                    // ACTUAL target session runtime, not the bot default: a
+                    // retained session can freeze TRAE while the bot defaults to
+                    // another CLI. For managed TRAE the input is only queued in
+                    // the worker, which may still be waiting in its start gate:
+                    // keep the target held and the run parked until the worker
+                    // reports the exact turn accepted. Other CLIs keep the
+                    // historical fork acceptance.
+                    const targetCliId = (() => {
+                      const anchors = [targetTask.rootMessageId, `schedule-task:${task.id}`, targetTask.chatId]
+                        .filter((value): value is string => !!value);
+                      for (const anchor of anchors) {
+                        const ds = activeSessions.get(`${anchor}::${effectiveAppId}`)
+                          ?? activeSessions.get(anchor);
+                        const cliId = ds?.session?.cliLaunchSnapshot?.cliId ?? ds?.session?.cliId;
+                        if (cliId) return cliId;
+                      }
+                      return cfg.cliId;
+                    })();
+                    if (targetCliId === 'traex') {
                       scheduler.markDeferredTargetHeld(
                         task.id, executionContext.runId, targetTask.chatId!, targetTurnId, effectiveAppId,
                       );
