@@ -361,6 +361,8 @@ export function buildBotmuxSystemPromptText(opts: {
   /** transcript-only: solo chat (owner + this bot). The identity block keeps
    *  name/open_id but drops routing_rules — there is no other bot to route to. */
   solo?: boolean;
+  /** Lead-only chat manager: append the lead-only role block. */
+  leadOnly?: boolean;
   /** The adapter building this prompt. Required (not optional) so every
    *  producer states it: CLI-specific lines key off it, and a producer that
    *  left it out would silently lose them. Today only `claude-code` adds one
@@ -368,7 +370,7 @@ export function buildBotmuxSystemPromptText(opts: {
    *  same text as before the field existed. */
   cliId: CliId | undefined;
 }): string {
-  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth, larkToolAppId, replyDelivery, solo, cliId } = opts;
+  const { locale, botName, botOpenId, builtinSkillBlock, noTransport, triggerUserAuth, larkToolAppId, replyDelivery, solo, leadOnly, cliId } = opts;
   const transcript = !noTransport && replyDelivery === 'transcript';
   const unknown = t('ai.identity.unknown', undefined, locale);
   const workflowHint = workflowDiscoveryHint(locale);
@@ -485,6 +487,7 @@ export function buildBotmuxSystemPromptText(opts: {
     '</botmux_routing>',
     ...identityBlock,
     ...(credentialBoundaryBlock ? ['', credentialBoundaryBlock] : []),
+    ...(leadOnly ? ['', '<lead_only_manager>', escapeXmlTagLikeTokens(t('ai.lead_only.rules', undefined, locale)), '</lead_only_manager>'] : []),
     ...(builtinSkillBlock ? ['', builtinSkillBlock] : []),
   ].join('\n');
 }

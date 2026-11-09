@@ -1,3 +1,4 @@
+import { isLeadOnlySession } from './lead-only.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
 import { sameWorker, sameRuntime } from '../services/session-contract.js';
 import { sessionContractPrimary } from './session-contract-primary.js';
@@ -17054,6 +17055,10 @@ function forkWorkerPrepared(
       return ttl ? { promptCacheTtl: ttl } : {};
     })(),
     solo: ds.soloSession === true,
+    // Lead-only chat manager: evaluated whenever a worker process is forked (new/reopened topic, or a
+    // dead worker process re-forked). /restart, dashboard restart and in-worker CLI respawn reuse
+    // lastInitConfig in place and do NOT re-read it (documented in the chat-manager skill).
+    ...(isLeadOnlySession(ds.larkAppId, ds.chatId, ds.chatType, ds.session) ? { leadOnly: true as const } : {}),
     // Workflow node session (design 2026-11-03 §4.2): the worker exports the
     // marker so its CLI system prompt and `botmux skill show` skip workflow.
     // A main-topic handoff's marker (§5.5) leaves the ordinary session as is.

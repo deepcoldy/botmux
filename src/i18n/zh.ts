@@ -1313,6 +1313,7 @@ export const messages: Record<string, string> = {
   'xpi.timeout.still_busy': '原任务仍在执行，且未选择后续处理；消息未执行。可重新发送，或 botmux send --as independent。',
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
+  'ai.lead_only.rules': '你是本群的负责人（chat manager），只转发不执行：不论任务大小一律用 botmux dispatch 派给执行 bot；需要看代码/资料也派单，让执行 bot 回报结论，不要自己读写文件或跑非 botmux 命令。长期笔记（用户定的规矩、各执行 bot 的专长）在群白板启用时先 botmux whiteboard current --create，再不带 --id 用 botmux whiteboard read/update 记到本群白板；白板由群内所有 bot 共享，不要写密钥。你只能使用 botmux 命令，且命令必须是单条普通 botmux 命令：不能用重定向（< >）、管道、; & 、$ 展开、反引号、括号或 # 注释；多行/含特殊字符的正文请整体放进单引号 \'...\'（正文里不要出现单引号），或在命令末尾用带引号定界符的 heredoc（<<\'EOF\'，结束行之后不能再有命令）。派出的会话是否起来用 botmux observe 确认。orchestrate 等技能里「简单紧耦合工作自己完成」一句在本会话不适用。',
   'ai.identity.unknown': '(未知)',
   'ai.credentials.acting_identity': '本会话已为 {tools} 启用按当前消息发起人身份注入授权。调用时沿用 botmux 注入的身份；授权可用性以工具返回结果为准。',
   'ai.credentials.git_identity': 'git 对 {host} 的鉴权已配置为使用本轮 bytedcli 身份。',
@@ -1387,6 +1388,9 @@ export const messages: Record<string, string> = {
   // <whiteboard> 结构化块（session-manager.renderWhiteboardBlock，{id} 必填）
   'ai.whiteboard.block_read': '本地项目上下文；读取：`botmux whiteboard read --id {id} --json`（拿到 content 与 updatedAt）。',
   'ai.whiteboard.block_update': '更新状态：`botmux whiteboard update --id {id} --expected-updated-at <上次 read 的 updatedAt> <内容>`。',
+  // lead-only 负责人会话的守卫拒绝 --id，这两条替换上面两条
+  'ai.whiteboard.block_read_lead_only': '本地项目上下文；读取：`botmux whiteboard read --json`（拿到 content 与 updatedAt；本会话只能读写本群白板，不要带 --id）。',
+  'ai.whiteboard.block_update_lead_only': '更新状态：`botmux whiteboard update --expected-updated-at <上次 read 的 updatedAt> <内容>`。',
   'ai.whiteboard.block_rewrite': '更新前先用 `read --json` 拿到当前内容与 updatedAt，融合新信息后整体重写为一份完整的当前状态（默认中文；代码标识/命令/错误信息可保留原文），并用 `--expected-updated-at` 回传 read 到的版本号做并发冲突检测。',
   'ai.whiteboard.block_cas': '若更新报 `whiteboard_cas_mismatch`，说明期间有其它 agent 改过白板——重新 `read --json` 拿最新内容与 updatedAt，再次融合重写。',
   'ai.whiteboard.block_tail_send': '不要直接读写本地文件；不要写密钥/隐私；用户可见结论仍必须 `botmux send`。',

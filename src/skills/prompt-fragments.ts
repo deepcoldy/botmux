@@ -337,6 +337,16 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
     gateLabel: '白板开启且绑定白板时',
   },
   {
+    key: 'ai.whiteboard.block_read_lead_only', block: 'whiteboard_block', stage: 'new', stages: ['followup'], kind: 'editable',
+    label: '白板：读取指令（lead-only 负责人会话，不带 --id）',
+    gateLabel: '白板开启、绑定白板且为 lead-only 负责人会话时（替换通用读取指令）',
+  },
+  {
+    key: 'ai.whiteboard.block_update_lead_only', block: 'whiteboard_block', stage: 'new', stages: ['followup'], kind: 'editable',
+    label: '白板：更新指令（lead-only 负责人会话，不带 --id）',
+    gateLabel: '白板开启、绑定白板且为 lead-only 负责人会话时（替换通用更新指令）',
+  },
+  {
     key: 'ai.whiteboard.block_rewrite', block: 'whiteboard_block', stage: 'new', stages: ['followup'], kind: 'editable',
     label: '白板：融合重写规则', gateLabel: '白板开启且绑定白板时',
   },

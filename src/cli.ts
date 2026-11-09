@@ -6705,8 +6705,10 @@ async function cmdChat(argv: string[]): Promise<void> {
 
 async function cmdChatManager(argv: string[]): Promise<void> {
   const action = argv[0];
-  if (argv.length !== 1 || !['set', 'clear', 'status'].includes(action)) {
-    console.error('用法: botmux manager set|clear|status');
+  const leadOnlyArg = action === 'lead-only' && argv.length === 2 && (argv[1] === 'on' || argv[1] === 'off')
+    ? argv[1] === 'on' : undefined;
+  if (leadOnlyArg === undefined && (argv.length !== 1 || !['set', 'clear', 'status'].includes(action))) {
+    console.error('用法: botmux manager set|clear|status|lead-only on|off');
     process.exitCode = 2;
     return;
   }
@@ -6718,7 +6720,8 @@ async function cmdChatManager(argv: string[]): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const response = await postSessionCliIpc(daemon.ipcPort, session.sessionId, 'chat-manager', { action });
+  const response = await postSessionCliIpc(daemon.ipcPort, session.sessionId, 'chat-manager',
+    leadOnlyArg === undefined ? { action } : { action, leadOnly: leadOnlyArg });
   const body: any = await response.json().catch(() => ({ ok: false, error: `HTTP ${response.status}` }));
   if (response.ok && body?.ok) console.log(JSON.stringify(body));
   else { console.error(JSON.stringify(body)); process.exitCode = 1; }
@@ -21322,6 +21325,11 @@ switch (command) {
   case 'hook': {
     // `botmux hook <cliId>` — hook 客户端，stdin 读 payload，stdout 写 directive
     const cliId = process.argv[3] ?? '';
+    if (cliId === 'lead-only-guard') {
+      // Hidden: PreToolUse guard of the dedicated lead-only plugin dir (never listed in help).
+      const { runLeadOnlyGuardHook } = await import('./skills/lead-only-guard.js');
+      runLeadOnlyGuardHook();
+    }
     await cmdHook(cliId);
     break;
   }

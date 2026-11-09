@@ -465,6 +465,9 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/.dashboard-port').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bin/botmux').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/claude-plugin/x').access).toBe('readOnly');
+    // Dedicated lead-only guard plugin: must be readable or a sandboxed lead-only session
+    // silently loads no PreToolUse hook and Bash stays unrestricted (same grant as the shared dir).
+    expect(accessForPath(p.rules, '/Users/u/.botmux/claude-plugin-lead-only/hooks/hooks.json').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/cursor-plugin/x').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/omp-plugin/x').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/pi-skills/x').access).toBe('readOnly');
