@@ -46,6 +46,16 @@ describe('feedback template', () => {
     expect(JSON.stringify(card)).not.toContain('https://example.com/answer');
     expect((card.body as any).elements.some((element: any) => element.content === 'Review this answer')).toBe(!!content);
   });
+  it.each(['', '   ', '\n\t '])('omits the reference element when its content is blank: %s', content => {
+    const template = defaultFeedbackTemplate();
+    template.elements = template.elements.map(element => element.slot === 'answerReference' ? { ...element, content } : element);
+    const card = buildFeedbackSurface({ template, policy: normalizeFeedbackPolicy({ enabled: true }), round: 1,
+      answerUrl: 'https://example.com/answer', preview: false });
+    const markdown = (card.body as any).elements.filter((element: any) => element.tag === 'markdown');
+    expect(markdown).toHaveLength(1);
+    expect(markdown[0].content).toBe(' ');
+    expect((card.body as any).elements.some((element: any) => element.content === content)).toBe(false);
+  });
   it('allows a ratings-only template but requires an action slot when actions are rendered', () => {
     const template = defaultFeedbackTemplate();
     template.elements = template.elements.filter(element => element.slot !== 'actionButtons');
