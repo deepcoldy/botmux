@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
+import { FeedbackExtensionStore } from './feedback-extension-store.js';
 import { normalizeFeedbackPolicy, type FeedbackPolicy } from './feedback-policy.js';
 import { effectiveWebhookDestinations, type FeedbackEventEnvelope, type FeedbackWebhookDestination, type FrozenWebhookDestination } from './feedback-outbox.js';
 import { SQLITE_FEEDBACK_STREAM_SCHEMA, validateFeedbackEventCursor, type FeedbackEventCursor, type SequencedFeedbackEvent } from './feedback-event-stream.js';
@@ -387,7 +388,7 @@ export class SkillFeedbackStore {
   readonly path: string;
   private readonly db: DatabaseSyncLike;
 
-  private constructor(dataDir: string, db: DatabaseSyncLike) {
+  private constructor(dataDir: string, db: DatabaseSyncLike, private readonly extensions: FeedbackExtensionStore) {
     mkdirSync(dataDir, { recursive: true });
     this.path = join(dataDir, 'botmux-feedback.sqlite');
     this.db = db;
@@ -522,15 +523,18 @@ export class SkillFeedbackStore {
     // Runtime-agnostic open: node:sqlite on Node, bun:sqlite on the compiled
     // binary (node:sqlite is absent under Bun). Same synchronous handle either way.
     const db = await openDatabaseSync(path);
+    let extensions: FeedbackExtensionStore | undefined;
     try {
-      return new SkillFeedbackStore(dataDir, db);
+      extensions = await FeedbackExtensionStore.open(dataDir);
+      return new SkillFeedbackStore(dataDir, db, extensions);
     } catch (error) {
+      extensions?.close();
       db.close();
       throw error;
     }
   }
 
-  close(): void { this.db.close(); }
+  close(): void { this.extensions.close(); this.db.close(); }
 
   private validateSchemaV1(): void {
     const required = ['interactions', 'skill_runs', 'responses', 'deliveries', 'feedback_revisions', 'turn_terminals', 'turn_completion_events', 'feedback_events', 'feedback_outbox'];
@@ -567,6 +571,7 @@ export class SkillFeedbackStore {
   }
 
   recordTurnDelivery(input: RecordTurnDeliveryInput): ReturnType<SkillFeedbackStore['mapDelivery']> {
+    input = { ...input, context: this.extensions.deliveryContext(input.botAppId, input.sessionId, input.turnId, input.context) };
     const hash = contentHash(input.content);
     const attempt = input.dispatchAttempt ?? 0;
     const discriminator = input.correlationDiscriminator ?? '';

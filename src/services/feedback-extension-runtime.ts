@@ -7,6 +7,7 @@ import { buildFeedbackSurface } from './feedback-template.js';
 import { feedbackAnswerGroups } from './feedback-answer-binding.js';
 import { logger } from '../utils/logger.js';
 import { feedbackRefreshBudget, refreshFeedbackMessage, type FeedbackRefreshBudget } from './feedback-refresh.js';
+import type { FeedbackSubjectBinding } from './feedback-context.js';
 
 function identity(parts: unknown[]): string { return createHash('sha256').update(JSON.stringify(parts)).digest('hex'); }
 
@@ -31,6 +32,7 @@ export async function reconcileFeedbackSurfaces(input: {
   type AnswerGroups = ReturnType<typeof feedbackAnswerGroups>;
   const topics = new Map<string, Promise<{
     groups: AnswerGroups; subjects: Map<string, string>;
+    contexts: Map<string, Record<string, unknown> | undefined>;
     topicRounds: Map<string, number>; subjectRounds: Map<string, number>;
   }>>();
   const answerUrls = new Map<string, Promise<string>>();
@@ -56,13 +58,16 @@ export async function reconcileFeedbackSurfaces(input: {
           || subscription.chatId !== feedbackDelivery.chatId || subscription.buttonKey !== data.verdictKey) continue;
         const hook = input.config.hooks.find(item => item.id === subscription.hookId);
         if (!hook?.enabled) continue;
+        const binding = feedbackDelivery.context?.feedbackSubjectBinding as FeedbackSubjectBinding | null | undefined;
+        const surfaceContext = extensions.surfaceContextForDelivery(input.appId, feedbackDelivery.deliveryId);
+        const context = surfaceContext === undefined ? binding?.context ?? null : surfaceContext;
         const executionId = identity(['feedback-hook', event.eventId, subscription.id]);
         jobs.push({ id: executionId, kind: 'hook', payload: { appId: input.appId, hookId: hook.id, hookVersion: hook.version, event: {
           schemaVersion: 1, type: 'feedback.revised', eventId: event.eventId, executionId, idempotencyKey: executionId,
           occurredAt: event.time, bot: { appId: input.appId }, scope: { chatId: feedbackDelivery.chatId }, action: null,
           answer: { deliveryId: feedbackDelivery.deliveryId, messageIds: [feedbackDelivery.platformMessageId] },
           feedback: { feedbackId: data.feedbackId, revision: data.revision, buttonKey: data.verdictKey, semantic: data.semantic },
-          actor: { subjectId: data.operatorSubjectId, appId: input.appId }, contextRef: null,
+          actor: { subjectId: data.operatorSubjectId, appId: input.appId }, context, contextRef: null,
         } } });
       }
     }
@@ -78,13 +83,15 @@ export async function reconcileFeedbackSurfaces(input: {
             const substantive: Delivery[] = [];
             const bySubject = new Map<string, Delivery[]>();
             const subjects = new Map<string, string>();
+            const contexts = new Map<string, Record<string, unknown> | undefined>();
             for (const delivery of sourceDeliveries) {
-              const binding = extensions.subject(input.appId, delivery.sessionId ?? '', delivery.turnId ?? '');
+              const binding = delivery.context?.feedbackSubjectBinding as FeedbackSubjectBinding | null | undefined;
               if (binding && binding.answerKind !== 'substantive') continue;
               const subject = binding?.sourceMessageId ?? delivery.topicRootId;
               if (!subject) continue;
               substantive.push(delivery);
               subjects.set(delivery.deliveryId, subject);
+              contexts.set(delivery.deliveryId, binding?.context);
               const subjectDeliveries = bySubject.get(subject) ?? [];
               subjectDeliveries.push(delivery);
               bySubject.set(subject, subjectDeliveries);
@@ -98,7 +105,7 @@ export async function reconcileFeedbackSurfaces(input: {
                 subjectRounds.set(group.id, group.round);
               }
             }
-            return { groups: [...groups.values()], subjects,
+            return { groups: [...groups.values()], subjects, contexts,
               topicRounds: new Map(topicGroups.map(group => [group.id, group.round])), subjectRounds };
           })());
         }
@@ -141,6 +148,7 @@ export async function reconcileFeedbackSurfaces(input: {
             jobs.push({ id: jobId, kind: 'surface', payload: {
               appId: input.appId, subjectId: answerSubjectId, topicId: delivery.topicRootId, chatId: delivery.chatId, answerId,
               deliveryId: delivery.deliveryId, answerMessageId: delivery.platformMessageId, messageIds: group.messageIds, round, card, actions,
+              context: candidates.contexts.get(delivery.deliveryId) ?? null,
               roundScope: topicRounds ? 'topic' : 'subject',
               mode: rule.mode, templateId: template.id, template, answerUrl,
             } });

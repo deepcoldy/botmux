@@ -38,7 +38,7 @@ async function openStorage(dataDir: string, config: FeedbackStorageConfig): Prom
       import('./feedback-postgres-store.js'),
       import('./feedback-postgres-analytics.js'),
     ]);
-    const store = await openPostgresFeedbackStore(target, password, config.instanceId, ca);
+    const store = await openPostgresFeedbackStore(target, password, config.instanceId, ca, false, dataDir);
     try {
       const analytics = await openPostgresFeedbackAnalytics(target, password, ca);
       const close = store.close.bind(store);

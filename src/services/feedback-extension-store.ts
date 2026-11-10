@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
+import { normalizeFeedbackBinding, normalizeFeedbackContext, type FeedbackContext, type FeedbackSubjectBinding } from './feedback-context.js';
 
 export interface ExtensionJobInput { id: string; kind: 'hook' | 'surface'; payload: Record<string, unknown> }
 export interface ExtensionJob extends ExtensionJobInput {
@@ -42,19 +43,21 @@ export class FeedbackExtensionStore {
     return new FeedbackExtensionStore(await openDatabaseSync(join(dataDir, 'feedback-extensions.sqlite')));
   }
   close(): void { this.database.close(); }
-  bindSubject(appId: string, sessionId: string, turnId: string, binding: {
-    sourceMessageId: string; answerKind: 'substantive' | 'clarification' | 'progress' | 'failed';
-  }): void {
+  bindSubject(appId: string, sessionId: string, turnId: string, input: FeedbackSubjectBinding): void {
+    const binding = normalizeFeedbackBinding(input);
     this.transaction(() => {
       const previous = this.subject(appId, sessionId, turnId);
-      if (previous && JSON.stringify(previous) !== JSON.stringify(binding)) throw new Error('feedback_subject_binding_conflict');
+      if (previous && JSON.stringify(normalizeFeedbackBinding(previous)) !== JSON.stringify(binding)) throw new Error('feedback_subject_binding_conflict');
       this.database.prepare('INSERT OR IGNORE INTO subject_bindings VALUES(?,?,?,?)').run(appId, sessionId, turnId, JSON.stringify(binding));
     });
   }
-  subject(appId: string, sessionId: string, turnId: string): { sourceMessageId: string; answerKind: string } | undefined {
+  subject(appId: string, sessionId: string, turnId: string): FeedbackSubjectBinding | undefined {
     const row = this.database.prepare('SELECT binding FROM subject_bindings WHERE app_id=? AND session_id=? AND turn_id=?')
       .get(appId, sessionId, turnId) as { binding: string } | undefined;
     return row ? JSON.parse(row.binding) : undefined;
+  }
+  deliveryContext(appId: string, sessionId: string, turnId: string, context?: Record<string, unknown>): Record<string, unknown> {
+    return { ...context, feedbackSubjectBinding: this.subject(appId, sessionId, turnId) ?? null };
   }
   activate(appId: string, startedAt: string): string {
     this.database.prepare('INSERT OR IGNORE INTO activation VALUES(?,?)').run(appId, startedAt);
@@ -187,6 +190,14 @@ export class FeedbackExtensionStore {
       .all(appId, deliveryId) as Array<{ message_id: string; binding: string }>;
     return rows.map(row => ({ messageId: row.message_id, binding: JSON.parse(row.binding) }));
   }
+  surfaceContextForDelivery(appId: string, deliveryId: string): FeedbackContext | null | undefined {
+    const surface = this.surfacesForDelivery(appId, deliveryId)[0]?.binding;
+    const queued = surface ? undefined : this.database.prepare(
+      "SELECT payload FROM jobs WHERE kind='surface' AND json_extract(payload,'$.appId')=? AND json_extract(payload,'$.deliveryId')=? ORDER BY rowid LIMIT 1",
+    ).get(appId, deliveryId) as { payload: string } | undefined;
+    const binding = surface ?? (queued ? JSON.parse(queued.payload) as Record<string, unknown> : undefined);
+    return binding ? normalizeFeedbackContext(binding.context ?? undefined) ?? null : undefined;
+  }
   dirtySurface(appId: string, messageId: string, state: Record<string, unknown>): void {
     this.transaction(() => this.writeDirtySurface(appId, messageId, state));
   }
@@ -256,7 +267,11 @@ export class FeedbackExtensionStore {
       if ((canResume || paused?.status === 'pending' && sameDefinition)
         && paused.payload.appId === input.job.payload.appId && paused.payload.hookId === input.job.payload.hookId) {
         this.database.prepare("UPDATE jobs SET status='pending',payload=?,result=NULL,token=NULL,deadline=NULL WHERE id=? AND status IN ('blocked','pending')")
-          .run(JSON.stringify(input.job.payload), input.job.id);
+          .run(JSON.stringify({
+            ...paused.payload,
+            hookVersion: input.job.payload.hookVersion,
+            hookDefinition: input.job.payload.hookDefinition,
+          }), input.job.id);
         this.audit(input.job.id, 'resubmitted_after_pause');
       }
       const previous = this.database.prepare('SELECT actor,job_id FROM action_requests WHERE request_id=?').get(input.requestId) as { actor: string; job_id: string } | undefined;

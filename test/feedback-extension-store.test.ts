@@ -5,6 +5,27 @@ import { describe, expect, it } from 'vitest';
 import { FeedbackExtensionStore } from '../src/services/feedback-extension-store.js';
 
 describe('feedback extension durability', () => {
+  it('freezes the first action event across cards, actors, replay and pause recovery', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-event-snapshot-'));
+    let store = await FeedbackExtensionStore.open(directory);
+    try {
+      const definition = { id: 'hook', command: ['script'] };
+      const first = { appId: 'app', hookId: 'hook', hookVersion: 1, hookDefinition: definition,
+        event: { context: { category: 42 }, surface: { messageId: 'surface-a' }, actor: { openId: 'first' } } };
+      const second = { ...first, hookVersion: 2,
+        event: { context: { category: 99 }, surface: { messageId: 'surface-b' }, actor: { openId: 'second' } } };
+      store.requestAction({ requestId: 'first', actor: 'first', job: { id: 'job', kind: 'hook', payload: first } });
+      store.requestAction({ requestId: 'second', actor: 'second', job: { id: 'job', kind: 'hook', payload: second } });
+      expect(store.job('job')?.payload.event).toEqual(first.event);
+      store.requestAction({ requestId: 'pause', actor: 'second', paused: true, job: { id: 'job', kind: 'hook', payload: second } });
+      store.close();
+      store = await FeedbackExtensionStore.open(directory);
+      store.requestAction({ requestId: 'resume', actor: 'second', job: { id: 'job', kind: 'hook', payload: second } });
+      expect(store.job('job')).toMatchObject({ status: 'pending', payload: { event: first.event, hookVersion: 2 } });
+      store.requestAction({ requestId: 'first', actor: 'first', job: { id: 'job', kind: 'hook', payload: first } });
+      expect(store.job('job')?.payload.event).toEqual(first.event);
+    } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
   it('rolls back a paused request together with its callback registration on conflict', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'feedback-pause-transaction-'));
     const store = await FeedbackExtensionStore.open(directory);
@@ -75,6 +96,39 @@ describe('feedback extension durability', () => {
       expect(store.subject('app', 'session', 'turn')).toEqual({ sourceMessageId: 'om_question', answerKind: 'substantive' });
       expect(store.subject('other', 'session', 'turn')).toBeUndefined();
       expect(() => store.bindSubject('app', 'session', 'turn', { sourceMessageId: 'om_other', answerKind: 'substantive' })).toThrow();
+    } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+  it('preserves bounded context through reopen and rejects changes to the same binding', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-context-'));
+    let store = await FeedbackExtensionStore.open(directory);
+    try {
+      const context = { kind: 'classification', category: 42, nested: { region: 'region-a' } };
+      store.bindSubject('app', 'session', 'turn', { sourceMessageId: 'om_question', answerKind: 'substantive', context });
+      context.nested.region = 'changed';
+      store.close();
+      store = await FeedbackExtensionStore.open(directory);
+      expect(store.subject('app', 'session', 'turn')?.context).toEqual({
+        category: 42, kind: 'classification', nested: { region: 'region-a' },
+      });
+      expect(() => store.bindSubject('app', 'session', 'turn', {
+        sourceMessageId: 'om_question', answerKind: 'substantive',
+        context: { nested: { region: 'region-a' }, category: 42, kind: 'classification' },
+      })).not.toThrow();
+      expect(() => store.bindSubject('app', 'session', 'turn', {
+        sourceMessageId: 'om_question', answerKind: 'substantive', context: { category: 99 },
+      })).toThrow('feedback_subject_binding_conflict');
+      expect(store.subject('other', 'session', 'turn')).toBeUndefined();
+      for (const invalid of [{ text: 'x'.repeat(8192) }, { number: Infinity }, { missing: undefined },
+        { nested: new Date() }, ['not-an-object']]) {
+        expect(() => store.bindSubject('app', 'session', 'invalid', {
+          sourceMessageId: 'om_question', answerKind: 'substantive', context: invalid as any,
+        })).toThrow();
+      }
+      let nested: Record<string, unknown> = {};
+      for (let depth = 0; depth < 8; depth++) nested = { child: nested };
+      expect(() => store.bindSubject('app', 'session', 'deep', {
+        sourceMessageId: 'om_question', answerKind: 'substantive', context: nested,
+      })).toThrow();
     } finally { store.close(); rmSync(directory, { recursive: true, force: true }); }
   });
   it('records manual evidence without re-executing unknown operations', async () => {

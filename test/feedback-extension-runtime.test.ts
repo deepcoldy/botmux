@@ -273,12 +273,16 @@ describe('feedback surface event reconciliation', () => {
     try {
       const ds = { larkAppId: 'app', chatId: 'oc_chat', session: { sessionId: 'session', rootMessageId: 'oc_chat', status: 'active',
         cliId: 'claude-code' }, managedTurnOrigin: { turnId: 'turn', callerOpenId: 'ou_requester', capability: 'cap' } } as any;
-      extensions.bindSubject('app', 'session', 'turn', { sourceMessageId: 'om_question', answerKind: 'substantive' });
+      const context = { kind: 'classification', category: 42 };
+      extensions.bindSubject('app', 'session', 'turn', { sourceMessageId: 'om_question', answerKind: 'substantive', context });
       await recordRelayedTurnDelivery({ ds, body: { messageId: 'om_answer', content: 'answer',
         policy: { enabled: true, audience: 'everyone' }, requesterSubjectId: 'ou_intruder' },
         store: source, feedback: { policy, requesterSubjectId: 'ou_requester' } } as any);
       const delivery = source.findDeliveryByPlatformMessage('lark', 'app', 'om_answer')!;
       expect(delivery).toMatchObject({ cardMode: 'card', policy: { audience: 'requester' }, requesterSubjectId: 'ou_requester' });
+      expect(delivery.context?.feedbackSubjectBinding).toEqual({
+        sourceMessageId: 'om_question', answerKind: 'substantive', context,
+      });
       source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'turn', status: 'completed' });
       const sent: string[] = [];
       await reconcileFeedbackSurfaces({ appId: 'app', sourceKey: 'source', source, extensions,
@@ -287,7 +291,9 @@ describe('feedback surface event reconciliation', () => {
         now: Date.now, send: async subject => { sent.push(subject); return 'om_surface'; },
         answerUrl: () => 'https://example.com/answer', removeInline: async () => {} });
       expect(sent).toEqual(['om_question']);
-      expect(extensions.surface('app', 'om_surface')).toMatchObject({ subjectId: 'om_question', answerMessageId: 'om_answer' });
+      expect(extensions.surface('app', 'om_surface')).toMatchObject({
+        subjectId: 'om_question', answerMessageId: 'om_answer', context,
+      });
     } finally { extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
   });
   it('does not use a chat ID as an unbound question message', async () => {
@@ -352,6 +358,63 @@ describe('feedback surface event reconciliation', () => {
         removeInline: async () => {}, now: Date.now });
       expect(extensions.claim('hook', Date.now(), 1000)).toBeUndefined();
       expect(extensions.cursor('source:app')).toBeGreaterThan(0);
+    } finally { extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+  it('uses the frozen delivery context for a feedback subscription after reopening', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-subscription-context-'));
+    const source = await SkillFeedbackStore.open(directory);
+    let extensions = await FeedbackExtensionStore.open(directory);
+    try {
+      extensions.bindSubject('app', 'session', 'one', {
+        sourceMessageId: 'question', answerKind: 'substantive', context: { category: 42 },
+      });
+      const delivery = source.recordTurnDelivery({ botAppId: 'app', sessionId: 'session', turnId: 'one',
+        platform: 'lark', platformAppId: 'app', platformMessageId: 'answer', chatId: 'chat',
+        content: 'answer', cardMode: 'card', status: 'delivered' });
+      extensions.bindSurface('app', 'surface', { deliveryId: delivery.deliveryId, context: { category: 42 } });
+      extensions.close();
+      extensions = await FeedbackExtensionStore.open(directory);
+      source.recordFeedback({ platform: 'lark', platformAppId: 'app', platformMessageId: 'answer',
+        operatorSubjectId: 'operator', result: 'positive', callbackKey: 'new' });
+      await reconcileFeedbackSurfaces({ appId: 'app', sourceKey: 'source', source, extensions,
+        config: { version: 1, hostId: 'host', templates: [], actions: [], presentations: {},
+          hooks: [{ id: 'hook', enabled: true } as any],
+          subscriptions: [{ id: 'subscription', appId: 'app', chatId: 'chat', buttonKey: 'positive', hookId: 'hook' }] },
+        send: async () => { throw new Error('unexpected send'); }, answerUrl: () => 'https://example.com',
+        removeInline: async () => {}, now: Date.now });
+      expect((extensions.jobsForApp('app')[0]?.payload.event as any).context).toEqual({ category: 42 });
+    } finally { extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+  it.each([false, true])('keeps historical queued-surface null context without backfill (delivery snapshot=%s)', async hasSnapshot => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-subscription-no-backfill-'));
+    const source = await SkillFeedbackStore.open(directory);
+    const extensions = await FeedbackExtensionStore.open(directory);
+    try {
+      if (hasSnapshot) extensions.bindSubject('app', 'session', 'one', {
+        sourceMessageId: 'question', answerKind: 'substantive', context: { category: 42 },
+      });
+      const delivery = source.recordTurnDelivery({ botAppId: 'app', sessionId: 'session', turnId: 'one',
+        platform: 'lark', platformAppId: 'app', platformMessageId: 'answer', chatId: 'chat',
+        content: 'answer', cardMode: 'card', status: 'delivered' });
+      source.recordFeedback({ platform: 'lark', platformAppId: 'app', platformMessageId: 'answer',
+        operatorSubjectId: 'operator', result: 'positive', callbackKey: 'old' });
+      if (!hasSnapshot) extensions.bindSubject('app', 'session', 'one', {
+        sourceMessageId: 'question', answerKind: 'substantive', context: { category: 99 },
+      });
+      extensions.ingest('pending', 0, [{ sequence: 1, eventId: 'pending', jobs: [{
+        id: 'pending-surface', kind: 'surface', payload: { appId: 'app', deliveryId: delivery.deliveryId,
+          context: null, round: 1, chatId: 'chat', subjectId: 'question' },
+      }] }]);
+      await reconcileFeedbackSurfaces({ appId: 'app', sourceKey: 'source', source, extensions,
+        config: { version: 1, hostId: 'host', templates: [], actions: [], presentations: {},
+          hooks: [{ id: 'hook', enabled: true } as any],
+          subscriptions: [{ id: 'subscription', appId: 'app', chatId: 'chat', buttonKey: 'positive', hookId: 'hook' }] },
+        send: async () => { throw new Error('unexpected send'); }, answerUrl: () => 'https://example.com',
+        removeInline: async () => {}, now: Date.now });
+      const job = extensions.jobsForApp('app').find(item => item.kind === 'hook')!;
+      expect((job.payload.event as any).context).toBeNull();
+      expect(delivery.context?.feedbackSubjectBinding).toEqual(hasSnapshot
+        ? { sourceMessageId: 'question', answerKind: 'substantive', context: { category: 42 } } : null);
     } finally { extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
   });
   it.each(['subject', 'topic'] as const)('counts %s scope across followup bindings and keeps topics and chats isolated', async roundScope => {

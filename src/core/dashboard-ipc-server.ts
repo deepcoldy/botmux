@@ -2354,16 +2354,29 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
 ipcRoute('POST', '/api/sessions/:sessionId/feedback-bind', async (req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
   let body: Record<string, unknown>;
-  try { body = await readJsonBody<Record<string, unknown>>(req, 4096); }
+  const { FEEDBACK_BIND_MAX_BYTES, normalizeFeedbackContext } = await import('../services/feedback-context.js');
+  try { body = await readJsonBody<Record<string, unknown>>(req, FEEDBACK_BIND_MAX_BYTES); }
   catch { return jsonRes(res, 400, { error: 'bad_json' }); }
   const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
   if (!auth.ok || !ds) return jsonRes(res, 403, { error: 'feedback_binding_forbidden' });
-  const turnId = ds.managedTurnOrigin?.turnId;
+  const execution = {
+    turnId: ds.managedTurnOrigin?.turnId,
+    capability: ds.managedTurnOrigin?.capability,
+    dispatchAttempt: ds.managedTurnOrigin?.dispatchAttempt,
+    appId: ds.larkAppId,
+    sessionId: ds.session.sessionId,
+    chatId: ds.chatId,
+    rootMessageId: ds.session.rootMessageId,
+  };
+  const turnId = execution.turnId;
   if (body.expectedTurnId !== turnId) return jsonRes(res, 409, { error: 'feedback_binding_turn_mismatch' });
   if (!turnId || typeof body.sourceMessageId !== 'string' || !/^om_[A-Za-z0-9_-]+$/.test(body.sourceMessageId)
     || !['substantive', 'clarification', 'progress', 'failed'].includes(String(body.answerKind))) {
     return jsonRes(res, 400, { error: 'feedback_binding_invalid' });
   }
+  let context;
+  try { context = normalizeFeedbackContext(body.context); }
+  catch (error) { return jsonRes(res, 400, { error: error instanceof Error ? error.message : 'feedback_context_invalid' }); }
   const detail = await getMessageDetail(ds.larkAppId, body.sourceMessageId, { userCardContent: false });
   const message = detail?.items?.[0] ?? detail;
   if (message?.chat_id !== ds.chatId) return jsonRes(res, 403, { error: 'feedback_binding_wrong_chat' });
@@ -2375,13 +2388,30 @@ ipcRoute('POST', '/api/sessions/:sessionId/feedback-bind', async (req, res, para
   const { FeedbackExtensionStore } = await import('../services/feedback-extension-store.js');
   const store = await FeedbackExtensionStore.open(config.session.dataDir);
   try {
-    if (ds.managedTurnOrigin?.turnId !== turnId || findActiveBySessionId(params.sessionId) !== ds) {
+    if (findActiveBySessionId(params.sessionId) !== ds
+      || !sessionCliIpcAuth(req, ds, params.sessionId, body).ok
+      || ds.managedTurnOrigin?.turnId !== turnId
+      || ds.managedTurnOrigin?.capability !== execution.capability
+      || ds.managedTurnOrigin?.dispatchAttempt !== execution.dispatchAttempt
+      || ds.larkAppId !== execution.appId || ds.session.sessionId !== execution.sessionId
+      || ds.chatId !== execution.chatId || ds.session.rootMessageId !== execution.rootMessageId
+      || ds.session.status === 'closed') {
       return jsonRes(res, 409, { error: 'feedback_binding_turn_mismatch' });
     }
-    store.bindSubject(ds.larkAppId, ds.session.sessionId, turnId, {
-      sourceMessageId: body.sourceMessageId, answerKind: body.answerKind as 'substantive' | 'clarification' | 'progress' | 'failed',
+    try {
+      store.bindSubject(ds.larkAppId, ds.session.sessionId, turnId, {
+        sourceMessageId: body.sourceMessageId, answerKind: body.answerKind as 'substantive' | 'clarification' | 'progress' | 'failed',
+        ...(context === undefined ? {} : { context }),
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === 'feedback_subject_binding_conflict') {
+        return jsonRes(res, 409, { error: error.message });
+      }
+      throw error;
+    }
+    return jsonRes(res, 200, {
+      ok: true, turnId, sourceMessageId: body.sourceMessageId, contextBound: context !== undefined,
     });
-    return jsonRes(res, 200, { ok: true, turnId, sourceMessageId: body.sourceMessageId });
   } finally { store.close(); }
 });
 
