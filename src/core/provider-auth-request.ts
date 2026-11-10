@@ -93,7 +93,9 @@ export async function requestProviderAuth(
       : { status: 'undeliverable', delivery: 'dm_failed', message: t('provider_auth.undeliverable', vars, locale) };
   }
   const delivery = await deps.deliver(link.text, link.command);
-  recent.set(key, { authUrl: link.authUrl, at: now(), reached: delivery !== 'dm_failed' });
+  const at = now();
+  for (const [k, v] of recent) if (at - v.at >= LINK_RESEND_MS) recent.delete(k);
+  recent.set(key, { authUrl: link.authUrl, at, reached: delivery !== 'dm_failed' });
   switch (delivery) {
     case 'inline': return { status: 'delivered', delivery, message: t('provider_auth.delivered_inline', vars, locale) };
     case 'dm': return { status: 'delivered', delivery, message: t('provider_auth.delivered_dm', vars, locale) };
@@ -105,4 +107,9 @@ export async function requestProviderAuth(
 /** @internal test-only */
 export function __resetProviderAuthForTest(): void {
   recent.clear();
+}
+
+/** @internal test-only */
+export function __providerAuthTrackedForTest(): number {
+  return recent.size;
 }

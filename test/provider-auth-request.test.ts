@@ -6,7 +6,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AuthLinkDelivery } from '../src/core/auth-link-delivery.js';
 import {
-  __resetProviderAuthForTest, LINK_RESEND_MS, requestProviderAuth, type ProviderAuthDeps,
+  __providerAuthTrackedForTest, __resetProviderAuthForTest, LINK_RESEND_MS, requestProviderAuth, type ProviderAuthDeps,
 } from '../src/core/provider-auth-request.js';
 import type { MeegoLoginRequest } from '../src/services/meego-auth.js';
 
@@ -107,6 +107,15 @@ describe('requestProviderAuth — Meego', () => {
     expect((await ask('meego', 'ou_alice', { tenant: 'dcar' })).status).toBe('delivered');
     expect(deps.requestMeegoLogin).toHaveBeenLastCalledWith('ou_alice', 'dcar');
     expect(deps.deliver).toHaveBeenCalledTimes(2);
+  });
+
+  it('links sent long ago are forgotten, so a long-running daemon does not pile them up', async () => {
+    await ask('meego', 'ou_alice', { chatId: 'oc_a' });
+    await ask('meego', 'ou_bob', { chatId: 'oc_b' });
+    expect(__providerAuthTrackedForTest()).toBe(2);
+    clock += LINK_RESEND_MS;
+    await ask('meego', 'ou_carol', { chatId: 'oc_c' });
+    expect(__providerAuthTrackedForTest()).toBe(1);
   });
 
   it('provider down: unavailable, nothing sent', async () => {
