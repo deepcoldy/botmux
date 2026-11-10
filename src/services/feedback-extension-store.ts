@@ -4,6 +4,42 @@ import { join } from 'node:path';
 import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
 import { normalizeFeedbackBinding, normalizeFeedbackContext, type FeedbackContext, type FeedbackSubjectBinding } from './feedback-context.js';
 
+function isSqliteBusyError(error: unknown): boolean {
+  const code = (error as { code?: unknown })?.code;
+  if ((code === 'ERR_SQLITE_ERROR' || code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED') && code !== 'ERR_SQLITE_ERROR') {
+    return true;
+  }
+  const message = String((error as { message?: unknown })?.message ?? error).toLowerCase();
+  return message.includes('database is locked') || message.includes('database table is locked')
+    || message.includes('sqlite_busy') || message.includes('sqlite_locked');
+}
+function sleepShort(attempt: number): void {
+  const base = Math.min(20 * attempt, 120);
+  const jitter = Math.floor(Number(process.hrtime.bigint() % 17n));
+  try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, base + jitter); } catch {}
+}
+const EXTENSION_SCHEMA_V1 = `
+  CREATE TABLE IF NOT EXISTS cursors(source TEXT PRIMARY KEY, sequence INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS received(source TEXT NOT NULL,event_id TEXT NOT NULL,PRIMARY KEY(source,event_id));
+  CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,kind TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL,
+    token TEXT,deadline INTEGER,result TEXT);
+  CREATE TABLE IF NOT EXISTS action_requests(request_id TEXT PRIMARY KEY,actor TEXT NOT NULL,job_id TEXT NOT NULL REFERENCES jobs(id));
+  CREATE TABLE IF NOT EXISTS answers(app_id TEXT NOT NULL,chat_id TEXT NOT NULL,subject_id TEXT NOT NULL,
+    answer_id TEXT NOT NULL,delivery_id TEXT NOT NULL,round INTEGER NOT NULL,PRIMARY KEY(app_id,answer_id));
+  CREATE TABLE IF NOT EXISTS surfaces(app_id TEXT NOT NULL,message_id TEXT NOT NULL,binding TEXT NOT NULL,PRIMARY KEY(app_id,message_id));
+  CREATE TABLE IF NOT EXISTS activation(app_id TEXT PRIMARY KEY,started_at TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS dirty_surfaces(app_id TEXT NOT NULL,message_id TEXT NOT NULL,state TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(app_id,message_id));
+  CREATE TABLE IF NOT EXISTS reconciliations(id INTEGER PRIMARY KEY AUTOINCREMENT,job_id TEXT NOT NULL,
+    actor TEXT NOT NULL,evidence TEXT NOT NULL,outcome TEXT NOT NULL,created_at TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS subject_bindings(app_id TEXT NOT NULL,session_id TEXT NOT NULL,turn_id TEXT NOT NULL,
+    binding TEXT NOT NULL,PRIMARY KEY(app_id,session_id,turn_id));
+  CREATE TABLE IF NOT EXISTS inline_cleanup(app_id TEXT NOT NULL,message_id TEXT NOT NULL,PRIMARY KEY(app_id,message_id));
+  CREATE TABLE IF NOT EXISTS refresh_state(app_id TEXT NOT NULL,message_id TEXT NOT NULL,kind TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,next_run INTEGER NOT NULL DEFAULT 0,terminal INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(app_id,message_id,kind));
+`;
+
 export interface ExtensionJobInput { id: string; kind: 'hook' | 'surface'; payload: Record<string, unknown> }
 export interface ExtensionJob extends ExtensionJobInput {
   status: 'pending' | 'running' | 'succeeded' | 'blocked' | 'failed_before_effect' | 'unknown';
@@ -13,30 +49,53 @@ export interface ExtensionJob extends ExtensionJobInput {
 
 export class FeedbackExtensionStore {
   private constructor(private readonly database: DatabaseSyncLike) {
-    const version = Number((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version);
-    if (version > 1) { database.close(); throw new Error('feedback_extension_schema_newer'); }
-    database.exec(`PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
-      CREATE TABLE IF NOT EXISTS cursors(source TEXT PRIMARY KEY, sequence INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS received(source TEXT NOT NULL,event_id TEXT NOT NULL,PRIMARY KEY(source,event_id));
-      CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY,kind TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL,
-        token TEXT,deadline INTEGER,result TEXT);
-      CREATE TABLE IF NOT EXISTS action_requests(request_id TEXT PRIMARY KEY,actor TEXT NOT NULL,job_id TEXT NOT NULL REFERENCES jobs(id));
-      CREATE TABLE IF NOT EXISTS answers(app_id TEXT NOT NULL,chat_id TEXT NOT NULL,subject_id TEXT NOT NULL,
-        answer_id TEXT NOT NULL,delivery_id TEXT NOT NULL,round INTEGER NOT NULL,PRIMARY KEY(app_id,answer_id));
-      CREATE TABLE IF NOT EXISTS surfaces(app_id TEXT NOT NULL,message_id TEXT NOT NULL,binding TEXT NOT NULL,PRIMARY KEY(app_id,message_id));
-      CREATE TABLE IF NOT EXISTS activation(app_id TEXT PRIMARY KEY,started_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS dirty_surfaces(app_id TEXT NOT NULL,message_id TEXT NOT NULL,state TEXT NOT NULL,
-        revision INTEGER NOT NULL DEFAULT 1,PRIMARY KEY(app_id,message_id));
-      CREATE TABLE IF NOT EXISTS reconciliations(id INTEGER PRIMARY KEY AUTOINCREMENT,job_id TEXT NOT NULL,
-        actor TEXT NOT NULL,evidence TEXT NOT NULL,outcome TEXT NOT NULL,created_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS subject_bindings(app_id TEXT NOT NULL,session_id TEXT NOT NULL,turn_id TEXT NOT NULL,
-        binding TEXT NOT NULL,PRIMARY KEY(app_id,session_id,turn_id));
-      CREATE TABLE IF NOT EXISTS inline_cleanup(app_id TEXT NOT NULL,message_id TEXT NOT NULL,PRIMARY KEY(app_id,message_id));
-      CREATE TABLE IF NOT EXISTS refresh_state(app_id TEXT NOT NULL,message_id TEXT NOT NULL,kind TEXT NOT NULL,
-        attempts INTEGER NOT NULL DEFAULT 0,next_run INTEGER NOT NULL DEFAULT 0,terminal INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY(app_id,message_id,kind));
-      PRAGMA user_version=1;
-    `);
+    try {
+      database.exec('PRAGMA busy_timeout=5000;');
+      database.exec('PRAGMA foreign_keys=ON;');
+      this.enableWalWithRetry();
+      const version = Number((database.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined)?.user_version ?? 0);
+      if (version > 1) throw new Error('feedback_extension_schema_newer');
+      if (version === 0) {
+        this.withImmediateWrite(() => {
+          const observed = Number((database.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined)?.user_version ?? 0);
+          if (observed > 1) throw new Error('feedback_extension_schema_newer');
+          if (observed > 0) return;
+          database.exec(EXTENSION_SCHEMA_V1);
+          database.exec('PRAGMA user_version=1;');
+        });
+      }
+    } catch (error) {
+      database.close();
+      throw error;
+    }
+  }
+  private enableWalWithRetry(): void {
+    const maxAttempts = 10;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const mode = String((this.database.prepare('PRAGMA journal_mode=WAL').get() as { journal_mode?: string } | undefined)?.journal_mode ?? '').toLowerCase();
+        if (mode === 'wal') return;
+        if (attempt < maxAttempts) { sleepShort(attempt); continue; }
+        throw new Error(`feedback_extension_wal_mode_not_set:${mode || 'unknown'}`);
+      } catch (error) {
+        if (isSqliteBusyError(error) && attempt < maxAttempts) { sleepShort(attempt); continue; }
+        throw error;
+      }
+    }
+  }
+  private withImmediateWrite(fn: () => void): void {
+    const maxAttempts = 10;
+    for (let attempt = 1; ; attempt++) {
+      try { this.database.exec('BEGIN IMMEDIATE;'); } catch (error) {
+        if (isSqliteBusyError(error) && attempt < maxAttempts) { sleepShort(attempt); continue; }
+        throw error;
+      }
+      try { fn(); this.database.exec('COMMIT;'); return; } catch (error) {
+        try { this.database.exec('ROLLBACK;'); } catch {}
+        if (isSqliteBusyError(error) && attempt < maxAttempts) { sleepShort(attempt); continue; }
+        throw error;
+      }
+    }
   }
   static async open(dataDir: string): Promise<FeedbackExtensionStore> {
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });

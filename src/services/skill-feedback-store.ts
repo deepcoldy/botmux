@@ -388,7 +388,7 @@ export class SkillFeedbackStore {
   readonly path: string;
   private readonly db: DatabaseSyncLike;
 
-  private constructor(dataDir: string, db: DatabaseSyncLike, private readonly extensions: FeedbackExtensionStore) {
+  private constructor(dataDir: string, db: DatabaseSyncLike, private readonly extensions?: FeedbackExtensionStore) {
     mkdirSync(dataDir, { recursive: true });
     this.path = join(dataDir, 'botmux-feedback.sqlite');
     this.db = db;
@@ -525,7 +525,7 @@ export class SkillFeedbackStore {
     const db = await openDatabaseSync(path);
     let extensions: FeedbackExtensionStore | undefined;
     try {
-      extensions = await FeedbackExtensionStore.open(dataDir);
+      try { extensions = await FeedbackExtensionStore.open(dataDir); } catch { extensions = undefined; }
       return new SkillFeedbackStore(dataDir, db, extensions);
     } catch (error) {
       extensions?.close();
@@ -534,7 +534,7 @@ export class SkillFeedbackStore {
     }
   }
 
-  close(): void { this.extensions.close(); this.db.close(); }
+  close(): void { this.extensions?.close(); this.db.close(); }
 
   private validateSchemaV1(): void {
     const required = ['interactions', 'skill_runs', 'responses', 'deliveries', 'feedback_revisions', 'turn_terminals', 'turn_completion_events', 'feedback_events', 'feedback_outbox'];
@@ -571,7 +571,10 @@ export class SkillFeedbackStore {
   }
 
   recordTurnDelivery(input: RecordTurnDeliveryInput): ReturnType<SkillFeedbackStore['mapDelivery']> {
-    input = { ...input, context: this.extensions.deliveryContext(input.botAppId, input.sessionId, input.turnId, input.context) };
+    let context: Record<string, unknown>;
+    try { context = this.extensions ? this.extensions.deliveryContext(input.botAppId, input.sessionId, input.turnId, input.context) : { ...input.context, feedbackSubjectBinding: null }; }
+    catch { context = { ...input.context, feedbackSubjectBinding: null }; }
+    input = { ...input, context };
     const hash = contentHash(input.content);
     const attempt = input.dispatchAttempt ?? 0;
     const discriminator = input.correlationDiscriminator ?? '';

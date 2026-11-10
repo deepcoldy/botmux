@@ -85,13 +85,15 @@ export async function reconcileFeedbackSurfaces(input: {
             const subjects = new Map<string, string>();
             const contexts = new Map<string, Record<string, unknown> | undefined>();
             for (const delivery of sourceDeliveries) {
-              const binding = delivery.context?.feedbackSubjectBinding as FeedbackSubjectBinding | null | undefined;
+              const hasSnapshot = !!delivery.context && Object.prototype.hasOwnProperty.call(delivery.context, 'feedbackSubjectBinding');
+              const snapshot = hasSnapshot ? delivery.context?.feedbackSubjectBinding as FeedbackSubjectBinding | null | undefined : undefined;
+              const binding = hasSnapshot ? snapshot : extensions.subject(input.appId, delivery.sessionId ?? '', delivery.turnId ?? '');
               if (binding && binding.answerKind !== 'substantive') continue;
               const subject = binding?.sourceMessageId ?? delivery.topicRootId;
               if (!subject) continue;
               substantive.push(delivery);
               subjects.set(delivery.deliveryId, subject);
-              contexts.set(delivery.deliveryId, binding?.context);
+              contexts.set(delivery.deliveryId, snapshot?.context);
               const subjectDeliveries = bySubject.get(subject) ?? [];
               subjectDeliveries.push(delivery);
               bySubject.set(subject, subjectDeliveries);

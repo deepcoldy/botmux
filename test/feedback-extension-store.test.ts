@@ -1,10 +1,41 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
 import { FeedbackExtensionStore } from '../src/services/feedback-extension-store.js';
+import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
+import { openDatabaseSync } from '../src/services/sqlite-compat.js';
 
 describe('feedback extension durability', () => {
+  it('skips schema writes on reopen and isolates main feedback store from a corrupt extension DB', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-extension-open-isolation-'));
+    try {
+      const stores = await Promise.all(Array.from({ length: 6 }, () => FeedbackExtensionStore.open(directory)));
+      for (const store of stores) store.close();
+      const dbPath = join(directory, 'feedback-extensions.sqlite');
+      const raw = await openDatabaseSync(dbPath);
+      raw.exec('PRAGMA wal_checkpoint(TRUNCATE);');
+      raw.close();
+      const reopened = await FeedbackExtensionStore.open(directory);
+      const walPath = `${dbPath}-wal`;
+      expect(existsSync(walPath) ? statSync(walPath).size : 0).toBe(0);
+      reopened.close();
+
+      rmSync(dbPath, { force: true });
+      rmSync(walPath, { force: true });
+      rmSync(`${dbPath}-shm`, { force: true });
+      writeFileSync(dbPath, 'corrupt-extension-sqlite');
+      const main = await SkillFeedbackStore.open(directory);
+      try {
+        const delivery = main.recordTurnDelivery({
+          botAppId: 'app', sessionId: 'session', turnId: 'turn',
+          platform: 'lark', platformAppId: 'app', platformMessageId: 'om_answer',
+          content: 'answer', cardMode: 'card', status: 'delivered',
+        });
+        expect(delivery.context?.feedbackSubjectBinding).toBeNull();
+      } finally { main.close(); }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
   it('freezes the first action event across cards, actors, replay and pause recovery', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'feedback-event-snapshot-'));
     let store = await FeedbackExtensionStore.open(directory);

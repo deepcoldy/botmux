@@ -296,6 +296,38 @@ describe('feedback surface event reconciliation', () => {
       });
     } finally { extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
   });
+  it('falls back to the subject binding for a historical delivery without a snapshot while keeping context null', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-runtime-legacy-delivery-'));
+    const source = await SkillFeedbackStore.open(directory);
+    const extensions = await FeedbackExtensionStore.open(directory);
+    const policy = normalizeFeedbackPolicy({ enabled: true, audience: 'requester' })!;
+    try {
+      extensions.bindSubject('app', 'session', 'legacy-turn', {
+        sourceMessageId: 'om_question', answerKind: 'substantive', context: { category: 42 },
+      });
+      const delivery = source.recordTurnDelivery({
+        botAppId: 'app', sessionId: 'session', turnId: 'legacy-turn',
+        platform: 'lark', platformAppId: 'app', platformMessageId: 'om_answer',
+        chatId: 'oc_chat', topicRootId: 'om_topic_root', content: 'answer',
+        cardMode: 'feedback', status: 'delivered', policy, requesterSubjectId: 'ou_requester',
+      });
+      (source as any).db.prepare('UPDATE deliveries SET context_json=? WHERE delivery_id=?')
+        .run(JSON.stringify({ teamId: 'team' }), delivery.deliveryId);
+      source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'legacy-turn', status: 'completed' });
+      const sent: string[] = [];
+      await reconcileFeedbackSurfaces({
+        appId: 'app', sourceKey: 'source', source, extensions,
+        config: { version: 1, hostId: 'host', templates: [defaultFeedbackTemplate()], hooks: [], actions: [],
+          presentations: { app: { default: { enabled: true, rounds: [1], mode: 'separate' }, rules: [] } } },
+        now: Date.now, send: async subject => { sent.push(subject); return 'om_surface'; },
+        answerUrl: () => 'https://example.com/answer', removeInline: async () => {},
+      });
+      expect(sent).toEqual(['om_question']);
+      expect(extensions.surface('app', 'om_surface')).toMatchObject({
+        subjectId: 'om_question', answerMessageId: 'om_answer', context: null,
+      });
+    } finally { extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
   it('does not use a chat ID as an unbound question message', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'feedback-unbound-chat-'));
     const source = await SkillFeedbackStore.open(directory);
