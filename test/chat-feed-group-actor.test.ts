@@ -28,3 +28,21 @@ it('refuses a sender without personal authorization even when an old per-app tok
     .resolves.toEqual({ ok: false, error: 'user_login_required' });
   expect(fetchMock).not.toHaveBeenCalled();
 });
+
+it('rejects a sender outside the bot allowlist and malformed open ids before any token lookup', async () => {
+  root = mkdtempSync(join(tmpdir(), 'chat-label-deny-'));
+  const bots = join(root, 'bots.json');
+  vi.stubEnv('BOTS_CONFIG', bots);
+  writeFileSync(bots, JSON.stringify([{
+    larkAppId: 'cli_deny', larkAppSecret: 'test-only', cliId: 'antigravity',
+    allowedUsers: ['ou_owner'],
+  }]));
+  loadBotConfigs().forEach(registerBot);
+  const fetchMock = vi.fn();
+  vi.stubGlobal('fetch', fetchMock);
+  await expect(setChatFeedGroup('cli_deny', 'oc_current', 'ou_operator', 'p0'))
+    .resolves.toEqual({ ok: false, error: 'permission_denied' });
+  await expect(setChatFeedGroup('cli_deny', 'oc_current', 'not-an-open-id', 'p0'))
+    .resolves.toEqual({ ok: false, error: 'permission_denied' });
+  expect(fetchMock).not.toHaveBeenCalled();
+});
