@@ -1,6 +1,6 @@
 /** Verify native Antigravity paste through real PTY and Tmux transports in an isolated HOME. */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, fork } from 'node:child_process';
 import { randomUUID, createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -8,11 +8,12 @@ import { parseArgs, stripVTControlCharacters } from 'node:util';
 import { spawn } from 'node-pty';
 import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { TmuxPipeBackend } from '../src/adapters/backend/tmux-pipe-backend.js';
+import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
 
 const { values } = parseArgs({ options: {
   'agy-bin': { type: 'string' }, 'auth-dir': { type: 'string' }, report: { type: 'string' },
-  model: { type: 'string', default: 'gemini-3.8-flash-high' },
+  model: { type: 'string', default: 'gemini-3.8-flash-high' }, worker: { type: 'boolean', default: false },
 } });
 if (process.env.BOTMUX_FENCED_RUN !== '1' || !values['agy-bin'] || !values['auth-dir'] || !values.report) {
   throw new Error('Use fenced-run with --agy-bin, --auth-dir and --report.');
@@ -69,6 +70,7 @@ function nativeInputs(marker: string): string[] {
 
 /** Exercise the real adapter and one transport, with exact long-input receipt assertions. */
 async function verify(transport: 'pty' | 'tmux'): Promise<void> {
+  const processStarted = performance.now();
   const selected = createAntigravityAdapter(bin);
   const args = selected.buildArgs({ sessionId: randomUUID(), resume: false, reattach: false, cliVersion: version, workingDir: cwd, model: values.model });
   const marker = `AGY_${transport.toUpperCase()}_${randomUUID()}`;
@@ -106,6 +108,7 @@ async function verify(transport: 'pty' | 'tmux'): Promise<void> {
       await wait(100);
     }
     if (!isReady) throw new Error(`${transport} did not reach its input prompt: ${screen().slice(-1400)}`);
+    const readyMs = Math.round(performance.now() - processStarted);
     const started = performance.now();
     const submit = await selected.writeInput(handle, content);
     const confirmedMs = Math.round(performance.now() - started);
@@ -117,7 +120,7 @@ async function verify(transport: 'pty' | 'tmux'): Promise<void> {
     }
     const matched = inputs.filter(input => input.includes(content));
     records.push({ transport, bytes: Buffer.byteLength(content), lines: content.split('\n').length,
-      rawWrites, atomicSubmits, confirmedMs, nativeInputMs: Math.round(performance.now() - started),
+      rawWrites, atomicSubmits, readyMs, confirmedMs, nativeInputMs: Math.round(performance.now() - started),
       historyConfirmed: submit === undefined || submit.submitted === true, nativeFullInputMatches: matched.length });
     if ((submit && submit.submitted === false) || matched.length !== 1 || rawWrites + atomicSubmits !== 1) {
       throw new Error(`${transport} input failed exact receipt / single-submit assertions`);
@@ -125,9 +128,64 @@ async function verify(transport: 'pty' | 'tmux'): Promise<void> {
   } finally { close(); await wait(200); }
 }
 
+/** Measure the compiled production worker through native CLI readiness and exact input receipt. */
+async function verifyWorker(transport: 'pty' | 'tmux'): Promise<void> {
+  const marker = `AGY_WORKER_${transport.toUpperCase()}_${randomUUID()}`;
+  const prompt = `${marker} Reply only OK. Do not use tools.`;
+  const started = performance.now();
+  let importedMs: number | undefined;
+  let cliSpawnMs: number | undefined;
+  let cliReadyMs: number | undefined;
+  let promptReadyMs: number | undefined;
+  const worker = fork(resolve('dist/worker.js'), [], {
+    cwd, execArgv: [], stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    env: { ...process.env, BOTMUX_NO_CLAIM: '1' },
+  });
+  let logs = '';
+  worker.stdout?.on('data', (chunk: Buffer) => {
+    const text = chunk.toString(); logs = (logs + text).slice(-8000);
+    const elapsed = Math.round(performance.now() - started);
+    if (text.includes('Worker started')) importedMs ??= elapsed;
+    if (text.includes('Spawning fresh CLI:')) cliSpawnMs ??= elapsed;
+    if (text.includes('Prompt detected (idle)')) cliReadyMs ??= elapsed;
+  });
+  worker.stderr?.on('data', (chunk: Buffer) => { logs = (logs + chunk.toString()).slice(-8000); });
+  worker.on('message', (message: WorkerToDaemon) => {
+    if (message.type === 'prompt_ready') promptReadyMs ??= Math.round(performance.now() - started);
+  });
+  const exited = new Promise<void>(resolveExit => worker.once('exit', () => resolveExit()));
+  worker.send({ type: 'init', sessionId: randomUUID(), chatId: 'oc_input_benchmark', rootMessageId: 'om_input_benchmark',
+    workingDir: cwd, cliId: 'antigravity', cliPathOverride: bin, cliVersion: version, backendType: transport,
+    model: values.model, prompt, turnId: marker, larkAppId: 'benchmark_isolated', larkAppSecret: 'benchmark_isolated',
+    apiOnly: true, promptInjection: 'none',
+  } satisfies DaemonToWorker);
+  try {
+    let inputs: string[] = [];
+    for (let attempt = 0; attempt < 900; attempt++) {
+      inputs = nativeInputs(marker);
+      if (inputs.length) break;
+      if (worker.exitCode !== null) throw new Error(`Worker exited before native receipt (${worker.exitCode})`);
+      await wait(50);
+    }
+    if (inputs.length !== 1 || !inputs[0]?.includes(prompt)) throw new Error(`Worker native receipt missing or duplicated: ${logs.slice(-2000)}`);
+    records.push({ transport, scope: 'compiled-worker', importedMs, cliSpawnMs, cliReadyMs, promptReadyMs,
+      nativeInputMs: Math.round(performance.now() - started), nativeFullInputMatches: inputs.length,
+      promptInjection: 'none', note: 'No Feishu delivery/network latency; isolated small prompt.' });
+  } finally {
+    if (worker.connected) worker.send({ type: 'close' } satisfies DaemonToWorker, () => {});
+    const timer = setTimeout(() => worker.kill('SIGKILL'), 6000);
+    await exited;
+    clearTimeout(timer);
+  }
+}
+
 try {
   await verify('pty');
   await verify('tmux');
+  if (values.worker) {
+    await verifyWorker('pty');
+    await verifyWorker('tmux');
+  }
   const sourceAuthUnchanged = JSON.stringify(before) === JSON.stringify(authHashes());
   if (!sourceAuthUnchanged) throw new Error('Source authentication changed during verification');
   const report = { success: true, version, records, isolated: true, sourceAuthUnchanged };

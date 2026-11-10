@@ -22518,10 +22518,20 @@ function startScreenUpdates(): void {
       // dedup — it never touches isPromptReady, the idle detector, or the argv seed
       // flags (spawnArgvInitialPromptBusy / -NeedsWorkingSeed), so the first-prompt
       // evidence machinery and the end-of-turn seed are unchanged.
-      if (spawnArgvNeedsWorkingSeed && lastSentStatus !== 'working' && renderer) {
+      // A resumed native command can already be running before any idle prompt.
+      // Publish its actual frame without opening the ready gate or draining input.
+      const nativeScreen = lastInitConfig?.cliId === 'antigravity' && renderer
+        && backendScreenEvidenceIsAuthoritativeForMutation() ? renderer.rawSnapshot() : '';
+      const nativeWorking = !!nativeScreen && !!cliAdapter?.busyPattern?.test(busyProbeRegion(nativeScreen))
+        && !!cliAdapter.isSessionBusy?.({
+          sessionId,
+          cliSessionId: lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId,
+          getCurrentScreen: () => nativeScreen,
+        });
+      if (((spawnArgvNeedsWorkingSeed && lastSentStatus !== 'working') || nativeWorking) && renderer) {
         const projected = projectedRuntimeScreenStatus();
-        if (projected === 'working') {
-          const { content } = renderer.snapshot();
+        const { content, changed } = renderer.snapshot();
+        if (projected === 'working' && (lastSentStatus !== 'working' || (nativeWorking && changed))) {
           lastSentStatus = 'working';
           send({
             type: 'screen_update',
@@ -22530,7 +22540,7 @@ function startScreenUpdates(): void {
             turnId: currentBotmuxTurnId,
             dispatchAttempt: currentBotmuxDispatchAttempt,
           });
-          log('Argv-baked first prompt in flight — publishing projected working before first prompt');
+          if (!nativeWorking) log('Argv-baked first prompt in flight — publishing projected working before first prompt');
         }
       }
       return;
