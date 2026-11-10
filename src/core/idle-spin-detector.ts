@@ -236,6 +236,7 @@ export function createIdleSpinDetector(deps: IdleSpinDetectorDeps): IdleSpinDete
         ...(deps.mutationAcquireTimeoutMs !== undefined
           ? { mutationAcquireTimeoutMs: deps.mutationAcquireTimeoutMs }
           : {}),
+        ...(deps.shouldAbort ? { shouldAbort: deps.shouldAbort } : {}),
       },
     );
     if (result === null) {

@@ -105,6 +105,8 @@ export interface IdleAgeSweepOptions {
    * monopolize the event loop across dozens of teardowns.
    */
   maxCandidates?: number;
+  /** Checked before each candidate (daemon shutdown fence). */
+  shouldAbort?: () => boolean;
 }
 
 export interface IdleAgeSweepFailure {
@@ -360,6 +362,7 @@ export async function suspendSelectedIdleCandidatesAsync(
   const failures: IdleAgeSweepFailure[] = [];
   for (const candidate of candidates) {
     await yieldBetweenCandidates();
+    if (opts.shouldAbort?.()) break;
     // Re-run the full guard set rather than re-checking one field: the
     // eligibility predicate must stay identical to the dry-run selection.
     const stillEligible = selectIdleSuspendCandidates(activeSessions, {

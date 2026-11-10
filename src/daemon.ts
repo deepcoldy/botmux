@@ -33497,6 +33497,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               reason: 'host_pressure',
               maxCandidates: resolved.hostPressure.maxSuspendsPerPass,
               mutationAcquireTimeoutMs: 1_000,
+              shouldAbort: () => idleSpinStopped,
             });
             return swept === null ? null : swept.suspended.length;
           } catch (err) {
