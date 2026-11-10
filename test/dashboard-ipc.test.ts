@@ -13187,6 +13187,22 @@ describe('PUT /api/bot-card-prefs — unified card tool visibility', () => {
         body: JSON.stringify({ replyCardShowTools: 'false' }),
       });
       expect(badType.status).toBe(400);
+
+      for (const enabled of [true, false]) {
+        const saved = await fetch(url, {
+          method: 'PUT', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ replyCardNativeCot: enabled }),
+        });
+        expect(saved.status).toBe(200);
+        expect(await saved.json()).toMatchObject({ ok: true, replyCardNativeCot: enabled });
+        expect(getBot(appId).config.replyCardNativeCot === true).toBe(enabled);
+        expect(loadBotConfigs()[0].replyCardNativeCot === true).toBe(enabled);
+      }
+      const invalidNative = await fetch(url, {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ replyCardNativeCot: 'true' }),
+      });
+      expect(invalidNative.status).toBe(400);
     } finally {
       if (handle) await handle.close();
       handle = null;
@@ -13283,5 +13299,37 @@ describe('GET /api/sessions/:sessionId/reply-render-snapshot', () => {
       findSpy.mockReturnValue(undefined);
       expect((await fetch(base)).status).toBe(404);
     } finally { findSpy.mockRestore(); renderSpy.mockRestore(); }
+  });
+});
+
+
+describe('POST /api/sessions/:sessionId/reply-card-ready', () => {
+  it('requires host/session authority and rechecks the exact attempt after the native publication wait', async () => {
+    const cards = await import('../src/core/turn-reply-card.js');
+    const appId = 'cli_native_order';
+    const ds = { larkAppId: appId, currentTurnId: 'om_order',
+      managedTurnOrigin: { turnId: 'om_order', dispatchAttempt: 1, capability: 'fixture-capability' },
+      session: { sessionId: 'native-order', status: 'active' } } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    let release!: () => void;
+    const prepareSpy = vi.spyOn(cards, 'prepareReplyCardNativeThinking').mockImplementation(() => new Promise<void>(resolve => { release = resolve; }));
+    try {
+      setLarkAppId(appId); setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const path = '/api/sessions/native-order/reply-card-ready';
+      const body = JSON.stringify({ expectedTurnId: 'om_order', dispatchAttempt: 1 });
+      expect((await requestJson(handle.port, path, { method: 'POST', body })).status).toBe(403);
+      const query = () => requestJson(handle!.port, path, { method: 'POST', body,
+        headers: { ...trustedHostHeaders('POST', path, handle!.port), 'content-type': 'application/json' } });
+      const pending = query();
+      await vi.waitFor(() => expect(prepareSpy).toHaveBeenCalledOnce());
+      ds.managedTurnOrigin.dispatchAttempt = 2;
+      release();
+      expect((await pending).status).toBe(409);
+      ds.managedTurnOrigin.dispatchAttempt = 1;
+      prepareSpy.mockResolvedValue();
+      expect((await query()).status).toBe(200);
+      expect(prepareSpy).toHaveBeenLastCalledWith(ds, 'om_order', 1);
+    } finally { findSpy.mockRestore(); prepareSpy.mockRestore(); }
   });
 });

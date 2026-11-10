@@ -12,6 +12,8 @@
  * Both were invisible to `capabilities --json`. This script exercises the
  * layers that carry real risk under `bun build --compile`:
  *
+ *   0. screenshot     — the real terminal renderer encodes a PNG without an
+ *                       external native library or node_modules in its cwd.
  *   1. capabilities   — CLI graph loads at all (cheap canary, kept).
  *   1b. version       — the binary reports its own version rather than the
  *                       `unknown` sentinel. Compiled mode has no package.json on
@@ -203,6 +205,24 @@ if (process.platform === 'darwin') {
     fail('codesign', `invalid Mach-O signature — newer macOS will SIGKILL this binary before it runs. ` +
       `Check the Bun that compiled it (1.4.0 is known-bad, need >= 1.4.1). codesign said: ${detail}`);
   }
+}
+
+try {
+  const screenshotPath = join(home, 'screenshot.png');
+  execFileSync(binary, ['__screenshot-smoke', screenshotPath], {
+    cwd: home,
+    env: { ...childEnv, NAPI_RS_NATIVE_LIBRARY_PATH: '', NODE_PATH: '' },
+    encoding: 'utf8',
+    timeout: 60_000,
+  });
+  const png = readFileSync(screenshotPath);
+  if (png.length < 33 || !png.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+      || png.toString('ascii', 12, 16) !== 'IHDR' || png.readUInt32BE(16) === 0 || png.readUInt32BE(20) === 0) {
+    fail('screenshot', 'the compiled screenshot renderer did not produce a valid PNG');
+  }
+  console.log(`smoke: ✅ screenshot — ${png.readUInt32BE(16)}×${png.readUInt32BE(20)} PNG (${png.length} bytes), no external native override`);
+} catch (error) {
+  fail('screenshot', `compiled terminal PNG rendering failed: ${error instanceof Error ? error.message : String(error)}`);
 }
 
 // ── 1. capabilities: the CLI graph loads ─────────────────────────────────────

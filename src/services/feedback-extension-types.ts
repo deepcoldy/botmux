@@ -8,6 +8,7 @@ export interface FeedbackScope {
 export interface FeedbackPresentationLayer {
   enabled?: boolean;
   rounds?: number[];
+  roundScope?: 'subject' | 'topic';
   mode?: 'separate' | 'inline' | 'both';
   templateId?: string;
   actionIds?: string[];
@@ -26,6 +27,7 @@ export interface FeedbackPresentationConfig {
 export interface EffectivePresentation {
   enabled: boolean;
   rounds: number[];
+  roundScope?: 'subject' | 'topic';
   mode: 'separate' | 'inline' | 'both';
   templateId: string;
   actionIds: string[];

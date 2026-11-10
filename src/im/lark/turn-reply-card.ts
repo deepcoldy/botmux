@@ -171,6 +171,9 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   const en = presentation.locale === 'en';
   const terminal = replyCardIsTerminal(record);
   const pendingAsks = (record.asks ?? []).filter(entry => !entry.result && !entry.ask.settled);
+  // Native thinking carries the runtime status, so only its opt-in turns drop the in-card chrome.
+  const simpleFinal = record.nativeCot === true && !!record.finalCard && record.phase === 'completed' && !pendingAsks.length;
+  const compactRuntime = record.nativeCot === true && !terminal && !record.finalCard && !pendingAsks.length;
   const phaseLabels = en
     ? { queued: 'Queued', working: 'Working', waiting: 'Waiting for a response', stopping: 'Stopping', completed: 'Completed', failed: 'Failed', cancelled: 'Stopped', ambiguous: 'Interrupted', superseded: 'Continued in a later message' }
       : { queued: '等待执行', working: '处理中', waiting: '等待响应', stopping: '正在停止', completed: '已完成', failed: '执行失败', cancelled: '已停止', ambiguous: '执行状态待确认', superseded: '已由后续消息接续' };
@@ -304,22 +307,38 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   }
 
   // A runtime status is separate from a model-authored layout title.
-  card.body.elements.unshift({ tag: 'markdown', element_id: 'botmux_turn_status', content: `${pendingAsks.length ? '🙋' : phaseIcons[record.phase]} **${title}**` });
+  if (!compactRuntime && !simpleFinal) card.body.elements.unshift({ tag: 'markdown', element_id: 'botmux_turn_status', content: `${pendingAsks.length ? '🙋' : phaseIcons[record.phase]} **${title}**` });
   const usage = presentation.showLiveUsage && record.usage
     ? cardUsageFooterSegment(record.usage, presentation.locale, 'streaming') : null;
   // Final cards already carry their frozen runtime identity in the footer.
   const runtime = !record.finalCard && record.usage ? cardUsageRuntimeSegment(record.usage) : null;
   const usageLine = [usage, runtime].filter(Boolean).join(' · ');
-  if (usageLine) card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_usage', text_size: 'notation', content: usageLine });
+  if (usageLine && !compactRuntime && !simpleFinal) card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_usage', text_size: 'notation', content: usageLine });
   if (!terminal && !record.finalCard && ['working', 'waiting'].includes(record.phase) && presentation.canStop) {
     card.body.elements.push({ tag: 'column_set', element_id: 'botmux_turn_control_0', columns: [{ tag: 'column', width: 'auto', elements: [{
-      tag: 'button', text: { tag: 'plain_text', content: en ? '⏹ Stop' : '⏹ 停止' }, type: 'danger',
+      tag: 'button', text: { tag: 'plain_text', content: compactRuntime ? (en ? 'Stop' : '停止') : (en ? '⏹ Stop' : '⏹ 停止') },
+      type: compactRuntime ? 'default' : 'danger', ...(compactRuntime ? { size: 'small' } : {}),
       behaviors: [{ type: 'callback', value: {
         action: 'stop_turn', session_id: record.sessionId, root_id: record.rootId,
         lark_app_id: record.larkAppId, chat_id: record.chatId, reply_card_turn_id: record.turnId,
         ...(record.dispatchAttempt !== undefined ? { reply_card_attempt: record.dispatchAttempt } : {}),
       } }],
     }] }] });
+  }
+  if (compactRuntime) {
+    card.body.padding = '8px 12px';
+    card.body.vertical_spacing = '4px';
+    const controls = card.body.elements.find(element => element.element_id === 'botmux_turn_control_0') as any;
+    card.body.elements = card.body.elements.filter(element => element !== controls
+      && (record.progress.length > 0 || !element.element_id?.startsWith('botmux_turn_progress_')));
+    card.body.elements.push({ tag: 'column_set', element_id: 'botmux_reply_actions', flex_mode: 'none',
+      horizontal_spacing: '8px', vertical_align: 'center', columns: [
+        // Reuse the visible chrome text as the purpose-marker carrier so the
+        // marker stamper does not append an otherwise empty Markdown row.
+        { tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center', elements: [{ tag: 'markdown', element_id: 'botmux_reply_footer',
+          text_size: 'notation', content: `<font color='grey'>${en ? 'Working…' : '正在处理…'}</font>` }] },
+        ...(controls?.columns ?? []),
+      ] } as any);
   }
   // Feedback becomes clickable after runtime settlement, avoiding a feedback
   // callback racing with the last status PATCH.

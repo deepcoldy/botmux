@@ -90,7 +90,7 @@ describe('bytedcli identity renewal', () => {
     expect(await renewExpiringBytedcliIdentities()).toBe(0);
     expect(renew).toHaveBeenCalledWith(ALICE);
     expect(recallProvenIdentityContent(dir, SESSION, TURN, 'bytedcli'))
-      .toBe(renderIdentityEnv({ ...original, home: join(dir, 'replacement-home') }));
+      .toBe(renderIdentityEnv(publishedIdentityShape(dir, SESSION, { ...original, home: join(dir, 'replacement-home') })));
     expect(trackedBytedcliRenewalCount()).toBe(0);
   });
 

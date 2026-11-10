@@ -5,10 +5,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { normalizeOncallGroupPolicy, oncallGroupEnabled } from '../src/services/oncall-group-policy.js';
 import { OncallGroupStore, type OncallGroupSource } from '../src/services/oncall-group-store.js';
 import { createOncallGroup, loadOncallGroupTarget, oncallUsername, type OncallGroupTarget } from '../src/services/oncall-group-client.js';
-import { attachOncallGroupButton } from '../src/im/lark/oncall-group.js';
+import { attachOncallGroupButton, buildOncallGroupColumn } from '../src/im/lark/oncall-group.js';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 import { buildFeedbackElement, renderFeedbackCard } from '../src/im/lark/skill-feedback-card.js';
 import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
+import { createNativeOncallLink } from '../src/services/oncall-platform.js';
+import { CARD_LATE_CHROME_RESERVE_BYTES } from '../src/im/lark/md-card.js';
 
 const dirs: string[] = [];
 const temporary = () => { const dir = mkdtempSync(join(tmpdir(), 'oncall-group-')); dirs.push(dir); return dir; };
@@ -113,22 +115,41 @@ describe('Oncall and feedback card composition', () => {
   it('appends exactly one button to the right without mutating existing controls', () => {
     const card = attach(base);
     expect(card.body.elements[1].flex_mode).toBe('flow');
-    expect(card.body.elements[1].columns.slice(0, -1)).toEqual((base.body.elements[1] as any).columns);
-    expect(card.body.elements[1].columns.at(-1).elements[0]).toMatchObject({
-      text: { content: '拉起 Oncall 群' }, type: 'primary',
-      icon: { tag: 'standard_icon', token: 'chat_outlined' },
+    expect(card.body.elements[1].columns).toEqual((base.body.elements[1] as any).columns);
+    expect(card.body.elements.at(-1).columns[0]).toMatchObject({ width: 'weighted' });
+    expect(card.body.elements.at(-1).columns.at(-1).elements[0]).toMatchObject({
+      text: { content: '转人工' }, type: 'default', size: 'small',
       behaviors: [{ type: 'callback', value: { action: 'oncall_group_create' } }],
     });
     expect(JSON.stringify(base)).not.toContain('oncall_group');
     expect(attach(card)).toEqual(card);
   });
+  it('puts handoff status beside a small neutral group link', () => {
+    const column = buildOncallGroupColumn({ href: 'https://applink.feishu.cn/client/chat/open?chatId=oc_fixture',
+      status: '进入人工 Oncall 群', handoffStatus: '已发起人工 Oncall' });
+    expect(column.direction).toBe('horizontal');
+    expect(column.elements[0]).toMatchObject({ tag: 'button', type: 'default', size: 'small',
+      behaviors: [{ type: 'open_url', default_url: 'https://applink.feishu.cn/client/chat/open?chatId=oc_fixture' }] });
+    expect(column.elements[1]).toMatchObject({ tag: 'markdown', text_size: 'notation' });
+  });
+  it('keeps a native form link for a long question within the late card chrome reserve', async () => {
+    const page = new URL('https://oncall.example.test/chat?tenant=12');
+    const fetcher = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: 0, data: {
+      lark_dialog_url: 'https://applink.feishu.cn/client/web_url/open?url=' + encodeURIComponent(page.href) } })));
+    const question = '系统报错日志'.repeat(500);
+    const href = await createNativeOncallLink(target, 'secret', '', question, 'feishu', fetcher);
+    const prefill = JSON.parse(new URL(new URL(href).searchParams.get('url')!).searchParams.get('context')!).trigger_message;
+    expect(prefill.endsWith('…') && question.startsWith(prefill.slice(0, -1))).toBe(true);
+    expect(Buffer.byteLength(JSON.stringify(buildOncallGroupColumn({ href })))).toBeLessThan(CARD_LATE_CHROME_RESERVE_BYTES);
+  });
+
   it('preserves the static button through feedback and secondary selections', () => {
     const negative = { result: policy.buttons.find(button => button.semantic === 'negative')!.key };
     const first = attach(renderFeedbackCard(base, policy, negative));
     const second = renderFeedbackCard(attach(base), policy, negative);
     expect(first).toEqual(second);
     expect(JSON.stringify(first)).toContain('botmux_feedback_reasons');
-    expect(JSON.stringify(first)).toContain('拉起 Oncall 群');
+    expect(JSON.stringify(first)).toContain('转人工');
     const reason = renderFeedbackCard(first, policy, { ...negative, reasonKey: 'wrong', comment: 'details' });
     for (const card of [first, second, reason] as any[]) {
       for (const id of ['botmux_feedback', 'botmux_feedback_reasons']) {
@@ -141,16 +162,16 @@ describe('Oncall and feedback card composition', () => {
   });
   it('supports feedback-off and leaves disabled, unselected and private cards unchanged', () => {
     const raw = JSON.stringify(answerCard);
-    expect(attach(answerCard).body.elements[1].columns[0].elements[0].text.content).toBe('拉起 Oncall 群');
+    expect(attach(answerCard).body.elements[1].columns.at(-1).elements[0].text.content).toBe('转人工');
     expect(attachOncallGroupButton(raw, undefined, 'oc_source')).toBe(raw);
     expect(attachOncallGroupButton(raw, { enabled: true, chatIds: ['oc_other'] }, 'oc_source')).toBe(raw);
     expect(attachOncallGroupButton(raw, { enabled: true, chatIds: ['oc_source'] }, 'oc_source', 'p2p')).toBe(raw);
   });
   it('restores the Oncall callback when Lark omits behaviors from a fetched card', () => {
     const fetched = attach(base);
-    for (const column of fetched.body.elements[1].columns) delete column.elements[0].behaviors;
+    for (const column of fetched.body.elements.at(-1).columns) for (const element of column.elements) delete element.behaviors;
     const rendered: any = renderFeedbackCard(fetched, policy, { result: policy.buttons[0].key });
-    expect(rendered.body.elements[1].columns.at(-1)).toEqual(attach(base).body.elements[1].columns.at(-1));
+    expect(rendered.body.elements.at(-1).columns.at(-1)).toEqual(attach(base).body.elements.at(-1).columns.at(-1));
   });
   it.each([true, false])('keeps Oncall on overflow reply cards with feedback=%s', feedback => {
     const card = buildTurnReplyCard({
@@ -166,10 +187,7 @@ describe('Oncall and feedback card composition', () => {
 });
 
 describe('Oncall button with a voice-only chrome row', () => {
-  it('joins the existing footer+voice column_set instead of making a standalone row', () => {
-    // Voice-enabled bots render footer+voice as botmux_reply_actions even when
-    // the reply-card action menu is off; the on-call button must stay in that
-    // row rather than silently moving to a standalone row at card bottom.
+  it('keeps voice controls and anchors the Oncall action at the bottom right', () => {
     const card = {
       schema: '2.0',
       body: { elements: [
@@ -184,7 +202,8 @@ describe('Oncall button with a voice-only chrome row', () => {
     const attached = JSON.parse(attachOncallGroupButton(JSON.stringify(card), { enabled: true, chatIds: ['oc_source'] }, 'oc_source'));
     const row = attached.body.elements.find((e: any) => e.element_id === 'botmux_reply_actions');
     expect(row.columns).toHaveLength(3);
-    expect(row.columns[2].elements[0].text.content).toBe('拉起 Oncall 群');
-    expect(attached.body.elements.some((e: any) => e.element_id === 'botmux_oncall_group')).toBe(false);
+    expect(row.columns[1].elements[0].behaviors[0].value.action).toBe('voice_summary');
+    expect(attached.body.elements.at(-1).columns.at(-1).elements[0].behaviors[0].value.action).toBe('oncall_group_create');
+    expect(attached.body.elements.at(-1).element_id).toBe('botmux_reply_actions');
   });
 });

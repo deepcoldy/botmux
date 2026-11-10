@@ -91,6 +91,11 @@ BOTMUX_NO_CLAIM=1 bun run use:here   # 逃生阀：本次不认领
 
 纯 `bun run build` 故意不认领——review/验证别人 PR 时不会悄悄抢走全局指向。实现见 `scripts/claim-botmux-bin.mjs`。
 
+单实例候选版本可在 daemon 启动环境设置绝对路径 `BOTMUX_WRAPPER_BIN=<candidate>/bin`，
+让 daemon 和 worker 共用独立 wrapper，保留共享全局 binary。
+不要仅为隔离 wrapper 将 daemon 放入新的 user namespace：恢复的 CLI 可能仍在宿主
+namespace，新 worker 无权读取它的 `/proc/<pid>/fd`，会导致 transcript 桥接失联。
+
 ### 改动需用户手动测试时 → 部署本 checkout 到 live daemon
 
 当改动需要用户在飞书里**手动验证**（而非纯单测能覆盖），改完自测绿后执行：

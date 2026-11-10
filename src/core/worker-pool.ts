@@ -190,7 +190,7 @@ import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
 import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, abortCotMessage, resumeCotMessage } from '../im/lark/cot-message.js';
-import { replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
+import { retireReplyCardDisplay, replyCardDispatchAttempt, updateReplyCardNativeThinking, replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
 import { ReplyCardWithdrawnError } from '../services/turn-reply-card.js';
 import { readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
@@ -251,7 +251,7 @@ import { cleanupSessionTempDirAfterExit } from './session-temp.js';
 import { removeSessionMcpGatewayDir } from './plugins/mcp/socket-dir.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 import { materializeFeedbackPolicyForDelivery } from '../services/feedback-reviewer-delivery.js';
-import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
+import { attachOncallGroupButton, recordOncallGroupDelivery, prepareNativeOncallCard } from '../im/lark/oncall-group.js';
 import { attachWorkflowSidebarEntry, workflowNodeSessionEntry } from '../im/lark/workflow-sidebar-entry.js';
 import { resolveWorkflowEntryLink } from './workflow-entry-link.js';
 import { beginFinalOutputDelivery, onFinalOutputDeliverySettled, waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
@@ -2774,7 +2774,12 @@ export function resumeTurnNotices(ds: DaemonSession): void {
 async function sendTurnNotice(
   ds: DaemonSession,
   notice: Pick<TurnNoticeRecord, 'kind' | 'turnId' | 'msgType' | 'content'>,
+  owns?: () => boolean,
 ): Promise<void> {
+  if (owns?.() === false) return;
+  const beforeWrite = owns ? () => {
+    if (!owns()) throw new Error('Turn notice no longer owns delivery');
+  } : undefined;
   const uuid = randomUUID();
   try {
     await requireCallbacks().sessionReply(
@@ -2783,9 +2788,10 @@ async function sendTurnNotice(
       notice.msgType,
       ds.larkAppId,
       notice.turnId,
-      { uuid, sourceSessionId: ds.session.sessionId },
+      { uuid, sourceSessionId: ds.session.sessionId, ...(beforeWrite ? { beforeWrite } : {}) },
     );
   } catch (err) {
+    if (owns?.() === false) return;
     if (!turnNoticeSendRetryable(err)) throw err;
     const now = Date.now();
     const delayMs = recoveryNoticeRetryDelayMs(1);
@@ -6135,7 +6141,8 @@ export async function postTurnStartingCard(
     // Reserve the turn before the CLI can call `botmux send`. Its reply uses
     // the same durable record even while the first card POST is in flight.
     replyPost = updateTurnReplyCard(ds, turnId, { kind: 'refresh' },
-      (body, type, uuid, beforeWrite) => sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, turnId, { uuid, beforeWrite }))
+      (body, type, uuid, beforeWrite) => sessionReply(sessionAnchorId(ds), body, type, ds.larkAppId, turnId, { uuid, beforeWrite }),
+      { dispatchAttempt: replyCardDispatchAttempt(ds, turnId) })
       .then(result => !!result).catch(error => {
         logger.warn(`[reply-card] initial card: ${error instanceof Error ? error.message : String(error)}`);
         return false;
@@ -19094,7 +19101,7 @@ function setupWorkerHandlers(
           ds.replyCardRunningTurnId = msg.turnId;
           void updateTurnReplyCard(ds, msg.turnId, { kind: 'start' },
             (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }),
-            { owns: ownsLifecycleMutation }).catch(error => logger.warn(`[${t}] reply-card start: ${error.message}`));
+            { dispatchAttempt: msg.dispatchAttempt, owns: ownsLifecycleMutation }).catch(error => logger.warn(`[${t}] reply-card start: ${error.message}`));
         }
         break;
       }
@@ -20050,6 +20057,19 @@ function setupWorkerHandlers(
         break;
       }
 
+      case 'turn_display_retired': {
+        if (!ownsLifecycleMutation() || managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        try {
+          await retireReplyCardDisplay(ds, msg,
+            (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }), ownsLifecycleMutation);
+        } catch (error) {
+          if (!ownsLifecycleMutation()) break;
+          logger.warn(`[${t}] reply-card retirement failed; delivering the warning through the existing notice path`);
+          await sendTurnNotice(ds, { kind: 'user_notify', turnId: msg.turnId, msgType: 'text', content: msg.message }, ownsLifecycleMutation);
+        }
+        break;
+      }
+
       case 'thinking_update': {
         // Cosmetic CoT channel — never touches settlement. Same stale-worker
         // guard as screen_update; sessionId echo is validated when present.
@@ -20060,8 +20080,10 @@ function setupWorkerHandlers(
         // Cache even when the CoT switches are off — `/cot show` uses this to
         // summon the bubble mid-turn with everything accumulated so far.
         ds.lastThinkingUpdate = { entries: msg.entries, turnId: msg.turnId, dispatchAttempt: msg.dispatchAttempt };
-        if (replyCardModeFor(ds, msg.turnId) !== 'legacy') {
+        const replyMode = replyCardModeFor(ds, msg.turnId);
+        if (replyMode !== 'legacy') {
           if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+            updateReplyCardNativeThinking(ds, msg, ownsLifecycleMutation);
             queueTurnReplyTools(ds, msg,
               (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }), ownsLifecycleMutation);
           }
@@ -21825,6 +21847,15 @@ function setupWorkerHandlers(
           }
         }
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) break;
+        if (msg.kind === 'structured_turn_not_collected' && msg.turnId && ownsLifecycleMutation()) {
+          try {
+            if (await retireReplyCardDisplay(ds, { ...msg, turnId: msg.turnId },
+              (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }), ownsLifecycleMutation)) break;
+          } catch (error) {
+            logger.warn(`[${t}] reply-card warning update failed; falling back to the existing notice path`);
+          }
+          if (!ownsLifecycleMutation()) break;
+        }
         if (msg.kind === 'input_not_submitted' && ownsLifecycleMutation()
           && (!msg.turnId || !ds.currentTurnId || ds.currentTurnId === msg.turnId)) {
           scheduleActiveRuntimePatch(ds);
@@ -21857,7 +21888,8 @@ function setupWorkerHandlers(
               await sendTurnNotice(ds, { kind: 'user_notify', turnId: fallbackTurnId(ds, msg.turnId), msgType: 'text', content: msg.message });
             }
           } else {
-            await sendTurnNotice(ds, { kind: 'user_notify', turnId: fallbackTurnId(ds, msg.turnId), msgType: 'text', content: msg.message });
+            await sendTurnNotice(ds, { kind: 'user_notify', turnId: fallbackTurnId(ds, msg.turnId), msgType: 'text', content: msg.message },
+              msg.kind === 'structured_turn_not_collected' ? ownsLifecycleMutation : undefined);
           }
         } catch (err: any) {
           logger.error(`[${t}] Failed to deliver user_notify to Lark: ${err.message}`);
@@ -24603,8 +24635,11 @@ function deliverFinalOutput(
           content: tr('card.turn_failed.field_error', { errorCode: `\`${msg.turnFailureCode}\`` }, localeForBot(ds.larkAppId)) });
         cardJson = JSON.stringify(failedCard);
       }
+      const nativeLink = !managedReceiver ? await prepareNativeOncallCard(ds.larkAppId, ds.chatId, msg.replyTurnId ?? msg.turnId, ds.session.sessionId) : undefined;
       if (!managedReceiver) {
-        cardJson = attachOncallGroupButton(cardJson, getBot(ds.larkAppId).config.oncallGroup, ds.chatId, ds.chatType);
+        cardJson = attachOncallGroupButton(cardJson, getBot(ds.larkAppId).config.oncallGroup, ds.chatId, ds.chatType, {
+          appId: ds.larkAppId, sessionId: ds.session.sessionId, questionId: msg.replyTurnId ?? msg.turnId, phase: 'final', nativeLink,
+        });
       }
       // §11 / §5.5: a node session's replies carry the run's「工作流 ›」entry
       // at the signature row's right end (after the on-call button).
@@ -24848,9 +24883,9 @@ function deliverFinalOutput(
       }
       if (!managedReceiver) {
         recordOncallGroupDelivery(config.session.dataDir, {
-          appId: ds.larkAppId, chatId: ds.chatId, messageId,
+          appId: ds.larkAppId, chatId: ds.chatId, messageId, sessionId: ds.session.sessionId, rootId: sessionAnchorId(ds),
           questionId: msg.replyTurnId ?? msg.turnId,
-          answer: explicit?.finalText ?? safeAssistantText, card: JSON.parse(explicit?.finalCard ?? cardJson),
+          answer: explicit?.finalText ?? safeAssistantText, card: JSON.parse(explicit?.finalCard ?? cardJson), nativeLink,
         });
       }
       if (msg.turnId.startsWith('mlrp_turn_')) {
