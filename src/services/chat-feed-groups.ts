@@ -20,7 +20,8 @@ async function groups(api: ChatFeedGroupApi): Promise<FeedGroup[]> {
   const seen = new Set<string>();
   let token = '';
   for (let page = 0; page < 20; page++) {
-    const query = new URLSearchParams({ page_size: '50', ...(token ? { page_token: token } : {}) });
+    // Feishu rejects a first page without page_token (9499); send it empty.
+    const query = new URLSearchParams({ page_size: '50', page_token: token });
     const data = await api.request(`/open-apis/im/v1/groups?${query}`);
     if (!Array.isArray(data.groups)) throw new Error('invalid_feed_group_directory');
     for (const raw of data.groups) {

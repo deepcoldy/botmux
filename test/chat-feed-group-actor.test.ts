@@ -46,3 +46,43 @@ it('rejects a sender outside the bot allowlist and malformed open ids before any
     .resolves.toEqual({ ok: false, error: 'permission_denied' });
   expect(fetchMock).not.toHaveBeenCalled();
 });
+
+it('uses the sender token and sends page_token on the first directory page, as the live API requires', async () => {
+  root = mkdtempSync(join(tmpdir(), 'chat-label-live-'));
+  const data = join(homedir(), '.botmux', 'data');
+  mkdirSync(data, { recursive: true });
+  const bots = join(root, 'bots.json');
+  vi.stubEnv('BOTS_CONFIG', bots);
+  writeFileSync(bots, JSON.stringify([{
+    larkAppId: 'cli_live', larkAppSecret: 'test-only', cliId: 'antigravity', allowedUsers: ['ou_operator'],
+  }]));
+  writeFileSync(join(data, 'user-token-cli_live-ou_operator.json'), JSON.stringify({
+    access_token: 'operator-test-token', token_type: 'Bearer',
+    expires_at: new Date(Date.now() + 3600000).toISOString(),
+    scope: 'im:feed_group_v1:read im:feed_group_v1:write', appId: 'cli_live', brand: 'feishu', openId: 'ou_operator',
+  }));
+  loadBotConfigs().forEach(registerBot);
+  const calls: Array<{ method: string; path: string; query: URLSearchParams; authorization: string | null }> = [];
+  vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    const call = { method: init?.method ?? 'GET', path: url.pathname, query: url.searchParams, authorization: new Headers(init?.headers).get('authorization') };
+    calls.push(call);
+    if (call.method === 'GET') {
+      // Live behavior (docs/plans/2026-09-29-session-close-tag.md): the first page still needs an empty page_token.
+      if (!call.query.has('page_token')) return Response.json({ code: 9499, msg: 'Missing required parameter: PageToken' }, { status: 400 });
+      return Response.json({ code: 0, data: { groups: [{ group_id: 'ofg_old', name: 'pending', type: 'normal' }], has_more: false } });
+    }
+    if (call.path === '/open-apis/im/v1/groups') return Response.json({ code: 0, data: { group_id: 'ofg_p1' } });
+    return Response.json({ code: 0, data: {} });
+  }));
+  await expect(setChatFeedGroup('cli_live', 'oc_current', 'ou_operator', 'p1'))
+    .resolves.toEqual({ ok: true, chatId: 'oc_current', label: 'p1' });
+  expect(calls.map(call => `${call.method} ${call.path}`)).toEqual([
+    'GET /open-apis/im/v1/groups',
+    'POST /open-apis/im/v1/groups',
+    'POST /open-apis/im/v1/groups/ofg_p1/batch_add_item',
+    'POST /open-apis/im/v1/groups/ofg_old/batch_remove_item',
+  ]);
+  expect(calls[0]!.query.get('page_token')).toBe('');
+  expect(calls.every(call => call.authorization === 'Bearer operator-test-token')).toBe(true);
+});
