@@ -45,6 +45,12 @@ export interface ProviderAuthDeps {
 
 const PROVIDER_LABEL: Record<AuthProvider, string> = { meego: 'Meego', bytedcli: 'ByteCloud' };
 
+/** What the person sends elsewhere when the link cannot reach them privately.
+ *  meegle keeps one login per tenant, so the tenant is part of the command. */
+export function meegoLoginCommand(tenant?: MeegoTenant): string {
+  return tenant ? `/login meego ${tenant}` : '/login meego';
+}
+
 const recent = new Map<string, { authUrl: string; at: number; reached: boolean }>();
 
 export async function requestProviderAuth(
@@ -64,7 +70,7 @@ export async function requestProviderAuth(
     link = {
       authUrl: login.authUrl,
       text: [t('auth_link.meego_title', undefined, locale), login.authUrl, '', t('auth_link.meego_footer', undefined, locale)].join('\n'),
-      command: '/login meego',
+      command: meegoLoginCommand(tenant),
     };
   } else {
     if (await deps.bytedcliAuthorized(openId) === true) {

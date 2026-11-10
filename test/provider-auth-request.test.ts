@@ -101,6 +101,13 @@ describe('requestProviderAuth — Meego', () => {
     expect((await ask('meego', 'ou_alice', { chatId: 'oc_topic' })).status).toBe('pending');
   });
 
+  it('the fallback command names the tenant, so a dcar user is pointed at the right login', async () => {
+    await ask('meego', 'ou_alice', { tenant: 'dcar' });
+    expect(deps.deliver.mock.calls[0]![1]).toBe('/login meego dcar');
+    await ask('meego', 'ou_bob');
+    expect(deps.deliver.mock.calls[1]![1]).toBe('/login meego');
+  });
+
   it('asks for the tenant the command runs under, and tracks each tenant\'s link apart', async () => {
     await ask('meego');
     meego = { state: 'link', authUrl: MEEGO_URL };
