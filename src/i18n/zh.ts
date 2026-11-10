@@ -187,6 +187,7 @@ export const messages: Record<string, string> = {
   'worker.traex_auto_model.preflight_lowest_load': '⚠️ 本次独立新轮次进入前，模型池内所有已知负载都超过 {threshold}%；已选择最低负载模型 {toModel}（{load}%，检查模型 {checkedModel} 为 {fromLoad}%），同值按模型池顺序确定。',
   'worker.traex_auto_model.preflight_hold': '⚠️ 本次独立新轮次进入前，模型池内所有已知负载都超过 {threshold}%；当前模型 {model} 已是最低负载项（{load}%），本轮保持该模型。',
   'worker.traex_auto_model.continue_prompt': '继续完成当前尚未结束的任务。请先根据已有会话上下文确认已经完成的步骤，不要重复已经成功执行的有副作用操作，然后从中断处继续并给出最终结果。',
+  'worker.traex_auto_model.continuation_rejected': '⚠️ 会话契约拒绝了自动换模续接，原始请求不会重发。请核对执行状态后再恢复任务。',
   'worker.traex_auto_model.access_search': '⚠️ 已跳过本轮访问暂时受限的模型，正在按模型池顺序尝试 {toModel} 并续接原会话。不会使用池外模型。',
   'worker.traex_auto_model.access_available_model': '↪️ 原模型访问暂时受限。已自动切换至模型池中首个不需排队的模型 {toModel}（当前负载 {load}%），正在续接原会话。如果仍持续排队，会继续检查后续模型。',
   'worker.traex_auto_model.access_selected_model': '↪️ 已跳过访问暂时受限的模型，当前 {toModel} 已正常开始执行，继续原会话。',

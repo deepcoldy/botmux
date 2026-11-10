@@ -6,7 +6,7 @@ import { sessionContractStore, type SessionContractStore } from '../services/ses
 import {
   contractReadiness, sameWorker, sameRuntime, sameExecution, type ContractSessionRef, type WorkerRef, type RuntimeRef,
   type RuntimeIdentity, type SessionEventContext, type ContractEvent, type ExecutionRef, type ControlKind,
-  type ControlOperation, type RuntimeContract,
+  type ControlOperation, type RuntimeContract, type RuntimeExecutionContinuation,
   sessionContractsEnabled,
   contractTerminalStatus,
   samePhysicalRuntimeIdentity,
@@ -65,13 +65,27 @@ export class SessionController {
   bindWorker(generation: number): SessionContractBootstrap {
     const previous = this.store.read(this.ref)?.worker;
     const worker = previous?.generation === generation ? previous : { workerId: randomUUID(), generation };
-    this.store.bindWorker(this.ref, worker); this.refresh(); return { version: 2, session: this.ref, worker,
+    this.store.bindWorker(this.ref, worker); this.refresh(); return { version: 2, session: this.ref, worker, executionContinuations: true,
       executions: this.store.executions(this.ref).map(({ ref, runtime, phase }) => ({ ref, runtime, phase })) };
   }
-  reserveBinding(bindingId: string, worker: WorkerRef): RuntimeRef {
+  private executionContinuationSupported(): boolean {
+    const cfg = this.ds.initConfig;
+    return cfg?.cliId === 'traex' && cfg.traexAutoModel?.enabled === true
+      && !cfg.adoptMode && !cfg.existingAppServerEndpoint && !cfg.wrapperCli
+      && ['pty', 'tmux', 'zellij', 'herdr'].includes(cfg.backendType);
+  }
+  reserveBinding(bindingId: string, worker: WorkerRef, continuation?: RuntimeExecutionContinuation): RuntimeRef {
     const state = this.store.read(this.ref)!;
     if (!sameWorker(state.worker, worker)) throw new Error('stale_runtime_registration');
-    const value = this.store.reserveRuntime(this.ref, worker, bindingId); this.refresh(); return value;
+    if (continuation && !this.executionContinuationSupported()) {
+      throw new Error('execution_continuation_not_supported');
+    }
+    const value = this.store.atomic(() => {
+      const runtime = this.store.reserveRuntime(this.ref, worker, bindingId);
+      if (continuation) this.store.planExecutionContinuation(this.ref, bindingId, runtime, worker, continuation);
+      return runtime;
+    });
+    this.refresh(); return value;
   }
   bindRuntime(bindingId: string, worker: WorkerRef, identity: RuntimeIdentity, operationId?: string, continuesBindingId?: string): RuntimeContract {
     if (this.abortedBindings.has(bindingId)) throw new Error('runtime_reservation_abandoned');
@@ -90,9 +104,14 @@ export class SessionController {
       const bound = this.store.bindRuntime(this.ref, proposed.ref, worker, identity, operation);
       if (continued && !sameRuntime(continued, bound.ref) && sameRuntime(this.store.read(this.ref)?.activeRuntime, bound.ref)) {
         this.store.continueRuntime(this.ref, continued, bound.ref, worker);
+        this.store.inheritExecutionContinuation(this.ref, continuesBindingId!, bindingId, worker);
       }
       return bound;
     });
+    // Physical binding is a fact even if granting execution continuation fails.
+    // A later registration retries the grant without erasing that live process.
+    if (this.executionContinuationSupported()) this.store.commitExecutionContinuation(this.ref, bindingId, worker);
+    else this.store.rejectExecutionContinuation(this.ref, bindingId);
     this.refresh(); return runtime;
   }
   bindingMayStart(bindingId: string): boolean {

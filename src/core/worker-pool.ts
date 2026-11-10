@@ -23053,7 +23053,7 @@ function setupWorkerHandlers(
       if (!sessionController.admitsRegistration(msg.type, msg.bindingId, metadata, contractWorker) || ds.worker !== worker) return;
       try {
         if (msg.type === 'runtime_binding_started') {
-          sessionController.reserveBinding(msg.bindingId, contractWorker);
+          sessionController.reserveBinding(msg.bindingId, contractWorker, msg.continuation);
           await sessionController.flushPrimary();
           const state = sessionController.store.read(sessionController.ref)!;
           if (ds.worker !== worker || !sameWorker(state.worker, contractWorker)) return;
@@ -23087,7 +23087,9 @@ function setupWorkerHandlers(
           sessionController.refresh();
           await sessionController.flushPrimary();
           if (ds.worker !== worker || !sameWorker(sessionController.store.read(sessionController.ref)!.worker, contractWorker)) return;
+          const continuation = sessionController.store.executionContinuation(sessionController.ref, msg.bindingId);
           worker.send({ type: 'runtime_contract_assigned', bindingId: msg.bindingId, runtime: runtime.ref, mayExecute: runtime.phase !== 'retiring',
+            ...(continuation ? { continuation } : {}),
             ...(observedExecutions.length ? { observedExecutions } : {}),
             executions: sessionController.store.executions(sessionController.ref).filter(execution => execution.runtime?.runtimeId === runtime.ref.runtimeId).map(execution => execution.ref),
             admissionStates: sessionController.store.executions(sessionController.ref).map(({ ref, runtime, phase }) => ({ ref, runtime, phase })) } as DaemonToWorker);
@@ -23095,6 +23097,10 @@ function setupWorkerHandlers(
         }
       } catch (error) {
         logger.warn(`[${t}] Runtime contract binding not confirmed: ${String(error)}`);
+        if (msg.type === 'runtime_binding_started' && msg.continuation
+          && ds.worker === worker && sameWorker(sessionController.store.read(sessionController.ref)!.worker, contractWorker)) {
+          worker.send({ type: 'runtime_contract_reserved', bindingId: msg.bindingId, mayStart: false });
+        }
         // A refused binding never becomes current. Release its reservation so
         // it cannot mask the surviving runtime's exit, and return the worker
         // to that runtime's binding.

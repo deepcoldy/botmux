@@ -922,6 +922,7 @@ let idleScreenSettleTask: {
   promise: Promise<{ proceed: boolean; degraded: boolean }>;
 } | null = null;
 let intentionalRestartBackend: SessionBackend | null = null;
+const intentionallyRetiredBackends = new WeakSet<SessionBackend>();
 // Hybrid codex RPC input mode (opt-in per bot, cfg.codexRpcInput). When active,
 // user input is delivered to codex via the app-server JSON-RPC channel
 // (turn/start) instead of a tmux paste, and the pane runs `codex --remote`
@@ -2014,7 +2015,13 @@ function bindSessionBackendExit<T extends (...args: any[]) => any>(callback: T):
   const observed = backend;
   return bindSessionRuntimeCallback(((...args: Parameters<T>) => {
     if (backend !== observed) {
-      if (intentionalRestartBackend === observed) intentionalRestartBackend = null;
+      if (intentionalRestartBackend === observed || (observed && intentionallyRetiredBackends?.has(observed))) {
+        if (observed) intentionallyRetiredBackends?.add(observed);
+        if (intentionalRestartBackend === observed) intentionalRestartBackend = null;
+        // Expected teardown must not reconcile the original execution while
+        // its already-started exact replacement is still proving identity.
+        return;
+      }
       // Only a scoped host can retain an old runtime's exit as history. Legacy
       // consumers interpret claude_exit as the current CLI and must not receive
       // a delayed exit from the planned replacement's predecessor.
@@ -2083,6 +2090,9 @@ async function publishRuntimeContract(binding: RuntimeEventBinding, nativeSessio
   const observed = runtimeIdentityForContract(binding);
   const identity = nativeSessionId ? { ...observed, nativeSessionId } : observed;
   const previous = binding.identity;
+  // A planned Auto continuation may bind only the actual native CLI, not a
+  // launcher/opaque startup observation whose process proof is still pending.
+  if (binding.continuation && (!identity.nativeSessionId || identity.proof === 'opaque')) return;
   // A buffered observation can arrive after the process disappears. Preserve
   // its proven binding so the captured physical exit still stops the runtime.
   if (previous && previous.proof !== 'opaque' && identity.proof === 'opaque') return;
@@ -2092,7 +2102,9 @@ async function publishRuntimeContract(binding: RuntimeEventBinding, nativeSessio
     || (previous.nativeSessionId !== undefined && previous.nativeSessionId !== identity.nativeSessionId))) {
     const scope = workerSessionEventScope;
     continuesBindingId = binding.bindingId;
+    const continuation = binding.continuation;
     binding = scope.beginRuntime(binding.operationId, binding.physicalId);
+    binding.continuation = continuation;
     scope.enterRuntime(binding);
     send({ type: 'runtime_binding_started', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
   }
@@ -6083,7 +6095,9 @@ function traexAutoModelRuntimeEligible(): boolean {
     && !lastInitConfig.adoptMode
     && !lastInitConfig.existingAppServerEndpoint
     && !codexRpcEngine
-    && !isRemoteBackendType(effectiveBackendType);
+    && !isRemoteBackendType(effectiveBackendType)
+    // A newer worker must not rotate into a host that cannot grant recovery.
+    && (!workerSessionEventScope || lastInitConfig.sessionContract?.executionContinuations === true);
 }
 
 function enqueueTraexAutoModelRecovery(turnId: string): boolean {
@@ -6095,9 +6109,16 @@ function enqueueTraexAutoModelRecovery(turnId: string): boolean {
     item.traexAutoModelRecovery === true && item.turnId === turnId)) {
     return true;
   }
+  const binding = workerSessionEventScope?.currentBinding();
+  const execution = workerSessionEventScope?.executionForTurn(turnId);
+  const nativeSessionId = lastInitConfig?.cliSessionId;
+  const continuation = binding?.runtime && execution && nativeSessionId
+    ? { reason: 'traex-auto-model' as const, from: binding.runtime, execution, nativeSessionId } : undefined;
+  if (workerSessionEventScope && !continuation) return false;
   pendingMessages.unshift({
     content: t('worker.traex_auto_model.continue_prompt'),
     turnId,
+    ...(continuation ? { traexAutoModelContinuation: structuredClone(continuation) } : {}),
     trustedCaller: active.caller,
     trustedController: active.controller,
     turnCallerOpenId: currentBotmuxCallerOpenId,
@@ -6141,10 +6162,15 @@ function executeTraexAutoModelSwitch(
     || !lastInitConfig) return false;
   const nativeSessionId = lastInitConfig.cliSessionId;
   if (!nativeSessionId) return false;
-  if (opts.resumeCurrentTurn && traexAutoModelTurnReplayForbidden) return false;
+  if (opts.resumeCurrentTurn && (traexAutoModelTurnReplayForbidden || currentInputDeliveryQuarantine())) return false;
   const active = activeTurnAuthority.snapshot();
   if (opts.resumeCurrentTurn && (!active?.started || active.turnId !== action.turnId
     || active.dispatchAttempt !== undefined)) return false;
+  const sourceBinding = workerSessionEventScope?.currentBinding();
+  if (opts.resumeCurrentTurn && workerSessionEventScope
+    && (!sourceBinding?.runtime || sourceBinding.identity?.proof !== 'process_start'
+      || sourceBinding.identity.nativeSessionId !== nativeSessionId
+      || !workerSessionEventScope.executionForTurn(action.turnId))) return false;
   if (!traexAutoModelController?.commitSwitch(action)) return false;
   if (opts.resumeCurrentTurn && !enqueueTraexAutoModelRecovery(action.turnId)) {
     log(`TraeX auto-model switch refused: turn ${action.turnId.slice(0, 12)} lacks safe ordinary-turn authority`);
@@ -20913,6 +20939,7 @@ function traexAutoModelInputHold(): boolean {
 }
 
 let traexAutoModelAdmissionRetry: ReturnType<typeof setTimeout> | undefined;
+let traexContinuationGrantRecheckAt = 0;
 
 /** Unknown/stale reads must retain the input and remain live even when a
  * static screen emits no further output. One bounded retry drives the normal
@@ -21400,6 +21427,21 @@ async function flushPending(): Promise<void> {
       if (activeTurnBlocks(pendingMessages[0]!)) break;
       if (traexAutoModelRuntimeEligible()
         && !(await admitTraexAutoModelPendingInput(pendingMessages[0]!))) break;
+      const continuation = pendingMessages[0]!.traexAutoModelContinuation;
+      if (workerSessionEventScope && pendingMessages[0]!.traexAutoModelRecovery && continuation
+        && !workerSessionEventScope.canSubmitContinuation(pendingMessages[0]!.turnId!, continuation.execution)) {
+        const scope = workerSessionEventScope;
+        const binding = scope.currentBinding();
+        if (binding && Date.now() - traexContinuationGrantRecheckAt >= 1_000) {
+          traexContinuationGrantRecheckAt = Date.now();
+          void scope.run(binding, () => publishRuntimeContract(binding)).catch(error => {
+            log(`TraeX continuation grant recheck failed: ${String(error)}`);
+          });
+        }
+        keepPromptReadyAfterHold();
+        retryTraexAutoModelAdmission();
+        break;
+      }
       if (!openingInputBoxSettled) {
         // writeInput would run the same check after this input is dequeued and
         // its turn opened; a refusal there fails the input instead of keeping it.
@@ -21442,11 +21484,15 @@ async function flushPending(): Promise<void> {
         retryTraexAutoModelAdmission();
         break;
       }
-      if (workerSessionEventScope && !workerSessionEventScope.canSubmit(item.turnId, item.dispatchAttempt)) {
+      const continuedExecution = item.traexAutoModelRecovery ? item.traexAutoModelContinuation?.execution : undefined;
+      if (workerSessionEventScope && !(continuedExecution && item.turnId
+        ? workerSessionEventScope.canSubmitContinuation(item.turnId, continuedExecution)
+        : workerSessionEventScope.canSubmit(item.turnId, item.dispatchAttempt))) {
         if (item.turnId) send({ type: 'turn_input_rejected', turnId: item.turnId, ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}), reason: 'execution_reconciliation_required' });
         continue;
       }
-      workerSessionEventScope?.enterTurn(item.turnId, item.dispatchAttempt);
+      if (continuedExecution && item.turnId) workerSessionEventScope?.enterContinuation(item.turnId, continuedExecution);
+      else workerSessionEventScope?.enterTurn(item.turnId, item.dispatchAttempt);
       cliSubmissionInFlight = { item, generation: cliSpawnGeneration, composerOwned: false };
       attachDeferredPluginSkillCatalog(item);
       // Apply the credential snapshot that arrived WITH this turn, immediately
@@ -23359,14 +23405,23 @@ async function spawnCli(
   }
   const execution = firstBinding || cfg.prompt ? cfg.sessionCommand?.execution : undefined;
   const previousBinding = workerSessionEventScope.currentBinding();
+  const recovery = opts.restartCause === 'traex-auto-model'
+    ? pendingMessages.find(item => item.traexAutoModelRecovery && item.traexAutoModelContinuation
+      && item.turnId === traexAutoModelController?.currentTurnId())?.traexAutoModelContinuation : undefined;
+  const continuation = recovery && cfg.cliId === 'traex' && cfg.resume
+    && cfg.cliSessionId === recovery.nativeSessionId && previousBinding?.runtime
+    && previousBinding.runtime.runtimeId === recovery.from.runtimeId
+    && previousBinding.runtime.epoch === recovery.from.epoch ? recovery : undefined;
   const binding = workerSessionEventScope.beginRuntime(activeRestartAttemptId);
+  binding.continuation = continuation;
   if (execution) workerSessionEventScope.rememberExecution(execution, binding);
   return workerSessionEventScope.run(binding, async () => {
     const reserved = awaitRuntimeReservation(pendingRuntimeReservations, binding.bindingId, () => log(
       `Runtime reservation ${binding.bindingId} unanswered after ${RUNTIME_RESERVATION_SLOW_LOG_MS / 1000}s; `
       + `waiting for the daemon up to ${RUNTIME_RESERVATION_DEADLINE_MS / 1000}s`,
     ));
-    send({ type: 'runtime_binding_started', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
+    send({ type: 'runtime_binding_started', bindingId: binding.bindingId,
+      ...(continuation ? { continuation } : {}), ...(binding.operationId ? { operationId: binding.operationId } : {}) });
     const outcome = await reserved;
     const superseded = closeRequested || workerSessionEventScope?.currentBinding() !== binding;
     if (outcome !== 'granted' || superseded) {
@@ -23375,6 +23430,7 @@ async function spawnCli(
       // Superseded means another lifecycle operation owns the next start. An
       // unanswered start has no such owner, so it must fail where it is seen.
       if (outcome === 'expired' && !superseded) throw new RuntimeReservationExpiredError();
+      if (outcome === 'refused' && continuation && !superseded) throw new Error('TraeX auto-model continuation reservation was refused');
       if (outcome === 'refused') log(`Daemon refused runtime reservation ${binding.bindingId}; the lifecycle operation that owns the session takes over`);
       throw new CliSpawnSupersededError();
     }
@@ -30220,7 +30276,10 @@ async function restartCliProcess(
           pending.push(...childrenOf(current));
         }
       }
-      if (restartingBackend) intentionalRestartBackend = restartingBackend;
+      if (restartingBackend) {
+        intentionalRestartBackend = restartingBackend;
+        intentionallyRetiredBackends.add(restartingBackend);
+      }
       const teardown = restartingBackend?.destroySession?.();
       let teardownOutcome: RestartTeardownOutcome = { kind: 'absent' };
       if (teardown && typeof (teardown as Promise<void>).then === 'function') {
@@ -34811,13 +34870,36 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       break;
     }
     case 'runtime_contract_assigned': {
-      workerSessionEventScope?.assign(msg.bindingId, msg.runtime);
-      for (const state of msg.admissionStates ?? []) workerSessionEventScope?.noteAdmission(state);
+      const scope = workerSessionEventScope;
+      if (scope && !scope.bindingSharesCurrentProcess(msg.bindingId)) break;
+      scope?.assign(msg.bindingId, msg.runtime);
+      const continuation = msg.continuation;
+      if (continuation?.status === 'approved') {
+        const state = msg.admissionStates?.find(value => value.ref.executionId === continuation.execution.executionId
+          && value.ref.turnId === continuation.execution.turnId && value.ref.dispatchAttempt === continuation.execution.dispatchAttempt);
+        if (state) scope?.acceptContinuation(msg.bindingId, state);
+      }
+      for (const state of msg.admissionStates ?? []) scope?.noteAdmission(state);
       for (const execution of msg.executions ?? []) workerSessionEventScope?.rememberExecution(execution);
       for (const observed of msg.observedExecutions ?? []) {
         workerSessionEventScope?.rememberObservedExecution(msg.bindingId, observed.runtime, observed.execution);
       }
-      if (!msg.mayExecute) { closeRequested = true; stopBridgeWatcher(); stopScreenshotLoop(); killCli(); }
+      if (continuation?.status === 'rejected') {
+        const recovery = pendingMessages.find(item => item.traexAutoModelRecovery
+          && item.traexAutoModelContinuation?.execution.executionId === continuation.execution.executionId);
+        if (recovery?.turnId) {
+          for (let index = pendingMessages.length - 1; index >= 0; index--) {
+            if (pendingMessages[index]!.traexAutoModelRecovery
+              && pendingMessages[index]!.traexAutoModelContinuation?.execution.executionId === continuation.execution.executionId) pendingMessages.splice(index, 1);
+          }
+          traexAutoModelTurnReplayForbidden = true;
+          traexAutoModelController?.endTurn(recovery.turnId);
+          send({ type: 'user_notify', turnId: recovery.turnId, message: t('worker.traex_auto_model.continuation_rejected') });
+        }
+      }
+      if (!msg.mayExecute && (!scope || scope.currentBinding()?.bindingId === msg.bindingId)) {
+        closeRequested = true; stopBridgeWatcher(); stopScreenshotLoop(); killCli();
+      } else if (continuation) void flushPending();
       break;
     }
 

@@ -14,6 +14,12 @@ import { t } from '../src/i18n/index.js';
 import { lookupCliDisplayName } from '../src/adapters/cli/display-names.js';
 import { traexAutoModelPolicyKey } from '../src/services/traex-auto-model.js';
 import { restartInterruptionNote, restartInterruptionNotice } from '../src/services/restart-interruption.js';
+import { SessionController } from '../src/core/session-controller.js';
+import { SessionContractStore } from '../src/services/session-contract-store.js';
+import { sameWorker } from '../src/services/session-contract.js';
+import { loadWorkerPoolClosure } from './helpers/worker-pool-function-harness.js';
+import type { DaemonSession } from '../src/core/types.js';
+import { probeTmuxFunctional } from '../src/setup/ensure-tmux.js';
 
 const interruptedTurn = { turnOpen: true, tasks: [] };
 const interruptionNote = () => restartInterruptionNote(interruptedTurn);
@@ -43,6 +49,8 @@ if (!modelOrderNoticeFragment) {
 const children: ChildProcess[] = [];
 const roots: string[] = [];
 const panes: string[] = [];
+const contractHandles: SessionContractStore[] = [];
+const contractEvents: Promise<unknown>[] = [];
 afterEach(async () => {
   for (const child of children.splice(0)) {
     if (child.exitCode === null && child.signalCode === null) {
@@ -54,6 +62,8 @@ afterEach(async () => {
   for (const pane of panes.splice(0)) {
     killWorkerTmuxSession(`=${pane}`);
   }
+  await Promise.all(contractEvents.splice(0));
+  for (const store of contractHandles.splice(0)) store.close();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -71,7 +81,7 @@ async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = 
   delayedHistoryReceipt?: { submission: number; ms: number },
   preflight?: { enabled: boolean; initialPrompt?: string; dispatchAttempt?: number;
     probe?: 'success' | 'timeout' | 'failure'; timeoutMs?: number },
-  restoreInterruptedStructuredTurn = false, restoreExhaustedOnLast = false) {
+  restoreInterruptedStructuredTurn = false, restoreExhaustedOnLast = false, withContract = false) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-auto-model-'));
   roots.push(root);
   const dataDir = join(root, 'session');
@@ -211,7 +221,7 @@ process.stdin.on('data', chunk => {
           ...(failed ? { error } : {}) });
         idle();
       }, 1200);
-    } else if (successorAfterReset) {
+    } else if (successorAfterReset || (${JSON.stringify(withContract)} && model !== 'core')) {
       process.stdout.write('\\x1b[2J\\x1b[H◆ Working… (2s • esc to interrupt)\\nContext 99% left\\n');
     } else if (${JSON.stringify(activityMode === 'delayed-first-queue')} && model === 'core') {
       // Native submission is acknowledged before its first activity repaint.
@@ -267,7 +277,7 @@ setInterval(() => {
     })}\n`);
   }
   const binary = process.env.BOTMUX_TEST_WORKER_BINARY;
-  const backendType = binary || process.env.BOTMUX_TEST_WORKER_BACKEND === 'tmux' ? 'tmux' : 'pty';
+  const backendType = withContract || binary || process.env.BOTMUX_TEST_WORKER_BACKEND === 'tmux' ? 'tmux' : 'pty';
   if (backendType === 'tmux') panes.push(`bmx-${sessionId.slice(0, 8)}`);
   const options = {
     cwd: resolve('.'),
@@ -324,9 +334,22 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
   const child = binary ? spawn(binary, ['__worker'], options) : spawnNodeTsScript(entry, [], options);
   children.push(child);
   const measurements: any[] = [];
+  const hostErrors: unknown[] = [];
+  const ds = { larkAppId: 'app_test', chatId: 'oc_test', worker: child, workerGeneration: 1,
+    session: { sessionId, larkAppId: 'app_test', status: 'active' }, cliReadyGeneration: 0 } as unknown as DaemonSession;
+  const store = withContract ? new SessionContractStore(dataDir, 'app_test') : undefined;
+  if (store) contractHandles.push(store);
+  const controller = store ? new SessionController(ds, store) : undefined;
+  const bootstrap = controller?.bindWorker(1);
+  const host = controller && bootstrap ? loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', {
+    sessionController: controller, contractWorker: bootstrap.worker, ds, worker: child, sameWorker,
+    logger: { warn: (line: string) => logs.push(`HOST ${line}\n`), debug: () => {}, error: () => {} }, t,
+    handleLegacyWorkerMessage: async () => {},
+  }) : undefined;
   child.on('message', (raw: any) => {
     if (raw.type === 'admission_heartbeat' || raw.type === 'admission_capture') measurements.push(raw);
     else messages.push(raw as WorkerToDaemon);
+    if (host) contractEvents.push(host(raw).catch(error => { hostErrors.push(error); }));
   });
   child.stdout?.on('data', chunk => logs.push(chunk.toString()));
   child.stderr?.on('data', chunk => logs.push(chunk.toString()));
@@ -374,14 +397,111 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
         last: { reasoningEffort: 'xhigh', modelBackendVariant: 'max' },
       } } : {}),
     } } : {}),
+    ...(bootstrap ? { sessionContract: bootstrap } : {}),
     larkAppId: 'app_test', larkAppSecret: 'secret' } satisfies DaemonToWorker;
+  ds.initConfig = init;
   child.send(init);
   if (startupExtraArgs) await wait(() => messages.some(message => message.type === 'error' && message.message.includes('cannot be overridden')), 'rejected external model argv');
   else await wait(() => messages.some(message => message.type === 'prompt_ready'), 'startup prompt');
-  return { child, messages, wait, submissions, launches, release, nativeId, logs, rpcRequests, init, measurements, crash, fake };
+  const sendInput = (content: string, turnId: string): void => {
+    const execution = controller?.admitInput(turnId);
+    const message = { type: 'message' as const, content, turnId,
+      trustedCaller: { requestLarkAppId: 'app_test', requestUserOpenId: 'ou_test', senderType: 'user' as const },
+      ...(controller ? { sessionCommand: controller.command({ type: 'message', turnId,
+        sessionCommand: { version: 2, execution } }) } : {}) };
+    child.send(message);
+  };
+  return { child, messages, wait, submissions, launches, release, nativeId, logs, rpcRequests, init, measurements, crash, fake,
+    sendInput, controller, hostErrors, options, entry, ds };
 }
 
 describe('TraeX auto-model real Worker and PTY', () => {
+  it.skipIf(!probeTmuxFunctional().ok)('does not replay original input after an approved-window host restart', async () => {
+    const f = await fixture(true, 'ordered', false, undefined, true, undefined, true,
+      undefined, 0, 0, false, false, undefined, undefined, undefined, false, false, true);
+    const originalSend = f.child.send.bind(f.child);
+    let dropped = 0;
+    f.child.send = ((message: any, ...args: any[]) => {
+      if (message.type === 'runtime_contract_assigned' && message.continuation?.status === 'approved') {
+        dropped++; return true;
+      }
+      return (originalSend as any)(message, ...args);
+    }) as typeof f.child.send;
+    f.sendInput('original restart task', 'om_restart');
+    await f.wait(() => rows(f.submissions).length === 1, 'original request submitted');
+    await f.wait(() => dropped > 0, 'approved receipt deliberately lost');
+    expect(rows(f.submissions)).toHaveLength(1);
+    const restartedDs = { ...f.ds, session: structuredClone(f.ds.session) };
+    const exited = new Promise<void>(resolveExit => f.child.once('exit', () => resolveExit()));
+    f.child.kill('SIGKILL'); await exited;
+    contractHandles.splice(contractHandles.indexOf(f.controller!.store), 1); f.controller!.store.close();
+    const store = new SessionContractStore(f.options.env.SESSION_DATA_DIR, 'app_test'); contractHandles.push(store);
+    const controller = new SessionController(restartedDs, store); const bootstrap = controller.bindWorker(2);
+    const second = spawnNodeTsScript(f.entry, [], f.options); children.push(second);
+    restartedDs.worker = second; restartedDs.workerGeneration = 2;
+    const secondMessages: WorkerToDaemon[] = [];
+    const secondLogs: string[] = [];
+    const host = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', {
+      sessionController: controller, contractWorker: bootstrap.worker, ds: restartedDs, worker: second, sameWorker,
+      logger: { warn: (line: string) => secondLogs.push(line), debug: () => {}, error: () => {} }, t,
+      handleLegacyWorkerMessage: async () => {},
+    });
+    second.on('message', (raw: any) => { secondMessages.push(raw); contractEvents.push(host(raw)); });
+    second.stdout?.on('data', chunk => secondLogs.push(chunk.toString()));
+    second.stderr?.on('data', chunk => secondLogs.push(chunk.toString()));
+    const init = { ...f.init, model: 'backup', resume: true, cliSessionId: f.nativeId, sessionContract: bootstrap };
+    restartedDs.initConfig = init; second.send(init);
+    async function waitSecond(predicate: () => boolean, description: string) {
+      const until = Date.now() + 35_000;
+      while (Date.now() < until) {
+        if (predicate()) return;
+        if (second.exitCode !== null || second.signalCode !== null) break;
+        await new Promise(resolveWait => setTimeout(resolveWait, 50));
+      }
+      throw new Error(`${description}\n${secondLogs.join('')}`);
+    }
+    await waitSecond(() => secondMessages.some(message => message.type === 'prompt_ready'), 'reattached worker ready');
+    const execution = controller.admitInput('om_restart');
+    second.send({ type: 'message', content: 'original restart task', turnId: execution.turnId,
+      trustedCaller: { requestLarkAppId: 'app_test', requestUserOpenId: 'ou_test', senderType: 'user' },
+      sessionCommand: controller.command({ type: 'message', turnId: execution.turnId, sessionCommand: { version: 2, execution } }) });
+    await waitSecond(() => rows(f.submissions).length >= 2 || secondMessages.some(message => message.type === 'turn_input_rejected'), 'duplicate rejection');
+    expect(rows(f.submissions).filter(row => row.text === 'original restart task')).toHaveLength(1);
+  }, 80_000);
+
+  it.skipIf(!probeTmuxFunctional().ok)('continues an admitted execution after an exact model switch under the session contract', async () => {
+    const f = await fixture(true, 'ordered', false, undefined, true, undefined, true,
+      undefined, 0, 0, false, false, undefined, undefined, undefined, false, false, true);
+    f.sendInput('original contract task', 'om_contract');
+    await f.wait(() => rows(f.submissions).length === 1, 'original contract input');
+    await f.wait(() => rows(f.launches).length === 2, 'exact model replacement');
+    await f.wait(() => rows(f.submissions).length === 2, 'authorized contract continuation', 30_000);
+    expect(f.hostErrors).toEqual([]);
+    expect(f.messages.filter(message => message.type === 'turn_input_rejected')).toEqual([]);
+    expect(rows(f.submissions)[1].text).toBe(t('worker.traex_auto_model.continue_prompt'));
+    expect(rows(f.launches).slice(1).every(row => row.args[0] === 'resume' && row.args.at(-1) === f.nativeId)).toBe(true);
+    await new Promise(resolveWait => setTimeout(resolveWait, 3_000));
+    writeFileSync(f.release, 'finish');
+    await f.wait(() => f.messages.some(message => message.type === 'turn_terminal'
+      && message.turnId === 'om_contract' && message.status === 'completed'), 'continued execution terminal');
+    const executions = f.controller!.store.executions(f.controller!.ref, 'om_contract');
+    expect(executions).toHaveLength(1);
+    expect(executions[0]!.phase).toBe('succeeded');
+    expect(executions[0]!.runtime).toEqual(f.controller!.currentRuntime());
+    f.sendInput('next contract task', 'om_contract_next');
+    await f.wait(() => rows(f.submissions).length === 3, 'successor contract input');
+    expect(rows(f.submissions).filter(row => row.text === 'original contract task')).toHaveLength(1);
+    expect(rows(f.submissions).filter(row => row.text === t('worker.traex_auto_model.continue_prompt'))).toHaveLength(1);
+    expect(rows(f.submissions).filter(row => row.text === 'next contract task')).toHaveLength(1);
+    const priorMessages = f.messages.length;
+    f.sendInput('original contract task', 'om_contract');
+    await f.wait(() => f.messages.slice(priorMessages).some(message =>
+      (message.type === 'turn_input_committed' || message.type === 'turn_input_rejected')
+      && message.turnId === 'om_contract'), 'duplicate input receipt');
+    expect(rows(f.submissions)).toHaveLength(3);
+    expect(f.hostErrors).toEqual([]);
+  }, 70_000);
+
   it('model access restrictions continue through the ordered pool without replaying the original input', async () => {
     const f = await fixture(true, 'ordered', false, undefined, false, undefined, false,
       undefined, 0, 0, false, false, { code: 'other', message: 'Model access temporarily restricted.', trigger: 'capacity' });
