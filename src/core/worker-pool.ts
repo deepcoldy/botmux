@@ -25564,6 +25564,11 @@ export function forkAdoptWorker(
   // IPC handlers capture the contract at registration time, before the child
   // requests its first runtime reservation (including restored adopt sessions).
   ds.initConfig = initMsg;
+  try {
+    startNewGenerationEnvLedger(ds, initMsg.env);
+  } catch (err) {
+    logger.error(`[${t}] Failed to initialize adopt worker env ledger: ${err instanceof Error ? err.message : String(err)}`);
+  }
   setupWorkerHandlers(ds, worker, startupState, workerGeneration, stderrRing);
   ds.worker = worker;
   initializeWorkerIpcBootstrap(worker);
@@ -25580,12 +25585,6 @@ export function forkAdoptWorker(
 
   // init is now accepted by the child. Everything below is projection only and
   // must not turn this prompt back into a retryable delivery.
-  ds.initConfig = initMsg;
-  try {
-    startNewGenerationEnvLedger(ds, initMsg.env);
-  } catch (err) {
-    logger.error(`[${t}] Failed to initialize adopt worker env ledger: ${err instanceof Error ? err.message : String(err)}`);
-  }
   const adoptedCliIdTyped = adoptedCliId as CliId;
   if (ds.session.cliId !== adoptedCliIdTyped) {
     ds.session.cliId = adoptedCliIdTyped;

@@ -7407,6 +7407,29 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
     }));
   });
 
+  it.each([false, true])('preserves previous env risk before adopt init dispatch, including send failure (fail=%s)', failSend => {
+    const ds = makeAdoptDs();
+    ds.mojoAppliedUnprovableEnvKeys = ['LD_PRELOAD'];
+    ds.mojoRetiringUnprovableEnvKeys = ['PATH'];
+    const child: ChildProcess = makeFakeWorker();
+    vi.spyOn(child, 'send').mockImplementation(() => {
+      expect(ds.mojoRetiringUnprovableEnvKeys?.slice().sort()).toEqual(['LD_PRELOAD', 'PATH']);
+      expect(ds.mojoAppliedUnprovableEnvKeys).toBeUndefined();
+      if (failSend) throw new Error('Init dispatch failed');
+      return true;
+    });
+    forkMock.mockReturnValueOnce(child);
+
+    if (failSend) {
+      expect(() => forkAdoptWorker(ds)).toThrow('Init dispatch failed');
+      expect(ds.initConfig).toBeUndefined();
+    } else {
+      expect(forkAdoptWorker(ds)).toBe('accepted');
+    }
+    expect(ds.mojoRetiringUnprovableEnvKeys?.slice().sort()).toEqual(['LD_PRELOAD', 'PATH']);
+    expect(child.send).toHaveBeenCalledOnce();
+  });
+
   it.each([false, true])('cleans up and reports a synchronous adopt init send failure (previous init=%s)', hasPreviousInit => {
     const ds = makeAdoptDs();
     if (hasPreviousInit) forkAdoptWorker(ds);
