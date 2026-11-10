@@ -18,9 +18,9 @@
  * starts us with a minimal environment.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync, unlinkSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync, unlinkSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { homedir, userInfo } from 'node:os';
-import { join, dirname } from 'node:path';
+import { basename, join, dirname } from 'node:path';
 import { isStandaloneBinary } from './core/self-spawn.js';
 import { isCliIdentityPath } from './utils/child-env.js';
 
@@ -249,14 +249,34 @@ export function mergePathEntries(preferred: string, fallback: string, separator 
  * Priority, highest first:
  *   1. the user's login-shell PATH — what the user actually expects to find;
  *   2. the PATH already persisted in the boot hook — never shrink it;
- *   3. the PATH of whoever is writing the hook right now.
+ *   3. the PATH of whoever is writing the hook right now;
+ *   4. the tool dirs botmux's installer manages ({@link managedToolDirs}).
  *
- * A missing login PATH (no shell, probe failed) simply drops that tier.
+ * A missing login PATH (no shell, probe failed) simply drops that tier. Tier 4
+ * is the only one that does not depend on anybody's environment: a unit that
+ * already lost a managed dir cannot get it back from tiers 1–3 when none of
+ * them ever had it.
+ *
+ * Tier 4 is laid out from disk on EVERY render, as one group: the dirs the
+ * login shell lists in its own order, then the rest newest first. Once written
+ * it comes back as tier 2, so deriving it from the persisted PATH would pin
+ * the first runtime ever written ahead of every later one and keep a removed
+ * runtime forever. Only without a login PATH (probe failed) does the persisted
+ * order stand in for the login shell's, and only once it lists every runtime
+ * on disk; otherwise a flaky probe would flip the order on every render.
+ * Where tiers 1–3 already list one of these dirs the group takes that place
+ * (a healthy unit keeps finding `node` where it did); otherwise it goes last
+ * and only fills gaps. Entries of installer runtimes that no longer exist drop
+ * out, but only while some runtime is still visible: an empty, unreadable or
+ * missing root (re-install, a share not mounted yet) proves nothing, and
+ * dropping then would push the dirs to the end for good.
  */
 export function bootHookPath(input: {
   callerPath?: string;
   existingPath?: string;
   loginPath?: string;
+  /** Tier 4, for tests. Defaults to {@link managedToolDirs}. */
+  managedDirs?: readonly string[];
   targetPlatform: NodeJS.Platform;
 }): string {
   const separator = input.targetPlatform === 'win32' ? ';' : ':';
@@ -266,7 +286,76 @@ export function bootHookPath(input: {
     caller,
     separator,
   );
-  return autostartPath(merged, input.targetPlatform);
+  const managed = input.managedDirs ?? managedToolDirs(homedir(), input.targetPlatform);
+  const current = new Set(managed);
+  const root = installerRoot(homedir());
+  const owned = (entry: string) =>
+    current.has(entry) || (current.size > 0 && isInstallerNodeBin(entry, root) && !isDirectory(entry));
+  const listed = (path: string) => [...new Set(path.split(separator).filter(entry => current.has(entry)))];
+  const persisted = listed(input.existingPath ?? '');
+  const preferred = input.loginPath !== undefined
+    ? listed(input.loginPath)
+    : persisted.length === current.size ? persisted : [];
+  const group = [...new Set([...preferred, ...managed])];
+  const entries = autostartPath(merged, input.targetPlatform).split(separator);
+  const kept = entries.filter(entry => !owned(entry));
+  // Placed after autostartPath so empty tiers 1–3 still fall back to the
+  // system default dirs instead of a PATH holding only the managed ones.
+  const base = kept.length > 0 ? kept : autostartPath('', input.targetPlatform).split(separator);
+  const first = entries.findIndex(owned);
+  const at = first === -1 ? base.length : first;
+  return [...base.slice(0, at), ...group, ...base.slice(at)].join(separator);
+}
+
+const INSTALLER_NODE_DIR = /^node-v(\d+)\.(\d+)\.(\d+)-([a-z]+)-([a-z0-9]+)$/;
+
+function installerRoot(home: string): string {
+  return join(home, '.local', 'share', 'botmux');
+}
+
+/** `<installer root>/node-v<x.y.z>-<os>-<arch>/bin`, existing or not. */
+function isInstallerNodeBin(entry: string, root: string): boolean {
+  return basename(entry) === 'bin' && dirname(dirname(entry)) === root
+    && INSTALLER_NODE_DIR.test(basename(dirname(entry)));
+}
+
+/**
+ * Tool directories botmux's installer manages on this machine, newest first.
+ *
+ * Today that is the Node runtime the one-click installer unpacks to
+ * `~/.local/share/botmux/node-<version>-<os>-<arch>` on a machine without a
+ * usable Node. `npm i -g` run with that Node installs lark-cli, agentbuddy and
+ * the like into its `bin`, yet the installer only puts `~/.local/bin` (links
+ * to node/npm) in the shell profile — the login shell never has this dir, and
+ * without it new sessions bind lark-cli to the not-installed placeholder.
+ *
+ * Only dirs that exist and match this OS/CPU are returned (`os` and `arch` in
+ * the installer's naming are Node's `process.platform` / `process.arch`).
+ */
+export function managedToolDirs(
+  home: string = homedir(),
+  targetPlatform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+): string[] {
+  const root = installerRoot(home);
+  let names: string[];
+  try { names = readdirSync(root); } catch { return []; }
+  const version = (m: RegExpExecArray) => [Number(m[1]), Number(m[2]), Number(m[3])];
+  return names
+    .map(name => ({ name, match: INSTALLER_NODE_DIR.exec(name) }))
+    .filter((e): e is { name: string; match: RegExpExecArray } =>
+      !!e.match && e.match[4] === targetPlatform && e.match[5] === arch)
+    .sort((a, b) => {
+      const [x, y] = [version(a.match), version(b.match)];
+      // Names break ties so the order never depends on the directory listing.
+      return y[0] - x[0] || y[1] - x[1] || y[2] - x[2] || (a.name < b.name ? -1 : 1);
+    })
+    .map(({ name }) => join(root, name, 'bin'))
+    .filter(isDirectory);
+}
+
+function isDirectory(path: string): boolean {
+  try { return statSync(path).isDirectory(); } catch { return false; }
 }
 
 /** The PATH already persisted in a systemd unit, if the unit has one. */
