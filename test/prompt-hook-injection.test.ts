@@ -153,6 +153,19 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     else process.env.SESSION_DATA_DIR = prevDataDir;
   });
 
+  it.each(['auto', 'off'] as const)('exposes message location in %s mode', (mode) => {
+    getBotMock.mockReturnValue({ config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: mode } });
+    for (const root of [undefined, 'om_topic']) {
+      const messageLocation = { messageId: 'om_followup', ...(root ? { rootMessageId: root } : {}) };
+      const result = buildFollowUpCliInput('followup', SESSION_ID, followUpOpts({ messageLocation }));
+      expect(result.content).toContain('message_id="om_followup"');
+      expect(result.content).toContain(`placement="${root ? 'thread' : 'chat'}"`);
+      if (root) expect(result.content).toContain('root_message_id="om_topic"');
+      else expect(result.content).not.toContain('root_message_id=');
+      if (mode === 'auto') expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeDefined();
+    }
+  });
+
   it('auto + claude-code + preflight 通过：reminder/whiteboard/sender/mentions 进 sidecar，PTY 文本只剩正文', () => {
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: 'wb_1' }));
 

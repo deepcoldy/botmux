@@ -400,7 +400,8 @@ describe('empty-started session — first real business turn must use the new-to
     );
 
     const followUp = liveInputs()[0]!.content;
-    expect(followUp).toBe('继续');
+    expect(followUp).toContain('继续');
+    expect(followUp).toContain('<message_location ');
     const envelope = claimPromptContext(
       ds.session.sessionId,
       'om_live_resumed_hook_emphasis',
@@ -432,7 +433,8 @@ describe('empty-started session — first real business turn must use the new-to
     );
 
     const followUp = liveInputs()[0]!.content;
-    expect(followUp).toBe('继续');
+    expect(followUp).toContain('继续');
+    expect(followUp).toContain('<message_location ');
     const envelope = claimPromptContext(
       ds.session.sessionId,
       'om_live_resumed_transcript_hook_emphasis',

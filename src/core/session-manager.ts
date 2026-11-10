@@ -1,3 +1,4 @@
+import { renderInboundMessageLocation, type InboundMessageLocation } from './reply-message.js';
 import { isWorkflowNodeSessionMarker, workflowHandoffInputOptions } from './workflow-node-session.js';
 import { isLeadOnlySession } from './lead-only.js';
 import { deploymentContinuationCandidate, claimDeploymentContinuation, deploymentContinuationClaimCurrent, setDeploymentContinuation } from '../services/deployment-continuation.js';
@@ -1825,7 +1826,7 @@ export function buildNewTopicCliInput(
  * Mirrors buildNewTopicPrompt structure but for subsequent messages.
  * Session ID is omitted for adopt mode and CLIs with injectsSessionContext.
  */
-type FollowUpBlockKey = 'sessionId' | 'role' | 'credentials' | 'summaryMemory' | 'formatting' | 'reminder' | 'whiteboard' | 'groupHistory' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
+type FollowUpBlockKey = 'messageLocation' | 'sessionId' | 'role' | 'credentials' | 'summaryMemory' | 'formatting' | 'reminder' | 'whiteboard' | 'groupHistory' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
 
 /**
  * 按既有顺序构造 follow-up 的各个块。inline 模式直接 join；hook 模式
@@ -1834,6 +1835,7 @@ type FollowUpBlockKey = 'sessionId' | 'role' | 'credentials' | 'summaryMemory' |
 /** follow-up 构建选项。sessionBackendType 取会话冻结的后端类型（非当前 bot 配置，
  *  那些是 next-session 生效），用于判断该会话是否有本地 Claude hook 进程。 */
 type FollowUpOpts = {
+  messageLocation?: InboundMessageLocation;
   promptInjection?: PromptInjection;
   attachments?: LarkAttachment[];
   mentions?: LarkMention[];
@@ -1959,6 +1961,8 @@ function buildFollowUpBlocks(
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
 
   if (opts?.sharedGroupContext) blocks.push({ key: 'groupHistory', text: opts.sharedGroupContext });
+  const messageLocation = renderInboundMessageLocation(opts?.messageLocation);
+  if (messageLocation && !bare) blocks.push({ key: 'messageLocation', text: messageLocation });
 
   // bare（transcript + solo）：裸文本 + `[附件]`/`[@提及]` 行，附件/提及已折进正文，
   // 下面的 sender / senderNote / attachments / mentions 块一并跳过；substitute 保留。

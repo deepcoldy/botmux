@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { selectReplyMessageId, parseReplyMessageTarget } from './core/reply-message.js';
 import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { isMessageListenerTaskAnchor, isSilentMessageListenerSession, messageListenerSendBlocked } from './core/message-listener-silence.js';
@@ -77,7 +78,7 @@ import {
 } from './core/dispatch-lifecycle.js';
 import { withBotSteerDirective } from './core/bot-steer-directive.js';
 import { withBotSessionDirective } from './core/topic-session-continuity.js';
-import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
+import { pickTurnReplyTarget, collectTurnWindowParticipants, dedupeParticipants } from './core/reply-target.js';
 import {
   consumeAutostartUnitMarker,
   enableAutostart,
@@ -7956,6 +7957,7 @@ const SEND_HELP_BODY = [
   '       --mention-back                  @回本轮触发消息的发送者（open_id 自动取自会话）',
   '       --no-mention                    明确声明本条不@任何人',
   '       --quote <message_id>            指定引用某条消息（普通群，默认引用本轮触发消息）',
+  '       --reply-to <message_id>          按当前会话已接收消息的位置回复（不改变 final 轮次）',
   '       --no-quote                      不引用，发独立消息（普通群）',
   '       --voice "<口语文字>"            合成语音气泡发出（需先 botmux voice 配置 TTS）',
   '       --top-level                     发顶层消息（不回复进当前话题）',
@@ -10376,7 +10378,7 @@ async function relaySend(
   // and --session-id flags are dropped — content/attachments come from the
   // outbox and session-id is forced host-side.
   const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent', '--schedule-remove-self', '--top-level']);
-  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into', '--secretary-action', '--secretary-reason']);
+  const FLAGS_VAL = new Set(['--mention', '--quote', '--reply-to', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into', '--secretary-action', '--secretary-reason']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
@@ -11634,6 +11636,16 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // Quote chain (chat scope): --quote <message_id> overrides the auto target,
   // --no-quote forces a plain (un-quoted) send.
   const explicitQuote = argValue(rest, '--quote');
+  if (flagPresentButValueMissing(rest, '--reply-to')
+    || rest.filter(token => token === '--reply-to' || token.startsWith('--reply-to=')).length > 1) {
+    console.error('botmux send: --reply-to 需要且只能指定一个消息编号');
+    process.exit(2);
+  }
+  const explicitReplyTo = argValue(rest, '--reply-to');
+  if (explicitReplyTo !== undefined && (sendTopLevel || overrideChatId || sendInto || explicitQuote !== undefined)) {
+    console.error('botmux send: --reply-to 不能与 --top-level / --chat-id / --into / --quote 混用');
+    process.exit(2);
+  }
   const managedQuoteError = managedVcQuoteError({
     managed: !!vcMeetingManagedSendOrigin,
     durableDelivery: !!vcMeetingDeliveryReplyOrigin,
@@ -11922,11 +11934,25 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
 
   // Prefer the exact per-turn reply anchor; the latest single slot is only a
   // compatibility fallback for sessions persisted before replyTargets.
-  const turnReplyTarget = pickTurnReplyTarget(s, currentTurnId);
+  const replyMarker = trustedRelayCtx && process.env.BOTMUX_REPLY_MESSAGE_ID
+    ? { sessionId: trustedRelayCtx.sessionId, turnId: trustedRelayCtx.turnId,
+        queuedTurns: [{ turnId: process.env.BOTMUX_REPLY_MESSAGE_ID, inputConsumed: true as const }] }
+    : liveMarkerCtx;
+  let replyMessageId = currentTurnId;
+  try {
+    replyMessageId = selectReplyMessageId(s, currentTurnId,
+      !sendTopLevel && !overrideChatId && !sendInto && explicitQuote === undefined
+        && !vcMeetingManagedSendOrigin && originSessionId === sid ? replyMarker : undefined,
+      explicitReplyTo);
+  } catch (error) {
+    console.error(`botmux send: ${error instanceof Error ? error.message : error}`);
+    process.exit(2);
+  }
+  const turnReplyTarget = pickTurnReplyTarget(s, replyMessageId);
   const turnBoundQuoteTarget = turnReplyTarget?.rootMessageId
-    ?? s.turnReplyContexts?.[currentTurnId ?? '']?.quoteTargetId
+    ?? s.turnReplyContexts?.[replyMessageId ?? '']?.quoteTargetId
     ?? (turnReplyTarget?.turnId?.startsWith('om_') ? turnReplyTarget.turnId : undefined)
-    ?? (currentTurnId?.startsWith('om_') ? currentTurnId : undefined);
+    ?? (replyMessageId?.startsWith('om_') ? replyMessageId : undefined);
   if (privateReplyEnabled(s) && (sendInto || overrideChatId)) {
     console.error('当前群角色已启用私聊回复，请移除 --into / --chat-id 后发送给本轮提问人。');
     process.exit(2);
@@ -12022,7 +12048,9 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   const frozenTurnDispatch = originSessionId === sid
     ? exactOriginDispatch
     : undefined;
-  const frozenTurnReplyTarget = frozenTurnDispatch?.replyTarget;
+  const selectedReplyContext = replyMessageId !== currentTurnId || explicitReplyTo
+    ? s.turnReplyContexts?.[replyMessageId ?? ''] : undefined;
+  const frozenTurnReplyTarget = parseReplyMessageTarget(selectedReplyContext?.target) ?? frozenTurnDispatch?.replyTarget;
   if (exactOriginDispatch?.deliverySink === 'http_wait'
     || exactOriginDispatch?.deliverySink === 'http_async'
     || exactOriginDispatch?.deliverySink === 'suppressed') {
@@ -12472,7 +12500,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   }
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
     ?? frozenTurnDispatch?.replyTargetSenderOpenId
-    ?? turnReplyTarget?.senderOpenId
+    ?? pickTurnReplyTarget(s, currentTurnId)?.senderOpenId
     ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId
     // #750 exact-turn contract: the global latest-slot quote sender may ONLY be
     // borrowed as a legacy fallback when there is NO currentTurnId (true
@@ -12681,7 +12709,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
           explicitQuote,
           noQuote,
           quoteTargetId: explicitQuote
-            ?? frozenTurnDispatch?.quoteTargetId
+            ?? (selectedReplyContext ? turnBoundQuoteTarget : frozenTurnDispatch?.quoteTargetId)
             ?? turnBoundQuoteTarget
             ?? (currentTurnId ? undefined : s.quoteTargetId),
           frozenReplyTarget: frozenTurnReplyTarget,
@@ -13434,6 +13462,9 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // VC turns carry their own single-target origin, so they skip this gate.
   if (mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel) {
     const window = collectTurnWindowParticipants(s, currentTurnId);
+    const selectedWindow = selectedReplyContext ? collectTurnWindowParticipants(s, replyMessageId) : window;
+    window.participants = dedupeParticipants([...window.participants, ...selectedWindow.participants]);
+    window.incomplete ||= selectedWindow.incomplete;
     const ambiguity = mentionBackAmbiguity({ chatType: s.chatType, participants: window.participants, incomplete: window.incomplete });
     if (ambiguity.ambiguous) {
       console.error(mentionBackAmbiguityError(ambiguity.candidates, ambiguity.incomplete));
@@ -13444,9 +13475,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // --mention-back: @ the sender of the message this turn is replying to
   // (open_id from the session — model needn't know it). Bare-name form so it
   // renders as a trailing <at>.
-  if (mentionBack && replyTargetSenderOpenId
-      && !mentions.some(m => m.open_id === replyTargetSenderOpenId)) {
-    mentions.push({ open_id: replyTargetSenderOpenId, name: '' });
+  const mentionReplySender = selectedReplyContext
+    ? turnReplyTarget?.senderOpenId ?? selectedReplyContext.replyTargetSenderOpenId
+    : replyTargetSenderOpenId;
+  if (mentionBack && mentionReplySender
+      && !mentions.some(m => m.open_id === mentionReplySender)) {
+    mentions.push({ open_id: mentionReplySender, name: '' });
   }
 
   const { sendMessage, replyMessage, urgentMessage, uploadImage: uploadLarkImage, uploadFile: uploadLarkFile, MessageWithdrawnError, getChatModeStrict, getMessageThreadId } = await import('./im/lark/client.js');
@@ -13745,7 +13779,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     sessionQuoteTargetId: vcMeetingDeliveryReplyOrigin
       ? undefined
       : explicitVcMeetingImOrigin?.larkMessageId
-        ?? frozenTurnDispatch?.quoteTargetId
+        ?? (selectedReplyContext ? turnBoundQuoteTarget : frozenTurnDispatch?.quoteTargetId)
         ?? turnBoundQuoteTarget
         ?? (currentTurnId ? undefined : s.quoteTargetId),
   });
@@ -13759,7 +13793,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // 上面或 `shouldDropAfterTheFactTopicQuote` 里短路，普通热路径不多付这次调用。
   // 探测失败一律保持 quote（既有默认行为），绝不因为不确定就改变所有正常回复的落点。
   const quotedTurnInThread = quoteTargetId
-    ? (s.turnReplyContexts?.[currentTurnId ?? '']?.inThread
+    ? (s.turnReplyContexts?.[replyMessageId ?? '']?.inThread
       ?? s.turnReplyContexts?.[quoteTargetId]?.inThread)
     : undefined;
   let effectiveQuoteTargetId = quoteTargetId;

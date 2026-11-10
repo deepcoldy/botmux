@@ -54,6 +54,7 @@ export const SEND_FLAG_SPECS: readonly SendFlagSpec[] = [
   { names: ['--chat-id'], kind: 'value' },
   { names: ['--into'], kind: 'value' },
   { names: ['--quote'], kind: 'value' },
+  { names: ['--reply-to'], kind: 'value' },
   { names: ['--as'], kind: 'value' },
   { names: ['--plugin-card-action'], kind: 'value' },
   { names: ['--completion-proposal-file'], kind: 'value' },

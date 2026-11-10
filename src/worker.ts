@@ -5750,6 +5750,7 @@ let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let currentTurnSteerPromoted = false;
 interface QueuedTypeAheadTurnRecord {
   turnId: string;
+  inputConsumed?: true;
   identityTurnId?: string;
   dispatchAttempt?: number;
   linkRefMode?: 'observe' | 'enabled';
@@ -6766,6 +6767,7 @@ function authorizeManagedSend(
   ok: true;
   origin: {
     turnId?: string;
+    replyMessageId?: string;
     dispatchAttempt?: number;
     requiresCodexAppLedger?: boolean;
     linkRefMode?: 'observe' | 'enabled';
@@ -6816,6 +6818,8 @@ function authorizeManagedSend(
     ? {
         ok: true,
         origin: {
+          ...(capability.turnId === currentBotmuxTurnId && !requiresCodexAppLedger && !imOrigin
+            ? { replyMessageId: queuedTypeAheadTurns.filter(t => t.inputConsumed).at(-1)?.turnId } : {}),
           ...(capability.turnId ? { turnId: capability.turnId } : {}),
           ...(capability.dispatchAttempt !== undefined
             ? { dispatchAttempt: capability.dispatchAttempt }
@@ -7016,6 +7020,7 @@ function writeCliPidMarker(): void {
                 if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && markerQueuedTurnStillLive(qt) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
                   queuedTypeAheadTurns.push({
                     turnId: qt.turnId,
+                ...(qt.inputConsumed === true ? { inputConsumed: true as const } : {}),
                     ...(markerIdentityTurnId(qt.identityTurnId) ? { identityTurnId: markerIdentityTurnId(qt.identityTurnId)! } : {}),
                     ...(typeof qt.dispatchAttempt === 'number' ? { dispatchAttempt: qt.dispatchAttempt } : {}),
                     ...(qt.linkRefMode === 'observe' || qt.linkRefMode === 'enabled'
@@ -7038,6 +7043,7 @@ function writeCliPidMarker(): void {
           : undefined;
         const queuedTurns = queuedTypeAheadTurns.map(t => ({
           turnId: t.turnId,
+          ...(t.inputConsumed === true ? { inputConsumed: true as const } : {}),
           ...(markerIdentityTurnId(t.identityTurnId) ? { identityTurnId: markerIdentityTurnId(t.identityTurnId)! } : {}),
           ...(t.dispatchAttempt !== undefined ? { dispatchAttempt: t.dispatchAttempt } : {}),
           ...(t.linkRefMode ? { linkRefMode: t.linkRefMode } : {}),
@@ -7103,6 +7109,7 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
           if (t && typeof t.turnId === 'string' && t.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(t.turnId) && !queuedTypeAheadTurns.some(q => q.turnId === t.turnId)) {
             queuedTypeAheadTurns.push({
               turnId: t.turnId,
+              ...(t.inputConsumed === true ? { inputConsumed: true as const } : {}),
               ...(markerIdentityTurnId(t.identityTurnId) ? { identityTurnId: markerIdentityTurnId(t.identityTurnId)! } : {}),
               ...(typeof t.dispatchAttempt === 'number' ? { dispatchAttempt: t.dispatchAttempt } : {}),
               ...(t.linkRefMode === 'observe' || t.linkRefMode === 'enabled'
@@ -7217,6 +7224,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
             if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && markerQueuedTurnStillLive(qt) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
               queuedTypeAheadTurns.push({
                 turnId: qt.turnId,
+                ...(qt.inputConsumed === true ? { inputConsumed: true as const } : {}),
                 ...(markerIdentityTurnId(qt.identityTurnId) ? { identityTurnId: markerIdentityTurnId(qt.identityTurnId)! } : {}),
                 ...(qt.linkRefMode === 'observe' || qt.linkRefMode === 'enabled'
                   ? { linkRefMode: qt.linkRefMode }
@@ -21965,6 +21973,12 @@ async function flushPending(): Promise<void> {
           item.durablePrimaryInbox,
         );
       }
+      // Claude/Codex have stronger native-consumption callbacks. Other adapters
+      // acknowledge delivery by returning successfully from writeInput.
+      if (result?.submitted !== false && !writeAdapter.claudeDataDir
+        && !codexHistoryMatchProvesConsumption() && !writeRpcEngine) {
+        markReplyInputConsumed(item.turnId);
+      }
       const queuedPostSubmitNativeTitle = result?.submitted !== false
         ? maybeQueuePostSubmitNativeSessionTitle(item)
         : false;
@@ -33688,6 +33702,14 @@ function acknowledgeTurnInputReceived(turnId?: string): void {
   if (turnId) send({ type: 'turn_input_received', turnId });
 }
 
+/** Keep reply location separate from execution identity and the final queue. */
+function markReplyInputConsumed(turnId: string | undefined): void {
+  const queued = queuedTypeAheadTurns.find(turn => turn.turnId === turnId);
+  if (!queued || queued.inputConsumed) return;
+  queued.inputConsumed = true;
+  writeCliPidMarker();
+}
+
 /** Native acceptance proof for shared group background coverage. Emitted only
  * from boundaries where the CLI itself evidenced this exact input: Codex's
  * exact owned history line, a Codex RPC turn/start acknowledgement, or a
@@ -33701,6 +33723,7 @@ function acknowledgeNativeInputConsumed(
   dispatchAttempt?: number,
 ): void {
   if (!turnId) return;
+  markReplyInputConsumed(turnId);
   // The CLI has the input in its own history: a crash no longer re-delivers
   // it to a resumed CLI (see InflightInputTracker.onTurnStarted).
   inflightInputs.onTurnStarted(turnId);

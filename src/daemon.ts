@@ -1,3 +1,4 @@
+import { renderInboundMessageLocation } from './core/reply-message.js';
 import { clearTakeoverModelSources } from './core/model-pin.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers, forbiddenReadWriteMessage, readOnlyLauncherMountMessage } from './services/sandbox-path-guard.js';
 import { registerSessionContractPrimary } from './core/session-contract-primary.js';
@@ -29853,6 +29854,7 @@ async function handleThreadReplyAdmitted(
         await resolveSoloSessionForTurn(ds, ctxChatType, tailSender);
         if (effortSessionIsCurrent && !effortSessionIsCurrent()) throw new Error('Effort task session changed during queued activation preparation');
         const followUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
+          messageLocation: { messageId: parsed.messageId, ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}) },
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
@@ -29943,6 +29945,10 @@ async function handleThreadReplyAdmitted(
     const followUpSender: import('./im/lark/identity-cache.js').ResolvedSender | undefined = callerOpenId
       ? { openId: callerOpenId, type: isForeignBot ? 'bot' : 'user' }
       : undefined;
+    if (!zeroInjection) enriched = `${renderInboundMessageLocation({
+      messageId: parsed.messageId,
+      ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}),
+    })}\n${enriched}`;
     const hadBufferedFollowUps = (ds.pendingFollowUps?.length ?? 0) > 0;
     const sameInitialCaller = !!followUpSender?.openId
       && followUpSender.openId === ds.pendingSender?.openId;
@@ -29997,6 +30003,7 @@ async function handleThreadReplyAdmitted(
         // 此分支是 pending 首个 worker 的同步屏障，不能 await 网络（见上方注释），
         // 所以不重算 solo，沿用会话注册时算好的 ds.soloSession。
         const exactFollowUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
+          messageLocation: { messageId: parsed.messageId, ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}) },
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
@@ -30555,6 +30562,7 @@ async function handleThreadReplyAdmitted(
           },
         )
       : buildFollowUpCliInput(promptContent, ds.session.sessionId, {
+          messageLocation: { messageId: parsed.messageId, ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}) },
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
@@ -30794,6 +30802,7 @@ async function handleThreadReplyAdmitted(
           const stagedSender = await getThreadSender();
           await resolveSoloSessionForTurn(ds, ctxChatType, stagedSender);
           const currentFollowUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
+          messageLocation: { messageId: parsed.messageId, ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}) },
             attachments,
             mentions: parsed.mentions,
             isAdoptMode: false,
