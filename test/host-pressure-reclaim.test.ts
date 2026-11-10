@@ -51,6 +51,21 @@ describe('host-pressure reclaim state machine', () => {
     expect(results).toEqual([false, false, true]);
   });
 
+  it('does not arm the cooldown on healthy ticks before the first overload', () => {
+    let state = INITIAL_HOST_PRESSURE_STATE;
+    for (let i = 0; i < 3; i++) {
+      state = evaluateHostPressure(state, healthy, cfg(), now + i * 30_000, thresholds).state;
+    }
+    expect(state.cooldownUntil).toBe(0);
+    const results = [];
+    for (let i = 0; i < 3; i++) {
+      const result = evaluateHostPressure(state, overloaded, cfg(), now + (i + 3) * 30_000, thresholds);
+      state = result.state;
+      results.push(result.shouldReclaim);
+    }
+    expect(results).toEqual([false, false, true]);
+  });
+
   it('keeps the episode hot after a positive pass (no intra-episode cooldown)', async () => {
     let state = INITIAL_HOST_PRESSURE_STATE;
     for (let i = 0; i < 3; i++) {

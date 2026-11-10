@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createIdleSpinSampler } from '../src/core/idle-spin-sampler.js';
@@ -205,6 +205,52 @@ describe('idle-spin sampler', () => {
     const sample = await sampler.sample(targets);
     expect(sample.invalid.get('s1')).toBe('ambiguous_pid');
     expect(sample.invalid.get('s2')).toBe('ambiguous_pid');
+  });
+
+  it('falls back to a full ppid scan when children files are unavailable', async () => {
+    const root = makeProcRoot([
+      { pid: 100, ppid: 1, start: 1000, utime: 0, stime: 0, children: [101] },
+      { pid: 101, ppid: 100, start: 1001, utime: 0, stime: 0, children: [102] },
+      { pid: 102, ppid: 101, start: 1002, utime: 0, stime: 0 },
+    ]);
+    const sampler = createIdleSpinSampler({
+      procRoot: root,
+      cpuCount: 4,
+      platform: 'linux',
+      childrenSupported: false,
+    });
+    const targets = [{
+      sessionId: 's1',
+      attestation: { cliPid: 100, cliProcStart: '1000' },
+    }];
+    await sampler.sample(targets);
+    updateTicks(root, 102, 100, 11_000);
+    const sample = await sampler.sample(targets);
+    expect(sample.invalid.size).toBe(0);
+    expect(sample.sessions.get('s1')?.pids).toBe(3);
+    expect(sample.sessions.get('s1')?.cpuPercent).toBeCloseTo(40, 5);
+  });
+
+  it('fails closed when a children file is unreadable (EACCES)', async () => {
+    const root = makeProcRoot([
+      { pid: 100, ppid: 1, start: 1000, utime: 0, stime: 0, children: [101] },
+      { pid: 101, ppid: 100, start: 1001, utime: 0, stime: 0 },
+    ]);
+    const childrenPath = join(root, '100', 'task', '100', 'children');
+    const original = readFileSync(childrenPath, 'utf8');
+    try {
+      chmodSync(childrenPath, 0o000);
+      const sampler = createIdleSpinSampler({ procRoot: root, cpuCount: 4, platform: 'linux' });
+      const sample = await sampler.sample([{
+        sessionId: 's1',
+        attestation: { cliPid: 100, cliProcStart: '1000' },
+      }]);
+      expect(sample.sessions.has('s1')).toBe(false);
+      expect(sample.invalid.has('s1')).toBe(true);
+    } finally {
+      chmodSync(childrenPath, 0o644);
+      writeFileSync(childrenPath, original);
+    }
   });
 
   it('fails closed instead of truncating an oversized process tree', async () => {

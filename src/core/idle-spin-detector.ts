@@ -22,6 +22,8 @@ export interface IdleSpinDetectorDeps {
   observeInstall?: (ds: DaemonSession, cliId: CliId, now: number) => { state: string };
   now?: () => number;
   mutationAcquireTimeoutMs?: number;
+  /** Checked immediately before the suspend action (daemon shutdown fence). */
+  shouldAbort?: () => boolean;
 }
 
 export interface IdleSpinTickResult {
@@ -57,7 +59,10 @@ function effectiveCliId(
   fallback?: CliId | (() => CliId | undefined),
 ): CliId | undefined {
   const resolvedFallback = typeof fallback === 'function' ? fallback() : fallback;
-  return (ds.session.cliId ?? ds.initConfig?.cliId ?? resolvedFallback) as CliId | undefined;
+  return (ds.session.cliLaunchSnapshot?.cliId
+    ?? ds.session.cliId
+    ?? ds.initConfig?.cliId
+    ?? resolvedFallback) as CliId | undefined;
 }
 
 /**
@@ -78,7 +83,10 @@ function effectiveCliId(
  */
 export function createIdleSpinDetector(deps: IdleSpinDetectorDeps): IdleSpinDetector {
   const now = deps.now ?? (() => Date.now());
-  const streaks = new Map<string, number>();
+  // A streak belongs to one worker generation. A crash/re-fork that did not
+  // suspend must not inherit the old generation's count and get parked on its
+  // first idle sample.
+  const streaks = new Map<string, { generation: number | undefined; count: number }>();
   let lastConfigKey = '';
 
   function reset(): void {
@@ -104,7 +112,7 @@ export function createIdleSpinDetector(deps: IdleSpinDetectorDeps): IdleSpinDete
     }
 
     const at = now();
-    const olderThanMs = Math.max(0, config.minIdleMinutes * 60_000);
+    const olderThanMs = Math.max(1, config.minIdleMinutes * 60_000);
     const strictCandidates = selectIdleSuspendCandidates(deps.activeSessions, {
       olderThanMs,
       now: at,
@@ -167,26 +175,44 @@ export function createIdleSpinDetector(deps: IdleSpinDetectorDeps): IdleSpinDete
     const sample = await deps.sampler.sample(targets, markers);
     if (!sample.supported) {
       // Non-Linux (or unreadable procfs): fail closed, never auto-suspend.
+      // An invalid sample is not evidence of calm, so clear the streaks too.
+      streaks.clear();
       return { ...EMPTY_RESULT, candidates: eligible.length, invalid: eligible.length };
     }
 
     let overThreshold = 0;
-    for (const { sessionId } of eligible) {
+    for (const { sessionId, ds } of eligible) {
       const measured = sample.sessions.get(sessionId);
       if (!measured || measured.cpuPercent < config.cpuPercent) {
         streaks.delete(sessionId);
         continue;
       }
-      const next = (streaks.get(sessionId) ?? 0) + 1;
-      streaks.set(sessionId, next);
-      if (next >= config.consecutiveSamples) overThreshold += 1;
+      const generation = ds.workerGeneration;
+      const previous = streaks.get(sessionId);
+      const count = previous && previous.generation === generation ? previous.count + 1 : 1;
+      streaks.set(sessionId, { generation, count });
+      if (count >= config.consecutiveSamples) overThreshold += 1;
     }
 
     const victims = eligible
-      .filter(({ sessionId }) => (streaks.get(sessionId) ?? 0) >= config.consecutiveSamples)
+      .filter(({ sessionId }) => (streaks.get(sessionId)?.count ?? 0) >= config.consecutiveSamples)
       .slice(0, config.maxSuspendsPerSample)
       .map(entry => entry.sessionId);
     if (victims.length === 0) {
+      return {
+        candidates: eligible.length,
+        sampled: sample.sessions.size,
+        overThreshold,
+        suspended: 0,
+        invalid: sample.invalid.size,
+        gateBusy: false,
+        hostCpuPct: sample.hostCpuPct,
+      };
+    }
+
+    if (deps.shouldAbort?.()) {
+      // Daemon shutdown started while the async sample was in flight: never
+      // park a worker the shutdown path is already fencing.
       return {
         candidates: eligible.length,
         sampled: sample.sessions.size,
@@ -247,5 +273,9 @@ export function createIdleSpinDetector(deps: IdleSpinDetectorDeps): IdleSpinDete
     };
   }
 
-  return { tick, reset, streaks: () => streaks };
+  return {
+    tick,
+    reset,
+    streaks: () => new Map([...streaks].map(([sessionId, entry]) => [sessionId, entry.count] as const)),
+  };
 }

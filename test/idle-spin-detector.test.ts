@@ -316,6 +316,84 @@ describe('idle-spin detector', () => {
     expect(ds.worker).toBeNull();
   });
 
+  it('resets the streak when the worker generation changes (crash/re-fork)', async () => {
+    const ds = makeDs('gen');
+    const sessions = new Map([['gen', ds]]);
+    const detector = createIdleSpinDetector({
+      larkAppId: 'cli_test',
+      activeSessions: sessions,
+      defaultCliId: 'traex',
+      sampler: fakeSampler(() => ({ gen: 200 })),
+      observeInstall: () => ({ state: 'current' }),
+      now: () => now,
+    });
+    await detector.tick(config());
+    expect(detector.streaks().get('gen')).toBe(1);
+    ds.workerGeneration = 2;
+    ds.localProcessAttestation.workerGeneration = 2;
+    await detector.tick(config());
+    expect(detector.streaks().get('gen')).toBe(1);
+    expect(ds.worker).not.toBeNull();
+    await detector.tick(config());
+    expect(ds.worker).toBeNull();
+  });
+
+  it('clears streaks on an unsupported sample instead of treating it as calm', async () => {
+    const ds = makeDs('unsupported');
+    const sessions = new Map([['unsupported', ds]]);
+    let supported = true;
+    const sampler: IdleSpinSampler = {
+      async sample(targets) {
+        if (!supported) {
+          return {
+            supported: false, sampledAt: now, cpuCount: 32, hostCpuPct: 0,
+            sessions: new Map(), invalid: new Map(),
+          };
+        }
+        return {
+          supported: true, sampledAt: now, cpuCount: 32, hostCpuPct: 50,
+          sessions: new Map(targets.map(t => [t.sessionId, {
+            sessionId: t.sessionId, cpuPercent: 200, pids: 1, confidence: 'attestation' as const,
+          }])),
+          invalid: new Map(),
+        };
+      },
+      reset() { /* no-op */ },
+    };
+    const detector = createIdleSpinDetector({
+      larkAppId: 'cli_test',
+      activeSessions: sessions,
+      defaultCliId: 'traex',
+      sampler,
+      observeInstall: () => ({ state: 'current' }),
+      now: () => now,
+    });
+    await detector.tick(config());
+    expect(detector.streaks().get('unsupported')).toBe(1);
+    supported = false;
+    await detector.tick(config());
+    expect(detector.streaks().size).toBe(0);
+  });
+
+  it('does not suspend when shutdown starts while the sample is in flight', async () => {
+    const ds = makeDs('abort');
+    const sessions = new Map([['abort', ds]]);
+    let aborted = false;
+    const detector = createIdleSpinDetector({
+      larkAppId: 'cli_test',
+      activeSessions: sessions,
+      defaultCliId: 'traex',
+      sampler: fakeSampler(() => ({ abort: 200 })),
+      observeInstall: () => ({ state: 'current' }),
+      now: () => now,
+      shouldAbort: () => aborted,
+    });
+    await detector.tick(config());
+    aborted = true;
+    await detector.tick(config());
+    expect(ds.worker).not.toBeNull();
+  });
+
   it('does nothing when the config is disabled', async () => {
     const ds = makeDs('off');
     const sessions = new Map([['off', ds]]);

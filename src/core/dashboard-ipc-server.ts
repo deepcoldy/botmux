@@ -337,9 +337,7 @@ import { updateLongTaskReminderConfig } from '../services/long-task-reminder-con
 import {
   selectIdleSuspendCandidates,
   sweepIdleWorkersByAgeAfterTurnDrain,
-  suspendSelectedIdleCandidatesAfterTurnDrain,
 } from './idle-worker-sweeper.js';
-import { resolveIdleSpinSuspendConfig } from './idle-spin-config.js';
 import { updateSessionOwnerReminderConfig } from '../services/session-owner-reminder-config-store.js';
 import { sendSessionOwnerThreadNotification } from '../services/session-owner-notification.js';
 import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
@@ -3251,14 +3249,12 @@ ipcRoute('POST', '/api/maintenance/suspend-idle', async (req, res) => {
  */
 ipcRoute('GET', '/api/host-overload/counts', (_req, res) => {
   const stopped = sessionStore.listSessions().filter(s => s.status === 'active' && isSessionStopped(s)).length;
-  let idle = 0;
-  for (const ds of listActiveSessions()) {
-    if (!ds.worker || ds.worker.killed) continue;
-    if (ds.adoptedFrom || ds.initConfig?.adoptMode) continue;
-    if (!isSuspendableBackendType(ds.initConfig?.backendType)) continue;
-    if (ds.lastScreenStatus !== 'idle') continue;
-    idle++;
-  }
+  // Use the SAME strict selector as the manual sweep so the card's「闲置 N」
+  // is exactly the number a click can act on (never a larger, looser count).
+  const registry = getActiveSessionsRegistry();
+  const idle = registry
+    ? selectIdleSuspendCandidates(registry, { olderThanMs: 1, now: Date.now() }).length
+    : 0;
   jsonRes(res, 200, { ok: true, stopped, idle });
 });
 
@@ -3274,7 +3270,7 @@ ipcRoute('GET', '/api/host-overload/counts', (_req, res) => {
  * Returns `{ ok, mode, affected }` — `affected` counts sessions acted on here.
  */
 ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
-  const body = await readJsonBodyOrBadJson<{ mode?: unknown; source?: unknown }>(req, res);
+  const body = await readJsonBodyOrBadJson<{ mode?: unknown }>(req, res);
   if (body === BAD_JSON) return;
   const mode = body?.mode;
 
@@ -3296,57 +3292,13 @@ ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
   }
 
   if (mode === 'suspend_idle') {
-    // This daemon's own idle live workers only. Both paths use the SAME strict
-    // selector as the operator age sweep and the CPU policy: never touch adopt,
-    // mid-turn, background-task, accepted-input, scheduled-run, activation,
-    // keep-alive or idle-auto-compact sessions.
+    // This daemon's own idle live workers only. Keep the historical async
+    // suspend path (it flushes the session controller) but select candidates
+    // with the SAME strict selector as the operator age sweep and the CPU
+    // policy: never touch adopt, mid-turn, background-task, accepted-input,
+    // scheduled-run, activation, keep-alive or idle-auto-compact sessions.
     const registry = getActiveSessionsRegistry();
     if (!registry) return jsonRes(res, 503, { ok: false, error: 'session_registry_unavailable' });
-    const runtimeAppIds = new Set([...registry.values()].map(ds => ds.larkAppId).filter(Boolean));
-    if (runtimeAppIds.size > 1
-      || (cachedLarkAppId && runtimeAppIds.size === 1 && !runtimeAppIds.has(cachedLarkAppId))) {
-      return jsonRes(res, 409, { ok: false, error: 'ambiguous_daemon_scope' });
-    }
-    const larkAppId = cachedLarkAppId || [...runtimeAppIds][0];
-    const source = body?.source === 'auto' ? 'auto' : 'manual';
-
-    if (source === 'auto') {
-      if (!larkAppId) return jsonRes(res, 503, { ok: false, error: 'daemon_scope_unavailable' });
-      let minIdleMinutes = 0;
-      let maxSuspendsPerPass: number | undefined;
-      try {
-        const resolved = resolveIdleSpinSuspendConfig(getBot(larkAppId).config.idleSpinSuspend);
-        if (!resolved.enabled || !resolved.hostPressure.enabled) {
-          return jsonRes(res, 200, { ok: true, mode, affected: 0, disabled: true });
-        }
-        minIdleMinutes = resolved.minIdleMinutes;
-        maxSuspendsPerPass = resolved.hostPressure.maxSuspendsPerPass;
-      } catch { /* bot missing → conservative defaults */ }
-      const result = await suspendSelectedIdleCandidatesAfterTurnDrain(
-        larkAppId,
-        registry,
-        undefined,
-        {
-          olderThanMs: Math.max(1, minIdleMinutes * 60_000),
-          now: Date.now(),
-          reason: 'host_pressure',
-          ...(maxSuspendsPerPass !== undefined ? { maxCandidates: maxSuspendsPerPass } : {}),
-          mutationAcquireTimeoutMs: 1_000,
-        },
-      );
-      if (result === null) {
-        logger.info('[overload-sweep] suspend_idle(auto): mutation gate busy; retry later');
-        return jsonRes(res, 200, { ok: true, mode, affected: 0, gateBusy: true });
-      }
-      logger.info(
-        `[overload-sweep] suspend_idle(auto): suspended ${result.suspended.length} idle worker(s)`
-        + (result.failures.length ? `, failures=${result.failures.length}` : ''),
-      );
-      return jsonRes(res, 200, { ok: true, mode, affected: result.suspended.length });
-    }
-
-    // Manual owner action: keep the historical async suspend path (it flushes
-    // the session controller) but select candidates with the strict guard.
     const candidates = selectIdleSuspendCandidates(registry, {
       olderThanMs: 1,
       now: Date.now(),

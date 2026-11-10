@@ -1396,10 +1396,7 @@ export async function runAutoWorktreeCommit(deps: {
  * exact "显示 0、实际没清" symptom this fix exists to kill — just triggered by
  * "the daemon holding the zombies failed" instead of "the first daemon had none".
  */
-export async function sweepHostOverload(
-  mode: 'clean_stopped' | 'suspend_idle',
-  opts: { source?: 'manual' | 'auto' } = {},
-): Promise<number> {
+async function sweepHostOverload(mode: 'clean_stopped' | 'suspend_idle'): Promise<number> {
   const daemons = listOnlineDaemons();
   if (daemons.length === 0) throw new Error(`sweep ${mode}: no online daemon`);
 
@@ -1408,7 +1405,7 @@ export async function sweepHostOverload(
       const res = await fetchDaemonIpc(d.ipcPort, '/api/host-overload/sweep', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ mode, source: opts.source ?? 'manual' }),
+        body: JSON.stringify({ mode }),
       });
       const body: any = await res.json().catch(() => ({}));
       if (res.ok && body?.ok && typeof body.affected === 'number') return body.affected;

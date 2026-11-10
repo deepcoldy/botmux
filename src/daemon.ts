@@ -106,7 +106,7 @@ import { registerOverloadNonce } from './im/lark/overload-nonce.js';
 import { cotRecoveryMatches, settleCotMessageForShutdown, sweepOrphanCotMessages } from './im/lark/cot-message.js';
 import { settleTurnReplyCards, sweepInterruptedReplyCards } from './core/turn-reply-card.js';
 import { resolveBrowserTargets, detectRunningBrowsers } from './core/browser-restart.js';
-import { countHostOverload, sweepHostOverload } from './im/lark/card-handler.js';
+import { countHostOverload } from './im/lark/card-handler.js';
 import { startMaintenance, stopMaintenance } from './core/maintenance.js';
 import {
   selectCodexRuntimeUpdateTargets,
@@ -33438,6 +33438,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     sampler: idleSpinSampler,
     readMarkers: () => readCliPidMarkers(config.session.dataDir),
     mutationAcquireTimeoutMs: 1_000,
+    shouldAbort: () => idleSpinStopped,
   });
 
   const runIdleSpinGuard = async (): Promise<void> => {
@@ -33470,21 +33471,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         hostCpuPct = (await idleSpinSampler.sample([])).hostCpuPct;
       }
 
-      // Layer 2: host-pressure backstop.
+      // Layer 2: host-pressure backstop. Every daemon judges the host locally
+      // and reclaims ONLY its own idle workers. Per-daemon ownership is what
+      // prevents duplicate reclaim across bots sharing TRAE_HOME; a notifier
+      // fan-out would add a single point of failure without any extra effect.
       if (!resolved.hostPressure.enabled || process.env.BOTMUX_HOST_PRESSURE_RECLAIM === '0') return;
-      const alertCfg = readGlobalConfig().hostOverloadAlert;
-      const targetAppId = alertCfg?.enabled === true && typeof alertCfg.targetBotAppId === 'string'
-        ? alertCfg.targetBotAppId
-        : undefined;
-      const targetOnline = targetAppId
-        ? listOnlineDaemons().some(daemon => daemon.larkAppId === targetAppId)
-        : false;
-      const isNotifier = isOverloadAlertTarget(alertCfg, { larkAppId: cfg.larkAppId, apiOnly: cfg.apiOnly });
-      // Exactly one coordinator: the configured notifier fans out to every
-      // daemon when it is online. If no notifier is configured/online, every
-      // daemon falls back to reclaiming only its own idle workers.
-      if (targetAppId !== undefined && targetOnline && !isNotifier) return;
-      const useFanout = isNotifier && targetOnline;
 
       const tick = await runHostPressureTick({
         state: hostPressureState,
@@ -33498,8 +33489,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         now: Date.now(),
         baseThresholds: resolveOverloadThresholds(),
         reclaim: async () => {
+          if (idleSpinStopped) return null;
           try {
-            if (useFanout) return await sweepHostOverload('suspend_idle', { source: 'auto' });
             const swept = await sweepIdleWorkersByAgeAfterTurnDrain(cfg.larkAppId, activeSessions, {
               olderThanMs: Math.max(1, resolved.minIdleMinutes * 60_000),
               now: Date.now(),
@@ -36316,6 +36307,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             browsers = running.map(b => ({ bundleId: b.bundleId, label: b.label, memMB: b.memMB }));
           } catch (err) { logger.warn(`[overload] browser probe failed, no restart buttons: ${err instanceof Error ? err.message : String(err)}`); }
           enteredCardState = initialOverloadCardState(action, counts, nonce, browsers);
+          // The guard may have already reclaimed before this card was built
+          // (both timers are 30s and independently phased); keep that count.
+          if (autoSuspendedInEpisode > 0) enteredCardState.autoSuspendedN = autoSuspendedInEpisode;
           cardJson = buildOverloadAlertCard(enteredCardState);
         } else {
           cardJson = buildOverloadRecoveredCard(action);
@@ -36325,7 +36319,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             const messageId = await sendUserMessage(cfg.larkAppId, ownerOpenId, cardJson, 'interactive');
             if (action.kind === 'entered' && enteredCardState) {
               overloadAlertCard = { messageId, state: enteredCardState };
-              autoSuspendedInEpisode = 0;
             } else {
               overloadAlertCard = undefined;
               autoSuspendedInEpisode = 0;

@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { cpus, platform } from 'node:os';
 import { parseProcessStat } from './resource-monitor/procfs.js';
 import type { CliMarkerInfo } from './resource-monitor/attribution.js';
@@ -71,6 +71,14 @@ export interface IdleSpinSamplerOptions {
   fullThreadScanEverySamples?: number;
   maxPidsPerSession?: number;
   maxThreadsPerProcess?: number;
+  /**
+   * Whether `/proc/<pid>/task/<tid>/children` is available. Default probes
+   * `/proc/<this pid>/task/<this pid>/children`. When absent (kernel without
+   * CONFIG_PROC_CHILDREN, hidepid, old kernel), the sampler falls back to one
+   * full `/proc/<pid>/stat` ppid scan for that tick instead of silently
+   * treating every process as childless.
+   */
+  childrenSupported?: boolean;
   now?: () => number;
 }
 
@@ -130,6 +138,11 @@ export function createIdleSpinSampler(opts: IdleSpinSamplerOptions = {}): IdleSp
   const maxPidsPerSession = Math.max(1, opts.maxPidsPerSession ?? DEFAULT_MAX_PIDS_PER_SESSION);
   const maxThreadsPerProcess = Math.max(1, opts.maxThreadsPerProcess ?? DEFAULT_MAX_THREADS_PER_PROCESS);
   const now = opts.now ?? (() => Date.now());
+  const childrenSupported = opts.childrenSupported ?? (
+    procRoot === '/proc'
+      ? existsSync(`${procRoot}/${process.pid}/task/${process.pid}/children`)
+      : true
+  );
 
   const threadCache = new Map<string, ThreadScanCacheEntry>();
   /**
@@ -151,6 +164,8 @@ export function createIdleSpinSampler(opts: IdleSpinSamplerOptions = {}): IdleSp
   let previousTotalCpuTicks: number | undefined;
   let previousIdleCpuTicks: number | undefined;
   let previousPids = new Map<number, ProcTickRow>();
+  /** Per-sample lazy ppid map for the no-children-file fallback. */
+  let fallbackChildren: Map<number, number[]> | null | undefined;
 
   function readStatRow(pid: number): ProcTickRow | null {
     try {
@@ -196,11 +211,35 @@ export function createIdleSpinSampler(opts: IdleSpinSamplerOptions = {}): IdleSp
     }
   }
 
-  function readChildrenForThread(pid: number, tid: number): number[] {
+  type ChildrenRead = { children: number[] } | { error: NodeJS.ErrnoException };
+
+  function readChildrenForThread(pid: number, tid: number): ChildrenRead {
     try {
-      return parseNumericList(readFileSync(`${procRoot}/${pid}/task/${tid}/children`, 'utf8'));
+      return { children: parseNumericList(readFileSync(`${procRoot}/${pid}/task/${tid}/children`, 'utf8')) };
+    } catch (err) {
+      return { error: err as NodeJS.ErrnoException };
+    }
+  }
+
+  /**
+   * Full `/proc` ppid scan used only when the kernel does not expose
+   * per-thread `children` files. One stat read per process; no cmdline / smaps.
+   * Returns null on failure so the caller fails closed instead of under-counting.
+   */
+  function buildFallbackChildren(): Map<number, number[]> | null {
+    try {
+      const children = new Map<number, number[]>();
+      for (const entry of readdirSync(procRoot)) {
+        if (!/^\d+$/.test(entry)) continue;
+        const row = readStatRow(Number(entry));
+        if (!row) continue;
+        const siblings = children.get(row.ppid) ?? [];
+        siblings.push(row.pid);
+        children.set(row.ppid, siblings);
+      }
+      return children;
     } catch {
-      return [];
+      return null;
     }
   }
 
@@ -214,6 +253,15 @@ export function createIdleSpinSampler(opts: IdleSpinSamplerOptions = {}): IdleSp
    * forked by a newly-created thread is discovered within a bounded window.
    */
   function readChildren(pid: number, fullThreadScan: boolean): number[] | null {
+    // Kernels without per-thread `children` (or hidepid) must not look like
+    // "this process has no children": that under-counts CPU and can miss the
+    // spinner entirely. Fall back to one ppid scan for this tick; if even that
+    // is unavailable, fail closed.
+    if (!childrenSupported) {
+      if (!fallbackChildren) fallbackChildren = buildFallbackChildren();
+      return fallbackChildren ? (fallbackChildren.get(pid) ?? []) : null;
+    }
+
     const tids = readThreadIds(pid);
     if (tids === null) return null;
     if (tids.length > maxThreadsPerProcess) return null;
@@ -241,9 +289,16 @@ export function createIdleSpinSampler(opts: IdleSpinSamplerOptions = {}): IdleSp
     const children: number[] = [];
     for (const tid of scanTids) {
       const direct = readChildrenForThread(pid, tid);
-      if (direct.length > 0) {
+      if ('error' in direct) {
+        // ENOENT is a thread/process that disappeared between readdir and read;
+        // anything else (EACCES, EPERM, hidepid) is unreadable ownership and
+        // must fail the session closed rather than under-count.
+        if (direct.error.code === 'ENOENT') continue;
+        return null;
+      }
+      if (direct.children.length > 0) {
         cacheEntry.childThreads.add(tid);
-        children.push(...direct);
+        children.push(...direct.children);
       } else if (!fullThreadScan && tid !== pid) {
         cacheEntry.childThreads.delete(tid);
       }
@@ -321,6 +376,7 @@ export function createIdleSpinSampler(opts: IdleSpinSamplerOptions = {}): IdleSp
   ): Promise<IdleSpinSample> {
     const sampledAt = now();
     if (runtimePlatform !== 'linux') return emptySample(sampledAt, cpuCount, false);
+    fallbackChildren = undefined;
 
     const system = readSystemCpu();
     if (!system) return emptySample(sampledAt, cpuCount, false);

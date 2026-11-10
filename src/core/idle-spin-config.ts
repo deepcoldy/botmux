@@ -139,10 +139,12 @@ function normalizeHostPressure(raw: unknown): IdleSpinHostPressureConfig | undef
     if (!isFiniteInRange(obj.exitCpuPercent, 0, 100)) return undefined;
     out.exitCpuPercent = obj.exitCpuPercent;
   }
-  if (out.enterCpuPercent !== undefined && out.exitCpuPercent !== undefined
-    && out.exitCpuPercent >= out.enterCpuPercent) {
-    return undefined;
-  }
+  // Validate the MERGED pair, not only an explicitly supplied pair: a partial
+  // override such as `{ enterCpuPercent: 60 }` inherits the default exit (70)
+  // and would otherwise produce reverse hysteresis (exit >= enter → flapping).
+  const mergedEnter = out.enterCpuPercent ?? DEFAULT_IDLE_SPIN_SUSPEND_CONFIG.hostPressure.enterCpuPercent;
+  const mergedExit = out.exitCpuPercent ?? DEFAULT_IDLE_SPIN_SUSPEND_CONFIG.hostPressure.exitCpuPercent;
+  if (mergedExit >= mergedEnter) return undefined;
   return out;
 }
 
@@ -178,7 +180,9 @@ export function normalizeIdleSpinSuspendConfig(raw: unknown): IdleSpinSuspendCon
     out.sampleIntervalSeconds = obj.sampleIntervalSeconds;
   }
   if ('minIdleMinutes' in obj) {
-    if (!isFiniteInRange(obj.minIdleMinutes, 0, 1440)) return undefined;
+    // 0 would make the strict selector return no candidates at all (it rejects
+    // non-positive ages), silently disabling Layer 1. Require at least 1.
+    if (!isFiniteInRange(obj.minIdleMinutes, 1, 1440)) return undefined;
     out.minIdleMinutes = obj.minIdleMinutes;
   }
   if ('maxSuspendsPerSample' in obj) {
@@ -197,13 +201,19 @@ export function normalizeIdleSpinSuspendConfig(raw: unknown): IdleSpinSuspendCon
 export function resolveIdleSpinSuspendConfig(
   raw: IdleSpinSuspendConfig | undefined,
 ): ResolvedIdleSpinSuspendConfig {
+  const hostPressure = {
+    ...DEFAULT_IDLE_SPIN_SUSPEND_CONFIG.hostPressure,
+    ...(raw?.hostPressure ?? {}),
+  };
+  // Last-resort safety for callers that bypass normalize: never hand a reverse
+  // hysteresis pair to evaluateOverload.
+  if (hostPressure.exitCpuPercent >= hostPressure.enterCpuPercent) {
+    hostPressure.exitCpuPercent = Math.max(0, hostPressure.enterCpuPercent - 1);
+  }
   return {
     ...DEFAULT_IDLE_SPIN_SUSPEND_CONFIG,
     ...(raw ?? {}),
-    hostPressure: {
-      ...DEFAULT_IDLE_SPIN_SUSPEND_CONFIG.hostPressure,
-      ...(raw?.hostPressure ?? {}),
-    },
+    hostPressure,
     cliIds: raw?.cliIds ?? DEFAULT_IDLE_SPIN_SUSPEND_CONFIG.cliIds,
   };
 }

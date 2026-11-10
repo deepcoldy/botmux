@@ -66,14 +66,18 @@ export function evaluateHostPressure(
   const overloaded = evaluation.nextState.overloaded;
 
   if (!overloaded) {
-    // Episode ended (or never started): reset the strike counter and start the
-    // cooldown so a host hovering around the exit line cannot immediately
-    // re-enter and sweep again.
+    // Only an overloaded → healthy EDGE starts a cooldown. A healthy tick
+    // before the first overload must not arm one: a daemon that boots on a
+    // healthy host and then accumulates 53 idle spinners would otherwise
+    // suppress its first reclaim for `cooldownMinutes`.
+    const recoveredEdge = prev.overloadState.overloaded;
     return {
       state: {
         overloadState: evaluation.nextState,
         strikes: 0,
-        cooldownUntil: now + Math.max(0, config.cooldownMinutes) * 60_000,
+        cooldownUntil: recoveredEdge
+          ? now + Math.max(0, config.cooldownMinutes) * 60_000
+          : prev.cooldownUntil,
       },
       overloaded: false,
       strikes: 0,

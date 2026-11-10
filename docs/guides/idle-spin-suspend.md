@@ -37,10 +37,9 @@ worker 挂起，保留会话与历史，下一条消息冷恢复。
   合格候选或压力退出；单轮最多 16 个；只有“episode 结束”或“某一轮 0 候选”才进入
   10 分钟冷却。
 - 只回收严格候选（与 Layer 1 同一个 `selectIdleSuspendCandidates`）。
-- 配置了 `hostOverloadAlert` 且 notifier daemon 在线时，由 notifier 通过现有
-  `/api/host-overload/sweep` fan-out 统一回收，并在同一张过载边沿卡上补一行
-  “已自动挂起 X 个”；不新增 DM。未配置/notifier 不在线时，每个 daemon 只回收自己的
-  idle worker。
+- 每个 daemon 本地判定、只回收自己的 idle worker；per-daemon 归属天然避免多 bot 重复回收，
+  也不依赖 notifier daemon 在线。通知仍由 `hostOverloadAlert` 的边沿卡负责，卡上补一行
+  “本 bot 已自动挂起 X 个”；不新增 DM。
 
 ## 严格 guard
 
@@ -90,6 +89,7 @@ per-bot `idleSpinSuspend`（`bots.json` 或 `botmux config set idleSpinSuspend '
 ```
 
 - `cpuPercent`：**单核百分比**，`20` = 0.2 核。
+- `minIdleMinutes`：最小 1（0 会让严格选择器直接返回空集，等于静默关闭 Layer 1）。
 - `cliIds`：默认只对 `traex` 生效。其他 CLI（如 claude-code 的 prompt-cache keepalive /
   idle auto-compact）需要显式 opt-in。
 - `enabled: false` 关闭两层；`cliIds: []` 只关 Layer 1，保留 Layer 2。
