@@ -706,7 +706,8 @@ export async function downloadResources(larkAppId: string, messageId: string, re
       // Whose token backs the user-token fallback: the person who sent the
       // attachment. They can see what they just posted, and the download is
       // attributed to them rather than to whoever happens to be logged in.
-      await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath, senderOpenId);
+      await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath, senderOpenId,
+        res.fallbackMessageIds ? { fallbackMessageIds: res.fallbackMessageIds } : undefined);
       const attachment: LarkAttachment = { type: res.type, path: savePath, name: res.name, resourceKey: res.key };
       // Sniffing is best-effort: a successfully downloaded attachment must remain available.
       try {
