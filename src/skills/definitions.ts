@@ -1502,7 +1502,9 @@ stdout 为一行 JSON。注意：\`--json\` 覆盖所有结果类型；超时 / 
 - 不使用 \`--questions-file\` 时 \`--options\` 必填，至少 2 项，逗号分隔
 - 推荐 \`key=label\`，key 用稳定英文短词，label 给用户看
 - \`--multi\` 开启多选；\`--json\` 的 \`answers[0]\` 保留完整 key 数组，且 \`selected\` 恒为 \`null\`（多选不要读 \`selected\`）
-- 默认超时 300 秒，可用 \`--timeout <seconds>\` 调整
+- 省略 \`--timeout\` 仍默认 300 秒；正数范围为 10–3600 秒。只有显式 \`botmux ask buttons --timeout 0\` 表示无截止时间，直到真人回答或宿主正式关闭/撤销
+- \`--timeout 0\` 要求 CLI 和 daemon 同时支持，使用版本化入口；旧 daemon 会明确拒绝，不自动降级成有限超时。此选项不改变 hook 或权限确认的有限超时策略
+- 无期限不代表永久批准：答题人、原请求身份、nonce、首个有效答案、当前方案版本与授权范围仍须校验。连接丢失后复用同一 requestId 和原卡片，不能用超时或重复提问代替人工决定
 
 ## @ 点名（--mention）
 

@@ -8123,6 +8123,7 @@ ${SEND_HELP_BODY}
   input-capture register|inspect|revoke|revoke-set --bot <appId> --session <id> ...
   ask buttons --questions-file <file>   多题/文本/数值表单，支持预选；一次提交，返回 answers/inputs JSON
   ask buttons --answerer <ou_id>       仅指定答题人可提交（不授予业务批准权）
+  ask buttons --timeout 0              显式无限等待（需 CLI/daemon 同时支持）；省略仍默认 300 秒
   ask buttons --mention <ou_id>        在卡片里 @ 该成员。仅本应用通讯录查得到的真人有效，
                                        否则只丢掉 @，卡片照发
   ask buttons [--multi] --options "a,b" "<问题>"
@@ -17800,10 +17801,11 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
   try {
     // Versioned admission prevents an old daemon silently dropping the
     // respondent restriction on a choice-only request. Never downgrade it.
-    const endpoint = body.answererOpenId || (body.questions as import('./core/ask-types.js').AskQuestion[] | undefined)?.some(q => q.input)
+    const endpoint = body.timeoutMs === 0 ? '/api/asks/no-deadline-v1'
+      : body.answererOpenId || (body.questions as import('./core/ask-types.js').AskQuestion[] | undefined)?.some(q => q.input)
       ? '/api/asks/form-v1' : '/api/asks';
-    // No client-side timeout — broker enforces `timeoutMs` and will respond
-    // with `kind:'timedOut'` so this fetch always settles.
+    // No client-side timeout — the broker owns finite expiry and explicit
+    // no-deadline asks wait for an answer or invalidation.
     res = await postAskIpc(daemon.ipcPort, endpoint, body);
   } catch (fetchErr) {
     // Socket refused / reset / timeout → daemon is down or restarting → retryable.
@@ -18029,18 +18031,10 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     console.error('botmux ask: 正在等待真人回答；Ctrl-C 不取消确认，请等待回答或正常超时。');
   };
   process.on('SIGINT', protectAskWait);
-  const reconnectDeadline = Date.now() + timeoutMs + 60_000;
   let result: import('./core/ask-types.js').AskResult;
   try {
-    while (true) {
-      try { result = await postAsk(body); break; }
-      catch (err) {
-        if (!(err as { retryable?: boolean }).retryable || Date.now() >= reconnectDeadline) throw err;
-        // The daemon owns the deadline and receipt. Reuse the same request;
-        // don't convert a transport failure into a human decision/timeout.
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-    }
+    const { waitForExplicitAskResult } = await import('./core/explicit-ask-continuation.js');
+    result = await waitForExplicitAskResult(body, postAsk);
   } catch (err) {
     process.removeListener('SIGINT', protectAskWait);
     console.error((err as Error).message);

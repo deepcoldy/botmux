@@ -20,6 +20,40 @@ export interface ExplicitAskReceipt {
 /** Consumed receipts only answer late reconnects of the same invocation. */
 const CONSUMED_RECEIPT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
+function orderedJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(orderedJson);
+  if (value && typeof value === 'object') return Object.fromEntries(
+    Object.entries(value).filter(([, field]) => field !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, field]) => [key, orderedJson(field)]),
+  );
+  return value;
+}
+
+function sameExplicitInvocation(left: CreateAskInput, right: CreateAskInput): boolean {
+  const { replyCardTarget: leftTarget, backendSurvivesRestart: leftBackend, ...leftIdentity } = left;
+  const { replyCardTarget: rightTarget, backendSurvivesRestart: rightBackend, ...rightIdentity } = right;
+  return JSON.stringify(orderedJson(leftIdentity)) === JSON.stringify(orderedJson(rightIdentity));
+}
+
+export async function waitForExplicitAskResult(
+  body: Record<string, unknown> & { timeoutMs: number },
+  post: (body: Record<string, unknown>) => Promise<AskResult>,
+  deps: { now?: () => number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<AskResult> {
+  const now = deps.now ?? Date.now;
+  const sleep = deps.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const reconnectDeadline = body.timeoutMs === 0 ? null : now() + body.timeoutMs + 60_000;
+  while (true) {
+    try { return await post(body); }
+    catch (error) {
+      if (!(error as { retryable?: boolean }).retryable
+        || (reconnectDeadline !== null && now() >= reconnectDeadline)) throw error;
+      await sleep(1000);
+    }
+  }
+}
+
 /** Explicit asks have a daemon-owned claimant, independent of the waiting CLI.
  * Keep terminal receipts until acknowledged or durably dispatched to the SAME
  * session. A stable turn key makes a lost dispatch response safe to retry. */
@@ -32,6 +66,8 @@ export function createExplicitAskContinuation(deps: {
   onError: (error: unknown) => void;
   releaseHandoff?: (input: CreateAskInput) => void;
   hasHandoff?: (input: CreateAskInput) => boolean;
+  shouldInvalidate?: (receipt: ExplicitAskReceipt) => boolean;
+  invalidate?: (input: CreateAskInput, reason: string) => void;
   now?: () => number;
 }) {
   const now = deps.now ?? Date.now;
@@ -51,12 +87,12 @@ export function createExplicitAskContinuation(deps: {
     mkdirSync(deps.dir, { recursive: true, mode: 0o700 });
     atomicWriteFileSync(pathFor(key), JSON.stringify(receipt), { mode: 0o600, durable: true });
   };
-  /** presentation 只影响发卡位置和点名，不写进回执：回执 input 的全等比较就是调用身份。 */
+  /** presentation 只影响首次发卡位置和点名；重连保持原始回执与冻结卡片授权。 */
   function wait(input: CreateAskInput & { requestId: string }, origin?: ExplicitAskReceipt['origin'],
     presentation?: Pick<CreateAskInput, 'cardRootMessageId' | 'mentionedOpenId'>): Promise<AskResult> {
     const key = keyFor(input);
     const original = read(key);
-    if (original && JSON.stringify(original.input) !== JSON.stringify(input)) {
+    if (original && !sameExplicitInvocation(original.input, input)) {
       return Promise.reject(new Error('explicit ask invocation identity conflict'));
     }
     if (original?.result) return Promise.resolve(original.result);
@@ -68,10 +104,11 @@ export function createExplicitAskContinuation(deps: {
       return Promise.resolve(result);
     }
     if (!original) write(key, { version: 1, input, ...(origin ? { origin } : {}) });
-    const promise = deps.register({ ...input, ...presentation }).then(result => {
+    const frozenInput = original?.input ?? input;
+    const promise = deps.register(original ? frozenInput : { ...frozenInput, ...presentation }).then(result => {
       const receipt = read(key)!;
       write(key, { ...receipt, result, settledAt: now() });
-      deps.releaseHandoff?.(input);
+      deps.releaseHandoff?.(frozenInput);
       return result;
     }).finally(() => running.delete(key));
     running.set(key, promise);
@@ -80,7 +117,7 @@ export function createExplicitAskContinuation(deps: {
   function acknowledge(input: CreateAskInput & { requestId: string }, canAcknowledge?: (receipt: ExplicitAskReceipt) => boolean): AskResult | undefined {
     const key = keyFor(input);
     const receipt = read(key);
-    if (!receipt?.result || JSON.stringify(receipt.input) !== JSON.stringify(input)) return undefined;
+    if (!receipt?.result || !sameExplicitInvocation(receipt.input, input)) return undefined;
     // A stdout flush can succeed even after its tool caller ended. A stale
     // origin is not consumption; leave the receipt for same-session recovery.
     if (!canAcknowledge || canAcknowledge(receipt)) write(key, { ...receipt, acknowledged: true });
@@ -105,6 +142,11 @@ export function createExplicitAskContinuation(deps: {
             continue;
           }
           if (!receipt.result) {
+            if (receipt.input.timeoutMs === 0 && deps.shouldInvalidate?.(receipt) && deps.invalidate) {
+              deps.invalidate(receipt.input, 'explicit Ask session closed or binding changed');
+              void wait(receipt.input).catch(deps.onError);
+              continue;
+            }
             // Restore only existing, still-bound sessions. Never create a session
             // or revive a closed business task to recover an interaction.
             if (deps.canResume(receipt) && !running.has(key)) {
