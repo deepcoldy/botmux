@@ -253,6 +253,21 @@ export class SessionContractStore {
   private saveEntity(ref: ContractSessionRef, kind: string, id: string, phase: string, value: unknown): void {
     this.db.prepare('INSERT INTO entities(session_key,kind,id,phase,value) VALUES(?,?,?,?,?) ON CONFLICT(session_key,kind,id) DO UPDATE SET phase=excluded.phase,value=excluded.value').run(sessionKey(ref), kind, id, phase, JSON.stringify(value));
   }
+  /** Continuation decisions are checkpointed authority, not an auxiliary
+   * cache. Advance the version in the same transaction as the entity write. */
+  private saveExecutionContinuation(ref: ContractSessionRef, bindingId: string, value: PlannedExecutionContinuation): void {
+    this.transaction(() => {
+      const previous = this.entity<PlannedExecutionContinuation>(ref, 'execution_continuation', bindingId);
+      if (JSON.stringify(previous) === JSON.stringify(value)) return;
+      const state = this.read(ref); if (!state) throw new Error('contract_session_missing');
+      this.saveEntity(ref, 'execution_continuation', bindingId, value.status, value);
+      const updated = { ...state, revision: state.revision + 1 };
+      const changed = this.db.prepare('UPDATE contracts SET revision=?,value=? WHERE session_key=? AND revision=?')
+        .run(updated.revision, JSON.stringify(updated), sessionKey(ref), state.revision);
+      if (Number(changed.changes) !== 1) throw new SessionContractConflict(state.revision);
+      this.projectSession(ref, updated);
+    });
+  }
   private projectSession(ref: ContractSessionRef, state: SessionContract): void {
     if (!this.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'").get()) return;
     const hit = this.db.prepare('SELECT row FROM sessions WHERE session_id=?').get(ref.sessionId) as { row: string } | undefined;
@@ -372,7 +387,7 @@ export class SessionContractStore {
         || running.length !== 1 || !sameExecution(running[0]!.ref, request.execution)) {
         throw new Error('execution_continuation_unproven');
       }
-      this.saveEntity(ref, 'execution_continuation', bindingId, 'planned', {
+      this.saveExecutionContinuation(ref, bindingId, {
         ...structuredClone(request), target, executionRuntime: execution.runtime, worker, status: 'planned',
       } satisfies PlannedExecutionContinuation);
     });
@@ -388,7 +403,7 @@ export class SessionContractStore {
       const target = this.binding(ref, bindingId);
       const source = this.runtime(ref, plan.from.runtimeId);
       const execution = this.execution(ref, plan.execution.executionId);
-      const reject = (): void => this.saveEntity(ref, 'execution_continuation', bindingId, 'rejected', { ...plan, status: 'rejected' });
+      const reject = (): void => this.saveExecutionContinuation(ref, bindingId, { ...plan, status: 'rejected' });
       if (!state || state.lifecycle !== 'active' || state.activeOperationId || !sameWorker(state.worker, worker)
         || !sameWorker(plan.worker, worker) || !target || !sameRuntime(target.ref, plan.target)
         || !sameRuntime(state.activeRuntime, target.ref) || !sameWorker(target.worker, worker)
@@ -404,7 +419,7 @@ export class SessionContractStore {
       const result = this.applyInside(ref, { type: 'execution_continued', execution: execution.ref,
         from: plan.executionRuntime, runtime: target.ref }, `continuation:${bindingId}`);
       if (result.decision !== 'applied') { reject(); return; }
-      this.saveEntity(ref, 'execution_continuation', bindingId, 'approved', { ...plan, status: 'approved' });
+      this.saveExecutionContinuation(ref, bindingId, { ...plan, status: 'approved' });
     });
   }
   /** A launcher/native-id enrichment keeps the physical CLI. Preserve an
@@ -417,15 +432,17 @@ export class SessionContractStore {
     const execution = this.execution(ref, plan.execution.executionId);
     if (plan.status === 'approved' && execution?.phase !== 'accepted') return;
     const rejected = target.identity?.nativeSessionId !== plan.nativeSessionId || !!execution?.terminal || !!execution?.cancelRequested;
-    this.saveEntity(ref, 'execution_continuation', bindingId, rejected ? 'rejected' : plan.status, {
+    this.saveExecutionContinuation(ref, bindingId, {
       ...plan, ...(plan.status === 'planned' ? { target: target.ref } : {}), status: rejected ? 'rejected' : plan.status,
     });
   }
   rejectExecutionContinuation(ref: ContractSessionRef, bindingId: string): void {
-    const plan = this.entity<PlannedExecutionContinuation>(ref, 'execution_continuation', bindingId);
-    const execution = plan && this.execution(ref, plan.execution.executionId);
-    if (!plan || plan.status === 'rejected' || (plan.status === 'approved' && execution?.phase !== 'accepted')) return;
-    this.saveEntity(ref, 'execution_continuation', bindingId, 'rejected', { ...plan, status: 'rejected' });
+    this.transaction(() => {
+      const plan = this.entity<PlannedExecutionContinuation>(ref, 'execution_continuation', bindingId);
+      const execution = plan && this.execution(ref, plan.execution.executionId);
+      if (!plan || plan.status === 'rejected' || (plan.status === 'approved' && execution?.phase !== 'accepted')) return;
+      this.saveExecutionContinuation(ref, bindingId, { ...plan, status: 'rejected' });
+    });
   }
   executionContinuation(ref: ContractSessionRef, bindingId: string): RuntimeExecutionContinuationResult | undefined {
     const plan = this.entity<PlannedExecutionContinuation>(ref, 'execution_continuation', bindingId);

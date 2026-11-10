@@ -7,20 +7,18 @@ import { SessionContractStore } from '../src/services/session-contract-store.js'
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { registerSessionContractPrimary } from '../src/core/session-contract-primary.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { ExecutionPhase, RuntimeIdentity, RuntimeExecutionContinuation } from '../src/services/session-contract.js';
 
-const fixtureConfig = vi.hoisted(() => ({ dataDir: '' }));
-vi.mock('../src/config.js', () => ({ config: { session: { get dataDir() { return fixtureConfig.dataDir; } } } }));
 const directories: string[] = [];
 const handles: Array<{ close(): void }> = [];
 const identity = (physicalId: string, nativeSessionId = 'native-task'): RuntimeIdentity =>
   ({ backend: 'tmux', physicalId, nativeSessionId, proof: 'process_start' });
 
-function fixture(phase: ExecutionPhase = 'submitting', dispatchAttempt?: number) {
+function fixture(phase: ExecutionPhase = 'submitting', dispatchAttempt?: number, appId = 'cli_continuation_test') {
   const data = mkdtempSync(join(tmpdir(), 'execution-continuation-')); directories.push(data);
-  fixtureConfig.dataDir = data;
-  const ref = { appId: 'cli_continuation_test', sessionId: 'session-test' };
+  const ref = { appId, sessionId: 'session-test' };
   const store = new SessionContractStore(data, ref.appId); handles.push(store);
   const ds = { larkAppId: ref.appId, chatId: 'oc_test', cliReadyGeneration: 0,
     session: { sessionId: ref.sessionId, status: 'active', cliId: 'traex' },
@@ -183,6 +181,42 @@ describe('ordinary execution continuation', () => {
     expect(sent).toHaveLength(planned ? 0 : 1);
     expect(s.store.executionContinuation(s.ref, 'replacement')?.status).toBe(planned ? 'approved' : 'rejected');
     expect(s.currentExecution().phase).toBe(planned ? 'accepted' : 'reconciling');
+  });
+
+  it.each([false, true])('checkpoints revocation atomically and keeps retries idempotent (failVersionWrite=%s)', async failVersionWrite => {
+    vi.useFakeTimers();
+    const s = fixture('submitting', undefined, `cli_continuation_primary_${failVersionWrite}`);
+    s.reserve(); s.bind(); s.ds.session.rootMessageId = 'om_primary_test';
+    let primary: any = { value: { type: 'botmux.session.primary', session: structuredClone(s.ds.session) } };
+    let writes = 0;
+    registerSessionContractPrimary(s.ref.appId, { writeExactFromCurrent: async (_key: string, update: any) => {
+      primary = { value: structuredClone(update(primary)) }; writes++; return { kind: 'written' };
+    } } as any, () => { throw new Error('unexpected primary fence'); });
+    await s.controller.flushPrimary();
+    const approvedRevision = s.store.read(s.ref)!.revision;
+    await vi.advanceTimersByTimeAsync(100);
+    s.ds.initConfig!.traexAutoModel!.enabled = false;
+    if (failVersionWrite) {
+      const db = openDatabaseSyncOrThrow(s.store.filename); handles.push(db);
+      db.exec("CREATE TRIGGER fail_version BEFORE UPDATE ON contracts BEGIN SELECT RAISE(ABORT,'version_write_failed'); END");
+      expect(s.bind).toThrow('version_write_failed');
+      expect(s.store.executionContinuation(s.ref, 'replacement')?.status).toBe('approved');
+      expect(s.store.read(s.ref)!.revision).toBe(approvedRevision);
+      db.exec('DROP TRIGGER fail_version');
+    }
+    s.bind();
+    expect(s.store.executionContinuation(s.ref, 'replacement')?.status).toBe('rejected');
+    const rejectedRevision = s.store.read(s.ref)!.revision;
+    expect(rejectedRevision).toBeGreaterThan(approvedRevision);
+    await s.controller.flushPrimary(); expect(writes).toBe(2);
+    s.bind(); await s.controller.flushPrimary();
+    expect(s.store.read(s.ref)!.revision).toBe(rejectedRevision); expect(writes).toBe(2);
+    const restartedDs = { ...s.ds, session: structuredClone(primary.value.session) };
+    handles.splice(handles.indexOf(s.store), 1); s.store.close();
+    const reopened = new SessionContractStore(s.data, s.ref.appId); handles.push(reopened);
+    const restarted = new SessionController(restartedDs, reopened);
+    expect(restarted.store.executionContinuation(s.ref, 'replacement')?.status).toBe('rejected');
+    expect(restarted.store.read(s.ref)!.revision).toBe(rejectedRevision);
   });
 
   it('preserves an unused permit across physical CLI enrichment and then rotates again', () => {
