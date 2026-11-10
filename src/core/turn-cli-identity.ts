@@ -388,11 +388,17 @@ async function publishOne(
         if (local) return publish(local, true);
       }
       // Proven model only: the wrapper asks the daemon on every invocation, so
-      // a transient refusal can be re-asked there (see retryTransientTurnIdentity).
-      const retryable = platform.state === 'unavailable' && !!turnId && storageModel === 'proven';
+      // a refusal that can change during the turn (the platform was down, or
+      // the person has not authorized yet) can be re-asked there (see
+      // retryTransientTurnIdentity).
+      const retryable = (platform.state === 'unavailable' || platform.state === 'not_authorized')
+        && !!turnId && storageModel === 'proven';
       const outcome = refuseViaPlatform(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId, storageModel, platform, retryable);
       if (retryable) {
-        rememberTransientRefusal({ botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId: turnId! });
+        rememberTransientRefusal({
+          botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId: turnId!,
+          ...refusalKindOf(platform as Extract<PlatformIdentityResolution, { state: 'unavailable' | 'not_authorized' }>),
+        });
       }
       return outcome;
     }
@@ -414,8 +420,18 @@ async function publishOne(
 // published is still what is in force (compare-and-set right before writing,
 // so a newer publication or a revocation is never overwritten).
 //
-// Only `unavailable` qualifies: an HTTP answer about the person (not
-// authorized, no consent, not a teammate, forbidden) is final for the turn.
+// Two refusals qualify, each on its own pace:
+//  - `unavailable` (the platform could not be reached): first re-ask right
+//    away, then at most once per TRANSIENT_REFUSAL_RETRY_INTERVAL_MS;
+//  - `not_authorized` (incl. missing consent): the person can authorize on the
+//    platform page while the turn runs, and the refusal tells them to then just
+//    retry. Without a re-ask that retry could never succeed in the same turn:
+//    the turn kept the refusal it began with, and a reply mid-turn is steered
+//    into the running turn by Codex, so no new turn picks the grant up
+//    (deepcoldy/botmux#3312). Re-asked at most once per
+//    NOT_AUTHORIZED_RETRY_INTERVAL_MS, counted from the refusal itself.
+// The other answers about the person (not a teammate, forbidden) are final for
+// the turn.
 
 /** Minimum spacing between re-asks for one turn/tool. The FIRST re-ask is not
  *  spaced: preparing the turn already waited out a full grant budget, and the
@@ -428,13 +444,27 @@ export const TRANSIENT_REFUSAL_RETRY_INTERVAL_MS = 10_000;
 export const TRANSIENT_REFUSAL_WAIT_CAP_MS = GRANT_WAIT_CAP_MS;
 /** Re-asks per turn/tool; an agent stuck in a retry loop cannot hammer the platform. */
 export const TRANSIENT_REFUSAL_MAX_RETRIES = 5;
+/** Spacing between re-asks of a "not authorized yet" refusal. Authorizing takes
+ *  a person a while, and every re-ask is a grant request the platform records,
+ *  so this is slower than the outage pace and the first one waits too. */
+export const NOT_AUTHORIZED_RETRY_INTERVAL_MS = 30_000;
+/** Re-asks per turn/tool of a "not authorized yet" refusal: with the spacing
+ *  above, about ten minutes of a turn that keeps calling the tool. */
+export const NOT_AUTHORIZED_MAX_RETRIES = 20;
 /** Forget an entry after this long even if its turn's material is still held. */
 const TRANSIENT_REFUSAL_TTL_MS = 2 * 60 * 60 * 1000;
 const TRANSIENT_REFUSAL_MAX_ENTRIES = 1000;
 
+type RetryableRefusalKind = 'unavailable' | 'not_authorized';
+
 interface TransientRefusal {
   botConfig: BotConfig;
   tool: TriggerUserAuthTool;
+  /** Which refusal was published; decides the pace and what a re-ask may keep. */
+  kind: RetryableRefusalKind;
+  /** For `not_authorized`: whether it was the missing-consent variant. A re-ask
+   *  that gets the other variant republishes, so the person reads the right step. */
+  consent?: boolean;
   sessionDataDir: string;
   sessionId: string;
   senderOpenId: string;
@@ -453,6 +483,17 @@ interface TransientRefusal {
 
 const transientRefusals = new Map<string, TransientRefusal>();
 
+function refusalKindOf(
+  platform: Extract<PlatformIdentityResolution, { state: 'unavailable' | 'not_authorized' }>,
+): Pick<TransientRefusal, 'kind' | 'consent'> {
+  return platform.state === 'not_authorized' ? { kind: 'not_authorized', consent: platform.consent } : { kind: 'unavailable' };
+}
+
+const retryIntervalOf = (entry: TransientRefusal) =>
+  entry.kind === 'not_authorized' ? NOT_AUTHORIZED_RETRY_INTERVAL_MS : TRANSIENT_REFUSAL_RETRY_INTERVAL_MS;
+const maxRetriesOf = (entry: TransientRefusal) =>
+  entry.kind === 'not_authorized' ? NOT_AUTHORIZED_MAX_RETRIES : TRANSIENT_REFUSAL_MAX_RETRIES;
+
 function transientKey(sessionDataDir: string, sessionId: string, turnId: string, tool: TriggerUserAuthTool): string {
   return JSON.stringify([sessionDataDir, sessionId, turnId, tool]);
 }
@@ -465,7 +506,9 @@ function rememberTransientRefusal(entry: Omit<TransientRefusal, 'body' | 'authEp
   transientRefusals.delete(key);
   transientRefusals.set(key, {
     ...entry, body, authEpoch: readCliAuthEpoch(entry.senderOpenId),
-    createdAt: now, lastAttemptAt: Number.NEGATIVE_INFINITY, retries: 0,
+    // An outage is re-asked on the turn's first call; "not authorized yet" was
+    // itself just asked, so its spacing starts now.
+    createdAt: now, lastAttemptAt: entry.kind === 'not_authorized' ? now : Number.NEGATIVE_INFINITY, retries: 0,
   });
   while (transientRefusals.size > TRANSIENT_REFUSAL_MAX_ENTRIES) {
     const oldest = transientRefusals.keys().next().value;
@@ -507,12 +550,12 @@ export async function retryTransientTurnIdentity(args: {
     const now = Date.now();
     if (!stillInForce(entry)
       || now - entry.createdAt > TRANSIENT_REFUSAL_TTL_MS
-      || entry.retries >= TRANSIENT_REFUSAL_MAX_RETRIES
+      || entry.retries >= maxRetriesOf(entry)
       || !policyStillWants(args.currentPolicy, entry, args.botConfig)) {
       transientRefusals.delete(key);
       return;
     }
-    if (now - entry.lastAttemptAt < TRANSIENT_REFUSAL_RETRY_INTERVAL_MS) return;
+    if (now - entry.lastAttemptAt < retryIntervalOf(entry)) return;
     entry.lastAttemptAt = now;
     entry.retries++;
     entry.inFlight = runTransientRetry(key, entry, args.currentPolicy, args.botConfig)
@@ -589,6 +632,9 @@ async function runTransientRetry(
       return;
     }
     if (platform.state === 'unavailable') return; // keep the refusal; retry later
+    if (platform.state === 'not_authorized' && entry.kind === 'not_authorized' && platform.consent === entry.consent) {
+      return; // still the same refusal: they have not authorized yet; ask again later
+    }
     if (platform.state === 'unbound') {
       // Unbound mid-turn: what applies now depends on the source (auto falls
       // back to local logins) and is the next turn's decision. Keep the
@@ -596,10 +642,16 @@ async function runTransientRetry(
       drop();
       return;
     }
-    // The platform now answered about the person: publish that answer, final.
+    // The platform now answered about the person: publish that answer. A "not
+    // authorized yet" answer stays re-askable (now on its own pace); the other
+    // answers about the person are final for the turn.
     refuseViaPlatform(entry.tool, entry.botConfig, entry.sessionDataDir, entry.sessionId, entry.senderOpenId,
       entry.locale, entry.turnId, 'proven', platform);
     drop();
+    if (platform.state === 'not_authorized') {
+      const { botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId } = entry;
+      rememberTransientRefusal({ botConfig, tool, sessionDataDir, sessionId, senderOpenId, locale, turnId, ...refusalKindOf(platform) });
+    }
   } catch (e) {
     logger.warn(`[trigger-user-auth] retry of ${entry.tool} identity failed for session ${entry.sessionId}: `
       + `${e instanceof Error ? e.message : String(e)}`);
