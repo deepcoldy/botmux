@@ -38,7 +38,7 @@ beforeEach(() => {
     'fi',
     'case "$1 $2" in',
     '  "status ")',
-    '    if [ -s "$store/credentials.enc" ]; then a=true; else a=false; fi',
+    '    if [ -s "$store/credentials-bytedcli.enc" ]; then a=true; else a=false; fi',
     '    printf \'{"status":"success","data":{"official_meegle_cli_authenticated":%s}}\\n\' "$a" ;;',
     '  "login --begin")',
     '    [ -z "$STUB_FAIL" ] || { echo \'{"status":"error","error":{"code":"NETWORK"}}\'; exit 1; }',
@@ -48,7 +48,7 @@ beforeEach(() => {
     '  "login --complete")',
     `    [ "$3" = ${COMPLETE_TOKEN} ] || { echo '{"status":"error","error":{"code":"MEEGO_LOGIN_CHALLENGE_INVALID"}}'; exit 1; }`,
     '    if [ -f "$STUB_DIR/approved-$who" ]; then',
-    '      mkdir -p "$store" && cp "$STUB_DIR/approved-$who" "$store/credentials.enc"',
+    '      mkdir -p "$store" && cp "$STUB_DIR/approved-$who" "$store/credentials-bytedcli.enc"',
     '      echo \'{"status":"success","data":{"login_status":"success"}}\'',
     '    else echo \'{"status":"error","error":{"code":"MEEGO_LOGIN_TIMEOUT"}}\'; exit 1; fi ;;',
     'esac',
@@ -126,7 +126,7 @@ describe('requestMeegoLogin', () => {
     approve(ALICE, 'alice-login');
     expect(await m.requestMeegoLogin(ALICE)).toEqual({ state: 'ready' });
     const home = m.meegoHomeFor(ALICE);
-    expect(readFileSync(join(home, '.meegle', 'credentials.enc'), 'utf8')).toBe('alice-login');
+    expect(readFileSync(join(home, '.meegle', 'credentials-bytedcli.enc'), 'utf8')).toBe('alice-login');
     expect(existsSync(join(home, '.botmux-meego-challenge'))).toBe(false);
 
     // Logged in: reported ready by the provider, nothing new started.
@@ -143,8 +143,8 @@ describe('requestMeegoLogin', () => {
     const bob = await m.requestMeegoLogin(BOB);
     expect(bob).toEqual({ state: 'link', authUrl: 'https://meego.example/device?code=ou_bob-2' });
     expect(cliCalls().at(-1)?.home).toBe(m.meegoHomeFor(BOB));
-    expect(existsSync(join(m.meegoHomeFor(BOB), '.meegle', 'credentials.enc'))).toBe(false);
-    expect(readFileSync(join(m.meegoHomeFor(ALICE), '.meegle', 'credentials.enc'), 'utf8')).toBe('alice-login');
+    expect(existsSync(join(m.meegoHomeFor(BOB), '.meegle', 'credentials-bytedcli.enc'))).toBe(false);
+    expect(readFileSync(join(m.meegoHomeFor(ALICE), '.meegle', 'credentials-bytedcli.enc'), 'utf8')).toBe('alice-login');
   });
 
   it('an expired challenge is replaced by a new login', async () => {

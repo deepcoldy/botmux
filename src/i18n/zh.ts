@@ -722,6 +722,7 @@ export const messages: Record<string, string> = {
   'cmd.login.bytedcli_unavailable': 'ByteCloud（bytedcli）：授权服务暂时不可用，已有授权和待确认的登录会保留。服务恢复后重试，无需重新授权。',
   'cmd.login.bytedcli_status_yes': 'ByteCloud（bytedcli，含 codebase-cli / git）：已授权',
   'cmd.login.meego_ready': '✅ Meego 已登录。这份登录按人保存，你在本机器人的所有会话里都能直接用。',
+  'cmd.login.meego_tenant_invalid': '❌ Meego 租户只能是 {tenants}（不写即默认租户），例如 /login meego dcar。',
   'cmd.login.bytedcli_status_no': 'ByteCloud（bytedcli，含 codebase-cli / git）：未授权 —— 首次调用时会自动返回登录链接',
   'cmd.login.lark_title': '🔐 lark-cli 授权（点链接确认）',
   'cmd.login.lark_step1': '请打开下面的链接，用你自己的飞书账号确认授权：',

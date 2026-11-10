@@ -6,7 +6,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AuthLinkDelivery } from '../src/core/auth-link-delivery.js';
 import {
-  __resetProviderAuthForTest, LINK_RESEND_MS, requestProviderAuth, type ProviderAuthDeps,
+  __providerAuthTrackedForTest, __resetProviderAuthForTest, LINK_RESEND_MS, requestProviderAuth, type ProviderAuthDeps,
 } from '../src/core/provider-auth-request.js';
 import type { MeegoLoginRequest } from '../src/services/meego-auth.js';
 
@@ -101,12 +101,28 @@ describe('requestProviderAuth — Meego', () => {
     expect((await ask('meego', 'ou_alice', { chatId: 'oc_topic' })).status).toBe('pending');
   });
 
+  it('the fallback command names the tenant, so a dcar user is pointed at the right login', async () => {
+    await ask('meego', 'ou_alice', { tenant: 'dcar' });
+    expect(deps.deliver.mock.calls[0]![1]).toBe('/login meego dcar');
+    await ask('meego', 'ou_bob');
+    expect(deps.deliver.mock.calls[1]![1]).toBe('/login meego');
+  });
+
   it('asks for the tenant the command runs under, and tracks each tenant\'s link apart', async () => {
     await ask('meego');
     meego = { state: 'link', authUrl: MEEGO_URL };
     expect((await ask('meego', 'ou_alice', { tenant: 'dcar' })).status).toBe('delivered');
     expect(deps.requestMeegoLogin).toHaveBeenLastCalledWith('ou_alice', 'dcar');
     expect(deps.deliver).toHaveBeenCalledTimes(2);
+  });
+
+  it('links sent long ago are forgotten, so a long-running daemon does not pile them up', async () => {
+    await ask('meego', 'ou_alice', { chatId: 'oc_a' });
+    await ask('meego', 'ou_bob', { chatId: 'oc_b' });
+    expect(__providerAuthTrackedForTest()).toBe(2);
+    clock += LINK_RESEND_MS;
+    await ask('meego', 'ou_carol', { chatId: 'oc_c' });
+    expect(__providerAuthTrackedForTest()).toBe(1);
   });
 
   it('provider down: unavailable, nothing sent', async () => {

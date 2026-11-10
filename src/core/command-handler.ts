@@ -19,6 +19,8 @@ import { triggerUserAuthApplies, credentialSourceOf } from '../services/trigger-
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { requestMeegoLogin } from '../services/meego-auth.js';
+import { MEEGO_TENANTS, type MeegoTenant } from '../services/bytedcli-home.js';
+import { meegoLoginCommand } from './provider-auth-request.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
 import { sessionLarkToolBound } from './lark-tool-binding.js';
 import { deliverAuthLink } from './auth-link-delivery.js';
@@ -4533,10 +4535,19 @@ export async function handleCommand(
         const platformCredsUrl = credSource !== 'local' && (larkGoverned || bytedcliGoverned)
           ? platformCredentialsUrl() : null;
         const explicitGoverned = (subCmd === 'lark' && larkGoverned) || (subCmd === 'bytedcli' && bytedcliGoverned);
-        // `/login meego` — the person's Meego login, kept once per person for
-        // every session of this bot. Independent of where ByteCloud credentials
-        // come from: the platform does not issue Meego logins.
-        if (subCmd === 'meego') {
+        // `/login meego [dcar]` — the person's Meego login, kept once per person
+        // for every session of this bot. Independent of where ByteCloud
+        // credentials come from: the platform does not issue Meego logins.
+        // meegle keeps one login per tenant, so a dcar user names the tenant
+        // here the way `bytedcli meego login --tenant dcar` does.
+        const meegoArgs = subCmd.split(/\s+/);
+        if (meegoArgs[0] === 'meego') {
+          const tenantArg = meegoArgs.slice(1).join(' ').replace(/^--tenant(?:=|\s+)/, '').toLowerCase();
+          if (tenantArg && !MEEGO_TENANTS.includes(tenantArg as MeegoTenant)) {
+            await sessionReply(rootId, t('cmd.login.meego_tenant_invalid', { tenants: MEEGO_TENANTS.join(' / ') }, loc));
+            break;
+          }
+          const tenant = tenantArg ? tenantArg as MeegoTenant : undefined;
           if (!bytedcliGoverned) {
             await sessionReply(rootId, t('cmd.login.bytedcli_configure', undefined, loc));
             break;
@@ -4545,11 +4556,11 @@ export async function handleCommand(
             await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc));
             break;
           }
-          const login = await requestMeegoLogin(loginOpenId);
+          const login = await requestMeegoLogin(loginOpenId, tenant);
           if (login.state === 'link') {
             await authLinkReply([
               t('auth_link.meego_title', undefined, loc), login.authUrl, '', t('auth_link.meego_footer', undefined, loc),
-            ].join('\n'), '/login meego');
+            ].join('\n'), meegoLoginCommand(tenant));
           } else {
             await sessionReply(rootId, login.state === 'ready'
               ? t('cmd.login.meego_ready', undefined, loc)

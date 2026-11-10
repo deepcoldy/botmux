@@ -759,7 +759,7 @@ import * as sessionStore from '../src/services/session-store.js';
 import { resetSessionCodexModelSelection } from '../src/core/worker-pool.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
-import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, getMessageDetail, UserTokenMissingError } from '../src/im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, sendEphemeralCard, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, getMessageDetail, UserTokenMissingError } from '../src/im/lark/client.js';
 import { recordP2pForceTopicRoot, removeP2pForceTopicRoot } from '../src/services/p2p-force-topic-store.js';
 import { buildAdoptSelectCard, buildRepoSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
@@ -2194,6 +2194,11 @@ describe('handleCommand', () => {
     vi.mocked(statSync).mockReturnValue({ isDirectory: () => true } as any);
     vi.mocked(deleteMessage).mockResolvedValue(true);
     vi.mocked(sendMessage).mockResolvedValue('card-msg-id');
+    // Auth-link delivery: a test that queues a DM / private-card failure with
+    // mockRejectedValueOnce and never reaches it would hand that failure to a
+    // later test; mockReset drops the queue, then the default comes back.
+    vi.mocked(sendUserMessage).mockReset().mockResolvedValue('private-msg-id');
+    vi.mocked(sendEphemeralCard).mockReset().mockResolvedValue('eph_picker_msg_id');
     vi.mocked(replyMessage).mockResolvedValue('picker-card-msg-id');
     vi.mocked(getChatModeStrict).mockResolvedValue('topic');
     vi.mocked(getMessageThreadId).mockResolvedValue('omt_child');
@@ -7852,11 +7857,32 @@ describe('handleCommand', () => {
           const { requestMeegoLogin } = await import('../src/services/meego-auth.js');
           const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
           await handleCommand('/login', ROOT_ID, makeLarkMessage('/login meego'), deps, LARK_APP_ID);
-          expect(requestMeegoLogin).toHaveBeenCalledExactlyOnceWith('ou_sender');
+          expect(requestMeegoLogin).toHaveBeenCalledExactlyOnceWith('ou_sender', undefined);
           const [, openId, dmText] = vi.mocked(sendUserMessage).mock.calls[0]!;
           expect(openId).toBe('ou_sender');
           expect(dmText).toContain('https://meego.example/device?code=M1');
           expect(replies(deps)).toEqual([t('auth_link.sent_privately', undefined, 'zh')]);
+        });
+
+        it.each(['/login meego dcar', '/login meego DCAR', '/login meego --tenant dcar', '/login meego --tenant=dcar'])(
+          '%s logs in to the dcar tenant, and the fallback names it', async (text) => {
+            const { requestMeegoLogin } = await import('../src/services/meego-auth.js');
+            const { sendEphemeralCard } = await import('../src/im/lark/client.js');
+            vi.mocked(sendUserMessage).mockRejectedValueOnce(new Error('230013'));
+            vi.mocked(sendEphemeralCard).mockRejectedValueOnce(new Error('18053'));
+            const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
+            await handleCommand('/login', ROOT_ID, makeLarkMessage(text), deps, LARK_APP_ID);
+            expect(requestMeegoLogin).toHaveBeenCalledExactlyOnceWith('ou_sender', 'dcar');
+            expect(replies(deps)).toEqual([t('auth_link.dm_failed', { command: '/login meego dcar' }, 'zh')]);
+          });
+
+        it('a tenant bytedcli does not have: says which ones exist, starts nothing', async () => {
+          const { requestMeegoLogin } = await import('../src/services/meego-auth.js');
+          const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
+          await handleCommand('/login', ROOT_ID, makeLarkMessage('/login meego boe'), deps, LARK_APP_ID);
+          expect(requestMeegoLogin).not.toHaveBeenCalled();
+          expect(sendUserMessage).not.toHaveBeenCalled();
+          expect(replies(deps)).toEqual([t('cmd.login.meego_tenant_invalid', { tenants: 'dcar' }, 'zh')]);
         });
 
         it('DM and card both fail: points to /login meego elsewhere, never the link', async () => {

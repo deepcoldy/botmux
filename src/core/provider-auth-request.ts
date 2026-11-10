@@ -45,6 +45,12 @@ export interface ProviderAuthDeps {
 
 const PROVIDER_LABEL: Record<AuthProvider, string> = { meego: 'Meego', bytedcli: 'ByteCloud' };
 
+/** What the person sends elsewhere when the link cannot reach them privately.
+ *  meegle keeps one login per tenant, so the tenant is part of the command. */
+export function meegoLoginCommand(tenant?: MeegoTenant): string {
+  return tenant ? `/login meego ${tenant}` : '/login meego';
+}
+
 const recent = new Map<string, { authUrl: string; at: number; reached: boolean }>();
 
 export async function requestProviderAuth(
@@ -64,7 +70,7 @@ export async function requestProviderAuth(
     link = {
       authUrl: login.authUrl,
       text: [t('auth_link.meego_title', undefined, locale), login.authUrl, '', t('auth_link.meego_footer', undefined, locale)].join('\n'),
-      command: '/login meego',
+      command: meegoLoginCommand(tenant),
     };
   } else {
     if (await deps.bytedcliAuthorized(openId) === true) {
@@ -93,7 +99,9 @@ export async function requestProviderAuth(
       : { status: 'undeliverable', delivery: 'dm_failed', message: t('provider_auth.undeliverable', vars, locale) };
   }
   const delivery = await deps.deliver(link.text, link.command);
-  recent.set(key, { authUrl: link.authUrl, at: now(), reached: delivery !== 'dm_failed' });
+  const at = now();
+  for (const [k, v] of recent) if (at - v.at >= LINK_RESEND_MS) recent.delete(k);
+  recent.set(key, { authUrl: link.authUrl, at, reached: delivery !== 'dm_failed' });
   switch (delivery) {
     case 'inline': return { status: 'delivered', delivery, message: t('provider_auth.delivered_inline', vars, locale) };
     case 'dm': return { status: 'delivered', delivery, message: t('provider_auth.delivered_dm', vars, locale) };
@@ -105,4 +113,9 @@ export async function requestProviderAuth(
 /** @internal test-only */
 export function __resetProviderAuthForTest(): void {
   recent.clear();
+}
+
+/** @internal test-only */
+export function __providerAuthTrackedForTest(): number {
+  return recent.size;
 }

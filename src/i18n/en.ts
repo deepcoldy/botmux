@@ -725,6 +725,7 @@ export const messages: Record<string, string> = {
   'cmd.login.bytedcli_unavailable': 'ByteCloud (bytedcli): authorization service unavailable. Existing credentials and pending login are retained. Retry after recovery; no new authorization is needed.',
   'cmd.login.bytedcli_status_yes': 'ByteCloud (bytedcli, incl. codebase-cli / git): authorized',
   'cmd.login.meego_ready': '✅ Meego is logged in. The login is kept per person, so every conversation you have with this bot can use it.',
+  'cmd.login.meego_tenant_invalid': '❌ The Meego tenant can only be {tenants} (leave it out for the default tenant), e.g. /login meego dcar.',
   'cmd.login.bytedcli_status_no': 'ByteCloud (bytedcli, incl. codebase-cli / git): not authorized — the first call returns a login link automatically',
   'cmd.login.lark_title': '🔐 lark-cli authorization (tap the link)',
   'cmd.login.lark_step1': 'Open the link below and confirm with your own Feishu account:',
