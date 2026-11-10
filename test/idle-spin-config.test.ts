@@ -53,8 +53,13 @@ describe('idleSpinSuspend config', () => {
     expect(normalizeIdleSpinSuspendConfig({ cliIds: [] })).toEqual({ cliIds: [] });
   });
 
+  it('keeps unknown cli ids (they simply never match a live session)', () => {
+    expect(normalizeIdleSpinSuspendConfig({ cliIds: ['future-cli'] })).toEqual({ cliIds: ['future-cli'] });
+  });
+
   it.each([
-    ['unknown cli id', { cliIds: ['not-a-cli'] }],
+    ['non-string cli id', { cliIds: ['traex', 42] }],
+    ['blank cli id', { cliIds: ['  '] }],
     ['cpuPercent 0', { cpuPercent: 0 }],
     ['cpuPercent too high', { cpuPercent: 401 }],
     ['fractional samples', { consecutiveSamples: 2.5 }],

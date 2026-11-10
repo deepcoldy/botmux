@@ -1,4 +1,3 @@
-import { ALL_CLI_IDS } from '../adapters/cli/registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 
 /**
@@ -90,8 +89,6 @@ export const DEFAULT_IDLE_SPIN_SUSPEND_CONFIG: ResolvedIdleSpinSuspendConfig = {
   },
 };
 
-const CLI_ID_SET = new Set<string>(ALL_CLI_IDS);
-
 function isFiniteInRange(value: unknown, min: number, max: number): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max;
 }
@@ -104,8 +101,13 @@ function normalizeCliIds(raw: unknown): CliId[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   const out: CliId[] = [];
   for (const entry of raw) {
-    if (typeof entry !== 'string' || !CLI_ID_SET.has(entry)) return undefined;
-    if (!out.includes(entry as CliId)) out.push(entry as CliId);
+    // Do NOT import the CLI registry here: `bot-config-store` → this module →
+    // `adapters/cli/registry` closes a cycle that leaves `ALL_CLI_IDS` in TDZ
+    // during dashboard/daemon startup. An unknown id is harmless — it simply
+    // never matches a live session's CLI.
+    if (typeof entry !== 'string' || !entry.trim()) return undefined;
+    const id = entry.trim() as CliId;
+    if (!out.includes(id)) out.push(id);
   }
   return out;
 }
