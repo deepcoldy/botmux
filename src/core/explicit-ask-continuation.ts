@@ -172,6 +172,18 @@ export function createExplicitAskContinuation(deps: {
   return { wait, acknowledge, sweep };
 }
 
+/** Whether the live session still owns an explicit Ask's routing binding. The
+ * Ask is bound with root=null in a chat-scope session, whose record stores its
+ * chat id as rootMessageId; comparing that raw field would treat every
+ * chat-scope Ask as rebound. Recovery and no-deadline invalidation share this. */
+export function explicitAskSessionBound(
+  ask: Pick<CreateAskInput, 'larkAppId' | 'chatId' | 'rootMessageId'>,
+  session: { larkAppId: string; chatId: string; session: { scope?: 'thread' | 'chat'; rootMessageId: string } } | undefined,
+): boolean {
+  return !!session && session.larkAppId === ask.larkAppId && session.chatId === ask.chatId
+    && (session.session.scope === 'chat' ? null : session.session.rootMessageId) === ask.rootMessageId;
+}
+
 /** The daemon must compare against its live worker authority, not CLI stdout. */
 export function explicitAskOriginIsLive(receipt: ExplicitAskReceipt, session: {
   workerAlive: boolean;

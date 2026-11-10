@@ -196,6 +196,13 @@ describe('explicit Ask durable continuation', () => {
       shouldInvalidate: () => true, invalidate: invalidateExplicitAsk, releaseHandoff: releaseExplicitAskHandoff });
     await recovered.sweep();
     expect(getAskSnapshot(original.askId)?.result).toMatchObject({ kind: 'invalidated' });
+    // The closed session never reconnects: the sweep itself must commit the
+    // non-approval receipt and release the broker handoff.
+    await vi.advanceTimersByTimeAsync(0);
+    const receipts = readdirSync(fixture.deps.dir).filter(file => /^[a-f0-9]{64}\.json$/.test(file))
+      .map(file => JSON.parse(readFileSync(join(fixture.deps.dir, file), 'utf8')));
+    expect(receipts).toEqual([expect.objectContaining({ result: expect.objectContaining({ kind: 'invalidated', timedOut: false }) })]);
+    expect(store.list()).toHaveLength(1);
     await expect(recovered.wait(noDeadline)).resolves.toMatchObject({ kind: 'invalidated', timedOut: false });
     expect(tryResolveAsk({ askId: original.askId, nonce: original.nonce, selected: 'yes', by: 'human' })).toBe('already_settled');
     expect(store.list()).toHaveLength(1);
