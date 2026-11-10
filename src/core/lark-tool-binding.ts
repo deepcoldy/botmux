@@ -12,6 +12,7 @@ import { resolveEntrySpawn } from './self-spawn.js';
 import { headlessChatId, isHeadlessId } from '../services/headless-session-store.js';
 import { resolveBotmuxWrapperBinDir } from './botmux-wrapper.js';
 import { clearLarkToolDelegations } from './lark-tool-delegation.js';
+import { GRANT_ROUTE_CLIENT_TIMEOUT_MS } from '../platform/credential-grant-budget.js';
 import type { ProtectedLoopbackService } from './protected-http-egress-host.js';
 
 export const LARK_TOOL_BINDING_FILE = 'lark-tool-binding.json';
@@ -30,6 +31,9 @@ export function larkToolLoopbackService(sessionId: string, ipcPort: number): Pro
     path: `/api/sessions/${sessionId}/${LARK_TOOL_ROUTE}`,
     forwardHeaders: ['content-type', 'x-botmux-lark-session'],
     attestProcessPeer: true,
+    // The route runs a platform credential grant for `--as user`; a sandboxed
+    // runner reaches it through this relay, which must not cut it sooner.
+    upstreamTimeoutMs: GRANT_ROUTE_CLIENT_TIMEOUT_MS,
   };
 }
 export interface LarkToolBinding {

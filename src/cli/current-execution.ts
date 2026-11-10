@@ -1,4 +1,5 @@
 import { loopbackFetchImpl } from '../core/loopback-fetch.js';
+import { GRANT_ROUTE_CLIENT_TIMEOUT_MS } from '../platform/credential-grant-budget.js';
 import { findOnlineDaemon, parseDaemonIpcPort } from '../utils/daemon-discovery.js';
 
 export const CURRENT_EXECUTION_SCHEMA = 'botmux.current-execution.v1' as const;
@@ -148,11 +149,14 @@ export async function resolveCurrentExecutionIdentity(options: {
     // authority: the destination still attests the actual socket process.
     const ipcPort = options.fetchImpl ? options.ipcPort
       : parseDaemonIpcPort(findOnlineDaemon(options.larkAppId)?.ipcPort) ?? options.ipcPort;
+    // The route may wait on a platform grant still in flight (or re-ask for
+    // one) before answering; giving up sooner would refuse the tool call while
+    // the credentials are on their way.
     response = await (options.fetchImpl ?? loopbackFetchImpl)(
       `http://127.0.0.1:${ipcPort}${CURRENT_EXECUTION_IDENTITY_ROUTE}`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ sessionId: options.sessionId, tool: options.tool }),
-        redirect: 'error', signal: AbortSignal.timeout(20_000),
+        redirect: 'error', signal: AbortSignal.timeout(GRANT_ROUTE_CLIENT_TIMEOUT_MS),
       },
     );
   } catch (error) {
