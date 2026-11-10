@@ -93,6 +93,11 @@ export function workerSubmitHarness() {
   scope.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', scope);
   const schedule = loadWorkerFunction('scheduleSubmitFailureNotify', scope);
   scope.scheduleSubmitFailureNotify = schedule;
+  // flushPending's reply-addressing bookkeeping: the generic-adapter branch only
+  // runs when neither native proof applies (traex harness → the predicate is
+  // false), and markReplyInputConsumed is a safe no-op on the empty queue above.
+  scope.codexHistoryMatchProvesConsumption = loadWorkerFunction('codexHistoryMatchProvesConsumption', scope);
+  scope.markReplyInputConsumed = loadWorkerFunction('markReplyInputConsumed', scope);
   const flush = loadWorkerFunction<() => Promise<void>>('flushPending', scope);
   return { scope, queue, flush, schedule, recheck, settlements, submitFailureChains, inputDeliveryEvidence };
 }
