@@ -149,6 +149,14 @@ vi.mock('../src/im/lark/delegated-grant.js', () => ({
   applyDelegatedGrants: (...args: any[]) => mockApplyDelegatedGrants(...args),
 }));
 
+// 群负责人判定（本地认领记录 + 飞书群描述）由 test/chat-manager-routing.test.ts 用真实模块覆盖；
+// 这里只盯接线：默认不是任何群的负责人，用例按需打开。
+const mockIsChatManager = vi.fn(async (..._args: any[]) => false);
+vi.mock('../src/services/chat-manager.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/chat-manager.js')>()),
+  isChatManager: (...args: any[]) => mockIsChatManager(...args),
+}));
+
 const mockListChatBotMembers = vi.fn(async () => [] as Array<{ openId: string; name: string }>);
 const mockResolveCurrentChatBotOpenIds = vi.fn(async (_recv: string, _chat: string, _subjects: string[]) => ({
   ok: false, error: 'live_membership_unavailable', message: 'default_no_resolution',
@@ -344,6 +352,7 @@ beforeEach(() => {
   // that exercise 1v1 behavior opt in explicitly, so execution order cannot
   // leak one scenario's group shape into the next.
   mockGetChatInfo.mockReset().mockResolvedValue({ userCount: 3, botCount: 1 });
+  mockIsChatManager.mockReset().mockResolvedValue(false);
 });
 
 describe('im.message.receive_v1 — forwarded topic clarification coalescing', () => {
@@ -981,6 +990,8 @@ function setupBotState(opts?: {
 	  commandTriggers?: { enabled: boolean; commands: Array<{ cmd: string; prompt?: string }>; chats?: string[]; excludedChats?: string[] };
 	  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
 	  chatMentionModes?: Record<string, 'always' | 'topic' | 'never' | 'ambient'>;
+	  chatManagerEnabled?: boolean;
+	  chatManagerSharedTopic?: boolean;
 	  p2pMode?: 'thread' | 'chat' | 'group';
 	  summaryRange?: { limit?: number; sinceHours?: number };
 	  summaryMemory?: boolean;
@@ -1023,6 +1034,8 @@ function setupBotState(opts?: {
 	      commandTriggers: opts?.commandTriggers,
 	      chatReplyModes: opts?.chatReplyModes,
 	      chatMentionModes: opts?.chatMentionModes,
+	      chatManagerEnabled: opts?.chatManagerEnabled,
+	      chatManagerSharedTopic: opts?.chatManagerSharedTopic,
 	      p2pMode: opts?.p2pMode,
 	      summaryRange: opts?.summaryRange,
 	      summaryMemory: opts?.summaryMemory,
@@ -8911,6 +8924,119 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  // ── 群负责人 × 共享模式：chatManagerSharedTopic（默认关）——群负责人免 @ 接的顶层消息开不开话题 ──
+  describe('shared + group manager (chatManagerSharedTopic)', () => {
+    const CHAT = 'chat-shared-manager';
+    function managerEvent(messageId: string, extra: Record<string, unknown> = {}) {
+      return makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '看一下补跑任务还要不要' }),
+        messageId,
+        chatId: CHAT,
+        chatType: 'group',
+        ...extra,
+      });
+    }
+    function managerSetup(opts: { sharedTopic?: boolean; managerEnabled?: boolean; replyMode?: 'shared' | 'chat-topic'; allowedUsers?: string[] } = {}) {
+      setupBotState({
+        allowedUsers: opts.allowedUsers ?? [USER_OPEN_ID],
+        regularGroupReplyMode: opts.replyMode ?? 'shared',
+        regularGroupMentionMode: 'topic',
+        chatManagerEnabled: opts.managerEnabled ?? true,
+        chatManagerSharedTopic: opts.sharedTopic,
+      });
+      mockGetChatMode.mockResolvedValue('group');
+      mockGetCachedChatMode.mockReturnValue('group');
+      handlers.isSessionOwner.mockReturnValue(false);
+      mockIsChatManager.mockImplementation(async (app: string, chat: string) => app === MY_APP_ID && chat === CHAT);
+    }
+    async function deliver(event: any) {
+      await capturedHandlers['im.message.receive_v1'](event);
+      await flushEventWork();
+    }
+
+    it('switch off (default): the manager still answers the non-@ top-level message, flat (no topic)', async () => {
+      managerSetup();
+      const event = managerEvent('msg-manager-flat');
+      await deliver(event);
+      expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+      const [, ctx] = handlers.handleNewTopic.mock.calls[0];
+      expect(ctx).toMatchObject({ scope: 'chat', anchor: CHAT, larkAppId: MY_APP_ID });
+      expect(ctx.replyRootId).toBeUndefined();
+    });
+
+    it('switch on: the manager opens a topic under the message, reusing the group session', async () => {
+      managerSetup({ sharedTopic: true });
+      const event = managerEvent('msg-manager-topic');
+      await deliver(event);
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+        scope: 'chat',
+        anchor: CHAT,
+        replyRootId: 'msg-manager-topic',
+        larkAppId: MY_APP_ID,
+      }));
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+      expect(mockIsChatManager).toHaveBeenCalledTimes(1);
+    });
+
+    it('reuses one fail-closed manager decision across topic seeding and access gating', async () => {
+      managerSetup({ sharedTopic: true });
+      mockIsChatManager.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+      await deliver(managerEvent('msg-manager-lookup-failed'));
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+      expect(mockIsChatManager).toHaveBeenCalledTimes(1);
+    });
+
+    it('switch on, but this bot is not the chat manager: not answered at all', async () => {
+      managerSetup({ sharedTopic: true });
+      mockIsChatManager.mockResolvedValue(false);
+      await deliver(managerEvent('msg-not-manager'));
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    });
+
+    it('switch on without the group-manager switch: does nothing on its own', async () => {
+      managerSetup({ sharedTopic: true, managerEnabled: false });
+      await deliver(managerEvent('msg-manager-disabled'));
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    });
+
+    it('switch on: a message that @mentions another member yields (no topic, not answered)', async () => {
+      managerSetup({ sharedTopic: true });
+      await deliver(managerEvent('msg-manager-redirect', {
+        content: JSON.stringify({ text: '@Someone 这个交给你' }),
+        mentions: [{ key: '@_other', name: 'Someone', id: { open_id: 'ou_someone_else' } }],
+      }));
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    });
+
+    it('switch on: a sender without talk permission is not answered', async () => {
+      managerSetup({ sharedTopic: true, allowedUsers: ['ou_someone_else'] });
+      await deliver(managerEvent('msg-manager-stranger'));
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    });
+
+    it('switch on, reply mode not shared: the manager answers flat exactly as before', async () => {
+      managerSetup({ sharedTopic: true, replyMode: 'chat-topic' });
+      await deliver(managerEvent('msg-manager-chat-topic'));
+      expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+      const [, ctx] = handlers.handleNewTopic.mock.calls[0];
+      expect(ctx).toMatchObject({ scope: 'chat', anchor: CHAT });
+      expect(ctx.replyRootId).toBeUndefined();
+    });
+
+    it('switch on: a reply inside a native topic is not a manager seed (manager covers top level only)', async () => {
+      managerSetup({ sharedTopic: true });
+      handlers.resolveReplyThreadAlias.mockReturnValue(null);
+      await deliver(managerEvent('msg-manager-in-thread', { rootId: 'om_foreign_root', threadId: 'omt_foreign' }));
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    });
   });
 
   it('mention mode always (default): a non-@ top-level message is ignored', async () => {

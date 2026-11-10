@@ -110,6 +110,10 @@ Mutations require the current human sender to explicitly authorize the action an
 
 Managers answer talk-authorized top-level messages without a mention, yielding when another member is addressed (@all is not a handoff). The bot name is appended to the group title; clearing preserves manual renames. Existing ambient, never and reply-mode settings remain independent. Manager ownership is a group-level handoff, not a new mention mode or a guarantee that no other bot replies.
 
+**Whether manager-answered messages open a topic**: off by default, so a top-level message the manager answers without an @ still gets a flat reply. In a regular group whose reply mode is `shared`, turn on "Open a topic for group-manager messages" in the same Dashboard section (or `/botconfig set chatManagerSharedTopic on`) to put the reply in a topic under that message, the same as a top-level message that @-mentions the bot. It is still the one group session; Group manager must be on; other reply modes are unaffected.
+
+![The Dashboard switch for opening a topic for group-manager messages](/img/chat-manager-shared-topic-dashboard.png)
+
 Clear the old manager before setting the new one. Each manager-specific mention-free decision verifies the remote description marker with no stale fallback and requires local administrator opt-in. Description overflow is rejected without truncating human text.
 
 Lark has no cross-host conditional writes: concurrent claims are not strongly consistent. After network failures or `chat_update_unconfirmed`, inspect status before retrying. Local records are stored under `chat-managers/` in the data directory with mode 0600; include them in backups.
