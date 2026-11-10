@@ -6273,7 +6273,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
     ? t('card.action.resume_started_remote', { cliName }, loc)
     : resumeStartsFresh(ds.session)
       ? t('card.action.resume_success_fresh', { cliName }, loc)
-      : t('cmd.resume.cli_success', { cliName }, loc);
+      : t('card.action.resume_success', { cliName }, loc);
   const postResumeNotice = async (): Promise<void> => {
     if (!ds.larkAppId) return;
     if (!sessionTransportDisabled(ds)) {

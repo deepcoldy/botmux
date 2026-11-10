@@ -866,7 +866,6 @@ export const messages: Record<string, string> = {
   'cmd.adopt.resume_not_found': '⚠️ That past session no longer exists or is already in use.',
   'cmd.adopt.managed_other_topic': '⚠️ That ID belongs to a Botmux session in another topic and cannot be moved here with /adopt. Resume it from the original topic, or run `botmux resume {id}` locally.',
   'cmd.resume.none': '⚠️ There is no closed session to resume here.',
-  'cmd.resume.cli_success': '🔄 Session resumed. Send a message to continue with {cliName}.',
   'cmd.resume.lane_unsupported': 'ℹ️ That session is a parallel-lane shadow and cannot be resumed with /resume. Continue in the original session.',
   'cmd.resume.primary_unsupported': 'ℹ️ This deployment runs durable coordination (primary); /resume is not supported yet. Click "Resume session" on the original session\'s close card instead.',
   'cmd.close.primary_unsupported': 'ℹ️ This deployment runs durable coordination (primary). This request did not enter the durable close path, so local close was refused. Send a plain `/close` in the topic again; `/close wt` and card-confirmed worktree deletion are not supported yet.',
