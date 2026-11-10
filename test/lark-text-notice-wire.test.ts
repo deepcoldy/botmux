@@ -171,7 +171,7 @@ describe('dashboard resume notice reaches Feishu wrapped once', () => {
     const w = await resumeOnce(lang, { root: 'om_resume_root', cliId: 'codex' });
     expect(w.api).toBe('reply');
     expect(w.path).toMatchObject({ message_id: 'om_resume_root' });
-    const notice = expectSingleWrap(w.data.content, '🔄');
+    const notice = expectSingleWrap(w.data.content, '✅');
     expect(notice).toContain(fragment);
     expect(notice).not.toContain(otherFragment);
     expect(notice).not.toMatch(/command line|命令行/i);
