@@ -39,8 +39,8 @@ import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
 import { withConfiguredBotOwner } from './core/bot-owner-attribution.js';
 import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-binding.js';
-import { releaseExplicitAskHandoff, hasExplicitAskHandoff } from './core/ask-broker.js';
-import { createExplicitAskContinuation, explicitAskRecoveryRequest, explicitAskOriginIsLive } from './core/explicit-ask-continuation.js';
+import { releaseExplicitAskHandoff, hasExplicitAskHandoff, invalidateExplicitAsk, setExplicitAskSessionChecker } from './core/ask-broker.js';
+import { createExplicitAskContinuation, explicitAskRecoveryRequest, explicitAskOriginIsLive, explicitAskSessionBound } from './core/explicit-ask-continuation.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, readdirSync, existsSync, mkdirSync, unlinkSync, realpathSync } from 'node:fs';
@@ -10667,12 +10667,13 @@ const explicitAskContinuation = createExplicitAskContinuation({
   register: input => registerHostAsk(input),
   releaseHandoff: releaseExplicitAskHandoff,
   hasHandoff: hasExplicitAskHandoff,
+  invalidate: invalidateExplicitAsk,
+  shouldInvalidate: receipt => sessionsRestored
+    && !explicitAskSessionBound(receipt.input, findActiveBySessionId(receipt.input.sessionId)),
   canResume: receipt => {
     const ds = findActiveBySessionId(receipt.input.sessionId);
-    return sessionsRestored && !!ds && ds.larkAppId === receipt.input.larkAppId
-      && ds.chatId === receipt.input.chatId
-      && (ds.session.scope === 'chat' ? null : ds.session.rootMessageId) === receipt.input.rootMessageId
-      && (!receipt.result || !ds.worker || ds.lastScreenStatus === 'idle');
+    return sessionsRestored && explicitAskSessionBound(receipt.input, ds)
+      && (!receipt.result || !ds!.worker || ds!.lastScreenStatus === 'idle');
   },
   dispatch: async (receipt, key) => {
     const ds = findActiveBySessionId(receipt.input.sessionId);
@@ -11089,6 +11090,7 @@ const handleAskRequest: Parameters<typeof ipcRoute>[2] = async (req, res) => {
 };
 ipcRoute('POST', '/api/asks', handleAskRequest);
 ipcRoute('POST', '/api/asks/form-v1', handleAskRequest);
+ipcRoute('POST', '/api/asks/no-deadline-v1', handleAskRequest);
 
 // The hook behind a permission card reports that its CLI ended the confirmation
 // without the card (built-in timeout, terminal choice, interrupt). Same caller
@@ -33224,6 +33226,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   setAskCanTalkChecker((appId, chatId, openId, chatType, actor) =>
     evaluateAskAnswerTalk(appId, chatId, openId, chatType, actor),
   );
+  setExplicitAskSessionChecker(ask => !sessionsRestored
+    || explicitAskSessionBound(ask, findActiveBySessionId(ask.sessionId)));
 
   // Resume pending `botmux ask` cards that outlived a daemon restart. Each is
   // restored as a DORMANT ask (card still live in Feishu, no waiter yet). The

@@ -25,6 +25,17 @@ function validBody(over: Record<string, unknown> = {}) {
 }
 
 describe('parseAskBody — happy path', () => {
+  it('accepts no deadline only for an explicit invocation with a stable request identity', () => {
+    expect(parseAskBody(validBody({ timeoutMs: 0, originKind: 'explicit', requestId: 'stable' })))
+      .toMatchObject({ timeoutMs: 0, originKind: 'explicit', requestId: 'stable' });
+    for (const originKind of [undefined, 'hook', 'permission', 'host_explicit']) {
+      expect(parseAskBody(validBody({ timeoutMs: 0, originKind, requestId: 'stable' })))
+        .toHaveProperty('error');
+    }
+    expect(parseAskBody(validBody({ timeoutMs: 0, originKind: 'explicit' })))
+      .toHaveProperty('error');
+  });
+
   it('parses explicit result acknowledgement without treating it as a new Ask', () => {
     expect(parseAskBody(validBody({ requestId: 'stable', originKind: 'explicit', acknowledge: true }))).toMatchObject({ acknowledge: true, requestId: 'stable' });
   });

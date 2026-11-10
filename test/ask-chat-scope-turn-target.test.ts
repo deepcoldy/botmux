@@ -9,11 +9,12 @@ import {
   registerHostAsk,
   setCanTalkChecker,
   setCardDispatcher,
+  setExplicitAskSessionChecker,
   submitCustomReply,
 } from '../src/core/ask-broker.js';
 import { parseAskBody, registerAskForResponse, verifiedAskMention } from '../src/core/ask-api.js';
 import { authorizeSessionScopedIpc, bindSessionScopedIpcIdentity } from '../src/core/daemon-ipc-session-auth.js';
-import { createExplicitAskContinuation, explicitAskOriginIsLive } from '../src/core/explicit-ask-continuation.js';
+import { createExplicitAskContinuation, explicitAskOriginIsLive, explicitAskSessionBound } from '../src/core/explicit-ask-continuation.js';
 import { frozenReplyContextForTurn } from '../src/core/reply-target.js';
 import { createLarkAskCardDispatcher } from '../src/im/lark/ask-card.js';
 import { isSilentMessageListenerSession } from '../src/core/message-listener-silence.js';
@@ -164,5 +165,44 @@ describe('chat-scope 会话里 ask 卡片跟随发起 turn 的冻结回复目标
     await done;
     expect(responses).toEqual([{ status: 200, payload: expect.objectContaining({ kind: 'answered', comment: '继续' }) }]);
     expect(sent).toHaveLength(1);
+  });
+
+  // chat-scope 会话记录里 rootMessageId 存的是 chatId，而 ask 身份按 root=null 绑定；
+  // 无期限 ask 的「会话关闭/换绑即失效」若拿原始字段比较，会把每张 chat-scope 卡判成已换绑。
+  it('无期限 ask：真实绑定出的 chat-scope 身份算会话仍在，可作答；会话关闭后同一张卡只得失效', async () => {
+    const ds = chatScopeSession({});
+    const live = new Map<string, Ds>([[ds.session.sessionId, ds]]);
+    setExplicitAskSessionChecker(ask => explicitAskSessionBound(ask, live.get(ask.sessionId)));
+    await cardThenTextAnswer(ds, askBody(TURN, { timeoutMs: 0 }));
+
+    const before = sent.length;
+    const { done, responses } = post(ds, askBody(TURN, { timeoutMs: 0, requestId: 'req-closed' }));
+    await vi.waitFor(() => expect(sent.length).toBe(before + 1));
+    const [pending] = listPendingAsksByAnchor({ larkAppId: APP, chatId: CHAT, anchor: CHAT });
+    live.clear();
+    expect(submitCustomReply({ askId: pending!.askId, by: 'ou_user', text: '继续' })).toBe('already_settled');
+    await done;
+    expect(responses.at(-1)).toMatchObject({ status: 200, payload: { kind: 'invalidated', timedOut: false } });
+  });
+
+  it('daemon 的显式 ask 回执判定：chat-scope 会话在线时不失效且可恢复，关闭或换群才失效，会话恢复完成前不判', () => {
+    const ds = chatScopeSession({});
+    const receipt = { version: 1, input: { larkAppId: APP, chatId: CHAT, rootMessageId: null, sessionId: ds.session.sessionId,
+      requestId: 'req-receipt', originKind: 'host_explicit', timeoutMs: 0, questions: [] } };
+    const scope: Record<string, any> = {
+      createExplicitAskContinuation: (deps: unknown) => deps, join, config: { session: { dataDir: dir } },
+      sessionsRestored: true, findActiveBySessionId: () => ds, explicitAskSessionBound,
+      releaseExplicitAskHandoff: () => {}, hasExplicitAskHandoff: () => true, invalidateExplicitAsk: () => {},
+    };
+    const deps = productionConst('src/daemon.ts', 'explicitAskContinuation', scope);
+    expect(deps.shouldInvalidate(receipt)).toBe(false);
+    expect(deps.canResume(receipt)).toBe(true);
+    scope.findActiveBySessionId = () => ({ ...ds, chatId: 'oc_other_chat' });
+    expect(deps.shouldInvalidate(receipt)).toBe(true);
+    expect(deps.canResume(receipt)).toBe(false);
+    scope.findActiveBySessionId = () => undefined;
+    expect(deps.shouldInvalidate(receipt)).toBe(true);
+    scope.sessionsRestored = false;
+    expect(deps.shouldInvalidate(receipt)).toBe(false);
   });
 });
