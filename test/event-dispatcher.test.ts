@@ -8939,13 +8939,21 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
         ...extra,
       });
     }
-    function managerSetup(opts: { sharedTopic?: boolean; managerEnabled?: boolean; replyMode?: 'shared' | 'chat-topic'; allowedUsers?: string[] } = {}) {
+    function managerSetup(opts: { sharedTopic?: boolean; managerEnabled?: boolean; replyMode?: 'shared' | 'chat-topic'; allowedUsers?: string[]; listener?: boolean } = {}) {
       setupBotState({
         allowedUsers: opts.allowedUsers ?? [USER_OPEN_ID],
         regularGroupReplyMode: opts.replyMode ?? 'shared',
         regularGroupMentionMode: 'topic',
         chatManagerEnabled: opts.managerEnabled ?? true,
         chatManagerSharedTopic: opts.sharedTopic,
+        messageListeners: opts.listener ? {
+          [CHAT]: {
+            enabled: true, prompt: 'Process matching messages',
+            senderPolicy: { mode: 'include_only', includeSenderOpenIds: [USER_OPEN_ID], includeSenderTypes: ['user'] },
+            messagePolicy: { includeMsgTypes: ['text'], scope: 'top_level' },
+            replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+          },
+        } : undefined,
       });
       mockGetChatMode.mockResolvedValue('group');
       mockGetCachedChatMode.mockReturnValue('group');
@@ -9036,6 +9044,36 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       await deliver(managerEvent('msg-manager-in-thread', { rootId: 'om_foreign_root', threadId: 'omt_foreign' }));
       expect(handlers.handleNewTopic).not.toHaveBeenCalled();
       expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    });
+
+    it('switch on: a matched message listener keeps its own thread route instead of being folded into the group session', async () => {
+      managerSetup({ sharedTopic: true, listener: true });
+      const event = managerEvent('msg-manager-listener');
+      await deliver(event);
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+        scope: 'thread',
+        anchor: 'msg-manager-listener',
+        messageListener: expect.objectContaining({ senderOpenId: USER_OPEN_ID }),
+      }));
+    });
+
+    it('switch on: a topic-group top-level post does not add a getChatMode forceRefresh beyond the off baseline', async () => {
+      function topicGroupCalls(sharedTopic: boolean): number {
+        managerSetup({ sharedTopic });
+        // 话题群：真实 isChatManager 的 readManagerChat 会因 chat_mode!=group 抛错→false。
+        mockGetChatMode.mockClear();
+        mockGetChatMode.mockResolvedValue('topic');
+        mockGetCachedChatMode.mockReturnValue('topic');
+        mockIsChatManager.mockResolvedValue(false);
+        return mockGetChatMode.mock.calls.length;
+      }
+      const offBase = topicGroupCalls(false);
+      await deliver(managerEvent('msg-manager-topic-group-off'));
+      const offCalls = mockGetChatMode.mock.calls.length - offBase;
+      const onBase = topicGroupCalls(true);
+      await deliver(managerEvent('msg-manager-topic-group-on'));
+      const onCalls = mockGetChatMode.mock.calls.length - onBase;
+      expect(onCalls).toBe(offCalls);
     });
   });
 

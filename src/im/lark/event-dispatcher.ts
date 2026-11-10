@@ -4234,15 +4234,21 @@ async function maybeApplySharedTopicSeed(input: {
     || (seedMentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message));
   // 群负责人免 @ 接的顶层消息：默认（开关关）照旧平铺回复、不开话题；bot 显式开了
   // `chatManagerSharedTopic` 时，和 @ 本 bot 的顶层消息一样开话题。开关关着时不做任何查询。
+  // `!!chatManagerAddressed` 同时是 bot 路径护栏：bot 发送方的 seed 调用点不传该回调，
+  // 且未 @ 的 bot 消息在分发器上游已被硬 return，能到达这里的 bot 消息 mentioned 恒为 true、
+  // managerSeedCandidate 恒为 false——回调缺失时不得继续走到下面的 chatManagerAddressed!()。
   const managerSeedCandidate = !mentioned && !policyAnswersUnmentioned
     && !!chatManagerAddressed && getBot(larkAppId).config.chatManagerSharedTopic === true;
   if (!mentioned && !policyAnswersUnmentioned && !managerSeedCandidate) return undefined;
+  // 负责人判定前置到 chat_mode 刷新之前：isChatManager 内的 readManagerChat 自身已校验
+  // 「普通群、非话题模式」（话题群抛错→fail-closed false），所以话题群未 @ 顶层帖在此退出，
+  // 不再多付一次 getChatMode 强刷；判定为真时它同时证明了当前就是普通群。
+  // 下方 freshMode 检查仍保留，作为群属性在两次远端读取之间被转换的二次防线。
+  if (managerSeedCandidate && !await chatManagerAddressed!()) return undefined;
   const freshMode = routing.scope === 'thread'
     ? await getChatMode(larkAppId, chatId, { forceRefresh: true })
     : (getCachedChatMode(larkAppId, chatId) ?? 'group');
   if (freshMode !== 'group') return undefined;
-  // 群负责人判定可能要读飞书群信息，放在其余条件都满足之后；不满足时不改 routing。
-  if (managerSeedCandidate && !await chatManagerAddressed!()) return undefined;
   routing.scope = 'chat';
   routing.anchor = chatId;
   logger.info(`[reply-mode] shared turn msg=${messageId.substring(0, 12)} routes through chat=${chatId.substring(0, 12)}`
@@ -6167,7 +6173,9 @@ export function createLarkEventDispatcherRuntime(
       } else {
         const seedReplyRootId = await maybeApplySharedTopicSeed({
           larkAppId, chatId, chatType, message, senderOpenId, messageId, routing, forceTopicApplied,
-          chatManagerAddressed,
+          // 群监听命中的消息归属监听自己的会话路由（独立 thread/per_message 或 chat + autoClose），
+          // 负责人 seed 不得把它并进群级会话；监听支路不传负责人回调即可保持原路由。
+          chatManagerAddressed: messageListener ? undefined : chatManagerAddressed,
         });
         if (seedReplyRootId) {
           replyRootId = seedReplyRootId;

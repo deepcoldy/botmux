@@ -72,6 +72,17 @@ describe('card-prefs store — chatManagerSharedTopic', () => {
     expect(store.getBotCardPrefs('app_default').chatManagerSharedTopic).toBe(false);
   });
 
+  it('a persisted true survives a fresh process reload through parseBotConfigsFromText', async () => {
+    // 重启链路：bots.json 里的 true 必须被 parseBotConfigsFromText 接回 config，
+    // 否则开关会在 daemon 重启后静默失效（写盘测试覆盖不到这一半）。
+    writeConfig({ chatManagerSharedTopic: true, chatManagerEnabled: true });
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+
+    expect(registry.getBot('app_default').config.chatManagerSharedTopic).toBe(true);
+    expect(store.getBotCardPrefs('app_default').chatManagerSharedTopic).toBe(true);
+  });
+
   it('Dashboard: on persists true to disk and memory; off removes the key again', async () => {
     writeConfig();
     const { registry, store } = await freshModules();
