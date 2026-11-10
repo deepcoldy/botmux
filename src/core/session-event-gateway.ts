@@ -44,9 +44,11 @@ export class SessionEventGateway {
       // A queued turn must persist its dispatch before writing to the runner,
       // so it has no native runtime binding yet. These preparatory events do
       // not bind/start the attempt and still require the current producer.
+      // The worker announces capture identity at the CLI write boundary,
+      // before turn_execution_started binds the queued execution.
       const unboundCurrent = sameWorker(state.worker, channel) && sameRuntime(state.activeRuntime, runtime)
         && (['turn_execution_started', 'native_input_consumed', 'turn_terminal', 'final_output'].includes(type)
-          || (execution.phase === 'queued' && ['managed_turn_origin', 'managed_turn_origin_revoked', 'codex_app_dispatch_transition'].includes(type)));
+          || (execution.phase === 'queued' && ['managed_turn_origin', 'managed_turn_origin_revoked', 'codex_app_dispatch_transition', 'capture_identity'].includes(type)));
       if (!sameRuntime(execution.runtime, runtime)
         && !(!execution.runtime && (recovery || workerEvents.has(type) || unboundCurrent))) {
         return { kind: 'reject', reason: 'execution_scope_unproven' };

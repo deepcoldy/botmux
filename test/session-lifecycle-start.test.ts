@@ -441,6 +441,52 @@ afterEach(() => {
 });
 
 describe('worker start operation', () => {
+  it.each([false, true])('keeps the adopted screenshot after capture identity precedes execution start (pre-admitted=%s)', async preAdmitted => {
+    vi.useFakeTimers();
+    const data = mkdtempSync(join(tmpdir(), 'botmux-adopt-screenshot-'));
+    const store = new SessionContractStore(data, 'app_test');
+    try {
+      const ds = makeDs({
+        adoptedFrom: { tmuxTarget: 'adopt-screenshot:0.0', originalCliPid: 23456, cliId: 'codex', cwd: REPO },
+        displayMode: 'screenshot',
+      });
+      const controller = new SessionController(ds, store);
+      contractController.value = controller;
+      const child: ChildProcess = makeFakeWorker();
+      forkMock.mockImplementationOnce(() => child);
+      forkAdoptWorker(ds);
+      const contract = ds.initConfig?.sessionContract;
+      if (!contract) throw new Error('Adopt init did not include the session contract');
+      const scope = new WorkerSessionEventScope(contract.session, contract.worker);
+      const binding = scope.beginRuntime();
+      controller.reserveBinding(binding.bindingId, contract.worker);
+      const runtime = controller.bindRuntime(binding.bindingId, contract.worker, {
+        backend: 'tmux', physicalId: '23456:start', nativeSessionId: 'adopt-screenshot', proof: 'process_start',
+      });
+      scope.assign(binding.bindingId, runtime.ref);
+      const turnId = 'om_adopt_screenshot';
+      const execution = preAdmitted ? controller.admitInput(turnId) : undefined;
+      const emit = async (message: WorkerToDaemon): Promise<void> => {
+        child.emit('message', scope.run(binding, () => ({ ...message, sessionContract: scope.envelope() }), execution));
+        await vi.advanceTimersByTimeAsync(0);
+      };
+
+      await emit({ type: 'capture_identity', revision: 1, turnId });
+      expect(ds.captureIdentity).toMatchObject({ revision: 1, turnId });
+      expect(store.executions(controller.ref, turnId)[0]).toMatchObject({ phase: 'queued' });
+      expect(store.executions(controller.ref, turnId)[0].runtime).toBeUndefined();
+      await emit({ type: 'turn_execution_started', turnId, startedAtMs: Date.now() });
+      await emit({ type: 'screenshot_uploaded', imageKey: 'img_adopt', status: 'working', turnId, captureRevision: 1 });
+      expect(ds.currentImageKey).toBe('img_adopt');
+      expect(ds.currentImageSource).toMatchObject({ imageKey: 'img_adopt', turnId });
+    } finally {
+      contractController.value = undefined;
+      store.close();
+      rmSync(data, { recursive: true, force: true });
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     { cliId: 'codex', restored: false },
     { cliId: 'codex', restored: true },

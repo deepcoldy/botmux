@@ -13,6 +13,8 @@ import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { loadWorkerPoolClosure, loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
 import type { DaemonSession } from '../src/core/types.js';
+import type { WorkerToDaemon } from '../src/types.js';
+import type { RuntimeEventBinding } from '../src/services/session-event-scope.js';
 import { sameWorker, sameRuntime } from '../src/services/session-contract.js';
 import { RestartCoordinator } from '../src/core/restart-coordinator.js';
 import { RUNTIME_RESERVATION_DEADLINE_MS, RuntimeReservationExpiredError } from '../src/services/runtime-reservation.js';
@@ -42,6 +44,87 @@ afterEach(() => {
 });
 
 describe('contract gateway and real worker boundaries', () => {
+  it.each([
+    { turnId: undefined, retry: false },
+    { turnId: 'om_initial_capture', retry: false },
+    { turnId: undefined, retry: true },
+    { turnId: 'om_initial_capture', retry: true },
+  ])('publishes the initial capture tuple inside its runtime before rendering (turn=$turnId, retry=$retry)', async ({ turnId, retry }) => {
+    vi.useFakeTimers();
+    const s = fixture();
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const reservations = new Map<string, (allowed: boolean) => void>();
+    const sent: WorkerToDaemon[] = [];
+    const admitted: string[] = [];
+    let starts = 0;
+    const env: Record<string, unknown> = {
+      workerSessionEventScope: scope, pendingRuntimeReservations: reservations,
+      currentBotmuxTurnId: undefined, currentBotmuxDispatchAttempt: undefined,
+      currentBotmuxCallerOpenId: undefined, captureRevision: 0, captureIdentityAnnounced: false,
+      activeRestartAttemptId: undefined, closeRequested: false,
+      spawnCliBody: vi.fn(async () => {
+        starts += 1;
+        expect(sent.filter(message => message.type === 'capture_identity')).toHaveLength(starts);
+        if (retry && starts === 1) throw new Error('Preparation failed before runtime publication');
+      }),
+      publishRuntimeContract: async (binding: RuntimeEventBinding) => {
+        const runtime = s.controller.bindRuntime(binding.bindingId, s.worker, {
+          backend: 'tmux', physicalId: '222:start', nativeSessionId: 'restored-adopt', proof: 'process_start',
+        });
+        scope.assign(binding.bindingId, runtime.ref);
+        for (const message of s.store.deferredEvents<WorkerToDaemon>(s.ref, binding.bindingId)) {
+          admitted.push(s.controller.ingest(message, s.worker).kind);
+        }
+      },
+      log: vi.fn(),
+    };
+    const metadata = loadWorkerFunction<(message: WorkerToDaemon) => WorkerToDaemon>('sessionEventMetadata', env);
+    env.send = (raw: WorkerToDaemon) => {
+      const message = metadata(raw);
+      sent.push(message);
+      if (message.type === 'runtime_binding_started') {
+        s.controller.reserveBinding(message.bindingId, s.worker);
+        reservations.get(message.bindingId)?.(true);
+      } else if (message.type === 'runtime_binding_aborted') {
+        if (!message.sessionContract) throw new Error('Missing abort metadata');
+        s.controller.abandonBinding(message.bindingId, s.worker, message.sessionContract.eventId);
+        scope.confirmAbortedStart(message.bindingId);
+      } else if (message.type === 'capture_identity') {
+        expect(s.controller.ingest(message, s.worker).kind).toBe('defer');
+      }
+    };
+    const capture = loadWorkerFunction<(turnId?: string, attempt?: number, caller?: string) => void>('setCaptureIdentity', env);
+    capture(turnId, undefined, 'ou_owner');
+    expect(sent).toEqual([]);
+    expect(env.currentBotmuxTurnId).toBe(turnId);
+
+    const spawn = loadWorkerFunction<(cfg: { prompt: string }) => Promise<void>>('spawnCli', env);
+    if (retry) {
+      await expect(spawn({ prompt: '' })).rejects.toThrow('Preparation failed before runtime publication');
+      expect(scope.currentBinding()).toBeUndefined();
+    }
+    await spawn({ prompt: '' });
+    expect(admitted).toEqual(['current']);
+    expect(sent.filter(message => message.type === 'capture_identity').at(-1)).toMatchObject({
+      revision: 0,
+      sessionContract: { bindingId: scope.currentBinding()?.bindingId },
+      ...(turnId ? { turnId } : {}),
+    });
+  });
+
+  it('accepts capture identity before the worker reports execution start', () => {
+    const s = fixture();
+    const turnId = 'om_adopt_screenshot';
+    const capture = {
+      type: 'capture_identity', turnId, revision: 1,
+      sessionContract: s.context(1),
+    };
+    expect(s.controller.ingest(capture, s.worker)).toMatchObject({ kind: 'current' });
+    const execution = s.store.executions(s.ref, turnId)[0];
+    expect(execution).toMatchObject({ phase: 'queued' });
+    expect(execution.runtime).toBeUndefined();
+  });
+
   it('does not upgrade an old runtime scope through a newer pending binding', () => {
     const s = fixture(); const execution = s.controller.admitInput('known-turn'); s.controller.reserveBinding('new-pending', s.worker);
     const before = s.store.read(s.ref)!.revision;
