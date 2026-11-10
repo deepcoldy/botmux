@@ -326,6 +326,15 @@ export function readTraexThreadIndex(
   }, dbPath) ?? new Map<string, TraexThreadIndexEntry>();
 }
 
+export function readTraexThreadWorkingDir(id: string, dbPath = traeStateDbPath()): string | undefined {
+  if (!id) return undefined;
+  return withTraeDb(db => {
+    const select = traexThreadSelect(db, TRAEX_THREAD_INDEX_COLUMNS);
+    if (!select) return undefined;
+    return normalizeTraexThreadIndexEntry(db.prepare(`${select} WHERE id=?`).get(id) as TraexThreadRow | undefined)?.cwd;
+  }, dbPath) ?? undefined;
+}
+
 /** Title / first prompt / origin for just these threads — the candidates a
  *  picker is about to show. Prompt columns are read whole on purpose: origin
  *  detection needs the envelope's closing tags and trailing footer, which can

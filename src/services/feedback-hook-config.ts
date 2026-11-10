@@ -27,7 +27,7 @@ export function normalizeFeedbackHook(input: unknown): FeedbackHookRegistration 
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('feedbackHook: expected object');
   const raw = input as Record<string, unknown>;
   const allowed = ['id', 'version', 'protocolVersion', 'hostId', 'command', 'cwd', 'allowedBotAppIds',
-    'allowedChatIds', 'allowedActionIds', 'timeoutMs', 'concurrency', 'envRefs', 'enabled'];
+    'allowedChatIds', 'allowedActionIds', 'timeoutMs', 'concurrency', 'envRefs', 'enabled', 'answerWorktree'];
   for (const field of Object.keys(raw)) {
     if (!allowed.includes(field)) throw new Error(`feedbackHook.${field}: unknown field`);
   }
@@ -41,6 +41,20 @@ export function normalizeFeedbackHook(input: unknown): FeedbackHookRegistration 
   });
   const cwd = text(raw.cwd, 'cwd');
   if (!isAbsolute(command[0]) || !isAbsolute(cwd)) throw new Error('feedbackHook.command/cwd: absolute paths required');
+  let answerWorktree: FeedbackHookRegistration['answerWorktree'];
+  if (raw.answerWorktree !== undefined) {
+    const value = raw.answerWorktree as Record<string, unknown>;
+    if (!value || typeof value !== 'object' || Array.isArray(value)
+      || Object.keys(value).some(key => !['script', 'repositoryRoots'].includes(key))
+      || typeof value.script !== 'string' || value.script.includes('\\') || value.script.includes('\0')
+      || value.script.split('/').some(part => !part || part === '.' || part === '..')
+      || isAbsolute(value.script) || command.length < 2
+      || !Array.isArray(value.repositoryRoots) || !value.repositoryRoots.length
+      || value.repositoryRoots.some(root => typeof root !== 'string' || !isAbsolute(root) || root.includes('\0'))) {
+      throw new Error('feedbackHook.answerWorktree: invalid script or repository roots');
+    }
+    answerWorktree = { script: value.script, repositoryRoots: [...new Set(value.repositoryRoots as string[])] };
+  }
   const envRefs: Record<string, string> = {};
   if (raw.envRefs !== undefined) {
     if (!raw.envRefs || typeof raw.envRefs !== 'object' || Array.isArray(raw.envRefs)) throw new Error('feedbackHook.envRefs: expected object');
@@ -61,5 +75,6 @@ export function normalizeFeedbackHook(input: unknown): FeedbackHookRegistration 
     allowedActionIds: identifiers(raw.allowedActionIds, 'allowedActionIds'),
     timeoutMs: positive(raw.timeoutMs, 'timeoutMs'), concurrency: positive(raw.concurrency, 'concurrency'),
     envRefs, enabled: raw.enabled === true,
+    ...(answerWorktree ? { answerWorktree } : {}),
   };
 }

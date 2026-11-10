@@ -19,6 +19,8 @@ import { feedbackMaintenanceActive, acquireFeedbackSendLease } from './feedback-
 import { resolveFeedbackPresentation } from './feedback-presentation.js';
 import { feedbackRefreshBudget, refreshFeedbackMessage } from './feedback-refresh.js';
 import type { FeedbackHookRegistration } from './feedback-extension-types.js';
+import { resolveFeedbackAnswerCommand } from './feedback-answer-worktree.js';
+import type { FeedbackAnswerWorktree } from './feedback-extension-types.js';
 
 function configured(dataDir: string): boolean { return existsSync(join(dataDir, 'feedback-extensions.json')); }
 async function removeInlineFeedback(dataDir: string, appId: string, messageId: string, signal?: AbortSignal): Promise<void> {
@@ -196,8 +198,26 @@ export async function tickFeedbackExtensions(dataDir: string, appId: string, lan
       extensions.settle(job.id, job.token!, 'failed_before_effect', { reason: 'hook_secret_unavailable' });
       return;
     }
-    const outcome = await runFeedbackHook({ hook, event: job.payload.event as HookEvent, hostId: config.hostId, env });
-    extensions.settle(job.id, job.token!, outcome.outcome, { ...outcome });
+    let executionHook = hook;
+    let executionEvent = job.payload.event as HookEvent;
+    let execution: Record<string, unknown> | undefined;
+    if (hook.answerWorktree) {
+      try {
+        const answer = executionEvent.answer as { sessionId: string; turnId: string } | undefined;
+        if (!answer) throw new Error('feedback_worktree_answer_missing');
+        const resolved = resolveFeedbackAnswerCommand(hook, executionEvent.answerWorktree as FeedbackAnswerWorktree,
+          answer.sessionId, answer.turnId);
+        const { answerWorktree: registration, ...legacyHook } = hook;
+        executionHook = { ...legacyHook, command: resolved.command, cwd: resolved.cwd };
+        execution = resolved.execution;
+        executionEvent = { ...executionEvent, execution };
+      } catch {
+        extensions.settle(job.id, job.token!, 'blocked', { reason: 'feedback_worktree_unavailable', recoverable: false });
+        return;
+      }
+    }
+    const outcome = await runFeedbackHook({ hook: executionHook, event: executionEvent, hostId: config.hostId, env });
+    extensions.settle(job.id, job.token!, outcome.outcome, { ...outcome, ...(execution ? { execution } : {}) });
   } finally { extensions.close(); }
 }
 
@@ -238,6 +258,12 @@ export async function handleFeedbackExtensionCard(input: unknown, appId: string,
       || !hook.allowedChatIds.includes(String(binding.chatId)) || !hook.allowedActionIds.includes(action.id)) {
       return { toast: { type: 'error', content: '动作未启用或已撤销' } };
     }
+    if (hook.answerWorktree && binding.worktreeBindingVersion !== 1) {
+      return { toast: { type: 'info', content: '历史反馈卡保持原样，请在新问题中使用新机制' } };
+    }
+    if (hook.answerWorktree && (!binding.answerWorktree || !binding.questionRouting)) {
+      return { toast: { type: 'error', content: '原答复目录或问题归属未绑定，未执行通知' } };
+    }
     const jobId = createHash('sha256').update(JSON.stringify([appId, binding.chatId, binding.subjectId, action.id])).digest('hex');
     const actor = candidates[0];
     const previous = extensions.job(jobId);
@@ -260,9 +286,11 @@ export async function handleFeedbackExtensionCard(input: unknown, appId: string,
       schemaVersion: 1, eventId: jobId, executionId: jobId, idempotencyKey: jobId, type: 'action.requested',
       occurredAt: new Date().toISOString(), bot: { appId },
       scope: { chatId: String(binding.chatId), topicId: binding.subjectId, subjectId: binding.subjectId, sourceMessageId: binding.subjectId },
-      answer: { answerGroupId: binding.answerId, deliveryId: binding.deliveryId, messageIds: binding.messageIds ?? [binding.answerMessageId], round: binding.round },
+      answer: { answerGroupId: binding.answerId, deliveryId: binding.deliveryId, messageIds: binding.messageIds ?? [binding.answerMessageId],
+        round: binding.round, sessionId: delivery.sessionId, turnId: delivery.turnId },
       surface: { messageId, templateId: binding.templateId }, actor: { openId: actor, appId },
       action: { id: action.id }, feedback: null, contextRef: null,
+      ...(hook.answerWorktree ? { answerWorktree: binding.answerWorktree, questionRouting: binding.questionRouting } : {}),
     };
     extensions.requestAction({
       requestId: createHash('sha256').update(JSON.stringify([jobId, actor, messageId])).digest('hex'),

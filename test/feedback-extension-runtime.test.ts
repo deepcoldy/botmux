@@ -12,6 +12,33 @@ import { buildFeedbackElement } from '../src/im/lark/skill-feedback-card.js';
 import { recordRelayedTurnDelivery } from '../src/core/relayed-turn-delivery.js';
 
 describe('feedback surface event reconciliation', () => {
+  it('persists model routing and answer worktree only on newly prepared surfaces', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-answer-binding-'));
+    const source = await SkillFeedbackStore.open(directory);
+    const extensions = await FeedbackExtensionStore.open(directory);
+    const worktree = { sessionId: 'session', turnId: 'turn', root: '/answer', commonDir: '/repo/.git',
+      gitDir: '/repo/.git/worktrees/answer', device: 1, inode: 2 };
+    const routing = { questionTypeId: 12, regions: ['sg'], reason: 'question concerns samples' };
+    try {
+      extensions.bindSubject('app', 'session', 'turn', {
+        sourceMessageId: 'question', answerKind: 'substantive', worktree, routing,
+      } as any);
+      source.recordTurnDelivery({ botAppId: 'app', sessionId: 'session', turnId: 'turn', platform: 'lark',
+        platformAppId: 'app', platformMessageId: 'answer', chatId: 'chat', topicRootId: 'question',
+        content: 'answer', cardMode: 'feedback', status: 'delivered', policy: normalizeFeedbackPolicy({ enabled: true }) });
+      source.recordTurnTerminal({ botAppId: 'app', sessionId: 'session', turnId: 'turn', status: 'completed' });
+      const legacy = { appId: 'app', chatId: 'chat', subjectId: 'old', actions: [] };
+      extensions.bindSurface('app', 'old-surface', legacy);
+      await reconcileFeedbackSurfaces({ appId: 'app', sourceKey: 'source', source, extensions, now: Date.now,
+        send: async () => 'new-surface', answerUrl: () => 'https://example.com', removeInline: async () => {},
+        config: { version: 1, hostId: 'host', templates: [defaultFeedbackTemplate()], hooks: [], actions: [],
+          presentations: { app: normalizeFeedbackPresentation({ default: { enabled: true, rounds: [1] } }) } } });
+      expect(extensions.surface('app', 'new-surface')).toMatchObject({
+        worktreeBindingVersion: 1, answerWorktree: worktree, questionRouting: routing,
+      });
+      expect(extensions.surface('app', 'old-surface')).toEqual(legacy);
+    } finally { extensions.close(); source.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
   it('retries a transient failed URL preparation rather than retaining its rejected batch cache', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'feedback-url-retry-'));
     const source = await SkillFeedbackStore.open(directory);

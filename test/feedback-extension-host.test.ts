@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync, unlinkSync } from 'node:fs';
+import { mkdtempSync, rmSync, unlinkSync, mkdirSync, writeFileSync, realpathSync, readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -29,6 +30,7 @@ import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 import { buildFeedbackSurface, defaultFeedbackTemplate } from '../src/services/feedback-template.js';
 import { feedbackRefreshBudget, refreshFeedbackMessage } from '../src/services/feedback-refresh.js';
 import { closeFeedbackStorage, getFeedbackStorage } from '../src/services/feedback-storage.js';
+import { bindFeedbackAnswerWorktree } from '../src/services/feedback-answer-worktree.js';
 
 const dispose: Array<() => void> = [];
 afterEach(() => {
@@ -73,6 +75,63 @@ async function fixture() {
 }
 
 describe('feedback extension host callback', () => {
+  it('runs a new card in its original answer worktree and retains its execution receipt on another click', async () => {
+    const data = await fixture();
+    const directory = realpathSync(data.directory);
+    const repository = join(directory, 'repository');
+    const answerDirectory = join(directory, 'answer');
+    const marker = join(directory, 'effect');
+    mkdirSync(repository);
+    const git = (...args: string[]) => execFileSync('git', ['-C', repository, ...args], {
+      env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' }, stdio: 'ignore',
+    });
+    git('init', '-q');
+    mkdirSync(join(repository, 'assets'));
+    writeFileSync(join(repository, 'assets/callback.py'),
+      `import json,sys\nfrom pathlib import Path\nrequest=json.load(sys.stdin)\nPath(${JSON.stringify(marker)}).write_text(str(Path.cwd()))\nprint(json.dumps({"schemaVersion":1,"executionId":request["executionId"],"outcome":"succeeded","publicMessage":"done","receiptRefs":["message:receipt"]}))\n`);
+    git('add', '.');
+    git('-c', 'user.name=Test', '-c', 'user.email=test@example.com', 'commit', '-qm', 'initial');
+    git('worktree', 'add', '-qb', 'answer', answerDirectory);
+    const config = await readFeedbackExtensionConfig(data.directory);
+    const registration = { script: 'assets/callback.py', repositoryRoots: [repository] };
+    await saveFeedbackExtensionConfig(data.directory, config.version, {
+      ...config, hooks: config.hooks.map(hook => ({ ...hook, version: 2,
+        command: ['/usr/bin/python3', '/old/callback.py'], answerWorktree: registration })),
+      presentations: { app: { default: { enabled: true, rounds: [1], actionIds: ['help'] }, rules: [] } },
+    }, 'admin');
+    const worktree = bindFeedbackAnswerWorktree({
+      sessionId: 'session', turnId: 'turn', workingDir: answerDirectory,
+    }, registration);
+    data.extensions.bindSurface('app', 'new-surface', { ...data.extensions.surface('app', 'surface')!,
+      worktreeBindingVersion: 1, answerWorktree: worktree,
+      questionRouting: { questionTypeId: 12, regions: ['sg'], reason: 'sample question' } });
+    const callback = { ...data.callback('feedback_custom_action', { action_id: 'help' }),
+      context: { open_message_id: 'new-surface', open_chat_id: 'chat' } };
+    await handleFeedbackExtensionCard(callback, 'app', data.directory);
+    await tickFeedbackExtensions(data.directory, 'app', 'background');
+    expect(readFileSync(marker, 'utf8')).toBe(answerDirectory);
+    const job = data.extensions.jobsForApp('app').find(item => item.kind === 'hook')!;
+    expect(job).toMatchObject({ status: 'succeeded', result: {
+      receiptRefs: ['message:receipt'], execution: { root: answerDirectory, script: 'assets/callback.py' },
+    } });
+    unlinkSync(marker);
+    await handleFeedbackExtensionCard(callback, 'app', data.directory);
+    await tickFeedbackExtensions(data.directory, 'app', 'background');
+    expect(data.extensions.job(job.id)?.status).toBe('succeeded');
+    expect(() => readFileSync(marker)).toThrow();
+  });
+  it('does not execute an old card through newly enabled worktree routing', async () => {
+    const data = await fixture();
+    const config = await readFeedbackExtensionConfig(data.directory);
+    await saveFeedbackExtensionConfig(data.directory, config.version, {
+      ...config, hooks: config.hooks.map(hook => ({ ...hook, version: 2,
+        command: ['/usr/bin/python3', '/old/callback.py'],
+        answerWorktree: { script: 'assets/callback.py', repositoryRoots: ['/repository'] } })),
+    }, 'admin');
+    const response = await handleFeedbackExtensionCard(data.callback('feedback_custom_action', { action_id: 'help' }), 'app', data.directory);
+    expect(response?.toast?.type).toBe('info');
+    expect(data.extensions.jobsForApp('app').filter(job => job.kind === 'hook')).toEqual([]);
+  });
   it('blocks a surface prepared before its counting scope changes at the transport boundary', async () => {
     const data = await fixture();
     const initial = await readFeedbackExtensionConfig(data.directory);

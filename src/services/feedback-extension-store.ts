@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import type { FeedbackAnswerWorktree, FeedbackQuestionRouting } from './feedback-extension-types.js';
 import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
 
 export interface ExtensionJobInput { id: string; kind: 'hook' | 'surface'; payload: Record<string, unknown> }
@@ -44,6 +45,7 @@ export class FeedbackExtensionStore {
   close(): void { this.database.close(); }
   bindSubject(appId: string, sessionId: string, turnId: string, binding: {
     sourceMessageId: string; answerKind: 'substantive' | 'clarification' | 'progress' | 'failed';
+    worktree?: FeedbackAnswerWorktree; routing?: FeedbackQuestionRouting;
   }): void {
     this.transaction(() => {
       const previous = this.subject(appId, sessionId, turnId);
@@ -51,7 +53,9 @@ export class FeedbackExtensionStore {
       this.database.prepare('INSERT OR IGNORE INTO subject_bindings VALUES(?,?,?,?)').run(appId, sessionId, turnId, JSON.stringify(binding));
     });
   }
-  subject(appId: string, sessionId: string, turnId: string): { sourceMessageId: string; answerKind: string } | undefined {
+  subject(appId: string, sessionId: string, turnId: string): {
+    sourceMessageId: string; answerKind: string; worktree?: FeedbackAnswerWorktree; routing?: FeedbackQuestionRouting;
+  } | undefined {
     const row = this.database.prepare('SELECT binding FROM subject_bindings WHERE app_id=? AND session_id=? AND turn_id=?')
       .get(appId, sessionId, turnId) as { binding: string } | undefined;
     return row ? JSON.parse(row.binding) : undefined;

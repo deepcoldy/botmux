@@ -2372,6 +2372,25 @@ ipcRoute('POST', '/api/sessions/:sessionId/feedback-bind', async (req, res, para
     if (!sourceThread || sourceThread !== rootThread) return jsonRes(res, 403, { error: 'feedback_binding_wrong_topic' });
   }
   const { FeedbackExtensionStore } = await import('../services/feedback-extension-store.js');
+  let answerBinding: Record<string, unknown> = {};
+  if (body.routing !== undefined) {
+    try {
+      const { bindFeedbackAnswerWorktree, normalizeFeedbackQuestionRouting } = await import('../services/feedback-answer-worktree.js');
+      const routing = normalizeFeedbackQuestionRouting(body.routing);
+      const cliId = ds.session.cliId;
+      const nativeSessionId = ds.session.cliSessionId;
+      const nativeWorkingDir = cliId === 'traex' && nativeSessionId
+        ? (await import('../services/traex-transcript.js')).readTraexThreadWorkingDir(nativeSessionId)
+        : undefined;
+      const worktree = bindFeedbackAnswerWorktree({
+        sessionId: ds.session.sessionId, turnId, cliId, nativeSessionId,
+        workingDir: ds.workingDir ?? ds.session.workingDir, nativeWorkingDir,
+      });
+      answerBinding = { routing, worktree };
+    } catch {
+      return jsonRes(res, 409, { error: 'feedback_answer_binding_unavailable' });
+    }
+  }
   const store = await FeedbackExtensionStore.open(config.session.dataDir);
   try {
     if (ds.managedTurnOrigin?.turnId !== turnId || findActiveBySessionId(params.sessionId) !== ds) {
@@ -2379,6 +2398,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/feedback-bind', async (req, res, para
     }
     store.bindSubject(ds.larkAppId, ds.session.sessionId, turnId, {
       sourceMessageId: body.sourceMessageId, answerKind: body.answerKind as 'substantive' | 'clarification' | 'progress' | 'failed',
+      ...answerBinding,
     });
     return jsonRes(res, 200, { ok: true, turnId, sourceMessageId: body.sourceMessageId });
   } finally { store.close(); }

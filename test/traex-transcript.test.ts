@@ -22,6 +22,7 @@ import {
   traexSessionIdFromRolloutPath,
   readTraexThreadDetails,
   readTraexThreadIndex,
+  readTraexThreadWorkingDir,
   readTraexThreadTitle,
 } from '../src/services/traex-transcript.js';
 import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
@@ -30,6 +31,23 @@ import { GOAL_COMMAND_OBJECTIVE } from '../src/workflows/v3/contract.js';
 const SID = '00000000-0000-7000-8000-000000000001';
 let dir: string;
 let path: string;
+
+describe('exact native answer directory', () => {
+  it('reads only the requested native thread current cwd and observes later directory updates', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-native-cwd-'));
+    const databasePath = join(directory, 'native.sqlite');
+    const database = openDatabaseSyncNow(databasePath)!;
+    try {
+      database.exec('CREATE TABLE threads (id TEXT PRIMARY KEY,cwd TEXT)');
+      database.prepare('INSERT INTO threads VALUES (?,?)').run('answer', '/repository/answer');
+      database.prepare('INSERT INTO threads VALUES (?,?)').run('other', '/repository/other');
+      expect(readTraexThreadWorkingDir('answer', databasePath)).toBe('/repository/answer');
+      expect(readTraexThreadWorkingDir('missing', databasePath)).toBeUndefined();
+      database.prepare('UPDATE threads SET cwd=? WHERE id=?').run('/repository/updated', 'answer');
+      expect(readTraexThreadWorkingDir('answer', databasePath)).toBe('/repository/updated');
+    } finally { database.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
+});
 
 function line(value: unknown): string {
   return `${JSON.stringify(value)}\n`;

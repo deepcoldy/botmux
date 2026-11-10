@@ -138,11 +138,15 @@ export async function reconcileFeedbackSurfaces(input: {
             const answerUrl = await answerUrls.get(urlKey)!;
             const card = buildFeedbackSurface({ template, policy: delivery.policy, round,
               answerUrl, preview: false, actions });
+            const answerBinding = extensions.subject(input.appId, delivery.sessionId ?? '', delivery.turnId ?? '');
             jobs.push({ id: jobId, kind: 'surface', payload: {
               appId: input.appId, subjectId: answerSubjectId, topicId: delivery.topicRootId, chatId: delivery.chatId, answerId,
               deliveryId: delivery.deliveryId, answerMessageId: delivery.platformMessageId, messageIds: group.messageIds, round, card, actions,
               roundScope: topicRounds ? 'topic' : 'subject',
               mode: rule.mode, templateId: template.id, template, answerUrl,
+              worktreeBindingVersion: 1,
+              ...(answerBinding?.worktree ? { answerWorktree: answerBinding.worktree } : {}),
+              ...(answerBinding?.routing ? { questionRouting: answerBinding.routing } : {}),
             } });
             preparedJobs.add(jobId);
           }

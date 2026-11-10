@@ -49,4 +49,26 @@ export interface FeedbackHookRegistration {
   concurrency: number;
   envRefs: Record<string, string>;
   enabled: boolean;
+  answerWorktree?: { script: string; repositoryRoots: string[] };
+}
+
+export interface FeedbackAnswerWorktree {
+  sessionId: string;
+  turnId: string;
+  root: string;
+  commonDir: string;
+  gitDir: string;
+  device: number;
+  inode: number;
+  commonDevice?: number;
+  commonInode?: number;
+  gitDevice?: number;
+  gitInode?: number;
+  nativeSessionId?: string;
+}
+
+export interface FeedbackQuestionRouting {
+  questionTypeId: number;
+  regions: string[];
+  reason: string;
 }
