@@ -25950,6 +25950,7 @@ async function spawnCliBody(
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
     resume: effectiveResume,
+    reattach: willReattachPersistent,
     workingDir: buildArgsWorkingDir,
     resumeSessionId: effectiveCliSessionId,
     quietResume: codexAutoUpgrade?.stage === 'restoring',
