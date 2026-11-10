@@ -403,7 +403,7 @@ import {
   protectedSessionMutationReasons,
 } from './session-mutation-guard.js';
 import { listPendingAsks, submitAskFromDesktop } from './ask-broker.js';
-import { getGlobalMessageListenerConfig, getGroupMessageListenerMode, getMessageListenerConfig, messageListenerConfigFromUpdate, sanitizeMessageListenerUpdate, updateGlobalMessageListenerConfig, updateGroupMessageListenerMode, updateMessageListenerConfig, validateMessageListenerUpdate } from '../services/message-listener-store.js';
+import { getGlobalMessageListenerConfig, getGroupMessageListenerMode, getMessageListenerConfig, messageListenerConfigFromUpdate, sanitizeMessageListenerUpdate, saveCustomGroupMessageListener, updateGlobalMessageListenerConfig, updateGroupMessageListenerMode, updateMessageListenerConfig, validateMessageListenerUpdate } from '../services/message-listener-store.js';
 import { getCommandTriggerConfig, setCommandTriggerChatEnabled, updateCommandTriggerConfig } from '../services/command-trigger-store.js';
 import { reservedCommandKind } from '../services/command-trigger.js';
 import { resolvePassthroughCommands } from './command-handler.js';
@@ -8360,8 +8360,8 @@ async function collectMessageListenerPreviewMatches(
   // the preview leg structurally immune to the next field added to the config.
   // Only `enabled` is overridden: an off draft is still previewable.
   const configured = messageListenerConfigFromUpdate(listener);
-  // Blank prompt => nothing worth previewing (findMessageListenerForChat would
-  // reject it anyway); mirrors the save path treating it as a clear.
+  // Blank prompt => nothing worth previewing: findMessageListenerForChat never
+  // matches it, even once enabled.
   if (!configured) return [];
   const previewListener: MessageListenerConfig = { ...configured, enabled: true };
   const previewBot = {
@@ -8803,9 +8803,10 @@ ipcRoute('PUT', '/api/group-message-listeners/:chatId', requireBoundBot(async (r
   if (update.prompt && Buffer.byteLength(update.prompt, 'utf-8') > MAX_MESSAGE_LISTENER_PROMPT_BYTES) {
     return jsonRes(res, 400, { ok: false, error: 'prompt_too_large' });
   }
-  const result = await updateMessageListenerConfig(cachedLarkAppId, p.chatId, update);
-  jsonRes(res, result.ok ? 200 : ['prompt_required', 'sender_required'].includes(result.reason) ? 400 : 500,
-    result.ok ? { ok: true, mode: 'custom', listener: result.listener } : { ok: false, error: result.reason });
+  const result = await saveCustomGroupMessageListener(cachedLarkAppId, p.chatId, update);
+  if (!result.ok) return jsonRes(res, ['prompt_required', 'sender_required'].includes(result.reason) ? 400 : 500, { ok: false, error: result.reason });
+  // Answer from the same reads as GET: the page takes this as what the group now runs.
+  jsonRes(res, 200, { ok: true, mode: getGroupMessageListenerMode(cachedLarkAppId, p.chatId), listener: getMessageListenerConfig(cachedLarkAppId, p.chatId) });
 }));
 
 // ─── 免@ 斜杠命令（commandTriggers） ──────────────────────────────────────

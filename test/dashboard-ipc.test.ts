@@ -52,6 +52,7 @@ import * as scheduler from '../src/core/scheduler.js';
 import * as botRegistry from '../src/bot-registry.js';
 import * as costCalculator from '../src/core/cost-calculator.js';
 import { clearMessageListenerRunPreviewStore, markMessageListenerRunPreviewReplied, markMessageListenerRunPreviewCompleted, markMessageListenerRunPreviewRunning } from '../src/services/message-listener-run-preview-store.js';
+import { findMessageListenerForChat } from '../src/services/message-listener.js';
 import * as persistentBackend from '../src/core/persistent-backend.js';
 import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
@@ -3866,6 +3867,91 @@ describe('PUT/GET /api/message-listeners/:chatId — disabled draft persistence 
       else process.env.BOTS_CONFIG = prevBotsConfig;
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('PUT /api/group-message-listeners/:chatId — the answer is what the group now runs', () => {
+  const appId = 'test-group-listener-app';
+  const chatId = 'oc_group_listener_chat';
+  const ownRule = { mode: 'custom', listener: { enabled: true, prompt: '本群规则' } };
+
+  async function withDaemon(entry: Record<string, unknown>, run: (base: string) => Promise<void>): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-group-listener-'));
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = join(dir, 'bots.json');
+      writeFileSync(process.env.BOTS_CONFIG, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude', ...entry }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      await run(`http://127.0.0.1:${handle.port}`);
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const put = (base: string, body: unknown) => fetch(`${base}/api/group-message-listeners/${chatId}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  });
+
+  it('keeps a custom rule saved switched off with no prompt, so the group stays off the global rule', async () => {
+    await withDaemon({
+      globalMessageListener: { enabled: true, prompt: '全局规则' },
+      groupMessageListenerOverrides: { [chatId]: ownRule },
+    }, async base => {
+      const res = await put(base, { mode: 'custom', listener: { enabled: false, prompt: '', contentPolicy: { includeKeywords: ['告警'] } } });
+      expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({ ok: true, mode: 'custom', listener: { enabled: false, prompt: '', contentPolicy: { includeKeywords: ['告警'] } } });
+      expect(await (await fetch(`${base}/api/group-message-listeners/${chatId}`)).json()).toMatchObject({ mode: 'custom', listener: { enabled: false, prompt: '' } });
+      expect(findMessageListenerForChat(getBot(appId), chatId)).toBeUndefined();
+      expect(findMessageListenerForChat(getBot(appId), 'oc_inheriting_chat')?.prompt).toBe('全局规则');
+
+      // A restart reads the same paused rule back from bots.json.
+      __testOnly_resetBotRegistry();
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      expect(getBot(appId).config.groupMessageListenerOverrides?.[chatId]).toMatchObject({ mode: 'custom', listener: { enabled: false, prompt: '' } });
+      expect(findMessageListenerForChat(getBot(appId), chatId)).toBeUndefined();
+    });
+  });
+
+  it.each([
+    ['custom, on', { mode: 'custom', listener: { enabled: true, prompt: '新规则' } }],
+    ['custom, off with a prompt', { mode: 'custom', listener: { enabled: false, prompt: '新规则' } }],
+    ['custom, off with no prompt', { mode: 'custom', listener: { enabled: false, prompt: '' } }],
+    ['disabled', { mode: 'disabled' }],
+    ['inherit', { mode: 'inherit' }],
+  ])('answers "%s" with what a re-read returns', async (_name, body) => {
+    await withDaemon({ groupMessageListenerOverrides: { [chatId]: ownRule } }, async base => {
+      const answer = await (await put(base, body)).json();
+      const reread = await (await fetch(`${base}/api/group-message-listeners/${chatId}`)).json();
+      expect(answer).toMatchObject({ ok: true, mode: reread.mode });
+      if (reread.mode === 'custom') expect(answer.listener).toEqual(reread.listener);
+    });
+  });
+
+  // What a group-page save leaves in bots.json: the rule plus its legacy shadow,
+  // which a restart loads into memory for the poller and the no-override fallback.
+  const savedFromGroupPage = { groupMessageListenerOverrides: { [chatId]: ownRule }, messageListeners: { [chatId]: ownRule.listener } };
+
+  it('leaves the legacy DELETE route clearing the rule, for the running daemon too', async () => {
+    await withDaemon(savedFromGroupPage, async base => {
+      expect((await fetch(`${base}/api/message-listeners/${chatId}`, { method: 'DELETE' })).status).toBe(200);
+      expect(await (await fetch(`${base}/api/group-message-listeners/${chatId}`)).json()).toMatchObject({ mode: 'inherit', listener: null });
+      expect(findMessageListenerForChat(getBot(appId), chatId)).toBeUndefined();
+    });
+  });
+
+  it('pauses the rule for the running daemon too, so a later legacy clear cannot bring it back', async () => {
+    await withDaemon(savedFromGroupPage, async base => {
+      expect((await put(base, { mode: 'custom', listener: { enabled: false, prompt: '' } })).status).toBe(200);
+      // The poller reads this row; a stale enabled copy keeps the paused group polled.
+      expect(getBot(appId).config.messageListeners?.[chatId]).toMatchObject({ enabled: false, prompt: '' });
+      expect((await fetch(`${base}/api/message-listeners/${chatId}`, { method: 'DELETE' })).status).toBe(200);
+      expect(findMessageListenerForChat(getBot(appId), chatId)).toBeUndefined();
+    });
   });
 });
 
