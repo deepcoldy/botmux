@@ -22,3 +22,6 @@ flowchart LR
 实测使用 `bun scripts/fenced-run.ts -- node --import tsx scripts/verify-antigravity-terminal-input.ts --agy-bin <cli> --auth-dir <authentication-directory> --report <report.json>`。node-pty 探针由 Node 执行，Bun 仅执行围栏。agy 1.5.4 对 1004 行、约 29KB 中文和 emoji 输入，在真实 PTY 与私有 tmux 两条路径都只提交一次，原生完整 transcript 各仅出现一条完整输入。单次测得 history 确认分别为 113ms、268ms，完整原生记录出现分别为 3499ms、3855ms；这些是一次观测，不是模型响应耗时或性能保证。认证源文件哈希保持不变。
 
 对抗验证发现磁盘版本不能代表暖恢复进程版本，已通过显式 reattach 上下文修复；暖恢复和未知边界保留旧路径。额外验证了写入结果不明与迟到确认、并发输入完整帧、非法 ESC 和 CRLF 归一化。
+
+
+最终验证：在 master `5011868` 上重放本次提交后，完整构建通过。通过 fenced runner 清理会话身份/IPC 环境并串行运行 6 个相关测试文件，64 条中 63 条通过；唯一失败为 `worker-agy-delivery.integration.test.ts` 的 `keeps an active command working despite its visible empty composer`，在输入前等待 screen_update 超时。另建未修改的 master `5011868` 工作树执行同一用例，同样超时，故未将其归因于本次输入改动，根因仍未确定。PR 保留草稿，未部署。跨 CLI 的 Grok tmux 启动及 Claude 启动回归通过。分别移除暖恢复与 ESC 保护的变异测试均准确失败，随后恢复源码。
