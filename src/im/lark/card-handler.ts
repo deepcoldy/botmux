@@ -98,7 +98,7 @@ import { holdPurgeClickRollback } from '../../services/image-purge-recovery.js';
 import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { AutoWorktreeFailClosedError } from '../../services/default-worktree.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
-import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
+import { resumeSuccessMessage } from '../../core/resume-result-message.js';
 import { cliHasNoRawPassthroughSurface, cliSupportsCompactAction } from '../../core/passthrough-commands.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
@@ -4020,11 +4020,7 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           // the adapter can only resume a precise cliSessionId and none was
           // persisted, the next spawn starts a FRESH session — say so instead
           // of claiming history is back.
-          const resumeMsg = result.recoveryPending
-            ? t('card.action.resume_started_remote', { cliName }, localeForBot(result.ds.larkAppId))
-            : resumeStartsFresh(result.ds.session)
-              ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
-              : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
+          const resumeMsg = resumeSuccessMessage(result, cliName, localeForBot(result.ds.larkAppId));
           // Restore the ORIGINAL live streaming card (🖥️ header + usage line +
           // 显示输出/终端/操作链接/关闭会话) as a WITHDRAW-then-REPOST when live
           // cards are enabled. Card-off bots only withdraw the stale closed card

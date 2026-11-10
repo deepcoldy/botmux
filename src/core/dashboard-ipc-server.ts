@@ -9,7 +9,7 @@ import { scheduleActiveRuntimePatch } from './worker-pool.js';
 import { botModelPins, clearModelPins } from './model-pin-store.js';
 import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, CodexProfileError } from '../services/codex-profiles.js';
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
-import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
+import { resumeSuccessMessage } from './resume-result-message.js';
 import { boardErrorStatus, type BoardCliRequest, type DecisionBoardService } from './decision-board/service.js';
 import {
   BOARD_HTML_CSP,
@@ -6661,11 +6661,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   // Mirror the card-button / /resume receipt wording: when the adapter can only
   // resume a precise cliSessionId and none was persisted, the next spawn is a
   // fresh CLI, so say so instead of claiming the old history is back.
-  const notice = result.recoveryPending
-    ? t('card.action.resume_started_remote', { cliName }, loc)
-    : resumeStartsFresh(ds.session)
-      ? t('card.action.resume_success_fresh', { cliName }, loc)
-      : t('card.action.resume_success', { cliName }, loc);
+  const notice = resumeSuccessMessage(result, cliName, loc);
   const postResumeNotice = async (): Promise<void> => {
     if (!ds.larkAppId) return;
     if (!sessionTransportDisabled(ds)) {
