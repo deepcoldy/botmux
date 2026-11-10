@@ -7,7 +7,7 @@
  * reporting `no local token`, and a new session started over.
  *
  * These run the real wrapper under /bin/sh against a stub CLI that keeps its
- * login exactly where meegle does (`$HOME/.meegle/credentials.enc`), and a stub
+ * login exactly where meegle does (`$HOME/.meegle/credentials-bytedcli.enc`), and a stub
  * `botmux` that records what the wrapper asked of the daemon.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
@@ -50,25 +50,25 @@ beforeEach(() => {
     'shift',
     'case "$1" in',
     '  status)',
-    '    if [ -s "$store/credentials.enc" ]; then a=true; else a=false; fi',
+    '    if [ -s "$store/credentials-bytedcli.enc" ]; then a=true; else a=false; fi',
     '    printf \'{"status":"success","data":{"official_meegle_cli_authenticated":%s}}\\n\' "$a" ;;',
     '  login)',
     '    mkdir -p "$store"',
     '    if [ "$2" = --complete ]; then',
-    '      cat "$STUB_APPROVED" > "$store/credentials.enc"',
+    '      cat "$STUB_APPROVED" > "$store/credentials-bytedcli.enc"',
     '      echo \'{"status":"success","data":{"login_status":"success"}}\'',
     '    else',
     '      echo \'{"status":"success","data":{"verification_uri_complete":"https://meego.example/device?code=STUBCODE","complete_token":"stub-complete"}}\'',
     '    fi ;;',
     '  *)',
-    '    if [ ! -s "$store/credentials.enc" ]; then',
+    '    if [ ! -s "$store/credentials-bytedcli.enc" ]; then',
     '      echo \'{"status":"error","error":{"code":"MEEGLE_AUTH_REQUIRED","details":"no local token"}}\'; exit 1',
     '    fi',
     // A refresh rewrites the file the way meegle does: temp file, then rename.
     '    if [ -n "$STUB_ROTATE" ]; then',
-    '      printf "%s-refreshed" "$(cat "$store/credentials.enc")" > "$store/.cred.tmp" && mv "$store/.cred.tmp" "$store/credentials.enc"',
+    '      printf "%s-refreshed" "$(cat "$store/credentials-bytedcli.enc")" > "$store/.cred.tmp" && mv "$store/.cred.tmp" "$store/credentials-bytedcli.enc"',
     '    fi',
-    '    printf \'{"status":"success","data":{"login":"%s"}}\\n\' "$(cat "$store/credentials.enc")" ;;',
+    '    printf \'{"status":"success","data":{"login":"%s"}}\\n\' "$(cat "$store/credentials-bytedcli.enc")" ;;',
     'esac',
     '',
   ].join('\n'));
@@ -147,7 +147,7 @@ function loginInStore(openId: string, credential: string): void {
   });
 }
 
-const storedCredential = (openId: string) => readFileSync(join(storeHome(openId), '.meegle', 'credentials.enc'), 'utf8');
+const storedCredential = (openId: string) => readFileSync(join(storeHome(openId), '.meegle', 'credentials-bytedcli.enc'), 'utf8');
 
 describe('one Meego login per person, shared by every session', () => {
   it('a login finished from the DM is what the group topic and a brand-new session use', () => {
@@ -215,7 +215,7 @@ describe('one Meego login per person, shared by every session', () => {
     const topic = session('sess-topic', ALICE);
     const topicHome = bytedcliTurnHome(dataDir(), 'sess-topic', { openId: ALICE });
     mkdirSync(join(topicHome, '.meegle'), { recursive: true });
-    writeFileSync(join(topicHome, '.meegle', 'credentials.enc'), 'session-local');
+    writeFileSync(join(topicHome, '.meegle', 'credentials-bytedcli.enc'), 'session-local');
     loginInStore(ALICE, 'alice-login');
 
     expect(run(topic, 'sess-topic', ['-j', 'meego', 'user', 'me']).stdout).toContain('alice-login');
