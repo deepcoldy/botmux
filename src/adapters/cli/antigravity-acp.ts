@@ -1,4 +1,6 @@
 /** Opt-in Antigravity ACP adapter; native terminal sessions keep their existing adapter. */
+import { detectModelsViaExec } from './model-catalog-json.js';
+import { parseAntigravityModels } from './antigravity-models.js';
 import { resolveCommandReal } from './registry.js';
 import { runnerArgv0 } from '../../core/self-spawn.js';
 import { resolveRunnerPath } from './runner-path.js';
@@ -51,5 +53,9 @@ export function createAntigravityAcpAdapter(pathOverride?: string): CliAdapter {
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: false,
     modelChoices: CLI_MODEL_CHOICES.antigravity,
+    /** Discover account-visible models without starting a conversation. */
+    async detectModels(options) {
+      return detectModelsViaExec(executable(), ['models'], parseAntigravityModels, options?.env);
+    },
   };
 }
