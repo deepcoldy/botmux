@@ -231,7 +231,9 @@ describe('idle-spin sampler', () => {
     expect(sample.sessions.get('s1')?.cpuPercent).toBeCloseTo(40, 5);
   });
 
-  it('fails closed when a children file is unreadable (EACCES)', async () => {
+  // Root bypasses DAC (chmod 000 stays readable), so EACCES can only be
+  // reproduced as an unprivileged user — same guard as cli-send-hook-context.
+  it.skipIf(process.getuid?.() === 0)('fails closed when a children file is unreadable (EACCES)', async () => {
     const root = makeProcRoot([
       { pid: 100, ppid: 1, start: 1000, utime: 0, stime: 0, children: [101] },
       { pid: 101, ppid: 100, start: 1001, utime: 0, stime: 0 },
