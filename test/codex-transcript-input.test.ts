@@ -61,9 +61,7 @@ function terminal(initial = OVERLAY, options: {
         return options.closeResult === 'false' ? false : undefined;
       }
       if (data === '\r') return enter();
-      if (data.startsWith('\x1b[200~') && data.endsWith('\x1b[201~\r')) {
-        paste(data.slice(6, -7)); return enter();
-      }
+      if (data.startsWith('\x1b[200~') && data.endsWith('\x1b[201~')) { paste(data.slice(6, -6)); return; }
       paste(data);
     }),
     pasteText: vi.fn(paste),
@@ -106,7 +104,7 @@ describe('Codex transcript submission boundary', () => {
     expect(t.target.sendSpecialKeys).not.toHaveBeenCalled();
   });
 
-  it('uses the same one-shot behavior for raw bracketed PTY writes', async () => {
+  it('writes the raw bracketed PTY frame and then Enter as a separate write', async () => {
     const t = terminal();
     delete t.target.submitBracketedPaste;
     delete t.target.pasteText;
@@ -114,7 +112,7 @@ describe('Codex transcript submission boundary', () => {
     expect(await submit(t.target)).toMatchObject({ submitted: true });
     expect(t.executed).toEqual([MESSAGE]);
     expect(vi.mocked(t.target.write).mock.calls.map(([data]) => data))
-      .toEqual(['q', `\x1b[200~${MESSAGE}\x1b[201~\r`]);
+      .toEqual(['q', `\x1b[200~${MESSAGE}\x1b[201~`, '\r']);
   });
 
   it.each(['false', 'throw'] as const)('observes an ambiguous %s close without repeating it', async closeResult => {
@@ -393,7 +391,7 @@ describe('Codex transcript submission boundary', () => {
     expect(t.rewinds()).toBe(0);
     expect(t.executed).toEqual([MESSAGE]);
   });
-  it('submits small, multiline Markdown and long pastes as one frame without screen-text inference', async () => {
+  it('submits small, multiline Markdown and long pastes as one frame plus a separate Enter, without screen-text inference', async () => {
     for (const message of ['First line  \nSecond line', 'a'.repeat(2000), '中文😀'.repeat(600)]) {
       const t = terminal('');
       delete t.target.submitBracketedPaste;
@@ -401,7 +399,7 @@ describe('Codex transcript submission boundary', () => {
       await flushFakeTimers();
       expect(await pending).toMatchObject({ submitted: true });
       expect(t.executed).toEqual([message]);
-      expect(t.target.write).toHaveBeenCalledExactlyOnceWith(`\x1b[200~${message}\x1b[201~\r`);
+      expect(vi.mocked(t.target.write).mock.calls.map(([data]) => data)).toEqual([`\x1b[200~${message}\x1b[201~`, '\r']);
       expect(t.target.sendSpecialKeys).not.toHaveBeenCalled();
     }
   });
