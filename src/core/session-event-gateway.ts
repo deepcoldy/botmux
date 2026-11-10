@@ -8,7 +8,8 @@ export type SessionEventAdmission =
   | { kind: 'defer'; bindingId: string }
   | { kind: 'reject'; reason: string };
 const immutableFacts = new Set(['turn_terminal', 'final_output', 'final_output_offer', 'turn_interrupt_result', 'codex_app_dispatch_persisted', 'restart_result', 'claude_exit']);
-const workerEvents = new Set(['worker_ipc_ready', 'ready', 'worker_error', 'error', 'transfer_detached', 'runtime_binding', 'runtime_binding_started', 'runtime_binding_aborted', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'turn_interrupt_result', 'restart_result', 'session_ready_ack']);
+// persistent_backend_target is stamped before the CLI spawns, so it can only be worker-scoped.
+const workerEvents = new Set(['worker_ipc_ready', 'ready', 'worker_error', 'error', 'transfer_detached', 'runtime_binding', 'runtime_binding_started', 'runtime_binding_aborted', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'turn_interrupt_result', 'restart_result', 'session_ready_ack', 'persistent_backend_target']);
 /** A trusted channel supplies producer identity. An event cannot self-upgrade
  * to the current execution instance merely because its IPC worker survived. */
 export class SessionEventGateway {
