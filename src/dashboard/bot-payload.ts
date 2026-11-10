@@ -233,6 +233,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     replyCardActions: j?.replyCardActions === true,
     cotEnabled: normalizeCotEnabled(j),
     replyCardShowTools: j?.replyCardShowTools !== false,
+    replyCardNativeCot: j?.replyCardNativeCot === true,
     senderTag: j?.senderTag !== false,
     senderTagHideEmail: j?.senderTagHideEmail === true,
     overloadAlert: j?.overloadAlert === true,

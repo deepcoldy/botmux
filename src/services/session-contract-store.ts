@@ -464,6 +464,33 @@ export class SessionContractStore {
     return !!value && sameWorker(value.worker, worker) && sameExecution(value.execution, execution)
       && sameRuntime(value.runtime, runtime) && sameRuntime(this.execution(ref, execution.executionId)?.runtime, runtime);
   }
+  /** The live CLI of `from` became `to` without restarting. Attempts already
+   * bound to `from` keep running in that process and stay on their runtime. */
+  continueRuntime(ref: ContractSessionRef, from: RuntimeRef, to: RuntimeRef, worker: WorkerRef): void {
+    this.saveEntity(ref, 'runtime_continuation', from.runtimeId, 'active', { from, to, worker });
+  }
+  /** Runtimes the live CLI of `from` became through `worker`'s in-process continuations, in order. */
+  continuedRuntimes(ref: ContractSessionRef, from: RuntimeRef, worker: WorkerRef): RuntimeRef[] {
+    const chain: RuntimeRef[] = [];
+    let current = from;
+    for (let hops = 0; hops < 16; hops++) {
+      const link = this.entity<{ from: RuntimeRef; to: RuntimeRef; worker: WorkerRef }>(ref, 'runtime_continuation', current.runtimeId);
+      if (!link || !sameRuntime(link.from, current) || !sameWorker(link.worker, worker)) break;
+      chain.push(link.to); current = link.to;
+    }
+    return chain;
+  }
+  /** `from` is `to`, or became it through `worker`'s in-process continuations. */
+  runtimeContinues(ref: ContractSessionRef, from: RuntimeRef, to: RuntimeRef, worker: WorkerRef): boolean {
+    return sameRuntime(from, to) || this.continuedRuntimes(ref, from, worker).some(runtime => sameRuntime(runtime, to));
+  }
+  /** An attempt bound to a runtime its own worker continued into the active one. */
+  continuedExecution(ref: ContractSessionRef, runtime: RuntimeRef, worker: WorkerRef, execution?: ExecutionRef): boolean {
+    const active = this.read(ref)?.activeRuntime;
+    const attempt = execution ? this.execution(ref, execution.executionId) : undefined;
+    if (!active || !attempt || !sameExecution(attempt.ref, execution) || !sameRuntime(attempt.runtime, runtime)) return false;
+    return !sameRuntime(runtime, active) && this.runtimeContinues(ref, runtime, active, worker);
+  }
   admitExecution(ref: ContractSessionRef, turnId: string, dispatchAttempt?: number, admissionId?: string): ExecutionContract {
     return this.transaction(() => {
       const session = this.read(ref); if (!session) throw new Error('contract_session_missing');

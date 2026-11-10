@@ -3,8 +3,17 @@ import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync } from 'node:
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { prependBotmuxBin, botmuxWrapperFiles, resolveBotmuxWrapperBinDir } from '../src/core/botmux-wrapper.js';
+import { buildBotWorkerEnv, buildSessionChildEnv, botInjectedEnv } from '../src/core/env-policy.js';
 
 describe('resolveBotmuxWrapperBinDir — single source of truth (core-only isolation)', () => {
+  it('keeps a dedicated runtime root across strict worker transport and rejects bot overrides', () => {
+    const root = '/srv/candidate/bin';
+    const worker = buildBotWorkerEnv({ HOME: '/home/u', BOTMUX_WRAPPER_BIN: root }, { mode: 'strict' });
+    expect(resolveBotmuxWrapperBinDir(worker)).toBe(root);
+    expect(resolveBotmuxWrapperBinDir(buildSessionChildEnv(worker, { mode: 'strict' }))).toBe(root);
+    expect(botInjectedEnv({ BOTMUX_WRAPPER_BIN: '/wrong' }).BOTMUX_WRAPPER_BIN).toBeUndefined();
+    expect(resolveBotmuxWrapperBinDir({ HOME: '/home/u', BOTMUX_WRAPPER_BIN: 'relative' })).toBe('/home/u/.botmux/bin');
+  });
   it('core-only → dedicated <SESSION_DATA_DIR>/bin (never shared ~/.botmux/bin)', () => {
     expect(resolveBotmuxWrapperBinDir({ BOTMUX_CORE_ONLY: '1', SESSION_DATA_DIR: '/srv/co/data', HOME: '/home/u' }))
       .toBe('/srv/co/data/bin');

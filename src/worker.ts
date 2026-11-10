@@ -453,6 +453,7 @@ import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './service
 import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot, type AntigravityCotEntry } from './services/antigravity-cot.js';
 import { KimiActivityObserver } from './services/kimi-cot.js';
 import { findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
+import { antigravityTransport, verifyAntigravityTransport } from './services/antigravity-transport.js';
 import { annotateAntigravityUsageLimit, isAntigravityWorkingScreen } from './adapters/cli/antigravity.js';
 import {
   mapAntigravityCompactOffsetToFull,
@@ -538,6 +539,7 @@ import {
 import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay, scaleMs } from './utils/timing.js';
 import { waitForProcessQuiescence } from './services/process-quiescence.js';
+import { reapStaleCodexThreadWriter, shouldReapStaleCodexWriterBeforeSpawn } from './services/codex-stale-writer-reaper.js';
 import { pidNotProvablyGone } from './utils/process-alive.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
 import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
@@ -2084,16 +2086,19 @@ async function publishRuntimeContract(binding: RuntimeEventBinding, nativeSessio
   // A buffered observation can arrive after the process disappears. Preserve
   // its proven binding so the captured physical exit still stops the runtime.
   if (previous && previous.proof !== 'opaque' && identity.proof === 'opaque') return;
+  let continuesBindingId: string | undefined;
   if (previous && previous.proof !== 'opaque' && (previous.backend !== identity.backend || previous.physicalId !== identity.physicalId
     || previous.proof !== identity.proof || (previous.nativeGeneration !== undefined && previous.nativeGeneration !== identity.nativeGeneration)
     || (previous.nativeSessionId !== undefined && previous.nativeSessionId !== identity.nativeSessionId))) {
     const scope = workerSessionEventScope;
+    continuesBindingId = binding.bindingId;
     binding = scope.beginRuntime(binding.operationId, binding.physicalId);
     scope.enterRuntime(binding);
     send({ type: 'runtime_binding_started', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
   }
   binding.identity = identity;
-  send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
+  send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity,
+    ...(continuesBindingId ? { continuesBindingId } : {}), ...(binding.operationId ? { operationId: binding.operationId } : {}) });
 }
 let cliSpawnGeneration = 0;
 /** What the TRAE install entry resolved to right before the spawn of
@@ -11972,6 +11977,7 @@ function drainPathInto(path: string, fromOffset: number): { offset: number; tail
 // shared with the Claude path.
 
 function codexBridgeFallbackActive(): boolean {
+  if (lastInitConfig?.cliId === 'antigravity' && cliAdapter?.runnerFramedInput) return false;
   // scratch full-root COW: cursor's transcript mirror lands in the overlay
   // and the host-side reader (~/.cursor/projects) cannot resolve it, so the
   // send-less harvest would silently vanish. `botmux send` still works, so
@@ -12096,6 +12102,7 @@ function structuredBridgeIngestPath(
 
 function codexBridgeStartTimer(): void {
   if (codexBridgeTimer) return;
+  log(`Structured bridge poller armed (cliId=${lastInitConfig?.cliId ?? 'unknown'})`);
   // Single 1s ticker that handles three jobs: late-attach (poll for the
   // rollout file once we know cliSessionId), ingest (fs.watch backup),
   // and idle-window emit. The last is critical for the late-attach race:
@@ -12644,6 +12651,27 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
       codexBridgePendingTail = cursor.pendingTail;
       codexBridgeBaselineDone = true;
       log(`Codex bridge baselined: ${rolloutPath} (offset=${codexBridgeOffset})`);
+      // A resumed CLI may receive a new prompt before its first owned rollout
+      // is discovered. Preserve those live marks instead of baselining past it.
+      const pending = structuredBridgeIs('traex') ? codexBridgeQueue.peek().filter(turn =>
+        !turn.restoredFromJournal && !turn.started && turn.finalText === undefined && turn.markTimeMs !== undefined) : [];
+      if (pending.length) {
+        const entries = pending.map(turn => ({ turnId: turn.turnId, markTimeMs: turn.markTimeMs!, jsonlPath: rolloutPath,
+          offsetAtMark: turn.recoveryJsonlPathAtMark === rolloutPath ? turn.recoveryOffsetAtMark ?? 0 : 0 }));
+        const plan = planBridgeTurnRecovery(entries, cursor.newOffset);
+        if (plan.kind === 'recover') {
+          const replay = structuredBridgeIngestPath(rolloutPath, plan.fromOffset);
+          const cutoff = Math.min(...pending.map(turn => turn.markTimeMs!));
+          const { history, live } = splitCodexEventsByCutoff(replay.events, cutoff);
+          codexBridgeQueue.absorb(history);
+          codexBridgeQueue.ingest(live);
+          codexBridgeOffset = replay.newOffset;
+          codexBridgePendingTail = replay.pendingTail;
+          emitReadyCodexTurns();
+          if (live.some(event => event.kind === 'assistant_final')) idleDetector?.fireIdle();
+          log(`TRAE initial baseline retained ${pending.length} live pending turn(s)`);
+        }
+      }
     }
     }
   } else {
@@ -12754,6 +12782,7 @@ function armCursorCotForTurn(): void {
 let antigravityCotReaderSessionId: string | undefined;
 
 function ensureAntigravityCotReader(cliSessionId: string): void {
+  if (cliAdapter?.runnerFramedInput) return;
   if (!cliSessionId || antigravityCotReaderSessionId === cliSessionId) return;
   const previousId = antigravityCotReaderSessionId;
   antigravityCotReaderSessionId = cliSessionId;
@@ -12783,6 +12812,7 @@ function ensureAntigravityCotReader(cliSessionId: string): void {
 }
 
 function armAntigravityCotForTurn(): void {
+  if (cliAdapter?.runnerFramedInput) return;
   if (lastInitConfig?.cliId !== 'antigravity') return;
   if (nativeSessionForkPending()) return;
   let cid = cliAdapter?.resolveActiveSessionId?.({ cliPid: backend?.getChildPid?.() ?? undefined, cliCwd: lastInitConfig.workingDir })
@@ -13487,24 +13517,28 @@ function maybeFollowGrokSessionRotationViaPid(): void {
   codexBridgeNotifyCliSessionId(observed.sessionId);
 }
 
-/** Follow a TRAE in-process session rotation for direct local input in an
- * adopted pane. `codexBridgeNotifyCliSessionId` performs the drain-before-
- * detach switch and persists the newly observed native session id. */
+/** Discover the rollout actually held by the live TRAE process, including its
+ * first lazily opened rollout when submit verification returned no session id.
+ * `codexBridgeNotifyCliSessionId` also owns rotation's drain-before-detach. */
 function maybeFollowTraexSessionRotationViaPid(): void {
-  if (lastInitConfig?.adoptMode !== true
-    || !structuredBridgeIs('traex') || !codexBridgeRolloutPath || !backend) return;
+  if (!structuredBridgeIs('traex') || !backend) return;
   const now = Date.now();
   if (now - traexBridgePidProbeLastMs < TRAEX_BRIDGE_PID_PROBE_INTERVAL_MS) return;
+  const firstProbe = traexBridgePidProbeLastMs === 0;
   traexBridgePidProbeLastMs = now;
-  const pid = (backend as { cliPid?: number }).cliPid
-    ?? backend.getChildPid?.()
-    ?? codexAdoptPendingPid;
+  const pid = currentTraexObservedPid();
+  if (firstProbe) log(`TRAE bridge first PID probe: wired=${(backend as { cliPid?: number }).cliPid ?? 'none'}, observed=${pid ?? 'none'}, bound=${!!codexBridgeRolloutPath}, resume=${lastSpawnEffectiveResume}`);
   if (!pid) return;
-  const currentSid = traexSessionIdFromRolloutPath(codexBridgeRolloutPath);
+  const currentSid = codexBridgeRolloutPath ? traexSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
   const observed = findTraexRolloutByPid(pid, currentSid);
   if (!observed) return;
   if (currentSid?.toLowerCase() === observed.cliSessionId.toLowerCase()) return;
   persistCliSessionId(observed.cliSessionId);
+  if (!codexBridgeRolloutPath && lastSpawnEffectiveResume && !lastInitConfig?.adoptMode) {
+    codexBridgePendingSessionId = undefined;
+    codexBridgeAttach(observed.path, 'baseline-existing');
+    return;
+  }
   codexBridgeNotifyCliSessionId(observed.cliSessionId);
 }
 
@@ -13852,11 +13886,11 @@ function structuredBridgeRecoveryCursorAtMark(): { jsonlPath: string; offsetAtMa
     ?? lastSpawnEffectiveCliSessionId
     ?? (spec?.spawn?.sessionId === 'cli-or-adapter' ? lastSpawnEffectiveAdapterSessionId : undefined)
     ?? lastInitConfig?.cliSessionId;
-  if (!sessionIdAtMark) return undefined;
-  const jsonlPath = resolveFileBridgePath(cliId, {
+  const jsonlPath = (sessionIdAtMark ? resolveFileBridgePath(cliId, {
     sessionId: sessionIdAtMark,
     cwd: lastInitConfig?.workingDir,
-  });
+  }) : undefined) ?? (cliId === 'traex' && currentTraexObservedPid()
+    ? findTraexRolloutByPid(currentTraexObservedPid()!)?.path : undefined);
   if (!jsonlPath) return undefined;
   const cursor = baselineJsonlCursor(jsonlPath);
   return { jsonlPath, offsetAtMark: cursor.newOffset };
@@ -14177,7 +14211,9 @@ function notifyUncollectedStructuredTurns(turns: readonly CodexPendingTurn[]): v
     send({
       type: 'user_notify',
       message: uncollectedStructuredTurnNotice(),
+      kind: 'structured_turn_not_collected',
       turnId: turn.turnId,
+      ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
     });
   }
 }
@@ -14235,6 +14271,7 @@ function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
   holdStructuredStartLeasesWhileCliStarting();
   let fenceCurrentRpcEngine = false;
   const settledByTerminal = new Set<CodexPendingTurn>();
+  const displayRetirements: CodexPendingTurn[] = [];
   const dropped = pruneExpiredPreStartHeadsAndEmit(
     codexBridgeQueue,
     emitReadyCodexTurns,
@@ -14281,6 +14318,10 @@ function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
             turn.dispatchAttempt,
           );
           settledByTerminal.add(turn);
+        } else if (!turn.isLocal && turn.turnId.startsWith('om_')) {
+          // A prior submit notice may suppress another notification, but must
+          // never suppress closure of an eagerly published thinking display.
+          displayRetirements.push(turn);
         }
         // Publish/retire N before a synchronous immediate restart can clear the
         // current exact identity in killCli(). The callback still installs the
@@ -14298,7 +14339,7 @@ function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
   );
   if (dropped.length === 0) return false;
   log(`${source}: expired ${dropped.length} structured head(s) without transcript start (${dropped.map(turn => turn.turnId).join(', ')})`);
-  notifyUncollectedStructuredTurns(uncollectedTurnsNeedingNotice(dropped, {
+  const turnsNeedingNotice = uncollectedTurnsNeedingNotice(dropped, {
     settledByTerminal,
     hasOwnNotice: turn => structuredTurnsWithSubmitNotice.delete(turn.turnId)
       || submitFailureChains.has({
@@ -14313,7 +14354,15 @@ function pruneExpiredStructuredHeadsAndEmit(source: string): boolean {
         dispatchAttempt: turn.dispatchAttempt,
         cliGeneration: cliSpawnGeneration,
       }) ?? Date.now(), turn) === 'botmux-send',
-  }));
+  });
+  notifyUncollectedStructuredTurns(turnsNeedingNotice);
+  // The notice handler already retires its reply card. Only emit a separate
+  // display edge for inputs whose own prior notice suppressed this one.
+  for (const turn of displayRetirements) {
+    if (!turnsNeedingNotice.includes(turn)) {
+      send({ type: 'turn_display_retired', turnId: turn.turnId, message: uncollectedStructuredTurnNotice() });
+    }
+  }
   if (fenceCurrentRpcEngine) log('Fenced ambiguous Codex RPC generation before structured successor replay');
   // A rejected prompt-ready signal may be waiting on this exact pre-start
   // lease. Re-evaluate it after both the queue mark and its separate RPC
@@ -18392,7 +18441,8 @@ function maybeCaptureKiroSessionId(data: string): void {
 function splitCodexAppControl(data: string): string {
   return appRunnerControlDecoder.push(
     data,
-    APP_RUNNER_OSC_CLI_IDS.has(lastInitConfig?.cliId ?? ''),
+    APP_RUNNER_OSC_CLI_IDS.has(lastInitConfig?.cliId ?? '')
+      || (lastInitConfig?.cliId === 'antigravity' && cliAdapter?.runnerFramedInput === true),
     handleAppRunnerOscMarker,
   );
 }
@@ -20117,6 +20167,7 @@ function observeCursorCliSessionId(pid: number, label = 'spawn'): void {
 }
 
 function observeAntigravityCliSessionId(pid: number, label = 'spawn'): void {
+  if (cliAdapter?.runnerFramedInput) return;
   if (!Number.isInteger(pid) || pid <= 0) return;
   if (lastInitConfig?.cliId !== 'antigravity') return;
 
@@ -23606,7 +23657,16 @@ async function spawnCliBody(
     wrapperCli: cfg.wrapperCli,
     cliLaunchMode: cfg.cliLaunchMode,
   };
-  const createAdapter = () => createCliAdapterSync(effectiveCliId, cfg.cliPathOverride, { configDir: cfg.cliConfigDir });
+  const agyTransport = effectiveCliId === 'antigravity' ? antigravityTransport(cfg.env) : undefined;
+  if (agyTransport === 'acp' && (cfg.wrapperCli || cfg.promptInjection === 'none' || cfg.startupCommands?.length)) {
+    throw new Error('Antigravity ACP does not support wrapperCli, startupCommands or zero-injection terminal sessions.');
+  }
+  if (agyTransport === 'acp' && ['riff', 'mojo', 'remote-runner', 'orca'].includes(cfg.backendType)) {
+    throw new Error('Antigravity ACP requires a local process backend.');
+  }
+  const createAdapter = () => createCliAdapterSync(effectiveCliId, cfg.cliPathOverride, {
+    configDir: cfg.cliConfigDir, antigravityTransport: agyTransport,
+  });
   cliAdapter = createAdapter();
   let waitedForMissingCli = false;
   if (!cfg.adoptMode && cfg.backendType !== 'riff') {
@@ -25852,6 +25912,10 @@ async function spawnCliBody(
       ? nativeSubagentRuntimeHookCommand()
       : undefined,
   });
+  if (agyTransport) verifyAntigravityTransport({
+    dataDir: config.session.dataDir, sessionId: cfg.sessionId,
+    transport: agyTransport, reattach: willReattachPersistent,
+  });
   // Pi's deferred long-first-prompt command is implemented by a session-scoped
   // extension. Keep its launch args across owned process restarts while the
   // queued/in-flight command may still need replay.
@@ -25964,7 +26028,8 @@ async function spawnCliBody(
   // build can't read bots.json (Seatbelt-denied) → `botmux send` fails "Bot not registered".
   // (The tmux backend re-prepends this in its pane script after rcfile load; this covers the
   // pty/direct-spawn path, whose child inherits childEnv.PATH directly.)
-  childEnv.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), childEnv.PATH);
+  childEnv.BOTMUX_WRAPPER_BIN = resolveBotmuxWrapperBinDir(process.env);
+  childEnv.PATH = prependBotmuxBin(childEnv.BOTMUX_WRAPPER_BIN, childEnv.PATH);
   if (!boundLark) {
     delete childEnv.BOTMUX_LARK_TOOL_BINDING;
   }
@@ -26282,6 +26347,50 @@ async function spawnCliBody(
       { botmuxSessionProfile: hermesUsesBotmuxSessionProfile },
     )
     : undefined;
+
+  // A cold `codex resume` cannot share its thread with a still-running Codex:
+  // the new TUI stops at "This conversation is open in another app" and never
+  // accepts input. A restart that left this session's previous Codex alive
+  // outside the pane we manage (replaced tmux server, unreattached pane) used
+  // to wedge the session exactly that way. Retire only a holder that carries
+  // THIS session's id; anything else is reported and left alone.
+  if (effectiveCliSessionId && shouldReapStaleCodexWriterBeforeSpawn({
+    cliId: cfg.cliId,
+    willReattachPersistent,
+    resume: effectiveResume,
+    cliSessionId: effectiveCliSessionId,
+    rpcEngine: !!codexRpcEngine,
+    adoptMode: !!cfg.adoptMode,
+    existingAppServerEndpoint: !!cfg.existingAppServerEndpoint,
+    remoteBackend: isRemoteBackendType(effectiveBackendType),
+  })) {
+    const homes = [...new Set([perBotInjectEnv.CODEX_HOME, childEnv.CODEX_HOME, join(homedir(), '.codex')]
+      .filter((home): home is string => typeof home === 'string' && home.trim() !== '')
+      .map(home => { try { return realpathSync(home.trim()); } catch { return home.trim(); } }))];
+    for (const home of homes) {
+      if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
+      try {
+        const outcome = await reapStaleCodexThreadWriter({
+          codexHome: home,
+          threadId: effectiveCliSessionId,
+          sessionId: cfg.sessionId,
+          excludePids: [process.pid],
+        });
+        if (outcome.kind === 'reaped') {
+          log(`[codex-writer-lock] retired stale Codex of this session holding thread ${effectiveCliSessionId}: pids ${outcome.pids.join(',')}${outcome.forced ? ' (SIGKILL)' : ''}`);
+        } else if (outcome.kind === 'foreign') {
+          log(`[codex-writer-lock] thread ${effectiveCliSessionId} is held by a process outside this session (pids ${outcome.pids.join(',')}); left alone${outcome.reaped.length ? `, retired own pids ${outcome.reaped.join(',')}` : ''}`);
+        } else if (outcome.kind === 'stuck') {
+          log(`[codex-writer-lock] stale Codex of this session survived SIGKILL (pids ${outcome.pids.join(',')}); resume may stop at the lock screen`);
+        } else if (outcome.kind === 'unavailable') {
+          log(`[codex-writer-lock] could not enumerate holders of thread ${effectiveCliSessionId} under ${home}`);
+        }
+      } catch (error) {
+        log(`[codex-writer-lock] check failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (spawnGeneration !== cliSpawnGeneration) throw new CliSpawnSupersededError();
+  }
 
   // ── File sandbox (oncall): wrap the CLI in bwrap so it can only touch a
   // per-session project copy + de-identified config. The agent's `botmux send`
@@ -29439,6 +29548,10 @@ async function spawnCliBody(
     reattachOpenTurnGate = true;
     reattachOpenTurnLogged = false;
     scheduleReattachIdleProbe(`${effectiveBackendType} reattach`, backend);
+  } else if (isPipeMode && backend && cfg.cliId === 'antigravity' && cliAdapter.runnerFramedInput) {
+    // A small headless runner can print ready before pipe-pane subscribes.
+    // Recover its actual viewport once the detector and all listeners exist.
+    seedBackendScreen('Antigravity ACP startup', backend);
   }
 
   // Fallback: if the CLI takes too long to show its prompt (e.g. slow plugin

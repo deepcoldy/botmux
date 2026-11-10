@@ -73,12 +73,27 @@ export class SessionController {
     if (!sameWorker(state.worker, worker)) throw new Error('stale_runtime_registration');
     const value = this.store.reserveRuntime(this.ref, worker, bindingId); this.refresh(); return value;
   }
-  bindRuntime(bindingId: string, worker: WorkerRef, identity: RuntimeIdentity, operationId?: string): RuntimeContract {
+  bindRuntime(bindingId: string, worker: WorkerRef, identity: RuntimeIdentity, operationId?: string, continuesBindingId?: string): RuntimeContract {
     if (this.abortedBindings.has(bindingId)) throw new Error('runtime_reservation_abandoned');
     const existing = this.store.binding(this.ref, bindingId);
     if (existing && !this.store.bindingProducer(this.ref, bindingId, worker)) throw new Error('runtime_binding_producer_mismatch');
     const proposed = existing ?? { ref: this.reserveBinding(bindingId, worker) };
-    const runtime = this.store.bindRuntime(this.ref, proposed.ref, worker, identity, operationId); this.refresh(); return runtime;
+    const runtime = this.store.atomic(() => {
+      // Only the worker's own active runtime can be continued in-process.
+      const predecessor = continuesBindingId && this.store.bindingProducer(this.ref, continuesBindingId, worker)
+        ? this.store.binding(this.ref, continuesBindingId)?.ref : undefined;
+      const state = this.store.read(this.ref);
+      const continued = predecessor && sameRuntime(predecessor, state?.activeRuntime) ? predecessor : undefined;
+      // The operation that spawned the live CLI may already be confirmed;
+      // continuing that CLI is not part of it.
+      const operation = continued && !state?.activeOperationId ? undefined : operationId;
+      const bound = this.store.bindRuntime(this.ref, proposed.ref, worker, identity, operation);
+      if (continued && !sameRuntime(continued, bound.ref) && sameRuntime(this.store.read(this.ref)?.activeRuntime, bound.ref)) {
+        this.store.continueRuntime(this.ref, continued, bound.ref, worker);
+      }
+      return bound;
+    });
+    this.refresh(); return runtime;
   }
   bindingMayStart(bindingId: string): boolean {
     return !this.abortedBindings.has(bindingId) && this.store.binding(this.ref, bindingId)?.phase === 'starting';
@@ -108,6 +123,13 @@ export class SessionController {
     if (!source.identity && owner && this.store.bindingProducer(this.ref, bindingId, owner)) return { version: 2, runtime: source.ref };
     if (sameRuntime(source.ref, current?.ref)) return { version: 2, runtime: source.ref };
     const execution = turnId ? this.store.executions(this.ref, turnId, dispatchAttempt)[0] : undefined;
+    // Hooks keep the binding their CLI was spawned under; the worker only
+    // accepts commands aimed at its current runtime.
+    if (current && owner && sameWorker(current.worker, owner) && this.store.runtimeContinues(this.ref, source.ref, current.ref, owner)) {
+      const ranHere = execution?.runtime && this.store.runtimeContinues(this.ref, source.ref, execution.runtime, owner)
+        && this.store.runtimeContinues(this.ref, execution.runtime, current.ref, owner);
+      return { version: 2, runtime: current.ref, ...(ranHere ? { execution: execution!.ref } : {}) };
+    }
     const executor = execution?.runtime ? this.store.runtime(this.ref, execution.runtime.runtimeId) : undefined;
     if (executor?.identity && samePhysicalRuntimeIdentity(source.identity, executor.identity)) return { version: 2, runtime: executor.ref, execution: execution!.ref };
     if (typeof nativeSessionId === 'string' && current?.identity?.nativeSessionId === nativeSessionId
@@ -179,7 +201,9 @@ export class SessionController {
     if (!active) return this.allowsInput();
     if (active.kind !== 'current' && active.kind !== 'worker') return false;
     const state = this.store.read(this.ref)!;
-    return sameWorker(state.worker, active.context.producer) && (!active.context.scope.runtime || sameRuntime(state.activeRuntime, active.context.scope.runtime)) && !['closing', 'closed', 'suspended'].includes(state.lifecycle);
+    const runtime = active.context.scope.runtime;
+    return sameWorker(state.worker, active.context.producer) && (!runtime || sameRuntime(state.activeRuntime, runtime)
+      || this.store.continuedExecution(this.ref, runtime, active.context.producer, active.context.scope.execution)) && !['closing', 'closed', 'suspended'].includes(state.lifecycle);
   }
   run<T>(admission: SessionEventAdmission, work: () => T): T { return eventScope.run(admission, work); }
   outputOrigin(origin: SessionEventContext): SessionEventContext | undefined {
@@ -251,8 +275,13 @@ export class SessionController {
       const preliminary = this.gateway.admit(message.type, context, channel);
       if (preliminary.kind === 'reject' || preliminary.kind === 'defer') return preliminary;
       const existing = this.store.executions(this.ref, message.turnId, message.dispatchAttempt);
+      const current = this.currentRuntime();
+      // A turn the CLI starts itself is reported under the binding it was
+      // spawned with; an in-process continuation moved that CLI to `current`.
+      if (current && !sameRuntime(current, context.scope.runtime) && !existing.some(value => sameRuntime(value.runtime, context.scope.runtime))
+        && this.store.runtimeContinues(this.ref, context.scope.runtime, current, channel)) context.scope.runtime = current;
       if (existing.length === 1) context.scope.execution = existing[0].ref;
-      else if (!existing.length && sameRuntime(this.currentRuntime(), context.scope.runtime)) context.scope.execution = this.admitInput(message.turnId, message.dispatchAttempt);
+      else if (!existing.length && sameRuntime(current, context.scope.runtime)) context.scope.execution = this.admitInput(message.turnId, message.dispatchAttempt);
     }
     const uncertainTerminal = message.type === 'turn_terminal' && contractTerminalStatus(message.status, message.errorCode) === 'reconciling';
     if (['turn_terminal', 'final_output', 'turn_execution_started', 'native_input_consumed'].includes(message.type) && !context.scope.execution) return { kind: 'reject', reason: 'execution_scope_missing' };
@@ -292,7 +321,12 @@ export class SessionController {
     }
     if (message.type === 'claude_exit' && runtime) {
       let currentPhysicalExit = false;
-      for (const sibling of this.store.physicalRuntimes(this.ref, runtime)) {
+      // The exit callback keeps the binding its CLI was spawned under.
+      const exited = new Map<string, RuntimeContract>();
+      for (const ref of [runtime, ...this.store.continuedRuntimes(this.ref, runtime, channel)]) {
+        for (const sibling of this.store.physicalRuntimes(this.ref, ref)) exited.set(sibling.ref.runtimeId, sibling);
+      }
+      for (const sibling of exited.values()) {
         if (!sameRuntime(sibling.ref, runtime)) this.store.apply(this.ref, { type: 'runtime_lost', runtime: sibling.ref, confirmed: true, reason: 'physical_exit' }, `${context.eventId}:${sibling.ref.runtimeId}`);
         this.store.markUnresolvedExecutions(this.ref, sibling.ref);
         if (sameRuntime(sibling.ref, this.currentRuntime())) currentPhysicalExit = true;

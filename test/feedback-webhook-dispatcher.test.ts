@@ -1,8 +1,8 @@
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHmac } from 'node:crypto';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   FeedbackWebhookSecretStore,
   startFeedbackWebhookDispatcher,
@@ -14,9 +14,23 @@ import {
 import { parseBotConfigsFromText } from '../src/bot-registry.js';
 import { SkillFeedbackStore } from '../src/services/skill-feedback-store.js';
 import { beginFeedbackMaintenance, freezeFeedbackSource } from '../src/services/feedback-maintenance.js';
+import { closeFeedbackStorage, getFeedbackStorage } from '../src/services/feedback-storage.js';
+import { readFeedbackStorageConfig } from '../src/services/feedback-storage-config.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+
+async function storeWithOneOutboxRow(prefix: string): Promise<SkillFeedbackStore> {
+  const dir = mkdtempSync(join(tmpdir(), prefix)); dirs.push(dir);
+  const db = await SkillFeedbackStore.open(dir);
+  db.recordTurnTerminal({ botAppId: 'app', sessionId: 's', turnId: 't', status: 'completed' });
+  db.recordTurnDelivery({
+    botAppId: 'app', sessionId: 's', turnId: 't', platform: 'lark', platformAppId: 'app', platformMessageId: 'm',
+    content: 'answer', cardMode: 'card', status: 'delivered',
+    webhookDestinations: [{ id: 'd', enabled: true, url: 'https://hook.example/x', eventTypes: ['turn.completed'], secretRef: 'secret', timeoutMs: 1000 }],
+  });
+  return db;
+}
 
 describe('feedback webhook destination and secret safety', () => {
   it('normalizes destinations while preserving secret references only', () => {
@@ -61,6 +75,211 @@ describe('feedback webhook destination and secret safety', () => {
 });
 
 describe('feedback webhook attempt contract', () => {
+  it('keeps a recurring lazy opening single-flight and isolates its failure during bounded stop', async () => {
+    vi.useFakeTimers();
+    let rejectOpening!: (error: Error) => void;
+    const opening = new Promise<SkillFeedbackStore>((_, reject) => { rejectOpening = reject; });
+    let calls = 0;
+    const dispatcher = startFeedbackWebhookDispatcher({
+      store: () => ++calls === 1 ? Promise.reject(new Error('bootstrap-failed')) : opening,
+      readSecret: () => 'secret', intervalMs: 50,
+    });
+    try {
+      await dispatcher.ready;
+      await vi.advanceTimersByTimeAsync(1050);
+      expect(calls).toBe(2);
+      const stopping = dispatcher.stop(100);
+      rejectOpening(new Error('recurring-open-failed'));
+      await expect(stopping).resolves.toBeUndefined();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { rejectOpening(new Error('test-finished')); vi.useRealTimers(); }
+  });
+
+  it('returns immediately from stop(0) while a recurring storage opening remains pending', async () => {
+    vi.useFakeTimers();
+    const opening = deferred<SkillFeedbackStore>();
+    let calls = 0;
+    const dispatcher = startFeedbackWebhookDispatcher({
+      store: () => ++calls === 1 ? Promise.reject(new Error('bootstrap-failed')) : opening.promise,
+      readSecret: () => 'secret', intervalMs: 50,
+    });
+    try {
+      await dispatcher.ready;
+      await vi.advanceTimersByTimeAsync(50);
+      expect(calls).toBe(2);
+      await dispatcher.stop(0);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { opening.resolve(undefined as unknown as SkillFeedbackStore); vi.useRealTimers(); }
+  });
+
+  it('releases a claim that completes after hard stop without dispatching or inventing an unknown outcome', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-late-claim-')); dirs.push(dir);
+    const db = await SkillFeedbackStore.open(dir);
+    const blocker = await SkillFeedbackStore.open(dir);
+    db.recordTurnTerminal({ botAppId: 'app', sessionId: 's', turnId: 't', status: 'completed' });
+    db.recordTurnDelivery({
+      botAppId: 'app', sessionId: 's', turnId: 't', platform: 'lark', platformAppId: 'app', platformMessageId: 'm',
+      content: 'answer', cardMode: 'card', status: 'delivered',
+      webhookDestinations: [{ id: 'd', enabled: true, url: 'https://hook.example/x', eventTypes: ['turn.completed'], secretRef: 'secret' }],
+    });
+    const claimed = deferred<void>(), release = deferred<void>();
+    const original = db.tryClaimFeedbackOutbox.bind(db);
+    vi.spyOn(db, 'tryClaimFeedbackOutbox').mockImplementation(async input => {
+      const result = original(input);
+      (blocker as any).db.exec('BEGIN IMMEDIATE');
+      claimed.resolve();
+      await release.promise;
+      return result;
+    });
+    const dispatcher = startFeedbackWebhookDispatcher({
+      store: db, readSecret: () => 'secret',
+      dispatch: async () => ({ kind: 'retry' as const, error: 'webhook_outcome_unknown' }),
+    });
+    try {
+      await claimed.promise;
+      await dispatcher.stop(0);
+      release.resolve();
+      await dispatcher.ready;
+      (blocker as any).db.exec('COMMIT');
+      db.resetExpiredFeedbackOutboxClaims(Date.now() + 1000, 0);
+      expect(db.listFeedbackOutbox()).toMatchObject([{ status: 'pending', lastError: 'webhook_stopped_before_request' }]);
+      await beginFeedbackMaintenance(dir, 'late-claim');
+      await expect(freezeFeedbackSource(dir, 'late-claim')).resolves.toBeUndefined();
+    } finally {
+      release.resolve(); await dispatcher.stop(0);
+      try { (blocker as any).db.exec('ROLLBACK'); } catch {}
+      blocker.close(); db.close();
+    }
+  });
+
+  it('does not send when request admission is busy and recovers the claim as known-unsent', async () => {
+    const db = await storeWithOneOutboxRow('botmux-webhook-admission-busy-');
+    const dispatch = vi.fn(async () => ({ kind: 'delivered' as const, status: 200 }));
+    vi.spyOn(db, 'tryStartFeedbackOutboxRequest').mockReturnValue({ done: false, busy: true });
+    const dispatcher = startFeedbackWebhookDispatcher({ store: db, readSecret: () => 'secret', dispatch, intervalMs: 100_000 });
+    try {
+      await dispatcher.ready;
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(db.listFeedbackOutbox()).toMatchObject([{ status: 'inflight', lastError: 'webhook_claimed_before_request' }]);
+      db.resetExpiredFeedbackOutboxClaims(Date.now() + 1000, 0);
+      expect(db.listFeedbackOutbox()).toMatchObject([{ status: 'pending', lastError: 'webhook_stopped_before_request' }]);
+    } finally { await dispatcher.stop(0); db.close(); }
+  });
+
+  it('does not send when another worker re-claimed the row before admission', async () => {
+    const db = await storeWithOneOutboxRow('botmux-webhook-admission-stolen-');
+    const dispatch = vi.fn(async () => ({ kind: 'delivered' as const, status: 200 }));
+    const admit = db.tryStartFeedbackOutboxRequest.bind(db);
+    vi.spyOn(db, 'tryStartFeedbackOutboxRequest').mockImplementation((outboxId, claimToken) => {
+      db.resetExpiredFeedbackOutboxClaims(Date.now() + 1000, 0);
+      db.claimFeedbackOutbox({ now: Date.now() + 1000, limit: 1, claimToken: 'other-worker' });
+      return admit(outboxId, claimToken);
+    });
+    const dispatcher = startFeedbackWebhookDispatcher({ store: db, readSecret: () => 'secret', dispatch, intervalMs: 100_000 });
+    try {
+      await dispatcher.ready;
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(db.listFeedbackOutbox()).toMatchObject([{ status: 'inflight', claimToken: 'other-worker' }]);
+    } finally { await dispatcher.stop(0); db.close(); }
+  });
+
+  it('does not send when hard stop lands between request admission and the request', async () => {
+    const db = await storeWithOneOutboxRow('botmux-webhook-admitted-stop-');
+    const dispatch = vi.fn(async () => ({ kind: 'delivered' as const, status: 200 }));
+    const admit = db.tryStartFeedbackOutboxRequest.bind(db);
+    let dispatcher!: ReturnType<typeof startFeedbackWebhookDispatcher>;
+    vi.spyOn(db, 'tryStartFeedbackOutboxRequest').mockImplementation((outboxId, claimToken) => {
+      const admitted = admit(outboxId, claimToken);
+      void dispatcher.stop(0);
+      return admitted;
+    });
+    dispatcher = startFeedbackWebhookDispatcher({ store: db, readSecret: () => 'secret', dispatch, intervalMs: 100_000 });
+    try {
+      await dispatcher.ready;
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(db.listFeedbackOutbox()).toMatchObject([{ status: 'pending', lastError: 'webhook_stopped_before_request' }]);
+    } finally { await dispatcher.stop(0); db.close(); }
+  });
+
+  it('does not send claimed rows when hard stop lands while the claim returns', async () => {
+    const db = await storeWithOneOutboxRow('botmux-webhook-claim-stop-');
+    const dispatch = vi.fn(async () => ({ kind: 'delivered' as const, status: 200 }));
+    const claim = db.tryClaimFeedbackOutbox.bind(db);
+    let dispatcher!: ReturnType<typeof startFeedbackWebhookDispatcher>;
+    vi.spyOn(db, 'tryClaimFeedbackOutbox').mockImplementation(input => {
+      const claimed = claim(input);
+      void dispatcher.stop(0);
+      return claimed;
+    });
+    dispatcher = startFeedbackWebhookDispatcher({ store: db, readSecret: () => 'secret', dispatch, intervalMs: 100_000 });
+    try {
+      await dispatcher.ready;
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(db.listFeedbackOutbox()).toMatchObject([{ status: 'pending', lastError: 'webhook_stopped_before_request' }]);
+    } finally { await dispatcher.stop(0); db.close(); }
+  });
+
+  it('retries a failed storage bootstrap and delivers pending events without restarting', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-bootstrap-')); dirs.push(dir);
+    const config = await readFeedbackStorageConfig(dir);
+    const path = join(dir, 'feedback-storage.json');
+    writeFileSync(path, '{');
+    const errors: unknown[] = [];
+    const dispatcher = startFeedbackWebhookDispatcher({
+      store: async () => (await getFeedbackStorage(dir)).store,
+      readSecret: () => 'secret', intervalMs: 50, onError: error => errors.push(error),
+      dispatch: async () => ({ kind: 'delivered' as const, status: 204 }),
+    });
+    try {
+      await dispatcher.ready;
+      expect(errors).toHaveLength(1);
+      writeFileSync(path, JSON.stringify(config));
+      const { store } = await getFeedbackStorage(dir);
+      await store.recordTurnTerminal({ botAppId: 'app', sessionId: 's', turnId: 't', status: 'completed' });
+      await store.recordTurnDelivery({
+        botAppId: 'app', sessionId: 's', turnId: 't', platform: 'lark', platformAppId: 'app', platformMessageId: 'm',
+        content: 'answer', cardMode: 'card', status: 'delivered',
+        webhookDestinations: [{ id: 'd', enabled: true, url: 'https://hook.example/x', eventTypes: ['turn.completed'], secretRef: 'secret' }],
+      });
+      await vi.waitFor(async () => {
+        expect(await store.listFeedbackOutbox()).toMatchObject([{ status: 'delivered', attempts: 1 }]);
+      });
+    } finally {
+      await dispatcher.stop(0);
+      await closeFeedbackStorage(dir);
+    }
+  });
+
+  it.each(['quiesce', 'stop'] as const)('does not start dispatching when storage opens after %s', async method => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-late-bootstrap-')); dirs.push(dir);
+    const db = await SkillFeedbackStore.open(dir);
+    db.recordTurnTerminal({ botAppId: 'app', sessionId: 's', turnId: 't', status: 'completed' });
+    db.recordTurnDelivery({
+      botAppId: 'app', sessionId: 's', turnId: 't', platform: 'lark', platformAppId: 'app', platformMessageId: 'm',
+      content: 'answer', cardMode: 'card', status: 'delivered',
+      webhookDestinations: [{ id: 'd', enabled: true, url: 'https://hook.example/x', eventTypes: ['turn.completed'], secretRef: 'secret' }],
+    });
+    const opening = deferred<SkillFeedbackStore>();
+    const dispatcher = startFeedbackWebhookDispatcher({
+      store: () => opening.promise, readSecret: () => 'secret',
+      dispatch: async () => ({ kind: 'delivered' as const, status: 204 }),
+    });
+    const stopped = method === 'stop' ? dispatcher.stop(0) : dispatcher.quiesce();
+    opening.resolve(db);
+    try {
+      await stopped;
+      await dispatcher.ready;
+      expect(db.listFeedbackOutbox()).toMatchObject([{ status: 'pending', attempts: 0 }]);
+      const resumed = startFeedbackWebhookDispatcher({
+        store: db, readSecret: () => 'secret',
+        dispatch: async () => ({ kind: 'delivered' as const, status: 204 }),
+      });
+      await resumed.ready;
+      await resumed.stop(0);
+      expect(db.listFeedbackOutbox()).toMatchObject([{ status: 'delivered', attempts: 1 }]);
+    } finally { await dispatcher.stop(0); db.close(); }
+  });
+
   it('retains unknown request outcome and blocks migration after a transport reset', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-webhook-unknown-')); dirs.push(dir);
     const db = await SkillFeedbackStore.open(dir);

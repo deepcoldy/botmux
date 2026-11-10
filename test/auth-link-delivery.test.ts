@@ -51,6 +51,37 @@ describe('deliverAuthLink', () => {
     expect(inPlace).toEqual([t('auth_link.sent_privately', undefined, 'zh')]);
   });
 
+  it('group, DM fails: the link goes in a card only the initiator can see; the group only hears that', async () => {
+    const h = harness(async () => { throw new Error('230013'); });
+    const cards: Array<[string, string]> = [];
+    expect(await deliverAuthLink({
+      privateChat: false, openId: 'ou_a', text: LINK, ...h, locale: 'zh', privateCommand: '/login meego',
+      sendEphemeral: async (openId, card) => { cards.push([openId, card]); },
+    })).toBe('ephemeral');
+    expect(cards).toHaveLength(1);
+    expect(cards[0][0]).toBe('ou_a');
+    expect(JSON.parse(cards[0][1]).elements[0].content).toBe(LINK);
+    expect(h.inPlace).toEqual([t('auth_link.sent_ephemeral', undefined, 'zh')]);
+  });
+
+  it('group, DM and the private card both fail: a way to get it, never the link', async () => {
+    const h = harness(async () => { throw new Error('230013'); });
+    expect(await deliverAuthLink({
+      privateChat: false, openId: 'ou_a', text: LINK, ...h, locale: 'zh', privateCommand: '/login meego',
+      sendEphemeral: async () => { throw new Error('18053'); },
+    })).toBe('dm_failed');
+    expect(h.inPlace).toEqual([t('auth_link.dm_failed', { command: '/login meego' }, 'zh')]);
+    expect(h.inPlace.join('')).not.toContain(LINK);
+  });
+
+  it('the private card is only a fallback: not used when the DM works or in a 1:1 chat', async () => {
+    const sendEphemeral = vi.fn(async () => undefined);
+    await deliverAuthLink({ privateChat: false, openId: 'ou_a', text: LINK, ...harness(), sendEphemeral });
+    await deliverAuthLink({ privateChat: true, openId: 'ou_a', text: LINK, ...harness(), sendEphemeral });
+    await deliverAuthLink({ privateChat: false, openId: undefined, text: LINK, ...harness(), sendEphemeral });
+    expect(sendEphemeral).not.toHaveBeenCalled();
+  });
+
   it('group without a usable initiator: no DM to anyone, no link in the group', async () => {
     const h = harness();
     expect(await deliverAuthLink({ privateChat: false, openId: undefined, text: LINK, ...h, locale: 'zh' })).toBe('dm_failed');

@@ -14,6 +14,7 @@ import { cardMarkdownImageReferences, FEISHU_IMG_KEY } from '../src/im/lark/card
 import { shouldSuppressBridgeEmit } from '../src/services/bridge-fallback-gate.js';
 import { extractCardContent } from '../src/im/lark/message-parser.js';
 import { extractCotEntries } from '../src/services/claude-transcript.js';
+import { projectGroupContextCard } from '../src/im/lark/group-context-card.js';
 
 const key = { larkAppId: 'app_test', sessionId: 'session', turnId: 'om_turn' };
 const input = { mode: 'unified' as const, chatId: 'oc_chat', rootId: 'om_root' };
@@ -29,6 +30,26 @@ it('reads the unified card tool visibility from bot config, defaulting to visibl
   ]));
   expect(replyCardPresentation(configs[0], 'oc_any').showTools).toBe(false);
   expect(replyCardPresentation(configs[1], 'oc_any').showTools).toBe(true);
+});
+
+it('keeps the initial answer compact while preserving stop and the final answer renderer', () => {
+  const record: TurnReplyCardRecord = { ...key, ...input, version: 1, phase: 'working', createdAtMs: 1,
+    nativeCot: true, progress: [], tools: [], usage: { context: null, tokens: null } };
+  const initial = JSON.parse(buildTurnReplyCard(record, presentation));
+  expect(initial.body.elements.some((e: any) => ['botmux_turn_status', 'botmux_turn_usage'].includes(e.element_id))).toBe(false);
+  const controls = initial.body.elements.find((e: any) => e.element_id === 'botmux_reply_actions');
+  const stop = controls.columns.flatMap((c: any) => c.elements).find((e: any) => e.tag === 'button');
+  expect(stop).toMatchObject({ size: 'small', behaviors: [{ type: 'callback', value: { action: 'stop_turn', reply_card_turn_id: key.turnId } }] });
+  for (const canStop of [true, false]) {
+    const raw = buildTurnReplyCard(record, { ...presentation, canStop });
+    const card = JSON.parse(raw);
+    const blankRows = card.body.elements.filter((element: any) => element.tag === 'markdown'
+      && !String(element.content ?? '').replace(/<[^>]*>|\u2063/g, '').trim());
+    expect(blankRows).toEqual([]);
+    expect(projectGroupContextCard(raw)).toEqual({ kind: 'runtime' });
+  }
+  const final = JSON.parse(buildTurnReplyCard({ ...record, phase: 'completed', finalCard: finalEvent().card, finalText: '完整答复' }, presentation));
+  expect(extractCardContent(JSON.stringify(final))).toContain('完整答复');
 });
 
 describe('one reply card per turn', () => {
@@ -71,6 +92,71 @@ describe('one reply card per turn', () => {
       expect(io.patch).toHaveBeenCalledTimes(patches);
     },
   );
+
+  it('retires duplicate notices atomically and retries an unacknowledged PATCH on the same card', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    const retirement = { kind: 'display_retired' as const, notice: 'Transcript unavailable' };
+    vi.mocked(io.patch).mockRejectedValueOnce(new Error('PATCH unavailable'));
+    await expect(store.update(key, retirement, io)).rejects.toThrow('PATCH unavailable');
+    expect(store.read(key)).toMatchObject({ phase: 'ambiguous', progress: [retirement.notice], publishPending: true });
+    await Promise.all([store.update(key, retirement, io), store.update(key, retirement, io)]);
+    expect(store.read(key)?.progress).toEqual([retirement.notice]);
+    expect(store.read(key)?.pendingPatch).toBeUndefined();
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect(cards.size).toBe(1);
+  });
+
+  it('keeps an already-published final answer when a late missing-transcript notice arrives', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, finalEvent('Actual answer'), io);
+    await store.update(key, { kind: 'terminal', phase: 'ambiguous', notice: 'Transcript unavailable' }, io);
+    expect(store.read(key)?.progress).toEqual([]);
+    expect(store.read(key)?.finalText).toBe('Actual answer');
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect([...cards.values()][0]).not.toContain('Transcript unavailable');
+  });
+
+  it.each([false, true])('completes an acknowledged answer through display retirement (final ACK was lost=%s)', async lost => {
+    await store.update(key, { kind: 'start' }, io);
+    if (lost) vi.mocked(io.patch).mockRejectedValueOnce(new Error('ACK lost'));
+    const final = store.update(key, finalEvent('Actual answer'), io);
+    if (lost) await expect(final).rejects.toThrow('ACK lost'); else await final;
+    await store.update(key, { kind: 'display_retired', notice: 'Capture unavailable' }, io);
+    expect(store.read(key)).toMatchObject({ phase: 'completed', finalDelivered: true });
+    expect(JSON.parse([...cards.values()][0]).body.elements.find((e: any) => e.element_id === 'botmux_turn_status')?.content).toContain('已完成');
+    expect(io.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains display-only retirement across recovery and accepts the late final on the same card', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'display_retired', notice: 'Capture unavailable' }, io);
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    await store.update(key, finalEvent('Late answer'), io);
+    expect(store.read(key)).toMatchObject({ phase: 'completed', finalDelivered: true });
+    expect(store.read(key)?.disconnected).not.toBe(true);
+    expect(io.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('normalizes display retirement when recovery acknowledges the previously uncertain final PATCH', async () => {
+    await store.update(key, { kind: 'start' }, io);
+    vi.mocked(io.patch).mockRejectedValueOnce(new Error('ACK lost'));
+    await expect(store.update(key, finalEvent('Actual answer'), io)).rejects.toThrow('ACK lost');
+    vi.mocked(io.patch).mockRejectedValueOnce(new Error('ACK lost'));
+    await expect(store.update(key, { kind: 'display_retired', notice: 'Capture unavailable' }, io)).rejects.toThrow('ACK lost');
+    expect(store.read(key)?.finalDelivered).not.toBe(true);
+    await new TurnReplyCardStore(dir).update(key, { kind: 'recover' }, io);
+    expect(store.read(key)).toMatchObject({ phase: 'completed', finalDelivered: true });
+    expect(io.send).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['failed', 'cancelled', 'superseded', 'ambiguous'] as const)('preserves a real %s terminal after final publication and display retirement', async phase => {
+    await store.update(key, { kind: 'start' }, io);
+    await store.update(key, { kind: 'terminal', phase }, io);
+    await store.update(key, finalEvent('Partial answer'), io);
+    await store.update(key, { kind: 'display_retired', notice: 'Capture unavailable' }, io);
+    expect(store.read(key)?.phase).toBe(phase);
+    expect(store.read(key)?.displayRetired).not.toBe(true);
+  });
 
   it('replays the same PATCH after its remote acceptance was not acknowledged', async () => {
     await store.update(key, { kind: 'start' }, io);

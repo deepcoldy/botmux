@@ -18,6 +18,9 @@ import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effec
 import { triggerUserAuthApplies, credentialSourceOf } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
+import { requestMeegoLogin } from '../services/meego-auth.js';
+import { MEEGO_TENANTS, type MeegoTenant } from '../services/bytedcli-home.js';
+import { meegoLoginCommand } from './provider-auth-request.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
 import { sessionLarkToolBound } from './lark-tool-binding.js';
 import { deliverAuthLink } from './auth-link-delivery.js';
@@ -47,7 +50,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { resolveCliRuntime, runtimeInstallationKey, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
-import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, getMessageDetail, uploadImage, UserTokenMissingError } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, sendEphemeralCard, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, getMessageDetail, uploadImage, UserTokenMissingError } from '../im/lark/client.js';
 import type { OutboundMessageOptions } from '../im/lark/client.js';
 import { assertSendTopicsAvailable, TopicSendError } from '../cli/topic-send-guard.js';
 import { prepareForkTopic } from '../im/lark/fork-topic.js';
@@ -57,7 +60,7 @@ import { logger } from '../utils/logger.js';
 import { isStoreFileUnavailableError } from '../utils/json-file.js';
 import { buildRestartStatusCard, restartStatusCardNotifier } from './restart-status-card.js';
 import { botsInfoObjectEntries, isBotsInfoNameEntry, normalizeBotsInfoRouteEntries } from '../services/bots-info-shape.js';
-import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
+import { updateReplyCardNativeThinking, replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { supportsUnifiedReplyCardCli } from '../services/turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
@@ -1666,9 +1669,14 @@ export async function handleCotCommand(
   }
 
   const sub = content.replace(/^\/cot\s*/i, '').trim().toLowerCase();
-  // Master switch defaults ON — only an explicit false means disabled.
+  // /cot controls all enabled process destinations for the effective reply mode.
   const masterOn = (() => {
-    try { return getBot(larkAppId).config.cotEnabled !== false; } catch { return false; }
+    try {
+      const cfg = getBot(larkAppId).config;
+      const ds = deps.activeSessions.get(sessionKey(rootId, larkAppId));
+      const unified = ds?.currentTurnId ? replyCardModeFor(ds) !== 'legacy' : cfg.replyCardMode === 'unified';
+      return cfg.cotEnabled !== false || (unified && cfg.replyCardNativeCot === true);
+    } catch { return false; }
   })();
 
   if (sub === 'off') {
@@ -1700,6 +1708,7 @@ export async function handleCotCommand(
           activity: publicReplyCardActivity(update.entries),
         }, (body, type, uuid, beforeWrite) => deps.sessionReply(rootId, body, type, larkAppId, update.turnId, { uuid, beforeWrite }),
         { dispatchAttempt: update.dispatchAttempt, forceVisible: true });
+        updateReplyCardNativeThinking(ds, update);
         return;
       }
       // Turn in flight with thinking already accumulated — render right away
@@ -4479,12 +4488,14 @@ export async function handleCommand(
         const loginOpenId = message.senderId;
         // Any reply carrying an authorization link reaches only the sender: a
         // group member opening someone else's link would authorize as THEMSELVES.
+        const loginChatId = ds?.chatId ?? message.chatId;
         const authLinkReply = (text: string, privateCommand = '/login') => deliverAuthLink({
           privateChat: (ds?.chatType ?? message.chatType) === 'p2p',
           openId: isUsableOpenId(loginOpenId) ? loginOpenId : undefined,
           text,
           replyInPlace: content => sessionReply(rootId, content),
           sendDirect: (openId, content) => sendUserMessage(botCfg2.larkAppId, openId, content),
+          ...(loginChatId ? { sendEphemeral: (openId: string, card: string) => sendEphemeralCard(botCfg2.larkAppId, loginChatId, openId, card) } : {}),
           locale: loc,
           privateCommand,
         });
@@ -4524,6 +4535,39 @@ export async function handleCommand(
         const platformCredsUrl = credSource !== 'local' && (larkGoverned || bytedcliGoverned)
           ? platformCredentialsUrl() : null;
         const explicitGoverned = (subCmd === 'lark' && larkGoverned) || (subCmd === 'bytedcli' && bytedcliGoverned);
+        // `/login meego [dcar]` — the person's Meego login, kept once per person
+        // for every session of this bot. Independent of where ByteCloud
+        // credentials come from: the platform does not issue Meego logins.
+        // meegle keeps one login per tenant, so a dcar user names the tenant
+        // here the way `bytedcli meego login --tenant dcar` does.
+        const meegoArgs = subCmd.split(/\s+/);
+        if (meegoArgs[0] === 'meego') {
+          const tenantArg = meegoArgs.slice(1).join(' ').replace(/^--tenant(?:=|\s+)/, '').toLowerCase();
+          if (tenantArg && !MEEGO_TENANTS.includes(tenantArg as MeegoTenant)) {
+            await sessionReply(rootId, t('cmd.login.meego_tenant_invalid', { tenants: MEEGO_TENANTS.join(' / ') }, loc));
+            break;
+          }
+          const tenant = tenantArg ? tenantArg as MeegoTenant : undefined;
+          if (!bytedcliGoverned) {
+            await sessionReply(rootId, t('cmd.login.bytedcli_configure', undefined, loc));
+            break;
+          }
+          if (!isUsableOpenId(loginOpenId)) {
+            await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc));
+            break;
+          }
+          const login = await requestMeegoLogin(loginOpenId, tenant);
+          if (login.state === 'link') {
+            await authLinkReply([
+              t('auth_link.meego_title', undefined, loc), login.authUrl, '', t('auth_link.meego_footer', undefined, loc),
+            ].join('\n'), meegoLoginCommand(tenant));
+          } else {
+            await sessionReply(rootId, login.state === 'ready'
+              ? t('cmd.login.meego_ready', undefined, loc)
+              : t('provider_auth.unavailable', { provider: 'Meego', detail: login.detail }, loc));
+          }
+          break;
+        }
         // platform 模式 + 本机未绑定：按矩阵一律拒绝，绝不落到本机扫码——否则扫完也不会被采信。
         if (credSource === 'platform' && !platformCredsUrl && (larkGoverned || bytedcliGoverned)
           && (subCmd === '' || explicitGoverned)) {

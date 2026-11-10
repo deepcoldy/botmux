@@ -16,6 +16,7 @@ import { clearUserToken, isUsableOpenId } from '../utils/user-token.js';
 import { bumpCliAuthEpoch } from './cli-auth-epoch.js';
 import { bytedcliHomeFor, clearBytedcliAuth, logoutBytedcli } from './bytedcli-auth.js';
 import { clearLarkCliAuth, larkCliHomeFor, logoutLarkCli } from './lark-cli-auth.js';
+import { clearMeegoAuth } from './meego-auth.js';
 
 export type RemoteLogout = 'skipped' | 'ok' | 'failed';
 
@@ -24,7 +25,7 @@ export type RevokeTriggerUserAuthResult =
   | {
     ok: true;
     openId: string;
-    removed: { larkCli: boolean; bytedcli: boolean; userToken: boolean };
+    removed: { larkCli: boolean; bytedcli: boolean; meego: boolean; userToken: boolean };
     remoteLogout: { larkCli: RemoteLogout; bytedcli: RemoteLogout };
     identitiesDropped: number;
   };
@@ -63,6 +64,9 @@ export async function revokeTriggerUserAuth(args: {
   if (larkExisted || existsSync(larkHome)) clearLarkCliAuth(args.openId);
   if (bytedExisted || existsSync(bytedHome)) clearBytedcliAuth(args.openId);
 
+  // Meego's login is local files only. The bump above already moved every
+  // newly published Meego home to a fresh epoch directory.
+  const meego = clearMeegoAuth(args.openId);
   const userToken = clearUserToken(args.appId, args.brand, args.openId);
   const identitiesDropped = dropPublishedIdentitiesForOpenId(args.sessionDataDir, args.openId);
 
@@ -72,6 +76,7 @@ export async function revokeTriggerUserAuth(args: {
     removed: {
       larkCli: larkExisted && !existsSync(larkHome),
       bytedcli: bytedExisted && !existsSync(bytedHome),
+      meego,
       userToken,
     },
     remoteLogout: { larkCli: larkRemote, bytedcli: bytedRemote },

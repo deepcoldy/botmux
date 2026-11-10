@@ -8,7 +8,7 @@ import { wrapBracketedPaste } from './tui-input.js';
 import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle, type ResumableSession } from './types.js';
 import { opencodeDbPath } from '../../services/opencode-paths.js';
 
-import { delay } from '../../utils/timing.js';
+import { delay, scaleMs } from '../../utils/timing.js';
 
 /**
  * OpenCode 会话存储：1.17+ 是一个全局 SQLite 库（opencode.db），session 表一行一个
@@ -24,6 +24,28 @@ import { delay } from '../../utils/timing.js';
 
 const OPENCODE_SESSION_ID_RE = /^ses_[0-9A-Za-z-]+$/;
 const OPENCODE_PASTE_THRESHOLD = 150;
+
+/** OpenCode 1.x 输入框：左边框是一列 `┃`，下边沿是 `╹▀▀▀…`，首页和会话页、空闲和
+ *  忙碌时都画着。下边沿只在主题的 backgroundElement 不透明时画，透明主题（如
+ *  lucent-orng）那一行是空格；左边框所有主题都画。画出来之前屏幕是空的，这时打
+ *  进去的字会被整段丢掉，不落库、也不发请求。 */
+const OPENCODE_COMPOSER_RE = /^[ \t]*(?:┃|╹▀{8,})/m;
+/** 启动可能比 worker 的静默窗口长（每次启动都要装插件依赖）。给足但有界：
+ *  输入框长相变了也只是首条消息晚这么久，不会卡住。 */
+const OPENCODE_COMPOSER_WAIT_MS = 45_000;
+const OPENCODE_COMPOSER_POLL_MS = 250;
+
+/** 等到终端里出现 OpenCode 的输入框或超时。只有 tmux 能读到当前画面，读不到画面的
+ *  后端不等。 */
+async function waitForOpenCodeComposer(pty: PtyHandle): Promise<void> {
+  if (!pty.captureViewportAsync) return;
+  const deadline = Date.now() + scaleMs(OPENCODE_COMPOSER_WAIT_MS);
+  while (Date.now() < deadline) {
+    const screen = await pty.captureViewportAsync().catch(() => '');
+    if (OPENCODE_COMPOSER_RE.test(screen)) return;
+    await delay(OPENCODE_COMPOSER_POLL_MS);
+  }
+}
 
 /** `models` 列表里一行模型 id 的形态：provider/name（允许多级，如 openrouter/anthropic/claude-sonnet-4）。 */
 const MODEL_ID_RE = /^[^\s/]+(?:\/[^\s]+)+$/;
@@ -492,6 +514,12 @@ export interface OpenCodeLikeAdapterOptions {
    * 所以这里宁可不加也不赌。
    */
   autoApproveMinVersion?: string;
+  /**
+   * 进程起来后的第一次写入先等输入框画出来（见 waitForOpenCodeComposer）。
+   * 首条消息超出启动参数预算、resume、带启动命令时都改成启动后打字，
+   * 打早了会被吞。只给确认过输入框长相的 CLI 打开。
+   */
+  waitsForComposer?: boolean;
 }
 
 /**
@@ -524,6 +552,9 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
   // is a spawn-time concern.
   const rawBin = pathOverride ?? runtime.defaultBin;
   let cachedBin: string | undefined;
+  // 已等过输入框的终端句柄。每次 spawn 都是新的 backend 句柄，所以只有启动
+  // 后的第一次写入会等；之后输入框被弹窗遮住也照常打字。
+  const composerChecked = new WeakSet<PtyHandle>();
   return {
     id: runtime.id,
     // Whole dir kept REAL, not just auth.json: opencode keeps its global SQLite DB
@@ -633,6 +664,10 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
     },
 
     async writeInput(pty: PtyHandle, content: string) {
+      if (runtime.waitsForComposer && !composerChecked.has(pty)) {
+        composerChecked.add(pty);
+        await waitForOpenCodeComposer(pty);
+      }
       // 提交验证基线先于写入采样（traex 同款）。斜杠命令是 TUI 命令面板输入，
       // 不产生 user message 行，跳过验证（重试 Enter 还可能误触面板项）。
       const isSlashCommand = content.startsWith('/');
@@ -730,6 +765,7 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     modelListArgs: ['models'],
     autoApproveArg: '--auto',
     autoApproveMinVersion: '1.17.12',
+    waitsForComposer: true,
     modelChoices: CLI_MODEL_CHOICES['opencode'],
   });
 }

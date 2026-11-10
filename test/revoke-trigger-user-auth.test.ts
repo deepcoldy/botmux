@@ -111,8 +111,10 @@ function plantStores() {
   for (const dir of [
     join(data, 'bytedcli-home', ALICE),
     join(data, 'lark-cli-home', ALICE),
+    join(data, 'meego-home', ALICE, 'epoch-0', '.meegle'),
     join(data, 'bytedcli-home', BOB),
     join(data, 'lark-cli-home', BOB),
+    join(data, 'meego-home', BOB, 'epoch-0', '.meegle'),
     join(data, `lark-cli-issuer-${ALICE}`),
   ]) {
     mkdirSync(dir, { recursive: true });
@@ -135,7 +137,7 @@ describe('revokeTriggerUserAuth', () => {
     });
     expect(first.ok).toBe(true);
     if (!first.ok) return;
-    expect(first.removed).toEqual({ larkCli: true, bytedcli: true, userToken: true });
+    expect(first.removed).toEqual({ larkCli: true, bytedcli: true, meego: true, userToken: true });
     expect(first.remoteLogout).toEqual({ larkCli: 'ok', bytedcli: 'ok' });
     expect(spawns.map(s => s.cmd)).toEqual(['lark-cli', 'bytedcli']);
     expect(spawns.every(s => s.homeExisted && s.args.join(' ') === 'auth logout --json')).toBe(true);
@@ -145,6 +147,8 @@ describe('revokeTriggerUserAuth', () => {
     expect(existsSync(join(data, 'lark-cli-home', ALICE))).toBe(false);
     expect(existsSync(join(data, 'bytedcli-home', BOB))).toBe(true);
     expect(existsSync(join(data, 'lark-cli-home', BOB))).toBe(true);
+    expect(existsSync(join(data, 'meego-home', ALICE))).toBe(false);
+    expect(existsSync(join(data, 'meego-home', BOB, 'epoch-0', '.meegle', 'marker'))).toBe(true);
     expect(existsSync(join(data, `lark-cli-issuer-${ALICE}`, 'marker'))).toBe(true);
     expect(existsSync(join(data, `user-token-${APP}-${ALICE}.json`))).toBe(false);
     expect(readFileSync(join(data, `user-token-${APP}-${BOB}.json`), 'utf8')).toContain(BOB_SECRET);
@@ -156,7 +160,7 @@ describe('revokeTriggerUserAuth', () => {
     });
     expect(second.ok).toBe(true);
     if (!second.ok) return;
-    expect(second.removed).toEqual({ larkCli: false, bytedcli: false, userToken: false });
+    expect(second.removed).toEqual({ larkCli: false, bytedcli: false, meego: false, userToken: false });
     expect(existsSync(join(data, 'bytedcli-home', BOB))).toBe(true);
   });
 

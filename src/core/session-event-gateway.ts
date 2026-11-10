@@ -52,7 +52,9 @@ export class SessionEventGateway {
         return { kind: 'reject', reason: 'execution_scope_unproven' };
       }
     }
-    if (!recovery && !observation && sameWorker(state.worker, channel) && sameRuntime(state.activeRuntime, runtime) && state.lifecycle !== 'closed' && state.lifecycle !== 'closing') {
+    const continued = !sameRuntime(state.activeRuntime, runtime) && sameWorker(state.worker, channel)
+      && this.store.continuedExecution(this.session, runtime, channel, context.scope.execution);
+    if (!recovery && !observation && sameWorker(state.worker, channel) && (sameRuntime(state.activeRuntime, runtime) || continued) && state.lifecycle !== 'closed' && state.lifecycle !== 'closing') {
       if (type === 'claude_exit' && this.store.hasPendingRuntimeReplacement(this.session, runtime)) return { kind: 'historical', context };
       return { kind: 'current', context };
     }

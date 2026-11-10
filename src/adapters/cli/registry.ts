@@ -19,6 +19,7 @@ import { createOpenCodeAdapter } from './opencode.js';
 import { createOpenCode2Adapter } from './opencode2.js';
 import { createMiMoCodeAdapter } from './mimocode.js';
 import { createAntigravityAdapter, antigravityBridgeSpec } from './antigravity.js';
+import { createAntigravityAcpAdapter } from './antigravity-acp.js';
 import { createMtrAdapter } from './mtr.js';
 import { createHermesAdapter } from './hermes.js';
 import { createMiraAdapter } from './mira.js';
@@ -295,6 +296,8 @@ const adapterCache = new Map<string, CliAdapter>();
 
 /** Per-bot launch options that change WHERE an adapter's CLI keeps its data. */
 export interface CliAdapterOptions {
+  /** Opt-in ACP transport; absent retains the native Antigravity terminal. */
+  readonly antigravityTransport?: 'terminal' | 'acp';
   /**
    * CLI config profile dir (`cliConfigDir`). Claude Code only: launched with
    * `CLAUDE_CONFIG_DIR=<dir>`, and the adapter's data root, hook target,
@@ -309,9 +312,9 @@ export interface CliAdapterOptions {
 export async function createCliAdapter(id: CliId, pathOverride?: string, opts?: CliAdapterOptions): Promise<CliAdapter> {
   const normalized = id.toLowerCase() as CliId;
   const configDir = cliSupportsConfigDir(normalized) ? opts?.configDir : undefined;
-  const key = `${normalized}:${pathOverride ?? ''}:${configDir ?? ''}`;
+  const key = `${normalized}:${pathOverride ?? ''}:${configDir ?? ''}:${normalized === 'antigravity' ? opts?.antigravityTransport ?? 'terminal' : ''}`;
   if (adapterCache.has(key)) return adapterCache.get(key)!;
-  const adapter = createCliAdapterSync(normalized, pathOverride, { configDir });
+  const adapter = createCliAdapterSync(normalized, pathOverride, { configDir, antigravityTransport: opts?.antigravityTransport });
   adapterCache.set(key, adapter);
   return adapter;
 }
@@ -333,7 +336,8 @@ export function createCliAdapterSync(id: CliId, pathOverride?: string, opts?: Cl
     case 'opencode': return createOpenCodeAdapter(pathOverride);
     case 'opencode2': return createOpenCode2Adapter(pathOverride);
     case 'mimocode': return createMiMoCodeAdapter(pathOverride);
-    case 'antigravity': return createAntigravityAdapter(pathOverride);
+    case 'antigravity': return opts?.antigravityTransport === 'acp'
+      ? createAntigravityAcpAdapter(pathOverride) : createAntigravityAdapter(pathOverride);
     case 'mtr': return createMtrAdapter(pathOverride);
     case 'hermes': return createHermesAdapter(pathOverride);
     case 'mira': return createMiraAdapter(pathOverride);

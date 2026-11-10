@@ -53,6 +53,9 @@ export const DAEMON_ENV_KEYS = [
   // non-secret environment value: the daemon inherits it, worker/session
   // children retain it, and individual Go commands may still override -p.
   'GOFLAGS',
+  // Dashboard-editable, non-secret connection settings must refresh on restart.
+  'ONCALL_GROUP_ENDPOINT',
+  'ONCALL_EMAIL_DOMAIN',
   // Dashboard-only, non-secret settings: the control-audit destination
   // (dashboard/control-audit.ts defaultControlAuditPath) and the terminal
   // takeover lease TTL (dashboard/terminal-control.ts terminalControlTtlFromEnv).

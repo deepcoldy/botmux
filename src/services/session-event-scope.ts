@@ -76,7 +76,9 @@ export class WorkerSessionEventScope {
   }
   isCurrentContext(): boolean {
     const origin = this.storage.getStore()?.binding;
-    return !origin || origin === this.current || sameRuntime(origin.runtime, this.current?.runtime);
+    // A semantic rebind keeps the physical CLI, so callbacks started with it still drive it.
+    return !origin || origin === this.current || sameRuntime(origin.runtime, this.current?.runtime)
+      || origin.physicalId === this.current?.physicalId;
   }
   noteAdmission(state: ExecutionAdmissionState): void {
     this.knownExecutions.set(state.ref.executionId, state.ref);
@@ -104,11 +106,13 @@ export class WorkerSessionEventScope {
   ownsExecutionEvent(turnId: string, dispatchAttempt?: number): boolean {
     const origin = this.storage.getStore()?.binding;
     if (!origin) return true;
+    // A semantic rebind keeps the physical CLI. Observers started with it still
+    // own the turns it was given, whichever binding they were captured under.
     const submission = this.submissions.get(this.turnKey(turnId, dispatchAttempt));
-    if (submission) return submission === origin || sameRuntime(submission.runtime, origin.runtime);
+    if (submission) return submission === origin || sameRuntime(submission.runtime, origin.runtime) || submission.physicalId === origin.physicalId;
     const execution = this.executionForTurn(turnId, dispatchAttempt);
     const state = execution ? this.admissionStates.get(execution.executionId) : undefined;
-    if (state?.runtime) return sameRuntime(state.runtime, origin.runtime);
+    if (state?.runtime) return sameRuntime(state.runtime, origin.runtime) || this.bindingForRuntime(state.runtime)?.physicalId === origin.physicalId;
     return this.isCurrentContext();
   }
   bindingForRuntime(runtime: RuntimeRef): RuntimeEventBinding | undefined {
@@ -202,6 +206,13 @@ export class WorkerSessionEventScope {
   }
   origin(turnId?: string, dispatchAttempt?: number): CapturedSessionOrigin | undefined {
     const active = this.storage.getStore();
+    // The daemon bound the attempt to the runtime it was submitted under.
+    // Within one physical CLI that outranks the binding a callback captured.
+    const submission = turnId ? this.submissions.get(this.turnKey(turnId, dispatchAttempt)) : undefined;
+    if (turnId && active?.binding && submission && submission !== active.binding && submission.physicalId === active.binding.physicalId) {
+      const execution = this.executionForTurn(turnId, dispatchAttempt);
+      if (execution) return this.snapshot(submission, execution);
+    }
     if (active?.binding && active.execution && (!turnId || active.execution.turnId === turnId)) return this.snapshot(active.binding, active.execution);
     if (turnId) {
       const values = this.origins.get(this.turnKey(turnId, dispatchAttempt)) ?? [];
