@@ -44,6 +44,7 @@ import {
   type CliIdentity,
 } from './cli-identity.js';
 import { trackBytedcliIdentityRenewal } from './bytedcli-identity-renewal.js';
+import { GRANT_WAIT_CAP_MS } from '../platform/credential-grant-budget.js';
 
 /** What was published for one tool this turn — drives the user-visible notice. */
 export interface ToolIdentityOutcome {
@@ -147,8 +148,10 @@ export interface PublishTurnIdentityArgs {
 // that window: it found nothing yet and was refused as if the person had no
 // credentials, while the next message — published in time — worked.
 
-/** Longest an identity fetch waits on a publication that is still running. */
-export const PUBLICATION_WAIT_CAP_MS = 10_000;
+/** Longest an identity fetch waits on a publication that is still running.
+ *  Outlasts a whole platform grant: a shorter wait refused the tool call while
+ *  the grant was still on its way. */
+export const PUBLICATION_WAIT_CAP_MS = GRANT_WAIT_CAP_MS;
 const publicationsInFlight = new Map<string, Set<Promise<unknown>>>();
 const publicationKey = (sessionDataDir: string, sessionId: string) => JSON.stringify([sessionDataDir, sessionId]);
 
@@ -418,11 +421,11 @@ async function publishOne(
  *  spaced: preparing the turn already waited out a full grant budget, and the
  *  agent's first tool call is usually the only one before it gives up. */
 export const TRANSIENT_REFUSAL_RETRY_INTERVAL_MS = 10_000;
-/** Longest a wrapper's identity fetch waits on a re-ask. Stays well inside the
- *  wrapper's own 20s IPC timeout (a contact lookup plus a grant can exceed it);
- *  past this the current refusal is served and the attempt finishes in the
- *  background for the next call. */
-export const TRANSIENT_REFUSAL_WAIT_CAP_MS = 10_000;
+/** Longest a wrapper's identity fetch waits on a re-ask: long enough for the
+ *  union_id lookup plus a whole grant, and inside the wrapper's own timeout
+ *  (`GRANT_ROUTE_CLIENT_TIMEOUT_MS`). Past this the current refusal is served
+ *  and the attempt finishes in the background for the next call. */
+export const TRANSIENT_REFUSAL_WAIT_CAP_MS = GRANT_WAIT_CAP_MS;
 /** Re-asks per turn/tool; an agent stuck in a retry loop cannot hammer the platform. */
 export const TRANSIENT_REFUSAL_MAX_RETRIES = 5;
 /** Forget an entry after this long even if its turn's material is still held. */

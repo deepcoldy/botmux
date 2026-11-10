@@ -16,6 +16,7 @@
  */
 import { postJson } from './platform-http.js';
 import { readPlatformBinding } from './binding.js';
+import { FIRST_ATTEMPT_TIMEOUT_MS, TOTAL_BUDGET_MS } from './credential-grant-budget.js';
 import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 
 export interface CredentialGrantRequest {
@@ -79,13 +80,7 @@ export const GRANT_VARIABLE_KEYS: Record<TriggerUserAuthTool, { required: readon
 };
 
 /**
- * Budgets. A grant sits on the turn's critical path, so the whole call —
- * including its one retry — has a hard cap. On a platform cache miss the grant
- * is minted on the spot, which takes seconds: the first attempt is long enough
- * to wait out a slow mint, and the cap still leaves the retry at least 5s,
- * enough to finish a typical one. The retry needs that much because it rarely
- * benefits from the first attempt's mint: the platform completes a mint it
- * started, but the retry can land on another instance and mint again.
+ * Budgets: see `credential-grant-budget.ts` for the numbers and why.
  *
  * Why a retry at all: a request that got NO answer (silent socket, reset,
  * timeout) never reached the platform's verdict; one new connection fixes the
@@ -93,8 +88,7 @@ export const GRANT_VARIABLE_KEYS: Record<TriggerUserAuthTool, { required: readon
  * without making the person resend their message. An HTTP status is the
  * platform's answer and is never retried here.
  */
-export const FIRST_ATTEMPT_TIMEOUT_MS = 7_000;
-export const TOTAL_BUDGET_MS = 12_000;
+export { FIRST_ATTEMPT_TIMEOUT_MS, TOTAL_BUDGET_MS };
 /** A retry with less time than this left is not worth starting. */
 export const MIN_RETRY_BUDGET_MS = 1_000;
 /** Defense in depth: a grant is a per-turn token. Whatever the platform says,
@@ -252,9 +246,12 @@ async function requestCredentialGrantInner(
   let json: unknown;
   for (let attempt = 0; ; attempt++) {
     const remaining = deadline - Date.now();
+    // The retry gets the rest of the budget: it often starts a mint over on
+    // another instance, and capping it at another first attempt would leave
+    // the total budget unreachable.
     const timeoutMs = Math.max(1, attempt === 0
       ? Math.min(opts.timeoutMs ?? FIRST_ATTEMPT_TIMEOUT_MS, totalBudget)
-      : Math.min(FIRST_ATTEMPT_TIMEOUT_MS, remaining));
+      : remaining);
     try {
       // Always a connection of its own: grants are one per turn, so a pooled
       // keep-alive socket saves one handshake but can be one the path already

@@ -41,6 +41,7 @@ const {
 const { recallProvenIdentityContent, forgetProvenIdentityContent, writeSessionIdentity } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+const { TOTAL_BUDGET_MS } = await import('../src/platform/credential-grant-budget.js');
 
 const ALICE = 'ou_alice';
 const SESSION = 'sess-1';
@@ -230,6 +231,25 @@ describe('transient platform refusal within a turn', () => {
     release(GRANTED);
     await vi.waitFor(() => expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'"));
     expect(grantCalls).toBe(2);
+  });
+
+  it('a re-ask that takes a whole platform grant budget still answers the wrapper waiting on it', async () => {
+    responses = [NETWORK_DOWN];
+    await prepare();
+    const release = hangingGrants();
+    const now = Date.now();
+    vi.useRealTimers();
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    let served: string | undefined;
+    const waiting = retry().then(() => { served = current(); });
+    await vi.waitFor(() => expect(grantCalls).toBe(2));
+    // The platform answers on the grant client's last millisecond.
+    setTimeout(() => release(GRANTED), TOTAL_BUDGET_MS);
+    await vi.advanceTimersByTimeAsync(TOTAL_BUDGET_MS);
+    await waiting;
+    expect(served).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
+    expect(TRANSIENT_REFUSAL_WAIT_CAP_MS).toBeGreaterThan(TOTAL_BUDGET_MS);
   });
 
   it('a policy changed mid-turn ends the re-asks instead of fetching under the old one', async () => {

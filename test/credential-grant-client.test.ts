@@ -11,6 +11,8 @@ import {
   requestCredentialGrant,
   platformCredentialsUrl,
   CREDENTIAL_GRANT_PATH,
+  FIRST_ATTEMPT_TIMEOUT_MS,
+  TOTAL_BUDGET_MS,
   type CredentialGrantClientOptions,
 } from '../src/platform/credential-grant-client.js';
 
@@ -274,6 +276,48 @@ describe('requestCredentialGrant transport failures', () => {
       expect(r.ok).toBe(true);
       expect(calls).toHaveLength(2);
       expect(calls[1]!.timeoutMs).toBeGreaterThanOrEqual(4_500);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // The total matches the 30s the daemon gives a local bytedcli invocation, so
+  // a mint that went slow twice still lands inside the turn's identity budget.
+  it('gives the retry the rest of the 30s budget: a 20s retry mint still lands', async () => {
+    vi.useFakeTimers();
+    try {
+      const { calls, http, reached } = slowPlatform([null, 20_000]);
+      const t0 = Date.now();
+      let settledAfter: number | undefined;
+      const pending = requestCredentialGrant(REQ, { binding: BINDING, http })
+        .then(r => { settledAfter = Date.now() - t0; return r; });
+      await reached;
+      await vi.advanceTimersByTimeAsync(60_000);
+      const r = await pending;
+      expect(r.ok).toBe(true);
+      expect(calls.map(c => c.timeoutMs)).toEqual([FIRST_ATTEMPT_TIMEOUT_MS, TOTAL_BUDGET_MS - FIRST_ATTEMPT_TIMEOUT_MS]);
+      expect(settledAfter).toBe(FIRST_ATTEMPT_TIMEOUT_MS + 20_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('with the default budgets, gives up exactly at the total budget, not sooner', async () => {
+    vi.useFakeTimers();
+    try {
+      const { calls, http, reached } = slowPlatform([null, null]);
+      const t0 = Date.now();
+      let settledAfter: number | undefined;
+      const pending = requestCredentialGrant(REQ, { binding: BINDING, http })
+        .then(r => { settledAfter = Date.now() - t0; return r; });
+      await reached;
+      await vi.advanceTimersByTimeAsync(TOTAL_BUDGET_MS - 1);
+      expect(settledAfter).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(60_000);
+      const r = await pending;
+      expect(!r.ok && r.reason).toBe('network');
+      expect(settledAfter).toBe(TOTAL_BUDGET_MS);
+      expect(calls).toHaveLength(2);
     } finally {
       vi.useRealTimers();
     }
