@@ -741,6 +741,16 @@ export interface CliAdapter {
    * snapshot. Must reject stale prompts, loading, dialogs, and unsent drafts.
    * This only releases startup type-ahead; it never proves an idle/turn boundary. */
   readonly startupReadyFromHistory?: (history: string) => boolean;
+  /** Positive evidence, judged on the backend's own cells and cursor, that the
+   * input box is empty and accepts a write now: the verdict the adapter's
+   * writeInput enforces. When defined and the backend reports its input state,
+   * a fresh spawn's first write waits for it instead of readyPattern, and the
+   * first-prompt soft timeout releases on it. */
+  readonly inputBoxReady?: (state: { viewport: string; cursor: { x: number; y: number } }) => boolean;
+  /** The pre-write input-box check writeInput starts with, run on a spawn's
+   * opening input before it leaves the worker's queue: a refusal (the reason)
+   * keeps it queued until inputBoxReady holds again instead of failing it. */
+  readonly settleInputBox?: (pty: PtyHandle) => Promise<string | undefined>;
 
   /**
    * Longer PTY-silence window used ONLY before this CLI process's FIRST idle
