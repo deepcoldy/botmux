@@ -520,10 +520,13 @@ function rememberTransientRefusal(entry: Omit<TransientRefusal, 'body' | 'authEp
 /**
  * Called by the proven identity route before it serves a turn's identity. When
  * what is in force is a transient platform refusal this module published, ask
- * the platform again (the first time right away, then at most once per
- * {@link TRANSIENT_REFUSAL_RETRY_INTERVAL_MS}) and publish the answer if the
- * refusal is still the one in force. Concurrent callers share one attempt; no
- * caller waits longer than {@link TRANSIENT_REFUSAL_WAIT_CAP_MS}. Never throws.
+ * the platform again and publish the answer if the refusal is still the one in
+ * force. Each refusal keeps its own pace: an `unavailable` refusal is re-asked
+ * right away and then at most once per {@link TRANSIENT_REFUSAL_RETRY_INTERVAL_MS},
+ * while a `not_authorized` refusal waits {@link NOT_AUTHORIZED_RETRY_INTERVAL_MS}
+ * from the refusal itself, including before its first re-ask. Concurrent callers
+ * share one attempt; no caller waits longer than
+ * {@link TRANSIENT_REFUSAL_WAIT_CAP_MS}. Never throws.
  *
  * `currentPolicy` — not `botConfig` — is what decides whether a re-ask may run
  * and whether its answer may be written: a bot policy changed mid-turn (tool no

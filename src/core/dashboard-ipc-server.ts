@@ -1646,8 +1646,9 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
         tool: tool === 'codebase' ? 'bytedcli' : tool, delegated: delegation, storageModel: 'proven',
       });
     }
-    // A refusal published because the platform was unreachable when the turn
-    // was prepared gets another chance on this call (rate-limited, CAS-guarded).
+    // A refusal published when the turn was prepared — the platform was
+    // unreachable, or the person had not authorized yet — gets another chance
+    // on this call (rate-limited per refusal kind, CAS-guarded).
     // The Codebase companion is published together with bytedcli.
     //
     // The policy is passed as a READER, not a config: a Dashboard edit replaces
