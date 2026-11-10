@@ -274,6 +274,31 @@ describe('Codex transcript submission boundary', () => {
     expect(t.executed).toEqual([]);
   });
 
+  it('does not carry the opening check over to a replaced process', async () => {
+    const t = terminal('');
+    const adapter = createCodexAdapter();
+    expect(await adapter.settleInputBox!(t.target)).toBeUndefined();
+    t.target.cliPid = 67890;
+    t.redraw(3);
+    expect(await submit(t.target)).toMatchObject({ submitted: false, failureReason: expect.stringContaining('existing draft') });
+    expect(t.target.submitBracketedPaste).not.toHaveBeenCalled();
+    expect(t.executed).toEqual([]);
+  });
+
+  it('restarts the draft wait when a redraw frame interrupts a draft-looking one', async () => {
+    const t = terminal('');
+    const settledBox = t.target.captureInputState!;
+    const startup = { viewport: '  >_ OpenAI Codex (v0.166.0)\n     /tmp/work\n\n\n› Ask Codex to do anything\n', cursor: { x: 2, y: 4 } };
+    const residual = { viewport: 'Previous conversation\n› mid-redraw residual glyphs\n\n  model · /tmp · Ready\n', cursor: { x: 27, y: 1 } };
+    // One capture per 50ms: each draft-looking stretch stays under the draft
+    // wait, the two together do not.
+    const frames = [startup, ...Array(8).fill(residual), startup, ...Array(8).fill(residual)];
+    t.target.captureInputState = vi.fn(() => frames.shift() ?? settledBox());
+    expect(await submit(t.target)).toMatchObject({ submitted: true });
+    expect(t.executed).toEqual([MESSAGE]);
+    expect(t.target.submitBracketedPaste).toHaveBeenCalledExactlyOnceWith(MESSAGE);
+  });
+
   it('judges the box ready only at an initialized empty composer or a viewer it can close', () => {
     const ready = createCodexAdapter().inputBoxReady!;
     const composer = (text: string, x: number) => ({ viewport: `Previous conversation\n› ${text}\n  model · /tmp · Ready\n  ? for shortcuts\n`, cursor: { x, y: 1 } });
