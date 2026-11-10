@@ -99,7 +99,7 @@ export async function buildForwardedTree(
     childrenByParent.set(parent, list);
   }
 
-  function walk(parentId: string, depth: number): ForwardedNode[] {
+  function walk(parentId: string, depth: number, ancestors: string[] = []): ForwardedNode[] {
     const children = childrenByParent.get(parentId) ?? [];
     const nodes: ForwardedNode[] = [];
     for (const msg of children) {
@@ -125,14 +125,16 @@ export async function buildForwardedTree(
       }
 
       // Resources first so the numberer assigns [图片 N] in attachment order;
-      // text extraction below reuses those numbers. Do NOT override messageId —
-      // Lark requires the parent merge_forward's message_id to download
-      // resources (error 234003 if sub-message ID is used).
+      // text extraction below reuses those numbers. Keep the outer forward as
+      // the primary download ID: some forwards require it, while others return
+      // 234003 until the owning leaf or enclosing forward ID is used.
       const subResources = extractResources(msg.msg_type ?? 'text', msg.body?.content ?? '', numberer);
-      extraResources.push(...subResources);
+      const fallbackMessageIds = [...new Set([msg.message_id, parentId, ...ancestors])]
+        .filter((id): id is string => typeof id === 'string' && !!id && id !== rootMessageId);
+      extraResources.push(...subResources.map(resource => ({ ...resource, fallbackMessageIds })));
 
       if (msg.msg_type === 'merge_forward' && depth < maxDepth) {
-        const inner = walk(msg.message_id, depth + 1);
+        const inner = walk(msg.message_id, depth + 1, [parentId, ...ancestors]);
         nodes.push({ senderOpenId, senderType, ...(senderName ? { senderName } : {}), children: inner });
       } else {
         const sub = parseApiMessage(msg, numberer);
