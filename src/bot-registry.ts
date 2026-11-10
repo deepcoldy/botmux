@@ -43,6 +43,7 @@ import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import { parseVolcengineConfig } from './services/voice/volcengine-config.js';
 import { normalizeGroupIdleClose, type GroupIdleCloseSettings } from './core/group-idle-close.js';
+import { normalizeIdleSpinSuspendConfig } from './core/idle-spin-config.js';
 import { normalizeGroupSerialInput } from './core/group-serial-input.js';
 import { normalizeGroupDefaultModels, type GroupDefaultModels } from './core/group-default-models.js';
 import type { GroupJoinAnchorMode } from './core/auto-start.js';
@@ -1891,6 +1892,14 @@ export interface BotConfig {
    * (pty/riff/mojo) are never TTL-suspended. See core/idle-worker-sweeper.ts.
    */
   idleSuspendMinutes?: number;
+  /**
+   * CPU-driven idle suspension. Layer 1 parks an idle worker whose CLI
+   * process subtree keeps burning CPU (default: TRAE only, 20% of one core
+   * for 3 consecutive samples after 5 minutes idle). Layer 2 is the
+   * host-pressure backstop. Unset = conservative defaults; set
+   * `{ enabled: false }` to opt out. See core/idle-spin-config.ts.
+   */
+  idleSpinSuspend?: import('./core/idle-spin-config.js').IdleSpinSuspendConfig;
   /** Periodically @ the persisted Session owner while selected actionable
    * runtime states remain unchanged. Missing means disabled. */
   sessionOwnerReminder?: SessionOwnerReminderConfig;
@@ -4365,6 +4374,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         && Number.isInteger(entry.idleSuspendMinutes) && entry.idleSuspendMinutes > 0
         ? entry.idleSuspendMinutes
         : undefined,
+      idleSpinSuspend: (() => {
+        if (entry.idleSpinSuspend === undefined) return undefined;
+        const normalized = normalizeIdleSpinSuspendConfig(entry.idleSpinSuspend);
+        if (normalized === undefined) {
+          logger.warn(`[bot-registry:${entry.larkAppId}] ignoring invalid idleSpinSuspend`);
+        }
+        return normalized;
+      })(),
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
       longTaskReminder: normalizeLongTaskReminderConfig(entry.longTaskReminder),
       quotaFallbackBot: normalizedQuotaFallback.config,

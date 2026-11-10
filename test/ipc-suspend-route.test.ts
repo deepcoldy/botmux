@@ -35,11 +35,30 @@ async function postSuspend(sessionId: string): Promise<Response> {
 }
 
 function activeSession(over: Record<string, unknown> = {}) {
+  const old = Date.now() - 60_000;
+  const base = {
+    session: {
+      sessionId: 's-susp',
+      status: 'active',
+      cliId: 'traex',
+      lastMessageAt: new Date(old).toISOString(),
+    },
+    initConfig: { backendType: 'tmux', cliId: 'traex' },
+    worker: { killed: false, pid: 4242 },
+    workerReady: true,
+    lastScreenStatus: 'idle',
+    larkAppId: 'cli_test',
+    spawnedAt: old,
+    lastMessageAt: old,
+  } as any;
   return {
-    session: { sessionId: 's-susp', status: 'active' },
-    initConfig: { backendType: 'tmux' },
-    worker: { killed: false },
+    ...base,
     ...over,
+    session: { ...base.session, ...((over.session as object | undefined) ?? {}) },
+    initConfig: { ...base.initConfig, ...((over.initConfig as object | undefined) ?? {}) },
+    worker: over.worker === null
+      ? null
+      : { ...base.worker, ...((over.worker as object | undefined) ?? {}) },
   } as any;
 }
 
