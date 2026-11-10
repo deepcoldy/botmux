@@ -124,6 +124,97 @@ export function rawCliExecutable(id: CliId, pathOverride?: string): string | und
   return override || (normalized === 'codem' ? defaultCodemExecutable() : RAW_CLI_EXECUTABLES[normalized]);
 }
 
+/**
+ * Short names `/cli` accepts besides the cliId, so a CLI can be picked from a
+ * phone without typing `claude-code` or `oh-my-pi`. The program name in
+ * RAW_CLI_EXECUTABLES (`claude`, `omp`, `agy` …) is always accepted too and is
+ * not repeated here. Keyed by the full CliId union: a new CLI does not compile
+ * until its aliases are decided (an empty list is fine).
+ *
+ * A name may belong to several CLIs (`trae` is both TRAE CLI generations);
+ * `/cli` then lists the candidates instead of picking one. An exact cliId always
+ * wins, which is how `codex` — also codex-app's program — stays Codex.
+ */
+const CLI_SHORT_ALIASES: Readonly<Record<CliId, readonly string[]>> = {
+  'claude-code': ['cc'],
+  seed: [],
+  relay: [],
+  aiden: [],
+  coco: ['trae'],
+  codex: [],
+  'codex-app': [],
+  cursor: [],
+  genius: [],
+  opencode: [],
+  opencode2: [],
+  mimocode: [],
+  antigravity: [],
+  mtr: [],
+  hermes: [],
+  mira: [],
+  mir: [],
+  traex: ['traecli', 'trae'],
+  pi: [],
+  copilot: [],
+  'oh-my-pi': [],
+  ebsd: [],
+  kimi: [],
+  grok: [],
+  'kiro-cli': ['kiro'],
+  riff: [],
+  reasonix: [],
+  dsh: [],
+  'dsh-tui': [],
+  mojo: [],
+  minimax: [],
+  'remote-runner': [],
+  codem: [],
+  zcode: [],
+  doubao: [],
+};
+
+/** Every non-id name of each CLI: its program name, then its short aliases. */
+export const CLI_ALIASES: Readonly<Record<CliId, readonly string[]>> = Object.fromEntries(
+  ALL_CLI_IDS.map((id): [CliId, readonly string[]] => [id, [...new Set(
+    [RAW_CLI_EXECUTABLES[id], ...CLI_SHORT_ALIASES[id]]
+      .filter((name): name is string => !!name && name !== id),
+  )]]),
+) as Record<CliId, readonly string[]>;
+
+export type CliNameResolution =
+  | { readonly kind: 'cli'; readonly cliId: CliId }
+  | { readonly kind: 'ambiguous'; readonly candidates: readonly CliId[] }
+  | { readonly kind: 'unknown' };
+
+/**
+ * Resolve what a user typed to pick a CLI, case-insensitively: an exact cliId
+ * first, then an alias that names exactly one CLI.
+ */
+export function resolveCliName(
+  input: string,
+  aliases: Readonly<Record<CliId, readonly string[]>> = CLI_ALIASES,
+): CliNameResolution {
+  const name = input.trim().toLowerCase();
+  if (!name) return { kind: 'unknown' };
+  const exact = ALL_CLI_IDS.find(id => id === name);
+  if (exact) return { kind: 'cli', cliId: exact };
+  const candidates = ALL_CLI_IDS.filter(id => aliases[id]?.includes(name));
+  if (candidates.length === 1) return { kind: 'cli', cliId: candidates[0]! };
+  if (candidates.length > 1) return { kind: 'ambiguous', candidates };
+  return { kind: 'unknown' };
+}
+
+/** The aliases that select `id` on their own — shadowed or shared ones left out. */
+export function cliAliasesSelecting(
+  id: CliId,
+  aliases: Readonly<Record<CliId, readonly string[]>> = CLI_ALIASES,
+): string[] {
+  return (aliases[id] ?? []).filter(name => {
+    const resolved = resolveCliName(name, aliases);
+    return resolved.kind === 'cli' && resolved.cliId === id;
+  });
+}
+
 const RESOLVE_COMMAND_SCRIPT = 'command -v -- "$1"';
 
 function commandProbeArgv(sh: string, flags: string, cmd: string, useSetsid = true): string[] {

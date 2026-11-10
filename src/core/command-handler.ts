@@ -46,7 +46,7 @@ import { buildDismissConfirmCard, buildDismissReceiptCard } from '../im/lark/dis
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { handleProjectGroupRoles } from './dashboard-command/groups.js';
 import { handleGroupSessionsCommand } from './group-sessions-command.js';
-import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { ALL_CLI_IDS, cliAliasesSelecting, createCliAdapterSync, resolveCliName } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { resolveCliRuntime, runtimeInstallationKey, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
@@ -241,6 +241,16 @@ function cliSelectionSecurityError(botCfg: { env?: Record<string, string>; backe
   if (botCfg.backendType === 'riff' || botCfg.riff !== undefined) return 'CLI-selected sessions cannot use Riff';
   if (botCfg.codexRpcInput === true && !RPC_CAPABLE_CLIS.has(cliId)) return 'selected CLI cannot use codexRpcInput';
   return undefined;
+}
+
+function cliSelectionUsage(loc: Locale): string {
+  // An unrestricted bot: drops only the CLIs `/cli` refuses everywhere (riff).
+  const ids = ALL_CLI_IDS.filter(id => !cliSelectionSecurityError({}, id, 'default'));
+  const aliases = ids.flatMap(id => {
+    const names = cliAliasesSelecting(id);
+    return names.length ? [`${names.join(' / ')} → ${id}`] : [];
+  });
+  return t('cmd.cli.usage', { aliases: aliases.join('\n'), ids: ids.join(', ') }, loc);
 }
 
 /**
@@ -2130,21 +2140,19 @@ export async function handleCommand(
           break;
         }
         const botCfg = getBot(ds.larkAppId).config;
-        const rawArgs = message.content.replace(/^\/cli\s*/i, '').trim();
-        const args = rawArgs.split(/\s+/u);
-        const requestedId = args[0];
-        let selectedCliId: CliId | undefined;
-        if (args.length === 1) {
-          try {
-            selectedCliId = createCliAdapterSync(requestedId as CliId).id as CliId;
-          } catch {
-            // Keep the normal invalid-CLI response below.
-          }
-        }
-        if (!selectedCliId) {
-          await sessionReply(rootId, 'Usage: /cli <cliId>\nUnknown or invalid CLI.');
+        const args = message.content.replace(/^\/cli\s*/i, '').trim().split(/\s+/u).filter(Boolean);
+        const requested = args.length === 1 ? resolveCliName(args[0]!) : undefined;
+        if (requested?.kind === 'ambiguous') {
+          const choices = requested.candidates.map(id => t('cmd.cli.choice', { cliId: id, name: getCliDisplayName(id) }, loc)).join(', ');
+          await sessionReply(rootId, t('cmd.cli.ambiguous', { input: args[0]!, choices }, loc));
           break;
         }
+        if (requested?.kind !== 'cli') {
+          const usage = cliSelectionUsage(loc);
+          await sessionReply(rootId, args.length === 1 ? `${t('cmd.cli.unknown', { input: args[0]! }, loc)}\n${usage}` : usage);
+          break;
+        }
+        const selectedCliId = requested.cliId;
         if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd: '/cli' }, loc));
           break;

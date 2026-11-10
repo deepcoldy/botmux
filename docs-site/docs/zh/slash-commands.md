@@ -98,7 +98,7 @@ Codex 容量不足自动续跑**默认关闭**。管理员可用 `/botconfig set
 两条命令都默认可用，需要操作权限（管理员 / `allowedUsers`，或用 `canTalkDaemonCommands` 放开）。
 
 - **`/rename <标题>`**：在已有会话里发，改 Botmux 会话名（Dashboard、`/sessions` 列表跟着变），运行中的 Codex / Claude Code 会同步改原生会话名。飞书群名、话题名不变。
-- **`/cli <cliId>`**：只给**还没启动 CLI** 的会话选 CLI，例如在新话题里第一条就发 `/cli codex`，再发任务，这个会话就用 Codex 跑，Bot 的默认 CLI 不变。`cliId` 取值见[支持的 CLI](/adapters#支持的-cli--agent)。以下情况会被拒绝：会话已有历史或 CLI 已经起来、接管（adopt）的会话、排队中的会话、Bot 配了 `env`、用 Riff 后端、选的是 `riff`，以及所选 CLI 和 Bot 的零注入（`promptInjection: "none"`）或 `codexRpcInput` 不兼容。`/cli` 不在 `/help` 里显示。
+- **`/cli <cliId>`**：只给**还没启动 CLI** 的会话选 CLI，例如在新话题里第一条就发 `/cli codex`，再发任务，这个会话就用 Codex 跑，Bot 的默认 CLI 不变。`cliId` 取值见[支持的 CLI](/adapters#支持的-cli--agent)。也可以写程序名或简写，不区分大小写：`/cli cc` 或 `/cli claude` 选 Claude Code，`/cli omp` 选 Oh My Pi，`/cli agy` 选 Antigravity；完整 `cliId` 优先，所以 `/cli codex` 选的是 Codex 而不是同样跑 `codex` 的 Codex App。一个简写对应多个 CLI（如 `trae` 同时是 TRAE CLI 的新旧两代）时不替你选，会列出候选让你改发完整 ID。只发 `/cli` 列出全部可选 CLI 和简写。以下情况会被拒绝：会话已有历史或 CLI 已经起来、接管（adopt）的会话、排队中的会话、Bot 配了 `env`、用 Riff 后端、选的是 `riff`，以及所选 CLI 和 Bot 的零注入（`promptInjection: "none"`）或 `codexRpcInput` 不兼容。`/cli` 不在 `/help` 里显示。
 
 ## 群负责人（Agent 工具）
 

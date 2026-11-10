@@ -740,6 +740,7 @@ import {
   writeRoleProfileEntry,
 } from '../src/services/role-profile-store.js';
 import type { CommandHandlerDeps } from '../src/core/command-handler.js';
+import { ALL_CLI_IDS, cliAliasesSelecting } from '../src/adapters/cli/registry.js';
 import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import { withBotTurnMutation } from '../src/core/bot-turn-mutation-gate.js';
@@ -1074,16 +1075,87 @@ describe('/cli session selection', () => {
     expect(ds.session.cliLaunchSnapshot).toEqual(snapshot);
   });
 
-  it('rejects bare /cli and unknown cli ids', async () => {
+  it('answers bare /cli, extra tokens and unknown names with every selectable CLI and its aliases', async () => {
     const ds = makeDaemonSession({
       hasHistory: false,
       session: makeSession({ cliId: undefined }),
     });
     const deps = makeDeps(ds);
     await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli'), deps, LARK_APP_ID);
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli claude code'), deps, LARK_APP_ID);
     await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli does-not-exist'), deps, LARK_APP_ID);
     expect(ds.session.cliLaunchSnapshot).toBeUndefined();
-    expect(deps.sessionReply).toHaveBeenLastCalledWith(ROOT_ID, 'Usage: /cli <cliId>\nUnknown or invalid CLI.', undefined, LARK_APP_ID, 'msg_001');
+    const replies = vi.mocked(deps.sessionReply).mock.calls.map(call => call[1]);
+    expect(replies).toHaveLength(3);
+    expect(replies[2]).toContain('does-not-exist');
+    for (const reply of replies) {
+      const lines = reply.split('\n');
+      for (const id of ALL_CLI_IDS) {
+        // riff is refused by /cli on every bot, so it is not offered.
+        if (id === 'riff') expect(reply).not.toContain(id);
+        else expect(reply).toContain(id);
+        for (const alias of cliAliasesSelecting(id)) {
+          expect(lines.some(line => line.includes(alias) && line.includes(id)), `${alias} listed with ${id}`).toBe(true);
+        }
+      }
+      // Names that pick nothing on their own are not offered: `codex` is Codex's
+      // own id rather than Codex App's alias, and `trae` is shared by coco and traex.
+      const words = reply.split(/[^a-z0-9-]+/i);
+      expect(words).not.toContain('trae');
+      expect(words.filter(word => word === 'codex-app')).toHaveLength(1);
+    }
+  });
+
+  it.each([
+    ['cc', 'claude-code'],
+    ['CC', 'claude-code'],
+    ['claude', 'claude-code'],
+    ['omp', 'oh-my-pi'],
+    ['Agy', 'antigravity'],
+    // codex is also the program codex-app runs; the exact cliId wins.
+    ['codex', 'codex'],
+  ] as const)('selects %s as %s', async (input, cliId) => {
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage(`/cli ${input}`), deps, LARK_APP_ID);
+
+    expect(ds.session.cliLaunchSnapshot).toEqual(expect.objectContaining({ state: 'pending', entryId: cliId, cliId }));
+    expect(deps.sessionReply).toHaveBeenLastCalledWith(ROOT_ID, expect.stringContaining(cliId), undefined, LARK_APP_ID, 'msg_001');
+  });
+
+  it('lists the candidates of an alias shared by several CLIs and keeps the current selection', async () => {
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined }),
+    });
+    const deps = makeDeps(ds);
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli hermes'), deps, LARK_APP_ID);
+    const selected = ds.session.cliLaunchSnapshot;
+
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli Trae'), deps, LARK_APP_ID);
+
+    expect(ds.session.cliLaunchSnapshot).toBe(selected);
+    expect(selected?.cliId).toBe('hermes');
+    const reply = vi.mocked(deps.sessionReply).mock.lastCall?.[1] ?? '';
+    expect(reply).toContain('/cli traex');
+    expect(reply).toContain('/cli coco');
+  });
+
+  it('applies the operator check to a CLI picked by alias', async () => {
+    vi.mocked(canOperate).mockReturnValueOnce(false);
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ cliId: undefined }),
+    });
+    const deps = makeDeps(ds);
+
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli cc'), deps, LARK_APP_ID);
+
+    expect(ds.session.cliLaunchSnapshot).toBeUndefined();
   });
 
   it('rejects riff because it requires bot-level backend configuration', async () => {
