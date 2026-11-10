@@ -5722,29 +5722,21 @@ async function cmdList(): Promise<void> {
   // would make a large session list quadratic and amplify socket timeouts.
   const probeSnapshot = buildBackingProbeSnapshot(active);
 
-  // Auto-prune unrecoverable sessions: process dead and no recoverable backing
-  // session (tmux/herdr/zellij/zmx).
-  // Split into two buckets so a never-activated daemon-command scratch (e.g. an
+  // Auto-prune only never-activated daemon-command scratches (e.g. an
   // unconfirmed /adopt that only posted a picker card, /help, an abandoned
-  // /relay picker) isn't reported as a crashed CLI. Such a scratch never forked
+  // /relay picker). Such a scratch never forked
   // a worker, so it has no cliId / lastCliInput / adoptedFrom — the same "was it
   // ever a real CLI session" markers isRelayableRealSession uses. Closing it is
   // fine, but the "进程已死且无 tmux session" notice wrongly implies a CLI ran
   // and crashed, which is exactly the confusing output users hit after /adopt.
-  const pruned: SessionData[] = [];
   const prunedScratch: SessionData[] = [];
   const live: SessionData[] = [];
   for (const s of active) {
     if (isAdoptedSession(s)) {
-      const pid = adoptedCliPid(s);
-      if (pid && isProcessAlive(pid)) {
-        live.push(s);
-      } else if (pid) {
-        pruned.push(s);
-      } else {
-        const hasPid = !!(s.pid && isProcessAlive(s.pid));
-        hasPid ? live.push(s) : pruned.push(s);
-      }
+      // A sandbox can deny signal-zero probes of the external CLI with EPERM.
+      // Listing must not turn that lack of visibility into a permanent close
+      // of its live bridge. Retain even a stale/missing pid for explicit detach.
+      live.push(s);
       continue;
     }
 
@@ -5753,8 +5745,7 @@ async function cmdList(): Promise<void> {
     const disposition = sessionListDisposition(s, { hasPid, hasBackingSession });
     // Non-adopt sessions are only ever kept or pruned-as-scratch now: a real
     // managed session with a missing backing is dormant-recoverable, never
-    // auto-closed by this read command (see sessionListDisposition). Adopt
-    // zombies still reach the `pruned` bucket via the branch above.
+    // auto-closed by this read command (see sessionListDisposition).
     if (disposition === 'prune_scratch') prunedScratch.push(s);
     else live.push(s);
   }
@@ -5781,20 +5772,14 @@ async function cmdList(): Promise<void> {
     // Keep `list` read-only in primary mode. These rows come from the Pod-local
     // store, so even an apparently harmless scratch cleanup could close only
     // the local row while PostgreSQL keeps the canonical Session active.
-    live.push(...prunedScratch, ...pruned);
-    const skipped = prunedScratch.length + pruned.length;
+    live.push(...prunedScratch);
+    const skipped = prunedScratch.length;
     if (skipped > 0) {
       console.warn(`⚠️ primary coordination 下已跳过 ${skipped} 个本地会话的自动清理；本次仅展示，不修改状态。`);
     }
   } else {
     // Scratches: close silently — they were placeholders, not dead sessions.
     await closeNow(prunedScratch, 'scratch');
-    if (pruned.length > 0) {
-      const prunedCount = await closeNow(pruned, 'real');
-      if (prunedCount > 0) {
-        console.log(`已自动清理 ${prunedCount} 个不可恢复的会话（进程已退出或无可恢复后端）`);
-      }
-    }
   }
 
   // Sort by creation time, newest first
