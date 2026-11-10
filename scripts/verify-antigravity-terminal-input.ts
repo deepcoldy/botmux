@@ -40,6 +40,14 @@ writeFileSync(join(root, 'settings.json'), JSON.stringify({ trustedWorkspaces: [
 const version = execFileSync(bin, ['--version'], { encoding: 'utf8', timeout: 3_000 }).trim();
 const records: Array<Record<string, unknown>> = [];
 
+/** Every run gets a fresh fenced HOME, so agy's per-HOME 15-minute self-update
+ *  throttle never engages: without this, the background updater replaces the
+ *  binary at --agy-bin in place. Must be the literal "true" (agy ignores "1"),
+ *  matching scripts/oncall-cli-matrix/specs.ts. */
+function probeEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  return { ...process.env, AGY_CLI_DISABLE_AUTO_UPDATE: 'true', ...extra };
+}
+
 /** Wait without blocking the runner or the CLI's input processing. */
 const wait = (ms: number): Promise<void> => new Promise(resolveWait => setTimeout(resolveWait, ms));
 /** Quote only process-owned paths/arguments for a new private Tmux session. */
@@ -82,7 +90,7 @@ async function verify(transport: 'pty' | 'tmux'): Promise<void> {
   let screen: () => string;
   let close: () => void;
   if (transport === 'pty') {
-    const child = spawn(bin, args, { name: 'xterm-256color', cols: 160, rows: 40, cwd, env: { ...process.env, TERM: 'xterm-256color', NO_COLOR: '1' } });
+    const child = spawn(bin, args, { name: 'xterm-256color', cols: 160, rows: 40, cwd, env: probeEnv({ TERM: 'xterm-256color', NO_COLOR: '1' }) });
     let output = '';
     child.onData(chunk => { output = (output + chunk).slice(-32_000); });
     handle = { cliPid: child.pid, cliCwd: cwd, write(text) { rawWrites++; child.write(text); return true; } };
@@ -93,7 +101,7 @@ async function verify(transport: 'pty' | 'tmux'): Promise<void> {
     const socket = `agy-proof-${randomUUID().slice(0, 8)}`;
     const tmuxArgs = ['-L', socket];
     execFileSync('tmux', [...tmuxArgs, 'new-session', '-d', '-s', 'agy-proof', '-x', '160', '-y', '40', '-c', cwd,
-      `exec ${[bin, ...args].map(quote).join(' ')}`], { timeout: 5_000, env: process.env });
+      `exec ${[bin, ...args].map(quote).join(' ')}`], { timeout: 5_000, env: probeEnv() });
     const backend = new TmuxPipeBackend('agy-proof', { socketName: socket });
     handle = { write(text) { rawWrites++; backend.write(text); return true; },
       submitBracketedPaste(text) { atomicSubmits++; return backend.submitBracketedPaste(text); } };
@@ -139,7 +147,7 @@ async function verifyWorker(transport: 'pty' | 'tmux'): Promise<void> {
   let promptReadyMs: number | undefined;
   const worker = fork(resolve('dist/worker.js'), [], {
     cwd, execArgv: [], stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-    env: { ...process.env, BOTMUX_NO_CLAIM: '1' },
+    env: probeEnv({ BOTMUX_NO_CLAIM: '1' }),
   });
   let logs = '';
   worker.stdout?.on('data', (chunk: Buffer) => {
