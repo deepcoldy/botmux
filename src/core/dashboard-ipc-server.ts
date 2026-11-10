@@ -1,3 +1,4 @@
+import { setChatFeedGroup } from '../services/chat-feed-groups.js';
 import { readOncallDeploymentEnv } from '../services/oncall-deployment-config.js';
 import { loadOncallPresetOptions } from '../services/oncall-preset-options.js';
 import { loadOncallGroupTarget, readOncallGroupSettings, saveOncallGroupTarget } from '../services/oncall-group-client.js';
@@ -7920,6 +7921,22 @@ ipcRoute('PUT', '/api/group-card-mode/:chatId', async (req, res, p) => {
   return jsonRes(res, 200, { ok: true, enabled, changed: result.changed });
 });
 
+/** Trusted plugin host operation; actor identity remains bound to the command sender. */
+ipcRoute('PUT', '/api/groups/:chatId/feed-group', requireBoundBot(async (req, res, p) => {
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  const { actorOpenId, label } = body as Record<string, unknown>;
+  if (typeof actorOpenId !== 'string' || (label !== null && typeof label !== 'string')) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  const cancelled = new AbortController();
+  const onClose = () => { if (!res.writableEnded) cancelled.abort(); };
+  res.once('close', onClose);
+  try {
+    const result = await setChatFeedGroup(cachedLarkAppId, p.chatId, actorOpenId, label, cancelled.signal);
+    return jsonRes(res, result.ok ? 200 : result.error === 'permission_denied' ? 403 : 400, result);
+  } finally { res.off('close', onClose); }
+}, NOT_BOUND_BODY.okFalse));
+
 ipcRoute('PUT', '/api/group-default-models/:chatId', requireBoundBot(async (req, res, p) => {
   if (!/^oc_[a-zA-Z0-9_-]+$/.test(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
   let models;
@@ -7987,6 +8004,7 @@ ipcRoute('GET', '/api/groups', requireBoundBot(async (_req, res) => {
         firstSeenAt: seenMap.get(c.chatId) ?? null,
         hasRole,
         hasMessageListener,
+        hasMessageListenerConfig: getMessageListenerConfig(cachedLarkAppId, c.chatId) !== null || hasMessageListener,
         observedBotNames,
         pinStreamingCardMasterEnabled,
         pinStreamingCardChatEnabled,

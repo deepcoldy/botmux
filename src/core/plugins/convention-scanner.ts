@@ -334,7 +334,9 @@ const scanCommands = (
   } catch {
     throw new Error('invalid_plugin_commands_endpoint');
   }
-  return { schemaVersion: 1, endpoint, commands };
+  if (record.afterClose !== undefined && record.afterClose !== true) throw new Error('invalid_plugin_after_close');
+  if (record.replacesCloseTag !== undefined && (record.replacesCloseTag !== true || record.afterClose !== true)) throw new Error('invalid_plugin_close_tag_override');
+  return { schemaVersion: 1, endpoint, commands, ...(record.afterClose === true ? { afterClose: true } : {}), ...(record.replacesCloseTag === true ? { replacesCloseTag: true } : {}) };
 };
 
 export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPluginManifest): ScannedPluginContributions | undefined {

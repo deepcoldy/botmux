@@ -7046,6 +7046,7 @@ async function executePluginSlashCommand(input: {
   chatType: 'p2p' | 'group' | undefined;
   anchor: string;
   messageId: string;
+  issuedAt?: number;
   senderOpenId: string | undefined;
   senderUnionId: string | undefined;
   teamTrustUnionId: string | undefined;
@@ -7064,6 +7065,7 @@ async function executePluginSlashCommand(input: {
     chatType: input.chatType,
     anchor,
     messageId: input.messageId,
+    issuedAt: input.issuedAt,
     senderOpenId: input.senderOpenId,
     senderUnionId: input.senderUnionId,
     locale,
@@ -27450,6 +27452,7 @@ async function executeNewTopicSlash(slash: NewTopicSlashContext): Promise<boolea
       chatType,
       anchor,
       messageId: parsed.messageId,
+      issuedAt: Number(parsed.createTime) || Date.now(),
       senderOpenId,
       senderUnionId,
       teamTrustUnionId,
@@ -31405,6 +31408,7 @@ async function executeThreadSlash(slash: ThreadSlashContext): Promise<boolean> {
       chatType,
       anchor,
       messageId: parsed.messageId,
+      issuedAt: Number(parsed.createTime) || Date.now(),
       senderOpenId,
       senderUnionId,
       teamTrustUnionId,
