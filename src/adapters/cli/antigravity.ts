@@ -1,3 +1,5 @@
+import { detectModelsViaExec } from './model-catalog-json.js';
+import { parseAntigravityModels } from './antigravity-models.js';
 import { existsSync, statSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -343,6 +345,10 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.gemini'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     modelChoices: CLI_MODEL_CHOICES['antigravity'],
+    /** Discover account-visible models without starting a conversation. */
+    async detectModels(options) {
+      return detectModelsViaExec(this.resolvedBin, ['models'], parseAntigravityModels, options?.env);
+    },
 
     buildArgs({ sessionId, resume, resumeSessionId, disableCliBypass, model, reasoningEffort }) {
       const args = disableCliBypass ? [] : ['--dangerously-skip-permissions'];
