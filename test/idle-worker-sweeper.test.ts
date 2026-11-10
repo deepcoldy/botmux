@@ -365,6 +365,30 @@ describe('maintenance idle suspension', () => {
     ]);
     expect(b.worker).not.toBe(null);
   });
+
+  it('stops the action loop per-candidate once shouldAbort flips (shutdown fence)', async () => {
+    // Candidates are ordered oldest-first: abort-a, then abort-b, then abort-c.
+    const a = ds('abort-a', 'tmux', now - 9 * day);
+    const b = ds('abort-b', 'tmux', now - 8 * day);
+    const c = ds('abort-c', 'tmux', now - 7 * day);
+    const sessions = new Map<string, any>([['abort-a', a], ['abort-b', b], ['abort-c', c]]);
+    let abortChecks = 0;
+    const shouldAbort = () => { abortChecks += 1; return abortChecks > 1; };
+
+    const result = await suspendSelectedIdleCandidatesAsync(
+      sessions,
+      undefined,
+      { olderThanMs: 7 * day, now, reason: 'idle_spin', shouldAbort },
+      () => Promise.resolve(),
+    );
+
+    // First candidate completes before the flag flips; the remaining two are
+    // never touched once shutdown is observed between candidates.
+    expect(result.suspended.map(item => item.sessionId)).toEqual(['abort-a']);
+    expect(a.worker).toBe(null);
+    expect(b.worker).not.toBe(null);
+    expect(c.worker).not.toBe(null);
+  });
 });
 
 describe('sweepIdleWorkers (per-bot count cap)', () => {
