@@ -41,6 +41,11 @@
  */
 import { makeFingerprint, normaliseForFingerprint } from './bridge-turn-queue.js';
 import type { CodexBridgeEvent, CodexCotEntry } from './codex-transcript.js';
+import { createHash } from 'node:crypto';
+
+function exactInputHash(text: string): string {
+  return createHash('sha256').update(text.replace(/\r\n?/g, '\n'), 'utf8').digest('hex');
+}
 
 const UNMATCHED_REPLAY_WINDOW_MS = 5_000;
 const MAX_BUFFERED_UNMATCHED_EVENTS = 20;
@@ -75,6 +80,11 @@ export interface CodexPendingTurn {
   restoredFromJournal?: boolean;
   started: boolean;
   contentFingerprint?: string;
+  /** Digest of the full written input for driver-proved input aliases.
+   * The historical prefix fingerprint alone cannot prove a rewritten skill
+   * input whose arguments differ after its first 30 characters. Persist the
+   * digest for restart recovery without retaining the full private prompt. */
+  inputTextHash?: string;
   /** Wall-clock millis when mark() was called. The emit gate uses this as
    *  the lower bound of the "did `botmux send` happen for this turn?"
    *  window. Optional only for legacy / test-injected turns. */
@@ -204,6 +214,16 @@ export class CodexBridgeQueue {
     private readonly now: () => number = Date.now,
     private readonly onLocalTurnStarted?: (turn: CodexPendingTurn) => void,
   ) {}
+
+  private matchesUserInput(turn: CodexPendingTurn, event: CodexBridgeEvent): boolean {
+    if (event.inputTextAliases !== undefined) {
+      if (turn.inputTextHash === undefined) return false;
+      return [event.text, ...event.inputTextAliases]
+        .some(text => exactInputHash(text) === turn.inputTextHash);
+    }
+    return !turn.contentFingerprint
+      || normaliseForFingerprint(event.text).includes(turn.contentFingerprint);
+  }
 
   private isClosedNativeTurn(sourceSessionId: string | undefined, sourceTurnId: string): boolean {
     return this.closedNativeTurns.some(closed => closed.sourceTurnId === sourceTurnId
@@ -366,6 +386,7 @@ export class CodexBridgeQueue {
       ...(linkRefMode ? { linkRefMode } : {}),
       started: false,
       contentFingerprint: makeFingerprint(message),
+      ...(/^[ \t]*(?:[/$]|\[\$)/.test(message) ? { inputTextHash: exactInputHash(message) } : {}),
       markTimeMs,
       recoveryJsonlPathAtMark: recoveryCursorAtMark?.jsonlPath,
       recoveryOffsetAtMark: recoveryCursorAtMark?.offsetAtMark,
@@ -380,6 +401,7 @@ export class CodexBridgeQueue {
   restorePendingTurns(entries: readonly {
     turnId: string;
     fingerprint: string;
+    inputTextHash?: string;
     markTimeMs: number;
     linkRefMode?: 'observe' | 'enabled';
     jsonlPath?: string;
@@ -399,6 +421,7 @@ export class CodexBridgeQueue {
         restoredFromJournal: true,
         ...(entry.linkRefMode ? { linkRefMode: entry.linkRefMode } : {}),
         contentFingerprint: makeFingerprint(entry.fingerprint), markTimeMs: entry.markTimeMs,
+        ...(entry.inputTextHash ? { inputTextHash: entry.inputTextHash } : {}),
         recoveryJsonlPathAtMark: entry.jsonlPath,
         recoveryOffsetAtMark: entry.offsetAtMark,
         ...(entry.mergedExecution ? {
@@ -909,8 +932,7 @@ export class CodexBridgeQueue {
       if (provisional) {
         const collectingTooOld = provisional.markTimeMs !== undefined
           && ev.timestampMs < provisional.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
-        const collectingFingerprintOk = !provisional.contentFingerprint
-          || normaliseForFingerprint(ev.text).includes(provisional.contentFingerprint);
+        const collectingFingerprintOk = this.matchesUserInput(provisional, ev);
         if (!collectingTooOld && collectingFingerprintOk) {
           provisional.transcriptStartTimeMs = ev.timestampMs;
           provisional.sourceMessageId = ev.sourceMessageId;
@@ -956,9 +978,7 @@ export class CodexBridgeQueue {
       const next = this.queue.find(t => !t.started);
       const tooOld = !!next && next.markTimeMs !== undefined && ev.timestampMs < next.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
       let fingerprintOk = true;
-      if (next?.contentFingerprint) {
-        fingerprintOk = normaliseForFingerprint(ev.text).includes(next.contentFingerprint);
-      }
+      if (next) fingerprintOk = this.matchesUserInput(next, ev);
       const willStartNext = !!next && !tooOld && fingerprintOk;
       const willSynthLocal = !willStartNext && this.localTurnsEnabled && ev.timestampMs >= this.localLowerBoundMs - UNMATCHED_REPLAY_WINDOW_MS;
       if (willStartNext) this.revalidateRestoredMerge(next!, ev);

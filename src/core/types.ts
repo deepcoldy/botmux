@@ -779,6 +779,10 @@ export interface DaemonSession {
    *  an obligation that will never terminal again. Bounded LRU of settled
    *  dedupe facts only — never an unresolved obligation. */
   settledInputTurns?: Map<string, number>;
+  /** Key (in acceptedInputTurns) of the input this generation accepted last.
+   *  The idle reclaim hold waits on that turn only: an earlier one that never
+   *  reported a terminal is over once a later input was accepted. */
+  latestAcceptedInputKey?: string;
   /** Conservative overflow latch. When more unresolved obligations exist than
    *  the ledger tracks, an automatic reclaim stays blocked for the rest of the
    *  generation instead of silently dropping an unresolved obligation. */

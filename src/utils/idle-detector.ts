@@ -569,6 +569,13 @@ export class IdleDetector {
     return this.programStatusLastAtMs === 0 ? Number.POSITIVE_INFINITY : now - this.programStatusLastAtMs;
   }
 
+  /** OSC 7501 holds the session busy: a `working` or `blocked` record. The
+   *  same condition on which fireIdle() and adoptPromptReady() refuse to end
+   *  the turn — for a caller that would otherwise end it from the screen. */
+  programStatusHeldBusy(): boolean {
+    return this.programStatusAuthority && this.hasBusyProgramStatus();
+  }
+
   /**
    * Drop a `working` hold the caller has proven stale from other evidence: the
    * CLI's transcript closed the turn with nothing written since, and the
