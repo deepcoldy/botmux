@@ -8776,7 +8776,9 @@ function settleBackgroundTasksFromSiblings(): void {
   for (const taskId of backgroundTaskStopsInSiblingTranscripts(
     bridgeJsonlDir, bridgeJsonlPath, backgroundStopScanSinceMs, backgroundStopScanOffsets,
   )) {
-    backgroundTaskTracker.settle(taskId);
+    // Read now, written no later: a resume a re-drain reads again (older) must
+    // not bring the task back.
+    backgroundTaskTracker.settle(taskId, Date.now());
   }
 }
 
