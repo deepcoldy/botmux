@@ -161,6 +161,11 @@ export class WorkerSessionEventScope {
     if (state?.runtime) return sameRuntime(state.runtime, origin.runtime) || this.bindingForRuntime(state.runtime)?.physicalId === origin.physicalId;
     return this.isCurrentContext();
   }
+  isExecutionSettled(turnId: string, dispatchAttempt?: number): boolean {
+    const execution = this.executionForTurn(turnId, dispatchAttempt);
+    const state = execution ? this.admissionStates.get(execution.executionId) : undefined;
+    return !!state && ['succeeded', 'failed', 'cancelled'].includes(state.phase);
+  }
   bindingForRuntime(runtime: RuntimeRef): RuntimeEventBinding | undefined {
     return [...this.bindings.values()].find(binding => binding.runtime?.runtimeId === runtime.runtimeId && binding.runtime.epoch === runtime.epoch);
   }
@@ -258,6 +263,14 @@ export class WorkerSessionEventScope {
     if (turnId && active?.binding && submission && submission !== active.binding && submission.physicalId === active.binding.physicalId) {
       const execution = this.executionForTurn(turnId, dispatchAttempt);
       if (execution) return this.snapshot(submission, execution);
+    }
+    if (turnId && active?.binding) {
+      const execution = this.executionForTurn(turnId, dispatchAttempt);
+      const runtime = execution ? this.admissionStates.get(execution.executionId)?.runtime : undefined;
+      const binding = runtime ? this.bindingForRuntime(runtime) : undefined;
+      // Observer grants retain the original runtime even if a successor has
+      // already entered this physical CLI before the restored terminal drains.
+      if (binding && binding.physicalId === active.binding.physicalId) return this.snapshot(binding, execution);
     }
     if (active?.binding && active.execution && (!turnId || active.execution.turnId === turnId)) return this.snapshot(active.binding, active.execution);
     if (turnId) {

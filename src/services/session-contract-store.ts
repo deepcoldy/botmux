@@ -559,11 +559,14 @@ export class SessionContractStore {
       const state = this.read(ref); const current = this.runtime(ref);
       const attempt = this.execution(ref, execution.executionId);
       const source = attempt?.runtime && this.runtime(ref, attempt.runtime.runtimeId);
+      const lineage = source ? [source.ref, ...this.continuedRuntimes(ref, source.ref, source.worker)] : [];
+      const survivor = lineage.length ? this.runtime(ref, lineage.at(-1)!.runtimeId) : undefined;
       if (!state || state.lifecycle !== 'active' || state.activeOperationId || !sameWorker(state.worker, worker)
           || !current || !sameWorker(current.worker, worker) || !['starting', 'ready'].includes(current.phase)
-          || !sameExecution(attempt?.ref, execution) || attempt?.phase !== 'reconciling'
-          || !source || !sameRuntime(attempt.runtime, source.ref) || source.phase !== 'unresolved' || sameRuntime(source.ref, current.ref)
-          || !current.identity?.nativeSessionId || !reusableRuntimeIdentity(source.identity, current.identity)) return false;
+          || !sameExecution(attempt?.ref, execution) || !['submitting', 'accepted', 'reconciling'].includes(attempt!.phase) || attempt?.terminal
+          || !source || !sameRuntime(attempt.runtime, source.ref) || sameWorker(source.worker, worker)
+          || !survivor || (survivor.phase !== 'unresolved' && !sameRuntime(survivor.ref, current.ref)) || sameRuntime(source.ref, current.ref)
+          || !current.identity?.nativeSessionId || !reusableRuntimeIdentity(survivor.identity, current.identity)) return false;
       if (this.authorizedExecutionObserver(ref, source.ref, worker, execution)) return true;
       this.saveEntity(ref, 'execution_observer', JSON.stringify([worker.workerId, worker.generation, execution.executionId]),
         'authorized', { worker, execution, runtime: source.ref });

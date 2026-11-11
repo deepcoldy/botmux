@@ -103,10 +103,14 @@ export class SessionController {
       // id a resumed Claude first shows at its first write, after the resume
       // was confirmed at the prompt.
       const live = this.store.binding(this.ref, bindingId);
-      const enrichesActive = state?.lifecycle === 'active' && !!live?.identity && sameRuntime(live.ref, state.activeRuntime);
+      const enrichesActive = !!state && (state.lifecycle === 'active' || (state.lifecycle === 'suspending' && !!state.activeOperationId))
+        && !!live?.identity && sameRuntime(live.ref, state.activeRuntime)
+        && sameWorker(live.worker, worker) && ['starting', 'ready'].includes(live.phase);
       // The operation that spawned the live CLI may already be confirmed;
       // continuing or enriching that CLI is not part of it.
-      const operation = (continued || enrichesActive) && !state?.activeOperationId ? undefined : operationId;
+      // Identity changes still go through bindRuntime's physical/native checks.
+      const operation = enrichesActive ? state?.activeOperationId
+        : continued && !state?.activeOperationId ? undefined : operationId;
       const bound = this.store.bindRuntime(this.ref, proposed.ref, worker, identity, operation);
       if (continued && !sameRuntime(continued, bound.ref) && sameRuntime(this.store.read(this.ref)?.activeRuntime, bound.ref)) {
         this.store.continueRuntime(this.ref, continued, bound.ref, worker);
@@ -367,7 +371,11 @@ export class SessionController {
     const runtime = this.store.runtime(this.ref);
     if (runtime && sameWorker(runtime.worker, worker)) {
       this.store.apply(this.ref, { type: 'runtime_lost', runtime: runtime.ref, confirmed: false, reason: 'worker_disconnected' });
-      this.store.markUnresolvedExecutions(this.ref, runtime.ref);
+      for (const execution of this.store.executions(this.ref)) {
+        if (execution.runtime && this.store.runtimeContinues(this.ref, execution.runtime, runtime.ref, worker)) {
+          this.store.markUnresolvedExecutions(this.ref, execution.runtime);
+        }
+      }
     }
     this.refresh();
   }

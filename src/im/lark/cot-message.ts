@@ -128,6 +128,7 @@ interface CotState {
   recovery?: CotRecoveryIdentity;
   resumeRequested?: boolean;
   createSuperseded?: boolean;
+  terminalCheckpointRetry?: ReturnType<typeof setTimeout>;
 }
 
 interface CotRecoveryIdentity {
@@ -140,7 +141,7 @@ interface CotRecoveryIdentity {
 
 interface CotRecoveryBinding extends CotRecoveryIdentity { turnId: string }
 
-/** Only the persistent, non-isolated agy case can safely continue its native
+/** Persistent, non-isolated Antigravity and Codex sessions retain their native
  * task across worker replacement. Other CLI/backend lifecycles stay unchanged. */
 export function canResumeCotMessage(ds: Pick<DaemonSession, 'session' | 'larkAppId'> & Partial<Pick<DaemonSession, 'initConfig'>>): boolean {
   if (isSilentMessageListenerSession(ds.session)) return false;
@@ -148,7 +149,7 @@ export function canResumeCotMessage(ds: Pick<DaemonSession, 'session' | 'larkApp
     const cfg = getBot(ds.larkAppId).config;
     const sandbox = ds.session.sandbox ?? ds.initConfig?.sandbox ?? cfg.sandbox;
     return ds.session.status === 'active'
-      && (ds.session.cliId ?? cfg.cliId) === 'antigravity'
+      && ['antigravity', 'codex'].includes(ds.session.cliId ?? cfg.cliId)
       && ds.session.backendType === 'tmux'
       && !ds.session.adoptedFrom && !ds.initConfig?.adoptMode
       && typeof ds.session.cliSessionId === 'string' && !!ds.session.cliSessionId
@@ -243,7 +244,7 @@ function settleSupersededState(ds: DaemonSession, state: CotState): void {
 // created by the previous generation would spin on「执行中」forever (its
 // turn_terminal lands in a process that no longer knows the cot_id). So every
 // created bubble leaves a tiny marker file until it settles; the next daemon
-// generation resumes v2 markers for the exact persistent agy task, and closes
+// generation resumes v2 markers for the exact persistent native task, and closes
 // other leftovers. UI delivery failures never settle the business turn.
 
 function cotOrphanDir(): string {
@@ -480,6 +481,31 @@ export function resumeCotMessage(ds: DaemonSession, binding?: { turnId: string; 
 function clearCotOrphanMarker(state: CotState): void {
   if (!state.cotId || state.retainOrphanMarker) return;
   try { unlinkSync(join(cotOrphanDir(), `${state.cotId}.json`)); } catch { /* already gone */ }
+}
+
+/** Do not publish a terminal that recovery would later mistake for live work.
+ * A transient disk error keeps one retry while the owning process survives. */
+function checkpointCotTerminal(ds: DaemonSession, state: CotState): boolean {
+  if (recordCotOrphanMarker(ds, state) || !state.recovery || !state.cotId) {
+    if (state.terminalCheckpointRetry) clearTimeout(state.terminalCheckpointRetry);
+    state.terminalCheckpointRetry = undefined;
+    return true;
+  }
+  if (!recoveryIdentityMatches(ds, state.recovery)) return false;
+  if (!state.terminalCheckpointRetry) {
+    state.terminalCheckpointRetry = setTimeout(() => {
+      state.terminalCheckpointRetry = undefined;
+      if (state.settled) return;
+      if (!checkpointCotTerminal(ds, state)) return;
+      state.pausedForRestore = false;
+      if (state.disabled) {
+        state.settled = true;
+        void completeAndClear(ds, state, state.finishStatus === 'done' ? 'done' : 'error');
+      } else void pump(ds, state);
+    }, 1000);
+    state.terminalCheckpointRetry.unref?.();
+  }
+  return false;
 }
 
 /**
@@ -804,6 +830,10 @@ async function apiComplete(ds: DaemonSession, state: CotState, reason: 'done' | 
 
 /** Remove a recovery marker only after a confirmed completion response. */
 async function completeAndClear(ds: DaemonSession, state: CotState, reason: 'done' | 'error'): Promise<void> {
+  if (state.finishStatus && !checkpointCotTerminal(ds, state)) {
+    state.settled = false;
+    return;
+  }
   try {
     await apiComplete(ds, state, reason);
     clearCotOrphanMarker(state);
@@ -1078,6 +1108,7 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
         continue; // re-check for newer entries queued during the push
       }
       if (state.finishStatus && !state.settled) {
+        if (!checkpointCotTerminal(ds, state)) break;
         const terminalEvents = [
           ...(state.workerDisconnected
             ? interruptedNoticeEvents(ds.larkAppId, state.lastReasoningId, 'cot.worker_disconnected') : []),
@@ -1113,7 +1144,7 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
       resumeCotMessage(ds);
     }
     // Work queued while we were failing/finishing a batch above.
-    if (!state.disabled && !state.pausedForRestore && (state.pendingEntries !== undefined || (state.finishStatus && !state.settled))) {
+    if (!state.disabled && !state.pausedForRestore && !state.terminalCheckpointRetry && (state.pendingEntries !== undefined || (state.finishStatus && !state.settled))) {
       void pump(ds, state);
     }
   }
@@ -1269,7 +1300,7 @@ export async function settleCotMessageForShutdown(ds: DaemonSession): Promise<vo
 }
 
 /**
- * Worker loss pauses a surviving agy/tmux stream for adoption. Other backends
+ * Worker loss pauses a surviving native/tmux stream for adoption. Other backends
  * keep their legacy best-effort close when no turn_terminal was delivered.
  * Idempotent; no-op when nothing is live.
  */
@@ -1336,7 +1367,7 @@ export function finalizeCotMessage(
   if (state.settled) return true;
   if (!state.finishStatus) state.finishStatus = status === 'completed' ? 'done' : 'interrupted';
   state.pausedForRestore = false;
-  recordCotOrphanMarker(ds, state);
+  if (!checkpointCotTerminal(ds, state)) return true;
   if (state.disabled) {
     // A mid-turn push failure left the bubble unfinished (disabled before
     // finishStatus was set). Close it here rather than letting it spin until

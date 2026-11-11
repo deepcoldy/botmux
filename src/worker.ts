@@ -14552,7 +14552,20 @@ function drainReliableTerminalBeforeInterrupt(): void {
 }
 
 function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
-  const ready = settledQuotaTurns ?? codexBridgeQueue.drainEmittable().filter(turn => !recoverTraexQuotaTurn(turn));
+  let ready = settledQuotaTurns ?? codexBridgeQueue.drainEmittable().filter(turn => !recoverTraexQuotaTurn(turn));
+  if (workerSessionEventScope) {
+    // A stale journal can contain an already-settled predecessor that cannot
+    // receive an observer grant. Retire only that proven, unowned attempt;
+    // owned output retries and unresolved executions keep their delivery path.
+    ready = ready.filter(turn => workerSessionEventScope!.ownsExecutionEvent(turn.turnId, turn.dispatchAttempt)
+      || !workerSessionEventScope!.isExecutionSettled(turn.turnId, turn.dispatchAttempt));
+  }
+  // Restored transcript terminals can precede the host's observer grant. Keep
+  // them queued until the exact execution origin is confirmed, then redrive.
+  if (workerSessionEventScope && ready.some(turn => !workerSessionEventScope!.ownsExecutionEvent(turn.turnId, turn.dispatchAttempt))) {
+    codexBridgeQueue.restoreDrained(ready);
+    return;
+  }
   if (!universalOutputHandoff) { checkpointCodexAdoptRecovery(); checkpointStructuredBridgeRecovery(); }
   if (ready.length === 0) return;
   if (!codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined)) {
@@ -34974,6 +34987,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         log(`Daemon retired runtime binding ${msg.bindingId} (mayExecute=false); closing the transcript bridge and the CLI backend`);
         closeRequested = true; stopBridgeWatcher(); stopScreenshotLoop(); killCli();
       } else if (continuation) void flushPending();
+      if (msg.mayExecute && msg.observedExecutions?.length) codexBridgeDrainAndMaybeEmit();
       break;
     }
 

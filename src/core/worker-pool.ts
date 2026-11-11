@@ -191,7 +191,7 @@ import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
 import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, abortCotMessage, resumeCotMessage } from '../im/lark/cot-message.js';
-import { retireReplyCardDisplay, replyCardDispatchAttempt, updateReplyCardNativeThinking, replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
+import { retireReplyCardDisplay, settleTurnReplyCardTerminal, replyCardDispatchAttempt, updateReplyCardNativeThinking, replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
 import { ReplyCardWithdrawnError } from '../services/turn-reply-card.js';
 import { readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
@@ -22050,17 +22050,10 @@ function setupWorkerHandlers(
         // post-terminal summon would create a bubble nobody ever finishes).
         if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt) && replyCardModeFor(ds, msg.turnId) !== 'legacy') {
           if (ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
-          void (async () => {
-            await flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
-              logger.warn(`[${t}] reply-card final tool flush: ${error.message}`);
-            });
-            await updateTurnReplyCard(ds, msg.turnId, {
-              kind: 'terminal', phase: msg.status, durationMs: msg.durationMs, completedAtMs: msg.completedAtMs,
-            }, (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }),
-            { dispatchAttempt: msg.dispatchAttempt, owns: ownsLifecycleMutation });
-          })().catch(error => logger.warn(`[${t}] reply-card terminal: ${error.message}`));
-        }
-        finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
+          void settleTurnReplyCardTerminal(ds, msg,
+            (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }), ownsLifecycleMutation)
+            .catch(error => logger.warn(`[${t}] reply-card terminal: ${error.message}`));
+        } else finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
         ds.cotForced = undefined;
         ds.lastThinkingUpdate = undefined;
         // 「执行失败」只在下一条 IM 消息入轮时清（beginNewTurn / 输入提交）。在
@@ -23093,6 +23086,13 @@ function setupWorkerHandlers(
         else {
           const runtime = sessionController.bindRuntime(msg.bindingId, contractWorker, msg.identity, msg.operationId, msg.continuesBindingId);
           const observedExecutions: NonNullable<Extract<DaemonToWorker, { type: 'runtime_contract_assigned' }>['observedExecutions']> = [];
+          if ((ds.initConfig?.cliId ?? ds.session.cliId) === 'codex' && runtime.identity?.backend === 'tmux') {
+            for (const execution of sessionController.store.executions(sessionController.ref)) {
+              if (execution.runtime && sessionController.store.authorizeExecutionObserver(sessionController.ref, contractWorker, execution.ref)) {
+                observedExecutions.push({ runtime: execution.runtime, execution: execution.ref });
+              }
+            }
+          }
           if (isCodexAppCliId(ds.initConfig?.cliId ?? ds.session.cliId)) {
             for (const entry of ds.session.codexAppDispatchLedger ?? []) {
               if (entry.state !== 'prepared') continue;
@@ -23185,7 +23185,18 @@ function setupWorkerHandlers(
       if (!recoveredOrigin) msg = { ...msg, sessionOutputOrigin: admission.context };
     }
     if (admission.kind === 'historical') {
-      if (msg.type === 'turn_terminal') await cb.onTurnTerminal?.(ds, msg, { workerGeneration: metadata!.producer.generation });
+      if (msg.type === 'turn_terminal') {
+        // Proven historical terminal facts may settle only their own display;
+        // they must never drive the replacement runtime's readiness or queue.
+        const ownsDisplay = () => ownsWorkerSession() && !isSessionTransferring(ds);
+        const turnId = msg.turnId;
+        if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+          await settleTurnReplyCardTerminal(ds, msg,
+            (body, type, uuid, beforeWrite) => scopedReply(body, type, turnId, { uuid, beforeWrite }), ownsDisplay)
+            .catch(error => logger.warn(`[${t}] historical reply-card terminal: ${error.message}`));
+        }
+        await cb.onTurnTerminal?.(ds, msg, { workerGeneration: metadata!.producer.generation });
+      }
       if (msg.type === 'final_output') await sessionController.run(admission, () => handleLegacyWorkerMessage(msg));
     } else {
       if (msg.type === 'final_output') msg = { ...msg, sessionOutputOrigin: msg.sessionOutputOrigin ?? admission.context };
