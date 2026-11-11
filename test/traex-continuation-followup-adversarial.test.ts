@@ -100,9 +100,11 @@ function fixture(mode: 'planned' | 'approved' | 'unreserved' = 'approved', appId
   const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', env);
   const receive = loadWorkerMessageHandler('runtime_contract_assigned', env);
   const receiveFailureAck = loadWorkerMessageHandler('continuation_failure_ack', env);
+  const receiveAbortAck = loadWorkerMessageHandler('runtime_binding_aborted_ack', env);
   const child = { send: vi.fn((message: any) => {
     if (message.type === 'runtime_contract_assigned') inflight.push(receive(message).catch(error => { errors.push(error); }));
     if (message.type === 'continuation_failure_ack') inflight.push(receiveFailureAck(message).catch(error => { errors.push(error); }));
+    if (message.type === 'runtime_binding_aborted_ack') inflight.push(receiveAbortAck(message).catch(error => { errors.push(error); }));
   }) };
   ds.worker = child as any;
   const hostEnv: Record<string, any> = {
@@ -405,6 +407,40 @@ describe('independent continuation follow-up adversarial probes', () => {
     const admitted = state.controller.ingest(state.failure(enriched.bindingId), state.worker);
     expect(admitted.kind === 'reject').toBe(consumed);
     expect(state.store.execution(state.ref, state.execution.executionId)?.phase).toBe(consumed ? 'accepted' : 'failed');
+  });
+
+  it('confirms the abort of a refused continuation reservation so the surviving worker stops reporting it', async () => {
+    vi.useFakeTimers();
+    // The host refused the reservation before creating a binding; the worker
+    // survives and reports the abandoned start like any other aborted start.
+    const state = fixture('unreserved');
+    expect(state.store.binding(state.ref, state.replacement.bindingId)).toBeUndefined();
+    const aborts = () => state.sent.filter(message => message.type === 'runtime_binding_aborted'
+      && message.bindingId === state.replacement.bindingId);
+    state.scope.reportAbortedStart(state.replacement, () => state.env.send({
+      type: 'runtime_binding_aborted', bindingId: state.replacement.bindingId,
+    }));
+    await state.settle();
+    await vi.advanceTimersByTimeAsync(5_100);
+    await state.settle();
+    expect(state.errors).toEqual([]);
+    expect(state.child.send).toHaveBeenCalledWith({ type: 'runtime_binding_aborted_ack', bindingId: state.replacement.bindingId });
+    expect(aborts()).toHaveLength(1);
+    expect(state.store.binding(state.ref, state.replacement.bindingId)).toBeUndefined();
+  });
+
+  it('still refuses to confirm an abort report for a runtime bound to a real process', async () => {
+    vi.useFakeTimers();
+    const state = fixture('approved');
+    const bound = state.store.binding(state.ref, state.replacement.bindingId);
+    expect(bound?.identity).toBeDefined();
+    state.scope.run(state.replacement, () => state.env.send({
+      type: 'runtime_binding_aborted', bindingId: state.replacement.bindingId,
+    }));
+    await state.settle();
+    expect(state.errors).toEqual([]);
+    expect(state.child.send).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'runtime_binding_aborted_ack' }));
+    expect(state.store.binding(state.ref, state.replacement.bindingId)).toEqual(bound);
   });
 
   it('keeps consumption durable on the original approved binding', () => {

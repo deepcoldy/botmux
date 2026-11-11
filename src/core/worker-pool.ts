@@ -23108,7 +23108,11 @@ function setupWorkerHandlers(
               && (!state.activeOperationId || state.activeOperationId === msg.operationId) });
         }
         else if (msg.type === 'runtime_binding_aborted') {
-          if (!sessionController.abandonBinding(msg.bindingId, contractWorker, metadata!.eventId)) return;
+          // A refused reservation (e.g. a TraeX continuation the contract could
+          // not plan) rolled back without creating a binding. Nothing remains to
+          // abandon, but the surviving worker re-reports until it is confirmed.
+          const reserved = !!sessionController.store.binding(sessionController.ref, msg.bindingId);
+          if (reserved && !sessionController.abandonBinding(msg.bindingId, contractWorker, metadata!.eventId)) return;
           await sessionController.flushPrimary();
           if (ds.worker !== worker || !sameWorker(sessionController.store.read(sessionController.ref)!.worker, contractWorker)) return;
           worker.send({ type: 'runtime_binding_aborted_ack', bindingId: msg.bindingId });
