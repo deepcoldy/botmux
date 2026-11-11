@@ -411,7 +411,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   },
   {
     key: 'ai.send.after_success_progress', block: 'send_feedback', stage: 'send', kind: 'editable',
-    label: '进度发送成功回显（继续任务）',
+    label: '进度发送成功回显（未标记 final）',
   },
   {
     key: 'ai.send.after_success_auxiliary', block: 'send_feedback', stage: 'send', kind: 'editable',

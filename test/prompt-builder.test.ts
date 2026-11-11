@@ -607,7 +607,7 @@ describe('buildFollowUpContent', () => {
     // every follow-up reminder intentionally tiny. By default (experimental
     // anti-resend toggle OFF) it carries the final-delivery requirement without
     // the additional unknown-send reconciliation clause.
-    expect(content).toContain('<botmux_reminder>需要回复的请求，结束前必须用 botmux send --response-kind final 交付结果或具体阻碍并核验成功；查询完成、发过进度不等于交付。已交付勿重发；只有本轮明确允许静默时才可不发送而输出 BOTMUX_NOTHING_TO_SEND。</botmux_reminder>');
+    expect(content).toContain(`<botmux_reminder>${t('ai.followup.reminder', undefined, 'zh')}</botmux_reminder>`);
     expect(content).not.toContain('别因「无输出」提示重发');
     expect(content).not.toContain('JSON.stringify');
     expect(content).not.toContain('botmux skill show botmux-send');
@@ -618,8 +618,7 @@ describe('buildFollowUpContent', () => {
     try {
       const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'codex' });
       // ON variant keeps permitted silence and qualifies no-resend by final delivery.
-      expect(content).toContain('只有本轮明确允许静默时才可不发送而输出 BOTMUX_NOTHING_TO_SEND');
-      expect(content).toMatch(/<botmux_reminder>[^<]*最终答复已成功交付时[^<]*不要重复发送[^<]*<\/botmux_reminder>/);
+      expect(content).toContain(`<botmux_reminder>${t('ai.followup.reminder_no_resend', undefined, 'zh')}</botmux_reminder>`);
     } finally {
       delete (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint;
     }
@@ -634,7 +633,7 @@ describe('buildFollowUpContent', () => {
     // the same final-delivery and permitted-silence contract as codex/traex.
     const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'hermes' });
 
-    expect(content).toContain('<botmux_reminder>需要回复的请求，结束前必须用 botmux send --response-kind final 交付结果或具体阻碍并核验成功；查询完成、发过进度不等于交付。已交付勿重发；只有本轮明确允许静默时才可不发送而输出 BOTMUX_NOTHING_TO_SEND。</botmux_reminder>');
+    expect(content).toContain(`<botmux_reminder>${t('ai.followup.reminder', undefined, 'zh')}</botmux_reminder>`);
     expect(content).not.toContain('普通文字回复不要调用 `botmux send`');
     expect(content).not.toContain('直接把给用户看的答案写在 final');
   });
@@ -646,8 +645,7 @@ describe('buildFollowUpContent', () => {
     (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint = true;
     try {
       const content = buildFollowUpContent('hello', SESSION_ID, { cliId: 'hermes' });
-      expect(content).toContain('只有本轮明确允许静默时才可不发送而输出 BOTMUX_NOTHING_TO_SEND');
-      expect(content).toMatch(/<botmux_reminder>[^<]*最终答复已成功交付时[^<]*不要重复发送[^<]*<\/botmux_reminder>/);
+      expect(content).toContain(`<botmux_reminder>${t('ai.followup.reminder_no_resend', undefined, 'zh')}</botmux_reminder>`);
     } finally {
       delete (config as { noVisibleOutputHint?: boolean }).noVisibleOutputHint;
     }
