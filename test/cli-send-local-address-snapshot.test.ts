@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { spawnSyncTsScript } from './helpers/ts-runner.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
 
@@ -49,5 +50,55 @@ describe('botmux send in an env-only (remote) session', () => {
     expect(result.status, result.stderr).toBe(0);
     expect(sent).toContain('/opt/app/logs/error.log');
     expect(sent).toContain('http://localhost:3000/health');
+  });
+});
+
+// Any sandboxed session of a bot leaves its send-cred file in BOT_HOME, and
+// `botmux send` then registers the bot from it. In a host session bots.json is
+// still readable and is the live setting; only an isolated sandbox, where it is
+// denied, falls back to the worker's snapshot.
+describe('botmux send for a bot that has a send-cred file', () => {
+  function send(opts: { botsJson: 'on' | 'off' | 'missing'; snapshot: '1' | '0' | undefined }) {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-cred-local-address-'));
+    try {
+      const dataDir = join(root, 'data');
+      const botsPath = join(root, 'bots.json');
+      if (opts.botsJson !== 'missing') {
+        writeFileSync(botsPath, JSON.stringify([{ larkAppId: 'cli_cred', larkAppSecret: 'secret', cliId: 'claude-code',
+          replyCardMode: 'legacy', ...(opts.botsJson === 'on' ? { hideLocalAddresses: true } : {}) }]));
+      }
+      mkdirSync(join(root, 'bots', 'cli_cred'), { recursive: true });
+      writeFileSync(join(root, 'bots', 'cli_cred', 'send-cred.json'), JSON.stringify({ larkAppId: 'cli_cred', larkAppSecret: 'secret' }));
+      seedPersistedSessionRows(dataDir, 'cli_cred', { sid_cred: {
+        sessionId: 'sid_cred', larkAppId: 'cli_cred', status: 'active', cliId: 'claude-code', chatId: 'oc_cred',
+        rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root,
+      } });
+      const result = spawnSyncTsScript(fixture, ['send', '--no-mention', '--response-kind', 'progress',
+        '日志在 /opt/app/logs/error.log，服务 http://localhost:3000/health'], {
+        cwd: process.cwd(), encoding: 'utf8', timeout: 30_000,
+        env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: botsPath,
+          BOTMUX_SESSION_ID: 'sid_cred', BOTMUX_TURN_ID: 'om_turn', BOTMUX_LARK_APP_ID: 'cli_cred', BOTMUX_DAEMON_IPC_PORT: '49501',
+          ...(opts.snapshot === undefined ? {} : { BOTMUX_HIDE_LOCAL_ADDRESSES: opts.snapshot }) },
+      });
+      const sent = String(result.stdout).split('\n').filter(line => line.startsWith('CAPTURE_REPLY='))
+        .map(line => JSON.stringify(JSON.parse(line.slice('CAPTURE_REPLY='.length)).body)).join('\n');
+      return { result, sent };
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+  const replaced = (sent: string) => !sent.includes('/opt/app/logs') && !sent.includes('localhost:3000');
+
+  it.each([
+    ['bots.json on, snapshot off', { botsJson: 'on', snapshot: '0' }, true],
+    ['bots.json on, pane from before the snapshot existed', { botsJson: 'on', snapshot: undefined }, true],
+    ['bots.json off, snapshot on', { botsJson: 'off', snapshot: '1' }, false],
+    ['sandbox (bots.json out of reach), snapshot on', { botsJson: 'missing', snapshot: '1' }, true],
+    ['sandbox (bots.json out of reach), snapshot off', { botsJson: 'missing', snapshot: '0' }, false],
+  ] as const)('%s', (_label, opts, expectReplaced) => {
+    const { result, sent } = send(opts);
+    expect(result.status, String(result.stderr)).toBe(0);
+    expect(sent).toContain('日志在');
+    expect(replaced(sent)).toBe(expectReplaced);
   });
 });

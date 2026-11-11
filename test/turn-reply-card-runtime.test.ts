@@ -132,6 +132,74 @@ describe('reply-card runtime eligibility and recovery', () => {
     }
   });
 
+  // A model card accepted while the bot had hideLocalAddresses off keeps its
+  // link fields when the card is rendered again after the switch is turned on;
+  // prose follows the switch from then on. Otherwise the turn never settles.
+  describe('hideLocalAddresses turned on while a turn is in flight', () => {
+    const localButton = 'http://127.0.0.1:3000/report';
+    const prose = '报告见 /custom/project/out/report.html';
+    const explicitCard = JSON.stringify({ schema: '2.0', body: { elements: [
+      { tag: 'markdown', content: prose },
+      { tag: 'button', text: { tag: 'plain_text', content: '打开报告' }, behaviors: [{ type: 'open_url', default_url: localButton }] },
+    ] } });
+    let on = false;
+    let restore: () => void = () => {};
+    beforeEach(() => { on = false; restore = setHideLocalAddressesResolver(() => on); });
+    afterEach(() => restore());
+    const keyOf = (ds: DaemonSession) => ({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' });
+
+    it('settles the terminal update, keeping the accepted button and rewriting prose', async () => {
+      const ds = session({ workingDir: '/custom/project' });
+      const send = vi.fn(async (_body: string) => 'om_card');
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: prose, source: 'explicit', card: explicitCard }, send);
+      on = true;
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase: 'completed' }, send);
+      const record = new TurnReplyCardStore(dir).read(keyOf(ds))!;
+      expect(record).toMatchObject({ phase: 'completed', finalDelivered: true });
+      expect(record.publishPending).toBeFalsy();
+      const last = vi.mocked(updateMessage).mock.calls.at(-1)![2] as string;
+      expect(last).toContain(localButton);
+      expect(last).not.toContain('/custom/project/out');
+    });
+
+    it('lets a restart re-render the interrupted card', async () => {
+      const ds = session({ workingDir: '/custom/project' });
+      const send = vi.fn(async (_body: string) => 'om_card');
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: prose, source: 'explicit', card: explicitCard }, send);
+      on = true;
+      const store = new TurnReplyCardStore(dir);
+      const record = store.read(keyOf(ds))!;
+      record.createdAtMs = record.updatedAtMs = 1;
+      writeFileSync(join(store.directory, `${store.id(keyOf(ds))}.json`), JSON.stringify(record));
+      vi.mocked(updateMessage).mockClear();
+      await sweepInterruptedReplyCards(ds.larkAppId);
+      expect(updateMessage).toHaveBeenCalledOnce();
+      expect(vi.mocked(updateMessage).mock.calls[0]![2]).toContain(localButton);
+      expect(store.read(keyOf(ds))?.publishPending).toBeFalsy();
+    });
+
+    it('retries an unacknowledged first send after the switch is turned on during the backoff', async () => {
+      const ds = session({ workingDir: '/custom/project' });
+      const uuids: string[] = [];
+      let first = true;
+      const send = vi.fn(async (_body: string, _type: string, uuid?: string) => {
+        uuids.push(uuid!);
+        if (first) {
+          first = false;
+          on = true; // turned on while the result of the first POST is unknown
+          throw new Error('socket hang up');
+        }
+        return 'om_card';
+      });
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: prose, source: 'explicit', card: explicitCard }, send as any);
+      expect(send).toHaveBeenCalledTimes(2);
+      expect(new Set(uuids).size).toBe(1);
+      expect(new TurnReplyCardStore(dir).read(keyOf(ds))).toMatchObject({ messageId: 'om_card', finalDelivered: true });
+    });
+  });
+
   it.each(['disconnect', 'restart'] as const)('removes local addresses when a %s re-renders the reply card', async how => {
     const ds = session({ workingDir: '/custom/project' });
     const send = vi.fn(async (_body: string) => 'om_reply');

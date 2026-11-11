@@ -627,7 +627,7 @@ When off (the default), replies and cards are sent as written and no related rul
 - Before model output reaches Feishu (`botmux send`, the automatically forwarded final answer, unified reply cards, native thinking messages and document comment replies), absolute host paths, local schemes such as `file://` and local service addresses are replaced: source files under the working directory become repository-relative paths, everything else becomes an internal-file label, and skill links keep only their name. System paths that name no user file, such as `/dev/null` and `/proc`, stay.
 - The system prompt gets the full rule once per session and every turn's reminder gets one sentence, asking the model to leave such addresses out and deliver files as attachments or reachable links.
 - A card whose button or link points at this host is refused and the model gets `LOCAL_ADDRESS_OUTBOUND_REJECTED`; botmux's own Web terminal and Dashboard links are sent as usual.
-- Reply processing and the per-turn reminder apply immediately; the full rule in the system prompt applies from the next session (or when the session's worker is started again).
+- Reply processing and the per-turn reminder apply immediately; the full rule in the system prompt applies from the next new session.
 - The Dashboard switch "Bot Config → Message Cards → Development host addresses" writes this field.
 
 ### Zero prompt injection (`promptInjection: "none"`)

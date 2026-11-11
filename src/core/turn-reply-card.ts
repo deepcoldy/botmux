@@ -276,7 +276,11 @@ export async function updateTurnReplyCard(
   } satisfies import('../services/turn-reply-card.js').TurnReplyCardTransport;
   for (let attempt = 0; ; attempt++) {
     try {
-      const delivered = await store.update(key, event, transport);
+      // A model card already accepted for this turn keeps its own link fields
+      // when the card is rendered again, even if the bot turned
+      // hideLocalAddresses on since; otherwise the turn could never settle.
+      const delivered = await replayVettedBody([store.read(key)?.finalCard, event.kind === 'final' ? event.card : undefined],
+        'interactive', () => store.update(key, event, transport));
       const complete = event.kind === 'final' && event.source === 'bridge'
         && delivered.record.finalSource === 'bridge' && delivered.record.finalText === event.text
         && delivered.record.finalDelivered && !!delivered.messageId
@@ -425,7 +429,8 @@ async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: im
   };
   // The record keeps the agent's raw text; a re-render is model output entering again.
   const localContext = localAddressContextForBot(record.larkAppId, workingDir);
-  await store.update(record, { kind: 'recover', beforeMs, orphanAskIds }, {
+  // The accepted model card keeps its link fields on re-render (see updateTurnReplyCard).
+  await replayVettedBody([record.finalCard], 'interactive', () => store.update(record, { kind: 'recover', beforeMs, orphanAskIds }, {
     beforeEffect,
     send: async () => { throw new Error('Recovery may only update an existing reply card'); },
     // The persisted pendingPatch was vetted before this restart.
@@ -448,7 +453,7 @@ async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: im
       ...replyCardPresentation(getBot(record.larkAppId).config, record.chatId),
       locale: localeForBot(record.larkAppId), canStop: false,
     }), 'interactive', localContext),
-  });
+  }));
 }
 
 /** Like the CoT orphan sweep: recover only this bot's previously visible cards. */

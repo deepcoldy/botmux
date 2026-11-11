@@ -68,9 +68,15 @@ export function sendableCardLink(url: string, appId: string): boolean {
   }
 }
 
-/** Sends again a body that passed the policy before it was persisted for
- * replay. Its own local link fields stay trusted for this send, so a frozen
- * body is not re-judged against a Dashboard port or host that changed since. */
-export function replayVettedBody<T>(content: string, msgType: string, send: () => T): T {
-  return vettedReplay.run(new Set(localJumpTargets(content, msgType)), send);
+/** Sends again a body that was persisted for replay after it entered under the
+ * bot's policy at that time. Its own local link fields stay trusted for this
+ * send, so a frozen body is not re-judged against a Dashboard port or host that
+ * changed since, nor against hideLocalAddresses turned on after it was accepted.
+ * Prose is still processed under the current setting. */
+export function replayVettedBody<T>(content: string | readonly (string | undefined)[], msgType: string, send: () => T): T {
+  const trusted = new Set<string>();
+  for (const body of typeof content === 'string' ? [content] : content) {
+    if (body) for (const target of localJumpTargets(body, msgType)) trusted.add(target);
+  }
+  return vettedReplay.run(trusted, send);
 }

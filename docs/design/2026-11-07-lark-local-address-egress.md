@@ -20,7 +20,9 @@
 - 仓库里与回复展示、提示词相关的开关都是 bot 级（`senderTag`、`replyStyle`、`cotEnabled`、答复卡页脚等）。同一台机器上常同时有只给自己用的 bot 和给别人用的 bot，各入口本来也按 bot 取上下文（`localAddressContextForBot`）。
 - 链接字段拒发、正文替换和两条提示规则防的是同一件事：发出别人打不开的本机地址。链接字段检查不是凭据防线，宿主带能力参数的终端和 Dashboard 链接本来就按形状放行。只开其中一部分没有对应的使用场景：只拒发按钮时，正文里的 markdown 本机链接照样能点；只提示不替换就少了兜底。所以由一个开关一起控制。
 
-生效时机：模型输出入口和飞书发送层每次发送都读当前配置，Dashboard 或 `/botconfig` 改完从下一条消息起生效；每轮提示从下一轮起生效；系统提示（或首轮 Shell 提示）里的完整规则在会话 worker 拉起时读取，对新会话或重新拉起 worker 的会话生效。`botmux send` 在宿主上先读已加载的注册表，再读 bots.json；沙盒里读不到 bots.json 时，用 worker 拉起时写进会话环境的快照 `BOTMUX_HIDE_LOCAL_ADDRESSES`，Riff / Mojo 远端会话同理。开关只由 bot 层判定（`src/im/lark/local-address-switch.ts`），策略模块收到关闭的上下文时原样返回输入。
+生效时机：模型输出入口和飞书发送层每次发送都读当前配置，Dashboard 或 `/botconfig` 改完从下一条消息起生效；每轮提示从下一轮起生效；系统提示（或首轮 Shell 提示）里的完整规则在会话 CLI 启动时写入，对新会话（或 CLI 重新启动后）生效，tmux 重新接上的旧 pane 不会刷新。`botmux send` 在宿主上读已加载的注册表或 bots.json——即使这个 bot 以前的沙盒会话在 BOT_HOME 留下了发送凭据文件；只有读不到 bots.json 的沙盒里才用 CLI 启动时写进会话环境的快照 `BOTMUX_HIDE_LOCAL_ADDRESSES`，Riff / Mojo 远端会话的 bots.json 可能是旧副本，同样以快照为准。开关只由 bot 层判定（`src/im/lark/local-address-switch.ts`），策略模块收到关闭的上下文时原样返回输入。
+
+一轮进行中切换开关时，已经接受的模型卡片（显式 final 的卡片 JSON）重新渲染、重试或重启结算时沿用它自带的链接字段，正文按切换后的设置处理；自动 final 的冻结正文同理按下文「重放」沿用。否则开关关闭时接受的本机按钮会在打开后被反复拒发，这一轮无法结算。
 
 ## 处理规则
 
