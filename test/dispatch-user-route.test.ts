@@ -164,6 +164,22 @@ describe('dispatch user IPC end-to-end identity binding', () => {
       tools: ['lark-cli', 'bytedcli'] });
     expect(scheduleCreateCapabilities((await read())!.authority)).toEqual([]);
   });
+  it('keeps an administrator\'s default schedule grant alongside dispatch-only tools', async () => {
+    const h = harness();
+    h.ds.chatId = 'oc_target';
+    h.scope.getBot = () => ({ config: { triggerUserAuth: {
+      enabled: true, tools: [], dispatchOnly,
+    } } });
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: {
+      createEnabled: true, defaultOnDispatchFromBotAppIds: ['cli_source'],
+    } });
+    expect((await h.run()).status).toBe(200);
+    const authority = (await read())?.authority;
+    expect(authority).toMatchObject({ openId: 'ou_alice', tools: ['bytedcli'] });
+    expect(scheduleCreateCapabilities(authority!)).toEqual([
+      expect.objectContaining({ action: 'schedule:create', targetAppId: 'cli_target' }),
+    ]);
+  });
   it.each(['source-chat', 'target-chat', 'target-app', 'mixed-target', 'bot', 'recovered-caller', 'inherited'])(
     'does not add dispatch-only credentials for %s', async scenario => {
       const h = harness();

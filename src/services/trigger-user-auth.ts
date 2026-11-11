@@ -360,11 +360,12 @@ export function triggerUserAuthApplies(
   return !!config?.enabled && config.tools.includes(tool);
 }
 
-/** Whether a `--mention` handoff from this bot carries the turn's sender to a
- *  bot on the same machine. Needs the policy itself to be on: a bot that does
- *  not run its own tools as the sender has no verified sender to hand over. */
+/** Whether a `--mention` handoff from this bot can carry the turn's sender to
+ *  a bot on the same machine. Dispatch-only tools can establish this boundary
+ *  even when the source bot governs none of its own CLI tools. */
 export function delegatesOnMention(
   config: TriggerUserAuthConfig | null | undefined,
 ): boolean {
-  return !!config?.enabled && config.tools.length > 0 && config.delegateOnMention !== false;
+  return !!config?.enabled && (config.tools.length > 0 || !!config.dispatchOnly)
+    && config.delegateOnMention !== false;
 }

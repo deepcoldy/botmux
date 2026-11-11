@@ -118,6 +118,13 @@ describe('mention handoff: prepare', () => {
     expect(readPendingDispatchUser(dataDir, secret, prepared.value.deliveryId)?.authority.tools)
       .toEqual(['lark-cli', 'bytedcli']);
   });
+  it('hands off dispatch-only tools when the source bot governs no CLI tools', async () => {
+    const h = harness({ triggerUserAuth: { ...scoped, tools: [] } });
+    const prepared = await h.prepare();
+    expect(prepared.value.delegated).toBe(true);
+    expect(readPendingDispatchUser(dataDir, secret, prepared.value.deliveryId)?.authority.tools)
+      .toEqual(['bytedcli']);
+  });
   it.each(['bot', 'scheduled', 'other-target', 'mixed-target', 'recovery', 'inherited'])(
     'does not add scoped tools to a %s mention', async scenario => {
       const h = harness({ triggerUserAuth: scoped });
