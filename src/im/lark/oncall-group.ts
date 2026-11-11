@@ -3,7 +3,7 @@ import { readOncallPresetOptions } from '../../services/oncall-preset-options.js
 import { getBot } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
-import { OncallGroupStore, oncallHandoffWorkPending, pendingOncallMessageIds, type OncallGroupSource } from '../../services/oncall-group-store.js';
+import { OncallGroupStore, oncallForwardingPending, pendingOncallMessageIds, type OncallGroupSource } from '../../services/oncall-group-store.js';
 import { oncallGroupEnabled, type OncallGroupPolicy, type OncallForwardMode } from '../../services/oncall-group-policy.js';
 import { createOncallGroup, loadOncallGroupTarget, OncallGroupApiError } from '../../services/oncall-group-client.js';
 import { getMessageDetail, replyMessage } from './client.js';
@@ -697,9 +697,9 @@ export async function retryPendingOncallHandoffs(appId: string, owns: () => bool
     try {
       if (!waiting) await prepareOncallGroupInvite(source).catch(() => { inviteFailed = true; });
       // Backfill old invite buttons without re-opening the expired handoff window,
-      // and without a membership check when only the invitation is missing.
+      // and check membership only when conversation forwarding is still owed.
       const current = store.getRequest(source);
-      if (handoffOpen && current && oncallHandoffWorkPending(current)) {
+      if (handoffOpen && current && oncallForwardingPending(current)) {
         await forwardOncallConversation(source, () => owns() && oncallGroupEnabled(getBot(appId).config.oncallGroup, source.chatId));
       }
       if (JSON.stringify(store.getRequest(source)) !== before || store.getRequest(source)?.cardRefreshPending) {

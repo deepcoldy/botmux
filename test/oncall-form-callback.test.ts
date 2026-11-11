@@ -658,7 +658,7 @@ describe('public entry to a created Oncall group', () => {
     groups.claim(source,'ou_owner',{messageIds:['om_question'],cutoffMs:Date.now(),forwardMode:'individual'});
     groups.finish(source,{status:'succeeded',openChatId:'oc_created',forwarded:['om_question']},groups.getRequest(source)!.attemptId);
     groups.markCardsRefreshed(source,groups.getRequest(source)!);
-    mocks.bot.config.oncallGroup.enabled=false;mocks.invite.mockRejectedValue(Error('share disabled'));
+    mocks.invite.mockRejectedValue(Error('share disabled'));
     const start=Date.now();const clock=vi.spyOn(Date,'now');
     try {
       for(let ms=0;ms<=10*60_000;ms+=5_000){clock.mockReturnValue(start+ms);await retryPendingOncallHandoffs('app');}
@@ -684,6 +684,22 @@ describe('public entry to a created Oncall group', () => {
     await retryPendingOncallHandoffs('app');
     expect(mocks.invite.mock.calls.length).toBeGreaterThan(before);
     expect(groups.getRequest(source)?.inviteLink).toContain('add_by_link');
+  });
+  it('backs off the invitation with Oncall disabled too',async()=>{
+    seedWithoutInvite();mocks.bot.config.oncallGroup.enabled=false;mocks.invite.mockRejectedValue(Error('share disabled'));
+    for(let i=0;i<12;i++) await retryPendingOncallHandoffs('app');
+    expect(mocks.invite.mock.calls.length).toBeLessThan(3);
+  });
+  it('refreshes a pending card inside the window without checking membership when nothing is left to forward',async()=>{
+    const groups=new OncallGroupStore(dir);
+    groups.claim(source,'ou_owner',{messageIds:['om_question'],cutoffMs:Date.now(),forwardMode:'individual'});
+    groups.finish(source,{status:'succeeded',openChatId:'oc_created',forwarded:['om_question'],inviteLink:'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=invite-oc_created'},groups.getRequest(source)!.attemptId);
+    mocks.update.mockRejectedValueOnce(Error('PATCH unavailable'));
+    await retryPendingOncallHandoffs('app');
+    expect(groups.getRequest(source)?.cardRefreshPending).toBe(true);
+    await retryPendingOncallHandoffs('app');
+    expect(mocks.update).toHaveBeenCalledTimes(2);expect(groups.getRequest(source)?.cardRefreshPending).toBe(false);
+    expect(mocks.membership).not.toHaveBeenCalled();
   });
   it('does not call the share API from a card refresh retried by the cycle while the invitation is backed off',async()=>{
     const groups=seedWithoutInvite();mocks.invite.mockRejectedValue(Error('share disabled'));
