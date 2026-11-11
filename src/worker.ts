@@ -546,7 +546,7 @@ import { waitForProcessQuiescence } from './services/process-quiescence.js';
 import { reapStaleCodexThreadWriter, shouldReapStaleCodexWriterBeforeSpawn } from './services/codex-stale-writer-reaper.js';
 import { pidNotProvablyGone } from './utils/process-alive.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
-import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
+import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, readClaudeLiveSessionId, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
 import { cliProcessAliveFromBackend } from './adapters/cli/backend-liveness.js';
 import { statuslineDir } from './services/statusline-snapshot.js';
@@ -2092,6 +2092,14 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
       const owned = findTraexRolloutSetByPid(childPid);
       const observed = owned?.size === 1 ? findTraexRolloutByPid(childPid) : undefined;
       if (observed && owned!.has(observed.cliSessionId)) nativeSessionId = observed.cliSessionId;
+    } else if (!nativeSessionId && cliAdapter?.claudeDataDir) {
+      // Likewise a re-attached Claude may be mid-turn and write nothing until
+      // that turn ends. Without its conversation the contract cannot tell this
+      // live CLI from another and its running attempt loses its origin. The
+      // process's own pid-state record names it — the source a write's session
+      // id comes from — when the record is provably this process's and agrees
+      // with what the process holds open.
+      nativeSessionId = readClaudeLiveSessionId(childPid, bridgeDataDir);
     }
     if (owned() && readProcessStartIdentity(childPid) === start) return { backend: backendType, physicalId: `${childPid}:${start}`, proof: 'process_start', ...(nativeSessionId ? { nativeSessionId } : {}) };
   }
