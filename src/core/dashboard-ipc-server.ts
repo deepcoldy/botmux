@@ -1614,16 +1614,27 @@ ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
 
 /** One daemon log line per session and refusal kind per minute: a wrapper
  *  retried in a loop must not flood the log, yet the first refusal of a kind
- *  has to be visible without debug logging. */
+ *  has to be visible without debug logging.
+ *
+ *  The session id in the request is whatever the caller chose, and an
+ *  unproven caller can be any local process. So only a LIVE session's own id
+ *  is ever used as a key or printed; every request naming an unknown session
+ *  shares one key, and the table drops its oldest entry rather than resetting
+ *  the limit of every real session at once. */
 const IDENTITY_REFUSAL_LOG_INTERVAL_MS = 60_000;
+const IDENTITY_REFUSAL_LOG_KEYS_MAX = 1_000;
 const identityRefusalLoggedAt = new Map<string, number>();
-function logIdentityRouteRefusal(sessionId: string, tool: string, reason: string, detail?: string): void {
-  const key = `${sessionId}\0${reason}`;
+function logIdentityRouteRefusal(requestedSessionId: string, tool: string, reason: string, detail?: string): void {
+  const sessionId = findActiveBySessionId(requestedSessionId)?.session.sessionId;
+  const key = `${sessionId ?? ''}\0${reason}`;
   const now = Date.now();
   if (now - (identityRefusalLoggedAt.get(key) ?? -Infinity) < IDENTITY_REFUSAL_LOG_INTERVAL_MS) return;
-  if (identityRefusalLoggedAt.size > 1_000) identityRefusalLoggedAt.clear();
+  identityRefusalLoggedAt.delete(key);
+  while (identityRefusalLoggedAt.size >= IDENTITY_REFUSAL_LOG_KEYS_MAX) {
+    identityRefusalLoggedAt.delete(identityRefusalLoggedAt.keys().next().value!);
+  }
   identityRefusalLoggedAt.set(key, now);
-  logger.warn(`[trigger-user-auth] refused ${tool} identity for ${sessionId.slice(0, 8)}: ${reason}${detail ? ` (${detail})` : ''}`);
+  logger.warn(`[trigger-user-auth] refused ${tool} identity for ${sessionId ? sessionId.slice(0, 8) : 'an unknown session'}: ${reason}${detail ? ` (${detail})` : ''}`);
 }
 
 /** Storage model the daemon publishes for a managed session is resolved with

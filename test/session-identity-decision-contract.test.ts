@@ -9,10 +9,17 @@
  * — a new topic's first message, a dormant session woken by a message, a
  * scheduled run — the report carried that still-queued turn's execution scope.
  * It was parked until the binding settled and then refused as
- * `execution_scope_unproven` (debug log only). The daemon never learned the
- * session was proven, the identity route refused every managed wrapper
- * (`bytedcli` exit 77, `current_execution_unverified`) for the whole worker
- * generation, while `botmux execution current` stayed verified.
+ * `execution_scope_unproven` (debug log only). Codex / TRAE in RPC input mode
+ * send the report from engageCodexRpc, outside any binding, where it was
+ * refused as `runtime_scope_missing` whether or not a turn was attached. The
+ * daemon never learned the session was proven, the identity route refused
+ * every managed wrapper (`bytedcli` exit 77, `current_execution_unverified`)
+ * for the whole worker generation, while `botmux execution current` stayed
+ * verified.
+ *
+ * A report made inside a binding still waits for that binding, so a start
+ * that fails before its CLI exists cannot change the decision the surviving
+ * CLI runs under.
  *
  * Real worker start path (spawnCli + sessionEventMetadata) against the real
  * daemon handler, controller and contract store; the CLI launch is stubbed.
@@ -60,16 +67,13 @@ function world() {
     const env: any = { workerSessionEventScope: new WorkerSessionEventScope(ref, worker), pendingRuntimeReservations: new Map(),
       activeRestartAttemptId: undefined, closeRequested: false, initialInputOwnershipPending: false,
       CliSpawnSupersededError: class extends Error {}, log: vi.fn(), currentBotmuxTurnId: undefined };
-    const state = { landedBeforeRuntimeBound: false };
-    env.spawnCliBody = vi.fn(async () => {
+    let launch = async () => {
       env.send({ ...decision, ...(env.currentBotmuxTurnId ? { turnId: env.currentBotmuxTurnId } : {}) });
-      // The window that matters: the CLI is about to run its first tool call,
-      // the runtime is not bound yet.
-      await new Promise(resolve => setTimeout(resolve, 0));
-      state.landedBeforeRuntimeBound = delivered.some(message => message.type === 'session_identity_decision' && message.generation === generation);
-    });
+    };
+    env.spawnCliBody = vi.fn(async () => launch());
+    let pane = 0;
     env.publishRuntimeContract = vi.fn(async (binding: any) => {
-      binding.identity = { backend: 'tmux', physicalId: `pane-${generation}`, proof: 'opaque' };
+      binding.identity = { backend: 'tmux', physicalId: `pane-${generation}-${++pane}`, proof: 'opaque' };
       env.send({ type: 'runtime_binding', bindingId: binding.bindingId, identity: binding.identity,
         ...(binding.operationId ? { operationId: binding.operationId } : {}) });
     });
@@ -84,7 +88,8 @@ function world() {
     const host = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', hostScope); hostScope.handleWorkerMessage = host;
     env.send = (message: any) => { pending.push(host(metadata(message))); };
     const spawn = loadWorkerFunction<(cfg: any) => Promise<void>>('spawnCli', env);
-    return { env, worker, state, spawn, drain: () => Promise.all(pending), metadata, host };
+    return { env, worker, spawn, metadata, host, setLaunch: (next: () => Promise<void>) => { launch = next; },
+      drain: async () => { while (pending.length) await Promise.all(pending.splice(0)); } };
   };
   return { ds, store, ref, controller, delivered, warn, start };
 }
@@ -124,9 +129,47 @@ describe.each([
     expect(warn).not.toHaveBeenCalled();
   });
 
-  it('lands before the runtime is bound, ahead of the opening turn\'s first tool call', async () => {
-    const { g } = await run();
-    expect(g.state.landedBeforeRuntimeBound).toBe(true);
+});
+
+describe('session_identity_decision from the Codex / TRAE RPC engine, sent outside any runtime binding', () => {
+  it.each([
+    ['a worker started without input (restore)', undefined],
+    ['a new topic whose first message is already admitted', 'om_first'],
+    ['a scheduled run', 'schedule:daily:7b0c64b6-6a2f-4f8e-9a51-0e2c3b8c1d2e'],
+  ])('reaches the daemon handler for %s', async (_name, openingTurn) => {
+    const w = world();
+    const g = w.start(1);
+    if (openingTurn) {
+      // The init command's execution is known before any CLI binding exists.
+      g.env.workerSessionEventScope.rememberExecution(w.controller.admitInput(openingTurn));
+      g.env.currentBotmuxTurnId = openingTurn;
+    }
+    expect(g.env.workerSessionEventScope.currentBinding()).toBeUndefined();
+    g.env.send({ ...decision, ...(openingTurn ? { turnId: openingTurn } : {}) });
+    await g.drain();
+    expect(w.delivered.filter(message => message.type === 'session_identity_decision')).toEqual([
+      expect.objectContaining({ model: 'proven', ...(openingTurn ? { turnId: openingTurn } : {}) }),
+    ]);
+    expect(w.warn).not.toHaveBeenCalled();
+  });
+});
+
+describe('a replacement start that fails before its CLI exists', () => {
+  it('does not change the decision the surviving CLI runs under', async () => {
+    const w = world();
+    const g = w.start(1);
+    await g.spawn({ prompt: '', resume: true }); await g.drain();
+    // The replacement reports a different spawn shape, then never launches.
+    const restart = w.controller.beginControl('restart').operation.operationId; w.controller.controlStarted(restart);
+    g.env.activeRestartAttemptId = restart;
+    g.setLaunch(async () => {
+      g.env.send({ ...decision, model: 'single', sandboxEngaged: true, loopbackShared: false });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      throw new Error('spawn failed after the decision');
+    });
+    await expect(g.spawn({ prompt: '', resume: true })).rejects.toThrow('spawn failed after the decision');
+    await g.drain();
+    expect(w.delivered.filter(message => message.type === 'session_identity_decision').map(message => message.model)).toEqual(['proven']);
   });
 });
 
