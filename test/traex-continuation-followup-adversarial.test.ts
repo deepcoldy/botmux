@@ -96,6 +96,7 @@ function fixture(mode: 'planned' | 'approved' | 'unreserved' = 'approved', appId
     traexContinuationGrantRecheckAt: 0,
     traexAutoModelRuntimeEligible: () => true, admitTraexAutoModelPendingInput: async () => true,
     stopBridgeWatcher: vi.fn(), stopScreenshotLoop: vi.fn(), killCli: vi.fn(),
+    armRetiredRuntimeExit: vi.fn(),
   });
   const metadata = loadWorkerFunction<(message: any) => any>('sessionEventMetadata', env);
   const receive = loadWorkerMessageHandler('runtime_contract_assigned', env);
