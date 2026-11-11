@@ -5563,6 +5563,26 @@ describe('persistent backend target handoff', () => {
   });
 });
 
+// The full local-address rule in the CLI system prompt is decided per bot when
+// the worker is forked; bots that have not turned the switch on get no flag.
+describe('hideLocalAddresses rides the worker init for the system prompt', () => {
+  const readInit = () => {
+    const worker = forkMock.mock.results.at(-1)!.value;
+    return vi.mocked(worker.send).mock.calls[0][0];
+  };
+
+  it('is absent for a bot with the default (off)', () => {
+    forkWorker(makeDs(), 'hello', false);
+    expect(readInit().hideLocalAddresses).toBeUndefined();
+  });
+
+  it('is set for a bot that turned it on', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ hideLocalAddresses: true }));
+    forkWorker(makeDs(), 'hello', false);
+    expect(readInit().hideLocalAddresses).toBe(true);
+  });
+});
+
 describe('no-transport read isolation follows local sandbox config (not forced)', () => {
   // Behavioral lock for the 2026-08 change: a no-transport session (apiOnly bot
   // OR HTTP virtual chat) is NO LONGER force-isolated. readIsolation is opt-in

@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   config: { session: { dataDir: '' } },
+  identityRequest: vi.fn(),
   bot: { config: { brand: 'feishu', oncallGroup: {} as any } },
   invite: vi.fn(), reply: vi.fn(), update: vi.fn(), withdraw: vi.fn(), membership: vi.fn(), mode: vi.fn(), ephemeral: vi.fn(), remove: vi.fn(), sender: vi.fn(), detail: vi.fn(), forward: vi.fn(), merge: vi.fn(), thread: vi.fn(), chat: vi.fn(),
 }));
@@ -20,6 +21,7 @@ import { attachOncallGroupButton, recordOncallGroupDelivery, handleOncallGroupAc
 import { OncallGroupStore, type OncallGroupSource } from '../src/services/oncall-group-store.js';
 import { OncallFormStore } from '../src/services/oncall-form-store.js';
 import { larkApiError } from '../src/im/lark/lark-errors.js';
+vi.mock('@larksuiteoapi/node-sdk', () => ({ DefaultCache: class {}, Client: class { request = mocks.identityRequest; } }));
 let dir: string; let fetcher: ReturnType<typeof vi.fn>;
 const source: OncallGroupSource = { appId: 'app', sessionId: 'session', chatId: 'oc_source', rootId: 'om_root', messageId: 'om_reply', questionId: 'om_question', answer: 'answer' };
 const event = (action: string, draft?: any, owner = 'ou_owner') => ({ operator: { open_id: owner },
@@ -64,6 +66,25 @@ describe('direct Oncall confirmation', () => {
 });
 
 describe('personal Oncall form callbacks', () => {
+  it('uses the shared identity app for both opening and submitting a classified form', async () => {
+    mocks.bot.config.oncallGroup.identitySource = 'shared';
+    mocks.bot.config.oncallGroup.forwardMode = 'none';
+    vi.stubEnv('ONCALL_IDENTITY_APP_ID', 'cli_directory'); vi.stubEnv('ONCALL_IDENTITY_APP_SECRET', 'form-directory-secret');
+    mocks.identityRequest.mockImplementation(async ({ url }) => url.includes('/tenant/') ? { code: 0, data: { tenant: { tenant_key: 'tenant' } } }
+      : { code: 0, data: { user: { user_id: 'real_user', email: 'actual@example.test' } } });
+    const callback = event('oncall_group_create'); callback.operator.user_id = 'real_user'; callback.operator.tenant_key = 'tenant';
+    await handleOncallGroupAction(callback, 'app');
+    const d = draft();
+    const submit = event('oncall_group_form_submit', d); submit.operator = callback.operator;
+    fetcher.mockImplementation(async (url: string, options) => options?.method === 'POST'
+      ? response({ oncall_flow_id: 123, open_chat_id: 'oc_created' })
+      : url.includes('/workflow/') ? response({ tenant_id: 12, type_id: 34, config: '[]' }) : response({ region: { cn: [category] } }));
+    await handleOncallFormAction(submit, 'app');
+    expect(mocks.sender).not.toHaveBeenCalled();
+    const post = fetcher.mock.calls.find(([, options]) => options?.method === 'POST');
+    expect(post?.[1].headers['x-api-user']).toBe('actual');
+    expect(new OncallGroupStore(dir).getRequest(source)?.status).toBe('succeeded');
+  });
   it.each(['topic', 'p2p'])('rejects unsupported %s containers without publishing a form or a ticket', async mode => {
     mocks.mode.mockResolvedValue(mode);
     expect((await handleOncallGroupAction(event('oncall_group_create'), 'app')).toast.type).toBe('error');

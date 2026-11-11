@@ -325,6 +325,15 @@ describe('collapsed pasted-text chip in Claude composer', () => {
     expect(diagnoseSubmitFailure({ screenText: emptyComposer, cliId: 'claude-code' }).reason).toBe('unknown');
   });
 
+  it('ignores a complete historical composer example when the current composer is empty', () => {
+    const quotedComposer = [
+      RULE, '❯ [Pasted text #2 +3 lines]', RULE,
+      'That was the earlier example.',
+      RULE, '❯ ', RULE,
+    ].join('\n');
+    expect(diagnoseSubmitFailure({ screenText: quotedComposer, cliId: 'claude-code' }).reason).toBe('unknown');
+  });
+
   it('needs the composer prompt marker: a chip-shaped line elsewhere in a box is not a draft', () => {
     const noPrompt = [RULE, '[Pasted text #2 +3 lines]', '  some other pane content', RULE].join('\n');
     expect(diagnoseSubmitFailure({ screenText: noPrompt, cliId: 'claude-code' }).reason).toBe('unknown');

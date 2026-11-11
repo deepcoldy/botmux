@@ -19,6 +19,9 @@ export interface LocalAddressContext {
   /** Check card link fields and leave prose as written. The transport sees
    * host-written bodies too; prose is rewritten where model output enters. */
   linkFieldsOnly?: boolean;
+  /** The bot has not opted into the policy (BotConfig.hideLocalAddresses):
+   * every entry returns its input unchanged and nothing is refused. */
+  disabled?: boolean;
 }
 
 interface Context {
@@ -289,6 +292,7 @@ function scrubText(input: string, ctx: Context): string {
 }
 
 export function sanitizeLocalAddressText(text: string, context: LocalAddressContext = {}): string {
+  if (context.disabled) return text;
   return scrubText(text, contextFor(context));
 }
 
@@ -336,6 +340,7 @@ function scrubNode(node: unknown, key: string | undefined, ctx: Context): unknow
 }
 
 export function sanitizeLocalAddressNode<T>(node: T, context: LocalAddressContext = {}): T {
+  if (context.disabled) return node;
   return scrubNode(node, undefined, contextFor(context)) as T;
 }
 

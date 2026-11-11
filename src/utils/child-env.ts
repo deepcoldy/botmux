@@ -231,6 +231,9 @@ export const REDACTED_CHILD_ENV_KEYS = [
   'GITHUB_TOKEN',
   'GH_TOKEN',
   'ONCALL_SERVICE_SECRET',
+  'ONCALL_IDENTITY_APP_ID',
+  'ONCALL_IDENTITY_APP_SECRET',
+  'ONCALL_IDENTITY_BRAND',
   // node:child_process.fork() injects these into the worker so Node can attach
   // its IPC channel on startup. They belong to that exact parent/worker edge.
   // Forwarding them to an ordinary child (notably a Python Remote Runner which
@@ -440,6 +443,8 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // fallback cannot drift to the default when bots.json is unreadable.
   'BOTMUX_USAGE_DISPLAY',
   'BOTMUX_REPLY_FOOTER',
+  // Per-bot local-address policy snapshot for a sandboxed `botmux send`.
+  'BOTMUX_HIDE_LOCAL_ADDRESSES',
   // Normalized sparse reply-style snapshot. Shared/native skill loaders and
   // `botmux send` consume this same session value; it must never enter a
   // co-tenant tmux server's ambient environment.
@@ -598,6 +603,8 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   // env is never a config input for it.
   'BOTMUX_USAGE_DISPLAY',
   'BOTMUX_REPLY_FOOTER',
+  // Per-bot local-address policy, from the worker's init snapshot per session.
+  'BOTMUX_HIDE_LOCAL_ADDRESSES',
   // Spawn-time normalized reply style; unset/scrub at every session boundary to
   // avoid cross-bot guide/card drift through a shared persistent backend.
   'BOTMUX_REPLY_STYLE',

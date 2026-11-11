@@ -43,6 +43,7 @@ function fixture() {
     activeTurnAuthority: authority, inflightInputs: tracker, currentBotmuxTurnId: 'turn', cliSpawnGeneration: 1,
     lastInitConfig: { cliId: 'traex', cliSessionId: 'native', model: models[0] }, backend: {},
     traexAutoModelSwitching: false, cliRestartInProgress: false, isFlushing: false, isPromptReady: false,
+    currentInputDeliveryQuarantine: () => null,
     commandLineWritesPending: 0, pendingMessages: [], currentBotmuxCallerOpenId: 'caller',
     currentTraexLoadSnapshot: () => query, currentTraexQuotas: vi.fn(), rememberTraexModelLoadSnapshot: vi.fn(),
     TRAEX_MODEL_ACCESS_ERROR_CODE, TRAEX_QUOTA_ERROR_CODE, TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS,

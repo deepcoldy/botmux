@@ -253,6 +253,14 @@ function setupActiveWorkerHandlers(ds: DaemonSession, worker: any): void {
 
 // ─── Tests ─────────────────────────────────────────────────────────────────
 
+import { setHideLocalAddressesResolver } from '../src/im/lark/local-address-switch.js';
+
+// The local-address cases in this file are for bots that turned on
+// BotConfig.hideLocalAddresses (default off; the off path is covered in
+// test/local-address-egress.test.ts). The registry is mocked here, so the
+// switch is answered directly.
+setHideLocalAddressesResolver(() => true);
+
 describe('Worker ready: set_display_mode re-sync', () => {
   let sessionReplyMock: ReturnType<typeof vi.fn>;
   let closeSessionMock: ReturnType<typeof vi.fn>;

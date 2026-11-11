@@ -118,7 +118,8 @@ describe('prompt fragment catalog matches what each stage reads', () => {
     );
     setPromptOverrideResolver((key) => (followup.has(key) ? `<<${key}>>` : undefined));
     for (const loc of SUPPORTED_LOCALES) {
-      const lines = feishuReplyPresentationGuidance(loc).split('\n');
+      // With the bot's hideLocalAddresses switch on, every line that can appear.
+      const lines = feishuReplyPresentationGuidance(loc, true).split('\n');
       expect(lines.length).toBeGreaterThan(1);
       for (const line of lines) expect(line, `[${loc}]`).toMatch(/^<<ai\.[\w.]+>>$/);
     }

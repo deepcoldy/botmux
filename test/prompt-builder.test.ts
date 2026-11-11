@@ -118,6 +118,8 @@ import { buildExternalEventApplicationContext, buildExternalEventCodexAppContext
 import type { TriggerRequest } from '../src/services/trigger-types.js';
 import { setBotLookup, setDefaultLocale, t } from '../src/i18n/index.js';
 import { BOTMUX_SHELL_HINTS, buildBotmuxShellHints, buildBotmuxSystemPromptText, feishuReplyPresentationGuidance } from '../src/adapters/cli/shared-hints.js';
+import { setHideLocalAddressesResolver } from '../src/im/lark/local-address-switch.js';
+import { escapeXmlTagLikeTokens } from '../src/utils/xml.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { rmSync } from 'node:fs';
 import { writeManagerClaim } from '../src/services/chat-manager-state.js';
@@ -492,15 +494,40 @@ describe('botmux routing prose XML boundaries', () => {
 });
 
 describe('local-address rule placement', () => {
+  // The rules ride only for a bot that turned on BotConfig.hideLocalAddresses.
   it.each(['zh', 'en'] as const)('states the full rule once per session and a one-line reminder per turn (%s)', locale => {
-    const rule = t('ai.routing.no_local_addresses', undefined, locale);
-    const reminder = t('ai.followup.no_local_addresses', undefined, locale);
-    expect(buildBotmuxSystemPromptText({ locale })).toContain(rule);
-    expect(buildBotmuxShellHints(locale).join('\n')).toContain(rule);
-    const followUp = buildFollowUpContent('hello', 'sid-rule', { locale });
-    expect(followUp).toContain(reminder);
-    expect(followUp).not.toContain(rule);
-    expect(reminder.length * 2).toBeLessThan(rule.length);
+    const restore = setHideLocalAddressesResolver(app => app === 'app_hides');
+    try {
+      const rule = t('ai.routing.no_local_addresses', undefined, locale);
+      const reminder = t('ai.followup.no_local_addresses', undefined, locale);
+      expect(buildBotmuxSystemPromptText({ locale, hideLocalAddresses: true, cliId: 'claude-code' })).toContain(rule);
+      const opening = buildNewTopicPrompt('hello', 'sid-rule', 'codex', undefined, undefined, undefined, undefined, undefined,
+        undefined, locale, undefined, { larkAppId: 'app_hides' });
+      expect(opening).toContain(escapeXmlTagLikeTokens(rule));
+      const followUp = buildFollowUpContent('hello', 'sid-rule', { locale, larkAppId: 'app_hides' });
+      expect(followUp).toContain(reminder);
+      expect(followUp).not.toContain(rule);
+      expect(reminder.length * 2).toBeLessThan(rule.length);
+    } finally { restore(); }
+  });
+
+  it.each(['zh', 'en'] as const)('injects neither rule for a bot that has not turned it on (%s)', locale => {
+    const restore = setHideLocalAddressesResolver(app => app === 'app_hides');
+    try {
+      const rule = t('ai.routing.no_local_addresses', undefined, locale);
+      const reminder = t('ai.followup.no_local_addresses', undefined, locale);
+      expect(buildBotmuxSystemPromptText({ locale, hideLocalAddresses: undefined, cliId: 'claude-code' })).not.toContain(rule);
+      expect(buildBotmuxShellHints(locale).join('\n')).not.toContain(escapeXmlTagLikeTokens(rule));
+      const opening = buildNewTopicPrompt('hello', 'sid-rule', 'codex', undefined, undefined, undefined, undefined, undefined,
+        undefined, locale, undefined, { larkAppId: 'app_default' });
+      expect(opening).not.toContain(escapeXmlTagLikeTokens(rule));
+      for (const larkAppId of ['app_default', undefined]) {
+        const followUp = buildFollowUpContent('hello', 'sid-rule', { locale, larkAppId });
+        expect(followUp).toContain(t('ai.followup.feishu_safe_emphasis', undefined, locale));
+        expect(followUp).not.toContain(reminder);
+      }
+      expect(feishuReplyPresentationGuidance(locale)).toBe(t('ai.followup.feishu_safe_emphasis', undefined, locale));
+    } finally { restore(); }
   });
 });
 
