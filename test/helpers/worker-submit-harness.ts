@@ -93,6 +93,10 @@ export function workerSubmitHarness() {
   scope.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', scope);
   const schedule = loadWorkerFunction('scheduleSubmitFailureNotify', scope);
   scope.scheduleSubmitFailureNotify = schedule;
+  // Real predicates for flushPending's native-consumption proof (traex harness →
+  // no Codex history proof); markReplyInputConsumed is a no-op on the empty queue.
+  scope.codexHistoryMatchProvesConsumption = loadWorkerFunction('codexHistoryMatchProvesConsumption', scope);
+  scope.markReplyInputConsumed = loadWorkerFunction('markReplyInputConsumed', scope);
   const flush = loadWorkerFunction<() => Promise<void>>('flushPending', scope);
   return { scope, queue, flush, schedule, recheck, settlements, submitFailureChains, inputDeliveryEvidence };
 }

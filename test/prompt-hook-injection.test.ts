@@ -153,6 +153,24 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     else process.env.SESSION_DATA_DIR = prevDataDir;
   });
 
+  it.each(['auto', 'off'] as const)('exposes message location in %s mode', (mode) => {
+    getBotMock.mockReturnValue({ config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: mode } });
+    for (const root of [undefined, 'om_topic']) {
+      const messageLocation = { messageId: 'om_followup', ...(root ? { rootMessageId: root } : {}) };
+      const result = buildFollowUpCliInput('followup', SESSION_ID, followUpOpts({ messageLocation }));
+      // hook 模式：位置元数据随 sender 一起进 envelope，输入框只剩正文。
+      const visible = mode === 'auto' ? claimByPrompt(SESSION_ID, TURN_ID, result.content)! : result.content;
+      if (mode === 'auto') {
+        expect(result.content).toBe('followup');
+        expect(visible).toBeDefined();
+      }
+      expect(visible).toContain('message_id="om_followup"');
+      expect(visible).toContain(`placement="${root ? 'thread' : 'chat'}"`);
+      if (root) expect(visible).toContain('root_message_id="om_topic"');
+      else expect(visible).not.toContain('root_message_id=');
+    }
+  });
+
   it('auto + claude-code + preflight 通过：reminder/whiteboard/sender/mentions 进 sidecar，PTY 文本只剩正文', () => {
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: 'wb_1' }));
 

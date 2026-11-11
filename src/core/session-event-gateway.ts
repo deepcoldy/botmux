@@ -8,7 +8,8 @@ export type SessionEventAdmission =
   | { kind: 'defer'; bindingId: string }
   | { kind: 'reject'; reason: string };
 const immutableFacts = new Set(['turn_terminal', 'final_output', 'final_output_offer', 'turn_interrupt_result', 'codex_app_dispatch_persisted', 'restart_result', 'claude_exit']);
-const workerEvents = new Set(['worker_ipc_ready', 'ready', 'worker_error', 'error', 'transfer_detached', 'runtime_binding', 'runtime_binding_started', 'runtime_binding_aborted', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'turn_interrupt_result', 'restart_result', 'session_ready_ack']);
+// persistent_backend_target is stamped before the CLI spawns, so it can only be worker-scoped.
+const workerEvents = new Set(['worker_ipc_ready', 'ready', 'worker_error', 'error', 'transfer_detached', 'runtime_binding', 'runtime_binding_started', 'runtime_binding_aborted', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'turn_interrupt_result', 'restart_result', 'session_ready_ack', 'persistent_backend_target']);
 /** A trusted channel supplies producer identity. An event cannot self-upgrade
  * to the current execution instance merely because its IPC worker survived. */
 export class SessionEventGateway {
@@ -44,9 +45,11 @@ export class SessionEventGateway {
       // A queued turn must persist its dispatch before writing to the runner,
       // so it has no native runtime binding yet. These preparatory events do
       // not bind/start the attempt and still require the current producer.
+      // The worker announces capture identity at the CLI write boundary,
+      // before turn_execution_started binds the queued execution.
       const unboundCurrent = sameWorker(state.worker, channel) && sameRuntime(state.activeRuntime, runtime)
         && (['turn_execution_started', 'native_input_consumed', 'turn_terminal', 'final_output'].includes(type)
-          || (execution.phase === 'queued' && ['managed_turn_origin', 'managed_turn_origin_revoked', 'codex_app_dispatch_transition'].includes(type)));
+          || (execution.phase === 'queued' && ['managed_turn_origin', 'managed_turn_origin_revoked', 'codex_app_dispatch_transition', 'capture_identity'].includes(type)));
       if (!sameRuntime(execution.runtime, runtime)
         && !(!execution.runtime && (recovery || workerEvents.has(type) || unboundCurrent))) {
         return { kind: 'reject', reason: 'execution_scope_unproven' };

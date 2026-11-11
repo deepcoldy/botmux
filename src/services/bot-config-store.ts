@@ -1,6 +1,7 @@
 import { botAcceptsLaunchModel } from '../core/launch-model-capability.js';
 import { parseGroupCreationDefaults } from './group-creation-options.js';
 import { normalizeStewardConfig } from '../core/decision-board/model.js';
+import { normalizeIdleSpinSuspendConfig } from '../core/idle-spin-config.js';
 import { formatZcodeModelChoice, resolveZcodeModelReference, zcodeAmbiguousModelIds } from './zcode-models.js';
 import { parseSandboxNetworkPolicy, networkPolicySupportError } from '../core/sandbox-network-policy.js';
 /**
@@ -194,6 +195,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'cardActionAckTimeoutMs', configKey: 'cardActionAckTimeoutMs', kind: 'number', effect: 'immediate', clearable: true, min: MIN_CARD_ACTION_ACK_TIMEOUT_MS, max: MAX_CARD_ACTION_ACK_TIMEOUT_MS, hint: '本 bot 所有卡片动作的同步 ACK 等待时长（500–2500ms，默认 2500ms）；超时先提示后台处理，插件可继续执行；unset 回默认' },
   { key: 'maxLiveWorkers', configKey: 'maxLiveWorkers', kind: 'number', effect: 'immediate', clearable: true, hint: '最大常驻会话数；超过后最久未用的会话自动休眠（退出后台进程和 CLI、回收内存，下条消息冷恢复）；unset=默认 30' },
   { key: 'idleSuspendMinutes', configKey: 'idleSuspendMinutes', kind: 'number', effect: 'immediate', clearable: true, hint: '空闲会话自动休眠超时（分钟，正整数）；会话持续空闲超过该时长即自动休眠回收内存，与最大常驻会话数互不影响；unset=关闭（默认，空闲不超时，仅受数量上限约束）' },
+  { key: 'idleSpinSuspend', configKey: 'idleSpinSuspend', kind: 'json', effect: 'immediate', clearable: true, hint: 'CPU 空闲自旋回收 JSON：{"enabled":true,"cliIds":["traex"],"cpuPercent":20,"consecutiveSamples":3,"sampleIntervalSeconds":30,"minIdleMinutes":5,"maxSuspendsPerSample":8,"hostPressure":{"enabled":true,"afterSamples":3,"cooldownMinutes":10,"maxSuspendsPerPass":16,"enterCpuPercent":85,"exitCpuPercent":70}}；cpuPercent 是单核百分比（20=0.2 核）；两层都只作用于 cliIds 内的 CLI（默认只有 traex），CLI 下仍有后台任务等子进程的会话不会被挂起；unset 用保守默认值' },
   { key: 'customPassthroughCommands', configKey: 'customPassthroughCommands', kind: 'stringList', effect: 'immediate', clearable: true, hint: '额外放行透传给 CLI 的 slash 命令（逗号/换行分隔，或“空格+/”分隔，如 /goal /export；名字内空格归一为连字符，/Ultra Goal → /ultra-goal）；unset 回仅内置白名单' },
   { key: 'canTalkDaemonCommands', configKey: 'canTalkDaemonCommands', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseCanTalkDaemonCommandsInput, hint: '把列出的 daemon 命令权限从 canOperate（仅管理员）降到 canTalk（对话放行即可用），如 /status /help；仅认 daemon 命令，透传命令无效；unset 回全部仅管理员' },
   { key: 'startupCommands', configKey: 'startupCommands', kind: 'stringList', effect: 'next-session', clearable: true, parseList: parseStartupCommandsInput, hint: '开会话后、首条消息前自动发给 CLI 的命令（逗号/换行分隔，可带参数，如 /effort ultracode）；unset 回不发' },
@@ -1057,7 +1059,7 @@ export type CoerceResult =
   | { ok: true; value: unknown }
   // A few reasons carry detail (e.g. which keys were rejected), so this is a
   // union of literals plus those prefixed forms rather than a closed literal set.
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` | `invalid_prompt_cache: ${string}` | `invalid_steward: ${string}` | `invalid_feedback_presentation: ${string}` };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'invalid_env' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_herdr_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` | `invalid_no_progress_notify: ${string}` | `invalid_prompt_cache: ${string}` | `invalid_steward: ${string}` | `invalid_feedback_presentation: ${string}` | 'invalid_idle_spin_suspend' };
 
 /** herdr 块全部可写字段；与 normalizeHerdrBackendConfig 接受的键必须一致（有 parity 测试）。 */
 export const HERDR_FIELD_NAMES = ['sessionName', 'placement', 'workspace', 'tab', 'splitDirection', 'chatTypes'] as const;
@@ -1193,6 +1195,12 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
         if (spec.configKey === 'noProgressNotify') {
           try { return { ok: true, value: normalizeNoProgressNotifyPolicy(parsed) }; }
           catch (error) { return { ok: false, reason: `invalid_no_progress_notify: ${error instanceof Error ? error.message : String(error)}` }; }
+        }
+        if (spec.configKey === 'idleSpinSuspend') {
+          const normalized = normalizeIdleSpinSuspendConfig(parsed);
+          return normalized
+            ? { ok: true, value: normalized }
+            : { ok: false, reason: 'invalid_idle_spin_suspend' };
         }
         if (spec.configKey === 'skills') {
           const policy = readBotSkillPolicy(parsed);

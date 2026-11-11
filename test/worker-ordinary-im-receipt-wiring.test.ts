@@ -54,3 +54,27 @@ describe('Claude transcript native input consumption receipt', () => {
     }
   });
 });
+
+describe('consumed input updates addressing without advancing execution', () => {
+  it('publishes only a consumed queued input and preserves every final obligation', () => {
+    const queue = [{ turnId: 'om_b' }, { turnId: 'om_c' }];
+    const snapshots: unknown[] = [];
+    const scope: Record<string, unknown> = {
+      queuedTypeAheadTurns: queue,
+      writeCliPidMarker: () => snapshots.push(structuredClone(queue)),
+      inflightInputs: { onTurnStarted: vi.fn() },
+      lastWrittenCliInput: undefined,
+      send: vi.fn(),
+    };
+    scope.markReplyInputConsumed = loadWorkerFunction('markReplyInputConsumed', scope);
+    const acknowledge = loadWorkerFunction<(id: string, proof: string) => void>('acknowledgeNativeInputConsumed', scope);
+    acknowledge('om_b', 'claude_transcript_user_record');
+    expect(snapshots).toEqual([[{ turnId: 'om_b', inputConsumed: true }, { turnId: 'om_c' }]]);
+    acknowledge('om_b', 'claude_transcript_user_record');
+    acknowledge('om_missing', 'codex_history_match');
+    expect(snapshots).toHaveLength(1);
+    acknowledge('om_c', 'codex_history_match');
+    expect(snapshots).toHaveLength(2);
+    expect(queue.map(t => t.turnId)).toEqual(['om_b', 'om_c']);
+  });
+});

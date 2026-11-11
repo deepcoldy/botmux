@@ -1,3 +1,4 @@
+import { renderInboundMessageLocation } from './core/reply-message.js';
 import { clearTakeoverModelSources } from './core/model-pin.js';
 import { findForbiddenReadWritePaths, findReadOnlyLauncherMountCovers, forbiddenReadWriteMessage, readOnlyLauncherMountMessage } from './services/sandbox-path-guard.js';
 import { registerSessionContractPrimary } from './core/session-contract-primary.js';
@@ -100,6 +101,7 @@ import {
   type OverloadState,
   type OverloadThresholds,
   type OverloadCardBrowser,
+  type OverloadCardState,
 } from './core/host-overload-alert.js';
 import { registerOverloadNonce } from './im/lark/overload-nonce.js';
 import { cotRecoveryMatches, settleCotMessageForShutdown, sweepOrphanCotMessages } from './im/lark/cot-message.js';
@@ -767,6 +769,11 @@ import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import { createGroupIdleCloseSweeper } from './core/group-idle-close-sweeper.js';
 import { sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
+import { resolveIdleSpinSuspendConfig } from './core/idle-spin-config.js';
+import { createIdleSpinSampler } from './core/idle-spin-sampler.js';
+import { createIdleSpinDetector } from './core/idle-spin-detector.js';
+import { INITIAL_HOST_PRESSURE_STATE, runHostPressureTick } from './core/host-pressure-reclaim.js';
+import { readCliPidMarkers } from './core/resource-monitor/cli-markers.js';
 import {
   DEFAULT_SESSION_OWNER_REMINDER,
   SessionOwnerReminderController,
@@ -29858,6 +29865,7 @@ async function handleThreadReplyAdmitted(
         await resolveSoloSessionForTurn(ds, ctxChatType, tailSender);
         if (effortSessionIsCurrent && !effortSessionIsCurrent()) throw new Error('Effort task session changed during queued activation preparation');
         const followUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
+          messageLocation: { messageId: parsed.messageId, ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}) },
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
@@ -29948,6 +29956,10 @@ async function handleThreadReplyAdmitted(
     const followUpSender: import('./im/lark/identity-cache.js').ResolvedSender | undefined = callerOpenId
       ? { openId: callerOpenId, type: isForeignBot ? 'bot' : 'user' }
       : undefined;
+    if (!zeroInjection) enriched = `${renderInboundMessageLocation({
+      messageId: parsed.messageId,
+      ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}),
+    })}\n${enriched}`;
     const hadBufferedFollowUps = (ds.pendingFollowUps?.length ?? 0) > 0;
     const sameInitialCaller = !!followUpSender?.openId
       && followUpSender.openId === ds.pendingSender?.openId;
@@ -30002,6 +30014,7 @@ async function handleThreadReplyAdmitted(
         // 此分支是 pending 首个 worker 的同步屏障，不能 await 网络（见上方注释），
         // 所以不重算 solo，沿用会话注册时算好的 ds.soloSession。
         const exactFollowUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
+          messageLocation: { messageId: parsed.messageId, ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}) },
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
@@ -30560,6 +30573,7 @@ async function handleThreadReplyAdmitted(
           },
         )
       : buildFollowUpCliInput(promptContent, ds.session.sessionId, {
+          messageLocation: { messageId: parsed.messageId, ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}) },
           attachments,
           mentions: parsed.mentions,
           isAdoptMode: false,
@@ -30799,6 +30813,7 @@ async function handleThreadReplyAdmitted(
           const stagedSender = await getThreadSender();
           await resolveSoloSessionForTurn(ds, ctxChatType, stagedSender);
           const currentFollowUp = buildFollowUpCliInput(promptContent, ds.session.sessionId, {
+          messageLocation: { messageId: parsed.messageId, ...(ds.scope === 'thread' || parsed.threadId ? { rootMessageId: parsed.rootId || parsed.messageId } : {}) },
             attachments,
             mentions: parsed.mentions,
             isAdoptMode: false,
@@ -33412,6 +33427,140 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
     })();
   };
+  // ─── CPU-driven idle-spin + host-pressure guard ──────────────────────────
+  // TRAE CLI (0.214.x) keeps ~3k inotify watches over ~/.trae/skills and
+  // self-excites on its own skill-directory IN_OPEN events. Dozens of idle
+  // sessions therefore burn cores without producing turns. BotMux cannot fix
+  // the CLI, so it parks idle workers whose process subtree keeps burning CPU
+  // and adds a host-pressure backstop. Both layers reuse the strict idle
+  // selector + suspendWorker; neither introduces a new kill path.
+  let overloadAlertCard: { messageId: string; state: OverloadCardState } | undefined;
+  let autoSuspendedInEpisode = 0;
+  let hostPressureState = INITIAL_HOST_PRESSURE_STATE;
+  let idleSpinTimer: ReturnType<typeof setTimeout> | undefined;
+  let idleSpinTickRunning = false;
+  let idleSpinUnsupportedLogged = false;
+  let idleSpinStopped = false;
+  const idleSpinSampler = createIdleSpinSampler();
+  const idleSpinDetector = createIdleSpinDetector({
+    larkAppId: cfg.larkAppId,
+    activeSessions,
+    defaultCliId: () => {
+      try { return getBot(cfg.larkAppId).config.cliId; } catch { return undefined; }
+    },
+    sampler: idleSpinSampler,
+    readMarkers: () => readCliPidMarkers(config.session.dataDir),
+    mutationAcquireTimeoutMs: 1_000,
+    shouldAbort: () => idleSpinStopped,
+  });
+
+  const runIdleSpinGuard = async (): Promise<void> => {
+    if (idleSpinStopped || idleSpinTickRunning) return;
+    idleSpinTickRunning = true;
+    try {
+      if (process.platform !== 'linux') {
+        if (!idleSpinUnsupportedLogged) {
+          idleSpinUnsupportedLogged = true;
+          logger.info('[idle-spin] disabled: process CPU attribution requires Linux procfs');
+        }
+        return;
+      }
+      if (process.env.BOTMUX_IDLE_SPIN_SUSPEND === '0') return;
+      const liveBotConfig = getBot(cfg.larkAppId).config;
+      const resolved = resolveIdleSpinSuspendConfig(liveBotConfig.idleSpinSuspend);
+      // `cliIds` scopes BOTH layers: with no CLI in scope there is nothing
+      // either layer may park, so treat it exactly like `enabled: false`.
+      if (!resolved.enabled || resolved.cliIds.length === 0) {
+        idleSpinDetector.reset();
+        hostPressureState = INITIAL_HOST_PRESSURE_STATE;
+        autoSuspendedInEpisode = 0;
+        return;
+      }
+
+      // Layer 1: CPU idle-spin (always samples strict candidates; no host gate).
+      const hostCpuPct = (await idleSpinDetector.tick(resolved)).hostCpuPct;
+
+      // Layer 2: host-pressure backstop. Every daemon judges the host locally
+      // and reclaims ONLY its own idle workers, and only those Layer 1 itself
+      // may act on (same `cliIds` + TRAE identity, childless CLI) — a host
+      // overload must not park other CLIs' sessions that did not opt in.
+      // Per-daemon ownership is what prevents duplicate reclaim across bots
+      // sharing TRAE_HOME; a notifier fan-out would add a single point of
+      // failure without any extra effect.
+      if (!resolved.hostPressure.enabled || process.env.BOTMUX_HOST_PRESSURE_RECLAIM === '0') return;
+
+      const tick = await runHostPressureTick({
+        state: hostPressureState,
+        reading: {
+          load15: loadavg()[2] ?? 0,
+          memTotalBytes: totalmem(),
+          memFreeBytes: freemem(),
+          cpuPct: hostCpuPct,
+        },
+        config: resolved.hostPressure,
+        now: Date.now(),
+        baseThresholds: resolveOverloadThresholds(),
+        reclaim: async () => {
+          if (idleSpinStopped) return null;
+          try {
+            return await idleSpinDetector.reclaimHostPressure(resolved);
+          } catch (err) {
+            logger.warn(`[host-pressure] reclaim failed: ${err instanceof Error ? err.message : String(err)}`);
+            return null;
+          }
+        },
+      });
+      hostPressureState = tick.state;
+
+      if (!tick.overloaded) {
+        autoSuspendedInEpisode = 0;
+        overloadAlertCard = undefined;
+        return;
+      }
+      if (tick.reclaimed !== null && tick.reclaimed > 0) {
+        autoSuspendedInEpisode += tick.reclaimed;
+        logger.info(
+          `[host-pressure] bot=${cfg.larkAppId} auto-suspended=${tick.reclaimed} `
+          + `total=${autoSuspendedInEpisode} load15=${(loadavg()[2] ?? 0).toFixed(2)} `
+          + `hostCpu=${hostCpuPct.toFixed(0)}% strikes=${tick.strikes}`,
+        );
+        if (overloadAlertCard) {
+          const nextState: OverloadCardState = {
+            ...overloadAlertCard.state,
+            autoSuspendedN: autoSuspendedInEpisode,
+          };
+          overloadAlertCard.state = nextState;
+          try {
+            await updateMessage(cfg.larkAppId, overloadAlertCard.messageId, buildOverloadAlertCard(nextState));
+          } catch (err) {
+            logger.debug(`[host-pressure] overload card patch skipped: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn(`[idle-spin] guard tick failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      idleSpinTickRunning = false;
+    }
+  };
+
+  const scheduleIdleSpinGuard = (): void => {
+    if (idleSpinStopped) return;
+    if (idleSpinTimer) clearTimeout(idleSpinTimer);
+    let seconds = 30;
+    try {
+      const liveBotConfig = getBot(cfg.larkAppId).config;
+      seconds = resolveIdleSpinSuspendConfig(liveBotConfig.idleSpinSuspend).sampleIntervalSeconds;
+    } catch { /* bot gone → keep default */ }
+    // ±20% jitter keeps a 50-daemon fleet from sweeping /proc in lockstep.
+    const jitter = 0.8 + Math.random() * 0.4;
+    idleSpinTimer = setTimeout(() => {
+      void runIdleSpinGuard().finally(scheduleIdleSpinGuard);
+    }, Math.max(10_000, seconds * 1_000 * jitter));
+    idleSpinTimer.unref?.();
+  };
+  scheduleIdleSpinGuard();
+
   // Converge an incomplete keyed idempotent async turn on CLI/worker exit, and if
   // the durable dispatch_unknown write itself FAILS (EIO/ENOSPC/foreign slot),
   // take the session to an OBSERVABLE fail-closed terminal by closing it —
@@ -36145,6 +36294,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         // `recovered`: display-only card. On any send failure, fall back to the
         // plain-text alert so the owner still hears about it.
         let cardJson: string;
+        let enteredCardState: OverloadCardState | undefined;
         if (action.kind === 'entered') {
           const nonce = randomUUID();
           registerOverloadNonce(nonce);
@@ -36161,16 +36311,32 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             const running = await detectRunningBrowsers(targets);
             browsers = running.map(b => ({ bundleId: b.bundleId, label: b.label, memMB: b.memMB }));
           } catch (err) { logger.warn(`[overload] browser probe failed, no restart buttons: ${err instanceof Error ? err.message : String(err)}`); }
-          cardJson = buildOverloadAlertCard(initialOverloadCardState(action, counts, nonce, browsers));
+          enteredCardState = initialOverloadCardState(action, counts, nonce, browsers);
+          // The guard may have already reclaimed before this card was built
+          // (both timers are 30s and independently phased); keep that count.
+          if (autoSuspendedInEpisode > 0) enteredCardState.autoSuspendedN = autoSuspendedInEpisode;
+          cardJson = buildOverloadAlertCard(enteredCardState);
         } else {
           cardJson = buildOverloadRecoveredCard(action);
         }
-        void sendUserMessage(cfg.larkAppId, ownerOpenId, cardJson, 'interactive')
-          .catch((err) => {
+        void (async () => {
+          try {
+            const messageId = await sendUserMessage(cfg.larkAppId, ownerOpenId, cardJson, 'interactive');
+            if (action.kind === 'entered' && enteredCardState) {
+              overloadAlertCard = { messageId, state: enteredCardState };
+            } else {
+              overloadAlertCard = undefined;
+              autoSuspendedInEpisode = 0;
+            }
+          } catch (err) {
             logger.warn(`[overload] card DM failed, falling back to text: ${err instanceof Error ? err.message : String(err)}`);
-            return sendUserMessage(cfg.larkAppId, ownerOpenId, formatOverloadAlert(action));
-          })
-          .catch((err) => logger.warn(`[overload] text fallback DM also failed: ${err instanceof Error ? err.message : String(err)}`));
+            try {
+              await sendUserMessage(cfg.larkAppId, ownerOpenId, formatOverloadAlert(action));
+            } catch (fallbackErr) {
+              logger.warn(`[overload] text fallback DM also failed: ${fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr)}`);
+            }
+          }
+        })();
       } catch (err) {
         logger.warn(`[overload] sample failed: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -36195,6 +36361,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    // Stop the CPU guard before the worker fleet is drained: a tick that
+    // started just before shutdown must not park a worker the shutdown path is
+    // already fencing.
+    idleSpinStopped = true;
+    if (idleSpinTimer) clearTimeout(idleSpinTimer);
     const shutdownDeadlineMs = Date.now() + DAEMON_SHUTDOWN_MAX_MS;
     const mutationResult = await tryWithBotTurnMutation(
       cfg.larkAppId,
