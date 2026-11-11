@@ -26,6 +26,8 @@ it('refuses a sender without personal authorization even when an old per-app tok
   vi.stubGlobal('fetch', fetchMock);
   await expect(setChatFeedGroup('cli_actor', 'oc_current', 'ou_operator', null))
     .resolves.toEqual({ ok: false, error: 'user_login_required' });
+  await expect(setChatFeedGroup('cli_actor', 'oc_current', 'ou_operator', 'P0', undefined, ['P0']))
+    .resolves.toEqual({ ok: false, error: 'user_login_required' });
   expect(fetchMock).not.toHaveBeenCalled();
 });
 
@@ -43,6 +45,8 @@ it('rejects a sender outside the bot allowlist and malformed open ids before any
   await expect(setChatFeedGroup('cli_deny', 'oc_current', 'ou_operator', 'p0'))
     .resolves.toEqual({ ok: false, error: 'permission_denied' });
   await expect(setChatFeedGroup('cli_deny', 'oc_current', 'not-an-open-id', 'p0'))
+    .resolves.toEqual({ ok: false, error: 'permission_denied' });
+  await expect(setChatFeedGroup('cli_deny', 'oc_current', 'ou_operator', 'P0', undefined, ['P0']))
     .resolves.toEqual({ ok: false, error: 'permission_denied' });
   expect(fetchMock).not.toHaveBeenCalled();
 });
