@@ -206,6 +206,19 @@ describe('one reply card per turn', () => {
     expect(io.send).toHaveBeenCalledTimes(1);
   });
 
+  it('does not hand back at the turn end, so a separately sent final still adds no summary card', async () => {
+    const nativeKey = await nativeTurn('om_native_end_handback');
+    let live = true;
+    const daemon = { ...io, nativeThinkingLive: () => live };
+    await store.update(nativeKey, { kind: 'progress', text: 'Intermediate status' }, daemon);
+    expect(await store.noteExternalFinal(nativeKey, input.chatId)).toBe(true);
+    // The display failed, was lost to a restart, or aged out just before the terminal.
+    live = false;
+    expect((await store.update(nativeKey, { kind: 'terminal', phase: 'completed' }, daemon)).delivered).toBe(false);
+    expect(io.send).not.toHaveBeenCalled();
+    expect(store.read(nativeKey)).toMatchObject({ phase: 'completed', nativeCotVisible: true, externalFinal: true });
+  });
+
   it('replays an unknown first native CoT POST after reopening even once nothing is actionable', async () => {
     const nativeKey = await nativeTurn('om_native_unknown_post');
     const entry = nativeAsk('native_unknown');

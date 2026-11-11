@@ -374,8 +374,9 @@ export class TurnReplyCardStore {
       // The display can retire before this turn ends (a newer turn replaced
       // it, a push failed, the channel was switched off, or a restart lost it).
       // Persist the hand-back so CLI senders, which cannot see the daemon's
-      // display state, publish progress on the card again.
-      if (record.nativeCotVisible && io.nativeThinkingLive && !io.nativeThinkingLive()) {
+      // display state, publish progress on the card again. Once the turn has
+      // ended there is no progress left to hand back.
+      if (record.nativeCotVisible && !replyCardIsTerminal(record) && io.nativeThinkingLive && !io.nativeThinkingLive()) {
         delete record.nativeCotVisible;
         this.write(key, record);
       }

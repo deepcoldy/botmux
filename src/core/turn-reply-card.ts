@@ -118,7 +118,11 @@ function nativeThinkingOwner(ds: DaemonSession, owns?: () => boolean): () => boo
 export function updateReplyCardNativeThinking(ds: DaemonSession, msg: ToolsUpdate, owns?: () => boolean): void {
   const record = new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, msg.turnId, msg.dispatchAttempt))
     ?? new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, msg.turnId));
-  if (record?.nativeCot && ((!record.nativeCotReady && !record.messageId) || hasCotMessageForTurn(ds, msg))) {
+  // After native thinking handed this turn back to the answer card, keep it
+  // there: re-enabling the channel mid-turn must not show the same progress
+  // twice. `/cot show` explicitly asks for both.
+  const handedBack = record?.nativeCotReady && !record.nativeCotVisible && !ds.cotForced;
+  if (record?.nativeCot && !handedBack && ((!record.nativeCotReady && !record.messageId) || hasCotMessageForTurn(ds, msg))) {
     handleCotThinkingUpdate(ds, { type: 'thinking_update', ...msg }, record.mode, nativeThinkingOwner(ds, owns));
   }
 }

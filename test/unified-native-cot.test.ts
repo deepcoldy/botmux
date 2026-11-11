@@ -6,8 +6,8 @@ import type { DaemonSession } from '../src/core/types.js';
 import { config } from '../src/config.js';
 import { getBot, getBotClient } from '../src/bot-registry.js';
 import { updateMessage } from '../src/im/lark/client.js';
-import { replyCardModeFor, queueTurnReplyTools, flushTurnReplyTools, updateTurnReplyCard, updateReplyCardNativeThinking, prepareReplyCardNativeThinking, retireReplyCardDisplay } from '../src/core/turn-reply-card.js';
-import { abortCotMessage, handleCotThinkingUpdate, finalizeCotMessage } from '../src/im/lark/cot-message.js';
+import { replyCardModeFor, queueTurnReplyTools, flushTurnReplyTools, updateTurnReplyCard, updateReplyCardNativeThinking, prepareReplyCardNativeThinking, retireReplyCardDisplay, supersedeTurnReplyCard } from '../src/core/turn-reply-card.js';
+import { abortCotMessage, handleCotThinkingSuperseded, handleCotThinkingUpdate, finalizeCotMessage } from '../src/im/lark/cot-message.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
 import { loadWorkerPoolMessageHandlers } from './helpers/worker-pool-message-harness.js';
 import { loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
@@ -224,6 +224,55 @@ describe('unified replies with an independent native CoT channel', () => {
       expect(next).toMatchObject({ nativeCotVisible: true });
       expect(next.messageId).toBeUndefined();
     }
+  });
+
+  it('keeps a handed-back turn on the answer card when the native channel is switched on again', async () => {
+    bot.config.replyCardNativeCot = true;
+    const handle = worker();
+    const pushedText = () => JSON.stringify(request.mock.calls.filter(([req]) => req.method === 'PUT'));
+    // Worker snapshots are cumulative.
+    const steps = (count: number) => ({ ...update(''), entries: Array.from({ length: count }, (_, i) => ({ kind: 'thinking', text: `step ${i + 1}` })) });
+    handle(steps(1)); await settle(); await flushTurnReplyTools(ds, 'om_turn');
+    bot.config.noCotChats = [ds.chatId];
+    handle(steps(2)); await settle(); await flushTurnReplyTools(ds, 'om_turn');
+    expect(send).toHaveBeenCalledTimes(1);
+    bot.config.noCotChats = [];
+    handle(steps(3)); await settle(); await flushTurnReplyTools(ds, 'om_turn');
+    expect(pushedText()).toContain('step 1');
+    expect(pushedText()).not.toContain('step 3');
+    expect(vi.mocked(updateMessage).mock.calls.length).toBeGreaterThan(0);
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not hand a steer-merged turn back to a card before it is superseded', async () => {
+    bot.config.replyCardNativeCot = true;
+    const handle = worker();
+    handle(update('reading')); await settle(); await flushTurnReplyTools(ds, 'om_turn');
+    // The worker's last cumulative update is still buffered when the steer is confirmed.
+    handle(update('reading', 'merging')); await settle();
+    expect(handleCotThinkingSuperseded(ds, { type: 'thinking_superseded', sessionId: 'native-session', turnId: 'om_turn' } as any)).toBe(true);
+    await settle(); await flushTurnReplyTools(ds, 'om_turn');
+    await supersedeTurnReplyCard(ds, { turnId: 'om_turn' }, send, () => true);
+    expect(send).not.toHaveBeenCalled();
+    expect(new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' })).toMatchObject({ phase: 'superseded', nativeCotVisible: true });
+  });
+
+  it.each([true, false])('reports native thinking as live to the answer barrier only when it carries the turn (switched off mid-create=%s)', async switchedOff => {
+    bot.config.replyCardNativeCot = true;
+    let releaseCreate!: () => void;
+    request.mockImplementation(async (req: any) => {
+      if (req.method === 'POST' && String(req.url).endsWith('/message_cot')) {
+        await new Promise<void>(resolve => { releaseCreate = resolve; });
+        return { code: 0, data: { cot_id: 'cot_native', message_id: 'om_cot' } };
+      }
+      return { code: 0, data: {} };
+    });
+    expect(replyCardModeFor(ds, 'om_turn')).toBe('unified');
+    const ready = prepareReplyCardNativeThinking(ds, 'om_turn');
+    await vi.waitFor(() => expect(releaseCreate).toBeTypeOf('function'));
+    if (switchedOff) bot.config.noCotChats = [ds.chatId];
+    releaseCreate();
+    expect(await ready).toBe(!switchedOff);
   });
 
   it('keeps a finished turn on native thinking so a separately sent final adds no summary card', async () => {
