@@ -4575,6 +4575,29 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
   if (action.action === 'workstream_rename') {
     return jsonRes(res, 403, { ok: false, error: 'project_workstream_route_required' });
   }
+  if (action.action === 'dispatch' || action.action === 'report') {
+    if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(action.dispatchRoot)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_dispatch_root' });
+    }
+    const imported = readProjectAttachmentRecord(config.session.dataDir, action.dispatchRoot);
+    if (imported) {
+      if (action.action === 'dispatch') {
+        // dispatch --into is a coordination message, not authority to rename
+        // or re-claim an imported source from a bot/notification turn.
+        if (action.title || action.purpose || action.status || action.progress !== undefined
+          || action.owners !== undefined) {
+          return jsonRes(res, 403, { ok: false, error: 'project_workstream_route_required' });
+        }
+        const current = readProjectGroup(config.session.dataDir, ds.chatId);
+        return current && imported.chatId === ds.chatId && imported.coordinatorLarkAppId === ds.larkAppId
+          ? jsonRes(res, 200, { ok: true, project: current })
+          : jsonRes(res, 403, { ok: false, error: 'project_coordinator_required' });
+      }
+      if (!action.expectedAttachment) {
+        return jsonRes(res, 403, { ok: false, error: 'project_workstream_route_required' });
+      }
+    }
+  }
   if (action.action === 'report' && action.expectedAttachment && !isTrustedHostIpcRequest(req)) {
     return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
   }
