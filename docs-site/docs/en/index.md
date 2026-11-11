@@ -57,6 +57,7 @@ For the full walkthrough (Lark international, manual permission setup, troublesh
 | Switch CLIs, or pick a CLI for one session | [CLI adapters](/en/adapters) |
 | Manage bots, sessions, and config in a web UI | [Dashboard](/en/dashboard) · [Global Settings](/en/global-settings) |
 | Watch several sessions' progress and terminals at once | [Agent Workbench](/en/workbench) |
+| Manage several machines in one website, open Dashboards and terminals from anywhere, and work with a team | [Central Platform (open source)](/en/platform) |
 
 More: [Roles & teams](/en/roles) · [File sandbox](/en/sandbox) · [Voice summary](/en/voice) · [Local whiteboard](/en/whiteboard) · [Persistent tmux sessions](/en/tmux) · [Feedback storage](/en/feedback-storage) · [Model Proxy (experimental)](/en/model-proxy) · [Slash commands](/en/slash-commands) · [CLI commands](/en/cli-commands) · [Architecture overview](/en/architecture) · [Best practices](/en/best-practices)
 

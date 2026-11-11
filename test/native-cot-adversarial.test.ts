@@ -155,7 +155,8 @@ describe('independent native CoT adversarial lifecycle', () => {
       }
     };
     const answer = vi.fn(async () => 'om_answer');
-    const start = updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, answer);
+    const start = updateTurnReplyCard(ds, 'om_turn', { kind: 'final', text: 'answer', source: 'bridge',
+      card: '{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"answer"}]}}' }, answer);
     await until(() => releaseCreate !== undefined);
     expect(answer).not.toHaveBeenCalled();
     releaseCreate!(); await until(() => releasePrologue !== undefined);

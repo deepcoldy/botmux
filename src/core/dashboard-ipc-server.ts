@@ -2153,7 +2153,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/reply-card-ready', async (req, res, p
     || (attempt !== undefined && (!Number.isSafeInteger(attempt) || Number(attempt) < 1))) {
     return jsonRes(res, 409, { ok: false, error: 'reply_turn_changed' });
   }
-  await prepareReplyCardNativeThinking(ds, turnId, attempt as number | undefined);
+  const nativeThinkingVisible = await prepareReplyCardNativeThinking(ds, turnId, attempt as number | undefined);
   const current = findActiveBySessionId(params.sessionId);
   if (!sessionCliIpcAuth(req, current, params.sessionId, body).ok || (current && replyCardDispatchAttempt(current, turnId) !== attempt)) {
     return jsonRes(res, 409, { ok: false, error: 'reply_attempt_changed' });
@@ -2161,7 +2161,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/reply-card-ready', async (req, res, p
   if (current !== ds || current?.currentTurnId !== turnId || current?.session.status === 'closed') {
     return jsonRes(res, 409, { ok: false, error: 'reply_turn_changed' });
   }
-  return jsonRes(res, 200, { ok: true });
+  // The CLI persists this with the barrier; absent (older daemon) means the
+  // answer card keeps showing progress.
+  return jsonRes(res, 200, { ok: true, nativeThinkingVisible: nativeThinkingVisible === true });
 });
 
 /** Session-bound single-message delivery through the primary durable outbox.

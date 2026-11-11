@@ -147,7 +147,7 @@ An invalid timezone name is skipped and the next level is used. The auto-update 
 |---|---|---|
 | GitHub download proxy (`httpProxy`) | System & Maintenance → Auto Maintenance | HTTP proxy for GitHub downloads when the standalone binary updates itself, e.g. `http://127.0.0.1:7890`. If empty, `HTTPS_PROXY` / `HTTP_PROXY` are used, otherwise it connects directly. npm / pnpm / Bun installs use their own proxy settings |
 | OAuth callback base URL (`oauthRedirectBase`) | General → Access | After a Feishu authorization (e.g. `/login`), Feishu redirects here and the Dashboard finishes it, so you don't paste the callback URL by hand. Useful when botmux doesn't run on your own computer. Enter scheme + host + port only, e.g. `http://10.1.2.3:7891`. After changing it, open any bot's "Session-group tag" row and click "Fix Open Platform callback", otherwise Feishu returns error 20029 |
-| Remote terminal access (`remoteAccess`) | General → Access | Off by default. Shown only when this machine is bound to the central platform. When on, session terminals, card terminal buttons, and webhook URLs use platform links; off uses local links |
+| Remote terminal access (`remoteAccess`) | General → Access | Off by default. Shown only when this machine is bound to the [central platform](/en/platform). When on, session terminals, card terminal buttons, and webhook URLs use platform links; off uses local links |
 
 For the web terminal itself, see [Web Terminal](/en/web-terminal).
 
