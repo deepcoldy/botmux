@@ -27,7 +27,7 @@ import { deliverAuthLink } from './auth-link-delivery.js';
 import { platformTeammateVerdict } from './platform-teammate.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
-import { renderPluginCommandHelp } from './plugins/commands/runtime.js';
+import { pluginCommandGateway, renderPluginCommandHelp } from './plugins/commands/runtime.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
 import { markReportReplyInput } from './report-source-reply.js';
@@ -2758,12 +2758,31 @@ export async function handleCommand(
           }
           // Run only after a clean explicit close, never on crash/restart/refusal.
           // The already-closed session and its receipt do not wait for OAuth/IM.
-          void tagClosedSessionGroup(closed.current.larkAppId, closed.current.chatId, targetSessionId)
+          const closeTagging = pluginCommandGateway.replacesCloseTag(closed.current.larkAppId)
+            ? Promise.resolve({ status: 'skipped' as const })
+            : tagClosedSessionGroup(closed.current.larkAppId, closed.current.chatId, targetSessionId);
+          void closeTagging
+            .catch(() => ({ status: 'failed' as const }))
             .then(async result => {
-              if (result.status === 'skipped') return;
-              await sessionReply(rootId, result.status === 'updated'
-                ? t('cmd.close.tag_updated', { name: result.name }, loc)
-                : t('cmd.close.tag_failed', undefined, loc));
+              if (result.status !== 'skipped') {
+                try {
+                  await sessionReply(rootId, result.status === 'updated'
+                    ? t('cmd.close.tag_updated', { name: result.name }, loc)
+                    : t('cmd.close.tag_failed', undefined, loc));
+                } catch (error) { logger.warn(`[${logTag}] close tag receipt failed: ${error}`); }
+              }
+              const outcomes = await pluginCommandGateway.afterClose({
+                larkAppId: closed.current.larkAppId, eventId: message.messageId, issuedAt: Number(message.createTime) || Date.now(),
+                command: '/close', args: '',
+                chat: { chatId: closed.current.chatId, chatType: closed.current.session.chatType ?? message.chatType ?? null, anchor: rootId },
+                sender: { openId: message.senderId ?? null, unionId: message.senderUnionId ?? null },
+                privileges: { canTalk: true, canOperate: canOperate(closed.current.larkAppId, closed.current.chatId, message.senderId, message.senderUnionId) },
+                locale: loc,
+              });
+              for (const outcome of outcomes) {
+                if (!outcome.ok) await sessionReply(rootId, '会话已关闭，但插件后续操作未确认，请检查群分类。');
+                else if (outcome.reply?.kind === 'text') await sessionReply(rootId, outcome.reply.text);
+              }
             }).catch(err => logger.warn(`[${logTag}] close tag notification failed: ${err}`));
           // 「会话已关闭」卡片优先「仅自己可见」：普通群顶层走 ephemeral 只发给
           // 执行 /close 的本人；若本命令从折叠到 chat-scope 的真实话题触发，则

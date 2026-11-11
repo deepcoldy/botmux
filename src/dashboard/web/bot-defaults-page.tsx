@@ -668,6 +668,8 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     groupJoinCommandEnabled: body.groupJoinCommandEnabled,
     groupJoinCommand: body.groupJoinCommand,
     autoStartOnNewTopic: body.autoStartOnNewTopic,
+    chatManagerEnabled: body.chatManagerEnabled,
+    chatManagerSharedTopic: body.chatManagerSharedTopic,
     autoStartExcludedChats: body.autoStartExcludedChats,
     regularGroupReplyMode: body.regularGroupReplyMode,
     regularGroupMentionMode: body.regularGroupMentionMode,
@@ -6800,6 +6802,8 @@ function SessionModeSection(props: {
   const [docStatus, setDocStatus] = useState<StatusMessage>(null);
   const [chatManager, setChatManager] = useState(props.bot.chatManagerEnabled === true);
   const [chatManagerStatus, setChatManagerStatus] = useState<StatusMessage>(null);
+  const [chatManagerSharedTopic, setChatManagerSharedTopic] = useState(props.bot.chatManagerSharedTopic === true);
+  const [chatManagerSharedTopicStatus, setChatManagerSharedTopicStatus] = useState<StatusMessage>(null);
   const [groupSecretary, setGroupSecretary] = useState(props.bot.groupSecretaryEnabled === true);
   const [groupSecretaryStatus, setGroupSecretaryStatus] = useState<StatusMessage>(null);
 
@@ -6817,6 +6821,9 @@ function SessionModeSection(props: {
   useEffect(() => {
     setChatManager(props.bot.chatManagerEnabled === true);
   }, [props.bot.chatManagerEnabled]);
+  useEffect(() => {
+    setChatManagerSharedTopic(props.bot.chatManagerSharedTopic === true);
+  }, [props.bot.chatManagerSharedTopic]);
   useEffect(() => {
     setGroupSecretary(props.bot.groupSecretaryEnabled === true);
   }, [props.bot.groupSecretaryEnabled]);
@@ -6997,6 +7004,19 @@ function SessionModeSection(props: {
         }}
       />
       <div className="bd-mode-group-side" style={{ margin: '0 0 8px' }}><StatusSpan status={chatManagerStatus} attr={{ 'data-chat-manager-status': '' }} /></div>
+
+      <ToggleRow
+        checked={chatManagerSharedTopic}
+        disabled={busy === 'chatManagerSharedTopic' || !chatManager}
+        dataAction="toggle-chat-manager-shared-topic"
+        title={tr('botDefaults.chatManagerSharedTopicTitle')}
+        help={tr('botDefaults.chatManagerSharedTopicHelp')}
+        onChange={checked => {
+          setChatManagerSharedTopic(checked);
+          void saveCardMode('chatManagerSharedTopic', { chatManagerSharedTopic: checked }, setChatManagerSharedTopicStatus);
+        }}
+      />
+      <div className="bd-mode-group-side" style={{ margin: '0 0 8px' }}><StatusSpan status={chatManagerSharedTopicStatus} attr={{ 'data-chat-manager-shared-topic-status': '' }} /></div>
 
       <ToggleRow
         checked={groupSecretary}

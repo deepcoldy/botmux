@@ -84,6 +84,10 @@ export interface ProtectedLoopbackService {
   path: string;
   forwardHeaders: string[];
   attestProcessPeer?: boolean;
+  /** How long the upstream may stay silent before the request is cut (default
+   *  {@link UPSTREAM_TIMEOUT_MS}). A route that holds its answer while it
+   *  waits on slow work (a platform credential grant) declares a longer one. */
+  upstreamTimeoutMs?: number;
 }
 
 export interface ProtectedLoopbackForwardRequest {
@@ -192,6 +196,10 @@ function normalizeLoopbackServices(raw: readonly ProtectedLoopbackService[] | un
       forwardHeaders.push(header);
     }
     if (service.attestProcessPeer !== undefined && service.attestProcessPeer !== true) {
+      throw new Error('invalid_protected_loopback_service');
+    }
+    if (service.upstreamTimeoutMs !== undefined
+      && (!Number.isSafeInteger(service.upstreamTimeoutMs) || service.upstreamTimeoutMs <= 0)) {
       throw new Error('invalid_protected_loopback_service');
     }
     return { ...service, method, path, forwardHeaders };
@@ -531,7 +539,7 @@ function defaultLoopbackForwarder(
       path: request.path,
       headers,
       agent: false,
-      timeout: UPSTREAM_TIMEOUT_MS,
+      timeout: service.upstreamTimeoutMs ?? UPSTREAM_TIMEOUT_MS,
     }, response => resolve({
       status: response.statusCode ?? 502,
       headers: response.headers,

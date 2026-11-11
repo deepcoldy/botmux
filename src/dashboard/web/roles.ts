@@ -4,6 +4,7 @@ import type {
 } from './role-profile-match.js';
 import { effectiveRoleKey, loadEffectiveRoleMap } from './role-batch.js';
 import { readJson } from './dashboard-api.js';
+import type { GroupDefaultModels } from '../../core/group-default-models.js';
 import type { ListenerContentPolicy } from '../../services/message-listener-content-policy.js';
 
 export interface BotInfo {
@@ -12,6 +13,11 @@ export interface BotInfo {
   inChat: boolean;
   hasRole: boolean;
   hasMessageListener?: boolean;
+  hasMessageListenerConfig?: boolean;
+  agentCliId?: string;
+  agentModel?: string;
+  agentReasoningEffort?: string;
+  defaultModels?: GroupDefaultModels;
   oncallChat: unknown;
 }
 
@@ -214,6 +220,14 @@ export function entryForBot(entries: RoleProfileEntry[], larkAppId: string | nul
   return larkAppId ? entries.find(entry => entry.larkAppId === larkAppId) : undefined;
 }
 
+/** Rank by configured listener count, then present Bot count; preserve the API order on ties. */
+export function sortRoleGroups(groups: readonly GroupInfo[]): GroupInfo[] {
+  return groups.map(group => {
+    const bots = group.memberBots.filter(bot => bot.inChat);
+    return { group, bots: bots.length, listeners: bots.filter(bot => bot.hasMessageListenerConfig ?? bot.hasMessageListener).length };
+  }).sort((a, b) => b.listeners - a.listeners || b.bots - a.bots).map(entry => entry.group);
+}
+
 export function filterRoleGroups(groups: GroupInfo[], filter: string): GroupInfo[] {
   const q = filter.toLowerCase();
   if (!q) return groups;
@@ -249,6 +263,11 @@ export async function loadGroups(): Promise<{ groups: GroupInfo[]; bots: Dashboa
         inChat: member.inChat ?? false,
         hasRole: member.hasRole ?? false,
         hasMessageListener: member.hasMessageListener ?? false,
+        hasMessageListenerConfig: member.hasMessageListenerConfig ?? member.hasMessageListener ?? false,
+        agentCliId: member.agentCliId ?? member.cliId,
+        agentModel: member.agentModel,
+        agentReasoningEffort: member.agentReasoningEffort,
+        defaultModels: member.defaultModels,
         oncallChat: member.oncallChat ?? null,
       })),
     })),

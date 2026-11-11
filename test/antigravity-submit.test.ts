@@ -185,4 +185,116 @@ describe('antigravity writeInput — single-Enter submit', () => {
     expect(typeof result?.recheck).toBe('function');
     expect(fake.enterCount()).toBe(1);
   });
+
+  /** Build through the actual launch contract so capability is tied to this adapter instance. */
+  function adapterForVersion(cliVersion?: string) {
+    const selected = createAntigravityAdapter('/usr/local/bin/agy');
+    selected.buildArgs({ sessionId: 'agy-paste-test', resume: false, reattach: false, cliVersion });
+    return selected;
+  }
+
+  it('submits long modern input as one framed PTY write with one trailing Enter', async () => {
+    resetHistory();
+    const selected = adapterForVersion('1.5.4');
+    const content = '<user_message>\n中文🙂 input\n\n' + 'padding\n'.repeat(1000) + '</user_message>';
+    const writes: string[] = [];
+    const fake = makePty();
+    fake.pty.write = data => { writes.push(data); appendHistory(content); return true; };
+    await selected.writeInput(fake.pty, content);
+    expect(writes).toEqual(['\x1b[200~' + content + '\x1b[201~\r']);
+    expect(fake.texts).toEqual([]);
+    expect(fake.specialKeys).toEqual([]);
+  });
+
+  it('uses an atomic backend paste+submit capability without sending another Enter', async () => {
+    resetHistory();
+    const content = 'atomic\n中文\n';
+    const calls: string[] = [];
+    const fake = makePty();
+    fake.pty.submitBracketedPaste = text => { calls.push(text); appendHistory(text); return true; };
+    fake.pty.write = () => { throw new Error('unexpected raw write'); };
+    await adapterForVersion('1.5.4').writeInput(fake.pty, content);
+    expect(calls).toEqual([content]);
+    expect(fake.specialKeys).toEqual([]);
+    expect(fake.texts).toEqual([]);
+  });
+
+  for (const version of [undefined, 'unknown', '1.5.3', '1.5.4-beta.1']) {
+    it(`retains the legacy soft-newline path for version ${version}`, async () => {
+      resetHistory();
+      const content = 'legacy\n中文';
+      const fake = makePty({ onEnter: () => appendHistory(content) });
+      let atomicCalls = 0;
+      fake.pty.submitBracketedPaste = () => { atomicCalls++; return true; };
+      await adapterForVersion(version).writeInput(fake.pty, content);
+      expect(fake.texts).toEqual(['legacy', '中文']);
+      expect(fake.specialKeys).toEqual([['M-Enter'], ['Enter']]);
+      expect(atomicCalls).toBe(0);
+    });
+  }
+
+  for (const failure of ['false', 'throw'] as const) {
+    it(`does not replay or switch input methods after an ambiguous modern write: ${failure}`, async () => {
+      resetHistory();
+      const content = 'ambiguous\nmessage';
+      const fake = makePty();
+      let calls = 0;
+      fake.pty.submitBracketedPaste = () => {
+        calls++;
+        if (failure === 'throw') throw new Error('acknowledgement lost');
+        return false;
+      };
+      const result = await adapterForVersion('1.5.4').writeInput(fake.pty, content);
+      expect(result?.submitted).toBe(false);
+      expect(calls).toBe(1);
+      expect(fake.texts).toEqual([]);
+      expect(fake.specialKeys).toEqual([]);
+      appendHistory(content);
+      expect(result?.recheck?.()).toBe(true);
+    });
+  }
+
+  it('accepts a late receipt after a modern write returned false, without retrying', async () => {
+    resetHistory();
+    const content = 'late paste receipt';
+    let calls = 0;
+    const fake = makePty();
+    fake.pty.submitBracketedPaste = () => { calls++; void delay(800).then(() => appendHistory(content)); return false; };
+    expect(await adapterForVersion('1.5.4').writeInput(fake.pty, content)).toBeUndefined();
+    expect(calls).toBe(1);
+    expect(fake.specialKeys).toEqual([]);
+  });
+
+  it('normalizes pasted CRLF and refuses ESC before any terminal write', async () => {
+    resetHistory();
+    const selected = adapterForVersion('1.5.4');
+    const writes: string[] = [];
+    const fake = makePty();
+    fake.pty.submitBracketedPaste = text => { writes.push(text); appendHistory(text); return true; };
+    await selected.writeInput(fake.pty, 'one\r\ntwo\rthree');
+    expect(writes).toEqual(['one\ntwo\nthree']);
+    const blocked = await selected.writeInput(fake.pty, 'payload\x1b[201~\r/clear');
+    expect(blocked?.submitted).toBe(false);
+    expect(writes).toHaveLength(1);
+  });
+
+  it('keeps version selection local to each launch and resets it on unknown launches', async () => {
+    resetHistory();
+    const content = 'one\ntwo';
+    const selected = adapterForVersion('1.5.4');
+    selected.buildArgs({ sessionId: 'agy-new-generation', resume: true, cliVersion: 'unknown' });
+    const fake = makePty({ onEnter: () => appendHistory(content) });
+    await selected.writeInput(fake.pty, content);
+    expect(fake.specialKeys).toEqual([['M-Enter'], ['Enter']]);
+  });
+
+  it('does not apply an upgraded installation version to a surviving older pane', async () => {
+    resetHistory();
+    const selected = adapterForVersion('1.5.4');
+    selected.buildArgs({ sessionId: 'agy-existing-pane', resume: true, reattach: true, cliVersion: '1.5.4' });
+    const content = 'surviving\nolder CLI';
+    const fake = makePty({ onEnter: () => appendHistory(content) });
+    await selected.writeInput(fake.pty, content);
+    expect(fake.specialKeys).toEqual([['M-Enter'], ['Enter']]);
+  });
 });

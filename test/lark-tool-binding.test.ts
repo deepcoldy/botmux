@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { larkToolBindingPath, larkToolChildEnv, larkToolPrompt, larkToolPromptFromEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding, cleanupLarkToolBinding, larkToolLoopbackService, sessionLarkToolBound } from '../src/core/lark-tool-binding.js';
 import { sessionIdentityBinDir, sessionIdentityDataDir } from '../src/core/cli-identity.js';
+import { GRANT_ROUTE_CLIENT_TIMEOUT_MS, TOTAL_BUDGET_MS } from '../src/platform/credential-grant-budget.js';
 import { readLarkToolHelp, fakeLarkHelpScript } from './helpers/lark-tool-help.js';
 import { nodeTsRunnerPrefix, spawnSyncTsScript, spawnTsScript } from './helpers/ts-runner.js';
 
@@ -27,7 +28,10 @@ describe('managed lark-cli binding', () => {
       path: '/api/sessions/session-a/lark-tool-identity',
       forwardHeaders: ['content-type', 'x-botmux-lark-session'],
       attestProcessPeer: true,
+      // The route can run a platform grant: the relay must outlast it.
+      upstreamTimeoutMs: GRANT_ROUTE_CLIENT_TIMEOUT_MS,
     });
+    expect(GRANT_ROUTE_CLIENT_TIMEOUT_MS).toBeGreaterThan(TOTAL_BUDGET_MS);
   });
 
   it('is default ON unless explicitly disabled (larkToolBinding: false); leaves adopt/remote/workflow alone', () => {

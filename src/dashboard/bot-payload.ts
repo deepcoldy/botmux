@@ -248,6 +248,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     groupJoinCommand: typeof j?.groupJoinCommand === 'string' ? j.groupJoinCommand : '',
     autoStartOnNewTopic: j?.autoStartOnNewTopic === true,
     chatManagerEnabled: j?.chatManagerEnabled === true,
+    chatManagerSharedTopic: j?.chatManagerSharedTopic === true,
     groupSecretaryEnabled: j?.groupSecretaryEnabled === true,
     autoStartExcludedChats: Array.isArray(j?.autoStartExcludedChats) ? j.autoStartExcludedChats : [],
     summaryRange: j?.summaryRange

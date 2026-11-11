@@ -1,7 +1,7 @@
 import { modelPinView, cliMatchesBot, type ModelPin } from './model-pin.js';
 import { isPinSuspendedForAdopt } from './shared-adopt.js';
 import { cliModelSupportsReasoningEffort, reasoningEffortsForCliModel, type CodexReasoningEffort } from '../services/codex-reasoning-effort.js';
-import { groupModelSettings, type GroupDefaultModels, type GroupModelSettings } from './group-default-models.js';
+import { isGroupModelCliId, groupModelSettings, type GroupDefaultModels, type GroupModelSettings } from './group-default-models.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { supportsCodexModelSelection } from '../services/codex-model-selection.js';
 import {
@@ -37,7 +37,7 @@ export type LaunchModelSession = {
 /** Scope is checked at launch: some creation paths assign it after creating the row. */
 export function resolveSessionGroupSettings(ds: LaunchModelSession, cliId: string | undefined): GroupModelSettings {
   const isTopic = ds.session.scope !== 'chat' && ds.session.chatType !== 'p2p' && !ds.session.adoptedFrom;
-  return isTopic && (cliId === 'codex' || cliId === 'claude-code')
+  return isTopic && isGroupModelCliId(cliId)
     ? groupModelSettings(ds.session.groupDefaultModels?.[cliId]) : {};
 }
 

@@ -852,4 +852,47 @@ describe('session protected HTTP egress host', () => {
       forward: async () => ({ status: 204, headers: {}, body: Buffer.alloc(0) }),
     })).rejects.toThrow(/not a directory/);
   });
+
+  // The default relay cut a silent upstream after a fixed 30s. A daemon route
+  // that runs a platform credential grant can legitimately stay silent that
+  // long, so it declares its own timeout and the relay must honour it.
+  it.each([
+    ['delivers a slow answer when the service allows the upstream longer than it takes', 2_000, 200],
+    ['still cuts an upstream that stays silent past the service\'s own timeout', 100, 502],
+  ] as const)('%s', async (_label, upstreamTimeoutMs, expectedStatus) => {
+    const daemon = new HttpServer((req, res) => {
+      req.resume();
+      req.once('end', () => setTimeout(() => {
+        if (res.destroyed) return;
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end('{"ok":true}');
+      }, 400));
+    });
+    await new Promise<void>(resolve => daemon.listen(0, '127.0.0.1', resolve));
+    cleanups.push(() => new Promise<void>(resolve => { daemon.closeAllConnections(); daemon.close(() => resolve()); }));
+    const port = (daemon.address() as { port: number }).port;
+    const path = '/api/sessions/session-a/lark-tool-identity';
+    const { host, auth } = await start({
+      loopbackServices: [{
+        id: 'lark-tool-identity', listenPort: port, upstreamPort: port, method: 'POST', path,
+        forwardHeaders: ['content-type'], upstreamTimeoutMs,
+      }],
+    });
+    const result = await unixHttpRequest(host.socketPath, 'POST', path, {
+      'x-botmux-egress-auth': auth,
+      'x-botmux-loopback-service': 'lark-tool-identity',
+      'content-type': 'application/json',
+    }, Buffer.from('{"mode":"user"}'));
+    expect(result.status).toBe(expectedStatus);
+    if (expectedStatus === 200) expect(result.body.toString('utf8')).toBe('{"ok":true}');
+  });
+
+  it.each([0, -1, 1.5, Number.NaN])('rejects a loopback service with upstream timeout %s', async upstreamTimeoutMs => {
+    await expect(start({
+      loopbackServices: [{
+        id: 'lark-tool-identity', listenPort: 7950, upstreamPort: 7950, method: 'POST',
+        path: '/api/sessions/session-a/lark-tool-identity', forwardHeaders: ['content-type'], upstreamTimeoutMs,
+      }],
+    })).rejects.toThrow('invalid_protected_loopback_service');
+  });
 });

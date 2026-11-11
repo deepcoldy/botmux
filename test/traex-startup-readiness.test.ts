@@ -29,6 +29,30 @@ const LOADED = `╭────────────────────�
 ❯ Find and fix a bug in @filename
   GPT-6-Astra xhigh · Context 100% left · /data00/home/huangyuhang.edu`;
 
+// Real tmux 160x50 frames from traecli 0.214.1. The empty composer paints in
+// ~1.5s, but the model/context footer only appears after the model list fetch
+// resolves (measured above 30s on a slow network); until then the only footer
+// row is the native shortcut hint. Requiring a Context row here held the first
+// prompt until the 90s hard timeout even though the composer already accepted
+// keystrokes.
+const SHORTCUT_ONLY_YOLO = [
+  '  █ ◆ ◆ █  TRAE CLI (v0.214.1)',
+  '  /tmp/traex0214/work',
+  '  permissions: YOLO mode',
+  '──────────────────────────────────────────────────────────',
+  '❯ Ask TRAE CLI to do anything',
+  '──────────────────────────────────────────────────────────',
+  '  ? for shortcuts',
+];
+const SHORTCUT_ONLY_STANDARD = [
+  '  █ ◆ ◆ █  TRAE CLI (v0.214.1)',
+  '  /tmp/traex0214/work',
+  '──────────────────────────────────────────────────────────',
+  '❯ Ask TRAE CLI to do anything',
+  '──────────────────────────────────────────────────────────',
+  '  ? for shortcuts',
+];
+
 const REPOSITORY_NOTICE = [
   '  █ ◆ ◆ █  TRAE CLI (v0.212.1)',
   '  ~/projects',
@@ -328,6 +352,23 @@ old completed response
     quiet();
     expect(idle).toHaveBeenCalledTimes(1);
   });
+
+  it('releases the startup hold when a 0.214.1 shortcut-only frame replaces the loading skeleton', () => {
+    detector.feed(LOADING);
+    quiet();
+    expect(idle).not.toHaveBeenCalled();
+    expect(detector.observeStartupHistory(SHORTCUT_ONLY_YOLO.join('\n'))).toBe(true);
+    expect(detector.isStartupPending()).toBe(false);
+  });
+
+  it('does not release the startup hold on the 0.205 combined shortcut/context loading row', () => {
+    detector.feed(LOADING);
+    const combined = SHORTCUT_ONLY_YOLO.slice(0, -1)
+      .concat('  ? for shortcuts                                                                                        100% context left')
+      .join('\n');
+    expect(detector.observeStartupHistory(combined)).toBe(false);
+    expect(detector.isStartupPending()).toBe(true);
+  });
 });
 
 
@@ -373,4 +414,42 @@ describe('TraeX initialized composer', () => {
       expect(traexRestoredComposerReady(['◆ Previous instructions:', `  ${line}`,
         '■ Conversation interrupted', ...INITIALIZED_COMPOSER].join('\n'))).toBe(true);
     });
+});
+
+// Real tmux 160x50 frames from traecli 0.214.1: see SHORTCUT_ONLY_* above.
+describe('TraeX 0.214.1 shortcut-only startup footer', () => {
+  it.each([
+    ['YOLO cold start', SHORTCUT_ONLY_YOLO],
+    ['standard workspace cold start', SHORTCUT_ONLY_STANDARD],
+    ['agents hint only', SHORTCUT_ONLY_YOLO.slice(0, -1).concat('  ← for agents')],
+    ['both hint tokens', SHORTCUT_ONLY_YOLO.slice(0, -1).concat('  ? for shortcuts · ← for agents')],
+  ])('accepts the initialized empty composer before the model footer resolves: %s', (_name, rows) => {
+    expect(traexRestoredComposerReady(rows.join('\n'))).toBe(true);
+  });
+
+  it('accepts the same frame on an exact resume', () => {
+    expect(traexRestoredComposerReady(SHORTCUT_ONLY_STANDARD.join('\n'), { resumedSession: true })).toBe(true);
+  });
+
+  it.each([
+    ['migration dialog below the hint', [
+      ...SHORTCUT_ONLY_YOLO,
+      '',
+      '  > Legacy TRAE CLI data detected',
+      '  Would you like to migrate detected data to the new TRAE CLI storage?',
+      '    1. Proceed with selected',
+      '    2. Skip for now',
+    ]],
+    ['draft in the composer', SHORTCUT_ONLY_YOLO.map(row => row.replace('Ask TRAE CLI to do anything', 'my unsent draft'))],
+    ['0.205 loading skeleton keeps its combined context row', [
+      ...SHORTCUT_ONLY_YOLO.slice(0, -1),
+      '  ? for shortcuts                                                                                        100% context left',
+    ]],
+    ['unknown notification sentence', SHORTCUT_ONLY_YOLO.slice(0, -1).concat('  Please wait while models load')],
+    ['hint row with extra suffix', SHORTCUT_ONLY_YOLO.slice(0, -1).concat('  ? for shortcuts  loading')],
+    ['login surface above the composer', ['Sign in to TraeCode CLI', ...SHORTCUT_ONLY_YOLO]],
+    ['picker composer row', SHORTCUT_ONLY_YOLO.map(row => row.replace('Ask TRAE CLI to do anything', '1. Continue'))],
+  ])('keeps non-ready or blocked surfaces gated: %s', (_name, rows) => {
+    expect(traexRestoredComposerReady(rows.join('\n'))).toBe(false);
+  });
 });

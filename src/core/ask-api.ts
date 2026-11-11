@@ -90,7 +90,8 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
   if (
     typeof r.timeoutMs !== 'number' ||
     !Number.isFinite(r.timeoutMs) ||
-    r.timeoutMs < 1000
+    (r.timeoutMs < 1000 && !(r.timeoutMs === 0 && r.originKind === 'explicit'
+      && typeof r.requestId === 'string' && r.requestId.trim()))
   ) {
     return { error: 'bad_timeoutMs' };
   }

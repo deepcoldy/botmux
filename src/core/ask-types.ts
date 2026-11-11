@@ -182,8 +182,8 @@ export interface CreateAskInput {
   backendSurvivesRestart?: boolean;
   /** 问题列表，调用方保证每问 `options.length ≥ 2（input 或 inputMode=text 时为空）` 且 key 唯一。 */
   questions: ReadonlyArray<AskQuestion>;
-  /** Absolute deadline; computed by caller from `--timeout`. Broker won't
-   *  re-compute. */
+  /** Relative timeout in milliseconds. Zero means no deadline, only for a
+   * daemon-managed explicit Ask with a stable requestId. */
   timeoutMs: number;
   /** 发起 ask 的会话类型。仅用于点击鉴权时把 chatType 喂给 canTalk（p2pOpen 腿）；
    *  缺省时该腿 fail-closed，鉴权退回原语义。 */
@@ -232,6 +232,7 @@ export interface PendingAsk {
   customAnswers?: ReadonlyArray<string | null>;
   customRevision?: number;
   createdAt: number;
+  /** Absolute epoch milliseconds; 0 means an explicit Ask has no deadline. */
   deadlineAt: number;
   /** Set after the card dispatch succeeds. Until then, the ask is "registered
    *  but not visible" — clicks can't physically arrive yet. */

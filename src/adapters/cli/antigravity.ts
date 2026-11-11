@@ -1,9 +1,12 @@
+import { detectModelsViaExec } from './model-catalog-json.js';
+import { parseAntigravityModels } from './antigravity-models.js';
 import { existsSync, statSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { delay } from '../../utils/timing.js';
+import { wrapBracketedPaste } from './tui-input.js';
 import { stripAnsiScreenText } from '../../utils/idle-detector.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult, StructuredBridgeSpec } from './types.js';
@@ -323,6 +326,14 @@ export const antigravityBridgeSpec: StructuredBridgeSpec = {
   spawn: { sessionId: 'cli', baseline: 'birth-aware' },
 };
 
+/** Only release versions with the verified paste contract opt into the fast path. */
+function supportsAntigravityBracketedPaste(version: string | undefined): boolean {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?$/.exec(version?.trim() ?? '');
+  if (!match) return false;
+  const [major = 0, minor = 0, patch = 0] = match.slice(1, 4).map(Number);
+  return major > 1 || (major === 1 && (minor > 5 || (minor === 5 && patch >= 4)));
+}
+
 export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
   // modelChoices and must not shell out (see resolveCommand); the binary path
@@ -330,6 +341,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'agy';
   let cachedBin: string | undefined;
   let sessionLog: AntigravitySessionLog | undefined;
+  let bracketedPasteSupported = false;
   const activeSessionId = (pty: Pick<PtyHandle, 'cliPid' | 'cliCwd'>): string | undefined =>
     sessionLog?.read().currentId
       ?? findAntigravityConversationId({ pid: pty.cliPid, cwd: pty.cliCwd }) ?? undefined;
@@ -343,8 +355,13 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.gemini'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     modelChoices: CLI_MODEL_CHOICES['antigravity'],
+    /** Discover account-visible models without starting a conversation. */
+    async detectModels(options) {
+      return detectModelsViaExec(this.resolvedBin, ['models'], parseAntigravityModels, options?.env);
+    },
 
-    buildArgs({ sessionId, resume, resumeSessionId, disableCliBypass, model, reasoningEffort }) {
+    buildArgs({ sessionId, resume, resumeSessionId, disableCliBypass, model, reasoningEffort, cliVersion, reattach }) {
+      bracketedPasteSupported = reattach === false && supportsAntigravityBracketedPaste(cliVersion);
       const args = disableCliBypass ? [] : ['--dangerously-skip-permissions'];
       sessionLog = new AntigravitySessionLog(sessionId);
       args.push('--log-file', sessionLog.path);
@@ -363,18 +380,8 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       if (reasoningEffort && (reasoningEffort === 'low' || reasoningEffort === 'medium' || reasoningEffort === 'high')) {
         args.push('--effort', reasoningEffort);
       }
-      // NOTE: we deliberately do NOT pass `-i` / `--prompt-interactive`.
-      // Despite the flag's existence in `agy --help`, empirical testing
-      // shows that:
-      //   (a) -i prompts do NOT auto-submit (unlike other CLIs' -i)
-      //   (b) -i prompts do NOT appear in history.jsonl, so we can't even
-      //       confirm submission through our usual marker channel
-      //   (c) a follow-up Enter does not finish the deposit either
-      // Treating -i as the initial-prompt channel would cause the worker
-      // to skip stdin-injection (passesInitialPromptViaArgs=true), and
-      // the user's first message would silently disappear. Instead, the
-      // worker queues the prompt and writeInput delivers it after idle
-      // — same pattern as cursor/aiden. */
+      // agy 1.5.4 supports -i, but its startup prompt bypasses history.jsonl.
+      // Keep the same verified stdin submit path for initial and later turns.
       return args;
     },
 
@@ -410,20 +417,15 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
-      // Two known constraints (verified empirically):
-      //
-      // 1. Bracketed paste (`\e[200~...\e[201~`) doesn't work — agy treats
-      //    the markers as literal characters. So we type each line via
-      //    `send-keys -l` (sendText) and use M-Enter (alt+Enter) between
-      //    lines as the documented soft-newline. Trailing plain Enter is
-      //    the unambiguous submit.
-      //
-      // 2. agy logs every submit to ~/.gemini/antigravity-cli/history.jsonl
-      //    as `{"display":"...","timestamp":...,"workspace":"..."}` —
-      //    same pattern as Codex/CoCo. We poll the delta past `baseByte`
-      //    for our `display` prefix marker. If unseen after the in-band
-      //    poll budget, return {submitted:false, recheck} so the worker
-      //    can warn the user.
+      if (bracketedPasteSupported) {
+        // ESC can terminate a paste frame and turn payload into live keys.
+        if (content.includes('\x1b')) return { submitted: false, failureReason: 'antigravity_paste_control_character' };
+        content = content.replace(/\r\n?/g, '\n');
+      }
+      // agy 1.5.4 accepts complete bracketed-paste frames. Older/unknown
+      // versions retain the original M-Enter soft-newline contract. A write
+      // acknowledgement is not submission evidence: both paths still use the
+      // post-write history delta and never replay an unconfirmed input.
       const baseByte = currentFileSize(HISTORY_PATH);
       const marker = historyMarker(content);
 
@@ -439,44 +441,51 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
         }
       };
 
-      try {
-        if (pty.sendText && pty.sendSpecialKeys) {
-          const lines = content.split('\n');
-          if (typeof pty.sendLines === 'function') {
-            const BATCH_SIZE = 40;
-            for (let i = 0; i < lines.length; i += BATCH_SIZE) {
-              const chunk = lines.slice(i, i + BATCH_SIZE);
-              pty.sendLines(chunk, 'M-Enter');
-              if (i + BATCH_SIZE < lines.length) {
-                pty.sendSpecialKeys('M-Enter');
+      if (bracketedPasteSupported) {
+        try {
+          if (pty.submitBracketedPaste) pty.submitBracketedPaste(content);
+          else pty.write(wrapBracketedPaste(content) + '\r');
+        } catch { /* The input may have landed; confirm it without replaying. */ }
+      } else {
+        try {
+          if (pty.sendText && pty.sendSpecialKeys) {
+            const lines = content.split('\n');
+            if (typeof pty.sendLines === 'function') {
+              const BATCH_SIZE = 40;
+              for (let i = 0; i < lines.length; i += BATCH_SIZE) {
+                const chunk = lines.slice(i, i + BATCH_SIZE);
+                pty.sendLines(chunk, 'M-Enter');
+                if (i + BATCH_SIZE < lines.length) {
+                  pty.sendSpecialKeys('M-Enter');
+                }
+                await delay(10);
               }
-              await delay(10);
+            } else {
+              for (let i = 0; i < lines.length; i++) {
+                if (lines[i].length > 0) pty.sendText(lines[i]);
+                if (i < lines.length - 1) {
+                  pty.sendSpecialKeys('M-Enter');
+                }
+                await delay(10);
+              }
             }
           } else {
+            // Raw PTY fallback (no tmux): write text directly with ESC+\r
+            // for soft newlines.
+            const lines = content.split('\n');
             for (let i = 0; i < lines.length; i++) {
-              if (lines[i].length > 0) pty.sendText(lines[i]);
-              if (i < lines.length - 1) {
-                pty.sendSpecialKeys('M-Enter');
-              }
+              pty.write(lines[i]);
+              if (i < lines.length - 1) pty.write('\x1b\r');
               await delay(10);
             }
           }
-        } else {
-          // Raw PTY fallback (no tmux): write text directly with ESC+\r
-          // for soft newlines.
-          const lines = content.split('\n');
-          for (let i = 0; i < lines.length; i++) {
-            pty.write(lines[i]);
-            if (i < lines.length - 1) pty.write('\x1b\r');
-            await delay(10);
-          }
+        } catch {
+          return { submitted: false };
         }
-      } catch {
-        return { submitted: false };
-      }
 
-      await delay(300);
-      if (!trySendEnter()) return { submitted: false };
+        await delay(300);
+        if (!trySendEnter()) return { submitted: false };
+      }
 
       // Single Enter only — do NOT retry it. agy's history.jsonl append can
       // lag well past a short per-attempt window (cold start, large initial
