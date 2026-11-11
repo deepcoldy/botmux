@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
-import { sameRuntime, type ContractSessionRef, type WorkerRef, type RuntimeRef, type ExecutionRef, type SessionEventContext, type RuntimeIdentity, type ExecutionAdmissionState } from './session-contract.js';
+import { sameRuntime, sameExecution, type ContractSessionRef, type WorkerRef, type RuntimeRef, type ExecutionRef, type SessionEventContext, type RuntimeIdentity, type ExecutionAdmissionState } from './session-contract.js';
 
 export interface CapturedSessionOrigin {
   bindingId: string;
@@ -15,6 +15,7 @@ export interface RuntimeEventBinding {
   proposedRuntime?: RuntimeRef;
   operationId?: string;
   identity?: RuntimeIdentity;
+  continuation?: import('./session-contract.js').RuntimeExecutionContinuation;
 }
 interface Context { binding?: RuntimeEventBinding; execution?: ExecutionRef; operationId?: string }
 
@@ -27,6 +28,7 @@ export class WorkerSessionEventScope {
   private readonly knownExecutions = new Map<string, ExecutionRef>();
   private readonly admissionStates = new Map<string, ExecutionAdmissionState>();
   private readonly submissions = new Map<string, RuntimeEventBinding>();
+  private readonly continuations = new Map<string, RuntimeEventBinding>();
   private current?: RuntimeEventBinding;
   private readonly predecessors = new Map<string, RuntimeEventBinding | undefined>();
   private readonly aborted = new Set<string>();
@@ -44,6 +46,10 @@ export class WorkerSessionEventScope {
     binding.runtime = runtime; return true;
   }
   currentBinding(): RuntimeEventBinding | undefined { return this.current; }
+  bindingSharesCurrentProcess(bindingId: string): boolean {
+    const binding = this.bindings.get(bindingId);
+    return !!binding && !!this.current && binding.physicalId === this.current.physicalId;
+  }
   restoreAfterAbortedStart(binding: RuntimeEventBinding, previous?: RuntimeEventBinding): void {
     if (binding.runtime) return;
     if (previous && this.bindings.get(previous.bindingId) !== previous) throw new Error('previous_runtime_binding_unproven');
@@ -86,6 +92,45 @@ export class WorkerSessionEventScope {
     if (previous && previous.phase !== 'queued' && state.phase === 'queued') return;
     this.admissionStates.set(state.ref.executionId, structuredClone(state));
   }
+  /** Only an explicit host grant may reset the state of an already submitted
+   * ordinary turn. Ordinary canSubmit keeps its lifetime duplicate fence. */
+  acceptContinuation(bindingId: string, state: ExecutionAdmissionState): boolean {
+    const current = this.current;
+    const addressed = this.bindings.get(bindingId);
+    const binding = state.runtime && this.bindingForRuntime(state.runtime);
+    const key = this.turnKey(state.ref.turnId, state.ref.dispatchAttempt);
+    const source = this.submissions.get(key);
+    const previous = this.admissionStates.get(state.ref.executionId);
+    if (!current || !addressed || !binding || !binding.runtime
+      || addressed.physicalId !== current.physicalId || binding.physicalId !== current.physicalId
+      || !current.identity?.nativeSessionId || current.identity.nativeSessionId !== binding.identity?.nativeSessionId
+      || !sameRuntime(state.runtime, binding.runtime) || state.phase !== 'accepted'
+      || state.ref.dispatchAttempt !== undefined
+      || !sameExecution(this.executionForTurn(state.ref.turnId), state.ref)
+      || !source || source.physicalId === binding.physicalId
+      || (previous && !['submitting', 'accepted', 'running'].includes(previous.phase))) return false;
+    this.continuations.set(key, binding);
+    this.admissionStates.set(state.ref.executionId, structuredClone(state));
+    this.rememberExecution(state.ref, binding);
+    return true;
+  }
+  canSubmitContinuation(turnId: string, execution: ExecutionRef): boolean {
+    const key = this.turnKey(turnId, execution.dispatchAttempt);
+    const current = this.current;
+    const binding = this.continuations.get(key);
+    const state = this.admissionStates.get(execution.executionId);
+    const source = this.submissions.get(key);
+    return execution.turnId === turnId && execution.dispatchAttempt === undefined
+      && sameExecution(this.executionForTurn(turnId), execution)
+      && !!current && !!binding && binding.physicalId === current.physicalId
+      && !!current.identity?.nativeSessionId && current.identity.nativeSessionId === binding.identity?.nativeSessionId
+      && sameRuntime(state?.runtime, binding.runtime) && state?.phase === 'accepted'
+      && !!source && source.physicalId !== binding.physicalId;
+  }
+  enterContinuation(turnId: string, execution: ExecutionRef): void {
+    if (!this.canSubmitContinuation(turnId, execution)) throw new Error('execution_continuation_unproven');
+    this.enterRuntime(this.continuations.get(this.turnKey(turnId))!, execution);
+  }
   canSubmit(turnId?: string, dispatchAttempt?: number, admitted?: ExecutionRef): boolean {
     if (!turnId) return true;
     if (admitted && admitted.turnId !== turnId) return false;
@@ -100,6 +145,7 @@ export class WorkerSessionEventScope {
     const binding = this.storage.getStore()?.binding ?? this.current;
     if (!binding || !turnId) return;
     this.submissions.set(this.turnKey(turnId, dispatchAttempt), binding);
+    this.continuations.delete(this.turnKey(turnId, dispatchAttempt));
     const execution = this.executionForTurn(turnId, dispatchAttempt);
     if (execution) this.noteAdmission({ ref: execution, runtime: binding.runtime ?? binding.proposedRuntime, phase: 'submitting' });
   }

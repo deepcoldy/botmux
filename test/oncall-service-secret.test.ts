@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { parse } from 'dotenv';
+import * as secureHost from '../src/platform/secure-host-file.js';
 import { readOncallDeploymentEnv } from '../src/services/oncall-deployment-config.js';
 import { loadOncallGroupTarget } from '../src/services/oncall-group-client.js';
 import { handleOncallServiceSecret } from '../src/dashboard/oncall-service-secret.js';
@@ -15,7 +16,7 @@ let server: Server;
 let identity: { canManageHost: boolean; authSessionId: string } | null;
 const endpoint = '/api/oncall-service-secret';
 beforeEach(async () => {
-  for (const key of ['ONCALL_GROUP_ENDPOINT', 'ONCALL_EMAIL_DOMAIN', 'ONCALL_SERVICE_SECRET']) vi.stubEnv(key, '');
+  for (const key of ['ONCALL_GROUP_ENDPOINT', 'ONCALL_EMAIL_DOMAIN', 'ONCALL_SERVICE_SECRET', 'ONCALL_IDENTITY_APP_ID', 'ONCALL_IDENTITY_APP_SECRET', 'ONCALL_IDENTITY_BRAND']) vi.stubEnv(key, '');
   dir = mkdtempSync(join(tmpdir(), 'oncall-secret-'));
   envFile = join(dir, '.env');
   identity = { canManageHost: true, authSessionId: 'admin' };
@@ -36,6 +37,88 @@ afterEach(async () => {
 const get = () => fetch(base + endpoint);
 const connectionPut = (body: unknown, token = csrf) => fetch(base + '/api/oncall-connection', {
   method: 'PUT', headers: { 'content-type': 'application/json', origin: base, 'x-botmux-csrf': token }, body: JSON.stringify(body),
+});
+const identityPut = (body: unknown, token = csrf) => fetch(base + '/api/oncall-identity', {
+  method: 'PUT', headers: { 'content-type': 'application/json', origin: base, 'x-botmux-csrf': token }, body: JSON.stringify(body),
+});
+
+describe('shared Oncall identity application', () => {
+  it('uses injected identity credentials only while the saved file has no identity keys', async () => {
+    const inherited = { ONCALL_IDENTITY_APP_ID: 'cli_old', ONCALL_IDENTITY_APP_SECRET: 'old-secret', ONCALL_IDENTITY_BRAND: 'feishu' };
+    writeFileSync(envFile, 'OTHER=keep\n', { mode: 0o600 });
+    expect(readOncallDeploymentEnv(envFile, inherited)).toMatchObject(inherited);
+    for (const saved of ['ONCALL_IDENTITY_APP_ID=cli_next\n', 'ONCALL_IDENTITY_APP_SECRET=next-secret\n', 'ONCALL_IDENTITY_BRAND=lark\n']) {
+      writeFileSync(envFile, saved);
+      const active = readOncallDeploymentEnv(envFile, inherited);
+      for (const key of Object.keys(inherited)) expect(active[key]).toBe(parse(saved)[key]);
+    }
+  });
+  it('does not report or restore an inherited password after manual removal', async () => {
+    vi.stubEnv('ONCALL_IDENTITY_APP_ID', 'cli_next');
+    vi.stubEnv('ONCALL_IDENTITY_APP_SECRET', 'old-secret');
+    vi.stubEnv('ONCALL_IDENTITY_BRAND', 'lark');
+    writeFileSync(envFile, 'ONCALL_IDENTITY_APP_ID=cli_next\nONCALL_IDENTITY_BRAND=lark\n', { mode: 0o600 });
+    expect(await (await fetch(base + '/api/oncall-identity')).json()).toMatchObject({ appId: 'cli_next', brand: 'lark', appSecretConfigured: false });
+    expect((await identityPut({ appId: 'cli_next', brand: 'lark' })).status).toBe(400);
+    expect(parse(readFileSync(envFile)).ONCALL_IDENTITY_APP_SECRET).toBeUndefined();
+  });
+  it.each(['rotated-secret', null])('rechecks the saved password under the write lock after intervening replacement %s', async nextSecret => {
+    vi.stubEnv('ONCALL_IDENTITY_APP_SECRET', 'inherited-secret');
+    const initial = 'ONCALL_IDENTITY_APP_ID=cli_directory\nONCALL_IDENTITY_BRAND=feishu\nONCALL_IDENTITY_APP_SECRET=initial-secret\n';
+    writeFileSync(envFile, initial, { mode: 0o600 });
+    const original = secureHost.withSecureHostParentSync;
+    vi.spyOn(secureHost, 'withSecureHostParentSync').mockImplementationOnce((path, fn) => {
+      original(path, file => file.withLeafLock(() => file.writeLeaf(initial.replace('ONCALL_IDENTITY_APP_SECRET=initial-secret\n', nextSecret ? `ONCALL_IDENTITY_APP_SECRET=${nextSecret}\n` : ''))));
+      return original(path, fn);
+    });
+    expect((await identityPut({ appId: 'cli_directory', brand: 'feishu' })).status).toBe(nextSecret ? 200 : 503);
+    expect(parse(readFileSync(envFile)).ONCALL_IDENTITY_APP_SECRET).toBe(nextSecret ?? undefined);
+  });
+  it('retains the complete saved tuple on write failure and supports immediate retry', async () => {
+    const initial = 'OTHER=keep\nONCALL_IDENTITY_APP_ID=cli_old\nONCALL_IDENTITY_APP_SECRET=old-secret\nONCALL_IDENTITY_BRAND=feishu\n';
+    writeFileSync(envFile, initial, { mode: 0o600 });
+    const original = secureHost.withSecureHostParentSync;
+    const spy = vi.spyOn(secureHost, 'withSecureHostParentSync').mockImplementationOnce((path, fn) =>
+      original(path, handle => fn({ ...handle, writeLeaf: () => { throw new Error('write fault'); } })));
+    const replacement = { appId: 'cli_next', brand: 'lark', appSecret: 'next-secret' };
+    expect((await identityPut(replacement)).status).toBe(503);
+    expect(readFileSync(envFile, 'utf8')).toBe(initial);
+    spy.mockRestore();
+    expect((await identityPut(replacement)).status).toBe(200);
+    expect(parse(readFileSync(envFile))).toMatchObject({ OTHER: 'keep', ONCALL_IDENTITY_APP_ID: 'cli_next', ONCALL_IDENTITY_APP_SECRET: 'next-secret', ONCALL_IDENTITY_BRAND: 'lark' });
+  });
+  it('saves host credentials atomically and exposes only their presence to the editor', async () => {
+    writeFileSync(envFile, 'OTHER=keep\nONCALL_SERVICE_SECRET=oncall-secret\n', { mode: 0o600 });
+    expect((await identityPut({ appId: 'cli_directory', brand: 'feishu', appSecret: 'directory-secret' })).status).toBe(200);
+    expect(await (await fetch(base + '/api/oncall-identity')).json()).toEqual({ ok: true, appId: 'cli_directory', brand: 'feishu', appSecretConfigured: true });
+    expect(parse(readFileSync(envFile))).toMatchObject({ OTHER: 'keep', ONCALL_SERVICE_SECRET: 'oncall-secret', ONCALL_IDENTITY_APP_SECRET: 'directory-secret' });
+    expect(readOncallDeploymentEnv(envFile).ONCALL_IDENTITY_APP_ID).toBe('cli_directory');
+    if (process.platform !== 'win32') expect(statSync(envFile).mode & 0o777).toBe(0o600);
+  });
+  it('keeps the same app credential when omitted, but requires a new one when switching apps or platforms', async () => {
+    const value = { appId: 'cli_directory', brand: 'feishu', appSecret: 'first-secret' };
+    expect((await identityPut(value)).status).toBe(200);
+    expect((await identityPut({ appId: value.appId, brand: value.brand })).status).toBe(200);
+    const before = readFileSync(envFile, 'utf8');
+    for (const invalid of [{ appId: 'cli_other', brand: 'feishu' }, { appId: value.appId, brand: 'lark' }, { ...value, appSecret: '' }, { ...value, appSecret: 'line\nbreak' }, { ...value, endpoint: 'https://example.test' }]) {
+      expect((await identityPut(invalid)).status).toBe(400);
+      expect(readFileSync(envFile, 'utf8')).toBe(before);
+    }
+    expect((await identityPut({ ...value, appSecret: 'rotated-secret' })).status).toBe(200);
+    expect(readOncallDeploymentEnv(envFile).ONCALL_IDENTITY_APP_SECRET).toBe('rotated-secret');
+  });
+  it('protects shared credentials with host authority and CSRF without echoing secret input', async () => {
+    const value = { appId: 'cli_directory', brand: 'feishu', appSecret: 'private-secret' };
+    expect((await identityPut(value, '')).status).toBe(403);
+    identity = { canManageHost: false, authSessionId: 'viewer' };
+    expect((await fetch(base + '/api/oncall-identity')).status).toBe(403);
+    expect((await identityPut(value)).status).toBe(403);
+    expect(existsSync(envFile)).toBe(false);
+    for (const method of ['GET', 'PUT']) {
+      expect(decideDashboardAuth({ method, pathname: '/api/oncall-identity', hasTokenParam: false, presentedToken: undefined, activeToken: 'admin', publicReadOnly: true }).kind).toBe('deny401');
+      expect(decideWorkbenchH5Auth({ method, pathname: '/api/oncall-identity' }).kind).toBe('deny401');
+    }
+  });
 });
 
 it('inherits existing platform defaults and keeps connection updates separate from the service credential', async () => {

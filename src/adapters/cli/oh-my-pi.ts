@@ -203,6 +203,7 @@ export function createOhMyPiAdapter(
       larkToolAppId,
       noTransport,
       solo,
+      hideLocalAddresses,
       skillPluginDir,
       env,
       promptInjection,
@@ -233,6 +234,7 @@ export function createOhMyPiAdapter(
         larkToolAppId,
         replyDelivery: effectiveReplyDelivery,
         solo,
+        hideLocalAddresses,
         cliId: 'oh-my-pi',
       });
 

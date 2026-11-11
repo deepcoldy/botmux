@@ -30,6 +30,7 @@ function fixture(extra: Record<string, unknown> = {}) {
     applyTraexAutoModelSettings: (cfg: any, _pool: unknown, model: string) => { cfg.model = model; },
     restartCliProcess: vi.fn(async () => {}), log: vi.fn(), send: vi.fn(), t: (key: string) => key,
     traexAutoModelSwitching: false, cliRestartInProgress: false, isFlushing: false,
+    currentInputDeliveryQuarantine: () => null,
     ...extra,
   };
   scope.holdTraexRecoveryForStop = loadWorkerFunction('holdTraexRecoveryForStop', scope);

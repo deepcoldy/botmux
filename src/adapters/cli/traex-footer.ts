@@ -138,14 +138,27 @@ export function traexRestoredComposerReady(
   // composer and fail the empty-composer hint check above; anything rendered
   // above an intact composer is covered by the worker's startup-blocker
   // probes and its flush-time re-checks, not by this predicate.
-  const shortcutOnlyFooter = footer.length === 1
-    && /^[ \t]*(?:\? for shortcuts|← for agents)(?:[ \t]+·[ \t]+(?:\? for shortcuts|← for agents))*[ \t]*$/.test(footer[0]!);
+  const hintOnlyRow = /^[ \t]*(?:\? for shortcuts|← for agents)(?:[ \t]+·[ \t]+(?:\? for shortcuts|← for agents))*[ \t]*$/;
+  const shortcutOnlyFooter = footer.length === 1 && hintOnlyRow.test(footer[0]!);
+  // A working directory wider than the pane truncates the model/context row
+  // with a U+2026 ellipsis before the Context cell can render. Such a row
+  // still contains the native ` · ` cell separator and ends on the
+  // truncation marker, which ordinary notifications never do. The bottom
+  // pane only emits native status cells (toasts render above the composer),
+  // so this arm deliberately trusts the footer-region geometry; revisit it if
+  // a future build moves notification content below the composer.
+  const truncatedStatusRow = /^[ \t]*(?![^\r\n]*│)\S[^\r\n]* · [^\r\n]*…[ \t]*$/;
   if (!repositoryNotice && !shortcutOnlyFooter
-    && !/^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context (?:\d+% (?:left|used)|—)(?: · [^\r\n]*)?[ \t]*$/.test(footer[0]!)) return false;
+    && !/^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context (?:\d+% (?:left|used)|—)(?: · [^\r\n]*)?[ \t]*$/.test(footer[0]!)
+    && !truncatedStatusRow.test(footer[0]!)) return false;
   // Only the model cell is initialization evidence; a cwd named "loading"
   // in a later footer cell must not strand an otherwise initialized prompt.
   if (!repositoryNotice && /\bloading\b/i.test(footer[0]!.split(' · ', 1)[0]!)) return false;
-  if (footer.length === 2 && !/^[ \t]*(?:[☢▧] )?(?:Full Access|Read Only|Auto Mode|Workspace Edit|Auto|Default)[^\r\n]* · (?:\? for shortcuts|← for agents)/.test(footer[1]!)) return false;
+  // approval_policy=never and custom permission profiles (e.g. a managed
+  // qdh-topic profile) omit the standard permission label, so the second
+  // footer row is a bare hint row; otherwise it must carry a known label.
+  if (footer.length === 2 && !hintOnlyRow.test(footer[1]!)
+    && !/^[ \t]*(?:[☢▧] )?(?:Full Access|Read Only|Auto Mode|Workspace Edit|Auto|Default)[^\r\n]* · (?:\? for shortcuts|← for agents)/.test(footer[1]!)) return false;
   // A login banner can be taller than the nearby live-status region. Inspect
   // all rows above the composer for native login prompts, but do not treat
   // a transcript sentence mentioning login as an active input owner.

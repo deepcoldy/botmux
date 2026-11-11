@@ -21,7 +21,7 @@ export function workerSubmitHarness() {
     lastInitConfig: { cliId: 'traex' }, cliSpawnGeneration: 7,
     cliRestartInProgress: false, isPromptReady: true, isFlushing: false,
     codexModelMigrationCheckNeeded: () => false,
-    idleDetector: { isStartupPending: () => false },
+    idleDetector: { isStartupPending: () => false, programStatusHeldWorking: () => false },
     shouldHoldCodexRunnerInput: () => false,
     currentInputDeliveryQuarantine: () => null,
     hasPendingInputForFlush: () => pendingMessages.length > 0,
