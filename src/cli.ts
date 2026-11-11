@@ -10689,35 +10689,61 @@ function currentTurnHasNoTransport(): boolean {
   return !!appId && currentBotIsApiOnly(appId);
 }
 
-/** Tamper-resistant managed-origin transport check for the root-dispatch gate.
+/** Tamper-resistant managed-origin transport verdict, plus the chatId it was
+ *  judged from.
+ *
  *  Resolves the origin session via the pid-marker ANCESTRY (process.ppid walk),
  *  NOT the mutable BOTMUX_SESSION_ID env, then loads that session's record and
  *  judges transport from its chatId + its bot's apiOnly config. So `env -u
  *  BOTMUX_SESSION_ID -u BOTMUX_CHAT_ID -u BOTMUX_LARK_APP_ID` cannot shed the
- *  managed no-transport identity. Returns false (not gated) when no managed
- *  origin resolves — a bare host-operator shell keeps full access. Total; on any
- *  resolution error falls back to the env-based check (never throws). */
-function managedOriginHasNoTransport(): boolean {
+ *  managed no-transport identity. Returns `noTransport: false` (not gated) when
+ *  no managed origin resolves — a bare host-operator shell keeps full access.
+ *  Total; on any resolution error falls back to the env-based check (never
+ *  throws).
+ *
+ *  The record is the routing truth, not the env: BOTMUX_CHAT_ID is a spawn-time
+ *  snapshot, so a session that was headless when its CLI was spawned and was
+ *  later bound/transferred to a real chat keeps that very process (the tmux
+ *  backend re-attaches to the surviving `bmx-<sessionId>` rather than
+ *  respawning), and its env never learns about the move. `chatId` is returned so
+ *  the refusal message can name the reason the same snapshot was judged from. */
+function resolveManagedOriginTransport(): {
+  noTransport: boolean;
+  chatId: string | undefined;
+} {
+  const envVerdict = (requireEnvSession: boolean) => ({
+    noTransport: (!requireEnvSession || !!process.env.BOTMUX_SESSION_ID)
+      && currentTurnHasNoTransport(),
+    chatId: process.env.BOTMUX_CHAT_ID,
+  });
   try {
     const ctx = resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID);
     if (!ctx?.sessionId) {
       // No managed origin at all (bare operator). Still honor an explicit env
       // signal if present (daemon-spawned turn whose marker was pruned), but a
       // truly bare shell has neither → not gated.
-      return !!process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport();
+      return envVerdict(true);
     }
     const s = loadSessions().get(ctx.sessionId);
     if (!s) {
       // Marker resolved a session id but no record on disk (riff sandbox etc.) —
       // fall back to the env view for that same managed turn.
-      return currentTurnHasNoTransport();
+      return envVerdict(false);
     }
     const chatId = s.chatId ?? '';
-    if (isHttpVirtualSession(chatId)) return true;
-    return !!s.larkAppId && currentBotIsApiOnly(s.larkAppId);
+    return {
+      noTransport: isHttpVirtualSession(chatId)
+        || (!!s.larkAppId && currentBotIsApiOnly(s.larkAppId)),
+      chatId,
+    };
   } catch {
-    return !!process.env.BOTMUX_SESSION_ID && currentTurnHasNoTransport();
+    return envVerdict(true);
   }
+}
+
+/** Tamper-resistant managed-origin transport check for the root-dispatch gate. */
+function managedOriginHasNoTransport(): boolean {
+  return resolveManagedOriginTransport().noTransport;
 }
 
 /** Refuse a Feishu-touching CLI command for a no-transport turn with a clear,
@@ -10726,8 +10752,13 @@ function managedOriginHasNoTransport(): boolean {
  *  it calls process.exit(2), so callers just `if (assertTurnTransportOrExit(...)) return;`
  *  for type-flow clarity; execution never continues past the exit. */
 function assertTurnTransportOrExit(op: string): void {
-  if (!currentTurnHasNoTransport()) return;
-  const chatId = process.env.BOTMUX_CHAT_ID ?? '';
+  // Judge with the SAME managed-origin verdict the root-dispatch gate applies to
+  // every Lark-facing command. Judging by the env alone permanently refused
+  // `send` (and every sibling verb) in a session that was spawned headless and
+  // later bound to a real chat — see resolveManagedOriginTransport.
+  const verdict = resolveManagedOriginTransport();
+  if (!verdict.noTransport) return;
+  const chatId = verdict.chatId ?? '';
   const headless = chatId.startsWith('headless_');
   const why = headless
     ? 'this turn runs in a headless automation session (no Feishu chat)'

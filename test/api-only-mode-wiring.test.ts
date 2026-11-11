@@ -252,6 +252,37 @@ describe('CLI transport gate for a managed no-transport turn', () => {
       rmSync(dataDir, { recursive: true, force: true });
     }
   }, 120_000);
+
+  it('follows the session record when a bound session still carries its spawn-time headless env', () => {
+    // A headless session that is later bound/transferred to a real chat keeps the
+    // CLI process it was spawned with: the tmux backend re-attaches to the
+    // surviving bmx-<sessionId> instead of respawning, so BOTMUX_CHAT_ID stays
+    // `headless_*` for the rest of that generation. The session record has
+    // already moved and is the routing truth — `send` (and every sibling verb)
+    // must not be refused for the whole life of that process.
+    const dataDir = mkdtempSync(join(tmpdir(), 'api-only-cli-bound-'));
+    try {
+      seedPersistedSessionRows(dataDir, 'cli_gate_bot', {
+        s_bound: { sessionId: 's_bound', chatId: 'oc_bound_gate', larkAppId: 'cli_gate_bot', rootMessageId: 'om_bound_root', scope: 'thread', status: 'active' },
+      });
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: 's_bound' }));
+      const env: Record<string, string> = {};
+      for (const [k, v] of Object.entries(process.env)) if (!k.startsWith('BOTMUX_') && v !== undefined) env[k] = v;
+      env.SESSION_DATA_DIR = dataDir;
+      env.BOTMUX_SESSION_ID = 's_bound';
+      env.BOTMUX_CHAT_ID = 'headless_hl_stale';
+      env.BOTMUX_LARK_APP_ID = 'cli_gate_bot';
+      for (const args of [['send', 'hello'], ['create-group', '--bot', 'cli_gate_bot']]) {
+        const r = spawnSyncTsScript('src/cli.ts', args, { env, encoding: 'utf8', timeout: 60_000 });
+        // Past the gate each command still fails on the fixture's missing bot
+        // credentials; what must never appear is the no-transport refusal.
+        expect(String(r.stderr), args.join(' ')).not.toMatch(/headless automation session|no Feishu transport/);
+      }
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  }, 120_000);
 });
 
 describe('core-only entrypoint', () => {
