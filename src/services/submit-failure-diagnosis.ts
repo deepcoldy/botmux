@@ -115,6 +115,7 @@ function claudeComposerDraftMatch(screen: string): string | undefined {
   for (const bodyText of claudeComposerBodies(screen)) {
     if (bodyText.includes('<user_message>')) return 'draft_parked:claude_composer';
     if (CLAUDE_PASTED_TEXT_CHIP.test(bodyText)) return 'draft_parked:claude_pasted_chip';
+    return undefined;
   }
   return undefined;
 }

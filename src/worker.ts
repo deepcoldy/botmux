@@ -20616,7 +20616,11 @@ function scheduleSubmitFailureNotify(
     // 必须放在 SessionStart 门控之前：门控只认 transcript，而 transcript 恰好
     // 就是迟到的那个。
     // Hook processing can report OSC 7501 working before Claude paints a busy footer.
-    const busyNow = idleDetector?.programStatusHeldWorking() === true || (() => {
+    // Background tasks can retain working after a turn; parked input still needs diagnosis/rescue.
+    const nativeWorking = idleDetector?.programStatusHeldWorking() === true
+      && submitDiagnosis.reason !== 'draft_parked'
+      && (lastInitConfig?.cliId !== 'claude-code' || !claudeComposerHoldsInput(submitDiagnosisScreen, msg));
+    const busyNow = nativeWorking || (() => {
       if (!cliAdapter?.busyPattern || !submitDiagnosisScreen) return false;
       try {
         return cliAdapter.busyPattern.test(busyProbeRegion(submitDiagnosisScreen));
