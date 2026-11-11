@@ -356,7 +356,7 @@ import { sendSessionOwnerThreadNotification } from '../services/session-owner-no
 import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
 import { WorkspaceRecycleRuntime, type RecycleAction } from './workspace-recycle-runtime.js';
 import { validateRecycleRequest } from './workspace-recycle-journal.js';
-import { isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, hasUnacceptedCliInput, identityStorageModelForDaemonSession, identityDecisionConflict } from './worker-pool.js';
+import { isSessionLifecycleInFlight, hasPendingOrdinaryImDelivery, hasUnacceptedCliInput, identityStorageModelForDaemonSession, identityDecisionConflict, identityModelRefusalReason } from './worker-pool.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -1612,20 +1612,52 @@ ipcRoute('POST', CURRENT_EXECUTION_ROUTE, async (req, res) => {
   return document ? jsonRes(res, 200, document) : jsonRes(res, 403, blocked);
 });
 
+/** One daemon log line per session and refusal kind per minute: a wrapper
+ *  retried in a loop must not flood the log, yet the first refusal of a kind
+ *  has to be visible without debug logging.
+ *
+ *  The session id in the request is whatever the caller chose, and an
+ *  unproven caller can be any local process. So only a LIVE session's own id
+ *  is ever used as a key or printed; every request naming an unknown session
+ *  shares one key, and the table drops its oldest entry rather than resetting
+ *  the limit of every real session at once. */
+const IDENTITY_REFUSAL_LOG_INTERVAL_MS = 60_000;
+const IDENTITY_REFUSAL_LOG_KEYS_MAX = 1_000;
+const identityRefusalLoggedAt = new Map<string, number>();
+function logIdentityRouteRefusal(requestedSessionId: string, tool: string, reason: string, detail?: string): void {
+  const sessionId = findActiveBySessionId(requestedSessionId)?.session.sessionId;
+  const key = `${sessionId ?? ''}\0${reason}`;
+  const now = Date.now();
+  if (now - (identityRefusalLoggedAt.get(key) ?? -Infinity) < IDENTITY_REFUSAL_LOG_INTERVAL_MS) return;
+  identityRefusalLoggedAt.delete(key);
+  while (identityRefusalLoggedAt.size >= IDENTITY_REFUSAL_LOG_KEYS_MAX) {
+    identityRefusalLoggedAt.delete(identityRefusalLoggedAt.keys().next().value!);
+  }
+  identityRefusalLoggedAt.set(key, now);
+  logger.warn(`[trigger-user-auth] refused ${tool} identity for ${sessionId ? sessionId.slice(0, 8) : 'an unknown session'}: ${reason}${detail ? ` (${detail})` : ''}`);
+}
+
 /** Storage model the daemon publishes for a managed session is resolved with
  *  the same predicate (worker-pool.identityStorageModelForDaemonSession) the
- *  worker uses to render the wrapper; they must never disagree for one session. */
+ *  worker uses to render the wrapper; they must never disagree for one session.
+ *
+ *  Every refusal carries a `reason` naming the step that failed, so the wrapper
+ *  can tell the person what to do instead of one undifferentiated
+ *  `current_execution_unverified`. Before the caller's lineage is proven the
+ *  reason only says THAT it is not proven (`peer_unresolved` /
+ *  `lineage_unproven`), never anything about the session; the finer reasons
+ *  are given only to a proven caller of the current execution. */
 ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
-  const blocked = {
-    schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'blocked', error: 'current_execution_unverified',
-  };
+  const blocked = (reason: string) => ({
+    schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'blocked', error: 'current_execution_unverified', reason,
+  });
   let body: unknown;
   try { body = await readBoundedJsonBody(req, 1024, 1000); }
   catch (error) {
     if (error instanceof IpcBodyTooLargeError || error instanceof IpcBodyTimeoutError) {
       closeUntrustedRequestAfterResponse(req, res);
     }
-    return jsonRes(res, error instanceof IpcBodyTooLargeError ? 413 : 400, blocked);
+    return jsonRes(res, error instanceof IpcBodyTooLargeError ? 413 : 400, blocked('invalid_request'));
   }
   const record = body && typeof body === 'object' && !Array.isArray(body)
     ? body as Record<string, unknown> : undefined;
@@ -1638,15 +1670,25 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
   const toolValue = typeof record?.tool === 'string' ? record.tool : '';
   const tool: IdentityRouteTool | '' = (identityRouteTools as readonly string[]).includes(toolValue)
     ? toolValue as IdentityRouteTool : '';
-  if (!sessionId || !tool) return jsonRes(res, 400, blocked);
+  if (!sessionId || !tool) return jsonRes(res, 400, blocked('invalid_request'));
   const peer = await resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress, remotePort: req.socket.remotePort, localPort: req.socket.localPort,
   });
-  if (!peer.ok) return jsonRes(res, 403, blocked);
+  if (!peer.ok) {
+    logIdentityRouteRefusal(sessionId, tool, 'peer_unresolved', peer.reason);
+    return jsonRes(res, 403, blocked('peer_unresolved'));
+  }
   const document = resolveDaemonCurrentExecution({ sessionId, peer: peer.peer, findSession: findActiveBySessionId });
   if (document) {
     const ds = findActiveBySessionId(sessionId);
-    if (!ds || identityStorageModelForDaemonSession(ds) !== 'proven') return jsonRes(res, 403, blocked);
+    if (!ds) return jsonRes(res, 403, blocked('lineage_unproven'));
+    // The caller is proven to be the current execution; only the session's
+    // identity model keeps it from its identity. Say which half.
+    const modelRefusal = identityModelRefusalReason(ds);
+    if (modelRefusal) {
+      logIdentityRouteRefusal(sessionId, tool, modelRefusal);
+      return jsonRes(res, 403, blocked(modelRefusal));
+    }
     const identityTurnId = document.identityTurnId ?? document.turnId;
     // A workflow handoff's delegation is re-checked on every use: once its
     // attempt ended or it was withdrawn, this turn's tool refuses from now on
@@ -1702,6 +1744,7 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
     // Lineage is proven, but no identity material exists for this turn (never
     // prepared, collected at a terminal boundary, daemon restart). Distinct
     // from a proof failure so the wrapper denies without confusing the two.
+    logIdentityRouteRefusal(sessionId, tool, 'identity_material_unavailable', `turn ${identityTurnId}`);
     return jsonRes(res, 404, {
       schema: CURRENT_EXECUTION_IDENTITY_SCHEMA, status: 'blocked', error: 'identity_material_unavailable',
     });
@@ -1716,7 +1759,12 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
       identityTurnId: detached.identityTurnId, env: detached.env,
     });
   }
-  return jsonRes(res, 403, blocked);
+  // Operator-only detail: which daemon-side precondition of the lineage proof
+  // is absent. The caller is not proven, so it gets the coarse reason only.
+  const live = findActiveBySessionId(sessionId);
+  logIdentityRouteRefusal(sessionId, tool, 'lineage_unproven',
+    !live ? 'no active session' : !live.managedTurnOrigin?.turnId ? 'no live turn origin' : 'caller outside the live turn');
+  return jsonRes(res, 403, blocked('lineage_unproven'));
 });
 
 for (const route of [BACKGROUND_REGISTRATION_ROUTE, BACKGROUND_REVOKE_ROUTE]) {

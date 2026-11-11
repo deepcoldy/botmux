@@ -1522,6 +1522,12 @@ export function ensureSessionIdentityStorage(
       mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
     atomicWriteFileSync(identityLayoutMarkerPath(sessionDataDir, sessionId), `${model}-v1\n`, { mode: 0o600 });
+  } else if (model === 'proven') {
+    // Already proven, yet plaintext root snapshots can exist: a daemon that
+    // never received this worker's identity decision kept publishing every
+    // turn under the fail-closed single default. The proven wrapper never
+    // reads them, so they are pure exposure; no token rests on disk here.
+    clearSingleIdentityArtifacts(sessionDataDir, sessionId);
   }
   const paths = [
     sessionActiveTurnPath(sessionDataDir, sessionId),
