@@ -81,7 +81,8 @@ async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = 
   delayedHistoryReceipt?: { submission: number; ms: number },
   preflight?: { enabled: boolean; initialPrompt?: string; dispatchAttempt?: number;
     probe?: 'success' | 'timeout' | 'failure'; timeoutMs?: number },
-  restoreInterruptedStructuredTurn = false, restoreExhaustedOnLast = false, withContract = false) {
+  restoreInterruptedStructuredTurn = false, restoreExhaustedOnLast = false, withContract = false,
+  resumeRolloutDelayMs = 0) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-auto-model-'));
   roots.push(root);
   const dataDir = join(root, 'session');
@@ -136,7 +137,11 @@ const nativeId = ${JSON.stringify(nativeId)};
 const release = ${JSON.stringify(release)};
 const rollout = ${JSON.stringify(rolloutPath)};
 // Fresh-session discovery follows the native CLI's open rollout descriptor.
-const rolloutFd = fs.openSync(rollout, 'a');
+// Real TraeX 0.214 opens a resumed rollout up to about a second after it
+// starts; a delay models that window without changing other fixtures.
+let rolloutFd = process.argv.includes('resume') && ${JSON.stringify(resumeRolloutDelayMs)} > 0 ? undefined : fs.openSync(rollout, 'a');
+if (rolloutFd === undefined) setTimeout(() => { rolloutFd ??= fs.openSync(rollout, 'a'); }, ${JSON.stringify(resumeRolloutDelayMs)});
+const rolloutWriter = () => rolloutFd ??= fs.openSync(rollout, 'a');
 if (!process.argv.includes('resume')) fs.writeSync(rolloutFd, JSON.stringify({
   type: 'session_meta', payload: { id: nativeId, cwd: process.cwd() },
 }) + '\\n');
@@ -154,7 +159,7 @@ process.stdout.write('\\x1b[?2004h');
 let input = '', pasted = '', submitted = false, completed = false, submissionCount = 0;
 let turnId;
 const startedAt = Date.now();
-function line(payload) { fs.writeSync(rolloutFd, JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload }) + '\\n'); }
+function line(payload) { fs.writeSync(rolloutWriter(), JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload }) + '\\n'); }
 function idle() {
   if (exitBeforePrompt) {
     process.stdout.write('\\x1b[2J\\x1b[H│ model: loading /model to change │\\n❯ Ask anything\\n');
@@ -195,7 +200,7 @@ process.stdin.on('data', chunk => {
     line({ type: 'user_message', message: text, images: [], local_images: [], text_elements: [], turn_id: turnId });
     // Real interrupted work leaves model/tool history beyond the user receipt.
     // This also exercises the restart scan after that receipt was already read.
-    fs.writeSync(rolloutFd, JSON.stringify({ timestamp: new Date().toISOString(), type: 'history_mutation',
+    fs.writeSync(rolloutWriter(), JSON.stringify({ timestamp: new Date().toISOString(), type: 'history_mutation',
       payload: { version: 1, commit_id: turnId, turn_id: turnId, operation: 'append',
         items: [{ type: 'function_call', name: 'read_file', call_id: turnId, arguments: '{"path":"src/a.ts"}' }] },
     }) + '\\n');
@@ -501,6 +506,51 @@ describe('TraeX auto-model real Worker and PTY', () => {
     expect(rows(f.submissions)).toHaveLength(3);
     expect(f.hostErrors).toEqual([]);
   }, 70_000);
+
+  it.skipIf(!probeTmuxFunctional().ok)('holds the continuation until a late native identity earns the grant', async () => {
+    // The replacement prompt is ready before its resumed rollout is open: the
+    // first registration has no native proof, so the queued continuation must
+    // wait and re-register instead of being refused as a duplicate.
+    const f = await fixture(true, 'ordered', false, undefined, true, undefined, true,
+      undefined, 0, 0, false, false, undefined, undefined, undefined, false, false, true, 2_500);
+    f.sendInput('original late-proof task', 'om_late_proof');
+    await f.wait(() => rows(f.submissions).length === 1, 'original late-proof input');
+    await f.wait(() => rows(f.launches).length === 2, 'exact model replacement');
+    await f.wait(() => rows(f.submissions).length === 2, 'continuation after late native proof', 30_000);
+    expect(rows(f.submissions)[1].text).toBe(t('worker.traex_auto_model.continue_prompt'));
+    expect(f.messages.filter(message => message.type === 'turn_input_rejected')).toEqual([]);
+    expect(f.hostErrors).toEqual([]);
+    expect(f.controller!.store.executions(f.controller!.ref, 'om_late_proof')[0]!.runtime).toEqual(f.controller!.currentRuntime());
+  }, 70_000);
+
+  it.skipIf(!probeTmuxFunctional().ok)('stops a refused contract continuation without replaying it or blocking queued input', async () => {
+    const f = await fixture(true, 'ordered', false, undefined, true, undefined, true,
+      undefined, 0, 0, false, false, undefined, undefined, undefined, false, false, true);
+    let cancelled = false;
+    f.child.on('message', (raw: any) => {
+      // A stop the Worker could not deliver during the planned teardown leaves
+      // cancelRequested on the reserved continuation, so native proof rejects it.
+      if (cancelled || raw.type !== 'runtime_binding_started' || !raw.continuation) return;
+      cancelled = true;
+      const execution = f.controller!.store.executions(f.controller!.ref, 'om_refused')[0]!;
+      const operation = f.controller!.beginControl('cancel', undefined, execution.ref).operation;
+      f.controller!.controlStarted(operation.operationId);
+      f.controller!.controlResult(operation.operationId, 'rejected');
+    });
+    f.sendInput('original refused task', 'om_refused');
+    await f.wait(() => rows(f.submissions).length === 1, 'original refused input');
+    f.sendInput('queued follow-up task', 'om_refused_next');
+    await f.wait(() => f.messages.some(message => message.type === 'user_notify' && message.turnId === 'om_refused'
+      && message.message === t('worker.traex_auto_model.continuation_rejected')), 'continuation refusal notice', 40_000);
+    await f.wait(() => rows(f.submissions).some(row => row.text === 'queued follow-up task'), 'queued follow-up after refusal', 30_000);
+    expect(cancelled).toBe(true);
+    expect(f.child.exitCode).toBeNull();
+    expect(f.hostErrors).toEqual([]);
+    expect(rows(f.launches)).toHaveLength(2);
+    expect(rows(f.submissions).filter(row => row.text === 'original refused task')).toHaveLength(1);
+    expect(rows(f.submissions).filter(row => row.text === t('worker.traex_auto_model.continue_prompt'))).toHaveLength(0);
+    expect(f.controller!.store.executions(f.controller!.ref, 'om_refused')[0]!.runtime).not.toEqual(f.controller!.currentRuntime());
+  }, 90_000);
 
   it('model access restrictions continue through the ordered pool without replaying the original input', async () => {
     const f = await fixture(true, 'ordered', false, undefined, false, undefined, false,

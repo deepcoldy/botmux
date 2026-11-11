@@ -6095,13 +6095,7 @@ function traexAutoModelRuntimeEligible(): boolean {
     && !lastInitConfig.adoptMode
     && !lastInitConfig.existingAppServerEndpoint
     && !codexRpcEngine
-    && !isRemoteBackendType(effectiveBackendType)
-    // Keep this backend set identical to the host's
-    // SessionController.executionContinuationSupported gate: a rotation the
-    // host cannot grant would make the replacement spawn fail fatally.
-    && (TRAEX_CONTINUATION_BACKENDS as readonly string[]).includes(effectiveBackendType)
-    // A newer worker must not rotate into a host that cannot grant recovery.
-    && (!workerSessionEventScope || lastInitConfig.sessionContract?.executionContinuations === true);
+    && !isRemoteBackendType(effectiveBackendType);
 }
 
 function enqueueTraexAutoModelRecovery(turnId: string): boolean {
@@ -6171,8 +6165,17 @@ function executeTraexAutoModelSwitch(
   if (opts.resumeCurrentTurn && (!active?.started || active.turnId !== action.turnId
     || active.dispatchAttempt !== undefined)) return false;
   const sourceBinding = workerSessionEventScope?.currentBinding();
+  // Only resuming the current turn needs a host continuation grant. Gate that
+  // path alone: preflight / new-turn selection never carry one, so a backend
+  // or host without grants keeps them (the turn stays on its model instead).
+  // Keep this backend set identical to the host's
+  // SessionController.executionContinuationSupported gate: a rotation the
+  // host cannot grant would make the replacement spawn fail fatally.
   if (opts.resumeCurrentTurn && workerSessionEventScope
-    && (!sourceBinding?.runtime || sourceBinding.identity?.proof !== 'process_start'
+    && (!(TRAEX_CONTINUATION_BACKENDS as readonly string[]).includes(effectiveBackendType)
+      // A newer worker must not rotate into a host that cannot grant recovery.
+      || lastInitConfig.sessionContract?.executionContinuations !== true
+      || !sourceBinding?.runtime || sourceBinding.identity?.proof !== 'process_start'
       || sourceBinding.identity.nativeSessionId !== nativeSessionId
       || !workerSessionEventScope.executionForTurn(action.turnId))) return false;
   if (!traexAutoModelController?.commitSwitch(action)) return false;

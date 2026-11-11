@@ -10,6 +10,11 @@ import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { registerSessionContractPrimary } from '../src/core/session-contract-primary.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { ExecutionPhase, RuntimeIdentity, RuntimeExecutionContinuation } from '../src/services/session-contract.js';
+import { TRAEX_CONTINUATION_BACKENDS } from '../src/services/session-contract.js';
+import { TraexAutoModelController, TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT } from '../src/services/traex-auto-model.js';
+import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
+import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
+import { isRemoteBackendType } from '../src/core/persistent-backend.js';
 
 const directories: string[] = [];
 const handles: Array<{ close(): void }> = [];
@@ -288,5 +293,61 @@ describe('worker continuation permits', () => {
       expect(s.scope.isCurrentContext()).toBe(true);
     }
     expect(s.scope.run(s.sourceBinding, () => s.scope.isCurrentContext())).toBe(false);
+  });
+});
+
+// The host grants continuations only on TRAEX_CONTINUATION_BACKENDS and only
+// after bootstrap negotiation. That gate belongs to resuming the current turn:
+// preflight / new-turn selection never carry a continuation and must keep
+// working on other local backends (zmx) and against an older host.
+describe('worker continuation gate', () => {
+  function gate(backendType: string, hostGrants: boolean) {
+    const s = fixture();
+    const scope = new WorkerSessionEventScope(s.ref, s.worker);
+    const source = scope.beginRuntime(); source.identity = identity('source:1'); scope.assign(source.bindingId, s.source);
+    scope.rememberExecution(s.execution, source);
+    const controller = new TraexAutoModelController({ enabled: true, models: ['one', 'two'], queueTimeoutMs: 5000 });
+    controller.beginTurn(s.execution.turnId);
+    const authority = new ActiveTurnAuthority();
+    authority.reserve({ turnId: s.execution.turnId }); authority.markStarted({ turnId: s.execution.turnId });
+    const env: Record<string, any> = {
+      traexAutoModelController: controller, codexRpcEngine: null, effectiveBackendType: backendType,
+      isRemoteBackendType, TRAEX_CONTINUATION_BACKENDS, TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT,
+      lastInitConfig: { cliId: 'traex', cliSessionId: 'native-task', model: 'one',
+        ...(hostGrants ? { sessionContract: { ...s.bootstrap } } : { sessionContract: { ...s.bootstrap, executionContinuations: undefined } }) },
+      workerSessionEventScope: scope, activeTurnAuthority: authority, inflightInputs: new InflightInputTracker(),
+      pendingMessages: [] as any[], currentBotmuxCallerOpenId: 'caller', traexAutoModelTurnReplayForbidden: false,
+      currentInputDeliveryQuarantine: () => null, traexAutoModelSwitching: false, cliRestartInProgress: false, isFlushing: false,
+      applyTraexAutoModelSettings: (cfg: any, _pool: unknown, model: string) => { cfg.model = model; },
+      restartCliProcess: vi.fn(async () => {}), send: vi.fn(), log: vi.fn(), t: (key: string) => key,
+    };
+    env.traexAutoModelRuntimeEligible = loadWorkerFunction<() => boolean>('traexAutoModelRuntimeEligible', env);
+    env.enqueueTraexAutoModelRecovery = loadWorkerFunction('enqueueTraexAutoModelRecovery', env);
+    const execute = loadWorkerFunction<(action: any, opts: { resumeCurrentTurn: boolean }) => boolean>('executeTraexAutoModelSwitch', env);
+    const action = (reason: string) => ({ kind: 'switch', turnId: s.execution.turnId, fromModel: 'one', toModel: 'two', toIndex: 1, reason });
+    return { s, env, controller, execute, action };
+  }
+
+  it.each([['zmx', true], ['tmux', false]] as const)(
+    'keeps Auto eligible but never resumes the current turn without a grant (%s, host grants=%s)', (backendType, hostGrants) => {
+      const g = gate(backendType, hostGrants);
+      expect(g.env.traexAutoModelRuntimeEligible()).toBe(true);
+      expect(g.execute(g.action('capacity_timeout'), { resumeCurrentTurn: true })).toBe(false);
+      expect(g.controller.currentModel()).toBe('one');
+      expect(g.env.pendingMessages).toEqual([]);
+      expect(g.env.restartCliProcess).not.toHaveBeenCalled();
+      // An independent-turn selection carries no continuation and still runs.
+      expect(g.execute(g.action('preflight_available'), { resumeCurrentTurn: false })).toBe(true);
+      expect(g.env.restartCliProcess).toHaveBeenCalledOnce();
+      expect(g.env.restartCliProcess.mock.calls[0][1]).not.toHaveProperty('restartCause');
+    });
+
+  it('resumes the current turn with a continuation on a granting host and backend', () => {
+    const g = gate('tmux', true);
+    expect(g.execute(g.action('capacity_timeout'), { resumeCurrentTurn: true })).toBe(true);
+    expect(g.env.restartCliProcess.mock.calls[0][1]).toMatchObject({ restartCause: 'traex-auto-model', exactResumeSessionId: 'native-task' });
+    expect(g.env.pendingMessages).toHaveLength(1);
+    expect(g.env.pendingMessages[0]).toMatchObject({ traexAutoModelRecovery: true,
+      traexAutoModelContinuation: { reason: 'traex-auto-model', execution: g.s.execution, from: g.s.source, nativeSessionId: 'native-task' } });
   });
 });
