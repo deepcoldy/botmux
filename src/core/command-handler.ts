@@ -7477,6 +7477,8 @@ export async function startAdoptSession(
     current.session.serviceTier = 'inherit';
     current.adoptedFrom = adoptedFromForTarget(target);
     current.session.adoptedFrom = { ...current.adoptedFrom };
+    current.session.projectRouteRevision = (current.session.projectRouteRevision ?? 1) + 1;
+    current.session.projectImportSource = 'adopt';
     sessionStore.updateSession(current.session);
     forkAdoptWorker(current);
     return { status: 'adopted' as const, anchor: sessionAnchorId(current) };
@@ -7581,6 +7583,8 @@ export async function startResumeImportSession(
     current.session.workingDir = target.cwd;
     current.session.cliSessionId = target.cliSessionId;
     current.session.title = target.title || `Import: ${project}`;
+    current.session.projectRouteRevision = (current.session.projectRouteRevision ?? 1) + 1;
+    current.session.projectImportSource = 'resume_import';
     // Resume sandbox decision is left to forkWorker (resume=true → not
     // sandboxed, matching restore semantics). Mark history so this is a resume.
     current.hasHistory = true;

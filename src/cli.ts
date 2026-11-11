@@ -6241,7 +6241,7 @@ async function cmdMaintenance(args: string[]): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'reply-card-ready' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'project-workstream' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'reply-card-ready' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -6249,7 +6249,7 @@ async function postSessionCliIpc(
   if (!process.env.BOTMUX_SEND_RELAY) {
     try { hostSecret = loadDaemonIpcSecret(); } catch { /* sandboxed/read-isolated: capability fallback below */ }
   }
-  if (!hostSecret || route === 'chat-manager') {
+  if (!hostSecret || route === 'chat-manager' || route === 'project-workstream') {
     const claim = readManagedOriginCapability(
       resolveDataDir(),
       sessionId,
@@ -6261,7 +6261,7 @@ async function postSessionCliIpc(
       if (claim.turnId) requestBody.originTurnId = claim.turnId;
       if (claim.dispatchAttempt !== undefined) requestBody.originDispatchAttempt = claim.dispatchAttempt;
     }
-    if (!claim && route === 'chat-manager' && !process.env.BOTMUX_SEND_RELAY && !process.env.BOTMUX_ORIGIN_CHANNEL_ID) {
+    if (!claim && (route === 'chat-manager' || route === 'project-workstream') && !process.env.BOTMUX_SEND_RELAY && !process.env.BOTMUX_ORIGIN_CHANNEL_ID) {
       const marker = findAuthenticatedAncestorSessionContext(resolveDataDir());
       if (marker?.sessionId === sessionId && marker.capability) {
         requestBody.originCapability = marker.capability;
@@ -6897,6 +6897,13 @@ async function cmdProject(argv: string[]): Promise<void> {
                         [--milestone <里程碑>] [--next-milestone <下一节点>] [--clear-next-milestone]
   botmux project close [--milestone <完成说明>]
   botmux project resume [--phase <阶段>] [--focus <当前焦点>]
+  botmux project workstream inspect --root <om_root> --source-app <cli_app> --source-session <id>
+  botmux project workstream attach --root <om_root> --source-app <cli_app> --source-session <id>
+                                  --title <24字内标题> [--purpose <说明>] [--revision <n>] [--grant <id>]
+  botmux project workstream rename --root <om_root> --title <24字内标题>
+  botmux project workstream update --root <om_root> --status <任务状态> [--content <说明>]
+  botmux project workstream status [--root <om_root>]
+  botmux project workstream grant
 
 说明:
   仅用于普通群的 chat-scope 主控会话。init 创建并置顶唯一进度卡；后续命令原地更新。
@@ -6916,7 +6923,8 @@ async function cmdProject(argv: string[]): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  if (session.chatType !== 'group' || session.scope !== 'chat') {
+  const sourceGrant = 'workstream' in parsed && parsed.workstream.action === 'grant';
+  if (session.chatType !== 'group' || (session.scope !== 'chat' && !sourceGrant)) {
     console.error('project 模式只能在普通群的 chat-scope 主控会话中使用。');
     process.exitCode = 1;
     return;
@@ -6931,9 +6939,17 @@ async function cmdProject(argv: string[]): Promise<void> {
   const response = await postSessionCliIpc(
     ipcPort,
     session.sessionId,
-    'project',
-    parsed.action as unknown as Record<string, unknown>,
+    'workstream' in parsed ? 'project-workstream' : 'project',
+    'workstream' in parsed ? parsed.workstream : parsed.action as unknown as Record<string, unknown>,
   );
+  if ('workstream' in parsed) {
+    const result = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; result?: unknown; grantId?: string };
+    if (!response.ok || !result.ok) {
+      console.error(`workstream 操作失败: ${result.error ?? response.status}`);
+      process.exitCode = 1;
+    } else console.log(JSON.stringify(result.result ?? result, null, 2));
+    return;
+  }
   const body = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; project?: Record<string, unknown> };
   if (!response.ok || !body.ok || !body.project) {
     console.error(`project 操作失败: ${body.error ?? `HTTP ${response.status}`}`);

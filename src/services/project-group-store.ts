@@ -10,6 +10,17 @@ export type ProjectWorkstreamStatus = 'pending' | 'in_progress' | 'blocked' | 'c
 
 export interface ProjectWorkstream {
   dispatchRoot: string;
+  /** Imported association metadata, not business completion. Missing on legacy
+   * dispatch rows; never turn a closed/moved CLI into a completed task. */
+  attachment?: {
+    sourceSessionId: string;
+    sourceLarkAppId: string;
+    revision: number;
+    routeRevision?: number;
+    source?: 'relay' | 'bind' | 'adopt' | 'resume_import' | 'fork' | 'manual';
+    state: 'pending' | 'active' | 'moved' | 'closed' | 'unknown';
+    reportCapability: 'verified' | 'manual' | 'unavailable';
+  };
   threadId?: string;
   title: string;
   purpose: string;

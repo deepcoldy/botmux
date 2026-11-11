@@ -963,6 +963,10 @@ export interface Session {
   /** Daemon-selected, app-scoped session owner. Frozen for the worker lifetime;
    *  not the current-turn sender. Absent for ownerless/foreign-bot sessions. */
   ownerOpenId?: string;       // receives owner-only replies/mentions
+  /** Host-persisted physical association version. Only explicit route/import
+   * commits advance this, never a worker restart or ordinary new turn. */
+  projectRouteRevision?: number;
+  projectImportSource?: 'relay' | 'bind' | 'adopt' | 'resume_import' | 'fork';
   /** Best-effort human-readable chat name. Group sessions use the Lark group
    *  name when available; p2p sessions fall back to the initiating user name. */
   chatDisplayName?: string;
