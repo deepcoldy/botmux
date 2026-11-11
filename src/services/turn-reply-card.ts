@@ -42,6 +42,12 @@ export interface TurnReplyCardRecord extends TurnReplyCardKey {
   nativeCot?: boolean;
   /** Durable release: retries/recovery never create another thinking display. */
   nativeCotReady?: boolean;
+  /** Set with nativeCotReady: the native thinking display really exists, so it
+   * (not an early answer card) carries passive progress. Absent → card fallback. */
+  nativeCotVisible?: boolean;
+  /** This turn's final went out as a separate message in the same chat (for
+   * example to notify others), so a completed turn needs no summary card. */
+  externalFinal?: boolean;
   chatId: string;
   rootId: string;
   phase: ReplyCardPhase;
@@ -100,8 +106,9 @@ export interface TurnReplyCardTransport {
   send(content: string, uuid: string): Promise<string>;
   patch(messageId: string, content: string): Promise<void>;
   beforeEffect(): void | Promise<void>;
-  /** Runs under the publication lock, before the first answer POST. */
-  beforeCreate?(): void | Promise<void>;
+  /** Runs under the publication lock, before the first answer POST. Resolves
+   * true only when the native thinking display is live for this turn. */
+  beforeCreate?(): void | boolean | Promise<void | boolean>;
   isWithdrawn(error: unknown): boolean;
   /** A full answer that does not fit is delivered once as a native file. */
   sendOverflow?(text: string, uuid: string): Promise<string>;
@@ -185,6 +192,22 @@ export class TurnReplyCardStore {
       this.write(key, record);
       return record;
     });
+  }
+
+  /** Record that this turn's final was delivered as a separate message in the
+   * card's chat. Persistence only: no provider I/O, no card creation. A turn
+   * without a reply-card record, a different destination or an answer already
+   * on the card is left untouched. Returns whether the record was marked. */
+  async noteExternalFinal(key: TurnReplyCardKey, chatId: string): Promise<boolean> {
+    if (!this.read(key)) return false;
+    return withFileLock(this.path(key), async () => {
+      const record = this.read(key);
+      if (!record || record.chatId !== chatId || record.finalCard || record.withdrawn) return false;
+      if (record.externalFinal) return true;
+      record.externalFinal = true;
+      this.write(key, record);
+      return true;
+    }, { maxWaitMs: 15_000 });
   }
 
   async update(key: TurnReplyCardKey, inputEvent: TurnReplyCardEvent | (() => TurnReplyCardEvent), io: TurnReplyCardTransport): Promise<{
@@ -331,9 +354,10 @@ export class TurnReplyCardStore {
 
       if (!record.messageId && record.nativeCot && !record.nativeCotReady) {
         if (!io.beforeCreate) throw new Error('Native thinking publication requires its ordering barrier');
-        await io.beforeCreate();
+        const nativeVisible = await io.beforeCreate();
         await io.beforeEffect();
         record.nativeCotReady = true;
+        if (nativeVisible === true) record.nativeCotVisible = true;
         this.write(key, record);
       }
 
@@ -344,16 +368,22 @@ export class TurnReplyCardStore {
         return record.omitImages ? omitReplyCardImages(body) : body;
       };
       let card = render();
-      // Native thinking already carries passive progress. An answer card is
-      // needed for a final, an error, or an actionable Ask/Oncall control.
-      // An uncertain POST still replays its original payload after restart.
-      if (record.nativeCot && !record.messageId && !record.pendingCreate && !record.finalCard
+      // A live native thinking display already carries passive progress. An
+      // answer card is needed for a final, an error, an actionable Ask/Oncall
+      // control, or a completed turn whose final did not go out separately.
+      // Without a confirmed display the card keeps its fallback role. An
+      // existing card and an uncertain POST keep their publication protocol.
+      if (record.nativeCot && record.nativeCotVisible && !record.messageId && !record.pendingCreate && !record.finalCard
         && !io.forceVisible && !['failed', 'cancelled', 'ambiguous'].includes(record.phase)
         && !(record.asks ?? []).some(entry => !entry.result && !entry.ask.settled)) {
-        const elements = JSON.parse(card).body?.elements ?? [];
-        const hasOncallControl = elements.some((element: any) => element.element_id === 'botmux_oncall_group'
-          || element.columns?.some((column: any) => column.element_id === 'botmux_oncall_group_column'));
-        if (!hasOncallControl || record.phase === 'completed') return { delivered: false, record };
+        if (record.phase === 'completed') {
+          if (record.externalFinal) return { delivered: false, record };
+        } else {
+          const elements = JSON.parse(card).body?.elements ?? [];
+          const hasOncallControl = elements.some((element: any) => element.element_id === 'botmux_oncall_group'
+            || element.columns?.some((column: any) => column.element_id === 'botmux_oncall_group_column'));
+          if (!hasOncallControl) return { delivered: false, record };
+        }
       }
       const completeRecordNeedsFile = replyCardIsTerminal(record) && !record.disconnected && !record.finalCard
         && Buffer.byteLength(record.progress.join('\n\n'), 'utf8') > 6000;

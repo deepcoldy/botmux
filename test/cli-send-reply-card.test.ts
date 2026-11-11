@@ -89,6 +89,7 @@ describe('real CLI send into a running reply card', () => {
         expect(captures[0]).toContain('A complete answer.');
         expect(record.phase).toBe('completed');
         expect(record.messageId).toBeUndefined();
+        expect(record.externalFinal).toBe(true);
         return;
       }
       expect(record.finalDelivered).toBe(true);
@@ -97,6 +98,48 @@ describe('real CLI send into a running reply card', () => {
       expect(card.body.elements.some((element: any) => element.element_id === 'botmux_turn_status')).toBe(false);
       expect(record.lastCard).toContain('A complete answer.');
       expect(record.lastCard).toContain('oncall_group_create');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 35_000);
+
+  it.each([
+    { barrier: 'ready', visible: true },
+    { barrier: 'ready-hidden', visible: false },
+    { barrier: 'ready-legacy', visible: false },
+  ])('lets only a live native thinking display take over bare progress ($barrier)', ({ barrier, visible }) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-native-visible-cli-'));
+    const dataDir = join(root, 'data');
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: key.sessionId, turnId: key.turnId }));
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{ larkAppId: key.larkAppId, larkAppSecret: 'fixture', cliId: 'codex', replyCardMode: 'unified', replyCardNativeCot: true }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        ...key, status: 'active', cliId: 'codex', larkAppId: key.larkAppId, chatId: 'oc_test', rootMessageId: 'om_root',
+        scope: 'thread', chatType: 'group', workingDir: root,
+      } });
+      const store = new TurnReplyCardStore(dataDir);
+      store.prepareSync(key, { mode: 'unified', nativeCot: true, chatId: 'oc_test', rootId: 'om_root' });
+      const result = spawnSyncTsScript(fixture, ['send', '--no-mention', 'Still checking the logs'], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: key.turnId, BOTMUX_LARK_APP_ID: key.larkAppId,
+          BOTMUX_DAEMON_IPC_PORT: '49501', BOTMUX_TEST_NATIVE_COT_BARRIER: barrier },
+        encoding: 'utf8', timeout: 30_000,
+      });
+      expect(result.status, String(result.stderr)).toBe(0);
+      const stdout = String(result.stdout);
+      expect(stdout).toContain('CAPTURE_NATIVE_READY');
+      const record = store.read(key)!;
+      expect(record).toMatchObject({ nativeCotReady: true, progress: ['Still checking the logs'] });
+      if (visible) {
+        expect(stdout).not.toContain('CAPTURE_REPLY=');
+        expect(stdout).toContain('"delivered":false');
+        expect(record).toMatchObject({ nativeCotVisible: true });
+        expect(record.messageId).toBeUndefined();
+      } else {
+        expect(stdout.split('\n').filter(line => line.startsWith('CAPTURE_REPLY='))).toHaveLength(1);
+        expect(record.nativeCotVisible).toBeUndefined();
+        expect(record.messageId).toBeTruthy();
+      }
     } finally { rmSync(root, { recursive: true, force: true }); }
   }, 35_000);
 

@@ -130,13 +130,16 @@ export function replyCardDispatchAttempt(ds: DaemonSession, turnId: string): num
   return ds.lastThinkingUpdate?.turnId === turnId ? ds.lastThinkingUpdate.dispatchAttempt : undefined;
 }
 
-export async function prepareReplyCardNativeThinking(ds: DaemonSession, turnId: string, dispatchAttempt?: number, owns?: () => boolean): Promise<void> {
+/** Resolves whether the native thinking display is live for this turn. Only a
+ * live display may take over passive progress from the answer card. */
+export async function prepareReplyCardNativeThinking(ds: DaemonSession, turnId: string, dispatchAttempt?: number, owns?: () => boolean): Promise<boolean> {
   const store = new TurnReplyCardStore(config.session.dataDir);
   const record = store.read(replyCardKey(ds, turnId, dispatchAttempt)) ?? store.read(replyCardKey(ds, turnId));
   const binding = { turnId, dispatchAttempt: dispatchAttempt ?? replyCardDispatchAttempt(ds, turnId) };
   if (record?.nativeCot && ((!record.nativeCotReady && !record.messageId) || hasCotMessageForTurn(ds, binding))) {
-    await prepareCotMessageBeforeReply(ds, binding, nativeThinkingOwner(ds, owns));
+    return prepareCotMessageBeforeReply(ds, binding, nativeThinkingOwner(ds, owns));
   }
+  return false;
 }
 
 /**

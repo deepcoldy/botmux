@@ -13422,8 +13422,8 @@ describe('POST /api/sessions/:sessionId/reply-card-ready', () => {
       managedTurnOrigin: { turnId: 'om_order', dispatchAttempt: 1, capability: 'fixture-capability' },
       session: { sessionId: 'native-order', status: 'active' } } as any;
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
-    let release!: () => void;
-    const prepareSpy = vi.spyOn(cards, 'prepareReplyCardNativeThinking').mockImplementation(() => new Promise<void>(resolve => { release = resolve; }));
+    let release!: (visible: boolean) => void;
+    const prepareSpy = vi.spyOn(cards, 'prepareReplyCardNativeThinking').mockImplementation(() => new Promise<boolean>(resolve => { release = resolve; }));
     try {
       setLarkAppId(appId); setIpcAuthSecret(TEST_IPC_SECRET);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
@@ -13435,11 +13435,16 @@ describe('POST /api/sessions/:sessionId/reply-card-ready', () => {
       const pending = query();
       await vi.waitFor(() => expect(prepareSpy).toHaveBeenCalledOnce());
       ds.managedTurnOrigin.dispatchAttempt = 2;
-      release();
+      release(true);
       expect((await pending).status).toBe(409);
       ds.managedTurnOrigin.dispatchAttempt = 1;
-      prepareSpy.mockResolvedValue();
-      expect((await query()).status).toBe(200);
+      // The CLI may hand passive progress to native thinking only when it is live.
+      for (const visible of [true, false]) {
+        prepareSpy.mockResolvedValue(visible);
+        const ready = await query();
+        expect(ready.status).toBe(200);
+        expect(ready.json).toEqual({ ok: true, nativeThinkingVisible: visible });
+      }
       expect(prepareSpy).toHaveBeenLastCalledWith(ds, 'om_order', 1);
     } finally { findSpy.mockRestore(); prepareSpy.mockRestore(); }
   });

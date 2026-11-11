@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import MarkdownIt from 'markdown-it';
-import { TurnReplyCardStore, type TurnReplyCardRecord, type TurnReplyCardTransport } from '../src/services/turn-reply-card.js';
+import { TurnReplyCardStore, type ReplyCardAsk, type TurnReplyCardRecord, type TurnReplyCardTransport } from '../src/services/turn-reply-card.js';
 import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools, replyCardPresentation } from '../src/im/lark/turn-reply-card.js';
 import { parseBotConfigsFromText } from '../src/bot-registry.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
@@ -71,16 +71,28 @@ describe('one reply card per turn', () => {
   });
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
-  it('keeps native CoT progress off the answer surface and publishes one final after reopening', async () => {
-    const nativeKey = { ...key, turnId: 'om_native_quiet' };
+  // Native thinking that the barrier confirmed live carries passive progress.
+  // 'legacy' = an older daemon/CLI barrier that resolves without a visibility answer.
+  const nativeTurn = async (turnId: string, liveThinking: boolean | 'legacy' = true) => {
+    const nativeKey = { ...key, turnId };
     await store.prepare(nativeKey, { ...input, nativeCot: true });
-    io.beforeCreate = vi.fn(async () => {});
+    io.beforeCreate = vi.fn(async () => liveThinking === 'legacy' ? undefined : liveThinking);
+    return nativeKey;
+  };
+  const nativeAsk = (askId: string) => ({ ask: {
+    askId, nonce: 'nonce', larkAppId: key.larkAppId, sessionId: key.sessionId,
+    chatId: input.chatId, rootMessageId: input.rootId, createdAt: 1, deadlineAt: 60001, settled: false,
+    questions: [{ prompt: 'Continue?', options: [{ key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' }], multiSelect: false }],
+  } }) as ReplyCardAsk;
+
+  it('keeps native CoT progress off the answer surface and publishes one final after reopening', async () => {
+    const nativeKey = await nativeTurn('om_native_quiet');
     for (const event of [{ kind: 'start' as const }, { kind: 'progress' as const, text: 'I will check the evidence.' },
       { kind: 'tools' as const, tools: [{ id: 'tool', name: 'Read', subject: 'evidence' }] }]) {
       expect((await store.update(nativeKey, event, io)).delivered).toBe(false);
     }
     expect(io.send).not.toHaveBeenCalled();
-    expect(store.read(nativeKey)).toMatchObject({ progress: ['I will check the evidence.'], nativeCotReady: true });
+    expect(store.read(nativeKey)).toMatchObject({ progress: ['I will check the evidence.'], nativeCotReady: true, nativeCotVisible: true });
     const reopened = new TurnReplyCardStore(dir);
     await reopened.update(nativeKey, finalEvent('Verified answer'), io);
     await reopened.update(nativeKey, { kind: 'terminal', phase: 'completed' }, io);
@@ -89,38 +101,108 @@ describe('one reply card per turn', () => {
     expect(reopened.read(nativeKey)).toMatchObject({ finalDelivered: true, phase: 'completed', finalText: 'Verified answer' });
   });
 
+  it.each([false, 'legacy'] as const)('keeps the answer card as the progress surface when native thinking is not live (barrier=%s)', async live => {
+    const nativeKey = await nativeTurn(`om_native_fallback_${live}`, live);
+    expect((await store.update(nativeKey, { kind: 'start' }, io)).delivered).toBe(true);
+    await store.update(nativeKey, { kind: 'progress', text: 'Still running the suite' }, io);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect(io.patch).toHaveBeenCalledTimes(1);
+    expect(store.read(nativeKey)).toMatchObject({ nativeCotReady: true, messageId: expect.any(String) });
+    expect(store.read(nativeKey)?.nativeCotVisible).toBeUndefined();
+    expect(extractCardContent(store.read(nativeKey)!.lastCard!)).toContain('Still running the suite');
+    // The barrier ran once; later updates do not reopen native thinking.
+    expect(io.beforeCreate).toHaveBeenCalledTimes(1);
+  });
+
   it('does not create a completed progress card when a final was sent separately for notifications', async () => {
-    const nativeKey = { ...key, turnId: 'om_native_external_final' };
-    await store.prepare(nativeKey, { ...input, nativeCot: true });
-    io.beforeCreate = async () => {};
+    const nativeKey = await nativeTurn('om_native_external_final');
     await store.update(nativeKey, { kind: 'progress', text: 'Intermediate status' }, io);
+    expect(await store.noteExternalFinal(nativeKey, input.chatId)).toBe(true);
     await store.update(nativeKey, { kind: 'terminal', phase: 'completed' }, io);
     await new TurnReplyCardStore(dir).update(nativeKey, { kind: 'refresh' }, io);
     expect(io.send).not.toHaveBeenCalled();
-    expect(store.read(nativeKey)).toMatchObject({ phase: 'completed', progress: ['Intermediate status'] });
+    expect(store.read(nativeKey)).toMatchObject({ phase: 'completed', progress: ['Intermediate status'], externalFinal: true });
+  });
+
+  it('closes a native CoT turn that ended without any final with one completion card', async () => {
+    const nativeKey = await nativeTurn('om_native_no_final');
+    await store.update(nativeKey, { kind: 'progress', text: 'The answer only reached a progress send' }, io);
+    expect(io.send).not.toHaveBeenCalled();
+    // A final for another chat is not this conversation's closing message.
+    expect(await store.noteExternalFinal(nativeKey, 'oc_elsewhere')).toBe(false);
+    expect((await store.update(nativeKey, { kind: 'terminal', phase: 'completed' }, io)).delivered).toBe(true);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect(extractCardContent(store.read(nativeKey)!.lastCard!)).toContain('The answer only reached a progress send');
+    expect(store.read(nativeKey)?.externalFinal).toBeUndefined();
+  });
+
+  it('does not mark an answer that is already on the card as external', async () => {
+    const nativeKey = await nativeTurn('om_native_card_final');
+    await store.update(nativeKey, finalEvent('On the card'), io);
+    expect(await store.noteExternalFinal(nativeKey, input.chatId)).toBe(false);
+    expect(await store.noteExternalFinal({ ...key, turnId: 'om_unprepared' }, input.chatId)).toBe(false);
+    expect(store.read(nativeKey)?.externalFinal).toBeUndefined();
   });
 
   it.each(['failed', 'cancelled', 'ambiguous'] as const)('publishes a native CoT %s outcome without requiring a final answer', async phase => {
-    const nativeKey = { ...key, turnId: `om_native_${phase}` };
-    await store.prepare(nativeKey, { ...input, nativeCot: true });
-    io.beforeCreate = async () => {};
+    const nativeKey = await nativeTurn(`om_native_${phase}`);
     await store.update(nativeKey, { kind: 'progress', text: 'Intermediate status' }, io);
+    expect(io.send).not.toHaveBeenCalled();
     await store.update(nativeKey, { kind: 'terminal', phase }, io);
     expect(io.send).toHaveBeenCalledTimes(1);
     expect(store.read(nativeKey)?.phase).toBe(phase);
   });
 
   it('still publishes an actionable question before a native CoT final answer', async () => {
-    const nativeKey = { ...key, turnId: 'om_native_ask' };
-    await store.prepare(nativeKey, { ...input, nativeCot: true });
-    io.beforeCreate = async () => {};
-    await store.update(nativeKey, { kind: 'ask', entry: { ask: {
-      askId: 'native_question', nonce: 'nonce', larkAppId: key.larkAppId, sessionId: key.sessionId,
-      chatId: input.chatId, rootMessageId: input.rootId, createdAt: 1, deadlineAt: 60001, settled: false,
-      questions: [{ prompt: 'Continue?', options: [{ key: 'yes', label: 'Yes' }, { key: 'no', label: 'No' }], multiSelect: false }],
-    } } }, io);
+    const nativeKey = await nativeTurn('om_native_ask');
+    await store.update(nativeKey, { kind: 'ask', entry: nativeAsk('native_question') }, io);
     expect(io.send).toHaveBeenCalledTimes(1);
     expect(store.read(nativeKey)?.lastCard).toContain('Continue?');
+  });
+
+  it('keeps settling a native CoT card that is already visible', async () => {
+    const nativeKey = await nativeTurn('om_native_existing');
+    const entry = nativeAsk('native_existing');
+    expect((await store.update(nativeKey, { kind: 'start' }, io)).delivered).toBe(false);
+    await store.update(nativeKey, { kind: 'ask', entry }, io);
+    await store.update(nativeKey, { kind: 'ask', entry: { ...entry, result: {
+      kind: 'answered', answers: [['yes']], by: 'ou_user', comment: null, timedOut: false,
+    } as ReplyCardAsk['result'] } }, io);
+    await store.update(nativeKey, { kind: 'progress', text: 'Continuing after the answer' }, io);
+    const working = store.read(nativeKey)!.lastCard!;
+    expect(working).toContain('stop_turn');
+    await store.update(nativeKey, { kind: 'terminal', phase: 'completed' }, io);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    const settled = store.read(nativeKey)!.lastCard!;
+    expect(settled).not.toBe(working);
+    expect(settled).not.toContain('stop_turn');
+    expect(extractCardContent(settled)).toContain('Continuing after the answer');
+  });
+
+  it('replays an unknown first native CoT POST after reopening even once nothing is actionable', async () => {
+    const nativeKey = await nativeTurn('om_native_unknown_post');
+    const entry = nativeAsk('native_unknown');
+    vi.mocked(io.send).mockRejectedValueOnce(new Error('POST result unknown'));
+    await expect(store.update(nativeKey, { kind: 'ask', entry }, io)).rejects.toThrow('POST result unknown');
+    const pending = store.read(nativeKey)!.pendingCreate!.content;
+    expect(pending).toContain('Continue?');
+    const reopened = new TurnReplyCardStore(dir);
+    await reopened.update(nativeKey, { kind: 'ask', entry: { ...entry, result: {
+      kind: 'answered', answers: [['yes']], by: 'ou_user', comment: null, timedOut: false,
+    } as ReplyCardAsk['result'] } }, io);
+    expect(io.send).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(io.send).mock.calls[1]).toEqual([pending, vi.mocked(io.send).mock.calls[0][1]]);
+    expect(reopened.read(nativeKey)).toMatchObject({ messageId: vi.mocked(io.send).mock.calls[0][1] });
+    expect(reopened.read(nativeKey)?.pendingCreate).toBeUndefined();
+  });
+
+  it('shows native CoT progress on the card when the process is explicitly requested', async () => {
+    const nativeKey = await nativeTurn('om_native_forced');
+    await store.update(nativeKey, { kind: 'progress', text: 'Hidden by default' }, io);
+    expect(io.send).not.toHaveBeenCalled();
+    expect((await store.update(nativeKey, { kind: 'progress', text: 'Shown on request' }, { ...io, forceVisible: true })).delivered).toBe(true);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect(extractCardContent(store.read(nativeKey)!.lastCard!)).toContain('Shown on request');
   });
 
   it.each(['completed', 'failed', 'cancelled', 'ambiguous', 'superseded'] as const)(

@@ -14508,6 +14508,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       if (replyRecord && replyKey) {
         if (replyRecord.chatId !== targetChatId) throw new Error('Reply-card destination changed; send refused');
         let delivered: Awaited<ReturnType<typeof replyStore.update>> | undefined;
+        let undeliveredProgressHint = '进度已保存到本轮记录；请用 botmux send --response-kind final 发送完整答复。';
         const replyDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
           delivered = await replyStore.update(replyKey, effectiveResponseKind === 'final'
             ? { kind: 'final', text, card: replyCardJson, source: 'explicit',
@@ -14521,7 +14522,11 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
                 expectedTurnId: currentTurnId, dispatchAttempt: originDispatchAttempt,
               });
               if (!ready.ok) throw new Error('Native thinking publication is not ready; answer send deferred');
+              // Only an explicit confirmation lets native thinking carry
+              // progress; an older daemon or failed display keeps the card.
+              const readiness = await ready.json().catch(() => undefined) as { nativeThinkingVisible?: unknown } | undefined;
               await revalidateIsolatedOriginBeforeEffect();
+              return readiness?.nativeThinkingVisible === true;
             },
             send: (body, uuid) => dispatchPrimaryUnlocked(body, 'interactive', undefined, completionProposalRecord ? completionProposalCardDispatchUuid(completionProposalRecord) : (uuid ?? providerUuid)),
             patch: (id, body) => patchPublishedGroupCard(appId, targetChatId, id, body, replyRecord.rootId,
@@ -14546,12 +14551,17 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
               return dispatchAfterOriginGate(JSON.stringify({ file_key: fileKey }), 'file', uuid);
             },
           });
+          if (!delivered.messageId && delivered.record.nativeCot && delivered.record.nativeCotVisible) {
+            // Progress is expected here; asking for a final would push the
+            // model to lock the turn early with an interim note.
+            undeliveredProgressHint = '进度已记录到本轮：执行过程由原生思考区展示，进度会随最终答复卡一并归档。中间进度继续按默认方式发送即可；完成后再用 botmux send --response-kind final 发送完整答复。';
+          }
           return delivered.messageId ?? '';
         });
         turnPrimaryReplayed ||= replyDelivery.replayed;
         unifiedReplyUsed = true;
         if (!replyDelivery.messageId) {
-          console.error('进度已保存到本轮记录；请用 botmux send --response-kind final 发送完整答复。');
+          console.error(undeliveredProgressHint);
           console.log(JSON.stringify({ success: true, accepted: true, delivered: false, sessionId: sid, turnId: currentTurnId }));
           return;
         }
@@ -14607,6 +14617,19 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
         ...(scheduleSelfCleanup ? { scheduleSelfCleanup } : {}),
       }));
       return;
+    }
+
+    // A final that left as its own message (notifications, quote, attachments…)
+    // already closes this turn in the chat. Tell the reply card so a completed
+    // native-CoT turn does not add a second, answerless summary card. Failure
+    // only restores that summary card; the delivered final is unaffected.
+    if (effectiveResponseKind === 'final' && messageId && currentTurnId && !unifiedReplyUsed) {
+      try {
+        await new TurnReplyCardStore(resolveDataDir()).noteExternalFinal(
+          { larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt }, targetChatId);
+      } catch (error) {
+        console.error(`botmux send: 未能标记本轮答复卡（最终答复已送达）：${error instanceof Error ? error.message : String(error)}`);
+      }
     }
 
     if (oncallGroupCard && messageId) {

@@ -1180,11 +1180,14 @@ export function handleCotThinkingUpdate(
 }
 
 /** The initial answer waits for native create + prologue (or its bounded failure).
- * Once started, keep waiting even when the operator turns the switch off. */
+ * Once started, keep waiting even when the operator turns the switch off.
+ * Resolves true only when this turn's native thinking display actually exists
+ * and is still accepting updates; a failed create, a disabled stream or a
+ * switched-off channel resolves false so the answer card keeps carrying progress. */
 export async function prepareCotMessageBeforeReply(
   ds: DaemonSession, binding: { turnId: string; dispatchAttempt?: number },
   owns?: () => boolean,
-): Promise<void> {
+): Promise<boolean> {
   const key = turnKeyOf(binding);
   let state = states.get(ds);
   if (state?.turnKey !== key) state = recentStates.get(ds)?.get(key);
@@ -1192,7 +1195,9 @@ export async function prepareCotMessageBeforeReply(
     handleCotThinkingUpdate(ds, { type: 'thinking_update', ...binding, entries: [] }, 'unified', owns);
     state = states.get(ds);
   }
-  if (state?.turnKey === key) await state.publication;
+  if (state?.turnKey !== key) return false;
+  await state.publication;
+  return !!state.cotId && !state.disabled;
 }
 
 export function hasCotMessageForTurn(ds: DaemonSession, binding: { turnId: string; dispatchAttempt?: number }): boolean {

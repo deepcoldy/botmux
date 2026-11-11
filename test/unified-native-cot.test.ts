@@ -164,16 +164,31 @@ describe('unified replies with an independent native CoT channel', () => {
     expect(request).not.toHaveBeenCalled();
   });
 
-  it('continues the answer card when native CoT fails, without sending a fallback answer', async () => {
+  it.each(['rejected', 'business-error', 'prologue-failed', 'chat-off-after-admission'] as const)('continues the answer card when native CoT is unavailable (%s), without sending a fallback answer', async failure => {
     bot.config.replyCardNativeCot = true;
-    request.mockRejectedValue(new Error('CoT unavailable'));
+    if (failure === 'rejected') request.mockRejectedValue(new Error('CoT unavailable'));
+    if (failure === 'business-error') request.mockResolvedValue({ code: 99991672, msg: 'Access denied' });
+    // The bubble exists, but its first push failed: it no longer carries progress.
+    if (failure === 'prologue-failed') request.mockImplementation(async (req: any) => {
+      if (req.method === 'POST' && String(req.url).endsWith('/message_cot')) return { code: 0, data: { cot_id: 'cot_native', message_id: 'om_cot' } };
+      throw new Error('CoT push unavailable');
+    });
+    // Admission froze nativeCot=true; `/cot off` afterwards pauses the native channel.
+    expect(replyCardModeFor(ds, 'om_turn')).toBe('unified');
+    if (failure === 'chat-off-after-admission') bot.config.noCotChats = [ds.chatId];
     const handle = worker();
     handle(update('first')); await settle(); await flushTurnReplyTools(ds, 'om_turn');
+    // Without a live thinking display the answer card is the progress surface.
+    expect(send).toHaveBeenCalledTimes(1);
     handle(update('later')); await settle(); await flushTurnReplyTools(ds, 'om_turn');
     await updateTurnReplyCard(ds, 'om_turn', finalAnswer('answer survives'), send);
     expect(send).toHaveBeenCalledTimes(1);
-    expect(request).toHaveBeenCalledTimes(1);
-    expect(send.mock.calls.at(-1)?.[0]).toContain('answer survives');
+    const creates = request.mock.calls.filter(([req]) => req.method === 'POST' && String(req.url).endsWith('/message_cot'));
+    expect(creates).toHaveLength(failure === 'chat-off-after-admission' ? 0 : 1);
+    expect(vi.mocked(updateMessage).mock.calls.at(-1)?.[2]).toContain('answer survives');
+    const record = new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' })!;
+    expect(record).toMatchObject({ nativeCot: true, nativeCotReady: true });
+    expect(record.nativeCotVisible).toBeUndefined();
   });
 
   it.each([false, true])('settles eager thinking when its transcript never starts (card update failure=%s)', async fail => {
