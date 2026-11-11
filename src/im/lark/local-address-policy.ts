@@ -368,7 +368,6 @@ export function localJumpTargets(content: string, msgType: string, context: Loca
 export function prepareLocalAddressContent(
   content: string, msgType = 'text', context: LocalAddressContext = {},
 ): string {
-  if (context.disabled) return content;
   if (msgType === 'text') return sanitizeLocalAddressText(content, context);
   if (msgType !== 'interactive' && msgType !== 'post') return content;
   let parsed: unknown;
