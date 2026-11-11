@@ -279,8 +279,12 @@ if (process.env.BOTMUX_TEST_NATIVE_COT_BARRIER) {
     const path = new URL(url).pathname;
     if (!path.endsWith('/reply-card-ready')) throw new Error(`Unexpected native CoT test route: ${path}`);
     console.log('CAPTURE_NATIVE_READY');
-    const ok = process.env.BOTMUX_TEST_NATIVE_COT_BARRIER === 'ready';
-    return new Response(JSON.stringify({ ok }), { status: ok ? 200 : 409 });
+    // ready = live native thinking; ready-hidden = display failed/switched off;
+    // ready-legacy = an older daemon that answers without visibility.
+    const barrier = process.env.BOTMUX_TEST_NATIVE_COT_BARRIER ?? '';
+    const ok = barrier.startsWith('ready');
+    const body = barrier === 'ready-legacy' || !ok ? { ok } : { ok, nativeThinkingVisible: barrier === 'ready' };
+    return new Response(JSON.stringify(body), { status: ok ? 200 : 409 });
   });
 }
 // Any non-SDK network request also fails closed; this fixture never contacts Feishu.

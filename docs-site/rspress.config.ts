@@ -18,6 +18,7 @@ const zhSidebar = [
       { text: '5 分钟快速接入', link: '/quickstart' },
       { text: '前置要求', link: '/prerequisites' },
       { text: 'macOS 桌面版', link: '/desktop' },
+      { text: '中心化平台（开源）', link: '/platform' },
     ],
   },
   {
@@ -114,6 +115,7 @@ const enSidebar = [
       { text: '5-Minute Quickstart', link: '/en/quickstart' },
       { text: 'Prerequisites', link: '/en/prerequisites' },
       { text: 'macOS Desktop App', link: '/en/desktop' },
+      { text: 'Central Platform (Open Source)', link: '/en/platform' },
     ],
   },
   {
