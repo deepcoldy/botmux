@@ -553,3 +553,100 @@ describe('TraeX 0.214.1 managed-config footer variants', () => {
     expect(traexRestoredComposerReady([base[0]!, extraOrRow, HINT_ONLY_ROW].join('\n'))).toBe(false);
   });
 });
+
+// Real tmux frames from traecli 0.214.1 with a startup diagnostic warning
+// (an unparsable SKILL.md): the bottom indicator is right-aligned on the hint
+// row as `⚠ N warning(s) · f2 to view`. It is a notice, not an input owner.
+const WARNING_SUFFIX = '⚠ 1 warning · f2 to view';
+const WARNING_SUFFIX_PLURAL = '⚠ 2 warnings · f2 to view';
+const hintRowWithWarning = (suffix: string, width = 160) => {
+  const hint = '  ? for shortcuts';
+  return hint + ' '.repeat(Math.max(1, width - hint.length - suffix.length)) + suffix;
+};
+
+describe('TraeX 0.214.1 warning indicator on the footer hint row', () => {
+  it.each([
+    ['single warning', WARNING_SUFFIX],
+    ['plural warnings', WARNING_SUFFIX_PLURAL],
+  ])('accepts a bare hint row carrying the %s suffix', (_name, suffix) => {
+    const rows = [
+      '──────────────────────────────────────────────────────────',
+      '❯ Ask TRAE CLI to do anything',
+      '──────────────────────────────────────────────────────────',
+      '  GPT-6.1-Sol · /tmp/repo · Context 100% left',
+      hintRowWithWarning(suffix),
+    ];
+    expect(traexRestoredComposerReady(rows.join('\n'))).toBe(true);
+  });
+
+  it('accepts the warning suffix on a shortcut-only single-row footer', () => {
+    const screen = [
+      '❯ Ask TRAE CLI to do anything',
+      hintRowWithWarning(WARNING_SUFFIX),
+    ].join('\n');
+    expect(traexRestoredComposerReady(screen)).toBe(true);
+  });
+
+  it('accepts the warning suffix together with a truncated long-cwd status row', () => {
+    const screen = [
+      '❯ Ask TRAE CLI to do anything',
+      '  GPT-6.1-Sol · /tmp/repo/very-long-directory-name-component-0123456789/very-long-directory-name-compo…',
+      hintRowWithWarning(WARNING_SUFFIX),
+    ].join('\n');
+    expect(traexRestoredComposerReady(screen)).toBe(true);
+  });
+
+  it.each([
+    ['ascii bang instead of the warning glyph', hintRowWithWarning(WARNING_SUFFIX).replace('⚠', '!')],
+    ['warning text without the f2 view action', '  ? for shortcuts   ⚠ 1 warning'],
+    ['non-numeric warning count', hintRowWithWarning(WARNING_SUFFIX).replace('1 warning', 'many warnings')],
+    ['unrelated sentence after the hint', '  ? for shortcuts   ⚠ something else'],
+  ])('rejects look-alike suffixes: %s', (_name, row) => {
+    expect(traexRestoredComposerReady([
+      '❯ Ask TRAE CLI to do anything',
+      '  GPT-6.1-Sol · /tmp/repo · Context 100% left',
+      row,
+    ].join('\n'))).toBe(false);
+  });
+
+  it('still rejects a draft even with the genuine warning suffix', () => {
+    expect(traexRestoredComposerReady([
+      '❯ my unsent draft',
+      '  GPT-6.1-Sol · /tmp/repo · Context 100% left',
+      hintRowWithWarning(WARNING_SUFFIX),
+    ].join('\n'))).toBe(false);
+  });
+
+  it('releases the IdleDetector startup hold on a warning-suffixed hint row', () => {
+    detector.feed(LOADING);
+    expect(detector.observeStartupHistory([
+      '❯ Ask TRAE CLI to do anything',
+      hintRowWithWarning(WARNING_SUFFIX),
+    ].join('\n'))).toBe(true);
+    expect(detector.isStartupPending()).toBe(false);
+  });
+
+  it.each([
+    ['medium pane degrades to warning count plus f2', '? for shortcuts   ⚠ 2 · f2'],
+    ['narrow pane drops the hint tokens and keeps warning plus f2', '               ⚠ 2 · f2'],
+    ['narrowest pane leaves the bare warning count', '          ⚠ 2'],
+  ])('accepts the width-degraded warning indicator: %s', (_name, row) => {
+    expect(traexRestoredComposerReady([
+      '❯ Ask TRAE CLI to do anything',
+      '  GPT-6.1-Sol · /tmp/repo · Context 100% left',
+      row,
+    ].join('\n'))).toBe(true);
+  });
+
+  it.each([
+    ['ascii glyph on the warning-only row', '! 2'],
+    ['non-numeric count on the warning-only row', '⚠ many'],
+    ['bare glyph without a count', '⚠'],
+    ['trailing text after a bare warning row', '⚠ 2 something'],
+  ])('rejects malformed warning-only rows: %s', (_name, row) => {
+    expect(traexRestoredComposerReady([
+      '❯ Ask TRAE CLI to do anything',
+      row,
+    ].join('\n'))).toBe(false);
+  });
+});
