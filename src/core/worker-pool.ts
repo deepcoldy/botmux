@@ -71,7 +71,7 @@ import { RETIRED_RUNTIME_SUCCESSOR_COOLDOWN_MS, WORKER_EXIT_RUNTIME_RETIRED } fr
 import { hasUnsentInputs, unsentInputJournalFile } from '../services/unsent-input-journal.js';
 import { checkWorkerAdmission, formatMemoryBytes, tierWorkerAdmission, type WorkerAdmissionDecision } from './worker-budget.js';
 import { coalesceMarginalAdmissionRetry } from './admission-reclaim.js';
-import { reclaimIdleWorkersForAdmissionAfterTurnDrain } from './idle-worker-sweeper.js';
+import { reclaimIdleWorkersForAdmissionAfterTurnDrain, unsettledReplyHoldUntil } from './idle-worker-sweeper.js';
 import { createWorkerStderrRing, WORKER_ERROR_MARKER, type WorkerStderrRing } from './worker-stderr-ring.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
@@ -10578,6 +10578,22 @@ function reconcileInstallChangeClaim(ds: DaemonSession): InstallClaimVerdict | u
   return verdict;
 }
 
+const pendingSuspendRetryTimers = new WeakMap<DaemonSession, { at: number; timer: ReturnType<typeof setTimeout> }>();
+
+/** Re-run a queued suspend's checkpoint once its reply hold has run out. */
+function retryPendingSuspendAt(ds: DaemonSession, at: number, ownsGeneration?: () => boolean): void {
+  const previous = pendingSuspendRetryTimers.get(ds);
+  if (previous?.at === at) return;
+  if (previous) clearTimeout(previous.timer);
+  else logger.info(`[${tag(ds)}] Queued suspend (${ds.pendingSuspendReason}) waits for the last reply to settle`);
+  const timer = setTimeout(() => {
+    if (pendingSuspendRetryTimers.get(ds)?.timer === timer) pendingSuspendRetryTimers.delete(ds);
+    runPendingSuspendIfSettled(ds, ownsGeneration);
+  }, Math.max(0, at - Date.now()) + 1);
+  timer.unref?.();
+  pendingSuspendRetryTimers.set(ds, { at, timer });
+}
+
 function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => boolean): void {
   const reason = ds.pendingSuspendReason;
   if (!reason) return;
@@ -10609,6 +10625,17 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
   // its way into the CLI; retiring the CLI now destroys it. The claim stays and
   // is cashed in once the worker reports that input taken.
   if (hasUnacceptedCliInput(ds)) return;
+  // The output side of the same rule, shared with the automatic reclaims: the
+  // turn that just ended may not have handed its answer over yet, or the
+  // daemon is still writing it to Lark. Suspending now drops that answer. The
+  // claim stays; the turn's terminal or the delivery's end re-runs this
+  // checkpoint, and a timer at the hold's bound makes sure it runs even if
+  // neither comes.
+  const replyHoldUntil = unsettledReplyHoldUntil(ds);
+  if (replyHoldUntil !== undefined) {
+    retryPendingSuspendAt(ds, replyHoldUntil, ownsGeneration);
+    return;
+  }
   if (reason === CLI_INSTALL_CHANGED_SUSPEND) {
     // A TRAE reclaim carries an exact running-object claim; re-prove it right
     // before acting. A Pi `cli_install_changed` report has no claim and keeps
@@ -10635,6 +10662,8 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
   // backend that stopped being suspendable), and that refusal is temporary —
   // eating the flag would silently drop the request until the next `suspend all`.
   if (suspendWorker(ds, reason)) {
+    const retry = pendingSuspendRetryTimers.get(ds);
+    if (retry) { clearTimeout(retry.timer); pendingSuspendRetryTimers.delete(ds); }
     // suspendWorker already consumed the claim (goal state reached); logging
     // here keeps the "fulfilled by the deferred path" signal distinguishable
     // from a suspend that came from anywhere else.
@@ -10801,7 +10830,7 @@ export function sweepTraexInstallChanges(
 // still being delivered. The drain module notifies after each delivery settles;
 // re-run the settlement checkpoint only when such a claim is queued.
 onFinalOutputDeliverySettled(ds => {
-  if (ds.pendingSuspendReason === CLI_INSTALL_CHANGED_SUSPEND) runPendingSuspendIfSettled(ds);
+  if (ds.pendingSuspendReason !== undefined) runPendingSuspendIfSettled(ds);
   requestLiveSessionCapAfterTurnSettled(ds);
 });
 
@@ -16284,6 +16313,21 @@ export function forkWorker(
   return true;
 }
 
+/** Turns a re-attached worker may treat as finished: only an ordinary-turn
+ *  recovery that settled `completed` proves its turn ended. `cancelled` means
+ *  only that auto-continuation was given up (Esc / Ctrl+C / a new message);
+ *  the CLI may still be running that turn. The worker's own opening turn is
+ *  never one of them. */
+function completedRecoveryTurnTerminals(
+  recovery: Session['ordinaryTurnRecovery'],
+  openingTurnId: string | undefined,
+): Array<{ turnId: string; status: 'completed' }> | undefined {
+  if (recovery?.status !== 'completed') return undefined;
+  const ids = [...new Set([recovery.logicalTurnId, recovery.currentTurnId])]
+    .filter((id): id is string => Boolean(id) && id !== openingTurnId);
+  return ids.length > 0 ? ids.map(turnId => ({ turnId, status: 'completed' as const })) : undefined;
+}
+
 function forkWorkerPrepared(
   ds: DaemonSession,
   promptInput: string | CliTurnPayload,
@@ -17619,6 +17663,8 @@ function forkWorkerPrepared(
       sessionStore.updateSession(ds.session);
     }
   }
+  const settledTurnTerminals = completedRecoveryTurnTerminals(ds.session.ordinaryTurnRecovery, initMsg.turnId);
+  if (settledTurnTerminals) initMsg.settledTurnTerminals = settledTurnTerminals;
   const runtimeController = controllerForSession(ds, true);
   if (runtimeController) {
     initMsg.restartAttemptId = runtimeController.prepareWorkerStart(initMsg.restartAttemptId);
@@ -20184,6 +20230,20 @@ function setupWorkerHandlers(
         // ZMX intentionally reports ready with port=0, but its plain-history
         // screenshots and idle/status transitions must keep flowing.
         if (!startupState.ready && !workerHasInitialized(ds)) break;
+        const activeController = typeof sessionController !== 'undefined' ? sessionController : undefined;
+        const admittedExecution = activeController?.admittedExecution();
+        const openingExecution = msg.turnId && ds.initConfig?.turnId === msg.turnId ? ds.initConfig.sessionCommand?.execution : undefined;
+        const screenTurnProven = Boolean(msg.turnId) && (
+          !activeController
+          || (admittedExecution !== undefined
+            && admittedExecution.turnId === msg.turnId
+            && (msg.dispatchAttempt === undefined || admittedExecution.dispatchAttempt === msg.dispatchAttempt))
+          || (openingExecution !== undefined
+            && openingExecution.turnId === msg.turnId
+            && (msg.dispatchAttempt === undefined || openingExecution.dispatchAttempt === msg.dispatchAttempt)
+            && activeController.store.execution(activeController.ref, openingExecution.executionId)?.phase === 'queued')
+        );
+        const screenTurnId = screenTurnProven ? msg.turnId : undefined;
         const prevStatus = ds.lastScreenStatus;
         const prevBackgroundTaskCount = ds.backgroundTaskCount;
         updateUsageLimitState(ds, msg.usageLimit);
@@ -20199,7 +20259,7 @@ function setupWorkerHandlers(
           const published = cb.onScreenStatus?.(ds, {
             prevStatus,
             status: ds.lastScreenStatus as ScreenStatus,
-            turnId: msg.turnId,
+            turnId: screenTurnId,
           });
           void Promise.resolve(published).catch((err: any) => {
             logger.debug(`[${t}] runtime status card bridge failed: ${err?.message ?? err}`);
@@ -20273,7 +20333,7 @@ function setupWorkerHandlers(
             if (ds.lastScreenStatus === 'idle' && (prevStatus === 'working' || prevStatus === 'analyzing')) {
               void finishTurnReactions(ds);
               if (ds.session.workflowNode && !ds.session.workflowNode.submittedAt) {
-                cb.onWorkflowNodeTurnSettled?.(ds, { ...(msg.turnId ? { turnId: msg.turnId } : {}), at: Date.now() });
+                cb.onWorkflowNodeTurnSettled?.(ds, { ...(screenTurnId ? { turnId: screenTurnId } : {}), at: Date.now() });
               }
             }
           }
@@ -20292,26 +20352,26 @@ function setupWorkerHandlers(
         // Never borrow a shared session's current/queued turn.
         // Notify once per idle episode, including a first frame already at idle,
         // so repeated snapshots cannot keep resetting the settlement debounce.
-        const deferredTurnId = resolveDeferredScheduledTurnId(ds, msg.turnId)
-          ?? (msg.turnId && scheduledSessionRun(ds.session, msg.turnId) ? msg.turnId : undefined);
-        if (msg.turnId && msg.turnId === ds.deferredScheduleUnconfirmedTurnId) {
+        const deferredTurnId = resolveDeferredScheduledTurnId(ds, screenTurnId)
+          ?? (screenTurnId && scheduledSessionRun(ds.session, screenTurnId) ? screenTurnId : undefined);
+        if (screenTurnId && screenTurnId === ds.deferredScheduleUnconfirmedTurnId) {
           ds.deferredScheduleUnconfirmedTurnId = undefined;
         }
         if (ds.lastScreenStatus !== 'idle') deferredScheduleIdleTurnIds.clear();
         if (ds.lastScreenStatus === 'idle' && deferredTurnId
           && !deferredScheduleIdleTurnIds.has(deferredTurnId)
-          && (msg.turnId || deferredTurnId !== ds.deferredScheduleUnconfirmedTurnId)) {
+          && (screenTurnId || deferredTurnId !== ds.deferredScheduleUnconfirmedTurnId)) {
           deferredScheduleIdleTurnIds.add(deferredTurnId);
           void cb.onDeferredScheduleTurnSettled?.(ds, { turnId: deferredTurnId, source: 'idle' });
         }
 
         if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) { clearUsageRefreshTimer(ds); break; }
 
-        if (msg.turnId && prevStatus !== ds.lastScreenStatus && replyCardModeFor(ds, msg.turnId) !== 'legacy'
+        if (screenTurnId && prevStatus !== ds.lastScreenStatus && replyCardModeFor(ds, screenTurnId) !== 'legacy'
           && (ds.lastScreenStatus === 'working' || ds.lastScreenStatus === 'stalled')) {
-          void updateTurnReplyCard(ds, msg.turnId,
+          void updateTurnReplyCard(ds, screenTurnId,
             { kind: 'phase', phase: ds.lastScreenStatus === 'stalled' ? 'waiting' : 'working' },
-            (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }),
+            (body, type, uuid, beforeWrite) => scopedReply(body, type, screenTurnId, { uuid, beforeWrite }),
             { owns: ownsLifecycleMutation }).catch(error => logger.warn(`[${t}] reply-card status: ${error.message}`));
         }
 
@@ -20350,7 +20410,7 @@ function setupWorkerHandlers(
           );
           const ownerOpenId = ds.session.ownerOpenId;
           const notifyText = ownerOpenId ? `<at id=${ownerOpenId}></at> ${notifyBody}` : notifyBody;
-          scopedReply(notifyText, 'text', msg.turnId).catch((err: any) => {
+          scopedReply(notifyText, 'text', screenTurnId).catch((err: any) => {
             logger.debug(`[${t}] Failed to deliver rate-limit notification: ${err?.message ?? err}`);
           });
         }
@@ -20371,7 +20431,7 @@ function setupWorkerHandlers(
           && quotaFallback.kinds.includes(ds.usageLimit.kind)
         ) {
           const limitKey = usageLimitStateKey(ds.usageLimit);
-          const fallbackTurn = fallbackTurnId(ds, msg.turnId);
+          const fallbackTurn = fallbackTurnId(ds, screenTurnId);
           if (!claimQuotaFallbackEvent(ds.larkAppId, ds.usageLimit.kind)) {
             logger.info(
               `[${t}] Quota fallback deduplicated within five minutes `
@@ -20522,7 +20582,7 @@ function setupWorkerHandlers(
             ownsFreshScreenPost()
             && remoteRetirementAdmissionPhase(ds) === null
             && retainsLarkStreamingCardTransport(ds);
-          const cardReplyTarget = captureStreamingCardReplyTarget(ds, msg.turnId);
+          const cardReplyTarget = captureStreamingCardReplyTarget(ds, screenTurnId);
           if (!ownsLifecycleMutation() || !stillOwnsFreshScreenPost()) break;
           const screenPost = scopedReplyTo(
             postingDisplayAnchor,
@@ -22703,6 +22763,10 @@ function setupWorkerHandlers(
           releaseActiveIdentityTurn(config.session.dataDir, msg.sessionId, terminalIdentityTurn);
         }
         collectSessionTurnGarbage(ds);
+        // A suspend queued for this turn may have been held for its terminal.
+        // Only now, after the terminal's own card and receipt work has run and
+        // registered its deliveries (which the hold then waits for).
+        if (ds.pendingSuspendReason !== undefined) runPendingSuspendIfSettled(ds, ownsWorkerSession);
         break;
       }
 
@@ -25696,6 +25760,8 @@ export function forkAdoptWorker(
     // way out of date if the user has /clear'd since).
     adoptRestoredFromMetadata: opts?.restoredFromMetadata === true ? true : undefined,
   };
+  const settledTurnTerminals = completedRecoveryTurnTerminals(ds.session.ordinaryTurnRecovery, opts?.turnId);
+  if (settledTurnTerminals) initMsg.settledTurnTerminals = settledTurnTerminals;
   const runtimeController = controllerForSession(ds, true);
   if (runtimeController) {
     initMsg.restartAttemptId = runtimeController.prepareWorkerStart(initMsg.restartAttemptId);

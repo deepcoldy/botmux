@@ -2300,6 +2300,7 @@ type DaemonToWorkerTransport = DaemonToWorkerBase extends infer Message
         suppressDeliveredFinalFailureNotice?: boolean;
         /** Explicit, off-by-default ordinary bridge handoff negotiation. */
         sessionContract?: import('./services/session-contract.js').SessionContractBootstrap;
+        settledTurnTerminals?: Array<{ turnId: string; status: 'completed' }>;
         finalOutputHandoff?: { version: 1 | 2; token: string; admitNew?: boolean };
       }
     : Message
