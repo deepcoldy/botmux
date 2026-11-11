@@ -65,3 +65,7 @@ botmux project workstream notifications --mode ignore
 
 重复发送沿用相同 trigger idempotency key；只有宿主 input-commit 回执才能确认
 已通知。未知结果保留 pending，不能为了改投新主控而盲目重复运行模型。
+
+设置开关时，等待文件锁期间的当前回合授权、项目版本和主控替换会被重新校验。
+若提交后响应失败，失败不代表设置已回滚：应读回群的 `importedSessionPolicy`，
+不要自动反向写入。显式重试同一目标值可以安全收敛。

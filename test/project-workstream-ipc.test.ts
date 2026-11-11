@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import { config } from '../src/config.js';
 import * as registry from '../src/bot-registry.js';
 import * as pool from '../src/core/worker-pool.js';
@@ -6,12 +8,16 @@ import * as client from '../src/im/lark/client.js';
 import * as runtime from '../src/services/project-workstream-runtime.js';
 import { setIpcAuthSecret, startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
+import * as modes from '../src/services/group-collaboration-mode-store.js';
+import { mutateProjectGroup } from '../src/services/project-group-store.js';
+import { withFileLock } from '../src/utils/file-lock.js';
 
 const APP = 'cli_project_main', CHAT = 'oc_project_ipc', CAP = 'ab'.repeat(32);
 let handle: IpcServerHandle;
 let ds: any;
 let attach: ReturnType<typeof vi.spyOn>;
 const oldDir = config.session.dataDir;
+const roots: string[] = [];
 
 async function post(action: string, extra: Record<string, unknown> = {}, host = false) {
   const path = '/api/sessions/main-ipc/project-workstream';
@@ -53,6 +59,7 @@ afterEach(async () => {
   setIpcAuthSecret(null);
   vi.restoreAllMocks();
   config.session.dataDir = oldDir;
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 const source = { sourceSessionId: 'worker', sourceLarkAppId: 'cli_worker', rootMessageId: 'om_task', title: '迁入任务' };
 
@@ -106,4 +113,55 @@ describe('project workstream IPC boundary', () => {
     expect(runtime.projectWorkstreamAttachments.rename).toHaveBeenCalled();
     expect(attach).not.toHaveBeenCalled();
   });
+  it.each(['capability', 'origin', 'project-generation'] as const)(
+    'rejects notification opt-in if %s changes while the real configuration lock is held', async change => {
+      const dataDir = mkdtempSync(join(process.env.SESSION_DATA_DIR!, 'workstream-ipc-'));
+      roots.push(dataDir);
+      config.session.dataDir = dataDir;
+      await modes.writeGroupCollaborationMode(dataDir, {
+        chatId: CHAT, mode: 'project', coordinatorAppId: APP, workerAppIds: ['cli_worker'],
+      });
+      await mutateProjectGroup(dataDir, CHAT, () => ({
+        schemaVersion: 1, revision: 1, chatId: CHAT, larkAppId: APP,
+        coordinatorSessionId: 'main-ipc', title: '合成项目', goal: '测试',
+        phase: '验证', focus: '测试', status: 'active', blockers: [], workstreams: [], milestones: [],
+        createdAt: '2026-11-11T00:00:00Z', updatedAt: '2026-11-11T00:00:00Z',
+      }));
+      const originalWriter = modes.writeGroupCollaborationMode;
+      let entered!: () => void, release!: () => void, called!: () => void;
+      const locked = new Promise<void>(resolve => { entered = resolve; });
+      const unlocked = new Promise<void>(resolve => { release = resolve; });
+      const writerCalled = new Promise<void>(resolve => { called = resolve; });
+      const held = withFileLock(join(dataDir, modes.GROUP_COLLABORATION_MODE_STORE_FILE), async () => {
+        entered();
+        await unlocked;
+      });
+      await locked;
+      vi.spyOn(modes, 'writeGroupCollaborationMode').mockImplementation((...args) => {
+        called();
+        return originalWriter(...args);
+      });
+      try {
+        const pending = post('notifications', { mode: 'notify' });
+        await writerCalled;
+        if (change === 'capability') ds.managedTurnOrigin.capability = 'cd'.repeat(32);
+        else if (change === 'origin') ds.managedTurnOrigin = { ...ds.managedTurnOrigin };
+        else await mutateProjectGroup(dataDir, CHAT, current => ({
+          ...current!, createdAt: '2026-11-11T00:01:00Z',
+        }));
+        release();
+        await held;
+        const response = await pending;
+        expect(response.status).not.toBe(200);
+        expect(await response.json()).toMatchObject({
+          ok: false, error: change === 'project-generation'
+            ? 'project_configuration_changed' : 'project_attachment_actor_unproven',
+        });
+        expect(modes.readGroupCollaborationMode(dataDir, CHAT)?.importedSessionPolicy).toBe('ignore');
+      } finally {
+        release();
+        await held;
+      }
+    },
+  );
 });

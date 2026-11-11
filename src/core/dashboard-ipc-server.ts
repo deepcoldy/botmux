@@ -3504,15 +3504,18 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-workstream', async (req, res,
         workerAppIds: mode.workerAppIds, autoEnrollWorkers: mode.autoEnrollWorkers,
         importedSessionPolicy: body.mode,
       }, () => {
-        if (findActiveBySessionId(params.sessionId) !== ds || ds.managedTurnOrigin?.turnId !== turn
-          || !canOperate(ds.larkAppId, ds.chatId, caller.requestUserOpenId!, caller.requestUserUnionId)) {
+        if (!actor.authorizationStillValid()) {
           throw new Error('project_attachment_actor_unproven');
         }
         const current = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
         if (current?.mode !== 'project' || current.coordinatorAppId !== ds.larkAppId) {
           throw new Error('project_coordinator_required');
         }
-        if (JSON.stringify(current) !== JSON.stringify(mode)) {
+        const currentProject = readProjectGroup(config.session.dataDir, ds.chatId);
+        if (JSON.stringify(current) !== JSON.stringify(mode)
+          || currentProject?.createdAt !== project.createdAt
+          || currentProject.larkAppId !== project.larkAppId
+          || currentProject.coordinatorSessionId !== project.coordinatorSessionId) {
           throw new Error('project_configuration_changed');
         }
       });
@@ -3527,7 +3530,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-workstream', async (req, res,
     });
     else if (body.action === 'status') result = await projectWorkstreamAttachments.reconcile(actor, { rootMessageId: rootMessageId || undefined });
     else throw new Error('invalid_workstream_action');
-    if (findActiveBySessionId(params.sessionId) !== ds || ds.managedTurnOrigin?.turnId !== turn) {
+    if (!actor.authorizationStillValid()) {
       throw new Error('project_attachment_actor_unproven');
     }
     if (body.action !== 'inspect' && isDispatchTaskTreeCardEnabled()) {

@@ -16,6 +16,8 @@ import {
   createDispatchReportBinding, resolveVerifiedDispatchReportTarget, verifyDispatchReportBinding,
 } from '../src/core/dispatch-report-binding.js';
 import { updateDispatchRegistry } from '../src/core/dispatch-registry.js';
+import { buildDispatchTaskTree, recordDispatchLastReport } from '../src/core/dispatch-task-tree.js';
+import { authorizeReportSessionRelayRequest } from '../src/core/report-session-relay.js';
 import { issueProjectSourceGrant, verifyProjectSourceGrant } from '../src/services/project-workstream-authority.js';
 import { withFileLock } from '../src/utils/file-lock.js';
 
@@ -356,6 +358,83 @@ describe('project workstream attachments', () => {
     expect(readProjectGroup(f.dataDir, 'oc_group')?.workstreams[0]).toMatchObject({ title: '重命名任务', status: 'completed' });
     expect(f.registry().om_topic).toMatchObject({ title: '重命名任务', orchSessionId: 'main-one' });
     expect(verifyDispatchReportBinding(SECRET, 'om_topic', f.registry().om_topic.reportBinding)?.sourceName).toBe('重命名任务');
+  });
+
+  it.each(['', '子任务', ' 子项目 ', '一'.repeat(25)])(
+    'rejects invalid rename titles at the host service without modifying either projection', async title => {
+      const f = await fixture();
+      await f.service.attach(f.actor, f.request);
+      const project = readProjectGroup(f.dataDir, 'oc_group');
+      const registry = f.registry();
+      await expect(f.service.rename(f.actor, { rootMessageId: 'om_topic', title }))
+        .rejects.toThrow('project_workstream_title_required');
+      expect(readProjectGroup(f.dataDir, 'oc_group')).toEqual(project);
+      expect(f.registry()).toEqual(registry);
+    },
+  );
+
+  it('refuses rename by another coordinator or for an unregistered root without creating a task', async () => {
+    const f = await fixture();
+    await f.service.attach(f.actor, f.request);
+    const project = readProjectGroup(f.dataDir, 'oc_group');
+    const registry = f.registry();
+    await expect(f.service.rename({ ...f.actor, larkAppId: 'cli_other' }, {
+      rootMessageId: 'om_topic', title: '越权标题',
+    })).rejects.toThrow('project_coordinator_required');
+    await expect(f.service.rename(f.actor, {
+      rootMessageId: 'om_unknown', title: '未登记任务',
+    })).rejects.toThrow('workstream_not_found');
+    expect(readProjectGroup(f.dataDir, 'oc_group')).toEqual(project);
+    expect(f.registry()).toEqual(registry);
+  });
+
+  it('renames an imported item at the Unicode title limit and preserves child report authorization and task identity', async () => {
+    const f = await fixture();
+    await f.service.attach(f.actor, f.request);
+    const original = verifyDispatchReportBinding(SECRET, 'om_topic', f.registry().om_topic.reportBinding)!;
+    const title = '𠮷'.repeat(24);
+    await f.service.rename(f.actor, { rootMessageId: 'om_topic', title });
+    const binding = verifyDispatchReportBinding(SECRET, 'om_topic', f.registry().om_topic.reportBinding)!;
+    expect(binding).toEqual({ ...original, sourceName: title });
+    const capability = 'synthetic-live-report-capability';
+    const decision = authorizeReportSessionRelayRequest({
+      trustedHost: false, selfLarkAppId: 'cli_worker', registry: f.registry(), bindingSecret: SECRET,
+      raw: {
+        sessionId: 'source-one', dispatchRoot: 'om_topic', content: '改名后完成',
+        status: 'completed', originCapability: capability,
+      },
+      session: {
+        sessionId: 'source-one', larkAppId: 'cli_worker', chatId: 'oc_group',
+        scope: 'thread', rootMessageId: 'om_topic', receiver: false,
+        ownerKey: 'union:on_owner', routeRevision: 1,
+        liveOrigin: { capability, turnId: 'om_current_turn', dispatchAttempt: 1 },
+      },
+    });
+    expect(decision).toMatchObject({
+      ok: true, target: { sessionId: 'main-one', larkAppId: 'cli_main' },
+      sourceName: title, projectUpdate: { status: 'completed' },
+    });
+    if (!decision.ok) throw new Error('expected authorized report');
+    await f.coordinator.run(f.context, {
+      action: 'report', dispatchRoot: decision.dispatchRoot,
+      content: decision.content, ...decision.projectUpdate,
+      expectedAttachment: {
+        sourceSessionId: 'source-one', revision: 1, coordinatorSessionId: 'main-one',
+      },
+    });
+    await updateDispatchRegistry(join(f.dataDir, 'orchestrate-dispatch.json'), registry => {
+      recordDispatchLastReport(registry, decision.dispatchRoot, {
+        ...decision.projectUpdate, content: decision.content, at: '2026-11-11T01:00:00Z',
+      });
+    });
+    expect(readProjectGroup(f.dataDir, 'oc_group')?.workstreams).toHaveLength(1);
+    expect(readProjectGroup(f.dataDir, 'oc_group')?.workstreams[0])
+      .toMatchObject({ dispatchRoot: 'om_topic', title, status: 'completed' });
+    expect(buildDispatchTaskTree({
+      registry: f.registry(), orchSessionId: 'main-one', title: '项目',
+      sessions: [{ sessionId: 'source-one', larkAppId: 'cli_worker', rootMessageId: 'om_topic', status: 'active' }],
+      localAppIds: new Set(['cli_worker']),
+    }).nodes).toMatchObject([{ dispatchRoot: 'om_topic', title, state: 'done' }]);
   });
 
   it('refuses a symlinked authority leaf instead of reading or overwriting it', async () => {
