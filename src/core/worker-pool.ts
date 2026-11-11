@@ -16228,6 +16228,21 @@ export function forkWorker(
   return true;
 }
 
+/** Turns a re-attached worker may treat as finished: only an ordinary-turn
+ *  recovery that settled `completed` proves its turn ended. `cancelled` means
+ *  only that auto-continuation was given up (Esc / Ctrl+C / a new message);
+ *  the CLI may still be running that turn. The worker's own opening turn is
+ *  never one of them. */
+function completedRecoveryTurnTerminals(
+  recovery: Session['ordinaryTurnRecovery'],
+  openingTurnId: string | undefined,
+): Array<{ turnId: string; status: 'completed' }> | undefined {
+  if (recovery?.status !== 'completed') return undefined;
+  const ids = [...new Set([recovery.logicalTurnId, recovery.currentTurnId])]
+    .filter((id): id is string => Boolean(id) && id !== openingTurnId);
+  return ids.length > 0 ? ids.map(turnId => ({ turnId, status: 'completed' as const })) : undefined;
+}
+
 function forkWorkerPrepared(
   ds: DaemonSession,
   promptInput: string | CliTurnPayload,
@@ -17563,14 +17578,8 @@ function forkWorkerPrepared(
       sessionStore.updateSession(ds.session);
     }
   }
-  const settledRecovery = ds.session.ordinaryTurnRecovery;
-  if (settledRecovery?.status === 'completed') {
-    const settledIds = [...new Set([settledRecovery.logicalTurnId, settledRecovery.currentTurnId])]
-      .filter((id): id is string => Boolean(id) && id !== initMsg.turnId);
-    if (settledIds.length > 0) {
-      initMsg.settledTurnTerminals = settledIds.map(turnId => ({ turnId, status: 'completed' as const }));
-    }
-  }
+  const settledTurnTerminals = completedRecoveryTurnTerminals(ds.session.ordinaryTurnRecovery, initMsg.turnId);
+  if (settledTurnTerminals) initMsg.settledTurnTerminals = settledTurnTerminals;
   const runtimeController = controllerForSession(ds, true);
   if (runtimeController) {
     initMsg.restartAttemptId = runtimeController.prepareWorkerStart(initMsg.restartAttemptId);
@@ -25605,14 +25614,8 @@ export function forkAdoptWorker(
     // way out of date if the user has /clear'd since).
     adoptRestoredFromMetadata: opts?.restoredFromMetadata === true ? true : undefined,
   };
-  const settledAdoptRecovery = ds.session.ordinaryTurnRecovery;
-  if (settledAdoptRecovery?.status === 'completed') {
-    const settledIds = [...new Set([settledAdoptRecovery.logicalTurnId, settledAdoptRecovery.currentTurnId])]
-      .filter((id): id is string => Boolean(id) && id !== opts?.turnId);
-    if (settledIds.length > 0) {
-      initMsg.settledTurnTerminals = settledIds.map(turnId => ({ turnId, status: 'completed' as const }));
-    }
-  }
+  const settledTurnTerminals = completedRecoveryTurnTerminals(ds.session.ordinaryTurnRecovery, opts?.turnId);
+  if (settledTurnTerminals) initMsg.settledTurnTerminals = settledTurnTerminals;
   const runtimeController = controllerForSession(ds, true);
   if (runtimeController) {
     initMsg.restartAttemptId = runtimeController.prepareWorkerStart(initMsg.restartAttemptId);

@@ -248,6 +248,40 @@ describe('bindCliPidMarker: taking the executing turn back on reattach', () => {
     expect(onDisk()).toMatchObject({ turnId: null, procStart: readProcessStartIdentity(process.pid) });
   });
 
+  it('retires a marker turn whose own attempt already failed in sessionContract executions', () => {
+    // A failed attempt settles only its own (turn, attempt) key: no generic
+    // key, so this pins the attempt-scoped arm of the seeding.
+    writeFileSync(markerPath, JSON.stringify({
+      sessionId: 's-bind',
+      turnId: 'om_attempt_failed',
+      dispatchAttempt: 1,
+      callerOpenId: 'ou_asker',
+      trustedCaller: caller,
+      procStart: readProcessStartIdentity(process.pid),
+    }));
+
+    seedInit({
+      type: 'init',
+      sessionId: 's-bind',
+      sessionContract: {
+        session: { appId: 'cli_app', sessionId: 's-bind' },
+        worker: { workerId: 'w-2', generation: 2 },
+        executions: [
+          {
+            ref: { executionId: 'exec-failed-1', turnId: 'om_attempt_failed', dispatchAttempt: 1 },
+            phase: 'failed',
+          },
+        ],
+      },
+    });
+    bind();
+
+    expect(scope.currentBotmuxTurnId).toBeUndefined();
+    expect((scope.activeTurnAuthority as ActiveTurnAuthority).snapshot()).toBeUndefined();
+    expect(published).toEqual([]);
+    expect(onDisk()).toMatchObject({ turnId: null, procStart: readProcessStartIdentity(process.pid) });
+  });
+
   it('preserves a retry attempt when only an earlier attempt failed in sessionContract executions', () => {
     writeFileSync(markerPath, JSON.stringify({
       sessionId: 's-bind',

@@ -33761,12 +33761,9 @@ function retireTerminatedMarkerTurn(parsed: {
     // was just confirmed emitted, so this lookup returns false for it too.
     return !turnTerminalEmitted(parsed.turnId, siblingAttempt);
   };
-  const activeSibling = !genericSettled
-    && currentBotmuxTurnId === parsed.turnId
-    && currentBotmuxDispatchAttempt !== dispatchAttempt
-    && !turnTerminalEmitted(parsed.turnId, currentBotmuxDispatchAttempt);
-  const liveSibling = activeSibling
-    || queuedTypeAheadTurns.some(siblingIsLive)
+  // Every caller skips a marker head equal to currentBotmuxTurnId, so the
+  // active turn is never a sibling here: only queued records can be.
+  const liveSibling = queuedTypeAheadTurns.some(siblingIsLive)
     || (parsed.queuedTurns ?? []).some(siblingIsLive);
   dropQueuedTurnRecord(parsed.turnId, dispatchAttempt, { tombstone: !liveSibling });
   if (!liveSibling) markTurnRetired(parsed.turnId);
