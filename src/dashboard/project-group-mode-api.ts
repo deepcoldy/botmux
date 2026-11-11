@@ -76,9 +76,11 @@ function responseBody(
     ? {
         ...publicConfig,
         autoEnrollWorkers: publicConfig.autoEnrollWorkers === true,
+        importedSessionPolicy: publicConfig.importedSessionPolicy === 'notify' ? 'notify' : 'ignore',
         progressCard: resolveProjectProgressCardConfig(publicConfig.progressCard),
       }
-    : publicConfig ?? { schemaVersion: 1, chatId, mode: 'standard' };
+    : { ...(publicConfig ?? { schemaVersion: 1, chatId, mode: 'standard' }),
+        importedSessionPolicy: publicConfig?.importedSessionPolicy === 'notify' ? 'notify' : 'ignore' };
   return {
     ok: true,
     config: effectiveConfig,
@@ -107,10 +109,15 @@ export async function putProjectGroupMode(
 ): Promise<ProjectGroupModeApiResult> {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return bad('body_must_be_object');
   const record = body as Record<string, unknown>;
-  const supported = new Set(['mode', 'coordinatorAppId', 'workerAppIds', 'autoEnrollWorkers', 'progressCard']);
+  const supported = new Set(['mode', 'coordinatorAppId', 'workerAppIds', 'autoEnrollWorkers', 'progressCard', 'importedSessionPolicy']);
   const unsupported = Object.keys(record).filter(key => !supported.has(key));
   if (unsupported.length > 0) return bad('unsupported_field', 400, { fields: unsupported });
   if (record.mode !== 'standard' && record.mode !== 'project') return bad('invalid_mode');
+  if (record.importedSessionPolicy !== undefined
+    && record.importedSessionPolicy !== 'ignore' && record.importedSessionPolicy !== 'notify') {
+    return bad('invalid_imported_session_policy');
+  }
+  const importedSessionPolicy = record.importedSessionPolicy as 'ignore' | 'notify' | undefined;
 
   const groups = await deps.groups();
   const chat = groups.chats.find(candidate => candidate.chatId === chatId);
@@ -132,7 +139,7 @@ export async function putProjectGroupMode(
         });
       }
     }
-    const config = await writeConfig(deps.dataDir, { chatId, mode: 'standard' });
+    const config = await writeConfig(deps.dataDir, { chatId, mode: 'standard', importedSessionPolicy });
     return { status: 200, body: responseBody(chatId, config, readProject(deps.dataDir, chatId)) };
   }
 
@@ -185,6 +192,7 @@ export async function putProjectGroupMode(
     coordinatorAppId,
     workerAppIds,
     autoEnrollWorkers,
+    importedSessionPolicy,
     progressCard: progressCardParsed.value,
   });
   if (!project) {

@@ -54,6 +54,11 @@ export interface TriggerSessionDeps {
  * public TriggerRequest schema: an untrusted connector must not choose a turn
  * identity that participates in durable delivery reconciliation. */
 export interface TriggerSessionInternalOptions {
+  /** Reject a host-only event before reserving its at-most-once turn lease. */
+  validateBeforeClaim?: () => void;
+  /** Final synchronous host-side policy fence for internal metadata events.
+   * Public trigger JSON cannot supply this callback. */
+  validateBeforeDispatch?: () => void;
   stableTurnId?: string;
   /** Trusted dashboard listener execution; never accepted from the public trigger API. */
   messageListenerRun?: import('./message-listener-silence.js').SilentMessageListenerRun;
@@ -875,6 +880,7 @@ async function triggerSessionTurnAdmitted(
         ? { content, codexAppSteerable: true }
         : { ...content, codexAppSteerable: true };
   const prepareStableDispatch = (target: DaemonSession, willFork: boolean): number | undefined => {
+    internal?.validateBeforeDispatch?.();
     // Every accepted external input owns its generated turn, including quiet
     // report follow-ups on an already-running worker. Keep its reply anchor
     // independent of presentation and final-output suppression options.
@@ -1423,6 +1429,7 @@ async function triggerSessionTurnAdmitted(
       | { reuse: TriggerResponse }
       | { retry: TriggerResponse }
       | { lease: idempotencyStore.IdempotencyRecord | undefined } => {
+      internal?.validateBeforeClaim?.();
       if (!turnLeaseKey) return { lease: undefined };
       // At-most-once cannot be held through the queued-activation durable tail:
       // that staging path (admitQueuedActivationTail → promotion → queuedActivation

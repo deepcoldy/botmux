@@ -442,7 +442,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   suspendWorker: vi.fn(() => false),
   forkWorker: vi.fn(),
   recordTurnExplicitMention: vi.fn(),
-  forkAdoptWorker: vi.fn(),
+  forkAdoptWorker: vi.fn().mockReturnValue('accepted'),
   adoptSandboxBlocked: vi.fn((botCfg, session) => botCfg?.sandbox === true || botCfg?.readIsolation === true || session?.sandbox === true || process.env.BOTMUX_SANDBOX === '1'),
   getCurrentCliVersion: vi.fn(() => '1.0.42'),
   requestSessionRestart: vi.fn((_ds: any, observer: any) => {
@@ -744,6 +744,7 @@ import { ALL_CLI_IDS, cliAliasesSelecting } from '../src/adapters/cli/registry.j
 import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import { withBotTurnMutation } from '../src/core/bot-turn-mutation-gate.js';
+import { setProjectAssociationConsumer } from '../src/core/project-session-association-events.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
 import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, updateCodexAppEffort, updateCodexCliEffort, sendWorkerSessionInput, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
@@ -2280,6 +2281,7 @@ describe('handleCommand', () => {
     vi.mocked(sessionStore.getOwnedSession).mockReturnValue(undefined);
     vi.mocked(sessionStore.listSessions).mockReturnValue([]);
     vi.mocked(resumeSession).mockReset();
+    vi.mocked(forkAdoptWorker).mockReset().mockReturnValue('accepted');
   });
 
   describe('/fork source protection', () => {
@@ -8584,6 +8586,38 @@ describe('handleCommand', () => {
       expect(forkWorker).toHaveBeenCalledWith(ds, '', true);
       const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as string;
       expect(reply).toContain('Vendor Codex');
+    });
+
+    it('does not announce a successful association or retain an import notification after adopt admission is rejected', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      const association = vi.fn();
+      setProjectAssociationConsumer(association);
+      vi.mocked(forkAdoptWorker).mockImplementationOnce(current => {
+        // Model an import eligible for notification before the final worker
+        // admission rejects it; the caller must clear that pending marker.
+        current.session.projectImportPending = true;
+        return 'rejected';
+      });
+      const target = {
+        source: 'tmux' as const, tmuxTarget: 'rejected-pane:0.0',
+        cliPid: 4242, cliId: 'claude-code' as const, cwd: '/repo',
+        paneCols: 80, paneRows: 24,
+      };
+      try {
+        await startAdoptSession(target, ds, deps, LARK_APP_ID);
+        expect(forkAdoptWorker).toHaveBeenCalledWith(ds);
+        expect(association).not.toHaveBeenCalled();
+        expect(ds.session.projectImportPending).toBe(false);
+        expect(sessionStore.updateSession).toHaveBeenLastCalledWith(ds.session);
+        expect(deps.sessionReply).toHaveBeenCalledTimes(1);
+        const reply = vi.mocked(deps.sessionReply).mock.calls[0]![1];
+        // The success response identifies the adopted pane. Refusal must not
+        // present that success receipt to the user.
+        expect(reply).not.toContain(target.tmuxTarget);
+      } finally {
+        setProjectAssociationConsumer(undefined);
+      }
     });
 
     it('should refuse re-adopt and prompt 断开 when ds.adoptedFrom is already set', async () => {
