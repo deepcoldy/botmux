@@ -24,7 +24,10 @@
 
 答复delivery首次落盘时，在原有delivery context中保存宿主核验的`feedbackSubjectBinding`
 快照；当时没有绑定则显式保存null。SQLite和PostgreSQL运行入口均使用该快照，
-surface准备与feedback.revised订阅不读取后来新增的subject绑定。
+surface与feedback.revised订阅的context只取该快照，不读取后来新增的subject绑定。
+问题归属与答复类型仍按该回合的绑定判定，与旧版一致：同一回合在答复落盘后才绑定时，
+归属与类型照常生效，但context不进入该答复（为null），因此需要context时须在答复前绑定。
+从未绑定过的部署不会因此新建扩展库。
 反馈surface保留该答复的context快照，原生动作事件及feedback.revised订阅携带
 `context`，由宿主读取而不接受按钮回调的自报context。旧卡缺失时为null，保留历史快照，
 不从新问题猜测或补写。`contextRef`保持原null契约，不假定引用解析能力。

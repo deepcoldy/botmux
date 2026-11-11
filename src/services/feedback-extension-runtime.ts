@@ -85,9 +85,12 @@ export async function reconcileFeedbackSurfaces(input: {
             const subjects = new Map<string, string>();
             const contexts = new Map<string, Record<string, unknown> | undefined>();
             for (const delivery of sourceDeliveries) {
-              const hasSnapshot = !!delivery.context && Object.prototype.hasOwnProperty.call(delivery.context, 'feedbackSubjectBinding');
-              const snapshot = hasSnapshot ? delivery.context?.feedbackSubjectBinding as FeedbackSubjectBinding | null | undefined : undefined;
-              const binding = hasSnapshot ? snapshot : extensions.subject(input.appId, delivery.sessionId ?? '', delivery.turnId ?? '');
+              // The snapshot freezes only the context. Question and answer kind still
+              // follow the turn's binding as before: a binding never changes once
+              // written, so the two differ only when the same turn binds after its
+              // answer was recorded, which must keep working.
+              const snapshot = delivery.context?.feedbackSubjectBinding as FeedbackSubjectBinding | null | undefined;
+              const binding = snapshot ?? extensions.subject(input.appId, delivery.sessionId ?? '', delivery.turnId ?? '');
               if (binding && binding.answerKind !== 'substantive') continue;
               const subject = binding?.sourceMessageId ?? delivery.topicRootId;
               if (!subject) continue;
