@@ -45,6 +45,7 @@ function restartHarness(opts: { replacementPromptReadyDuringSpawn: boolean }) {
     tmuxRestartTimer: null,
     remoteThreadId: undefined,
     intentionalRestartBackend: undefined,
+    intentionallyRetiredBackends: new WeakSet(),
     effectiveBackendType: 'pty',
     awaitingFirstPrompt: false,
     isPromptReady: true,
