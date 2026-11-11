@@ -16,6 +16,9 @@ import { peerSessions, type ChatSessionRef, type ChatTaskReaderDeps } from './co
 import { stewardTaskHintsOn } from './core/decision-board/model.js';
 import { composeRowFromActive, composeRowFromPersistedActive } from './core/dashboard-rows.js';
 import { onSessionTaskEvent } from './core/session-task-events.js';
+import { validateProjectAttachmentReport, getProjectAttachmentSource, projectWorkstreamAttachments, setProjectWorkstreamPool } from './services/project-workstream-runtime.js';
+import { setProjectAssociationConsumer } from './core/project-session-association-events.js';
+import { installProjectImportRuntime } from './services/project-import-runtime.js';
 import { setDecisionCardService } from './core/decision-board/card-action.js';
 import { createPrStateLookup } from './core/decision-board/github-pr-state.js';
 import { lookupChatAcrossBots } from './core/decision-board/chat-lookup.js';
@@ -570,6 +573,7 @@ import {
 import {
   createDispatchReportBinding,
   resolveVerifiedDispatchReportTarget,
+  verifyDispatchReportBinding,
   loadOrCreateDispatchReportBindingSecret,
   DISPATCH_REPORT_REGISTER_MAX_BYTES,
   DISPATCH_REPORT_REGISTER_ROUTE,
@@ -4961,6 +4965,7 @@ function sessionTopicWriteOptions(ds: DaemonSession, turnId?: string, verifiedSo
 async function syncDispatchTaskTreeAfterReport(input: {
   dispatchRoot: string; status?: unknown; content: string;
   target: { larkAppId: string; sessionId: string };
+  expectedAttachment?: { sourceSessionId: string; revision: number; coordinatorSessionId: string };
 }): Promise<void> {
   const warn = (error: unknown) => logger.warn(`[task-tree] refresh after report failed: ${error instanceof Error ? error.message : String(error)}`);
   // Default-off feature gate (3.2(c)): when the machine-wide task-tree card is
@@ -4971,6 +4976,14 @@ async function syncDispatchTaskTreeAfterReport(input: {
   try {
     let orchSessionId: string | undefined;
     await updateDispatchRegistry(join(config.session.dataDir, 'orchestrate-dispatch.json'), registry => {
+      if (input.expectedAttachment) {
+        const entry = registry[input.dispatchRoot] as { reportBinding?: unknown } | undefined;
+        const binding = verifyDispatchReportBinding(
+          loadOrCreateDispatchReportBindingSecret(config.session.dataDir), input.dispatchRoot, entry?.reportBinding,
+        );
+        if (binding?.attachment?.sourceSessionId !== input.expectedAttachment.sourceSessionId
+          || binding.attachment.revision !== input.expectedAttachment.revision || binding.attachment.state !== 'active') return;
+      }
       orchSessionId = recordDispatchLastReport(registry, input.dispatchRoot, {
         status: input.status, content: input.content, at: new Date().toISOString(),
       });
@@ -4996,15 +5009,20 @@ async function reportZeroPromptFinal(ds: DaemonSession, input: {
   let registry: Record<string, unknown>;
   try { registry = JSON.parse(readFileSync(join(config.session.dataDir, 'orchestrate-dispatch.json'), 'utf8')); }
   catch { return; }
+  const attachmentProof = await validateProjectAttachmentReport(registry, input.dispatchRoot, ds.larkAppId, ds.session.sessionId);
+  if (!attachmentProof.ok) return;
   const decision = prepareAutomaticDispatchReport({
     registry, bindingSecret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
     dispatchRoot: input.dispatchRoot, sourceSessionId: ds.session.sessionId,
     sourceLarkAppId: ds.larkAppId, content: input.content,
+    sourceOwnerKey: attachmentProof.ownerKey, sourceRouteRevision: attachmentProof.routeRevision,
   });
   if (!decision) return;
   const requestId = `zero-prompt:${ds.session.sessionId}:${input.turnId}`;
   const triggerMeta = { requestId, receivedAt: new Date().toISOString(), turnIdempotencyKey: requestId };
   await retryAutomaticDispatchReport(async () => {
+    const proof = await validateProjectAttachmentReport(registry, input.dispatchRoot!, ds.larkAppId, ds.session.sessionId);
+    if (!proof.ok) throw new Error(proof.error);
     const target = findOnlineDaemon(decision.target.larkAppId);
     if (!target) throw new Error('zero-prompt report: orchestrator daemon is offline');
     const delivered = await deliverReportSessionRelay({
@@ -10331,6 +10349,27 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
     }
   } catch { /* missing/malformed registry fails closed below */ }
 
+  const reportRoot = raw && typeof raw === 'object' && typeof (raw as Record<string, unknown>).dispatchRoot === 'string'
+    ? (raw as Record<string, unknown>).dispatchRoot as string : '';
+  // Validate the current source capability before doing new cross-daemon or
+  // authority-journal reads. The snapshot is not an oracle for unproven IDs.
+  const reportBody = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
+  const sourceAuth = authorizeSessionScopedIpc({
+    trustedHost: isTrustedHostIpcRequest(req), sessionExists: !!ds, receiverSession: !!ds?.session.vcMeetingReceiver,
+    allowReceiver: false, sessionId: ds?.session.sessionId ?? '',
+    liveOrigin: ds?.managedTurnOrigin,
+    claimedCapability: typeof reportBody.originCapability === 'string' ? reportBody.originCapability : undefined,
+    claimedTurnId: typeof reportBody.originTurnId === 'string' ? reportBody.originTurnId : undefined,
+    claimedDispatchAttempt: typeof reportBody.originDispatchAttempt === 'number' ? reportBody.originDispatchAttempt : undefined,
+  });
+  if (!sourceAuth.ok) return jsonRes(res, 403, { ok: false, error: sourceAuth.error });
+  const attachmentProof = ds && reportRoot.startsWith('om_')
+    ? await validateProjectAttachmentReport(registry, reportRoot, ds.larkAppId, ds.session.sessionId)
+    : undefined;
+  if (attachmentProof && !attachmentProof.ok) {
+    return jsonRes(res, 403, { ok: false, error: attachmentProof.error });
+  }
+
   const authorizeInput = (): ReportSessionRelayAuthorizationInput => ({
     raw,
     trustedHost: isTrustedHostIpcRequest(req),
@@ -10343,6 +10382,7 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
           receiver: !!ds.session.vcMeetingReceiver,
           scope: ds.scope ?? ds.session.scope,
           rootMessageId: ds.session.rootMessageId,
+          ...(attachmentProof?.ok ? { ownerKey: attachmentProof.ownerKey, routeRevision: attachmentProof.routeRevision } : {}),
           ...(ds.managedTurnOrigin ? { liveOrigin: ds.managedTurnOrigin } : {}),
           ...(ds.session.quoteTargetId ? { quoteTargetId: ds.session.quoteTargetId } : {}),
           ...(ds.session.replyTargets ? { replyTargets: ds.session.replyTargets } : {}),
@@ -10357,6 +10397,14 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
   });
   const authorize = () => authorizeReportSessionRelayRequest(authorizeInput());
   const decision = authorize();
+  const importedBinding = verifyDispatchReportBinding(
+    loadOrCreateDispatchReportBindingSecret(config.session.dataDir), reportRoot,
+    (registry[reportRoot] as { reportBinding?: unknown } | undefined)?.reportBinding,
+  );
+  const expectedAttachment = importedBinding?.attachment ? {
+    sourceSessionId: importedBinding.attachment.sourceSessionId, revision: importedBinding.attachment.revision,
+    coordinatorSessionId: importedBinding.targetSessionId,
+  } : undefined;
 
   // #2262: a relay the orchestrator provably never received is published in the
   // caller's own dispatch thread instead of being lost. Only requests that opt
@@ -10440,6 +10488,12 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
   }
 
   const sourceWriteOptions = sessionTopicWriteOptions(ds!, ds!.managedTurnOrigin?.turnId, decision.dispatchRoot);
+  const originalSourceFence = sourceWriteOptions.beforeWrite;
+  sourceWriteOptions.beforeWrite = async () => {
+    await originalSourceFence?.();
+    const proof = await validateProjectAttachmentReport(registry, decision.dispatchRoot, ds!.larkAppId, ds!.session.sessionId);
+    if (!proof.ok) throw new Error(proof.error);
+  };
   const targetDaemon = findOnlineDaemon(decision.target.larkAppId);
   const triggerMeta = {
     requestId: `report:${decision.source.sessionId}:${Date.now()}`,
@@ -10448,8 +10502,11 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
   const postProjectUpdate = async (
     target: { larkAppId: string; sessionId: string },
   ): Promise<{ projectSynced: boolean; projectSyncError?: string }> => {
+    const currentProof = await validateProjectAttachmentReport(registry, decision.dispatchRoot, ds!.larkAppId, ds!.session.sessionId);
+    if (!currentProof.ok) return { projectSynced: false, projectSyncError: currentProof.error };
     await syncDispatchTaskTreeAfterReport({
       dispatchRoot: decision.dispatchRoot, status: decision.projectUpdate.status, content: decision.content, target,
+      expectedAttachment,
     });
     return postProjectGroupUpdate(target);
   };
@@ -10473,6 +10530,7 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
           body: JSON.stringify({
             action: 'report', dispatchRoot: decision.dispatchRoot, content: decision.content,
             ...decision.projectUpdate,
+            ...(expectedAttachment ? { expectedAttachment } : {}),
           }),
         },
       );
@@ -32808,6 +32866,7 @@ async function waitForManagedActivationCommit(index: number, appId: string): Pro
 }
 
 export async function startDaemon(botIndex?: number): Promise<void> {
+  setProjectWorkstreamPool({ findActiveBySessionId });
   if (feedbackMaintenanceActive(config.session.dataDir)) {
     logger.warn('[feedback] Persisted maintenance is active. Inspect `botmux feedback storage status`; resume or cancel the original migration. New turns remain blocked until explicit recovery.');
   }
@@ -36073,6 +36132,26 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     chatTasks: boardChatTasks,
   });
   setDecisionBoardService(decisionBoard);
+  const projectImports = installProjectImportRuntime({
+    listActiveSessions: () => [...activeSessions.values()],
+    findActiveBySessionId,
+    markEnqueued: observed => {
+      const live = findActiveBySessionId(observed.sessionId);
+      if (!live || live.larkAppId !== observed.larkAppId
+        || live.session.projectRouteRevision !== observed.projectRouteRevision) return;
+      live.session.projectImportPending = false;
+      try { sessionStore.updateSession(live.session); } catch { live.session.projectImportPending = true; }
+    },
+  });
+  const projectImportTick = setInterval(() => {
+    void projectImports.tick().catch(() => logger.debug('[project] import recovery pending'));
+  }, 30_000);
+  projectImportTick.unref?.();
+  setProjectAssociationConsumer(event => {
+    void getProjectAttachmentSource(event.larkAppId, event.sessionId)
+      .then(source => source && projectWorkstreamAttachments.observe(source))
+      .catch(() => logger.debug('[project] association projection pending; refresh can repair'));
+  });
   // 子任务提醒：本 daemon 记下本轮结果或举手时，按群转给本机开着「子任务提醒」的管家
   // （本 bot 直接调用，其他 bot 走本机 IPC）。管家端防抖、重新核对、去重。
   onSessionTaskEvent(({ chatId }) => {

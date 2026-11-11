@@ -19,7 +19,7 @@ import {
   resolveReportRelayFallbackTarget,
   type ReportSessionRelaySessionView,
 } from '../src/core/report-session-relay.js';
-import { createDispatchReportBinding, DISPATCH_REPORT_REGISTER_ROUTE } from '../src/core/dispatch-report-binding.js';
+import { createDispatchReportBinding, DISPATCH_REPORT_REGISTER_ROUTE, type DispatchReportAttachment } from '../src/core/dispatch-report-binding.js';
 import { routeHasNarrowUntrustedAuth } from '../src/core/dashboard-ipc-server.js';
 import { loopbackFetch } from '../src/core/loopback-fetch.js';
 
@@ -86,6 +86,96 @@ function authorize(
     ...overrides,
   });
 }
+
+describe('imported workstream report source authorization', () => {
+  const attachment: DispatchReportAttachment = {
+    sourceSessionId: 'session-source', sourceLarkAppId: 'cli_source', ownerKey: 'union:on_owner',
+    sourceRouteRevision: 1,
+    revision: 1, state: 'active', reportCapability: 'verified',
+  };
+  const registry = (overrides: Partial<DispatchReportAttachment> = {}) => ({
+    om_dispatch: {
+      ...REGISTRY.om_dispatch,
+      reportBinding: createDispatchReportBinding(BINDING_SECRET, {
+        ...REGISTRY.om_dispatch.reportBinding.payload,
+        attachment: { ...attachment, ...overrides },
+      }),
+    },
+  });
+
+  it('allows exactly the host-proven source session, app and owner', () => {
+    expect(authorize({
+      registry: registry(), session: session({ ownerKey: attachment.ownerKey, routeRevision: 1 }),
+    })).toMatchObject({ ok: true, source: { sessionId: 'session-source', larkAppId: 'cli_source' } });
+  });
+
+  it.each([
+    { sourceSessionId: 'replacement-session' },
+    { sourceLarkAppId: 'cli_another_bot' },
+    { ownerKey: 'union:on_other_owner' },
+    { sourceRouteRevision: 2 },
+  ])('refuses a report from a different source lifetime or owner', changed => {
+    expect(authorize({
+      registry: registry(changed), session: session({ ownerKey: attachment.ownerKey, routeRevision: 1 }),
+    })).toEqual({ ok: false, status: 403, error: 'dispatch_attachment_source_mismatch' });
+  });
+
+  it('does not accept caller-supplied owner identity when host owner proof is missing', () => {
+    expect(authorize({
+      registry: registry(),
+      raw: { sessionId: 'session-source', dispatchRoot: 'om_dispatch', content: 'report',
+        originCapability: CAPABILITY, ownerKey: attachment.ownerKey },
+    })).toEqual({ ok: false, status: 403, error: 'dispatch_attachment_source_mismatch' });
+  });
+
+  it('rejects a stale binding after a move away and back to the same root', () => {
+    expect(authorize({
+      registry: registry(),
+      session: session({ ownerKey: attachment.ownerKey, routeRevision: 3 }),
+      raw: { sessionId: 'session-source', dispatchRoot: 'om_dispatch', content: 'report',
+        originCapability: CAPABILITY, routeRevision: 1 },
+    })).toEqual({ ok: false, status: 403, error: 'dispatch_attachment_source_mismatch' });
+  });
+
+  it('requires host route proof rather than a request-body route revision', () => {
+    expect(authorize({
+      registry: registry(),
+      session: session({ ownerKey: attachment.ownerKey }),
+      raw: { sessionId: 'session-source', dispatchRoot: 'om_dispatch', content: 'report',
+        originCapability: CAPABILITY, routeRevision: 1 },
+    })).toEqual({ ok: false, status: 403, error: 'dispatch_attachment_source_mismatch' });
+  });
+
+  it.each([
+    { state: 'pending' as const },
+    { state: 'moved' as const },
+    { reportCapability: 'manual' as const },
+    { reportCapability: 'unavailable' as const },
+  ])('does not relay an inactive or unverified attachment', changed => {
+    expect(authorize({
+      registry: registry(changed), session: session({ ownerKey: attachment.ownerKey, routeRevision: 1 }),
+    })).toEqual({ ok: false, status: 403, error: 'dispatch_attachment_inactive' });
+  });
+
+  it('keeps legacy report authorization independent of the new owner field', () => {
+    expect(authorize({ session: session({ ownerKey: undefined }) }).ok).toBe(true);
+  });
+
+  it('requires source lifetime and owner proof for automatic imported reporting', () => {
+    const input = { registry: registry(), bindingSecret: BINDING_SECRET, dispatchRoot: 'om_dispatch',
+      sourceSessionId: 'session-source', sourceLarkAppId: 'cli_source', sourceOwnerKey: attachment.ownerKey,
+      sourceRouteRevision: 1,
+      content: 'a final answer' };
+    expect(prepareAutomaticDispatchReport(input)).toMatchObject({ ok: true, projectUpdate: {} });
+    expect(prepareAutomaticDispatchReport({ ...input, sourceSessionId: 'replacement-session' })).toBeUndefined();
+    expect(prepareAutomaticDispatchReport({ ...input, sourceLarkAppId: 'cli_other' })).toBeUndefined();
+    expect(prepareAutomaticDispatchReport({ ...input, sourceOwnerKey: undefined })).toBeUndefined();
+    expect(prepareAutomaticDispatchReport({ ...input, sourceRouteRevision: undefined })).toBeUndefined();
+    expect(prepareAutomaticDispatchReport({ ...input, sourceRouteRevision: 2 })).toBeUndefined();
+    expect(prepareAutomaticDispatchReport({ ...input, registry: registry({ state: 'closed' }) })).toBeUndefined();
+    expect(prepareAutomaticDispatchReport({ ...input, registry: registry({ reportCapability: 'manual' }) })).toBeUndefined();
+  });
+});
 
 describe('report session relay authorization', () => {
   it('binds delivery keys to content so changed content cannot replay an old receipt', () => {
