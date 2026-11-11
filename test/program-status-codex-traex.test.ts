@@ -301,6 +301,60 @@ describe('transcript terminal vs a held working report', () => {
   });
 });
 
+describe('a locally started turn after a screen-owned cycle emits its busy edge', () => {
+  // P2: while awaiting the CLI's own busy report a screen-settled command
+  // (/status, /clear — no OSC reports) or a post-terminal-fence fireIdle()
+  // publishes the idle edge. Local/web-terminal input then clears isIdle, and
+  // the working report takes authority. The busy edge must still fire: under
+  // authority the later painted Working row can no longer trip idleToBusyPattern.
+  const readyScreen = (cli: 'codex' | 'traex') => cli === 'codex'
+    ? '\r\n› Ask Codex to do anything\r\n'
+    : '\r\n❯ Ask TRAE CLI to do anything\r\n';
+  for (const cli of ['codex', 'traex'] as const) {
+    const app = cli === 'codex' ? 'codex' : 'traecli';
+
+    it(`${cli}: a screen-settled, report-less command — OSC working still publishes one busy edge`, () => {
+      vi.useFakeTimers({ now: 0 });
+      const detector = new IdleDetector(adapterFor(cli));
+      const busyEdges: string[] = [];
+      detector.onBusy(() => busyEdges.push('busy'));
+      detector.fireIdle(); // retire startup before the scenario cycle
+      detector.reset({ inputCycle: true });
+      detector.feed(readyScreen(cli));
+      vi.advanceTimersByTime(3_500); // spinner guard 3s + quiescence 2s
+      expect(detector.isIdleNow()).toBe(true);
+      // Local (e.g. web-terminal) echo: any PTY bytes clear isIdle while the
+      // one-shot busy edge stays armed.
+      detector.feed('typed locally\r');
+      expect(detector.isIdleNow()).toBe(false);
+      detector.observeProgramStatus({ state: 'working', app });
+      expect(busyEdges).toEqual(['busy']);
+      // Repeated working records and the now-ignored Working row do not duplicate it.
+      detector.observeProgramStatus({ state: 'working', app });
+      detector.feed('\r\n• Working (0s • esc to interrupt)\r\n');
+      expect(busyEdges).toEqual(['busy']);
+      detector.dispose();
+      vi.useRealTimers();
+    });
+
+    it(`${cli}: a post-terminal-fence fireIdle cycle — OSC working still publishes one busy edge`, () => {
+      vi.useFakeTimers({ now: 0 });
+      const detector = new IdleDetector(adapterFor(cli));
+      const busyEdges: string[] = [];
+      detector.onBusy(() => busyEdges.push('busy'));
+      detector.fireIdle();
+      detector.reset({ inputCycle: true });
+      detector.fireIdle(); // fence recheck ends the turn while awaiting the busy report
+      expect(detector.isIdleNow()).toBe(true);
+      detector.feed('typed locally\r');
+      detector.observeProgramStatus({ state: 'working', app });
+      expect(busyEdges).toEqual(['busy']);
+      detector.dispose();
+      vi.useRealTimers();
+    });
+  }
+});
+
 describe('OSC 7501 launch gate', () => {
   const codex = createCodexAdapter('/bin/codex');
   const traex = createTraexAdapter('/bin/traex');

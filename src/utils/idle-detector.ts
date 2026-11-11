@@ -985,7 +985,13 @@ export class IdleDetector {
 
   private lockProgramStatusBusy(): void {
     this.clearTimer();
-    const wasIdle = this.isIdle;
+    // PTY output between the published idle edge and this report (a local /
+    // web-terminal input, or a report-less command the screen just settled)
+    // already cleared `isIdle`, while the one-shot busy edge stays armed.
+    // Taking OSC authority here must still emit that edge: once authoritative,
+    // the later painted Working row can no longer trip idleToBusyPattern in
+    // feed(), so without this the whole locally started turn reads as idle.
+    const wasIdle = this.isIdle || this.busyTransitionArmed;
     this.isIdle = false;
     this.busyTransitionArmed = false;
     if (wasIdle) this.busyCallback?.();
