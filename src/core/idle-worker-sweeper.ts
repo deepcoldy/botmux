@@ -494,6 +494,19 @@ function unsettledTurnHold(ds: DaemonSession): UnsettledTurnHold | undefined {
 /** Holds already logged, so repeated sweeps log a hold and its expiry once. */
 const loggedUnsettledHold = new WeakMap<DaemonSession, string>();
 
+/**
+ * When an automatic reclaim or a queued suspend of this session may go ahead
+ * as far as its last reply is concerned: `undefined` when nothing holds it,
+ * else the time the current hold ends (its bound; it ends sooner when the
+ * reply settles).
+ */
+export function unsettledReplyHoldUntil(ds: DaemonSession, now: number = Date.now()): number | undefined {
+  const hold = unsettledTurnHold(ds);
+  if (!hold) return undefined;
+  const until = hold.since + hold.graceMs;
+  return now < until ? until : undefined;
+}
+
 function holdsReclaimForUnsettledTurn(ds: DaemonSession, now: number): boolean {
   const hold = unsettledTurnHold(ds);
   if (!hold) return false;

@@ -71,7 +71,7 @@ import { RETIRED_RUNTIME_SUCCESSOR_COOLDOWN_MS, WORKER_EXIT_RUNTIME_RETIRED } fr
 import { hasUnsentInputs, unsentInputJournalFile } from '../services/unsent-input-journal.js';
 import { checkWorkerAdmission, formatMemoryBytes, tierWorkerAdmission, type WorkerAdmissionDecision } from './worker-budget.js';
 import { coalesceMarginalAdmissionRetry } from './admission-reclaim.js';
-import { reclaimIdleWorkersForAdmissionAfterTurnDrain } from './idle-worker-sweeper.js';
+import { reclaimIdleWorkersForAdmissionAfterTurnDrain, unsettledReplyHoldUntil } from './idle-worker-sweeper.js';
 import { createWorkerStderrRing, WORKER_ERROR_MARKER, type WorkerStderrRing } from './worker-stderr-ring.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
@@ -10578,6 +10578,22 @@ function reconcileInstallChangeClaim(ds: DaemonSession): InstallClaimVerdict | u
   return verdict;
 }
 
+const pendingSuspendRetryTimers = new WeakMap<DaemonSession, { at: number; timer: ReturnType<typeof setTimeout> }>();
+
+/** Re-run a queued suspend's checkpoint once its reply hold has run out. */
+function retryPendingSuspendAt(ds: DaemonSession, at: number, ownsGeneration?: () => boolean): void {
+  const previous = pendingSuspendRetryTimers.get(ds);
+  if (previous?.at === at) return;
+  if (previous) clearTimeout(previous.timer);
+  else logger.info(`[${tag(ds)}] Queued suspend (${ds.pendingSuspendReason}) waits for the last reply to settle`);
+  const timer = setTimeout(() => {
+    if (pendingSuspendRetryTimers.get(ds)?.timer === timer) pendingSuspendRetryTimers.delete(ds);
+    runPendingSuspendIfSettled(ds, ownsGeneration);
+  }, Math.max(0, at - Date.now()) + 1);
+  timer.unref?.();
+  pendingSuspendRetryTimers.set(ds, { at, timer });
+}
+
 function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => boolean): void {
   const reason = ds.pendingSuspendReason;
   if (!reason) return;
@@ -10609,6 +10625,17 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
   // its way into the CLI; retiring the CLI now destroys it. The claim stays and
   // is cashed in once the worker reports that input taken.
   if (hasUnacceptedCliInput(ds)) return;
+  // The output side of the same rule, shared with the automatic reclaims: the
+  // turn that just ended may not have handed its answer over yet, or the
+  // daemon is still writing it to Lark. Suspending now drops that answer. The
+  // claim stays; the turn's terminal or the delivery's end re-runs this
+  // checkpoint, and a timer at the hold's bound makes sure it runs even if
+  // neither comes.
+  const replyHoldUntil = unsettledReplyHoldUntil(ds);
+  if (replyHoldUntil !== undefined) {
+    retryPendingSuspendAt(ds, replyHoldUntil, ownsGeneration);
+    return;
+  }
   if (reason === CLI_INSTALL_CHANGED_SUSPEND) {
     // A TRAE reclaim carries an exact running-object claim; re-prove it right
     // before acting. A Pi `cli_install_changed` report has no claim and keeps
@@ -10635,6 +10662,8 @@ function runPendingSuspendIfSettled(ds: DaemonSession, ownsGeneration?: () => bo
   // backend that stopped being suspendable), and that refusal is temporary —
   // eating the flag would silently drop the request until the next `suspend all`.
   if (suspendWorker(ds, reason)) {
+    const retry = pendingSuspendRetryTimers.get(ds);
+    if (retry) { clearTimeout(retry.timer); pendingSuspendRetryTimers.delete(ds); }
     // suspendWorker already consumed the claim (goal state reached); logging
     // here keeps the "fulfilled by the deferred path" signal distinguishable
     // from a suspend that came from anywhere else.
@@ -10801,7 +10830,7 @@ export function sweepTraexInstallChanges(
 // still being delivered. The drain module notifies after each delivery settles;
 // re-run the settlement checkpoint only when such a claim is queued.
 onFinalOutputDeliverySettled(ds => {
-  if (ds.pendingSuspendReason === CLI_INSTALL_CHANGED_SUSPEND) runPendingSuspendIfSettled(ds);
+  if (ds.pendingSuspendReason !== undefined) runPendingSuspendIfSettled(ds);
   requestLiveSessionCapAfterTurnSettled(ds);
 });
 
@@ -22740,6 +22769,10 @@ function setupWorkerHandlers(
           releaseActiveIdentityTurn(config.session.dataDir, msg.sessionId, terminalIdentityTurn);
         }
         collectSessionTurnGarbage(ds);
+        // A suspend queued for this turn may have been held for its terminal.
+        // Only now, after the terminal's own card and receipt work has run and
+        // registered its deliveries (which the hold then waits for).
+        if (ds.pendingSuspendReason !== undefined) runPendingSuspendIfSettled(ds, ownsWorkerSession);
         break;
       }
 
