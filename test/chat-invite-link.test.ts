@@ -16,6 +16,7 @@ describe('native chat invitation',()=>{
   {code:0,data:{is_permanent:true,share_link:'https://outside.test/?link_token=x'}},
   {code:0,data:{is_permanent:true,share_link:'https://applink.larkoffice.com.outside.test/client/chat/chatter/add_by_link?link_token=x'}},
   {code:0,data:{is_permanent:true,share_link:'https://applink.feishu.cn/client/chat/open?openChatId=oc_created'}},
+  {code:0,data:{is_permanent:true,share_link:'https://user:secret@applink.feishu.cn/client/chat/chatter/add_by_link?link_token=x'}},
  ])('refuses failed, expiring or non-invitation responses',async response=>{
   mocks.link.mockResolvedValue(response);await expect(getChatInviteLink('app','oc_created')).rejects.toThrow();
  });

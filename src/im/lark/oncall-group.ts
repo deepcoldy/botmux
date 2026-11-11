@@ -506,7 +506,8 @@ export async function refreshOncallSessionCard(source: OncallGroupSource): Promi
         await client.updateMessage(carrier.appId, carrier.messageId, compose(carrier.cardJson));
       }
     } catch (error) {
-      if (!(error instanceof Error && error.name === 'MessageWithdrawnError')) failures.push(error);
+      // A withdrawn card, or one past Lark's edit window, can never show the new entry.
+      if (!(error instanceof Error && ['MessageWithdrawnError', 'MessageUpdateExpiredError'].includes(error.name))) failures.push(error);
     }
   }
   if (failures.length) throw new AggregateError(failures, '部分结果卡的人工入口更新失败，将重试');
@@ -646,18 +647,45 @@ export async function forwardOncallConversation(source: OncallGroupSource, owns:
   }, { maxWaitMs: 60_000 });
 }
 
+const ONCALL_HANDOFF_WINDOW_MS = 24 * 60 * 60_000;
+const ONCALL_BACKFILL_RETRY_MAX_MS = 30 * 60_000;
+/** Per app, per created group: when the last backfill outside the handoff window
+ * failed, and when it may run again. Kept in memory, so a restart retries once. */
+const oncallBackfillRetries = new Map<string, Map<string, { failures: number; nextAtMs: number }>>();
+
 export async function retryPendingOncallHandoffs(appId: string, owns: () => boolean = () => true): Promise<void> {
   const store = new OncallGroupStore(config.session.dataDir);
-  for (const source of store.pendingHandoffs(appId)) {
+  const pending = store.pendingHandoffs(appId);
+  const retries = oncallBackfillRetries.get(appId) ?? new Map<string, { failures: number; nextAtMs: number }>();
+  oncallBackfillRetries.set(appId, retries);
+  const pendingKeys = new Set(pending.map(source => store.handoffKey(source)));
+  for (const key of retries.keys()) if (!pendingKeys.has(key)) retries.delete(key);
+  for (const source of pending) {
     if (!owns()) return;
+    const key = store.handoffKey(source);
+    const handoffOpen = Date.now() - (store.getRequest(source)?.submittedAtMs ?? 0) < ONCALL_HANDOFF_WINDOW_MS;
+    // Old groups only need their invitation and cards repaired. A lasting
+    // failure there (no share permission, bot left the group) must not repeat
+    // every cycle forever; the open handoff window keeps its immediate retry.
+    const retry = retries.get(key);
+    if (!handoffOpen && retry && Date.now() < retry.nextAtMs) continue;
     const before = JSON.stringify(store.getRequest(source));
+    let repaired = true;
     try {
-      await prepareOncallGroupInvite(source).catch(() => {});
+      await prepareOncallGroupInvite(source).catch(() => { repaired = false; });
       // Backfill old invite buttons without re-opening the expired handoff window.
-      if (Date.now() - (store.getRequest(source)?.submittedAtMs ?? 0) < 24 * 60 * 60_000) {
+      if (handoffOpen) {
         await forwardOncallConversation(source, () => owns() && oncallGroupEnabled(getBot(appId).config.oncallGroup, source.chatId));
       }
       if (JSON.stringify(store.getRequest(source)) !== before || store.getRequest(source)?.cardRefreshPending) await refreshOncallSessionCard(source);
-    } catch { logger.warn('[oncall-group] Handoff reconciliation will retry; no new group is created'); }
+    } catch {
+      repaired = false;
+      logger.warn('[oncall-group] Handoff reconciliation will retry; no new group is created');
+    }
+    if (repaired || handoffOpen) retries.delete(key);
+    else {
+      const failures = (retry?.failures ?? 0) + 1;
+      retries.set(key, { failures, nextAtMs: Date.now() + Math.min(ONCALL_BACKFILL_RETRY_MAX_MS, 5_000 * 2 ** failures) });
+    }
   }
 }

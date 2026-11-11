@@ -582,7 +582,7 @@ describe('public entry to a created Oncall group', () => {
     expect(mocks.update).toHaveBeenCalled();
     expect(mocks.forward).not.toHaveBeenCalled();expect(mocks.membership).not.toHaveBeenCalled();
   });
-  it('retries an old invitation card patch after disabling new Oncall creation',async()=>{
+  it('retries an old invitation card patch after disabling new Oncall creation, once its backoff has passed',async()=>{
     const groups=new OncallGroupStore(dir);
     groups.claim(source,'ou_owner',{messageIds:[],cutoffMs:Date.now()-25*60*60_000,forwardMode:'none'});
     groups.finish(source,{status:'succeeded',openChatId:'oc_created'},groups.getRequest(source)!.attemptId);
@@ -590,9 +590,82 @@ describe('public entry to a created Oncall group', () => {
     await retryPendingOncallHandoffs('app');
     expect(groups.getRequest(source)).toMatchObject({cardRefreshPending:true,inviteLink:expect.stringContaining('add_by_link')});
     await retryPendingOncallHandoffs('app');
+    expect(mocks.update).toHaveBeenCalledOnce();
+    const later=Date.now()+31*60_000;const clock=vi.spyOn(Date,'now').mockReturnValue(later);
+    try { await retryPendingOncallHandoffs('app'); } finally { clock.mockRestore(); }
     expect(mocks.update).toHaveBeenCalledTimes(2);expect(mocks.invite).toHaveBeenCalledOnce();
     expect(groups.getRequest(source)?.cardRefreshPending).toBe(false);
     expect(mocks.forward).not.toHaveBeenCalled();
+  });
+  it('settles an old card past the edit window instead of patching it every cycle',async()=>{
+    const groups=new OncallGroupStore(dir);
+    groups.claim(source,'ou_owner',{messageIds:[],cutoffMs:Date.now()-20*24*60*60_000,forwardMode:'none'});
+    groups.finish(source,{status:'succeeded',openChatId:'oc_created'},groups.getRequest(source)!.attemptId);
+    mocks.update.mockRejectedValue(Object.assign(Error('past the edit window'),{name:'MessageUpdateExpiredError'}));
+    await retryPendingOncallHandoffs('app');
+    expect(groups.getRequest(source)).toMatchObject({inviteLink:expect.stringContaining('add_by_link'),cardRefreshPending:false});
+    expect(groups.pendingHandoffs('app')).toEqual([]);
+    await retryPendingOncallHandoffs('app');
+    expect(mocks.update).toHaveBeenCalledOnce();
+  });
+  it('backs off a lasting invitation failure for an old group instead of calling the share API every cycle',async()=>{
+    const groups=new OncallGroupStore(dir);
+    groups.claim(source,'ou_owner',{messageIds:[],cutoffMs:Date.now()-25*60*60_000,forwardMode:'none'});
+    groups.finish(source,{status:'succeeded',openChatId:'oc_created'},groups.getRequest(source)!.attemptId);
+    groups.markCardsRefreshed(source,groups.getRequest(source)!);
+    mocks.invite.mockRejectedValue(Error('share disabled'));
+    const start=Date.now();const clock=vi.spyOn(Date,'now');const attempts:number[]=[];
+    try {
+      for(let ms=0;ms<=60*60_000;ms+=5_000){
+        clock.mockReturnValue(start+ms);const before=mocks.invite.mock.calls.length;
+        await retryPendingOncallHandoffs('app');
+        if(mocks.invite.mock.calls.length>before)attempts.push(ms);
+      }
+    } finally { clock.mockRestore(); }
+    const cycles=60*60_000/5_000+1;
+    expect(attempts[0]).toBe(0);
+    expect(attempts.length).toBeGreaterThan(2);
+    expect(attempts.length*10).toBeLessThan(cycles);
+    const gaps=attempts.slice(1).map((at,i)=>at-attempts[i]);
+    expect(gaps[0]).toBeGreaterThan(5_000);
+    expect(gaps.every((gap,i)=>i===0||gap>=gaps[i-1])).toBe(true);
+    expect(groups.getRequest(source)?.inviteLink).toBeUndefined();
+  });
+  it('keeps retrying an unavailable invitation every cycle inside the handoff window',async()=>{
+    const groups=seedWithoutInvite();mocks.invite.mockRejectedValue(Error('bot not in group yet'));
+    await retryPendingOncallHandoffs('app');const first=mocks.invite.mock.calls.length;
+    await retryPendingOncallHandoffs('app');
+    expect(first).toBeGreaterThan(0);expect(mocks.invite.mock.calls.length).toBeGreaterThan(first);
+    mocks.invite.mockResolvedValue('https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=invite-oc_created');
+    await retryPendingOncallHandoffs('app');
+    expect(groups.getRequest(source)?.inviteLink).toContain('add_by_link');
+  });
+  it('forgets an old group backoff once a click has repaired it, so a later card is refreshed at once',async()=>{
+    const groups=new OncallGroupStore(dir);
+    groups.claim(source,'ou_owner',{messageIds:[],cutoffMs:Date.now()-25*60*60_000,forwardMode:'none'});
+    groups.finish(source,{status:'succeeded',openChatId:'oc_created'},groups.getRequest(source)!.attemptId);
+    groups.markCardsRefreshed(source,groups.getRequest(source)!);
+    mocks.invite.mockRejectedValueOnce(Error('share disabled'));
+    await retryPendingOncallHandoffs('app');
+    const result=await handleOncallGroupAction(event('oncall_group_join',undefined,'ou_other'),'app');
+    await result.afterAck();
+    expect(groups.pendingHandoffs('app')).toEqual([]);
+    await retryPendingOncallHandoffs('app');
+    const patches=mocks.update.mock.calls.length;
+    groups.recordSource({...source,messageId:'om_reply_next',cardJson:JSON.stringify({schema:'2.0',body:{elements:[]}})});
+    await retryPendingOncallHandoffs('app');
+    expect(mocks.update.mock.calls.length).toBeGreaterThan(patches);
+    expect(groups.getRequest(source)?.cardRefreshPending).toBe(false);
+  });
+  it('refuses to prepare an invitation before group creation has succeeded',async()=>{
+    const groups=new OncallGroupStore(dir);
+    const join=()=>handleOncallGroupAction(event('oncall_group_join',undefined,'ou_other'),'app');
+    expect((await join()).toast.type).toBe('error');
+    groups.claim(source,'ou_owner',{messageIds:[],cutoffMs:Date.now(),forwardMode:'none'});
+    expect((await join()).toast.type).toBe('error');
+    groups.finish(source,{status:'failed'},groups.getRequest(source)!.attemptId);
+    expect((await join()).toast.type).toBe('error');
+    expect(mocks.invite).not.toHaveBeenCalled();expect(mocks.update).not.toHaveBeenCalled();expect(mocks.reply).not.toHaveBeenCalled();
   });
   it('prepares missing invites even when the handoff mode is none',async()=>{
     const groups=seedWithoutInvite();

@@ -14,7 +14,7 @@ vi.mock('../src/bot-registry.js', () => ({ getBot: () => mocks.bot }));
 vi.mock('../src/im/lark/client.js', () => ({ getChatInviteLink: mocks.invite, getMessageDetail: mocks.detail, replyMessage: mocks.reply, updateMessage: mocks.update }));
 vi.mock('../src/im/lark/identity-cache.js', () => ({ resolveSender: mocks.sender }));
 
-import { attachOncallGroupButton, handleOncallGroupAction, recordOncallGroupDelivery } from '../src/im/lark/oncall-group.js';
+import { attachOncallGroupButton, handleOncallGroupAction, reconcileOncallReplyCard, recordOncallGroupDelivery } from '../src/im/lark/oncall-group.js';
 import { OncallGroupStore, type OncallGroupSource } from '../src/services/oncall-group-store.js';
 
 let dir: string;
@@ -139,5 +139,12 @@ it('repairs a legacy non-session card for a different clicker without creating a
   await result.afterAck();
   expect(mocks.sender).not.toHaveBeenCalled();expect(fetcher).not.toHaveBeenCalled();
   const card=JSON.parse(mocks.update.mock.calls.at(-1)![2]);
+  expect(card.body.elements.at(-1).columns.at(-1).elements[0].behaviors).toEqual([{type:'open_url',default_url:groups.getRequest(source)!.inviteLink}]);
+});
+
+it('rebuilds the group invitation on a non-session card after feedback readback drops its button',()=>{
+  const groups=new OncallGroupStore(dir);groups.claim(source,'ou_owner');
+  groups.finish(source,{status:'succeeded',openChatId:'oc_created',inviteLink:'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=invite-oc_created'});
+  const card=reconcileOncallReplyCard('app','om_reply',{schema:'2.0',body:{elements:[]}});
   expect(card.body.elements.at(-1).columns.at(-1).elements[0].behaviors).toEqual([{type:'open_url',default_url:groups.getRequest(source)!.inviteLink}]);
 });
