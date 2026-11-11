@@ -2132,7 +2132,7 @@ type DaemonToWorkerBase =
   | { type: 'runtime_binding_aborted_ack'; bindingId: string }
   /** The host refused this binding; the worker returns to its predecessor. */
   | { type: 'runtime_binding_refused'; bindingId: string }
-  | { type: 'runtime_contract_assigned'; bindingId: string; runtime: import('./services/session-contract.js').RuntimeRef; mayExecute: boolean; executions?: import('./services/session-contract.js').ExecutionRef[]; admissionStates?: import('./services/session-contract.js').ExecutionAdmissionState[]; observedExecutions?: Array<{ runtime: import('./services/session-contract.js').RuntimeRef; execution: import('./services/session-contract.js').ExecutionRef }> }
+  | { type: 'runtime_contract_assigned'; bindingId: string; runtime: import('./services/session-contract.js').RuntimeRef; mayExecute: boolean; executions?: import('./services/session-contract.js').ExecutionRef[]; admissionStates?: import('./services/session-contract.js').ExecutionAdmissionState[]; observedExecutions?: Array<{ runtime: import('./services/session-contract.js').RuntimeRef; execution: import('./services/session-contract.js').ExecutionRef }>; continuation?: import('./services/session-contract.js').RuntimeExecutionContinuationResult }
   | { type: 'execution_contract_assigned'; bindingId: string; execution: import('./services/session-contract.js').ExecutionRef }
   | import('./services/universal-output-handoff.js').OutputHandoffReceipt
   | import('./services/final-output-handoff.js').FinalOutputAccepted
@@ -2457,7 +2457,7 @@ export type WorkerToDaemonBase =
   | { type: 'protected_mcp_secret_channel_request'; requestId: string; capabilityId: string }
   | ({ type: 'codex_app_effort_result'; requestId: string } & CodexAppEffortResult)
   | ({ type: 'codex_cli_effort_result'; requestId: string } & CodexAppEffortResult)
-  | { type: 'runtime_binding_started'; bindingId: string; operationId?: string }
+  | { type: 'runtime_binding_started'; bindingId: string; operationId?: string; continuation?: import('./services/session-contract.js').RuntimeExecutionContinuation }
   | { type: 'runtime_binding_aborted'; bindingId: string; operationId?: string }
   | { type: 'runtime_binding'; bindingId: string; identity: import('./services/session-contract.js').RuntimeIdentity; operationId?: string;
       /** The same live CLI moved here from this binding (launcher PID
