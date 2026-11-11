@@ -670,7 +670,7 @@ import {
 } from './core/scheduled-send.js';
 import { markScheduleRunLogDelivered } from './services/schedule-run-log-store.js';
 import { claimCardLocation, createScheduleIdentityClaims, resolveScheduledRunIdentity, type ScheduledRunIdentity } from './core/schedule-identity-claim.js';
-import { TRIGGER_USER_AUTH_TOOLS, delegatesOnMention } from './services/trigger-user-auth.js';
+import { TRIGGER_USER_AUTH_TOOLS, delegatesOnMention, dispatchOnlyToolsForTurn } from './services/trigger-user-auth.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
   runIdempotencyFailClose,
@@ -9207,6 +9207,19 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
       : ds.session.failedTurnRecovery?.turnId === turnId ? ds.session.failedTurnRecovery.caller
         : active?.turnId === turnId ? active.caller
           : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId));
+    const tools = bot.triggerUserAuth?.enabled === true ? bot.triggerUserAuth.tools : [];
+    const dispatchOnlyTools = dispatchOnlyToolsForTurn(bot.triggerUserAuth, {
+      sourceChatId: ds.chatId,
+      targetChatId: chatId,
+      targetAppIds,
+      directHuman: ds.session.failedTurnRecovery?.turnId !== turnId
+        && !!active && active.turnId === turnId
+        && active.caller.senderType === 'user' && !active.caller.source
+        && active.caller.requestLarkAppId === ds.larkAppId
+        && !!active.caller.requestUserOpenId,
+      inherited: false,
+    });
+    const dispatchTools = [...new Set([...tools, ...dispatchOnlyTools])];
     // A host bot grant stands in only for turns that no human administrator
     // drives. An administrator's own dispatch (live, or restored from the reply
     // registry) keeps their identity, their tool delegation and the ordinary
@@ -9223,20 +9236,20 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     const botGrant = matchedGrant?.chatIds.includes(ds.chatId) ? matchedGrant : undefined;
     const scheduleCreateDefaulted = body.suppressScheduleCreate !== true
       && body.delegateScheduleCreate !== true
+      && dispatchOnlyTools.length === 0
       && (delegationPolicy?.defaultOnDispatchFromBotAppIds?.includes(ds.larkAppId) === true || !!botGrant);
     const scheduleCreateRequested = body.suppressScheduleCreate !== true
       && (body.delegateScheduleCreate === true || scheduleCreateDefaulted);
     if (scheduleCreateRequested && delegationPolicy?.createEnabled !== true) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_disabled' });
     }
-    const tools = bot.triggerUserAuth?.enabled === true ? bot.triggerUserAuth.tools : [];
     const configuredScheduleRunScopes = delegationPolicy?.runScopes ?? [];
     if (scheduleCreateRequested && !botGrant
       && configuredScheduleRunScopes.some(scope => !tools.includes(scope))) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_source_run_scope_unavailable' });
     }
     const needsDelegation = targetAppIds.length > 0
-      && (tools.length > 0 || scheduleCreateRequested);
+      && (dispatchTools.length > 0 || scheduleCreateRequested);
     // Host IPC authentication proves the local command, not a human turn.
     // In particular a revoked worker may retain a policy-only origin. Never
     // report a protected dispatch as sent after dropping its user authority.
@@ -9270,7 +9283,7 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
       sourceAppId: ds.larkAppId,
       caller: dispatchCaller,
       inherited: inherited?.authority,
-      tools,
+      tools: inherited ? tools : dispatchTools,
       ...(scheduleCreateRequested ? {
         scheduleCreate: {
           targetAppIds,
@@ -9411,13 +9424,24 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
     } else if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
       return skip('delegated_caller_not_allowed');
     }
+    const dispatchOnlyTools = dispatchOnlyToolsForTurn(bot.triggerUserAuth, {
+      sourceChatId: ds.chatId,
+      targetChatId: chatId,
+      targetAppIds,
+      directHuman: ds.session.failedTurnRecovery?.turnId !== turnId
+        && !!active && active.turnId === turnId
+        && active.caller.senderType === 'user' && !active.caller.source
+        && active.caller.requestLarkAppId === ds.larkAppId
+        && !!active.caller.requestUserOpenId,
+      inherited: !!inherited,
+    });
     const authority = await authorityForDispatch({
       sourceAppId: ds.larkAppId,
       caller: ds.session.failedTurnRecovery?.turnId === turnId ? ds.session.failedTurnRecovery.caller
         : active?.turnId === turnId ? active.caller
           : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId)),
       inherited: inherited?.authority,
-      tools: bot.triggerUserAuth!.tools,
+      tools: [...new Set([...bot.triggerUserAuth!.tools, ...dispatchOnlyTools])],
       resolveUnionId: resolveUnionIdFromOpenId,
     });
     if (!authority) return skip(inherited ? 'no_shared_tool' : 'no_direct_human');

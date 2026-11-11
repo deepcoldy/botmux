@@ -88,6 +88,22 @@ describe('parseTriggerUserAuthConfig', () => {
     expect(() => parseTriggerUserAuthConfig({ enabled: 'true' })).toThrow(/enabled/);
     expect(() => parseTriggerUserAuthConfig({ enabled: true, tools: 'lark-cli' })).toThrow(/tools/);
   });
+
+  it('parses exact dispatch-only scopes and keeps them out of source CLI auth', () => {
+    const config = parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'],
+      dispatchOnly: { tools: ['bytedcli', 'bytedcli'], targetAppIds: ['cli_target'], chatIds: ['oc_group'] } });
+    expect(config?.dispatchOnly).toEqual({ tools: ['bytedcli'], targetAppIds: ['cli_target'], chatIds: ['oc_group'] });
+    expect(triggerUserAuthApplies(config, 'bytedcli')).toBe(false);
+    expect(delegatesOnMention(config)).toBe(true);
+  });
+
+  it('rejects incomplete or disabled dispatch-only scopes', () => {
+    const valid = { tools: ['bytedcli'], targetAppIds: ['cli_target'], chatIds: ['oc_group'] };
+    expect(() => parseTriggerUserAuthConfig({ enabled: false, dispatchOnly: valid })).toThrow(/enabled/);
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, dispatchOnly: { ...valid, chatIds: [] } })).toThrow(/chatIds/);
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, dispatchOnly: { ...valid, targetAppIds: ['*'] } })).toThrow(/targetAppIds/);
+    expect(() => parseTriggerUserAuthConfig({ enabled: true, dispatchOnly: { ...valid, tools: ['git'] } })).toThrow(/tools/);
+  });
 });
 
 describe('triggerUserAuthApplies', () => {

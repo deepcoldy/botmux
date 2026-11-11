@@ -98,6 +98,13 @@ export interface TriggerUserAuthConfig {
    * key live on this machine).
    */
   delegateOnMention?: boolean;
+  /** Extra tools signed only for a direct human's dispatch into the exact
+   * listed chat and target apps. They never govern this bot's own CLI calls. */
+  dispatchOnly?: {
+    tools: TriggerUserAuthTool[];
+    targetAppIds: string[];
+    chatIds: string[];
+  };
   /**
    * Code host whose git pushes should carry the acting identity, e.g.
    * `code.example.com`. Absent → git is left alone.
@@ -249,6 +256,30 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     'triggerUserAuth.gitTokenExchangeUrl',
   );
 
+  let dispatchOnly: TriggerUserAuthConfig['dispatchOnly'];
+  if (rec.dispatchOnly !== undefined) {
+    if (!enabled || typeof rec.dispatchOnly !== 'object' || rec.dispatchOnly === null
+      || Array.isArray(rec.dispatchOnly)) {
+      throw new TriggerUserAuthConfigError('triggerUserAuth.dispatchOnly requires an enabled object');
+    }
+    const entry = rec.dispatchOnly as Record<string, unknown>;
+    const identifiers = (key: 'targetAppIds' | 'chatIds', pattern: RegExp): string[] => {
+      const value = entry[key];
+      if (!Array.isArray(value) || value.length === 0 || value.some(id => typeof id !== 'string' || !pattern.test(id))) {
+        throw new TriggerUserAuthConfigError(`triggerUserAuth.dispatchOnly.${key} must contain valid IDs`);
+      }
+      return [...new Set(value as string[])];
+    };
+    if (!Array.isArray(entry.tools) || entry.tools.length === 0 || entry.tools.some(tool => !isTool(tool))) {
+      throw new TriggerUserAuthConfigError('triggerUserAuth.dispatchOnly.tools must contain supported tools');
+    }
+    dispatchOnly = {
+      tools: [...new Set(entry.tools as TriggerUserAuthTool[])],
+      targetAppIds: identifiers('targetAppIds', /^cli_[A-Za-z0-9_-]{1,128}$/),
+      chatIds: identifiers('chatIds', /^oc_[A-Za-z0-9_-]{1,128}$/),
+    };
+  }
+
   return {
     enabled,
     tools,
@@ -256,9 +287,31 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     credentialSource,
     // Equal to the default → not stored.
     ...(rec.delegateOnMention === false ? { delegateOnMention: false } : {}),
+    ...(dispatchOnly ? { dispatchOnly } : {}),
     ...(gitHost ? { gitHost } : {}),
     ...(gitTokenExchangeUrl ? { gitTokenExchangeUrl } : {}),
   };
+}
+
+/** Restrict dispatch-only credentials to the active direct human turn. A
+ * delegated/bot turn can only forward its existing signed tool set. */
+export function dispatchOnlyToolsForTurn(
+  config: TriggerUserAuthConfig | null | undefined,
+  request: {
+    sourceChatId: string;
+    targetChatId: string;
+    targetAppIds: string[];
+    directHuman: boolean;
+    inherited: boolean;
+  },
+): TriggerUserAuthTool[] {
+  const policy = config?.enabled ? config.dispatchOnly : undefined;
+  if (!policy || !request.directHuman || request.inherited
+    || request.sourceChatId !== request.targetChatId
+    || !policy.chatIds.includes(request.targetChatId)
+    || request.targetAppIds.length === 0
+    || request.targetAppIds.some(id => !policy.targetAppIds.includes(id))) return [];
+  return policy.tools;
 }
 
 /** A bare hostname. Rejects anything carrying a scheme, path, or shell-hostile

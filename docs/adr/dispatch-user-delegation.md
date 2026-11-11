@@ -25,6 +25,12 @@
 9. `botmux send --mention <同机 Bot>` 交接同样附带委托（来源 Bot 的 `triggerUserAuth.delegateOnMention`，默认开，Dashboard「按触发人鉴权」里可关）。消息由 CLI 自己发出，所以分两步：发送前 CLI 调 `/api/dispatch-user/mention-prepare`，只传目标 Bot 的应用 ID 和群；来源 daemon 在当前回合是真人直接触发，或本回合已带有经验证的委托时写 pending 记录（定时任务、不带委托的机器人消息都不算）；后一种与 `botmux dispatch` 一致，按当前群重新检查原用户的访问权限，只能收窄工具，否则主编排收到一个 Bot 的回报后再 @ 下一个 Bot，原用户身份就会断掉，目标限本机已配置的其它 Bot、限本会话所在群。发送后 CLI 调 `/api/dispatch-user/mention-bind`，daemon 向飞书取回这条消息，确认是本 Bot 在发送前登记之后发到该群的，才把记录绑定到这个消息 ID；校验不过或发送失败都撤销登记。交接消息可能在普通群顶层、引用回复或话题里，所以这类记录不写话题根，只绑定精确的消息 ID；`botmux dispatch` 的记录仍要求话题根一致。任何一步不成，消息照常发出，只是接收方这一轮没有委托身份。正文里写的 `@Bot`（被注入成真正 @ 的那种）与 `--mention` 同样算交接目标。交接被拒时，接收方提示里的 `--dispatch-root` 指向这条交接消息本身；它在 dispatch 回报登记里没有条目，`botmux report` 会按「未送达主编排」的公告发到群里，而不是回到发起方会话。
 10. 接收方每次按委托发布身份时记一条 `[dispatch-user:audit] receive`（来源 Bot、目标 Bot、union_id、会话、回合、工具、结果）；来源 daemon 在登记和绑定时各记一条 `mention-prepare` / `mention-bind`，不签委托时记一条 `mention-prepare skipped` 及原因。
 
+### 指定目标的派发专用工具权限
+
+来源 Bot 可在 `triggerUserAuth.dispatchOnly` 配置 `tools`、`targetAppIds` 和 `chatIds`。这份工具权限仅在当前真人直接发起、来源群等于目标群、目标应用全部在白名单中，且本轮没有继承委托时，加入 `botmux dispatch` 或同机 `botmux send --mention` 的签名；配置缺失或任一条件不满足时不增加权限。字段必须完整且使用精确应用 ID / 群 ID，非法配置拒绝加载。
+
+`dispatchOnly` 不改变来源 Bot 自己的 CLI 身份、定时任务的运行 scope 或机器人回合。自动附加的定时授权不得覆盖这份真人即时委派；显式请求定时授权仍遵循原授权规则。目标 Bot 仍逐项验证签名、真人访问权限、群成员关系，并按目标 Bot 自己的 `triggerUserAuth` 获取该人的凭据。部署新配置前须确认 Botmux 的 `capabilities --json` 包含 `dispatch_only_user_auth_v1`；旧版本不会执行这条派发规则。
+
 ## 边界与取舍
 
 - 双方须使用同一部署的数据目录和宿主信任域，并开启相应工具的 `triggerUserAuth`。跨机器派发和跨机器的 `--mention` 交接、旧的仅 `--bot open_id` 派发没有这份委托。
