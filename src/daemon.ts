@@ -772,7 +772,7 @@ import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import { createGroupIdleCloseSweeper } from './core/group-idle-close-sweeper.js';
-import { sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
+import { coalesceSweepTriggers, sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import { resolveIdleSpinSuspendConfig } from './core/idle-spin-config.js';
 import { createIdleSpinSampler } from './core/idle-spin-sampler.js';
 import { createIdleSpinDetector } from './core/idle-spin-detector.js';
@@ -33451,41 +33451,34 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // One cap implementation shared by event-driven checks (process start / idle
   // edge) and the 60s safety-net timer below. Each daemon owns exactly one
   // bot's activeSessions map, so the configured limit is per bot.
-  let liveSessionCapSweepPending = false;
-  const enforceLiveSessionCap = (source: 'session_change' | 'periodic'): void => {
-    // Coalesce spawn/idle/timer bursts.  The detached mutation evaluates the
-    // current map and current config only after every admitted turn has drained,
-    // so one pending sweep subsumes all triggers that arrive before it runs.
-    if (liveSessionCapSweepPending) return;
-    liveSessionCapSweepPending = true;
-    void (async () => {
-      try {
-        const liveBotConfig = getBot(cfg.larkAppId).config;
-        const maxLiveWorkers = liveBotConfig.maxLiveWorkers;
-        const idleTtlMs = typeof liveBotConfig.idleSuspendMinutes === 'number'
-          && liveBotConfig.idleSuspendMinutes > 0
-          ? liveBotConfig.idleSuspendMinutes * 60_000
-          : undefined;
-        const suspended = await sweepIdleWorkersAfterTurnDrain(
-          cfg.larkAppId,
-          activeSessions,
-          { maxLiveWorkers, idleTtlMs },
+  // Coalesced: the detached mutation evaluates the current map and config only
+  // after every admitted turn has drained, so one sweep subsumes the triggers
+  // that arrive before it starts (see coalesceSweepTriggers).
+  const enforceLiveSessionCap = coalesceSweepTriggers(async (source: 'session_change' | 'periodic'): Promise<void> => {
+    try {
+      const liveBotConfig = getBot(cfg.larkAppId).config;
+      const maxLiveWorkers = liveBotConfig.maxLiveWorkers;
+      const idleTtlMs = typeof liveBotConfig.idleSuspendMinutes === 'number'
+        && liveBotConfig.idleSuspendMinutes > 0
+        ? liveBotConfig.idleSuspendMinutes * 60_000
+        : undefined;
+      const suspended = await sweepIdleWorkersAfterTurnDrain(
+        cfg.larkAppId,
+        activeSessions,
+        { maxLiveWorkers, idleTtlMs },
+      );
+      if (suspended.length > 0) {
+        const ttlCount = suspended.filter(entry => entry.reason === 'idle_ttl').length;
+        logger.info(
+          `[idle-worker-sweeper] suspended ${suspended.length} session(s) `
+          + `[idle_ttl=${ttlCount}, live_worker_cap=${suspended.length - ttlCount}; `
+          + `cap-limit=${maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS}] source=${source}`,
         );
-        if (suspended.length > 0) {
-          const ttlCount = suspended.filter(entry => entry.reason === 'idle_ttl').length;
-          logger.info(
-            `[idle-worker-sweeper] suspended ${suspended.length} session(s) `
-            + `[idle_ttl=${ttlCount}, live_worker_cap=${suspended.length - ttlCount}; `
-            + `cap-limit=${maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS}] source=${source}`,
-          );
-        }
-      } catch (err) {
-        logger.warn(`[idle-worker-sweeper] cap enforcement failed: ${err instanceof Error ? err.message : String(err)}`);
-      } finally {
-        liveSessionCapSweepPending = false;
       }
-    })();
-  };
+    } catch (err) {
+      logger.warn(`[idle-worker-sweeper] cap enforcement failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
   // ─── CPU-driven idle-spin + host-pressure guard ──────────────────────────
   // TRAE CLI (0.214.x) keeps ~3k inotify watches over ~/.trae/skills and
   // self-excites on its own skill-directory IN_OPEN events. Dozens of idle

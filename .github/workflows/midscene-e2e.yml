@@ -511,6 +511,7 @@ jobs:
             --feishu-cases "$FEISHU_CASES" \
             --skipped-cases-dir test/e2e-browser/cases \
             --pages-url "$REPORT_SITE_URL" \
+            --site-artifact-name botmux-midscene-site \
             --output "$GITHUB_STEP_SUMMARY"
           test -s "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
@@ -634,5 +635,7 @@ jobs:
           QUOTA_RESET: ${{ needs.feishu.outputs.quota_reset }}
           REPORT_PUBLISHED: ${{ needs.deploy-report.result == 'success' }}
           REPORT_SITE_URL: ${{ needs.midscene-report.outputs.report-site-url }}
+          # Pages prunes old reports; the comment points here once the link 404s.
+          SITE_ARTIFACT_NAME: botmux-midscene-site
           MANIFEST_PATH: ${{ runner.temp }}/midscene-site/manifest.json
         run: node scripts/midscene-notify-failure.mjs
