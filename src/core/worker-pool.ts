@@ -10019,6 +10019,7 @@ function noteAcceptedInputTurn(
         phase: unproven.phase === 'native-submit' ? 'native-submit' : phase,
         at: Date.now(),
       });
+      if (ds.latestAcceptedInputKey === unprovenKey) ds.latestAcceptedInputKey = key;
       return;
     }
   } else {
@@ -10037,6 +10038,7 @@ function noteAcceptedInputTurn(
   }
 
   const previous = turns.get(key);
+  if (!previous) ds.latestAcceptedInputKey = key;
   // A later queue-commit observation must never downgrade proven native submit.
   const nextPhase = previous?.phase === 'native-submit' ? 'native-submit' : phase;
   turns.delete(key);
@@ -10094,6 +10096,7 @@ function clearAcceptedInputTurns(ds: DaemonSession): void {
   ds.acceptedInputTurns = undefined;
   ds.settledInputTurns = undefined;
   ds.acceptedInputOverflow = undefined;
+  ds.latestAcceptedInputKey = undefined;
 }
 
 /** Does the CURRENT generation still own an accepted input with no terminal? */
@@ -10105,6 +10108,35 @@ export function hasUnsettledAcceptedInput(ds: DaemonSession): boolean {
     if (entry.workerGeneration === ds.workerGeneration) return true;
   }
   return false;
+}
+
+/** The input this generation accepted last, while its turn has no terminal
+ *  yet. Earlier unsettled inputs are not reported: a session runs one turn at
+ *  a time, so a turn that never reported its terminal is over once a later
+ *  input was accepted (hasUnsettledAcceptedInput keeps counting it). */
+export function latestUnsettledAcceptedInput(ds: DaemonSession): { turnId: string; at: number } | undefined {
+  const key = ds.latestAcceptedInputKey;
+  const entry = key === undefined ? undefined : ds.acceptedInputTurns?.get(key);
+  if (!entry || entry.workerGeneration !== ds.workerGeneration) return undefined;
+  return { turnId: entry.turnId, at: entry.at };
+}
+
+/** CLIs a worker of this daemon has reported a turn terminal for. A CLI whose
+ *  worker never reports one (no transcript bridge: the screen idle is its only
+ *  turn end) would otherwise leave every accepted input unsettled. */
+const turnTerminalReportingCliIds = new Set<string>();
+
+function workerCliId(ds: DaemonSession): string | undefined {
+  return ds.initConfig?.cliId ?? ds.session.cliId;
+}
+
+export function cliReportsTurnTerminals(ds: DaemonSession): boolean {
+  const cliId = workerCliId(ds);
+  return cliId !== undefined && turnTerminalReportingCliIds.has(cliId);
+}
+
+export function __testOnly_resetTurnTerminalReportingClis(): void {
+  turnTerminalReportingCliIds.clear();
 }
 
 /** Whether a direct keystroke command (e.g. `/model <value>`) may be injected
@@ -10770,7 +10802,17 @@ export function sweepTraexInstallChanges(
 // re-run the settlement checkpoint only when such a claim is queued.
 onFinalOutputDeliverySettled(ds => {
   if (ds.pendingSuspendReason === CLI_INSTALL_CHANGED_SUSPEND) runPendingSuspendIfSettled(ds);
+  requestLiveSessionCapAfterTurnSettled(ds);
 });
+
+/** The automatic reclaims hold an idle session while its last turn is not
+ *  settled (idle-worker-sweeper). Re-check the cap when such a turn settles,
+ *  instead of waiting for the next idle edge or the periodic backstop. */
+function requestLiveSessionCapAfterTurnSettled(ds: DaemonSession): void {
+  if (ds.lastScreenStatus !== 'idle' || !ds.worker || ds.worker.killed) return;
+  const enforce = callbacks?.enforceLiveSessionCap;
+  if (enforce) queueMicrotask(enforce);
+}
 
 function armWorkerKillBackstop(w: ChildProcess, label: string, sigtermMs: number = WORKER_SIGTERM_BACKSTOP_MS): void {
   const sigterm = setTimeout(() => {
@@ -21974,6 +22016,9 @@ function setupWorkerHandlers(
         // accepted-input guard for it, and only for the exact attempt it names:
         // a late terminal from an older attempt must not release a newer one.
         settleAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, true);
+        const terminalCliId = workerCliId(ds);
+        if (terminalCliId !== undefined) turnTerminalReportingCliIds.add(terminalCliId);
+        requestLiveSessionCapAfterTurnSettled(ds);
         try {
           getLinkRefRuntime()?.settleTurn({
             appId: ds.larkAppId,

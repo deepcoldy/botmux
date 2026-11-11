@@ -138,8 +138,19 @@ export function traexRestoredComposerReady(
   // composer and fail the empty-composer hint check above; anything rendered
   // above an intact composer is covered by the worker's startup-blocker
   // probes and its flush-time re-checks, not by this predicate.
-  const hintOnlyRow = /^[ \t]*(?:\? for shortcuts|← for agents)(?:[ \t]+·[ \t]+(?:\? for shortcuts|← for agents))*[ \t]*$/;
-  const shortcutOnlyFooter = footer.length === 1 && hintOnlyRow.test(footer[0]!);
+  // Startup diagnostics (e.g. an unparsable SKILL.md) are collected in the
+  // bottom warning indicator, right-aligned on the hint row. A wide pane shows
+  // `⚠ N warning(s) · f2 to view`; narrow panes degrade it to `⚠ N · f2` and
+  // then bare `⚠ N` (measured thresholds: 52 / 25 / 15 cols). It is a notice,
+  // not an input owner, so a hint row carrying any of these shapes is still
+  // the native composer footer. Below ~25 cols the hint tokens themselves are
+  // dropped and the warning indicator becomes the whole footer row.
+  const warningIndicator = '⚠[ \\t]+\\d+(?:[ \\t]+warnings?[ \\t]+·[ \\t]+f2[ \\t]+to[ \\t]+view|[ \\t]+·[ \\t]+f2)?';
+  const warningSuffix = `(?:[ \\t]+${warningIndicator})?`;
+  const hintOnlyRow = new RegExp(`^[ \\t]*(?:\\? for shortcuts|← for agents)(?:[ \\t]+·[ \\t]+(?:\\? for shortcuts|← for agents))*${warningSuffix}[ \\t]*$`);
+  const warningOnlyRow = new RegExp(`^[ \\t]*${warningIndicator}[ \\t]*$`);
+  const warningOnlyFooter = warningOnlyRow.test(footer[footer.length - 1]!);
+  const shortcutOnlyFooter = footer.length === 1 && (hintOnlyRow.test(footer[0]!) || warningOnlyFooter);
   // A working directory wider than the pane truncates the model/context row
   // with a U+2026 ellipsis before the Context cell can render. Such a row
   // still contains the native ` · ` cell separator and ends on the
@@ -156,8 +167,9 @@ export function traexRestoredComposerReady(
   if (!repositoryNotice && /\bloading\b/i.test(footer[0]!.split(' · ', 1)[0]!)) return false;
   // approval_policy=never and custom permission profiles (e.g. a managed
   // qdh-topic profile) omit the standard permission label, so the second
-  // footer row is a bare hint row; otherwise it must carry a known label.
-  if (footer.length === 2 && !hintOnlyRow.test(footer[1]!)
+  // footer row is a bare hint row; on a narrow pane the hint tokens are
+  // dropped entirely and only the width-degraded warning indicator remains.
+  if (footer.length === 2 && !hintOnlyRow.test(footer[1]!) && !warningOnlyRow.test(footer[1]!)
     && !/^[ \t]*(?:[☢▧] )?(?:Full Access|Read Only|Auto Mode|Workspace Edit|Auto|Default)[^\r\n]* · (?:\? for shortcuts|← for agents)/.test(footer[1]!)) return false;
   // A login banner can be taller than the nearby live-status region. Inspect
   // all rows above the composer for native login prompts, but do not treat
