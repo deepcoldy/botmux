@@ -2,6 +2,8 @@
 
 `sessionCleanup.archiveCodex` 缺省为 false，可在 Dashboard 设置页的空闲清理区域开启；它独立于定时清理的 enabled，同时适用于手动关闭、手动和定时清理。只改配置开关不会扫描或归档历史会话。
 
+每个 Bot 可在 `bots.json` 设置 `archiveCodex: true|false` 覆盖全局值；省略时继承全局开关。运行中使用 `/config set archiveCodex on`、`/config set archiveCodex off` 或 `/config unset archiveCodex` 设置，`/config get archiveCodex` 显示 on / off / inherit。修改对后续关闭与清理立即生效，不需要重启；每次关闭在实际开始时冻结策略，途中改配置不改变本次操作。TTADK 等不支持 app-server 的 Bot 可单独关闭，其他 Bot 继续沿用全局配置。开关不影响已有归档 journal 的恢复，也不控制标题同步。
+
 Dashboard 两处空闲清理 fanout 向现有 close RPC 传递 `idleCleanup: true`。Daemon 先完成普通关闭，再处理原生归档。Dashboard / CLI close RPC、`/close` 和飞书关闭卡片同样启用归档；休眠、重启、仓库替换和其它自动关闭路径不会归档。飞书卡片异步完成归档并通过话题消息提示失败，避免阻塞回调 ACK。关闭成功但归档失败，响应仍保留 `ok: true` 和独立的 `archiveError`，批量结果统计 `archiveFailed`；手动关闭/清理显示警告，定时清理记录日志。
 
 Worker 在原生 session id 已确认时上报可信目标（thread id、实际 Codex executable、实际 CODEX_HOME）。支持自有本地 Codex CLI / codex-app 的 pty/tmux，包括 Codex RPC input 模式；codex-app 使用实际 Codex executable 而非 runner 的 Node/Bun executable；外部 adopt、existingAppServerEndpoint、wrapper、remote runner、scratch 和缺少目标的历史记录跳过。不从 live bot 配置推测旧会话目录。

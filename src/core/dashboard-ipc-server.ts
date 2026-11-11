@@ -250,7 +250,7 @@ import {
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
 import { readGlobalConfig, isDispatchTaskTreeCardEnabled, isWorkflowFeatureEnabled, workflowNodeExecutorMode, repoPickerScanOptions } from '../global-config.js';
-import { archiveCodexForCleanup } from '../services/codex-cleanup-archive.js';
+import { archiveCodexForCleanup, codexCleanupArchiveEnabled } from '../services/codex-cleanup-archive.js';
 import {
   clearChatReplyMode,
   getChatReplyModeState,
@@ -2498,21 +2498,26 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
   const initial = findSessionRecord(params.sessionId);
   const initiallyClosed = initial?.status === 'closed';
   let codexArchiveReleaseTicket: CodexCleanupReleaseTicket | undefined;
-  const closeCurrentGeneration = () => closeSession(params.sessionId, {
-    ...(isTrustedHostIpcRequest(req) && body.idleCleanup === true && body.idleCleanupSource === 'scheduled'
-      ? { backgroundExecutionCleanup: true } : {}),
-    // Dashboard "close" and `botmux delete` are human closes (empty body); only
-    // idle/auto cleanup (idleCleanup: true) stays resumable.
-    ...(body.idleCleanup === true ? {} : { userClosed: true }),
-    onCodexCleanupRelease: ticket => { codexArchiveReleaseTicket = ticket; },
-  });
+  let archiveCodex = false;
+  const closeCurrentGeneration = () => {
+    const current = findSessionRecord(params.sessionId);
+    archiveCodex = codexCleanupArchiveEnabled(findActiveBySessionId(params.sessionId)?.larkAppId ?? current?.larkAppId);
+    return closeSession(params.sessionId, {
+      ...(isTrustedHostIpcRequest(req) && body.idleCleanup === true && body.idleCleanupSource === 'scheduled'
+        ? { backgroundExecutionCleanup: true } : {}),
+      // Dashboard "close" and `botmux delete` are human closes (empty body); only
+      // idle/auto cleanup (idleCleanup: true) stays resumable.
+      ...(body.idleCleanup === true ? {} : { userClosed: true }),
+      onCodexCleanupRelease: ticket => { codexArchiveReleaseTicket = ticket; },
+    });
+  };
   const cleanupSource = body.idleCleanupSource === 'manual' ? 'manual'
     : body.idleCleanupSource === 'scheduled' ? 'scheduled' : 'unspecified';
   logger.info(`[session-close] session=${params.sessionId} intent=${body.idleCleanup === true ? `idle_cleanup:${cleanupSource}` : 'explicit_close'}`);
   const cleanupArchive = async (): Promise<string | undefined> => {
     const row = sessionStore.getOwnedSession(params.sessionId);
     if (!row) return;
-    const enabled = readGlobalConfig().sessionCleanup?.archiveCodex === true;
+    const enabled = archiveCodex;
     const error = await archiveCodexForCleanup(row, enabled, sessionStore.updateSession, undefined,
       async () => codexArchiveReleaseTicket?.released);
     const outcome = error === 'codex_archive_target_unverified' || error === 'codex_archive_target_invalid'
@@ -2538,6 +2543,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
     // never clear a stale pre-drain snapshot while a turn is still preparing.
     const current = findSessionRecord(params.sessionId);
     if (current && current.status === 'closed') {
+      archiveCodex = codexCleanupArchiveEnabled(findActiveBySessionId(params.sessionId)?.larkAppId ?? current.larkAppId);
       // Manual re-close must revoke jobs preserved by automatic cleanup. Do
       // not return before the canonical durable close clears that marker.
       if (current.backgroundExecutionCleanupClosedAt

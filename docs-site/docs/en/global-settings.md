@@ -66,6 +66,8 @@ Lots of open sessions eat memory. Want sessions nobody has used for a while to c
 | Check interval (`intervalMinutes`) | Minutes between checks, minimum 5 | 60 |
 | Archive Codex threads on close / cleanup (`archiveCodex`) | Archive the matching Codex thread when a session closes (manual close or idle cleanup), restore it on reopen | Off |
 
+Override this switch for one Bot with `/config set archiveCodex on` or `/config set archiveCodex off`; `/config unset archiveCodex` restores inheritance. The corresponding Bot entry in `bots.json` also accepts `"archiveCodex": true` or `false`. Command changes apply to subsequent closes and cleanup immediately; an in-progress close keeps its initial value. Previously archived sessions can still be restored.
+
 It uses **the same rules** as the manual "Clean idle" button on the Session Control page, just unattended. Only truly idle sessions are closed: sessions that are running, locked, waiting on a repo pick, or carrying an alert for you are left alone.
 
 ```json

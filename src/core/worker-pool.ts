@@ -25,7 +25,7 @@ import { listPendingAsks } from './ask-broker.js';
 import { isHookPermissionAsk } from './ask-hook/types.js';
 import { captureCodexCleanupRelease, type CodexCleanupReleaseTicket } from '../services/codex-cleanup-release.js';
 import { removeP2pForceTopicRoot } from '../services/p2p-force-topic-store.js';
-import { archiveCodexForCleanup, ownedLocalCodex } from '../services/codex-cleanup-archive.js';
+import { archiveCodexForCleanup, codexCleanupArchiveEnabled, ownedLocalCodex } from '../services/codex-cleanup-archive.js';
 import { trackStartingCardPublication } from './starting-card-publication.js';
 import { privateReplyEnabled } from './private-reply.js';
 import { currentGatewayCallerOpenId } from './gateway-turn-caller.js';
@@ -11264,7 +11264,10 @@ async function closeSessionBody(
   const hadLiveWorker = !!ds?.worker && !ds.worker.killed;
   const closingWorker = ds?.worker ?? undefined;
   const closeWorkerGeneration = ds ? closeFenceGeneration(ds) : undefined;
-  const codexArchiveReleaseTicket = readGlobalConfig().sessionCleanup?.archiveCodex === true
+  // Freeze the policy for this close so a toggle during teardown cannot create
+  // an archive obligation without the matching native release ticket.
+  const archiveCodex = codexCleanupArchiveEnabled(ds?.larkAppId ?? stored?.larkAppId);
+  const codexArchiveReleaseTicket = archiveCodex
       && (opts?.explicitClose || opts?.onCodexCleanupRelease) && closingWorker && ds
       && ownedLocalCodex(ds.session) && ds.session.cliSessionId
     ? captureCodexCleanupRelease(closingWorker, { sessionId, threadId: ds.session.cliSessionId,
@@ -11707,7 +11710,7 @@ async function closeSessionBody(
     if (row && (wasOpen || row.codexCleanupArchive)) {
       const archive = async () => {
         const error = await archiveCodexForCleanup(row,
-          readGlobalConfig().sessionCleanup?.archiveCodex === true, sessionStore.updateSession, undefined,
+          archiveCodex, sessionStore.updateSession, undefined,
           async () => {
             if (!codexArchiveReleaseTicket) return undefined;
             return codexArchiveReleaseTicket.released;

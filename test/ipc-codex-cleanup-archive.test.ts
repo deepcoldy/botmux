@@ -6,6 +6,8 @@ import { startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-
 import * as pool from '../src/core/worker-pool.js';
 import * as store from '../src/services/session-store.js';
 import * as globalConfig from '../src/global-config.js';
+import * as botRegistry from '../src/bot-registry.js';
+import { withBotTurnAdmission } from '../src/core/bot-turn-mutation-gate.js';
 import { setCodexAppThreadArchived } from '../src/services/codex-app-threads.js';
 import type { Session } from '../src/types.js';
 vi.mock('../src/core/daemon-ipc-session-auth.js', async original => ({
@@ -45,6 +47,48 @@ async function close(idleCleanup: boolean, enabled: boolean, patch: Partial<Sess
   return { row, response, body: await response.json() };
 }
 describe('daemon close idle-cleanup intent', () => {
+  it.each([true, false])('pending retry freezes policy after earlier admissions drain (%s)', async nextEnabled => {
+    const bot = { config: { archiveCodex: !nextEnabled } };
+    vi.spyOn(botRegistry, 'getBot').mockReturnValue(bot as any);
+    let releaseAdmission!: () => void;
+    let entered!: () => void;
+    const enteredGate = new Promise<void>(resolve => { entered = resolve; });
+    const admission = withBotTurnAdmission('mock-bot', async () => {
+      entered();
+      await new Promise<void>(resolve => { releaseAdmission = resolve; });
+    });
+    await enteredGate;
+    const closing = close(false, false, {
+      status: 'closed',
+      codexCleanupArchive: { threadId: 'mock-native', state: 'pending',
+        release: mockCleanupRelease({ sessionId: 'mock-cleanup', cliSessionId: 'mock-native' }) },
+    });
+    try {
+      await vi.waitFor(() => expect(pool.findActiveBySessionId).toHaveBeenCalled());
+      expect(setCodexAppThreadArchived).not.toHaveBeenCalled();
+      bot.config.archiveCodex = nextEnabled;
+      releaseAdmission();
+      await admission;
+      expect((await closing).body.ok).toBe(true);
+      expect(vi.mocked(setCodexAppThreadArchived).mock.calls.length).toBe(nextEnabled ? 1 : 0);
+    } finally { releaseAdmission(); await admission; await closing; }
+  });
+
+  it.each([false, true])('bot override controls explicit and idle cleanup independently of the global switch (%s)', async idle => {
+    for (const override of [false, true]) {
+      vi.spyOn(botRegistry, 'getBot').mockImplementation(appId => {
+        expect(appId).toBe('mock-bot');
+        return { config: { archiveCodex: override } } as any;
+      });
+      const result = await close(idle, !override);
+      expect(result.body.ok).toBe(true);
+      expect(result.body.archiveError).toBeUndefined();
+      expect(vi.mocked(setCodexAppThreadArchived).mock.calls.length).toBe(override ? 1 : 0);
+      await handle?.close(); handle = undefined;
+      vi.restoreAllMocks(); vi.mocked(setCodexAppThreadArchived).mockReset();
+    }
+  });
+
   it.each([false, true])('archives only after explicit/idle close commits (%s)', async intent => {
     const result = await close(intent, true);
     expect(result.body.ok).toBe(true);
