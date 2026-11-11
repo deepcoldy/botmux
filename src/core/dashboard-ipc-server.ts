@@ -2503,6 +2503,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
     const current = findSessionRecord(params.sessionId);
     archiveCodex = codexCleanupArchiveEnabled(findActiveBySessionId(params.sessionId)?.larkAppId ?? current?.larkAppId);
     return closeSession(params.sessionId, {
+      archiveCodex,
       ...(isTrustedHostIpcRequest(req) && body.idleCleanup === true && body.idleCleanupSource === 'scheduled'
         ? { backgroundExecutionCleanup: true } : {}),
       // Dashboard "close" and `botmux delete` are human closes (empty body); only

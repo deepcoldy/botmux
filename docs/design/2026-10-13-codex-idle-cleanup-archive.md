@@ -53,7 +53,7 @@ Worker 退出仅表示进程结束，持久会话仍为 active 时，向 Dashboa
 
 Worker 的 exit code 0 只能证明包装进程退出，不能证明 detached app-server 已释放。显式关闭现在先捕获属于该次启动的 CLI / RPC 原生进程树及进程出生身份，保持 Worker 存活、有界 await RPC stop 和原生进程退出；原生进程退出前不会发送释放证明。丢失、异常、超时或无法读取身份时 fail closed。延迟强杀计时器随原生子进程退出清除，不对已退出的 PID 补发信号。
 
-Daemon 在 pool 实际选择本次关闭对象时生成 session/thread/workerGeneration/nonce 绑定的 ticket，仅接受该 IPC 子进程的匹配证明；干净 Worker exit、旧代或错误 nonce 都不能授权归档。IPC 在 mutation gate 内调用 pool 并获取 ticket，避免 gate 等待期间旧→新或无→新 Worker 的快照过时。卡片仍不 await teardown，归档与重开使用同一生命周期串行队列。
+Daemon 在 pool 实际选择本次关闭对象时生成 session/thread/workerGeneration/nonce 绑定的 ticket，仅接受该 IPC 子进程的匹配证明；干净 Worker exit、旧代或错误 nonce 都不能授权归档。IPC 在 mutation gate 内冻结归档策略，将同一快照传入 pool 并用于后续归档；契约持久化等待及 Worker 释放期间修改配置只影响后续操作。pool 按实际关闭代际返回 ticket，避免 gate 等待期间旧→新或无→新 Worker 的快照过时。卡片仍不 await teardown，归档与重开使用同一生命周期串行队列。
 
 验证过的释放凭据随 pending / archived journal 保存，允许已确认释放后的 RPC 失败重试与幂等关闭；旧 pending 记录或当前无 Worker 且无法证明原生释放的记录不推测凭据，只提示并拒绝归档。历史归档的显式恢复规则保留。所有生产归档入口均由 service 校验凭据，不允许无证明的新归档。
 

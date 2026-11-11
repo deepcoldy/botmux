@@ -11208,7 +11208,7 @@ export function closeSession(sessionId: string, opts?: Parameters<typeof closeSe
 
 async function closeSessionBody(
   sessionId: string,
-  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public'; explicitClose?: boolean; userClosed?: boolean; backgroundExecutionCleanup?: boolean; onArchiveError?: (error: string) => Promise<unknown>; onCodexCleanupRelease?: (ticket: CodexCleanupReleaseTicket) => void },
+  opts?: { awaitWorkerExit?: boolean; workspaceRetirement?: Session['workspaceRetirement']; cardVisibility?: 'private' | 'public'; explicitClose?: boolean; userClosed?: boolean; backgroundExecutionCleanup?: boolean; archiveCodex?: boolean; onArchiveError?: (error: string) => Promise<unknown>; onCodexCleanupRelease?: (ticket: CodexCleanupReleaseTicket) => void },
 ): Promise<CloseSessionResult> {
   // `awaitWorkerExit` (default true): whether to block on the worker process
   // actually exiting before returning. A busy CLI wedges in node-pty teardown
@@ -11264,9 +11264,9 @@ async function closeSessionBody(
   const hadLiveWorker = !!ds?.worker && !ds.worker.killed;
   const closingWorker = ds?.worker ?? undefined;
   const closeWorkerGeneration = ds ? closeFenceGeneration(ds) : undefined;
-  // Freeze the policy for this close so a toggle during teardown cannot create
-  // an archive obligation without the matching native release ticket.
-  const archiveCodex = codexCleanupArchiveEnabled(ds?.larkAppId ?? stored?.larkAppId);
+  // IPC freezes the policy before contract persistence; other callers resolve
+  // it here. Release and archive must use the same snapshot throughout close.
+  const archiveCodex = opts?.archiveCodex ?? codexCleanupArchiveEnabled(ds?.larkAppId ?? stored?.larkAppId);
   const codexArchiveReleaseTicket = archiveCodex
       && (opts?.explicitClose || opts?.onCodexCleanupRelease) && closingWorker && ds
       && ownedLocalCodex(ds.session) && ds.session.cliSessionId
