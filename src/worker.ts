@@ -21373,10 +21373,17 @@ async function flushPending(): Promise<void> {
     }
     if (adoptInputReady && pendingAdoptMessages.length > 0) {
       const item = pendingAdoptMessages.shift()!;
-      await runAdoptMessageForCapturedGeneration(item, () => {
+      const outcome = await runAdoptMessageForCapturedGeneration(item, () => {
         pendingAdoptMessages.unshift(item);
         log(`Re-queued adopt message at queue head for the replacement CLI generation (${item.content.length} chars)`);
       });
+      // Its native terminal can make the composer ready while the adapter is
+      // still awaiting history. That idle edge reached this flush under its
+      // mutex; re-drive after finally releases it, so the next queued message
+      // does not depend on another terminal redraw. A non-write never spins.
+      if (outcome === 'completed' && isPromptReady && pendingAdoptMessages.length > 0) {
+        queueMicrotask(() => { void flushPending(); });
+      }
       return;
     }
     let holdDrainForPreferredReset = false;

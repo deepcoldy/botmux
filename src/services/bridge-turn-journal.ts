@@ -50,6 +50,9 @@ export interface BridgeTurnJournalEntry {
    *  send-marker window and the split cutoff keep their original bounds. */
   markTimeMs: number;
   fingerprint?: string;
+  /** Full-input digest for driver-proved spelling aliases. Older journals
+   * omit it and cannot use an alias as exact-input evidence. */
+  inputTextHash?: string;
   contentNormalized?: string;
   /** Transcript file the mark was armed against. Restore is scoped to the
    *  SAME file — a rotation between generations makes attribution unsafe. */
@@ -175,10 +178,12 @@ export function readBridgeTurnJournal(path: string): BridgeTurnJournalEntry[] {
         || entry.pendingFinal.output.turnId !== entry.turnId)) {
         throw new Error('Invalid pending final handoff journal');
       }
-      const { mergedExecution, claimedAtMs, ...rest } = entry;
-      const plain = typeof claimedAtMs === 'number' && Number.isFinite(claimedAtMs)
-        ? { ...rest, claimedAtMs }
-        : rest;
+      const { mergedExecution, claimedAtMs, inputTextHash, ...rest } = entry;
+      const plain = {
+        ...rest,
+        ...(typeof inputTextHash === 'string' && /^[a-f0-9]{64}$/.test(inputTextHash) ? { inputTextHash } : {}),
+        ...(typeof claimedAtMs === 'number' && Number.isFinite(claimedAtMs) ? { claimedAtMs } : {}),
+      };
       // Invalid optional merge evidence must not discard the pending answer
       // or invent delivery credit. Older journals have no such field.
       if (!isJsonObject(mergedExecution)
