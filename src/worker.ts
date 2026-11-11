@@ -19404,6 +19404,20 @@ function redriveRejectedStructuredReady(): void {
   }
 
   structuredRejectedReadyEvidenceGeneration = undefined;
+  // The CLI reported `working` (or `blocked` on a permission / question
+  // prompt) over OSC 7501 after the prompt edge being replayed here, e.g. for
+  // the turn the deferred write just opened. Its own `idle` report ends the
+  // turn; a screen probe must not overrule it — with botmux's statusLine
+  // Claude draws no busy marker, so the probe would mark a running turn ready
+  // and an idle reclaim could then suspend it. A lost `idle` report is
+  // released by the stale program-status check instead.
+  // Kept here, not in probeBusyPatternIdle: for Pi / oh-my-pi the post-submit
+  // probe loop is the only release when their `idle` report is lost (no
+  // transcript-based stale check, and fireIdle refuses while OSC holds busy).
+  if (idleDetector?.programStatusHeldBusy()) {
+    log('Structured pre-start gate: program status reports the CLI busy — leaving readiness to its idle report');
+    return;
+  }
   if (ptyOutputGeneration.isCurrent(readyEvidenceGeneration)) {
     log('Structured pre-start gate settled with no newer PTY output — re-driving prior prompt-ready signal');
     idleDetector?.fireIdle();
