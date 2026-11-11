@@ -261,6 +261,7 @@ import { sendRemoteRunnerOutboundMessage } from './services/remote-runner-outbou
 import { runRemoteRunnerSessionTool } from './services/remote-runner-session-tool.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup, shouldDeferInitialPromptForReattach, judgeStartupCommandAck, STARTUP_COMMAND_ACK_TIMEOUT_MS } from './core/startup-commands.js';
+import { RETIRED_RUNTIME_EXIT_GRACE_MS, WORKER_EXIT_RUNTIME_RETIRED } from './core/retired-runtime-exit.js';
 import { spawnHasStartupWork } from './core/initial-native-rename.js';
 import { botInjectedEnv, buildSessionChildEnv } from './core/env-policy.js';
 import { envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPolicyStamp } from './services/env-policy-stamp.js';
@@ -35026,7 +35027,13 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       }
       if (!msg.mayExecute && (!scope || scope.currentBinding()?.bindingId === msg.bindingId)) {
         log(`Daemon retired runtime binding ${msg.bindingId} (mayExecute=false); closing the transcript bridge and the CLI backend`);
+        // A close already under way ends this worker itself. Otherwise nothing
+        // can bring the retired worker back (the close fence aborts every later
+        // spawn as superseded), so it must not stay behind queueing input.
+        const closeUnderWay = closeRequested;
+        if (!closeUnderWay) retiredRuntimeBackend = backend;
         closeRequested = true; stopBridgeWatcher(); stopScreenshotLoop(); killCli();
+        if (!closeUnderWay) armRetiredRuntimeExit(msg.bindingId);
       } else if (continuation) void flushPending();
       break;
     }
@@ -36178,6 +36185,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         break;
       }
 
+      cancelRetiredRuntimeExit();
       closeRequested = true;
       const cleanupRequest = msg.codexCleanupRelease;
       let nativeSnapshot: ReturnType<typeof captureCodexNativeProcesses> | undefined;
@@ -36209,7 +36217,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // reach here: the branch above fences them all (request-less remote close
       // is refused; with a requestId it goes through prepare/commit), so
       // destroySession() below only ever tears down local backing sessions.
-      const closeTeardown = backend?.destroySession?.();
+      // A retired runtime's backend was only detached (killCli): its persistent
+      // session is still this close's to destroy.
+      const closeTeardown = backend
+        ? backend?.destroySession?.()
+        : retiredRuntimeBackend?.destroySession?.();
       if (closeTeardown && typeof (closeTeardown as Promise<void>).then === 'function') {
         try { await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]); }
         catch { /* logged by backend */ }
@@ -36235,6 +36247,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
 
     case 'detach_for_transfer': {
       log('Transfer detach requested');
+      cancelRetiredRuntimeExit();
       stopScreenshotLoop();
       // Transfer keeps the logical session alive. The daemon starts its
       // replacement on the new routing anchor only after this worker ACKs the
@@ -36589,7 +36602,7 @@ function cleanup(): void {
  * only retire this worker's HTTP/WebSocket observers. Ordinary managed sessions
  * retain the historical killCli shutdown path.
  */
-function shutdownWorkerForParentExit(reason: string): void {
+function shutdownWorkerForParentExit(reason: string, exitCode = 0): void {
   stopScreenshotLoop();
   if (lastInitConfig?.existingAppServerEndpoint) {
     log(`Preserving existing-App-Server remote TUI during ${reason}`);
@@ -36603,7 +36616,7 @@ function shutdownWorkerForParentExit(reason: string): void {
       sandboxCleanup = null;
     }
     cleanup();
-    process.exit(0);
+    process.exit(exitCode);
     return;
   }
   // A persistent sandboxed pane (oncall / scratch / credential-only) survives
@@ -36634,7 +36647,37 @@ function shutdownWorkerForParentExit(reason: string): void {
   }
   killCli({ preserveSandbox, preserveCliPidMarker });
   cleanup();
-  process.exit(0);
+  process.exit(exitCode);
+}
+
+/** Armed when the daemon retires this worker's live runtime binding and no
+ *  close is already ending it (see core/retired-runtime-exit.ts). */
+let retiredRuntimeExitTimer: ReturnType<typeof setTimeout> | undefined;
+/** That runtime's backend, detached but with its persistent session alive. */
+let retiredRuntimeBackend: SessionBackend | null = null;
+
+/** The retired worker waits briefly for the lifecycle operation that
+ *  superseded it, then hands its unwritten inputs to the session's next worker
+ *  and ends this generation, so a later message starts a successor instead of
+ *  queueing behind a backend that will never come back. A v3 workflow worker
+ *  is left as it was: its pool owns its lifecycle and deadline. */
+function armRetiredRuntimeExit(bindingId: string): void {
+  if (retiredRuntimeExitTimer || isWorkflowWorker()) return;
+  retiredRuntimeExitTimer = setTimeout(() => {
+    retiredRuntimeExitTimer = undefined;
+    log(`No close, suspend or transfer took over retired runtime binding ${bindingId} within `
+      + `${RETIRED_RUNTIME_EXIT_GRACE_MS / 1000}s; handing ${pendingMessages.length} unwritten input(s) `
+      + 'to the next worker and ending this generation');
+    shutdownWorkerForParentExit('runtime retired', WORKER_EXIT_RUNTIME_RETIRED);
+  }, RETIRED_RUNTIME_EXIT_GRACE_MS);
+}
+
+/** A close or transfer reached the retired worker: its own teardown ends it.
+ *  (Suspend needs no call: its teardown runs to process.exit without yielding.) */
+function cancelRetiredRuntimeExit(): void {
+  if (!retiredRuntimeExitTimer) return;
+  clearTimeout(retiredRuntimeExitTimer);
+  retiredRuntimeExitTimer = undefined;
 }
 
 process.on('SIGTERM', () => shutdownWorkerForParentExit('SIGTERM'));
