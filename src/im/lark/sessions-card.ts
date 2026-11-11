@@ -586,16 +586,16 @@ function mapResumeDisabledReason(reasonKey: string | undefined): string | undefi
  *  rejected here even if the raw row still has a port value.
  *
  *  The direct-port link carries no capability, so on this machine's own
- *  interface it looks like any local service and Lark would reject the whole
- *  card; it is left out there. */
-export function buildSessionTerminalUrl(row: SessionRow): string | null {
+ *  interface it looks like any local service, and a bot that hides local
+ *  addresses would have the whole card rejected; it is left out there. */
+export function buildSessionTerminalUrl(row: SessionRow, larkAppId: string): string | null {
   if (row.status === 'closed') return null;
   if (typeof row.proxyPort === 'number' && row.proxyPort > 0) {
     return `${localHttpOrigin(config.web.externalHost, row.proxyPort)}/s/${encodeURIComponent(row.sessionId)}`;
   }
   if (typeof row.webPort === 'number' && row.webPort > 0) {
     const url = localHttpOrigin(config.web.externalHost, row.webPort);
-    return sendableCardLink(url) ? url : null;
+    return sendableCardLink(url, larkAppId) ? url : null;
   }
   return null;
 }
@@ -712,7 +712,7 @@ export async function handleSessionsCardAction(
       pageSize: navPageSize,
       sourcePage: navPage,
       scope: navScope,
-      terminalUrl: buildSessionTerminalUrl(row),
+      terminalUrl: buildSessionTerminalUrl(row, larkAppId),
       feishuChatLink: row.feishuChatLink ?? null,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };
@@ -799,7 +799,7 @@ export async function handleSessionsCardAction(
       pageSize: navPageSize,
       sourcePage: navPage,
       scope: navScope,
-      terminalUrl: buildSessionTerminalUrl(synth),
+      terminalUrl: buildSessionTerminalUrl(synth, larkAppId),
       feishuChatLink: synth.feishuChatLink ?? null,
     });
     const card = JSON.parse(cardJson) as Record<string, unknown>;
@@ -946,7 +946,7 @@ export async function handleSessionsCardAction(
       pageSize: navPageSize,
       sourcePage: navPage,
       scope: navScope,
-      terminalUrl: buildSessionTerminalUrl(after),
+      terminalUrl: buildSessionTerminalUrl(after, larkAppId),
       feishuChatLink: after.feishuChatLink ?? null,
     });
     return { card: { type: 'raw', data: JSON.parse(cardJson) as Record<string, unknown> } };

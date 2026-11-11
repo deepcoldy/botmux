@@ -40,6 +40,7 @@ import {
 import { logger } from './utils/logger.js';
 import { createLarkUploadHttpPool } from './utils/lark-http-pool.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
+import { HIDE_LOCAL_ADDRESSES_ENV, setHideLocalAddressesResolver } from './im/lark/local-address-switch.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import { parseVolcengineConfig } from './services/voice/volcengine-config.js';
 import { normalizeGroupIdleClose, type GroupIdleCloseSettings } from './core/group-idle-close.js';
@@ -1730,6 +1731,17 @@ export interface BotConfig {
   /** Omit only email from prompt sender tags; keep daemon identity intact. Default false. */
   senderTagHideEmail?: boolean;
   /**
+   * Keep development-host addresses out of this bot's Lark replies. Off by
+   * default (absent = off; only an explicit true persists): model output is
+   * sent as written and no local-address rule is injected into prompts.
+   * True applies the whole policy of docs/design/2026-11-07-lark-local-address-egress.md:
+   * host paths and local service addresses in model output become relative
+   * references or an internal-file label, both prompt rules are injected, and
+   * card link fields pointing at this host are refused unless they are the
+   * host's own page links. See resolveHideLocalAddresses.
+   */
+  hideLocalAddresses?: boolean;
+  /**
    * Codex / TraeX (experimental): override the machine default for app-server
    * JSON-RPC input. True enables, false keeps terminal input, absence inherits
    * dashboard.codexRpcInput. No effect on other CLIs.
@@ -2637,6 +2649,7 @@ setBotLookup((id) => bots.get(id));
 // 同理给 ask 卡片选项布局注册 lookup：ask-card.ts 经 turn-reply-ask.ts 间接依赖
 // 本模块，不能反向 import，只能由这里把 bots 表推进去。
 setAskOptionLayoutLookup((id) => bots.get(id));
+setHideLocalAddressesResolver(resolveHideLocalAddresses);
 
 /** Path of the bot config file we loaded (so `/oncall` can persist bindings back). */
 let loadedConfigPath: string | undefined;
@@ -3256,6 +3269,38 @@ export function resolveBrandLabel(larkAppId: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+let hideLocalAddressesCache: { mtimeMs: number; map: Map<string, boolean> } | null = null;
+
+/**
+ * Whether the bot keeps development-host addresses out of its Lark replies
+ * (default off). Read on every send, so a Dashboard or `/config` change applies
+ * to the next message: the loaded registry first, then bots.json, then the
+ * spawn-time env snapshot a sandboxed or remote `botmux send` carries.
+ */
+export function resolveHideLocalAddresses(larkAppId: string): boolean {
+  const inMem = bots.get(larkAppId);
+  if (inMem) return inMem.config.hideLocalAddresses === true;
+  const path = loadedConfigPath ?? botsConfigDiskPath();
+  if (path) {
+    try {
+      const stat = statSync(path);
+      if (!hideLocalAddressesCache || hideLocalAddressesCache.mtimeMs !== stat.mtimeMs) {
+        const raw = JSON.parse(readFileSync(path, 'utf-8'));
+        const map = new Map<string, boolean>();
+        if (Array.isArray(raw)) {
+          for (const entry of raw) {
+            if (entry && typeof entry.larkAppId === 'string') map.set(entry.larkAppId, entry.hideLocalAddresses === true);
+          }
+        }
+        hideLocalAddressesCache = { mtimeMs: stat.mtimeMs, map };
+      }
+      const configured = hideLocalAddressesCache.map.get(larkAppId);
+      if (configured !== undefined) return configured;
+    } catch { /* isolated send: disk is intentionally unreadable */ }
+  }
+  return process.env.BOTMUX_LARK_APP_ID === larkAppId && process.env[HIDE_LOCAL_ADDRESSES_ENV] === '1';
 }
 
 /**
@@ -4492,6 +4537,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // <sender> tag is injected, so existing prompts are unchanged.
       senderTag: entry.senderTag === false ? false : undefined,
       senderTagHideEmail: entry.senderTagHideEmail === true ? true : undefined,
+      hideLocalAddresses: entry.hideLocalAddresses === true ? true : undefined,
       noPinStreamingCardChats: Array.isArray(entry.noPinStreamingCardChats)
         ? (() => {
           const filtered = entry.noPinStreamingCardChats

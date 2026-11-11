@@ -12,6 +12,7 @@ import * as larkClient from '../src/im/lark/client.js';
 import { config } from '../src/config.js';
 import { rememberLarkToolDelegation, clearLarkToolDelegations } from '../src/core/lark-tool-delegation.js';
 import * as meegoAuth from '../src/services/meego-auth.js';
+import { sessionAuthRequests } from '../src/core/session-auth-requests.js';
 import { __resetProviderAuthForTest } from '../src/core/provider-auth-request.js';
 
 const CAP = 'ab'.repeat(32);
@@ -50,6 +51,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.useRealTimers();
   clearLarkToolDelegations(config.session.dataDir, 'auth-session');
   await ipc.close();
   setIpcAuthSecret(null);
@@ -72,6 +74,7 @@ describe('agent authorization in a group chat', () => {
 
   it('DMs the link to the requester and never returns it to the agent', async () => {
     const dm = vi.spyOn(larkClient, 'sendUserMessage').mockResolvedValue('om_dm');
+    const ephemeral = vi.spyOn(larkClient, 'sendEphemeralCard').mockResolvedValue('om_private');
     const response = await post();
     expect(response.status).toBe(200);
     const body = await response.json() as Record<string, unknown>;
@@ -84,6 +87,7 @@ describe('agent authorization in a group chat', () => {
     expect(dm.mock.calls[0][0]).toBe('cli_test');
     expect(dm.mock.calls[0][1]).toBe('ou_sender');
     expect(dm.mock.calls[0][2]).toContain(AUTH_URL);
+    expect(ephemeral).not.toHaveBeenCalled();
 
     // Reusing the pending request does not DM again and still hides the link.
     const again = await (await post()).json() as Record<string, unknown>;
@@ -93,8 +97,114 @@ describe('agent authorization in a group chat', () => {
     expect(dm).toHaveBeenCalledTimes(1);
   });
 
-  it('refuses without a link when the DM cannot be delivered, and drops the request', async () => {
+  it('falls back to a requester-only group card and reuses its actual delivery receipt', async () => {
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockRejectedValue(new Error('230013 user not in scope'));
+    const ephemeral = vi.spyOn(larkClient, 'sendEphemeralCard').mockResolvedValue('om_private');
+    const publicSend = vi.spyOn(larkClient, 'sendMessage').mockResolvedValue('om_public');
+    const publicReply = vi.spyOn(larkClient, 'replyMessage').mockResolvedValue('om_reply');
+    const response = await post();
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toMatchObject({ ok: true, delivery: 'ephemeral' });
+    expect(JSON.stringify(body)).not.toContain(AUTH_URL);
+    expect(ephemeral).toHaveBeenCalledExactlyOnceWith('cli_test', 'oc_test', 'ou_sender', expect.stringContaining(AUTH_URL));
+    const again = await (await post()).json();
+    expect(again).toMatchObject({ requestId: body.requestId, delivery: 'ephemeral' });
+    expect(JSON.stringify(again)).not.toContain(AUTH_URL);
+    expect(dm).toHaveBeenCalledTimes(1);
+    expect(ephemeral).toHaveBeenCalledTimes(1);
+    expect(tokens.requestUserAuthorization).toHaveBeenCalledTimes(1);
+    expect(publicSend).not.toHaveBeenCalled();
+    expect(publicReply).not.toHaveBeenCalled();
+    poll.mockResolvedValue({ status: 'ready', token: 'authorized-after-private-card' });
+    expect(await (await post('auth-status', { requestId: body.requestId })).json()).toEqual({ ok: true, status: 'ready' });
+  });
+
+  it('does not report delivery or resend while a private delivery is in flight', async () => {
+    let release!: (value: string) => void;
+    let entered!: () => void;
+    const sending = new Promise<void>(resolve => { entered = resolve; });
+    const dm = vi.spyOn(larkClient, 'sendUserMessage').mockImplementation(() => {
+      entered();
+      return new Promise<string>(resolve => { release = resolve; });
+    });
+    const first = post();
+    await sending;
+    try {
+      const response = await post();
+      expect(response.status).toBe(409);
+      expect(await response.json()).toMatchObject({ error: 'auth_link_delivery_pending' });
+      expect(dm).toHaveBeenCalledTimes(1);
+      expect(tokens.requestUserAuthorization).toHaveBeenCalledTimes(1);
+    } finally { release('om_dm'); }
+    expect(await (await first).json()).toMatchObject({ ok: true, delivery: 'dm' });
+  });
+
+  it.each(['disabled', 'expired', 'closed', 'different_actor'])('does not start fallback after the grant is retired: %s', async reason => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    let reject!: (error: Error) => void;
+    let entered!: () => void;
+    const sending = new Promise<void>(resolve => { entered = resolve; });
+    vi.spyOn(larkClient, 'sendUserMessage').mockImplementation(() => {
+      entered();
+      return new Promise<string>((_, fail) => { reject = fail; });
+    });
+    const ephemeral = vi.spyOn(larkClient, 'sendEphemeralCard').mockResolvedValue('om_private');
+    const pending = post();
+    await sending;
+    if (reason === 'disabled') vi.mocked(botRegistry.getBot).mockReturnValue({ config: {
+      larkAppId: 'cli_test', larkAppSecret: 'test-secret', triggerUserAuth: { enabled: false },
+    } } as any);
+    if (reason === 'closed') session.session.status = 'closed';
+    if (reason === 'different_actor') session.managedTurnOrigin.callerOpenId = 'ou_other';
+    await vi.advanceTimersByTimeAsync(reason === 'expired' ? 600_001 : 2_001);
+    expect([...sessionAuthRequests.values()]).toHaveLength(0);
+    reject(new Error('DM failed'));
+    const response = await pending;
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ ok: false, error: 'auth_request_expired' });
+    expect(ephemeral).not.toHaveBeenCalled();
+  });
+
+  it('still delivers for the same requester after their turn rotates', async () => {
+    vi.spyOn(larkClient, 'sendUserMessage').mockImplementation(async () => {
+      session.managedTurnOrigin.turnId = 'om_next_turn';
+      throw new Error('DM unavailable');
+    });
+    const ephemeral = vi.spyOn(larkClient, 'sendEphemeralCard').mockResolvedValue('om_private');
+    const response = await post();
+    expect(response.status).toBe(200);
+    const body = await response.json();
+    expect(body).toMatchObject({ ok: true, delivery: 'ephemeral' });
+    expect(ephemeral).toHaveBeenCalledExactlyOnceWith('cli_test', 'oc_test', 'ou_sender', expect.stringContaining(AUTH_URL));
+    expect(await (await post('auth-status', { requestId: body.requestId, originTurnId: 'om_next_turn' })).json())
+      .toEqual({ ok: true, status: 'pending' });
+  });
+
+  it('does not report a usable request when the grant expires during card delivery', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    vi.spyOn(larkClient, 'sendUserMessage').mockRejectedValue(new Error('DM unavailable'));
+    let release!: (id: string) => void;
+    let entered!: () => void;
+    const sending = new Promise<void>(resolve => { entered = resolve; });
+    const ephemeral = vi.spyOn(larkClient, 'sendEphemeralCard').mockImplementation(() => {
+      entered();
+      return new Promise<string>(resolve => { release = resolve; });
+    });
+    const pending = post();
+    await sending;
+    await vi.advanceTimersByTimeAsync(600_001);
+    release('om_private');
+    const response = await pending;
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ ok: false, error: 'auth_request_expired' });
+    expect(ephemeral).toHaveBeenCalledTimes(1);
+    expect([...sessionAuthRequests.values()]).toHaveLength(0);
+  });
+
+  it('refuses without a link when both private channels fail, and drops the request', async () => {
     vi.spyOn(larkClient, 'sendUserMessage').mockRejectedValue(new Error('230013 user not in scope'));
+    vi.spyOn(larkClient, 'sendEphemeralCard').mockRejectedValue(new Error('18053 topic group unsupported'));
     const response = await post();
     expect(response.status).toBe(409);
     const body = await response.json() as Record<string, unknown>;

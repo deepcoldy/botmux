@@ -183,6 +183,7 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
       'botDefaults.replyStyleColor', 'botDefaults.replyStyleTag', 'botDefaults.replyStyleCustomTag',
     ],
   },
+  { id: 'local-address', tab: 'cards', titleKey: 'botDefaults.sectionLocalAddress', fieldKeys: ['botDefaults.hideLocalAddresses'] },
   { id: 'ask-option-layout', tab: 'cards', titleKey: 'botDefaults.sectionAskOptionLayout' },
   { id: 'brand', tab: 'cards', titleKey: 'botDefaults.sectionBrand', fieldKeys: ['botDefaults.brandLabel'] },
   { id: 'oncall', tab: 'cards', titleKey: 'botDefaults.sectionOncall' },
@@ -468,6 +469,8 @@ export type BotDefaultsRow = {
    *  explicit false means the tag is suppressed. */
   senderTag?: boolean;
   senderTagHideEmail?: boolean;
+  /** Keep development-host addresses out of Lark replies. Default off. */
+  hideLocalAddresses?: boolean;
   overloadAlert?: boolean;
   botToBotSameDir?: boolean;
   quotaFallbackBot?: {
