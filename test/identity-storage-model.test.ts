@@ -174,6 +174,19 @@ describe('the two models are mutually exclusive per session', () => {
     expect(readFileSync(join(dataDir, 'identity-layout'), 'utf8').trim()).toBe('proven-v1');
   });
 
+  it('a single re-init keeps the snapshot the daemon published before the spawn', () => {
+    // The plaintext clean-up above is for proven layouts only. A single
+    // session's root file is its live publication channel: the daemon writes
+    // the waking or restarted turn there at accept time, before the worker
+    // re-initializes the same layout, and wiping it would deny that turn.
+    ensureSessionIdentityStorage(dir, SESSION, ['bytedcli'], 'single');
+    writeSessionIdentity(dir, SESSION, aliceBy('turn-A'), 'single');
+    ensureSessionIdentityStorage(dir, SESSION, ['bytedcli'], 'single');
+    const dataDir = sessionIdentityDataDir(dir, SESSION);
+    expect(readFileSync(join(dataDir, 'bytedcli.env'), 'utf8')).toContain('jwt-turn-A');
+    expect(readFileSync(join(dataDir, 'codebase.env'), 'utf8')).not.toBe('');
+  });
+
   it('re-initializing the same model never truncates a live marker', () => {
     ensureSessionIdentityStorage(dir, SESSION, ['bytedcli'], 'proven');
     writeSessionIdentity(dir, SESSION, aliceBy('turn-A'), 'proven');
