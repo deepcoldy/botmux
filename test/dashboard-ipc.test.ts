@@ -3917,6 +3917,24 @@ describe('PUT /api/group-message-listeners/:chatId — the answer is what the gr
     });
   });
 
+  it('counts a paused custom rule as configured on GET /api/groups, apart from the active flag', async () => {
+    await withDaemon({
+      groupMessageListenerOverrides: { [chatId]: { mode: 'custom', listener: { enabled: false, prompt: '暂停的规则' } } },
+    }, async base => {
+      const spy = vi.spyOn(groupsStore, 'listChats').mockResolvedValue([
+        { chatId, name: 'paused' },
+        { chatId: 'oc_group_listener_plain', name: 'plain' },
+      ]);
+      try {
+        const body = await (await fetch(`${base}/api/groups`)).json();
+        expect(body.chats.map((chat: any) => [chat.chatId, chat.hasMessageListener, chat.hasMessageListenerConfig])).toEqual([
+          [chatId, false, true],
+          ['oc_group_listener_plain', false, false],
+        ]);
+      } finally { spy.mockRestore(); }
+    });
+  });
+
   it.each([
     ['custom, on', { mode: 'custom', listener: { enabled: true, prompt: '新规则' } }],
     ['custom, off with a prompt', { mode: 'custom', listener: { enabled: false, prompt: '新规则' } }],
@@ -11246,6 +11264,7 @@ describe('GET /api/groups (Phase B)', () => {
       firstSeenAt: null,
       hasRole: false,
       hasMessageListener: false,
+      hasMessageListenerConfig: false,
       observedBotNames: [],
       pinStreamingCardMasterEnabled: false,
       pinStreamingCardChatEnabled: true,
@@ -11289,6 +11308,7 @@ describe('GET /api/groups (Phase B)', () => {
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
+        hasMessageListenerConfig: false,
         observedBotNames: [],
         pinStreamingCardMasterEnabled: false,
         pinStreamingCardChatEnabled: true,
@@ -11338,6 +11358,7 @@ describe('GET /api/groups (Phase B)', () => {
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
+        hasMessageListenerConfig: false,
         observedBotNames: [],
         pinStreamingCardMasterEnabled: false,
         pinStreamingCardChatEnabled: false,
@@ -11377,6 +11398,7 @@ describe('GET /api/groups (Phase B)', () => {
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
+        hasMessageListenerConfig: false,
         observedBotNames: [],
         pinStreamingCardMasterEnabled: false,
         pinStreamingCardChatEnabled: true,
@@ -11429,6 +11451,7 @@ describe('GET /api/groups (Phase B)', () => {
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
+          hasMessageListenerConfig: false,
           observedBotNames: [],
           pinStreamingCardMasterEnabled: true,
           pinStreamingCardChatEnabled: true,
@@ -11448,6 +11471,7 @@ describe('GET /api/groups (Phase B)', () => {
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
+          hasMessageListenerConfig: false,
           observedBotNames: [],
           pinStreamingCardMasterEnabled: true,
           pinStreamingCardChatEnabled: false,
@@ -11467,6 +11491,7 @@ describe('GET /api/groups (Phase B)', () => {
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
+          hasMessageListenerConfig: false,
           observedBotNames: [],
           pinStreamingCardMasterEnabled: true,
           pinStreamingCardChatEnabled: true,

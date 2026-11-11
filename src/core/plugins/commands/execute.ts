@@ -11,6 +11,7 @@ export interface PluginSlashCommandInput {
   chatType: 'p2p' | 'group' | undefined;
   anchor: string;
   messageId: string;
+  issuedAt?: number;
   senderOpenId: string | undefined;
   senderUnionId: string | undefined;
   locale: string;
@@ -53,6 +54,7 @@ export async function runPluginSlashCommand(input: PluginSlashCommandInput, deps
   deps.onAdmitted();
   const outcome = await deps.execute(input.pluginId, {
     eventId: input.messageId,
+    ...(input.issuedAt !== undefined ? { issuedAt: input.issuedAt } : {}),
     larkAppId: input.larkAppId,
     command: input.cmd,
     args: input.content.replace(/^\S+/, '').trim(),

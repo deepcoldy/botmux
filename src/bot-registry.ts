@@ -2435,6 +2435,13 @@ export interface BotConfig {
    */
   chatManagerEnabled?: boolean;
   /**
+   * 群负责人免 @ 接的顶层消息，在「共享」回复模式（`regularGroupReplyMode`/`/reply-mode` = shared）
+   * 的普通群里也开话题：回复挂在那条消息下面，和 @ 本 bot 的顶层消息一样；会话仍是群级那一个。
+   * 仅当显式为 true 且 `chatManagerEnabled` 也为 true 时生效。默认（undefined/false）= 关闭：
+   * 群负责人免 @ 的消息照旧平铺回复，老用户行为不变。其它回复模式不受影响。
+   */
+  chatManagerSharedTopic?: boolean;
+  /**
    * 群秘书（`/secretary on`）总开关。仅当显式为 true 时，群里才能用 `/secretary on|takeover`
    * 把本 bot 设为群秘书，后台旁听与巡检才运行。默认（undefined/false）= 关闭，老用户行为不变；
    * `/secretary off|status` 不被此开关阻断。
@@ -4537,6 +4544,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
       chatManagerEnabled: entry.chatManagerEnabled === true || undefined,
+      chatManagerSharedTopic: entry.chatManagerSharedTopic === true || undefined,
       groupSecretaryEnabled: entry.groupSecretaryEnabled === true || undefined,
       // 非法的 steward 配置按关处理（不阻断 bot 启动）；Dashboard / /config 写入时已校验。
       steward: (() => {

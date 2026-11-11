@@ -7,6 +7,11 @@ import { optionDescriptions } from './ask-option-descriptions.js';
 const safe = (s: string) => s.replace(/[\\`*_[\]<>!~&]/g, c => `\\${c}`);
 const plain = (content: string) => ({ tag: 'plain_text', content });
 
+export function formatAskDeadline(deadlineAt: number, locale: Locale): string {
+  if (deadlineAt === 0) return locale === 'en' ? 'No deadline (until answered or invalidated)' : '无截止时间（直到回答或失效）';
+  return new Date(deadlineAt).toLocaleString(locale === 'en' ? 'en-US' : 'zh-CN');
+}
+
 /** `mention` (a ready `<at>` tag) is drawn only while unsettled; `descriptionCap` limits each option description. */
 export function buildAskFormElements(ask: PendingAsk, locale: Locale, result?: AskResult, valueCap = 300,
   extras: { mention?: string; descriptionCap?: number } = {}): Array<Record<string, any>> {
@@ -18,7 +23,7 @@ export function buildAskFormElements(ask: PendingAsk, locale: Locale, result?: A
     return head + (en ? '… (full answer returned to caller)' : '…（完整答案已返回调用方）');
   };
   const elements: Array<Record<string, any>> = [{ tag: 'markdown', content:
-    `${en ? 'Deadline' : '等待截止'}：${new Date(ask.deadlineAt).toLocaleString(en ? 'en-US' : 'zh-CN')}\n`
+    `${en ? 'Deadline' : '等待截止'}：${formatAskDeadline(ask.deadlineAt, locale)}\n`
     + (ask.answererOpenId ? (en ? 'Only the designated respondent may submit.' : '仅指定答题人可提交。')
       : (en ? 'Members allowed to talk to this bot may answer; this does not grant business approval.' : '本会话可对话成员可作答；不代表具备业务批准权。')) }];
   if (result) {

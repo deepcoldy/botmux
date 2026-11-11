@@ -498,10 +498,10 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       const blocked = await prepareCodexTranscriptInput(pty);
       if (blocked) return { submitted: false, failureReason: blocked };
       const terminalSession = await refreshCodexTerminalSession(pty);
-      // One frame: Paste is processed before Enter by the native event loop.
-      // Never leave a timer window in which a human can submit/replace the
-      // draft or open backtrack before our delayed Enter. Receipt checks below
-      // are read-only, including after an ambiguous transport result.
+      // Paste frame and Enter go out back to back: no timer window in which a
+      // human can submit/replace the draft or open backtrack before a delayed
+      // Enter. Receipt checks below are read-only, including after an
+      // ambiguous transport result.
       const historyPath = codexHistoryPath();
       const baseByte = currentFileSize(historyPath);
 
@@ -555,8 +555,11 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
           : undefined;
 
       try {
+        // Enter is a separate write right after the frame (see the tmux
+        // backend's submitBracketedPaste): in one write it can be stranded in
+        // the tty when the frame fills Codex's 1024-byte read exactly.
         if (pty.submitBracketedPaste) pty.submitBracketedPaste(content);
-        else pty.write(wrapBracketedPaste(content) + '\r');
+        else if (pty.write(wrapBracketedPaste(content)) !== false) pty.write('\r');
       } catch { /* The frame may have landed before acknowledgement failed. */ }
       const match = await waitForHistoryAppend(historyPath, baseByte, content, 3200, acceptSid, proveSid);
       if (match.found) return historyMatchResult(match, cliPid !== undefined);

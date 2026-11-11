@@ -975,11 +975,33 @@ export class TmuxPipeBackend implements SessionBackend {
     return this.pasteBuffer(text, false);
   }
 
-  /** Paste framing and Enter are queued in one tmux command batch. Send ESC
-   * markers as literal keys: newer servers sanitize ESC inside buffers.
-   * No separate client call or adapter timer can target a replacement draft. */
+  /** The framed paste is one tmux command batch; Enter follows as a second,
+   * back-to-back tmux call. Send ESC markers as literal keys: newer servers
+   * sanitize ESC inside buffers.
+   *
+   * Enter must reach the pane as its own write. tmux turns one command batch
+   * into a single write to the pane, and crossterm (Codex's input layer)
+   * reads 1024 bytes at a time under edge-triggered epoll and returns as soon
+   * as a read yields an event. When the frame up to `ESC[201~` fills a read
+   * exactly, a CR riding in the same write stays in the tty with no new
+   * readiness edge: the message sits in the composer until the next key.
+   * A separate write always raises a fresh edge.
+   *
+   * The CR is sent synchronously right after the paste call returns, with no
+   * timer, so the gap is one tmux client round-trip (milliseconds). The
+   * comment this replaces ruled out a delayed adapter Enter, a window long
+   * enough for a human to replace the draft or open backtrack; nothing in this
+   * process runs between the two calls, and writeInput's history receipt
+   * still decides whether the input was submitted. */
   submitBracketedPaste(text: string): boolean {
-    return this.pasteBuffer(text, true);
+    if (!this.pasteBuffer(text, true)) return false;
+    return this.guardedSend('send-keys (submit)', () => {
+      execFileSync('tmux', [...this.tmuxArgs, 'send-keys', '-t', this.paneTarget, '-l', '--', '\r'], {
+        stdio: 'ignore',
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
+    });
   }
 
   private pasteBuffer(text: string, submit: boolean): boolean {
@@ -991,7 +1013,7 @@ export class TmuxPipeBackend implements SessionBackend {
       // the opening marker. Queue the entire empty frame as literal keys.
       if (submit && text.length === 0) {
         execFileSync('tmux', [...this.tmuxArgs,
-          'send-keys', '-t', this.paneTarget, '-l', '--', '\x1b[200~\x1b[201~\r'], {
+          'send-keys', '-t', this.paneTarget, '-l', '--', '\x1b[200~\x1b[201~'], {
           stdio: 'ignore',
           timeout: 5000,
           env: tmuxEnv(),
@@ -1010,7 +1032,7 @@ export class TmuxPipeBackend implements SessionBackend {
         const pasteArgs = ['paste-buffer', '-b', bufferName, '-t', this.paneTarget, '-d', submit ? '-r' : '-p'];
         const commands = submit
           ? ['send-keys', '-t', this.paneTarget, '-l', '--', '\x1b[200~', ';',
-            ...pasteArgs, ';', 'send-keys', '-t', this.paneTarget, '-l', '--', '\x1b[201~\r']
+            ...pasteArgs, ';', 'send-keys', '-t', this.paneTarget, '-l', '--', '\x1b[201~']
           : pasteArgs;
         execFileSync('tmux', [...this.tmuxArgs, ...commands], {
           stdio: 'ignore',

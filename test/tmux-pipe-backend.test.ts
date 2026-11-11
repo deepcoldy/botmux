@@ -965,19 +965,32 @@ describe('TmuxPipeBackend input addressing', () => {
     expect(pasteArgs).toContain('-p');
   });
 
-  it('submits multiline Codex input and Enter in one tmux command batch', () => {
+  it('submits the framed Codex paste in one tmux batch and Enter as the next tmux call', () => {
     const be = new TmuxPipeBackend('0:5.0');
     be.spawn('', [], spawnOpts());
     mockedExecFileSync.mockClear();
     expect(be.submitBracketedPaste('line one  \nline two')).toBe(true);
     const calls = getExecFileCalls();
-    expect(calls).toHaveLength(2);
+    expect(calls).toHaveLength(3);
     expect((calls[0][2] as any).input).toBe('line one  \nline two');
     expect(calls[1][1]).toContain('paste-buffer');
     expect(calls[1][1]).toContain('-r');
     expect(calls[1][1]).not.toContain('-p');
-    expect((calls[1][1] as string[]).slice(-7)).toEqual([';', 'send-keys', '-t', '0:5.0', '-l', '--', '\x1b[201~\r']);
+    expect((calls[1][1] as string[]).slice(-7)).toEqual([';', 'send-keys', '-t', '0:5.0', '-l', '--', '\x1b[201~']);
     expect(calls[1][1]).toContain('\x1b[200~');
+    expect((calls[2][1] as string[]).slice(-6)).toEqual(['send-keys', '-t', '0:5.0', '-l', '--', '\r']);
+  });
+
+  it('does not send Enter when the framed paste was dropped', () => {
+    const be = new TmuxPipeBackend('0:5.0');
+    be.spawn('', [], spawnOpts());
+    mockedExecFileSync.mockClear();
+    mockedExecFileSync.mockImplementation(((_file: string, args: string[]) => {
+      if (args.includes('paste-buffer')) throw new Error('server busy');
+      return '';
+    }) as typeof execFileSync);
+    expect(be.submitBracketedPaste('message')).toBe(false);
+    expect(getExecFileCalls().some(call => (call[1] as string[]).includes('\r'))).toBe(false);
   });
 
   it('uses a fresh named tmux buffer for each paste', () => {

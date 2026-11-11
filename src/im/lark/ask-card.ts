@@ -1,5 +1,5 @@
 import { hasAskForm } from '../../core/ask-form.js';
-import { buildAskFormElements } from './ask-form-elements.js';
+import { buildAskFormElements, formatAskDeadline } from './ask-form-elements.js';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -534,7 +534,7 @@ function renderAskCardWithCap(
       body: { elements: buildAskFormElements(capped, locale, result, Math.min(300, promptCap), { mention, descriptionCap }) } });
   }
   const optionLayout = askOptionLayoutForBot(ask.larkAppId);
-  const deadline = new Date(ask.deadlineAt).toLocaleString('zh-CN');
+  const deadline = formatAskDeadline(ask.deadlineAt, locale);
   const status = result ? settleStatus(result, ask, locale) : undefined;
   const confirmEmptyArmed = !!opts?.confirmEmptyArmed && !status;
 

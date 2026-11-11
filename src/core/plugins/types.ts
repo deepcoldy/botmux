@@ -79,6 +79,10 @@ export interface PluginCommandEntry {
 
 /** Public, install-time declaration of Lark slash commands routed to a plugin service. */
 export interface PluginCommandsContribution {
+  /** Receive a host-authenticated /close notification only after a clean explicit close. */
+  afterClose?: true;
+  /** This close hook owns classification, replacing the legacy closed-name migration. */
+  replacesCloseTag?: true;
   schemaVersion: 1;
   endpoint: string;
   commands: PluginCommandEntry[];

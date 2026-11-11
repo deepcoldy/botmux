@@ -65,3 +65,19 @@ it('proxies exact group/bot settings and invalidates the group cache only on suc
   await setDefaultModelsForGroup('oc_demo', 'app-a', '{}', deps);
   expect(invalidateGroups).toHaveBeenCalledOnce();
 });
+
+
+it('offers Antigravity live models and saves only verified common effort levels', async () => {
+  const writes = mockRequests();
+  let renderer!: TestRenderer.ReactTestRenderer;
+  await act(async () => { renderer = TestRenderer.create(React.createElement(GroupDefaultModelsRow, {
+    ...props, cliId: 'antigravity', models: { codex: 'keep-codex' },
+  })); });
+  expect(globalThis.fetch).toHaveBeenCalledWith('/api/cli-options/models?key=antigravity&bot=app-a');
+  await act(async () => renderer.root.findByType(ModelPickerField).props.onChange('gemini-4-argon-high'));
+  expect(renderer.root.findByType(DropdownField).props.options.map((o: { value: string }) => o.value)).toEqual(['', 'low', 'medium', 'high']);
+  await act(async () => renderer.root.findByType(DropdownField).props.onChange('high'));
+  await act(async () => renderer.root.findByType('form').props.onSubmit({ preventDefault() {} }));
+  expect(writes[0].body).toEqual({ codex: 'keep-codex', antigravity: { model: 'gemini-4-argon-high', reasoningEffort: 'high' } });
+  await act(async () => renderer.unmount());
+});
