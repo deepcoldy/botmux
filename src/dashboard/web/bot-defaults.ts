@@ -123,6 +123,8 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   },
   { id: 'cross-bot', tab: 'sessions', titleKey: 'botDefaults.sectionCrossBot', fieldKeys: ['botDefaults.botToBotSameDir'] },
   { id: 'session-cap', tab: 'sessions', titleKey: 'botDefaults.sectionSessionCap', fieldKeys: ['botDefaults.maxLiveWorkers', 'botDefaults.idleSuspendMinutes'] },
+  // 只对 codex / codex-app 渲染；覆盖全局 sessionCleanup.archiveCodex。
+  { id: 'codex-archive', tab: 'sessions', titleKey: 'botDefaults.sectionCodexArchive', fieldKeys: ['botDefaults.archiveCodexLabel'] },
   { id: 'prompt-cache', tab: 'sessions', titleKey: 'botDefaults.sectionPromptCache', fieldKeys: [
       'promptCache.ttl', 'promptCache.keepalive', 'promptCache.idleMinutes', 'promptCache.maxPings',
       'promptCache.activeHours', 'promptCache.minContextTokens',
@@ -396,6 +398,10 @@ export type BotDefaultsRow = {
    *  (null: older daemon). Advice only; never blocks saving. */
   scratchCapability?: ScratchCapability | null;
   codexAuthSync?: 'shared' | 'isolated';
+  /** Per-bot override of the global close/cleanup Codex archive switch; null = inherit. */
+  archiveCodex?: boolean | null;
+  /** Current global `sessionCleanup.archiveCodex`, shown on the inherit option. */
+  archiveCodexDefault?: boolean;
   /** Trigger-user CLI auth: null / absent = off (the historical behavior, where
    *  CLI calls use whatever identity is logged in on the machine).
    *  gitHost / gitTokenExchangeUrl have no editor in the UI — they round-trip

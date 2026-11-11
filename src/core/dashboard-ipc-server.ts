@@ -9843,6 +9843,9 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     // on THIS daemon. Advice next to the choice; saving is never blocked on it.
     scratchCapability: (() => { try { return probeScratchCapability(); } catch { return null; } })(),
     codexAuthSync,
+    // Per-bot archive override (null = inherit sessionCleanup.archiveCodex). Read
+    // from the live config so a `/config set archiveCodex` shows up without reload.
+    archiveCodex: (() => { try { const v = getBot(cachedLarkAppId).config.archiveCodex; return typeof v === 'boolean' ? v : null; } catch { return null; } })(),
     envPolicy: (() => { try { return getBot(cachedLarkAppId).config.envPolicy ?? { mode: 'inherit' }; } catch { return { mode: 'inherit' }; } })(),
     sandboxPaths: sandboxPathsForDashboard ?? null,
     // Already-stored readWrite entries the save path would now refuse; the
@@ -12073,6 +12076,20 @@ botConfigPutRoute('/api/bot-max-live-workers', 'maxLiveWorkers', {
 botConfigPutRoute('/api/bot-idle-suspend-minutes', 'idleSuspendMinutes', {
   normalize: nullableNumberField('idleSuspendMinutes'),
   respond: value => ({ ok: true, idleSuspendMinutes: value }),
+});
+
+// Per-bot 关闭/清理时原生归档 Codex 的覆盖。Body `{ archiveCodex: true | false | null }`:
+//   • true / false → 显式开 / 关，写进 bots.json（显式 false 也落盘，不随全局变化）
+//   • null         → 删除覆盖，继承全局 sessionCleanup.archiveCodex
+// 缺少该键或类型不对一律 400，不把空 body 当清除。走 applyConfigField（与 /config 同一
+// 写盘 + 内存热更新路径），下一次关闭/清理即按新值冻结，已开始的关闭不受影响。
+botConfigPutRoute('/api/bot-archive-codex', 'archiveCodex', {
+  normalize: raw => {
+    const value = typeof raw === 'object' && raw !== null && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>).archiveCodex : undefined;
+    return value === null || typeof value === 'boolean' ? fieldOk(value) : fieldInvalid('invalid_archive_codex');
+  },
+  respond: value => ({ ok: true, archiveCodex: value }),
 });
 
 ipcRoute('PUT', '/api/bot-session-owner-reminder', requireBoundBot(async (req, res) => {

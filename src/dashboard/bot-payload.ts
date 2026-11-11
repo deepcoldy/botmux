@@ -291,6 +291,10 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     replyDeliveryDefault: j?.replyDeliveryDefault === 'transcript' ? 'transcript' : 'send',
     replyDeliverySupported: j?.replyDeliverySupported === true,
     codexAuthSync: j?.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
+    // Per-bot 关闭/清理时原生归档 Codex 的覆盖：null = 继承全局。全局当前值随行下发，
+    // 页面在「跟随全局」里直接写出它，避免看不出本 Bot 实际会不会归档。
+    archiveCodex: typeof j?.archiveCodex === 'boolean' ? j.archiveCodex : null,
+    archiveCodexDefault: readGlobalConfig().sessionCleanup?.archiveCodex === true,
     // Trigger-user CLI auth policy. No secrets in it — just which tools it
     // covers and what to do when the sender has not authorized. Run through the
     // SHARED parser so this door cannot drift from bots.json / /botconfig: a
@@ -344,6 +348,7 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
   askOptionLayout: any;
   trustSameOwnerBots: boolean | undefined;
   grantDelegateBots: string[] | undefined;
+  archiveCodex: boolean | undefined;
 } {
   return {
     quotaFallbackBot: rawEntry?.quotaFallbackBot,
@@ -356,6 +361,8 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
     grantDelegateBots: Array.isArray(rawEntry?.grantDelegateBots)
       ? rawEntry.grantDelegateBots.filter((x: unknown): x is string => typeof x === 'string')
       : undefined,
+    // 缺省继承全局：显式的开/关不从这里带回，离线行会显示成「跟随全局」。
+    archiveCodex: typeof rawEntry?.archiveCodex === 'boolean' ? rawEntry.archiveCodex : undefined,
   };
 }
 

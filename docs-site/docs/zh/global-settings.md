@@ -66,7 +66,7 @@
 | 检查频率（`intervalMinutes`） | 每隔几分钟检查一次，最少 5 分钟 | 60 |
 | 关闭/清理时同步归档 Codex（`archiveCodex`） | 关会话时（手动关闭或空闲清理）顺手归档对应的 Codex 会话，重新打开时恢复 | 关 |
 
-单个 Bot 可用 `/config set archiveCodex on` 或 `/config set archiveCodex off` 覆盖此开关；`/config unset archiveCodex` 恢复继承。也可在 `bots.json` 对应 Bot 条目设置 `"archiveCodex": true` 或 `false`。命令修改对后续关闭/清理立即生效，已开始的关闭沿用开始时的值；已有归档会话仍可恢复。
+单个 Bot 可在 Dashboard「Bot 配置 → 会话 → Codex 原生归档」里选择跟随全局、开启或关闭（只对 Codex Bot 显示）；也可用 `/config set archiveCodex on` 或 `/config set archiveCodex off` 覆盖此开关，`/config unset archiveCodex` 恢复继承。也可在 `bots.json` 对应 Bot 条目设置 `"archiveCodex": true` 或 `false`。命令修改对后续关闭/清理立即生效，已开始的关闭沿用开始时的值；已有归档会话仍可恢复。
 
 它和「会话控制」页上手动点「清理空闲」用的是**同一套判断**，只是自动跑。只清真正空闲的会话：正在运行、被锁定、还有待处理的选仓或需要你处理的提醒的会话，都不会被关。
 

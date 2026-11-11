@@ -1163,6 +1163,10 @@ function BotDefaultsCard(props: {
               <CrossBotSection bot={bot} putCardPref={putCardPref} />
             </section>
             <section className="bd-tile" id={botDefaultsSectionDomId('session-cap')}><SessionCapSection bot={bot} patchBot={patchBot} /></section>
+            {/* 原生归档只作用于自有本地 Codex 会话（ownedLocalCodex），其它 CLI 不显示。 */}
+            {bot.cliId === 'codex' || bot.cliId === 'codex-app' ? (
+              <section className="bd-tile" id={botDefaultsSectionDomId('codex-archive')}><CodexArchiveSection bot={bot} patchBot={patchBot} /></section>
+            ) : null}
             {/* 提示缓存 TTL / 保活只对 Claude Code 生效（--settings promptCacheTtl + 注入保活轮）。 */}
             {bot.cliId === 'claude-code' ? (
               <section className="bd-tile" id={botDefaultsSectionDomId('prompt-cache')}><PromptCacheSection bot={bot} patchBot={patchBot} /></section>
@@ -4752,6 +4756,63 @@ function LarkToolBindingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
       />
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-lark-tool-binding-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+type ArchiveCodexChoice = 'inherit' | 'on' | 'off';
+
+function archiveCodexChoice(value: boolean | null | undefined): ArchiveCodexChoice {
+  return value === true ? 'on' : value === false ? 'off' : 'inherit';
+}
+
+/** Per-bot override of the global close/cleanup archive switch. Explicit on/off
+ *  is persisted even when it equals the global value, so a later global change
+ *  does not move this bot; only "follow global" removes the override. */
+export function CodexArchiveSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const { bot, patchBot } = props;
+  const [choice, setChoice] = useState<ArchiveCodexChoice>(archiveCodexChoice(bot.archiveCodex));
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+
+  useEffect(() => setChoice(archiveCodexChoice(bot.archiveCodex)), [bot.archiveCodex]);
+
+  async function save(next: ArchiveCodexChoice): Promise<void> {
+    const previous = choice;
+    const value = next === 'inherit' ? null : next === 'on';
+    setChoice(next);
+    await saveBotField({
+      request: () => sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/archive-codex`, { archiveCodex: value }),
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.archiveCodexSaved'),
+      onSaved: () => patchBot(bot.larkAppId, { archiveCodex: value }),
+      rollback: () => setChoice(previous),
+    });
+  }
+
+  const globalState = tr(bot.archiveCodexDefault === true ? 'botDefaults.archiveCodexStateOn' : 'botDefaults.archiveCodexStateOff');
+  return (
+    <section className="bd-section">
+      <h3 className="bd-section-title">{tr('botDefaults.sectionCodexArchive')}</h3>
+      <div className="bd-row">
+        <label>
+          <span>{tr('botDefaults.archiveCodexLabel')}</span>
+          <select
+            data-input="archiveCodex"
+            value={choice}
+            disabled={busy}
+            onChange={event => void save(event.currentTarget.value as ArchiveCodexChoice)}
+          >
+            <option value="inherit">{tr('botDefaults.archiveCodexInherit', { state: globalState })}</option>
+            <option value="on">{tr('botDefaults.archiveCodexOn')}</option>
+            <option value="off">{tr('botDefaults.archiveCodexOff')}</option>
+          </select>
+        </label>
+        <small>{tr('botDefaults.archiveCodexHelp')}</small>
+        <StatusSpan status={status} attr={{ 'data-archive-codex-status': '' }} />
       </div>
     </section>
   );
