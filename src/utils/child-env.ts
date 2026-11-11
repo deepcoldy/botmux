@@ -231,6 +231,9 @@ export const REDACTED_CHILD_ENV_KEYS = [
   'GITHUB_TOKEN',
   'GH_TOKEN',
   'ONCALL_SERVICE_SECRET',
+  'ONCALL_IDENTITY_APP_ID',
+  'ONCALL_IDENTITY_APP_SECRET',
+  'ONCALL_IDENTITY_BRAND',
   // node:child_process.fork() injects these into the worker so Node can attach
   // its IPC channel on startup. They belong to that exact parent/worker edge.
   // Forwarding them to an ordinary child (notably a Python Remote Runner which

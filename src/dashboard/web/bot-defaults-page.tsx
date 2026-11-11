@@ -1270,11 +1270,12 @@ type OncallBasicDraft = {
   connectionError: string;
   tenantName: string;
   loaded: boolean;
+  loadError: string;
 };
 
 function emptyOncallBasicDraft(): OncallBasicDraft {
   return { target: { tenantId: 0 }, savedTarget: null, secret: '', savedSecret: null, secretConfigured: null,
-    credentialActive: false, connectionReady: false, connectionError: '', tenantName: '', loaded: false };
+    credentialActive: false, connectionReady: false, connectionError: '', tenantName: '', loaded: false, loadError: '' };
 }
 
 function oncallTargetValid(target: OncallGroupBusinessTarget, direct: boolean): boolean {
@@ -1304,6 +1305,52 @@ function oncallConnectionDirty(connection: OncallConnectionDraft): boolean {
   return connection.saved !== null && (connection.endpoint.trim() !== connection.saved.endpoint || connection.emailDomain.trim() !== connection.saved.emailDomain);
 }
 
+type OncallIdentityApp = { appId: string; brand: 'feishu' | 'lark'; appSecretConfigured: boolean };
+type OncallIdentityDraft = OncallIdentityApp & { appSecret: string; saved: OncallIdentityApp | null; error: string };
+const emptyOncallIdentity = (): OncallIdentityDraft => ({ appId: '', brand: 'feishu', appSecretConfigured: false, appSecret: '', saved: null, error: '' });
+function oncallIdentityDirty(draft: OncallIdentityDraft): boolean {
+  return draft.saved !== null && (draft.appId.trim() !== draft.saved.appId || draft.brand !== draft.saved.brand || Boolean(draft.appSecret));
+}
+function oncallIdentityValid(draft: OncallIdentityDraft): boolean {
+  const sameApp = draft.saved?.appId === draft.appId.trim() && draft.saved?.brand === draft.brand;
+  return draft.saved !== null && /^cli_[a-zA-Z0-9]+$/.test(draft.appId.trim())
+    && (draft.appSecret ? Boolean(draft.appSecret.trim()) && draft.appSecret.trim().length <= 8192 && !/[^\x21-\x7e]/.test(draft.appSecret.trim()) : sameApp && draft.appSecretConfigured);
+}
+
+function OncallIdentitySettings(props: { source: 'bot' | 'shared'; draft: OncallIdentityDraft; busy: boolean;
+  onSourceChange: (source: 'bot' | 'shared') => void; onChange: (value: Partial<OncallIdentityDraft>) => void }) {
+  const { draft } = props;
+  return <div className="bd-oncall-preset">
+    <div className="bd-oncall-field"><FieldTitle help="按机器人选择提单人身份的查询方式，不改变 AI 使用权限。使用统一应用时，业务机器人仍需开通“获取用户 user ID”权限并发布。">提单人身份查询</FieldTitle>
+      <DropdownField dataInput="oncallIdentitySource" ariaLabel="提单人身份查询" disabled={props.busy} value={props.source}
+        options={[{ value: 'bot', label: '使用当前机器人', hint: '由当前机器人读取提单人邮箱' }, { value: 'shared', label: '使用统一查询应用', hint: '多个业务机器人共用一个应用读取邮箱' }]}
+        onChange={value => props.onSourceChange(value as 'bot' | 'shared')} />
+    </div>
+    {props.source === 'bot' ? <p className="bd-section-note">请由应用管理员为当前机器人开通通讯录基本信息、用户邮箱只读权限，并将通讯录数据范围设为全部成员，审核发布后生效。</p>
+      : <>
+        <fieldset className="bd-oncall-fields" disabled={props.busy || draft.saved === null}>
+          <div className="bd-oncall-grid">
+            <label className="bd-oncall-field"><FieldTitle help="同一部署共用的企业自建应用。须与业务机器人属于同一租户；App ID 和 App Secret 在该应用的“凭证与基础信息”中获取。">查询应用 App ID</FieldTitle>
+              <input name="oncallIdentityAppId" autoComplete="off" spellCheck={false} value={draft.appId} placeholder="cli_…"
+                onChange={event => props.onChange({ appId: event.currentTarget.value })} />
+            </label>
+            <label className="bd-oncall-field"><FieldTitle help="统一查询应用的 App Secret，不是 Oncall Service Secret。凭据仅存于部署主机，不传入 AI 会话。已配置时无需重复输入；更换 App ID 或平台时需重新填写。">查询应用 App Secret</FieldTitle>
+              <input name="oncallIdentityAppSecret" type="password" autoComplete="new-password" spellCheck={false} maxLength={8192} value={draft.appSecret}
+                placeholder={draft.appSecretConfigured ? '已配置，输入可更换' : '输入查询应用的 App Secret'}
+                onChange={event => props.onChange({ appSecret: event.currentTarget.value })} />
+            </label>
+            <div className="bd-oncall-field"><FieldTitle help="选择查询应用所属的平台，必须与使用它的业务机器人一致。">查询应用平台</FieldTitle>
+              <DropdownField dataInput="oncallIdentityBrand" ariaLabel="查询应用平台" disabled={props.busy || draft.saved === null} value={draft.brand}
+                options={[{ value: 'feishu', label: '飞书' }, { value: 'lark', label: 'Lark' }]}
+                onChange={brand => props.onChange({ brand: brand as 'feishu' | 'lark' })} />
+            </div>
+          </div>
+        </fieldset>
+        <p className={`bd-section-note${draft.error ? ' bd-warn' : ''}`}>{draft.error || '查询应用凭据由同一部署共用，保存后下次转人工自动使用。'} <InfoTip>查询应用需开通“获取通讯录基本信息”“获取用户邮箱信息”“获取用户 user ID”“获取企业信息”只读权限，并将通讯录数据范围设为全部成员、审核发布。企业信息仅用于校验租户一致。业务机器人只需取得可信回调中的 user_id，无需拥有全员邮箱读取范围。</InfoTip></p>
+      </>}
+  </div>;
+}
+
 function OncallBasicSettings(props: { draft: OncallBasicDraft; busy: boolean; connectionPending: boolean;
   onTargetChange: (target: OncallGroupBusinessTarget) => void; onSecretChange: (secret: string) => void; onCheck: () => void }) {
   const { draft, busy } = props;
@@ -1317,7 +1364,7 @@ function OncallBasicSettings(props: { draft: OncallBasicDraft; busy: boolean; co
             <input name="tenantId" type="number" min={1} step={1} value={draft.target.tenantId || ''} onChange={event => props.onTargetChange({ ...draft.target, tenantId: Number(event.currentTarget.value) })} />
           </label>
           <div className="bd-oncall-business-meta" role="status">
-            <span>{!draft.loaded ? '读取中…' : dirty ? '保存后读取业务线名称' : draft.tenantName || (draft.savedTarget ? `业务线 ${draft.savedTarget.tenantId}` : '未设置业务线')}</span>
+            <span>{draft.loadError ? '配置读取失败' : !draft.loaded ? '读取中…' : dirty ? '保存后读取业务线名称' : draft.tenantName || (draft.savedTarget ? `业务线 ${draft.savedTarget.tenantId}` : '未设置业务线')}</span>
             {draft.loaded && <><span className="bd-oncall-status" data-state={!props.connectionPending && !dirty && draft.connectionOk === true ? 'ok' : !props.connectionPending && !dirty && draft.connectionOk === false ? 'error' : 'idle'}>{props.connectionPending ? '连接待更新' : dirty ? '待保存' : !draft.connectionReady || !draft.credentialActive ? '待配置' : draft.connectionOk === true ? '连接正常' : draft.connectionOk === false ? '连接异常' : '待检测'}</span>
               <InfoTip>检测已保存业务线的平台连接。连通成功不代表已验证建群及入群权限。</InfoTip>
               <button type="button" disabled={busy || props.connectionPending || !draft.savedTarget || dirty || oncallSecretDirty(draft) || !draft.connectionReady || !draft.credentialActive} onClick={props.onCheck}>检测连接</button></>}
@@ -1335,6 +1382,7 @@ function OncallBasicSettings(props: { draft: OncallBasicDraft; busy: boolean; co
         </div>
       </div>
     </fieldset>
+    {draft.loadError && <p className="bd-section-note bd-warn" role="alert">{draft.loadError}。修复后刷新页面重新读取。</p>}
     {draft.connectionError && <p className="bd-section-note bd-warn">{draft.connectionError}</p>}
   </details>;
 }
@@ -1391,6 +1439,7 @@ export function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: Patc
   const [status, setStatus] = useState<StatusMessage>(null);
   const [basic, setBasic] = useState<OncallBasicDraft>(emptyOncallBasicDraft);
   const [connection, setConnection] = useState<OncallConnectionDraft>(emptyOncallConnection);
+  const [identity, setIdentity] = useState<OncallIdentityDraft>(emptyOncallIdentity);
   const [presetValid, setPresetValid] = useState(false);
   const [presetRevision, setPresetRevision] = useState(0);
   const groupLabel = useId();
@@ -1401,20 +1450,30 @@ export function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: Patc
   useEffect(() => {
     if (!visited || !ui.authed) return;
     let current = true;
-    setBasic(emptyOncallBasicDraft()); setConnection(emptyOncallConnection()); setStatus(null);
+    setBasic(emptyOncallBasicDraft()); setConnection(emptyOncallConnection()); setIdentity(emptyOncallIdentity()); setStatus(null);
     void Promise.allSettled([
       sendJson('GET', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/oncall-target`),
       sendJson('GET', '/api/oncall-service-secret'),
       sendJson('GET', `/api/oncall-connection?appId=${encodeURIComponent(props.bot.larkAppId)}`),
-    ]).then(([targetResult, secretResult, connectionResult]) => {
+      sendJson('GET', '/api/oncall-identity'),
+    ]).then(([targetResult, secretResult, connectionResult, identityResult]) => {
       if (!current) return;
-      if (targetResult.status === 'rejected') throw targetResult.reason;
-      if (!targetResult.value.ok) throw new Error(responseErrorText(targetResult.value));
+      if (identityResult.status === 'fulfilled' && identityResult.value.ok) {
+        const body = identityResult.value.body;
+        const value: OncallIdentityApp = { appId: typeof body.appId === 'string' ? body.appId : '',
+          brand: body.brand === 'lark' ? 'lark' : 'feishu', appSecretConfigured: body.appSecretConfigured === true };
+        setIdentity({ ...value, appSecret: '', saved: value, error: '' });
+      } else {
+        const reason = identityResult.status === 'rejected' ? caughtErrorText(identityResult.reason) : responseErrorText(identityResult.value);
+        setIdentity({ ...emptyOncallIdentity(), error: `无法读取统一查询应用配置：${reason}。修复后刷新页面重新读取。` });
+      }
       if (connectionResult.status === 'fulfilled' && connectionResult.value.ok) {
         const body = connectionResult.value.body;
         const value = { endpoint: typeof body.endpoint === 'string' ? body.endpoint : '', emailDomain: typeof body.emailDomain === 'string' ? body.emailDomain : '' };
         setConnection({ ...value, saved: value, error: '' });
       } else setConnection({ ...emptyOncallConnection(), error: '无法读取连接配置，仅部署管理员可编辑；请检查权限或稍后刷新。' });
+      if (targetResult.status === 'rejected') throw targetResult.reason;
+      if (!targetResult.value.ok) throw new Error(responseErrorText(targetResult.value));
       const body = targetResult.value.body;
       const target = body.target as OncallGroupBusinessTarget | null;
       const savedSecret = secretResult.status === 'fulfilled' && secretResult.value.ok && typeof secretResult.value.body.secret === 'string'
@@ -1424,7 +1483,12 @@ export function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: Patc
         secretConfigured: savedSecret !== null && secretResult.status === 'fulfilled' ? secretResult.value.body.configured === true : null,
         credentialActive: body.credentialActive === true, connectionReady: body.connectionReady === true,
         connectionOk: body.connectionOk, connectionError: body.connectionError ?? '', tenantName: body.tenantName ?? '', loaded: true });
-    }).catch(error => { if (current) setStatus({ text: caughtErrorText(error) }); });
+    }).catch(error => {
+      if (!current) return;
+      const text = caughtErrorText(error);
+      setBasic(previous => ({ ...previous, loadError: text }));
+      setStatus({ text });
+    });
     return () => { current = false; };
   }, [props.bot.larkAppId, visited]);
   function updateDraft(next: OncallGroupPolicy): void {
@@ -1438,6 +1502,10 @@ export function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: Patc
     const secretChanged = oncallSecretDirty(basic);
     const targetChanged = oncallTargetDirty(basic);
     const connectionChanged = oncallConnectionDirty(connection);
+    const identityChanged = next.identitySource === 'shared' && oncallIdentityDirty(identity);
+    if ((identityChanged || (policyChanged && next.enabled && next.identitySource === 'shared')) && !oncallIdentityValid(identity)) {
+      setStatus({ text: '请在高级设置中填写有效的统一查询应用 App ID 和 App Secret' }); return;
+    }
     if (connectionChanged && !oncallConnectionValid(connection)) {
       setStatus({ text: '请填写有效的 HTTPS 网关地址和邮箱域（不含 @）' }); return;
     }
@@ -1450,6 +1518,14 @@ export function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: Patc
     setBusy(true); setStatus(null);
     let savedParts = false;
     try {
+      if (identityChanged) {
+        const value = { appId: identity.appId.trim(), brand: identity.brand };
+        const response = await sendJson('PUT', '/api/oncall-identity', { ...value, ...(identity.appSecret ? { appSecret: identity.appSecret.trim() } : {}) }, controlCsrfHeaders());
+        if (!response.ok) throw new Error(responseErrorText(response));
+        savedParts = true;
+        const saved = { ...value, appSecretConfigured: true };
+        setIdentity({ ...saved, appSecret: '', saved, error: '' });
+      }
       if (secretChanged || connectionChanged) {
         const value = { endpoint: connection.endpoint.trim(), emailDomain: connection.emailDomain.trim() };
         const response = connectionChanged
@@ -1502,12 +1578,15 @@ export function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: Patc
   const hasCredential = basic.credentialActive || basic.secretConfigured === true || Boolean(basic.secret.trim());
   const connectionChanged = oncallConnectionDirty(connection);
   const connectionValid = oncallConnectionValid(connection);
-  const canEnable = basic.loaded && targetValid && (basic.connectionReady || (connectionChanged && connectionValid)) && hasCredential;
+  const identityChanged = policy.identitySource === 'shared' && oncallIdentityDirty(identity);
+  const identityReady = policy.identitySource !== 'shared' || oncallIdentityValid(identity);
+  const canEnable = basic.loaded && targetValid && (basic.connectionReady || (connectionChanged && connectionValid)) && hasCredential && identityReady;
   const policyChanged = JSON.stringify(policy) !== JSON.stringify(savedPolicy);
-  const dirty = connectionChanged || oncallTargetDirty(basic) || oncallSecretDirty(basic) || policyChanged;
+  const dirty = identityChanged || connectionChanged || oncallTargetDirty(basic) || oncallSecretDirty(basic) || policyChanged;
   const options = [...props.chats, ...policy.chatIds.filter(id => !props.chats.some(chat => chat.chatId === id)).map(chatId => ({ chatId }))];
   return <section className="bd-section bd-oncall-section">
     <h3 className="bd-section-title"><FieldTitle help="同一会话的回答卡片共用一个人工群。建群后统一显示进群入口，并按对话交接设置同步提交前的会话记录。">{tr('botDefaults.sectionOncall')}</FieldTitle></h3>
+    {!savedPolicy.enabled && <p className="bd-section-note" role="note">使用前，请由应用管理员选择身份查询方式：为当前机器人申请全员通讯录邮箱读取范围，或在下方高级设置中配置统一查询应用。两种方式均不改变 AI 使用授权；权限需审核发布后生效。</p>}
     <ToggleRow checked={policy.enabled} disabled={busy || (!policy.enabled && !canEnable)} title="启用转人工 Oncall" help="需要先配置业务线和服务凭据。此处修改为草稿，点击底部保存后生效。" description="在回答卡片中显示转人工入口。" onChange={enabled => updateDraft({ ...policy, enabled })} />
     {visited && ui.authed ? <OncallBasicSettings draft={basic} busy={busy} connectionPending={connectionChanged}
       onTargetChange={target => { setBasic(previous => ({ ...previous, target: target.tenantId !== previous.target.tenantId ? { tenantId: target.tenantId } : target })); setPresetValid(false); setStatus(null); }}
@@ -1579,10 +1658,13 @@ export function OncallGroupSettings(props: { bot: BotDefaultsRow; patchBot: Patc
         </div>
       </fieldset>
       <p className={`bd-section-note${connection.error ? ' bd-warn' : ''}`}>{connection.error || '已提供默认值；同一部署的机器人共用，修改后点击底部保存即可生效。'}</p>
+      <OncallIdentitySettings source={policy.identitySource ?? 'bot'} draft={identity} busy={busy}
+        onSourceChange={identitySource => updateDraft({ ...policy, identitySource })}
+        onChange={value => { setIdentity(previous => ({ ...previous, ...value })); setStatus(null); }} />
     </details> : null}
     <div className="actions bd-oncall-actions">
-      <StatusSpan status={status ?? (policy.enabled && !policy.chatIds.length ? { text: '请选择适用群聊' } : basic.loaded && !hasCredential ? { text: '请先填写服务凭据' } : dirty ? { text: '有未保存的修改' } : null)} />
-      <button type="button" className="primary" disabled={busy || !basic.loaded || !dirty || (oncallSecretDirty(basic) && !basic.secret.trim()) || (connectionChanged && !connectionValid) || (oncallTargetDirty(basic) && !targetValid) || (policyChanged && policy.enabled && (!policy.chatIds.length || !canEnable))} onClick={() => void save(policy)}>{busy ? '保存中…' : '保存配置'}</button>
+      <StatusSpan status={status ?? (identityChanged && !oncallIdentityValid(identity) ? { text: '请填写有效的查询应用 App ID 和 App Secret' } : policy.enabled && !policy.chatIds.length ? { text: '请选择适用群聊' } : basic.loaded && !hasCredential ? { text: '请先填写服务凭据' } : dirty ? { text: '有未保存的修改' } : null)} />
+      <button type="button" className="primary" disabled={busy || !basic.loaded || !dirty || (identityChanged && !oncallIdentityValid(identity)) || (oncallSecretDirty(basic) && !basic.secret.trim()) || (connectionChanged && !connectionValid) || (oncallTargetDirty(basic) && !targetValid) || (policyChanged && policy.enabled && (!policy.chatIds.length || !canEnable))} onClick={() => void save(policy)}>{busy ? '保存中…' : '保存配置'}</button>
     </div>
   </section>;
 }

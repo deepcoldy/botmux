@@ -7,6 +7,7 @@ import { DropdownField } from '../src/dashboard/web/field-controls.js';
 let renderer: TestRenderer.ReactTestRenderer;
 let fetcher: ReturnType<typeof vi.fn>;
 let storedSecret: string;
+let storedIdentity: { appId: string; brand: string; appSecretConfigured: boolean };
 let externallyUpdatePolicy: (policy: typeof initialPolicy) => void;
 const response = (body: object, status = 200) => new Response(JSON.stringify({ ok: status === 200, ...body }), { status });
 const initialPolicy = { enabled: true, chatIds: ['oc_demo'], flowMode: 'classify', formDisplay: 'thread_card', button: { timing: 'first', minTurns: 1 } };
@@ -22,7 +23,15 @@ beforeEach(() => {
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
   vi.stubGlobal('document', { querySelector: () => ({ getAttribute: () => 'csrf-token' }) });
   storedSecret = 'current-service-secret';
+  storedIdentity = { appId: '', brand: 'feishu', appSecretConfigured: false };
   fetcher = vi.fn(async (url: string, options?: RequestInit) => {
+    if (url === '/api/oncall-identity') {
+      if (options?.method === 'PUT') {
+        const body = JSON.parse(options.body as string);
+        storedIdentity = { appId: body.appId, brand: body.brand, appSecretConfigured: true };
+      }
+      return response(storedIdentity);
+    }
     if (url.startsWith('/api/oncall-connection')) return response({ endpoint: 'https://oncall.example.test/chat/', emailDomain: 'example.test' });
     if (url === '/api/oncall-service-secret') {
       if (options?.method === 'PUT') storedSecret = JSON.parse(options.body as string).secret;
@@ -51,6 +60,101 @@ async function render(policy = initialPolicy) {
 }
 
 describe('Oncall unified save', () => {
+  it.each(['http', 'network'])('shows the identity read failure reason and still allows current-bot policy edits (%s)', async failure => {
+    const original = fetcher.getMockImplementation()!;
+    const reason = 'directory configuration unavailable';
+    fetcher.mockImplementation(async (url: string, options?: RequestInit) => {
+      if (url === '/api/oncall-identity') {
+        if (failure === 'network') throw new Error(reason);
+        return response({ error: reason }, 503);
+      }
+      return original(url, options);
+    });
+    await render();
+    act(() => renderer.root.findByProps({ dataInput: 'oncallIdentitySource' }).props.onChange('shared'));
+    expect(renderer.root.findAllByType('p').some(node => node.children.join('').includes(reason))).toBe(true);
+    act(() => renderer.root.findByProps({ dataInput: 'oncallIdentitySource' }).props.onChange('bot'));
+    toggle();
+    await save();
+    expect(writes().map(([url]) => url)).toEqual(['/api/bots/app/oncall-group']);
+    expect(JSON.parse(writes()[0][1].body).oncallGroup.enabled).toBe(false);
+  });
+  it('saves a shared identity app before enabling it and never reads a stored password into the editor', async () => {
+    await render();
+    act(() => renderer.root.findByProps({ dataInput: 'oncallIdentitySource' }).props.onChange('shared'));
+    expect(saveButton().props.disabled).toBe(true);
+    change('oncallIdentityAppId', 'cli_directory');
+    change('oncallIdentityAppSecret', 'directory-secret');
+    expect(writes()).toHaveLength(0);
+    expect(saveButton().props.disabled).toBe(false);
+    await save();
+    expect(writes().map(([url]) => url)).toEqual(['/api/oncall-identity', '/api/bots/app/oncall-group']);
+    expect(JSON.parse(writes()[0][1].body)).toEqual({ appId: 'cli_directory', brand: 'feishu', appSecret: 'directory-secret' });
+    expect(JSON.parse(writes()[1][1].body).oncallGroup.identitySource).toBe('shared');
+    expect(input('oncallIdentityAppSecret').props.value).toBe('');
+    expect(saveButton().props.disabled).toBe(true);
+    change('oncallIdentityAppId', 'cli_other');
+    expect(saveButton().props.disabled).toBe(true);
+  });
+  it('can switch to the current bot without changing or deleting the shared app', async () => {
+    storedIdentity = { appId: 'cli_directory', brand: 'feishu', appSecretConfigured: true };
+    await render({ ...initialPolicy, identitySource: 'shared' } as any);
+    act(() => renderer.root.findByProps({ dataInput: 'oncallIdentitySource' }).props.onChange('bot'));
+    await save();
+    expect(writes().map(([url]) => url)).toEqual(['/api/bots/app/oncall-group']);
+    expect(JSON.parse(writes()[0][1].body).oncallGroup.identitySource).toBe('bot');
+    expect(storedIdentity.appId).toBe('cli_directory');
+  });
+  it('does not rewrite shared credentials after their save succeeds but the per-bot policy fails', async () => {
+    const original = fetcher.getMockImplementation()!;
+    fetcher.mockImplementationOnce(original);
+    await render();
+    act(() => renderer.root.findByProps({ dataInput: 'oncallIdentitySource' }).props.onChange('shared'));
+    change('oncallIdentityAppId', 'cli_directory'); change('oncallIdentityAppSecret', 'directory-secret');
+    let rejectPolicy = true;
+    fetcher.mockImplementation(async (url: string, options?: RequestInit) => url.endsWith('/oncall-group') && rejectPolicy
+      ? response({ error: 'temporarily unavailable' }, 503) : original(url, options));
+    await save();
+    expect(input('oncallIdentityAppSecret').props.value).toBe('');
+    rejectPolicy = false;
+    await save();
+    expect(writes().map(([url]) => url)).toEqual(['/api/oncall-identity', '/api/bots/app/oncall-group', '/api/bots/app/oncall-group']);
+  });
+  it('ignores an unfinished shared-app draft when switching back to the current bot', async () => {
+    await render();
+    act(() => renderer.root.findByProps({ dataInput: 'oncallIdentitySource' }).props.onChange('shared'));
+    change('oncallIdentityAppId', 'unfinished-app');
+    act(() => renderer.root.findByProps({ dataInput: 'oncallIdentitySource' }).props.onChange('bot'));
+    expect(saveButton().props.disabled).toBe(false);
+    await save();
+    expect(writes().map(([url]) => url)).toEqual(['/api/bots/app/oncall-group']);
+  });
+  it('retains saved global credentials without overwriting a policy changed during their save', async () => {
+    const original = fetcher.getMockImplementation()!;
+    let release!: () => void;
+    fetcher.mockImplementation(async (url: string, options?: RequestInit) => {
+      const response = await original(url, options);
+      if (url === '/api/oncall-identity' && options?.method === 'PUT') await new Promise<void>(resolve => { release = resolve; });
+      return response;
+    });
+    await render();
+    act(() => renderer.root.findByProps({ dataInput: 'oncallIdentitySource' }).props.onChange('shared'));
+    change('oncallIdentityAppId', 'cli_directory'); change('oncallIdentityAppSecret', 'directory-secret');
+    await act(async () => { saveButton().props.onClick(); });
+    expect(release).toBeTypeOf('function');
+    act(() => externallyUpdatePolicy({ ...initialPolicy, enabled: false }));
+    await act(async () => { release(); });
+    expect(writes().map(([url]) => url)).toEqual(['/api/oncall-identity']);
+    expect(storedIdentity.appSecretConfigured).toBe(true);
+    expect(renderer.root.findByProps({ dataInput: 'oncallIdentitySource' }).props.value).toBe('bot');
+  });
+  it('requires a real replacement secret when the password field contains only whitespace', async () => {
+    storedIdentity = { appId: 'cli_directory', brand: 'feishu', appSecretConfigured: true };
+    await render({ ...initialPolicy, identitySource: 'shared' } as any);
+    change('oncallIdentityAppSecret', '   ');
+    expect(saveButton().props.disabled).toBe(true);
+    expect(writes()).toHaveLength(0);
+  });
   it('sends connection and credential changes in one write and can check them immediately', async () => {
     await render();
     change('oncallEndpoint', 'https://new.test/chat/');
@@ -318,9 +422,13 @@ describe('Oncall unified save', () => {
   });
 
   it('does not allow a failed target read to overwrite persisted routing', async () => {
+    const original = fetcher.getMockImplementation()!;
     fetcher.mockImplementation(async (url: string) => url.endsWith('/oncall-target')
-      ? response({ error: 'read failed' }, 503) : response({ configured: true }));
+      ? response({ error: 'read failed' }, 503) : original(url));
     await render();
+    expect(renderer.root.findByProps({ role: 'alert' }).children.join('')).toContain('read failed');
+    expect(input('oncallEndpoint').props.value).toBe('https://oncall.example.test/chat/');
+    expect(renderer.root.findByProps({ className: 'bd-oncall-details bd-oncall-advanced' }).findByType('fieldset').props.disabled).toBe(false);
     expect(saveButton().props.disabled).toBe(true);
     expect(writes()).toHaveLength(0);
   });
