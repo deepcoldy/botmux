@@ -115,6 +115,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   __testOnly_setSuspendBackingVerifier();
+  vi.useRealTimers();
 });
 
 describe('idle-spin detector', () => {
@@ -291,6 +292,8 @@ describe('idle-spin detector', () => {
   });
 
   it('keeps streaks and retries when the mutation gate is busy', async () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+    vi.setSystemTime(now);
     const ds = makeDs('gated');
     const sessions = new Map([['gated', ds]]);
     const detector = createIdleSpinDetector({
@@ -312,7 +315,11 @@ describe('idle-spin detector', () => {
     });
     await admitted;
 
-    const first = await detector.tick(config({ consecutiveSamples: 1 }));
+    const firstTick = detector.tick(config({ consecutiveSamples: 1 }));
+    // Let sampling enqueue the gate timeout before advancing the clock.
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1);
+    const first = await firstTick;
     expect(first.gateBusy).toBe(true);
     expect(ds.worker).not.toBeNull();
     expect(detector.streaks().get('gated')).toBe(1);
@@ -320,6 +327,7 @@ describe('idle-spin detector', () => {
     release();
     await admission;
     const second = await detector.tick(config({ consecutiveSamples: 1 }));
+    expect(second.gateBusy).toBe(false);
     expect(second.suspended).toBe(1);
     expect(ds.worker).toBeNull();
   });
