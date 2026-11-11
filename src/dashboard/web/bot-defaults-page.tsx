@@ -45,6 +45,9 @@ import {
   type BotDefaultsSection,
   type BotDefaultsTab,
   botDefaultsSectionDomId,
+  codexArchiveInapplicableReason,
+  codexArchiveSectionVisible,
+  type CodexArchiveInapplicable,
   findBotDefaultsSection,
   parseBotDefaultsTab,
 } from './bot-defaults.js';
@@ -1163,8 +1166,8 @@ function BotDefaultsCard(props: {
               <CrossBotSection bot={bot} putCardPref={putCardPref} />
             </section>
             <section className="bd-tile" id={botDefaultsSectionDomId('session-cap')}><SessionCapSection bot={bot} patchBot={patchBot} /></section>
-            {/* 原生归档只作用于自有本地 Codex 会话（ownedLocalCodex），其它 CLI 不显示。 */}
-            {bot.cliId === 'codex' || bot.cliId === 'codex-app' ? (
+            {/* 原生归档只作用于自有本地 Codex 会话（ownedLocalCodex）；其它 CLI 只在留有显式覆盖时显示，以便清除。 */}
+            {codexArchiveSectionVisible(bot) ? (
               <section className="bd-tile" id={botDefaultsSectionDomId('codex-archive')}><CodexArchiveSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             {/* 提示缓存 TTL / 保活只对 Claude Code 生效（--settings promptCacheTtl + 注入保活轮）。 */}
@@ -4763,6 +4766,13 @@ function LarkToolBindingSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
 
 type ArchiveCodexChoice = 'inherit' | 'on' | 'off';
 
+const ARCHIVE_CODEX_INAPPLICABLE_KEYS = {
+  'not-codex': 'botDefaults.archiveCodexNotCodex',
+  wrapper: 'botDefaults.archiveCodexWrapper',
+  scratch: 'botDefaults.archiveCodexScratch',
+  backend: 'botDefaults.archiveCodexBackend',
+} as const satisfies Record<CodexArchiveInapplicable, string>;
+
 function archiveCodexChoice(value: boolean | null | undefined): ArchiveCodexChoice {
   return value === true ? 'on' : value === false ? 'off' : 'inherit';
 }
@@ -4794,6 +4804,7 @@ export function CodexArchiveSection(props: { bot: BotDefaultsRow; patchBot: Patc
   }
 
   const globalState = tr(bot.archiveCodexDefault === true ? 'botDefaults.archiveCodexStateOn' : 'botDefaults.archiveCodexStateOff');
+  const inapplicable = codexArchiveInapplicableReason(bot);
   return (
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionCodexArchive')}</h3>
@@ -4812,6 +4823,7 @@ export function CodexArchiveSection(props: { bot: BotDefaultsRow; patchBot: Patc
           </select>
         </label>
         <small>{tr('botDefaults.archiveCodexHelp')}</small>
+        {inapplicable ? <small className="bd-section-note" data-archive-codex-inapplicable={inapplicable}>{tr(ARCHIVE_CODEX_INAPPLICABLE_KEYS[inapplicable])}</small> : null}
         <StatusSpan status={status} attr={{ 'data-archive-codex-status': '' }} />
       </div>
     </section>

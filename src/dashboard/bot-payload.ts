@@ -361,7 +361,7 @@ export function sparseOverridesFromRawBotConfig(rawEntry: any): {
     grantDelegateBots: Array.isArray(rawEntry?.grantDelegateBots)
       ? rawEntry.grantDelegateBots.filter((x: unknown): x is string => typeof x === 'string')
       : undefined,
-    // 缺省继承全局：显式的开/关不从这里带回，离线行会显示成「跟随全局」。
+    // 显式开/关原样带回（否则 daemon 离线时会显示成「跟随全局」）；缺省或非法值不带，按跟随全局显示。
     archiveCodex: typeof rawEntry?.archiveCodex === 'boolean' ? rawEntry.archiveCodex : undefined,
   };
 }

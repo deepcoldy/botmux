@@ -2,7 +2,7 @@
 
 `sessionCleanup.archiveCodex` 缺省为 false，可在 Dashboard 设置页的空闲清理区域开启；它独立于定时清理的 enabled，同时适用于手动关闭、手动和定时清理。只改配置开关不会扫描或归档历史会话。
 
-每个 Bot 可在 `bots.json` 设置 `archiveCodex: true|false` 覆盖全局值；省略时继承全局开关。运行中使用 Dashboard「Bot 配置 → 会话 → Codex 原生归档」（跟随全局 / 开启 / 关闭，写入走 `PUT /api/bot-archive-codex`），或 `/config set archiveCodex on`、`/config set archiveCodex off`、`/config unset archiveCodex` 设置，`/config get archiveCodex` 显示 on / off / inherit。修改对后续关闭与清理立即生效，不需要重启；每次关闭在实际开始时冻结策略，途中改配置不改变本次操作。TTADK 等不支持 app-server 的 Bot 可单独关闭，其他 Bot 继续沿用全局配置。开关不影响已有归档 journal 的恢复，也不控制标题同步。
+每个 Bot 可在 `bots.json` 设置 `archiveCodex: true|false` 覆盖全局值；省略时继承全局开关。运行中使用 Dashboard「Bot 配置 → 会话 → Codex 原生归档」（跟随全局 / 开启 / 关闭，写入走 `PUT /api/bot-archive-codex`），或 `/config set archiveCodex on`、`/config set archiveCodex off`、`/config unset archiveCodex` 设置，`/config get archiveCodex` 显示 on / off / inherit。修改对后续关闭与清理立即生效，不需要重启；每次关闭在实际开始时冻结策略，途中改配置不改变本次操作。使用不支持 app-server 的 Codex 构建的 Bot 可单独关闭，其他 Bot 继续沿用全局配置；包装器启动（如 TTADK）、scratch 沙盒和非 pty/tmux 后端的会话本来就不做原生归档，Dashboard 对这类 Bot 会提示设置不起作用。开关不影响已有归档 journal 的恢复，也不控制标题同步。
 
 Dashboard 两处空闲清理 fanout 向现有 close RPC 传递 `idleCleanup: true`。Daemon 先完成普通关闭，再处理原生归档。Dashboard / CLI close RPC、`/close` 和飞书关闭卡片同样启用归档；休眠、重启、仓库替换和其它自动关闭路径不会归档。飞书卡片异步完成归档并通过话题消息提示失败，避免阻塞回调 ACK。关闭成功但归档失败，响应仍保留 `ok: true` 和独立的 `archiveError`，批量结果统计 `archiveFailed`；手动关闭/清理显示警告，定时清理记录日志。
 
