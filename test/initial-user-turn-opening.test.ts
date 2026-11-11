@@ -400,6 +400,7 @@ describe('empty-started session — first real business turn must use the new-to
     );
 
     const followUp = liveInputs()[0]!.content;
+    // Host metadata rides the hook envelope; the composer keeps only the user text.
     expect(followUp).toBe('继续');
     const envelope = claimPromptContext(
       ds.session.sessionId,
@@ -407,6 +408,7 @@ describe('empty-started session — first real business turn must use the new-to
       fingerprintPromptText(followUp),
       prefixOf(followUp),
     );
+    expect(envelope).toContain('<message_location message_id="om_live_resumed_hook_emphasis" placement="thread" root_message_id="om_live_resumed_hook_emphasis_root" />');
     expect(envelope).toContain(t('ai.followup.feishu_safe_emphasis', undefined, 'zh'));
   });
 
@@ -432,6 +434,7 @@ describe('empty-started session — first real business turn must use the new-to
     );
 
     const followUp = liveInputs()[0]!.content;
+    // Host metadata rides the hook envelope; the composer keeps only the user text.
     expect(followUp).toBe('继续');
     const envelope = claimPromptContext(
       ds.session.sessionId,
@@ -439,6 +442,7 @@ describe('empty-started session — first real business turn must use the new-to
       fingerprintPromptText(followUp),
       prefixOf(followUp),
     );
+    expect(envelope).toContain('<message_location message_id="om_live_resumed_transcript_hook_emphasis" placement="thread" root_message_id="om_live_resumed_transcript_hook_emphasis_root" />');
     expect(envelope).toContain('<botmux_formatting>');
     expect(envelope).toContain(t('ai.followup.feishu_safe_emphasis', undefined, 'zh'));
     expect(envelope).not.toContain('botmux send');

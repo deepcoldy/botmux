@@ -1746,6 +1746,7 @@ const RELAY_FLAGS_NOVAL = new Set([
 const RELAY_FLAGS_VAL = new Set([
   '--mention',
   '--quote',
+  '--reply-to',
   '--response-kind',
   '--expected-link',
   '--as',
@@ -2039,6 +2040,7 @@ export function buildRelayHostEnv(
   delete env.BOTMUX_ORIGIN_CHANNEL_ID;
   delete env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
   delete env.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
+  delete env.BOTMUX_REPLY_MESSAGE_ID;
   // Every host re-exec of a sandbox relay carries the route gate: routing
   // flags it forwards must be decided by the daemon, never trusted as given.
   env[SANDBOX_RELAY_ROUTE_GATE_ENV] = '1';
@@ -2095,6 +2097,7 @@ export function startOutboxWatcher(
           ok: true;
           origin: {
             turnId?: string;
+            replyMessageId?: string;
             dispatchAttempt?: number;
             /** The worker matched an unsettled Codex App ledger entry. The
              * host child must still find that exact entry before any provider
@@ -2253,6 +2256,8 @@ export function startOutboxWatcher(
       // the exact receipt/IM origin carried below.
       requestEnv.BOTMUX_HOST_RELAY_AUTHORIZED = '1';
       delete requestEnv.BOTMUX_TURN_ID;
+      delete requestEnv.BOTMUX_REPLY_MESSAGE_ID;
+      if (trustedOrigin?.replyMessageId) requestEnv.BOTMUX_REPLY_MESSAGE_ID = trustedOrigin.replyMessageId;
       delete requestEnv.BOTMUX_DISPATCH_ATTEMPT;
       if (trustedOrigin?.turnId !== undefined) requestEnv.BOTMUX_TURN_ID = trustedOrigin.turnId;
       if (trustedOrigin?.dispatchAttempt !== undefined) {

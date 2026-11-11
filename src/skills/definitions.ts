@@ -820,9 +820,10 @@ sandbox 内也可以用 \`--into <om_话题根消息id>\` 往已有话题追加�
 | \`--schedule-remove-self\` | 仅 scheduled turn + 标准 final；投递成功并落账后删除当前精确任务 |
 | \`--completion-proposal-file <path>\` | 仅与标准 final 同用；附一个 requester-only、24h 有效的二选一可选后续 |
 | \`--mention <open_id[:name]>\` | @mention，可重复。带 \`:name\` 时文本里的 \`@name\` 会被替换成 \<at\> 标签；只传 open_id 则在消息末尾追加 @。用 \`botmux bots list\` 查 open_id |
-| \`--mention-back\` | @ 回本轮触发消息的发送者（open_id 自动从会话取）。满足 @ 硬门 |
+| \`--mention-back\` | @ 回本次回复目标消息的发送者（open_id 自动从会话取，保留多参与者歧义检查）。满足 @ 硬门 |
 | \`--no-mention\` | 明确声明本条不 @ 任何人。满足 @ 硬门 |
-| \`--quote <message_id>\` | 引用指定消息（普通群）。默认引用本轮触发消息 |
+| \`--quote <message_id>\` | 引用指定消息（普通群）。默认跟随最近已注入消息的位置；需要回复较早消息时用 --reply-to |
+| \`--reply-to <message_id>\` | 按当前会话已接收消息的位置回复；不改变 final 归属。不能与显式 --quote / --top-level / --chat-id / --into 混用 |
 | \`--no-quote\` | 不引用，发独立消息（普通群） |
 | \`--urgent[=app\\|sms\\|phone]\` | 加急本轮触发者，必须与 \`--mention-back\` 同用；默认应用内加急 |
 | \`--top-level\` | 发顶层消息（不回复进当前话题）；自动跳过"发送给/cc" footer |
