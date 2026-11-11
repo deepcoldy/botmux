@@ -28,6 +28,7 @@ export interface OncallGroupRequest {
   conversationScopePending?: boolean;
   flowId?: string;
   openChatId?: string;
+  inviteLink?: string;
   submittedAtMs?: number;
   operatorOpenId?: string;
   forwarded?: string[];
@@ -58,7 +59,7 @@ export function pendingOncallMessageIds(request: OncallGroupRequest | undefined)
 }
 
 function cardState(request: OncallGroupRequest): string {
-  return JSON.stringify([request.status, request.openChatId, request.handoffError, request.conversationScopePending,
+  return JSON.stringify([request.status, request.openChatId, request.inviteLink, request.handoffError, request.conversationScopePending,
     request.restrictedMessageIds, pendingOncallMessageIds(request)]);
 }
 
@@ -167,10 +168,11 @@ export class OncallGroupStore {
       const request = read<OncallGroupRequest>(key)
         ?? ([...legacyFiles.get(key) ?? []].some(file => requests.has(file)) ? this.legacyRequest(source) : undefined);
       return request?.status === 'succeeded'
-        && Date.now() - (request.submittedAtMs ?? 0) < 24 * 60 * 60_000
-        && (request.cardRefreshPending || (request.handoffError !== 'restricted_merge'
-          && (request.conversationScopePending || (request.forwardMode !== 'none' && !request.forwardingBlocked
-            && pendingOncallMessageIds(request).length > 0))));
+        && (((!request.inviteLink || request.cardRefreshPending) && !!request.openChatId)
+          || (Date.now() - (request.submittedAtMs ?? 0) < 24 * 60 * 60_000
+            && (request.cardRefreshPending || (request.handoffError !== 'restricted_merge'
+              && (request.conversationScopePending || (request.forwardMode !== 'none' && !request.forwardingBlocked
+                && pendingOncallMessageIds(request).length > 0))))));
     }).map(([, source]) => source);
   }
 

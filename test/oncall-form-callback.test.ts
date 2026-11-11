@@ -7,16 +7,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   config: { session: { dataDir: '' } },
   bot: { config: { brand: 'feishu', oncallGroup: {} as any } },
-  reply: vi.fn(), update: vi.fn(), withdraw: vi.fn(), membership: vi.fn(), mode: vi.fn(), ephemeral: vi.fn(), remove: vi.fn(), sender: vi.fn(), detail: vi.fn(), forward: vi.fn(), merge: vi.fn(), thread: vi.fn(), chat: vi.fn(),
+  invite: vi.fn(), reply: vi.fn(), update: vi.fn(), withdraw: vi.fn(), membership: vi.fn(), mode: vi.fn(), ephemeral: vi.fn(), remove: vi.fn(), sender: vi.fn(), detail: vi.fn(), forward: vi.fn(), merge: vi.fn(), thread: vi.fn(), chat: vi.fn(),
 }));
 vi.mock('../src/im/lark/md-card.js', () => ({ omitReplyCardImages: (card: string) => card }));
 vi.mock('../src/config.js', () => ({ config: mocks.config }));
 vi.mock('../src/bot-registry.js', () => ({ getBot: () => mocks.bot }));
-vi.mock('../src/im/lark/client.js', () => ({ getChatModeStrict: mocks.mode, sendEphemeralCard: mocks.ephemeral,
+vi.mock('../src/im/lark/client.js', () => ({ getChatInviteLink: mocks.invite, getChatModeStrict: mocks.mode, sendEphemeralCard: mocks.ephemeral,
   deleteEphemeralCard: mocks.remove, deleteMessage: mocks.withdraw, replyMessage: mocks.reply, updateMessage: mocks.update, resolveSender: mocks.sender, getMessageDetail: mocks.detail,
   forwardMessage: mocks.forward, mergeForwardMessages: mocks.merge, isBotInChat: mocks.membership, listThreadMessagesWithContext: mocks.thread, listChatMessagesUntil: mocks.chat }));
 vi.mock('../src/im/lark/identity-cache.js', () => ({ resolveSender: mocks.sender }));
-import { attachOncallGroupButton, recordOncallGroupDelivery, handleOncallGroupAction, handleOncallFormAction, snapshotOncallConversation, forwardOncallConversation, reconcileOncallReplyCard, retryPendingOncallHandoffs, refreshOncallSessionCard } from '../src/im/lark/oncall-group.js';
+import { attachOncallGroupButton, recordOncallGroupDelivery, handleOncallGroupAction, handleOncallFormAction, snapshotOncallConversation, forwardOncallConversation, reconcileOncallReplyCard, retryPendingOncallHandoffs, refreshOncallSessionCard, prepareOncallGroupInvite } from '../src/im/lark/oncall-group.js';
 import { OncallGroupStore, type OncallGroupSource } from '../src/services/oncall-group-store.js';
 import { OncallFormStore } from '../src/services/oncall-form-store.js';
 import { larkApiError } from '../src/im/lark/lark-errors.js';
@@ -29,6 +29,7 @@ const category = { id: 34, name: 'category', tenant_id: 12, type_action: 'create
 const response = (data: any) => new Response(JSON.stringify({ code: 0, data }));
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.invite.mockReset().mockResolvedValue('https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=invite-oc_created');
   dir = mkdtempSync(join(tmpdir(), 'oncall-form-callback-')); mocks.config.session.dataDir = dir;
   mocks.bot.config.oncallGroup = { enabled: true, chatIds: ['oc_source'], flowMode: 'classify', formDisplay: 'private_card' };
   mocks.membership.mockResolvedValue(true); mocks.mode.mockResolvedValue('group'); mocks.sender.mockResolvedValue({ email: 'owner@example.test' });
@@ -56,7 +57,7 @@ describe('direct Oncall confirmation', () => {
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
     mocks.bot.config.oncallGroup.flowMode = 'classify'; expect(compose().confirm).toBeUndefined();
     const groups = new OncallGroupStore(dir); groups.claim(source, 'ou_owner', { messageIds: [], cutoffMs: Date.now(), forwardMode: 'none' });
-    groups.finish(source, { status: 'succeeded', openChatId: 'oc_created' }, groups.getRequest(source)!.attemptId);
+    groups.finish(source, { status: 'succeeded', openChatId: 'oc_created', inviteLink: 'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=invite-oc_created' }, groups.getRequest(source)!.attemptId);
     mocks.bot.config.oncallGroup.flowMode = 'direct';
     expect(compose().confirm).toBeUndefined(); expect(compose().behaviors[0].type).toBe('open_url');
   });
@@ -97,7 +98,7 @@ describe('personal Oncall form callbacks', () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
   it('restores the existing group link after feedback and does not reactivate an older source', () => {
-    const store = new OncallGroupStore(dir); store.claim(source); store.finish(source, { status: 'succeeded', openChatId: 'oc_created' }, store.getRequest(source)!.attemptId);
+    const store = new OncallGroupStore(dir); store.claim(source); store.finish(source, { status: 'succeeded', openChatId: 'oc_created', inviteLink: 'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=invite-oc_created' }, store.getRequest(source)!.attemptId);
     const base = { schema: '2.0', body: { elements: [] } };
     const restored = reconcileOncallReplyCard('app', source.messageId, base);
     const button = restored.body.elements[0].columns.at(-1).elements.find((e: any) => e.tag === 'button');
@@ -119,7 +120,7 @@ describe('personal Oncall form callbacks', () => {
     const second = { ...source, questionId: 'om_next', messageId: 'om_newest', turnNumber: 2, cardJson: JSON.stringify(base) };
     groups.registerTurn('app', 'session', second.questionId); groups.recordSource(second);
     groups.claim(second, 'ou_owner', { messageIds: [], cutoffMs: Date.now(), forwardMode: 'none' });
-    groups.finish(second, { status: 'succeeded', openChatId: 'oc_created' }, groups.getRequest(second)!.attemptId);
+    groups.finish(second, { status: 'succeeded', openChatId: 'oc_created', inviteLink: 'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=invite-oc_created' }, groups.getRequest(second)!.attemptId);
     await refreshOncallSessionCard(second);
     expect(mocks.update.mock.calls.map(call => call[1]).sort()).toEqual(['om_newest', 'om_reply']);
     for (const [, , raw] of mocks.update.mock.calls) {
@@ -138,7 +139,7 @@ describe('personal Oncall form callbacks', () => {
     groups.registerTurn('app', 'session', 'om_next');
     groups.recordSource({ ...source, questionId: 'om_next', messageId: 'om_newest', turnNumber: 2 });
     groups.claim(source, 'ou_owner', { messageIds: [], cutoffMs: Date.now(), forwardMode: 'none' });
-    groups.finish(source, { status: 'succeeded', openChatId: 'oc_created' }, groups.getRequest(source)!.attemptId);
+    groups.finish(source, { status: 'succeeded', openChatId: 'oc_created', inviteLink: 'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=invite-oc_created' }, groups.getRequest(source)!.attemptId);
     recordOncallGroupDelivery(dir, { ...source, turnNumber: 1, card: base });
     expect(groups.latest('app', 'session')?.messageId).toBe('om_newest');
     const card = reconcileOncallReplyCard('app', source.messageId, base);
@@ -259,7 +260,7 @@ describe('original conversation handoff', () => {
   it('keeps an uncertain forward durable, retries with the same uuid inside the window, and blocks expired retries', async () => {
     vi.useFakeTimers(); vi.setSystemTime(1000);
     const store = new OncallGroupStore(dir); store.claim(source, 'ou_owner', { messageIds: ['om_question', 'om_reply'], cutoffMs: 1000 });
-    const attempt = store.getRequest(source)!.attemptId; store.finish(source, { status: 'succeeded', openChatId: 'oc_created' }, attempt);
+    const attempt = store.getRequest(source)!.attemptId; store.finish(source, { status: 'succeeded', openChatId: 'oc_created', inviteLink: 'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=invite-oc_created' }, attempt);
     mocks.forward.mockRejectedValueOnce(new Error('timeout')); await forwardOncallConversation(source);
     expect(store.getRequest(source)?.forwarding?.messageId).toBe('om_question');
     await forwardOncallConversation(source);
@@ -344,7 +345,7 @@ describe('topic classification card and group handoff', () => {
     expect(store.pendingHandoffs('app')).toHaveLength(0);
     const creates = fetcher.mock.calls.filter(call => call[0].endsWith('/chat/'));
     expect(creates).toHaveLength(1); expect(JSON.parse(creates[0][1].body)).toMatchObject({ type_id: 34, region: 'cn', priority: 'P2' });
-    expect(mocks.update.mock.calls.some(call => call[1] === 'om_reply' && call[2].includes('openChatId=oc_created'))).toBe(true);
+    expect(mocks.update.mock.calls.some(call => call[1] === 'om_reply' && call[2].includes('link_token=invite-oc_created'))).toBe(true);
     // A late callback only retries retirement, never creates another group.
     const closed = await handleOncallFormAction(event('oncall_group_form_submit', selected), 'app');
     mocks.withdraw.mockResolvedValueOnce(false);
@@ -389,7 +390,7 @@ describe('Oncall forwarding delivery mode', () => {
 
   const seed = (ids: string[], mode: 'merge' | 'individual') => {
     const store = new OncallGroupStore(dir); store.claim(source, 'ou_owner', { messageIds: ids, cutoffMs: Date.now(), forwardMode: mode });
-    store.finish(source, { status: 'succeeded', openChatId: 'oc_created' }, store.getRequest(source)!.attemptId); return store;
+    store.finish(source, { status: 'succeeded', openChatId: 'oc_created', inviteLink: 'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=invite-oc_created' }, store.getRequest(source)!.attemptId); return store;
   };
   const handoffElements = () => JSON.parse(attachOncallGroupButton(JSON.stringify({ schema: '2.0', body: { elements: [] } }),
     mocks.bot.config.oncallGroup, source.chatId, 'group', {
@@ -489,5 +490,115 @@ describe('Oncall forwarding delivery mode', () => {
     mocks.merge.mockResolvedValueOnce({ messageId: 'om_recovered', invalidMessageIds: [] });
     await forwardOncallConversation(source); expect(mocks.merge.mock.calls.at(-1)![1]).toEqual(['om_missing']);
     expect(store.getRequest(source)?.forwarded).toEqual(['om_q', 'om_missing']);
+  });
+});
+
+
+describe('public entry to a created Oncall group', () => {
+  function seedWithoutInvite() {
+    const groups = new OncallGroupStore(dir);
+    groups.claim(source, 'ou_owner', { messageIds: [], cutoffMs: Date.now(), forwardMode: 'none' });
+    groups.finish(source, { status: 'succeeded', openChatId: 'oc_created' }, groups.getRequest(source)!.attemptId);
+    return groups;
+  }
+  it('lets a different clicker enter after the feature is disabled without resolving an email or creating a ticket', async () => {
+    const groups = seedWithoutInvite(); mocks.bot.config.oncallGroup.enabled = false;
+    vi.stubEnv('ONCALL_SERVICE_SECRET', '');
+    const original = groups.getRequest(source)!;
+    const result = await handleOncallGroupAction(event('oncall_group_join', undefined, 'ou_other'), 'app');
+    expect(result.toast.type).toBe('success');
+    expect(mocks.update).not.toHaveBeenCalled();
+    await result.afterAck();
+    expect(mocks.invite).toHaveBeenCalledWith('app', 'oc_created');
+    expect(mocks.sender).not.toHaveBeenCalled(); expect(fetcher).not.toHaveBeenCalled();
+    const after = groups.getRequest(source)!;
+    expect(after).toMatchObject({ status:'succeeded',operatorOpenId:'ou_owner',openChatId:'oc_created',attemptId:original.attemptId });
+    expect(after.inviteLink).toContain('/client/chat/chatter/add_by_link?');
+    const card = JSON.parse(mocks.update.mock.calls.at(-1)![2]);
+    const button = card.body.elements[0].columns.at(-1).elements[0];
+    expect(button.behaviors).toEqual([{type:'open_url',default_url:after.inviteLink}]);
+    expect(button.confirm).toBeUndefined();
+  });
+  it('retries invitation failure on the same existing group and shares one link across concurrent clickers', async () => {
+    const groups=seedWithoutInvite(); mocks.invite.mockRejectedValueOnce(Error('not in group'));
+    expect((await handleOncallGroupAction(event('oncall_group_join',undefined,'ou_other'),'app')).toast.type).toBe('error');
+    expect(groups.getRequest(source)?.inviteLink).toBeUndefined();
+    const results=await Promise.all(['ou_one','ou_two'].map(id=>handleOncallGroupAction(event('oncall_group_join',undefined,id),'app')));
+    expect(results.map(r=>r.toast.type)).toEqual(['success','success']);
+    expect(mocks.invite).toHaveBeenCalledTimes(2);expect(fetcher).not.toHaveBeenCalled();
+    expect(groups.getRequest(source)).toMatchObject({status:'succeeded',openChatId:'oc_created',operatorOpenId:'ou_owner'});
+  });
+  it('rejects missing operators, forged source chats and uncreated group entries', async () => {
+    const groups=seedWithoutInvite();
+    const forged=event('oncall_group_join');forged.context.open_chat_id='oc_other';
+    for(const e of [forged,event('oncall_group_join',undefined,'')])expect((await handleOncallGroupAction(e,'app')).toast.type).toBe('error');
+    expect(mocks.invite).not.toHaveBeenCalled();
+    expect(groups.getRequest(source)?.inviteLink).toBeUndefined();
+    const unknown=event('oncall_group_join');unknown.context.open_message_id='om_missing';
+    expect((await handleOncallGroupAction(unknown,'app')).toast.type).toBe('error');
+  });
+  it('keeps retrying an unavailable invite after its fallback card has been acknowledged',async()=>{
+    const groups=seedWithoutInvite();mocks.invite.mockRejectedValueOnce(Error('not in group'));
+    await refreshOncallSessionCard(source);
+    expect(groups.getRequest(source)?.cardRefreshPending).toBe(false);
+    expect(groups.getRequest(source)?.inviteLink).toBeUndefined();
+    await retryPendingOncallHandoffs('app');
+    expect(groups.getRequest(source)?.inviteLink).toContain('add_by_link');
+    expect(groups.pendingHandoffs('app')).toEqual([]);
+  });
+  it('does not acknowledge an old rendered state after its invitation changes',async()=>{
+    const groups=seedWithoutInvite();const before=groups.getRequest(source)!;
+    groups.markCardsRefreshed(source,before);
+    expect(groups.getRequest(source)?.cardRefreshPending).toBe(false);
+    groups.finish(source,{status:'succeeded',inviteLink:'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=invite-oc_created'},before.attemptId);
+    groups.markCardsRefreshed(source,before);
+    expect(groups.getRequest(source)?.cardRefreshPending).toBe(true);
+  });
+  it.each(['invite-waits','forward-waits'])('retains partial handoff receipts and the invite when %s',async order=>{
+    const groups=new OncallGroupStore(dir);
+    groups.claim(source,'ou_owner',{messageIds:['om_done','om_question'],cutoffMs:Date.now(),forwardMode:'individual'});
+    groups.finish(source,{status:'succeeded',openChatId:'oc_created',forwarded:['om_done'],forwardedMessageIds:{om_done:'om_forwarded_done'}},groups.getRequest(source)!.attemptId);
+    let release!:()=>void;
+    const waiting=new Promise<void>(resolve=>{release=resolve;});
+    const link='https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=invite-oc_created';
+    if(order==='invite-waits') {
+      mocks.invite.mockImplementationOnce(async()=>{await waiting;return link;});
+      const invite=prepareOncallGroupInvite(source);await vi.waitFor(()=>expect(mocks.invite).toHaveBeenCalledOnce());
+      await forwardOncallConversation(source);release();await invite;
+    } else {
+      mocks.forward.mockImplementationOnce(async()=>{await waiting;return 'om_forwarded';});
+      const forward=forwardOncallConversation(source);await vi.waitFor(()=>expect(mocks.forward).toHaveBeenCalledOnce());
+      await prepareOncallGroupInvite(source);release();await forward;
+    }
+    expect(groups.getRequest(source)).toMatchObject({inviteLink:link,forwarded:['om_done','om_question'],forwardedMessageIds:{om_done:'om_forwarded_done',om_question:'om_forwarded'}});
+  });
+  it('backfills an old invite without forwarding conversations beyond the handoff window',async()=>{
+    const groups=new OncallGroupStore(dir);
+    groups.claim(source,'ou_owner',{messageIds:['om_question'],cutoffMs:Date.now()-25*60*60_000,forwardMode:'individual'});
+    groups.finish(source,{status:'succeeded',openChatId:'oc_created'},groups.getRequest(source)!.attemptId);
+    groups.markCardsRefreshed(source,groups.getRequest(source)!);
+    await retryPendingOncallHandoffs('app');
+    expect(groups.getRequest(source)?.inviteLink).toContain('add_by_link');
+    expect(mocks.update).toHaveBeenCalled();
+    expect(mocks.forward).not.toHaveBeenCalled();expect(mocks.membership).not.toHaveBeenCalled();
+  });
+  it('retries an old invitation card patch after disabling new Oncall creation',async()=>{
+    const groups=new OncallGroupStore(dir);
+    groups.claim(source,'ou_owner',{messageIds:[],cutoffMs:Date.now()-25*60*60_000,forwardMode:'none'});
+    groups.finish(source,{status:'succeeded',openChatId:'oc_created'},groups.getRequest(source)!.attemptId);
+    mocks.bot.config.oncallGroup.enabled=false;mocks.update.mockRejectedValueOnce(Error('PATCH unavailable'));
+    await retryPendingOncallHandoffs('app');
+    expect(groups.getRequest(source)).toMatchObject({cardRefreshPending:true,inviteLink:expect.stringContaining('add_by_link')});
+    await retryPendingOncallHandoffs('app');
+    expect(mocks.update).toHaveBeenCalledTimes(2);expect(mocks.invite).toHaveBeenCalledOnce();
+    expect(groups.getRequest(source)?.cardRefreshPending).toBe(false);
+    expect(mocks.forward).not.toHaveBeenCalled();
+  });
+  it('prepares missing invites even when the handoff mode is none',async()=>{
+    const groups=seedWithoutInvite();
+    await retryPendingOncallHandoffs('app');
+    expect(groups.getRequest(source)?.inviteLink).toContain('add_by_link');
+    expect(groups.pendingHandoffs('app')).toEqual([]);
+    expect(mocks.forward).not.toHaveBeenCalled();expect(mocks.sender).not.toHaveBeenCalled();
   });
 });

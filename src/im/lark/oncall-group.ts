@@ -19,21 +19,21 @@ import { chatAppLink } from './lark-hosts.js';
 import type { CardActionData } from './card-handler.js';
 import { extractLarkBusinessCode, LARK_CODE_FORWARD_RESTRICTED } from './lark-errors.js';
 
-export function buildOncallGroupColumn(options: { href?: string; status?: string; disabled?: boolean; retryForward?: boolean; handoffStatus?: string; confirmText?: string } = {}): Record<string, any> {
+export function buildOncallGroupColumn(options: { href?: string; status?: string; joinGroup?: boolean; disabled?: boolean; retryForward?: boolean; handoffStatus?: string; confirmText?: string } = {}): Record<string, any> {
   return { tag: 'column', element_id: 'botmux_oncall_group_column', width: 'auto', direction: 'horizontal',
     horizontal_spacing: '8px', vertical_align: 'center', padding: '0px', elements: [{
       tag: 'button', text: { tag: 'plain_text', content: options.status ?? '转人工' }, type: 'default', size: 'small',
-      ...(options.href && options.status ? { icon: { tag: 'standard_icon', token: 'chat_outlined', color: 'grey' } } : {}),
+      ...((options.href || options.joinGroup) && options.status ? { icon: { tag: 'standard_icon', token: 'chat_outlined', color: 'grey' } } : {}),
       ...(options.disabled ? { disabled: true } : {}),
       ...(options.confirmText ? { confirm: { title: { tag: 'plain_text', content: '确认发起人工 Oncall？' }, text: { tag: 'plain_text', content: options.confirmText } } } : {}),
       behaviors: options.href ? [{ type: 'open_url', default_url: options.href }]
-        : [{ type: 'callback', value: { action: 'oncall_group_create' } }],
+        : [{ type: 'callback', value: { action: options.joinGroup ? 'oncall_group_join' : 'oncall_group_create' } }],
     }, ...(options.handoffStatus ? [{ tag: 'markdown', text_size: 'notation', content: `<font color='grey'>${options.handoffStatus}</font>` }] : []),
     ...(options.retryForward ? [{ tag: 'button', type: 'default', size: 'small', text: { tag: 'plain_text', content: '重试转交' },
       behaviors: [{ type: 'callback', value: { action: 'oncall_group_forward' } }] }] : [])] };
 }
 
-export interface OncallCardContext { appId: string; sessionId: string; questionId: string; phase: 'first' | 'final'; nativeLink?: string; messageId?: string }
+export interface OncallCardContext { appId: string; sessionId?: string; questionId: string; phase: 'first' | 'final'; nativeLink?: string; messageId?: string }
 
 export function stripOncallGroupButton(raw: string): string {
   const card = JSON.parse(raw);
@@ -52,9 +52,9 @@ export function attachOncallGroupButton(raw: string, policy: OncallGroupPolicy |
     const store = new OncallGroupStore(config.session.dataDir);
     const request = store.getRequest({ ...context, chatId, messageId: '', answer: '' });
     if (chatType === 'p2p' || (!oncallGroupEnabled(policy, chatId) && request?.status !== 'succeeded')) return raw;
-    const turnNumber = store.registerTurn(context.appId, context.sessionId, context.questionId, { chatId });
+    const turnNumber = context.sessionId ? store.registerTurn(context.appId, context.sessionId, context.questionId, { chatId }) : 1;
     if (request?.status === 'succeeded' && request.openChatId) options = {
-      href: chatAppLink(request.openChatId, getBot(context.appId).config.brand), status: '进入人工 Oncall 群',
+      href: request.inviteLink, joinGroup: true, status: '进入人工 Oncall 群',
       retryForward: request.forwardMode !== 'none' && request.handoffError !== 'restricted_merge'
         && (request.conversationScopePending === true || pendingOncallMessageIds(request).length > 0),
       handoffStatus: request.forwardMode === 'none' ? undefined
@@ -70,7 +70,7 @@ export function attachOncallGroupButton(raw: string, policy: OncallGroupPolicy |
       else if (policy?.flowMode === 'classify' && (policy.formDisplay ?? 'native') === 'native' && context.nativeLink) options.href = context.nativeLink;
     }
   } else if (chatType === 'p2p' || !oncallGroupEnabled(policy, chatId)) return raw;
-  if ((policy?.flowMode ?? 'direct') === 'direct' && !options.href && !options.disabled) {
+  if ((policy?.flowMode ?? 'direct') === 'direct' && !options.href && !options.joinGroup && !options.disabled) {
     let destination = '使用管理员预设的业务线、区域和问题分类。';
     if (context) {
       try {
@@ -111,7 +111,7 @@ export function recordOncallGroupDelivery(dataDir: string, { card, ...source }: 
   try {
     const store = new OncallGroupStore(dataDir);
     if (source.sessionId && !oncallGroupEnabled(getBot(source.appId).config.oncallGroup, source.chatId) && !store.getRequest(source)) return;
-    store.recordSource(source.sessionId ? { ...source, cardJson: JSON.stringify(card) } : source);
+    store.recordSource({ ...source, cardJson: JSON.stringify(card) });
   }
   catch { logger.warn('[oncall-group] Could not index the delivered card; the answer must not be resent'); }
 }
@@ -120,7 +120,7 @@ export function recordOncallGroupDelivery(dataDir: string, { card, ...source }: 
  * session state, including cards from earlier turns. */
 export function reconcileOncallReplyCard(appId: string, messageId: string, card: Record<string, any>): Record<string, any> {
   const source = new OncallGroupStore(config.session.dataDir).findSource(appId, messageId);
-  if (!source?.sessionId) return card;
+  if (!source) return card;
   const raw = JSON.stringify(card);
   return JSON.parse(attachOncallGroupButton(raw, getBot(appId).config.oncallGroup, source.chatId, 'group', {
     appId, sessionId: source.sessionId, questionId: source.questionId, phase: 'final', nativeLink: source.nativeLink, messageId,
@@ -131,6 +131,25 @@ export async function handleOncallGroupAction(data: CardActionData, appId: strin
   const store = new OncallGroupStore(config.session.dataDir);
   let source: OncallGroupSource | undefined;
   try { source = store.findSource(appId, data.context?.open_message_id ?? ''); } catch { /* invalid source is rejected below */ }
+  if (data.action?.value?.action === 'oncall_group_join') {
+    if (!source || (data.context?.open_chat_id && data.context.open_chat_id !== source.chatId)
+      || !data.operator?.open_id?.startsWith('ou_') || store.getRequest(source)?.status !== 'succeeded') {
+      return oncallError(new Error('人工群入口已失效，请从原结果卡进入'));
+    }
+    try {
+      await prepareOncallGroupInvite(source);
+      return {
+        toast: { type: 'success', content: '入群邀请已就绪，请再次点击进入人工群' },
+        afterAck: async () => {
+          // Callback completion can restore the old view if this patch precedes its ACK.
+          await refreshOncallSessionCard(source);
+          if (!source.cardJson && !source.sessionId) {
+            await replyMessage(appId, source.messageId, `人工 Oncall 群入群邀请：${store.getRequest(source)!.inviteLink}`, 'text', true);
+          }
+        },
+      };
+    } catch { return oncallError(new Error('人工群入群邀请暂不可用，请联系管理员将机器人加入人工群并允许分享群')); }
+  }
   const bot = getBot(appId).config;
   const policySnapshot = JSON.stringify(bot.oncallGroup);
   if (!source || !oncallGroupEnabled(bot.oncallGroup, source.chatId)
@@ -204,7 +223,9 @@ export async function handleOncallGroupAction(data: CardActionData, appId: strin
       }
       result = store.getRequest(source);
     }
-    text = result?.status === 'succeeded' && result.openChatId ? `Oncall 群：${chatAppLink(result.openChatId, bot.brand)}`
+    if (result?.status === 'succeeded') await prepareOncallGroupInvite(source).catch(() => {});
+    const invite = store.getRequest(source)?.inviteLink;
+    text = result?.status === 'succeeded' && result.openChatId ? `Oncall 群：${invite ?? chatAppLink(result.openChatId, bot.brand)}`
       : result?.status === 'failed' ? '拉起 Oncall 群失败，可再次点击重试'
         : '建群请求已提交，暂未确认结果，请勿重复创建；若长时间无结果，请联系管理员核对';
   } catch (error) {
@@ -212,7 +233,10 @@ export async function handleOncallGroupAction(data: CardActionData, appId: strin
     text = error instanceof Error ? error.message : 'Oncall 建群暂不可用';
   }
   if (source.sessionId) await refreshOncallSessionCard(source).catch(() => logger.warn('[oncall-group] Latest card refresh pending'));
-  else await replyMessage(appId, source.messageId, text, 'text', true);
+  else {
+    if (store.getRequest(source)?.status === 'succeeded') await refreshOncallSessionCard(source).catch(() => {});
+    await replyMessage(appId, source.messageId, text, 'text', true);
+  }
 }
 
 const nativeLinks = new Map<string, Promise<string | undefined>>();
@@ -437,8 +461,21 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
   } catch (error) { return oncallError(error); }
 }
 
+/** One permanent invitation per created group; failures never recreate a ticket. */
+export async function prepareOncallGroupInvite(source: OncallGroupSource): Promise<void> {
+  const groups = new OncallGroupStore(config.session.dataDir);
+  await withFileLock(join(config.session.dataDir, 'oncall-groups', `invite-${groups.handoffKey(source)}`), async () => {
+    const request = groups.getRequest(source);
+    if (request?.status !== 'succeeded' || !request.openChatId || request.inviteLink) return;
+    const { getChatInviteLink } = await import('./client.js');
+    const inviteLink = await getChatInviteLink(source.appId, request.openChatId);
+    groups.finish(source, { status: 'succeeded', openChatId: request.openChatId, inviteLink }, request.attemptId);
+  });
+}
+
 export async function refreshOncallSessionCard(source: OncallGroupSource): Promise<void> {
   const groups = new OncallGroupStore(config.session.dataDir);
+  await prepareOncallGroupInvite(source).catch(() => logger.warn('[oncall-group] Native group invitation is unavailable; retrying with the existing group'));
   const beforeRefresh = groups.getRequest(source);
   const { TurnReplyCardStore } = await import('../../services/turn-reply-card.js');
   const client = await import('./client.js');
@@ -448,8 +485,8 @@ export async function refreshOncallSessionCard(source: OncallGroupSource): Promi
   for (const carrier of carriers) {
     const key = carrier.sessionId ? { larkAppId: carrier.appId, sessionId: carrier.sessionId,
       turnId: carrier.questionId, dispatchAttempt: carrier.dispatchAttempt } : undefined;
-    const context: OncallCardContext | undefined = carrier.sessionId ? { appId: carrier.appId, sessionId: carrier.sessionId,
-      questionId: carrier.questionId, phase: 'final', nativeLink: carrier.nativeLink, messageId: carrier.messageId } : undefined;
+    const context: OncallCardContext = { appId: carrier.appId, sessionId: carrier.sessionId,
+      questionId: carrier.questionId, phase: 'final', nativeLink: carrier.nativeLink, messageId: carrier.messageId };
     const compose = (raw: string) => attachOncallGroupButton(raw, getBot(carrier.appId).config.oncallGroup, carrier.chatId, 'group', context);
     const record = key ? cards.read(key) : undefined;
     try {
@@ -613,10 +650,13 @@ export async function retryPendingOncallHandoffs(appId: string, owns: () => bool
   const store = new OncallGroupStore(config.session.dataDir);
   for (const source of store.pendingHandoffs(appId)) {
     if (!owns()) return;
-    if (!oncallGroupEnabled(getBot(appId).config.oncallGroup, source.chatId)) continue;
     const before = JSON.stringify(store.getRequest(source));
     try {
-      await forwardOncallConversation(source, () => owns() && oncallGroupEnabled(getBot(appId).config.oncallGroup, source.chatId));
+      await prepareOncallGroupInvite(source).catch(() => {});
+      // Backfill old invite buttons without re-opening the expired handoff window.
+      if (Date.now() - (store.getRequest(source)?.submittedAtMs ?? 0) < 24 * 60 * 60_000) {
+        await forwardOncallConversation(source, () => owns() && oncallGroupEnabled(getBot(appId).config.oncallGroup, source.chatId));
+      }
       if (JSON.stringify(store.getRequest(source)) !== before || store.getRequest(source)?.cardRefreshPending) await refreshOncallSessionCard(source);
     } catch { logger.warn('[oncall-group] Handoff reconciliation will retry; no new group is created'); }
   }
