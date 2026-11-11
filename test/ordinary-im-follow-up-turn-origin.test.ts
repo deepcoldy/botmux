@@ -266,11 +266,23 @@ describe('ordinary IM follow-up turn origin', () => {
     expect(workerPool.hasUnacceptedCliInput(s.ds)).toBe(true);
     expect(s.ds.worker).toBe(s.worker);
 
-    // Once the worker reports its queue drained, the claim is cashed in.
+    // Once the worker reports its queue drained, the input is no longer
+    // unaccepted — but the follow-up turn has not reported its terminal yet.
+    // The queued suspend must stay alive until that turn's reply is safe
+    // (0d649d5fd): cashing it in here could still drop the follow-up answer.
     s.ws.pendingMessages.length = 0;
     await s.scope.run(s.binding, async () => { s.ws.publishCliInputBacklog(); await s.drain(); });
     await new Promise(resolve => setImmediate(resolve));
     expect(workerPool.hasUnacceptedCliInput(s.ds)).toBe(false);
+    expect(s.ds.pendingSuspendReason).toBe('cli_install_changed');
+    expect(s.ds.worker).toBe(s.worker);
+
+    // Once the follow-up turn itself terminates and the screen is idle with no
+    // reply still in flight, the checkpoint fulfills the queued suspend.
+    const followUpCapability = await s.writeTurn(FOLLOW_UP, caller('ou_follow_up_sender'), false);
+    await s.finishTurn(FOLLOW_UP, followUpCapability);
+    await s.scope.run(s.binding, () => s.toDaemon({ type: 'screen_update', status: 'idle', content: '' }));
+    await new Promise(resolve => setImmediate(resolve));
     expect(s.ds.pendingSuspendReason).toBeUndefined();
   });
 
