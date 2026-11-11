@@ -35984,7 +35984,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   });
   setDecisionBoardService(decisionBoard);
   const projectImports = installProjectImportRuntime({
-    listActiveSessions,
+    listActiveSessions: () => [...activeSessions.values()],
     findActiveBySessionId,
     markEnqueued: observed => {
       const live = findActiveBySessionId(observed.sessionId);
