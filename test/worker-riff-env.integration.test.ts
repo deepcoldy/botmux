@@ -297,6 +297,7 @@ describe('Riff worker session environment', () => {
         larkAppId: appId,
         larkAppSecret: 'secret',
         ownerOpenId: 'ou_authenticated_owner',
+        hideLocalAddresses: true,
         feedback: {
           enabled: true,
           audience: 'requester',
@@ -328,6 +329,9 @@ describe('Riff worker session environment', () => {
         }),
       ]);
       expect(request.config?.env?.BOTMUX_USAGE_DISPLAY).toBe('footer');
+      // The remote `botmux send` cannot read bots.json; it keeps this bot's
+      // local-address policy from the worker's snapshot.
+      expect(request.config?.env?.BOTMUX_HIDE_LOCAL_ADDRESSES).toBe('1');
       expect(request.config?.env?.BOTMUX_ROOT_MESSAGE_ID).toBe(rootMessageId);
       expect(request.config?.env?.BOTMUX_CHAT_ID).toBe('oc_riff_env');
       expect(request.config?.env?.BOTMUX_SESSION_SCOPE).toBe('thread');
