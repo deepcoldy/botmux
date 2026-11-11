@@ -8,6 +8,7 @@ import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
 import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
 import { OncallGroupStore } from '../src/services/oncall-group-store.js';
+import { attachOncallGroupButton } from '../src/im/lark/oncall-group.js';
 import { projectGroupContextCard } from '../src/im/lark/group-context-card.js';
 import { setGroupContextSettings } from '../src/services/group-context-settings-store.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
@@ -30,8 +31,9 @@ describe('real CLI send into a running reply card', () => {
     { cliId: 'traex', timing: 'first', unified: true },
     { cliId: 'traex', timing: 'final', unified: true },
     { cliId: 'codex', timing: 'final', unified: true },
+    { cliId: 'codex', timing: 'final', unified: true, notify: true },
     { cliId: 'claude-code', timing: 'final', unified: false },
-  ])('keeps a bare send as progress and attaches Oncall to the final answer ($cliId/$timing/$unified)', async ({ cliId, timing, unified }) => {
+  ])('keeps a bare send as progress and attaches Oncall to the final answer ($cliId/$timing/$unified notify=$notify)', async ({ cliId, timing, unified, notify }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-send-kind-'));
     const dataDir = join(root, 'data');
     try {
@@ -48,7 +50,8 @@ describe('real CLI send into a running reply card', () => {
       } });
       const store = new TurnReplyCardStore(dataDir);
       if (unified) await store.prepare(key, { mode: 'unified', nativeCot: true, chatId: 'oc_test', rootId: 'om_root' });
-      const send = (kind?: string) => spawnSyncTsScript(fixture, ['send', '--no-mention',
+      const send = (kind?: string) => spawnSyncTsScript(fixture, ['send',
+        ...(kind === 'final' && notify ? ['--mention', 'ou_first:First', '--mention', 'ou_second:Second'] : ['--no-mention']),
         ...(kind ? ['--response-kind', kind] : []), 'A complete answer.'], {
         cwd: fileURLToPath(new URL('..', import.meta.url)),
         env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
@@ -58,7 +61,11 @@ describe('real CLI send into a running reply card', () => {
       });
       const unclassified = send();
       expect(unclassified.status, String(unclassified.stderr)).toBe(0);
-      expect(String(unclassified.stdout)).toContain('CAPTURE_REPLY=');
+      if (!unified || timing === 'first') expect(String(unclassified.stdout)).toContain('CAPTURE_REPLY=');
+      else {
+        expect(String(unclassified.stdout)).not.toContain('CAPTURE_REPLY=');
+        expect(String(unclassified.stdout)).toContain('"delivered":false');
+      }
       if (!unified) return;
       expect(store.read(key)).toMatchObject({ progress: ['A complete answer.'] });
       expect(store.read(key)?.finalCard).toBeUndefined();
@@ -67,9 +74,23 @@ describe('real CLI send into a running reply card', () => {
       await store.update(key, { kind: 'terminal', phase: 'completed' }, {
         beforeEffect: () => {}, isWithdrawn: () => false,
         send: async () => { throw new Error('terminal must reuse the published answer'); }, patch: async () => {},
-        render: record => buildTurnReplyCard(record, { showProcess: false, showToolResults: false, canStop: false }),
+        render: record => {
+          const raw = buildTurnReplyCard(record, { showProcess: false, showToolResults: false, canStop: false });
+          return notify ? attachOncallGroupButton(raw, { enabled: true, chatIds: ['oc_test'], button: { timing, minTurns: 1 } },
+            'oc_test', 'group', { appId: key.larkAppId, sessionId: key.sessionId, questionId: key.turnId, phase: 'final' }) : raw;
+        },
       });
       const record = store.read(key)!;
+      if (notify) {
+        const captures = String(final.stdout).split('\n').filter(line => line.startsWith('CAPTURE_REPLY='));
+        expect(captures).toHaveLength(1);
+        expect(captures[0]).toContain('ou_first');
+        expect(captures[0]).toContain('ou_second');
+        expect(captures[0]).toContain('A complete answer.');
+        expect(record.phase).toBe('completed');
+        expect(record.messageId).toBeUndefined();
+        return;
+      }
       expect(record.finalDelivered).toBe(true);
       expect(record.finalSource).toBe('explicit');
       const card = JSON.parse(record.lastCard!);

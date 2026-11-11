@@ -60,6 +60,8 @@ describe('unified replies with an independent native CoT channel', () => {
   const update = (text: string) => ({ type: 'thinking_update', sessionId: 'native-session', turnId: 'om_turn', entries: [{ kind: 'thinking', text }] });
   const events = () => request.mock.calls.filter(([req]) => req.method === 'PUT')
     .flatMap(([req]) => req.data.events.map((e: any) => ({ type: e.event_type, content: JSON.parse(e.content) })));
+  const finalAnswer = (text: string) => ({ kind: 'final' as const, text, source: 'bridge' as const,
+    card: JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: text }] } }) });
 
   it.each(['claude-code', 'codex'] as const)('keeps a long %s turn on one answer card plus one native bubble', async cli => {
     ds.session.cliId = cli;
@@ -73,7 +75,7 @@ describe('unified replies with an independent native CoT channel', () => {
       await settle();
       await flushTurnReplyTools(ds, 'om_turn');
     }
-    await updateTurnReplyCard(ds, 'om_turn', { kind: 'final', text: 'final answer', card: JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'final answer' }] } }), source: 'bridge' }, send);
+    await updateTurnReplyCard(ds, 'om_turn', finalAnswer('final answer'), send);
     await updateTurnReplyCard(ds, 'om_turn', { kind: 'terminal', phase: 'completed' }, send);
     finalizeCotMessage(ds, 'om_turn', 'completed');
     await settle();
@@ -103,14 +105,14 @@ describe('unified replies with an independent native CoT channel', () => {
     send.mockImplementation(async (_body, _type, _uuid, beforeWrite) => {
       await beforeWrite(); order.push('answer'); return 'om_answer';
     });
-    const posting = updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+    const posting = updateTurnReplyCard(ds, 'om_turn', finalAnswer('first answer'), send);
     await vi.waitFor(() => expect(release).toBeTypeOf('function'));
     expect(send).not.toHaveBeenCalled();
     release(); await posting;
     expect(order).toEqual(['thinking-created', 'thinking-initialized', 'answer']);
-    // Normal card PATCH and explicit CLI readiness reuse the same native entity.
+    // Later refreshes and explicit CLI readiness reuse the same native entity.
     await prepareReplyCardNativeThinking(ds, 'om_turn');
-    await updateTurnReplyCard(ds, 'om_turn', { kind: 'progress', text: 'later' }, send);
+    await updateTurnReplyCard(ds, 'om_turn', { kind: 'refresh' }, send);
     expect(request.mock.calls.filter(([req]) => req.method === 'POST')).toHaveLength(1);
     expect(send).toHaveBeenCalledTimes(1);
   });
@@ -130,7 +132,7 @@ describe('unified replies with an independent native CoT channel', () => {
     bot.config.replyCardNativeCot = true;
     const healthySend = send.getMockImplementation()!;
     send.mockRejectedValue(new Error('answer ACK lost'));
-    await expect(updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send)).rejects.toThrow('answer ACK lost');
+    await expect(updateTurnReplyCard(ds, 'om_turn', finalAnswer('answer'), send)).rejects.toThrow('answer ACK lost');
     const record = new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' })!;
     expect(record.nativeCotReady).toBe(true);
     const failedSends = send.mock.calls.length;
@@ -150,7 +152,7 @@ describe('unified replies with an independent native CoT channel', () => {
     expect(request.mock.calls.some(([req]) => req.method === 'POST')).toBe(native === true);
     const card = new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' })!;
     expect(card.activity).not.toEqual([]);
-    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(native === true ? 0 : 1);
     finalizeCotMessage(ds, 'om_turn', 'completed'); await settle();
   });
 
@@ -168,15 +170,16 @@ describe('unified replies with an independent native CoT channel', () => {
     const handle = worker();
     handle(update('first')); await settle(); await flushTurnReplyTools(ds, 'om_turn');
     handle(update('later')); await settle(); await flushTurnReplyTools(ds, 'om_turn');
-    await updateTurnReplyCard(ds, 'om_turn', { kind: 'final', text: 'answer survives', card: JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'answer survives' }] } }), source: 'bridge' }, send);
+    await updateTurnReplyCard(ds, 'om_turn', finalAnswer('answer survives'), send);
     expect(send).toHaveBeenCalledTimes(1);
     expect(request).toHaveBeenCalledTimes(1);
-    expect(vi.mocked(updateMessage).mock.calls.at(-1)?.[2]).toContain('answer survives');
+    expect(send.mock.calls.at(-1)?.[0]).toContain('answer survives');
   });
 
   it.each([false, true])('settles eager thinking when its transcript never starts (card update failure=%s)', async fail => {
     bot.config.replyCardNativeCot = true;
     await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+    expect(send).not.toHaveBeenCalled();
     const fallback = vi.fn(async () => {});
     const handle = loadWorkerPoolMessageHandlers(['turn_display_retired'], {
       ds, t: 'fixture', logger: { warn: vi.fn(), error: vi.fn() }, emitSessionLifecycleHook: vi.fn(),
@@ -188,13 +191,16 @@ describe('unified replies with an independent native CoT channel', () => {
     }, true);
     await handle({ type: 'turn_display_retired', turnId: 'om_turn', message: 'Transcript unavailable' });
     await settle();
-    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(fail ? 0 : 1);
     expect(request.mock.calls.some(([req]) => req.url.includes('/complete/'))).toBe(true);
-    if (fail) expect(fallback).toHaveBeenCalledWith(ds, expect.objectContaining({ turnId: 'om_turn', content: 'Transcript unavailable' }), expect.any(Function));
+    if (fail) {
+      expect(fallback).toHaveBeenCalledTimes(1);
+      expect(fallback).toHaveBeenCalledWith(ds, expect.objectContaining({ turnId: 'om_turn', content: 'Transcript unavailable' }), expect.any(Function));
+    }
     else {
       expect(fallback).not.toHaveBeenCalled();
       expect(new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' })?.phase).toBe('ambiguous');
-      expect(vi.mocked(updateMessage).mock.calls.at(-1)?.[2]).toContain('Transcript unavailable');
+      expect(send.mock.calls.at(-1)?.[0]).toContain('Transcript unavailable');
     }
   });
 

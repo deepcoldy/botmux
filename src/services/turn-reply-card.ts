@@ -344,6 +344,17 @@ export class TurnReplyCardStore {
         return record.omitImages ? omitReplyCardImages(body) : body;
       };
       let card = render();
+      // Native thinking already carries passive progress. An answer card is
+      // needed for a final, an error, or an actionable Ask/Oncall control.
+      // An uncertain POST still replays its original payload after restart.
+      if (record.nativeCot && !record.messageId && !record.pendingCreate && !record.finalCard
+        && !io.forceVisible && !['failed', 'cancelled', 'ambiguous'].includes(record.phase)
+        && !(record.asks ?? []).some(entry => !entry.result && !entry.ask.settled)) {
+        const elements = JSON.parse(card).body?.elements ?? [];
+        const hasOncallControl = elements.some((element: any) => element.element_id === 'botmux_oncall_group'
+          || element.columns?.some((column: any) => column.element_id === 'botmux_oncall_group_column'));
+        if (!hasOncallControl || record.phase === 'completed') return { delivered: false, record };
+      }
       const completeRecordNeedsFile = replyCardIsTerminal(record) && !record.disconnected && !record.finalCard
         && Buffer.byteLength(record.progress.join('\n\n'), 'utf8') > 6000;
       if (turnReplyCardRequestBytes(card, record.chatId) > TURN_REPLY_CARD_MAX_BYTES || completeRecordNeedsFile) {
