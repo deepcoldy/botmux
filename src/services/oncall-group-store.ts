@@ -58,6 +58,13 @@ export function pendingOncallMessageIds(request: OncallGroupRequest | undefined)
   return request?.messageIdsSnapshot?.filter(id => !request.forwarded?.includes(id) && !request.restrictedMessageIds?.includes(id)) ?? [];
 }
 
+/** Conversation forwarding or a card refresh that the 24-hour handoff window still owes. */
+export function oncallHandoffWorkPending(request: OncallGroupRequest): boolean {
+  return !!request.cardRefreshPending || (request.handoffError !== 'restricted_merge'
+    && (!!request.conversationScopePending || (request.forwardMode !== 'none' && !request.forwardingBlocked
+      && pendingOncallMessageIds(request).length > 0)));
+}
+
 function cardState(request: OncallGroupRequest): string {
   return JSON.stringify([request.status, request.openChatId, request.inviteLink, request.handoffError, request.conversationScopePending,
     request.restrictedMessageIds, pendingOncallMessageIds(request)]);
@@ -169,10 +176,7 @@ export class OncallGroupStore {
         ?? ([...legacyFiles.get(key) ?? []].some(file => requests.has(file)) ? this.legacyRequest(source) : undefined);
       return request?.status === 'succeeded'
         && (((!request.inviteLink || request.cardRefreshPending) && !!request.openChatId)
-          || (Date.now() - (request.submittedAtMs ?? 0) < 24 * 60 * 60_000
-            && (request.cardRefreshPending || (request.handoffError !== 'restricted_merge'
-              && (request.conversationScopePending || (request.forwardMode !== 'none' && !request.forwardingBlocked
-                && pendingOncallMessageIds(request).length > 0))))));
+          || (Date.now() - (request.submittedAtMs ?? 0) < 24 * 60 * 60_000 && oncallHandoffWorkPending(request)));
     }).map(([, source]) => source);
   }
 

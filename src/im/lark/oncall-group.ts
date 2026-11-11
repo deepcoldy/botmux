@@ -3,7 +3,7 @@ import { readOncallPresetOptions } from '../../services/oncall-preset-options.js
 import { getBot } from '../../bot-registry.js';
 import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
-import { OncallGroupStore, pendingOncallMessageIds, type OncallGroupSource } from '../../services/oncall-group-store.js';
+import { OncallGroupStore, oncallHandoffWorkPending, pendingOncallMessageIds, type OncallGroupSource } from '../../services/oncall-group-store.js';
 import { oncallGroupEnabled, type OncallGroupPolicy, type OncallForwardMode } from '../../services/oncall-group-policy.js';
 import { createOncallGroup, loadOncallGroupTarget, OncallGroupApiError } from '../../services/oncall-group-client.js';
 import { getMessageDetail, replyMessage } from './client.js';
@@ -18,6 +18,7 @@ import { parseApiMessage } from './message-parser.js';
 import { chatAppLink } from './lark-hosts.js';
 import type { CardActionData } from './card-handler.js';
 import { extractLarkBusinessCode, LARK_CODE_FORWARD_RESTRICTED } from './lark-errors.js';
+import { TopicSendError } from '../../cli/topic-send-guard.js';
 
 export function buildOncallGroupColumn(options: { href?: string; status?: string; joinGroup?: boolean; disabled?: boolean; retryForward?: boolean; handoffStatus?: string; confirmText?: string } = {}): Record<string, any> {
   return { tag: 'column', element_id: 'botmux_oncall_group_column', width: 'auto', direction: 'horizontal',
@@ -142,9 +143,12 @@ export async function handleOncallGroupAction(data: CardActionData, appId: strin
         toast: { type: 'success', content: '入群邀请已就绪，请再次点击进入人工群' },
         afterAck: async () => {
           // Callback completion can restore the old view if this patch precedes its ACK.
-          await refreshOncallSessionCard(source);
-          if (!source.cardJson && !source.sessionId) {
-            await replyMessage(appId, source.messageId, `人工 Oncall 群入群邀请：${store.getRequest(source)!.inviteLink}`, 'text', true);
+          // A clicked card that can no longer change still has to deliver the link.
+          let replyWithLink = !source.cardJson && !source.sessionId;
+          try {
+            await refreshOncallSessionCard(source, { onExpired: messageId => { if (messageId === source.messageId) replyWithLink = true; } });
+          } finally {
+            if (replyWithLink) await replyMessage(appId, source.messageId, `人工 Oncall 群入群邀请：${store.getRequest(source)!.inviteLink}`, 'text', true);
           }
         },
       };
@@ -471,9 +475,25 @@ export async function prepareOncallGroupInvite(source: OncallGroupSource): Promi
   });
 }
 
-export async function refreshOncallSessionCard(source: OncallGroupSource): Promise<void> {
+/** Cards that can never be updated again: withdrawn, blocked under the stop
+ * topic policy, or past Lark's edit window. */
+function oncallCardUnchangeable(error: unknown): 'expired' | 'gone' | undefined {
+  if (!(error instanceof Error)) return undefined;
+  if (error.name === 'MessageUpdateExpiredError') return 'expired';
+  if (error.name === 'MessageWithdrawnError') return 'gone';
+  return error instanceof TopicSendError && error.code === 'TOPIC_SEND_BLOCKED' ? 'gone' : undefined;
+}
+
+export async function refreshOncallSessionCard(source: OncallGroupSource, options: {
+  /** The reconcile loop prepares invitations itself, under its own backoff. */
+  prepareInvite?: boolean;
+  /** Called for each card that is past Lark's edit window. */
+  onExpired?: (messageId: string) => void;
+} = {}): Promise<void> {
   const groups = new OncallGroupStore(config.session.dataDir);
-  await prepareOncallGroupInvite(source).catch(() => logger.warn('[oncall-group] Native group invitation is unavailable; retrying with the existing group'));
+  if (options.prepareInvite !== false) {
+    await prepareOncallGroupInvite(source).catch(() => logger.warn('[oncall-group] Native group invitation is unavailable; retrying with the existing group'));
+  }
   const beforeRefresh = groups.getRequest(source);
   const { TurnReplyCardStore } = await import('../../services/turn-reply-card.js');
   const client = await import('./client.js');
@@ -504,8 +524,9 @@ export async function refreshOncallSessionCard(source: OncallGroupSource): Promi
         await client.updateMessage(carrier.appId, carrier.messageId, compose(carrier.cardJson));
       }
     } catch (error) {
-      // A withdrawn card, or one past Lark's edit window, can never show the new entry.
-      if (!(error instanceof Error && ['MessageWithdrawnError', 'MessageUpdateExpiredError'].includes(error.name))) failures.push(error);
+      const unchangeable = oncallCardUnchangeable(error);
+      if (!unchangeable) failures.push(error);
+      else if (unchangeable === 'expired') options.onExpired?.(carrier.messageId);
     }
   }
   if (failures.length) throw new AggregateError(failures, '部分结果卡的人工入口更新失败，将重试');
@@ -646,44 +667,51 @@ export async function forwardOncallConversation(source: OncallGroupSource, owns:
 }
 
 const ONCALL_HANDOFF_WINDOW_MS = 24 * 60 * 60_000;
-const ONCALL_BACKFILL_RETRY_MAX_MS = 30 * 60_000;
-/** Per app, per created group: when the last backfill outside the handoff window
- * failed, and when it may run again. Kept in memory, so a restart retries once. */
-const oncallBackfillRetries = new Map<string, Map<string, { failures: number; nextAtMs: number }>>();
+const ONCALL_REPAIR_RETRY_MAX_MS = 30 * 60_000;
+interface OncallRepairRetry { failures: number; nextAtMs: number; state: string }
+/** Per app, per created group: the request state at the last failed repair and
+ * when the same state may be retried. In memory, so a restart retries once. */
+const oncallRepairRetries = new Map<string, Map<string, OncallRepairRetry>>();
 
 export async function retryPendingOncallHandoffs(appId: string, owns: () => boolean = () => true): Promise<void> {
   const store = new OncallGroupStore(config.session.dataDir);
   const pending = store.pendingHandoffs(appId);
-  const retries = oncallBackfillRetries.get(appId) ?? new Map<string, { failures: number; nextAtMs: number }>();
-  oncallBackfillRetries.set(appId, retries);
+  const retries = oncallRepairRetries.get(appId) ?? new Map<string, OncallRepairRetry>();
+  oncallRepairRetries.set(appId, retries);
   const pendingKeys = new Set(pending.map(source => store.handoffKey(source)));
   for (const key of retries.keys()) if (!pendingKeys.has(key)) retries.delete(key);
   for (const source of pending) {
     if (!owns()) return;
     const key = store.handoffKey(source);
-    const handoffOpen = Date.now() - (store.getRequest(source)?.submittedAtMs ?? 0) < ONCALL_HANDOFF_WINDOW_MS;
-    // Old groups only need their invitation and cards repaired. A lasting
-    // failure there (no share permission, bot left the group) must not repeat
-    // every cycle forever; the open handoff window keeps its immediate retry.
-    const retry = retries.get(key);
-    if (!handoffOpen && retry && Date.now() < retry.nextAtMs) continue;
     const before = JSON.stringify(store.getRequest(source));
-    let repaired = true;
+    const handoffOpen = Date.now() - (store.getRequest(source)?.submittedAtMs ?? 0) < ONCALL_HANDOFF_WINDOW_MS;
+    // A lasting invitation failure (no share permission, bot left the group) or,
+    // for old groups, a lasting card failure must not repeat every cycle. Any
+    // change to the request (bot joined, receipt, a click repaired the invite)
+    // retries at once. Forwarding inside the handoff window keeps its 5 s cycle.
+    const retry = retries.get(key);
+    const waiting = !!retry && retry.state === before && Date.now() < retry.nextAtMs;
+    if (waiting && !handoffOpen) continue;
+    let inviteFailed = false;
+    let refreshFailed = false;
     try {
-      await prepareOncallGroupInvite(source).catch(() => { repaired = false; });
-      // Backfill old invite buttons without re-opening the expired handoff window.
-      if (handoffOpen) {
+      if (!waiting) await prepareOncallGroupInvite(source).catch(() => { inviteFailed = true; });
+      // Backfill old invite buttons without re-opening the expired handoff window,
+      // and without a membership check when only the invitation is missing.
+      const current = store.getRequest(source);
+      if (handoffOpen && current && oncallHandoffWorkPending(current)) {
         await forwardOncallConversation(source, () => owns() && oncallGroupEnabled(getBot(appId).config.oncallGroup, source.chatId));
       }
-      if (JSON.stringify(store.getRequest(source)) !== before || store.getRequest(source)?.cardRefreshPending) await refreshOncallSessionCard(source);
+      if (JSON.stringify(store.getRequest(source)) !== before || store.getRequest(source)?.cardRefreshPending) {
+        await refreshOncallSessionCard(source, { prepareInvite: false }).catch(error => { refreshFailed = true; throw error; });
+      }
     } catch {
-      repaired = false;
       logger.warn('[oncall-group] Handoff reconciliation will retry; no new group is created');
     }
-    if (repaired || handoffOpen) retries.delete(key);
-    else {
+    if (inviteFailed || (refreshFailed && !handoffOpen)) {
       const failures = (retry?.failures ?? 0) + 1;
-      retries.set(key, { failures, nextAtMs: Date.now() + Math.min(ONCALL_BACKFILL_RETRY_MAX_MS, 5_000 * 2 ** failures) });
-    }
+      retries.set(key, { failures, state: JSON.stringify(store.getRequest(source)),
+        nextAtMs: Date.now() + Math.min(ONCALL_REPAIR_RETRY_MAX_MS, 5_000 * 2 ** failures) });
+    } else if (!waiting) retries.delete(key);
   }
 }
