@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
+import { openDatabaseSync, openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.js';
 import { normalizeFeedbackBinding, normalizeFeedbackContext, type FeedbackContext, type FeedbackSubjectBinding } from './feedback-context.js';
 
 function isSqliteBusyError(error: unknown): boolean {
@@ -18,6 +18,39 @@ function sleepShort(attempt: number): void {
   const jitter = Math.floor(Number(process.hrtime.bigint() % 17n));
   try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, base + jitter); } catch {}
 }
+const EXTENSION_DATABASE = 'feedback-extensions.sqlite';
+
+/**
+ * Delivery context plus the host-verified binding of that turn, frozen when the
+ * answer delivery is first recorded (null = no binding).
+ *
+ * The bind route always creates the extension database before writing a
+ * binding, so a missing file means this turn has no binding. Do not create the
+ * file here: the extension host treats its existence as "extensions were used"
+ * and every bot's two feedback ticks then open it every 2 seconds. Open per
+ * call instead of holding a handle, because the long-lived main store may have
+ * been opened before any binding existed. A read failure records null and never
+ * blocks the main delivery.
+ */
+export function feedbackDeliveryContext(dataDir: string | undefined, input: {
+  botAppId: string; sessionId: string; turnId: string; context?: Record<string, unknown>;
+}): Record<string, unknown> {
+  let binding: FeedbackSubjectBinding | null = null;
+  const path = dataDir ? join(dataDir, EXTENSION_DATABASE) : undefined;
+  if (path && existsSync(path)) {
+    try {
+      const database = openDatabaseSyncOrThrow(path);
+      try {
+        database.exec('PRAGMA busy_timeout=5000;');
+        const row = database.prepare('SELECT binding FROM subject_bindings WHERE app_id=? AND session_id=? AND turn_id=?')
+          .get(input.botAppId, input.sessionId, input.turnId) as { binding: string } | undefined;
+        binding = row ? JSON.parse(row.binding) as FeedbackSubjectBinding : null;
+      } finally { database.close(); }
+    } catch { binding = null; }
+  }
+  return { ...input.context, feedbackSubjectBinding: binding };
+}
+
 const EXTENSION_SCHEMA_V1 = `
   CREATE TABLE IF NOT EXISTS cursors(source TEXT PRIMARY KEY, sequence INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS received(source TEXT NOT NULL,event_id TEXT NOT NULL,PRIMARY KEY(source,event_id));
@@ -99,7 +132,7 @@ export class FeedbackExtensionStore {
   }
   static async open(dataDir: string): Promise<FeedbackExtensionStore> {
     mkdirSync(dataDir, { recursive: true, mode: 0o700 });
-    return new FeedbackExtensionStore(await openDatabaseSync(join(dataDir, 'feedback-extensions.sqlite')));
+    return new FeedbackExtensionStore(await openDatabaseSync(join(dataDir, EXTENSION_DATABASE)));
   }
   close(): void { this.database.close(); }
   bindSubject(appId: string, sessionId: string, turnId: string, input: FeedbackSubjectBinding): void {
@@ -114,9 +147,6 @@ export class FeedbackExtensionStore {
     const row = this.database.prepare('SELECT binding FROM subject_bindings WHERE app_id=? AND session_id=? AND turn_id=?')
       .get(appId, sessionId, turnId) as { binding: string } | undefined;
     return row ? JSON.parse(row.binding) : undefined;
-  }
-  deliveryContext(appId: string, sessionId: string, turnId: string, context?: Record<string, unknown>): Record<string, unknown> {
-    return { ...context, feedbackSubjectBinding: this.subject(appId, sessionId, turnId) ?? null };
   }
   activate(appId: string, startedAt: string): string {
     this.database.prepare('INSERT OR IGNORE INTO activation VALUES(?,?)').run(appId, startedAt);

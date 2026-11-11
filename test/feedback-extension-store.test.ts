@@ -36,6 +36,28 @@ describe('feedback extension durability', () => {
       } finally { main.close(); }
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
+  it('creates no extension database for unbound answers and freezes a later binding through the same main store', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'feedback-extension-lazy-'));
+    const main = await SkillFeedbackStore.open(directory);
+    try {
+      const record = (turnId: string, platformMessageId: string) => main.recordTurnDelivery({
+        botAppId: 'app', sessionId: 'session', turnId, platform: 'lark', platformAppId: 'app', platformMessageId,
+        content: 'answer', cardMode: 'card', status: 'delivered', context: { teamId: 'team' },
+      });
+      expect(record('first', 'om_first').context).toEqual({ teamId: 'team', feedbackSubjectBinding: null });
+      // The extension host treats an existing database as "extensions in use".
+      expect(existsSync(join(directory, 'feedback-extensions.sqlite'))).toBe(false);
+      const extensions = await FeedbackExtensionStore.open(directory);
+      try {
+        extensions.bindSubject('app', 'session', 'second', {
+          sourceMessageId: 'om_question', answerKind: 'substantive', context: { category: 42 },
+        });
+      } finally { extensions.close(); }
+      expect(record('second', 'om_second').context).toEqual({ teamId: 'team', feedbackSubjectBinding: {
+        sourceMessageId: 'om_question', answerKind: 'substantive', context: { category: 42 },
+      } });
+    } finally { main.close(); rmSync(directory, { recursive: true, force: true }); }
+  });
   it('freezes the first action event across cards, actors, replay and pause recovery', async () => {
     const directory = mkdtempSync(join(tmpdir(), 'feedback-event-snapshot-'));
     let store = await FeedbackExtensionStore.open(directory);

@@ -7,7 +7,7 @@ import type { RecordTurnDeliveryInput, RecordTurnTerminalInput, TurnCompletionEv
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
 import { effectiveWebhookDestinations, type FeedbackEventEnvelope, type FeedbackWebhookDestination } from './feedback-outbox.js';
 import { validateFeedbackEventCursor, type FeedbackEventCursor, type SequencedFeedbackEvent } from './feedback-event-stream.js';
-import { FeedbackExtensionStore } from './feedback-extension-store.js';
+import { feedbackDeliveryContext } from './feedback-extension-store.js';
 
 type Input<Method extends keyof FeedbackStore> = Parameters<FeedbackStore[Method]>[0];
 type Output<Method extends keyof FeedbackStore> = Awaited<ReturnType<FeedbackStore[Method]>>;
@@ -44,8 +44,8 @@ function cardTemplate(value: Record<string, unknown> | undefined): Record<string
 }
 
 class PostgresFeedbackStore implements FeedbackStore {
-  constructor(private readonly pool: Pool, private readonly extensions?: FeedbackExtensionStore) {}
-  async close(): Promise<void> { this.extensions?.close(); await this.pool.end(); }
+  constructor(private readonly pool: Pool, private readonly dataDir?: string) {}
+  async close(): Promise<void> { await this.pool.end(); }
   private async transaction<Result>(operation: (client: PoolClient) => Promise<Result>, ordered = true): Promise<Result> {
     const client = await this.pool.connect();
     try {
@@ -116,10 +116,7 @@ class PostgresFeedbackStore implements FeedbackStore {
     return row ? this.delivery(this.pool, row) : undefined;
   }
   async recordTurnDelivery(input: RecordTurnDeliveryInput): Promise<Output<'recordTurnDelivery'>> {
-    let context: Record<string, unknown>;
-    try { context = this.extensions ? this.extensions.deliveryContext(input.botAppId, input.sessionId, input.turnId, input.context) : { ...input.context, feedbackSubjectBinding: null }; }
-    catch { context = { ...input.context, feedbackSubjectBinding: null }; }
-    input = { ...input, context };
+    input = { ...input, context: feedbackDeliveryContext(this.dataDir, input) };
     return this.transaction(async client => {
       await this.lock(client, JSON.stringify(['turn', input.botAppId, input.sessionId, input.turnId, input.dispatchAttempt ?? 0]));
       await this.lock(client, JSON.stringify(['message', input.platform, input.platformAppId, input.platformMessageId]));
@@ -323,14 +320,11 @@ class PostgresFeedbackStore implements FeedbackStore {
 
 export async function openPostgresFeedbackStore(target: PostgresTarget, password: PostgresCredential, instanceId: string, ca?: string, provision = false, dataDir?: string): Promise<FeedbackStore> {
   const pool = feedbackPostgresPool(target, password, ca);
-  let extensions: FeedbackExtensionStore | undefined;
   try {
     const client = await pool.connect();
     try { await ensurePostgresFeedbackSchema(client, target.schema, instanceId, undefined, provision); } finally { client.release(); }
-    if (dataDir) { try { extensions = await FeedbackExtensionStore.open(dataDir); } catch { extensions = undefined; } }
-    return new PostgresFeedbackStore(pool, extensions);
+    return new PostgresFeedbackStore(pool, dataDir);
   } catch (error) {
-    extensions?.close();
     await pool.end();
     throw error;
   }
