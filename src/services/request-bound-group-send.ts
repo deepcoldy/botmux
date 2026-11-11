@@ -82,6 +82,29 @@ export const GROUP_SEND_ARCHIVE_LIMIT = 20_000;
  */
 export const GROUP_SEND_COMPACT_BATCH = GROUP_SEND_RECORD_LIMIT / 10;
 
+/** The live cap, compaction batch and archive cap in force. */
+type GroupSendLimits = { record: number; compactBatch: number; archive: number };
+const PRODUCTION_LIMITS: Readonly<GroupSendLimits> = Object.freeze({
+  record: GROUP_SEND_RECORD_LIMIT, compactBatch: GROUP_SEND_COMPACT_BATCH, archive: GROUP_SEND_ARCHIVE_LIMIT,
+});
+let limits: Readonly<GroupSendLimits> = PRODUCTION_LIMITS;
+
+/**
+ * @internal test-only. Every send rewrites the whole live file, so crossing
+ * the real 2000-record cap through real sends is quadratic work (tens of
+ * seconds, minutes on a loaded runner). Tests that need to cross the cap that
+ * way shrink the limits instead; the cap, compaction and eviction code is the
+ * same. `null` restores the production limits.
+ */
+export function __setGroupSendLimitsForTest(next: GroupSendLimits | null): void {
+  if (next && !(Number.isInteger(next.record) && next.record > 1
+    && Number.isInteger(next.compactBatch) && next.compactBatch > 0 && next.compactBatch < next.record
+    && Number.isInteger(next.archive) && next.archive > 0)) {
+    throw new Error('invalid group send limits');
+  }
+  limits = next ? Object.freeze({ ...next }) : PRODUCTION_LIMITS;
+}
+
 /** Sibling of the live store: `group-sends-<appId>.json` → `group-sends-<appId>-archive.json`. */
 export function groupSendArchivePath(storePath: string): string {
   return storePath.endsWith('.json')
@@ -192,7 +215,7 @@ function oldestSent(file: StoreFile): [string, GroupSendRecord][] {
  */
 function evictArchiveOverflow(file: StoreFile): void {
   const entries = Object.entries(file.records);
-  let overflow = entries.length - GROUP_SEND_ARCHIVE_LIMIT;
+  let overflow = entries.length - limits.archive;
   if (overflow <= 0) return;
   entries.sort((a, b) => (a[1].sentAt ?? Number.NEGATIVE_INFINITY) - (b[1].sentAt ?? Number.NEGATIVE_INFINITY) || byKey(a[0], b[0]));
   for (const [storeKey] of entries) {
@@ -272,14 +295,14 @@ export async function sendRequestBoundGroupMessage(deps: GroupSendDeps, input: G
     if (!record) {
       record = { chatId: input.chatId, requestId: input.requestId, contentDigest,
         uuid: groupSendUuid(deps.larkAppId, input.chatId, input.requestId), state: 'pending', firstAttemptAt: now() };
-      const overflow = Object.keys(active.records).length + 1 - GROUP_SEND_RECORD_LIMIT;
+      const overflow = Object.keys(active.records).length + 1 - limits.record;
       if (overflow > 0) {
         const movable = oldestSent(active);
         // Decide the whole move before touching either file. Compacting only
         // part of the overflow would still be over the cap and would have
         // written the archive on a store_full response.
         if (movable.length < overflow) return { ok: false, status: 503, error: 'store_full', retryable: false };
-        const moving = movable.slice(0, Math.max(overflow, GROUP_SEND_COMPACT_BATCH));
+        const moving = movable.slice(0, Math.max(overflow, limits.compactBatch));
         for (const [storeKey, compacted] of moving) archive.records[storeKey] = compacted;
         evictArchiveOverflow(archive);
         save(archivePath, archive);
