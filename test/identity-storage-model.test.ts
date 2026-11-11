@@ -158,6 +158,22 @@ describe('the two models are mutually exclusive per session', () => {
     expect(existsSync(join(sessionIdentityDataDir(dir, SESSION), 'bytedcli.env'))).toBe(true);
   });
 
+  it('a proven re-init removes plaintext a single-model publication left behind, keeping proven memory', () => {
+    // A daemon that never received the worker's identity decision published
+    // every turn under the fail-closed single default, onto an already-proven
+    // layout. The proven wrapper never reads those files; the next proven
+    // spawn must not leave them on disk.
+    ensureSessionIdentityStorage(dir, SESSION, ['bytedcli'], 'proven');
+    writeSessionIdentity(dir, SESSION, aliceBy('turn-A'), 'proven');
+    writeSessionIdentity(dir, SESSION, aliceBy('turn-B'), 'single');
+    const dataDir = sessionIdentityDataDir(dir, SESSION);
+    expect(readdirSync(dataDir).filter(name => name.endsWith('.env')).sort()).toEqual(['bytedcli.env', 'codebase.env']);
+    ensureSessionIdentityStorage(dir, SESSION, ['bytedcli'], 'proven');
+    expect(readdirSync(dataDir).some(name => name.endsWith('.env'))).toBe(false);
+    expect(recallProvenIdentityContent(dir, SESSION, 'turn-A', 'bytedcli')).toContain('jwt-turn-A');
+    expect(readFileSync(join(dataDir, 'identity-layout'), 'utf8').trim()).toBe('proven-v1');
+  });
+
   it('re-initializing the same model never truncates a live marker', () => {
     ensureSessionIdentityStorage(dir, SESSION, ['bytedcli'], 'proven');
     writeSessionIdentity(dir, SESSION, aliceBy('turn-A'), 'proven');
