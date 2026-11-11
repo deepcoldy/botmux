@@ -7500,7 +7500,7 @@ export async function startAdoptSession(
     return;
   }
   if (adopted.status === 'rejected') {
-    await sessionReply(adopted.anchor, '外部会话未成功接入；未登记项目迁入，请检查接入限制后重试。');
+    await sessionReply(adopted.anchor, '外部会话未成功接入，请检查接入限制后重试。');
     return;
   }
   if (adopted.status === 'pending') {

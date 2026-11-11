@@ -4,8 +4,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   createProjectImportNotifications,
-  recordProjectSessionImport,
-  setProjectImportNotifications,
   type ProjectImportCoordinator,
   type ProjectImportEvent,
   type ProjectImportNotification,
@@ -16,7 +14,6 @@ import {
 
 const roots: string[] = [];
 afterEach(() => {
-  setProjectImportNotifications(undefined);
   for (const path of roots.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
@@ -420,16 +417,6 @@ describe('project import notifications', () => {
     await f.runtime.flush();
     expect(f.runtime.list()[0]?.reason).toBe('delivery_outcome_unknown');
     expect(JSON.stringify(log.mock.calls)).not.toContain('PRIVATE');
-  });
-
-  it('the singleton recorder only observes a committed snapshot and cannot fail its operation', () => {
-    const enqueue = vi.fn(() => { throw new Error('disk unavailable'); });
-    setProjectImportNotifications({
-      enqueue, flush: async () => ({ delivered: 0, pending: 0, cancelled: 0 }), list: () => [],
-    });
-    const f = fixture();
-    expect(() => recordProjectSessionImport(f.source, 'committed-route')).not.toThrow();
-    expect(enqueue).toHaveBeenCalledWith({ operationId: 'committed-route', snapshot: f.source });
   });
 
   it('supports each approved import source without interpreting it as a new business task', () => {

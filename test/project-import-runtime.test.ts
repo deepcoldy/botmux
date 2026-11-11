@@ -15,7 +15,6 @@ import {
 import { projectImportSnapshotFromSource } from '../src/services/project-import-snapshot.js';
 import {
   projectImportOperationId,
-  setProjectImportNotifications,
   type ProjectImportCoordinator,
 } from '../src/services/project-import-notifications.js';
 import type { GroupCollaborationModeConfig } from '../src/services/group-collaboration-mode-store.js';
@@ -23,7 +22,6 @@ import type { ProjectGroupState } from '../src/services/project-group-store.js';
 
 const roots: string[] = [];
 afterEach(() => {
-  setProjectImportNotifications(undefined);
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 const jsonResponse = (body: unknown, status = 200) => new Response(JSON.stringify(body), {

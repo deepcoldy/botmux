@@ -11,7 +11,6 @@ export { projectImportSnapshotFromSource } from './project-import-snapshot.js';
 import {
   createProjectImportNotifications,
   projectImportOperationId,
-  setProjectImportNotifications,
   type ProjectImportCoordinator,
   type ProjectImportNotification,
   type ProjectImportNotificationRuntime,
@@ -262,6 +261,5 @@ export function installProjectImportRuntime(options: {
     findDaemon: appId => findOnlineDaemon(appId) ?? undefined,
     fetchIpc: fetchDaemonIpc,
   });
-  setProjectImportNotifications(runtime.notifications);
   return runtime;
 }

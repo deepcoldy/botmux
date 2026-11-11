@@ -421,24 +421,10 @@ export function createProjectImportNotifications(deps: ProjectImportNotification
   return { enqueue, list, flush };
 }
 
-let runtime: ProjectImportNotificationRuntime | undefined;
-
-/** Daemon-installed consumer. Tests can clear it without touching live state. */
-export function setProjectImportNotifications(value: ProjectImportNotificationRuntime | undefined): void {
-  runtime = value;
-}
-
 /** The same committed source episode is recorded by the hot path and the
  * recovery scan. Real moves/imports advance revision, so A→B→A is distinct. */
 export function projectImportOperationId(snapshot: Pick<ProjectImportSnapshot, 'larkAppId' | 'sessionId' | 'routeRevision'>): string {
   return `project-import-${createHash('sha256').update(JSON.stringify([
     snapshot.larkAppId, snapshot.sessionId, snapshot.routeRevision,
   ])).digest('hex')}`;
-}
-
-/** Projection-only after a committed migration/import. An outbox fault must
- * not falsely turn an already-successful relay/adopt into a failed operation. */
-export function recordProjectSessionImport(snapshot: ProjectImportSnapshot, operationId: string = projectImportOperationId(snapshot)): void {
-  try { runtime?.enqueue({ operationId, snapshot }); }
-  catch { /* The daemon reconciler can retry a committed route; never expose secrets in logging. */ }
 }
