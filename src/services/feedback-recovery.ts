@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { isAtomicWriteTempName } from '../utils/atomic-write.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLock, FileLockTimeoutError } from '../utils/file-lock.js';
-import { readDurableProcessIdentity } from '../utils/process-identity.js';
+import { APPROX_START_IDENTITY_PREFIX, approxStartIdentityMatches, readDurableProcessIdentity } from '../utils/process-identity.js';
 import { readFeedbackStorageConfig } from './feedback-storage-config.js';
 // getFeedbackStorage is imported lazily: this module sits on the daemon/send
 // static load path, and the storage selector pulls in the optional `pg` dep.
@@ -73,9 +73,15 @@ export function inspectSendRecovery(dataDir: string): RecoveryItem[] {
     try { lease = JSON.parse(readFileSync(join(directory, name), 'utf8')); }
     catch { throw new Error('feedback_send_lease_invalid'); }
     if (!Number.isInteger(lease.processId) || lease.processId < 2 || !lease.processStartId) throw new Error('feedback_send_lease_invalid');
-    const identity = readDurableProcessIdentity(lease.processId);
-    let live = identity === lease.processStartId;
-    if (!identity) {
+    // undefined = birth identity unreadable here; fall back to bare liveness.
+    let live: boolean | undefined;
+    if (lease.processStartId.startsWith(APPROX_START_IDENTITY_PREFIX)) {
+      live = approxStartIdentityMatches(lease.processId, lease.processStartId);
+    } else {
+      const identity = readDurableProcessIdentity(lease.processId);
+      live = identity ? identity === lease.processStartId : undefined;
+    }
+    if (live === undefined) {
       try { process.kill(lease.processId, 0); live = true; }
       catch (error) { live = (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
     }
