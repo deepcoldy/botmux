@@ -123,7 +123,10 @@ describe('real CLI send into a running reply card', () => {
       sendArgs: ['--no-mention', '--top-level'],
       deliveryKind: 'detoured_send',
     },
-  ] as const)('records $name as exact empty-final reply evidence', ({ cliId, sendArgs, deliveryKind }) => {
+  ].flatMap(scenario => (['progress', 'final', 'auxiliary'] as const)
+    .map(responseKind => ({ ...scenario, responseKind }))))(
+    'records $name/$responseKind and only treats final as completed delivery',
+    ({ cliId, sendArgs, deliveryKind, responseKind }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-visible-reply-marker-'));
     const dataDir = join(root, 'data');
     const turnId = `om_${cliId}_visible_reply`;
@@ -152,7 +155,10 @@ describe('real CLI send into a running reply card', () => {
       } });
       const result = spawnSyncTsScript(
         fixture,
-        ['send', ...sendArgs, 'Visible result already delivered.'],
+        ['send', ...sendArgs,
+          // A bare send defaults to progress; it must not mask missing final delivery.
+          ...(responseKind === 'progress' ? [] : ['--response-kind', responseKind]),
+          'Visible result already delivered.'],
         {
           cwd: fileURLToPath(new URL('..', import.meta.url)),
           env: {
@@ -178,6 +184,7 @@ describe('real CLI send into a running reply card', () => {
         deliveryKind,
         targetChatId: 'oc_test',
         messageId: 'om_separate_message',
+        responseKind,
       });
       expect(shouldEmitEmptyCompletedBridgeFallback({
         sessionId: key.sessionId,
@@ -186,7 +193,7 @@ describe('real CLI send into a running reply card', () => {
         isLocal: false,
         finalText: '',
         terminalStatus: 'completed',
-      }, undefined, markers, false)).toBe(false);
+      }, undefined, markers, false)).toBe(responseKind !== 'final');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
