@@ -2053,6 +2053,12 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
     const execution = workerSessionEventScope.executionForTurn(msg.turnId, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined);
     if (execution) context.scope.execution = execution;
   }
+  if (msg.type === 'screen_update' && context.scope.execution
+    && (msg.turnId !== context.scope.execution.turnId || msg.dispatchAttempt !== context.scope.execution.dispatchAttempt)) {
+    delete context.scope.execution;
+    const execution = workerSessionEventScope.executionForTurn(msg.turnId, msg.dispatchAttempt);
+    if (execution) context.scope.execution = execution;
+  }
   // Physical process proof is available before an opening attempt is bound.
   // Keep its frozen runtime, without claiming execution acceptance.
   if (msg.type === 'claude_exit' || msg.type === 'local_process_attestation') delete context.scope.execution;
@@ -7231,16 +7237,18 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
     withPidMarkerLock(markerPath, () => {
       const raw = readFileSync(markerPath, 'utf-8');
       const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed.turnId === 'string' && parsed.turnId) {
-        if (!currentBotmuxTurnId) {
+      if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && parsed.turnId !== currentBotmuxTurnId) {
+        if (retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
+          // Disk holds an older turn that has already terminated; do not re-adopt it.
+        } else if (!currentBotmuxTurnId) {
           adoptInitialActiveTurn(parsed);
-        } else if (currentBotmuxTurnId !== parsed.turnId && !retiredTurnIds.has(parsed.turnId)) {
+        } else {
           adoptDisplacedActiveTurn(parsed);
         }
       }
       if (parsed && Array.isArray(parsed.queuedTurns) && parsed.queuedTurns.length > 0) {
         for (const t of parsed.queuedTurns) {
-          if (t && typeof t.turnId === 'string' && t.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(t.turnId) && !queuedTypeAheadTurns.some(q => q.turnId === t.turnId)) {
+          if (t && typeof t.turnId === 'string' && t.turnId !== currentBotmuxTurnId && markerQueuedTurnStillLive(t) && !queuedTypeAheadTurns.some(q => q.turnId === t.turnId)) {
             queuedTypeAheadTurns.push({
               turnId: t.turnId,
               ...(t.inputConsumed === true ? { inputConsumed: true as const } : {}),
@@ -7256,7 +7264,7 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
           }
         }
       } else if (parsed && typeof parsed.queuedTurnId === 'string' && parsed.queuedTurnId) {
-        if (parsed.queuedTurnId !== currentBotmuxTurnId && !retiredTurnIds.has(parsed.queuedTurnId) && !queuedTypeAheadTurns.some(q => q.turnId === parsed.queuedTurnId)) {
+        if (parsed.queuedTurnId !== currentBotmuxTurnId && markerQueuedTurnStillLive({ turnId: parsed.queuedTurnId }) && !queuedTypeAheadTurns.some(q => q.turnId === parsed.queuedTurnId)) {
           queuedTypeAheadTurns.push({ turnId: parsed.queuedTurnId });
         }
       }
@@ -33739,9 +33747,13 @@ function retireTerminatedMarkerTurn(parsed: {
   const dispatchAttempt = typeof parsed.dispatchAttempt === 'number'
     ? parsed.dispatchAttempt
     : queued?.dispatchAttempt;
-  if (!turnTerminalEmitted(parsed.turnId, dispatchAttempt)) return false;
+  const genericStatus = dispatchAttempt !== undefined && sessionId
+    ? emittedTurnTerminals.statusOf(sessionId, parsed.turnId, undefined)
+    : undefined;
+  const genericSettled = genericStatus === 'completed' || genericStatus === 'cancelled';
+  if (!turnTerminalEmitted(parsed.turnId, dispatchAttempt) && !genericSettled) return false;
   const siblingIsLive = (candidate: { turnId?: unknown; dispatchAttempt?: unknown } | undefined): boolean => {
-    if (!candidate || candidate.turnId !== parsed.turnId) return false;
+    if (genericSettled || !candidate || candidate.turnId !== parsed.turnId) return false;
     const siblingAttempt = typeof candidate.dispatchAttempt === 'number'
       ? candidate.dispatchAttempt
       : undefined;
@@ -33749,7 +33761,12 @@ function retireTerminatedMarkerTurn(parsed: {
     // was just confirmed emitted, so this lookup returns false for it too.
     return !turnTerminalEmitted(parsed.turnId, siblingAttempt);
   };
-  const liveSibling = queuedTypeAheadTurns.some(siblingIsLive)
+  const activeSibling = !genericSettled
+    && currentBotmuxTurnId === parsed.turnId
+    && currentBotmuxDispatchAttempt !== dispatchAttempt
+    && !turnTerminalEmitted(parsed.turnId, currentBotmuxDispatchAttempt);
+  const liveSibling = activeSibling
+    || queuedTypeAheadTurns.some(siblingIsLive)
     || (parsed.queuedTurns ?? []).some(siblingIsLive);
   dropQueuedTurnRecord(parsed.turnId, dispatchAttempt, { tombstone: !liveSibling });
   if (!liveSibling) markTurnRetired(parsed.turnId);
@@ -34323,6 +34340,34 @@ function unattendedRawInputRefusal(
 
 // ─── IPC Message Handler ─────────────────────────────────────────────────────
 
+function seedInitTurnTerminals(msg: Extract<DaemonToWorker, { type: 'init' }>): void {
+  const contractExecutions = msg.sessionContract?.executions ?? [];
+  const hasUnsettledExecution = (turnId: string): boolean =>
+    contractExecutions.some(other => other.ref.turnId === turnId
+      && other.phase !== 'succeeded' && other.phase !== 'failed' && other.phase !== 'cancelled');
+  for (const state of contractExecutions) {
+    workerSessionEventScope?.noteAdmission(state);
+    if (sessionId && typeof emittedTurnTerminals !== 'undefined'
+      && (state.phase === 'succeeded' || state.phase === 'failed' || state.phase === 'cancelled')) {
+      const terminalStatus = state.phase === 'succeeded' ? 'completed' : state.phase;
+      emittedTurnTerminals.claim(sessionId, state.ref.turnId, state.ref.dispatchAttempt, terminalStatus);
+      if ((state.phase === 'succeeded' || state.phase === 'cancelled')
+        && state.ref.dispatchAttempt !== undefined
+        && state.ref.turnId !== msg.turnId
+        && !hasUnsettledExecution(state.ref.turnId)) {
+        emittedTurnTerminals.claim(sessionId, state.ref.turnId, undefined, terminalStatus);
+      }
+    }
+  }
+  if (sessionId && typeof emittedTurnTerminals !== 'undefined') {
+    for (const settled of msg.settledTurnTerminals ?? []) {
+      if (settled.turnId !== msg.turnId && !hasUnsettledExecution(settled.turnId)) {
+        emittedTurnTerminals.claim(sessionId, settled.turnId, undefined, settled.status);
+      }
+    }
+  }
+}
+
 async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Promise<void> {
   const msg = raw as DaemonToWorker;
 
@@ -34449,7 +34494,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
       workerSessionEventScope = msg.sessionContract ? new WorkerSessionEventScope(msg.sessionContract.session, msg.sessionContract.worker) : undefined;
-      for (const state of msg.sessionContract?.executions ?? []) workerSessionEventScope?.noteAdmission(state);
+      seedInitTurnTerminals(msg);
       if (msg.sessionCommand?.execution) workerSessionEventScope?.rememberExecution(msg.sessionCommand.execution);
       initializeFinalOutputHandoff(msg);
       applyInitFinalOutputBackpressure(msg, ordinaryImTurnId);
