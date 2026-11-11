@@ -3458,15 +3458,21 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-workstream', async (req, res,
       return jsonRes(res, 200, { ok: true, grantId: grant.id, expiresAt: grant.expiresAt });
     }
     if (ds.scope !== 'chat') throw new Error('project_coordinator_required');
+    let coordinatorOwnerStillValid: (() => boolean) | undefined;
     if (body.action === 'attach' || body.action === 'status') {
       // Report validation binds an imported workstream to this coordinator
       // session's owner. Registering or rebinding it from another operator's
       // turn (or in an ownerless session) would succeed here yet make every
       // later report fail, so refuse explicitly before any write.
+      const coordinatorOwnerIdentity = () => JSON.stringify([
+        ds.session.larkAppId, ds.session.ownerOpenId, ds.session.ownerUnionId,
+      ]);
+      const admittedOwnerIdentity = coordinatorOwnerIdentity();
+      coordinatorOwnerStillValid = () => coordinatorOwnerIdentity() === admittedOwnerIdentity;
       const coordinatorOwnerKey = await projectSessionOwnerKey({
         larkAppId: ds.larkAppId, ownerOpenId: ds.session.ownerOpenId, ownerUnionId: ds.session.ownerUnionId,
       });
-      if (!coordinatorOwnerKey || coordinatorOwnerKey !== ownerKey) {
+      if (!coordinatorOwnerKey || coordinatorOwnerKey !== ownerKey || !coordinatorOwnerStillValid()) {
         throw new Error('project_coordinator_owner_required');
       }
     }
@@ -3495,6 +3501,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-workstream', async (req, res,
       authorizationStillValid: () => findActiveBySessionId(params.sessionId) === ds
         && ds.managedTurnOrigin === admittedOrigin && ds.managedTurnOrigin?.capability === admittedCapability
         && ds.managedTurnOrigin?.turnId === turn
+        && (!coordinatorOwnerStillValid || coordinatorOwnerStillValid())
         && canOperate(ds.larkAppId, ds.chatId, caller.requestUserOpenId!, caller.requestUserUnionId),
     };
     Object.assign(actor, {

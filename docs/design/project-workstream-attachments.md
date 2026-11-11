@@ -44,6 +44,8 @@ grant 限当前源 session、话题、关联版本、项目群和主控 app，�
 - rename 不发送新 prompt，修改项目行与任务树标题，不更改完成状态。
 - `attach` 与 `status` 须由主控会话的 owner 本人在当前回合执行；其它成员或无 owner 的
   主控会话直接拒绝（`project_coordinator_owner_required`），因为回报校验绑定主控会话 owner。
+  owner 归一化前后以及后续队列/文件锁等待期间都校验宿主身份快照；owner 改变时拒绝旧操作，
+  不自动把旧关联转交给新 owner。
 - 来源 worker 空闲挂起或被回收不改变关联：登记和 status 不把一时未就绪当成失去回报能力；
   回报时仍要求来源 CLI 已就绪。
 

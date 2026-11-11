@@ -9,8 +9,10 @@ import * as runtime from '../src/services/project-workstream-runtime.js';
 import { setIpcAuthSecret, startIpcServer, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
 import * as modes from '../src/services/group-collaboration-mode-store.js';
-import { mutateProjectGroup } from '../src/services/project-group-store.js';
+import { mutateProjectGroup, readProjectGroup } from '../src/services/project-group-store.js';
 import { withFileLock } from '../src/utils/file-lock.js';
+import { createProjectWorkstreamAttachments } from '../src/services/project-workstream-attachments.js';
+import { ProjectCoordinator, type ProjectCoordinatorTransport } from '../src/services/project-coordinator.js';
 
 const APP = 'cli_project_main', CHAT = 'oc_project_ipc', CAP = 'ab'.repeat(32);
 let handle: IpcServerHandle;
@@ -126,6 +128,69 @@ describe('project workstream IPC boundary', () => {
     ds.session.ownerUnionId = 'on_owner';
     expect((await post('attach', source)).status).toBe(200);
   });
+  it.each(['attach', 'status'] as const)('rejects owner replacement during asynchronous legacy owner resolution before invoking %s', async action => {
+    ds.session.ownerUnionId = undefined;
+    ds.session.ownerOpenId = 'ou_legacy_owner';
+    vi.mocked(client.resolveUnionIdFromOpenIdStrict).mockImplementationOnce(async () => {
+      ds.session.ownerUnionId = 'on_replacement';
+      return { status: 'resolved', unionId: 'on_owner' };
+    });
+    const reconcile = vi.spyOn(runtime.projectWorkstreamAttachments, 'reconcile');
+    const res = await post(action, action === 'attach' ? source : {});
+    expect(res.status).toBe(403);
+    expect(await res.json()).toMatchObject({ error: 'project_coordinator_owner_required' });
+    expect(attach).not.toHaveBeenCalled();
+    expect(reconcile).not.toHaveBeenCalled();
+  });
+  it.each(['attach', 'status'] as const)(
+    'rechecks coordinator ownership after real %s source lookup before persistent writes', async action => {
+      const dataDir = mkdtempSync(join(process.env.SESSION_DATA_DIR!, 'owner-ipc-'));
+      roots.push(dataDir);
+      config.session.dataDir = dataDir;
+      await modes.writeGroupCollaborationMode(dataDir, {
+        chatId: CHAT, mode: 'project', coordinatorAppId: APP, workerAppIds: ['cli_worker'],
+      });
+      const transport: ProjectCoordinatorTransport = {
+        sendCard: vi.fn(async () => 'om_card'), updateCard: vi.fn(async () => {}),
+        pinMessage: vi.fn(async () => true), unpinMessage: vi.fn(async () => true),
+        resolveThreadId: vi.fn(async () => null), isMessageWithdrawn: () => false,
+        isMessageUpdateExpired: () => false, brand: () => 'feishu',
+      };
+      const coordinator = new ProjectCoordinator(transport);
+      await coordinator.run({
+        dataDir, chatId: CHAT, larkAppId: APP, coordinatorSessionId: 'main-ipc',
+      }, { action: 'init', title: '合成项目', goal: '测试所有权边界' });
+      let replaceOwner = false;
+      const service = createProjectWorkstreamAttachments({
+        dataDir,
+        getSource: async () => {
+          if (replaceOwner) ds.session.ownerUnionId = 'on_replacement';
+          return {
+            sessionId: 'worker', larkAppId: 'cli_worker', chatId: CHAT, rootMessageId: 'om_task',
+            scope: 'thread', status: 'active', ownerKey: 'union:on_owner', routeRevision: 1,
+            source: 'relay', ordinary: true, reportCapability: 'verified',
+          };
+        },
+        getProject: chatId => readProjectGroup(dataDir, chatId),
+        getMode: chatId => modes.readGroupCollaborationMode(dataDir, chatId),
+        projectRun: (ctx, value, beforeApply) => coordinator.run(ctx, value, beforeApply),
+        reportSecret: () => 'synthetic-owner-boundary-secret',
+        lookupRoot: async () => true,
+      });
+      attach.mockImplementation((actor, request) => service.attach(actor, request));
+      vi.spyOn(runtime.projectWorkstreamAttachments, 'reconcile')
+        .mockImplementation((actor, request) => service.reconcile(actor, request));
+      if (action === 'status') expect((await post('attach', source)).status).toBe(200);
+      const before = readProjectGroup(dataDir, CHAT);
+      const publicationCount = vi.mocked(transport.updateCard).mock.calls.length;
+      replaceOwner = true;
+      const res = await post(action, action === 'attach' ? source : { rootMessageId: 'om_task' });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ error: 'project_attachment_turn_stale' });
+      expect(readProjectGroup(dataDir, CHAT)).toEqual(before);
+      expect(transport.updateCard).toHaveBeenCalledTimes(publicationCount);
+    },
+  );
   it('allows dedicated rename action without an extra task kickoff', async () => {
     expect((await post('rename', { rootMessageId: 'om_task', title: '实现迁入任务' })).status).toBe(200);
     expect(runtime.projectWorkstreamAttachments.rename).toHaveBeenCalled();
