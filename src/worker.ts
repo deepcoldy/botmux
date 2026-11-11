@@ -5745,6 +5745,8 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
                   message: `The CLI backend changed after passthrough command ${msg.content} but before its dependent follow-up. The follow-up was withheld; verify the terminal and retry the bundle explicitly.`,
                 });
                 log(`Withheld stale bundled adopt follow-up after raw command (${followUpContent.length} chars)`);
+              } else if (result === 'refused-before-write') {
+                log(`Withheld refused bundled adopt follow-up after raw command (${followUpContent.length} chars)`);
               } else if (result === 'completed') {
                 log(`Completed adopt follow-up after raw input (${followUpContent.length} chars)`);
               }
@@ -15533,7 +15535,7 @@ function beginCliWriteCycle(): void {
  *  message listener does not await a prior async invocation, so without the
  *  outer AsyncSerialQueue two CoCo/Codex writes can overwrite the same composer
  *  while the first is sleeping before Enter or polling history. */
-type AdoptWriteResult = 'completed' | 'stale-before-write' | 'stale-after-write';
+type AdoptWriteResult = 'completed' | 'refused-before-write' | 'stale-before-write' | 'stale-after-write';
 
 async function writeAdoptMessage(
   content: string,
@@ -15658,7 +15660,10 @@ async function writeAdoptMessage(
       { turnId, dispatchAttempt },
       'failed',
     );
-    return 'completed';
+    // Nothing was written and prepareAdoptWrite never ran. Keep this distinct
+    // from a finished write so flushPending does not re-drive queued peers off
+    // a refusal: they wait for the next real prompt-ready edge as before.
+    return 'refused-before-write';
   }
 
   if (isStructuredBridgeAdoptInputCli(lastInitConfig?.cliId) && cliAdapter) {
@@ -21444,10 +21449,20 @@ async function flushPending(): Promise<void> {
     }
     if (adoptInputReady && pendingAdoptMessages.length > 0) {
       const item = pendingAdoptMessages.shift()!;
-      await runAdoptMessageForCapturedGeneration(item, () => {
+      const outcome = await runAdoptMessageForCapturedGeneration(item, () => {
         pendingAdoptMessages.unshift(item);
         log(`Re-queued adopt message at queue head for the replacement CLI generation (${item.content.length} chars)`);
       });
+      // Its native terminal can make the composer ready while the adapter is
+      // still awaiting history. That idle edge reached this flush under its
+      // mutex; re-drive after finally releases it, so the next queued message
+      // does not depend on another terminal redraw. Only a finished write
+      // re-drives: a pre-write refusal ('refused-before-write') wrote nothing
+      // and leaves peers to the next genuine prompt-ready edge, so this can
+      // never spin without a write.
+      if (outcome === 'completed' && isPromptReady && pendingAdoptMessages.length > 0) {
+        queueMicrotask(() => { void flushPending(); });
+      }
       return;
     }
     let holdDrainForPreferredReset = false;
