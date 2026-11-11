@@ -20631,7 +20631,12 @@ function scheduleSubmitFailureNotify(
     // 只要还在忙就继续等；回合结束、页脚消失后立刻回到下面正常的告警判定。
     // 必须放在 SessionStart 门控之前：门控只认 transcript，而 transcript 恰好
     // 就是迟到的那个。
-    const busyNow = (() => {
+    // Hook processing can report OSC 7501 working before Claude paints a busy footer.
+    // Background tasks can retain working after a turn; parked input still needs diagnosis/rescue.
+    const nativeWorking = idleDetector?.programStatusHeldWorking() === true
+      && submitDiagnosis.reason !== 'draft_parked'
+      && (lastInitConfig?.cliId !== 'claude-code' || !claudeComposerHoldsInput(submitDiagnosisScreen, msg));
+    const busyNow = nativeWorking || (() => {
       if (!cliAdapter?.busyPattern || !submitDiagnosisScreen) return false;
       try {
         return cliAdapter.busyPattern.test(busyProbeRegion(submitDiagnosisScreen));
@@ -20647,7 +20652,7 @@ function scheduleSubmitFailureNotify(
       && chainIsCurrent()
     ) {
       busySilenceExtra += 1;
-      log(`Deferred recheck sees the CLI positively mid-turn (busy footer) — input was accepted, waiting for the receipt. preview="${preview}"`);
+      log(`Deferred recheck sees the CLI positively mid-turn (program status or busy footer) — waiting for the receipt. preview="${preview}"`);
       armDeferredRecheck();
       return;
     }
