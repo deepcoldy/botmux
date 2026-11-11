@@ -160,23 +160,50 @@ describe('one reply card per turn', () => {
     expect(store.read(nativeKey)?.lastCard).toContain('Continue?');
   });
 
-  it('keeps settling a native CoT card that is already visible', async () => {
-    const nativeKey = await nativeTurn('om_native_existing');
-    const entry = nativeAsk('native_existing');
+  it.each([false, true])('keeps updating and settling a native CoT card that is already visible (external final=%s)', async external => {
+    const nativeKey = await nativeTurn(`om_native_existing_${external}`);
+    const entry = nativeAsk(`native_existing_${external}`);
     expect((await store.update(nativeKey, { kind: 'start' }, io)).delivered).toBe(false);
     await store.update(nativeKey, { kind: 'ask', entry }, io);
     await store.update(nativeKey, { kind: 'ask', entry: { ...entry, result: {
       kind: 'answered', answers: [['yes']], by: 'ou_user', comment: null, timedOut: false,
     } as ReplyCardAsk['result'] } }, io);
-    await store.update(nativeKey, { kind: 'progress', text: 'Continuing after the answer' }, io);
+    const patches = vi.mocked(io.patch).mock.calls.length;
+    expect((await store.update(nativeKey, { kind: 'progress', text: 'Continuing after the answer' }, io)).delivered).toBe(true);
+    expect(io.patch).toHaveBeenCalledTimes(patches + 1);
     const working = store.read(nativeKey)!.lastCard!;
+    expect(extractCardContent(working)).toContain('Continuing after the answer');
     expect(working).toContain('stop_turn');
+    if (external) expect(await store.noteExternalFinal(nativeKey, input.chatId)).toBe(true);
     await store.update(nativeKey, { kind: 'terminal', phase: 'completed' }, io);
     expect(io.send).toHaveBeenCalledTimes(1);
+    expect(io.patch).toHaveBeenCalledTimes(patches + 2);
     const settled = store.read(nativeKey)!.lastCard!;
-    expect(settled).not.toBe(working);
     expect(settled).not.toContain('stop_turn');
     expect(extractCardContent(settled)).toContain('Continuing after the answer');
+  });
+
+  it('hands progress back to the card once native thinking retires before the turn ends', async () => {
+    const nativeKey = await nativeTurn('om_native_retired');
+    let live = true;
+    const daemon = { ...io, nativeThinkingLive: () => live };
+    expect((await store.update(nativeKey, { kind: 'progress', text: 'Shown in native thinking' }, daemon)).delivered).toBe(false);
+    expect(store.read(nativeKey)?.nativeCotVisible).toBe(true);
+    // A newer turn's display replaced this one (or it failed, was switched off, or a restart lost it).
+    live = false;
+    // A CLI sender cannot see daemon display state; it relies on the persisted hand-back.
+    expect((await store.update(nativeKey, { kind: 'progress', text: 'Before the daemon notices' }, io)).delivered).toBe(false);
+    expect((await store.update(nativeKey, { kind: 'tools', tools: [{ id: 't', name: 'Bash', subject: 'npm test' }] }, daemon)).delivered).toBe(true);
+    expect(io.send).toHaveBeenCalledTimes(1);
+    expect(store.read(nativeKey)?.nativeCotVisible).toBeUndefined();
+    expect(extractCardContent(store.read(nativeKey)!.lastCard!)).toContain('Before the daemon notices');
+    expect((await store.update(nativeKey, { kind: 'progress', text: 'Now on the card' }, io)).delivered).toBe(true);
+    expect(extractCardContent(store.read(nativeKey)!.lastCard!)).toContain('Now on the card');
+    // The hand-back is final for this turn even if the daemon's view changes again.
+    live = true;
+    await store.update(nativeKey, { kind: 'progress', text: 'Still on the card' }, daemon);
+    expect(store.read(nativeKey)?.nativeCotVisible).toBeUndefined();
+    expect(io.send).toHaveBeenCalledTimes(1);
   });
 
   it('replays an unknown first native CoT POST after reopening even once nothing is actionable', async () => {

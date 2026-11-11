@@ -143,6 +143,54 @@ describe('real CLI send into a running reply card', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   }, 35_000);
 
+  it('marks only a final in this conversation as closing the turn, and completes a lost mark on retry', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-external-final-cli-'));
+    const dataDir = join(root, 'data');
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: key.sessionId, turnId: key.turnId }));
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{ larkAppId: key.larkAppId, larkAppSecret: 'fixture', cliId: 'codex', replyCardMode: 'unified', replyCardNativeCot: true }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        ...key, status: 'active', cliId: 'codex', larkAppId: key.larkAppId, chatId: 'oc_test', rootMessageId: 'om_root',
+        scope: 'thread', chatType: 'group', workingDir: root,
+      } });
+      const store = new TurnReplyCardStore(dataDir);
+      const topLevelTurn = key;
+      const notifyTurn = { ...key, turnId: 'om_turn_notify' };
+      for (const turn of [topLevelTurn, notifyTurn]) store.prepareSync(turn, { mode: 'unified', nativeCot: true, chatId: 'oc_test', rootId: 'om_root' });
+      const sendFinal = (turnId: string, ...args: string[]) => {
+        writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: key.sessionId, turnId }));
+        return spawnSyncTsScript(fixture, ['send', ...args, '--response-kind', 'final', 'Answer for everyone'], {
+          cwd: fileURLToPath(new URL('..', import.meta.url)),
+          env: { PATH: process.env.PATH, HOME: root, SESSION_DATA_DIR: dataDir, BOTS_CONFIG: join(root, 'bots.json'),
+            BOTMUX_SESSION_ID: key.sessionId, BOTMUX_TURN_ID: turnId, BOTMUX_LARK_APP_ID: key.larkAppId,
+            BOTMUX_DAEMON_IPC_PORT: '49501', BOTMUX_TEST_NATIVE_COT_BARRIER: 'ready' },
+          encoding: 'utf8', timeout: 30_000,
+        });
+      };
+      // A final posted at the group's top level leaves this topic without a closing message.
+      const elsewhere = sendFinal(topLevelTurn.turnId, '--no-mention', '--top-level');
+      expect(elsewhere.status, String(elsewhere.stderr)).toBe(0);
+      expect(String(elsewhere.stdout)).toContain('CAPTURE_REPLY=');
+      expect(store.read(topLevelTurn)?.externalFinal).toBeUndefined();
+      // A final that notifies others stays in this topic and closes the turn.
+      const first = sendFinal(notifyTurn.turnId, '--mention', 'ou_first:First');
+      expect(first.status, String(first.stderr)).toBe(0);
+      expect(String(first.stdout)).toContain('CAPTURE_REPLY=');
+      expect(store.read(notifyTurn)?.externalFinal).toBe(true);
+      // The mark is lost after delivery; the model retries the same final.
+      const notifyPath = join(store.directory, `${store.id(notifyTurn)}.json`);
+      const lost = JSON.parse(readFileSync(notifyPath, 'utf8'));
+      delete lost.externalFinal;
+      writeFileSync(notifyPath, JSON.stringify(lost));
+      const retry = sendFinal(notifyTurn.turnId, '--mention', 'ou_first:First');
+      expect(retry.status, String(retry.stderr)).toBe(0);
+      expect(String(retry.stdout)).toContain('"replayed":true');
+      expect(String(retry.stdout)).not.toContain('CAPTURE_REPLY=');
+      expect(store.read(notifyTurn)?.externalFinal).toBe(true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  }, 70_000);
+
   it.each(['ready', 'denied'])('waits for the native thinking barrier before its first answer (%s)', async barrier => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-native-order-cli-'));
     const dataDir = join(root, 'data');

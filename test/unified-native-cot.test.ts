@@ -7,7 +7,7 @@ import { config } from '../src/config.js';
 import { getBot, getBotClient } from '../src/bot-registry.js';
 import { updateMessage } from '../src/im/lark/client.js';
 import { replyCardModeFor, queueTurnReplyTools, flushTurnReplyTools, updateTurnReplyCard, updateReplyCardNativeThinking, prepareReplyCardNativeThinking, retireReplyCardDisplay } from '../src/core/turn-reply-card.js';
-import { handleCotThinkingUpdate, finalizeCotMessage } from '../src/im/lark/cot-message.js';
+import { abortCotMessage, handleCotThinkingUpdate, finalizeCotMessage } from '../src/im/lark/cot-message.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
 import { loadWorkerPoolMessageHandlers } from './helpers/worker-pool-message-harness.js';
 import { loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
@@ -189,6 +189,55 @@ describe('unified replies with an independent native CoT channel', () => {
     const record = new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' })!;
     expect(record).toMatchObject({ nativeCot: true, nativeCotReady: true });
     expect(record.nativeCotVisible).toBeUndefined();
+  });
+
+  it.each(['newer-turn', 'worker-lost', 'switched-off'] as const)('hands progress back to the answer card when native thinking retires mid-turn (%s)', async retirement => {
+    bot.config.replyCardNativeCot = true;
+    let cot = 0;
+    request.mockImplementation(async (req: any) => ({ code: 0,
+      data: req.method === 'POST' && String(req.url).endsWith('/message_cot') ? { cot_id: `cot_${++cot}`, message_id: `om_cot_${cot}` } : {} }));
+    const handle = worker();
+    const turnUpdate = (turnId: string, ...texts: string[]) => ({ type: 'thinking_update', sessionId: 'native-session', turnId,
+      entries: texts.map(text => ({ kind: 'thinking', text })) });
+    await updateTurnReplyCard(ds, 'om_turn', { kind: 'refresh' }, send);
+    handle(turnUpdate('om_turn', 'reading')); await settle(); await flushTurnReplyTools(ds, 'om_turn');
+    expect(send).not.toHaveBeenCalled();
+    if (retirement === 'newer-turn') {
+      // A type-ahead follow-up is admitted while this turn keeps running.
+      ds.currentTurnId = 'om_next';
+      await updateTurnReplyCard(ds, 'om_next', { kind: 'refresh' }, send);
+      await settle();
+      expect(send).not.toHaveBeenCalled();
+    } else if (retirement === 'worker-lost') {
+      abortCotMessage(ds); await settle();
+    } else {
+      bot.config.noCotChats = [ds.chatId];
+    }
+    handle(turnUpdate('om_turn', 'reading', 'fixing')); await settle(); await flushTurnReplyTools(ds, 'om_turn');
+    await updateTurnReplyCard(ds, 'om_turn', { kind: 'progress', text: 'fix applied, running tests' }, send);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(updateMessage).mock.calls.at(-1)?.[2]).toContain('fix applied, running tests');
+    const record = new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' })!;
+    expect(record.nativeCotVisible).toBeUndefined();
+    if (retirement === 'newer-turn') {
+      const next = new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_next' })!;
+      expect(next).toMatchObject({ nativeCotVisible: true });
+      expect(next.messageId).toBeUndefined();
+    }
+  });
+
+  it('keeps a finished turn on native thinking so a separately sent final adds no summary card', async () => {
+    bot.config.replyCardNativeCot = true;
+    const handle = worker();
+    handle(update('reading')); await settle(); await flushTurnReplyTools(ds, 'om_turn');
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' };
+    expect(await new TurnReplyCardStore(dir).noteExternalFinal(key, ds.chatId)).toBe(true);
+    // worker-pool starts the terminal card update, then settles the native display.
+    const terminal = updateTurnReplyCard(ds, 'om_turn', { kind: 'terminal', phase: 'completed' }, send);
+    finalizeCotMessage(ds, 'om_turn', 'completed');
+    await terminal; await settle();
+    expect(send).not.toHaveBeenCalled();
+    expect(new TurnReplyCardStore(dir).read(key)).toMatchObject({ phase: 'completed', nativeCotVisible: true, externalFinal: true });
   });
 
   it.each([false, true])('settles eager thinking when its transcript never starts (card update failure=%s)', async fail => {

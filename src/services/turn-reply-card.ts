@@ -43,7 +43,8 @@ export interface TurnReplyCardRecord extends TurnReplyCardKey {
   /** Durable release: retries/recovery never create another thinking display. */
   nativeCotReady?: boolean;
   /** Set with nativeCotReady: the native thinking display really exists, so it
-   * (not an early answer card) carries passive progress. Absent → card fallback. */
+   * (not an early answer card) carries passive progress. Absent → card fallback.
+   * Cleared for good once the daemon sees that display retired mid-turn. */
   nativeCotVisible?: boolean;
   /** This turn's final went out as a separate message in the same chat (for
    * example to notify others), so a completed turn needs no summary card. */
@@ -109,6 +110,9 @@ export interface TurnReplyCardTransport {
   /** Runs under the publication lock, before the first answer POST. Resolves
    * true only when the native thinking display is live for this turn. */
   beforeCreate?(): void | boolean | Promise<void | boolean>;
+  /** Daemon only (it owns the display state): whether native thinking still
+   * carries this turn. A retired display hands progress back to the card. */
+  nativeThinkingLive?(): boolean;
   isWithdrawn(error: unknown): boolean;
   /** A full answer that does not fit is delivered once as a native file. */
   sendOverflow?(text: string, uuid: string): Promise<string>;
@@ -207,7 +211,7 @@ export class TurnReplyCardStore {
       record.externalFinal = true;
       this.write(key, record);
       return true;
-    }, { maxWaitMs: 15_000 });
+    }, { maxWaitMs: 8_000 });
   }
 
   async update(key: TurnReplyCardKey, inputEvent: TurnReplyCardEvent | (() => TurnReplyCardEvent), io: TurnReplyCardTransport): Promise<{
@@ -367,6 +371,14 @@ export class TurnReplyCardStore {
           ? { ...visibleRecord, phase: 'completed' } : visibleRecord);
         return record.omitImages ? omitReplyCardImages(body) : body;
       };
+      // The display can retire before this turn ends (a newer turn replaced
+      // it, a push failed, the channel was switched off, or a restart lost it).
+      // Persist the hand-back so CLI senders, which cannot see the daemon's
+      // display state, publish progress on the card again.
+      if (record.nativeCotVisible && io.nativeThinkingLive && !io.nativeThinkingLive()) {
+        delete record.nativeCotVisible;
+        this.write(key, record);
+      }
       let card = render();
       // A live native thinking display already carries passive progress. An
       // answer card is needed for a final, an error, an actionable Ask/Oncall

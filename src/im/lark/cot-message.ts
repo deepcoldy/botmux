@@ -1197,7 +1197,22 @@ export async function prepareCotMessageBeforeReply(
   }
   if (state?.turnKey !== key) return false;
   await state.publication;
-  return !!state.cotId && !state.disabled;
+  return cotMessageCarriesTurn(ds, binding);
+}
+
+/** Whether this turn's native thinking display still carries its progress.
+ * False once it failed or was never created, was retired before the turn's own
+ * terminal (a newer turn's display replaced it, or the worker was lost), the
+ * channel was switched off, or no display state survived a daemon restart.
+ * Its own terminal closing the display is the normal end and stays true. */
+export function cotMessageCarriesTurn(ds: DaemonSession, binding: { turnId: string; dispatchAttempt?: number }): boolean {
+  const key = turnKeyOf(binding);
+  let state = states.get(ds);
+  if (state?.turnKey !== key) state = recentStates.get(ds)?.get(key);
+  if (!state || state.turnKey !== key || !state.cotId || state.disabled) return false;
+  if (earlyTerminals.get(ds)?.has(key)) return true;
+  if (state.finishStatus || state.pausedForRestore || retiredKeys.get(ds)?.includes(key)) return false;
+  return cotEnabled(ds, 'unified');
 }
 
 export function hasCotMessageForTurn(ds: DaemonSession, binding: { turnId: string; dispatchAttempt?: number }): boolean {

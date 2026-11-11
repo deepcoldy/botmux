@@ -7,7 +7,7 @@ import { config } from '../config.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
 import { getBot } from '../bot-registry.js';
-import { handleCotThinkingUpdate, finalizeCotMessage, hasCotMessageForTurn, prepareCotMessageBeforeReply } from '../im/lark/cot-message.js';
+import { cotMessageCarriesTurn, handleCotThinkingUpdate, finalizeCotMessage, hasCotMessageForTurn, prepareCotMessageBeforeReply } from '../im/lark/cot-message.js';
 import { normalizeUsageDisplay } from '../bot-registry.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
@@ -229,6 +229,7 @@ export async function updateTurnReplyCard(
     usage: withCardRuntimeIdentity(ds, usage ?? { context: null, tokens: null }, ds.session.cliId ?? cfg.cliId),
     beforeEffect,
     beforeCreate: () => prepareReplyCardNativeThinking(ds, turnId, options.dispatchAttempt, options.owns),
+    nativeThinkingLive: () => cotMessageCarriesTurn(ds, { turnId, dispatchAttempt: options.dispatchAttempt ?? replyCardDispatchAttempt(ds, turnId) }),
     send: async (body, uuid) => {
       body = prepareLocalAddressContent(body, 'interactive', localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir));
       const messageId = await send(body, 'interactive', uuid, beforeEffect);
