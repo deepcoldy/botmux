@@ -973,6 +973,12 @@ describe('isolatedPaneReattachSafe — start-time contract bump forces cold resp
     expect(isolatedPaneReattachSafe(JSON.stringify({ ...current, version: 16 }), ['credential'])).toBe(false);
   });
 
+  it('cold-spawns previous credential-only panes without project authority directory masks', () => {
+    const current = JSON.parse(isolationPaneMarkerContent('boot', ['credential'])) as Record<string, unknown>;
+    expect(isolatedPaneReattachSafe(JSON.stringify(current), ['credential'])).toBe(true);
+    expect(isolatedPaneReattachSafe(JSON.stringify({ ...current, version: 18 }), ['credential'])).toBe(false);
+  });
+
   it('restore path: a v17 sandboxed pane (no skill manifest / snapshot binds) is killed + cold-spawned; a current one warm-reattaches', () => {
     // v18 adds spawn-time read-only binds for the session's skill manifest and
     // its skill snapshot dir. Warm reattach keeps the old process + mounts

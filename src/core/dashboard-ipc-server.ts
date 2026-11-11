@@ -3443,6 +3443,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-workstream', async (req, res,
       }
       if (findActiveBySessionId(params.sessionId) !== ds || ds.managedTurnOrigin?.turnId !== turn
         || ds.managedTurnOrigin !== admittedOrigin || ds.managedTurnOrigin?.capability !== admittedCapability
+        || !canOperate(ds.larkAppId, ds.chatId, caller.requestUserOpenId!, caller.requestUserUnionId)
         || source.chatId !== ds.chatId || source.rootMessageId !== ds.session.rootMessageId
         || source.routeRevision !== (ds.session.projectRouteRevision ?? 1)) {
         throw new Error('source_route_mismatch');
