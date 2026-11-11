@@ -3251,14 +3251,12 @@ ipcRoute('POST', '/api/maintenance/suspend-idle', async (req, res) => {
  */
 ipcRoute('GET', '/api/host-overload/counts', (_req, res) => {
   const stopped = sessionStore.listSessions().filter(s => s.status === 'active' && isSessionStopped(s)).length;
-  let idle = 0;
-  for (const ds of listActiveSessions()) {
-    if (!ds.worker || ds.worker.killed) continue;
-    if (ds.adoptedFrom || ds.initConfig?.adoptMode) continue;
-    if (!isSuspendableBackendType(ds.initConfig?.backendType)) continue;
-    if (ds.lastScreenStatus !== 'idle') continue;
-    idle++;
-  }
+  // Use the SAME strict selector as the manual sweep so the card's「闲置 N」
+  // is exactly the number a click can act on (never a larger, looser count).
+  const registry = getActiveSessionsRegistry();
+  const idle = registry
+    ? selectIdleSuspendCandidates(registry, { olderThanMs: 1, now: Date.now() }).length
+    : 0;
   jsonRes(res, 200, { ok: true, stopped, idle });
 });
 
@@ -3296,22 +3294,31 @@ ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
   }
 
   if (mode === 'suspend_idle') {
-    // This daemon's own idle live workers only. Correctness guards mirror the
-    // idle-worker sweeper: never touch adopt sessions or mid-turn (busy) ones.
+    // This daemon's own idle live workers only. Keep the historical async
+    // suspend path (it flushes the session controller) but select candidates
+    // with the SAME strict selector as the operator age sweep and the CPU
+    // policy: never touch adopt, mid-turn, background-task, accepted-input,
+    // scheduled-run, activation, keep-alive or idle-auto-compact sessions.
+    const registry = getActiveSessionsRegistry();
+    if (!registry) return jsonRes(res, 503, { ok: false, error: 'session_registry_unavailable' });
+    const candidates = selectIdleSuspendCandidates(registry, {
+      olderThanMs: 1,
+      now: Date.now(),
+    });
+    const bySessionId = new Map(
+      [...registry.values()].map(ds => [ds.session.sessionId, ds] as const),
+    );
     let affected = 0;
-    for (const ds of listActiveSessions()) {
-      if (!ds.worker || ds.worker.killed) continue;             // no live worker
-      if (ds.adoptedFrom || ds.initConfig?.adoptMode) continue;  // never suspend adopt
-      if (!isSuspendableBackendType(ds.initConfig?.backendType)) continue;
-      if (ds.lastScreenStatus !== 'idle') continue;              // never cut an in-flight reply
-      if (hasUnacceptedCliInput(ds)) continue;                   // nor a message its CLI has not taken yet
+    for (const candidate of candidates) {
+      const ds = bySessionId.get(candidate.sessionId);
+      if (!ds) continue;
       try {
         if (await suspendWorkerAsync(ds, 'host_overload_suspend')) affected++;
       } catch (err) {
-        logger.warn(`[overload-sweep] suspend failed for ${ds.session.sessionId.slice(0, 8)}: ${ipcErrorText(err)}`);
+        logger.warn(`[overload-sweep] suspend failed for ${candidate.sessionId.slice(0, 8)}: ${ipcErrorText(err)}`);
       }
     }
-    logger.info(`[overload-sweep] suspend_idle: suspended ${affected} idle worker(s)`);
+    logger.info(`[overload-sweep] suspend_idle(manual): suspended ${affected} idle worker(s)`);
     return jsonRes(res, 200, { ok: true, mode, affected });
   }
 

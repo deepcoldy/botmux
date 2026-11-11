@@ -10093,7 +10093,7 @@ function clearAcceptedInputTurns(ds: DaemonSession): void {
 }
 
 /** Does the CURRENT generation still own an accepted input with no terminal? */
-function hasUnsettledAcceptedInput(ds: DaemonSession): boolean {
+export function hasUnsettledAcceptedInput(ds: DaemonSession): boolean {
   if (ds.acceptedInputOverflow) return true;
   const turns = ds.acceptedInputTurns;
   if (!turns) return false;
