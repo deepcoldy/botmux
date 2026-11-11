@@ -1,3 +1,4 @@
+import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { TraexAutoModelController, TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS, TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT } from '../src/services/traex-auto-model.js';
@@ -20,6 +21,7 @@ function fixture(extra: Record<string, unknown> = {}) {
   let resolve!: (value: any) => void;
   const catalog = new Promise<any>(done => { resolve = done; });
   const scope: Record<string, any> = {
+    inputDeliveryEvidence: new InputDeliveryEvidenceTracker(),
     traexAutoModelRuntimeEligible: () => true, traexAutoModelController: controller,
     activeTurnAuthority: authority, currentBotmuxTurnId: 'turn', cliSpawnGeneration: 1,
     lastInitConfig: { cliSessionId: 'native', model: models[0] }, backend: {},
@@ -37,6 +39,7 @@ function fixture(extra: Record<string, unknown> = {}) {
   scope.settleStoppedTraexRecovery = loadWorkerFunction('settleStoppedTraexRecovery', scope);
   scope.enqueueTraexAutoModelRecovery = loadWorkerFunction('enqueueTraexAutoModelRecovery', scope);
   scope.executeTraexAutoModelSwitch = loadWorkerFunction('executeTraexAutoModelSwitch', scope);
+  scope.releaseInputDeliveryQuarantineForStructuredTerminal = loadWorkerFunction('releaseInputDeliveryQuarantineForStructuredTerminal', scope);
   const recover = loadWorkerFunction<(turn: any) => boolean>('recoverTraexQuotaTurn', scope);
   const notify = loadWorkerFunction<(turnId: string, queued: boolean, progressing: boolean, completed?: boolean) => void>('notifyTraexModelAccessSwitchActivity', scope);
   const turn = { turnId: 'turn', sourceTurnId: 'native-turn', terminalStatus: 'failed', terminalErrorCode: TRAEX_MODEL_ACCESS_ERROR_CODE };
@@ -294,6 +297,46 @@ describe('model access recovery Worker boundary', () => {
     await loadWorkerFunction<(key: string) => Promise<void>>('handleTermAction', f.scope)('ctrlc');
     expect(f.scope.emitReadyCodexTurns).toHaveBeenCalledOnce();
     f.resolve(loads()); await new Promise(resolve => setImmediate(resolve));
+    expect(f.scope.restartCliProcess).not.toHaveBeenCalled();
+  });
+});
+
+function quarantinedFixture(extra: Record<string, unknown> = {}) {
+  const f = fixture(extra);
+  f.scope.inputDeliveryQuarantine = { backend: f.scope.backend, generation: 1, turnId: 'turn' };
+  f.scope.flushPending = vi.fn();
+  for (const name of ['currentInputDeliveryQuarantine', 'releaseInputDeliveryQuarantine',
+    'releaseInputDeliveryQuarantineForStructuredTerminal', 'armInputDeliveryQuarantine']) {
+    f.scope[name] = loadWorkerFunction(name, f.scope);
+  }
+  return f;
+}
+
+describe('exact-terminal quarantine recovery ordering', () => {
+  it('registers recovery before deferred flush, and terminal-first prevents late quarantine installation', async () => {
+    vi.useFakeTimers(); const f = quarantinedFixture({cliAdapter: {quarantineUnconfirmedSubmits: true}});
+    f.scope.flushPending.mockImplementation(() => { expect(f.scope.traexQuotaPending?.turnId).toBe('turn'); });
+    expect(f.recover(f.turn)).toBe(true);
+    expect(f.scope.inputDeliveryQuarantine).toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(f.scope.flushPending).toHaveBeenCalledOnce();
+    expect(f.scope.armInputDeliveryQuarantine(f.scope.backend, {turnId: 'turn'})).toBeNull();
+    expect(f.scope.restartCliProcess).not.toHaveBeenCalled();
+    f.resolve(loads()); await drainPromises();
+    expect(f.scope.restartCliProcess).toHaveBeenCalledOnce();
+  });
+  it('does not let an exact failure clear another dispatch attempt quarantine', async () => {
+    vi.useFakeTimers(); const f = quarantinedFixture(); f.scope.inputDeliveryQuarantine.dispatchAttempt = 7;
+    f.recover(f.turn); await vi.advanceTimersByTimeAsync(1); f.resolve(loads()); await drainPromises();
+    expect(f.scope.inputDeliveryQuarantine.dispatchAttempt).toBe(7);
+    expect(f.scope.flushPending).not.toHaveBeenCalled();
+    expect(f.scope.restartCliProcess).not.toHaveBeenCalled();
+    expect(f.scope.emitReadyCodexTurns).toHaveBeenCalledOnce();
+  });
+  it('generation rotation fences the scheduled flush after terminal release', async () => {
+    vi.useFakeTimers(); const f = quarantinedFixture(); f.recover(f.turn);
+    f.scope.cliSpawnGeneration++; await vi.advanceTimersByTimeAsync(1); f.resolve(loads()); await drainPromises();
+    expect(f.scope.flushPending).not.toHaveBeenCalled();
     expect(f.scope.restartCliProcess).not.toHaveBeenCalled();
   });
 });

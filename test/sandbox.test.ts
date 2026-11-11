@@ -7,7 +7,8 @@
  * prepareDirectSandbox. The pure mount-plan logic lives in fs-policy.ts and is
  * covered by fs-policy.test.ts.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import * as systemBwrap from '../src/core/system-bwrap.js';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync, lstatSync, chmodSync, utimesSync } from 'node:fs';
@@ -23,6 +24,34 @@ import { materializeProtectedHttpLoopbackArgs } from '../src/core/protected-http
 import type { NetworkLaunchPlan } from '../src/core/sandbox-network-launch.js';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
+
+// These tests inspect launch plans and filesystem preparation; they never
+// execute bubblewrap. Keep host package discovery out of this unit boundary so
+// a missing distro package cannot trigger sudo/apt (or turn assertions into
+// early returns). Real namespace execution remains in sandbox integration tests.
+function prepareSandboxPlan(opts: Parameters<typeof prepareDirectSandbox>[0]) {
+  const bin = mkdtempSync(join(tmpdir(), 'sbx-plan-tools-'));
+  const path = process.env.PATH;
+  for (const [name, help] of Object.entries({
+    bwrap: '--add-seccomp-fd --disable-userns',
+    slirp4netns: '--disable-host-loopback --disable-dns',
+    unshare: '--kill-child --mount-proc',
+    nft: '', ip: '',
+  })) {
+    // Discovery/help only: accidentally executing a fake sandbox must fail.
+    writeFileSync(join(bin, name), `#!/bin/sh\n[ "$1" = "--help" ] || exit 99\nprintf '%s\\n' '${help}'\n`, { mode: 0o755 });
+  }
+  process.env.PATH = `${bin}:${path ?? ''}`;
+  const resolver = vi.spyOn(systemBwrap, 'bwrapExecutable').mockReturnValue(join(bin, 'bwrap'));
+  try {
+    return prepareDirectSandbox(opts);
+  } finally {
+    resolver.mockRestore();
+    if (path === undefined) delete process.env.PATH;
+    else process.env.PATH = path;
+    rmSync(bin, { recursive: true, force: true });
+  }
+}
 
 describe('codex-app sandboxExtraExecPaths', () => {
   it('returns exactly the resolved codex bin and never the working dir', () => {
@@ -71,7 +100,7 @@ describe('prepareDirectSandbox protected egress socket mount', () => {
     const prompt = 'Keep http://127.0.0.1:0 in this prompt unchanged';
     let plan: ReturnType<typeof prepareDirectSandbox> = null;
     try {
-      plan = prepareDirectSandbox({
+      plan = prepareSandboxPlan({
         sessionId: 'provider-argv', dataDir,
         policy: { rules: [], net: true, writeRegexes: [] },
         networkPolicy: { version: 1, public: { mode: 'allow' }, private: { mode: 'allow' } },
@@ -117,7 +146,7 @@ describe('prepareDirectSandbox protected egress socket mount', () => {
     writeFileSync(protectedHttpEgressAuthTokenPath(egressPath), 'host-auth-token-fixture\n', { mode: 0o600 });
     let plan: ReturnType<typeof prepareDirectSandbox> = null;
     try {
-      plan = prepareDirectSandbox({
+      plan = prepareSandboxPlan({
         sessionId: 'protected-egress',
         dataDir,
         policy: { rules: [], net: true, writeRegexes: [] },
@@ -160,7 +189,7 @@ describe('prepareDirectSandbox protected egress socket mount', () => {
     writeFileSync(protectedHttpEgressAuthTokenPath(egressPath), 'host-auth-token-fixture\n', { mode: 0o600 });
     let plan: ReturnType<typeof prepareDirectSandbox> = null;
     try {
-      plan = prepareDirectSandbox({
+      plan = prepareSandboxPlan({
         sessionId: 'local-service-bridge',
         dataDir,
         policy: { rules: [], net: true, writeRegexes: [] },
@@ -222,8 +251,8 @@ describe('prepareDirectSandbox protected egress socket mount', () => {
       mcpGatewaySocketPath: gatewayPath,
     };
     try {
-      expect(prepareDirectSandbox({ ...common, protectedEgressSocketPath: outsidePath })).toBeNull();
-      expect(prepareDirectSandbox({ ...common, protectedEgressSocketPath: nonSocket })).toBeNull();
+      expect(prepareSandboxPlan({ ...common, protectedEgressSocketPath: outsidePath })).toBeNull();
+      expect(prepareSandboxPlan({ ...common, protectedEgressSocketPath: nonSocket })).toBeNull();
     } finally {
       await Promise.all([new Promise<void>(resolve => gateway.close(() => resolve())), new Promise<void>(resolve => outside.close(() => resolve()))]);
       rmSandboxScratch(root);
@@ -472,15 +501,13 @@ describe('prepareDirectSandbox canonicalizes the exec bin (symlinked-$HOME)', ()
     writeFileSync(realBin, '#!/bin/sh\ntrue\n', { mode: 0o755 });
     const linkBin = join(dir, 'linked-cli');
     symlinkSync(realBin, linkBin);
-    const r = prepareDirectSandbox({
+    const r = prepareSandboxPlan({
       sessionId: 'binlink', dataDir: tmp(),
       policy: { rules: [], net: true, writeRegexes: [] },
       chdir: dir, home: dir, cliBin: linkBin, cliArgs: ['--v'],
       tempDir: join(dir, 'session-temp'),
     });
-    // Off-CI without bwrap installed prepareDirectSandbox returns null (dep gate);
-    // only assert the canonicalization when it actually produced a plan.
-    if (!r) return;
+    if (!r) throw new Error('Expected sandbox plan with fixture dependencies');
     const dashDash = r.args.lastIndexOf('--');
     expect(dashDash).toBeGreaterThan(-1);
     const execTarget = r.args[dashDash + 1];
@@ -516,18 +543,18 @@ describe('sandbox TAR_OPTIONS', () => {
   it('reaches the bwrap child of a root worker', () => {
     if (process.platform !== 'linux' || process.getuid?.() !== 0) return;
     const dir = mkdtempSync(join(tmpdir(), 'sbx-tar-'));
-    const r = prepareDirectSandbox({
+    const r = prepareSandboxPlan({
       sessionId: 'taropts', dataDir: tmp(),
       policy: { rules: [], net: true, writeRegexes: [] },
       chdir: dir, home: dir, cliBin: '/bin/true', cliArgs: [],
     });
-    if (!r) return; // bwrap unavailable on this host
+    if (!r) throw new Error('Expected sandbox plan with fixture dependencies');
     const index = r.args.indexOf('TAR_OPTIONS');
     expect(r.args[index - 1]).toBe('--setenv');
     expect(r.args[index + 1]).toContain('--no-same-owner');
     r.cleanup();
     // The bot's own value is the base, not the daemon's.
-    const own = prepareDirectSandbox({
+    const own = prepareSandboxPlan({
       sessionId: 'taropts2', dataDir: tmp(),
       policy: { rules: [], net: true, writeRegexes: [] },
       chdir: dir, home: dir, cliBin: '/bin/true', cliArgs: [],
@@ -557,8 +584,8 @@ describe('prepareDirectSandbox mcode data alias', () => {
     const f = fixture();
     let plan: ReturnType<typeof prepareDirectSandbox> = null;
     try {
-      plan = prepareDirectSandbox({ ...f.opts, minimaxDataDir: f.alias, useBwrapArgsFile });
-      if (!plan) return;
+      plan = prepareSandboxPlan({ ...f.opts, minimaxDataDir: f.alias, useBwrapArgsFile });
+      if (!plan) throw new Error('Expected sandbox plan with fixture dependencies');
       const args = plan.argsFile ? readFileSync(plan.argsFile, 'utf8').split('\0') : plan.args;
       const aliasAt = args.findIndex((arg, i) => arg === '--symlink' && args[i + 2] === f.alias);
       expect(aliasAt).toBeGreaterThan(-1);
@@ -575,23 +602,23 @@ describe('prepareDirectSandbox mcode data alias', () => {
     const f = fixture();
     let plan: ReturnType<typeof prepareDirectSandbox> = null;
     try {
-      plan = prepareDirectSandbox({ ...f.opts, ...(canonical ? { minimaxDataDir: f.target } : {}) });
-      if (!plan) return;
+      plan = prepareSandboxPlan({ ...f.opts, ...(canonical ? { minimaxDataDir: f.target } : {}) });
+      if (!plan) throw new Error('Expected sandbox plan with fixture dependencies');
       expect(plan.args).not.toContain(f.alias);
     } finally { plan?.cleanup(); rmSandboxScratch(f.root); }
   });
   it.each(['missing', 'parent-only', 'denied', 'collision'] as const)('rejects an alias with %s access instead of expanding the grant', scenario => {
     if (process.platform !== 'linux') return;
     const f = fixture();
-    const baseline = prepareDirectSandbox(f.opts);
+    const baseline = prepareSandboxPlan(f.opts);
     try {
-      if (!baseline) return;
+      if (!baseline) throw new Error('Expected sandbox plan with fixture dependencies');
       baseline.cleanup();
       const rules = scenario === 'missing' ? [] : scenario === 'parent-only'
         ? [{ path: dirname(f.target), access: 'readWrite' as const, source: 'user' as const }]
         : [...f.opts.policy.rules,
         { path: scenario === 'denied' ? f.target : f.alias, access: 'deny' as const, source: 'user' as const }];
-      expect(() => prepareDirectSandbox({ ...f.opts, policy: { ...f.opts.policy, rules }, minimaxDataDir: f.alias })).toThrow(/exact canonical writable grant/);
+      expect(() => prepareSandboxPlan({ ...f.opts, policy: { ...f.opts.policy, rules }, minimaxDataDir: f.alias })).toThrow(/exact canonical writable grant/);
       expect(existsSync(join(f.opts.dataDir, 'sandboxes', f.opts.sessionId))).toBe(false);
     } finally { baseline?.cleanup(); rmSandboxScratch(f.root); }
   });
@@ -612,7 +639,7 @@ describe('prepareDirectSandbox tmux argument transport', () => {
     });
     let plan: ReturnType<typeof prepareDirectSandbox> = null;
     try {
-      plan = prepareDirectSandbox({
+      plan = prepareSandboxPlan({
         sessionId: 'long-tmux',
         dataDir,
         policy: { rules, net: true, writeRegexes: [] },
@@ -622,7 +649,7 @@ describe('prepareDirectSandbox tmux argument transport', () => {
         cliArgs: ['%s', 'space value', '$literal', 'line\nbreak'],
         useBwrapArgsFile: true,
       });
-      if (!plan) return;
+      if (!plan) throw new Error('Expected sandbox plan with fixture dependencies');
 
       expect(plan.argsFile).toBeDefined();
       expect(statSync(plan.argsFile!).mode & 0o777).toBe(0o600);
@@ -651,7 +678,7 @@ describe('prepareDirectSandbox tmux argument transport', () => {
     mkdirSync(workingDir);
     const sessionRoot = join(realpathSync(dataDir), 'sandboxes', 'invalid-argv');
     try {
-      expect(() => prepareDirectSandbox({
+      expect(() => prepareSandboxPlan({
         sessionId: 'invalid-argv',
         dataDir,
         policy: {

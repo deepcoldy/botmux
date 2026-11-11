@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
-import { spawnNodeTsScript } from './helpers/ts-runner.js';
+import { nodeTsRunnerPrefix, spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { resolveCodexRpcInput } from '../src/services/codex-rpc-input-policy.js';
 import { killWorkerTmuxSession } from './helpers/worker-tmux-session.js';
@@ -104,7 +104,7 @@ async function fixture(enabled: boolean, loadData: false | 'busy' | 'ordered' = 
   writeFileSync(rolloutPath, '');
   writeFileSync(historyPath, '');
   const fake = join(root, 'fake-traex');
-  writeFileSync(fake, `#!/usr/bin/env node
+  writeFileSync(fake, `#!${nodeTsRunnerPrefix().command}
 const fs = require('node:fs');
 if (process.argv[2] === 'debug') {
   fs.appendFileSync(${JSON.stringify(rpcRequests)}, JSON.stringify({ method: 'debug/models' }) + '\\n');
@@ -565,13 +565,14 @@ describe('TraeX auto-model real Worker and PTY', () => {
     expect(f.messages.filter(message => message.type === 'active_runtime' && message.traexAutoModelRuntime?.modelAccessRecovery?.blockedModels.length === 2).length).toBeGreaterThan(0);
   }, 45_000);
 
-  it('model access restrictions also skip confirmed quota failures during the same capacity search', async () => {
+  it.each([0, 400])('model access restrictions also skip confirmed quota failures during the same capacity search (receipt delay %sms)', async receiptDelayMs => {
     const f = await fixture(true, 'ordered', false, undefined, false, undefined, false,
       undefined, 0, 0, false, false, { code: 'other', message: 'Model access temporarily restricted.', trigger: 'capacity',
         modelErrors: { backup: { codex_error_info: 'usage_limit_exceeded', message: 'Usage quota exhausted' } },
-      });
+      }, receiptDelayMs ? { submission: 1, ms: receiptDelayMs } : undefined);
     f.child.send({ type: 'message', content: 'mixed access and quota task', turnId: 'om_access_quota' } satisfies DaemonToWorker);
     await f.wait(() => f.messages.some(message => message.type === 'turn_terminal' && message.turnId === 'om_access_quota' && message.status === 'completed'), 'mixed failure recovery complete');
+    if (receiptDelayMs) expect(f.logs.join('')).toContain('after unconfirmed submit turn=om_access_quota');
     expect(rows(f.launches).map(row => row.model)).toEqual(['core', 'backup', 'last']);
     expect(rows(f.submissions).filter(row => row.text.startsWith('mixed access and quota task'))).toHaveLength(1);
     expect(f.messages.filter(message => message.type === 'turn_terminal' && message.turnId === 'om_access_quota')).toHaveLength(1);
