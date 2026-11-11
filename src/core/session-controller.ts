@@ -367,16 +367,23 @@ export class SessionController {
     return admission;
   }
   workerLost(worker: WorkerRef): void {
-    this.store.apply(this.ref, { type: 'worker_lost', worker });
-    const runtime = this.store.runtime(this.ref);
-    if (runtime && sameWorker(runtime.worker, worker)) {
+    this.store.atomic(() => {
+      this.store.apply(this.ref, { type: 'worker_lost', worker });
+      const runtime = this.store.runtime(this.ref);
+      if (!runtime || !sameWorker(runtime.worker, worker)) return;
       this.store.apply(this.ref, { type: 'runtime_lost', runtime: runtime.ref, confirmed: false, reason: 'worker_disconnected' });
+      // Unsettled attempts on any runtime this worker continued into the lost
+      // one ran in the same CLI. Mark each such runtime once, not per attempt.
+      const sources = new Map<string, RuntimeRef>();
       for (const execution of this.store.executions(this.ref)) {
-        if (execution.runtime && this.store.runtimeContinues(this.ref, execution.runtime, runtime.ref, worker)) {
-          this.store.markUnresolvedExecutions(this.ref, execution.runtime);
+        if (execution.runtime && !['succeeded', 'failed', 'cancelled'].includes(execution.phase)) {
+          sources.set(JSON.stringify([execution.runtime.runtimeId, execution.runtime.epoch]), execution.runtime);
         }
       }
-    }
+      for (const source of sources.values()) {
+        if (this.store.runtimeContinues(this.ref, source, runtime.ref, worker)) this.store.markUnresolvedExecutions(this.ref, source);
+      }
+    });
     this.refresh();
   }
 }

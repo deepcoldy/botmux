@@ -1176,7 +1176,14 @@ export function handleCotThinkingUpdate(
     state = states.get(ds);
   }
   if (state?.turnKey !== key && retiredKeys.get(ds)?.includes(key)) return true;
-  if (state?.recovery && !recoveryIdentityMatches(ds, state.recovery)) return false;
+  if (state?.recovery && !recoveryIdentityMatches(ds, state.recovery)) {
+    if (!state.cotId || state.turnKey === key) return false;
+    // A created stream of a native task/target this session no longer runs
+    // stays untouched for the next generation's orphan sweep (its marker keeps
+    // that identity), but it must not keep every later turn without a stream.
+    retireKey(ds, state.turnKey);
+    state = undefined;
+  }
   if (state && state.turnKey !== key) {
     // superseded turn：先把旧气泡收尾（见 settleSupersededState），再换新 state。
     retireKey(ds, state.turnKey);

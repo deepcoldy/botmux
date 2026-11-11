@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { SessionController } from '../src/core/session-controller.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
+import { RestoredObserverGrantWait } from '../src/services/restored-observer-grant-wait.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { sameWorker, type WorkerRef } from '../src/services/session-contract.js';
@@ -492,6 +493,9 @@ describe('restored transcript terminal delivery', () => {
     const emit = loadWorkerFunction<() => void>('emitReadyCodexTurns', {
       codexBridgeQueue: queue, workerSessionEventScope: scope, recoverTraexQuotaTurn: () => false,
       universalOutputHandoff: undefined, checkpointCodexAdoptRecovery: checkpoint,
+      // Only a persistent Codex tmux binding can still receive a host grant.
+      lastInitConfig: { cliId: 'codex' }, effectiveBackendType: 'tmux',
+      restoredObserverGrantWait: new RestoredObserverGrantWait(), codexBridgeDrainAndMaybeEmit: vi.fn(),
     });
     scope.run(binding, emit);
     expect(checkpoint).not.toHaveBeenCalled();

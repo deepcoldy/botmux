@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
 import { admitSessionCommand } from './services/session-command-gateway.js';
-import { contractTerminalStatus, TRAEX_CONTINUATION_BACKENDS, type RuntimeIdentity } from './services/session-contract.js';
+import { contractTerminalStatus, executionObserverSupported, TRAEX_CONTINUATION_BACKENDS, type RuntimeIdentity } from './services/session-contract.js';
+import { RestoredObserverGrantWait } from './services/restored-observer-grant-wait.js';
 import {
   awaitRuntimeReservation,
   RUNTIME_RESERVATION_DEADLINE_MS,
@@ -14551,20 +14552,31 @@ function drainReliableTerminalBeforeInterrupt(): void {
   }
 }
 
+/** Restored structured turns waiting for the host's historical observer grant. */
+const restoredObserverGrantWait = new RestoredObserverGrantWait();
+
 function emitReadyCodexTurns(settledQuotaTurns?: CodexPendingTurn[]): void {
   let ready = settledQuotaTurns ?? codexBridgeQueue.drainEmittable().filter(turn => !recoverTraexQuotaTurn(turn));
   if (workerSessionEventScope) {
+    const scope = workerSessionEventScope;
     // A stale journal can contain an already-settled predecessor that cannot
     // receive an observer grant. Retire only that proven, unowned attempt;
     // owned output retries and unresolved executions keep their delivery path.
-    ready = ready.filter(turn => workerSessionEventScope!.ownsExecutionEvent(turn.turnId, turn.dispatchAttempt)
-      || !workerSessionEventScope!.isExecutionSettled(turn.turnId, turn.dispatchAttempt));
-  }
-  // Restored transcript terminals can precede the host's observer grant. Keep
-  // them queued until the exact execution origin is confirmed, then redrive.
-  if (workerSessionEventScope && ready.some(turn => !workerSessionEventScope!.ownsExecutionEvent(turn.turnId, turn.dispatchAttempt))) {
-    codexBridgeQueue.restoreDrained(ready);
-    return;
+    ready = ready.filter(turn => scope.ownsExecutionEvent(turn.turnId, turn.dispatchAttempt)
+      || !scope.isExecutionSettled(turn.turnId, turn.dispatchAttempt));
+    // Restored transcript terminals can precede the host's observer grant.
+    // Keep them queued only while that grant can still arrive; the FIFO queue
+    // holds every successor behind them. Afterwards an ungranted turn returns
+    // to ordinary admission, which refuses its cross-runtime terminal.
+    const unproven = ready.filter(turn => !scope.ownsExecutionEvent(turn.turnId, turn.dispatchAttempt));
+    if (unproven.length > 0) {
+      if (restoredObserverGrantWait.hold(scope.currentBinding()?.bindingId,
+        executionObserverSupported(lastInitConfig?.cliId, effectiveBackendType), () => codexBridgeDrainAndMaybeEmit())) {
+        codexBridgeQueue.restoreDrained(ready);
+        return;
+      }
+      log(`Restored structured turn(s) ${unproven.map(turn => turn.turnId.substring(0, 8)).join(',')} have no observer grant; returning them to ordinary admission`);
+    }
   }
   if (!universalOutputHandoff) { checkpointCodexAdoptRecovery(); checkpointStructuredBridgeRecovery(); }
   if (ready.length === 0) return;
@@ -34987,7 +34999,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         log(`Daemon retired runtime binding ${msg.bindingId} (mayExecute=false); closing the transcript bridge and the CLI backend`);
         closeRequested = true; stopBridgeWatcher(); stopScreenshotLoop(); killCli();
       } else if (continuation) void flushPending();
-      if (msg.mayExecute && msg.observedExecutions?.length) codexBridgeDrainAndMaybeEmit();
+      // The host decided which restored executions this binding may observe;
+      // release the ones it did not grant instead of waiting for the deadline.
+      const observerDecided = msg.observerDecision === true && (!scope || scope.currentBinding()?.bindingId === msg.bindingId)
+        && restoredObserverGrantWait.decide(msg.bindingId);
+      if (msg.mayExecute && (msg.observedExecutions?.length || observerDecided)) codexBridgeDrainAndMaybeEmit();
       break;
     }
 

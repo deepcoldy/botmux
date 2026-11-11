@@ -391,6 +391,17 @@ describe.each(['antigravity', 'codex'])('surviving %s thinking stream', cliId =>
     expect(sequence).toBe(2); expect(entities.get('cot2')!.status).toBe('open');
   });
 
+  it('lets a later turn open its own stream after the paused native task is replaced', async () => {
+    const ds = makeDs({ currentTurnId: 'om_turn' }); update(ds, 'before'); await flush();
+    abortCotMessage(ds); await flush(); request.mockClear();
+    ds.session.cliSessionId = 'native2'; ds.currentTurnId = 'om_next';
+    expect(update(ds, 'next turn', 'om_next')).toBe(true); await flush();
+    expect(entities.get('cot2')?.status).toBe('open');
+    // The replaced task's stream is left, with its own identity, to the next generation's sweep.
+    expect(request.mock.calls.some(([req]) => (req.data?.cot_id ?? req.url.split('/').at(-1)) === 'cot1')).toBe(false);
+    expect(entities.get('cot1')!.status).toBe('open'); expect(marker().nativeSessionId).toBe('native1');
+  });
+
   it.each(['app', 'chat', 'native'] as const)('rejects updates after the live %s identity changes', async field => {
     const ds = makeDs(); update(ds, 'before'); await flush(); request.mockClear();
     if (field === 'app') ds.larkAppId = 'other';

@@ -1,6 +1,6 @@
 import { isLeadOnlySession } from './lead-only.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
-import { sameWorker, sameRuntime } from '../services/session-contract.js';
+import { sameWorker, sameRuntime, executionObserverSupported } from '../services/session-contract.js';
 import { observeTraexInstall } from '../services/traex-install-watch.js';
 import {
   compareLaunchedInstall,
@@ -22053,7 +22053,8 @@ function setupWorkerHandlers(
           void settleTurnReplyCardTerminal(ds, msg,
             (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }), ownsLifecycleMutation)
             .catch(error => logger.warn(`[${t}] reply-card terminal: ${error.message}`));
-        } else finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
+        }
+        finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
         ds.cotForced = undefined;
         ds.lastThinkingUpdate = undefined;
         // 「执行失败」只在下一条 IM 消息入轮时清（beginNewTurn / 输入提交）。在
@@ -23086,7 +23087,11 @@ function setupWorkerHandlers(
         else {
           const runtime = sessionController.bindRuntime(msg.bindingId, contractWorker, msg.identity, msg.operationId, msg.continuesBindingId);
           const observedExecutions: NonNullable<Extract<DaemonToWorker, { type: 'runtime_contract_assigned' }>['observedExecutions']> = [];
-          if ((ds.initConfig?.cliId ?? ds.session.cliId) === 'codex' && runtime.identity?.backend === 'tmux') {
+          // A native-identified binding is the host's one observer decision for
+          // it; the worker releases restored turns this decision did not grant.
+          const observerDecision = executionObserverSupported(ds.initConfig?.cliId ?? ds.session.cliId, runtime.identity?.backend)
+            && !!runtime.identity?.nativeSessionId;
+          if (executionObserverSupported(ds.initConfig?.cliId ?? ds.session.cliId, runtime.identity?.backend)) {
             for (const execution of sessionController.store.executions(sessionController.ref)) {
               if (execution.runtime && sessionController.store.authorizeExecutionObserver(sessionController.ref, contractWorker, execution.ref)) {
                 observedExecutions.push({ runtime: execution.runtime, execution: execution.ref });
@@ -23112,6 +23117,7 @@ function setupWorkerHandlers(
           worker.send({ type: 'runtime_contract_assigned', bindingId: msg.bindingId, runtime: runtime.ref, mayExecute: runtime.phase !== 'retiring',
             ...(continuation ? { continuation } : {}),
             ...(observedExecutions.length ? { observedExecutions } : {}),
+            ...(observerDecision ? { observerDecision: true } : {}),
             executions: sessionController.store.executions(sessionController.ref).filter(execution => execution.runtime?.runtimeId === runtime.ref.runtimeId).map(execution => execution.ref),
             admissionStates: sessionController.store.executions(sessionController.ref).map(({ ref, runtime, phase }) => ({ ref, runtime, phase })) } as DaemonToWorker);
           for (const pending of sessionController.store.deferredEvents<WorkerToDaemon>(sessionController.ref, msg.bindingId)) await handleWorkerMessage(pending);
@@ -23190,6 +23196,7 @@ function setupWorkerHandlers(
         // they must never drive the replacement runtime's readiness or queue.
         const ownsDisplay = () => ownsWorkerSession() && !isSessionTransferring(ds);
         const turnId = msg.turnId;
+        if (ownsDisplay()) finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
         if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
           await settleTurnReplyCardTerminal(ds, msg,
             (body, type, uuid, beforeWrite) => scopedReply(body, type, turnId, { uuid, beforeWrite }), ownsDisplay)
