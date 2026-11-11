@@ -7,6 +7,7 @@ import {
   contractReadiness, sameWorker, sameRuntime, sameExecution, type ContractSessionRef, type WorkerRef, type RuntimeRef,
   type RuntimeIdentity, type SessionEventContext, type ContractEvent, type ExecutionRef, type ControlKind,
   type ControlOperation, type RuntimeContract, type RuntimeExecutionContinuation,
+  TRAEX_CONTINUATION_BACKENDS,
   sessionContractsEnabled,
   contractTerminalStatus,
   samePhysicalRuntimeIdentity,
@@ -72,7 +73,7 @@ export class SessionController {
     const cfg = this.ds.initConfig;
     return cfg?.cliId === 'traex' && cfg.traexAutoModel?.enabled === true
       && !cfg.adoptMode && !cfg.existingAppServerEndpoint && !cfg.wrapperCli
-      && ['pty', 'tmux', 'zellij', 'herdr'].includes(cfg.backendType);
+      && (TRAEX_CONTINUATION_BACKENDS as readonly string[]).includes(cfg.backendType);
   }
   reserveBinding(bindingId: string, worker: WorkerRef, continuation?: RuntimeExecutionContinuation): RuntimeRef {
     const state = this.store.read(this.ref)!;

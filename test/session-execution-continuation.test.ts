@@ -76,7 +76,7 @@ describe('ordinary execution continuation', () => {
       expect(s.currentExecution().runtime).toEqual(s.source);
     });
 
-  it.each(['worker', 'native', 'execution', 'durable', 'overlap', 'unsupported'] as const)(
+  it.each(['worker', 'native', 'execution', 'durable', 'overlap', 'unsupported', 'unsupported-backend'] as const)(
     'rejects an unproven continuation source (%s)', condition => {
       const s = fixture('submitting', condition === 'durable' ? 1 : undefined);
       if (condition === 'native') s.request.nativeSessionId = 'another-native';
@@ -87,6 +87,9 @@ describe('ordinary execution continuation', () => {
         s.store.apply(s.ref, { type: 'execution_phase', execution: other, runtime: s.source, phase: 'submitting' });
       }
       if (condition === 'unsupported') s.ds.initConfig!.cliId = 'codex';
+      // zmx is a selectable local backend but cannot prove a botmux-owned
+      // process; the Worker gate shares this same backend set.
+      if (condition === 'unsupported-backend') s.ds.initConfig!.backendType = 'zmx';
       expect(() => condition === 'worker'
         ? s.controller.reserveBinding('replacement', { workerId: 'foreign', generation: 2 }, s.request)
         : s.reserve()).toThrow();

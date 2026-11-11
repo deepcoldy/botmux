@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
 import { admitSessionCommand } from './services/session-command-gateway.js';
-import { contractTerminalStatus, type RuntimeIdentity } from './services/session-contract.js';
+import { contractTerminalStatus, TRAEX_CONTINUATION_BACKENDS, type RuntimeIdentity } from './services/session-contract.js';
 import {
   awaitRuntimeReservation,
   RUNTIME_RESERVATION_DEADLINE_MS,
@@ -6096,6 +6096,10 @@ function traexAutoModelRuntimeEligible(): boolean {
     && !lastInitConfig.existingAppServerEndpoint
     && !codexRpcEngine
     && !isRemoteBackendType(effectiveBackendType)
+    // Keep this backend set identical to the host's
+    // SessionController.executionContinuationSupported gate: a rotation the
+    // host cannot grant would make the replacement spawn fail fatally.
+    && (TRAEX_CONTINUATION_BACKENDS as readonly string[]).includes(effectiveBackendType)
     // A newer worker must not rotate into a host that cannot grant recovery.
     && (!workerSessionEventScope || lastInitConfig.sessionContract?.executionContinuations === true);
 }

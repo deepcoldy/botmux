@@ -27,6 +27,11 @@ export interface RuntimeExecutionContinuationResult {
   execution: ExecutionRef;
   status: 'approved' | 'rejected';
 }
+/** Local PTY-family backends whose process_start identity a continuation can
+ * prove. Remote backends run off-box; zmx launches the CLI itself rather than
+ * botmux, so neither can supply the required physical process proof. The host
+ * gate and the Worker rotation gate must use this same set. */
+export const TRAEX_CONTINUATION_BACKENDS = ['pty', 'tmux', 'zellij', 'herdr'] as const;
 export interface RuntimeIdentity {
   backend: string;
   physicalId: string;
