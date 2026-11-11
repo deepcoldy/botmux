@@ -41,6 +41,23 @@ function append(...records: unknown[]): void {
   appendFileSync(rollout, records.map(record => JSON.stringify(record)).join('\n') + '\n');
 }
 
+// Real traex 0.214.1 shape: the raw items carry plain user.text with no skill
+// block; only the display completion's UserMessage knows the native skill
+// object. Drain order must let that display record claim the turn first.
+function realisticUser(text = '$receipt' + BODY, skillName = 'receipt', skillPath = '/tmp/skills/receipt/SKILL.md') {
+  return { timestamp: new Date(START + 100).toISOString(), type: 'history_mutation', payload: {
+    operation: 'append', turn_id: 'native-1',
+    items: [{ type: 'message', role: 'user',
+      internal_chat_message_metadata_passthrough: { turn_id: 'native-1', content_item_kinds: ['user.text'] },
+      content: [{ type: 'input_text', text }] }],
+    display_completions: [{
+      thread_id: SID, turn_id: 'native-1', item: { type: 'UserMessage', id: 'user-1', content: [
+        { type: 'text', text }, { type: 'skill', name: skillName, path: skillPath },
+      ] },
+    }],
+  } };
+}
+
 describe('TRAE native skill submit receipts', () => {
   it.each([
     '/tmp/skills/receipt/SKILL.md',
@@ -129,6 +146,51 @@ describe('TRAE native skill task attribution', () => {
     expect(started).toEqual(['im-skill']);
     expect(queue.drainEmittable()).toEqual([expect.objectContaining({
       turnId: 'im-skill', sourceSessionId: SID, sourceTurnId: 'native-1', finalText: 'Receipt checked.',
+    })]);
+    expect(queue.size()).toBe(0);
+    queue.ingest(drained.events);
+    expect(queue.drainEmittable()).toEqual([]);
+    expect(started).toEqual(['im-skill']);
+  });
+
+  it('hashes a dollar-skill mark and attributes the native token via its skill block', () => {
+    const queue = new CodexBridgeQueue(() => START);
+    queue.setLocalTurns(true, START);
+    const started: string[] = [];
+    queue.setTurnStartObserver(turn => started.push(turn.turnId));
+    // A leading $ must enter the same hash gate as a slash command: the native
+    // UserMessage only matches through inputTextAliases, so a mark without
+    // inputTextHash could never start this turn and would lose it to a local
+    // turn synthesis.
+    queue.mark('im-dollar-skill', '$receipt' + BODY, START);
+    expect(queue.peek()[0].inputTextHash).toMatch(/^[a-f0-9]{64}$/);
+    queue.beginSubmitVerification('im-dollar-skill', START);
+    append(user('$receipt' + BODY, 'receipt', '/tmp/skills/receipt/SKILL.md'));
+    queue.ingest(drainTraexRollout(rollout, 0, { adoptMode: true }).events);
+    expect(started).toEqual(['im-dollar-skill']);
+    expect(queue.peek()[0]).toMatchObject({
+      turnId: 'im-dollar-skill', started: true, sourceMessageId: 'user-1',
+    });
+  });
+
+  it('attributes a real-shaped record once when raw items lack the skill block', () => {
+    const queue = new CodexBridgeQueue(() => START + 2_000);
+    queue.setLocalTurns(true, START);
+    const started: string[] = [];
+    queue.setTurnStartObserver(turn => started.push(turn.turnId));
+    queue.mark('im-skill', '/receipt' + BODY, START);
+    queue.beginSubmitVerification('im-skill', START);
+    append(realisticUser(), { timestamp: new Date(START + 1_000).toISOString(), type: 'event_msg', payload: {
+      type: 'task_complete', turn_id: 'native-1', last_agent_message: 'Receipt checked.',
+    } });
+    const drained = drainTraexRollout(rollout, 0, { adoptMode: true });
+    // Only the display-derived UserMessage carries aliases; the raw user.text
+    // item is de-duplicated on the same native turn id and emits nothing.
+    expect(drained.events.filter(event => event.kind === 'user')).toHaveLength(1);
+    queue.ingest(drained.events);
+    expect(started).toEqual(['im-skill']);
+    expect(queue.drainEmittable()).toEqual([expect.objectContaining({
+      turnId: 'im-skill', sourceTurnId: 'native-1', finalText: 'Receipt checked.',
     })]);
     expect(queue.size()).toBe(0);
     queue.ingest(drained.events);
