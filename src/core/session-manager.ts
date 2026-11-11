@@ -2223,7 +2223,9 @@ export function buildFollowUpCliInput(
   const hookTurnId = opts?.turnId;
   if (resolveEnvelopeInjectionMode(opts) === 'hook' && hookTurnId) {
     const blocks = buildFollowUpBlocks(content, sessionId, opts, true);
-    const ENVELOPE_KEYS = new Set<FollowUpBlockKey>(['formatting', 'reminder', 'whiteboard', 'sender', 'mentions']);
+    // messageLocation 是宿主元数据，与 sender 同类：hook 模式下进 envelope，
+    // 输入框与 transcript 仍只有用户正文。
+    const ENVELOPE_KEYS = new Set<FollowUpBlockKey>(['formatting', 'reminder', 'whiteboard', 'sender', 'mentions', 'messageLocation']);
     const ptyText = blocks
       .filter((b) => !ENVELOPE_KEYS.has(b.key))
       .map((b) => b.text)

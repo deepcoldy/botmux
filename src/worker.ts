@@ -21973,12 +21973,6 @@ async function flushPending(): Promise<void> {
           item.durablePrimaryInbox,
         );
       }
-      // Claude/Codex have stronger native-consumption callbacks. Other adapters
-      // acknowledge delivery by returning successfully from writeInput.
-      if (result?.submitted !== false && !writeAdapter.claudeDataDir
-        && !codexHistoryMatchProvesConsumption() && !writeRpcEngine) {
-        markReplyInputConsumed(item.turnId);
-      }
       const queuedPostSubmitNativeTitle = result?.submitted !== false
         ? maybeQueuePostSubmitNativeSessionTitle(item)
         : false;
@@ -33702,7 +33696,11 @@ function acknowledgeTurnInputReceived(turnId?: string): void {
   if (turnId) send({ type: 'turn_input_received', turnId });
 }
 
-/** Keep reply location separate from execution identity and the final queue. */
+/** Keep reply location separate from execution identity and the final queue.
+ * Called only with native consumption proof (acknowledgeNativeInputConsumed),
+ * never because writeInput returned: CoCo and Antigravity's queue mode accept a
+ * busy-time Enter but park it until the running turn ends, so a write-time mark
+ * would send the running turn's own answer to the still-unread message. */
 function markReplyInputConsumed(turnId: string | undefined): void {
   const queued = queuedTypeAheadTurns.find(turn => turn.turnId === turnId);
   if (!queued || queued.inputConsumed) return;

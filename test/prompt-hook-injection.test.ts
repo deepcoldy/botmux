@@ -158,11 +158,16 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     for (const root of [undefined, 'om_topic']) {
       const messageLocation = { messageId: 'om_followup', ...(root ? { rootMessageId: root } : {}) };
       const result = buildFollowUpCliInput('followup', SESSION_ID, followUpOpts({ messageLocation }));
-      expect(result.content).toContain('message_id="om_followup"');
-      expect(result.content).toContain(`placement="${root ? 'thread' : 'chat'}"`);
-      if (root) expect(result.content).toContain('root_message_id="om_topic"');
-      else expect(result.content).not.toContain('root_message_id=');
-      if (mode === 'auto') expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeDefined();
+      // hook 模式：位置元数据随 sender 一起进 envelope，输入框只剩正文。
+      const visible = mode === 'auto' ? claimByPrompt(SESSION_ID, TURN_ID, result.content)! : result.content;
+      if (mode === 'auto') {
+        expect(result.content).toBe('followup');
+        expect(visible).toBeDefined();
+      }
+      expect(visible).toContain('message_id="om_followup"');
+      expect(visible).toContain(`placement="${root ? 'thread' : 'chat'}"`);
+      if (root) expect(visible).toContain('root_message_id="om_topic"');
+      else expect(visible).not.toContain('root_message_id=');
     }
   });
 

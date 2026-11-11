@@ -6,6 +6,7 @@ import { describe, expect, it } from 'vitest';
 import { spawnSyncTsScript } from './helpers/ts-runner.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { beginReplyTargetTurn } from '../src/core/reply-target.js';
+import { selectReplyMessageId } from '../src/core/reply-message.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
@@ -102,6 +103,27 @@ describe('send addresses the consumed message without changing final attribution
       expect(result.writes).toEqual([]);
     } finally { f.close(); }
   });
+  it.each([
+    [['--quote', 'om_first'], '/open-apis/im/v1/messages/om_topic/reply'],
+    [['--top-level'], '/open-apis/im/v1/messages'],
+  ])('explicit routing %j keeps the execution turn and its sender', (args, path) => {
+    const f = setup();
+    try {
+      const result = f.run(args);
+      expect(result.status, String(result.stderr)).toBe(0);
+      expect(result.writes[0].path).toBe(path);
+      expect(result.writes[0].body.content).toContain('ou_first');
+      expect(result.writes[0].body.content).not.toContain('ou_second');
+    } finally { f.close(); }
+  });
+  it('refuses --reply-to combined with explicit routing before any provider write', () => {
+    const f = setup();
+    try {
+      const result = f.run(['--reply-to', 'om_first', '--quote', 'om_first']);
+      expect(result.status).toBe(2);
+      expect(result.writes).toEqual([]);
+    } finally { f.close(); }
+  });
   it('keeps a final required for each queued turn', () => {
     const f = setup();
     try {
@@ -112,5 +134,29 @@ describe('send addresses the consumed message without changing final attribution
       expect(second.status, String(second.stderr)).toBe(0);
       expect(second.writes).toHaveLength(1);
     } finally { f.close(); }
+  });
+});
+
+describe('selectReplyMessageId', () => {
+  const retained = () => ({ target: { mode: 'plain', chatId: 'oc_test' } });
+  const s = { sessionId: 'sid', turnReplyContexts: { om_a: retained(), om_b: retained(), om_c: retained() } };
+  const marker = (over: Record<string, unknown> = {}) => ({
+    sessionId: 'sid', turnId: 'om_a',
+    queuedTurns: [{ turnId: 'om_b', inputConsumed: true as const }, { turnId: 'om_c', inputConsumed: true as const }, { turnId: 'om_d' }],
+    ...over,
+  });
+  it('follows the newest consumed message that this session retained', () => {
+    expect(selectReplyMessageId(s, 'om_a', marker())).toBe('om_c');
+    expect(selectReplyMessageId(s, 'om_a', marker({ queuedTurns: [{ turnId: 'om_b', inputConsumed: true }, { turnId: 'om_gone', inputConsumed: true }] }))).toBe('om_a');
+  });
+  it('ignores a marker for another session or another execution turn', () => {
+    expect(selectReplyMessageId(s, 'om_a', marker({ sessionId: 'other' }))).toBe('om_a');
+    expect(selectReplyMessageId(s, 'om_a', marker({ turnId: 'om_older' }))).toBe('om_a');
+    expect(selectReplyMessageId(s, 'om_a', null)).toBe('om_a');
+  });
+  it('accepts only a retained message id from this session for --reply-to', () => {
+    expect(selectReplyMessageId(s, 'om_a', marker(), 'om_b')).toBe('om_b');
+    expect(() => selectReplyMessageId(s, 'om_a', marker(), 'om_unknown')).toThrow();
+    expect(() => selectReplyMessageId({ ...s, turnReplyContexts: { ...s.turnReplyContexts, x_b: retained() } }, 'om_a', marker(), 'x_b')).toThrow();
   });
 });
