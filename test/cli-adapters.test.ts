@@ -29,6 +29,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
+import { t } from '../src/i18n/index.js';
 import { busyProbeRegion } from '../src/utils/busy-probe.js';
 import { shouldWriteNow } from '../src/utils/input-gate.js';
 import { isTypeAheadBlockedByBypass, resolvePtyInputPolicy } from '../src/utils/pty-input-policy.js';
@@ -189,6 +190,30 @@ describe('Codex zero injection isolation', () => {
       rmSync(home, { recursive: true, force: true });
     }
   });
+});
+
+// The full local-address rule rides the Botmux system prompt only for a bot that
+// turned on BotConfig.hideLocalAddresses; the worker hands the flag to every
+// adapter that builds that prompt.
+describe('local-address rule in adapter-built system prompts', () => {
+  const rule = t('ai.routing.no_local_addresses', undefined, 'zh');
+  const adapters = [
+    ['claude-code', () => createClaudeCodeAdapter()],
+    ['genius', () => createGeniusAdapter('/bin/genius')],
+    ['grok', () => createGrokAdapter('/bin/grok')],
+    ['pi', () => createPiAdapter('/bin/pi', () => '/tmp/boundary.js')],
+    ['oh-my-pi', () => createOhMyPiAdapter('/bin/omp', () => '/tmp/boundary.js')],
+  ] as const;
+  it.each(adapters.flatMap(([name, create]) => [true, false, undefined].map(on => [name, create, on] as const)))(
+    '%s carries the rule when hideLocalAddresses=%s', (_name, create, hideLocalAddresses) => {
+      const env: Record<string, string> = {};
+      const args = create().buildArgs({ sessionId: 'sess-local-rule', resume: false, locale: 'zh', botName: 'B',
+        botOpenId: 'ou_b', env, ...(hideLocalAddresses === undefined ? {} : { hideLocalAddresses }) });
+      const prompt = [...args, ...Object.values(env)].join('\n');
+      expect(prompt).toContain('<botmux_routing>');
+      if (hideLocalAddresses) expect(prompt).toContain(rule);
+      else expect(prompt).not.toContain(rule);
+    });
 });
 
 describe('zero injection with structured final reply adapters', () => {

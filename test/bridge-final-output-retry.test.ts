@@ -301,6 +301,14 @@ afterAll(async () => {
   rmSync(config.session.dataDir, { recursive: true, force: true });
 });
 
+import { setHideLocalAddressesResolver } from '../src/im/lark/local-address-switch.js';
+
+// The local-address cases in this file are for bots that turned on
+// BotConfig.hideLocalAddresses (default off; the off path is covered in
+// test/local-address-egress.test.ts). The registry is mocked here, so the
+// switch is answered directly.
+setHideLocalAddressesResolver(() => true);
+
 describe('Bridge final_output delivery (P2 retry)', () => {
   beforeEach(async () => {
     const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
@@ -3931,6 +3939,36 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(cardJson).toContain('file');
     expect(cardJson).not.toContain(missing);
     expect(cardJson).not.toContain('[file](');
+  });
+
+  it('forwards host paths and local links as written for a bot that has not turned on hideLocalAddresses', async () => {
+    const restore = setHideLocalAddressesResolver(() => false);
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    try {
+      const ds = makeDs();
+      ds.workingDir = '/custom/project';
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, {
+        ...finalOutputMsg(),
+        content: '排查证据在 /opt/app/logs/error.log 和 /custom/project/src/main.ts:12，见 [说明](/home/alice/notes.md)，服务 http://localhost:3000/health',
+      }, 'tag', 0);
+
+      await vi.advanceTimersByTimeAsync(10);
+
+      const cardJson = sessionReply.mock.calls[0][1] as string;
+      for (const kept of ['/opt/app/logs/error.log', '/custom/project/src/main.ts:12', '[说明](/home/alice/notes.md)', 'http://localhost:3000/health']) {
+        expect(cardJson).toContain(kept);
+      }
+      expect(cardJson).not.toContain('内部文件');
+    } finally {
+      restore();
+    }
   });
 
   it('removes an inaccessible home-shaped relative link from non-isolated bridge output', async () => {

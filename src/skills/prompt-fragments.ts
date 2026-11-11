@@ -150,7 +150,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   {
     key: 'ai.routing.no_local_addresses', block: 'routing_system', stage: 'new', kind: 'editable',
     label: '飞书回复：用户可访问的地址',
-    gateLabel: '完整规则，每个会话一次：系统提示，或无系统提示 CLI 的首轮 Shell 提示',
+    gateLabel: '仅 bot 配置开启「隐藏开发机地址」时注入（默认关）；完整规则每个会话一次：系统提示，或无系统提示 CLI 的首轮 Shell 提示',
   },
   {
     key: 'ai.routing.intro_transcript', block: 'routing_system', stage: 'new', kind: 'editable',
@@ -378,7 +378,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   {
     key: 'ai.followup.no_local_addresses', block: 'followup', stage: 'followup', kind: 'editable',
     label: '飞书回复：用户可访问的地址（每轮一句）',
-    gateLabel: '随每轮飞书格式提示；完整规则在会话开始阶段',
+    gateLabel: '仅 bot 配置开启「隐藏开发机地址」时随每轮飞书格式提示（默认关）；完整规则在会话开始阶段',
   },
   {
     key: 'ai.followup.reminder_hook', block: 'followup', stage: 'followup', kind: 'editable',

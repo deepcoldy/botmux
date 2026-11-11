@@ -364,7 +364,7 @@ export async function sendMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendMessage');
-  content = prepareLocalAddressContent(content, msgType, linkFieldContext());
+  content = prepareLocalAddressContent(content, msgType, linkFieldContext(larkAppId));
   const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'sendMessage', async () => {
     // A retry gets a new cache after the gate wait, never a previous attempt's
@@ -434,7 +434,7 @@ export async function replyMessage(
   options?: OutboundMessageOptions,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'replyMessage');
-  content = prepareLocalAddressContent(content, msgType, linkFieldContext());
+  content = prepareLocalAddressContent(content, msgType, linkFieldContext(larkAppId));
   const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(larkAppId, 'replyMessage', async () => {
     const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
@@ -820,7 +820,7 @@ export async function sendUserMessage(
   options?: Pick<OutboundMessageOptions, 'beforeWrite'>,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendUserMessage');
-  content = prepareLocalAddressContent(content, msgType, linkFieldContext());
+  content = prepareLocalAddressContent(content, msgType, linkFieldContext(larkAppId));
   const wireUuid = dedupeUuid(uuid);
   return executeWithLarkGate(
     larkAppId,
@@ -1344,7 +1344,7 @@ export async function sendEphemeralCard(
   larkAppId: string, chatId: string, openId: string, cardJson: string,
 ): Promise<string> {
   assertLarkTransport(larkAppId, 'sendEphemeralCard');
-  cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext());
+  cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext(larkAppId));
   return executeWithLarkGate(larkAppId, 'sendEphemeralCard', async () => {
     const c = getBotClient(larkAppId);
     let card: unknown;
@@ -1410,7 +1410,7 @@ export async function updateMessage(
   const beforeWrite = typeof optionsOrAck === 'object' ? optionsOrAck.beforeWrite : undefined;
   const returnAcknowledgement = optionsOrAck === true || (typeof optionsOrAck === 'object' && optionsOrAck.returnAcknowledgement === true);
   assertLarkTransport(larkAppId, 'updateMessage');
-  cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext());
+  cardJson = prepareLocalAddressContent(cardJson, 'interactive', linkFieldContext(larkAppId));
   return executeWithLarkGate(larkAppId, 'updateMessage', async () => {
     const topicLookup = createTopicMessageLookupCache(lookupWriteTopic);
     await assertMessageWriteAllowed(larkAppId, messageId, topicLookup.lookup);
@@ -1488,7 +1488,7 @@ export async function updateCardStreamingSettings(
   settings: CardStreamingSettings,
 ): Promise<void> {
   assertLarkTransport(larkAppId, 'updateCardStreamingSettings');
-  settings = sanitizeLocalAddressNode(settings, linkFieldContext());
+  settings = sanitizeLocalAddressNode(settings, linkFieldContext(larkAppId));
   return executeWithLarkGate(larkAppId, 'updateCardStreamingSettings', async () => {
     await assertMessageWriteAllowed(larkAppId, settings.messageId);
     const c = getBotClient(larkAppId);
@@ -1552,7 +1552,7 @@ export async function patchCardStreamElement(
   messageId?: string,
 ): Promise<void> {
   assertLarkTransport(larkAppId, 'patchCardStreamElement');
-  partialElement = sanitizeLocalAddressNode(partialElement, linkFieldContext());
+  partialElement = sanitizeLocalAddressNode(partialElement, linkFieldContext(larkAppId));
   return executeWithLarkGate(larkAppId, 'patchCardStreamElement', async () => {
     await assertMessageWriteAllowed(larkAppId, messageId);
     const c = getBotClient(larkAppId);

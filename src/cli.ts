@@ -10769,7 +10769,11 @@ async function registerSelfFromCredFile(): Promise<void> {
   // transport boundary (getBotClient throws for apiOnly). A non-apiOnly bot with
   // no secret is still a no-op (nothing to register).
   if (!cred.larkAppSecret && cred.apiOnly !== true) return;
-  const { registerBot } = await import('./bot-registry.js');
+  const { registerBot, resolveHideLocalAddresses } = await import('./bot-registry.js');
+  // Read before registering: a host session can read bots.json (the live
+  // setting); only an isolated sandbox falls back to the worker's snapshot.
+  // The cred file outlives the sandboxed session that wrote it.
+  const hideLocalAddresses = resolveHideLocalAddresses(appId);
   registerBot({
     larkAppId: appId,
     larkAppSecret: cred.larkAppSecret ?? '',
@@ -10785,6 +10789,7 @@ async function registerSelfFromCredFile(): Promise<void> {
       process.env.BOTMUX_USAGE_DISPLAY === 'off'
         ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
         : undefined,
+    hideLocalAddresses: hideLocalAddresses || undefined,
   } as import('./bot-registry.js').BotConfig);
 }
 
@@ -10873,6 +10878,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
       process.env.BOTMUX_USAGE_DISPLAY === 'off'
         ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
         : undefined,
+    hideLocalAddresses: process.env.BOTMUX_HIDE_LOCAL_ADDRESSES === '1' || undefined,
   } as unknown as import('./bot-registry.js').BotConfig;
 
   const session: SessionData = {

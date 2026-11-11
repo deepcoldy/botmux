@@ -9887,6 +9887,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     replyCardNativeCot: cardPrefs.replyCardNativeCot,
     senderTag: cardPrefs.senderTag,
     senderTagHideEmail: cardPrefs.senderTagHideEmail,
+    hideLocalAddresses: cardPrefs.hideLocalAddresses,
     overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
     autoInviteOwnerOnGroupAdd: cardPrefs.autoInviteOwnerOnGroupAdd,
@@ -10053,6 +10054,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
     senderTag?: unknown;
     senderTagHideEmail?: unknown;
+    hideLocalAddresses?: unknown;
   }>(req, res);
   if (body === BAD_JSON) return;
 
@@ -10075,6 +10077,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
     senderTag?: boolean;
     senderTagHideEmail?: boolean;
+    hideLocalAddresses?: boolean;
   } = {};
   for (const key of [...REPLY_FOOTER_KEYS, 'showReplyTiming'] as const) {
     if (body[key] !== undefined) {
@@ -10134,6 +10137,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   else if (typeof body.thinkingCard === 'boolean') patch.cotEnabled = body.thinkingCard;
   if (typeof body.senderTag === 'boolean') patch.senderTag = body.senderTag;
   if (typeof body.senderTagHideEmail === 'boolean') patch.senderTagHideEmail = body.senderTagHideEmail;
+  if (typeof body.hideLocalAddresses === 'boolean') patch.hideLocalAddresses = body.hideLocalAddresses;
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
   if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;

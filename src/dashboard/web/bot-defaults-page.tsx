@@ -658,6 +658,7 @@ export function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefau
     replyCardNativeCot: body.replyCardNativeCot,
     senderTag: body.senderTag,
     senderTagHideEmail: body.senderTagHideEmail,
+    hideLocalAddresses: body.hideLocalAddresses,
     summaryMemory: body.summaryMemory,
     summaryMemoryPath: body.summaryMemoryPath,
     botToBotSameDir: body.botToBotSameDir,
@@ -1208,6 +1209,7 @@ function BotDefaultsCard(props: {
             <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('feedback')}><FeedbackSettingsSection bot={bot} patchBot={patchBot} active={props.activeTab === 'cards'} /></section>
             <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('oncall')}><OncallSettingsSection bot={bot} patchBot={patchBot} active={props.activeTab === 'cards'} /></section>
             <section className="bd-tile bd-tile-wide" id={botDefaultsSectionDomId('reply-style')}><ReplyStyleSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile" id={botDefaultsSectionDomId('local-address')}><LocalAddressSection bot={bot} patchBot={patchBot} putCardPref={putCardPref} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('ask-option-layout')}><AskOptionLayoutSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile" id={botDefaultsSectionDomId('brand')}><BrandSection bot={bot} patchBot={patchBot} brandEnabled={props.brandEnabled} /></section>
           </BdTabGrid>
@@ -6701,6 +6703,46 @@ export function SenderTagSection(props: { bot: BotDefaultsRow; patchBot: PatchBo
       <small className="bd-section-note">{tr('botDefaults.senderTagNote')}</small>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-sender-tag-status': '' }} />
+      </div>
+    </section>
+  );
+}
+
+export function LocalAddressSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
+  const tr = useT();
+  const [on, setOn] = useState(props.bot.hideLocalAddresses === true);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => setOn(props.bot.hideLocalAddresses === true), [props.bot.hideLocalAddresses]);
+
+  async function save(next: boolean): Promise<void> {
+    const previous = on;
+    setOn(next);
+    await saveBotField({
+      request: () => props.putCardPref({ hideLocalAddresses: next }),
+      strict: false,
+      setStatus,
+      setBusy,
+      saved: tr('botDefaults.cardPrefSaved'),
+      onSaved: () => props.patchBot(props.bot.larkAppId, { hideLocalAddresses: next }),
+      rollback: () => setOn(previous),
+    });
+  }
+
+  return (
+    <section className="bd-section" data-local-address>
+      <h3 className="bd-section-title">{tr('botDefaults.sectionLocalAddress')}</h3>
+      <ToggleRow
+        checked={on}
+        disabled={busy}
+        dataAction="toggle-hide-local-addresses"
+        title={tr('botDefaults.hideLocalAddresses')}
+        help={tr('botDefaults.hideLocalAddressesHelp')}
+        onChange={checked => void save(checked)}
+      />
+      <div className="actions">
+        <StatusSpan status={status} attr={{ 'data-local-address-status': '' }} />
       </div>
     </section>
   );
