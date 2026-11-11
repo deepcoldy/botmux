@@ -33,6 +33,7 @@ export function checkpointCodexAdoptTurns(
       .map(identity => identity.turnId);
     return [{ turnId: turn.turnId, markTimeMs: turn.markTimeMs,
       fingerprint: turn.contentFingerprint, jsonlPath: rolloutPath,
+      ...(turn.inputTextHash ? { inputTextHash: turn.inputTextHash } : {}),
       ...(turn.linkRefMode ? { linkRefMode: turn.linkRefMode } : {}),
       ...(turn.sourceTurnId && supersededTurnIds?.length ? { mergedExecution: {
         sourceTurnId: turn.sourceTurnId,

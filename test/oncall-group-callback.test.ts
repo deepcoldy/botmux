@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
+  identityRequest: vi.fn(),
   config: { session: { dataDir: '' } },
   bot: { config: { brand: 'feishu', oncallGroup: { enabled: true, chatIds: ['oc_source'] } } },
   reply: vi.fn(), sender: vi.fn(), detail: vi.fn(), update: vi.fn(),
@@ -15,6 +16,7 @@ vi.mock('../src/im/lark/identity-cache.js', () => ({ resolveSender: mocks.sender
 
 import { attachOncallGroupButton, handleOncallGroupAction, recordOncallGroupDelivery } from '../src/im/lark/oncall-group.js';
 import { OncallGroupStore, type OncallGroupSource } from '../src/services/oncall-group-store.js';
+vi.mock('@larksuiteoapi/node-sdk', () => ({ DefaultCache: class {}, Client: class { request = mocks.identityRequest; } }));
 
 let dir: string;
 let source: OncallGroupSource;
@@ -39,6 +41,35 @@ beforeEach(() => {
 afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
 describe('Oncall card callback', () => {
+  it('does not claim or create a group when the feature is disabled during shared identity lookup', async () => {
+    (mocks.bot.config.oncallGroup as any).identitySource = 'shared';
+    vi.stubEnv('ONCALL_IDENTITY_APP_ID', 'cli_directory'); vi.stubEnv('ONCALL_IDENTITY_APP_SECRET', 'pending-directory-secret');
+    let release!: (profile: unknown) => void;
+    mocks.identityRequest.mockImplementation(({ url }) => url.includes('/tenant/')
+      ? Promise.resolve({ code: 0, data: { tenant: { tenant_key: 'tenant' } } })
+      : new Promise(resolve => { release = resolve; }));
+    const callback = event(); callback.operator.user_id = 'real_user'; callback.operator.tenant_key = 'tenant';
+    const operation = handleOncallGroupAction(callback, 'app');
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    mocks.bot.config.oncallGroup.enabled = false;
+    release({ code: 0, data: { user: { user_id: 'real_user', email: 'actual@example.test' } } });
+    await operation;
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
+  });
+  it('creates a group for a trusted shared-app user without querying the business app directory or trusting action values', async () => {
+    (mocks.bot.config.oncallGroup as any).identitySource = 'shared';
+    vi.stubEnv('ONCALL_IDENTITY_APP_ID', 'cli_directory'); vi.stubEnv('ONCALL_IDENTITY_APP_SECRET', 'directory-secret');
+    mocks.identityRequest.mockImplementation(async ({ url }) => url.includes('/tenant/') ? { code: 0, data: { tenant: { tenant_key: 'tenant' } } }
+      : { code: 0, data: { user: { user_id: 'real_user', email: 'actual@example.test' } } });
+    const callback = event(); callback.operator.user_id = 'real_user'; callback.operator.tenant_key = 'tenant';
+    callback.action.value.user_id = 'spoofed_user'; callback.action.value.email = 'spoofed@example.test';
+    await handleOncallGroupAction(callback, 'app');
+    expect(mocks.sender).not.toHaveBeenCalled();
+    expect(mocks.identityRequest).toHaveBeenCalledWith(expect.objectContaining({ url: '/open-apis/contact/v3/users/real_user' }));
+    expect(fetcher.mock.calls[0][1].headers['x-api-user']).toBe('actual');
+    expect(new OncallGroupStore(dir).getRequest(source)?.status).toBe('succeeded');
+  });
   it('rejects missing operators, mismatched chats, missing sources and disabled old cards', async () => {
     for (const data of [event(''), event('ou_clicker', 'oc_other'), { ...event(), context: { open_message_id: 'om_unknown' } }]) {
       expect((await handleOncallGroupAction(data, 'app')).toast.type).toBe('error');

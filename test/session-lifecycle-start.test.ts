@@ -5563,6 +5563,26 @@ describe('persistent backend target handoff', () => {
   });
 });
 
+// The full local-address rule in the CLI system prompt is decided per bot when
+// the worker is forked; bots that have not turned the switch on get no flag.
+describe('hideLocalAddresses rides the worker init for the system prompt', () => {
+  const readInit = () => {
+    const worker = forkMock.mock.results.at(-1)!.value;
+    return vi.mocked(worker.send).mock.calls[0][0];
+  };
+
+  it('is absent for a bot with the default (off)', () => {
+    forkWorker(makeDs(), 'hello', false);
+    expect(readInit().hideLocalAddresses).toBeUndefined();
+  });
+
+  it('is set for a bot that turned it on', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ hideLocalAddresses: true }));
+    forkWorker(makeDs(), 'hello', false);
+    expect(readInit().hideLocalAddresses).toBe(true);
+  });
+});
+
 describe('no-transport read isolation follows local sandbox config (not forced)', () => {
   // Behavioral lock for the 2026-08 change: a no-transport session (apiOnly bot
   // OR HTTP virtual chat) is NO LONGER force-isolated. readIsolation is opt-in
@@ -10409,5 +10429,68 @@ describe('turn failure diagnostics: only a workflow draft clarify session asks i
     const init = initOf();
     expect(init).toMatchObject({ type: 'init' });
     expect(Object.keys(init)).not.toContain('captureTurnFailureDiagnostics');
+  });
+});
+
+describe('settledTurnTerminals on worker init', () => {
+  const initOf = () => {
+    const worker = forkMock.mock.results.at(-1)!.value;
+    return vi.mocked(worker.send).mock.calls.map(call => call[0]).find(message => message.type === 'init');
+  };
+
+  it('passes completed ordinaryTurnRecovery ids on forkWorker and forkAdoptWorker', () => {
+    const ds = makeDs({ hasHistory: true });
+    ds.session.ordinaryTurnRecovery = {
+      version: 1,
+      logicalTurnId: 'om_prev_logical',
+      currentTurnId: 'bmx-recovery-prev',
+      status: 'completed',
+      updatedAt: '2026-11-11T00:00:00.000Z',
+    } as any;
+    expect(forkWorker(ds, '', true)).toBe(true);
+    expect(initOf()?.settledTurnTerminals).toEqual([
+      { turnId: 'om_prev_logical', status: 'completed' },
+      { turnId: 'bmx-recovery-prev', status: 'completed' },
+    ]);
+
+    const adopted = makeDs({
+      adoptedFrom: { tmuxTarget: 'adopt-settled:0.0', originalCliPid: 23456, sessionId: 'sess-adopt', cliId: 'claude-code', cwd: REPO },
+    });
+    adopted.session.ordinaryTurnRecovery = {
+      version: 1,
+      logicalTurnId: 'om_adopt_done',
+      currentTurnId: 'om_adopt_done',
+      status: 'completed',
+      updatedAt: '2026-11-11T00:00:00.000Z',
+    } as any;
+    expect(forkAdoptWorker(adopted, { restoredFromMetadata: true })).toBe('accepted');
+    expect(initOf()?.settledTurnTerminals).toEqual([{ turnId: 'om_adopt_done', status: 'completed' }]);
+  });
+
+  it('omits settledTurnTerminals when ordinaryTurnRecovery is running, cancelled, or matches the opening turn', () => {
+    for (const status of ['running', 'cancelled'] as const) {
+      const ds = makeDs({ hasHistory: true });
+      ds.session.ordinaryTurnRecovery = {
+        version: 1,
+        logicalTurnId: `om_${status}`,
+        currentTurnId: `om_${status}`,
+        status,
+        ...(status === 'cancelled' ? { cancelledByTurnId: 'stop' } : {}),
+        updatedAt: '2026-11-11T00:00:00.000Z',
+      } as any;
+      expect(forkWorker(ds, '', true)).toBe(true);
+      expect(initOf()?.settledTurnTerminals).toBeUndefined();
+    }
+
+    const matching = makeDs({ hasHistory: true });
+    matching.session.ordinaryTurnRecovery = {
+      version: 1,
+      logicalTurnId: 'om_same_turn',
+      currentTurnId: 'om_same_turn',
+      status: 'completed',
+      updatedAt: '2026-11-11T00:00:00.000Z',
+    } as any;
+    expect(forkWorker(matching, 'hello', 'om_same_turn')).toBe(true);
+    expect(initOf()?.settledTurnTerminals).toBeUndefined();
   });
 });

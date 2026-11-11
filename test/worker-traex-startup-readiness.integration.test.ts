@@ -26,11 +26,11 @@ function redraw(rows: string[]): string {
 
 // per-bot-home: TRAE_HOME comes only from the bot's env (the worker's own env
 // has none), so the submit receipt is only visible if the worker follows it.
-type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog' | 'per-bot-home' | 'repository-notice' | 'resumed-repository-notice' | 'resumed-repository-notice-held-idle' | 'native-viewport' | 'native-viewport-loading' | 'native-viewport-race' | 'native-viewport-retry' | 'session-lock' | 'shortcut-only-footer';
+type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog' | 'per-bot-home' | 'repository-notice' | 'resumed-repository-notice' | 'resumed-repository-notice-held-idle' | 'native-viewport' | 'native-viewport-loading' | 'native-viewport-race' | 'native-viewport-retry' | 'session-lock' | 'shortcut-only-footer' | 'bare-hint-two-row-footer' | 'truncated-cwd-footer' | 'warning-hint-footer';
 
 const tmuxAvailable = probeTmuxFunctional().ok;
 for (const backendType of process.env.BOTMUX_TEST_WORKER_BINARY ? ['tmux'] as const : ['pty', 'tmux'] as const) {
-  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice', 'resumed-repository-notice', 'resumed-repository-notice-held-idle', 'native-viewport', 'native-viewport-loading', 'native-viewport-race', 'native-viewport-retry', 'session-lock', 'shortcut-only-footer'] as const) {
+  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice', 'resumed-repository-notice', 'resumed-repository-notice-held-idle', 'native-viewport', 'native-viewport-loading', 'native-viewport-race', 'native-viewport-retry', 'session-lock', 'shortcut-only-footer', 'bare-hint-two-row-footer', 'truncated-cwd-footer', 'warning-hint-footer'] as const) {
     if (mode.startsWith('native-viewport') && backendType !== 'tmux') continue;
     it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
       `TraeX ${backendType} ${mode}: admits a quiet cursor-painted composer and submits the first input once`,
@@ -96,7 +96,30 @@ async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise
         ? ['  █ ◆ ◆ █  TRAE CLI (v0.214.1)', '  /tmp/repo', '  permissions: YOLO mode',
           ...COMPOSER.slice(0, 3).map(row => row.replace('Use /skills to list available skills', 'Ask TRAE CLI to do anything')),
           '  ? for shortcuts']
-        : ['TraeCode CLI (v0.211.1)', '', ...COMPOSER];
+        : mode === 'bare-hint-two-row-footer'
+          // approval_policy=never or a custom permission profile suppresses
+          // the standard permission label: the context row stays, but the
+          // second footer row is only the native shortcut hint.
+          ? ['  █ ◆ ◆ █  TRAE CLI (v0.214.1)', '  /tmp/repo',
+            ...COMPOSER.slice(0, 3).map(row => row.replace('Use /skills to list available skills', 'Ask TRAE CLI to do anything')),
+            '  GPT-6-Astra xhigh · /tmp/repo · Context —',
+            '  ? for shortcuts']
+          : mode === 'truncated-cwd-footer'
+            // A cwd wider than the pane truncates the model/context row with
+            // U+2026 before the Context cell renders.
+            ? ['  █ ◆ ◆ █  TRAE CLI (v0.214.1)', '  /tmp/repo',
+              ...COMPOSER.slice(0, 3).map(row => row.replace('Use /skills to list available skills', 'Ask TRAE CLI to do anything')),
+              '  GPT-6-Astra xhigh · /tmp/repo/very-long-directory-name-component-0123456789/very-long-directory-name-compo…',
+              '  ? for shortcuts']
+            : mode === 'warning-hint-footer'
+              // A startup diagnostic warning is right-aligned on the bare
+              // hint row (`⚠ N warning(s) · f2 to view`); it is a notice and
+              // must not block first-prompt admission.
+              ? ['  █ ◆ ◆ █  TRAE CLI (v0.214.1)', '  /tmp/repo',
+                ...COMPOSER.slice(0, 3).map(row => row.replace('Use /skills to list available skills', 'Ask TRAE CLI to do anything')),
+                '  GPT-6-Astra xhigh · /tmp/repo · Context —',
+                '  ? for shortcuts' + ' '.repeat(80) + '⚠ 1 warning · f2 to view']
+              : ['TraeCode CLI (v0.211.1)', '', ...COMPOSER];
   // #2247 later taught the byte-stream readyPattern the same cursor-painted
   // shape: the stripped redraw now matches through the preceding rule, so
   // recognition no longer depends on the viewport poller. The same rule arm

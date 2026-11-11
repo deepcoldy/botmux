@@ -230,6 +230,9 @@ export interface CardActionData {
   event?: { event_id?: string };
   operator?: {
     open_id?: string;
+    /** Trusted callback identity; user_id requires contact:user.employee_id:readonly. */
+    user_id?: string;
+    tenant_key?: string;
     /** Lark-verified union_id, present on card v2 callbacks where the tenant
      *  enables `with_union_id`. Absent when Lark doesn't carry it; callers
      *  fall back to `resolveUserUnionId` via `resolveCardOperatorUnionId`. */

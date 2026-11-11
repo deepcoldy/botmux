@@ -213,6 +213,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       noTransport,
       triggerUserAuth,
       larkToolAppId,
+      hideLocalAddresses,
       promptInjection,
     }) {
       const args: string[] = [];
@@ -274,6 +275,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
             asksViaHook: false,
             whiteboardEnabled: whiteboardEnabled(),
           }),
+          hideLocalAddresses,
           cliId: 'grok',
         }),
       );

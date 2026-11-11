@@ -6239,6 +6239,23 @@ async function cmdMaintenance(args: string[]): Promise<void> {
  *  （非隔离进程）走 trusted-host HMAC 签名；读不到（沙箱 BOTMUX_SEND_RELAY /
  *  macOS 读隔离 carve-out）改带本会话当前轮换的 origin capability，由 daemon
  *  handler 与活跃记录比对。两条路都不读 bots.json。 */
+/** A final that left as its own message in this turn's conversation (for
+ * notifications, a quote, attachments…) closes the turn there, so a completed
+ * native-CoT reply card needs no answerless summary. Finals sent elsewhere (top
+ * level, another topic or chat) do not, and keep that summary. Persistence only:
+ * failure restores the summary card and never affects the delivered final. */
+async function noteTurnFinalOutsideReplyCard(
+  key: { larkAppId: string; sessionId: string; turnId: string; dispatchAttempt?: number },
+  chatId: string, offThread: boolean,
+): Promise<void> {
+  if (offThread) return;
+  try {
+    await new TurnReplyCardStore(resolveDataDir()).noteExternalFinal(key, chatId);
+  } catch (error) {
+    console.error(`botmux send: 未能标记本轮答复卡（最终答复已送达）：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
@@ -10769,7 +10786,11 @@ async function registerSelfFromCredFile(): Promise<void> {
   // transport boundary (getBotClient throws for apiOnly). A non-apiOnly bot with
   // no secret is still a no-op (nothing to register).
   if (!cred.larkAppSecret && cred.apiOnly !== true) return;
-  const { registerBot } = await import('./bot-registry.js');
+  const { registerBot, resolveHideLocalAddresses } = await import('./bot-registry.js');
+  // Read before registering: a host session can read bots.json (the live
+  // setting); only an isolated sandbox falls back to the worker's snapshot.
+  // The cred file outlives the sandboxed session that wrote it.
+  const hideLocalAddresses = resolveHideLocalAddresses(appId);
   registerBot({
     larkAppId: appId,
     larkAppSecret: cred.larkAppSecret ?? '',
@@ -10785,6 +10806,7 @@ async function registerSelfFromCredFile(): Promise<void> {
       process.env.BOTMUX_USAGE_DISPLAY === 'off'
         ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
         : undefined,
+    hideLocalAddresses: hideLocalAddresses || undefined,
   } as import('./bot-registry.js').BotConfig);
 }
 
@@ -10873,6 +10895,7 @@ function riffModeSession(opts: { evenWithLocalSessions?: boolean } = {}): { sess
       process.env.BOTMUX_USAGE_DISPLAY === 'off'
         ? (process.env.BOTMUX_USAGE_DISPLAY as import('./bot-registry.js').UsageDisplayMode)
         : undefined,
+    hideLocalAddresses: process.env.BOTMUX_HIDE_LOCAL_ADDRESSES === '1' || undefined,
   } as unknown as import('./bot-registry.js').BotConfig;
 
   const session: SessionData = {
@@ -12794,6 +12817,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     process.exit(2);
   }
   if (existingTurnPrimary) {
+    // A retry after a lost reply-card mark completes it; a final already on
+    // the card is left alone by the store.
+    if (effectiveResponseKind === 'final' && currentTurnId) {
+      await noteTurnFinalOutsideReplyCard({ larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt },
+        overrideChatId ?? s.chatId, sendTopLevel || !!sendInto || !!overrideChatId);
+    }
     await removeScheduleSelfAfterFinal();
     if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
       advanceAncestorSessionTurn(
@@ -14508,6 +14537,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       if (replyRecord && replyKey) {
         if (replyRecord.chatId !== targetChatId) throw new Error('Reply-card destination changed; send refused');
         let delivered: Awaited<ReturnType<typeof replyStore.update>> | undefined;
+        let undeliveredProgressHint = '进度已保存到本轮记录；请用 botmux send --response-kind final 发送完整答复。';
         const replyDelivery = await executeTurnPrimary(turnRequestIdentity, async providerUuid => {
           delivered = await replyStore.update(replyKey, effectiveResponseKind === 'final'
             ? { kind: 'final', text, card: replyCardJson, source: 'explicit',
@@ -14521,7 +14551,11 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
                 expectedTurnId: currentTurnId, dispatchAttempt: originDispatchAttempt,
               });
               if (!ready.ok) throw new Error('Native thinking publication is not ready; answer send deferred');
+              // Only an explicit confirmation lets native thinking carry
+              // progress; an older daemon or failed display keeps the card.
+              const readiness = await ready.json().catch(() => undefined) as { nativeThinkingVisible?: unknown } | undefined;
               await revalidateIsolatedOriginBeforeEffect();
+              return readiness?.nativeThinkingVisible === true;
             },
             send: (body, uuid) => dispatchPrimaryUnlocked(body, 'interactive', undefined, completionProposalRecord ? completionProposalCardDispatchUuid(completionProposalRecord) : (uuid ?? providerUuid)),
             patch: (id, body) => patchPublishedGroupCard(appId, targetChatId, id, body, replyRecord.rootId,
@@ -14546,12 +14580,17 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
               return dispatchAfterOriginGate(JSON.stringify({ file_key: fileKey }), 'file', uuid);
             },
           });
+          if (!delivered.messageId && delivered.record.nativeCot && delivered.record.nativeCotVisible) {
+            // Progress is expected here; asking for a final would push the
+            // model to lock the turn early with an interim note.
+            undeliveredProgressHint = '进度已记录到本轮：执行过程由原生思考区展示，进度会随最终答复卡一并归档。中间进度继续按默认方式发送即可；完成后再用 botmux send --response-kind final 发送完整答复。';
+          }
           return delivered.messageId ?? '';
         });
         turnPrimaryReplayed ||= replyDelivery.replayed;
         unifiedReplyUsed = true;
         if (!replyDelivery.messageId) {
-          console.error('进度已保存到本轮记录；请用 botmux send --response-kind final 发送完整答复。');
+          console.error(undeliveredProgressHint);
           console.log(JSON.stringify({ success: true, accepted: true, delivered: false, sessionId: sid, turnId: currentTurnId }));
           return;
         }
@@ -14589,6 +14628,11 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     if (turnPrimaryReplayed) {
       // Reusing a receipt is not a new send. Preserve the original marker's
       // time, including when another input arrived while we waited on the lock.
+      // The first sender may have lost the reply-card mark; it is idempotent.
+      if (effectiveResponseKind === 'final' && currentTurnId) {
+        await noteTurnFinalOutsideReplyCard({ larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt },
+          targetChatId, sendTopLevel || !!sendInto || !!overrideChatId);
+      }
       await removeScheduleSelfAfterFinal();
       if (scheduleSelfCleanup?.removed && liveMarkerCtx?.markerPid) {
         advanceAncestorSessionTurn(
@@ -14607,6 +14651,11 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
         ...(scheduleSelfCleanup ? { scheduleSelfCleanup } : {}),
       }));
       return;
+    }
+
+    if (effectiveResponseKind === 'final' && messageId && currentTurnId && !unifiedReplyUsed) {
+      await noteTurnFinalOutsideReplyCard({ larkAppId: appId, sessionId: sid, turnId: currentTurnId, dispatchAttempt: originDispatchAttempt },
+        targetChatId, sendTopLevel || !!sendInto || !!overrideChatId);
     }
 
     if (oncallGroupCard && messageId) {

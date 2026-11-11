@@ -2153,7 +2153,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/reply-card-ready', async (req, res, p
     || (attempt !== undefined && (!Number.isSafeInteger(attempt) || Number(attempt) < 1))) {
     return jsonRes(res, 409, { ok: false, error: 'reply_turn_changed' });
   }
-  await prepareReplyCardNativeThinking(ds, turnId, attempt as number | undefined);
+  const nativeThinkingVisible = await prepareReplyCardNativeThinking(ds, turnId, attempt as number | undefined);
   const current = findActiveBySessionId(params.sessionId);
   if (!sessionCliIpcAuth(req, current, params.sessionId, body).ok || (current && replyCardDispatchAttempt(current, turnId) !== attempt)) {
     return jsonRes(res, 409, { ok: false, error: 'reply_attempt_changed' });
@@ -2161,7 +2161,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/reply-card-ready', async (req, res, p
   if (current !== ds || current?.currentTurnId !== turnId || current?.session.status === 'closed') {
     return jsonRes(res, 409, { ok: false, error: 'reply_turn_changed' });
   }
-  return jsonRes(res, 200, { ok: true });
+  // The CLI persists this with the barrier; absent (older daemon) means the
+  // answer card keeps showing progress.
+  return jsonRes(res, 200, { ok: true, nativeThinkingVisible: nativeThinkingVisible === true });
 });
 
 /** Session-bound single-message delivery through the primary durable outbox.
@@ -4435,7 +4437,9 @@ for (const action of ['auth-request', 'auth-status']) {
         // Outside a 1:1 chat the link already went to the person privately when
         // this request was created; never hand it to the agent to post.
         if (!privateChat) {
-          return jsonRes(res, 200, { ok: true, requestId, delivery: 'dm', message: t('auth_link.request_dm_agent', undefined, loc),
+          if (!request.delivery) return jsonRes(res, 409, { ok: false, requestId, error: 'auth_link_delivery_pending' });
+          return jsonRes(res, 200, { ok: true, requestId, delivery: request.delivery,
+            message: t(request.delivery === 'ephemeral' ? 'auth_link.request_ephemeral_agent' : 'auth_link.request_dm_agent', undefined, loc),
             scopes: request.authorization.scopes, expiresIn: remaining, autoCallback: true });
         }
         return jsonRes(res, 200, { ok: true, requestId, authUrl: request.authorization.authUrl,
@@ -4455,24 +4459,45 @@ for (const action of ['auth-request', 'auth-status']) {
     trackSessionAuthorization(requestId, { sessionId: params.sessionId, appId: cfg.larkAppId,
       callerOpenId, identityTurnId, authorization, isCurrent, isValid: isAuthorizationValid });
     if (!privateChat) {
-      try {
-        await sendUserMessage(cfg.larkAppId, callerOpenId, [
+      const delivery = await deliverAuthLink({
+        privateChat: false,
+        openId: callerOpenId,
+        text: [
           t('auth_link.request_dm_title', undefined, loc),
           authorization.authUrl,
           t('auth_link.request_dm_footer', {
             scopes: authorization.scopes.join(' '),
             minutes: Math.max(1, Math.round(authorization.expiresIn / 60)),
           }, loc),
-        ].join('\n'));
-      } catch {
-        const tracked = sessionAuthRequests.get(requestId);
+        ].join('\n'),
+        locale: loc,
+        // The IPC caller presents the link-free result; do not send a second
+        // public notice or make successful private delivery depend on it.
+        replyInPlace: async () => undefined,
+        sendDirect: (to, text) => sendUserMessage(cfg.larkAppId, to, text),
+        sendEphemeral: async (to, card) => {
+          // DM may have taken long enough for cancellation, policy changes or
+          // expiry to retire this grant. Do not start another delivery then.
+          if (!isAuthorizationValid()) throw new Error('auth_request_expired');
+          return sendEphemeralCard(cfg.larkAppId, ds.chatId, to, card);
+        },
+      });
+      const tracked = sessionAuthRequests.get(requestId);
+      if (!isAuthorizationValid()) {
+        tracked?.dispose();
+        sessionAuthRequests.delete(requestId);
+        return jsonRes(res, 409, { ok: false, error: 'auth_request_expired' });
+      }
+      if (delivery !== 'dm' && delivery !== 'ephemeral') {
         tracked?.dispose();
         sessionAuthRequests.delete(requestId);
         return jsonRes(res, 409, { ok: false, error: 'auth_link_private_delivery_failed',
           message: t('auth_link.request_dm_failed_agent', undefined, loc) });
       }
+      if (tracked) tracked.delivery = delivery;
       return jsonRes(res, 200, {
-        ok: true, requestId, delivery: 'dm', message: t('auth_link.request_dm_agent', undefined, loc),
+        ok: true, requestId, delivery,
+        message: t(delivery === 'ephemeral' ? 'auth_link.request_ephemeral_agent' : 'auth_link.request_dm_agent', undefined, loc),
         scopes: authorization.scopes, expiresIn: authorization.expiresIn, autoCallback: true,
       });
     }
@@ -9860,6 +9885,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     replyCardNativeCot: cardPrefs.replyCardNativeCot,
     senderTag: cardPrefs.senderTag,
     senderTagHideEmail: cardPrefs.senderTagHideEmail,
+    hideLocalAddresses: cardPrefs.hideLocalAddresses,
     overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
     autoInviteOwnerOnGroupAdd: cardPrefs.autoInviteOwnerOnGroupAdd,
@@ -10026,6 +10052,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
     senderTag?: unknown;
     senderTagHideEmail?: unknown;
+    hideLocalAddresses?: unknown;
   }>(req, res);
   if (body === BAD_JSON) return;
 
@@ -10048,6 +10075,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
     senderTag?: boolean;
     senderTagHideEmail?: boolean;
+    hideLocalAddresses?: boolean;
   } = {};
   for (const key of [...REPLY_FOOTER_KEYS, 'showReplyTiming'] as const) {
     if (body[key] !== undefined) {
@@ -10107,6 +10135,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   else if (typeof body.thinkingCard === 'boolean') patch.cotEnabled = body.thinkingCard;
   if (typeof body.senderTag === 'boolean') patch.senderTag = body.senderTag;
   if (typeof body.senderTagHideEmail === 'boolean') patch.senderTagHideEmail = body.senderTagHideEmail;
+  if (typeof body.hideLocalAddresses === 'boolean') patch.hideLocalAddresses = body.hideLocalAddresses;
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
   if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;

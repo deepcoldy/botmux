@@ -53,6 +53,7 @@ import type { PersistentBackendTarget } from '../adapters/backend/types.js';
 import { adoptTargetLabel, validateAdoptTargetState } from './session-discovery.js';
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir } from '../bot-registry.js';
+import { hideLocalAddressesFor } from '../im/lark/local-address-switch.js';
 import type { BotConfig } from '../bot-registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { sameRuntimeIdentity, type CliRuntimeConfig, type CliRuntimeSnapshot } from '../adapters/cli/runtime.js';
@@ -1475,7 +1476,7 @@ function buildNewTopicBlocks(
   // hint list is unchanged.
   const hints = adapter.injectsSessionContext
     ? []
-    : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId, { sessionKind });
+    : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId, { sessionKind, hideLocalAddresses: hideLocalAddressesFor(opts?.larkAppId) });
 
   const routingBlock = hints.length > 0
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
@@ -1908,7 +1909,7 @@ function buildFollowUpBlocks(
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, opts?.locale);
   const formattingBlock = opts?.cliId !== 'mira' && !noTransport
-    ? `<botmux_formatting>${feishuReplyPresentationGuidance(opts?.locale)}</botmux_formatting>`
+    ? `<botmux_formatting>${feishuReplyPresentationGuidance(opts?.locale, hideLocalAddressesFor(opts?.larkAppId))}</botmux_formatting>`
     : '';
   const skipSessionId = opts?.isAdoptMode || (opts?.cliId
     ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
@@ -2022,7 +2023,7 @@ export function buildFollowUpContent(
   ) {
     const formattingGuidance = sessionIsNoTransport(opts.larkAppId, opts.chatId) || opts.cliId === 'mira'
       ? undefined
-      : feishuReplyPresentationGuidance(opts.locale);
+      : feishuReplyPresentationGuidance(opts.locale, hideLocalAddressesFor(opts.larkAppId));
     return buildServiceUserPrompt(
       [opts?.sharedGroupContext, content].filter(Boolean).join('\n\n'),
       formattingGuidance,
@@ -2256,7 +2257,7 @@ export function buildFollowUpCliInput(
   const roleBlock = renderApplicationRoleBlock(opts.larkAppId, opts.chatId, { followUp: true });
   const formattingBlock = sessionIsNoTransport(opts.larkAppId, opts.chatId)
     ? ''
-    : `<botmux_formatting>${feishuReplyPresentationGuidance(opts.locale)}</botmux_formatting>`;
+    : `<botmux_formatting>${feishuReplyPresentationGuidance(opts.locale, hideLocalAddressesFor(opts.larkAppId))}</botmux_formatting>`;
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts.whiteboardId,
     noTransport: sessionIsNoTransport(opts.larkAppId, opts.chatId),

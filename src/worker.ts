@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
 import { admitSessionCommand } from './services/session-command-gateway.js';
-import { contractTerminalStatus, type RuntimeIdentity } from './services/session-contract.js';
+import { contractTerminalStatus, TRAEX_CONTINUATION_BACKENDS, type RuntimeIdentity } from './services/session-contract.js';
 import {
   awaitRuntimeReservation,
   RUNTIME_RESERVATION_DEADLINE_MS,
@@ -261,6 +261,7 @@ import { sendRemoteRunnerOutboundMessage } from './services/remote-runner-outbou
 import { runRemoteRunnerSessionTool } from './services/remote-runner-session-tool.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup, shouldDeferInitialPromptForReattach, judgeStartupCommandAck, STARTUP_COMMAND_ACK_TIMEOUT_MS } from './core/startup-commands.js';
+import { RETIRED_RUNTIME_EXIT_GRACE_MS, WORKER_EXIT_RUNTIME_RETIRED } from './core/retired-runtime-exit.js';
 import { spawnHasStartupWork } from './core/initial-native-rename.js';
 import { botInjectedEnv, buildSessionChildEnv } from './core/env-policy.js';
 import { envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPolicyStamp } from './services/env-policy-stamp.js';
@@ -350,6 +351,7 @@ import {
   resolveReplyFooterPreferences,
   type BotConfig,
 } from './bot-registry.js';
+import { HIDE_LOCAL_ADDRESSES_ENV, hideLocalAddressesEnvValue } from './im/lark/local-address-switch.js';
 import {
   readGlobalConfig,
   isCrossPrincipalInterruptionEnabled,
@@ -923,6 +925,7 @@ let idleScreenSettleTask: {
   promise: Promise<{ proceed: boolean; degraded: boolean }>;
 } | null = null;
 let intentionalRestartBackend: SessionBackend | null = null;
+const intentionallyRetiredBackends = new WeakSet<SessionBackend>();
 // Hybrid codex RPC input mode (opt-in per bot, cfg.codexRpcInput). When active,
 // user input is delivered to codex via the app-server JSON-RPC channel
 // (turn/start) instead of a tmux paste, and the pane runs `codex --remote`
@@ -2015,7 +2018,13 @@ function bindSessionBackendExit<T extends (...args: any[]) => any>(callback: T):
   const observed = backend;
   return bindSessionRuntimeCallback(((...args: Parameters<T>) => {
     if (backend !== observed) {
-      if (intentionalRestartBackend === observed) intentionalRestartBackend = null;
+      if (intentionalRestartBackend === observed || (observed && intentionallyRetiredBackends?.has(observed))) {
+        if (observed) intentionallyRetiredBackends?.add(observed);
+        if (intentionalRestartBackend === observed) intentionalRestartBackend = null;
+        // Expected teardown must not reconcile the original execution while
+        // its already-started exact replacement is still proving identity.
+        return;
+      }
       // Only a scoped host can retain an old runtime's exit as history. Legacy
       // consumers interpret claude_exit as the current CLI and must not receive
       // a delayed exit from the planned replacement's predecessor.
@@ -2043,6 +2052,12 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   const context = workerSessionEventScope.envelope(captured);
   if (!context.scope.execution && 'turnId' in msg) {
     const execution = workerSessionEventScope.executionForTurn(msg.turnId, 'dispatchAttempt' in msg ? msg.dispatchAttempt : undefined);
+    if (execution) context.scope.execution = execution;
+  }
+  if (msg.type === 'screen_update' && context.scope.execution
+    && (msg.turnId !== context.scope.execution.turnId || msg.dispatchAttempt !== context.scope.execution.dispatchAttempt)) {
+    delete context.scope.execution;
+    const execution = workerSessionEventScope.executionForTurn(msg.turnId, msg.dispatchAttempt);
     if (execution) context.scope.execution = execution;
   }
   // Physical process proof is available before an opening attempt is bound.
@@ -2084,6 +2099,9 @@ async function publishRuntimeContract(binding: RuntimeEventBinding, nativeSessio
   const observed = runtimeIdentityForContract(binding);
   const identity = nativeSessionId ? { ...observed, nativeSessionId } : observed;
   const previous = binding.identity;
+  // A planned Auto continuation may bind only the actual native CLI, not a
+  // launcher/opaque startup observation whose process proof is still pending.
+  if (binding.continuation && (!identity.nativeSessionId || identity.proof === 'opaque')) return;
   // A buffered observation can arrive after the process disappears. Preserve
   // its proven binding so the captured physical exit still stops the runtime.
   if (previous && previous.proof !== 'opaque' && identity.proof === 'opaque') return;
@@ -2093,7 +2111,9 @@ async function publishRuntimeContract(binding: RuntimeEventBinding, nativeSessio
     || (previous.nativeSessionId !== undefined && previous.nativeSessionId !== identity.nativeSessionId))) {
     const scope = workerSessionEventScope;
     continuesBindingId = binding.bindingId;
+    const continuation = binding.continuation;
     binding = scope.beginRuntime(binding.operationId, binding.physicalId);
+    binding.continuation = continuation;
     scope.enterRuntime(binding);
     send({ type: 'runtime_binding_started', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
   }
@@ -5731,6 +5751,8 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
                   message: `The CLI backend changed after passthrough command ${msg.content} but before its dependent follow-up. The follow-up was withheld; verify the terminal and retry the bundle explicitly.`,
                 });
                 log(`Withheld stale bundled adopt follow-up after raw command (${followUpContent.length} chars)`);
+              } else if (result === 'refused-before-write') {
+                log(`Withheld refused bundled adopt follow-up after raw command (${followUpContent.length} chars)`);
               } else if (result === 'completed') {
                 log(`Completed adopt follow-up after raw input (${followUpContent.length} chars)`);
               }
@@ -6104,9 +6126,16 @@ function enqueueTraexAutoModelRecovery(turnId: string): boolean {
     item.traexAutoModelRecovery === true && item.turnId === turnId)) {
     return true;
   }
+  const binding = workerSessionEventScope?.currentBinding();
+  const execution = workerSessionEventScope?.executionForTurn(turnId);
+  const nativeSessionId = lastInitConfig?.cliSessionId;
+  const continuation = binding?.runtime && execution && nativeSessionId
+    ? { reason: 'traex-auto-model' as const, from: binding.runtime, execution, nativeSessionId } : undefined;
+  if (workerSessionEventScope && !continuation) return false;
   pendingMessages.unshift({
     content: t('worker.traex_auto_model.continue_prompt'),
     turnId,
+    ...(continuation ? { traexAutoModelContinuation: structuredClone(continuation) } : {}),
     trustedCaller: active.caller,
     trustedController: active.controller,
     turnCallerOpenId: currentBotmuxCallerOpenId,
@@ -6150,10 +6179,24 @@ function executeTraexAutoModelSwitch(
     || !lastInitConfig) return false;
   const nativeSessionId = lastInitConfig.cliSessionId;
   if (!nativeSessionId) return false;
-  if (opts.resumeCurrentTurn && traexAutoModelTurnReplayForbidden) return false;
+  if (opts.resumeCurrentTurn && (traexAutoModelTurnReplayForbidden || currentInputDeliveryQuarantine())) return false;
   const active = activeTurnAuthority.snapshot();
   if (opts.resumeCurrentTurn && (!active?.started || active.turnId !== action.turnId
     || active.dispatchAttempt !== undefined)) return false;
+  const sourceBinding = workerSessionEventScope?.currentBinding();
+  // Only resuming the current turn needs a host continuation grant. Gate that
+  // path alone: preflight / new-turn selection never carry one, so a backend
+  // or host without grants keeps them (the turn stays on its model instead).
+  // Keep this backend set identical to the host's
+  // SessionController.executionContinuationSupported gate: a rotation the
+  // host cannot grant would make the replacement spawn fail fatally.
+  if (opts.resumeCurrentTurn && workerSessionEventScope
+    && (!(TRAEX_CONTINUATION_BACKENDS as readonly string[]).includes(effectiveBackendType)
+      // A newer worker must not rotate into a host that cannot grant recovery.
+      || lastInitConfig.sessionContract?.executionContinuations !== true
+      || !sourceBinding?.runtime || sourceBinding.identity?.proof !== 'process_start'
+      || sourceBinding.identity.nativeSessionId !== nativeSessionId
+      || !workerSessionEventScope.executionForTurn(action.turnId))) return false;
   if (!traexAutoModelController?.commitSwitch(action)) return false;
   if (opts.resumeCurrentTurn && !enqueueTraexAutoModelRecovery(action.turnId)) {
     log(`TraeX auto-model switch refused: turn ${action.turnId.slice(0, 12)} lacks safe ordinary-turn authority`);
@@ -7197,16 +7240,18 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
     withPidMarkerLock(markerPath, () => {
       const raw = readFileSync(markerPath, 'utf-8');
       const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed.turnId === 'string' && parsed.turnId) {
-        if (!currentBotmuxTurnId) {
+      if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && parsed.turnId !== currentBotmuxTurnId) {
+        if (retiredTurnIds.has(parsed.turnId) || retireTerminatedMarkerTurn(parsed)) {
+          // Disk holds an older turn that has already terminated; do not re-adopt it.
+        } else if (!currentBotmuxTurnId) {
           adoptInitialActiveTurn(parsed);
-        } else if (currentBotmuxTurnId !== parsed.turnId && !retiredTurnIds.has(parsed.turnId)) {
+        } else {
           adoptDisplacedActiveTurn(parsed);
         }
       }
       if (parsed && Array.isArray(parsed.queuedTurns) && parsed.queuedTurns.length > 0) {
         for (const t of parsed.queuedTurns) {
-          if (t && typeof t.turnId === 'string' && t.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(t.turnId) && !queuedTypeAheadTurns.some(q => q.turnId === t.turnId)) {
+          if (t && typeof t.turnId === 'string' && t.turnId !== currentBotmuxTurnId && markerQueuedTurnStillLive(t) && !queuedTypeAheadTurns.some(q => q.turnId === t.turnId)) {
             queuedTypeAheadTurns.push({
               turnId: t.turnId,
               ...(t.inputConsumed === true ? { inputConsumed: true as const } : {}),
@@ -7222,7 +7267,7 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
           }
         }
       } else if (parsed && typeof parsed.queuedTurnId === 'string' && parsed.queuedTurnId) {
-        if (parsed.queuedTurnId !== currentBotmuxTurnId && !retiredTurnIds.has(parsed.queuedTurnId) && !queuedTypeAheadTurns.some(q => q.turnId === parsed.queuedTurnId)) {
+        if (parsed.queuedTurnId !== currentBotmuxTurnId && markerQueuedTurnStillLive({ turnId: parsed.queuedTurnId }) && !queuedTypeAheadTurns.some(q => q.turnId === parsed.queuedTurnId)) {
           queuedTypeAheadTurns.push({ turnId: parsed.queuedTurnId });
         }
       }
@@ -15498,7 +15543,7 @@ function beginCliWriteCycle(): void {
  *  message listener does not await a prior async invocation, so without the
  *  outer AsyncSerialQueue two CoCo/Codex writes can overwrite the same composer
  *  while the first is sleeping before Enter or polling history. */
-type AdoptWriteResult = 'completed' | 'stale-before-write' | 'stale-after-write';
+type AdoptWriteResult = 'completed' | 'refused-before-write' | 'stale-before-write' | 'stale-after-write';
 
 async function writeAdoptMessage(
   content: string,
@@ -15623,7 +15668,10 @@ async function writeAdoptMessage(
       { turnId, dispatchAttempt },
       'failed',
     );
-    return 'completed';
+    // Nothing was written and prepareAdoptWrite never ran. Keep this distinct
+    // from a finished write so flushPending does not re-drive queued peers off
+    // a refusal: they wait for the next real prompt-ready edge as before.
+    return 'refused-before-write';
   }
 
   if (isStructuredBridgeAdoptInputCli(lastInitConfig?.cliId) && cliAdapter) {
@@ -19369,6 +19417,20 @@ function redriveRejectedStructuredReady(): void {
   }
 
   structuredRejectedReadyEvidenceGeneration = undefined;
+  // The CLI reported `working` (or `blocked` on a permission / question
+  // prompt) over OSC 7501 after the prompt edge being replayed here, e.g. for
+  // the turn the deferred write just opened. Its own `idle` report ends the
+  // turn; a screen probe must not overrule it — with botmux's statusLine
+  // Claude draws no busy marker, so the probe would mark a running turn ready
+  // and an idle reclaim could then suspend it. A lost `idle` report is
+  // released by the stale program-status check instead.
+  // Kept here, not in probeBusyPatternIdle: for Pi / oh-my-pi the post-submit
+  // probe loop is the only release when their `idle` report is lost (no
+  // transcript-based stale check, and fireIdle refuses while OSC holds busy).
+  if (idleDetector?.programStatusHeldBusy()) {
+    log('Structured pre-start gate: program status reports the CLI busy — leaving readiness to its idle report');
+    return;
+  }
   if (ptyOutputGeneration.isCurrent(readyEvidenceGeneration)) {
     log('Structured pre-start gate settled with no newer PTY output — re-driving prior prompt-ready signal');
     idleDetector?.fireIdle();
@@ -20631,7 +20693,12 @@ function scheduleSubmitFailureNotify(
     // 只要还在忙就继续等；回合结束、页脚消失后立刻回到下面正常的告警判定。
     // 必须放在 SessionStart 门控之前：门控只认 transcript，而 transcript 恰好
     // 就是迟到的那个。
-    const busyNow = (() => {
+    // Hook processing can report OSC 7501 working before Claude paints a busy footer.
+    // Background tasks can retain working after a turn; parked input still needs diagnosis/rescue.
+    const nativeWorking = idleDetector?.programStatusHeldWorking() === true
+      && submitDiagnosis.reason !== 'draft_parked'
+      && (lastInitConfig?.cliId !== 'claude-code' || !claudeComposerHoldsInput(submitDiagnosisScreen, msg));
+    const busyNow = nativeWorking || (() => {
       if (!cliAdapter?.busyPattern || !submitDiagnosisScreen) return false;
       try {
         return cliAdapter.busyPattern.test(busyProbeRegion(submitDiagnosisScreen));
@@ -20647,7 +20714,7 @@ function scheduleSubmitFailureNotify(
       && chainIsCurrent()
     ) {
       busySilenceExtra += 1;
-      log(`Deferred recheck sees the CLI positively mid-turn (busy footer) — input was accepted, waiting for the receipt. preview="${preview}"`);
+      log(`Deferred recheck sees the CLI positively mid-turn (program status or busy footer) — waiting for the receipt. preview="${preview}"`);
       armDeferredRecheck();
       return;
     }
@@ -20929,6 +20996,7 @@ function traexAutoModelInputHold(): boolean {
 }
 
 let traexAutoModelAdmissionRetry: ReturnType<typeof setTimeout> | undefined;
+let traexContinuationGrantRecheckAt = 0;
 
 /** Unknown/stale reads must retain the input and remain live even when a
  * static screen emits no further output. One bounded retry drives the normal
@@ -21389,10 +21457,20 @@ async function flushPending(): Promise<void> {
     }
     if (adoptInputReady && pendingAdoptMessages.length > 0) {
       const item = pendingAdoptMessages.shift()!;
-      await runAdoptMessageForCapturedGeneration(item, () => {
+      const outcome = await runAdoptMessageForCapturedGeneration(item, () => {
         pendingAdoptMessages.unshift(item);
         log(`Re-queued adopt message at queue head for the replacement CLI generation (${item.content.length} chars)`);
       });
+      // Its native terminal can make the composer ready while the adapter is
+      // still awaiting history. That idle edge reached this flush under its
+      // mutex; re-drive after finally releases it, so the next queued message
+      // does not depend on another terminal redraw. Only a finished write
+      // re-drives: a pre-write refusal ('refused-before-write') wrote nothing
+      // and leaves peers to the next genuine prompt-ready edge, so this can
+      // never spin without a write.
+      if (outcome === 'completed' && isPromptReady && pendingAdoptMessages.length > 0) {
+        queueMicrotask(() => { void flushPending(); });
+      }
       return;
     }
     let holdDrainForPreferredReset = false;
@@ -21416,6 +21494,21 @@ async function flushPending(): Promise<void> {
       if (activeTurnBlocks(pendingMessages[0]!)) break;
       if (traexAutoModelRuntimeEligible()
         && !(await admitTraexAutoModelPendingInput(pendingMessages[0]!))) break;
+      const continuation = pendingMessages[0]!.traexAutoModelContinuation;
+      if (workerSessionEventScope && pendingMessages[0]!.traexAutoModelRecovery && continuation
+        && !workerSessionEventScope.canSubmitContinuation(pendingMessages[0]!.turnId!, continuation.execution)) {
+        const scope = workerSessionEventScope;
+        const binding = scope.currentBinding();
+        if (binding && Date.now() - traexContinuationGrantRecheckAt >= 1_000) {
+          traexContinuationGrantRecheckAt = Date.now();
+          void scope.run(binding, () => publishRuntimeContract(binding)).catch(error => {
+            log(`TraeX continuation grant recheck failed: ${String(error)}`);
+          });
+        }
+        keepPromptReadyAfterHold();
+        retryTraexAutoModelAdmission();
+        break;
+      }
       if (!openingInputBoxSettled) {
         // writeInput would run the same check after this input is dequeued and
         // its turn opened; a refusal there fails the input instead of keeping it.
@@ -21458,11 +21551,15 @@ async function flushPending(): Promise<void> {
         retryTraexAutoModelAdmission();
         break;
       }
-      if (workerSessionEventScope && !workerSessionEventScope.canSubmit(item.turnId, item.dispatchAttempt)) {
+      const continuedExecution = item.traexAutoModelRecovery ? item.traexAutoModelContinuation?.execution : undefined;
+      if (workerSessionEventScope && !(continuedExecution && item.turnId
+        ? workerSessionEventScope.canSubmitContinuation(item.turnId, continuedExecution)
+        : workerSessionEventScope.canSubmit(item.turnId, item.dispatchAttempt))) {
         if (item.turnId) send({ type: 'turn_input_rejected', turnId: item.turnId, ...(item.dispatchAttempt !== undefined ? { dispatchAttempt: item.dispatchAttempt } : {}), reason: 'execution_reconciliation_required' });
         continue;
       }
-      workerSessionEventScope?.enterTurn(item.turnId, item.dispatchAttempt);
+      if (continuedExecution && item.turnId) workerSessionEventScope?.enterContinuation(item.turnId, continuedExecution);
+      else workerSessionEventScope?.enterTurn(item.turnId, item.dispatchAttempt);
       cliSubmissionInFlight = { item, generation: cliSpawnGeneration, composerOwned: false };
       attachDeferredPluginSkillCatalog(item);
       // Apply the credential snapshot that arrived WITH this turn, immediately
@@ -23385,14 +23482,23 @@ async function spawnCli(
   }
   const execution = firstBinding || cfg.prompt ? cfg.sessionCommand?.execution : undefined;
   const previousBinding = workerSessionEventScope.currentBinding();
+  const recovery = opts.restartCause === 'traex-auto-model'
+    ? pendingMessages.find(item => item.traexAutoModelRecovery && item.traexAutoModelContinuation
+      && item.turnId === traexAutoModelController?.currentTurnId())?.traexAutoModelContinuation : undefined;
+  const continuation = recovery && cfg.cliId === 'traex' && cfg.resume
+    && cfg.cliSessionId === recovery.nativeSessionId && previousBinding?.runtime
+    && previousBinding.runtime.runtimeId === recovery.from.runtimeId
+    && previousBinding.runtime.epoch === recovery.from.epoch ? recovery : undefined;
   const binding = workerSessionEventScope.beginRuntime(activeRestartAttemptId);
+  binding.continuation = continuation;
   if (execution) workerSessionEventScope.rememberExecution(execution, binding);
   return workerSessionEventScope.run(binding, async () => {
     const reserved = awaitRuntimeReservation(pendingRuntimeReservations, binding.bindingId, () => log(
       `Runtime reservation ${binding.bindingId} unanswered after ${RUNTIME_RESERVATION_SLOW_LOG_MS / 1000}s; `
       + `waiting for the daemon up to ${RUNTIME_RESERVATION_DEADLINE_MS / 1000}s`,
     ));
-    send({ type: 'runtime_binding_started', bindingId: binding.bindingId, ...(binding.operationId ? { operationId: binding.operationId } : {}) });
+    send({ type: 'runtime_binding_started', bindingId: binding.bindingId,
+      ...(continuation ? { continuation } : {}), ...(binding.operationId ? { operationId: binding.operationId } : {}) });
     const outcome = await reserved;
     const superseded = closeRequested || workerSessionEventScope?.currentBinding() !== binding;
     if (outcome !== 'granted' || superseded) {
@@ -23401,6 +23507,7 @@ async function spawnCli(
       // Superseded means another lifecycle operation owns the next start. An
       // unanswered start has no such owner, so it must fail where it is seen.
       if (outcome === 'expired' && !superseded) throw new RuntimeReservationExpiredError();
+      if (outcome === 'refused' && continuation && !superseded) throw new Error('TraeX auto-model continuation reservation was refused');
       if (outcome === 'refused') log(`Daemon refused runtime reservation ${binding.bindingId}; the lifecycle operation that owns the session takes over`);
       throw new CliSpawnSupersededError();
     }
@@ -24121,6 +24228,7 @@ async function spawnCliBody(
       ...((riffBackendConfig as EffectiveMojoConfig).env ?? {}),
       BOTMUX_REPLY_STYLE: JSON.stringify(cfg.replyStyle ?? {}),
       BOTMUX_REPLY_FOOTER: JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId)),
+      [HIDE_LOCAL_ADDRESSES_ENV]: hideLocalAddressesEnvValue(cfg.hideLocalAddresses === true),
       [PLUGIN_CARD_ACTION_CAPABILITIES_ENV]: cardActionCapabilities,
     };
     for (const key of protectedMcpEnvKeys) delete (riffBackendConfig as EffectiveMojoConfig).env![key];
@@ -24157,6 +24265,7 @@ async function spawnCliBody(
       BOTMUX_USAGE_DISPLAY: resolveUsageDisplay(cfg.larkAppId),
       BOTMUX_REPLY_FOOTER: JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId)),
       BOTMUX_REPLY_STYLE: JSON.stringify(cfg.replyStyle ?? {}),
+      [HIDE_LOCAL_ADDRESSES_ENV]: hideLocalAddressesEnvValue(cfg.hideLocalAddresses === true),
       [PLUGIN_CARD_ACTION_CAPABILITIES_ENV]: cardActionCapabilities,
     };
     // Core-only capability must survive into the sandboxed CLI: riffModeSession
@@ -24220,6 +24329,11 @@ async function spawnCliBody(
     // the guide and the actual card renderer.
     mergedEnv.BOTMUX_REPLY_STYLE = JSON.stringify(cfg.replyStyle ?? {});
     mergedEnv.BOTMUX_REPLY_FOOTER = JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId));
+    // The local-address snapshot is likewise host-resolved: a remote `botmux
+    // send` reads it when bots.json is out of reach. Re-freeze after the raw
+    // riff env merge so a stale/forged backendConfig.env cannot turn the bot's
+    // hideLocalAddresses policy off in the remote pane.
+    mergedEnv[HIDE_LOCAL_ADDRESSES_ENV] = hideLocalAddressesEnvValue(cfg.hideLocalAddresses === true);
     // Public selector metadata is a host-resolved session snapshot. It is only
     // a send-time validation hint (the daemon reauthorizes every callback), but
     // still freeze it after raw riff env merges so stale config cannot desync
@@ -26018,6 +26132,7 @@ async function spawnCliBody(
     promptCacheTtl: cfg.promptCacheTtl,
     solo: cfg.solo,
     leadOnly: cfg.leadOnly,
+    hideLocalAddresses: cfg.hideLocalAddresses === true,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
     modelProviderBaseUrlOverride: codexProtectedProviderBridge
@@ -26339,6 +26454,9 @@ async function spawnCliBody(
   childEnv.BOTMUX_CARD_BRAND_ENABLED = readGlobalConfig().dashboard?.cardBrandLabel === false ? 'false' : 'true';
   childEnv.BOTMUX_USAGE_DISPLAY = resolveUsageDisplay(cfg.larkAppId);
   childEnv.BOTMUX_REPLY_FOOTER = JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId));
+  // A sandboxed `botmux send` cannot read bots.json; it keeps this bot's
+  // local-address policy from the snapshot taken when the worker was forked.
+  childEnv[HIDE_LOCAL_ADDRESSES_ENV] = hideLocalAddressesEnvValue(cfg.hideLocalAddresses === true);
   // The stable native/global skill loader and `botmux send` must see one exact
   // normalized snapshot for the lifetime of this pane. Always inject `{}` for
   // defaults so an inherited stale value can never bleed across bot sessions.
@@ -30268,7 +30386,10 @@ async function restartCliProcess(
           pending.push(...childrenOf(current));
         }
       }
-      if (restartingBackend) intentionalRestartBackend = restartingBackend;
+      if (restartingBackend) {
+        intentionalRestartBackend = restartingBackend;
+        intentionallyRetiredBackends.add(restartingBackend);
+      }
       const teardown = restartingBackend?.destroySession?.();
       let teardownOutcome: RestartTeardownOutcome = { kind: 'absent' };
       if (teardown && typeof (teardown as Promise<void>).then === 'function') {
@@ -33656,9 +33777,13 @@ function retireTerminatedMarkerTurn(parsed: {
   const dispatchAttempt = typeof parsed.dispatchAttempt === 'number'
     ? parsed.dispatchAttempt
     : queued?.dispatchAttempt;
-  if (!turnTerminalEmitted(parsed.turnId, dispatchAttempt)) return false;
+  const genericStatus = dispatchAttempt !== undefined && sessionId
+    ? emittedTurnTerminals.statusOf(sessionId, parsed.turnId, undefined)
+    : undefined;
+  const genericSettled = genericStatus === 'completed' || genericStatus === 'cancelled';
+  if (!turnTerminalEmitted(parsed.turnId, dispatchAttempt) && !genericSettled) return false;
   const siblingIsLive = (candidate: { turnId?: unknown; dispatchAttempt?: unknown } | undefined): boolean => {
-    if (!candidate || candidate.turnId !== parsed.turnId) return false;
+    if (genericSettled || !candidate || candidate.turnId !== parsed.turnId) return false;
     const siblingAttempt = typeof candidate.dispatchAttempt === 'number'
       ? candidate.dispatchAttempt
       : undefined;
@@ -33666,6 +33791,8 @@ function retireTerminatedMarkerTurn(parsed: {
     // was just confirmed emitted, so this lookup returns false for it too.
     return !turnTerminalEmitted(parsed.turnId, siblingAttempt);
   };
+  // Every caller skips a marker head equal to currentBotmuxTurnId, so the
+  // active turn is never a sibling here: only queued records can be.
   const liveSibling = queuedTypeAheadTurns.some(siblingIsLive)
     || (parsed.queuedTurns ?? []).some(siblingIsLive);
   dropQueuedTurnRecord(parsed.turnId, dispatchAttempt, { tombstone: !liveSibling });
@@ -34240,6 +34367,34 @@ function unattendedRawInputRefusal(
 
 // ─── IPC Message Handler ─────────────────────────────────────────────────────
 
+function seedInitTurnTerminals(msg: Extract<DaemonToWorker, { type: 'init' }>): void {
+  const contractExecutions = msg.sessionContract?.executions ?? [];
+  const hasUnsettledExecution = (turnId: string): boolean =>
+    contractExecutions.some(other => other.ref.turnId === turnId
+      && other.phase !== 'succeeded' && other.phase !== 'failed' && other.phase !== 'cancelled');
+  for (const state of contractExecutions) {
+    workerSessionEventScope?.noteAdmission(state);
+    if (sessionId && typeof emittedTurnTerminals !== 'undefined'
+      && (state.phase === 'succeeded' || state.phase === 'failed' || state.phase === 'cancelled')) {
+      const terminalStatus = state.phase === 'succeeded' ? 'completed' : state.phase;
+      emittedTurnTerminals.claim(sessionId, state.ref.turnId, state.ref.dispatchAttempt, terminalStatus);
+      if ((state.phase === 'succeeded' || state.phase === 'cancelled')
+        && state.ref.dispatchAttempt !== undefined
+        && state.ref.turnId !== msg.turnId
+        && !hasUnsettledExecution(state.ref.turnId)) {
+        emittedTurnTerminals.claim(sessionId, state.ref.turnId, undefined, terminalStatus);
+      }
+    }
+  }
+  if (sessionId && typeof emittedTurnTerminals !== 'undefined') {
+    for (const settled of msg.settledTurnTerminals ?? []) {
+      if (settled.turnId !== msg.turnId && !hasUnsettledExecution(settled.turnId)) {
+        emittedTurnTerminals.claim(sessionId, settled.turnId, undefined, settled.status);
+      }
+    }
+  }
+}
+
 async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Promise<void> {
   const msg = raw as DaemonToWorker;
 
@@ -34366,7 +34521,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       activeRestartAttemptId = msg.restartAttemptId;
       sessionId = msg.sessionId;
       workerSessionEventScope = msg.sessionContract ? new WorkerSessionEventScope(msg.sessionContract.session, msg.sessionContract.worker) : undefined;
-      for (const state of msg.sessionContract?.executions ?? []) workerSessionEventScope?.noteAdmission(state);
+      seedInitTurnTerminals(msg);
       if (msg.sessionCommand?.execution) workerSessionEventScope?.rememberExecution(msg.sessionCommand.execution);
       initializeFinalOutputHandoff(msg);
       applyInitFinalOutputBackpressure(msg, ordinaryImTurnId);
@@ -34872,16 +35027,43 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       break;
     }
     case 'runtime_contract_assigned': {
-      workerSessionEventScope?.assign(msg.bindingId, msg.runtime);
-      for (const state of msg.admissionStates ?? []) workerSessionEventScope?.noteAdmission(state);
+      const scope = workerSessionEventScope;
+      if (scope && !scope.bindingSharesCurrentProcess(msg.bindingId)) break;
+      scope?.assign(msg.bindingId, msg.runtime);
+      const continuation = msg.continuation;
+      if (continuation?.status === 'approved') {
+        const state = msg.admissionStates?.find(value => value.ref.executionId === continuation.execution.executionId
+          && value.ref.turnId === continuation.execution.turnId && value.ref.dispatchAttempt === continuation.execution.dispatchAttempt);
+        if (state) scope?.acceptContinuation(msg.bindingId, state);
+      }
+      for (const state of msg.admissionStates ?? []) scope?.noteAdmission(state);
       for (const execution of msg.executions ?? []) workerSessionEventScope?.rememberExecution(execution);
       for (const observed of msg.observedExecutions ?? []) {
         workerSessionEventScope?.rememberObservedExecution(msg.bindingId, observed.runtime, observed.execution);
       }
-      if (!msg.mayExecute) {
-        log(`Daemon retired runtime binding ${msg.bindingId} (mayExecute=false); closing the transcript bridge and the CLI backend`);
-        closeRequested = true; stopBridgeWatcher(); stopScreenshotLoop(); killCli();
+      if (continuation?.status === 'rejected') {
+        const recovery = pendingMessages.find(item => item.traexAutoModelRecovery
+          && item.traexAutoModelContinuation?.execution.executionId === continuation.execution.executionId);
+        if (recovery?.turnId) {
+          for (let index = pendingMessages.length - 1; index >= 0; index--) {
+            if (pendingMessages[index]!.traexAutoModelRecovery
+              && pendingMessages[index]!.traexAutoModelContinuation?.execution.executionId === continuation.execution.executionId) pendingMessages.splice(index, 1);
+          }
+          traexAutoModelTurnReplayForbidden = true;
+          traexAutoModelController?.endTurn(recovery.turnId);
+          send({ type: 'user_notify', turnId: recovery.turnId, message: t('worker.traex_auto_model.continuation_rejected') });
+        }
       }
+      if (!msg.mayExecute && (!scope || scope.currentBinding()?.bindingId === msg.bindingId)) {
+        log(`Daemon retired runtime binding ${msg.bindingId} (mayExecute=false); closing the transcript bridge and the CLI backend`);
+        // A close already under way ends this worker itself. Otherwise nothing
+        // can bring the retired worker back (the close fence aborts every later
+        // spawn as superseded), so it must not stay behind queueing input.
+        const closeUnderWay = closeRequested;
+        if (!closeUnderWay) retiredRuntimeBackend = backend;
+        closeRequested = true; stopBridgeWatcher(); stopScreenshotLoop(); killCli();
+        if (!closeUnderWay) armRetiredRuntimeExit(msg.bindingId);
+      } else if (continuation) void flushPending();
       break;
     }
 
@@ -36032,6 +36214,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         break;
       }
 
+      cancelRetiredRuntimeExit();
       closeRequested = true;
       const cleanupRequest = msg.codexCleanupRelease;
       let nativeSnapshot: ReturnType<typeof captureCodexNativeProcesses> | undefined;
@@ -36063,7 +36246,11 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       // reach here: the branch above fences them all (request-less remote close
       // is refused; with a requestId it goes through prepare/commit), so
       // destroySession() below only ever tears down local backing sessions.
-      const closeTeardown = backend?.destroySession?.();
+      // A retired runtime's backend was only detached (killCli): its persistent
+      // session is still this close's to destroy.
+      const closeTeardown = backend
+        ? backend?.destroySession?.()
+        : retiredRuntimeBackend?.destroySession?.();
       if (closeTeardown && typeof (closeTeardown as Promise<void>).then === 'function') {
         try { await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]); }
         catch { /* logged by backend */ }
@@ -36089,6 +36276,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
 
     case 'detach_for_transfer': {
       log('Transfer detach requested');
+      cancelRetiredRuntimeExit();
       stopScreenshotLoop();
       // Transfer keeps the logical session alive. The daemon starts its
       // replacement on the new routing anchor only after this worker ACKs the
@@ -36443,7 +36631,7 @@ function cleanup(): void {
  * only retire this worker's HTTP/WebSocket observers. Ordinary managed sessions
  * retain the historical killCli shutdown path.
  */
-function shutdownWorkerForParentExit(reason: string): void {
+function shutdownWorkerForParentExit(reason: string, exitCode = 0): void {
   stopScreenshotLoop();
   if (lastInitConfig?.existingAppServerEndpoint) {
     log(`Preserving existing-App-Server remote TUI during ${reason}`);
@@ -36457,7 +36645,7 @@ function shutdownWorkerForParentExit(reason: string): void {
       sandboxCleanup = null;
     }
     cleanup();
-    process.exit(0);
+    process.exit(exitCode);
     return;
   }
   // A persistent sandboxed pane (oncall / scratch / credential-only) survives
@@ -36488,7 +36676,37 @@ function shutdownWorkerForParentExit(reason: string): void {
   }
   killCli({ preserveSandbox, preserveCliPidMarker });
   cleanup();
-  process.exit(0);
+  process.exit(exitCode);
+}
+
+/** Armed when the daemon retires this worker's live runtime binding and no
+ *  close is already ending it (see core/retired-runtime-exit.ts). */
+let retiredRuntimeExitTimer: ReturnType<typeof setTimeout> | undefined;
+/** That runtime's backend, detached but with its persistent session alive. */
+let retiredRuntimeBackend: SessionBackend | null = null;
+
+/** The retired worker waits briefly for the lifecycle operation that
+ *  superseded it, then hands its unwritten inputs to the session's next worker
+ *  and ends this generation, so a later message starts a successor instead of
+ *  queueing behind a backend that will never come back. A v3 workflow worker
+ *  is left as it was: its pool owns its lifecycle and deadline. */
+function armRetiredRuntimeExit(bindingId: string): void {
+  if (retiredRuntimeExitTimer || isWorkflowWorker()) return;
+  retiredRuntimeExitTimer = setTimeout(() => {
+    retiredRuntimeExitTimer = undefined;
+    log(`No close, suspend or transfer took over retired runtime binding ${bindingId} within `
+      + `${RETIRED_RUNTIME_EXIT_GRACE_MS / 1000}s; handing ${pendingMessages.length} unwritten input(s) `
+      + 'to the next worker and ending this generation');
+    shutdownWorkerForParentExit('runtime retired', WORKER_EXIT_RUNTIME_RETIRED);
+  }, RETIRED_RUNTIME_EXIT_GRACE_MS);
+}
+
+/** A close or transfer reached the retired worker: its own teardown ends it.
+ *  (Suspend needs no call: its teardown runs to process.exit without yielding.) */
+function cancelRetiredRuntimeExit(): void {
+  if (!retiredRuntimeExitTimer) return;
+  clearTimeout(retiredRuntimeExitTimer);
+  retiredRuntimeExitTimer = undefined;
 }
 
 process.on('SIGTERM', () => shutdownWorkerForParentExit('SIGTERM'));

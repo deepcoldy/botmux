@@ -56,6 +56,7 @@ function harness(extra: Record<string, unknown> = {}) {
   const scope: Record<string, any> = {
     traexAutoModelRuntimeEligible: () => true, traexAutoModelSwitching: false,
     cliRestartInProgress: false, isFlushing: false, traexAutoModelTurnReplayForbidden: false,
+    currentInputDeliveryQuarantine: () => null,
     lastInitConfig: { cliId: 'traex', cliSessionId: 'native', model: 'core' },
     activeTurnAuthority: authority, traexAutoModelController: controller,
     inflightInputs: tracker, currentBotmuxCallerOpenId: 'caller', pendingMessages: [],
@@ -329,6 +330,7 @@ describe('auto-model Worker admission and original-input retirement', () => {
 
   it.each([
     { isFlushing: true }, { cliRestartInProgress: true }, { traexAutoModelTurnReplayForbidden: true },
+    { currentInputDeliveryQuarantine: () => ({ generation: 1 }) },
     { lastInitConfig: { cliId: 'traex', model: 'core' } },
     { traexAutoModelRuntimeEligible: () => false },
   ])('does not advance the model or enqueue recovery when the runtime cannot safely resume (%j)', extra => {

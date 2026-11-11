@@ -6,7 +6,8 @@ import { sessionContractStore, type SessionContractStore } from '../services/ses
 import {
   contractReadiness, sameWorker, sameRuntime, sameExecution, type ContractSessionRef, type WorkerRef, type RuntimeRef,
   type RuntimeIdentity, type SessionEventContext, type ContractEvent, type ExecutionRef, type ControlKind,
-  type ControlOperation, type RuntimeContract,
+  type ControlOperation, type RuntimeContract, type RuntimeExecutionContinuation,
+  TRAEX_CONTINUATION_BACKENDS,
   sessionContractsEnabled,
   contractTerminalStatus,
   samePhysicalRuntimeIdentity,
@@ -65,13 +66,27 @@ export class SessionController {
   bindWorker(generation: number): SessionContractBootstrap {
     const previous = this.store.read(this.ref)?.worker;
     const worker = previous?.generation === generation ? previous : { workerId: randomUUID(), generation };
-    this.store.bindWorker(this.ref, worker); this.refresh(); return { version: 2, session: this.ref, worker,
+    this.store.bindWorker(this.ref, worker); this.refresh(); return { version: 2, session: this.ref, worker, executionContinuations: true,
       executions: this.store.executions(this.ref).map(({ ref, runtime, phase }) => ({ ref, runtime, phase })) };
   }
-  reserveBinding(bindingId: string, worker: WorkerRef): RuntimeRef {
+  private executionContinuationSupported(): boolean {
+    const cfg = this.ds.initConfig;
+    return cfg?.cliId === 'traex' && cfg.traexAutoModel?.enabled === true
+      && !cfg.adoptMode && !cfg.existingAppServerEndpoint && !cfg.wrapperCli
+      && (TRAEX_CONTINUATION_BACKENDS as readonly string[]).includes(cfg.backendType);
+  }
+  reserveBinding(bindingId: string, worker: WorkerRef, continuation?: RuntimeExecutionContinuation): RuntimeRef {
     const state = this.store.read(this.ref)!;
     if (!sameWorker(state.worker, worker)) throw new Error('stale_runtime_registration');
-    const value = this.store.reserveRuntime(this.ref, worker, bindingId); this.refresh(); return value;
+    if (continuation && !this.executionContinuationSupported()) {
+      throw new Error('execution_continuation_not_supported');
+    }
+    const value = this.store.atomic(() => {
+      const runtime = this.store.reserveRuntime(this.ref, worker, bindingId);
+      if (continuation) this.store.planExecutionContinuation(this.ref, bindingId, runtime, worker, continuation);
+      return runtime;
+    });
+    this.refresh(); return value;
   }
   bindRuntime(bindingId: string, worker: WorkerRef, identity: RuntimeIdentity, operationId?: string, continuesBindingId?: string): RuntimeContract {
     if (this.abortedBindings.has(bindingId)) throw new Error('runtime_reservation_abandoned');
@@ -95,9 +110,14 @@ export class SessionController {
       const bound = this.store.bindRuntime(this.ref, proposed.ref, worker, identity, operation);
       if (continued && !sameRuntime(continued, bound.ref) && sameRuntime(this.store.read(this.ref)?.activeRuntime, bound.ref)) {
         this.store.continueRuntime(this.ref, continued, bound.ref, worker);
+        this.store.inheritExecutionContinuation(this.ref, continuesBindingId!, bindingId, worker);
       }
       return bound;
     });
+    // Physical binding is a fact even if granting execution continuation fails.
+    // A later registration retries the grant without erasing that live process.
+    if (this.executionContinuationSupported()) this.store.commitExecutionContinuation(this.ref, bindingId, worker);
+    else this.store.rejectExecutionContinuation(this.ref, bindingId);
     this.refresh(); return runtime;
   }
   bindingMayStart(bindingId: string): boolean {
@@ -211,6 +231,10 @@ export class SessionController {
       || this.store.continuedExecution(this.ref, runtime, active.context.producer, active.context.scope.execution)) && !['closing', 'closed', 'suspended'].includes(state.lifecycle);
   }
   run<T>(admission: SessionEventAdmission, work: () => T): T { return eventScope.run(admission, work); }
+  admittedExecution(): ExecutionRef | undefined {
+    const active = eventScope.getStore();
+    return active && (active.kind === 'current' || active.kind === 'worker') ? active.context.scope.execution : undefined;
+  }
   outputOrigin(origin: SessionEventContext): SessionEventContext | undefined {
     const value = structuredClone(origin);
     if (value.session.appId !== this.ref.appId || value.session.sessionId !== this.ref.sessionId) return undefined;
@@ -251,6 +275,14 @@ export class SessionController {
     // and revocation cannot create an attempt through the legacy inference path.
     if (['turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'turn_interrupt_result', 'managed_turn_origin', 'managed_turn_origin_revoked'].includes(message.type)
       && message.turnId && !context.scope.execution) return { kind: 'reject', reason: 'execution_scope_missing' };
+    if (message.type === 'screen_update' && context.scope.execution) {
+      const stored = this.store.execution(this.ref, context.scope.execution.executionId);
+      if (!sameExecution(stored?.ref, context.scope.execution)
+        || message.turnId !== context.scope.execution.turnId
+        || ('dispatchAttempt' in message && message.dispatchAttempt !== context.scope.execution.dispatchAttempt)) {
+        delete context.scope.execution;
+      }
+    }
     if (context.session.appId !== this.ref.appId || context.session.sessionId !== this.ref.sessionId
       || !Number.isSafeInteger(context.sequence) || context.sequence < 1 || context.eventId !== `${channel.workerId}:${context.sequence}`
       || (message.turnId && context.scope.execution && (message.turnId !== context.scope.execution.turnId || ('dispatchAttempt' in message && message.dispatchAttempt !== context.scope.execution.dispatchAttempt)))) return { kind: 'reject', reason: 'session_event_reference_mismatch' };
@@ -286,7 +318,14 @@ export class SessionController {
       if (current && !sameRuntime(current, context.scope.runtime) && !existing.some(value => sameRuntime(value.runtime, context.scope.runtime))
         && this.store.runtimeContinues(this.ref, context.scope.runtime, current, channel)) context.scope.runtime = current;
       if (existing.length === 1) context.scope.execution = existing[0].ref;
-      else if (!existing.length && sameRuntime(current, context.scope.runtime)) context.scope.execution = this.admitInput(message.turnId, message.dispatchAttempt);
+      else if (!existing.length && message.type !== 'screen_update' && sameRuntime(current, context.scope.runtime)) context.scope.execution = this.admitInput(message.turnId, message.dispatchAttempt);
+    }
+    // Physical screen status is a runtime observation, not an execution claim:
+    // keep proven runtime-bound attribution, but drop unproven/unbound turn
+    // scopes instead of rejecting the current runtime's idle/working frame.
+    if (message.type === 'screen_update' && context.scope.runtime && context.scope.execution
+      && !sameRuntime(this.store.execution(this.ref, context.scope.execution.executionId)?.runtime, context.scope.runtime)) {
+      delete context.scope.execution;
     }
     const uncertainTerminal = message.type === 'turn_terminal' && contractTerminalStatus(message.status, message.errorCode) === 'reconciling';
     if (['turn_terminal', 'final_output', 'turn_execution_started', 'native_input_consumed'].includes(message.type) && !context.scope.execution) return { kind: 'reject', reason: 'execution_scope_missing' };

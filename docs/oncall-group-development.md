@@ -12,6 +12,8 @@
 
 ```bash
 bun run test test/oncall-group.test.ts test/oncall-group-callback.test.ts \
+  test/oncall-identity.test.ts test/oncall-identity-sdk.test.ts \
+  test/oncall-service-secret.test.ts test/oncall-target-settings-ui.test.ts \
   test/oncall-session-handoff.test.ts test/oncall-form-callback.test.ts \
   test/turn-reply-card.test.ts test/turn-reply-card-runtime.test.ts \
   test/cli-send-reply-card.test.ts test/dashboard-daemon-proxy-routes.test.ts
@@ -28,8 +30,28 @@ bun run build
 | --- | --- | --- | --- |
 | `ONCALL_SERVICE_SECRET` | 每套部署一个 | Oncall 页面密码框保存到 `~/.botmux/.env`，或部署 Secret 注入 | 保存后下次 Oncall 操作自动加载 |
 | `ONCALL_GROUP_ENDPOINT`、`ONCALL_EMAIL_DOMAIN` | 每套部署一组 | Dashboard「转人工 Oncall → 高级设置」写入宿主 `.env`；也支持部署注入 | 保存后下次 Oncall 操作自动加载 |
+| `ONCALL_IDENTITY_APP_ID`、`ONCALL_IDENTITY_APP_SECRET`、`ONCALL_IDENTITY_BRAND` | 每套部署一组，可选 | Dashboard「转人工 Oncall → 高级设置 → 提单人身份查询」 | 选择统一查询的 Bot 下次转人工时使用 |
 | 业务目标 | 每个 Bot 的业务线，直接建群另需区域和分类 | Dashboard「消息卡片 → 转人工 Oncall」；`<dataDir>/oncall-group-targets.json` | 下次需要新建或重试时读取 |
 | 开关和来源群 | 每个 Bot 两项 | Bot 配置 `oncallGroup`，推荐由 Dashboard 维护 | 热更新；不会给已发出的无按钮卡片补按钮 |
+
+### 提单人身份查询
+
+首次启用转人工时，页面提示由应用管理员选择以下两种方式；普通提单用户不需要各自申请权限，也不会因此获得 AI 使用或机器人管理权限。
+
+- **使用当前机器人（默认）**：保持原有 `open_id → 当前应用通讯录邮箱 → Oncall 用户名` 链路。管理员为当前机器人开通通讯录基本信息、用户邮箱只读权限，并将通讯录数据范围覆盖服务对象；面向全员服务时选择全部成员，审核发布后生效。
+- **使用统一查询应用**：设置当前 Bot 的 `oncallGroup.identitySource` 为 `shared`。多个 Bot 可以共用同一套查询应用凭据，各 Bot 也可独立保留 `bot` 模式。业务机器人需开通 `contact:user.employee_id:readonly`，由可信飞书卡片回调提供 `operator.user_id` 和 `operator.tenant_key`。统一应用需与其属于同一租户、同一飞书/Lark 平台，并开通 `contact:contact.base:readonly`、`contact:user.email:readonly`、`contact:user.employee_id:readonly`、`tenant:tenant:readonly`，通讯录数据范围设为全部成员并审核发布。企业信息权限只用于核对租户，缺少时不会跳过校验。
+
+在高级设置填写查询应用 App ID、App Secret 和平台，使用底部唯一的保存按钮提交。凭据由宿主管理员保存在权限为 `0600` 的 `~/.botmux/.env`，不写入每个 Bot 配置，也不传入会话 CLI。`GET /api/oncall-identity` 只返回 App ID、平台及凭据是否存在，不回传 Secret；`PUT` 沿用宿主管理和 CSRF 校验。更换 App ID 或平台时必须重新提供 Secret，凭据轮换后后续操作自动加载。
+
+App ID、Secret、平台按整组读取：宿主文件出现任一身份配置键时，只使用文件中的这一组，不借用启动环境补齐；文件完全没有身份配置键时才使用部署注入值。人工半改配置会提示未配置，不会把旧凭据送给新应用或其他平台。省略 Secret 的保存会在写锁内重新读取，保留同期轮换的新值。
+
+以下为真实页面组件配合虚构数据的截图，非线上身份查询验收：
+
+![高级身份查询配置](assets/oncall-shared-identity-settings.png)
+
+统一查询只接受可信回调中的租户级 `user_id`，先验证查询应用所属租户，再查询邮箱；不接受按钮 value、聊天正文中的姓名/邮箱，也不把其他应用的 `open_id` 传给查询应用。缺少回调字段、权限未发布、租户不一致或查询失败时会给出明确提示，不改用另一个人的身份。直接建群和群内分类表单共用此解析；原生侧栏仍由平台完成身份认证，保持原有行为。
+
+启用统一方式前需在测试群验收：通讯录范围外用户的真实点击回调能提供 `user_id`，统一应用能读取该员工邮箱，建群提单人正确。单测和平台连接检测不能代替这项验收。
 
 ### 服务凭据
 
@@ -224,12 +246,12 @@ Linux 候选实例已完成实际配置热保存、运行时凭据检查、平�
 
 ### 管理员连接设置
 
-`GET/PUT /api/oncall-connection` 仅允许宿主管理员，写入沿用 CSRF 和安全 `.env` 文件校验。GET 可带 `appId` 回填该 Bot 的旧版连接；PUT 只接受 `endpoint`、`emailDomain`，不会改写服务凭据。凭据通过基础设置中的密码框加载和编辑，默认遮罩显示；仅实际修改时随底部唯一保存按钮提交，保存后继续保留。连接配置保存后重启生效；连通性和业务线名称来自已加载配置的只读平台请求，不等同于真实建群权限。
+`GET/PUT /api/oncall-connection` 仅允许宿主管理员，写入沿用 CSRF 和安全 `.env` 文件校验。GET 可带 `appId` 回填该 Bot 的旧版连接；PUT 接受 `endpoint`、`emailDomain` 和可选的 `secret`，将同时编辑的连接与服务凭据原子保存。凭据通过基础设置中的密码框加载和编辑，默认遮罩显示；仅实际修改时随底部唯一保存按钮提交，保存后继续保留。后续平台操作自动读取保存值；连通性和业务线名称来自只读平台请求，不等同于真实建群权限。
 
-日常页面按基础设置、交接设置排列。未加载服务凭据时无法调用平台；可先输入新凭据并一起保存启用配置，随后需重启加载，页面不会自动重启。部署已提供凭据时无需再次输入。业务线与交接策略保存后用于后续请求，无需重启。保存期间收到其他页面的交接策略更新时停止覆盖并提示重新确认。交接设置在宽屏采用两行两列，窄屏自动纵排。
+日常页面按基础设置、交接设置排列。未配置服务凭据时无法调用平台；可先输入新凭据并一起保存启用配置，后续操作自动加载，无需重启。部署已提供凭据时无需再次输入。业务线与交接策略保存后用于后续请求。保存期间收到其他页面的交接策略更新时停止覆盖并提示重新确认。交接设置在宽屏采用两行两列，窄屏自动纵排。
 
 ### Dashboard 高级连接设置
 
 转人工子卡底部提供默认收起的“高级设置”，左右两列编辑网关地址、企业邮箱域。读取复用宿主管理员 `GET /api/oncall-connection?appId=...`，自动带入保存值、部署值或当前 Bot 的旧版值，不在前端内置组织地址。读取失败时禁用这两个输入，不影响其他业务设置保存。
 
-高级设置复用唯一的底部保存按钮；修改只保留在本地草稿，连接有变化时才调用管理员 `PUT /api/oncall-connection`，带 CSRF。顺序为服务凭据、连接参数、业务目标、交接策略；部分失败保留剩余草稿并可重试，不重复写入已成功部分。连接变更后提示重启加载，待保存或待加载期间不允许用旧运行配置检测新连接；不会自动重启机器人。连接参数同一部署共用，仍遵循部署环境的既有加载顺序。
+高级设置复用唯一的底部保存按钮；修改只保留在本地草稿，连接有变化时才调用管理员 `PUT /api/oncall-connection`，带 CSRF，同时修改的服务凭据随同保存。统一查询应用有变化时先保存该应用，再保存业务目标和交接策略；部分失败保留剩余草稿并可重试，不重复写入已成功部分。连接参数同一部署共用，保存后后续操作自动读取；存在未保存的连接草稿时不允许用旧配置检测新连接。

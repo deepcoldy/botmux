@@ -36,7 +36,7 @@ The token is a login credential, like a long-lived key:
 
 | How you deploy | What the link looks like | Why |
 |---|---|---|
-| Bound to the central platform (remote access on and bound) | `https://m-<machineId>.<platform-domain>/`, **no token** | The platform sends you through single sign-on first and knows who you are. The token does nothing here and would only be a leak risk |
+| Bound to the [central platform](/en/platform) (remote access on and bound) | `https://m-<machineId>.<platform-domain>/`, **no token** | The platform sends you through single sign-on first and knows who you are. The token does nothing here and would only be a leak risk |
 | Your own reverse proxy (`BOTMUX_PUBLIC_URL`) or a Devbox short link | `https://<your-domain>/?t=<token>`, **with token** | The proxy only forwards requests and does not identify you, so the token is the only ticket in |
 | LAN only | `http://<lan-ip>:7891/?t=<token>`, **with token** | Same as above |
 

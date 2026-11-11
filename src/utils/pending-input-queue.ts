@@ -64,6 +64,8 @@ export interface PendingCliInput {
    * the original turn id for reply attribution but is never merged with a
    * later user input. */
   traexAutoModelRecovery?: true;
+  /** Captured before teardown; only the host can authorize its new runtime. */
+  traexAutoModelContinuation?: import('../services/session-contract.js').RuntimeExecutionContinuation;
   /** This still-queued independent turn has completed its read-only TraeX load
    * admission. It survives an intentional exact-resume model restart so the
    * original prompt is submitted once without repeating the preflight. */
