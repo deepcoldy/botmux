@@ -17,7 +17,8 @@ const MAX_POLL_CHARGE_MS = 250;
 type Submission = { text: string; nativeTurnId: string };
 
 describe('TraeX input delivery evidence ordering', () => {
-  it.each(['early-terminal', 'early-send', 'late-terminal', 'history', 'unknown'] as const)(
+  it.each(['early-terminal', 'early-send', 'late-terminal', 'history', 'unknown',
+    'skill-adopt-history', 'skill-adopt-terminal'] as const)(
     'delivers successors exactly once with %s evidence',
     async mode => {
       // Keep the UNIX socket path short on macOS (104-byte socket limit).
@@ -67,16 +68,24 @@ function complete(id) {
 }
 idle();
 for (const ms of [500,1000]) setTimeout(() => { if (!count) idle(); }, ms);
+setInterval(() => { if (!count) idle(); }, 5_000);
 const collect = (${createBracketedPasteCollector.toString()})(text => {
   count++;
   const id = crypto.randomUUID();
   fs.appendFileSync(submissions,JSON.stringify({text,nativeTurnId:id})+'\\n');
-  if (count > 1 || mode === 'history') {
-    fs.appendFileSync(history,JSON.stringify({session_id:sid,ts:Date.now()/1000,text})+'\\n');
+  const skill = count === 1 && mode.startsWith('skill-adopt-');
+  if (count > 1 || mode === 'history' || mode === 'skill-adopt-history') {
+    const recorded = skill ? text.replace('/receipt', '[$receipt](/tmp/fixture/receipt/SKILL.md)') : text;
+    fs.appendFileSync(history,JSON.stringify({session_id:sid,ts:Date.now()/1000,text:recorded})+'\\n');
   }
   if (count > 1 || !['early-send','unknown'].includes(mode)) {
     line({type:'task_started',turn_id:id,root_turn_id:id});
-    line({type:'user_message',message:text,turn_id:id,images:[],local_images:[],text_elements:[]});
+    if (skill) {
+      fs.appendFileSync(rollout, JSON.stringify({ timestamp:new Date().toISOString(), type:'history_mutation',
+        payload: {operation:'append', turn_id:id, items:[], display_completions:[{thread_id:sid,turn_id:id,
+          item:{type:'UserMessage',id:'message-'+id,content:[{type:'text',text:text.replace('/receipt','$receipt')},
+            {type:'skill',name:'receipt',path:'/tmp/fixture/receipt/SKILL.md'}]}}]}})+'\\n');
+    } else line({type:'user_message',message:text,turn_id:id,images:[],local_images:[],text_elements:[]});
   }
   process.stdout.write('\\x1b[2J\\x1b[H◆ Working… (1s • esc to interrupt)\\nContext 99% left\\n');
   if (count === 1) {
@@ -86,7 +95,7 @@ const collect = (${createBracketedPasteCollector.toString()})(text => {
       idle();
     },300);
     else if (mode === 'unknown') setTimeout(idle,300);
-    else if (mode !== 'late-terminal') setTimeout(() => complete(id),300);
+    else if (mode !== 'late-terminal') setTimeout(() => complete(id),mode === 'skill-adopt-terminal' ? 3400 : 300);
   } else setTimeout(() => complete(id),300);
 });
 process.stdin.on('data',collect);
@@ -98,7 +107,7 @@ setInterval(() => {
       const env = privateTmuxEnv(socketRoot, { HOME: root, USERPROFILE: root, SHELL: '/bin/bash' });
       fenceHomeRootedEnv(root, env);
       Object.assign(env, {
-        TRAE_HOME: traeHome, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId,
+        TRAE_HOME: traeHome, SESSION_DATA_DIR: dataDir, BOTMUX_SESSION_ID: sessionId, CLI_ID: 'traex',
         BOTMUX_TIME_SCALE: '1', LARK_APP_ID: 'app_test', LARK_APP_SECRET: 'dummy_test_secret',
       });
       delete env.CLI_EXTRA_ARGS;
@@ -135,25 +144,35 @@ setInterval(() => {
       const nativeEvent = (payload: unknown) => appendFileSync(rollout,
         `${JSON.stringify({ timestamp: new Date().toISOString(), type: 'event_msg', payload })}\n`);
       try {
+        const adopt = mode.startsWith('skill-adopt-');
+        let adoptCliPid: number | undefined;
+        if (adopt) {
+          execFileSync('tmux', ['new-session', '-d', '-s', 'skill-fixture', '-x', '160', '-y', '50', fake],
+            { env, timeout: 5_000 });
+          adoptCliPid = Number(execFileSync('tmux', ['display-message', '-p', '-t', 'skill-fixture:0.0', '#{pane_pid}'],
+            { env, timeout: 2_000, encoding: 'utf8' }).trim());
+        }
         child.send({
           type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root', workingDir: dataDir,
           cliId: 'traex', cliPathOverride: fake, cliSessionId: nativeSessionId, resume: true,
           backendType: 'tmux', prompt: '', larkAppId: 'app_test', larkAppSecret: 'dummy_test_secret', locale: 'zh',
+          ...(adopt ? { adoptMode: true, adoptSource: 'tmux', adoptTmuxTarget: 'skill-fixture:0.0',
+            adoptCliPid, adoptPaneCols: 160, adoptPaneRows: 50 } : {}),
         });
         // Loading worker.ts through tsx on a cold cache took 22-25s on a starved
         // runner; that is harness cost, so it gets its own budget.
         await wait(() => logs.join('').includes('Worker started, waiting for init'), 'worker booted', 60_000);
         await wait(() => messages.some(m => m.type === 'prompt_ready'), 'initial readiness', 30_000);
-        sent('check version', 'om_first');
+        sent(adopt ? '/receipt check version' : 'check version', 'om_first');
         await wait(() => received().length === 1, 'first input received');
-        if (mode === 'early-terminal' || mode === 'history') {
+        if (mode === 'early-terminal' || mode === 'history' || mode === 'skill-adopt-history') {
           await wait(() => messages.some(m => m.type === 'turn_terminal'
             && m.turnId === 'om_first' && m.status === 'completed'), 'native completion before adapter receipt');
           expect(messages.some(m => m.type === 'final_output' && m.turnId === 'om_first'
             && m.content === 'VERSION_EXECUTED_AND_REPLIED')).toBe(true);
         }
         if (mode === 'early-send') await wait(() => existsSync(sendMarker), 'send during adapter wait');
-        if (mode !== 'history' && mode !== 'early-terminal') {
+        if (mode !== 'history' && mode !== 'early-terminal' && mode !== 'skill-adopt-history') {
           await wait(() => logs.join('').includes('deferred 20000ms recheck queued'), 'adapter receipt exhausted');
         }
         sent('diagnose one', 'om_follow_one');
@@ -180,12 +199,12 @@ setInterval(() => {
         await wait(() => messages.some(m => m.type === 'turn_terminal'
           && m.turnId === 'om_follow_two' && m.status === 'completed'), 'successors completed',
         mode === 'early-send' ? 35_000 : 12_000);
-        expect(received()[0]!.text.startsWith('check version')).toBe(true);
+        expect(received()[0]!.text.startsWith(adopt ? '/receipt check version' : 'check version')).toBe(true);
         expect(received().slice(1).map(row => row.text)).toEqual(['diagnose one', 'diagnose two']);
         expect(messages.some(m => (m.type === 'user_notify' && m.kind === 'input_not_submitted')
           || (m.type === 'turn_terminal' && m.errorCode === 'submit_unconfirmed'))).toBe(false);
         expect(messages.filter(m => m.type === 'user_notify')).toEqual([]);
-        if (mode === 'early-terminal' || mode === 'history') {
+        if (mode === 'early-terminal' || mode === 'history' || mode === 'skill-adopt-history') {
           expect(logs.join('')).not.toContain('Quarantined input delivery');
         } else {
           expect(logs.join('')).toContain('Released input-delivery quarantine');
