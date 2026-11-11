@@ -273,12 +273,69 @@ describe('CLI transport gate for a managed no-transport turn', () => {
       env.BOTMUX_SESSION_ID = 's_bound';
       env.BOTMUX_CHAT_ID = 'headless_hl_stale';
       env.BOTMUX_LARK_APP_ID = 'cli_gate_bot';
-      for (const args of [['send', 'hello'], ['create-group', '--bot', 'cli_gate_bot']]) {
+      for (const { args, status, downstream } of [
+        { args: ['send', '--response-kind', 'invalid', 'hello'], status: 2, downstream: /--response-kind/ },
+        { args: ['create-group'], status: 1, downstream: /--bot/ },
+      ]) {
         const r = spawnSyncTsScript('src/cli.ts', args, { env, encoding: 'utf8', timeout: 60_000 });
-        // Past the gate each command still fails on the fixture's missing bot
-        // credentials; what must never appear is the no-transport refusal.
+        // Invalid arguments stop before credentials or network activity, but
+        // only after both transport gates have accepted the bound session.
+        expect(r.status, args.join(' ')).toBe(status);
+        expect(String(r.stderr), args.join(' ')).toMatch(downstream);
         expect(String(r.stderr), args.join(' ')).not.toMatch(/headless automation session|no Feishu transport/);
       }
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it.each(['headless_gate', 'http_async_gate', 'http_wait_gate'])(
+    'refuses a conflicting env session while its ancestor remains %s', chatId => {
+      const dataDir = mkdtempSync(join(tmpdir(), 'api-only-cli-conflict-'));
+      try {
+        seedPersistedSessionRows(dataDir, 'cli_gate_bot', {
+          s_virtual: { sessionId: 's_virtual', chatId, larkAppId: 'cli_gate_bot', scope: 'chat', status: 'active' },
+          s_real: { sessionId: 's_real', chatId: 'oc_real_gate', larkAppId: 'cli_gate_bot', scope: 'chat', status: 'active' },
+        });
+        mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+        writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: 's_virtual' }));
+        const env: Record<string, string> = {};
+        for (const [k, v] of Object.entries(process.env)) if (!k.startsWith('BOTMUX_') && v !== undefined) env[k] = v;
+        env.SESSION_DATA_DIR = dataDir;
+        env.BOTMUX_SESSION_ID = 's_real';
+        env.BOTMUX_CHAT_ID = 'oc_real_gate';
+        env.BOTMUX_LARK_APP_ID = 'cli_gate_bot';
+        const r = spawnSyncTsScript('src/cli.ts', ['create-group'], { env, encoding: 'utf8', timeout: 60_000 });
+        expect(r.status).toBe(2);
+        expect(String(r.stderr)).toMatch(/no Feishu transport/);
+      } finally {
+        rmSync(dataDir, { recursive: true, force: true });
+      }
+    }, 120_000,
+  );
+
+  it('refuses an apiOnly bot even with a real-chat session record', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'api-only-cli-real-'));
+    try {
+      seedPersistedSessionRows(dataDir, 'cli_gate_bot', {
+        s_real: { sessionId: 's_real', chatId: 'oc_real_gate', larkAppId: 'cli_gate_bot', scope: 'chat', status: 'active' },
+      });
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({ sessionId: 's_real' }));
+      mkdirSync(join(dataDir, '.botmux'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux', 'bots.json'), JSON.stringify([
+        { larkAppId: 'cli_gate_bot', apiOnly: true, cliId: 'traex' },
+      ]));
+      const env: Record<string, string> = {};
+      for (const [k, v] of Object.entries(process.env)) if (!k.startsWith('BOTMUX_') && v !== undefined) env[k] = v;
+      env.HOME = dataDir;
+      env.SESSION_DATA_DIR = dataDir;
+      env.BOTMUX_SESSION_ID = 's_real';
+      env.BOTMUX_CHAT_ID = 'oc_real_gate';
+      env.BOTMUX_LARK_APP_ID = 'cli_gate_bot';
+      const r = spawnSyncTsScript('src/cli.ts', ['create-group'], { env, encoding: 'utf8', timeout: 60_000 });
+      expect(r.status).toBe(2);
+      expect(String(r.stderr)).toMatch(/no Feishu transport/);
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
     }

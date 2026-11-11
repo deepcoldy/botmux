@@ -10692,8 +10692,8 @@ function currentTurnHasNoTransport(): boolean {
 /** Tamper-resistant managed-origin transport verdict, plus the chatId it was
  *  judged from.
  *
- *  Resolves the origin session via the pid-marker ANCESTRY (process.ppid walk),
- *  NOT the mutable BOTMUX_SESSION_ID env, then loads that session's record and
+ *  Checks the pid-marker ANCESTRY (process.ppid walk) before the general routing
+ *  resolver; a conflicting BOTMUX_SESSION_ID is refused. Then loads the record and
  *  judges transport from its chatId + its bot's apiOnly config. So `env -u
  *  BOTMUX_SESSION_ID -u BOTMUX_CHAT_ID -u BOTMUX_LARK_APP_ID` cannot shed the
  *  managed no-transport identity. Returns `noTransport: false` (not gated) when
@@ -10717,7 +10717,18 @@ function resolveManagedOriginTransport(): {
     chatId: process.env.BOTMUX_CHAT_ID,
   });
   try {
-    const ctx = resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID);
+    const dataDir = resolveDataDir();
+    const envSessionId = process.env.BOTMUX_SESSION_ID?.trim();
+    // The general routing resolver treats envSessionId as ground truth and
+    // skips conflicting markers. A transport gate must observe the ancestor
+    // before that filter, or a changed env could select another real session.
+    // Reject the conflict rather than routing through either identity; legacy
+    // markers without a birth stamp may be stale, not just a changed env.
+    const ancestor = findLiveAncestorSessionContext(dataDir);
+    if (ancestor?.sessionId && envSessionId && ancestor.sessionId !== envSessionId) {
+      return { noTransport: true, chatId: undefined };
+    }
+    const ctx = ancestor?.sessionId ? ancestor : resolveSessionContext(dataDir, envSessionId);
     if (!ctx?.sessionId) {
       // No managed origin at all (bare operator). Still honor an explicit env
       // signal if present (daemon-spawned turn whose marker was pruned), but a
@@ -21081,10 +21092,9 @@ async function runPluginCommandByName(rawCommand: string, commandArgs: string[])
 // ─── Central root-dispatch transport gate ──────────────────────────────────
 // A MANAGED no-transport turn (a CLI turn the daemon spawned for an apiOnly bot
 // or a virtual/headless session) must not run ANY Lark-facing command. The managed
-// origin is resolved via the pid-marker ANCESTRY (resolveSessionContext walks
-// process.ppid to a worker-written marker) — NOT the mutable BOTMUX_SESSION_ID
-// env — so `env -u BOTMUX_SESSION_ID … botmux create-group` cannot shed the
-// managed identity. We then load THAT session's record and gate on its chatId +
+// gate observes the pid-marker ancestry before env-based routing and refuses a
+// conflicting env session, so changing or removing BOTMUX_SESSION_ID cannot
+// discard a visible ancestor origin. We load that session's record and gate on its chatId +
 // its bot's apiOnly (config, not env), so unsetting BOTMUX_CHAT_ID/LARK_APP_ID
 // also can't flip the verdict. Covers every Feishu-facing verb by construction.
 // A BARE host-operator shell (no ancestry marker, no env session) resolves no
