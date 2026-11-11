@@ -50,6 +50,14 @@ function session(overrides: Partial<DaemonSession> = {}): DaemonSession {
   } as DaemonSession;
 }
 
+import { setHideLocalAddressesResolver } from '../src/im/lark/local-address-switch.js';
+
+// The local-address cases in this file are for bots that turned on
+// BotConfig.hideLocalAddresses (default off; the off path is covered in
+// test/local-address-egress.test.ts). The registry is mocked here, so the
+// switch is answered directly.
+setHideLocalAddressesResolver(() => true);
+
 describe('reply-card runtime eligibility and recovery', () => {
   let dir: string;
   let bot: ReturnType<typeof getBot>;
@@ -102,6 +110,25 @@ describe('reply-card runtime eligibility and recovery', () => {
     for (const body of cards) {
       expect(body).not.toContain('/home/alice/');
       expect(body).not.toContain('/custom/project/');
+    }
+  });
+
+  it.each(['bridge', 'explicit'] as const)('sends a %s reply with its host paths for a bot that has not turned on hideLocalAddresses', async source => {
+    const restore = setHideLocalAddressesResolver(() => false);
+    try {
+      const ds = session({ workingDir: '/custom/project' });
+      const send = vi.fn(async (_body: string) => 'om_inline');
+      const raw = '见 [协作技能](/home/alice/.agents/skills/a/SKILL.md)，改动在 /custom/project/src/main.ts:12';
+      const card = JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: raw }] } });
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: raw, source, card }, send);
+      await updateTurnReplyCard(ds, 'om_mode', { kind: 'terminal', phase: 'completed' }, send);
+      const cards = [...send.mock.calls.map(call => call[0]), ...vi.mocked(updateMessage).mock.calls.map(call => call[2])];
+      expect(cards.some(body => body.includes('[协作技能](/home/alice/.agents/skills/a/SKILL.md)')
+        && body.includes('/custom/project/src/main.ts:12'))).toBe(true);
+      for (const body of cards) expect(body).not.toContain('内部文件');
+    } finally {
+      restore();
     }
   });
 

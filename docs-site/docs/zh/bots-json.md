@@ -73,6 +73,7 @@
 | 拉黑某人 | `blockedUsers` |
 | 限制 agent 能读写的文件 | `sandbox`（见[文件沙盒](/sandbox)） |
 | 嫌实时卡片吵 | `disableStreamingCard`、`hiddenStreamingCardButtons` |
+| bot 给别人用，回复里不带开发机路径和本机地址 | `hideLocalAddresses`（见[隐藏开发机地址](#hide-local-addresses)） |
 | 一轮只用一张卡显示进度和答复 | `replyCardMode: "unified"` |
 | 不 @ 也自动开工 | `autoStartOnNewTopic`、`autoStartOnGroupJoin` |
 | 机器人首次上线后私聊主人一句欢迎语 | `welcomeMessage`（见[上线欢迎语](#welcome-message)） |
@@ -581,6 +582,7 @@ Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」可以直�
 | `replyDelivery` | 最终答复怎么送到飞书。`send`（除 Doubao 外所有 CLI 的默认）：模型自己执行 `botmux send`；`transcript`：botmux 从 CLI 的会话记录里自动取本轮最后的回答发出去。见下方说明 |
 | `senderTag` | 默认开启：每条转给 CLI 的消息都带一个 `<sender ... />` 标签，告诉模型是谁在说话。只有写 `false` 才关闭 |
 | `senderTagHideEmail` | 默认关闭。开启后 `<sender>` 标签里不带邮箱，姓名和 ID 保留 |
+| `hideLocalAddresses` | 默认关闭：模型回复原样发到飞书。开启后把开发机路径和本机服务地址挡在回复外。见下方[隐藏开发机地址](#hide-local-addresses) |
 | `promptInjection` | `"default"`（默认）或 `"none"`。`none` 是零注入模式：botmux 不加任何系统提示和提醒，只传任务原文和附件，并自动回传最终答复。见下方说明 |
 | `envelopeInjection` | 仅 Claude Code：`auto` 时把每轮的提醒内容改由 hook 注入，终端输入框里只剩消息本身；默认 `off` 保持原样 |
 | `topicUnavailablePolicy` | 原话题被删除或不可用时怎么办。见[原话题不可用策略](/topic-unavailable-policy) |
@@ -621,6 +623,23 @@ Doubao 默认就是 `transcript`（它的工具命令跑在账号级常驻进程
 - `botmux send --mention-back`（@ 回本轮发消息的人）不受影响，它用的是 daemon 自己记录的触发人。
 - 代价：Dashboard 的会话洞察没法再从标签判断发言人类型，`/adopt` 识别 botmux 会话时少了一条线索。
 - Dashboard 里「发言人标签」开关改的就是这个字段。
+
+### 隐藏开发机地址（`hideLocalAddresses`） {#hide-local-addresses}
+
+飞书用户在自己的客户端里看回复，打不开开发机上的文件和本机服务。bot 给别人用时可以打开这个开关；只给自己用、需要在回复里看到排障路径的保持默认关闭。
+
+```text
+/botconfig set hideLocalAddresses on
+/botconfig set hideLocalAddresses off
+```
+
+默认关闭时，回复和卡片原样发出，提示里也不加相关规则。开启后：
+
+- 模型的回复（`botmux send`、自动转发的最终答复、动态单卡、思考过程消息、文档评论回复）发到飞书前，开发机上的绝对路径、`file://` 这类本地协议和本机服务地址会被替换：工作目录里的源码换成仓库相对路径，其它换成「【内部文件】」；技能链接只保留名称。`/dev/null`、`/proc` 这类不指向用户文件的系统路径保留。
+- 系统提示里加一条完整规则（每个会话一次），每轮提醒里加一句，要求模型不放这类地址，文件改用附件或真实可访问的链接。
+- 卡片按钮或链接指向本机地址时整条拒发，模型会收到 `LOCAL_ADDRESS_OUTBOUND_REJECTED`；botmux 自己生成的 Web 终端、Dashboard 链接照常发送。
+- 回复处理和每轮提醒立即生效；系统提示里的完整规则从下一个会话（或会话重新拉起）起生效。
+- Dashboard「Bot 配置 → 消息卡片 → 开发机地址」里的开关改的就是这个字段。
 
 ### 零注入模式（`promptInjection: "none"`）
 

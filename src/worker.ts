@@ -350,6 +350,7 @@ import {
   resolveReplyFooterPreferences,
   type BotConfig,
 } from './bot-registry.js';
+import { HIDE_LOCAL_ADDRESSES_ENV, hideLocalAddressesEnvValue } from './im/lark/local-address-switch.js';
 import {
   readGlobalConfig,
   isCrossPrincipalInterruptionEnabled,
@@ -24189,6 +24190,7 @@ async function spawnCliBody(
       ...((riffBackendConfig as EffectiveMojoConfig).env ?? {}),
       BOTMUX_REPLY_STYLE: JSON.stringify(cfg.replyStyle ?? {}),
       BOTMUX_REPLY_FOOTER: JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId)),
+      [HIDE_LOCAL_ADDRESSES_ENV]: hideLocalAddressesEnvValue(cfg.hideLocalAddresses === true),
       [PLUGIN_CARD_ACTION_CAPABILITIES_ENV]: cardActionCapabilities,
     };
     for (const key of protectedMcpEnvKeys) delete (riffBackendConfig as EffectiveMojoConfig).env![key];
@@ -24225,6 +24227,7 @@ async function spawnCliBody(
       BOTMUX_USAGE_DISPLAY: resolveUsageDisplay(cfg.larkAppId),
       BOTMUX_REPLY_FOOTER: JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId)),
       BOTMUX_REPLY_STYLE: JSON.stringify(cfg.replyStyle ?? {}),
+      [HIDE_LOCAL_ADDRESSES_ENV]: hideLocalAddressesEnvValue(cfg.hideLocalAddresses === true),
       [PLUGIN_CARD_ACTION_CAPABILITIES_ENV]: cardActionCapabilities,
     };
     // Core-only capability must survive into the sandboxed CLI: riffModeSession
@@ -26086,6 +26089,7 @@ async function spawnCliBody(
     promptCacheTtl: cfg.promptCacheTtl,
     solo: cfg.solo,
     leadOnly: cfg.leadOnly,
+    hideLocalAddresses: cfg.hideLocalAddresses === true,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
     modelProviderBaseUrlOverride: codexProtectedProviderBridge
@@ -26407,6 +26411,9 @@ async function spawnCliBody(
   childEnv.BOTMUX_CARD_BRAND_ENABLED = readGlobalConfig().dashboard?.cardBrandLabel === false ? 'false' : 'true';
   childEnv.BOTMUX_USAGE_DISPLAY = resolveUsageDisplay(cfg.larkAppId);
   childEnv.BOTMUX_REPLY_FOOTER = JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId));
+  // A sandboxed `botmux send` cannot read bots.json; it keeps this bot's
+  // local-address policy from the snapshot taken when the worker was forked.
+  childEnv[HIDE_LOCAL_ADDRESSES_ENV] = hideLocalAddressesEnvValue(cfg.hideLocalAddresses === true);
   // The stable native/global skill loader and `botmux send` must see one exact
   // normalized snapshot for the lifetime of this pane. Always inject `{}` for
   // defaults so an inherited stale value can never bleed across bot sessions.

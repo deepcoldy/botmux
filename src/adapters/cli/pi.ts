@@ -352,6 +352,7 @@ export function createPiAdapter(
       larkToolAppId,
       replyDelivery,
       solo,
+      hideLocalAddresses,
       skillPluginDir,
       workingDir,
       env,
@@ -371,6 +372,7 @@ export function createPiAdapter(
         larkToolAppId,
         replyDelivery: effectiveReplyDelivery,
         solo,
+        hideLocalAddresses,
         cliId: 'pi',
       });
 

@@ -3,6 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { config } from '../../config.js';
+import { hideLocalAddressesFor } from './local-address-switch.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import { isHostCapabilityLink, type HostLinkScope } from '../../core/host-capability-link.js';
 import {
@@ -29,9 +30,14 @@ function hostIssuedLink(): (url: string) => boolean {
   return url => isHostCapabilityLink(url, scope ??= hostLinkScope()) || !!vettedReplay.getStore()?.has(url);
 }
 
+/** Bots that have not turned on BotConfig.hideLocalAddresses send model output
+ * and card links as written, the behavior from before the policy existed. */
+const POLICY_OFF: LocalAddressContext = Object.freeze({ disabled: true });
+
 /** Where model output enters. Host-selected labels; never take policy
  * exemptions from the agent payload. */
 export function localAddressContextForBot(appId: string, workingDir?: string): LocalAddressContext {
+  if (!hideLocalAddressesFor(appId)) return POLICY_OFF;
   const locale = localeForBot(appId);
   return {
     ...(workingDir ? { workspaceRoots: [workingDir] } : {}),
@@ -41,18 +47,20 @@ export function localAddressContextForBot(appId: string, workingDir?: string): L
   };
 }
 
-/** Every outbound body, whoever wrote it: a card link field must be one of the
- * host's own link shapes. Host-written prose such as a resume command, a cwd
- * or a Dashboard link sent to an admin is not rewritten. */
-export function linkFieldContext(): LocalAddressContext {
+/** Every outbound body of a bot with the policy on, whoever wrote it: a card
+ * link field must be one of the host's own link shapes. Host-written prose such
+ * as a resume command, a cwd or a Dashboard link sent to an admin is not
+ * rewritten. */
+export function linkFieldContext(appId: string): LocalAddressContext {
+  if (!hideLocalAddressesFor(appId)) return POLICY_OFF;
   return { linkFieldsOnly: true, hostIssuedLink: hostIssuedLink() };
 }
 
 /** Whether a card link field holding `url` would be sent, for builders that
  * would rather leave a button out than have the whole card rejected. */
-export function sendableCardLink(url: string): boolean {
+export function sendableCardLink(url: string, appId: string): boolean {
   try {
-    sanitizeLocalAddressNode({ url }, linkFieldContext());
+    sanitizeLocalAddressNode({ url }, linkFieldContext(appId));
     return true;
   } catch (error) {
     if (error instanceof LocalAddressOutboundError) return false;

@@ -1927,9 +1927,10 @@ export function sessionSupportsWebTerminal(ds: DaemonSession): boolean {
  *  keeps its entry after a restart. A direct link embeds the port itself, and a
  *  persisted port belongs to the current generation only while a worker exists
  *  to listen on it (it is that worker's preferred port) — once restored without
- *  one, it is the previous daemon's and nothing listens there. A direct link
- *  without a read capability is also empty: Feishu refuses a bare local root,
- *  and that must cost the button, not the card. */
+ *  one, it is the previous daemon's and nothing listens there. For a bot that
+ *  hides local addresses a direct link without a read capability is also
+ *  empty: the transport refuses a bare local root, and that must cost the
+ *  button, not the card. */
 export function readableTerminalUrlFor(ds: DaemonSession): string {
   if (!sessionSupportsWebTerminal(ds)) return '';
   const port = getTerminalProxyPort()
@@ -1937,7 +1938,7 @@ export function readableTerminalUrlFor(ds: DaemonSession): string {
     : ds.workerPort ?? (ds.worker ? ds.session.webPort : undefined);
   if (!port) return '';
   const url = buildTerminalUrl(ds);
-  return sendableCardLink(url) ? url : '';
+  return sendableCardLink(url, ds.larkAppId) ? url : '';
 }
 
 /** Empty means the live streaming card should not offer a Web Terminal button.
@@ -1953,7 +1954,7 @@ export function liveReadableTerminalUrlFor(ds: DaemonSession): string {
   // Prompt readiness does not determine whether the worker's port is usable.
   if (!ds.workerPort) return '';
   const url = buildTerminalUrl(ds);
-  return sendableCardLink(url) ? url : '';
+  return sendableCardLink(url, ds.larkAppId) ? url : '';
 }
 
 // Per-bot opt-in: the writable terminal link to embed directly in the streaming
@@ -17483,6 +17484,9 @@ function forkWorkerPrepared(
     // dead worker process re-forked). /restart, dashboard restart and in-worker CLI respawn reuse
     // lastInitConfig in place and do NOT re-read it (documented in the chat-manager skill).
     ...(isLeadOnlySession(ds.larkAppId, ds.chatId, ds.chatType, ds.session) ? { leadOnly: true as const } : {}),
+    // Full local-address rule in the system prompt; like leadOnly it is read
+    // when a worker process is forked. Rewriting replies reads the live value.
+    ...(botCfg.hideLocalAddresses === true ? { hideLocalAddresses: true as const } : {}),
     // Workflow node session (design 2026-11-03 §4.2): the worker exports the
     // marker so its CLI system prompt and `botmux skill show` skip workflow.
     // A main-topic handoff's marker (§5.5) leaves the ordinary session as is.
