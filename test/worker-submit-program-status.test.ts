@@ -130,6 +130,18 @@ describe('worker submit confirmation with native program status', () => {
     expect(h.backend.sendSpecialKeys).not.toHaveBeenCalled();
   });
 
+  it('lets the generic parked-draft screen gate override held working for another CLI', async () => {
+    // The claude-only composer guard cannot see this CLI's input box; the
+    // draft_parked screen verdict is the only thing that keeps a stale
+    // background working record from muting the parked-draft warning.
+    const parkedScreen = '❯\n[Pasted Content 3882 chars]\n⏎ to submit';
+    const h = harness(parkedScreen, { cliId: 'kimi', priorWorking: true });
+    expect(h.detector.programStatusHeldWorking()).toBe(true);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(h.warnings()).toHaveLength(1);
+    expect(h.chain.size()).toBe(0);
+  });
+
   it('preserves the one-shot late SessionStart submit rescue while an older working record remains', async () => {
     const h = harness(composerScreen('status please'), { priorWorking: true });
     const pressComposerSubmit = vi.fn(() => true);
