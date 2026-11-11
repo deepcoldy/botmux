@@ -226,7 +226,7 @@ describe('unified replies with an independent native CoT channel', () => {
     }
   });
 
-  it('keeps a handed-back turn on the answer card when the native channel is switched on again', async () => {
+  it.each([false, true])('keeps a handed-back turn on the answer card when the native channel is switched on again (/cot show=%s)', async shown => {
     bot.config.replyCardNativeCot = true;
     const handle = worker();
     const pushedText = () => JSON.stringify(request.mock.calls.filter(([req]) => req.method === 'PUT'));
@@ -236,12 +236,36 @@ describe('unified replies with an independent native CoT channel', () => {
     bot.config.noCotChats = [ds.chatId];
     handle(steps(2)); await settle(); await flushTurnReplyTools(ds, 'om_turn');
     expect(send).toHaveBeenCalledTimes(1);
-    bot.config.noCotChats = [];
+    expect(new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' }))
+      .toMatchObject({ nativeCotHandedBack: true });
+    // Switching the channel back on keeps progress on the card; `/cot show` asks for both.
+    if (shown) ds.cotForced = true;
+    else bot.config.noCotChats = [];
     handle(steps(3)); await settle(); await flushTurnReplyTools(ds, 'om_turn');
     expect(pushedText()).toContain('step 1');
-    expect(pushedText()).not.toContain('step 3');
+    if (shown) expect(pushedText()).toContain('step 3');
+    else expect(pushedText()).not.toContain('step 3');
     expect(vi.mocked(updateMessage).mock.calls.length).toBeGreaterThan(0);
     expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps feeding native thinking when the barrier record predates the visibility field', async () => {
+    bot.config.replyCardNativeCot = true;
+    const handle = worker();
+    // An older CLI ran the barrier: the display exists, but only nativeCotReady was written.
+    expect(replyCardModeFor(ds, 'om_turn')).toBe('unified');
+    expect(await prepareReplyCardNativeThinking(ds, 'om_turn')).toBe(true);
+    const store = new TurnReplyCardStore(dir);
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_turn' };
+    await store.update(key, { kind: 'progress', text: 'from an older CLI' }, {
+      render: () => JSON.stringify({ schema: '2.0', body: { elements: [{ tag: 'markdown', content: 'card' }] } }),
+      beforeEffect: () => {}, beforeCreate: async () => undefined, isWithdrawn: () => false,
+      send: async () => 'om_cli_card', patch: async () => {},
+    });
+    expect(store.read(key)).toMatchObject({ nativeCotReady: true, messageId: 'om_cli_card' });
+    handle({ ...update(''), entries: [{ kind: 'thinking', text: 'thinking 1' }, { kind: 'thinking', text: 'thinking 2' }] });
+    await settle();
+    expect(JSON.stringify(request.mock.calls.filter(([req]) => req.method === 'PUT'))).toContain('thinking 2');
   });
 
   it('does not hand a steer-merged turn back to a card before it is superseded', async () => {

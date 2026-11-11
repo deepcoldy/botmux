@@ -46,6 +46,9 @@ export interface TurnReplyCardRecord extends TurnReplyCardKey {
    * (not an early answer card) carries passive progress. Absent → card fallback.
    * Cleared for good once the daemon sees that display retired mid-turn. */
   nativeCotVisible?: boolean;
+  /** That hand-back happened: the card owns progress for the rest of the turn,
+   * so native thinking is not resumed if the channel is switched on again. */
+  nativeCotHandedBack?: boolean;
   /** This turn's final went out as a separate message in the same chat (for
    * example to notify others), so a completed turn needs no summary card. */
   externalFinal?: boolean;
@@ -378,6 +381,7 @@ export class TurnReplyCardStore {
       // ended there is no progress left to hand back.
       if (record.nativeCotVisible && !replyCardIsTerminal(record) && io.nativeThinkingLive && !io.nativeThinkingLive()) {
         delete record.nativeCotVisible;
+        record.nativeCotHandedBack = true;
         this.write(key, record);
       }
       let card = render();
