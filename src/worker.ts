@@ -21534,8 +21534,16 @@ async function flushPending(): Promise<void> {
           || cliRestartInProgress) break;
       }
       if (activeTurnBlocks(pendingMessages[0]!)) break;
+      const admissionHead = pendingMessages[0]!;
       if (traexAutoModelRuntimeEligible()
-        && !(await admitTraexAutoModelPendingInput(pendingMessages[0]!))) break;
+        && !(await admitTraexAutoModelPendingInput(admissionHead))) {
+        // A continuation deadline or refusal can abandon the head while its
+        // viewport read is in flight. That refusal judged a removed input, not
+        // the screen: keep the readiness this flush found, or the independent
+        // successor waits for a composer edge a static replacement never paints.
+        if (pendingMessages[0] !== admissionHead) keepPromptReadyAfterHold();
+        break;
+      }
       const continuation = pendingMessages[0]!.traexAutoModelContinuation;
       if (workerSessionEventScope && pendingMessages[0]!.traexAutoModelRecovery && continuation
         && !workerSessionEventScope.canSubmitContinuation(pendingMessages[0]!.turnId!, continuation.execution)) {

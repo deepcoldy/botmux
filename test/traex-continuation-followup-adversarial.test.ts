@@ -555,6 +555,52 @@ describe('independent continuation follow-up adversarial probes', () => {
     }).toEqual({ phase: 'failed', queuedTurns: [state.successor.turnId], terminalEmissions: 1 });
   });
 
+  it('releases the queued successor when the deadline abandons the recovery during its viewport admission', async () => {
+    vi.useFakeTimers();
+    const state = fixture('planned');
+    const env = state.env;
+    env.publishRuntimeContract = vi.fn(async () => {});
+    env.flushPending = state.harness.flush;
+    // A write cycle revokes readiness until a hold or a write settles it.
+    env.beginCliWriteCycle = () => { env.isPromptReady = false; };
+    // The real pre-turn gate: an independent successor with no turn owning the
+    // CLI waits for a composer edge whenever readiness is gone.
+    Object.assign(env, {
+      activeTurnAuthority: { snapshot: () => undefined },
+      traexAutoModelSwitching: false, traexQuotaPending: undefined, traexAutoModelPreflightPending: false,
+      traexAutoModelPreflightEnabled: () => false,
+    });
+    env.traexAutoModelController.config = { trigger: 'capacity', reselectPerTurn: false };
+    env.resetTraexAutoModelBeforePendingTurn = loadWorkerFunction('resetTraexAutoModelBeforePendingTurn', env);
+    // The recovery's viewport read is in flight when the deadline fires. Like
+    // the real admission, a read refuses an item that is no longer the head.
+    let readStarted = false;
+    let finishRead!: () => void;
+    const read = new Promise<void>(resolveRead => { finishRead = resolveRead; });
+    env.admitTraexAutoModelPendingInput = async (item: any) => {
+      if (item.traexAutoModelRecovery) { readStarted = true; await read; }
+      return env.pendingMessages[0] === item;
+    };
+    const taken: string[] = [];
+    env.freshnessInputQueue.takeNormal = () => { taken.push(env.pendingMessages[0]?.turnId); return undefined; };
+    env.isPromptReady = true;
+    const interrupted = state.harness.flush();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(readStarted).toBe(true);
+    expect(state.abandon('timeout')).toBe(true);
+    finishRead();
+    await interrupted;
+    await state.settle();
+    // The bounded admission retry (or the host's refusal answer) re-drives the
+    // flush; the replacement's screen is static, so no composer edge follows.
+    await state.harness.flush();
+    expect(state.errors).toEqual([]);
+    expect({
+      phase: state.store.execution(state.ref, state.execution.executionId)?.phase,
+      written: taken,
+    }).toEqual({ phase: 'failed', written: [state.successor.turnId] });
+  });
+
   it.each(['ordinary-refusal', 'close', 'new-runtime'] as const)('handles reservation refusal with %s ownership', async owner => {
     vi.useFakeTimers();
     const state = fixture('unreserved');
