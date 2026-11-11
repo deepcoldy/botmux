@@ -27,6 +27,11 @@ export interface RuntimeExecutionContinuationResult {
   execution: ExecutionRef;
   status: 'approved' | 'rejected';
 }
+export interface RuntimeExecutionContinuationFailure {
+  bindingId: string;
+  continuation: RuntimeExecutionContinuation;
+  notice?: string;
+}
 /** Local PTY-family backends whose process_start identity a continuation can
  * prove. Remote backends run off-box; zmx launches the CLI itself rather than
  * botmux, so neither can supply the required physical process proof. The host
@@ -86,7 +91,7 @@ export interface SessionContract {
   activeOperationId?: string;
 }
 export type ExecutionAdmissionState = Pick<ExecutionContract, 'ref' | 'runtime' | 'phase'>;
-export interface SessionContractBootstrap { version: 2; session: ContractSessionRef; worker: WorkerRef; executions?: ExecutionAdmissionState[]; executionContinuations?: true }
+export interface SessionContractBootstrap { version: 2; session: ContractSessionRef; worker: WorkerRef; executions?: ExecutionAdmissionState[]; executionContinuations?: true; executionContinuationFailures?: true }
 export interface SessionCommandContext { version: 2; runtime?: RuntimeRef; execution?: ExecutionRef; operationId?: string }
 export interface ContractScope {
   runtime?: RuntimeRef;

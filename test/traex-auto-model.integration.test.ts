@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync } from 'node:f
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 import { resolveCodexRpcInput } from '../src/services/codex-rpc-input-policy.js';
@@ -340,6 +340,8 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
   children.push(child);
   const measurements: any[] = [];
   const hostErrors: unknown[] = [];
+  const terminalDeliveries: WorkerToDaemon[] = [];
+  const noticeDeliveries: WorkerToDaemon[] = [];
   const ds = { larkAppId: 'app_test', chatId: 'oc_test', worker: child, workerGeneration: 1,
     session: { sessionId, larkAppId: 'app_test', status: 'active' }, cliReadyGeneration: 0 } as unknown as DaemonSession;
   const store = withContract ? new SessionContractStore(dataDir, 'app_test') : undefined;
@@ -349,7 +351,14 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
   const host = controller && bootstrap ? loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', {
     sessionController: controller, contractWorker: bootstrap.worker, ds, worker: child, sameWorker,
     logger: { warn: (line: string) => logs.push(`HOST ${line}\n`), debug: () => {}, error: () => {} }, t,
-    handleLegacyWorkerMessage: async () => {},
+    cb: { onTurnTerminal: async (_session: unknown, message: WorkerToDaemon) => { terminalDeliveries.push(message); } },
+    enqueueContinuationFailureNotice: (_session: unknown, failure: import('../src/services/session-contract.js').RuntimeExecutionContinuationFailure) => {
+      if (failure.notice) noticeDeliveries.push({ type: 'user_notify', message: failure.notice, turnId: failure.continuation.execution.turnId });
+    },
+    handleLegacyWorkerMessage: async (message: WorkerToDaemon) => {
+      if (message.type === 'turn_terminal') terminalDeliveries.push(message);
+      if (message.type === 'user_notify') noticeDeliveries.push(message);
+    },
   }) : undefined;
   child.on('message', (raw: any) => {
     if (raw.type === 'admission_heartbeat' || raw.type === 'admission_capture') measurements.push(raw);
@@ -365,7 +374,15 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
       if (child.exitCode !== null || child.signalCode !== null) throw new Error(`worker exited: ${description}\n${logs.join('')}`);
       await new Promise(resolveWait => setTimeout(resolveWait, 50));
     }
-    throw new Error(`timeout: ${description}\n${logs.join('')}`);
+    const state = {
+      executions: controller?.store.executions(controller.ref).map(execution => ({
+        turnId: execution.ref.turnId, phase: execution.phase, runtime: execution.runtime,
+      })),
+      recent: messages.filter(message => ['turn_terminal', 'cli_input_backlog', 'turn_input_rejected', 'runtime_binding', 'prompt_ready'].includes(message.type)).slice(-12),
+      hostErrors: hostErrors.map(String),
+      submissions: rows(submissions),
+    };
+    throw new Error(`timeout: ${description}\n${JSON.stringify(state)}\n${logs.join('')}`);
   }
   const init = { type: 'init', sessionId, chatId: 'oc_test', rootMessageId: 'om_root',
     workingDir: dataDir, cliId: 'traex', cliPathOverride: fake, cliSessionId: freshStart ? undefined : nativeId,
@@ -417,7 +434,7 @@ if (__realSend) process.send = function (msg: any, callback?: any): boolean {
     child.send(message);
   };
   return { child, messages, wait, submissions, launches, release, nativeId, logs, rpcRequests, init, measurements, crash, fake,
-    sendInput, controller, hostErrors, options, entry, ds };
+    sendInput, controller, hostErrors, terminalDeliveries, noticeDeliveries, options, entry, ds };
 }
 
 describe('TraeX auto-model real Worker and PTY', () => {
@@ -523,7 +540,66 @@ describe('TraeX auto-model real Worker and PTY', () => {
     expect(f.controller!.store.executions(f.controller!.ref, 'om_late_proof')[0]!.runtime).toEqual(f.controller!.currentRuntime());
   }, 70_000);
 
-  it.skipIf(!probeTmuxFunctional().ok)('stops a refused contract continuation without replaying it or blocking queued input', async () => {
+  it.skipIf(!probeTmuxFunctional().ok).each(['normal', 'lost-ack', 'persistence-retry'] as const)('abandons a refused continuation reservation without losing queued input (%s)', async mode => {
+    const fixtureState = await fixture(true, 'ordered', false, undefined, true, undefined, true,
+      undefined, 0, 0, false, false, undefined, undefined, undefined, false, false, true);
+    let acknowledgements = 0;
+    if (mode === 'lost-ack') {
+      const originalSend = fixtureState.child.send.bind(fixtureState.child);
+      fixtureState.child.send = ((message: DaemonToWorker, ...args: any[]) => {
+        if (message.type === 'continuation_failure_ack' && ++acknowledgements === 1) return true;
+        return (originalSend as any)(message, ...args);
+      }) as typeof fixtureState.child.send;
+    }
+    if (mode === 'persistence-retry') {
+      vi.spyOn(fixtureState.controller!.store, 'rejectExecutionContinuation')
+        .mockImplementationOnce(() => { throw new Error('transient_failure_store'); });
+    }
+    let cancelled = false;
+    fixtureState.child.prependListener('message', (message: WorkerToDaemon) => {
+      if (cancelled || message.type !== 'runtime_binding_started' || !message.continuation) return;
+      cancelled = true;
+      const controller = fixtureState.controller!;
+      const execution = controller.store.executions(controller.ref, 'om_reservation_refused')[0]!;
+      const operation = controller.beginControl('cancel', undefined, execution.ref).operation;
+      controller.controlStarted(operation.operationId);
+      controller.controlResult(operation.operationId, 'rejected');
+    });
+    fixtureState.sendInput('original reservation-refused task', 'om_reservation_refused');
+    await fixtureState.wait(() => rows(fixtureState.submissions).length === 1, 'original reservation-refused input');
+    fixtureState.sendInput('queued reservation follow-up', 'om_reservation_next');
+    await fixtureState.wait(() => rows(fixtureState.submissions).some(row => row.text === 'queued reservation follow-up'),
+      'queued input survives refused continuation reservation', 40_000);
+    expect(cancelled).toBe(true);
+    expect(fixtureState.child.exitCode).toBeNull();
+    expect(fixtureState.hostErrors.map(String)).toEqual(mode === 'persistence-retry'
+      ? [expect.stringContaining('transient_failure_store')] : []);
+    expect(rows(fixtureState.submissions).map(row => row.text)).toEqual([
+      'original reservation-refused task', 'queued reservation follow-up',
+    ]);
+    await fixtureState.wait(() => fixtureState.terminalDeliveries.some(message => message.type === 'turn_terminal'
+      && message.turnId === 'om_reservation_refused'), 'host confirms refused execution terminal');
+    expect(fixtureState.controller!.store.executions(fixtureState.controller!.ref, 'om_reservation_refused')[0]!.phase).toBe('failed');
+    expect(fixtureState.terminalDeliveries.filter(message => message.type === 'turn_terminal'
+      && message.turnId === 'om_reservation_refused')).toHaveLength(1);
+    expect(fixtureState.noticeDeliveries.filter(message => message.type === 'user_notify'
+      && message.message === t('worker.traex_auto_model.continuation_rejected'))).toHaveLength(1);
+    if (mode === 'lost-ack') {
+      await fixtureState.wait(() => acknowledgements >= 2, 'lost failure acknowledgement retried');
+      const terminals = fixtureState.messages.filter(message => message.type === 'turn_terminal'
+        && message.turnId === 'om_reservation_refused').length;
+      expect(terminals).toBeGreaterThan(1);
+      await new Promise(resolveWait => setTimeout(resolveWait, 1_200));
+      expect(fixtureState.messages.filter(message => message.type === 'turn_terminal'
+        && message.turnId === 'om_reservation_refused')).toHaveLength(terminals);
+      expect(fixtureState.terminalDeliveries.filter(message => message.type === 'turn_terminal'
+        && message.turnId === 'om_reservation_refused')).toHaveLength(1);
+      expect(fixtureState.noticeDeliveries.filter(message => message.type === 'user_notify'
+        && message.message === t('worker.traex_auto_model.continuation_rejected'))).toHaveLength(1);
+    }
+  }, 70_000);
+
+  it.skipIf(!probeTmuxFunctional().ok)('stops and settles a refused contract continuation without replaying it or blocking queued input', async () => {
     const f = await fixture(true, 'ordered', false, undefined, true, undefined, true,
       undefined, 0, 0, false, false, undefined, undefined, undefined, false, false, true);
     let cancelled = false;
@@ -540,7 +616,7 @@ describe('TraeX auto-model real Worker and PTY', () => {
     f.sendInput('original refused task', 'om_refused');
     await f.wait(() => rows(f.submissions).length === 1, 'original refused input');
     f.sendInput('queued follow-up task', 'om_refused_next');
-    await f.wait(() => f.messages.some(message => message.type === 'user_notify' && message.turnId === 'om_refused'
+    await f.wait(() => f.noticeDeliveries.some(message => message.type === 'user_notify'
       && message.message === t('worker.traex_auto_model.continuation_rejected')), 'continuation refusal notice', 40_000);
     await f.wait(() => rows(f.submissions).some(row => row.text === 'queued follow-up task'), 'queued follow-up after refusal', 30_000);
     expect(cancelled).toBe(true);
@@ -550,6 +626,67 @@ describe('TraeX auto-model real Worker and PTY', () => {
     expect(rows(f.submissions).filter(row => row.text === 'original refused task')).toHaveLength(1);
     expect(rows(f.submissions).filter(row => row.text === t('worker.traex_auto_model.continue_prompt'))).toHaveLength(0);
     expect(f.controller!.store.executions(f.controller!.ref, 'om_refused')[0]!.runtime).not.toEqual(f.controller!.currentRuntime());
+    expect(f.messages.filter(message => message.type === 'turn_terminal' && message.turnId === 'om_refused')).toHaveLength(1);
+    expect(f.controller!.store.executions(f.controller!.ref, 'om_refused')[0]!.phase).toBe('failed');
+    expect(f.terminalDeliveries.filter(message => message.type === 'turn_terminal' && message.turnId === 'om_refused')).toHaveLength(1);
+    expect(f.noticeDeliveries.filter(message => message.type === 'user_notify'
+      && message.message === t('worker.traex_auto_model.continuation_rejected'))).toHaveLength(1);
+  }, 90_000);
+
+  it.skipIf(!probeTmuxFunctional().ok).each(['pending', 'lost-approval', 'missing-native-identity'] as const)('bounds an unanswered continuation grant and releases queued input (%s)', async mode => {
+    const fixtureState = await fixture(true, 'ordered', false, undefined, true, undefined, true,
+      undefined, 0, 0, false, false, undefined, undefined, undefined, false, false, true,
+      mode === 'missing-native-identity' ? 60_000 : 0);
+    const controller = fixtureState.controller!;
+    const pausedGrant = mode === 'pending' ? vi.spyOn(controller.store, 'commitExecutionContinuation').mockImplementation(() => {}) : undefined;
+    const originalSend = fixtureState.child.send.bind(fixtureState.child);
+    let withheldApproval: DaemonToWorker | undefined;
+    if (mode === 'lost-approval') {
+      fixtureState.child.send = ((message: DaemonToWorker, ...args: any[]) => {
+        if (message.type === 'runtime_contract_assigned' && message.continuation?.status === 'approved') {
+          withheldApproval = message;
+          return true;
+        }
+        return (originalSend as any)(message, ...args);
+      }) as typeof fixtureState.child.send;
+    }
+    fixtureState.sendInput('original ungranted task', 'om_ungranted');
+    await fixtureState.wait(() => rows(fixtureState.submissions).length === 1, 'original ungranted input');
+    fixtureState.sendInput('queued ungranted follow-up', 'om_ungranted_next');
+    await fixtureState.wait(() => rows(fixtureState.launches).length === 2, 'replacement awaiting continuation grant');
+    await fixtureState.wait(() => rows(fixtureState.submissions).some(row => row.text === 'queued ungranted follow-up'),
+      'bounded grant wait releases queued input', 45_000);
+    expect(fixtureState.child.exitCode).toBeNull();
+    expect(fixtureState.hostErrors).toEqual([]);
+    expect(rows(fixtureState.submissions).map(row => row.text)).toEqual([
+      'original ungranted task', 'queued ungranted follow-up',
+    ]);
+    expect(fixtureState.messages.filter(message => message.type === 'turn_terminal'
+      && message.turnId === 'om_ungranted')).toHaveLength(1);
+    expect(controller.store.executions(controller.ref, 'om_ungranted')[0]!.phase).toBe('failed');
+    expect(fixtureState.noticeDeliveries.filter(message => message.type === 'user_notify'
+      && message.message === t('worker.traex_auto_model.continuation_timeout'))).toHaveLength(1);
+    pausedGrant?.mockRestore();
+    const registration = [...fixtureState.messages].reverse().find(message => message.type === 'runtime_binding');
+    expect(registration?.type).toBe('runtime_binding');
+    if (registration?.type === 'runtime_binding') {
+      controller.bindRuntime(registration.bindingId, registration.sessionContract!.producer, registration.identity);
+      expect(controller.store.executionContinuation(controller.ref, registration.bindingId)?.status).toBe('rejected');
+    }
+    expect(controller.store.executions(controller.ref, 'om_ungranted')[0]!.phase).toBe('failed');
+    if (mode === 'lost-approval') {
+      expect(withheldApproval).toBeDefined();
+      originalSend(withheldApproval!);
+      originalSend(withheldApproval!);
+      const received = fixtureState.messages.length;
+      fixtureState.sendInput('original ungranted task', 'om_ungranted');
+      await fixtureState.wait(() => fixtureState.messages.slice(received).some(message =>
+        (message.type === 'turn_input_committed' || message.type === 'turn_input_rejected')
+        && message.turnId === 'om_ungranted'), 'duplicate remains refused after late approval');
+      expect(rows(fixtureState.submissions)).toHaveLength(2);
+      expect(fixtureState.messages.filter(message => message.type === 'turn_terminal'
+        && message.turnId === 'om_ungranted')).toHaveLength(1);
+    }
   }, 90_000);
 
   it('model access restrictions continue through the ordered pool without replaying the original input', async () => {
