@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { openDatabaseSync, type DatabaseSyncLike } from './sqlite-compat.js';
+import { feedbackDeliveryContext } from './feedback-extension-store.js';
 import { normalizeFeedbackPolicy, type FeedbackPolicy } from './feedback-policy.js';
 import { effectiveWebhookDestinations, type FeedbackEventEnvelope, type FeedbackWebhookDestination, type FrozenWebhookDestination } from './feedback-outbox.js';
 import { SQLITE_FEEDBACK_STREAM_SCHEMA, validateFeedbackEventCursor, type FeedbackEventCursor, type SequencedFeedbackEvent } from './feedback-event-stream.js';
@@ -387,7 +388,7 @@ export class SkillFeedbackStore {
   readonly path: string;
   private readonly db: DatabaseSyncLike;
 
-  private constructor(dataDir: string, db: DatabaseSyncLike) {
+  private constructor(private readonly dataDir: string, db: DatabaseSyncLike) {
     mkdirSync(dataDir, { recursive: true });
     this.path = join(dataDir, 'botmux-feedback.sqlite');
     this.db = db;
@@ -567,6 +568,7 @@ export class SkillFeedbackStore {
   }
 
   recordTurnDelivery(input: RecordTurnDeliveryInput): ReturnType<SkillFeedbackStore['mapDelivery']> {
+    input = { ...input, context: feedbackDeliveryContext(this.dataDir, input) };
     const hash = contentHash(input.content);
     const attempt = input.dispatchAttempt ?? 0;
     const discriminator = input.correlationDiscriminator ?? '';
