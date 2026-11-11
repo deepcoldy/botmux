@@ -441,6 +441,54 @@ describe('project workstream attachments', () => {
     expect(f.registry().om_topic.lastReport).toBeUndefined();
   });
 
+  it('rejects a same-turn actor whose capability or permission is revoked during source lookup', async () => {
+    const f = await fixture();
+    let allowed = true;
+    const actor = { ...f.actor, turnId: 'om_same_turn', authorizationStillValid: () => allowed };
+    const service = createProjectWorkstreamAttachments({ ...f.deps, actorAllowed: () => true });
+    f.getSource.mockImplementationOnce(async () => {
+      allowed = false;
+      return structuredClone(f.source());
+    });
+    await expect(service.attach(actor, f.request)).rejects.toThrow('project_attachment_turn_stale');
+    expect(actor.turnId).toBe('om_same_turn');
+    expect(readProjectGroup(f.dataDir, 'oc_group')!.workstreams).toHaveLength(0);
+    expect(readProjectAttachmentRecord(f.dataDir, 'om_topic')).toBeUndefined();
+    expect(f.projectRun).not.toHaveBeenCalled();
+  });
+
+  it('rechecks same-turn caller authorization after a report waits in the real coordinator queue', async () => {
+    const f = await fixture();
+    await f.service.attach(f.actor, f.request);
+    let allowed = true, entered!: () => void, release!: () => void, enqueued!: () => void;
+    const actor = { ...f.actor, turnId: 'om_same_turn', authorizationStillValid: () => allowed };
+    const service = createProjectWorkstreamAttachments({ ...f.deps, actorAllowed: () => true });
+    const blocked = new Promise<void>(resolve => { entered = resolve; });
+    const unblocked = new Promise<void>(resolve => { release = resolve; });
+    const queued = new Promise<void>(resolve => { enqueued = resolve; });
+    vi.mocked(f.transport.updateCard).mockImplementationOnce(async () => {
+      entered();
+      await unblocked;
+    });
+    const blocker = f.coordinator.run(f.context, { action: 'refresh' });
+    await blocked;
+    f.projectRun.mockImplementation((ctx, action, beforeApply) => {
+      const result = f.coordinator.run(ctx, action, beforeApply);
+      if (action.action === 'report') enqueued();
+      return result;
+    });
+    const report = service.update(actor, { rootMessageId: 'om_topic', status: 'completed', content: '旧权限回报' })
+      .then(result => ({ result }), error => ({ error: error.message }));
+    await queued;
+    allowed = false;
+    release();
+    await blocker;
+    expect(await report).toMatchObject({ error: 'project_attachment_turn_stale' });
+    expect(actor.turnId).toBe('om_same_turn');
+    expect(readProjectGroup(f.dataDir, 'oc_group')!.workstreams[0]!).toMatchObject({ status: 'pending', progress: 0 });
+    expect(f.registry().om_topic.lastReport).toBeUndefined();
+  });
+
   it('repairs an interrupted imported rename from its denied journal once, without reverting later titles', async () => {
     const f = await fixture();
     await f.service.attach(f.actor, f.request);

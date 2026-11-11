@@ -58,6 +58,8 @@ export interface ProjectAttachmentActor {
   authorizedSourceRouteRevision?: number;
   /** Host closure checks an exact grant again at every commit boundary. */
   sourceAuthorizationStillValid?: () => boolean;
+  /** Admission-frozen caller/turn capability and current operator policy. */
+  authorizationStillValid?: () => boolean;
   turnId?: string;
 }
 
@@ -265,6 +267,9 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
 
   function authorizeActor(actor: ProjectAttachmentActor): ProjectGroupState {
     if (deps.actorAllowed && !deps.actorAllowed(actor)) fail('project_attachment_turn_stale');
+    if (actor.authorizationStillValid && !actor.authorizationStillValid()) {
+      fail('project_attachment_turn_stale');
+    }
     if (actor.sourceAuthorizationStillValid && !actor.sourceAuthorizationStillValid()) {
       fail('source_owner_authorization_required');
     }

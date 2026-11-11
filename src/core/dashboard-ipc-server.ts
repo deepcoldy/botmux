@@ -3395,13 +3395,16 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-workstream', async (req, res,
     return jsonRes(res, 403, { ok: false, error: 'project_coordinator_required' });
   }
   const turn = ds.managedTurnOrigin?.turnId;
+  const admittedOrigin = ds.managedTurnOrigin;
+  const admittedCapability = admittedOrigin?.capability;
   const caller = ds.managedTurnOrigin?.trustedCaller
     ?? (ds.activeInteractiveTurn?.turnId === turn ? ds.activeInteractiveTurn?.caller : undefined)
     ?? (turn ? dispatchCallerFromReply(ds.larkAppId, ds.session.replyTargets?.[turn]) : undefined);
   const ownerKey = await projectHumanCallerKey(caller);
   if (!ownerKey || !caller?.requestUserOpenId
     || !canOperate(ds.larkAppId, ds.chatId, caller.requestUserOpenId, caller.requestUserUnionId)
-    || findActiveBySessionId(params.sessionId) !== ds || ds.managedTurnOrigin?.turnId !== turn) {
+    || findActiveBySessionId(params.sessionId) !== ds || ds.managedTurnOrigin?.turnId !== turn
+    || ds.managedTurnOrigin !== admittedOrigin || ds.managedTurnOrigin?.capability !== admittedCapability) {
     return jsonRes(res, 403, { ok: false, error: 'project_attachment_actor_unproven' });
   }
   if (!body || typeof body.action !== 'string') return jsonRes(res, 400, { ok: false, error: 'invalid_workstream_action' });
@@ -3439,6 +3442,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-workstream', async (req, res,
         throw new Error('source_owner_authorization_required');
       }
       if (findActiveBySessionId(params.sessionId) !== ds || ds.managedTurnOrigin?.turnId !== turn
+        || ds.managedTurnOrigin !== admittedOrigin || ds.managedTurnOrigin?.capability !== admittedCapability
         || source.chatId !== ds.chatId || source.rootMessageId !== ds.session.rootMessageId
         || source.routeRevision !== (ds.session.projectRouteRevision ?? 1)) {
         throw new Error('source_route_mismatch');
@@ -3474,7 +3478,12 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-workstream', async (req, res,
       throw new Error('project_attachment_actor_unproven');
     }
     const actor = { sessionId: ds.session.sessionId, larkAppId: ds.larkAppId, chatId: ds.chatId,
-      scope: 'chat' as const, ownerKey, authorizedSourceOwnerKey, sourceAuthorizationStillValid, turnId: turn };
+      scope: 'chat' as const, ownerKey, authorizedSourceOwnerKey, sourceAuthorizationStillValid, turnId: turn,
+      authorizationStillValid: () => findActiveBySessionId(params.sessionId) === ds
+        && ds.managedTurnOrigin === admittedOrigin && ds.managedTurnOrigin?.capability === admittedCapability
+        && ds.managedTurnOrigin?.turnId === turn
+        && canOperate(ds.larkAppId, ds.chatId, caller.requestUserOpenId!, caller.requestUserUnionId),
+    };
     Object.assign(actor, {
       authorizedSourceSessionId: authorizedSourceOwnerKey ? sourceSessionId : undefined,
       authorizedSourceLarkAppId: authorizedSourceOwnerKey ? sourceLarkAppId : undefined,
