@@ -7,7 +7,7 @@ import { config } from '../config.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
 import { getBot } from '../bot-registry.js';
-import { handleCotThinkingUpdate, finalizeCotMessage, hasCotMessageForTurn, prepareCotMessageBeforeReply } from '../im/lark/cot-message.js';
+import { cotMessageCarriesTurn, handleCotThinkingUpdate, finalizeCotMessage, hasCotMessageForTurn, prepareCotMessageBeforeReply } from '../im/lark/cot-message.js';
 import { normalizeUsageDisplay } from '../bot-registry.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
@@ -118,7 +118,11 @@ function nativeThinkingOwner(ds: DaemonSession, owns?: () => boolean): () => boo
 export function updateReplyCardNativeThinking(ds: DaemonSession, msg: ToolsUpdate, owns?: () => boolean): void {
   const record = new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, msg.turnId, msg.dispatchAttempt))
     ?? new TurnReplyCardStore(config.session.dataDir).read(replyCardKey(ds, msg.turnId));
-  if (record?.nativeCot && ((!record.nativeCotReady && !record.messageId) || hasCotMessageForTurn(ds, msg))) {
+  // After native thinking handed this turn back to the answer card, keep it
+  // there: re-enabling the channel mid-turn must not show the same progress
+  // twice. `/cot show` explicitly asks for both.
+  const handedBack = record?.nativeCotHandedBack === true && !ds.cotForced;
+  if (record?.nativeCot && !handedBack && ((!record.nativeCotReady && !record.messageId) || hasCotMessageForTurn(ds, msg))) {
     handleCotThinkingUpdate(ds, { type: 'thinking_update', ...msg }, record.mode, nativeThinkingOwner(ds, owns));
   }
 }
@@ -130,13 +134,16 @@ export function replyCardDispatchAttempt(ds: DaemonSession, turnId: string): num
   return ds.lastThinkingUpdate?.turnId === turnId ? ds.lastThinkingUpdate.dispatchAttempt : undefined;
 }
 
-export async function prepareReplyCardNativeThinking(ds: DaemonSession, turnId: string, dispatchAttempt?: number, owns?: () => boolean): Promise<void> {
+/** Resolves whether the native thinking display is live for this turn. Only a
+ * live display may take over passive progress from the answer card. */
+export async function prepareReplyCardNativeThinking(ds: DaemonSession, turnId: string, dispatchAttempt?: number, owns?: () => boolean): Promise<boolean> {
   const store = new TurnReplyCardStore(config.session.dataDir);
   const record = store.read(replyCardKey(ds, turnId, dispatchAttempt)) ?? store.read(replyCardKey(ds, turnId));
   const binding = { turnId, dispatchAttempt: dispatchAttempt ?? replyCardDispatchAttempt(ds, turnId) };
   if (record?.nativeCot && ((!record.nativeCotReady && !record.messageId) || hasCotMessageForTurn(ds, binding))) {
-    await prepareCotMessageBeforeReply(ds, binding, nativeThinkingOwner(ds, owns));
+    return prepareCotMessageBeforeReply(ds, binding, nativeThinkingOwner(ds, owns));
   }
+  return false;
 }
 
 /**
@@ -226,6 +233,7 @@ export async function updateTurnReplyCard(
     usage: withCardRuntimeIdentity(ds, usage ?? { context: null, tokens: null }, ds.session.cliId ?? cfg.cliId),
     beforeEffect,
     beforeCreate: () => prepareReplyCardNativeThinking(ds, turnId, options.dispatchAttempt, options.owns),
+    nativeThinkingLive: () => cotMessageCarriesTurn(ds, { turnId, dispatchAttempt: options.dispatchAttempt ?? replyCardDispatchAttempt(ds, turnId) }),
     send: async (body, uuid) => {
       body = prepareLocalAddressContent(body, 'interactive', localAddressContextForBot(ds.larkAppId, ds.workingDir ?? ds.session.workingDir));
       const messageId = await send(body, 'interactive', uuid, beforeEffect);
@@ -276,7 +284,11 @@ export async function updateTurnReplyCard(
   } satisfies import('../services/turn-reply-card.js').TurnReplyCardTransport;
   for (let attempt = 0; ; attempt++) {
     try {
-      const delivered = await store.update(key, event, transport);
+      // A model card already accepted for this turn keeps its own link fields
+      // when the card is rendered again, even if the bot turned
+      // hideLocalAddresses on since; otherwise the turn could never settle.
+      const delivered = await replayVettedBody([store.read(key)?.finalCard, event.kind === 'final' ? event.card : undefined],
+        'interactive', () => store.update(key, event, transport));
       const complete = event.kind === 'final' && event.source === 'bridge'
         && delivered.record.finalSource === 'bridge' && delivered.record.finalText === event.text
         && delivered.record.finalDelivered && !!delivered.messageId
@@ -441,7 +453,8 @@ async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: im
   };
   // The record keeps the agent's raw text; a re-render is model output entering again.
   const localContext = localAddressContextForBot(record.larkAppId, workingDir);
-  await store.update(record, { kind: 'recover', beforeMs, orphanAskIds }, {
+  // The accepted model card keeps its link fields on re-render (see updateTurnReplyCard).
+  await replayVettedBody([record.finalCard], 'interactive', () => store.update(record, { kind: 'recover', beforeMs, orphanAskIds }, {
     beforeEffect,
     send: async () => { throw new Error('Recovery may only update an existing reply card'); },
     // The persisted pendingPatch was vetted before this restart.
@@ -464,7 +477,7 @@ async function settleDisconnectedReplyCard(store: TurnReplyCardStore, record: im
       ...replyCardPresentation(getBot(record.larkAppId).config, record.chatId),
       locale: localeForBot(record.larkAppId), canStop: false,
     }), 'interactive', localContext),
-  });
+  }));
 }
 
 /** Like the CoT orphan sweep: recover only this bot's previously visible cards. */

@@ -26,6 +26,7 @@ function runSend(options: {
   env?: NodeJS.ProcessEnv;
   repeat?: boolean;
   content?: string;
+  bot?: Record<string, unknown>;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-send-doc-'));
   const dataDir = join(root, 'data');
@@ -34,7 +35,7 @@ function runSend(options: {
     mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
     const pidMarkerPath = join(dataDir, '.botmux-cli-pids', String(process.pid));
     writeFileSync(join(root, 'bots.json'), JSON.stringify([{
-      larkAppId: 'cli_test', larkAppSecret: 'test-secret', cliId,
+      larkAppId: 'cli_test', larkAppSecret: 'test-secret', cliId, ...options.bot,
     }]));
     seedPersistedSessionRows(dataDir, 'cli_test', {
       sid_doc: {
@@ -133,11 +134,23 @@ describe('real CLI document-comment reply routing', () => {
   // The document reply API is a raw request outside the Lark message client,
   // so the send command's own presentation pass is the only one on this path.
   it('removes host paths from an explicit document reply before the provider request', () => {
-    const result = runSend({ content: '报告在 /home/alice/private/report.md，另见 [说明](/home/alice/notes.md)。' });
+    const result = runSend({
+      content: '报告在 /home/alice/private/report.md，另见 [说明](/home/alice/notes.md)。',
+      bot: { hideLocalAddresses: true },
+    });
     expect(result.status, result.stderr).toBe(0);
     const text = JSON.stringify(result.requests[0]?.body);
     expect(text).toContain('说明');
     expect(text).not.toContain('/home/alice');
+  }, 35_000);
+
+  it('sends host paths as written for a bot that has not turned on hideLocalAddresses', () => {
+    const result = runSend({ content: '报告在 /home/alice/private/report.md，另见 [说明](/home/alice/notes.md)。' });
+    expect(result.status, result.stderr).toBe(0);
+    const text = JSON.stringify(result.requests[0]?.body);
+    expect(text).toContain('/home/alice/private/report.md');
+    expect(text).toContain('/home/alice/notes.md');
+    expect(text).not.toContain('内部文件');
   }, 35_000);
 
   it('treats an omitted response kind as the one final document reply', () => {

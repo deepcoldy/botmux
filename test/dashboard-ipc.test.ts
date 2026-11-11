@@ -50,6 +50,8 @@ import * as sandboxStore from '../src/services/sandbox-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import * as scheduler from '../src/core/scheduler.js';
 import * as botRegistry from '../src/bot-registry.js';
+import { sanitizeLocalAddressText } from '../src/im/lark/local-address-policy.js';
+import { localAddressContextForBot } from '../src/im/lark/local-address-context.js';
 import * as costCalculator from '../src/core/cost-calculator.js';
 import { clearMessageListenerRunPreviewStore, markMessageListenerRunPreviewReplied, markMessageListenerRunPreviewCompleted, markMessageListenerRunPreviewRunning } from '../src/services/message-listener-run-preview-store.js';
 import { findMessageListenerForChat } from '../src/services/message-listener.js';
@@ -3484,6 +3486,51 @@ describe('PUT /api/bot-card-prefs — senderTag (<sender> 注入开关)', () => 
       // Back to default ⇒ the key is REMOVED rather than stored as true, so
       // bots.json stays free of redundant defaults.
       expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].senderTag).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT /api/bot-card-prefs — hideLocalAddresses (飞书回复隐藏开发机地址)', () => {
+  it('defaults off, persists only an explicit true and applies it to the next reply', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-local-address-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-local-address-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    const evidence = '日志在 /opt/app/logs/error.log';
+    const put = (base: string, value: unknown) => fetch(`${base}/api/bot-card-prefs`, {
+      method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ hideLocalAddresses: value }),
+    });
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex' }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ hideLocalAddresses: false });
+      expect(sanitizeLocalAddressText(evidence, localAddressContextForBot(appId))).toBe(evidence);
+
+      const on = await put(base, true);
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, hideLocalAddresses: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({ hideLocalAddresses: true });
+      expect(sanitizeLocalAddressText(evidence, localAddressContextForBot(appId))).not.toContain('/opt/app/logs');
+
+      // A non-boolean is not coerced into a value.
+      expect((await put(base, 'yes')).status).toBe(400);
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({ hideLocalAddresses: true });
+
+      const off = await put(base, false);
+      expect(await off.json()).toMatchObject({ ok: true, hideLocalAddresses: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).not.toHaveProperty('hideLocalAddresses');
+      expect(sanitizeLocalAddressText(evidence, localAddressContextForBot(appId))).toBe(evidence);
     } finally {
       if (handle) await handle.close();
       handle = null;
@@ -13422,8 +13469,8 @@ describe('POST /api/sessions/:sessionId/reply-card-ready', () => {
       managedTurnOrigin: { turnId: 'om_order', dispatchAttempt: 1, capability: 'fixture-capability' },
       session: { sessionId: 'native-order', status: 'active' } } as any;
     const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
-    let release!: () => void;
-    const prepareSpy = vi.spyOn(cards, 'prepareReplyCardNativeThinking').mockImplementation(() => new Promise<void>(resolve => { release = resolve; }));
+    let release!: (visible: boolean) => void;
+    const prepareSpy = vi.spyOn(cards, 'prepareReplyCardNativeThinking').mockImplementation(() => new Promise<boolean>(resolve => { release = resolve; }));
     try {
       setLarkAppId(appId); setIpcAuthSecret(TEST_IPC_SECRET);
       handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
@@ -13435,11 +13482,16 @@ describe('POST /api/sessions/:sessionId/reply-card-ready', () => {
       const pending = query();
       await vi.waitFor(() => expect(prepareSpy).toHaveBeenCalledOnce());
       ds.managedTurnOrigin.dispatchAttempt = 2;
-      release();
+      release(true);
       expect((await pending).status).toBe(409);
       ds.managedTurnOrigin.dispatchAttempt = 1;
-      prepareSpy.mockResolvedValue();
-      expect((await query()).status).toBe(200);
+      // The CLI may hand passive progress to native thinking only when it is live.
+      for (const visible of [true, false]) {
+        prepareSpy.mockResolvedValue(visible);
+        const ready = await query();
+        expect(ready.status).toBe(200);
+        expect(ready.json).toEqual({ ok: true, nativeThinkingVisible: visible });
+      }
       expect(prepareSpy).toHaveBeenLastCalledWith(ds, 'om_order', 1);
     } finally { findSpy.mockRestore(); prepareSpy.mockRestore(); }
   });

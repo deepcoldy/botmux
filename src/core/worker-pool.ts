@@ -67,6 +67,8 @@ import { mayRestoreWriteAdmission } from '../adapters/backend/destroy-result.js'
 import { config } from '../config.js';
 import { readGlobalConfig, configuredProtectedMcpEnvKeys } from '../global-config.js';
 import { workerExitDashboardEvent } from './worker-exit-dashboard-event.js';
+import { RETIRED_RUNTIME_SUCCESSOR_COOLDOWN_MS, WORKER_EXIT_RUNTIME_RETIRED } from './retired-runtime-exit.js';
+import { hasUnsentInputs, unsentInputJournalFile } from '../services/unsent-input-journal.js';
 import { checkWorkerAdmission, formatMemoryBytes, tierWorkerAdmission, type WorkerAdmissionDecision } from './worker-budget.js';
 import { coalesceMarginalAdmissionRetry } from './admission-reclaim.js';
 import { reclaimIdleWorkersForAdmissionAfterTurnDrain } from './idle-worker-sweeper.js';
@@ -1927,9 +1929,10 @@ export function sessionSupportsWebTerminal(ds: DaemonSession): boolean {
  *  keeps its entry after a restart. A direct link embeds the port itself, and a
  *  persisted port belongs to the current generation only while a worker exists
  *  to listen on it (it is that worker's preferred port) — once restored without
- *  one, it is the previous daemon's and nothing listens there. A direct link
- *  without a read capability is also empty: Feishu refuses a bare local root,
- *  and that must cost the button, not the card. */
+ *  one, it is the previous daemon's and nothing listens there. For a bot that
+ *  hides local addresses a direct link without a read capability is also
+ *  empty: the transport refuses a bare local root, and that must cost the
+ *  button, not the card. */
 export function readableTerminalUrlFor(ds: DaemonSession): string {
   if (!sessionSupportsWebTerminal(ds)) return '';
   const port = getTerminalProxyPort()
@@ -1937,7 +1940,7 @@ export function readableTerminalUrlFor(ds: DaemonSession): string {
     : ds.workerPort ?? (ds.worker ? ds.session.webPort : undefined);
   if (!port) return '';
   const url = buildTerminalUrl(ds);
-  return sendableCardLink(url) ? url : '';
+  return sendableCardLink(url, ds.larkAppId) ? url : '';
 }
 
 /** Empty means the live streaming card should not offer a Web Terminal button.
@@ -1953,7 +1956,7 @@ export function liveReadableTerminalUrlFor(ds: DaemonSession): string {
   // Prompt readiness does not determine whether the worker's port is usable.
   if (!ds.workerPort) return '';
   const url = buildTerminalUrl(ds);
-  return sendableCardLink(url) ? url : '';
+  return sendableCardLink(url, ds.larkAppId) ? url : '';
 }
 
 // Per-bot opt-in: the writable terminal link to embed directly in the streaming
@@ -10016,6 +10019,7 @@ function noteAcceptedInputTurn(
         phase: unproven.phase === 'native-submit' ? 'native-submit' : phase,
         at: Date.now(),
       });
+      if (ds.latestAcceptedInputKey === unprovenKey) ds.latestAcceptedInputKey = key;
       return;
     }
   } else {
@@ -10034,6 +10038,7 @@ function noteAcceptedInputTurn(
   }
 
   const previous = turns.get(key);
+  if (!previous) ds.latestAcceptedInputKey = key;
   // A later queue-commit observation must never downgrade proven native submit.
   const nextPhase = previous?.phase === 'native-submit' ? 'native-submit' : phase;
   turns.delete(key);
@@ -10091,6 +10096,7 @@ function clearAcceptedInputTurns(ds: DaemonSession): void {
   ds.acceptedInputTurns = undefined;
   ds.settledInputTurns = undefined;
   ds.acceptedInputOverflow = undefined;
+  ds.latestAcceptedInputKey = undefined;
 }
 
 /** Does the CURRENT generation still own an accepted input with no terminal? */
@@ -10102,6 +10108,35 @@ export function hasUnsettledAcceptedInput(ds: DaemonSession): boolean {
     if (entry.workerGeneration === ds.workerGeneration) return true;
   }
   return false;
+}
+
+/** The input this generation accepted last, while its turn has no terminal
+ *  yet. Earlier unsettled inputs are not reported: a session runs one turn at
+ *  a time, so a turn that never reported its terminal is over once a later
+ *  input was accepted (hasUnsettledAcceptedInput keeps counting it). */
+export function latestUnsettledAcceptedInput(ds: DaemonSession): { turnId: string; at: number } | undefined {
+  const key = ds.latestAcceptedInputKey;
+  const entry = key === undefined ? undefined : ds.acceptedInputTurns?.get(key);
+  if (!entry || entry.workerGeneration !== ds.workerGeneration) return undefined;
+  return { turnId: entry.turnId, at: entry.at };
+}
+
+/** CLIs a worker of this daemon has reported a turn terminal for. A CLI whose
+ *  worker never reports one (no transcript bridge: the screen idle is its only
+ *  turn end) would otherwise leave every accepted input unsettled. */
+const turnTerminalReportingCliIds = new Set<string>();
+
+function workerCliId(ds: DaemonSession): string | undefined {
+  return ds.initConfig?.cliId ?? ds.session.cliId;
+}
+
+export function cliReportsTurnTerminals(ds: DaemonSession): boolean {
+  const cliId = workerCliId(ds);
+  return cliId !== undefined && turnTerminalReportingCliIds.has(cliId);
+}
+
+export function __testOnly_resetTurnTerminalReportingClis(): void {
+  turnTerminalReportingCliIds.clear();
 }
 
 /** Whether a direct keystroke command (e.g. `/model <value>`) may be injected
@@ -10271,6 +10306,18 @@ export function destroySuspendBackingVerified(
 let suspendBackingVerifier: (ds: DaemonSession) => boolean = destroySuspendBackingVerified;
 
 /** Unit-test seam; production never overrides the exact kill + post-probe path. */
+/** When a worker that ended itself after its runtime was retired last got a
+ *  successor started for the input it handed over (see the worker exit handler). */
+const retiredRuntimeSuccessorStartedAt = new WeakMap<DaemonSession, number>();
+const startRetiredRuntimeSuccessorDefault = (ds: DaemonSession): boolean => forkWorker(ds, '', { resume: true });
+let startRetiredRuntimeSuccessor = startRetiredRuntimeSuccessorDefault;
+
+export function __testOnly_setRetiredRuntimeSuccessorStarter(
+  starter?: (ds: DaemonSession) => boolean,
+): void {
+  startRetiredRuntimeSuccessor = starter ?? startRetiredRuntimeSuccessorDefault;
+}
+
 export function __testOnly_setSuspendBackingVerifier(
   verifier?: (ds: DaemonSession) => boolean,
 ): void {
@@ -10755,7 +10802,17 @@ export function sweepTraexInstallChanges(
 // re-run the settlement checkpoint only when such a claim is queued.
 onFinalOutputDeliverySettled(ds => {
   if (ds.pendingSuspendReason === CLI_INSTALL_CHANGED_SUSPEND) runPendingSuspendIfSettled(ds);
+  requestLiveSessionCapAfterTurnSettled(ds);
 });
+
+/** The automatic reclaims hold an idle session while its last turn is not
+ *  settled (idle-worker-sweeper). Re-check the cap when such a turn settles,
+ *  instead of waiting for the next idle edge or the periodic backstop. */
+function requestLiveSessionCapAfterTurnSettled(ds: DaemonSession): void {
+  if (ds.lastScreenStatus !== 'idle' || !ds.worker || ds.worker.killed) return;
+  const enforce = callbacks?.enforceLiveSessionCap;
+  if (enforce) queueMicrotask(enforce);
+}
 
 function armWorkerKillBackstop(w: ChildProcess, label: string, sigtermMs: number = WORKER_SIGTERM_BACKSTOP_MS): void {
   const sigterm = setTimeout(() => {
@@ -17483,6 +17540,9 @@ function forkWorkerPrepared(
     // dead worker process re-forked). /restart, dashboard restart and in-worker CLI respawn reuse
     // lastInitConfig in place and do NOT re-read it (documented in the chat-manager skill).
     ...(isLeadOnlySession(ds.larkAppId, ds.chatId, ds.chatType, ds.session) ? { leadOnly: true as const } : {}),
+    // Full local-address rule in the system prompt; like leadOnly it is read
+    // when a worker process is forked. Rewriting replies reads the live value.
+    ...(botCfg.hideLocalAddresses === true ? { hideLocalAddresses: true as const } : {}),
     // Workflow node session (design 2026-11-03 §4.2): the worker exports the
     // marker so its CLI system prompt and `botmux skill show` skip workflow.
     // A main-topic handoff's marker (§5.5) leaves the ordinary session as is.
@@ -21956,6 +22016,9 @@ function setupWorkerHandlers(
         // accepted-input guard for it, and only for the exact attempt it names:
         // a late terminal from an older attempt must not release a newer one.
         settleAcceptedInputTurn(ds, msg.turnId, msg.dispatchAttempt, true);
+        const terminalCliId = workerCliId(ds);
+        if (terminalCliId !== undefined) turnTerminalReportingCliIds.add(terminalCliId);
+        requestLiveSessionCapAfterTurnSettled(ds);
         try {
           getLinkRefRuntime()?.settleTurn({
             appId: ds.larkAppId,
@@ -23240,8 +23303,13 @@ function setupWorkerHandlers(
       ? taskContinuationWorkerExitRecovery(ds, workerGeneration)
       : undefined;
     const preReadyExit = !startupState.ready;
+    // The worker ended itself because this daemon retired its live runtime and
+    // no lifecycle operation took it over: as deliberate as a suspend, and it
+    // handed its unwritten inputs to the next worker the same way.
+    const retiredRuntimeExit = code === WORKER_EXIT_RUNTIME_RETIRED;
+    const deliberateRetirement = lifecycleRetirement || retiredRuntimeExit;
     const suppressDeliveryFailure = transferRetirement
-      || lifecycleRetirement
+      || deliberateRetirement
       || worker.killed
       || ds.session.status === 'closed';
     const ordinaryImTurnIds = ordinaryImTurnIdsForWorker(worker);
@@ -23256,16 +23324,19 @@ function setupWorkerHandlers(
       // A deliberate retirement suppresses the misleading crash/ambiguity
       // notices, but a tracked turn that never committed still owes the user
       // a terminal outcome: it will never run and nothing redelivers it.
-      retiredBeforeCommit: lifecycleRetirement
+      retiredBeforeCommit: deliberateRetirement
         && !transferRetirement
         && ds.session.status !== 'closed',
     });
     settleWorkerCliInputBacklog(ds, worker, {
-      notify: lifecycleRetirement
+      notify: deliberateRetirement
         && !transferRetirement
         && ds.session.status !== 'closed',
       ownedByDeliveryTracker: ordinaryImTurnIds,
     });
+    if (retiredRuntimeExit) {
+      logger.warn(`[${t}] Worker ended its generation after its runtime was retired; the next message starts a successor`);
+    }
     transferRetiringWorkers.delete(worker);
     clearLifecycleRetirement(ds, worker);
     logger.info(`[${t}] Worker process exited (code: ${code})`);
@@ -23468,6 +23539,34 @@ function setupWorkerHandlers(
         void Promise.resolve(workerExitReconciled).then(
           resumeAfterReconcile,
           resumeAfterReconcile,
+        );
+      }
+      if (retiredRuntimeExit) {
+        // What the retired worker handed over waits in the journal for the next
+        // worker. Start it now rather than whenever another message arrives.
+        const startSuccessorAfterReconcile = (): void => {
+          if (ds.session.status !== 'active'
+            || (ds.worker && !ds.worker.killed)
+            || (activeSessionsRegistry && activeSessionsRegistry.get(activeSessionKey(ds)) !== ds)
+            || controllerForSession(ds)?.acceptsUserInput() === false
+            || isSessionLifecycleInFlight(ds) || isSessionTransferring(ds)
+            || !hasUnsentInputs(unsentInputJournalFile(config.session.dataDir, ds.session.sessionId))) return;
+          const lastStartAtMs = retiredRuntimeSuccessorStartedAt.get(ds);
+          if (lastStartAtMs !== undefined && Date.now() - lastStartAtMs < RETIRED_RUNTIME_SUCCESSOR_COOLDOWN_MS) {
+            logger.warn(`[${t}] Handed-over input waits for the next message: a successor was already started ${Math.round((Date.now() - lastStartAtMs) / 1000)}s ago`);
+            return;
+          }
+          retiredRuntimeSuccessorStartedAt.set(ds, Date.now());
+          logger.info(`[${t}] Starting a successor worker for the input the retired worker handed over`);
+          try {
+            startRetiredRuntimeSuccessor(ds);
+          } catch (err) {
+            logger.error(`[${t}] Successor worker for handed-over input failed to start: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        };
+        void Promise.resolve(workerExitReconciled).then(
+          startSuccessorAfterReconcile,
+          startSuccessorAfterReconcile,
         );
       }
     } else {

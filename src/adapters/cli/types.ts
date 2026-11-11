@@ -272,6 +272,9 @@ export interface CliAdapter {
     /** Lead-only chat manager session (claude-code only; ignored by other CLIs): block
      *  file/web/agent tools, mount the dedicated lead-only guard plugin dir, append the lead-only prompt. */
     leadOnly?: boolean;
+    /** BotConfig.hideLocalAddresses when the worker was forked: adapters that
+     *  build the Botmux system prompt add the full local-address rule. */
+    hideLocalAddresses?: boolean;
     /** UI / response language for prompts injected into the CLI (e.g. zh / en). */
     locale?: import('../../i18n/index.js').Locale;
     /** Optional model name from BotConfig.model. Adapters whose CLI accepts a

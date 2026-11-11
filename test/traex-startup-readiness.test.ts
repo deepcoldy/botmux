@@ -369,6 +369,32 @@ old completed response
     expect(detector.observeStartupHistory(combined)).toBe(false);
     expect(detector.isStartupPending()).toBe(true);
   });
+
+  it('releases the startup hold on a managed-config two-row footer with a bare hint row', () => {
+    detector.feed(LOADING);
+    quiet();
+    expect(idle).not.toHaveBeenCalled();
+    expect(detector.observeStartupHistory([
+      '──────────────────────────',
+      '❯ Ask TRAE CLI to do anything',
+      '──────────────────────────',
+      '  GPT-6.1-Sol · /tmp/repo · Context 100% left',
+      '  ? for shortcuts',
+    ].join('\n'))).toBe(true);
+    expect(detector.isStartupPending()).toBe(false);
+  });
+
+  it('releases the startup hold when a long cwd truncates the context row', () => {
+    detector.feed(LOADING);
+    expect(detector.observeStartupHistory([
+      '──────────────────────────',
+      '❯ Ask TRAE CLI to do anything',
+      '──────────────────────────',
+      '  GPT-6.1-Sol · /tmp/repo/very-long-directory-name-component-0123456789/very-long-directory-name-compo…',
+      '  ? for shortcuts',
+    ].join('\n'))).toBe(true);
+    expect(detector.isStartupPending()).toBe(false);
+  });
 });
 
 
@@ -451,5 +477,176 @@ describe('TraeX 0.214.1 shortcut-only startup footer', () => {
     ['picker composer row', SHORTCUT_ONLY_YOLO.map(row => row.replace('Ask TRAE CLI to do anything', '1. Continue'))],
   ])('keeps non-ready or blocked surfaces gated: %s', (_name, rows) => {
     expect(traexRestoredComposerReady(rows.join('\n'))).toBe(false);
+  });
+});
+
+// Real tmux frames from traecli 0.214.1 with the integration layer's managed
+// config. approval_policy=never and custom permission profiles suppress the
+// standard permission label; a cwd wider than the pane truncates the
+// model/context row (U+2026) before the Context cell renders. Both used to
+// fail the readiness predicate until the 90s hard timeout.
+const HINT_ONLY_ROW = '  ? for shortcuts';
+const TWO_ROW_BARE_HINT = [
+  '──────────────────────────────────────────────────────────',
+  '❯ Ask TRAE CLI to do anything',
+  '──────────────────────────────────────────────────────────',
+  '  GPT-6.1-Sol · /tmp/repo · Context 100% left',
+  HINT_ONLY_ROW,
+];
+const LONG_CWD_TRUNCATED = '  GPT-6.1-Sol · /tmp/repo/very-long-directory-name-component-0123456789/very-long-directory-name-compo…';
+
+describe('TraeX 0.214.1 managed-config footer variants', () => {
+  it.each([
+    ['approval_policy=never built-in profile', TWO_ROW_BARE_HINT],
+    ['custom qdh-topic profile', TWO_ROW_BARE_HINT.map(row => row.replace('/tmp/repo', '/tmp/qdh'))],
+    ['bare agents hint instead of shortcut hint', TWO_ROW_BARE_HINT.slice(0, -1).concat('  ← for agents')],
+    ['both hint tokens under a context row', TWO_ROW_BARE_HINT.slice(0, -1).concat('  ? for shortcuts · ← for agents')],
+  ])('accepts a two-row footer whose second row is a bare hint: %s', (_name, rows) => {
+    expect(traexRestoredComposerReady(rows.join('\n'))).toBe(true);
+  });
+
+  it.each([
+    ['truncated cwd with bare hint row', [
+      '──────────────────────────────────────────────────────────',
+      '❯ Ask TRAE CLI to do anything',
+      '──────────────────────────────────────────────────────────',
+      LONG_CWD_TRUNCATED,
+      HINT_ONLY_ROW,
+    ]],
+    ['truncated cwd with standard access row', [
+      '──────────────────────────────────────────────────────────',
+      '❯ Ask TRAE CLI to do anything',
+      '──────────────────────────────────────────────────────────',
+      LONG_CWD_TRUNCATED,
+      '  ▧ Workspace Edit (shift+tab to cycle) · ? for shortcuts · ← for agents',
+    ]],
+  ])('accepts a truncated model/cwd row ending in U+2026: %s', (_name, rows) => {
+    expect(traexRestoredComposerReady(rows.join('\n'))).toBe(true);
+    expect(traexRestoredComposerReady(rows.join('\n'), { resumedSession: true })).toBe(true);
+  });
+
+  it.each([
+    ['ascii dots are not native truncation', LONG_CWD_TRUNCATED.replace('…', '...')],
+    ['truncated row without cell separators', '  some truncated row without separators…'],
+    ['bordered banner row is not a footer cell', '  │ GPT-6.1-Sol · /tmp/repo/compo…'],
+    ['unknown label on the second row', '  qdh-topic something unknown'],
+    ['third footer row present', '  extra row'],
+    ['loading word in the model cell', '  loading · /tmp/repo · Context 100% left'],
+  ])('keeps non-matching footer shapes gated: %s', (_name, extraOrRow) => {
+    const base = [
+      '❯ Ask TRAE CLI to do anything',
+      '  GPT-6.1-Sol · /tmp/repo · Context 100% left',
+      HINT_ONLY_ROW,
+    ];
+    if (extraOrRow === '  extra row') {
+      expect(traexRestoredComposerReady([...base, extraOrRow].join('\n'))).toBe(false);
+      return;
+    }
+    if (extraOrRow === '  qdh-topic something unknown') {
+      expect(traexRestoredComposerReady([base[0]!, base[1]!, extraOrRow].join('\n'))).toBe(false);
+      return;
+    }
+    if (extraOrRow.startsWith('  loading')) {
+      expect(traexRestoredComposerReady([base[0]!, extraOrRow, HINT_ONLY_ROW].join('\n'))).toBe(false);
+      return;
+    }
+    expect(traexRestoredComposerReady([base[0]!, extraOrRow, HINT_ONLY_ROW].join('\n'))).toBe(false);
+  });
+});
+
+// Real tmux frames from traecli 0.214.1 with a startup diagnostic warning
+// (an unparsable SKILL.md): the bottom indicator is right-aligned on the hint
+// row as `⚠ N warning(s) · f2 to view`. It is a notice, not an input owner.
+const WARNING_SUFFIX = '⚠ 1 warning · f2 to view';
+const WARNING_SUFFIX_PLURAL = '⚠ 2 warnings · f2 to view';
+const hintRowWithWarning = (suffix: string, width = 160) => {
+  const hint = '  ? for shortcuts';
+  return hint + ' '.repeat(Math.max(1, width - hint.length - suffix.length)) + suffix;
+};
+
+describe('TraeX 0.214.1 warning indicator on the footer hint row', () => {
+  it.each([
+    ['single warning', WARNING_SUFFIX],
+    ['plural warnings', WARNING_SUFFIX_PLURAL],
+  ])('accepts a bare hint row carrying the %s suffix', (_name, suffix) => {
+    const rows = [
+      '──────────────────────────────────────────────────────────',
+      '❯ Ask TRAE CLI to do anything',
+      '──────────────────────────────────────────────────────────',
+      '  GPT-6.1-Sol · /tmp/repo · Context 100% left',
+      hintRowWithWarning(suffix),
+    ];
+    expect(traexRestoredComposerReady(rows.join('\n'))).toBe(true);
+  });
+
+  it('accepts the warning suffix on a shortcut-only single-row footer', () => {
+    const screen = [
+      '❯ Ask TRAE CLI to do anything',
+      hintRowWithWarning(WARNING_SUFFIX),
+    ].join('\n');
+    expect(traexRestoredComposerReady(screen)).toBe(true);
+  });
+
+  it('accepts the warning suffix together with a truncated long-cwd status row', () => {
+    const screen = [
+      '❯ Ask TRAE CLI to do anything',
+      '  GPT-6.1-Sol · /tmp/repo/very-long-directory-name-component-0123456789/very-long-directory-name-compo…',
+      hintRowWithWarning(WARNING_SUFFIX),
+    ].join('\n');
+    expect(traexRestoredComposerReady(screen)).toBe(true);
+  });
+
+  it.each([
+    ['ascii bang instead of the warning glyph', hintRowWithWarning(WARNING_SUFFIX).replace('⚠', '!')],
+    ['warning text without the f2 view action', '  ? for shortcuts   ⚠ 1 warning'],
+    ['non-numeric warning count', hintRowWithWarning(WARNING_SUFFIX).replace('1 warning', 'many warnings')],
+    ['unrelated sentence after the hint', '  ? for shortcuts   ⚠ something else'],
+  ])('rejects look-alike suffixes: %s', (_name, row) => {
+    expect(traexRestoredComposerReady([
+      '❯ Ask TRAE CLI to do anything',
+      '  GPT-6.1-Sol · /tmp/repo · Context 100% left',
+      row,
+    ].join('\n'))).toBe(false);
+  });
+
+  it('still rejects a draft even with the genuine warning suffix', () => {
+    expect(traexRestoredComposerReady([
+      '❯ my unsent draft',
+      '  GPT-6.1-Sol · /tmp/repo · Context 100% left',
+      hintRowWithWarning(WARNING_SUFFIX),
+    ].join('\n'))).toBe(false);
+  });
+
+  it('releases the IdleDetector startup hold on a warning-suffixed hint row', () => {
+    detector.feed(LOADING);
+    expect(detector.observeStartupHistory([
+      '❯ Ask TRAE CLI to do anything',
+      hintRowWithWarning(WARNING_SUFFIX),
+    ].join('\n'))).toBe(true);
+    expect(detector.isStartupPending()).toBe(false);
+  });
+
+  it.each([
+    ['medium pane degrades to warning count plus f2', '? for shortcuts   ⚠ 2 · f2'],
+    ['narrow pane drops the hint tokens and keeps warning plus f2', '               ⚠ 2 · f2'],
+    ['narrowest pane leaves the bare warning count', '          ⚠ 2'],
+  ])('accepts the width-degraded warning indicator: %s', (_name, row) => {
+    expect(traexRestoredComposerReady([
+      '❯ Ask TRAE CLI to do anything',
+      '  GPT-6.1-Sol · /tmp/repo · Context 100% left',
+      row,
+    ].join('\n'))).toBe(true);
+  });
+
+  it.each([
+    ['ascii glyph on the warning-only row', '! 2'],
+    ['non-numeric count on the warning-only row', '⚠ many'],
+    ['bare glyph without a count', '⚠'],
+    ['trailing text after a bare warning row', '⚠ 2 something'],
+  ])('rejects malformed warning-only rows: %s', (_name, row) => {
+    expect(traexRestoredComposerReady([
+      '❯ Ask TRAE CLI to do anything',
+      row,
+    ].join('\n'))).toBe(false);
   });
 });

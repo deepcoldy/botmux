@@ -73,6 +73,7 @@ Two bots, one on Claude Code and one on Codex:
 | Block someone | `blockedUsers` |
 | Limit which files the agent can read and write | `sandbox` (see [File sandbox](/en/sandbox)) |
 | The live card is too noisy | `disableStreamingCard`, `hiddenStreamingCardButtons` |
+| Keep host paths and local addresses out of replies for a bot others use | `hideLocalAddresses` (see [Hide development host addresses](#hide-local-addresses)) |
 | One card per turn for both progress and answer | `replyCardMode: "unified"` |
 | Start working without being @-mentioned | `autoStartOnNewTopic`, `autoStartOnGroupJoin` |
 | DM the owner a welcome message when the bot first comes online | `welcomeMessage` (see [Welcome message](#welcome-message)) |
@@ -485,7 +486,7 @@ Rules:
 - Only `"enabled": true` turns it on. Leaving out `tools` covers every tool; an unknown tool name is an error rather than a silent downgrade.
 - When someone who hasn't authorized makes a call, the command is refused and the refusal carries an authorization link. The AI can also send that person a link itself with `botmux auth request` (see [Agent-initiated authorization](/en/cli-commands#agent-auth-request)), or ask them to send `/login` in the topic. Retry after authorizing.
 - It never falls back to running as the bot or as anyone else. `bytedcli` has no bot identity, so an unauthorized call simply fails.
-- Optional fields: `credentialSource` (`auto` by default / `platform` central platform only / `local` local QR login only), `delegateOnMention` (default `true`, see [Carry the sender over on @ handoffs](/en/permissions#delegate-on-mention)), `gitHost` (git pushes to that code host also authenticate as the current turn's sender).
+- Optional fields: `credentialSource` (`auto` by default / `platform` [central platform](/en/platform) only / `local` local QR login only), `delegateOnMention` (default `true`, see [Carry the sender over on @ handoffs](/en/permissions#delegate-on-mention)), `gitHost` (git pushes to that code host also authenticate as the current turn's sender).
 
 #### Upgrade note: old-format authorizations need a fresh `/login` {#legacy-user-token}
 
@@ -570,6 +571,7 @@ Edit it visually in Dashboard "Bot Config → Message Cards → Final answer fee
 | `replyDelivery` | How the final answer reaches Feishu. `send` (default for every CLI except Doubao): the model runs `botmux send` itself; `transcript`: botmux takes the turn's last answer from the CLI's session record and sends it. See below |
 | `senderTag` | On by default: every message forwarded to the CLI carries a `<sender ... />` tag saying who spoke. Only `false` turns it off |
 | `senderTagHideEmail` | Off by default. When on, the `<sender>` tag leaves out the email; name and ID stay |
+| `hideLocalAddresses` | Off by default: model replies reach Feishu as written. When on, host paths and local service addresses are kept out of replies. See [Hide development host addresses](#hide-local-addresses) below |
 | `promptInjection` | `"default"` (default) or `"none"`. `none` is zero-injection mode: botmux adds no system prompt or reminders, passes only the task and attachments, and forwards the final answer automatically. See below |
 | `envelopeInjection` | Claude Code only: `auto` moves the per-turn reminder into a hook, so the terminal input box shows only the message itself. Default `off` keeps it as is |
 | `topicUnavailablePolicy` | What to do when the original topic is deleted or unavailable. See [Topic unavailable policy](/en/topic-unavailable-policy) |
@@ -610,6 +612,23 @@ Without it the model can't tell who is speaking: in multi-person sessions it can
 - `botmux send --mention-back` (mention the person who sent this turn) is unaffected; it uses the daemon's own record of who triggered the turn.
 - Trade-off: Dashboard session insights can no longer tell the sender type from the tag, and `/adopt` loses one clue for recognizing botmux sessions.
 - The Dashboard "Speaker Tag" switch writes this field.
+
+### Hide development host addresses (`hideLocalAddresses`) {#hide-local-addresses}
+
+Feishu users read replies in their own client and cannot open files or services on the development host. Turn this on for a bot other people use; keep the default (off) for a bot only you use whose replies should show troubleshooting paths.
+
+```text
+/botconfig set hideLocalAddresses on
+/botconfig set hideLocalAddresses off
+```
+
+When off (the default), replies and cards are sent as written and no related rule is added to prompts. When on:
+
+- Before model output reaches Feishu (`botmux send`, the automatically forwarded final answer, unified reply cards, native thinking messages and document comment replies), absolute host paths, local schemes such as `file://` and local service addresses are replaced: source files under the working directory become repository-relative paths, everything else becomes an internal-file label, and skill links keep only their name. System paths that name no user file, such as `/dev/null` and `/proc`, stay.
+- The system prompt gets the full rule once per session and every turn's reminder gets one sentence, asking the model to leave such addresses out and deliver files as attachments or reachable links.
+- A card whose button or link points at this host is refused and the model gets `LOCAL_ADDRESS_OUTBOUND_REJECTED`; botmux's own Web terminal and Dashboard links are sent as usual.
+- Reply processing and the per-turn reminder apply immediately; the full rule in the system prompt applies from the next new session.
+- The Dashboard switch "Bot Config → Message Cards → Development host addresses" writes this field.
 
 ### Zero prompt injection (`promptInjection: "none"`)
 

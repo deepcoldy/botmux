@@ -72,7 +72,7 @@ By default a terminal link looks like `http://<host LAN IP>:<port>/s/<session ID
 
 | Your setup | Do this | The link becomes |
 |------|------|------|
-| Connected to the central platform (remote access on and bound) | Nothing extra | `https://t-<machineId>.<platform domain>/s/<session ID>` |
+| Connected to the [central platform](/en/platform) (remote access on and bound) | Nothing extra | `https://t-<machineId>.<platform domain>/s/<session ID>` |
 | You reverse-proxy the Dashboard to a domain with nginx or similar | Set `BOTMUX_PUBLIC_URL` | `<your domain>/s/<session ID>` |
 | botmux runs on a cloud host with a public address | Set `WEB_EXTERNAL_HOST` | `http://<public address>:<port>/s/<session ID>` |
 | botmux runs locally and you forward through a relay host | See "Forwarding through a relay host" below | `http://<relay address>:<port>/s/<session ID>` |

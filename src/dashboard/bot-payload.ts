@@ -236,6 +236,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     replyCardNativeCot: j?.replyCardNativeCot === true,
     senderTag: j?.senderTag !== false,
     senderTagHideEmail: j?.senderTagHideEmail === true,
+    hideLocalAddresses: j?.hideLocalAddresses === true,
     overloadAlert: j?.overloadAlert === true,
     botToBotSameDir: j?.botToBotSameDir !== false,
     quotaFallbackBot: normalizeQuotaFallbackBotConfig(j?.quotaFallbackBot, bot.larkAppId).config ?? null,

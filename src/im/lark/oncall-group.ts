@@ -5,7 +5,7 @@ import { config } from '../../config.js';
 import { logger } from '../../utils/logger.js';
 import { OncallGroupStore, pendingOncallMessageIds, type OncallGroupSource } from '../../services/oncall-group-store.js';
 import { oncallGroupEnabled, type OncallGroupPolicy, type OncallForwardMode } from '../../services/oncall-group-policy.js';
-import { createOncallGroup, loadOncallGroupTarget, oncallUsername, OncallGroupApiError } from '../../services/oncall-group-client.js';
+import { createOncallGroup, loadOncallGroupTarget, OncallGroupApiError } from '../../services/oncall-group-client.js';
 import { getMessageDetail, replyMessage } from './client.js';
 import { createNativeOncallLink, readOncallChoices, validateOncallSelection } from '../../services/oncall-platform.js';
 import { OncallFormStore, type OncallFormDraft } from '../../services/oncall-form-store.js';
@@ -13,7 +13,7 @@ import { buildOncallFormCard } from './oncall-form-card.js';
 import { createHash } from 'node:crypto';
 import { withFileLock } from '../../utils/file-lock.js';
 import { join } from 'node:path';
-import { resolveSender } from './identity-cache.js';
+import { resolveOncallUsername } from './oncall-identity.js';
 import { parseApiMessage } from './message-parser.js';
 import { chatAppLink } from './lark-hosts.js';
 import type { CardActionData } from './card-handler.js';
@@ -154,7 +154,7 @@ export async function handleOncallGroupAction(data: CardActionData, appId: strin
   }
   if (bot.oncallGroup?.flowMode === 'classify' && (!existingRequest || existingRequest.status === 'failed')) {
     try {
-      if (['private_card', 'thread_card'].includes(bot.oncallGroup.formDisplay ?? 'native')) return await openOncallForm(source, data.operator.open_id);
+      if (['private_card', 'thread_card'].includes(bot.oncallGroup.formDisplay ?? 'native')) return await openOncallForm(source, data.operator);
       const href = await prepareNativeOncallCard(appId, source.chatId, source.questionId);
       if (!href) throw new Error('原生提单入口暂不可用，请检查连接配置');
       await replyMessage(appId, source.messageId, JSON.stringify({ schema: '2.0', body: { elements: [
@@ -173,8 +173,7 @@ export async function handleOncallGroupAction(data: CardActionData, appId: strin
       if (!target.typeId || !target.region) throw new Error('直接建群需要配置固定区域和分类');
       const secret = deployment.ONCALL_SERVICE_SECRET?.trim();
       if (!secret) throw new Error('Oncall 服务账号凭据尚未配置，请联系机器人管理员设置 ONCALL_SERVICE_SECRET');
-      const sender = await resolveSender(appId, data.operator.open_id, 'user');
-      const username = oncallUsername(sender?.email, target);
+      const username = await resolveOncallUsername(appId, data.operator, target, deployment);
       let question = '';
       if (source.questionId.startsWith('om_')) {
         try {
@@ -261,7 +260,8 @@ function oncallError(error: unknown): any {
   return { toast: { type: 'error', content: error instanceof Error ? error.message : 'Oncall 暂不可用，请重试' } };
 }
 
-async function openOncallForm(source: OncallGroupSource, ownerOpenId: string): Promise<any> {
+async function openOncallForm(source: OncallGroupSource, operator: NonNullable<CardActionData['operator']>): Promise<any> {
+  const ownerOpenId = operator.open_id!;
   const client = await import('./client.js');
   const visibility = getBot(source.appId).config.oncallGroup?.formDisplay === 'thread_card' ? 'thread' : 'private';
   const policySnapshot = JSON.stringify(getBot(source.appId).config.oncallGroup);
@@ -274,8 +274,7 @@ async function openOncallForm(source: OncallGroupSource, ownerOpenId: string): P
   const deployment = readOncallDeploymentEnv();
   const target = loadOncallGroupTarget(config.session.dataDir, source.appId, deployment);
   const secret = deployment.ONCALL_SERVICE_SECRET?.trim() ?? '';
-  const sender = await resolveSender(source.appId, ownerOpenId, 'user');
-  const username = oncallUsername(sender?.email, target);
+  const username = await resolveOncallUsername(source.appId, operator, target, deployment);
   const choices = await readOncallChoices(target, secret, username);
   const region = Object.keys(choices.regions)[0] ?? '';
   const detail = await getMessageDetail(source.appId, source.questionId);
@@ -380,8 +379,7 @@ export async function handleOncallFormAction(data: CardActionData, appId: string
         const deployment = readOncallDeploymentEnv();
         const target = loadOncallGroupTarget(config.session.dataDir, appId, deployment);
         const secret = deployment.ONCALL_SERVICE_SECRET?.trim() ?? '';
-        const sender = await resolveSender(appId, owner, 'user');
-        const username = oncallUsername(sender?.email, target);
+        const username = await resolveOncallUsername(appId, data.operator, target, deployment);
         if (!draft.typeId || !draft.region) throw new Error('请完成问题区域和分类选择');
         await validateOncallSelection(target, secret, username, draft.region, draft.typeId);
         // Selection may have loaded while another process claimed this question.
