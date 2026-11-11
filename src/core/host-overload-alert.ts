@@ -546,7 +546,7 @@ export function buildOverloadAlertCard(st: OverloadCardState, hostLabel?: string
   if (st.autoSuspendedN !== undefined && st.autoSuspendedN > 0) {
     elements.push({
       tag: 'div',
-      text: { tag: 'lark_md', content: `本 bot 已自动挂起 **${st.autoSuspendedN}** 个持续高 CPU 的闲置会话（下条消息冷恢复）` },
+      text: { tag: 'lark_md', content: `本 bot 已因整机过载自动挂起 **${st.autoSuspendedN}** 个闲置会话（下条消息冷恢复）` },
     });
   }
   if (memList) elements.push({ tag: 'div', text: { tag: 'lark_md', content: memList } });

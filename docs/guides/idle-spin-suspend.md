@@ -24,6 +24,12 @@ worker 挂起，保留会话与历史，下一条消息冷恢复。
   或进程树超过 512 pid / 256 线程时，该会话 fail-closed 跳过，绝不截断后低估。
 - CPU 单位是**单核百分比**：`20` 表示约 0.2 个逻辑核，不是整机 CPU 百分比。
 - 默认连续 3 个 30s 采样周期超过 20%，且会话已连续空闲 ≥5 分钟，才挂起。
+- 挂起前现读一次 CLI 进程（attestation 的 `cliPid` / `enginePid`）的全部线程 `children`：
+  只要还有存活子进程（TRAE `background_shell` 后台任务、dev server、构建、watcher、MCP 服务等）
+  就不挂起并清零连续计数。实测 TRAE 0.214.1 的后台任务在本轮结束、屏幕回到空闲后仍挂在
+  traex 进程下（`sleep ← zsh ← traex ← tmux server`），而 TRAE 不上报后台任务数，严格 guard
+  看不到这类工作；挂起会连同子进程一起销毁。读不到（根进程消失/被复用、task 目录不可读、
+  超线程上限）一律视为有子进程，fail-closed。
 - 命中后走现有 `suspendWorker`（reason `idle_spin`）：保留 `session.status=active`、
   写 `suspendedColdResume`、下条消息冷恢复；不新增强杀路径。
 
@@ -36,14 +42,17 @@ worker 挂起，保留会话与历史，下一条消息冷恢复。
 - 连续 3 个采样周期处于过载才第一次回收；同一 episode 内每个采样周期继续回收，直到没有
   合格候选或压力退出；单轮最多 16 个；只有“episode 结束”或“某一轮 0 候选”才进入
   10 分钟冷却。
-- 只回收严格候选（与 Layer 1 同一个 `selectIdleSuspendCandidates`）。
+- 只回收 **Layer 1 自己可以动的那批会话**：严格候选（同一个 `selectIdleSuspendCandidates`）
+  ∩ `cliIds` ∩ traex 身份为 `current` ∩ CLI 进程无存活子进程。Layer 2 只是去掉“单会话 CPU
+  超阈值”这一条，不扩大 CLI 范围——默认 `cliIds: ["traex"]` 时，整机过载**不会**挂起
+  Claude Code、Codex 等其它 CLI 的空闲会话；要让它们参与需在 `cliIds` 里显式加入。
 - 每个 daemon 本地判定、只回收自己的 idle worker；per-daemon 归属天然避免多 bot 重复回收，
   也不依赖 notifier daemon 在线。通知仍由 `hostOverloadAlert` 的边沿卡负责，卡上补一行
   “本 bot 已自动挂起 X 个”；不新增 DM。
 
 ## 严格 guard
 
-两层共用 `selectIdleSuspendCandidates` 的严格集合：
+两层共用 `selectIdleSuspendCandidates` 的严格集合，再叠加 `cliIds`、traex 身份与“CLI 无存活子进程”三条：
 
 - 基础：live worker、`session.status=active`、`workerReady`、`lastScreenStatus=idle`、
   非 adopted、非 locked、后端可恢复（tmux/herdr/zellij/zmx；pty/riff/mojo 不参与）。
@@ -57,7 +66,9 @@ worker 挂起，保留会话与历史，下一条消息冷恢复。
   `idleAutoCompactWarmSince`、`idleAutoCompactPendingNotice`、
   `idleAutoCompactDispatchedTurnId`。
 - 身份：traex 必须 `observeTraexInstall` 为 `current`（`not-traex` 不适用）；固定旧版本
-  (`stale`) 或身份不明确 (`unknown`) 一律不自动回收。
+  (`stale`) 或身份不明确 (`unknown`) 一律不自动回收（两层都适用）。
+- 后台工作：CLI 进程下有存活子进程（后台任务、工具 shell、MCP 服务……）不自动回收（两层都适用）。
+  配了常驻 MCP 服务的 TRAE 会话因此不会被自动挂起，与本改动之前的行为相同。
 
 重启后：连续计数不持久化；restored 会话如果没有 `idleSinceAt`，使用
 `conservativeIdleActivityAt`（持久化 lastMessageAt / 运行时 lastMessageAt / spawnedAt 取 max）
@@ -90,9 +101,9 @@ per-bot `idleSpinSuspend`（`bots.json` 或 `botmux config set idleSpinSuspend '
 
 - `cpuPercent`：**单核百分比**，`20` = 0.2 核。
 - `minIdleMinutes`：最小 1（0 会让严格选择器直接返回空集，等于静默关闭 Layer 1）。
-- `cliIds`：默认只对 `traex` 生效。其他 CLI（如 claude-code 的 prompt-cache keepalive /
-  idle auto-compact）需要显式 opt-in。
-- `enabled: false` 关闭两层；`cliIds: []` 只关 Layer 1，保留 Layer 2。
+- `cliIds`：两层的作用范围，默认只对 `traex` 生效。其他 CLI（如 claude-code 的
+  prompt-cache keepalive / idle auto-compact）需要显式 opt-in。
+- `enabled: false` 或 `cliIds: []` 关闭两层；`hostPressure.enabled: false` 只关 Layer 2。
 - 配置每 tick 重新读取，热加载，无需重启。
 - kill switch：`BOTMUX_IDLE_SPIN_SUSPEND=0`（两层都关）、
   `BOTMUX_HOST_PRESSURE_RECLAIM=0`（只关 Layer 2）。
@@ -110,6 +121,8 @@ per-bot `idleSpinSuspend`（`bots.json` 或 `botmux config set idleSpinSuspend '
 - 50 daemon × 2 次/分钟外推约 0.6% 单核平均；daemon 定时器带 ±20% jitter，
   避免 fleet 同步扫 `/proc`。
 - 不读 `cmdline`、不读 `smaps_rollup`，不做 `--version` 探测。
+- “CLI 是否有存活子进程”只在真要挂起前（Layer 1 连续计数达标、Layer 2 回收轮）对相关会话
+  做一次全线程 `children` 读取，平时采样不增加开销。
 
 ## 与 #3252 / #3273 的关系
 

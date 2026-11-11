@@ -767,11 +767,7 @@ import { HerdrBackend } from './adapters/backend/herdr-backend.js';
 import { ZellijBackend } from './adapters/backend/zellij-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import { createGroupIdleCloseSweeper } from './core/group-idle-close-sweeper.js';
-import {
-  sweepIdleWorkersAfterTurnDrain,
-  sweepIdleWorkersByAgeAfterTurnDrain,
-  DEFAULT_MAX_LIVE_WORKERS,
-} from './core/idle-worker-sweeper.js';
+import { sweepIdleWorkersAfterTurnDrain, DEFAULT_MAX_LIVE_WORKERS } from './core/idle-worker-sweeper.js';
 import { resolveIdleSpinSuspendConfig } from './core/idle-spin-config.js';
 import { createIdleSpinSampler } from './core/idle-spin-sampler.js';
 import { createIdleSpinDetector } from './core/idle-spin-detector.js';
@@ -33455,7 +33451,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (process.env.BOTMUX_IDLE_SPIN_SUSPEND === '0') return;
       const liveBotConfig = getBot(cfg.larkAppId).config;
       const resolved = resolveIdleSpinSuspendConfig(liveBotConfig.idleSpinSuspend);
-      if (!resolved.enabled) {
+      // `cliIds` scopes BOTH layers: with no CLI in scope there is nothing
+      // either layer may park, so treat it exactly like `enabled: false`.
+      if (!resolved.enabled || resolved.cliIds.length === 0) {
         idleSpinDetector.reset();
         hostPressureState = INITIAL_HOST_PRESSURE_STATE;
         autoSuspendedInEpisode = 0;
@@ -33463,18 +33461,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
 
       // Layer 1: CPU idle-spin (always samples strict candidates; no host gate).
-      let hostCpuPct = 0;
-      if (resolved.cliIds.length > 0) {
-        const result = await idleSpinDetector.tick(resolved);
-        hostCpuPct = result.hostCpuPct;
-      } else {
-        hostCpuPct = (await idleSpinSampler.sample([])).hostCpuPct;
-      }
+      const hostCpuPct = (await idleSpinDetector.tick(resolved)).hostCpuPct;
 
       // Layer 2: host-pressure backstop. Every daemon judges the host locally
-      // and reclaims ONLY its own idle workers. Per-daemon ownership is what
-      // prevents duplicate reclaim across bots sharing TRAE_HOME; a notifier
-      // fan-out would add a single point of failure without any extra effect.
+      // and reclaims ONLY its own idle workers, and only those Layer 1 itself
+      // may act on (same `cliIds` + TRAE identity, childless CLI) — a host
+      // overload must not park other CLIs' sessions that did not opt in.
+      // Per-daemon ownership is what prevents duplicate reclaim across bots
+      // sharing TRAE_HOME; a notifier fan-out would add a single point of
+      // failure without any extra effect.
       if (!resolved.hostPressure.enabled || process.env.BOTMUX_HOST_PRESSURE_RECLAIM === '0') return;
 
       const tick = await runHostPressureTick({
@@ -33491,15 +33486,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         reclaim: async () => {
           if (idleSpinStopped) return null;
           try {
-            const swept = await sweepIdleWorkersByAgeAfterTurnDrain(cfg.larkAppId, activeSessions, {
-              olderThanMs: Math.max(1, resolved.minIdleMinutes * 60_000),
-              now: Date.now(),
-              reason: 'host_pressure',
-              maxCandidates: resolved.hostPressure.maxSuspendsPerPass,
-              mutationAcquireTimeoutMs: 1_000,
-              shouldAbort: () => idleSpinStopped,
-            });
-            return swept === null ? null : swept.suspended.length;
+            return await idleSpinDetector.reclaimHostPressure(resolved);
           } catch (err) {
             logger.warn(`[host-pressure] reclaim failed: ${err instanceof Error ? err.message : String(err)}`);
             return null;

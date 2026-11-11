@@ -32,7 +32,8 @@ export interface IdleSpinSuspendConfig {
   /** Master switch for BOTH layers. Default true. */
   enabled?: boolean;
   /**
-   * CLI ids this policy may suspend. Default `['traex']`: the TRAE CLI's
+   * CLI ids BOTH layers may suspend (Layer 2 never widens this scope; an empty
+   * list disables both). Default `['traex']`: the TRAE CLI's
    * skills-directory inotify self-excitation is the known root cause; other
    * CLIs (notably claude-code keep-alive / idle auto-compact) have legitimate
    * idle CPU and must opt in explicitly.

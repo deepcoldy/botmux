@@ -1896,7 +1896,9 @@ export interface BotConfig {
    * CPU-driven idle suspension. Layer 1 parks an idle worker whose CLI
    * process subtree keeps burning CPU (default: TRAE only, 20% of one core
    * for 3 consecutive samples after 5 minutes idle). Layer 2 is the
-   * host-pressure backstop. Unset = conservative defaults; set
+   * host-pressure backstop over the same `cliIds` scope. Neither layer parks
+   * a CLI that still has live child processes (background tasks). Unset =
+   * conservative defaults; set
    * `{ enabled: false }` to opt out. See core/idle-spin-config.ts.
    */
   idleSpinSuspend?: import('./core/idle-spin-config.js').IdleSpinSuspendConfig;

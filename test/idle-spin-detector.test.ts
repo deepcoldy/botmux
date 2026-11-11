@@ -64,8 +64,16 @@ function makeDs(sessionId: string, overrides: Record<string, any> = {}) {
   } as any;
 }
 
-function fakeSampler(readCpu: () => Record<string, number>): IdleSpinSampler {
+function fakeSampler(
+  readCpu: () => Record<string, number>,
+  readChildren: () => Record<string, number | null> = () => ({}),
+): IdleSpinSampler {
   return {
+    liveCliChildren(targets) {
+      const children = readChildren();
+      // Default: a childless CLI (an idle TRAE with no background task).
+      return new Map(targets.map(t => [t.sessionId, t.sessionId in children ? children[t.sessionId] : 0] as const));
+    },
     async sample(targets): Promise<IdleSpinSample> {
       const cpu = readCpu();
       const sessions = new Map();
@@ -358,6 +366,7 @@ describe('idle-spin detector', () => {
           invalid: new Map(),
         };
       },
+      liveCliChildren: targets => new Map(targets.map(t => [t.sessionId, 0] as const)),
       reset() { /* no-op */ },
     };
     const detector = createIdleSpinDetector({
@@ -459,5 +468,100 @@ describe('idle-spin detector', () => {
     // Each detector only ever saw its own map.
     expect(detectorA.streaks().has('other')).toBe(false);
     expect(detectorB.streaks().has('own')).toBe(false);
+  });
+
+  it('does not park a spinning CLI that still has a live child (background task), then needs a fresh streak', async () => {
+    // TRAE `background_shell` tasks stay children of the traex process after
+    // the turn ends; the screen is idle and TRAE reports no background-task
+    // count, so only the process tree shows the work a suspend would kill.
+    const ds = makeDs('bg');
+    const sessions = new Map([['bg', ds]]);
+    const children: Record<string, number | null> = { bg: 1 };
+    const detector = createIdleSpinDetector({
+      larkAppId: 'cli_test',
+      activeSessions: sessions,
+      defaultCliId: 'traex',
+      sampler: fakeSampler(() => ({ bg: 200 }), () => children),
+      observeInstall: () => ({ state: 'current' }),
+      now: () => now,
+    });
+    await detector.tick(config());
+    const vetoed = await detector.tick(config());
+    expect(vetoed.busyChildren).toBe(1);
+    expect(vetoed.suspended).toBe(0);
+    expect(ds.worker).not.toBeNull();
+    expect(detector.streaks().has('bg')).toBe(false);
+
+    children.bg = 0; // the background task finished
+    const fresh = await detector.tick(config());
+    expect(fresh.suspended).toBe(0);
+    expect(ds.worker).not.toBeNull();
+    const parked = await detector.tick(config());
+    expect(parked.suspended).toBe(1);
+    expect(ds.worker).toBeNull();
+  });
+
+  it('fails closed when the CLI children cannot be read', async () => {
+    const ds = makeDs('unreadable');
+    const sessions = new Map([['unreadable', ds]]);
+    const detector = createIdleSpinDetector({
+      larkAppId: 'cli_test',
+      activeSessions: sessions,
+      defaultCliId: 'traex',
+      sampler: fakeSampler(() => ({ unreadable: 200 }), () => ({ unreadable: null })),
+      observeInstall: () => ({ state: 'current' }),
+      now: () => now,
+    });
+    for (let i = 0; i < 4; i++) await detector.tick(config());
+    expect(ds.worker).not.toBeNull();
+  });
+
+  it('host-pressure reclaim parks only the sessions Layer 1 may act on', async () => {
+    const traex = makeDs('traex-idle');
+    const claude = makeDs('claude-idle', {
+      session: { cliId: 'claude-code' },
+      initConfig: { backendType: 'tmux', cliId: 'claude-code' },
+    });
+    const stale = makeDs('traex-stale');
+    const withTask = makeDs('traex-bg');
+    const sessions = new Map([
+      ['traex-idle', traex], ['claude-idle', claude], ['traex-stale', stale], ['traex-bg', withTask],
+    ]);
+    const detector = createIdleSpinDetector({
+      larkAppId: 'cli_test',
+      activeSessions: sessions,
+      defaultCliId: 'traex',
+      // No CPU at all: Layer 2 drops the per-session CPU bar, nothing else.
+      sampler: fakeSampler(() => ({}), () => ({ 'traex-bg': 1 })),
+      observeInstall: (ds: any) => ({ state: ds.session.sessionId === 'traex-stale' ? 'stale' : 'current' }),
+      now: () => now,
+    });
+
+    expect(await detector.reclaimHostPressure(config())).toBe(1);
+    expect(traex.worker).toBeNull();
+    // Default `cliIds: ['traex']`: an idle Claude Code session is out of scope.
+    expect(claude.worker).not.toBeNull();
+    // Same identity and background-task guards as Layer 1.
+    expect(stale.worker).not.toBeNull();
+    expect(withTask.worker).not.toBeNull();
+
+    // Explicit opt-in widens Layer 2 exactly like Layer 1.
+    expect(await detector.reclaimHostPressure(config({ cliIds: ['traex', 'claude-code'] }))).toBe(1);
+    expect(claude.worker).toBeNull();
+    expect(await detector.reclaimHostPressure(config({ cliIds: [] }))).toBe(0);
+  });
+
+  it('host-pressure reclaim honours maxSuspendsPerPass', async () => {
+    const sessions = new Map(['a', 'b', 'c'].map(id => [id, makeDs(id)] as const));
+    const detector = createIdleSpinDetector({
+      larkAppId: 'cli_test',
+      activeSessions: sessions,
+      defaultCliId: 'traex',
+      sampler: fakeSampler(() => ({})),
+      observeInstall: () => ({ state: 'current' }),
+      now: () => now,
+    });
+    expect(await detector.reclaimHostPressure(config({ hostPressure: { maxSuspendsPerPass: 2 } }))).toBe(2);
+    expect([...sessions.values()].filter(ds => ds.worker === null)).toHaveLength(2);
   });
 });

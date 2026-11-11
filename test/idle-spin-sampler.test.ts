@@ -293,6 +293,82 @@ describe('idle-spin sampler', () => {
     expect(sample.sessions.get('s1')?.pids).toBe(2);
   });
 
+  it('counts live CLI children, excluding the other roots and the worker subtree', async () => {
+    const root = makeProcRoot([
+      // cliPid 100 → background shell 101, plus the engine root 200.
+      { pid: 100, ppid: 1, start: 1000, utime: 0, stime: 0, children: [101, 200] },
+      { pid: 101, ppid: 100, start: 1001, utime: 0, stime: 0 },
+      { pid: 200, ppid: 100, start: 2000, utime: 0, stime: 0 },
+      // The worker's own helpers are not CLI work.
+      { pid: 300, ppid: 1, start: 3000, utime: 0, stime: 0, children: [301] },
+      { pid: 301, ppid: 300, start: 3001, utime: 0, stime: 0 },
+    ]);
+    const sampler = createIdleSpinSampler({ procRoot: root, cpuCount: 4, platform: 'linux' });
+    const targets = [{
+      sessionId: 's1',
+      workerPid: 300,
+      attestation: { cliPid: 100, cliProcStart: '1000', enginePid: 200, engineProcStart: '2000' },
+    }];
+    expect(sampler.liveCliChildren(targets).get('s1')).toBe(1);
+    writeFileSync(join(root, '100', 'task', '100', 'children'), '200');
+    expect(sampler.liveCliChildren(targets).get('s1')).toBe(0);
+  });
+
+  it('reads CLI children fresh even when the cached subtree has not seen them yet', async () => {
+    const root = makeProcRoot([
+      { pid: 100, ppid: 1, start: 1000, utime: 0, stime: 0, childThreads: [105] },
+    ]);
+    const sampler = createIdleSpinSampler({ procRoot: root, cpuCount: 4, platform: 'linux' });
+    const targets = [{ sessionId: 's1', attestation: { cliPid: 100, cliProcStart: '1000' } }];
+    await sampler.sample(targets);
+    writeFileSync(join(root, 'stat'), 'cpu  11000 0 0 0 0 0 0 0 0 0\n');
+    await sampler.sample(targets);
+    // A worker thread (not the main thread) starts a background shell after
+    // the subtree was cached; an ordinary sample would not rescan thread 105.
+    mkdirSync(join(root, '101', 'task', '101'), { recursive: true });
+    writeFileSync(join(root, '101', 'stat'), statLine({ pid: 101, ppid: 100, start: 1001, utime: 0, stime: 0 }));
+    writeFileSync(join(root, '101', 'task', '101', 'children'), '');
+    writeFileSync(join(root, '100', 'task', '105', 'children'), '101');
+    expect(sampler.liveCliChildren(targets).get('s1')).toBe(1);
+  });
+
+  it('fails closed (null) for a recycled CLI root or a missing attestation pid', async () => {
+    const root = makeProcRoot([
+      { pid: 100, ppid: 1, start: 1000, utime: 0, stime: 0 },
+    ]);
+    const sampler = createIdleSpinSampler({ procRoot: root, cpuCount: 4, platform: 'linux' });
+    const counts = sampler.liveCliChildren([
+      { sessionId: 'recycled', attestation: { cliPid: 100, cliProcStart: '999' } },
+      { sessionId: 'gone', attestation: { cliPid: 4242, cliProcStart: '1' } },
+      { sessionId: 'unproven', workerPid: 100 },
+    ]);
+    expect(counts.get('recycled')).toBeNull();
+    expect(counts.get('gone')).toBeNull();
+    expect(counts.get('unproven')).toBeNull();
+    const darwin = createIdleSpinSampler({ procRoot: root, platform: 'darwin' });
+    expect(darwin.liveCliChildren([{ sessionId: 'mac', attestation: { cliPid: 100, cliProcStart: '1000' } }]).get('mac')).toBeNull();
+  });
+
+  it('a host-only sample does not inflate the next session sample', async () => {
+    const root = makeProcRoot([
+      { pid: 100, ppid: 1, start: 1000, utime: 0, stime: 0 },
+    ]);
+    const sampler = createIdleSpinSampler({ procRoot: root, cpuCount: 4, platform: 'linux' });
+    const targets = [{ sessionId: 's1', attestation: { cliPid: 100, cliProcStart: '1000' } }];
+    await sampler.sample(targets);
+    updateTicks(root, 100, 100, 11_000);
+    await sampler.sample([]);
+    updateTicks(root, 100, 200, 12_000);
+    // 100 ticks per 1000 host ticks × 4 cores = 40% in every window. Dividing
+    // the 200-tick pid delta (since the first sample) by the 1000-tick host
+    // delta (since the host-only sample) would report 80%.
+    const afterHostOnly = await sampler.sample(targets);
+    expect(afterHostOnly.sessions.get('s1')?.cpuPercent ?? 0).toBeLessThanOrEqual(40);
+    updateTicks(root, 100, 300, 13_000);
+    const next = await sampler.sample(targets);
+    expect(next.sessions.get('s1')?.cpuPercent).toBeCloseTo(40, 5);
+  });
+
   it('is unsupported (fail closed) on non-Linux platforms', async () => {
     const sampler = createIdleSpinSampler({ platform: 'darwin' });
     const sample = await sampler.sample([{ sessionId: 's1' }]);
@@ -323,6 +399,27 @@ describe('idle-spin sampler', () => {
     } finally {
       try { process.kill(-pid, 'SIGKILL'); } catch { /* already gone */ }
       try { shell.kill('SIGKILL'); } catch { /* already gone */ }
+    }
+  });
+
+  it.skipIf(process.platform !== 'linux')('sees a real live child of the CLI process (background-task shape)', async () => {
+    // `sh` keeps running after `sleep` returns, so it cannot exec it away:
+    // the same shape as a TRAE background shell left under the traex process.
+    const withChild = spawn('sh', ['-c', 'sleep 30; true'], { detached: true, stdio: 'ignore' });
+    const childless = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+    try {
+      await new Promise(resolve => setTimeout(resolve, 150));
+      const counts = createIdleSpinSampler().liveCliChildren([
+        { sessionId: 'with-child', attestation: { cliPid: withChild.pid!, cliProcStart: readProcessStartIdentity(withChild.pid!) } },
+        { sessionId: 'childless', attestation: { cliPid: childless.pid!, cliProcStart: readProcessStartIdentity(childless.pid!) } },
+      ]);
+      expect(counts.get('with-child')).toBe(1);
+      expect(counts.get('childless')).toBe(0);
+    } finally {
+      for (const child of [withChild, childless]) {
+        try { process.kill(-child.pid!, 'SIGKILL'); } catch { /* already gone */ }
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      }
     }
   });
 });

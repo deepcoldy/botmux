@@ -87,6 +87,25 @@ export interface IdleSpinSampler {
     targets: readonly IdleSpinTarget[],
     markers?: ReadonlyMap<number, CliMarkerInfo>,
   ): Promise<IdleSpinSample>;
+  /**
+   * Live direct child processes of each target's CLI roots (attestation
+   * `cliPid` / `enginePid`, or stamped markers when attestation is absent),
+   * excluding the other roots of the same session and the worker. Read fresh
+   * (full thread scan, no cache) because it gates a destructive action.
+   *
+   * A CLI child is a tool shell, a background task (TRAE `background_shell`,
+   * dev server, build, watcher), an MCP server, …: work a suspend would kill.
+   * botmux has no structured background-task signal for most CLIs (TRAE
+   * included), so a positive count must veto an automatic suspend.
+   *
+   * `null` = the roots cannot be proven or their children cannot be read
+   * (missing/recycled root, unreadable task dir, thread cap, non-Linux): the
+   * caller must fail closed.
+   */
+  liveCliChildren(
+    targets: readonly IdleSpinTarget[],
+    markers?: ReadonlyMap<number, CliMarkerInfo>,
+  ): Map<string, number | null>;
   reset(): void;
 }
 
@@ -329,8 +348,8 @@ export function createIdleSpinSampler(opts: IdleSpinSamplerOptions = {}): IdleSp
   function rootsForTarget(
     target: IdleSpinTarget,
     markersBySession: Map<string, MarkerWithPid[]>,
-  ): { roots: Array<{ pid: number; procStart?: string }>; confidence: IdleSpinConfidence } | { invalid: string } {
-    const roots: Array<{ pid: number; procStart?: string }> = [];
+  ): { roots: Array<{ pid: number; procStart?: string; worker?: true }>; confidence: IdleSpinConfidence } | { invalid: string } {
+    const roots: Array<{ pid: number; procStart?: string; worker?: true }> = [];
     let confidence: IdleSpinConfidence = 'worker';
 
     if (target.attestation) {
@@ -365,9 +384,63 @@ export function createIdleSpinSampler(opts: IdleSpinSamplerOptions = {}): IdleSp
     }
 
     if (target.workerPid !== undefined) {
-      roots.push({ pid: target.workerPid });
+      roots.push({ pid: target.workerPid, worker: true });
     }
     return { roots, confidence };
+  }
+
+  function groupMarkersBySession(
+    markers: ReadonlyMap<number, CliMarkerInfo> | undefined,
+  ): Map<string, MarkerWithPid[]> {
+    const markersBySession = new Map<string, MarkerWithPid[]>();
+    if (markers) {
+      for (const [pid, marker] of markers) {
+        const list = markersBySession.get(marker.sessionId) ?? [];
+        list.push({ ...marker, pid });
+        markersBySession.set(marker.sessionId, list);
+      }
+    }
+    return markersBySession;
+  }
+
+  function liveCliChildren(
+    targets: readonly IdleSpinTarget[],
+    markers?: ReadonlyMap<number, CliMarkerInfo>,
+  ): Map<string, number | null> {
+    const out = new Map<string, number | null>();
+    if (runtimePlatform !== 'linux') {
+      for (const target of targets) out.set(target.sessionId, null);
+      return out;
+    }
+    // Fresh per call: the no-children-file fallback must not reuse a ppid map
+    // built for an earlier sample.
+    fallbackChildren = undefined;
+    const markersBySession = groupMarkersBySession(markers);
+    for (const target of targets) {
+      const rootInfo = rootsForTarget(target, markersBySession);
+      if ('invalid' in rootInfo) {
+        out.set(target.sessionId, null);
+        continue;
+      }
+      const cliRoots = rootInfo.roots.filter(root => !root.worker);
+      const rootPids = new Set(rootInfo.roots.map(root => root.pid));
+      let total = 0;
+      let provable = cliRoots.length > 0;
+      for (const root of cliRoots) {
+        const row = readStatRow(root.pid);
+        // A vanished or recycled root proves nothing about the CLI's children.
+        const children = row && (root.procStart === undefined || row.startTicks === root.procStart)
+          ? readChildren(root.pid, true)
+          : null;
+        if (children === null) {
+          provable = false;
+          break;
+        }
+        total += children.filter(pid => !rootPids.has(pid)).length;
+      }
+      out.set(target.sessionId, provable ? total : null);
+    }
+    return out;
   }
 
   async function sample(
@@ -394,6 +467,10 @@ export function createIdleSpinSampler(opts: IdleSpinSamplerOptions = {}): IdleSp
     if (targets.length === 0) {
       previousTotalCpuTicks = system.total;
       previousIdleCpuTicks = system.idle;
+      // A host-only sample moves the host baseline; per-pid deltas measured
+      // against an OLDER pid baseline would then be divided by this shorter
+      // host window and inflate session CPU. Drop the pid baseline with it.
+      previousPids = new Map();
       return {
         supported: true,
         sampledAt,
@@ -407,14 +484,7 @@ export function createIdleSpinSampler(opts: IdleSpinSamplerOptions = {}): IdleSp
     sampleCount += 1;
     const fullThreadScan = sampleCount % fullThreadScanEverySamples === 1;
 
-    const markersBySession = new Map<string, MarkerWithPid[]>();
-    if (markers) {
-      for (const [pid, marker] of markers) {
-        const list = markersBySession.get(marker.sessionId) ?? [];
-        list.push({ ...marker, pid });
-        markersBySession.set(marker.sessionId, list);
-      }
-    }
+    const markersBySession = groupMarkersBySession(markers);
 
     const invalid = new Map<string, string>();
     const currentRows = new Map<number, ProcTickRow>();
@@ -578,6 +648,7 @@ export function createIdleSpinSampler(opts: IdleSpinSamplerOptions = {}): IdleSp
 
   return {
     sample,
+    liveCliChildren,
     reset() {
       threadCache.clear();
       treeCache.clear();

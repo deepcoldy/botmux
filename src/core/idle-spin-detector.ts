@@ -33,12 +33,26 @@ export interface IdleSpinTickResult {
   suspended: number;
   invalid: number;
   gateBusy: boolean;
+  /** Over-threshold sessions NOT suspended because their CLI still has live
+   *  child processes (background task, tool shell, MCP server…) or the
+   *  children could not be read. */
+  busyChildren: number;
   /** Host-wide CPU utilization from this tick's /proc/stat delta. */
   hostCpuPct: number;
 }
 
 export interface IdleSpinDetector {
   tick(config: ResolvedIdleSpinSuspendConfig): Promise<IdleSpinTickResult>;
+  /**
+   * One host-pressure (Layer 2) reclaim pass. Parks at most
+   * `hostPressure.maxSuspendsPerPass` of the SAME sessions Layer 1 may act on
+   * (strict idle selector ∩ `cliIds` ∩ proven TRAE identity) whose CLI has no
+   * live child process. Layer 2 only drops the per-session CPU requirement; it
+   * never widens the CLI scope, so with the default `cliIds: ['traex']` no
+   * other CLI's idle session is touched by a host overload.
+   * Returns the number parked, or null when the bot gate stayed busy.
+   */
+  reclaimHostPressure(config: ResolvedIdleSpinSuspendConfig): Promise<number | null>;
   reset(): void;
   /** Test/diagnostics view: sessionId → consecutive over-threshold samples. */
   streaks(): ReadonlyMap<string, number>;
@@ -51,6 +65,7 @@ const EMPTY_RESULT: IdleSpinTickResult = {
   suspended: 0,
   invalid: 0,
   gateBusy: false,
+  busyChildren: 0,
   hostCpuPct: 0,
 };
 
@@ -94,6 +109,66 @@ export function createIdleSpinDetector(deps: IdleSpinDetectorDeps): IdleSpinDete
     lastConfigKey = '';
   }
 
+  /** Strict idle candidates narrowed to `cliIds` and a proven TRAE identity.
+   *  Shared by Layer 1 and Layer 2 so the two can never disagree on scope. */
+  function selectEligible(
+    config: ResolvedIdleSpinSuspendConfig,
+    at: number,
+  ): { strictCount: number; eligible: Array<{ sessionId: string; ds: DaemonSession }> } {
+    const strictCandidates = selectIdleSuspendCandidates(deps.activeSessions, {
+      olderThanMs: Math.max(1, config.minIdleMinutes * 60_000),
+      now: at,
+    });
+    const bySessionId = new Map(
+      [...deps.activeSessions.values()].map(ds => [ds.session.sessionId, ds] as const),
+    );
+    const eligible: Array<{ sessionId: string; ds: DaemonSession }> = [];
+    for (const candidate of strictCandidates) {
+      const ds = bySessionId.get(candidate.sessionId);
+      if (!ds) continue;
+      const cliId = effectiveCliId(ds, deps.defaultCliId);
+      if (!cliId || !config.cliIds.includes(cliId)) continue;
+      // Pinned old installs and unknown process identities must never be
+      // reclaimed automatically. `observeTraexInstall` is cached for 15s and
+      // never runs a `--version` probe.
+      if (cliId === 'traex') {
+        const observation = (deps.observeInstall ?? observeTraexInstall)(ds, cliId, at);
+        if (observation.state !== 'current' && observation.state !== 'not-traex') continue;
+      }
+      eligible.push({ sessionId: candidate.sessionId, ds });
+    }
+    return { strictCount: strictCandidates.length, eligible };
+  }
+
+  function targetFor(sessionId: string, ds: DaemonSession): IdleSpinTarget {
+    const att = ds.localProcessAttestation;
+    return {
+      sessionId,
+      ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
+      ...(ds.workerGeneration !== undefined ? { workerGeneration: ds.workerGeneration } : {}),
+      ...(att
+        ? {
+          attestation: {
+            ...(att.workerGeneration !== undefined ? { workerGeneration: att.workerGeneration } : {}),
+            ...(att.cliPid !== undefined ? { cliPid: att.cliPid } : {}),
+            ...(att.cliProcStart !== undefined ? { cliProcStart: att.cliProcStart } : {}),
+            ...(att.enginePid !== undefined ? { enginePid: att.enginePid } : {}),
+            ...(att.engineProcStart !== undefined ? { engineProcStart: att.engineProcStart } : {}),
+          },
+        }
+        : {}),
+    };
+  }
+
+  function readMarkers(): ReadonlyMap<number, CliMarkerInfo> | undefined {
+    try {
+      return deps.readMarkers?.();
+    } catch (err) {
+      logger.warn(`[idle-spin] marker read failed: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+  }
+
   async function tick(config: ResolvedIdleSpinSuspendConfig): Promise<IdleSpinTickResult> {
     if (!config.enabled) {
       streaks.clear();
@@ -113,64 +188,18 @@ export function createIdleSpinDetector(deps: IdleSpinDetectorDeps): IdleSpinDete
 
     const at = now();
     const olderThanMs = Math.max(1, config.minIdleMinutes * 60_000);
-    const strictCandidates = selectIdleSuspendCandidates(deps.activeSessions, {
-      olderThanMs,
-      now: at,
-    });
-    const bySessionId = new Map(
-      [...deps.activeSessions.values()].map(ds => [ds.session.sessionId, ds] as const),
-    );
-
-    const eligible: Array<{ sessionId: string; ds: DaemonSession }> = [];
-    for (const candidate of strictCandidates) {
-      const ds = bySessionId.get(candidate.sessionId);
-      if (!ds) continue;
-      const cliId = effectiveCliId(ds, deps.defaultCliId);
-      if (!cliId || !config.cliIds.includes(cliId)) continue;
-      // Pinned old installs and unknown process identities must never be
-      // reclaimed automatically. `observeTraexInstall` is cached for 15s and
-      // never runs a `--version` probe.
-      if (cliId === 'traex') {
-        const observation = (deps.observeInstall ?? observeTraexInstall)(ds, cliId, at);
-        if (observation.state !== 'current' && observation.state !== 'not-traex') continue;
-      }
-      eligible.push({ sessionId: candidate.sessionId, ds });
-    }
+    const { strictCount, eligible } = selectEligible(config, at);
 
     const eligibleIds = new Set(eligible.map(entry => entry.sessionId));
     for (const sessionId of [...streaks.keys()]) {
       if (!eligibleIds.has(sessionId)) streaks.delete(sessionId);
     }
     if (eligible.length === 0) {
-      return { ...EMPTY_RESULT, candidates: strictCandidates.length };
+      return { ...EMPTY_RESULT, candidates: strictCount };
     }
 
-    const targets: IdleSpinTarget[] = eligible.map(({ sessionId, ds }) => {
-      const att = ds.localProcessAttestation;
-      return {
-        sessionId,
-        ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
-        ...(ds.workerGeneration !== undefined ? { workerGeneration: ds.workerGeneration } : {}),
-        ...(att
-          ? {
-            attestation: {
-              ...(att.workerGeneration !== undefined ? { workerGeneration: att.workerGeneration } : {}),
-              ...(att.cliPid !== undefined ? { cliPid: att.cliPid } : {}),
-              ...(att.cliProcStart !== undefined ? { cliProcStart: att.cliProcStart } : {}),
-              ...(att.enginePid !== undefined ? { enginePid: att.enginePid } : {}),
-              ...(att.engineProcStart !== undefined ? { engineProcStart: att.engineProcStart } : {}),
-            },
-          }
-          : {}),
-      };
-    });
-
-    let markers: ReadonlyMap<number, CliMarkerInfo> | undefined;
-    try {
-      markers = deps.readMarkers?.();
-    } catch (err) {
-      logger.warn(`[idle-spin] marker read failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    const targets = eligible.map(({ sessionId, ds }) => targetFor(sessionId, ds));
+    const markers = readMarkers();
 
     const sample = await deps.sampler.sample(targets, markers);
     if (!sample.supported) {
@@ -194,10 +223,29 @@ export function createIdleSpinDetector(deps: IdleSpinDetectorDeps): IdleSpinDete
       if (count >= config.consecutiveSamples) overThreshold += 1;
     }
 
-    const victims = eligible
+    const overIds = eligible
       .filter(({ sessionId }) => (streaks.get(sessionId)?.count ?? 0) >= config.consecutiveSamples)
-      .slice(0, config.maxSuspendsPerSample)
       .map(entry => entry.sessionId);
+    // Veto before acting: high subtree CPU is ALSO what an idle CLI looks like
+    // while a background task it started (TRAE `background_shell`, dev server,
+    // build, watcher) keeps running. TRAE reports no structured background-task
+    // count, so the strict selector cannot see that work; a suspend would kill
+    // it. Read the CLI's children fresh and only park a childless CLI.
+    const childCounts = overIds.length > 0
+      ? deps.sampler.liveCliChildren(targets.filter(target => overIds.includes(target.sessionId)), markers)
+      : new Map<string, number | null>();
+    let busyChildren = 0;
+    const victims: string[] = [];
+    for (const sessionId of overIds) {
+      if (childCounts.get(sessionId) !== 0) {
+        busyChildren += 1;
+        // Start over once the work is gone: the session must then show
+        // `consecutiveSamples` fresh over-threshold samples on its own.
+        streaks.delete(sessionId);
+        continue;
+      }
+      if (victims.length < config.maxSuspendsPerSample) victims.push(sessionId);
+    }
     if (victims.length === 0) {
       return {
         candidates: eligible.length,
@@ -206,6 +254,7 @@ export function createIdleSpinDetector(deps: IdleSpinDetectorDeps): IdleSpinDete
         suspended: 0,
         invalid: sample.invalid.size,
         gateBusy: false,
+        busyChildren,
         hostCpuPct: sample.hostCpuPct,
       };
     }
@@ -220,6 +269,7 @@ export function createIdleSpinDetector(deps: IdleSpinDetectorDeps): IdleSpinDete
         suspended: 0,
         invalid: sample.invalid.size,
         gateBusy: false,
+        busyChildren,
         hostCpuPct: sample.hostCpuPct,
       };
     }
@@ -249,6 +299,7 @@ export function createIdleSpinDetector(deps: IdleSpinDetectorDeps): IdleSpinDete
         suspended: 0,
         invalid: sample.invalid.size,
         gateBusy: true,
+        busyChildren,
         hostCpuPct: sample.hostCpuPct,
       };
     }
@@ -270,12 +321,51 @@ export function createIdleSpinDetector(deps: IdleSpinDetectorDeps): IdleSpinDete
       suspended: result.suspended.length,
       invalid: sample.invalid.size,
       gateBusy: false,
+      busyChildren,
       hostCpuPct: sample.hostCpuPct,
     };
   }
 
+  function hostPressureCandidates(config: ResolvedIdleSpinSuspendConfig): ReadonlySet<string> {
+    if (!config.enabled || config.cliIds.length === 0) return new Set();
+    const { eligible } = selectEligible(config, now());
+    if (eligible.length === 0) return new Set();
+    const counts = deps.sampler.liveCliChildren(
+      eligible.map(({ sessionId, ds }) => targetFor(sessionId, ds)),
+      readMarkers(),
+    );
+    return new Set(eligible
+      .map(entry => entry.sessionId)
+      .filter(sessionId => counts.get(sessionId) === 0));
+  }
+
+  async function reclaimHostPressure(config: ResolvedIdleSpinSuspendConfig): Promise<number | null> {
+    if (deps.shouldAbort?.()) return null;
+    const selectIds = hostPressureCandidates(config);
+    if (selectIds.size === 0) return 0;
+    const result = await suspendSelectedIdleCandidatesAfterTurnDrain(
+      deps.larkAppId,
+      deps.activeSessions,
+      selectIds,
+      {
+        olderThanMs: Math.max(1, config.minIdleMinutes * 60_000),
+        now: now(),
+        reason: 'host_pressure',
+        maxCandidates: config.hostPressure.maxSuspendsPerPass,
+        ...(deps.mutationAcquireTimeoutMs !== undefined
+          ? { mutationAcquireTimeoutMs: deps.mutationAcquireTimeoutMs }
+          : {}),
+        ...(deps.shouldAbort ? { shouldAbort: deps.shouldAbort } : {}),
+      },
+    );
+    if (result === null) return null;
+    for (const entry of result.suspended) streaks.delete(entry.sessionId);
+    return result.suspended.length;
+  }
+
   return {
     tick,
+    reclaimHostPressure,
     reset,
     streaks: () => new Map([...streaks].map(([sessionId, entry]) => [sessionId, entry.count] as const)),
   };
