@@ -89,6 +89,7 @@ export interface GroupCollaborationModeResponse {
     coordinatorAppId?: string;
     workerAppIds?: string[];
     autoEnrollWorkers?: boolean;
+    importedSessionPolicy?: 'ignore' | 'notify';
     progressCard?: ProjectProgressCardConfig;
   };
   project: ProjectGroupRuntimeSummary | null;
@@ -252,12 +253,13 @@ export async function setGroupPinStreamingCard(
 export async function saveGroupCollaborationMode(
   chatId: string,
   input:
-    | { mode: 'standard' }
+    | { mode: 'standard'; importedSessionPolicy?: 'ignore' | 'notify' }
     | {
         mode: 'project';
         coordinatorAppId: string;
         workerAppIds: string[];
         autoEnrollWorkers: boolean;
+        importedSessionPolicy?: 'ignore' | 'notify';
         progressCard: ProjectProgressCardConfig;
       },
 ): Promise<GroupCollaborationModeResponse> {

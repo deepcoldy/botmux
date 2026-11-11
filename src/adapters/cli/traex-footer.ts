@@ -129,7 +129,19 @@ export function traexRestoredComposerReady(
       && startupRows.some(row => /^[ \t]*permissions:[ \t]+\S/.test(row))
     ))
     && !startupRows.some(row => /(?:model|directory):[ \t]*loading\b/i.test(row));
-  if (!repositoryNotice && !/^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context (?:\d+% (?:left|used)|—)(?: · [^\r\n]*)?[ \t]*$/.test(footer[0]!)) return false;
+  // TraeX 0.214.1 cold start draws the empty composer with a bare shortcut
+  // hint before the model/context footer resolves (measured: the model list
+  // fetch can take tens of seconds, leaving this frame on screen past the
+  // first-prompt hard timeout). Accept it only when the single footer row
+  // consists solely of native hint tokens. Recorded blocking pages (folder
+  // trust, migration, hooks review, sign-in, session lock) replace the
+  // composer and fail the empty-composer hint check above; anything rendered
+  // above an intact composer is covered by the worker's startup-blocker
+  // probes and its flush-time re-checks, not by this predicate.
+  const shortcutOnlyFooter = footer.length === 1
+    && /^[ \t]*(?:\? for shortcuts|← for agents)(?:[ \t]+·[ \t]+(?:\? for shortcuts|← for agents))*[ \t]*$/.test(footer[0]!);
+  if (!repositoryNotice && !shortcutOnlyFooter
+    && !/^[ \t]*\S[^│\r\n]* · (?:[^│\r\n]* · )?Context (?:\d+% (?:left|used)|—)(?: · [^\r\n]*)?[ \t]*$/.test(footer[0]!)) return false;
   // Only the model cell is initialization evidence; a cwd named "loading"
   // in a later footer cell must not strand an otherwise initialized prompt.
   if (!repositoryNotice && /\bloading\b/i.test(footer[0]!.split(' · ', 1)[0]!)) return false;

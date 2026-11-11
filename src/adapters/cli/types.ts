@@ -310,6 +310,8 @@ export interface CliAdapter {
      *  Missing or "unknown" means "not probed": adapters must then behave as if the
      *  flag is unsupported (keep the old argv) rather than guess. */
     cliVersion?: string;
+    /** True when attaching to an existing process; its version may differ from the installation. */
+    reattach?: boolean;
     /** Codex App only: restricted local browser extension bridge. */
     codexBrowser?: import('../../core/codex-browser-config.js').CodexBrowserConfig;
     /** Codex-family only: when true (default from the global `bypassCodexHookTrust`

@@ -298,6 +298,18 @@ import { createGroupMessageRecallService } from '../services/group-message-recal
 import { GroupRecallError } from '../services/group-message-recall.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
 import { readProjectGroup } from '../services/project-group-store.js';
+import { writeGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
+import {
+  localProjectAttachmentSource, getProjectAttachmentSource, projectHumanCallerKey, projectSessionOwnerKey,
+  projectWorkstreamAttachments, setProjectWorkstreamPool,
+} from '../services/project-workstream-runtime.js';
+import { issueProjectSourceGrant, verifyProjectSourceGrant } from '../services/project-workstream-authority.js';
+import { readProjectAttachmentRecord } from '../services/project-workstream-attachments.js';
+import { loadOrCreateDispatchReportBindingSecret } from './dispatch-report-binding.js';
+import { dispatchCallerFromReply } from './dispatch-user-delegation.js';
+import { projectImportSnapshotFromSource } from '../services/project-import-snapshot.js';
+import { projectImportOperationId } from '../services/project-import-notifications.js';
+import { createHash } from 'node:crypto';
 import {
   evaluateProjectDispatchPolicy,
   readGroupCollaborationMode,
@@ -1266,7 +1278,7 @@ export function routeHasNarrowUntrustedAuth(method: string, pathname: string): b
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|dispatch-tree|decision-board|decision-board\/upload|project-dispatch-policy|continuation|durable-send|turn-delivery|reply-card-ready|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager|rename|project|project-workstream|dispatch-tree|decision-board|decision-board\/upload|project-dispatch-policy|continuation|durable-send|turn-delivery|reply-card-ready|feedback-bind|deferred-topic|link-refs\/register|link-refs\/resolve|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -1646,8 +1658,9 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
         tool: tool === 'codebase' ? 'bytedcli' : tool, delegated: delegation, storageModel: 'proven',
       });
     }
-    // A refusal published because the platform was unreachable when the turn
-    // was prepared gets another chance on this call (rate-limited, CAS-guarded).
+    // A refusal published when the turn was prepared — the platform was
+    // unreachable, or the person had not authorized yet — gets another chance
+    // on this call (rate-limited per refusal kind, CAS-guarded).
     // The Codebase companion is published together with bytedcli.
     //
     // The policy is passed as a READER, not a config: a Dashboard edit replaces
@@ -2354,16 +2367,29 @@ ipcRoute('POST', `/api/sessions/:sessionId/${RELAYED_TURN_DELIVERY_ROUTE}`, asyn
 ipcRoute('POST', '/api/sessions/:sessionId/feedback-bind', async (req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
   let body: Record<string, unknown>;
-  try { body = await readJsonBody<Record<string, unknown>>(req, 4096); }
+  const { FEEDBACK_BIND_MAX_BYTES, normalizeFeedbackContext } = await import('../services/feedback-context.js');
+  try { body = await readJsonBody<Record<string, unknown>>(req, FEEDBACK_BIND_MAX_BYTES); }
   catch { return jsonRes(res, 400, { error: 'bad_json' }); }
   const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
   if (!auth.ok || !ds) return jsonRes(res, 403, { error: 'feedback_binding_forbidden' });
-  const turnId = ds.managedTurnOrigin?.turnId;
+  const execution = {
+    turnId: ds.managedTurnOrigin?.turnId,
+    capability: ds.managedTurnOrigin?.capability,
+    dispatchAttempt: ds.managedTurnOrigin?.dispatchAttempt,
+    appId: ds.larkAppId,
+    sessionId: ds.session.sessionId,
+    chatId: ds.chatId,
+    rootMessageId: ds.session.rootMessageId,
+  };
+  const turnId = execution.turnId;
   if (body.expectedTurnId !== turnId) return jsonRes(res, 409, { error: 'feedback_binding_turn_mismatch' });
   if (!turnId || typeof body.sourceMessageId !== 'string' || !/^om_[A-Za-z0-9_-]+$/.test(body.sourceMessageId)
     || !['substantive', 'clarification', 'progress', 'failed'].includes(String(body.answerKind))) {
     return jsonRes(res, 400, { error: 'feedback_binding_invalid' });
   }
+  let context;
+  try { context = normalizeFeedbackContext(body.context); }
+  catch (error) { return jsonRes(res, 400, { error: error instanceof Error ? error.message : 'feedback_context_invalid' }); }
   const detail = await getMessageDetail(ds.larkAppId, body.sourceMessageId, { userCardContent: false });
   const message = detail?.items?.[0] ?? detail;
   if (message?.chat_id !== ds.chatId) return jsonRes(res, 403, { error: 'feedback_binding_wrong_chat' });
@@ -2375,13 +2401,30 @@ ipcRoute('POST', '/api/sessions/:sessionId/feedback-bind', async (req, res, para
   const { FeedbackExtensionStore } = await import('../services/feedback-extension-store.js');
   const store = await FeedbackExtensionStore.open(config.session.dataDir);
   try {
-    if (ds.managedTurnOrigin?.turnId !== turnId || findActiveBySessionId(params.sessionId) !== ds) {
+    if (findActiveBySessionId(params.sessionId) !== ds
+      || !sessionCliIpcAuth(req, ds, params.sessionId, body).ok
+      || ds.managedTurnOrigin?.turnId !== turnId
+      || ds.managedTurnOrigin?.capability !== execution.capability
+      || ds.managedTurnOrigin?.dispatchAttempt !== execution.dispatchAttempt
+      || ds.larkAppId !== execution.appId || ds.session.sessionId !== execution.sessionId
+      || ds.chatId !== execution.chatId || ds.session.rootMessageId !== execution.rootMessageId
+      || ds.session.status === 'closed') {
       return jsonRes(res, 409, { error: 'feedback_binding_turn_mismatch' });
     }
-    store.bindSubject(ds.larkAppId, ds.session.sessionId, turnId, {
-      sourceMessageId: body.sourceMessageId, answerKind: body.answerKind as 'substantive' | 'clarification' | 'progress' | 'failed',
+    try {
+      store.bindSubject(ds.larkAppId, ds.session.sessionId, turnId, {
+        sourceMessageId: body.sourceMessageId, answerKind: body.answerKind as 'substantive' | 'clarification' | 'progress' | 'failed',
+        ...(context === undefined ? {} : { context }),
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === 'feedback_subject_binding_conflict') {
+        return jsonRes(res, 409, { error: error.message });
+      }
+      throw error;
+    }
+    return jsonRes(res, 200, {
+      ok: true, turnId, sourceMessageId: body.sourceMessageId, contextBound: context !== undefined,
     });
-    return jsonRes(res, 200, { ok: true, turnId, sourceMessageId: body.sourceMessageId });
   } finally { store.close(); }
 });
 
@@ -3250,14 +3293,12 @@ ipcRoute('POST', '/api/maintenance/suspend-idle', async (req, res) => {
  */
 ipcRoute('GET', '/api/host-overload/counts', (_req, res) => {
   const stopped = sessionStore.listSessions().filter(s => s.status === 'active' && isSessionStopped(s)).length;
-  let idle = 0;
-  for (const ds of listActiveSessions()) {
-    if (!ds.worker || ds.worker.killed) continue;
-    if (ds.adoptedFrom || ds.initConfig?.adoptMode) continue;
-    if (!isSuspendableBackendType(ds.initConfig?.backendType)) continue;
-    if (ds.lastScreenStatus !== 'idle') continue;
-    idle++;
-  }
+  // Use the SAME strict selector as the manual sweep so the card's「闲置 N」
+  // is exactly the number a click can act on (never a larger, looser count).
+  const registry = getActiveSessionsRegistry();
+  const idle = registry
+    ? selectIdleSuspendCandidates(registry, { olderThanMs: 1, now: Date.now() }).length
+    : 0;
   jsonRes(res, 200, { ok: true, stopped, idle });
 });
 
@@ -3295,22 +3336,31 @@ ipcRoute('POST', '/api/host-overload/sweep', async (req, res) => {
   }
 
   if (mode === 'suspend_idle') {
-    // This daemon's own idle live workers only. Correctness guards mirror the
-    // idle-worker sweeper: never touch adopt sessions or mid-turn (busy) ones.
+    // This daemon's own idle live workers only. Keep the historical async
+    // suspend path (it flushes the session controller) but select candidates
+    // with the SAME strict selector as the operator age sweep and the CPU
+    // policy: never touch adopt, mid-turn, background-task, accepted-input,
+    // scheduled-run, activation, keep-alive or idle-auto-compact sessions.
+    const registry = getActiveSessionsRegistry();
+    if (!registry) return jsonRes(res, 503, { ok: false, error: 'session_registry_unavailable' });
+    const candidates = selectIdleSuspendCandidates(registry, {
+      olderThanMs: 1,
+      now: Date.now(),
+    });
+    const bySessionId = new Map(
+      [...registry.values()].map(ds => [ds.session.sessionId, ds] as const),
+    );
     let affected = 0;
-    for (const ds of listActiveSessions()) {
-      if (!ds.worker || ds.worker.killed) continue;             // no live worker
-      if (ds.adoptedFrom || ds.initConfig?.adoptMode) continue;  // never suspend adopt
-      if (!isSuspendableBackendType(ds.initConfig?.backendType)) continue;
-      if (ds.lastScreenStatus !== 'idle') continue;              // never cut an in-flight reply
-      if (hasUnacceptedCliInput(ds)) continue;                   // nor a message its CLI has not taken yet
+    for (const candidate of candidates) {
+      const ds = bySessionId.get(candidate.sessionId);
+      if (!ds) continue;
       try {
         if (await suspendWorkerAsync(ds, 'host_overload_suspend')) affected++;
       } catch (err) {
-        logger.warn(`[overload-sweep] suspend failed for ${ds.session.sessionId.slice(0, 8)}: ${ipcErrorText(err)}`);
+        logger.warn(`[overload-sweep] suspend failed for ${candidate.sessionId.slice(0, 8)}: ${ipcErrorText(err)}`);
       }
     }
-    logger.info(`[overload-sweep] suspend_idle: suspended ${affected} idle worker(s)`);
+    logger.info(`[overload-sweep] suspend_idle(manual): suspended ${affected} idle worker(s)`);
     return jsonRes(res, 200, { ok: true, mode, affected });
   }
 
@@ -3351,6 +3401,302 @@ function sessionCliIpcAuth(
   });
   return decision.ok ? { ok: true } : { ok: false, error: decision.error };
 }
+
+/** A peer reads only its own authoritative source snapshot; this is not a
+ * model-facing general transcript/session enumeration API. */
+ipcRoute('POST', '/api/project-workstream/source', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBody<Record<string, unknown>>(req, 8192).catch(() => undefined);
+  if (body?.sourceLarkAppId !== cachedLarkAppId || typeof body.sourceSessionId !== 'string') {
+    return jsonRes(res, 404, { ok: false, error: 'source_session_unavailable' });
+  }
+  const source = await localProjectAttachmentSource(cachedLarkAppId, body.sourceSessionId);
+  return source ? jsonRes(res, 200, { ok: true, source })
+    : jsonRes(res, 404, { ok: false, error: 'source_session_unavailable' });
+});
+
+ipcRoute('POST', '/api/sessions/:sessionId/project-workstream', async (req, res, params) => {
+  const body = await readJsonBody<Record<string, unknown>>(req, 16 * 1024).catch(() => undefined);
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  const currentTurnProof = authorizeSessionScopedIpc({
+    trustedHost: false, sessionExists: !!ds, receiverSession: !!ds?.session.vcMeetingReceiver,
+    allowReceiver: false, sessionId: params.sessionId, liveOrigin: ds?.managedTurnOrigin,
+    claimedCapability: typeof body?.originCapability === 'string' ? body.originCapability : undefined,
+    claimedTurnId: typeof body?.originTurnId === 'string' ? body.originTurnId : undefined,
+    claimedDispatchAttempt: typeof body?.originDispatchAttempt === 'number' ? body.originDispatchAttempt : undefined,
+  });
+  if (!currentTurnProof.ok) return jsonRes(res, 403, { ok: false, error: currentTurnProof.error });
+  if (!ds || ds.chatType !== 'group' || ds.session.vcMeetingReceiver || sessionTransportDisabled(ds)) {
+    return jsonRes(res, 403, { ok: false, error: 'project_coordinator_required' });
+  }
+  const turn = ds.managedTurnOrigin?.turnId;
+  const admittedOrigin = ds.managedTurnOrigin;
+  const admittedCapability = admittedOrigin?.capability;
+  const caller = ds.managedTurnOrigin?.trustedCaller
+    ?? (ds.activeInteractiveTurn?.turnId === turn ? ds.activeInteractiveTurn?.caller : undefined)
+    ?? (turn ? dispatchCallerFromReply(ds.larkAppId, ds.session.replyTargets?.[turn]) : undefined);
+  const ownerKey = await projectHumanCallerKey(caller);
+  if (!ownerKey || !caller?.requestUserOpenId
+    || !canOperate(ds.larkAppId, ds.chatId, caller.requestUserOpenId, caller.requestUserUnionId)
+    || findActiveBySessionId(params.sessionId) !== ds || ds.managedTurnOrigin?.turnId !== turn
+    || ds.managedTurnOrigin !== admittedOrigin || ds.managedTurnOrigin?.capability !== admittedCapability) {
+    return jsonRes(res, 403, { ok: false, error: 'project_attachment_actor_unproven' });
+  }
+  if (!body || typeof body.action !== 'string') return jsonRes(res, 400, { ok: false, error: 'invalid_workstream_action' });
+  const fields = new Set(['action', 'sourceSessionId', 'sourceLarkAppId', 'rootMessageId', 'title', 'purpose',
+    'expectedRevision', 'grant', 'status', 'content', 'remaining', 'milestone', 'progress', 'mode',
+    'originCapability', 'originTurnId', 'originDispatchAttempt', 'sessionId']);
+  if (Object.keys(body).some(key => !fields.has(key))
+    || (body.expectedRevision !== undefined && (!Number.isSafeInteger(body.expectedRevision) || Number(body.expectedRevision) < 1))
+    || (body.progress !== undefined && (!Number.isInteger(body.progress) || Number(body.progress) < 0 || Number(body.progress) > 100))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_workstream_fields' });
+  }
+  for (const key of ['sourceSessionId', 'sourceLarkAppId', 'rootMessageId', 'title', 'purpose', 'grant', 'status', 'content', 'remaining', 'milestone']) {
+    if (body[key] !== undefined && typeof body[key] !== 'string') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_workstream_fields' });
+    }
+  }
+  const string = (key: string) => typeof body[key] === 'string' ? body[key] as string : undefined;
+  for (const [key, value] of Object.entries(body)) {
+    if (typeof value === 'string' && (value.length > 2000 || value.includes('\0'))) {
+      return jsonRes(res, 400, { ok: false, error: `invalid_${key}` });
+    }
+  }
+  try {
+    const sourceSessionId = string('sourceSessionId') ?? '';
+    const sourceLarkAppId = string('sourceLarkAppId') ?? '';
+    const rootMessageId = string('rootMessageId') ?? '';
+    const request = {
+      sourceSessionId, sourceLarkAppId, rootMessageId, title: string('title'), purpose: string('purpose'),
+      expectedRevision: typeof body.expectedRevision === 'number' ? body.expectedRevision : undefined,
+    };
+    if (body.action === 'grant') {
+      const source = await localProjectAttachmentSource(ds.larkAppId, ds.session.sessionId);
+      const mode = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
+      if (!source?.ownerKey || source.scope !== 'thread' || !mode?.coordinatorAppId || mode.mode !== 'project') {
+        throw new Error('source_owner_authorization_required');
+      }
+      if (findActiveBySessionId(params.sessionId) !== ds || ds.managedTurnOrigin?.turnId !== turn
+        || ds.managedTurnOrigin !== admittedOrigin || ds.managedTurnOrigin?.capability !== admittedCapability
+        || !canOperate(ds.larkAppId, ds.chatId, caller.requestUserOpenId!, caller.requestUserUnionId)
+        || source.chatId !== ds.chatId || source.rootMessageId !== ds.session.rootMessageId
+        || source.routeRevision !== (ds.session.projectRouteRevision ?? 1)) {
+        throw new Error('source_route_mismatch');
+      }
+      const grant = issueProjectSourceGrant({
+        dataDir: config.session.dataDir, secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
+        callerOwnerKey: ownerKey, source: {
+          sourceSessionId: source.sessionId, sourceLarkAppId: source.larkAppId,
+          rootMessageId: source.rootMessageId, routeRevision: source.routeRevision, ownerKey: source.ownerKey,
+        }, targetChatId: ds.chatId, coordinatorAppId: mode.coordinatorAppId,
+      });
+      return jsonRes(res, 200, { ok: true, grantId: grant.id, expiresAt: grant.expiresAt });
+    }
+    if (ds.scope !== 'chat') throw new Error('project_coordinator_required');
+    let coordinatorOwnerStillValid: (() => boolean) | undefined;
+    if (body.action === 'attach' || body.action === 'status') {
+      // Report validation binds an imported workstream to this coordinator
+      // session's owner. Registering or rebinding it from another operator's
+      // turn (or in an ownerless session) would succeed here yet make every
+      // later report fail, so refuse explicitly before any write.
+      const coordinatorOwnerIdentity = () => JSON.stringify([
+        ds.session.larkAppId, ds.session.ownerOpenId, ds.session.ownerUnionId,
+      ]);
+      const admittedOwnerIdentity = coordinatorOwnerIdentity();
+      coordinatorOwnerStillValid = () => coordinatorOwnerIdentity() === admittedOwnerIdentity;
+      const coordinatorOwnerKey = await projectSessionOwnerKey({
+        larkAppId: ds.larkAppId, ownerOpenId: ds.session.ownerOpenId, ownerUnionId: ds.session.ownerUnionId,
+      });
+      if (!coordinatorOwnerKey || coordinatorOwnerKey !== ownerKey || !coordinatorOwnerStillValid()) {
+        throw new Error('project_coordinator_owner_required');
+      }
+    }
+    let authorizedSourceOwnerKey: string | undefined;
+    let authorizedSourceRouteRevision: number | undefined;
+    let sourceAuthorizationStillValid: (() => boolean) | undefined;
+    if (string('grant')) {
+      const source = await getProjectAttachmentSource(sourceLarkAppId, sourceSessionId);
+      if (source) {
+        const scope = {
+          dataDir: config.session.dataDir, secret: loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
+          id: string('grant')!, sourceSessionId, sourceLarkAppId, rootMessageId,
+          routeRevision: source.routeRevision, targetChatId: ds.chatId, coordinatorAppId: ds.larkAppId,
+        };
+        authorizedSourceOwnerKey = verifyProjectSourceGrant(scope);
+        authorizedSourceRouteRevision = source.routeRevision;
+        sourceAuthorizationStillValid = () => verifyProjectSourceGrant(scope) === authorizedSourceOwnerKey;
+      }
+      if (!authorizedSourceOwnerKey) throw new Error('source_owner_authorization_required');
+    }
+    if (findActiveBySessionId(params.sessionId) !== ds || ds.managedTurnOrigin?.turnId !== turn) {
+      throw new Error('project_attachment_actor_unproven');
+    }
+    const actor = { sessionId: ds.session.sessionId, larkAppId: ds.larkAppId, chatId: ds.chatId,
+      scope: 'chat' as const, ownerKey, authorizedSourceOwnerKey, sourceAuthorizationStillValid, turnId: turn,
+      authorizationStillValid: () => findActiveBySessionId(params.sessionId) === ds
+        && ds.managedTurnOrigin === admittedOrigin && ds.managedTurnOrigin?.capability === admittedCapability
+        && ds.managedTurnOrigin?.turnId === turn
+        && (!coordinatorOwnerStillValid || coordinatorOwnerStillValid())
+        && canOperate(ds.larkAppId, ds.chatId, caller.requestUserOpenId!, caller.requestUserUnionId),
+    };
+    Object.assign(actor, {
+      authorizedSourceSessionId: authorizedSourceOwnerKey ? sourceSessionId : undefined,
+      authorizedSourceLarkAppId: authorizedSourceOwnerKey ? sourceLarkAppId : undefined,
+      authorizedSourceRootMessageId: authorizedSourceOwnerKey ? rootMessageId : undefined,
+      authorizedSourceRouteRevision,
+    });
+    let result: unknown;
+    if (body.action === 'notifications') {
+      const mode = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
+      const project = readProjectGroup(config.session.dataDir, ds.chatId);
+      if (mode?.mode !== 'project' || mode.coordinatorAppId !== ds.larkAppId || project?.larkAppId !== ds.larkAppId) {
+        throw new Error('project_coordinator_required');
+      }
+      if (body.mode !== 'ignore' && body.mode !== 'notify') throw new Error('invalid_imported_session_policy');
+      result = await writeGroupCollaborationMode(config.session.dataDir, {
+        chatId: ds.chatId, mode: 'project', coordinatorAppId: ds.larkAppId,
+        workerAppIds: mode.workerAppIds, autoEnrollWorkers: mode.autoEnrollWorkers,
+        importedSessionPolicy: body.mode,
+      }, () => {
+        if (!actor.authorizationStillValid()) {
+          throw new Error('project_attachment_actor_unproven');
+        }
+        const current = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
+        if (current?.mode !== 'project' || current.coordinatorAppId !== ds.larkAppId) {
+          throw new Error('project_coordinator_required');
+        }
+        const currentProject = readProjectGroup(config.session.dataDir, ds.chatId);
+        if (JSON.stringify(current) !== JSON.stringify(mode)
+          || currentProject?.createdAt !== project.createdAt
+          || currentProject.larkAppId !== project.larkAppId
+          || currentProject.coordinatorSessionId !== project.coordinatorSessionId) {
+          throw new Error('project_configuration_changed');
+        }
+      });
+    }
+    else if (body.action === 'inspect') result = await projectWorkstreamAttachments.inspect(actor, request);
+    else if (body.action === 'attach') result = await projectWorkstreamAttachments.attach(actor, request);
+    else if (body.action === 'rename') result = await projectWorkstreamAttachments.rename(actor, { rootMessageId, title: string('title') ?? '' });
+    else if (body.action === 'update') result = await projectWorkstreamAttachments.update(actor, {
+      rootMessageId, status: string('status') as import('../services/project-group-store.js').ProjectWorkstreamStatus,
+      content: string('content'), remaining: string('remaining'), milestone: string('milestone'),
+      progress: typeof body.progress === 'number' ? body.progress : undefined, expectedRevision: request.expectedRevision,
+    });
+    else if (body.action === 'status') result = await projectWorkstreamAttachments.reconcile(actor, { rootMessageId: rootMessageId || undefined });
+    else throw new Error('invalid_workstream_action');
+    if (!actor.authorizationStillValid()) {
+      throw new Error('project_attachment_actor_unproven');
+    }
+    if (body.action !== 'inspect' && isDispatchTaskTreeCardEnabled()) {
+      await dispatchTaskTreeCards.refresh(taskTreeOrchestrator(ds)).catch(() => undefined);
+    }
+    return jsonRes(res, 200, { ok: true, result });
+  } catch (error) {
+    const detail = ipcErrorText(error);
+    return jsonRes(res, detail.includes('required') || detail.includes('unproven') ? 403 : 400, { ok: false, error: detail });
+  }
+});
+
+ipcRoute('POST', '/api/project-workstream/coordinators', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBody<Record<string, unknown>>(req, 4096).catch(() => undefined);
+  const project = typeof body?.chatId === 'string' ? readProjectGroup(config.session.dataDir, body.chatId) : undefined;
+  const mode = project && readGroupCollaborationMode(config.session.dataDir, project.chatId);
+  const ds = project && findActiveBySessionId(project.coordinatorSessionId);
+  const valid = ds && project && mode?.mode === 'project' && mode.coordinatorAppId === cachedLarkAppId
+    && body?.coordinatorLarkAppId === cachedLarkAppId && body.coordinatorSessionId === project.coordinatorSessionId
+    && ds.larkAppId === cachedLarkAppId && ds.chatId === project.chatId && ds.scope === 'chat'
+    && ds.session.status === 'active' && !ds.session.vcMeetingReceiver;
+  return jsonRes(res, 200, { ok: true, coordinators: valid ? [{
+    sessionId: ds.session.sessionId, larkAppId: ds.larkAppId, chatId: ds.chatId, scope: ds.scope, status: 'active',
+  }] : [] });
+});
+
+/** Host-only metadata notification. It may queue a turn but cannot mint a new
+ * coordinator session or grant access to any source transcript. */
+ipcRoute('POST', '/api/project-import/deliver', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBody<Record<string, unknown>>(req, 16 * 1024).catch(() => undefined);
+  const notification = body?.notification as { id?: string; operationId?: string; projectGeneration?: string; coordinatorAppId?: string; snapshot?: import('../services/project-import-notifications.js').ProjectImportSnapshot } | undefined;
+  const snapshot = notification?.snapshot;
+  const target = body?.target as { sessionId?: string; larkAppId?: string; chatId?: string; scope?: string } | undefined;
+  const key = body?.idempotencyKey;
+  if (!snapshot || !notification?.id || !notification.operationId || !target?.sessionId
+    || target.larkAppId !== cachedLarkAppId || typeof key !== 'string' || key.length > 200
+    || notification.coordinatorAppId !== cachedLarkAppId
+    || notification.operationId !== projectImportOperationId(snapshot)
+    || notification.id !== createHash('sha256').update(notification.operationId).digest('hex')) {
+    return jsonRes(res, 400, { ok: false, error: 'project_import_invalid_target', preDispatch: true });
+  }
+  const expectedKey = `project-import:${notification.id}:${createHash('sha256').update(target.sessionId).digest('hex').slice(0, 24)}`;
+  if (key !== expectedKey) return jsonRes(res, 400, { ok: false, error: 'project_import_invalid_target', preDispatch: true });
+  const ds = findActiveBySessionId(target.sessionId);
+  const fence = () => {
+    const project = readProjectGroup(config.session.dataDir, snapshot.chatId);
+    const mode = readGroupCollaborationMode(config.session.dataDir, snapshot.chatId);
+    if (mode?.mode !== 'project' || mode.importedSessionPolicy !== 'notify'
+      || mode.coordinatorAppId !== cachedLarkAppId || !mode.workerAppIds?.includes(snapshot.larkAppId)
+      || !project || project.createdAt !== notification.projectGeneration) throw new Error('policy_disabled');
+    if (!ds || findActiveBySessionId(target.sessionId!) !== ds || ds.session.status !== 'active'
+      || ds.scope !== 'chat' || ds.chatId !== snapshot.chatId || ds.session.vcMeetingReceiver
+      || project.coordinatorSessionId !== target.sessionId || project.larkAppId !== ds.larkAppId) {
+      throw new Error('coordinator_unavailable');
+    }
+    // Cross-bot session-store reads are read-only and intentionally narrow.
+    // Recheck the committed physical source immediately before claiming or
+    // dispatching the target turn, after all peer/network awaits.
+    const source = sessionStore.getSession(snapshot.sessionId);
+    if (!source || source.larkAppId !== snapshot.larkAppId || source.status !== 'active'
+      || source.chatId !== snapshot.chatId || source.rootMessageId !== snapshot.rootMessageId
+      || source.scope !== 'thread' || (source.projectRouteRevision ?? 1) !== snapshot.routeRevision
+      || source.projectImportSource !== snapshot.source || source.workflowNode || source.vcMeetingReceiver
+      || source.messageListenerRun || source.deferredScheduleRun) throw new Error('source_changed');
+  };
+  try {
+    fence();
+    const current = projectImportSnapshotFromSource(await getProjectAttachmentSource(snapshot.larkAppId, snapshot.sessionId));
+    if (!current || !current.ordinary || current.status !== 'active' || current.chatType !== 'group'
+      || current.scope !== 'thread' || JSON.stringify(current) !== JSON.stringify(snapshot)) throw new Error('source_changed');
+    fence();
+  } catch (error) {
+    return jsonRes(res, 409, { ok: false, error: ipcErrorText(error), preDispatch: true });
+  }
+  let dispatched = false;
+  let preDispatchError: string | undefined;
+  try {
+    const result = await triggerSessionTurn({
+      source: { type: 'ui', connectorId: 'project-import', requestId: notification.id },
+      target: { kind: 'turn', botId: cachedLarkAppId, sessionId: target.sessionId },
+      envelope: { format: 'project-import/v1', sourceName: '项目会话迁入', trusted: false, payload: {
+        sourceSessionId: snapshot.sessionId, sourceLarkAppId: snapshot.larkAppId,
+        rootMessageId: snapshot.rootMessageId, source: snapshot.source, routeRevision: snapshot.routeRevision,
+      } },
+      instruction: 'An existing session arrived in this project. This is a metadata-only notice, not authorization to read its transcript or claim someone else’s work. Request an explicit human workstream attach action when appropriate. Do not create a new task automatically.',
+      presentation: { thinking: 'hidden', topicMessage: null },
+      options: { turnIdempotencyKey: key, asyncReturnSessionId: true },
+    }, { larkAppId: cachedLarkAppId, activeSessions: getActiveSessionsRegistry()! }, {
+      validateBeforeClaim: () => {
+        try { fence(); } catch (error) { preDispatchError = ipcErrorText(error); throw error; }
+      },
+      validateBeforeDispatch: () => {
+        try { fence(); } catch (error) { preDispatchError = ipcErrorText(error); throw error; }
+        dispatched = true;
+      },
+    });
+    if (!result.ok && !dispatched && preDispatchError) {
+      return jsonRes(res, 409, { ok: false, error: preDispatchError, preDispatch: true });
+    }
+    const registration = readTurnRegistration(cachedLarkAppId, target.sessionId, key);
+    const commit = registration.body.inputCommitted as { state?: string } | undefined;
+    const delivered = result.ok && commit?.state === 'observed';
+    return jsonRes(res, 200, { ok: true, delivered, unknown: !delivered,
+      notificationId: notification.id, idempotencyKey: key, targetSessionId: target.sessionId });
+  } catch (error) {
+    return jsonRes(res, 409, { ok: false, error: ipcErrorText(error), preDispatch: !dispatched });
+  }
+});
 
 /**
  * P1-12：会话血缘的根 pid——「谁有资格持有预览端口」的起点。
@@ -4293,13 +4639,58 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
   }
   const action = parseProjectCoordinatorAction(body);
   if (!action) return jsonRes(res, 400, { ok: false, error: 'invalid_project_action' });
+  // Item rename has its own human/source-aware route. Exposing the internal
+  // action here would let a notice/bot turn bypass that authority boundary.
+  if (action.action === 'workstream_rename') {
+    return jsonRes(res, 403, { ok: false, error: 'project_workstream_route_required' });
+  }
+  if (action.action === 'dispatch' || action.action === 'report') {
+    if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(action.dispatchRoot)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_dispatch_root' });
+    }
+    const imported = readProjectAttachmentRecord(config.session.dataDir, action.dispatchRoot);
+    if (imported) {
+      if (action.action === 'dispatch') {
+        // dispatch --into is a coordination message, not authority to rename
+        // or re-claim an imported source from a bot/notification turn.
+        if (action.title || action.purpose || action.status || action.progress !== undefined
+          || action.owners !== undefined) {
+          return jsonRes(res, 403, { ok: false, error: 'project_workstream_route_required' });
+        }
+        const current = readProjectGroup(config.session.dataDir, ds.chatId);
+        return current && imported.chatId === ds.chatId && imported.coordinatorLarkAppId === ds.larkAppId
+          ? jsonRes(res, 200, { ok: true, project: current })
+          : jsonRes(res, 403, { ok: false, error: 'project_coordinator_required' });
+      }
+      if (!action.expectedAttachment) {
+        return jsonRes(res, 403, { ok: false, error: 'project_workstream_route_required' });
+      }
+    }
+  }
+  if (action.action === 'report' && action.expectedAttachment && !isTrustedHostIpcRequest(req)) {
+    return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  }
   try {
     const project = await projectCoordinator.run({
       dataDir: config.session.dataDir,
       chatId: ds.chatId,
       larkAppId: ds.larkAppId,
       coordinatorSessionId: ds.session.sessionId,
-    }, action);
+    }, action, action.action === 'report' && action.expectedAttachment ? () => {
+      const record = readProjectAttachmentRecord(config.session.dataDir, ds.chatId, action.dispatchRoot);
+      const source = record && sessionStore.getSession(record.source.sessionId);
+      const mode = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
+      if (!record || record.phase !== 'active' || record.state !== 'active'
+        || record.source.sessionId !== action.expectedAttachment!.sourceSessionId
+        || record.revision !== action.expectedAttachment!.revision
+        || record.coordinatorSessionId !== ds.session.sessionId
+        || record.coordinatorLarkAppId !== ds.larkAppId
+        || source?.status !== 'active' || source.larkAppId !== record.source.larkAppId
+        || source.chatId !== record.chatId || source.rootMessageId !== record.rootMessageId
+        || (source.projectRouteRevision ?? 1) !== record.source.routeRevision
+        || mode?.mode !== 'project' || mode.coordinatorAppId !== ds.larkAppId
+        || !mode.workerAppIds?.includes(record.source.larkAppId)) throw new Error('project_attachment_revision_conflict');
+    } : undefined);
     return jsonRes(res, 200, { ok: true, project });
   } catch (error) {
     const detail = ipcErrorText(error);
@@ -5709,7 +6100,7 @@ ipcRoute('POST', '/api/headless/sessions/:sessionId/bind', requireBoundBot(async
       });
     }
   }
-  const result = await transferSession(record.sessionId, targetChatId, rootMessageId, 'group', targetScope);
+  const result = await transferSession(record.sessionId, targetChatId, rootMessageId, 'group', targetScope, { importSource: 'bind' });
   if (!result.ok) {
     if (createdRootMessage) {
       deleteMessage(cachedLarkAppId, rootMessageId).catch(() => { /* best-effort cleanup */ });
@@ -9483,6 +9874,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     autoStartOnGroupJoinSeedDefault: t('daemon.auto_start_join_seed', undefined, localeForBot(cachedLarkAppId)),
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
     chatManagerEnabled: cardPrefs.chatManagerEnabled,
+    chatManagerSharedTopic: cardPrefs.chatManagerSharedTopic,
     groupSecretaryEnabled: cardPrefs.groupSecretaryEnabled,
     autoStartExcludedChats: cardPrefs.autoStartExcludedChats,
     groupJoinCommandEnabled: cardPrefs.groupJoinCommandEnabled,
@@ -9633,6 +10025,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
     chatManagerEnabled?: unknown;
+    chatManagerSharedTopic?: unknown;
     groupSecretaryEnabled?: unknown;
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
     senderTag?: unknown;
@@ -9654,6 +10047,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
     chatManagerEnabled?: boolean;
+    chatManagerSharedTopic?: boolean;
     groupSecretaryEnabled?: boolean;
     overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
     senderTag?: boolean;
@@ -9746,6 +10140,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   }
   if (typeof body.autoStartOnNewTopic === 'boolean') patch.autoStartOnNewTopic = body.autoStartOnNewTopic;
   if (typeof body.chatManagerEnabled === 'boolean') patch.chatManagerEnabled = body.chatManagerEnabled;
+  if (typeof body.chatManagerSharedTopic === 'boolean') patch.chatManagerSharedTopic = body.chatManagerSharedTopic;
   if (typeof body.groupSecretaryEnabled === 'boolean') patch.groupSecretaryEnabled = body.groupSecretaryEnabled;
   if (body.autoStartExcludedChats !== undefined) {
     if (!Array.isArray(body.autoStartExcludedChats) || body.autoStartExcludedChats.some(id => typeof id !== 'string' || !/^oc_[a-zA-Z0-9]+$/.test(id.trim()))) {
@@ -12337,6 +12732,7 @@ export function startIpcServer(opts: {
    * the trusted-host HMAC — this does NOT disable auth wholesale (codex P1). */
   coreOnlyPublicRoutes?: boolean;
 }): Promise<IpcServerHandle> {
+  setProjectWorkstreamPool({ findActiveBySessionId });
   let boundPort = opts.port;
   const server: Server = createServer(async (req, res) => {
     try {

@@ -1,5 +1,11 @@
 import type { DaemonSession } from './types.js';
-import { hasUnacceptedCliInput, isSessionTransferring, suspendWorker } from './worker-pool.js';
+import {
+  hasPendingOrdinaryImInput,
+  hasUnacceptedCliInput,
+  hasUnsettledAcceptedInput,
+  isSessionTransferring,
+  suspendWorker,
+} from './worker-pool.js';
 import {
   getSessionPersistentBackendType,
   isSuspendableBackendType,
@@ -87,6 +93,20 @@ export interface IdleAgeSweepOptions {
   olderThanMs: number;
   now?: number;
   mutationAcquireTimeoutMs?: number;
+  /**
+   * Suspend reason recorded on the session (default `idle_timeout`). Automatic
+   * policies pass their own (`idle_spin`, `host_pressure`) so logs and the
+   * persisted cold-resume state name the policy that parked the worker.
+   */
+  reason?: string;
+  /**
+   * Hard cap on candidates acted on in this pass. `undefined` = no cap (the
+   * operator command). Automatic policies bound a pass so one sweep cannot
+   * monopolize the event loop across dozens of teardowns.
+   */
+  maxCandidates?: number;
+  /** Checked before each candidate (daemon shutdown fence). */
+  shouldAbort?: () => boolean;
 }
 
 export interface IdleAgeSweepFailure {
@@ -124,7 +144,19 @@ function conservativeIdleActivityAt(ds: DaemonSession): number | undefined {
   return values.length > 0 ? Math.max(...values) : undefined;
 }
 
-function hasUnsettledIdleSuspendState(ds: DaemonSession): boolean {
+/**
+ * Strict "this generation owns no unsettled work" predicate shared by the
+ * operator age sweep and the CPU-driven idle-spin / host-pressure reclaims.
+ *
+ * This is deliberately stronger than `suspendableIdleCandidates` (the cap/TTL
+ * fast path): an idle screen can coexist with a turn the worker has accepted
+ * but not submitted, a scheduled run whose settlement is pending, a dashboard
+ * activation tail, or a prompt-cache keep-alive / idle auto-compact turn. Any
+ * of those would be destroyed by a suspend, so unknown or pending state fails
+ * closed here. New guards must be added HERE, not only to the automatic
+ * selector, so operator and automatic reclaims never drift apart.
+ */
+export function hasUnsettledIdleSuspendState(ds: DaemonSession): boolean {
   return hasProtectedSessionMutationOwnership(ds)
     || isSessionTransferring(ds)
     || !!ds.pendingRepo
@@ -140,6 +172,34 @@ function hasUnsettledIdleSuspendState(ds: DaemonSession): boolean {
     || !!ds.tuiPromptProcessing
     || !!ds.agentAttention
     || !!ds.usageLimit
+    // A turn the worker accepted is not the same as a turn the CLI started;
+    // the screen can still show a cached idle.
+    || hasPendingOrdinaryImInput(ds)
+    || hasUnsettledAcceptedInput(ds)
+    // Dashboard backlog activation journal / FIFO: input has not reached the
+    // CLI yet, so the generation still owns it.
+    || !!ds.session.queued
+    || ds.session.queuedActivationPending === true
+    || (ds.session.queuedActivationTail?.length ?? 0) > 0
+    || ds.initialStartPending === true
+    || ds.pendingPrompt !== undefined
+    || ds.pendingTurnId !== undefined
+    // Scheduled runs must keep the existing deferred/held contract: never
+    // suspend while a hidden run is in flight or its settlement is pending.
+    || ds.session.deferredScheduleRun !== undefined
+    || ds.deferredScheduleUndeliveredTurnId !== undefined
+    || ds.deferredScheduleUnconfirmedTurnId !== undefined
+    // Claude Code idle keep-alive deliberately wakes an idle CLI; suspending
+    // it would defeat the cache-keepalive feature. Idle auto-compact is a
+    // botmux-authored turn for the same reason.
+    || ds.promptCacheKeepalive !== undefined
+    || ds.idleAutoCompactArm !== undefined
+    // `idleAutoCompactWarmSince` is tracked even while the feature is OFF
+    // (the CLI's idle edge is a useful clock). Only an enabled auto-compact
+    // can dispatch a turn from that stretch, so only then is it a blocker.
+    || (ds.session.idleAutoCompact?.enabled === true && ds.idleAutoCompactWarmSince !== undefined)
+    || ds.idleAutoCompactPendingNotice !== undefined
+    || ds.idleAutoCompactDispatchedTurnId !== undefined
     // Background tasks still running die with the CLI (same guard as the
     // cap / TTL / admission candidates in suspendableIdleCandidates).
     || (ds.backgroundTaskCount ?? 0) > 0
@@ -261,17 +321,55 @@ export async function sweepIdleWorkersByAgeAsync(
   opts: IdleAgeSweepOptions,
   yieldBetweenCandidates: () => Promise<void> = () => new Promise<void>(resolve => setImmediate(resolve)),
 ): Promise<IdleAgeSweepResult> {
-  const candidates = selectIdleSuspendCandidates(activeSessions, opts);
+  return suspendSelectedIdleCandidatesAsync(
+    activeSessions,
+    undefined,
+    opts,
+    yieldBetweenCandidates,
+  );
+}
+
+/**
+ * Shared action loop for every strict idle policy (operator age sweep,
+ * CPU-driven idle-spin, host-pressure reclaim).
+ *
+ * `selectIds` narrows the strict candidate set (the CPU policy only acts on
+ * sessions whose sampled CPU crossed its threshold); `undefined` means "all
+ * strict candidates". The guard set is ALWAYS {@link selectIdleSuspendCandidates}
+ * — both for the initial selection and for the pre-suspend re-check — so an
+ * operator-triggered sweep and an automatic reclaim can never disagree about
+ * which sessions are safe to park.
+ */
+export async function suspendSelectedIdleCandidatesAsync(
+  activeSessions: Map<string, DaemonSession>,
+  selectIds: ReadonlySet<string> | undefined,
+  opts: IdleAgeSweepOptions,
+  yieldBetweenCandidates: () => Promise<void> = () => new Promise<void>(resolve => setImmediate(resolve)),
+): Promise<IdleAgeSweepResult> {
+  const reason = opts.reason ?? 'idle_timeout';
+  const maxCandidates = opts.maxCandidates !== undefined && Number.isFinite(opts.maxCandidates)
+    ? Math.max(0, Math.floor(opts.maxCandidates))
+    : undefined;
+  if (maxCandidates === 0) return { candidates: [], suspended: [], failures: [] };
+
+  let candidates = selectIdleSuspendCandidates(activeSessions, opts);
+  if (selectIds !== undefined) {
+    candidates = candidates.filter(candidate => selectIds.has(candidate.sessionId));
+  }
+  if (maxCandidates !== undefined) candidates = candidates.slice(0, maxCandidates);
+
   const suspended: IdleSuspendCandidate[] = [];
   const failures: IdleAgeSweepFailure[] = [];
   for (const candidate of candidates) {
     await yieldBetweenCandidates();
+    if (opts.shouldAbort?.()) break;
     // Re-run the full guard set rather than re-checking one field: the
     // eligibility predicate must stay identical to the dry-run selection.
     const stillEligible = selectIdleSuspendCandidates(activeSessions, {
       ...opts,
       now: opts.now ?? Date.now(),
-    }).some(item => item.sessionId === candidate.sessionId);
+    }).some(item => item.sessionId === candidate.sessionId
+      && (selectIds === undefined || selectIds.has(item.sessionId)));
     if (!stillEligible) {
       failures.push({ candidate, error: 'session_changed' });
       continue;
@@ -285,7 +383,7 @@ export async function sweepIdleWorkersByAgeAsync(
       continue;
     }
     try {
-      if (suspendWorker(ds, 'idle_timeout')) {
+      if (suspendWorker(ds, reason)) {
         suspended.push({
           ...candidate,
           backingReleased: true,
@@ -313,6 +411,22 @@ export function sweepIdleWorkersByAgeAfterTurnDrain(
     larkAppId,
     opts.mutationAcquireTimeoutMs ?? IDLE_WORKER_SWEEP_MUTATION_ACQUIRE_TIMEOUT_MS,
     () => sweepIdleWorkersByAgeAsync(activeSessions, opts),
+  ).then(result => result.acquired ? result.value : null);
+}
+
+/** Mutation-gated variant for CPU / host-pressure policies that act on a
+ *  subset of the strict candidates. Returns null when the bot gate stayed busy;
+ *  the caller retries on the next sampling tick. */
+export function suspendSelectedIdleCandidatesAfterTurnDrain(
+  larkAppId: string,
+  activeSessions: Map<string, DaemonSession>,
+  selectIds: ReadonlySet<string> | undefined,
+  opts: IdleAgeSweepOptions,
+): Promise<IdleAgeSweepResult | null> {
+  return tryWithBotTurnMutation(
+    larkAppId,
+    opts.mutationAcquireTimeoutMs ?? IDLE_WORKER_SWEEP_MUTATION_ACQUIRE_TIMEOUT_MS,
+    () => suspendSelectedIdleCandidatesAsync(activeSessions, selectIds, opts),
   ).then(result => result.acquired ? result.value : null);
 }
 

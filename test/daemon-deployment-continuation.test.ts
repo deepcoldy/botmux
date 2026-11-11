@@ -103,6 +103,7 @@ function freshNativeTurn(turnId = 'om_first') {
     readIsolationOriginChannelId: undefined, sandboxRelayOutbox: undefined, currentVcMeetingImTurnOrigin: undefined,
     currentBotmuxTurnId: turnId, currentBotmuxDispatchAttempt: undefined, currentBotmuxLinkRefMode: undefined,
     randomBytes, parseDaemonIpcPort: () => undefined, writeCliPidMarker: () => {}, log: () => {}, flushPending: () => {},
+    queuedTypeAheadTurns: [],
     inflightInputs: { onTurnStarted: () => {} }, isUnsentInputReplayable, restoredUnsentInputs: new Set(), writtenInputs: new WrittenInputLedger(),
     send: (message: any) => {
       if (message.type.startsWith('managed_turn_origin')) handlePoolMessage(message);
@@ -110,7 +111,8 @@ function freshNativeTurn(turnId = 'om_first') {
     },
   };
   for (const name of ['unlinkManagedOriginCapabilityFiles', 'completeManagedTurnOriginRevocation',
-    'releaseActiveTurnAuthority', 'publishSandboxRelayCapability', 'acknowledgeNativeInputConsumed', 'noteCliInputWritten']) {
+    'releaseActiveTurnAuthority', 'publishSandboxRelayCapability', 'acknowledgeNativeInputConsumed',
+    'markReplyInputConsumed', 'noteCliInputWritten']) {
     scope[name] = loadWorkerFunction(name, scope);
   }
   const identity = { turnId, caller };

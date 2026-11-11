@@ -2645,6 +2645,21 @@ describe('card pref save response backfills tool visibility onto the page row', 
     // A true response restores the default-on display state.
     expect(patchCardPrefsFromBody({ ...base, replyCardShowTools: false }, { replyCardShowTools: true }).replyCardShowTools).toBe(true);
   });
+
+  it('maps both group-manager switches from the PUT response body back onto the bot row', () => {
+    const base = {
+      larkAppId: 'cli_chat_manager_backfill',
+      chatManagerEnabled: false,
+      chatManagerSharedTopic: false,
+    };
+    expect(patchCardPrefsFromBody(base, {
+      chatManagerEnabled: true,
+      chatManagerSharedTopic: true,
+    })).toMatchObject({
+      chatManagerEnabled: true,
+      chatManagerSharedTopic: true,
+    });
+  });
 });
 
 describe('reply footer parent response synchronization', () => {

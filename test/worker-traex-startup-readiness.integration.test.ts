@@ -26,11 +26,11 @@ function redraw(rows: string[]): string {
 
 // per-bot-home: TRAE_HOME comes only from the bot's env (the worker's own env
 // has none), so the submit receipt is only visible if the worker follows it.
-type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog' | 'per-bot-home' | 'repository-notice' | 'resumed-repository-notice' | 'resumed-repository-notice-held-idle' | 'native-viewport' | 'native-viewport-loading' | 'native-viewport-race' | 'native-viewport-retry' | 'session-lock';
+type Scenario = 'fresh' | 'resume' | 'loaded-banner' | 'blocked-screens' | 'hostile-first' | 'hostile-dialog' | 'per-bot-home' | 'repository-notice' | 'resumed-repository-notice' | 'resumed-repository-notice-held-idle' | 'native-viewport' | 'native-viewport-loading' | 'native-viewport-race' | 'native-viewport-retry' | 'session-lock' | 'shortcut-only-footer';
 
 const tmuxAvailable = probeTmuxFunctional().ok;
 for (const backendType of process.env.BOTMUX_TEST_WORKER_BINARY ? ['tmux'] as const : ['pty', 'tmux'] as const) {
-  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice', 'resumed-repository-notice', 'resumed-repository-notice-held-idle', 'native-viewport', 'native-viewport-loading', 'native-viewport-race', 'native-viewport-retry', 'session-lock'] as const) {
+  for (const mode of ['fresh', 'resume', 'loaded-banner', 'blocked-screens', 'hostile-first', 'hostile-dialog', 'per-bot-home', 'repository-notice', 'resumed-repository-notice', 'resumed-repository-notice-held-idle', 'native-viewport', 'native-viewport-loading', 'native-viewport-race', 'native-viewport-retry', 'session-lock', 'shortcut-only-footer'] as const) {
     if (mode.startsWith('native-viewport') && backendType !== 'tmux') continue;
     it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
       `TraeX ${backendType} ${mode}: admits a quiet cursor-painted composer and submits the first input once`,
@@ -90,7 +90,13 @@ async function runScenario(backendType: 'pty' | 'tmux', mode: Scenario): Promise
     : mode === 'loaded-banner'
       ? ['│ model: GPT-6-Astra xhigh /model to change │', '│ directory: /tmp/loading │',
         ...COMPOSER.map(row => row.replace(' · ~ · ', ' · /tmp/loading · '))]
-      : ['TraeCode CLI (v0.211.1)', '', ...COMPOSER];
+      : mode === 'shortcut-only-footer'
+        // TraeX 0.214.1 cold start: empty composer plus a bare shortcut hint,
+        // with no model/context footer until the model list fetch resolves.
+        ? ['  █ ◆ ◆ █  TRAE CLI (v0.214.1)', '  /tmp/repo', '  permissions: YOLO mode',
+          ...COMPOSER.slice(0, 3).map(row => row.replace('Use /skills to list available skills', 'Ask TRAE CLI to do anything')),
+          '  ? for shortcuts']
+        : ['TraeCode CLI (v0.211.1)', '', ...COMPOSER];
   // #2247 later taught the byte-stream readyPattern the same cursor-painted
   // shape: the stripped redraw now matches through the preceding rule, so
   // recognition no longer depends on the viewport poller. The same rule arm

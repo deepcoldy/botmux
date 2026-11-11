@@ -73,6 +73,7 @@ import { reclaimIdleWorkersForAdmissionAfterTurnDrain } from './idle-worker-swee
 import { createWorkerStderrRing, WORKER_ERROR_MARKER, type WorkerStderrRing } from './worker-stderr-ring.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
+import { noteProjectAssociationChanged, markProjectImportPending } from './project-session-association-events.js';
 import { recordTurnInputCommit } from '../services/idempotency-store.js';
 import { CODEX_CAPACITY_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId } from '../services/codex-transcript.js';
 import {
@@ -10093,7 +10094,7 @@ function clearAcceptedInputTurns(ds: DaemonSession): void {
 }
 
 /** Does the CURRENT generation still own an accepted input with no terminal? */
-function hasUnsettledAcceptedInput(ds: DaemonSession): boolean {
+export function hasUnsettledAcceptedInput(ds: DaemonSession): boolean {
   if (ds.acceptedInputOverflow) return true;
   const turns = ds.acceptedInputTurns;
   if (!turns) return false;
@@ -11612,6 +11613,8 @@ async function closeSessionBody(
   // All authoritative map/status/store/event state above transitions
   // synchronously, before the first await. Lark reaction/unsubscribe cleanup is
   // best-effort and can be slow; it must not leave a resurrection window.
+  const projectClosed = ds?.session ?? sessionStore.getOwnedSession(sessionId);
+  if (projectClosed?.status === 'closed') noteProjectAssociationChanged(projectClosed);
 
   // Trigger-user credentials die with the session. These files hold a live user
   // token, so a closed session must not leave one on disk for a future session
@@ -13355,6 +13358,7 @@ export async function transferSession(
    */
   targetScope: 'thread' | 'chat',
   opts?: {
+    importSource?: 'relay' | 'bind';
     /** @internal Override for tests — the real implementation forks a child
      *  process and tries to attach to tmux, neither of which is appropriate
      *  in a unit test environment. Defaults to module-level forkWorker. */
@@ -13670,6 +13674,9 @@ export async function transferSession(
   ds.session.rootMessageId = targetRootMessageId;
   ds.session.scope = targetScope;
   ds.session.chatType = targetChatType;
+  ds.session.projectRouteRevision = (ds.session.projectRouteRevision ?? 1) + 1;
+  ds.session.projectImportSource = opts?.importSource ?? 'relay';
+  markProjectImportPending(ds.session);
   ds.session.lastMessageAt = new Date().toISOString();
   // Card state was pinned to the source chat — clear so the new worker posts
   // a fresh card in the target chat instead of trying to PATCH a message that
@@ -13699,6 +13706,7 @@ export async function transferSession(
     }
   }
   routingCommitted = true;
+  noteProjectAssociationChanged(ds.session);
   // The route is now durable and the source card identity has been cleared.
   // Unpin exactly the pre-commit capture: a target publication racing after
   // this point must never be selected by source cleanup.
@@ -14022,6 +14030,8 @@ async function forkFromSource(
     // child's first spawn resumes it and forks forward (pendingForkSession), then
     // the worker persists the child's own new id and clears the marker.
     childSession.forkedFrom = ds.session.sessionId;
+    childSession.projectRouteRevision = 1;
+    childSession.projectImportSource = 'fork';
     childSession.forkTaskText = opts?.forkTaskText;
     childSession.larkThreadId = opts?.larkThreadId;
     childSession.lastCallerOpenId = opts?.senderOpenId;
@@ -14044,6 +14054,7 @@ async function forkFromSource(
     // bug in a multi-bot fleet), and destabilises sandbox transcript/BOT_HOME
     // location.
     childSession.larkAppId = ds.larkAppId;
+    markProjectImportPending(childSession);
     // Both native fork and clean failed-turn recovery inherit one recorded
     // launch posture. Never re-derive sandbox/CLI profile from the live bot:
     // a missing sandbox stamp on resume can silently disable isolation.
@@ -19896,6 +19907,13 @@ function setupWorkerHandlers(
         // observation is not a completed fork and must leave the intent intact.
         if (ds.session.pendingForkSession && msg.cliSessionId === ds.session.cliSessionId) break;
         const wasLocalCliOpenReady = isLocalCliOpenReady(ds, { cliId: effectiveCliId });
+        const previousNativeId = ds.session.cliSessionId;
+        if (previousNativeId && previousNativeId !== msg.cliSessionId && !ds.session.pendingForkSession) {
+          ds.session.projectRouteRevision = (ds.session.projectRouteRevision ?? 1) + 1;
+          // Native /clear or /resume is a new execution episode, not another
+          // import into this project. It invalidates stale attachment proofs.
+          ds.session.projectImportPending = false;
+        }
         ds.session.cliSessionId = msg.cliSessionId;
         ds.session.codexCleanupTarget = ['codex', 'codex-app'].includes(effectiveCliId)
           && !isSharedAdoptSession(ds) && msg.codexCleanupTarget?.threadId === msg.cliSessionId
@@ -19911,6 +19929,9 @@ function setupWorkerHandlers(
         if (ds.adoptedFrom) ds.adoptedFrom.sessionId = msg.cliSessionId;
         if (ds.session.adoptedFrom) ds.session.adoptedFrom.sessionId = msg.cliSessionId;
         sessionStore.updateSession(ds.session);
+        if (previousNativeId && previousNativeId !== msg.cliSessionId) {
+          noteProjectAssociationChanged(ds.session);
+        }
         // Usage ledger: publish ownership the moment the CLI-native session id
         // is known, so consumers exclude this session from native parsers
         // before its first positive-delta record exists.
@@ -25334,6 +25355,7 @@ export function forkAdoptWorker(
   const startupState: WorkerStartupState = { ready: false, failureNotified: false };
   const adoptedCliId = adopted.cliId ?? 'claude-code';
   let initMsg!: DaemonToWorker;
+  const previousInitConfig = ds.initConfig;
 
   try {
   // A fork-level failure emits 'error'; without a handler it crashes the daemon.
@@ -25562,18 +25584,27 @@ export function forkAdoptWorker(
     initMsg.restartAttemptId = runtimeController.prepareWorkerStart(initMsg.restartAttemptId);
     initMsg.sessionContract = runtimeController.bindWorker(workerGeneration);
   }
-  setupWorkerHandlers(ds, worker, startupState, workerGeneration, stderrRing);
-  ds.worker = worker;
-  initializeWorkerIpcBootstrap(worker);
   {
     const initCallerOpenId = turnCallerOpenIdFor(ds, 'turnId' in initMsg ? initMsg.turnId : undefined);
     if (initCallerOpenId) initMsg = { ...initMsg, turnCallerOpenId: initCallerOpenId };
   }
+  // IPC handlers capture the contract at registration time, before the child
+  // requests its first runtime reservation (including restored adopt sessions).
+  ds.initConfig = initMsg;
+  try {
+    startNewGenerationEnvLedger(ds, initMsg.env);
+  } catch (err) {
+    logger.error(`[${t}] Failed to initialize adopt worker env ledger: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  setupWorkerHandlers(ds, worker, startupState, workerGeneration, stderrRing);
+  ds.worker = worker;
+  initializeWorkerIpcBootstrap(worker);
   afterWorkerIpcBootstrap(worker, () => {
     opts?.onIpcDispatchAttempted?.();
     worker.send(initMsg);
   });
   } catch (err) {
+    if (ds.initConfig === initMsg) ds.initConfig = previousInitConfig;
     if (ds.worker === worker) ds.worker = null;
     try { worker.kill(); } catch { /* best-effort pre-init child fence */ }
     throw err;
@@ -25581,12 +25612,6 @@ export function forkAdoptWorker(
 
   // init is now accepted by the child. Everything below is projection only and
   // must not turn this prompt back into a retryable delivery.
-  ds.initConfig = initMsg;
-  try {
-    startNewGenerationEnvLedger(ds, initMsg.env);
-  } catch (err) {
-    logger.error(`[${t}] Failed to initialize adopt worker env ledger: ${err instanceof Error ? err.message : String(err)}`);
-  }
   const adoptedCliIdTyped = adoptedCliId as CliId;
   if (ds.session.cliId !== adoptedCliIdTyped) {
     ds.session.cliId = adoptedCliIdTyped;

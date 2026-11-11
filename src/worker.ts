@@ -146,6 +146,7 @@ import { publishCliSessionIdToDaemon } from './core/cli-session-id-publisher.js'
 import { ActiveTurnAuthority, type TurnAuthorityIdentity } from './core/active-turn-authority.js';
 import { isValidMarkerIdentityTurnId } from './core/turn-id-shape.js';
 import { markerBelongsToLiveProcess, readProcessStartIdentity } from './core/session-marker.js';
+import { projectAuthorityPaths } from './services/project-authority-paths.js';
 import { CodexAppEngineRootWaitCancelled, parseCodexAppEngineIdentityClaim, verifyCodexAppEngineIdentity, type CodexAppEngineIdentity } from './services/codex-app-engine-identity.js';
 import { cliSurvivesWorkerExit, handsCliPidMarkerToSuccessor } from './core/cli-pid-marker-handoff.js';
 import { assertWorkingDirStaysInRoleLibrary, roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
@@ -5835,13 +5836,20 @@ function setCaptureIdentity(
   turnId: string | undefined,
   dispatchAttempt: number | undefined,
   callerOpenId?: string,
+  forceAnnouncement = false,
 ): void {
   const changed = turnId !== currentBotmuxTurnId || dispatchAttempt !== currentBotmuxDispatchAttempt;
   currentBotmuxTurnId = turnId;
   currentBotmuxDispatchAttempt = dispatchAttempt;
   currentBotmuxCallerOpenId = callerOpenId;
-  if (!changed && captureIdentityAnnounced) return;
+  if (!changed && captureIdentityAnnounced && !forceAnnouncement) return;
   if (changed && captureIdentityAnnounced) captureRevision += 1;
+  // Init sets the tuple before a runtime exists. Publish it only from a
+  // runtime scope so the daemon can retain it behind the pending binding.
+  if (workerSessionEventScope && !workerSessionEventScope.contextBinding()) {
+    captureIdentityAnnounced = false;
+    return;
+  }
   captureIdentityAnnounced = true;
   send({
     type: 'capture_identity',
@@ -5854,6 +5862,7 @@ let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let currentTurnSteerPromoted = false;
 interface QueuedTypeAheadTurnRecord {
   turnId: string;
+  inputConsumed?: true;
   identityTurnId?: string;
   dispatchAttempt?: number;
   linkRefMode?: 'observe' | 'enabled';
@@ -6891,6 +6900,7 @@ function authorizeManagedSend(
   ok: true;
   origin: {
     turnId?: string;
+    replyMessageId?: string;
     dispatchAttempt?: number;
     requiresCodexAppLedger?: boolean;
     linkRefMode?: 'observe' | 'enabled';
@@ -6941,6 +6951,8 @@ function authorizeManagedSend(
     ? {
         ok: true,
         origin: {
+          ...(capability.turnId === currentBotmuxTurnId && !requiresCodexAppLedger && !imOrigin
+            ? { replyMessageId: queuedTypeAheadTurns.filter(t => t.inputConsumed).at(-1)?.turnId } : {}),
           ...(capability.turnId ? { turnId: capability.turnId } : {}),
           ...(capability.dispatchAttempt !== undefined
             ? { dispatchAttempt: capability.dispatchAttempt }
@@ -7141,6 +7153,7 @@ function writeCliPidMarker(): void {
                 if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && markerQueuedTurnStillLive(qt) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
                   queuedTypeAheadTurns.push({
                     turnId: qt.turnId,
+                ...(qt.inputConsumed === true ? { inputConsumed: true as const } : {}),
                     ...(markerIdentityTurnId(qt.identityTurnId) ? { identityTurnId: markerIdentityTurnId(qt.identityTurnId)! } : {}),
                     ...(typeof qt.dispatchAttempt === 'number' ? { dispatchAttempt: qt.dispatchAttempt } : {}),
                     ...(qt.linkRefMode === 'observe' || qt.linkRefMode === 'enabled'
@@ -7163,6 +7176,7 @@ function writeCliPidMarker(): void {
           : undefined;
         const queuedTurns = queuedTypeAheadTurns.map(t => ({
           turnId: t.turnId,
+          ...(t.inputConsumed === true ? { inputConsumed: true as const } : {}),
           ...(markerIdentityTurnId(t.identityTurnId) ? { identityTurnId: markerIdentityTurnId(t.identityTurnId)! } : {}),
           ...(t.dispatchAttempt !== undefined ? { dispatchAttempt: t.dispatchAttempt } : {}),
           ...(t.linkRefMode ? { linkRefMode: t.linkRefMode } : {}),
@@ -7228,6 +7242,7 @@ function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
           if (t && typeof t.turnId === 'string' && t.turnId !== currentBotmuxTurnId && !retiredTurnIds.has(t.turnId) && !queuedTypeAheadTurns.some(q => q.turnId === t.turnId)) {
             queuedTypeAheadTurns.push({
               turnId: t.turnId,
+              ...(t.inputConsumed === true ? { inputConsumed: true as const } : {}),
               ...(markerIdentityTurnId(t.identityTurnId) ? { identityTurnId: markerIdentityTurnId(t.identityTurnId)! } : {}),
               ...(typeof t.dispatchAttempt === 'number' ? { dispatchAttempt: t.dispatchAttempt } : {}),
               ...(t.linkRefMode === 'observe' || t.linkRefMode === 'enabled'
@@ -7342,6 +7357,7 @@ function syncQueuedTurnsFromMarkerDisk(): boolean {
             if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && markerQueuedTurnStillLive(qt) && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
               queuedTypeAheadTurns.push({
                 turnId: qt.turnId,
+                ...(qt.inputConsumed === true ? { inputConsumed: true as const } : {}),
                 ...(markerIdentityTurnId(qt.identityTurnId) ? { identityTurnId: markerIdentityTurnId(qt.identityTurnId)! } : {}),
                 ...(qt.linkRefMode === 'observe' || qt.linkRefMode === 'enabled'
                   ? { linkRefMode: qt.linkRefMode }
@@ -22571,10 +22587,20 @@ function startScreenUpdates(): void {
       // dedup — it never touches isPromptReady, the idle detector, or the argv seed
       // flags (spawnArgvInitialPromptBusy / -NeedsWorkingSeed), so the first-prompt
       // evidence machinery and the end-of-turn seed are unchanged.
-      if (spawnArgvNeedsWorkingSeed && lastSentStatus !== 'working' && renderer) {
+      // A resumed native command can already be running before any idle prompt.
+      // Publish its actual frame without opening the ready gate or draining input.
+      const nativeScreen = lastInitConfig?.cliId === 'antigravity' && renderer
+        && backendScreenEvidenceIsAuthoritativeForMutation() ? renderer.rawSnapshot() : '';
+      const nativeWorking = !!nativeScreen && !!cliAdapter?.busyPattern?.test(busyProbeRegion(nativeScreen))
+        && !!cliAdapter.isSessionBusy?.({
+          sessionId,
+          cliSessionId: lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId,
+          getCurrentScreen: () => nativeScreen,
+        });
+      if (((spawnArgvNeedsWorkingSeed && lastSentStatus !== 'working') || nativeWorking) && renderer) {
         const projected = projectedRuntimeScreenStatus();
-        if (projected === 'working') {
-          const { content } = renderer.snapshot();
+        const { content, changed } = renderer.snapshot();
+        if (projected === 'working' && (lastSentStatus !== 'working' || (nativeWorking && changed))) {
           lastSentStatus = 'working';
           send({
             type: 'screen_update',
@@ -22583,7 +22609,7 @@ function startScreenUpdates(): void {
             turnId: currentBotmuxTurnId,
             dispatchAttempt: currentBotmuxDispatchAttempt,
           });
-          log('Argv-baked first prompt in flight — publishing projected working before first prompt');
+          if (!nativeWorking) log('Argv-baked first prompt in flight — publishing projected working before first prompt');
         }
       }
       return;
@@ -23441,7 +23467,12 @@ async function spawnCli(
       if (outcome === 'refused') log(`Daemon refused runtime reservation ${binding.bindingId}; the lifecycle operation that owns the session takes over`);
       throw new CliSpawnSupersededError();
     }
-    try { await spawnCliBody(cfg, opts); }
+    try {
+      // Every reserved runtime needs its own snapshot: a failed predecessor
+      // may have lost its deferred announcement when its binding was aborted.
+      setCaptureIdentity(currentBotmuxTurnId, currentBotmuxDispatchAttempt, currentBotmuxCallerOpenId, true);
+      await spawnCliBody(cfg, opts);
+    }
     catch (error) {
       // A replacement that never published an identity releases its
       // reservation; otherwise it would mask the surviving runtime's exit.
@@ -26013,6 +26044,7 @@ async function spawnCliBody(
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
     resume: effectiveResume,
+    reattach: willReattachPersistent,
     workingDir: buildArgsWorkingDir,
     resumeSessionId: effectiveCliSessionId,
     quietResume: codexAutoUpgrade?.stage === 'restoring',
@@ -26942,6 +26974,7 @@ async function spawnCliBody(
     const hostOnlyDenyPaths: string[] = [
       join(canonical(dataDir), 'schedule-preconditions'),
       join(canonical(dataDir), 'link-refs'),
+      ...projectAuthorityPaths(canonical(dataDir)),
     ];
     const mandatoryDenyRegexes: string[] = [];
     const mandatoryReadOnlyPaths: string[] = [];
@@ -27537,6 +27570,7 @@ async function spawnCliBody(
       sessionId: cfg.sessionId,
     });
     const scratchDeny = [...new Set<string>([
+      ...projectAuthorityPaths(scratchCanonical(scratchDataDir)),
       ...credentialRules.denyPaths.map(path =>
         scratchProtectedPathSet.has(path) ? path : scratchCanonical(path)),
       ...existingProtectedPathVariants(scratchProtectedPaths),
@@ -28014,6 +28048,10 @@ async function spawnCliBody(
       botmuxHome: canonical(configuredBotmuxHome),
       defaultBotmuxHome: canonical(defaultBotmuxHome),
     }, seatbeltProtectedPaths);
+    // Imported-task authority is nested under dataDir, not among the legacy
+    // root-level dashboard files enumerated by credential-only profiles.
+    rules.denyPaths.push(...projectAuthorityPaths(canonical(isolationRuntimeDataDir)));
+    rules.denyWritePaths.push(...projectAuthorityPaths(canonical(isolationRuntimeDataDir)));
     const profileDir = join(isolationRuntimeDataDir, 'read-isolation');
     mkdirSync(profileDir, { recursive: true });
     const originDirectory = managedOriginCapabilityDirectory(
@@ -28134,6 +28172,16 @@ async function spawnCliBody(
       }
     };
     const credentialOnlyProtectedPaths = protectedPathsForHome(hostHomeDir);
+    for (const path of projectAuthorityPaths(isolationRuntimeDataDir)) {
+      try { mkdirSync(path, { recursive: true, mode: 0o700 }); } catch {
+        throw new Error('project authority mask directory unavailable');
+      }
+      const shape = lstatSync(path);
+      if (!shape.isDirectory() || shape.isSymbolicLink()) {
+        throw new Error('project authority mask directory is not safe');
+      }
+      hideDirectories.add(realpathSync(path));
+    }
     for (const path of [
       ...credentialOnlyProtectedPaths,
       ...existingProtectedPathVariants(credentialOnlyProtectedPaths),
@@ -33905,6 +33953,18 @@ function acknowledgeTurnInputReceived(turnId?: string): void {
   if (turnId) send({ type: 'turn_input_received', turnId });
 }
 
+/** Keep reply location separate from execution identity and the final queue.
+ * Called only with native consumption proof (acknowledgeNativeInputConsumed),
+ * never because writeInput returned: CoCo and Antigravity's queue mode accept a
+ * busy-time Enter but park it until the running turn ends, so a write-time mark
+ * would send the running turn's own answer to the still-unread message. */
+function markReplyInputConsumed(turnId: string | undefined): void {
+  const queued = queuedTypeAheadTurns.find(turn => turn.turnId === turnId);
+  if (!queued || queued.inputConsumed) return;
+  queued.inputConsumed = true;
+  writeCliPidMarker();
+}
+
 /** Native acceptance proof for shared group background coverage. Emitted only
  * from boundaries where the CLI itself evidenced this exact input: Codex's
  * exact owned history line, a Codex RPC turn/start acknowledgement, or a
@@ -33918,6 +33978,7 @@ function acknowledgeNativeInputConsumed(
   dispatchAttempt?: number,
 ): void {
   if (!turnId) return;
+  markReplyInputConsumed(turnId);
   // The CLI has the input in its own history: a crash no longer re-delivers
   // it to a resumed CLI (see InflightInputTracker.onTurnStarted).
   inflightInputs.onTurnStarted(turnId);
@@ -34905,6 +34966,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
         }
       }
       if (!msg.mayExecute && (!scope || scope.currentBinding()?.bindingId === msg.bindingId)) {
+        log(`Daemon retired runtime binding ${msg.bindingId} (mayExecute=false); closing the transcript bridge and the CLI backend`);
         closeRequested = true; stopBridgeWatcher(); stopScreenshotLoop(); killCli();
       } else if (continuation) void flushPending();
       break;

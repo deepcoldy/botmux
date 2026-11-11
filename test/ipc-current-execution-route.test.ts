@@ -260,6 +260,63 @@ describe('POST /api/current-execution', () => {
     }
   });
 
+  it('a requester who authorizes mid-turn gets the grant on a later fetch of the same turn (#3312)', async () => {
+    const { publishTurnCliIdentity, __resetTransientRefusalsForTest, NOT_AUTHORIZED_RETRY_INTERVAL_MS } = await import('../src/core/turn-cli-identity.js');
+    const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+    const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
+    const ds = session();
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 's-execution' ? ds : undefined);
+    const policy = parseTriggerUserAuthConfig({ enabled: true, tools: ['bytedcli'], credentialSource: 'platform' });
+    vi.spyOn(await import('../src/bot-registry.js'), 'getBot').mockReturnValue({ config: {
+      larkAppId: 'cli_execution', larkToolBinding: true, backendType: 'pty', triggerUserAuth: policy,
+    } } as any);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const dataDir = mkdtempSync(join(tmpdir(), 'cli-identity-not-authorized-'));
+    previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    let authorized = false;
+    let calls = 0;
+    __resetTransientRefusalsForTest();
+    __setPlatformCredentialDepsForTest({
+      readBinding: () => ({ platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' }),
+      resolveUnionId: async () => 'on_alice',
+      requestGrant: async () => {
+        calls++;
+        return authorized
+          ? { ok: true, value: { tool: 'bytedcli', unionId: 'on_alice', expiresAt: Date.now() + 3_600_000,
+            variables: { BYTEDCLI_USER_CLOUD_JWT: 'jwt-after-authorizing' } } }
+          : { ok: false, reason: 'not_authorized', error: 'credential_not_found', authorizeUrl: 'https://platform.example.test/credentials' };
+      },
+    });
+    const fetchIdentity = async () => {
+      const response = await fetch(`http://127.0.0.1:${ipc!.port}/api/current-execution-identity`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ sessionId: 's-execution', tool: 'bytedcli' }),
+      });
+      expect(response.status).toBe(200);
+      return ((await response.json()) as { env: string }).env;
+    };
+    try {
+      await publishTurnCliIdentity({
+        botConfig: { larkAppId: 'cli_execution', larkAppSecret: 's', brand: 'feishu', triggerUserAuth: policy } as any,
+        sessionDataDir: dataDir, sessionId: 's-execution', senderOpenId: 'ou_alice',
+        turnId: 'trigger-current', storageModel: 'proven',
+      });
+      // The turn starts refused, and its next call right away is not a new platform request.
+      expect(await fetchIdentity()).toContain("BOTMUX_IDENTITY_MODE='denied'");
+      expect(calls).toBe(1);
+      // They authorize on the platform; once the spacing has passed, the same turn picks the grant up.
+      authorized = true;
+      vi.spyOn(Date, 'now').mockReturnValue(Date.now() + NOT_AUTHORIZED_RETRY_INTERVAL_MS + 1_000);
+      expect(await fetchIdentity()).toContain("BYTEDCLI_USER_CLOUD_JWT='jwt-after-authorizing'");
+      expect(calls).toBe(2);
+    } finally {
+      __setPlatformCredentialDepsForTest(null);
+      __resetTransientRefusalsForTest();
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('re-reads the live bot policy after the platform answers: a mid-flight switch to local is not written', async () => {
     const { publishTurnCliIdentity, __resetTransientRefusalsForTest } = await import('../src/core/turn-cli-identity.js');
     const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');

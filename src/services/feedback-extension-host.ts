@@ -17,6 +17,7 @@ import { handleSkillFeedbackCardAction, renderFeedbackCard } from '../im/lark/sk
 import { surfaceFeedbackStore, renderFeedbackSurfaceState } from './feedback-surface-delivery.js';
 import { feedbackMaintenanceActive, acquireFeedbackSendLease } from './feedback-maintenance.js';
 import { resolveFeedbackPresentation } from './feedback-presentation.js';
+import { normalizeFeedbackContext } from './feedback-context.js';
 import { feedbackRefreshBudget, refreshFeedbackMessage } from './feedback-refresh.js';
 import type { FeedbackHookRegistration } from './feedback-extension-types.js';
 
@@ -262,7 +263,8 @@ export async function handleFeedbackExtensionCard(input: unknown, appId: string,
       scope: { chatId: String(binding.chatId), topicId: binding.subjectId, subjectId: binding.subjectId, sourceMessageId: binding.subjectId },
       answer: { answerGroupId: binding.answerId, deliveryId: binding.deliveryId, messageIds: binding.messageIds ?? [binding.answerMessageId], round: binding.round },
       surface: { messageId, templateId: binding.templateId }, actor: { openId: actor, appId },
-      action: { id: action.id }, feedback: null, contextRef: null,
+      action: { id: action.id }, feedback: null,
+      context: binding.context === null ? null : normalizeFeedbackContext(binding.context) ?? null, contextRef: null,
     };
     extensions.requestAction({
       requestId: createHash('sha256').update(JSON.stringify([jobId, actor, messageId])).digest('hex'),

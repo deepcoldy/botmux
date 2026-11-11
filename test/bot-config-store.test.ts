@@ -2629,6 +2629,29 @@ describe('bot-config store', () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe('bot_not_registered');
   });
+
+  it('persists idleSpinSuspend without dropping other bot fields', async () => {
+    const { registry, store } = await loaded({ workingDir: '/tmp/keep-me', maxLiveWorkers: 12 });
+    const spec = store.findConfigField('idleSpinSuspend')!;
+    const coerced = store.coerceConfigValue(spec, JSON.stringify({ cpuPercent: 30, cliIds: ['traex'] }));
+    expect(coerced.ok).toBe(true);
+    const r = await store.applyConfigField('app_default', spec, (coerced as any).value);
+    expect(r.ok).toBe(true);
+    const persisted = readConfig();
+    expect(persisted.idleSpinSuspend).toMatchObject({ cpuPercent: 30, cliIds: ['traex'] });
+    expect(persisted.workingDir).toBe('/tmp/keep-me');
+    expect(persisted.maxLiveWorkers).toBe(12);
+    expect(registry.getBot('app_default').config.idleSpinSuspend).toMatchObject({ cpuPercent: 30 });
+  });
+
+  it('rejects an out-of-range idleSpinSuspend without writing', async () => {
+    const { store } = await loaded({ maxLiveWorkers: 12 });
+    const spec = store.findConfigField('idleSpinSuspend')!;
+    const coerced = store.coerceConfigValue(spec, JSON.stringify({ cpuPercent: 0 }));
+    expect(coerced.ok).toBe(false);
+    expect(readConfig().idleSpinSuspend).toBeUndefined();
+    expect(readConfig().maxLiveWorkers).toBe(12);
+  });
 });
 
 describe('codexProfile cross-field gate across generic write surfaces (#2037)', () => {

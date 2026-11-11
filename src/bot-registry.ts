@@ -43,6 +43,7 @@ import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
 import { parseVolcengineConfig } from './services/voice/volcengine-config.js';
 import { normalizeGroupIdleClose, type GroupIdleCloseSettings } from './core/group-idle-close.js';
+import { normalizeIdleSpinSuspendConfig } from './core/idle-spin-config.js';
 import { normalizeGroupSerialInput } from './core/group-serial-input.js';
 import { normalizeGroupDefaultModels, type GroupDefaultModels } from './core/group-default-models.js';
 import type { GroupJoinAnchorMode } from './core/auto-start.js';
@@ -1891,6 +1892,16 @@ export interface BotConfig {
    * (pty/riff/mojo) are never TTL-suspended. See core/idle-worker-sweeper.ts.
    */
   idleSuspendMinutes?: number;
+  /**
+   * CPU-driven idle suspension. Layer 1 parks an idle worker whose CLI
+   * process subtree keeps burning CPU (default: TRAE only, 20% of one core
+   * for 3 consecutive samples after 5 minutes idle). Layer 2 is the
+   * host-pressure backstop over the same `cliIds` scope. Neither layer parks
+   * a CLI that still has live child processes (background tasks). Unset =
+   * conservative defaults; set
+   * `{ enabled: false }` to opt out. See core/idle-spin-config.ts.
+   */
+  idleSpinSuspend?: import('./core/idle-spin-config.js').IdleSpinSuspendConfig;
   /** Periodically @ the persisted Session owner while selected actionable
    * runtime states remain unchanged. Missing means disabled. */
   sessionOwnerReminder?: SessionOwnerReminderConfig;
@@ -2423,6 +2434,13 @@ export interface BotConfig {
    * 不被此开关阻断（拆除与只读始终允许）。
    */
   chatManagerEnabled?: boolean;
+  /**
+   * 群负责人免 @ 接的顶层消息，在「共享」回复模式（`regularGroupReplyMode`/`/reply-mode` = shared）
+   * 的普通群里也开话题：回复挂在那条消息下面，和 @ 本 bot 的顶层消息一样；会话仍是群级那一个。
+   * 仅当显式为 true 且 `chatManagerEnabled` 也为 true 时生效。默认（undefined/false）= 关闭：
+   * 群负责人免 @ 的消息照旧平铺回复，老用户行为不变。其它回复模式不受影响。
+   */
+  chatManagerSharedTopic?: boolean;
   /**
    * 群秘书（`/secretary on`）总开关。仅当显式为 true 时，群里才能用 `/secretary on|takeover`
    * 把本 bot 设为群秘书，后台旁听与巡检才运行。默认（undefined/false）= 关闭，老用户行为不变；
@@ -4365,6 +4383,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         && Number.isInteger(entry.idleSuspendMinutes) && entry.idleSuspendMinutes > 0
         ? entry.idleSuspendMinutes
         : undefined,
+      idleSpinSuspend: (() => {
+        if (entry.idleSpinSuspend === undefined) return undefined;
+        const normalized = normalizeIdleSpinSuspendConfig(entry.idleSpinSuspend);
+        if (normalized === undefined) {
+          logger.warn(`[bot-registry:${entry.larkAppId}] ignoring invalid idleSpinSuspend`);
+        }
+        return normalized;
+      })(),
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
       longTaskReminder: normalizeLongTaskReminderConfig(entry.longTaskReminder),
       quotaFallbackBot: normalizedQuotaFallback.config,
@@ -4518,6 +4544,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
       chatManagerEnabled: entry.chatManagerEnabled === true || undefined,
+      chatManagerSharedTopic: entry.chatManagerSharedTopic === true || undefined,
       groupSecretaryEnabled: entry.groupSecretaryEnabled === true || undefined,
       // 非法的 steward 配置按关处理（不阻断 bot 启动）；Dashboard / /config 写入时已校验。
       steward: (() => {

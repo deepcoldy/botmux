@@ -255,6 +255,8 @@ setTimeout(() => {
   render();
   process.stdin.on('data', buf => {
     const s = buf.toString('utf8');
+    // Claude reads a backslash right before Enter as a soft newline.
+    if (s === '\\r' && composer.endsWith('\\\\')) { composer = composer.slice(0, -1) + '\\n'; render(); return; }
     if (s === '\\r') { submit(); return; }
     composer += s.replace(/\\r/g, '\\n');
     render();

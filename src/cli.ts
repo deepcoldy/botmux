@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { selectReplyMessageId, parseReplyMessageTarget } from './core/reply-message.js';
 import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { isMessageListenerTaskAnchor, isSilentMessageListenerSession, messageListenerSendBlocked } from './core/message-listener-silence.js';
@@ -77,7 +78,7 @@ import {
 } from './core/dispatch-lifecycle.js';
 import { withBotSteerDirective } from './core/bot-steer-directive.js';
 import { withBotSessionDirective } from './core/topic-session-continuity.js';
-import { pickTurnReplyTarget, collectTurnWindowParticipants } from './core/reply-target.js';
+import { pickTurnReplyTarget, collectTurnWindowParticipants, dedupeParticipants } from './core/reply-target.js';
 import {
   consumeAutostartUnitMarker,
   enableAutostart,
@@ -5722,29 +5723,21 @@ async function cmdList(): Promise<void> {
   // would make a large session list quadratic and amplify socket timeouts.
   const probeSnapshot = buildBackingProbeSnapshot(active);
 
-  // Auto-prune unrecoverable sessions: process dead and no recoverable backing
-  // session (tmux/herdr/zellij/zmx).
-  // Split into two buckets so a never-activated daemon-command scratch (e.g. an
+  // Auto-prune only never-activated daemon-command scratches (e.g. an
   // unconfirmed /adopt that only posted a picker card, /help, an abandoned
-  // /relay picker) isn't reported as a crashed CLI. Such a scratch never forked
+  // /relay picker). Such a scratch never forked
   // a worker, so it has no cliId / lastCliInput / adoptedFrom — the same "was it
   // ever a real CLI session" markers isRelayableRealSession uses. Closing it is
   // fine, but the "进程已死且无 tmux session" notice wrongly implies a CLI ran
   // and crashed, which is exactly the confusing output users hit after /adopt.
-  const pruned: SessionData[] = [];
   const prunedScratch: SessionData[] = [];
   const live: SessionData[] = [];
   for (const s of active) {
     if (isAdoptedSession(s)) {
-      const pid = adoptedCliPid(s);
-      if (pid && isProcessAlive(pid)) {
-        live.push(s);
-      } else if (pid) {
-        pruned.push(s);
-      } else {
-        const hasPid = !!(s.pid && isProcessAlive(s.pid));
-        hasPid ? live.push(s) : pruned.push(s);
-      }
+      // A sandbox can deny signal-zero probes of the external CLI with EPERM.
+      // Listing must not turn that lack of visibility into a permanent close
+      // of its live bridge. Retain even a stale/missing pid for explicit detach.
+      live.push(s);
       continue;
     }
 
@@ -5753,8 +5746,7 @@ async function cmdList(): Promise<void> {
     const disposition = sessionListDisposition(s, { hasPid, hasBackingSession });
     // Non-adopt sessions are only ever kept or pruned-as-scratch now: a real
     // managed session with a missing backing is dormant-recoverable, never
-    // auto-closed by this read command (see sessionListDisposition). Adopt
-    // zombies still reach the `pruned` bucket via the branch above.
+    // auto-closed by this read command (see sessionListDisposition).
     if (disposition === 'prune_scratch') prunedScratch.push(s);
     else live.push(s);
   }
@@ -5781,20 +5773,14 @@ async function cmdList(): Promise<void> {
     // Keep `list` read-only in primary mode. These rows come from the Pod-local
     // store, so even an apparently harmless scratch cleanup could close only
     // the local row while PostgreSQL keeps the canonical Session active.
-    live.push(...prunedScratch, ...pruned);
-    const skipped = prunedScratch.length + pruned.length;
+    live.push(...prunedScratch);
+    const skipped = prunedScratch.length;
     if (skipped > 0) {
       console.warn(`⚠️ primary coordination 下已跳过 ${skipped} 个本地会话的自动清理；本次仅展示，不修改状态。`);
     }
   } else {
     // Scratches: close silently — they were placeholders, not dead sessions.
     await closeNow(prunedScratch, 'scratch');
-    if (pruned.length > 0) {
-      const prunedCount = await closeNow(pruned, 'real');
-      if (prunedCount > 0) {
-        console.log(`已自动清理 ${prunedCount} 个不可恢复的会话（进程已退出或无可恢复后端）`);
-      }
-    }
   }
 
   // Sort by creation time, newest first
@@ -6256,7 +6242,7 @@ async function cmdMaintenance(args: string[]): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'reply-card-ready' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'chat-manager' | 'rename' | 'project' | 'project-workstream' | 'decision-board' | 'continuation' | 'durable-send' | 'turn-delivery' | 'reply-card-ready' | 'feedback-bind' | typeof DEFERRED_TOPIC_CLAIM_ROUTE | 'link-refs/register' | 'link-refs/resolve',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -6264,7 +6250,7 @@ async function postSessionCliIpc(
   if (!process.env.BOTMUX_SEND_RELAY) {
     try { hostSecret = loadDaemonIpcSecret(); } catch { /* sandboxed/read-isolated: capability fallback below */ }
   }
-  if (!hostSecret || route === 'chat-manager') {
+  if (!hostSecret || route === 'chat-manager' || route === 'project-workstream') {
     const claim = readManagedOriginCapability(
       resolveDataDir(),
       sessionId,
@@ -6276,7 +6262,7 @@ async function postSessionCliIpc(
       if (claim.turnId) requestBody.originTurnId = claim.turnId;
       if (claim.dispatchAttempt !== undefined) requestBody.originDispatchAttempt = claim.dispatchAttempt;
     }
-    if (!claim && route === 'chat-manager' && !process.env.BOTMUX_SEND_RELAY && !process.env.BOTMUX_ORIGIN_CHANNEL_ID) {
+    if (!claim && (route === 'chat-manager' || route === 'project-workstream') && !process.env.BOTMUX_SEND_RELAY && !process.env.BOTMUX_ORIGIN_CHANNEL_ID) {
       const marker = findAuthenticatedAncestorSessionContext(resolveDataDir());
       if (marker?.sessionId === sessionId && marker.capability) {
         requestBody.originCapability = marker.capability;
@@ -6912,6 +6898,14 @@ async function cmdProject(argv: string[]): Promise<void> {
                         [--milestone <里程碑>] [--next-milestone <下一节点>] [--clear-next-milestone]
   botmux project close [--milestone <完成说明>]
   botmux project resume [--phase <阶段>] [--focus <当前焦点>]
+  botmux project workstream inspect --root <om_root> --source-app <cli_app> --source-session <id>
+  botmux project workstream attach --root <om_root> --source-app <cli_app> --source-session <id>
+                                  --title <24字内标题> [--purpose <说明>] [--revision <n>] [--grant <id>]
+  botmux project workstream rename --root <om_root> --title <24字内标题>
+  botmux project workstream update --root <om_root> --status <任务状态> [--content <说明>]
+  botmux project workstream status [--root <om_root>]
+  botmux project workstream grant
+  botmux project workstream notifications --mode ignore|notify
 
 说明:
   仅用于普通群的 chat-scope 主控会话。init 创建并置顶唯一进度卡；后续命令原地更新。
@@ -6931,7 +6925,8 @@ async function cmdProject(argv: string[]): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  if (session.chatType !== 'group' || session.scope !== 'chat') {
+  const sourceGrant = 'workstream' in parsed && parsed.workstream.action === 'grant';
+  if (session.chatType !== 'group' || (session.scope !== 'chat' && !sourceGrant)) {
     console.error('project 模式只能在普通群的 chat-scope 主控会话中使用。');
     process.exitCode = 1;
     return;
@@ -6946,9 +6941,17 @@ async function cmdProject(argv: string[]): Promise<void> {
   const response = await postSessionCliIpc(
     ipcPort,
     session.sessionId,
-    'project',
-    parsed.action as unknown as Record<string, unknown>,
+    'workstream' in parsed ? 'project-workstream' : 'project',
+    'workstream' in parsed ? parsed.workstream : parsed.action as unknown as Record<string, unknown>,
   );
+  if ('workstream' in parsed) {
+    const result = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; result?: unknown; grantId?: string };
+    if (!response.ok || !result.ok) {
+      console.error(`workstream 操作失败: ${result.error ?? response.status}`);
+      process.exitCode = 1;
+    } else console.log(JSON.stringify(result.result ?? result, null, 2));
+    return;
+  }
   const body = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; project?: Record<string, unknown> };
   if (!response.ok || !body.ok || !body.project) {
     console.error(`project 操作失败: ${body.error ?? `HTTP ${response.status}`}`);
@@ -7956,6 +7959,7 @@ const SEND_HELP_BODY = [
   '       --mention-back                  @回本轮触发消息的发送者（open_id 自动取自会话）',
   '       --no-mention                    明确声明本条不@任何人',
   '       --quote <message_id>            指定引用某条消息（普通群，默认引用本轮触发消息）',
+  '       --reply-to <message_id>         按当前会话已接收消息的位置回复（不改变 final 轮次）',
   '       --no-quote                      不引用，发独立消息（普通群）',
   '       --voice "<口语文字>"            合成语音气泡发出（需先 botmux voice 配置 TTS）',
   '       --top-level                     发顶层消息（不回复进当前话题）',
@@ -10377,7 +10381,7 @@ async function relaySend(
   // and --session-id flags are dropped — content/attachments come from the
   // outbox and session-id is forced host-side.
   const FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent', '--schedule-remove-self', '--top-level']);
-  const FLAGS_VAL = new Set(['--mention', '--quote', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into', '--secretary-action', '--secretary-reason']);
+  const FLAGS_VAL = new Set(['--mention', '--quote', '--reply-to', '--response-kind', '--expected-link', '--as', '--plugin-card-action', '--chat-id', '--into', '--secretary-action', '--secretary-reason']);
   const flags: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const tok = rest[i];
@@ -11635,6 +11639,16 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // Quote chain (chat scope): --quote <message_id> overrides the auto target,
   // --no-quote forces a plain (un-quoted) send.
   const explicitQuote = argValue(rest, '--quote');
+  if (flagPresentButValueMissing(rest, '--reply-to')
+    || rest.filter(token => token === '--reply-to' || token.startsWith('--reply-to=')).length > 1) {
+    console.error('botmux send: --reply-to 需要且只能指定一个消息编号');
+    process.exit(2);
+  }
+  const explicitReplyTo = argValue(rest, '--reply-to');
+  if (explicitReplyTo !== undefined && (sendTopLevel || overrideChatId || sendInto || explicitQuote !== undefined)) {
+    console.error('botmux send: --reply-to 不能与 --top-level / --chat-id / --into / --quote 混用');
+    process.exit(2);
+  }
   const managedQuoteError = managedVcQuoteError({
     managed: !!vcMeetingManagedSendOrigin,
     durableDelivery: !!vcMeetingDeliveryReplyOrigin,
@@ -11923,11 +11937,25 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
 
   // Prefer the exact per-turn reply anchor; the latest single slot is only a
   // compatibility fallback for sessions persisted before replyTargets.
-  const turnReplyTarget = pickTurnReplyTarget(s, currentTurnId);
+  const replyMarker = trustedRelayCtx && process.env.BOTMUX_REPLY_MESSAGE_ID
+    ? { sessionId: trustedRelayCtx.sessionId, turnId: trustedRelayCtx.turnId,
+        queuedTurns: [{ turnId: process.env.BOTMUX_REPLY_MESSAGE_ID, inputConsumed: true as const }] }
+    : liveMarkerCtx;
+  let replyMessageId = currentTurnId;
+  try {
+    replyMessageId = selectReplyMessageId(s, currentTurnId,
+      !sendTopLevel && !overrideChatId && !sendInto && explicitQuote === undefined
+        && !vcMeetingManagedSendOrigin && originSessionId === sid ? replyMarker : undefined,
+      explicitReplyTo);
+  } catch (error) {
+    console.error(`botmux send: ${error instanceof Error ? error.message : error}`);
+    process.exit(2);
+  }
+  const turnReplyTarget = pickTurnReplyTarget(s, replyMessageId);
   const turnBoundQuoteTarget = turnReplyTarget?.rootMessageId
-    ?? s.turnReplyContexts?.[currentTurnId ?? '']?.quoteTargetId
+    ?? s.turnReplyContexts?.[replyMessageId ?? '']?.quoteTargetId
     ?? (turnReplyTarget?.turnId?.startsWith('om_') ? turnReplyTarget.turnId : undefined)
-    ?? (currentTurnId?.startsWith('om_') ? currentTurnId : undefined);
+    ?? (replyMessageId?.startsWith('om_') ? replyMessageId : undefined);
   if (privateReplyEnabled(s) && (sendInto || overrideChatId)) {
     console.error('当前群角色已启用私聊回复，请移除 --into / --chat-id 后发送给本轮提问人。');
     process.exit(2);
@@ -12023,7 +12051,9 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   const frozenTurnDispatch = originSessionId === sid
     ? exactOriginDispatch
     : undefined;
-  const frozenTurnReplyTarget = frozenTurnDispatch?.replyTarget;
+  const selectedReplyContext = replyMessageId !== currentTurnId || explicitReplyTo
+    ? s.turnReplyContexts?.[replyMessageId ?? ''] : undefined;
+  const frozenTurnReplyTarget = parseReplyMessageTarget(selectedReplyContext?.target) ?? frozenTurnDispatch?.replyTarget;
   if (exactOriginDispatch?.deliverySink === 'http_wait'
     || exactOriginDispatch?.deliverySink === 'http_async'
     || exactOriginDispatch?.deliverySink === 'suppressed') {
@@ -12473,7 +12503,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   }
   const replyTargetSenderOpenId = explicitVcMeetingImOrigin?.replyTargetSenderOpenId
     ?? frozenTurnDispatch?.replyTargetSenderOpenId
-    ?? turnReplyTarget?.senderOpenId
+    ?? pickTurnReplyTarget(s, currentTurnId)?.senderOpenId
     ?? s.turnReplyContexts?.[currentTurnId ?? '']?.replyTargetSenderOpenId
     // #750 exact-turn contract: the global latest-slot quote sender may ONLY be
     // borrowed as a legacy fallback when there is NO currentTurnId (true
@@ -12682,7 +12712,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
           explicitQuote,
           noQuote,
           quoteTargetId: explicitQuote
-            ?? frozenTurnDispatch?.quoteTargetId
+            ?? (selectedReplyContext ? turnBoundQuoteTarget : frozenTurnDispatch?.quoteTargetId)
             ?? turnBoundQuoteTarget
             ?? (currentTurnId ? undefined : s.quoteTargetId),
           frozenReplyTarget: frozenTurnReplyTarget,
@@ -13435,6 +13465,9 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // VC turns carry their own single-target origin, so they skip this gate.
   if (mentionBack && !explicitVcMeetingImOrigin && !sendTopLevel) {
     const window = collectTurnWindowParticipants(s, currentTurnId);
+    const selectedWindow = selectedReplyContext ? collectTurnWindowParticipants(s, replyMessageId) : window;
+    window.participants = dedupeParticipants([...window.participants, ...selectedWindow.participants]);
+    window.incomplete ||= selectedWindow.incomplete;
     const ambiguity = mentionBackAmbiguity({ chatType: s.chatType, participants: window.participants, incomplete: window.incomplete });
     if (ambiguity.ambiguous) {
       console.error(mentionBackAmbiguityError(ambiguity.candidates, ambiguity.incomplete));
@@ -13445,9 +13478,12 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // --mention-back: @ the sender of the message this turn is replying to
   // (open_id from the session — model needn't know it). Bare-name form so it
   // renders as a trailing <at>.
-  if (mentionBack && replyTargetSenderOpenId
-      && !mentions.some(m => m.open_id === replyTargetSenderOpenId)) {
-    mentions.push({ open_id: replyTargetSenderOpenId, name: '' });
+  const mentionReplySender = selectedReplyContext
+    ? turnReplyTarget?.senderOpenId ?? selectedReplyContext.replyTargetSenderOpenId
+    : replyTargetSenderOpenId;
+  if (mentionBack && mentionReplySender
+      && !mentions.some(m => m.open_id === mentionReplySender)) {
+    mentions.push({ open_id: mentionReplySender, name: '' });
   }
 
   const { sendMessage, replyMessage, urgentMessage, uploadImage: uploadLarkImage, uploadFile: uploadLarkFile, MessageWithdrawnError, getChatModeStrict, getMessageThreadId } = await import('./im/lark/client.js');
@@ -13746,7 +13782,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     sessionQuoteTargetId: vcMeetingDeliveryReplyOrigin
       ? undefined
       : explicitVcMeetingImOrigin?.larkMessageId
-        ?? frozenTurnDispatch?.quoteTargetId
+        ?? (selectedReplyContext ? turnBoundQuoteTarget : frozenTurnDispatch?.quoteTargetId)
         ?? turnBoundQuoteTarget
         ?? (currentTurnId ? undefined : s.quoteTargetId),
   });
@@ -13760,7 +13796,7 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
   // 上面或 `shouldDropAfterTheFactTopicQuote` 里短路，普通热路径不多付这次调用。
   // 探测失败一律保持 quote（既有默认行为），绝不因为不确定就改变所有正常回复的落点。
   const quotedTurnInThread = quoteTargetId
-    ? (s.turnReplyContexts?.[currentTurnId ?? '']?.inThread
+    ? (s.turnReplyContexts?.[replyMessageId ?? '']?.inThread
       ?? s.turnReplyContexts?.[quoteTargetId]?.inThread)
     : undefined;
   let effectiveQuoteTargetId = quoteTargetId;

@@ -99,9 +99,14 @@ export class SessionController {
         ? this.store.binding(this.ref, continuesBindingId)?.ref : undefined;
       const state = this.store.read(this.ref);
       const continued = predecessor && sameRuntime(predecessor, state?.activeRuntime) ? predecessor : undefined;
+      // The live runtime re-reporting its own identity, e.g. the native session
+      // id a resumed Claude first shows at its first write, after the resume
+      // was confirmed at the prompt.
+      const live = this.store.binding(this.ref, bindingId);
+      const enrichesActive = state?.lifecycle === 'active' && !!live?.identity && sameRuntime(live.ref, state.activeRuntime);
       // The operation that spawned the live CLI may already be confirmed;
-      // continuing that CLI is not part of it.
-      const operation = continued && !state?.activeOperationId ? undefined : operationId;
+      // continuing or enriching that CLI is not part of it.
+      const operation = (continued || enrichesActive) && !state?.activeOperationId ? undefined : operationId;
       const bound = this.store.bindRuntime(this.ref, proposed.ref, worker, identity, operation);
       if (continued && !sameRuntime(continued, bound.ref) && sameRuntime(this.store.read(this.ref)?.activeRuntime, bound.ref)) {
         this.store.continueRuntime(this.ref, continued, bound.ref, worker);
@@ -279,7 +284,7 @@ export class SessionController {
         // is worker-scoped and must outlive the released reservation.
         const failureReport = message.type === 'error' || message.type === 'worker_error' || (message.type === 'restart_result' && message.status !== 'succeeded');
         if (!runtime.identity && !failureReport && ['stopped', 'retiring'].includes(runtime.phase)) return { kind: 'reject', reason: 'runtime_reservation_abandoned' };
-        if (!runtime.identity && !failureReport && (waitsForBinding || !['ready', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'restart_result', 'session_ready_ack'].includes(message.type))) {
+        if (!runtime.identity && !failureReport && (waitsForBinding || !['ready', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'restart_result', 'session_ready_ack', 'persistent_backend_target'].includes(message.type))) {
           this.store.deferEvent(this.ref, context.bindingId, context.eventId, context.sequence, message);
           return { kind: 'defer', bindingId: context.bindingId };
         }
