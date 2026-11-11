@@ -90,3 +90,47 @@ it('uses the sender token and sends page_token on the first directory page, as t
   expect(calls[0]!.query.get('page_token')).toBe('');
   expect(calls.every(call => call.authorization === 'Bearer operator-test-token')).toBe(true);
 });
+
+it('forwards the explicit scope on the sender path: switch and close never touch unrelated personal groups', async () => {
+  root = mkdtempSync(join(tmpdir(), 'chat-label-scope-'));
+  const data = join(homedir(), '.botmux', 'data');
+  mkdirSync(data, { recursive: true });
+  const bots = join(root, 'bots.json');
+  vi.stubEnv('BOTS_CONFIG', bots);
+  writeFileSync(bots, JSON.stringify([{
+    larkAppId: 'cli_scope', larkAppSecret: 'test-only', cliId: 'antigravity', allowedUsers: ['ou_operator'],
+  }]));
+  writeFileSync(join(data, 'user-token-cli_scope-ou_operator.json'), JSON.stringify({
+    access_token: 'operator-test-token', token_type: 'Bearer',
+    expires_at: new Date(Date.now() + 3600000).toISOString(),
+    scope: 'im:feed_group_v1:read im:feed_group_v1:write', appId: 'cli_scope', brand: 'feishu', openId: 'ou_operator',
+  }));
+  loadBotConfigs().forEach(registerBot);
+  const writes: string[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    if ((init?.method ?? 'GET') === 'GET') {
+      return Response.json({ code: 0, data: { has_more: false, groups: [
+        { group_id: 'ofg_work', name: '工作', type: 'normal' },
+        { group_id: 'ofg_p0', name: 'P0', type: 'normal' },
+        { group_id: 'ofg_backlog', name: 'Backlog', type: 'normal' },
+      ] } });
+    }
+    writes.push(url.pathname);
+    return Response.json({ code: 0, data: {} });
+  }));
+  const scope = ['P0', 'Backlog'];
+  await expect(setChatFeedGroup('cli_scope', 'oc_current', 'ou_operator', 'Backlog', undefined, scope))
+    .resolves.toEqual({ ok: true, chatId: 'oc_current', label: 'Backlog' });
+  expect(writes).toEqual([
+    '/open-apis/im/v1/groups/ofg_backlog/batch_add_item',
+    '/open-apis/im/v1/groups/ofg_p0/batch_remove_item',
+  ]);
+  writes.length = 0;
+  await expect(setChatFeedGroup('cli_scope', 'oc_current', 'ou_operator', null, undefined, scope))
+    .resolves.toEqual({ ok: true, chatId: 'oc_current', label: null });
+  expect(writes).toEqual([
+    '/open-apis/im/v1/groups/ofg_p0/batch_remove_item',
+    '/open-apis/im/v1/groups/ofg_backlog/batch_remove_item',
+  ]);
+});

@@ -90,6 +90,9 @@ describe('malformed JSON body → 400 bad_json (readJsonBodyOrBadJson)', () => {
       { actorOpenId: 'ou_operator', label: 'P0' },
       { actorOpenId: 'ou_operator', label: 'P0', managedLabels: ['P1'] },
       { actorOpenId: 'ou_operator', label: 'P0', managedLabels: 'P0' },
+      // A missing scope must never fall back to the legacy contract, which removes every personal group.
+      { actorOpenId: 'ou_operator', label: null },
+      { actorOpenId: 'ou_operator', label: 'p0' },
     ]) {
       const response = await fetch(endpoint, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
       expect(response.status).toBe(400);

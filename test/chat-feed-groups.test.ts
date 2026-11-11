@@ -88,7 +88,7 @@ describe('scoped plugin feed groups', () => {
   it.each([
     ['Unknown', ['P0']], ['P0', []], ['P0', ['P0', 'P0']],
     ['P0', ['P0', ' ']], ['P0', ['P0', 'invisible\u202ename']],
-    ['P0', ['P0', 'a'.repeat(51)]], ['P0', Array.from({ length: 51 }, (_, i) => `n${i}`)],
+    ['P0', ['P0', 'a'.repeat(51)]], ['n0', Array.from({ length: 51 }, (_, i) => `n${i}`)],
   ])('rejects malformed or out-of-scope selection %s before reading or writing', async (target, names) => {
     const client = api([]);
     await expect(replaceChatFeedGroups(client, 'oc_current', target as string, names as string[])).rejects.toThrow('invalid_chat_label');
