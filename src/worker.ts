@@ -5823,13 +5823,20 @@ function setCaptureIdentity(
   turnId: string | undefined,
   dispatchAttempt: number | undefined,
   callerOpenId?: string,
+  forceAnnouncement = false,
 ): void {
   const changed = turnId !== currentBotmuxTurnId || dispatchAttempt !== currentBotmuxDispatchAttempt;
   currentBotmuxTurnId = turnId;
   currentBotmuxDispatchAttempt = dispatchAttempt;
   currentBotmuxCallerOpenId = callerOpenId;
-  if (!changed && captureIdentityAnnounced) return;
+  if (!changed && captureIdentityAnnounced && !forceAnnouncement) return;
   if (changed && captureIdentityAnnounced) captureRevision += 1;
+  // Init sets the tuple before a runtime exists. Publish it only from a
+  // runtime scope so the daemon can retain it behind the pending binding.
+  if (workerSessionEventScope && !workerSessionEventScope.contextBinding()) {
+    captureIdentityAnnounced = false;
+    return;
+  }
   captureIdentityAnnounced = true;
   send({
     type: 'capture_identity',
@@ -23388,7 +23395,12 @@ async function spawnCli(
       if (outcome === 'refused') log(`Daemon refused runtime reservation ${binding.bindingId}; the lifecycle operation that owns the session takes over`);
       throw new CliSpawnSupersededError();
     }
-    try { await spawnCliBody(cfg, opts); }
+    try {
+      // Every reserved runtime needs its own snapshot: a failed predecessor
+      // may have lost its deferred announcement when its binding was aborted.
+      setCaptureIdentity(currentBotmuxTurnId, currentBotmuxDispatchAttempt, currentBotmuxCallerOpenId, true);
+      await spawnCliBody(cfg, opts);
+    }
     catch (error) {
       // A replacement that never published an identity releases its
       // reservation; otherwise it would mask the surviving runtime's exit.

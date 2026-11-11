@@ -25328,6 +25328,7 @@ export function forkAdoptWorker(
   const startupState: WorkerStartupState = { ready: false, failureNotified: false };
   const adoptedCliId = adopted.cliId ?? 'claude-code';
   let initMsg!: DaemonToWorker;
+  const previousInitConfig = ds.initConfig;
 
   try {
   // A fork-level failure emits 'error'; without a handler it crashes the daemon.
@@ -25556,18 +25557,27 @@ export function forkAdoptWorker(
     initMsg.restartAttemptId = runtimeController.prepareWorkerStart(initMsg.restartAttemptId);
     initMsg.sessionContract = runtimeController.bindWorker(workerGeneration);
   }
-  setupWorkerHandlers(ds, worker, startupState, workerGeneration, stderrRing);
-  ds.worker = worker;
-  initializeWorkerIpcBootstrap(worker);
   {
     const initCallerOpenId = turnCallerOpenIdFor(ds, 'turnId' in initMsg ? initMsg.turnId : undefined);
     if (initCallerOpenId) initMsg = { ...initMsg, turnCallerOpenId: initCallerOpenId };
   }
+  // IPC handlers capture the contract at registration time, before the child
+  // requests its first runtime reservation (including restored adopt sessions).
+  ds.initConfig = initMsg;
+  try {
+    startNewGenerationEnvLedger(ds, initMsg.env);
+  } catch (err) {
+    logger.error(`[${t}] Failed to initialize adopt worker env ledger: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  setupWorkerHandlers(ds, worker, startupState, workerGeneration, stderrRing);
+  ds.worker = worker;
+  initializeWorkerIpcBootstrap(worker);
   afterWorkerIpcBootstrap(worker, () => {
     opts?.onIpcDispatchAttempted?.();
     worker.send(initMsg);
   });
   } catch (err) {
+    if (ds.initConfig === initMsg) ds.initConfig = previousInitConfig;
     if (ds.worker === worker) ds.worker = null;
     try { worker.kill(); } catch { /* best-effort pre-init child fence */ }
     throw err;
@@ -25575,12 +25585,6 @@ export function forkAdoptWorker(
 
   // init is now accepted by the child. Everything below is projection only and
   // must not turn this prompt back into a retryable delivery.
-  ds.initConfig = initMsg;
-  try {
-    startNewGenerationEnvLedger(ds, initMsg.env);
-  } catch (err) {
-    logger.error(`[${t}] Failed to initialize adopt worker env ledger: ${err instanceof Error ? err.message : String(err)}`);
-  }
   const adoptedCliIdTyped = adoptedCliId as CliId;
   if (ds.session.cliId !== adoptedCliIdTyped) {
     ds.session.cliId = adoptedCliIdTyped;

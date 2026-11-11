@@ -84,7 +84,10 @@ describe.each([
 ])('persistent_backend_target published before the CLI spawn of %s', (_name, withFirstPrompt) => {
   it('reaches the daemon handler instead of being rejected', async () => {
     const { delivered, sent } = await firstStart(withFirstPrompt);
-    expect(sent.map(message => message.type)).toEqual(['runtime_binding_started', 'persistent_backend_target', 'runtime_binding']);
+    // capture_identity is force-published inside the reserved runtime before
+    // spawnCliBody, so it lands between the reservation grant and the
+    // pre-spawn backend target stamp.
+    expect(sent.map(message => message.type)).toEqual(['runtime_binding_started', 'capture_identity', 'persistent_backend_target', 'runtime_binding']);
     expect(delivered.filter(message => message.type === 'persistent_backend_target').map(message => message.target)).toEqual([target]);
   });
 
