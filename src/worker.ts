@@ -24291,6 +24291,11 @@ async function spawnCliBody(
     // the guide and the actual card renderer.
     mergedEnv.BOTMUX_REPLY_STYLE = JSON.stringify(cfg.replyStyle ?? {});
     mergedEnv.BOTMUX_REPLY_FOOTER = JSON.stringify(resolveReplyFooterPreferences(cfg.larkAppId));
+    // The local-address snapshot is likewise host-resolved: a remote `botmux
+    // send` reads it when bots.json is out of reach. Re-freeze after the raw
+    // riff env merge so a stale/forged backendConfig.env cannot turn the bot's
+    // hideLocalAddresses policy off in the remote pane.
+    mergedEnv[HIDE_LOCAL_ADDRESSES_ENV] = hideLocalAddressesEnvValue(cfg.hideLocalAddresses === true);
     // Public selector metadata is a host-resolved session snapshot. It is only
     // a send-time validation hint (the daemon reauthorizes every callback), but
     // still freeze it after raw riff env merges so stale config cannot desync
