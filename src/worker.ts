@@ -34878,7 +34878,10 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       for (const observed of msg.observedExecutions ?? []) {
         workerSessionEventScope?.rememberObservedExecution(msg.bindingId, observed.runtime, observed.execution);
       }
-      if (!msg.mayExecute) { closeRequested = true; stopBridgeWatcher(); stopScreenshotLoop(); killCli(); }
+      if (!msg.mayExecute) {
+        log(`Daemon retired runtime binding ${msg.bindingId} (mayExecute=false); closing the transcript bridge and the CLI backend`);
+        closeRequested = true; stopBridgeWatcher(); stopScreenshotLoop(); killCli();
+      }
       break;
     }
 

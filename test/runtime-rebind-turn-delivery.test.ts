@@ -50,7 +50,7 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-async function startWorker({ opening = true, cliPid = process.ppid, restart = false }: { opening?: boolean; cliPid?: number; restart?: boolean } = {}) {
+async function startWorker({ opening = true, cliPid = process.ppid, restart = false, wake = false }: { opening?: boolean; cliPid?: number; restart?: boolean; wake?: boolean } = {}) {
   const sessionReply = vi.fn(async () => 'om_reply');
   workerPool.initWorkerPool({
     sessionReply, getSessionWorkingDir: () => dir, getActiveCount: () => 1, closeSession: vi.fn(),
@@ -71,10 +71,17 @@ async function startWorker({ opening = true, cliPid = process.ppid, restart = fa
   // forkWorker's contract bootstrap: a cold start carries its opening turn on
   // init; a warm reattach gets every turn through ordinary IM delivery.
   controller = controllerForSession(ds, true)!;
+  if (wake) {
+    // A suspended session: the message that wakes it forks a worker whose CLI
+    // resumes under the session's resume operation.
+    const suspend = controller.beginControl('suspend').operation.operationId;
+    controller.controlStarted(suspend); controller.controlResult(suspend, 'confirmed');
+  }
+  const resumeId = wake ? controller.prepareWorkerStart() : undefined;
   const contract = controller.bindWorker(1);
   // A resume or /restart spawns its CLI under the control operation.
-  const restartId = restart ? controller.beginControl('restart').operation.operationId : undefined;
-  if (restartId) controller.controlStarted(restartId);
+  const restartId = restart ? controller.beginControl('restart').operation.operationId : resumeId;
+  if (restart && restartId) controller.controlStarted(restartId);
   const openingExecution = opening ? controller.admitInput(TURNS[0]) : undefined;
   ds.initConfig = { type: 'init', sessionId: SESSION, cliId: 'claude-code', backendType: 'tmux', ...(opening ? { turnId: TURNS[0] } : {}), sessionContract: contract } as any;
 
@@ -129,6 +136,8 @@ async function startWorker({ opening = true, cliPid = process.ppid, restart = fa
           for (const state of message.admissionStates ?? []) scope.noteAdmission(state);
           for (const execution of message.executions ?? []) scope.rememberExecution(execution);
           for (const observed of message.observedExecutions ?? []) scope.rememberObservedExecution(message.bindingId, observed.runtime, observed.execution);
+          // The worker stops reading its transcript once the daemon retires its runtime.
+          if (!message.mayExecute) ws.closeRequested = true;
           break;
         }
       }
@@ -337,6 +346,38 @@ describe('turns around a semantic runtime rebind', () => {
     expect(lostTurnWarnings(warn)).toEqual([]);
   });
 
+  // A message wakes a suspended session; the resume is confirmed at the CLI's
+  // first prompt (the ready gate's timeout fallback), and the resumed Claude
+  // shows its native session id only once the waking message is written. The
+  // relay had already resolved the real CLI, so the live runtime only adds that
+  // id to its identity.
+  it('answers the waking message when the woken CLI reports its native session after the resume was confirmed', async () => {
+    const warn = vi.spyOn(logger, 'warn');
+    const s = await startWorker({ wake: true, cliPid: process.pid });
+    expect(s.controller.allowsInput()).toBe(true);
+    const first = await s.writeOpeningTurn();
+    await s.publishNativeSession('native-woken');
+
+    expect(s.scope.currentBinding()).toBe(s.binding);
+    expect(s.toWorker.filter(message => message.type === 'runtime_contract_assigned').at(-1))
+      .toMatchObject({ bindingId: s.binding.bindingId, mayExecute: true });
+    expect(s.controller.currentRuntime()).toEqual(s.binding.runtime);
+    const live = s.controller.store.runtime(s.controller.ref);
+    expect(live).toMatchObject({ identity: { nativeSessionId: 'native-woken' } });
+    expect(live?.phase).not.toBe('retiring');
+    await s.answer(TURNS[0], first);
+    await vi.waitFor(() => expect(s.replies()).toEqual(answers(TURNS[0])));
+
+    const second = await s.deliver(TURNS[1]);
+    expect(s.ds.managedTurnOrigin).toMatchObject({ turnId: TURNS[1], callerOpenId: `ou_${TURNS[1]}` });
+    await s.answer(TURNS[1], second);
+    await vi.waitFor(() => expect(s.replies()).toEqual(answers(TURNS[0], TURNS[1])));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(s.replies()).toHaveLength(2);
+    expect(s.workerLog).not.toContainEqual(expect.stringContaining('Dropped final_output after close fence'));
+    expect(lostTurnWarnings(warn)).toEqual([]);
+  });
+
   // The pane's exit callback keeps the binding the CLI was spawned under.
   it('takes the idle exit of the relay-resolved CLI as the current runtime\'s exit', async () => {
     const s = await startWorker();
@@ -373,6 +414,39 @@ describe('turns around a semantic runtime rebind', () => {
     await new Promise(resolve => setTimeout(resolve, 50));
     expect(s.replies()).toHaveLength(3);
     expect(lostTurnWarnings(warn)).toEqual([]);
+  });
+});
+
+describe('identity the live runtime of a woken session reports', () => {
+  function wokenSession() {
+    const ds = {
+      session: { sessionId: SESSION, chatId: 'oc_group', chatType: 'group', status: 'active', cliId: 'claude-code',
+        createdAt: new Date().toISOString(), workerGeneration: 1 },
+      larkAppId: APP, chatId: 'oc_group', chatType: 'group', scope: 'chat', workerGeneration: 1,
+    } as unknown as DaemonSession;
+    controller = controllerForSession(ds, true)!;
+    const suspend = controller.beginControl('suspend').operation.operationId;
+    controller.controlStarted(suspend); controller.controlResult(suspend, 'confirmed');
+    const resume = controller.prepareWorkerStart()!;
+    const { worker } = controller.bindWorker(1);
+    controller.reserveBinding('spawned', worker);
+    const identity = { backend: 'tmux', physicalId: '4242:1', proof: 'process_start' } as const;
+    controller.bindRuntime('spawned', worker, identity, resume);
+    const report = () => controller.bindRuntime('spawned', worker, { ...identity, nativeSessionId: 'native-woken' }, resume);
+    return { resume, report };
+  }
+
+  it('is recorded under the resume while the resume is still open', () => {
+    const { resume, report } = wokenSession();
+    expect(report().phase).not.toBe('retiring');
+    expect(controller.operation(resume)?.phase).not.toBe('confirmed');
+    expect(controller.store.runtime(controller.ref)?.identity?.nativeSessionId).toBe('native-woken');
+  });
+
+  it('does not keep a runtime the failed resume left behind', () => {
+    const { resume, report } = wokenSession();
+    controller.controlResult(resume, 'rejected');
+    expect(report().phase).toBe('retiring');
   });
 });
 

@@ -84,9 +84,14 @@ export class SessionController {
         ? this.store.binding(this.ref, continuesBindingId)?.ref : undefined;
       const state = this.store.read(this.ref);
       const continued = predecessor && sameRuntime(predecessor, state?.activeRuntime) ? predecessor : undefined;
+      // The live runtime re-reporting its own identity, e.g. the native session
+      // id a resumed Claude first shows at its first write, after the resume
+      // was confirmed at the prompt.
+      const live = this.store.binding(this.ref, bindingId);
+      const enrichesActive = state?.lifecycle === 'active' && !!live?.identity && sameRuntime(live.ref, state.activeRuntime);
       // The operation that spawned the live CLI may already be confirmed;
-      // continuing that CLI is not part of it.
-      const operation = continued && !state?.activeOperationId ? undefined : operationId;
+      // continuing or enriching that CLI is not part of it.
+      const operation = (continued || enrichesActive) && !state?.activeOperationId ? undefined : operationId;
       const bound = this.store.bindRuntime(this.ref, proposed.ref, worker, identity, operation);
       if (continued && !sameRuntime(continued, bound.ref) && sameRuntime(this.store.read(this.ref)?.activeRuntime, bound.ref)) {
         this.store.continueRuntime(this.ref, continued, bound.ref, worker);
