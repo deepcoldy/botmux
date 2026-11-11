@@ -291,37 +291,49 @@ describe('idle-spin detector', () => {
   });
 
   it('keeps streaks and retries when the mutation gate is busy', async () => {
-    const ds = makeDs('gated');
-    const sessions = new Map([['gated', ds]]);
-    const detector = createIdleSpinDetector({
-      larkAppId: 'cli_gate',
-      activeSessions: sessions,
-      defaultCliId: 'traex',
-      sampler: fakeSampler(() => ({ gated: 200 })),
-      observeInstall: () => ({ state: 'current' }),
-      now: () => now,
-      mutationAcquireTimeoutMs: 1,
-    });
-    const { withBotTurnAdmission } = await import('../src/core/bot-turn-mutation-gate.js');
-    let release!: () => void;
-    let started!: () => void;
-    const admitted = new Promise<void>(resolve => { started = resolve; });
-    const admission = withBotTurnAdmission('cli_gate', async () => {
-      started();
-      await new Promise<void>(resolve => { release = resolve; });
-    });
-    await admitted;
+    // The gate checks its 1ms budget against Date.now() after an await, so on the
+    // wall clock a >1ms event-loop hop timed out even the uncontended retry
+    // (#3328). Freeze only Date.now: the held admission still exhausts the budget
+    // through the gate's real setTimeout, and the retry no longer races the clock.
+    // (Not vi.useFakeTimers({ toFake: ['Date'] }): bun fakes setTimeout as well,
+    // so the first tick's drain timeout would never fire on the bun-test leg.)
+    const frozenNow = Date.now();
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(frozenNow);
+    try {
+      const ds = makeDs('gated');
+      const sessions = new Map([['gated', ds]]);
+      const detector = createIdleSpinDetector({
+        larkAppId: 'cli_gate',
+        activeSessions: sessions,
+        defaultCliId: 'traex',
+        sampler: fakeSampler(() => ({ gated: 200 })),
+        observeInstall: () => ({ state: 'current' }),
+        now: () => now,
+        mutationAcquireTimeoutMs: 1,
+      });
+      const { withBotTurnAdmission } = await import('../src/core/bot-turn-mutation-gate.js');
+      let release!: () => void;
+      let started!: () => void;
+      const admitted = new Promise<void>(resolve => { started = resolve; });
+      const admission = withBotTurnAdmission('cli_gate', async () => {
+        started();
+        await new Promise<void>(resolve => { release = resolve; });
+      });
+      await admitted;
 
-    const first = await detector.tick(config({ consecutiveSamples: 1 }));
-    expect(first.gateBusy).toBe(true);
-    expect(ds.worker).not.toBeNull();
-    expect(detector.streaks().get('gated')).toBe(1);
+      const first = await detector.tick(config({ consecutiveSamples: 1 }));
+      expect(first.gateBusy).toBe(true);
+      expect(ds.worker).not.toBeNull();
+      expect(detector.streaks().get('gated')).toBe(1);
 
-    release();
-    await admission;
-    const second = await detector.tick(config({ consecutiveSamples: 1 }));
-    expect(second.suspended).toBe(1);
-    expect(ds.worker).toBeNull();
+      release();
+      await admission;
+      const second = await detector.tick(config({ consecutiveSamples: 1 }));
+      expect(second.suspended).toBe(1);
+      expect(ds.worker).toBeNull();
+    } finally {
+      dateNow.mockRestore();
+    }
   });
 
   it('resets the streak when the worker generation changes (crash/re-fork)', async () => {
