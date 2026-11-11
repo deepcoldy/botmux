@@ -125,6 +125,29 @@ describe('mention handoff: prepare', () => {
     expect(readPendingDispatchUser(dataDir, secret, prepared.value.deliveryId)?.authority.tools)
       .toEqual(['bytedcli']);
   });
+  it('does not add scoped tools when the same chat is outside the chatIds allowlist', async () => {
+    const h = harness({ triggerUserAuth: scoped });
+    h.ds.chatId = 'oc_other_group';
+    const prepared = await h.prepare({ chatId: 'oc_other_group' });
+    expect(prepared.value.delegated).toBe(true);
+    expect(readPendingDispatchUser(dataDir, secret, prepared.value.deliveryId)?.authority.tools)
+      .toEqual(['lark-cli']);
+  });
+  it('keeps scoped tools for a local target when another mentioned bot is not on this machine', async () => {
+    const h = harness({ triggerUserAuth: scoped, localBots: ['cli_source', 'cli_target'] });
+    const prepared = await h.prepare({ targetAppIds: ['cli_target', 'cli_remote'] });
+    expect(prepared.value.delegated).toBe(true);
+    expect(prepared.value.targetAppIds).toEqual(['cli_target']);
+    expect(readPendingDispatchUser(dataDir, secret, prepared.value.deliveryId)?.authority.tools)
+      .toEqual(['lark-cli', 'bytedcli']);
+  });
+  it('reports no_delegatable_tool when a direct human policy signs no tool for the target', async () => {
+    const h = harness({ triggerUserAuth: { enabled: true, tools: [],
+      dispatchOnly: { tools: ['bytedcli'], targetAppIds: ['cli_elsewhere'], chatIds: ['oc_chat'] } } });
+    const prepared = await h.prepare();
+    expect(prepared).toEqual({ status: 200, value: { ok: true, delegated: false, reason: 'no_delegatable_tool' } });
+    expect(() => store()).toThrow();
+  });
   it.each(['bot', 'scheduled', 'other-target', 'mixed-target', 'recovery', 'inherited'])(
     'does not add scoped tools to a %s mention', async scenario => {
       const h = harness({ triggerUserAuth: scoped });

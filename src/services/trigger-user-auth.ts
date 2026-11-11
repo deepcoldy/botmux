@@ -257,10 +257,17 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
   );
 
   let dispatchOnly: TriggerUserAuthConfig['dispatchOnly'];
-  if (rec.dispatchOnly !== undefined) {
-    if (!enabled || typeof rec.dispatchOnly !== 'object' || rec.dispatchOnly === null
+  // dispatchOnly only takes effect while the policy is enabled, so a disabled
+  // policy accepts and drops the field instead of validating it. Flipping
+  // `enabled` to false by hand is a natural kill switch; rejecting the load
+  // here would make that one bot's edit fail the whole bots.json and take
+  // every other bot in the file down on the next daemon start. Re-enabling
+  // re-runs this parser, so a malformed scope is still refused before it can
+  // ever govern a dispatch.
+  if (rec.dispatchOnly !== undefined && enabled) {
+    if (typeof rec.dispatchOnly !== 'object' || rec.dispatchOnly === null
       || Array.isArray(rec.dispatchOnly)) {
-      throw new TriggerUserAuthConfigError('triggerUserAuth.dispatchOnly requires an enabled object');
+      throw new TriggerUserAuthConfigError('triggerUserAuth.dispatchOnly requires an object');
     }
     const entry = rec.dispatchOnly as Record<string, unknown>;
     const identifiers = (key: 'targetAppIds' | 'chatIds', pattern: RegExp): string[] => {

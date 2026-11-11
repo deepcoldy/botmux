@@ -9426,15 +9426,20 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
     } else if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
       return skip('delegated_caller_not_allowed');
     }
+    const directHumanTurn = ds.session.failedTurnRecovery?.turnId !== turnId
+      && !!active && active.turnId === turnId
+      && active.caller.senderType === 'user' && !active.caller.source
+      && active.caller.requestLarkAppId === ds.larkAppId
+      && !!active.caller.requestUserOpenId;
+    // Scope the dispatch-only check to `targets` — the local bots that actually
+    // receive a signed record. The raw targetAppIds may name a bot that is not
+    // configured on this machine; it is filtered out above, so letting it veto
+    // the whitelist would only strip tools from the local targets that matched.
     const dispatchOnlyTools = dispatchOnlyToolsForTurn(bot.triggerUserAuth, {
       sourceChatId: ds.chatId,
       targetChatId: chatId,
-      targetAppIds,
-      directHuman: ds.session.failedTurnRecovery?.turnId !== turnId
-        && !!active && active.turnId === turnId
-        && active.caller.senderType === 'user' && !active.caller.source
-        && active.caller.requestLarkAppId === ds.larkAppId
-        && !!active.caller.requestUserOpenId,
+      targetAppIds: targets,
+      directHuman: directHumanTurn,
       inherited: !!inherited,
     });
     const authority = await authorityForDispatch({
@@ -9446,7 +9451,14 @@ ipcRoute('POST', DISPATCH_USER_MENTION_PREPARE_ROUTE, async (req, res) => {
       tools: [...new Set([...bot.triggerUserAuth!.tools, ...dispatchOnlyTools])],
       resolveUnionId: resolveUnionIdFromOpenId,
     });
-    if (!authority) return skip(inherited ? 'no_shared_tool' : 'no_direct_human');
+    if (!authority) {
+      if (inherited) return skip('no_shared_tool');
+      // A live human whose policy signs no tool for this target is distinct
+      // from a turn that has no direct human at all; keep the audit reason
+      // truthful so a skipped handoff is not misread as a non-human caller.
+      if (!directHumanTurn) return skip('no_direct_human');
+      return skip('no_delegatable_tool');
+    }
     if (ds.managedTurnOrigin?.turnId !== turnId) {
       return jsonRes(res, 409, { ok: false, error: 'dispatch_turn_changed' });
     }

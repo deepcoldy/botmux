@@ -206,6 +206,18 @@ describe('dispatch user IPC end-to-end identity binding', () => {
       if (scenario === 'bot' || scenario === 'recovered-caller') expect(signed).toBeUndefined();
       else expect(signed?.authority.tools).toEqual(['lark-cli']);
     });
+  it('does not add dispatch-only credentials when the shared chat is outside the chatIds allowlist', async () => {
+    const h = harness();
+    h.ds.chatId = 'oc_other_group';
+    h.body.chatId = 'oc_other_group';
+    restrictSource(h);
+    h.scope.lookupMessageChatId = vi.fn(async () => 'oc_other_group');
+    expect((await h.run()).status).toBe(200);
+    const signed = await resolveDispatchUser({ dataDir, secret,
+      appId: h.body.targetAppIds[0], chatId: 'oc_other_group', rootId: 'om_root',
+      turnId: 'om_kickoff', waitMs: 0 });
+    expect(signed?.authority.tools).toEqual(['lark-cli']);
+  });
   it.each(['completed', 'failed', 'aborted'] as const)('keeps TRAE human delegation through transient screen-idle until %s', async outcome => {
     const h = harness({}, true); // sandbox off: host IPC authentication is available
     const path = join(dataDir, 'rollout.jsonl');
