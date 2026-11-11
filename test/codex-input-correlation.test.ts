@@ -30,7 +30,7 @@ function pane(onEnter: (text: string) => void) {
   let text = '';
   return {
     cliPid: 1234,
-    write(data: string) { text = data.replace(/^\x1b\[200~/, '').replace(/\x1b\[201~\r$/, ''); onEnter(text); },
+    write(data: string) { if (data === '\r') onEnter(text); else text = data.replace(/^\x1b\[200~/, '').replace(/\x1b\[201~$/, ''); },
     submitBracketedPaste(data: string) { text = data; onEnter(text); },
     pasteText(data: string) { text = data; },
     sendSpecialKeys() { onEnter(text); },

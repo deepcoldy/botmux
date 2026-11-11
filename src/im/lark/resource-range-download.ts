@@ -16,9 +16,10 @@ class RangeDownloadError extends Error {}
 
 /** SDK stream errors carry JSON in response.data, not response.data.code.
  * Read only a bounded error body; never serialize the SDK request/credentials. */
-export async function isResourceSizeLimitError(error: any): Promise<boolean> {
+export async function getResourceErrorCode(error: any): Promise<number | undefined> {
   const data = error?.response?.data;
-  if (Number(data?.code ?? error?.code) === LARK_RESOURCE_SIZE_LIMIT_CODE) return true;
+  const code = Number(data?.code ?? error?.code);
+  if (Number.isFinite(code)) return code;
   let body = '';
   if (typeof data === 'string' || Buffer.isBuffer(data)) {
     body = data.toString().slice(0, 32 * 1024);
@@ -29,14 +30,20 @@ export async function isResourceSizeLimitError(error: any): Promise<boolean> {
       let bytes = 0;
       for await (const chunk of data) {
         bytes += Buffer.byteLength(chunk);
-        if (bytes > 32 * 1024) return false;
+        if (bytes > 32 * 1024) return undefined;
         body += chunk.toString();
       }
-    } catch { return false; }
+    } catch { return undefined; }
     finally { clearTimeout(timer); data.destroy?.(); }
   }
-  try { return Number(JSON.parse(body).code) === LARK_RESOURCE_SIZE_LIMIT_CODE; }
-  catch { return false; }
+  try {
+    const parsedCode = Number(JSON.parse(body).code);
+    return Number.isFinite(parsedCode) ? parsedCode : undefined;
+  } catch { return undefined; }
+}
+
+export async function isResourceSizeLimitError(error: any): Promise<boolean> {
+  return await getResourceErrorCode(error) === LARK_RESOURCE_SIZE_LIMIT_CODE;
 }
 
 function validateRange(stream: ResourceStream, start: number, end: number, total?: number): number {

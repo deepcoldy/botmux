@@ -1,7 +1,8 @@
 /**
  * A turn whose platform grant failed transiently (no answer, reset, timeout)
  * must not stay refused for the whole turn: in the proven model the daemon
- * re-asks the platform when the wrapper next fetches the refusal.
+ * re-asks the platform when the wrapper next fetches the refusal. The same
+ * holds for "not authorized yet": the person can authorize mid-turn (#3312).
  *
  * Run:  npx vitest run --project unit test/turn-cli-identity-transient-retry.test.ts
  */
@@ -37,16 +38,23 @@ const {
   TRANSIENT_REFUSAL_RETRY_INTERVAL_MS,
   TRANSIENT_REFUSAL_MAX_RETRIES,
   TRANSIENT_REFUSAL_WAIT_CAP_MS,
+  NOT_AUTHORIZED_RETRY_INTERVAL_MS,
+  NOT_AUTHORIZED_MAX_RETRIES,
 } = await import('../src/core/turn-cli-identity.js');
 const { recallProvenIdentityContent, forgetProvenIdentityContent, writeSessionIdentity } = await import('../src/core/cli-identity.js');
 const { parseTriggerUserAuthConfig } = await import('../src/services/trigger-user-auth.js');
 const { __setPlatformCredentialDepsForTest } = await import('../src/core/platform-credential-source.js');
+const { TOTAL_BUDGET_MS } = await import('../src/platform/credential-grant-budget.js');
 
 const ALICE = 'ou_alice';
 const SESSION = 'sess-1';
 const TURN = 'om_t1';
 const BINDING = { platformUrl: 'https://platform.example.test', machineToken: 'mt', machineId: 'm-1' };
 const NETWORK_DOWN = { ok: false, reason: 'network', error: '连接超时（5000ms）' };
+const NOT_AUTHORIZED = { ok: false, reason: 'not_authorized', error: 'credential_not_found', authorizeUrl: 'https://platform.example.test/credentials' };
+const CONSENT_MISSING = { ok: false, reason: 'consent_missing', error: 'consent_missing', authorizeUrl: 'https://platform.example.test/credentials?consent=1' };
+const NOT_TEAMMATE = { ok: false, reason: 'not_teammate', error: 'not_teammate' };
+const FORBIDDEN = { ok: false, reason: 'forbidden', status: 403, error: 'machine_forbidden' };
 const GRANTED = {
   ok: true,
   value: {
@@ -140,29 +148,116 @@ describe('transient platform refusal within a turn', () => {
     expect(grantCalls).toBe(3);
   });
 
-  it('an answer about the person (not authorized) is final and is never re-asked', async () => {
-    responses = [{ ok: false, reason: 'not_authorized', error: 'credential_not_found' }];
-    const out = await prepare();
-    expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('needs-authorization');
-    later();
-    await retry();
-    expect(grantCalls).toBe(1);
-  });
+  it.each([['not a teammate', NOT_TEAMMATE], ['forbidden', FORBIDDEN]] as const)(
+    'an answer about the person that cannot change mid-turn (%s) is final and is never re-asked', async (_label, answer) => {
+      responses = [answer];
+      const out = await prepare();
+      expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('needs-authorization');
+      later(NOT_AUTHORIZED_RETRY_INTERVAL_MS);
+      await retry();
+      expect(grantCalls).toBe(1);
+    });
 
-  it('a retry that now gets a definite answer publishes it and stops retrying', async () => {
-    responses = [NETWORK_DOWN, { ok: false, reason: 'not_authorized', error: 'credential_not_found', authorizeUrl: 'https://platform.example.test/credentials' }];
+  it('a retry that now gets a final answer about the person publishes it and stops retrying', async () => {
+    responses = [NETWORK_DOWN, NOT_TEAMMATE];
     await prepare();
     const transient = current();
     later();
     await retry();
     expect(grantCalls).toBe(2);
     expect(current()).not.toBe(transient);
-    expect(current()).toContain('https://platform.example.test/credentials');
-    later();
+    later(NOT_AUTHORIZED_RETRY_INTERVAL_MS);
     await retry();
     expect(grantCalls).toBe(2);
   });
 
+  it('a retry that now gets "not authorized" publishes it and keeps asking on the not-authorized pace', async () => {
+    responses = [NETWORK_DOWN, NOT_AUTHORIZED, GRANTED];
+    await prepare();
+    later();
+    await retry();
+    expect(grantCalls).toBe(2);
+    expect(current()).toContain('https://platform.example.test/credentials');
+    later(); // the outage pace no longer applies
+    await retry();
+    expect(grantCalls).toBe(2);
+    later(NOT_AUTHORIZED_RETRY_INTERVAL_MS);
+    await retry();
+    expect(grantCalls).toBe(3);
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
+  });
+
+});
+
+describe('not authorized yet within a turn (#3312)', () => {
+  it('the person authorizes mid-turn and a later call in the same turn gets the grant', async () => {
+    responses = [NOT_AUTHORIZED, GRANTED];
+    const out = await prepare();
+    expect(out.find(o => o.tool === 'bytedcli')?.state).toBe('needs-authorization');
+    expect(current()).toContain('https://platform.example.test/credentials');
+    // The refusal was itself just asked: no re-ask before the spacing has passed.
+    await retry();
+    later(NOT_AUTHORIZED_RETRY_INTERVAL_MS - 1);
+    await retry();
+    expect(grantCalls).toBe(1);
+    later(1);
+    await retry();
+    expect(grantCalls).toBe(2);
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
+    expect(current('codebase')).not.toContain("BOTMUX_IDENTITY_MODE='denied'");
+    later(NOT_AUTHORIZED_RETRY_INTERVAL_MS);
+    await retry();
+    expect(grantCalls).toBe(2); // recovered: nothing more to ask
+  });
+
+  it('keeps the same refusal while they have not authorized, and stops after a bounded number of re-asks', async () => {
+    responses = [NOT_AUTHORIZED];
+    await prepare();
+    const refusal = current();
+    for (let i = 1; i <= NOT_AUTHORIZED_MAX_RETRIES + 2; i++) {
+      later(NOT_AUTHORIZED_RETRY_INTERVAL_MS);
+      await retry();
+      expect(current()).toBe(refusal);
+    }
+    expect(grantCalls).toBe(1 + NOT_AUTHORIZED_MAX_RETRIES);
+  });
+
+  it('switches the refusal to the consent step when that is what is missing now, and still recovers', async () => {
+    responses = [NOT_AUTHORIZED, CONSENT_MISSING, GRANTED];
+    await prepare();
+    const notAuthorized = current();
+    later(NOT_AUTHORIZED_RETRY_INTERVAL_MS);
+    await retry();
+    expect(current()).not.toBe(notAuthorized);
+    expect(current()).toContain('consent=1');
+    later(NOT_AUTHORIZED_RETRY_INTERVAL_MS);
+    await retry();
+    expect(grantCalls).toBe(3);
+    expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
+  });
+
+  it('a revocation of the person\'s credentials during the turn ends the re-asks', async () => {
+    responses = [NOT_AUTHORIZED, GRANTED];
+    await prepare();
+    authEpoch++;
+    later(NOT_AUTHORIZED_RETRY_INTERVAL_MS);
+    await retry();
+    expect(grantCalls).toBe(1);
+    expect(current()).toContain("BOTMUX_IDENTITY_MODE='denied'");
+  });
+
+  it('the single-file model publishes the refusal as before and registers nothing', async () => {
+    responses = [NOT_AUTHORIZED, GRANTED];
+    await publishTurnCliIdentity({
+      botConfig: config, sessionDataDir: dir, sessionId: SESSION, senderOpenId: ALICE, turnId: TURN, storageModel: 'single',
+    });
+    later(NOT_AUTHORIZED_RETRY_INTERVAL_MS);
+    await retry();
+    expect(grantCalls).toBe(1);
+  });
+});
+
+describe('transient platform refusal within a turn: concurrency and policy', () => {
   it('never overwrites a publication that replaced the refusal while the retry was in flight', async () => {
     responses = [NETWORK_DOWN];
     await prepare();
@@ -230,6 +325,25 @@ describe('transient platform refusal within a turn', () => {
     release(GRANTED);
     await vi.waitFor(() => expect(current()).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'"));
     expect(grantCalls).toBe(2);
+  });
+
+  it('a re-ask that takes a whole platform grant budget still answers the wrapper waiting on it', async () => {
+    responses = [NETWORK_DOWN];
+    await prepare();
+    const release = hangingGrants();
+    const now = Date.now();
+    vi.useRealTimers();
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+    let served: string | undefined;
+    const waiting = retry().then(() => { served = current(); });
+    await vi.waitFor(() => expect(grantCalls).toBe(2));
+    // The platform answers on the grant client's last millisecond.
+    setTimeout(() => release(GRANTED), TOTAL_BUDGET_MS);
+    await vi.advanceTimersByTimeAsync(TOTAL_BUDGET_MS);
+    await waiting;
+    expect(served).toContain("BYTEDCLI_USER_CLOUD_JWT='cloud-jwt'");
+    expect(TRANSIENT_REFUSAL_WAIT_CAP_MS).toBeGreaterThan(TOTAL_BUDGET_MS);
   });
 
   it('a policy changed mid-turn ends the re-asks instead of fetching under the old one', async () => {

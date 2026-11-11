@@ -1,3 +1,4 @@
+import { setChatFeedGroup } from '../services/chat-feed-groups.js';
 import { readOncallDeploymentEnv } from '../services/oncall-deployment-config.js';
 import { loadOncallPresetOptions } from '../services/oncall-preset-options.js';
 import { loadOncallGroupTarget, readOncallGroupSettings, saveOncallGroupTarget } from '../services/oncall-group-client.js';
@@ -403,7 +404,7 @@ import {
   protectedSessionMutationReasons,
 } from './session-mutation-guard.js';
 import { listPendingAsks, submitAskFromDesktop } from './ask-broker.js';
-import { getGlobalMessageListenerConfig, getGroupMessageListenerMode, getMessageListenerConfig, messageListenerConfigFromUpdate, sanitizeMessageListenerUpdate, updateGlobalMessageListenerConfig, updateGroupMessageListenerMode, updateMessageListenerConfig, validateMessageListenerUpdate } from '../services/message-listener-store.js';
+import { getGlobalMessageListenerConfig, getGroupMessageListenerMode, getMessageListenerConfig, messageListenerConfigFromUpdate, sanitizeMessageListenerUpdate, saveCustomGroupMessageListener, updateGlobalMessageListenerConfig, updateGroupMessageListenerMode, updateMessageListenerConfig, validateMessageListenerUpdate } from '../services/message-listener-store.js';
 import { getCommandTriggerConfig, setCommandTriggerChatEnabled, updateCommandTriggerConfig } from '../services/command-trigger-store.js';
 import { reservedCommandKind } from '../services/command-trigger.js';
 import { resolvePassthroughCommands } from './command-handler.js';
@@ -1645,8 +1646,9 @@ ipcRoute('POST', CURRENT_EXECUTION_IDENTITY_ROUTE, async (req, res) => {
         tool: tool === 'codebase' ? 'bytedcli' : tool, delegated: delegation, storageModel: 'proven',
       });
     }
-    // A refusal published because the platform was unreachable when the turn
-    // was prepared gets another chance on this call (rate-limited, CAS-guarded).
+    // A refusal published when the turn was prepared — the platform was
+    // unreachable, or the person had not authorized yet — gets another chance
+    // on this call (rate-limited per refusal kind, CAS-guarded).
     // The Codebase companion is published together with bytedcli.
     //
     // The policy is passed as a READER, not a config: a Dashboard edit replaces
@@ -7920,6 +7922,22 @@ ipcRoute('PUT', '/api/group-card-mode/:chatId', async (req, res, p) => {
   return jsonRes(res, 200, { ok: true, enabled, changed: result.changed });
 });
 
+/** Trusted plugin host operation; actor identity remains bound to the command sender. */
+ipcRoute('PUT', '/api/groups/:chatId/feed-group', requireBoundBot(async (req, res, p) => {
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  const { actorOpenId, label } = body as Record<string, unknown>;
+  if (typeof actorOpenId !== 'string' || (label !== null && typeof label !== 'string')) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  const cancelled = new AbortController();
+  const onClose = () => { if (!res.writableEnded) cancelled.abort(); };
+  res.once('close', onClose);
+  try {
+    const result = await setChatFeedGroup(cachedLarkAppId, p.chatId, actorOpenId, label, cancelled.signal);
+    return jsonRes(res, result.ok ? 200 : result.error === 'permission_denied' ? 403 : 400, result);
+  } finally { res.off('close', onClose); }
+}, NOT_BOUND_BODY.okFalse));
+
 ipcRoute('PUT', '/api/group-default-models/:chatId', requireBoundBot(async (req, res, p) => {
   if (!/^oc_[a-zA-Z0-9_-]+$/.test(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
   let models;
@@ -7987,6 +8005,7 @@ ipcRoute('GET', '/api/groups', requireBoundBot(async (_req, res) => {
         firstSeenAt: seenMap.get(c.chatId) ?? null,
         hasRole,
         hasMessageListener,
+        hasMessageListenerConfig: getMessageListenerConfig(cachedLarkAppId, c.chatId) !== null || hasMessageListener,
         observedBotNames,
         pinStreamingCardMasterEnabled,
         pinStreamingCardChatEnabled,
@@ -8360,8 +8379,8 @@ async function collectMessageListenerPreviewMatches(
   // the preview leg structurally immune to the next field added to the config.
   // Only `enabled` is overridden: an off draft is still previewable.
   const configured = messageListenerConfigFromUpdate(listener);
-  // Blank prompt => nothing worth previewing (findMessageListenerForChat would
-  // reject it anyway); mirrors the save path treating it as a clear.
+  // Blank prompt => nothing worth previewing: findMessageListenerForChat never
+  // matches it, even once enabled.
   if (!configured) return [];
   const previewListener: MessageListenerConfig = { ...configured, enabled: true };
   const previewBot = {
@@ -8803,9 +8822,10 @@ ipcRoute('PUT', '/api/group-message-listeners/:chatId', requireBoundBot(async (r
   if (update.prompt && Buffer.byteLength(update.prompt, 'utf-8') > MAX_MESSAGE_LISTENER_PROMPT_BYTES) {
     return jsonRes(res, 400, { ok: false, error: 'prompt_too_large' });
   }
-  const result = await updateMessageListenerConfig(cachedLarkAppId, p.chatId, update);
-  jsonRes(res, result.ok ? 200 : ['prompt_required', 'sender_required'].includes(result.reason) ? 400 : 500,
-    result.ok ? { ok: true, mode: 'custom', listener: result.listener } : { ok: false, error: result.reason });
+  const result = await saveCustomGroupMessageListener(cachedLarkAppId, p.chatId, update);
+  if (!result.ok) return jsonRes(res, ['prompt_required', 'sender_required'].includes(result.reason) ? 400 : 500, { ok: false, error: result.reason });
+  // Answer from the same reads as GET: the page takes this as what the group now runs.
+  jsonRes(res, 200, { ok: true, mode: getGroupMessageListenerMode(cachedLarkAppId, p.chatId), listener: getMessageListenerConfig(cachedLarkAppId, p.chatId) });
 }));
 
 // ─── 免@ 斜杠命令（commandTriggers） ──────────────────────────────────────
@@ -9464,6 +9484,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     autoStartOnGroupJoinSeedDefault: t('daemon.auto_start_join_seed', undefined, localeForBot(cachedLarkAppId)),
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
     chatManagerEnabled: cardPrefs.chatManagerEnabled,
+    chatManagerSharedTopic: cardPrefs.chatManagerSharedTopic,
     groupSecretaryEnabled: cardPrefs.groupSecretaryEnabled,
     autoStartExcludedChats: cardPrefs.autoStartExcludedChats,
     groupJoinCommandEnabled: cardPrefs.groupJoinCommandEnabled,
@@ -9614,6 +9635,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
     chatManagerEnabled?: unknown;
+    chatManagerSharedTopic?: unknown;
     groupSecretaryEnabled?: unknown;
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
     senderTag?: unknown;
@@ -9635,6 +9657,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
     chatManagerEnabled?: boolean;
+    chatManagerSharedTopic?: boolean;
     groupSecretaryEnabled?: boolean;
     overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
     senderTag?: boolean;
@@ -9727,6 +9750,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', requireBoundBot(async (req, res) => {
   }
   if (typeof body.autoStartOnNewTopic === 'boolean') patch.autoStartOnNewTopic = body.autoStartOnNewTopic;
   if (typeof body.chatManagerEnabled === 'boolean') patch.chatManagerEnabled = body.chatManagerEnabled;
+  if (typeof body.chatManagerSharedTopic === 'boolean') patch.chatManagerSharedTopic = body.chatManagerSharedTopic;
   if (typeof body.groupSecretaryEnabled === 'boolean') patch.groupSecretaryEnabled = body.groupSecretaryEnabled;
   if (body.autoStartExcludedChats !== undefined) {
     if (!Array.isArray(body.autoStartExcludedChats) || body.autoStartExcludedChats.some(id => typeof id !== 'string' || !/^oc_[a-zA-Z0-9]+$/.test(id.trim()))) {

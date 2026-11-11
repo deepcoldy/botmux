@@ -37,8 +37,31 @@ import {
 } from '../src/im/lark/ask-option-layout.js';
 import { getDefaultLocale, setDefaultLocale, t as tr } from '../src/i18n/index.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
+import { buildAskFormElements } from '../src/im/lark/ask-form-elements.js';
+import { buildTurnReplyAskElements } from '../src/im/lark/turn-reply-ask-elements.js';
 
 const mockedSubmitAsk = vi.mocked(submitAsk);
+
+describe('no-deadline card presentation', () => {
+  it('does not format the zero sentinel as an epoch date in standalone, form or inline Ask cards', () => {
+    const formatDate = vi.spyOn(Date.prototype, 'toLocaleString');
+    try {
+      const ask = makePending({ originKind: 'host_explicit', deadlineAt: 0,
+        questions: makePending().questions.map(question => ({ ...question, allowCustom: false })) });
+      const standalone = JSON.parse(renderAskCard(ask).json);
+      const form = buildAskFormElements({ ...ask, questions: [{
+        prompt: 'Input', options: [], multiSelect: false, input: { type: 'text' },
+      }] }, 'en');
+      const inline = buildTurnReplyAskElements({ ask }, 'en');
+      expect(standalone.elements.length).toBeGreaterThan(0);
+      expect(form.some(element => element.tag === 'form')).toBe(true);
+      expect(inline.some(element => element.tag === 'column_set')).toBe(true);
+      expect(formatDate).not.toHaveBeenCalled();
+      renderAskCard(makePending());
+      expect(formatDate).toHaveBeenCalled();
+    } finally { formatDate.mockRestore(); }
+  });
+});
 
 // 答复鉴权 = canTalk。卡片点击测试里默认只放行 ou_owner，其余（如 ou_intruder）拒绝。
 beforeEach(() => {

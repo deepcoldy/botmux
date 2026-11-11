@@ -1,4 +1,6 @@
 export const CODEX_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
+/** Common verified effort levels honored by both Antigravity terminal and ACP. */
+export const ANTIGRAVITY_REASONING_EFFORTS: readonly CodexReasoningEffort[] = ['low', 'medium', 'high'];
 export const CODEX_COMMON_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4);
 export const GROK_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4);
 export const GROK_COMMON_REASONING_EFFORTS = GROK_REASONING_EFFORTS.slice(0, 3);
@@ -90,7 +92,7 @@ export function isConfigurableReasoningCliId(cliId: string | undefined): boolean
     // differ per model (grok-4.6 tops out at xhigh, GLM/Opus go to max, MiMo is
     // a switch). The launch path resolves the closest supported level, so the
     // whole vocabulary is offered here instead of a per-model subset.
-    || cliId === 'zcode';
+    || cliId === 'zcode' || cliId === 'antigravity';
 }
 
 export function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
@@ -131,6 +133,7 @@ export function reasoningEffortsForCliModel(
   cliId: string | undefined,
   model: string | undefined,
 ): readonly CodexReasoningEffort[] {
+  if (cliId === 'antigravity') return ANTIGRAVITY_REASONING_EFFORTS;
   if (cliId === 'grok') return grokReasoningEffortsForModel(model);
   if (cliId === 'remote-runner') return REMOTE_RUNNER_REASONING_EFFORTS;
   if (cliId === 'traex') return traexReasoningEffortsForModel(model);

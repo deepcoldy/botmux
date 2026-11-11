@@ -20,6 +20,8 @@ export interface PluginHostPrivileges {
 export interface PluginCommandRequest {
   schemaVersion: typeof PLUGIN_COMMAND_SCHEMA_VERSION;
   eventId: string;
+  /** Trusted original IM event time, used to reject delayed state-changing hooks. */
+  issuedAt?: number;
   larkAppId: string;
   command: string;
   args: string;

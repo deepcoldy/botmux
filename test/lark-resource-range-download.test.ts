@@ -181,6 +181,19 @@ describe('downloadMessageResource wiring', () => {
     expect(mocks.request.mock.calls.map(([request]) => request.headers?.Range)).toEqual([undefined, 'bytes=0-0', 'bytes=0-2']);
     expect(mocks.userToken).not.toHaveBeenCalled();
   });
+  it('requests oversized video bodies through the file resource type, including Range retries', async () => {
+    // Lark's resource endpoint only accepts type=image|file; a video body is a file.
+    const output = await outputPath(); mocks.request.mockRejectedValueOnce(sizeError(true));
+    mocks.request.mockImplementation(async ({ headers }: any) => {
+      const [, start, end] = /^bytes=(\d+)-(\d+)$/.exec(headers.Range)!;
+      return partial(Number(start), Number(end), 3);
+    });
+    await downloadMessageResource('cli_test', 'om_test', 'video_test', 'video', output, 'ou_sender');
+    expect(await readFile(output)).toEqual(Buffer.alloc(3, 7));
+    expect(mocks.request.mock.calls.map(([request]) => [request.headers?.Range, request.params?.type]))
+      .toEqual([[undefined, 'file'], ['bytes=0-0', 'file'], ['bytes=0-2', 'file']]);
+    expect(mocks.userToken).not.toHaveBeenCalled();
+  });
   it('does not ask for login when a size-limit Range attempt fails', async () => {
     const output = await outputPath(); mocks.request.mockRejectedValueOnce(sizeError());
     const rangeError = Object.assign(new Error('range forbidden'), { status: 403 });

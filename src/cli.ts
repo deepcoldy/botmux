@@ -5723,29 +5723,21 @@ async function cmdList(): Promise<void> {
   // would make a large session list quadratic and amplify socket timeouts.
   const probeSnapshot = buildBackingProbeSnapshot(active);
 
-  // Auto-prune unrecoverable sessions: process dead and no recoverable backing
-  // session (tmux/herdr/zellij/zmx).
-  // Split into two buckets so a never-activated daemon-command scratch (e.g. an
+  // Auto-prune only never-activated daemon-command scratches (e.g. an
   // unconfirmed /adopt that only posted a picker card, /help, an abandoned
-  // /relay picker) isn't reported as a crashed CLI. Such a scratch never forked
+  // /relay picker). Such a scratch never forked
   // a worker, so it has no cliId / lastCliInput / adoptedFrom — the same "was it
   // ever a real CLI session" markers isRelayableRealSession uses. Closing it is
   // fine, but the "进程已死且无 tmux session" notice wrongly implies a CLI ran
   // and crashed, which is exactly the confusing output users hit after /adopt.
-  const pruned: SessionData[] = [];
   const prunedScratch: SessionData[] = [];
   const live: SessionData[] = [];
   for (const s of active) {
     if (isAdoptedSession(s)) {
-      const pid = adoptedCliPid(s);
-      if (pid && isProcessAlive(pid)) {
-        live.push(s);
-      } else if (pid) {
-        pruned.push(s);
-      } else {
-        const hasPid = !!(s.pid && isProcessAlive(s.pid));
-        hasPid ? live.push(s) : pruned.push(s);
-      }
+      // A sandbox can deny signal-zero probes of the external CLI with EPERM.
+      // Listing must not turn that lack of visibility into a permanent close
+      // of its live bridge. Retain even a stale/missing pid for explicit detach.
+      live.push(s);
       continue;
     }
 
@@ -5754,8 +5746,7 @@ async function cmdList(): Promise<void> {
     const disposition = sessionListDisposition(s, { hasPid, hasBackingSession });
     // Non-adopt sessions are only ever kept or pruned-as-scratch now: a real
     // managed session with a missing backing is dormant-recoverable, never
-    // auto-closed by this read command (see sessionListDisposition). Adopt
-    // zombies still reach the `pruned` bucket via the branch above.
+    // auto-closed by this read command (see sessionListDisposition).
     if (disposition === 'prune_scratch') prunedScratch.push(s);
     else live.push(s);
   }
@@ -5782,20 +5773,14 @@ async function cmdList(): Promise<void> {
     // Keep `list` read-only in primary mode. These rows come from the Pod-local
     // store, so even an apparently harmless scratch cleanup could close only
     // the local row while PostgreSQL keeps the canonical Session active.
-    live.push(...prunedScratch, ...pruned);
-    const skipped = prunedScratch.length + pruned.length;
+    live.push(...prunedScratch);
+    const skipped = prunedScratch.length;
     if (skipped > 0) {
       console.warn(`⚠️ primary coordination 下已跳过 ${skipped} 个本地会话的自动清理；本次仅展示，不修改状态。`);
     }
   } else {
     // Scratches: close silently — they were placeholders, not dead sessions.
     await closeNow(prunedScratch, 'scratch');
-    if (pruned.length > 0) {
-      const prunedCount = await closeNow(pruned, 'real');
-      if (prunedCount > 0) {
-        console.log(`已自动清理 ${prunedCount} 个不可恢复的会话（进程已退出或无可恢复后端）`);
-      }
-    }
   }
 
   // Sort by creation time, newest first
@@ -8125,6 +8110,7 @@ ${SEND_HELP_BODY}
   input-capture register|inspect|revoke|revoke-set --bot <appId> --session <id> ...
   ask buttons --questions-file <file>   多题/文本/数值表单，支持预选；一次提交，返回 answers/inputs JSON
   ask buttons --answerer <ou_id>       仅指定答题人可提交（不授予业务批准权）
+  ask buttons --timeout 0              显式无限等待（需 CLI/daemon 同时支持）；省略仍默认 300 秒
   ask buttons --mention <ou_id>        在卡片里 @ 该成员。仅本应用通讯录查得到的真人有效，
                                        否则只丢掉 @，卡片照发
   ask buttons [--multi] --options "a,b" "<问题>"
@@ -17834,10 +17820,11 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
   try {
     // Versioned admission prevents an old daemon silently dropping the
     // respondent restriction on a choice-only request. Never downgrade it.
-    const endpoint = body.answererOpenId || (body.questions as import('./core/ask-types.js').AskQuestion[] | undefined)?.some(q => q.input)
+    const endpoint = body.timeoutMs === 0 ? '/api/asks/no-deadline-v1'
+      : body.answererOpenId || (body.questions as import('./core/ask-types.js').AskQuestion[] | undefined)?.some(q => q.input)
       ? '/api/asks/form-v1' : '/api/asks';
-    // No client-side timeout — broker enforces `timeoutMs` and will respond
-    // with `kind:'timedOut'` so this fetch always settles.
+    // No client-side timeout — the broker owns finite expiry and explicit
+    // no-deadline asks wait for an answer or invalidation.
     res = await postAskIpc(daemon.ipcPort, endpoint, body);
   } catch (fetchErr) {
     // Socket refused / reset / timeout → daemon is down or restarting → retryable.
@@ -18063,18 +18050,10 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     console.error('botmux ask: 正在等待真人回答；Ctrl-C 不取消确认，请等待回答或正常超时。');
   };
   process.on('SIGINT', protectAskWait);
-  const reconnectDeadline = Date.now() + timeoutMs + 60_000;
   let result: import('./core/ask-types.js').AskResult;
   try {
-    while (true) {
-      try { result = await postAsk(body); break; }
-      catch (err) {
-        if (!(err as { retryable?: boolean }).retryable || Date.now() >= reconnectDeadline) throw err;
-        // The daemon owns the deadline and receipt. Reuse the same request;
-        // don't convert a transport failure into a human decision/timeout.
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-    }
+    const { waitForExplicitAskResult } = await import('./core/explicit-ask-continuation.js');
+    result = await waitForExplicitAskResult(body, postAsk);
   } catch (err) {
     process.removeListener('SIGINT', protectAskWait);
     console.error((err as Error).message);

@@ -641,7 +641,8 @@ main:has(.groups-page) .groups-matrix-section > #g-loading {
   padding: 14px 15px;
 }
 
-.metric-card span {
+/* Help triggers and marks keep their own centered icon styles. */
+.metric-card span:not(:where(.ui-info-tip, .ui-info-mark)) {
   display: block;
   color: var(--muted);
   font-size: 12px;
@@ -685,7 +686,7 @@ main:has(.groups-page) .groups-matrix-section > #g-loading {
   min-width: 0;
 }
 
-.metric-card .metric-label-with-help > span {
+.metric-card .metric-label-with-help > span:not(.ui-info-tip) {
   display: inline;
 }
 

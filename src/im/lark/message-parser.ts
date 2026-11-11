@@ -395,6 +395,8 @@ export interface MessageResource {
   name: string;
   /** When set, download uses this message_id instead of the parent (e.g. merge_forward sub-messages). */
   messageId?: string;
+  /** Other message IDs from the same forward tree, tried only for resource ownership mismatches. */
+  fallbackMessageIds?: string[];
 }
 
 /**

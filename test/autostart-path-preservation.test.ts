@@ -19,7 +19,9 @@
  * THE FIX: the boot hook's PATH is a MERGE of
  *   1. the user's login-shell PATH (what the user expects to find),
  *   2. the PATH the hook already carries (never shrink it),
- *   3. the PATH of the process writing the hook right now.
+ *   3. the PATH of the process writing the hook right now,
+ *   4. the tool dirs botmux's installer manages — the one tier no environment
+ *      can lose, so a unit that was already rendered too narrow heals itself.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawnSync } from 'node:child_process';
@@ -43,6 +45,7 @@ import {
   autostartPath,
   bootHookPath,
   enableAutostart,
+  managedToolDirs,
   mergePathEntries,
   plistPathFromContent,
   refreshAutostart,
@@ -336,6 +339,240 @@ describe('refreshAutostart keeps the unit PATH', () => {
 
     expect(refreshAutostart(stableOpts())).toBe(false);
     expect(readFileSync(unitFile, 'utf-8')).toBe(afterFirst);
+  });
+});
+
+describe('installer-managed Node runtime', () => {
+  // The one-click installer keeps its own Node under
+  // ~/.local/share/botmux/node-<version>-<os>-<arch>, and `npm i -g` run with
+  // that Node puts lark-cli / agentbuddy into its bin. The installer only adds
+  // ~/.local/bin to the shell profile, so once a unit has lost this directory
+  // neither the login shell nor a narrow caller can bring it back.
+  const SYSTEM_DEFAULT = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+  const cpu = process.arch === 'arm64' ? 'arm64' : 'x64';
+  function installerNode(version: string, os = 'linux', arch = cpu, withBin = true): string {
+    const root = join(home, '.local', 'share', 'botmux', `node-${version}-${os}-${arch}`);
+    mkdirSync(withBin ? join(root, 'bin') : root, { recursive: true });
+    return join(root, 'bin');
+  }
+  function linuxHome(): void {
+    home = mkdtempSync(join(tmpdir(), 'botmux-autostart-'));
+    vi.stubEnv('HOME', home);
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+  }
+  function brokenUnits(): void {
+    mkdirSync(unitDir(), { recursive: true });
+    writeFileSync(join(unitDir(), 'botmux.service'), `[Service]\nEnvironment=PATH=${SYSTEM_DEFAULT}\n`);
+    writeFileSync(
+      join(unitDir(), 'botmux-watchdog.service'),
+      `[Service]\nEnvironment=PATH=${SYSTEM_DEFAULT}\nEnvironment=${AUTOSTART_UNIT_ENV}=1\nExecStart=x __watchdog\n`,
+    );
+  }
+  const unitEntries = (name: string) =>
+    unitPathFromContent(readFileSync(join(unitDir(), name), 'utf-8'))!.split(':');
+
+  it('refresh restores the managed Node bin to units that lost it', () => {
+    linuxHome();
+    const bin = installerNode('v22.23.1');
+    brokenUnits();
+    const narrow = () => opts({
+      environmentPath: SYSTEM_DEFAULT,
+      loginShellPath: '/home/u/.local/bin:/usr/bin',
+    });
+
+    expect(refreshAutostart(narrow())).toBe(true);
+    expect(unitEntries('botmux.service')).toContain(bin);
+    expect(unitEntries('botmux-watchdog.service')).toContain(bin);
+
+    // Stable inputs render a stable file: no rewrite + daemon-reload per start.
+    const unit = readFileSync(join(unitDir(), 'botmux.service'), 'utf-8');
+    expect(refreshAutostart(narrow())).toBe(false);
+    expect(readFileSync(join(unitDir(), 'botmux.service'), 'utf-8')).toBe(unit);
+  });
+
+  it('autostart enable writes the managed Node bin over a broken unit', () => {
+    linuxHome();
+    const bin = installerNode('v22.23.1');
+    brokenUnits();
+
+    enableAutostart(opts({ environmentPath: SYSTEM_DEFAULT, loginShellPath: undefined }));
+
+    expect(unitEntries('botmux.service')).toContain(bin);
+    expect(unitEntries('botmux-watchdog.service')).toContain(bin);
+  });
+
+  it('adds nothing when the installer has no Node for this machine', () => {
+    linuxHome();
+    installerNode('v22.23.1', 'linux', cpu === 'x64' ? 'arm64' : 'x64');
+    installerNode('v22.23.1', 'darwin');
+    installerNode('v24.1.0', 'linux', cpu, false);
+    mkdirSync(join(home, '.local', 'share', 'botmux', 'installer', 'bin'), { recursive: true });
+    brokenUnits();
+
+    refreshAutostart(opts({ environmentPath: SYSTEM_DEFAULT, loginShellPath: undefined }));
+
+    expect(unitEntries('botmux.service').join(':')).toBe(SYSTEM_DEFAULT);
+  });
+
+  it('keeps a managed dir where a healthy unit already has it', () => {
+    linuxHome();
+    const bin = installerNode('v22.23.1');
+    mkdirSync(unitDir(), { recursive: true });
+    writeFileSync(join(unitDir(), 'botmux.service'), `[Service]\nEnvironment=PATH=${bin}:${SYSTEM_DEFAULT}\n`);
+
+    refreshAutostart(opts({ environmentPath: SYSTEM_DEFAULT, loginShellPath: undefined }));
+
+    // Its `node` must keep winning over /usr/bin/node.
+    expect(unitEntries('botmux.service')).toEqual([bin, ...SYSTEM_DEFAULT.split(':')]);
+  });
+
+  it('follows the installer: a newer runtime goes ahead, a removed one drops out', () => {
+    linuxHome();
+    const old = installerNode('v22.9.0');
+    brokenUnits();
+    const narrow = () => opts({ environmentPath: SYSTEM_DEFAULT, loginShellPath: undefined });
+    refreshAutostart(narrow());
+    expect(unitEntries('botmux.service')).toEqual([...SYSTEM_DEFAULT.split(':'), old]);
+
+    // The unit now persists `old`, so it comes back as tier 2 on every render.
+    const newer = installerNode('v22.23.1');
+    expect(refreshAutostart(narrow())).toBe(true);
+    expect(unitEntries('botmux.service')).toEqual([...SYSTEM_DEFAULT.split(':'), newer, old]);
+    expect(unitEntries('botmux-watchdog.service')).toEqual([...SYSTEM_DEFAULT.split(':'), newer, old]);
+
+    rmSync(dirname(old), { recursive: true });
+    expect(refreshAutostart(narrow())).toBe(true);
+    expect(unitEntries('botmux.service')).toEqual([...SYSTEM_DEFAULT.split(':'), newer]);
+    expect(unitEntries('botmux-watchdog.service')).toEqual([...SYSTEM_DEFAULT.split(':'), newer]);
+  });
+
+  it('puts the new runtime where the unit had the one it replaced', () => {
+    linuxHome();
+    const old = installerNode('v22.9.0');
+    mkdirSync(unitDir(), { recursive: true });
+    writeFileSync(join(unitDir(), 'botmux.service'), `[Service]\nEnvironment=PATH=${old}:${SYSTEM_DEFAULT}\n`);
+    const newer = installerNode('v24.1.0');
+    rmSync(dirname(old), { recursive: true });
+
+    refreshAutostart(opts({ environmentPath: SYSTEM_DEFAULT, loginShellPath: undefined }));
+
+    expect(unitEntries('botmux.service')).toEqual([newer, ...SYSTEM_DEFAULT.split(':')]);
+  });
+
+  it('drops only installer runtimes that are gone, nothing else', () => {
+    linuxHome();
+    const bin = installerNode('v22.23.1');
+    const otherCpu = installerNode('v22.9.0', 'linux', cpu === 'x64' ? 'arm64' : 'x64');
+    const gone = join(home, '.local', 'share', 'botmux', `node-v18.0.0-linux-${cpu}`, 'bin');
+    const elsewhere = join(home, 'opt', `node-v18.0.0-linux-${cpu}`, 'bin');
+    mkdirSync(unitDir(), { recursive: true });
+    writeFileSync(
+      join(unitDir(), 'botmux.service'),
+      `[Service]\nEnvironment=PATH=${otherCpu}:${gone}:${elsewhere}:${SYSTEM_DEFAULT}\n`,
+    );
+
+    refreshAutostart(opts({ environmentPath: SYSTEM_DEFAULT, loginShellPath: undefined }));
+
+    // Another CPU's runtime still exists, and a lookalike outside the installer root is not ours.
+    expect(unitEntries('botmux.service')).toEqual([otherCpu, bin, elsewhere, ...SYSTEM_DEFAULT.split(':')]);
+  });
+
+  it('keeps the entries while the installer shows no runtime at all', () => {
+    linuxHome();
+    const bin = installerNode('v22.23.1');
+    mkdirSync(unitDir(), { recursive: true });
+    writeFileSync(join(unitDir(), 'botmux.service'), `[Service]\nEnvironment=PATH=${bin}:${SYSTEM_DEFAULT}\n`);
+    const narrow = () => opts({ environmentPath: SYSTEM_DEFAULT, loginShellPath: undefined });
+    const root = join(home, '.local', 'share', 'botmux');
+
+    // A re-install in progress or a share not mounted yet: missing, then empty.
+    rmSync(root, { recursive: true });
+    refreshAutostart(narrow());
+    expect(unitEntries('botmux.service')).toEqual([bin, ...SYSTEM_DEFAULT.split(':')]);
+    mkdirSync(root);
+    refreshAutostart(narrow());
+    expect(unitEntries('botmux.service')).toEqual([bin, ...SYSTEM_DEFAULT.split(':')]);
+
+    installerNode('v22.23.1');
+    refreshAutostart(narrow());
+    expect(unitEntries('botmux.service')).toEqual([bin, ...SYSTEM_DEFAULT.split(':')]);
+  });
+
+  it("keeps the login shell's order when a later login probe fails", () => {
+    linuxHome();
+    const older = installerNode('v22.23.1');
+    const newer = installerNode('v24.1.0');
+    brokenUnits();
+
+    refreshAutostart(opts({ environmentPath: SYSTEM_DEFAULT, loginShellPath: `${older}:/usr/bin` }));
+    const unit = readFileSync(join(unitDir(), 'botmux.service'), 'utf-8');
+    expect(unitEntries('botmux.service').slice(0, 2)).toEqual([older, newer]);
+
+    expect(refreshAutostart(opts({ environmentPath: SYSTEM_DEFAULT, loginShellPath: undefined }))).toBe(false);
+    expect(readFileSync(join(unitDir(), 'botmux.service'), 'utf-8')).toBe(unit);
+
+    // A login PATH that answers again still wins over the persisted order.
+    refreshAutostart(opts({ environmentPath: SYSTEM_DEFAULT, loginShellPath: `${newer}:/usr/bin` }));
+    expect(unitEntries('botmux.service').slice(0, 2)).toEqual([newer, older]);
+  });
+
+  it('writes the managed Node bin into the macOS LaunchAgent too', () => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-autostart-'));
+    vi.stubEnv('HOME', home);
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+    const bin = installerNode('v22.23.1', 'darwin');
+    const agents = join(home, 'Library', 'LaunchAgents');
+    mkdirSync(agents, { recursive: true });
+    const plist = join(agents, 'com.botmux.daemon.plist');
+    writeFileSync(plist, '<dict>\n<key>PATH</key>\n<string>/usr/bin:/bin</string>\n</dict>\n');
+
+    expect(refreshAutostart(opts({ environmentPath: '/usr/bin:/bin', loginShellPath: undefined }))).toBe(true);
+    expect(plistPathFromContent(readFileSync(plist, 'utf-8'))).toBe(`/usr/bin:/bin:${bin}`);
+  });
+
+  it('lists the runtimes for this OS and CPU, newest first', () => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-autostart-'));
+    // Neither creation order nor name order is version order.
+    const [v22_23_10, v24, v22_9, v22_23_1] = ['v22.23.10', 'v24.1.0', 'v22.9.0', 'v22.23.1']
+      .map(version => installerNode(version, 'linux', 'x64'));
+    installerNode('v24.2.0', 'linux', 'arm64');
+    const mac = installerNode('v22.23.1', 'darwin', 'arm64');
+
+    expect(managedToolDirs(home, 'linux', 'x64')).toEqual([v24, v22_23_10, v22_23_1, v22_9]);
+    expect(managedToolDirs(home, 'darwin', 'arm64')).toEqual([mac]);
+    expect(managedToolDirs(home, 'win32', 'x64')).toEqual([]);
+  });
+
+  it('only fills gaps: every other tier keeps its precedence', () => {
+    const merged = bootHookPath({
+      callerPath: '/usr/bin:/bin',
+      existingPath: '/opt/kept',
+      loginPath: '/home/u/.local/bin',
+      managedDirs: ['/managed/node/bin'],
+      targetPlatform: 'linux',
+    });
+    // A command any tier already resolves keeps resolving to the same file.
+    expect(merged).toBe('/home/u/.local/bin:/opt/kept:/usr/bin:/bin:/managed/node/bin');
+  });
+
+  it("keeps the login shell's order of the managed dirs", () => {
+    expect(bootHookPath({
+      callerPath: '/usr/bin:/bin',
+      loginPath: '/managed/v22/bin:/usr/bin',
+      managedDirs: ['/managed/v24/bin', '/managed/v22/bin'],
+      targetPlatform: 'linux',
+    })).toBe('/managed/v22/bin:/managed/v24/bin:/usr/bin:/bin');
+  });
+
+  it('does not let the managed dirs replace the system default fallback', () => {
+    const managedDirs = ['/managed/node/bin'];
+    expect(bootHookPath({ callerPath: '', managedDirs, targetPlatform: 'linux' }))
+      .toBe(`${SYSTEM_DEFAULT}:/managed/node/bin`);
+    const onlyManaged = bootHookPath({ callerPath: '/managed/node/bin', managedDirs, targetPlatform: 'linux' });
+    expect(onlyManaged).toBe(`/managed/node/bin:${SYSTEM_DEFAULT}`);
+    // Read back as tier 2 on the next render, it must not flip.
+    expect(bootHookPath({ callerPath: '/managed/node/bin', existingPath: onlyManaged, managedDirs, targetPlatform: 'linux' }))
+      .toBe(onlyManaged);
   });
 });
 

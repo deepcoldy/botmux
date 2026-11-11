@@ -402,7 +402,7 @@ import {
   compatMachineIdForAuthenticatedRequest,
   handleDesktopCompat,
 } from './dashboard/compat.js';
-import { isDashboardChunkJsPath, missingDashboardChunkModule } from './dashboard/stale-chunk-module.js';
+import { serveMissingDashboardChunk } from './dashboard/stale-chunk-http.js';
 import { aggregateRoleBatch, parseRoleBatchTargets } from './dashboard/roles-batch.js';
 import { automateOpenPlatformSetup, vcListenerEventGateError } from './setup/open-platform-automation.js';
 import { repairOpenPlatformRedirects } from './setup/open-platform-redirect-repair.js';
@@ -2802,22 +2802,6 @@ function serveStatic(
   }
 }
 
-function serveMissingDashboardChunkModule(req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
-  if (!isDashboardChunkJsPath(pathname)) return false;
-  const body = missingDashboardChunkModule();
-  res.writeHead(200, {
-    'content-type': 'application/javascript',
-    'cache-control': 'no-store',
-    'content-length': String(Buffer.byteLength(body)),
-  });
-  if (req.method === 'HEAD') {
-    res.end();
-    return true;
-  }
-  res.end(body);
-  return true;
-}
-
 function dashboardEntriesForRecord(record: InstalledPluginRecord): PluginDashboardEntry[] {
   return record.contributions?.dashboard ?? [];
 }
@@ -3650,6 +3634,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
           firstSeenAt,
           hasRole,
           hasMessageListener,
+          hasMessageListenerConfig,
           observedBotNames,
           pinStreamingCardMasterEnabled,
           pinStreamingCardChatEnabled,
@@ -3682,6 +3667,7 @@ async function buildGroupsMatrix(): Promise<GroupsMatrix> {
           agentCliId, agentModel, agentReasoningEffort,
           hasRole: hasRole ?? false,
           hasMessageListener: hasMessageListener ?? false,
+          hasMessageListenerConfig: hasMessageListenerConfig ?? hasMessageListener ?? false,
           pinStreamingCardMasterEnabled: pinStreamingCardMasterEnabled ?? false,
           pinStreamingCardChatEnabled: pinStreamingCardChatEnabled ?? true,
           pinStreamingCardEffectiveEnabled: pinStreamingCardEffectiveEnabled ?? false,
@@ -4916,7 +4902,7 @@ const server = createServer(async (req, res) => {
           ? html => injectControlCsrfMeta(html, controlCsrfTokens.mint(requestIdentity.authSessionId))
           : undefined,
       })) return;
-      if (serveMissingDashboardChunkModule(req, res, lookupPath)) return;
+      if (serveMissingDashboardChunk(req, res, lookupPath)) return;
     }
 
     // ─── Public API (cookie/token already validated above) ──────────────────

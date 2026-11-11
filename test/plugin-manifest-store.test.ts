@@ -331,6 +331,17 @@ describe('plugin manifest and registry basics', () => {
       endpoint: '/botmux/commands/v1',
       commands: [{ name: '/work-bind', description: '绑定工作项' }],
     });
+    const closeRoot = makeSource('cmd-close-hook', [{ name: '/p0' }]);
+    const closeFile = join(closeRoot, 'commands', 'index.json');
+    const declaration = JSON.parse(readFileSync(closeFile, 'utf8'));
+    writeFileSync(closeFile, JSON.stringify({ ...declaration, afterClose: true }));
+    expect(scanPluginContributions(closeRoot, manifest('cmd-close-hook'))?.commands?.afterClose).toBe(true);
+    writeFileSync(closeFile, JSON.stringify({ ...declaration, afterClose: true, replacesCloseTag: true }));
+    expect(scanPluginContributions(closeRoot, manifest('cmd-close-hook'))?.commands?.replacesCloseTag).toBe(true);
+    writeFileSync(closeFile, JSON.stringify({ ...declaration, replacesCloseTag: true }));
+    expect(() => scanPluginContributions(closeRoot, manifest('cmd-close-hook'))).toThrow('invalid_plugin_close_tag_override');
+    writeFileSync(closeFile, JSON.stringify({ ...declaration, afterClose: 'true' }));
+    expect(() => scanPluginContributions(closeRoot, manifest('cmd-close-hook'))).toThrow('invalid_plugin_after_close');
     for (const reserved of ['/close', '/disconnect', '/effort', '/t', '/compact', '/grant']) {
       expect(() => scanPluginContributions(makeSource(`cmd-${reserved.slice(1)}`, [{ name: reserved }]), manifest('cmd-x')))
         .toThrow(`plugin_command_reserved:${reserved}`);

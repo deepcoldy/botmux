@@ -27,7 +27,7 @@ import { deliverAuthLink } from './auth-link-delivery.js';
 import { platformTeammateVerdict } from './platform-teammate.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
-import { renderPluginCommandHelp } from './plugins/commands/runtime.js';
+import { pluginCommandGateway, renderPluginCommandHelp } from './plugins/commands/runtime.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
 import * as sessionStore from '../services/session-store.js';
 import { markReportReplyInput } from './report-source-reply.js';
@@ -46,7 +46,7 @@ import { buildDismissConfirmCard, buildDismissReceiptCard } from '../im/lark/dis
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { handleProjectGroupRoles } from './dashboard-command/groups.js';
 import { handleGroupSessionsCommand } from './group-sessions-command.js';
-import { createCliAdapterSync } from '../adapters/cli/registry.js';
+import { ALL_CLI_IDS, cliAliasesSelecting, createCliAdapterSync, resolveCliName } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { resolveCliRuntime, runtimeInstallationKey, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
@@ -241,6 +241,16 @@ function cliSelectionSecurityError(botCfg: { env?: Record<string, string>; backe
   if (botCfg.backendType === 'riff' || botCfg.riff !== undefined) return 'CLI-selected sessions cannot use Riff';
   if (botCfg.codexRpcInput === true && !RPC_CAPABLE_CLIS.has(cliId)) return 'selected CLI cannot use codexRpcInput';
   return undefined;
+}
+
+function cliSelectionUsage(loc: Locale): string {
+  // An unrestricted bot: drops only the CLIs `/cli` refuses everywhere (riff).
+  const ids = ALL_CLI_IDS.filter(id => !cliSelectionSecurityError({}, id, 'default'));
+  const aliases = ids.flatMap(id => {
+    const names = cliAliasesSelecting(id);
+    return names.length ? [`${names.join(' / ')} → ${id}`] : [];
+  });
+  return t('cmd.cli.usage', { aliases: aliases.join('\n'), ids: ids.join(', ') }, loc);
 }
 
 /**
@@ -2130,21 +2140,19 @@ export async function handleCommand(
           break;
         }
         const botCfg = getBot(ds.larkAppId).config;
-        const rawArgs = message.content.replace(/^\/cli\s*/i, '').trim();
-        const args = rawArgs.split(/\s+/u);
-        const requestedId = args[0];
-        let selectedCliId: CliId | undefined;
-        if (args.length === 1) {
-          try {
-            selectedCliId = createCliAdapterSync(requestedId as CliId).id as CliId;
-          } catch {
-            // Keep the normal invalid-CLI response below.
-          }
-        }
-        if (!selectedCliId) {
-          await sessionReply(rootId, 'Usage: /cli <cliId>\nUnknown or invalid CLI.');
+        const args = message.content.replace(/^\/cli\s*/i, '').trim().split(/\s+/u).filter(Boolean);
+        const requested = args.length === 1 ? resolveCliName(args[0]!) : undefined;
+        if (requested?.kind === 'ambiguous') {
+          const choices = requested.candidates.map(id => t('cmd.cli.choice', { cliId: id, name: getCliDisplayName(id) }, loc)).join(', ');
+          await sessionReply(rootId, t('cmd.cli.ambiguous', { input: args[0]!, choices }, loc));
           break;
         }
+        if (requested?.kind !== 'cli') {
+          const usage = cliSelectionUsage(loc);
+          await sessionReply(rootId, args.length === 1 ? `${t('cmd.cli.unknown', { input: args[0]! }, loc)}\n${usage}` : usage);
+          break;
+        }
+        const selectedCliId = requested.cliId;
         if (!canOperate(ds.larkAppId, ds.chatId, message.senderId, message.senderUnionId)) {
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd: '/cli' }, loc));
           break;
@@ -2750,12 +2758,31 @@ export async function handleCommand(
           }
           // Run only after a clean explicit close, never on crash/restart/refusal.
           // The already-closed session and its receipt do not wait for OAuth/IM.
-          void tagClosedSessionGroup(closed.current.larkAppId, closed.current.chatId, targetSessionId)
+          const closeTagging = pluginCommandGateway.replacesCloseTag(closed.current.larkAppId)
+            ? Promise.resolve({ status: 'skipped' as const })
+            : tagClosedSessionGroup(closed.current.larkAppId, closed.current.chatId, targetSessionId);
+          void closeTagging
+            .catch(() => ({ status: 'failed' as const }))
             .then(async result => {
-              if (result.status === 'skipped') return;
-              await sessionReply(rootId, result.status === 'updated'
-                ? t('cmd.close.tag_updated', { name: result.name }, loc)
-                : t('cmd.close.tag_failed', undefined, loc));
+              if (result.status !== 'skipped') {
+                try {
+                  await sessionReply(rootId, result.status === 'updated'
+                    ? t('cmd.close.tag_updated', { name: result.name }, loc)
+                    : t('cmd.close.tag_failed', undefined, loc));
+                } catch (error) { logger.warn(`[${logTag}] close tag receipt failed: ${error}`); }
+              }
+              const outcomes = await pluginCommandGateway.afterClose({
+                larkAppId: closed.current.larkAppId, eventId: message.messageId, issuedAt: Number(message.createTime) || Date.now(),
+                command: '/close', args: '',
+                chat: { chatId: closed.current.chatId, chatType: closed.current.session.chatType ?? message.chatType ?? null, anchor: rootId },
+                sender: { openId: message.senderId ?? null, unionId: message.senderUnionId ?? null },
+                privileges: { canTalk: true, canOperate: canOperate(closed.current.larkAppId, closed.current.chatId, message.senderId, message.senderUnionId) },
+                locale: loc,
+              });
+              for (const outcome of outcomes) {
+                if (!outcome.ok) await sessionReply(rootId, '会话已关闭，但插件后续操作未确认，请检查群分类。');
+                else if (outcome.reply?.kind === 'text') await sessionReply(rootId, outcome.reply.text);
+              }
             }).catch(err => logger.warn(`[${logTag}] close tag notification failed: ${err}`));
           // 「会话已关闭」卡片优先「仅自己可见」：普通群顶层走 ephemeral 只发给
           // 执行 /close 的本人；若本命令从折叠到 chat-scope 的真实话题触发，则

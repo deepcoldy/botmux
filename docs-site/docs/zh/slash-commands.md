@@ -98,7 +98,7 @@ Codex 容量不足自动续跑**默认关闭**。管理员可用 `/botconfig set
 两条命令都默认可用，需要操作权限（管理员 / `allowedUsers`，或用 `canTalkDaemonCommands` 放开）。
 
 - **`/rename <标题>`**：在已有会话里发，改 Botmux 会话名（Dashboard、`/sessions` 列表跟着变），运行中的 Codex / Claude Code 会同步改原生会话名。飞书群名、话题名不变。
-- **`/cli <cliId>`**：只给**还没启动 CLI** 的会话选 CLI，例如在新话题里第一条就发 `/cli codex`，再发任务，这个会话就用 Codex 跑，Bot 的默认 CLI 不变。`cliId` 取值见[支持的 CLI](/adapters#支持的-cli--agent)。以下情况会被拒绝：会话已有历史或 CLI 已经起来、接管（adopt）的会话、排队中的会话、Bot 配了 `env`、用 Riff 后端、选的是 `riff`，以及所选 CLI 和 Bot 的零注入（`promptInjection: "none"`）或 `codexRpcInput` 不兼容。`/cli` 不在 `/help` 里显示。
+- **`/cli <cliId>`**：只给**还没启动 CLI** 的会话选 CLI，例如在新话题里第一条就发 `/cli codex`，再发任务，这个会话就用 Codex 跑，Bot 的默认 CLI 不变。`cliId` 取值见[支持的 CLI](/adapters#支持的-cli--agent)。也可以写程序名或简写，不区分大小写：`/cli cc` 或 `/cli claude` 选 Claude Code，`/cli omp` 选 Oh My Pi，`/cli agy` 选 Antigravity；完整 `cliId` 优先，所以 `/cli codex` 选的是 Codex 而不是同样跑 `codex` 的 Codex App。一个简写对应多个 CLI（如 `trae` 同时是 TRAE CLI 的新旧两代）时不替你选，会列出候选让你改发完整 ID。只发 `/cli` 列出全部可选 CLI 和简写。以下情况会被拒绝：会话已有历史或 CLI 已经起来、接管（adopt）的会话、排队中的会话、Bot 配了 `env`、用 Riff 后端、选的是 `riff`，以及所选 CLI 和 Bot 的零注入（`promptInjection: "none"`）或 `codexRpcInput` 不兼容。`/cli` 不在 `/help` 里显示。
 
 ## 群负责人（Agent 工具）
 
@@ -109,6 +109,10 @@ Codex 容量不足自动续跑**默认关闭**。管理员可用 `/botconfig set
 设置/取消要求当前轮真实发送者明确命中该机器人的管理员名单。会话 owner、其他机器人、定时任务和过期轮次不能代替真人授权。只作用于当前普通群，不支持跨群指定目标，也不接管自动管理的会话群。
 
 负责人接有对话权限的人的群顶层未 @ 消息；只点名其他成员时让路，@all 不算转交。群名追加机器人名，取消时保留人工改名。原有 ambient、never 和 reply-mode 独立生效；负责人是群级身份与交接，不是新的响应模式，也不保证全群只有一个机器人回复。
+
+**负责人接的消息开不开话题**：默认不开，免 @ 接下的顶层消息照旧平铺回复。回复模式为 `shared` 的普通群里，想让它像 @ 本机器人那样把回复挂到那条消息下面的话题，在 Dashboard 同一处打开「群负责人接的消息也开话题」（或 `/botconfig set chatManagerSharedTopic on`）。会话仍是群里同一个；要先打开「群负责人」；其它回复模式不受影响。话题里继续说话要不要 @，仍按本群的「群聊 @ 策略」：默认「必须 @」时话题内续话也要 @，配成「话题内免 @」、`never` 或 `ambient` 后才可免 @ 续话。
+
+![Dashboard 中「群负责人接的消息也开话题」开关](/img/chat-manager-shared-topic-dashboard.png)
 
 切换时先让旧负责人 clear，成功后再让新负责人 set。每次负责人免 @ 放行都核对群描述标记，读取失败不沿用旧状态；必须同时存在本地管理员启用记录。描述超长拒绝，不截断人写的说明。
 

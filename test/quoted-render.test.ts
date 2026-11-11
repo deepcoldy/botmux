@@ -129,8 +129,8 @@ describe('getQuotedMessageDetail', () => {
     expect(out.content).toContain('[图片 1]');
     expect(out.content).toContain('[文件 1: report.pdf]');
     expect(out.resources).toEqual([
-      { type: 'image', key: 'img_nested', name: 'img_nested.jpg' },
-      { type: 'file', key: 'file_nested', name: 'report.pdf' },
+      { type: 'image', key: 'img_nested', name: 'img_nested.jpg', fallbackMessageIds: ['om_image', 'om_inner'] },
+      { type: 'file', key: 'file_nested', name: 'report.pdf', fallbackMessageIds: ['om_file', 'om_inner'] },
     ]);
   });
 });

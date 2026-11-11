@@ -2891,6 +2891,22 @@ async function sendGrantRequestToApproverDm(o: {
 // ─── Group message access check ──────────────────────────────────────────
 
 /**
+ * 群负责人顶层免 @ 寻址：发送者有对话权限、本 bot 开了 `chatManagerEnabled`、消息在普通群
+ * 顶层（不在话题里）、没有点名别的成员，且本 bot 确实是本群负责人。
+ *
+ * checkGroupMessageAccess 的免 @ 放行，与共享回复模式下「群负责人接的消息也开话题」
+ * （`chatManagerSharedTopic`）共用这一条判定，两处条件不会各自漂移。isChatManager 先查本地
+ * 认领记录，只有本 bot 认领过本群时才去飞书读群描述，所以放在最后。
+ */
+async function addressedAsChatManager(
+  larkAppId: string, message: any, chatId: string, isAllowed: boolean,
+): Promise<boolean> {
+  return isAllowed && getBot(larkAppId).config.chatManagerEnabled === true
+    && message.chat_type === 'group' && !message.root_id && !message.thread_id
+    && !mentionsAnotherMember(larkAppId, message) && await isChatManager(larkAppId, chatId);
+}
+
+/**
  * Check group message addressing:
  * - 'allowed'     -> sender is allowed, bot was @mentioned or enabled solo-group bypass applies
  * - 'not_allowed' -> bot was @mentioned but sender is not in allowlist
@@ -2901,6 +2917,8 @@ export async function checkGroupMessageAccess(
   groupStatsOptions?: {
     requireFresh?: boolean;
     snapshot?: { userCount: number; botCount: number };
+    /** Reuse the current event's fail-closed manager lookup when routing already performed it. */
+    chatManagerAddressed?: () => Promise<boolean>;
   },
 ): Promise<'allowed' | 'not_allowed' | 'ignore'> {
   const mentioned = isBotMentioned(larkAppId, message, senderOpenId);
@@ -2916,9 +2934,10 @@ export async function checkGroupMessageAccess(
   // or ownership of independent topics. Explicit mentions keep their usual path.
   // Gated per bot by `chatManagerEnabled` (default off): a disabled bot stops
   // answering un-@ messages as manager without touching the group name/marker.
-  if (isAllowed && getBot(larkAppId).config.chatManagerEnabled === true
-    && message.chat_type === 'group' && !message.root_id && !message.thread_id
-    && !mentionsAnotherMember(larkAppId, message) && await isChatManager(larkAppId, chatId)) {
+  const managerAddressed = groupStatsOptions?.chatManagerAddressed
+    ? await groupStatsOptions.chatManagerAddressed()
+    : await addressedAsChatManager(larkAppId, message, chatId, isAllowed);
+  if (managerAddressed) {
     return 'allowed';
   }
 
@@ -4182,10 +4201,16 @@ async function maybeApplySharedTopicSeed(input: {
   messageId: string;
   routing: { scope: 'thread' | 'chat'; anchor: string };
   forceTopicApplied?: boolean;
+  /**
+   * 人路径专用：这条消息是否由本 bot 以群负责人身份免 @ 接下（见 addressedAsChatManager）。
+   * 只在 bot 开了 `chatManagerSharedTopic` 时才会被调用；bot 发来的消息不传，群负责人寻址
+   * 本来就只对人生效。
+   */
+  chatManagerAddressed?: () => Promise<boolean>;
 }): Promise<string | undefined> {
   const {
     larkAppId, chatId, chatType, message, senderOpenId, messageId, routing,
-    forceTopicApplied,
+    forceTopicApplied, chatManagerAddressed,
   } = input;
   if (forceTopicApplied) return undefined;
   // This helper only seeds a shared reply topic. A message with both fields is
@@ -4204,16 +4229,30 @@ async function maybeApplySharedTopicSeed(input: {
   // Bot-originated seeds can precede an authorized human turn. A cold signed
   // default intentionally falls back to the stricter global mention mode.
   const seedMentionMode = resolveGroupMentionMode(larkAppId, chatId);
-  if (!isBotMentioned(larkAppId, message, senderOpenId)
-      && !(seedMentionMode === 'never'
-        || (seedMentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message)))) return undefined;
+  const mentioned = isBotMentioned(larkAppId, message, senderOpenId);
+  const policyAnswersUnmentioned = seedMentionMode === 'never'
+    || (seedMentionMode === 'ambient' && !mentionsAnotherMember(larkAppId, message));
+  // 群负责人免 @ 接的顶层消息：默认（开关关）照旧平铺回复、不开话题；bot 显式开了
+  // `chatManagerSharedTopic` 时，和 @ 本 bot 的顶层消息一样开话题。开关关着时不做任何查询。
+  // `!!chatManagerAddressed` 同时是 bot 路径护栏：bot 发送方的 seed 调用点不传该回调，
+  // 且未 @ 的 bot 消息在分发器上游已被硬 return，能到达这里的 bot 消息 mentioned 恒为 true、
+  // managerSeedCandidate 恒为 false——回调缺失时不得继续走到下面的 chatManagerAddressed!()。
+  const managerSeedCandidate = !mentioned && !policyAnswersUnmentioned
+    && !!chatManagerAddressed && getBot(larkAppId).config.chatManagerSharedTopic === true;
+  if (!mentioned && !policyAnswersUnmentioned && !managerSeedCandidate) return undefined;
+  // 负责人判定前置到 chat_mode 刷新之前：isChatManager 内的 readManagerChat 自身已校验
+  // 「普通群、非话题模式」（话题群抛错→fail-closed false），所以话题群未 @ 顶层帖在此退出，
+  // 不再多付一次 getChatMode 强刷；判定为真时它同时证明了当前就是普通群。
+  // 下方 freshMode 检查仍保留，作为群属性在两次远端读取之间被转换的二次防线。
+  if (managerSeedCandidate && !await chatManagerAddressed!()) return undefined;
   const freshMode = routing.scope === 'thread'
     ? await getChatMode(larkAppId, chatId, { forceRefresh: true })
     : (getCachedChatMode(larkAppId, chatId) ?? 'group');
   if (freshMode !== 'group') return undefined;
   routing.scope = 'chat';
   routing.anchor = chatId;
-  logger.info(`[reply-mode] shared turn msg=${messageId.substring(0, 12)} routes through chat=${chatId.substring(0, 12)}`);
+  logger.info(`[reply-mode] shared turn msg=${messageId.substring(0, 12)} routes through chat=${chatId.substring(0, 12)}`
+    + (managerSeedCandidate ? ' via=chat-manager' : ''));
   return messageId;
 }
 
@@ -5798,6 +5837,14 @@ export function createLarkEventDispatcherRuntime(
           );
         }
       }
+      // One message gets one fail-closed manager decision. Shared-topic seeding
+      // and the later generic addressing gate must not observe different remote
+      // group-description snapshots or pay for the same lookup twice.
+      let chatManagerAddressedResult: Promise<boolean> | undefined;
+      const chatManagerAddressed = (): Promise<boolean> => {
+        chatManagerAddressedResult ??= addressedAsChatManager(larkAppId, message, chatId, isAllowed);
+        return chatManagerAddressedResult;
+      };
       // Trusted creator metadata affects addressing only. Unauthorized senders
       // must not trigger Lark/registry I/O; operation gates stay unchanged.
       if (isAllowed) {
@@ -6126,6 +6173,9 @@ export function createLarkEventDispatcherRuntime(
       } else {
         const seedReplyRootId = await maybeApplySharedTopicSeed({
           larkAppId, chatId, chatType, message, senderOpenId, messageId, routing, forceTopicApplied,
+          // 群监听命中的消息归属监听自己的会话路由（独立 thread/per_message 或 chat + autoClose），
+          // 负责人 seed 不得把它并进群级会话；监听支路不传负责人回调即可保持原路由。
+          chatManagerAddressed: messageListener ? undefined : chatManagerAddressed,
         });
         if (seedReplyRootId) {
           replyRootId = seedReplyRootId;
@@ -6403,6 +6453,7 @@ export function createLarkEventDispatcherRuntime(
             {
               requireFresh: !!primary,
               ...(stats ? { snapshot: stats } : {}),
+              chatManagerAddressed,
             },
           );
           if (access === 'not_allowed') {

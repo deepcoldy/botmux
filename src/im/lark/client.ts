@@ -40,7 +40,7 @@ import {
   type DefinitiveContactErrorCode,
 } from './lark-errors.js';
 import type { ChatContext } from '../../types.js';
-import { downloadResourceWithRange, isResourceSizeLimitError, type ResourceStream } from './resource-range-download.js';
+import { downloadResourceWithRange, getResourceErrorCode, isResourceSizeLimitError, LARK_RESOURCE_SIZE_LIMIT_CODE, type ResourceStream } from './resource-range-download.js';
 
 // larkGet lives in a dependency-free module so setup/owner-identity.ts (shared
 // by every onboarding / allowedUsers write path) can use the same no-body GET
@@ -1715,7 +1715,7 @@ export async function getMessageThreadId(
  * token authorized for this bot), which is what the paths without a per-turn
  * sender still rely on.
  */
-export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file' | 'video', savePath: string, senderOpenId?: string, options?: { allowUserTokenFallback?: boolean }): Promise<void> {
+export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file' | 'video', savePath: string, senderOpenId?: string, options?: { allowUserTokenFallback?: boolean; fallbackMessageIds?: readonly string[] }): Promise<void> {
   // apiOnly hard-gate BEFORE the app→user token fallback. Without this, the
   // App Token attempt (getBotClient) throws LarkTransportDisabledError, gets
   // caught below as a "failed app download", and silently falls through to the
@@ -1729,37 +1729,53 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
     mkdirSync(dir, { recursive: true });
   }
 
-  // Try App Token first
-  try {
-    await downloadWithAppToken(larkAppId, messageId, fileKey, apiType, savePath);
-    logger.info(`Downloaded ${type} ${fileKey} → ${savePath}`);
-    return;
-  } catch (appErr: any) {
-    // 234037 is a transfer-size limit, not an identity/permission failure.
-    // Retry with the SAME app token, including passive-history downloads.
-    // A failed Range transfer must propagate, never turn into a /login prompt.
-    if (await isResourceSizeLimitError(appErr)) {
-      const c = getBotClient(larkAppId);
-      await downloadResourceWithRange((start, end) => (c as any).request({
-        method: 'GET',
-        url: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/resources/${encodeURIComponent(fileKey)}`,
-        params: { type },
-        headers: { Range: `bytes=${start}-${end}` },
-        responseType: 'stream',
-        timeout: 30_000,
-      }), savePath);
-      logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via App Token Range)`);
+  // Resolve resource ownership with the same app identity before borrowing a
+  // user's token. A forward's outer ID, owning leaf and enclosing forward can
+  // differ; retry only the IDs supplied by its parsed message tree.
+  const messageIds = [...new Set([messageId, ...(options?.fallbackMessageIds ?? [])])];
+  let resourceMessageId = messageId;
+  for (const [index, candidateId] of messageIds.entries()) {
+    resourceMessageId = candidateId;
+    try {
+      await downloadWithAppToken(larkAppId, resourceMessageId, fileKey, apiType, savePath);
+      logger.info(`Downloaded ${type} ${fileKey} → ${savePath}`);
       return;
+    } catch (appErr: any) {
+      // SDK errors can contain a one-shot JSON stream. Decode it once for both
+      // ownership and size classification.
+      const errorCode = await getResourceErrorCode(appErr);
+      if (errorCode === 234003) {
+        if (index + 1 < messageIds.length) continue;
+        // "File not in msg." is not evidence that a personal token is missing.
+        throw appErr;
+      }
+      // 234037 is a transfer-size limit, not an identity/permission failure.
+      // Retry with the SAME app token, including passive-history downloads.
+      // A failed Range transfer must propagate, never turn into a /login prompt.
+      if (errorCode === LARK_RESOURCE_SIZE_LIMIT_CODE) {
+        const c = getBotClient(larkAppId);
+        await downloadResourceWithRange((start, end) => (c as any).request({
+          method: 'GET',
+          url: `/open-apis/im/v1/messages/${encodeURIComponent(resourceMessageId)}/resources/${encodeURIComponent(fileKey)}`,
+          params: { type: apiType },
+          headers: { Range: `bytes=${start}-${end}` },
+          responseType: 'stream',
+          timeout: 30_000,
+        }), savePath);
+        logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via App Token Range)`);
+        return;
+      }
+      // Passive history is only entitled to the observing app's visibility.
+      // It must never borrow a historical sender's OAuth credentials.
+      if (options?.allowUserTokenFallback === false) throw appErr;
+      // AxiosError status can be at various paths depending on SDK version
+      const status = appErr?.response?.status ?? appErr?.response?.statusCode
+        ?? appErr?.status ?? appErr?.statusCode;
+      // Only fall through to User Token for 400/403; other errors (network, etc.) re-throw
+      if (status && status !== 400 && status !== 403) throw appErr;
+      logger.debug(`App Token download failed (${status ?? 'unknown'}), trying User Token fallback...`);
+      break;
     }
-    // Passive history is only entitled to the observing app's visibility.
-    // It must never borrow a historical sender's OAuth credentials.
-    if (options?.allowUserTokenFallback === false) throw appErr;
-    // AxiosError status can be at various paths depending on SDK version
-    const status = appErr?.response?.status ?? appErr?.response?.statusCode
-      ?? appErr?.status ?? appErr?.statusCode;
-    // Only fall through to User Token for 400/403; other errors (network, etc.) re-throw
-    if (status && status !== 400 && status !== 403) throw appErr;
-    logger.debug(`App Token download failed (${status ?? 'unknown'}), trying User Token fallback...`);
   }
 
   // Fallback: User Token from botmux OAuth (/login)
@@ -1783,7 +1799,7 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
     );
   }
 
-  await downloadWithUserToken(userToken, messageId, fileKey, apiType, savePath, brand);
+  await downloadWithUserToken(userToken, resourceMessageId, fileKey, apiType, savePath, brand);
   logger.info(`Downloaded ${type} ${fileKey} → ${savePath} (via User Token)`);
 }
 
