@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { sendCompletionHintKey } from './services/send-completion-hint.js';
 import { selectReplyMessageId, parseReplyMessageTarget } from './core/reply-message.js';
 import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
@@ -14806,17 +14807,13 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
     console.error(`✓ 已发送 ${messageId} ｜ ${primaryQuotedId ? `引用 ${primaryQuotedId}` : '未引用'} ｜ ${atSummary}`);
     // Sentinel guidance is surfaced HERE — in the send-success output the model
     // reads back — rather than only in the injected system prompt. A model only
-    // learns about BOTMUX_NOTHING_TO_SEND after it has actually sent, so it
-    // cannot use the sentinel to end a turn where it did work but forgot to send
+    // gets completion guidance only after a final has actually been sent, so a
+    // progress receipt cannot invite it to end before delivering the answer
     // (the ghosting shape). The injected prompt keeps a one-line sentinel note
     // only for the genuine never-send silence case (message addressed to another
     // bot). See services/bridge-fallback-gate.ts for the matching strip-and-forward gate.
     const sendLocale = localeForBot(appId);
-    console.error(unifiedReplyUsed && effectiveResponseKind !== 'final'
-      ? t('ai.send.after_success_unified', undefined, sendLocale)
-      : advancedNextTurnId
-        ? t('ai.send.after_success_steer_advanced', undefined, sendLocale)
-        : t('ai.send.after_success_hint', undefined, sendLocale));
+    console.error(t(sendCompletionHintKey(effectiveResponseKind, unifiedReplyUsed, advancedNextTurnId), undefined, sendLocale));
     if (asChoice) {
       console.error(t(
         asChoice === 'independent' ? 'xpi.send.as_marked_independent' : 'xpi.send.as_marked_suggestion',
