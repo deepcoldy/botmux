@@ -28,6 +28,8 @@ export interface SessionAuthRequest {
   isCurrent: () => boolean;
   /** Session/app liveness used to keep or retire the daemon-side background poll. */
   isValid: () => boolean;
+  /** Confirmed private delivery; absent while sending (or for inline requests). */
+  delivery?: 'dm' | 'ephemeral';
   status: 'pending' | 'ready' | 'failed';
   expiresAt: number;
   poll: SessionAuthPoll;
