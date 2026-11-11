@@ -17,6 +17,7 @@ import { composeRowFromActive, composeRowFromPersistedActive } from './core/dash
 import { onSessionTaskEvent } from './core/session-task-events.js';
 import { validateProjectAttachmentReport, getProjectAttachmentSource, projectWorkstreamAttachments } from './services/project-workstream-runtime.js';
 import { setProjectAssociationConsumer } from './core/project-session-association-events.js';
+import { installProjectImportRuntime } from './services/project-import-runtime.js';
 import { setDecisionCardService } from './core/decision-board/card-action.js';
 import { createPrStateLookup } from './core/decision-board/github-pr-state.js';
 import { lookupChatAcrossBots } from './core/decision-board/chat-lookup.js';
@@ -35981,6 +35982,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     chatTasks: boardChatTasks,
   });
   setDecisionBoardService(decisionBoard);
+  const projectImports = installProjectImportRuntime({
+    markEnqueued: observed => {
+      const live = findActiveBySessionId(observed.sessionId);
+      if (!live || live.larkAppId !== observed.larkAppId
+        || live.session.projectRouteRevision !== observed.projectRouteRevision) return;
+      live.session.projectImportPending = false;
+      try { sessionStore.updateSession(live.session); } catch { live.session.projectImportPending = true; }
+    },
+  });
+  const projectImportTick = setInterval(() => {
+    void projectImports.tick().catch(() => logger.debug('[project] import recovery pending'));
+  }, 30_000);
+  projectImportTick.unref?.();
   setProjectAssociationConsumer(event => {
     void getProjectAttachmentSource(event.larkAppId, event.sessionId)
       .then(source => source && projectWorkstreamAttachments.observe(source))

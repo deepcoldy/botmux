@@ -45,3 +45,23 @@ grant 限当前源 session、话题、关联版本、项目群和主控 app，�
 
 新任务要借旧上下文时，使用受支持的 native `/fork` 得到新话题后登记新的 root；
 不支持或源忙时，新建 dispatch 并明确传递摘要/产物。第一期仍一个 root 一项任务。
+
+## 可选迁入通知
+
+默认关闭，旧群升级后不增加模型回合。项目主控在本人当前回合显式选择：
+
+```bash
+botmux project workstream notifications --mode notify
+botmux project workstream notifications --mode ignore
+```
+
+只通知明确 relay/bind/adopt/import/fork 的项目 Worker 独立话题，非项目群不发。
+通知只含 app/session/root/source/revision，不附标题、cwd、transcript 或终端内容。
+通知不是认领许可；主控不能从无真人 sender 的通知回合推测 owner 身份。
+
+来源提交时保存 pending 标记，宿主每 30 秒有界补投；持久 outbox 用同一
+关联版本的确定性 ID 去重。目标主控唯一且存在才投递；离线保留 pending，
+没有主控时不自动建会话。源或项目模式改变会取消陈旧事件。
+
+重复发送沿用相同 trigger idempotency key；只有宿主 input-commit 回执才能确认
+已通知。未知结果保留 pending，不能为了改投新主控而盲目重复运行模型。

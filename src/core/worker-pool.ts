@@ -73,7 +73,7 @@ import { reclaimIdleWorkersForAdmissionAfterTurnDrain } from './idle-worker-swee
 import { createWorkerStderrRing, WORKER_ERROR_MARKER, type WorkerStderrRing } from './worker-stderr-ring.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
-import { noteProjectAssociationChanged } from './project-session-association-events.js';
+import { noteProjectAssociationChanged, markProjectImportPending } from './project-session-association-events.js';
 import { recordTurnInputCommit } from '../services/idempotency-store.js';
 import { CODEX_CAPACITY_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId } from '../services/codex-transcript.js';
 import {
@@ -13676,6 +13676,7 @@ export async function transferSession(
   ds.session.chatType = targetChatType;
   ds.session.projectRouteRevision = (ds.session.projectRouteRevision ?? 1) + 1;
   ds.session.projectImportSource = opts?.importSource ?? 'relay';
+  markProjectImportPending(ds.session);
   ds.session.lastMessageAt = new Date().toISOString();
   // Card state was pinned to the source chat — clear so the new worker posts
   // a fresh card in the target chat instead of trying to PATCH a message that
@@ -14053,6 +14054,7 @@ async function forkFromSource(
     // bug in a multi-bot fleet), and destabilises sandbox transcript/BOT_HOME
     // location.
     childSession.larkAppId = ds.larkAppId;
+    markProjectImportPending(childSession);
     // Both native fork and clean failed-turn recovery inherit one recorded
     // launch posture. Never re-derive sandbox/CLI profile from the live bot:
     // a missing sandbox stamp on resume can silently disable isolation.
@@ -19908,6 +19910,9 @@ function setupWorkerHandlers(
         const previousNativeId = ds.session.cliSessionId;
         if (previousNativeId && previousNativeId !== msg.cliSessionId && !ds.session.pendingForkSession) {
           ds.session.projectRouteRevision = (ds.session.projectRouteRevision ?? 1) + 1;
+          // Native /clear or /resume is a new execution episode, not another
+          // import into this project. It invalidates stale attachment proofs.
+          ds.session.projectImportPending = false;
         }
         ds.session.cliSessionId = msg.cliSessionId;
         ds.session.codexCleanupTarget = ['codex', 'codex-app'].includes(effectiveCliId)

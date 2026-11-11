@@ -541,7 +541,10 @@ export function createProjectWorkstreamAttachments(deps: ProjectWorkstreamAttach
           }, actorCommitGuard(actor, record.projectGeneration));
         } catch (error) {
           updated = deps.getProject(actor.chatId);
-          if (updated?.workstreams.find(item => item.dispatchRoot === request.rootMessageId)?.status !== request.status) {
+          const item = updated?.workstreams.find(item => item.dispatchRoot === request.rootMessageId);
+          if (item?.status !== request.status || item.lastReport !== content
+            || (request.progress !== undefined && item.progress !== request.progress)
+            || item.remaining !== record.pendingReport.remaining) {
             throw error;
           }
           cardError = error instanceof Error ? error.message : String(error);

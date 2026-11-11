@@ -580,6 +580,19 @@ describe('project workstream attachments', () => {
     expect(readProjectAttachmentRecord(f.dataDir, 'om_topic')!.pendingReport).toBeUndefined();
   });
 
+  it('does not mistake unchanged status for a committed new report after a project write failure', async () => {
+    const f = await fixture();
+    await f.service.attach(f.actor, f.request);
+    await f.service.update(f.actor, { rootMessageId: 'om_topic', status: 'completed', content: '原先结果' });
+    f.projectRun.mockRejectedValueOnce(new Error('before_project_commit'));
+    await expect(f.service.update(f.actor, {
+      rootMessageId: 'om_topic', status: 'completed', content: '未经落盘的新结果',
+    })).rejects.toThrow('before_project_commit');
+    await f.service.reconcile(f.actor);
+    expect(readProjectGroup(f.dataDir, 'oc_group')!.workstreams[0]!.lastReport).toBe('原先结果');
+    expect(f.registry().om_topic.lastReport).toMatchObject({ status: 'completed', line: '原先结果' });
+  });
+
   it('does not mirror an obsolete report over a newer human report during recovery', async () => {
     const f = await fixture();
     await f.service.attach(f.actor, f.request);

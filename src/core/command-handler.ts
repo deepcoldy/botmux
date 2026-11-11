@@ -149,6 +149,7 @@ import { modelPinText } from './model-pin.js';
 import { writeSessionModelPin, sessionAcceptsDirectCommand, recordTurnExplicitMention } from './worker-pool.js';
 import { messageMentionsBot } from '../im/lark/message-parser.js';
 import { updateSessionTitle } from './session-title.js';
+import { markProjectImportPending, noteProjectAssociationChanged } from './project-session-association-events.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import { hasProtectedSessionMutationOwnership } from './session-mutation-guard.js';
 import { withBotTurnMutation, runDetachedBotTurnAdmission } from './bot-turn-mutation-gate.js';
@@ -7341,6 +7342,9 @@ export async function startCodexAppThreadSession(
     current.session.title = `Codex App: ${title}`;
     current.session.cliId = existingAppServerEndpoint ? 'codex' : 'codex-app';
     current.session.cliSessionId = thread.threadId;
+    current.session.projectRouteRevision = (current.session.projectRouteRevision ?? 1) + 1;
+    current.session.projectImportSource = 'adopt';
+    markProjectImportPending(current.session);
     if (existingAppServerEndpoint) {
       // Do not reuse a possibly frozen runner/wrapper from the temporary
       // BotMux shell this topic started with. The next fork freezes the current
@@ -7362,6 +7366,7 @@ export async function startCodexAppThreadSession(
     current.session.adoptedFrom = undefined;
     sessionStore.updateSession(current.session);
     forkWorker(current, '', true);
+    noteProjectAssociationChanged(current.session);
     return { status: 'switched' as const, anchor: sessionAnchorId(current) };
   });
   if (switched.status === 'gone') {
@@ -7479,12 +7484,23 @@ export async function startAdoptSession(
     current.session.adoptedFrom = { ...current.adoptedFrom };
     current.session.projectRouteRevision = (current.session.projectRouteRevision ?? 1) + 1;
     current.session.projectImportSource = 'adopt';
+    markProjectImportPending(current.session);
     sessionStore.updateSession(current.session);
-    forkAdoptWorker(current);
+    const admission = forkAdoptWorker(current);
+    if (admission !== 'accepted') {
+      current.session.projectImportPending = false;
+      sessionStore.updateSession(current.session);
+      return { status: 'rejected' as const, anchor: sessionAnchorId(current) };
+    }
+    noteProjectAssociationChanged(current.session);
     return { status: 'adopted' as const, anchor: sessionAnchorId(current) };
   });
   if (adopted.status === 'gone') {
     await replyNoSession((content) => sessionReply(sessionAnchorId(ds), content), loc);
+    return;
+  }
+  if (adopted.status === 'rejected') {
+    await sessionReply(adopted.anchor, '外部会话未成功接入；未登记项目迁入，请检查接入限制后重试。');
     return;
   }
   if (adopted.status === 'pending') {
@@ -7585,11 +7601,13 @@ export async function startResumeImportSession(
     current.session.title = target.title || `Import: ${project}`;
     current.session.projectRouteRevision = (current.session.projectRouteRevision ?? 1) + 1;
     current.session.projectImportSource = 'resume_import';
+    markProjectImportPending(current.session);
     // Resume sandbox decision is left to forkWorker (resume=true → not
     // sandboxed, matching restore semantics). Mark history so this is a resume.
     current.hasHistory = true;
     sessionStore.updateSession(current.session);
     forkWorker(current, '', true);
+    noteProjectAssociationChanged(current.session);
     return { status: 'resumed' as const, anchor: sessionAnchorId(current) };
   });
   if (resumed.status === 'gone') {

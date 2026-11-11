@@ -298,6 +298,7 @@ import { createGroupMessageRecallService } from '../services/group-message-recal
 import { GroupRecallError } from '../services/group-message-recall.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
 import { readProjectGroup } from '../services/project-group-store.js';
+import { writeGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
 import {
   localProjectAttachmentSource, getProjectAttachmentSource, projectHumanCallerKey,
   projectWorkstreamAttachments,
@@ -306,6 +307,9 @@ import { issueProjectSourceGrant, verifyProjectSourceGrant } from '../services/p
 import { readProjectAttachmentRecord } from '../services/project-workstream-attachments.js';
 import { loadOrCreateDispatchReportBindingSecret } from './dispatch-report-binding.js';
 import { dispatchCallerFromReply } from './dispatch-user-delegation.js';
+import { projectImportSnapshotFromSource } from '../services/project-import-runtime.js';
+import { projectImportOperationId } from '../services/project-import-notifications.js';
+import { createHash } from 'node:crypto';
 import {
   evaluateProjectDispatchPolicy,
   readGroupCollaborationMode,
@@ -3379,6 +3383,14 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-workstream', async (req, res,
   const ds = findActiveBySessionId(params.sessionId);
   const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
   if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  const currentTurnProof = authorizeSessionScopedIpc({
+    trustedHost: false, sessionExists: !!ds, receiverSession: !!ds?.session.vcMeetingReceiver,
+    allowReceiver: false, sessionId: params.sessionId, liveOrigin: ds?.managedTurnOrigin,
+    claimedCapability: typeof body?.originCapability === 'string' ? body.originCapability : undefined,
+    claimedTurnId: typeof body?.originTurnId === 'string' ? body.originTurnId : undefined,
+    claimedDispatchAttempt: typeof body?.originDispatchAttempt === 'number' ? body.originDispatchAttempt : undefined,
+  });
+  if (!currentTurnProof.ok) return jsonRes(res, 403, { ok: false, error: currentTurnProof.error });
   if (!ds || ds.chatType !== 'group' || ds.session.vcMeetingReceiver || sessionTransportDisabled(ds)) {
     return jsonRes(res, 403, { ok: false, error: 'project_coordinator_required' });
   }
@@ -3394,7 +3406,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-workstream', async (req, res,
   }
   if (!body || typeof body.action !== 'string') return jsonRes(res, 400, { ok: false, error: 'invalid_workstream_action' });
   const fields = new Set(['action', 'sourceSessionId', 'sourceLarkAppId', 'rootMessageId', 'title', 'purpose',
-    'expectedRevision', 'grant', 'status', 'content', 'remaining', 'milestone', 'progress',
+    'expectedRevision', 'grant', 'status', 'content', 'remaining', 'milestone', 'progress', 'mode',
     'originCapability', 'originTurnId', 'originDispatchAttempt', 'sessionId']);
   if (Object.keys(body).some(key => !fields.has(key))
     || (body.expectedRevision !== undefined && (!Number.isSafeInteger(body.expectedRevision) || Number(body.expectedRevision) < 1))
@@ -3470,7 +3482,32 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-workstream', async (req, res,
       authorizedSourceRouteRevision,
     });
     let result: unknown;
-    if (body.action === 'inspect') result = await projectWorkstreamAttachments.inspect(actor, request);
+    if (body.action === 'notifications') {
+      const mode = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
+      const project = readProjectGroup(config.session.dataDir, ds.chatId);
+      if (mode?.mode !== 'project' || mode.coordinatorAppId !== ds.larkAppId || project?.larkAppId !== ds.larkAppId) {
+        throw new Error('project_coordinator_required');
+      }
+      if (body.mode !== 'ignore' && body.mode !== 'notify') throw new Error('invalid_imported_session_policy');
+      result = await writeGroupCollaborationMode(config.session.dataDir, {
+        chatId: ds.chatId, mode: 'project', coordinatorAppId: ds.larkAppId,
+        workerAppIds: mode.workerAppIds, autoEnrollWorkers: mode.autoEnrollWorkers,
+        importedSessionPolicy: body.mode,
+      }, () => {
+        if (findActiveBySessionId(params.sessionId) !== ds || ds.managedTurnOrigin?.turnId !== turn
+          || !canOperate(ds.larkAppId, ds.chatId, caller.requestUserOpenId!, caller.requestUserUnionId)) {
+          throw new Error('project_attachment_actor_unproven');
+        }
+        const current = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
+        if (current?.mode !== 'project' || current.coordinatorAppId !== ds.larkAppId) {
+          throw new Error('project_coordinator_required');
+        }
+        if (JSON.stringify(current) !== JSON.stringify(mode)) {
+          throw new Error('project_configuration_changed');
+        }
+      });
+    }
+    else if (body.action === 'inspect') result = await projectWorkstreamAttachments.inspect(actor, request);
     else if (body.action === 'attach') result = await projectWorkstreamAttachments.attach(actor, request);
     else if (body.action === 'rename') result = await projectWorkstreamAttachments.rename(actor, { rootMessageId, title: string('title') ?? '' });
     else if (body.action === 'update') result = await projectWorkstreamAttachments.update(actor, {
@@ -3490,6 +3527,105 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-workstream', async (req, res,
   } catch (error) {
     const detail = ipcErrorText(error);
     return jsonRes(res, detail.includes('required') || detail.includes('unproven') ? 403 : 400, { ok: false, error: detail });
+  }
+});
+
+ipcRoute('POST', '/api/project-workstream/coordinators', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBody<Record<string, unknown>>(req, 4096).catch(() => undefined);
+  const project = typeof body?.chatId === 'string' ? readProjectGroup(config.session.dataDir, body.chatId) : undefined;
+  const mode = project && readGroupCollaborationMode(config.session.dataDir, project.chatId);
+  const ds = project && findActiveBySessionId(project.coordinatorSessionId);
+  const valid = ds && project && mode?.mode === 'project' && mode.coordinatorAppId === cachedLarkAppId
+    && body?.coordinatorLarkAppId === cachedLarkAppId && body.coordinatorSessionId === project.coordinatorSessionId
+    && ds.larkAppId === cachedLarkAppId && ds.chatId === project.chatId && ds.scope === 'chat'
+    && ds.session.status === 'active' && !ds.session.vcMeetingReceiver;
+  return jsonRes(res, 200, { ok: true, coordinators: valid ? [{
+    sessionId: ds.session.sessionId, larkAppId: ds.larkAppId, chatId: ds.chatId, scope: ds.scope, status: 'active',
+  }] : [] });
+});
+
+/** Host-only metadata notification. It may queue a turn but cannot mint a new
+ * coordinator session or grant access to any source transcript. */
+ipcRoute('POST', '/api/project-import/deliver', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBody<Record<string, unknown>>(req, 16 * 1024).catch(() => undefined);
+  const notification = body?.notification as { id?: string; operationId?: string; projectGeneration?: string; coordinatorAppId?: string; snapshot?: import('../services/project-import-notifications.js').ProjectImportSnapshot } | undefined;
+  const snapshot = notification?.snapshot;
+  const target = body?.target as { sessionId?: string; larkAppId?: string; chatId?: string; scope?: string } | undefined;
+  const key = body?.idempotencyKey;
+  if (!snapshot || !notification?.id || !notification.operationId || !target?.sessionId
+    || target.larkAppId !== cachedLarkAppId || typeof key !== 'string' || key.length > 200
+    || notification.coordinatorAppId !== cachedLarkAppId
+    || notification.operationId !== projectImportOperationId(snapshot)
+    || notification.id !== createHash('sha256').update(notification.operationId).digest('hex')) {
+    return jsonRes(res, 400, { ok: false, error: 'project_import_invalid_target', preDispatch: true });
+  }
+  const expectedKey = `project-import:${notification.id}:${createHash('sha256').update(target.sessionId).digest('hex').slice(0, 24)}`;
+  if (key !== expectedKey) return jsonRes(res, 400, { ok: false, error: 'project_import_invalid_target', preDispatch: true });
+  const ds = findActiveBySessionId(target.sessionId);
+  const fence = () => {
+    const project = readProjectGroup(config.session.dataDir, snapshot.chatId);
+    const mode = readGroupCollaborationMode(config.session.dataDir, snapshot.chatId);
+    if (mode?.mode !== 'project' || mode.importedSessionPolicy !== 'notify'
+      || mode.coordinatorAppId !== cachedLarkAppId || !mode.workerAppIds?.includes(snapshot.larkAppId)
+      || !project || project.createdAt !== notification.projectGeneration) throw new Error('policy_disabled');
+    if (!ds || findActiveBySessionId(target.sessionId!) !== ds || ds.session.status !== 'active'
+      || ds.scope !== 'chat' || ds.chatId !== snapshot.chatId || ds.session.vcMeetingReceiver
+      || project.coordinatorSessionId !== target.sessionId || project.larkAppId !== ds.larkAppId) {
+      throw new Error('coordinator_unavailable');
+    }
+    // Cross-bot session-store reads are read-only and intentionally narrow.
+    // Recheck the committed physical source immediately before claiming or
+    // dispatching the target turn, after all peer/network awaits.
+    const source = sessionStore.getSession(snapshot.sessionId);
+    if (!source || source.larkAppId !== snapshot.larkAppId || source.status !== 'active'
+      || source.chatId !== snapshot.chatId || source.rootMessageId !== snapshot.rootMessageId
+      || source.scope !== 'thread' || (source.projectRouteRevision ?? 1) !== snapshot.routeRevision
+      || source.projectImportSource !== snapshot.source || source.workflowNode || source.vcMeetingReceiver
+      || source.messageListenerRun || source.deferredScheduleRun) throw new Error('source_changed');
+  };
+  try {
+    fence();
+    const current = projectImportSnapshotFromSource(await getProjectAttachmentSource(snapshot.larkAppId, snapshot.sessionId));
+    if (!current || !current.ordinary || current.status !== 'active' || current.chatType !== 'group'
+      || current.scope !== 'thread' || JSON.stringify(current) !== JSON.stringify(snapshot)) throw new Error('source_changed');
+    fence();
+  } catch (error) {
+    return jsonRes(res, 409, { ok: false, error: ipcErrorText(error), preDispatch: true });
+  }
+  let dispatched = false;
+  let preDispatchError: string | undefined;
+  try {
+    const result = await triggerSessionTurn({
+      source: { type: 'ui', connectorId: 'project-import', requestId: notification.id },
+      target: { kind: 'turn', botId: cachedLarkAppId, sessionId: target.sessionId },
+      envelope: { format: 'project-import/v1', sourceName: '项目会话迁入', trusted: false, payload: {
+        sourceSessionId: snapshot.sessionId, sourceLarkAppId: snapshot.larkAppId,
+        rootMessageId: snapshot.rootMessageId, source: snapshot.source, routeRevision: snapshot.routeRevision,
+      } },
+      instruction: 'An existing session arrived in this project. This is a metadata-only notice, not authorization to read its transcript or claim someone else’s work. Request an explicit human workstream attach action when appropriate. Do not create a new task automatically.',
+      presentation: { thinking: 'hidden', topicMessage: null },
+      options: { turnIdempotencyKey: key, asyncReturnSessionId: true },
+    }, { larkAppId: cachedLarkAppId, activeSessions: getActiveSessionsRegistry()! }, {
+      validateBeforeClaim: () => {
+        try { fence(); } catch (error) { preDispatchError = ipcErrorText(error); throw error; }
+      },
+      validateBeforeDispatch: () => {
+        try { fence(); } catch (error) { preDispatchError = ipcErrorText(error); throw error; }
+        dispatched = true;
+      },
+    });
+    if (!result.ok && !dispatched && preDispatchError) {
+      return jsonRes(res, 409, { ok: false, error: preDispatchError, preDispatch: true });
+    }
+    const registration = readTurnRegistration(cachedLarkAppId, target.sessionId, key);
+    const commit = registration.body.inputCommitted as { state?: string } | undefined;
+    const delivered = result.ok && commit?.state === 'observed';
+    return jsonRes(res, 200, { ok: true, delivered, unknown: !delivered,
+      notificationId: notification.id, idempotencyKey: key, targetSessionId: target.sessionId });
+  } catch (error) {
+    return jsonRes(res, 409, { ok: false, error: ipcErrorText(error), preDispatch: !dispatched });
   }
 });
 
@@ -4445,11 +4581,18 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
       coordinatorSessionId: ds.session.sessionId,
     }, action, action.action === 'report' && action.expectedAttachment ? () => {
       const record = readProjectAttachmentRecord(config.session.dataDir, ds.chatId, action.dispatchRoot);
+      const source = record && sessionStore.getSession(record.source.sessionId);
+      const mode = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
       if (!record || record.phase !== 'active' || record.state !== 'active'
         || record.source.sessionId !== action.expectedAttachment!.sourceSessionId
         || record.revision !== action.expectedAttachment!.revision
         || record.coordinatorSessionId !== ds.session.sessionId
-        || record.coordinatorLarkAppId !== ds.larkAppId) throw new Error('project_attachment_revision_conflict');
+        || record.coordinatorLarkAppId !== ds.larkAppId
+        || source?.status !== 'active' || source.larkAppId !== record.source.larkAppId
+        || source.chatId !== record.chatId || source.rootMessageId !== record.rootMessageId
+        || (source.projectRouteRevision ?? 1) !== record.source.routeRevision
+        || mode?.mode !== 'project' || mode.coordinatorAppId !== ds.larkAppId
+        || !mode.workerAppIds?.includes(record.source.larkAppId)) throw new Error('project_attachment_revision_conflict');
     } : undefined);
     return jsonRes(res, 200, { ok: true, project });
   } catch (error) {

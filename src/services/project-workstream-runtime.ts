@@ -12,6 +12,7 @@ import { projectOwnerKey, projectCallerOwnerKey } from './project-workstream-aut
 import { createProjectWorkstreamAttachments, readProjectAttachmentRecord, type ProjectAttachmentSource } from './project-workstream-attachments.js';
 import { safeTextPreview } from './insight/safe-detail.js';
 import type { TrustedCaller, Session } from '../types.js';
+import { getBinding } from './issue-board-store.js';
 import { verifyDispatchReportBinding } from '../core/dispatch-report-binding.js';
 
 /** Freshness is proved against the denied host journal, not the CLI-readable
@@ -125,7 +126,9 @@ export async function localProjectAttachmentSource(appId: string, sessionId: str
   const latestLive = findActiveBySessionId(sessionId);
   const latest = latestLive?.session ?? sessionStore.getOwnedSession(sessionId);
   if (!latest || before !== JSON.stringify([latest.sessionId, latest.chatId, latest.rootMessageId, latest.projectRouteRevision, latest.ownerOpenId, latest.ownerUnionId, latest.status])) return;
+  const issueBinding = getBinding(config.session.dataDir, latest.scope === 'chat' ? latest.chatId : latest.rootMessageId);
   const ordinary = !latest.workflowNode && !latest.vcMeetingReceiver
+    && !(issueBinding && issueBinding.larkAppId === appId)
     && !latest.messageListenerRun && !latest.deferredScheduleRun;
   return {
     sessionId, larkAppId: appId, chatId: latest.chatId, rootMessageId: latest.rootMessageId,

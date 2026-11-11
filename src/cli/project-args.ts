@@ -48,6 +48,7 @@ export function parseProjectArgs(subcommand: string, args: readonly string[]): P
       update: ['--root', '--status', '--content', '--progress', '--remaining', '--milestone', '--revision'],
       status: ['--root'],
       grant: [],
+      notifications: ['--mode'],
     };
     if (!command || !allowedByAction[command]) return { ok: false, error: 'workstream 子命令: inspect|attach|rename|update|status|grant' };
     const rest = args.slice(1);
@@ -61,7 +62,10 @@ export function parseProjectArgs(subcommand: string, args: readonly string[]): P
       if (!value?.trim() || value.startsWith('--')) return { ok: false, error: `${flag} 需要一个值` };
     }
     const root = one(rest, '--root');
-    if (command !== 'grant' && command !== 'status' && !root) return { ok: false, error: '--root 必填' };
+    if (!['grant', 'status', 'notifications'].includes(command) && !root) return { ok: false, error: '--root 必填' };
+    if (command === 'notifications' && !['ignore', 'notify'].includes(one(rest, '--mode') ?? '')) {
+      return { ok: false, error: '--mode 必须是 ignore 或 notify' };
+    }
     if (root && !/^om_[A-Za-z0-9_-]{1,128}$/.test(root)) return { ok: false, error: '--root 必须是话题根消息 ID' };
     if ((command === 'inspect' || command === 'attach') && (!one(rest, '--source-session') || !one(rest, '--source-app'))) {
       return { ok: false, error: '--source-session 和 --source-app 必填' };
@@ -85,6 +89,7 @@ export function parseProjectArgs(subcommand: string, args: readonly string[]): P
         grant: one(rest, '--grant'), status, progress,
         content: one(rest, '--content'), remaining: one(rest, '--remaining'), milestone: one(rest, '--milestone'),
         expectedRevision: revision ? Number(revision) : undefined,
+        mode: one(rest, '--mode'),
       },
     };
   }

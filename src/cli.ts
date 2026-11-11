@@ -6904,6 +6904,7 @@ async function cmdProject(argv: string[]): Promise<void> {
   botmux project workstream update --root <om_root> --status <任务状态> [--content <说明>]
   botmux project workstream status [--root <om_root>]
   botmux project workstream grant
+  botmux project workstream notifications --mode ignore|notify
 
 说明:
   仅用于普通群的 chat-scope 主控会话。init 创建并置顶唯一进度卡；后续命令原地更新。
