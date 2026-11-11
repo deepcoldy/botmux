@@ -7942,7 +7942,7 @@ const SEND_HELP_BODY = [
   '       --mention-back                  @回本轮触发消息的发送者（open_id 自动取自会话）',
   '       --no-mention                    明确声明本条不@任何人',
   '       --quote <message_id>            指定引用某条消息（普通群，默认引用本轮触发消息）',
-  '       --reply-to <message_id>          按当前会话已接收消息的位置回复（不改变 final 轮次）',
+  '       --reply-to <message_id>         按当前会话已接收消息的位置回复（不改变 final 轮次）',
   '       --no-quote                      不引用，发独立消息（普通群）',
   '       --voice "<口语文字>"            合成语音气泡发出（需先 botmux voice 配置 TTS）',
   '       --top-level                     发顶层消息（不回复进当前话题）',
