@@ -764,6 +764,10 @@ describe('Feishu E2E session card wait', () => {
   });
 });
 
+// The clocks below read like Date.now(), not from 0: a wait measured from the
+// epoch instead of from the click or the send passes a clock that starts at 0.
+const WALL_CLOCK = Date.UTC(2026, 10, 11);
+
 describe('Feishu E2E card output toggle', () => {
   // The streaming card as Feishu shows it: 「更多操作」 starts folded, every
   // landed click flips the output when its card update arrives, and that
@@ -801,6 +805,7 @@ describe('Feishu E2E card output toggle', () => {
     return {
       calls,
       output: () => output,
+      elapsed: () => t,
       deps: {
         toggle: async () => {
           settle();
@@ -826,7 +831,7 @@ describe('Feishu E2E card output toggle', () => {
           folded = true;
           live = true;
         },
-        now: () => t,
+        now: () => WALL_CLOCK + t,
         sleep: async (ms: number) => {
           t += ms;
         },
@@ -860,7 +865,7 @@ describe('Feishu E2E card output toggle', () => {
       on: false, clicked: true, unfolds: 1, reloaded: false,
     });
     expect(never.calls.clicks).toBe(1);
-    expect(never.deps.now()).toBeLessThanOrEqual(45_000 + 1_000);
+    expect(never.elapsed()).toBeLessThanOrEqual(45_000 + 1_000);
   });
 
   it('leaves output that is already on alone', async () => {
@@ -966,7 +971,7 @@ describe('Feishu E2E command reply wait', () => {
         if (opts.reopenFails) throw new Error('Feishu Messenger chat list did not load');
         reloadedAt = t;
       },
-      now: () => t,
+      now: () => WALL_CLOCK + t,
       sleep: async (ms: number) => {
         t += ms;
       },

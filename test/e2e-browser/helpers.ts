@@ -1858,6 +1858,7 @@ export async function showStreamingOutput(
   const header = await moreHeader();
   await header?.scrollIntoViewIfNeeded({ timeout: 15_000 }).catch(() => {});
 
+  let reloadError: string | undefined;
   const result = await turnOutputOn(
     {
       toggle: async () => {
@@ -1890,7 +1891,8 @@ export async function showStreamingOutput(
             try {
               await opts.reopen!();
             } catch (error) {
-              console.warn(`[e2e] Reloading the topic failed: ${(error as Error).message.split('\n')[0]}`);
+              reloadError = (error as Error).message.split('\n')[0];
+              console.warn(`[e2e] Reloading the topic failed: ${reloadError}`);
             }
           }
         : undefined,
@@ -1906,7 +1908,7 @@ export async function showStreamingOutput(
     const detail =
       `the card's output toggle never read 「📕 隐藏输出」 within ${OUTPUT_ON_BUDGET_MS / 1000}s ` +
       `(clicked 「显示输出」: ${result.clicked ? 'yes' : 'no'}; unfolded 「更多操作」 ${result.unfolds}×; ` +
-      `reloaded the topic: ${result.reloaded ? 'yes' : 'no'})`;
+      `reloaded the topic: ${!result.reloaded ? 'no' : reloadError ? `failed (${reloadError})` : 'yes'})`;
     await recordFailureState(agent, page, MORE_ACTIONS_LABEL, detail);
     throw new Error(`showStreamingOutput: ${detail}`);
   }
