@@ -301,13 +301,13 @@ import { readProjectGroup } from '../services/project-group-store.js';
 import { writeGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
 import {
   localProjectAttachmentSource, getProjectAttachmentSource, projectHumanCallerKey,
-  projectWorkstreamAttachments,
+  projectWorkstreamAttachments, setProjectWorkstreamPool,
 } from '../services/project-workstream-runtime.js';
 import { issueProjectSourceGrant, verifyProjectSourceGrant } from '../services/project-workstream-authority.js';
 import { readProjectAttachmentRecord } from '../services/project-workstream-attachments.js';
 import { loadOrCreateDispatchReportBindingSecret } from './dispatch-report-binding.js';
 import { dispatchCallerFromReply } from './dispatch-user-delegation.js';
-import { projectImportSnapshotFromSource } from '../services/project-import-runtime.js';
+import { projectImportSnapshotFromSource } from '../services/project-import-snapshot.js';
 import { projectImportOperationId } from '../services/project-import-notifications.js';
 import { createHash } from 'node:crypto';
 import {
@@ -4570,6 +4570,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) =>
   }
   const action = parseProjectCoordinatorAction(body);
   if (!action) return jsonRes(res, 400, { ok: false, error: 'invalid_project_action' });
+  // Item rename has its own human/source-aware route. Exposing the internal
+  // action here would let a notice/bot turn bypass that authority boundary.
+  if (action.action === 'workstream_rename') {
+    return jsonRes(res, 403, { ok: false, error: 'project_workstream_route_required' });
+  }
   if (action.action === 'report' && action.expectedAttachment && !isTrustedHostIpcRequest(req)) {
     return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
   }
@@ -12635,6 +12640,7 @@ export function startIpcServer(opts: {
    * the trusted-host HMAC — this does NOT disable auth wholesale (codex P1). */
   coreOnlyPublicRoutes?: boolean;
 }): Promise<IpcServerHandle> {
+  setProjectWorkstreamPool({ findActiveBySessionId });
   let boundPort = opts.port;
   const server: Server = createServer(async (req, res) => {
     try {

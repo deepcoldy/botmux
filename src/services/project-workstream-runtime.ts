@@ -1,5 +1,5 @@
 import { config } from '../config.js';
-import { findActiveBySessionId } from '../core/worker-pool.js';
+import type { DaemonSession } from '../core/types.js';
 import * as sessionStore from './session-store.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { fetchDaemonIpc } from '../core/daemon-ipc-auth.js';
@@ -9,11 +9,28 @@ import { readProjectGroup } from './project-group-store.js';
 import { projectCoordinator } from './project-coordinator-runtime.js';
 import { loadOrCreateDispatchReportBindingSecret } from '../core/dispatch-report-binding.js';
 import { projectOwnerKey, projectCallerOwnerKey } from './project-workstream-authority.js';
-import { createProjectWorkstreamAttachments, readProjectAttachmentRecord, type ProjectAttachmentSource } from './project-workstream-attachments.js';
+import { createProjectWorkstreamAttachments, readProjectAttachmentRecord, type ProjectAttachmentActor, type ProjectAttachmentSource } from './project-workstream-attachments.js';
 import { safeTextPreview } from './insight/safe-detail.js';
 import type { TrustedCaller, Session } from '../types.js';
 import { getBinding } from './issue-board-store.js';
 import { verifyDispatchReportBinding } from '../core/dispatch-report-binding.js';
+
+export interface ProjectWorkstreamPool {
+  findActiveBySessionId(sessionId: string): DaemonSession | undefined;
+}
+
+let workstreamPool: ProjectWorkstreamPool | undefined;
+
+/** The daemon/IPC composition root installs its pool after bootstrap. Services
+ * must not import the worker-pool (which itself imports the daemon IPC graph),
+ * or loading a route can initialize a second unconfigured pool during a cycle. */
+export function setProjectWorkstreamPool(pool: ProjectWorkstreamPool | undefined): void {
+  workstreamPool = pool;
+}
+
+function findActiveBySessionId(sessionId: string): DaemonSession | undefined {
+  return workstreamPool?.findActiveBySessionId(sessionId);
+}
 
 /** Freshness is proved against the denied host journal, not the CLI-readable
  * registry. Replaying an old valid signature cannot revive a revoked source. */
@@ -156,20 +173,43 @@ export async function getProjectAttachmentSource(appId: string, sessionId: strin
   return body?.source?.sessionId === sessionId && body.source.larkAppId === appId ? body.source : undefined;
 }
 
-export const projectWorkstreamAttachments = createProjectWorkstreamAttachments({
-  dataDir: config.session.dataDir,
-  getSource: getProjectAttachmentSource,
-  getProject: chatId => readProjectGroup(config.session.dataDir, chatId),
-  getMode: chatId => readGroupCollaborationMode(config.session.dataDir, chatId),
-  projectRun: (context, action, beforeApply) => projectCoordinator.run(context, action, beforeApply),
-  reportSecret: () => loadOrCreateDispatchReportBindingSecret(config.session.dataDir),
-  actorAllowed: actor => {
-    const ds = findActiveBySessionId(actor.sessionId);
-    return !!actor.turnId && !!ds && ds.larkAppId === actor.larkAppId && ds.chatId === actor.chatId
-      && ds.scope === 'chat' && ds.managedTurnOrigin?.turnId === actor.turnId;
-  },
-  lookupRoot: async (chatId, root) => {
-    const project = readProjectGroup(config.session.dataDir, chatId);
-    return !!project && await lookupMessageChatId(project.larkAppId, root) === chatId;
-  },
-});
+export function projectAttachmentActorAllowed(actor: ProjectAttachmentActor): boolean {
+  const ds = findActiveBySessionId(actor.sessionId);
+  return !!actor.turnId && !!ds && ds.larkAppId === actor.larkAppId && ds.chatId === actor.chatId
+    && ds.scope === 'chat' && ds.managedTurnOrigin?.turnId === actor.turnId;
+}
+
+type ProjectWorkstreamService = ReturnType<typeof createProjectWorkstreamAttachments>;
+let cachedWorkstreamService: { dataDir: string; service: ProjectWorkstreamService } | undefined;
+
+/** Importing the IPC module must not read session configuration before daemon
+ * bootstrap (or a test fixture) has initialized it. Keep a stable facade for
+ * IPC callers/spies and bind each service instance to its selected state root. */
+function workstreamService(): ProjectWorkstreamService {
+  const dataDir = config.session.dataDir;
+  if (cachedWorkstreamService?.dataDir === dataDir) return cachedWorkstreamService.service;
+  const service = createProjectWorkstreamAttachments({
+    dataDir,
+    getSource: getProjectAttachmentSource,
+    getProject: chatId => readProjectGroup(dataDir, chatId),
+    getMode: chatId => readGroupCollaborationMode(dataDir, chatId),
+    projectRun: (context, action, beforeApply) => projectCoordinator.run(context, action, beforeApply),
+    reportSecret: () => loadOrCreateDispatchReportBindingSecret(dataDir),
+    actorAllowed: projectAttachmentActorAllowed,
+    lookupRoot: async (chatId, root) => {
+      const project = readProjectGroup(dataDir, chatId);
+      return !!project && await lookupMessageChatId(project.larkAppId, root) === chatId;
+    },
+  });
+  cachedWorkstreamService = { dataDir, service };
+  return service;
+}
+
+export const projectWorkstreamAttachments: ProjectWorkstreamService = {
+  inspect: (...args) => workstreamService().inspect(...args),
+  attach: (...args) => workstreamService().attach(...args),
+  update: (...args) => workstreamService().update(...args),
+  rename: (...args) => workstreamService().rename(...args),
+  reconcile: (...args) => workstreamService().reconcile(...args),
+  observe: (...args) => workstreamService().observe(...args),
+};

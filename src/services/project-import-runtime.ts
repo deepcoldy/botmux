@@ -1,11 +1,13 @@
 import { config } from '../config.js';
 import { fetchDaemonIpc } from '../core/daemon-ipc-auth.js';
-import { listActiveSessions, findActiveBySessionId } from '../core/worker-pool.js';
+import type { DaemonSession } from '../core/types.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { readGroupCollaborationMode, type GroupCollaborationModeConfig } from './group-collaboration-mode-store.js';
 import { readProjectGroup, type ProjectGroupState } from './project-group-store.js';
 import { getProjectAttachmentSource } from './project-workstream-runtime.js';
 import type { ProjectAttachmentSource } from './project-workstream-attachments.js';
+import { projectImportSnapshotFromSource } from './project-import-snapshot.js';
+export { projectImportSnapshotFromSource } from './project-import-snapshot.js';
 import {
   createProjectImportNotifications,
   projectImportOperationId,
@@ -14,7 +16,6 @@ import {
   type ProjectImportNotification,
   type ProjectImportNotificationRuntime,
   type ProjectImportPolicy,
-  type ProjectImportSnapshot,
   type ProjectImportSource,
 } from './project-import-notifications.js';
 
@@ -66,17 +67,6 @@ export interface ProjectImportRuntime {
 const IMPORT_SOURCES = new Set(['relay', 'bind', 'adopt', 'resume_import', 'fork']);
 const ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,255}$/;
 const knownSource = (source: string): source is ProjectImportSource => IMPORT_SOURCES.has(source);
-
-export function projectImportSnapshotFromSource(source: ProjectImportRuntimeSource | undefined): ProjectImportSnapshot | undefined {
-  if (!source || !knownSource(source.source)
-    || (source.chatType !== 'group' && source.chatType !== 'p2p')) return;
-  return {
-    sessionId: source.sessionId, larkAppId: source.larkAppId,
-    chatId: source.chatId, rootMessageId: source.rootMessageId,
-    chatType: source.chatType, scope: source.scope, status: source.status,
-    routeRevision: source.routeRevision, ordinary: source.ordinary, source: source.source,
-  };
-}
 
 /** This result is deliberately narrower than a successful trigger HTTP status.
  * "accepted" without durable input evidence can still be outcome-unknown. */
@@ -240,14 +230,16 @@ export function createProjectImportRuntime(deps: ProjectImportRuntimeDeps): Proj
 /** Install only in the owning daemon. Scheduling is explicitly its caller's
  * responsibility, so importing this module never starts timers or reads state. */
 export function installProjectImportRuntime(options: {
+  listActiveSessions(): readonly DaemonSession[];
+  findActiveBySessionId(sessionId: string): DaemonSession | undefined;
   markEnqueued?: ProjectImportRuntimeDeps['markEnqueued'];
-} = {}): ProjectImportRuntime {
+}): ProjectImportRuntime {
   const runtime = createProjectImportRuntime({
     dataDir: config.session.dataDir,
     getMode: chatId => readGroupCollaborationMode(config.session.dataDir, chatId),
     getProject: chatId => readProjectGroup(config.session.dataDir, chatId),
     getSource: getProjectAttachmentSource,
-    listRecoverableSessions: () => listActiveSessions().map(ds => {
+    listRecoverableSessions: () => options.listActiveSessions().map(ds => {
       const session = ds.session as typeof ds.session & { projectImportPending?: boolean };
       return {
         sessionId: session.sessionId,
@@ -264,7 +256,7 @@ export function installProjectImportRuntime(options: {
     }),
     markEnqueued: options.markEnqueued,
     localCoordinator: sessionId => {
-      const ds = findActiveBySessionId(sessionId);
+      const ds = options.findActiveBySessionId(sessionId);
       return ds ? { sessionId, larkAppId: ds.larkAppId, chatId: ds.chatId, scope: ds.scope, status: ds.session.status } : undefined;
     },
     findDaemon: appId => findOnlineDaemon(appId) ?? undefined,

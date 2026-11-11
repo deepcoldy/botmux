@@ -15,7 +15,7 @@ import { peerSessions, type ChatSessionRef, type ChatTaskReaderDeps } from './co
 import { stewardTaskHintsOn } from './core/decision-board/model.js';
 import { composeRowFromActive, composeRowFromPersistedActive } from './core/dashboard-rows.js';
 import { onSessionTaskEvent } from './core/session-task-events.js';
-import { validateProjectAttachmentReport, getProjectAttachmentSource, projectWorkstreamAttachments } from './services/project-workstream-runtime.js';
+import { validateProjectAttachmentReport, getProjectAttachmentSource, projectWorkstreamAttachments, setProjectWorkstreamPool } from './services/project-workstream-runtime.js';
 import { setProjectAssociationConsumer } from './core/project-session-association-events.js';
 import { installProjectImportRuntime } from './services/project-import-runtime.js';
 import { setDecisionCardService } from './core/decision-board/card-action.js';
@@ -32851,6 +32851,7 @@ async function waitForManagedActivationCommit(index: number, appId: string): Pro
 }
 
 export async function startDaemon(botIndex?: number): Promise<void> {
+  setProjectWorkstreamPool({ findActiveBySessionId });
   if (feedbackMaintenanceActive(config.session.dataDir)) {
     logger.warn('[feedback] Persisted maintenance is active. Inspect `botmux feedback storage status`; resume or cancel the original migration. New turns remain blocked until explicit recovery.');
   }
@@ -35983,6 +35984,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   });
   setDecisionBoardService(decisionBoard);
   const projectImports = installProjectImportRuntime({
+    listActiveSessions,
+    findActiveBySessionId,
     markEnqueued: observed => {
       const live = findActiveBySessionId(observed.sessionId);
       if (!live || live.larkAppId !== observed.larkAppId

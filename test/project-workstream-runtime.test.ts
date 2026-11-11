@@ -11,12 +11,21 @@ const mocks = vi.hoisted(() => ({
   project: vi.fn(),
   record: vi.fn(),
   secret: vi.fn(),
+  issueBinding: vi.fn(),
+  factory: vi.fn(),
+  instances: [] as any[],
+  dataDir: '/synthetic-state',
+  configAvailable: false,
+  configReads: 0,
   serviceDeps: undefined as any,
 }));
-vi.mock('../src/config.js', () => ({ config: { session: { dataDir: '/synthetic-state' } } }));
-vi.mock('../src/core/worker-pool.js', () => ({
-  findActiveBySessionId: (id: string) => mocks.live.get(id),
-}));
+vi.mock('../src/config.js', () => ({ config: { session: {
+  get dataDir() {
+    mocks.configReads += 1;
+    if (!mocks.configAvailable) throw new ReferenceError('synthetic fixture dataDir is not initialized');
+    return mocks.dataDir;
+  },
+} } }));
 vi.mock('../src/services/session-store.js', () => ({
   getOwnedSession: (id: string) => mocks.stored.get(id),
 }));
@@ -32,6 +41,7 @@ vi.mock('../src/services/group-collaboration-mode-store.js', () => ({
 vi.mock('../src/services/project-group-store.js', () => ({
   readProjectGroup: mocks.project,
 }));
+vi.mock('../src/services/issue-board-store.js', () => ({ getBinding: mocks.issueBinding }));
 vi.mock('../src/services/project-coordinator-runtime.js', () => ({
   projectCoordinator: { run: vi.fn() },
 }));
@@ -41,9 +51,13 @@ vi.mock('../src/core/dispatch-report-binding.js', async importOriginal => ({
 }));
 vi.mock('../src/services/project-workstream-attachments.js', () => ({
   readProjectAttachmentRecord: mocks.record,
-  createProjectWorkstreamAttachments: (deps: unknown) => {
+  createProjectWorkstreamAttachments: (deps: any) => {
+    mocks.factory(deps);
     mocks.serviceDeps = deps;
-    return {};
+    const instance = Object.fromEntries(['inspect', 'attach', 'update', 'rename', 'reconcile', 'observe']
+      .map(method => [method, vi.fn().mockResolvedValue({ method, dataDir: deps.dataDir })]));
+    mocks.instances.push(instance);
+    return instance;
   },
 }));
 
@@ -52,8 +66,13 @@ import {
   localProjectAttachmentSource,
   projectHumanCallerKey,
   projectSessionOwnerKey,
+  projectAttachmentActorAllowed,
+  projectWorkstreamAttachments,
+  setProjectWorkstreamPool,
   validateProjectAttachmentReport,
 } from '../src/services/project-workstream-runtime.js';
+
+const configReadsAtImport = mocks.configReads;
 
 const SECRET = 'synthetic-runtime-binding-secret';
 const ROOT = 'om_source_root';
@@ -109,6 +128,11 @@ function importedFixture() {
 }
 
 beforeEach(() => {
+  setProjectWorkstreamPool({ findActiveBySessionId: (id: string) => mocks.live.get(id) });
+  mocks.configAvailable = true;
+  mocks.dataDir = '/synthetic-state';
+  mocks.factory.mockClear();
+  mocks.issueBinding.mockReset().mockReturnValue(undefined);
   mocks.live.clear();
   mocks.stored.clear();
   mocks.union.mockReset().mockResolvedValue({ status: 'unavailable' });
@@ -164,6 +188,90 @@ describe('project workstream runtime owner identity', () => {
   });
 });
 
+describe('project workstream runtime lazy facade', () => {
+  const actor = {
+    sessionId: 'main-session', larkAppId: 'cli_main', chatId: 'oc_project',
+    scope: 'chat' as const, ownerKey: OWNER, turnId: 'turn-current',
+  };
+  const request = {
+    sourceSessionId: SOURCE_ID, sourceLarkAppId: SOURCE_APP, rootMessageId: ROOT, title: '任务',
+  };
+
+  it('does not read dataDir when the module is imported before fixture initialization', () => {
+    expect(configReadsAtImport).toBe(0);
+  });
+
+  it('fails closed before the composition root installs a live pool', async () => {
+    const f = importedFixture();
+    mocks.stored.set(SOURCE_ID, f.source);
+    setProjectWorkstreamPool(undefined);
+    expect(projectAttachmentActorAllowed(actor)).toBe(false);
+    expect(await localProjectAttachmentSource(SOURCE_APP, SOURCE_ID)).toMatchObject({
+      reportCapability: 'unavailable',
+    });
+    expect(await f.validate()).toEqual({ ok: false, error: 'dispatch_attachment_inactive' });
+  });
+
+  it('uses the currently installed pool without eagerly constructing or replacing it', async () => {
+    const first = vi.fn(() => undefined);
+    setProjectWorkstreamPool({ findActiveBySessionId: first });
+    expect(await localProjectAttachmentSource(SOURCE_APP, SOURCE_ID)).toBeUndefined();
+    expect(first).toHaveBeenCalledWith(SOURCE_ID);
+    const second = vi.fn(() => ({ session: sourceSession(), cliReady: true }) as any);
+    setProjectWorkstreamPool({ findActiveBySessionId: second });
+    expect(await localProjectAttachmentSource(SOURCE_APP, SOURCE_ID)).toMatchObject({
+      sessionId: SOURCE_ID, reportCapability: 'verified',
+    });
+    expect(second).toHaveBeenCalledWith(SOURCE_ID);
+  });
+
+  it('creates the service upon first use and reuses it across facade methods', async () => {
+    mocks.dataDir = '/synthetic-lazy-one';
+    const inspected = await projectWorkstreamAttachments.inspect(actor, request);
+    expect(inspected).toEqual({ method: 'inspect', dataDir: mocks.dataDir });
+    await projectWorkstreamAttachments.attach(actor, request);
+    await projectWorkstreamAttachments.rename(actor, { rootMessageId: ROOT, title: '新任务名' });
+    await projectWorkstreamAttachments.update(actor, { rootMessageId: ROOT, status: 'completed', content: '完成' });
+    await projectWorkstreamAttachments.reconcile(actor, { rootMessageId: ROOT });
+    await projectWorkstreamAttachments.observe({
+      sessionId: SOURCE_ID, larkAppId: SOURCE_APP, chatId: actor.chatId, rootMessageId: ROOT,
+      scope: 'thread', status: 'active', ownerKey: OWNER, routeRevision: 1,
+      source: 'relay', ordinary: true, reportCapability: 'verified',
+    });
+    expect(mocks.factory).toHaveBeenCalledTimes(1);
+    const instance = mocks.instances.at(-1)!;
+    expect(instance.inspect).toHaveBeenCalledWith(actor, request);
+    expect(instance.attach).toHaveBeenCalledWith(actor, request);
+    expect(instance.rename).toHaveBeenCalledTimes(1);
+    expect(instance.update).toHaveBeenCalledTimes(1);
+    expect(instance.reconcile).toHaveBeenCalledTimes(1);
+    expect(instance.observe).toHaveBeenCalledTimes(1);
+  });
+
+  it('rebinds after the selected data root changes without changing facade identity', async () => {
+    const facade = projectWorkstreamAttachments;
+    mocks.dataDir = '/synthetic-lazy-before';
+    await facade.inspect(actor, request);
+    const oldDeps = mocks.serviceDeps;
+    mocks.dataDir = '/synthetic-lazy-after';
+    expect(await facade.inspect(actor, request)).toEqual({ method: 'inspect', dataDir: mocks.dataDir });
+    expect(facade).toBe(projectWorkstreamAttachments);
+    expect(mocks.factory).toHaveBeenCalledTimes(2);
+    // A service already in use stays pinned to its original authority root.
+    oldDeps.getMode('oc_project');
+    expect(mocks.mode).toHaveBeenLastCalledWith('/synthetic-lazy-before', 'oc_project');
+  });
+
+  it('keeps method properties spyable for IPC route tests', async () => {
+    const spy = vi.spyOn(projectWorkstreamAttachments, 'inspect');
+    try {
+      mocks.dataDir = '/synthetic-lazy-spy';
+      await projectWorkstreamAttachments.inspect(actor, request);
+      expect(spy).toHaveBeenCalledWith(actor, request);
+    } finally { spy.mockRestore(); }
+  });
+});
+
 describe('project workstream runtime source projection', () => {
   it('requires the same live chat-scope managed turn for attachment mutations', () => {
     mocks.live.set('main-session', {
@@ -172,15 +280,15 @@ describe('project workstream runtime source projection', () => {
     });
     const actor = {
       sessionId: 'main-session', larkAppId: 'cli_main', chatId: 'oc_project',
-      scope: 'chat', ownerKey: OWNER, turnId: 'turn-current',
+      scope: 'chat' as const, ownerKey: OWNER, turnId: 'turn-current',
     };
-    expect(mocks.serviceDeps.actorAllowed(actor)).toBe(true);
-    expect(mocks.serviceDeps.actorAllowed({ ...actor, turnId: undefined })).toBe(false);
-    expect(mocks.serviceDeps.actorAllowed({ ...actor, turnId: 'turn-old' })).toBe(false);
-    expect(mocks.serviceDeps.actorAllowed({ ...actor, larkAppId: 'cli_other' })).toBe(false);
-    expect(mocks.serviceDeps.actorAllowed({ ...actor, chatId: 'oc_other' })).toBe(false);
+    expect(projectAttachmentActorAllowed(actor)).toBe(true);
+    expect(projectAttachmentActorAllowed({ ...actor, turnId: undefined })).toBe(false);
+    expect(projectAttachmentActorAllowed({ ...actor, turnId: 'turn-old' })).toBe(false);
+    expect(projectAttachmentActorAllowed({ ...actor, larkAppId: 'cli_other' })).toBe(false);
+    expect(projectAttachmentActorAllowed({ ...actor, chatId: 'oc_other' })).toBe(false);
     mocks.live.get('main-session').scope = 'thread';
-    expect(mocks.serviceDeps.actorAllowed(actor)).toBe(false);
+    expect(projectAttachmentActorAllowed(actor)).toBe(false);
   });
 
   it('projects metadata and readiness without transcript or raw terminal content', async () => {

@@ -4,23 +4,28 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   createProjectImportRuntime,
+  installProjectImportRuntime,
   projectImportRegistrationOutcome,
-  projectImportSnapshotFromSource,
   PROJECT_IMPORT_COORDINATORS_ROUTE,
   PROJECT_IMPORT_DELIVER_ROUTE,
   type ProjectImportRecoverableSession,
   type ProjectImportRuntimeDeps,
   type ProjectImportRuntimeSource,
 } from '../src/services/project-import-runtime.js';
+import { projectImportSnapshotFromSource } from '../src/services/project-import-snapshot.js';
 import {
   projectImportOperationId,
+  setProjectImportNotifications,
   type ProjectImportCoordinator,
 } from '../src/services/project-import-notifications.js';
 import type { GroupCollaborationModeConfig } from '../src/services/group-collaboration-mode-store.js';
 import type { ProjectGroupState } from '../src/services/project-group-store.js';
 
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => {
+  setProjectImportNotifications(undefined);
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
 const jsonResponse = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
   status, headers: { 'content-type': 'application/json' },
 });
@@ -88,6 +93,17 @@ function fixture() {
 }
 
 describe('project import runtime wiring', () => {
+  it('installs with composition-root pool callbacks without starting a timer or scanning at import', async () => {
+    const listActiveSessions = vi.fn(() => []);
+    const findActiveBySessionId = vi.fn(() => undefined);
+    const installed = installProjectImportRuntime({ listActiveSessions, findActiveBySessionId });
+    expect(listActiveSessions).not.toHaveBeenCalled();
+    expect(findActiveBySessionId).not.toHaveBeenCalled();
+    expect(await installed.tick()).toEqual({ recovered: 0, delivered: 0, pending: 0, cancelled: 0 });
+    expect(listActiveSessions).toHaveBeenCalledOnce();
+    expect(findActiveBySessionId).not.toHaveBeenCalled();
+  });
+
   it('the default-off gate avoids source lookups, peer/network work and outbox creation', async () => {
     const f = fixture();
     f.setMode({ ...f.mode(), importedSessionPolicy: undefined });
