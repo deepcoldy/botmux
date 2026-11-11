@@ -42,6 +42,10 @@ grant 限当前源 session、话题、关联版本、项目群和主控 app，�
 - workflow、会议、监听和周期执行的专属会话不会被普通项目登记抢占。
 - 外部 adopt 仅手工跟踪，不能假定其已获得 botmux prompt 或回报 capability。
 - rename 不发送新 prompt，修改项目行与任务树标题，不更改完成状态。
+- `attach` 与 `status` 须由主控会话的 owner 本人在当前回合执行；其它成员或无 owner 的
+  主控会话直接拒绝（`project_coordinator_owner_required`），因为回报校验绑定主控会话 owner。
+- 来源 worker 空闲挂起或被回收不改变关联：登记和 status 不把一时未就绪当成失去回报能力；
+  回报时仍要求来源 CLI 已就绪。
 
 新任务要借旧上下文时，使用受支持的 native `/fork` 得到新话题后登记新的 root；
 不支持或源忙时，新建 dispatch 并明确传递摘要/产物。第一期仍一个 root 一项任务。

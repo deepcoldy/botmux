@@ -36,7 +36,7 @@ beforeEach(async () => {
   });
   bot.resolvedAllowedUsers = ['ou_owner'];
   ds = {
-    session: { sessionId: 'main-ipc', chatId: CHAT, rootMessageId: 'om_main', scope: 'chat', status: 'active' },
+    session: { sessionId: 'main-ipc', chatId: CHAT, rootMessageId: 'om_main', scope: 'chat', status: 'active', ownerUnionId: 'on_owner' },
     larkAppId: APP, chatId: CHAT, chatType: 'group', scope: 'chat',
     managedTurnOrigin: { capability: CAP, turnId: 'om_human', dispatchAttempt: 1, trustedCaller: {
       requestLarkAppId: APP, requestUserOpenId: 'ou_owner', requestUserUnionId: 'on_owner', senderType: 'user',
@@ -107,6 +107,24 @@ describe('project workstream IPC boundary', () => {
       expect((await post('attach', { ...source, ...extra })).status).toBe(400);
     }
     expect(attach).not.toHaveBeenCalled();
+  });
+  it('refuses attach/status unless the human is the coordinator session owner', async () => {
+    const reconcile = vi.spyOn(runtime.projectWorkstreamAttachments, 'reconcile');
+    // Report validation compares the coordinator session owner with the human
+    // who attached; another operator or an ownerless coordinator would leave a
+    // registered association whose reports are always rejected.
+    for (const owner of [{ ownerUnionId: 'on_other' }, { ownerUnionId: undefined }]) {
+      Object.assign(ds.session, owner);
+      for (const [action, extra] of [['attach', source], ['status', {}]] as const) {
+        const res = await post(action, extra);
+        expect(res.status).toBe(403);
+        expect((await res.json()).error).toBe('project_coordinator_owner_required');
+      }
+    }
+    expect(attach).not.toHaveBeenCalled();
+    expect(reconcile).not.toHaveBeenCalled();
+    ds.session.ownerUnionId = 'on_owner';
+    expect((await post('attach', source)).status).toBe(200);
   });
   it('allows dedicated rename action without an extra task kickoff', async () => {
     expect((await post('rename', { rootMessageId: 'om_task', title: '实现迁入任务' })).status).toBe(200);

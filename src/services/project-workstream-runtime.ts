@@ -100,7 +100,7 @@ export async function validateProjectAttachmentReport(
     || finalCoordinator.larkAppId !== record.coordinatorLarkAppId
     || finalCoordinator.chatId !== record.chatId || finalCoordinator.scope !== 'chat'
     || finalCoordinator.ownerKey !== record.coordinatorOwnerKey
-    || !currentSource || currentSource.session.status !== 'active'
+    || !currentSource || !currentSource.cliReady || currentSource.session.status !== 'active'
     || currentSource.session.chatId !== record.chatId || currentSource.session.rootMessageId !== root
     || (currentSource.session.projectRouteRevision ?? 1) !== record.source.routeRevision
     || currentMode?.mode !== 'project' || currentMode.coordinatorAppId !== record.coordinatorLarkAppId
@@ -152,8 +152,14 @@ export async function localProjectAttachmentSource(appId: string, sessionId: str
     scope: latest.scope ?? 'thread', status: latest.status, chatType: latest.chatType,
     ownerKey, routeRevision: latest.projectRouteRevision ?? 1,
     source: latest.projectImportSource ?? 'manual', ordinary,
+    // Capability is a property of the association, not of the current worker
+    // generation: idle suspension/reclaim clears cliReady while the session
+    // stays active. Freezing that transient state into attach or letting status
+    // downgrade on it would reject every later report from the woken worker.
+    // Report-time readiness is checked separately in
+    // validateProjectAttachmentReport.
     reportCapability: latest.adoptedFrom ? 'manual'
-      : latest.pendingForkSession || !latest.cliSessionId || !latestLive?.cliReady ? 'unavailable' : 'verified',
+      : latest.pendingForkSession || !latest.cliSessionId || !latestLive ? 'unavailable' : 'verified',
     title: safeTextPreview(latest.title, 80)?.text,
   };
 }

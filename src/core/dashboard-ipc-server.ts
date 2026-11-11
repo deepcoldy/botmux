@@ -300,7 +300,7 @@ import { projectCoordinator } from '../services/project-coordinator-runtime.js';
 import { readProjectGroup } from '../services/project-group-store.js';
 import { writeGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
 import {
-  localProjectAttachmentSource, getProjectAttachmentSource, projectHumanCallerKey,
+  localProjectAttachmentSource, getProjectAttachmentSource, projectHumanCallerKey, projectSessionOwnerKey,
   projectWorkstreamAttachments, setProjectWorkstreamPool,
 } from '../services/project-workstream-runtime.js';
 import { issueProjectSourceGrant, verifyProjectSourceGrant } from '../services/project-workstream-authority.js';
@@ -3458,6 +3458,18 @@ ipcRoute('POST', '/api/sessions/:sessionId/project-workstream', async (req, res,
       return jsonRes(res, 200, { ok: true, grantId: grant.id, expiresAt: grant.expiresAt });
     }
     if (ds.scope !== 'chat') throw new Error('project_coordinator_required');
+    if (body.action === 'attach' || body.action === 'status') {
+      // Report validation binds an imported workstream to this coordinator
+      // session's owner. Registering or rebinding it from another operator's
+      // turn (or in an ownerless session) would succeed here yet make every
+      // later report fail, so refuse explicitly before any write.
+      const coordinatorOwnerKey = await projectSessionOwnerKey({
+        larkAppId: ds.larkAppId, ownerOpenId: ds.session.ownerOpenId, ownerUnionId: ds.session.ownerUnionId,
+      });
+      if (!coordinatorOwnerKey || coordinatorOwnerKey !== ownerKey) {
+        throw new Error('project_coordinator_owner_required');
+      }
+    }
     let authorizedSourceOwnerKey: string | undefined;
     let authorizedSourceRouteRevision: number | undefined;
     let sourceAuthorizationStillValid: (() => boolean) | undefined;
