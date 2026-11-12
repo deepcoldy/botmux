@@ -171,6 +171,7 @@ import {
 import { createDispatchLaunchOperationStore } from './core/dispatch-launch-operation-store.js';
 import { createDispatchLaunchSourceCoordinator } from './core/dispatch-launch-source.js';
 import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from './cli/session-list-liveness.js';
+import { deferredSuspendNote, DRY_RUN_DEFER_NOTE } from './cli/suspend-output.js';
 import {
   computeSessionPickerLayout,
   type SessionPickerColumnKey,
@@ -6032,7 +6033,7 @@ async function cmdSuspend(): Promise<void> {
       }
       const predicted = predictSuspend(await lookupRow(s.sessionId, s.larkAppId));
       switch (predicted) {
-        case 'defer': console.log(`· 将排队（正在回复，完成后自动挂起）: ${label}`); deferred++; break;
+        case 'defer': console.log(`· 将排队，${DRY_RUN_DEFER_NOTE}: ${label}`); deferred++; break;
         case 'suspend': console.log(`· 将挂起: ${label}`); break;
         case 'no_worker': console.log(`· 将跳过（本就无存活 CLI）: ${label}`); skipped++; break;
         case 'refuse': console.log(`· 将拒绝（adopt / 不可挂起 backend）: ${label}`); failed++; break;
@@ -6066,7 +6067,7 @@ async function cmdSuspend(): Promise<void> {
       if (res.ok && body?.ok) {
         if (body.suspended) { console.log(`✓ 已挂起: ${label}`); suspended++; }
         else if (body.reason === 'deferred') {
-          console.log(`⏳ 已排队（正在回复，完成后自动挂起）: ${label}`);
+          console.log(`⏳ 已排队，${deferredSuspendNote(body)}: ${label}`);
           deferred++;
         }
         else { console.log(`· 本就无存活 CLI（目标态已达成）: ${label}`); skipped++; }
