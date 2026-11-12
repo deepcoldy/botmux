@@ -572,8 +572,8 @@ function jwtClaims(jwt: string): { exp?: unknown; region?: unknown } | null {
  * Regions this person's login could not mint a token for, and under which
  * login. Most logins hold no regional access, so without this every turn spent
  * three failing CLI runs (~2.5s measured) re-learning that. A miss only means
- * "that region keeps the default token", which is also what a failure means,
- * so remembering it can never widen access. It is forgotten on any change of
+ * "that region has no token" (its calls are refused by the wrapper), which is
+ * also what a failure means, so remembering it can never widen access. It is forgotten on any change of
  * login or epoch, on logout, and after {@link REGIONAL_MISS_TTL_MS}.
  */
 const regionalMissCache = new Map<string, { fingerprint: string; epoch: number; durableEpoch: number; atMs: number }>();
@@ -601,9 +601,9 @@ async function regionalCloudJwt(
   if (!credentialEpochCurrent(openId, epoch, durableEpoch)) return null;
   const jwt = result.ok ? result.stdout.trim() : '';
   const claims = jwt && !/\s/.test(jwt) ? jwtClaims(jwt) : null;
-  // A token for another partition would only move the failure; keep the default.
+  // A token for another partition would only move the failure; publish none.
   if (!claims || claims.region !== region) {
-    logger.debug(`[bytedcli-auth] no ${region} ByteCloud JWT for ${openId}; that region keeps the default token`);
+    logger.debug(`[bytedcli-auth] no ${region} ByteCloud JWT for ${openId}; that region's calls are refused`);
     // Remember only a definite answer about this login (the CLI ran and said
     // it holds no login for that site, or handed back no usable token). A
     // timeout, a crash or a missing binary says nothing, so the next turn asks
@@ -770,8 +770,9 @@ async function mintJwts(openId: string, epoch: number, durableEpoch: number): Pr
   if (!codeJwt) {
     logger.debug(`[bytedcli-auth] no Codebase JWT for ${openId}; git attribution will fall back`);
   }
-  // Regional tokens are best-effort like the Codebase JWT: without one, that
-  // region's calls keep the default token. Minted one at a time — concurrent
+  // Regional tokens are best-effort like the Codebase JWT: without one, the
+  // wrapper refuses that region's calls (never sends the default token there),
+  // and the rest of the turn is unaffected. Minted one at a time — concurrent
   // mints against the same HOME were measured returning another region's token.
   const regionalCloudJwts: BytedcliRegionalJwts = {};
   for (const [region, site] of BYTEDCLI_REGIONAL_SITES) {

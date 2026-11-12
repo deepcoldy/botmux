@@ -41,6 +41,7 @@ import {
   gitIdentityConfigPairs,
   applyTurnGitConfigEnv,
   prepareTurnGitConfigEnv,
+  type BytedCliIdentity,
 } from '../src/core/cli-identity.js';
 
 let dir: string;
@@ -843,16 +844,179 @@ describe('renderIdentityWrapper', () => {
     expect(bytedcliSiteToken(['bmq'], { BYTEDCLI_CLOUD_SITE: 'US-TTPBD' })).toBe('bd-tok');
   });
 
-  it('keeps the default ByteCloud JWT for a site whose region has no token', () => {
+  /** Run the bytedcli wrapper over `identity`; the tool prints the JWT it got. */
+  function bytedcliRun(
+    identity: Omit<BytedCliIdentity, 'tool'>,
+    args: string[],
+    env: Record<string, string> = {},
+  ): { status: number; stdout: string; stderr: string } {
     const tool = join(dir, 'real-bytedcli.sh');
     writeFileSync(tool, '#!/bin/sh\nprintf "%s" "$BYTEDCLI_USER_CLOUD_JWT"\n');
     chmodSync(tool, 0o755);
     const wrapperPath = join(dir, 'bytedcli');
     writeFileSync(wrapperPath, renderIdentityWrapper('bytedcli', tool));
-    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'cn-tok' }, 'single');
-    expect(runWrapper(wrapperPath, {
-      SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, BOTMUX_IDENTITY_CLOUD_JWT_I18N: 'forged',
-    }, ['--site', 'i18n-tt'])).toBe('cn-tok');
+    writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', ...identity }, 'single');
+    const r = spawnSync('/bin/sh', [wrapperPath, ...args], {
+      encoding: 'utf8',
+      env: { PATH: '/usr/bin:/bin', SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, ...env },
+    });
+    return { status: r.status ?? -1, stdout: r.stdout, stderr: r.stderr };
+  }
+
+  // A cn token sent to an overseas partition is refused there (HTTP 401, read
+  // by people as "not logged in"); the wrapper refuses first and names the
+  // partition, instead of sending the default token where it cannot work.
+  it.each([
+    [['--site', 'i18n-tt', 'aa', 'query'], {}, 'i18n-tt', 'i18n'],
+    [['--site=ROW', 'x'], {}, 'ROW', 'i18n'],
+    [['x'], { BYTEDCLI_CLOUD_SITE: 'i18n' }, 'i18n', 'i18nbd'],
+    [['--site', 'us-ttp', 'tce', 'list'], {}, 'us-ttp', 'tx'],
+  ] as const)('refuses a call whose partition has no token: %j %j', (args, env, site, region) => {
+    // Inherited copies of the regional variables are not this turn's tokens.
+    const r = bytedcliRun({ cloudJwt: 'cn-tok' }, [...args], {
+      ...env, BOTMUX_IDENTITY_CLOUD_JWT_I18N: 'forged', BOTMUX_IDENTITY_CLOUD_JWT_I18NBD: 'forged', BOTMUX_IDENTITY_CLOUD_JWT_TX: 'forged',
+    });
+    expect(r.status).toBe(IDENTITY_DENIED_EXIT_CODE);
+    expect(r.stdout).toBe('');
+    expect(r.stderr).toContain(`站点 ${site} 属于 ${region} 分区`);
+    expect(r.stderr).toContain('[reason=regional_jwt_missing]');
+  });
+
+  it('refuses only the partition without a token; the others and the default site still run', () => {
+    const identity = { cloudJwt: 'cn-tok', regionalCloudJwts: { i18n: 'i18n-tok' } };
+    expect(bytedcliRun(identity, ['--site', 'i18n-tt', 'aa'])).toMatchObject({ status: 0, stdout: 'i18n-tok' });
+    expect(bytedcliRun(identity, ['aa'])).toMatchObject({ status: 0, stdout: 'cn-tok' });
+    expect(bytedcliRun(identity, ['--site', 'cn', 'aa'])).toMatchObject({ status: 0, stdout: 'cn-tok' });
+    const refused = bytedcliRun(identity, ['--site', 'i18n-bd', 'bmq']);
+    expect(refused.status).toBe(IDENTITY_DENIED_EXIT_CODE);
+    expect(refused.stdout).toBe('');
+    expect(refused.stderr).toContain('属于 i18nbd 分区');
+  });
+
+  it('says why the partition has no token, by who was asked for it', () => {
+    const hint = (identity: Parameters<typeof bytedcliRun>[0], env: Record<string, string> = {}) =>
+      bytedcliRun(identity, ['--site', 'i18n-tt', 'aa'], env).stderr;
+    const local = hint({ cloudJwt: 'cn-tok', regionalCloudJwtSource: 'local' });
+    const platform = hint({ cloudJwt: 'cn-tok', regionalCloudJwtSource: 'platform' });
+    const legacy = hint({ cloudJwt: 'cn-tok', regionalCloudJwtSource: 'platform-legacy' });
+    const unknown = hint({ cloudJwt: 'cn-tok' });
+    expect(new Set([local, platform, legacy, unknown]).size).toBe(4);
+    expect(local).toContain('本机');
+    expect(platform).toContain('平台为发起人签票');
+    expect(legacy).toContain('升级平台');
+    // An inherited source marker cannot reword the refusal of an identity that has none.
+    expect(hint({ cloudJwt: 'cn-tok' }, { BOTMUX_IDENTITY_REGIONAL_SOURCE: 'platform-legacy' })).toBe(unknown);
+  });
+
+  // bytedcli 0.191 reads these as i18n-tt too: `--cloud-site` is rewritten to
+  // `--site`, an empty `--site` counts as not given (the variable decides),
+  // and JS trim() also drops Unicode spaces.
+  it.each([
+    [['--cloud-site', 'i18n-tt', 'aa'], {}],
+    [['--cloud-site=row', 'aa'], {}],
+    [['--site', 'cn', '--cloud-site', 'I18N-TT', 'aa'], {}],
+    [['--site=', 'aa'], { BYTEDCLI_CLOUD_SITE: 'i18n-tt' }],
+    [['--site', '', 'aa'], { BYTEDCLI_CLOUD_SITE: 'row' }],
+    [['--site', '\u00a0i18n-tt\u3000', 'aa'], {}],
+    [['aa'], { BYTEDCLI_CLOUD_SITE: '\ufeffi18n-tt\u00a0' }],
+  ] as const)('reads the site the way bytedcli does: %j %j', (args, env) => {
+    const both = { cloudJwt: 'cn-tok', regionalCloudJwts: { i18n: 'i18n-tok' } };
+    expect(bytedcliRun(both, [...args], env)).toMatchObject({ status: 0, stdout: 'i18n-tok' });
+    const refused = bytedcliRun({ cloudJwt: 'cn-tok' }, [...args], env);
+    expect(refused.status).toBe(IDENTITY_DENIED_EXIT_CODE);
+    expect(refused.stderr).toContain('属于 i18n 分区');
+  });
+
+  it('lets a non-empty --site override the variable, as bytedcli does', () => {
+    const identity = { cloudJwt: 'cn-tok', regionalCloudJwts: { i18n: 'i18n-tok' } };
+    expect(bytedcliRun(identity, ['--site', 'cn', 'aa'], { BYTEDCLI_CLOUD_SITE: 'i18n-tt' }))
+      .toMatchObject({ status: 0, stdout: 'cn-tok' });
+  });
+
+  // Codebase authenticates with the Codebase JWT, Meego with the person's own
+  // login, help with nothing: none of them sends the partition's ByteCloud JWT.
+  it.each([
+    [['codebase', 'mr', 'list']],
+    [['-j', '--profile', 'p', 'meego', 'workitem']],
+    [['help', 'aa']],
+    [['--help']],
+    [['-h']],
+    [['aa', 'query', '--help']],
+    [['--version']],
+    [['-V']],
+    // Root help / version flags answer before any command runs.
+    [['-h', 'aa']],
+    [['--version', 'aa']],
+    [['-V', 'aa', 'query']],
+    [[]],
+    [['--json']],
+  ] as const)('runs what never uses the partition token without that token: %j', args => {
+    expect(bytedcliRun({ cloudJwt: 'cn-tok' }, [...args], { BYTEDCLI_CLOUD_SITE: 'i18n-tt' }))
+      .toMatchObject({ status: 0, stdout: 'cn-tok' });
+  });
+
+  it.each([
+    [['--profile', 'codebase', 'aa']],
+    [['--jq', 'help', 'aa']],
+    [['aa', 'codebase']],
+    [['aa', '-h', 'host']],
+    [['--', 'codebase']],
+    [['--', '--help']],
+  ] as const)('still refuses a command that only looks exempt: %j', args => {
+    const r = bytedcliRun({ cloudJwt: 'cn-tok' }, [...args], { BYTEDCLI_CLOUD_SITE: 'i18n-tt' });
+    expect(r.status).toBe(IDENTITY_DENIED_EXIT_CODE);
+    expect(r.stdout).toBe('');
+  });
+
+  // bytedcli enables positional options: a --site after the command is that
+  // command's own option (`bytecloud list-legacy-vregions --site i18n` filters
+  // a cn listing by site), not the site the call authenticates against. Such a
+  // call ran with the default token before regional refusals and still does.
+  it.each([
+    [['bytecloud', 'list-legacy-vregions', '--site', 'i18n'], {}],
+    [['-j', 'bytecloud', 'list-legacy-vdcs', '--site=i18n-tt'], {}],
+    [['--profile', 'p', 'aa', '--cloud-site', 'us-ttp'], {}],
+    [['--site', 'cn', 'aa', '--site', 'row'], { BYTEDCLI_CLOUD_SITE: 'i18n-tt' }],
+  ] as const)('does not refuse for a --site that belongs to the command: %j %j', (args, env) => {
+    expect(bytedcliRun({ cloudJwt: 'cn-tok' }, [...args], env)).toMatchObject({ status: 0, stdout: 'cn-tok' });
+  });
+
+  // The global site — before the command, else the variable — is what bytedcli
+  // authenticates against, whatever --site the command adds, so it decides the
+  // refusal and the partition it names.
+  it.each([
+    [['--site', 'i18n-tt', 'bytecloud', 'list-legacy-vregions', '--site', 'i18n'], {}, 'i18n-tt', 'i18n'],
+    [['aa', '--site', 'cn'], { BYTEDCLI_CLOUD_SITE: 'us-ttp' }, 'us-ttp', 'tx'],
+    // A root option's value is not the command: the --site after it is still global.
+    [['--jq', 'aa', '--site', 'i18n-tt', 'bb'], {}, 'i18n-tt', 'i18n'],
+  ] as const)('refuses by the global site, whatever the command adds: %j %j', (args, env, site, region) => {
+    const r = bytedcliRun({ cloudJwt: 'cn-tok', regionalCloudJwts: { i18nbd: 'bd-tok' } }, [...args], env);
+    expect(r.status).toBe(IDENTITY_DENIED_EXIT_CODE);
+    expect(r.stdout).toBe('');
+    expect(r.stderr).toContain(`站点 ${site} 属于 ${region} 分区`);
+  });
+
+  // Which token is sent is unchanged: a command that authenticates against its
+  // own --site (nac) still gets that partition's token.
+  it('still sends the partition token named by a --site after the command', () => {
+    expect(bytedcliSiteToken(['nac', 'aa', '--site', 'i18n-bd'])).toBe('bd-tok');
+  });
+
+  it('keeps the regional source marker away from the tool', () => {
+    const tool = join(dir, 'env-dump.sh');
+    writeFileSync(tool, '#!/bin/sh\nenv\n');
+    chmodSync(tool, 0o755);
+    const wrapperPath = join(dir, 'bytedcli');
+    writeFileSync(wrapperPath, renderIdentityWrapper('bytedcli', tool));
+    writeSessionIdentity(dir, SESSION, {
+      tool: 'bytedcli', cloudJwt: 'cn-tok', regionalCloudJwts: { i18n: 'i18n-tok' }, regionalCloudJwtSource: 'platform',
+    }, 'single');
+    const out = runWrapper(wrapperPath, {
+      SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, BOTMUX_IDENTITY_REGIONAL_SOURCE: 'inherited',
+    }, ['--site', 'i18n-tt', 'aa']);
+    expect(out).toContain('BYTEDCLI_USER_CLOUD_JWT=i18n-tok');
+    expect(out).not.toContain('BOTMUX_IDENTITY_REGIONAL_SOURCE');
+    expect(out).not.toContain('BOTMUX_IDENTITY_CLOUD_JWT_');
   });
 
   it('uses refreshed credentials on the next invocation in the same turn', () => {
