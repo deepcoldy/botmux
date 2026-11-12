@@ -8145,6 +8145,8 @@ ${SEND_HELP_BODY}
   ask buttons --questions-file <file>   多题/文本/数值表单，支持预选；一次提交，返回 answers/inputs JSON
   ask buttons --answerer <ou_id>       仅指定答题人可提交（不授予业务批准权）
   ask buttons --timeout 0              显式无限等待（需 CLI/daemon 同时支持）；省略仍默认 300 秒
+  ask buttons --request-id <id>        显式稳定调用身份，重连同参数不创建第二张卡
+  ask control describe|inspect|retire|release --control-file <file>   宿主受管控制，精确绑定原请求/轮/代次
   ask buttons --mention <ou_id>        在卡片里 @ 该成员。仅本应用通讯录查得到的真人有效，
                                        否则只丢掉 @，卡片照发
   ask buttons [--multi] --options "a,b" "<问题>"
@@ -17990,6 +17992,33 @@ const CLI_RESOLVED_UNKNOWN_ASK_RETRY_MS = 3_000;
 const CLI_RESOLVED_UNKNOWN_ASK_POLL_MS = 200;
 
 async function cmdAsk(sub: string, rest: string[]): Promise<void> {
+  if (sub === 'control') {
+    const action = rest[0];
+    const controlFile = argValue(rest, '--control-file');
+    if (!['describe', 'inspect', 'retire', 'release'].includes(action ?? '') || !controlFile) {
+      console.error('botmux ask control: use describe|inspect|retire|release --control-file <JSON>');
+      process.exit(2);
+    }
+    const { readFileSync } = await import('node:fs');
+    const body = JSON.parse(readFileSync(controlFile, 'utf8')) as Record<string, unknown>;
+    if (typeof body.larkAppId !== 'string') {
+      console.error('botmux ask control: larkAppId required');
+      process.exit(2);
+    }
+    const daemon = findDaemon(body.larkAppId);
+    if (!daemon) {
+      console.error('botmux ask control: daemon unavailable');
+      process.exit(3);
+    }
+    const response = await fetchDaemonIpc(daemon.ipcPort, `/api/asks/managed/${action}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      signal: AbortSignal.timeout(15_000),
+    }, loadDaemonIpcSecret());
+    const result = await response.json();
+    await writeAndFlush(process.stdout, JSON.stringify(result) + '\n');
+    if (!response.ok) process.exit(3);
+    return;
+  }
   // Workflow-subagent safety gate (same posture as cmdSend): a CLI running
   // inside a workflow subagent (Slice F) must not surface chat UI. Workflow
   // approvals belong in humanGate / decision nodes so the choice is part of
@@ -18016,7 +18045,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     process.exit(2);
   }
 
-  const { findMissingAskEnv, parseAskOptions, parseAskQuestionsFile, parseAskTimeoutSeconds, parseAskMention, AskArgsError } =
+  const { findMissingAskEnv, parseAskOptions, parseAskQuestionsFile, parseAskTimeoutSeconds, parseAskMention, parseAskRequestId, AskArgsError } =
     await import('./core/ask-args.js');
   type AskJsonOutput = import('./core/ask-types.js').AskJsonOutput;
   const { toLegacySelected, isCustomReply } = await import('./core/ask-types.js');
@@ -18044,6 +18073,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   let questions;
   let timeoutMs;
   let mentionedOpenId;
+  let requestId;
   try {
     if (rest.some(a => a === '--answerer' || a.startsWith('--answerer='))
       && (!answererOpenId || !/^ou_[A-Za-z0-9_-]{1,128}$/.test(answererOpenId))) {
@@ -18061,6 +18091,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     } else options = parseAskOptions(optionsRaw);
     timeoutMs = parseAskTimeoutSeconds(timeoutRaw);
     mentionedOpenId = parseAskMention(mentionRaw);
+    requestId = parseAskRequestId(argValue(rest, '--request-id'));
   } catch (err) {
     if (err instanceof AskArgsError) {
       console.error(`botmux ask: ${err.message}`);
@@ -18101,7 +18132,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     // Stable invocation identity: reconnect without posting a second card.
     originKind: 'explicit',
     ...(answererOpenId ? { answererOpenId } : {}),
-    requestId: randomUUID(),
+    requestId: requestId ?? randomUUID(),
     ...(liveAskOrigin?.turnId ? { originTurnId: liveAskOrigin.turnId } : {}),
     ...(liveAskOrigin?.dispatchAttempt !== undefined
       ? { originDispatchAttempt: liveAskOrigin.dispatchAttempt }

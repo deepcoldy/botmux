@@ -15,6 +15,22 @@ export interface ExplicitAskReceipt {
   delivered?: boolean;
   /** Daemon-observed origin, never supplied as authority by the caller. */
   origin?: { turnId: string; dispatchAttempt?: number; workerGeneration?: number };
+  retirement?: { operationId: string; reason: string; requestedAt: number };
+  card?: { askId: string; cardMessageId?: string; cardDeliveredAt?: number };
+}
+
+export interface ExplicitAskControl {
+  larkAppId: string;
+  sessionId: string;
+  requestId: string;
+  chatId: string;
+  rootMessageId: string | null;
+  origin: NonNullable<ExplicitAskReceipt['origin']>;
+}
+
+export interface ExplicitAskRetirement extends ExplicitAskControl {
+  operationId: string;
+  reason: string;
 }
 
 /** Consumed receipts only answer late reconnects of the same invocation. */
@@ -68,12 +84,19 @@ export function createExplicitAskContinuation(deps: {
   hasHandoff?: (input: CreateAskInput) => boolean;
   shouldInvalidate?: (receipt: ExplicitAskReceipt) => boolean;
   invalidate?: (input: CreateAskInput, reason: string) => void;
+  retire?: (input: CreateAskInput, reason: string) => AskResult | undefined;
+  snapshot?: (input: CreateAskInput) => {
+    askId: string;
+    cardMessageId?: string;
+    cardDeliveredAt?: number;
+    result?: AskResult;
+  } | undefined;
   now?: () => number;
 }) {
   const now = deps.now ?? Date.now;
   const running = new Map<string, Promise<AskResult>>();
   let sweeping = false;
-  const keyFor = (input: CreateAskInput) => createHash('sha256')
+  const keyFor = (input: Pick<CreateAskInput, 'larkAppId' | 'sessionId' | 'requestId'>) => createHash('sha256')
     .update(askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!)).digest('hex');
   const pathFor = (key: string) => join(deps.dir, `${key}.json`);
   const read = (key: string): ExplicitAskReceipt | undefined => {
@@ -87,6 +110,48 @@ export function createExplicitAskContinuation(deps: {
     mkdirSync(deps.dir, { recursive: true, mode: 0o700 });
     atomicWriteFileSync(pathFor(key), JSON.stringify(receipt), { mode: 0o600, durable: true });
   };
+  function describe(control: Omit<ExplicitAskControl, 'origin'>): ExplicitAskReceipt {
+    const key = keyFor(control);
+    const receipt = read(key);
+    if (!receipt || receipt.input.larkAppId !== deps.appId) throw new Error('explicit Ask not found');
+    if (receipt.input.timeoutMs !== 0 || receipt.input.originKind !== 'host_explicit') {
+      throw new Error('explicit Ask control requires a no-deadline receipt');
+    }
+    if (receipt.input.chatId !== control.chatId || receipt.input.rootMessageId !== control.rootMessageId) {
+      throw new Error('explicit Ask control binding conflict');
+    }
+    const snapshot = deps.snapshot?.(receipt.input);
+    const card = snapshot ? { askId: snapshot.askId, cardMessageId: snapshot.cardMessageId,
+      cardDeliveredAt: snapshot.cardDeliveredAt } : receipt.card;
+    return { ...receipt, ...(card ? { card } : {}),
+      ...(snapshot?.result && !receipt.result ? { result: snapshot.result } : {}) };
+  }
+  function inspect(control: ExplicitAskControl): ExplicitAskReceipt {
+    const receipt = describe(control);
+    if (!receipt.origin || receipt.origin.turnId !== control.origin.turnId
+      || receipt.origin.workerGeneration !== control.origin.workerGeneration
+      || receipt.origin.dispatchAttempt !== control.origin.dispatchAttempt) {
+      throw new Error('explicit Ask control binding conflict');
+    }
+    return receipt;
+  }
+  function retire(control: ExplicitAskRetirement): ExplicitAskReceipt {
+    let receipt = inspect(control);
+    if (receipt.retirement && (receipt.retirement.operationId !== control.operationId
+      || receipt.retirement.reason !== control.reason)) throw new Error('explicit Ask retirement conflict');
+    if (receipt.result) return receipt;
+    if (!deps.retire) throw new Error('explicit Ask retirement unsupported');
+    const key = keyFor(receipt.input);
+    receipt = { ...receipt, retirement: receipt.retirement ?? {
+      operationId: control.operationId, reason: control.reason, requestedAt: now(),
+    } };
+    write(key, receipt);
+    const result = deps.retire(receipt.input, control.reason);
+    if (!result) throw new Error('explicit Ask handoff unavailable');
+    const latest = read(key)!;
+    if (!latest.result) write(key, { ...latest, result, settledAt: now() });
+    return inspect(control);
+  }
   /** presentation 只影响首次发卡位置和点名；重连保持原始回执与冻结卡片授权。 */
   function wait(input: CreateAskInput & { requestId: string }, origin?: ExplicitAskReceipt['origin'],
     presentation?: Pick<CreateAskInput, 'cardRootMessageId' | 'mentionedOpenId'>): Promise<AskResult> {
@@ -107,7 +172,7 @@ export function createExplicitAskContinuation(deps: {
     const frozenInput = original?.input ?? input;
     const promise = deps.register(original ? frozenInput : { ...frozenInput, ...presentation }).then(result => {
       const receipt = read(key)!;
-      write(key, { ...receipt, result, settledAt: now() });
+      write(key, { ...receipt, result: receipt.result ?? result, settledAt: receipt.settledAt ?? now() });
       deps.releaseHandoff?.(frozenInput);
       return result;
     }).finally(() => running.delete(key));
@@ -137,11 +202,16 @@ export function createExplicitAskContinuation(deps: {
           const receipt = read(key)!;
           if (receipt.version !== 1 || receipt.input.larkAppId !== deps.appId
             || keyFor(receipt.input) !== key) continue;
-          if (receipt.acknowledged || receipt.delivered) {
+          if (receipt.acknowledged || receipt.delivered || receipt.retirement && receipt.result) {
             if (now() - receipt.settledAt! >= CONSUMED_RECEIPT_RETENTION_MS) rmSync(pathFor(key), { force: true });
             continue;
           }
           if (!receipt.result) {
+            if (receipt.retirement && deps.retire) {
+              const result = deps.retire(receipt.input, receipt.retirement.reason);
+              if (result) write(key, { ...receipt, result, settledAt: now() });
+              continue;
+            }
             if (receipt.input.timeoutMs === 0 && deps.shouldInvalidate?.(receipt) && deps.invalidate) {
               deps.invalidate(receipt.input, 'explicit Ask session closed or binding changed');
               void wait(receipt.input).catch(deps.onError);
@@ -169,7 +239,7 @@ export function createExplicitAskContinuation(deps: {
     } catch (error) { deps.onError(error); }
     finally { sweeping = false; }
   }
-  return { wait, acknowledge, sweep };
+  return { wait, acknowledge, sweep, describe, inspect, retire };
 }
 
 /** Whether the live session still owns an explicit Ask's routing binding. The

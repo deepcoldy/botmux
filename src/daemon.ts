@@ -43,8 +43,10 @@ import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
 import { withConfiguredBotOwner } from './core/bot-owner-attribution.js';
 import { readCanonicalBotActorOwnerBindings } from './core/bot-actor-owner-binding.js';
-import { releaseExplicitAskHandoff, hasExplicitAskHandoff, invalidateExplicitAsk, setExplicitAskSessionChecker } from './core/ask-broker.js';
+import { releaseExplicitAskHandoff, hasExplicitAskHandoff, invalidateExplicitAsk, setExplicitAskSessionChecker, retireExplicitAsk, explicitAskSnapshot } from './core/ask-broker.js';
 import { createExplicitAskContinuation, explicitAskRecoveryRequest, explicitAskOriginIsLive, explicitAskSessionBound } from './core/explicit-ask-continuation.js';
+import { createManagedAskControl, parseManagedAskControl } from './core/managed-ask-control.js';
+import { canSafelyReclaimWorkerForInstallChange, suspendWorkerAsync } from './core/worker-pool.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, readdirSync, existsSync, mkdirSync, unlinkSync, realpathSync } from 'node:fs';
@@ -10733,6 +10735,8 @@ const explicitAskContinuation = createExplicitAskContinuation({
   releaseHandoff: releaseExplicitAskHandoff,
   hasHandoff: hasExplicitAskHandoff,
   invalidate: invalidateExplicitAsk,
+  retire: retireExplicitAsk,
+  snapshot: explicitAskSnapshot,
   shouldInvalidate: receipt => sessionsRestored
     && !explicitAskSessionBound(receipt.input, findActiveBySessionId(receipt.input.sessionId)),
   canResume: receipt => {
@@ -10750,6 +10754,53 @@ const explicitAskContinuation = createExplicitAskContinuation({
   },
   onError: error => logger.warn(`[ask-continuation] ${error instanceof Error ? error.message : String(error)}`),
 });
+
+const managedAskControl = createManagedAskControl({
+  get appId() { return selfDaemonLarkAppId ?? ''; },
+  inspect: explicitAskContinuation.inspect,
+  describe: explicitAskContinuation.describe,
+  retire: explicitAskContinuation.retire,
+  snapshot: receipt => explicitAskSnapshot(receipt.input),
+  session: sessionId => {
+    const ds = findActiveBySessionId(sessionId);
+    if (!ds) return undefined;
+    return {
+      larkAppId: ds.larkAppId, chatId: ds.chatId,
+      rootMessageId: ds.session.scope === 'chat' ? null : ds.session.rootMessageId,
+      workerGeneration: ds.workerGeneration,
+      workerAlive: !!ds.worker && !ds.worker.killed,
+      turnId: ds.managedTurnOrigin?.turnId,
+      safeToSuspend: (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited')
+        && canSafelyReclaimWorkerForInstallChange(ds),
+      resourceOwned: !ds.adoptedFrom && !ds.session.adoptedFrom && !ds.initConfig?.adoptMode
+        && ds.session.locked !== true && !isSessionTransferring(ds),
+      suspensionConfirmed: ds.session.suspendedColdResume === true,
+      terminatedTurnIds: [...ds.terminalIdentityTurnIds ?? []],
+    };
+  },
+  suspend: async (sessionId, stillOwned) => {
+    const ds = findActiveBySessionId(sessionId);
+    return !!ds && await suspendWorkerAsync(ds, 'managed_ask_retired', stillOwned);
+  },
+});
+
+for (const action of ['describe', 'inspect', 'retire', 'release'] as const) {
+  ipcRoute('POST', `/api/asks/managed/${action}`, async (req, res) => {
+    if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { error: 'trusted_host_required' });
+    let request: ReturnType<typeof parseManagedAskControl>;
+    try { request = parseManagedAskControl(await readJsonBody(req, 16384), action); }
+    catch (error) { return jsonRes(res, error instanceof JsonBodyTooLargeError ? 413 : 400, { error: 'invalid_managed_ask_control' }); }
+    try {
+      const result = await withBotTurnMutation(request.larkAppId, async () => {
+        return action === 'describe' ? managedAskControl.describe(request) : action === 'inspect' ? managedAskControl.inspect(request)
+          : action === 'retire' ? await managedAskControl.retire(request) : await managedAskControl.release(request);
+      });
+      return jsonRes(res, 200, result);
+    } catch (error) {
+      return jsonRes(res, 409, { status: 'unknown', error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+}
 
 /** Resolve once at registration; delivery must not consult evictable replyTargets
  * or mutable lastCallerOpenId. Autonomous asks use the existing canTalk policy. */

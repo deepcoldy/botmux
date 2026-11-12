@@ -10326,11 +10326,12 @@ export function __testOnly_setSuspendBackingVerifier(
 
 const primarySuspendInFlight = new WeakMap<DaemonSession, Promise<boolean>>();
 const primarySuspendApplying = new WeakSet<DaemonSession>();
-export async function suspendWorkerAsync(ds: DaemonSession, reason = 'suspended_idle'): Promise<boolean> {
-  const result = suspendWorker(ds, reason);
+export async function suspendWorkerAsync(ds: DaemonSession, reason = 'suspended_idle', stillOwned?: () => boolean): Promise<boolean> {
+  const result = suspendWorker(ds, reason, stillOwned);
   return primarySuspendInFlight.get(ds) ?? result;
 }
-export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
+export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stillOwned?: () => boolean): boolean {
+  if (stillOwned && !stillOwned()) return false;
   if (hasProtectedSessionMutationOwnership(ds)) {
     logger.warn(`[${tag(ds)}] Refused worker suspend (${reason}) while Codex App dispatch ownership is non-empty`);
     return false;
@@ -10359,7 +10360,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boo
       const pending = controller.flushPrimary().then(async () => {
         if (controller.operation()?.operationId !== operationId) return false;
         primarySuspendApplying.add(ds);
-        try { const result = suspendWorker(ds, reason); await controller.flushPrimary(); return result; }
+        try { const result = suspendWorker(ds, reason, stillOwned); await controller.flushPrimary(); return result; }
         finally { primarySuspendApplying.delete(ds); }
       });
       primarySuspendInFlight.set(ds, pending);
