@@ -1,6 +1,6 @@
 import { sameRuntime, type RuntimeRef, type SessionCommandContext } from './session-contract.js';
 
-const receipts = new Set(['runtime_contract_assigned', 'runtime_contract_reserved', 'runtime_binding_aborted_ack', 'runtime_binding_refused', 'execution_contract_assigned', 'final_output_settled', 'final_output_accepted',
+const receipts = new Set(['runtime_contract_assigned', 'runtime_contract_reserved', 'runtime_binding_aborted_ack', 'continuation_failure_ack', 'runtime_binding_refused', 'execution_contract_assigned', 'final_output_settled', 'final_output_accepted',
   'codex_app_dispatch_persisted', 'codex_app_text_persisted', 'deployment_continuation_cancelled',
   'link_ref_register_result', 'link_ref_resolve_result', 'link_ref_restore_mode_result',
   'worker_ipc_probe', 'close_abort']);

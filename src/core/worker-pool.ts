@@ -2784,6 +2784,28 @@ export function resumeTurnNotices(ds: DaemonSession): void {
   turnNoticeOutbox.resume(turnNoticeHost(ds));
 }
 
+function enqueueContinuationFailureNotice(
+  ds: DaemonSession,
+  failure: import('../services/session-contract.js').RuntimeExecutionContinuationFailure,
+): void {
+  if (typeof failure.notice !== 'string' || !failure.notice) return;
+  const execution = failure.continuation.execution;
+  const uuid = createHash('sha256').update(JSON.stringify([
+    'traex-continuation-failure', ds.larkAppId, ds.session.sessionId, execution.executionId,
+  ])).digest('hex').slice(0, 32);
+  if (!ds.session.turnNotices?.some(notice => notice.delivery.uuid === uuid)) {
+    const previous = ds.session.turnNotices;
+    const now = Date.now();
+    ds.session.turnNotices = addTurnNotice(previous, {
+      kind: 'user_notify', turnId: execution.turnId, msgType: 'text', content: failure.notice, createdAt: now,
+      delivery: { state: 'pending', attempts: 0, uuid, nextAttemptAt: now },
+    });
+    try { sessionStore.updateSession(ds.session); }
+    catch (error) { ds.session.turnNotices = previous; throw error; }
+  }
+  resumeTurnNotices(ds);
+}
+
 /** Send a failure card / worker notice. When the send fails transiently (see
  *  turnNoticeSendRetryable) the notice is kept on the session and retried with
  *  the same uuid; any other failure is thrown as before. */
@@ -22243,6 +22265,7 @@ function setupWorkerHandlers(
           // The durable receipt remains non-terminal and can be reconciled;
           // never let a projection/store failure crash the worker IPC loop.
           logger.error(`[${t}] Failed to persist turn_terminal for ${msg.turnId.substring(0, 8)}: ${err.message}`);
+          if (msg.continuationFailure) throw err;
         }
         if (terminalPersisted) publishTurnFinished(ds, msg);
         if (terminalPersisted && msg.turnId.startsWith('mlrp_turn_')
@@ -23227,7 +23250,11 @@ function setupWorkerHandlers(
               && (!state.activeOperationId || state.activeOperationId === msg.operationId) });
         }
         else if (msg.type === 'runtime_binding_aborted') {
-          if (!sessionController.abandonBinding(msg.bindingId, contractWorker, metadata!.eventId)) return;
+          // A refused reservation (e.g. a TraeX continuation the contract could
+          // not plan) rolled back without creating a binding. Nothing remains to
+          // abandon, but the surviving worker re-reports until it is confirmed.
+          const reserved = !!sessionController.store.binding(sessionController.ref, msg.bindingId);
+          if (reserved && !sessionController.abandonBinding(msg.bindingId, contractWorker, metadata!.eventId)) return;
           await sessionController.flushPrimary();
           if (ds.worker !== worker || !sameWorker(sessionController.store.read(sessionController.ref)!.worker, contractWorker)) return;
           worker.send({ type: 'runtime_binding_aborted_ack', bindingId: msg.bindingId });
@@ -23328,13 +23355,24 @@ function setupWorkerHandlers(
       if (msg.sessionOutputOrigin?.scope.execution && msg.sessionOutputOrigin.scope.execution.executionId !== admission.context.scope.execution?.executionId) return;
       if (!recoveredOrigin) msg = { ...msg, sessionOutputOrigin: admission.context };
     }
-    if (admission.kind === 'historical') {
-      if (msg.type === 'turn_terminal') await cb.onTurnTerminal?.(ds, msg, { workerGeneration: metadata!.producer.generation });
-      if (msg.type === 'final_output') await sessionController.run(admission, () => handleLegacyWorkerMessage(msg));
-    } else {
-      if (msg.type === 'final_output') msg = { ...msg, sessionOutputOrigin: msg.sessionOutputOrigin ?? admission.context };
-      await sessionController.run(admission, () => handleLegacyWorkerMessage(msg));
-    }
+    const deliveryAdmission = admission;
+    const deliver = async (): Promise<void> => {
+      if (msg.type === 'turn_terminal' && msg.continuationFailure) enqueueContinuationFailureNotice(ds, msg.continuationFailure);
+      if (deliveryAdmission.kind === 'historical') {
+        if (msg.type === 'turn_terminal') await cb.onTurnTerminal?.(ds, msg, { workerGeneration: metadata!.producer.generation });
+        if (msg.type === 'final_output') await sessionController.run(deliveryAdmission, () => handleLegacyWorkerMessage(msg));
+      } else {
+        if (msg.type === 'final_output') msg = { ...msg, sessionOutputOrigin: msg.sessionOutputOrigin ?? deliveryAdmission.context };
+        await sessionController.run(deliveryAdmission, () => handleLegacyWorkerMessage(msg));
+      }
+    };
+    if (msg.type === 'turn_terminal' && msg.continuationFailure) {
+      const failure = msg.continuationFailure;
+      await sessionController.deliverContinuationFailure(failure.continuation.execution, msg.errorCode!, deliver);
+      if (ds.worker === worker && sameWorker(sessionController.store.read(sessionController.ref)!.worker, contractWorker)) {
+        worker.send({ type: 'continuation_failure_ack', bindingId: failure.bindingId, execution: failure.continuation.execution });
+      }
+    } else await deliver();
     if (metadata) sessionController.store.acknowledgeDeferred(sessionController.ref, metadata.eventId);
   };
   worker.on('message', msg => {
