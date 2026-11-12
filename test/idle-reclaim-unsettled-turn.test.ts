@@ -378,6 +378,90 @@ describe('automatic reclaim of a session whose last answer may still be on its w
   });
 });
 
+/** What the manual suspend route does when the session is mid-turn. */
+function queueManualSuspend(ds: DaemonSession): void {
+  ds.pendingSuspendReason = 'manual_suspend';
+  ds.pendingSuspendGeneration = ds.workerGeneration;
+}
+
+describe('a suspend queued while the session works', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    __testOnly_resetTurnTerminalReportingClis();
+    __testOnly_setSuspendBackingVerifier(() => true);
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => '/repo', getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    } as any);
+  });
+
+  afterEach(() => {
+    __testOnly_setSuspendBackingVerifier();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it('waits for the answer being delivered when the turn ends, then is carried out', async () => {
+    const { worker, answering } = overCapWithOneSessionAnswering();
+    queueManualSuspend(answering);
+    // The worker handed the answer over and ended the turn; the daemon is
+    // writing it to Lark when the prompt comes back.
+    const finishDelivery = beginFinalOutputDelivery(answering, TURN);
+    turnTerminal(worker, answering);
+    screenIdle(worker);
+    await flush();
+
+    expect(answering.worker).toBe(worker);
+    expect(worker.send).not.toHaveBeenCalledWith({ type: 'suspend' });
+    expect(answering.pendingSuspendReason).toBe('manual_suspend');
+
+    finishDelivery();
+    await flush();
+    expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
+    expect(answering.worker).toBe(null);
+    expect(answering.pendingSuspendReason).toBeUndefined();
+  });
+
+  it('waits for the terminal of a turn that looks idle, then is carried out', async () => {
+    claudeReportsTerminals();
+    const { worker, answering } = overCapWithOneSessionAnswering();
+    queueManualSuspend(answering);
+    screenIdle(worker);
+    await flush();
+    expect(answering.worker).toBe(worker);
+
+    turnTerminal(worker, answering);
+    await flush();
+    expect(answering.worker).toBe(null);
+  });
+
+  it('is carried out once the hold runs out, even if the delivery never settles', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    const { worker, answering } = overCapWithOneSessionAnswering();
+    queueManualSuspend(answering);
+    beginFinalOutputDelivery(answering, TURN);
+    turnTerminal(worker, answering);
+    screenIdle(worker);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(answering.worker).toBe(worker);
+
+    await vi.advanceTimersByTimeAsync(FINAL_DELIVERY_RECLAIM_GRACE_MS - 1_000);
+    expect(answering.worker).toBe(worker);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(answering.worker).toBe(null);
+  });
+
+  it('is still carried out right away when the answer is already out', async () => {
+    const { worker, answering } = overCapWithOneSessionAnswering();
+    queueManualSuspend(answering);
+    turnTerminal(worker, answering);
+    screenIdle(worker);
+    await flush();
+
+    expect(answering.worker).toBe(null);
+  });
+});
+
 describe('coalesced sweep triggers', () => {
   it('runs one more sweep for triggers that arrive while one is running', async () => {
     const runs: string[] = [];

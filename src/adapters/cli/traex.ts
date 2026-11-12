@@ -24,7 +24,7 @@ import {
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay } from '../../utils/timing.js';
 import { traexModelPickerPage, traexRestoredComposerReady, traexViewportFooterBusy } from './traex-footer.js';
-import { probeTraexHookTrustSupport, TRAEX_HOOK_TRUST_FLAG, TRAEX_HOOK_TRUST_MIN_VERSION } from './traex-version.js';
+import { probeTraexHookTrustSupport, TRAEX_HOOK_TRUST_FLAG, TRAEX_HOOK_TRUST_MIN_VERSION, TRAEX_PROGRAM_STATUS_MIN_VERSION } from './traex-version.js';
 
 /**
  * TRAE CLI (a.k.a. traex / traecli) adapter.
@@ -693,6 +693,29 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // A missing history receipt is ambiguous: block successors in this backend
     // generation and never replay the unconfirmed message automatically.
     quarantineUnconfirmedSubmits: true,
+    // OSC 7501 (`ESC]7501;state=…:app=traecli ESC\`), sent unprompted on any
+    // TTY incl. tmux (no `7501;?` probe). 0.214.1 is the first release that
+    // reports; 0.213.1 sends none. Recorded on 0.214.1, tmux and PTY:
+    //   startup  idle once the composer takes input, also while only the
+    //            shortcut-hint footer is drawn (#3307) or the model fetch
+    //            stalls; working while MCP servers boot, then idle (input
+    //            written meanwhile runs; its turn reports only done). Trust,
+    //            hooks-review and sign-in pages report nothing, but a resumed
+    //            session's lock page is drawn in the same burst as an idle.
+    //   turn     [idle on the first keystroke] → working → done; an approval
+    //            reports blocked kind=permission, then working once answered.
+    //   /status, /clear, /rename: no report at all.
+    // So startup timing stays on screen quiescence; the startup idle report
+    // only stands in for the composer predicate on footers it does not know
+    // (the #3307 / #3338 hard waits). A write hands idle to the screen until
+    // traecli reports busy; from there working → blocked → done decides, and
+    // nothing is typed ahead into an approval while it reports blocked.
+    // Older/unknown versions, adopted panes and RPC viewers keep the screen.
+    supportsProgramStatus: true,
+    programStatusMinVersion: TRAEX_PROGRAM_STATUS_MIN_VERSION,
+    programStatusFollowsInputCycle: true,
+    programStatusYieldsToTranscriptTerminal: true,
+    programStatusBlockedHoldsInput: true,
     // TRAE's trust/advisory startup screens can accept stdin before the real
     // composer exists, so the worker's 15s soft fallback must wait for the
     // prompt marker. A hard cap in the worker still prevents permanent hangs.

@@ -90,6 +90,8 @@ function overCapDaemon(opts: {
   dataDir: string;
   workingDir: string;
   start: (init: Record<string, unknown>) => StartedWorker;
+  /** Run the cap sweep on idle edges (default); off to watch another path. */
+  capSweep?: boolean;
 }) {
   previousDataDir = config.session.dataDir;
   config.session.dataDir = opts.dataDir;
@@ -137,7 +139,9 @@ function overCapDaemon(opts: {
   workerPool.initWorkerPool({
     sessionReply, getSessionWorkingDir: () => opts.workingDir, getActiveCount: () => activeSessions.size,
     closeSession: vi.fn(),
-    enforceLiveSessionCap: () => { void sweepIdleWorkersAfterTurnDrain(APP, activeSessions, { maxLiveWorkers: 1 }); },
+    enforceLiveSessionCap: () => {
+      if (opts.capSweep !== false) void sweepIdleWorkersAfterTurnDrain(APP, activeSessions, { maxLiveWorkers: 1 });
+    },
   } as any);
 
   const controller = controllerForSession(ds, true)!;
@@ -233,5 +237,23 @@ describe.skipIf(!runnable)('the live-worker cap and an answer still being delive
       },
     });
     await expectAnsweredThenSuspended(ds, worker, answers);
+  }, 150_000);
+
+  it('carries out a suspend queued while the turn ran only after its answer reached Lark', async () => {
+    // Production (2026-11-11, session fc17c9ee): `botmux suspend` queued while
+    // the session worked; at the turn's end the queued suspend ran on the idle
+    // edge, 100 ms after the worker handed the answer over, and the answer
+    // never reached the group.
+    const h = setupFakeClaude({ turnMs: 800 });
+    const { ds, worker, answers } = overCapDaemon({
+      sessionId: h.sessionId, cliId: 'claude-code', dataDir: join(h.root, 'data'), workingDir: h.workingDir,
+      start: init => h.startWorker(init as any), capSweep: false,
+    });
+    await waitFor(worker, () => ds.lastScreenStatus === 'working', 'the turn running', 90_000);
+    // What the suspend route does for a session mid-turn.
+    ds.pendingSuspendReason = 'manual_suspend';
+    ds.pendingSuspendGeneration = ds.workerGeneration;
+    await expectAnsweredThenSuspended(ds, worker, answers);
+    expect(ds.pendingSuspendReason).toBeUndefined();
   }, 150_000);
 });
