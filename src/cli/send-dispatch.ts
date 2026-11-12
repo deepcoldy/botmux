@@ -169,6 +169,47 @@ export function shouldSendAsPureVideo(input: {
     && input.mentionCount === 0;
 }
 
+type PrimaryShapeInput = Parameters<typeof shouldSendAsPureVideo>[0];
+
+/**
+ * A "pure file" send: exactly one `--files` attachment and nothing else, so the
+ * file message itself is the primary message. Same `<at>` constraint as
+ * {@link shouldSendAsPureVideo}: a requested mention needs the card path.
+ */
+export function shouldSendAsPureFile(input: PrimaryShapeInput): boolean {
+  return !input.hasBodyText
+    && input.imageCount === 0
+    && input.fileCount === 1
+    && input.videoCount === 0
+    && input.mentionCount === 0;
+}
+
+/**
+ * True when the primary message would be the standard reply card with nothing
+ * in its body: no text and no image. Attachments would then trail a card that
+ * shows at most a footer (and none at all for a `--no-mention` progress send,
+ * which Feishu rejects with 230099 so the attachments never go out either).
+ * Only the media-primary shapes (pure file / pure video) may omit the body.
+ *
+ * Callers exclude primaries that are not this card (custom/diff card, voice,
+ * slash) and bodies synthesized from flags (`--as`).
+ */
+export function primaryCardBodyMissing(input: PrimaryShapeInput): boolean {
+  return !input.hasBodyText
+    && input.imageCount === 0
+    && !shouldSendAsPureFile(input)
+    && !shouldSendAsPureVideo(input);
+}
+
+/** Refusal for {@link primaryCardBodyMissing}; `reason` says where the body
+ *  was looked for (stdin shape, empty --content-file, …). */
+export function sendBodyRequiredMessage(reason: string): string {
+  return `botmux send: 这次发送需要正文，但${reason}。`
+    + '多个附件、视频和文件一起发、或带 @（--mention / --mention-back）时，附件前要先发一张正文卡片，不能发空卡片；本次什么都没发。\n'
+    + '请把正文写成位置参数（botmux send --files a --files b --no-mention "说明"），或用 --content-file <文件>；'
+    + "正文由较慢的管道产生时加 '-'，让 botmux 等 stdin 写完。只发一个文件且不 @ 人时可以不写正文。";
+}
+
 export type VideoAttachmentInput = {
   videoPath: string;
   coverPath: string;

@@ -322,6 +322,35 @@ type ToolsUpdate = { turnId: string; dispatchAttempt?: number; entries: import('
 type PendingTools = { msg: ToolsUpdate; send: ReplyCardSender; owns: () => boolean; timer?: ReturnType<typeof setTimeout> };
 const pendingTools = new WeakMap<DaemonSession, Map<string, PendingTools>>();
 const toolFlushes = new WeakMap<DaemonSession, Map<string, Promise<void>>>();
+// Sessions owning queued/in-flight tool flushes. WeakMaps are not enumerable, so
+// without this registry test teardown cannot reach timers queued by an earlier
+// test case whose ds local variable is already out of scope.
+const trackedToolSessions = new Set<DaemonSession>();
+
+function untrackToolSessionIfIdle(ds: DaemonSession): void {
+  if (!pendingTools.get(ds)?.size && !toolFlushes.get(ds)?.size) trackedToolSessions.delete(ds);
+}
+
+/** Test-only: cancel every queued tools flush and await in-flight ones.
+ *  After this resolves, no reply-card timer or flush can write into a data dir
+ *  that the test is about to remove or that belongs to the next test. */
+export async function __testOnlyDrainTurnReplyTools(): Promise<void> {
+  // Loop to a fixed point: awaiting an in-flight flush could in principle run
+  // handlers that queue again, so one pass must not claim the contract early.
+  while (trackedToolSessions.size) {
+    for (const ds of [...trackedToolSessions]) {
+      const pending = pendingTools.get(ds);
+      if (pending) {
+        for (const next of pending.values()) {
+          if (next.timer) clearTimeout(next.timer);
+        }
+        pending.clear();
+      }
+      await Promise.allSettled([...(toolFlushes.get(ds)?.values() ?? [])]);
+      trackedToolSessions.delete(ds);
+    }
+  }
+}
 
 export function queueTurnReplyTools(ds: DaemonSession, msg: ToolsUpdate, send: ReplyCardSender, owns: () => boolean): void {
   let pending = pendingTools.get(ds);
@@ -336,6 +365,7 @@ export function queueTurnReplyTools(ds: DaemonSession, msg: ToolsUpdate, send: R
   }
   const next: PendingTools = { msg, send, owns };
   pending.set(key, next);
+  trackedToolSessions.add(ds);
   next.timer = setTimeout(() => {
     void flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
       logger.warn(`[reply-card] tool update failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -352,7 +382,10 @@ export async function flushTurnReplyTools(ds: DaemonSession, turnId: string, dis
   if (inflight) await inflight.catch(() => undefined);
   const pending = pendingTools.get(ds);
   const next = pending?.get(key);
-  if (!next) return;
+  if (!next) {
+    untrackToolSessionIfIdle(ds);
+    return;
+  }
   clearTimeout(next.timer);
   pending!.delete(key);
   const cfg = getBot(ds.larkAppId).config;
@@ -364,7 +397,10 @@ export async function flushTurnReplyTools(ds: DaemonSession, turnId: string, dis
   let running = toolFlushes.get(ds);
   if (!running) { running = new Map(); toolFlushes.set(ds, running); }
   running.set(key, work);
-  try { await work; } finally { if (running.get(key) === work) running.delete(key); }
+  try { await work; } finally {
+    if (running.get(key) === work) running.delete(key);
+    untrackToolSessionIfIdle(ds);
+  }
 }
 
 /** UI retirement never asserts native task failure or changes task settlement. */

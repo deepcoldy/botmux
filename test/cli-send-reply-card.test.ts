@@ -235,7 +235,10 @@ describe('real CLI send into a running reply card', () => {
       sendArgs: ['--no-mention', '--top-level'],
       deliveryKind: 'detoured_send',
     },
-  ] as const)('records $name as exact empty-final reply evidence', ({ cliId, sendArgs, deliveryKind }) => {
+  ].flatMap(scenario => (['progress', 'final', 'auxiliary'] as const)
+    .map(responseKind => ({ ...scenario, responseKind }))))(
+    'records $name/$responseKind and only treats final as completed delivery',
+    ({ cliId, sendArgs, deliveryKind, responseKind }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-visible-reply-marker-'));
     const dataDir = join(root, 'data');
     const turnId = `om_${cliId}_visible_reply`;
@@ -264,7 +267,10 @@ describe('real CLI send into a running reply card', () => {
       } });
       const result = spawnSyncTsScript(
         fixture,
-        ['send', ...sendArgs, 'Visible result already delivered.'],
+        ['send', ...sendArgs,
+          // A bare send defaults to progress; it must not mask missing final delivery.
+          ...(responseKind === 'progress' ? [] : ['--response-kind', responseKind]),
+          'Visible result already delivered.'],
         {
           cwd: fileURLToPath(new URL('..', import.meta.url)),
           env: {
@@ -290,6 +296,7 @@ describe('real CLI send into a running reply card', () => {
         deliveryKind,
         targetChatId: 'oc_test',
         messageId: 'om_separate_message',
+        responseKind,
       });
       expect(shouldEmitEmptyCompletedBridgeFallback({
         sessionId: key.sessionId,
@@ -298,7 +305,7 @@ describe('real CLI send into a running reply card', () => {
         isLocal: false,
         finalText: '',
         terminalStatus: 'completed',
-      }, undefined, markers, false)).toBe(false);
+      }, undefined, markers, false)).toBe(responseKind !== 'final');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -1109,7 +1116,9 @@ describe('session Oncall after the CLI turn lease retires', () => {
           BOTS_CONFIG: join(root, 'bots.json'), BOTMUX_SESSION_ID: key.sessionId, BOTMUX_LARK_APP_ID: key.larkAppId }, encoding: 'utf8', timeout: 30_000 });
       expect(result.status, String(result.stderr)).toBe(0);
       const delivered = String(result.stdout).split('\n').find(line => line.startsWith('CAPTURE_REPLY='));
-      expect(delivered).toContain('oc_existing');
+      expect(delivered).toContain('oncall_group_join');
+      expect(delivered).not.toContain('oncall_group_create');
+      expect(store.getRequest(source)?.openChatId).toBe('oc_existing');
       expect(store.findSource(key.larkAppId, 'om_separate_message')?.questionId).toBe(key.turnId);
       store.recordSource(source); expect(store.latest(key.larkAppId, key.sessionId)?.messageId).toBe('om_separate_message');
     } finally { rmSync(root, { recursive: true, force: true }); }

@@ -1,10 +1,13 @@
 import { parseArgs } from 'node:util';
-import { resolveCurrentExecutionIdentity } from './cli/current-execution.js';
+import { CurrentExecutionIdentityError, resolveCurrentExecutionIdentity } from './cli/current-execution.js';
+import { identityRefusalLines } from './cli/identity-refusal-guidance.js';
 
 // Governed tools plus the Codebase CLI companion that mirrors bytedcli's
 // identity; kept in sync with CODEBASE_COMPANION_TOOL in core/cli-identity.ts
 // (a compile-entry test pins the runner wiring end to end).
 const IDENTITY_TOOLS = ['lark-cli', 'bytedcli', 'codebase'] as const;
+
+let requestedTool = 'tool';
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
@@ -14,9 +17,10 @@ async function main(): Promise<void> {
     'app-id': { type: 'string' }, 'ipc-port': { type: 'string' }, tool: { type: 'string' },
   } });
   const tool = values.tool;
+  if (tool && (IDENTITY_TOOLS as readonly string[]).includes(tool)) requestedTool = tool;
   if (!values['session-id'] || !values['app-id']
     || !(IDENTITY_TOOLS as readonly string[]).includes(tool ?? '')) {
-    throw new Error('Invalid managed CLI identity invocation');
+    throw new CurrentExecutionIdentityError('current_execution_route_unavailable', 'invalid_invocation');
   }
   const execution = await resolveCurrentExecutionIdentity({
     ipcPort: Number(values['ipc-port']), sessionId: values['session-id'], larkAppId: values['app-id'],
@@ -30,6 +34,11 @@ async function main(): Promise<void> {
 }
 
 await main().catch(error => {
-  process.stderr.write(`botmux: ${error instanceof Error ? error.message : 'current_execution_unverified'}\n`);
+  // The wrapper exits 77 on any failure here; these lines are all the person
+  // and their agent get, so name the failing step and what to do about it.
+  const lines = error instanceof CurrentExecutionIdentityError
+    ? identityRefusalLines(requestedTool, error.code, error.reason)
+    : [`botmux: ${error instanceof Error ? error.message : 'current_execution_unverified'}`];
+  process.stderr.write(`${lines.join('\n')}\n`);
   process.exitCode = 77;
 });

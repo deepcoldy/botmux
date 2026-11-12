@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { WorkerSessionEventScope, type RuntimeEventBinding, type CapturedSessionOrigin } from './services/session-event-scope.js';
 import { admitSessionCommand } from './services/session-command-gateway.js';
-import { contractTerminalStatus, TRAEX_CONTINUATION_BACKENDS, type RuntimeIdentity } from './services/session-contract.js';
+import { contractTerminalStatus, sameExecution, sameRuntime, TRAEX_CONTINUATION_BACKENDS, type RuntimeIdentity, type ExecutionRef,
+  type RuntimeExecutionContinuation, type RuntimeExecutionContinuationFailure } from './services/session-contract.js';
 import {
   awaitRuntimeReservation,
   RUNTIME_RESERVATION_DEADLINE_MS,
@@ -545,7 +546,8 @@ import { waitForProcessQuiescence } from './services/process-quiescence.js';
 import { reapStaleCodexThreadWriter, shouldReapStaleCodexWriterBeforeSpawn } from './services/codex-stale-writer-reaper.js';
 import { pidNotProvablyGone } from './utils/process-alive.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
-import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
+import { restoredTurnLabel } from './services/restored-turn-label.js';
+import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, readClaudeLiveSessionId, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
 import { cliProcessAliveFromBackend } from './adapters/cli/backend-liveness.js';
 import { statuslineDir } from './services/statusline-snapshot.js';
@@ -680,6 +682,7 @@ import {
 } from './utils/idle-detector.js';
 import { ProgramStatusFramingStream } from './utils/program-status-parser.js';
 import { programStatusRelayLaunch } from './core/program-status-relay-launch.js';
+import { programStatusBlockHoldsTypeAhead, programStatusEnabledForLaunch, startupIdleReportScreenAdmits } from './core/program-status-gate.js';
 import { busyProbeRegion } from './utils/busy-probe.js';
 import { BusyReadyFallbackGate } from './utils/busy-ready-fallback.js';
 import {
@@ -764,6 +767,7 @@ import {
   validTraexAutoModelRuntime,
   TRAEX_AUTO_MODEL_DEFAULT_OVERLOAD_THRESHOLD_PERCENT,
   TRAEX_AUTO_MODEL_DEFAULT_PREFLIGHT_TIMEOUT_MS,
+  TRAEX_AUTO_MODEL_CONTINUATION_GRANT_TIMEOUT_MS,
   type TraexAutoModelAction,
   type TraexAutoModelPreflightDecision,
 } from './services/traex-auto-model.js';
@@ -2063,9 +2067,22 @@ function sessionEventMetadata(msg: WorkerToDaemon, origin?: CapturedSessionOrigi
   // Physical process proof is available before an opening attempt is bound.
   // Keep its frozen runtime, without claiming execution acceptance.
   if (msg.type === 'claude_exit' || msg.type === 'local_process_attestation') delete context.scope.execution;
-  // Queue observations span turns, including admissions not yet bound to the
-  // runtime. An unaccepted input must not invalidate its own backlog report.
-  if (msg.type === 'cli_input_backlog') delete context.scope.execution;
+  // Queue observations belong to this worker process, not to a turn or a
+  // runtime: they span turns (including admissions not yet bound to the
+  // runtime) and runtimes too. Whatever callback publishes one, it reports the
+  // queue as it is now, so it must not carry the binding that callback was
+  // started under: once the runtime is re-bound (the relay resolved the real
+  // CLI behind its launcher, then the native session id arrived), a report
+  // from the write that began before it would be dropped as a stale runtime's
+  // event. A backlog is reported only when it changes, so the daemon would keep
+  // the previous report — "the CLI has not taken its input" — for good. The
+  // producer is still this worker; the gateway admits it as a worker event.
+  if (msg.type === 'cli_input_backlog') {
+    delete context.scope.execution;
+    delete context.scope.runtime;
+    delete context.scope.operationId;
+    delete context.bindingId;
+  }
   return { ...msg, sessionContract: context };
 }
 function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdentity {
@@ -2089,6 +2106,14 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
       const owned = findTraexRolloutSetByPid(childPid);
       const observed = owned?.size === 1 ? findTraexRolloutByPid(childPid) : undefined;
       if (observed && owned!.has(observed.cliSessionId)) nativeSessionId = observed.cliSessionId;
+    } else if (!nativeSessionId && cliAdapter?.claudeDataDir) {
+      // Likewise a re-attached Claude may be mid-turn and write nothing until
+      // that turn ends. Without its conversation the contract cannot tell this
+      // live CLI from another and its running attempt loses its origin. The
+      // process's own pid-state record names it — the source a write's session
+      // id comes from — when the record is provably this process's and agrees
+      // with what the process holds open.
+      nativeSessionId = readClaudeLiveSessionId(childPid, bridgeDataDir);
     }
     if (owned() && readProcessStartIdentity(childPid) === start) return { backend: backendType, physicalId: `${childPid}:${start}`, proof: 'process_start', ...(nativeSessionId ? { nativeSessionId } : {}) };
   }
@@ -3132,17 +3157,23 @@ let spawnArgvSubmissionEvidence: {
 let idleDetector: IdleDetector | null = null;
 let programStatusStream: ProgramStatusFramingStream | null = null;
 
-function shouldEnableProgramStatus(cliId: string | undefined, adapter?: CliAdapter | null): boolean {
-  if (adapter?.supportsProgramStatus !== undefined) {
-    return adapter.supportsProgramStatus;
+function shouldEnableProgramStatus(
+  cfg: Pick<Extract<DaemonToWorker, { type: 'init' }>, 'cliId' | 'cliVersion' | 'adoptMode'>,
+  adapter?: CliAdapter | null,
+  opts: { quiet?: boolean } = {},
+): boolean {
+  let declared = adapter?.supportsProgramStatus !== undefined ? adapter : undefined;
+  if (!declared && cfg.cliId) {
+    try { declared = createCliAdapterSync(cfg.cliId as CliId); } catch { return false; }
   }
-  if (!cliId) return false;
-  try {
-    const probe = createCliAdapterSync(cliId as CliId);
-    return probe.supportsProgramStatus === true;
-  } catch {
-    return false;
+  const launch = { cliVersion: cfg.cliVersion, adoptMode: cfg.adoptMode === true, remoteViewer: !!remoteWsUrl };
+  const enabled = programStatusEnabledForLaunch(declared, launch);
+  if (!enabled && !opts.quiet && declared?.supportsProgramStatus === true && declared.programStatusMinVersion) {
+    const why = launch.adoptMode ? 'adopted pane' : launch.remoteViewer ? 'RPC viewer'
+      : `version ${JSON.stringify(cfg.cliVersion?.split('\n')[0] ?? 'unknown')} < ${declared.programStatusMinVersion}`;
+    log(`[program-status] ${declared.id} reports not parsed (${why}); idle stays on screen heuristics`);
   }
+  return enabled;
 }
 let isTmuxMode = false;
 /** True once a crash diagnostic tmux shell (bmx-diag-<sid>) is live. */
@@ -4125,6 +4156,8 @@ let lastWebTerminalInputAtMs = 0;
 let webTerminalInputGeneration = 0;
 /** webTerminalInputGeneration at the latest SessionStart boundary. */
 let webTerminalInputGenerationAtBoundary = 0;
+/** webTerminalInputGeneration when this CLI generation's IdleDetector was built. */
+let webTerminalInputGenerationAtSpawn = 0;
 /** The forwards among those that submitted the CLI's input box
  *  (terminalInputSubmits). ESC, Ctrl-C, arrow keys and characters still being
  *  typed are terminal activity, not new model input. */
@@ -5674,7 +5707,7 @@ async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' 
       hasFollowUp: !!onFollowUp,
       onAccepted: () => {
         isPromptReady = false;
-        idleDetector?.reset();
+        idleDetector?.reset({ inputCycle: true });
         log(`Passthrough slash command: ${msg.content}`);
       },
       // Non-adopt follows the normal busy queue. Adopt keeps the complete
@@ -6146,6 +6179,40 @@ function enqueueTraexAutoModelRecovery(turnId: string): boolean {
   return true;
 }
 
+function abandonTraexAutoModelContinuation(
+  continuation: RuntimeExecutionContinuation,
+  bindingId: string,
+  reason: 'rejected' | 'timeout',
+): boolean {
+  const scope = workerSessionEventScope;
+  const recovery = pendingMessages.find(item => item.traexAutoModelRecovery
+    && sameExecution(item.traexAutoModelContinuation?.execution, continuation.execution)
+    && sameRuntime(item.traexAutoModelContinuation?.from, continuation.from));
+  if (!scope || !recovery?.turnId) return false;
+  clearTraexContinuationGrantWait(continuation.execution);
+  for (let index = pendingMessages.length - 1; index >= 0; index--) {
+    const item = pendingMessages[index]!;
+    if (item.traexAutoModelRecovery && sameExecution(item.traexAutoModelContinuation?.execution, continuation.execution)
+      && sameRuntime(item.traexAutoModelContinuation?.from, continuation.from)) pendingMessages.splice(index, 1);
+  }
+  const binding = scope.currentBinding();
+  if (binding && sameExecution(binding.continuation?.execution, continuation.execution)
+    && sameRuntime(binding.continuation?.from, continuation.from)) binding.continuation = undefined;
+  traexAutoModelTurnReplayForbidden = true;
+  const origin = scope.abandonContinuation(continuation.execution);
+  if (origin) {
+    scope.run(scope.restore(origin), () => {
+      emitTurnTerminal(continuation.execution.turnId, 'failed', `traex_auto_model_continuation_${reason}`,
+        undefined, undefined, false, undefined, undefined, { bindingId, continuation,
+          notice: t(reason === 'timeout' ? 'worker.traex_auto_model.continuation_timeout' : 'worker.traex_auto_model.continuation_rejected') });
+    }, continuation.execution);
+  } else traexAutoModelController?.endTurn(continuation.execution.turnId);
+  if (binding) void scope.run(binding, () => publishRuntimeContract(binding)).catch(error => {
+    log(`TraeX continuation fallback registration failed: ${String(error)}`);
+  });
+  return true;
+}
+
 /** A proposed restart is not proof that a candidate is executing or queued. */
 function notifyTraexModelAccessSwitchActivity(turnId: string, queued: boolean, progressing: boolean, completed = false): void {
   const notice = traexModelAccessSwitchNotice;
@@ -6194,6 +6261,7 @@ function executeTraexAutoModelSwitch(
     && (!(TRAEX_CONTINUATION_BACKENDS as readonly string[]).includes(effectiveBackendType)
       // A newer worker must not rotate into a host that cannot grant recovery.
       || lastInitConfig.sessionContract?.executionContinuations !== true
+      || lastInitConfig.sessionContract?.executionContinuationFailures !== true
       || !sourceBinding?.runtime || sourceBinding.identity?.proof !== 'process_start'
       || sourceBinding.identity.nativeSessionId !== nativeSessionId
       || !workerSessionEventScope.executionForTurn(action.turnId))) return false;
@@ -6537,6 +6605,11 @@ function recoverTraexQuotaTurn(turn: CodexPendingTurn): boolean {
   const nativeSessionId = lastInitConfig.cliSessionId;
   const target = backend;
   traexQuotaPending = token;
+  // An exact native terminal settles the ambiguous write before attempting
+  // recovery. Otherwise the switch rejects the still-quarantined generation
+  // and only the later fallback emission releases it, losing the recovery.
+  // Register pending recovery first so the release cannot admit queued input.
+  releaseInputDeliveryQuarantineForStructuredTerminal(turn.turnId, turn.dispatchAttempt);
   if (capacityRecovery) {
     // Invalidate older capacity proposals and persist the refusal before IO.
     controller.recordUnavailableModel(turn.turnId);
@@ -11967,12 +12040,11 @@ function emitReadyTurns(opts: {
     }
 
     // A restored turn's fallback is a RECOVERED partial/final produced around
-    // a worker restart — label it so the user can tell it from a live answer.
-    // Prefix is applied AFTER the suppress gate so dedup compares the model's
-    // own text, never the notice.
-    const deliveredText = turn.restoredFromJournal && !universalOutputHandoff
-      ? `${t('worker.bridge_restored_turn_notice')}\n\n${postText}`
-      : postText;
+    // a restart, possibly turns ago. The daemon notes which turn it answers
+    // above it; the content itself stays the model's own text, so the reply
+    // keeps one identity whether it is emitted live or after a restore.
+    const deliveredText = postText;
+    const restoredTurn = turn.restoredFromJournal ? restoredTurnLabel(turn) : undefined;
     usageLimitTracker.noteTurnCompleted('answered');
     const handoffOutput = { sessionId: sessionId!, content: deliveredText, lastUuid: lastUuid!, turnId: turn.turnId };
     if (workerFinalOutputHandoff && handoffTurnIds.has(turn.turnId) && !turn.isLocal && turn.dispatchAttempt === undefined
@@ -12004,6 +12076,7 @@ function emitReadyTurns(opts: {
         : {}),
       ...(turn.isLocal && zeroPromptTerminalSync() ? { terminalLocal: true } : {}),
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+      ...(restoredTurn ? { restoredTurn } : {}),
     });
   }
   } catch (error) {
@@ -15292,11 +15365,32 @@ function traexFirstPromptViewportRejects(): boolean {
   if (lastInitConfig?.cliId !== 'traex' || !awaitingFirstPrompt
     || !backendScreenEvidenceIsAuthoritativeForMutation()) return false;
   if (!idleDetector?.isReadyEvidenceWeak()) return false;
+  // TraeX itself last reported idle over OSC 7501 (0.214.1+, parsed only on
+  // a version-gated launch). The predicate below only knows the footer shapes
+  // seen so far; an unknown one must not send the first prompt back to the
+  // hard timeout (#3307 / #3338). Timing still comes from screen quiescence.
+  // The report alone is not enough: the screen must still show a prompt row
+  // and no blocking page (see traexIdleReportScreenShowsComposer). A draft can
+  // only come from web-terminal input, which keeps the predicate.
+  const reported = idleDetector.lastProgramStatusReport();
+  if (programStatusStream && (reported === 'idle' || reported === 'done')
+    && webTerminalInputGeneration === webTerminalInputGenerationAtSpawn
+    && traexIdleReportScreenShowsComposer()) return false;
   const predicate = cliAdapter?.startupReadyFromHistory;
   if (!predicate) return false;
   let screen = '';
   try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
   return !!screen && !predicate(screen);
+}
+
+/** The rendered screen still shows a TraeX prompt row and no blocking page,
+ *  so an `idle` report sent before the first write may stand for the unknown
+ *  footer. A hold raised from an earlier frame (lock page) also refuses. */
+function traexIdleReportScreenShowsComposer(): boolean {
+  if (hookReviewInputHold || heldStuckPage()) return false;
+  let screen = '';
+  try { screen = renderer?.rawSnapshot() ?? ''; } catch { return false; }
+  return startupIdleReportScreenAdmits(screen, cliAdapter?.readyPattern);
 }
 
 /** 当前渲染画面是否有提示符（renderer 尚未就绪时按「没有」处理，等下一轮）。 */
@@ -15532,7 +15626,7 @@ function beginCliWriteCycle(): void {
   idleTranscriptSettle?.cancel();
   beginRuntimeWriteCycle({
     setPromptReady: ready => { isPromptReady = ready; },
-    resetIdleDetector: () => { idleDetector?.reset(); },
+    resetIdleDetector: () => { idleDetector?.reset({ inputCycle: true }); },
   });
   // Input is about to reach the CLI: the main agent's turn starts here, before
   // its transcript record lands (a turn terminal record ends it again).
@@ -20999,6 +21093,49 @@ function traexAutoModelInputHold(): boolean {
 
 let traexAutoModelAdmissionRetry: ReturnType<typeof setTimeout> | undefined;
 let traexContinuationGrantRecheckAt = 0;
+let traexContinuationGrantWait: {
+  input: PendingCliInput;
+  physicalId: string;
+  timer?: ReturnType<typeof setTimeout>;
+} | undefined;
+
+function clearTraexContinuationGrantWait(execution?: ExecutionRef): void {
+  const pending = traexContinuationGrantWait;
+  if (!pending || (execution && !sameExecution(pending.input.traexAutoModelContinuation?.execution, execution))) return;
+  if (pending.timer) clearTimeout(pending.timer);
+  traexContinuationGrantWait = undefined;
+}
+
+function armTraexContinuationGrantWait(): void {
+  const scope = workerSessionEventScope;
+  const binding = scope?.currentBinding();
+  const input = pendingMessages[0];
+  const continuation = input?.traexAutoModelContinuation;
+  if (!scope || !binding || !input?.traexAutoModelRecovery || !continuation || !isPromptReady
+    || !sameExecution(binding.continuation?.execution, continuation.execution)
+    || !sameRuntime(binding.continuation?.from, continuation.from)) return;
+  if (scope.canSubmitContinuation(continuation.execution.turnId, continuation.execution)) {
+    clearTraexContinuationGrantWait(continuation.execution);
+    return;
+  }
+  if (traexContinuationGrantWait?.input === input && traexContinuationGrantWait.physicalId === binding.physicalId) return;
+  clearTraexContinuationGrantWait();
+  input.traexAutoModelContinuationDeadlineAt ??= Date.now() + TRAEX_AUTO_MODEL_CONTINUATION_GRANT_TIMEOUT_MS;
+  const pending: NonNullable<typeof traexContinuationGrantWait> = { input, physicalId: binding.physicalId };
+  traexContinuationGrantWait = pending;
+  pending.timer = setTimeout(() => {
+    if (traexContinuationGrantWait !== pending) return;
+    clearTraexContinuationGrantWait();
+    const current = scope.currentBinding();
+    if (workerSessionEventScope !== scope || !current || current.physicalId !== pending.physicalId
+      || !pendingMessages.includes(input) || scope.canSubmitContinuation(continuation.execution.turnId, continuation.execution)) return;
+    scope.run(current, () => {
+      abandonTraexAutoModelContinuation(continuation, current.bindingId, 'timeout');
+      void flushPending();
+    });
+  }, Math.max(0, input.traexAutoModelContinuationDeadlineAt - Date.now()));
+  pending.timer.unref?.();
+}
 
 /** Unknown/stale reads must retain the input and remain live even when a
  * static screen emits no further output. One bounded retry drives the normal
@@ -21096,6 +21233,17 @@ function runtimePtyInputPolicy(): ReturnType<typeof resolvePtyInputPolicy> {
     : policy;
 }
 
+/** The CLI reports over OSC 7501 that a dialog waits on the human (an
+ *  approval). Text typed ahead now would land in it, where Enter picks the
+ *  default answer (TraeX/Codex: "Yes, proceed"). Queued input waits for the
+ *  turn's terminal report instead. Opt-in per adapter; a question block is
+ *  answered by the next message, so it is not held (see
+ *  programStatusBlockHoldsTypeAhead). */
+function programStatusBlockedHoldsTypeAhead(): boolean {
+  return cliAdapter?.programStatusBlockedHoldsInput === true
+    && programStatusBlockHoldsTypeAhead(idleDetector?.programStatusBlock() ?? null);
+}
+
 /** The hybrid WebSocket RPC engine only has a serial turn/start contract. It
  *  does not implement Codex App's ordered turn/steer grouping, so type-ahead
  *  must stop while the exact native turn is awaiting activation, active, or
@@ -21147,6 +21295,7 @@ async function flushPending(): Promise<void> {
   if (isCodexAppCliId(lastInitConfig?.cliId) && !codexAppRuntimeTypeAheadReady()) return;
   if (isFlushing) return;  // while loop in active flush will pick up new messages
   if (!backend || !cliAdapter) return;
+  if (pendingMessages[0]?.traexAutoModelContinuation) armTraexContinuationGrantWait();
   if (
     ambiguousSubmissionRecoveryHold
     && ambiguousSubmissionRecoveryHold.backend !== backend
@@ -21263,7 +21412,7 @@ async function flushPending(): Promise<void> {
     runtimeSupportsTypeAhead,
     durableTurnInFlight,
     pendingMessages[0],
-    directRpcTurnBlocksTypeAhead(),
+    directRpcTurnBlocksTypeAhead() || programStatusBlockedHoldsTypeAhead(),
   ) && !activeTurnBlocks(pendingMessages[0] ?? {});
   // Native /rename is an administrative command, not a steer/queued model
   // message. It must wait for a real prompt even on type-ahead CLIs. Normal
@@ -21494,13 +21643,27 @@ async function flushPending(): Promise<void> {
           || cliRestartInProgress) break;
       }
       if (activeTurnBlocks(pendingMessages[0]!)) break;
+      const admissionHead = pendingMessages[0]!;
       if (traexAutoModelRuntimeEligible()
-        && !(await admitTraexAutoModelPendingInput(pendingMessages[0]!))) break;
+        && !(await admitTraexAutoModelPendingInput(admissionHead))) {
+        // A continuation deadline or refusal can abandon the head while its
+        // viewport read is in flight. That refusal judged a removed input, not
+        // the screen: keep the readiness this flush found, or the independent
+        // successor waits for a composer edge a static replacement never paints.
+        if (pendingMessages[0] !== admissionHead) keepPromptReadyAfterHold();
+        break;
+      }
       const continuation = pendingMessages[0]!.traexAutoModelContinuation;
       if (workerSessionEventScope && pendingMessages[0]!.traexAutoModelRecovery && continuation
         && !workerSessionEventScope.canSubmitContinuation(pendingMessages[0]!.turnId!, continuation.execution)) {
         const scope = workerSessionEventScope;
         const binding = scope.currentBinding();
+        const recovery = pendingMessages[0]!;
+        recovery.traexAutoModelContinuationDeadlineAt ??= Date.now() + TRAEX_AUTO_MODEL_CONTINUATION_GRANT_TIMEOUT_MS;
+        if (binding && Date.now() >= recovery.traexAutoModelContinuationDeadlineAt) {
+          abandonTraexAutoModelContinuation(continuation, binding.bindingId, 'timeout');
+          continue;
+        }
         if (binding && Date.now() - traexContinuationGrantRecheckAt >= 1_000) {
           traexContinuationGrantRecheckAt = Date.now();
           void scope.run(binding, () => publishRuntimeContract(binding)).catch(error => {
@@ -22506,7 +22669,7 @@ function sendToPty(
     runtimePtyInputPolicy().supportsTypeAhead,
     durableTurnInFlight,
     next,
-    directRpcTurnBlocksTypeAhead(),
+    directRpcTurnBlocksTypeAhead() || programStatusBlockedHoldsTypeAhead(),
   ) && !activeTurnBlocks(next);
   const shouldMergeQueued = !traexAutoModelRuntimeEligible()
     && opts.dispatchAttempt === undefined && !durableTurnInFlight
@@ -23509,7 +23672,10 @@ async function spawnCli(
       // Superseded means another lifecycle operation owns the next start. An
       // unanswered start has no such owner, so it must fail where it is seen.
       if (outcome === 'expired' && !superseded) throw new RuntimeReservationExpiredError();
-      if (outcome === 'refused' && continuation && !superseded) throw new Error('TraeX auto-model continuation reservation was refused');
+      if (outcome === 'refused' && continuation && !superseded) {
+        abandonTraexAutoModelContinuation(continuation, binding.bindingId, 'rejected');
+        return spawnCli(cfg, opts);
+      }
       if (outcome === 'refused') log(`Daemon refused runtime reservation ${binding.bindingId}; the lifecycle operation that owns the session takes over`);
       throw new CliSpawnSupersededError();
     }
@@ -23651,7 +23817,7 @@ async function spawnCliBody(
   forceClearSessionRenameInFlight();
   // Early mount based on cfg.cliId before cliAdapter is instantiated for this generation
   // (necessary for adopt mode which wires onPtyData before the normal spawn sequence).
-  programStatusStream = shouldEnableProgramStatus(cfg.cliId, cliAdapter) ? new ProgramStatusFramingStream() : null;
+  programStatusStream = shouldEnableProgramStatus(cfg, cliAdapter, { quiet: true }) ? new ProgramStatusFramingStream() : null;
   queuedTurnAdvanceConsumedForPrompt = undefined;
   retiredTurnIds.clear();
   currentCliCredentialIsolated = false;
@@ -23950,7 +24116,12 @@ async function spawnCliBody(
     };
   }
   // Re-verify capability once effectiveCliId (e.g. dsh-tui) and cliPathOverride are resolved into cliAdapter.
-  if (cliAdapter.supportsProgramStatus && !programStatusStream) {
+  // A version-gated adapter (codex / traex) is decided per launch either way.
+  if (cliAdapter.programStatusMinVersion !== undefined) {
+    programStatusStream = shouldEnableProgramStatus(cfg, cliAdapter)
+      ? programStatusStream ?? new ProgramStatusFramingStream()
+      : null;
+  } else if (cliAdapter.supportsProgramStatus && !programStatusStream) {
     programStatusStream = new ProgramStatusFramingStream();
   }
   const cardActionCapabilities = pluginCardActionCapabilitiesEnv(cfg);
@@ -29313,6 +29484,7 @@ async function spawnCliBody(
       if (backend !== observedBackend || !backendScreenEvidenceIsAuthoritativeForMutation()) return '';
       return stripAnsiScreenText(captureBackendScreen(observedBackend));
     });
+    webTerminalInputGenerationAtSpawn = webTerminalInputGeneration;
     // A new CLI process starts with no closed turn of its own.
     claudeTranscriptTurnEnd.reset();
     wireIdleDetectorBusyTransition(idleDetector, `${cliName()} PTY`);
@@ -33830,6 +34002,7 @@ function emitTurnTerminal(
   /** The provider's own error text for a non-completed terminal, raw: masked
    *  and clipped below, before it leaves the worker. */
   errorDetail?: string,
+  continuationFailure?: RuntimeExecutionContinuationFailure,
 ): void {
   if (!sessionId || !turnId) return;
   if (workerSessionEventScope && !workerSessionEventScope.ownsExecutionEvent(turnId, dispatchAttempt)) return;
@@ -33871,19 +34044,28 @@ function emitTurnTerminal(
   const diagnostics = captureTurnFailureDiagnostics && (status === 'failed' || status === 'ambiguous')
     ? turnFailureDiagnostics({ errorDetail, screen: turnFailureScreen() })
     : {};
-  send({
+  const terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }> = {
     type: 'turn_terminal',
     sessionId,
     turnId,
     status,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     ...(errorCode ? { errorCode } : {}),
+    ...(continuationFailure ? { continuationFailure } : {}),
     ...(outputDisposition ? { outputDisposition } : {}),
     ...(retryable !== undefined ? { retryable } : {}),
     ...(timing ? { completedAtMs: timing.completedAtMs } : {}),
     ...(timing?.durationMs !== undefined ? { durationMs: timing.durationMs } : {}),
     ...diagnostics,
-  });
+  };
+  const scope = workerSessionEventScope;
+  if (continuationFailure && scope) {
+    scope.reportContinuationFailure(continuationFailure, () => {
+      if (workerSessionEventScope !== scope) return false;
+      send(terminal);
+      return true;
+    });
+  } else send(terminal);
   let wakePending = false;
   if (terminalReleasesDurableTurn(
     { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt },
@@ -35013,6 +35195,10 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       workerSessionEventScope?.confirmAbortedStart(msg.bindingId);
       break;
     }
+    case 'continuation_failure_ack': {
+      workerSessionEventScope?.confirmContinuationFailure(msg.bindingId, msg.execution);
+      break;
+    }
     case 'runtime_binding_refused': {
       workerSessionEventScope?.refuseBinding(msg.bindingId);
       break;
@@ -35036,7 +35222,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       if (continuation?.status === 'approved') {
         const state = msg.admissionStates?.find(value => value.ref.executionId === continuation.execution.executionId
           && value.ref.turnId === continuation.execution.turnId && value.ref.dispatchAttempt === continuation.execution.dispatchAttempt);
-        if (state) scope?.acceptContinuation(msg.bindingId, state);
+        if (state && scope?.acceptContinuation(msg.bindingId, state)) clearTraexContinuationGrantWait(continuation.execution);
       }
       for (const state of msg.admissionStates ?? []) scope?.noteAdmission(state);
       for (const execution of msg.executions ?? []) workerSessionEventScope?.rememberExecution(execution);
@@ -35046,15 +35232,7 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
       if (continuation?.status === 'rejected') {
         const recovery = pendingMessages.find(item => item.traexAutoModelRecovery
           && item.traexAutoModelContinuation?.execution.executionId === continuation.execution.executionId);
-        if (recovery?.turnId) {
-          for (let index = pendingMessages.length - 1; index >= 0; index--) {
-            if (pendingMessages[index]!.traexAutoModelRecovery
-              && pendingMessages[index]!.traexAutoModelContinuation?.execution.executionId === continuation.execution.executionId) pendingMessages.splice(index, 1);
-          }
-          traexAutoModelTurnReplayForbidden = true;
-          traexAutoModelController?.endTurn(recovery.turnId);
-          send({ type: 'user_notify', turnId: recovery.turnId, message: t('worker.traex_auto_model.continuation_rejected') });
-        }
+        if (recovery?.traexAutoModelContinuation) abandonTraexAutoModelContinuation(recovery.traexAutoModelContinuation, msg.bindingId, 'rejected');
       }
       if (!msg.mayExecute && (!scope || scope.currentBinding()?.bindingId === msg.bindingId)) {
         log(`Daemon retired runtime binding ${msg.bindingId} (mayExecute=false); closing the transcript bridge and the CLI backend`);

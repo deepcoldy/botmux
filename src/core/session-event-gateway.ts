@@ -9,7 +9,19 @@ export type SessionEventAdmission =
   | { kind: 'reject'; reason: string };
 const immutableFacts = new Set(['turn_terminal', 'final_output', 'final_output_offer', 'turn_interrupt_result', 'codex_app_dispatch_persisted', 'restart_result', 'claude_exit']);
 // persistent_backend_target is stamped before the CLI spawns, so it can only be worker-scoped.
-const workerEvents = new Set(['worker_ipc_ready', 'ready', 'worker_error', 'error', 'transfer_detached', 'runtime_binding', 'runtime_binding_started', 'runtime_binding_aborted', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'turn_interrupt_result', 'restart_result', 'session_ready_ack', 'persistent_backend_target']);
+// session_identity_decision is the worker's report of the spawn it is about to
+// make (sandbox / loopback shape). It is sent before the CLI exists, while an
+// opening turn is still queued: from inside the reserved binding (held with it
+// until the binding settles, so a start that aborts never applies it), or from
+// the Codex RPC engine outside any binding. Scoping it to a runtime or turn
+// refused it on every start that carries an opening turn and on every RPC
+// start, leaving the daemon on the fail-closed single model and every proven
+// identity wrapper on exit 77. It grants nothing: the producer is still the
+// current worker channel, any execution it names must exist, and the daemon
+// handler re-checks generation, session and structural possibility.
+// cli_input_backlog reports the worker's own input queue, which outlives runtime
+// re-bindings; the worker sends it without a runtime (see sessionEventMetadata).
+const workerEvents = new Set(['worker_ipc_ready', 'ready', 'worker_error', 'error', 'transfer_detached', 'runtime_binding', 'runtime_binding_started', 'runtime_binding_aborted', 'turn_input_received', 'turn_input_committed', 'turn_input_rejected', 'turn_interrupt_result', 'restart_result', 'session_ready_ack', 'persistent_backend_target', 'session_identity_decision', 'cli_input_backlog']);
 /** A trusted channel supplies producer identity. An event cannot self-upgrade
  * to the current execution instance merely because its IPC worker survived. */
 export class SessionEventGateway {
