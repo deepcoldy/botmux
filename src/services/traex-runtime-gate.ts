@@ -103,8 +103,10 @@ export interface TraexRuntimeLease {
    *  exec (adopt/reattach/wrapper/forge). Its content identity is unknown, so
    *  it blocks incompatible starts and must never authorize one. */
   occupancyOnly?: boolean;
-  /** Attach the real CLI birth identity after exec. Never releases the slot. */
-  markRunning(cliPid: number, cliStart?: string): Promise<void>;
+  /** Attach the real CLI birth identity after exec. Never releases the slot.
+   *  `comboKey` backfills content identity for a record registered without
+   *  proof (adopt/reattach/opaque launcher); it never replaces a proven key. */
+  markRunning(cliPid: number, cliStart?: string, comboKey?: string): Promise<void>;
   /** The process behind this lease does not run the object we registered.
    *  Downgrade the occupant to unknown so it blocks instead of authorizing a
    *  parallel start with an unproven identity. */
@@ -193,12 +195,14 @@ function leaseFor(
     domain,
     snapshot,
     ...(occupancyOnly ? { occupancyOnly: true } : {}),
-    async markRunning(cliPid: number, cliStart?: string): Promise<void> {
+    async markRunning(cliPid: number, cliStart?: string, comboKey?: string): Promise<void> {
       await markTraexRuntimeRunning(domain, occupantId, {
         cliPid,
         ...(cliStart ? { cliStart } : {}),
         ...(snapshot.dir ? { snapshotDir: snapshot.dir } : {}),
+        ...(comboKey ? { comboKey } : {}),
       });
+      if (comboKey && snapshot.comboKey === '') snapshot.comboKey = comboKey;
     },
     async markUnknown(cliPid?: number, cliStart?: string): Promise<void> {
       await markTraexRuntimeUnknown(domain, occupantId, {
@@ -415,6 +419,10 @@ export interface TraexRuntimeOccupancyInput {
   traeHome?: string;
   /** Configured release entry; used for status only, never as content proof. */
   releaseDir: string;
+  /** The target CLI pid, when already known (adopt/reattach). Only pass it
+   *  when it is proven to be the CLI; it becomes the record's prune identity. */
+  cliPid?: number;
+  cliStart?: string;
   workerPid: number;
   workerStart?: string;
   daemonPid: number;
@@ -510,6 +518,9 @@ export async function acquireTraexRuntimeOccupancy(
       comboKey: '',
       force: input.existingRuntime === true,
       occupancyOnly: input.existingRuntime === true,
+      ...(input.releaseDir ? { traexPath: input.releaseDir } : {}),
+      ...(input.cliPid !== undefined ? { cliPid: input.cliPid } : {}),
+      ...(input.cliStart ? { cliStart: input.cliStart } : {}),
       workerPid: input.workerPid,
       ...(input.workerStart ? { workerStart: input.workerStart } : {}),
       daemonPid: input.daemonPid,

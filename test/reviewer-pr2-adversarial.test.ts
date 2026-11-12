@@ -336,7 +336,12 @@ describe('independent PR2 r4 late worker defer', () => {
     scheduler.setExecuteCallback(async (current, context) => {
       runId = context.runId;
       expect(scheduler.markDeferredTargetDispatching(current.id, runId, 'oc_A', turnId, APP)).toBe(true);
-      scheduler.markDeferredTargetDispatched(current.id, runId, 'oc_A', APP);
+      // The fork returned and the target is recorded as dispatched, but the
+      // worker has not accepted the exact turn yet.
+      scheduler.parkDeferredRun(current.id, context, {
+        runId, detail: 'worker accepted the fork, not the turn',
+        targets: { oc_A: 'dispatched' }, targetTurnIds: { oc_A: turnId },
+      });
       // Mirrors daemon: executeScheduledTask returned after fork, worker has
       // not yet finished spawnCli / consulted the physical-cache gate.
       return 'executed';
@@ -388,7 +393,10 @@ describe('independent PR2 r5 admission facts', () => {
     scheduler.setExecuteCallback(async (current, context) => {
       runId = context.runId;
       scheduler.markDeferredTargetDispatching(current.id,runId,'oc_A',turnId,APP);
-      scheduler.markDeferredTargetDispatched(current.id,runId,'oc_A',APP);
+      scheduler.parkDeferredRun(current.id, context, {
+        runId, detail: 'fork returned, turn not accepted yet',
+        targets: { oc_A: 'dispatched' }, targetTurnIds: { oc_A: turnId },
+      });
       return 'executed'; // daemon currently returns immediately after fork
     });
     scheduler.runNow(t.id);
@@ -405,10 +413,11 @@ describe('independent PR2 r5 admission facts', () => {
     const turnId = `schedule:${t.id}:late`;
     scheduler.setExecuteCallback(async (current,context) => {
       runId = context.runId;
-      for(const chatId of ['oc_A','oc_B']){
-        scheduler.markDeferredTargetDispatching(current.id,runId,chatId,chatId==='oc_A'?turnId:`schedule:${t.id}:other`,APP);
-        scheduler.markDeferredTargetDispatched(current.id,runId,chatId,APP);
-      }
+      scheduler.parkDeferredRun(current.id, context, {
+        runId, detail: 'both targets dispatched, none accepted yet',
+        targets: { oc_A: 'dispatched', oc_B: 'dispatched' },
+        targetTurnIds: { oc_A: turnId, oc_B: `schedule:${current.id}:other` },
+      });
       return 'executed';
     });
     scheduler.runNow(t.id);

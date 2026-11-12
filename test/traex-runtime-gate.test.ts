@@ -31,6 +31,7 @@ import {
   markTraexRuntimeRunning,
   type TraexRuntimeOccupant,
 } from '../src/services/traex-runtime-registry.js';
+import { readProcessStartIdentity } from '../src/utils/process-identity.js';
 import {
   captureTraexReleaseIdentity,
   comboKeyFromHashes,
@@ -200,6 +201,115 @@ describe('traex runtime registry', () => {
       occupantId: 'live', comboKey: 'content-new', workerPid: process.pid, daemonPid: process.pid,
     });
     expect(decision.decision).toBe('blocked');
+  });
+
+  it('backfills an unproven record with the running content key and never replaces a proven one', async () => {
+    const domain = domainFor(traeHome());
+    await acquireTraexRuntimeStart(domain, {
+      occupantId: 'opaque', comboKey: '', force: true, occupancyOnly: true,
+      workerPid: process.ppid, daemonPid: process.ppid,
+    });
+    await markTraexRuntimeRunning(domain, 'opaque', { cliPid: process.pid, comboKey: 'content-a' });
+    expect(readTraexRuntimeOccupants(domain)?.find(o => o.occupantId === 'opaque')?.comboKey)
+      .toBe('content-a');
+
+    // A proven identity is authoritative: a later observation never rewrites it.
+    const provenDomain = domainFor(traeHome());
+    await acquireTraexRuntimeStart(provenDomain, {
+      occupantId: 'proven', comboKey: 'content-b', workerPid: 2_000_000_000, daemonPid: 2_000_000_000,
+    });
+    await markTraexRuntimeRunning(provenDomain, 'proven', { cliPid: process.pid, comboKey: 'content-c' });
+    expect(readTraexRuntimeOccupants(provenDomain)?.find(o => o.occupantId === 'proven')?.comboKey)
+      .toBe('content-b');
+  });
+
+  it('inherits the proven content key when the same live CLI is re-registered', async () => {
+    const domain = domainFor(traeHome());
+    const cliStart = readProcessStartIdentity(process.pid);
+    await acquireTraexRuntimeStart(domain, {
+      occupantId: 'first', comboKey: 'content-a', force: true, occupancyOnly: true,
+      cliPid: process.pid, ...(cliStart ? { cliStart } : {}),
+      workerPid: process.ppid, daemonPid: process.ppid,
+    });
+    await acquireTraexRuntimeStart(domain, {
+      occupantId: 'second', comboKey: '', force: true, occupancyOnly: true,
+      cliPid: process.pid, ...(cliStart ? { cliStart } : {}),
+      workerPid: process.ppid, daemonPid: process.ppid,
+    });
+    expect(readTraexRuntimeOccupants(domain)?.find(o => o.occupantId === 'second')?.comboKey)
+      .toBe('content-a');
+  });
+
+  it('lets a same-content start overlap an opaque runtime after its identity is backfilled', async () => {
+    const domain = domainFor(traeHome());
+    await acquireTraexRuntimeStart(domain, {
+      occupantId: 'opaque', comboKey: '', workerPid: process.ppid, daemonPid: process.ppid,
+    });
+    await markTraexRuntimeRunning(domain, 'opaque', { cliPid: process.pid, comboKey: 'content-a' });
+    const same = await acquireTraexRuntimeStart(domain, {
+      occupantId: 'same', comboKey: 'content-a', workerPid: process.pid, daemonPid: process.pid,
+    });
+    expect(same.decision).toBe('start');
+    const other = await acquireTraexRuntimeStart(domain, {
+      occupantId: 'other', comboKey: 'content-b', workerPid: process.pid, daemonPid: process.pid,
+    });
+    expect(other.decision).toBe('blocked');
+  });
+
+  it('releases a starting orphan after the grace only when the snapshot scan is definitely empty', async () => {
+    const domain = domainFor(traeHome());
+    const deadPid = 2_000_000_000;
+    const snapshotDir = tempDir('botmux-traex-orphan-');
+    await acquireTraexRuntimeStart(domain, {
+      occupantId: 'orphan', comboKey: 'content-old', snapshotDir,
+      workerPid: deadPid, daemonPid: deadPid, now: Date.now() - 11 * 60_000,
+    });
+    const decision = await acquireTraexRuntimeStart(domain, {
+      occupantId: 'live', comboKey: 'content-new', workerPid: process.pid, daemonPid: process.pid,
+    });
+    expect(decision.decision).toBe('start');
+    expect(readTraexRuntimeOccupants(domain)?.map(o => o.occupantId)).toEqual(['live']);
+  });
+
+  it('keeps a starting orphan inside the grace even when nothing runs from it', async () => {
+    const domain = domainFor(traeHome());
+    const deadPid = 2_000_000_000;
+    const snapshotDir = tempDir('botmux-traex-orphan-');
+    await acquireTraexRuntimeStart(domain, {
+      occupantId: 'orphan', comboKey: 'content-old', snapshotDir,
+      workerPid: deadPid, daemonPid: deadPid, now: Date.now() - 60_000,
+    });
+    const decision = await acquireTraexRuntimeStart(domain, {
+      occupantId: 'live', comboKey: 'content-new', workerPid: process.pid, daemonPid: process.pid,
+    });
+    expect(decision.decision).toBe('blocked');
+  });
+
+  it('releases an occupancy-only orphan after its longer grace and keeps a live adopted CLI', async () => {
+    const orphanDomain = domainFor(traeHome());
+    const deadPid = 2_000_000_000;
+    const orphanRelease = tempDir('botmux-traex-occ-');
+    await acquireTraexRuntimeStart(orphanDomain, {
+      occupantId: 'occ-orphan', comboKey: '', force: true, occupancyOnly: true, traexPath: orphanRelease,
+      workerPid: deadPid, daemonPid: deadPid, now: Date.now() - 31 * 60_000,
+    });
+    const freed = await acquireTraexRuntimeStart(orphanDomain, {
+      occupantId: 'live', comboKey: 'content-new', workerPid: process.pid, daemonPid: process.pid,
+    });
+    expect(freed.decision).toBe('start');
+    expect(readTraexRuntimeOccupants(orphanDomain)?.map(o => o.occupantId)).toEqual(['live']);
+
+    const adoptedDomain = domainFor(traeHome());
+    const adoptedRelease = tempDir('botmux-traex-occ-');
+    await acquireTraexRuntimeStart(adoptedDomain, {
+      occupantId: 'adopted', comboKey: 'content-a', force: true, occupancyOnly: true, traexPath: adoptedRelease,
+      cliPid: process.pid, workerPid: deadPid, daemonPid: deadPid, now: Date.now() - 31 * 60_000,
+    });
+    const same = await acquireTraexRuntimeStart(adoptedDomain, {
+      occupantId: 'same', comboKey: 'content-a', workerPid: process.pid, daemonPid: process.pid,
+    });
+    expect(same.decision).toBe('start');
+    expect(readTraexRuntimeOccupants(adoptedDomain)?.map(o => o.occupantId)).toContain('adopted');
   });
 
   it('keeps a record whose process birth cannot be proven', async () => {

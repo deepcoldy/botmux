@@ -23,6 +23,7 @@ import type { ScheduledTask } from '../src/types.js';
 import * as scheduler from '../src/core/scheduler.js';
 import { ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
+import { queryScheduleRunLogs } from '../src/services/schedule-run-log-store.js';
 
 const APP = 'cli_deferred_test';
 
@@ -327,6 +328,42 @@ describe('deferred scheduled run lifecycle', () => {
     expect(settled.repeat?.completed).toBe(1);
   });
 
+  it('settles a stuck parked run exactly once across repeated replays', async () => {
+    const task = addTwoTargetTask();
+    const { callback } = makeDaemonCallback({ action: () => 'defer' });
+    scheduler.setExecuteCallback(callback);
+    scheduler.runNow(task.id);
+    await flush();
+    const runId = scheduler.getRuntimeTask(task.id, APP)!.lastRunId!;
+
+    // A restart after `dispatching` turns the target ambiguous; production used
+    // to throw on every retry, so it never settled and never alerted.
+    scheduler.parkDeferredRun(task.id, {
+      runId, trigger: 'scheduler', startedAt: new Date().toISOString(),
+    }, { runId, detail: 'ambiguous after restart', targets: { oc_a: 'dispatching', oc_b: 'waiting' } });
+    scheduler.recoverDeferredRunOnStartup(task.id, APP);
+    expect(scheduler.getRuntimeTask(task.id, APP)!.deferredRun?.targets.oc_a).toBe('ambiguous');
+
+    const alert = vi.fn();
+    scheduler.setScheduleFailureAlert(alert);
+    for (let round = 0; round < 60; round += 1) {
+      scheduler.settleParkedRunOnce(task.id, runId, 'ambiguous target cannot be replayed');
+    }
+    await flush();
+
+    expect(alert).toHaveBeenCalledTimes(1);
+    const errors = queryScheduleRunLogs(task.id, { limit: 10 }, APP).logs
+      .filter(entry => entry.outcome === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0].errorCode).toBe('deferred_unsettled');
+    const settled = scheduler.getRuntimeTask(task.id, APP)!;
+    expect(settled.deferredRun).toBeUndefined();
+    expect(settled.lastStatus).toBe('error');
+    expect(settled.repeat?.completed).toBe(1);
+    expect(settled.nextRunAt).toBeDefined();
+    expect(Date.parse(settled.nextRunAt!)).toBeGreaterThan(Date.now());
+  });
+
   it('does not let a stale run outcome clear a newer parked run', async () => {
     const task = addTwoTargetTask();
     const { callback } = makeDaemonCallback({ action: () => 'defer' });
@@ -341,7 +378,7 @@ describe('deferred scheduled run lifecycle', () => {
     // Simulate the daemon delivering a stale deferred result: recordDispatchOutcome
     // is private, so assert through the public invariant that parking is keyed by
     // lastRunId — a different runId cannot mutate the parked record.
-    expect(scheduler.markDeferredTargetDispatched(task.id, 'stale-run-id', 'oc_a', APP)).toBe(false);
+    expect(scheduler.markDeferredTargetHeld(task.id, 'stale-run-id', 'oc_a', 'turn', APP)).toBe(false);
     expect(scheduler.parkDeferredRun(task.id, {
       runId: 'stale-run-id', trigger: 'scheduler', startedAt: new Date().toISOString(),
     }, { runId: 'stale-run-id', detail: 'stale', targets: { oc_a: 'waiting' } })).toBe(false);

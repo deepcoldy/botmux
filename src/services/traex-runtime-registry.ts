@@ -37,6 +37,14 @@ export const TRAEX_RUNTIME_REGISTRY_VERSION = 1;
 /** A starting/running occupant renews this lease. It is only used where the
  *  process-birth source is unavailable; on Linux pid+starttime is authoritative. */
 export const TRAEX_RUNTIME_LEASE_MS = 60_000;
+/** A `starting` reservation whose worker died before attaching a CLI is only
+ *  dropped after this grace, and only when no process runs from its snapshot.
+ *  The grace covers a forked launcher that has not exec'd yet. */
+export const TRAEX_STARTING_ORPHAN_GRACE_MS = 10 * 60_000;
+/** An adopted/reattached runtime has no snapshot dir; its conservative proof is
+ *  the install release dir. It gets a longer grace because the install dir is
+ *  shared by unrelated processes. */
+export const TRAEX_OCCUPANCY_ORPHAN_GRACE_MS = 30 * 60_000;
 
 export type TraexOccupantPhase = 'starting' | 'running' | 'draining';
 
@@ -50,6 +58,9 @@ export interface TraexRuntimeOccupant {
    *  worker gate. Equal signatures merely avoid a pointless defer. */
   installSignature?: string;
   snapshotDir?: string;
+  /** Install release dir for an occupancy-only record (no snapshot). Used only
+   *  as the conservative "is any writer still running from here" scan path. */
+  traexPath?: string;
   phase: TraexOccupantPhase;
   workerPid: number;
   workerStart?: string;
@@ -83,10 +94,17 @@ export interface TraexStartRequest {
    *  Recorded at `starting` so a daemon crash before `markRunning` can still be
    *  reconciled by scanning for a live process under it. */
   snapshotDir?: string;
+  /** Release dir this occupancy-only runtime was observed at. */
+  traexPath?: string;
   workerPid: number;
   workerStart?: string;
   daemonPid: number;
   daemonStart?: string;
+  /** A target CLI pid already known at registration (adopt/reattach). Writing
+   *  it here instead of waiting for `markRunning` gives a later prune a real
+   *  process to judge. Only pass it when the pid is proven to be the CLI. */
+  cliPid?: number;
+  cliStart?: string;
   fixedPath?: boolean;
   /** Register occupancy without demanding compatibility. Used ONLY for runtimes
    *  that are already alive and were not started by this worker
@@ -166,6 +184,7 @@ function normalizeOccupant(value: unknown): TraexRuntimeOccupant | undefined {
     comboKey: typeof v.comboKey === 'string' ? v.comboKey : '',
     ...(typeof v.installSignature === 'string' ? { installSignature: v.installSignature } : {}),
     ...(typeof v.snapshotDir === 'string' ? { snapshotDir: v.snapshotDir } : {}),
+    ...(typeof v.traexPath === 'string' ? { traexPath: v.traexPath } : {}),
     phase,
     workerPid: v.workerPid,
     ...(typeof v.workerStart === 'string' ? { workerStart: v.workerStart } : {}),
@@ -249,36 +268,73 @@ export function occupantLiveness(occupant: TraexRuntimeOccupant, now = Date.now(
 }
 
 /**
- * Recover `starting` records whose worker died before attaching the CLI.
+ * Recover or boundedly release `starting` records whose worker died before
+ * attaching the CLI.
  *
  * A daemon crash in the spawn window leaves a reservation with no `cliPid`. If
  * a process is provably running the recorded snapshot, that process IS the
  * runtime this record reserved — adopt its birth identity so the normal
- * liveness path can release it once it exits. When nothing is found the record
- * stays: a forked launcher may not have exec'd yet, and "not visible now" is
- * not proof that no writer will appear.
+ * liveness path can release it once it exits. When the scan is DEFINITELY empty
+ * and the grace has passed, the reservation is released: the worker can no
+ * longer exec (it is dead) and nothing is writing from the recorded path. An
+ * unanswered scan (`undefined`, e.g. macOS) keeps the record; a forked launcher
+ * may still appear, so "cannot tell" is never "gone".
+ *
+ * Occupancy-only records have no snapshot; their conservative scan path is the
+ * install release dir and they get a longer grace because that dir is shared.
  */
 function reconcileStartingOrphans(occupants: TraexRuntimeOccupant[], now: number): {
   occupants: TraexRuntimeOccupant[];
   changed: boolean;
 } {
   let changed = false;
-  const next = occupants.map((occupant) => {
-    if (occupant.phase !== 'starting' || occupant.cliPid !== undefined || !occupant.snapshotDir) return occupant;
-    if (pidLiveness(occupant.workerPid, occupant.workerStart) !== 'dead') return occupant;
-    const writers = findProcessesRunningUnder(occupant.snapshotDir);
-    if (!writers || writers.length === 0) return occupant;
+  const next: TraexRuntimeOccupant[] = [];
+  for (const occupant of occupants) {
+    if (occupant.phase !== 'starting' || occupant.cliPid !== undefined) {
+      next.push(occupant);
+      continue;
+    }
+    if (pidLiveness(occupant.workerPid, occupant.workerStart) !== 'dead') {
+      next.push(occupant);
+      continue;
+    }
+    const scanPath = occupant.snapshotDir
+      ?? (occupant.occupancyOnly === true ? occupant.traexPath : undefined);
+    const grace = occupant.occupancyOnly === true
+      ? TRAEX_OCCUPANCY_ORPHAN_GRACE_MS
+      : TRAEX_STARTING_ORPHAN_GRACE_MS;
+    if (!scanPath || now - occupant.createdAt < grace) {
+      next.push(occupant);
+      continue;
+    }
+    const writers = findProcessesRunningUnder(scanPath);
+    if (writers === undefined) {
+      next.push(occupant);
+      continue;
+    }
+    if (writers.length === 0) {
+      // Worker dead + definite empty scan + grace elapsed: the bounded exit.
+      changed = true;
+      continue;
+    }
+    // A live writer under a private snapshot dir is this reservation's runtime.
+    // An occupancy-only record's shared install dir may name unrelated TRAE
+    // processes, so it is only used as a "do not clean" proof.
+    if (!occupant.snapshotDir) {
+      next.push(occupant);
+      continue;
+    }
     const cliPid = writers[0];
     const cliStart = readProcessStartIdentity(cliPid);
     changed = true;
-    return {
+    next.push({
       ...occupant,
       phase: 'running' as const,
       cliPid,
       ...(cliStart ? { cliStart } : {}),
       heartbeatAt: now,
-    };
-  });
+    });
+  }
   return { occupants: next, changed };
 }
 
@@ -370,10 +426,19 @@ export async function acquireTraexRuntimeStart(
       superseded.push(occupant.occupantId);
       return false;
     });
+    // Cheap identity inheritance: re-registering the SAME live CLI (daemon
+    // restart / reattach) must not reset its proven content to unknown just
+    // because the caller only knows the pid. A record for that exact process
+    // already names the bytes it runs.
+    const effectiveComboKey = request.comboKey === '' && request.cliPid !== undefined
+      ? (remaining.find((occupant) => occupant.cliPid === request.cliPid
+        && (occupant.cliStart ?? undefined) === (request.cliStart ?? undefined)
+        && occupant.comboKey.length > 0)?.comboKey ?? '')
+      : request.comboKey;
     // `force` registers occupancy without asserting content compatibility.
     // Used only for runtimes this worker did not start (adopt/reattach/...),
     // which must still make an incompatible start wait.
-    const blockers = request.force === true ? [] : blockersFor(remaining, request.comboKey);
+    const blockers = request.force === true ? [] : blockersFor(remaining, effectiveComboKey);
     if (blockers.length > 0) {
       if (pruned.pruned.length > 0 || superseded.length > 0 || reconciled.changed) {
         writeRegistry(domain, { version: TRAEX_RUNTIME_REGISTRY_VERSION, occupants: remaining });
@@ -383,14 +448,19 @@ export async function acquireTraexRuntimeStart(
     const bootId = readLinuxBootIdentity();
     const occupant: TraexRuntimeOccupant = {
       occupantId: request.occupantId,
-      comboKey: request.comboKey,
+      comboKey: effectiveComboKey,
       ...(request.installSignature ? { installSignature: request.installSignature } : {}),
       ...(request.snapshotDir ? { snapshotDir: request.snapshotDir } : {}),
-      phase: 'starting',
+      ...(request.traexPath ? { traexPath: request.traexPath } : {}),
+      // A known CLI at registration is already alive; recording it here (not
+      // only in a later markRunning) gives the prune a real process to judge.
+      phase: request.cliPid !== undefined ? 'running' : 'starting',
       workerPid: request.workerPid,
       ...(request.workerStart ? { workerStart: request.workerStart } : {}),
       daemonPid: request.daemonPid,
       ...(request.daemonStart ? { daemonStart: request.daemonStart } : {}),
+      ...(request.cliPid !== undefined ? { cliPid: request.cliPid } : {}),
+      ...(request.cliStart ? { cliStart: request.cliStart } : {}),
       ...(bootId ? { bootId } : {}),
       ...(request.fixedPath ? { fixedPath: true } : {}),
       ...(request.occupancyOnly ? { occupancyOnly: true } : {}),
@@ -427,11 +497,15 @@ export async function acquireTraexRuntimeStart(
  * Attach the real CLI birth identity after exec. A failed update is logged by
  * the caller but never releases the slot: the worker pid already occupies it,
  * and the gate fails closed rather than forget a live runtime.
+ *
+ * `comboKey` is a backfill for records registered without content proof
+ * (adopt/reattach/opaque launcher). It is only applied while the record still
+ * has no key: a proven identity is never replaced by a later observation.
  */
 export async function markTraexRuntimeRunning(
   domain: TraexRuntimeDomain,
   occupantId: string,
-  detail: { cliPid: number; cliStart?: string; snapshotDir?: string; now?: number },
+  detail: { cliPid: number; cliStart?: string; snapshotDir?: string; comboKey?: string; now?: number },
 ): Promise<boolean> {
   return mutateOccupant(domain, occupantId, (occupant, now) => ({
     ...occupant,
@@ -439,6 +513,7 @@ export async function markTraexRuntimeRunning(
     cliPid: detail.cliPid,
     ...(detail.cliStart ? { cliStart: detail.cliStart } : {}),
     ...(detail.snapshotDir ? { snapshotDir: detail.snapshotDir } : {}),
+    ...(detail.comboKey && occupant.comboKey === '' ? { comboKey: detail.comboKey } : {}),
     heartbeatAt: now,
     leaseUntil: now + TRAEX_RUNTIME_LEASE_MS,
   }));

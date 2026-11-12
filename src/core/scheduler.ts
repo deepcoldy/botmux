@@ -776,6 +776,80 @@ export function parkDeferredRun(
   return parked;
 }
 
+/** A parked run must not wait forever behind a runtime handoff. Past this bound
+ *  it settles as one failed run instead of silently never firing. */
+export const TRAEX_DEFERRED_RUN_TIMEOUT_MS = 30 * 60_000;
+
+/**
+ * Terminally settle a parked run that can no longer progress (ambiguous target,
+ * worker exit, or the handoff timeout).
+ *
+ * One exit for every stuck case: clear the parked identity so `markRuntimeRun`
+ * cannot re-park it, record the failed run once (failure accounting + at most
+ * one alert), write one run-log error, and publish one fired event. The next
+ * occurrence is already armed by the original claim; one-shots are disabled by
+ * `markRuntimeRun`. A second call for the same run is a no-op.
+ */
+export function settleParkedRunOnce(
+  id: string,
+  runId: string,
+  reason: string,
+  appId?: string,
+): boolean {
+  const before = runtimeTask(id, appId);
+  const deferred = before?.deferredRun;
+  if (!before || !deferred || deferred.runId !== runId) return false;
+  let cleared = false;
+  mutateRuntimeTask(id, task => {
+    if (task.deferredRun?.runId !== runId) return;
+    cleared = true;
+    return { ...task, deferredRun: undefined };
+  }, appId);
+  if (!cleared) return false;
+  const result = markRuntimeRun(id, false, reason, undefined, runId);
+  const settled = runtimeTask(id, appId);
+  if (!settled) return true;
+  if (result.crossedFailureThreshold) {
+    emitFailureAlertIfNeeded(settled, result);
+  } else if (failureAlert && settled.failureAlertSent !== true) {
+    // A stuck run is an operational fault on its own: alert once even before
+    // the normal consecutive-failure streak reaches its threshold. The same
+    // watermark keeps the alert single-shot for this streak.
+    try {
+      failureAlert(settled, result.consecutiveFailures ?? 1, reason);
+      mutateRuntimeTask(id, task => ({ ...task, failureAlertSent: true }), appId);
+    } catch (error) {
+      logger.warn(`[scheduler] Deferred-run failure alert failed for ${id}: ${String(error)}`);
+    }
+  }
+  const scope = settled.larkAppId ?? appId ?? scheduleStore.getScheduleScope();
+  if (scope) {
+    try {
+      appendScheduleRunLog({
+        id: runId,
+        taskId: id,
+        trigger: 'scheduler',
+        outcome: 'error',
+        precondition: deferred.precondition ?? 'not_checked',
+        startedAt: deferred.since,
+        finishedAt: new Date().toISOString(),
+        durationMs: Math.max(0, Date.now() - Date.parse(deferred.since)),
+        additionalPrompt: !!deferred.additionalPrompt,
+        errorCode: 'deferred_unsettled',
+        error: reason,
+      }, scope);
+    } catch (error) {
+      logger.warn(`[scheduler] Deferred run log unavailable for ${id}: ${String(error)}`);
+    }
+  }
+  dashboardEventBus.publish({
+    type: 'schedule.fired',
+    body: { id, runAt: Date.now(), status: 'error', error: reason },
+  });
+  emitScheduleFiredHook(settled, 'error', reason);
+  return true;
+}
+
 /** Persist `dispatching` immediately before the target's IPC send. A crash in
  *  this state becomes `ambiguous` on restart (never auto-replayed).
  *
@@ -832,19 +906,6 @@ export function markDeferredTargetDispatching(
     return false;
   }
   return changed;
-}
-
-/** Record that a target's input was accepted by a session. */
-export function markDeferredTargetDispatched(
-  id: string,
-  runId: string,
-  chatId: string,
-  appId?: string,
-): boolean {
-  return mutateDeferredTarget(id, runId, appId, deferred => {
-    if (deferred.targets[chatId] !== 'dispatching') return undefined;
-    return { ...deferred, targets: { ...deferred.targets, [chatId]: 'dispatched' } };
-  });
 }
 
 /**
@@ -957,20 +1018,6 @@ export function noteWorkerRuntimeAccepted(
   appId?: string,
 ): boolean {
   return markDeferredTargetAccepted(id, runId, chatId, turnId, appId);
-}
-
-/** A target that was not actually sent (precheck refused again) goes back to
- *  `waiting` so the next retry can still deliver it exactly once. */
-export function markDeferredTargetWaiting(
-  id: string,
-  runId: string,
-  chatId: string,
-  appId?: string,
-): boolean {
-  return mutateDeferredTarget(id, runId, appId, deferred => {
-    if (deferred.targets[chatId] !== 'dispatching') return undefined;
-    return { ...deferred, targets: { ...deferred.targets, [chatId]: 'waiting' } };
-  });
 }
 
 /** Restart recovery: a `dispatching` target may or may not have reached the
@@ -1550,6 +1597,18 @@ async function tick(): Promise<void> {
     // once. It reuses the stored runId so a retry cannot mint a second run.
     if (task.deferredRun) {
       const deferred = task.deferredRun;
+      // Single bounded exit: a handoff that never clears must not leave the
+      // occurrence parked forever with no settlement and no alert.
+      const since = Date.parse(deferred.since);
+      if (Number.isFinite(since) && now - since >= TRAEX_DEFERRED_RUN_TIMEOUT_MS) {
+        settleParkedRunOnce(
+          task.id,
+          deferred.runId,
+          `scheduled run stayed parked behind a TRAE runtime handoff for ${Math.round((now - since) / 60_000)} minutes`,
+          task.larkAppId,
+        );
+        continue;
+      }
       // A parked run only retries while the task is still allowed to run: a
       // person pausing it must not be overridden by the retry clock. The
       // manual authorization minted for the original claim keeps a

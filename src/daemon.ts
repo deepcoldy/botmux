@@ -34131,6 +34131,26 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     onWorkerExit(ds, context) {
       ds.messageListenerCompletedTurnId = undefined;
+      // A scheduled turn held behind the TRAE runtime handoff can never be
+      // accepted once its worker is gone. Settle that parked run now instead of
+      // waiting for the handoff timeout; the same single-exit helper is used by
+      // the ambiguous and timeout paths.
+      const scheduledRuns = [
+        ...(ds.session.scheduledRun ? [ds.session.scheduledRun] : []),
+        ...Object.values(ds.session.scheduledRuns ?? {}),
+      ];
+      for (const run of scheduledRuns) {
+        const parked = scheduler.getRuntimeTask(run.taskId, ds.larkAppId)?.deferredRun;
+        if (!parked || parked.runId !== run.runId) continue;
+        if (Object.values(parked.acceptedTargets ?? {}).includes(run.turnId)) continue;
+        if (!Object.values(parked.heldTargets ?? {}).includes(run.turnId)) continue;
+        scheduler.settleParkedRunOnce(
+          run.taskId,
+          run.runId,
+          'scheduled turn worker exited while the TRAE runtime handoff was still waiting',
+          ds.larkAppId,
+        );
+      }
       // A Node worker exit (including the SIGKILL backstop) proves this exact
       // generation can no longer write. Unlike onCliExit, this is safe for
       // persistent-pane backends and therefore owns crash-path release.
@@ -36097,10 +36117,18 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         for (const chatId of targetChatIds) {
           const state = parked?.targets[chatId];
           if (state === 'ambiguous') {
-            throw new Error(
+            // The turn may or may not have reached the worker before the
+            // restart; replaying it could double-send. Settle the run ONCE
+            // (single run-log error, single alert, next occurrence armed) and
+            // stop retrying — a per-tick throw here would never settle it.
+            scheduler.settleParkedRunOnce(
+              task.id,
+              executionContext.runId,
               `scheduled target ${chatId} may or may not have received the turn before a restart; `
               + 'refusing to replay it automatically',
+              effectiveAppId,
             );
+            return 'deferred';
           }
           const turnId = parked?.targetTurnIds?.[chatId] ?? `schedule:${task.id}:${randomUUID()}`;
           turnIds.set(chatId, turnId);

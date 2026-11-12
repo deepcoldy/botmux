@@ -439,7 +439,11 @@ import {
   type TraexRuntimeBlocker,
   type TraexRuntimeLease,
 } from './services/traex-runtime-gate.js';
-import { releaseDirForExecutable } from './services/traex-runtime-snapshot.js';
+import {
+  captureTraexExecutableIdentity,
+  readTraexSnapshotProvenance,
+  releaseDirForExecutable,
+} from './services/traex-runtime-snapshot.js';
 import { drainTraexRollout, traexResumeTargetLeftInDefaultHome, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, traexSessionIdFromRolloutPath, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
 import { bridgeCodexUserInput } from './services/codex-user-input.js';
 import { cocoEventsPathForSession, drainCocoEvents, findCocoSessionByPid } from './services/coco-transcript.js';
@@ -25720,6 +25724,28 @@ async function spawnCliBody(
   // backend child pid right after spawn and again whenever a launcher/sandbox
   // leaf resolves, so the registry names the process that really writes the
   // shared cache rather than a wrapper that may exit earlier.
+  const traexContentKeyInFlight = new Set<number>();
+  /**
+   * Content identity of the process actually running at `pid`.
+   *
+   * A record registered without proof (adopt/reattach/opaque launcher) can
+   * still be identified after the fact: `/proc/<pid>/exe` names the kernel's
+   * own object, a BotMux snapshot records its `comboKey` in the manifest, and
+   * otherwise the running executable (plus its release siblings) is hashed.
+   * Any failure stays unknown — the caller then keeps the fail-closed record.
+   */
+  const captureRunningContentKey = async (pid: number, cliStart?: string): Promise<string | undefined> => {
+    const running = readRunningExeIdentity(pid, cliStart);
+    if (!running) return undefined;
+    const provenance = readTraexSnapshotProvenance(running.path);
+    if (provenance) return provenance.manifest.comboKey;
+    try {
+      return (await captureTraexExecutableIdentity(running.path)).comboKey || undefined;
+    } catch (err) {
+      log(`[traex-runtime] could not capture content identity for pid ${pid}: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
+    }
+  };
   const attachTraexLeaseCli = (pid: number): void => {
     const lease = traexRuntimeLease;
     if (!lease) return;
@@ -25743,11 +25769,26 @@ async function spawnCliBody(
         );
       }
     }
-    void (proven
-      ? lease.markRunning(pid, cliStart ?? undefined)
-      : lease.markUnknown(pid, cliStart ?? undefined)).catch((err) => {
-      log(`[traex-runtime] failed to record CLI identity ${pid}: ${err instanceof Error ? err.message : String(err)}`);
-    });
+    // A record with no content identity (adopt/reattach/opaque launcher) is
+    // backfilled once the real TRAE process is known. This is what lets two
+    // same-version runtimes overlap instead of serialising the whole domain,
+    // and what stops a reconnected daemon from pinning the domain to unknown.
+    const backfill = proven && lease.snapshot.comboKey === '' && isTraexProcess(pid);
+    if (backfill && !traexContentKeyInFlight.has(pid)) {
+      traexContentKeyInFlight.add(pid);
+      void captureRunningContentKey(pid, cliStart ?? undefined)
+        .then(comboKey => lease.markRunning(pid, cliStart ?? undefined, comboKey))
+        .catch((err) => {
+          log(`[traex-runtime] failed to record CLI identity ${pid}: ${err instanceof Error ? err.message : String(err)}`);
+        })
+        .finally(() => traexContentKeyInFlight.delete(pid));
+    } else {
+      void (proven
+        ? lease.markRunning(pid, cliStart ?? undefined)
+        : lease.markUnknown(pid, cliStart ?? undefined)).catch((err) => {
+        log(`[traex-runtime] failed to record CLI identity ${pid}: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
     if (traexLeaseRunning) return;
     traexLeaseRunning = true;
     // From here the worker is not a "pre-exec" owner: an exit must release
@@ -25839,11 +25880,26 @@ async function spawnCliBody(
         if (spawnGeneration !== cliSpawnGeneration) return 'spawn-superseded';
         return undefined;
       };
+      // An already-alive runtime may already have a proven TRAE pid. Recording
+      // it at registration (instead of only after the first attach) gives the
+      // registry a real process to prune and lets it inherit a known content
+      // identity. A launcher pid is never used: only the TRAE leaf writes the
+      // shared cache.
+      const knownExistingPid = traexExistingRuntime
+        ? (cfg.adoptMode === true ? cfg.adoptCliPid : backend?.getChildPid?.() ?? undefined)
+        : undefined;
+      const knownExistingStart = knownExistingPid !== undefined && isTraexProcess(knownExistingPid)
+        ? readProcessStartIdentity(knownExistingPid)
+        : undefined;
+      const knownExisting = knownExistingPid !== undefined && isTraexProcess(knownExistingPid)
+        ? { cliPid: knownExistingPid, ...(knownExistingStart ? { cliStart: knownExistingStart } : {}) }
+        : undefined;
       const gate = traexExistingRuntime
         // Already alive: register as unknown beside an occupant, never authorize
         // a parallel start.
         ? await acquireTraexRuntimeOccupancy({
             ...common,
+            ...(knownExisting ?? {}),
             fixedPath,
             existingRuntime: true,
           })
