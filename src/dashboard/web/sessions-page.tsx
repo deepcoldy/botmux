@@ -1948,6 +1948,10 @@ function SessionsPage(): React.JSX.Element {
   useT();
   const storeRows = useStoreSelector(snapshot => [...snapshot.sessions.values()] as SessionRow[]);
   const bootstrapped = useStoreSelector(snapshot => snapshot.bootstrapped);
+  const sessionSnapshotVersion = useStoreSelector(snapshot => snapshot.sessionSnapshotVersion);
+  const closedCursor = useStoreSelector(snapshot => snapshot.closedCursor);
+  const closedTotal = useStoreSelector(snapshot => snapshot.closedTotal);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [revision, setRevision] = useState(0);
   const refresh = useCallback(() => setRevision(v => v + 1), []);
   const [filters, setFilters] = useState<FiltersState>(() => initialFilters('', readStoredSessionsShowUnknownChats(windowStorage())));
@@ -1969,6 +1973,19 @@ function SessionsPage(): React.JSX.Element {
   // `#/sessions?session=<id>`（⌘K 全局搜索等跨页入口）直接打开该会话的详情抽屉；
   // 会话还没进 store 时抽屉先不出，快照到了 rowsById 命中后自然弹出。
   const [drawerSessionId, setDrawerSessionId] = useState<string | null>(() => hashQueryParam('session'));
+  useEffect(() => {
+    if (bootstrapped && drawerSessionId) {
+      void store.ensureSession(drawerSessionId).catch(() => toast(t('sessions.historyLoadError')));
+    }
+  }, [bootstrapped, drawerSessionId, sessionSnapshotVersion]);
+
+  /** Load another history page without changing the active-session snapshot. */
+  const loadMoreHistory = async (): Promise<void> => {
+    setHistoryLoading(true);
+    try { await store.loadMoreClosedSessions(); }
+    catch { toast(t('sessions.historyLoadError')); }
+    finally { setHistoryLoading(false); }
+  };
   const [historyState, setHistoryState] = useState<HistoryState | null>(null);
   const [termState, setTermState] = useState<TerminalState | null>(null);
   const [kanbanHost, setKanbanHost] = useState<HTMLElement | null>(null);
@@ -2729,6 +2746,14 @@ function SessionsPage(): React.JSX.Element {
           onRun: runIdleCleanup,
         }}
       />
+      {bootstrapped && closedCursor !== null ? (
+        <div className="sessions-history-pagination" role="status">
+          <span>{t('sessions.historyPartial', { count: closedTotal })}</span>{' '}
+          <button type="button" disabled={historyLoading} onClick={() => void loadMoreHistory()}>
+            {t(historyLoading ? 'sessions.historyLoading' : 'sessions.historyLoadMore')}
+          </button>
+        </div>
+      ) : null}
       <BulkBar
         selectedCount={selected.size}
         lockDisabled={!selectedRows.some(row => !row.locked)}
