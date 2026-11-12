@@ -48,7 +48,7 @@ async function send(
   args: string[],
   stdin: StdinInput,
   extraEnv: Record<string, string> = {},
-  opts: { session?: boolean } = {},
+  opts: { session?: boolean; sessionRow?: Record<string, unknown> } = {},
 ): Promise<SendResult> {
   const root = mkdtempSync(join(tmpdir(), 'cli-send-attachment-stdin-'));
   let stdinFd: number | undefined;
@@ -64,6 +64,7 @@ async function send(
     seedPersistedSessionRows(data, 'cli_test', { sid: {
       sessionId: 'sid', status: 'active', cliId: 'codex', larkAppId: 'cli_test', chatId: 'oc_test',
       rootMessageId: 'om_root', scope: 'thread', chatType: 'group', workingDir: root,
+      ...opts.sessionRow,
     } });
     const resolved = args.map(arg => {
       if (!arg.startsWith('@')) return arg;
@@ -167,6 +168,7 @@ describe('需要正文卡片的附件组合没有正文时立即拒绝，不发�
   // missing body (exit 2) rather than failing to infer a session (exit 1).
   it.each([
     ['多个文件、不 @', [...NO_MENTION, '--files', '@a.json', '--files', '@b.json']],
+    ['单个文件 + @', [...MENTION, '--files', '@a.json']],
     ['单个文件 + --mention-back', ['--mention-back', '--files', '@a.json']],
   ])('在解析会话之前就拒绝：%s', async (_name, args) => {
     const result = await send(args, { kind: 'open' }, {}, { session: false });
@@ -190,6 +192,29 @@ describe('其它正文来源为空时同样不发空卡片', () => {
     const result = await send([...NO_MENTION, '--content-file', '@empty.md', '--files', '@a.json'], { kind: 'dev-null' });
     expect(result.status, result.stderr).toBe(0);
     expect(msgTypes(result)).toEqual(['file']);
+  }, 60_000);
+
+  it('空 --content-file + 单个文件 + --mention-back：拒绝，不发只有页脚的卡片', async () => {
+    // A resolvable reply target, so only the missing body can stop this send.
+    const result = await send(['--mention-back', '--content-file', '@empty.md', '--files', '@a.json'], { kind: 'dev-null' }, {}, {
+      sessionRow: {
+        replyTargets: { om_turn: { updatedAt: new Date().toISOString(), senderOpenId: 'ou_requester',
+          participants: [{ openId: 'ou_requester', isBot: false }] } },
+        turnReplyContexts: { om_turn: { target: { mode: 'thread', rootMessageId: 'om_root' },
+          replyTargetSenderOpenId: 'ou_requester', replyTargetSenderIsBot: false } },
+      },
+    });
+    expect(result.status, result.stderr).toBe(2);
+    expect(result.writes).toEqual([]);
+  }, 60_000);
+});
+
+describe('正文由参数合成时不要求正文', () => {
+  it('--as 带多个附件、没有正文：照常发出正文卡片和附件', async () => {
+    const result = await send(['--as', 'independent', ...NO_MENTION, '--files', '@a.json', '--files', '@b.json'],
+      { kind: 'dev-null' });
+    expect(result.status, result.stderr).toBe(0);
+    expect(msgTypes(result)).toEqual(['interactive', 'file', 'file']);
   }, 60_000);
 });
 
