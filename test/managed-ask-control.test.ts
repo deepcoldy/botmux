@@ -24,7 +24,8 @@ describe('managed explicit Ask retirement control', () => {
     let generation = 3;
     let terminal = false;
     const receipt = (): ExplicitAskReceipt => ({
-      version: 1, input: { ...request, timeoutMs: 0, originKind: 'host_explicit', questions: [] },
+      version: 1, input: { ...request, timeoutMs: 0, originKind: 'host_explicit',
+        questions: [{ prompt: 'original decision', options: [{ key: 'fix', label: 'fix' }, { key: 'waive', label: 'waive' }], multiSelect: false }] },
       origin: request.origin,
       ...(retired ? { retirement: { operationId: 'operation', reason: 'business ended', requestedAt: 1 },
         result: { kind: 'invalidated', reason: 'business ended', timedOut: false, selected: null, by: null, comment: null } } : {}),
@@ -39,7 +40,7 @@ describe('managed explicit Ask retirement control', () => {
         suspensionConfirmed: !alive, terminatedTurnIds: terminal ? ['turn'] : [] }),
       suspend: async () => { alive = false; return true; },
     });
-    await expect(controller.retire(request)).resolves.toMatchObject({ status: 'draining' });
+    await expect(controller.retire(request)).resolves.toMatchObject({ status: 'draining', questions: receipt().input.questions });
     expect(retired).toBe(true);
     generation = 4;
     await expect(controller.release(request)).resolves.toMatchObject({ status: 'conflict' });

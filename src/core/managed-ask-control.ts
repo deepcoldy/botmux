@@ -58,12 +58,12 @@ export function createManagedAskControl(deps: {
   }
   function result(request: ExplicitAskControl, receipt: ExplicitAskReceipt, status: string) {
     const card = deps.snapshot(receipt) ?? receipt.card;
-    return { status, sessionId: request.sessionId, requestId: request.requestId,
+    return { status, sessionId: request.sessionId, requestId: request.requestId, questions: receipt.input.questions,
+      answererOpenId: receipt.input.answererOpenId,
       ...(receipt.result ? { result: receipt.result } : {}),
       ...(receipt.retirement ? { operationId: receipt.retirement.operationId } : {}),
       ...(receipt.origin ? { origin: receipt.origin } : {}),
-      ...(card ? { askId: card.askId, cardMessageId: card.cardMessageId, cardDeliveredAt: card.cardDeliveredAt,
-        answererOpenId: receipt.input.answererOpenId } : {}) };
+      ...(card ? { askId: card.askId, cardMessageId: card.cardMessageId, cardDeliveredAt: card.cardDeliveredAt } : {}) };
   }
   function inspect(request: ExplicitAskControl) {
     const receipt = validate(request);
