@@ -215,6 +215,45 @@ describe('turn.finished worker wiring', () => {
     expect(hookBody).toContain('ou_sender');
   });
 
+  it('propagates continuation terminal persistence failures before acknowledging settlement', async () => {
+    const daemonSession = makeDs('sid-continuation-wire');
+    let unavailable = true;
+    const persist = vi.fn(async () => {
+      if (unavailable) throw new Error('continuation_store_down');
+    });
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => dataDir,
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+      onTurnTerminal: persist,
+    });
+    __testOnly_setupWorkerHandlers(daemonSession, daemonSession.worker as never);
+    off = dashboardEventBus.subscribe(event => {
+      if (event.type === 'turn.finished' && (event.body as { sessionId?: string }).sessionId === 'sid-continuation-wire') {
+        finished.push(event.body as Record<string, unknown>);
+      }
+    });
+    const terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }> = {
+      type: 'turn_terminal', sessionId: daemonSession.session.sessionId, turnId: 'om_continuation_wire',
+      status: 'failed', errorCode: 'traex_auto_model_continuation_timeout',
+      continuationFailure: {
+        bindingId: 'replacement',
+        continuation: {
+          reason: 'traex-auto-model', execution: { executionId: 'original', turnId: 'om_continuation_wire' },
+          from: { runtimeId: 'source', epoch: 1 }, nativeSessionId: 'native',
+        },
+      },
+    };
+    await expect(deliver(daemonSession, terminal)).rejects.toThrow('continuation_store_down');
+    expect(finished).toEqual([]);
+    unavailable = false;
+    await deliver(daemonSession, terminal);
+    expect(persist).toHaveBeenCalledTimes(2);
+    expect(finished).toEqual([expect.objectContaining({ turnId: terminal.turnId, terminalStatus: 'failed' })]);
+    expect(await readMarker(terminal.turnId)).not.toBe('');
+  });
+
   it('uses the Codex App ledger sender frozen at acceptance, and skips the notice when that persist throws', async () => {
     const ds = makeDs('sid-codex');
     ds.session.cliId = 'codex-app';

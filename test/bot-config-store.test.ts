@@ -876,6 +876,26 @@ describe('bot-config store', () => {
     expect(registry.getBot('app_default').config.model).toBeUndefined();
   });
 
+  it('archiveCodex preserves both overrides across reload and unset restores inheritance', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('archiveCodex')!;
+    expect(spec.effect).toBe('immediate');
+    for (const enabled of [true, false]) {
+      expect((await store.applyConfigField('app_default', spec, enabled)).ok).toBe(true);
+      expect(readConfig().archiveCodex).toBe(enabled);
+      expect(registry.getBot('app_default').config.archiveCodex).toBe(enabled);
+      const [reloaded] = registry.parseBotConfigsFromText(readFileSync(configPath, 'utf8'));
+      expect(reloaded.archiveCodex).toBe(enabled);
+    }
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('archiveCodex');
+    expect(registry.getBot('app_default').config.archiveCodex).toBeUndefined();
+    const snapshot = store.getConfigSnapshot('app_default');
+    expect(snapshot.ok && snapshot.rows.find(field => field.key === 'archiveCodex')?.value).toBe('inherit');
+    const [invalid] = registry.parseBotConfigsFromText(JSON.stringify([{ ...readConfig(), archiveCodex: 'false' }]));
+    expect(invalid.archiveCodex).toBeUndefined();
+  });
+
   it('displayName round-trips, fires the refresher hook, and clears on null', async () => {
     const { registry, store } = await loaded();
     const spec = store.findConfigField('displayName')!;

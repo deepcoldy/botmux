@@ -6,7 +6,7 @@ import { sessionContractStore, type SessionContractStore } from '../services/ses
 import {
   contractReadiness, sameWorker, sameRuntime, sameExecution, type ContractSessionRef, type WorkerRef, type RuntimeRef,
   type RuntimeIdentity, type SessionEventContext, type ContractEvent, type ExecutionRef, type ControlKind,
-  type ControlOperation, type RuntimeContract, type RuntimeExecutionContinuation,
+  type ControlOperation, type RuntimeContract, type RuntimeExecutionContinuation, type RuntimeExecutionContinuationFailure,
   TRAEX_CONTINUATION_BACKENDS,
   sessionContractsEnabled,
   contractTerminalStatus,
@@ -33,6 +33,8 @@ export class SessionController {
   private primaryRevision = 0;
   private primaryQueue = Promise.resolve();
   private readonly abortedBindings = new Set<string>();
+  private readonly continuationFailureEffects = new Map<string, Promise<void>>();
+  private readonly appliedContinuationFailureEffects = new Set<string>();
   constructor(readonly ds: DaemonSession, store?: SessionContractStore) {
     this.ref = { appId: ds.larkAppId, sessionId: ds.session.sessionId };
     this.store = store ?? sessionContractStore(config.session.dataDir, ds.larkAppId);
@@ -55,7 +57,7 @@ export class SessionController {
   flushPrimary(): Promise<void> {
     if (!sessionContractPrimary(this.ref.appId)) return Promise.resolve();
     const snapshot = this.store.snapshot(this.ref);
-    const pending = this.primaryQueue.then(async () => {
+    const pending = this.primaryQueue.catch(() => {}).then(async () => {
       if (snapshot.session.revision <= this.primaryRevision) return;
       await commitPrimarySessionContract(this.ds.session, snapshot, this.primaryRevision);
       this.primaryRevision = snapshot.session.revision;
@@ -63,10 +65,30 @@ export class SessionController {
     });
     this.primaryQueue = pending; return pending;
   }
+  async deliverContinuationFailure(execution: ExecutionRef, errorCode: string, deliver: () => Promise<void>): Promise<void> {
+    const key = execution.executionId;
+    const existing = this.continuationFailureEffects.get(key);
+    if (existing) return existing;
+    const pending = (async () => {
+      if (!this.store.continuationFailureDelivered(this.ref, execution, errorCode)) {
+        if (!this.appliedContinuationFailureEffects.has(key)) {
+          await deliver();
+          this.appliedContinuationFailureEffects.add(key);
+        }
+        this.store.confirmContinuationFailureDelivery(this.ref, execution, errorCode);
+        this.refresh();
+      }
+      await this.flushPrimary();
+      this.appliedContinuationFailureEffects.delete(key);
+    })();
+    this.continuationFailureEffects.set(key, pending);
+    try { await pending; }
+    finally { if (this.continuationFailureEffects.get(key) === pending) this.continuationFailureEffects.delete(key); }
+  }
   bindWorker(generation: number): SessionContractBootstrap {
     const previous = this.store.read(this.ref)?.worker;
     const worker = previous?.generation === generation ? previous : { workerId: randomUUID(), generation };
-    this.store.bindWorker(this.ref, worker); this.refresh(); return { version: 2, session: this.ref, worker, executionContinuations: true,
+    this.store.bindWorker(this.ref, worker); this.refresh(); return { version: 2, session: this.ref, worker, executionContinuations: true, executionContinuationFailures: true,
       executions: this.store.executions(this.ref).map(({ ref, runtime, phase }) => ({ ref, runtime, phase })) };
   }
   private executionContinuationSupported(): boolean {
@@ -331,6 +353,19 @@ export class SessionController {
       && !sameRuntime(this.store.execution(this.ref, context.scope.execution.executionId)?.runtime, context.scope.runtime)) {
       delete context.scope.execution;
     }
+    const continuationFailure = message.continuationFailure as RuntimeExecutionContinuationFailure | undefined;
+    if (continuationFailure !== undefined) {
+      if (message.type !== 'turn_terminal' || message.status !== 'failed' || this.ds.initConfig?.cliId !== 'traex'
+        || !['traex_auto_model_continuation_rejected', 'traex_auto_model_continuation_timeout'].includes(String(message.errorCode))
+        || !context.scope.runtime || !sameExecution(context.scope.execution, continuationFailure?.continuation?.execution)) {
+        return { kind: 'reject', reason: 'execution_continuation_failure_unproven' };
+      }
+      const runtime = this.store.executionContinuationFailureRuntime(this.ref, channel, continuationFailure,
+        context.scope.runtime, String(message.errorCode));
+      if (!runtime) return { kind: 'reject', reason: 'execution_continuation_failure_unproven' };
+      context.scope.runtime = runtime;
+      delete context.bindingId;
+    }
     const uncertainTerminal = message.type === 'turn_terminal' && contractTerminalStatus(message.status, message.errorCode) === 'reconciling';
     if (['turn_terminal', 'final_output', 'turn_execution_started', 'native_input_consumed'].includes(message.type) && !context.scope.execution) return { kind: 'reject', reason: 'execution_scope_missing' };
     const admission = this.gateway.admit(message.type, context, channel, recoveredOrigin);
@@ -353,7 +388,7 @@ export class SessionController {
       const code = typeof message.errorCode === 'string' ? message.errorCode : undefined;
       event = { type: 'execution_terminal', runtime, execution,
         status: contractTerminalStatus(message.status, code),
-        evidence: code === 'preempted_by_user_message' ? 'caller_interrupt_boundary' : uncertainTerminal ? 'observer_loss' : 'native_terminal', ...(code ? { errorCode: code } : {}) };
+        evidence: continuationFailure ? 'continuation_abandoned' : code === 'preempted_by_user_message' ? 'caller_interrupt_boundary' : uncertainTerminal ? 'observer_loss' : 'native_terminal', ...(code ? { errorCode: code } : {}) };
     }
     if (message.type === 'final_output' && execution) event = { type: 'execution_output', execution, output: { availability: message.content ? 'available' : 'empty', ...(typeof message.content === 'string' ? { content: message.content } : {}), completeness: message.turnFailed ? 'partial' : 'final' } };
     if (message.type === 'restart_result' && typeof message.attemptId === 'string') event = { type: 'control_result', operationId: message.attemptId, phase: message.status === 'succeeded' ? 'confirmed' : message.untouched ? 'failed_before_effect' : message.status === 'failed' ? 'rejected' : 'uncertain', ...(runtime ? { runtime } : {}), ...(message.status === 'failed' && typeof message.category === 'string' ? { error: message.category } : {}) };
@@ -364,8 +399,14 @@ export class SessionController {
       event = { type: 'control_result', operationId: operation.operationId, phase: message.delivered ? 'confirmed' : message.reason === 'delivery_failed' ? 'uncertain' : 'rejected' };
     }
     if (event) {
-      const result = this.store.apply(this.ref, event, context.eventId); this.refresh();
+      const result = this.store.apply(this.ref, event, context.eventId);
       if (result.decision === 'conflict' || result.decision === 'stale') return { kind: 'reject', reason: result.reason ?? `contract_${result.decision}` };
+      if (continuationFailure) this.store.rejectExecutionContinuation(this.ref, continuationFailure.bindingId);
+      if (this.ds.initConfig?.cliId === 'traex' && event.type === 'execution_phase' && event.execution.dispatchAttempt === undefined
+        && (event.phase === 'submitting' || event.phase === 'accepted')) {
+        this.store.consumeExecutionContinuation(this.ref, channel, event.execution, event.runtime);
+      }
+      this.refresh();
     }
     if (message.type === 'claude_exit' && runtime) {
       let currentPhysicalExit = false;

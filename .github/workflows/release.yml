@@ -153,9 +153,9 @@ jobs:
   # passed". The guards themselves are unchanged (same conditions, same
   # fail-closed behavior); only their location moved.
   #
-  # Side benefit for the ancestry guard: it now fetches origin/master sooner
-  # after the tag push than before, which shrinks (does not remove) its
-  # documented "master moved between tag creation and this fetch" race window.
+  # The ancestry guard no longer refuses a tag just because master moved after
+  # it was pushed: a tag on an older master commit is admitted as long as it
+  # contains the published baseline (see the guard's comment below).
   preflight:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -164,15 +164,19 @@ jobs:
     outputs:
       tag: ${{ steps.dist_tag.outputs.tag }}
       prerelease: ${{ steps.dist_tag.outputs.prerelease }}
-      # The origin/master SHA the ancestry guard below actually validated against.
-      # `release` re-checks against THIS value rather than re-fetching, so a commit
-      # landing on master mid-run cannot flip the verdict after the platform
-      # subpackages are already on npm (issue #1150).
+      # The facts the ancestry guard below actually admitted this release on: the
+      # origin/master SHA it read, which rule admitted it, and (for the
+      # published-baseline rule) the baseline commits it required. `release`
+      # re-checks THESE values rather than re-reading master / npm / tags, so a
+      # commit landing on master or a dist-tag moving mid-run cannot flip the
+      # verdict after the platform subpackages are already on npm (issue #1150).
       master_sha: ${{ steps.master_ancestry.outputs.master_sha }}
+      ancestry_mode: ${{ steps.master_ancestry.outputs.ancestry_mode }}
+      baseline_shas: ${{ steps.master_ancestry.outputs.baseline_shas }}
     steps:
       - uses: actions/checkout@v6
-        # fetch-depth: 0 —— 「stable 必须包含最新 master」那道闸要跑
-        # `git merge-base --is-ancestor origin/master HEAD`,浅克隆拿不到共同祖先。
+        # fetch-depth: 0 —— 正式版发版闸要在 master、被打 tag 的 commit 和已发布版本的 tag 之间
+        # 跑 `git merge-base --is-ancestor`，浅克隆拿不到共同祖先。
         with:
           fetch-depth: 0
 
@@ -238,38 +242,65 @@ jobs:
             exit 1
           fi
 
-      - name: Guard — stable release must contain the latest master
-        # 正式版（latest）只能从「包含最新 master 的 commit」上发：被打 tag 的 commit
-        # 必须把 origin/master 当作祖先——即直接在 master 上打 tag，或在已 rebase 到最新
-        # master 的子分支上打 tag。否则拒绝，防止从落后/分叉的个人分支打出正式版（曾发生
-        # v2.47.0 从落后 master 175 个 commit 的分支发到 latest，丢了一大批 master 改动）。
+      - name: Guard — stable release must come from master
+        # 正式版（latest）只能从 master 发（判定在 .github/scripts/release-master-guard.mjs，
+        # 行为测试在 test/release-ancestry-pin.test.ts）。
+        #
+        # 先决条件：release tag 是规范的 vX.Y.Z，且 origin 上没有版本号更高的正式版 tag——正式版
+        # 必须按版本号递增的顺序打 tag。这条以前只有本地 pre-push hook 在查（可以不启用、
+        # --no-verify 可绕、网页建 tag 不经过）。先打高版本、后打低版本时，低版本的改动不一定在
+        # 高版本里：两个都批准后 latest 最终是缺了低版本改动的高版本；用 npm-dist-tag.yml 回滚后
+        # 在旧提交上打一个比已发布版本低的号，也会让 latest 缺已发布的改动。
+        #
+        # 放行条件二选一：
+        #   ① 被打 tag 的 commit 包含 origin/master——直接在 master tip 上打 tag，或在已 rebase
+        #      到最新 master 的子分支上打 tag。这是原来的规则。
+        #   ② 被打 tag 的 commit 在 origin/master 的 first-parent 链上（tip、tip~1、tip~2……，
+        #      可以不是 tip；用 merge commit 合进来的分支内部提交不算），并且包含「已发布基线」：
+        #      npm latest 版本对应 tag 的 commit，加上版本号介于 npm latest 与本版之间的每个正式版
+        #      tag 的 commit。
+        # 拿不到基线（npm view 失败、latest 不是规范的 X.Y.Z、对应 tag 不存在）时只剩 ①，
+        # fail-closed。判定只看 commit 图、tag 和已发布版本，不看墙钟时间。
         # canary/beta/rc/next 走旁路 dist-tag、用于分支灰度，不受此约束。
         #
-        # 为什么保持 fail-closed、不放宽（codex review 结论）：commit graph 无法区分两种
-        # 形状完全相同的场景——「打完 tag 后 master 才前进」（无害竞态）与「B 已在 master 上
-        # 之后再把 tag 指向历史 A」（真丢改动）。二者的 tag/master/ancestry/版本号全一致，只有
-        # 「tag 创建 vs B 落 master」的墙钟先后能区分，而这不可信地存在于 graph 里。因此在没有
-        # 「tag 创建时 master tip」的可信证明前，放宽这道闸必然引入「把旧 commit 发成 latest」
-        # 的洞。竞态的正确解法是「fetch 最新 master 后在新 HEAD 上重打 tag」（下面的 Fix 提示），
-        # 而 #593 那次真正漏的是 changelog（changelog 已锚到「上一个已发布 Release」，
-        # 使失败/无 Release 的 tag 不再截断下一版 changelog）——发版闸本身当时拒得没错。
-        # 注意竞态：若打完 tag 后、本 job fetch 前 master 又前进了，这里会判定 tag 落后而
-        # fail（fail-closed，安全方向）——重新 fetch master 后在新 HEAD 上重打 tag 即可。
+        # 为什么从「必须包含最新 master」放宽到 ②：旧规则下打完 tag 后 master 只要再进一个
+        # 提交，正式版就被拒（v3.59.2 因此被拒两次，发版期间只能按住所有合码）。当时不放宽
+        # 的理由是：「打完 tag 后 master 才前进」和「B 已在 master 上之后再把 tag 指向历史 A」
+        # 在 commit 图上分不开。② 不再需要分开它们：两种情况里没进这一版的都只是还没发布
+        # 过的 B，B 进下一版（changelog 锚在「上一个已发布 Release」，下一版会把 B 带上；
+        # 本次运行的 summary 会列出没进这一版的 master 提交）。真正要挡的是正式版比用户已经
+        # 拿到或即将拿到的版本少东西：② 靠「必须包含已发布基线」保证，① 靠「包含 master tip」
+        # 保证（tip 包含了所有从 master 发出去的版本），两者都与墙钟先后无关。例外和以前一样：
+        # ① 允许的子分支上那些只在发版分支上的提交，不合回 master 就不会进下一版。
+        # ② 只认 first-parent 链，是因为祖先关系太松：用 merge commit 合进来的分支内部提交（包括
+        # 一个误打在个人分支上、被拒过的 tag，分支合入后再 Re-run）也是 master 的祖先。first-parent
+        # 链也不完全等于「master 停留过的状态」：Rebase and merge 一次重放多个提交时，中间提交也在
+        # 链上；把带 merge 的本地 master 直接推上去时，分支自己的提交会进入链、之前的 tip 反而离开链。
+        # 前一类仍然必须包含已发布基线，不会发出比已发布版本少东西的版本，只是可能发出一个 CI 没
+        # 单独跑过的中间状态（① 允许的子分支也是同样的量级）；后一类走不了 ②，fail-closed，在当前 tip
+        # 上重打即可。
+        #
+        # 恢复失败的正式版只用「Re-run failed jobs」：已经成功的 job 保留原来的输出，release 继续按原来
+        # 固定的值复核。「Re-run all jobs」会重跑 preflight、重新判定（此时若已有更高的正式版 tag 就会被拒），
+        # 还会重编、重发子包，有烧掉版本号的风险。
+        #
+        # 怎么挡住真正出过的事故：v2.47.0 从落后 master 的分支发到 latest，丢了一大批
+        # master 改动。它的 tag commit 不在 master 上，也不包含当时的 npm latest v2.46.1（GitHub
+        # compare：diverged，v2.46.1 领先 174 个提交）——①② 都不成立，照样拒绝。
+        #
+        # 基线为什么要算上 npm latest 与本版之间的正式版 tag：正式版发包前要等 Developer ID 签名
+        # 的人工审批，可能几个小时，这期间 npm latest 还是上一版。若只看 npm latest，在更旧的
+        # master 提交上打的下一个正式版也能过，两次都批准后版本号更大的那个反而缺前一版的
+        # 改动。版本号高于本版的 tag 已被先决条件拒掉，所以基线覆盖了所有已发布和在途的正式版。
+        # 版本号不倒退由上一步「Guard against downgrading npm latest」负责，这里管的是内容不倒退。
+        #
+        # 判定用到的事实（master SHA、放行方式、基线 commit）固定成 step 输出，release job 只按
+        # 这些固定值复核，见那边的 TOCTOU 说明（issue #1150）。
         id: master_ancestry
         if: steps.dist_tag.outputs.tag == 'latest'
-        run: |
-          git fetch origin master --quiet
-          if ! git merge-base --is-ancestor origin/master HEAD; then
-            echo "REFUSING: tagged commit $(git rev-parse --short HEAD) does not contain the latest origin/master ($(git rev-parse --short origin/master))."
-            echo "Stable (latest) releases must be tagged on master, or on a branch rebased onto the latest master."
-            echo "Fix: rebase/merge onto origin/master then re-tag — or use a -canary/-beta/-rc suffix to publish off-master for testing."
-            exit 1
-          fi
-          echo "OK: tagged commit contains origin/master ($(git rev-parse --short origin/master))."
-          # PIN the exact master this verdict was computed against, so `release`
-          # can re-check the SAME fact instead of re-reading a moving ref. See the
-          # TOCTOU note on the release-side guard below.
-          echo "master_sha=$(git rev-parse origin/master)" >> "$GITHUB_OUTPUT"
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node .github/scripts/release-master-guard.mjs admit
 
   # ── MAIN PACKAGE PUBLISH — DELIBERATELY LAST ─────────────────────────────────
   # Publishes `botmux-workflow-core` + the main `botmux` package, then creates
@@ -405,23 +436,10 @@ jobs:
             exit 1
           fi
 
-      - name: Guard — stable release must contain the latest master
-        # 正式版（latest）只能从「包含最新 master 的 commit」上发：被打 tag 的 commit
-        # 必须把 origin/master 当作祖先——即直接在 master 上打 tag，或在已 rebase 到最新
-        # master 的子分支上打 tag。否则拒绝，防止从落后/分叉的个人分支打出正式版（曾发生
-        # v2.47.0 从落后 master 175 个 commit 的分支发到 latest，丢了一大批 master 改动）。
+      - name: Guard — stable release must come from master
+        # 复核 preflight 的「Guard — stable release must come from master」放行时用到的同一组事实。
+        # 规则、为什么放宽、怎么挡住 v2.47.0 那类事故，都写在 preflight 那一步的注释里。
         # canary/beta/rc/next 走旁路 dist-tag、用于分支灰度，不受此约束。
-        #
-        # 为什么保持 fail-closed、不放宽（codex review 结论）：commit graph 无法区分两种
-        # 形状完全相同的场景——「打完 tag 后 master 才前进」（无害竞态）与「B 已在 master 上
-        # 之后再把 tag 指向历史 A」（真丢改动）。二者的 tag/master/ancestry/版本号全一致，只有
-        # 「tag 创建 vs B 落 master」的墙钟先后能区分，而这不可信地存在于 graph 里。因此在没有
-        # 「tag 创建时 master tip」的可信证明前，放宽这道闸必然引入「把旧 commit 发成 latest」
-        # 的洞。竞态的正确解法是「fetch 最新 master 后在新 HEAD 上重打 tag」（下面的 Fix 提示），
-        # 而 #593 那次真正漏的是 changelog（下一步已把 changelog 锚到「上一个已发布 Release」，
-        # 使失败/无 Release 的 tag 不再截断下一版 changelog）——发版闸本身当时拒得没错。
-        # 注意竞态：若打完 tag 后、本 job fetch 前 master 又前进了，这里会判定 tag 落后而
-        # fail（fail-closed，安全方向）——重新 fetch master 后在新 HEAD 上重打 tag 即可。
         if: steps.dist_tag.outputs.tag == 'latest'
         env:
           # ⚠️ TOCTOU (issue #1150): re-reading `origin/master` HERE is what burned
@@ -441,28 +459,19 @@ jobs:
           # hash differently and publish-npm-if-missing.mjs correctly refuses to
           # overwrite a published version with different content. 3.18.10 was burned.
           #
-          # So this job re-checks the SHA preflight PINNED, not whatever master is now.
-          # The guard keeps its meaning — the tag must contain the master that was
-          # current when this release was ADMITTED — while the verdict stays immutable
-          # for the rest of the run. A commit landing mid-release belongs to the next
-          # release, not to a burned version number.
+          # So this job re-checks the facts preflight PINNED — which rule admitted the
+          # release, the master SHA it read, and the baseline commits it required —
+          # never whatever master, npm `latest` or the tags say now. The published
+          # baseline is just as mobile as master: the subpackages published moments
+          # ago, or a concurrent release, can move npm `latest`. The guard keeps its
+          # meaning — the tag must satisfy what was true when this release was
+          # ADMITTED — while the verdict stays immutable for the rest of the run. A
+          # commit landing mid-release belongs to the next release, not to a burned
+          # version number.
+          PINNED_MODE: ${{ needs.preflight.outputs.ancestry_mode }}
           PINNED_MASTER: ${{ needs.preflight.outputs.master_sha }}
-        run: |
-          if [ -z "$PINNED_MASTER" ]; then
-            echo "REFUSING: preflight pinned no master SHA, so this job cannot re-check the"
-            echo "same fact preflight admitted. Failing closed rather than re-reading a ref"
-            echo "that may have moved since (issue #1150)."
-            exit 1
-          fi
-          # Fetch by SHA — the pinned commit is not necessarily master's tip any more.
-          git fetch origin "$PINNED_MASTER" --quiet
-          if ! git merge-base --is-ancestor "$PINNED_MASTER" HEAD; then
-            echo "REFUSING: tagged commit $(git rev-parse --short HEAD) does not contain the master preflight admitted ($(git rev-parse --short "$PINNED_MASTER"))."
-            echo "Stable (latest) releases must be tagged on master, or on a branch rebased onto the latest master."
-            echo "Fix: rebase/merge onto origin/master then re-tag — or use a -canary/-beta/-rc suffix to publish off-master for testing."
-            exit 1
-          fi
-          echo "OK: tagged commit contains the master preflight admitted ($(git rev-parse --short "$PINNED_MASTER"))."
+          PINNED_BASELINE: ${{ needs.preflight.outputs.baseline_shas }}
+        run: node .github/scripts/release-master-guard.mjs verify
 
       - run: bun run build
 
