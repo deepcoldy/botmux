@@ -2616,6 +2616,7 @@ export type WorkerToDaemonBase =
   /** Claude statusline effort.level, independent of the transcript's serving model.
    * null means the current native session has no usable effort reading. */
   | ({ type: 'claude_effort' } & import('./services/claude-effort-observer.js').ClaudeEffortObservation)
+  | ({ type: 'native_reasoning' } & import('./services/native-reasoning-observation.js').NativeReasoningObservation)
   /** OBSERVED FACTS about Claude Code's automatic model switching — never a
    * decision. `claudeSessionId` (always present) says WHICH Claude conversation
    * they are about; `fallback` is a `scope:"session"` switch record this worker

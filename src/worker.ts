@@ -556,6 +556,9 @@ import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-co
 import { cliProcessAliveFromBackend } from './adapters/cli/backend-liveness.js';
 import { statuslineDir } from './services/statusline-snapshot.js';
 import { ClaudeEffortObserver } from './services/claude-effort-observer.js';
+import { isNativeReasoningEffort, type NativeReasoningObservation, type AppliedReasoningSelection } from './services/native-reasoning-observation.js';
+import { readGrokRuntimeObservation } from './services/grok-runtime-observer.js';
+import { readNativeReasoningFooter } from './utils/native-reasoning-footer.js';
 import { turnSendLedgerSessionDir } from './services/turn-send-ledger.js';
 import { prepareCursorUsageJournal } from './services/cursor-usage-hook.js';
 import { readySignalLogDir, readySignalLogPath } from './services/ready-signal-log.js';
@@ -9278,6 +9281,55 @@ const codexSubagentLimitTracker = new CodexSubagentLimitTracker(
 const modelFallbackTracker = new ClaudeModelFallbackTracker();
 const claudeEffortObserver = new ClaudeEffortObserver();
 let claudeEffortNotBeforeMs = 0;
+let nativeReasoningNotBeforeMs = 0;
+let lastNativeReasoningKey: string | undefined;
+let nativeReasoningClock: { owner: string; atMs: number } | undefined;
+
+function publishNativeReasoningObservation(observed: NativeReasoningObservation): void {
+  if (closeRequested || !backend || observed.cliId !== lastInitConfig?.cliId) return;
+  const binding = workerSessionEventScope?.currentBinding();
+  const owner = JSON.stringify([cliLifetimeNonce, binding?.runtime?.runtimeId, observed.cliId, observed.nativeSessionId]);
+  if (observed.observedAtMs !== undefined) {
+    if (nativeReasoningClock?.owner === owner && observed.observedAtMs < nativeReasoningClock.atMs) return;
+    nativeReasoningClock = { owner, atMs: observed.observedAtMs };
+  }
+  const { observedAtMs: _time, ...value } = observed;
+  const key = JSON.stringify([owner, value]);
+  if (key === lastNativeReasoningKey) return;
+  lastNativeReasoningKey = key;
+  const publish = () => send({ type: 'native_reasoning', ...observed,
+    ...(typeof cliSpawnGeneration === 'number' ? { cliSpawnGeneration } : {}) });
+  if (workerSessionEventScope && binding) workerSessionEventScope.run(binding, publish);
+  else publish();
+}
+
+function publishAppliedReasoningSelection(path: string, selected?: AppliedReasoningSelection): void {
+  const cliId = lastInitConfig?.cliId;
+  if (!selected || path !== codexBridgeRolloutPath || (cliId !== 'codex' && cliId !== 'traex')
+    || selected.atMs < nativeReasoningNotBeforeMs || selected.atMs > Date.now()) return;
+  const nativeSessionId = cliId === 'codex' ? codexGenerationSessionIdFromRolloutPath(path) : traexSessionIdFromRolloutPath(path);
+  if (!nativeSessionId || (selected.nativeSessionId && selected.nativeSessionId !== nativeSessionId)) return;
+  publishNativeReasoningObservation({ cliId, nativeSessionId, reasoningEffort: selected.reasoningEffort,
+    source: 'native-settings', observedAtMs: selected.atMs });
+}
+
+function publishNativeReasoningFooter(screen: string, observedAtMs = Date.now()): void {
+  const cliId = lastInitConfig?.cliId;
+  const nativeSessionId = lastInitConfig?.cliSessionId;
+  if ((cliId !== 'codex' && cliId !== 'traex') || !nativeSessionId) return;
+  const reasoningEffort = readNativeReasoningFooter(cliId, screen);
+  if (reasoningEffort !== undefined && (reasoningEffort === null || isNativeReasoningEffort(reasoningEffort))) {
+    publishNativeReasoningObservation({ cliId, nativeSessionId, reasoningEffort, source: 'native-footer', observedAtMs });
+  }
+}
+
+function publishGrokRuntimeObservation(): void {
+  if (!backend || closeRequested || lastInitConfig?.cliId !== 'grok' || !codexBridgeRolloutPath) return;
+  const sessionDir = dirname(codexBridgeRolloutPath);
+  const nativeSessionId = lastInitConfig.cliSessionId;
+  if (!nativeSessionId) return;
+  publishNativeReasoningObservation(readGrokRuntimeObservation(sessionDir, nativeSessionId, Date.now(), nativeReasoningNotBeforeMs));
+}
 
 /** Statusline is emitted on native effort changes (Claude 2.1.322's effortValue
  * dependency), even without an assistant turn. Do not infer from argv/settings. */
@@ -12572,6 +12624,9 @@ function structuredBridgeIngestPath(
       publishNativeGoal(result.latestGoal);
     }
     if (nativeGoalSourcePath === path) observeNativeGoal();
+    if ((result as CodexDrainResult).latestReasoningSelection) {
+      publishAppliedReasoningSelection(path, (result as CodexDrainResult).latestReasoningSelection);
+    }
     if (structuredBridgeIs('codex')) {
       // Codex resume can copy the whole conversation into a new generation
       // file; content-addressed ids let the queue dedup copied history across
@@ -18695,6 +18750,13 @@ async function handleTrustedCodexAppMarker(
   payload: Record<string, unknown>,
   control?: { generation: string; seq: number; socket?: Socket; channelId?: number; epoch?: string },
 ): Promise<boolean> {
+  if (kind === 'reasoning_observed' && lastInitConfig?.cliId === 'antigravity' && cliAdapter?.runnerFramedInput) {
+    if (typeof payload.nativeSessionId !== 'string'
+      || (payload.reasoningEffort !== null && !isNativeReasoningEffort(payload.reasoningEffort))) return false;
+    publishNativeReasoningObservation({ cliId: 'antigravity', nativeSessionId: payload.nativeSessionId,
+      reasoningEffort: payload.reasoningEffort, source: 'acp-config' });
+    return true;
+  }
   if (kind === 'effort_result' && isCodexAppCliId(lastInitConfig?.cliId)) {
     if (typeof payload.requestId !== 'string'
       || !['applied', 'future_only', 'invalid', 'unavailable', 'error'].includes(String(payload.status))
@@ -23544,6 +23606,9 @@ function startScreenUpdates(): void {
       const { snapshot, status } = await snapshotWithLatestRuntimeStatus(async () => {
         let content = lastContent;
         let changed = false;
+        let refreshed = false;
+        let nativeScreen: string | undefined;
+        const observedAtMs = Date.now();
 
         // Capture only when the pane has emitted output since our last snapshot.
         // During idle (the steady state for a parked session) this skips a tmux
@@ -23559,6 +23624,7 @@ function startScreenUpdates(): void {
           lastCapturedPtyActivity: lastSnapshotPtyActivity,
           screenSelfDriven: isScreenSelfDriven(backend),
         })) {
+          refreshed = true;
           lastSnapshotPtyActivity = ptyActivity;
           lastSnapshotGridRevision = gridRevision;
           // Preferred path: pipe-pane backends pull a fresh viewport snapshot
@@ -23578,17 +23644,19 @@ function startScreenUpdates(): void {
               const rawSnap = await snapshotToText(backend, renderCols, renderRows, { filter: false });
               if (rawSnap) lastAnalyzerSnapshot = rawSnap.content;
             }
+            nativeScreen = lastAnalyzerSnapshot;
           } else if (renderer) {
             const snap = renderer.snapshot();
             content = snap.content;
             changed = snap.changed;
+            nativeScreen = renderer.rawSnapshot();
           } else {
             return null;
           }
           lastContent = content;
         }
 
-        return { content, changed };
+        return { content, changed, refreshed, nativeScreen, observedAtMs };
       }, projectedRuntimeScreenStatus);
       if (!snapshot) return;
       // TRAE's question page sits still once drawn: the tick's screen catches
@@ -23601,6 +23669,9 @@ function startScreenUpdates(): void {
 
       if (backend === capacityBackend && cliSpawnGeneration === capacityGeneration) {
         observeTraexAutoModelCapacity(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
+        if (snapshot.refreshed && status === 'idle' && snapshot.nativeScreen) {
+          publishNativeReasoningFooter(snapshot.nativeScreen, snapshot.observedAtMs);
+        }
       }
       // Kimi paints its cache-expiry menu once and then sits still: the
       // per-chunk hold check can miss it while the renderer is still parsing
@@ -24501,6 +24572,9 @@ async function spawnCliBody(
   const spawnStartedAtMs = Date.now();
   claudeEffortNotBeforeMs = spawnStartedAtMs;
   claudeEffortObserver.reset();
+  nativeReasoningNotBeforeMs = spawnStartedAtMs;
+  lastNativeReasoningKey = undefined;
+  nativeReasoningClock = undefined;
   restartInterruptionScanBeforeMs = undefined;
   // Every spawn is a new CLI process that can show the picker again. Not all
   // respawns pass through killCli() (e.g. the retry after a crash-loop park),
@@ -31093,6 +31167,8 @@ function killCli(opts: {
   // depend on that implementation detail.
   cliSpawnGeneration++;
   claudeEffortObserver.reset();
+  lastNativeReasoningKey = undefined;
+  nativeReasoningClock = undefined;
   lastSpawnCodexLauncherPid = undefined;
   codexOwnershipAttestationPending = false;
   if (backend) previousCliEndedAtMs = Date.now();
@@ -37620,6 +37696,8 @@ setInterval(publishCliInputBacklog, 1_000).unref?.();
 // Runtime effort reporting cannot depend on a PTY redraw or a new model turn.
 const claudeEffortPollTimer = setInterval(publishClaudeEffortObservation, 1_000);
 claudeEffortPollTimer.unref?.();
+const grokRuntimePollTimer = setInterval(publishGrokRuntimeObservation, 1_000);
+grokRuntimePollTimer.unref?.();
 // 预加载层会在正式处理器注册前暂存冷启动消息；现在按到达顺序交还。
 (process as NodeJS.EventEmitter).emit(WORKER_IPC_HANDLER_READY_EVENT);
 
@@ -37627,6 +37705,7 @@ claudeEffortPollTimer.unref?.();
 
 function cleanup(): void {
   clearInterval(claudeEffortPollTimer);
+  clearInterval(grokRuntimePollTimer);
   workerFinalOutputHandoff?.stop();
   if (codexUpgradeTimer) clearInterval(codexUpgradeTimer);
   codexUpgradeTimer = undefined;

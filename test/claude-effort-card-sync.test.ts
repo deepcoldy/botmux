@@ -105,11 +105,11 @@ describe('Claude effort worker → daemon → card', () => {
     expect(usage(ds).reasoningEffort).toBe('medium');
   });
 
-  it.each(['codex', 'traex', 'grok'] as const)('preserves the existing %s configured and observed effort behavior', cliId => {
+  it.each(['codex', 'traex', 'grok'] as const)('omits %s launch effort while keeping observed effort and rejecting Claude events', cliId => {
     const ds = session(); ds.session.cliId = cliId;
-    expect(usage(ds).reasoningEffort).toBe('high');
+    expect(usage(ds).reasoningEffort).toBeUndefined();
     ds.activeReasoningEffort = 'medium';
-    expect(usage(ds).reasoningEffort).toBe('medium');
+    expect(usage(ds).reasoningEffort).toBe(cliId === 'grok' ? undefined : 'medium');
     expect(applyClaudeEffortObservation(ds, { claudeSessionId: NATIVE, reasoningEffort: 'low' },
       { worker, workerGeneration: 4, cliId })).toBe(false);
     expect(ds.activeReasoningEffort).toBe('medium');

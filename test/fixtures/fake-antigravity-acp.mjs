@@ -6,7 +6,7 @@ const mode = process.env.AGY_TEST_MODE;
 const sessionId = 'native-agy-test-session';
 const configs = { models: { availableModels: [{ modelId: 'gemini-test-high' }] }, configOptions: [
   { id: 'model', category: 'model', options: [{ value: 'gemini-test' }] },
-  { id: 'effort', category: 'thought_level', options: [{ value: 'high' }] },
+  { id: 'effort', category: 'thought_level', currentValue: 'low', options: [{ value: 'low' }, { value: 'medium' }, { value: 'high' }] },
 ] };
 /** Emit a complete NDJSON frame, including UTF-8 split across transport chunks. */
 function send(message) {
@@ -24,7 +24,13 @@ createInterface({ input: process.stdin }).on('line', line => {
   if (request.method === 'initialize') send({ id: request.id, result: { protocolVersion: 1, agentCapabilities: { loadSession: mode !== 'no-restore' } } });
   else if (request.method === 'session/new') send({ id: request.id, result: { sessionId, ...configs } });
   else if (request.method === 'session/load') send({ id: request.id, result: mode === 'wrong-load' ? { sessionId: 'foreign-session' } : configs });
-  else if (['session/set_config_option', 'session/set_model'].includes(request.method)) send({ id: request.id, result: configs });
+  else if (['session/set_config_option', 'session/set_model'].includes(request.method)) {
+    if (request.params.configId === 'effort') {
+      if (mode === 'effort-denied') { send({ id: request.id, error: { code: -32602 } }); return; }
+      configs.configOptions[1].currentValue = mode === 'effort-override' ? 'medium' : request.params.value;
+    }
+    send({ id: request.id, result: configs });
+  }
   else if (request.method === 'session/prompt') {
     if (mode === 'hang') return;
     if (mode === 'exit') { process.exit(7); return; }
@@ -33,6 +39,9 @@ createInterface({ input: process.stdin }).on('line', line => {
     const update = value => send({ method: 'session/update', params: {
       sessionId: mode === 'foreign-update' ? 'foreign-session' : request.params.sessionId, update: value,
     } });
+    if (mode === 'effort-clear') update({ sessionUpdate: 'config_option_update', configOptions: [
+      { id: 'effort', category: 'thought_level', currentValue: null },
+    ] });
     update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'intermediate commentary' } });
     update({ sessionUpdate: 'tool_call', title: 'Read fixture' });
     update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: '中文 complete answer' } });

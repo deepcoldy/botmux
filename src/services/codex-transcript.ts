@@ -1,3 +1,4 @@
+import { appliedReasoningSelectionFromRecord, type AppliedReasoningSelection } from './native-reasoning-observation.js';
 /**
  * Reader for Codex's per-session rollout JSONL.
  *
@@ -959,6 +960,8 @@ export function splitCodexEventsByCutoff(
 
 export interface CodexDrainResult {
   latestGoal?: NativeGoalState | null;
+  /** Native settings selection ACK, observed without waiting for turn_context. */
+  latestReasoningSelection?: import('./native-reasoning-observation.js').AppliedReasoningSelection;
   events: CodexBridgeEvent[];
   /** Byte offset of the last fully-parsed line + its trailing \n. The next
    *  drain should pass this back as fromOffset. */
@@ -1776,6 +1779,7 @@ export function drainCodexRollout(
   const spawnedSubagents: CodexSpawnedSubagent[] = [];
   let latestGoal: NativeGoalState | null | undefined;
   let latestThreadSettings: CodexThreadSettings | undefined;
+  let latestReasoningSelection: AppliedReasoningSelection | undefined;
   let latestModel: string | undefined;
   let latestReasoningEffort: string | undefined;
   // Remember both deferred and ordinary calls seen in this drain. A plain
@@ -1806,6 +1810,7 @@ export function drainCodexRollout(
     const settings = codexThreadSettingsFromEvent(obj);
     if (settings) {
       latestThreadSettings = settings;
+      latestReasoningSelection = appliedReasoningSelectionFromRecord(obj) ?? latestReasoningSelection;
       continue;
     }
     // turn_context carries the executor model/effort on every turn (latest-wins,
@@ -2036,6 +2041,7 @@ export function drainCodexRollout(
     newOffset,
     pendingTail,
     latestThreadSettings,
+    ...(latestReasoningSelection ? { latestReasoningSelection } : {}),
     latestModel,
     latestReasoningEffort,
     ...(latestGoal !== undefined ? { latestGoal } : {}),

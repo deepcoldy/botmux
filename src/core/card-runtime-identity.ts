@@ -15,10 +15,18 @@ export function withCardRuntimeIdentity(
   effectiveCliId: CliId | undefined = ds.session.cliId,
 ): CardUsageSnapshot {
   const runtimeModel = ds.activeModel?.trim() || ds.session.model?.trim();
-  // Claude can change effort within the CLI. Its frozen launch preference is
-  // not a runtime observation; omit it until statusline supplies a current value.
-  const reasoningEffort = ds.activeReasoningEffort?.trim()
-    || (effectiveCliId !== 'claude-code' ? ds.session.reasoningEffort?.trim() : undefined);
+  const candidate = ds.nativeReasoningObservation;
+  const observed = candidate && candidate.cliId === effectiveCliId && candidate.nativeSessionId === ds.session.cliSessionId
+    && candidate.workerGeneration === ds.workerGeneration
+    && candidate.workerGeneration === ds.session.workerGeneration
+    && (ds.localProcessAttestation?.cliSpawnGeneration === undefined
+      || candidate.cliSpawnGeneration === ds.localProcessAttestation.cliSpawnGeneration) ? candidate : undefined;
+  const staleObservation = candidate && candidate.cliId === effectiveCliId && !observed;
+  const strictEffort = ['claude-code', 'codex', 'traex', 'grok', 'antigravity'].includes(effectiveCliId ?? '');
+  // CLI-local settings can change independently of the frozen launch preference.
+  // The explicitly observed CLIs never show an unlabelled launch effort.
+  const reasoningEffort = (effectiveCliId !== 'grok' ? ds.activeReasoningEffort?.trim() : undefined)
+    || (!strictEffort ? ds.session.reasoningEffort?.trim() : undefined);
   const remoteRunner = (ds.initConfig?.backendType ?? ds.session.backendType) === 'remote-runner';
   const remoteUsage = remoteRunner ? normalizeRemoteRunnerUsageReport(ds.session.remoteRunnerUsage) : undefined;
   const remoteState = remoteRunner ? normalizeRemoteRunnerBackendState(ds.session.remoteBackendState) : undefined;
@@ -35,18 +43,23 @@ export function withCardRuntimeIdentity(
   const model = (zcodeNative ? nativeModel : undefined)
     || remote?.model?.trim()
     || (effectiveCliId === 'minimax' ? nativeModel : undefined)
+    || (effectiveCliId === 'grok' ? observed?.model?.trim() || nativeModel : undefined)
     || runtimeModel || nativeModel;
-  const effort = (zcodeNative ? nativeEffort : undefined)
+  const effort = staleObservation ? undefined : observed ? observed.reasoningEffort ?? undefined : (zcodeNative ? nativeEffort : undefined)
     || remote?.reasoningEffort?.trim()
     || (effectiveCliId === 'minimax' ? nativeEffort : undefined)
+    || (effectiveCliId === 'grok' ? nativeEffort : undefined)
     || reasoningEffort || nativeEffort;
+  const effortSource = observed && observed.source !== 'native-summary' ? 'selected'
+    : !observed && effort && (effectiveCliId === 'codex' || effectiveCliId === 'traex') ? 'last-execution' : undefined;
   const variant = remote?.modelBackendVariant?.trim() || (ds.activeModelBackendVariant !== undefined
     ? ds.activeModelBackendVariant : ds.session.modelBackendVariant);
   return {
     ...snapshot,
     ...(model ? { model } : {}),
     ...(effort ? { reasoningEffort: effort }
-      : effectiveCliId === 'claude-code' ? { reasoningEffort: undefined } : {}),
+      : strictEffort ? { reasoningEffort: undefined } : {}),
+    ...(strictEffort ? { reasoningEffortSource: effortSource } : {}),
     ...(ds.activeModelBackendVariant !== undefined
       ? { modelBackendVariant: variant || undefined }
       : variant ? { modelBackendVariant: variant } : {}),

@@ -424,6 +424,8 @@ export interface CardUsageSnapshot {
   model?: string;
   /** Observed reasoning effort. Non-Claude CLIs may fall back to session configuration. */
   reasoningEffort?: string;
+  /** Native settings can change before the running turn adopts them. */
+  reasoningEffortSource?: 'selected' | 'last-execution';
   /** Session-only configuration; separate from the last executor-reported effort. */
   reasoningControl?: {
     /** Native CLI menu accepted this setting for the next turn. */
@@ -903,7 +905,11 @@ export function cardUsageRuntimeSegment(
       ? 'Max'
       : '';
   const reasoningEffort = compactRuntimeLabel(usage.reasoningEffort, 10);
-  const tail = [variant, reasoningEffort].filter(Boolean);
+  const effortLabel = reasoningEffort && usage.reasoningEffortSource === 'selected'
+    ? `${reasoningEffort}（已选）`
+    : reasoningEffort && usage.reasoningEffortSource === 'last-execution'
+      ? `${reasoningEffort}（最近执行）` : reasoningEffort;
+  const tail = [variant, effortLabel].filter(Boolean);
   return `**${model}**${tail.length > 0 ? `\u00a0${tail.join(' · ')}` : ''}`;
 }
 

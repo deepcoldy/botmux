@@ -224,6 +224,7 @@ import { buildReplyConsoleUrl } from './dashboard-url.js';
 import type { TraexAutoModelConfig } from '../services/traex-auto-model.js';
 import { withCardRuntimeIdentity } from './card-runtime-identity.js';
 import { applyClaudeEffortObservation } from './claude-effort-observation.js';
+import { applyNativeReasoningObservation } from './native-reasoning-observation.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import { teardownSessionSandboxTree } from '../adapters/backend/sandbox-tree-teardown.js';
 import {
@@ -18725,6 +18726,7 @@ function setupWorkerHandlers(
   // cannot leave a stale model/effort tail on the card.
   ds.activeModel = undefined;
   ds.activeReasoningEffort = undefined;
+  ds.nativeReasoningObservation = undefined;
   ds.activeModelBackendVariant = undefined;
   // The model-fallback notice is the ONE runtime fact a worker generation does
   // NOT own: it must survive every respawn and stay visible each round until
@@ -20025,6 +20027,14 @@ function setupWorkerHandlers(
             ? { workerGeneration: ds.workerGeneration }
             : {}),
         };
+        if (msg.cliSpawnGeneration !== undefined && msg.cliSpawnGeneration !== previousSpawnGeneration
+          && ds.nativeReasoningObservation) {
+          if (ds.nativeReasoningObservation.cliSpawnGeneration !== msg.cliSpawnGeneration) {
+            ds.nativeReasoningObservation = undefined;
+            if (effectiveCliId === 'grok') ds.activeReasoningEffort = undefined;
+          }
+          scheduleActiveRuntimePatch(ds);
+        }
         break;
       }
       case 'queued_activation_submitted': {
@@ -20928,6 +20938,13 @@ function setupWorkerHandlers(
           sessionStore.updateSession(ds.session);
         }
         scheduleActiveRuntimePatch(ds);
+        break;
+      }
+
+      case 'native_reasoning': {
+        if (applyNativeReasoningObservation(ds, msg, { worker, workerGeneration, cliId: effectiveCliId })) {
+          scheduleActiveRuntimePatch(ds);
+        }
         break;
       }
 
