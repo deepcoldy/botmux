@@ -8928,6 +8928,153 @@ describe('managed turn authority worker generations', () => {
 });
 
 describe('worker startup failure delivery', () => {
+  it.each([
+    { source: 'tmux', tmuxTarget: undefined },
+    { tmuxTarget: undefined },
+    { source: 'tmux', tmuxTarget: '   ' },
+    { source: 'zellij', zellijSession: 'original', zellijPaneId: undefined },
+    { source: 'zellij', zellijSession: undefined, zellijPaneId: '2' },
+    { source: 'herdr', herdrSessionName: 'original', herdrTarget: undefined },
+    { source: 'herdr', herdrSessionName: undefined, herdrTarget: 'pane-2' },
+    { source: 'orca', orcaTerminalHandle: undefined },
+  ])('refuses partial adopted terminal metadata on startup retry ($source)', async damaged => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO, getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs({ adoptedFrom: {
+      source: 'tmux', tmuxTarget: 'original:0.0', originalCliPid: 4242,
+      sessionId: 'original-cli-session', cliId: 'traex', cwd: REPO,
+    } });
+    ds.session.adoptedFrom = ds.adoptedFrom;
+    forkAdoptWorker(ds);
+    const worker = ds.worker as any;
+    worker.emit('message', { type: 'error', message: 'spawnSync tmux ETIMEDOUT' });
+    await vi.advanceTimersByTimeAsync(0);
+    worker.emit('exit', 1);
+    // Model a partial recovered metadata object without any cross-source
+    // fallback fields that could accidentally select a different terminal.
+    ds.adoptedFrom = { originalCliPid: 4242, cliId: 'traex', cwd: REPO, ...damaged } as any;
+    ds.session.adoptedFrom = ds.adoptedFrom;
+    await vi.advanceTimersByTimeAsync(240_000);
+    expect(ds.worker).toBeNull();
+    expect(forkMock).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { source: 'tmux', cliId: 'traex', tmuxTarget: 'original:0.0', persistedOnly: false },
+    { source: undefined, cliId: 'traex', tmuxTarget: 'original:0.0', persistedOnly: true },
+    { source: 'tmux', cliId: 'traex', tmuxTarget: 'original:0.0', persistedOnly: true },
+    { source: 'tmux', cliId: 'claude-code', tmuxTarget: 'original:0.0' },
+    { source: 'zellij', cliId: 'codex', zellijSession: 'original', zellijPaneId: '2' },
+    { source: 'herdr', cliId: 'traex', herdrSessionName: 'original', herdrTarget: 'pane-2' },
+    { source: 'orca', cliId: 'claude-code', orcaTerminalHandle: 'term-original' },
+  ])('retries an adopted $source/$cliId bridge against its original terminal (persisted-only=$persistedOnly)', async target => {
+    vi.useFakeTimers();
+    const adopted = { ...target, originalCliPid: 4242, sessionId: 'original-cli-session', cwd: REPO } as any;
+    const ds = makeDs({ adoptedFrom: adopted });
+    ds.session.adoptedFrom = adopted;
+    forkAdoptWorker(ds);
+    const worker = ds.worker as any;
+    worker.emit('message', {
+      type: 'error', message: 'CLI runtime reservation was not confirmed by the daemon within 120s',
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    worker.emit('exit', 1);
+    if ('persistedOnly' in target && target.persistedOnly) ds.adoptedFrom = undefined;
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    const replacement = ds.worker as any;
+    expect(replacement).not.toBe(worker);
+    expect(replacement.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init', adoptMode: true, adoptSource: target.source ?? 'tmux',
+      adoptCliPid: 4242, cliId: target.cliId, prompt: '',
+    }));
+    if (target.cliId !== 'claude-code') {
+      expect(ds.initConfig?.cliSessionId).toBe('original-cli-session');
+    }
+    expect(ds.adoptedFrom).toEqual(adopted);
+  });
+
+  it('keeps an adopted startup retry bounded without launching a managed CLI', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs({ adoptedFrom: {
+      source: 'tmux', tmuxTarget: 'original:0.0', originalCliPid: 4242,
+      sessionId: 'original-cli-session', cliId: 'traex', cwd: REPO,
+    } });
+    forkAdoptWorker(ds);
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const worker = ds.worker as any;
+      worker.emit('message', { type: 'error', message: 'spawnSync tmux ETIMEDOUT' });
+      await vi.advanceTimersByTimeAsync(0);
+      worker.emit('exit', 1);
+      await vi.advanceTimersByTimeAsync(240_000);
+    }
+    expect(ds.worker).toBeNull();
+    expect(forkMock).toHaveBeenCalledTimes(4);
+    for (const result of forkMock.mock.results) {
+      expect(result.value.send).toHaveBeenCalledWith(expect.objectContaining({
+        adoptMode: true, adoptTmuxTarget: 'original:0.0', adoptCliPid: 4242,
+      }));
+    }
+  });
+
+  it('does not revive an adopted bridge closed during startup backoff', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs({ adoptedFrom: {
+      source: 'tmux', tmuxTarget: 'original:0.0', originalCliPid: 4242,
+      sessionId: 'original-cli-session', cliId: 'traex', cwd: REPO,
+    } });
+    forkAdoptWorker(ds);
+    const worker = ds.worker as any;
+    worker.emit('message', { type: 'error', message: 'spawnSync tmux ETIMEDOUT' });
+    await vi.advanceTimersByTimeAsync(0);
+    worker.emit('exit', 1);
+    ds.session.status = 'closed';
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(ds.worker).toBeNull();
+    expect(forkMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('still retries an ordinary CLI startup through the managed launch path', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    forkWorker(ds, '', true);
+    const worker = ds.worker as any;
+    worker.emit('message', { type: 'error', message: 'spawnSync tmux ETIMEDOUT' });
+    await vi.advanceTimersByTimeAsync(0);
+    worker.emit('exit', 1);
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect((ds.worker as any).send).toHaveBeenCalledWith(expect.objectContaining({ type: 'init', resume: true }));
+    expect(ds.initConfig?.adoptMode).not.toBe(true);
+  });
+
+  it.each(['missing-target', 'sandbox-enabled'])('reports an adopted retry that cannot proceed (%s)', async failure => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => REPO, getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs({ adoptedFrom: {
+      source: 'tmux', tmuxTarget: 'original:0.0', originalCliPid: 4242,
+      sessionId: 'original-cli-session', cliId: 'traex', cwd: REPO,
+    } });
+    ds.session.adoptedFrom = ds.adoptedFrom;
+    forkAdoptWorker(ds);
+    const worker = ds.worker as any;
+    worker.emit('message', { type: 'error', message: 'spawnSync tmux ETIMEDOUT' });
+    await vi.advanceTimersByTimeAsync(0);
+    worker.emit('exit', 1);
+    if (failure === 'missing-target') {
+      ds.adoptedFrom = undefined;
+      ds.session.adoptedFrom = undefined;
+    } else {
+      vi.mocked(getBot).mockImplementation(() => defaultBot({ sandbox: true }));
+    }
+    await vi.advanceTimersByTimeAsync(240_000);
+    expect(ds.worker).toBeNull();
+    expect(forkMock).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps the clean init payload and reports a structured failure once to its exact originating turn', async () => {
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
     const sessionReply = vi.fn(async () => 'om_error_reply');

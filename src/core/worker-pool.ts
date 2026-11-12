@@ -18417,10 +18417,9 @@ function setupWorkerHandlers(
    *   - bounded by MAX_STARTUP_AUTO_RETRIES per failing streak (reset on a
    *     worker generation reaching `ready`), so a persistent failure still
    *     surfaces to the user with the standard card.
-   * The retry itself is a blank re-fork (`forkWorker(ds, '', true)`) — exactly
-   * what a daemon restart or the next inbound message would do: re-attach when
-   * the backing pane survived (the 08-23 case — pane and CLI were alive, only
-   * the worker had died), cold `--resume` otherwise.
+   * A managed CLI retries through its normal re-attach/cold-resume path.
+   * An external adopt retries only its bridge worker against the original
+   * terminal: a failed bridge must never create a new managed CLI.
    */
   const scheduleTransientStartupRetry = (
     reason: string,
@@ -18452,10 +18451,42 @@ function setupWorkerHandlers(
         `[${t}] Auto-retrying worker start (${attempts}/${MAX_STARTUP_AUTO_RETRIES}) `
         + 'after transient startup failure',
       );
+      const retryAdopt = !!(ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode === true);
       try {
-        forkWorker(ds, '', true);
+        if (retryAdopt) {
+          // Durable metadata may be the only remaining target after recovery.
+          // Missing/incomplete metadata is rejected before forking rather than
+          // cold-starting an unrelated CLI under the adopted-session identity.
+          ds.adoptedFrom ??= ds.session.adoptedFrom as DaemonSession['adoptedFrom'];
+          const adopted = ds.adoptedFrom;
+          const present = (value: unknown): value is string => typeof value === 'string' && value.trim().length > 0;
+          // Old metadata omitted source for tmux (and sometimes zellij).
+          // Validate the original source's target, never borrow another
+          // backend's fields from a partially recovered metadata object.
+          const source = adopted?.source ?? (adopted?.zellijPaneId ? 'zellij' : 'tmux');
+          const validTarget = adopted && (
+            source === 'tmux' ? present(adopted.tmuxTarget)
+              : source === 'zellij' ? present(adopted.zellijSession) && present(adopted.zellijPaneId)
+                : source === 'herdr' ? present(adopted.herdrSessionName)
+                  && (present(adopted.herdrTarget) || present(adopted.herdrPaneId))
+                  : source === 'orca' && present(adopted.orcaTerminalHandle)
+          );
+          if (!validTarget) throw new Error('Missing adopt terminal identity; no replacement CLI was launched');
+          if (forkAdoptWorker(ds, { restoredFromMetadata: true }) !== 'accepted') {
+            throw new Error('Adopt bridge restart was refused; no replacement CLI was launched');
+          }
+        } else {
+          forkWorker(ds, '', true);
+        }
       } catch (err: any) {
         logger.error(`[${t}] Startup auto-retry fork failed: ${err?.message ?? err}`);
+        if (retryAdopt) {
+          // The previous transient error was suppressed in favour of this
+          // retry. A refused/missing target must not leave the user waiting
+          // silently with no worker and no further retry scheduled.
+          startupState.failureNotified = false;
+          void notifyStartupFailure(err?.message ?? String(err));
+        }
       }
     }, delayMs);
     timer.unref?.();
