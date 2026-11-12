@@ -54,6 +54,22 @@ const record = content => {
   fs.mkdirSync(path.dirname(cfg.transcript), { recursive: true });
   fs.appendFileSync(cfg.transcript, JSON.stringify({ type: 'user', timestamp: new Date().toISOString(), message: { role: 'user', content } }) + '\\n');
 };
+// Real Claude Code ends every turn with a terminal assistant record
+// (stop_reason end_turn). Without one, scanRestartInterruption() always sees
+// turnOpen=true: whether the restart interruption note is then delivered
+// depends on which prompt-ready path wins the race (idle detector at ~2s vs
+// the 15s first-prompt timeout), making the post-restart submit list flaky.
+const closeTurn = () => fs.appendFileSync(cfg.transcript, JSON.stringify({
+  type: 'assistant',
+  uuid: 'a-' + process.pid + '-' + Date.now(),
+  timestamp: new Date().toISOString(),
+  message: {
+    id: 'm-' + process.pid + '-' + Date.now(),
+    role: 'assistant',
+    stop_reason: 'end_turn',
+    content: [{ type: 'text', text: 'ok' }],
+  },
+}) + '\\n');
 const submit = () => {
   const text = composer;
   composer = '';
@@ -66,6 +82,7 @@ const submit = () => {
   } else {
     record(text);
   }
+  closeTurn();
   render();
 };
 process.stdin.on('data', buf => {
