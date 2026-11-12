@@ -5,6 +5,7 @@ import {
   dispatchPrimaryMessage,
   findStdinAliasAttachment,
   normalizeInteractiveCardInput,
+  primaryCardBodyMissing,
   sendFileAttachments,
   sendVideoAttachments,
   shouldSendAsPureVideo,
@@ -310,6 +311,32 @@ describe('shouldSendAsPureVideo', () => {
 
   it('is NOT pure-video when there is no video at all', () => {
     expect(shouldSendAsPureVideo({ ...base, videoCount: 0 })).toBe(false);
+  });
+});
+
+describe('primaryCardBodyMissing (no reply card without a body)', () => {
+  const none = { hasBodyText: false, imageCount: 0, fileCount: 0, videoCount: 0, mentionCount: 0 };
+
+  it('lets the media-primary shapes go without a body', () => {
+    // One file, nothing else: the file message is the primary message.
+    expect(primaryCardBodyMissing({ ...none, fileCount: 1 })).toBe(false);
+    // Videos only: the first video is the primary message.
+    expect(primaryCardBodyMissing({ ...none, videoCount: 2 })).toBe(false);
+  });
+
+  it('needs a body whenever the attachments would trail a reply card', () => {
+    expect(primaryCardBodyMissing({ ...none, fileCount: 2 })).toBe(true);
+    expect(primaryCardBodyMissing({ ...none, fileCount: 1, videoCount: 1 })).toBe(true);
+    // A mention can only live on a card, never on a media message.
+    expect(primaryCardBodyMissing({ ...none, fileCount: 1, mentionCount: 1 })).toBe(true);
+    expect(primaryCardBodyMissing({ ...none, videoCount: 1, mentionCount: 1 })).toBe(true);
+    expect(primaryCardBodyMissing(none)).toBe(true);
+  });
+
+  it('treats text or an inline image as card content', () => {
+    expect(primaryCardBodyMissing({ ...none, fileCount: 2, mentionCount: 1, hasBodyText: true })).toBe(false);
+    expect(primaryCardBodyMissing({ ...none, fileCount: 2, mentionCount: 1, imageCount: 1 })).toBe(false);
+    expect(primaryCardBodyMissing({ ...none, imageCount: 1 })).toBe(false);
   });
 });
 

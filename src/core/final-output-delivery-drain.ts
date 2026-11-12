@@ -2,6 +2,9 @@ import type { DaemonSession } from './types.js';
 import { waitAllWithin } from './producer-quiescence.js';
 
 const allFinalOutputDeliveries = new Set<Promise<void>>();
+/** When each in-flight delivery began, for callers that bound how long they
+ *  wait on one (the idle reclaim hold). */
+const deliveryStartedAt = new WeakMap<Promise<void>, number>();
 
 type FinalOutputDeliverySettledListener = (ds: DaemonSession, turnId?: string) => void;
 const settledListeners = new Set<FinalOutputDeliverySettledListener>();
@@ -37,6 +40,7 @@ export function beginFinalOutputDelivery(ds: DaemonSession, turnId?: string): ()
     : undefined;
   pendingForTurn?.add(settled);
   allFinalOutputDeliveries.add(settled);
+  deliveryStartedAt.set(settled, Date.now());
 
   let finished = false;
   return () => {
@@ -85,6 +89,16 @@ export function snapshotFinalOutputDeliveries(ds: DaemonSession): Promise<void>[
 
 export function finalOutputDeliveryCount(ds: DaemonSession): number {
   return ds.finalOutputDeliveriesInFlight?.size ?? 0;
+}
+
+/** Start time of the session's oldest final delivery still in flight. */
+export function oldestFinalOutputDeliveryStartedAt(ds: DaemonSession): number | undefined {
+  let oldest: number | undefined;
+  for (const pending of ds.finalOutputDeliveriesInFlight ?? []) {
+    const startedAt = deliveryStartedAt.get(pending);
+    if (startedAt !== undefined && (oldest === undefined || startedAt < oldest)) oldest = startedAt;
+  }
+  return oldest;
 }
 
 export function snapshotAllFinalOutputDeliveries(): Promise<void>[] {

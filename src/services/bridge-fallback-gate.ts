@@ -780,6 +780,15 @@ export function shouldSuppressBridgeEmit(
     : markerSetCoversFinal(markersInWindow, gatedFinal);
 }
 
+/** Preserve legacy unclassified deliveries, but never treat an explicitly
+ * classified progress/supplement (including a managed-card snapshot) as final.
+ * Attribution and delivery-mode checks still belong to shouldSuppressBridgeEmit. */
+function completedDeliveryMarkers(markers: readonly BridgeSendMarker[]): BridgeSendMarker[] {
+  return markers.filter(marker =>
+    marker.responseKind !== 'progress' && marker.responseKind !== 'auxiliary'
+    && marker.replyCardResponseKind !== 'progress' && marker.replyCardResponseKind !== 'auxiliary');
+}
+
 /** Some structured CLIs can report a durable completed turn while their
  * terminal event carries no final text. If there was no attributable successful
  * `botmux send` / `botmux report`, silently completing leaves the Lark thread with no
@@ -818,7 +827,7 @@ export function shouldEmitEmptyCompletedBridgeFallback(
   if (turn.isLocal) return false;
   if (turn.terminalStatus !== undefined && turn.terminalStatus !== 'completed') return false;
   if ((turn.finalText ?? '').trim().length > 0) return false;
-  return !shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode, replyDelivery);
+  return !shouldSuppressBridgeEmit(turn, nextBoundaryMs, completedDeliveryMarkers(markers), adoptMode, replyDelivery);
 }
 
 /** 结构化失败回合补发可见错误；进度回复不能替代失败原因。 */
@@ -861,6 +870,9 @@ export function shouldSuppressStructuredFallback(
    *  true 才启用下面的「已送达 final」门禁；缺省与旧行为逐字一致。 */
   suppressDeliveredFinalFailureNotice = false,
 ): boolean {
+  if (fallbackKind === 'empty_completed') {
+    return shouldSuppressBridgeEmit(turn, nextBoundaryMs, completedDeliveryMarkers(markers), adoptMode, replyDelivery);
+  }
   if (fallbackKind !== 'failed') {
     return shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode, replyDelivery);
   }

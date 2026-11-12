@@ -150,7 +150,7 @@ export function alreadyNotified(comments, runId) {
   return Array.isArray(comments) && comments.some((comment) => String(comment?.body ?? '').includes(marker));
 }
 
-export function commentBody({ mentions, reasons, cases, reportUrl, runUrl, range, pulls, self, runId, quotaCases = 0, quotaReset = null }) {
+export function commentBody({ mentions, reasons, cases, reportUrl, siteArtifactName = '', runUrl, range, pulls, self, runId, quotaCases = 0, quotaReset = null }) {
   const lines = [];
   const who = [...new Set(mentions.filter(Boolean))].map((login) => `@${login}`).join(' ');
   lines.push(`${who ? `${who} ` : ''}合入 master 后的 Midscene E2E 失败：${reasons.join('；')}。`);
@@ -174,7 +174,12 @@ export function commentBody({ mentions, reasons, cases, reportUrl, runUrl, range
   if (quotaCases > 0) {
     lines.push(`${quotaNote(quotaReset)}：另有 ${quotaCases} 个用例因此失败，未列出；上面的失败也可能受其影响。`, '');
   }
-  if (reportUrl) lines.push(`- Midscene 报告（截图、回放、录像）：${reportUrl}`);
+  if (reportUrl) {
+    lines.push(`- Midscene 报告（截图、回放、录像）：${reportUrl}`);
+    // Pages keeps only the newest master runs, so this link is gone after a
+    // few more merges; the run's site artifact holds the same report.
+    if (siteArtifactName) lines.push(`  - Pages 只保留最近几次运行的报告，链接 404 时到运行页的 Artifacts 下载 \`${siteArtifactName}\`（同一份报告，解压后用静态服务打开）`);
+  }
   lines.push(`- 运行与 Summary：${runUrl}`);
   if (runId !== undefined) lines.push('', runMarker(runId));
   return `${lines.join('\n')}\n`;
@@ -246,6 +251,7 @@ export async function notify({ env, fetchImpl = fetch }) {
   const runUrl = `${env.GITHUB_SERVER_URL}/${env.GITHUB_REPOSITORY}/actions/runs/${selfRunId}`;
   const workflow = env.NOTIFY_WORKFLOW_FILE ?? 'midscene-e2e.yml';
   const reportUrl = env.REPORT_PUBLISHED === 'true' ? env.REPORT_SITE_URL : '';
+  const siteArtifactName = env.SITE_ARTIFACT_NAME ?? '';
 
   const { workflow_runs: runs } = await github(
     `/actions/workflows/${workflow}/runs?branch=${encodeURIComponent(branch)}&event=push&status=completed&per_page=50`,
@@ -275,13 +281,13 @@ export async function notify({ env, fetchImpl = fetch }) {
     else await github(route, { method: 'POST', body: JSON.stringify({ body }) });
   };
   if (pulls.length === 0) {
-    const body = commentBody({ mentions: [owner], reasons, cases, reportUrl, runUrl, range, pulls, self: null, runId: selfRunId, ...quota });
+    const body = commentBody({ mentions: [owner], reasons, cases, reportUrl, siteArtifactName, runUrl, range, pulls, self: null, runId: selfRunId, ...quota });
     await post(`/commits/${headSha}/comments`, body);
     console.log(`No merged pull request in ${range}; commented on ${headSha}.`);
     return;
   }
   for (const pull of pulls) {
-    const body = commentBody({ mentions: [pull.author, owner], reasons, cases, reportUrl, runUrl, range, pulls, self: pull.number, runId: selfRunId, ...quota });
+    const body = commentBody({ mentions: [pull.author, owner], reasons, cases, reportUrl, siteArtifactName, runUrl, range, pulls, self: pull.number, runId: selfRunId, ...quota });
     await post(`/issues/${pull.number}/comments`, body);
     console.log(`Commented on #${pull.number} (${pull.author}).`);
   }

@@ -98,6 +98,13 @@ export interface TriggerUserAuthConfig {
    * key live on this machine).
    */
   delegateOnMention?: boolean;
+  /** Extra tools signed only for a direct human's dispatch into the exact
+   * listed chat and target apps. They never govern this bot's own CLI calls. */
+  dispatchOnly?: {
+    tools: TriggerUserAuthTool[];
+    targetAppIds: string[];
+    chatIds: string[];
+  };
   /**
    * Code host whose git pushes should carry the acting identity, e.g.
    * `code.example.com`. Absent → git is left alone.
@@ -249,6 +256,37 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     'triggerUserAuth.gitTokenExchangeUrl',
   );
 
+  let dispatchOnly: TriggerUserAuthConfig['dispatchOnly'];
+  // dispatchOnly only takes effect while the policy is enabled, so a disabled
+  // policy accepts and drops the field instead of validating it. Flipping
+  // `enabled` to false by hand is a natural kill switch; rejecting the load
+  // here would make that one bot's edit fail the whole bots.json and take
+  // every other bot in the file down on the next daemon start. Re-enabling
+  // re-runs this parser, so a malformed scope is still refused before it can
+  // ever govern a dispatch.
+  if (rec.dispatchOnly !== undefined && enabled) {
+    if (typeof rec.dispatchOnly !== 'object' || rec.dispatchOnly === null
+      || Array.isArray(rec.dispatchOnly)) {
+      throw new TriggerUserAuthConfigError('triggerUserAuth.dispatchOnly requires an object');
+    }
+    const entry = rec.dispatchOnly as Record<string, unknown>;
+    const identifiers = (key: 'targetAppIds' | 'chatIds', pattern: RegExp): string[] => {
+      const value = entry[key];
+      if (!Array.isArray(value) || value.length === 0 || value.some(id => typeof id !== 'string' || !pattern.test(id))) {
+        throw new TriggerUserAuthConfigError(`triggerUserAuth.dispatchOnly.${key} must contain valid IDs`);
+      }
+      return [...new Set(value as string[])];
+    };
+    if (!Array.isArray(entry.tools) || entry.tools.length === 0 || entry.tools.some(tool => !isTool(tool))) {
+      throw new TriggerUserAuthConfigError('triggerUserAuth.dispatchOnly.tools must contain supported tools');
+    }
+    dispatchOnly = {
+      tools: [...new Set(entry.tools as TriggerUserAuthTool[])],
+      targetAppIds: identifiers('targetAppIds', /^cli_[A-Za-z0-9_-]{1,128}$/),
+      chatIds: identifiers('chatIds', /^oc_[A-Za-z0-9_-]{1,128}$/),
+    };
+  }
+
   return {
     enabled,
     tools,
@@ -256,9 +294,31 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     credentialSource,
     // Equal to the default → not stored.
     ...(rec.delegateOnMention === false ? { delegateOnMention: false } : {}),
+    ...(dispatchOnly ? { dispatchOnly } : {}),
     ...(gitHost ? { gitHost } : {}),
     ...(gitTokenExchangeUrl ? { gitTokenExchangeUrl } : {}),
   };
+}
+
+/** Restrict dispatch-only credentials to the active direct human turn. A
+ * delegated/bot turn can only forward its existing signed tool set. */
+export function dispatchOnlyToolsForTurn(
+  config: TriggerUserAuthConfig | null | undefined,
+  request: {
+    sourceChatId: string;
+    targetChatId: string;
+    targetAppIds: string[];
+    directHuman: boolean;
+    inherited: boolean;
+  },
+): TriggerUserAuthTool[] {
+  const policy = config?.enabled ? config.dispatchOnly : undefined;
+  if (!policy || !request.directHuman || request.inherited
+    || request.sourceChatId !== request.targetChatId
+    || !policy.chatIds.includes(request.targetChatId)
+    || request.targetAppIds.length === 0
+    || request.targetAppIds.some(id => !policy.targetAppIds.includes(id))) return [];
+  return policy.tools;
 }
 
 /** A bare hostname. Rejects anything carrying a scheme, path, or shell-hostile
@@ -307,11 +367,12 @@ export function triggerUserAuthApplies(
   return !!config?.enabled && config.tools.includes(tool);
 }
 
-/** Whether a `--mention` handoff from this bot carries the turn's sender to a
- *  bot on the same machine. Needs the policy itself to be on: a bot that does
- *  not run its own tools as the sender has no verified sender to hand over. */
+/** Whether a `--mention` handoff from this bot can carry the turn's sender to
+ *  a bot on the same machine. Dispatch-only tools can establish this boundary
+ *  even when the source bot governs none of its own CLI tools. */
 export function delegatesOnMention(
   config: TriggerUserAuthConfig | null | undefined,
 ): boolean {
-  return !!config?.enabled && config.tools.length > 0 && config.delegateOnMention !== false;
+  return !!config?.enabled && (config.tools.length > 0 || !!config.dispatchOnly)
+    && config.delegateOnMention !== false;
 }

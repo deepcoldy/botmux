@@ -208,6 +208,8 @@ export async function recordTurnOutcome(
   terminal: TurnOutcomeTerminal,
   opts: {
     recoveryHandled: boolean;
+    /** Per-turn facts, independent of whether this turn still owns the latest projection. */
+    onClassified?: (outcome: TurnOutcome) => void;
     isFinalDelivered: () => boolean;
     drainTimeoutMs?: number;
     now?: () => number;
@@ -226,12 +228,13 @@ export async function recordTurnOutcome(
       now,
     );
   }
-  if (outcomeSeq.get(ds) !== seq) return undefined;
   const outcome = classifyTurnOutcome(terminal, {
     recoveryHandled: opts.recoveryHandled,
     finalDelivered: terminal.status === 'completed' && opts.isFinalDelivered()
       && finalKinds.get(ds)?.get(terminal.turnId) !== 'diagnostic',
   });
+  opts.onClassified?.(outcome);
+  if (outcomeSeq.get(ds) !== seq) return undefined;
   const at = now();
   const current = normalizeLastTurn(ds.session.lastTurn);
   const startedAt = turnStarts.get(ds)?.get(terminal.turnId);

@@ -1777,9 +1777,16 @@ export interface OutputToggleDeps {
   unfoldMore: () => Promise<void>;
   /** Click 「📖 显示输出」; false when the click did not go through. */
   clickShow: () => Promise<boolean>;
+  /** Load Messenger afresh and open the topic again. Without it the view is never reloaded. */
+  reopen?: () => Promise<void>;
   now: () => number;
   sleep: (ms: number) => Promise<void>;
 }
+
+/** How long a landed click may go without the card reading 「隐藏输出」 before the topic is reloaded. */
+const OUTPUT_STALE_MS = 25_000;
+/** What a reload that outlasted the budget still gets to unfold the panel and read the toggle. */
+const OUTPUT_AFTER_RELOAD_MS = 15_000;
 
 /**
  * Turn the streaming card's output on. The toggle sits in the card's
@@ -1788,20 +1795,36 @@ export interface OutputToggleDeps {
  * is out of sight or will not take a click (a panel folded by clipping keeps
  * the label readable), and click 「显示输出」 once: a second click turns the
  * output off again. Done when the toggle reads 「隐藏输出」.
+ *
+ * With `reopen`, a click that landed but left the card unchanged for
+ * OUTPUT_STALE_MS reloads the topic once and reads the card again, without a
+ * second click. CI: in most such failures the daemon had taken the click,
+ * switched the worker to screenshots and updated the card without an error,
+ * while the open view kept showing 「显示输出」. A card that still reads
+ * 「显示输出」 after the reload was not updated at all, and fails.
  */
 export async function turnOutputOn(
   deps: OutputToggleDeps,
   timeoutMs: number,
-): Promise<{ on: boolean; clicked: boolean; unfolds: number }> {
-  const deadline = deps.now() + timeoutMs;
+): Promise<{ on: boolean; clicked: boolean; unfolds: number; reloaded: boolean }> {
+  let deadline = deps.now() + timeoutMs;
   let clicked = false;
+  let clickedAt = 0;
+  let reloaded = false;
   let unfolds = 0;
   while (deps.now() < deadline) {
     const toggle = await deps.toggle();
-    if (toggle === 'hide') return { on: true, clicked, unfolds };
+    if (toggle === 'hide') return { on: true, clicked, unfolds, reloaded };
+    if (clicked && !reloaded && deps.reopen && deps.now() - clickedAt >= OUTPUT_STALE_MS) {
+      reloaded = true;
+      await deps.reopen();
+      deadline = Math.max(deadline, deps.now() + OUTPUT_AFTER_RELOAD_MS);
+      continue;
+    }
     let unfold = toggle === undefined;
     if (!unfold && !clicked) {
       clicked = await deps.clickShow();
+      if (clicked) clickedAt = deps.now();
       unfold = !clicked;
     }
     if (unfold) {
@@ -1810,7 +1833,7 @@ export async function turnOutputOn(
     }
     await deps.sleep(1_000);
   }
-  return { on: false, clicked, unfolds };
+  return { on: false, clicked, unfolds, reloaded };
 }
 
 const MORE_ACTIONS_LABEL = '更多操作';
@@ -1823,6 +1846,7 @@ const OUTPUT_ON_BUDGET_MS = 45_000;
 export async function showStreamingOutput(
   agent: PlaywrightAgent,
   page: Page,
+  opts?: { reopen?: () => Promise<void> },
 ): Promise<void> {
   const cardClause =
     '主内容区正在显示的测试话题里，当前会话的流式卡片（主行带"打开 Web 终端"和"关闭会话"的那张，可能在 ACK 文本气泡上方）。' +
@@ -1834,6 +1858,7 @@ export async function showStreamingOutput(
   const header = await moreHeader();
   await header?.scrollIntoViewIfNeeded({ timeout: 15_000 }).catch(() => {});
 
+  let reloadError: string | undefined;
   const result = await turnOutputOn(
     {
       toggle: async () => {
@@ -1860,15 +1885,30 @@ export async function showStreamingOutput(
           .then(() => true)
           .catch(() => false);
       },
+      reopen: opts?.reopen
+        ? async () => {
+            console.warn('[e2e] The card still reads 「显示输出」 after the click; reloading the topic');
+            try {
+              await opts.reopen!();
+            } catch (error) {
+              reloadError = (error as Error).message.split('\n')[0];
+              console.warn(`[e2e] Reloading the topic failed: ${reloadError}`);
+            }
+          }
+        : undefined,
       now: () => Date.now(),
       sleep: (ms) => page.waitForTimeout(ms),
     },
     OUTPUT_ON_BUDGET_MS,
   );
+  if (result.on && result.reloaded) {
+    console.warn('[e2e] The card read 「隐藏输出」 only after a reload: the open view had not rendered the card update');
+  }
   if (!result.on) {
     const detail =
       `the card's output toggle never read 「📕 隐藏输出」 within ${OUTPUT_ON_BUDGET_MS / 1000}s ` +
-      `(clicked 「显示输出」: ${result.clicked ? 'yes' : 'no'}; unfolded 「更多操作」 ${result.unfolds}×)`;
+      `(clicked 「显示输出」: ${result.clicked ? 'yes' : 'no'}; unfolded 「更多操作」 ${result.unfolds}×; ` +
+      `reloaded the topic: ${!result.reloaded ? 'no' : reloadError ? `failed (${reloadError})` : 'yes'})`;
     await recordFailureState(agent, page, MORE_ACTIONS_LABEL, detail);
     throw new Error(`showStreamingOutput: ${detail}`);
   }
@@ -2238,14 +2278,70 @@ function escapeRegExp(text: string): string {
 }
 
 /**
- * Send a command and wait for the bot's answer to it: text matching `pattern`
- * that appears after the last echo of `command` (the user's bubble, or the
- * quote in the bot's reply). Returns the match. DOM order instead of counts,
- * because older messages drop out of Feishu's partial rendering. With
- * `reopen`, a view that shows nothing by half time is opened again once: CI
- * saw a mode restore fail three times while the bot had answered each within
- * a second, because the group view had stopped rendering new messages.
+ * The bot's answer to `command` in the page text `text`: text matching
+ * `pattern` that appears after the last echo of `command` (the user's bubble,
+ * or the quote in the bot's reply). DOM order instead of counts, because older
+ * messages drop out of Feishu's partial rendering.
  */
+export function replyAfterCommand(text: string, command: string, pattern: RegExp): RegExpMatchArray | null {
+  const echo = new RegExp(`${escapeRegExp(command.trim())}[ \\t]*\\n`, 'g');
+  const last = [...text.matchAll(echo)].at(-1);
+  if (!last) return null;
+  return text.slice(last.index! + last[0].length).match(pattern);
+}
+
+/** What awaitCommandReply needs from the page; injected so it can be tested. */
+export interface CommandReplyDeps {
+  /** The rendered page text. */
+  read: () => Promise<string>;
+  /** Scroll toward the newest messages and click 「N 条新消息」. */
+  nudge: () => Promise<void>;
+  /** Load Messenger afresh and open the chat again. Without it the view is never reopened. */
+  reopen?: () => Promise<void>;
+  now: () => number;
+  sleep: (ms: number) => Promise<void>;
+  log: (message: string) => void;
+}
+
+/**
+ * Wait for the answer to an already sent `command` (replyAfterCommand). With
+ * `reopen`, a view that shows nothing by half time is opened again once, and
+ * read once more if that reload outlasted the budget: CI saw a mode restore
+ * fail three times while the bot had answered each within a second, because
+ * the view had stopped rendering new messages — the answers were all there
+ * after a reload.
+ */
+export async function awaitCommandReply(
+  deps: CommandReplyDeps,
+  command: string,
+  pattern: RegExp,
+  timeoutMs: number,
+): Promise<RegExpMatchArray | null> {
+  const started = deps.now();
+  const deadline = started + timeoutMs;
+  let reopened = false;
+  while (deps.now() < deadline) {
+    const match = replyAfterCommand(await deps.read(), command, pattern);
+    if (match) return match;
+    if (deps.reopen && !reopened && deps.now() - started > timeoutMs / 2) {
+      reopened = true;
+      deps.log(`No reply to "${command}" yet; re-opening the view`);
+      try {
+        await deps.reopen();
+      } catch (error) {
+        deps.log(`Re-opening the view failed: ${(error as Error).message.split('\n')[0]}`);
+      }
+      continue;
+    }
+    await deps.nudge();
+    await deps.sleep(2_000);
+  }
+  if (!reopened) return null;
+  await deps.nudge();
+  return replyAfterCommand(await deps.read(), command, pattern);
+}
+
+/** Send a command and wait for the bot's answer to it (awaitCommandReply). Returns the match. */
 export async function sendAndAwaitReply(
   page: Page,
   send: () => Promise<void>,
@@ -2254,30 +2350,21 @@ export async function sendAndAwaitReply(
   timeoutMs = 60_000,
   reopen?: () => Promise<void>,
 ): Promise<RegExpMatchArray> {
-  const echo = new RegExp(`${escapeRegExp(command.trim())}[ \\t]*\\n`, 'g');
   await send();
-  const started = Date.now();
-  const deadline = started + timeoutMs;
-  let reopened = false;
-  while (Date.now() < deadline) {
-    const body = await page.locator('body').innerText();
-    const echoes = [...body.matchAll(echo)];
-    const after = echoes.length > 0 ? body.slice(echoes.at(-1)!.index! + echoes.at(-1)![0].length) : '';
-    const match = after.match(pattern);
-    if (match) return match;
-    if (reopen && !reopened && Date.now() - started > timeoutMs / 2) {
-      reopened = true;
-      console.warn(`[e2e] No reply to "${command}" yet; re-opening the view`);
-      try {
-        await reopen();
-      } catch (error) {
-        console.warn(`[e2e] Re-opening the view failed: ${(error as Error).message.split('\n')[0]}`);
-      }
-      continue;
-    }
-    await scrollConversation(page);
-    await page.waitForTimeout(2_000);
-  }
+  const match = await awaitCommandReply(
+    {
+      read: () => page.locator('body').innerText(),
+      nudge: () => scrollConversation(page),
+      reopen,
+      now: () => Date.now(),
+      sleep: (ms) => page.waitForTimeout(ms),
+      log: (message) => console.warn(`[e2e] ${message}`),
+    },
+    command,
+    pattern,
+    timeoutMs,
+  );
+  if (match) return match;
   throw new Error(`No reply matching ${pattern} after "${command}" within ${timeoutMs}ms`);
 }
 

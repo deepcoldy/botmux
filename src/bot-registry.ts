@@ -1763,6 +1763,8 @@ export interface BotConfig {
    * CODEX_HOME and never reads or copies global auth, with or without sandbox.
    */
   codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode;
+  /** Override native Codex archive on close/cleanup; unset inherits sessionCleanup.archiveCodex. */
+  archiveCodex?: boolean;
   /**
    * Per-bot CLI credential source directory (absolute, `~/` expanded). When set,
    * a sandboxed bot copies its CLI login from `<dir>/<cli>/…` on every cold
@@ -4387,6 +4389,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       existingAppServer,
       // Missing keeps the historical every-cold-spawn global auth refresh.
       codexAuthSync: entry.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
+      archiveCodex: typeof entry.archiveCodex === 'boolean' ? entry.archiveCodex : undefined,
       credentialsSourceDir,
       remoteRunner: entry.remoteRunner === undefined
         ? undefined

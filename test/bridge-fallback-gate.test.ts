@@ -2060,3 +2060,58 @@ describe('structuredFallbackKind', () => {
     )).toBe('none');
   });
 });
+
+describe('empty completion requires delivery, not explicitly classified progress', () => {
+  const completed = {
+    ...turn(100), sessionId: 'session', turnId: 'turn', dispatchAttempt: 1,
+    terminalStatus: 'completed' as const, finalText: '',
+  };
+  const delivered: BridgeSendMarker = {
+    ...markerForContent(150, 'result'), sessionId: 'session', turnId: 'turn', dispatchAttempt: 1,
+    messageId: 'message', responseKind: 'final', deliveryKind: 'current_session_send',
+  };
+
+  it.each(['send', 'transcript'] as const)('keeps both classification and emit gates open for progress (%s)', mode => {
+    for (const marker of [
+      { ...delivered, responseKind: 'progress' as const },
+      { ...delivered, responseKind: 'auxiliary' as const },
+      { ...delivered, replyCardResponseKind: 'progress' as const },
+      { ...delivered, replyCardResponseKind: 'auxiliary' as const },
+    ]) {
+      const kind = structuredFallbackKind(completed, 200, [marker], false, true, mode);
+      expect(kind).toBe('empty_completed');
+      expect(shouldSuppressStructuredFallback(kind, completed, 200, [marker], false, mode)).toBe(false);
+    }
+  });
+
+  it('retains the real no-answer/no-send regression', () => {
+    expect(structuredFallbackKind(completed, 200, [], false, true)).toBe('empty_completed');
+  });
+
+  it('does not repost after a final, including an image-only final', () => {
+    for (const marker of [delivered, { ...delivered, contentLength: undefined, contentHash: undefined }]) {
+      expect(structuredFallbackKind(completed, 200, [marker], false, true)).toBe('none');
+    }
+  });
+
+  it('does not borrow another turn or attempt final', () => {
+    for (const marker of [{ ...delivered, turnId: 'other' }, { ...delivered, dispatchAttempt: 2 }]) {
+      expect(structuredFallbackKind(completed, 200, [marker], false, true)).toBe('empty_completed');
+    }
+  });
+
+  it('keeps legacy unclassified sends and explicit silence compatible', () => {
+    const { responseKind: _kind, ...legacy } = delivered;
+    expect(structuredFallbackKind(completed, 200, [legacy], false, true)).toBe('none');
+    const silent = { ...completed, finalText: 'BOTMUX_NOTHING_TO_SEND' };
+    expect(shouldSuppressStructuredFallback('final', silent, 200, [], false)).toBe(true);
+    expect(shouldEmitEmptyCompletedBridgeFallback(completed, 200, [], true)).toBe(false);
+    expect(shouldEmitEmptyCompletedBridgeFallback({ ...completed, isLocal: true }, 200, [], false)).toBe(false);
+  });
+
+  it('preserves normal final text dedup independently of completion evidence', () => {
+    const progress = { ...delivered, responseKind: 'progress' as const };
+    const answer = { ...completed, finalText: 'result' };
+    expect(shouldSuppressStructuredFallback('final', answer, 200, [progress], false)).toBe(true);
+  });
+});

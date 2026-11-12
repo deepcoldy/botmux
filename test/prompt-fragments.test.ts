@@ -102,6 +102,8 @@ describe('prompt fragment catalog', () => {
       'ai.whiteboard.block_read',
       'ai.whiteboard.hint_send_shell',
       'ai.send.after_success_unified',
+      'ai.send.after_success_progress',
+      'ai.send.after_success_auxiliary',
     ];
     for (const key of migratedKeys) {
       expect(PROMPT_FRAGMENTS.some((f: PromptFragmentSpec) => f.key === key), key).toBe(true);

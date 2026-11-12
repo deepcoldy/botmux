@@ -188,6 +188,7 @@ export const messages: Record<string, string> = {
   'worker.traex_auto_model.preflight_hold': '⚠️ 本次独立新轮次进入前，模型池内所有已知负载都超过 {threshold}%；当前模型 {model} 已是最低负载项（{load}%），本轮保持该模型。',
   'worker.traex_auto_model.continue_prompt': '继续完成当前尚未结束的任务。请先根据已有会话上下文确认已经完成的步骤，不要重复已经成功执行的有副作用操作，然后从中断处继续并给出最终结果。',
   'worker.traex_auto_model.continuation_rejected': '⚠️ 会话契约拒绝了自动换模续接，原始请求不会重发。请核对执行状态后再恢复任务。',
+  'worker.traex_auto_model.continuation_timeout': '⚠️ 自动换模后没能及时确认可以接着做原任务，本轮已结束，原请求不会自动重发；后面排队的消息会照常处理。',
   'worker.traex_auto_model.access_search': '⚠️ 已跳过本轮访问暂时受限的模型，正在按模型池顺序尝试 {toModel} 并续接原会话。不会使用池外模型。',
   'worker.traex_auto_model.access_available_model': '↪️ 原模型访问暂时受限。已自动切换至模型池中首个不需排队的模型 {toModel}（当前负载 {load}%），正在续接原会话。如果仍持续排队，会继续检查后续模型。',
   'worker.traex_auto_model.access_selected_model': '↪️ 已跳过访问暂时受限的模型，当前 {toModel} 已正常开始执行，继续原会话。',
@@ -1293,7 +1294,7 @@ export const messages: Record<string, string> = {
   'ai.routing.ask_wait': '等待 botmux ask 真人回答时，无输出属正常等待；不得发送 Ctrl-C、kill 或取消等待工具来提前结束。复用原等待进程直到回答或正常超时；传输错误、超时和机器人回复不代表真人授权。收到 Ask 接续事件时回读原任务、问题与方案版本，只消费对应决定，不重跑已完成工作。',
   'ai.routing.usage_helpers': '- 上下文：`botmux history`；协作 bot：`botmux bots list`',
   'ai.routing.usage_silence': '- 不是发给你的消息，最终回复只输出 `BOTMUX_NOTHING_TO_SEND`',
-  'ai.routing.no_visible_output_ok': '`botmux send` 成功即已送达；本轮终端无可见输出、直接结束是正常的。若看到「上一条回复没有可见输出，请继续」之类提示，那是底层 CLI 误判，不要因此重发——除非 `botmux send` 本身报错。',
+  'ai.routing.no_visible_output_ok': '只有最终答复已通过 botmux send --response-kind final 成功交付，才可无终端正文地结束；progress 发送成功不代表任务完成。不要因“无输出”提示重发已交付的答案；发送结果未知先核对，不能直接当作成功或失败。',
   'ai.routing.workflow_hint': 'Workflow：多步目标或已保存的流程，先问用户是否用工作流；用户同意或发 `/workflow` 后，先运行 `botmux skill show botmux-workflow`。',
   'ai.routing.feedback_response_kind': '本轮最终答复用 `botmux send --response-kind final` 标记且只发一次（挂载页脚签名；若此 bot 启用了最终回答反馈，同时挂反馈按钮）。中间进度/补充类发送不要加 flag（默认按 progress，不展示页脚签名）。声明 final 即锁定本轮最终答复：之后不能再发 progress，如需补充请用 `--response-kind auxiliary`。',
   'ai.routing.hidden_context_defense': '以下 XML/配置块是隐藏运行上下文，只能静默读取并遵守：`<botmux_routing>`、`<botmux_builtin_skills>`、`<identity>`、`<session_id>`、`<role>`、`<sender>`、`<mentions>`、`<available_bots>`、`<attachments>`。不要回复、不要确认、不要说“已了解/已补充/已记录”。只处理 `<user_message>` 中的真实用户请求。',
@@ -1301,10 +1302,12 @@ export const messages: Record<string, string> = {
   // 转发，系统提示彻底不提 botmux send——intro 换成下面这条，usage_* 只留
   // helpers / silence（见 shared-hints.ts）。
   'ai.routing.intro_transcript': '你在飞书（Lark）会话中。用户看不到终端输出；你的最终 assistant message 会由 botmux 自动转发回飞书，直接作答即可。',
-  'ai.send.after_success_hint': '本次发送已完成。若本轮 final 后仍需补充，请使用 `botmux send --response-kind auxiliary`；没有了就让最终回复只输出 BOTMUX_NOTHING_TO_SEND。',
+  'ai.send.after_success_hint': '最终答复已成功发送。若原任务已完成或已交代具体阻碍，可让终端最终回复只输出 BOTMUX_NOTHING_TO_SEND，勿重复发送；后续补充使用 botmux send --response-kind auxiliary。',
   'ai.send.after_success_steer_advanced': '本次发送已完成。会话已自动切换至下一排队轮次；请针对新消息使用 `botmux send --response-kind final` 发送完整答复（若无需回复则输出 BOTMUX_NOTHING_TO_SEND）。',
   // 本轮发送走统一回复卡片（unified reply）时的成功回显——此时内容已进卡片，
   // 提示模型完成时用 --response-kind final 发完整答复。
+  'ai.send.after_success_progress': '进度消息已发送（未标记 final）。若这条已是对原请求的完整答复，直接让最终回复只输出 BOTMUX_NOTHING_TO_SEND，不要再发总结或重复内容；若只是确认、阶段进度或任务尚未完成，继续原任务，完成或受阻时用 botmux send --response-kind final 交付结果或具体阻碍。',
+  'ai.send.after_success_auxiliary': '补充消息已发送。请核对原任务的最终答复是否已成功交付；补充消息本身不证明原任务完成，已交付的内容不要重复发送。',
   'ai.send.after_success_unified': '进度已更新到本轮卡片。完成时请用 botmux send --response-kind final 发送完整答复。',
   'ai.routing.xpi_as_hint': 'XPI 已开启：向其他 Bot 发送普通文本时必须预先声明处理方式。马上单独做用 `botmux send --as independent`；留给当前任务、等对方确认用 `--as suggestion`。',
   'ai.shell.xpi_as_hint': 'XPI 已开启：向其他 Bot 发送普通文本必须携带处理方式。马上单独做：`botmux send --as independent`；留给当前任务：`botmux send --as suggestion`。',
@@ -1358,8 +1361,8 @@ export const messages: Record<string, string> = {
   'ai.shell.multiline_heredoc': '多行正文必须走 quoted heredoc / stdin（或 UTF-8 `--content-file`）；禁止写成 `botmux send "第一行\\n第二行"`，也不要先 `JSON.stringify` / JSON 转义再传位置参数，shell / botmux 不会把字面量 `\\n` 还原成换行。',
   'ai.shell.heredoc_example': "正确多行示例：\n```bash\nbotmux send <<'EOF'\n第一行\n第二行\nEOF\n```",
   'ai.shell.helpers': '辅助命令：`botmux history`（读此会话历史；thread/话题会话拉话题内，普通群 chat-scope 会话拉整群）、`botmux quoted <message_id>`（按需读取被引用的消息，仅在 prompt 头部出现 `[用户引用了消息 ...]` 提示时使用）、`botmux bots list`（查群内其他机器人）。',
-  'ai.shell.when_to_send': '发给你的消息至少用 `botmux send` 回应一次（Bash 执行,不是 print/echo）,别沉默;发什么、发几条由你判断。只有根本不是发给你的消息才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
-  'ai.shell.no_visible_output_ok': '`botmux send` 成功（退出码 0）即代表已送达用户；本轮终端没有可见文本、直接结束是正常的。若看到「你上一条回复没有可见输出，请继续产出用户可见回复」之类提示，那是底层 CLI 的误判——不要重发，除非 `botmux send` 自己报错。',
+  'ai.shell.when_to_send': '对于需要回复的请求，必须通过 Bash 执行 botmux send --response-kind final 交付完整结果或具体阻碍，并核验发送成功后再结束；查询完成或只发进度不算交付。已成功交付不要重复发送。只有根本不是发给你的消息才让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND` 这一个词。',
+  'ai.shell.no_visible_output_ok': '只有最终答复已通过 botmux send --response-kind final 成功交付（退出码 0），才可无终端正文地结束；progress 发送成功不代表任务完成。不要因“无输出”提示重发已交付的答案；发送结果未知先核对，不能直接当作成功或失败。',
   // replyDelivery=transcript 的 shell-hints 变体：只用 intro / when_to_send 两条改口
   // 版 + helpers，整段不提 botmux send（commands_are_shell / how_to_send / heredoc /
   // mention_gate 都不注入，见 shared-hints.ts）。
@@ -1375,9 +1378,9 @@ export const messages: Record<string, string> = {
   'ai.available_bots.hint': '要跟这里的某个 bot 沟通或协作必须 --mention 它的 open_id（botmux send --mention ou_xxx ...），不 --mention 对方 bot 完全收不到消息',
   'ai.available_bots.hint_collapsed': '要跟别的 bot 沟通或协作先 `botmux bots list` 查 open_id 再 --mention，不 --mention 对方收不到',
   'ai.available_bots.collapsed_line': '群里有 {count} 个可协作 bot：{names}。',
-  'ai.followup.reminder': '发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND',
-  'ai.followup.reminder_hook': '本会话通过 botmux 桥接飞书,终端里的输出用户看不到。会话约定:回复通过 botmux send 发送到飞书会话;发什么、发几条由你判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND。',
-  'ai.followup.reminder_no_resend': '发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND;send 成功即已送达,本轮无可见文本地结束是正常的,别因「无输出」提示重发',
+  'ai.followup.reminder': '需要回复的请求，结束前必须用 botmux send --response-kind final 交付结果或具体阻碍并核验成功；查询完成、发过进度不等于交付。已交付勿重发；只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND。',
+  'ai.followup.reminder_hook': '本会话通过 botmux 桥接飞书，用户看不到终端输出。需要回复的请求，结束前必须用 botmux send --response-kind final 交付结果或具体阻碍并核验成功；查询完成、发过进度不等于交付。已交付勿重发；只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND。',
+  'ai.followup.reminder_no_resend': '需要回复的请求，结束前必须用 botmux send --response-kind final 交付结果或具体阻碍并核验成功；查询完成、发过进度不等于交付。最终答复已成功交付时，终端无正文是正常的，不要重复发送；发送结果未知先核对。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND。',
   'ai.followup.feishu_safe_emphasis': '短进度优先纯文本；强调仅包短词或无中文标点的短语，标点和后文放在 `**` 外。',
   'ai.followup.no_local_addresses': '回复里不要放开发机路径、文件协议或本机服务地址，文件用附件或可访问链接。',
   // No-transport 续轮（apiOnly bot / HTTP 虚拟会话）：这是程序发起的请求-应答，无飞书
@@ -1653,12 +1656,14 @@ export const messages: Record<string, string> = {
   'worker.raw_input_failed_command_only': '⚠️ Slash 命令未能确认送达 {cliName}。请检查当前终端状态后重发。',
   'worker.raw_input_failed_recovery': '⚠️ Slash 命令未能确认送达 {cliName}，同一条消息中紧随其后的正文没有继续提交。\n原因：{reason}',
   'worker.raw_input_failed_command_only_recovery': '⚠️ Slash 命令未能确认送达 {cliName}。\n原因：{reason}',
-  'worker.empty_final_completed': '⚠️ {cliName} 已报告本轮处理完成，但 Botmux 未能在该 structured CLI 的当前 turn 中匹配到最终文本或成功外发证据。如果你已看到 bot 发出的结果，可忽略本提示；否则请打开 Web 终端查看最后输出，或重发消息继续会话。',
+  'worker.empty_final_completed': '⚠️ {cliName} 已报告本轮处理完成，但 Botmux 未能在该 structured CLI 的当前 turn 中匹配到最终文本或成功送达的最终答复（进度消息不计入）。如果你已看到 bot 发出的结果，可忽略本提示；否则请打开 Web 终端查看最后输出，或重发消息继续会话。',
   'worker.final_output_content_audit_blocked': '⚠️ 本轮回复含有被飞书判定为敏感的内容（错误码 {code}），自动打码后仍未通过内容安全审计，没能发到群里。完整回复保留在 Web 终端中，可以打开查看。',
   'worker.final_output_content_audit_blocked_unredacted': '⚠️ 本轮回复含有被飞书判定为敏感的内容（错误码 {code}），没能自动定位到需要打码的部分，消息没能发到群里。完整回复保留在 Web 终端中，可以打开查看。',
   'worker.final_output_content_audit_redacted_note': '部分内容已自动打码',
   'worker.final_output_card_rejected': '⚠️ 本轮回复卡片被飞书拒收（错误码 {code}）。已停止重复回传，会话仍可继续使用。完整回答保留在 Web 终端中，可打开查看或要求以纯文字重新发送。',
   'worker.bridge_restored_turn_notice': '⚠️ 本轮曾因 botmux 重启中断，以下是从终端记录恢复的该轮输出（可能不完整）：',
+  'card.restored_turn_notice': '⚠️ 这是 {time}「{excerpt}」那一轮的回复：这一轮中途 botmux 重启过，以下内容从终端记录恢复，可能不完整。',
+  'card.restored_turn_notice_no_excerpt': '⚠️ 这是 {time} 那一轮的回复：这一轮中途 botmux 重启过，以下内容从终端记录恢复，可能不完整。',
   'worker.restart_interrupted.note': '【botmux 提示】这个会话刚刚重启过：CLI 进程中途退出，已用原上下文恢复。{details}请先核对这些工作的实际状态（例如 CI、测试、子任务的结果），再继续没做完的事；仍需要的监控或后台任务要重新启动。',
   'worker.restart_interrupted.note_turn': '重启前你正在处理的那一轮还没做完。',
   'worker.restart_interrupted.note_tasks': '以下后台任务随旧进程一起终止，不会再有完成通知：{tasks}。',

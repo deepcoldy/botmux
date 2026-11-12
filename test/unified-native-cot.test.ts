@@ -1,12 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { DaemonSession } from '../src/core/types.js';
 import { config } from '../src/config.js';
 import { getBot, getBotClient } from '../src/bot-registry.js';
 import { updateMessage } from '../src/im/lark/client.js';
-import { replyCardModeFor, queueTurnReplyTools, flushTurnReplyTools, updateTurnReplyCard, updateReplyCardNativeThinking, prepareReplyCardNativeThinking, retireReplyCardDisplay, supersedeTurnReplyCard } from '../src/core/turn-reply-card.js';
+import { replyCardModeFor, queueTurnReplyTools, flushTurnReplyTools, updateTurnReplyCard, updateReplyCardNativeThinking, prepareReplyCardNativeThinking, retireReplyCardDisplay, supersedeTurnReplyCard, __testOnlyDrainTurnReplyTools } from '../src/core/turn-reply-card.js';
 import { abortCotMessage, handleCotThinkingSuperseded, handleCotThinkingUpdate, finalizeCotMessage } from '../src/im/lark/cot-message.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
 import { loadWorkerPoolMessageHandlers } from './helpers/worker-pool-message-harness.js';
@@ -49,13 +49,10 @@ describe('unified replies with an independent native CoT channel', () => {
     } as DaemonSession;
   });
   afterEach(async () => {
-    // Thinking updates enqueue a timer and may still be acquiring the disk
-    // publication lock after a handler returns. Drain them while this test's
-    // dataDir, bot and sender are still installed, before the next fixture can
-    // reuse their mutable bindings or remove the records underneath a writer.
-    await flushTurnReplyTools(ds, 'om_turn');
-    await flushTurnReplyTools(ds, 'om_next');
-    await settle();
+    // Queued tool flushes run on 1200ms unref timers and write through the
+    // mutable config.session.dataDir. Drain them before removing this test's
+    // dir so a late flush can neither race the rmdir nor land in the next test.
+    await __testOnlyDrainTurnReplyTools();
     vi.unstubAllEnvs();
     rmSync(dir, { recursive: true, force: true });
   });
@@ -472,5 +469,41 @@ describe('unified replies with an independent native CoT channel', () => {
     handle(update('legacy enabled')); await settle();
     expect(request.mock.calls.some(([req]) => req.method === 'POST')).toBe(true);
     finalizeCotMessage(ds, 'om_turn', 'completed'); await settle();
+  });
+
+  it('drain cancels a queued tools timer so it cannot write into a later test data dir', async () => {
+    // A test that queues tool activity without an explicit flush leaves a
+    // 1200ms unref timer. The store reads config.session.dataDir only when the
+    // timer fires, so an undrained timer from a finished test writes into the
+    // next test's dir (and races its teardown). Drain must cancel it outright.
+    const nextDir = mkdtempSync(join(tmpdir(), 'unified-native-cot-drain-'));
+    try {
+      queueTurnReplyTools(ds, { turnId: 'om_turn', entries: [{ kind: 'thinking', text: 'buffered' }] }, send, () => true);
+      await __testOnlyDrainTurnReplyTools();
+      config.session.dataDir = nextDir;
+      await new Promise(resolve => setTimeout(resolve, 1300));
+      expect(readdirSync(nextDir)).toEqual([]);
+      expect(send).not.toHaveBeenCalled();
+    } finally {
+      config.session.dataDir = dir;
+      rmSync(nextDir, { recursive: true, force: true });
+    }
+  });
+
+  it('drain waits for a tools flush already writing, so teardown cannot remove the dir under it', async () => {
+    bot.config.cotEnabled = true;
+    await updateTurnReplyCard(ds, 'om_turn', { kind: 'start' }, send);
+    let releasePatch!: () => void;
+    vi.mocked(updateMessage).mockImplementationOnce(() => new Promise<void>(resolve => { releasePatch = resolve; }));
+    queueTurnReplyTools(ds, { turnId: 'om_turn', entries: [{ kind: 'thinking', text: 'in flight' }] }, send, () => true);
+    const flushing = flushTurnReplyTools(ds, 'om_turn');
+    await vi.waitFor(() => expect(releasePatch).toBeTypeOf('function'));
+    let drained = false;
+    const draining = __testOnlyDrainTurnReplyTools().then(() => { drained = true; });
+    await settle();
+    expect(drained).toBe(false);
+    releasePatch();
+    await Promise.all([flushing, draining]);
+    expect(drained).toBe(true);
   });
 });

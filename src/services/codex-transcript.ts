@@ -249,6 +249,9 @@ export interface CodexBridgeEvent {
   /** Concatenated text from the message's content blocks (input_text for
    *  user, output_text for assistant). Empty for 'cot' events. */
   text: string;
+  /** Exact alternative input spellings proved by the CLI's user record
+   * (e.g. TRAE's native skill expansion). Never derived from assistant text. */
+  inputTextAliases?: string[];
   /** For kind 'cot': the thinking / tool-call entries parsed from this line. */
   cotEntries?: CodexCotEntry[];
   /** Optional durable-delivery terminal outcome carried by bridges with an

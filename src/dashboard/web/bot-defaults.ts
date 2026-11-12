@@ -123,6 +123,8 @@ export const BOT_DEFAULTS_SECTIONS: readonly BotDefaultsSection[] = [
   },
   { id: 'cross-bot', tab: 'sessions', titleKey: 'botDefaults.sectionCrossBot', fieldKeys: ['botDefaults.botToBotSameDir'] },
   { id: 'session-cap', tab: 'sessions', titleKey: 'botDefaults.sectionSessionCap', fieldKeys: ['botDefaults.maxLiveWorkers', 'botDefaults.idleSuspendMinutes'] },
+  // codex / codex-app（或留有显式覆盖的 Bot）才渲染，见 codexArchiveSectionVisible；覆盖全局 sessionCleanup.archiveCodex。
+  { id: 'codex-archive', tab: 'sessions', titleKey: 'botDefaults.sectionCodexArchive', fieldKeys: ['botDefaults.archiveCodexLabel'] },
   { id: 'prompt-cache', tab: 'sessions', titleKey: 'botDefaults.sectionPromptCache', fieldKeys: [
       'promptCache.ttl', 'promptCache.keepalive', 'promptCache.idleMinutes', 'promptCache.maxPings',
       'promptCache.activeHours', 'promptCache.minContextTokens',
@@ -246,6 +248,26 @@ export function findBotDefaultsSection(id: string | null | undefined): BotDefaul
  * `#/bot-defaults?bot=<appId>&tab=<分类>&section=<区块>&field=<配置项>` 深链；都不给就是 Bot 配置页本身。
  * 给了区块就不必再给分类，页面按区块所在的分类切过去。
  */
+/** 为什么这个 Bot 的会话不会做 Codex 原生归档（与 daemon 侧 ownedLocalCodex 的 Bot 级条件对齐）；
+ *  null = 会按本设置归档。只用于提示，不拦保存：显式值仍作用于切换前启动、尚未关闭的旧会话。 */
+export type CodexArchiveInapplicable = 'not-codex' | 'wrapper' | 'scratch' | 'backend';
+
+export function codexArchiveInapplicableReason(
+  bot: Pick<BotDefaultsRow, 'cliId' | 'wrapperCli' | 'effectiveSandboxMode' | 'sandboxMode' | 'sandbox' | 'backendType' | 'defaultBackendType'>,
+): CodexArchiveInapplicable | null {
+  if (bot.cliId !== 'codex' && bot.cliId !== 'codex-app') return 'not-codex';
+  if (bot.wrapperCli) return 'wrapper';
+  if ((bot.effectiveSandboxMode ?? bot.sandboxMode ?? (bot.sandbox ? 'oncall' : 'off')) === 'scratch') return 'scratch';
+  const backend = bot.backendType || bot.defaultBackendType;
+  if (backend && backend !== 'pty' && backend !== 'tmux') return 'backend';
+  return null;
+}
+
+/** Codex Bot 总是显示；其它 CLI 只在还留着显式覆盖时显示，保证残留值看得见、清得掉。 */
+export function codexArchiveSectionVisible(bot: Pick<BotDefaultsRow, 'cliId' | 'archiveCodex'>): boolean {
+  return bot.cliId === 'codex' || bot.cliId === 'codex-app' || typeof bot.archiveCodex === 'boolean';
+}
+
 export function botDefaultsHref(target: { bot?: string; tab?: BotDefaultsTab; section?: string; field?: string } = {}): string {
   const params = new URLSearchParams();
   if (target.bot) params.set('bot', target.bot);
@@ -396,6 +418,10 @@ export type BotDefaultsRow = {
    *  (null: older daemon). Advice only; never blocks saving. */
   scratchCapability?: ScratchCapability | null;
   codexAuthSync?: 'shared' | 'isolated';
+  /** Per-bot override of the global close/cleanup Codex archive switch; null = inherit. */
+  archiveCodex?: boolean | null;
+  /** Current global `sessionCleanup.archiveCodex`, shown on the inherit option. */
+  archiveCodexDefault?: boolean;
   /** Trigger-user CLI auth: null / absent = off (the historical behavior, where
    *  CLI calls use whatever identity is logged in on the machine).
    *  gitHost / gitTokenExchangeUrl have no editor in the UI — they round-trip

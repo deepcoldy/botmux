@@ -99,6 +99,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => ({
 import {
   initWorkerPool,
   __testOnly_setupWorkerHandlers,
+  __testOnly_setSuspendBackingVerifier,
   recordTurnExplicitMention,
 } from '../src/core/worker-pool.js';
 import { beginFinalOutputDelivery, waitForFinalOutputDeliveryDrain } from '../src/core/final-output-delivery-drain.js';
@@ -234,6 +235,32 @@ describe('independent turn terminal receipt', () => {
     expect(call[4]).toBe('om_turn_done');
     expect(call[5]?.replyTarget).toEqual({ mode: 'thread', rootMessageId: 'om_exact_root' });
     expect(call[5]?.uuid).toMatch(/^tr_[0-9a-f]{47}$/);
+  });
+
+  it('still posts the strip when a suspend is queued for the turn, then carries the suspend out', async () => {
+    // The suspend route queues `botmux suspend` while the session works; the
+    // turn's terminal is where it may run. It must not take the worker before
+    // the terminal's own receipt work has started.
+    __testOnly_setSuspendBackingVerifier(() => true);
+    try {
+      const ds = makeDs();
+      ds.initConfig = { backendType: 'tmux' } as any;
+      ds.lastScreenStatus = 'idle';
+      ds.pendingSuspendReason = 'manual_suspend';
+      bindLarkTurn(ds, 'om_turn_queued_suspend');
+      const worker = ds.worker as any;
+      __testOnly_setupWorkerHandlers(ds, worker);
+
+      await deliver(ds, terminalMsg('om_turn_queued_suspend'));
+
+      await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+      expect(buildTurnTerminalReceiptCard).toHaveBeenCalledWith('completed', expect.anything());
+      await vi.waitFor(() => expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' }));
+      expect(ds.worker).toBe(null);
+      expect(ds.pendingSuspendReason).toBeUndefined();
+    } finally {
+      __testOnly_setSuspendBackingVerifier();
+    }
   });
 
   it.each(['traex', 'codex'] as const)('patches only the last standard reply footer (%s)', async cliId => {

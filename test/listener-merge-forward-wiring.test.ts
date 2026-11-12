@@ -14,6 +14,10 @@
  * The reroute idempotency (a CAS-loser re-enters carrying the rendered
  * prompt) is pinned at the pure-function level in
  * message-listener.test.ts; here we assert the two production call sites.
+ *
+ * The same new-topic route also pins the opening turn identity that listener
+ * auto-close relies on: the cold fork never begins a presentation turn, so its
+ * terminal must be recognised through the submitted input identity.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -111,6 +115,7 @@ vi.mock('../src/im/lark/merge-forward.js', async () => {
 import { registerBot } from '../src/bot-registry.js';
 import { sessionKey } from '../src/core/types.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { recordMessageListenerTurnTerminal } from '../src/core/message-listener-auto-close.js';
 import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleNewTopic as handleNewTopic,
@@ -215,6 +220,30 @@ describe('listener merge-forward expansion wiring', () => {
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
     const input = (mocks.forkWorker.mock.calls[0]?.[1] as any)?.content as string;
     assertForwardBodyOnce(input);
+  });
+
+  it('new-topic route: an auto-close listener opening completes under the turn the worker runs', async () => {
+    const messageId = 'om_fwd_autoclose_root';
+    await handleNewTopic(
+      forwardEvent(messageId),
+      {
+        chatId: CHAT,
+        messageId,
+        chatType: 'group' as const,
+        scope: 'thread' as const,
+        anchor: messageId,
+        replyRootId: messageId,
+        larkAppId: APP,
+        messageListener: listenerMatch({ autoCloseAfterCompletion: true }),
+      },
+    );
+
+    const ds = activeSessions.get(sessionKey(messageId, APP))!;
+    const turnId = (mocks.forkWorker.mock.calls[0]?.[2] as { turnId?: string } | undefined)?.turnId;
+    expect(turnId).toBeTruthy();
+    // turn_terminal carries the turnId handed to forkWorker.
+    expect(recordMessageListenerTurnTerminal(ds, { turnId: turnId!, status: 'completed' })).toBe(true);
+    expect(ds.messageListenerCompletedTurnId).toBe(turnId);
   });
 
   it('thread route: expanded forward XML reaches the live-worker CLI input once', async () => {
