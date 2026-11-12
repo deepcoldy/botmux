@@ -12398,8 +12398,12 @@ function publishNativeGoal(goal: import('./services/native-goal-state.js').Nativ
   if (binding && workerSessionEventScope) workerSessionEventScope.run(binding, publish);
   else publish();
 }
+/** Opt-in per bot (goalStatusCard), fixed for this worker process. */
+function nativeGoalCardEnabled(): boolean {
+  return lastInitConfig?.goalStatusCard === true && (structuredBridgeIs('traex') || structuredBridgeIs('codex'));
+}
 function observeNativeGoal(): void {
-  if (!structuredBridgeIs('traex') && !structuredBridgeIs('codex') || nativeGoalGeneration !== cliSpawnGeneration) {
+  if (!nativeGoalCardEnabled() || nativeGoalGeneration !== cliSpawnGeneration) {
     nativeGoalSourcePath = undefined;
     if (nativeGoalTimer) clearInterval(nativeGoalTimer);
     nativeGoalTimer = undefined;
@@ -12440,7 +12444,7 @@ function structuredBridgeIngestPath(
       flushTrailingFinal: opts.flushOmpTrailingFinal || opts.flushAntigravityTrailingFinal,
     });
     if (spec.stateCommit === 'drain') structuredBridgeDriverState = result.state;
-    if ((nativeGoalSourcePath !== path || nativeGoalGeneration !== cliSpawnGeneration) && (structuredBridgeIs('traex') || structuredBridgeIs('codex'))) {
+    if ((nativeGoalSourcePath !== path || nativeGoalGeneration !== cliSpawnGeneration) && nativeGoalCardEnabled()) {
       nativeGoalSourcePath = path;
       nativeGoalGeneration = cliSpawnGeneration;
       nativeGoalSignature = undefined;
@@ -12455,7 +12459,7 @@ function structuredBridgeIngestPath(
       nativeGoalTimer = setInterval(observeNativeGoal, 2000);
       nativeGoalTimer.unref?.();
     }
-    if (result.latestGoal !== undefined) {
+    if (result.latestGoal !== undefined && nativeGoalCardEnabled()) {
       publishNativeGoal(result.latestGoal);
     }
     if (nativeGoalSourcePath === path) observeNativeGoal();

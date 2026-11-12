@@ -24,7 +24,8 @@ describe('native goal observer runtime scope', () => {
       backend: {}, cliRestartInProgress: false, Date: { now: () => now }, structuredBridgeIs: () => true,
       traexSessionIdFromRolloutPath: (path: string) => path, codexGenerationSessionIdFromRolloutPath: (path: string) => path,
       readNativeGoalForRollout: () => ({ goalId: 'g1', objective: 'goal', status: 'complete', createdAt: 100, updatedAt: 103, timeUsedSeconds: 9 }),
-      currentBotmuxTurnId: undefined, currentBotmuxDispatchAttempt: undefined };
+      currentBotmuxTurnId: undefined, currentBotmuxDispatchAttempt: undefined, lastInitConfig: { goalStatusCard: true } };
+    scope.nativeGoalCardEnabled = loadWorkerFunction('nativeGoalCardEnabled', scope);
     scope.publishNativeGoal = loadWorkerFunction('publishNativeGoal', scope);
     scope.sessionEventMetadata = loadWorkerFunction('sessionEventMetadata', scope);
     scope.send = (message: any) => events.push(scope.sessionEventMetadata(message));
@@ -46,8 +47,26 @@ describe('native goal observer runtime scope', () => {
   it('does not read a previous physical generation after replacement', () => {
     const read = vi.fn();
     const scope: any = { structuredBridgeIs: () => true, nativeGoalGeneration: 1, cliSpawnGeneration: 2,
-      nativeGoalSourcePath: 'old', nativeGoalTimer: undefined, readNativeGoalForRollout: read };
+      nativeGoalSourcePath: 'old', nativeGoalTimer: undefined, readNativeGoalForRollout: read, lastInitConfig: { goalStatusCard: true } };
+    scope.nativeGoalCardEnabled = loadWorkerFunction('nativeGoalCardEnabled', scope);
     loadWorkerFunction('observeNativeGoal', scope)();
     expect(read).not.toHaveBeenCalled(); expect(scope.nativeGoalSourcePath).toBeUndefined();
+  });
+  it('does not poll the native goal store when the bot switch was off at worker start', () => {
+    const read = vi.fn(() => null);
+    const timer = setInterval(() => {}, 60_000);
+    const scope: any = { structuredBridgeIs: () => true, nativeGoalGeneration: 2, cliSpawnGeneration: 2,
+      nativeGoalSourcePath: 'current', nativeGoalTimer: timer, nativeGoalReadAt: 0, backend: {}, cliRestartInProgress: false,
+      Date: { now: () => 10_000 }, traexSessionIdFromRolloutPath: (path: string) => path, codexGenerationSessionIdFromRolloutPath: (path: string) => path,
+      readNativeGoalForRollout: read, publishNativeGoal: vi.fn(), lastInitConfig: { cliId: 'codex' } };
+    scope.nativeGoalCardEnabled = loadWorkerFunction('nativeGoalCardEnabled', scope);
+    loadWorkerFunction('observeNativeGoal', scope)();
+    expect(read).not.toHaveBeenCalled();
+    expect(scope.nativeGoalTimer).toBeUndefined(); expect(scope.nativeGoalSourcePath).toBeUndefined();
+    scope.lastInitConfig = { cliId: 'codex', goalStatusCard: true };
+    scope.nativeGoalSourcePath = 'current';
+    loadWorkerFunction('observeNativeGoal', scope)();
+    expect(read).toHaveBeenCalledOnce();
+    clearInterval(timer);
   });
 });

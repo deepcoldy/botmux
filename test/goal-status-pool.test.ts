@@ -7,6 +7,7 @@ import { loadWorkerPoolMessageHandlers } from './helpers/worker-pool-message-har
 import { isSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 
 function fixture(silent = false) {
+  const botConfig: any = { apiOnly: false, goalStatusCard: true };
   const acks: any[] = [], posts: any[] = [], patches: any[] = [];
   const worker = { send: (message: any) => acks.push(message) };
   const session: any = { status: 'active', workerGeneration: 1, rootMessageId: 'om_root', sessionId: 'session' };
@@ -15,7 +16,7 @@ function fixture(silent = false) {
   let diskFails = false;
   let patchError: (() => unknown) | undefined;
   const scope: any = { ds, worker, workerGeneration: 1, handlerSession: session, handlerLarkAppId: 'app', handlerAnchor: 'om_root',
-    sessionAnchorId: () => 'om_root', activeSessionsRegistry: undefined, getBot: () => ({ config: { apiOnly: false } }),
+    sessionAnchorId: () => 'om_root', activeSessionsRegistry: undefined, getBot: () => ({ config: botConfig }),
     privateReplyEnabled: () => false, isDocNativeSession: () => false, goalStatusCardOrigin, goalCardEntity: undefined,
     GoalStatusCardController, goalStatusCard: undefined, MessageWithdrawnError, MessageUpdateExpiredError, TopicSendError,
     sessionStore: { updateSession(s: any) { if (diskFails && s.nativeGoalStatusCard) throw new Error('disk write failed'); } },
@@ -28,14 +29,14 @@ function fixture(silent = false) {
     scopedReply: async (card: string, _type: string, turn: string, opts: any) => {
       opts.beforeWrite(); posts.push({ turn, card: JSON.parse(card) }); return 'om_card';
     } };
-  for (const name of ['ownsWorkerSession', 'goalCardOwns', 'ordinaryManagedSuppression', 'managedAuxUiSuppressed', 'goalCardCanDisplay']) {
+  for (const name of ['ownsWorkerSession', 'goalCardOwns', 'goalCardEnabled', 'ordinaryManagedSuppression', 'managedAuxUiSuppressed', 'goalCardCanDisplay']) {
     scope[name] = loadWorkerPoolClosure(name, scope);
   }
   const handler = loadWorkerPoolMessageHandlers(['goal_update'], scope);
   const goal = { goalId: 'g1', objective: 'goal', status: 'active', createdAt: 100, updatedAt: 101, timeUsedSeconds: 4 };
   const send = (changes = {}, turnId = 'om_user') => handler({ type: 'goal_update', signature: 'sig', turnId, goal: { ...goal, ...changes } });
   const settled = async () => { await scope.goalStatusCard?.settled(); };
-  return { ds, session, scope, posts, patches, acks, send, settled, failDisk: (value: boolean) => { diskFails = value; },
+  return { ds, session, scope, botConfig, posts, patches, acks, send, settled, failDisk: (value: boolean) => { diskFails = value; },
     failPatch: (error?: () => unknown) => { patchError = error; }, close: () => scope.goalStatusCard?.dispose() };
 }
 
@@ -76,6 +77,22 @@ describe('native goal worker-pool integration', () => {
     f.failPatch(() => new MessageWithdrawnError('om_card'));
     f.send({ status: 'complete', updatedAt: 108, timeUsedSeconds: 11 }); await f.settled();
     expect(f.posts).toHaveLength(1); f.close();
+  });
+  it('posts nothing and arms no refresh while the bot switch is off, and stops a live card when it is turned off', async () => {
+    const f = fixture(); f.botConfig.goalStatusCard = undefined;
+    f.send(); await f.settled();
+    expect(f.posts).toHaveLength(0); expect(f.scope.goalStatusCard).toBeUndefined();
+    expect(f.session.nativeGoalStatusCard).toBeUndefined(); expect(f.acks).toHaveLength(1);
+    // A goal reported while off is not hidden for good: turning the switch on shows it.
+    expect(f.session.nativeGoalCardOrigin.hidden).toBe(false);
+    f.botConfig.goalStatusCard = true;
+    f.send({ updatedAt: 102, timeUsedSeconds: 5 }); await f.settled();
+    expect(f.posts).toHaveLength(1);
+    const patches = f.patches.length;
+    f.botConfig.goalStatusCard = false;
+    f.send({ status: 'complete', updatedAt: 106, timeUsedSeconds: 9 }); await f.settled();
+    expect(f.patches).toHaveLength(patches); expect(f.posts).toHaveLength(1);
+    f.close();
   });
   it('recognises a withdrawn card on a replacement worker even though the chat lookup of a withdrawn message fails', async () => {
     const f = fixture(); f.send(); await f.settled();

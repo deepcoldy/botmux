@@ -18288,6 +18288,9 @@ function forkWorkerPrepared(
     // Full local-address rule in the system prompt; like leadOnly it is read
     // when a worker process is forked. Rewriting replies reads the live value.
     ...(botCfg.hideLocalAddresses === true ? { hideLocalAddresses: true as const } : {}),
+    // Opt-in native goal status card: the worker reads the CLI goal store only
+    // when this is on at worker start; the daemon also checks the live value.
+    ...(botCfg.goalStatusCard === true ? { goalStatusCard: true as const } : {}),
     // Per-session 缓存过期自动压缩 (core/kimi-cache-expiry.ts); later toggles
     // reach the live worker as `kimi_cache_expiry_auto_compact`.
     ...(isKimiCacheExpiryAutoCompactEnabled(ds.session) ? { kimiCacheExpiryAutoCompact: true as const } : {}),
@@ -18879,9 +18882,15 @@ function setupWorkerHandlers(
     if (isMeetingDrivenTurn(ds, turnId, dispatchAttempt)) return true;
     return ordinaryManagedSuppression(turnId, dispatchAttempt);
   };
+  // Opt-in bot switch, read live: turning it off stops cards immediately. It is
+  // not part of goalCardOwns, which also decides whether a goal is born hidden.
+  const goalCardEnabled = () => {
+    try { return getBot(ds.larkAppId).config.goalStatusCard === true; }
+    catch { return false; }
+  };
   const goalCardCanDisplay = () => {
     const origin = ds.session.nativeGoalCardOrigin;
-    return goalCardOwns() && origin?.hidden === false && !managedAuxUiSuppressed(origin.turnId, origin.dispatchAttempt)
+    return goalCardEnabled() && goalCardOwns() && origin?.hidden === false && !managedAuxUiSuppressed(origin.turnId, origin.dispatchAttempt)
       && !isSubstituteTurn(ds, origin.turnId) && !isTriggerFinalSuppressed(ds, origin.turnId);
   };
   // Opt-in, daemon-owned watchdog: it still ticks when the CLI/model stops
