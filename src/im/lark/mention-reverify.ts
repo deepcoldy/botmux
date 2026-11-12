@@ -13,6 +13,9 @@
  * （需要复用其闭包内的 processMessageEvent / 权威回读 / 幂等闸）：
  *  - contentHasMentionPlaceholder：识别「用户输入过 @」（正文里的 @_user_N 占位符），
  *    作为值得补偿的廉价信号——没打 @ 的普通群聊消息绝不进入补偿，REST 放大有界。
+ *  - mentionPlaceholdersSettled：占位符在 mention 落定后**仍留在正文里**（飞书靠它
+ *    关联 mentions[]），所以只有「还有占位符没对上已落定的 mentions[] 条目」才值得
+ *    回读；@ 了别人的普通消息快照里早已落定，不产生任何回读。
  *  - mentionReverifyEnabled / parseReverifyDelaysMs：总开关与重试节奏（env 可调）。
  *  - acquire/releaseReverifySlot：按 `${larkAppId}:${messageId}` 记账的有界登记表，
  *    同一消息的补偿排期有总量硬上限（防「补偿派发→再被忽略→再补偿」的病态循环），
@@ -64,6 +67,42 @@ export function contentHasMentionPlaceholder(
     }
   } catch { /* 非 JSON 正文：退回原串直接匹配 */ }
   return MENTION_PLACEHOLDER_RE.test(raw);
+}
+
+const MENTION_PLACEHOLDER_GLOBAL_RE = /@_user_\d+/g;
+
+function mentionEntryHasIdentity(mention: unknown): boolean {
+  const id = (mention as { id?: unknown } | null | undefined)?.id;
+  if (typeof id === 'string') return id.trim() !== '';
+  if (!id || typeof id !== 'object') return false;
+  return ['open_id', 'union_id', 'user_id', 'app_id'].some(field => {
+    const value = (id as Record<string, unknown>)[field];
+    return typeof value === 'string' && value.trim() !== '';
+  });
+}
+
+/**
+ * 正文里的 @ 占位符是否已全部落定：每个 `@_user_N` 在 mentions[] 里都有同 key、
+ * 且带身份（open_id / union_id / user_id / app_id 任一）的条目。正文里没有占位符
+ *（从没打 @、编辑时删掉了 @、消息已撤回）同样视为已落定——没有可等的 mention。
+ *
+ * 调用方已确认「没 @ 本 bot」时，已落定 = @ 的是别人或 @ 已不在正文里：快照与
+ * 权威回读据此给出同一个结论，排期入口和回读终止判定共用本函数，两处不会分叉。
+ * 兼容 WS 事件形态（mentions[].id 是对象）与 REST 行形态（id 是字符串）。
+ */
+export function mentionPlaceholdersSettled(
+  message: (MentionReverifyMessageLike & { mentions?: unknown }) | null | undefined,
+): boolean {
+  const raw = message?.content ?? message?.body?.content;
+  const keys = new Set(typeof raw === 'string' ? raw.match(MENTION_PLACEHOLDER_GLOBAL_RE) ?? [] : []);
+  if (keys.size === 0) return true;
+  const mentions: unknown[] = Array.isArray(message?.mentions) ? message.mentions : [];
+  for (const key of keys) {
+    const settled = mentions.some(mention =>
+      (mention as { key?: unknown } | null | undefined)?.key === key && mentionEntryHasIdentity(mention));
+    if (!settled) return false;
+  }
+  return true;
 }
 
 /** 默认节奏：覆盖实测 0.1–3s 的落定窗口并留 5 倍余量，总跨度 ~16s。 */

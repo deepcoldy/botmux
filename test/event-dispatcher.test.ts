@@ -15985,4 +15985,108 @@ describe('im.message.receive_v1 — mention late-resolution reverify', () => {
     expect(mockGetMessageDetail).toHaveBeenCalledTimes(2);
     expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
   });
+
+  it('does not read back a message whose snapshot already resolved its @ to another member', async () => {
+    // 占位符在 mention 落定后仍留在正文里：群里 @ 别人的普通消息快照里早已落定，
+    // 不得让每个没被 @ 的 bot 都白白回读一次。
+    const resolvedElsewhere = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@_user_1 please take a look' }),
+      messageId: 'om-resolved-elsewhere',
+      chatId: 'chat-race',
+      chatType: 'group',
+      mentions: [{ key: '@_user_1', name: 'Alice', id: { open_id: 'ou_alice', union_id: 'on_alice' } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](resolvedElsewhere);
+    await settle();
+    expect(reverifyPendingCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(16_000);
+    await settle();
+    expect(mockGetMessageDetail).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('ends after one readback without a give-up warning when the message was recalled', async () => {
+    // 飞书对已撤回消息的单条详情：deleted=true、正文换成固定提示、不带 mentions。
+    // 没有可等的 @ 了，不得按「未落定」重试到底再报一条假的放弃 WARN。
+    await capturedHandlers['im.message.receive_v1'](raceEvent('om-race-recalled', 'chat-race'));
+    await settle();
+    mockGetMessageDetail.mockResolvedValue({
+      items: [{
+        message_id: 'om-race-recalled',
+        chat_id: 'chat-race',
+        msg_type: 'text',
+        deleted: true,
+        updated: false,
+        body: { content: 'This message was recalled' },
+        create_time: String(Date.now()),
+        sender: { id: USER_OPEN_ID, id_type: 'open_id', sender_type: 'user' },
+      }],
+    });
+    await vi.advanceTimersByTimeAsync(16_000);
+    await settle();
+    expect(mockGetMessageDetail).toHaveBeenCalledTimes(1);
+    expect(reverifyPendingCount()).toBe(0);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    const warned = logger.warn.mock.calls.map(([message]) => String(message)).join('\n');
+    expect(warned).not.toContain('om-race-recalled'.substring(0, 12));
+  });
+
+  it('still recovers an @ that arrived while the bot open_id probe was failing', async () => {
+    // 本 bot open_id 还没探明时，快照里已落定的 @ 无法判断是不是自己：必须照常排期，
+    // 回读前再探一次 open_id，探明后补派发。
+    const state = setupBotState({ allowedUsers: [USER_OPEN_ID], botOpenId: undefined });
+    let probeDown = true;
+    vi.stubGlobal('fetch', vi.fn(async (url: unknown) => {
+      if (probeDown) throw new Error('bot info probe unavailable');
+      return String(url).includes('tenant_access_token')
+        ? { json: async () => ({ code: 0, tenant_access_token: 't' }) }
+        : { json: async () => ({ code: 0, bot: { open_id: MY_OPEN_ID, app_name: 'BotA' } }) };
+    }) as any);
+    try {
+      await capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@_user_1 why is this job stuck' }),
+        messageId: 'om-race-probe',
+        chatId: 'chat-race',
+        chatType: 'group',
+        mentions: [{ key: '@_user_1', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      }));
+      await settle();
+      expect(state.botOpenId).toBeUndefined();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+      probeDown = false;
+      mockGetMessageDetail.mockResolvedValue(readbackWithBotMention('om-race-probe', 'chat-race', MY_OPEN_ID));
+      await vi.advanceTimersByTimeAsync(2_500);
+      await settle();
+      expect(state.botOpenId).toBe(MY_OPEN_ID);
+      expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('never reads back plain chatter, even while the bot open_id is still unknown', async () => {
+    // open_id 没探明时「已落定且指向他人」无从判定，普通群聊不被回读只靠占位符入口闸。
+    setupBotState({ allowedUsers: [USER_OPEN_ID], botOpenId: undefined });
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('bot info probe unavailable'); }) as any);
+    try {
+      await capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: 'just chatting while the probe is down' }),
+        messageId: 'om-plain-probe-down',
+        chatId: 'chat-race',
+        chatType: 'group',
+        mentions: [],
+      }));
+      await settle();
+      expect(reverifyPendingCount()).toBe(0);
+      await vi.advanceTimersByTimeAsync(16_000);
+      await settle();
+      expect(mockGetMessageDetail).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
 });

@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import {
   acquireReverifySlot,
   contentHasMentionPlaceholder,
+  mentionPlaceholdersSettled,
   MENTION_REVERIFY_MAX_SCHEDULES,
   MENTION_REVERIFY_MAX_PENDING,
   MENTION_REVERIFY_MAX_RETAINED,
@@ -57,6 +58,61 @@ describe('contentHasMentionPlaceholder', () => {
     expect(contentHasMentionPlaceholder(null)).toBe(false);
     expect(contentHasMentionPlaceholder({})).toBe(false);
     expect(contentHasMentionPlaceholder({ content: '' })).toBe(false);
+  });
+});
+
+describe('mentionPlaceholdersSettled', () => {
+  const text = (value: string) => JSON.stringify({ text: value });
+
+  it('is unsettled while a typed @ has no mentions[] entry yet', () => {
+    expect(mentionPlaceholdersSettled({ content: text('@_user_1 why is this job stuck'), mentions: [] })).toBe(false);
+    expect(mentionPlaceholdersSettled({ content: text('@_user_1 why is this job stuck') })).toBe(false);
+  });
+
+  it('is settled once every placeholder maps to an entry with an identity (WS and REST shapes)', () => {
+    expect(mentionPlaceholdersSettled({
+      content: text('@_user_1 and @_user_2 please check'),
+      mentions: [
+        { key: '@_user_1', name: 'Alice', id: { open_id: 'ou_alice' } },
+        { key: '@_user_2', name: 'Bob', id: { union_id: 'on_bob' } },
+      ],
+    })).toBe(true);
+    expect(mentionPlaceholdersSettled({
+      body: { content: text('@_user_1 please check') },
+      mentions: [{ key: '@_user_1', name: 'Alice', id: 'ou_alice', id_type: 'open_id' }],
+    })).toBe(true);
+  });
+
+  it('stays unsettled while only some placeholders have resolved', () => {
+    expect(mentionPlaceholdersSettled({
+      content: text('@_user_1 and @_user_2 please check'),
+      mentions: [{ key: '@_user_1', name: 'Alice', id: { open_id: 'ou_alice' } }],
+    })).toBe(false);
+  });
+
+  it('does not count an entry without any identity as settled', () => {
+    expect(mentionPlaceholdersSettled({
+      content: text('@_user_1 please check'),
+      mentions: [{ key: '@_user_1', name: 'BotA', id: {} }],
+    })).toBe(false);
+    expect(mentionPlaceholdersSettled({
+      content: text('@_user_1 please check'),
+      mentions: [{ key: '@_user_1', name: 'BotA', id: '' }],
+    })).toBe(false);
+  });
+
+  it('covers at nodes in post content', () => {
+    const post = JSON.stringify({ zh_cn: { content: [[{ tag: 'at', user_id: '@_user_1' }, { tag: 'text', text: ' hi' }]] } });
+    expect(mentionPlaceholdersSettled({ content: post, mentions: [] })).toBe(false);
+    expect(mentionPlaceholdersSettled({
+      content: post,
+      mentions: [{ key: '@_user_1', name: 'Alice', id: { open_id: 'ou_alice' } }],
+    })).toBe(true);
+  });
+
+  it('treats content without placeholders as settled (no @ left to wait for)', () => {
+    expect(mentionPlaceholdersSettled({ content: 'This message was recalled' })).toBe(true);
+    expect(mentionPlaceholdersSettled({ content: text('the @ was edited away'), mentions: [] })).toBe(true);
   });
 });
 

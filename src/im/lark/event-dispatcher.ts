@@ -80,6 +80,7 @@ import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } fro
 import {
   acquireReverifySlot,
   contentHasMentionPlaceholder,
+  mentionPlaceholdersSettled,
   mentionReverifyEnabled,
   parseReverifyDelaysMs,
   releaseReverifySlot,
@@ -6862,6 +6863,8 @@ export function createLarkEventDispatcherRuntime(
    * 照旧把关；seen-store 的 claim 不会重复发生（补偿不走 WS 投递层）。
    * 落定为「@ 的是别人」→ 静默放弃（正常让路）；回读一直无 mention / 失败 →
    * 按次重试，耗尽后 WARN（这是本缺陷此前完全不可见的观测面）。
+   * 快照里的 @ 已经全部落定（即 @ 的是别人）时不排期：占位符落定后仍留在正文里，
+   * 否则群里每条 @ 别人的消息都会让每个没被 @ 的 bot 白白回读一次。
    */
   let mentionReverifyDelays: number[] | undefined;
   let mentionReverifyCapacityWarned = false;
@@ -6884,6 +6887,9 @@ export function createLarkEventDispatcherRuntime(
       if (!messageId || !chatId) return;
       if (message?.chat_type === 'p2p') return;
       if (!contentHasMentionPlaceholder(message)) return;
+      // 快照里的 @ 已全部落定且没有本 bot（调用方已判定未 @ 我们）= @ 的是别人，
+      // 回读只会得出同一结论，不排期。只有仍有未落定的 @ 才值得回读。
+      if (mentionSettledElsewhere(larkAppId, message)) return;
       if (isMessageTriggerClaimed(larkAppId, messageId)) return;
       const key = messageTriggerKey(larkAppId, messageId);
       if (mentionReverifyTimers.has(key)) return;
@@ -6943,6 +6949,12 @@ export function createLarkEventDispatcherRuntime(
     }
   }
 
+  /** 调用方已确认没 @ 本 bot 时，能否断定「@ 都已落定且指向别人」。本 bot open_id
+   * 还没探明时无从排除自己，按未落定处理（继续排期 / 重试，回读前会再探一次）。 */
+  function mentionSettledElsewhere(larkAppId: string, message: any): boolean {
+    return !!getBot(larkAppId).botOpenId && mentionPlaceholdersSettled(message);
+  }
+
   async function runMentionReverifyReadback(input: {
     larkAppId: string;
     messageId: string;
@@ -6974,9 +6986,11 @@ export function createLarkEventDispatcherRuntime(
     data.__groupContextHandled = true;
     await ensureBotOpenId(larkAppId).catch(() => { /* degrade; heartbeat retries */ });
     if (!isBotMentioned(larkAppId, data.message, undefined)) {
-      const mentions: unknown = data.message?.mentions;
-      if (Array.isArray(mentions) && mentions.length > 0) {
-        logger.debug(`[mention-reverify:${larkAppId}] mention 已落定但指向他人，放弃 msg=${messageId.substring(0, 12)}`);
+      if (mentionSettledElsewhere(larkAppId, data.message)) {
+        logger.debug(
+          `[mention-reverify:${larkAppId}] @ 已落定且不含本 bot（指向他人、@ 已删或消息已撤回），放弃 ` +
+          `msg=${messageId.substring(0, 12)}`,
+        );
         return 'elsewhere';
       }
       return 'retry';
