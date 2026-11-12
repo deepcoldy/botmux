@@ -546,6 +546,7 @@ import { waitForProcessQuiescence } from './services/process-quiescence.js';
 import { reapStaleCodexThreadWriter, shouldReapStaleCodexWriterBeforeSpawn } from './services/codex-stale-writer-reaper.js';
 import { pidNotProvablyGone } from './utils/process-alive.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
+import { restoredTurnLabel } from './services/restored-turn-label.js';
 import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, readClaudeLiveSessionId, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
 import { cliProcessAliveFromBackend } from './adapters/cli/backend-liveness.js';
@@ -12021,12 +12022,11 @@ function emitReadyTurns(opts: {
     }
 
     // A restored turn's fallback is a RECOVERED partial/final produced around
-    // a worker restart — label it so the user can tell it from a live answer.
-    // Prefix is applied AFTER the suppress gate so dedup compares the model's
-    // own text, never the notice.
-    const deliveredText = turn.restoredFromJournal && !universalOutputHandoff
-      ? `${t('worker.bridge_restored_turn_notice')}\n\n${postText}`
-      : postText;
+    // a restart, possibly turns ago. The daemon notes which turn it answers
+    // above it; the content itself stays the model's own text, so the reply
+    // keeps one identity whether it is emitted live or after a restore.
+    const deliveredText = postText;
+    const restoredTurn = turn.restoredFromJournal ? restoredTurnLabel(turn) : undefined;
     usageLimitTracker.noteTurnCompleted('answered');
     const handoffOutput = { sessionId: sessionId!, content: deliveredText, lastUuid: lastUuid!, turnId: turn.turnId };
     if (workerFinalOutputHandoff && handoffTurnIds.has(turn.turnId) && !turn.isLocal && turn.dispatchAttempt === undefined
@@ -12058,6 +12058,7 @@ function emitReadyTurns(opts: {
         : {}),
       ...(turn.isLocal && zeroPromptTerminalSync() ? { terminalLocal: true } : {}),
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+      ...(restoredTurn ? { restoredTurn } : {}),
     });
   }
   } catch (error) {

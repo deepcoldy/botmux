@@ -969,6 +969,7 @@ import {
   prepareVcMeetingImReply,
 } from '../services/vc-meeting-im-reply.js';
 import { neutralizeLarkAtTags } from '../services/send-policy.js';
+import { restoredTurnNotice } from '../services/restored-turn-label.js';
 import { recordVcMeetingListenerMessage } from '../services/vc-meeting-listener-message-store.js';
 import {
   getVcMeetingListenerTopicRoot,
@@ -24857,7 +24858,9 @@ function deliverFinalOutput(
             ...(replyCardActionBinding ? { cardActions: replyCardActionBinding } : {}),
           })
         : buildCanonicalFinalReplyCard({
-            markdown: repairReplyMarkdown(deliveredAssistantText),
+            markdown: repairReplyMarkdown(msg.restoredTurn && !managedReceiver
+              ? `${restoredTurnNotice(msg.restoredTurn, localeForBot(ds.larkAppId))}\n\n${deliveredAssistantText}`
+              : deliveredAssistantText),
             ...(feedback ? { feedback } : {}),
             recipientOpenId,
             brand: renderBrandTemplate(resolveBrandLabel(ds.larkAppId), ds.workingDir),

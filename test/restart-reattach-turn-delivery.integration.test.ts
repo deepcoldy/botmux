@@ -125,9 +125,12 @@ function liveSession(opts: { turnMs: number; pidStateGated?: boolean; recordRead
     closeContract ??= () => controller.store.close();
     const restartAttemptId = controller.prepareWorkerStart();
     const sessionContract = controller.bindWorker(generation);
+    // As forkWorker always negotiates it: final outputs go through the
+    // durable output handoff, the path production replies take.
     const init = {
       type: 'init' as const, sessionId: h.sessionId, resume: true, cliId: 'claude-code', backendType: 'tmux' as const,
       promptInjection: undefined, prompt: '', restartAttemptId, sessionContract,
+      finalOutputHandoff: { version: 2 as const, token: randomUUID(), admitNew: false },
     };
     ds.initConfig = init as any;
     const g = h.startWorker(init as any);
@@ -165,6 +168,8 @@ function liveSession(opts: { turnMs: number; pidStateGated?: boolean; recordRead
   const turnReplies = () => replies().filter(text => text.includes(`reply: ${TEXT}`));
   const notice = new Set((['zh', 'en'] as const).map(locale => t('worker.final_output_undelivered', undefined, locale)));
   const undeliveredNotices = () => replies().filter(text => notice.has(text));
+  /** The reply says which turn it answers: the turn's input began with TEXT. */
+  const namesItsTurn = (reply: string) => reply.includes(`「${TEXT}」`) || reply.includes(`(\"${TEXT}\")`);
 
   /** The daemon's shutdown for a persistent backend, then the new daemon's
    *  restore. `beforeReattach` runs while no worker is attached. */
@@ -180,7 +185,7 @@ function liveSession(opts: { turnMs: number; pidStateGated?: boolean; recordRead
     const ds2 = daemonSession(2);
     return { ...fork(ds2, 2, opts.confirmLate), ds: ds2 };
   };
-  return { h, ds1, first, replies, turnReplies, undeliveredNotices, restartDaemon };
+  return { h, ds1, first, replies, turnReplies, undeliveredNotices, namesItsTurn, restartDaemon };
 }
 
 /** Start the message's turn on the first worker. When the CLI's record is
@@ -214,6 +219,8 @@ describe.skipIf(!runnable)('a turn running across a daemon restart', () => {
     await sleep(3_000);
     const log = next.logs.join('');
     expect(s.turnReplies(), log).toHaveLength(1);
+    // Recovered from the journal: the note above it names the turn it answers.
+    expect(s.namesItsTurn(s.turnReplies()[0]!), s.turnReplies()[0]).toBe(true);
     expect(s.undeliveredNotices()).toEqual([]);
     expect(log).not.toContain('Dropped final output with unproven execution origin');
     await vi.waitFor(() => expect(execution()?.phase).toBe('succeeded'), { timeout: 10_000 });
@@ -238,6 +245,8 @@ describe.skipIf(!runnable)('a turn running across a daemon restart', () => {
     await sleep(3_000);
     const log = next.logs.join('');
     expect(s.turnReplies(), log).toHaveLength(1);
+    // Recovered from the journal: the note above it names the turn it answers.
+    expect(s.namesItsTurn(s.turnReplies()[0]!), s.turnReplies()[0]).toBe(true);
     expect(s.undeliveredNotices()).toEqual([]);
     expect(log).not.toContain('Dropped final output with unproven execution origin');
     await vi.waitFor(() => expect(execution()?.phase).toBe('succeeded'), { timeout: 10_000 });
@@ -262,6 +271,8 @@ describe.skipIf(!runnable)('a turn running across a daemon restart', () => {
     await sleep(3_000);
     const log = next.logs.join('');
     expect(s.turnReplies(), log).toHaveLength(1);
+    // Recovered from the journal: the note above it names the turn it answers.
+    expect(s.namesItsTurn(s.turnReplies()[0]!), s.turnReplies()[0]).toBe(true);
     expect(s.undeliveredNotices()).toEqual([]);
     await vi.waitFor(() => expect(execution()?.phase).toBe('succeeded'), { timeout: 10_000 });
   }, 240_000);
