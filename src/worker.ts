@@ -9287,7 +9287,6 @@ let terminalEffortAwaitingClaudeChoice: TerminalEffortChoice | undefined;
 let terminalEffortSavedNonce: string | undefined;
 let terminalEffortEnabledSinceMs: number | undefined;
 let terminalEffortEnableEpoch: number | undefined;
-let terminalEffortPreferenceAtSpawn: string | undefined;
 function readTerminalEffortPreference(notAfter?: number): string | undefined {
   if (!lastInitConfig?.sessionId || !lastInitConfig.larkAppId) return;
   const row = sessionStore.readSessionRowFromDisk(lastInitConfig.sessionId, lastInitConfig.larkAppId);
@@ -24671,7 +24670,6 @@ async function spawnCliBody(
   terminalEffortSavedNonce = undefined;
   terminalEffortEnabledSinceMs = config.terminalEffortWriteback ? spawnStartedAtMs : undefined;
   terminalEffortEnableEpoch = config.terminalEffortWriteback ? config.terminalEffortWritebackEpoch : undefined;
-  terminalEffortPreferenceAtSpawn = readTerminalEffortPreference();
   nativeReasoningNotBeforeMs = spawnStartedAtMs;
   lastNativeReasoningKey = undefined;
   nativeReasoningClock = undefined;
@@ -36616,7 +36614,6 @@ async function handleContractDaemonMessage(raw: unknown, handle?: unknown): Prom
     case 'terminal_effort_writeback_ack': {
       if (terminalEffortPendingChoice?.nonce === msg.nonce) {
         terminalEffortSavedNonce = msg.nonce;
-        terminalEffortPreferenceAtSpawn = msg.preference;
         terminalEffortPendingChoice = undefined;
         terminalEffortAwaitingClaudeChoice = undefined;
       }

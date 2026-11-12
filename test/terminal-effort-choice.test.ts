@@ -112,6 +112,14 @@ describe('confirmed terminal effort intent', () => {
     expect(tracker.observe({ binding, effort: 'medium', atMs: NOW }, true, 'native-settings')).toBeUndefined();
   });
 
+  it.each(['❯', '›'])('rejects old menu output above a fresh empty %s composer', cursor => {
+    const { tracker, binding, client } = fixture('codex');
+    tracker.input(client, '\r', binding, { enabled: true, ready: true,
+      screen: `Select Reasoning Level for GPT\n› 2. Medium\nenter select · esc back\n${cursor}`,
+      readPreference: () => '["high",null,null,null]' });
+    expect(tracker.observe({ binding, effort: 'medium', atMs: NOW }, true, 'native-settings')).toBeUndefined();
+  });
+
   it('keeps separate clients, cancellation, multiline prose and bracketed paste out of the intent path', () => {
     const { tracker, binding, client } = fixture();
     tracker.input(client, '/effort med', binding, { enabled: true, ready: true, readPreference: () => '["high",null,null,null]' });

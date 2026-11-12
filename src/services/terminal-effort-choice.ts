@@ -37,6 +37,14 @@ function effortLabel(label: string): CodexReasoningEffort | undefined {
 }
 /** Require a live effort picker, its selection cursor and its native footer. */
 function selectedMenuEffort(screen: string): CodexReasoningEffort | undefined {
+  // A fresh empty composer after the native menu's footer retires that menu,
+  // just like a composer containing a placeholder or draft.
+  const rawLines = screen.split(/\r?\n/);
+  let footer = -1;
+  for (let i = rawLines.length - 1; i >= 0; i--) {
+    if (/enter.*(?:select|confirm|apply|default).*esc/i.test(rawLines[i]!)) { footer = i; break; }
+  }
+  if (footer >= 0 && rawLines.slice(footer + 1).some(line => /^\s*[❯›»>]\s*$/.test(line))) return;
   const codex = parseCodexEffortMenu(screen);
   if (codex?.kind === 'effort' || codex?.kind === 'advanced') {
     return effortLabel(codex.rows.find(row => row.selected)?.label ?? '');
@@ -49,6 +57,7 @@ function selectedMenuEffort(screen: string): CodexReasoningEffort | undefined {
   if (heading < 0 || !lines.slice(heading + 1).some(line => /enter.*(?:select|confirm|apply).*esc/i.test(line))) return;
   const tail = lines.slice(heading + 1);
   if (tail.some(line => {
+    if (/^\s*[❯›»>]\s*$/.test(line)) return true;
     const cursor = /^\s*[❯›»>●◉▸]\s*(?:\d+[.)]\s*)?(.+)$/.exec(line);
     return cursor && effortLabel(cursor[1]!) === undefined;
   })) return;
