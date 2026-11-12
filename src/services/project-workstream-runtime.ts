@@ -1,4 +1,5 @@
 import { config } from '../config.js';
+import { getBot } from '../bot-registry.js';
 import type { DaemonSession } from '../core/types.js';
 import * as sessionStore from './session-store.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
@@ -193,7 +194,17 @@ export async function localProjectAttachmentSource(appId: string, sessionId: str
     reportCapability: latest.adoptedFrom ? 'manual'
       : latest.pendingForkSession || !latest.cliSessionId || !latestLive ? 'unavailable' : 'verified',
     title: safeTextPreview(latest.title, 80)?.text,
+    botName: resolveSourceBotDisplayName(appId),
   };
+}
+
+function resolveSourceBotDisplayName(appId: string): string {
+  try {
+    const local = getBot(appId)?.botName?.trim();
+    if (local) return local;
+  } catch { /* bot not registered in this daemon */ }
+  const peer = findOnlineDaemon(appId)?.botName?.trim();
+  return peer || appId;
 }
 
 export async function getProjectAttachmentSource(appId: string, sessionId: string): Promise<ProjectAttachmentSource | undefined> {

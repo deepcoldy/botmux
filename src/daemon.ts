@@ -543,7 +543,7 @@ import {
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
 import { createProductionDraftLaunchDeps, createProductionWorkflowDraftService, installWorkflowDraftService } from './core/workflow-draft-daemon.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setCardClickTurnPoster, productionWorkflowDraftClarifier, productionWorkflowDraftProjects, productionWorkflowDraftSessionBinder, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, setDecisionBoardService, setProjectCardRuntimeObserver, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionLifecycleHandler, setDurableSessionListHandler, setDurableSessionSendHandler, setCardClickTurnPoster, productionWorkflowDraftClarifier, productionWorkflowDraftProjects, productionWorkflowDraftSessionBinder, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -586,7 +586,9 @@ import { recordDispatchRegistryEntry, updateDispatchRegistry } from './core/disp
 import { recordDispatchLastReport } from './core/dispatch-task-tree.js';
 import { initialDispatchLifecycle } from './core/dispatch-lifecycle.js';
 import { applyDispatchLaunchBinding, registerDispatchLaunchBinding } from './core/dispatch-launch-binding.js';
-import { projectCoordinator } from './services/project-coordinator-runtime.js';
+import { projectCoordinator, resolveProjectGroupCardRuntime } from './services/project-coordinator-runtime.js';
+import { createProjectCardRuntimeSync } from './services/project-card-runtime-sync.js';
+import { listProjectGroups } from './services/project-group-store.js';
 import {
   addProjectWorkerIfNeeded,
   evaluateProjectDispatchPolicy,
@@ -36278,18 +36280,50 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       try { sessionStore.updateSession(live.session); } catch { live.session.projectImportPending = true; }
     },
   });
+  const projectCardRuntimeSync = createProjectCardRuntimeSync({
+    larkAppId: cfg.larkAppId,
+    listProjects: () => listProjectGroups(config.session.dataDir),
+    readMode: chatId => readGroupCollaborationMode(config.session.dataDir, chatId),
+    resolveRuntime: project => resolveProjectGroupCardRuntime(project, config.session.dataDir),
+    refresh: project => projectCoordinator.run({
+      dataDir: config.session.dataDir,
+      chatId: project.chatId,
+      larkAppId: cfg.larkAppId,
+      coordinatorSessionId: project.coordinatorSessionId,
+    }, { action: 'refresh' }),
+    forwardToCoordinator: (coordinatorAppId, chatId) => {
+      const peer = findOnlineDaemon(coordinatorAppId, config.session.dataDir);
+      if (!peer) return;
+      void fetchDaemonIpc(peer.ipcPort, '/api/project-card/task-event', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chatId }),
+        signal: AbortSignal.timeout(3_000),
+      }).then(r => r.body?.cancel()).catch(() => undefined);
+    },
+    onDeferred: (chatId, err: any) => logger.debug(`[project] card runtime refresh for ${chatId} deferred: ${err?.message ?? err}`),
+  });
+  setProjectCardRuntimeObserver(chatId => projectCardRuntimeSync.schedule(chatId, 1_000));
+  setTimeout(() => projectCardRuntimeSync.schedule(undefined, 0), 6_000).unref?.();
+  setTimeout(() => projectCardRuntimeSync.schedule(undefined, 0), 15_000).unref?.();
   const projectImportTick = setInterval(() => {
     void projectImports.tick().catch(() => logger.debug('[project] import recovery pending'));
+    projectCardRuntimeSync.schedule(undefined, 0);
   }, 30_000);
   projectImportTick.unref?.();
   setProjectAssociationConsumer(event => {
     void getProjectAttachmentSource(event.larkAppId, event.sessionId)
-      .then(source => source && projectWorkstreamAttachments.observe(source))
+      .then(async source => {
+        if (!source) return;
+        await projectWorkstreamAttachments.observe(source);
+        projectCardRuntimeSync.notify(source.chatId);
+      })
       .catch(() => logger.debug('[project] association projection pending; refresh can repair'));
   });
   // 子任务提醒：本 daemon 记下本轮结果或举手时，按群转给本机开着「子任务提醒」的管家
   // （本 bot 直接调用，其他 bot 走本机 IPC）。管家端防抖、重新核对、去重。
   onSessionTaskEvent(({ chatId }) => {
+    projectCardRuntimeSync.notify(chatId);
     let bots: readonly BotConfig[];
     try { bots = loadBotConfigsCached(); } catch { return; }
     for (const bot of bots) {
