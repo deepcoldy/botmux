@@ -250,6 +250,16 @@ describe('imported workstream reporting across source worker suspension and acti
     expect(await f.report()).toEqual({ ok: false, error: 'dispatch_attachment_inactive' });
     f.sourceWorker.session.rootMessageId = 'om_topic';
 
+    // Shutdown detach clears ds.worker before the worker's exit event reaches
+    // the controller, so the contract still projects workerReady=true; only the
+    // missing worker handle can reject a report inside that window.
+    const liveWorker = f.sourceWorker.worker;
+    f.sourceWorker.worker = null;
+    expect(f.sourceWorker.workerReady).toBe(true);
+    expect(await f.report()).toEqual({ ok: false, error: 'dispatch_attachment_inactive' });
+    f.sourceWorker.worker = liveWorker;
+    expect(await f.report()).toMatchObject({ ok: true });
+
     // Worker disconnect during turn rejects subsequent reports
     controller.workerLost(boot.worker);
     expect(f.sourceWorker.workerReady).toBe(false);
