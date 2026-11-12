@@ -193,8 +193,11 @@ describe('Kimi Code cache-expiry menu (kimi family) over real captures', () => {
     (screen: string) => screen.split('\n').map(row => `> ${row}`).join('\n'),
     // The title row anchor: rewording it must break the match.
     (screen: string) => screen.replace(/^.*This session has been idle.*$/m, ' This session was idle for a while.'),
-    // The blank row between the hint and the body is part of the block.
-    (screen: string) => screen.replace('Esc cancel\n\n  Cache expired', 'Esc cancel\n  Cache expired'),
+    // The blank row between the hint and the body is part of the block. It
+    // must be FILLED, not deleted: deleting it shifts the block up a row and
+    // the title/hint anchors reject that first, so the blank-row anchor would
+    // never be the one biting. Filling it keeps every other row in place.
+    (screen: string) => screen.replace('Esc cancel\n\n  Cache expired', 'Esc cancel\n   (quoted note)\n  Cache expired'),
   ])('does not recognise quoted, incomplete or reworded menus %#', change => {
     const screen = change(fixture('kimi-2.5.3-cache-expiry-idle-submit.txt'));
     expect(classifyStuckPage(screen, 'kimi')).toBeUndefined();
