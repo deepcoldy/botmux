@@ -287,6 +287,14 @@ describe('CLI transport gate for a managed no-transport turn', () => {
         expect(String(r.stderr), args.join(' ')).toMatch(downstream);
         expect(String(r.stderr), args.join(' ')).not.toMatch(/headless automation session|no Feishu transport/);
       }
+      // tabs / top-notice prefer the caller's env chat over the record; the
+      // headless snapshot must not shadow the chat the session was bound to.
+      // No bot is configured here, so the command fails before any Feishu call
+      // and reports the chat it resolved.
+      const tabs = spawnSyncTsScript('src/cli.ts', ['tabs', 'list', '--json'], { env, encoding: 'utf8', timeout: 60_000 });
+      const tabsResult = String(tabs.stdout).trim().split('\n').pop() ?? '';
+      expect(tabsResult, String(tabs.stderr)).toMatch(/^\{/);
+      expect(JSON.parse(tabsResult).chatId).toBe('oc_bound_gate');
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
     }

@@ -9586,6 +9586,18 @@ async function assertListenerCardDestination(session: SessionData, appId: string
   }
 }
 
+/** BOTMUX_CHAT_ID for the caller's own session, preferred over an old session
+ *  record whose chatType/chatId may predate a DM→group handoff (the worker
+ *  refreshes it for the current managed session). Never applied to an explicit
+ *  different sid. A virtual (headless/HTTP) value is skipped: it is a spawn-time
+ *  snapshot that cannot name a Feishu chat, and a session later bound to a real
+ *  chat keeps it in its env — only the record knows the bound chat. */
+function currentSessionEnvChatId(sid: string): string | undefined {
+  if (sid !== process.env.BOTMUX_SESSION_ID) return undefined;
+  const chatId = process.env.BOTMUX_CHAT_ID?.trim();
+  return chatId && !isHttpVirtualSession(chatId) ? chatId : undefined;
+}
+
 async function cmdTabs(rest: string[]): Promise<void> {
   const {
     CHAT_TABS_CLI_USAGE,
@@ -9611,12 +9623,7 @@ async function cmdTabs(rest: string[]): Promise<void> {
   await registerSelfFromCredFile();
   const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
   assertSessionTransportOrExit(session, 'tabs');
-  // The worker refreshes BOTMUX_CHAT_ID for the current managed session. Prefer
-  // that turn-bound value over an old session record whose chatType/chatId may
-  // predate a DM→group handoff. Never apply it to an explicit different sid.
-  const currentEnvChatId = sid === process.env.BOTMUX_SESSION_ID
-    ? process.env.BOTMUX_CHAT_ID?.trim()
-    : undefined;
+  const currentEnvChatId = currentSessionEnvChatId(sid);
   const chatId = parsed.chatId ?? currentEnvChatId ?? session.chatId;
   if (!chatId || (session.chatType === 'p2p' && !parsed.chatId && !currentEnvChatId)) {
     console.error('botmux tabs: 当前会话不是群聊；请在群会话中运行，或传 --chat-id <oc_xxx>');
@@ -9664,9 +9671,7 @@ async function cmdTopNotice(rest: string[]): Promise<void> {
   await registerSelfFromCredFile();
   const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
   assertSessionTransportOrExit(session, 'top-notice');
-  const currentEnvChatId = sid === process.env.BOTMUX_SESSION_ID
-    ? process.env.BOTMUX_CHAT_ID?.trim()
-    : undefined;
+  const currentEnvChatId = currentSessionEnvChatId(sid);
   const chatId = parsed.chatId ?? currentEnvChatId ?? session.chatId;
   if (!chatId || (session.chatType === 'p2p' && !parsed.chatId && !currentEnvChatId)) {
     console.error('botmux top-notice: 当前会话不是群聊；请在群会话中运行，或传 --chat-id <oc_xxx>');
