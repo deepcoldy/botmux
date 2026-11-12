@@ -24056,6 +24056,10 @@ async function spawnCliBody(
     return;
   }
 
+  // An adopt generation owns only an observer. Missing/corrupt terminal
+  // metadata must never fall through into spawning a Botmux-owned CLI.
+  if (Boolean(cfg.adoptMode)) throw new Error('Missing adopt terminal identity; refusing managed CLI launch');
+
   // dsh runtime variant: when the bot selected dsh-tui (dshRuntime='tui'),
   // resolve the PTY-driven dsh-tui adapter instead of the headless JSON-RPC
   // runner. The bot's cliId stays 'dsh' (the toggle is a per-bot config field),
