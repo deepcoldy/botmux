@@ -1,5 +1,6 @@
 import { config } from '../config.js';
 import { getBot } from '../bot-registry.js';
+import { botHasConfiguredAllowlist } from '../core/bot-allowlist.js';
 import type { DaemonSession } from '../core/types.js';
 import * as sessionStore from './session-store.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
@@ -199,21 +200,13 @@ function tryGetBot(appId: string): ReturnType<typeof getBot> | undefined {
   try { return getBot(appId); } catch { return undefined; }
 }
 
-function hasConfiguredBotAllowlist(bot: ReturnType<typeof getBot>): boolean {
-  return (bot.config.allowedUsers?.length ?? 0) > 0
-    || (bot.config.allowedChatGroups?.length ?? 0) > 0
-    || (bot.config.globalGrants?.length ?? 0) > 0
-    || !!bot.config.ownerOpenId
-    || bot.config.p2pOpen === true;
-}
-
 /** Human-only operator gate matching event-dispatcher canOperate without its bot-union legs. */
 export function canHumanOperateBot(larkAppId: string, humanOpenId: string | undefined): boolean {
   const bot = tryGetBot(larkAppId);
   if (!bot) return false;
   if (humanOpenId && bot.resolvedAllowedUsers.includes(humanOpenId)) return true;
   if (humanOpenId && bot.resolvedBlockedUsers.includes(humanOpenId)) return false;
-  return !hasConfiguredBotAllowlist(bot);
+  return !botHasConfiguredAllowlist(bot);
 }
 
 export function resolveSourceBotDisplayName(appId: string, dataDir = config.session.dataDir): string {
