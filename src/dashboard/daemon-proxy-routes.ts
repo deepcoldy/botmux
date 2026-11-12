@@ -118,6 +118,8 @@ export const BOT_PROXY_ROUTES: readonly ProxyRoute[] = [
   putBotConfig('env'),
   putBotConfig('env-policy'),
   putBotConfig('codex-auth-sync'),
+  // archive-codex：`{ archiveCodex: true | false | null }`（null = 继承全局 sessionCleanup.archiveCodex）。
+  putBotConfig('archive-codex'),
   // codex-config：独立 CODEX_HOME 的 config.toml 路径信息；resync 先备份再从宿主覆盖。
   { method: 'GET', path: botPath('codex-config'), upstream: '/api/bot-codex-config', body: NO_BODY },
   { method: 'POST', path: botPath('codex-config/resync'), upstream: '/api/bot-codex-config/resync', body: RAW },
