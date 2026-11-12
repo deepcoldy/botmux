@@ -68,6 +68,7 @@ describe('contract gateway and real worker boundaries', () => {
       sessionStore: { updateSessionPid: vi.fn(), updateSession: vi.fn() },
       dashboardEventBus: { publish: vi.fn() }, clearPendingSuspendClaim: vi.fn(),
     };
+    scope.managedSuspendAttemptId = loadWorkerPoolFunction('managedSuspendAttemptId', scope);
     scope.suspendWorker = loadWorkerPoolFunction('suspendWorker', scope);
     const suspend = loadWorkerPoolFunction('suspendWorkerAsync', scope);
     const safe = loadWorkerPoolFunction('canSafelyReclaimWorkerForInstallChange', scope);
@@ -116,6 +117,7 @@ describe('contract gateway and real worker boundaries', () => {
       suspendBackingVerifier: () => { destructiveChecks++; return false; },
       logger: { warn: vi.fn() }, tag: () => 'test',
     };
+    scope.managedSuspendAttemptId = loadWorkerPoolFunction('managedSuspendAttemptId', scope);
     scope.suspendWorker = loadWorkerPoolFunction('suspendWorker', scope);
     const suspend = loadWorkerPoolFunction('suspendWorkerAsync', scope);
     expect(await suspend(daemon, 'managed_ask_retired', () => !pending)).toBe(false);
@@ -123,6 +125,37 @@ describe('contract gateway and real worker boundaries', () => {
     expect(fixtureState.controller.operation(suspendOperationId)?.phase).toBe('failed_before_effect');
     expect(fixtureState.controller.allowsInput()).toBe(true);
     expect(fixtureState.store.read(fixtureState.ref)?.lifecycle).toBe('active');
+  });
+  it('uses a new linked attempt only after the prior managed suspend proved no effects', async () => {
+    const fixtureState = fixture();
+    const daemon = fixtureState.ds;
+    daemon.worker = { killed: false, send: vi.fn(), kill: vi.fn() } as any;
+    daemon.initConfig = { backendType: 'tmux' } as any;
+    fixtureState.store.apply(fixtureState.ref, { type: 'worker_online', worker: fixtureState.worker });
+    let pending = false;
+    let first = true;
+    vi.spyOn(fixtureState.controller, 'flushPrimary').mockImplementation(async () => {
+      if (first) { first = false; pending = true; }
+    });
+    let effects = 0;
+    const scope: any = {
+      primarySuspendInFlight: new WeakMap(), primarySuspendApplying: new WeakSet(), sameRuntime,
+      controllerForSession: () => fixtureState.controller, sessionContractPrimary: () => true,
+      hasProtectedSessionMutationOwnership: () => false, isSessionTransferring: () => false,
+      isSuspendableBackendType: () => true, trackLifecycleRetirement: vi.fn(), clearLifecycleRetirement: vi.fn(),
+      suspendBackingVerifier: () => { effects++; return false; },
+      logger: { warn: vi.fn(), info: vi.fn() }, tag: () => 'test',
+    };
+    scope.managedSuspendAttemptId = loadWorkerPoolFunction('managedSuspendAttemptId', scope);
+    scope.suspendWorker = loadWorkerPoolFunction('suspendWorker', scope);
+    const suspend = loadWorkerPoolFunction('suspendWorkerAsync', scope);
+    expect(await suspend(daemon, 'managed_ask_retired', () => !pending, 'managed-ask-retire')).toBe(false);
+    expect(fixtureState.controller.operation('managed-ask-retire')?.phase).toBe('failed_before_effect');
+    pending = false;
+    expect(await suspend(daemon, 'managed_ask_retired', () => !pending, 'managed-ask-retire')).toBe(false);
+    expect(effects).toBe(1);
+    expect(fixtureState.controller.operation()?.operationId).not.toBe('managed-ask-retire');
+    expect(fixtureState.controller.operation()?.phase).toBe('uncertain');
   });
   it.each([
     { turnId: undefined, retry: false },
@@ -363,6 +396,7 @@ describe('contract gateway and real worker boundaries', () => {
       dashboardEventBus: { publish: vi.fn() }, restartCoordinator: { cancelSession: vi.fn() }, logger: { warn: vi.fn(), info: vi.fn() }, tag: () => 'test' };
     scope.suspendWorker = loadWorkerPoolFunction('suspendWorker', scope);
     const suspend = loadWorkerPoolFunction<(ds: DaemonSession) => Promise<boolean>>('suspendWorkerAsync', scope);
+    scope.managedSuspendAttemptId = loadWorkerPoolFunction('managedSuspendAttemptId', scope);
     expect(await suspend(s.ds)).toBe(false);
     const operation = controller.operation()!;
     expect(operation).toMatchObject({ kind: 'suspend', phase: 'uncertain' });

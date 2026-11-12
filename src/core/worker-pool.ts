@@ -10326,8 +10326,22 @@ export function __testOnly_setSuspendBackingVerifier(
 
 const primarySuspendInFlight = new WeakMap<DaemonSession, Promise<boolean>>();
 const primarySuspendApplying = new WeakSet<DaemonSession>();
+function managedSuspendAttemptId(ds: DaemonSession, baseOperationId?: string): string | undefined {
+  if (!baseOperationId) return undefined;
+  const controller = controllerForSession(ds);
+  if (!controller) return baseOperationId;
+  let attempt = 0;
+  while (attempt < 10000) {
+    const operationId = attempt === 0 ? baseOperationId : `${baseOperationId}-${attempt}`;
+    const operation = controller.operation(operationId);
+    if (!operation || !['failed_before_effect', 'rejected'].includes(operation.phase)) return operationId;
+    attempt++;
+  }
+  throw new Error('managed suspend attempts exhausted');
+}
+
 export async function suspendWorkerAsync(ds: DaemonSession, reason = 'suspended_idle', stillOwned?: (operationId?: string) => boolean, expectedOperationId?: string): Promise<boolean> {
-  const result = suspendWorker(ds, reason, stillOwned, expectedOperationId);
+  const result = suspendWorker(ds, reason, stillOwned, managedSuspendAttemptId(ds, expectedOperationId));
   return primarySuspendInFlight.get(ds) ?? result;
 }
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stillOwned?: (operationId?: string) => boolean, expectedOperationId?: string): boolean {
@@ -10725,6 +10739,7 @@ export function canSafelyReclaimWorkerForInstallChange(ds: DaemonSession, suspen
   if (ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) return false;
   if (ds.session.locked === true) return false;
   if (suspendOperationId) {
+    suspendOperationId = managedSuspendAttemptId(ds, suspendOperationId);
     const controller = controllerForSession(ds);
     const operation = controller?.operation();
     if (operation) {

@@ -9,6 +9,7 @@
 - `retire` 先持久操作意图，再严格落盘原 broker 的 `invalidated` 结算，解除原等待。原有效答案优先；存储失败不能声称已退役。
 - `release` 必须使用同一退役操作。原轮真正 terminal，后台工作、输入及交付排空，原代次与资源归属仍可核验时，才走既有受管 suspend。异步落盘后、真正拆除前再次核验同一安全谓词。
 - 受管 suspend 使用原退役 ID 派生的确定控制 ID，重启/结果未知后的再次 release 只对账同一 operation/runtime。认领前要求 readiness；认领后 readiness 被该操作撤销时仍保留精确 operation/代次/terminal/排空检查。未知不能当无效果结算；只对确定无效果的 applying 拒绝恢复 active。
+- 确定 `failed_before_effect/rejected` 后才允许沿该退役 ID 的下一持久尝试序号重新释放；不重写旧操作事件。`uncertain/applying/confirmed` 不分配新尝试，重启由既有持久控制历史恢复同一身份。
 - `draining` 表示未释放；`retired` 表示决策已失效；`suspended` 表示确证挂起；`unknown/conflict` 不等于操作成功。HTTP 超时后先 inspect 原操作，不创建新操作盲重试。
 
 业务生命周期由宿主 opt-in 观察器登记，不内置 MR 查询、提醒时间、调度或自动恢复。原卡送达时刻才可作为业务计时起点。重启恢复未完成的退役意图，不创建新的模型恢复轮；已经退役的结果保留用于原调用重连，迟到旧按钮不授予新授权。
