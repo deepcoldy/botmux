@@ -35834,3 +35834,13 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .bd-oncall-preset > strong { font-size: 12px; font-weight: 600; }
 .bd-oncall-preset .bd-oncall-grid { margin-top: 12px; gap: 12px; }
 .bd-oncall-preset > .bd-section-note { display: block; margin-top: 12px; }
+
+.bd-command-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px; border: 1px solid var(--border); border-radius: var(--radius-md, 8px); background: var(--surface); }
+.bd-command-tags:focus-within { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft, transparent); }
+.bd-command-tag { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 3px 8px; border-radius: 6px; background: var(--accent-soft, var(--bg)); border: 1px solid var(--border); }
+.bd-command-tag code { padding: 0; background: transparent; overflow-wrap: anywhere; }
+.bd-command-tag button { margin: 0; padding: 0 2px; min-height: 24px; border: 0; box-shadow: none; background: transparent; color: var(--muted); line-height: 1; }
+.bd-command-tags input { flex: 1 1 140px; min-width: 0; width: auto; margin: 0; padding: 6px; border: 0; box-shadow: none; background: transparent; }
+.bd-command-tags input:focus { border: 0; box-shadow: none; }
+.bd-command-tags.is-disabled { opacity: .65; }
+.bd-command-error { color: var(--danger); }
