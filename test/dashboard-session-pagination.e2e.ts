@@ -60,6 +60,14 @@ describe('dashboard history pagination in Chromium', () => {
     const more = page.getByRole('button', { name: '加载更早的已关闭会话' });
     await more.waitFor();
     expect(requests).toEqual(['?view=board']);
+    // The banner reads like the dormant-session hint next to it: muted 12px text with a link-style button.
+    const look = await page.evaluate(() => {
+      const banner = document.querySelector('.sessions-history-pagination')!;
+      const button = banner.querySelector('button')!;
+      const [b, btn] = [getComputedStyle(banner), getComputedStyle(button)];
+      return { fontSize: b.fontSize, border: btn.borderTopWidth, background: btn.backgroundColor, cursor: btn.cursor };
+    });
+    expect(look).toEqual({ fontSize: '12px', border: '0px', background: 'rgba(0, 0, 0, 0)', cursor: 'pointer' });
     expect(await page.evaluate(() => (window as unknown as { fixtureStore: { sessions: Map<string, unknown> } }).fixtureStore.sessions.size)).toBe(119);
     if (process.env.BOTMUX_PAGINATION_SCREENSHOT) {
       mkdirSync(dirname(process.env.BOTMUX_PAGINATION_SCREENSHOT), { recursive: true });

@@ -12,7 +12,15 @@ export interface SessionPage<T> {
   closedTotal?: number;
 }
 
+export interface SessionPageOptions<T> {
+  /** Names resolved outside the row (current bot name, group name) that the
+   *  browser shows next to a session, so a keyword search can find them too. */
+  searchText?: (row: T) => ReadonlyArray<unknown>;
+}
+
 const CLOSED_PAGE_SIZE = 50;
+/** Keyword search is a browser text box, not a document; anything longer is not a real query. */
+export const SESSION_QUERY_MAX_LENGTH = 200;
 type ClosedKey = [number, string];
 
 /** Resolve the stable descending history key, falling back for legacy rows. */
@@ -40,8 +48,37 @@ function decodeCursor(raw: string): ClosedKey {
   return [parsed[0], parsed[1]];
 }
 
+/** Split a keyword query the way the ⌘K palette does (whitespace-separated, case-insensitive). */
+function parseQuery(raw: string | null): string[] {
+  if (raw === null) return [];
+  if (raw.length > SESSION_QUERY_MAX_LENGTH || /[\u0000-\u001f\u007f]/.test(raw)) {
+    throw new Error('invalid_session_query');
+  }
+  return raw.trim().toLowerCase().split(/\s+/).filter(Boolean);
+}
+
+/**
+ * The fields the ⌘K palette and the Workbench rail match a session on. Server
+ * matching is a plain substring superset of theirs (no fuzzy title match), so
+ * every row the browser would rank still arrives; the browser then ranks the
+ * merged rows itself. `larkAppId` stays out on purpose, like the palette.
+ */
+function sessionSearchText(row: SessionListRow, extra: ReadonlyArray<unknown>): string {
+  const r = row as SessionListRow & Record<string, unknown>;
+  const workspace = (r.workspace && typeof r.workspace === 'object' ? r.workspace : {}) as Record<string, unknown>;
+  return [
+    r.title, r.chatDisplayName, r.botName, r.cliId, r.repoName, r.gitBranch, r.workingDir,
+    workspace.rootPath, workspace.displayName, workspace.branch, r.sessionId, r.chatId,
+    ...extra,
+  ].filter(value => typeof value === 'string' && value).join('\n').toLowerCase();
+}
+
 /** Select browser rows before expensive presentation work; legacy callers keep all rows. */
-export function selectSessionPage<T extends SessionListRow>(rows: T[], params: URLSearchParams): SessionPage<T> {
+export function selectSessionPage<T extends SessionListRow>(
+  rows: T[],
+  params: URLSearchParams,
+  options: SessionPageOptions<T> = {},
+): SessionPage<T> {
   const view = params.get('view');
   if (view === null) return { sessions: rows };
   if (view === 'single') {
@@ -52,8 +89,12 @@ export function selectSessionPage<T extends SessionListRow>(rows: T[], params: U
   if (view !== 'board' && view !== 'closed') throw new Error('invalid_session_view');
   const rawCursor = params.get('cursor');
   if (view === 'board' && rawCursor !== null) throw new Error('invalid_session_cursor');
+  const rawQuery = params.get('q');
+  if (view === 'board' && rawQuery !== null) throw new Error('invalid_session_query');
   const cursor = rawCursor === null ? null : decodeCursor(rawCursor);
-  const closed = rows.filter(row => row.status === 'closed')
+  const tokens = parseQuery(rawQuery);
+  const closed = rows.filter(row => row.status === 'closed'
+    && (tokens.length === 0 || matchesTokens(sessionSearchText(row, options.searchText?.(row) ?? []), tokens)))
     .sort((a, b) => compareKeys(closedKey(a), closedKey(b)));
   const remaining = cursor ? closed.filter(row => compareKeys(closedKey(row), cursor) > 0) : closed;
   const page = remaining.slice(0, CLOSED_PAGE_SIZE);
@@ -64,4 +105,8 @@ export function selectSessionPage<T extends SessionListRow>(rows: T[], params: U
     closedCursor: remaining.length > page.length && last
       ? Buffer.from(JSON.stringify(closedKey(last))).toString('base64url') : null,
   };
+}
+
+function matchesTokens(text: string, tokens: readonly string[]): boolean {
+  return tokens.every(token => text.includes(token));
 }

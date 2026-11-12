@@ -4933,15 +4933,25 @@ const server = createServer(async (req, res) => {
       // re-resolves by larkAppId; the stored row is left untouched.
       const nameOf = dashboardBotNameLookup();
       groupsMatrixSnapshot.warm();
+      const groupPresentation = groupsMatrixSnapshot.peekPresentation();
       let page: ReturnType<typeof selectSessionPage<ReturnType<typeof aggregator.getSessions>[number]>>;
-      try { page = selectSessionPage(aggregator.getSessions(), url.searchParams); }
+      try {
+        page = selectSessionPage(aggregator.getSessions(), url.searchParams, {
+          // ⌘K / Workbench search also matches the names the browser displays
+          // beside a row: the current bot name and the group name.
+          searchText: row => [
+            row.larkAppId ? nameOf(row.larkAppId) : undefined,
+            typeof row.chatId === 'string' ? groupPresentation.get(row.chatId)?.name : undefined,
+          ],
+        });
+      }
       catch (error) {
         return jsonRes(res, 400, { ok: false, error: error instanceof Error ? error.message : 'invalid_session_page' });
       }
       const sessions = enrichSessionsWithGroupNames(page.sessions.map(s => {
         const n = s.larkAppId ? nameOf(s.larkAppId) : undefined;
         return n && n !== s.botName ? { ...s, botName: n } : s;
-      }), groupsMatrixSnapshot.peekPresentation());
+      }), groupPresentation);
       const browserSessions = projectSessionPreviewsForBrowser(sessions);
       lazyTopicLinkBackfill.trigger(browserSessions);
       return jsonRes(res, 200, {
