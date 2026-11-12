@@ -256,6 +256,15 @@ describe('fetchObserveSession', () => {
     expect(session.turn).toBe('idle');
     expect(session.phase).toBe('unknown');
     expect(session.queued).toBe(false);
+    expect(session).not.toHaveProperty('task');
+  });
+
+  it('adds the task block for a single session only when asked', async () => {
+    const fetch: DaemonIpcFetch = async () => jsonResponse({ session: baseRow({ sessionId: 's_task_1', status: 'working', busySinceAt: OBSERVED_AT - 5_000 }) });
+    const deps = { now: () => OBSERVED_AT, secret: 'test', discover: () => [makeDaemon()], fetch };
+    expect(await fetchObserveSession('s_task_1', deps)).not.toHaveProperty('task');
+    const session = await fetchObserveSession('s_task_1', { ...deps, includeTask: true });
+    expect(session.task).toEqual({ kind: 'working', busySinceAt: OBSERVED_AT - 5_000 });
   });
 
   it('surfaces not_found without cache fallback', async () => {

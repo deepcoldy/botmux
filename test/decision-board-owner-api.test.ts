@@ -127,6 +127,10 @@ describe('ownerList / ownerDetail', () => {
 
     expect(service.ownerList(['active']).items.map(i => i.title)).toEqual(['正在修']);
     expect(service.ownerList(parseOwnerBoardStates('all')!).items).toHaveLength(3);
+    // 看板视图比请求的状态宽（decide 视图含待验收、all 视图含全部），只回请求的状态。
+    expect(service.ownerList(['decide']).items.map(i => i.seq)).toEqual([decide]);
+    expect(service.ownerList(['accept']).items.map(i => i.seq)).toEqual([accept]);
+    expect(service.ownerList(['accept', 'active']).items.map(i => i.state).sort()).toEqual(['accept', 'active']);
   });
 
   it('详情带进展和最近历史（最新在前）；没有的编号报 item_not_found', async () => {
@@ -139,6 +143,12 @@ describe('ownerList / ownerDetail', () => {
     expect(item.events.some(e => e.text.includes('跑完 CI'))).toBe(true);
     for (const e of item.events) expect(e).not.toHaveProperty('actorRef');
     expect(await errorCode(() => service.ownerDetail(999))).toBe('item_not_found');
+
+    // 历史只带最新的 50 条。
+    for (let i = 1; i <= 55; i++) await service.cli({ action: 'set', ref: String(seq), fields: { note: `第 ${i} 次` } }, { sessionId: 's' });
+    const many = service.ownerDetail(seq).item.events;
+    expect(many).toHaveLength(50);
+    expect(many[0]!.text).toContain('第 55 次');
   });
 
   it('没开管家的 bot 不列、也不为此建库', async () => {
@@ -172,10 +182,18 @@ describe('ownerDecide', () => {
     const listed = service.ownerList(['decide']).items[0]!;
     expect(listed.pendingDecisions).toBe(1);
     expect(listed.lastDecision).toMatchObject({ batchId: 1, choice: 'A', text: '合吧', delivery: 'delivered', handled: false });
-    expect(service.ownerDetail(seq).item.events[0]).toMatchObject({ actor: 'owner', kind: 'decision', batchId: 1 });
+    expect(service.ownerDetail(seq).item.events[0]).toMatchObject({ actor: 'owner', kind: 'decision', batchId: 1, text: '选 A：合吧（本机客户端）' });
     expect(service.store().getBatch(APP, 1)!.source).toBe('local');
     const pending = await service.cli({ action: 'pending' }, { sessionId: 's' }) as any;
     expect(pending.decisions.map((d: any) => [d.batchId, d.seq, d.choice])).toEqual([[1, seq, 'A']]);
+
+    // 事项离开再重新进入待拍板：上一轮的决定不算这一轮的 lastDecision（仍计在待执行里）。
+    await service.cli({ action: 'set', ref: String(seq), fields: { state: 'active' } }, { sessionId: 's' });
+    await new Promise(resolve => setTimeout(resolve, 5));
+    await service.cli({ action: 'set', ref: String(seq), fields: { state: 'decide' } }, { sessionId: 's' });
+    const reentered = service.ownerList(['decide']).items[0]!;
+    expect(reentered.lastDecision).toBeUndefined();
+    expect(reentered.pendingDecisions).toBe(1);
   });
 
   it('管家群里这一项的卡片写明是本机客户端做的决定', async () => {
@@ -185,6 +203,13 @@ describe('ownerDecide', () => {
     const text = JSON.stringify(service.cards!.render(seq)!.card);
     expect(text).toContain('本机客户端已选 **B 不合**');
     expect(text).not.toContain('网页上已选');
+
+    // 本机客户端又改了决定：卡片上写明覆盖的是哪种来源的批次。
+    await service.ownerDecide({ seq, askKey: keyOf(seq), choice: 'A', requestId: 'req-card-002' });
+    await service.cardsIdle();
+    const after = JSON.stringify(service.cards!.render(seq)!.card);
+    expect(after).toContain('本机客户端已选 **A 合**');
+    expect(after).toContain('覆盖了本机客户端批次 #1 的决定');
   });
 
   it('待验收的项可以只写说明', async () => {
@@ -219,6 +244,12 @@ describe('ownerDecide', () => {
     const acceptKey = keyOf(seq);
     await service.cli({ action: 'set', ref: String(seq), fields: { state: 'decide' } }, { sessionId: 's' });
     expect(await errorCode(() => service.ownerDecide({ seq, askKey: acceptKey, text: '验收通过', requestId: 'req-flip-002' }))).toBe('ask_changed');
+    // 离开后重新进入待拍板（问题、选项都没变）：上一轮的 askKey 也不再算数。
+    const roundOneKey = keyOf(seq);
+    await service.cli({ action: 'set', ref: String(seq), fields: { state: 'active' } }, { sessionId: 's' });
+    await new Promise(resolve => setTimeout(resolve, 5));
+    await service.cli({ action: 'set', ref: String(seq), fields: { state: 'decide' } }, { sessionId: 's' });
+    expect(await errorCode(() => service.ownerDecide({ seq, askKey: roundOneKey, choice: 'A', requestId: 'req-flip-003' }))).toBe('ask_changed');
     expect(service.store().decisionsFor(APP, seq, false)).toEqual([]);
   });
 
@@ -290,6 +321,24 @@ describe('ownerDecide', () => {
     expect(delivered.map(d => d.turnId)).toEqual([`board:${APP}:1`]);
   });
 
+  it('投递途中被后来的决定覆盖、进程随后死掉（dispatched 残留且已被覆盖）：重试不再重投那一条', async () => {
+    const seq = await addDecide();
+    const askKey = keyOf(seq);
+    deliverImpl = async () => { throw new Error('down'); };
+    await service.ownerDecide({ seq, askKey, choice: 'A', requestId: 'req-ovcr-001' });
+    // 第 1 批正在投（dispatched）时第 2 批到达：只记覆盖、不作废（管家可能已经收到）。
+    service.store().markBatchDispatched(APP, 1, `board:${APP}:1`);
+    deliverImpl = async input => { delivered.push(input); return { sessionId: 'sess-steward' }; };
+    const later = await service.ownerDecide({ seq, askKey, choice: 'B', requestId: 'req-ovcr-002' });
+    expect(later.supersedes).toEqual([1]);
+    service.close();
+    service = makeService();
+
+    const retry = await service.ownerDecide({ seq, askKey, choice: 'A', requestId: 'req-ovcr-001' });
+    expect(retry).toMatchObject({ duplicate: true, decision: { supersededBy: 2 }, batch: { id: 1 } });
+    expect(delivered.map(d => d.turnId)).toEqual([`board:${APP}:2`]);
+  });
+
   it('以后提交的为准：较早没送到的决定（卡片或本机）作废，重试作废的那条不再投', async () => {
     const seq = await addDecide();
     deliverImpl = async () => { throw new Error('down'); };
@@ -315,6 +364,22 @@ describe('ownerDecide', () => {
     expect(delivered.map(d => d.turnId)).toEqual([`board:${APP}:3`]);
     const pending = await service.cli({ action: 'pending' }, { sessionId: 's' }) as any;
     expect(pending.decisions.map((d: any) => [d.batchId, d.choice])).toEqual([[3, 'A']]);
+  });
+
+  it('较早没送到的网页决定也以本机后来的决定为准', async () => {
+    const seq = await addDecide();
+    deliverImpl = async () => { throw new Error('down'); };
+    const item = service.store().getItem(APP, seq)!;
+    const draft = service.putDraft(seq, 'owner', { choice: 'A', text: '网页上选 A', baseRev: item.rev }).draft!;
+    const web = await service.submit({ author: 'owner', submitter: 'local', nonce: 'web-before-local', items: [{ seq, draftUpdatedAt: draft.updatedAt }] });
+    expect(web.batch.delivery).toBe('failed');
+
+    deliverImpl = async input => { delivered.push(input); return { sessionId: 'sess-steward' }; };
+    const local = await service.ownerDecide({ seq, askKey: keyOf(seq), choice: 'B', requestId: 'req-afterweb' });
+    expect(local.supersedes).toEqual([1]);
+    expect(service.store().decisionsFor(APP, seq, false).map(d => [d.batchId, !!d.handledAt, d.supersededBy])).toEqual([
+      [1, true, 2], [2, false, undefined],
+    ]);
   });
 
   it('已经送到管家的较早决定不作废：新决定提醒管家先如实标记那一条', async () => {
