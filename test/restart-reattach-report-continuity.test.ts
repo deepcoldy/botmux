@@ -1,9 +1,10 @@
+import { randomBytes } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { closeSync, mkdirSync, mkdtempSync, openSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SessionController } from '../src/core/session-controller.js';
-import { ActiveTurnAuthority } from '../src/core/active-turn-authority.js';
+import { ActiveTurnAuthority, sameTrustedPrincipal } from '../src/core/active-turn-authority.js';
 import { SessionContractStore } from '../src/services/session-contract-store.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 import {
@@ -16,8 +17,9 @@ import {
 } from '../src/core/report-session-relay.js';
 import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
+import { loadWorkerPoolClosure } from './helpers/worker-pool-function-harness.js';
 import type { DaemonSession } from '../src/core/types.js';
-import type { WorkerRef } from '../src/services/session-contract.js';
+import { sameWorker, type WorkerRef } from '../src/services/session-contract.js';
 
 const fixtureConfig = vi.hoisted(() => ({ dataDir: '' }));
 vi.mock('../src/config.js', async (importOriginal) => {
@@ -1012,5 +1014,306 @@ describe('continued launcher-to-leaf turn continuity across daemon restart', () 
     });
     expect(publishedContexts).toHaveLength(1);
     expect(workerGlobals.sandboxRelayCapability).toBeNull();
+  });
+});
+
+describe('runtime_contract_assigned re-publication fails closed on each stale-turn signal', () => {
+  const turnId = 'om_reattach_guard_1';
+  const exec = { executionId: 'exec-guard-1', turnId, dispatchAttempt: 1 };
+  const runtime1 = { runtimeId: 'rt-guard-1', epoch: 1 };
+  function harness() {
+    const scope = new WorkerSessionEventScope(
+      { appId: 'cli_executor_test', sessionId: 'session-executor-1' },
+      { workerId: 'w2', generation: 2 },
+    );
+    const older = scope.beginRuntime(undefined, '222:leafStart1');
+    const current = scope.beginRuntime(undefined, '222:leafStart1');
+    const authority = new ActiveTurnAuthority();
+    authority.reserve({ turnId, dispatchAttempt: 1 });
+    authority.markStarted({ turnId, dispatchAttempt: 1 });
+    const published: Array<string | undefined> = [];
+    const globals: Record<string, unknown> = {
+      workerSessionEventScope: scope,
+      activeTurnAuthority: authority,
+      retiredTurnIds: new Set<string>(),
+      currentBotmuxTurnId: turnId,
+      currentBotmuxDispatchAttempt: 1,
+      sandboxRelayCapability: { token: 'cap-live', turnId, dispatchAttempt: 1 },
+      publishedOriginContractScope: undefined,
+      pendingRuntimeReservations: new Map(),
+      pendingMessages: [],
+      closeRequested: false,
+      backend: null,
+      retiredRuntimeBackend: null,
+      restoredObserverGrantWait: { decide: () => false },
+      codexBridgeDrainAndMaybeEmit: () => {},
+      log: () => {},
+      flushPending: async () => {},
+      clearTraexContinuationGrantWait: () => {},
+      abandonTraexAutoModelContinuation: () => {},
+      stopBridgeWatcher: () => {},
+      stopScreenshotLoop: () => {},
+      killCli: () => {},
+      armRetiredRuntimeExit: () => {},
+      publishSandboxRelayCapability: () => { published.push(scope.contextBinding()?.bindingId); return true; },
+    };
+    const handle = loadWorkerFunction<(raw: unknown) => Promise<void>>('handleContractDaemonMessage', globals);
+    const assigned = (overrides: Record<string, unknown> = {}) => ({
+      type: 'runtime_contract_assigned',
+      bindingId: current.bindingId,
+      runtime: runtime1,
+      mayExecute: true,
+      admissionStates: [{ ref: exec, runtime: runtime1, phase: 'running' }],
+      executions: [exec],
+      ...overrides,
+    });
+    return { scope, older, current, authority, published, globals, handle, assigned };
+  }
+
+  it('re-publishes the live turn under the assigned current binding (control)', async () => {
+    const h = harness();
+    await h.handle(h.assigned());
+    expect(h.published).toEqual([h.current.bindingId]);
+  });
+
+  it.each<[string, (h: ReturnType<typeof harness>) => Record<string, unknown> | void]>([
+    ['the turn was retired locally', h => { (h.globals.retiredTurnIds as Set<string>).add(turnId); }],
+    ['the relay capability belongs to another turn', h => {
+      h.globals.sandboxRelayCapability = { token: 'cap-other', turnId: 'om_other_turn', dispatchAttempt: 1 };
+    }],
+    ['the relay capability belongs to another dispatch attempt', h => {
+      h.globals.sandboxRelayCapability = { token: 'cap-retry', turnId, dispatchAttempt: 2 };
+    }],
+    ['local turn authority moved to another turn', h => {
+      h.authority.clear();
+      h.authority.reserve({ turnId: 'om_other_turn', dispatchAttempt: 1 });
+    }],
+    ['the host retired the assigned runtime', () => ({ mayExecute: false })],
+    ['the assignment answers an older binding of the same process', h => ({
+      bindingId: h.older.bindingId, runtime: { runtimeId: 'rt-guard-0', epoch: 0 },
+    })],
+    ['the host already settled the execution', () => ({
+      admissionStates: [{ ref: exec, runtime: runtime1, phase: 'succeeded' }],
+    })],
+  ])('does not re-publish when %s', async (_name, arrange) => {
+    const h = harness();
+    const overrides = arrange(h) ?? {};
+    await h.handle(h.assigned(overrides));
+    expect(h.published).toEqual([]);
+  });
+});
+
+describe('runtimeIdentityForContract header-verified Codex fd identity', () => {
+  it('takes the sole top-level id from verified rollout headers when subagent rollouts are open, only if the PID owns it', () => {
+    const scope = new WorkerSessionEventScope({ appId: 'a', sessionId: 's' }, { workerId: 'w', generation: 2 });
+    const parentSid = '019a0000-0000-7000-8000-111111111111';
+    const subagentSid = '019a0000-0000-7000-8000-222222222222';
+    const foreignSid = '019a0000-0000-7000-8000-999999999999';
+    const env: Record<string, unknown> = {
+      backend: { cliPid: 222 },
+      codexRpcEngine: undefined,
+      effectiveBackendType: 'tmux',
+      lastInitConfig: { cliId: 'codex' },
+      cliAdapter: {},
+      workerSessionEventScope: scope,
+      readProcessStartIdentity: () => 'leafStart1',
+      findCodexRolloutSetByPid: () => new Set([parentSid, subagentSid]),
+      findCodexRolloutByPid: () => null,
+      codexHistorySidIsOwned: (sid: string, owned: ReadonlySet<string>) => owned.has(sid.toLowerCase()),
+      codexGenerationSessionIdFromRolloutPath: () => undefined,
+      codexBridgeRolloutPath: undefined,
+      codexBridgeQueue: { peek: () => [] },
+      readCodexLiveSessionId: () => parentSid,
+    };
+    const readIdentity = loadWorkerFunction<(b: any) => any>('runtimeIdentityForContract', env);
+    // No active bridge turn: the verified header alone identifies the parent conversation.
+    expect(readIdentity(scope.beginRuntime())).toEqual({
+      backend: 'tmux', physicalId: '222:leafStart1', proof: 'process_start', nativeSessionId: parentSid,
+    });
+    // A header id the PID does not hold among its rollouts is never adopted.
+    env.readCodexLiveSessionId = () => foreignSid;
+    expect(readIdentity(scope.beginRuntime())).toEqual({
+      backend: 'tmux', physicalId: '222:leafStart1', proof: 'process_start',
+    });
+  });
+});
+
+describe('refreshActiveRuntimeContract', () => {
+  it('re-reports only a changed, non-opaque identity of the current physical CLI', () => {
+    const scope = new WorkerSessionEventScope({ appId: 'a', sessionId: 's' }, { workerId: 'w', generation: 2 });
+    const launcher = { backend: 'tmux', physicalId: '111:launcherStart1', proof: 'process_start' };
+    const leaf = { backend: 'tmux', physicalId: '222:leafStart1', proof: 'process_start' };
+    let next: Record<string, unknown> = launcher;
+    const published: string[] = [];
+    const env: Record<string, unknown> = {
+      workerSessionEventScope: scope,
+      runtimeIdentityForContract: () => next,
+      publishRuntimeContract: (binding: { bindingId: string }) => { published.push(binding.bindingId); return Promise.resolve(); },
+    };
+    const refresh = loadWorkerFunction<() => void>('refreshActiveRuntimeContract', env);
+    const old = scope.beginRuntime(undefined, 'pane-old');
+    const active = scope.beginRuntime(undefined, 'pane-live');
+    // Nothing is re-reported before the first identity was published.
+    refresh();
+    active.identity = { ...launcher };
+    // Same identity: no churn.
+    refresh();
+    // An opaque observation never replaces a process proof.
+    next = { backend: 'tmux', physicalId: active.physicalId, proof: 'opaque' };
+    refresh();
+    // A callback still running for another process must not re-report the live one.
+    next = leaf;
+    scope.run(old, () => refresh());
+    expect(published).toEqual([]);
+    // The relay resolved the real CLI behind its launcher.
+    refresh();
+    expect(published).toEqual([active.bindingId]);
+  });
+});
+
+describe('launcher-chain recovery guards', () => {
+  const sid = '019a0000-0000-7000-8000-000000000001';
+  const launcher = { backend: 'tmux', physicalId: '111:launcherStart1', proof: 'process_start' as const };
+  const leaf = { backend: 'tmux', physicalId: '222:leafStart1', nativeSessionId: sid, proof: 'process_start' as const };
+  function restartedMidTurn() {
+    const s = createFixture(sid);
+    const oldExec = s.controller.admitInput('om_old_running_turn');
+    expect(s.controller.ingest({
+      type: 'turn_execution_started',
+      turnId: 'om_old_running_turn',
+      sessionContract: s.context(s.worker1, 1, { runtime: s.runtime1, execution: oldExec }),
+    }, s.worker1)).toMatchObject({ kind: 'current' });
+    s.controller.workerLost(s.worker1);
+    const worker2 = s.controller.bindWorker(2).worker;
+    const outer = s.controller.reserveBinding('w2-launcher', worker2);
+    s.controller.bindRuntime('w2-launcher', worker2, launcher);
+    return { s, worker2, outer };
+  }
+
+  it('declines, without refusing the binding, to recover the old leaf while a new turn is open on an outer launcher of the chain', () => {
+    const { s, worker2, outer } = restartedMidTurn();
+    const newExec = s.controller.admitInput('om_new_turn_on_outer_launcher');
+    s.store.bindQueuedExecution(s.ref, newExec, outer);
+    // session-scope launcher -> wrapper -> real CLI: two in-process hops.
+    s.controller.reserveBinding('w2-wrapper', worker2);
+    const wrapper = s.controller.bindRuntime('w2-wrapper', worker2,
+      { backend: 'tmux', physicalId: '333:wrapperStart1', proof: 'process_start' }, undefined, 'w2-launcher');
+    expect(s.store.runtimeContinues(s.ref, outer, wrapper.ref, worker2)).toBe(true);
+    const leafReserved = s.controller.reserveBinding('w2-leaf', worker2);
+    const leafBound = s.controller.bindRuntime('w2-leaf', worker2, leaf, undefined, 'w2-wrapper');
+    expect(leafBound.ref).toEqual(leafReserved);
+    expect(leafBound.ref).not.toEqual(s.runtime1);
+    expect(s.store.runtimeContinues(s.ref, outer, leafBound.ref, worker2)).toBe(true);
+  });
+
+  it('refuses recovery when another process of the same worker was bound in between, outside the continuation chain', () => {
+    const { s, worker2 } = restartedMidTurn();
+    s.controller.reserveBinding('w2-unrelated', worker2);
+    s.controller.bindRuntime('w2-unrelated', worker2, { backend: 'tmux', physicalId: '444:unrelatedStart1', proof: 'process_start' });
+    const leafReserved = s.controller.reserveBinding('w2-leaf', worker2);
+    const leafBound = s.controller.bindRuntime('w2-leaf', worker2, leaf, undefined, 'w2-unrelated');
+    expect(leafBound.ref).toEqual(leafReserved);
+    expect(leafBound.ref).not.toEqual(s.runtime1);
+  });
+});
+
+describe('re-publication through the real worker and daemon paths after a launcher-bound turn survives a restart', () => {
+  it('re-signs the observed turn on the recovered leaf runtime once, and the daemon restores its managed origin', async () => {
+    const data = mkdtempSync(join(tmpdir(), 'reattach-real-publish-'));
+    directories.push(data);
+    fixtureConfig.dataDir = data;
+    const sid = '019a0000-0000-7000-8000-0000000000aa';
+    const launcher = { backend: 'tmux', physicalId: '111:launcherStart1', proof: 'process_start' as const };
+    const leaf = { backend: 'tmux', physicalId: '222:leafStart1', nativeSessionId: sid, proof: 'process_start' as const };
+    const ds: any = { larkAppId: 'cli_real_publish', chatId: 'oc_chat',
+      session: { sessionId: 's-real', larkAppId: 'cli_real_publish', status: 'active', cliId: 'codex' } };
+    const store = new SessionContractStore(data, ds.larkAppId);
+    handles.push(store);
+    const controller = new SessionController(ds, store);
+    // Worker 1 started the turn on the launcher binding, then resolved the leaf in process.
+    const worker1 = controller.bindWorker(1).worker;
+    const launcher1 = controller.reserveBinding('w1-launcher', worker1);
+    controller.bindRuntime('w1-launcher', worker1, launcher);
+    const turnId = 'om_launcher_bound_turn';
+    const execution = controller.admitInput(turnId);
+    expect(controller.ingest({ type: 'turn_execution_started', turnId, sessionContract: { version: 2, session: controller.ref,
+      producer: worker1, bindingId: 'w1-launcher', eventId: `${worker1.workerId}:1`, sequence: 1,
+      scope: { runtime: launcher1, execution } } } as any, worker1)).toMatchObject({ kind: 'current' });
+    controller.reserveBinding('w1-leaf', worker1);
+    const leaf1 = controller.bindRuntime('w1-leaf', worker1, leaf, undefined, 'w1-launcher');
+    controller.workerLost(worker1);
+    const worker2 = controller.bindWorker(2).worker;
+
+    // Daemon side: the production runtime_binding / managed_turn_origin handlers.
+    const toWorker: any[] = [];
+    const daemonWorker: any = { pid: 90, connected: true, killed: false,
+      send: (message: any, callback?: (error: null) => void) => { toWorker.push(message); callback?.(null); return true; } };
+    ds.worker = daemonWorker;
+    const logger = { warn: vi.fn(), debug: vi.fn(), info: vi.fn(), error: vi.fn() };
+    const hostEnv: any = { ds, worker: daemonWorker, sessionController: controller, contractWorker: worker2, botCfg: {},
+      sessionCliId: () => 'codex', logger, t: 'real-publish', sameWorker, sameTrustedPrincipal,
+      currentGatewayCallerOpenId: () => undefined, currentTurnProcessIdentities: () => ['222:leafStart1'],
+      noteTurnDispatchAttempt: vi.fn(), ensureAutomaticTaskContinuationLease: vi.fn() };
+    hostEnv.handleLegacyWorkerMessage = loadWorkerPoolClosure('handleLegacyWorkerMessage', hostEnv);
+    const host = loadWorkerPoolClosure<(message: any) => Promise<void>>('handleWorkerMessage', hostEnv);
+    hostEnv.handleWorkerMessage = host;
+
+    // Worker 2 side: production send / metadata / publication / IPC handler.
+    const scope = new WorkerSessionEventScope(controller.ref, worker2);
+    const authority = new ActiveTurnAuthority();
+    authority.reserve({ turnId });
+    authority.markStarted({ turnId });
+    const wire: any[] = [];
+    const pending: Promise<void>[] = [];
+    const env: Record<string, any> = {
+      workerSessionEventScope: scope, activeTurnAuthority: authority, sessionId: 's-real', lastInitConfig: { cliId: 'codex' },
+      currentBotmuxTurnId: turnId, currentBotmuxDispatchAttempt: undefined, retiredTurnIds: new Set<string>(),
+      sandboxRelayCapability: { token: 'cap-restored-from-marker', turnId }, publishedOriginContractScope: undefined,
+      writeCliPidMarker: vi.fn(), parseDaemonIpcPort: () => 7956, randomBytes, frozenTurnLinkRefMode: () => undefined,
+      isWorkflowWorker: () => false, pendingRuntimeReservations: new Map(), pendingMessages: [], closeRequested: false,
+      backend: null, retiredRuntimeBackend: null, restoredObserverGrantWait: { decide: () => false },
+      codexBridgeDrainAndMaybeEmit: () => {}, log: () => {}, flushPending: async () => {},
+      clearTraexContinuationGrantWait: () => {}, abandonTraexAutoModelContinuation: () => {},
+      stopBridgeWatcher: () => {}, stopScreenshotLoop: () => {}, killCli: () => {}, armRetiredRuntimeExit: () => {},
+      process: { env: {}, send: (message: any) => { wire.push(message); pending.push(host(message)); } },
+    };
+    for (const name of ['workerIpcPayload', 'send', 'publishSandboxRelayCapability']) env[name] = loadWorkerFunction(name, env);
+    const handleContract = loadWorkerFunction<(raw: unknown) => Promise<void>>('handleContractDaemonMessage', env);
+    const drain = async () => { while (pending.length) await Promise.all(pending.splice(0)); };
+    const register = async (identity: Record<string, unknown>, continuesBindingId?: string) => {
+      const binding = scope.beginRuntime(undefined, 'pane-1');
+      binding.identity = identity as any;
+      await scope.run(binding, async () => {
+        env.send({ type: 'runtime_binding_started', bindingId: binding.bindingId });
+        await drain();
+        env.send({ type: 'runtime_binding', bindingId: binding.bindingId, identity,
+          ...(continuesBindingId ? { continuesBindingId } : {}) });
+        await drain();
+      });
+      const assigned = toWorker.filter(message => message.type === 'runtime_contract_assigned' && message.bindingId === binding.bindingId).at(-1);
+      expect(assigned).toBeDefined();
+      return { binding, assigned };
+    };
+
+    const outer = await register(launcher);
+    await handleContract(outer.assigned);
+    await drain();
+    const inner = await register(leaf, outer.binding.bindingId);
+    expect(inner.assigned.runtime).toEqual(leaf1.ref);
+    expect(inner.assigned.observedExecutions).toEqual([{ runtime: launcher1, execution }]);
+    wire.length = 0;
+    await handleContract(inner.assigned);
+    await drain();
+    const origins = wire.filter(message => message.type === 'managed_turn_origin');
+    expect(origins).toHaveLength(1);
+    expect(origins[0].sessionContract).toMatchObject({ bindingId: inner.binding.bindingId,
+      scope: { runtime: leaf1.ref, execution } });
+    expect(logger.warn).not.toHaveBeenCalledWith(expect.stringMatching(/Dropped managed_turn_origin/));
+    expect(ds.managedTurnOrigin).toMatchObject({ turnId, capability: origins[0].capability });
+
+    // A duplicate assignment for the same binding and execution does not rotate the capability again.
+    await handleContract(inner.assigned);
+    await drain();
+    expect(wire.filter(message => message.type === 'managed_turn_origin')).toHaveLength(1);
   });
 });
