@@ -1651,6 +1651,18 @@ export function identityStorageModelForDaemonSession(ds: DaemonSession): Identit
   return report.model;
 }
 
+/** Why the proven identity route refuses a session whose caller lineage is
+ *  already proven: which half of {@link identityStorageModelForDaemonSession}
+ *  kept it off `proven`. Undefined when the session IS proven. Reported to the
+ *  proven caller and to the daemon log so a refusal names the failing step
+ *  instead of looking like an authorization problem. */
+export type IdentityModelRefusalReason = 'identity_decision_missing' | 'identity_decision_conflict' | 'identity_model_single';
+export function identityModelRefusalReason(ds: DaemonSession): IdentityModelRefusalReason | undefined {
+  if (!ds.reportedIdentityModel) return 'identity_decision_missing';
+  if (identityDecisionConflict(ds)) return 'identity_decision_conflict';
+  return identityStorageModelForDaemonSession(ds) === 'proven' ? undefined : 'identity_model_single';
+}
+
 /** Whether an identity-decision report's turn may be replayed on a flip.
  *
  * The decision arrives over the CURRENT worker generation's private IPC (that
@@ -23289,9 +23301,11 @@ function setupWorkerHandlers(
       } catch (error) { logger.warn(`[${t}] Recovered output origin unproven: ${String(error)}`); return; }
     }
     // Losing the current worker's turn origin leaves --as user and actor
-    // current without a requesting user, so it must be visible in production.
+    // current without a requesting user, and losing its identity decision
+    // leaves every proven identity wrapper refused (exit 77), so both must be
+    // visible in production.
     const logRejected = (reason: string) => {
-      if ((msg.type === 'managed_turn_origin' || msg.type === 'managed_turn_origin_revoked') && ds.worker === worker) {
+      if ((msg.type === 'managed_turn_origin' || msg.type === 'managed_turn_origin_revoked' || msg.type === 'session_identity_decision') && ds.worker === worker) {
         logger.warn(`[${t}] Dropped ${msg.type} from current worker turn=${msg.turnId ?? '-'} reason=${reason}`);
       } else if (msg.type === 'final_output' && ds.worker === worker) {
         reportUndeliveredFinal(msg, reason);
