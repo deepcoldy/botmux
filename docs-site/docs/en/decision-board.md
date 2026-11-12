@@ -196,6 +196,25 @@ botmux board set <n> --dismiss-hint                   # dismiss the board hint
 - `attach` with an explainer: an `.html` page is a single file (images inlined as data URLs, UTF-8, at most 10MB); `.mp4` / `.webm` videos are at most 50MB, mp4 in H.264 with `-movflags +faststart`. Up to 4 per attach, alongside screenshots if you like. The steward guide (`botmux board guide`) covers how to write the page and has a minimal template.
 - See `botmux board --help` for every option.
 
+## Reading the board and deciding from other local tools
+
+Other tools on the same machine (your own scripts, a local Feishu client) can read a steward's board and submit decisions for you with `botmux owner-board`. Output is always JSON:
+
+```bash
+botmux owner-board boards                                      # stewards online on this machine
+botmux owner-board list --bot <steward appId> [--state decide,accept] [--query text]
+botmux owner-board show --bot <steward appId> <n>
+botmux owner-board decide --bot <steward appId> <n> --ask-key <askKey> --request-id <id> \
+  [--choice A] [--text "note"]
+```
+
+- `list` shows "needs decision + needs review" by default; `--state` takes a comma list of `decide` / `accept` / `active` / `waiting` / `done` / `closed`, or `all`. Each item carries the question, options, recommendation, main chat, links, update time and the Feishu sidebar link.
+- `decide` only accepts items that need a decision or a review and works like clicking an option on the card: the item goes to the steward as a batch of its own, and both the timeline and the card in the steward chat say it came from a local client. Pass the item's `askKey` from `list` / `show`; if the steward changed the question, options or state since, the call is refused so you can refresh first. `--request-id` is chosen by the caller: retrying with the same id and the same content never submits twice and redelivers if the previous attempt did not get through; reusing an id for another item or other content is refused.
+- Like the card, **the later decision wins**: an earlier decision on the same item (from the card or a local client) that has not reached the steward is voided; one that already reached it stays, and the steward is told to record what actually happened to it first. Review notes on an item that needs review do not void each other; each one is delivered.
+- `decide` refuses to run inside a botmux session (when `BOTMUX_SESSION_ID` is inherited): decisions come from the owner's own tools, not from an agent inside a session.
+- Authentication is the host daemon's local credential (the same one `botmux observe` uses, `~/.botmux/.dashboard-secret`) and only `127.0.0.1` is dialed. Sandboxed sessions cannot read that credential, so agents inside them cannot use it; Dashboard login and APIs are unchanged.
+- Nothing to configure: it works once the daemons run a version that has it. See `botmux owner-board --help` for every field.
+
 ## Where the data lives
 
 The board lives in `<data dir>/decision-board.sqlite` (one file per machine, partitioned per steward bot) with images and explainers under `<data dir>/decision-board/<app_id>/files/` (pages / videos uploaded but not attached yet sit in the sibling `staging/` and are removed after an hour), created on first use. Turning the steward off keeps the data.

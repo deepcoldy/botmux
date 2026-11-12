@@ -73,6 +73,17 @@ daemon 重启前开始的轮没有。
   里的预览。匿名只读面板去掉它。
 - 只用 `botmux send` 且没带 `--response-kind final` 的轮没有最终回复回执，记 `no_output`（宁可显示空闲也不猜已交付）。
 
+## 外部读取（`botmux observe --include-task`）
+
+本机外部工具用 `botmux observe --include-task` 拿同一套推导：CLI 拿到 daemon 的会话行后调
+`deriveSessionTaskStatus()`，原样投影成 `task: { kind, reason?, detail?, at?, busySinceAt?, summary?, remaining? }`
+（`since` 改名 `busySinceAt`，其余同名）。observe 是 owner 本机的宿主 CLI，按 owner 视角带最终回复第一行；
+daemon 没给出已知运行态（探测失败、未知状态）时不带 `task`。不带 `--include-task` 时输出不变。
+`--active` / `--since <时长>` 只留没关闭、并且在跑或窗口内有消息的会话（默认 24 小时）。
+
+推导需要的输入里，休眠后由持久行补出的会话（没有 DaemonSession 的 persisted-active 行）只带本轮结果，
+没有举手和 TODO；举手只在内存里，daemon 重启后清空。这两处和 Dashboard 看到的一样。
+
 ## 会话控制页看板
 
 | 列 | 进来的会话 |

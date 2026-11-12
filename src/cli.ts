@@ -8079,8 +8079,11 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               用 resolve --outcome delivered|not-delivered --yes 恢复后续重试
   list        列出活跃会话（交互式选择并连接 tmux）
               --plain  纯文本表格输出（管道/脚本场景）
-  observe [--session <id>] [--lark-app <appId>] [--include-raw]
+  observe [--session <id>] [--lark-app <appId>] [--include-raw] [--include-task] [--active|--since <时长>]
               通过 daemon 实时 IPC 输出 canonical worker/session JSON；失败保持 unknown，不回退缓存
+              --include-task 附任务状态；--active / --since 只列没关闭且在跑或窗口内有消息的会话
+  owner-board boards|list|show|decide --bot <appId> …
+              本机外部客户端读管家的决策看板、提交决定（JSON，宿主机 host HMAC；见 botmux owner-board --help）
   interaction-context --bot <appId> --session <id> [--actor <openId>]
               宿主只读查询真实会话来源及当前回答权限（不恢复会话）
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
@@ -21889,6 +21892,11 @@ switch (command) {
   case 'manager':  await cmdChatManager(process.argv.slice(3)); break;
   case 'project':  await cmdProject(process.argv.slice(3)); break;
   case 'board':    await cmdBoard(process.argv.slice(3)); break;
+  case 'owner-board': {
+    const { runOwnerBoardCommand } = await import('./cli/owner-board-command.js');
+    process.exitCode = await runOwnerBoardCommand(process.argv.slice(3));
+    break;
+  }
   case 'dispatch': await cmdDispatch(process.argv.slice(3)); break;
   case 'report': await cmdReport(process.argv.slice(3)); break;
   case 'grant': await cmdExactChatGrant(process.argv.slice(3)); break;

@@ -11,6 +11,8 @@ import { normalizeCodexProfile, scanCodexProfiles, validateCodexProfile, CodexPr
 import { REPLY_FOOTER_KEYS, normalizeReplyFooter, type ReplyFooterPreferences } from '../services/reply-footer.js';
 import { resumeSuccessMessage } from './resume-result-message.js';
 import { boardErrorStatus, type BoardCliRequest, type DecisionBoardService } from './decision-board/service.js';
+import { parseOwnerBoardStates } from './decision-board/owner-api.js';
+import { BOARD_STATES } from './decision-board/model.js';
 import {
   BOARD_HTML_CSP,
   BOARD_UPLOAD_HEADERS,
@@ -5119,6 +5121,41 @@ decisionBoardRoute('POST', '/api/decision-board/batches/:id/redeliver', async (s
   const id = decisionBoardSeq(params.id);
   if (id === null) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
   jsonRes(res, 200, { ok: true, ...(await service.redeliver(id)) });
+});
+
+/**
+ * 本机外部客户端（`botmux owner-board`）：列出 / 读一项 / 提交一项决定。只走 host HMAC（外层默认闸，
+ * 这里再核一次），Dashboard 不转发这组路由；字段见 decision-board/owner-api.ts。
+ */
+function ownerBoardRoute(method: string, path: string,
+  handler: (service: DecisionBoardService, req: IncomingMessage, res: ServerResponse, params: Record<string, string>) => Promise<void> | void): void {
+  decisionBoardRoute(method, path, async (service, req, res, params) => {
+    if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+    await handler(service, req, res, params);
+  });
+}
+
+ownerBoardRoute('GET', '/api/decision-board/owner/items', (service, req, res) => {
+  const url = new URL(req.url!, 'http://localhost');
+  const states = parseOwnerBoardStates(url.searchParams.get('state'));
+  if (!states) return jsonRes(res, 400, { ok: false, error: 'invalid_state', message: `状态只能是 ${BOARD_STATES.join(' / ')} 或 all` });
+  const query = url.searchParams.get('q')?.slice(0, 200) || undefined;
+  jsonRes(res, 200, { ok: true, ...service.ownerList(states, query) });
+});
+
+ownerBoardRoute('GET', '/api/decision-board/owner/items/:seq', (service, _req, res, params) => {
+  const seq = decisionBoardSeq(params.seq);
+  if (seq === null) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  jsonRes(res, 200, { ok: true, ...service.ownerDetail(seq) });
+});
+
+ownerBoardRoute('POST', '/api/decision-board/owner/items/:seq/decide', async (service, req, res, params) => {
+  const seq = decisionBoardSeq(params.seq);
+  const body = await readJsonBody<Record<string, unknown>>(req, 256 * 1024).catch(() => undefined);
+  if (seq === null || !body || typeof body !== 'object' || Array.isArray(body)) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  jsonRes(res, 200, { ok: true, ...await service.ownerDecide({
+    seq, askKey: body.askKey, choice: body.choice, text: body.text, requestId: body.requestId,
+  }) });
 });
 
 /** Trusted Dashboard creates or refreshes the one pinned pre-project guide. */
