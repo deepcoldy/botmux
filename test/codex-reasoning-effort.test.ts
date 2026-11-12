@@ -77,9 +77,11 @@ describe('Grok model-aware reasoning efforts', () => {
     expect(isConfigurableReasoningCliId('opencode')).toBe(false);
   });
 
-  it('exposes xhigh only for grok-4.6', () => {
-    expect(reasoningEffortsForCliModel('grok', 'grok-4.6')).toEqual(GROK_REASONING_EFFORTS);
-    expect(cliModelSupportsReasoningEffort('grok', 'grok-4.6', 'xhigh')).toBe(true);
+  it.each(['grok-4.6', 'grok-4.7', 'grok-4.7-build-fast', ' GROK-4.7-BUILD-FAST '])('exposes the advertised xhigh level for %s', model => {
+    expect(reasoningEffortsForCliModel('grok', model)).toEqual(GROK_REASONING_EFFORTS);
+    expect(cliModelSupportsReasoningEffort('grok', model, 'xhigh')).toBe(true);
+    expect(cliModelSupportsReasoningEffort('grok', model, 'max')).toBe(false);
+    expect(cliModelSupportsReasoningEffort('grok', model, 'ultra')).toBe(false);
   });
 
   it('fails closed to the three-level intersection for grok-4.5 and unknown models', () => {

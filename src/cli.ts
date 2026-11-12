@@ -17459,8 +17459,9 @@ botmux grant chat — 给目标 Bot 增删/查询精确群对话授权（不授�
   - --subject-open-id 与 --subject-bot 严格二选一，均可重复传入。
   - --subject-bot 是推荐的稳定 App 身份入口，由 receiver daemon 在自己视角解析 open_id；
     它仅支持 grant，revoke/readback 仍必须显式传 --subject-open-id。
-  - grant 只接受 receiver 视角下 Feishu /members/bots 实时返回的群内 Bot open_id；
-    接口失败时 fail-closed，不使用 observed/cross-ref 历史回退。
+  - grant 只接受 receiver 视角下当前在群的 open_id：Bot 以 Feishu /members/bots 实时结果为准，
+    真人以群成员列表 /members 实时结果为准（--subject-bot 只会是 Bot，只查 /members/bots）；
+    给不出确定结论时 fail-closed，不使用 observed/cross-ref 历史回退。receiver 自身不能作为 subject。
   - revoke 不依赖实时成员查询，Bot 已退群后仍可清理旧授权。
   - readback 只返回显式请求的 subject，不枚举整个授权表。
   - 只写 chatGrant（talk-only）；不改 allowedUsers / allowedChatGroups / team trust，

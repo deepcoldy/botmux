@@ -115,6 +115,19 @@ describe('TraeX auto-model current-turn continuation real Worker and PTY', () =>
     expect(f.controller!.store.executions(f.controller!.ref, 'om_late_proof')[0]!.runtime).toEqual(f.controller!.currentRuntime());
   }, 70_000);
 
+  // The shared teardown SIGKILLs workers and then awaits contractEvents, where
+  // production handleWorkerMessage replies to the worker's last messages may
+  // still be pending. Such a reply hits a dead channel; if the teardown stops
+  // retiring the worker's IPC, the run fails with that unhandled error.
+  it.skipIf(!probeTmuxFunctional().ok)('tolerates a host reply that lands after the teardown killed the worker', async () => {
+    const f = await fixture(true, 'ordered', false, undefined, true, undefined, true,
+      undefined, 0, 0, false, false, undefined, undefined, undefined, false, false, true);
+    expect(f.child.exitCode).toBeNull();
+    contractEvents.push(new Promise<void>(resolveReply => f.child.once('exit', () => {
+      f.child.send({ type: 'runtime_binding_aborted_ack', bindingId: 'late-reply' } as DaemonToWorker);
+      setTimeout(resolveReply, 50);
+    })));
+  }, 70_000);
   it.skipIf(!probeTmuxFunctional().ok).each(['normal', 'lost-ack', 'persistence-retry'] as const)('abandons a refused continuation reservation without losing queued input (%s)', async mode => {
     const fixtureState = await fixture(true, 'ordered', false, undefined, true, undefined, true,
       undefined, 0, 0, false, false, undefined, undefined, undefined, false, false, true);
