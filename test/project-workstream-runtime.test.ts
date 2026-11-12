@@ -92,12 +92,14 @@ function sourceSession(patch: Record<string, unknown> = {}) {
 
 function importedFixture() {
   const source = sourceSession();
-  mocks.live.set(SOURCE_ID, { session: source, cliReady: true });
+  mocks.live.set(SOURCE_ID, { session: source, worker: { killed: false }, workerReady: true, cliReady: true });
   mocks.live.set('main-session', {
     session: sourceSession({
       sessionId: 'main-session', larkAppId: 'cli_main', scope: 'chat',
       rootMessageId: 'om_main', cliSessionId: 'native-main',
     }),
+    worker: { killed: false },
+    workerReady: true,
     cliReady: true,
   });
   const record = {
@@ -527,16 +529,87 @@ describe('project workstream runtime report freshness', () => {
     expect(lookups).toBe(2);
   });
 
-  it('rejects lost source readiness while resolving the final coordinator', async () => {
+  it('accepts mid-turn reports when runtime_busy clears cliReady or updates display titles, while rejecting worker loss', async () => {
+    const f = importedFixture();
+    // Active turn: promptReady=false -> cliReady=false while workerReady=true and worker is alive.
+    mocks.live.get(SOURCE_ID).cliReady = false;
+    mocks.live.get('main-session').session.ownerUnionId = undefined;
+    let lookups = 0;
+    mocks.union.mockImplementation(async () => {
+      lookups += 1;
+      if (lookups === 1) {
+        // Volatile display fields changing mid-validation must not trip source identity checks.
+        mocks.live.get(SOURCE_ID).currentTurnTitle = '正在执行复测...';
+        f.source.title = '更新后的展示标题';
+      }
+      if (lookups === 2) {
+        // Prompt flipping between busy and ready within the same live worker generation stays valid.
+        mocks.live.get(SOURCE_ID).cliReady = true;
+      }
+      return { status: 'resolved', unionId: 'on_owner' };
+    });
+    expect(await f.validate()).toEqual({ ok: true, ownerKey: OWNER, routeRevision: 1 });
+    expect(lookups).toBe(2);
+
+    // Losing worker runtime liveness mid-validation still fails closed.
+    lookups = 0;
+    mocks.union.mockImplementation(async () => {
+      lookups += 1;
+      if (lookups === 2) mocks.live.get(SOURCE_ID).workerReady = false;
+      return { status: 'resolved', unionId: 'on_owner' };
+    });
+    expect(await f.validate()).toEqual({ ok: false, error: 'dispatch_attachment_inactive' });
+    expect(lookups).toBe(2);
+  });
+
+  it('rejects a report when the worker generation is replaced and fully recovers mid-validation', async () => {
+    const f = importedFixture();
+    const live = mocks.live.get(SOURCE_ID);
+    live.workerGeneration = 1;
+    live.cliReady = false;
+    mocks.live.get('main-session').session.ownerUnionId = undefined;
+    let lookups = 0;
+    mocks.union.mockImplementation(async () => {
+      lookups += 1;
+      if (lookups === 2) {
+        // forkWorker reserves a new generation and the replacement worker comes
+        // fully online before the final gate: liveness alone cannot tell the
+        // generations apart, so the generation snapshot must reject the report.
+        live.workerGeneration = 2;
+        live.worker = { killed: false };
+        live.workerReady = true;
+      }
+      return { status: 'resolved', unionId: 'on_owner' };
+    });
+    expect(await f.validate()).toEqual({ ok: false, error: 'dispatch_attachment_inactive' });
+    expect(lookups).toBe(2);
+  });
+
+  it('rejects a report when the source session is marked for cold resume even with a live worker', async () => {
     const f = importedFixture();
     mocks.live.get('main-session').session.ownerUnionId = undefined;
     let lookups = 0;
     mocks.union.mockImplementation(async () => {
       lookups += 1;
-      if (lookups === 2) mocks.live.get(SOURCE_ID).cliReady = false;
+      if (lookups === 2) mocks.live.get(SOURCE_ID).session.suspendedColdResume = true;
       return { status: 'resolved', unionId: 'on_owner' };
     });
     expect(await f.validate()).toEqual({ ok: false, error: 'dispatch_attachment_inactive' });
     expect(lookups).toBe(2);
+  });
+
+  it('still rejects a non-title source field that drifts while resolving the coordinator', async () => {
+    const f = importedFixture();
+    mocks.live.get('main-session').session.ownerUnionId = undefined;
+    let lookups = 0;
+    mocks.union.mockImplementation(async () => {
+      lookups += 1;
+      // Only the display title is exempt from the source/final comparison. The
+      // import kind has no other freshness check, so this is the only guard.
+      if (lookups === 1) f.source.projectImportSource = 'adopt';
+      return { status: 'resolved', unionId: 'on_owner' };
+    });
+    expect(await f.validate()).toEqual({ ok: false, error: 'dispatch_attachment_inactive' });
+    expect(lookups).toBe(1);
   });
 });
