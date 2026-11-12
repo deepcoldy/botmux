@@ -55,12 +55,12 @@ function isSourceSessionRuntimeLive(ds: DaemonSession | undefined): ds is Daemon
   return ds.worker !== undefined ? true : ds.cliReady === true;
 }
 
+/** Only the display title may refresh mid-turn. Every other field stays in the
+ *  comparison, so a field later added to ProjectAttachmentSource is checked by
+ *  default instead of silently dropping out of the freshness proof. */
 function authoritativeSourceIdentity(source: ProjectAttachmentSource): string {
-  return JSON.stringify([
-    source.sessionId, source.larkAppId, source.chatId, source.rootMessageId,
-    source.scope, source.chatType ?? null, source.status, source.ownerKey,
-    source.routeRevision, source.source, source.ordinary, source.reportCapability,
-  ]);
+  const { title: _displayOnly, ...authoritative } = source;
+  return JSON.stringify(authoritative);
 }
 
 /** Freshness is proved against the denied host journal, not the CLI-readable

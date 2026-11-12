@@ -597,4 +597,19 @@ describe('project workstream runtime report freshness', () => {
     expect(await f.validate()).toEqual({ ok: false, error: 'dispatch_attachment_inactive' });
     expect(lookups).toBe(2);
   });
+
+  it('still rejects a non-title source field that drifts while resolving the coordinator', async () => {
+    const f = importedFixture();
+    mocks.live.get('main-session').session.ownerUnionId = undefined;
+    let lookups = 0;
+    mocks.union.mockImplementation(async () => {
+      lookups += 1;
+      // Only the display title is exempt from the source/final comparison. The
+      // import kind has no other freshness check, so this is the only guard.
+      if (lookups === 1) f.source.projectImportSource = 'adopt';
+      return { status: 'resolved', unionId: 'on_owner' };
+    });
+    expect(await f.validate()).toEqual({ ok: false, error: 'dispatch_attachment_inactive' });
+    expect(lookups).toBe(1);
+  });
 });
