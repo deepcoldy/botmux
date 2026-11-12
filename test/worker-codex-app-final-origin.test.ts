@@ -64,6 +64,9 @@ function harness(reattached: boolean | 'native-recovery' = false, ordinary = fal
     codexAppGenerationCommits: [], codexAppRecoveredDispatches: [], turnExecutionClock: new TurnExecutionClock(),
     codexAppPendingDaemonAcks: new Map(), CODEX_APP_DAEMON_PERSIST_TIMEOUT_MS: 30_000,
     closeRequested: false, frozenTurnLinkRefMode: () => undefined, isWorkflowWorker: () => false,
+    // This harness exercises signed control finals; JSONL bridge draining is
+    // an independent listener awakened by the same observer assignment.
+    codexBridgeDrainAndMaybeEmit: vi.fn(),
     log: vi.fn(), cliName: () => 'Codex App', rejectCodexAppControlMarker: vi.fn(),
     currentBotmuxTurnId: 'turn-next', currentBotmuxDispatchAttempt: 99,
     inputDeliveryEvidence: { start: vi.fn() }, cliSpawnGeneration: 1,

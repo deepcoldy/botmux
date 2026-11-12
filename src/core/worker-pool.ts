@@ -1,6 +1,6 @@
 import { isLeadOnlySession } from './lead-only.js';
 import { controllerForSession, type WorkerContractContext } from './session-controller.js';
-import { sameWorker, sameRuntime } from '../services/session-contract.js';
+import { sameWorker, sameRuntime, executionObserverSupported } from '../services/session-contract.js';
 import { observeTraexInstall } from '../services/traex-install-watch.js';
 import {
   compareLaunchedInstall,
@@ -193,7 +193,7 @@ import { getSessionUsageSnapshot } from './cost-calculator.js';
 import { repairReplyMarkdown } from '../services/reply-markdown.js';
 import { renderBrandTemplate } from '../im/lark/brand-template.js';
 import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessage, abortCotMessage, resumeCotMessage } from '../im/lark/cot-message.js';
-import { retireReplyCardDisplay, replyCardDispatchAttempt, updateReplyCardNativeThinking, replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
+import { retireReplyCardDisplay, settleTurnReplyCardTerminal, replyCardDispatchAttempt, updateReplyCardNativeThinking, replyCardModeFor, replyCardSandboxBlocked, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards, supersedeTurnReplyCard } from './turn-reply-card.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
 import { ReplyCardWithdrawnError } from '../services/turn-reply-card.js';
 import { readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
@@ -22847,15 +22847,9 @@ function setupWorkerHandlers(
         // post-terminal summon would create a bubble nobody ever finishes).
         if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt) && replyCardModeFor(ds, msg.turnId) !== 'legacy') {
           if (ds.replyCardRunningTurnId === msg.turnId) ds.replyCardRunningTurnId = undefined;
-          void (async () => {
-            await flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
-              logger.warn(`[${t}] reply-card final tool flush: ${error.message}`);
-            });
-            await updateTurnReplyCard(ds, msg.turnId, {
-              kind: 'terminal', phase: msg.status, durationMs: msg.durationMs, completedAtMs: msg.completedAtMs,
-            }, (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }),
-            { dispatchAttempt: msg.dispatchAttempt, owns: ownsLifecycleMutation });
-          })().catch(error => logger.warn(`[${t}] reply-card terminal: ${error.message}`));
+          void settleTurnReplyCardTerminal(ds, msg,
+            (body, type, uuid, beforeWrite) => scopedReply(body, type, msg.turnId, { uuid, beforeWrite }), ownsLifecycleMutation)
+            .catch(error => logger.warn(`[${t}] reply-card terminal: ${error.message}`));
         }
         finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
         ds.cotForced = undefined;
@@ -23909,6 +23903,17 @@ function setupWorkerHandlers(
         else {
           const runtime = sessionController.bindRuntime(msg.bindingId, contractWorker, msg.identity, msg.operationId, msg.continuesBindingId);
           const observedExecutions: NonNullable<Extract<DaemonToWorker, { type: 'runtime_contract_assigned' }>['observedExecutions']> = [];
+          // A native-identified binding is the host's one observer decision for
+          // it; the worker releases restored turns this decision did not grant.
+          const observerDecision = executionObserverSupported(ds.initConfig?.cliId ?? ds.session.cliId, runtime.identity?.backend)
+            && !!runtime.identity?.nativeSessionId;
+          if (executionObserverSupported(ds.initConfig?.cliId ?? ds.session.cliId, runtime.identity?.backend)) {
+            for (const execution of sessionController.store.executions(sessionController.ref)) {
+              if (execution.runtime && sessionController.store.authorizeExecutionObserver(sessionController.ref, contractWorker, execution.ref)) {
+                observedExecutions.push({ runtime: execution.runtime, execution: execution.ref });
+              }
+            }
+          }
           if (isCodexAppCliId(ds.initConfig?.cliId ?? ds.session.cliId)) {
             for (const entry of ds.session.codexAppDispatchLedger ?? []) {
               if (entry.state !== 'prepared') continue;
@@ -23928,6 +23933,7 @@ function setupWorkerHandlers(
           worker.send({ type: 'runtime_contract_assigned', bindingId: msg.bindingId, runtime: runtime.ref, mayExecute: runtime.phase !== 'retiring',
             ...(continuation ? { continuation } : {}),
             ...(observedExecutions.length ? { observedExecutions } : {}),
+            ...(observerDecision ? { observerDecision: true } : {}),
             executions: sessionController.store.executions(sessionController.ref).filter(execution => execution.runtime?.runtimeId === runtime.ref.runtimeId).map(execution => execution.ref),
             admissionStates: sessionController.store.executions(sessionController.ref).map(({ ref, runtime, phase }) => ({ ref, runtime, phase })) } as DaemonToWorker);
           for (const pending of sessionController.store.deferredEvents<WorkerToDaemon>(sessionController.ref, msg.bindingId)) await handleWorkerMessage(pending);
@@ -24001,6 +24007,23 @@ function setupWorkerHandlers(
     if (msg.type === 'final_output') {
       if (msg.sessionOutputOrigin?.scope.execution && msg.sessionOutputOrigin.scope.execution.executionId !== admission.context.scope.execution?.executionId) return;
       if (!recoveredOrigin) msg = { ...msg, sessionOutputOrigin: admission.context };
+    }
+    // Display settlement of a proven historical terminal (CoT stream + reply
+    // card) belongs to the daemon's full handler scope and must not run inside
+    // the minimal-dependency deliver() closure (continuation-failure delivery
+    // reuses that closure in scoped worker harnesses). It only applies to a
+    // normal historical terminal; continuation-failure terminals settle through
+    // deliverContinuationFailure below. These facts never drive the successor
+    // runtime's readiness or queue.
+    if (admission.kind === 'historical' && msg.type === 'turn_terminal' && !msg.continuationFailure) {
+      const ownsDisplay = () => ownsWorkerSession() && !isSessionTransferring(ds);
+      const turnId = msg.turnId;
+      if (ownsDisplay()) finalizeCotMessage(ds, msg.turnId, msg.status, msg.dispatchAttempt);
+      if (!managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) {
+        await settleTurnReplyCardTerminal(ds, msg,
+          (body, type, uuid, beforeWrite) => scopedReply(body, type, turnId, { uuid, beforeWrite }), ownsDisplay)
+          .catch(error => logger.warn(`[${t}] historical reply-card terminal: ${error.message}`));
+      }
     }
     const deliveryAdmission = admission;
     const deliver = async (): Promise<void> => {

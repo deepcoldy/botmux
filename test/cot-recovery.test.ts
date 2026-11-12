@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -19,10 +19,11 @@ let dataDir: string;
 let sequence = 0;
 let entities: Map<string, { status: string; events: Array<{ type: string; content: any }> }>;
 let intercept: ((req: any) => Promise<any> | undefined) | undefined;
+let sessionCliId = 'antigravity';
 const makeDs = (over: any = {}): any => ({
   larkAppId: 'app1', chatId: 'oc_chat', ...over,
   session: { sessionId: 'session1', rootMessageId: 'om_root', status: 'active',
-    cliId: 'antigravity', cliSessionId: 'native1', backendType: 'tmux', ...(over.session ?? {}) },
+    cliId: sessionCliId, cliSessionId: 'native1', backendType: 'tmux', ...(over.session ?? {}) },
 });
 const update = (ds: any, text: string, turnId = 'om_turn', dispatchAttempt?: number): boolean =>
   handleCotThinkingUpdate(ds, { type: 'thinking_update', turnId, dispatchAttempt, entries: [{ kind: 'thinking', text }] });
@@ -69,13 +70,146 @@ beforeEach(() => {
 });
 afterEach(() => { vi.useRealTimers(); rmSync(dataDir, { recursive: true, force: true }); });
 
-describe('surviving agy thinking stream', () => {
+describe.each(['antigravity', 'codex'])('surviving %s thinking stream', cliId => {
+  beforeEach(() => {
+    sessionCliId = cliId;
+    vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: true, cliId } } as any);
+  });
+  it('retries the real terminal after its checkpoint write and remote delivery both fail', async () => {
+    const ds = makeDs(); update(ds, 'before'); await flush();
+    await settled(() => markers().includes('cot1.json'));
+    const blockedCheckpoint = join(dataDir, 'cot-orphans', `cot1.json.${process.pid}.tmp`);
+    mkdirSync(blockedCheckpoint);
+    intercept = () => Promise.reject(new Error('offline'));
+    finalizeCotMessage(ds, 'om_turn', 'completed'); await flush();
+    expect(entities.get('cot1')!.status).toBe('open');
+    rmSync(blockedCheckpoint, { recursive: true });
+    await vi.advanceTimersByTimeAsync(1001);
+    expect(marker()).toMatchObject({ finishStatus: 'done', resumable: false });
+    expect(entities.get('cot1')!.status).toBe('open');
+    intercept = undefined;
+    const next = makeDs();
+    await sweepOrphanCotMessages('app1', binding => cotRecoveryMatches(next, binding));
+    expect(entities.get('cot1')!.status).toBe('done');
+    expect(markers()).toEqual([]);
+  });
+
+  it('keeps a terminal checkpoint retry alive when an older append fails in flight', async () => {
+    const ds = makeDs(); update(ds, 'before'); await flush();
+    let failAppend!: (error: Error) => void;
+    intercept = req => {
+      if (req.method !== 'PUT') return;
+      return new Promise((_resolve, reject) => { failAppend = reject; });
+    };
+    handleCotThinkingUpdate(ds, { type: 'thinking_update', turnId: 'om_turn', entries: [
+      { kind: 'thinking', text: 'before' }, { kind: 'thinking', text: 'pending' },
+    ] }); await flush();
+    const blockedCheckpoint = join(dataDir, 'cot-orphans', `cot1.json.${process.pid}.tmp`);
+    mkdirSync(blockedCheckpoint);
+    finalizeCotMessage(ds, 'om_turn', 'completed');
+    intercept = () => Promise.reject(new Error('offline'));
+    failAppend(new Error('append response lost')); await flush();
+    rmSync(blockedCheckpoint, { recursive: true });
+    await vi.advanceTimersByTimeAsync(1001);
+    expect(marker()).toMatchObject({ finishStatus: 'done', resumable: false });
+    intercept = undefined;
+    const next = makeDs();
+    await sweepOrphanCotMessages('app1', binding => cotRecoveryMatches(next, binding));
+    expect(entities.get('cot1')!.status).toBe('done');
+    expect(markers()).toEqual([]);
+  });
+
+  it('persists a superseded disabled stream terminal before retrying its delivery', async () => {
+    const ds = makeDs({ currentTurnId: 'om_old' }); update(ds, 'before', 'om_old'); await flush();
+    intercept = req => req.method === 'PUT' ? Promise.reject(new Error('append offline')) : undefined;
+    handleCotThinkingUpdate(ds, { type: 'thinking_update', turnId: 'om_old', entries: [
+      { kind: 'thinking', text: 'before' }, { kind: 'thinking', text: 'unsent' },
+    ] }); await flush();
+    const blockedCheckpoint = join(dataDir, 'cot-orphans', `cot1.json.${process.pid}.tmp`);
+    mkdirSync(blockedCheckpoint);
+    intercept = req => req.url.endsWith('/cot1') ? Promise.reject(new Error('completion offline')) : undefined;
+    ds.currentTurnId = 'om_new'; update(ds, 'successor', 'om_new'); await flush();
+    rmSync(blockedCheckpoint, { recursive: true });
+    await vi.advanceTimersByTimeAsync(1001);
+    expect(marker()).toMatchObject({ finishStatus: 'done', resumable: false });
+    intercept = undefined;
+    await sweepOrphanCotMessages('app1', binding => cotRecoveryMatches(ds, binding));
+    expect(entities.get('cot1')!.status).toBe('done');
+    expect(entities.get('cot2')!.status).toBe('open');
+  });
+
+  it.each(['successor', 'closed'] as const)('serializes checkpoint retries with a %s and a late terminal ACK', async mode => {
+    const ds = makeDs({ currentTurnId: 'om_old' }); update(ds, 'before', 'om_old'); await flush();
+    const blockedCheckpoint = join(dataDir, 'cot-orphans', `cot1.json.${process.pid}.tmp`);
+    mkdirSync(blockedCheckpoint);
+    finalizeCotMessage(ds, 'om_old', 'completed');
+    if (mode === 'successor') { ds.currentTurnId = 'om_new'; update(ds, 'new', 'om_new'); }
+    else { ds.session.status = 'closed'; await settleCotMessageForShutdown(ds); }
+    for (let i = 0; i < 5; i++) {
+      await vi.advanceTimersByTimeAsync(1000);
+      if (mode === 'successor') update(ds, 'new updates', 'om_new');
+    }
+    const oldTerminalRequests = () => request.mock.calls.filter(([req]) =>
+      req.url.endsWith('/cot1') || (req.data?.cot_id === 'cot1' && req.data.events?.some((event: any) => event.event_type === 'RUN_FINISHED')));
+    expect(oldTerminalRequests()).toHaveLength(0);
+    rmSync(blockedCheckpoint, { recursive: true });
+    let release!: () => void;
+    intercept = req => {
+      if (!req.url.endsWith('/cot1') && !(req.data?.cot_id === 'cot1'
+        && req.data.events?.some((event: any) => event.event_type === 'RUN_FINISHED'))) return;
+      const response = deliver(req); intercept = undefined;
+      return new Promise(resolve => { release = () => resolve(response); });
+    };
+    await vi.advanceTimersByTimeAsync(1001);
+    expect(oldTerminalRequests()).toHaveLength(1);
+    for (let i = 0; i < 10; i++) { finalizeCotMessage(ds, 'om_old', 'completed'); await vi.advanceTimersByTimeAsync(1000); }
+    expect(oldTerminalRequests()).toHaveLength(1);
+    release(); await flush();
+    expect(entities.get('cot1')!.status).toBe('done');
+    expect(markers()).not.toContain('cot1.json');
+    if (mode === 'successor') expect(entities.get('cot2')!.status).toBe('open');
+    else expect(ds.session.status).toBe('closed');
+  });
+
+  it.each(['closed', 'suspended', 'sandbox', 'cot-off'] as const)('respects an operator %s change while the old append ACK is delayed', async change => {
+    const ds = makeDs(); update(ds, 'before'); await flush();
+    let release!: () => void;
+    intercept = req => {
+      if (req.method !== 'PUT') return;
+      const response = deliver(req); intercept = undefined;
+      return new Promise(resolve => { release = () => resolve(response); });
+    };
+    handleCotThinkingUpdate(ds, { type: 'thinking_update', turnId: 'om_turn', entries: [
+      { kind: 'thinking', text: 'before' }, { kind: 'thinking', text: 'pending' },
+    ] });
+    await flush(); abortCotMessage(ds);
+    if (change === 'closed') ds.session.status = 'closed';
+    if (change === 'suspended') ds.session.suspendedColdResume = true;
+    if (change === 'sandbox') ds.session.sandbox = 'scratch';
+    if (change === 'cot-off') vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: false, cliId } } as any);
+    await settleCotMessageForShutdown(ds);
+    const requestsAtChange = request.mock.calls.length;
+    release(); await vi.advanceTimersByTimeAsync(30_000);
+    expect(request.mock.calls.length).toBe(requestsAtChange);
+    expect(sequence).toBe(1);
+    if (change === 'cot-off') {
+      expect(update(ds, 'hidden by operator')).toBe(false);
+      expect(entities.get('cot1')!.status).toBe('open');
+      finalizeCotMessage(ds, 'om_turn', 'completed'); await flush();
+      expect(entities.get('cot1')!.status).toBe('done');
+    } else {
+      expect(canResumeCotMessage(ds)).toBe(false);
+      expect(entities.get('cot1')!.status).toBe('error');
+      expect(markers()).toEqual([]);
+    }
+  });
+
   it.each(['graceful', 'crash'] as const)('resumes the same entity after %s daemon replacement', async mode => {
-    const old = makeDs(); update(old, 'before'); await flush();
+    const old = makeDs({ session: { cliId } }); update(old, 'before'); await flush();
     await settled(() => entities.get('cot1')?.events.some(e => e.type === 'REASONING_MESSAGE_START') === true);
     const oldIds = entities.get('cot1')!.events.filter(e => e.type === 'REASONING_MESSAGE_START').map(e => e.content.messageId);
     if (mode === 'graceful') await settleCotMessageForShutdown(old);
-    const next = makeDs();
+    const next = makeDs({ session: { cliId } });
     await sweepOrphanCotMessages('app1', binding => cotRecoveryMatches(next, binding));
     expect(entities.get('cot1')!.status).toBe('open'); expect(completes()).toHaveLength(0);
     expect(resumeCotMessage(next)).toBe(true);
@@ -257,6 +391,17 @@ describe('surviving agy thinking stream', () => {
     expect(sequence).toBe(2); expect(entities.get('cot2')!.status).toBe('open');
   });
 
+  it('lets a later turn open its own stream after the paused native task is replaced', async () => {
+    const ds = makeDs({ currentTurnId: 'om_turn' }); update(ds, 'before'); await flush();
+    abortCotMessage(ds); await flush(); request.mockClear();
+    ds.session.cliSessionId = 'native2'; ds.currentTurnId = 'om_next';
+    expect(update(ds, 'next turn', 'om_next')).toBe(true); await flush();
+    expect(entities.get('cot2')?.status).toBe('open');
+    // The replaced task's stream is left, with its own identity, to the next generation's sweep.
+    expect(request.mock.calls.some(([req]) => (req.data?.cot_id ?? req.url.split('/').at(-1)) === 'cot1')).toBe(false);
+    expect(entities.get('cot1')!.status).toBe('open'); expect(marker().nativeSessionId).toBe('native1');
+  });
+
   it.each(['app', 'chat', 'native'] as const)('rejects updates after the live %s identity changes', async field => {
     const ds = makeDs(); update(ds, 'before'); await flush(); request.mockClear();
     if (field === 'app') ds.larkAppId = 'other';
@@ -279,6 +424,7 @@ describe('surviving agy thinking stream', () => {
     const ds = makeDs(); update(ds, 'before'); await flush();
     intercept = () => Promise.reject(new Error('offline'));
     finalizeCotMessage(ds, 'om_turn', 'completed'); await flush();
+    await settled(() => completes().some(([req]) => req.params.reason === 'done'));
     expect(entities.get('cot1')!.status).toBe('open'); expect(marker().finishStatus).toBe('done');
     intercept = undefined; await sweepOrphanCotMessages('app1');
     expect(entities.get('cot1')!.status).toBe('done'); await settled(() => markers().length === 0); expect(markers()).toEqual([]);
@@ -364,7 +510,7 @@ describe('surviving agy thinking stream', () => {
     expect(entities.get('cot1')!.status).toBe('done'); await settled(() => markers().length === 0); expect(markers()).toEqual([]);
   });
 
-  it.each([{ cliId: 'codex' }, { backendType: 'pty' }, { sandbox: 'oncall' }, { sandbox: 'scratch' },
+  it.each([{ cliId: 'claude-code' }, { backendType: 'pty' }, { sandbox: 'oncall' }, { sandbox: 'scratch' },
     { suspendedColdResume: true }, { cliSessionId: undefined }, { adoptedFrom: { tmuxTarget: 'external:0.0' } }])('retains legacy shutdown semantics for %o', async session => {
     const ds = makeDs({ session }); expect(canResumeCotMessage(ds)).toBe(false);
     update(ds, 'before'); await flush(); await settleCotMessageForShutdown(ds);
