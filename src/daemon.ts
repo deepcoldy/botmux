@@ -10785,9 +10785,9 @@ const managedAskControl = createManagedAskControl({
   retire: explicitAskContinuation.retire,
   snapshot: receipt => explicitAskSnapshot(receipt.input),
   session: managedAskSession,
-  suspend: async (sessionId, stillOwned) => {
+  suspend: async (sessionId, stillOwned, operationId) => {
     const ds = findActiveBySessionId(sessionId);
-    return !!ds && await suspendWorkerAsync(ds, 'managed_ask_retired', stillOwned);
+    return !!ds && await suspendWorkerAsync(ds, 'managed_ask_retired', stillOwned, operationId);
   },
 });
 

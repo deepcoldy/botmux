@@ -10326,15 +10326,17 @@ export function __testOnly_setSuspendBackingVerifier(
 
 const primarySuspendInFlight = new WeakMap<DaemonSession, Promise<boolean>>();
 const primarySuspendApplying = new WeakSet<DaemonSession>();
-export async function suspendWorkerAsync(ds: DaemonSession, reason = 'suspended_idle', stillOwned?: (operationId?: string) => boolean): Promise<boolean> {
-  const result = suspendWorker(ds, reason, stillOwned);
+export async function suspendWorkerAsync(ds: DaemonSession, reason = 'suspended_idle', stillOwned?: (operationId?: string) => boolean, expectedOperationId?: string): Promise<boolean> {
+  const result = suspendWorker(ds, reason, stillOwned, expectedOperationId);
   return primarySuspendInFlight.get(ds) ?? result;
 }
-export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stillOwned?: (operationId?: string) => boolean): boolean {
-  const continuingController = primarySuspendApplying.has(ds) ? controllerForSession(ds) : undefined;
-  const continuingOperationId = continuingController?.operation()?.operationId;
+export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stillOwned?: (operationId?: string) => boolean, expectedOperationId?: string): boolean {
+  const continuingController = primarySuspendApplying.has(ds) || expectedOperationId ? controllerForSession(ds) : undefined;
+  const continuingOperationId = expectedOperationId ?? continuingController?.operation()?.operationId;
   if (stillOwned && !stillOwned(continuingOperationId)) {
-    if (continuingOperationId) continuingController!.controlResult(continuingOperationId, 'failed_before_effect', undefined, 'managed_suspend_ownership_changed');
+    if (continuingOperationId && continuingController?.operation(continuingOperationId)?.phase === 'applying') {
+      continuingController.controlResult(continuingOperationId, 'failed_before_effect', undefined, 'managed_suspend_ownership_changed');
+    }
     return false;
   }
   if (hasProtectedSessionMutationOwnership(ds)) {
@@ -10360,12 +10362,12 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
   if (controller && sessionContractPrimary(ds.larkAppId) && !primarySuspendApplying.has(ds)) {
     if (!primarySuspendInFlight.has(ds)) {
       let operationId: string;
-      try { operationId = controller.beginControl('suspend').operation.operationId; controller.controlStarted(operationId); }
+      try { operationId = controller.beginControl('suspend', expectedOperationId).operation.operationId; controller.controlStarted(operationId); }
       catch { return false; }
       const pending = controller.flushPrimary().then(async () => {
         if (controller.operation()?.operationId !== operationId) return false;
         primarySuspendApplying.add(ds);
-        try { const result = suspendWorker(ds, reason, stillOwned); await controller.flushPrimary(); return result; }
+        try { const result = suspendWorker(ds, reason, stillOwned, operationId); await controller.flushPrimary(); return result; }
         finally { primarySuspendApplying.delete(ds); }
       });
       primarySuspendInFlight.set(ds, pending);
@@ -10376,7 +10378,7 @@ export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stil
   let operationId: string | undefined;
   if (controller) {
     try {
-      const value = controller.beginControl('suspend'); operationId = value.operation.operationId;
+      const value = controller.beginControl('suspend', expectedOperationId); operationId = value.operation.operationId;
       const reverify = value.operation.phase === 'uncertain' && sameRuntime(value.operation.targetRuntime, controller.currentRuntime());
       if (value.joined && value.operation.phase !== 'planned' && !reverify && !primarySuspendApplying.has(ds)) return false;
       controller.controlStarted(operationId);
@@ -10725,8 +10727,11 @@ export function canSafelyReclaimWorkerForInstallChange(ds: DaemonSession, suspen
   if (suspendOperationId) {
     const controller = controllerForSession(ds);
     const operation = controller?.operation();
-    if (!operation || operation.operationId !== suspendOperationId || operation.kind !== 'suspend'
-      || operation.phase !== 'applying' || !sameRuntime(operation.targetRuntime, controller!.currentRuntime())) return false;
+    if (operation) {
+      if (operation.operationId !== suspendOperationId || operation.kind !== 'suspend'
+        || !['applying', 'uncertain'].includes(operation.phase)
+        || !sameRuntime(operation.targetRuntime, controller!.currentRuntime())) return false;
+    } else if (ds.workerReady !== true) return false;
   } else if (ds.workerReady !== true) return false;
   if (hasProtectedSessionMutationOwnership(ds) || isSessionTransferring(ds)) return false;
   if (ds.pendingRepo || ds.pendingRepoCommitInFlight || ds.worktreeCreating) return false;

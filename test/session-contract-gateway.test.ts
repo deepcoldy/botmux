@@ -58,10 +58,15 @@ describe('contract gateway and real worker boundaries', () => {
       controllerForSession: () => fixtureState.controller, sessionContractPrimary: () => true,
       hasProtectedSessionMutationOwnership: () => false, isSessionTransferring: () => false,
       isSuspendableBackendType: () => true, trackLifecycleRetirement: vi.fn(), clearLifecycleRetirement: vi.fn(),
-      suspendBackingVerifier: () => { destructiveChecks++; return false; },
+      suspendBackingVerifier: () => { destructiveChecks++; return destructiveChecks > 1; },
       hasPendingOrdinaryImInput: () => false, hasUnsettledAcceptedInput: () => false,
       isSessionRestartInFlight: () => false, isSessionEffortChangeInFlight: () => false,
-      logger: { warn: vi.fn() }, tag: () => 'test',
+      logger: { warn: vi.fn(), info: vi.fn() }, tag: () => 'test',
+      restartCoordinator: { cancelSession: vi.fn() }, armWorkerKillBackstop: vi.fn(),
+      clearAcceptedInputTurns: vi.fn(), invalidateStuckWarning: vi.fn(), invalidateTuiPrompt: vi.fn(),
+      clearIdleAutoCompactStretch: vi.fn(), takeSessionPreviewTarget: () => undefined,
+      sessionStore: { updateSessionPid: vi.fn(), updateSession: vi.fn() },
+      dashboardEventBus: { publish: vi.fn() }, clearPendingSuspendClaim: vi.fn(),
     };
     scope.suspendWorker = loadWorkerPoolFunction('suspendWorker', scope);
     const suspend = loadWorkerPoolFunction('suspendWorkerAsync', scope);
@@ -76,12 +81,18 @@ describe('contract gateway and real worker boundaries', () => {
       session: (_sessionId, operationId) => ({ larkAppId: fixtureState.appId, chatId: 'oc_test', rootMessageId: 'root',
         workerGeneration: 1, workerAlive: true, resourceOwned: true, safeToSuspend: safe(daemon, operationId),
         terminalExecutionKeys: [managedAskOriginKey(request.origin)] }),
-      suspend: (_sessionId, guard) => suspend(daemon, 'managed_ask_retired', guard),
+      suspend: (_sessionId, guard, operationId) => suspend(daemon, 'managed_ask_retired', guard, operationId),
     });
     expect(daemon.workerReady).toBe(true);
     await expect(control.release(request)).resolves.toMatchObject({ status: 'unknown' });
     expect(destructiveChecks).toBe(1);
     expect(fixtureState.controller.operation()?.phase).toBe('uncertain');
+    const originalOperationId = fixtureState.controller.operation()!.operationId;
+    await expect(control.release(request)).resolves.toMatchObject({ status: 'suspended' });
+    expect(destructiveChecks).toBe(2);
+    expect(fixtureState.controller.operation(originalOperationId)?.phase).toBe('confirmed');
+    expect(fixtureState.store.read(fixtureState.ref)?.lifecycle).toBe('suspended');
+    expect(daemon.worker).toBeNull();
   });
 
   it('settles a claimed managed suspend without effects when accepted input arrives during primary flush', async () => {

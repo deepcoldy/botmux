@@ -58,7 +58,7 @@ export function createManagedAskControl(deps: {
   retire: (request: ExplicitAskRetirement) => ExplicitAskReceipt;
   snapshot: (receipt: ExplicitAskReceipt) => PendingAsk | undefined;
   session: (sessionId: string, suspendOperationId?: string) => ManagedAskSession | undefined;
-  suspend: (sessionId: string, stillOwned: (suspendOperationId?: string) => boolean) => Promise<boolean>;
+  suspend: (sessionId: string, stillOwned: (suspendOperationId?: string) => boolean, operationId: string) => Promise<boolean>;
 }) {
   const releasing = new Set<string>();
   function bound(request: Omit<ExplicitAskControl, 'origin'>) {
@@ -117,10 +117,11 @@ export function createManagedAskControl(deps: {
       return managedAskExecutionOwned(request, current) && !!current?.workerAlive && current.safeToSuspend
         && current.terminalExecutionKeys?.includes(managedAskOriginKey(request.origin)) === true;
     };
-    if (!stillOwned() || releasing.has(request.sessionId)) return result(request, receipt, 'draining');
+    const suspendOperationId = `managed-ask-${receipt.retirement.operationId}`;
+    if (!stillOwned(suspendOperationId) || releasing.has(request.sessionId)) return result(request, receipt, 'draining');
     releasing.add(request.sessionId);
     try {
-      const confirmed = await deps.suspend(request.sessionId, stillOwned);
+      const confirmed = await deps.suspend(request.sessionId, stillOwned, suspendOperationId);
       return result(request, receipt, confirmed ? 'suspended' : 'unknown');
     } finally { releasing.delete(request.sessionId); }
   }
