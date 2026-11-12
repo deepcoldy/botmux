@@ -15917,4 +15917,72 @@ describe('im.message.receive_v1 — mention late-resolution reverify', () => {
       delete process.env.BOTMUX_MENTION_REVERIFY;
     }
   });
+
+  it('never schedules readback for ordinary group chatter without an @ placeholder', async () => {
+    // REST 放大边界：没有 @ 占位符的普通群聊消息在 @ 闸被忽略后，整条重试梯
+    // （推进满 16s）都不得产生任何权威回读或 pending 登记。
+    const plain = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'just chatting, no mention' }),
+      messageId: 'om-plain-chatter',
+      chatId: 'chat-race',
+      chatType: 'group',
+      mentions: [],
+    });
+    await capturedHandlers['im.message.receive_v1'](plain);
+    await settle();
+    expect(reverifyPendingCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(16_000);
+    await settle();
+    expect(mockGetMessageDetail).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('terminates after one readback when the placeholder resolves to another member', async () => {
+    // 「@ 他人 → 一次回读即静默终止」必须钉到整条时间轴：推进满重试梯后仍只有
+    // 一次回读、名额已释放、不派发，也不打放弃 WARN（不是落定失败，是正常让路）。
+    await capturedHandlers['im.message.receive_v1'](raceEvent('om-race-elsewhere-full', 'chat-race'));
+    await settle();
+    mockGetMessageDetail.mockResolvedValue(
+      readbackWithBotMention('om-race-elsewhere-full', 'chat-race', 'ou_someone_else'),
+    );
+    await vi.advanceTimersByTimeAsync(16_000);
+    await settle();
+    expect(mockGetMessageDetail).toHaveBeenCalledTimes(1);
+    expect(reverifyPendingCount()).toBe(0);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    const warned = logger.warn.mock.calls.map(([message]) => String(message)).join('\n');
+    expect(warned).not.toContain('om-race-elsewhere-full'.substring(0, 12));
+  });
+
+  it('does not reschedule compensation when an edit event arrives after the message already triggered', async () => {
+    // 排期入口的 claimed 闸：编辑事件刻意不走 message_id claim（同 id 已被原消息
+    // claim 过），所以「先派发、后编辑」只能靠 schedule 入口的 claimed 检查阻止
+    // 冗余排期——这是该闸唯一可达的路径。
+    // 1) 编辑补 @ 回读见本 bot mention → 正常派发并落 triggered-store。
+    mockGetMessageDetail.mockResolvedValueOnce(
+      readbackWithBotMention('om-race-edit-claimed', 'chat-race', MY_OPEN_ID),
+    );
+    await capturedHandlers['im.message.updated_v1'](
+      { event_id: 'evt-edit-claimed-1', message: { message_id: 'om-race-edit-claimed', chat_id: 'chat-race' } },
+    );
+    await settle();
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+    expect(hasTriggeredMessage(MY_APP_ID, 'om-race-edit-claimed')).toBe(true);
+
+    // 2) 又一次编辑事件，回读快照仍无本 bot mention（读回竞态再现）：claimed 闸
+    // 必须直接挡住，不登记定时器、不占 pending 名额。
+    mockGetMessageDetail.mockResolvedValueOnce(
+      readbackWithBotMention('om-race-edit-claimed', 'chat-race', undefined),
+    );
+    await capturedHandlers['im.message.updated_v1'](
+      { event_id: 'evt-edit-claimed-2', message: { message_id: 'om-race-edit-claimed', chat_id: 'chat-race' } },
+    );
+    await settle();
+    expect(reverifyPendingCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(16_000);
+    await settle();
+    expect(mockGetMessageDetail).toHaveBeenCalledTimes(2);
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+  });
 });
