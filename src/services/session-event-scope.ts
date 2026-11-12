@@ -47,6 +47,7 @@ export class WorkerSessionEventScope {
     binding.runtime = runtime; return true;
   }
   currentBinding(): RuntimeEventBinding | undefined { return this.current; }
+  bindingById(bindingId: string): RuntimeEventBinding | undefined { return this.bindings.get(bindingId); }
   bindingSharesCurrentProcess(bindingId: string): boolean {
     const binding = this.bindings.get(bindingId);
     return !!binding && !!this.current && binding.physicalId === this.current.physicalId;
@@ -340,7 +341,13 @@ export class WorkerSessionEventScope {
       const values = this.origins.get(this.turnKey(turnId, dispatchAttempt)) ?? [];
       const inBinding = active?.binding ? values.filter(value => value.binding === active.binding) : values;
       if (inBinding.length === 1) return this.snapshot(inBinding[0].binding, inBinding[0].execution);
-      if (inBinding.length > 1) return undefined;
+      if (inBinding.length > 1) {
+        const sameExecutionAndProcess = new Set(inBinding.map(value => value.execution.executionId)).size === 1
+          && new Set(inBinding.map(value => value.binding.physicalId)).size === 1;
+        if (!sameExecutionAndProcess) return undefined;
+        const picked = (this.current && inBinding.find(value => value.binding === this.current)) ?? inBinding[inBinding.length - 1];
+        return this.snapshot(picked.binding, picked.execution);
+      }
     }
     return active?.binding ? this.snapshot(active.binding) : undefined;
   }

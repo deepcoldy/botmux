@@ -6661,8 +6661,33 @@ async function cmdPreview(rest: string[]): Promise<void> {
 
 async function cmdChat(argv: string[]): Promise<void> {
   const sub = argv[0] ?? '';
+  if (sub === 'create' || sub === 'members') {
+    const { parseSessionChatArgs, SESSION_CHAT_HELP } = await import('./cli/session-chat.js');
+    if (argv.includes('--help') || argv.includes('-h')) {
+      console.log(SESSION_CHAT_HELP);
+      return;
+    }
+    const input = parseSessionChatArgs(argv);
+    assertTurnTransportOrExit('chat');
+    const { sid, larkAppId, session } = await resolveSessionAppId(undefined);
+    assertSessionTransportOrExit(session, 'chat');
+    const turnId = process.env.BOTMUX_HOST_RELAY_AUTHORIZED === '1'
+      && isTrustedVcMeetingHostRelayParent(true, session.pid, process.ppid)
+      ? process.env.BOTMUX_TURN_ID
+      : resolveSessionContext(resolveDataDir(), sid)?.turnId;
+    if (!turnId) throw new Error('chat_turn_unavailable');
+    const { SESSION_CHAT_TOOLS_ROUTE } = await import('./core/session-chat-tools.js');
+    const response = await postCurrentSessionDaemonRoute({
+      path: SESSION_CHAT_TOOLS_ROUTE, sessionId: sid, larkAppId,
+      body: { ...input, turnId }, signal: AbortSignal.timeout(60_000),
+    });
+    const body = await response.json() as { ok?: boolean; error?: string };
+    console.log(JSON.stringify(body));
+    if (!response.ok || !body.ok) process.exitCode = 1;
+    return;
+  }
   if (sub !== 'rename') {
-    console.error('用法: botmux chat rename <新群名称> [--proactive]');
+    console.error('用法: botmux chat rename <新群名称> [--proactive] | create --name <群名> [--member <open_id|邮箱>] | members [--chat-id <群>]');
     process.exitCode = 2;
     return;
   }
@@ -14344,7 +14369,9 @@ async function cmdSend(rest: string[], beginFeedbackEffect?: () => void, preflig
       });
       if (addressedMentions.length !== mentions.length) {
         mentions = mentions.filter(mention => addressedMentions.includes(mention.open_id));
-        console.error('botmux send: 本话题是派单话题，结果已由 botmux report 交回原会话；已去掉对派单 Bot 的 @。');
+        console.error(
+          'botmux send: 本话题是派单话题，已去掉对派单 Bot 的 @（避免群内循环触发）；botmux send 不会自动向主控交回结果：本轮还没回报的，请在前台执行 `botmux report --status in_progress|completed "<正文>"` 回报原会话；本轮已经回报过的不要重复执行。',
+        );
       }
     }
     const knownBotOpenIds = knownBotOpenIdsFromCrossRef(crossRef, botEntries, appId);

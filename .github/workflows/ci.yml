@@ -69,13 +69,16 @@ jobs:
   # actual/plan ratios across fully-green runs span ~0.79–0.94 (≈±15%), i.e.
   # ~±6 min between shards at this size. With a 20-min limit the longest shard
   # observed 19.2/19.7/20.1 min on three runs and was step-cancelled at 20m06s
-  # (no failing test). 25 min covers that measured variance and still caps a
-  # genuinely hung shard; a stale table only makes shards less even, never
-  # drops a file (refresh with scripts/update-shard-timings.mjs). See #2986.
+  # (no failing test). As the suite grew, run 43209206162 shard 2 took 1456.47s
+  # for 12,924 passing tests plus ~45s of setup: the 25-min job limit cancelled
+  # it just after the green summary. 30 min leaves room for setup, teardown and
+  # measured runner variance while still bounding a hung shard. A stale table
+  # only makes shards less even, never drops a file (refresh with
+  # scripts/update-shard-timings.mjs). See #2986.
   test:
     name: test (${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -94,7 +97,7 @@ jobs:
       # Permission denied",exit 1)。这里放开限制并预装 bubblewrap,让沙盒
       # 用例在 CI 上真正执行。整步 best-effort:哪一步失败都不阻塞——测试侧
       # 有 bwrap 运行时探测 gate,跑不了会 loud skip。sudo/apt 卡住时 `|| true`
-      # 不会返回,所以整段准备限时 90s,避免吃掉 job 的 25 分钟超时。
+      # 不会返回,所以整段准备限时 90s,避免吃掉 job 的 30 分钟超时。
       # install 前必须先 apt-get update:runner 镜像自带的 apt 索引会滞后于镜像源,
       # 实测索引里的 bubblewrap 0.9.0-1ubuntu0.1 被 0.9.0-1ubuntu0.2 顶替后,
       # 不 update 直接 install 全部镜像源 404(2026-09-19 master 自身 CI 因此红)。
@@ -117,7 +120,7 @@ jobs:
           bun-version: 1.4.4
       - run: node scripts/ci-net-retry.mjs bun install --frozen-lockfile
       - run: bun run build
-      # No rerun on failure: a shard spends up to ~17 of its 25 minutes in
+      # No rerun on failure: a shard spends up to ~24 of its 30 minutes in
       # vitest, so a second pass cannot finish anyway, and a flake must surface
       # to be fixed rather than be retried away (#2464).
       - name: Unit tests (shard ${{ matrix.shard }}/4)
