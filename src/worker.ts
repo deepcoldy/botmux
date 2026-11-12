@@ -13516,52 +13516,6 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
   if (!codexBridgeFallbackActive()) return;
   // A reported (proven) id supersedes any not-yet-owned history candidate.
   codexBridgeUnprovenSession = undefined;
-  if (structuredBridgeIs('antigravity')) {
-    // cliSessionId is agy's conversation UUID, which names the brain
-    // transcript directory. writeInput and the native --log-file observer
-    // report the id on every submit/stream switch, so this must run BEFORE the
-    // generic `if (codexBridgeRolloutPath)` guard below to handle both initial
-    // attach and rotation/rebind (e.g. `/new`, `/fork`, or correcting an early
-    // misbound transcript).
-    const agyPath = resolveFileBridgePath('antigravity', { sessionId: cliSessionId });
-    // Compared by conversation, not path: a compact-log bind resolves to the
-    // full log here once agy has created it, and that is NOT a /new. The
-    // ticker moves the bind over at a turn boundary.
-    const action = decideAntigravityNotifyAction(codexBridgeRolloutPath, agyPath);
-    if (action.kind === 'same') {
-      codexBridgePendingSessionId = undefined;
-      return;
-    }
-    if (action.kind !== 'wait-pending') {
-      if (action.kind === 'rotate') {
-        // Conversation rotated (/new) or corrected from an early misbind:
-        // drain the retired transcript only when an earlier turn actually
-        // belongs to it, then rebind fresh-empty so the current conversation's
-        // existing bytes are ingested from byte 0.
-        if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1) {
-          try {
-            codexBridgeIngest({ flushAntigravityTrailingFinal: true });
-            emitReadyCodexTurns();
-          } catch (err: any) {
-            log(`Antigravity pre-rotation bridge drain failed: ${err.message}`);
-          }
-        }
-        log(`Antigravity bridge rotated ${codexBridgeRolloutPath ?? '?'} → ${action.path}`);
-        codexBridgeDetachFile();
-        codexBridgeAttach(action.path, 'fresh-empty');
-      } else {
-        codexBridgeAttach(action.path, antigravityLateAttachMode(action.path));
-      }
-      codexBridgePendingSessionId = undefined;
-      codexBridgeIngest();
-    } else {
-      // The brain file is created lazily after submit — keep id pending and
-      // let the 1s ticker late-attach or rotate once the file appears.
-      codexBridgePendingSessionId = cliSessionId;
-      codexBridgeStartTimer();
-    }
-    return;
-  }
   if (codexBridgeRolloutPath) {
     // A Codex process can keep its parent and sibling-agent rollouts open at
     // the same time. Pre-submit pid discovery therefore may have attached an
@@ -13727,7 +13681,7 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
         codexBridgeStartTimer();
       }
     }
-    return;
+    if (!structuredBridgeIs('antigravity')) return;
   }
   if (structuredBridgeIs('mtr')) {
     const source = findMtrSessionById(cliSessionId);
@@ -13758,6 +13712,52 @@ function codexBridgeNotifyCliSessionId(cliSessionId: string): void {
         codexBridgeAttach(cursorPath, structuredSpawnAttachMode());
       }
     } else {
+      codexBridgePendingSessionId = cliSessionId;
+      codexBridgeStartTimer();
+    }
+    return;
+  }
+  if (structuredBridgeIs('antigravity')) {
+    // cliSessionId is agy's conversation UUID, which names the brain
+    // transcript directory. writeInput and the native --log-file observer
+    // report the id on every submit/stream switch, and `codexBridgeRolloutPath`
+    // above falls through for Antigravity so this handles both initial attach
+    // and in-binding rotation/rebind (e.g. `/new`, `/fork`, or correcting an
+    // early misbound transcript).
+    const agyPath = resolveFileBridgePath('antigravity', { sessionId: cliSessionId });
+    // Compared by conversation, not path: a compact-log bind resolves to the
+    // full log here once agy has created it, and that is NOT a /new. The
+    // ticker moves the bind over at a turn boundary.
+    const action = decideAntigravityNotifyAction(codexBridgeRolloutPath, agyPath);
+    if (action.kind === 'same') {
+      codexBridgePendingSessionId = undefined;
+      return;
+    }
+    if (action.kind !== 'wait-pending') {
+      if (action.kind === 'rotate') {
+        // Conversation rotated (/new) or corrected from an early misbind:
+        // drain the retired transcript only when an earlier turn actually
+        // belongs to it, then rebind fresh-empty so the current conversation's
+        // existing bytes are ingested from byte 0.
+        if (codexBridgeQueue.peek().some(turn => turn.started && turn.finalText === undefined) || codexBridgeQueue.peek().length > 1) {
+          try {
+            codexBridgeIngest({ flushAntigravityTrailingFinal: true });
+            emitReadyCodexTurns();
+          } catch (err: any) {
+            log(`Antigravity pre-rotation bridge drain failed: ${err.message}`);
+          }
+        }
+        log(`Antigravity bridge rebound ${codexBridgeRolloutPath ?? '?'} → ${action.path}`);
+        codexBridgeDetachFile();
+        codexBridgeAttach(action.path, 'fresh-empty');
+      } else {
+        codexBridgeAttach(action.path, antigravityLateAttachMode(action.path));
+      }
+      codexBridgePendingSessionId = undefined;
+      codexBridgeIngest();
+    } else {
+      // The brain file is created lazily after submit — keep id pending and
+      // let the 1s ticker late-attach or rotate once the file appears.
       codexBridgePendingSessionId = cliSessionId;
       codexBridgeStartTimer();
     }
