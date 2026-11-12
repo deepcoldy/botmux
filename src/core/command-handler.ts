@@ -15,7 +15,7 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, loadBotConfigs, type BotConfig } from '../bot-registry.js';
-import { triggerUserAuthApplies, credentialSourceOf } from '../services/trigger-user-auth.js';
+import { triggerUserAuthApplies, credentialSourceOf, capabilityOn } from '../services/trigger-user-auth.js';
 import { platformCredentialsUrl } from '../platform/credential-grant-client.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { requestMeegoLogin } from '../services/meego-auth.js';
@@ -1252,7 +1252,7 @@ async function applyAllowedUsersSet(
 
 function bytedcliLoginSuccessReply(botConfig: BotConfig, locale: Locale): string {
   const policy = botConfig.triggerUserAuth;
-  const enabled = triggerUserAuthApplies(policy, 'bytedcli');
+  const enabled = capabilityOn(policy, 'bytecloud');
   const lines = [
     t('cmd.login.bytedcli_ok', undefined, locale),
     t(enabled ? 'cmd.login.bytedcli_enabled' : 'cmd.login.bytedcli_configure', undefined, locale),
@@ -1336,7 +1336,8 @@ async function triggerUserAuthStatusLines(
   senderOpenId: string | undefined,
 ): Promise<string[]> {
   const policy = botCfg.triggerUserAuth;
-  if (!policy?.enabled || !policy.tools.length) return [];
+  const on = (capability: 'lark-user' | 'bytecloud' | 'meego') => capabilityOn(policy, capability);
+  if (!on('lark-user') && !on('bytecloud') && !on('meego')) return [];
   const brand = normalizeBrand(botCfg.brand);
   // lark-cli acts as the person via either the new per-person device-code HOME
   // or a legacy bot-app OAuth token. Both must count (and /login status reads the
@@ -1348,29 +1349,30 @@ async function triggerUserAuthStatusLines(
   const larkAuthorized = senderOpenId !== undefined
     && (hasLarkCliHome(senderOpenId) || !!legacyLarkUser);
 
-  const bytedStatus = policy.tools.includes('bytedcli') ? await bytedcliLoginStatus(senderOpenId) : undefined;
+  const bytedStatus = on('bytecloud') ? await bytedcliLoginStatus(senderOpenId) : undefined;
   const lines = ['Trigger-user auth: 已开启'];
-  for (const tool of policy.tools) {
-    lines.push(`  ${tool}: ${
-      tool === 'lark-cli'
-        ? larkAuthorized
-          ? `以${legacyLarkUser?.userName ? `「${legacyLarkUser.userName}」` : '你自己'}的身份调用`
-          // lark-cli no longer degrades to the bot's own identity: an
-          // unauthorized call is refused, and the refusal carries a ready
-          // device-code link. Saying "running as the bot" here would describe a
-          // fallback that the turn path does not have.
-          : '你未授权 —— 命令会被拒绝；首次被拒时会自动返回授权链接，点开后重试即可'
-        // ByteCloud is a separate identity provider, so this is a genuinely
-        // different verdict from the Lark line above — the same person can be
-        // authorized for one and refused by the other. There is no bot identity
-        // to degrade to here either; the mint path tries the existing HOME even
-        // while a fresh challenge is pending; ask the provider for the current status.
-        : bytedStatus === 'unavailable'
-          ? '授权服务暂时不可用，已有授权会保留；服务恢复后重试，无需重新授权'
-          : bytedStatus === 'authorized'
+  if (on('lark-user')) {
+    lines.push(`  lark-user: ${
+      larkAuthorized
+        ? `以${legacyLarkUser?.userName ? `「${legacyLarkUser.userName}」` : '你自己'}的身份调用`
+        // lark-cli never degrades to the bot's own identity: an unauthorized
+        // call is refused, and the refusal carries a ready device-code link.
+        : '你未授权 —— 命令会被拒绝；首次被拒时会自动返回授权链接，点开后重试即可'
+    }`);
+  }
+  if (on('bytecloud')) {
+    // ByteCloud is a separate identity provider from Lark, so this verdict can
+    // differ from the Lark line above; there is no bot identity to degrade to.
+    lines.push(`  bytecloud（bytedcli / codebase / git push / bitscli）: ${
+      bytedStatus === 'unavailable'
+        ? '授权服务暂时不可用，已有授权会保留；服务恢复后重试，无需重新授权'
+        : bytedStatus === 'authorized'
           ? '以你自己的身份调用'
           : '你未授权 —— 首次调用被拒时会自动返回登录链接'
     }`);
+  }
+  if (on('meego')) {
+    lines.push('  meego（bytedcli meego）: 以你自己的 Meego 登录调用；还没登录时首次调用会私下发你登录链接，也可以发 /login meego');
   }
   return lines;
 }
@@ -4556,7 +4558,7 @@ export async function handleCommand(
         // 也只给平台链接；auto 模式下显式的 /login lark|bytedcli 仍可走本机扫码。
         const credSource = credentialSourceOf(botCfg2.triggerUserAuth);
         const larkGoverned = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
-        const bytedcliGoverned = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli');
+        const bytedcliGoverned = capabilityOn(botCfg2.triggerUserAuth, 'bytecloud');
         const platformCredsUrl = credSource !== 'local' && (larkGoverned || bytedcliGoverned)
           ? platformCredentialsUrl() : null;
         const explicitGoverned = (subCmd === 'lark' && larkGoverned) || (subCmd === 'bytedcli' && bytedcliGoverned);
@@ -4573,8 +4575,8 @@ export async function handleCommand(
             break;
           }
           const tenant = tenantArg ? tenantArg as MeegoTenant : undefined;
-          if (!bytedcliGoverned) {
-            await sessionReply(rootId, t('cmd.login.bytedcli_configure', undefined, loc));
+          if (!capabilityOn(botCfg2.triggerUserAuth, 'meego')) {
+            await sessionReply(rootId, t('cmd.login.meego_native', undefined, loc));
             break;
           }
           if (!isUsableOpenId(loginOpenId)) {
@@ -4591,6 +4593,15 @@ export async function handleCommand(
               ? t('cmd.login.meego_ready', undefined, loc)
               : t('provider_auth.unavailable', { provider: 'Meego', detail: login.detail }, loc));
           }
+          break;
+        }
+        // A capability that is off is native: this bot never runs it as the
+        // person, so there is nothing to authorize and no link is minted.
+        const nativeLogin = (subCmd === 'bytedcli' || subCmd.startsWith('bytedcli ') && !/^bytedcli\s+(done|完成)$/.test(subCmd)) && !bytedcliGoverned ? 'ByteCloud'
+          : (subCmd === 'lark' || subCmd.startsWith('lark ')) && !larkGoverned && !larkBound ? t('trigger_user_auth.provider_lark', undefined, loc)
+            : undefined;
+        if (nativeLogin) {
+          await sessionReply(rootId, t('cmd.login.native', { provider: nativeLogin }, loc));
           break;
         }
         // platform 模式 + 本机未绑定：按矩阵一律拒绝，绝不落到本机扫码——否则扫完也不会被采信。
@@ -4674,7 +4685,7 @@ export async function handleCommand(
             lines.push(t(hasLarkCliHome(loginOpenId) ? 'cmd.login.lark_status_yes' : 'cmd.login.lark_status_no', undefined, loc));
           }
           // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。
-          if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli')) {
+          if (loginOpenId && bytedcliGoverned) {
             const status = await bytedcliLoginStatus(loginOpenId);
             lines.push(t(
               status === 'unavailable' ? 'cmd.login.bytedcli_unavailable'
@@ -4683,6 +4694,9 @@ export async function handleCommand(
               undefined,
               loc,
             ));
+          }
+          if (loginOpenId && capabilityOn(botCfg2.triggerUserAuth, 'meego')) {
+            lines.push(t('cmd.login.meego_status', undefined, loc));
           }
           // Legacy bot-app OAuth status when lark-cli is not governed by the
           // per-person device-code flow.

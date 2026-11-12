@@ -1,46 +1,41 @@
 /**
  * Trigger-user CLI authentication policy.
  *
- * Default OFF. When a bot enables it, that bot's CLI calls out to `lark-cli` /
- * `bytedcli` run as **the person who sent the current message**, instead of
- * "whoever happens to be logged in on this machine".
+ * Default OFF. Each capability (see {@link TRIGGER_USER_AUTH_CAPABILITIES}) is
+ * either native (its CLI runs on whatever this machine is logged in as) or
+ * trigger-user: its CLI calls run as **the person who sent the current
+ * message**.
  *
  * ## The rule this file encodes
  *
- * A CLI call uses the credentials of the current message's sender, or none.
- * The only permitted downgrade is "the bot's own tenant identity", which
- * belongs to nobody. Falling back to *another person's* login is never
- * allowed — not even the owner's. That is what the feature exists to remove,
- * so there is deliberately no config value that asks for it.
+ * A trigger-user call uses the credentials of the current message's sender, or
+ * the call is refused with an authorization entry. There is no downgrade to a
+ * bot or machine identity, and falling back to *another person's* login is
+ * never allowed — not even the owner's. That is what the feature exists to
+ * remove, so there is deliberately no config value that asks for it (the old
+ * `fallback` field is parsed and ignored).
  *
  * Why no owner exception: the moment one exists, "whose permissions ran this?"
  * loses its single answer, and every credential lookup grows a branch. Those
  * bugs are silent — nothing errors, the audit trail just names the wrong
  * person.
  *
- * ## Why the two tools cannot share one rule
- *
- * `lark-cli` has a real non-human identity (app id + secret resolve
- * `identity: bot`), so most calls can degrade safely. `bytedcli` has only SSO
- * personal login — no service account, no AK/SK — so for it "unauthorized"
- * genuinely means "this command cannot run". `supportsBotIdentity` records that
- * asymmetry rather than pretending both tools behave alike.
- *
- * Both tools DO support per-person credentials, by different mechanisms: Lark
+ * Both tools support per-person credentials, by different mechanisms: Lark
  * through an OAuth user token injected as env, ByteCloud through that person's
  * own `bytedcli` login kept in a private HOME (see services/bytedcli-auth.ts).
- * What differs is only the fallback when someone has not authorized.
- *
  * Whether a *particular* lark-cli command accepts `--as bot` is not decided
- * here: the CLI itself declares it (an unsupported one answers `--as bot is
- * not supported, this command only supports: user`). A hand-maintained list of
- * "commands needing a person" would go stale and grow holes.
+ * here: the CLI itself declares it.
  */
 import type { SandboxMode } from '../adapters/cli/sandbox-mode.js';
 
 /** Tools whose credentials botmux can inject per person. */
 export const TRIGGER_USER_AUTH_TOOLS = ['lark-cli', 'bytedcli'] as const;
 export type TriggerUserAuthTool = typeof TRIGGER_USER_AUTH_TOOLS[number];
+
+/** Every tool whose wrapper asks the daemon for the turn's identity: the governed
+ *  tools plus the Codebase and Bits CLIs, which follow bytedcli's identity. */
+export const IDENTITY_ROUTE_TOOLS = [...TRIGGER_USER_AUTH_TOOLS, 'codebase', 'bitscli'] as const;
+export type IdentityRouteTool = typeof IDENTITY_ROUTE_TOOLS[number];
 
 /**
  * Where a person's credentials come from.
@@ -63,31 +58,32 @@ export const TRIGGER_USER_AUTH_CREDENTIAL_SOURCES = ['auto', 'platform', 'local'
 export type TriggerUserAuthCredentialSource = typeof TRIGGER_USER_AUTH_CREDENTIAL_SOURCES[number];
 
 /**
- * Policy intent for a sender who has not authorized this tool.
+ * Per-bot capability switches. Each is either native (off: the CLI runs with
+ * this machine's own login, untouched) or trigger-user (on: the message
+ * sender's own credentials, or a refusal).
  *
- * RETAINED FOR CONFIG COMPATIBILITY ONLY: neither governed tool currently
- * degrades to a machine identity — bytedcli never had one, and lark-cli's
- * bot-identity downgrade was removed with the per-person HOME model. Both
- * values therefore resolve to a refusal (the refusal carries an authorization
- * link), but the field is still parsed so stored configs keep validating.
- *
- * - `bot-identity` (default): legacy value; no longer degrades anything.
- * - `none`: the call fails and the sender is asked to authorize.
- *
- * Note there is no `device` / `machine-login` option — see the file header.
+ * - `lark-user`: Feishu user identity (`lark-cli --as user`).
+ * - `bytecloud`: bytedcli, codebase, git push, bitscli / bits-cli.
+ * - `meego`: Meego through `bytedcli meego`. The standalone `meegle` command is not governed.
  */
-export const TRIGGER_USER_AUTH_FALLBACKS = ['bot-identity', 'none'] as const;
-export type TriggerUserAuthFallback = typeof TRIGGER_USER_AUTH_FALLBACKS[number];
+export const TRIGGER_USER_AUTH_CAPABILITIES = ['lark-user', 'bytecloud', 'meego'] as const;
+export type TriggerUserAuthCapability = typeof TRIGGER_USER_AUTH_CAPABILITIES[number];
 
 export interface TriggerUserAuthConfig {
   enabled: boolean;
-  /** Tools this applies to. Empty means the policy is inert. */
+  /** Tools this applies to. Empty means the policy is inert. When
+   *  `capabilities` is set this is derived from it. */
   tools: TriggerUserAuthTool[];
-  fallback: TriggerUserAuthFallback;
+  /** Capability switches. Absent: derived from `tools` (lark-cli → lark-user,
+   *  bytedcli → bytecloud + meego); see `policyFromConfig`. */
+  capabilities?: TriggerUserAuthCapability[];
   /** See {@link TRIGGER_USER_AUTH_CREDENTIAL_SOURCES}. The parser always fills
    *  it; it is optional on the type only so hand-built configs (tests, legacy
    *  callers) keep compiling — read it through {@link credentialSourceOf}. */
   credentialSource?: TriggerUserAuthCredentialSource;
+  /** The legacy `fallback` value as stored. Never acted on; it only keeps the
+   *  background-job policy key of an unedited config what it was. */
+  legacyFallback?: 'bot-identity' | 'none';
   /**
    * Whether `botmux send --mention <bot on this machine>` hands this turn's
    * sender to that bot, the way `botmux dispatch` already does: the daemon
@@ -180,6 +176,18 @@ function isTool(value: unknown): value is TriggerUserAuthTool {
   return typeof value === 'string' && (TRIGGER_USER_AUTH_TOOLS as readonly string[]).includes(value);
 }
 
+function isCapability(value: unknown): value is TriggerUserAuthCapability {
+  return typeof value === 'string' && (TRIGGER_USER_AUTH_CAPABILITIES as readonly string[]).includes(value);
+}
+
+/** The governed tools that carry the given capabilities: Meego and ByteCloud
+ *  both go through bytedcli. */
+export function toolsForCapabilities(capabilities: readonly TriggerUserAuthCapability[]): TriggerUserAuthTool[] {
+  return TRIGGER_USER_AUTH_TOOLS.filter(tool => tool === 'lark-cli'
+    ? capabilities.includes('lark-user')
+    : capabilities.includes('bytecloud') || capabilities.includes('meego'));
+}
+
 /**
  * Parse the `triggerUserAuth` entry from `bots.json`.
  *
@@ -204,7 +212,21 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
   const enabled = rec.enabled === true;
 
   let tools: TriggerUserAuthTool[];
-  if (rec.tools === undefined) {
+  let capabilities: TriggerUserAuthCapability[] | undefined;
+  if (rec.capabilities !== undefined && rec.capabilities !== null) {
+    if (!Array.isArray(rec.capabilities)) {
+      throw new TriggerUserAuthConfigError('triggerUserAuth.capabilities must be an array');
+    }
+    const unknownCapabilities = rec.capabilities.filter(item => !isCapability(item));
+    if (unknownCapabilities.length) {
+      throw new TriggerUserAuthConfigError(
+        `triggerUserAuth.capabilities has unknown entries: ${unknownCapabilities.map(String).join(', ')}`
+        + ` (supported: ${TRIGGER_USER_AUTH_CAPABILITIES.join(', ')})`,
+      );
+    }
+    capabilities = [...new Set(rec.capabilities as TriggerUserAuthCapability[])];
+    tools = toolsForCapabilities(capabilities);
+  } else if (rec.tools === undefined) {
     // Enabling without naming tools means "all of them" — the operator asked
     // for the boundary, so apply it everywhere rather than nowhere.
     tools = [...TRIGGER_USER_AUTH_TOOLS];
@@ -219,19 +241,6 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
     tools = [...new Set(rec.tools as TriggerUserAuthTool[])];
   } else {
     throw new TriggerUserAuthConfigError('triggerUserAuth.tools must be an array');
-  }
-
-  let fallback: TriggerUserAuthFallback = 'bot-identity';
-  if (rec.fallback !== undefined) {
-    if (!(TRIGGER_USER_AUTH_FALLBACKS as readonly unknown[]).includes(rec.fallback)) {
-      // Name the rejected value: an operator reaching for "device" needs to be
-      // told it is refused on purpose, not left guessing at a typo.
-      throw new TriggerUserAuthConfigError(
-        `triggerUserAuth.fallback must be one of ${TRIGGER_USER_AUTH_FALLBACKS.join(' | ')}`
-        + ` (got ${JSON.stringify(rec.fallback)}; falling back to another person's login is never available)`,
-      );
-    }
-    fallback = rec.fallback as TriggerUserAuthFallback;
   }
 
   let credentialSource: TriggerUserAuthCredentialSource = 'auto';
@@ -290,8 +299,9 @@ export function parseTriggerUserAuthConfig(raw: unknown): TriggerUserAuthConfig 
   return {
     enabled,
     tools,
-    fallback,
+    ...(capabilities ? { capabilities } : {}),
     credentialSource,
+    ...(rec.fallback === 'none' || rec.fallback === 'bot-identity' ? { legacyFallback: rec.fallback } : {}),
     // Equal to the default → not stored.
     ...(rec.delegateOnMention === false ? { delegateOnMention: false } : {}),
     ...(dispatchOnly ? { dispatchOnly } : {}),
@@ -350,6 +360,29 @@ function optionalHttpsUrl(value: unknown, field: string): string | undefined {
     );
   }
   return value;
+}
+
+/** The capabilities that run as the message sender. `capabilities`, when
+ *  present, overrides `tools` (lark-cli → lark-user, bytedcli → bytecloud + meego). */
+export function capabilitiesOf(
+  config: Pick<TriggerUserAuthConfig, 'enabled' | 'tools' | 'capabilities'> | null | undefined,
+): Set<TriggerUserAuthCapability> {
+  const caps = new Set<TriggerUserAuthCapability>();
+  if (!config?.enabled) return caps;
+  if (config.capabilities) {
+    config.capabilities.forEach(c => caps.add(c));
+  } else {
+    if (config.tools.includes('lark-cli')) caps.add('lark-user');
+    if (config.tools.includes('bytedcli')) { caps.add('bytecloud'); caps.add('meego'); }
+  }
+  return caps;
+}
+
+export function capabilityOn(
+  config: Pick<TriggerUserAuthConfig, 'enabled' | 'tools' | 'capabilities'> | null | undefined,
+  capability: TriggerUserAuthCapability,
+): boolean {
+  return capabilitiesOf(config).has(capability);
 }
 
 /** The effective credential source; absent means `auto`. */

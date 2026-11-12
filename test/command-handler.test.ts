@@ -9,7 +9,7 @@
 // Must stay the first import: this file fakes node:fs, so refuse to run outside
 // the data-dir fence instead of touching live botmux data (see the helper).
 import './helpers/require-fenced-data-dir.js';
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach, onTestFinished } from 'vitest';
 
 vi.mock('../src/services/feed-group-tagger.js', () => ({
   tagClosedSessionGroup: vi.fn(async () => ({ status: 'skipped' })),
@@ -810,6 +810,16 @@ const LARK_APP_ID = 'app-1';
 const CODEX_APP_ID = 'app-codex-app';
 const ROOT_ID = 'om_root_abc123';
 const CHAT_ID = 'oc_chat_xyz';
+
+/** Makes the mocked bot run the given capabilities as the sender, until the test ends. */
+function governBot(triggerUserAuth: unknown): void {
+  const previous = vi.mocked(getBot).getMockImplementation()!;
+  vi.mocked(getBot).mockImplementation(((id?: string) => {
+    const bot = previous(id as any) as any;
+    return { ...bot, config: { ...bot.config, triggerUserAuth: parseTriggerUserAuthConfig(triggerUserAuth) ?? undefined } };
+  }) as any);
+  onTestFinished(() => { vi.mocked(getBot).mockImplementation(previous); });
+}
 
 function defaultGetBot(id: string = 'app-1') {
   return {
@@ -5332,7 +5342,7 @@ describe('handleCommand', () => {
 
       it('names the authorized person for lark-cli', async () => {
         const text = await statusText(statusWith({ enabled: true, tools: ['lark-cli'] }, true));
-        expect(text).toContain('lark-cli: 以「孙晓雪」的身份调用');
+        expect(text).toContain('lark-user: 以「孙晓雪」的身份调用');
       });
 
       // F-C: a person who authorized through the per-person device-code HOME
@@ -5342,7 +5352,7 @@ describe('handleCommand', () => {
         try {
           vi.mocked(listAuthorizedUsers).mockReturnValue([]);
           const text = await statusText(statusWith({ enabled: true, tools: ['lark-cli'] }, false));
-          expect(text).toContain('lark-cli: 以你自己的身份调用');
+          expect(text).toContain('lark-user: 以你自己的身份调用');
           expect(text).not.toContain('你未授权');
         } finally {
           vi.mocked(hasLarkCliHome).mockReturnValue(false);
@@ -5351,7 +5361,7 @@ describe('handleCommand', () => {
 
       it('tells an unauthorized sender the call is refused (never "as the bot")', async () => {
         const text = await statusText(statusWith({ enabled: true, tools: ['lark-cli'] }, false));
-        expect(text).toContain('lark-cli: 你未授权');
+        expect(text).toContain('lark-user: 你未授权');
         // lark-cli no longer degrades to the bot's own identity: claiming the
         // call would run as the bot here would contradict the actual refusal.
         expect(text).not.toContain('bot 身份');
@@ -5361,7 +5371,7 @@ describe('handleCommand', () => {
 
       it('warns that the command will be refused under fallback: none', async () => {
         const text = await statusText(
-          statusWith({ enabled: true, tools: ['lark-cli'], fallback: 'none' }, false),
+          statusWith({ enabled: true, tools: ['lark-cli'] }, false),
         );
         expect(text).toContain('命令会被拒绝');
       });
@@ -5374,9 +5384,16 @@ describe('handleCommand', () => {
         const text = await statusText(
           statusWith({ enabled: true, tools: ['lark-cli', 'bytedcli'] }, true),
         );
-        expect(text).toContain('lark-cli: 以「孙晓雪」的身份调用');
-        expect(text).toContain('bytedcli: 你未授权');
+        expect(text).toContain('lark-user: 以「孙晓雪」的身份调用');
+        expect(text).toContain('bytecloud（bytedcli / codebase / git push / bitscli）: 你未授权');
         expect(text).toContain('首次调用被拒时会自动返回登录链接');
+      });
+
+      it('reports per capability: Meego-only has a Meego line and no ByteCloud or Lark line', async () => {
+        const text = await statusText(statusWith({ enabled: true, tools: ['bytedcli'], capabilities: ['meego'] }, false));
+        expect(text).toContain('meego（bytedcli meego）');
+        expect(text).not.toContain('bytecloud');
+        expect(text).not.toContain('lark-user');
       });
 
       it('reports provider outages without telling the user to authorize again', async () => {
@@ -5391,7 +5408,7 @@ describe('handleCommand', () => {
         const text = await statusText(
           statusWith({ enabled: true, tools: ['bytedcli'] }, false),
         );
-        expect(text).toContain('bytedcli: 以你自己的身份调用');
+        expect(text).toContain('bytecloud（bytedcli / codebase / git push / bitscli）: 以你自己的身份调用');
       });
 
       it('does not call a merely pending device login authorized when there is no HOME', async () => {
@@ -5401,7 +5418,7 @@ describe('handleCommand', () => {
           const text = await statusText(
             statusWith({ enabled: true, tools: ['bytedcli'] }, false),
           );
-          expect(text).toContain('bytedcli: 你未授权');
+          expect(text).toContain('bytecloud（bytedcli / codebase / git push / bitscli）: 你未授权');
           expect(text).toContain('首次调用被拒时会自动返回登录链接');
         } finally {
           vi.mocked(pendingBytedcliChallenge).mockReturnValue(null);
@@ -5417,7 +5434,7 @@ describe('handleCommand', () => {
           const text = await statusText(
             statusWith({ enabled: true, tools: ['bytedcli'] }, false),
           );
-          expect(text).toContain('bytedcli: 以你自己的身份调用');
+          expect(text).toContain('bytecloud（bytedcli / codebase / git push / bitscli）: 以你自己的身份调用');
         } finally {
           vi.mocked(pendingBytedcliChallenge).mockReturnValue(null);
         }
@@ -7911,6 +7928,7 @@ describe('handleCommand', () => {
       });
 
       it('/login bytedcli: the ByteCloud link is DMed too', async () => {
+        governBot({ enabled: true, tools: ['lark-cli', 'bytedcli'] });
         const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);
         expect(vi.mocked(sendUserMessage).mock.calls[0]![2]).toContain('https://cloud.example.com/auth?state=x');
@@ -7935,6 +7953,7 @@ describe('handleCommand', () => {
       });
 
       it('DM and the sender-only card both fail: says where to get it, never posts the link', async () => {
+        governBot({ enabled: true, tools: ['lark-cli', 'bytedcli'] });
         const { sendEphemeralCard } = await import('../src/im/lark/client.js');
         vi.mocked(sendUserMessage).mockRejectedValueOnce(new Error('230013'));
         vi.mocked(sendEphemeralCard).mockRejectedValueOnce(new Error('18053 chat can not be thread'));
@@ -8009,13 +8028,57 @@ describe('handleCommand', () => {
           expect(replies(deps)).toEqual([t('cmd.login.meego_ready', undefined, 'zh')]);
         });
 
+        it.each([
+          ['/login bytedcli', { enabled: true, tools: ['bytedcli'], capabilities: ['meego'] }],
+          ['/login bytedcli', { enabled: true, tools: ['lark-cli'], capabilities: ['lark-user'] }],
+          ['/login lark', { enabled: true, tools: ['bytedcli'], capabilities: ['bytecloud'] }],
+        ])('%s with that capability off: says the machine login is used, mints no link', async (text, triggerUserAuth) => {
+          const previous = vi.mocked(getBot).getMockImplementation()!;
+          vi.mocked(getBot).mockImplementation(((id?: string) => {
+            const bot = previous(id as any) as any;
+            return { ...bot, config: { ...bot.config, triggerUserAuth, larkToolBinding: false } };
+          }) as any);
+          const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
+          await handleCommand('/login', ROOT_ID, makeLarkMessage(text), deps, LARK_APP_ID);
+          vi.mocked(getBot).mockImplementation(previous);
+          expect(sendUserMessage).not.toHaveBeenCalled();
+          expect(replies(deps)).toEqual([t('cmd.login.native', { provider: text.includes('lark') ? t('trigger_user_auth.provider_lark', undefined, 'zh') : 'ByteCloud' }, 'zh')]);
+        });
+
+        it('/login status for a meego-only bot reports the Meego line, not the legacy token status', async () => {
+          const previous = vi.mocked(getBot).getMockImplementation()!;
+          vi.mocked(getBot).mockImplementation(((id?: string) => {
+            const bot = previous(id as any) as any;
+            return { ...bot, config: { ...bot.config, triggerUserAuth: { enabled: true, tools: ['bytedcli'], capabilities: ['meego'] }, larkToolBinding: false } };
+          }) as any);
+          const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
+          await handleCommand('/login', ROOT_ID, makeLarkMessage('/login status'), deps, LARK_APP_ID);
+          vi.mocked(getBot).mockImplementation(previous);
+          expect(replies(deps)).toEqual([t('cmd.login.meego_status', undefined, 'zh')]);
+        });
+
+        it('meego switched off while bytecloud is on: says Meego uses the machine login, starts nothing', async () => {
+          const previous = vi.mocked(getBot).getMockImplementation()!;
+          vi.mocked(getBot).mockImplementation(((id?: string) => {
+            const bot = previous(id as any) as any;
+            return { ...bot, config: { ...bot.config, triggerUserAuth: { enabled: true, tools: ['bytedcli'], capabilities: ['bytecloud'] } } };
+          }) as any);
+          const { requestMeegoLogin } = await import('../src/services/meego-auth.js');
+          const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
+          await handleCommand('/login', ROOT_ID, makeLarkMessage('/login meego'), deps, LARK_APP_ID);
+          vi.mocked(getBot).mockImplementation(previous);
+          expect(requestMeegoLogin).not.toHaveBeenCalled();
+          expect(sendUserMessage).not.toHaveBeenCalled();
+          expect(replies(deps)).toEqual([t('cmd.login.meego_native', undefined, 'zh')]);
+        });
+
         it('bot does not run bytedcli as the person: explains the configuration, starts nothing', async () => {
           restore?.();
           const { requestMeegoLogin } = await import('../src/services/meego-auth.js');
           const deps = makeDeps(makeDaemonSession({ chatType: 'group' }));
           await handleCommand('/login', ROOT_ID, makeLarkMessage('/login meego'), deps, LARK_APP_ID);
           expect(requestMeegoLogin).not.toHaveBeenCalled();
-          expect(replies(deps)).toEqual([t('cmd.login.bytedcli_configure', undefined, 'zh')]);
+          expect(replies(deps)).toEqual([t('cmd.login.meego_native', undefined, 'zh')]);
         });
       });
 
@@ -8223,6 +8286,7 @@ describe('handleCommand', () => {
       });
 
       it('returns the ByteCloud link and says it is separate from Feishu', async () => {
+        governBot({ enabled: true, tools: ['lark-cli', 'bytedcli'] });
         const deps = makeDeps(makeDaemonSession({ chatType: 'p2p' }));
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);
 
@@ -8260,7 +8324,7 @@ describe('handleCommand', () => {
             expect(text).not.toContain('triggerUserAuth.enabled');
           } else {
             expect(text).toContain('triggerUserAuth.enabled');
-            expect(text).toContain('triggerUserAuth.tools');
+            expect(text).toContain('triggerUserAuth.capabilities');
             expect(text).not.toContain('已为 bytedcli 启用');
           }
           expect(text.includes('code.example.com')).toBe(git);
@@ -8378,6 +8442,7 @@ describe('handleCommand', () => {
       // path now completing pending logins, retrying just works — say so, and
       // still mention /login done as an explicit confirmation path.
       it('includes the post-authorization step after the link', async () => {
+        governBot({ enabled: true, tools: ['lark-cli', 'bytedcli'] });
         const deps = makeDeps(makeLegacyLarkSession({ chatType: 'p2p' }));
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login lark'), deps, LARK_APP_ID);
 

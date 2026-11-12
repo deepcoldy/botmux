@@ -428,8 +428,9 @@ export type BotDefaultsRow = {
    *  through the daemon's merge on PUT, so the page neither shows nor sends them. */
   triggerUserAuth?: {
     enabled: boolean;
-    tools: Array<'lark-cli' | 'bytedcli'>;
-    fallback: 'bot-identity' | 'none';
+    tools?: Array<'lark-cli' | 'bytedcli'>;
+    /** Per-capability switches. The daemon fills it for stored tools-only configs. */
+    capabilities?: Array<'lark-user' | 'bytecloud' | 'meego'>;
     /** Where the sender's credentials come from: central platform first
      *  (`auto`, default), platform only, or this machine only. */
     credentialSource?: 'auto' | 'platform' | 'local';

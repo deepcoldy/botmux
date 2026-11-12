@@ -4578,8 +4578,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
   const { bot, patchBot } = props;
   const policy = bot.triggerUserAuth ?? null;
   const enabled = policy?.enabled === true;
-  const tools = policy?.tools ?? ['lark-cli', 'bytedcli'];
-  const fallback = policy?.fallback ?? 'bot-identity';
+  const capabilities = policy?.capabilities ?? ['lark-user' as const, 'bytecloud' as const, 'meego' as const];
   const credentialSource = policy?.credentialSource ?? 'auto';
   const delegateOnMention = policy?.delegateOnMention !== false;
   const [busy, setBusy] = useState(false);
@@ -4621,17 +4620,21 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
     });
   }
 
-  function toggleTool(tool: 'lark-cli' | 'bytedcli', on: boolean): void {
-    const next = on ? [...new Set([...tools, tool])] : tools.filter(t => t !== tool);
-    void save({ enabled: true, tools: next, fallback, credentialSource, delegateOnMention });
+  function policyWith(next: { capabilities?: typeof capabilities; credentialSource?: typeof credentialSource; delegateOnMention?: boolean }) {
+    return {
+      enabled: true,
+      capabilities: next.capabilities ?? capabilities,
+      credentialSource: next.credentialSource ?? credentialSource,
+      delegateOnMention: next.delegateOnMention ?? delegateOnMention,
+    };
   }
 
-  function setCredentialSource(next: 'auto' | 'platform' | 'local'): void {
-    void save({ enabled: true, tools, fallback, credentialSource: next, delegateOnMention });
+  function saveWith(next: Parameters<typeof policyWith>[0]): void {
+    void save(policyWith(next));
   }
 
-  function setDelegateOnMention(next: boolean): void {
-    void save({ enabled: true, tools, fallback, credentialSource, delegateOnMention: next });
+  function toggleCapability(capability: typeof capabilities[number], on: boolean): void {
+    saveWith({ capabilities: on ? [...new Set([...capabilities, capability])] : capabilities.filter(c => c !== capability) });
   }
 
   return (
@@ -4643,24 +4646,22 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
         dataAction="toggle-trigger-user-auth"
         title={tr('botDefaults.triggerUserAuthToggle')}
         help={tr('botDefaults.triggerUserAuthHelp')}
-        onChange={checked => void save(
-          checked ? { enabled: true, tools, fallback, credentialSource, delegateOnMention } : null,
-        )}
+        onChange={checked => void save(checked ? policyWith({}) : null)}
       />
       {enabled ? (
         <>
           <div className="bd-row">
             <span>{tr('botDefaults.triggerUserAuthTools')}</span>
-            {(['lark-cli', 'bytedcli'] as const).map(tool => (
-              <label key={tool} className="bd-inline-check">
+            {(['lark-user', 'bytecloud', 'meego'] as const).map(capability => (
+              <label key={capability} className="bd-inline-check">
                 <input
                   type="checkbox"
-                  data-action={`trigger-user-auth-tool-${tool}`}
-                  checked={tools.includes(tool)}
+                  data-action={`trigger-user-auth-capability-${capability}`}
+                  checked={capabilities.includes(capability)}
                   disabled={busy}
-                  onChange={event => toggleTool(tool, event.currentTarget.checked)}
+                  onChange={event => toggleCapability(capability, event.currentTarget.checked)}
                 />
-                <span>{tool}</span>
+                <span>{tr(`botDefaults.triggerUserAuthCapability.${capability}`)}</span>
               </label>
             ))}
           </div>
@@ -4670,7 +4671,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
               data-action="trigger-user-auth-source"
               value={credentialSource}
               disabled={busy}
-              onChange={event => setCredentialSource(event.currentTarget.value as 'auto' | 'platform' | 'local')}
+              onChange={event => saveWith({ credentialSource: event.currentTarget.value as 'auto' | 'platform' | 'local' })}
             >
               <option value="auto">{tr('botDefaults.triggerUserAuthSourceAuto')}</option>
               <option value="platform">{tr('botDefaults.triggerUserAuthSourcePlatform')}</option>
@@ -4697,10 +4698,10 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
             dataAction="toggle-trigger-user-auth-delegate-on-mention"
             title={tr('botDefaults.triggerUserAuthDelegateOnMention')}
             help={tr('botDefaults.triggerUserAuthDelegateOnMentionHelp')}
-            onChange={checked => setDelegateOnMention(checked)}
+            onChange={checked => saveWith({ delegateOnMention: checked })}
           />
-          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthFallbackNote')}</p>
-          {tools.includes('bytedcli') ? (
+          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthCapabilityNote')}</p>
+          {capabilities.includes('bytecloud') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
           ) : null}
           {typeof info?.authorizedCount === 'number' ? (

@@ -484,8 +484,9 @@ Pick one way to turn it on. It **takes effect for new sessions** (`/restart` an 
 Rules:
 
 - Only `"enabled": true` turns it on. Leaving out `tools` covers every tool; an unknown tool name is an error rather than a silent downgrade.
+- Optional `capabilities` switches each capability separately: `lark-user` (Feishu user identity, `lark-cli --as user`), `bytecloud` (ByteCloud: bytedcli, codebase, git push and bitscli / bits-cli, one switch) and `meego` (`bytedcli meego` only; the standalone `meegle` command is not governed). An unknown value is an error. When absent it is derived from `tools` (`lark-cli` → `lark-user`, `bytedcli` → `bytecloud` + `meego`). With `bytecloud` or `meego` left off the matching commands stay native: they run on this machine's own login with no botmux involvement. With `lark-user` left off, `lark-cli --as user` is still decided by `larkToolBinding`.
 - When someone who hasn't authorized makes a call, the command is refused and the refusal carries an authorization link. The AI can also send that person a link itself with `botmux auth request` (see [Agent-initiated authorization](/en/cli-commands#agent-auth-request)), or ask them to send `/login` in the topic. Retry after authorizing.
-- It never falls back to running as the bot or as anyone else. `bytedcli` has no bot identity, so an unauthorized call simply fails.
+- It never falls back to running as the bot or as anyone else, and there is no machine-login fallback option; a legacy `fallback` field in old configs is ignored. `bytedcli` has no bot identity, so an unauthorized call simply fails.
 - Optional fields: `credentialSource` (`auto` by default / `platform` [central platform](/en/platform) only / `local` local QR login only), `delegateOnMention` (default `true`, see [Carry the sender over on @ handoffs](/en/permissions#delegate-on-mention)), `gitHost` (git pushes to that code host also authenticate as the current turn's sender).
 
 #### Upgrade note: old-format authorizations need a fresh `/login` {#legacy-user-token}

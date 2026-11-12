@@ -179,7 +179,6 @@ describe('dashboard bot payload helpers', () => {
     const policy = {
       enabled: true,
       tools: ['lark-cli' as const],
-      fallback: 'none' as const,
       gitHost: 'code.example.com',
     };
     // An enabled policy survives whole — a refresh rebuilds the toggle, the tool
@@ -193,11 +192,11 @@ describe('dashboard bot payload helpers', () => {
     expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: null }))
       .toMatchObject({ triggerUserAuth: null });
     expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: { enabled: false } }))
-      .toMatchObject({ triggerUserAuth: { enabled: false, tools: ['lark-cli', 'bytedcli'], fallback: 'bot-identity' } });
+      .toMatchObject({ triggerUserAuth: { enabled: false, tools: ['lark-cli', 'bytedcli'] } });
 
     // A malformed policy must not throw here: this builds every bot row, so one
     // bad value would blank the whole Bot Defaults page rather than one toggle.
-    expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: { enabled: true, fallback: 'device' } }))
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: { enabled: true, capabilities: ['bits'] } }))
       .toMatchObject({ triggerUserAuth: null });
     expect(botDefaultsPayload({ larkAppId: 'app' }, { triggerUserAuth: 'yes' }))
       .toMatchObject({ triggerUserAuth: null });
