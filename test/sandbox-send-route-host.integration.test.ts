@@ -5,8 +5,12 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
-import { spawnTsScript } from './helpers/ts-runner.js';
+import { isBunRuntime, spawnTsScript } from './helpers/ts-runner.js';
+import { executeRiffHostTool, RiffHostTools } from '../src/services/riff-host-tools.js';
+import { callRiffHostTool } from '../src/cli/riff-host-tools.js';
+import { handleSessionChatTool, SESSION_CHAT_TOOLS_ROUTE } from '../src/core/session-chat-tools.js';
 import {
   SANDBOX_RELAY_ROUTE_GATE_ENV,
   SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE,
@@ -28,15 +32,21 @@ afterEach(async () => {
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
-async function fakeDaemon(verdict: Record<string, unknown>) {
+async function fakeDaemon(verdict: Record<string, unknown>, chatTool?: (body: any) => Promise<{ status: number; body: Record<string, unknown> }>) {
   const requests: Array<{ path: string; body: any }> = [];
   const server = createServer((req, res) => {
     let raw = '';
     req.on('data', chunk => { raw += String(chunk); });
-    req.on('end', () => {
+    req.on('end', async () => {
       let body: any = {};
       try { body = JSON.parse(raw || '{}'); } catch { /* keep {} */ }
       requests.push({ path: req.url ?? '', body });
+      if (req.url === SESSION_CHAT_TOOLS_ROUTE && chatTool) {
+        const result = await chatTool(body);
+        res.writeHead(result.status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(result.body));
+        return;
+      }
       const ok = req.url === SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE;
       res.writeHead(ok ? (verdict.ok ? 200 : 403) : 404, { 'content-type': 'application/json' });
       res.end(JSON.stringify(ok ? verdict : { ok: false, error: 'not_found' }));
@@ -98,6 +108,79 @@ const captured = (stdout: string, prefix: string) => stdout.split('\n')
   .map(line => JSON.parse(line.slice(prefix.length)));
 
 describe('host re-exec of a sandboxed routed send', () => {
+  it('creates a chat once, resolves QA in the same app, then sends directly from the original Riff task', async () => {
+    let creations = 0;
+    const daemon = await fakeDaemon({ ok: true, chatId: 'oc_created', reason: 'authorized' }, body => handleSessionChatTool(body, {
+      sessionId: 'route-session', larkAppId: APP, chatId: 'oc_self', turnId: 'turn-live',
+      callerOpenId: 'ou_caller', humanCaller: true, enabled: true, isCurrent: () => true,
+    }, {
+      route: {
+        lookupMessageChatId: async () => null, getChatInfo: async () => ({ external: false, mode: 'group' }),
+        isBotInChat: async () => true, listMemberOpenIds: async () => ['ou_caller', 'ou_qa'], canTalk: () => true,
+      },
+      resolveMembers: async () => new Map([['qa@example.com', 'ou_qa']]),
+      listMembers: async () => [{ openId: 'ou_qa', name: 'QA' }],
+      create: async input => {
+        creations++;
+        expect(input.userIds).toEqual(['ou_caller', 'ou_qa']);
+        return { chatId: 'oc_created', invalidUserIds: [] };
+      },
+    }));
+    const { root, env } = prepare(daemon.port);
+    delete env[SANDBOX_RELAY_ROUTE_GATE_ENV];
+    if (!isBunRuntime()) env.NODE_OPTIONS = `--import=${createRequire(import.meta.url).resolve('tsx')}`;
+    const gateway = new RiffHostTools();
+    const server = createServer((req, res) => { void gateway.handle(req, res); });
+    servers.push(server);
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    const binding = gateway.bind(`http://127.0.0.1:${(server.address() as AddressInfo).port}/api/riff-host-tools`, {
+      sessionId: 'route-session', turnId: 'turn-live', dataDir: env.SESSION_DATA_DIR!, workingDir: root, env,
+      cliPath: join(repoRoot, 'test/fixtures/sandbox-route-send-capture.ts'), isCurrent: () => true,
+    });
+    const create = { operationId: 'riff-create-0001', argv: ['chat', 'create', '--name', 'Verification', '--member', 'qa@example.com'] };
+    const created = await callRiffHostTool(binding, create);
+    expect(created.exitCode, created.stderr).toBe(0);
+    expect(JSON.parse(created.stdout)).toMatchObject({ ok: true, larkAppId: APP, chatId: 'oc_created', complete: true });
+    expect(await callRiffHostTool(binding, create)).toEqual(created);
+    expect(creations).toBe(1);
+    const members = await callRiffHostTool(binding, { operationId: 'riff-members-0001', argv: ['chat', 'members', '--chat-id', 'oc_created'] });
+    expect(members.exitCode, members.stderr).toBe(0);
+    expect(JSON.parse(members.stdout)).toMatchObject({ larkAppId: APP, members: [{ openId: 'ou_qa' }] });
+    const sent = await callRiffHostTool(binding, { operationId: 'riff-notify-0001',
+      argv: ['send', '--chat-id', 'oc_created', '--top-level', '--mention', 'ou_qa', 'ready for verification'] });
+    expect(sent.exitCode, sent.stderr).toBe(0);
+    expect(captured(sent.stdout, 'CAPTURE_SEND=')).toEqual([{ receiveId: 'oc_created' }]);
+    expect(captured(sent.stdout, 'CAPTURE_CONTENT=').join()).toContain('<at id=ou_qa>');
+    expect(daemon.requests.filter(q => q.path === SESSION_CHAT_TOOLS_ROUTE).map(q => q.body)).toEqual([
+      { sessionId: 'route-session', action: 'create', name: 'Verification', members: ['qa@example.com'], chatMode: 'group', turnId: 'turn-live' },
+      { sessionId: 'route-session', action: 'members', chatId: 'oc_created', turnId: 'turn-live' },
+    ]);
+  }, 30_000);
+
+  it.each([true, false])('authorizes a Riff routed send through the real host CLI: allowed=%s', async allowed => {
+    const daemon = await fakeDaemon(allowed
+      ? { ok: true, chatId: 'oc_team', reason: 'authorized' }
+      : { ok: false, error: 'principal_not_authorized' });
+    const { root, env } = prepare(daemon.port);
+    // The Riff executor must install its own route gate, rather than inherit
+    // the sandbox outbox's environment. The target and mentions travel intact.
+    delete env[SANDBOX_RELAY_ROUTE_GATE_ENV];
+    if (!isBunRuntime()) env.NODE_OPTIONS = `--import=${createRequire(import.meta.url).resolve('tsx')}`;
+    const result = await executeRiffHostTool({ operationId: 'riff-route-0001',
+      argv: ['send', '--chat-id=oc_team', '--top-level', '--mention', 'ou_qa', 'ready for verification'] }, {
+      sessionId: 'route-session', turnId: 'turn-live', dataDir: env.SESSION_DATA_DIR!,
+      workingDir: root, env,
+      cliPath: join(repoRoot, 'test/fixtures/sandbox-route-send-capture.ts'), isCurrent: () => true,
+    });
+    expect(daemon.requests.filter(q => q.path === SANDBOX_SEND_ROUTE_AUTHORIZE_ROUTE).map(q => q.body)).toEqual([
+      { sessionId: 'route-session', chatId: 'oc_team', turnId: 'turn-live' },
+    ]);
+    expect(result.exitCode, result.stderr).toBe(allowed ? 0 : 2);
+    expect(captured(result.stdout, 'CAPTURE_SEND=')).toEqual(allowed ? [{ receiveId: 'oc_team' }] : []);
+    if (allowed) expect(captured(result.stdout, 'CAPTURE_CONTENT=').join()).toContain('<at id=ou_qa>');
+    else expect(result.stderr).toContain('principal_not_authorized');
+  }, 30_000);
+
   it('refuses a forged chat id the daemon rejects, before any provider message', async () => {
     const daemon = await fakeDaemon({ ok: false, error: 'principal_not_authorized', chatId: 'oc_secret' });
     const { root, env } = prepare(daemon.port);

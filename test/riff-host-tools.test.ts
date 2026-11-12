@@ -180,7 +180,8 @@ describe('Riff host boundary', () => {
   }, 30_000);
 
   it.each([
-    ['send', '--session-id', 'other', 'body'], ['send', '--chat-id=oc_other', 'body'],
+    ['send', '--session-id', 'other', 'body'], ['send', '--into=om_other', 'body'],
+    ['chat', 'create', '--bot', 'other'], ['chat', 'members', '--lark-app-id', 'other'],
     ['schedule', 'add', 'every 1h', 'prompt', '--lark-app-id', 'other'],
     ['send', '--content-file', '/etc/passwd'], ['card', 'patch', '--card-file=/etc/passwd'],
     ['restart'], ['plugin', 'install', 'anything'], ['board', 'attach', '1', '/etc/passwd'],
