@@ -13,12 +13,11 @@
  * "Queued message while CLI backend is restarting". The status card kept
  * showing a running turn, suspend only queued, Stop sent ^C into nothing.
  *
- * The first case replays that day: wake, compaction-start signal, next message.
- * The others take a retirement #214 does not cover — the identity update
- * landing while an exact-turn interrupt (a cancel operation) is in flight — and
- * check the ways out: the retired worker ends its generation and the message it
- * was holding is handed to a successor and answered without waiting for
- * another message; a close arriving before that still tears the CLI down.
+ * A late identity during cancel must preserve the executor and the control
+ * fence; rejecting the cancel lets the next message run and deliver its reply.
+ * A confirmed suspend, in contrast, revokes authority before the late identity:
+ * the retired worker must exit and hand unwritten input to a successor. Close
+ * must tear down the CLI both during cancel and during retirement's grace window.
  *
  * Real worker, real tmux backend on a private socket, a fake Claude; the daemon
  * side is the real worker IPC handler with the real SQLite session contract.
@@ -43,6 +42,7 @@ import { config } from '../src/config.js';
 import * as bots from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as workerPool from '../src/core/worker-pool.js';
+import { contractReadiness } from '../src/services/session-contract.js';
 import { controllerForSession } from '../src/core/session-controller.js';
 import { WORKER_EXIT_RUNTIME_RETIRED } from '../src/core/retired-runtime-exit.js';
 import { preferredManagedTmuxSocket } from '../src/adapters/backend/tmux-socket.js';
@@ -165,7 +165,7 @@ function wakeSuspendedSession() {
   return { h, ds, controller, g, fork, replies, sendNext };
 }
 
-describe.skipIf(!runnable)('a worker whose runtime the daemon retired', () => {
+describe.skipIf(!runnable)('late runtime identity and worker retirement', () => {
   it('still delivers the next message after a wake whose ready gate fell back and a compaction started', async () => {
     const { h, g, replies, sendNext } = wakeSuspendedSession();
     // The wake turn ran and the CLI reported its native session id after the
@@ -190,22 +190,52 @@ describe.skipIf(!runnable)('a worker whose runtime the daemon retired', () => {
     expect(log).not.toContain('mayExecute=false');
   }, 180_000);
 
-  /** Wake with an exact-turn interrupt of the waking turn in flight
-   *  (interruptExactWorkerTurn has opened its cancel operation) when the
-   *  message is written and the CLI then shows its native session id: that
-   *  identity update carries the resume operation, which is no longer the
-   *  active one, and the contract retires the live runtime. */
-  async function retireDuringInterrupt() {
+  /** Intervene before the first write publishes the native session identity. */
+  async function controlBeforeIdentity(kind: 'cancel' | 'suspend') {
     const session = wakeSuspendedSession();
     const { controller, g } = session;
     await g.waitFor(() => g.logs.join('').includes('Startup command confirmed'), 'the startup command before the write', 120_000);
     const execution = controller.store.executions(controller.ref)
       .find(value => value.ref.turnId === WAKE_TURN && !value.terminal)!;
-    const cancel = controller.beginControl('cancel', undefined, execution.ref).operation.operationId;
-    controller.controlStarted(cancel);
-    await g.waitFor(() => g.logs.join('').includes('mayExecute=false'), 'the daemon retiring the runtime', 30_000);
-    expect(g.logs.join('').indexOf('Published CLI session id')).toBeGreaterThan(g.logs.join('').indexOf('Writing to PTY'));
-    controller.controlResult(cancel, 'uncertain');
+    expect(controller.store.runtime(controller.ref)?.identity?.nativeSessionId).toBeUndefined();
+    const operation = controller.beginControl(kind, undefined, kind === 'cancel' ? execution.ref : undefined).operation.operationId;
+    controller.controlStarted(operation);
+    return { ...session, operation };
+  }
+
+  async function cancelDuringIdentity() {
+    const session = await controlBeforeIdentity('cancel');
+    const { controller, g, operation } = session;
+    await g.waitFor(() => !!controller.store.runtime(controller.ref)?.identity?.nativeSessionId,
+      'the late native identity to reach the daemon');
+    expect(controller.store.runtime(controller.ref)?.phase).not.toBe('retiring');
+    expect(controller.store.read(controller.ref)?.activeOperationId).toBe(operation);
+    expect(contractReadiness(controller.store.read(controller.ref)!, controller.store.runtime(controller.ref)).cliReady).toBe(false);
+    expect(g.logs.join('')).not.toContain('mayExecute=false');
+    return session;
+  }
+
+  it('keeps the executor and delivers the next reply after a cancel is rejected', async () => {
+    const { h, controller, g, operation, replies, sendNext } = await cancelDuringIdentity();
+    controller.controlResult(operation, 'rejected');
+    expect(controller.allowsInput()).toBe(true);
+    await g.waitFor(() => replies().some(text => text.includes(`reply: ${WAKE_TEXT}`)), 'the waking reply');
+    expect(sendNext()).toBe(true);
+    await g.waitFor(() => submitted(h, NEXT_TEXT), 'the next input on the original executor');
+    await g.waitFor(() => replies().some(text => text.includes(`reply: ${NEXT_TEXT}`)), 'the next reply');
+    expect(g.child.exitCode).toBeNull();
+    expect(g.logs.join('')).not.toContain('mayExecute=false');
+  }, 180_000);
+
+  async function retireAfterSuspend() {
+    const session = await controlBeforeIdentity('suspend');
+    const { controller, g, operation } = session;
+    // The daemon has confirmed the suspend before this worker's late report.
+    // Unlike metadata enrichment during cancel, this cannot reauthorize it.
+    controller.controlResult(operation, 'confirmed');
+    await g.waitFor(() => g.logs.join('').includes('mayExecute=false'), 'the daemon retiring the suspended runtime');
+    expect(controller.store.read(controller.ref)?.lifecycle).toBe('suspended');
+    expect(controller.store.runtime(controller.ref)?.phase).toBe('retiring');
     return session;
   }
 
@@ -216,7 +246,7 @@ describe.skipIf(!runnable)('a worker whose runtime the daemon retired', () => {
   });
 
   it('ends its generation and has the message it was holding answered by a successor', async () => {
-    const { h, ds, g, fork, replies, sendNext } = await retireDuringInterrupt();
+    const { h, ds, g, fork, replies, sendNext } = await retireAfterSuspend();
     // The daemon starts a successor for handed-over input the way it re-forks
     // a worker-less session.
     let successor: Generation | undefined;
@@ -242,8 +272,8 @@ describe.skipIf(!runnable)('a worker whose runtime the daemon retired', () => {
     expect(existsSync(join(h.root, 'data', 'turn-marks', `${h.sessionId}.unsent.json`))).toBe(false);
   }, 300_000);
 
-  it('still has a close that arrives before it ends tear down the CLI', async () => {
-    const { h, ds, g } = await retireDuringInterrupt();
+  it.each(['cancel', 'retirement'] as const)('tears down the CLI when close arrives during %s', async phase => {
+    const { h, ds, g } = await (phase === 'cancel' ? cancelDuringIdentity() : retireAfterSuspend());
     const pane = `bmx-${h.sessionId.slice(0, 8)}`;
     const socket = join(h.root, `tmux-${process.getuid?.() ?? 0}`, preferredManagedTmuxSocket() ?? 'default');
     const paneAlive = () => {
@@ -253,7 +283,7 @@ describe.skipIf(!runnable)('a worker whose runtime the daemon retired', () => {
     const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
     expect(paneAlive()).toBe(true);
 
-    // /close lands inside the retired worker's grace window.
+    // /close must tear down the physical CLI regardless of pending controls.
     workerPool.killWorker(ds);
     expect(await exitOf(g, 20_000)).toBe(0);
     await vi.waitFor(() => {

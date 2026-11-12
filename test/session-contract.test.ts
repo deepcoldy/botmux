@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { SessionContractStore, SessionContractConflict, sessionContractStore } from '../src/services/session-contract-store.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
-import { contractReadiness } from '../src/services/session-contract.js';
+import { contractReadiness, reduceSessionContract, type ContractTransitionInput, type RuntimeIdentity } from '../src/services/session-contract.js';
 import { WorkerSessionEventScope } from '../src/services/session-event-scope.js';
 const ref = { appId: 'cli_contract_test', sessionId: 'session_test' };
 const worker = { workerId: 'worker_one', generation: 1 };
@@ -104,6 +104,42 @@ describe('session identity and state contract', () => {
     store.bindRuntime(ref, reserved, worker, { ...identity, nativeGeneration: 'next' }, operation.operationId);
     expect(store.read(ref)?.activeRuntime).toEqual(next);
     expect(store.runtime(ref, reserved.runtimeId)?.phase).toBe('retiring');
+  });
+  it.each([
+    'not_selected', 'other_runtime', 'other_worker', 'retiring', 'stopped', 'unresolved',
+    'suspended', 'resuming', 'closed', 'opaque', 'other_physical', 'native_session_changed', 'native_generation_changed',
+  ] as const)('does not accept late identity enrichment across the %s reducer fence', fence => {
+    const { store, operation } = settledRestart();
+    const input: ContractTransitionInput = { session: store.read(ref)!, runtime: store.runtime(ref)! };
+    // Call the reducer directly: store.bindRuntime's validation must not mask
+    // a missing guard in the state machine itself.
+    if (fence === 'not_selected') input.session.activeRuntime = { runtimeId: 'selected_elsewhere', epoch: 9 };
+    if (fence === 'other_runtime') {
+      input.runtime!.ref = { runtimeId: 'previous_runtime', epoch: 8 };
+      input.session.activeRuntime = input.runtime!.ref;
+    }
+    if (fence === 'other_worker') input.runtime!.worker = { workerId: 'old_worker', generation: 0 };
+    if (fence === 'retiring' || fence === 'stopped' || fence === 'unresolved') input.runtime!.phase = fence;
+    if (fence === 'suspended' || fence === 'resuming' || fence === 'closed') input.session.lifecycle = fence;
+    if (fence === 'opaque') input.runtime!.identity!.proof = 'opaque';
+    if (fence === 'native_session_changed') input.runtime!.identity!.nativeSessionId = 'already_known';
+    if (fence === 'native_generation_changed') input.runtime!.identity!.nativeGeneration = 'already_known';
+    const nextIdentity: RuntimeIdentity = { ...input.runtime!.identity!, nativeSessionId: identity.nativeSessionId, nativeGeneration: 'next' };
+    if (fence === 'other_physical') nextIdentity.physicalId = 'different_process';
+    const incoming = { ...store.runtime(ref)!, identity: nextIdentity, phase: 'ready' as const };
+    const result = reduceSessionContract(input, { type: 'runtime_bound', runtime: incoming, operationId: operation.operationId });
+    expect(result.decision).toBe('historical');
+    expect(result.runtime?.phase).toBe('retiring');
+    expect(result.session.activeRuntime).toEqual(input.session.activeRuntime);
+    expect(result.session.lifecycle).toBe(input.session.lifecycle);
+  });
+  it('preserves explicit retirement when a binding repeats exactly the same identity', () => {
+    const { store, runtime } = settledRestart();
+    const input = { session: store.read(ref)!, runtime };
+    const result = reduceSessionContract(input, { type: 'runtime_bound', runtime: { ...runtime, phase: 'retiring' } });
+    expect(result.decision).toBe('applied');
+    expect(result.runtime?.phase).toBe('retiring');
+    expect(contractReadiness(result.session, result.runtime).cliReady).toBe(false);
   });
   it.each(['suspend', 'cancel'] as const)('retains an uncertain %s record while a reopened store starts one recovery restart', kind => {
     const store = open(); bind(store);
