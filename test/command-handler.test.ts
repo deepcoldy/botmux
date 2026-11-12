@@ -2123,6 +2123,12 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(resolvePassthroughCommands('app-2').has('/goal')).toBe(true);
   });
 
+  it('keeps TRAE native /goal available for a frozen session after switching the bot CLI', () => {
+    expect(resolvePassthroughCommands('app-2', 'traex').has('/goal')).toBe(true);
+    expect(resolveAdapterDefaultPassthroughCommands('app-2', 'traex')).toContain('/goal');
+    expect(resolvePassthroughCommands('app-2', 'codex-app').size).toBe(0);
+  });
+
   it('forwards /fast as a global passthrough WITHOUT cold-start (not adapter-scoped)', () => {
     // /fast is a tier toggle, not "start a unit of work": it lives in the global
     // PASSTHROUGH_COMMANDS (forwarded to Codex on an existing session), and is

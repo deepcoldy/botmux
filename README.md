@@ -106,6 +106,8 @@ npm 包内包含相同的自包含二进制，安装后命令与行为完全一�
 
 ## 支持的 CLI / Agent
 
+使用支持原生目标模式的交互式 CLI（Claude Code、Codex、TRAE CLI）时，可在飞书发送 `/goal <目标与完成条件>`，开启背后 agent 的 goal 模式；新话题会自动创建会话。已有会话中的 `/goal`、`/goal pause`、`/goal resume` 等命令原样交给 CLI，具体子命令以所用 CLI 的版本为准。此入口使用终端透传，需要 CLI 支持原生命令输入。
+
 通过 `bots.json` 里的 `cliId` 一键切换。内置 **20+ 适配器**，覆盖本地 CLI（独立进程隔离，`tmux attach` 可直接接入调试）以及 API / 云 Agent：
 
 `claude-code` · `codex` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `codem` ([CodeM 说明](docs/codem.md)) · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `traex` · `mtr` · `hermes` · `ebsd` ([配置说明](docs/ebsd.md)) · `mira` · `riff` (云 Agent) · `mojo` · `remote-runner` ([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax` ([MiniMax Code 说明](docs/minimax-code.md)) · `zcode` (ZCode TUI；适配器声明 `interruptKey: 'esc'`，新消息到达时抢占运行中的回合) · `doubao` ([Doubao CLI 安装与使用](docs/doubao.md)) …
