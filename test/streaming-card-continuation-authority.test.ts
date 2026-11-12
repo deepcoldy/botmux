@@ -501,4 +501,140 @@ describe('streaming card authority across same-worker runtime continuations and 
     expect(ds.streamCardId).toBe('om_existing_card');
     expect(ds.streamCardId).not.toBe(CARD_POSTING_SENTINEL);
   });
+
+  it('rolls back the posting sentinel on the screen_update POST path when a non-continued replacement wins ownership mid-flight', async () => {
+    const controller = controllerForSession(ds, true)!;
+    closeStores.push(() => controller.store.close());
+    ds.initConfig = { sessionContract: controller.bindWorker(1) } as any;
+    const worker = createFakeWorker();
+    ds.worker = worker as any;
+    ds.workerGeneration = 1;
+    ds.session.workerGeneration = 1;
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    setupWorkerHandlers(ds, worker as any, undefined, 1);
+    const workerRef = controller.store.read(controller.ref)!.worker!;
+    const r1 = controller.reserveBinding('b1-screen', workerRef);
+    controller.bindRuntime('b1-screen', workerRef, {
+      backend: 'tmux',
+      physicalId: '100:screenStart',
+      proof: 'process_start',
+    });
+
+    // A completed ready POST drives the contract worker_online, so the later
+    // screen_update passes the workerHasInitialized gate (workerReady is a
+    // contract-backed read-only accessor once a controller exists).
+    mocks.reply.mockResolvedValueOnce({ code: 0, data: { message_id: 'om_first_card' } });
+    await worker.listeners('message')[0]({
+      type: 'ready',
+      port: 9999,
+      token: 'fixture',
+      turnId: 'om_turn_1',
+      sessionContract: {
+        version: 2,
+        session: controller.ref,
+        producer: workerRef,
+        bindingId: 'b1-screen',
+        eventId: `${workerRef.workerId}:1`,
+        sequence: 1,
+        scope: { runtime: r1 },
+      },
+    });
+    expect(ds.workerReady).toBe(true);
+    expect(ds.streamCardId).toBe('om_first_card');
+    // Simulate a session whose live card was lost without a successor, so the
+    // next screen_update takes the fresh-card POST branch.
+    ds.streamCardId = undefined;
+
+    let resolveScreen!: (value: { code: number; data: { message_id: string } }) => void;
+    let screenPostInFlight = false;
+    mocks.reply.mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          screenPostInFlight = true;
+          resolveScreen = resolve;
+        }),
+    );
+
+    worker.listeners('message')[0]({
+      type: 'screen_update',
+      content: 'working...',
+      status: 'working',
+      turnId: 'om_turn_1',
+      sessionContract: {
+        version: 2,
+        session: controller.ref,
+        producer: workerRef,
+        bindingId: 'b1-screen',
+        eventId: `${workerRef.workerId}:2`,
+        sequence: 2,
+        scope: { runtime: r1 },
+      },
+    });
+
+    await vi.waitFor(() => expect(screenPostInFlight).toBe(true));
+    expect(ds.streamCardId).toBe(CARD_POSTING_SENTINEL);
+
+    // Non-continued replacement (no continuesBindingId) wins ownership mid-POST.
+    const r2 = controller.reserveBinding('b2-screen-respawn', workerRef);
+    controller.bindRuntime('b2-screen-respawn', workerRef, {
+      backend: 'tmux',
+      physicalId: '999:screenRespawn',
+      nativeSessionId: 'conv-screen-respawn',
+      proof: 'process_start',
+    });
+
+    resolveScreen({ code: 0, data: { message_id: 'om_screen_stale' } });
+
+    await vi.waitFor(() => {
+      expect(mocks.delete).toHaveBeenCalledWith({ path: { message_id: 'om_screen_stale' } });
+    });
+    // Sentinel must be rolled back on the screen_update path too, not left stuck.
+    expect(ds.streamCardId).toBeUndefined();
+
+    // The replacement runtime's next screen_update can now POST a fresh card.
+    mocks.reply.mockResolvedValueOnce({ code: 0, data: { message_id: 'om_screen_fresh' } });
+    worker.listeners('message')[0]({
+      type: 'screen_update',
+      content: 'still working...',
+      status: 'working',
+      turnId: 'om_turn_1',
+      sessionContract: {
+        version: 2,
+        session: controller.ref,
+        producer: workerRef,
+        bindingId: 'b2-screen-respawn',
+        eventId: `${workerRef.workerId}:3`,
+        sequence: 3,
+        scope: { runtime: r2 },
+      },
+    });
+    await vi.waitFor(() => expect(ds.streamCardId).toBe('om_screen_fresh'));
+  });
+
+  it('restores pre-POST card identity at the starting-card entry gate when a closed handoff loses ownership while the post identity still holds', async () => {
+    // No session controller here: workerReady stays a plain writable field,
+    // mirroring the standalone postTurnStartingCard harness above.
+    ds.workerReady = true;
+    ds.streamCardId = 'om_existing_card';
+    ds.streamCardNonce = 'nonce_existing';
+    ds.streamCardPending = true;
+    ds.streamCardPendingTurnId = 'om_turn_1';
+    // A manual card matching the live identity keeps streaming cards enabled
+    // (handoffCardBlocksStreaming === false) while the closed handoff still
+    // makes stillOwnsPost() false at the entry gate — without retiring the
+    // session, so the generic (non-retirement-only) rollback must run.
+    ds.session.handoffLiveCard = {
+      turnId: 'om_turn_1',
+      closed: true,
+      manualCard: { messageId: 'om_existing_card', nonce: 'nonce_existing' },
+    } as any;
+
+    const startingResult = await postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    expect(startingResult).toBe(false);
+    expect(mocks.reply).not.toHaveBeenCalled();
+    expect(ds.streamCardId).toBe('om_existing_card');
+    expect(ds.streamCardNonce).toBe('nonce_existing');
+    expect(ds.streamCardId).not.toBe(CARD_POSTING_SENTINEL);
+  });
 });
