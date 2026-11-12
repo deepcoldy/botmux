@@ -35601,7 +35601,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   let oncallHandoffStopped = false;
   if (!cfg.apiOnly) {
     const reconcileOncall = async () => {
-      if (oncallHandoffRunning || oncallHandoffStopped || !getBot(cfg.larkAppId).config.oncallGroup?.enabled) return;
+      // Existing group invitations remain usable after new handoffs are disabled.
+      // The reconciler checks the live policy before forwarding conversations.
+      if (oncallHandoffRunning || oncallHandoffStopped) return;
       oncallHandoffRunning = true;
       try { await (await import('./im/lark/oncall-group.js')).retryPendingOncallHandoffs(cfg.larkAppId, () => !oncallHandoffStopped); }
       catch { logger.warn('[oncall-group] Handoff recovery failed; retry remains scheduled'); }

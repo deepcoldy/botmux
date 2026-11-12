@@ -1109,7 +1109,9 @@ describe('session Oncall after the CLI turn lease retires', () => {
           BOTS_CONFIG: join(root, 'bots.json'), BOTMUX_SESSION_ID: key.sessionId, BOTMUX_LARK_APP_ID: key.larkAppId }, encoding: 'utf8', timeout: 30_000 });
       expect(result.status, String(result.stderr)).toBe(0);
       const delivered = String(result.stdout).split('\n').find(line => line.startsWith('CAPTURE_REPLY='));
-      expect(delivered).toContain('oc_existing');
+      expect(delivered).toContain('oncall_group_join');
+      expect(delivered).not.toContain('oncall_group_create');
+      expect(store.getRequest(source)?.openChatId).toBe('oc_existing');
       expect(store.findSource(key.larkAppId, 'om_separate_message')?.questionId).toBe(key.turnId);
       store.recordSource(source); expect(store.latest(key.larkAppId, key.sessionId)?.messageId).toBe('om_separate_message');
     } finally { rmSync(root, { recursive: true, force: true }); }

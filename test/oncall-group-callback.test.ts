@@ -7,14 +7,15 @@ const mocks = vi.hoisted(() => ({
   identityRequest: vi.fn(),
   config: { session: { dataDir: '' } },
   bot: { config: { brand: 'feishu', oncallGroup: { enabled: true, chatIds: ['oc_source'] } } },
-  reply: vi.fn(), sender: vi.fn(), detail: vi.fn(), update: vi.fn(),
+  invite: vi.fn(), reply: vi.fn(), sender: vi.fn(), detail: vi.fn(), update: vi.fn(),
 }));
+vi.mock('../src/im/lark/md-card.js', () => ({ omitReplyCardImages: (card: string) => card }));
 vi.mock('../src/config.js', () => ({ config: mocks.config }));
 vi.mock('../src/bot-registry.js', () => ({ getBot: () => mocks.bot }));
-vi.mock('../src/im/lark/client.js', () => ({ getMessageDetail: mocks.detail, replyMessage: mocks.reply, updateMessage: mocks.update }));
+vi.mock('../src/im/lark/client.js', () => ({ getChatInviteLink: mocks.invite, getMessageDetail: mocks.detail, replyMessage: mocks.reply, updateMessage: mocks.update }));
 vi.mock('../src/im/lark/identity-cache.js', () => ({ resolveSender: mocks.sender }));
 
-import { attachOncallGroupButton, handleOncallGroupAction, recordOncallGroupDelivery } from '../src/im/lark/oncall-group.js';
+import { attachOncallGroupButton, handleOncallGroupAction, reconcileOncallReplyCard, recordOncallGroupDelivery } from '../src/im/lark/oncall-group.js';
 import { OncallGroupStore, type OncallGroupSource } from '../src/services/oncall-group-store.js';
 vi.mock('@larksuiteoapi/node-sdk', () => ({ DefaultCache: class {}, Client: class { request = mocks.identityRequest; } }));
 
@@ -24,6 +25,7 @@ let fetcher: ReturnType<typeof vi.fn>;
 const event = (operator = 'ou_clicker', chatId = 'oc_source') => ({ context: { open_message_id: 'om_reply', open_chat_id: chatId }, operator: { open_id: operator }, action: { value: { action: 'oncall_group_create' } } }) as any;
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.invite.mockResolvedValue('https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=invite-oc_created');
   dir = mkdtempSync(join(tmpdir(), 'oncall-callback-'));
   mocks.config.session.dataDir = dir;
   mocks.bot.config.oncallGroup = { enabled: true, chatIds: ['oc_source'] };
@@ -87,7 +89,7 @@ describe('Oncall card callback', () => {
     expect(fetcher).not.toHaveBeenCalled();
     expect(new OncallGroupStore(dir).getRequest(source)).toBeUndefined();
   });
-  it('uses the verified clicker account and replies with a link without changing the original card', async () => {
+  it('uses the verified clicker account and updates the card to a native group invitation', async () => {
     vi.stubEnv('ONCALL_SERVICE_SECRET', ' service-secret ');
     vi.stubEnv('BYTEDCLI_USER_CLOUD_JWT', 'another-user-jwt');
     await expect(handleOncallGroupAction(event(), 'app')).resolves.toBeUndefined();
@@ -98,10 +100,10 @@ describe('Oncall card callback', () => {
     expect(fetcher.mock.calls[0][1].headers).not.toHaveProperty('x-jwt-token');
     expect(fetcher.mock.calls[0][1].headers['x-api-user']).toBe('clicker');
     expect(JSON.parse(fetcher.mock.calls[0][1].body).trigger_message).toContain('original question');
-    expect(mocks.reply).toHaveBeenCalledWith('app', 'om_reply', expect.stringContaining('openChatId=oc_created'), 'text', true);
-    expect(mocks.update).not.toHaveBeenCalled();
+    expect(mocks.reply).toHaveBeenCalledWith('app', 'om_reply', expect.stringContaining('link_token=invite-oc_created'), 'text', true);
+    expect(mocks.update).toHaveBeenCalledWith('app','om_reply',expect.stringContaining('link_token=invite-oc_created'));
     expect(existsSync(join(dir, 'botmux-feedback.sqlite'))).toBe(false);
-    expect(new OncallGroupStore(dir).findSource('app', 'om_reply')).toEqual(source);
+    expect(new OncallGroupStore(dir).findSource('app', 'om_reply')).toMatchObject(source);
   });
   it.each(['', '  '])('does not create or claim a group with an empty service secret %j', async secret => {
     vi.stubEnv('ONCALL_SERVICE_SECRET', secret);
@@ -112,7 +114,7 @@ describe('Oncall card callback', () => {
     vi.stubEnv('ONCALL_SERVICE_SECRET', 'service-secret');
     await handleOncallGroupAction(event(), 'app');
     expect(fetcher).toHaveBeenCalledTimes(1);
-    expect(mocks.reply.mock.calls.at(-1)![2]).toContain('openChatId=oc_created');
+    expect(mocks.reply.mock.calls.at(-1)![2]).toContain('link_token=invite-oc_created');
   });
   it('reuses the saved result after a reply failure, including for another clicker', async () => {
     mocks.reply.mockRejectedValueOnce(new Error('reply failed'));
@@ -120,7 +122,7 @@ describe('Oncall card callback', () => {
     vi.stubEnv('ONCALL_SERVICE_SECRET', '');
     await handleOncallGroupAction(event('ou_another'), 'app');
     expect(fetcher).toHaveBeenCalledTimes(1);
-    expect(mocks.reply.mock.calls.at(-1)![2]).toContain('openChatId=oc_created');
+    expect(mocks.reply.mock.calls.at(-1)![2]).toContain('link_token=invite-oc_created');
   });
   it('deduplicates concurrent clicks and does not recreate after an uncertain result', async () => {
     let reject!: (error: Error) => void;
@@ -147,7 +149,7 @@ describe('Oncall card callback', () => {
     await handleOncallGroupAction(event('ou_another'), 'app');
     expect(fetcher).toHaveBeenCalledTimes(2);
     expect(fetcher.mock.calls[1][1].headers).toMatchObject({ Authorization: 'Bearer updated-secret', 'x-api-user': 'another' });
-    expect(mocks.reply.mock.calls.at(-1)![2]).toContain('openChatId=oc_created');
+    expect(mocks.reply.mock.calls.at(-1)![2]).toContain('link_token=invite-oc_created');
   });
   it('does not call the platform when the clicker account cannot be verified', async () => {
     mocks.sender.mockResolvedValueOnce({ email: 'clicker@other.test' });
@@ -155,4 +157,25 @@ describe('Oncall card callback', () => {
     expect(fetcher).not.toHaveBeenCalled();
     expect(mocks.reply.mock.calls.at(-1)![2]).toContain('无法确认 Oncall 账号');
   });
+});
+
+
+it('repairs a legacy non-session card for a different clicker without creating a second group',async()=>{
+  const groups=new OncallGroupStore(dir);groups.claim(source,'ou_owner');groups.finish(source,{status:'succeeded',openChatId:'oc_created'});
+  mocks.bot.config.oncallGroup.enabled=false;
+  const e=event('ou_other');e.action.value.action='oncall_group_join';
+  const result=await handleOncallGroupAction(e,'app');
+  expect(result.toast.type).toBe('success');
+  expect(mocks.update).not.toHaveBeenCalled();
+  await result.afterAck();
+  expect(mocks.sender).not.toHaveBeenCalled();expect(fetcher).not.toHaveBeenCalled();
+  const card=JSON.parse(mocks.update.mock.calls.at(-1)![2]);
+  expect(card.body.elements.at(-1).columns.at(-1).elements[0].behaviors).toEqual([{type:'open_url',default_url:groups.getRequest(source)!.inviteLink}]);
+});
+
+it('rebuilds the group invitation on a non-session card after feedback readback drops its button',()=>{
+  const groups=new OncallGroupStore(dir);groups.claim(source,'ou_owner');
+  groups.finish(source,{status:'succeeded',openChatId:'oc_created',inviteLink:'https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=invite-oc_created'});
+  const card=reconcileOncallReplyCard('app','om_reply',{schema:'2.0',body:{elements:[]}});
+  expect(card.body.elements.at(-1).columns.at(-1).elements[0].behaviors).toEqual([{type:'open_url',default_url:groups.getRequest(source)!.inviteLink}]);
 });
