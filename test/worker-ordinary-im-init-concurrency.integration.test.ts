@@ -149,6 +149,13 @@ setInterval(() => {
       writeFileSync(request, value);
       await waitFor(() => existsSync(receipt) && readFileSync(receipt, 'utf8') === value, logs);
     };
+    // Phase 1 is worker start-up, which stretches with runner load (bun first
+    // compiles src/worker.ts, then init spawns the PTY CLI): under bun-test's
+    // four-way fan-out a busy runner can spend the whole shared 8s window
+    // before the fake CLI even exists, failing with empty logs (#3371). Wait
+    // for its pid file under a load-tolerant budget first; only the file
+    // handshake then uses the fixed window, so slow start-up cannot eat it.
+    await waitFor(() => existsSync(pidDir) && readdirSync(pidDir).length > 0, logs, 25_000);
     await writeReceipt('started');
     const cliPid = Number(readdirSync(pidDir)[0]);
     expect(Number.isSafeInteger(cliPid) && cliPid > 1).toBe(true);
@@ -172,7 +179,8 @@ setInterval(() => {
       await waitFor(() => !processAlive(cliPid)
         && (child.exitCode !== null || child.signalCode !== null), logs);
     }
-  }, 20_000);
+    // The 25s start-up budget above is load-tolerant; give the whole case room.
+  }, 60_000);
 });
 
 describe('ordinary IM during real worker init', () => {
