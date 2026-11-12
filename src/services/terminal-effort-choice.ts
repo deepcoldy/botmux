@@ -41,14 +41,19 @@ function selectedMenuEffort(screen: string): CodexReasoningEffort | undefined {
   if (codex?.kind === 'effort' || codex?.kind === 'advanced') {
     return effortLabel(codex.rows.find(row => row.selected)?.label ?? '');
   }
-  const lines = screen.split(/\r?\n/);
+  const lines = screen.split(/\r?\n/).map(line => line.replace(/^\s*[│┃|]\s*/, '').replace(/\s*[│┃|]\s*$/, ''));
   let heading = -1;
   for (let i = lines.length - 1; i >= 0; i--) {
-    if (/^\s*(?:Select|Choose|Change)\s+(?:reasoning\s+)?effort(?:\s+level)?\s*[:?]?\s*$/i.test(lines[i]!)) { heading = i; break; }
+    if (/^\s*(?:(?:Select|Choose|Change)\s+(?:reasoning\s+)?effort(?:\s+level)?|Reasoning Effort|Select Reasoning Level for .+)\s*[:?]?\s*$/i.test(lines[i]!)) { heading = i; break; }
   }
   if (heading < 0 || !lines.slice(heading + 1).some(line => /enter.*(?:select|confirm|apply).*esc/i.test(line))) return;
-  const selected = lines.slice(heading + 1).flatMap(line => {
-    const match = /^\s*[❯›>●◉]\s*(?:\d+[.)]\s*)?(.+)$/.exec(line);
+  const tail = lines.slice(heading + 1);
+  if (tail.some(line => {
+    const cursor = /^\s*[❯›»>●◉▸]\s*(?:\d+[.)]\s*)?(.+)$/.exec(line);
+    return cursor && effortLabel(cursor[1]!) === undefined;
+  })) return;
+  const selected = tail.flatMap(line => {
+    const match = /^\s*[❯›»>●◉▸]\s*(?:\d+[.)]\s*)?(.+)$/.exec(line);
     return match ? [effortLabel(match[1]!)] : [];
   }).filter((value): value is CodexReasoningEffort => value !== undefined);
   return selected.length === 1 ? selected[0] : undefined;
@@ -79,7 +84,8 @@ export class TerminalEffortChoiceTracker {
     enabled: boolean; ready: boolean; screen?: string; now?: number; enableEpoch?: number; readPreference?: () => string | undefined;
   }): void {
     const now = options.now ?? Date.now();
-    if (!options.enabled || !options.ready || !supported(binding.cliId) || !binding.nativeSessionId
+    const confirmedMenu = /[\r\n]/.test(data) && options.screen ? selectedMenuEffort(options.screen) : undefined;
+    if (!options.enabled || (!options.ready && !confirmedMenu) || !supported(binding.cliId) || !binding.nativeSessionId
       || this.last && owner(this.last.binding) !== owner(binding)) {
       this.lines.delete(client); this.pending = undefined; return;
     }
@@ -101,7 +107,7 @@ export class TerminalEffortChoiceTracker {
       if (char === '\r' || char === '\n') {
         const explicit = /^\/(?:effort|reasoning|reasoning-effort)\s+(low|medium|high|xhigh|max|ultra)\s*$/i.exec(line);
         const menu = /^\/(?:effort|reasoning|reasoning-effort|model)\s*$/i.test(line);
-        const selected = !line && this.pending && options.screen ? selectedMenuEffort(options.screen) : undefined;
+        const selected = options.screen ? selectedMenuEffort(options.screen) : undefined;
         if (explicit || menu || selected) {
           if (this.last && owner(this.last.binding) === owner(binding)) {
             const expectedPreference = options.readPreference?.();
@@ -110,7 +116,7 @@ export class TerminalEffortChoiceTracker {
               expected: explicit ? explicit[1]!.toLowerCase() as CodexReasoningEffort : selected,
               before: this.last.effort, model: this.last.model, enableEpoch: options.enableEpoch ?? 0, expectedPreference };
           }
-        } else if (!(line === '' && this.pending?.expected === undefined && parseCodexEffortMenu(options.screen ?? '')?.kind === 'model')) this.pending = undefined;
+        } else if (!(line === '' && this.pending?.expected === undefined)) this.pending = undefined;
         line = '';
       } else if (char >= ' ' && char <= '~' && line.length < 160) line += char;
       else { line = ''; this.pending = undefined; }

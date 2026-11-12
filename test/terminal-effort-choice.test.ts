@@ -94,6 +94,24 @@ describe('confirmed terminal effort intent', () => {
     expect(tracker.observe({ binding, effort: 'medium', atMs: NOW }, true, 'native-settings', 3)).toBeUndefined();
   });
 
+  it.each([
+    ['traex', 'Select Reasoning Level for GPT\n  1. Low\n❯ 2. Medium\n  enter confirm | esc go back', 'native-settings'],
+    ['grok', '│ Reasoning Effort │\n│ > Medium │\n│   High │\n│ enter select · esc back │', 'native-summary'],
+  ] as const)('confirms the current %s native effort menu even without a preceding command buffer', (cliId, screen, source) => {
+    const { tracker, binding, client } = fixture(cliId);
+    tracker.input(client, '\r', binding, { enabled: true, ready: false, screen,
+      readPreference: () => '["high",null,null,null]' });
+    expect(tracker.observe({ binding, effort: 'medium', atMs: NOW }, true, source)).toMatchObject({ requestedEffort: 'medium' });
+  });
+
+  it('does not treat an effort dialog in old output above a fresh composer as a current choice', () => {
+    const { tracker, binding, client } = fixture('traex');
+    tracker.input(client, '\r', binding, { enabled: true, ready: true,
+      screen: 'Select Reasoning Level for GPT\n❯ 2. Medium\nenter confirm | esc go back\n❯ Ask anything',
+      readPreference: () => '["high",null,null,null]' });
+    expect(tracker.observe({ binding, effort: 'medium', atMs: NOW }, true, 'native-settings')).toBeUndefined();
+  });
+
   it('keeps separate clients, cancellation, multiline prose and bracketed paste out of the intent path', () => {
     const { tracker, binding, client } = fixture();
     tracker.input(client, '/effort med', binding, { enabled: true, ready: true, readPreference: () => '["high",null,null,null]' });
