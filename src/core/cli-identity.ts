@@ -669,8 +669,8 @@ const BYTEDCLI_REGIONAL_SOURCE_VAR = 'BOTMUX_IDENTITY_REGIONAL_SOURCE';
 // A turn's tickets are fixed when the turn is prepared, so a retry inside the
 // same turn gets the same answer: the hints say to send a new message.
 const BYTEDCLI_REGIONAL_MISSING_HINTS: Record<BytedcliRegionalJwtSource, string> = {
-  local: '本机为发起人签票时没有签到这个分区的票：发起人的 ByteCloud 登录可能没有该分区的权限，也可能这次签票失败。本轮内重试拿不到新票；确认有该分区权限后，稍后发一条新消息再试。',
-  platform: '平台为发起人签票时没有签出这个分区的票：发起人在平台授权的 ByteCloud 登录可能没有该分区的权限，也可能这次签票失败。本轮内重试拿不到新票；确认有该分区权限后，发一条新消息再试。',
+  local: '本机为发起人签票时没有签到这个分区的票：bytedcli 的登录按站点分开保存，本机的按人授权只登录了默认站点，发起人没在该站点另外登录过就签不出；也可能发起人没有该分区权限，或这次签票失败。可让 bot 改用平台授权（平台凭据页可为海外站点单独授权）。本轮内重试拿不到新票，处理后发一条新消息再试。',
+  platform: '平台为发起人签票时没有签出这个分区的票：海外站点要在平台凭据页单独授权，发起人可能还没授权该站点，或该站点授权已失效；也可能这次签票失败。本轮内重试拿不到新票；授权该站点后发一条新消息再试。',
   'platform-legacy': '本机绑定的平台还不签发分区票（需要升级平台），海外分区的 bytedcli 命令暂时无法以发起人身份执行。请联系平台管理员；平台升级后发一条新消息再试。',
 };
 const BYTEDCLI_REGIONAL_MISSING_DEFAULT_HINT = '请确认发起人有该分区的权限后，发一条新消息再试。';

@@ -2,13 +2,15 @@
 
 开启 trigger-user-auth 后，daemon 从触发人的独立 HOME 获取默认及区域 JWT；签票材料来自宿主按人登录目录，而包装器执行命令时使用会话 scratch 内的按人空 HOME；两者不共享 SDK 登录。包装器按 bytedcli 0.191 的读法认站点并选择对应区域，原始参数保持不变：`--site value` / `--site=value` 与等价写法 `--cloud-site`（最后一个生效），显式参数优先于 `BYTEDCLI_CLOUD_SITE`，但空的 `--site` 视为未给、由环境变量决定；取值两端的空白（含 JS `trim()` 会去掉的 Unicode 空白）被去掉后再大小写不敏感匹配。`i18n`/`i18n-bd` 选择 i18nbd，`i18n-tt`/EU 规范站点选择 i18n，US 规范站点选择 tx。区域材料不以内部变量名传给子进程；claim 不符的签票结果被丢弃。
 
-**全局站点**所在区域没有材料时，包装器**拒绝执行**（退出码 77），stderr 写明站点、所属分区和 `[reason=regional_jwt_missing]`，不会拿默认（cn）JWT 去请求该分区：分区服务对它只会回 401（使用者看到的是「用户未登录」），或者 bytedcli 因 region claim 不符跳过它、再去会话 scratch 内没有登录的按人 HOME 找，同样失败，而且掩盖了真正缺的是哪个分区的票。拒绝文案按区域材料的来源给出原因：本机签票没签到（发起人登录可能没有该分区权限，或这次签票失败）、平台没签出、或绑定的平台尚不签发分区票（需升级平台）。不涉及区域的站点（默认、`cn`、`boe` 等）照旧用默认 JWT。不会把该分区 ByteCloud JWT 发出去的调用也照常执行、不因缺票被拒：帮助与版本输出（`--help` 任意位置、命令前的 `-h` / `--version` / `-V`、没有命令）、`codebase`（用 Codebase JWT）、`meego`（用本人的 Meego 登录）——否则会话级设了海外 `BYTEDCLI_CLOUD_SITE` 时，缺票的人连这些命令都用不了。命令按 bytedcli 的 `getFirstCommandArgIndex` 找（跳过带值的根选项）；认不出的一律按需要分区票处理。
+**全局站点**所在区域没有材料时，包装器**拒绝执行**（退出码 77），stderr 写明站点、所属分区和 `[reason=regional_jwt_missing]`，不会拿默认（cn）JWT 去请求该分区：分区服务对它只会回 401（使用者看到的是「用户未登录」），或者 bytedcli 因 region claim 不符跳过它、再去会话 scratch 内没有登录的按人 HOME 找，同样失败，而且掩盖了真正缺的是哪个分区的票。拒绝文案按区域材料的来源给出原因：本机签票没签到（bytedcli 的登录按站点分开，本机按人授权只登录默认站点）、平台没签出（海外站点需在平台凭据页单独授权）、或绑定的平台尚不签发分区票（需升级平台）。不涉及区域的站点（默认、`cn`、`boe` 等）照旧用默认 JWT。不会把该分区 ByteCloud JWT 发出去的调用也照常执行、不因缺票被拒：帮助与版本输出（`--help` 任意位置、命令前的 `-h` / `--version` / `-V`、没有命令）、`codebase`（用 Codebase JWT）、`meego`（用本人的 Meego 登录）——否则会话级设了海外 `BYTEDCLI_CLOUD_SITE` 时，缺票的人连这些命令都用不了。命令按 bytedcli 的 `getFirstCommandArgIndex` 找（跳过带值的根选项）；认不出的一律按需要分区票处理。
 
 全局站点是 bytedcli 实际鉴权用的站点：命令前（同样按 `getFirstCommandArgIndex` 划界）最后一个 `--site` / `--cloud-site`，没有或为空时取 `BYTEDCLI_CLOUD_SITE`。bytedcli 开了 positional options，命令后的 `--site` 属于该子命令自己，含义因命令而异（例如 `bytecloud list-legacy-vregions --site i18n` 是在 cn 上按站点过滤），所以它不触发缺票拒绝，这类调用照旧带默认 JWT 执行；命令自己加的 `--site` 也不能盖掉全局站点的拒绝（`--site i18n-tt <cmd> --site i18n` 按 i18n-tt 判定并点名 i18n 分区）。换哪张票仍按上面「最后一个 `--site`、不分位置」的规则，保持 #2472 的行为：像 nac 这样用自己的 `--site` 决定鉴权站点的命令，持票时照旧拿到对应分区的票。
 
 ### 平台供票
 
 机器绑定平台后，bytedcli 的 grant 请求体带 `cloudJwtRegions: ["i18n","i18nbd","tx"]`，声明本 daemon 能消费的分区。支持分区票的平台在同一次 grant 里、用同一人（同一 union_id）的同一份授权归档签出各分区的票，放在 `variables` 的 `BYTEDCLI_USER_CLOUD_JWT_I18N` / `_I18NBD` / `_TX`（签到才有），并在响应顶层回 `cloudJwtRegions` 表示实际尝试过的分区。daemon 只接受 region claim 与所在分区一致的票，发布方式与本机签的区域票相同；团队、同意、审计检查与默认票完全共用，不新增信任面。
+
+平台侧每个海外站点单独授权、单独保存一份登录（默认站点的登录签不出海外分区的票），签票时与默认票同一次 grant 下发。
 
 兼容：分区变量必须由请求声明后才能下发——旧版 daemon 的 grant 白名单遇到任何未知变量会把整张 grant 判为无效，等于让该人失去 bytedcli 授权。旧版平台只读自己认识的请求字段，照旧只回默认票；daemon 收不到 `cloudJwtRegions` 回执，就把缺票原因写成「绑定的平台尚不签发分区票」。平台签发的材料不进入本地续期器（见下）。
 
