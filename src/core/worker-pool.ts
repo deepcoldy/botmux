@@ -3743,7 +3743,7 @@ function sessionAgentConfig(
     const legacyPath = selected.cliPathOverride ?? undefined;
     const wrapperCli = selected.wrapperCli ?? undefined;
     const cliLaunchMode = selected.cliLaunchMode ?? undefined;
-    const reasoningEffort = selected.reasoningEffort ?? groupEffort;
+    let reasoningEffort = selected.reasoningEffort ?? groupEffort;
     const modelBackendVariant = isBackendVariantCliId(selected.cliId)
       ? selected.modelBackendVariant ?? undefined
       : undefined;
@@ -3771,6 +3771,18 @@ function sessionAgentConfig(
     const modelChoice = resolveSessionLaunchModelChoice(ds, botCfg);
     const model = modelChoice.model;
     recordLaunchModel(ds, model);
+    // Newly saved native-catalog receipts have the same cold-launch fence on
+    // both storage paths. Keep legacy /cli snapshots unchanged when there is
+    // no writeback receipt, and leave modelPin's existing authority intact.
+    if (selected.cliId === 'grok' && reasoningEffort === 'xhigh'
+        && ds.session.terminalEffortPreferenceEdit?.nativeEffort === 'xhigh'
+        && !cliModelSupportsReasoningEffort(selected.cliId, model, reasoningEffort)
+        && !(config.terminalEffortWriteback && hasConfirmedNativeGrokEffort(ds.session, model))) {
+      ds.session.reasoningEffort = undefined;
+      selected.reasoningEffort = undefined;
+      reasoningEffort = undefined;
+      sessionStore.updateSession(ds.session);
+    }
     // A per-session `/cli` selection launches the stock CLI: like bot env (rejected
     // above), the bot's config profile belongs to the bot's own CLI, not the
     // selected one. ds.session.cliConfigDir stays unset for these sessions.

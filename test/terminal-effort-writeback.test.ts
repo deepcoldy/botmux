@@ -10,6 +10,11 @@ import { terminalEffortPreferenceKey, type TerminalEffortChoice } from '../src/s
 import { resolveSessionLaunchEffort } from '../src/core/session-model.js';
 import { createClaudeCodeAdapter } from '../src/adapters/cli/claude-code.js';
 import { loadWorkerPoolMessageHandlers } from './helpers/worker-pool-message-harness.js';
+import { loadWorkerPoolFunction } from './helpers/worker-pool-function-harness.js';
+import { resolveSessionLaunchModelChoice } from '../src/core/session-model.js';
+import { resolveCliRuntime, snapshotCliRuntime, runtimePathOverride } from '../src/adapters/cli/runtime.js';
+import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId } from '../src/services/codex-reasoning-effort.js';
+import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { applyClaudeEffortObservation } from '../src/core/claude-effort-observation.js';
 import { applyNativeReasoningObservation } from '../src/core/native-reasoning-observation.js';
 import { ClaudeEffortObserver } from '../src/services/claude-effort-observer.js';
@@ -74,6 +79,39 @@ describe('terminal effort persistence', () => {
     expect(hasConfirmedNativeGrokEffort(restored, restored.model)).toBe(true);
     expect(hasConfirmedNativeGrokEffort(restored, 'grok-other')).toBe(false);
     expect(hasConfirmedNativeGrokEffort({ ...restored, cliSessionId: 'other' }, restored.model)).toBe(false);
+  });
+
+  it.each([false, true])('fences newly confirmed Grok xhigh at the actual cold launch, snapshot=%s', snapshot => {
+    const f = fixture('grok');
+    Object.assign(f.row, { model: 'grok-4.7-build-fast', cliRuntime: snapshotCliRuntime(resolveCliRuntime({ cliId: 'grok' })) });
+    if (snapshot) f.row.cliLaunchSnapshot = { cliId: 'grok', cliRuntime: f.row.cliRuntime, state: 'resolved', reasoningEffort: 'high', startupCommands: [] } as any;
+    store.updateSession(f.row); f.state.session = structuredClone(f.row); f.state.activeModel = f.row.model;
+    const choice = { ...f.selection, model: f.row.model, requestedEffort: 'xhigh' as const, expectedPreference: terminalEffortPreferenceKey(f.row) };
+    expect(persistTerminalEffortChoice(f.state, { ...f.observation, model: f.row.model, reasoningEffort: 'xhigh', userSelection: choice },
+      f.source, { ...f.options, supportsEffort: () => false })).toBe(true);
+    store.init(APP); const saved = structuredClone(store.getSession(f.row.sessionId)!);
+    function cold(enabled: boolean, model = saved.model, pin?: Session['modelPin']) {
+      const ds = { session: { ...structuredClone(saved), ...(pin ? { modelPin: pin } : {}) } };
+      const scope: Record<string, any> = { config: { terminalEffortWriteback: enabled }, sessionStore: { updateSession: store.updateSession },
+        resolveSessionGroupSettings: () => ({}), resolveCliRuntime, snapshotCliRuntime, runtimePathOverride,
+        isBackendVariantCliId, isConfigurableReasoningCliId, resolveSessionLaunchModelChoice, resolveSessionLaunchEffort,
+        hasConfirmedNativeGrokEffort, cliModelSupportsReasoningEffort, recordCodexModelLaunch: () => false,
+        refreshNativeCodexModel: () => false, cliSupportsConfigDir: () => false, RPC_CAPABLE_CLIS: new Set(['codex', 'traex']) };
+      scope.recordLaunchModel = loadWorkerPoolFunction('recordLaunchModel', scope);
+      scope.sessionServiceTier = loadWorkerPoolFunction('sessionServiceTier', scope);
+      const cfg = loadWorkerPoolFunction('sessionAgentConfig', scope)(ds, { cliId: 'grok', model });
+      const args = createGrokAdapter('/fake/grok').buildArgs({ sessionId: saved.sessionId, resume: true,
+        resumeSessionId: saved.cliSessionId, model: cfg.model, reasoningEffort: cfg.reasoningEffort } as any);
+      return { args, cfg, session: ds.session };
+    }
+    expect(cold(true).args).toContain('xhigh');
+    const off = cold(false); expect(off.args).not.toContain('xhigh');
+    expect(off.session.reasoningEffort).toBeUndefined();
+    if (snapshot) expect(off.session.cliLaunchSnapshot?.reasoningEffort).toBeUndefined();
+    expect(cold(true, 'grok-4.5').args).not.toContain('xhigh');
+    const pin: NonNullable<Session['modelPin']> = { model: saved.model!, effort: 'high', source: 'command', setBy: 'fixture', setAt: new Date(NOW).toISOString() };
+    store.mutateOwnedSessionsAtomically([saved.sessionId], rows => { rows.get(saved.sessionId)!.modelPin = pin; }, { modelPinWrite: true });
+    expect(cold(true, saved.model, pin).cfg.reasoningEffort).toBe('high');
   });
 
   it('off means no disk write, including an otherwise valid selection', () => {
