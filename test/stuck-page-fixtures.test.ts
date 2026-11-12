@@ -191,9 +191,35 @@ describe('Kimi Code cache-expiry menu (kimi family) over real captures', () => {
     (screen: string) => screen.replace('↑↓ navigate · Enter select · Esc cancel', 'Press enter to continue'),
     (screen: string) => screen.replace('Cache expired — the next message', 'The docs say: Cache expired — the next message'),
     (screen: string) => screen.split('\n').map(row => `> ${row}`).join('\n'),
+    // The title row anchor: rewording it must break the match.
+    (screen: string) => screen.replace(/^.*This session has been idle.*$/m, ' This session was idle for a while.'),
+    // The blank row between the hint and the body is part of the block.
+    (screen: string) => screen.replace('Esc cancel\n\n  Cache expired', 'Esc cancel\n  Cache expired'),
   ])('does not recognise quoted, incomplete or reworded menus %#', change => {
     const screen = change(fixture('kimi-2.5.3-cache-expiry-idle-submit.txt'));
     expect(classifyStuckPage(screen, 'kimi')).toBeUndefined();
+  });
+
+  it('a menu quoted above the live composer is not recognised through the xterm text form either', async () => {
+    // capture-pane keeps the composer's box borders (covered by the raw case
+    // above); the worker's PTY renderer blanks them, so the quoted block is
+    // left with only its `>` input row plus the two live status rows below —
+    // which passes the footer row bound unless the composer input row is
+    // rejected. The quoted block is the menu's two rules and what is between
+    // them; the live screen's own status chrome is not part of that quote.
+    const fixtureRows = fixture('kimi-2.5.3-cache-expiry-idle-submit.txt').replace(/\s+$/, '').split('\n');
+    const ruleRows = fixtureRows.map((row, i) => (/^\s*─{8,}\s*$/.test(row) ? i : -1)).filter(i => i >= 0);
+    const quotedBlock = fixtureRows.slice(ruleRows[0], ruleRows[1]! + 1).join('\n');
+    const quoted = `${quotedBlock}\n ╭${'─'.repeat(156)}╮\n │ >${' '.repeat(155)}│\n ╰${'─'.repeat(156)}╯\n Never Ask  K3  /tmp/kimi-cache-probe\n context: 1% (201/256k)`;
+    const renderer = new TerminalRenderer(160, 50);
+    try {
+      await renderer.writeAndFlush(quoted.split('\n').join('\r\n'));
+      const xtermText = renderer.rawSnapshot();
+      expect(classifyStuckPage(xtermText, 'kimi')).toBeUndefined();
+      expect(matchKimiCacheExpiryMenu(xtermText)).toBeUndefined();
+    } finally {
+      renderer.dispose();
+    }
   });
 
   it('two pointers (a mid-redraw frame) is not read as the default row', () => {

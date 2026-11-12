@@ -66,6 +66,14 @@ const TITLE = /^\s*This session has been idle for \S/;
 const HINT = /^\s*↑↓ navigate · Enter select · Esc cancel\s*$/;
 const BODY = /^\s*Cache expired — the next message\b/;
 const SELECT_POINTER = '❯';
+/** A live composer input row: its ASCII `>` prompt, with the box border and
+ *  leading `│` blanked by the xterm text form. The live cache-expiry menu
+ *  REPLACES the composer, so such a row below the block means the block is a
+ *  menu QUOTED in the transcript (e.g. an answer describing the menu), not the
+ *  live menu. On a PTY screen the xterm text leaves only this row plus the
+ *  1–2 status rows, which otherwise passes the footer bound. The menu's own
+ *  pointer is ❯ (U+276F), never ASCII `>`. */
+const COMPOSER_INPUT_ROW = /^\s*│?\s*>/;
 const OPTION_ROWS: ReadonlyArray<readonly [KimiCacheExpiryChoice, RegExp]> = [
   ['compact', /^\s*(❯\s+)?Compact and continue(?:\s+\S.*)?$/],
   ['new', /^\s*(❯\s+)?Start a new session(?:\s+\S.*)?$/],
@@ -107,6 +115,12 @@ export function matchKimiCacheExpiryMenu(snapshot: string): KimiCacheExpiryMenu 
     }
     if (rows[b + 5]!.trim() !== '' || !isRuleRow(rows[bottom]!)) return undefined;
     const below = rows.slice(bottom + 1).filter(row => row.trim() !== '');
+    // A composer input row below the block: the live menu replaces the
+    // composer, so this is the same menu text quoted in the transcript — never
+    // the live menu (its `>` would not be there). Checked before the footer
+    // bound: the xterm text form blanks the composer's box borders, leaving
+    // the input row plus only the 1–2 status rows.
+    if (below.some(row => COMPOSER_INPUT_ROW.test(row))) return undefined;
     if (below.length > MAX_FOOTER_ROWS) return undefined;
     return {
       highlighted: pointers === 1 ? highlighted : undefined,

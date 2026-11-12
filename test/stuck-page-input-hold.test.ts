@@ -428,6 +428,17 @@ describe('a held message raises the stuck card', () => {
     expect(h.sent[0].message).toContain('TRAE CLI (traex)');
   });
 
+  it('a Kimi hold on a non-authoritative screen names the cache-expiry menu, not the Codex hook menu', () => {
+    const h = harness('kimi', { screen: KIMI_MENU, authoritative: false, pending: [{ turnId: 't' }] });
+    h.fn('refreshHookReviewInputHold')(KIMI_MENU);
+    expect(h.scope.hookReviewInputHold).toBe(true);
+    h.fn('notifyHookReviewInputHold')();
+    expect(h.sent).toHaveLength(1);
+    expect(h.sent[0].type).toBe('user_notify');
+    expect(h.sent[0].message).toContain('缓存过期');
+    expect(h.sent[0].message).not.toContain('Hook');
+  });
+
   it('a CLI without the declaration never gets a key card', () => {
     const h = harness('claude-code', { screen: CODEX_L2, pending: [{ turnId: 't' }] });
     h.fn('refreshHookReviewInputHold')(CODEX_L2);

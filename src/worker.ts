@@ -4519,12 +4519,18 @@ function notifyHookReviewInputHold(freshScreen?: string): void {
     });
     return;
   }
+  // The screen is not authoritative enough to name the classified page (e.g.
+  // a ZMX history snapshot): the hold still protects the queued input, but the
+  // notice must name this CLI's own blocking page, never the Codex hook menu.
+  const holdNotice = cliAdapter?.stuckPageFamily === 'kimi'
+    ? `⚠️ ${cliName()} 正在显示「缓存过期」选择菜单。为避免消息被菜单吞掉或误选选项，`
+      + 'BotMux 已暂存后续消息；请先在 Web 终端完成选择，恢复普通输入框后会自动投递。'
+    : `⚠️ ${cliName()} 正在显示 Hook 审核菜单。为避免消息误触“Trust all”或被菜单吞掉，`
+      + 'BotMux 已暂存后续消息；请先在终端完成 Hook 选择，恢复普通输入框后会自动投递。';
   send({
     type: 'user_notify',
     turnId: currentBotmuxTurnId,
-    message:
-      `⚠️ ${cliName()} 正在显示 Hook 审核菜单。为避免消息误触“Trust all”或被菜单吞掉，`
-      + 'BotMux 已暂存后续消息；请先在终端完成 Hook 选择，恢复普通输入框后会自动投递。',
+    message: holdNotice,
   });
 }
 
