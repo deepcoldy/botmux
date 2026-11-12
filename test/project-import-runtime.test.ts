@@ -112,11 +112,10 @@ describe('project import runtime wiring', () => {
     expect(readdirSync(f.dataDir)).toEqual([]);
   });
 
-  it.each(['standard', 'no-project', 'not-worker', 'different-main'])(
+  it.each(['standard', 'not-worker', 'different-main'])(
     'does not recover or notify an ineligible project: %s', async kind => {
       const f = fixture();
       if (kind === 'standard') f.setMode({ ...f.mode(), mode: 'standard' });
-      if (kind === 'no-project') f.setProject(undefined);
       if (kind === 'not-worker') f.setMode({ ...f.mode(), workerAppIds: [] });
       if (kind === 'different-main') f.setProject({ ...f.project(), larkAppId: 'cli_other' });
       await f.runtime.tick();
@@ -125,6 +124,24 @@ describe('project import runtime wiring', () => {
       expect(f.markEnqueued).toHaveBeenCalledWith(f.sessions()[0], 'skipped');
     },
   );
+
+  it('defaults to notify and bootstraps coordinator when group is in project mode without an initialized project', async () => {
+    const f = fixture();
+    f.setProject(undefined);
+    f.setMode({ ...f.mode(), importedSessionPolicy: 'ignore' });
+    expect(await f.runtime.tick()).toMatchObject({ recovered: 1, delivered: 1 });
+    expect(f.markEnqueued).toHaveBeenCalledWith(f.sessions()[0], 'queued');
+    const coordCall = f.fetchIpc.mock.calls.find(([, path]) => path === PROJECT_IMPORT_COORDINATORS_ROUTE);
+    expect(coordCall).toBeDefined();
+    expect(JSON.parse(String(coordCall![2]?.body))).toEqual({
+      chatId: 'oc_project',
+      coordinatorLarkAppId: 'cli_main',
+      ensureUninitializedCoordinator: true,
+    });
+    const deliverCall = f.fetchIpc.mock.calls.find(([, path]) => path === PROJECT_IMPORT_DELIVER_ROUTE);
+    expect(deliverCall).toBeDefined();
+    expect(JSON.parse(String(deliverCall![2]?.body)).notification.projectGeneration).toBe('__uninitialized__');
+  });
 
   it('does not rediscover arbitrary historical imports without a pending marker', async () => {
     const f = fixture();

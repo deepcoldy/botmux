@@ -6920,7 +6920,10 @@ async function cmdProject(argv: string[]): Promise<void> {
   botmux project resume [--phase <阶段>] [--focus <当前焦点>]
   botmux project workstream inspect --root <om_root> --source-app <cli_app> --source-session <id>
   botmux project workstream attach --root <om_root> --source-app <cli_app> --source-session <id>
-                                  --title <24字内标题> [--purpose <说明>] [--revision <n>] [--grant <id>]
+                                  --title <24字内标题> [--purpose <说明>] [--revision <n>]
+                                  [--grant <id> | --claim-owner]
+  botmux project workstream confirm --root <om_root> --source-app <cli_app> --source-session <id>
+                                   [--title <24字内标题>] [--purpose <说明>]
   botmux project workstream rename --root <om_root> --title <24字内标题>
   botmux project workstream update --root <om_root> --status <任务状态> [--content <说明>]
   botmux project workstream status [--root <om_root>]
@@ -6965,9 +6968,10 @@ async function cmdProject(argv: string[]): Promise<void> {
     'workstream' in parsed ? parsed.workstream : parsed.action as unknown as Record<string, unknown>,
   );
   if ('workstream' in parsed) {
-    const result = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; result?: unknown; grantId?: string };
+    const result = await response.json().catch(() => ({})) as { ok?: boolean; error?: string; hint?: string; result?: unknown; grantId?: string };
     if (!response.ok || !result.ok) {
-      console.error(`workstream 操作失败: ${result.error ?? response.status}`);
+      const hintLine = typeof result.hint === 'string' && result.hint ? `\n提示: ${result.hint}` : '';
+      console.error(`workstream 操作失败: ${result.error ?? response.status}${hintLine}`);
       process.exitCode = 1;
     } else console.log(JSON.stringify(result.result ?? result, null, 2));
     return;

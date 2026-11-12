@@ -11,12 +11,14 @@ export { projectImportSnapshotFromSource } from './project-import-snapshot.js';
 import {
   createProjectImportNotifications,
   projectImportOperationId,
+  UNINITIALIZED_PROJECT_GENERATION,
   type ProjectImportCoordinator,
   type ProjectImportNotification,
   type ProjectImportNotificationRuntime,
   type ProjectImportPolicy,
   type ProjectImportSource,
 } from './project-import-notifications.js';
+import { effectiveProjectImportPolicy } from '../core/project-session-association-events.js';
 
 export const PROJECT_IMPORT_DELIVER_ROUTE = '/api/project-import/deliver';
 export const PROJECT_IMPORT_COORDINATORS_ROUTE = '/api/project-workstream/coordinators';
@@ -43,7 +45,7 @@ export interface ProjectImportRuntimeDeps {
   dataDir: string;
   getMode(chatId: string): GroupCollaborationModeConfig | undefined;
   getProject(chatId: string): ProjectGroupState | undefined;
-  getSource(appId: string, sessionId: string): Promise<ProjectImportRuntimeSource | undefined>;
+  getSource(appId: string, sessionId: string): Promise<ProjectAttachmentSource & { chatType?: 'group' | 'p2p' } | undefined>;
   listRecoverableSessions(): readonly ProjectImportRecoverableSession[];
   /** Compare-and-set clear the SAME source revision after durable enqueue, or
    * after explicit disable; never clear a newer migration's pending marker. */
@@ -51,6 +53,8 @@ export interface ProjectImportRuntimeDeps {
   /** The local daemon may have the exact coordinator in memory. This is not a
    * fallback to another arbitrary chat session. */
   localCoordinator(sessionId: string): ProjectImportCoordinator | undefined;
+  /** Optional local resolver/bootstrapper for an uninitialized project group's chat coordinator. */
+  localUninitializedCoordinator?(chatId: string, appId: string): Promise<ProjectImportCoordinator | undefined> | ProjectImportCoordinator | undefined;
   findDaemon(appId: string): { ipcPort: number } | undefined;
   fetchIpc(port: number, path: string, init?: RequestInit): Promise<Response>;
   now?(): number;
@@ -94,10 +98,12 @@ export function createProjectImportRuntime(deps: ProjectImportRuntimeDeps): Proj
     const mode = deps.getMode(chatId);
     if (!mode) return;
     const project = deps.getProject(chatId);
+    const projectExists = !!project && project.larkAppId === mode.coordinatorAppId;
     return {
-      mode: mode.mode, importedSessionPolicy: mode.importedSessionPolicy ?? 'ignore',
-      projectExists: !!project && project.larkAppId === mode.coordinatorAppId,
-      projectGeneration: project?.createdAt ?? '',
+      mode: mode.mode,
+      importedSessionPolicy: effectiveProjectImportPolicy(mode, project),
+      projectExists,
+      projectGeneration: projectExists ? project.createdAt : (!project ? UNINITIALIZED_PROJECT_GENERATION : ''),
       coordinatorAppId: mode.coordinatorAppId,
       workerAppIds: mode.workerAppIds ?? [],
     };
@@ -109,18 +115,26 @@ export function createProjectImportRuntime(deps: ProjectImportRuntimeDeps): Proj
   async function coordinators(chatId: string, appId: string): Promise<ProjectImportCoordinator[]> {
     const project = deps.getProject(chatId);
     const mode = deps.getMode(chatId);
-    if (!project || mode?.mode !== 'project' || mode.coordinatorAppId !== appId
-      || project.larkAppId !== appId) return [];
-    const local = deps.localCoordinator(project.coordinatorSessionId);
-    if (local) return local.larkAppId === appId && local.chatId === chatId
-      && local.sessionId === project.coordinatorSessionId && local.scope === 'chat'
-      && local.status === 'active' ? [local] : [];
+    if (mode?.mode !== 'project' || mode.coordinatorAppId !== appId) return [];
+    if (project && project.larkAppId !== appId) return [];
+    if (project) {
+      const local = deps.localCoordinator(project.coordinatorSessionId);
+      if (local) return local.larkAppId === appId && local.chatId === chatId
+        && local.sessionId === project.coordinatorSessionId && local.scope === 'chat'
+        && local.status === 'active' ? [local] : [];
+    } else if (deps.localUninitializedCoordinator) {
+      const local = await deps.localUninitializedCoordinator(chatId, appId);
+      if (local) return local.larkAppId === appId && local.chatId === chatId
+        && local.scope === 'chat' && local.status === 'active' ? [local] : [];
+    }
     const daemon = deps.findDaemon(appId);
     if (!daemon) return [];
     try {
       const response = await deps.fetchIpc(daemon.ipcPort, PROJECT_IMPORT_COORDINATORS_ROUTE, {
         method: 'POST', headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ chatId, coordinatorLarkAppId: appId, coordinatorSessionId: project.coordinatorSessionId }),
+        body: JSON.stringify(project
+          ? { chatId, coordinatorLarkAppId: appId, coordinatorSessionId: project.coordinatorSessionId }
+          : { chatId, coordinatorLarkAppId: appId, ensureUninitializedCoordinator: true }),
         signal: AbortSignal.timeout(5_000),
       });
       if (!response.ok) return [];
@@ -129,7 +143,9 @@ export function createProjectImportRuntime(deps: ProjectImportRuntimeDeps): Proj
       // Never let an old/faulty peer select a different session or destination.
       return body.coordinators.filter((c): c is ProjectImportCoordinator => !!c
         && typeof c === 'object' && !Array.isArray(c)
-        && c.sessionId === project.coordinatorSessionId && c.larkAppId === appId
+        && typeof c.sessionId === 'string' && ID.test(c.sessionId)
+        && (!project || c.sessionId === project.coordinatorSessionId)
+        && c.larkAppId === appId
         && c.chatId === chatId && c.scope === 'chat' && c.status === 'active')
         .map(c => ({ sessionId: c.sessionId, larkAppId: c.larkAppId, chatId: c.chatId, scope: c.scope, status: c.status }));
     } catch { return []; }
@@ -193,7 +209,8 @@ export function createProjectImportRuntime(deps: ProjectImportRuntimeDeps): Proj
       const effective = policy(session.chatId);
       // Fast gate before querying another daemon or resolving source owner.
       if (effective?.mode !== 'project' || effective.importedSessionPolicy !== 'notify'
-        || !effective.projectExists || !effective.workerAppIds?.includes(session.larkAppId)) {
+        || (!effective.projectExists && effective.projectGeneration !== UNINITIALIZED_PROJECT_GENERATION)
+        || !effective.workerAppIds?.includes(session.larkAppId)) {
         deps.markEnqueued?.(session, 'skipped');
         continue;
       }

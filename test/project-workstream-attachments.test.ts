@@ -106,14 +106,18 @@ describe('project workstream attachments', () => {
     expect(readProjectAttachmentRecord(f.dataDir, 'oc_group', 'om_topic')?.revision).toBe(1);
   });
 
-  it.each([
-    { ownerKey: undefined },
-    { ownerKey: 'union:on_other' },
-  ])('requires source-owner authorization', async patch => {
-    const f = await fixture();
-    Object.assign(f.source(), patch);
-    await expect(f.service.attach(f.actor, f.request)).rejects.toThrow('source_owner_authorization_required');
-    expect(readProjectGroup(f.dataDir, 'oc_group')?.workstreams).toHaveLength(0);
+  it('distinguishes ownerless source (source_owner_unknown) from foreign owner (source_owner_authorization_required)', async () => {
+    const ownerless = await fixture();
+    ownerless.source().ownerKey = undefined;
+    await expect(ownerless.service.inspect(ownerless.actor, ownerless.request)).rejects.toThrow('source_owner_unknown');
+    await expect(ownerless.service.attach(ownerless.actor, ownerless.request)).rejects.toThrow('source_owner_unknown');
+    expect(readProjectGroup(ownerless.dataDir, 'oc_group')?.workstreams).toHaveLength(0);
+
+    const foreign = await fixture();
+    foreign.source().ownerKey = 'union:on_other';
+    await expect(foreign.service.inspect(foreign.actor, foreign.request)).rejects.toThrow('source_owner_authorization_required');
+    await expect(foreign.service.attach(foreign.actor, foreign.request)).rejects.toThrow('source_owner_authorization_required');
+    expect(readProjectGroup(foreign.dataDir, 'oc_group')?.workstreams).toHaveLength(0);
   });
 
   it('accepts a host-proved scoped source-owner consent, not actor JSON', async () => {

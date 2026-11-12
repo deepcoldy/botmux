@@ -2412,3 +2412,89 @@ export async function triggerSessionTurn(
   }
   return result;
 }
+
+/**
+ * Resolve or create a dormant ordinary-group `chat`-scope coordinator session
+ * when a session is relayed/adopted into an uninitialized project group before
+ * anyone has spoken to the coordinator at top level.
+ */
+export async function ensureChatCoordinatorSessionForImport(input: {
+  larkAppId: string;
+  chatId: string;
+  activeSessions: Map<string, DaemonSession>;
+  ownerOpenId?: string;
+  ownerUnionId?: string;
+}): Promise<DaemonSession | undefined> {
+  const key = sessionKey(input.chatId, input.larkAppId);
+  const existing = input.activeSessions.get(key);
+  if (existing) {
+    return existing.session.status === 'active'
+      && existing.scope === 'chat'
+      && existing.chatId === input.chatId
+      && existing.larkAppId === input.larkAppId
+      && !existing.session.vcMeetingReceiver
+      ? existing
+      : undefined;
+  }
+  const wd = resolveWorkingDir(input.larkAppId, input.chatId);
+  if (!wd.ok) return undefined;
+  const bot = getBot(input.larkAppId);
+  const configuredOwner = bot.config.ownerOpenId && /^ou_[A-Za-z0-9_-]{1,128}$/u.test(bot.config.ownerOpenId)
+    ? bot.config.ownerOpenId
+    : undefined;
+  const effectiveOwnerOpenId = input.ownerOpenId ?? configuredOwner;
+  return withActiveSessionKeyLock(input.activeSessions, key, () => {
+    const current = input.activeSessions.get(key);
+    if (current) {
+      return current.session.status === 'active'
+        && current.scope === 'chat'
+        && current.chatId === input.chatId
+        && current.larkAppId === input.larkAppId
+        && !current.session.vcMeetingReceiver
+        ? current
+        : undefined;
+    }
+    const session = sessionStore.createSession(
+      input.chatId,
+      input.chatId,
+      '[项目主控] 迁入会话初始化',
+      'group',
+      'chat',
+      { source: 'http' },
+    );
+    const now = Date.now();
+    const nowIso = new Date(now).toISOString();
+    session.larkAppId = input.larkAppId;
+    session.scope = 'chat';
+    if (input.ownerUnionId) session.ownerUnionId = input.ownerUnionId;
+    if (effectiveOwnerOpenId) {
+      session.ownerOpenId = effectiveOwnerOpenId;
+      session.lastCallerOpenId = effectiveOwnerOpenId;
+    }
+    session.lastMessageAt = nowIso;
+    session.workingDir = wd.workingDir;
+    session.cliId = bot.config.cliId;
+    sessionStore.updateSession(session);
+    messageQueue.ensureQueue(input.chatId);
+    const newDs: DaemonSession = {
+      session,
+      worker: null,
+      workerPort: null,
+      workerToken: null,
+      larkAppId: input.larkAppId,
+      chatId: input.chatId,
+      chatType: 'group',
+      scope: 'chat',
+      spawnedAt: Date.parse(session.createdAt) || now,
+      cliVersion: getCurrentCliVersion(),
+      lastMessageAt: now,
+      hasHistory: false,
+      workingDir: wd.workingDir,
+    };
+    if (!setActiveSessionIfActive(input.activeSessions, key, newDs)) {
+      try { sessionStore.closeSession(session.sessionId); } catch { /* ignore */ }
+      return undefined;
+    }
+    return newDs;
+  });
+}

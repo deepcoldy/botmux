@@ -1,9 +1,11 @@
 import { config } from '../config.js';
+import { getBot } from '../bot-registry.js';
 import type { DaemonSession } from '../core/types.js';
 import * as sessionStore from './session-store.js';
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { fetchDaemonIpc } from '../core/daemon-ipc-auth.js';
-import { resolveUnionIdFromOpenIdStrict, lookupMessageChatId } from '../im/lark/client.js';
+import { resolveUnionIdFromOpenIdStrict, lookupMessageChatId, resolveTargetAppOpenId } from '../im/lark/client.js';
+import { getIdentity } from '../im/lark/identity-cache.js';
 import { readGroupCollaborationMode } from './group-collaboration-mode-store.js';
 import { readProjectGroup } from './project-group-store.js';
 import { projectCoordinator } from './project-coordinator-runtime.js';
@@ -14,6 +16,11 @@ import { safeTextPreview } from './insight/safe-detail.js';
 import type { TrustedCaller, Session } from '../types.js';
 import { getBinding } from './issue-board-store.js';
 import { verifyDispatchReportBinding } from '../core/dispatch-report-binding.js';
+import { readAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
+import { isTeamBot } from './team-bots-store.js';
+import { isPlatformTeamBot } from './platform-team-store.js';
+import { noteProjectAssociationChanged } from '../core/project-session-association-events.js';
+import { logger } from '../utils/logger.js';
 
 export interface ProjectWorkstreamPool {
   findActiveBySessionId(sessionId: string): DaemonSession | undefined;
@@ -161,6 +168,8 @@ export async function localProjectAttachmentSource(appId: string, sessionId: str
     reportCapability: latest.adoptedFrom ? 'manual'
       : latest.pendingForkSession || !latest.cliSessionId || !latestLive ? 'unavailable' : 'verified',
     title: safeTextPreview(latest.title, 80)?.text,
+    recentSummary: safeTextPreview(latestLive?.currentTurnTitle || latest.nativeSessionTitle, 80)?.text,
+    botName: resolveSourceBotDisplayName(appId),
   };
 }
 
@@ -179,8 +188,262 @@ export async function getProjectAttachmentSource(appId: string, sessionId: strin
   return body?.source?.sessionId === sessionId && body.source.larkAppId === appId ? body.source : undefined;
 }
 
+const HOST_CARD_CALLBACK_ACTOR = Symbol('hostCardCallbackActor');
+const UNION_ID_RE = /^on_[A-Za-z0-9_-]{1,128}$/u;
+const OPEN_ID_RE = /^ou_[A-Za-z0-9_-]{1,128}$/u;
+const APP_ID_RE = /^cli_[A-Za-z0-9_-]{1,128}$/u;
+const CHAT_ID_RE = /^oc_[A-Za-z0-9_-]{1,128}$/u;
+const ROOT_ID_RE = /^om_[A-Za-z0-9_-]{1,128}$/u;
+
+function tryGetBot(appId: string): ReturnType<typeof getBot> | undefined {
+  try { return getBot(appId); } catch { return undefined; }
+}
+
+function hasConfiguredBotAllowlist(bot: ReturnType<typeof getBot>): boolean {
+  return (bot.config.allowedUsers?.length ?? 0) > 0
+    || (bot.config.allowedChatGroups?.length ?? 0) > 0
+    || (bot.config.globalGrants?.length ?? 0) > 0
+    || !!bot.config.ownerOpenId
+    || bot.config.p2pOpen === true;
+}
+
+/** Human-only operator gate matching event-dispatcher canOperate without its bot-union legs. */
+export function canHumanOperateBot(larkAppId: string, humanOpenId: string | undefined): boolean {
+  const bot = tryGetBot(larkAppId);
+  if (!bot) return false;
+  if (humanOpenId && bot.resolvedAllowedUsers.includes(humanOpenId)) return true;
+  if (humanOpenId && bot.resolvedBlockedUsers.includes(humanOpenId)) return false;
+  return !hasConfiguredBotAllowlist(bot);
+}
+
+export function resolveSourceBotDisplayName(appId: string, dataDir = config.session.dataDir): string {
+  const local = tryGetBot(appId)?.botName?.trim();
+  if (local) return local;
+  const peer = findOnlineDaemon(appId, dataDir)?.botName?.trim();
+  return peer || appId;
+}
+
+/** Non-serializable host proof used only by verified Feishu card callbacks in-daemon. */
+export function markHostCardCallbackActor(actor: ProjectAttachmentActor): ProjectAttachmentActor {
+  Object.defineProperty(actor, HOST_CARD_CALLBACK_ACTOR, {
+    value: true,
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  return actor;
+}
+
+export interface ClaimOwnerlessProjectSourceInput {
+  sourceLarkAppId: string;
+  sourceSessionId: string;
+  chatId: string;
+  rootMessageId: string;
+  expectedRouteRevision?: number;
+  claimantUnionId: string;
+  claimantLarkAppId: string;
+  claimantOpenId: string;
+  via: 'human_turn_attach' | 'topic_card_confirm';
+}
+
+export type ClaimOwnerlessProjectSourceResult =
+  | { ok: true; alreadyClaimed: boolean; source: ProjectAttachmentSource }
+  | { ok: false; error: string };
+
+export async function resolveHumanOpenIdOnApp(
+  targetLarkAppId: string,
+  humanUnionId: string,
+): Promise<string | undefined> {
+  if (!APP_ID_RE.test(targetLarkAppId) || !UNION_ID_RE.test(humanUnionId)) return undefined;
+  const direct = await resolveTargetAppOpenId(targetLarkAppId, humanUnionId).catch(() => undefined);
+  if (direct?.status === 'resolved' && OPEN_ID_RE.test(direct.openId)) {
+    return direct.openId;
+  }
+  const cached = readAllowedUsersResolveCache(config.session.dataDir, targetLarkAppId)[humanUnionId];
+  if (cached && OPEN_ID_RE.test(cached)) return cached;
+  try {
+    const matches = [...new Set(
+      sessionStore.listSessions()
+        .filter(s => s.larkAppId === targetLarkAppId && s.ownerUnionId === humanUnionId && OPEN_ID_RE.test(s.ownerOpenId ?? ''))
+        .map(s => s.ownerOpenId!),
+    )];
+    if (matches.length === 1) return matches[0];
+  } catch { /* Fall closed to undefined if store snapshot is unavailable. */ }
+  return undefined;
+}
+
+async function resolveClaimantOpenIdOnSourceApp(
+  sourceLarkAppId: string,
+  claimantUnionId: string,
+  claimantLarkAppId: string,
+  claimantOpenId: string,
+): Promise<string | undefined> {
+  if (claimantLarkAppId === sourceLarkAppId && OPEN_ID_RE.test(claimantOpenId)) {
+    return claimantOpenId;
+  }
+  return resolveHumanOpenIdOnApp(sourceLarkAppId, claimantUnionId);
+}
+
+/**
+ * Execute an ownerless source-session claim on the daemon that owns `sourceLarkAppId`.
+ * Returns `undefined` when this process does not host `sourceLarkAppId` / `sourceSessionId`.
+ */
+export async function localClaimOwnerlessProjectSource(
+  input: ClaimOwnerlessProjectSourceInput,
+): Promise<ClaimOwnerlessProjectSourceResult | undefined> {
+  const {
+    sourceLarkAppId, sourceSessionId, chatId, rootMessageId, expectedRouteRevision,
+    claimantUnionId, claimantLarkAppId, claimantOpenId, via,
+  } = input;
+  if (!APP_ID_RE.test(sourceLarkAppId) || !APP_ID_RE.test(claimantLarkAppId)
+    || !CHAT_ID_RE.test(chatId) || !ROOT_ID_RE.test(rootMessageId)
+    || !UNION_ID_RE.test(claimantUnionId) || !OPEN_ID_RE.test(claimantOpenId)
+    || !sourceSessionId || sourceSessionId.length > 256) {
+    return { ok: false, error: 'invalid_workstream_source' };
+  }
+  if (!tryGetBot(sourceLarkAppId)) return undefined;
+  const live = findActiveBySessionId(sourceSessionId);
+  const durableBefore = sessionStore.getOwnedSession(sourceSessionId);
+  const initialSession = live?.session ?? durableBefore;
+  if (!initialSession || initialSession.larkAppId !== sourceLarkAppId) return undefined;
+
+  const auditDeny = (reason: string) => {
+    logger.warn(
+      `[project-workstream-claim] outcome=denied reason=${reason} via=${via} `
+      + `session=${sourceSessionId} app=${sourceLarkAppId} chat=${chatId} root=${rootMessageId} `
+      + `operator_union=${claimantUnionId} coordinator_open=${claimantOpenId} at=${new Date().toISOString()}`,
+    );
+  };
+
+  const dataDir = config.session.dataDir;
+  if (isTeamBot(dataDir, claimantUnionId) || isPlatformTeamBot(dataDir, claimantUnionId)) {
+    auditDeny('actor_nonhuman');
+    return { ok: false, error: 'actor_nonhuman' };
+  }
+  const resolvedSourceOpenId = await resolveClaimantOpenIdOnSourceApp(
+    sourceLarkAppId, claimantUnionId, claimantLarkAppId, claimantOpenId,
+  );
+  if (resolvedSourceOpenId) {
+    const cachedIdentity = getIdentity(sourceLarkAppId, resolvedSourceOpenId);
+    if (cachedIdentity?.type === 'bot' || cachedIdentity?.type === 'app') {
+      auditDeny('actor_nonhuman');
+      return { ok: false, error: 'actor_nonhuman' };
+    }
+  }
+  if (!canHumanOperateBot(sourceLarkAppId, resolvedSourceOpenId)) {
+    auditDeny('source_claim_operator_not_allowed');
+    return { ok: false, error: 'source_claim_operator_not_allowed' };
+  }
+
+  const currentLive = findActiveBySessionId(sourceSessionId);
+  const currentDurable = sessionStore.getOwnedSession(sourceSessionId);
+  const session = currentLive?.session ?? currentDurable;
+  if (!session || session.larkAppId !== sourceLarkAppId) {
+    return { ok: false, error: 'source_session_unavailable' };
+  }
+  if (session.status !== 'active' || session.chatId !== chatId || session.rootMessageId !== rootMessageId
+    || (session.scope ?? 'thread') !== 'thread'
+    || (expectedRouteRevision !== undefined && (session.projectRouteRevision ?? 1) !== expectedRouteRevision)) {
+    auditDeny('source_route_mismatch');
+    return { ok: false, error: 'source_route_mismatch' };
+  }
+  const issueBinding = getBinding(dataDir, session.rootMessageId);
+  const ordinary = !session.workflowNode && !session.vcMeetingReceiver
+    && !(issueBinding && issueBinding.larkAppId === sourceLarkAppId)
+    && !session.messageListenerRun && !session.deferredScheduleRun
+    && !currentLive?.pendingRepo && !session.pendingRepoSetup;
+  if (!ordinary) {
+    auditDeny('source_managed_elsewhere');
+    return { ok: false, error: 'source_managed_elsewhere' };
+  }
+
+  const existingUnion = session.ownerUnionId ?? currentDurable?.ownerUnionId;
+  const existingOpen = session.ownerOpenId ?? currentDurable?.ownerOpenId;
+  if (existingUnion !== undefined || existingOpen !== undefined) {
+    const sameClaimant = existingUnion === claimantUnionId
+      && (session.ownerUnionId === undefined || session.ownerUnionId === claimantUnionId)
+      && (currentDurable?.ownerUnionId === undefined || currentDurable.ownerUnionId === claimantUnionId)
+      && (existingOpen === undefined || (resolvedSourceOpenId !== undefined && existingOpen === resolvedSourceOpenId));
+    if (!sameClaimant) {
+      auditDeny('source_owner_already_present');
+      return { ok: false, error: 'source_owner_already_present' };
+    }
+    const existingSource = await localProjectAttachmentSource(sourceLarkAppId, sourceSessionId);
+    if (!existingSource) return { ok: false, error: 'source_session_unavailable' };
+    logger.info(
+      `[project-workstream-claim] outcome=already_claimed via=${via} `
+      + `session=${sourceSessionId} app=${sourceLarkAppId} chat=${chatId} root=${rootMessageId} `
+      + `routeRevision=${session.projectRouteRevision ?? 1} operator_union=${claimantUnionId} at=${new Date().toISOString()}`,
+    );
+    return { ok: true, alreadyClaimed: true, source: existingSource };
+  }
+
+  const prevOwnerUnionId = session.ownerUnionId;
+  const prevOwnerOpenId = session.ownerOpenId;
+  const prevDsOwnerOpenId = currentLive?.ownerOpenId;
+  try {
+    session.ownerUnionId = claimantUnionId;
+    if (resolvedSourceOpenId) {
+      session.ownerOpenId = resolvedSourceOpenId;
+      if (currentLive) currentLive.ownerOpenId = resolvedSourceOpenId;
+    }
+    sessionStore.updateSession(session);
+  } catch (error) {
+    session.ownerUnionId = prevOwnerUnionId;
+    session.ownerOpenId = prevOwnerOpenId;
+    if (currentLive) currentLive.ownerOpenId = prevDsOwnerOpenId;
+    auditDeny('source_claim_persist_failed');
+    return { ok: false, error: error instanceof Error ? error.message : 'source_claim_persist_failed' };
+  }
+
+  noteProjectAssociationChanged(session);
+  const claimedSource = await localProjectAttachmentSource(sourceLarkAppId, sourceSessionId);
+  if (!claimedSource) return { ok: false, error: 'source_session_unavailable' };
+  logger.info(
+    `[project-workstream-claim] outcome=claimed via=${via} `
+    + `session=${sourceSessionId} app=${sourceLarkAppId} chat=${chatId} root=${rootMessageId} `
+    + `routeRevision=${session.projectRouteRevision ?? 1} operator_union=${claimantUnionId} `
+    + `coordinator_open=${claimantOpenId} source_open=${resolvedSourceOpenId ?? 'unresolved'} at=${new Date().toISOString()}`,
+  );
+  return { ok: true, alreadyClaimed: false, source: claimedSource };
+}
+
+export async function claimOwnerlessProjectSource(
+  input: ClaimOwnerlessProjectSourceInput,
+): Promise<ClaimOwnerlessProjectSourceResult> {
+  const local = await localClaimOwnerlessProjectSource(input);
+  if (local) return local;
+  const peer = findOnlineDaemon(input.sourceLarkAppId);
+  if (!peer) return { ok: false, error: 'source_session_unavailable' };
+  const response = await fetchDaemonIpc(peer.ipcPort, '/api/project-workstream/claim-source', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+    signal: AbortSignal.timeout(5_000),
+  }).catch(() => undefined);
+  if (!response) return { ok: false, error: 'source_session_unavailable' };
+  const body = await response.json().catch(() => undefined) as {
+    ok?: boolean;
+    alreadyClaimed?: boolean;
+    source?: ProjectAttachmentSource;
+    error?: string;
+  } | undefined;
+  if (response.ok && body?.ok === true && body.source?.sessionId === input.sourceSessionId
+    && body.source.larkAppId === input.sourceLarkAppId) {
+    return { ok: true, alreadyClaimed: body.alreadyClaimed === true, source: body.source };
+  }
+  return { ok: false, error: typeof body?.error === 'string' && body.error ? body.error : 'source_session_unavailable' };
+}
+
 export function projectAttachmentActorAllowed(actor: ProjectAttachmentActor): boolean {
   const ds = findActiveBySessionId(actor.sessionId);
+  if ((actor as unknown as Record<symbol, unknown>)[HOST_CARD_CALLBACK_ACTOR] === true) {
+    const session = ds?.session ?? sessionStore.getOwnedSession(actor.sessionId);
+    return !!session && session.status === 'active' && !session.vcMeetingReceiver
+      && (ds
+        ? ds.larkAppId === actor.larkAppId && ds.chatId === actor.chatId && ds.scope === 'chat'
+        : session.larkAppId === actor.larkAppId && session.chatId === actor.chatId && session.scope === 'chat');
+  }
   return !!actor.turnId && !!ds && ds.larkAppId === actor.larkAppId && ds.chatId === actor.chatId
     && ds.scope === 'chat' && ds.managedTurnOrigin?.turnId === actor.turnId;
 }

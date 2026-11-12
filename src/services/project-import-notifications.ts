@@ -116,11 +116,18 @@ function validSnapshot(value: unknown): value is ProjectImportSnapshot {
     && typeof s.ordinary === 'boolean' && SOURCES.has(s.source);
 }
 
+export const UNINITIALIZED_PROJECT_GENERATION = '__uninitialized__';
+
 function projectAllows(policy: ProjectImportPolicy | undefined, source: ProjectImportSnapshot): policy is ProjectImportPolicy & { coordinatorAppId: string } {
   return !!policy && policy.mode === 'project' && policy.importedSessionPolicy === 'notify'
-    && policy.projectExists && safeId(policy.projectGeneration)
+    && (policy.projectExists ? safeId(policy.projectGeneration) : policy.projectGeneration === UNINITIALIZED_PROJECT_GENERATION)
     && prefixedId(policy.coordinatorAppId, 'cli_') && policy.coordinatorAppId !== source.larkAppId
     && (!policy.workerAppIds || policy.workerAppIds.includes(source.larkAppId));
+}
+
+function generationMatchesPolicy(recordedGeneration: string, policy: ProjectImportPolicy): boolean {
+  if (policy.projectGeneration === recordedGeneration) return true;
+  return recordedGeneration === UNINITIALIZED_PROJECT_GENERATION && policy.projectExists && safeId(policy.projectGeneration);
 }
 
 function sameAssociation(a: ProjectImportSnapshot, b: ProjectImportSnapshot): boolean {
@@ -260,7 +267,7 @@ export function createProjectImportNotifications(deps: ProjectImportNotification
 
   async function liveFence(record: ProjectImportNotification, target?: ProjectImportCoordinator): Promise<void> {
     const policy = deps.getPolicy(record.snapshot.chatId);
-    if (!projectAllows(policy, record.snapshot) || policy.projectGeneration !== record.projectGeneration
+    if (!projectAllows(policy, record.snapshot) || !generationMatchesPolicy(record.projectGeneration, policy)
       || policy.coordinatorAppId !== record.coordinatorAppId) throw new NotificationFenceError('project_policy_changed', true);
     const current = await deps.getCurrent(record.snapshot.larkAppId, record.snapshot.sessionId);
     if (!current) throw new NotificationFenceError('source_unavailable', false);
@@ -280,7 +287,7 @@ export function createProjectImportNotifications(deps: ProjectImportNotification
     }
     // Awaited source/coordinator lookups cannot preserve an old policy grant.
     const latestPolicy = deps.getPolicy(record.snapshot.chatId);
-    if (!projectAllows(latestPolicy, record.snapshot) || latestPolicy.projectGeneration !== record.projectGeneration
+    if (!projectAllows(latestPolicy, record.snapshot) || !generationMatchesPolicy(record.projectGeneration, latestPolicy)
       || latestPolicy.coordinatorAppId !== record.coordinatorAppId) throw new NotificationFenceError('project_policy_changed', true);
   }
 

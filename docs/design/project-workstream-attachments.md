@@ -8,6 +8,8 @@
 ```bash
 botmux project workstream inspect --root om_root --source-app cli_worker --source-session session-id
 botmux project workstream attach --root om_root --source-app cli_worker --source-session session-id --title "具体任务"
+botmux project workstream attach --root om_root --source-app cli_worker --source-session session-id --title "具体任务" --claim-owner
+botmux project workstream confirm --root om_root --source-app cli_worker --source-session session-id [--title "具体任务"]
 botmux project workstream rename --root om_root --title "新的具体标题"
 botmux project workstream update --root om_root --status in_progress --content "正在实现"
 botmux project workstream status
@@ -30,7 +32,21 @@ botmux project workstream attach --root om_root --source-app cli_worker --source
 ```
 
 grant 限当前源 session、话题、关联版本、项目群和主控 app，一小时有效，不授权
-读取私聊 transcript/终端。bot 触发回合、定时任务回合、未知 caller 不会被推测成人类。
+读取私聊 transcript/终端。bot 触发回合、定时任务回合、未知 caller 不会被推测成人类，
+拒绝码明确区分：
+
+- `actor_nonhuman`：当前回合不是真人直接发起（机器人转发、非迁入通知的后台/定时触发等），不可代本人认领或变更归属。
+- `source_owner_unknown`：源会话缺少 `ownerOpenId`/`ownerUnionId`（如早期无主会话迁入），不能走 `grant`，需由本人显式认领。
+- `source_owner_authorization_required`：源会话已有其他成员的 owner，需原主人在源话题执行 `grant` 后由主控带 `--grant` 登记。
+
+### 无主会话显式认领与迁入话题确认卡
+
+当无主会话迁入项目群时，不能凭机器人转发文字、`lastCaller` 或 relay 占位推断归属，支持两条经宿主鉴权并留存审计日志的显式认领路径：
+
+1. **迁入话题确认卡片（推荐）**：开启 `notifications --mode notify` 时，宿主在投递迁入通知的同时，直接由主控应用在迁入后的目标话题内回复一张可见的「项目会话迁入」卡片（展示来源 Bot、会话摘要、迁入方式、当前是否已登记看板及未登记原因）；对已迁入的历史会话，主控也可执行 `botmux project workstream confirm` 补发/刷新该卡片。需要本人确认时卡片附带「确认登记」按钮，点击人经飞书回调 `operator` 校验确认为主控会话真人 owner 且具备源 Bot 的人类操作权限后，宿主将无主会话的 `ownerUnionId`（及可解析的源应用 `ownerOpenId`）补写为本人并完成 `attach`，同步更新项目置顶进度卡与话题卡片，全程记录 `[project-workstream-claim]` 与 `[project-import-card]` 审计日志。
+2. **本人真人回合显式认领**：本人在项目群直接 @主控 发话要求认领并登记时，主控可在该真人回合执行 `botmux project workstream attach ... --claim-owner` 完成认领与登记（非真人回合调用一律返回 `actor_nonhuman`；已有其他 owner 的会话一律返回 `source_owner_already_present`，绝不覆盖）。
+
+在宿主投递的 `project-import` 通知回合中，仅对当前通知绑定的 `(rootMessageId, sourceLarkAppId, sourceSessionId)` 放行只读 `inspect`、`confirm` 以及同主人会话的 `attach`（使同主人会话能立即写入项目置顶进度卡并把话题卡更新为「已登记看板」），不放开静默回合的模型自由群发，避免提示词注入或后台重试噪音污染主群时间线。
 
 ## 安全与恢复
 
