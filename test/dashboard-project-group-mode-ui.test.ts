@@ -114,6 +114,78 @@ describe('Dashboard project group mode section', () => {
     expect(renderer.root.findByProps({ 'data-project-runtime': 'active' })).toBeTruthy();
     expect(renderer.root.findByProps({ value: 'compact-list' }).props.checked).toBe(true);
     expect(renderer.root.findByProps({ 'data-project-auto-enroll-workers': 'oc_project' }).props.checked).toBe(false);
+    expect(renderer.root.findByProps({ 'data-project-completed-display': 'oc_project' }).props.value).toBe('all');
     expect(renderer.root.findAllByType('input').every(input => input.props.type === 'radio' || input.props.type === 'checkbox')).toBe(true);
+  });
+
+  it('saves completedDisplay selection and supports resetting back to all', async () => {
+    const fetchMock = vi.fn(async (_url: string, init?: RequestInit) => {
+      const body = init?.body ? JSON.parse(String(init.body)) : {};
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          config: {
+            chatId: 'oc_project',
+            mode: 'project',
+            coordinatorAppId: 'cli_coordinator',
+            workerAppIds: ['cli_worker'],
+            autoEnrollWorkers: false,
+            progressCard: body.progressCard,
+          },
+          project: null,
+        }),
+      };
+    }) as any;
+    globalThis.fetch = fetchMock;
+    const projectChat: GroupChat = {
+      ...chat,
+      collaborationMode: 'project',
+      projectCoordinatorAppId: 'cli_coordinator',
+      projectWorkerAppIds: ['cli_worker'],
+      projectAutoEnrollWorkers: false,
+      projectProgressCard: {
+        schemaVersion: 1,
+        templateId: 'compact-list',
+        sections: ['goal', 'workstreams'],
+        milestonesExpanded: false,
+      },
+    };
+    const onSaved = vi.fn(async () => ({ chats: [], bots: [] }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    await act(async () => {
+      renderer = TestRenderer.create(React.createElement(ProjectGroupModeSection, {
+        chat: projectChat, members, tr, onSaved,
+      }));
+    });
+    await settle();
+
+    const select = renderer.root.findByProps({ 'data-project-completed-display': 'oc_project' });
+    act(() => select.props.onChange({ currentTarget: { value: 'collapsed' } }));
+    const save = renderer.root.findAllByType('button').find(button => button.children.join('') === 'groups.projectModeSave');
+    await act(async () => { save!.props.onClick(); });
+
+    const firstPut = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+    expect(firstPut.progressCard).toEqual({
+      schemaVersion: 1,
+      templateId: 'compact-list',
+      sections: ['goal', 'workstreams'],
+      milestonesExpanded: false,
+      completedDisplay: 'collapsed',
+    });
+
+    const selectAfterSave = renderer.root.findByProps({ 'data-project-completed-display': 'oc_project' });
+    expect(selectAfterSave.props.value).toBe('collapsed');
+    act(() => selectAfterSave.props.onChange({ currentTarget: { value: 'all' } }));
+    await act(async () => { save!.props.onClick(); });
+
+    const secondPut = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body));
+    expect(secondPut.progressCard).toEqual({
+      schemaVersion: 1,
+      templateId: 'compact-list',
+      sections: ['goal', 'workstreams'],
+      milestonesExpanded: false,
+    });
   });
 });

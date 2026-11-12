@@ -4970,6 +4970,23 @@ function decisionBoardRoute(method: string, path: string,
   });
 }
 
+let projectCardRuntimeObserver: ((chatId: string) => void) | null = null;
+export function setProjectCardRuntimeObserver(observer: ((chatId: string) => void) | null): void {
+  projectCardRuntimeObserver = observer;
+}
+
+/**
+ * 本机其他 daemon 记下本轮结果、举手或会话关联变化时按群通知项目主控刷新置顶卡（host HMAC）。
+ */
+ipcRoute('POST', '/api/project-card/task-event', async (req, res) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
+  const body = await readJsonBody<Record<string, unknown>>(req, 4096).catch(() => undefined);
+  const chatId = typeof body?.chatId === 'string' && /^oc_[A-Za-z0-9_-]{1,128}$/.test(body.chatId) ? body.chatId : null;
+  if (!chatId) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  projectCardRuntimeObserver?.(chatId);
+  return jsonRes(res, 200, { ok: true });
+});
+
 /**
  * 本机其他 daemon 记下本轮结果或举手时按群通知管家（host HMAC）。只带群 ID，管家自己重新读状态。
  * 不放在 /api/decision-board 下：Dashboard 不转发它。

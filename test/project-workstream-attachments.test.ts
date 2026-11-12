@@ -740,4 +740,88 @@ describe('project workstream attachments', () => {
     });
     expect(f.registry().om_topic.lastReport).toBeUndefined();
   });
+
+  it('stores human-readable botName in owners on attach and upgrades legacy appId owners on reconcile', async () => {
+    const f = await fixture();
+    f.source().botName = 'BotAlpha';
+    await f.service.attach(f.actor, f.request);
+    expect(readProjectGroup(f.dataDir, 'oc_group')!.workstreams[0]!.owners).toEqual(['BotAlpha']);
+
+    // Simulate legacy stored row with raw appId owner, then reconcile.
+    await mutateProjectGroup(f.dataDir, 'oc_group', current => {
+      current!.workstreams[0]!.owners = ['cli_worker'];
+      return current;
+    });
+    await f.service.reconcile(f.actor);
+    expect(readProjectGroup(f.dataDir, 'oc_group')!.workstreams[0]!.owners).toEqual(['BotAlpha']);
+  });
+
+  it('allows coordinator manual status update on an ordinary dispatched workstream with verified binding', async () => {
+    const f = await fixture();
+    await f.coordinator.run(f.context, {
+      action: 'dispatch',
+      dispatchRoot: 'om_ordinary_dispatch',
+      title: '历史补跑任务：评估与停用',
+      purpose: '评估并停用自动补跑任务',
+      owners: ['BotAlpha'],
+      status: 'in_progress',
+      progress: 20,
+    });
+    await updateDispatchRegistry(join(f.dataDir, 'orchestrate-dispatch.json'), registry => {
+      registry.om_ordinary_dispatch = {
+        orchChatId: f.actor.chatId,
+        orchScope: 'chat',
+        orchAppId: f.actor.larkAppId,
+        orchSessionId: f.actor.sessionId,
+        targetChatId: f.actor.chatId,
+        targetAppIds: ['cli_worker'],
+        title: '历史补跑任务：评估与停用',
+        status: 'accepted',
+        createdAt: '2026-11-10T00:00:00.000Z',
+        updatedAt: '2026-11-10T00:00:00.000Z',
+        reportBinding: createDispatchReportBinding(SECRET, {
+          dispatchRoot: 'om_ordinary_dispatch',
+          targetLarkAppId: f.actor.larkAppId,
+          targetSessionId: f.actor.sessionId,
+          targetChatId: f.actor.chatId,
+          targetScope: 'chat',
+          sourceName: '历史补跑任务：评估与停用',
+          issuedAt: '2026-11-10T00:00:00.000Z',
+        }),
+      };
+    });
+
+    const res = await f.service.update(f.actor, {
+      rootMessageId: 'om_ordinary_dispatch',
+      status: 'completed',
+      progress: 100,
+      content: '子项目已完成：评估停用收口',
+    });
+    expect(res).toMatchObject({ registered: true, cardSynced: true });
+    expect(readProjectGroup(f.dataDir, 'oc_group')!.workstreams[0]).toMatchObject({
+      dispatchRoot: 'om_ordinary_dispatch',
+      status: 'completed',
+      progress: 100,
+      lastReport: '子项目已完成：评估停用收口',
+    });
+    expect(f.registry().om_ordinary_dispatch.lastReport).toMatchObject({
+      status: 'completed',
+      line: '子项目已完成：评估停用收口',
+    });
+  });
+
+  it('passes resolveCardRuntime into published project card JSON', async () => {
+    const f = await fixture();
+    f.transport.resolveCardRuntime = vi.fn(async () => ({
+      ownerDisplayNames: { cli_worker: 'BotAlpha' },
+      sessionFactsByRoot: {
+        om_topic: { status: 'idle', lastTurn: { turnId: 'om_turn_1', outcome: 'delivered', at: Date.now() } },
+      },
+    }));
+    await f.service.attach(f.actor, f.request);
+    const lastCardPayload = vi.mocked(f.transport.updateCard).mock.calls.at(-1)?.[2] ?? '';
+    expect(lastCardPayload).toContain('BotAlpha');
+    expect(lastCardPayload).not.toContain('cli_worker');
+    expect(lastCardPayload).toContain('等回复');
+  });
 });
