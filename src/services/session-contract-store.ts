@@ -543,10 +543,15 @@ export class SessionContractStore {
         const history = (this.db.prepare("SELECT value FROM entities WHERE session_key=? AND kind='runtime'").all(sessionKey(ref)) as Array<{ value: string }>).map(row => JSON.parse(row.value) as RuntimeContract);
         const executions = this.executions(ref);
         if (executions.some(execution => !terminalPhase(execution.phase) && sameRuntime(execution.runtime, previous.ref))) {
-          throw new Error('runtime_recovery_has_active_execution');
+          // Work still open on the selected bare observation keeps the older
+          // runtime out of reach. The complete identity is that same live
+          // process, so it completes the selected runtime: refusing the binding
+          // would leave a re-attached worker, and that work, with no runtime.
+          if (['retiring', 'stopped'].includes(previous.phase)) throw new Error('runtime_recovery_has_active_execution');
+          reuse = previous;
         }
         const records = (this.db.prepare("SELECT value FROM events WHERE session_key=? AND type IN ('runtime_bound','runtime_reserved')").all(sessionKey(ref)) as Array<{ value: string }>).map(row => JSON.parse(row.value) as Extract<ContractEvent, { type: 'runtime_bound' | 'runtime_reserved' }>);
-        const candidates = history.filter(runtime => runtime.phase === 'unresolved'
+        const candidates = reuse ? [] : history.filter(runtime => runtime.phase === 'unresolved'
           && runtime.ref.epoch < previous.ref.epoch && reusableRuntimeIdentity(runtime.identity, identity));
         if (candidates.length === 1) {
           const candidate = candidates[0];

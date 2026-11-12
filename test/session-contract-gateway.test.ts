@@ -501,8 +501,8 @@ describe('contract gateway and real worker boundaries', () => {
     if (condition === 'foreign_binding') worker = s.controller.bindWorker(3).worker;
     const bindingId = ['confirmed_binding', 'foreign_binding'].includes(condition) ? 'middle-bare' : 'new-proof';
     if (!['confirmed_binding', 'foreign_binding'].includes(condition)) s.controller.reserveBinding(bindingId, worker);
-    if (condition === 'middle_attempt' || condition === 'foreign_binding') {
-      expect(() => s.controller.bindRuntime(bindingId, worker, old.identity!)).toThrow(condition === 'middle_attempt' ? 'runtime_recovery_has_active_execution' : 'runtime_binding_producer_mismatch');
+    if (condition === 'foreign_binding') {
+      expect(() => s.controller.bindRuntime(bindingId, worker, old.identity!)).toThrow('runtime_binding_producer_mismatch');
       expect(s.store.runtime(s.ref)?.ref).toEqual(middle);
       expect(s.store.binding(s.ref, 'middle-bare')?.ref).toEqual(middle);
       return;
@@ -511,9 +511,59 @@ describe('contract gateway and real worker boundaries', () => {
     if (condition === 'recover') expect(result.ref).toEqual(old.ref);
     else expect(result.ref).not.toEqual(old.ref);
     if (condition === 'confirmed_binding') expect(result.ref).toEqual(middle);
+    if (condition === 'middle_attempt') {
+      // Work still open on the bare observation keeps the older runtime out of
+      // reach; the complete identity of that same process completes it rather
+      // than leaving the re-attached worker without a runtime.
+      expect(result.ref).toEqual(middle);
+      expect(s.store.runtime(s.ref)).toMatchObject({ ref: middle, identity: old.identity });
+      expect(s.store.binding(s.ref, bindingId)?.ref).toEqual(middle);
+    }
     expect(s.store.execution(s.ref, execution.executionId)).toMatchObject({ phase: 'reconciling', runtime: old.ref });
     expect(s.store.binding(s.ref, 'middle-bare')?.ref).toEqual(middle);
     if (condition === 'recover') expect(s.store.read(s.ref)?.runtimeEpoch).toBe(3);
+  });
+  it.each(['stopped', 'retiring'] as const)('never completes a %s bare runtime that still has open work', phase => {
+    const s = fixture(); const old = s.store.runtime(s.ref)!;
+    const worker = s.controller.bindWorker(2).worker;
+    const bare = s.controller.reserveBinding('bare', worker);
+    s.controller.bindRuntime('bare', worker, { backend: 'tmux', physicalId: '111:start1', proof: 'process_start' });
+    const open = s.controller.admitInput('bare-active'); s.store.bindQueuedExecution(s.ref, open, bare);
+    if (phase === 'stopped') s.store.apply(s.ref, { type: 'runtime_lost', runtime: bare, confirmed: true });
+    else {
+      const current = s.store.runtime(s.ref, bare.runtimeId)!;
+      s.store.apply(s.ref, { type: 'runtime_bound', runtime: { ...current, phase: 'retiring' }, operationId: 'not-active' });
+    }
+    expect(s.store.runtime(s.ref, bare.runtimeId)?.phase).toBe(phase);
+    s.controller.reserveBinding('complete', worker);
+    expect(() => s.controller.bindRuntime('complete', worker, old.identity!)).toThrow('runtime_recovery_has_active_execution');
+    expect(s.store.runtime(s.ref, bare.runtimeId)?.identity?.nativeSessionId).toBeUndefined();
+  });
+  it('takes a busy re-attached Claude\'s conversation from its own record, never over one the binding already learned', () => {
+    const scope = new WorkerSessionEventScope({ appId: 'a', sessionId: 's' }, { workerId: 'w', generation: 1 });
+    const reads: Array<[number, string]> = [];
+    const env: any = { backend: { cliPid: 111 }, codexRpcEngine: undefined, effectiveBackendType: 'tmux',
+      lastInitConfig: { cliId: 'claude-code' }, cliAdapter: { claudeDataDir: '/claude' }, bridgeDataDir: '/bridge-claude',
+      readProcessStartIdentity: () => 'start1',
+      readClaudeLiveSessionId: (pid: number, dir: string) => { reads.push([pid, dir]); return 'native-live'; } };
+    env.workerSessionEventScope = scope;
+    const identity = loadWorkerFunction<(binding: any) => any>('runtimeIdentityForContract', env);
+    // A fresh binding of the re-attached CLI: the process's own record names it,
+    // read from the directory the bridge reads.
+    const fresh = scope.beginRuntime();
+    expect(identity(fresh)).toEqual({ backend: 'tmux', physicalId: '111:start1', proof: 'process_start', nativeSessionId: 'native-live' });
+    expect(reads).toEqual([[111, '/bridge-claude']]);
+    // A conversation the binding already learned at a write is never replaced.
+    const learned = scope.beginRuntime(); learned.identity = { backend: 'tmux', physicalId: '111:start1', proof: 'process_start', nativeSessionId: 'native-written' };
+    expect(identity(learned).nativeSessionId).toBe('native-written');
+    expect(reads).toHaveLength(1);
+    // No answer from the record: the identity stays as it was before.
+    env.readClaudeLiveSessionId = () => undefined;
+    expect(identity(scope.beginRuntime())).toEqual({ backend: 'tmux', physicalId: '111:start1', proof: 'process_start' });
+    // Other CLIs never consult a Claude record.
+    env.cliAdapter = {}; env.lastInitConfig = { cliId: 'codex' };
+    env.readClaudeLiveSessionId = () => { throw new Error('read for a non-Claude CLI'); };
+    expect(identity(scope.beginRuntime())).toEqual({ backend: 'tmux', physicalId: '111:start1', proof: 'process_start' });
   });
   it('uses fresh unambiguous PID-owned native identity on a busy reattach before granting the binding', () => {
     const s = fixture(); const old = s.store.runtime(s.ref)!;
