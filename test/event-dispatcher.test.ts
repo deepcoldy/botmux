@@ -321,6 +321,7 @@ import { normalizeManagedOwnerEntries } from '../src/setup/owner-identity.js';
 import { createPluginCardActionGateway } from '../src/core/plugins/card-actions/gateway.js';
 import { InputCaptureTerminalRejection } from '../src/core/plugins/input-capture/runtime.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
+import { _resetMentionDropCountsForTest } from '../src/im/lark/mention-drop-telemetry.js';
 import { resolve } from 'node:path';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -13163,6 +13164,186 @@ describe('writeBotInfoFile — multi-daemon merge', () => {
     const written = JSON.parse(mockWriteFileSync.mock.calls[0][1]);
     expect(written).toHaveLength(1);
     expect(written[0].larkAppId).toBe(MY_APP_ID);
+  });
+});
+
+// ─── mention-drop：找本 bot 的群消息在入口被静默丢弃时必须留下 WARN ───────────────────
+// 用户反馈「@ 了没反应」时，这些出口过去只有 DEBUG 或没有日志，和「事件从未入站」无法区分。
+// 每个出口都要：不派发、不回复（行为不变），但留一条带原因的 WARN，且不带正文。
+describe('im.message.receive_v1 — mention-drop WARN for silently dropped @', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+  const BODY = '请帮忙看下排障记录';
+  const dropLines = () => vi.mocked(logger.warn).mock.calls
+    .map(call => String(call[0]))
+    .filter(line => line.includes('[mention-drop:'));
+  const selfMention = { key: '@_user_1', name: 'BotA', id: { open_id: MY_OPEN_ID } };
+  const groupEvent = (messageId: string, text: string, mentions?: TestMention[], senderOpenId = USER_OPEN_ID) => makeUserMessageEvent({
+    senderOpenId, content: JSON.stringify({ text }), messageId, chatId: 'chat-drop', chatType: 'group', mentions,
+  });
+  const deliver = async (event: any) => {
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    await flushEventWork();
+  };
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    _resetMentionDropCountsForTest();
+    vi.mocked(logger.warn).mockClear();
+    mockReplyMessage.mockReset().mockResolvedValue('msg-id');
+    mockGetOwnerOpenId.mockReturnValue(undefined);
+    mockGetChatMode.mockReset().mockResolvedValue('group');
+    mockGetUserProfile.mockReset().mockResolvedValue({ name: '访客' });
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    handlers = makeHandlers();
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  afterEach(() => {
+    mockGetOwnerOpenId.mockReturnValue(undefined);
+    vi.unstubAllGlobals();
+  });
+
+  it('warns once when this bot\'s open_id is still unknown and the @ cannot be recognised', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], botOpenId: undefined });
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new Error('bot info unreachable'); }) as any);
+    await deliver(groupEvent('om_drop_openid_unknown', `@_user_1 ${BODY}`, [selfMention]));
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    const lines = dropLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('reason=open_id_unknown');
+    expect(lines[0]).toContain('msg=om_drop_open');
+    expect(lines[0]).not.toContain(BODY);
+  });
+
+  it.each([
+    '/mention-mode never',
+    '/reply-mode chat',
+    '/tabs',
+    '/secretary on',
+    '/substitute on',
+    '/grant',
+    '/invite cli_someone',
+    '/introduce',
+  ])('warns when a dispatcher command (%s) swallows an @ that has not resolved yet', async command => {
+    const messageId = `om_drop_cmd_${command.split(' ')[0]!.slice(1)}`;
+    await deliver(groupEvent(messageId, `@_user_1 ${command}`, []));
+
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    const lines = dropLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('reason=command_gate');
+    expect(lines[0]).toContain('mention=unresolved');
+    expect(lines[0]).toContain(`msg=${messageId.substring(0, 12)}`);
+  });
+
+  it('stays quiet when a command addressed to this bot is answered', async () => {
+    await deliver(groupEvent('om_drop_cmd_answered', '@_user_1 /mention-mode', [selfMention]));
+    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+    expect(dropLines()).toEqual([]);
+  });
+
+  it('stays quiet when a command is addressed to another, already-resolved member', async () => {
+    await deliver(groupEvent('om_drop_cmd_other', '@_user_1 /mention-mode never',
+      [{ key: '@_user_1', name: 'OtherBot', id: { open_id: OTHER_BOT_OPEN_ID } }]));
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+    expect(dropLines()).toEqual([]);
+  });
+
+  it.each([
+    ['grant_cards_off', () => {
+      setupBotState({ allowedUsers: ['ou_owner'], autoGrantRequestCards: false });
+      mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    }],
+    ['grant_no_admin', () => {
+      setupBotState({ allowedUsers: ['ou_owner'] });
+      mockGetOwnerOpenId.mockReturnValue(undefined);
+    }],
+    ['sender_blocked', () => {
+      setupBotState({ allowedUsers: ['ou_owner'], resolvedBlockedUsers: ['ou_guest_drop'] });
+      mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    }],
+    ['grant_card_failed', () => {
+      setupBotState({ allowedUsers: ['ou_owner'] });
+      mockGetOwnerOpenId.mockReturnValue('ou_owner');
+      mockReplyMessage.mockRejectedValueOnce(new Error('HTTP 400'));
+    }],
+  ] as const)('warns %s when an unauthorised sender\'s @ gets no grant card', async (reason, arrange) => {
+    arrange();
+    await deliver(groupEvent(`om_drop_${reason}`, `@_user_1 ${BODY}`, [selfMention], 'ou_guest_drop'));
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    const lines = dropLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(`reason=${reason}`);
+    expect(lines[0]).toContain('mention=explicit');
+    expect(lines[0]).not.toContain(BODY);
+  });
+
+  it('stays quiet while the grant card is visible, and warns once a repeat @ gets no notice at all', async () => {
+    setupBotState({ allowedUsers: ['ou_owner'] });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    await deliver(groupEvent('om_drop_grant_first', `@_user_1 ${BODY}`, [selfMention], 'ou_guest_repeat'));
+    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+    expect(dropLines()).toEqual([]);
+
+    // 卡已经回在申请人自己的消息下，待处理期间再 @ 不另发提示：这一条没有任何可见回执。
+    await deliver(groupEvent('om_drop_grant_again', `@_user_1 ${BODY}`, [selfMention], 'ou_guest_repeat'));
+    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+    const lines = dropLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('reason=grant_throttled');
+    expect(lines[0]).toContain('msg=om_drop_gran');
+  });
+
+  it('warns when a blacklisted sender\'s unresolved @ is ignored', async () => {
+    setupBotState({ allowedUsers: ['ou_owner'], resolvedBlockedUsers: ['ou_guest_blocked'] });
+    await deliver(groupEvent('om_drop_blocked_unresolved', `@_user_1 ${BODY}`, [], 'ou_guest_blocked'));
+    const lines = dropLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('reason=sender_blocked');
+    expect(lines[0]).toContain('mention=unresolved');
+  });
+
+  it.each([
+    ['substitute_keyword_miss', { keywords: ['oncall'] }],
+    ['substitute_excluded_chat', { excludedChats: ['chat-drop'] }],
+  ] as const)('warns %s when the substitute hand-off swallows an unresolved @ of this bot', async (reason, extra) => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], substituteMode: {
+      enabled: true, targets: [{ openId: 'ou_sub' }], ...extra,
+    } });
+    await deliver(groupEvent(`om_drop_${reason}`, `@_user_1 @_sub ${BODY}`,
+      [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }]));
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    const lines = dropLines();
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(`reason=${reason}`);
+    expect(lines[0]).toContain('mention=unresolved');
+  });
+
+  it('stays quiet when the substitute hand-off only involves the substitute target', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], substituteMode: {
+      enabled: true, targets: [{ openId: 'ou_sub' }], keywords: ['oncall'],
+    } });
+    await deliver(groupEvent('om_drop_sub_only', '@_sub 下午开会', [{ key: '@_sub', name: 'Sub Person', id: { open_id: 'ou_sub' } }]));
+    expect(dropLines()).toEqual([]);
+  });
+
+  it('stays quiet for ordinary chatter and for @s that are delivered', async () => {
+    await deliver(groupEvent('om_drop_chatter', '下午开会'));
+    await deliver(groupEvent('om_drop_other', '@_user_1 你看下', [{ key: '@_user_1', name: 'Zhang', id: { open_id: 'ou_zhang' } }]));
+    await deliver(groupEvent('om_drop_delivered', `@_user_1 ${BODY}`, [selfMention]));
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+    expect(dropLines()).toEqual([]);
   });
 });
 
