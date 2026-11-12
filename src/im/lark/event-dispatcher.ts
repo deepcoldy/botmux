@@ -27,6 +27,7 @@ import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, resolveNonsupportMessage, daemonCommandLanePreview, type MentionIdentity } from './message-parser.js';
+import { reportMentionDrop, type MentionDropReason } from './mention-drop-telemetry.js';
 import { matchesSubstituteKeywords } from '../../services/substitute-keywords.js';
 import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.js';
 import { commandPrecedesMentions, isCommandTargetOnly } from './mention-targets.js';
@@ -2694,6 +2695,22 @@ export function humanCanRunDaemonCommand(
 }
 
 /**
+ * 授权申请这一步的结果。card_sent / throttle_notice_sent / held 是申请人或管理员看得到、或消息等批准后重放，其余都是
+ * 「这条消息没有任何可见回执」——调用方据此记 mention-drop（见 silentGrantDropReason）。
+ */
+export type GrantRequestOutcome =
+  | 'card_sent'
+  | 'throttle_notice_sent'
+  | 'held'
+  | 'blocked'
+  | 'cards_off'
+  | 'no_requester'
+  | 'no_admin'
+  | 'p2p_not_forwarded'
+  | 'throttled_silent'
+  | 'send_failed';
+
+/**
  * 入口 A：无权限者 @bot（或私聊 bot）时弹授权申请卡，由管理员处置。
  * 受 grant-pending 节流：pending 中 / deny 冷却期内不再发卡。真人路径的调用方传
  * `notifyThrottledRequester`，申请人在这期间再来找 bot 时回一句原因（同一张卡 / 同一次拒绝
@@ -2712,38 +2729,41 @@ export function humanCanRunDaemonCommand(
 export async function maybeSendGrantRequestCard(
   larkAppId: string, message: any, chatId: string, requesterOpenId: string | undefined, messageData?: any,
   opts?: { notifyThrottledRequester?: boolean },
-): Promise<void> {
+): Promise<GrantRequestOutcome> {
   // 黑名单用户静默：不弹授权申请卡、不开 pending、不触发任何回复（P1c）。
   // 必须在 autoGrantRequestCards / owner / 节流等一切判定之前短路。
-  if (requesterOpenId && evaluateTalk(larkAppId, chatId, requesterOpenId).reason === 'blocked') return;
+  if (requesterOpenId && evaluateTalk(larkAppId, chatId, requesterOpenId).reason === 'blocked') return 'blocked';
   // 下面两种拦截对申请人是静默的，info 日志是 owner 排查「别人 @ 没反应」的唯一线索。
   if (getBot(larkAppId).config.autoGrantRequestCards === false) {
     logSilentGrantDrop(larkAppId, chatId, requesterOpenId, 'autoGrantRequestCards is off');
-    return;
+    return 'cards_off';
   }
-  if (!requesterOpenId) return;
+  if (!requesterOpenId) return 'no_requester';
   const owner = getOwnerOpenId(larkAppId);
   if (!owner) {
     logSilentGrantDrop(larkAppId, chatId, requesterOpenId, 'no resolved admin in allowedUsers');
-    return;
+    return 'no_admin';
   }
   if (isThrottled(larkAppId, chatId, requesterOpenId)) {
     if (opts?.notifyThrottledRequester) {
-      await replyThrottledRequester(larkAppId, message, chatId, requesterOpenId);
-      return;
+      return await replyThrottledRequester(larkAppId, message, chatId, requesterOpenId)
+        ? 'throttle_notice_sent'
+        : 'throttled_silent';
     }
     const held = messageData === undefined ? 'no_message' : holdPendingMessage(larkAppId, chatId, requesterOpenId, messageData);
     if (held === 'held') {
       logger.info(`[grant:${larkAppId}] holding message ${String(message?.message_id ?? '?').substring(0, 12)} from ${requesterOpenId.substring(0, 12)} in ${chatId.substring(0, 12)} until the request card is handled`);
-    } else if (held !== 'duplicate') {
+      return 'held';
+    }
+    if (held !== 'duplicate') {
       logSilentGrantDrop(larkAppId, chatId, requesterOpenId, `request throttled, message not held: ${held}`);
     }
-    return;
+    return held === 'duplicate' ? 'held' : 'throttled_silent';
   }
   const chatType: 'p2p' | 'group' = message?.chat_type === 'p2p' ? 'p2p' : 'group';
   const forwardToOwnerDm = getBot(larkAppId).config.grantRequestToOwnerDm === true;
   // 未开转投时 p2p 维持不发卡：卡 reply 回来只会发给申请人自己（按钮又是 owner 专属）且暴露 owner。
-  if (chatType === 'p2p' && !forwardToOwnerDm) return;
+  if (chatType === 'p2p' && !forwardToOwnerDm) return 'p2p_not_forwarded';
   const routePromise: Promise<GrantRequestRoute | undefined> = forwardToOwnerDm
     ? resolveGrantRequestRoute(larkAppId, chatId, chatType, message).catch(() => undefined)
     : resolveGrantApprover(larkAppId, chatId, message)
@@ -2786,10 +2806,10 @@ export async function maybeSendGrantRequestCard(
       markPendingDelivered(larkAppId, chatId, [requesterOpenId], nonce);
       await replyMessage(larkAppId, message.message_id, t('card.grant.request_forwarded', undefined, loc))
         .catch(err => logger.debug(`grant request forwarded ack failed: ${err}`));
-      return;
+      return 'card_sent';
     }
     clearPending(larkAppId, chatId, requesterOpenId);
-    return;
+    return 'send_failed';
   }
   const card = buildGrantCard(
     {
@@ -2810,11 +2830,30 @@ export async function maybeSendGrantRequestCard(
     // 只能等 daemon 重启或别的 target 触发全表 prune 才恢复。清掉后下次 @ 会重试发卡。
     clearPending(larkAppId, chatId, requesterOpenId);
     logger.debug(`grant request card send failed: ${err}`);
-    return;
+    return 'send_failed';
   }
   // 卡已送达才落盘：daemon 重启后管理员照样能点这张卡。卡就回复在申请人自己的消息下面，
   // 它本身就是「在等管理员处理」的说明，待处理期间申请人再来找 bot 不另发文字提示。
   markPendingDelivered(larkAppId, chatId, [requesterOpenId], nonce, { shownToRequester: true });
+  return 'card_sent';
+}
+
+/** 授权申请没有给任何人留下可见痕迹时，对应的 mention-drop 原因；可见 / 已挂起重放则返回 undefined。 */
+export function silentGrantDropReason(outcome: GrantRequestOutcome): MentionDropReason | undefined {
+  switch (outcome) {
+    case 'blocked': return 'sender_blocked';
+    case 'cards_off': return 'grant_cards_off';
+    case 'no_requester': return 'grant_no_sender';
+    case 'no_admin': return 'grant_no_admin';
+    case 'throttled_silent': return 'grant_throttled';
+    case 'send_failed': return 'grant_card_failed';
+    // p2p 不是群 @，不在 mention-drop 范围内（且静默是有意不泄露 owner）。
+    case 'p2p_not_forwarded':
+    case 'card_sent':
+    case 'throttle_notice_sent':
+    case 'held':
+      return undefined;
+  }
 }
 
 function logSilentGrantDrop(
@@ -2827,9 +2866,9 @@ function logSilentGrantDrop(
  *  待处理的卡就在申请人眼前（回复在原会话）时不回：卡片本身已经说明在等管理员。 */
 async function replyThrottledRequester(
   larkAppId: string, message: any, chatId: string, requesterOpenId: string,
-): Promise<void> {
+): Promise<boolean> {
   const notice = claimThrottleNotice(larkAppId, chatId, requesterOpenId);
-  if (!notice) return;
+  if (!notice) return false;
   const text = t(
     notice.reason === 'pending' ? 'card.grant.request_still_pending' : 'card.grant.request_recently_denied',
     undefined,
@@ -2837,9 +2876,11 @@ async function replyThrottledRequester(
   );
   try {
     await replyMessage(larkAppId, message.message_id, text);
+    return true;
   } catch (err) {
     notice.release();
     logger.debug(`grant throttle notice failed: ${err}`);
+    return false;
   }
 }
 
@@ -5372,6 +5413,14 @@ export function createLarkEventDispatcherRuntime(
       // so the @ is recognized. Best-effort: on probe failure we degrade to the
       // prior behavior (the periodic heartbeat retries the probe).
       await ensureBotOpenId(larkAppId).catch(() => { /* degrade; heartbeat retries */ });
+      // Probe failed: every @ below is judged "not mentioned" and dropped at
+      // DEBUG. Leave one WARN per affected human group message instead.
+      if (!getBot(larkAppId).botOpenId && sender?.sender_type !== 'app' && sender?.sender_type !== 'bot') {
+        reportMentionDrop({
+          larkAppId, botOpenId: undefined, message, reason: 'open_id_unknown',
+          senderOpenId: sender?.sender_id?.open_id,
+        });
+      }
 
       // Recovery rows intentionally persist the list endpoint's transport-stable
       // card body. Best-effort resolve the full card before any listener/@
@@ -5857,40 +5906,50 @@ export function createLarkEventDispatcherRuntime(
       // so the command never reaches a CLI session (each @ed bot's daemon
       // independently records the mentions[] open_ids + names). 无需授权：
       // 任何人都能登记花名册（只记 observed，不授予任何权限）。
+      // dispatcher 层斜杠命令在群里只认明确 @ 本 bot 的；认不出时处理器直接吞掉、不回复。
+      // 这条消息若带着还没解析出身份的 @，就是一次没有任何痕迹的漏接，记 mention-drop。
+      const commandConsumed = () => {
+        if (chatType === 'group' && !isBotMentioned(larkAppId, message, senderOpenId)) {
+          reportMentionDrop({
+            larkAppId, botOpenId: getBot(larkAppId).botOpenId, message, reason: 'command_gate', senderOpenId,
+          });
+        }
+      };
+
       if (await tryHandleIntroduceCommand(larkAppId, message, senderOpenId)) {
-        return;
+        return commandConsumed();
       }
 
       if (await tryHandleReplyModeCommand(larkAppId, message, senderOpenId, isAllowed)) {
-        return;
+        return commandConsumed();
       }
 
       if (await tryHandleChatTabsCommand(larkAppId, message, senderOpenId, isAllowed)) {
-        return;
+        return commandConsumed();
       }
 
       if (await tryHandleMentionModeCommand(larkAppId, message, senderOpenId, isAllowed)) {
-        return;
+        return commandConsumed();
       }
 
       if (await tryHandleSecretaryCommand(larkAppId, message, senderOpenId, isAllowed)) {
-        return;
+        return commandConsumed();
       }
 
       if (await tryHandleSubstituteCommand(larkAppId, message, senderOpenId)) {
-        return;
+        return commandConsumed();
       }
 
       // /grant、/revoke — 群内授权元命令。在路由/spawn 之前拦截（仅 owner，需明确 @ 本 bot），
       // 否则会被当成 prompt 喂给 CLI 会话。
       if (await tryHandleGrantCommand(larkAppId, message, senderOpenId)) {
-        return;
+        return commandConsumed();
       }
 
       // /invite — 把群外 bot 拉进本群的元命令。与 /grant 同款拦截模型（仅 owner，
       // 需明确 @ 本 bot），防止进路由/spawn，也防多 bot 重复执行拉人。
       if (await tryHandleInviteCommand(larkAppId, message, senderOpenId)) {
-        return;
+        return commandConsumed();
       }
 
       logger.debug('Received message:', message);
@@ -5993,6 +6052,9 @@ export function createLarkEventDispatcherRuntime(
           `[substitute:${larkAppId}] excluded chat — dropping @target message ` +
           `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
         );
+        reportMentionDrop({
+          larkAppId, botOpenId: getBot(larkAppId).botOpenId, message, reason: 'substitute_excluded_chat', senderOpenId,
+        });
         return;
       }
       // 运行态 per-chat off：同上，只 @配置替身对象、未直接 @本 bot 的消息必须让路。
@@ -6010,6 +6072,9 @@ export function createLarkEventDispatcherRuntime(
           `[substitute:${larkAppId}] per-chat off — dropping @target message ` +
           `msg=${messageId.substring(0, 12)} chat=${chatId.substring(0, 12)}`,
         );
+        reportMentionDrop({
+          larkAppId, botOpenId: getBot(larkAppId).botOpenId, message, reason: 'substitute_chat_off', senderOpenId,
+        });
         return;
       }
       let substituteTrigger = substituteChatMode
@@ -6034,6 +6099,9 @@ export function createLarkEventDispatcherRuntime(
         // A keyword miss is a hand-off to the person, including owned topics,
         // mentionMode=never and solo groups. Do not fall through to auto-reply.
         logger.debug(`[substitute:${larkAppId}] keyword miss — dropping @target message msg=${messageId.substring(0, 12)}`);
+        reportMentionDrop({
+          larkAppId, botOpenId: getBot(larkAppId).botOpenId, message, reason: 'substitute_keyword_miss', senderOpenId,
+        });
         return;
       }
       if (substituteTrigger && !explicitlyMentionedThisBot && mentionlessSlash) {
@@ -6051,6 +6119,9 @@ export function createLarkEventDispatcherRuntime(
             `[substitute:${larkAppId}] active-topic trigger disabled; backing off ` +
             `msg=${messageId.substring(0, 12)} thread=${String(routing.anchor).substring(0, 12)}`,
           );
+          reportMentionDrop({
+            larkAppId, botOpenId: getBot(larkAppId).botOpenId, message, reason: 'substitute_topic_backoff', senderOpenId,
+          });
           return;
         }
       }
@@ -6461,8 +6532,12 @@ export function createLarkEventDispatcherRuntime(
             // 覆盖 ownsSession 真假两种情况，但绝不把该消息喂进已有 session。
             // 卡已在等处理 / 刚被拒绝时不再发卡，改回申请人一句原因（每张卡一次）。
             if (primary) return ignoredUnsupportedPrimarySideEffect('grant request cards');
-            await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data, { notifyThrottledRequester: true });
+            const grantOutcome = await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data, { notifyThrottledRequester: true });
             logger.debug(`Ignoring group message from non-allowed user: ${senderOpenId} (grant request card path)`);
+            const grantDrop = silentGrantDropReason(grantOutcome);
+            if (grantDrop) {
+              reportMentionDrop({ larkAppId, botOpenId: getBot(larkAppId).botOpenId, message, reason: grantDrop, senderOpenId });
+            }
             return;
           }
           if (access === 'ignore') {
@@ -6474,6 +6549,9 @@ export function createLarkEventDispatcherRuntime(
             if (senderOpenId
               && evaluateTalk(larkAppId, chatId, senderOpenId).reason === 'blocked') {
               logger.debug(`Ignoring new-topic auto-start from blocked sender: ${senderOpenId}`);
+              reportMentionDrop({
+                larkAppId, botOpenId: getBot(larkAppId).botOpenId, message, reason: 'sender_blocked', senderOpenId,
+              });
               return;
             }
             // 主动开工 — 场景②: a non-@ message that seeds a brand-new topic in
