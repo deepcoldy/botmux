@@ -726,35 +726,99 @@ function anyCaseGlob(site: string): string {
   return site.replace(/[a-z]/g, c => `[${c}${c.toUpperCase()}]`);
 }
 
-/**
- * Shell lines selecting the regional ByteCloud JWT for this call's site.
- *
- * A site in a region the identity holds no token for is REFUSED. Sending the
- * default (cn) token there cannot work — the partition rejects it (HTTP 401,
- * read by the person as "not logged in") or bytedcli skips it for the other
- * site's login, which a per-person scratch HOME does not have — and it would
- * hide which ticket is actually missing. Commands that never use that
- * partition's token run as before (see {@link BYTEDCLI_REGION_FREE_FN}).
- *
- * The site is read the way bytedcli 0.191 reads it: `--cloud-site` is its
- * spelling of `--site`, an empty `--site` counts as not given (the variable
- * then decides), and the value is trimmed with JS `trim()`, which also drops
- * Unicode spaces. Stripping every non-site character at either end covers that
- * trim; a value it over-strips is not a site bytedcli accepts either.
- */
-function bytedcliRegionalSelection(): string[] {
+/** Shell lines: `case "$<siteVar>"` setting `<jwtVar>` to this identity's
+ *  token for that site's region, and `<regionVar>` (when given) to the region. */
+function bytedcliSiteRegionCase(siteVar: string, jwtVar: string, regionVar?: string): string[] {
   const cases = (Object.keys(BYTEDCLI_SITE_REGIONS) as BytedcliRegion[]).map(region => {
     const sites = BYTEDCLI_SITE_REGIONS[region];
     const aliases = Object.keys(BYTEDCLI_SITE_ALIASES).filter(alias => sites.includes(BYTEDCLI_SITE_ALIASES[alias]));
-    return `    ${[...sites, ...aliases].map(anyCaseGlob).join('|')}) __botmux_region=${region}; __botmux_regional=$${BYTEDCLI_REGIONAL_JWT_VARS[region]} ;;`;
+    // The `|` alternatives are joined here, as literal text: sh does not read
+    // a `|` that comes out of a parameter expansion as a pattern separator.
+    const setRegion = regionVar ? `${regionVar}=${region}; ` : '';
+    return `    ${[...sites, ...aliases].map(anyCaseGlob).join('|')}) ${setRegion}${jwtVar}=$${BYTEDCLI_REGIONAL_JWT_VARS[region]} ;;`;
   });
+  return [`  case "$${siteVar}" in`, ...cases, '  esac'];
+}
+
+/** Shell lines trimming `$<siteVar>` the way bytedcli does (JS `trim()`, which
+ *  also drops Unicode spaces). Stripping every non-site character at either end
+ *  covers that trim; a value it over-strips is not a site bytedcli accepts either. */
+function bytedcliSiteTrim(siteVar: string): string[] {
+  return [
+    `  ${siteVar}=\${${siteVar}#"\${${siteVar}%%[[:alnum:]-]*}"}`,
+    `  ${siteVar}=\${${siteVar}%"\${${siteVar}##*[[:alnum:]-]}"}`,
+  ];
+}
+
+/**
+ * Shell lines selecting the regional ByteCloud JWT for this call's site.
+ *
+ * A call whose GLOBAL site is in a region the identity holds no token for is
+ * REFUSED. Sending the default (cn) token there cannot work — the partition
+ * rejects it (HTTP 401, read by the person as "not logged in") or bytedcli
+ * skips it for the other site's login, which a per-person scratch HOME does not
+ * have — and it would hide which ticket is actually missing. Commands that
+ * never use that partition's token run as before (see
+ * {@link BYTEDCLI_REGION_FREE_FN}).
+ *
+ * The global site is read the way bytedcli 0.191 reads it: from the root
+ * options only — it enables positional options, so a `--site` after the
+ * command is that command's own option (a filter for `bytecloud
+ * list-legacy-vregions`, a preset for `forge`), not the site the call is
+ * authenticated against; `--cloud-site` is its spelling of `--site`; an empty
+ * `--site` counts as not given (the variable then decides); the value is
+ * trimmed with JS `trim()` and matched in any case.
+ *
+ * Which token is swapped in is decided separately and as before (#2472): by
+ * the last `--site` anywhere, so a command that authenticates against its own
+ * `--site` (nac) keeps getting the partition token it was getting.
+ */
+function bytedcliRegionalSelection(): string[] {
+  const rootValueOptions = BYTEDCLI_ROOT_OPTIONS_WITH_VALUE.filter(option => option !== '--site' && option !== '--cloud-site');
   const hints = (Object.keys(BYTEDCLI_REGIONAL_MISSING_HINTS) as BytedcliRegionalJwtSource[]).map(source =>
     `      ${source}) __botmux_hint=${shellSingleQuote(BYTEDCLI_REGIONAL_MISSING_HINTS[source])} ;;`);
   return [
+    // The global site: the last --site among the root options, which end at
+    // the first command the way bytedcli's getFirstCommandArgIndex finds it.
+    '  __botmux_gsite=',
+    '  __botmux_next=',
+    '  __botmux_skip=',
+    '  for __botmux_arg in "$@"; do',
+    '    if [ -n "$__botmux_next" ]; then __botmux_gsite=$__botmux_arg; __botmux_next=; continue; fi',
+    '    if [ -n "$__botmux_skip" ]; then __botmux_skip=; continue; fi',
+    '    case "$__botmux_arg" in',
+    '      --) break ;;',
+    '      --site|--cloud-site) __botmux_next=1 ;;',
+    '      --site=*) __botmux_gsite=${__botmux_arg#--site=} ;;',
+    '      --cloud-site=*) __botmux_gsite=${__botmux_arg#--cloud-site=} ;;',
+    `      ${rootValueOptions.join('|')}) __botmux_skip=1 ;;`,
+    '      -*) ;;',
+    '      *) break ;;',
+    '    esac',
+    '  done',
+    '  if [ -z "$__botmux_gsite" ]; then __botmux_gsite=${BYTEDCLI_CLOUD_SITE:-}; fi',
+    ...bytedcliSiteTrim('__botmux_gsite'),
+    '  __botmux_region=',
+    '  __botmux_regional=',
+    ...bytedcliSiteRegionCase('__botmux_gsite', '__botmux_regional', '__botmux_region'),
+    '  if [ -n "$__botmux_region" ] && [ -z "$__botmux_regional" ] && ! __botmux_bd_region_free "$@"; then',
+    `    case "$${BYTEDCLI_REGIONAL_SOURCE_VAR}" in`,
+    ...hints,
+    `      *) __botmux_hint=${shellSingleQuote(BYTEDCLI_REGIONAL_MISSING_DEFAULT_HINT)} ;;`,
+    '    esac',
+    // printf's format carries no prose: the site is the caller's argument.
+    "    printf '%s%s%s%s%s%s%s\\n' "
+      + `${shellSingleQuote('botmux: bytedcli 这次调用的站点 ')} "$__botmux_gsite" `
+      + `${shellSingleQuote(' 属于 ')} "$__botmux_region" `
+      + `${shellSingleQuote(' 分区，需要发起人在该分区的 ByteCloud JWT，但本轮发起人身份里没有这张票，命令未执行。botmux 不会拿默认分区的票去请求 ')} "$__botmux_region" `
+      + `${shellSingleQuote(' 分区（那只会被对方以 401 / 未登录拒绝）。')} >&2`,
+    `    printf '%s\\n' "$__botmux_hint" '[reason=regional_jwt_missing]' >&2`,
+    `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '  fi',
+    // The token to send: by the last --site anywhere (#2472). Arguments are
+    // only read, never rewritten: "$@" is passed to the tool unchanged.
     '  __botmux_site=',
     '  __botmux_next=',
-    // Last --site wins, as with the CLI's own option parsing. Arguments are
-    // only read, never rewritten: "$@" is passed to the tool unchanged.
     '  for __botmux_arg in "$@"; do',
     '    if [ -n "$__botmux_next" ]; then __botmux_site=$__botmux_arg; __botmux_next=; continue; fi',
     '    case "$__botmux_arg" in',
@@ -765,30 +829,11 @@ function bytedcliRegionalSelection(): string[] {
     '    esac',
     '  done',
     '  if [ -z "$__botmux_site" ]; then __botmux_site=${BYTEDCLI_CLOUD_SITE:-}; fi',
-    // bytedcli trims (JS trim) and lowercases the site before resolving it.
-    '  __botmux_site=${__botmux_site#"${__botmux_site%%[[:alnum:]-]*}"}',
-    '  __botmux_site=${__botmux_site%"${__botmux_site##*[[:alnum:]-]}"}',
-    '  __botmux_region=',
+    ...bytedcliSiteTrim('__botmux_site'),
     '  __botmux_regional=',
-    '  case "$__botmux_site" in',
-    ...cases,
-    '  esac',
-    '  if [ -n "$__botmux_region" ] && [ -z "$__botmux_regional" ] && ! __botmux_bd_region_free "$@"; then',
-    `    case "$${BYTEDCLI_REGIONAL_SOURCE_VAR}" in`,
-    ...hints,
-    `      *) __botmux_hint=${shellSingleQuote(BYTEDCLI_REGIONAL_MISSING_DEFAULT_HINT)} ;;`,
-    '    esac',
-    // printf's format carries no prose: the site is the caller's argument.
-    "    printf '%s%s%s%s%s%s%s\\n' "
-      + `${shellSingleQuote('botmux: bytedcli 这次调用的站点 ')} "$__botmux_site" `
-      + `${shellSingleQuote(' 属于 ')} "$__botmux_region" `
-      + `${shellSingleQuote(' 分区，需要发起人在该分区的 ByteCloud JWT，但本轮发起人身份里没有这张票，命令未执行。botmux 不会拿默认分区的票去请求 ')} "$__botmux_region" `
-      + `${shellSingleQuote(' 分区（那只会被对方以 401 / 未登录拒绝）。')} >&2`,
-    `    printf '%s\\n' "$__botmux_hint" '[reason=regional_jwt_missing]' >&2`,
-    `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
-    '  fi',
+    ...bytedcliSiteRegionCase('__botmux_site', '__botmux_regional'),
     '  if [ -n "$__botmux_regional" ]; then BYTEDCLI_USER_CLOUD_JWT=$__botmux_regional; fi',
-    `  unset __botmux_site __botmux_next __botmux_arg __botmux_region __botmux_regional ${BYTEDCLI_REGIONAL_SOURCE_VAR} ${Object.values(BYTEDCLI_REGIONAL_JWT_VARS).join(' ')}`,
+    `  unset __botmux_site __botmux_gsite __botmux_next __botmux_skip __botmux_arg __botmux_region __botmux_regional ${BYTEDCLI_REGIONAL_SOURCE_VAR} ${Object.values(BYTEDCLI_REGIONAL_JWT_VARS).join(' ')}`,
   ];
 }
 

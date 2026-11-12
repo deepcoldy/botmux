@@ -944,6 +944,10 @@ describe('renderIdentityWrapper', () => {
     [['aa', 'query', '--help']],
     [['--version']],
     [['-V']],
+    // Root help / version flags answer before any command runs.
+    [['-h', 'aa']],
+    [['--version', 'aa']],
+    [['-V', 'aa', 'query']],
     [[]],
     [['--json']],
   ] as const)('runs what never uses the partition token without that token: %j', args => {
@@ -962,6 +966,40 @@ describe('renderIdentityWrapper', () => {
     const r = bytedcliRun({ cloudJwt: 'cn-tok' }, [...args], { BYTEDCLI_CLOUD_SITE: 'i18n-tt' });
     expect(r.status).toBe(IDENTITY_DENIED_EXIT_CODE);
     expect(r.stdout).toBe('');
+  });
+
+  // bytedcli enables positional options: a --site after the command is that
+  // command's own option (`bytecloud list-legacy-vregions --site i18n` filters
+  // a cn listing by site), not the site the call authenticates against. Such a
+  // call ran with the default token before regional refusals and still does.
+  it.each([
+    [['bytecloud', 'list-legacy-vregions', '--site', 'i18n'], {}],
+    [['-j', 'bytecloud', 'list-legacy-vdcs', '--site=i18n-tt'], {}],
+    [['--profile', 'p', 'aa', '--cloud-site', 'us-ttp'], {}],
+    [['--site', 'cn', 'aa', '--site', 'row'], { BYTEDCLI_CLOUD_SITE: 'i18n-tt' }],
+  ] as const)('does not refuse for a --site that belongs to the command: %j %j', (args, env) => {
+    expect(bytedcliRun({ cloudJwt: 'cn-tok' }, [...args], env)).toMatchObject({ status: 0, stdout: 'cn-tok' });
+  });
+
+  // The global site — before the command, else the variable — is what bytedcli
+  // authenticates against, whatever --site the command adds, so it decides the
+  // refusal and the partition it names.
+  it.each([
+    [['--site', 'i18n-tt', 'bytecloud', 'list-legacy-vregions', '--site', 'i18n'], {}, 'i18n-tt', 'i18n'],
+    [['aa', '--site', 'cn'], { BYTEDCLI_CLOUD_SITE: 'us-ttp' }, 'us-ttp', 'tx'],
+    // A root option's value is not the command: the --site after it is still global.
+    [['--jq', 'aa', '--site', 'i18n-tt', 'bb'], {}, 'i18n-tt', 'i18n'],
+  ] as const)('refuses by the global site, whatever the command adds: %j %j', (args, env, site, region) => {
+    const r = bytedcliRun({ cloudJwt: 'cn-tok', regionalCloudJwts: { i18nbd: 'bd-tok' } }, [...args], env);
+    expect(r.status).toBe(IDENTITY_DENIED_EXIT_CODE);
+    expect(r.stdout).toBe('');
+    expect(r.stderr).toContain(`站点 ${site} 属于 ${region} 分区`);
+  });
+
+  // Which token is sent is unchanged: a command that authenticates against its
+  // own --site (nac) still gets that partition's token.
+  it('still sends the partition token named by a --site after the command', () => {
+    expect(bytedcliSiteToken(['nac', 'aa', '--site', 'i18n-bd'])).toBe('bd-tok');
   });
 
   it('keeps the regional source marker away from the tool', () => {
