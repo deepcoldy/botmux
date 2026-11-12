@@ -620,7 +620,6 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // global PASSTHROUGH_COMMANDS instead (forwarded to Codex on an existing
     // session; harmless unknown-command on other CLIs).
     defaultPassthroughCommands: ['/goal'],
-    nativeGoal: { start: '/goal', status: '/goal' },
     buildSessionRenameCommand: (title) => `/rename ${title}`,
     systemHints: BOTMUX_SHELL_HINTS,
     // Codex 0.134.0+ accepts a message while the current turn is still running:

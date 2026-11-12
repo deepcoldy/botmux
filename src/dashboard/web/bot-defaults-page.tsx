@@ -9387,7 +9387,7 @@ export function NativeSlashCommandRegistration(props: { bot: BotDefaultsRow }) {
   );
 }
 
-function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+export function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const [passthrough, setPassthrough] = useState(typeof props.bot.customPassthroughCommands === 'string' ? props.bot.customPassthroughCommands : '');
   const [canTalk, setCanTalk] = useState(typeof props.bot.canTalkDaemonCommands === 'string' ? props.bot.canTalkDaemonCommands : '');
@@ -9437,6 +9437,15 @@ function SlashCommandPermissionsSection(props: { bot: BotDefaultsRow; patchBot: 
       <NativeSlashCommandRegistration bot={props.bot} />
       <div className="bd-subsection">
         <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.customPassthroughHelp')}>{tr('botDefaults.customPassthrough')}</FieldTitle></h4>
+        {props.bot.defaultPassthroughCommands?.length ? (
+          <div data-default-passthrough-commands="">
+            <p>{tr('botDefaults.defaultPassthrough')}</p>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 12 }}>
+              {props.bot.defaultPassthroughCommands.map(command => <code key={command}>{command}</code>)}
+            </div>
+          </div>
+        ) : null}
+        <p>{tr('botDefaults.customPassthroughInputHelp')}</p>
         <textarea
           data-input="customPassthroughCommands"
           rows={2}

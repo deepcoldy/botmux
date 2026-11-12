@@ -2129,9 +2129,30 @@ describe('PASSTHROUGH_COMMANDS set', () => {
     expect(resolvePassthroughCommands('app-2', 'codex-app').size).toBe(0);
   });
 
-  it.each(['seed', 'relay'])('enables goal cold-start through the generic %s capability', cliId => {
+  it.each(['seed', 'relay'])('enables native goal passthrough and cold-start for %s', cliId => {
     expect(resolveAdapterDefaultPassthroughCommands('app-2', cliId)).toContain('/goal');
-    expect(resolvePassthroughCommands('app-2', cliId).has('/goal')).toBe(true);
+  });
+
+  it('routes configured command names while preserving the full native command text', async () => {
+    const { classifySlash } = await import('../src/core/command-router.js');
+    const { writeRawCommandLine } = await import('../src/core/raw-command-writer.js');
+    const previous = vi.mocked(getBot).getMockImplementation()!;
+    const bot = getBot('app-2');
+    try {
+      bot.config.customPassthroughCommands = ['/export'];
+      vi.mocked(getBot).mockReturnValue(bot);
+      const passthrough = resolvePassthroughCommands('app-2');
+      expect(passthrough.has('/export')).toBe(true);
+      expect(resolvePassthroughCommands('app-2', undefined, false).has('/export')).toBe(false);
+      const content = '/export "release notes 中文" --format json --path C:\\tmp\\report';
+      const decision = classifySlash({ text: content, cliId: 'codex', context: 'thread', phase: 'running',
+        passthrough, coldStartPassthrough: new Set(), senderIsBot: false, acceptSlashFromBots: false });
+      expect(decision).toEqual({ kind: 'passthrough', cmd: '/export', content, delivery: 'to_session' });
+      const backend = { sendText: vi.fn(() => true), sendSpecialKeys: vi.fn(() => true), write: vi.fn(() => true) };
+      await writeRawCommandLine(backend, content, { delay: async () => {} });
+      expect(backend.sendText).toHaveBeenCalledWith(content);
+      expect(backend.sendSpecialKeys).toHaveBeenCalledWith('Enter');
+    } finally { vi.mocked(getBot).mockImplementation(previous); }
   });
 
   it('forwards /fast as a global passthrough WITHOUT cold-start (not adapter-scoped)', () => {

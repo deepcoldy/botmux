@@ -13543,40 +13543,17 @@ describe('POST /api/sessions/:sessionId/reply-card-ready', () => {
   });
 });
 
-describe('native goal Dashboard IPC', () => {
-  it('dispatches only declared controls and preserves the session-frozen CLI', async () => {
-    const appId = 'app_goal_ipc';
-    registerBot({ larkAppId: appId, larkAppSecret: 'fixture', cliId: 'codex-app' });
+describe('Dashboard default CLI passthrough configuration', () => {
+  it('reads native defaults separately from custom command names', async () => {
+    const appId = 'app_passthrough_defaults';
+    registerBot({ larkAppId: appId, larkAppSecret: 'fixture', cliId: 'traex', customPassthroughCommands: ['/export'] });
     setLarkAppId(appId);
-    setIpcAuthSecret(TEST_IPC_SECRET);
-    const ds = { session: { sessionId: 'goal-session', cliId: 'traex', status: 'active' },
-      larkAppId: appId, worker: { killed: false }, initConfig: { cliId: 'traex', backendType: 'pty' } } as any;
-    const find = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
-    const send = vi.spyOn(workerPool, 'sendWorkerSessionInput').mockReturnValue(true);
-    try {
-      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
-      const path = '/api/sessions/goal-session/goal';
-      const read = await fetch(`http://127.0.0.1:${handle.port}${path}`, { headers: trustedHostHeaders('GET', path, handle.port) });
-      expect(await read.json()).toMatchObject({ ok: true, actions: ['start', 'status', 'pause', 'resume', 'clear'] });
-      const post = (body: unknown) => fetch(`http://127.0.0.1:${handle!.port}${path}`, {
-        method: 'POST', headers: { ...trustedHostHeaders('POST', path, handle!.port), 'content-type': 'application/json' }, body: JSON.stringify(body),
-      });
-      expect((await post({ action: 'pause' })).status).toBe(200);
-      expect(send).toHaveBeenCalledWith(ds, { type: 'raw_input', content: '/goal pause', nativeGoalControl: true });
-      send.mockClear();
-      expect((await post({ action: 'shutdown' })).status).toBe(400);
-      expect(send).not.toHaveBeenCalled();
-      ds.initConfig.codexRpcInput = true;
-      expect((await post({ action: 'start', objective: 'Fix tests' })).status).toBe(409);
-      expect(send).not.toHaveBeenCalled();
-    } finally { find.mockRestore(); send.mockRestore(); }
-  });
-  it('refuses goal controls without trusted-host authentication', async () => {
-    setIpcAuthSecret(TEST_IPC_SECRET);
-    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
-    const response = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s1/goal`, {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: 'start', objective: 'Fix tests' }),
-    });
-    expect(response.status).toBe(401);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const response = await fetch(`http://127.0.0.1:${handle.port}/api/bot-default-oncall`);
+    expect(response.status).toBe(200);
+    const body = await response.json() as any;
+    expect(body.defaultPassthroughCommands).toContain('/goal');
+    expect(body.defaultPassthroughCommands).not.toContain('/export');
+    expect(body.customPassthroughCommands).toBe('/export');
   });
 });

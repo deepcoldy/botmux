@@ -121,7 +121,6 @@ import {
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { BOT_PROXY_ROUTES, handleDaemonProxyRoute, type DaemonProxyDeps } from './dashboard/daemon-proxy-routes.js';
 import { handleSessionEnvRoute } from './dashboard/session-env-api.js';
-import { handleGoalControlProxy } from './dashboard/goal-control-proxy.js';
 import { handleNativeSlashCommandsProxy } from './dashboard/native-slash-commands-proxy.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
 import { decisionBoardAccess, decisionBoardEntryRedirect, handleDecisionBoardApi } from './dashboard/decision-board-api.js';
@@ -6626,13 +6625,6 @@ const server = createServer(async (req, res) => {
       if (!entry) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
       return jsonRes(res, 200, { ok: true, entry });
     }
-
-    if (await handleGoalControlProxy(req, res, url, {
-      identity: requestIdentity,
-      csrfTokens: controlCsrfTokens,
-      ownerOf: sessionId => aggregator.ownerOf(sessionId) ?? undefined,
-      proxy: proxyToDaemon,
-    })) return;
 
     // 看板放置 / 重命名 / 锁定：带 JSON body 的会话写操作，原样转发给 owner daemon。
     // 不在公开读白名单内 → 只读访客在 decideDashboardAuth 已被 401。

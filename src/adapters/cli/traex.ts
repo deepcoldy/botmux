@@ -377,7 +377,6 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     id: 'traex',
     // Native /goal starts work and can cold-start an empty topic.
     defaultPassthroughCommands: ['/goal'],
-    nativeGoal: { start: '/goal', status: '/goal', pause: '/goal pause', resume: '/goal resume', clear: '/goal clear' },
     // codex_core-based TUI: hook-review flow + legacy-data migration picker.
     stuckPageFamily: 'codex-family',
     mcpGateway: {

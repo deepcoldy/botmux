@@ -358,6 +358,12 @@ describe('dashboard bot payload helpers', () => {
     });
   });
 
+  it('projects daemon-provided default CLI command names without inventing them for old daemons', () => {
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { defaultPassthroughCommands: ['/goal', '/model', 3, 'invalid'] }))
+      .toMatchObject({ defaultPassthroughCommands: ['/goal', '/model'] });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {}).defaultPassthroughCommands).toBeUndefined();
+  });
+
   it('projects launchShell so the dashboard preserves it after refresh', () => {
     const daemon = { larkAppId: 'app_shell', botName: 'BotShell', cliId: 'codex' };
     expect(botDefaultsPayload(daemon, { launchShell: '/usr/bin/zsh' })).toMatchObject({

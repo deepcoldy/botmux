@@ -35834,10 +35834,3 @@ button.dboard-add-image { min-height: 28px; padding: 0 10px; font-size: var(--fs
 .bd-oncall-preset > strong { font-size: 12px; font-weight: 600; }
 .bd-oncall-preset .bd-oncall-grid { margin-top: 12px; gap: 12px; }
 .bd-oncall-preset > .bd-section-note { display: block; margin-top: 12px; }
-
-.session-goal-panel { margin: 16px 0; padding: 16px; border: 1px solid var(--border); border-radius: 10px; }
-.session-goal-panel h4 { margin: 0 0 8px; }
-.session-goal-help { color: var(--muted); font-size: 13px; }
-.session-goal-panel textarea { display: block; width: 100%; box-sizing: border-box; margin: 8px 0; resize: vertical; }
-.session-goal-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0; }
-.session-goal-panel [role="alert"] { color: var(--danger); }

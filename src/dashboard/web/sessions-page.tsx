@@ -114,7 +114,6 @@ import { toast } from './toast.js';
 import { confirm } from './confirm-modal.js';
 import { SessionEnvLiveModal } from './session-env-editor.js';
 import { controlCsrfHeaders } from './control-csrf.js';
-import { SessionGoalPanel } from './session-goal-panel.js';
 
 type SessionRow = Record<string, any> & { sessionId: string; status: string };
 
@@ -1331,7 +1330,6 @@ function Drawer(props: {
             <p><b>rootMessageId:</b> <code>{row.rootMessageId ?? ''}</code> <CopyButton value={row.rootMessageId ?? ''} /></p>
             {row.threadId ? <p><b>threadId:</b> <code>{row.threadId}</code></p> : null}
             <p><b>{t('sessions.workingDir')}:</b> {row.workingDir ?? '-'}</p>
-            {!closed ? <SessionGoalPanel key={row.sessionId} sessionId={row.sessionId} terminalUrl={terminal} /> : null}
             <InsightPanel row={row} />
           </div>
           <footer className="drawer-foot">

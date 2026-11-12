@@ -158,7 +158,6 @@ import {
 import * as substituteModeStore from '../services/substitute-mode-store.js';
 import { claimPromptContext } from '../services/prompt-context-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
-import { nativeGoalControlView, prepareNativeGoalCommand } from './native-goal-control.js';
 import { normalizeCliRuntimeConfig, type CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import { evaluateReadIsolationGate } from '../adapters/cli/read-isolation.js';
 import {
@@ -4563,34 +4562,6 @@ for (const action of ['auth-request', 'auth-status']) {
 /** 向本会话 CLI 注入一条 allowlist 内的原生斜杠命令（idle 后生效）。
  *  鉴权双路径（见 sessionCliIpcAuth）：trusted-host 签名或本会话 rotating
  *  capability；命令面由 allowlist（默认空=全拒）承担。 */
-for (const method of ['GET', 'POST']) ipcRoute(method, '/api/sessions/:sessionId/goal', async (req, res, params) => {
-  // Only the Dashboard host can invoke goal controls; CLI session capabilities
-  // must not acquire this path's permission to start arbitrary agent work.
-  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { ok: false, error: 'trusted_host_required' });
-  const body = method === 'POST' ? await readJsonBody(req, 20 * 1024).catch(() => null) : null;
-  const ds = findActiveBySessionId(params.sessionId);
-  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
-  const cfg = getBot(ds.larkAppId).config;
-  const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.initConfig?.cliId ?? ds.session.cliId ?? cfg.cliId;
-  const adapter = createCliAdapterSync(cliId as never, cliId === cfg.cliId ? cfg.cliPathOverride : undefined);
-  const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
-  const view = nativeGoalControlView(adapter, {
-    adopted: !!ds.adoptedFrom || !!ds.initConfig?.adoptMode,
-    remote: !!backendType && isRemoteBackendType(backendType),
-    rpc: ds.initConfig?.codexRpcInput === true,
-    live: !!ds.worker && !ds.worker.killed,
-  });
-  if (method === 'GET') return jsonRes(res, 200, { ok: true, ...view });
-  if (view.blockedReason) return jsonRes(res, 409, { ok: false, error: view.blockedReason });
-  const parsed = prepareNativeGoalCommand(adapter.nativeGoal, body);
-  if (!parsed.ok) return jsonRes(res, 400, parsed);
-  // Same native input lane as IM /goal, including commands while a goal runs.
-  if (!sendWorkerSessionInput(ds, { type: 'raw_input', content: parsed.command, nativeGoalControl: true })) {
-    return jsonRes(res, 409, { ok: false, error: 'no_live_worker' });
-  }
-  return jsonRes(res, 200, { ok: true, accepted: true });
-});
-
 ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
   const body = await readJsonBody<{ command?: string } & Record<string, unknown>>(req)
     .catch(() => ({} as { command?: string } & Record<string, unknown>));
@@ -10055,6 +10026,7 @@ ipcRoute('GET', '/api/bot-default-oncall', requireBoundBot(async (_req, res) => 
     residentSessionCount,
     dormantSessionCount,
     startupCommands,
+    defaultPassthroughCommands: [...resolvePassthroughCommands(cachedLarkAppId, undefined, false)],
     customPassthroughCommands,
     canTalkDaemonCommands,
     launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
