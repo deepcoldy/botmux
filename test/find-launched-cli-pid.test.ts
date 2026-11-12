@@ -241,13 +241,44 @@ describe('worker wrapper PID wiring', () => {
   });
 
   it.each([false, true])('publishes the TRAE child when the backend aliases its child accessor to the bound PID (late PID=%s)', late => {
+    // Observe right after the PID binding (synchronous, or the 120ms late-PID
+    // callback) and before the retry's first 500ms tick: the binding itself
+    // must publish, not leave the bridge/attestation on the launcher meanwhile.
+    let atBinding: { cliPid: number; bridgeCliPid: unknown; attested: unknown[] } | undefined;
     const result = runWorkerWiring(late, {
       cliId: 'traex', wrapperCli: '', scopeLaunched: false, aliasedChildPid: true,
       relayChildren: [200], childComms: { 200: 'traex' },
+      beforeTimers: scope => {
+        scope.setTimeout(() => {
+          atBinding = {
+            cliPid: scope.backend.cliPid,
+            bridgeCliPid: scope.bridgeCliPid,
+            attested: scope.publishLocalProcessAttestation.mock.calls.map((call: unknown[]) => call[0]),
+          };
+        }, late ? 121 : 0);
+      },
+    });
+    expect(atBinding).toEqual({ cliPid: 200, bridgeCliPid: 200, attested: late ? [100, 200] : [200] });
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+  });
+
+  it.each([false, true])('binds a later-forked TRAE leaf when an aliased child accessor already names the scope payload (late PID=%s)', late => {
+    // Herdr/ZMX shape behind the owned session scope: the payload binding moves
+    // the aliased cliPid from the pane supervisor (100) to the Node launcher
+    // (150) before the retry's first tick, and the native TRAE (200) forks only
+    // after that tick. Discovery must keep running for the captured root.
+    const result = runWorkerWiring(late, {
+      cliId: 'traex', wrapperCli: '', aliasedChildPid: true,
+      scopeLaunched: true, scopePayloadPid: 150,
+      relayChildren: [150], children: { 150: [200] }, childComms: { 150: 'node', 200: 'traex' },
+      traexChildAfterMs: 2_000,
     });
     expect(result.backend.cliPid).toBe(200);
     expect(result.bridgeCliPid).toBe(200);
     expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+    expect(result.elapsedMs).toBeGreaterThanOrEqual(2_000);
   });
 
   it.each([false, true])('keeps a directly launched TRAE root rather than its TRAE subagent (late PID=%s)', late => {
@@ -269,6 +300,9 @@ describe('worker wrapper PID wiring', () => {
     });
     expect(result.backend.cliPid).toBe(100);
     expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(200);
+    // The superseded spawn's discovery ends at its next tick instead of
+    // rescanning the process table until the old launcher's leaf appears.
+    expect(result.elapsedMs).toBeLessThan(12_000);
   });
 
   it.each([false, true])('binds and attests an owned-scope payload rather than its pane supervisor (late PID=%s)', late => {

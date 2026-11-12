@@ -29071,7 +29071,14 @@ async function spawnCliBody(
     const generation = cliSpawnGeneration;
     scheduleTraexLeafPidResolve(launcherPid, {
       getBackend: () => backend,
-      getChildPid: () => backend?.getChildPid?.(),
+      // The captured spawn root, not backend.getChildPid() (same reasoning as
+      // the Codex resolver below): Herdr/ZMX alias that accessor to the mutable
+      // cliPid, which a launch-payload binding (owned scope / relay) has
+      // already moved off this root before the first tick. The same-pid arm
+      // would then end discovery for good, stranding a launcher whose TRAE
+      // leaf forks later. Backend identity still fences a replaced runtime;
+      // the generation fences a restart that keeps the same backend object.
+      getChildPid: () => (generation === cliSpawnGeneration ? launcherPid : null),
       applyRealPid: (realPid) => {
         if (generation !== cliSpawnGeneration) {
           log(`TRAE launcher: ignoring stale leaf pid ${realPid} from spawn ${generation} (current ${cliSpawnGeneration})`);
@@ -29159,9 +29166,9 @@ async function spawnCliBody(
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
     if (cfg.cliId === 'traex' && wiredPid !== ownershipPid) {
-      // Publish the synchronous ownership correction as well. Some backends
-      // alias getChildPid() to cliPid; rebinding it can end the retry before
-      // its callback gets a chance to update bridgeCliPid and attestation.
+      // Publish the synchronous ownership correction together with the
+      // binding: bridgeCliPid and the attestation must not keep naming the
+      // launcher until the retry's first tick.
       applyResolvedCliPid(wiredPid, 'TRAE ownership', ownershipPid);
     }
     if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(cliPid);
