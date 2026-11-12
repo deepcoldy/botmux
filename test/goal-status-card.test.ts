@@ -22,7 +22,7 @@ describe('native goal status card', () => {
     f.controller.update(active, 'om_start'); await f.controller.settled();
     expect(f.post).toHaveBeenCalledTimes(1);
     const initial = JSON.parse(f.patch.mock.calls[0][1]);
-    expect(initial.header.title.content).toMatch(/^目标进行中/);
+    expect(initial.header.title.content).toContain('目标进行中');
     await vi.advanceTimersByTimeAsync(2000);
     const animated = JSON.parse(f.patch.mock.calls.at(-1)![1]);
     expect(animated.header.title.content).not.toBe(initial.header.title.content);
@@ -32,7 +32,7 @@ describe('native goal status card', () => {
     expect(f.post).toHaveBeenCalledTimes(1);
     expect(f.patch.mock.calls.every(call => call[0] === 'om_goal_card')).toBe(true);
     const completed = JSON.parse(f.patch.mock.calls.at(-1)![1]);
-    expect(completed.header.title.content).toBe('目标已完成');
+    expect(completed.header.title.content).toContain('目标已完成');
     expect(completed.header.template).toBe('green');
     expect(completed.body.elements[1].content).toBe('已运行：00:00:15');
     const count = f.patch.mock.calls.length;
@@ -55,7 +55,7 @@ describe('native goal status card', () => {
     f.controller.update({ ...active, status: 'complete', updatedAt: active.updatedAt + 1, timeUsedSeconds: 11 });
     release('om_goal_card'); await f.controller.settled();
     expect(f.post).toHaveBeenCalledTimes(1);
-    expect(JSON.parse(f.patch.mock.calls.at(-1)![1]).header.title.content).toBe('目标已完成');
+    expect(JSON.parse(f.patch.mock.calls.at(-1)![1]).header.title.content).toContain('目标已完成');
     f.controller.dispose();
   });
   it('recovers a known card after restart without posting a second card', async () => {
@@ -112,7 +112,7 @@ describe('native goal status card', () => {
     next.update({ ...active, status: 'complete', updatedAt: active.updatedAt + 1, timeUsedSeconds: 11 });
     expect(nextPatch).not.toHaveBeenCalled();
     release(); await next.settled();
-    expect(JSON.parse(nextPatch.mock.calls[0][1]).header.title.content).toBe('目标已完成');
+    expect(JSON.parse(nextPatch.mock.calls[0][1]).header.title.content).toContain('目标已完成');
     f.controller.dispose(); next.dispose();
   });
   it('stops rendering when the worker no longer owns the session', async () => {

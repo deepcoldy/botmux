@@ -49,7 +49,9 @@ export function buildGoalStatusCard(goal: NativeGoalState, now = Date.now(), loc
     : { active: '目标进行中', complete: '目标已完成', paused: '目标已暂停', blocked: '目标受阻', cleared: '目标已清除' };
   const seconds = goalElapsedSeconds(goal);
   const elapsed = `${Math.floor(seconds / 3600).toString().padStart(2, '0')}:${Math.floor(seconds / 60 % 60).toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`;
-  const title = (labels[goal.status as keyof typeof labels] ?? (locale === 'en' ? 'Goal stopped' : '目标已停止'))
+  const objective = Array.from(goal.objective.replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\s+/g, ' ').trim());
+  const title = `${objective.slice(0, 40).join('')}${objective.length > 40 ? '…' : ''} — `
+    + (labels[goal.status as keyof typeof labels] ?? (locale === 'en' ? 'Goal stopped' : '目标已停止'))
     + (goal.status === 'active' ? ` ${'·'.repeat(Math.floor(now / 2000) % 3 + 1)}` : '');
   return JSON.stringify({ schema: '2.0', config: { wide_screen_mode: true },
     header: { title: { tag: 'plain_text', content: title },

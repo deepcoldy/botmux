@@ -41,7 +41,7 @@ describe('native goal worker-pool integration', () => {
     f.send({ status: 'complete', updatedAt: 106, timeUsedSeconds: 9 }); await f.settled();
     expect(f.posts).toHaveLength(1);
     expect(f.patches.every(patch => patch.id === 'om_card')).toBe(true);
-    expect(f.patches.at(-1).card.header.title.content).toBe('目标已完成');
+    expect(f.patches.at(-1).card.header.title.content).toContain('目标已完成');
     expect(f.patches.at(-1).card.body.elements[1].content).toBe('已运行：00:00:09');
     expect(f.acks).toHaveLength(2); f.close();
   });
