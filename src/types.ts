@@ -2415,6 +2415,11 @@ export interface WorkerFinalOutput {
    *  diagnostic, not a model answer: it must not count as the turn's delivered
    *  final reply. Presentation is unchanged. */
   emptyCompletedNotice?: boolean;
+  /** The transcript bridge recovered this turn from its journal after a
+   *  restart: which turn the reply answers, for a note above it. Presentation
+   *  only and outside the output's identity, so a recovered re-emit still
+   *  matches the live emit of the same reply. */
+  restoredTurn?: import('./services/restored-turn-label.js').RestoredTurnLabel;
   userText?: string;
   /** Two-phase Codex App final settlement; daemon persists before ACKing worker. */
   codexAppSettlement?: {

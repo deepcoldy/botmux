@@ -192,7 +192,16 @@ export class WorkerSessionEventScope {
     if (submission) return submission === origin || sameRuntime(submission.runtime, origin.runtime) || submission.physicalId === origin.physicalId;
     const execution = this.executionForTurn(turnId, dispatchAttempt);
     const state = execution ? this.admissionStates.get(execution.executionId) : undefined;
-    if (state?.runtime) return sameRuntime(state.runtime, origin.runtime) || this.bindingForRuntime(state.runtime)?.physicalId === origin.physicalId;
+    if (state?.runtime) {
+      const executor = this.bindingForRuntime(state.runtime);
+      if (sameRuntime(state.runtime, origin.runtime) || executor?.physicalId === origin.physicalId) return true;
+      // An attempt no binding of this worker ran — a predecessor's, still in
+      // the CLI this worker re-attached. Whether the live CLI's runtime is the
+      // one it ran on is the host's decision: it holds the events of a binding
+      // it has not confirmed yet, and refuses, visibly, an attempt it cannot
+      // tie to this runtime. Older generations' observers stay silent.
+      return !executor && !!this.current && origin.physicalId === this.current.physicalId;
+    }
     return this.isCurrentContext();
   }
   isExecutionSettled(turnId: string, dispatchAttempt?: number): boolean {

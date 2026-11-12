@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { afterEach } from 'vitest';
-import { spawnNodeTsScript } from './ts-runner.js';
+import { nodeTsRunnerPrefix, spawnNodeTsScript } from './ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../../src/types.js';
 import { resolveCodexRpcInput } from '../../src/services/codex-rpc-input-policy.js';
 import { killWorkerTmuxSession } from './worker-tmux-session.js';
@@ -107,7 +107,7 @@ export async function fixture(enabled: boolean, loadData: false | 'busy' | 'orde
   writeFileSync(rolloutPath, '');
   writeFileSync(historyPath, '');
   const fake = join(root, 'fake-traex');
-  writeFileSync(fake, `#!/usr/bin/env node
+  writeFileSync(fake, `#!${nodeTsRunnerPrefix().command}
 const fs = require('node:fs');
 if (process.argv[2] === 'debug') {
   fs.appendFileSync(${JSON.stringify(rpcRequests)}, JSON.stringify({ method: 'debug/models' }) + '\\n');

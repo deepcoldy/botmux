@@ -93,7 +93,11 @@ const answered = (h: Harness, text: string) => readJsonLines(join(h.root, 'event
  *  ready gate arms on botmux's SessionStart hook (which the fake never runs)
  *  and releases on its timeout, /effort runs, then the message is written. */
 function wakeSuspendedSession() {
-  const h = setupFakeClaude({ turnMs: 800 });
+  // Claude's own pid-state record becomes readable only once the worker has
+  // bound the CLI's runtime, so the native session id first arrives with the
+  // write — the identity update this file is about. (A record readable at the
+  // first binding puts the id there and there is no later update to retire on.)
+  const h = setupFakeClaude({ turnMs: 800, pidStateGated: true });
   const transcript = h.transcript(h.sessionId);
   const ago = (ms: number) => new Date(Date.now() - 3_600_000 + ms).toISOString();
   mkdirSync(dirname(transcript), { recursive: true });
@@ -153,6 +157,10 @@ function wakeSuspendedSession() {
     prompt: WAKE_TEXT, turnId: WAKE_TURN, trustedCaller: caller,
     sessionCommand: { version: 2 as const, execution: controller.admitInput(WAKE_TURN) },
   });
+  void (async () => {
+    while (!controller.store.runtime(controller.ref)?.identity && g.child.exitCode === null) await new Promise(done => setTimeout(done, 50));
+    writeFileSync(h.pidStateGate, '');
+  })();
   const replies = () => sessionReply.mock.calls.map(args => String(args[1]));
   /** The next message, through the daemon's ordinary IM delivery. */
   const sendNext = () => workerPool.sendWorkerInput(ds, NEXT_TEXT, NEXT_TURN, { trustedCaller: caller });

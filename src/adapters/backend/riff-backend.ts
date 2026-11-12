@@ -383,6 +383,67 @@ export async function cancelRiffTaskById(
   }
 }
 
+/** One task of a Riff thread, as seen by the daemon-side close reconciliation. */
+export interface RiffThreadTaskState {
+  id: string;
+  status?: string;
+  /** Status is one of TERMINAL_RIFF_STATUSES. Unknown or missing status is NOT
+   *  terminal: a state we cannot classify must not count as stopped. */
+  terminal: boolean;
+}
+
+/**
+ * Daemon-side listing of every task Riff holds under `threadId` (the worker
+ * sends the botmux sessionId as the thread id on task-execute). Used to prove a
+ * thread has nothing left running when the worker that tracked its in-flight
+ * requests is gone. Same identity rules as cancelRiffTaskById: a throwaway
+ * instance for JWT + lane headers, never a JWT refresh.
+ *
+ * Anything but a well-formed success envelope is an error, so an empty list
+ * always means "no tasks" and never "the query did not work".
+ */
+export async function queryRiffThreadTasks(
+  cfg: { baseUrl: string; jwt?: string; jwtEnv?: string; jwtHome?: string; extraHeaders?: Record<string, string> },
+  threadId: string,
+): Promise<{ ok: true; tasks: RiffThreadTaskState[] } | { ok: false; error: string }> {
+  try {
+    const headers: Record<string, string> = {};
+    const inst = new RiffBackend(cfg as RiffBackendConfig, 'thread-query');
+    const jwt = await inst['resolveJwt']({ allowRefresh: false });
+    if (jwt) headers['x-jwt-token'] = jwt;
+    inst['applyExtraHeaders'](headers);
+    const resp = await fetch(
+      `${cfg.baseUrl}/api/tasks?threadId=${encodeURIComponent(threadId)}&view=summary`,
+      { headers, signal: AbortSignal.timeout(8_000) },
+    );
+    if (!resp.ok) return { ok: false, error: `tasks query HTTP ${resp.status}` };
+    const body = (await resp.json()) as { success?: unknown; data?: unknown };
+    if (body?.success !== true || !Array.isArray(body.data)) {
+      return { ok: false, error: 'tasks query returned no task list' };
+    }
+    const tasks: RiffThreadTaskState[] = [];
+    for (const node of body.data as Array<{ id?: unknown; status?: unknown; threadId?: unknown }>) {
+      if (!node || typeof node.id !== 'string' || !node.id) {
+        return { ok: false, error: 'tasks query returned a task without an id' };
+      }
+      // A filter the server ignored would list other sessions' tasks; the
+      // caller would cancel them. Refuse the whole answer instead.
+      if (node.threadId !== undefined && node.threadId !== threadId) {
+        return { ok: false, error: 'tasks query returned a task from another thread' };
+      }
+      const status = typeof node.status === 'string' ? node.status : undefined;
+      tasks.push({
+        id: node.id,
+        ...(status !== undefined ? { status } : {}),
+        terminal: status !== undefined && TERMINAL_RIFF_STATUSES.has(status),
+      });
+    }
+    return { ok: true, tasks };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 /**
  * The one-line bootstrap the Riff agent runs before any botmux helper: make sure
  * the sandbox CLI is the host's exact build, then write this turn's binding.
@@ -1086,6 +1147,17 @@ export class RiffBackend implements SessionBackend {
    * the prepare-close handshake so the daemon can persist a retry handle. */
   private closeFailureTaskId: string | null = null;
   private closeFailureError: string | null = null;
+  /** A create/follow-up that ended with no task id (a client timeout, a
+   *  dropped connection) and that nothing adopted since may still have created
+   *  a task server-side that this backend does not track. Until a close has
+   *  stopped everything running in the thread -- or the request's settle time
+   *  has passed with nothing running -- no close may report the remote as
+   *  stopped. Kept across close attempts: a retry must not forget it. */
+  private unansweredWrite: { sentAtMs: number; settleAtMs: number } | null = null;
+  /** Slack past a request's own fetch budget for Riff to finish creating the
+   *  task it accepted. A heuristic: Riff has no idempotency key, so work that
+   *  outlives the client budget by more than this cannot be ruled out. */
+  private unknownWriteSettleSlackMs = 15_000;
   private closeLateTaskHandled = false;
   private closePrepared = false;
   private closeAttempt: symbol | null = null;
@@ -1391,6 +1463,59 @@ export class RiffBackend implements SessionBackend {
           ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
           error: 'close_aborted',
         };
+      }
+      if (this.unansweredWrite && !this.closeFailureTaskId) {
+        // A request ended without a task id, so the task it may have created
+        // is not tracked anywhere. The session is closing: stop every task
+        // still running in its thread. This counts as proof only when the
+        // whole sweep finished for THIS attempt and the request's settle time
+        // has passed (before it, the task may simply not exist yet). Until
+        // then the record stays, and every later close sweeps again.
+        const aborted = (): SessionDestroyResult => ({
+          ok: false,
+          ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+          error: 'close_aborted',
+        });
+        const unknown = this.unansweredWrite;
+        const running = await this.listRunningThreadTasks();
+        if (this.closeAttempt !== attempt || !this.closing) return aborted();
+        if (running === 'query_failed') {
+          return {
+            ok: false,
+            ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+            error: 'close_unknown_write_unverifiable',
+          };
+        }
+        for (const node of running) {
+          // Record the newest as lineage BEFORE cancelling it, so a failed
+          // cancel leaves the daemon a handle to retry (adoptLateTask does
+          // this for the late-task case too).
+          if (node === running.at(-1)) {
+            this.currentTaskId = node.id;
+            this.taskIdCb?.(node.id);
+          }
+          const cancelled = await this.cancelTaskWithRetry(node.id, 'unanswered-request close');
+          if (this.closeAttempt !== attempt || !this.closing) return aborted();
+          if (!cancelled) {
+            return {
+              ok: false,
+              taskId: node.id,
+              error: this.closeFailureError ?? 'unanswered_request_task_cancel_failed',
+            };
+          }
+        }
+        // Every task the listing showed is stopped now. Anything this close
+        // must still not trust: a request whose task may not be visible yet.
+        if (Date.now() < unknown.settleAtMs) {
+          return {
+            ok: false,
+            ...(this.currentTaskId ? { taskId: this.currentTaskId } : {}),
+            error: 'close_unknown_write_not_yet_visible',
+          };
+        }
+        if (this.unansweredWrite === unknown) this.unansweredWrite = null;
+        // The current lineage (if any) was just cancelled as part of the sweep.
+        if (running.some(node => node.id === this.currentTaskId)) this.closeLateTaskHandled = true;
       }
       if (this.closeFailureTaskId) {
         return {
@@ -1823,13 +1948,16 @@ export class RiffBackend implements SessionBackend {
     };
     if (this.config.templateId) payload.templateId = this.config.templateId;
 
+    const sentAtMs = Date.now();
+    const budgetMs = this.createTimeoutMs;
     try {
-      const taskId = await this.uploadAndCreate(url, payload, attachments, this.createTimeoutMs);
+      const taskId = await this.uploadAndCreate(url, payload, attachments, budgetMs);
       if (!(await this.adoptLateTask(taskId))) return;
       this.markActivity();
       this.reconnectAttempts = 0; // per-task budget (see streamTask)
       this.streamTask(taskId);
     } catch (err) {
+      this.noteUnansweredWrite(err, sentAtMs, budgetMs);
       this.emitError(`创建 riff 任务失败: ${err}`);
     }
   }
@@ -1874,13 +2002,19 @@ export class RiffBackend implements SessionBackend {
     // own createdAt.
     const sentAtMs = Date.now();
 
+    const budgetMs = this.followUpTimeoutMs();
     try {
-      const taskId = await this.uploadAndCreate(url, payload, attachments, this.followUpTimeoutMs());
+      const taskId = await this.uploadAndCreate(url, payload, attachments, budgetMs);
       if (!(await this.adoptLateTask(taskId))) return;
       this.markActivity();
       this.reconnectAttempts = 0; // per-task budget (see streamTask)
       this.streamTask(taskId);
     } catch (err) {
+      // A follow-up child adopted by the reconcile below is tracked again.
+      const adopted = this.isTimeoutError(err) && parentTaskId
+        ? await this.reconcileAfterFollowUpTimeout(parentTaskId, sentAtMs)
+        : false;
+      if (!adopted) this.noteUnansweredWrite(err, sentAtMs, budgetMs);
       // A client-side fetch timeout does NOT mean the server did nothing. riff
       // task-follow-up is "accept → return taskId", but returns only AFTER a
       // synchronous pre-flight (auth refresh + sandbox-status read + lark/meego/
@@ -1892,7 +2026,7 @@ export class RiffBackend implements SessionBackend {
       // child already exists, adopt it (no lost context, no duplicate); only a true
       // broken lineage resets to a fresh task.
       if (this.isTimeoutError(err) && parentTaskId) {
-        if (await this.reconcileAfterFollowUpTimeout(parentTaskId, sentAtMs)) return;
+        if (adopted) return;
         // Reconcile found no child. Deliberately NO auto-resend: riff has no
         // request-dedup (no X-Idempotency-Key / clientRequestId server-side), and
         // its follow-up redirects the parent to the thread's latest node — so a
@@ -1911,6 +2045,48 @@ export class RiffBackend implements SessionBackend {
       this.taskIdCb?.(null);
       this.emitError(`riff follow-up 失败: ${err}（下一条消息将新建任务）`);
     }
+  }
+
+  /** A create/follow-up that failed without a definite server answer: the
+   *  server may have created the task anyway. Only a 4xx or an error envelope
+   *  from Riff is a definite "nothing was created"; a 5xx may come from a
+   *  gateway after Riff already accepted the request, so it counts as
+   *  unanswered too. */
+  private noteUnansweredWrite(err: unknown, sentAtMs: number, budgetMs: number): void {
+    if (this.killed) return;
+    if (err instanceof Error && /^(HTTP 4\d{2}:|riff API returned error:)/.test(err.message)) return;
+    // The last POST may have gone out well after `sentAtMs` (attachment reads,
+    // a 401 retry after a JWT refresh), so its budget runs from no earlier than
+    // now, the moment it failed.
+    const settleAtMs = Math.max(sentAtMs + budgetMs, Date.now()) + this.unknownWriteSettleSlackMs;
+    const prior = this.unansweredWrite;
+    this.unansweredWrite = prior
+      ? { sentAtMs: Math.min(prior.sentAtMs, sentAtMs), settleAtMs: Math.max(prior.settleAtMs, settleAtMs) }
+      : { sentAtMs, settleAtMs };
+  }
+
+  /** Every task of this session's thread that is not in a terminal state,
+   *  oldest first (unknown/missing status counts as running). Same identity as
+   *  every other call of this backend. */
+  private async listRunningThreadTasks(): Promise<RiffThreadNode[] | 'query_failed'> {
+    let nodes: RiffThreadNode[];
+    try {
+      nodes = await this.fetchThreadNodes(this.sessionId, { strict: true });
+    } catch (err) {
+      logger.warn(`[riff] close could not list the thread for an unanswered request: ${err}`);
+      return 'query_failed';
+    }
+    if (nodes.some(n => !n.id || (n.threadId !== undefined && n.threadId !== this.sessionId))) {
+      logger.warn('[riff] close got a thread listing it cannot trust (missing id or another thread)');
+      return 'query_failed';
+    }
+    const created = (n: RiffThreadNode): number => {
+      const ms = n.createdAt ? Date.parse(n.createdAt) : NaN;
+      return Number.isFinite(ms) ? ms : Number.POSITIVE_INFINITY;
+    };
+    return nodes
+      .filter(n => !this.isTerminalStatus(n.status))
+      .sort((a, b) => created(a) - created(b));
   }
 
   /** Node's AbortSignal.timeout() rejects with a DOMException/Error named
@@ -2050,7 +2226,10 @@ export class RiffBackend implements SessionBackend {
   /** GET /api/tasks?threadId=&view=summary → { success, data: RiffThreadNode[] }.
    *  Owner-scoped (see reconcileAfterFollowUpTimeout). view=summary is the
    *  lightweight projection (no logs/results) suited to this hot-path probe. */
-  private async fetchThreadNodes(threadId: string): Promise<RiffThreadNode[]> {
+  private async fetchThreadNodes(
+    threadId: string,
+    opts: { strict?: boolean } = {},
+  ): Promise<RiffThreadNode[]> {
     const url = `${this.config.baseUrl}/api/tasks?threadId=${encodeURIComponent(threadId)}&view=summary`;
     const headers: Record<string, string> = {};
     const jwt = await this.getJwt();
@@ -2063,7 +2242,12 @@ export class RiffBackend implements SessionBackend {
     this.observeServerClock(resp.headers.get('date'));
     const result = (await resp.json()) as { success?: boolean; data?: RiffThreadNode[] };
     // Envelope is { success, data: [...] } — data is the array directly (NOT
-    // data.tasks). Empty/no-permission → [].
+    // data.tasks). Empty/no-permission → [] for the timeout reconcile, which
+    // only looks for something to adopt. A close that reads "nothing running"
+    // out of it must not accept anything but a well-formed task list.
+    if (opts.strict && (result?.success !== true || !Array.isArray(result.data))) {
+      throw new Error('tasks query returned no task list');
+    }
     return Array.isArray(result.data) ? result.data : [];
   }
 

@@ -1,3 +1,4 @@
+import { InputDeliveryEvidenceTracker } from '../src/services/input-delivery-evidence.js';
 import { describe, expect, it, vi } from 'vitest';
 import { loadWorkerFunction } from './helpers/worker-function-harness.js';
 import { TraexAutoModelController } from '../src/services/traex-auto-model.js';
@@ -20,6 +21,8 @@ function fixture(extra: Record<string, unknown> = {}) {
   const catalog = new Promise<any>(done => { resolve = done; });
   const tracker = new InflightInputTracker(); tracker.onWrite({ content: 'task', turnId: 'turn' });
   const scope: Record<string, any> = {
+    currentInputDeliveryQuarantine: () => null,
+    inputDeliveryEvidence: new InputDeliveryEvidenceTracker(),
     inflightInputs: tracker, pendingMessages: [],
     traexAutoModelRuntimeEligible: () => true, traexAutoModelController: controller,
     activeTurnAuthority: authority, currentBotmuxTurnId: 'turn', cliSpawnGeneration: 1,
@@ -34,6 +37,7 @@ function fixture(extra: Record<string, unknown> = {}) {
   scope.nativeSessionForkPending = loadWorkerFunction('nativeSessionForkPending', scope);
   scope.holdTraexRecoveryForStop = loadWorkerFunction('holdTraexRecoveryForStop', scope);
   scope.settleStoppedTraexRecovery = loadWorkerFunction('settleStoppedTraexRecovery', scope);
+  scope.releaseInputDeliveryQuarantineForStructuredTerminal = loadWorkerFunction('releaseInputDeliveryQuarantineForStructuredTerminal', scope);
   const recover = loadWorkerFunction<(turn: any) => boolean>('recoverTraexQuotaTurn', scope);
   const turn = { turnId: 'turn', sourceTurnId: 'native-turn', started: true,
     terminalStatus: 'failed', terminalErrorCode: TRAEX_QUOTA_ERROR_CODE };

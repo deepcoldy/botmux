@@ -547,7 +547,8 @@ import { waitForProcessQuiescence } from './services/process-quiescence.js';
 import { reapStaleCodexThreadWriter, shouldReapStaleCodexWriterBeforeSpawn } from './services/codex-stale-writer-reaper.js';
 import { pidNotProvablyGone } from './utils/process-alive.js';
 import { decideTurnIdleReport } from './utils/turn-idle-report.js';
-import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
+import { restoredTurnLabel } from './services/restored-turn-label.js';
+import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, readClaudeLiveSessionId, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand, turnIdleHookCommand } from './adapters/hook-command.js';
 import { cliProcessAliveFromBackend } from './adapters/cli/backend-liveness.js';
 import { statuslineDir } from './services/statusline-snapshot.js';
@@ -2106,6 +2107,14 @@ function runtimeIdentityForContract(binding: RuntimeEventBinding): RuntimeIdenti
       const owned = findTraexRolloutSetByPid(childPid);
       const observed = owned?.size === 1 ? findTraexRolloutByPid(childPid) : undefined;
       if (observed && owned!.has(observed.cliSessionId)) nativeSessionId = observed.cliSessionId;
+    } else if (!nativeSessionId && cliAdapter?.claudeDataDir) {
+      // Likewise a re-attached Claude may be mid-turn and write nothing until
+      // that turn ends. Without its conversation the contract cannot tell this
+      // live CLI from another and its running attempt loses its origin. The
+      // process's own pid-state record names it — the source a write's session
+      // id comes from — when the record is provably this process's and agrees
+      // with what the process holds open.
+      nativeSessionId = readClaudeLiveSessionId(childPid, bridgeDataDir);
     }
     if (owned() && readProcessStartIdentity(childPid) === start) return { backend: backendType, physicalId: `${childPid}:${start}`, proof: 'process_start', ...(nativeSessionId ? { nativeSessionId } : {}) };
   }
@@ -6597,6 +6606,11 @@ function recoverTraexQuotaTurn(turn: CodexPendingTurn): boolean {
   const nativeSessionId = lastInitConfig.cliSessionId;
   const target = backend;
   traexQuotaPending = token;
+  // An exact native terminal settles the ambiguous write before attempting
+  // recovery. Otherwise the switch rejects the still-quarantined generation
+  // and only the later fallback emission releases it, losing the recovery.
+  // Register pending recovery first so the release cannot admit queued input.
+  releaseInputDeliveryQuarantineForStructuredTerminal(turn.turnId, turn.dispatchAttempt);
   if (capacityRecovery) {
     // Invalidate older capacity proposals and persist the refusal before IO.
     controller.recordUnavailableModel(turn.turnId);
@@ -12027,12 +12041,11 @@ function emitReadyTurns(opts: {
     }
 
     // A restored turn's fallback is a RECOVERED partial/final produced around
-    // a worker restart — label it so the user can tell it from a live answer.
-    // Prefix is applied AFTER the suppress gate so dedup compares the model's
-    // own text, never the notice.
-    const deliveredText = turn.restoredFromJournal && !universalOutputHandoff
-      ? `${t('worker.bridge_restored_turn_notice')}\n\n${postText}`
-      : postText;
+    // a restart, possibly turns ago. The daemon notes which turn it answers
+    // above it; the content itself stays the model's own text, so the reply
+    // keeps one identity whether it is emitted live or after a restore.
+    const deliveredText = postText;
+    const restoredTurn = turn.restoredFromJournal ? restoredTurnLabel(turn) : undefined;
     usageLimitTracker.noteTurnCompleted('answered');
     const handoffOutput = { sessionId: sessionId!, content: deliveredText, lastUuid: lastUuid!, turnId: turn.turnId };
     if (workerFinalOutputHandoff && handoffTurnIds.has(turn.turnId) && !turn.isLocal && turn.dispatchAttempt === undefined
@@ -12064,6 +12077,7 @@ function emitReadyTurns(opts: {
         : {}),
       ...(turn.isLocal && zeroPromptTerminalSync() ? { terminalLocal: true } : {}),
       ...(turn.dispatchAttempt !== undefined ? { dispatchAttempt: turn.dispatchAttempt } : {}),
+      ...(restoredTurn ? { restoredTurn } : {}),
     });
   }
   } catch (error) {
@@ -24067,6 +24081,10 @@ async function spawnCliBody(
     return;
   }
 
+  // An adopt generation owns only an observer. Missing/corrupt terminal
+  // metadata must never fall through into spawning a Botmux-owned CLI.
+  if (Boolean(cfg.adoptMode)) throw new Error('Missing adopt terminal identity; refusing managed CLI launch');
+
   // dsh runtime variant: when the bot selected dsh-tui (dshRuntime='tui'),
   // resolve the PTY-driven dsh-tui adapter instead of the headless JSON-RPC
   // runner. The bot's cliId stays 'dsh' (the toggle is a per-bot config field),
@@ -29049,17 +29067,15 @@ async function spawnCliBody(
   if (cliPid) observeAntigravityCliSessionId(cliPid);
   observeZcodeCliSessionId();
 
-  // File sandbox / Linux credential-only bwrap launches `bwrap --unshare-pid --
-  // traex`; Forge x TraeX launches `forge run --agent traex`. In both shapes the
-  // pane leaf (getChildPid) is a launcher, not the process that holds the TRAE
-  // rollout fd, so the ownership gate cannot admit the id until backend.cliPid is
-  // rewired to the real traex descendant. Bounded retry (not one-shot): the
-  // launcher may not have forked traex yet at spawn. Reuses
-  // scheduleWrapperRealCliPid's stale-backend guard so a mid-retry worker restart
-  // can't rewire the new session.
+  // Any managed TRAE command may be a persistent launcher (including an
+  // ordinary Node wrapper supplied through cliPathOverride), not the process
+  // holding the rollout fd. Discover within this spawn's process tree, just as
+  // for Codex below, rather than limiting ownership resolution to bwrap/Forge.
+  // Native TRAE roots are kept by the resolver and retry's direct-leaf guard:
+  // descending them could otherwise bind a deeper TRAE subagent.
   const outerBwrapActive = sandboxRequested || credentialOnlyBwrap;
   lastSpawnOuterBwrapActive = outerBwrapActive;
-  const traexLauncherActive = outerBwrapActive || cfg.cliLaunchMode === 'forge-traex';
+  const traexLauncherActive = cfg.cliId === 'traex';
   lastSpawnTraexLauncherActive = traexLauncherActive;
   // A standard npm-installed Codex starts as a Node launcher which then forks
   // the native `codex` binary.  Treat every managed Codex spawn as potentially
@@ -29084,7 +29100,14 @@ async function spawnCliBody(
     const generation = cliSpawnGeneration;
     scheduleTraexLeafPidResolve(launcherPid, {
       getBackend: () => backend,
-      getChildPid: () => backend?.getChildPid?.(),
+      // The captured spawn root, not backend.getChildPid() (same reasoning as
+      // the Codex resolver below): Herdr/ZMX alias that accessor to the mutable
+      // cliPid, which a launch-payload binding (owned scope / relay) has
+      // already moved off this root before the first tick. The same-pid arm
+      // would then end discovery for good, stranding a launcher whose TRAE
+      // leaf forks later. Backend identity still fences a replaced runtime;
+      // the generation fences a restart that keeps the same backend object.
+      getChildPid: () => (generation === cliSpawnGeneration ? launcherPid : null),
       applyRealPid: (realPid) => {
         if (generation !== cliSpawnGeneration) {
           log(`TRAE launcher: ignoring stale leaf pid ${realPid} from spawn ${generation} (current ${cliSpawnGeneration})`);
@@ -29171,6 +29194,12 @@ async function spawnCliBody(
         : ownershipPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
     (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+    if (cfg.cliId === 'traex' && wiredPid !== ownershipPid) {
+      // Publish the synchronous ownership correction together with the
+      // binding: bridgeCliPid and the attestation must not keep naming the
+      // launcher until the retry's first tick.
+      applyResolvedCliPid(wiredPid, 'TRAE ownership', ownershipPid);
+    }
     if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(cliPid);
     if (cfg.cliId === 'codex' && codexLauncherActive) startCodexLauncherPidResolve(cliPid);
   }
@@ -29184,8 +29213,12 @@ async function spawnCliBody(
   // output) until the pid appears, then write the marker + wire claude-family pid.
   if (!cliPid) {
     let attempts = 0;
+    const latePidBackend = backend;
+    const latePidGeneration = cliSpawnGeneration;
     const resolveCliPidLate = () => {
       if (!backend) return;
+      if (cfg.cliId === 'traex'
+        && (backend !== latePidBackend || cliSpawnGeneration !== latePidGeneration)) return;
       const pid = backend.getChildPid?.();
       if (pid) {
         publishLocalProcessAttestation(pid);
@@ -29208,6 +29241,9 @@ async function spawnCliBody(
               : ownershipPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliPid = wiredPid;
           (backend as TmuxBackend | PtyBackend | ZellijBackend | ZmxBackend).cliCwd = cfg.workingDir;
+          if (cfg.cliId === 'traex' && wiredPid !== ownershipPid) {
+            applyResolvedCliPid(wiredPid, 'TRAE ownership', ownershipPid);
+          }
           if (cfg.cliId === 'traex' && traexLauncherActive) startTraexLauncherPidResolve(pid);
           if (cfg.cliId === 'codex' && codexLauncherActive) startCodexLauncherPidResolve(pid);
         }

@@ -1,12 +1,18 @@
 #!/usr/bin/env node
 // 正式版（npm latest）发版闸：被打 tag 的 commit 能不能发成 latest。
 //
-// release.yml 里两处调用，规则和理由写在 preflight 同名步骤的注释里：
-//   preflight 的「Guard — stable release must come from master」跑 `admit`：读 origin/master、
-//     release tag 和 npm latest，判定按哪条放行，并把判定用到的事实固定成 step 输出；
-//   release 的同名步骤跑 `verify`：只按 preflight 固定下来的 SHA 复核同一组事实，不再读
-//     origin/master、npm 或 tag。同一次运行里重读会移动的 ref，会在平台子包已经发到 npm
-//     之后翻转判定，版本号就此烧掉（issue #1150，v3.18.10）。
+// release.yml 里四处调用，规则和理由写在 preflight 同名步骤的注释里：
+//   preflight 的「Guard — stable release must come from master」跑 `admit`：打完 tag 立刻判一次，
+//     不放行就不必编译、不必等签名审批；
+//   publish-gate 的同名步骤再跑一次 `admit`：在签名审批之后、任何包发布之前，按当时的
+//     origin/master、release tag 和 npm 重新判定，并把判定用到的事实固定成 step 输出。审批
+//     可能等好几天，这期间 tag 和已发布版本都可能变，所以以这一次为准；
+//   binary-subpackages 的同名步骤跑 `recheck`：第一个 npm publish 之前，本版本的子包一个都还没发时
+//     按此刻的事实再判一次（应对「Re-run failed jobs」只重跑它、不重跑 publish-gate 的情况），已经发了
+//     一部分就沿用 publish-gate 的判定；
+//   release 的同名步骤跑 `verify`：只按 publish-gate 固定下来的 SHA 复核同一组事实，不再
+//     读 origin/master、npm 或 tag。同一次运行里在平台子包已经发到 npm 之后重读会移动的
+//     ref，会翻转判定，版本号就此烧掉（issue #1150，v3.18.10）。
 //
 // 先决条件（不满足直接拒绝，下面两条放行都要先过这一关）：
 //   release tag 是规范的 vX.Y.Z，且 origin 上没有版本号更高的正式版 tag。即正式版必须按版本号
@@ -21,19 +27,24 @@
 //   ② published-baseline：HEAD 在 origin/master 的 first-parent 链上（tip、tip~1、tip~2……，
 //      可以不是 tip；用 merge commit 合进来的分支内部提交不算），并且包含「已发布基线」
 //      里的每个 commit。基线 = npm latest 版本对应 tag 的 commit，加上版本号介于 npm latest 与
-//      本版之间的每个正式版 tag 的 commit（还在等签名审批的在途正式版、没发成的正式版 tag——
-//      算进来只会更严）。
-//   拿不到基线（npm 查询失败、latest 不是规范的 X.Y.Z、latest 不比本版旧、对应 tag 不存在）时
-//   只剩①，fail-closed。判定只看 commit 图和已发布版本，不看墙钟时间。
+//      本版之间的每个正式版——不论它只有 tag（还在等签名审批的在途正式版、没发成的正式版），
+//      还是已经发到 npm（被 npm-dist-tag 回滚掉的正式版）——对应 tag 的 commit。另外，npm 上只要
+//      已经发布过版本号高于本版的正式版，② 就不成立（tag 被删了也一样）。
+//   拿不到基线（npm 查询失败、latest 不是规范的 X.Y.Z、latest 不比本版旧、已发布过更高的
+//   正式版、基线里某个版本的 tag 不存在）时只剩①，fail-closed。① 不读 npm：tip 包含了
+//   所有从 master 发出去的版本。判定只看 commit 图、tag 和已发布版本，不看墙钟时间。
 //
 // 输出（追加到 $GITHUB_OUTPUT；没有该变量时打到 stdout）：
 //   master_sha     判定时用的 origin/master SHA
 //   ancestry_mode  contains-master | published-baseline
 //   baseline_shas  ②用到的基线 commit，空格分隔；①时为空
 //
-// 用法：node .github/scripts/release-master-guard.mjs admit|verify
-//   admit   读 env RELEASE_TAG（vX.Y.Z）、NPM_PACKAGE（默认 botmux）
-//   verify  读 env PINNED_MODE、PINNED_MASTER、PINNED_BASELINE（来自 preflight 的输出）
+// 用法：node .github/scripts/release-master-guard.mjs admit|verify|recheck
+//   admit   读 env RELEASE_TAG（vX.Y.Z）、NPM_PACKAGE（默认 botmux）、PREFLIGHT_MODE / PREFLIGHT_MASTER
+//           （publish-gate 与 recheck 传入 preflight 的输出，只用来给子分支 tag 找锚点）
+//   verify  读 env PINNED_MODE、PINNED_MASTER、PINNED_BASELINE、PINNED_ANCHOR（来自 publish-gate 的输出）
+//   recheck 另读 env SUBPACKAGE_PLATFORMS（发包循环用的同一份平台列表）
+// 三种都要完整历史（actions/checkout 的 fetch-depth: 0）：浅克隆里祖先关系不全，直接拒绝。
 // 退出码：0 放行；1 拒绝（含任何意外错误，fail-closed）；2 用法错误。
 //
 // 行为测试：test/release-ancestry-pin.test.ts（真实 git 仓库 + 假 npm，执行 workflow 步骤本身）。
@@ -133,6 +144,27 @@ function readNpmLatest(pkg) {
   return { version: r.stdout.trim() };
 }
 
+/** Every version of `pkg` ever published to npm (any dist-tag, including ones `latest` was rolled back off). */
+function readNpmPublished(pkg) {
+  const r = run('npm', ['view', pkg, 'versions', '--json']);
+  if (r.error || r.status !== 0) {
+    const detail = r.error ? r.error.message : lastLine(r.stderr) || `exit ${r.status}`;
+    return { error: `npm view ${pkg} versions failed: ${detail}` };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(r.stdout);
+  } catch {
+    return { error: `npm view ${pkg} versions did not print JSON` };
+  }
+  // npm prints a bare string instead of an array when there is exactly one version.
+  const list = Array.isArray(parsed) ? parsed : [parsed];
+  if (list.length === 0 || !list.every((v) => typeof v === 'string')) {
+    return { error: `npm view ${pkg} versions printed an unexpected shape` };
+  }
+  return { versions: list.map((v) => v.trim()) };
+}
+
 function tagCommit(name) {
   return gitMaybe(['rev-parse', '--verify', '--quiet', `refs/tags/${name}^{commit}`]);
 }
@@ -148,7 +180,8 @@ function stableTags() {
 
 /**
  * The commits every stable release from here on must contain: the tag npm `latest` was
- * published from, plus every stable tag ranked between npm latest and this release.
+ * published from, plus every stable version ranked between npm latest and this release —
+ * whether it exists only as a tag or has been published to npm.
  *
  * Why the in-between tags: a stable release waits for a manual Developer ID signing
  * approval before anything reaches npm, often for hours. Throughout that wait npm
@@ -168,24 +201,64 @@ function resolveBaseline(self, tags, pkg) {
     return { reason: `npm latest ${npm.version} is not older than this release` };
   }
 
-  const latestTag = `v${npm.version}`;
-  const latestSha = tagCommit(latestTag);
-  if (!latestSha) return { reason: `tag ${latestTag} (npm latest) does not exist` };
-  const entries = [{ tag: latestTag, sha: latestSha, role: 'npm latest' }];
+  // Why the published list as well as the tags: `latest` can be rolled back with
+  // npm-dist-tag.yml, and a stable tag can be deleted by someone holding the ruleset
+  // bypass. Then neither npm latest nor the tags show that users already had a newer
+  // version — npm's own version list still does.
+  const published = readNpmPublished(pkg);
+  if (published.error) return { reason: published.error };
+  const publishedStable = published.versions
+    .map((text) => ({ text, version: parseVersion(text) }))
+    .filter((p) => p.version);
+  const above = publishedStable.filter((p) => compareVersions(p.version, self) > 0);
+  if (above.length > 0) {
+    const top = above.map((p) => p.text).sort((a, b) => compareVersions(parseVersion(a), parseVersion(b))).pop();
+    return { reason: `npm already has stable version ${top} published, which ranks above this release` };
+  }
 
+  const wanted = new Map([[npm.version, 'npm latest']]);
   for (const t of tags) {
-    if (compareVersions(t.version, latest) <= 0 || compareVersions(t.version, self) >= 0) continue;
-    const sha = tagCommit(t.name);
-    if (!sha) return { reason: `tag ${t.name} does not resolve to a commit` };
-    entries.push({ tag: t.name, sha, role: 'stable tag between npm latest and this release' });
+    if (compareVersions(t.version, latest) > 0 && compareVersions(t.version, self) < 0) {
+      wanted.set(t.version.join('.'), 'stable tag between npm latest and this release');
+    }
+  }
+  for (const p of publishedStable) {
+    if (compareVersions(p.version, latest) > 0 && compareVersions(p.version, self) < 0) {
+      wanted.set(p.version.join('.'), 'published to npm between npm latest and this release');
+    }
+  }
+  const entries = [];
+  for (const [version, role] of [...wanted].sort((a, b) => compareVersions(parseVersion(a[0]), parseVersion(b[0])))) {
+    const tag = `v${version}`;
+    const sha = tagCommit(tag);
+    if (!sha) return { reason: `tag ${tag} (${role}) does not resolve to a commit` };
+    entries.push({ tag, sha, role });
   }
   return { entries };
 }
 
-function admit() {
+/**
+ * Ancestry questions need the whole history: in a shallow clone the commit graph is cut at
+ * the boundary, so "does HEAD contain X" is false for every X but HEAD itself. That can only
+ * turn admissions into refusals, but it does so for every tag not on master's current tip —
+ * so say why instead of refusing with a misleading reason.
+ */
+function refuseIfShallow() {
+  if (git(['rev-parse', '--is-shallow-repository']) !== 'true') return null;
+  return refuse([
+    'REFUSING: this checkout is shallow, so the release guard cannot see which commits the tag contains.',
+    'Fix: give the job\'s actions/checkout step `fetch-depth: 0`.',
+  ]);
+}
+
+/**
+ * The admission rule. `pin`: write the facts it was taken on as step outputs (preflight and
+ * publish-gate do); recheck only needs the verdict.
+ */
+function admit({ pin = true } = {}) {
   const releaseTag = process.env.RELEASE_TAG;
   if (!releaseTag) {
-    console.error('release-master-guard admit: RELEASE_TAG is required');
+    console.error('release-master-guard: RELEASE_TAG is required');
     return 2;
   }
   const pkg = process.env.NPM_PACKAGE || 'botmux';
@@ -198,6 +271,8 @@ function admit() {
     ]);
   }
 
+  const shallow = refuseIfShallow();
+  if (shallow !== null) return shallow;
   const head = git(['rev-parse', '--verify', 'HEAD^{commit}']);
   git(['fetch', '--quiet', 'origin', '+refs/heads/master:refs/remotes/origin/master']);
   const master = git(['rev-parse', '--verify', 'refs/remotes/origin/master^{commit}']);
@@ -213,7 +288,8 @@ function admit() {
     return refuse([
       `REFUSING: stable tag ${top} already exists, and it ranks above ${releaseTag}.`,
       'Stable versions must be tagged in increasing order: a lower version tagged later may carry changes the higher one lacks, and publishing the higher one after it would drop them from latest.',
-      `Fix: release this commit as a version above ${top}. If ${top} was created by mistake, FIRST cancel its Release run (a stable run may still be waiting for signing approval, and approving it later would publish ${top} on the facts it was admitted on), then delete the tag (needs the tag-ruleset bypass) and re-run this one.`,
+      `Fix: release this commit as a version above ${top}. Only if ${top} was created by mistake AND nothing of it is on npm yet (no botmux-* package at that version), cancel its Release run (it may still be waiting for signing approval), then delete the tag (needs the tag-ruleset bypass) and re-run this one.`,
+      `Once any package of ${top} is on npm, never delete its tag: re-running that half-published release resumes it on the verdict it was admitted on, which cannot see a lower release published in between. Ship the fix as a version above ${top} instead.`,
     ]);
   }
 
@@ -221,11 +297,26 @@ function admit() {
   // it) never depends on npm being reachable.
   if (isAncestor(master, head)) {
     console.log(`OK (contains-master): tagged commit ${short(head)} contains origin/master (${short(master)}).`);
-    setOutputs({ master_sha: master, ancestry_mode: 'contains-master', baseline_shas: '' });
+    if (pin) setOutputs({ master_sha: master, ancestry_mode: 'contains-master', baseline_shas: '', anchor_sha: '' });
     return 0;
   }
 
-  if (!onFirstParentChain(head, master)) {
+  // Where HEAD meets master's own line. Normally HEAD itself, on master's first-parent chain.
+  // For a tag that preflight admitted under ① — a child of the tip it saw, which the rules
+  // allow — it is that tip: master moving on while the release waits for signing approval
+  // must not turn the tag away (that is the whole point of ②). Only preflight's own pin can
+  // name it, so a branch that never contained master's tip gets no anchor.
+  let anchor = null;
+  if (onFirstParentChain(head, master)) {
+    anchor = head;
+  } else {
+    const admittedTip = process.env.PREFLIGHT_MODE === 'contains-master' ? (process.env.PREFLIGHT_MASTER || '').trim() : '';
+    if (FULL_SHA.test(admittedTip) && isAncestor(admittedTip, head) && onFirstParentChain(admittedTip, master)) {
+      anchor = admittedTip;
+      console.log(`tagged commit ${short(head)} is a child of ${short(admittedTip)}, the master tip preflight admitted it on; that commit is still on master.`);
+    }
+  }
+  if (!anchor) {
     return refuse([
       `REFUSING: tagged commit ${short(head)} neither contains the latest origin/master (${short(master)}) nor is on master's first-parent history.`,
       'Stable (latest) releases must be tagged on master, or on a branch rebased onto the latest master. A commit that only reached master through a merge commit is a branch commit, not a state master was in.',
@@ -283,10 +374,12 @@ function admit() {
     ...[...deferred, ...more].map((line) => `- ${line}`),
   ].join('\n'));
 
-  setOutputs({
+  if (pin) setOutputs({
     master_sha: master,
     ancestry_mode: 'published-baseline',
     baseline_shas: baseline.entries.map((e) => e.sha).join(' '),
+    // Empty when the tagged commit is itself on master's first-parent chain.
+    anchor_sha: anchor === head ? '' : anchor,
   });
   return 0;
 }
@@ -302,63 +395,119 @@ function verify() {
   const mode = (process.env.PINNED_MODE || '').trim();
   const master = (process.env.PINNED_MASTER || '').trim();
   const baseline = (process.env.PINNED_BASELINE || '').split(/\s+/).filter(Boolean);
+  const anchorPin = (process.env.PINNED_ANCHOR || '').trim();
 
   // Only a full SHA is a pin. A ref name (HEAD, origin/master) would quietly re-read a ref
   // that moves — the very thing this job must not do.
   if (!FULL_SHA.test(master)) {
     return refuse([
-      `REFUSING: preflight pinned no master SHA (got "${master}"), so this job cannot re-check the same facts preflight admitted.`,
+      `REFUSING: the admission pinned no master SHA (got "${master}"), so this job cannot re-check the same facts the release was admitted on.`,
       'Failing closed rather than re-reading a ref that may have moved since (issue #1150).',
     ]);
   }
+  const shallow = refuseIfShallow();
+  if (shallow !== null) return shallow;
   const head = git(['rev-parse', '--verify', 'HEAD^{commit}']);
   ensureCommit(master);
 
   if (mode === 'contains-master') {
     if (!isAncestor(master, head)) {
       return refuse([
-        `REFUSING: tagged commit ${short(head)} does not contain the master preflight admitted (${short(master)}).`,
+        `REFUSING: tagged commit ${short(head)} does not contain the master the release was admitted on (${short(master)}).`,
         'Stable (latest) releases must be tagged on master, or on a branch rebased onto the latest master.',
       ]);
     }
-    console.log(`OK: tagged commit ${short(head)} contains the master preflight admitted (${short(master)}).`);
+    console.log(`OK: tagged commit ${short(head)} contains the master the release was admitted on (${short(master)}).`);
     return 0;
   }
 
   if (mode === 'published-baseline') {
     if (baseline.length === 0 || !baseline.every((sha) => FULL_SHA.test(sha))) {
       return refuse([
-        `REFUSING: preflight admitted against a published baseline but pinned no valid baseline commits (got "${baseline.join(' ')}").`,
+        `REFUSING: the release was admitted against a published baseline, but no valid baseline commits were pinned (got "${baseline.join(' ')}").`,
         'Failing closed rather than re-deriving the baseline from npm or tags that may have moved since (issue #1150).',
       ]);
     }
+    if (anchorPin && !FULL_SHA.test(anchorPin)) {
+      return refuse([`REFUSING: the pinned anchor "${anchorPin}" is not a commit SHA (issue #1150).`]);
+    }
     for (const sha of baseline) ensureCommit(sha);
-    if (!onFirstParentChain(head, master)) {
-      return refuse([`REFUSING: tagged commit ${short(head)} is not on the first-parent history of the master preflight admitted (${short(master)}).`]);
+    const anchor = anchorPin || head;
+    if (anchorPin) {
+      ensureCommit(anchorPin);
+      if (!isAncestor(anchorPin, head)) {
+        return refuse([`REFUSING: tagged commit ${short(head)} does not contain the pinned anchor ${short(anchorPin)}.`]);
+      }
+    }
+    if (!onFirstParentChain(anchor, master)) {
+      return refuse([`REFUSING: ${short(anchor)} is not on the first-parent history of the master the release was admitted on (${short(master)}).`]);
     }
     const missing = baseline.filter((sha) => !isAncestor(sha, head));
     if (missing.length > 0) {
       return refuse([
-        `REFUSING: tagged commit ${short(head)} does not contain the published baseline preflight pinned:`,
+        `REFUSING: tagged commit ${short(head)} does not contain the published baseline the release was admitted on:`,
         ...missing.map((sha) => `  - ${short(sha)}`),
       ]);
     }
-    console.log(`OK: tagged commit ${short(head)} is on the master preflight admitted (${short(master)}) and contains its pinned baseline (${baseline.map(short).join(', ')}).`);
+    console.log(`OK: tagged commit ${short(head)} is on the master the release was admitted on (${short(master)}) and contains its pinned baseline (${baseline.map(short).join(', ')}).`);
     return 0;
   }
 
   return refuse([
-    `REFUSING: preflight pinned no recognised ancestry mode (got "${mode}").`,
+    `REFUSING: no recognised ancestry mode was pinned (got "${mode}").`,
     'Failing closed rather than guessing which rule admitted this release (issue #1150).',
   ]);
+}
+
+/**
+ * binary-subpackages, right before its first publish. "Re-run failed jobs" re-runs this job
+ * but NOT publish-gate when the gate succeeded and something between it and the first publish
+ * failed — the run may then be days old. So when nothing of this version is on npm yet, take
+ * the admission again on today's facts; once part of it is published, keep the pinned verdict
+ * (re-judging then could refuse half a release and burn the version, issue #1150).
+ */
+function recheck() {
+  const version = (process.env.RELEASE_TAG || '').replace(/^v/, '');
+  const packages = (process.env.SUBPACKAGE_PLATFORMS || '').split(/\s+/).filter(Boolean).map((plat) => `botmux-${plat}`);
+  if (!version || packages.length === 0) {
+    console.error('release-master-guard recheck: RELEASE_TAG and SUBPACKAGE_PLATFORMS are required');
+    return 2;
+  }
+  const published = [];
+  const unknown = [];
+  for (const name of packages) {
+    const r = run('npm', ['view', `${name}@${version}`, 'version']);
+    const out = `${r.stdout || ''}${r.stderr || ''}`;
+    if (r.status === 0 && r.stdout.trim() === version) published.push(name);
+    // An unpublished version answers E404, both for a known package ("No match found for
+    // version") and an unknown one; an empty success is treated the same. Anything else —
+    // timeouts, 5xx, auth — is an unknown.
+    else if ((r.status === 0 && r.stdout.trim() === '') || (r.status !== 0 && /\bE404\b/.test(out))) continue;
+    else unknown.push(`${name}: ${lastLine(out) || `exit ${r.status}`}`);
+  }
+  // One confirmed publish settles it: this is a resumed publish, whatever the others say.
+  if (unknown.length > 0 && published.length === 0) {
+    return refuse([
+      `REFUSING: could not tell whether any subpackage of ${version} is already on npm:`,
+      ...unknown.map((line) => `  - ${line}`),
+      'Fix: re-run once npm is reachable.',
+    ]);
+  }
+  if (published.length > 0) {
+    console.log(`${published.join(', ')} @${version} already on npm: this is a resumed publish, so it keeps the verdict publish-gate pinned.`);
+    return 0;
+  }
+  console.log(`nothing of ${version} is on npm yet: taking the admission again before the first publish.`);
+  return admit({ pin: false });
 }
 
 const command = process.argv[2];
 try {
   if (command === 'admit') process.exitCode = admit();
   else if (command === 'verify') process.exitCode = verify();
+  else if (command === 'recheck') process.exitCode = recheck();
   else {
-    console.error('usage: node .github/scripts/release-master-guard.mjs admit|verify');
+    console.error('usage: node .github/scripts/release-master-guard.mjs admit|verify|recheck');
     process.exitCode = 2;
   }
 } catch (err) {
