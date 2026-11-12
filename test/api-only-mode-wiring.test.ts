@@ -15,6 +15,7 @@ import {
 import { triggerSessionTurn } from '../src/core/trigger-session.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { readProcessStartIdentity } from '../src/core/session-marker.js';
 import { downloadMessageResource } from '../src/im/lark/client.js';
 import { __testOnly_driveApiCall } from '../src/im/lark/doc-comment.js';
 import * as groupsStore from '../src/services/groups-store.js';
@@ -274,7 +275,9 @@ describe('CLI transport gate for a managed no-transport turn', () => {
       env.BOTMUX_CHAT_ID = 'headless_hl_stale';
       env.BOTMUX_LARK_APP_ID = 'cli_gate_bot';
       for (const { args, status, downstream } of [
-        { args: ['send', '--response-kind', 'invalid', 'hello'], status: 2, downstream: /--response-kind/ },
+        // `send` validates --response-kind and similar argv shapes before the
+        // root gate, so the bad value must be one cmdSend checks after its gate.
+        { args: ['send', '--plugin-card-action', 'BAD!', 'hello'], status: 2, downstream: /无效 plugin id/ },
         { args: ['create-group'], status: 1, downstream: /--bot/ },
       ]) {
         const r = spawnSyncTsScript('src/cli.ts', args, { env, encoding: 'utf8', timeout: 60_000 });
@@ -307,12 +310,42 @@ describe('CLI transport gate for a managed no-transport turn', () => {
         env.BOTMUX_LARK_APP_ID = 'cli_gate_bot';
         const r = spawnSyncTsScript('src/cli.ts', ['create-group'], { env, encoding: 'utf8', timeout: 60_000 });
         expect(r.status).toBe(2);
-        expect(String(r.stderr)).toMatch(/no Feishu transport/);
+        expect(String(r.stderr)).toMatch(/marker names session s_virtual, but BOTMUX_SESSION_ID names s_real/);
       } finally {
         rmSync(dataDir, { recursive: true, force: true });
       }
     }, 120_000,
   );
+
+  it('refuses when a verified ancestor marker and BOTMUX_SESSION_ID name two different real sessions', () => {
+    // Either session could reach Feishu on its own, so only the conflict check
+    // stands between this call and routing it through a session it may not own.
+    const dataDir = mkdtempSync(join(tmpdir(), 'api-only-cli-real-conflict-'));
+    try {
+      seedPersistedSessionRows(dataDir, 'cli_gate_bot', {
+        s_marker: { sessionId: 's_marker', chatId: 'oc_marker_gate', larkAppId: 'cli_gate_bot', scope: 'chat', status: 'active' },
+        s_env: { sessionId: 's_env', chatId: 'oc_env_gate', larkAppId: 'cli_gate_bot', scope: 'chat', status: 'active' },
+      });
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+        sessionId: 's_marker',
+        procStart: readProcessStartIdentity(process.pid),
+      }));
+      const env: Record<string, string> = {};
+      for (const [k, v] of Object.entries(process.env)) if (!k.startsWith('BOTMUX_') && v !== undefined) env[k] = v;
+      env.SESSION_DATA_DIR = dataDir;
+      env.BOTMUX_SESSION_ID = 's_env';
+      env.BOTMUX_CHAT_ID = 'oc_env_gate';
+      env.BOTMUX_LARK_APP_ID = 'cli_gate_bot';
+      for (const args of [['create-group'], ['send', '--plugin-card-action', 'BAD!', 'hello']]) {
+        const r = spawnSyncTsScript('src/cli.ts', args, { env, encoding: 'utf8', timeout: 60_000 });
+        expect(r.status, args.join(' ')).toBe(2);
+        expect(String(r.stderr), args.join(' ')).toMatch(/marker names session s_marker, but BOTMUX_SESSION_ID names s_env/);
+      }
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  }, 120_000);
 
   it('refuses an apiOnly bot even with a real-chat session record', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'api-only-cli-real-'));

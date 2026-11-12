@@ -10633,7 +10633,7 @@ function currentBotIsApiOnly(larkAppId: string): boolean {
   // Under read isolation bots.json is denied ON PURPOSE, so loadBotsJson() below
   // can only ever answer "no bots at all". Letting that stand would silently turn
   // this check into a no-op for EVERY sandboxed bot — including the apiOnly ones
-  // it exists to catch — and managedOriginHasNoTransport() (which advertises
+  // it exists to catch — and resolveManagedOriginTransport() (which advertises
   // itself as tamper-resistant) delegates its verdict here.
   //
   // The worker already hands this bot its OWN config through the designed private
@@ -10689,6 +10689,15 @@ function currentTurnHasNoTransport(): boolean {
   return !!appId && currentBotIsApiOnly(appId);
 }
 
+interface ManagedOriginTransportVerdict {
+  noTransport: boolean;
+  chatId: string | undefined;
+  /** A visible ancestor marker and BOTMUX_SESSION_ID name different sessions. */
+  sessionConflict?: { ancestorSessionId: string; envSessionId: string };
+}
+
+let managedOriginTransportVerdict: ManagedOriginTransportVerdict | undefined;
+
 /** Tamper-resistant managed-origin transport verdict, plus the chatId it was
  *  judged from.
  *
@@ -10706,11 +10715,17 @@ function currentTurnHasNoTransport(): boolean {
  *  later bound/transferred to a real chat keeps that very process (the tmux
  *  backend re-attaches to the surviving `bmx-<sessionId>` rather than
  *  respawning), and its env never learns about the move. `chatId` is returned so
- *  the refusal message can name the reason the same snapshot was judged from. */
-function resolveManagedOriginTransport(): {
-  noTransport: boolean;
-  chatId: string | undefined;
-} {
+ *  the refusal message can name the reason the same snapshot was judged from.
+ *
+ *  Judged once per process: the root-dispatch gate and the command's own early
+ *  gate ask the same question moments apart, and the record lookup loads every
+ *  bot's session store (hundreds of ms on a large fleet). */
+function resolveManagedOriginTransport(): ManagedOriginTransportVerdict {
+  managedOriginTransportVerdict ??= judgeManagedOriginTransport();
+  return managedOriginTransportVerdict;
+}
+
+function judgeManagedOriginTransport(): ManagedOriginTransportVerdict {
   const envVerdict = (requireEnvSession: boolean) => ({
     noTransport: (!requireEnvSession || !!process.env.BOTMUX_SESSION_ID)
       && currentTurnHasNoTransport(),
@@ -10726,7 +10741,11 @@ function resolveManagedOriginTransport(): {
     // markers without a birth stamp may be stale, not just a changed env.
     const ancestor = findLiveAncestorSessionContext(dataDir);
     if (ancestor?.sessionId && envSessionId && ancestor.sessionId !== envSessionId) {
-      return { noTransport: true, chatId: undefined };
+      return {
+        noTransport: true,
+        chatId: undefined,
+        sessionConflict: { ancestorSessionId: ancestor.sessionId, envSessionId },
+      };
     }
     const ctx = ancestor?.sessionId ? ancestor : resolveSessionContext(dataDir, envSessionId);
     if (!ctx?.sessionId) {
@@ -10752,9 +10771,16 @@ function resolveManagedOriginTransport(): {
   }
 }
 
-/** Tamper-resistant managed-origin transport check for the root-dispatch gate. */
-function managedOriginHasNoTransport(): boolean {
-  return resolveManagedOriginTransport().noTransport;
+/** Refusal text for a marker/env session conflict. Naming both ids keeps the
+ *  real reason visible instead of the generic no-transport causes. */
+function managedOriginConflictMessage(
+  op: string,
+  conflict: NonNullable<ManagedOriginTransportVerdict['sessionConflict']>,
+): string {
+  return `botmux ${op} is unavailable: an ancestor process marker names session ` +
+    `${conflict.ancestorSessionId}, but BOTMUX_SESSION_ID names ${conflict.envSessionId}.\n` +
+    `Feishu read/write is refused rather than routed through either session. Run it\n` +
+    `from the session's own CLI without overriding BOTMUX_SESSION_ID.`;
 }
 
 /** Refuse a Feishu-touching CLI command for a no-transport turn with a clear,
@@ -10769,6 +10795,10 @@ function assertTurnTransportOrExit(op: string): void {
   // later bound to a real chat — see resolveManagedOriginTransport.
   const verdict = resolveManagedOriginTransport();
   if (!verdict.noTransport) return;
+  if (verdict.sessionConflict) {
+    console.error(managedOriginConflictMessage(op, verdict.sessionConflict));
+    process.exit(2);
+  }
   const chatId = verdict.chatId ?? '';
   const headless = chatId.startsWith('headless_');
   const why = headless
@@ -21105,13 +21135,16 @@ const LARK_FACING_COMMANDS = new Set([
   'tabs', 'top-notice',
   'vc-agent', 'report', 'actor', 'auth',
 ]);
-if (LARK_FACING_COMMANDS.has(command) && managedOriginHasNoTransport()) {
-  console.error(
-    `botmux ${command} is unavailable: this managed turn has no Feishu transport ` +
-    `(core-only apiOnly bot, HTTP control-API session, or headless automation session).\n` +
-    `Feishu read/write is not possible for this turn. Produce your normal answer\n` +
-    `through the current session result channel.`,
-  );
+const managedOriginVerdict = LARK_FACING_COMMANDS.has(command)
+  ? resolveManagedOriginTransport()
+  : undefined;
+if (managedOriginVerdict?.noTransport) {
+  console.error(managedOriginVerdict.sessionConflict
+    ? managedOriginConflictMessage(command, managedOriginVerdict.sessionConflict)
+    : `botmux ${command} is unavailable: this managed turn has no Feishu transport ` +
+      `(core-only apiOnly bot, HTTP control-API session, or headless automation session).\n` +
+      `Feishu read/write is not possible for this turn. Produce your normal answer\n` +
+      `through the current session result channel.`);
   process.exit(2);
 }
 
