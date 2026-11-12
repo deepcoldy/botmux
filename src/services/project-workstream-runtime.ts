@@ -32,6 +32,37 @@ function findActiveBySessionId(sessionId: string): DaemonSession | undefined {
   return workstreamPool?.findActiveBySessionId(sessionId);
 }
 
+/** Report-time runtime liveness for an attached source session.
+ *  During an active turn (`runtime_busy`), `SessionController` clears
+ *  `runtime.promptReady`, so `ds.cliReady` is legitimately `false` throughout
+ *  the turn that executes `botmux report`. Require a live worker generation
+ *  and bound native session instead of an idle prompt. */
+function isSourceSessionRuntimeLive(ds: DaemonSession | undefined): ds is DaemonSession {
+  if (!ds) return false;
+  const s = ds.session;
+  if (s.status !== 'active' || !s.cliSessionId || s.pendingForkSession || s.suspendedColdResume) {
+    return false;
+  }
+  if (s.sessionLifecycle && s.sessionLifecycle !== 'active') {
+    return false;
+  }
+  if (ds.worker !== undefined && (!ds.worker || ds.worker.killed)) {
+    return false;
+  }
+  if (ds.workerReady !== undefined) {
+    return ds.workerReady === true;
+  }
+  return ds.worker !== undefined ? true : ds.cliReady === true;
+}
+
+function authoritativeSourceIdentity(source: ProjectAttachmentSource): string {
+  return JSON.stringify([
+    source.sessionId, source.larkAppId, source.chatId, source.rootMessageId,
+    source.scope, source.chatType ?? null, source.status, source.ownerKey,
+    source.routeRevision, source.source, source.ordinary, source.reportCapability,
+  ]);
+}
+
 /** Freshness is proved against the denied host journal, not the CLI-readable
  * registry. Replaying an old valid signature cannot revive a revoked source. */
 export async function validateProjectAttachmentReport(
@@ -43,8 +74,9 @@ export async function validateProjectAttachmentReport(
     const s = ds.session;
     return JSON.stringify([s.sessionId, s.larkAppId, s.chatId, s.rootMessageId, s.status,
       s.ownerOpenId, s.ownerUnionId, s.projectRouteRevision, s.cliSessionId, s.pendingForkSession,
+      !!s.suspendedColdResume, s.sessionLifecycle ?? 'active',
       !!s.workflowNode, !!s.vcMeetingReceiver, !!s.messageListenerRun, !!s.deferredScheduleRun,
-      !!s.adoptedFrom, ds.cliReady]);
+      !!s.adoptedFrom, ds.workerGeneration ?? null, isSourceSessionRuntimeLive(ds)]);
   };
   const identityBefore = localSourceIdentity();
   const entry = registry[root] as Record<string, unknown> | undefined;
@@ -83,7 +115,7 @@ export async function validateProjectAttachmentReport(
   const finalRecord = readProjectAttachmentRecord(config.session.dataDir, root);
   const finalMode = readGroupCollaborationMode(config.session.dataDir, record.chatId);
   const finalProject = readProjectGroup(config.session.dataDir, record.chatId);
-  if (!finalSource || JSON.stringify(finalSource) !== JSON.stringify(source)
+  if (!finalSource || authoritativeSourceIdentity(finalSource) !== authoritativeSourceIdentity(source)
     || JSON.stringify(finalRecord) !== JSON.stringify(record)
     || finalMode?.mode !== 'project' || finalMode.coordinatorAppId !== record.coordinatorLarkAppId
     || !finalMode.workerAppIds?.includes(appId)
@@ -100,7 +132,7 @@ export async function validateProjectAttachmentReport(
     || finalCoordinator.larkAppId !== record.coordinatorLarkAppId
     || finalCoordinator.chatId !== record.chatId || finalCoordinator.scope !== 'chat'
     || finalCoordinator.ownerKey !== record.coordinatorOwnerKey
-    || !currentSource || !currentSource.cliReady || currentSource.session.status !== 'active'
+    || !isSourceSessionRuntimeLive(currentSource)
     || currentSource.session.chatId !== record.chatId || currentSource.session.rootMessageId !== root
     || (currentSource.session.projectRouteRevision ?? 1) !== record.source.routeRevision
     || currentMode?.mode !== 'project' || currentMode.coordinatorAppId !== record.coordinatorLarkAppId
