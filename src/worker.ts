@@ -12777,7 +12777,10 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
       codexBridgePendingTail = traj.pendingTail;
       let assignmentOffset = 0;
       try { assignmentOffset = statSync(rolloutPath.replace(/\/trajectory\.jsonl$/, '/assignment.md')).size; } catch { /* no assignment yet */ }
-      structuredBridgeDriverState = { assignmentOffset, trajectoryOffset: traj.newOffset };
+      structuredBridgeDriverState = {
+        assignmentOffset, trajectoryOffset: traj.newOffset,
+        ...(traj.pendingTail ? { skipTrajectoryTail: true } : {}),
+      };
       codexBridgeBaselineDone = true;
       structuredBridgeRecoveryAttempted = true;
       log(`Codex bridge baselined (doubao two-file): ${rolloutPath} (trajectoryOffset=${traj.newOffset}, assignmentOffset=${assignmentOffset})`);

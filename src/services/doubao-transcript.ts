@@ -15,10 +15,9 @@
  *     with non-empty `content` and NO `tool_calls`. A record with tool_calls is
  *     mid-turn narration and must never close the pending turn early.
  *
- * The bridge fallback only needs the original user prompt and the final
- * assistant message, so this reader emits the same two event kinds as the CoCo
- * reader ('user' | 'assistant_final'). The worker's generic structured-bridge
- * driver does the rest (fingerprint attribution, type-ahead queue, emit).
+ * User prompts and final answers feed reply attribution. Public tool calls and
+ * results also emit cosmetic 'cot' events for the execution timeline; they
+ * never start or complete a turn. Private reasoning fields are not forwarded.
  *
  * The worker owns one numeric offset + one driver-state slot, so the two files
  * share a single monotonic cursor: trajectory.jsonl byte size at the time of the
@@ -29,8 +28,9 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { readJsonlWindow } from './jsonl-cursor.js';
 import { logger } from '../utils/logger.js';
-import type { CodexBridgeEvent } from './codex-transcript.js';
+import type { CodexBridgeEvent, CodexCotEntry } from './codex-transcript.js';
 import { doubaoSessionRoots } from '../adapters/cli/doubao.js';
+import { boundSubjectForTransport, subjectFromArgsString } from './cot-subject.js';
 
 const SESSION_ID_RE = /^\d{10,24}$/;
 const ASSIGNMENT_FILE = 'assignment.md';
@@ -44,6 +44,9 @@ export interface DoubaoBridgeDrainState {
   assignmentOffset: number;
   /** Byte frontier in trajectory.jsonl. */
   trajectoryOffset: number;
+  /** A resume baseline retained an unfinished historical row. Its completion
+   *  belongs to history too, even if it lands alongside the next live prompt. */
+  skipTrajectoryTail?: true;
 }
 
 /** Drain context understood by the doubao driver (beyond the shared fields). */
@@ -210,14 +213,39 @@ function parseTrajectoryWindow(path: string, completeText: string, startOffset: 
 function parseTrajectoryLine(path: string, line: string, lineStart: number): CodexBridgeEvent | null {
   let obj: any;
   try { obj = JSON.parse(line); } catch { return null; }
+  const base = { uuid: `${path}:${lineStart}`, timestampMs: Date.now(), text: '' };
+  if (obj?.role === 'tool') {
+    if (typeof obj.tool_call_id !== 'string' || !obj.tool_call_id) return null;
+    const result = typeof obj.content === 'string' ? obj.content : '';
+    return { ...base, kind: 'cot', cotEntries: [{
+      kind: 'tool_result', id: obj.tool_call_id,
+      result: result.length > 800 ? `${result.slice(0, 800)}…` : result,
+    }] };
+  }
   if (obj?.role !== 'assistant') return null;
   const content = typeof obj.content === 'string' ? obj.content : '';
   // Mid-turn narration: the model narrates a tool call on the same record.
   // CoCo keys this off finish_reason:'tool_calls'; doubao lacks finish_reason,
   // but the presence of a non-empty tool_calls array is the same edge.
-  if (Array.isArray(obj.tool_calls) && obj.tool_calls.length > 0) return null;
+  if (Array.isArray(obj.tool_calls) && obj.tool_calls.length > 0) {
+    const cotEntries: CodexCotEntry[] = [];
+    for (const call of obj.tool_calls) {
+      if (typeof call?.id !== 'string' || !call.id
+        || typeof call.function?.name !== 'string' || !call.function.name) continue;
+      const input = call.function.arguments;
+      const args = typeof input === 'string' ? input
+        : input && typeof input === 'object' ? JSON.stringify(input) : '';
+      const subject = boundSubjectForTransport(subjectFromArgsString(args));
+      cotEntries.push({
+        kind: 'tool_call', id: call.id, name: call.function.name,
+        args: args.length > 600 ? `${args.slice(0, 600)}…` : args,
+        ...(subject ? { subject } : {}),
+      });
+    }
+    return cotEntries.length ? { ...base, kind: 'cot', cotEntries } : null;
+  }
   if (!content.trim()) return null;
-  return { uuid: `${path}:${lineStart}`, timestampMs: Date.now(), kind: 'assistant_final', text: content };
+  return { ...base, kind: 'assistant_final', text: content };
 }
 
 /** Incrementally drain BOTH native logs for a bound session.
@@ -287,17 +315,29 @@ export function drainDoubaoTranscript(
   const completeSections = trailingIncomplete ? parsedSections.slice(0, -1) : parsedSections;
   const userSections = completeSections.filter(s => s.event !== null);
 
-  // ── trajectory.jsonl: final assistant answers ────────────────────────────
+  // ── trajectory.jsonl: ordered execution progress and final answers ───────
   let trajectoryOffset = prevState.trajectoryOffset ?? 0;
+  let skipTrajectoryTail = prevState.skipTrajectoryTail === true;
   let pendingTail = '';
-  let finals: ParsedTrajectoryEvent[] = [];
+  let trajectoryEvents: ParsedTrajectoryEvent[] = [];
   try {
     if (existsSync(path)) {
       const size = statSync(path).size;
-      if (size < trajectoryOffset) trajectoryOffset = 0;
+      if (size < trajectoryOffset) {
+        trajectoryOffset = 0;
+        skipTrajectoryTail = false;
+      }
       if (size > trajectoryOffset) {
         const window = readJsonlWindow(path, trajectoryOffset, size);
-        finals = parseTrajectoryWindow(path, window.completeText, trajectoryOffset);
+        let start = trajectoryOffset;
+        let text = window.completeText;
+        if (skipTrajectoryTail && text) {
+          const end = text.indexOf('\n') + 1;
+          start += Buffer.byteLength(text.slice(0, end), 'utf8');
+          text = text.slice(end);
+          skipTrajectoryTail = false;
+        }
+        trajectoryEvents = parseTrajectoryWindow(path, text, start);
         trajectoryOffset = window.newOffset;
         pendingTail = window.pendingTail;
       }
@@ -308,19 +348,31 @@ export function drainDoubaoTranscript(
 
   // ── pair the two streams against queue-owned open turns ──────────────────
   const events: CodexBridgeEvent[] = [];
-  const finalsForOpen = Math.min(finals.length, openTurns);
-  const paired = Math.min(finals.length - finalsForOpen, userSections.length);
-  // 1. Close previously-started turns first so a prompt section in the same
-  //    window cannot HOL-drop and steal their final.
-  for (let i = 0; i < finalsForOpen; i++) events.push(finals[i]!.event);
-  // 2. Turns wholly inside this window: prompt then its own final.
-  for (let i = 0; i < paired; i++) {
-    events.push(userSections[i]!.event!);
-    events.push(finals[finalsForOpen + i]!.event);
+  let remainingOpen = openTurns;
+  let nextUser = 0;
+  let hasOwner = remainingOpen > 0;
+  for (const { event, start } of trajectoryEvents) {
+    if (!hasOwner && nextUser < userSections.length) {
+      events.push(userSections[nextUser++]!.event!);
+      hasOwner = true;
+    }
+    if (!hasOwner) {
+      if (trailingIncomplete) {
+        // The input heading already exists but its body has not flushed yet.
+        // Re-read this segment once the fingerprint can establish its owner.
+        trajectoryOffset = start;
+        break;
+      }
+      continue; // Ownerless history/cosmetic rows cannot claim a later turn.
+    }
+    events.push(event);
+    if (event.kind === 'assistant_final') {
+      if (remainingOpen > 0) remainingOpen--;
+      hasOwner = remainingOpen > 0;
+    }
   }
-  // 3. Submitted prompts whose final has not landed yet. The queue turn they
-  //    start is measured fresh on the next drain, so they need no hold here.
-  for (let i = paired; i < userSections.length; i++) events.push(userSections[i]!.event!);
+  // A pending prompt may precede its first trajectory row by several polls.
+  for (; nextUser < userSections.length; nextUser++) events.push(userSections[nextUser]!.event!);
 
   // Park assignment bytes at a torn trailing heading, if any; every complete
   // section above has been emitted and its bytes may be committed.
@@ -334,6 +386,6 @@ export function drainDoubaoTranscript(
     // be re-drained on the next tick either; take the max of the two frontiers.
     newOffset: Math.max(trajectoryOffset, fromOffset),
     pendingTail,
-    state: { assignmentOffset, trajectoryOffset },
+    state: { assignmentOffset, trajectoryOffset, ...(skipTrajectoryTail ? { skipTrajectoryTail: true } : {}) },
   };
 }

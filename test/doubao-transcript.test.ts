@@ -45,7 +45,7 @@ describe('doubao transcript bridge', () => {
     expect(doubaoSystemDirForSession('abc', roots)).toBeUndefined();
   });
 
-  it('drains user prompt + terminal assistant answer and skips mid-turn rows', () => {
+  it('drains public tool activity before the terminal assistant answer', () => {
     const root = join(tmpdir(), `doubao-bridge-drain-${process.pid}`);
     const { assignment, trajectory } = makeSession(root);
     const ts = '2026-11-02T05:40:07.661Z';
@@ -65,10 +65,12 @@ describe('doubao transcript bridge', () => {
     ].join('\n') + '\n');
 
     const r1 = doubaoBridgeSpec.drain(trajectory, 0, { adoptMode: false, state: undefined });
-    expect(r1.events.map(e => e.kind)).toEqual(['user', 'assistant_final']);
+    expect(r1.events.map(e => e.kind)).toEqual(['user', 'cot', 'cot', 'assistant_final']);
     expect(r1.events[0]!.text).toBe('请运行 date 并告诉我日期');
-    expect(r1.events[1]!.text).toBe('今天是 2026-11-02。');
-    expect(new Set(r1.events.map(e => e.uuid)).size).toBe(2);
+    expect(r1.events[1]!.cotEntries).toEqual([{ kind: 'tool_call', id: 't1', name: 'Bash', args: '{}' }]);
+    expect(r1.events[2]!.cotEntries).toEqual([{ kind: 'tool_result', id: 't1', result: '2026-11-02' }]);
+    expect(r1.events[3]!.text).toBe('今天是 2026-11-02。');
+    expect(new Set(r1.events.map(e => e.uuid)).size).toBe(4);
     expect(r1.state).toMatchObject({
       assignmentOffset: expect.any(Number),
       trajectoryOffset: expect.any(Number),
@@ -133,6 +135,135 @@ function tickDrain(
 
 const heading = (ts: string, body: string) => `## [${ts}] 需求\n${body}\n`;
 const finalRow = (text: string) => JSON.stringify({ role: 'assistant', content: text }) + '\n';
+const toolRow = (id: string, name: string, args: unknown) => JSON.stringify({
+  role: 'assistant', content: 'Tool preparation', reasoning_content: 'PRIVATE_REASONING',
+  tool_calls: [{ id, type: 'function', function: { name, arguments: args } }],
+}) + '\n';
+const resultRow = (id: string, content: string) => JSON.stringify({ role: 'tool', tool_call_id: id, content }) + '\n';
+
+describe('doubao execution timeline', () => {
+  it('preserves progress written between split heading and body appends', () => {
+    const { assignment, trajectory } = makeSession(join(tmpdir(), `doubao-progress-split-${process.pid}`));
+    const ts = '2026-11-12T00:30:00.000Z';
+    const queue = new CodexBridgeQueue(() => Date.parse(ts));
+    const observed: unknown[] = [];
+    queue.setCotObserver(entries => observed.push(...entries));
+    queue.mark('split', 'inspect split input', Date.parse(ts));
+    writeFileSync(assignment, `## [${ts}] 需求\n`);
+    writeFileSync(trajectory, toolRow('read-split', 'Read', { file_path: 'src/main.ts' }));
+    const cursor = { offset: 0, state: undefined as unknown };
+    expect(tickDrain(trajectory, cursor, queue).events).toEqual([]);
+    expect(tickDrain(trajectory, cursor, queue).events).toEqual([]);
+    writeFileSync(assignment, 'inspect split input\n', { flag: 'a' });
+    writeFileSync(trajectory, resultRow('read-split', 'read output') + finalRow('Done'), { flag: 'a' });
+    queue.ingest(tickDrain(trajectory, cursor, queue).events);
+    expect(observed).toMatchObject([
+      { kind: 'tool_call', id: 'read-split', subject: 'src/main.ts' },
+      { kind: 'tool_result', id: 'read-split' },
+    ]);
+    expect(queue.drainEmittable().map(turn => turn.finalText)).toEqual(['Done']);
+    expect(tickDrain(trajectory, cursor, queue).events).toEqual([]);
+  });
+
+  it('streams tool calls and results across polls while keeping the turn open until its final', () => {
+    const { assignment, trajectory } = makeSession(join(tmpdir(), `doubao-progress-${process.pid}`));
+    const ts = '2026-11-12T01:00:00.000Z';
+    const queue = new CodexBridgeQueue(() => Date.parse(ts));
+    const observed: Array<{ turnId: string; entries: unknown }> = [];
+    queue.setCotObserver((entries, turn) => observed.push({ turnId: turn.turnId, entries }));
+    queue.mark('turn-1', 'inspect files', Date.parse(ts));
+    writeFileSync(assignment, heading(ts, 'inspect files'));
+    writeFileSync(trajectory, toolRow('read-1', 'Read', JSON.stringify({ file_path: 'src/app.ts' })));
+    const cursor = { offset: 0, state: undefined as unknown };
+    queue.ingest(tickDrain(trajectory, cursor, queue).events);
+    expect(observed).toEqual([{ turnId: 'turn-1', entries: [{
+      kind: 'tool_call', id: 'read-1', name: 'Read',
+      args: JSON.stringify({ file_path: 'src/app.ts' }), subject: 'src/app.ts',
+    }] }]);
+    expect(queue.drainEmittable()).toEqual([]);
+    expect(tickDrain(trajectory, cursor, queue).events).toEqual([]);
+
+    writeFileSync(trajectory, resultRow('read-1', 'public tool output'), { flag: 'a' });
+    queue.ingest(tickDrain(trajectory, cursor, queue).events);
+    expect(observed[1]).toEqual({ turnId: 'turn-1', entries: [
+      { kind: 'tool_result', id: 'read-1', result: 'public tool output' },
+    ] });
+    expect(queue.drainEmittable()).toEqual([]);
+    writeFileSync(trajectory, finalRow('Finished'), { flag: 'a' });
+    queue.ingest(tickDrain(trajectory, cursor, queue).events);
+    expect(queue.drainEmittable().map(turn => [turn.turnId, turn.finalText])).toEqual([['turn-1', 'Finished']]);
+    expect(observed).toHaveLength(2);
+    expect(JSON.stringify(observed)).not.toContain('PRIVATE_REASONING');
+    expect(JSON.stringify(observed)).not.toContain('Tool preparation');
+  });
+
+  it('keeps both execution timelines on their own turns when a new prompt and old final arrive together', () => {
+    const { assignment, trajectory } = makeSession(join(tmpdir(), `doubao-progress-boundary-${process.pid}`));
+    const ts = '2026-11-12T02:00:00.000Z';
+    const nextTs = '2026-11-12T02:00:10.000Z';
+    const queue = new CodexBridgeQueue(() => Date.parse(ts));
+    const observed: Array<[string, string[]]> = [];
+    queue.setCotObserver((entries, turn) => observed.push([turn.turnId, entries.map(entry => entry.kind)]));
+    queue.mark('first', 'first request', Date.parse(ts));
+    writeFileSync(assignment, heading(ts, 'first request'));
+    writeFileSync(trajectory, '');
+    const cursor = { offset: 0, state: undefined as unknown };
+    queue.ingest(tickDrain(trajectory, cursor, queue).events);
+    queue.mark('next', 'next request', Date.parse(nextTs));
+    writeFileSync(assignment, heading(nextTs, 'next request'), { flag: 'a' });
+    writeFileSync(trajectory, toolRow('a', 'Read', {}) + resultRow('a', 'first output') + finalRow('First answer')
+      + toolRow('b', 'Bash', { command: 'echo done' }) + resultRow('b', 'done') + finalRow('Next answer'));
+    queue.ingest(tickDrain(trajectory, cursor, queue).events);
+    expect(observed).toEqual([
+      ['first', ['tool_call']], ['first', ['tool_result']],
+      ['next', ['tool_call']], ['next', ['tool_result']],
+    ]);
+    expect(queue.drainEmittable().map(turn => [turn.turnId, turn.finalText])).toEqual([
+      ['first', 'First answer'], ['next', 'Next answer'],
+    ]);
+    expect(tickDrain(trajectory, cursor, queue).events).toEqual([]);
+  });
+
+  it('does not replay ownerless tool history into a later prompt', () => {
+    const { assignment, trajectory } = makeSession(join(tmpdir(), `doubao-progress-orphan-${process.pid}`));
+    writeFileSync(trajectory, toolRow('old', 'Read', {}) + resultRow('old', 'old result'));
+    const cursor = { offset: 0, state: undefined as unknown };
+    expect(tickDrain(trajectory, cursor).events).toEqual([]);
+    const ts = '2026-11-12T03:00:00.000Z';
+    const queue = new CodexBridgeQueue(() => Date.parse(ts));
+    const observed: unknown[] = [];
+    queue.setCotObserver(entries => observed.push(...entries));
+    queue.mark('fresh', 'fresh request', Date.parse(ts));
+    writeFileSync(assignment, heading(ts, 'fresh request'));
+    writeFileSync(trajectory, toolRow('fresh', 'Grep', { pattern: 'RepositoryForm' }) + finalRow('Fresh answer'), { flag: 'a' });
+    queue.ingest(tickDrain(trajectory, cursor, queue).events);
+    expect(observed).toHaveLength(1);
+    expect(observed[0]).toMatchObject({ id: 'fresh', name: 'Grep', subject: 'RepositoryForm' });
+    expect(queue.drainEmittable().map(turn => turn.finalText)).toEqual(['Fresh answer']);
+  });
+
+  it('bounds tool payloads, extracts subjects before truncation, and ignores malformed/private records', () => {
+    const { assignment, trajectory } = makeSession(join(tmpdir(), `doubao-progress-bounds-${process.pid}`));
+    writeFileSync(assignment, heading('2026-11-12T04:00:00.000Z', 'bounded tools'));
+    const args = JSON.stringify({ content: 'x'.repeat(10_000), file_path: 'src/long.ts' });
+    const output = 'y'.repeat(10_000);
+    writeFileSync(trajectory, [
+      JSON.stringify({ role: 'assistant', content: '', reasoning_content: 'PRIVATE_REASONING' }) + '\n',
+      JSON.stringify({ role: 'assistant', content: 'not a final', tool_calls: [null, { id: 'missing-function' }] }) + '\n',
+      JSON.stringify({ role: 'tool', tool_call_id: null, content: 'unmatched' }) + '\n',
+      toolRow('write', 'Write', args), resultRow('write', output),
+    ].join(''));
+    const result = drainDoubaoTranscript(trajectory, 0);
+    expect(result.events.map(event => event.kind)).toEqual(['user', 'cot', 'cot']);
+    const call = result.events[1]!.cotEntries![0]!;
+    const returned = result.events[2]!.cotEntries![0]!;
+    expect(call).toMatchObject({ kind: 'tool_call', subject: 'src/long.ts' });
+    if (call.kind === 'tool_call') expect(call.args.length).toBeLessThan(args.length);
+    if (returned.kind === 'tool_result') expect(returned.result.length).toBeLessThan(output.length);
+    expect(result.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+    expect(JSON.stringify(result.events)).not.toContain('PRIVATE_REASONING');
+  });
+});
 
 describe('doubao two-file cross-window ordering', () => {
   it('delivers the previous final before starting the next prompt seen in the same drain window', () => {
