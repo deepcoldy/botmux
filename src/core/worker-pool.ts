@@ -10326,12 +10326,17 @@ export function __testOnly_setSuspendBackingVerifier(
 
 const primarySuspendInFlight = new WeakMap<DaemonSession, Promise<boolean>>();
 const primarySuspendApplying = new WeakSet<DaemonSession>();
-export async function suspendWorkerAsync(ds: DaemonSession, reason = 'suspended_idle', stillOwned?: () => boolean): Promise<boolean> {
+export async function suspendWorkerAsync(ds: DaemonSession, reason = 'suspended_idle', stillOwned?: (operationId?: string) => boolean): Promise<boolean> {
   const result = suspendWorker(ds, reason, stillOwned);
   return primarySuspendInFlight.get(ds) ?? result;
 }
-export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stillOwned?: () => boolean): boolean {
-  if (stillOwned && !stillOwned()) return false;
+export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle', stillOwned?: (operationId?: string) => boolean): boolean {
+  const continuingController = primarySuspendApplying.has(ds) ? controllerForSession(ds) : undefined;
+  const continuingOperationId = continuingController?.operation()?.operationId;
+  if (stillOwned && !stillOwned(continuingOperationId)) {
+    if (continuingOperationId) continuingController!.controlResult(continuingOperationId, 'failed_before_effect', undefined, 'managed_suspend_ownership_changed');
+    return false;
+  }
   if (hasProtectedSessionMutationOwnership(ds)) {
     logger.warn(`[${tag(ds)}] Refused worker suspend (${reason}) while Codex App dispatch ownership is non-empty`);
     return false;
@@ -10712,12 +10717,17 @@ export const __testOnly_runPendingSuspendIfSettled = runPendingSuspendIfSettled;
  *
  * `pendingSuspend*` is intentionally absent; see above.
  */
-export function canSafelyReclaimWorkerForInstallChange(ds: DaemonSession): boolean {
+export function canSafelyReclaimWorkerForInstallChange(ds: DaemonSession, suspendOperationId?: string): boolean {
   if (!ds.worker || ds.worker.killed) return false;
   if (ds.session.status !== 'active') return false;
   if (ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) return false;
   if (ds.session.locked === true) return false;
-  if (ds.workerReady !== true) return false;
+  if (suspendOperationId) {
+    const controller = controllerForSession(ds);
+    const operation = controller?.operation();
+    if (!operation || operation.operationId !== suspendOperationId || operation.kind !== 'suspend'
+      || operation.phase !== 'applying' || !sameRuntime(operation.targetRuntime, controller!.currentRuntime())) return false;
+  } else if (ds.workerReady !== true) return false;
   if (hasProtectedSessionMutationOwnership(ds) || isSessionTransferring(ds)) return false;
   if (ds.pendingRepo || ds.pendingRepoCommitInFlight || ds.worktreeCreating) return false;
   if (ds.initialStartPending) return false;

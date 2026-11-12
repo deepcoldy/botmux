@@ -10759,7 +10759,7 @@ const explicitAskContinuation = createExplicitAskContinuation({
   onError: error => logger.warn(`[ask-continuation] ${error instanceof Error ? error.message : String(error)}`),
 });
 
-function managedAskSession(sessionId: string) {
+function managedAskSession(sessionId: string, suspendOperationId?: string) {
     const ds = findActiveBySessionId(sessionId);
     if (!ds) return undefined;
     return {
@@ -10770,7 +10770,7 @@ function managedAskSession(sessionId: string) {
       turnId: ds.managedTurnOrigin?.turnId,
       dispatchAttempt: ds.managedTurnOrigin?.dispatchAttempt,
       safeToSuspend: (ds.lastScreenStatus === 'idle' || ds.lastScreenStatus === 'limited')
-        && canSafelyReclaimWorkerForInstallChange(ds),
+        && canSafelyReclaimWorkerForInstallChange(ds, suspendOperationId),
       resourceOwned: !ds.adoptedFrom && !ds.session.adoptedFrom && !ds.initConfig?.adoptMode
         && ds.session.locked !== true && !isSessionTransferring(ds),
       suspensionConfirmed: ds.session.suspendedColdResume === true,

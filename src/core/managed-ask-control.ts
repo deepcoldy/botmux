@@ -57,8 +57,8 @@ export function createManagedAskControl(deps: {
   describe?: (request: Omit<ExplicitAskControl, 'origin'>) => ExplicitAskReceipt;
   retire: (request: ExplicitAskRetirement) => ExplicitAskReceipt;
   snapshot: (receipt: ExplicitAskReceipt) => PendingAsk | undefined;
-  session: (sessionId: string) => ManagedAskSession | undefined;
-  suspend: (sessionId: string, stillOwned: () => boolean) => Promise<boolean>;
+  session: (sessionId: string, suspendOperationId?: string) => ManagedAskSession | undefined;
+  suspend: (sessionId: string, stillOwned: (suspendOperationId?: string) => boolean) => Promise<boolean>;
 }) {
   const releasing = new Set<string>();
   function bound(request: Omit<ExplicitAskControl, 'origin'>) {
@@ -112,8 +112,8 @@ export function createManagedAskControl(deps: {
       return result(request, receipt, 'conflict');
     }
     if (!session.workerAlive) return result(request, receipt, session.suspensionConfirmed ? 'suspended' : 'unknown');
-    const stillOwned = () => {
-      const current = deps.session(request.sessionId);
+    const stillOwned = (suspendOperationId?: string) => {
+      const current = deps.session(request.sessionId, suspendOperationId);
       return managedAskExecutionOwned(request, current) && !!current?.workerAlive && current.safeToSuspend
         && current.terminalExecutionKeys?.includes(managedAskOriginKey(request.origin)) === true;
     };
