@@ -255,12 +255,24 @@ describe('TraeX auto-model current-turn continuation real Worker and PTY', () =>
     expect(fixtureState.noticeDeliveries.filter(message => message.type === 'user_notify'
       && message.message === t('worker.traex_auto_model.continuation_timeout'))).toHaveLength(1);
     pausedGrant?.mockRestore();
-    const registration = [...fixtureState.messages].reverse().find(message => message.type === 'runtime_binding');
-    expect(registration?.type).toBe('runtime_binding');
-    if (registration?.type === 'runtime_binding') {
-      controller.bindRuntime(registration.bindingId, registration.sessionContract!.producer, registration.identity);
-      expect(controller.store.executionContinuation(controller.ref, registration.bindingId)?.status).toBe('rejected');
+    // Bind every distinct runtime the worker actually registered, then assert on
+    // the continuation records by their durable state rather than on whichever
+    // `runtime_binding` happens to arrive last. Under host load the worker's
+    // repeated re-publications flush in nondeterministic order, so "the last
+    // runtime_binding message" is not reliably the replacement binding. The
+    // original binding never had a continuation plan (undefined), while the
+    // exact model replacement binding is the unique one with a rejected plan.
+    const distinctBindings = new Map<string, Extract<WorkerToDaemon, { type: 'runtime_binding' }>>();
+    for (const message of fixtureState.messages) {
+      if (message.type === 'runtime_binding') distinctBindings.set(message.bindingId, message);
     }
+    expect(distinctBindings.size).toBeGreaterThanOrEqual(2);
+    for (const registration of distinctBindings.values()) {
+      controller.bindRuntime(registration.bindingId, registration.sessionContract!.producer, registration.identity);
+    }
+    const rejectedBindings = [...distinctBindings.keys()].filter(bindingId =>
+      controller.store.executionContinuation(controller.ref, bindingId)?.status === 'rejected');
+    expect(rejectedBindings).toHaveLength(1);
     expect(controller.store.executions(controller.ref, 'om_ungranted')[0]!.phase).toBe('failed');
     if (mode === 'lost-approval') {
       expect(withheldApproval).toBeDefined();
