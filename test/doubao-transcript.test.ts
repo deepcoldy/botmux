@@ -36,6 +36,8 @@ describe('Doubao live submission proof', () => {
     expect(doubaoLiveUser(trajectory)).toBeUndefined();
     expect(doubaoLiveUser(trajectory, proof(text + ' changed', assignment))).toBeUndefined();
     expect(doubaoLiveUser(trajectory, { ...proof(text, assignment), timestampMs: stamp + 1 })).toBeUndefined();
+    writeFileSync(assignment, `## [2026-11-12T00:00:00Z] 需求\n${text}\n## [2026-11-12T00:01:00Z] 需`);
+    expect(doubaoLiveUser(trajectory, proof(text, assignment))).toBeUndefined();
     writeFileSync(assignment, `## [2026-11-12T00:00:00Z] 需求\n${text}\n## [2026-11-12T00:00:00Z] 需求\n${text}\n`);
     expect(doubaoLiveUser(trajectory, proof(text, assignment))).toBeUndefined();
     writeFileSync(assignment, `## [2026-11-12T00:00:00Z] 需求\n${text}\n## [2026-11-12T00:01:00Z] 需求\n`);

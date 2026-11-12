@@ -214,6 +214,7 @@ export function doubaoLiveUser(path: string,
     const size = statSync(assignment).size;
     if (size > 4 * 1024 * 1024) return;
     const window = readJsonlWindow(assignment, 0, size);
+    if (window.pendingTail) return;
     const sections = parseAssignmentSections(assignment, window.completeText, 0);
     const latest = sections.at(-1);
     // An exact previously attributed native record also covers opening/solo
