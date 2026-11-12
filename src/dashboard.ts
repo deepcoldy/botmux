@@ -1,3 +1,4 @@
+import { selectSessionPage } from './dashboard/session-pagination.js';
 import { proxySessionStopControl } from './dashboard/session-stop-control.js';
 // src/dashboard.ts
 import { createServer, get as httpGet, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -4932,13 +4933,19 @@ const server = createServer(async (req, res) => {
       // re-resolves by larkAppId; the stored row is left untouched.
       const nameOf = dashboardBotNameLookup();
       groupsMatrixSnapshot.warm();
-      const sessions = enrichSessionsWithGroupNames(aggregator.getSessions().map(s => {
+      let page: ReturnType<typeof selectSessionPage<ReturnType<typeof aggregator.getSessions>[number]>>;
+      try { page = selectSessionPage(aggregator.getSessions(), url.searchParams); }
+      catch (error) {
+        return jsonRes(res, 400, { ok: false, error: error instanceof Error ? error.message : 'invalid_session_page' });
+      }
+      const sessions = enrichSessionsWithGroupNames(page.sessions.map(s => {
         const n = s.larkAppId ? nameOf(s.larkAppId) : undefined;
         return n && n !== s.botName ? { ...s, botName: n } : s;
       }), groupsMatrixSnapshot.peekPresentation());
       const browserSessions = projectSessionPreviewsForBrowser(sessions);
       lazyTopicLinkBackfill.trigger(browserSessions);
       return jsonRes(res, 200, {
+        ...page,
         sessions: projectSessionsForAudience(browserSessions, sessionBoardAudience),
       });
     }

@@ -20,6 +20,11 @@ export interface StoreSnapshot {
    *  installed. UI uses it to hold a skeleton instead of flashing an empty
    *  list before the bootstrap fetch lands. Stays true forever after. */
   bootstrapped: boolean;
+  /** Remaining closed-session history, loaded only on explicit request. */
+  closedCursor: string | null;
+  closedTotal: number;
+  /** Changes only when an authoritative session snapshot replaces cached rows. */
+  sessionSnapshotVersion: number;
 }
 
 class Store {
@@ -29,6 +34,11 @@ class Store {
   scheduleTimeZone = '';
   schedulesAvailable = true;
   private bootstrapped = false;
+  private closedCursor: string | null = null;
+  private closedTotal = 0;
+  private sessionGeneration = 0;
+  private sessionReads = new Map<string, Promise<void>>();
+  private sessionReadEvents = new Set<Array<{ type: string; body: Record<string, unknown> }>>();
   private version = 0;
   private snapshot: StoreSnapshot = {
     sessions: this.sessions,
@@ -38,6 +48,9 @@ class Store {
     scheduleTimeZone: this.scheduleTimeZone,
     schedulesAvailable: this.schedulesAvailable,
     bootstrapped: false,
+    closedCursor: null,
+    closedTotal: 0,
+    sessionSnapshotVersion: 0,
   };
   private listeners = new Set<() => void>();
   // Bot roster changes don't live in this cache (the Bot 配置 page owns its own
@@ -60,7 +73,11 @@ class Store {
    * 排程表清空并标记 {@link StoreSnapshot.schedulesAvailable} 为 false，但**会话
    * 快照照常落库**——P1-14 的整个要害就是别让排程的失败连累会话列表。
    */
-  replaceSnapshot(rows: Session[], schedules: Schedule[] | null, scheduleTimeZone?: string) {
+  replaceSnapshot(rows: Session[], schedules: Schedule[] | null, scheduleTimeZone?: string,
+    history?: { closedCursor?: string | null; closedTotal?: number }) {
+    this.sessionGeneration += 1;
+    this.closedCursor = history?.closedCursor ?? null;
+    this.closedTotal = history?.closedTotal ?? 0;
     this.sessions.clear();
     for (const row of rows) this.sessions.set(row.sessionId, row);
     this.schedules.clear();
@@ -73,7 +90,63 @@ class Store {
       for (const fn of this.scheduleRunLogListeners) fn();
     }
   }
+  /** Fetch one bounded history page; concurrent clicks share the same request. */
+  loadMoreClosedSessions(): Promise<void> {
+    const cursor = this.closedCursor;
+    if (cursor === null) return Promise.resolve();
+    return this.readSessionPage(`/api/sessions?view=closed&cursor=${encodeURIComponent(cursor)}`, true);
+  }
+
+  /** Resolve a deep link without downloading the entire session archive. */
+  ensureSession(sessionId: string): Promise<void> {
+    if (this.sessions.has(sessionId)) return Promise.resolve();
+    return this.readSessionPage(`/api/sessions?view=single&sessionId=${encodeURIComponent(sessionId)}`, false);
+  }
+
+  /** Merge missing rows, replay racing session events, and discard responses from an older snapshot. */
+  private readSessionPage(path: string, history: boolean): Promise<void> {
+    const generation = this.sessionGeneration;
+    const key = `${generation}:${path}`;
+    const existing = this.sessionReads.get(key);
+    if (existing) return existing;
+    const events: Array<{ type: string; body: Record<string, unknown> }> = [];
+    this.sessionReadEvents.add(events);
+    const request = (async () => {
+      const response = await fetch(path);
+      if (!response.ok) throw new Error('session_page_unavailable');
+      const page: { sessions: Session[]; closedCursor?: string | null; closedTotal?: number } = await response.json();
+      if (!Array.isArray(page.sessions)) throw new Error('invalid_session_page');
+      if (generation !== this.sessionGeneration) return;
+      const added = new Set<string>();
+      for (const row of page.sessions) {
+        if (!this.sessions.has(row.sessionId)) {
+          this.sessions.set(row.sessionId, row);
+          added.add(row.sessionId);
+        }
+      }
+      this.sessionReadEvents.delete(events);
+      for (const event of events) {
+        if (typeof event.body.sessionId === 'string' && added.has(event.body.sessionId)) {
+          this.applySse(event.type, event.body);
+        }
+      }
+      if (history) {
+        this.closedCursor = page.closedCursor ?? null;
+        this.closedTotal = page.closedTotal ?? this.closedTotal;
+      }
+      this.emit();
+    })().finally(() => {
+      this.sessionReadEvents.delete(events);
+      this.sessionReads.delete(key);
+    });
+    this.sessionReads.set(key, request);
+    return request;
+  }
+
   applySse(type: string, body: any) {
+    if (type.startsWith('session.')) {
+      for (const events of this.sessionReadEvents) events.push({ type, body });
+    }
     if (type === 'session.spawned') {
       this.sessions.set(body.session.sessionId, body.session);
     } else if (type === 'session.update') {
@@ -151,6 +224,9 @@ class Store {
       scheduleTimeZone: this.scheduleTimeZone,
       schedulesAvailable: this.schedulesAvailable,
       bootstrapped: this.bootstrapped,
+      closedCursor: this.closedCursor,
+      closedTotal: this.closedTotal,
+      sessionSnapshotVersion: this.sessionGeneration,
     };
     for (const fn of this.listeners) fn();
   }
@@ -251,13 +327,17 @@ export async function bootstrap(options: DashboardBootstrapOptions = {}) {
           // 保持打开、下一次 open 重试（见文件末尾注释与对应测试）。排程是**可选**
           // 资源：拿不到只是这一块降级，绝不能反过来吃掉会话快照。
           const [s, sch] = await Promise.all([
-            fetch('/api/sessions').then(r => r.json()),
+            fetch('/api/sessions?view=board').then(r => {
+              if (!r.ok) throw new Error('session_snapshot_unavailable');
+              return r.json();
+            }),
             canReadSchedules() ? fetchSchedulesSnapshot() : Promise.resolve(null),
           ]);
           store.replaceSnapshot(
             s.sessions ?? [],
             sch ? sch.schedules : null,
             sch?.timezone,
+            s,
           );
           completedReconcile = generation;
         } finally {

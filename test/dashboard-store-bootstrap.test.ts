@@ -104,7 +104,7 @@ describe('dashboard store bootstrap', () => {
     const sessionResponses = [initialSessions.promise, reconnectSessions.promise];
     const scheduleResponses = [initialSchedules.promise, reconnectSchedules.promise];
     const fetchMock = vi.fn((path: string) => (
-      path === '/api/sessions'
+      path === '/api/sessions?view=board'
         ? sessionResponses.shift()!
         : scheduleResponses.shift()!
     ));
@@ -181,7 +181,7 @@ describe('dashboard store bootstrap', () => {
   it('keeps the stream open when the first snapshot fails so a later open recovers', async () => {
     let sessionCalls = 0;
     const fetchMock = vi.fn((path: string) => {
-      if (path === '/api/sessions') {
+      if (path === '/api/sessions?view=board') {
         sessionCalls += 1;
         return sessionCalls === 1
           ? Promise.reject(new Error('snapshot unavailable'))
@@ -222,7 +222,7 @@ describe('dashboard store bootstrap · optional resources cannot sink the sessio
       [{ sessionId: 'workbench-session', status: 'working', repoName: 'botmux' }],
     ];
     const fetchMock = vi.fn((path: string) => {
-      if (path === '/api/sessions') {
+      if (path === '/api/sessions?view=board') {
         return Promise.resolve(jsonResponse({ sessions: sessionRows.shift() ?? [] }));
       }
       // 第一次是真实的 401 HTML 门禁页，第二次换成网络失败：两种「拿不到」都不许
@@ -253,7 +253,7 @@ describe('dashboard store bootstrap · optional resources cannot sink the sessio
 
   it('skips the /api/schedules round trip entirely for an identity without the capability', async () => {
     const fetchMock = vi.fn((path: string) => Promise.resolve(
-      path === '/api/sessions'
+      path === '/api/sessions?view=board'
         ? jsonResponse({ sessions: [{ sessionId: 'h5-session', status: 'idle' }] })
         : authWallResponse(),
     ));
@@ -263,14 +263,14 @@ describe('dashboard store bootstrap · optional resources cannot sink the sessio
     await bootstrap({ canReadSchedules: () => false });
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock).toHaveBeenCalledWith('/api/sessions');
+    expect(fetchMock).toHaveBeenCalledWith('/api/sessions?view=board');
     expect(store.sessions.has('h5-session')).toBe(true);
     expect(store.getSnapshot().schedulesAvailable).toBe(false);
   });
 
   it('still loads schedules and the effective timezone for an identity that has the capability', async () => {
     const fetchMock = vi.fn((path: string) => Promise.resolve(
-      path === '/api/sessions'
+      path === '/api/sessions?view=board'
         ? jsonResponse({ sessions: [{ sessionId: 'owner-session', status: 'idle' }] })
         : jsonResponse({ schedules: [{ id: 'sch-1', nextRunAt: '2026-01-01T00:00:00Z' }], timezone: 'Asia/Shanghai' }),
     ));
@@ -296,12 +296,12 @@ describe('dashboard store bootstrap · /events connection lifetime', () => {
   const HEARTBEAT_MS = 15_000;
 
   const sessionFetches = (fetchMock: ReturnType<typeof vi.fn>): number => (
-    fetchMock.mock.calls.filter(([path]) => path === '/api/sessions').length
+    fetchMock.mock.calls.filter(([path]) => path === '/api/sessions?view=board').length
   );
 
   function okFetch() {
     return vi.fn((path: string) => Promise.resolve(
-      path === '/api/sessions'
+      path === '/api/sessions?view=board'
         ? jsonResponse({ sessions: [] })
         : jsonResponse({ schedules: [] }),
     ));
@@ -666,5 +666,98 @@ describe('dashboard store bootstrap · /events connection lifetime', () => {
 
     expect(FakeEventSource.instances[0].closed).toBe(true);
     expect(FakeEventSource.instances).toHaveLength(1);
+  });
+});
+
+describe('closed session history loading', () => {
+  it('fetches only the board snapshot at startup and includes pagination metadata', async () => {
+    const fetchMock = vi.fn((path: string) => Promise.resolve(jsonResponse(
+      path === '/api/sessions?view=board'
+        ? { sessions: [{ sessionId: 'live', status: 'idle' }], closedCursor: 'next', closedTotal: 2000 }
+        : { schedules: [] },
+    )));
+    vi.stubGlobal('fetch', fetchMock);
+    const { bootstrap, store } = await import('../src/dashboard/web/store.js');
+    await bootstrap();
+    expect(fetchMock.mock.calls.map(([path]) => path)).toEqual(['/api/sessions?view=board', '/api/schedules']);
+    expect(store.getSnapshot()).toMatchObject({ closedCursor: 'next', closedTotal: 2000 });
+  });
+
+  it('coalesces page clicks and replays updates for historical rows without overwriting live rows', async () => {
+    const { store } = await import('../src/dashboard/web/store.js');
+    store.replaceSnapshot([{ sessionId: 'live', status: 'working' }], [], undefined, { closedCursor: 'next' });
+    const response = deferred<Response>();
+    const fetchMock = vi.fn(() => response.promise);
+    vi.stubGlobal('fetch', fetchMock);
+    const load = store.loadMoreClosedSessions();
+    const same = store.loadMoreClosedSessions();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    store.applySse('session.update', { sessionId: 'old', patch: { status: 'working', title: 'resumed' } });
+    response.resolve(jsonResponse({ sessions: [
+      { sessionId: 'old', status: 'closed', title: 'stale' },
+      { sessionId: 'live', status: 'closed' },
+    ], closedCursor: null }));
+    await Promise.all([load, same]);
+    expect(store.sessions.get('old')).toMatchObject({ status: 'working', title: 'resumed' });
+    expect(store.sessions.get('live')?.status).toBe('working');
+    expect(store.getSnapshot().closedCursor).toBeNull();
+    await store.loadMoreClosedSessions();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('discards an old page after snapshot reconciliation', async () => {
+    const { store } = await import('../src/dashboard/web/store.js');
+    store.replaceSnapshot([], [], undefined, { closedCursor: 'old-cursor' });
+    const response = deferred<Response>();
+    vi.stubGlobal('fetch', vi.fn(() => response.promise));
+    const load = store.loadMoreClosedSessions();
+    store.replaceSnapshot([{ sessionId: 'new', status: 'idle' }], [], undefined, { closedCursor: 'new-cursor' });
+    response.resolve(jsonResponse({ sessions: [{ sessionId: 'stale', status: 'closed' }], closedCursor: null }));
+    await load;
+    expect([...store.sessions.keys()]).toEqual(['new']);
+    expect(store.getSnapshot().closedCursor).toBe('new-cursor');
+  });
+
+  it('allows the same deep link to reload in a new snapshot while its old request is pending', async () => {
+    const { store } = await import('../src/dashboard/web/store.js');
+    store.replaceSnapshot([], []);
+    const old = deferred<Response>();
+    const fresh = deferred<Response>();
+    const fetchMock = vi.fn().mockReturnValueOnce(old.promise).mockReturnValueOnce(fresh.promise);
+    vi.stubGlobal('fetch', fetchMock);
+    const first = store.ensureSession('deep');
+    store.replaceSnapshot([], []);
+    const second = store.ensureSession('deep');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    fresh.resolve(jsonResponse({ sessions: [{ sessionId: 'deep', status: 'working' }] }));
+    await second;
+    old.resolve(jsonResponse({ sessions: [{ sessionId: 'deep', status: 'closed' }] }));
+    await first;
+    expect(store.sessions.get('deep')?.status).toBe('working');
+  });
+
+  it('keeps the cursor on failure so retry fetches the same bounded page', async () => {
+    const { store } = await import('../src/dashboard/web/store.js');
+    store.replaceSnapshot([], [], undefined, { closedCursor: 'retry-cursor' });
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response('', { status: 503 }))
+      .mockResolvedValueOnce(jsonResponse({ sessions: [{ sessionId: 'old', status: 'closed' }], closedCursor: null }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(store.loadMoreClosedSessions()).rejects.toThrow();
+    expect(store.getSnapshot().closedCursor).toBe('retry-cursor');
+    await store.loadMoreClosedSessions();
+    expect(fetchMock.mock.calls[0]).toEqual(fetchMock.mock.calls[1]);
+    expect(store.sessions.has('old')).toBe(true);
+  });
+
+  it('loads deep-linked archive rows individually and rejects failed snapshots', async () => {
+    const { store, bootstrap } = await import('../src/dashboard/web/store.js');
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse({ sessions: [{ sessionId: 'deep', status: 'closed' }] }))
+      .mockResolvedValueOnce(new Response('{"error":"unavailable"}', { status: 503 }));
+    vi.stubGlobal('fetch', fetchMock);
+    await store.ensureSession('deep');
+    expect(fetchMock).toHaveBeenCalledWith('/api/sessions?view=single&sessionId=deep');
+    expect(store.sessions.has('deep')).toBe(true);
+    await expect(bootstrap({ canReadSchedules: () => false })).rejects.toThrow('session_snapshot_unavailable');
+    expect(store.sessions.has('deep')).toBe(true);
   });
 });
