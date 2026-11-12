@@ -145,6 +145,10 @@ setInterval(() => {
       workingDir: dataDir, cliId: 'pi', cliPathOverride: fakeCli, backendType: 'pty',
       prompt: '', larkAppId: 'app_test', larkAppSecret: 'secret',
     } satisfies DaemonToWorker);
+    // The worker's HTTP listener is ready before its adapter finishes loading
+    // and starts the PTY. Give that cold start its own budget, then retain the
+    // short handshake deadline for the already-running writer below.
+    await waitFor(() => readdirSync(pidDir).length > 0, logs, 20_000);
     const writeReceipt = async (value: string) => {
       writeFileSync(request, value);
       await waitFor(() => existsSync(receipt) && readFileSync(receipt, 'utf8') === value, logs);
@@ -172,7 +176,7 @@ setInterval(() => {
       await waitFor(() => !processAlive(cliPid)
         && (child.exitCode !== null || child.signalCode !== null), logs);
     }
-  }, 20_000);
+  }, 60_000);
 });
 
 describe('ordinary IM during real worker init', () => {

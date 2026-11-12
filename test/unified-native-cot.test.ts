@@ -48,7 +48,17 @@ describe('unified replies with an independent native CoT channel', () => {
       session: { sessionId: 'native-session', rootMessageId: 'om_root', chatId: 'oc_native', status: 'active', cliId: 'claude-code', backendType: 'tmux' },
     } as DaemonSession;
   });
-  afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
+  afterEach(async () => {
+    // Thinking updates enqueue a timer and may still be acquiring the disk
+    // publication lock after a handler returns. Drain them while this test's
+    // dataDir, bot and sender are still installed, before the next fixture can
+    // reuse their mutable bindings or remove the records underneath a writer.
+    await flushTurnReplyTools(ds, 'om_turn');
+    await flushTurnReplyTools(ds, 'om_next');
+    await settle();
+    vi.unstubAllEnvs();
+    rmSync(dir, { recursive: true, force: true });
+  });
 
   function worker(owns = true, suppressed = false) {
     return loadWorkerPoolMessageHandlers(['thinking_update'], {
