@@ -90,6 +90,8 @@ Final text is harvested from local native logs: user sections in `assignment.md`
 
 Tool calls and results also feed Botmux's existing execution timeline while a task runs, including file reads, code searches, and shell commands. Updates follow the native log writes; these cosmetic events never complete a turn or replace its final reply, and private model reasoning fields are not read.
 
+To show tool activity directly inside an ordinary reply card, configure the Doubao bot with `replyCardMode: "unified"` and keep `cotEnabled` and `replyCardShowTools` enabled. Legacy mode uses Feishu's native progress bubble; a successful creation receipt alone does not prove the client displays its tool details.
+
 Doubao bots default to `replyDelivery: transcript` (other CLIs still default to `send`): the system prompt does not teach `botmux send`, and the final reply is collected only from the logs above. Doubao runs tool commands in an account-wide resident `doubao --type=service` process shared by every Doubao terminal on the machine, and that process keeps the environment and process tree of whichever terminal **first** started it. A `botmux send` issued from a tool is attributed through that tree, so the reply can land in another session, another chat, or even be sent as another bot. Switching back to `send` is not recommended; if you must, keep a single Doubao session on the machine and restart the resident process after switching.
 
 The first turn's native session id is captured for up to 20 seconds after submit (on a cold resident-process start, `assignment.md` takes 7–8 seconds to appear).

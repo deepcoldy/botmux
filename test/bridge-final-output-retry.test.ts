@@ -574,7 +574,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       const trajectory = join(dir, 'trajectory.jsonl');
       writeFileSync(trajectory, JSON.stringify({ role: 'assistant', content: body }) + '\n');
       const queue = new CodexBridgeQueue();
-      queue.mark('turn-1', prompt);
+      queue.mark('om_doubao_gallery', prompt);
       queue.ingest(drainDoubaoTranscript(trajectory, 0).events);
       const [ready] = queue.drainEmittable();
       expect(ready?.finalText).toBe(body);
@@ -587,7 +587,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       ds.workingDir = config.session.dataDir;
       const complete = vi.fn();
       const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
-      deliver(ds, { ...finalOutputMsg(), kind: 'bridge', content: ready!.finalText! }, 'tag', 0, complete);
+      deliver(ds, { ...finalOutputMsg(), turnId: ready!.turnId, kind: 'bridge', content: ready!.finalText! }, 'tag', 0, complete);
       await vi.advanceTimersByTimeAsync(10);
       await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledOnce());
       expect(uploadImageMock).toHaveBeenCalledTimes(12);
@@ -601,7 +601,46 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(card).not.toContain('RichMediaCard');
       expect(card).not.toContain(dir);
       expect(card).toContain('Gallery 3');
+      const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+      const record = new TurnReplyCardStore(config.session.dataDir).read({
+        larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ready!.turnId,
+      });
+      if (mode === 'unified') expect(record).toMatchObject({ mode: 'unified', finalDelivered: true });
+      else expect(record).toBeUndefined();
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('shows Doubao tools in a standard card before the final and retains its final images', async () => {
+    vi.useRealTimers();
+    getBot('app_test').config.replyCardMode = 'unified';
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.session.cliId = 'doubao';
+    ds.currentTurnId = 'om_doubao_visible_tools';
+    ds.workingDir = config.session.dataDir;
+    writeFileSync(`${config.session.dataDir}/preview.png`, Buffer.from('89504e470d0a1a0a', 'hex'));
+    const sessionReply = vi.fn(async () => 'om_doubao_visible_card');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => config.session.dataDir, getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker!);
+    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+    const store = new TurnReplyCardStore(config.session.dataDir);
+    const key = { larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId };
+    ds.worker!.emit('message', { type: 'turn_input_committed', turnId: ds.currentTurnId });
+    ds.worker!.emit('message', { type: 'thinking_update', sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
+      entries: [{ kind: 'tool_call', id: 'read', name: 'Read', args: '{"file_path":"README.md"}', subject: 'README.md' }] });
+    await vi.waitFor(() => expect(store.read(key)).toMatchObject({ mode: 'unified', phase: 'working', messageId: 'om_doubao_visible_card' }), { timeout: 4000 });
+    await vi.waitFor(() => expect(store.read(key)?.lastCard).toContain('README.md'), { timeout: 4000 });
+    expect(store.read(key)?.finalDelivered).not.toBe(true);
+    expect(getBotClient).not.toHaveBeenCalled();
+    ds.worker!.emit('message', { ...finalOutputMsg(), sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
+      kind: 'bridge', content: 'DOUBAO visible final\n\n<RichMediaCard>{"refs":["preview.png"]}</RichMediaCard>' });
+    await vi.waitFor(() => expect(store.read(key)?.finalDelivered).toBe(true), { timeout: 4000 });
+    expect(store.read(key)?.lastCard).toContain('DOUBAO visible final');
+    expect(store.read(key)?.lastCard).toContain('img_v3_uploaded_preview');
+    expect(store.read(key)?.lastCard).not.toContain('RichMediaCard');
+    expect(uploadImageMock).toHaveBeenCalledOnce();
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(updateMessageMock.mock.calls.every(call => call[1] === 'om_doubao_visible_card')).toBe(true);
   });
 
   it.each(['non-adopted', 'sandbox', 'read-isolation', 'remote', 'api-only'].flatMap(mode =>
