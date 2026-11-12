@@ -285,6 +285,8 @@ export const SENSITIVE_CARD_ACTIONS: ReadonlyMap<string, SensitiveCardActionMeta
   ['compact_session', NO_META],
   // 闲置自动压缩开关（core/idle-auto-compact.ts）：改的是会话持久设置，同样过 canOperate。
   ['toggle_idle_compact', { denyToastKey: 'card.idle_compact.no_permission' }],
+  // 缓存过期自动压缩开关（core/kimi-cache-expiry.ts）：同样是会话持久设置，过 canOperate。
+  ['toggle_kimi_expiry_compact', { denyToastKey: 'card.kimi_expiry_compact.no_permission' }],
   // 本群替身模式开关：写 per-bot + per-chat 运行态设置，同样过 canOperate。
   ['toggle_substitute', { denyToastKey: 'cmd.substitute.owner_only' }],
   ['quote_confirm', NO_META],

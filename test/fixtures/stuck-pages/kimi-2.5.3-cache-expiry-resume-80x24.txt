@@ -1,0 +1,24 @@
+ ● PROBE-REPLY-1
+
+ ● Compaction complete (14318 → 14768 tokens) (Ctrl-O to show compaction
+ summary)
+
+ ❯ Now list the open questions
+
+ ● PROBE-REPLY-3
+   tmux extended-keys is off. Modified Enter keys may not work. Add `set -g
+ extended-keys on` to ~/.tmux.conf and restart tmux.
+
+ ──────────────────────────────────────────────────────────────────────────────
+  This session has been idle for 1m and is ~14.6k tokens.
+  ↑↓ navigate · Enter select · Esc cancel
+
+  Cache expired — the next message re-sends the entire history at full price.
+   ❯ Compact and continue    one-time compact cost · cheapest way to keep th...
+     Start a new session     zero context cost · best for a new task
+     Continue as-is          full history kept · highest cost per turn
+     Don't ask me again
+
+ ──────────────────────────────────────────────────────────────────────────────
+ Never Ask  K3  /tmp/kimi-cache-probe
+                                                       context: 6% (14.6k/256k)

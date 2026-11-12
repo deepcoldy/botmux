@@ -22,6 +22,14 @@
  *    CLI config — the hook may then run outside the sandbox on every later
  *    start) or only navigate towards one. Bot operators (canOperate) only —
  *    exactly who could press them before this table existed.
+ *  - Kimi's cache-expiry menu: Enter picks whatever row is highlighted, so it
+ *    is offered only on `kimi cache expiry` — the page type the classifier
+ *    gives when the pointer is on "Compact and continue", re-checked on a
+ *    fresh capture right before the key is written. That row is the one Kimi
+ *    preselects, persists nothing and keeps the conversation (compacted); it
+ *    is `initiator` because it only lets the parked message go on. With the
+ *    pointer anywhere else (`kimi cache expiry moved`: new session, continue
+ *    at full price, never ask again) the card offers no key at all.
  *  - No free text, no arbitrary keys: the card never carries an input box.
  *
  * Index order of the two hook-review browser pages is kept identical to the
@@ -78,6 +86,16 @@ export const STUCK_PAGE_CATALOG: Readonly<Record<StuckPageType, StuckPageSpec>> 
     options: [
       { key: 'r', labelKey: 'card.stuck.key.retry_session_lock', audience: 'initiator' },
     ],
+  },
+  'kimi cache expiry': {
+    descriptionKey: 'card.stuck.page.kimi_cache_expiry',
+    options: [
+      { key: 'Enter', labelKey: 'card.stuck.key.kimi_compact_continue', audience: 'initiator' },
+    ],
+  },
+  'kimi cache expiry moved': {
+    descriptionKey: 'card.stuck.page.kimi_cache_expiry_moved',
+    options: [],
   },
 };
 

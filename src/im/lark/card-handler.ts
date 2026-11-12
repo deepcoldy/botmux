@@ -91,6 +91,7 @@ import { logger } from '../../utils/logger.js';
 import { buildRestartStatusCard, restartStatusCardNotifier } from '../../core/restart-status-card.js';
 import * as sessionStore from '../../services/session-store.js';
 import { applyIdleAutoCompactSetting, idleAutoCompactMinutes, isIdleAutoCompactEnabled } from '../../core/idle-auto-compact.js';
+import { applyKimiCacheExpiryAutoCompact, isKimiCacheExpiryAutoCompactEnabled } from '../../core/kimi-cache-expiry.js';
 import { cancelDeploymentContinuation } from '../../services/deployment-continuation.js';
 import { deploymentContinuationAuthority } from '../../core/deployment-continuation-authority.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../../services/failed-turn-retry.js';
@@ -102,7 +103,7 @@ import { resumeSuccessMessage } from '../../core/resume-result-message.js';
 import { cliHasNoRawPassthroughSurface, cliSupportsCompactAction } from '../../core/passthrough-commands.js';
 import { coordinationModeIsPrimary } from '../../services/durable-coordination-runtime.js';
 import { REPLY_CARD_MENU_ACTION } from './reply-card-actions.js';
-import { sessionReasoningControl, updateCodexCliEffort, topicReasoningControl, setTopicReasoningEffort, isSessionRestartInFlight, setSessionReasoningEffort, sessionSupportsIdleAutoCompact, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, substituteCardControlFor, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
+import { sessionReasoningControl, updateCodexCliEffort, topicReasoningControl, setTopicReasoningEffort, isSessionRestartInFlight, setSessionReasoningEffort, sessionSupportsIdleAutoCompact, sessionSupportsKimiCacheExpiryAutoCompact, sendKimiCacheExpiryAutoCompactSetting, forkWorker, killWorker, suspendWorker, sendWorkerInput, sendWorkerSessionInput, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, cachedStreamingCardStatus, cachedStreamCardLabel, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, liveReadableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, freezeSessionSandboxDecision, sessionAcceptsDirectCommand, buildStreamingCardJson, substituteCardControlFor, streamCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard, displayableStreamingCardImageKey, canExpectFreshStreamingScreenshot, restoreStreamingCardIdentityFromProof, streamingCardPresentationImageKey } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -3638,6 +3639,43 @@ export async function handleCardAction(input: unknown, deps: CardHandlerDeps, la
           content: enabled
             ? t('card.idle_compact.enabled', { minutes: idleAutoCompactMinutes(setting) }, loc)
             : t('card.idle_compact.disabled', undefined, loc),
+        },
+        ...(cardMessageId && ds.streamCardId === cardMessageId ? {
+          card: { type: 'raw' as const, data: JSON.parse(buildStreamingCardJson(ds, ds.session.suspendedColdResume ? 'idle' : undefined)) },
+        } : {}),
+      };
+    }
+
+    // 「🗜️ 缓存过期自动压缩：开/关」：本会话 opt-in（core/kimi-cache-expiry.ts，仅 Kimi Code）。
+    // 与闲置自动压缩同形：按钮值带目标状态 desired、旧卡重复点击幂等、设置落在会话行上；
+    // 存盘成功后推给活 worker，换代的 worker 从 init 读到同一设置。
+    if (actionType === 'toggle_kimi_expiry_compact') {
+      const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+      if (!ds) {
+        return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, loc) } };
+      }
+      // canOperate is enforced by the sensitive-action gate (card-action-routes.ts).
+      if (!sessionSupportsKimiCacheExpiryAutoCompact(ds)) {
+        return { toast: { type: 'warning', content: t('card.kimi_expiry_compact.unsupported', undefined, loc) } };
+      }
+      const enabled = value?.desired === 'on'
+        ? true
+        : value?.desired === 'off' ? false : !isKimiCacheExpiryAutoCompactEnabled(ds.session);
+      const previous = applyKimiCacheExpiryAutoCompact(ds.session, enabled);
+      try {
+        sessionStore.updateSession(ds.session);
+      } catch (err) {
+        if (previous) ds.session.kimiCacheExpiryAutoCompact = previous;
+        else delete ds.session.kimiCacheExpiryAutoCompact;
+        logger.warn(`[${tag(ds)}] toggle_kimi_expiry_compact save failed: ${err instanceof Error ? err.message : String(err)}`);
+        return { toast: { type: 'warning', content: t('card.kimi_expiry_compact.save_failed', undefined, loc) } };
+      }
+      sendKimiCacheExpiryAutoCompactSetting(ds, enabled);
+      logger.info(`[${tag(ds)}] Kimi cache-expiry auto-compact ${enabled ? 'on' : 'off'} via card by ${operatorOpenId ?? '?'}`);
+      return {
+        toast: {
+          type: 'success',
+          content: t(enabled ? 'card.kimi_expiry_compact.enabled' : 'card.kimi_expiry_compact.disabled', undefined, loc),
         },
         ...(cardMessageId && ds.streamCardId === cardMessageId ? {
           card: { type: 'raw' as const, data: JSON.parse(buildStreamingCardJson(ds, ds.session.suspendedColdResume ? 'idle' : undefined)) },

@@ -174,6 +174,7 @@ import { botLocale, localeForBot, t as tr } from '../i18n/index.js';
 import { LocalAddressOutboundError, prepareLocalAddressContent, sanitizeLocalAddressText } from '../im/lark/local-address-policy.js';
 import { localAddressContextForBot, replayVettedBody, sendableCardLink } from '../im/lark/local-address-context.js';
 import { isStuckPageType } from './stuck-page-catalog.js';
+import { isKimiCacheExpiryAutoCompactEnabled, supportsKimiCacheExpiryAutoCompact } from './kimi-cache-expiry.js';
 import { stuckCardFallbackText, stuckCardInitiatorOpenId, stuckCardPostErrorMeansUnsent, stuckKeyResultText } from './stuck-warning-card.js';
 
 import { sandboxNamespaceNotice } from './system-bwrap.js';
@@ -720,12 +721,14 @@ export function getDaemonStreamingCardUsageSnapshot(
   const modelFallback = ds.modelFallback;
   const reasoningControl = sessionReasoningControl(ds);
   const idleAutoCompact = idleAutoCompactCardState(ds);
+  const kimiCacheExpiryAutoCompact = kimiCacheExpiryAutoCompactCardState(ds);
   return {
     ...withCardRuntimeIdentity(ds, snapshot, effectiveCliId),
     ...(modelFallback ? { modelFallback } : {}),
     modelPin: sessionModelPinView(ds),
     ...(reasoningControl ? { reasoningControl } : {}),
     ...(idleAutoCompact ? { idleAutoCompact } : {}),
+    ...(kimiCacheExpiryAutoCompact ? { kimiCacheExpiryAutoCompact } : {}),
   };
 }
 
@@ -743,6 +746,26 @@ export function sessionSupportsIdleAutoCompact(ds: DaemonSession): boolean {
       vcMeetingReceiver: !!ds.session.vcMeetingReceiver,
     });
   } catch { return false; }
+}
+
+/** Whether this session can take 缓存过期自动压缩 (core/kimi-cache-expiry.ts):
+ *  Kimi Code on a local PTY / tmux backend, in a session botmux owns. */
+export function sessionSupportsKimiCacheExpiryAutoCompact(ds: DaemonSession): boolean {
+  try {
+    return supportsKimiCacheExpiryAutoCompact({
+      cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId,
+      backendType: ds.initConfig?.backendType ?? ds.session.backendType,
+      adopted: !!ds.adoptedFrom || !!ds.session.adoptedFrom || ds.initConfig?.adoptMode === true,
+      headless: !!ds.session.headless,
+      vcMeetingReceiver: !!ds.session.vcMeetingReceiver,
+    });
+  } catch { return false; }
+}
+
+/** Live-card state of the 缓存过期自动压缩 toggle; absent ⇒ not rendered. */
+export function kimiCacheExpiryAutoCompactCardState(ds: DaemonSession): CardUsageSnapshot['kimiCacheExpiryAutoCompact'] {
+  if (!sessionSupportsKimiCacheExpiryAutoCompact(ds)) return undefined;
+  return { enabled: isKimiCacheExpiryAutoCompactEnabled(ds.session) };
 }
 
 /** Live-card toggle state; absent ⇒ the toggle is not rendered. */
@@ -13657,6 +13680,19 @@ export function sendPromptCacheKeepalive(ds: DaemonSession, text: string): boole
   }
 }
 
+/** Push a 缓存过期自动压缩 toggle to the live worker. Not transfer-buffered:
+ *  a replacement worker reads the persisted setting from its init. */
+export function sendKimiCacheExpiryAutoCompactSetting(ds: DaemonSession, enabled: boolean): boolean {
+  const worker = ds.worker;
+  if (!worker || worker.killed) return false;
+  const message: DaemonToWorker = { type: 'kimi_cache_expiry_auto_compact', enabled };
+  try {
+    return afterWorkerIpcBootstrap(worker, () => worker.send(message));
+  } catch {
+    return false;
+  }
+}
+
 export type ExactTurnInterruptResult =
   | { ok: true; operationId?: string; confirmation?: 'interrupt_delivered' }
   | { ok: false; operationId?: string; reason: 'no_worker' | 'stale_turn' | 'unsupported' | 'delivery_failed' | 'timeout' | 'fork_pending' };
@@ -18244,6 +18280,9 @@ function forkWorkerPrepared(
     // Full local-address rule in the system prompt; like leadOnly it is read
     // when a worker process is forked. Rewriting replies reads the live value.
     ...(botCfg.hideLocalAddresses === true ? { hideLocalAddresses: true as const } : {}),
+    // Per-session 缓存过期自动压缩 (core/kimi-cache-expiry.ts); later toggles
+    // reach the live worker as `kimi_cache_expiry_auto_compact`.
+    ...(isKimiCacheExpiryAutoCompactEnabled(ds.session) ? { kimiCacheExpiryAutoCompact: true as const } : {}),
     // Workflow node session (design 2026-11-03 §4.2): the worker exports the
     // marker so its CLI system prompt and `botmux skill show` skip workflow.
     // A main-topic handoff's marker (§5.5) leaves the ordinary session as is.

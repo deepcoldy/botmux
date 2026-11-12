@@ -448,6 +448,9 @@ export interface CardUsageSnapshot {
    *  this snapshot for the same reason as `modelFallback`: every live-card call
    *  site already forwards it. Absent ⇒ unsupported here, toggle not rendered. */
   idleAutoCompact?: { enabled: boolean; minutes: number };
+  /** Per-session 缓存过期自动压缩 toggle (core/kimi-cache-expiry.ts), Kimi
+   *  Code only. Absent ⇒ unsupported here, toggle not rendered. */
+  kimiCacheExpiryAutoCompact?: { enabled: boolean };
   /** bots.json `cardFooterExtension` 命令给出的自定义段（已收成短单行纯文本），
    *  渲染时转义并接在用量段末尾。缺省 ⇒ 与未配置时逐字节相同。 */
   extensionSegments?: string[];
