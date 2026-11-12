@@ -96,7 +96,18 @@ export function createExplicitAskContinuation(deps: {
 }) {
   const now = deps.now ?? Date.now;
   const running = new Map<string, Promise<AskResult>>();
+  /** Receipts whose recovery turn is being dispatched right now. */
+  const dispatching = new Set<string>();
   let sweeping = false;
+  const handoffMissing = (): AskResult => ({ kind: 'invalidated', reason: 'durable Ask handoff missing; do not reuse an old confirmation',
+    selected: null, by: null, comment: null, timedOut: false });
+  /** The broker handoff is the only other copy of the delivered card's
+   * identity; freeze it into the receipt before that handoff is released. */
+  const withCard = (receipt: ExplicitAskReceipt): ExplicitAskReceipt => {
+    const snapshot = deps.snapshot?.(receipt.input);
+    return snapshot ? { ...receipt, card: { askId: snapshot.askId, cardMessageId: snapshot.cardMessageId,
+      cardDeliveredAt: snapshot.cardDeliveredAt } } : receipt;
+  };
   const keyFor = (input: Pick<CreateAskInput, 'larkAppId' | 'sessionId' | 'requestId'>) => createHash('sha256')
     .update(askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!)).digest('hex');
   const pathFor = (key: string) => join(deps.dir, `${key}.json`);
@@ -145,6 +156,12 @@ export function createExplicitAskContinuation(deps: {
     if (!deps.canRetire?.(current)) throw new Error('explicit Ask retirement authority conflict');
     const key = keyFor(current.input);
     const stored = read(key)!;
+    // The sweep already read this settled receipt and is creating its
+    // recovery turn: recording a retirement now would promise "no recovery
+    // turn" after the fact. Let the caller inspect and retry once it lands.
+    if (stored.result && !stored.retirement && dispatching.has(key)) {
+      throw new Error('explicit Ask recovery dispatch in flight');
+    }
     // A decision another path already invalidated (session rebound, handoff
     // missing) is void either way: record this operation so the same
     // retirement can release, without a second broker settlement.
@@ -155,7 +172,7 @@ export function createExplicitAskContinuation(deps: {
       const result = deps.retire(stored.input, control.reason);
       if (!result) throw new Error('explicit Ask handoff unavailable');
       const latest = read(key)!;
-      if (!latest.result) write(key, { ...latest, result, settledAt: now() });
+      if (!latest.result) write(key, withCard({ ...latest, result, settledAt: now() }));
       // The receipt now durably owns the terminal result; drop the broker's
       // host_explicit handoff exactly like a settled wait() does.
       deps.releaseHandoff?.(stored.input);
@@ -174,7 +191,7 @@ export function createExplicitAskContinuation(deps: {
     const joined = running.get(key);
     if (joined) return joined;
     if (original && deps.hasHandoff && !deps.hasHandoff(input)) {
-      const result: AskResult = { kind: 'invalidated', reason: 'durable Ask handoff missing; do not reuse an old confirmation', selected: null, by: null, comment: null, timedOut: false };
+      const result = handoffMissing();
       write(key, { ...original, result, settledAt: now() });
       return Promise.resolve(result);
     }
@@ -182,7 +199,7 @@ export function createExplicitAskContinuation(deps: {
     const frozenInput = original?.input ?? input;
     const promise = deps.register(original ? frozenInput : { ...frozenInput, ...presentation }).then(result => {
       const receipt = read(key)!;
-      write(key, { ...receipt, result: receipt.result ?? result, settledAt: receipt.settledAt ?? now() });
+      write(key, withCard({ ...receipt, result: receipt.result ?? result, settledAt: receipt.settledAt ?? now() }));
       deps.releaseHandoff?.(frozenInput);
       return result;
     }).finally(() => running.delete(key));
@@ -212,23 +229,34 @@ export function createExplicitAskContinuation(deps: {
           const receipt = read(key)!;
           if (receipt.version !== 1 || receipt.input.larkAppId !== deps.appId
             || keyFor(receipt.input) !== key) continue;
+          // A durable result makes the broker handoff redundant; this also
+          // finishes a release interrupted after the receipt write.
+          if (receipt.result) deps.releaseHandoff?.(receipt.input);
           if (receipt.acknowledged || receipt.delivered || receipt.retirement && receipt.result?.kind === 'invalidated') {
-            if (now() - receipt.settledAt! >= CONSUMED_RECEIPT_RETENTION_MS) rmSync(pathFor(key), { force: true });
+            // A retirement recorded on an old settled decision restarts retention.
+            const retainedSince = Math.max(receipt.settledAt ?? 0, receipt.retirement?.requestedAt ?? 0);
+            if (now() - retainedSince >= CONSUMED_RECEIPT_RETENTION_MS) rmSync(pathFor(key), { force: true });
             continue;
           }
           if (!receipt.result) {
             if (receipt.retirement && deps.retire) {
               const winner = deps.snapshot?.(receipt.input)?.result;
               if (winner?.kind === 'answered') {
-                write(key, { ...receipt, result: winner, settledAt: now() });
+                write(key, withCard({ ...receipt, result: winner, settledAt: now() }));
                 deps.releaseHandoff?.(receipt.input);
                 continue;
               }
               if (deps.canRetire?.(receipt)) {
                 const result = deps.retire(receipt.input, receipt.retirement.reason);
                 if (result) {
-                  write(key, { ...receipt, result, settledAt: now() });
+                  write(key, withCard({ ...receipt, result, settledAt: now() }));
                   deps.releaseHandoff?.(receipt.input);
+                } else if (deps.hasHandoff && !deps.hasHandoff(receipt.input)) {
+                  // Nothing can answer a card the broker no longer knows: the
+                  // decision is void, same as wait()'s missing-handoff verdict.
+                  write(key, { ...receipt, result: handoffMissing(), settledAt: now() });
+                } else {
+                  deps.onError(new Error(`explicit Ask retirement pending: broker handoff unavailable (${key.slice(0, 12)})`));
                 }
                 continue;
               }
@@ -254,10 +282,13 @@ export function createExplicitAskContinuation(deps: {
           // binding. Keep the receipt for the original caller to reconnect;
           // never continue a document task in an unbound turn.
           if (receipt.input.deliveryTarget || receipt.input.chatId.startsWith('doc:')) continue;
-          if (await deps.dispatch(receipt, `ask-${key}`)) {
-            // Re-read: a normal claimant may have acknowledged during dispatch.
-            write(key, { ...read(key)!, delivered: true });
-          }
+          dispatching.add(key);
+          try {
+            if (await deps.dispatch(receipt, `ask-${key}`)) {
+              // Re-read: a normal claimant may have acknowledged during dispatch.
+              write(key, { ...read(key)!, delivered: true });
+            }
+          } finally { dispatching.delete(key); }
         } catch (error) { deps.onError(error); }
       }
     } catch (error) { deps.onError(error); }
