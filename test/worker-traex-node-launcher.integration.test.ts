@@ -4,8 +4,12 @@
  * NOT a wrapperCli / Forge / bwrap test: treating only those shapes as launchers
  * strands the fresh worker on the Node pid and loses the native final.
  *
- * One copied Node image named "traex" gives the fixtures a real OS comm on
- * Linux and macOS; process.title / argv spoofing would not test that contract.
+ * One copied Node image named "traex", plus process.title inside the fixture
+ * scripts, gives the fixtures a real OS comm on Linux and macOS: the copy
+ * covers Node <=22 (comm follows the executable name) and the title covers
+ * Node 24+ (which forces the main thread to MainThread). On Linux the title
+ * is applied through prctl(PR_SET_NAME), i.e. it changes the actual
+ * /proc/<pid>/comm kernel field readComm reads — not an argv-only spoof.
  * The copy is shared by both cases, not repeated for every worker.
  */
 import { ChildProcess } from 'node:child_process';
@@ -158,6 +162,12 @@ suite('Worker + PTY: ordinary Node TRAE launcher ownership', () => {
         writeFileSync(nativeScript, `
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
+// Node 24+ renames its main thread to MainThread regardless of the executable
+// file name, so the copied image alone no longer yields a traex comm there.
+// process.title performs prctl(PR_SET_NAME) on Linux (the exact /proc/<pid>/
+// comm field readComm reads) and rewrites argv on macOS, keeping the fixture a
+// real OS-comm process on every supported runtime instead of an argv spoof.
+process.title = 'traex';
 const cfg = ${JSON.stringify(fixture)};
 const publish = (file, value) => {
   fs.writeFileSync(file + '.tmp', JSON.stringify(value));
@@ -254,6 +264,10 @@ if (subagent) {
         // env execs Node itself, so Linux does not retain the script basename
         // as comm (the parent must be an observable Node process on both OSes).
         writeFileSync(launcher, `#!/usr/bin/env node
+// Keep the observable launcher comm as node on every runtime: Node 24+ would
+// otherwise rename the main thread to MainThread. prctl touches /proc comm,
+// not argv, so the persistent-parent contract below stays a real process fact.
+process.title = 'node';
 const fs = require('node:fs');
 const { spawn } = require('node:child_process');
 fs.writeFileSync(${JSON.stringify(launcherPidFile)} + '.tmp', JSON.stringify(process.pid));
